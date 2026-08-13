@@ -76,6 +76,18 @@ pub fn verify_ed25519_signature(
 ) -> Result<bool, String> {
     use ed25519_dalek::Verifier;
 
+    // Length gate BEFORE decoding. bs58 decode is O(n^2) in the input length, so an oversized address
+    // string is a CPU bomb; a 32-byte key never exceeds 44 base58 chars and the signature is exactly
+    // 128 hex chars. Cheap, deterministic, and it makes this safe to call on unauthenticated input.
+    const MAX_B58_PUBKEY_CHARS: usize = 44;
+    const ED25519_SIG_HEX_CHARS: usize = 128;
+    if solana_address.len() > MAX_B58_PUBKEY_CHARS {
+        return Err(format!("Solana address too long: {} chars", solana_address.len()));
+    }
+    if signature_hex.len() != ED25519_SIG_HEX_CHARS {
+        return Err(format!("Invalid signature hex length: {} (expected {})", signature_hex.len(), ED25519_SIG_HEX_CHARS));
+    }
+
     // Decode Solana address (base58) → 32-byte public key
     let pubkey_bytes = bs58::decode(solana_address)
         .into_vec()

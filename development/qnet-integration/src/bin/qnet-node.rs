@@ -217,7 +217,7 @@ async fn validate_phase_and_pricing(phase: u8, node_type: NodeType, pricing: &Pr
                 .unwrap_or_else(|_| decoded.wallet_address.clone());
             let burn_verified = verify_solana_burn_for_activation(&full_solana_wallet, &decoded.tx_hash, price as u64).await?;
             if !burn_verified {
-                let wallet_preview = &full_solana_wallet[..full_solana_wallet.len().min(8)];
+                let wallet_preview = qnet_state::char_prefix(&full_solana_wallet, 8);
                 return Err(format!("Solana burn verification failed: {} 1DEV burn not found for wallet {}", price as u64, wallet_preview));
             }
             
@@ -2426,6 +2426,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = std::io::stderr().flush();
     }));
 
+    // Restart manifest sanity, before anything opens storage or touches the network. A malformed
+    // manifest is a broken RELEASE, not a runtime condition — refuse to start rather than run a binary
+    // whose restart anchor could hash-trust the wrong branch or silently bar identities.
+    if let Err(e) = qnet_integration::genesis_constants::restart_manifest_is_wellformed() {
+        eprintln!("[FATAL][RESTART] malformed_manifest err={} — refusing to start", e);
+        std::process::exit(1);
+    }
+    if let Some((mb, _)) = qnet_integration::genesis_constants::restart_anchor() {
+        eprintln!("[WARN][RESTART] manifest_active resume_from_mb={} excluded={}",
+                  mb, qnet_integration::genesis_constants::RESTART_MANIFEST.excluded.len());
+    }
+
     // SECURITY: Prevent direct execution - ONLY Docker or Mobile allowed
     if !std::path::Path::new("/.dockerenv").exists() && 
        std::env::var("DOCKER_ENV").is_err() &&
@@ -2963,7 +2975,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // Start background node monitoring
     // v8.0: Read QNET_HALT_HEIGHT once at startup for coordinated upgrades.
-    // Cosmos equivalent: halt-height flag. When ALL nodes set the same halt height,
+    // Halt-height flag. When ALL nodes set the same halt height,
     // they all stop gracefully at the same block → operator updates binaries → restarts.
     // Use case: breaking consensus changes (hard fork).
     // Normal rolling updates: leave unset (nodes restart one-by-one, catch up via snapshot).
@@ -2991,7 +3003,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             // v8.0: QNET_HALT_HEIGHT — coordinated upgrade stop
-            // Works like Cosmos halt-height: set same value on all nodes,
+            // Halt-height semantics: set the same value on all nodes,
             // they all stop at that block → update binaries → restart.
             if let Some(stop_at) = halt_height {
                 let current_height = node_clone.get_height().await;
@@ -3736,7 +3748,7 @@ async fn verify_solana_burn_for_activation(wallet_address: &str, expected_tx_has
     // This bypasses the wallet-address-based lookup entirely and works even when the
     // wallet is a short XOR-decoded prefix (first-time registration before registry exists).
     if !expected_tx_hash.is_empty() {
-        println!("🔍 Direct TX verification: {}...", &expected_tx_hash[..expected_tx_hash.len().min(16)]);
+        println!("🔍 Direct TX verification: {}...", qnet_state::char_prefix(&expected_tx_hash, 16));
         let tx_request = serde_json::json!({
             "jsonrpc": "2.0", "id": 1,
             "method": "getTransaction",
@@ -3763,12 +3775,12 @@ async fn verify_solana_burn_for_activation(wallet_address: &str, expected_tx_has
 
                                                 if (ix_type == "transfer" || ix_type == "transferChecked") && mint_ok && dest_ok && amount_ok {
                                                     println!("✅ VERIFIED (direct TX): Burn to incinerator confirmed!");
-                                                    println!("   TX: {}...", &expected_tx_hash[..expected_tx_hash.len().min(16)]);
+                                                    println!("   TX: {}...", qnet_state::char_prefix(&expected_tx_hash, 16));
                                                     return Ok(true);
                                                 }
                                                 if (ix_type == "burn" || ix_type == "burnChecked") && mint_ok && amount_ok {
                                                     println!("✅ VERIFIED (direct TX): SPL Token burn confirmed!");
-                                                    println!("   TX: {}...", &expected_tx_hash[..expected_tx_hash.len().min(16)]);
+                                                    println!("   TX: {}...", qnet_state::char_prefix(&expected_tx_hash, 16));
                                                     return Ok(true);
                                                 }
                                             }
@@ -3820,7 +3832,7 @@ async fn verify_solana_burn_for_activation(wallet_address: &str, expected_tx_has
 
     if let Some(result) = data.get("result") {
         if let Some(signatures) = result.as_array() {
-            println!("📋 Found {} recent transactions for wallet {}", signatures.len(), &wallet_address[..wallet_address.len().min(8)]);
+            println!("📋 Found {} recent transactions for wallet {}", signatures.len(), qnet_state::char_prefix(&wallet_address, 8));
             
             // Check each signature for burn transactions to incinerator
             for sig_info in signatures {
@@ -4889,7 +4901,7 @@ async fn get_activation_with_auto_genesis() -> Result<(NodeType, String), Box<dy
     if let Ok(env_code) = std::env::var("QNET_ACTIVATION_CODE") {
         let env_code = env_code.trim().to_string();
         if !env_code.is_empty() && env_code.starts_with("QNET-") {
-            println!("[INFO][STARTUP] activation_source=env_var code={}...", &env_code[..12.min(env_code.len())]);
+            println!("[INFO][STARTUP] activation_source=env_var code={}...", qnet_state::char_prefix(&env_code, 12));
             
             // Read burn data from env for stateless verification
             let burn_tx = std::env::var("QNET_BURN_TX_HASH").unwrap_or_default();
@@ -4903,7 +4915,7 @@ async fn get_activation_with_auto_genesis() -> Result<(NodeType, String), Box<dy
                 std::env::set_var("QNET_BURN_TX_HASH", &burn_tx);
                 std::env::set_var("QNET_BURN_AMOUNT", burn_amount.to_string());
                 println!("[INFO][STARTUP] burn_data=present tx={}... amount={}",
-                    &burn_tx[..16.min(burn_tx.len())], burn_amount);
+                    qnet_state::char_prefix(&burn_tx, 16), burn_amount);
             } else {
                 println!("[WARN][STARTUP] burn_data=missing — set QNET_BURN_TX_HASH and QNET_BURN_AMOUNT for full verification");
                 println!("[WARN][STARTUP] Code will still be validated via comprehensive checks at startup");

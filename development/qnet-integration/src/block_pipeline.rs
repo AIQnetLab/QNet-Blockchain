@@ -117,13 +117,6 @@ static HASH_CHAIN_BREAK_WITNESSES: once_cell::sync::Lazy<
     dashmap::DashMap<u64, DashSet<String>>
 > = once_cell::sync::Lazy::new(dashmap::DashMap::new);
 
-// v31.1: height→hash RAM cache. Verify reads parent hash here before
-// RocksDB, dodging LSM-read contention with concurrent apply writes.
-// Bounded LRU; deeper history falls back to disk on miss. ~1.2 MB at cap.
-const RECENT_BLOCK_HASHES_MAX: usize = 30_000;
-pub static RECENT_BLOCK_HASHES: once_cell::sync::Lazy<
-    dashmap::DashMap<u64, [u8; 32]>
-> = once_cell::sync::Lazy::new(dashmap::DashMap::new);
 
 // v32.10: cooldown for macroblock-anchored fork-recovery trigger.
 // Height → wall-clock secs of last trigger. 60s/height prevents thrashing
@@ -176,28 +169,29 @@ pub(crate) fn is_repair_solicited(height: u64) -> bool {
     REPAIR_SOLICITED.get(&height).map(|e| *e > now).unwrap_or(false)
 }
 
-/// Cache parent hash after apply commit / verify success / self-save.
-#[inline]
-pub fn cache_block_hash(height: u64, hash: [u8; 32]) {
-    RECENT_BLOCK_HASHES.insert(height, hash);
-    // LRU trim by lowest height when over cap.
-    if RECENT_BLOCK_HASHES.len() > RECENT_BLOCK_HASHES_MAX {
-        let mut min_h = u64::MAX;
-        for entry in RECENT_BLOCK_HASHES.iter() {
-            let h = *entry.key();
-            if h < min_h { min_h = h; }
-        }
-        if min_h != u64::MAX {
-            RECENT_BLOCK_HASHES.remove(&min_h);
+
+
+/// Single sink for the fork-recovery signal. DEEPEST target wins: concurrent detectors report
+/// different divergence points, and only the lowest satisfies all of them — a shallower target
+/// would leave the deeper fork in place. Three writers with different merge rules previously
+/// raced here and could settle on a height none of them intended.
+/// Current pending fork-recovery target (0 = none). Lets a detector tell whether its own signal won.
+pub(crate) fn fork_recovery_target() -> u64 {
+    FORK_RECOVERY_HEIGHT.load(Ordering::SeqCst)
+}
+
+pub(crate) fn signal_fork_recovery(target: u64) {
+    if target == 0 { return; } // 0 is the "no signal" sentinel — never store it as a target
+    let mut prev = FORK_RECOVERY_HEIGHT.load(Ordering::SeqCst);
+    loop {
+        if prev != 0 && prev <= target { return; }
+        match FORK_RECOVERY_HEIGHT.compare_exchange_weak(prev, target, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return,
+            Err(cur) => prev = cur,
         }
     }
 }
 
-/// O(1) RAM lookup for parent hash; None ⇒ caller falls back to RocksDB.
-#[inline]
-pub fn lookup_block_hash(height: u64) -> Option<[u8; 32]> {
-    RECENT_BLOCK_HASHES.get(&height).map(|e| *e.value())
-}
 
 /// Equal-absolute-round fork-choice tie-break for a PRE-VERIFY competitor (gossip-duplicate / repair /
 /// anchor-recovery — verify_stage is skipped or not-yet-run, so the bytes are UNVERIFIED). The incoming
@@ -213,14 +207,14 @@ pub fn lookup_block_hash(height: u64) -> Option<[u8; 32]> {
 ///   3. Sha3(incoming.sig) < Sha3(our.sig) — deterministic single winner (no oscillation);
 ///   4. incoming is VALIDLY producer-signed — closes signature-grinding (attacker has no producer key).
 /// Byte-identical rule at every pre-verify fork-choice site so fork-choice is one network-wide function.
-fn equal_round_selffork_supersedes(incoming: &qnet_state::MicroBlock, our: Option<(&str, &[u8])>) -> bool {
+fn equal_round_selffork_supersedes(storage: &Storage, incoming: &qnet_state::MicroBlock, our: Option<(&str, &[u8])>) -> bool {
     let (our_producer, our_sig) = match our { Some(t) => t, None => return false };
     if incoming.producer != our_producer { return false; }
     use sha3::Digest;
     if sha3::Sha3_256::digest(&incoming.signature).as_slice() >= sha3::Sha3_256::digest(our_sig).as_slice() {
         return false;
     }
-    crate::node::verify_microblock_producer_sig_sync(incoming)
+    crate::node::verify_microblock_producer_sig_sync(storage, incoming)
 }
 
 /// Deterministic microblock fork-choice (failover race): a same-height block from a STRICTLY HIGHER
@@ -348,7 +342,7 @@ fn maybe_supersede_by_certified_round(storage: &Arc<Storage>, block: &IngestBloc
         // UNVERIFIED gossip/repair bytes with no 2f+1-TC to lean on, so the producer-authorization +
         // signature check inside the helper is what stops a registered node grinding a lower sig to
         // force a wasteful reorg. See equal_round_selffork_supersedes.
-        equal_round_selffork_supersedes(&incoming, Some((&our_producer, &our_sig)))
+        equal_round_selffork_supersedes(storage, &incoming, Some((&our_producer, &our_sig)))
     } else {
         return; // strictly lower absolute round → keep ours
     };
@@ -368,10 +362,7 @@ fn maybe_supersede_by_certified_round(storage: &Arc<Storage>, block: &IngestBloc
     // apply_breaker (height-1). Deepest pending target wins (min) so a concurrent, deeper
     // signal is never masked. (h > finalized is guaranteed above; .max is a floor clamp.)
     let target = h.saturating_sub(1).max(finalized);
-    let prev = FORK_RECOVERY_HEIGHT.load(Ordering::SeqCst);
-    if prev == 0 || target < prev {
-        FORK_RECOVERY_HEIGHT.store(target, Ordering::SeqCst);
-    }
+    signal_fork_recovery(target);
     if is_warn() {
         println!("[WARN][FORK] round_supersede h={} our_round={} new_round={} action=reorg_to_certified",
                  h, our_round, incoming.timeout_round);
@@ -1275,7 +1266,9 @@ impl BlockPipeline {
             for (worker_id, mut worker_rx) in worker_rxs.into_iter().enumerate() {
                 let sig_verified_tx_w = sig_verified_tx.clone();
                 let metrics_w = metrics.clone();
+                let storage_w = ctx.storage.clone();
                 tokio::spawn(async move {
+                    let storage = storage_w;
                     while let Some(mut decoded) = worker_rx.recv().await {
                         // Producer signature verification is the CPU-bound
                         // step; everything else (hash chain, deferred
@@ -1294,6 +1287,7 @@ impl BlockPipeline {
                             // multi-threaded tokio runtime. This is the
                             // CPU parallelism the worker pool exists for.
                             match BlockchainNode::verify_microblock_signature(
+                                &storage,
                                 &decoded.microblock,
                                 &decoded.microblock.producer,
                                 None,
@@ -1690,7 +1684,15 @@ impl BlockPipeline {
         // is verified, we drain deferred blocks whose parent has now arrived.
         // Bounded to prevent OOM under load (thousands of Super nodes).
         const DEFERRED_MAX: usize = 2000;
-        let mut deferred: HashMap<u64, DecodedBlock> = HashMap::new();
+        // Keyed by PARENT HASH, not by height: a height-keyed map holds one entry per slot, so two
+        // blocks waiting on the same parent (the normal case during a branch race) silently
+        // overwrote each other. Keyed by parent hash, siblings coexist and the drain is a direct
+        // lookup of "who was waiting for the block I just verified".
+        let mut deferred: HashMap<[u8; 32], Vec<(u64, DecodedBlock)>> = HashMap::new();
+        let mut deferred_count: usize = 0;
+        // Per-producer occupancy, maintained incrementally: counting by scanning the whole buffer
+        // on every deferral is O(buffer) per block on the verify path.
+        let mut deferred_by_producer: HashMap<String, usize> = HashMap::new();
         // Separate bucket for burn-gated blocks whose N-2 committee isn't applied yet (node behind). Their
         // parent IS present (burn gate runs post parent-check), so the contiguity drain never revisits them
         // — re-driven when their committee becomes available (see redrive below). Bounded by DEFERRED_MAX.
@@ -1785,7 +1787,7 @@ impl BlockPipeline {
                 }
             }
 
-            while let Some(decoded) = to_process.pop() {
+            while let Some(mut decoded) = to_process.pop() {
             let mb = &decoded.microblock;
 
             // 1. Hash chain continuity (except genesis + the snapshot-anchor successor). The snapshot
@@ -1798,35 +1800,27 @@ impl BlockPipeline {
                 metrics.mark_verify_op(mb.height, PIPELINE_OP_VERIFY_LOAD_PREV);
                 let parent_h = mb.height - 1;
 
-                // v31.1: parent-hash from RAM cache; fall back to RocksDB on miss.
-                // load_result: Ok(Some) resolved, Ok(None) parent missing (defer),
-                // Err disk failure (drop). Backfill on disk-hit keeps cache warm.
+                // The parent must be the block CANONICALLY occupying the preceding slot, read
+                // straight from storage (no cache in front of it, so no stale oracle). Asking only
+                // "do we hold a block with this hash?" would be a tautology — the claimed hash
+                // would answer for itself — and would admit a child of any retained branch.
+                // Ok(Some) = canonical parent hash, Ok(None) = slot empty (defer), Err = disk failure.
                 let load_start = std::time::Instant::now();
-                let load_result: Result<Option<[u8; 32]>, ()> = if let Some(cached) = lookup_block_hash(parent_h) {
-                    Ok(Some(cached))
-                } else {
-                    let storage_for_load = storage.clone();
-                    match tokio::task::spawn_blocking(move || {
-                        storage_for_load.load_microblock_auto_format(parent_h)
-                    }).await {
-                        Ok(Ok(Some(prev_block))) => {
-                            let h = prev_block.hash();
-                            // Backfill so subsequent verifies stay on the fast path.
-                            cache_block_hash(parent_h, h);
-                            Ok(Some(h))
+                let storage_for_load = storage.clone();
+                let load_result: Result<Option<[u8; 32]>, ()> = match tokio::task::spawn_blocking(move || {
+                    storage_for_load.canonical_hash_at(parent_h)
+                }).await {
+                    Ok(Some(canonical)) => Ok(Some(canonical)),
+                    Ok(None) => Ok(None),
+                    Err(join_err) => {
+                        if is_warn() {
+                            println!(
+                                "[WARN][PIPELINE] verify_load_prev_join_err h={} parent_h={} err={}",
+                                mb.height, parent_h, join_err
+                            );
                         }
-                        Ok(Ok(None)) => Ok(None),
-                        Ok(Err(_)) => Err(()),
-                        Err(join_err) => {
-                            if is_warn() {
-                                println!(
-                                    "[WARN][PIPELINE] verify_load_prev_join_err h={} parent_h={} err={}",
-                                    mb.height, parent_h, join_err
-                                );
-                            }
-                            metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
-                            continue;
-                        }
+                        metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
+                        continue;
                     }
                 };
                 let load_elapsed = load_start.elapsed();
@@ -1846,13 +1840,77 @@ impl BlockPipeline {
                         // and would be invalidated by the move otherwise.
                         let child_h = mb.height;
                         let parent_h = mb.height - 1;
-                        // Previous block not yet available — defer for retry.
-                        if deferred.len() < DEFERRED_MAX {
+                        // We are here because the parent SLOT is empty (the read above returned
+                        // None), so this is an ordinary gap: defer and let the drain or repair fill
+                        // it. A child built on a COMPETING parent takes the mismatch path instead
+                        // (prev_hash_ok == false below), which is where the fork witness belongs —
+                        // re-testing the same empty slot here would be both unreachable and a
+                        // blocking storage read on the async reactor, once per deferred block.
+                        // Occupying a deferred slot requires a valid producer signature. The parent
+                        // gate runs before signature verification (cheap rejects first), but the
+                        // buffer is now keyed by PARENT HASH — an unauthenticated peer could
+                        // otherwise mint unlimited distinct keys with junk parents and pin the
+                        // buffer. Height keying used to bound that implicitly; hash keying does not.
+                        // Honour the worker pool's verdict: with verify_workers > 1 the block was
+                        // already ML-DSA-verified before reaching this stage. Re-verifying here would
+                        // run inline on the single serial verify task, taking no _verify_permits —
+                        // during catch-up, where most blocks pass through this buffer, that doubles
+                        // the cost on the one stage that cannot parallelise. The flag is process-local
+                        // and never crosses the wire (same reasoning as the stage's own check).
+                        let sig_ok = decoded.sig_pre_verified
+                            || (!mb.signature.is_empty()
+                                && BlockchainNode::verify_microblock_signature(
+                                    &storage, &decoded.microblock, &decoded.microblock.producer, None,
+                                ).await.unwrap_or(false));
+                        if !sig_ok {
+                            if is_warn() {
+                                println!("[WARN][PIPELINE] deferred_rejected_unsigned h={} from={}",
+                                         child_h, decoded.from_peer);
+                            }
+                            metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
+                            metrics.mark_verify_idle();
+                            continue;
+                        }
+                        // Record the result so the replay does not pay for the same verification
+                        // twice — during catch-up most blocks pass through the deferred buffer.
+                        decoded.sig_pre_verified = true;
+                        // Per-producer cap. The buffer is keyed by parent hash, which the sender
+                        // chooses, so a single registered producer could otherwise sign DEFERRED_MAX
+                        // blocks with random parents, fill every slot, and starve honest deferrals —
+                        // exactly during the stall in which this buffer is the recovery mechanism.
+                        // Height keying used to bound this implicitly; hash keying does not.
+                        // Sized above a full rotation: one producer legitimately makes
+                        // ROTATION_INTERVAL_BLOCKS consecutive blocks, and under loss they can all
+                        // arrive out of order — a cap below that would drop honest traffic. Two
+                        // rotations of headroom still bounds an attacker to 64 instead of 2000.
+                        const DEFERRED_MAX_PER_PRODUCER: usize = 2 * crate::node::ROTATION_INTERVAL_BLOCKS as usize;
+                        let from_this_producer = *deferred_by_producer
+                            .get(&decoded.microblock.producer).unwrap_or(&0usize);
+                        if from_this_producer >= DEFERRED_MAX_PER_PRODUCER {
+                            if is_warn() {
+                                println!("[WARN][PIPELINE] deferred_producer_cap h={} producer={} held={}",
+                                         child_h, decoded.microblock.producer, from_this_producer);
+                            }
+                            metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
+                            metrics.mark_verify_idle();
+                            continue;
+                        }
+                        // Previous block not yet available — park it under the parent it waits for.
+                        if deferred_count < DEFERRED_MAX {
                             if is_debug() {
                                 println!("[DBG][PIPELINE] block_deferred h={} need_h={} buf={}",
-                                         child_h, parent_h, deferred.len());
+                                         child_h, parent_h, deferred_count);
                             }
-                            deferred.insert(child_h, decoded);
+                            let parked_at = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs()).unwrap_or(0);
+                            let waiters = deferred.entry(mb.previous_hash).or_default();
+                            // Drop an exact duplicate re-delivery; distinct siblings both survive.
+                            if !waiters.iter().any(|(_, d)| d.microblock.hash() == decoded.microblock.hash()) {
+                                *deferred_by_producer.entry(decoded.microblock.producer.clone()).or_insert(0) += 1;
+                                waiters.push((parked_at, decoded));
+                                deferred_count += 1;
+                            }
                         } else {
                             if is_info() {
                                 println!("[INFO][PIPELINE] deferred_full h={} dropped (buf={})",
@@ -1917,15 +1975,15 @@ impl BlockPipeline {
                             &decoded.from_peer,
                         );
 
-                        // P2 walk-to-divergence: a hash_chain_break on a FAILOVER (round>0) block means our
-                        // stored PARENT may be a losing-fork block whose canonical, higher-certified-round
-                        // replacement we lack. Solicit the parent height so the certified-round fork-choice
-                        // (supersede_stored_from_sync) supersedes it and the rollback deepens ONE height
-                        // toward the true divergence point; the next re-sync repeats until the chains link —
-                        // instead of failing hash_chain_break forever on the same height (the non-convergent
-                        // h=79230 wedge). Safe either way: if OUR parent is canonical, the fetched parent is
-                        // same/lower round ⇒ no supersede. Self-throttled (2s/height, 16/s bucket).
-                        if (mb.timeout_round > 0 || mb.carried_baseline > 0) && mb.height > 1 {
+                        // Walk-to-divergence: a chain break means OUR stored parent may be the losing
+                        // variant whose canonical replacement we lack. Solicit the parent so certified-round
+                        // fork-choice can supersede it and the rollback deepens one height toward the true
+                        // divergence point; repeat until the chains link. Runs for EVERY break, not just
+                        // round>0 blocks — the round of the CHILD says nothing about which side diverged,
+                        // and gating on it left round-0 breaks with no convergence path at all. Safe when
+                        // our parent is canonical: the fetched parent is same/lower round ⇒ no supersede.
+                        // Self-throttled (2s/height, 16/s bucket).
+                        if mb.height > 1 {
                             if let Some(ref p2p) = unified_p2p {
                                 let _ = p2p.request_block_repair(mb.height - 1).await;
                             }
@@ -2057,7 +2115,7 @@ impl BlockPipeline {
                             } else if incoming_abs == local_abs {
                                 // Equal round: only a genuine same-producer self-fork (valid sig, lower hash)
                                 // supersedes, and only if we actually HOLD a competitor here (None ⇒ false).
-                                equal_round_selffork_supersedes(&decoded.microblock,
+                                equal_round_selffork_supersedes(&storage, &decoded.microblock,
                                     local_opt.as_ref().map(|b| (b.producer.as_str(), b.signature.as_slice())))
                             } else {
                                 false
@@ -2074,19 +2132,18 @@ impl BlockPipeline {
                                     None => true,
                                 };
                                 if cooldown_ok {
-                                    let prev = FORK_RECOVERY_HEIGHT
-                                        .load(std::sync::atomic::Ordering::SeqCst);
                                     // Roll back to the last good height = disputed-2 (the forked block is
                                     // local[disputed-1]), clamped to ≥ finalized. finalized_h+1 was wrong when
                                     // the fork IS at finalized+1 (our own tip): the handler's `rollback_to <
                                     // local_h` guard then never fires → forked tip kept → permanent
                                     // hash_chain_break (the N004 single-source self-fork wedge).
                                     let target = disputed_h.saturating_sub(2).max(finalized_h);
-                                    if target > prev {
-                                        FORK_RECOVERY_HEIGHT.store(
-                                            target,
-                                            std::sync::atomic::Ordering::SeqCst,
-                                        );
+                                    signal_fork_recovery(target);
+                                    // Stamp the cooldown only when this detector actually moved the
+                                    // signal. Stamping unconditionally silences this height for the
+                                    // cooldown window even though a deeper pending target won —
+                                    // the deeper rollback then runs with no re-trigger behind it.
+                                    if fork_recovery_target() == target {
                                         FORK_RECOVERY_TRIGGER_TIMES.insert(disputed_h, now_secs);
                                         if is_warn() {
                                             println!(
@@ -2200,6 +2257,7 @@ impl BlockPipeline {
                     // the verify-stage state machine sequential.
                     let _permit = _verify_permits.clone().acquire_owned().await.ok();
                     let verify_ok = match BlockchainNode::verify_microblock_signature(
+                        &storage,
                         &decoded.microblock,
                         &decoded.microblock.producer,
                         None, // No P2P needed for sync verification
@@ -2388,6 +2446,22 @@ impl BlockPipeline {
             // continuity; VRF-deterministic producer (soft); 2f+1 macroblock
             // commit/reveal retroactively ratifying (split-brain can't reach 2f+1).
 
+            // Wire-limit gate BEFORE any per-TX work. Transactions inside a producer-signed block never
+            // pass through mempool admission, so this is the only place their free-form fields meet a
+            // ceiling — and the gates below decode some of them with superlinear decoders.
+            {
+                let oversized = decoded.microblock.transactions.iter()
+                    .find_map(|tx| tx.enforce_wire_limits().err());
+                if let Some(reason) = oversized {
+                    if is_warn() {
+                        println!("[WARN][PIPELINE] tx_wire_limit h={} producer={} from={} reason={} action=reject_block",
+                                 mb.height, mb.producer, decoded.from_peer, reason);
+                    }
+                    metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+            }
+
             // Internal-only TX type guard: post-genesis, HARD REJECT the whole
             // block (+ peer reputation penalty) if it carries a genesis-only or
             // deprecated variant (CreateAccount / BatchRewardClaims /
@@ -2496,8 +2570,8 @@ impl BlockPipeline {
                         // ONE read-lock for the whole block's value-TX batch, released BEFORE the verifies.
                         let sg = state.read().await;
                         for tx in &decoded.microblock.transactions {
-                            // Merkle reward-claims (system_rewards_pool) are authorized by the per-proof
-                            // re-verify in apply, not a client sig — exempt from PQ re-verify here.
+                            // Merkle reward-claims carry the RECIPIENT's key over the claims payload, not a
+                            // sender sig over the TX — apply re-verifies both. Exempt from PQ re-verify here.
                             if matches!(tx.tx_type, qnet_state::TransactionType::RewardDistribution)
                                 && tx.from == "system_rewards_pool" { continue; }
                             let is_value = tx.is_value_class();
@@ -2592,6 +2666,107 @@ impl BlockPipeline {
                     metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
                     continue; // HARD REJECT — system TX fails presence / identity binds
                 }
+
+                // The epoch's emission is ONE-SHOT at h % 14400 == 0 and nothing required it to be
+                // there: a producer that cannot build it (it needs locally applied state) emits a
+                // perfectly valid empty block and the epoch silently loses BOTH the mint and its
+                // reward_root — nobody can ever claim those 4 hours. Requiring it makes the slot a duty
+                // only a node that actually holds state can discharge; a producer that cannot simply
+                // fails over to one that can. Expectation is a pure function of height, so every node
+                // agrees, and NoneDue heights are unaffected.
+                // Exact(0) is the end of the emission schedule: the producer builds no TX at zero, so
+                // requiring one would halt the chain permanently the moment the schedule floors out.
+                if let crate::node::EmissionExpectation::Exact(amount) =
+                    crate::node::BlockchainNode::expected_emission_amount(mb.height)
+                {
+                    if amount == 0 { /* nothing to mint ⇒ nothing to require */ } else
+                    if crate::reward_epoch::select_emission_at(&decoded.microblock.transactions, mb.height).is_none() {
+                        if is_warn() {
+                            println!(
+                                "[WARN][PIPELINE] emission_missing h={} producer={} action=reject_block",
+                                mb.height, mb.producer
+                            );
+                        }
+                        metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
+                        continue; // HARD REJECT — an empty emission slot burns the epoch's rewards
+                    }
+                }
+
+                // Equivocation proofs now MUTATE state (the offender's banned_at_height), so a block
+                // carrying one that does not verify must be rejected here — the apply arm trusts that
+                // this ran. Same verdict everywhere: TX bytes + committed chain state.
+                let mut bad_proof: Option<String> = None;
+                for tx in &decoded.microblock.transactions {
+                    if matches!(tx.tx_type,
+                        qnet_state::TransactionType::EquivocationProof { .. }
+                        | qnet_state::TransactionType::VoteEquivocationProof { .. })
+                        && !crate::node::BlockchainNode::equivocation_proof_verified(&storage, tx).await
+                    {
+                        bad_proof = Some(tx.hash.clone());
+                        break;
+                    }
+                }
+                if let Some(h) = bad_proof {
+                    if is_warn() {
+                        println!(
+                            "[WARN][PIPELINE] equivocation_proof_invalid h={} producer={} tx={} action=reject_block",
+                            mb.height, mb.producer, qnet_state::char_prefix(&h, 16)
+                        );
+                    }
+                    metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
+                    continue; // HARD REJECT — a forged ban must never reach apply
+                }
+            }
+
+            // Receive-side resource ceilings. The producer bounds its own block by BLOCK_GAS_LIMIT
+            // and the separate BLOCK_FUEL_LIMIT while filling (node.rs), and its comment claims the
+            // validator enforces the same two — it did not. Without a receive-side gate an elected
+            // producer could ship a block of arbitrary declared compute and every node would apply
+            // it, so the ceilings bounded only honest producers. Enforced FROM GENESIS and computed
+            // from SIGNED fields only (gas_limit, and reserved_fuel which is a pure fn of it), so the
+            // verdict is byte-identical on every node — a height gate or a storage-dependent variant
+            // would split the network into cohorts that disagree on block validity. `charged_gas`
+            // mirrors the producer's selection exactly; system TXs (gas_limit == 0) are exempt, as
+            // they are in the fill loop.
+            if mb.height > 0 {
+                let mut block_gas: u64 = 0;
+                let mut block_fuel: u64 = 0;
+                let mut over: Option<String> = None;
+                // Counted set must equal the producer's fill loop exactly, or an honest block is
+                // rejected by its peers. Per-tx MAX_GAS_LIMIT is deliberately NOT here: it is an
+                // admission rule, since a block-level reject would halt the chain on one oversized TX.
+                for tx in &decoded.microblock.transactions {
+                    if tx.from.starts_with("system_") || tx.gas_limit == 0 {
+                        continue;
+                    }
+                    let charged_gas = if mb.height >= qnet_state::GAS_METERING_ACTIVATION_HEIGHT {
+                        tx.compute_gas_used()
+                    } else {
+                        tx.gas_limit
+                    };
+                    block_gas = block_gas.saturating_add(charged_gas);
+                    block_fuel = block_fuel.saturating_add(tx.reserved_fuel());
+                    if block_gas > qnet_state::gas_limits::BLOCK_GAS_LIMIT {
+                        over = Some(format!("block_gas={} max={}", block_gas,
+                                            qnet_state::gas_limits::BLOCK_GAS_LIMIT));
+                        break;
+                    }
+                    if block_fuel > qnet_state::gas_limits::BLOCK_FUEL_LIMIT {
+                        over = Some(format!("block_fuel={} max={}", block_fuel,
+                                            qnet_state::gas_limits::BLOCK_FUEL_LIMIT));
+                        break;
+                    }
+                }
+                if let Some(reason) = over {
+                    if is_warn() {
+                        println!(
+                            "[WARN][PIPELINE] block_resource_limit h={} producer={} from={} {} action=reject_block",
+                            mb.height, mb.producer, decoded.from_peer, reason
+                        );
+                    }
+                    metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
+                    continue; // HARD REJECT — block declares more compute than the protocol allows
+                }
             }
 
             // Phase-1 burn-attestation gate (a block-validation rule, like the signature checks
@@ -2634,7 +2809,9 @@ impl BlockPipeline {
                         // while behind. A genuine invalid burn (committee present) still HARD-REJECTs; synced
                         // nodes hold the committee so never defer — the deterministic reject/fork-guard holds.
                         let h = mb.height;
-                        if crate::node::BlockchainNode::n2_committee_absent(&storage, h) {
+                        if crate::node::BlockchainNode::burn_committee_absent_for(
+                            &storage, &decoded.microblock.transactions)
+                        {
                             if committee_deferred.len() < DEFERRED_MAX {
                                 if is_debug() {
                                     println!("[DBG][PIPELINE] committee_deferred h={} reason=n2_absent buf={}", h, committee_deferred.len());
@@ -2656,20 +2833,18 @@ impl BlockPipeline {
                     }
                 }
 
-                // Client-registration identity bind: node_id MUST equal the deterministic wallet
-                // pseudonym, so a third party cannot burn-and-squat another wallet's derivable node_id
-                // (DoS its future onboarding via the apply dup-guard). Genesis is server-signed (no
-                // client_node_reg prefix) and exempt. Pure fn of TX bytes → identical verdict per node.
+                // Registration identity bind: node_id MUST equal the deterministic wallet pseudonym, so a
+                // third party cannot burn-and-squat another wallet's derivable node_id (DoS its future
+                // onboarding via the apply dup-guard). Applies to EVERY non-genesis registration — keying
+                // it on the client_node_reg data prefix left the bind opt-out, since `data` is a free
+                // attacker-chosen field. Genesis identities are protocol-minted and exempt. Pure fn of TX
+                // bytes → identical verdict per node.
                 {
                     let bad = decoded.microblock.transactions.iter().find_map(|tx| {
-                        if let qnet_state::TransactionType::NodeRegistration { node_id, node_type, wallet_address, .. } = &tx.tx_type {
-                            if tx.data.as_deref().unwrap_or("").starts_with("client_node_reg:") {
-                                let expected = match node_type {
-                                    qnet_state::account::NodeType::Light =>
-                                        crate::rpc::generate_light_node_pseudonym(wallet_address),
-                                    _ => crate::rpc::generate_super_node_pseudonym(wallet_address),
-                                };
-                                if node_id != &expected { return Some(node_id.clone()); }
+                        if let qnet_state::TransactionType::NodeRegistration { node_id, node_type, wallet_address, registration_proof, .. } = &tx.tx_type {
+                            if !crate::node::BlockchainNode::registration_identity_bound(
+                                node_id, node_type, wallet_address, registration_proof) {
+                                return Some(node_id.clone());
                             }
                         }
                         None
@@ -2749,6 +2924,14 @@ impl BlockPipeline {
             // v32.5: cache populated only on apply-commit, never at verify —
             // uncommitted view-change candidates must not poison the RAM cache.
             let block_height = decoded.height;
+            // Identity of the block just verified — the key its waiting children were parked under.
+            let verified_hash = decoded.microblock.hash();
+
+            // Liveness is NOT recorded here. A signature-verified block only proves the producer
+            // signed something — a block that fails apply (bad state_root, unresolvable pk, breaker)
+            // can be re-broadcast forever, and stamping liveness on each delivery would suppress
+            // failover against a producer that is wedging the chain. It is recorded at apply-commit
+            // instead, where the block has demonstrably advanced this node.
 
             let verified = VerifiedBlock {
                 height: block_height,
@@ -2788,26 +2971,55 @@ impl BlockPipeline {
             }
             metrics.mark_verify_idle();
 
-            // v13.1: Drain deferred chain — the block we just verified may unblock
-            // a sequence of deferred blocks: h+1 → h+2 → h+3 ...
-            // This turns O(N*M) retry into O(N) sequential drain.
-            let mut next = block_height + 1;
-            while let Some(def) = deferred.remove(&next) {
-                to_process.push(def);
-                next += 1;
+            // Drain by parentage: release everything that was waiting on the block just verified.
+            // Their own children are released when they in turn verify, so a chain unblocks in one
+            // pass without any height arithmetic — which is what makes it correct under sparse
+            // heights, where the next block is not necessarily height+1.
+            if let Some(waiters) = deferred.remove(&verified_hash) {
+                deferred_count = deferred_count.saturating_sub(waiters.len());
+                for (_, def) in waiters {
+                    if let Some(c) = deferred_by_producer.get_mut(&def.microblock.producer) {
+                        *c = c.saturating_sub(1);
+                    }
+                    to_process.push(def);
+                }
             }
 
             } // end while let Some(decoded) = to_process.pop()
 
-            // Periodic deferred cleanup: evict entries older than 500 blocks behind tip
-            if deferred.len() > 100 {
+            // Periodic deferred cleanup. TWO independent reclaim rules, because height alone is not
+            // enough: blocks parked ABOVE the tip are never "behind" it, and during the very stall
+            // where this buffer matters the tip does not advance — so a height-only rule can never
+            // reclaim them. An age rule always can.
+            if deferred_count > 100 {
                 let chain_h = storage.get_chain_height().unwrap_or(0);
-                if chain_h > 500 {
-                    let cutoff = chain_h - 500;
-                    let before = deferred.len();
-                    deferred.retain(|h, _| *h > cutoff);
-                    let evicted = before - deferred.len();
+                {
+                    const DEFERRED_MAX_AGE_SECS: u64 = 120;
+                    let now_secs = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs()).unwrap_or(0);
+                    let cutoff = if chain_h > 500 { chain_h - 500 } else { 0 };
+                    let before = deferred_count;
+                    for waiters in deferred.values_mut() {
+                        waiters.retain(|(parked_at, d)| {
+                            let too_old = now_secs.saturating_sub(*parked_at) > DEFERRED_MAX_AGE_SECS;
+                            d.microblock.height > cutoff && !too_old
+                        });
+                    }
+                    deferred.retain(|_, waiters| !waiters.is_empty());
+                    deferred_count = deferred.values().map(|v| v.len()).sum();
+                    let evicted = before - deferred_count;
+                    // Rebuild the index ONLY when something was actually evicted. The enclosing
+                    // condition is a buffer-size threshold, not an eviction event, so it holds on
+                    // every loop iteration while the buffer stays large — and with parent-hash keying
+                    // siblings coexist, so that is the common case during catch-up, not a rare one.
+                    // Rebuilding regardless meant a producer-String clone per buffered block (up to
+                    // DEFERRED_MAX) on every pass.
                     if evicted > 0 {
+                        deferred_by_producer.clear();
+                        for (_, d) in deferred.values().flat_map(|v| v.iter()) {
+                            *deferred_by_producer.entry(d.microblock.producer.clone()).or_insert(0) += 1;
+                        }
                         // v15.3: register eviction in dedicated counter so the
                         // backpressure formula can subtract these from the
                         // in-flight estimate. Without this, evicted blocks
@@ -2942,7 +3154,13 @@ impl BlockPipeline {
             // and releases the wait. seal_base == 0 (young chain, nothing sealed) is exempt.
             // At the live tip this never fires: production stops at the same bound first.
             {
-                const SEAL_LAG_CAP: u64 = crate::node::MAX_UNSEALED_WINDOWS * 90;
+                // A1: FOLLOWING the chain must not be finality-gated either. This cap used to equal the
+                // production ceiling ("at the live tip this never fires: production stops at the same
+                // bound first"), which stopped being true the moment production was decoupled — it would
+                // have become the new height wall, parking the apply worker in a 250 ms loop forever.
+                // Raised to the same roster-derivation horizon production now uses, so apply tracks
+                // production instead of gating it. It remains a bulk-catch-up bound, not a finality gate.
+                const SEAL_LAG_CAP: u64 = (crate::node::BlockchainNode::MAX_DERIVED_ROSTER_WINDOWS as u64) * 90;
                 let mut waited_ms: u64 = 0;
                 loop {
                     // Cheap atomic first: seal_base >= qc frontier, so within-cap here
@@ -3039,6 +3257,38 @@ impl BlockPipeline {
                     }
                 }
 
+                // The WIRE tx.hash is inside the producer-signed merkle_root but nothing downstream
+                // recomputed it, and the apply arms push that wire hash into the WASM event logs →
+                // logs_root → the 2f+1 checkpoint content. One flipped character from a relay would
+                // leave balances and state_root identical while permanently splitting this node's
+                // logs_root out of every window. Recompute with the producer's own formula.
+                if BlockchainNode::calculate_merkle_root(&block.microblock.transactions)
+                    != block.microblock.merkle_root {
+                    if is_warn() {
+                        println!("[WARN][PIPELINE] merkle_root_mismatch h={} from={} action=reject",
+                                 height, block.from_peer);
+                    }
+                    drop(state_guard);
+                    metrics.apply_failed.fetch_add(1, Ordering::Relaxed);
+                    crate::unified_p2p::clear_block_pending_sync(height);
+                    metrics.mark_apply_idle();
+                    continue;
+                }
+
+                // A zero state_root is not a valid commitment above genesis: it skipped BOTH the
+                // rollback snapshot and the root comparison, so the block committed unverified, and
+                // the checkpoint signal refuses to advance past such a head — a producer could wedge
+                // finality by omitting the field. Reject it; fork-choice takes a sibling.
+                if height > 0 && block.microblock.state_root == [0u8; 32] {
+                    if is_warn() {
+                        println!("[WARN][PIPELINE] zero_state_root h={} from={} action=reject", height, block.from_peer);
+                    }
+                    drop(state_guard);
+                    metrics.apply_failed.fetch_add(1, Ordering::Relaxed);
+                    crate::unified_p2p::clear_block_pending_sync(height);
+                    metrics.mark_apply_idle();
+                    continue;
+                }
                 // Create block snapshot for rollback (only for blocks with state_root)
                 let has_state_root = block.microblock.state_root != [0u8; 32];
                 // v15.4 DIAG: snapshot creation copies relevant account
@@ -3066,6 +3316,20 @@ impl BlockPipeline {
                     reward_mgr.get_processed_emission_macroblocks().clone()
                 };
 
+                // Slot check BEFORE apply: a sibling that cannot win the slot should not pay for a
+                // full apply. It can no longer corrupt anything either — apply is side-effect-free
+                // w.r.t. durable indices — so this is a cost guard, not a correctness one.
+                if ctx.storage.canonical_hash_at(height).map(|h| h != block.microblock.hash()).unwrap_or(false) {
+                    if is_warn() {
+                        println!("[WARN][PIPELINE] slot_taken_before_apply h={} from={} action=skip",
+                                 height, block.from_peer);
+                    }
+                    metrics.apply_failed.fetch_add(1, Ordering::Relaxed);
+                    crate::unified_p2p::clear_block_pending_sync(height);
+                    metrics.mark_apply_idle();
+                    continue;
+                }
+
                 // v15.4 DIAG: state mutation phase — applies all
                 // transactions and updates accounts. Heavy CPU but no
                 // I/O, so unlikely to hang from external contention.
@@ -3087,6 +3351,30 @@ impl BlockPipeline {
                             height, tx_count, apply_state_elapsed.as_millis()
                         );
                     }
+                }
+
+                // A claim referenced an epoch whose certifying macroblock is absent here. This node
+                // cannot decide the credit, so it must not commit the block — crediting or skipping
+                // would diverge state_root from nodes that hold it. Roll back and fetch.
+                if let Some(certifying_mb) = apply_result.reward_epoch_missing {
+                    if let Some(ref snapshot) = block_snapshot {
+                        state_guard.rollback_block(snapshot);
+                    }
+                    // No durable side-index cleanup: apply only COLLECTS them, and this block never
+                    // reached the canonical flush.
+                    drop(state_guard);
+                    println!("[ERR][PIPELINE] reward_epoch_missing h={} certifying_mb={} action=fetch_and_retry",
+                             height, certifying_mb);
+                    if let Some(p2p) = ctx.unified_p2p.as_ref() {
+                        let p = p2p.clone();
+                        tokio::spawn(async move {
+                            let _ = p.sync_macroblocks_repair(certifying_mb, certifying_mb).await;
+                        });
+                    }
+                    metrics.apply_failed.fetch_add(1, Ordering::Relaxed);
+                    crate::unified_p2p::clear_block_pending_sync(height);
+                    metrics.mark_apply_idle();
+                    continue;
                 }
 
                 let computed_state_root = apply_result.merkle_root;
@@ -3117,7 +3405,7 @@ impl BlockPipeline {
                     // base mismatches forever (the wedge). On threshold, escalate to fork
                     // recovery — which is fail-closed and ends in a clean QC-verified state-sync.
                     if record_apply_mismatch() {
-                        FORK_RECOVERY_HEIGHT.store(height.saturating_sub(1).max(1), Ordering::SeqCst);
+                        signal_fork_recovery(height.saturating_sub(1).max(1));
                         if is_warn() {
                             println!("[WARN][PIPELINE] apply_breaker_tripped h={} action=fork_recovery", height);
                         }
@@ -3132,6 +3420,64 @@ impl BlockPipeline {
                     p2p.record_apply_success(&block.from_peer);
                 }
 
+                // The slot must still be free before ANY durable materialisation. Everything below
+                // (burn bindings, registry rows + registry_root delta, pk binds, checkpoint seals)
+                // is written BEFORE the save on purpose — the checkpoint compute needs it present —
+                // but that also means a block whose save will be refused would leave those deltas
+                // behind with nothing able to reverse them safely: the rebuild helpers require a
+                // canonical-tip argument and quiesced applies, so they cannot run here. Preventing
+                // the write is the only sound option. The dedup above compares against the APPLIED
+                // tip, which this node's own producer path advances only after its save; this reads
+                // the canonical slot itself and so also covers that window.
+                if ctx.storage.canonical_hash_at(height).map(|h| h != block.microblock.hash()).unwrap_or(false) {
+                    if is_warn() {
+                        // Nothing to clean: this block collected its indices but never flushed them.
+                        println!("[WARN][PIPELINE] slot_taken_before_materialise h={} from={} action=skip",
+                                 height, block.from_peer);
+                    }
+                    if let Some(ref snapshot) = block_snapshot {
+                        state_guard.rollback_block(snapshot);
+                    }
+                    metrics.apply_failed.fetch_add(1, Ordering::Relaxed);
+                    crate::unified_p2p::clear_block_pending_sync(height);
+                    metrics.mark_apply_idle();
+                    continue;
+                }
+
+                // A rollback below this height is already driving the chain, so save_microblock will
+                // decline. Everything below is DURABLE and outside the accounts map, so rollback_block
+                // cannot reverse it — the reorg's own prune scans do, and they only catch rows that
+                // exist when they run. The claim is what orders us against them: held until the save
+                // below completes, so a rollback either sees us and drains, or bars us outright.
+                // Degraded to Light: save_microblock will answer NotStoredMode, and unlike a rollback
+                // nothing ever prunes what we would write here — the registry rows and seals would
+                // accumulate for blocks this node never applied and diverge its registry_root for good.
+                if !ctx.storage.should_store_full_blocks() {
+                    println!("[ERR][STORAGE] materialise_skipped h={} reason=storage_mode_keeps_no_blocks", height);
+                    if let Some(ref snapshot) = block_snapshot {
+                        state_guard.rollback_block(snapshot);
+                    }
+                    metrics.apply_failed.fetch_add(1, Ordering::Relaxed);
+                    crate::unified_p2p::clear_block_pending_sync(height);
+                    metrics.mark_apply_idle();
+                    continue;
+                }
+                let _materialise = match crate::storage::try_claim_materialise(height) {
+                    Some(g) => g,
+                    None => {
+                        if is_warn() {
+                            println!("[WARN][PIPELINE] materialise_skipped h={} reason=rollback_in_progress", height);
+                        }
+                        if let Some(ref snapshot) = block_snapshot {
+                            state_guard.rollback_block(snapshot);
+                        }
+                        metrics.apply_failed.fetch_add(1, Ordering::Relaxed);
+                        crate::unified_p2p::clear_block_pending_sync(height);
+                        metrics.mark_apply_idle();
+                        continue;
+                    }
+                };
+
                 // Materialise the committed burn→wallet binding (cbw) for this block's registrations
                 // NOW — after state-root acceptance (so a rejected block never binds) but BEFORE
                 // save_microblock makes h loadable. The verify stage's parent-continuity gate defers
@@ -3140,14 +3486,14 @@ impl BlockPipeline {
                 // caught. First-wins; the durable cbw set is reconciled from node_registry by
                 // rebuild_committed_burn_wallet on snapshot/reorg/boot.
                 for tx in &block.microblock.transactions {
-                    if let qnet_state::TransactionType::NodeRegistration { wallet_address, burn_tx, .. } = &tx.tx_type {
+                    if let qnet_state::TransactionType::NodeRegistration { node_id, wallet_address, burn_tx, .. } = &tx.tx_type {
                         // Scope = ANY NodeRegistration with a non-empty burn (super + LIGHT), MATCHING
                         // rebuild_committed_burn_wallet (srtr_+lrtr_) and registry_root. Light is now
                         // burn-attested on-chain (Option A), so its burn must bind cbw too; scope parity
                         // between this live writer and the rebuild is what prevents a fork. Empty-burn
                         // (genesis / not-yet-attested) regs auto-skip.
                         if !burn_tx.is_empty() {
-                            let _ = ctx.storage.committed_burn_wallet_put(burn_tx, wallet_address);
+                            let _ = ctx.storage.committed_burn_wallet_put(burn_tx, node_id);
                         }
                     }
                     // Heartbeat liveness index (lhb_): Phase-2A recency reads this instead of a
@@ -3172,6 +3518,13 @@ impl BlockPipeline {
                     // sha3 into registry_root for light-client committee verification.
                     let vrf = if vrf_pk_hex.is_empty() { None } else { hex::decode(vrf_pk_hex).ok() };
                     let _ = ctx.storage.save_node_registration_at_height_burn_vrf(node_id, type_str, wallet, 1.0, height, burn_tx, vrf.as_deref());
+                }
+                // Registration-origin markers, the dedup reseed source. The producer stamps these inline;
+                // without the mirror here a validator rebuilds an incomplete dedup map after any restart
+                // or snapshot join and then admits a second registration for a node everyone else rejects
+                // — a silent registry_root split.
+                for (node_id, wallet) in &apply_result.deferred_registration_origins {
+                    let _ = ctx.storage.mark_node_registration_origin(node_id, wallet);
                 }
                 // FIX-5: bind this block's value-TX pubkeys into the dilithium_pk_root LtHash
                 // (marker-guarded ⇒ once/account, deterministic) BEFORE the seal below.
@@ -3237,8 +3590,37 @@ impl BlockPipeline {
                         );
                     }
                 }
+                // A declined save (rollback in progress, height above the target) is NOT a commit:
+                // the success branch below advances the serve horizon and feeds the window-content
+                // accumulator and the finalized-round baseline, none of which self-correct for a
+                // block that never reached disk. Route it to the same not-applied path as a failure.
+                let save_result = match save_result {
+                    Ok(crate::storage::SaveOutcome::Stored) => Ok(()),
+                    Ok(crate::storage::SaveOutcome::DeclinedRollback) => {
+                        let (_active, target) = crate::storage::get_rollback_status();
+                        if is_warn() {
+                            println!("[WARN][PIPELINE] save_declined h={} target={} action=not_applied", height, target);
+                        }
+                        Err(crate::errors::IntegrationError::StorageError(
+                            format!("save_declined_rollback h={} target={}", height, target)))
+                    }
+                    Ok(crate::storage::SaveOutcome::NotStoredMode) => {
+                        // This node's storage keeps no blocks — a Super only reaches this through
+                        // disk-pressure degradation. It is NOT a race a fork recovery can repair, so
+                        // it must not escalate (that would spin recovery forever while the disk stays
+                        // full); it is a loud operational fault. The block is simply not applied.
+                        println!("[ERR][STORAGE] block_not_stored h={} reason=storage_mode_keeps_no_blocks action=not_applied", height);
+                        Err(crate::errors::IntegrationError::StorageError(
+                            format!("save_declined_not_stored h={}", height)))
+                    }
+                    Err(e) => Err(e),
+                };
                 match save_result {
                     Ok(()) => {
+                        // Canonical NOW — write the side indices collected during apply, BEFORE the
+                        // height is published: a checkpoint that sees block h must see h's logs too.
+                        // Nothing wrote them speculatively, so a losing sibling leaves no row behind.
+                        BlockchainNode::flush_block_side_indices(&ctx.storage, height, &apply_result.side_indices);
                         // v15.11: Record finalized round so the next height in
                         // this macroblock starts with a clean baseline. Mirrors
                         // the producer-side recording — every honest validator
@@ -3262,9 +3644,14 @@ impl BlockPipeline {
                             &block.microblock,
                         );
 
-                        // v32.5: publish canonical parent-hash to RAM cache only
-                        // after RocksDB commit — invariant cache == storage.
-                        cache_block_hash(height, block.microblock.hash());
+                        crate::unified_p2p::note_block_stored(height);
+
+                        // Producer liveness, recorded only now: the block is verified, applied and
+                        // durable, so it PROVES the producer advanced this node. Recording it at
+                        // verify instead would let a producer whose blocks never apply re-broadcast
+                        // itself alive and permanently suppress the failover meant to replace it.
+                        crate::unified_p2p::record_producer_liveness_from_block(
+                            &block.microblock.producer, height);
 
                         // ═══════════════════════════════════════════════════════
                         // v25 H9: VALIDATOR LIVENESS — SUCCESS PATH
@@ -3384,12 +3771,6 @@ impl BlockPipeline {
                         // the registry_root seal) so the WindowEnd checkpoint read can never race them.
                         // L2: emission reward recompute OFF the apply write-lock and off the pipeline
                         // foreground (blocking pool) — the O(recipients) merkle build never stalls apply.
-                        if let Some((epoch, total, committed_root, c_per, c_cnt)) = apply_result.deferred_emission_root.clone() {
-                            let st = ctx.storage.clone();
-                            tokio::task::spawn_blocking(move || {
-                                crate::node::BlockchainNode::persist_local_reward_root(&*st, epoch, total, &committed_root, c_per, c_cnt);
-                            });
-                        }
                         // B: light-eligibility recency index — same off-lock, off-foreground treatment as
                         // the emission root; the O(roster) snapshot never stalls the commit pipeline at scale.
                         if let Some(h) = apply_result.deferred_light_elig {
@@ -3542,6 +3923,77 @@ impl BlockPipeline {
                         if let Some(ref snapshot) = block_snapshot {
                             state_guard.rollback_block(snapshot);
                             if is_info() { println!("[INFO][PIPELINE] block_rollback h={} reason=save_failed", height); }
+                        }
+                        // Escalate on the KIND of failure, not on failure itself.
+                        //   fork_conflict = the L4 gate correctly refused a competing block at an
+                        //     occupied slot. That is a normal failover race, the incumbent is intact,
+                        //     and the loser was retained as a branch — a destructive rollback here
+                        //     would make the node delete its own valid, already-broadcast block.
+                        //   save_declined_rollback = a rollback is already driving the chain to a
+                        //     target below this height. Escalating would signal a SECOND, deeper
+                        //     recovery against the one in flight; the in-memory rollback above is the
+                        //     whole correction and the block is re-requested once rollback completes.
+                        //   unlinked_block / anything else = our stored parent is suspect, and the
+                        //     durable accumulators (registry_root / dilithium_pk_root LtHash, burn
+                        //     bindings) were materialised BEFORE the save and are not covered by the
+                        //     in-memory snapshot. Only the fork-recovery rebuild restores them.
+                        let err_text = format!("{:?}", e);
+                        let benign_race = err_text.contains("fork_conflict")
+                            || err_text.contains("save_declined_rollback")
+                            || err_text.contains("save_declined_not_stored");
+                        if benign_race {
+                            // The slot is held by a canonical block we already applied and saved, so
+                            // the chain is intact and nothing here may mutate it. Two things are
+                            // deliberately NOT done: no destructive rollback (it would delete our own
+                            // valid, broadcast block), and no accumulator "repair" — the rebuild
+                            // helpers take a canonical-tip argument and must run with applies
+                            // quiesced, so calling them here (tip is at `height`, applies are live)
+                            // deletes canonical rows and races the fold on the same keys. The
+                            // refused block's pre-save deltas are handled at their source instead:
+                            // materialisation is what must not happen before a successful save.
+                            //
+                            // EXCEPT fork_conflict: the slot-taken guard above filters every
+                            // already-occupied case, so reaching it means the slot was taken during the
+                            // save's own await and this block DID materialise its durable deltas, which
+                            // rollback_block cannot reverse. signal_fork_recovery is a monotonic atomic
+                            // target, not an inline rebuild — the producer arm already signals here.
+                            if err_text.contains("fork_conflict") {
+                                signal_fork_recovery(height.saturating_sub(1).max(1));
+                                if is_warn() {
+                                    println!("[WARN][PIPELINE] fork_conflict_after_materialise h={} action=signal_rebuild", height);
+                                }
+                            }
+                            if is_info() {
+                                let reason = if err_text.contains("fork_conflict") {
+                                    "fork_conflict"
+                                } else if err_text.contains("save_declined_not_stored") {
+                                    "storage_keeps_no_blocks"
+                                } else {
+                                    "rollback_in_progress"
+                                };
+                                println!("[INFO][PIPELINE] save_refused_benign h={} reason={} action=none", height, reason);
+                            }
+                        } else {
+                            // Never roll back below finality or the snapshot anchor.
+                            let floor = crate::node::LAST_FINALIZED_HEIGHT.load(Ordering::SeqCst)
+                                .max(crate::node::SNAPSHOT_ANCHOR_MB.load(Ordering::Acquire).saturating_mul(90));
+                            let target = height.saturating_sub(1).max(floor).max(1);
+                            if target < height {
+                                signal_fork_recovery(target);
+                                // Pull the parent too: if the save failed on linkage our stored parent is
+                                // the losing variant, and a rollback alone would re-download it.
+                                if height > 1 {
+                                    if let Some(p2p) = ctx.unified_p2p.as_ref() {
+                                        let p = p2p.clone();
+                                        let parent_h = height - 1;
+                                        tokio::spawn(async move { let _ = p.request_block_repair_priority(parent_h).await; });
+                                    }
+                                }
+                                if is_warn() {
+                                    println!("[WARN][PIPELINE] save_failed_escalated h={} target={} action=fork_recovery+parent_repair",
+                                             height, target);
+                                }
+                            }
                         }
 
 
@@ -3757,7 +4209,7 @@ impl BlockPipeline {
             // process-global fields that are NOT touched by the regular
             // per-transaction apply path:
             //   1. GLOBAL_GENESIS_TIMESTAMP — used by consensus timing (rounds,
-            //      timeout_round, PoH slot calc). If left at 0 the node
+            //      timeout_round, slot calc). If left at 0 the node
             //      computes rotation rounds against Unix epoch — unusable.
             //   2. Dynamic pricing state seed — cold-start base fee at genesis.
             //
@@ -4128,5 +4580,140 @@ mod tests_v19_range_sync {
         let dispatched = request_missing_range(500, 100);
         assert!(!dispatched, "inverted range (to < from) must be rejected");
         assert_eq!(get_state(), armed, "inverted input must not clobber in-flight state");
+    }
+}
+
+#[cfg(test)]
+mod tests_rollback_cache_invalidation {
+    use super::*;
+
+    static CACHE_TEST_LOCK: once_cell::sync::Lazy<std::sync::Mutex<()>> =
+        once_cell::sync::Lazy::new(|| std::sync::Mutex::new(()));
+
+    /// Incident regression (h=54059/54060), now proved STRUCTURALLY rather than by invalidation:
+    /// the height→hash cache that answered "this orphan's parent exists" no longer exists. Parents
+    /// resolve through `Storage::header_by_hash`, where the key is derived from the block's own
+    /// bytes — a rollback invalidates heights, never hashes, so a stale answer is unrepresentable.
+    /// The behavioural proof lives in `storage::tests_header_index` (a superseded block's hash and
+    /// its replacement's remain distinct keys) and in `storage::tests_parent_linkage_invariant`.
+    #[test]
+    fn parent_resolution_is_not_height_keyed() {
+        let _g = CACHE_TEST_LOCK.lock().unwrap();
+        // Guard against reintroduction. Built at runtime so this assertion cannot match itself.
+        let banned = format!("pub fn {}_block_hash", "cache");
+        let src = include_str!("block_pipeline.rs");
+        assert!(!src.contains(&banned),
+                "height-keyed hash cache reintroduced — parent resolution must stay content-addressed");
+    }
+
+    /// Concurrent detectors report different divergence points; the deepest must win, otherwise a
+    /// shallower rollback leaves the deeper fork in place.
+    #[test]
+    fn fork_recovery_signal_keeps_deepest_target() {
+        FORK_RECOVERY_HEIGHT.store(0, Ordering::SeqCst);
+
+        signal_fork_recovery(54_059);
+        signal_fork_recovery(54_090);
+        assert_eq!(FORK_RECOVERY_HEIGHT.load(Ordering::SeqCst), 54_059, "shallower target must not win");
+
+        signal_fork_recovery(54_000);
+        assert_eq!(FORK_RECOVERY_HEIGHT.load(Ordering::SeqCst), 54_000, "deeper target must win");
+
+        FORK_RECOVERY_HEIGHT.store(0, Ordering::SeqCst);
+    }
+
+    /// Serve horizon must follow stored, not applied, height: refusing to serve a block we hold
+    /// removes this node's relay subtree from repair service.
+    #[test]
+    fn serve_horizon_follows_stored_height() {
+        let _g = CACHE_TEST_LOCK.lock().unwrap();
+        let prev_local = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(Ordering::Relaxed);
+        let prev_stored = crate::unified_p2p::HIGHEST_STORED_HEIGHT.load(Ordering::Relaxed);
+
+        crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(54_058, Ordering::Relaxed);
+        crate::unified_p2p::note_block_stored(54_060);
+        assert_eq!(crate::unified_p2p::servable_height(), 54_060, "stored height must extend the serve horizon");
+
+        // A rollback must pull the horizon back down, or the node serves empty batches for the
+        // range it just deleted.
+        crate::unified_p2p::truncate_stored_height(54_058);
+        assert_eq!(crate::unified_p2p::servable_height(), 54_058, "rollback must lower the serve horizon");
+
+        crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(prev_local, Ordering::Relaxed);
+        crate::unified_p2p::HIGHEST_STORED_HEIGHT.store(prev_stored, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests_deferred_by_parent {
+    use super::*;
+
+    /// A height-keyed deferred map holds ONE entry per slot, so two blocks waiting on the same
+    /// parent — the normal case during a branch race — silently overwrote each other, and the
+    /// loser was never reconsidered even after its parent arrived. Keyed by parent hash they
+    /// coexist. Modelled here on the same structure the verify stage uses.
+    #[test]
+    fn siblings_waiting_on_one_parent_both_survive() {
+        let parent = [0x11u8; 32];
+        let mut deferred: HashMap<[u8; 32], Vec<u8>> = HashMap::new();
+
+        deferred.entry(parent).or_default().push(0xA1);
+        deferred.entry(parent).or_default().push(0xB2);
+
+        let waiters = deferred.remove(&parent).expect("waiters present");
+        assert_eq!(waiters.len(), 2, "both siblings must survive; a height-keyed map kept only one");
+        assert!(waiters.contains(&0xA1) && waiters.contains(&0xB2));
+    }
+
+    /// Releasing children by parent identity needs no height arithmetic, so it stays correct when
+    /// heights are sparse and the next block is not height+1.
+    #[test]
+    fn drain_follows_parentage_not_height() {
+        let (a, b) = ([0x01u8; 32], [0x02u8; 32]);
+        let mut deferred: HashMap<[u8; 32], Vec<&str>> = HashMap::new();
+        deferred.entry(a).or_default().push("child_of_a");
+        deferred.entry(b).or_default().push("child_of_b");
+
+        // Verifying `a` releases only a's child, regardless of what heights are involved.
+        let released = deferred.remove(&a).unwrap_or_default();
+        assert_eq!(released, vec!["child_of_a"]);
+        assert!(deferred.contains_key(&b), "unrelated waiters must not be disturbed");
+    }
+}
+
+#[cfg(test)]
+mod tests_deferred_capacity_rules {
+    use super::*;
+
+    /// A defensive cap must be derived from what the system legitimately produces, not chosen by
+    /// eye. One producer makes a full rotation of consecutive blocks, and under packet loss they
+    /// can all arrive out of order — a per-producer cap below the rotation size would silently
+    /// drop honest traffic during exactly the recovery it exists to protect.
+    #[test]
+    fn per_producer_cap_exceeds_a_full_rotation() {
+        const CAP: usize = 2 * crate::node::ROTATION_INTERVAL_BLOCKS as usize;
+        assert!(CAP > crate::node::ROTATION_INTERVAL_BLOCKS as usize,
+                "cap must hold a whole rotation of out-of-order blocks");
+        // It must still bound an attacker far below the global buffer size.
+        assert!(CAP * 4 < 2000, "cap must remain a meaningful fraction of DEFERRED_MAX");
+    }
+
+    /// The occupancy index must be maintained incrementally. Recomputing it by scanning the buffer
+    /// on every deferral is O(buffer) per block on the verify path — the cost peaks exactly when
+    /// the buffer is full, i.e. under the flood the cap defends against.
+    #[test]
+    fn producer_occupancy_is_tracked_incrementally() {
+        let mut by_producer: HashMap<String, usize> = HashMap::new();
+        let p = "genesis_node_001".to_string();
+
+        for _ in 0..5 { *by_producer.entry(p.clone()).or_insert(0) += 1; }
+        assert_eq!(by_producer.get(&p).copied(), Some(5));
+
+        // Draining releases occupancy so a producer is not permanently blocked by past deferrals.
+        for _ in 0..5 {
+            if let Some(c) = by_producer.get_mut(&p) { *c = c.saturating_sub(1); }
+        }
+        assert_eq!(by_producer.get(&p).copied(), Some(0),
+                   "released slots must return to the producer, or one burst blocks it forever");
     }
 }

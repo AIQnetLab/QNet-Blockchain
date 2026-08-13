@@ -3,7 +3,7 @@ name = "qnet-loadtest"
 version = "0.1.0"
 edition = "2021"
 description = "QNet external load-test harness: real /transaction confirmed-TPS + finality-latency measurement"
-license = "MIT"
+license = "BUSL-1.1"
 
 [[bin]]
 name = "qnet-loadtest"

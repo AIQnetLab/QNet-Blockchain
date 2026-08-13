@@ -226,6 +226,9 @@ pub async fn apply_genesis_state(
     crate::node::BlockchainNode::cache_node_registrations_from_transactions(
         storage, &block.transactions,
     );
+    // Stamp reg_height=0 + vrf too: an unstamped row is invisible to registry_root, and this loader
+    // runs at construction — every later stamping site is gated off by the state it just created.
+    crate::node::BlockchainNode::apply_genesis_registrations(storage, &block.transactions);
 
     if is_info() {
         println!("[INFO][GENESIS] registrations_cached txs={}", block.transactions.len());
@@ -306,11 +309,18 @@ async fn load_from_file(
     }
 
     // Save to storage for future use
-    if let Err(e) = storage.save_microblock(0, &data) {
-        if is_warn() {
-            println!("[WARN][GENESIS] save_to_storage_failed err={}", e);
+    // Not fatal — the block is in memory — but a non-write must still be visible: it means this
+    // node will not have genesis on disk after a restart.
+    match storage.save_microblock(0, &data) {
+        Ok(crate::storage::SaveOutcome::Stored) => {}
+        Ok(other) => {
+            println!("[ERR][GENESIS] save_to_storage_not_stored outcome={:?}", other);
         }
-        // Not fatal — we have the block in memory
+        Err(e) => {
+            if is_warn() {
+                println!("[WARN][GENESIS] save_to_storage_failed err={}", e);
+            }
+        }
     }
 
     Ok(Some(block))
@@ -419,9 +429,15 @@ async fn load_from_http(
         }
 
         // Save to storage
-        if let Err(e) = storage.save_microblock(0, &data) {
-            if is_warn() {
-                println!("[WARN][GENESIS] http_save_failed ip={} err={}", ip, e);
+        match storage.save_microblock(0, &data) {
+            Ok(crate::storage::SaveOutcome::Stored) => {}
+            Ok(other) => {
+                println!("[ERR][GENESIS] http_save_not_stored ip={} outcome={:?}", ip, other);
+            }
+            Err(e) => {
+                if is_warn() {
+                    println!("[WARN][GENESIS] http_save_failed ip={} err={}", ip, e);
+                }
             }
         }
 

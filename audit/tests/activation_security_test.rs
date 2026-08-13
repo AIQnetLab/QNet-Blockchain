@@ -5,6 +5,15 @@ use qnet_integration::storage::Storage;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 
+/// QNET_ACTIVATION_CODE and HOSTNAME are PROCESS-global, and cargo runs these tests on parallel
+/// threads in one binary — one test's set_var/remove_var decrypts another's storage with the wrong
+/// key. Every test that touches those vars takes this lock first.
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+    ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn get_test_timestamp() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -14,6 +23,7 @@ fn get_test_timestamp() -> u64 {
 
 #[test]
 fn test_aes256_encryption_no_key_in_db() {
+    let _env = env_guard();
     println!("\n=== AES-256-GCM ENCRYPTION TEST ===");
     
     let temp_dir = TempDir::new().unwrap();
@@ -63,6 +73,7 @@ fn test_aes256_encryption_no_key_in_db() {
 
 #[test]
 fn test_genesis_code_encryption() {
+    let _env = env_guard();
     println!("\n=== GENESIS CODE ENCRYPTION TEST ===");
     
     let temp_dir = TempDir::new().unwrap();
@@ -105,6 +116,7 @@ fn test_genesis_code_encryption() {
 
 #[test]
 fn test_database_theft_protection() {
+    let _env = env_guard();
     println!("\n=== DATABASE THEFT PROTECTION TEST ===");
     
     let temp_dir = TempDir::new().unwrap();
@@ -151,6 +163,7 @@ fn test_database_theft_protection() {
 
 #[test]
 fn test_device_migration_detection() {
+    let _env = env_guard();
     println!("\n=== DEVICE MIGRATION DETECTION TEST ===");
     
     let temp_dir = TempDir::new().unwrap();
@@ -197,6 +210,7 @@ fn test_device_migration_detection() {
 
 #[test]
 fn test_migration_with_rate_limit() {
+    let _env = env_guard();
     println!("\n=== DEVICE MIGRATION RATE LIMIT TEST ===");
     
     // This tests that migration tracking works through blockchain registry
@@ -216,6 +230,7 @@ fn test_migration_with_rate_limit() {
 
 #[test]
 fn test_wallet_immutability() {
+    let _env = env_guard();
     println!("\n=== WALLET IMMUTABILITY TEST ===");
     
     println!("Testing wallet extraction from activation code:");
@@ -239,6 +254,7 @@ fn test_wallet_immutability() {
 
 #[test]
 fn test_pseudonym_no_double_conversion() {
+    let _env = env_guard();
     println!("\n=== PSEUDONYM DOUBLE-CONVERSION PREVENTION TEST ===");
     
     // Test that genesis_node_XXX stays genesis_node_XXX (not converted to node_XXXX)
@@ -270,6 +286,7 @@ fn test_pseudonym_no_double_conversion() {
 
 #[test]
 fn test_first_microblock_grace_period() {
+    let _env = env_guard();
     println!("\n=== FIRST MICROBLOCK GRACE PERIOD TEST ===");
     
     // Test that block #1 gets 15s grace, others get 5s
@@ -295,6 +312,7 @@ fn test_first_microblock_grace_period() {
 
 #[test]
 fn test_security_summary() {
+    let _env = env_guard();
     println!("\n============================================================");
     println!("ACTIVATION SECURITY AUDIT SUMMARY");
     println!("============================================================");

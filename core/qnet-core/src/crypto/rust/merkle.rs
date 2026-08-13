@@ -1610,20 +1610,33 @@ mod tests {
         }
     }
     
+    /// 100K leaves = the target super-node count. The guard is on SCALING, not on wall-clock: both
+    /// measurements take the same machine load, so their RATIO stays meaningful where an absolute
+    /// deadline just fails whenever the box is busy. 4x the input must not cost 10x the time —
+    /// comfortably true for O(n log n), impossible for an accidental O(n^2), which would be ~16x.
     #[test]
     fn test_large_tree_100k() {
-        // Test with 100K elements (simulating 100K nodes)
-        let hashes: Vec<String> = (0..100_000)
-            .map(|i| format!("{:064x}", i))
-            .collect();
-        
-        let start = std::time::Instant::now();
-        let result = compute_merkle_root(&hashes).unwrap();
-        let duration = start.elapsed();
-        
-        println!("100K elements Merkle root computed in {:?}", duration);
-        assert!(!result.is_empty());
-        assert!(duration.as_millis() < 1000); // Should be under 1 second
+        let mk = |n: usize| -> Vec<String> { (0..n).map(|i| format!("{:064x}", i)).collect() };
+        let time_it = |hashes: &[String]| -> (String, std::time::Duration) {
+            let start = std::time::Instant::now();
+            let root = compute_merkle_root(hashes).unwrap();
+            (root, start.elapsed())
+        };
+
+        let (small_root, small) = time_it(&mk(25_000));
+        let (root, large) = time_it(&mk(100_000));
+        println!("merkle 25K={:?} 100K={:?}", small, large);
+
+        assert!(!root.is_empty());
+        assert!(!small_root.is_empty());
+        assert_eq!(root, compute_merkle_root(&mk(100_000)).unwrap(), "root must be deterministic");
+
+        // Guard against a division by ~0 on a very fast machine before comparing.
+        if small.as_micros() > 500 {
+            assert!(large.as_micros() < small.as_micros() * 10,
+                    "4x the leaves cost {}x the time (25K={:?}, 100K={:?}) - superlinear regression",
+                    large.as_micros() / small.as_micros().max(1), small, large);
+        }
     }
     
     #[test]

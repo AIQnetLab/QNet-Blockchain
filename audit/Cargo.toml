@@ -68,22 +68,8 @@ name = "consensus_scalability"
 path = "tests/consensus_scalability_tests.rs"
 
 [[test]]
-name = "critical_attacks"
-path = "tests/critical_attacks_test.rs"
-
-[[test]]
 name = "activation_security"
 path = "tests/activation_security_test.rs"
-
-[[bench]]
-name = "storage_benchmarks"
-harness = false
-path = "01_storage/benchmarks.rs"
-
-[[bench]]
-name = "reputation_benchmarks"
-harness = false
-path = "02_reputation/benchmarks.rs"
 
 # NOTE: Profiles moved to workspace root Cargo.toml
 # Profiles in non-root packages are ignored by Cargo

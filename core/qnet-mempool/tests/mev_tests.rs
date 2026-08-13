@@ -184,7 +184,7 @@ async fn test_bundle_priority_queue() {
     
     let public_pool = create_test_mempool();
     let config = BundleAllocationConfig::default();
-    let mev_pool = MevProtectedMempool::new(public_pool, config);
+    let _mev_pool = MevProtectedMempool::new(public_pool, config);
     
     // Test: Higher gas bundles should have priority
     let mut high_gas_bundle = create_test_bundle(2);

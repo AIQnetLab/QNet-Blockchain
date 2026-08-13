@@ -11,8 +11,8 @@
  * (the static 5-node committee), identical to having no checkpoint.
  *
  * Keep these BYTE-IDENTICAL to genesis_constants.rs or the verifier false-rejects
- * (it checks served committee pubkeys against the QC-signed registry_root, and the
- * genesis committee against these embedded keys).
+ * (it binds served committee pubkeys to the registry_root of the ALREADY-VERIFIED
+ * M-2 checkpoint, and the genesis committee to these embedded keys).
  */
 
 // node_id → consensus PK (hex, 1952-byte ML-DSA-65 / FIPS-204). Mirror of
@@ -33,8 +33,20 @@ export const GENESIS_ERA_MAX_INDEX = 3; // index < 3 ⇒ genesis era
 export const GENESIS_NODE_IDS = Object.keys(GENESIS_CONSENSUS_PKS);
 
 // Weak-subjectivity pin = (macroblock index, MacroBlock::hash). Mirror of
-// genesis_constants.rs WS_CHECKPOINT. (0, zeros) = INERT → anchor is genesis.
+// genesis_constants.rs WS_CHECKPOINT. (0, zeros) = INERT → the walk is genesis-rooted.
+//
+// A NON-ZERO pin bounds the walk on a mature chain: instead of walking every macroblock from genesis,
+// the device roots at K. Committee(j) derives from eligible+beacon of j-2 and its pubkeys bind to
+// registry_root of j-2, so rooting BOTH parity chains needs the derivation data of K *and* K-1 —
+// exactly the pair the node pins via WS_CHECKPOINT_DIGEST_ANCHOR / _PRED.
+//
+// `anchors` therefore MUST carry both K and K-1 whenever index > 0; the verifier fails closed
+// otherwise (a half-filled pin would silently root only one parity). Keep byte-identical to the node:
+//   eligible_raw  = hex of the macroblock's consensus_data.eligible_producers (bincode Vec)
+//   beacon        = hex of consensus_data.randomness_beacon
+//   registry_root = hex of the certified Checkpoint.registry_root at that index
 export const WS_CHECKPOINT = {
   index: 0,
   hash: '0000000000000000000000000000000000000000000000000000000000000000',
+  anchors: {},
 };

@@ -84,8 +84,9 @@ impl StateDB {
                     heartbeat_epoch: 0,
                     heartbeat_slots: 0,
                     heartbeat_final_epoch: 0,
-                    heartbeat_final_count: 0,
+                    heartbeat_final_slots: 0,
                     last_claimed_epoch: 0,
+            banned_at_height: 0,
                     storage_root: [0u8; 32], // inert: legacy is_contract=false apply path
                     dilithium_public_key: None, // FIX-5: bound at apply via the pk-persist hook, not this legacy ctor
                 }
@@ -153,8 +154,9 @@ impl StateDB {
                     heartbeat_epoch: 0,
                     heartbeat_slots: 0,
                     heartbeat_final_epoch: 0,
-                    heartbeat_final_count: 0,
+                    heartbeat_final_slots: 0,
                     last_claimed_epoch: 0,
+            banned_at_height: 0,
                     storage_root: [0u8; 32], // inert: legacy is_contract=false apply path
                     dilithium_public_key: None, // FIX-5: bound at apply via the pk-persist hook, not this legacy ctor
                 }

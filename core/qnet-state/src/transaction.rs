@@ -125,6 +125,12 @@ pub fn is_valid_sender_format(sender: &str) -> bool {
 /// Returns true ONLY for fully valid checksummed addresses. Invalid format,
 /// wrong length, or bad checksum all return false.
 fn is_valid_eon_address(addr: &str) -> bool {
+    // ASCII first: every slice below is by BYTE, and `addr` is peer-supplied UTF-8. A 45-byte string
+    // with a multi-byte char passes the length check and then panics on a non-boundary slice — and the
+    // workspace builds with panic="abort", so one gossiped TX kills the process.
+    if !addr.is_ascii() {
+        return false;
+    }
     if addr.len() != 45 {
         return false;
     }
@@ -155,6 +161,7 @@ fn is_debug_log() -> bool {
 
 /// QNet native transaction fee units (OPTIMIZED for mobile)
 pub const QNC_DECIMALS: u8 = 9; // 1 QNC = 10^9 smallest units (nanoQNC)
+pub const NANO_PER_QNC: u64 = 1_000_000_000;
 pub const BASE_FEE_NANO_QNC: u64 = 100_000; // 0.0001 QNC base fee (5x cheaper!)
 pub const PRIORITY_MULTIPLIER: u64 = 10; // 10x for priority transactions
 
@@ -412,11 +419,32 @@ pub enum TransactionType {
         /// Phase-1 proof-of-burn carrier. The external Solana 1DEV burn is non-deterministic (live
         /// RPC) and cannot be re-checked in apply, so the burn fact is brought ON-CHAIN as a committee
         /// quorum: `burn_attestors` carries ≥2f+1 distinct committee Dilithium signatures over
-        /// `burn_attestation_message(burn_tx, wallet_address, burn_amount, node_type, burn_cost, attest_epoch)`,
+        /// `burn_attestation_message(burn_tx, burn_wallet, wallet_address, burn_amount, node_type, burn_cost, attest_epoch)`,
         /// re-verified from these bytes at block validation (deterministic, snapshot-independent).
         /// Empty for genesis identities (registration_proof=="genesis") and when the gate is inactive.
         #[serde(default)]
         burn_tx: String,
+        /// Solana address the 1DEV burn came FROM. Attested (it is inside the 2f+1-signed message, and
+        /// each attestor writes the address it verified on Solana, never one supplied by the caller),
+        /// so block validation can check that `wallet_address` is derived from it. Without this the
+        /// beneficiary wallet was bound to nothing: anyone could register under another wallet's
+        /// derived pseudonym. Empty for genesis identities.
+        #[serde(default)]
+        burn_wallet: String,
+        /// Ed25519 signature by `burn_wallet` over `burn_owner_bind_message(..)` — the burner's
+        /// authorization of THIS beneficiary. The burn is the only Sybil cost, so the burner is the
+        /// authority on who it activates: without this a public burn_tx could be front-run and its
+        /// beneficiary set to any wallet. Hex, 64 bytes. Empty for genesis identities.
+        #[serde(default)]
+        burn_owner_sig: String,
+        /// The node's consensus / VRF public key (RAW ML-DSA-65, 1952 B; empty for Light, which never
+        /// signs consensus). It lives HERE, inside the hashed body, and not in the envelope
+        /// `dilithium_public_key` — the envelope fields are elided from the TX hash, so carrying the
+        /// consensus identity there let anyone relaying the TX swap it without changing the hash. The
+        /// envelope now carries the WALLET key, whose binding to `wallet_address` is what proves the
+        /// registrant owns the beneficiary.
+        #[serde(default)]
+        vrf_pk: Vec<u8>,
         #[serde(default)]
         burn_amount: u64,
         /// Required Phase-1 cost the committee attested (whole 1DEV). Carried so the verifier rebuilds
@@ -518,13 +546,13 @@ pub enum TransactionType {
     /// backfilled into immutable past blocks); the sender's per-epoch subwindow bitmask in
     /// account-state increments on apply. Reward eligibility = popcount(bitmask) >= 9.
     /// `from` (Transaction.from) = node wallet (the account whose counter increments);
-    /// `node_id` = consensus pseudonym for PK lookup. The Dilithium `signature` is verified at
-    /// block validation against the node's registry PK (apply trusts validated blocks).
+    /// `node_id` = consensus pseudonym for PK lookup. The authenticator is the standard
+    /// `Transaction.dilithium_signature` envelope over QNET_HEARTBEAT:node_id:anchor_height:anchor_hash,
+    /// verified at block validation against the node's registry PK (apply trusts validated blocks).
     Heartbeat {
         node_id: String,        // genesis_node_00X / super_xxx — consensus identity (PK lookup)
         anchor_height: u64,     // recent block height: epoch = /14400, subwindow = (%14400)/1440
         anchor_hash: String,    // canonical hash of block at anchor_height (hex) — anti-pre-sign
-        signature: String,      // Dilithium sig by node over node_id:anchor_height:anchor_hash
     },
 
     /// PRODUCTION v2.89: Light Node Eligibility Bitmap
@@ -552,7 +580,7 @@ pub enum TransactionType {
     },
     /// v9.4: Node reactivation after offline period
     /// Sent by returning nodes after sync to re-enter eligible producers set.
-    /// Similar to Cosmos MsgUnjail — explicit on-chain signal that node is back online and synced.
+    /// An explicit on-chain signal that the node is back online and synced.
     /// Free system TX (gas_limit = 0), deduplicated per macroblock-epoch.
     NodeReactivation {
         node_id: String,
@@ -909,8 +937,8 @@ fn qrc20_burn_to_sink(
         .contract_storage.insert("total_burned".to_string(), new_burned.to_string());
     if is_info_log() {
         println!("[INFO][QRC20] burn from={} amount={} supply={} contract={}",
-            &holder[..holder.len().min(16)], amount, new_supply,
-            &contract_addr[..contract_addr.len().min(16)]);
+            crate::char_prefix(holder, 16), amount, new_supply,
+            crate::char_prefix(contract_addr, 16));
     }
     crate::wasm_exec::push_wasm_log(tx_hash, contract_addr,
         crate::wasm_exec::encode_transfer_log("qrc20", "burn", holder, "", amount, ""));
@@ -1012,6 +1040,21 @@ fn refund_storage_deposit(
     Ok(())
 }
 
+/// Max anchor lag a Heartbeat may carry, enforced at APPLY on every path. Mirrors
+/// `qnet_integration::node::HB_ANCHOR_MAX_LAG`; drift between them is a consensus split.
+/// Phase-2 entry price FLOOR in nanoQNC — the chain rule, so an activation crafted outside the RPC
+/// that issues codes still cannot enter for free.
+///
+/// It is base × 0.5, not base: the network-size multiplier applied when quoting a code has a DISCOUNT
+/// tier (0.5× below 100k nodes, the whole early-network era), so a floor at base would reject every
+/// honestly-priced activation at exactly 2× the price the operator was charged. Floor = the minimum
+/// over that table. The multiplier itself cannot be a chain rule — it reads a process-local node
+/// counter, and a consensus rule needs a COMMITTED count.
+pub const PHASE2_SUPER_MIN_NANO: u64 = 3_750 * NANO_PER_QNC;
+pub const PHASE2_LIGHT_MIN_NANO: u64 = 5_000 * NANO_PER_QNC;
+
+pub const HB_ANCHOR_MAX_LAG_BLOCKS: u64 = 90;
+
 impl Transaction {
     /// Calculate transaction hash as Vec<u8>
     pub fn hash(&self) -> StateResult<Vec<u8>> {
@@ -1097,6 +1140,13 @@ impl Transaction {
                         addresses.push(transfer.to_address.clone());
                     }
                 }
+            }
+            // The offender's account is MUTATED by the apply arms below (banned_at_height), so it must
+            // be in this list: it drives BOTH the lazy pre-load and the rollback journal, and an arm
+            // touching an address that is absent from it clobbers the real account permanently.
+            TransactionType::EquivocationProof { offender, .. }
+            | TransactionType::VoteEquivocationProof { offender, .. } => {
+                if !addresses.contains(offender) { addresses.push(offender.clone()); }
             }
             TransactionType::BatchNodeActivations { activation_data, .. } => {
                 for data in activation_data {
@@ -1213,12 +1263,43 @@ impl Transaction {
     /// message so every validator agrees on it by signature-verification, never by re-reading Solana.
     /// `attest_epoch` = the epoch whose committee attested (M-5): bound in so the apply-time verifier
     /// resolves the SAME committee the attestors used, closing the arm-tip/apply-height straddle.
-    pub fn burn_attestation_message(burn_tx: &str, wallet: &str, amount: u64, node_type: &NodeType, cost: u64, attest_epoch: u64) -> String {
+    pub fn burn_attestation_message(
+        burn_tx: &str,
+        burn_wallet: &str,
+        wallet: &str,
+        amount: u64,
+        node_type: &NodeType,
+        cost: u64,
+        attest_epoch: u64,
+    ) -> String {
         let nt: u8 = match node_type {
             NodeType::Super => 0,
             NodeType::Light => 1,
         };
-        format!("burn_attest:{}:{}:{}:{}:{}:{}", burn_tx, wallet, amount, nt, cost, attest_epoch)
+        format!("burn_attest:{}:{}:{}:{}:{}:{}:{}", burn_tx, burn_wallet, wallet, amount, nt, cost, attest_epoch)
+    }
+
+    /// Canonical message the BURNING Solana wallet signs to authorize a node registration. Binds the
+    /// beneficiary (`wallet`, which also determines node_id), the registration proof AND the node's
+    /// attestation root, so a burn can only ever activate the node its owner named, running the key
+    /// its owner named. Rebuilt byte-identically from the TX at block validation; the mobile client
+    /// emits the same string.
+    ///
+    /// The attestation root is bound because it is otherwise unauthenticated for a Solana-derived
+    /// wallet: that wallet's address is not derived from the ML-DSA key, so nothing else ties the two
+    /// together and a relayer could swap the key the node's liveness proofs are checked against.
+    pub fn burn_owner_bind_message(
+        node_id: &str, wallet: &str, registration_proof: &str, timestamp: u64, attest_root: &[u8],
+        burn_tx: &str,
+    ) -> String {
+        format!("qnet_onchain_reg:{}:{}:{}:{}:{}:{}",
+                node_id, wallet, registration_proof, timestamp, Self::attest_root_tag(attest_root), burn_tx)
+    }
+
+    /// Stable tag for a registration's attestation root: sha3-256 of the ML-DSA-65 public key, or the
+    /// empty string when the registration carries none.
+    pub fn attest_root_tag(attest_root: &[u8]) -> String {
+        if attest_root.is_empty() { String::new() } else { hex::encode(Sha3_256::digest(attest_root)) }
     }
 
     /// Deterministic Phase-1 super/light activation cost in whole 1DEV, computed with INTEGER math so
@@ -1255,6 +1336,24 @@ impl Transaction {
                 | TransactionType::EquivocationProof { .. }
                 | TransactionType::VoteEquivocationProof { .. }
         )
+    }
+
+    /// The gas this tx actually debits from its sender when its apply arm succeeds. SINGLE source of
+    /// truth: system-typed TXs pay nothing (their cost lives outside this chain), so a caller must
+    /// never refund their "unused" gas or credit a producer for them — `is_ok()` alone would, since
+    /// those arms return Ok without ever touching the balance. Every arm charges exactly this.
+    pub fn gas_debit(&self) -> u64 {
+        if self.is_system_tx() {
+            return 0;
+        }
+        self.effective_gas_price().checked_mul(self.gas_limit).unwrap_or(u64::MAX)
+    }
+
+    /// A merkle reward-claim: user-initiated, fee-less, and authorized by the RECIPIENT's key. It is a
+    /// system TX only in the sense that it carries no sender fee — it must NOT ride the consensus
+    /// priority lane, where it would be packed ahead of every paying transaction.
+    pub fn is_merkle_reward_claim(&self) -> bool {
+        matches!(self.tx_type, TransactionType::RewardDistribution) && self.from == "system_rewards_pool"
     }
 
     /// The value-transfer classes eligible for FIX-5 pk-elision + dilithium_pk_root binding. SINGLE
@@ -1367,7 +1466,7 @@ impl Transaction {
     }
 
     /// v3.36: Gas metering -- compute ACTUAL gas consumed per TX type
-    /// Ethereum-style: user pays for gas_used, not gas_limit.
+    /// The user pays for gas_used, not gas_limit.
     /// gas_limit serves as maximum cap (out-of-gas if exceeded).
     /// For ContractDeploy/Call: includes per-byte cost for code/data.
     /// For future WASM VM: will return execution-measured gas instead of estimates.
@@ -1415,7 +1514,7 @@ impl Transaction {
         }
     }
 
-    /// v3.36: Compute gas refund amount (Ethereum EIP-1559 style)
+    /// v3.36: Compute gas refund amount (base-fee model)
     /// Returns the nanoQNC to refund to sender: (gas_limit - gas_used) * effective_gas_price
     /// IMPORTANT: Caller must credit this to sender AFTER apply_to_state() succeeds.
     /// ACTIVATION: Only apply refund for blocks >= GAS_METERING_ACTIVATION_HEIGHT
@@ -1500,7 +1599,100 @@ impl Transaction {
     }
     
     /// Check if transaction is valid
+    /// Structural ceilings on every free-form wire field. Pure length/count arithmetic — no hashing, no
+    /// signature work, no allocation — so it is safe to run on unauthenticated input and cheap enough to
+    /// run on every transaction of every incoming block.
+    ///
+    /// It exists because `validate()` is NOT on the block-validation path: a transaction arriving inside
+    /// a producer-signed block reaches the burn/identity gates without ever meeting the bounds below. Any
+    /// downstream decoder that is superlinear in its input (base58 is quadratic) then becomes a CPU bomb
+    /// a Byzantine producer can plant. Both paths call THIS.
+    pub fn enforce_wire_limits(&self) -> Result<(), String> {
+        const MAX_ADDR: usize = 128;
+        const MAX_DATA: usize = 262_144;
+        const MAX_SIG: usize = 16_384;
+        const MAX_PK: usize = 4_096;
+        if self.from.len() > MAX_ADDR || self.to.as_deref().map_or(false, |t| t.len() > MAX_ADDR) {
+            return Err("[REJECT][TX] address_too_long".to_string());
+        }
+        if self.hash.len() > MAX_ADDR {
+            return Err("[REJECT][TX] hash_too_long".to_string());
+        }
+        if self.data.as_deref().map_or(false, |d| d.len() > MAX_DATA) {
+            return Err("[REJECT][TX] data_too_long".to_string());
+        }
+        if self.signature.as_deref().map_or(false, |x| x.len() > MAX_SIG)
+            || self.dilithium_signature.as_deref().map_or(false, |x| x.len() > MAX_SIG)
+        {
+            return Err("[REJECT][TX] signature_too_long".to_string());
+        }
+        if self.public_key.as_deref().map_or(false, |x| x.len() > MAX_PK)
+            || self.dilithium_public_key.as_deref().map_or(false, |x| x.len() > MAX_PK)
+        {
+            return Err("[REJECT][TX] public_key_too_long".to_string());
+        }
+        self.tx_type_wire_limits()
+    }
+
+    /// Per-variant ceilings for the fields carried inside `tx_type`.
+    fn tx_type_wire_limits(&self) -> Result<(), String> {
+        const MAX_ID: usize = 128;
+        const MAX_ENDPOINT: usize = 256;
+        const MAX_SOLANA_ADDR: usize = 44;
+        const MAX_OWNER_SIG: usize = 128;
+        const MAX_ATTESTORS: usize = 4_096;
+        const MAX_ATTESTOR_SIG: usize = 16_384;
+        const MAX_PK_HEX: usize = 8_192;
+        match &self.tx_type {
+            TransactionType::NodeRegistration {
+                node_id, wallet_address, registration_proof, api_endpoint,
+                burn_tx, burn_wallet, burn_owner_sig, burn_attestors, vrf_pk, ..
+            } => {
+                if node_id.len() > MAX_ID || wallet_address.len() > MAX_ID
+                    || registration_proof.len() > MAX_ID || burn_tx.len() > MAX_ID
+                    || api_endpoint.len() > MAX_ENDPOINT
+                    || burn_wallet.len() > MAX_SOLANA_ADDR || burn_owner_sig.len() > MAX_OWNER_SIG
+                {
+                    return Err("[REJECT][TX] registration_field_too_long".to_string());
+                }
+                if burn_attestors.len() > MAX_ATTESTORS
+                    || burn_attestors.iter().any(|(id, sig)| id.len() > MAX_ID || sig.len() > MAX_ATTESTOR_SIG)
+                {
+                    return Err("[REJECT][TX] registration_attestors_too_large".to_string());
+                }
+                if !vrf_pk.is_empty() && vrf_pk.len() != 1952 {
+                    return Err("[REJECT][TX] vrf_pk_bad_length".to_string());
+                }
+            }
+            TransactionType::NodeReactivation { node_id, last_macroblock_hash, .. } => {
+                if node_id.len() > MAX_ID || last_macroblock_hash.len() > MAX_ID {
+                    return Err("[REJECT][TX] reactivation_field_too_long".to_string());
+                }
+            }
+            TransactionType::Heartbeat { node_id, anchor_hash, .. } => {
+                if node_id.len() > MAX_ID || anchor_hash.len() > MAX_ID {
+                    return Err("[REJECT][TX] heartbeat_field_too_long".to_string());
+                }
+            }
+            TransactionType::KeyRotation { node_id, new_dilithium_pk, old_key_signature, .. } => {
+                if node_id.len() > MAX_ID || new_dilithium_pk.len() > MAX_PK_HEX
+                    || old_key_signature.len() > MAX_ATTESTOR_SIG
+                {
+                    return Err("[REJECT][TX] key_rotation_field_too_long".to_string());
+                }
+            }
+            TransactionType::LightNodeEligibilityBitmap { genesis_id, bitmap_compressed, .. } => {
+                if genesis_id.len() > MAX_ID || bitmap_compressed.len() > 500_000 {
+                    return Err("[REJECT][TX] bitmap_field_too_long".to_string());
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<(), String> {
+        self.enforce_wire_limits()?;
         // Basic validation
         if self.from.is_empty() {
             return Err("[REJECT][TX] empty_sender_address".to_string());
@@ -1536,7 +1728,7 @@ impl Transaction {
         if !is_valid_sender_format(&self.from) {
             return Err(format!(
                 "[REJECT][TX] invalid_sender_format from={} (must be eon address, reserved protocol id, or node identifier)",
-                &self.from[..self.from.len().min(40)]
+                crate::char_prefix(&self.from, 40)
             ));
         }
 
@@ -1547,8 +1739,8 @@ impl Transaction {
         if self.hash != calculated_hash {
             return Err(format!(
                 "[REJECT][TX] invalid_hash stored={}.. calculated={}.. type={:?}",
-                &self.hash[..16.min(self.hash.len())],
-                &calculated_hash[..16.min(calculated_hash.len())],
+                crate::char_prefix(&self.hash, 16),
+                crate::char_prefix(&calculated_hash, 16),
                 std::mem::discriminant(&self.tx_type)
             ));
         }
@@ -1579,12 +1771,12 @@ impl Transaction {
                     return Err(format!(
                         "[REJECT][TX] transfer_sender_mismatch tx_from={} payload_from={} \
                          action=reject hint=payload_from_must_equal_tx_from",
-                        &self.from[..self.from.len().min(20)],
-                        &from[..from.len().min(20)]
+                        crate::char_prefix(&self.from, 20),
+                        crate::char_prefix(&from, 20)
                     ));
                 }
             }
-            TransactionType::NodeActivation { amount, phase, .. } => {
+            TransactionType::NodeActivation { amount, phase, node_type, .. } => {
                 // Phase 1: amount = 0 (only activation record, 1DEV burned externally on Solana)
                 // Phase 2: amount > 0 (QNC transferred to Pool 3 for redistribution to all nodes)
                 match phase {
@@ -1594,8 +1786,26 @@ impl Transaction {
                         }
                     }
                     ActivationPhase::Phase2 => {
-                        if *amount == 0 {
-                            return Err("[REJECT][NODE-ACTIVATION] phase2_zero_amount".to_string());
+                        // Entry price is the one Sybil lever no amount of protocol work can replace, and
+                        // it used to be checked only where activation codes are issued, so a hand-built
+                        // TX gossiped straight in for one nano. Pure function of node_type, so every
+                        // node agrees; `amount` is nanoQNC, the unit apply debits from the balance.
+                        //
+                        // SCOPE, precisely: validate() is an ADMISSION filter — mempool, gossip, RPC
+                        // submit and the honest producer's fill loop. NOTHING calls it when a block is
+                        // accepted (block_pipeline has no validate() call site; MicroBlock::validate is
+                        // uncalled), so this does not bind a byzantine producer that seals the TX
+                        // itself. Making it bind means a check in the block-accept path beside the
+                        // NodeActivation burn-attestation gate, behind a feature_gates height.
+                        let min_nano = match node_type {
+                            NodeType::Super => PHASE2_SUPER_MIN_NANO,
+                            NodeType::Light => PHASE2_LIGHT_MIN_NANO,
+                        };
+                        if *amount < min_nano {
+                            return Err(format!(
+                                "[REJECT][NODE-ACTIVATION] phase2_below_min amount={} min={}",
+                                amount, min_nano
+                            ));
                         }
                     }
                 }
@@ -1638,8 +1848,8 @@ impl Transaction {
                     return Err(format!(
                         "[REJECT][SWAP] sender_mismatch tx_from={} payload_from={} \
                          action=reject hint=payload_from_must_equal_tx_from",
-                        &self.from[..self.from.len().min(20)],
-                        &from[..from.len().min(20)]
+                        crate::char_prefix(&self.from, 20),
+                        crate::char_prefix(&from, 20)
                     ));
                 }
                 // amount_out_min can be 0 (no slippage protection, risky but allowed)
@@ -1679,13 +1889,12 @@ impl Transaction {
                     return Err("[REJECT][BATCH-CLAIM] batch_too_large max=1000".to_string());
                 }
             }
-            TransactionType::BatchNodeActivations { activation_data, .. } => {
-                if activation_data.is_empty() {
-                    return Err("[REJECT][BATCH-ACTIVATION] empty_activation_data".to_string());
-                }
-                if activation_data.len() > 500 {
-                    return Err("[REJECT][BATCH-ACTIVATION] batch_too_large max=500".to_string());
-                }
+            TransactionType::BatchNodeActivations { .. } => {
+                // Deprecated by architecture (1 wallet = 1 node ⇒ a single NodeActivation TX), kept in
+                // the enum only so old bytes still deserialize. Nothing constructs it. Rejected here to
+                // keep it out of relay and out of an honest producer's fill loop; the binding rule is
+                // the matching reject in the apply arm.
+                return Err("[REJECT][BATCH-ACTIVATION] deprecated_variant".to_string());
             }
             TransactionType::BatchTransfers { transfers, .. } => {
                 if transfers.is_empty() {
@@ -1785,7 +1994,7 @@ impl Transaction {
             TransactionType::Heartbeat { node_id, anchor_hash, .. } => {
                 // v35: structural checks only. The Dilithium sig (in dilithium_signature, over
                 // node_id:anchor_height:anchor_hash) + anchor==chain-hash + recency are enforced at
-                // block validation (verify_heartbeat_tx); this gate is pure (no storage/PK access).
+                // the producer's block-build filter; this gate is pure (no storage/PK access).
                 if node_id.is_empty() {
                     return Err("[REJECT][TX] heartbeat_empty_node_id".to_string());
                 }
@@ -1952,13 +2161,49 @@ impl Transaction {
                 // Note: Full validation (decompression + popcount) done at MacroBlock collection
                 // Here we only do basic sanity checks for TX acceptance
             }
-            TransactionType::NodeRegistration { node_id, node_type, wallet_address, api_endpoint, .. } => {
+            TransactionType::NodeRegistration {
+                node_id, node_type, wallet_address, api_endpoint, registration_proof,
+                burn_tx, burn_wallet, burn_owner_sig, burn_attestors, vrf_pk, ..
+            } => {
                 // System transaction: validate node registration data
                 if node_id.is_empty() {
                     return Err("[REJECT][NODE-ACTIVATION] empty_node_id".to_string());
                 }
                 if wallet_address.is_empty() {
                     return Err("[REJECT][NODE-ACTIVATION] empty_wallet_address".to_string());
+                }
+                // Length ceilings on every free-form field. These are the FIRST bound an unauthenticated
+                // TX meets: downstream gates base58/hex-decode burn_wallet and burn_owner_sig (bs58
+                // decode is O(n^2)), so an unbounded field would be a decode bomb reachable before any
+                // signature check. Bounds are generous vs the real encodings — Solana address ≤44 base58
+                // chars, ed25519 sig = 128 hex chars, tx signature ≤88 base58 chars.
+                const MAX_NODE_ID: usize = 128;
+                const MAX_WALLET: usize = 128;
+                const MAX_PROOF: usize = 128;
+                const MAX_BURN_TX: usize = 128;
+                const MAX_SOLANA_ADDR: usize = 44;
+                const MAX_OWNER_SIG: usize = 128;
+                const MAX_ATTESTORS: usize = 4096;
+                const MAX_ATTESTOR_SIG: usize = 16_384;
+                if node_id.len() > MAX_NODE_ID || wallet_address.len() > MAX_WALLET
+                    || registration_proof.len() > MAX_PROOF || burn_tx.len() > MAX_BURN_TX
+                    || burn_wallet.len() > MAX_SOLANA_ADDR || burn_owner_sig.len() > MAX_OWNER_SIG
+                {
+                    return Err("[REJECT][NODE-ACTIVATION] field_too_long".to_string());
+                }
+                if burn_attestors.len() > MAX_ATTESTORS
+                    || burn_attestors.iter().any(|(id, sig)| id.len() > MAX_NODE_ID || sig.len() > MAX_ATTESTOR_SIG)
+                {
+                    return Err("[REJECT][NODE-ACTIVATION] attestors_too_large".to_string());
+                }
+                // Consensus key: absent, or exactly one ML-DSA-65 public key. Never a Light node's.
+                if !vrf_pk.is_empty() {
+                    if vrf_pk.len() != 1952 {
+                        return Err("[REJECT][NODE-ACTIVATION] vrf_pk_bad_length".to_string());
+                    }
+                    if *node_type == NodeType::Light {
+                        return Err("[REJECT][NODE-ACTIVATION] light_node_vrf_pk_forbidden".to_string());
+                    }
                 }
                 // SECURITY: Light nodes MUST have empty api_endpoint (privacy protection!)
                 // Light nodes = mobile apps, their IP must NEVER be exposed!
@@ -2174,8 +2419,8 @@ impl Transaction {
                 if from != &self.from {
                     return Err(StateError::InvalidTransaction(format!(
                         "[REJECT][TX] transfer_sender_mismatch_at_apply tx_from={} payload_from={}",
-                        &self.from[..self.from.len().min(20)],
-                        &from[..from.len().min(20)]
+                        crate::char_prefix(&self.from, 20),
+                        crate::char_prefix(&from, 20)
                     )));
                 }
                 // Get sender account
@@ -2290,7 +2535,7 @@ impl Transaction {
 
                 if is_info_log() {
                     println!("[INFO][CREATE-ACCOUNT] addr={} balance={} by={}",
-                        &address[..address.len().min(16)], initial_balance, &self.from[..self.from.len().min(16)]);
+                        crate::char_prefix(&address, 16), initial_balance, crate::char_prefix(&self.from, 16));
                 }
             }
 
@@ -2336,15 +2581,9 @@ impl Transaction {
                     )));
                 }
 
-                // v14.8.4: For SYSTEM activation TX, the fee is ALWAYS zero
-                // (payment lives outside this chain). For legacy / future non-
-                // system activation paths we keep the original fee arithmetic.
-                let fee = if self.is_system_tx() {
-                    0u64
-                } else {
-                    self.effective_gas_price().checked_mul(self.gas_limit)
-                        .ok_or_else(|| StateError::InvalidTransaction("[REJECT][TX] gas_fee_overflow".into()))?
-                };
+                // For a SYSTEM activation TX the fee is ALWAYS zero (payment lives outside this chain).
+                // gas_debit() is the shared rule the refund/producer-credit decision also reads.
+                let fee = self.gas_debit();
                 let total_amount = amount.checked_add(fee)
                     .ok_or_else(|| StateError::InvalidTransaction("[REJECT][TX] total_amount_overflow".into()))?;
 
@@ -2547,8 +2786,8 @@ impl Transaction {
                         if is_info_log() {
                             println!("[INFO][TOKEN] qrc20_deployed name={} symbol={} supply={} addr={} by={}",
                                 name, symbol, initial_supply,
-                                &contract_address[..contract_address.len().min(20)],
-                                &self.from[..self.from.len().min(16)]);
+                                crate::char_prefix(&contract_address, 20),
+                                crate::char_prefix(&self.from, 16));
                         }
                     }
                 } else if is_qrc721 {
@@ -2567,8 +2806,8 @@ impl Transaction {
                         if is_info_log() {
                             println!("[INFO][NFT] qrc721_deployed name={} symbol={} addr={} by={}",
                                 name, symbol,
-                                &contract_address[..contract_address.len().min(20)],
-                                &self.from[..self.from.len().min(16)]);
+                                crate::char_prefix(&contract_address, 20),
+                                crate::char_prefix(&self.from, 16));
                         }
                     }
                 } else if is_wasm {
@@ -2590,16 +2829,16 @@ impl Transaction {
                     contract.contract_storage.insert("code".to_string(), code_hex);
                     if is_info_log() {
                         println!("[INFO][VM] wasm_deployed addr={} code_bytes={} by={}",
-                            &contract_address[..contract_address.len().min(20)], code.len(),
-                            &self.from[..self.from.len().min(16)]);
+                            crate::char_prefix(&contract_address, 20), code.len(),
+                            crate::char_prefix(&self.from, 16));
                     }
                 } else {
                     // Generic contract (WASM) — just store code_hash + deployer
                     if is_info_log() {
                         println!("[INFO][CONTRACT] deployed addr={} code_hash={}..{} fee={} by={}",
-                            &contract_address[..contract_address.len().min(20)],
+                            crate::char_prefix(&contract_address, 20),
                             &code_hash[..8], &code_hash[code_hash.len()-8..],
-                            fee, &self.from[..self.from.len().min(16)]);
+                            fee, crate::char_prefix(&self.from, 16));
                     }
                 }
 
@@ -2766,9 +3005,9 @@ impl Transaction {
 
                                     if is_info_log() {
                                         println!("[INFO][QRC20] transfer {} -> {} amount={} contract={}",
-                                            &sender_addr[..sender_addr.len().min(16)],
-                                            &to[..to.len().min(16)], amount,
-                                            &contract_addr[..contract_addr.len().min(16)]);
+                                            crate::char_prefix(&sender_addr, 16),
+                                            crate::char_prefix(&to, 16), amount,
+                                            crate::char_prefix(&contract_addr, 16));
                                     }
                                     // Success-gated transfer event (effect, not calldata intent) → getLogs +
                                     // logs_root + the token-transfer index. Only reached on the Ok path.
@@ -2803,8 +3042,8 @@ impl Transaction {
 
                                     if is_info_log() {
                                         println!("[INFO][QRC20] approve owner={} spender={} amount={}",
-                                            &sender_addr[..sender_addr.len().min(16)],
-                                            &spender[..spender.len().min(16)], amount);
+                                            crate::char_prefix(&sender_addr, 16),
+                                            crate::char_prefix(&spender, 16), amount);
                                     }
                                 }
                                 "transferFrom" | "transfer_from" => 'qrc20_transfer_from: {
@@ -2903,9 +3142,9 @@ impl Transaction {
 
                                     if is_info_log() {
                                         println!("[INFO][QRC20] transferFrom {} -> {} amount={} spender={}",
-                                            &from[..from.len().min(16)],
-                                            &to[..to.len().min(16)], amount,
-                                            &sender_addr[..sender_addr.len().min(16)]);
+                                            crate::char_prefix(&from, 16),
+                                            crate::char_prefix(&to, 16), amount,
+                                            crate::char_prefix(&sender_addr, 16));
                                     }
                                     // Transfer effect keyed on the token holder (from), not the spender.
                                     crate::wasm_exec::push_wasm_log(&self.hash, &contract_addr,
@@ -2988,8 +3227,8 @@ impl Transaction {
 
                                     if is_info_log() {
                                         println!("[INFO][QRC20] mint to={} amount={} supply={} contract={}",
-                                            &to[..to.len().min(16)], amount, new_supply,
-                                            &contract_addr[..contract_addr.len().min(16)]);
+                                            crate::char_prefix(&to, 16), amount, new_supply,
+                                            crate::char_prefix(&contract_addr, 16));
                                     }
                                     // Mint = Transfer(∅ → to): empty `from` marks a supply increase.
                                     crate::wasm_exec::push_wasm_log(&self.hash, &contract_addr,
@@ -3112,8 +3351,8 @@ impl Transaction {
 
                                     if is_info_log() {
                                         println!("[INFO][NFT] mint to={} token_id={} contract={}",
-                                            &to[..to.len().min(16)], token_id,
-                                            &contract_addr[..contract_addr.len().min(16)]);
+                                            crate::char_prefix(&to, 16), token_id,
+                                            crate::char_prefix(&contract_addr, 16));
                                     }
                                     crate::wasm_exec::push_wasm_log(&self.hash, &contract_addr,
                                         crate::wasm_exec::encode_transfer_log("qrc721", "mint", "", &to, 1, &token_id));
@@ -3143,9 +3382,9 @@ impl Transaction {
 
                                     if is_info_log() {
                                         println!("[INFO][NFT] transfer {} -> {} token_id={} contract={}",
-                                            &sender_addr[..sender_addr.len().min(16)],
-                                            &to[..to.len().min(16)], token_id,
-                                            &contract_addr[..contract_addr.len().min(16)]);
+                                            crate::char_prefix(&sender_addr, 16),
+                                            crate::char_prefix(&to, 16), token_id,
+                                            crate::char_prefix(&contract_addr, 16));
                                     }
                                     crate::wasm_exec::push_wasm_log(&self.hash, &contract_addr,
                                         if to == CANONICAL_BURN_ADDR {
@@ -3186,8 +3425,8 @@ impl Transaction {
 
                                     if is_info_log() {
                                         println!("[INFO][NFT] approve owner={} spender={} token_id={}",
-                                            &sender_addr[..sender_addr.len().min(16)],
-                                            &spender[..spender.len().min(16)], token_id);
+                                            crate::char_prefix(&sender_addr, 16),
+                                            crate::char_prefix(&spender, 16), token_id);
                                     }
                                 }
                                 "transferFrom" | "transfer_from" => {
@@ -3225,9 +3464,9 @@ impl Transaction {
 
                                     if is_info_log() {
                                         println!("[INFO][NFT] transferFrom {} -> {} token_id={} spender={}",
-                                            &from[..from.len().min(16)],
-                                            &to[..to.len().min(16)], token_id,
-                                            &sender_addr[..sender_addr.len().min(16)]);
+                                            crate::char_prefix(&from, 16),
+                                            crate::char_prefix(&to, 16), token_id,
+                                            crate::char_prefix(&sender_addr, 16));
                                     }
                                     crate::wasm_exec::push_wasm_log(&self.hash, &contract_addr,
                                         if to == CANONICAL_BURN_ADDR {
@@ -3340,12 +3579,12 @@ impl Transaction {
                         }
                         if over_cap && is_info_log() {
                             println!("[WARN][VM] wasm_storage_cap_exceeded contract={} — commit skipped, value returned (fee consumed)",
-                                &contract_addr[..contract_addr.len().min(20)]);
+                                crate::char_prefix(&contract_addr, 20));
                         }
                     }
                     if is_info_log() {
                         println!("[INFO][VM] wasm_calltree contract={} fuel={} trapped={} contracts={} h={}",
-                            &contract_addr[..contract_addr.len().min(20)], result.fuel_consumed,
+                            crate::char_prefix(&contract_addr, 20), result.fuel_consumed,
                             result.trapped, result.writes.len(), block_height);
                     }
                 } else {
@@ -3353,7 +3592,7 @@ impl Transaction {
                     const MAX_CALL_RECORDS: usize = 10_000;
                     let contract = accounts.get_mut(&contract_addr).unwrap();
                     if contract.contract_storage.len() < MAX_CALL_RECORDS {
-                        let call_key = format!("call:{}:{}", self.timestamp, &sender_addr[..sender_addr.len().min(16)]);
+                        let call_key = format!("call:{}:{}", self.timestamp, crate::char_prefix(&sender_addr, 16));
                         let call_value = format!("value={},gas={},data_len={}",
                             self.amount, fee,
                             self.data.as_ref().map(|d| d.len()).unwrap_or(0));
@@ -3363,8 +3602,8 @@ impl Transaction {
 
                 if is_info_log() && !is_qrc20 {
                     println!("[INFO][CONTRACT-CALL] {} -> {} fee={} value={} nanoQNC",
-                        &sender_addr[..sender_addr.len().min(16)],
-                        &contract_addr[..contract_addr.len().min(20)],
+                        crate::char_prefix(&sender_addr, 16),
+                        crate::char_prefix(&contract_addr, 20),
                         fee, self.amount);
                 }
             }
@@ -3429,7 +3668,7 @@ impl Transaction {
                     if is_info_log() {
                         println!("[INFO][REWARDS] reward_claimed amount={} QNC to={} pending_remaining={} QNC",
                             self.amount / 1_000_000_000,
-                            &to[..to.len().min(16)],
+                            crate::char_prefix(&to, 16),
                             recipient.pending_rewards / 1_000_000_000);
                     }
                 }
@@ -3477,61 +3716,23 @@ impl Transaction {
 
                 if is_info_log() {
                     println!("[INFO][BATCH-CLAIM-FEE] {} nodes by {} fee={} nanoQNC",
-                        node_ids.len(), &self.from[..self.from.len().min(16)], total_fee);
+                        node_ids.len(), crate::char_prefix(&self.from, 16), total_fee);
                 }
             }
-            TransactionType::BatchNodeActivations { activation_data, .. } => {
-                // Batch node activations - single nonce increment for the entire batch
-                let sender = accounts.get_mut(&self.from)
-                    .ok_or_else(|| StateError::AccountNotFound(self.from.clone()))?;
-
-                // IDEMPOTENT APPLY — see Transfer arm for full rationale.
-                if self.nonce <= sender.nonce {
-                    return Ok(());
-                }
-                // CRITICAL SECURITY: Check nonce to prevent replay attacks
-                if self.nonce != sender.nonce + 1 {
-                    return Err(StateError::InvalidTransaction(format!(
-                        "[REJECT][TX] invalid_nonce expected={} got={}",
-                        sender.nonce + 1, self.nonce
-                    )));
-                }
-
-                // Calculate total activation amount and fees (QUANTUM v2.25: +50% for Dilithium TX)
-                let total_activation_amount: u64 = activation_data.iter()
-                    .try_fold(0u64, |acc, d| acc.checked_add(d.activation_amount)
-                        .ok_or_else(|| StateError::InvalidTransaction("[REJECT][BATCH-ACTIVATION] amount_sum_overflow".into())))?;
-                let per_fee = self.effective_gas_price().checked_mul(self.gas_limit)
-                    .ok_or_else(|| StateError::InvalidTransaction("[REJECT][TX] gas_fee_overflow".into()))?;
-                let total_fee = per_fee.checked_mul(activation_data.len() as u64)
-                    .ok_or_else(|| StateError::InvalidTransaction("[REJECT][BATCH-ACTIVATION] total_fee_overflow".into()))?;
-                let total_cost = total_activation_amount.checked_add(total_fee)
-                    .ok_or_else(|| StateError::InvalidTransaction("[REJECT][BATCH-ACTIVATION] total_cost_overflow".into()))?;
-
-                if sender.balance < total_cost {
-                    return Err(StateError::InsufficientBalance {
-                        have: sender.balance,
-                        need: total_cost,
-                    });
-                }
-
-                // Deduct total cost once
-                sender.balance = sender.balance.checked_sub(total_cost)
-                    .ok_or_else(|| StateError::InvalidTransaction("[REJECT][BATCH-ACTIVATION] balance_underflow".into()))?;
-                sender.nonce = sender.nonce.checked_add(1)
-                    .ok_or_else(|| StateError::InvalidTransaction("[REJECT][TX] nonce_overflow".into()))?;
-
-                // v3.34: Actually activate each node (previously only deducted fees)
-                for data in activation_data {
-                    let owner = accounts.entry(data.owner_address.clone())
-                        .or_insert_with(|| Account::new(data.owner_address.clone()));
-                    owner.activate_node(format!("{:?}", data.node_type), self.timestamp);
-                }
-
-                if is_info_log() {
-                    println!("[INFO][BATCH-ACTIVATION] {} nodes by {} cost={} nanoQNC",
-                        activation_data.len(), &self.from[..self.from.len().min(16)], total_cost);
-                }
+            TransactionType::BatchNodeActivations { .. } => {
+                // Deprecated by architecture (1 wallet = 1 node ⇒ a single NodeActivation TX) and never
+                // constructed. The arm below called `activate_node` on every `owner_address` in the
+                // batch — addresses the sender does not own — which is a PERMANENT grief: `is_node` is
+                // one-way, and once set the victim's own NodeActivation is refused by the mempool and
+                // silently no-ops at apply (the single-use guard above), so that wallet can never run a
+                // node. With zero amounts it cost the attacker nothing.
+                //
+                // The reject must live HERE, not only in validate(): validate() is an admission filter
+                // (mempool, gossip, RPC, honest producer fill) and nothing calls it when a block is
+                // accepted, so a byzantine producer could seal one anyway. Apply is on the block path,
+                // and a rejected tx is skipped identically by every node ⇒ state_root still agrees.
+                return Err(StateError::InvalidTransaction(
+                    "[REJECT][BATCH-ACTIVATION] deprecated_variant".into()));
             }
             TransactionType::BatchTransfers { transfers, .. } => {
                 // Batch transfers - single nonce increment for the entire batch
@@ -3594,7 +3795,7 @@ impl Transaction {
                 if is_info_log() {
                     println!("[INFO][BATCH-TRANSFER] {} nanoQNC to {} recipients by {} fee={} nanoQNC",
                         total_transfer_amount, transfers.len(),
-                        &self.from[..self.from.len().min(16)], total_fee);
+                        crate::char_prefix(&self.from, 16), total_fee);
                 }
             }
             TransactionType::PingAttestation { from_node, to_node, response_time_ms, success } => {
@@ -3633,18 +3834,42 @@ impl Transaction {
                 // apply needs no block-height context. Validity (anchor/sig) verified upstream.
                 const EPOCH_BLOCKS: u64 = 14400;
                 const SUBWINDOW_BLOCKS: u64 = 1440; // 10 subwindows per epoch
+                // Mirrors qnet_integration::node::HB_ANCHOR_MAX_LAG (qnet-state cannot depend on it);
+                // an integration test asserts they are equal, because drift is a consensus split.
                 let epoch = anchor_height / EPOCH_BLOCKS;
                 let subwindow = ((anchor_height % EPOCH_BLOCKS) / SUBWINDOW_BLOCKS) as u16; // 0..9
                 let acct = accounts
                     .entry(self.from.clone())
                     .or_insert_with(|| Account::new(self.from.clone()));
-                if acct.heartbeat_epoch != epoch {
-                    acct.heartbeat_final_epoch = acct.heartbeat_epoch;
-                    acct.heartbeat_final_count = acct.heartbeat_slots.count_ones() as u8;
-                    acct.heartbeat_epoch = epoch;
-                    acct.heartbeat_slots = 0;
+                // Admission recency is a STATE rule, not just a producer-side filter: without it a
+                // byzantine producer can replay a genuine old heartbeat and mutate an epoch's tally
+                // after it settled. Ignoring (not rejecting) keeps producer and validator identical.
+                // The upper bound is load-bearing too: `saturating_sub` reads a FUTURE anchor as lag 0,
+                // and validate() bounds anchor_height nowhere, so a future-epoch anchor would slip past
+                // and drive the forward-roll below — overwriting the live tally. `<` mirrors the
+                // producer's own `ah < next_block_height`.
+                if *anchor_height >= block_height
+                    || block_height - *anchor_height > HB_ANCHOR_MAX_LAG_BLOCKS {
+                    return Ok(());
                 }
-                acct.heartbeat_slots |= 1u16 << subwindow.min(9);
+                let bit = 1u16 << subwindow.min(9);
+                if epoch > acct.heartbeat_epoch {
+                    // Forward roll ONLY. `!=` also rolled BACKWARDS on a late heartbeat, wiping the new
+                    // epoch's liveness and collapsing the old one to a single subwindow.
+                    acct.heartbeat_final_epoch = acct.heartbeat_epoch;
+                    acct.heartbeat_final_slots = acct.heartbeat_slots;
+                    acct.heartbeat_epoch = epoch;
+                    acct.heartbeat_slots = bit;
+                } else if epoch == acct.heartbeat_epoch {
+                    acct.heartbeat_slots |= bit;
+                } else if epoch == acct.heartbeat_final_epoch
+                    && acct.heartbeat_final_epoch + 1 == acct.heartbeat_epoch
+                {
+                    // Late, but still the immediately-preceding epoch: fold into the settled mask so the
+                    // tally converges regardless of arrival order. Anything older is out of the
+                    // admission window and ignored.
+                    acct.heartbeat_final_slots |= bit;
+                }
             }
             TransactionType::HeartbeatCommitment {
                 node_id,
@@ -3684,7 +3909,7 @@ impl Transaction {
                 // No balance changes, only registers node_id -> wallet_address binding
                 if is_info_log() {
                     println!("[INFO][NODE-REG] registered: {} ({:?}) -> {}",
-                        node_id, node_type, &wallet_address[..20.min(wallet_address.len())]);
+                        node_id, node_type, crate::char_prefix(&wallet_address, 20));
                 }
                 // Registration data is stored in blockchain for immutable lookup
             }
@@ -3703,15 +3928,27 @@ impl Transaction {
                 // Processing: VRF registry and P2P certificate manager pick up the change.
                 if is_info_log() {
                     println!("[INFO][KEY-ROTATE] node={} new_pk_prefix={}... effective_h={}",
-                        node_id, &new_dilithium_pk[..16.min(new_dilithium_pk.len())], effective_height);
+                        node_id, crate::char_prefix(&new_dilithium_pk, 16), effective_height);
                 }
             }
 
-            // Equivocation slashing proofs: no account-state effect. The penalty
-            // (offender → reputation 0 + ban) is applied deterministically in the
-            // reputation fold from the committed proof, not in account state.
-            TransactionType::EquivocationProof { .. } => {}
-            TransactionType::VoteEquivocationProof { .. } => {}
+            // Equivocation slashing: consensus already excludes the offender through the reputation
+            // fold, but that fold lives at the macroblock and the REWARD decision happens at a settle
+            // height that cannot reach back to it. So the ban is also carried HERE, in account state
+            // the snapshot already proves, where the reward filter reads it directly.
+            // Write-once (the ban is permanent) and idempotent, so re-apply and replay agree.
+            // SAFETY: the offender is in get_all_affected_addresses, so it is pre-loaded AND journaled;
+            // and a junk proof never reaches this arm — it is verified at admission and at block
+            // validity, where the chain-sourced offender key is available.
+            TransactionType::EquivocationProof { offender, .. }
+            | TransactionType::VoteEquivocationProof { offender, .. } => {
+                let acct = accounts
+                    .entry(offender.clone())
+                    .or_insert_with(|| Account::new(offender.clone()));
+                if acct.banned_at_height == 0 {
+                    acct.banned_at_height = block_height.max(1);
+                }
+            }
         }
 
         Ok(())
@@ -4186,7 +4423,7 @@ mod tests_v34_heartbeat {
 
     // Build a v34 Heartbeat TX. `from` == node_id (the account whose subwindow bitmask
     // increments). anchor_hash is a structurally-valid 64-hex placeholder (the real
-    // anchor/sig check is verify_heartbeat_tx at block validation, not apply).
+    // anchor/sig check is the producer's block-build filter, not apply).
     fn hb(node_id: &str, anchor_height: u64) -> Transaction {
         let mut tx = Transaction {
             hash: String::new(),
@@ -4203,7 +4440,6 @@ mod tests_v34_heartbeat {
                 node_id: node_id.to_string(),
                 anchor_height,
                 anchor_hash: "a".repeat(64),
-                signature: String::new(),
             },
             data: None,
             // v35: the heartbeat's single Dilithium sig lives here (over the anchor message).
@@ -4220,17 +4456,131 @@ mod tests_v34_heartbeat {
     #[test]
     fn apply_sets_subwindow_bit_and_is_idempotent() {
         let mut accts: HashMap<String, Account> = HashMap::new();
-        hb("genesis_node_001", 100).apply_to_state(&mut accts).unwrap(); // epoch 0, subwindow 0
+        hb("genesis_node_001", 100).apply_to_state_at(&mut accts, 150).unwrap(); // epoch 0, subwindow 0
         let a = accts.get("genesis_node_001").unwrap();
         assert_eq!(a.heartbeat_epoch, 0);
         assert_eq!(a.heartbeat_slots, 0b1);
         // subwindow 3 (anchor 3*1440+5 = 4325)
-        hb("genesis_node_001", 3 * 1440 + 5).apply_to_state(&mut accts).unwrap();
+        hb("genesis_node_001", 3 * 1440 + 5).apply_to_state_at(&mut accts, 3 * 1440 + 55).unwrap();
         assert_eq!(accts.get("genesis_node_001").unwrap().heartbeat_slots, 0b1001);
         assert_eq!(accts.get("genesis_node_001").unwrap().heartbeat_slots.count_ones(), 2);
         // re-hit subwindow 0 (anchor 200) → idempotent, still 2 bits (no inflation by spamming)
-        hb("genesis_node_001", 200).apply_to_state(&mut accts).unwrap();
+        hb("genesis_node_001", 200).apply_to_state_at(&mut accts, 250).unwrap();
         assert_eq!(accts.get("genesis_node_001").unwrap().heartbeat_slots.count_ones(), 2);
+    }
+
+    // A heartbeat for the epoch just left must FOLD into the settled mask. The old `!=` rule rolled
+    // backwards here: it wiped the new epoch's liveness and collapsed the old one to one subwindow.
+    #[test]
+    fn late_heartbeat_folds_into_settled_epoch_and_never_rolls_back() {
+        let mut accts: HashMap<String, Account> = HashMap::new();
+        for sw in 0..3u64 { hb("super_y", sw * 1440 + 10).apply_to_state_at(&mut accts, sw * 1440 + 20).unwrap(); }
+        hb("super_y", 14_400 + 5).apply_to_state_at(&mut accts, 14_410).unwrap(); // roll to epoch 1
+        // Late epoch-0 heartbeat. The fold window is exactly the last HB_ANCHOR_MAX_LAG blocks of the
+        // epoch — an older anchor is already outside the admission rule, so the two rules meet flush.
+        hb("super_y", 14_395).apply_to_state_at(&mut accts, 14_420).unwrap(); // subwindow 9, lag 25
+        let a = accts.get("super_y").unwrap();
+        assert_eq!(a.heartbeat_epoch, 1, "must not roll backwards");
+        assert_eq!(a.heartbeat_final_epoch, 0);
+        assert_eq!(a.heartbeat_final_slots.count_ones(), 4, "late bit folded into the settled epoch");
+        assert_eq!(a.heartbeat_slots.count_ones(), 1, "epoch 1 liveness intact");
+    }
+
+    // Within the admission window the outcome must not depend on arrival order — this is consensus
+    // state, so an order-dependent result is a fork.
+    #[test]
+    fn admission_window_order_does_not_change_the_outcome() {
+        let seed = |accts: &mut HashMap<String, Account>| {
+            for sw in 0..3u64 { hb("super_z", sw * 1440 + 10).apply_to_state_at(accts, sw * 1440 + 20).unwrap(); }
+        };
+        let (mut a1, mut a2) = (HashMap::new(), HashMap::new());
+        seed(&mut a1); seed(&mut a2);
+        // order A: roll first, then the late one
+        hb("super_z", 14_400 + 5).apply_to_state_at(&mut a1, 14_410).unwrap();
+        hb("super_z", 14_395).apply_to_state_at(&mut a1, 14_420).unwrap();
+        // order B: the late one first, then the roll
+        hb("super_z", 14_395).apply_to_state_at(&mut a2, 14_410).unwrap();
+        hb("super_z", 14_400 + 5).apply_to_state_at(&mut a2, 14_420).unwrap();
+        let (x, y) = (a1.get("super_z").unwrap(), a2.get("super_z").unwrap());
+        assert_eq!((x.heartbeat_epoch, x.heartbeat_slots, x.heartbeat_final_epoch, x.heartbeat_final_slots),
+                   (y.heartbeat_epoch, y.heartbeat_slots, y.heartbeat_final_epoch, y.heartbeat_final_slots));
+    }
+
+    // Anchor recency is a STATE rule, not a producer-side filter: a replayed old heartbeat must not
+    // mutate an epoch whose eligibility was already sampled.
+    #[test]
+    fn stale_anchor_is_ignored_at_apply() {
+        let mut accts: HashMap<String, Account> = HashMap::new();
+        hb("super_w", 100).apply_to_state_at(&mut accts, 150).unwrap();
+        let before = accts.get("super_w").unwrap().heartbeat_slots;
+        hb("super_w", 5 * 1440 + 10).apply_to_state_at(&mut accts, 5 * 1440 + 10 + 91).unwrap();
+        assert_eq!(accts.get("super_w").unwrap().heartbeat_slots, before, "lag > 90 ignored");
+        hb("super_w", 5 * 1440 + 10).apply_to_state_at(&mut accts, 5 * 1440 + 10 + 90).unwrap();
+        assert_ne!(accts.get("super_w").unwrap().heartbeat_slots, before, "lag == 90 admitted");
+    }
+
+    // Two structurally-distinct headers — the arm never inspects them (the cryptographic verification
+    // runs at the integration layer, which holds the chain-sourced offender key).
+    fn eq_hdr(tag: u8) -> EquivocationHeader {
+        EquivocationHeader {
+            timestamp: 1_700_000_000,
+            merkle_root: [tag; 32],
+            previous_hash: [0u8; 32],
+            state_root: [tag; 32],
+            vrf_output: None,
+            timeout_round: 0,
+            carried_baseline: 0,
+            pk_digest: [0u8; 32],
+            signature: vec![tag; 8],
+        }
+    }
+
+    // The ban must land in ACCOUNT state, because the reward filter reads it there — a settle-height
+    // computation cannot reach back to the macroblock that certified the ban.
+    #[test]
+    fn equivocation_proof_bans_the_offender_account() {
+        let mut accts: HashMap<String, Account> = HashMap::new();
+        let mut tx = hb("super_ban", 100);
+        tx.tx_type = TransactionType::EquivocationProof {
+            offender: "super_ban".to_string(),
+            height: 42,
+            block_a: eq_hdr(1),
+            block_b: eq_hdr(2),
+        };
+        tx.hash = tx.calculate_hash();
+
+        // The offender MUST be in the affected set, or the arm would touch an address that is neither
+        // pre-loaded nor journaled — the rollback would then clobber the real account.
+        assert!(tx.get_all_affected_addresses().contains(&"super_ban".to_string()));
+
+        tx.apply_to_state_at(&mut accts, 500).unwrap();
+        assert_eq!(accts.get("super_ban").unwrap().banned_at_height, 500);
+
+        // Write-once: a later proof for the same identity must not move the height (bans are permanent,
+        // and a moving value would make re-apply and replay disagree on the leaf).
+        tx.apply_to_state_at(&mut accts, 900).unwrap();
+        assert_eq!(accts.get("super_ban").unwrap().banned_at_height, 500);
+    }
+
+    // A FUTURE anchor must be ignored too. `saturating_sub` reads it as lag 0 and validate() bounds
+    // anchor_height nowhere, so without the upper bound a future-epoch anchor drives the forward roll
+    // and overwrites the live tally — a byzantine producer wiping its own settled epoch, or seeding a
+    // later one early.
+    #[test]
+    fn future_anchor_is_ignored_at_apply() {
+        let mut accts: HashMap<String, Account> = HashMap::new();
+        hb("super_f", 100).apply_to_state_at(&mut accts, 150).unwrap();
+        let (epoch, slots) = {
+            let a = accts.get("super_f").unwrap();
+            (a.heartbeat_epoch, a.heartbeat_slots)
+        };
+        // Anchor equal to the block height is already "not strictly past".
+        hb("super_f", 150).apply_to_state_at(&mut accts, 150).unwrap();
+        // A whole epoch ahead: this is what would have rolled the tally forward and cleared it.
+        hb("super_f", 14_400 + 10).apply_to_state_at(&mut accts, 200).unwrap();
+        let a = accts.get("super_f").unwrap();
+        assert_eq!(a.heartbeat_epoch, epoch, "future anchor must not roll the epoch");
+        assert_eq!(a.heartbeat_slots, slots, "future anchor must not touch the tally");
     }
 
     // Crossing into a new epoch finalizes the previous epoch's popcount (for the reward
@@ -4238,14 +4588,14 @@ mod tests_v34_heartbeat {
     #[test]
     fn apply_epoch_rollover_finalizes_previous() {
         let mut accts: HashMap<String, Account> = HashMap::new();
-        for sw in 0..3u64 { hb("super_x", sw * 1440 + 10).apply_to_state(&mut accts).unwrap(); }
+        for sw in 0..3u64 { hb("super_x", sw * 1440 + 10).apply_to_state_at(&mut accts, sw * 1440 + 60).unwrap(); }
         assert_eq!(accts.get("super_x").unwrap().heartbeat_slots.count_ones(), 3);
         // epoch 1 (anchor 14400+50): rollover
-        hb("super_x", 14_400 + 50).apply_to_state(&mut accts).unwrap();
+        hb("super_x", 14_400 + 50).apply_to_state_at(&mut accts, 14_400 + 100).unwrap();
         let a = accts.get("super_x").unwrap();
         assert_eq!(a.heartbeat_epoch, 1);
         assert_eq!(a.heartbeat_final_epoch, 0);
-        assert_eq!(a.heartbeat_final_count, 3, "prev epoch popcount finalized");
+        assert_eq!(a.heartbeat_final_slots.count_ones(), 3, "prev epoch popcount finalized");
         assert_eq!(a.heartbeat_slots, 0b1, "new epoch bitmask = subwindow 0 only");
     }
 
@@ -4253,7 +4603,7 @@ mod tests_v34_heartbeat {
     #[test]
     fn apply_nine_of_ten_reaches_threshold() {
         let mut accts: HashMap<String, Account> = HashMap::new();
-        for sw in 0..9u64 { hb("super_y", sw * 1440 + 10).apply_to_state(&mut accts).unwrap(); }
+        for sw in 0..9u64 { hb("super_y", sw * 1440 + 10).apply_to_state_at(&mut accts, sw * 1440 + 60).unwrap(); }
         assert_eq!(accts.get("super_y").unwrap().heartbeat_slots.count_ones(), 9);
     }
 
@@ -4262,17 +4612,18 @@ mod tests_v34_heartbeat {
     // is byte-identical network-wide. Drift here would split the signatures ⇒ no quorum forms.
     #[test]
     fn burn_attestation_message_is_canonical_and_type_distinct() {
-        let m = Transaction::burn_attestation_message("solSig", "walletA", 1500, &NodeType::Super, 1500, 5);
-        assert_eq!(m, Transaction::burn_attestation_message("solSig", "walletA", 1500, &NodeType::Super, 1500, 5), "deterministic");
-        assert_eq!(m, "burn_attest:solSig:walletA:1500:0:1500:5", "fixed format, Super=0, cost+epoch suffix");
+        let m = Transaction::burn_attestation_message("solSig", "solW", "walletA", 1500, &NodeType::Super, 1500, 5);
+        assert_eq!(m, Transaction::burn_attestation_message("solSig", "solW", "walletA", 1500, &NodeType::Super, 1500, 5), "deterministic");
+        assert_eq!(m, "burn_attest:solSig:solW:walletA:1500:0:1500:5", "fixed format, Super=0, burner+cost+epoch bound");
         // Every bound field (incl. node_type, cost AND attest_epoch) changes the signed message.
-        assert_ne!(m, Transaction::burn_attestation_message("solSig", "walletA", 1500, &NodeType::Light, 1500, 5));
-        assert_ne!(m, Transaction::burn_attestation_message("solSig", "walletA", 1501, &NodeType::Super, 1500, 5));
-        assert_ne!(m, Transaction::burn_attestation_message("solSig", "walletB", 1500, &NodeType::Super, 1500, 5));
-        assert_ne!(m, Transaction::burn_attestation_message("solSig2", "walletA", 1500, &NodeType::Super, 1500, 5));
-        assert_ne!(m, Transaction::burn_attestation_message("solSig", "walletA", 1500, &NodeType::Super, 1350, 5), "cost is bound");
-        assert_ne!(m, Transaction::burn_attestation_message("solSig", "walletA", 1500, &NodeType::Super, 1500, 6), "attest_epoch is bound");
-        assert_eq!(Transaction::burn_attestation_message("x", "y", 0, &NodeType::Light, 300, 3), "burn_attest:x:y:0:1:300:3", "Light=1");
+        assert_ne!(m, Transaction::burn_attestation_message("solSig", "solW", "walletA", 1500, &NodeType::Light, 1500, 5));
+        assert_ne!(m, Transaction::burn_attestation_message("solSig", "solW", "walletA", 1501, &NodeType::Super, 1500, 5));
+        assert_ne!(m, Transaction::burn_attestation_message("solSig", "solW", "walletB", 1500, &NodeType::Super, 1500, 5));
+        assert_ne!(m, Transaction::burn_attestation_message("solSig2", "solW", "walletA", 1500, &NodeType::Super, 1500, 5));
+        assert_ne!(m, Transaction::burn_attestation_message("solSig", "solW2", "walletA", 1500, &NodeType::Super, 1500, 5), "burner is bound");
+        assert_ne!(m, Transaction::burn_attestation_message("solSig", "solW", "walletA", 1500, &NodeType::Super, 1350, 5), "cost is bound");
+        assert_ne!(m, Transaction::burn_attestation_message("solSig", "solW", "walletA", 1500, &NodeType::Super, 1500, 6), "attest_epoch is bound");
+        assert_eq!(Transaction::burn_attestation_message("x", "s", "y", 0, &NodeType::Light, 300, 3), "burn_attest:x:s:y:0:1:300:3", "Light=1");
     }
 
     // Phase-1 cost formula: integer-deterministic, matching max(1500 - 150*floor(burn_pct/10), 300).

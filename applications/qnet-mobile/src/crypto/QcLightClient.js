@@ -41,6 +41,71 @@ const STATE_BYTES = LANES * 2;   // serialized LtHash state
 // Immutable per index; bounds inductive work across repeated balance checks.
 const _verifiedCache = new Map();
 
+// Negative cache: index → { reason, at }. Without it a macroblock this device can never verify is
+// re-fetched and re-verified on EVERY balance check — at committee 1000 that is ~501 ML-DSA opens per
+// call, forever, and the caller only ever sees `false` with no reason. Short-lived on purpose: the
+// cause is usually the SERVED proof, not the macroblock, so a different bootstrap node may well
+// succeed — the TTL bounds the retry rate without ever making a failure permanent.
+const _failedCache = new Map();
+const FAIL_TTL_MS = 60_000;
+
+// Guards re-entrancy of the cross-parity C_S walk (see verifyOne).
+const _csWalkInFlight = new Set();
+
+// ── weak-subjectivity pin ───────────────────────────────────────────────────
+// A non-zero pin MUST carry the derivation anchors for BOTH K and K-1 (one per parity chain). A
+// half-filled pin would root one parity and silently leave the other walking from genesis, so it is
+// refused outright rather than partially honoured.
+export function wsPinIsWellformed() {
+  const k = WS_CHECKPOINT.index || 0;
+  if (k === 0) return true; // inert: genesis-rooted, anchors unused
+  if (k < 2) return false;  // K-1 must itself be a real macroblock
+  const a = WS_CHECKPOINT.anchors || {};
+  for (const i of [k, k - 1]) {
+    const e = a[i];
+    if (!e || !e.eligible_raw || !e.beacon || !e.registry_root) return false;
+  }
+  return true;
+}
+
+// Derivation data for a PINNED index, or null. Deliberately NOT seeded into _verifiedCache: the pin
+// carries what j+2 needs to derive its committee, but NOT that index's own state_root/logs_root — a
+// cache entry would let a state-root query be answered from a value nobody verified.
+function pinnedAnchor(j) {
+  if (!wsPinIsWellformed()) return null;
+  const e = (WS_CHECKPOINT.anchors || {})[j];
+  if (!e) return null;
+  const ids = decodeEligibleNodeIds(hexToBytes(e.eligible_raw));
+  if (!ids.length) return null;
+  return { eligibleIds: ids, beacon: e.beacon, registryRoot: e.registry_root, pinned: true };
+}
+
+// THE anchor lookup: a macroblock this device verified itself, else a binary-pinned one.
+function anchorFor(j) {
+  return _verifiedCache.get(j) || pinnedAnchor(j);
+}
+
+// Lowest index this device can PROVE. Genesis-rooted: 1. Pinned at K: K+1 — K itself is trusted by
+// hash, but the pin carries no state_root/logs_root for it, so answering a query at K would mean
+// serving a value nobody verified.
+export function trustFloorIndex() {
+  const k = WS_CHECKPOINT.index || 0;
+  return k > 0 ? k + 1 : 1;
+}
+
+function noteFailure(j, reason) {
+  _failedCache.set(j, { reason, at: Date.now() });
+  return null;
+}
+
+// The live failure reason for `j`, or null once it has aged out.
+function recentFailure(j) {
+  const f = _failedCache.get(j);
+  if (!f) return null;
+  if (Date.now() - f.at >= FAIL_TTL_MS) { _failedCache.delete(j); return null; }
+  return f.reason;
+}
+
 // ── byte helpers ────────────────────────────────────────────────────────────
 function u64le(n) {
   // n may exceed 2^53; accept number | bigint | numeric string.
@@ -73,16 +138,48 @@ export function quorumSize(n) {
   return n - f;
 }
 
+// Smallest committee for which the recovery relaxation exists. Mirrors RELAXED_MIN_COMMITTEE.
+export const RELAXED_MIN_COMMITTEE = 10;
+// Checkpoint indices one recovery span covers (= 2 macroblocks). Mirrors RC_SPAN_INDICES.
+export const RC_SPAN_INDICES = 6;
+const CHECKPOINT_INTERVAL = 30;
+
+// Threshold under an active recovery pin. Floored to quorumSize below the committee floor, so the
+// relaxation is inert at genesis scale exactly as on the node.
+export function relaxedQuorum(n) {
+  if (n < RELAXED_MIN_COMMITTEE) return quorumSize(n);
+  return Math.floor(n / 2) + 1;
+}
+
+// The pin constrains the WINDOW only; the index is free. Mirrors recovery_window_head /
+// recovery_step_for_head on the node.
+export function recoveryWindowHead(anchorCpHead, k) {
+  return anchorCpHead + k * CHECKPOINT_INTERVAL;
+}
+
+// Step k implied by a window head, or null if it is off the span's grid.
+export function recoveryStepForHead(anchorCpHead, head) {
+  const delta = head - anchorCpHead;
+  if (!Number.isInteger(delta) || delta <= 0 || delta % CHECKPOINT_INTERVAL !== 0) return null;
+  const k = delta / CHECKPOINT_INTERVAL;
+  return k <= RC_SPAN_INDICES ? k : null;
+}
+
 // ── 2. Checkpoint.hash() — SHA3-256 over consensus-critical fields ───────────
 // Layout (checkpoint_bft.rs Checkpoint::hash): tag ++ index(u64LE)
 //   ++ [parent_qc.checkpoint_hash(32) ++ parent_qc.index(u64LE)]?  ++ window_head_height(u64LE)
 //   ++ window_mb_hashes[](32 each) ++ state_root(32) ++ beacon(32) ++ epoch_commitment(32)
 //   ++ reward_root(32) ++ registry_root(32) ++ logs_root(32) ++ dilithium_pk_root(32)
+//   ++ reward_epoch_root(32)
 //   ++ total_supply(u64LE) ++ timestamp(u64LE) ++ proposer.utf8 → 32B hash.
 // logs_root is CONSENSUS-ACTIVE from genesis (gate=0): the window's committed event logs (native
 // QRC-20/721 transfers + WASM emit_log) merkle-rooted; [0;32] only for a window with no logs.
-// dilithium_pk_root (FIX-5): LtHash digest of committed (address->ML-DSA-65 pk) bindings; hashed
-// AFTER logs_root, BEFORE total_supply — MUST match checkpoint_bft.rs exactly or every cp is rejected.
+// dilithium_pk_root (FIX-5): LtHash digest of committed (address->ML-DSA-65 pk) bindings.
+// reward_epoch_root: LtHash over certified (epoch, reward root) pairs; hashed AFTER
+// dilithium_pk_root, BEFORE total_supply — MUST match checkpoint_bft.rs exactly or every cp is rejected.
+// recovery_anchor is the LAST field and is folded TAGGED (0 = absent, 1 ++ mb(u64LE) ++ hash(32)),
+// so null can never collide with (0, zeros). The tag byte is written unconditionally — an ordinary
+// full-quorum checkpoint hashes a single 0x00, and omitting it here would diverge EVERY checkpoint.
 export function checkpointHash(cp) {
   const parts = [utf8('qnet-checkpoint-v2'), u64le(cp.index)];
   if (cp.parent_qc) {
@@ -98,10 +195,48 @@ export function checkpointHash(cp) {
   parts.push(hexToBytes(cp.registry_root));
   parts.push(hexToBytes(cp.logs_root || '0'.repeat(64)));
   parts.push(hexToBytes(cp.dilithium_pk_root || '0'.repeat(64)));
+  parts.push(hexToBytes(cp.reward_epoch_root || '0'.repeat(64)));
   parts.push(u64le(cp.total_supply));
   parts.push(u64le(cp.timestamp));
   parts.push(utf8(cp.proposer));
+  const ra = cp.recovery_anchor;
+  if (ra && ra.length === 2) {
+    parts.push(Buffer.from([1]));
+    parts.push(u64le(ra[0]));
+    parts.push(hexToBytes(ra[1]));
+  } else {
+    parts.push(Buffer.from([0]));
+  }
   return sha3_256(concat(parts)); // lowercase hex (32B)
+}
+
+// ── Relaxed-QC admission on device ──────────────────────────────────────────
+// The device holds no chain, so it cannot resolve C_S from the anchor macroblock by itself; the
+// node serves the anchor's committee alongside the proof. Everything checkable WITHOUT the anchor is
+// checked here, and the effective threshold is returned. Returns null when the pin is malformed —
+// the caller then rejects, which is advisory on device (it degrades a confirmation, never state).
+export function recoveryThreshold(cp, committee, anchor) {
+  if (!cp.recovery_anchor) return quorumSize(committee.length);
+  if (!anchor) return null;                                    // pinned but no anchor served
+  const [a, ah] = cp.recovery_anchor;
+  if (!a || a < 1) return null;
+  if (String(anchor.mb_hash || '').toLowerCase() !== String(ah || '').toLowerCase()) return null;
+  if (anchor.recovery_anchor) return null;                     // no chained spans
+  const cs = anchor.committee || [];
+  if (cs.length < RELAXED_MIN_COMMITTEE) return null;          // below the floor: not a relaxation
+  if (cs.length !== committee.length || cs.some((id, i) => id !== committee[i])) return null;
+  // k comes from the WINDOW HEAD, mirroring recovery_step_for_head on the node. Deriving it from the
+  // index delta rejected every genuine relaxed checkpoint: a TimeoutCertificate advances the view
+  // without certifying a window, so the index is deliberately not pinned.
+  const k = recoveryStepForHead(anchor.cp_head, cp.window_head_height);
+  if (k === null) return null;
+  // The anchor must be the CURRENT height's macroblock boundary, not any older committee the device
+  // once walked — without this the rule degrades to "n/2+1 of some historical committee".
+  if (anchor.cp_head !== a * MACROBLOCK_INTERVAL) return null;
+  if (!cp.parent_qc || cp.parent_qc.index + 1 !== cp.index) return null;
+  if (k === 1 && String(cp.parent_qc.checkpoint_hash).toLowerCase()
+                 !== String(anchor.qc_checkpoint_hash || '').toLowerCase()) return null;
+  return relaxedQuorum(cs.length);
 }
 
 // ── 3. Parse the ATTACHED dilithium sig string → detached sig hex ───────────
@@ -281,8 +416,10 @@ export function decodeEligibleNodeIds(eligibleRawBytes) {
 // Verifies a random sample of K committee signatures over the canonical vote
 // message; requires ALL sampled sigs valid AND distinct signers ≥ quorum.
 // pubkeysByNode: node_id → TRUSTED pk_hex (genesis map, or registry-verified).
-async function verifyQcFull(qc, committee, pubkeysByNode, checkpointHashHex) {
-  const q = quorumSize(committee.length);
+async function verifyQcFull(qc, committee, pubkeysByNode, checkpointHashHex, quorum) {
+  // The threshold is CALLER-supplied for the same reason as on the node: a certificate must never
+  // choose its own bar, and only the caller knows whether the recovery pin resolved.
+  const q = quorum == null ? quorumSize(committee.length) : quorum;
   if (q === 0) return false;
   const signers = qc.signers || [];
   const sigs = qc.sigs || [];
@@ -318,43 +455,59 @@ async function verifyQcFull(qc, committee, pubkeysByNode, checkpointHashHex) {
 
 // ── trusted pubkeys for a macroblock's committee ────────────────────────────
 // Genesis era (index < 3): committee = the 5 genesis ids, keys from the embedded
-// map. Epoch ≥ 3: derive committee via sampleCommittee over the served N-2
-// eligible_producers + beacon, then verify each served committee pubkey against
-// the QC-signed registry_root (recomputed from the served registry entries).
-async function resolvePubkeys(committee, cp, servedPubkeys, registryFetch) {
-  // Fetch the registry as of THIS macroblock's window head (where its registry_root is sealed),
-  // recompute the LtHash root, require it == the QC-signed cp.registry_root, then bind each committee
-  // member's served pubkey by sha3(pubkey)==entry.vrf_pk_sha3. Returns the trusted pubkey map or null.
-  const regHeight = cp.window_head_height;
+// map. Epoch ≥ 3: derive committee via sampleCommittee over the ALREADY-VERIFIED j-2
+// eligible_producers + beacon, then bind each served pubkey to the ALREADY-VERIFIED j-2
+// registry_root. Both the ids and the keys are therefore rooted in a certified ancestor.
+//
+// `anchorRoot` / `anchorHeight` MUST come from a checkpoint this device already verified, never
+// from `cp`. Binding to cp.registry_root was circular: cp is the very object whose QC is being
+// authenticated, so a server answering both the proof and the registry endpoint could mint
+// keypairs for the (publicly derivable) committee ids, publish entries whose vrf_pk_sha3 matched
+// them, set cp.registry_root to that set's root, and sign a forged state_root with its own keys —
+// every check passed by construction. Every member of committee_j is drawn from eligible_of(j-2)
+// and so is registered at or below (j-2)*90, which is exactly what the j-2 root covers.
+//
+// Missing or unbindable members are SKIPPED, not fatal: verifyQcFull needs `quorum` distinct valid
+// signatures and already tolerates a per-signer gap, so demanding a key for every derived member
+// only ever turns a verifiable macroblock into a dead one — and the walk is bottom-up, so one dead
+// index kills every higher index on that parity chain. A skipped key cannot help an attacker; it
+// strictly reduces the set of signatures that can count toward quorum.
+export async function resolvePubkeys(committee, anchorRoot, anchorHeight, servedPubkeys, registryFetch, needed) {
   let registry;
   try {
-    registry = await registryFetch(regHeight);
+    registry = await registryFetch(anchorHeight);
   } catch (e) {
-    console.warn('[WARN][REGISTRY] fetch_failed height=' + regHeight + ' err=' + (e && e.message));
+    console.warn('[WARN][REGISTRY] fetch_failed height=' + anchorHeight + ' err=' + (e && e.message));
     return null;
   }
   if (!registry || !Array.isArray(registry.entries)) {
-    console.warn('[WARN][REGISTRY] malformed height=' + regHeight);
+    console.warn('[WARN][REGISTRY] malformed height=' + anchorHeight);
     return null;
   }
-  if (recomputeRegistryRoot(registry.entries) !== cp.registry_root) {
-    console.warn('[ERR][REGISTRY] root_mismatch height=' + regHeight);
+  if (recomputeRegistryRoot(registry.entries) !== anchorRoot) {
+    console.warn('[ERR][REGISTRY] root_mismatch height=' + anchorHeight);
     return null;
   }
   const entryByNode = new Map(registry.entries.map((e) => [e.node_id, e]));
   const pubkeys = {};
+  let bound = 0;
   for (const nodeId of committee) {
     const pkHex = servedPubkeys[nodeId];
     const entry = entryByNode.get(nodeId);
-    if (!pkHex || !entry || !entry.vrf_pk_sha3) {
-      console.warn('[WARN][REGISTRY] no_pk_or_entry node=' + nodeId);
-      return null;
-    }
+    if (!pkHex || !entry || !entry.vrf_pk_sha3) continue;
     if (sha3_256(hexToBytes(pkHex)) !== entry.vrf_pk_sha3) {
       console.warn('[ERR][REGISTRY] pk_sha3_mismatch node=' + nodeId);
-      return null;
+      continue;
     }
     pubkeys[nodeId] = pkHex;
+    bound += 1;
+  }
+  // Cheap pre-check only: verifyQcFull enforces the real threshold on VALID signatures. `needed` is
+  // the threshold THIS checkpoint is judged at, which under a recovery pin is the relaxed one —
+  // hard-coding the full quorum here would reject a legitimately relaxed macroblock.
+  if (bound < needed) {
+    console.warn('[WARN][REGISTRY] bound_below_threshold bound=' + bound + ' need=' + needed + ' committee=' + committee.length);
+    return null;
   }
   return pubkeys;
 }
@@ -380,19 +533,21 @@ async function fetchJson(url, timeoutMs = 10000) {
 // sample_committee over the VERIFIED j-2 eligible+beacon from cache (NOT server-supplied). Verify the
 // QC in full, then anchor j's OWN eligible+banned via the QC-signed epoch_commitment. Caches
 // {stateRoot, checkpointHash, eligibleIds, beacon} so j+2 derives its committee from this.
-async function verifyOne(j, proof, registryFetch) {
+async function verifyOne(j, proof, registryFetch, csWalk) {
   const cp = proof.checkpoint;
   if (proof.index !== j || Math.floor((cp.window_head_height || 0) / MACROBLOCK_INTERVAL) !== j) {
     console.warn('[ERR][LIGHT] index_or_head_mismatch j=' + j + ' idx=' + proof.index + ' whh=' + cp.window_head_height);
-    return null;
+    return noteFailure(j, 'index_or_head_mismatch');
   }
   let committee, pubkeys;
   if (j < GENESIS_ERA_MAX_INDEX) {
     committee = GENESIS_NODE_IDS.slice();
     pubkeys = { ...GENESIS_CONSENSUS_PKS };
   } else {
-    const anchor = _verifiedCache.get(j - 2); // populated by the bottom-up parity walk
+    const anchor = anchorFor(j - 2); // verified by the walk, or the binary WS pin at the root
     if (!anchor || !Array.isArray(anchor.eligibleIds) || !anchor.beacon) {
+      // NOT cached: this is a consequence of an earlier step in THIS walk failing, not a fact about
+      // j. Recording it would suppress j's own retry once the earlier step recovers.
       console.warn('[WARN][LINEAGE] anchor_missing j=' + j + ' need=' + (j - 2));
       return null;
     }
@@ -400,13 +555,64 @@ async function verifyOne(j, proof, registryFetch) {
     // derive it from j (already bound via window_head_height/90==j), NEVER from the server-supplied
     // proof.epoch (an unbound seed would let an attacker grind the committee subset).
     committee = sampleCommittee([...anchor.eligibleIds].sort(), j, anchor.beacon);
-    pubkeys = await resolvePubkeys(committee, cp, proof.committee_pubkeys || {}, registryFetch);
-    if (!pubkeys) return null;
+    if (!anchor.registryRoot) return noteFailure(j, 'anchor_registry_root_missing');
+    pubkeys = await resolvePubkeys(committee, anchor.registryRoot, (j - 2) * MACROBLOCK_INTERVAL,
+                                   proof.committee_pubkeys || {}, registryFetch, quorumSize(committee.length));
+    if (!pubkeys) return noteFailure(j, 'pubkeys_unresolved');
   }
   const cpHash = checkpointHash(cp); // recompute, never trust a served hash
-  if (!(await verifyQcFull(proof.qc || {}, committee, pubkeys, cpHash))) {
+  // A pinned checkpoint is certified by the ANCHOR's committee (C_S) at the RELAXED threshold, not by
+  // the committee derived above. C_S must be DERIVED here, never taken from the server.
+  //
+  // The first version passed the served list in as both arguments, so recoveryThreshold compared it to
+  // itself and the check was vacuous: a node serving its own 10 registered supers as `committee` could
+  // certify a forged state_root at relaxedQuorum(10)=6 and the device would accept it, then cache the
+  // poisoned entry up the parity chain. That defeats the entire point of a trustless light client.
+  //
+  // C_S is sample_committee(eligible_of(a-2), a, beacon_of(a-2)) — exactly the derivation used for the
+  // ordinary path — so the device can compute it whenever it has ALREADY verified macroblock a-2. If it
+  // has not, the pin is refused: a relaxed macroblock is rare (it exists only during a halt recovery on
+  // a committee of at least RELAXED_MIN_COMMITTEE), and refusing costs a confirmation, while trusting
+  // the server costs the balance.
+  let quorum = quorumSize(committee.length);
+  if (cp.recovery_anchor) {
+    const rcAnchor = proof.recovery_anchor_info || null;
+    const anchorMb = Array.isArray(cp.recovery_anchor) ? cp.recovery_anchor[0] : 0;
+    let csSource = anchorMb >= 2 ? anchorFor(anchorMb - 2) : null;
+    // C_S's source sits on the OPPOSITE parity chain whenever j - anchorMb is odd, and this walk only
+    // ever verifies j's own chain — so at anchor+1 it was underivable forever, not just this round.
+    // Verify it on its own chain instead. anchorMb is untrusted here (the QC that would bind it is
+    // what we are trying to check), so bound the walk by anchorMb < j — structurally true for any
+    // real span, and it makes the recursion strictly decreasing.
+    if (!csSource && anchorMb >= 2 && anchorMb < j && typeof csWalk === 'function'
+        && !_csWalkInFlight.has(anchorMb - 2)) {
+      _csWalkInFlight.add(anchorMb - 2);
+      try { csSource = await csWalk(anchorMb - 2); }
+      catch (_) { csSource = null; }
+      finally { _csWalkInFlight.delete(anchorMb - 2); }
+    }
+    if (!csSource || !Array.isArray(csSource.eligibleIds) || !csSource.beacon) {
+      // Not a permanent verdict: the walk may reach a-2 later, and the TTL lets it retry.
+      console.warn('[ERR][LIGHT] rc_anchor_committee_underivable j=' + j + ' need=' + (anchorMb - 2));
+      return noteFailure(j, 'rc_anchor_committee_underivable');
+    }
+    const derivedCs = sampleCommittee([...csSource.eligibleIds].sort(), anchorMb, csSource.beacon);
+    quorum = recoveryThreshold(cp, derivedCs, rcAnchor);
+    if (quorum == null) {
+      // Includes "the node served no anchor info at all", which a different bootstrap node may well
+      // supply — hence the TTL rather than a permanent verdict.
+      console.warn('[ERR][LIGHT] rc_pin_invalid j=' + j);
+      return noteFailure(j, 'rc_pin_invalid');
+    }
+    committee = derivedCs;
+    if (!csSource.registryRoot) return noteFailure(j, 'rc_anchor_registry_root_missing');
+    pubkeys = await resolvePubkeys(committee, csSource.registryRoot, (anchorMb - 2) * MACROBLOCK_INTERVAL,
+                                   proof.committee_pubkeys || {}, registryFetch, quorum);
+    if (!pubkeys) return noteFailure(j, 'rc_pubkeys_unresolved');
+  }
+  if (!(await verifyQcFull(proof.qc || {}, committee, pubkeys, cpHash, quorum))) {
     console.warn('[ERR][LIGHT] qc_invalid j=' + j);
-    return null;
+    return noteFailure(j, 'qc_invalid');
   }
   // Anchor j's epoch-transition data: recompute epoch_commitment over the served raw eligible bytes +
   // the (derived) committee + served banned; it MUST equal the QC-signed cp.epoch_commitment. This
@@ -414,10 +620,13 @@ async function verifyOne(j, proof, registryFetch) {
   const eligibleBytes = hexToBytes(proof.eligible_raw || '');
   if (epochCommitment(eligibleBytes, committee, proof.banned || []) !== cp.epoch_commitment) {
     console.warn('[ERR][LIGHT] epoch_commitment_mismatch j=' + j);
-    return null;
+    return noteFailure(j, 'epoch_commitment_mismatch');
   }
-  const entry = { stateRoot: cp.state_root, logsRoot: cp.logs_root, checkpointHash: cpHash, eligibleIds: decodeEligibleNodeIds(eligibleBytes), beacon: cp.beacon };
+  // registryRoot is retained because j+2 binds its committee's pubkeys to it. It is certified: the QC
+  // over cpHash, which folds registry_root, has just been verified.
+  const entry = { stateRoot: cp.state_root, logsRoot: cp.logs_root, checkpointHash: cpHash, eligibleIds: decodeEligibleNodeIds(eligibleBytes), beacon: cp.beacon, registryRoot: cp.registry_root };
   _verifiedCache.set(j, entry);
+  _failedCache.delete(j);
   console.log('[INFO][LIGHT] macroblock_verified j=' + j + ' committee=' + committee.length);
   return entry;
 }
@@ -428,24 +637,42 @@ async function verifyOne(j, proof, registryFetch) {
 async function verifyMacroblockAt(idx, getRandomBootstrapNode) {
   if (_verifiedCache.has(idx)) return _verifiedCache.get(idx);
   const registryFetch = (height) => fetchJson(getRandomBootstrapNode() + '/api/v1/registry/height/' + height);
-  // WS=0 ⇒ start in the genesis era (committee pinned). When a non-zero WS pin is shipped (binary
-  // rotation, to bound the walk on a mature chain), the pinned macroblock's eligible+beacon must be
-  // embedded so the first step's anchor exists; until then the walk is genesis-rooted.
-  const start = (idx % 2 === 0) ? 2 : 1;
+  // Lets a recovery pin reach its C_S source on the other parity chain. See verifyOne.
+  const csWalk = (i) => verifyMacroblockAt(i, getRandomBootstrapNode);
+  // Walk root. WS=0 ⇒ genesis era (committee pinned, first two indices use the embedded genesis set).
+  // WS=K ⇒ root at the pin: this parity's first derivable index is K+1 or K+2, whichever matches idx's
+  // parity, because its N-2 anchor is then K-1 or K — the pair the pin embeds. That bounds the walk to
+  // (idx - K)/2 steps instead of idx/2 on a mature chain.
+  const k = WS_CHECKPOINT.index || 0;
+  if (k > 0 && !wsPinIsWellformed()) {
+    console.warn('[ERR][LIGHT] ws_pin_malformed index=' + k + ' — refusing to verify');
+    return null;
+  }
+  const start = k > 0
+    ? (((idx - (k + 1)) % 2 === 0) ? k + 1 : k + 2)
+    : ((idx % 2 === 0) ? 2 : 1);
   for (let j = start; j <= idx; j += 2) {
     if (_verifiedCache.has(j)) continue;
+    // A step that just failed is not re-verified until its TTL lapses. The walk still stops here —
+    // j+2's committee is derived from j — but it stops WITHOUT re-running the fetch and the ~quorum
+    // ML-DSA opens on every balance check, and the caller learns why.
+    const stale = recentFailure(j);
+    if (stale) {
+      console.warn('[WARN][LIGHT] walk_halted j=' + j + ' reason=' + stale + ' (cached, retries after TTL)');
+      return null;
+    }
     let proof;
     try {
       proof = await fetchJson(getRandomBootstrapNode() + '/api/v1/macroblock/' + j + '/proof');
     } catch (e) {
       console.warn('[WARN][LIGHT] proof_fetch_failed j=' + j + ' err=' + (e && e.message));
-      return null;
+      return noteFailure(j, 'proof_fetch_failed');
     }
     if (!proof || !proof.checkpoint || typeof proof.index !== 'number') {
       console.warn('[WARN][LIGHT] proof_malformed j=' + j);
-      return null;
+      return noteFailure(j, 'proof_malformed');
     }
-    if (!(await verifyOne(j, proof, registryFetch))) return null;
+    if (!(await verifyOne(j, proof, registryFetch, csWalk))) return null;
   }
   return _verifiedCache.get(idx) || null;
 }
@@ -472,8 +699,9 @@ export async function verifyMacroblockStateRoot(stateRoot, blockHeight, getRando
 
   const idx = Math.floor((blockHeight || 0) / MACROBLOCK_INTERVAL);
   // Fail closed below idx 1 (no finalized macroblock covers heights < 90 — macroblock 1 is the first)
-  // AND below the weak-subjectivity anchor (outside the trust window).
-  const floor = Math.max(1, WS_CHECKPOINT.index || 0);
+  // AND at-or-below the weak-subjectivity pin: the pin carries hash(MB_K) and K's committee-derivation
+  // data, NOT K's state_root, so indices up to K are trusted history this device cannot re-prove.
+  const floor = trustFloorIndex();
   if (idx < floor) {
     console.warn('[WARN][LIGHT] below_floor idx=' + idx + ' floor=' + floor);
     return false;
@@ -508,7 +736,7 @@ export async function verifyMacroblockLogsRoot(logsRoot, windowEnd, getRandomBoo
   if (!logsRoot || typeof logsRoot !== 'string') return false;
   if (typeof getRandomBootstrapNode !== 'function') return false;
   const idx = Math.floor((windowEnd || 0) / MACROBLOCK_INTERVAL);
-  const floor = Math.max(1, WS_CHECKPOINT.index || 0);
+  const floor = trustFloorIndex();
   if (idx < floor) return false; // below the finalized/trust floor — unprovable, not a forgery
   try {
     const verified = await verifyMacroblockAt(idx, getRandomBootstrapNode);
@@ -529,6 +757,8 @@ export async function verifyMacroblockLogsRoot(logsRoot, windowEnd, getRandomBoo
 /** Drop the in-memory verified-proof cache (e.g. on network switch). */
 export function clearQcCache() {
   _verifiedCache.clear();
+  // Both, or a network switch would keep refusing the walk on the OLD network's failures.
+  _failedCache.clear();
 }
 
 /*

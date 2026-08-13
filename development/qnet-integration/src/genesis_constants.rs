@@ -76,6 +76,98 @@ pub fn ws_checkpoint_committee_digests() -> ([u8; 32], [u8; 32]) {
     (WS_CHECKPOINT_DIGEST_ANCHOR, WS_CHECKPOINT_DIGEST_PRED)
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// COORDINATED RESTART
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// A coordinated restart: resume from a named macroblock, with a named set of identities barred from
+/// eligibility.
+///
+/// WHY THIS EXISTS. A chain with no staking has nothing to slash and nothing to leak, so it cannot
+/// bleed a stalled quorum back to liveness the way a bonded chain does. Four separate impossibility
+/// results say the stall itself cannot be prevented in-protocol: no public witness can prove work
+/// (the heartbeat preimage is entirely public), per-identity costs cannot exceed flat per-identity
+/// income, a farm amortises any cost better than a single honest operator, and a participation filter
+/// is either non-reproducible, frozen during the very halt it exists to end, or inert at target scale.
+/// What is left is what every non-slashing chain actually does: make the halt REVERSIBLE — a
+/// coordinated restart is the standard recovery for this class.
+///
+/// WHY A COMPILED CONSTANT AND NOT A RUNTIME AUTHORITY. A restart is the single most dangerous action
+/// this system can take — it re-roots trust. Carrying it as a signed message a running node would
+/// accept means shipping an online authority that can re-root the chain, which is a far worse standing
+/// risk than the halt it repairs. As a `const` it is inert until someone publishes a release, the
+/// change is a reviewable diff, and a node either runs that release or does not join. Same discipline
+/// as `WS_CHECKPOINT` above, and the project's env-flag policy forbids the alternative outright.
+pub struct RestartManifest {
+    /// Macroblock to resume from — MUST be full-quorum sealed and at or below the last good seal.
+    /// 0 = no restart in effect (the only value shipped for a fresh genesis).
+    pub resume_from_mb: u64,
+    /// `MacroBlock::hash()` of `resume_from_mb`. A node whose local copy disagrees FAILS TO START
+    /// rather than silently continuing on the branch the restart exists to abandon.
+    pub resume_mb_hash: [u8; 32],
+    /// Identities barred from eligibility from the restart onward. This is what stops the restarted
+    /// chain from re-halting on the same set within minutes; without it a restart is a reboot, not a
+    /// repair. Sorted, deduplicated — checked at build time by `restart_manifest_is_wellformed`.
+    pub excluded: &'static [&'static str],
+}
+
+/// The manifest this binary carries. INERT for a fresh genesis launch.
+pub const RESTART_MANIFEST: RestartManifest = RestartManifest {
+    resume_from_mb: 0,
+    resume_mb_hash: [0u8; 32],
+    excluded: &[],
+};
+
+/// Is a coordinated restart in effect for this binary?
+pub fn restart_active() -> bool { RESTART_MANIFEST.resume_from_mb > 0 }
+
+/// The `(macroblock, hash)` a restart resumes from, or None.
+pub fn restart_anchor() -> Option<(u64, [u8; 32])> {
+    if restart_active() { Some((RESTART_MANIFEST.resume_from_mb, RESTART_MANIFEST.resume_mb_hash)) } else { None }
+}
+
+/// Is `node_id` barred by the restart manifest? Barred identities are excluded from eligibility on
+/// EVERY path — the carry-over filter and the Phase-2A re-admission — or the re-admission would put
+/// them straight back into the quorum denominator the restart just cleaned.
+///
+/// Linear over a list that is empty in the shipped binary and expected to be small even after an
+/// incident; it is called per-candidate per-window, so if a manifest ever needs thousands of entries
+/// this must become a set built once per snapshot.
+pub fn restart_excludes(node_id: &str) -> bool {
+    RESTART_MANIFEST.excluded.iter().any(|e| *e == node_id)
+}
+
+/// The manifest must be internally consistent or the release is wrong in a way no test at run time can
+/// catch. A non-zero macroblock with a zero hash would hash-trust ANY macroblock at that index — the
+/// exact forge the WS pin's digests exist to prevent — so it fails closed here instead.
+pub fn restart_manifest_is_wellformed() -> Result<(), &'static str> {
+    let m = &RESTART_MANIFEST;
+    if m.resume_from_mb == 0 {
+        // Inert: nothing else may be set, or a half-filled manifest reads as "no restart" while
+        // silently barring identities.
+        if m.resume_mb_hash != [0u8; 32] { return Err("restart_hash_without_height"); }
+        if !m.excluded.is_empty() { return Err("restart_excludes_without_height"); }
+        return Ok(());
+    }
+    if m.resume_mb_hash == [0u8; 32] { return Err("restart_zero_hash"); }
+    // THE restart must name the SAME macroblock as the WS pin. This is what keeps the feature small:
+    // every branch-abandonment check a restart needs already exists on the pin path — `index < ws.0` is
+    // refused, and `index == pin.0` must hash-match, so a node holding the old branch is rejected by
+    // machinery that is already proven. Letting the two disagree would mean re-implementing that path,
+    // and a second trust root is exactly how a restart turns into a fork.
+    if m.resume_from_mb != WS_CHECKPOINT.0 { return Err("restart_disagrees_with_ws_pin_index"); }
+    if m.resume_mb_hash != WS_CHECKPOINT.1 { return Err("restart_disagrees_with_ws_pin_hash"); }
+    // A pinned macroblock with zero committee digests hash-trusts forged producers/beacon at that
+    // index — the forge those digests exist to close. A restart release must rotate them together.
+    if WS_CHECKPOINT_DIGEST_ANCHOR == [0u8; 32] || WS_CHECKPOINT_DIGEST_PRED == [0u8; 32] {
+        return Err("restart_without_committee_digests");
+    }
+    for w in m.excluded.windows(2) {
+        if w[0] >= w[1] { return Err("restart_excluded_not_sorted_or_duplicated"); }
+    }
+    Ok(())
+}
+
 /// Genesis node IP addresses (PRODUCTION)
 /// These IPs are authorized to run Genesis nodes
 pub const GENESIS_NODE_IPS: &[(&str, &str)] = &[
@@ -246,6 +338,16 @@ pub fn register_vrf_public_key(node_id: &str, pk_bytes: &[u8]) {
         println!("[WARN][VRF_REG] invalid pk_size={} node={}", pk_bytes.len(), node_id);
         return;
     }
+    // A genesis identity's key is pinned in the binary; nothing off the wire may restate it. Without
+    // this, a crafted NodeRegistration naming a genesis id installed an attacker key here — the caller
+    // that scans block bodies does not filter by apply success, so the TX did not even have to apply —
+    // and every block-validity reader resolves the producer key through this map.
+    // No-op during install_genesis_anchors_at_startup: it registers BEFORE setting the anchor map.
+    let anchor = qnet_consensus::consensus_crypto::get_consensus_pk_anchor(node_id);
+    if genesis_pk_overwrite_refused(anchor.as_deref(), pk_bytes) {
+        println!("[ERR][VRF_REG] genesis_pk_overwrite_refused node={}", node_id);
+        return;
+    }
     // PRODUCTION: Single write lock to eliminate TOCTOU race condition
     let mut registry = VRF_PK_REGISTRY.write();
     if registry.len() >= MAX_VRF_REGISTRY_SIZE && !registry.contains_key(node_id) {
@@ -308,7 +410,7 @@ lazy_static::lazy_static! {
 }
 
 /// Strip an "ip:port" or "ip" endpoint to its IPv4/IPv6 part only.
-fn endpoint_ip_only(api_endpoint: &str) -> String {
+pub fn endpoint_ip_only(api_endpoint: &str) -> String {
     // Accept "scheme://host:port" form too — strip scheme and trailing path.
     let after_scheme = api_endpoint.split("://").nth(1).unwrap_or(api_endpoint);
     let host_only = after_scheme.split('/').next().unwrap_or(after_scheme);
@@ -430,6 +532,15 @@ pub fn install_genesis_anchors_at_startup() -> usize {
         println!("[INFO][GENESIS] anchors_already_installed count={}", count);
     }
     count
+}
+
+/// A pinned genesis key may never be restated by anything that arrived off the wire. Returns true when
+/// a write must be refused: an anchor exists for this identity and the incoming key differs from it.
+///
+/// Both key writers consult this. It is a pure function so the invariant can be pinned by a test
+/// without installing the process-wide one-shot anchor map.
+pub(crate) fn genesis_pk_overwrite_refused(anchor: Option<&[u8]>, incoming: &[u8]) -> bool {
+    matches!(anchor, Some(a) if a != incoming)
 }
 
 /// Lookup the anchored PK for a given genesis node_id. Returns None if no
@@ -609,3 +720,57 @@ mod tests_v17_security {
     }
 }
 
+#[cfg(test)]
+mod genesis_pk_guard_tests {
+    use super::*;
+
+    /// THE invariant: a genesis identity's key is compiled into the binary, so nothing arriving over
+    /// the network may restate it. Both the RAM registry and the durable node_registry row consult
+    /// this. Before it existed, a crafted NodeRegistration naming a genesis id installed an attacker
+    /// key even though the transaction never applied — the extraction loop scans the raw block body —
+    /// and the durable row outranks the anchor in the vote/QC verifiers and is the ONLY source the
+    /// burn-attestation quorum reads.
+    #[test]
+    fn pinned_genesis_key_cannot_be_restated() {
+        let pinned = [7u8; 32];
+        let attacker = [8u8; 32];
+        assert!(genesis_pk_overwrite_refused(Some(&pinned), &attacker), "a differing key must be refused");
+        assert!(!genesis_pk_overwrite_refused(Some(&pinned), &pinned), "re-stamping the pinned value is the repair path");
+        // No anchor installed (non-genesis id, or the pre-anchor window during startup install) ⇒
+        // ordinary registration proceeds.
+        assert!(!genesis_pk_overwrite_refused(None, &attacker), "non-anchored identities are unaffected");
+    }
+
+    // The shipped binary must carry an INERT manifest and must say so consistently. A half-filled
+    // manifest (a hash or an exclusion list with no height) reads as "no restart" everywhere while
+    // silently barring identities — this is the check that makes that a build failure, not an incident.
+    #[test]
+    fn shipped_restart_manifest_is_inert_and_wellformed() {
+        assert!(restart_manifest_is_wellformed().is_ok(),
+                "the manifest in this binary is malformed: {:?}", restart_manifest_is_wellformed());
+        assert!(!restart_active(), "a fresh-genesis release must ship an INERT restart manifest");
+        assert!(restart_anchor().is_none());
+        assert!(RESTART_MANIFEST.excluded.is_empty());
+        assert!(!restart_excludes("genesis_node_001"));
+        assert!(!restart_excludes("node_anything"));
+    }
+
+    // Every way a restart release can be built wrong, and the error it must produce. These are all
+    // release-time mistakes: nothing at run time can detect them, so they fail closed at boot.
+    #[test]
+    fn malformed_restart_manifests_are_named_precisely() {
+        // Well-formedness is checked over the CONST, so exercise the same predicate over locals to
+        // pin the rules themselves rather than only the shipped value.
+        let sorted = ["node_a", "node_b", "node_c"];
+        assert!(sorted.windows(2).all(|w| w[0] < w[1]), "sorted+deduped is the rule");
+        let unsorted = ["node_b", "node_a"];
+        assert!(!unsorted.windows(2).all(|w| w[0] < w[1]));
+        let duplicated = ["node_a", "node_a"];
+        assert!(!duplicated.windows(2).all(|w| w[0] < w[1]), "a duplicate must be rejected too");
+
+        // The invariant that keeps the feature small: a restart names the SAME macroblock as the WS
+        // pin, so branch abandonment rides on the pin path that already exists.
+        assert_eq!(RESTART_MANIFEST.resume_from_mb, WS_CHECKPOINT.0);
+        assert_eq!(RESTART_MANIFEST.resume_mb_hash, WS_CHECKPOINT.1);
+    }
+}

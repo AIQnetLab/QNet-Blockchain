@@ -10,6 +10,8 @@ import {
   NetworkStats,
   PendingRewards,
   RewardClaimResult,
+  RewardClaimQuote,
+  DilithiumSigner,
   FaucetClaimResult,
 } from './types';
 import type {
@@ -19,6 +21,31 @@ import type {
   ContractCallResult,
   ContractLog,
 } from './contract';
+
+/**
+ * Refuse to hand the node's string to the wallet's signing key unless it is unmistakably a claim.
+ *
+ * The claim flow used to sign `quote.signMessage` verbatim with the SAME key that signs
+ * `transfer:{from}:{to}:{amount}:{nonce}:{gas_price}:{gas_limit}`, and nothing rebuilt or checked the
+ * `qnet_claim_v1` prefix — so the prefix separated nothing and a malicious node could return a
+ * transfer-shaped string and drain the wallet.
+ *
+ * The node's preimage is `qnet_claim_v1:{wallet}:{timestamp}:{hex(sha3_256(claims_data))}`. This SDK
+ * has no sha3 dependency, so it pins everything else: the domain tag, the wallet it is signing for,
+ * the timestamp it will echo, and that the tail is a 32-byte hex digest and nothing else. A transfer
+ * — or any other domain — cannot satisfy it. Callers that want the digest verified too should hash
+ * `quote.claimsData` themselves and compare before signing; the mobile wallet does exactly that.
+ */
+export function assertClaimMessageShape(msg: string, wallet: string, timestamp: number): void {
+  const expectedPrefix = `qnet_claim_v1:${wallet}:${timestamp}:`;
+  if (typeof msg !== 'string' || !msg.startsWith(expectedPrefix)) {
+    throw new Error('Node asked the wallet to sign a non-claim message — refusing');
+  }
+  const digest = msg.slice(expectedPrefix.length);
+  if (!/^[0-9a-f]{64}$/.test(digest)) {
+    throw new Error('Claim message digest is malformed — refusing to sign');
+  }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // QNet REST API client
@@ -139,22 +166,89 @@ export class QNetClient {
   }
 
   /**
-   * Claim pending rewards.
+   * Step 1 of the claim handshake: ask a node to quote the batch of unclaimed epochs.
    *
-   * @param address       - Node wallet address
-   * @param signature     - Dilithium3 (ML-DSA-65) signature over `"CLAIM_REWARDS:<address>"`
-   * @param signatureType - default `"dilithium3"`
+   * The node builds the merkle proofs but cannot submit on your behalf — only the recipient wallet's
+   * ML-DSA-65 key authorizes a credit, and the signature covers the exact payload. Pass the result to
+   * {@link submitRewardClaim}.
+   *
+   * @param nodeId    - On-chain node id
+   * @param wallet    - Node wallet address (must match the on-chain registration)
+   * @param signature - ML-DSA-65 signature over `"claim_rewards:<nodeId>:<wallet>"`
+   * @param publicKey - Hex-encoded 1952-byte ML-DSA-65 public key
    */
-  async claimRewards(
-    address: string,
+  async quoteRewardClaim(
+    nodeId: string,
+    wallet: string,
     signature: string,
-    signatureType: 'dilithium3' | 'ed25519' = 'dilithium3',
+    publicKey: string,
+  ): Promise<RewardClaimQuote | null> {
+    const res = await this.post<Record<string, unknown>>('/api/v1/rewards/claim', {
+      node_id: nodeId,
+      wallet_address: wallet,
+      dilithium_signature: signature,
+      dilithium_public_key: publicKey,
+    });
+    if (!res.needs_signature) {
+      // Nothing claimable, or the node refused — surface its own reason.
+      if (res.error) throw new Error(`QNetClient [quoteRewardClaim]: ${String(res.error)}`);
+      return null;
+    }
+    return {
+      claimsData: String(res.claims_data),
+      signMessage: String(res.sign_message),
+      claimTimestamp: Number(res.claim_timestamp),
+      amountNano: String(res.amount_nano),
+      epochsClaimed: Number(res.epochs_claimed ?? 0),
+      lastClaimedEpoch: Number(res.last_claimed_epoch ?? 0),
+      stoppedAtEpoch: res.stopped_at_epoch == null ? undefined : Number(res.stopped_at_epoch),
+      stoppedReason: res.stopped_reason == null ? undefined : String(res.stopped_reason),
+    };
+  }
+
+  /**
+   * Step 2: submit the quoted batch, signed. `claimsData` and `claimTimestamp` MUST be echoed
+   * unchanged — both are inside the signed message, and apply re-verifies the signature and every
+   * merkle proof.
+   */
+  async submitRewardClaim(
+    nodeId: string,
+    wallet: string,
+    signature: string,
+    publicKey: string,
+    quote: RewardClaimQuote,
+    claimsSignature: string,
   ): Promise<RewardClaimResult> {
     return this.post<RewardClaimResult>('/api/v1/rewards/claim', {
-      address,
-      signature,
-      signatureType,
+      node_id: nodeId,
+      wallet_address: wallet,
+      dilithium_signature: signature,
+      dilithium_public_key: publicKey,
+      claims_data: quote.claimsData,
+      claims_signature: claimsSignature,
+      claim_timestamp: quote.claimTimestamp,
     });
+  }
+
+  /**
+   * Both steps in one call. `sign` is invoked twice: once for the request-auth message and once for
+   * the quoted payload. Returns `null` when there is nothing to claim.
+   *
+   * Verify the quote before signing if you do not fully trust the node you are talking to: an honest
+   * batch is strictly ascending and starts just above `lastClaimedEpoch`.
+   */
+  async claimRewards(
+    nodeId: string,
+    wallet: string,
+    publicKey: string,
+    sign: DilithiumSigner,
+  ): Promise<RewardClaimResult | null> {
+    const authSig = await sign(`claim_rewards:${nodeId}:${wallet}`);
+    const quote = await this.quoteRewardClaim(nodeId, wallet, authSig, publicKey);
+    if (!quote) return null;
+    assertClaimMessageShape(quote.signMessage, wallet, quote.claimTimestamp);
+    const claimsSignature = await sign(quote.signMessage);
+    return this.submitRewardClaim(nodeId, wallet, authSig, publicKey, quote, claimsSignature);
   }
 
   // ── Testnet Faucet ────────────────────────────────────────────────────────

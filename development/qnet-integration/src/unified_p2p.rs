@@ -182,6 +182,30 @@ pub static CACHED_NETWORK_HEIGHT: AtomicU64 = AtomicU64::new(0);
 pub static LOCAL_BLOCKCHAIN_HEIGHT: Lazy<Arc<AtomicU64>> =
     Lazy::new(|| Arc::new(AtomicU64::new(0)));
 
+/// Highest height durably stored, which can lead the applied height. Serve decisions use this:
+/// refusing to serve a block we already hold removes our whole relay subtree from repair
+/// service and turns local lag into network-wide propagation loss.
+pub static HIGHEST_STORED_HEIGHT: Lazy<Arc<AtomicU64>> =
+    Lazy::new(|| Arc::new(AtomicU64::new(0)));
+
+/// Monotonic bump of the stored-height watermark.
+pub fn note_block_stored(height: u64) {
+    HIGHEST_STORED_HEIGHT.fetch_max(height, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Lower the watermark after a rollback deleted blocks above `target`. Without this the node keeps
+/// advertising a serve horizon over a range it no longer holds and answers those requests with empty
+/// batches forever.
+pub fn truncate_stored_height(target: u64) {
+    HIGHEST_STORED_HEIGHT.fetch_min(target, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Serve horizon: the highest height this node can answer for.
+pub fn servable_height() -> u64 {
+    LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed)
+        .max(HIGHEST_STORED_HEIGHT.load(std::sync::atomic::Ordering::Relaxed))
+}
+
 // v34: last KNOWN-CANONICAL validator count — from the consensus PK registry (genesis) or
 // the deterministic N-2 eligible set (normal epoch). When a node temporarily loses its
 // canonical source (N-2 macroblock not yet synced), get_active_validator_count() returns
@@ -1207,8 +1231,10 @@ static HIGHEST_CERTIFIED_ROUND: Lazy<Arc<DashMap<u64, u64>>> =
 /// two adjacent windows to quorum simultaneously (double-TC at a boundary straddle).
 static HIGHEST_OBSERVED_TC_WINDOW: AtomicU64 = AtomicU64::new(0);
 
-/// Window-keyed failover committee cache (committee_for_height(w*90), anchor = macroblock w-2).
-static FAILOVER_COMMITTEE_CACHE: Lazy<Arc<DashMap<u64, Arc<std::collections::HashSet<String>>>>> =
+/// Failover committee cache, keyed by (window, anchor_hash). Anchor-keying (R17.1) makes an L-advance
+/// invalidate automatically: the sealed and frozen arms name different anchors, so a now-sealed window
+/// computes a fresh key and a stale frozen entry can never be served.
+static FAILOVER_COMMITTEE_CACHE: Lazy<Arc<DashMap<(u64, [u8; 32]), Arc<std::collections::HashSet<String>>>>> =
     Lazy::new(|| Arc::new(DashMap::new()));
 
 /// Cooldown per macroblock index for the missing-anchor pull (secs).
@@ -1248,56 +1274,120 @@ pub fn timeout_vote_message(
     w: u64, round: u64, anchor: &[u8; 32],
     high_qc_idx: u64, high_qc_hash: &[u8; 32],
     tip_height: u64, tip_hash: &[u8; 32],
+    rc: Option<(u64, [u8; 32])>,
 ) -> String {
-    format!("QNET_TIMEOUT_V2:{}:{}:{}:{}:{}:{}:{}",
-            w, round, hex::encode(anchor),
-            high_qc_idx, hex::encode(high_qc_hash),
-            tip_height, hex::encode(tip_hash))
+    match rc {
+        // Byte-identical to the pre-pin form, so an unpinned vote is unchanged on the wire.
+        None => format!("QNET_TIMEOUT_V2:{}:{}:{}:{}:{}:{}:{}",
+                        w, round, hex::encode(anchor),
+                        high_qc_idx, hex::encode(high_qc_hash),
+                        tip_height, hex::encode(tip_hash)),
+        // Distinct domain tag: a relaxed vote can never be replayed as a strict one, and the pin it
+        // authorizes is inside what the voter signed.
+        Some((a, ah)) => format!("QNET_TIMEOUT_V2R:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+                                 w, round, hex::encode(anchor),
+                                 high_qc_idx, hex::encode(high_qc_hash),
+                                 tip_height, hex::encode(tip_hash),
+                                 a, hex::encode(ah)),
+    }
 }
 
-/// Deterministic failover committee for vote window `w`: committee_for_height(w*90) (epoch w,
-/// anchor macroblock w-2 — ALWAYS sealed for any producible window: the seal throttle caps tips at
-/// (last_sealed+2)*90). w<3 = genesis era: the committee IS the 5 genesis ids — never signature-only
-/// (a self-announced key must not count toward failover quorum). None = anchor absent locally
-/// (post-genesis) → caller pulls it and defers; the sender retransmits until the TC forms.
+/// Deterministic failover committee for vote window `w` (A1 R11.0). Resolution order: RC-span override
+/// → genesis (w<3) → sealed `committee_for_height(w*90)` when w-2 ≤ L → FrozenCommittee(w) off the
+/// sealed anchor M_A when finality is stalled → None (Defer: a certified anchor exists but is unheld,
+/// caller pulls). Removing the seal+2 wall is what keeps failover alive across the 32-window horizon.
 pub fn failover_committee_for_window(w: u64) -> Option<Arc<std::collections::HashSet<String>>> {
-    if let Some(c) = FAILOVER_COMMITTEE_CACHE.get(&w) { return Some(c.value().clone()); }
+    // Inside an armed recovery span the committee IS the anchor macroblock's C_S — first, and uncached
+    // (the arm is local and clears with the span).
+    if let Some(storage) = crate::node::try_get_storage() {
+        if let Some(cs) = crate::node::rc_span_committee_mb(storage, w) {
+            return Some(Arc::new(cs.into_iter().collect::<std::collections::HashSet<String>>()));
+        }
+    }
     if w < 3 {
+        let key = (w, [0u8; 32]);
+        if let Some(c) = FAILOVER_COMMITTEE_CACHE.get(&key) { return Some(c.value().clone()); }
         let set: std::collections::HashSet<String> = crate::genesis_constants::GENESIS_CONSENSUS_PKS
             .iter().map(|(id, _)| id.to_string()).collect();
         let arc = Arc::new(set);
-        FAILOVER_COMMITTEE_CACHE.insert(w, arc.clone());
+        FAILOVER_COMMITTEE_CACHE.insert(key, arc.clone());
         return Some(arc);
     }
     let storage = crate::node::try_get_storage()?;
-    let ids = crate::node::BlockchainNode::committee_for_height(&storage, w.saturating_mul(90))?;
+    let (anchor_hash, ids) = match crate::node::BlockchainNode::roster_mode(&storage, w) {
+        crate::node::RosterMode::Sealed => {
+            let ah = storage.get_macroblock_by_height(w.saturating_sub(2)).ok().flatten()
+                .and_then(crate::node::BlockchainNode::macroblock_plaintext)
+                .and_then(|raw| bincode::deserialize::<qnet_state::MacroBlock>(&raw).ok())
+                .map(|mb| mb.hash())?;
+            (ah, crate::node::BlockchainNode::committee_for_height(&storage, w.saturating_mul(90))?)
+        }
+        crate::node::RosterMode::Frozen => {
+            let l = storage.last_sealed_mb_index();
+            let (_a, anchor) = crate::node::BlockchainNode::frozen_anchor(&storage, l)?;
+            (anchor.hash(), crate::node::BlockchainNode::frozen_committee(&anchor, w))
+        }
+        crate::node::RosterMode::Defer => return None,
+    };
+    if ids.is_empty() { return None; }
+    let key = (w, anchor_hash);
+    if let Some(c) = FAILOVER_COMMITTEE_CACHE.get(&key) { return Some(c.value().clone()); }
     let arc = Arc::new(ids.into_iter().collect::<std::collections::HashSet<String>>());
-    FAILOVER_COMMITTEE_CACHE.insert(w, arc.clone());
-    FAILOVER_COMMITTEE_CACHE.retain(|k, _| k.saturating_add(8) >= w);
+    FAILOVER_COMMITTEE_CACHE.insert(key, arc.clone());
+    FAILOVER_COMMITTEE_CACHE.retain(|(k, _), _| k.saturating_add(8) >= w);
     Some(arc)
+}
+
+/// Recovery pin governing failover for window `w`. Derived from `(w, local arm)` rather than carried
+/// on the wire, so the pin cannot be mixed across a vote set and no wire field can be forged into a
+/// relaxed threshold.
+pub fn rc_pin_for_window(w: u64) -> Option<(u64, [u8; 32])> {
+    let (lo, hi) = crate::node::rc_span_windows()?;
+    if w < lo || w > hi { return None; }
+    crate::node::rc_armed().map(|(a, ah, _)| (a, ah))
 }
 
 /// Deterministic sealed anchor for window `w`: hash(macroblock w-2), zeros for w<3 (genesis
 /// convention). None = anchor macroblock absent locally (refuse-and-fetch).
 pub fn sealed_anchor_for_window(w: u64) -> Option<[u8; 32]> {
+    // Span windows re-anchor to the pin's own macroblock so the TC anchor check agrees with the
+    // committee source above — otherwise the two would name different macroblocks.
+    if let Some((lo, hi)) = crate::node::rc_span_windows() {
+        if w >= lo && w <= hi {
+            if let Some((_, ah, _)) = crate::node::rc_armed() { return Some(ah); }
+        }
+    }
     if w < 3 { return Some([0u8; 32]); }
     let storage = crate::node::try_get_storage()?;
-    let raw = storage.get_macroblock_by_height(w - 2).ok().flatten()?;
-    let plain = crate::node::BlockchainNode::macroblock_plaintext(raw)?;
-    let mb = bincode::deserialize::<qnet_state::MacroBlock>(&plain).ok()?;
-    Some(mb.hash())
+    // Sealed: hash(macroblock w-2). Frozen: hash(M_A) (R12) — the SAME anchor whose committee
+    // failover_committee_for_window resolves, so the TC anchor check and the committee source name one
+    // macroblock. Defer: None (caller pulls). The vote's anchor field advertises the sender's frontier.
+    match crate::node::BlockchainNode::roster_mode(&storage, w) {
+        crate::node::RosterMode::Sealed => {
+            let raw = storage.get_macroblock_by_height(w - 2).ok().flatten()?;
+            let plain = crate::node::BlockchainNode::macroblock_plaintext(raw)?;
+            let mb = bincode::deserialize::<qnet_state::MacroBlock>(&plain).ok()?;
+            Some(mb.hash())
+        }
+        crate::node::RosterMode::Frozen => {
+            let l = storage.last_sealed_mb_index();
+            crate::node::BlockchainNode::frozen_anchor(&storage, l).map(|(_a, mb)| mb.hash())
+        }
+        crate::node::RosterMode::Defer => None,
+    }
 }
 
-/// Amplification sanity ceiling, in windows: max(local seal, QC-verified frontier) + the SAME
-/// unsealed allowance the production throttle enforces — a window above it is not producible
-/// anywhere, so f+1 votes for it are fabricated. u64::MAX pre-first-seal (mirrors the throttle's
-/// skip-at-zero: heights ≤180 are unbounded until macroblock 1 seals).
+/// Amplification sanity ceiling, in windows: max(local seal, QC-verified frontier) + the SAME allowance
+/// the production throttle enforces — a window above it is not producible anywhere, so f+1 votes for it
+/// are fabricated. It MUST track the production horizon: while it sat at 2 windows and production ran to
+/// 32, every rotation vote for a window past +180 was discarded as fabricated, which silently disabled
+/// view change exactly where A1 was supposed to keep the chain moving. u64::MAX pre-first-seal.
 pub fn certified_view_bound_windows() -> u64 {
     let sealed_w = crate::node::try_get_storage().map(|s| s.last_sealed_mb_index()).unwrap_or(0);
     let qc_w = crate::node::qc_verified_frontier_cached() / 90;
     let base = sealed_w.max(qc_w);
     if base == 0 { return u64::MAX; }
-    base + crate::node::MAX_UNSEALED_WINDOWS
+    base + crate::node::BlockchainNode::MAX_DERIVED_ROSTER_WINDOWS as u64
 }
 
 /// Lowest window ABOVE `above_w` supported by ≥ f+1 DISTINCT committee voters (any round) —
@@ -1332,7 +1422,9 @@ pub fn lowest_window_with_support(above_w: u64) -> Option<u64> {
 /// and the node ceases to lead once the TC forms (exactly one leader per certified round). O(votes).
 pub fn round_one_short_of_quorum(w: u64, voter: &str) -> bool {
     let committee = match failover_committee_for_window(w) { Some(c) => c, None => return false };
-    let quorum = qnet_consensus::checkpoint_bft::quorum_size(committee.len());
+    // Must mirror the TC threshold exactly. A stale strict value here silently disables the
+    // self-yield that rotates the network off a stuck leader — precisely when the span needs it.
+    let quorum = crate::node::rc_effective_quorum_window(w, committee.len());
     if quorum == 0 { return false; }
     let certified = highest_certified_round_for(w);
     for e in TIMEOUT_VOTES.iter() {
@@ -1652,6 +1744,26 @@ pub fn last_remote_producer_heartbeat_age_ms(producer_id: &str) -> Option<u64> {
         .unwrap_or_default()
         .as_millis() as u64;
     Some(now_ms.saturating_sub(observed))
+}
+
+/// Record producer liveness from a VERIFIED block. A signed block at height h is strictly
+/// stronger evidence than a heartbeat: it proves the producer was alive AND targeting that
+/// slot. Costs no extra traffic, so it scales to any committee size — unlike broadcasting a
+/// heartbeat from every member. Only advances the observed clock (never rewinds it).
+pub fn record_producer_liveness_from_block(producer_id: &str, height: u64) {
+    // Only a block ABOVE our applied tip proves CURRENT liveness. Re-delivered or replayed old
+    // blocks must not refresh the clock — otherwise a stalled producer reads as fresh while peers
+    // replay its history, and the maps grow with producers that are no longer at the frontier.
+    if height <= LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed) { return; }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    REMOTE_PRODUCER_HEARTBEAT_OBSERVED_MS.insert(producer_id.to_string(), now_ms);
+    let bump = REMOTE_PRODUCER_HEARTBEAT_HEIGHT.get(producer_id).map(|v| *v.value() < height).unwrap_or(true);
+    if bump {
+        REMOTE_PRODUCER_HEARTBEAT_HEIGHT.insert(producer_id.to_string(), height);
+    }
 }
 
 /// Producer-advertised targeted slot_height from the last signed heartbeat, if any.
@@ -5224,7 +5336,7 @@ impl SimplifiedP2P {
                     match Self::verify_peer_authenticity(&target_addr).await {
                         Ok(peer_pubkey) => {
                             if crate::node::is_info() { println!("[INFO][P2P] Quantum-secured peer verified: {} | Dilithium signature validated | Key: {}...", 
-                                   target_addr, &peer_pubkey[..peer_pubkey.len().min(16)]); }
+                                   target_addr, qnet_state::char_prefix(&peer_pubkey, 16)); }
                             
                             // EXISTING: Use get_genesis_region_by_ip() to get correct Genesis peer region
                             use crate::genesis_constants::get_genesis_region_by_ip;
@@ -8289,7 +8401,7 @@ impl SimplifiedP2P {
             if !quic_fallback_rate_check(&node_id) {
                 if crate::node::is_warn() {
                     println!("[WARN][EMERGENCY] quic_fallback_rate_limited h={} node={}", 
-                             block_height, &node_id[..node_id.len().min(8)]);
+                             block_height, qnet_state::char_prefix(&node_id, 8));
                 }
                 // Skip QUIC fallback due to rate limit
             } else {
@@ -12298,7 +12410,9 @@ pub enum NetworkMessage {
         /// hasn't caught up.
         slot_height: u64,
         /// Dilithium3 detached signature over
-        /// "QNET_PRODUCER_HEARTBEAT_V1:{producer_id}:{timestamp}:{slot_height}"
+        /// "QNET_PRODUCER_HEARTBEAT_V2:{producer_id}:{timestamp}:{slot_height}:{parent_hash}",
+        /// where parent_hash is the canonical hash at slot_height-1. It is NOT on the wire — the
+        /// receiver reconstructs it from its own chain, so a claimed slot it does not hold cannot verify.
         signature: Vec<u8>,
     },
     
@@ -12958,28 +13072,16 @@ impl SimplifiedP2P {
                                 }
                             }
 
-                            // GOSSIP RE-BROADCAST v2.19.18: Forward received blocks to other peers
-                            // This improves block propagation reliability across the network
-                            // Only re-broadcast microblocks (macroblocks have their own consensus)
-                            // Skip re-broadcast for first 5 blocks (Genesis phase - direct broadcast sufficient)
-                            if !is_macroblock && height > 5 {
-                                // Clone data for gossip (received_block already cloned above)
-                                let gossip_msg = NetworkMessage::Block {
-                                    height,
-                                    data: received_block.data.clone(),
-                                    block_type: block_type.clone(),
-                                };
-
-                                // Forward to 2 random peers (gossip fanout)
-                                // Low fanout to avoid network spam while ensuring propagation
-                                self.gossip_to_random_peers(gossip_msg, 2);
-
-                                if height % 30 == 0 {
-                                    if crate::node::is_info() {
-                                        println!("[INFO][P2P] Re-broadcasted block #{} to 2 random peers", height);
-                                    }
-                                }
-                            }
+                            // No re-gossip here, deliberately. This lane has NO honest originator:
+                            // producers propagate via ShredProtocol, sync/repair via BlocksBatch, and
+                            // the only builders of NetworkMessage::Block are the genesis broadcast
+                            // (height 0, which the old `height > 5` guard skipped anyway) and
+                            // broadcast_block — reachable solely from broadcast_emergency_finalization
+                            // and broadcast_critical_alert, both of which have zero callers. So the
+                            // forward existed only for attacker-injected traffic, and it ran BEFORE any
+                            // validation, with fanout 2, no TTL, no seen-set and no sender exclusion:
+                            // N injected copies multiplied across the mesh. Ingest below still accepts
+                            // the block; only the amplifier is gone.
                         }
                         Err(e) => {
                             // v3.0: Clear pending on error so block can be retried
@@ -13047,7 +13149,7 @@ impl SimplifiedP2P {
                         Ok(_) => {
                             if crate::node::is_info() {
                                 println!("[INFO][P2P] Transaction {} from {} queued for processing",
-                                         &tx_hash[..tx_hash.len().min(16)], from_peer);
+                                         qnet_state::char_prefix(&tx_hash, 16), from_peer);
                             }
                         }
                         Err(e) => {
@@ -13267,9 +13369,17 @@ impl SimplifiedP2P {
                 // This is the same registry used for TimeoutVote signatures —
                 // pk_mismatch class of failures still applies and would
                 // correctly reject a spoofed heartbeat.
+                // v2: the signed preimage includes the PARENT HASH of the claimed slot, and we
+                // reconstruct it from OUR OWN storage rather than trusting a wire field. A producer
+                // claiming a slot we do not have (the cheap lie — this heartbeat SUPPRESSES the
+                // view-change vote, so an invented frontier held the slot for the whole ceiling)
+                // yields a hash we cannot reproduce, so the signature simply fails.
+                let anchor_hash = self.storage.as_ref()
+                    .and_then(|st| st.get_microblock_hash_hex(slot_height.saturating_sub(1)).ok().flatten())
+                    .unwrap_or_default();
                 let msg = format!(
-                    "QNET_PRODUCER_HEARTBEAT_V1:{}:{}:{}",
-                    producer_id, timestamp, slot_height
+                    "QNET_PRODUCER_HEARTBEAT_V2:{}:{}:{}:{}",
+                    producer_id, timestamp, slot_height, anchor_hash
                 );
                 let sig_str = match String::from_utf8(signature.clone()) {
                     Ok(s) => s,
@@ -13715,27 +13825,15 @@ impl SimplifiedP2P {
                         //     squatter's `register_consensus_pk_from_chain`
                         //     call is rejected as a mismatch (Fix #2/#3).
 
-                        // Disk persistence is owned by the on-chain apply path (authoritative, low-frequency,
-                        // guarantees snapshot completeness). This high-frequency gossip path only seeds RAM
-                        // once — no per-claim disk write (avoids write amplification at scale).
-                        if !crate::genesis_constants::has_vrf_key(&node_id) {
-                            if let Some(ref pk_bytes) = pk_for_verify {
-                                crate::genesis_constants::register_vrf_public_key(&node_id, pk_bytes);
-                                let _ = qnet_consensus::consensus_crypto::register_consensus_pk_from_chain(&node_id, pk_bytes);
-                                if let Some(ref storage) = self.storage {
-                                    let pk_hex = hex::encode(pk_bytes);
-                                    if let Err(e) = storage.save_vrf_public_key(&node_id, &pk_hex) {
-                                        if crate::node::is_debug() {
-                                            println!("[DBG][VRF] pk_persist_err node={} err={}", node_id, e);
-                                        }
-                                    }
-                                }
-                                if crate::node::is_info() {
-                                    println!("[INFO][VRF] pk_auto_registered node={} pk_hash={}",
-                                             node_id, hex::encode(&pk_bytes[..8]));
-                                }
-                            }
-                        }
+                        // NO key install here. "Trust-on-first-verify" was not proof of ownership: the
+                        // claim is self-signed, so verifying it with the CLAIMED key proves possession
+                        // of a keypair and says nothing about who owns `node_id`. Any peer could bind
+                        // any not-yet-registered id to its own key, first-writer-wins — and the
+                        // producer-signature verifier reads that binding, so the victim's real blocks
+                        // were then rejected for the process lifetime (and past it: the write reached
+                        // disk, and boot reloads disk into RAM as "chain-validated"). The chain-apply
+                        // path is the only authority for (node_id, pk); genesis identities are
+                        // pre-pinned at startup and never needed this.
 
                         let now = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
@@ -14198,19 +14296,17 @@ impl SimplifiedP2P {
                     _ => false,
                 };
 
-                if sig_ok {
-                    crate::genesis_constants::register_vrf_public_key(&node_id, &vrf_public_key);
-                    // v14.8: The self-signature over `QNET_VRF_KEY_v1:{node_id}` that just
-                    // verified IS proof-of-ownership — install in consensus registry too.
-                    let _ = qnet_consensus::consensus_crypto::register_consensus_pk_from_chain(&node_id, &vrf_public_key);
-                    if let Some(ref storage) = self.storage {
-                        let pk_hex = hex::encode(&vrf_public_key);
-                        let _ = storage.save_vrf_public_key(&node_id, &pk_hex);
-                    }
-                    if crate::node::is_info() {
-                        println!("[INFO][VRF-KEY] registered node={} pk_hash={}", node_id, hex::encode(&vrf_public_key[..8]));
-                    }
-                } else {
+                // The self-signature is verified with the ANNOUNCED key, so all it proves is that the
+                // sender holds SOME keypair — never that it owns `node_id`. Installing on that basis
+                // let any peer bind any not-yet-registered id to its own key (first-writer-wins,
+                // uncorrectable), and the producer-signature verifier reads that binding: the poisoned
+                // node then rejected every real block from the victim. The write also reached disk, and
+                // boot reloads disk into RAM as "chain-validated", so it outlived restarts.
+                //
+                // Nothing installs here any more. (node_id, pk) comes only from the chain-apply path,
+                // where the transaction's own signature authenticates the pair; genesis identities are
+                // pre-pinned into both registries at startup and never depended on this.
+                if !sig_ok {
                     if crate::node::is_warn() {
                         println!("[WARN][VRF-KEY] bad_self_sig node={}", node_id);
                     }
@@ -14761,7 +14857,7 @@ impl SimplifiedP2P {
                             // 3. Ed25519 is WEAKER than Dilithium against quantum attacks
                             // 4. Chain caused operational issues: missed broadcasts → rotation_incompatible
                             //    → rejected valid certs → block verification delays
-                            // 5. Top L1 blockchains (Solana, Ethereum, Aptos, Sui) do NOT use
+                            // 5. Top L1 blockchains do NOT use
                             //    P2P key rotation chains — they rely on primary key verification only
                             //
                             // Certificate is valid if and only if:
@@ -14995,7 +15091,7 @@ impl SimplifiedP2P {
                         if !dilithium_ok {
                             if crate::node::is_warn() {
                                 println!("[WARN][GOSSIP] dilithium_invalid node={} wallet={}...",
-                                    node_id, &wallet_address[..16.min(wallet_address.len())]);
+                                    node_id, qnet_state::char_prefix(&wallet_address, 16));
                             }
                             return;
                         }
@@ -15005,7 +15101,7 @@ impl SimplifiedP2P {
                     } else {
                         if crate::node::is_warn() {
                             println!("[WARN][GOSSIP] dilithium_missing_rejected node={} wallet={}...",
-                                node_id, &wallet_address[..16.min(wallet_address.len())]);
+                                node_id, qnet_state::char_prefix(&wallet_address, 16));
                         }
                         return;
                     }
@@ -15244,11 +15340,22 @@ impl SimplifiedP2P {
                     return;
                 }
                 
-                // VERIFY: Pinger must be in active Super nodes list
-                // v2.51: Lock-free check
-                if !self.active_full_super_nodes.contains_key(&pinger_id) && !pinger_id.starts_with("genesis_node_") {
+                // The pinger must be a REAL super, established by the chain — not by the gossip-filled
+                // `active_full_super_nodes` map, which is populated from a self-signed
+                // ActiveNodeAnnouncement whose key is TOFV-accepted for non-genesis identities (no burn,
+                // no registration, no chain needed to mint eligibility).
+                //
+                // Restricting it to genesis instead would have been worse: the mobile client picks a
+                // random bootstrap node, so every ping that lands on a Super would be silently dropped
+                // and that light node would earn NOTHING for the epoch. Light nodes are users and are
+                // paid for confirmed pings unconditionally — a relay rule must never be what breaks that.
+                let pinger_ok = pinger_id.starts_with("genesis_node_")
+                    || crate::node::try_get_storage()
+                        .and_then(|st| st.node_reg_height(&pinger_id).ok().flatten())
+                        .is_some();
+                if !pinger_ok {
                     if crate::node::is_info() {
-                        println!("[ERR][P2P] Unknown pinger {} for Light node {}", pinger_id, light_node_id);
+                        println!("[ERR][P2P] unregistered_pinger {} for Light node {}", pinger_id, light_node_id);
                     }
                     return;
                 }
@@ -15265,11 +15372,21 @@ impl SimplifiedP2P {
                 }
                 
                 // VERIFY: Pinger signature on attestation
-                let attestation_data = format!("attestation:{}:{}:{}:{}", 
+                let attestation_data = format!("attestation:{}:{}:{}:{}",
                     light_node_id, slot, timestamp, challenge);
                 if !self.verify_dilithium_heartbeat_signature(&attestation_data, &pinger_signature, &pinger_id) {
                     if crate::node::is_info() {
                         println!("[ERR][P2P] Invalid pinger signature for {}", light_node_id);
+                    }
+                    return;
+                }
+
+                // The DEVICE's own signature over the challenge is the only thing proving the phone
+                // actually answered; it was carried here and verified by nobody. Same verifier the HTTP
+                // ingress uses, so relay and ingress accept an identical set.
+                if !self.verify_light_ping_signature(&light_node_id, &challenge, &light_node_signature) {
+                    if crate::node::is_warn() {
+                        println!("[WARN][P2P] light_sig_invalid node={} pinger={}", light_node_id, pinger_id);
                     }
                     return;
                 }
@@ -15809,7 +15926,7 @@ impl SimplifiedP2P {
 
         if crate::node::is_debug() {
             println!("[DBG][DHT] kademlia_lookup target={} sent_to={} table_size={}",
-                     &target_node_id[..16.min(target_node_id.len())],
+                     qnet_state::char_prefix(&target_node_id, 16),
                      initial.len(), self.kademlia_table.total_peers());
         }
     }
@@ -15996,7 +16113,7 @@ impl SimplifiedP2P {
         if !signature.starts_with("dilithium_sig_") {
             if crate::node::is_info() {
                 println!("[ERR][P2P] Invalid signature format: unknown prefix (got: {}...)",
-                         &signature[..signature.len().min(20)]);
+                         qnet_state::char_prefix(&signature, 20));
             }
             return false;
         }
@@ -16251,9 +16368,46 @@ impl SimplifiedP2P {
     /// Verify signature for heartbeat (SYNC version)
     /// SAFE: Uses std::thread::spawn to isolate runtime, avoiding nested runtime panic
     /// Supports pure Dilithium3 (ML-DSA-65) formats (binary, JSON, legacy)
+    /// Verify a LIGHT node's own signature over its ping challenge. SINGLE implementation — the HTTP
+    /// ingress and the gossip relay must accept exactly the same set, or a relay admits what the
+    /// ingress rejects. Both accepted formats are rooted in the immutable on-chain key: `compact_bin:`
+    /// through the consensus PK binding, `ping_dilithium:` through the delegation cert verified against
+    /// `load_vrf_public_key` (fail-closed when the node has no on-chain key).
+    pub fn verify_light_ping_signature(&self, node_id: &str, challenge: &str, signature: &str) -> bool {
+        if node_id.is_empty() || challenge.is_empty() || signature.is_empty() {
+            return false;
+        }
+        if signature.starts_with("compact_bin:") {
+            return self.verify_dilithium_heartbeat_signature(challenge, signature, node_id);
+        }
+        if let Some(inner_sig) = signature.strip_prefix("ping_dilithium:") {
+            let storage = match self.storage.as_ref() {
+                Some(s) => s,
+                None => return false,
+            };
+            let (ping_pk_hex, delegation_cert) = match storage.get_light_ping_keys(node_id) {
+                Some(kv) => kv,
+                None => return false,
+            };
+            if ping_pk_hex.is_empty() || delegation_cert.is_empty() {
+                return false;
+            }
+            let onchain_pk_hex = match storage.load_vrf_public_key(node_id) {
+                Ok(Some(bytes)) => hex::encode(bytes),
+                _ => return false,
+            };
+            let delegation_msg = format!("delegate_ping:{}:{}", ping_pk_hex, node_id);
+            if !crate::rpc::verify_mobile_dilithium_signature(&delegation_msg, &delegation_cert, &onchain_pk_hex) {
+                return false;
+            }
+            return crate::rpc::verify_mobile_dilithium_signature(challenge, inner_sig, &ping_pk_hex);
+        }
+        false
+    }
+
     pub fn verify_dilithium_heartbeat_signature(&self, message: &str, signature: &str, node_id: &str) -> bool {
         use crate::quantum_crypto::DilithiumSignature;
-        
+
         // Check for empty/invalid signatures
         if signature.is_empty() || signature.len() < 100 {
             if crate::node::is_info() {
@@ -16288,7 +16442,7 @@ impl SimplifiedP2P {
         if !signature.starts_with("dilithium_sig_") {
             if crate::node::is_info() {
                 println!("[ERR][P2P] Invalid signature format: unknown prefix (got: {}...)",
-                         &signature[..signature.len().min(20)]);
+                         qnet_state::char_prefix(&signature, 20));
             }
             return false;
         }
@@ -16609,7 +16763,7 @@ impl SimplifiedP2P {
                                 if crate::node::is_debug() {
                                     println!("[DBG][CONS] pq_bin_verified node={} cert={}",
                                              node_id_clone,
-                                             &serial_clone[..8.min(serial_clone.len())]);
+                                             qnet_state::char_prefix(&serial_clone, 8));
                                 }
                                 true
                             }
@@ -18495,7 +18649,7 @@ impl SimplifiedP2P {
         }
         
         // v11.1: Don't serve blocks we don't have — prevents empty batch spam
-        let our_h = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+        let our_h = servable_height();
         if from_height > our_h && our_h > 0 {
             if crate::node::is_info() {
                 println!("[INFO][SYNC] skip_above_our_height from={} our_h={} peer={}", from_height, our_h, requester_id);
@@ -20962,7 +21116,7 @@ impl SimplifiedP2P {
                 } else {
                     if crate::node::is_info() {
                         println!("[INFO][P2P] Saved jail status for {} (batch {}, integrity: {}...)",
-                                node_id, batch_num, &integrity_hash[..integrity_hash.len().min(8)]);
+                                node_id, batch_num, qnet_state::char_prefix(&integrity_hash, 8));
                     }
                 }
             }
@@ -21505,7 +21659,7 @@ impl SimplifiedP2P {
             self.update_audit_index(&audit_index_file, &entry_hash);
             
             if crate::node::is_info() {
-                println!("[INFO][SECURITY] Security incident logged with hash: {}", &entry_hash[..entry_hash.len().min(16)]);
+                println!("[INFO][SECURITY] Security incident logged with hash: {}", qnet_state::char_prefix(&entry_hash, 16));
             }
         }
         
@@ -22102,7 +22256,8 @@ impl SimplifiedP2P {
 
         // Signature LAST (the ~5ms cost) — only after the cheap floor/round/committee/anchor gates.
         let vote_msg = timeout_vote_message(height, timeout_round, &anchor_arr,
-                                            high_qc_idx, &qc_hash_arr, tip_height, &tip_hash_arr);
+                                            high_qc_idx, &qc_hash_arr, tip_height, &tip_hash_arr,
+                                            rc_pin_for_window(height));
         if !self.verify_timeout_vote_signature(&voter_id, &vote_msg, &signature) {
             if crate::node::is_warn() {
                 println!("[WARN][TIMEOUT] vote_sig_invalid h={} voter={}", height, voter_id);
@@ -22118,7 +22273,9 @@ impl SimplifiedP2P {
         }
 
         // n−f quorum over the WINDOW committee (same quorum fn as Checkpoint-BFT).
-        let byzantine_threshold = qnet_consensus::checkpoint_bft::quorum_size(committee.len());
+        // Production must relax alongside finality: a relaxed checkpoint with no rotation behind it
+        // certifies nothing, and relaxing only one of the two is strictly worse than the halt.
+        let byzantine_threshold = crate::node::rc_effective_quorum_window(height, committee.len());
 
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
@@ -23084,7 +23241,7 @@ impl SimplifiedP2P {
             }
             None => { self.request_window_anchor(height); return None; }
         }
-        let quorum = qnet_consensus::checkpoint_bft::quorum_size(committee.len());
+        let quorum = crate::node::rc_effective_quorum_window(height, committee.len());
         // Dedup by voter BEFORE verify; drop non-committee voters.
         let mut by_voter: std::collections::HashMap<String, SignedTimeoutVote> = std::collections::HashMap::new();
         for v in votes {
@@ -23102,7 +23259,8 @@ impl SimplifiedP2P {
             .filter(|v| {
                 let msg = timeout_vote_message(height, timeout_round, &anchor,
                                                v.high_qc_idx, &v.high_qc_hash,
-                                               v.tip_height, &v.tip_hash);
+                                               v.tip_height, &v.tip_hash,
+                                               rc_pin_for_window(height));
                 self.verify_timeout_vote_signature(&v.voter_id, &msg, &v.signature)
             })
             .collect();
@@ -23175,9 +23333,9 @@ impl SimplifiedP2P {
         }
     }
 
-    /// Cooldown-gated control-lane pull of the sealed anchor macroblock (w-2) for vote window `w`.
-    /// The artifact provably exists network-wide for any producible window (seal-throttle bound),
-    /// so this costs at most one control-lane RTT before the deferred vote/TC can be processed.
+    /// Cooldown-gated control-lane pull of the anchor macroblock (w-2) for vote window `w`. It may not
+    /// be sealed anywhere yet (production runs ahead of the seal), so this is a best-effort pull: on a
+    /// hit the deferred vote/TC processes after one control-lane RTT, on a miss it stays deferred.
     pub(crate) fn request_window_anchor(&self, w: u64) {
         if w < 3 { return; }
         let idx = w - 2;
@@ -23228,7 +23386,9 @@ impl SimplifiedP2P {
         // Sanity bound: a real TC only exists for a producible window (≤ local tip + throttle slack);
         // a far-future cert_mb is fabricated and un-pullable.
         let local_w = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed) / 90;
-        if cert_mb > local_w.saturating_add(crate::node::MAX_UNSEALED_WINDOWS + 1) { return; }
+        // Same horizon as production and the view ceiling above.
+        if cert_mb > local_w.saturating_add(
+            crate::node::BlockchainNode::MAX_DERIVED_ROSTER_WINDOWS as u64 + 1) { return; }
         if cert_round <= self.get_highest_certified_round(cert_mb) { return; }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
@@ -23514,89 +23674,32 @@ impl SimplifiedP2P {
     /// NON-FAILOVER consumers only: the failover vote/TC path uses the window-keyed
     /// `failover_committee_for_window` (verifier-local height must never pick the quorum set there).
     /// `None` = genesis pre-180 / snapshot absent.
+    /// The consensus committee for THIS node's current epoch, as a set.
+    ///
+    /// Delegates to `BlockchainNode::committee_for_height` — THE single committee resolver. This used
+    /// to be a second, independent implementation with its own staleness policy (an 8-macroblock
+    /// walk-back against the other's zero), so the two could answer the same question differently on
+    /// an ordinary honest outage or a rolling upgrade. Two answers to "who is the committee" is a fork
+    /// surface that needs no adversary at all; there is now exactly one.
     fn deterministic_eligible_ids(&self) -> Option<std::collections::HashSet<String>> {
         let local_h = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Acquire);
         if local_h <= 180 {
-            return None; // genesis bootstrap → fallback (signature-only) doctrine
+            return None; // genesis bootstrap -> fallback (signature-only) doctrine
         }
         let current_epoch = (local_h - 1) / 90 + 1;
-        let required_macroblock = current_epoch.saturating_sub(2);
-        if required_macroblock == 0 {
-            return None;
-        }
         if let Some(c) = EPOCH_COMMITTEE_CACHE.get(&current_epoch) {
             return Some(c.value().as_ref().clone());
         }
         let storage = crate::node::try_get_storage()?;
-        // P1.5 self-healing: the committee is the eligible_producers snapshot
-        // of macroblock N-2. If N-2 is absent (a transient finality gap), do
-        // NOT collapse to empty/p2p-fallback (that diverges per-node and is
-        // unrecoverable). Deterministically walk back to the most recent
-        // AVAILABLE finalized snapshot ≤ N-2. Macroblocks below the gap are
-        // 2f+1-finalized and universally present; the eligible set is sticky
-        // across a few epochs, so honest nodes converge on the same set and
-        // the gap stays recoverable. Bounded depth — a deeper outage needs
-        // snapshot/restart, not a divergent local guess.
-        const MAX_FALLBACK_DEPTH: u64 = 8;
-        let floor = required_macroblock.saturating_sub(MAX_FALLBACK_DEPTH).max(1);
-        let mut idx = required_macroblock;
-        while idx >= floor {
-            if let Ok(Some(mb_data)) = storage.get_macroblock_by_height(idx) {
-                if let Ok(mb) = bincode::deserialize::<qnet_state::MacroBlock>(&mb_data) {
-                    // Identical predicate as try_load_macroblock_beacon:
-                    // a REAL finalized macroblock (eligible_producers non-empty
-                    // AND beacon present) → committee+beacon land on the SAME
-                    // macroblock, leader selection stays consistent.
-                    let beacon = match mb.consensus_data.randomness_beacon {
-                        Some(b) => b,
-                        None => { idx = idx.saturating_sub(1); continue; }
-                    };
-                    if let Some(snap) = mb.consensus_data.eligible_producers.as_ref() {
-                        if let Ok(producers) =
-                            bincode::deserialize::<Vec<qnet_state::EligibleProducer>>(snap)
-                        {
-                            // VRF committee (hard cap 1000, THRESHOLD==SIZE) via the SAME canonical
-                            // fn the macroblock sealer calls (checkpoint_bft::sample_committee) with
-                            // the SAME inputs — sorted-by-id eligible from THIS macroblock, window =
-                            // current epoch, its beacon as seed — byte-identical on every node.
-                            // Below the cap committee == full eligible set.
-                            let mut ids: Vec<String> = producers
-                                .into_iter()
-                                .map(|p| p.node_id)
-                                .filter(|id| !id.is_empty())
-                                .collect();
-                            if !ids.is_empty() {
-                                ids.sort(); // MUST match the sealer's sorted candidate order
-                                let committee = qnet_consensus::checkpoint_bft::sample_committee(
-                                    &ids,
-                                    current_epoch,
-                                    &beacon,
-                                    qnet_consensus::checkpoint_bft::COMMITTEE_THRESHOLD,
-                                    qnet_consensus::checkpoint_bft::COMMITTEE_SIZE,
-                                );
-                                let set: std::collections::HashSet<String> = committee.into_iter().collect();
-                                if idx == required_macroblock {
-                                    // Cache only the canonical N-2 result (fallback is transient
-                                    // and per-node, must not be pinned).
-                                    let arc = Arc::new(set);
-                                    EPOCH_COMMITTEE_CACHE.insert(current_epoch, arc.clone());
-                                    EPOCH_COMMITTEE_CACHE.retain(|e, _| *e + 4 >= current_epoch);
-                                    return Some(arc.as_ref().clone());
-                                }
-                                if crate::node::is_warn() {
-                                    println!("[WARN][BFT] committee_fallback used_mb={} wanted_mb={} depth={} reason=n2_absent_self_heal",
-                                             idx, required_macroblock, required_macroblock - idx);
-                                }
-                                return Some(set);
-                            }
-                        }
-                    }
-                }
-            }
-            if idx == floor { break; }
-            idx -= 1;
-        }
-        None
+        let set: std::collections::HashSet<String> =
+            crate::node::BlockchainNode::committee_for_height(&storage, local_h)?
+                .into_iter().collect();
+        // Cache per epoch. The resolver is a pure function of committed macroblocks, so a hit is the
+        // same value every node computes; the 4-epoch retain bounds it.
+        let arc = Arc::new(set);
+        EPOCH_COMMITTEE_CACHE.insert(current_epoch, arc.clone());
+        EPOCH_COMMITTEE_CACHE.retain(|e, _| *e + 4 >= current_epoch);
+        Some(arc.as_ref().clone())
     }
 
     /// Count unique alive peers by node_id, excluding self and stale entries.
@@ -25202,8 +25305,13 @@ impl SimplifiedP2P {
     // without an extra crypto check. The authoritative gate still runs
     // at the QUIC handshake / dispatcher layer on the presented PK.
 
-    /// O(1) check: is the supplied extracted Dilithium3 public key on
-    /// the permanent attacker blacklist? Safe to call from any thread.
+    /// O(1) check against the attacker-PK set.
+    ///
+    /// NOT a gate any more. The signature verifier used to early-return on a blacklisted key, which made
+    /// an acceptance verdict depend on per-process RAM populated by gossip — two nodes could disagree on
+    /// the same message. That early-return was removed and nothing calls this today; it is retained only
+    /// as an operator/telemetry read. Do NOT reintroduce it into a verification path.
+    #[allow(dead_code)]
     pub fn is_pk_blacklisted(&self, extracted_pk: &[u8]) -> bool {
         qnet_consensus::consensus_crypto::is_pk_blacklisted(extracted_pk)
     }
@@ -25439,11 +25547,11 @@ mod tests {
 
         // ── Canonical vote payload: versioned domain tag; every field changes the signed bytes.
         let a = [1u8; 32]; let qh = [2u8; 32]; let th = [3u8; 32];
-        let m = timeout_vote_message(7, 3, &a, 5, &qh, 640, &th);
+        let m = timeout_vote_message(7, 3, &a, 5, &qh, 640, &th, None);
         assert!(m.starts_with("QNET_TIMEOUT_V2:7:3:"), "domain-tagged + versioned");
-        assert_ne!(m, timeout_vote_message(7, 3, &[9u8; 32], 5, &qh, 640, &th), "anchor binds");
-        assert_ne!(m, timeout_vote_message(7, 3, &a, 5, &qh, 641, &th), "tip binds");
-        assert_ne!(m, timeout_vote_message(8, 3, &a, 5, &qh, 640, &th), "window binds");
+        assert_ne!(m, timeout_vote_message(7, 3, &[9u8; 32], 5, &qh, 640, &th, None), "anchor binds");
+        assert_ne!(m, timeout_vote_message(7, 3, &a, 5, &qh, 641, &th, None), "tip binds");
+        assert_ne!(m, timeout_vote_message(8, 3, &a, 5, &qh, 640, &th, None), "window binds");
 
         // ── Genesis-era committee (w<3): the fixed genesis set, n=5 ⇒ f=1, quorum=4 — never
         // signature-only. Anchor = zeros.

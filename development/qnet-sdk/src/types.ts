@@ -132,6 +132,26 @@ export interface RewardClaimResult {
   height: number;
 }
 
+/** Step 1 of the claim handshake: the batch the node offers, for the wallet to sign. */
+export interface RewardClaimQuote {
+  /** Exact payload bytes that go into the transaction — echo them back UNCHANGED. */
+  claimsData: string;
+  /** The message to sign with the wallet's ML-DSA-65 key. */
+  signMessage: string;
+  /** Timestamp bound into signMessage; must be echoed so the signature stays valid. */
+  claimTimestamp: number;
+  /** Exact base units as a decimal string — nanoQNC exceeds 2^53, so never parse it as a number. */
+  amountNano: string;
+  epochsClaimed: number;
+  /** The wallet's on-chain claim watermark; an honest batch starts just above it. */
+  lastClaimedEpoch: number;
+  stoppedAtEpoch?: number;
+  stoppedReason?: string;
+}
+
+/** Signs `message` with the wallet's ML-DSA-65 key and returns the node's expected signature format. */
+export type DilithiumSigner = (message: string) => Promise<string> | string;
+
 // ── Faucet ────────────────────────────────────────────────────────────────────
 
 export interface FaucetClaimResult {

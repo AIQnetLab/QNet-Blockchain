@@ -65,21 +65,38 @@ pub fn preimage(
     )
 }
 
-/// Deterministic SHA3-256 over ONE macroblock's forward-committee-derivation inputs — eligible_producers
-/// and randomness_beacon, the exact N-2 fields select_consensus_committee / committee_for_height read.
-/// Present/absent flags on BOTH fields so None and empty-Vec never collide. The WS pin / capsule carry
-/// this for K and K-1; the hash-trust branch checks the served macroblock against it, closing the
-/// forged-producers forward-committee forge (MacroBlock::hash() omits consensus_data).
+/// Deterministic SHA3-256 over ONE macroblock's committee-critical body fields — eligible_producers,
+/// randomness_beacon, consensus_committee and banned_validators. Present/absent flags on EVERY field so
+/// None and empty-Vec never collide. The WS pin / capsule carry this for K and K-1; the hash-trust
+/// branch checks the served macroblock against it, closing the forged-body forge (MacroBlock::hash()
+/// omits consensus_data entirely).
+///
+/// v2 adds the last two fields. `consensus_committee` is now the signature-checking set for a relaxed
+/// checkpoint anchored on this macroblock, and `banned_validators` is already trusted verbatim by
+/// load_macroblock_ban_set — at the two pin branches both were unauthenticated. Zero migration cost:
+/// the binary pin is (0,[0;32]) with zero digests at fresh genesis and capsules re-mint hourly.
 pub fn committee_fields_digest(mb: &qnet_state::MacroBlock) -> [u8; 32] {
     use sha3::{Digest, Sha3_256};
     let mut h = Sha3_256::new();
-    h.update(b"QNET_COMMITTEE_FIELDS_v1");
+    h.update(b"QNET_COMMITTEE_FIELDS_v2");
     match mb.consensus_data.eligible_producers.as_deref() {
         Some(elig) => { h.update([1u8]); h.update((elig.len() as u32).to_le_bytes()); h.update(elig); }
         None => { h.update([0u8]); }
     }
     match mb.consensus_data.randomness_beacon {
         Some(b) => { h.update([1u8]); h.update(b); }
+        None => { h.update([0u8]); }
+    }
+    match mb.consensus_data.consensus_committee.as_deref() {
+        Some(cmt) => {
+            h.update([1u8]);
+            h.update((cmt.len() as u32).to_le_bytes());
+            for id in cmt { h.update((id.len() as u32).to_le_bytes()); h.update(id.as_bytes()); }
+        }
+        None => { h.update([0u8]); }
+    }
+    match mb.consensus_data.banned_validators.as_deref() {
+        Some(b) => { h.update([1u8]); h.update((b.len() as u32).to_le_bytes()); h.update(b); }
         None => { h.update([0u8]); }
     }
     let mut out = [0u8; 32];

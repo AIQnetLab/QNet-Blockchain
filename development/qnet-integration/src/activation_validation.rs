@@ -414,21 +414,21 @@ impl BlockchainActivationRegistry {
     ///   3. ROCKSDB: wallet already registered → reverse index confirms ownership
     pub async fn verify_code_ownership(&self, code: &str, wallet_address: &str) -> Result<bool, IntegrationError> {
         println!("[INFO][VERIFY] code_ownership_check wallet={}... code={}...", 
-            &wallet_address[..16.min(wallet_address.len())],
-            &code[..12.min(code.len())]);
+            qnet_state::char_prefix(&wallet_address, 16),
+            qnet_state::char_prefix(&code, 12));
         
         // Strategy 1: In-memory quantum XOR decryption (works if registry has burn_tx data)
         match self.extract_wallet_from_activation_code(code).await {
             Ok(ref code_wallet) if code_wallet == wallet_address => {
                 println!("[INFO][VERIFY] ownership_confirmed method=quantum_decrypt wallet={}...", 
-                    &wallet_address[..16.min(wallet_address.len())]);
+                    qnet_state::char_prefix(&wallet_address, 16));
                 return Ok(true);
             }
             Ok(ref code_wallet) if !code_wallet.is_empty() && code_wallet.len() > 10 => {
                 // XOR decryption returned a plausible full wallet — but it doesn't match
                 println!("[WARN][VERIFY] ownership_rejected method=quantum_decrypt expected={}... got={}...",
-                    &wallet_address[..16.min(wallet_address.len())],
-                    &code_wallet[..16.min(code_wallet.len())]);
+                    qnet_state::char_prefix(&wallet_address, 16),
+                    qnet_state::char_prefix(&code_wallet, 16));
                 return Ok(false);
             }
             _ => {
@@ -460,12 +460,12 @@ impl BlockchainActivationRegistry {
                             || node_id == &super_pseudonym
                             || node_id == code {
                             println!("[INFO][VERIFY] ownership_confirmed method=rocksdb node={} wallet={}...",
-                                node_id, &wallet_address[..16.min(wallet_address.len())]);
+                                node_id, qnet_state::char_prefix(&wallet_address, 16));
                             return Ok(true);
                         }
                     }
                     println!("[WARN][VERIFY] wallet_has_different_node wallet={}... nodes={:?}",
-                        &wallet_address[..16.min(wallet_address.len())],
+                        qnet_state::char_prefix(&wallet_address, 16),
                         nodes.iter().map(|(id,_,_)| id.clone()).collect::<Vec<_>>());
                     return Ok(false);
                 }
@@ -492,7 +492,9 @@ impl BlockchainActivationRegistry {
         use sha3::{Sha3_256, Digest};
         
         // Parse code: QNET-{TYPE+TS}-{ENC_WALLET[0:6]}-{ENC_WALLET[6:10]+ENTROPY}
-        if !code.starts_with("QNET-") || code.len() != 25 {
+        // len() is BYTES; an ASCII check makes it a char count too, so every segment split below is
+        // exact rather than truncated.
+        if !code.starts_with("QNET-") || !code.is_ascii() || code.len() != 25 {
             return Err(IntegrationError::ValidationError("Invalid code format".to_string()));
         }
         let parts: Vec<&str> = code.split('-').collect();
@@ -509,7 +511,7 @@ impl BlockchainActivationRegistry {
         
         // Extract encrypted wallet hex from segments 2+3
         let segment2 = parts[2]; // 6 hex chars
-        let wallet_part2 = &parts[3][..4.min(parts[3].len())]; // first 4 hex chars
+        let wallet_part2 = qnet_state::char_prefix(&parts[3], 4); // first 4 hex chars
         let encrypted_wallet_hex = format!("{}{}", segment2, wallet_part2); // 10 hex chars = 5 bytes
         
         // Reconstruct XOR key: SHA3(burn_tx:type:amount)[0..32]
@@ -542,10 +544,10 @@ impl BlockchainActivationRegistry {
 
         if matches {
             println!("[INFO][VERIFY] ownership_confirmed method=stateless_xor wallet={}... bind_bytes={}",
-                &wallet_address[..16.min(wallet_address.len())], bind_len);
+                qnet_state::char_prefix(&wallet_address, 16), bind_len);
         } else {
             println!("[WARN][VERIFY] ownership_rejected method=stateless_xor wallet={}... bind_bytes={}",
-                &wallet_address[..16.min(wallet_address.len())], bind_len);
+                qnet_state::char_prefix(&wallet_address, 16), bind_len);
         }
 
         Ok(matches)
@@ -562,7 +564,9 @@ impl BlockchainActivationRegistry {
     ) -> Result<String, IntegrationError> {
         use sha3::{Sha3_256, Digest};
         
-        if !code.starts_with("QNET-") || code.len() != 25 {
+        // len() is BYTES; an ASCII check makes it a char count too, so every segment split below is
+        // exact rather than truncated.
+        if !code.starts_with("QNET-") || !code.is_ascii() || code.len() != 25 {
             return Err(IntegrationError::ValidationError("Invalid code format".to_string()));
         }
         let parts: Vec<&str> = code.split('-').collect();
@@ -577,7 +581,7 @@ impl BlockchainActivationRegistry {
         };
         
         let segment2 = parts[2];
-        let wallet_part2 = &parts[3][..4.min(parts[3].len())];
+        let wallet_part2 = qnet_state::char_prefix(&parts[3], 4);
         let encrypted_wallet_hex = format!("{}{}", segment2, wallet_part2);
         
         let key_material = format!("{}:{}:{}", burn_tx_hash, node_type, burn_amount);
@@ -597,7 +601,7 @@ impl BlockchainActivationRegistry {
         
         // Sanity check: prefix should contain only printable ASCII (valid wallet chars)
         if prefix.chars().all(|c| c.is_ascii_alphanumeric()) {
-            println!("[INFO][EXTRACT] wallet_prefix_stateless prefix={}...", &prefix[..prefix.len().min(5)]);
+            println!("[INFO][EXTRACT] wallet_prefix_stateless prefix={}...", qnet_state::char_prefix(&prefix, 5));
             Ok(prefix)
         } else {
             Err(IntegrationError::CryptoError(
@@ -1197,7 +1201,7 @@ impl BlockchainActivationRegistry {
         
         use sha3::{Sha3_256, Digest};
         let tx_hash_bytes = Sha3_256::digest(tx_data.as_bytes());
-        let tx_hash = format!("qnet_{:x}", &tx_hash_bytes)[..22.min(format!("qnet_{:x}", &tx_hash_bytes).len())].to_string();
+        let tx_hash = qnet_state::char_prefix(&format!("qnet_{:x}", &tx_hash_bytes), 22).to_string();
         
         // Submit to consensus engine (mempool -> block production)
         println!("🔗 Submitting migration transaction to QNet consensus: {}", tx_hash);
@@ -1893,6 +1897,7 @@ impl BlockchainActivationRegistry {
         
         // PRODUCTION: Create real blockchain transaction
         use qnet_state::{Transaction, TransactionType, account::{NodeType, ActivationPhase}};
+        use qnet_state::transaction::NANO_PER_QNC;
         
         // Parse node type from string to enum
         // v3.18: Full nodes removed
@@ -1934,8 +1939,13 @@ impl BlockchainActivationRegistry {
         // CRITICAL: Use NodeActivation transaction type for proper Pool 3 integration
         // Phase 1: amount = 0 (1DEV burned externally on Solana, FREE gas)
         // Phase 2: amount > 0 (QNC transferred to Pool 3, distributed to all nodes)
+        // The quoted price, the activation record and the XOR code key are all denominated in WHOLE
+        // QNC (human-facing). The chain is nanoQNC end to end — apply debits `amount` straight out of
+        // sender.balance and Pool 3 credits it — so the conversion belongs HERE, at the one boundary
+        // where a price becomes a chain value. Without it Phase 2 charged 3750 nano (~4e-6 QNC): the
+        // entry price existed only as an RPC courtesy and was worth nothing on-chain.
         let amount = if record.phase == 2 {
-            record.activation_amount // Phase 2: QNC to Pool 3
+            record.activation_amount.saturating_mul(NANO_PER_QNC) // Phase 2: QNC to Pool 3
         } else {
             0 // Phase 1: No QNC transfer (1DEV burned on Solana)
         };
@@ -1975,16 +1985,10 @@ impl BlockchainActivationRegistry {
         // canonical message (build_canonical_verify_message's NodeActivation arm). Ed25519 was an
         // illusory leg that proved no identity and is quantum-breakable — removed.
         {
-            let canonical_msg = format!(
-                "{}|{}|{}|{}|{}|{}|{}",
-                transaction.from,
-                transaction.to.as_deref().unwrap_or(""),
-                transaction.amount,
-                transaction.nonce,
-                transaction.gas_price,
-                transaction.gas_limit,
-                transaction.timestamp,
-            );
+            // THE one builder — never rebuild the preimage here, or signer and verifier drift and the
+            // payload silently falls back outside the signature.
+            let canonical_msg =
+                crate::node::BlockchainNode::build_canonical_verify_message(&transaction);
             let local_node_id = crate::unified_p2p::GLOBAL_NODE_ID.read().clone();
             if !local_node_id.is_empty() {
                 if let Some(crypto) = crate::node::try_get_quantum_crypto() {
@@ -2012,7 +2016,7 @@ impl BlockchainActivationRegistry {
         transaction.hash = transaction.calculate_hash();
         
         // PRODUCTION: Submit to blockchain through GLOBAL mempool
-        println!("[REGISTRY] 🔗 Submitting activation transaction to mempool: {}", &transaction.hash[..16.min(transaction.hash.len())]);
+        println!("[REGISTRY] 🔗 Submitting activation transaction to mempool: {}", qnet_state::char_prefix(&transaction.hash, 16));
         
         // CRITICAL: Use GLOBAL_MEMPOOL_INSTANCE to add transaction to mempool
         // This ensures transaction will be included in next microblock
@@ -2026,13 +2030,13 @@ impl BlockchainActivationRegistry {
                     // v2.26: Direct access - SimpleMempool is already thread-safe
                     // Use transaction.hash which was calculated via canonical_bytes()
                     if mempool_arc.add_binary_transaction(tx_bytes.clone(), transaction.hash.clone(), transaction.gas_price) {
-                        println!("[INFO][REGISTRY] activation_tx_added hash={}", &transaction.hash[..16.min(transaction.hash.len())]);
+                        println!("[INFO][REGISTRY] activation_tx_added hash={}", qnet_state::char_prefix(&transaction.hash, 16));
                         // v6.5: Gulf Stream broadcast → current producer + gossip backup
                         // If producer unknown (new node just started), fallback sends to ALL genesis nodes
                         // This ensures activation TX reaches whoever is producing blocks
                         if let Some(p2p) = crate::node::try_get_p2p() {
                             let _ = p2p.broadcast_transaction(tx_bytes.clone());
-                            println!("[INFO][REGISTRY] activation_tx_broadcast hash={}", &transaction.hash[..16.min(transaction.hash.len())]);
+                            println!("[INFO][REGISTRY] activation_tx_broadcast hash={}", qnet_state::char_prefix(&transaction.hash, 16));
 
                             // v6.5: Explicit send to ALL genesis nodes as guaranteed fallback
                             // New node may not know current producer yet — ensure TX reaches the network
@@ -2047,7 +2051,7 @@ impl BlockchainActivationRegistry {
                             println!("[INFO][REGISTRY] activation_tx_sent_to_genesis nodes={}", genesis_ips.len());
                         }
                     } else {
-                        println!("[WARN][REGISTRY] activation_tx_skip hash={} reason=duplicate_or_full", &transaction.hash[..16.min(transaction.hash.len())]);
+                        println!("[WARN][REGISTRY] activation_tx_skip hash={} reason=duplicate_or_full", qnet_state::char_prefix(&transaction.hash, 16));
                     }
                 }
                 Err(e) => {
@@ -2203,11 +2207,11 @@ impl BlockchainActivationRegistry {
         // No special "migration transaction" - just normal node activation that updates device signature
         println!("🔗 Device migration = node activation with same code (updates device signature)");
         if let Some(old_key) = &old_key_for_print {
-            println!("   📝 From device: {}...", &old_key[..8.min(old_key.len())]);
+            println!("   📝 From device: {}...", qnet_state::char_prefix(&old_key, 8));
         } else {
             println!("   📝 From device: unknown");
         }
-        println!("   📝 To device: {}...", &new_device_signature[..8.min(new_device_signature.len())]);
+        println!("   📝 To device: {}...", qnet_state::char_prefix(&new_device_signature, 8));
         println!("   💰 Cost: Normal activation cost (no extra fees for migration)");
         
         Ok(())

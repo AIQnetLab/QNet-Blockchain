@@ -21,6 +21,7 @@ pub mod archive_manager;
 pub mod genesis_constants;
 pub mod galc;              // Genesis-Anchored Live Checkpoint — live genesis-signed WS pin for cold-join
 pub mod reward_sharding;
+pub mod reward_epoch;      // Reward epochs: one owner for an epoch root, its total, and its serveability
 pub mod registry_lthash;   // Homomorphic (incremental, O(1)) multiset hash for registry_root at scale
 pub mod consensus_state;   // L1 consensus state machine (single coordinator)
 pub mod consensus_v2_driver; // Consensus v2 — Checkpoint-BFT driver (engine ↔ node bridge)
@@ -40,14 +41,13 @@ mod tests;                 // PRODUCTION v2.19.25: Complete test suite (API, Str
 // ============================================================================
 // CRYPTOGRAPHY MODULE (isolated for external audit)
 // ============================================================================
-/// All cryptographic operations: Dilithium, Ed25519, VRF, PoH, Key Management
+/// All cryptographic operations: Dilithium, VRF, Key Management
 /// See: src/crypto/mod.rs for full documentation
 pub mod crypto;
 
 // Backwards compatibility re-exports (so existing imports still work)
 pub use crypto::pq_crypto;
 pub use crypto::quantum_crypto;
-pub use crypto::poh;
 pub use crypto::vrf;
 pub use crypto::key_manager;
 

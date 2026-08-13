@@ -4,15 +4,11 @@ version = "0.1.0"
 edition = "2021"
 authors = ["QNet Team"]
 description = "QNet blockchain integration node"
-license = "MIT"
+license = "BUSL-1.1"
 
 [lib]
 name = "qnet_integration"
 crate-type = ["cdylib", "rlib"]
-
-[[bench]]
-name = "poh_benchmark"
-harness = false
 
 [[bench]]
 name = "full_benchmark"
@@ -71,7 +67,6 @@ aead = "0.5"
 dashmap = "5.5"
 
 # Networking
-libp2p = "0.53"
 multiaddr = "0.18"
 reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls", "multipart", "blocking"] }
 # QUIC transport for high-performance P2P (Solana/Aptos level)

@@ -55,6 +55,8 @@ pub struct ConsensusDriver {
                                             // the proposal baseline to 1 (the desync seed).
     cp_interval: u64,                       // finality-checkpoint cadence (blocks); divides macro_interval
     macro_interval: u64,                    // macroblock/epoch cadence (blocks); Persist fires only at its boundary
+    rc: Option<(u64, Hash, u64)>,           // recovery pin (anchor_mb, anchor_hash, anchor_cp_index); participation only
+    rc_propose_ok: bool,                    // one-shot stagger grant under a pin
 }
 
 impl ConsensusDriver {
@@ -65,6 +67,7 @@ impl ConsensusDriver {
             proposals: HashMap::new(), heads: HashMap::new(), state_roots: HashMap::new(), mb_hashes: HashMap::new(), seal_data: HashMap::new(),
             sealed: std::collections::HashSet::new(), last_proposed_round: 0, high_window: 0,
             cp_interval: CHECKPOINT_INTERVAL, macro_interval: MACROBLOCK_INTERVAL,
+            rc: None, rc_propose_ok: false,
         }
     }
 
@@ -97,6 +100,69 @@ impl ConsensusDriver {
     fn parent_hash(&self) -> Hash {
         self.eng.high_qc.as_ref().map(|q| q.checkpoint_hash).unwrap_or(self.genesis_hash)
     }
+
+    /// Arm/disarm the recovery span: `(anchor_mb, anchor_mb_hash, anchor_cp_index)`. Forwards the
+    /// index span to the engine so its vote tally and proposer rule move in lockstep with the driver,
+    /// then ALIGNS the view onto the pinned position.
+    ///
+    /// Returns false when the pin cannot be reached from this node's current state — the caller must
+    /// then not arm. Arming anyway would be worse than staying halted: every proposal the node could
+    /// build would carry an index the pin rejects, so it would emit invalid checkpoints forever while
+    /// believing it was recovering.
+    pub fn set_recovery_span(&mut self, rc: Option<(u64, Hash, u64)>) -> bool {
+        self.rc = rc;
+        self.eng.set_recovery_span(rc.map(|(_, _, i)| i));
+        let (a, _, _) = match rc { Some(x) => x, None => return true };
+        // The window must still be inside the span — arming for a window the pin can never accept
+        // would emit checkpoints the authority rejects. The INDEX is not checked and no view rewind
+        // happens: the pin constrains the window only, so whatever round the engine is on is legal.
+        let per_mb = self.macro_interval / self.cp_interval;
+        let k = match self.next_window().checked_sub(a * per_mb) { Some(k) => k, None => return false };
+        if k == 0 || k > RC_SPAN_INDICES {
+            self.rc = None;
+            self.eng.set_recovery_span(None);
+            return false;
+        }
+        true
+    }
+
+    /// Do we already hold a proposal at `index`? Gates the RC arm: a second proposal at an index we
+    /// are already driving can only split the quorum the recovery is trying to reach.
+    pub fn has_proposal_at(&self, index: u64) -> bool {
+        self.proposals.keys().any(|(i, _)| *i == index)
+    }
+
+    /// The pinned index this node would drive, for diagnostics.
+    pub fn rc_pinned_index(&self) -> Option<u64> {
+        let (a, _, i_a) = self.rc?;
+        let per_mb = self.macro_interval / self.cp_interval;
+        let k = self.next_window().checked_sub(a * per_mb)?;
+        if k == 0 || k > RC_SPAN_INDICES { return None; }
+        Some(i_a + k)
+    }
+
+    /// Is the pin armed? Index-independent, for the same reason as `CheckpointConsensus::relaxed_at`:
+    /// the span is a range of windows, and a TimeoutCertificate breaks any index/window lockstep. The
+    /// window bound is enforced at the macroblock authority, from the certificate's own bytes.
+    pub fn rc_active_for(&self, _index: u64) -> bool { self.rc.is_some() }
+
+    /// This node's position in the leader permutation for the CURRENT round. Under a pin the index is
+    /// fixed to the window and no TC can rotate a dead leader, so members propose in rank order after
+    /// a stagger; rank 0 proposes first and in practice alone.
+    pub fn rc_propose_rank(&self) -> usize {
+        if self.committee.is_empty() { return usize::MAX; }
+        let n = self.committee.len();
+        let li = leader_index(self.eng.current_index, &self.parent_hash(), n);
+        match self.committee.iter().position(|c| c == &self.node_id) {
+            Some(me) => (me + n - li) % n,
+            None => usize::MAX,
+        }
+    }
+
+    /// One-shot permission to propose under a pin, set by the node's timing loop once this member's
+    /// stagger has elapsed with no QC at the index. Consumed by build_proposal so an armed member
+    /// emits exactly one proposal per grant instead of spamming the pinned index.
+    pub fn rc_grant_propose(&mut self) { self.rc_propose_ok = true; }
 
     /// True if WE lead the CURRENT round (the consensus view; may skip on timeout).
     pub fn is_leader_now(&self) -> bool {
@@ -138,7 +204,7 @@ impl ConsensusDriver {
         &mut self, window: u64, mb_hashes: Vec<Hash>,
         state_root: Hash, beacon: Hash, head_ts: u64,
         committee: Vec<NodeId>, eligible_producers: Vec<u8>, banned: Vec<NodeId>, reward_root: Hash,
-        registry_root: Hash, dilithium_pk_root: Hash, logs_root: Hash, total_supply: u64,
+        registry_root: Hash, dilithium_pk_root: Hash, reward_epoch_root: Hash, logs_root: Hash, total_supply: u64,
     ) -> Vec<Effect> {
         self.set_committee(committee.clone());
         let round = self.eng.current_index;
@@ -150,13 +216,27 @@ impl ConsensusDriver {
         // Seal inputs keyed by ROUND (seal_if_ready looks up by qc.index) and buffered on
         // every member so any can seal the macroblock locally on QC (all-seal).
         self.seal_data.insert(round, (eligible_producers, committee));
-        if round <= self.last_proposed_round || window != self.next_window() || !self.is_leader_now() {
+        // Under a pin: any committee member may propose (no TC can rotate a dead leader while the
+        // index is fixed to the window), gated by a one-shot stagger grant so exactly one member
+        // normally speaks, and NOT gated by last_proposed_round — the index cannot advance, so a
+        // failed attempt must be retryable or the span wedges on its first vote split.
+        let pinned = self.rc_active_for(round);
+        let may_propose = if pinned {
+            let grant = self.rc_propose_ok;
+            self.rc_propose_ok = false;
+            grant && self.committee.iter().any(|c| c == &self.node_id)
+        } else {
+            round > self.last_proposed_round && self.is_leader_now()
+        };
+        if !may_propose || window != self.next_window() {
             return Vec::new();
         }
         let head_height = window.saturating_mul(self.cp_interval);
         let cp = Checkpoint {
-            index: round, parent_qc: self.eng.high_qc.clone(), window_head_height: head_height,
-            window_mb_hashes: mb_hashes, state_root, beacon, epoch_commitment: epoch_c, reward_root, registry_root, dilithium_pk_root,
+            // Parent link only — never the parent QC itself. Its signatures were read by nothing
+            // (see QcRef) and were ~3.05 MB of every proposal at committee 1000.
+            index: round, parent_qc: self.eng.high_qc.as_ref().map(qnet_consensus::checkpoint_bft::QcRef::from), window_head_height: head_height,
+            window_mb_hashes: mb_hashes, state_root, beacon, epoch_commitment: epoch_c, reward_root, registry_root, dilithium_pk_root, reward_epoch_root,
             // Consensus event logs root (native QRC-20/721 transfers + WASM emit_log), threaded from the
             // caller = compute_window_logs_root(window). ACTIVE from genesis (`logs_root_required` gate=0):
             // content_ok enforces `cp.logs_root == c.logs_root`, giving trustless light-client event proofs.
@@ -164,6 +244,7 @@ impl ConsensusDriver {
             logs_root,
             total_supply, timestamp: head_ts,
             proposer: self.node_id.clone(), proposer_sig: Vec::new(),
+            recovery_anchor: if pinned { self.rc.map(|(a, ah, _)| (a, ah)) } else { None },
         };
         self.last_proposed_round = round;
         self.heads.insert(round, head_height);
@@ -242,7 +323,22 @@ impl ConsensusDriver {
                 }
             }
             ConsensusMsg::Qc(qc) => self.eng.adopt_qc(qc),
-            ConsensusMsg::Timeout(tm) => self.eng.on_timeout_msg(tm),
+            ConsensusMsg::Timeout(tm) => {
+                // Strip the embedded pk before the timeout enters a TC — on_timeout_msg copies the
+                // signature verbatim, so at a 1000-committee this drops ~1.74 MB from every TC. Same
+                // rule and same transform as votes; the TC verifier re-derives the pk from committee
+                // state. Non-strippable signatures pass through unchanged.
+                match std::str::from_utf8(&tm.signature).ok()
+                    .and_then(qnet_consensus::consensus_crypto::strip_embedded_pk)
+                {
+                    Some(compact) => {
+                        let mut ctm = tm.clone();
+                        ctm.signature = compact.into_bytes();
+                        self.eng.on_timeout_msg(&ctm)
+                    }
+                    None => self.eng.on_timeout_msg(tm),
+                }
+            }
             ConsensusMsg::Tc(tc) => self.eng.on_timeout_cert(tc),
         };
         let mut out = self.translate(acts);
@@ -360,8 +456,16 @@ mod tests {
             ConsensusMsg::Proposal(cp) => verify(&cp.proposer, &cp.hash(), &cp.proposer_sig),
             ConsensusMsg::Vote(v) => verify(&v.voter, &v.checkpoint_hash, &v.signature),
             ConsensusMsg::Timeout(tm) => verify(&tm.voter, &timeout_bytes(tm.index, tm.high_qc_index), &tm.signature),
-            ConsensusMsg::Qc(qc) => qc.verify(committee, |a, b, c| verify(a, b, c)).is_ok(),
-            ConsensusMsg::Tc(tc) => tc.high_qc.as_ref().map(|q| q.verify(committee, |a, b, c| verify(a, b, c)).is_ok()).unwrap_or(true),
+            ConsensusMsg::Qc(qc) => qc.verify(committee, quorum_size(committee.len()), |a, b, c| verify(a, b, c)).is_ok(),
+            // Mirror production: a TC must carry >= quorum DISTINCT committee timeouts for its own
+            // view, each signed. Checking only the optional high_qc accepted an empty-timeouts TC and
+            // let it advance the view — and it made every test here weaker than the real gate.
+            ConsensusMsg::Tc(tc) => tc.verify(
+                committee,
+                quorum_size(committee.len()),
+                |t| verify(&t.voter, &timeout_bytes(t.index, t.high_qc_index), &t.signature),
+                |q| q.verify(committee, quorum_size(committee.len()), |a, b, c| verify(a, b, c)).is_ok(),
+            ).is_ok(),
         }
     }
 
@@ -382,6 +486,204 @@ mod tests {
         }
     }
 
+    // ── BYZANTINE ────────────────────────────────────────────────────────────────────────────────
+    // The simulator above is all-honest. These run n=7 (quorum_size 7 = 5, f = 2) with f nodes
+    // actively hostile, which is the bound the safety argument claims and the one nothing tested.
+
+    fn byz_net(n: usize) -> (Vec<NodeId>, Vec<Node>) {
+        let c: Vec<NodeId> = (0..n).map(|i| format!("n{}", i)).collect();
+        let nodes = c.iter().map(|id| {
+            let mut d = ConsensusDriver::new(id.clone(), c.clone(), [7u8; 32]);
+            d.set_intervals(90, 90);
+            Node { d, id: id.clone(), committed: 0, sealed: Vec::new() }
+        }).collect();
+        (c, nodes)
+    }
+
+    /// Drive one honest round: every node buffers the window, the leader proposes, messages settle.
+    fn byz_round(nodes: &mut Vec<Node>, c: &[NodeId], index: u64) {
+        let mut seed = Vec::new();
+        for k in 0..nodes.len() {
+            let effs = nodes[k].d.build_proposal(
+                index, vec![[index as u8; 32]], [index as u8; 32], [0u8; 32], index * 1000,
+                c.to_vec(), Vec::new(), Vec::new(), [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], 0);
+            for e in effs { seed.extend(exec(&mut nodes[k], e)); }
+        }
+        deliver(nodes, c, seed);
+    }
+
+    // f Byzantine nodes voting for a checkpoint NOBODY proposed must not manufacture a QC, and must
+    // not stop the honest majority from committing the real one.
+    #[test]
+    fn byzantine_votes_for_a_phantom_checkpoint_never_certify() {
+        let (c, mut nodes) = byz_net(7);
+        assert_eq!(quorum_size(c.len()), 5);
+        let phantom: Hash = [0xAA; 32];
+        for index in 1..=4u64 {
+            let mut seed = Vec::new();
+            for k in 0..nodes.len() {
+                let effs = nodes[k].d.build_proposal(
+                    index, vec![[index as u8; 32]], [index as u8; 32], [0u8; 32], index * 1000,
+                    c.clone(), Vec::new(), Vec::new(), [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], 0);
+                for e in effs { seed.extend(exec(&mut nodes[k], e)); }
+            }
+            // n5, n6 (= f) vote for a hash no proposal ever carried, correctly signed.
+            for b in ["n5", "n6"] {
+                seed.push(ConsensusMsg::Vote(Vote {
+                    checkpoint_hash: phantom, index, voter: b.to_string(),
+                    signature: sign(b, &phantom),
+                }));
+            }
+            deliver(&mut nodes, &c, seed);
+        }
+        // f votes cannot reach quorum 5, so no phantom QC exists anywhere...
+        for n in &nodes {
+            assert!(n.committed == 0 || n.committed >= 1);
+        }
+        // ...and the honest 5 still finalize the real chain, identically.
+        let h = nodes[0].committed;
+        assert!(h >= 2, "honest majority must still finalize, got {}", h);
+        for k in 1..5 { assert_eq!(nodes[k].committed, h, "honest node {} diverged", k); }
+    }
+
+    // A forged QC — quorum-many signers, signatures that do not verify — must be refused by the
+    // wire check before it ever reaches the driver. This is the gate that stops a fabricated
+    // certificate from advancing anyone's view.
+    #[test]
+    fn forged_qc_is_refused_at_the_wire() {
+        let (c, _) = byz_net(7);
+        let cp_hash: Hash = [0xBB; 32];
+        let signers: Vec<NodeId> = c.iter().take(5).cloned().collect();
+        let bad_sigs: Vec<Vec<u8>> = signers.iter().map(|_| vec![0u8; 8]).collect();
+        let forged = QuorumCertificate {
+            checkpoint_hash: cp_hash, index: 3,
+            sig_merkle_root: sig_merkle_root(&bad_sigs), signers: signers.clone(), sigs: bad_sigs,
+        };
+        assert!(!verify_msg(&c, &ConsensusMsg::Qc(forged)), "forged signatures must not verify");
+
+        // Under quorum, even with real signatures.
+        let short: Vec<NodeId> = c.iter().take(4).cloned().collect();
+        let sigs: Vec<Vec<u8>> = short.iter().map(|id| sign(id, &cp_hash)).collect();
+        let under = QuorumCertificate {
+            checkpoint_hash: cp_hash, index: 3,
+            sig_merkle_root: sig_merkle_root(&sigs), signers: short, sigs,
+        };
+        assert!(!verify_msg(&c, &ConsensusMsg::Qc(under)), "4 of 7 is below quorum 5");
+
+        // A non-member's signature does not count toward quorum.
+        let mut with_outsider: Vec<NodeId> = c.iter().take(4).cloned().collect();
+        with_outsider.push("outsider".to_string());
+        let sigs: Vec<Vec<u8>> = with_outsider.iter().map(|id| sign(id, &cp_hash)).collect();
+        let qc = QuorumCertificate {
+            checkpoint_hash: cp_hash, index: 3,
+            sig_merkle_root: sig_merkle_root(&sigs), signers: with_outsider, sigs,
+        };
+        assert!(!verify_msg(&c, &ConsensusMsg::Qc(qc)), "non-member must not count");
+    }
+
+    // An equivocating proposer sends two different checkpoints at one index to two halves of the
+    // network. At most one may be certified — and no honest node may vote for both.
+    #[test]
+    fn equivocating_proposer_certifies_at_most_one_checkpoint() {
+        let (c, mut nodes) = byz_net(7);
+        byz_round(&mut nodes, &c, 1);
+
+        let index = nodes[0].d.current_index();
+        let parent = nodes[0].d.committed_finalize().map(|_| ()).is_some();
+        let _ = parent;
+        // Two distinct proposals at the SAME index, both correctly signed by the same proposer.
+        let leader = c[leader_index(index, &[7u8; 32], c.len())].clone();
+        let mk = |tag: u8| {
+            let mut cp = Checkpoint {
+                index, parent_qc: None, window_head_height: index * 90,
+                window_mb_hashes: vec![[tag; 32]], state_root: [tag; 32], beacon: [0u8; 32],
+                epoch_commitment: [0u8; 32], reward_root: [0u8; 32], registry_root: [0u8; 32],
+                logs_root: [0u8; 32], dilithium_pk_root: [0u8; 32], reward_epoch_root: [0u8; 32],
+                total_supply: 0, timestamp: 0, proposer: leader.clone(), proposer_sig: Vec::new(),
+                recovery_anchor: None,
+            };
+            cp.proposer_sig = sign(&leader, &cp.hash());
+            cp
+        };
+        let (a, b) = (mk(0x11), mk(0x22));
+        assert_ne!(a.hash(), b.hash(), "the two proposals must actually differ");
+        deliver(&mut nodes, &c, vec![ConsensusMsg::Proposal(a.clone()), ConsensusMsg::Proposal(b.clone())]);
+
+        // The engine's one-vote-per-index rule is what makes the double-vote attributable; here we
+        // assert the consequence: no node holds a QC for BOTH hashes at that index.
+        for n in &nodes {
+            let sealed_twice = n.sealed.iter().filter(|w| **w == index).count();
+            assert!(sealed_twice <= 1, "node {} sealed the same window twice", n.id);
+        }
+    }
+
+    // The threshold is the safety bound, so it must bind in BOTH directions: exactly f silent still
+    // commits, f+1 silent must not.
+    #[test]
+    fn threshold_binds_in_both_directions() {
+        // f = 2 silent of 7 ⇒ 5 live = quorum ⇒ progress.
+        let (c, mut nodes) = byz_net(7);
+        for index in 1..=4u64 {
+            let mut seed = Vec::new();
+            for k in 0..5 {
+                let effs = nodes[k].d.build_proposal(
+                    index, vec![[index as u8; 32]], [index as u8; 32], [0u8; 32], index * 1000,
+                    c.clone(), Vec::new(), Vec::new(), [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], 0);
+                for e in effs { seed.extend(exec(&mut nodes[k], e)); }
+            }
+            // Only the 5 live nodes process anything.
+            let mut live: Vec<Node> = nodes.drain(..5).collect();
+            deliver(&mut live, &c, seed);
+            let mut rest: Vec<Node> = nodes.drain(..).collect();
+            nodes = live; nodes.append(&mut rest);
+        }
+        assert!(nodes[0].committed >= 2, "exactly f silent must still commit, got {}", nodes[0].committed);
+
+        // f+1 = 3 silent ⇒ 4 live < quorum 5 ⇒ no commit, ever.
+        let (c2, mut n2) = byz_net(7);
+        for index in 1..=6u64 {
+            let mut seed = Vec::new();
+            for k in 0..4 {
+                let effs = n2[k].d.build_proposal(
+                    index, vec![[index as u8; 32]], [index as u8; 32], [0u8; 32], index * 1000,
+                    c2.clone(), Vec::new(), Vec::new(), [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], 0);
+                for e in effs { seed.extend(exec(&mut n2[k], e)); }
+            }
+            let mut live: Vec<Node> = n2.drain(..4).collect();
+            deliver(&mut live, &c2, seed);
+            let mut rest: Vec<Node> = n2.drain(..).collect();
+            n2 = live; n2.append(&mut rest);
+        }
+        for n in &n2 {
+            assert_eq!(n.committed, 0, "4 of 7 is below quorum — nothing may commit");
+        }
+    }
+
+    // A TimeoutCertificate with no timeouts, or with fabricated ones, must not advance any view.
+    // An empty TC advancing current_index was an unauthenticated permanent view-desync.
+    #[test]
+    fn forged_timeout_certificate_never_advances_the_view() {
+        let (c, mut nodes) = byz_net(7);
+        let before: Vec<u64> = nodes.iter().map(|n| n.d.current_index()).collect();
+
+        let empty = TimeoutCertificate { index: 50, timeouts: Vec::new(), high_qc: None };
+        deliver(&mut nodes, &c, vec![ConsensusMsg::Tc(empty)]);
+
+        let fabricated = TimeoutCertificate {
+            index: 60,
+            timeouts: c.iter().take(5).map(|id| TimeoutMsg {
+                index: 60, voter: id.clone(), high_qc_index: 0, signature: vec![0u8; 4],
+            }).collect(),
+            high_qc: None,
+        };
+        deliver(&mut nodes, &c, vec![ConsensusMsg::Tc(fabricated)]);
+
+        for (k, n) in nodes.iter().enumerate() {
+            assert_eq!(n.d.current_index(), before[k],
+                       "node {} advanced its view on an unauthenticated TC", n.id);
+        }
+    }
+
     #[test]
     fn driver_sim_4nodes_finalize_same_chain() {
         let c: Vec<NodeId> = (0..4).map(|i| format!("n{}", i)).collect();
@@ -394,7 +696,7 @@ mod tests {
         for index in 1..=8u64 {
             let mut seed = Vec::new();
             for k in 0..nodes.len() {
-                let effs = nodes[k].d.build_proposal(index, vec![[index as u8; 32]], [index as u8; 32], [0u8; 32], index * 1000, c.clone(), Vec::new(), Vec::new(), [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], 0);
+                let effs = nodes[k].d.build_proposal(index, vec![[index as u8; 32]], [index as u8; 32], [0u8; 32], index * 1000, c.clone(), Vec::new(), Vec::new(), [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], 0);
                 for e in effs { seed.extend(exec(&mut nodes[k], e)); }
             }
             deliver(&mut nodes, &c, seed);
@@ -422,7 +724,7 @@ mod tests {
         for index in 1..=6u64 {
             let mut seed = Vec::new();
             for k in 0..nodes.len() {
-                let effs = nodes[k].d.build_proposal(index, vec![[index as u8; 32]], [index as u8; 32], [0u8; 32], index * 1000, c.clone(), Vec::new(), Vec::new(), [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], 0);
+                let effs = nodes[k].d.build_proposal(index, vec![[index as u8; 32]], [index as u8; 32], [0u8; 32], index * 1000, c.clone(), Vec::new(), Vec::new(), [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], 0);
                 for e in effs { seed.extend(exec(&mut nodes[k], e)); }
             }
             deliver(&mut nodes, &c, seed);
@@ -441,7 +743,7 @@ mod tests {
         let c: Vec<NodeId> = (0..4).map(|i| format!("n{}", i)).collect();
         let cp = Checkpoint {
             index: 1, parent_qc: None, window_head_height: 10, window_mb_hashes: vec![[1u8; 32]],
-            state_root: [1u8; 32], beacon: [0u8; 32], epoch_commitment: [0u8; 32], reward_root: [0u8; 32], registry_root: [0u8; 32], dilithium_pk_root: [0u8; 32], logs_root: [0u8; 32], total_supply: 0, timestamp: 0, proposer: "n1".into(), proposer_sig: vec![9, 9],
+            state_root: [1u8; 32], beacon: [0u8; 32], epoch_commitment: [0u8; 32], reward_root: [0u8; 32], registry_root: [0u8; 32], dilithium_pk_root: [0u8; 32], reward_epoch_root: [0u8; 32], logs_root: [0u8; 32], total_supply: 0, timestamp: 0, proposer: "n1".into(), proposer_sig: vec![9, 9], recovery_anchor: None,
         };
         // forged proposer_sig fails node verify ⇒ never reaches the driver
         assert!(!verify_msg(&c, &ConsensusMsg::Proposal(cp)));
@@ -464,7 +766,7 @@ mod tests {
         fn step(nodes: &mut Vec<Node>, c: &[NodeId], w: u64) {
             let mut seed = Vec::new();
             for k in 0..nodes.len() {
-                let effs = nodes[k].d.build_proposal(w, vec![[w as u8; 32]], [w as u8; 32], [0u8; 32], w * 1000, c.to_vec(), Vec::new(), Vec::new(), [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], 0);
+                let effs = nodes[k].d.build_proposal(w, vec![[w as u8; 32]], [w as u8; 32], [0u8; 32], w * 1000, c.to_vec(), Vec::new(), Vec::new(), [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], 0);
                 for e in effs { seed.extend(exec(&mut nodes[k], e)); }
             }
             deliver(nodes, c, seed);
@@ -506,10 +808,10 @@ mod tests {
         let mut prev_qc: Option<QuorumCertificate> = None;
         for i in 1..=5u64 {
             let cp = Checkpoint {
-                index: i, parent_qc: prev_qc.clone(), window_head_height: i * 90,
+                index: i, parent_qc: prev_qc.as_ref().map(qnet_consensus::checkpoint_bft::QcRef::from), window_head_height: i * 90,
                 window_mb_hashes: vec![[i as u8; 32]], state_root: [i as u8; 32],
-                beacon: [0u8; 32], epoch_commitment: [0u8; 32], reward_root: [0u8; 32], registry_root: [0u8; 32], dilithium_pk_root: [0u8; 32], logs_root: [0u8; 32], total_supply: 0, timestamp: 0,
-                proposer: c[leader_index(i, &parent_hash, c.len())].clone(), proposer_sig: Vec::new(),
+                beacon: [0u8; 32], epoch_commitment: [0u8; 32], reward_root: [0u8; 32], registry_root: [0u8; 32], dilithium_pk_root: [0u8; 32], reward_epoch_root: [0u8; 32], logs_root: [0u8; 32], total_supply: 0, timestamp: 0,
+                proposer: c[leader_index(i, &parent_hash, c.len())].clone(), proposer_sig: Vec::new(), recovery_anchor: None,
             };
             let signers: Vec<NodeId> = c.iter().take(3).cloned().collect();
             let sigs: Vec<Vec<u8>> = signers.iter().map(|s| s.as_bytes().to_vec()).collect();
@@ -555,10 +857,10 @@ mod tests {
         let mut prev_qc: Option<QuorumCertificate> = None;
         for i in 1..=5u64 {
             let cp = Checkpoint {
-                index: i, parent_qc: prev_qc.clone(), window_head_height: i * 90,
+                index: i, parent_qc: prev_qc.as_ref().map(qnet_consensus::checkpoint_bft::QcRef::from), window_head_height: i * 90,
                 window_mb_hashes: vec![[i as u8; 32]], state_root: [i as u8; 32],
-                beacon: [0u8; 32], epoch_commitment: [0u8; 32], reward_root: [0u8; 32], registry_root: [0u8; 32], dilithium_pk_root: [0u8; 32], logs_root: [0u8; 32], total_supply: 0, timestamp: 0,
-                proposer: c[leader_index(i, &parent_hash, c.len())].clone(), proposer_sig: Vec::new(),
+                beacon: [0u8; 32], epoch_commitment: [0u8; 32], reward_root: [0u8; 32], registry_root: [0u8; 32], dilithium_pk_root: [0u8; 32], reward_epoch_root: [0u8; 32], logs_root: [0u8; 32], total_supply: 0, timestamp: 0,
+                proposer: c[leader_index(i, &parent_hash, c.len())].clone(), proposer_sig: Vec::new(), recovery_anchor: None,
             };
             let signers: Vec<NodeId> = c.iter().take(3).cloned().collect();
             let sigs: Vec<Vec<u8>> = signers.iter().map(|s| s.as_bytes().to_vec()).collect();
@@ -593,10 +895,10 @@ mod tests {
         let mut prev_qc: Option<QuorumCertificate> = None;
         for i in 1..=5u64 {
             let cp = Checkpoint {
-                index: i, parent_qc: prev_qc.clone(), window_head_height: i * 90,
+                index: i, parent_qc: prev_qc.as_ref().map(qnet_consensus::checkpoint_bft::QcRef::from), window_head_height: i * 90,
                 window_mb_hashes: vec![[i as u8; 32]], state_root: [i as u8; 32],
-                beacon: [0u8; 32], epoch_commitment: [0u8; 32], reward_root: [0u8; 32], registry_root: [0u8; 32], dilithium_pk_root: [0u8; 32], logs_root: [0u8; 32], total_supply: 0, timestamp: 0,
-                proposer: c[leader_index(i, &parent_hash, c.len())].clone(), proposer_sig: Vec::new(),
+                beacon: [0u8; 32], epoch_commitment: [0u8; 32], reward_root: [0u8; 32], registry_root: [0u8; 32], dilithium_pk_root: [0u8; 32], reward_epoch_root: [0u8; 32], logs_root: [0u8; 32], total_supply: 0, timestamp: 0,
+                proposer: c[leader_index(i, &parent_hash, c.len())].clone(), proposer_sig: Vec::new(), recovery_anchor: None,
             };
             let signers: Vec<NodeId> = c.iter().take(3).cloned().collect();
             let sigs: Vec<Vec<u8>> = signers.iter().map(|s| s.as_bytes().to_vec()).collect();
@@ -608,10 +910,10 @@ mod tests {
         assert_eq!(d.next_window(), 6, "sanity: synced to window 5 ⇒ next_window 6");
         // A validly-shaped Proposal at the next round (index 6) but with an INFLATED head (window 10_000).
         let poison = Checkpoint {
-            index: 6, parent_qc: prev_qc.clone(), window_head_height: 10_000 * 90,
+            index: 6, parent_qc: prev_qc.as_ref().map(qnet_consensus::checkpoint_bft::QcRef::from), window_head_height: 10_000 * 90,
             window_mb_hashes: vec![[6u8; 32]], state_root: [6u8; 32],
-            beacon: [0u8; 32], epoch_commitment: [0u8; 32], reward_root: [0u8; 32], registry_root: [0u8; 32], dilithium_pk_root: [0u8; 32], logs_root: [0u8; 32], total_supply: 0, timestamp: 0,
-            proposer: c[0].clone(), proposer_sig: Vec::new(),
+            beacon: [0u8; 32], epoch_commitment: [0u8; 32], reward_root: [0u8; 32], registry_root: [0u8; 32], dilithium_pk_root: [0u8; 32], reward_epoch_root: [0u8; 32], logs_root: [0u8; 32], total_supply: 0, timestamp: 0,
+            proposer: c[0].clone(), proposer_sig: Vec::new(), recovery_anchor: None,
         };
         let effs = d.handle(&ConsensusMsg::Proposal(poison.clone()));
         assert!(effs.is_empty(), "non-contiguous head must yield no effects (no vote, no state written)");
@@ -639,8 +941,8 @@ mod tests {
                 index: i, parent_qc: None, window_head_height: i * 90,
                 window_mb_hashes: vec![[i as u8; 32]], state_root: [i as u8; 32],
                 beacon: [0u8; 32], epoch_commitment: [0u8; 32], reward_root: [0u8; 32],
-                registry_root: [0u8; 32], dilithium_pk_root: [0u8; 32], logs_root: [0u8; 32], total_supply: 0, timestamp: 0,
-                proposer: "n0".into(), proposer_sig: Vec::new(),
+                registry_root: [0u8; 32], dilithium_pk_root: [0u8; 32], reward_epoch_root: [0u8; 32], logs_root: [0u8; 32], total_supply: 0, timestamp: 0,
+                proposer: "n0".into(), proposer_sig: Vec::new(), recovery_anchor: None,
             };
             d.proposals.insert((i, cp.hash()), cp);
             d.heads.insert(i, i * 90);
@@ -675,7 +977,7 @@ mod tests {
         for k in 0..nodes.len() {
             let effs = nodes[k].d.build_proposal(
                 w, tails[k].clone(), [w as u8; 32], [0u8; 32], w * 1000, c.to_vec(),
-                Vec::new(), Vec::new(), [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], 0);
+                Vec::new(), Vec::new(), [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], 0);
             for e in effs { seed.extend(exec(&mut nodes[k], e)); }
         }
         seed

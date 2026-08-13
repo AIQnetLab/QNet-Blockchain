@@ -2,12 +2,11 @@
 #![cfg(test)]
 
 use qnet_consensus::commit_reveal::{
-    CommitRevealConsensus, ConsensusConfig, ConsensusPhase, 
-    Commit, Reveal, ValidatorNodeType, ValidatorCandidate
+    CommitRevealConsensus, ConsensusConfig,
+    Commit
 };
 use qnet_consensus::reputation::{NodeReputation, ReputationConfig};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use std::collections::HashMap;
 use colored::Colorize;
 use sha3::{Sha3_256, Digest};
 
@@ -51,7 +50,7 @@ fn generate_commit_hash(node_id: &str, data: &str, nonce: &[u8; 32]) -> String {
 fn test_byzantine_safety_threshold() {
     println!("\n{}", "=== BYZANTINE FAULT TOLERANCE TEST ===".green().bold());
     
-    let mut consensus = create_test_consensus("leader_node");
+    let _consensus = create_test_consensus("leader_node");
     
     // Test various node counts and their Byzantine thresholds
     let test_cases = vec![
@@ -93,7 +92,9 @@ fn test_commit_reveal_phases() {
     let round_number = consensus.start_round(participants.clone())
         .expect("Failed to start round");
     
-    assert_eq!(round_number, 1, "First round should be 1");
+    // Rounds are keyed on macroblock height, not a counter: the first round is the first macroblock
+    // boundary (MACROBLOCK_INTERVAL = 90), not 1.
+    assert_eq!(round_number, 90, "First round is the first macroblock boundary");
     println!("  Round {} started with {} participants", 
         round_number.to_string().cyan(), 
         participants.len().to_string().yellow()
@@ -103,7 +104,7 @@ fn test_commit_reveal_phases() {
     let nonce = [42u8; 32];
     let commit_hash = generate_commit_hash("genesis_node_001", "test_data", &nonce);
     
-    let commit = Commit {
+    let _commit = Commit {
         node_id: "genesis_node_001".to_string(),
         commit_hash: commit_hash.clone(),
         timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
@@ -395,7 +396,7 @@ fn test_consensus_performance_metrics() {
             timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
             signature: format!("sig_{}", i),
         };
-        let _ = consensus.process_commit(commit); // Ignore duplicates for perf test
+        let _ = consensus.process_commit(commit, i as u64); // Ignore duplicates for perf test
     }
     let elapsed = start.elapsed();
     let avg_commit = elapsed.as_micros() / iterations as u128;

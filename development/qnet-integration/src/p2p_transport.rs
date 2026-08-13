@@ -4,7 +4,7 @@
 //!
 //! ## Architecture
 //!
-//! ```
+//! ```text
 //! ┌─────────────────────────────────────────────────────────────────┐
 //! │                     P2PTransport Trait                          │
 //! │  - send_message(peer, msg) -> Response                         │
@@ -26,14 +26,14 @@
 //! ## Security Model
 //!
 //! 1. **Transport Encryption**: QUIC with TLS 1.3
-//! 2. **Peer Authentication**: PqCertificate (Ed25519 + Dilithium)
+//! 2. **Peer Authentication**: PqCertificate (ML-DSA-65 / Dilithium3)
 //! 3. **Message Integrity**: Dilithium signatures on all messages
 //! 4. **Post-Quantum**: NIST FIPS 204 compliant (ML-DSA/Dilithium)
 //!
 //! ## Protocol
 //!
 //! Binary message format (bincode serialization):
-//! ```
+//! ```text
 //! ┌──────────┬──────────┬────────────┬─────────────────┐
 //! │ Version  │ MsgType  │  Length    │    Payload      │
 //! │ (1 byte) │ (1 byte) │ (4 bytes)  │  (N bytes)      │

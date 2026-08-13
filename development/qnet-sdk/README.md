@@ -63,7 +63,7 @@ await client.sendTransaction({ ...tx, signature: mySignature.toString('hex') });
 | `getBalance(address)` | QNC balance + metadata |
 | `getBalanceFormatted(address)` | Human-readable balance string |
 | `getPendingRewards(address)` | Unclaimed rewards |
-| `claimRewards(address, signature)` | Claim pending rewards |
+| `claimRewards(nodeId, wallet, publicKey, sign)` | Claim pending rewards (two-step: the node quotes the batch, your key signs it) |
 | `requestFaucetTokens(walletAddress)` | Get 1500 1DEV + 0.001 SOL (testnet) |
 | `deployContract(params)` | Deploy a WASM smart contract |
 | `callContract(params)` | Read-only contract call |

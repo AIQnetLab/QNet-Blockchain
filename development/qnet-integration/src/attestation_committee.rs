@@ -251,25 +251,18 @@ pub fn is_in_attestation_committee(
     committee.iter().any(|v| v == node_id)
 }
 
-/// Compute the Byzantine 2/3+ supermajority threshold for a committee of given size.
+/// BFT threshold for a committee of `committee_size`. Delegates to THE network-wide formula.
 ///
-/// Canonical formula: ceil(2N/3) + 1 simplifications for integer arithmetic:
-///   threshold = (N * 2 + 2) / 3
+/// It used to compute `(2N + 2) / 3` independently, which is NOT the same function: it disagrees
+/// with `quorum_size` for every N divisible by 3 (N=6 → 4 vs 5, N=9 → 6 vs 7). Two threshold
+/// formulas in one tree is a fork waiting for its first caller — whichever subsystem picked the
+/// lower one would certify with fewer signatures than the rest of the network requires.
 ///
-/// This matches the network-wide BFT threshold used elsewhere in the codebase
-/// for consistency.
-///
-/// # Examples
-///
-/// ```ignore
-/// assert_eq!(byzantine_threshold(5), 4);     // 5 nodes → 4 attestations needed
-/// assert_eq!(byzantine_threshold(32), 22);   // 32 → 22
-/// assert_eq!(byzantine_threshold(64), 43);   // 64 → 43
-/// assert_eq!(byzantine_threshold(128), 86);  // 128 → 86
-/// ```
+/// `quorum_size(N) = N - floor((N-1)/3)`, the safe n-f bound: any two quorums share >= f+1 members,
+/// so at most one conflicting value can ever be certified.
 #[inline]
 pub fn byzantine_threshold(committee_size: usize) -> usize {
-    (committee_size * 2 + 2) / 3
+    qnet_consensus::checkpoint_bft::quorum_size(committee_size)
 }
 
 #[cfg(test)]
@@ -362,20 +355,24 @@ mod tests {
     }
 
     #[test]
-    fn byzantine_threshold_canonical() {
-        // Canonical 2/3+ supermajority thresholds. The function implements
-        // `ceil(2N/3)` via the integer-arithmetic identity `(2N + 2) / 3`,
-        // which equals the smallest integer K such that K > 2N/3 — i.e.
-        // the BFT 2f+1 threshold under f = floor((N-1)/3) Byzantine nodes.
-        assert_eq!(byzantine_threshold(5), 4);     // ceil(10/3) = 4
-        assert_eq!(byzantine_threshold(10), 7);    // ceil(20/3) = 7
-        assert_eq!(byzantine_threshold(32), 22);   // ceil(64/3) = 22
-        assert_eq!(byzantine_threshold(64), 43);   // ceil(128/3) = 43
-        assert_eq!(byzantine_threshold(128), 86);  // ceil(256/3) = 86
-        // N=1000: 2N/3 = 666.67, ceil = 667. Equivalent to 2f+1 where
-        // f = floor(999/3) = 333 → 2*333+1 = 667. Pre-fix test asserted
-        // 668 which would correspond to `2f+2` — strictly greater than
-        // the canonical BFT supermajority and therefore non-canonical.
+    fn byzantine_threshold_is_the_one_network_formula() {
+        // ONE formula, network-wide. The values that already agreed are unchanged...
+        assert_eq!(byzantine_threshold(5), 4);
+        assert_eq!(byzantine_threshold(10), 7);
+        assert_eq!(byzantine_threshold(32), 22);
+        assert_eq!(byzantine_threshold(64), 43);
+        assert_eq!(byzantine_threshold(128), 86);
         assert_eq!(byzantine_threshold(1000), 667);
+        // ...and the ones that did NOT are now corrected: the old (2N+2)/3 returned a LOWER bar for
+        // every N divisible by 3, which is the direction that breaks safety.
+        assert_eq!(byzantine_threshold(6), 5);   // was 4
+        assert_eq!(byzantine_threshold(9), 7);   // was 6
+        assert_eq!(byzantine_threshold(999), 667); // was 666
+        // No divergence anywhere, at any size.
+        for n in 0..=1200usize {
+            assert_eq!(byzantine_threshold(n),
+                       qnet_consensus::checkpoint_bft::quorum_size(n),
+                       "second threshold formula reappeared at n={}", n);
+        }
     }
 }

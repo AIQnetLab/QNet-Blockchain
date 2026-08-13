@@ -681,7 +681,14 @@ fn validate_eon_address_with_error(address: &str) -> Result<(), String> {
     if address.len() != 45 {
         return Err(format!("Invalid address length: expected 45, got {}", address.len()));
     }
-    
+    // A byte length says nothing about char boundaries: a 45-BYTE string with a multi-byte char
+    // straddling any slice index below panics, and the release profile aborts, so one unauthenticated
+    // request would kill the node. Addresses are ASCII by construction — reject anything else here,
+    // before any slicing.
+    if !address.is_ascii() {
+        return Err("Invalid address: non-ASCII characters".to_string());
+    }
+
     if &address[19..22] != "eon" {
         return Err("Invalid address format: missing 'eon' marker at position 19".to_string());
     }
@@ -1083,7 +1090,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
             if let Err(rate_limit_response) = check_api_rate_limit_with_key(remote_addr, api_key, limit_category) {
                 return Ok::<_, Rejection>(rate_limit_response.into_response());
             }
-            handle_rpc(request, blockchain).await.map(|r| r.into_response())
+            handle_rpc(request, remote_addr, blockchain).await.map(|r| r.into_response())
         });
 
     let root_path = warp::path::end()
@@ -1103,7 +1110,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
             if let Err(rate_limit_response) = check_api_rate_limit_with_key(remote_addr, api_key, limit_category) {
                 return Ok::<_, Rejection>(rate_limit_response.into_response());
             }
-            handle_rpc(request, blockchain).await.map(|r| r.into_response())
+            handle_rpc(request, remote_addr, blockchain).await.map(|r| r.into_response())
         });
     
     // REST API endpoints (new)
@@ -1849,7 +1856,10 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("claim"))
         .and(warp::path::end())
         .and(warp::post())
-        .and(warp::body::content_length_limit(64 * 1024)) // 64KB max
+        // Step 2 echoes the quoted claims_data back, so the body carries the merkle proofs plus two
+        // ML-DSA-65 envelopes. Must exceed CLAIM_QUOTE_BYTE_BUDGET + that overhead, or a wallet with
+        // many unclaimed epochs would be rejected by the filter before the handler ever sees it.
+        .and(warp::body::content_length_limit(256 * 1024))
         .and(warp::body::json())
         .and(warp::addr::remote())
         .and(blockchain_filter.clone())
@@ -2119,16 +2129,6 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::addr::remote())
         .and(blockchain_filter.clone())
         .and_then(handle_shred_protocol_metrics);
-
-    // Quantum VTS status endpoint (rate-limited)
-    let poh_status = api_v1
-        .and(warp::path("poh"))
-        .and(warp::path("status"))
-        .and(warp::path::end())
-        .and(warp::get())
-        .and(warp::addr::remote())
-        .and(blockchain_filter.clone())
-        .and_then(handle_poh_status);
 
     // Parallel Executor pipeline metrics endpoint (rate-limited)
     let parallel_executor_metrics = api_v1
@@ -2482,7 +2482,6 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .or(network_diagnostics)
         .or(block_stats)
         .or(shred_protocol_metrics)
-        .or(poh_status)
         .or(parallel_executor_metrics)
         .or(pre_execution_status)
         .or(adaptive_bft_info)
@@ -2712,6 +2711,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
 
 async fn handle_rpc(
     request: RpcRequest,
+    remote_addr: Option<std::net::SocketAddr>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
     let response = match request.method.as_str() {
@@ -2753,6 +2753,23 @@ async fn handle_rpc(
         // Phase-1 burn attestation (genesis-side): verify the external Solana 1DEV burn + sign.
         "node_attestBurn" => node_attest_burn(blockchain, request.params).await,
 
+        // Recovery relaxation. OPERATOR actions, so they are restricted to the loopback/private
+        // interface: on 0.0.0.0 they were reachable by anyone on the internet, and while neither can
+        // relax a healthy network (rc_try_arm re-checks every condition), disarming during a genuine
+        // halt is a free denial of the one recovery path the node has.
+        "node_armRecovery" | "node_disarmRecovery" | "node_recoveryStatus" => {
+            let ip = remote_addr.map(|a| a.ip().to_string()).unwrap_or_default();
+            if !is_internal_ip(&ip) {
+                Err(RpcError { code: -32004, message: "operator method: local interface only".to_string(), data: None })
+            } else {
+                match request.method.as_str() {
+                    "node_armRecovery" => node_arm_recovery(blockchain).await,
+                    "node_disarmRecovery" => node_disarm_recovery().await,
+                    _ => node_recovery_status(blockchain).await,
+                }
+            }
+        }
+
         _ => Err(RpcError {
             code: -32601,
             message: "Method not found".to_string(), data: None,
@@ -2790,36 +2807,113 @@ const ATTEST_ISSUE_RATE: u64 = 12;      // promotions/sec ≈ 1.5× the 8/block 
 const ATTEST_VALVE_THRESH: usize = 720; // pause issuance above this mempool registration backlog
 const ATTEST_PROMOTED_TTL_SECS: u64 = 600;
 
+/// First-sight Solana lookups one burner may have spent in the current window. The lookup is the only
+/// remaining pre-burn cost on this endpoint, so it is metered per identity rather than globally: a flood
+/// from one burner degrades only that burner.
+const ATTEST_LOOKUPS_PER_BURNER: u32 = 8;
+const ATTEST_LOOKUP_WINDOW_SECS: u64 = 60;
+/// GLOBAL ceiling on first-sight Solana lookups per window, across all callers. The per-burner counter
+/// alone is not a bound: keypairs are free, so a distributed flood just brings more identities. This is
+/// the attestor's own third-party RPC quota and it must be finite regardless of how many identities ask.
+const ATTEST_LOOKUPS_GLOBAL: u32 = 240;
+/// How long a burn_tx that failed Solana verification stays remembered. Long enough that re-polling a
+/// dead burn is free, short enough that a burn confirmed late still gets a second chance.
+const ATTEST_BAD_TTL_SECS: u64 = 600;
+const ATTEST_BAD_CAP: usize = 65_536;
+
+static ATTEST_LOOKUPS: Lazy<parking_lot::Mutex<(u64, u32, std::collections::HashMap<String, u32>)>> =
+    Lazy::new(|| parking_lot::Mutex::new((0, 0, std::collections::HashMap::new())));
+static ATTEST_BAD_BURNS: Lazy<parking_lot::Mutex<std::collections::HashMap<String, u64>>> =
+    Lazy::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+/// True iff this (burn_tx, burner) pair failed Solana verification recently. Repeat polls of a dead pair
+/// then cost one map probe, so an unlimited supply of junk ids no longer buys unlimited Solana round-trips.
+///
+/// Keyed by the PAIR, exactly like the positive cache: burn_tx alone is public, so a burn_tx-only key
+/// would let any stranger poll a victim's burn under their own address, get the definitive
+/// sender-mismatch answer cached, and lock the real owner out for the whole TTL.
+fn attest_lookup_known_bad(burn_tx: &str, burner: &str) -> bool {
+    let key = format!("{}_{}", burn_tx, burner);
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let mut m = ATTEST_BAD_BURNS.lock();
+    match m.get(&key) {
+        Some(at) if now.saturating_sub(*at) < ATTEST_BAD_TTL_SECS => true,
+        Some(_) => { m.remove(&key); false }
+        None => false,
+    }
+}
+
+/// Remember a DEFINITIVE verification failure. Never called for a transport failure: an unreachable or
+/// lagging Solana RPC must not blacklist a burn that is merely not indexed yet.
+fn attest_lookup_mark_bad(burn_tx: &str, burner: &str) {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let mut m = ATTEST_BAD_BURNS.lock();
+    if m.len() >= ATTEST_BAD_CAP {
+        m.retain(|_, at| now.saturating_sub(*at) < ATTEST_BAD_TTL_SECS);
+        if m.len() >= ATTEST_BAD_CAP { m.clear(); }
+    }
+    m.insert(format!("{}_{}", burn_tx, burner), now);
+}
+
+/// Ok(()) = this burner may spend one first-sight Solana lookup. Err(retry_after_secs) = its window quota
+/// is used up.
+fn attest_lookup_admit(burner: &str) -> Result<(), u64> {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let mut g = ATTEST_LOOKUPS.lock();
+    let window = now / ATTEST_LOOKUP_WINDOW_SECS;
+    if g.0 != window { g.0 = window; g.1 = 0; g.2.clear(); }
+    let retry = ATTEST_LOOKUP_WINDOW_SECS - (now % ATTEST_LOOKUP_WINDOW_SECS);
+    if g.1 >= ATTEST_LOOKUPS_GLOBAL { return Err(retry); }
+    let c = g.2.entry(burner.to_string()).or_insert(0);
+    if *c >= ATTEST_LOOKUPS_PER_BURNER { return Err(retry); }
+    *c += 1;
+    g.1 += 1;
+    Ok(())
+}
+
+/// Pending slots one burning wallet may hold at once. The queue is FIFO, so a burner cannot buy
+/// priority; this bounds how much of it a single identity can occupy.
+const ATTEST_PENDING_PER_BURNER: u32 = 8;
+
 struct AttestThrottle {
-    pending: std::collections::BTreeMap<String, ()>,  // burn_tx ASC = issuance order
-    promoted: std::collections::BTreeMap<String, u64>, // burn_tx → promoted-at unix secs
+    pending: std::collections::VecDeque<(String, String)>, // (burn_tx, burner) — ARRIVAL order
+    pending_set: std::collections::HashSet<String>,        // burn_tx membership
+    per_burner: std::collections::HashMap<String, u32>,    // burner → pending slots held
+    promoted: std::collections::BTreeMap<String, u64>,     // burn_tx → promoted-at unix secs
     last_tick_secs: u64,
 }
 static ATTEST_THROTTLE: Lazy<parking_lot::Mutex<AttestThrottle>> = Lazy::new(|| parking_lot::Mutex::new(
-    AttestThrottle { pending: std::collections::BTreeMap::new(), promoted: std::collections::BTreeMap::new(), last_tick_secs: 0 }));
+    AttestThrottle {
+        pending: std::collections::VecDeque::new(),
+        pending_set: std::collections::HashSet::new(),
+        per_burner: std::collections::HashMap::new(),
+        promoted: std::collections::BTreeMap::new(),
+        last_tick_secs: 0,
+    }));
 
-/// Ok(()) = promoted (sign now). Err(retry_after_secs) = queued/evicted (caller re-polls).
+/// Ok(()) = promoted (sign now). Err(retry_after_secs) = queued/full (caller re-polls).
+/// FIFO by arrival: issuance order must not be a function of the key, or a caller could mint keys that
+/// sort ahead of every real Solana signature and starve honest registrants deterministically. Slots are
+/// additionally capped per burning wallet, so one identity cannot hold the whole queue.
 /// INSERT-THEN-PROMOTE: the caller's key enters PENDING before the promotion tick runs, so a
 /// first-sight burn promotes in the SAME call whenever quota remains and the valve is open —
 /// single-shot flows (server-mediated light registration) succeed first try, and the rate bound
 /// (ISSUE_RATE/sec) still holds exactly because promotion only ever spends tick quota.
-fn attest_throttle_admit(burn_tx: &str) -> Result<(), u64> {
+fn attest_throttle_admit(burn_tx: &str, burner: &str) -> Result<(), u64> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     let mut t = ATTEST_THROTTLE.lock();
     t.promoted.retain(|_, at| now.saturating_sub(*at) < ATTEST_PROMOTED_TTL_SECS);
     if t.promoted.contains_key(burn_tx) { return Ok(()); }
-    if !t.pending.contains_key(burn_tx) {
+    if !t.pending_set.contains(burn_tx) {
         if t.pending.len() >= ATTEST_PENDING_CAP {
-            let max_key = t.pending.keys().next_back().cloned();
-            match max_key {
-                // Smaller than the retained frontier: displace the max (deterministic global-smallest set).
-                Some(mk) if burn_tx < mk.as_str() => { t.pending.remove(&mk); t.pending.insert(burn_tx.to_string(), ()); }
-                // Beyond the frontier: bounded monotone backoff (full-queue drain time), no rank exists.
-                _ => return Err((ATTEST_PENDING_CAP as u64 / ATTEST_ISSUE_RATE).max(60)),
-            }
-        } else {
-            t.pending.insert(burn_tx.to_string(), ());
+            return Err((ATTEST_PENDING_CAP as u64 / ATTEST_ISSUE_RATE).max(60));
         }
+        if t.per_burner.get(burner).copied().unwrap_or(0) >= ATTEST_PENDING_PER_BURNER {
+            return Err((ATTEST_PENDING_PER_BURNER as u64 / ATTEST_ISSUE_RATE).max(30));
+        }
+        t.pending.push_back((burn_tx.to_string(), burner.to_string()));
+        t.pending_set.insert(burn_tx.to_string());
+        *t.per_burner.entry(burner.to_string()).or_insert(0) += 1;
     }
     let elapsed = now.saturating_sub(t.last_tick_secs);
     if elapsed > 0 {
@@ -2829,8 +2923,15 @@ fn attest_throttle_admit(burn_tx: &str) -> Result<(), u64> {
         if backlog <= ATTEST_VALVE_THRESH {
             let quota = (elapsed.min(2) * ATTEST_ISSUE_RATE) as usize; // burst cap = 2 ticks
             for _ in 0..quota {
-                match t.pending.keys().next().cloned() {
-                    Some(k) => { t.pending.remove(&k); t.promoted.insert(k, now); }
+                match t.pending.pop_front() {
+                    Some((k, b)) => {
+                        t.pending_set.remove(&k);
+                        if let Some(c) = t.per_burner.get_mut(&b) {
+                            *c = c.saturating_sub(1);
+                            if *c == 0 { t.per_burner.remove(&b); }
+                        }
+                        t.promoted.insert(k, now);
+                    }
                     None => break,
                 }
             }
@@ -2839,7 +2940,7 @@ fn attest_throttle_admit(burn_tx: &str) -> Result<(), u64> {
         }
     }
     if t.promoted.contains_key(burn_tx) { return Ok(()); }
-    let rank = t.pending.range(..burn_tx.to_string()).count() as u64;
+    let rank = t.pending.iter().position(|(k, _)| k == burn_tx).unwrap_or(0) as u64;
     Err(rank / ATTEST_ISSUE_RATE + 1)
 }
 
@@ -2864,6 +2965,64 @@ async fn cached_solana_1dev_supply() -> Result<(u64, u64), String> {
 /// deterministically (verify_burn_attestation_quorum). Non-genesis nodes return an error.
 /// Issuance runs through the deterministic throttle above; the per-burn Solana verify is persisted
 /// (attburnv_) so re-polls never re-hit Solana.
+/// Arm the recovery relaxation on THIS node. It shortens only the stall wait — every other condition
+/// (the halt itself, the committee floor, the no-chained-span rule) is re-checked identically to the
+/// automatic path, so an operator cannot relax a healthy or an ineligible network.
+///
+/// Arming has no consensus effect by itself: it changes what this node proposes and counts, never what
+/// is valid. Validity is decided by each certificate's own bytes at the macroblock gate.
+async fn node_arm_recovery(blockchain: Arc<BlockchainNode>) -> Result<Value, RpcError> {
+    let storage = blockchain.get_storage();
+    let heard = crate::node::rc_recent_consensus_senders();
+    // Dry-run FIRST, so the operator gets the real refusal reason, then hand the actual arm to the
+    // consensus loop. Arming here directly would leave the DRIVER unarmed — and the loop's evaluator,
+    // seeing the global already set, would never call set_recovery_span again.
+    let dry = crate::node::rc_try_arm_dry(&storage, &heard, true);
+    if dry.is_ok() { crate::node::rc_request_arm(); }
+    match dry {
+        Ok((a, ah, cpi)) => {
+            let cs = crate::node::rc_span_committee_mb(&storage, a + 1).unwrap_or_default();
+            Ok(json!({
+                "armed": true,
+                "anchor_mb": a,
+                "anchor_hash": hex::encode(ah),
+                "span_indices": [cpi + 1, cpi + qnet_consensus::checkpoint_bft::RC_SPAN_INDICES],
+                "committee": cs.len(),
+                "quorum_size": qnet_consensus::checkpoint_bft::quorum_size(cs.len()),
+                "relaxed_quorum": qnet_consensus::checkpoint_bft::relaxed_quorum(cs.len()),
+            }))
+        }
+        Err(r) => Ok(json!({ "armed": false, "reason": r.reason() })),
+    }
+}
+
+async fn node_disarm_recovery() -> Result<Value, RpcError> {
+    crate::node::rc_disarm();
+    Ok(json!({ "armed": false }))
+}
+
+async fn node_recovery_status(blockchain: Arc<BlockchainNode>) -> Result<Value, RpcError> {
+    let storage = blockchain.get_storage();
+    let heard = crate::node::rc_recent_consensus_senders();
+    match crate::node::rc_armed() {
+        Some((a, ah, cpi)) => {
+            let cs = crate::node::rc_span_committee_mb(&storage, a + 1).unwrap_or_default();
+            Ok(json!({
+                "armed": true,
+                "anchor_mb": a,
+                "anchor_hash": hex::encode(ah),
+                "span_indices": [cpi + 1, cpi + qnet_consensus::checkpoint_bft::RC_SPAN_INDICES],
+                "span_windows": [a + 1, a + 2],
+                "heard_from": cs.iter().filter(|id| heard.contains(*id)).count(),
+                "committee": cs.len(),
+                "quorum_size": qnet_consensus::checkpoint_bft::quorum_size(cs.len()),
+                "relaxed_quorum": qnet_consensus::checkpoint_bft::relaxed_quorum(cs.len()),
+            }))
+        }
+        None => Ok(json!({ "armed": false, "heard_from": heard.len() })),
+    }
+}
+
 async fn node_attest_burn(blockchain: Arc<BlockchainNode>, params: Option<Value>) -> Result<Value, RpcError> {
     let params = params.unwrap_or(serde_json::Value::Null);
     let burn_tx = params.get("burn_tx").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -2879,6 +3038,35 @@ async fn node_attest_burn(blockchain: Arc<BlockchainNode>, params: Option<Value>
     let attest_epoch = params.get("attest_epoch").and_then(|v| v.as_u64()).unwrap_or(0);
     if burn_tx.is_empty() || solana_wallet.is_empty() || qnet_wallet.is_empty() {
         return Err(RpcError { code: -32602, message: "burn_tx, solana_wallet, qnet_wallet required".to_string(), data: None });
+    }
+    // burn_tx must be a well-formed Solana signature (base58 of 64 bytes). Anything else can never
+    // resolve on Solana, so it exists only to occupy queue slots and burn the attestor RPC quota.
+    if burn_tx.len() > 100 || bs58::decode(&burn_tx).into_vec().map(|v| v.len()) != Ok(64) {
+        return Err(RpcError { code: -32602, message: "burn_tx is not a base58 Solana signature".to_string(), data: None });
+    }
+    // Owner proof FIRST — before the epoch/committee resolution, the issuance throttle and any Solana
+    // I/O. Only the burning wallet's owner may obtain an attestation for its burn: the per-attestor
+    // dedup below binds burn_tx to the FIRST wallet attested, so without this check anyone reading a
+    // public burn_tx could lock it to a bogus beneficiary and permanently brick the real owner's burn.
+    // Cheap Ed25519 verify ⇒ also the DoS shield for everything that follows.
+    {
+        let reg_proof = params.get("registration_proof").and_then(|v| v.as_str()).unwrap_or("");
+        let owner_sig = params.get("owner_signature").and_then(|v| v.as_str()).unwrap_or("");
+        let node_id = params.get("node_id").and_then(|v| v.as_str()).unwrap_or("");
+        let ts = params.get("timestamp").and_then(|v| v.as_u64()).unwrap_or(0);
+        let attest_root = params.get("attest_root").and_then(|v| v.as_str()).unwrap_or("");
+        if attest_root.len() > 64 {
+            return Err(RpcError { code: -32602, message: "attest_root malformed".to_string(), data: None });
+        }
+        let bind_msg = format!("qnet_onchain_reg:{}:{}:{}:{}:{}:{}",
+                               node_id, qnet_wallet, reg_proof, ts, attest_root, burn_tx);
+        let ok = !owner_sig.is_empty() && crate::crypto::solana_derivation::verify_ed25519_signature(
+            bind_msg.as_bytes(), owner_sig, &solana_wallet).unwrap_or(false);
+        if !ok {
+            return Err(RpcError { code: -32602,
+                message: "owner_signature does not authorize this beneficiary for the burning wallet".to_string(),
+                data: None });
+        }
     }
     // Arithmetic epoch bound BEFORE any committee resolution (mirrors sign_burn_attestation):
     // only ~4 distinct epochs are ever resolvable, so the membership cache below stays complete
@@ -2909,14 +3097,6 @@ async fn node_attest_burn(blockchain: Arc<BlockchainNode>, params: Option<Value>
     if !is_member {
         return Err(RpcError { code: -32601, message: "not an attestor for attest_epoch".to_string(), data: None });
     }
-    // Issuance throttle BEFORE any Solana I/O: a queued caller costs this attestor one BTreeMap probe.
-    if let Err(retry_after_secs) = attest_throttle_admit(&burn_tx) {
-        return Err(RpcError {
-            code: -32050,
-            message: "attest_pending".to_string(),
-            data: Some(json!({ "retry_after_secs": retry_after_secs })),
-        });
-    }
     // Recompute the Phase-1 cost from THIS attestor's own Solana supply read (NOT the caller's hint) so
     // a forged hint can't lower the binding cost. Then require the ACTUAL on-Solana burn to cover it.
     let (total_burned, current_supply) = match cached_solana_1dev_supply().await {
@@ -2924,30 +3104,64 @@ async fn node_attest_burn(blockchain: Arc<BlockchainNode>, params: Option<Value>
         Err(e) => return Err(RpcError { code: -32000, message: format!("solana_supply_unavailable: {}", e), data: None }),
     };
     let cost = qnet_state::Transaction::phase1_activation_cost(total_burned, current_supply);
-    // Verify the external Solana 1DEV burn exists AND covers `cost` (live RPC; per-node, off consensus).
-    // First-sight result persisted per burn_tx; the cached amount is still re-checked against the
-    // CURRENT cost so a bucket move yields an honest reject, never a stale-cost signature.
-    let cached_burn = blockchain.get_storage().attest_burn_verified_get(&burn_tx).ok().flatten();
+    // Verify the external Solana 1DEV burn BEFORE the issuance queue, so a queue slot can only ever be
+    // held by a burn that provably exists — i.e. it costs the attacker a real 1DEV burn, not a free
+    // string. First-sight results are persisted per (burn_tx, burner); failures are negative-cached so a
+    // repeat costs one map probe instead of a Solana round-trip, and first-sight lookups are bounded per
+    // burner so one identity cannot drain the attestor's third-party RPC quota.
+    let cached_burn = blockchain.get_storage().attest_burn_verified_get(&burn_tx, &solana_wallet).ok().flatten();
     let actual_burned = match cached_burn {
         Some(a) if a >= cost => a,
         Some(_) => return Err(RpcError { code: -32000, message: format!("verified burn below current cost {} 1DEV", cost), data: None }),
         None => {
-            let a = match verify_burn_transaction_exists(&burn_tx, &solana_wallet, cost, 1).await {
+            if attest_lookup_known_bad(&burn_tx, &solana_wallet) {
+                return Err(RpcError { code: -32000, message: "burn previously failed verification".to_string(), data: None });
+            }
+            if let Err(retry) = attest_lookup_admit(&solana_wallet) {
+                return Err(RpcError { code: -32050, message: "attest_pending".to_string(),
+                                      data: Some(json!({ "retry_after_secs": retry })) });
+            }
+            // ONE attempt, not three. The retry loop inside exists for the registrant's own submit path
+            // (a fresh Solana TX can take 5-15 s to index); here it multiplies every unauthenticated
+            // request by 3 upstream getTransaction calls. A burn that is not yet indexed simply gets
+            // re-polled by the collector on its next cooldown.
+            let a = match verify_burn_transaction_exists_attempts(&burn_tx, &solana_wallet, cost, 1, 1).await {
                 Ok((true, actual)) => actual,
-                _ => return Err(RpcError { code: -32000, message: format!("burn not verified on Solana or below cost {} 1DEV", cost), data: None }),
+                // Definitive answer from Solana (no such burn / not a burn / below the required amount):
+                // safe to remember. An Err is a transport or indexing problem — the burn may confirm a
+                // moment later, so it is retried, never blacklisted.
+                Ok((false, _)) => {
+                    attest_lookup_mark_bad(&burn_tx, &solana_wallet);
+                    return Err(RpcError { code: -32000, message: format!("burn not verified on Solana or below cost {} 1DEV", cost), data: None });
+                }
+                Err(e) => {
+                    return Err(RpcError { code: -32000, message: format!("burn verification unavailable: {}", e), data: None });
+                }
             };
-            let _ = blockchain.get_storage().attest_burn_verified_put(&burn_tx, a);
+            let _ = blockchain.get_storage().attest_burn_verified_put(&burn_tx, &solana_wallet, a);
             a
         }
     };
+    // Signature-issuance throttle, now over VERIFIED burns only.
+    if let Err(retry_after_secs) = attest_throttle_admit(&burn_tx, &solana_wallet) {
+        return Err(RpcError {
+            code: -32050,
+            message: "attest_pending".to_string(),
+            data: Some(json!({ "retry_after_secs": retry_after_secs })),
+        });
+    }
     // Surface any divergence between the caller's declared amount and the verified on-chain amount.
     println!("[INFO][BURN] attest_amount declared={} actual_burned={} cost={}", amount, actual_burned, cost);
     // Sign over the ACTUAL on-Solana burned amount (NOT the caller's hint) + the locally-recomputed cost;
     // return BOTH the signed cost AND the signed amount so the collector agrees on the on-chain truth and
     // the registrant embeds the committee-certified amount (closes the over-burn quorum footgun: the
     // embedded burn_amount must equal the amount the counted 2f+1 attestors actually signed).
-    match blockchain.sign_burn_attestation(&burn_tx, &qnet_wallet, actual_burned, node_type, cost, attest_epoch) {
-        Some((genesis_id, sig)) => Ok(serde_json::json!({ "genesis_id": genesis_id, "sig": sig, "cost": cost, "amount": actual_burned })),
+    // The signed burner address is the one THIS attestor verified as the Solana fee payer above —
+    // never a caller-supplied value. Block validation binds wallet_address to it, so the beneficiary
+    // wallet can no longer be an arbitrary third party's.
+    match blockchain.sign_burn_attestation(&burn_tx, &solana_wallet, &qnet_wallet, actual_burned, node_type, cost, attest_epoch) {
+        Some((genesis_id, sig)) => Ok(serde_json::json!({ "genesis_id": genesis_id, "sig": sig, "cost": cost,
+                                                          "amount": actual_burned, "burn_wallet": solana_wallet })),
         None => Err(RpcError { code: -32000, message: "attestation refused (dedup / not committee / stale epoch)".to_string(), data: None }),
     }
 }
@@ -3688,14 +3902,14 @@ async fn device_migration(
         let message = format!("migrate:{}:{}", activation_code, new_device_signature);
         if !verify_mobile_dilithium_signature(&message, dilithium_sig, dilithium_pk_hex) {
             println!("[WARN][MIGRATE] dilithium_verify_failed code={}...",
-                     &activation_code[..16.min(activation_code.len())]);
+                     qnet_state::char_prefix(&activation_code, 16));
             return Err(RpcError {
                 code: -32003,
                 message: "Dilithium3 signature verification failed — unauthorized migration attempt".to_string(), data: None,
             });
         }
         println!("[INFO][MIGRATE] dilithium_verified code={}...",
-                 &activation_code[..16.min(activation_code.len())]);
+                 qnet_state::char_prefix(&activation_code, 16));
     }
 
     let node_type = blockchain.get_node_type();
@@ -3873,6 +4087,14 @@ async fn handle_account_balance_with_proof(
                 "address": proof.address,
                 "balance": proof.balance,
                 "nonce": proof.nonce,
+                // Every leaf input, or the client cannot rebuild the hash it is verifying.
+                "pending_rewards": proof.pending_rewards,
+                "heartbeat_epoch": proof.heartbeat_epoch,
+                "heartbeat_slots": proof.heartbeat_slots,
+                "heartbeat_final_epoch": proof.heartbeat_final_epoch,
+                "heartbeat_final_slots": proof.heartbeat_final_slots,
+                "last_claimed_epoch": proof.last_claimed_epoch,
+                "banned_at_height": proof.banned_at_height,
                 "merkle_proof": proof_array,
                 "state_root": hex::encode(proof.state_root),
                 "block_height": proof.block_height,
@@ -3940,7 +4162,7 @@ async fn handle_token_balance_with_proof(
             "heartbeat_epoch": p.heartbeat_epoch,
             "heartbeat_slots": p.heartbeat_slots,
             "heartbeat_final_epoch": p.heartbeat_final_epoch,
-            "heartbeat_final_count": p.heartbeat_final_count,
+            "heartbeat_final_slots": p.heartbeat_final_slots,
             "last_claimed_epoch": p.last_claimed_epoch,
             "account_proof": hexvec(&p.account_proof),
             // Anchors
@@ -4783,8 +5005,6 @@ async fn handle_macroblock_by_index(
                     "pool3_total_activations": macroblock.consensus_data.pool3_total_activations,
                 },
                 "previous_hash": hex::encode(macroblock.previous_hash),
-                "poh_hash": hex::encode(&macroblock.poh_hash),
-                "poh_count": macroblock.poh_count,
             });
             Ok(warp::reply::json(&response))
         }
@@ -4835,9 +5055,21 @@ async fn handle_macroblock_proof(
         };
     let storage = blockchain.get_storage();
     let committee = BlockchainNode::committee_for_height(&storage, mb.height).unwrap_or_default();
+    // Pubkeys for the derived committee UNION the QC's actual signers. A recovery checkpoint is
+    // certified by a different committee than committee_for_height derives, so the derived set alone
+    // leaves the client unable to resolve a signer's pk. Serving extra keys expands nothing: the
+    // client binds every pk to the registry_root of a macroblock it has ALREADY verified.
+    //
+    // Source of truth is the committed `vrf_pk_` row, with the RAM registry only as a fast path. That
+    // registry is an LRU that evicts after ~30 idle days, and this proof is for an IMMUTABLE historical
+    // macroblock: a committee member that has since left the network would simply be missing, and the
+    // client's walk is bottom-up, so one unserved index kills every higher index on that parity chain.
     let mut committee_pubkeys = serde_json::Map::new();
-    for nid in &committee {
-        if let Some(pk) = qnet_consensus::consensus_crypto::get_consensus_pk(nid) {
+    for nid in committee.iter().chain(qc.signers.iter()) {
+        if committee_pubkeys.contains_key(nid) { continue; }
+        let pk = qnet_consensus::consensus_crypto::get_consensus_pk(nid)
+            .or_else(|| storage.load_vrf_public_key(nid).ok().flatten());
+        if let Some(pk) = pk {
             committee_pubkeys.insert(nid.clone(), json!(hex::encode(&pk)));
         }
     }
@@ -4870,10 +5102,17 @@ async fn handle_macroblock_proof(
         "registry_root": hex::encode(cp.registry_root),
         "logs_root": hex::encode(cp.logs_root),
         "dilithium_pk_root": hex::encode(cp.dilithium_pk_root), // FIX-5: hashed after logs_root (see checkpointHash)
-        "total_supply": cp.total_supply,
+        "reward_epoch_root": hex::encode(cp.reward_epoch_root), // hashed after dilithium_pk_root
+        // STRING, not a JSON number: nanoQNC supply crosses 2^53, and the device folds this into the
+        // checkpoint hash — a JSON.parse double would silently round and false-reject every checkpoint.
+        "total_supply": cp.total_supply.to_string(),
         "timestamp": cp.timestamp,
         "proposer": cp.proposer,
+        // Last hashed field. The device folds it TAGGED, so omitting it here would make every
+        // recomputed checkpoint hash wrong, not just a relaxed one.
+        "recovery_anchor": cp.recovery_anchor.map(|(a, ah)| json!([a, hex::encode(ah)])),
     });
+    let recovery_anchor_info = recovery_anchor_json(&blockchain.get_storage(), &cp);
     let qc_json = json!({
         "signers": qc.signers,
         // sigs are the ASCII "dilithium_sig_<id>_<b64>" strings; lossless from_utf8 drops any non-UTF8
@@ -4889,7 +5128,34 @@ async fn handle_macroblock_proof(
         "committee_pubkeys": serde_json::Value::Object(committee_pubkeys),
         "eligible_raw": eligible_raw,
         "banned": banned,
+        // Under a pin the certifying set is the ANCHOR's committee at the relaxed threshold, and a
+        // device holds no chain to resolve it. Serve it alongside so one round trip is enough; the
+        // client still re-checks every pin clause it can and refuses a malformed one.
+        "recovery_anchor_info": recovery_anchor_info,
     })))
+}
+
+/// The anchor macroblock's pin-resolution data for a relaxed checkpoint, or Null. Everything here is
+/// re-derivable by any full node from committed data — it is a convenience for light clients, never a
+/// trust root: the device compares `mb_hash` against the hash inside the QC-signed `recovery_anchor`.
+fn recovery_anchor_json(storage: &crate::storage::Storage, cp: &qnet_consensus::checkpoint_bft::Checkpoint) -> serde_json::Value {
+    let (a, _ah) = match cp.recovery_anchor { Some(x) => x, None => return serde_json::Value::Null };
+    let mb = match storage.get_macroblock_by_height(a).ok().flatten()
+        .and_then(crate::node::BlockchainNode::macroblock_plaintext)
+        .and_then(|b| bincode::deserialize::<qnet_state::MacroBlock>(&b).ok())
+    { Some(m) => m, None => return serde_json::Value::Null };
+    let (cp_a, qc_a): (qnet_consensus::checkpoint_bft::Checkpoint, qnet_consensus::checkpoint_bft::QuorumCertificate) =
+        match mb.consensus_data.checkpoint_qc.as_ref().and_then(|b| bincode::deserialize(b).ok())
+        { Some(x) => x, None => return serde_json::Value::Null };
+    json!({
+        "mb": a,
+        "mb_hash": hex::encode(mb.hash()),
+        "cp_index": cp_a.index,
+        "cp_head": cp_a.window_head_height,
+        "qc_checkpoint_hash": hex::encode(qc_a.checkpoint_hash),
+        "committee": mb.consensus_data.consensus_committee.clone().unwrap_or_default(),
+        "recovery_anchor": cp_a.recovery_anchor.map(|(x, xh)| json!([x, hex::encode(xh)])),
+    })
 }
 
 /// Light-client registry dump as of {height}: the chain-confirmed roster (node_id, wallet, reg_height,
@@ -5216,7 +5482,7 @@ async fn handle_transaction_submit(
             crate::node::BlockchainNode::verify_user_tx_dilithium(&tx_for_verify)
         }).await.unwrap_or(false);
         if !verify_ok {
-            println!("[WARN][TX] dilithium_verify_failed from={}", &tx_request.from[..16.min(tx_request.from.len())]);
+            println!("[WARN][TX] dilithium_verify_failed from={}", qnet_state::char_prefix(&tx_request.from, 16));
             return Ok(warp::reply::json(&json!({
                 "success": false,
                 "error": "Dilithium signature verification failed",
@@ -5224,12 +5490,12 @@ async fn handle_transaction_submit(
             })));
         }
         println!("[INFO][TX] dilithium_verified from={} to={}",
-                 &tx_request.from[..8.min(tx_request.from.len())], &tx_request.to[..8.min(tx_request.to.len())]);
+                 qnet_state::char_prefix(&tx_request.from, 8), qnet_state::char_prefix(&tx_request.to, 8));
     }
 
     // Log quantum TX if present
     if tx.is_quantum_signed() {
-        println!("[INFO][TX] quantum_signed from={}", &tx_request.from[..16.min(tx_request.from.len())]);
+        println!("[INFO][TX] quantum_signed from={}", qnet_state::char_prefix(&tx_request.from, 16));
     }
 
     // PRODUCTION v2.77: Use BLAKE3 via calculate_hash() for consistency
@@ -5242,9 +5508,9 @@ async fn handle_transaction_submit(
             match blockchain.add_transaction_to_mempool(tx).await {
                 Ok(_) => {
                     println!("[INFO][TX] submitted tx={} from={} to={} amount={}", 
-                             &tx_hash[..16.min(tx_hash.len())],
-                             &tx_request.from[..16.min(tx_request.from.len())],
-                             &tx_request.to[..16.min(tx_request.to.len())],
+                             qnet_state::char_prefix(&tx_hash, 16),
+                             qnet_state::char_prefix(&tx_request.from, 16),
+                             qnet_state::char_prefix(&tx_request.to, 16),
                              tx_request.amount);
                     let response = json!({
                         "success": true,
@@ -5256,7 +5522,7 @@ async fn handle_transaction_submit(
                 Err(e) => {
                     // v2.101: Log mempool rejection for debugging
                     println!("[WARN][TX] mempool_rejected from={} err={}", 
-                             &tx_request.from[..16.min(tx_request.from.len())],
+                             qnet_state::char_prefix(&tx_request.from, 16),
                              e);
                     // Surface the real reason: the client's self-heal paths key on it (a pk_unresolved
                     // reject must make an eliding wallet re-attach the pubkey; a nonce reject must make it
@@ -5682,7 +5948,7 @@ async fn handle_bundle_cancel(
     if let Some(submitter_ip) = BUNDLE_SUBMITTER_IPS.get(&bundle_id) {
         if submitter_ip.value() != &caller_ip && !is_internal_ip(&caller_ip) {
             println!("[WARN][RPC] bundle_cancel_rejected bundle={} caller_ip={} submitter_ip={}",
-                     &bundle_id[..16.min(bundle_id.len())], caller_ip, submitter_ip.value());
+                     qnet_state::char_prefix(&bundle_id, 16), caller_ip, submitter_ip.value());
             return Ok(warp::reply::json(&json!({
                 "success": false,
                 "error": "Unauthorized: bundle can only be cancelled by the original submitter"
@@ -6170,117 +6436,17 @@ async fn handle_network_ping(
 /// ARCHITECTURE: Light nodes use compact_bin Dilithium3 signature format
 /// Same format as Super nodes for consistency and quantum resistance
 async fn verify_light_node_signature(node_id: &str, challenge: &str, signature: &str, blockchain: &Arc<BlockchainNode>) -> bool {
-    // Basic validation
-    if node_id.is_empty() || challenge.is_empty() || signature.is_empty() {
-        if crate::node::is_warn() {
-            println!("[WARN][LIGHT] sig_invalid reason=empty_params node={}", node_id);
-        }
-        return false;
-    }
-    
-    // PRODUCTION v2.78: Full Dilithium3 signature verification (compact_bin format)
-    // Format: "compact_bin:<base64_bincode_zstd>" - same as pinger attestations
-    // This provides quantum resistance for Light node attestations
-    if signature.starts_with("compact_bin:") {
-        // Use unified P2P verification (same as Super nodes)
-        if let Some(p2p) = blockchain.get_unified_p2p() {
-            // verify_dilithium_heartbeat_signature supports compact_bin format
-            let is_valid = p2p.verify_dilithium_heartbeat_signature(challenge, signature, node_id);
-            
-            if is_valid {
-                if crate::node::is_info() {
-                    println!("[INFO][LIGHT] pq_verified format=compact_bin node={}", node_id);
-                }
-            } else {
-                if crate::node::is_warn() {
-                    println!("[WARN][LIGHT] pq_verify_failed format=compact_bin node={}", node_id);
-                }
-            }
-            
-            return is_valid;
-        } else {
+    // Delegates to the SINGLE implementation shared with the gossip relay — duplicating the format
+    // rules here is how a relay ends up admitting what this ingress rejects.
+    match blockchain.get_unified_p2p() {
+        Some(p2p) => p2p.verify_light_ping_signature(node_id, challenge, signature),
+        None => {
             if crate::node::is_warn() {
                 println!("[WARN][LIGHT] p2p_unavailable node={}", node_id);
             }
-            return false;
-        }
-    }
-    
-    // PING DELEGATION v7.1: Dilithium3 ping key with Dilithium delegation cert
-    // Format: "ping_dilithium:<dilithium_sig>" where inner sig is "dilithium_sig_{nodeId}_{base64}"
-    // Verification:
-    //   1. Load ping_pubkey + ping_delegation_cert from P2P registry
-    //   2. Verify delegation cert: verify_mobile_dilithium_signature(quantum_pubkey, cert, msg)
-    //      where msg = "delegate_ping:{ping_pubkey}:{node_id}"
-    //   3. Verify ping sig: verify_mobile_dilithium_signature(ping_pubkey, inner_sig, challenge)
-    // Full quantum safety for background pings.
-    if signature.starts_with("ping_dilithium:") {
-        let inner_sig = &signature[15..]; // Skip "ping_dilithium:" prefix
-
-        // C: ping keys live in the dedicated CF (point-read), not the trimmed RAM registry.
-        let (ping_pk_hex, delegation_cert) = match blockchain.get_storage().get_light_ping_keys(node_id) {
-            Some(kv) => kv,
-            None => {
-                if crate::node::is_warn() {
-                    println!("[WARN][LIGHT] ping_keys_missing node={} action=reject_ping_dilithium", node_id);
-                }
-                return false;
-            }
-        };
-
-        if ping_pk_hex.is_empty() || delegation_cert.is_empty() {
-            if crate::node::is_warn() {
-                println!("[WARN][LIGHT] ping_delegation_missing node={} action=reject_ping_dilithium", node_id);
-            }
-            return false;
-        }
-
-        // Step 1: Verify delegation cert against the IMMUTABLE ON-CHAIN key, not the RAM registry's
-        // `quantum_pk` (which is set purely by gossip and is poisonable). load_vrf_public_key returns the
-        // Dilithium key committed by the node's own on-chain NodeRegistration (single-shot, ownership-
-        // gated at submit), so an attacker who poisons the RAM registry cannot forge this node's
-        // attestation. Fail-closed if the node has no on-chain key yet (not registered / TX not applied).
-        let onchain_pk_hex = match blockchain.get_storage().load_vrf_public_key(node_id) {
-            Ok(Some(bytes)) => hex::encode(bytes),
-            _ => {
-                if crate::node::is_warn() { println!("[WARN][LIGHT] no_onchain_key node={}", node_id); }
-                return false;
-            }
-        };
-        let delegation_msg = format!("delegate_ping:{}:{}", ping_pk_hex, node_id);
-        let delegation_ok = verify_mobile_dilithium_signature(&delegation_msg, &delegation_cert, &onchain_pk_hex);
-        if !delegation_ok {
-            if crate::node::is_warn() {
-                println!("[WARN][LIGHT] ping_delegation_cert_invalid node={}", node_id);
-            }
-            return false;
-        }
-
-        // Step 2: Verify Dilithium3 ping signature against authorized ping_pubkey
-        let ping_verified = verify_mobile_dilithium_signature(challenge, inner_sig, &ping_pk_hex);
-
-        return if ping_verified {
-            if crate::node::is_info() {
-                println!("[INFO][LIGHT] ping_dilithium_verified node={} (delegation=ok, quantum-safe)", node_id);
-            }
-            true
-        } else {
-            if crate::node::is_warn() {
-                println!("[WARN][LIGHT] ping_dilithium_sig_invalid node={}", node_id);
-            }
             false
-        };
+        }
     }
-
-    // Legacy `ping_ed25519:` (RAM-rooted, poisonable) and `light_hybrid_pending:` (key derived FROM
-    // node_id ⇒ trivially forgeable) fallbacks were REMOVED: on a fresh chain every client signs
-    // `ping_dilithium:` (or `compact_bin:`), rooted in the immutable on-chain key above. Anything else
-    // is rejected — no un-rooted attestation path survives.
-    if crate::node::is_warn() {
-        println!("[WARN][LIGHT] unknown_sig_format prefix={} node={}",
-                 &signature[..20.min(signature.len())], node_id);
-    }
-    false
 }
 
 // Generate quantum-resistant challenge
@@ -6464,21 +6630,17 @@ lazy_static::lazy_static! {
     static ref WALLET_REG_FAIL_TIMESTAMPS: dashmap::DashMap<String, Vec<u64>> =
         dashmap::DashMap::new();
 
+    // Epochs whose rebuild reproduced a root that disagrees with the certified one, and when it was
+    // last attempted. Without this, every claim request on a diverged node repeats the full O(roster)
+    // walk. Re-attempted after REBUILD_RETRY_SECS so a node that resyncs heals on its own.
+    static ref REWARD_REBUILD_DIVERGED: dashmap::DashMap<u64, u64> = dashmap::DashMap::new();
+
     // FIX R20-M1: Per-node claim lock to prevent double-claim race condition
     // Key: node_id, Value: claim-in-progress timestamp (unix seconds)
     // Two concurrent claims for same node_id will be serialized
     static ref CLAIM_IN_PROGRESS: DashSet<String> =
         DashSet::new();
 
-    /// Epochs whose local leaf-set could NOT be reconstructed to the 2f+1-committed reward_root
-    /// (snapshot-synced / body-pruned node: it holds the root row but not the epoch's bitmaps/bodies).
-    /// Suppresses the O(N) leaf-set rebuild on the authenticated claim path so a permanently-
-    /// unreconstructible epoch costs the full walk at most once per process, not once per request —
-    /// closing the request-amplification vector. Bounded (cleared wholesale at the cap); a restart
-    /// re-attempts each at most once, and an epoch that later heals is served from its (now-present)
-    /// shards and never consults this set.
-    pub(crate) static ref REWARD_REBUILD_SKIP: DashSet<u64> =
-        DashSet::new();
 
     // REMOVED: REWARD_MANAGER was causing desync issues
     // Now using blockchain.get_reward_manager() everywhere for proper synchronization
@@ -6871,13 +7033,13 @@ async fn handle_light_node_register(
         const WINDOW: u64 = 600; // 10 minutes
         const MAX_FAILS: usize = 5;
 
-        let mut entry = WALLET_REG_FAIL_TIMESTAMPS
-            .entry(wallet.clone())
-            .or_insert_with(Vec::new);
-        // Remove attempts outside the window
-        entry.retain(|&ts| now_secs.saturating_sub(ts) < WINDOW);
-        if entry.len() >= MAX_FAILS {
-            println!("[WARN][LIGHT] wallet_rate_limited wallet={}...", &wallet[..16.min(wallet.len())]);
+        // READ-ONLY check. Creating an entry here would let unauthenticated requests with distinct
+        // wallet strings grow the map without bound; entries exist only for wallets that actually failed.
+        let recent_fails = WALLET_REG_FAIL_TIMESTAMPS.get(wallet)
+            .map(|e| e.iter().filter(|&&ts| now_secs.saturating_sub(ts) < WINDOW).count())
+            .unwrap_or(0);
+        if recent_fails >= MAX_FAILS {
+            println!("[WARN][LIGHT] wallet_rate_limited wallet={}...", qnet_state::char_prefix(&wallet, 16));
             return Ok(warp::reply::json(&json!({
                 "success": false,
                 "error": "Too many failed registration attempts. Please wait 10 minutes before retrying.",
@@ -6971,7 +7133,7 @@ async fn handle_light_node_register(
             Some(tx) if !tx.is_empty() => tx.as_str(),
             _ => {
                 println!("[WARN][LIGHT] registration_rejected reason=missing_burn_tx_hash wallet={}...",
-                    &wallet[..16.min(wallet.len())]);
+                    qnet_state::char_prefix(&wallet, 16));
                 return Ok(warp::reply::json(&json!({
                     "success": false,
                     "error": "burn_tx_hash is required for node registration",
@@ -6982,7 +7144,7 @@ async fn handle_light_node_register(
         let burn_amount = register_request.burn_amount.unwrap_or(0);
         if burn_amount == 0 {
             println!("[WARN][LIGHT] registration_rejected reason=missing_burn_amount wallet={}...",
-                &wallet[..16.min(wallet.len())]);
+                qnet_state::char_prefix(&wallet, 16));
             return Ok(warp::reply::json(&json!({
                 "success": false,
                 "error": "burn_amount is required for node registration",
@@ -6995,16 +7157,13 @@ async fn handle_light_node_register(
         match registry.verify_code_ownership_stateless(code, xor_wallet, burn_tx, burn_amount) {
             Ok(true) => {
                 println!("[INFO][LIGHT] code_verified method=stateless_xor wallet={}...",
-                    &wallet[..16.min(wallet.len())]);
+                    qnet_state::char_prefix(&wallet, 16));
             }
             Ok(false) => {
                 println!("[WARN][LIGHT] code_rejected method=stateless_xor wallet={}... code={}...",
-                    &wallet[..16.min(wallet.len())], &code[..12.min(code.len())]);
+                    qnet_state::char_prefix(&wallet, 16), qnet_state::char_prefix(&code, 12));
                 // Record failed attempt for per-wallet rate limiting
-                if let Some(mut entry) = WALLET_REG_FAIL_TIMESTAMPS.get_mut(wallet) {
-                    let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-                    entry.push(now_secs);
-                }
+                record_wallet_reg_failure(wallet);
                 return Ok(warp::reply::json(&json!({
                     "success": false,
                     "error": "Activation code does not belong to this wallet (XOR mismatch)",
@@ -7013,11 +7172,8 @@ async fn handle_light_node_register(
             }
             Err(e) => {
                 println!("[WARN][LIGHT] stateless_verify_failed wallet={}... err={}",
-                    &wallet[..16.min(wallet.len())], e);
-                if let Some(mut entry) = WALLET_REG_FAIL_TIMESTAMPS.get_mut(wallet) {
-                    let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-                    entry.push(now_secs);
-                }
+                    qnet_state::char_prefix(&wallet, 16), e);
+                record_wallet_reg_failure(wallet);
                 return Ok(warp::reply::json(&json!({
                     "success": false,
                     "error": format!("Code verification failed: {}", e),
@@ -7033,7 +7189,7 @@ async fn handle_light_node_register(
                 Some(s) if !s.is_empty() => s.as_str(),
                 _ => {
                     println!("[WARN][LIGHT] registration_rejected reason=missing_ed25519_signature wallet={}...",
-                        &wallet[..16.min(wallet.len())]);
+                        qnet_state::char_prefix(&wallet, 16));
                     return Ok(warp::reply::json(&json!({
                         "success": false,
                         "error": "Ed25519 signature is required for node registration",
@@ -7063,11 +7219,11 @@ async fn handle_light_node_register(
             ) {
                 Ok(true) => {
                     println!("[INFO][LIGHT] ed25519_sig_verified solana_wallet={}...",
-                        &xor_wallet[..16.min(xor_wallet.len())]);
+                        qnet_state::char_prefix(&xor_wallet, 16));
                 }
                 Ok(false) => {
                     println!("[WARN][LIGHT] ed25519_sig_invalid solana_wallet={}...",
-                        &xor_wallet[..16.min(xor_wallet.len())]);
+                        qnet_state::char_prefix(&xor_wallet, 16));
                     return Ok(warp::reply::json(&json!({
                         "success": false,
                         "error": "Ed25519 signature verification failed — you are not the wallet owner",
@@ -7089,12 +7245,12 @@ async fn handle_light_node_register(
         match verify_burn_transaction_exists(burn_tx, xor_wallet, burn_amount, 1).await {
             Ok((true, _actual_burned)) => {
                 println!("[INFO][LIGHT] burn_verified tx={}... sender={} amount={}",
-                    &burn_tx[..16.min(burn_tx.len())],
-                    &xor_wallet[..16.min(xor_wallet.len())],
+                    qnet_state::char_prefix(&burn_tx, 16),
+                    qnet_state::char_prefix(&xor_wallet, 16),
                     burn_amount);
             }
             Ok((false, _)) => {
-                println!("[WARN][LIGHT] burn_not_found tx={}...", &burn_tx[..16.min(burn_tx.len())]);
+                println!("[WARN][LIGHT] burn_not_found tx={}...", qnet_state::char_prefix(&burn_tx, 16));
                 return Ok(warp::reply::json(&json!({
                     "success": false,
                     "error": "Burn transaction not found or insufficient amount on Solana",
@@ -7104,7 +7260,7 @@ async fn handle_light_node_register(
             }
             Err(e) => {
                 println!("[ERROR][LIGHT] burn_verify_err tx={}... err={}", 
-                    &burn_tx[..16.min(burn_tx.len())], e);
+                    qnet_state::char_prefix(&burn_tx, 16), e);
                 // v4.7: Solana verification is MANDATORY — no more "allow with XOR proof" bypass
                 return Ok(warp::reply::json(&json!({
                     "success": false,
@@ -7169,7 +7325,7 @@ async fn handle_light_node_register(
         {
             if crate::node::is_warn() {
                 println!("[WARN][LIGHT] pq_dilithium_missing wallet={}...",
-                    &wallet[..16.min(wallet.len())]);
+                    qnet_state::char_prefix(&wallet, 16));
             }
             return Ok(warp::reply::json(&json!({
                 "success": false,
@@ -7186,7 +7342,7 @@ async fn handle_light_node_register(
         if !dilithium_ok {
             if crate::node::is_warn() {
                 println!("[WARN][LIGHT] pq_dilithium_invalid wallet={}...",
-                    &wallet[..16.min(wallet.len())]);
+                    qnet_state::char_prefix(&wallet, 16));
             }
             return Ok(warp::reply::json(&json!({
                 "success": false,
@@ -7236,7 +7392,7 @@ async fn handle_light_node_register(
             }
             if crate::node::is_info() {
                 println!("[INFO][LIGHT] ping_delegation_ok pseudonym={} ping_pk={}...",
-                    light_node_pseudonym, &pp[..16.min(pp.len())]);
+                    light_node_pseudonym, qnet_state::char_prefix(&pp, 16));
             }
         }
     }
@@ -7292,7 +7448,7 @@ async fn handle_light_node_register(
                 {
                     registry.remove(&oldest_key);
                     println!("[INFO][RPC] light_node_registry_evicted oldest_node={} registry_size={}",
-                             &oldest_key[..16.min(oldest_key.len())], registry.len());
+                             qnet_state::char_prefix(&oldest_key, 16), registry.len());
                 }
             }
             // Create new Light node using privacy-preserving pseudonym
@@ -7641,35 +7797,6 @@ async fn handle_shred_protocol_metrics(remote_addr: Option<std::net::SocketAddr>
     Ok(warp::reply::json(&metrics))
 }
 
-// Handler for Quantum VTS status
-async fn handle_poh_status(remote_addr: Option<std::net::SocketAddr>, blockchain: Arc<BlockchainNode>) -> Result<impl warp::Reply, warp::Rejection> {
-    if let Err(resp) = check_api_rate_limit(remote_addr, "read_only") {
-        return Ok(resp);
-    }
-    // CRITICAL FIX: Get real hash rate from PoH instance
-    let (enabled, hash_rate_str, status) = if let Some(poh) = blockchain.get_poh() {
-        let hash_rate = poh.get_performance().await;
-        let hash_rate_formatted = if hash_rate >= 1_000_000.0 {
-            format!("{:.2}M hashes/sec", hash_rate / 1_000_000.0)
-        } else if hash_rate >= 1_000.0 {
-            format!("{:.2}K hashes/sec", hash_rate / 1_000.0)
-        } else {
-            format!("{:.0} hashes/sec", hash_rate)
-        };
-        (true, hash_rate_formatted, "running")
-    } else {
-        (false, "0 hashes/sec".to_string(), "disabled")
-    };
-    
-    let status = json!({
-        "enabled": enabled,
-        "algorithm": ["SHA3-512", "Blake3"],
-        "hash_rate": hash_rate_str,
-        "status": status
-    });
-    
-    Ok(warp::reply::json(&status))
-}
 
 // Handler for Parallel Executor metrics
 async fn handle_parallel_executor_metrics(remote_addr: Option<std::net::SocketAddr>, blockchain: Arc<BlockchainNode>) -> Result<impl warp::Reply, warp::Rejection> {
@@ -8805,7 +8932,7 @@ impl FCMPushService {
         }
         
         println!("[FCM] 📱 Sending FCM push to Light node: {} (token: {}...)", 
-                 node_id, &device_token[..8.min(device_token.len())]);
+                 node_id, qnet_state::char_prefix(&device_token, 8));
         
         // Get project ID from environment or use default
         let project_id = std::env::var("FCM_PROJECT_ID").unwrap_or_else(|_| "qnet-wallet".to_string());
@@ -9385,7 +9512,7 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
                         
                         if !keep_device {
                             println!("[CLEANUP] 📱 Removing inactive device {} from Light node {} (inactive for {}h)", 
-                                     &device.device_id[..8.min(device.device_id.len())], 
+                                     qnet_state::char_prefix(&device.device_id, 8), 
                                      node_id,
                                      (now - device.last_active) / 3600);
                         }
@@ -9438,6 +9565,17 @@ struct ClaimRewardsRequest {
     dilithium_signature: Option<String>,
     #[serde(default)]
     dilithium_public_key: Option<String>,
+    // Step 2 of the claim handshake: the exact `claims_data` string this node returned in step 1,
+    // echoed back with the wallet's ML-DSA-65 signature over it. Apply re-verifies both, so a claim
+    // can never be aimed at a wallet by anyone but its key holder.
+    #[serde(default)]
+    claims_data: Option<String>,
+    #[serde(default)]
+    claims_signature: Option<String>,
+    /// The `claim_timestamp` from step 1, echoed verbatim — it is inside the signed message and
+    /// becomes the TX timestamp, so a replay cannot re-stamp the payload into a fresh hash.
+    #[serde(default)]
+    claim_timestamp: Option<u64>,
 }
 
 async fn handle_claim_rewards(
@@ -9511,8 +9649,8 @@ async fn handle_claim_rewards(
             if registered != claim_request.wallet_address {
                 println!("[SECURITY][CLAIM] wallet_mismatch node={}", claim_request.node_id);
                 println!("[SECURITY][CLAIM] onchain={}... claimed={}...", 
-                         &registered[..16.min(registered.len())],
-                         &claim_request.wallet_address[..16.min(claim_request.wallet_address.len())]);
+                         qnet_state::char_prefix(&registered, 16),
+                         qnet_state::char_prefix(&claim_request.wallet_address, 16));
                 return Ok(warp::reply::json(&json!({
                     "success": false,
                     "error": "Wallet address does not match on-chain registration"
@@ -9547,11 +9685,66 @@ async fn handle_claim_rewards(
     }
     let _claim_guard = ClaimGuard(claim_request.node_id.clone());
 
-    // ── v3 merkle-claim: batch ALL of a wallet's unclaimed epochs into one proof-carrying TX ──
-    // Sig already verified above. Enumerate epochs via the reward-epochs index (no scan cap),
-    // generate each merkle proof from the locally-stored leaf set, and submit ONE batch claim TX
-    // covering every unclaimed epoch (oldest-first → no forfeiture). Apply re-verifies every proof
-    // against the consensus root, so this RPC cannot forge a credit.
+    // ── Step 2: the wallet returns the payload we quoted, signed. Submit it verbatim ──
+    // The signature covers these exact bytes, so this node cannot alter the batch, and no relayer
+    // can re-aim the signature at a shorter one. Mempool admission re-verifies both signature and
+    // proofs; apply is the final authority.
+    if let (Some(data), Some(sig)) = (claim_request.claims_data.as_ref(), claim_request.claims_signature.as_ref()) {
+        // Same number the route's content_length_limit allows, so transport and handler agree.
+        const MAX_CLAIMS_DATA: usize = 256 * 1024;
+        if data.len() > MAX_CLAIMS_DATA {
+            return Ok(warp::reply::json(&json!({ "success": false, "error": "claims_data too large" })));
+        }
+        let total_amount: u64 = serde_json::from_str::<serde_json::Value>(data).ok()
+            .and_then(|v| v.get("claims").and_then(|c| c.as_array().cloned()))
+            .map(|a| a.iter().filter_map(|e| e.get("amount").and_then(|x| x.as_u64()))
+                 .fold(0u64, |acc, x| acc.saturating_add(x)))
+            .unwrap_or(0);
+        let mut tx = qnet_state::Transaction {
+            hash: String::new(),
+            from: "system_rewards_pool".to_string(),
+            to: Some(wallet_address.clone()),
+            amount: total_amount,
+            nonce: 0,
+            gas_price: 0,
+            gas_limit: 0,
+            timestamp: claim_request.claim_timestamp.unwrap_or(0),
+            signature: None,
+            public_key: None,
+            tx_type: qnet_state::TransactionType::RewardDistribution,
+            data: Some(data.clone()),
+            dilithium_signature: Some(sig.clone().into_bytes()),
+            dilithium_public_key: claim_request.dilithium_public_key.clone().map(String::into_bytes),
+            chain_id: 0,
+        };
+        tx.hash = tx.calculate_hash();
+        if !crate::node::BlockchainNode::claim_authorized(&tx, &wallet_address, data) {
+            println!("[WARN][CLAIM] payload_signature_invalid wallet={}..", qnet_state::char_prefix(&wallet_address, 16));
+            return Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": "claims_signature does not authorize claims_data for this wallet"
+            })));
+        }
+        return match blockchain.submit_transaction(tx).await {
+            Ok(tx_hash) => {
+                println!("[INFO][CLAIM] merkle_claim_submitted wallet={}.. amount={} QNC hash={}",
+                         qnet_state::char_prefix(&wallet_address, 16), total_amount / 1_000_000_000, tx_hash);
+                Ok(warp::reply::json(&json!({
+                    "success": true,
+                    "tx_hash": tx_hash,
+                    "amount_qnc": total_amount as f64 / 1_000_000_000.0,
+                    "message": "Merkle reward claim submitted; credited on inclusion"
+                })))
+            }
+            Err(e) => Ok(warp::reply::json(&json!({ "success": false, "error": format!("{}", e) }))),
+        };
+    }
+
+    // ── Step 1: quote the batch of ALL of this wallet's unclaimed epochs ──
+    // Enumerate epochs via the reward-epochs index (no scan cap), generate each merkle proof from the
+    // locally-stored leaf set, and return the payload for the wallet to sign (oldest-first → no
+    // forfeiture). Apply re-verifies every proof and the wallet signature, so this RPC can neither
+    // forge a credit nor submit on the wallet's behalf.
     {
         // Scale guard: bound concurrent merkle proof-gen across all claims (thousands of nodes may
         // claim at an epoch boundary). Per-node CLAIM_IN_PROGRESS already serializes a single node.
@@ -9563,84 +9756,124 @@ async fn handle_claim_rewards(
             let g = state.read().await;
             (*g).get_last_claimed_epoch(&wallet_address)
         };
-        let epochs = storage.load_reward_epochs().unwrap_or_default();
+        let epochs = storage.reward_epochs_from(0).unwrap_or_default();
         let mut claim_entries: Vec<serde_json::Value> = Vec::new();
         let mut total_amount: u64 = 0;
+        // Reported so a wallet knows WHY the batch ended and can retry elsewhere.
+        let mut stopped_at: Option<(u64, &'static str)> = None;
+        // One O(roster) rebuild per request: this endpoint must not amplify into repeated full walks.
+        let mut rebuilt = false;
         const MAX_BATCH: usize = 512; // bound the TX size; the wallet re-calls for any remainder
+        // The quote goes back out over the wire signed, so it must be bounded in BYTES: proof depth
+        // grows with the recipient count, so an epoch count alone cannot keep the body under the route
+        // limit. Oldest-first + stop-not-skip means a partial batch forfeits nothing.
+        const CLAIM_QUOTE_BYTE_BUDGET: usize = 128 * 1024;
+        let mut quote_bytes: usize = 0;
         for epoch in epochs.into_iter().filter(|e| *e > last_claimed) {
-            if claim_entries.len() >= MAX_BATCH { break; }
-            // The 2f+1-committed reward_root is the SOLE authority for this epoch.
-            let (committed_root, ctotal) = match storage.load_epoch_reward_root(epoch) {
-                Ok(Some((r, _, _, t))) => (r, t),
-                _ => continue,
+            if claim_entries.len() >= MAX_BATCH {
+                stopped_at = Some((epoch, "batch_full"));
+                break;
+            }
+            if quote_bytes >= CLAIM_QUOTE_BYTE_BUDGET {
+                stopped_at = Some((epoch, "quote_byte_budget"));
+                break;
+            }
+            // The certified root is the sole authority. Claims stop (never skip) at the first
+            // epoch this node cannot serve: the watermark is monotonic, so skipping forfeits it.
+            let (committed_root, ctotal) = match storage.load_epoch_root(epoch) {
+                Ok(Some(r)) if r != [0u8; 32] => (hex::encode(r), crate::reward_epoch::canonical_total(epoch)),
+                Ok(Some(_)) => continue, // epoch distributed nothing
+                _ => { stopped_at = Some((epoch, "root_not_here")); break; }
             };
-            // Resolve the claim from the SHARDED structure — loads exactly ONE shard + the shard-meta,
-            // never the full O(N) leaf-set — and VERIFY the reconstructed shard-roots recombine to the
-            // committed root before proving. On Absent (a snapshot-synced/body-pruned node that has the
-            // root but not the leaf-set), rebuild the full set ONCE, verify, persist it sharded, then
-            // retry. A node that CANNOT reconstruct the epoch (bitmaps/bodies pruned) is memoised in
-            // REWARD_REBUILD_SKIP so it pays the O(N) walk at most once per process — never per request.
-            const REWARD_REBUILD_SKIP_CAP: usize = 16384;
+            // Resolve from the shard cache (one shard + meta, never the whole leaf set); the shard
+            // roots are re-verified against the certified root before proving. Absent = cache miss,
+            // rebuildable from durable indices — bounded to one rebuild per request.
             let claim = match crate::node::BlockchainNode::reward_proof_from_shard(&storage, epoch, &committed_root, &wallet_address, true) {
                 crate::node::ShardClaim::Absent => {
-                    if REWARD_REBUILD_SKIP.contains(&epoch) { continue; }
-                    let w = crate::node::BlockchainNode::compute_epoch_reward_distribution(&storage, epoch, ctotal).0;
-                    if crate::node::BlockchainNode::epoch_reward_merkle_root(&w, epoch) != committed_root {
-                        if REWARD_REBUILD_SKIP.len() >= REWARD_REBUILD_SKIP_CAP { REWARD_REBUILD_SKIP.clear(); }
-                        REWARD_REBUILD_SKIP.insert(epoch);
-                        if crate::node::is_warn() {
-                            println!("[WARN][REWARDS] claim_set_divergent epoch={} action=skip (local index resync needed)", epoch);
-                        }
-                        continue;
+                    const REBUILD_RETRY_SECS: u64 = 3600;
+                    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+                    if REWARD_REBUILD_DIVERGED.get(&epoch)
+                        .map_or(false, |t| now.saturating_sub(*t) < REBUILD_RETRY_SECS) {
+                        stopped_at = Some((epoch, "local_corruption"));
+                        break;
                     }
-                    // Reconstructed OK ⇒ this epoch is serveable here; clear any prior skip mark.
-                    REWARD_REBUILD_SKIP.remove(&epoch);
+                    if rebuilt { stopped_at = Some((epoch, "rebuild_budget")); break; }
+                    rebuilt = true;
+                    let w = crate::node::BlockchainNode::compute_epoch_reward_distribution(&storage, epoch, ctotal)
+                        .map(|x| x.0).unwrap_or_default();
+                    if crate::node::BlockchainNode::epoch_reward_merkle_root(&w, epoch) != committed_root {
+                        // Inputs present but they do not reproduce the certified root: local data is
+                        // corrupt, not merely missing. Alarm and stop; a resync is the repair.
+                        println!("[ERR][REWARDS] epoch_rebuild_diverged epoch={} action=stop_batch_resync", epoch);
+                        REWARD_REBUILD_DIVERGED.insert(epoch, now);
+                        stopped_at = Some((epoch, "local_corruption"));
+                        break;
+                    }
                     crate::node::BlockchainNode::save_epoch_reward_sharded(&storage, epoch, &w);
                     crate::node::BlockchainNode::reward_proof_from_shard(&storage, epoch, &committed_root, &wallet_address, true)
                 }
                 other => other,
             };
-            if let crate::node::ShardClaim::Proof(amount, proof) = claim {
-                let proof_json: Vec<serde_json::Value> = proof.iter().map(|(hh, l)| json!([hh, l])).collect();
-                claim_entries.push(json!({ "epoch": epoch, "amount": amount, "proof": proof_json }));
-                total_amount = total_amount.saturating_add(amount);
+            match claim {
+                crate::node::ShardClaim::Proof(amount, proof) => {
+                    // ~66 B per proof hash on the wire plus the entry scaffolding; charged before the
+                    // next iteration so the budget bounds what has already been accepted.
+                    quote_bytes = quote_bytes.saturating_add(64 + proof.len() * 70);
+                    let proof_json: Vec<serde_json::Value> = proof.iter().map(|(hh, l)| json!([hh, l])).collect();
+                    claim_entries.push(json!({ "epoch": epoch, "amount": amount, "proof": proof_json }));
+                    total_amount = total_amount.saturating_add(amount);
+                }
+                // This wallet has no leaf in this epoch — nothing to forfeit, keep batching.
+                crate::node::ShardClaim::NotRecipient => continue,
+                // Cannot serve it here. STOP: the watermark is monotonic, so batching a LATER epoch
+                // would advance it past this one and burn it for this wallet permanently.
+                other => {
+                    println!("[WARN][REWARDS] claim_epoch_unservable epoch={} outcome={:?} action=stop_batch", epoch, other);
+                    stopped_at = Some((epoch, "epoch_unservable"));
+                    break;
+                }
+            }
+        }
+        if claim_entries.is_empty() {
+            if let Some((epoch, reason)) = stopped_at {
+                return Ok(warp::reply::json(&json!({
+                    "success": false,
+                    "epochs_claimed": 0,
+                    "stopped_at_epoch": epoch,
+                    "stopped_reason": reason,
+                    "error": format!("This node cannot serve epoch {} ({}) — retry on another node", epoch, reason)
+                })));
             }
         }
         if !claim_entries.is_empty() {
+            // Step 1: quote the batch. The wallet signs these exact bytes and re-POSTs them with
+            // claims_data + claims_signature; only its own key can authorize a credit to it.
             let n = claim_entries.len();
             let data = json!({ "claims": claim_entries }).to_string();
-            let mut tx = qnet_state::Transaction {
-                hash: String::new(),
-                from: "system_rewards_pool".to_string(),
-                to: Some(wallet_address.clone()),
-                amount: total_amount,
-                nonce: 0,
-                gas_price: 0,
-                gas_limit: 0,
-                timestamp: chrono::Utc::now().timestamp() as u64,
-                signature: None,   // pure-Dilithium; Ed25519 not on a QNet path
-                public_key: None,
-                tx_type: qnet_state::TransactionType::RewardDistribution,
-                data: Some(data),
-                dilithium_signature: claim_request.dilithium_signature.clone().map(String::into_bytes),
-                dilithium_public_key: claim_request.dilithium_public_key.clone().map(String::into_bytes),
-                chain_id: 0,
-            };
-            tx.hash = tx.calculate_hash();
-            return match blockchain.submit_transaction(tx).await {
-                Ok(tx_hash) => {
-                    println!("[INFO][CLAIM] merkle_claim_submitted wallet={}.. epochs={} amount={} QNC hash={}",
-                             &wallet_address[..16.min(wallet_address.len())], n, total_amount / 1_000_000_000, tx_hash);
-                    Ok(warp::reply::json(&json!({
-                        "success": true,
-                        "tx_hash": tx_hash,
-                        "epochs_claimed": n,
-                        "amount_qnc": total_amount as f64 / 1_000_000_000.0,
-                        "message": "Merkle reward claim submitted; credited on inclusion"
-                    })))
-                }
-                Err(e) => Ok(warp::reply::json(&json!({ "success": false, "error": format!("{}", e) }))),
-            };
+            // The timestamp is quoted, not chosen at submit: the signature covers it, so step 2 must
+            // reproduce it byte-for-byte and a bumped-timestamp replay cannot verify.
+            let claim_ts = chrono::Utc::now().timestamp() as u64;
+            let sign_message = crate::node::BlockchainNode::claim_sign_message(&wallet_address, &data, claim_ts);
+            println!("[INFO][CLAIM] merkle_claim_quoted wallet={}.. epochs={} amount={} QNC",
+                     qnet_state::char_prefix(&wallet_address, 16), n, total_amount / 1_000_000_000);
+            return Ok(warp::reply::json(&json!({
+                "success": false,
+                "needs_signature": true,
+                "claims_data": data,
+                "sign_message": sign_message,
+                "claim_timestamp": claim_ts,
+                "epochs_claimed": n,
+                // Exact base units as a decimal STRING: nanoQNC exceeds 2^53, so a JSON number would
+                // round and the wallet's own cross-check would then reject an honest quote.
+                "amount_nano": total_amount.to_string(),
+                "amount_qnc": total_amount as f64 / 1_000_000_000.0,
+                // Lets the wallet verify the batch SHAPE (starts at the watermark, strictly ascending)
+                // instead of only its total — a truncated batch is what would strand epochs.
+                "last_claimed_epoch": last_claimed,
+                "stopped_at_epoch": stopped_at.map(|(e, _)| e),
+                "stopped_reason": stopped_at.map(|(_, r)| r),
+                "message": "Sign sign_message with the wallet Dilithium key and re-POST with claims_data + claims_signature"
+            })));
         }
         // No unclaimed merkle reward for this wallet — merkle reward_root is the SOLE reward source
         // (the legacy Account.pending_rewards accrual path was removed), so there is nothing to claim.
@@ -9655,6 +9888,32 @@ async fn handle_claim_rewards(
 /// reward-root epoch beyond its claim watermark — same enumeration the merkle claim path submits — plus
 /// any residual legacy Account.pending_rewards. Status-independent: reward is wallet-scoped, so it is
 /// returned in full whether the node is online, offline, or banned.
+/// The lowest epoch above this wallet's claim watermark in which it actually holds a reward leaf, i.e.
+/// where an honest claim batch MUST start. The wallet cross-checks the quote it is asked to sign against
+/// this: a quoting node that skipped the head would otherwise burn those epochs behind the monotonic
+/// watermark. `None` when nothing is claimable or this node cannot resolve the head epoch.
+async fn wallet_first_unclaimed_epoch(blockchain: &BlockchainNode, wallet: &str) -> Option<u64> {
+    let storage = blockchain.get_storage();
+    let last_claimed = {
+        let state = blockchain.get_state_manager();
+        let g = state.read().await;
+        g.get_last_claimed_epoch(wallet)
+    };
+    for epoch in storage.reward_epochs_from(0).unwrap_or_default().into_iter().filter(|e| *e > last_claimed) {
+        let root = match storage.load_epoch_root(epoch) {
+            Ok(Some(r)) if r != [0u8; 32] => hex::encode(r),
+            Ok(Some(_)) => continue, // epoch distributed nothing
+            _ => return None,        // cannot resolve here; reporting a later epoch would be a lie
+        };
+        match crate::node::BlockchainNode::reward_proof_from_shard(&storage, epoch, &root, wallet, false) {
+            crate::node::ShardClaim::Proof(_, _) => return Some(epoch),
+            crate::node::ShardClaim::NotRecipient => continue,
+            _ => return None,
+        }
+    }
+    None
+}
+
 async fn wallet_claimable_qnc(blockchain: &BlockchainNode, wallet: &str) -> u64 {
     let storage = blockchain.get_storage();
     let last_claimed = {
@@ -9663,17 +9922,19 @@ async fn wallet_claimable_qnc(blockchain: &BlockchainNode, wallet: &str) -> u64 
         g.get_last_claimed_epoch(wallet)
     };
     let mut total = 0u64; // merkle reward_root is the SOLE reward source (legacy accrual removed)
-    // Mirror handle_claim_rewards: one claim TX covers at most MAX_BATCH unclaimed epochs (the wallet
-    // re-claims for any remainder), so the shown figure equals what the next claim actually pays — no
-    // display-vs-claimable divergence.
+    // Mirror handle_claim_rewards EXACTLY, including where it STOPS: the claim watermark is monotonic,
+    // so that path stops at the first unservable epoch instead of skipping it. Skipping here would show
+    // more than the next claim can ever pay. This path never rebuilds (unauthenticated), so it can only
+    // under-report relative to the claim path, never over-report.
     const MAX_BATCH: usize = 512;
     let mut counted = 0usize;
-    for epoch in storage.load_reward_epochs().unwrap_or_default().into_iter().filter(|e| *e > last_claimed) {
+    for epoch in storage.reward_epochs_from(0).unwrap_or_default().into_iter().filter(|e| *e > last_claimed) {
         if counted >= MAX_BATCH { break; }
         // 2f+1-committed root = authority for this epoch.
-        let committed_root = match storage.load_epoch_reward_root(epoch) {
-            Ok(Some((r, _, _, _))) => r,
-            _ => continue,
+        let committed_root = match storage.load_epoch_root(epoch) {
+            Ok(Some(r)) if r != [0u8; 32] => hex::encode(r),
+            Ok(Some(_)) => continue,  // epoch distributed nothing — the claim path skips it too
+            _ => break,               // root not here: the claim path stops, so must the figure
         };
         // Amount-only resolution from the SHARDED structure (loads one shard, skips proof gen), verified
         // against the committed root. This endpoint is UNAUTHENTICATED, so it must NEVER trigger the
@@ -9682,12 +9943,28 @@ async fn wallet_claimable_qnc(blockchain: &BlockchainNode, wallet: &str) -> u64 
         // epoch; the figure self-corrects once the shards are present (via apply/finalization or a claim).
         let amt = match crate::node::BlockchainNode::reward_proof_from_shard(&storage, epoch, &committed_root, wallet, false) {
             crate::node::ShardClaim::Proof(a, _) => a,
-            _ => continue,
+            crate::node::ShardClaim::NotRecipient => continue, // no leaf here — the claim path keeps batching
+            _ => break,                                       // unservable: the claim path stops here
         };
         total = total.saturating_add(amt);
         counted += 1;
     }
     total
+}
+
+/// Record a failed registration attempt for per-wallet rate limiting. The ONLY writer that creates
+/// entries, so the map is bounded by wallets that actually failed inside the window; an oversized
+/// map is swept of entries whose attempts have all expired.
+fn record_wallet_reg_failure(wallet: &str) {
+    const WINDOW: u64 = 600;
+    const SWEEP_AT: usize = 10_000;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    if WALLET_REG_FAIL_TIMESTAMPS.len() >= SWEEP_AT {
+        WALLET_REG_FAIL_TIMESTAMPS.retain(|_, v| v.iter().any(|&ts| now.saturating_sub(ts) < WINDOW));
+    }
+    let mut e = WALLET_REG_FAIL_TIMESTAMPS.entry(wallet.to_string()).or_insert_with(Vec::new);
+    e.retain(|&ts| now.saturating_sub(ts) < WINDOW);
+    e.push(now);
 }
 
 async fn handle_get_pending_rewards(
@@ -9838,6 +10115,11 @@ async fn handle_get_pending_rewards(
         "phase": phase,
         "pending_rewards": total_qnc,
         "pending_rewards_nano": pending_amount, // exact base units (client divides by 1e9 for display)
+        // Where an honest claim batch must start; the wallet refuses to sign a quote that skips it.
+        "first_unclaimed_epoch": match blockchain.get_node_wallet(&node_id).await {
+            Some(w) => wallet_first_unclaimed_epoch(&blockchain, &w).await,
+            None => None,
+        },
         "pools": {
             "pool1_base_emission": pool1_qnc,
             "pool2_tx_fees": pool2_qnc,
@@ -10576,16 +10858,8 @@ async fn handle_get_reward_summary(
 ///
 /// Canonical message: from|to|amount|nonce|gas_price|gas_limit|timestamp (pipe format).
 async fn sign_node_registration_tx(tx: &mut qnet_state::Transaction, producer_node_id: &str) {
-    let canonical_msg = format!(
-        "{}|{}|{}|{}|{}|{}|{}",
-        tx.from,
-        tx.to.as_deref().unwrap_or(""),
-        tx.amount,
-        tx.nonce,
-        tx.gas_price,
-        tx.gas_limit,
-        tx.timestamp,
-    );
+    // THE one builder, so the signed preimage always includes whatever the verifier binds.
+    let canonical_msg = crate::node::BlockchainNode::build_canonical_verify_message(tx);
 
     // Pure ML-DSA-65: the node's Dilithium3 signature is the sole authenticator.
     use crate::node::try_get_quantum_crypto;
@@ -10636,7 +10910,7 @@ async fn handle_register_node(
     //       post-quantum gossip signature (pure Dilithium3 / ML-DSA-65).
     //       This endpoint gossips with empty signatures → other nodes reject the gossip
     //       → light node exists only on the receiving node (broken state, L1 violation).
-    //       L1 precedent: Ethereum EIP-2718 hard-blocked legacy TX format for typed TXs.
+    //       L1 precedent: typed-TX rollouts hard-block the legacy format rather than dual-accept.
     let node_type = match body["node_type"].as_str() {
         Some("light") => {
             return Ok(warp::reply::json(&json!({
@@ -10687,7 +10961,7 @@ async fn handle_register_node(
     {
         if quantum_pubkey.is_empty() || quantum_signature.is_empty() {
             println!("[WARN][REGISTER] rejected reason=missing_dilithium node_type={} wallet={}...",
-                node_type, &wallet_address[..16.min(wallet_address.len())]);
+                node_type, qnet_state::char_prefix(&wallet_address, 16));
             return Ok(warp::reply::json(&json!({
                 "success": false,
                 "error": format!(
@@ -10704,11 +10978,11 @@ async fn handle_register_node(
         if sig_valid {
             println!("[INFO][REGISTER] dilithium_verified node_type={} wallet={}... pk_prefix={}...",
                 node_type,
-                &wallet_address[..16.min(wallet_address.len())],
-                &quantum_pubkey[..16.min(quantum_pubkey.len())]);
+                qnet_state::char_prefix(&wallet_address, 16),
+                qnet_state::char_prefix(&quantum_pubkey, 16));
         } else {
             println!("[WARN][REGISTER] dilithium_invalid node_type={} wallet={}...",
-                node_type, &wallet_address[..16.min(wallet_address.len())]);
+                node_type, qnet_state::char_prefix(&wallet_address, 16));
             return Ok(warp::reply::json(&json!({
                 "success": false,
                 "error": "Dilithium3 signature verification failed. \
@@ -10753,7 +11027,7 @@ async fn handle_register_node(
             if !from_genesis_ip {
                 println!(
                     "[WARN][REGISTER] genesis_code_from_non_genesis_ip code={}... sender_ip={} action=reject",
-                    &activation_code[..16.min(activation_code.len())],
+                    qnet_state::char_prefix(&activation_code, 16),
                     sender_ip
                 );
                 return Ok(warp::reply::json(&json!({
@@ -10764,7 +11038,7 @@ async fn handle_register_node(
             }
             println!(
                 "[INFO][REGISTER] genesis_code_bypass code={}... ip={}",
-                &activation_code[..16.min(activation_code.len())],
+                qnet_state::char_prefix(&activation_code, 16),
                 sender_ip
             );
         } else {
@@ -10775,7 +11049,7 @@ async fn handle_register_node(
                 Some(tx) if !tx.is_empty() => tx,
                 _ => {
                     println!("[WARN][REGISTER] rejected reason=missing_burn_tx_hash wallet={}...",
-                        &wallet_address[..16.min(wallet_address.len())]);
+                        qnet_state::char_prefix(&wallet_address, 16));
                     return Ok(warp::reply::json(&json!({
                         "success": false,
                         "error": "burn_tx_hash is required for node registration",
@@ -10787,7 +11061,7 @@ async fn handle_register_node(
                 Some(amt) if amt > 0 => amt,
                 _ => {
                     println!("[WARN][REGISTER] rejected reason=missing_burn_amount wallet={}...",
-                        &wallet_address[..16.min(wallet_address.len())]);
+                        qnet_state::char_prefix(&wallet_address, 16));
                     return Ok(warp::reply::json(&json!({
                         "success": false,
                         "error": "burn_amount is required for node registration",
@@ -10804,12 +11078,12 @@ async fn handle_register_node(
             match registry.verify_code_ownership_stateless(activation_code, xor_wallet, burn_tx, burn_amount) {
                 Ok(true) => {
                     println!("[INFO][REGISTER] code_verified method=stateless_xor wallet={}...",
-                        &wallet_address[..16.min(wallet_address.len())]);
+                        qnet_state::char_prefix(&wallet_address, 16));
                 }
                 Ok(false) => {
                     println!("[WARN][REGISTER] code_rejected method=stateless_xor wallet={}... code={}...",
-                        &wallet_address[..16.min(wallet_address.len())],
-                        &activation_code[..8.min(activation_code.len())]);
+                        qnet_state::char_prefix(&wallet_address, 16),
+                        qnet_state::char_prefix(&activation_code, 8));
                     return Ok(warp::reply::json(&json!({
                         "success": false,
                         "error": "Activation code does not belong to this wallet (XOR mismatch)",
@@ -10818,7 +11092,7 @@ async fn handle_register_node(
                 }
                 Err(e) => {
                     println!("[WARN][REGISTER] stateless_verify_failed wallet={}... err={}",
-                        &wallet_address[..16.min(wallet_address.len())], e);
+                        qnet_state::char_prefix(&wallet_address, 16), e);
                     return Ok(warp::reply::json(&json!({
                         "success": false,
                         "error": format!("Code verification failed: {}", e),
@@ -10834,7 +11108,7 @@ async fn handle_register_node(
                     Some(s) if !s.is_empty() => s,
                     _ => {
                         println!("[WARN][REGISTER] rejected reason=missing_ed25519_signature wallet={}...",
-                            &wallet_address[..16.min(wallet_address.len())]);
+                            qnet_state::char_prefix(&wallet_address, 16));
                         return Ok(warp::reply::json(&json!({
                             "success": false,
                             "error": "Ed25519 signature is required for node registration",
@@ -10864,11 +11138,11 @@ async fn handle_register_node(
                 ) {
                     Ok(true) => {
                         println!("[INFO][REGISTER] ed25519_sig_verified solana_wallet={}...",
-                            &xor_wallet[..16.min(xor_wallet.len())]);
+                            qnet_state::char_prefix(&xor_wallet, 16));
                     }
                     Ok(false) => {
                         println!("[WARN][REGISTER] ed25519_sig_invalid solana_wallet={}...",
-                            &xor_wallet[..16.min(xor_wallet.len())]);
+                            qnet_state::char_prefix(&xor_wallet, 16));
                         return Ok(warp::reply::json(&json!({
                             "success": false,
                             "error": "Ed25519 signature verification failed — you are not the wallet owner",
@@ -10890,12 +11164,12 @@ async fn handle_register_node(
             match verify_burn_transaction_exists(burn_tx, xor_wallet, burn_amount, 1).await {
                 Ok((true, _actual_burned)) => {
                     println!("[INFO][REGISTER] burn_verified tx={}... sender={} amount={}",
-                        &burn_tx[..16.min(burn_tx.len())],
-                        &xor_wallet[..16.min(xor_wallet.len())],
+                        qnet_state::char_prefix(&burn_tx, 16),
+                        qnet_state::char_prefix(&xor_wallet, 16),
                         burn_amount);
                 }
                 Ok((false, _)) => {
-                    println!("[WARN][REGISTER] burn_not_found tx={}...", &burn_tx[..16.min(burn_tx.len())]);
+                    println!("[WARN][REGISTER] burn_not_found tx={}...", qnet_state::char_prefix(&burn_tx, 16));
                     return Ok(warp::reply::json(&json!({
                         "success": false,
                         "error": "Burn transaction not found or insufficient amount on Solana",
@@ -10905,7 +11179,7 @@ async fn handle_register_node(
                 }
                 Err(e) => {
                     println!("[ERROR][REGISTER] burn_verify_err tx={}... err={}",
-                        &burn_tx[..16.min(burn_tx.len())], e);
+                        qnet_state::char_prefix(&burn_tx, 16), e);
                     // v4.7: Solana verification is MANDATORY — no more bypass
                     return Ok(warp::reply::json(&json!({
                         "success": false,
@@ -10972,9 +11246,9 @@ async fn handle_register_node(
         // CHECK 1 — same code → same node_id → already registered
         if state.is_node_registered(&node_id) {
             println!("[INFO][REGISTER] already_registered_in_state type={} node={} wallet={}...",
-                node_type, node_id, &wallet_address[..16.min(wallet_address.len())]);
+                node_type, node_id, qnet_state::char_prefix(&wallet_address, 16));
             let reg_proof = {
-                let burn_prefix = &activation_code[..16.min(activation_code.len())];
+                let burn_prefix = qnet_state::char_prefix(&activation_code, 16);
                 let proof_input = format!("activation_{}:{}:{}", burn_prefix, node_id, wallet_address);
                 let h = blake3::hash(proof_input.as_bytes()).to_hex().to_string();
                 h[..32].to_string()
@@ -11025,7 +11299,7 @@ async fn handle_register_node(
                             if elapsed < 86400 {
                                 let remaining = 86400 - elapsed;
                                 println!("[WARN][REGISTER] migration_rate_limited wallet={}... elapsed={}s remaining={}s",
-                                    &wallet_address[..16.min(wallet_address.len())], elapsed, remaining);
+                                    qnet_state::char_prefix(&wallet_address, 16), elapsed, remaining);
                                 return Ok(warp::reply::json(&json!({
                                     "success": false,
                                     "error": "Server migration rate limited: max 1 per 24 hours",
@@ -11036,7 +11310,7 @@ async fn handle_register_node(
                         }
                         
                         println!("[INFO][REGISTER] super_node_migration detected node={} wallet={}...",
-                            node_id, &wallet_address[..16.min(wallet_address.len())]);
+                            node_id, qnet_state::char_prefix(&wallet_address, 16));
                         SUPER_NODE_MIGRATION_TIMESTAMPS.insert(wallet_address.to_string(), now_ts);
                         is_migration = true;
                     } else {
@@ -11047,7 +11321,7 @@ async fn handle_register_node(
                 } else {
                     // Different node_id but same wallet → 1 wallet = 1 node violation
                     println!("[WARN][REGISTER] wallet_already_has_different_node wallet={}... existing={} new={}",
-                        &wallet_address[..16.min(wallet_address.len())], existing_node_id, node_id);
+                        qnet_state::char_prefix(&wallet_address, 16), existing_node_id, node_id);
                     return Ok(warp::reply::json(&json!({
                         "success": false,
                         "error": format!("This wallet already has a {} node ({}). 1 wallet = 1 node rule.", existing_type, existing_node_id),
@@ -11224,7 +11498,7 @@ async fn handle_register_node(
     
     // Compute registration_proof for all node types (returned to caller)
     let registration_proof = {
-        let burn_prefix = &activation_code[..16.min(activation_code.len())];
+        let burn_prefix = qnet_state::char_prefix(&activation_code, 16);
         let proof_input = format!("activation_{}:{}:{}", burn_prefix, node_id, wallet_address);
         let h = blake3::hash(proof_input.as_bytes()).to_hex().to_string();
         h[..32].to_string()
@@ -11232,7 +11506,12 @@ async fn handle_register_node(
     
     // Super node / Genesis: server creates TX (no mobile client, server knows endpoint)
     // v4.9: Skip for migrations — node already on-chain.
-    let tx_created_server_side = if node_type == "super" || node_type == "genesis" {
+    // Under the burn gate this server-side TX carries no burn and no burner authorization, so every
+    // validator hard-rejects it — the node's own convergence driver arms the burn-attested registration.
+    // Emitting it would only spend gossip on bytes that can never land.
+    let burn_gate_active = qnet_state::feature_gates::is_active(
+        "burn_attestation_required", blockchain.get_storage().get_chain_height().unwrap_or(0));
+    let tx_created_server_side = if (node_type == "super" || node_type == "genesis") && !burn_gate_active {
         if !is_migration {
             // Use api_endpoint from request body if provided; empty string = node hides IP
             let api_endpoint = body["api_endpoint"].as_str().unwrap_or("").to_string();
@@ -11251,8 +11530,8 @@ async fn handle_register_node(
             if mempool.add_binary_transaction(tx_bytes.clone(), tx_hash.clone(), 0) {
                 println!("[INFO][REG] super_onchain_tx node={} wallet={}... hash={}... signed=dilithium3",
                          node_id,
-                         &wallet_address[..16.min(wallet_address.len())],
-                         &tx_hash[..16.min(tx_hash.len())]);
+                         qnet_state::char_prefix(&wallet_address, 16),
+                         qnet_state::char_prefix(&tx_hash, 16));
                 if let Some(p2p) = blockchain.get_unified_p2p() {
                     let _ = p2p.broadcast_transaction(tx_bytes.clone());
                     // Same guaranteed delivery as NodeActivation: direct fan-out to all genesis.
@@ -11927,7 +12206,7 @@ async fn handle_generate_activation_code(
             }
         }
         
-        println!("   QNet Reward Wallet: {}...", &qnet_wallet_for_rewards[..8.min(qnet_wallet_for_rewards.len())]);
+        println!("   QNet Reward Wallet: {}...", qnet_state::char_prefix(&qnet_wallet_for_rewards, 8));
     }
     
     // Validate node type
@@ -11948,8 +12227,8 @@ async fn handle_generate_activation_code(
     }
     
     println!("[GENERATE] 🔐 Generating activation code from burn transaction");
-    println!("   Wallet: {}", &request.wallet_address[..8.min(request.wallet_address.len())]);
-    println!("   Burn TX: {}", &request.burn_tx_hash[..8.min(request.burn_tx_hash.len())]);
+    println!("   Wallet: {}", qnet_state::char_prefix(&request.wallet_address, 8));
+    println!("   Burn TX: {}", qnet_state::char_prefix(&request.burn_tx_hash, 8));
     println!("   Node Type: {}", request.node_type);
     println!("   Amount: {} {}", request.burn_amount, if request.phase == 1 { "1DEV" } else { "QNC" });
     println!("   Phase: {}", request.phase);
@@ -11977,7 +12256,7 @@ async fn handle_generate_activation_code(
         }
         Ok((true, _actual_burned)) => {
             println!("[INFO][GENERATE] burn_tx_verified_on_solana tx={}...",
-                &request.burn_tx_hash[..16.min(request.burn_tx_hash.len())]);
+                qnet_state::char_prefix(&request.burn_tx_hash, 16));
         }
     }
     
@@ -12041,7 +12320,7 @@ async fn handle_generate_activation_code(
             Ok(nodes) if !nodes.is_empty() => {
                 let (existing_node_id, existing_type, _rep) = &nodes[0];
                 println!("[WARN][GENERATE] wallet_already_has_node wallet={}... node={} type={}",
-                    &qnet_wallet_for_rewards[..16.min(qnet_wallet_for_rewards.len())],
+                    qnet_state::char_prefix(&qnet_wallet_for_rewards, 16),
                     existing_node_id, existing_type);
                 let response = json!({
                     "success": false,
@@ -12063,7 +12342,7 @@ async fn handle_generate_activation_code(
                 Ok(nodes) if !nodes.is_empty() => {
                     let (existing_node_id, existing_type, _rep) = &nodes[0];
                     println!("[WARN][GENERATE] solana_wallet_already_has_node wallet={}... node={} type={}",
-                        &request.wallet_address[..16.min(request.wallet_address.len())],
+                        qnet_state::char_prefix(&request.wallet_address, 16),
                         existing_node_id, existing_type);
                     let response = json!({
                         "success": false,
@@ -12080,8 +12359,8 @@ async fn handle_generate_activation_code(
             }
         }
         println!("[INFO][GENERATE] wallet_clean eon={}... solana={}... proceeding",
-            &qnet_wallet_for_rewards[..16.min(qnet_wallet_for_rewards.len())],
-            &request.wallet_address[..16.min(request.wallet_address.len())]);
+            qnet_state::char_prefix(&qnet_wallet_for_rewards, 16),
+            qnet_state::char_prefix(&request.wallet_address, 16));
     } else {
         println!("[WARN][GENERATE] storage_unavailable skipping_1wallet1node_check");
     }
@@ -12493,9 +12772,21 @@ pub(crate) async fn verify_burn_transaction_exists(
     burn_amount: u64,
     phase: u8,
 ) -> Result<(bool, u64), String> {
+    verify_burn_transaction_exists_attempts(burn_tx_hash, wallet_address, burn_amount, phase, 3).await
+}
+
+/// Same, with an explicit retry budget. The relay/attestor path passes 1 so an unauthenticated caller
+/// cannot multiply its request into several upstream Solana round-trips.
+pub(crate) async fn verify_burn_transaction_exists_attempts(
+    burn_tx_hash: &str,
+    wallet_address: &str,
+    burn_amount: u64,
+    phase: u8,
+    max_attempts: u8,
+) -> Result<(bool, u64), String> {
     println!("[INFO][BURN] verify_burn_tx tx={}... wallet={}... amount={} phase={}",
-        &burn_tx_hash[..16.min(burn_tx_hash.len())],
-        &wallet_address[..16.min(wallet_address.len())],
+        qnet_state::char_prefix(&burn_tx_hash, 16),
+        qnet_state::char_prefix(&wallet_address, 16),
         burn_amount, phase);
     
     if phase == 1 {
@@ -12524,14 +12815,14 @@ pub(crate) async fn verify_burn_transaction_exists(
 
         // Solana devnet can take 5-15s to index a fresh transaction.
         // Retry up to 3 times with 6s delay before giving up.
-        const MAX_ATTEMPTS: u8 = 3;
+        let attempts: u8 = max_attempts.max(1);
         const RETRY_DELAY_SECS: u64 = 6;
 
         let mut rpc_response: serde_json::Value = serde_json::Value::Null;
         let mut last_err: Option<String> = None;
         let mut confirmed = false;
 
-        for attempt in 1..=MAX_ATTEMPTS {
+        for attempt in 1..=attempts {
             match client
                 .post(solana_rpc)
                 .json(&request_body)
@@ -12556,7 +12847,7 @@ pub(crate) async fn verify_burn_transaction_exists(
                             // If result is null → TX not indexed yet → retry
                             if parsed["result"].is_null() {
                                 println!("[WARN][BURN] solana_tx_not_indexed_yet attempt={} tx={}...", 
-                                    attempt, &burn_tx_hash[..16.min(burn_tx_hash.len())]);
+                                    attempt, qnet_state::char_prefix(&burn_tx_hash, 16));
                                 last_err = Some("Solana TX not indexed yet".to_string());
                             } else {
                                 rpc_response = parsed;
@@ -12568,8 +12859,8 @@ pub(crate) async fn verify_burn_transaction_exists(
                 }
             }
 
-            if attempt < MAX_ATTEMPTS {
-                println!("[INFO][BURN] retrying_solana_check in {}s attempt={}/{}", RETRY_DELAY_SECS, attempt, MAX_ATTEMPTS);
+            if attempt < attempts {
+                println!("[INFO][BURN] retrying_solana_check in {}s attempt={}/{}", RETRY_DELAY_SECS, attempt, attempts);
                 tokio::time::sleep(tokio::time::Duration::from_secs(RETRY_DELAY_SECS)).await;
             }
         }
@@ -12674,13 +12965,13 @@ pub(crate) async fn verify_burn_transaction_exists(
             // Accept only a real SPL burn (burn/burnChecked) OR a transfer TO the incinerator address.
             if !has_incinerator && !has_token_burn && !has_outer_burn {
                 println!("[ERROR][BURN] no_burn_indicator tx={}... accounts={:?}",
-                    &burn_tx_hash[..16.min(burn_tx_hash.len())],
+                    qnet_state::char_prefix(&burn_tx_hash, 16),
                     &account_keys[..account_keys.len().min(5)]);
                 return Err(format!(
                     "Transaction {} does not contain a valid SPL Token burn instruction. \
                      A genuine token burn (createBurnInstruction / burnChecked) or transfer to the \
                      incinerator is required for node activation. Token transfers to other addresses are not accepted.",
-                    &burn_tx_hash[..16.min(burn_tx_hash.len())]
+                    qnet_state::char_prefix(&burn_tx_hash, 16)
                 ));
             } else {
                 println!("[INFO][BURN] burn_indicator_found incinerator={} token_burn={} outer_burn={}",
@@ -13081,8 +13372,7 @@ async fn handle_producer_status(
             &Some(p2p.clone()),
             &node_id,
             blockchain.get_node_type(),
-            Some(&blockchain.get_storage()),
-            &blockchain.get_poh()
+            Some(&blockchain.get_storage())
         ).await
     } else {
         node_id.to_string()  // Solo mode
@@ -13193,8 +13483,14 @@ async fn handle_node_registration_client_submit(
     // commit an attacker-owned Dilithium key as the victim's immutable attestation root.
     match (req.burn_wallet.as_deref().filter(|s| !s.is_empty()), req.owner_signature.as_deref()) {
         (Some(solana_wallet), Some(owner_sig)) if !owner_sig.is_empty() => {
-            let owner_msg = format!("qnet_onchain_reg:{}:{}:{}:{}",
-                req.node_id, req.wallet_address, req.registration_proof, req.timestamp);
+            // Shared builder — block validation rebuilds the identical string from the TX, so the two
+            // can never drift apart. The attestation root is bound in: for a Solana-derived wallet it is
+            // the ONLY thing tying the submitted ML-DSA key to the burner's intent.
+            let wire_pk = req.dilithium_public_key.as_deref()
+                .and_then(|h| hex::decode(h).ok()).unwrap_or_default();
+            let owner_msg = qnet_state::Transaction::burn_owner_bind_message(
+                &req.node_id, &req.wallet_address, &req.registration_proof, req.timestamp, &wire_pk,
+                req.burn_tx_hash.as_deref().unwrap_or(""));
             match crate::crypto::solana_derivation::verify_ed25519_signature(
                 owner_msg.as_bytes(), owner_sig, solana_wallet
             ) {
@@ -13357,9 +13653,21 @@ async fn handle_node_registration_client_submit(
         // committee-certified agreed_amount (== what the counted 2f+1 signed), so an honest over-burn
         // still verifies. Exact-burn (declared == actual) ⇒ agreed_amount == burn_amount (unchanged).
         let storage_ref = crate::node::get_storage();
+        // The client's owner_signature (verified above) travels to every attestor: an attestor refuses
+        // to attest a burn whose owner did not authorize this beneficiary.
+        let owner_sig_str = req.owner_signature.clone().unwrap_or_default();
+        let reg_attest_tag = qnet_state::Transaction::attest_root_tag(
+            reg_tx.dilithium_public_key.as_deref().unwrap_or(&[]));
+        let owner_proof = crate::node::BurnOwnerProof {
+            node_id: &req.node_id,
+            registration_proof: &req.registration_proof,
+            timestamp: req.timestamp,
+            signature: &owner_sig_str,
+            attest_root_tag: &reg_attest_tag,
+        };
         let (attestors, agreed_cost, agreed_amount, agreed_epoch) = crate::node::BlockchainNode::collect_burn_attestations(
             burn_tx, solana_wallet, &req.wallet_address, burn_amount,
-            qnet_state::NodeType::Light, cost_hint, &**storage_ref,
+            qnet_state::NodeType::Light, cost_hint, &owner_proof, &**storage_ref,
         ).await;
         // Quorum of the committee OF agreed_epoch — the SAME committee the attestors signed for and the
         // on-chain verifier re-resolves (M-5), so `need` EXACTLY matches the verifier's threshold. Genesis
@@ -13396,9 +13704,14 @@ async fn handle_node_registration_client_submit(
             })));
         }
         if let qnet_state::TransactionType::NodeRegistration {
-            burn_tx: bt, burn_amount: ba, burn_cost: bc, burn_attestors: at, attest_epoch: ae, ..
+            burn_tx: bt, burn_wallet: bw, burn_owner_sig: bos, burn_amount: ba, burn_cost: bc,
+            burn_attestors: at, attest_epoch: ae, ..
         } = &mut reg_tx.tx_type {
             *bt = burn_tx.to_string();
+            *bw = solana_wallet.to_string();
+            // Carry the burner's authorization ON-CHAIN (verified above at admission, re-verified at
+            // block validation) — the admission check alone is advisory, any node can craft the TX.
+            *bos = req.owner_signature.clone().unwrap_or_default();
             *ba = agreed_amount;
             *bc = agreed_cost;
             *at = attestors;
@@ -13416,8 +13729,8 @@ async fn handle_node_registration_client_submit(
     if mempool.add_binary_transaction(tx_bytes.clone(), tx_hash.clone(), 0) {
         println!("[INFO][NODE-REG-CLIENT] tx_added node={} wallet={}... hash={}...",
                  req.node_id,
-                 &req.wallet_address[..16.min(req.wallet_address.len())],
-                 &tx_hash[..16.min(tx_hash.len())]);
+                 qnet_state::char_prefix(&req.wallet_address, 16),
+                 qnet_state::char_prefix(&tx_hash, 16));
 
         // Broadcast to all peers so the current producer includes it in the next block
         if let Some(p2p) = blockchain.get_unified_p2p() {
@@ -13517,7 +13830,7 @@ async fn handle_node_reactivation_submit(
     if mempool.add_binary_transaction(tx_bytes.clone(), tx_hash.clone(), react_tx.gas_price) {
         println!("[INFO][NODE-REACTIVATION] tx_added node={} h={} mb={} hash={}",
                  req.node_id, req.current_height, req.last_macroblock_index,
-                 &tx_hash[..16.min(tx_hash.len())]);
+                 qnet_state::char_prefix(&tx_hash, 16));
 
         // Broadcast to all peers for fast inclusion
         if let Some(p2p) = blockchain.get_unified_p2p() {
@@ -13779,8 +14092,8 @@ async fn generate_quantum_activation_code(
     use sha3::{Sha3_256, Digest};
     
     println!("🔐 Generating quantum-secure activation code with XOR encryption...");
-    println!("   Wallet: {}...", &request.wallet_address[..8.min(request.wallet_address.len())]);
-    println!("   Burn TX: {}...", &request.burn_tx_hash[..8.min(request.burn_tx_hash.len())]);
+    println!("   Wallet: {}...", qnet_state::char_prefix(&request.wallet_address, 8));
+    println!("   Burn TX: {}...", qnet_state::char_prefix(&request.burn_tx_hash, 8));
     println!("   Node Type: {}", request.node_type);
     
     // Step 1: Create encryption key from burn transaction (SHA3-256 for consistency)
@@ -14002,8 +14315,8 @@ async fn handle_contract_deploy(
     match blockchain.add_transaction_to_mempool(tx).await {
         Ok(_) => {
             println!("[CONTRACT] ✅ deployment_submitted contract={} hash={}",
-                     &contract_address[..16.min(contract_address.len())], 
-                     &tx_hash[..16.min(tx_hash.len())]);
+                     qnet_state::char_prefix(&contract_address, 16), 
+                     qnet_state::char_prefix(&tx_hash, 16));
             println!("[CONTRACT] security dilithium=✅ (pure-PQ, FIPS 204)");
             Ok(warp::reply::json(&json!({
                 "success": true,
@@ -14037,7 +14350,7 @@ async fn handle_contract_deploy(
 /// Format: "dilithium_sig_{nodeId}_{base64}" where base64 decodes to:
 ///   [signed_msg_len(4 LE)] [signedMessage = sig(3309) + msg(N)] [pk_len(4 LE)] [pk(1952)]
 /// Both Bouncy Castle and pqcrypto use the same NIST FIPS 204 standard
-fn verify_mobile_dilithium_signature(
+pub(crate) fn verify_mobile_dilithium_signature(
     expected_message: &str,
     formatted_signature: &str,
     public_key_hex: &str,
@@ -14392,7 +14705,7 @@ async fn handle_contract_call(
     match blockchain.add_transaction_to_mempool(tx).await {
         Ok(_) => {
             println!("📜 Contract call submitted: {}::{}", 
-                     &request.contract_address[..16.min(request.contract_address.len())], request.method);
+                     qnet_state::char_prefix(&request.contract_address, 16), request.method);
             
             Ok(warp::reply::json(&json!({
                 "success": true,
@@ -15134,8 +15447,8 @@ async fn handle_wasm_deploy(
     match blockchain.submit_transaction(tx).await {
         Ok(_) => {
             println!("[INFO][VM] wasm_deploy_submitted contract={} code_bytes={} hash={}",
-                     &contract_address[..16.min(contract_address.len())], code.len(),
-                     &tx_hash[..16.min(tx_hash.len())]);
+                     qnet_state::char_prefix(&contract_address, 16), code.len(),
+                     qnet_state::char_prefix(&tx_hash, 16));
             Ok(warp::reply::json(&json!({
                 "success": true,
                 "tx_hash": tx_hash,
@@ -15248,8 +15561,8 @@ async fn handle_nft_deploy(
         Ok(_) => {
             println!("[INFO][NFT] qrc721_deploy_submitted name={} symbol={} contract={} hash={}",
                      request.name, request.symbol,
-                     &contract_address[..16.min(contract_address.len())],
-                     &tx_hash[..16.min(tx_hash.len())]);
+                     qnet_state::char_prefix(&contract_address, 16),
+                     qnet_state::char_prefix(&tx_hash, 16));
             Ok(warp::reply::json(&json!({
                 "success": true,
                 "tx_hash": tx_hash,
@@ -15424,8 +15737,8 @@ async fn handle_token_deploy(
         Ok(_) => {
             println!("[INFO][TOKEN] qrc20_deploy_submitted name={} symbol={} supply={} contract={} hash={}",
                      request.name, request.symbol, request.initial_supply,
-                     &contract_address[..16.min(contract_address.len())],
-                     &tx_hash[..16.min(tx_hash.len())]);
+                     qnet_state::char_prefix(&contract_address, 16),
+                     qnet_state::char_prefix(&tx_hash, 16));
             
             Ok(warp::reply::json(&json!({
                 "success": true,

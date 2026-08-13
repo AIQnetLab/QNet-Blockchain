@@ -924,7 +924,7 @@ const TxRow = React.memo(function TxRow({ tx, onCopy, hideAmounts }) {
               <Text style={{ color: '#00e5f0', fontSize: 12, fontWeight: '800', marginLeft: 4 }} accessibilityLabel="QC-verified">✓</Text>
             )}
           </View>
-          {tx.fee > 0 && <Text style={{ color: '#666', fontSize: 11 }}>Fee: {hideAmounts ? '••••' : `${tx.fee.toFixed(5)} QNC`}</Text>}
+          {tx.fee > 0 && <Text style={{ color: '#666', fontSize: 11 }}>Fee: {hideAmounts ? '••••' : `${fmtAmount(tx.fee, 5)} QNC`}</Text>}
         </View>
       </View>
       <View style={{ borderTopWidth: 1, borderTopColor: '#1a1a2e', paddingTop: 8 }}>
@@ -964,6 +964,12 @@ async function fetchCachedBlockHeight() {
   finally { _blockHeightCache.inFlight = false; }
   return _blockHeightCache.height;
 }
+
+// Display-format a token amount: fixed precision, then strip meaningless trailing zeros —
+// "0.00000" → "0", "1.50000" → "1.5", "1.23456" → "1.23456". DISPLAY-ONLY: never feed this
+// into math or input fields (those keep full toFixed precision).
+const fmtAmount = (value, decimals) =>
+  (Number(value) || 0).toFixed(decimals).replace(/(\.\d*?)0+$/, '$1').replace(/\.$/, '');
 
 const WalletScreen = () => {
   const [walletManager] = useState(() => new WalletManager()); // lazy: construct once, not every render
@@ -1059,6 +1065,14 @@ const WalletScreen = () => {
   const [processingValidation, setProcessingValidation] = useState(false); // Track validation processing
   const [activationPricing, setActivationPricing] = useState(null); // Dynamic pricing info
   const [nodePseudonym, setNodePseudonym] = useState(''); // Pseudonym/alias for the node
+  // Always-current mirror of nodePseudonym for LONG-LIVED closures. The 30s status interval
+  // captures loadLightNodeStatus from the render its effect ran in; that closure's nodePseudonym
+  // is frozen (e.g. empty on the Recover-Code path, where the effect re-fires on type/code but the
+  // pseudonym arrives only at activation success) — so a state read there no-ops forever. The
+  // effect deps deliberately EXCLUDE nodePseudonym (it is set inside the effect's own chain →
+  // adding it self-retriggers); a ref gives stale closures the current value without touching deps.
+  const nodePseudonymRef = useRef(nodePseudonym);
+  useEffect(() => { nodePseudonymRef.current = nodePseudonym; }, [nodePseudonym]);
   const [showActivationInput, setShowActivationInput] = useState(false); // Show activation code input modal
   const [activationInputCode, setActivationInputCode] = useState(''); // Input activation code
   const [lightNodeStatus, setLightNodeStatus] = useState(null); // Light node network status
@@ -1377,9 +1391,18 @@ const WalletScreen = () => {
     }
   };
   
-  // Load Light node network status (for ping system)
-  const loadLightNodeStatus = async () => {
-    if (activatedNodeType !== 'light' || !nodePseudonym) return;
+  // Load Light node network status (for ping system).
+  // `pseudonym` param: callers that just LEARNED the pseudonym (activation/restore success)
+  // must pass it explicitly — state/ref are still pre-setState at that instant. Every other
+  // caller (30s interval, pull-to-refresh, tab effect) defaults to the REF, not closure state:
+  // the interval's closure may be from an older render whose nodePseudonym is frozen/empty
+  // (Recover-Code path), and the ref is the only always-current read that doesn't require
+  // re-running the effect (whose deps deliberately exclude nodePseudonym).
+  // nodeType is a parameter for the same reason pseudonym is: right after activation the executing
+  // closure still holds the PRE-activation value, so the guard would reject the very call that is
+  // meant to reveal the status window.
+  const loadLightNodeStatus = async (pseudonym = nodePseudonymRef.current, nodeType = activatedNodeType) => {
+    if (nodeType !== 'light' || !pseudonym) return;
     
     try {
       const status = await checkNodeStatus();
@@ -1710,7 +1733,9 @@ const WalletScreen = () => {
         const res = await walletManager.registerNodeWithCode(activationCode, wallet.qnetAddress || wallet.address, password);
         if (res && res.success) {
           showAlert('Success', 'Node re-established on this device. Attestation will resume shortly.');
-          await loadLightNodeStatus();
+          // Seed-restore edge: state/ref pseudonym may still be empty here (identity was just
+          // re-established) — pass the fresh one so the status load can't no-op on the guard.
+          await loadLightNodeStatus(res.pseudonym || undefined, res.nodeType || 'light');
         } else {
           showAlert('Error', (res && res.error) || 'Could not re-establish node. Please try again.');
         }
@@ -1903,6 +1928,11 @@ const WalletScreen = () => {
           // Already on-chain and durable. B: force a self-attest so it records this-epoch eligibility
           // now and starts earning immediately, instead of waiting for the next ping.
           try { await selfAttestIfNeeded(result.pseudonym, true); } catch (_) {}
+          // Flip the node tab to the status window NOW (same call as pull-to-refresh). Without this
+          // the render gate (lightNodeStatus?.registered) stays false until a manual refresh: the
+          // node-tab effect can't re-fire (type/code re-set to identical values) and this closure's
+          // nodePseudonym state is still pre-setState — hence the explicit pseudonym argument.
+          try { await loadLightNodeStatus(result.pseudonym, nodeType); } catch (_) {}
           showAlert(
             'Node Restored!',
             `Your existing ${nodeType} node has been reactivated and restored.\n\nNode ID: ${activationInputCode.trim()}\nSystem ID: ${result.pseudonym}`,
@@ -1915,6 +1945,8 @@ const WalletScreen = () => {
           // Fresh activation: self-attest NOW so this-epoch eligibility is recorded even when the
           // node's ping slot already passed this epoch (else it earns nothing until app reopen).
           try { await selfAttestIfNeeded(result.pseudonym, true); } catch (_) {}
+          // Auto-show the status window (see the restore branch above for why the explicit arg).
+          try { await loadLightNodeStatus(result.pseudonym, nodeType); } catch (_) {}
           showAlert(
             'Node Activated!',
             `Your ${nodeType} node has been successfully activated and registered in the network.\n\nNode ID: ${activationInputCode.trim()}\nSystem ID: ${result.pseudonym}`,
@@ -5049,7 +5081,7 @@ const WalletScreen = () => {
               {/* Balance Info */}
               <View style={styles.sendBalanceInfo}>
                 <Text style={styles.sendBalanceLabel}>Available Balance</Text>
-                <Text style={styles.sendBalanceAmount}>{maskAmt(sendingToken.balance.toFixed(5))} {sendingToken.symbol}</Text>
+                <Text style={styles.sendBalanceAmount}>{maskAmt(fmtAmount(sendingToken.balance, 5))} {sendingToken.symbol}</Text>
               </View>
               
               {/* Recipient Address */}
@@ -5256,7 +5288,7 @@ const WalletScreen = () => {
                     </View>
                   </View>
                   <View style={styles.tokenBalance}>
-                    <Text style={styles.tokenAmount}>{maskAmt(tokenBalances.qnc.toFixed(5))}</Text>
+                    <Text style={styles.tokenAmount}>{maskAmt(fmtAmount(tokenBalances.qnc, 5))}</Text>
                   </View>
                 </TouchableOpacity>
                 )}
@@ -5340,7 +5372,7 @@ const WalletScreen = () => {
                     </View>
                   </View>
                   <View style={styles.tokenBalance}>
-                    <Text style={styles.tokenAmount}>{maskAmt(balance.toFixed(4))}</Text>
+                    <Text style={styles.tokenAmount}>{maskAmt(fmtAmount(balance, 4))}</Text>
                     <Text style={styles.tokenValue}>{maskAmt(`$${(balance * tokenPrices.sol).toFixed(2)}`)}</Text>
                   </View>
                 </View>
@@ -5364,7 +5396,7 @@ const WalletScreen = () => {
                     </View>
                   </View>
                   <View style={styles.tokenBalance}>
-                    <Text style={styles.tokenAmount}>{maskAmt(tokenBalances['1dev'].toFixed(4))}</Text>
+                    <Text style={styles.tokenAmount}>{maskAmt(fmtAmount(tokenBalances['1dev'], 4))}</Text>
                     <Text style={styles.tokenValue}>{maskAmt(`$${(tokenBalances['1dev'] * tokenPrices['1dev']).toFixed(2)}`)}</Text>
                   </View>
                 </View>

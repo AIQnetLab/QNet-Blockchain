@@ -802,8 +802,9 @@ mod tests {
         println!("📊 With 256 shards: {:.0} theoretical TPS", tps * 256.0);
         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
 
-        assert!(generated > 0, "Should generate at least some transactions");
-        assert!(tps > 100.0, "Should generate at least 100 TX/sec (Dilithium3 is CPU-heavy)");
+        // Throughput is printed, never asserted: a wall-clock threshold measures the machine and the
+        // concurrent load on it, not this code, so it fails on a busy CI box for no defect.
+        assert_eq!(generated, num_transactions as u64, "every requested transaction must be generated");
     }
 
     /// Test parallel transaction generation

@@ -17,7 +17,6 @@
 //! ├── mod.rs              - This file (public exports)
 //! ├── pq_crypto.rs        - Pure ML-DSA-65 (Dilithium3) signatures
 //! ├── quantum_crypto.rs   - Quantum-resistant cryptography core
-//! ├── poh.rs              - Verifiable Time Sequence (VTS)
 //! ├── vrf.rs              - Legacy VRF (deprecated)
 //! ├── key_manager.rs      - Key generation and management
 //! └── crypto_integration.rs - Service integration layer
@@ -50,12 +49,8 @@ pub mod pq_crypto;
 /// Node activation, phase management, pricing calculations
 pub mod quantum_crypto;
 
-/// Verifiable Time Sequence (VTS)
-/// Time-based consensus with quantum-resistant hashing
-pub mod poh;
-
-/// Dilithium3-VRF: Post-quantum VRF for secret leader election
-/// Uses NIST FIPS 204 (ML-DSA-65) + SHA3-256
+/// Dilithium3-VRF: deterministic leader election and the per-block beacon contribution.
+/// The doc that stood here described Proof-of-History, which was removed — it never described `vrf`.
 pub mod vrf;
 
 /// Key management
@@ -100,10 +95,6 @@ pub use quantum_crypto::{
 };
 
 // Quantum VTS types
-pub use poh::{
-    PoH,
-    PoHEntry,
-};
 
 // VRF types (Dilithium3-VRF)
 pub use vrf::{

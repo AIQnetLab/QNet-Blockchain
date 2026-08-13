@@ -15,15 +15,13 @@ use pqcrypto_traits::sign::{
     DetachedSignature as SigTrait,
     SignedMessage as SmTrait,
 };
-use sha3::{Sha3_256, Digest};
+use sha3::{Sha3_256, Sha3_512, Digest};
 
 // Domain separation constants.
 //
-// v15.15: removed unused v4 VRF helpers (`DOMAIN_EVAL`, `DOMAIN_OUTPUT`,
-// `hash_input_keyed`, `derive_output`). The active VRF construction is v5,
-// implemented inline in `DilithiumVrf::evaluate` with `b"QNet_VRF_v5_OUTPUT"`
-// and `b"QNet_VRF_v5_PROOF"` literal domain tags. The v4 helpers were
-// orphaned during the v4→v5 refactor and never re-wired to a caller.
+// The active construction is v7: a deterministic sk-bound output with the pair authenticated by an
+// ML-DSA-65 signature (`b"QNet_VRF_v7_OUTPUT"` / `b"QNet_VRF_v7_PROOF"`). Determinism is required by
+// the beacon recompute at the checkpoint — see `evaluate`.
 //
 // `DOMAIN_SLOT` is still in use — it tags the seed input for
 // `compute_slot_seed`, the entry point for secret-leader-election and
@@ -158,75 +156,71 @@ impl DilithiumVrf {
 
     /// Evaluate VRF — deterministic: same (sk, input) → same output.
     ///
-    /// ML-DSA-65 signing is randomized (FIPS 204), so the output must NOT
-    /// be derived from signature bytes (that breaks determinism and makes
-    /// leader-election claims non-reproducible). Instead:
-    ///   output = SHA3-512(domain ‖ pk ‖ sk ‖ input)[..32]  (sk-bound, deterministic)
-    ///   proof  = Dilithium3 sig over (domain_proof ‖ pk ‖ input ‖ output)
-    /// Output is sk-private (unforgeable, hidden until reveal); the proof
-    /// ties (input, output) to pk. Output determinism despite randomized
-    /// signature bytes is the invariant leader election relies on.
+    ///   output = SHA3-512("QNet_VRF_v7_OUTPUT" ‖ pk ‖ sk ‖ input)[..32]
+    ///   proof  = ML-DSA-65 signature over ("QNet_VRF_v7_PROOF" ‖ pk ‖ input ‖ output)
+    ///
+    /// Determinism is a consensus-safety invariant, not a convenience. `vrf_output` is NOT covered by
+    /// `MicroBlock::hash()`, yet every node recomputes the window beacon from the STORED bodies at the
+    /// checkpoint. A producer that re-produces height h after a rollback emits the same seven hashed
+    /// fields — timestamp is `genesis_ts + h*SLOT`, so even that is fixed — hence a byte-identical
+    /// hash. If the output moved between the two evaluations, peers holding either variant see every
+    /// tail hash match (never TailDiverged, so no repair is solicited) and then disagree on the beacon,
+    /// which is a terminal ContentCheck::Reject. Five honest nodes, no attacker, permanent freeze.
+    ///
+    /// Price paid, knowingly: a verifier holding only pk cannot recompute the output, so `verify_static`
+    /// proves the producer AUTHENTICATED this (input, output) pair — not that the pair was forced.
+    /// Verifiability needs `output = f(public, proof)` with a UNIQUE proof; ML-DSA-65 is randomised, so
+    /// on this primitive verifiable and deterministic are mutually exclusive. That is why no consensus
+    /// value reads `vrf_output`: the window beacon folds QC-signed block hashes instead.
     pub fn evaluate(&self, input: &[u8]) -> Result<VrfOutput, String> {
         let sk_bytes = self.sk.as_ref()
             .ok_or("[ERR][VRF] not initialized")?;
         let pk_bytes = self.pk.as_ref()
             .ok_or("[ERR][VRF] pk not initialized")?;
 
-        // ── Deterministic output: SHA3-512(domain || pk || sk || input) → 32 bytes ──
-        // sk-bound, so without sk the output is computationally
-        // hidden; deterministic, so two calls with the same input
-        // yield byte-identical outputs.
-        use sha3::Sha3_512;
-        let mut out_hasher = Sha3_512::new();
-        out_hasher.update(b"QNet_VRF_v5_OUTPUT");
-        out_hasher.update(pk_bytes);
-        out_hasher.update(sk_bytes);
-        out_hasher.update(input);
-        let out_full = out_hasher.finalize();
-        let mut output = [0u8; 32];
-        output.copy_from_slice(&out_full[..32]);
-
-        // ── Proof: Dilithium3 signature over (domain_proof || pk || input || output) ──
-        // Anyone can verify (input, output, proof) ties together under
-        // pk; even though the signature bytes are randomised by
-        // FIPS 204, the verification predicate is deterministic
-        // (`verify_detached_signature` returns the same accept/reject
-        // for the same fixed (msg, sig, pk) input).
-        let mut proof_msg = Vec::with_capacity(32 + pk_bytes.len() + input.len() + 32);
-        proof_msg.extend_from_slice(b"QNet_VRF_v5_PROOF");
-        proof_msg.extend_from_slice(pk_bytes);
-        proof_msg.extend_from_slice(input);
-        proof_msg.extend_from_slice(&output);
-
+        let output = Self::output_from_secret(pk_bytes, sk_bytes, input);
+        let proof_msg = Self::proof_message(pk_bytes, input, &output);
         let sk = dilithium3::SecretKey::from_bytes(sk_bytes)
             .map_err(|e| format!("[ERR][VRF] sk_parse err={:?}", e))?;
         let sig = dilithium3::detached_sign(&proof_msg, &sk);
-        let proof = SigTrait::as_bytes(&sig).to_vec();
 
-        Ok(VrfOutput { output, proof })
+        Ok(VrfOutput { output, proof: SigTrait::as_bytes(&sig).to_vec() })
     }
 
-    /// Verify VRF proof (stateless, no secret key needed).
+    /// sk-bound, deterministic output. Unpredictable to anyone without sk; unrecomputable by a
+    /// verifier, which is exactly the limitation `evaluate` documents.
+    fn output_from_secret(pk_bytes: &[u8], sk_bytes: &[u8], input: &[u8]) -> [u8; 32] {
+        let mut h = Sha3_512::new();
+        h.update(b"QNet_VRF_v7_OUTPUT");
+        h.update(pk_bytes);
+        h.update(sk_bytes);
+        h.update(input);
+        let d = h.finalize();
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&d[..32]);
+        out
+    }
+
+    /// The message the VRF proof signs. Covers the output so the (input, output) pair is bound to pk:
+    /// a MITM cannot swap the output of a block in flight without invalidating this signature too.
+    fn proof_message(pk_bytes: &[u8], input: &[u8], output: &[u8; 32]) -> Vec<u8> {
+        let mut m = Vec::with_capacity(32 + pk_bytes.len() + input.len() + output.len());
+        m.extend_from_slice(b"QNet_VRF_v7_PROOF");
+        m.extend_from_slice(pk_bytes);
+        m.extend_from_slice(input);
+        m.extend_from_slice(output);
+        m
+    }
+
+    /// Verify a VRF proof (stateless, no secret key needed).
     ///
-    /// v5: verifies the Dilithium signature ties (pk, input, output)
-    /// together. The output itself cannot be recomputed without sk —
-    /// see `evaluate` doc for the construction rationale. The verifier
-    /// trusts that the holder of `pk`'s matching sk evaluated the VRF
-    /// honestly and signed the resulting (input, output) pair; a
-    /// dishonest claimer would have to forge a Dilithium signature,
-    /// which is the same security assumption that protects every
-    /// other consensus message in the system.
+    /// Proves that the holder of `pk` signed THIS (input, output) pair. It does NOT prove the output
+    /// was correctly derived — see `evaluate` for why that is unreachable on a randomised signature.
     pub fn verify_static(pk_bytes: &[u8], input: &[u8], vrf: &VrfOutput) -> Result<bool, String> {
         if pk_bytes.len() != D3_PK_BYTES {
             return Err(format!("[ERR][VRF] verify pk_size={}", pk_bytes.len()));
         }
-        // Reconstruct the same proof message the prover signed.
-        let mut proof_msg = Vec::with_capacity(32 + pk_bytes.len() + input.len() + 32);
-        proof_msg.extend_from_slice(b"QNet_VRF_v5_PROOF");
-        proof_msg.extend_from_slice(pk_bytes);
-        proof_msg.extend_from_slice(input);
-        proof_msg.extend_from_slice(&vrf.output);
-
+        let proof_msg = Self::proof_message(pk_bytes, input, &vrf.output);
         let pk = dilithium3::PublicKey::from_bytes(pk_bytes)
             .map_err(|e| format!("[ERR][VRF] pk_parse err={:?}", e))?;
         let sig = dilithium3::DetachedSignature::from_bytes(&vrf.proof)
@@ -251,63 +245,6 @@ impl DilithiumVrf {
         seed
     }
 
-    /// Am I elected for this slot?
-    pub fn evaluate_election(
-        &self, slot_seed: &[u8; 32], my_rep: f64, total_rep: f64,
-    ) -> Result<Option<VrfOutput>, String> {
-        let vrf = self.evaluate(slot_seed)?;
-        let threshold = Self::calculate_threshold(my_rep, total_rep);
-        if vrf.output_as_u128() < threshold {
-            println!("[INFO][VRF] elected node={} rep={:.1}/{:.1}", self.node_id, my_rep, total_rep);
-            Ok(Some(vrf))
-        } else {
-            Ok(None)
-        }
-    }
-
-    /// Verify another node's election claim
-    pub fn verify_election(
-        pk: &[u8], slot_seed: &[u8; 32], vrf: &VrfOutput, rep: f64, total_rep: f64,
-    ) -> Result<bool, String> {
-        if !Self::verify_static(pk, slot_seed, vrf)? {
-            return Ok(false);
-        }
-        Ok(vrf.output_as_u128() < Self::calculate_threshold(rep, total_rep))
-    }
-
-    /// Expected winners per round — controls claim density in P2P gossip.
-    /// 5 nodes  -> all 5 broadcast  (P = min(1.0, 20/5*rep_fraction) = 1.0)
-    /// 50 nodes -> ~20 broadcast     (~80 KB gossip)
-    /// 1000 nodes -> ~20 broadcast   (~80 KB gossip, same bandwidth)
-    pub const EXPECTED_WINNERS: f64 = 20.0;
-
-    /// Election threshold: P(elected) = EXPECTED_WINNERS * (rep / total_rep)
-    /// Guarantees ~EXPECTED_WINNERS claims per round regardless of network size.
-    /// P(0 winners) ~ e^(-EXPECTED_WINNERS) ~ 2e-9 -- practically impossible.
-    ///
-    /// FIX M-M20: Integer-only arithmetic to ensure cross-platform determinism.
-    /// All nodes must compute identical thresholds -- f64 precision varies by platform.
-    pub fn calculate_threshold(rep: f64, total_rep: f64) -> u128 {
-        if total_rep <= 0.0 || rep <= 0.0 { return 0; }
-
-        // Scale to integer arithmetic: multiply by 1_000_000 to preserve 6 decimal places
-        let rep_scaled = (rep * 1_000_000.0) as u128;
-        let total_scaled = (total_rep * 1_000_000.0) as u128;
-        if total_scaled == 0 { return 0; }
-
-        let expected = (Self::EXPECTED_WINNERS * 1_000_000.0) as u128;
-
-        // p_scaled = expected * rep / total (in millionths)
-        let p_scaled = expected.saturating_mul(rep_scaled) / total_scaled;
-
-        // If probability >= 1.0 (in millionths), saturate to MAX
-        if p_scaled >= 1_000_000 {
-            return u128::MAX;
-        }
-
-        // threshold = u128::MAX * p_scaled / 1_000_000
-        (u128::MAX / 1_000_000).saturating_mul(p_scaled)
-    }
 
     /// Pick winner: lowest VRF output (deterministic tiebreaker)
     pub fn select_winner(candidates: &[(String, VrfOutput)]) -> Option<(String, VrfOutput)> {
@@ -316,7 +253,7 @@ impl DilithiumVrf {
             .map(|(id, v)| (id.clone(), v.clone()))
     }
 
-    /// v4.5: PRIMARY deterministic leader selection (Ethereum/Solana model).
+    /// v4.5: PRIMARY deterministic leader selection.
     ///
     /// All inputs are on-chain → all nodes compute identical result.
     /// Zero P2P dependency. Mathematically impossible to disagree.
@@ -347,11 +284,8 @@ impl DilithiumVrf {
         Self::deterministic_leader(slot_seed, height, round, 0, num_candidates)
     }
 
-    // v15.15: removed orphaned v4 helpers `hash_input_keyed` and
-    // `derive_output`. Active VRF (v5) inlines its hashing inside
-    // `evaluate` / `verify_static` with `b"QNet_VRF_v5_OUTPUT"` and
-    // `b"QNet_VRF_v5_PROOF"` literal domain tags — no shared helpers
-    // needed.
+    // Hashing is inlined in `evaluate` / `verify_static` with the literal `QNet_VRF_v7_*` domain
+    // tags — no shared helpers, so a tag can never drift between signer and verifier.
 }
 
 // =========================================================================
@@ -491,29 +425,23 @@ impl Drop for WalletIdentity {
 mod tests {
     use super::*;
 
+    /// Re-evaluation MUST be byte-identical even though the ML-DSA signature underneath is randomised
+    /// per call: a leader claim is verified against a re-derived output, so a drifting one would make
+    /// a node's own claim unverifiable to its peers.
     #[test]
     fn test_vrf_deterministic() {
-        // v5 VRF construction: OUTPUT must be deterministic (same sk +
-        // input → same 32-byte output) — this is the core property
-        // every consensus path that consumes the VRF relies on.
-        //
-        // PROOF (the Dilithium3 signature) is INTENTIONALLY randomised
-        // by FIPS 204 ML-DSA-65 — every call returns different signature
-        // bytes for the same message. Both proofs are still valid
-        // witnesses for the (input, output) pair, so the verification
-        // predicate accepts both. Asserting byte-equality on proofs
-        // would conflate "deterministic VRF output" with "deterministic
-        // signature scheme" — a different (and stronger) property that
-        // QNet's post-quantum signing primitive does not provide.
         let (pk, sk) = dilithium3::keypair();
         let pk_b = PkTrait::as_bytes(&pk).to_vec();
         let mut vrf = DilithiumVrf::new("t1".into());
         vrf.initialize_from_keys(&pk_b, SkTrait::as_bytes(&sk)).unwrap();
         let a = vrf.evaluate(b"input").unwrap();
         let b = vrf.evaluate(b"input").unwrap();
+
         assert_eq!(a.output, b.output, "VRF output must be deterministic");
-        // Both proofs verify under the same (pk, input, output) — that
-        // is the property the consensus path requires.
+        assert_ne!(a.output, vrf.evaluate(b"other").unwrap().output, "output must track the input");
+        // Both evaluations verify despite differing signature bytes — determinism lives in the output,
+        // not in the proof, so a randomised signer cannot perturb it.
+        assert_ne!(a.proof, b.proof, "ML-DSA signing is randomised");
         assert!(DilithiumVrf::verify_static(&pk_b, b"input", &a).unwrap());
         assert!(DilithiumVrf::verify_static(&pk_b, b"input", &b).unwrap());
     }
@@ -527,6 +455,26 @@ mod tests {
         let out = vrf.evaluate(b"msg").unwrap();
         assert!(DilithiumVrf::verify_static(&pk_b, b"msg", &out).unwrap());
         assert!(!DilithiumVrf::verify_static(&pk_b, b"wrong", &out).unwrap());
+    }
+
+    /// What the proof DOES buy: the (input, output) pair is bound to pk, so nobody but the key holder
+    /// can put an output on the wire. It does NOT stop the key holder itself from choosing one — that
+    /// needs a unique signature, see `evaluate`. This test pins the boundary so the guarantee is not
+    /// over-read later.
+    #[test]
+    fn substituted_output_does_not_verify() {
+        let (pk, sk) = dilithium3::keypair();
+        let pk_b = PkTrait::as_bytes(&pk).to_vec();
+        let mut vrf = DilithiumVrf::new("t3".into());
+        vrf.initialize_from_keys(&pk_b, SkTrait::as_bytes(&sk)).unwrap();
+        let honest = vrf.evaluate(b"slot-seed").unwrap();
+        assert!(DilithiumVrf::verify_static(&pk_b, b"slot-seed", &honest).unwrap());
+
+        // A relay keeps the producer's signature and swaps the output: the signature covers the
+        // output, so it fails.
+        let tampered = VrfOutput { output: [0u8; 32], proof: honest.proof.clone() };
+        assert!(!DilithiumVrf::verify_static(&pk_b, b"slot-seed", &tampered).unwrap(),
+                "a substituted output must not verify");
     }
 
     #[test]
@@ -557,26 +505,6 @@ mod tests {
         let r = VrfOutput::from_bytes(&v.to_bytes()).unwrap();
         assert_eq!(r.output, v.output);
         assert_eq!(r.proof, v.proof);
-    }
-
-    #[test]
-    fn test_threshold_expected_winners() {
-        // 5 nodes, equal rep -> P(elected) = min(1.0, 20 * 1/5) = 1.0 -> all elected
-        let t5 = DilithiumVrf::calculate_threshold(90.0, 450.0);
-        assert_eq!(t5, u128::MAX); // saturates at 1.0
-
-        // 1000 nodes, equal rep -> P(elected) = 20/1000 = 0.02
-        let t1000 = DilithiumVrf::calculate_threshold(1.0, 1000.0);
-        // Integer-only: threshold = (u128::MAX / 1_000_000) * 20_000
-        let expected_int = (u128::MAX / 1_000_000).saturating_mul(20_000);
-        assert!(t1000 > 0);
-        // Allow small integer rounding difference
-        let diff = if t1000 > expected_int { t1000 - expected_int } else { expected_int - t1000 };
-        assert!(diff < u128::MAX / 1_000_000, "threshold diff too large");
-
-        // Zero rep -> 0
-        assert_eq!(DilithiumVrf::calculate_threshold(0.0, 100.0), 0);
-        assert_eq!(DilithiumVrf::calculate_threshold(10.0, 0.0), 0);
     }
 
     #[test]

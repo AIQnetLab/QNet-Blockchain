@@ -436,7 +436,7 @@ impl ProductionShardManager {
         match topology.shard_node_map.get(&cross_tx.to_shard) {
             Some(nodes) if !nodes.is_empty() => {
                 println!("[INFO][SHARD] cross_shard_notify dest_shard={} nodes={} tx={}",
-                         cross_tx.to_shard, nodes.len(), &cross_tx.tx_id[..16.min(cross_tx.tx_id.len())]);
+                         cross_tx.to_shard, nodes.len(), qnet_state::char_prefix(&cross_tx.tx_id, 16));
                 Ok(())
             }
             _ => {

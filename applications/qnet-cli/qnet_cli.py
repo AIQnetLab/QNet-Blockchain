@@ -275,24 +275,13 @@ def claim():
         if not click.confirm("Proceed with claim?"):
             return
             
-        # Submit claim request
-        claim_data = {
-            "node_id": node_id,
-            "wallet_address": wallet_address,
-            "amount": unclaimed
-        }
-        
-        response = requests.post(f"{config.node_url}/api/rewards/claim", 
-                               json=claim_data, timeout=10)
-        
-        if response.status_code == 200:
-            result = response.json()
-            claimed_amount = result.get('claimed', unclaimed)
-            click.echo(f"✅ Successfully claimed {claimed_amount:.3f} QNC!")
-            click.echo(f"   Transaction hash: {result.get('tx_hash', 'N/A')}")
-        else:
-            error_msg = response.json().get('error', 'Unknown error')
-            click.echo(f"❌ Claim failed: {error_msg}", err=True)
+        # A claim is authorised by TWO ML-DSA-65 signatures from the wallet key: one over
+        # "claim_rewards:{node_id}:{wallet}", and one over the payload the node quotes back. This CLI
+        # holds no key and has no post-quantum signer, so it cannot produce either. Say so plainly
+        # instead of posting a request the node will reject.
+        click.echo("❌ Claiming requires your wallet's ML-DSA-65 key, which this CLI does not hold.", err=True)
+        click.echo(f"   Claim from the QNet wallet app, or via @qnet/sdk claimRewards() with a signer.")
+        click.echo(f"   Node: {config.node_url}  node_id: {node_id}  wallet: {wallet_address}")
             
     except Exception as e:
         click.echo(f"Error: {str(e)}", err=True)

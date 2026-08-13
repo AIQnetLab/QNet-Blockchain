@@ -138,6 +138,12 @@ lazy_static::lazy_static! {
     /// attempt — there is no legitimate cause. We therefore admit a key
     /// to the blacklist on the FIRST observed mismatch.
     ///
+    /// NOT CONSULTED BY ANY VERIFIER. The signature path used to early-return on a hit, which made an
+    /// acceptance verdict a function of per-process, gossip-populated RAM — two honest nodes could reach
+    /// different verdicts on the same message, and a verdict that forks is worse than an attacker that
+    /// costs a signature check. The set is now telemetry and peer-selection hinting only; a rate-limited
+    /// reject log replaced the gate. Do not reintroduce it into verification.
+    ///
     /// PERSISTENCE: When an integrator (qnet-integration) installs a
     /// `ATTACKER_PK_PERSIST_CALLBACK` at boot, every insertion is
     /// mirrored to durable storage. On restart the integrator replays
@@ -500,9 +506,8 @@ const MAX_PK_REGISTRY_CAP_HARD: usize = 1_000_000;
 /// Default idle threshold for LRU eviction (30 days in seconds).
 /// Overridable via `QNET_PK_REGISTRY_IDLE_DAYS`.
 ///
-/// Choice rationale: 30 days is longer than the longest consecutive
-/// stall observed in any major BFT chain (Tendermint p99 outage ≈ 7
-/// days). A node silent for a full month is operationally dead; freeing
+/// Choice rationale: 30 days far exceeds any realistic consecutive BFT stall (worst outages
+/// elsewhere run about a week). A node silent for a full month is operationally dead; freeing
 /// its slot is correct.
 const DEFAULT_IDLE_THRESHOLD_SECS: u64 = 30 * 24 * 60 * 60;
 
@@ -1672,22 +1677,11 @@ async fn verify_with_real_dilithium(
     let signed_message_bytes = &signature_bytes[4..4 + signed_len];
     let public_key_bytes = &signature_bytes[pk_start..pk_start + pk_len];
 
-    // ─────────────────────────────────────────────────────────────────────
-    // Permanent attacker-PK fast path (defence-in-depth).
-    // ─────────────────────────────────────────────────────────────────────
-    // O(1) DashMap lookup. If this PK has been recorded as an impersonator
-    // in a prior verification (current run or replayed from durable
-    // storage on boot via `seed_attacker_pk_blacklist`), drop the message
-    // here — before the registry-lock dance and the ~3.3 KB Dilithium3
-    // open call. We bump the offense counter so telemetry stays correct
-    // and persistence reflects renewed activity, but emit no log line:
-    // the original `[CRIT][SECURITY] attacker_pk_blacklisted` discovery
-    // event is the canonical record; subsequent silent drops are the
-    // expected steady state.
-    if is_pk_blacklisted(public_key_bytes) {
-        let _ = record_attacker_pk(public_key_bytes, node_id);
-        return false;
-    }
+    // NO attacker-PK fast path here, deliberately — see the Tier-2 reject below for why the set is
+    // not trustworthy. This function decides signature validity, which decides BLOCK validity, so it
+    // must read only the committed registry: a process-local, persisted, remotely-installable set
+    // would give two honest nodes different verdicts on the same block. Saving one Dilithium open for
+    // a repeat offender is not worth a fork.
 
     // ─────────────────────────────────────────────────────────────────────
     // Identity → public-key binding policy (three tiers)
@@ -1749,44 +1743,25 @@ async fn verify_with_real_dilithium(
                 observe_pk_activity(node_id);
             }
             Some(entry) => {
-                // Tier 2: bound, mismatch — hostile identity claim. Hard reject.
-                //
-                // SECURITY ESCALATION (v25.1): CONSENSUS_PK_REGISTRY is
-                // immutable once bound — every node controls exactly one
-                // identity keypair. A mismatch is therefore conclusive
-                // evidence of an impersonation attempt: there is NO
-                // legitimate cause. We:
-                //
-                //   1. Hard-reject the math step (always — correctness
-                //      boundary).
-                //   2. Permanently blacklist the attacker's extracted PK
-                //      by SHA3-256 fingerprint, mirrored to durable
-                //      storage when the integrator has installed a
-                //      persistence callback.
-                //   3. Emit exactly ONE `[CRIT][SECURITY]` discovery log
-                //      line on first sighting of this attacker key; all
-                //      subsequent rejections from the same PK are silent
-                //      (the entry counts up but produces no log noise).
-                //
-                // Upstream layers (QUIC handshake, consensus dispatcher)
-                // consult `is_pk_blacklisted` BEFORE reaching this code
-                // path, so a recidivist attacker is dropped at the
-                // transport boundary and never causes a verification
-                // attempt. This site is the install path for new
-                // attacker keys and the last-line backstop.
+                // Tier 2: bound, mismatch — hostile identity claim.
+                // Reject the message — and NOTHING else. A mismatch proves only that SOMEBODY paired
+                // this node_id with this PK; it does not implicate the PK's owner, because both are
+                // public. Blacklisting the presented PK here handed anyone a remote censorship
+                // primitive: claim victim A's node_id, attach victim B's public key, and B is banned
+                // permanently on every node that saw it — while the ban itself is process-local RAM
+                // deciding block validity, so the banning nodes fork away from the rest. A PK may only
+                // be sanctioned by self-authenticating evidence, which is what the on-chain
+                // equivocation proof is.
+                // Through the file's own reject-log governor: this trigger is remotely repeatable at
+                // line rate, so an unconditional line is itself a log-DoS. The old code was
+                // self-limiting only because it logged once per newly-blacklisted key.
                 let pk_for_log = hex::encode(&public_key_bytes[..8.min(public_key_bytes.len())]);
                 let registered_for_log = hex::encode(&entry.pk[..8.min(entry.pk.len())]);
                 drop(registry);
-                let (record, was_first) = record_attacker_pk(public_key_bytes, node_id);
-                if was_first {
-                    eprintln!(
-                        "[CRIT][SECURITY] attacker_pk_blacklisted node={} registered={}.. extracted={}.. first_seen={} action=permanent_ban",
-                        node_id,
-                        registered_for_log,
-                        pk_for_log,
-                        record.first_seen_unix_s,
-                    );
-                }
+                log_sig_reject(node_id, &format!(
+                    "[WARN][SECURITY] identity_pk_mismatch node={} registered={}.. presented={}.. action=reject_message",
+                    node_id, registered_for_log, pk_for_log,
+                ));
                 return false;
             }
             None => {
@@ -2176,7 +2151,39 @@ mod tests_v17_security {
 //   * env override must control runtime cap / idle-threshold
 // ═══════════════════════════════════════════════════════════════════════════
 #[cfg(test)]
+mod tests_pk_elision {
+    use super::*;
+    use base64::engine::general_purpose;
+
+    /// `strip_embedded_pk` is NOT idempotent: it only accepts the full
+    /// `[sig_len][SignedMessage][pk_len][pk]` shape and returns None once the pk is gone. Anything that
+    /// verifies an ALREADY-stripped signature must therefore skip the strip, which is why votes and
+    /// timeouts each need a separate ingest gate (full sig) and certificate gate (compact sig).
+    /// Stripping twice rejects every certificate and wedges the view change.
+    #[test]
+    fn strip_is_not_idempotent() {
+        let sig_len: u32 = 3400;
+        let pk_len: u32 = 1952;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&sig_len.to_le_bytes());
+        bytes.extend_from_slice(&vec![1u8; sig_len as usize]);
+        bytes.extend_from_slice(&pk_len.to_le_bytes());
+        bytes.extend_from_slice(&vec![2u8; pk_len as usize]);
+        let full = format!("dilithium_sig_node_001_{}", general_purpose::STANDARD.encode(&bytes));
+
+        let compact = strip_embedded_pk(&full).expect("full envelope must strip");
+        assert!(compact.len() < full.len());
+        assert!(strip_embedded_pk(&compact).is_none(), "a compact signature must not strip again");
+    }
+}
+
+#[cfg(test)]
 mod tests_v20_pk_registry {
+    /// CONSENSUS_PK_REGISTRY is process-global, so tests that install entries into it must not run
+    /// concurrently: another test's older entry would win the most-stale eviction. Same discipline as
+    /// MARKER_TEST_LOCK in qnet-state.
+    static PK_REGISTRY_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
     use super::*;
     use std::sync::atomic::Ordering;
 
@@ -2224,6 +2231,7 @@ mod tests_v20_pk_registry {
     /// re-broadcasts after a long offline window.
     #[test]
     fn pinned_anchor_survives_idle_sweep() {
+        let _reg_guard = PK_REGISTRY_TEST_LOCK.lock();
         let id = "v20_test_pinned_anchor_survives";
         let pk = fake_pk_bytes(0xAA);
         // Insert with `last_seen` 10 years ago — far past any realistic
@@ -2247,6 +2255,7 @@ mod tests_v20_pk_registry {
     /// slots for new joiners.
     #[test]
     fn idle_non_pinned_entry_is_evicted() {
+        let _reg_guard = PK_REGISTRY_TEST_LOCK.lock();
         let id = "v20_test_idle_evicted";
         let pk = fake_pk_bytes(0xBB);
         let ancient_ts = now_secs().saturating_sub(60 * 60 * 24 * 60); // 60 days ago
@@ -2269,6 +2278,7 @@ mod tests_v20_pk_registry {
     /// over-aggressive sweep, violating the "active = retained" contract.
     #[test]
     fn fresh_non_pinned_entry_is_preserved() {
+        let _reg_guard = PK_REGISTRY_TEST_LOCK.lock();
         let id = "v20_test_fresh_preserved";
         let pk = fake_pk_bytes(0xCC);
         let now = now_secs();
@@ -2290,6 +2300,7 @@ mod tests_v20_pk_registry {
     /// NodeDeactivation TX apply hooks and by operator tooling.
     #[test]
     fn deactivate_removes_non_pinned_entry() {
+        let _reg_guard = PK_REGISTRY_TEST_LOCK.lock();
         let id = "v20_test_deactivate_removes";
         let pk = fake_pk_bytes(0xDD);
         install_test_entry(id, &pk, false, now_secs());
@@ -2309,6 +2320,7 @@ mod tests_v20_pk_registry {
     /// a network-wide upgrade ceremony; no runtime call may take them out.
     #[test]
     fn deactivate_refuses_pinned_entry() {
+        let _reg_guard = PK_REGISTRY_TEST_LOCK.lock();
         let id = "v20_test_deactivate_refuses_pinned";
         let pk = fake_pk_bytes(0xEE);
         install_test_entry(id, &pk, true, now_secs());
@@ -2331,6 +2343,7 @@ mod tests_v20_pk_registry {
     /// entries.
     #[test]
     fn in_line_eviction_picks_most_stale() {
+        let _reg_guard = PK_REGISTRY_TEST_LOCK.lock();
         let id_old = "v20_test_evict_pick_oldest";
         let id_recent = "v20_test_evict_pick_recent";
         let pk_old = fake_pk_bytes(0x10);

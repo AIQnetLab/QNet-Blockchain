@@ -1,10 +1,9 @@
 // Storage System Security & Performance Audit - FIXED VERSION
 #![cfg(test)]
 
-use qnet_integration::storage::{Storage, CompressionLevel, TransactionPattern};
-use qnet_state::{Transaction, MicroBlock, MacroBlock, ConsensusData, TransactionType};
+use qnet_integration::storage::{Storage, TransactionPattern};
+use qnet_state::{Transaction, MicroBlock, TransactionType};
 use std::time::{SystemTime, UNIX_EPOCH, Instant};
-use std::collections::HashMap;
 use colored::Colorize;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
@@ -34,7 +33,8 @@ fn create_test_transaction(id: u64, size: usize) -> Transaction {
     
     Transaction {
         // Using TxHash type (String) from real structure
-        hash: format!("tx_{:064x}", id),
+        // A real tx hash is 64 hex chars — storage keys the transaction pool on those bytes.
+        hash: format!("{:064x}", id),
         from: format!("qnet_{:040x}", id), // QNet address format
         to: Some(format!("qnet_{:040x}", id + 1000)),
         amount: 1000 + id,
@@ -56,6 +56,39 @@ fn create_test_transaction(id: u64, size: usize) -> Transaction {
     }
 }
 
+/// A properly LINKED run of microblocks. Storage enforces parent linkage (`unlinked_block
+/// parent_mismatch`), so a test that writes consecutive heights must chain previous_hash — writing
+/// zeros only worked before that invariant existed.
+fn create_test_chain(start: u64, count: u64, tx_count: usize) -> Vec<MicroBlock> {
+    let mut chain = Vec::new();
+    let mut parent: Option<MicroBlock> = None;
+    for h in start..start + count {
+        let mut block = create_test_microblock(h, tx_count);
+        if let Some(ref p) = parent {
+            block.previous_hash = p.hash();
+        }
+        parent = Some(block.clone());
+        chain.push(block);
+    }
+    chain
+}
+
+/// Persist a block the way production does: transaction BODIES go to the transaction pool, and the
+/// block stores only their hashes. Saving the block alone leaves it unloadable ("missing N
+/// transactions").
+fn save_block_like_production(storage: &Storage, block: &MicroBlock) {
+    for tx in &block.transactions {
+        let raw = hex::decode(&tx.hash).expect("tx hash is hex");
+        let mut hash32 = [0u8; 32];
+        hash32.copy_from_slice(&raw);
+        storage.transaction_pool.store_transaction(hash32, tx.clone())
+            .expect("Failed to store transaction");
+    }
+    let data = bincode::serialize(block).unwrap();
+    storage.save_block_with_delta(block.height, &data)
+        .expect("Failed to save");
+}
+
 /// Helper function to create test microblock with real QNet structure
 fn create_test_microblock(height: u64, tx_count: usize) -> MicroBlock {
     let transactions: Vec<Transaction> = (0..tx_count)
@@ -70,13 +103,13 @@ fn create_test_microblock(height: u64, tx_count: usize) -> MicroBlock {
         signature: vec![0u8; 64],
         previous_hash: [0u8; 32],
         merkle_root: [0u8; 32],
-        poh_hash: vec![0u8; 64],
-        poh_count: 0,
         vrf_output: None,
         vrf_proof: None,
         fees_collected: 0,
         state_root: [0u8; 32],
         timeout_round: 0,
+        carried_baseline: 0,
+        timeout_proof: None,
     }
 }
 
@@ -93,24 +126,16 @@ fn test_basic_storage_operations() {
     // Create and save a block
     let height = 42;
     let block = create_test_microblock(height, 5);
-    let block_data = bincode::serialize(&block).unwrap();
-    
+
     println!("  Saving block #{} with {} transactions...", height, 5);
-    storage.save_block_with_delta(height, &block_data)
-        .expect("Failed to save block");
-    
+    save_block_like_production(&storage, &block);
+
     // Load it back
-    let loaded = storage.load_microblock(height)
-        .expect("Failed to load block");
-    
-    assert!(loaded.is_some(), "Block should be loaded");
-    let loaded_data = loaded.unwrap();
-    
-    println!("  Loaded block: {} bytes", loaded_data.len());
-    
-    // Verify data integrity
-    let deserialized: MicroBlock = bincode::deserialize(&loaded_data)
-        .expect("Failed to deserialize loaded block");
+    // save_block_with_delta re-encodes the body, so the stored bytes are NOT plain bincode; read it
+    // back through the storage layer's own decoder, which is what every production caller uses.
+    let deserialized = storage.load_microblock_auto_format(height)
+        .expect("Failed to load block")
+        .expect("Block should be loaded");
     
     assert_eq!(deserialized.height, height);
     assert_eq!(deserialized.transactions.len(), 5);
@@ -179,7 +204,7 @@ fn test_pattern_based_compression() {
     
     for (name, size, pattern) in test_cases {
         let tx = create_test_transaction(1, size);
-        let original_data = bincode::serialize(&tx).unwrap();
+        let _original_data = bincode::serialize(&tx).unwrap();
         
         // Compress using pattern
         let compressed = storage.compress_transaction_by_pattern(&tx, pattern)
@@ -226,11 +251,8 @@ fn test_storage_persistence() {
     {
         let storage = Storage::new(path).expect("Failed to create storage");
         
-        for height in 1..=10 {
-            let block = create_test_microblock(height, 5);
-            let data = bincode::serialize(&block).unwrap();
-            storage.save_block_with_delta(height, &data)
-                .expect("Failed to save");
+        for block in create_test_chain(1, 10, 5) {
+            save_block_like_production(&storage, &block);
         }
         
         println!("  Saved 10 blocks to storage");
@@ -241,12 +263,9 @@ fn test_storage_persistence() {
         let storage = Storage::new(path).expect("Failed to recreate storage");
         
         for height in 1..=10 {
-            let loaded = storage.load_microblock(height)
+            let block = storage.load_microblock_auto_format(height)
                 .expect("Failed to load")
                 .expect("Block should exist");
-            
-            let block: MicroBlock = bincode::deserialize(&loaded)
-                .expect("Failed to deserialize");
             
             assert_eq!(block.height, height);
         }
@@ -273,13 +292,8 @@ fn test_concurrent_access() {
         .map(|thread_id| {
             let storage_clone = storage.clone();
             std::thread::spawn(move || {
-                for i in 0..blocks_per_thread {
-                    let height = thread_id * 1000 + i;
-                    let block = create_test_microblock(height, 3);
-                    let data = bincode::serialize(&block).unwrap();
-                    
-                    storage_clone.save_block_with_delta(height, &data)
-                        .expect("Failed to save in concurrent test");
+                for block in create_test_chain(thread_id * 1000, blocks_per_thread, 3) {
+                    save_block_like_production(&storage_clone, &block);
                 }
             })
         })
@@ -344,13 +358,11 @@ fn test_performance_benchmarks() {
     
     // Benchmark saves
     let iterations = 10;
-    let block = create_test_microblock(1, 10);
-    let data = bincode::serialize(&block).unwrap();
+    let chain = create_test_chain(1, iterations, 10);
     
     let start = Instant::now();
-    for i in 1..=iterations {
-        storage.save_block_with_delta(i, &data)
-            .expect("Failed to save");
+    for block in &chain {
+        save_block_like_production(&storage, block);
     }
     let elapsed = start.elapsed();
     let avg_save = elapsed.as_millis() / iterations as u128;

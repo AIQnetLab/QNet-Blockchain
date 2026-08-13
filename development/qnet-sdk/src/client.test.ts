@@ -166,11 +166,11 @@ describe('buildUnsignedTransfer', () => {
 });
 
 describe('buildRewardClaimPayload', () => {
-  it('produces a hex string containing the address', () => {
+  // The node verifies this string verbatim as UTF-8; it is not hex-encoded and it binds the node id.
+  it('is the exact message the node verifies', () => {
     const addr    = publicKeyHashToAddress(new Uint8Array(20).fill(0x77));
-    const payload = buildRewardClaimPayload(addr);
-    const decoded = Buffer.from(payload, 'hex').toString('utf8');
-    expect(decoded).toBe(`CLAIM_REWARDS:${addr}`);
+    const payload = buildRewardClaimPayload('super_node_007', addr);
+    expect(payload).toBe(`claim_rewards:super_node_007:${addr}`);
   });
 });
 

@@ -115,8 +115,8 @@ impl QNetNetworkConfig {
 
         if onedev_mint.contains("TBD") || burn_contract.contains("TBD") {
             eprintln!("[CRITICAL][CONFIG] mainnet_tbd_detected mint={} burn={}",
-                      &onedev_mint[..20.min(onedev_mint.len())],
-                      &burn_contract[..20.min(burn_contract.len())]);
+                      qnet_state::char_prefix(&onedev_mint, 20),
+                      qnet_state::char_prefix(&burn_contract, 20));
             eprintln!("[CRITICAL][CONFIG] set QNET_MAINNET_1DEV_MINT and QNET_MAINNET_BURN_CONTRACT env vars");
             std::process::exit(1);
         }

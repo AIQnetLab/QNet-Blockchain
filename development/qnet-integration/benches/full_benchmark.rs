@@ -1,43 +1,11 @@
 // QNet Comprehensive Benchmark Harness
 // Tests all critical components for production readiness
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId, Throughput};
+use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
 use qnet_integration::storage::PersistentStorage;
 use sha3::{Sha3_512, Sha3_256, Digest};
 use std::time::Duration;
 
-// Benchmark PoH throughput with optimizations
-fn benchmark_poh_throughput(c: &mut Criterion) {
-    let mut group = c.benchmark_group("poh_performance");
-    group.measurement_time(Duration::from_secs(10));
-    
-    // Test different batch sizes
-    for batch_size in [1000, 10000, 100000].iter() {
-        group.throughput(Throughput::Elements(*batch_size as u64));
-        group.bench_with_input(
-            BenchmarkId::new("sha3_512_optimized", batch_size),
-            batch_size,
-            |b, &size| {
-                b.iter(|| {
-                    let mut hash = [0u8; 64];
-                    hash[0] = 0x42; // Initial seed
-                    
-                    for i in 0..size {
-                        let mut hasher = Sha3_512::new();
-                        hasher.update(&hash);
-                        let counter = (i as u64).to_le_bytes();
-                        hasher.update(&counter);
-                        let result = hasher.finalize();
-                        hash.copy_from_slice(&result);
-                    }
-                    black_box(hash)
-                });
-            },
-        );
-    }
-    
-    group.finish();
-}
 
 // VRF init/evaluate/verify + producer-selection benches REMOVED with the deleted vrf/vrf_hybrid
 // modules (pure-Dilithium cutover); crypto benches live in benches/benchmark.rs.
@@ -181,7 +149,6 @@ fn benchmark_crypto(c: &mut Criterion) {
 
 criterion_group!(
     benches,
-    benchmark_poh_throughput,
     benchmark_consensus,
     benchmark_storage,
     benchmark_scalability,

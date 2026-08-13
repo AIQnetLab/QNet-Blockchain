@@ -309,7 +309,7 @@ impl QNetQuantumCrypto {
         // segment3 = encrypted_wallet[6:10] + entropy[0:2] OR encrypted_wallet[6:10] + entropy[0:4]
         // We need to extract wallet parts, ignoring entropy
         let wallet_part1 = segment2; // 6 chars
-        let wallet_part2 = &segment3[..4.min(segment3.len())]; // First 4 chars (rest is entropy)
+        let wallet_part2 = qnet_state::char_prefix(&segment3, 4); // First 4 chars (rest is entropy)
         let encrypted_wallet_hex = format!("{}{}", wallet_part1, wallet_part2); // 10 chars total
 
         // 5. Query blockchain for burn transaction AND amount (we need both for decryption key)

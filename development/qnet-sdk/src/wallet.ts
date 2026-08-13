@@ -83,13 +83,13 @@ export function buildUnsignedTransfer(params: {
 }
 
 /**
- * Build the canonical signing message for a reward claim.
+ * The request-auth message for a reward claim, verified verbatim as UTF-8 by the node.
  *
- * Sign this with your node's Dilithium3 (ML-DSA-65) key and pass the result
- * to `QNetClient.claimRewards()`.
+ * This authorizes the REQUEST only. The credit itself is authorized by a second signature over the
+ * quoted payload (`RewardClaimQuote.signMessage`) — see `QNetClient.claimRewards()`.
  */
-export function buildRewardClaimPayload(address: QNetAddress): string {
-  return Buffer.from(`CLAIM_REWARDS:${address}`, 'utf8').toString('hex');
+export function buildRewardClaimPayload(nodeId: string, address: QNetAddress): string {
+  return `claim_rewards:${nodeId}:${address}`;
 }
 
 /**

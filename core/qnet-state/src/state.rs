@@ -11,6 +11,14 @@ use parking_lot::RwLock as ParkingRwLock;
 use once_cell::sync::Lazy;
 use crate::{Account, Block, Transaction, TransactionType, StateError, StateResult, GAS_METERING_ACTIVATION_HEIGHT};
 use sha3::{Sha3_256, Digest};
+
+/// Result of a successful transaction apply. `charged == false` means the arm took its idempotent
+/// already-applied branch: nothing was debited, so the caller must NOT refund unused gas and must NOT
+/// credit the producer for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApplyOutcome {
+    pub charged: bool,
+}
 use tracing::{info, debug, warn, error};
 
 /// v7.0: Gate for including pending_rewards in Merkle hash.
@@ -50,6 +58,13 @@ static CREDITED_FEES_BLOCKS: Lazy<ParkingRwLock<HashSet<u64>>> = Lazy::new(|| {
     ParkingRwLock::new(HashSet::new())
 });
 
+/// CREDITED_FEES_BLOCKS is process-global and the account-wipe primitives clear it wholesale
+/// (correctly — a wipe destroys every credit). Any test that either takes a marker or calls a wipe
+/// must hold this, or the two race inside the single test binary. Test-only serialization; the
+/// production paths need no such lock because they already run under the state write lock.
+#[cfg(test)]
+pub(crate) static MARKER_TEST_LOCK: ParkingRwLock<()> = ParkingRwLock::new(());
+
 /// V2: storage_root of a contract with an empty contract_storage — the root of an empty
 /// StorageMerkleTree (a fixed constant). Account constructors seed this; a real deployed contract
 /// always carries metadata keys, so a contract leaf is never hashed with this in practice — it is a
@@ -74,6 +89,15 @@ pub fn should_credit_fees(block_height: u64) -> bool {
         set.retain(|&h| h >= min_keep);
     }
     true
+}
+
+/// Release the marker for a height whose credit was undone, restoring the invariant
+/// "marker set ⟺ that height's fee credit is live in state". Without it a rolled-back height can
+/// never be re-applied: the credit is skipped, finalize_merkle() misses the producer's fees and the
+/// block mismatches its own state_root deterministically, forever (the 1000-entry eviction cannot
+/// help — a node wedged at h always keeps h). Call ONLY where the credit itself was reversed.
+pub fn release_credited_fees(block_height: u64) -> bool {
+    CREDITED_FEES_BLOCKS.write().remove(&block_height)
 }
 
 /// v3.26: Clear credited fees cache (for testing or reset)
@@ -175,7 +199,20 @@ pub struct StateMerkleTree {
     /// Persistent across finalize calls — enables O(k log N) incremental path
     /// updates instead of O(N log N) full rebuild. Default subtrees stay
     /// implicit (default_hashes[depth]); only branches with ≥1 populated leaf
-    /// occupy this map. Bounded by 2N entries.
+    /// occupy this map.
+    ///
+    /// SIZE — measured, NOT 2N. An earlier "bounded by 2N entries" note here was wrong and it
+    /// mis-sized everything downstream (see the merkle-store auto-threshold). The fold runs all 256
+    /// levels unconditionally, and two random address hashes only converge around depth 256-log2(N);
+    /// below that each leaf is alone with a default sibling, so it carries a PRIVATE chain of stored
+    /// nodes. `tests_smt_node_growth::measure_intermediate_nodes_per_leaf` measures 250.3 nodes/leaf at
+    /// 64 leaves and 244.1 at 4096, tracking 256-log2(N) — about 233/leaf at 10M accounts, i.e. ~2.35e9
+    /// entries (~160 GB) rather than the ~20M the old note implied.
+    ///
+    /// Bringing this to the intended ~2N needs a compressed fold: store a single stub at the level
+    /// where a subtree becomes single-leaf and derive the chain below it on read, instead of
+    /// materialising every level. That changes no root value — only what is stored — but it touches
+    /// recompute_root, recompute_levels, node_get and generate_proof together, so it is its own task.
     pub(crate) intermediate_nodes: HashMap<(u32, [u8; HASH_SIZE]), [u8; HASH_SIZE]>,
     /// v32.14: leaf addresses changed since last finalize. Each one triggers
     /// a single path-walk in finalize. Cleared after recomputation.
@@ -260,6 +297,21 @@ impl StateMerkleTree {
         if self.node_cache_cap == 0 {
             self.node_cache_cap = DEFAULT_NODE_CACHE_CAP;
         }
+    }
+
+    /// Reset to an empty tree WITHOUT dropping the disk-backed node store or its cache cap.
+    ///
+    /// Full-state paths (clear, snapshot restore) used to assign a fresh `StateMerkleTree`, which
+    /// silently detached the store attached at boot — from then on the node held the whole tree in RAM
+    /// (~233 nodes/leaf) and OOMed at scale. Node/leaf rows for the old state are superseded by the
+    /// restore that follows; stale entries are unreachable from the new root and pruned by the store's
+    /// own delete path.
+    pub fn reset_preserving_store(&mut self) {
+        let store = self.node_store.clone();
+        let cap = self.node_cache_cap;
+        *self = Self::new();
+        self.node_store = store;
+        self.node_cache_cap = cap;
     }
 
     /// Override the read-through cache cap (0 = unbounded). No effect unless a
@@ -395,7 +447,7 @@ impl StateMerkleTree {
         // cache that may be empty despite existing accounts) can't spuriously log.
         if self.node_store.is_none() && self.leaves.is_empty() {
             println!("[DBG][MERKLE] first_account addr={} bal={} nonce={} addr_hash={} acct_hash={}",
-                     &address[..20.min(address.len())], account.balance, account.nonce,
+                     crate::char_prefix(&address, 20), account.balance, account.nonce,
                      hex::encode(&addr_hash[..8]), hex::encode(&account_hash[..8]));
         }
 
@@ -818,12 +870,17 @@ impl StateMerkleTree {
         hasher.update(&account.heartbeat_epoch.to_le_bytes());
         hasher.update(&account.heartbeat_slots.to_le_bytes());
         hasher.update(&account.heartbeat_final_epoch.to_le_bytes());
-        hasher.update(&[account.heartbeat_final_count]);
+        hasher.update(&account.heartbeat_final_slots.to_le_bytes());
         // last_claimed_epoch: reward-claim watermark — ALWAYS in leaf hash (fixed schema,
         // same rule as pending_rewards/HB). Anti-replay for merkle claims must be
         // consensus-bound, else nodes diverge on which epochs an account already claimed.
         hasher.update(b"LCE:");
         hasher.update(&account.last_claimed_epoch.to_le_bytes());
+        // banned_at_height: the consensus ban carried in state — ALWAYS in the leaf hash (fixed schema,
+        // same rule as pending_rewards/HB/LCE). Reward eligibility reads it, so it must be
+        // consensus-bound; a conditional inclusion would split running vs rebuilt nodes.
+        hasher.update(b"BAN:");
+        hasher.update(&account.banned_at_height.to_le_bytes());
         // FIX-5 (pk-elision): dilithium_public_key is DELIBERATELY EXCLUDED from the leaf hash. The
         // account `address` (hashed above) already IS a cryptographic commitment to the key —
         // address == format_eon(SHA512(pk)) — so folding the pk in would double-commit the same
@@ -1065,6 +1122,16 @@ pub struct BalanceProof {
     /// the correct Account hash after v7.0 fork (PENDING_REWARDS_IN_MERKLE=true).
     /// Without this, all proofs for accounts with pending_rewards > 0 fail verification.
     pub pending_rewards: u64,
+    /// Every remaining input to the account leaf hash. Without them the light client reconstructs the
+    /// leaf with zeros, so verification is permanently FALSE for any wallet that has ever claimed a
+    /// reward (last_claimed_epoch != 0) or any node that has ever heartbeated. Fixed schema, same rule
+    /// as pending_rewards: always present, never conditional.
+    pub heartbeat_epoch: u64,
+    pub heartbeat_slots: u16,
+    pub heartbeat_final_epoch: u64,
+    pub heartbeat_final_slots: u16,
+    pub last_claimed_epoch: u64,
+    pub banned_at_height: u64,
     /// Merkle proof (sibling_hash, is_right)
     pub proof: Vec<([u8; HASH_SIZE], bool)>,
     /// State root this proof is valid for
@@ -1089,8 +1156,10 @@ pub struct TokenBalanceProof {
     pub heartbeat_epoch: u64,
     pub heartbeat_slots: u16,
     pub heartbeat_final_epoch: u64,
-    pub heartbeat_final_count: u8,
+    pub heartbeat_final_slots: u16,
     pub last_claimed_epoch: u64,
+    /// Consensus ban carried in the leaf — must be reproduced or a banned holder's proof fails.
+    pub banned_at_height: u64,
     pub account_proof: Vec<([u8; HASH_SIZE], bool)>,
     // Level-2: balance:{holder} leaf → storage_root
     pub holder: String,
@@ -1141,6 +1210,13 @@ impl Default for ChainState {
 /// Records pre-images of accounts touched by transactions in this block.
 /// On rollback, restores only those accounts instead of the entire state.
 #[derive(Clone)]
+/// The dedup entry a commitment TX writes. Derived once (`commitment_key_for_tx`) and used by both
+/// the writer and the block journal, so the two can never disagree about what to undo.
+enum CommitmentKey {
+    Epoch { kind: String, sender: String, epoch: u64 },
+    Node { node_id: String, wallet: String },
+}
+
 pub struct BlockSnapshot {
     /// Pre-images of accounts that existed before modification
     pre_images: HashMap<String, Account>,
@@ -1151,6 +1227,24 @@ pub struct BlockSnapshot {
     /// QRC-20 wallet↔token ownership transitions applied this block (NON-consensus reverse-index
     /// deltas). Drained by the persist layer; never restored on rollback (the block is discarded).
     owns: Vec<crate::transaction::OwnsDelta>,
+    /// Chain-level counters captured before the block was applied. They live outside the accounts
+    /// map, so restoring accounts alone leaves a discarded block's minted supply in place — and a
+    /// checkpoint then seals a total_supply the rest of the network does not have.
+    supply_before: Option<(u64, u64)>, // (total_supply, last_minted_emission_mb)
+    /// Pre-images of the commitment-dedup entries this block writes. `None` = the key did not exist
+    /// before, so rollback removes it. Keyed exactly as `committed_epochs` is.
+    commit_epoch_before: HashMap<String, Option<u64>>,
+    /// Pre-images of `registered_nodes` entries this block writes. Same contract.
+    registered_before: HashMap<String, Option<String>>,
+    /// True when THIS apply took the process-global fee-credit marker for `height`. The marker also
+    /// lives outside the accounts map: rollback restores the producer's pre-image but the marker
+    /// would survive, so a re-apply of the same height silently skips the credit and can never
+    /// reproduce the block's state_root. Set only on Ok(true) — an apply that found the marker
+    /// already taken must NOT release another apply's live credit.
+    fee_credit_marked: bool,
+    /// chain_state.height before this block advanced it. Outside the accounts map and not in
+    /// state_root, but it stamps the height into every proof this node serves.
+    chain_height_before: Option<u64>,
 }
 
 impl BlockSnapshot {
@@ -1161,7 +1255,40 @@ impl BlockSnapshot {
             created_keys: HashSet::new(),
             height,
             owns: Vec::new(),
+            supply_before: None,
+            commit_epoch_before: HashMap::new(),
+            registered_before: HashMap::new(),
+            fee_credit_marked: false,
+            chain_height_before: None,
         }
+    }
+
+    /// Counters captured before this block mutated them, if it minted at all.
+    pub fn supply_before(&self) -> Option<(u64, u64)> { self.supply_before }
+
+    /// Capture the chain height before this block advanced it. First write wins.
+    pub fn record_chain_height(&mut self, before: u64) {
+        if self.chain_height_before.is_none() { self.chain_height_before = Some(before); }
+    }
+
+    /// Chain height captured before this block advanced it, if it did.
+    pub fn chain_height_before(&self) -> Option<u64> { self.chain_height_before }
+
+    /// Whether this apply owns the fee-credit marker for `height` and must release it on rollback.
+    pub fn fee_credit_marked(&self) -> bool { self.fee_credit_marked }
+
+    /// Capture the chain-level counters before they are mutated. First write wins, so a block that
+    /// mints more than once still restores the value it started from.
+    pub fn record_supply(&mut self, total_supply: u64, last_minted_emission_mb: u64) {
+        if self.supply_before.is_none() {
+            self.supply_before = Some((total_supply, last_minted_emission_mb));
+        }
+    }
+
+    /// Claim ownership of this height's fee-credit marker. Called by `credit_producer_fees_once`
+    /// only when it actually took the marker.
+    pub fn record_fee_credit_marked(&mut self) {
+        self.fee_credit_marked = true;
     }
 
     /// Record pre-images of addresses that a transaction is about to touch.
@@ -1181,6 +1308,11 @@ impl BlockSnapshot {
                 }
             }
         }
+    }
+
+    /// True once this address is journaled either way (pre-image or created).
+    pub fn has_journal_entry(&self, addr: &str) -> bool {
+        self.pre_images.contains_key(addr) || self.created_keys.contains(addr)
     }
 
     /// Legacy accessor — returns pre-images for rollback
@@ -1447,6 +1579,16 @@ impl StateManager {
     /// Genuinely-absent accounts (no entry on disk either) return false
     /// — they will be created lazily by the apply path when the
     /// transaction targets them.
+    /// Journal pre-images through the disk store. `accounts` is an LRU cache, so classifying a
+    /// resident miss as "created" would make rollback DELETE a live account — warm first, then decide.
+    pub fn journal_pre_images(&self, snap: &mut BlockSnapshot, addresses: &[String]) {
+        for addr in addresses {
+            if snap.has_journal_entry(addr) { continue; }
+            self.warm_account(addr);
+            snap.record_pre_images(std::slice::from_ref(addr), &self.accounts);
+        }
+    }
+
     pub fn warm_account(&self, address: &str) -> bool {
         if self.accounts.contains_key(address) {
             self.cache_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1696,6 +1838,20 @@ impl StateManager {
         self.registered_nodes.insert(node_id.to_string(), wallet_address.to_string());
     }
 
+    /// Drop both commitment-dedup maps. They are DERIVED from block history, not authoritative, so
+    /// any path that rebuilds the chain view from a snapshot must reset them and reseed
+    /// `registered_nodes` from the durable node_registry CF — otherwise the node keeps a dedup
+    /// oracle for a history it no longer has (accepting a duplicate registration other nodes reject)
+    /// or one for history it discarded (rejecting a re-applied registration others accept). Both
+    /// directions diverge registry_root while the accounts state_root still matches, so nothing
+    /// alarms. Deliberately NOT called inside `restore_accounts_streamed`: that primitive is also
+    /// the cold-join path, which reseeds right after, and a reset with no reseed just swaps one
+    /// direction of the bug for the other.
+    pub fn reset_commitment_dedup(&self) {
+        self.committed_epochs.clear();
+        self.registered_nodes.clear();
+    }
+
     /// Cold-join: seed one chain-confirmed node_id->wallet binding into `registered_nodes` from the
     /// snapshot-bound node_registry CF (the integration layer reads the CF and calls this per entry).
     /// Same insert as mark_node_registered; named distinctly so the cold-join rehydrate intent is
@@ -1766,27 +1922,77 @@ impl StateManager {
     
     /// PROTOCOL: After successful apply_to_state, mark this commitment in committed_epochs
     fn mark_commitment_from_tx(&self, tx: &Transaction) {
+        match Self::commitment_key_for_tx(tx) {
+            Some(CommitmentKey::Epoch { kind, sender, epoch }) => {
+                self.mark_epoch_committed(&kind, &sender, epoch);
+            }
+            Some(CommitmentKey::Node { node_id, wallet }) => {
+                self.mark_node_registered(&node_id, &wallet);
+            }
+            None => {} // Non-commitment TXs — nothing to mark
+        }
+    }
+
+    /// The dedup entry a TX would write, if any. SINGLE derivation, shared by the writer above and
+    /// by the block journal below — a rollback that derived the key differently would restore the
+    /// wrong entry and leave the real one set, which is the failure this shares a shape with.
+    fn commitment_key_for_tx(tx: &Transaction) -> Option<CommitmentKey> {
         let epoch_interval: u64 = 14400; // EMISSION_BLOCK_INTERVAL
         match &tx.tx_type {
             TransactionType::HeartbeatCommitment { node_id, window_start_height, .. } => {
-                let epoch = window_start_height / epoch_interval;
-                self.mark_epoch_committed("heartbeat", node_id, epoch);
+                Some(CommitmentKey::Epoch {
+                    kind: "heartbeat".into(), sender: node_id.clone(),
+                    epoch: window_start_height / epoch_interval,
+                })
             }
             TransactionType::PingCommitmentWithSampling { window_start_height, .. } => {
-                let epoch = window_start_height / epoch_interval;
-                self.mark_epoch_committed("ping", &tx.from, epoch);
+                Some(CommitmentKey::Epoch {
+                    kind: "ping".into(), sender: tx.from.clone(),
+                    epoch: window_start_height / epoch_interval,
+                })
             }
             TransactionType::LightNodeEligibilityBitmap { genesis_id, epoch, .. } => {
-                self.mark_epoch_committed("bitmap", genesis_id, *epoch);
+                Some(CommitmentKey::Epoch {
+                    kind: "bitmap".into(), sender: genesis_id.clone(), epoch: *epoch,
+                })
             }
             TransactionType::NodeRegistration { node_id, wallet_address, .. } => {
-                self.mark_node_registered(node_id, wallet_address);
+                Some(CommitmentKey::Node { node_id: node_id.clone(), wallet: wallet_address.clone() })
             }
             TransactionType::NodeReactivation { node_id, last_macroblock_index, .. } => {
                 // v9.4: Mark reactivation to prevent duplicates within same mb-epoch
-                self.mark_epoch_committed("reactivation", node_id, *last_macroblock_index);
+                Some(CommitmentKey::Epoch {
+                    kind: "reactivation".into(), sender: node_id.clone(),
+                    epoch: *last_macroblock_index,
+                })
             }
-            _ => {} // Non-commitment TXs — nothing to mark
+            _ => None,
+        }
+    }
+
+    /// Journal the dedup entry this TX is about to write, so a discarded block does not leave the
+    /// chain marked as having seen a commitment it never committed. These two maps live OUTSIDE the
+    /// accounts map, so an accounts-only rollback cannot reverse them: the re-applied TX is then
+    /// silently skipped as a duplicate, its registry row and registry_root delta are never written,
+    /// and the node's QC-certified registry_root diverges while its state_root still matches — so
+    /// nothing alarms and it drops out of every later quorum.
+    /// Call BEFORE applying the TX, once per TX. First write wins per key.
+    pub fn record_commitment_pre_image(&self, tx: &Transaction, snapshot: &mut BlockSnapshot) {
+        match Self::commitment_key_for_tx(tx) {
+            Some(CommitmentKey::Epoch { kind, sender, .. }) => {
+                let key = format!("{}:{}", kind, sender);
+                if !snapshot.commit_epoch_before.contains_key(&key) {
+                    let prev = self.committed_epochs.get(&key).map(|v| *v);
+                    snapshot.commit_epoch_before.insert(key, prev);
+                }
+            }
+            Some(CommitmentKey::Node { node_id, .. }) => {
+                if !snapshot.registered_before.contains_key(&node_id) {
+                    let prev = self.registered_nodes.get(&node_id).map(|v| v.clone());
+                    snapshot.registered_before.insert(node_id, prev);
+                }
+            }
+            None => {}
         }
     }
     /// Read an account for a QUERY path (get_account / get_balance / proof) with
@@ -1937,6 +2143,12 @@ impl StateManager {
             balance: account.balance,
             nonce: account.nonce,
             pending_rewards: account.pending_rewards,  // FIX R23-C2
+            heartbeat_epoch: account.heartbeat_epoch,
+            heartbeat_slots: account.heartbeat_slots,
+            heartbeat_final_epoch: account.heartbeat_final_epoch,
+            heartbeat_final_slots: account.heartbeat_final_slots,
+            last_claimed_epoch: account.last_claimed_epoch,
+            banned_at_height: account.banned_at_height,
             proof,
             state_root,
             block_height: chain_state.height,
@@ -1993,7 +2205,8 @@ impl StateManager {
             heartbeat_epoch: account.heartbeat_epoch,
             heartbeat_slots: account.heartbeat_slots,
             heartbeat_final_epoch: account.heartbeat_final_epoch,
-            heartbeat_final_count: account.heartbeat_final_count,
+            heartbeat_final_slots: account.heartbeat_final_slots,
+            banned_at_height: account.banned_at_height,
             last_claimed_epoch: account.last_claimed_epoch,
             account_proof,
             holder: holder.to_string(),
@@ -2021,15 +2234,17 @@ impl StateManager {
         // Copy the scalar metadata (O(1)) and DROP the account Ref before taking merkle_tree — never hold
         // an accounts shard lock across the tree lock (matches the apply-path lock order). A non-resident
         // (evicted) contract defers metadata capture to Level-2's off-lock disk read (need_disk=true).
-        let (need_disk, addr, balance, nonce, pending, code_hash, sroot, hb_e, hb_s, hb_fe, hb_fc, lce) =
+        let (need_disk, addr, balance, nonce, pending, code_hash, sroot, hb_e, hb_s, hb_fe, hb_fc, lce, ban_h) =
             match self.accounts.get(contract) {
                 Some(acc) => {
                     if !acc.is_contract { return None; }
                     (false, acc.address.clone(), acc.balance, acc.nonce, acc.pending_rewards,
                      acc.contract_code_hash.clone(), acc.storage_root, acc.heartbeat_epoch, acc.heartbeat_slots,
-                     acc.heartbeat_final_epoch, acc.heartbeat_final_count, acc.last_claimed_epoch)
+                     acc.heartbeat_final_epoch, acc.heartbeat_final_slots, acc.last_claimed_epoch,
+                     acc.banned_at_height)
                 }
-                None => (true, contract.to_string(), 0u64, 0u64, 0u64, None, [0u8; 32], 0u64, 0u16, 0u64, 0u8, 0u64),
+                None => (true, contract.to_string(), 0u64, 0u64, 0u64, None, [0u8; 32], 0u64, 0u16, 0u64, 0u16,
+                         0u64, 0u64),
             };
         let (account_proof, state_root) = {
             let mut tree = self.merkle_tree.write();
@@ -2041,7 +2256,7 @@ impl StateManager {
             contract_address: addr, account_balance: balance, account_nonce: nonce,
             account_pending_rewards: pending, contract_code_hash: code_hash, storage_root: sroot,
             heartbeat_epoch: hb_e, heartbeat_slots: hb_s, heartbeat_final_epoch: hb_fe,
-            heartbeat_final_count: hb_fc, last_claimed_epoch: lce, account_proof,
+            heartbeat_final_slots: hb_fc, last_claimed_epoch: lce, banned_at_height: ban_h, account_proof,
             holder: String::new(), token_balance: String::new(), storage_proof: Vec::new(),
             state_root, block_height: height,
         };
@@ -2086,8 +2301,9 @@ impl StateManager {
             partial.heartbeat_epoch = acc.heartbeat_epoch;
             partial.heartbeat_slots = acc.heartbeat_slots;
             partial.heartbeat_final_epoch = acc.heartbeat_final_epoch;
-            partial.heartbeat_final_count = acc.heartbeat_final_count;
+            partial.heartbeat_final_slots = acc.heartbeat_final_slots;
             partial.last_claimed_epoch = acc.last_claimed_epoch;
+            partial.banned_at_height = acc.banned_at_height;
             acc
         } else {
             let acc = accounts.get(contract)?.clone(); // O(holders) clone, OFF the outer state lock
@@ -2123,11 +2339,12 @@ impl StateManager {
             is_contract: false,
             contract_code_hash: None,
             contract_storage: std::collections::HashMap::new(),
-            heartbeat_epoch: 0,
-            heartbeat_slots: 0,
-            heartbeat_final_epoch: 0,
-            heartbeat_final_count: 0,
-            last_claimed_epoch: 0,
+            heartbeat_epoch: proof.heartbeat_epoch,
+            heartbeat_slots: proof.heartbeat_slots,
+            heartbeat_final_epoch: proof.heartbeat_final_epoch,
+            heartbeat_final_slots: proof.heartbeat_final_slots,
+            last_claimed_epoch: proof.last_claimed_epoch,
+            banned_at_height: proof.banned_at_height,
             // Inert for this native (is_contract=false) reconstruction — the SROOT branch never reads it.
             storage_root: [0u8; 32],
             dilithium_public_key: None, // FIX-5: inert for proof reconstruction (not part of TokenBalanceProof leaf inputs)
@@ -2175,8 +2392,9 @@ impl StateManager {
             heartbeat_epoch: proof.heartbeat_epoch,
             heartbeat_slots: proof.heartbeat_slots,
             heartbeat_final_epoch: proof.heartbeat_final_epoch,
-            heartbeat_final_count: proof.heartbeat_final_count,
+            heartbeat_final_slots: proof.heartbeat_final_slots,
             last_claimed_epoch: proof.last_claimed_epoch,
+            banned_at_height: proof.banned_at_height,
             storage_root: proof.storage_root,
             dilithium_public_key: None, // FIX-5: contract accounts never sign → never bind a pk (None reproduces the leaf)
         };
@@ -2248,23 +2466,35 @@ impl StateManager {
     /// * `Ok(true)` - Fees were credited (first call for this block)
     /// * `Ok(false)` - Fees already credited (subsequent calls - no-op)
     /// * `Err(_)` - Error during crediting
+    ///
+    /// `snapshot` is the block journal; it takes the marker-ownership flag so rollback releases the
+    /// marker exactly when it releases the credit. Passed in rather than set by the caller so a new
+    /// call site cannot silently omit it. `None` = a path with no rollback (producer-inline apply).
     pub fn credit_producer_fees_once(
-        &self, 
+        &self,
         block_height: u64,
-        producer_wallet: &str, 
-        fees: u64
+        producer_wallet: &str,
+        fees: u64,
+        snapshot: Option<&mut BlockSnapshot>,
     ) -> StateResult<bool> {
         if fees == 0 {
             return Ok(false); // No fees to credit
         }
-        
+
         // v3.26: Atomic check-and-mark to prevent race condition
         if !should_credit_fees(block_height) {
             // Already credited by another thread - this is expected behavior
             // when block arrives from multiple peers simultaneously
             return Ok(false);
         }
-        
+        if let Some(snap) = snapshot {
+            snap.record_fee_credit_marked();
+        }
+
+        // Read through the disk store: the producer wallet never appears in a tx, so the apply-path
+        // pre-warm never covers it. Crediting a fresh zero account would drop an evicted producer's
+        // balance and diverge its own state_root from every validator.
+        self.warm_account(producer_wallet);
         // Get or create producer account
         let mut account = self.accounts
             .entry(producer_wallet.to_string())
@@ -2392,20 +2622,20 @@ impl StateManager {
         }
     }
 
-    pub fn apply_transaction_lazy(&self, tx: &Transaction) -> StateResult<()> {
+    pub fn apply_transaction_lazy(&self, tx: &Transaction) -> StateResult<ApplyOutcome> {
         self.apply_transaction_lazy_at(tx, 0)
     }
 
     /// Lazy apply at a known block height, threaded into `apply_to_state_at` so the
     /// WASM host sees the height of the block that contains this TX.
-    pub fn apply_transaction_lazy_at(&self, tx: &Transaction, block_height: u64) -> StateResult<()> {
+    pub fn apply_transaction_lazy_at(&self, tx: &Transaction, block_height: u64) -> StateResult<ApplyOutcome> {
         let mut owns = Vec::new();
         self.apply_transaction_lazy_at_indexed(tx, block_height, &mut owns)
     }
 
     /// Lazy apply that also collects QRC-20 owns-index deltas (wallet↔token 0↔nonzero transitions)
     /// into `owns` so the persist layer maintains the reverse index. owns is NON-consensus.
-    pub fn apply_transaction_lazy_at_indexed(&self, tx: &Transaction, block_height: u64, owns: &mut Vec<crate::transaction::OwnsDelta>) -> StateResult<()> {
+    pub fn apply_transaction_lazy_at_indexed(&self, tx: &Transaction, block_height: u64, owns: &mut Vec<crate::transaction::OwnsDelta>) -> StateResult<ApplyOutcome> {
         // PROTOCOL: Check for duplicate commitment TXs before applying
         // Deterministic: same check on all nodes → same accept/reject decisions
         self.check_duplicate_commitment(tx)?;
@@ -2416,11 +2646,23 @@ impl StateManager {
         // creates balance=0 accounts — if not pre-loaded, existing balances are overwritten
         let mut accounts_map = HashMap::new();
 
+        // Warm through to disk, never cache-only: with eviction enabled an evicted account would be
+        // ABSENT here on one node and present on another, so the same tx would apply differently and
+        // split state_root. warm_account is a cache hit for everything already resident.
         for address in tx.get_all_affected_addresses() {
+            self.warm_account(&address);
             if let Some(acc) = self.accounts.get(&address) {
                 accounts_map.insert(address, acc.clone());
             }
         }
+
+        // Whether this tx will actually be CHARGED — the ONLY safe basis for refunding unused gas or
+        // crediting the producer, because plenty of arms return Ok(()) having debited nothing: a
+        // system-typed arm never charges gas at all (gas_debit), and every value arm short-circuits on
+        // an already-consumed nonce. Evaluated on the same pre-apply accounts the arm sees, so all
+        // nodes agree.
+        let charged = tx.gas_debit() > 0
+            && !accounts_map.get(&tx.from).map_or(false, |s| tx.nonce <= s.nonce);
 
         // Apply transaction
         tx.apply_to_state_at_indexed(&mut accounts_map, block_height, owns)?;
@@ -2446,10 +2688,10 @@ impl StateManager {
         for (address, account) in accounts_map {
             self.accounts.insert(address, account);
         }
-        
-        Ok(())
+
+        Ok(ApplyOutcome { charged })
     }
-    
+
     /// v3.36: Apply gas refund for metered blocks (EIP-1559 style)
     /// Returns unused gas (gas_limit - gas_used) * effective_gas_price to sender.
     /// ACTIVATION: Only for blocks at height >= GAS_METERING_ACTIVATION_HEIGHT.
@@ -2501,19 +2743,21 @@ impl StateManager {
         // (works with local copy, writes to state only on success)
         for tx in transactions {
             match self.apply_transaction_lazy(tx) {
-                Ok(_) => {
+                Ok(outcome) => {
                     applied += 1;
-                    // v3.42: Gas refund for metered blocks (EIP-1559)
                     // Genesis-only batch path (all callers apply height-0 genesis blocks): below the
                     // metering-activation height and carrying no WASM ContractCalls, so no fuel to bill.
-                    let _ = self.apply_gas_refund(tx, block_height, 0);
+                    // Still gated on `charged` — refunding a tx that paid nothing mints QNC.
+                    if outcome.charged {
+                        let _ = self.apply_gas_refund(tx, block_height, 0);
+                    }
                 }
                 Err(e) => {
                     failed += 1;
                     // Log failures (limit spam for large blocks)
                     if failed <= 10 {
                         println!("[WARN][STATE] tx_failed hash={} err={}", 
-                                 &tx.hash[..16.min(tx.hash.len())], e);
+                                 crate::char_prefix(&tx.hash, 16), e);
                     }
                 }
             }
@@ -2571,6 +2815,47 @@ impl StateManager {
         let k_removed = snapshot.created_keys().len();
         let k_restored = snapshot.accounts().len();
 
+        // Chain-level counters first: they are not part of the accounts map, so without this a
+        // discarded block's minted supply survives and a later checkpoint seals a total_supply the
+        // network does not share — the node's votes then fail content comparison for that window.
+        if let Some((supply, emission_mb)) = snapshot.supply_before() {
+            let mut cs = self.chain_state.write();
+            cs.total_supply = supply;
+            cs.last_minted_emission_mb = emission_mb;
+        }
+        // Same class: the height is stamped into every proof this node serves, so a discarded block
+        // would otherwise advertise a height it cannot prove.
+        if let Some(prev) = snapshot.chain_height_before() {
+            self.chain_state.write().height = prev;
+        }
+
+        // Same class as the counters above: the fee-credit marker lives outside the accounts map.
+        // Step 2 below restores the producer's pre-image, so the credit is gone — release the marker
+        // too, or a re-apply of this height skips the credit and can never match its own state_root.
+        // Keyed on the snapshot's own height and gated on THIS apply having taken it, so an apply
+        // that merely found the marker set never releases another apply's live credit.
+        if snapshot.fee_credit_marked() {
+            release_credited_fees(snapshot.height());
+        }
+
+        // Commitment-dedup maps, same class again: not in the accounts map, so restoring accounts
+        // alone leaves this block's marks in place. A re-applied NodeRegistration would then be
+        // dropped as a duplicate with NO state effect — the accounts root still matches, so the
+        // block is accepted, while this node never writes the registry row or its registry_root
+        // delta and silently fails content comparison in every later window.
+        for (key, prev) in &snapshot.commit_epoch_before {
+            match prev {
+                Some(epoch) => { self.committed_epochs.insert(key.clone(), *epoch); }
+                None => { self.committed_epochs.remove(key); }
+            }
+        }
+        for (node_id, prev) in &snapshot.registered_before {
+            match prev {
+                Some(wallet) => { self.registered_nodes.insert(node_id.clone(), wallet.clone()); }
+                None => { self.registered_nodes.remove(node_id); }
+            }
+        }
+
         // 1. Remove accounts created during this block from DashMap
         for addr in snapshot.created_keys() {
             self.accounts.remove(addr);
@@ -2608,11 +2893,14 @@ impl StateManager {
     
     /// v3.38: Clear all state (for Genesis block reset or full replay from genesis)
     pub fn clear(&self) {
+        // Same invariant as restore_accounts_streamed: the fee-credit markers describe credits that
+        // live in the accounts map, so they cannot outlive it.
+        clear_credited_fees_cache();
         self.accounts.clear();
         self.committed_epochs.clear();
         self.registered_nodes.clear();
         let mut tree = self.merkle_tree.write();
-        *tree = StateMerkleTree::new();
+        tree.reset_preserving_store();
         *self.state_root.write() = [0u8; 32];
         self.token_trees.write().clear(); // V2: drop the per-contract storage-tree cache on full reset
     }
@@ -2662,7 +2950,7 @@ impl StateManager {
         // that process MacroBlocks at different times.
 
         println!("[INFO][STATE] pending_rewards_updated wallet={}... amount={} QNC",
-                 &node_wallet[..node_wallet.len().min(16)],
+                 crate::char_prefix(&node_wallet, 16),
                  reward_amount / 1_000_000_000);
 
         Ok(())
@@ -2687,7 +2975,7 @@ impl StateManager {
         }
 
         println!("[INFO][STATE] pending_rewards_accrued wallet={}... delta={} total={} QNC",
-                 &node_wallet[..node_wallet.len().min(16)],
+                 crate::char_prefix(&node_wallet, 16),
                  delta / 1_000_000_000,
                  account.pending_rewards / 1_000_000_000);
 
@@ -2762,13 +3050,21 @@ impl StateManager {
     /// cold-join stream the accounts CF instead of materializing all N accounts in one Vec.
     pub fn restore_accounts_streamed<I>(&self, accounts: I) -> StateResult<[u8; 32]>
     where I: IntoIterator<Item = (String, Account)> {
+        // Wiping the accounts map destroys EVERY live fee credit, so the markers that record them
+        // must go with it — otherwise a re-applied height silently skips its credit and can never
+        // reproduce its own state_root. Released HERE, at the wipe itself, rather than in the
+        // callers: this is the primitive that breaks the invariant, and a caller-side release is
+        // one refactor away from being forgotten (it already missed the rollback-deleted range).
+        // Credits at or below the restored snapshot are re-established by the accounts below, and
+        // the replay above it re-takes its own markers.
+        clear_credited_fees_cache();
         self.accounts.clear();
         self.token_trees.write().clear(); // V2: drop the per-contract storage-tree cache — rebuilds lazily from the restored contract_storage
 
         // Fork flag (PENDING_REWARDS_IN_MERKLE) is left for block replay to activate on a v2-emission
         // block; hashing already always includes those fields, so it does not affect the root here.
         let mut tree = self.merkle_tree.write();
-        *tree = StateMerkleTree::new();
+        tree.reset_preserving_store();
 
         let mut count: usize = 0;
         for (address, account) in accounts {
@@ -2835,6 +3131,12 @@ impl StateManager {
     /// Returns: actual emitted amount in nanoQNC (may be less if MAX_SUPPLY reached)
     /// Idempotent: mints only when `emission_mb` exceeds the watermark, so re-apply,
     /// bulk-sync, or any redundant call path can never double- or under-count supply.
+    /// Current (total_supply, last_minted_emission_mb) — for capturing before a mint.
+    pub fn supply_watermark(&self) -> (u64, u64) {
+        let cs = self.chain_state.read();
+        (cs.total_supply, cs.last_minted_emission_mb)
+    }
+
     pub fn emit_rewards(&self, amount: u64, emission_mb: u64) -> StateResult<u64> {
         let mut chain_state = self.chain_state.write();
 
@@ -3042,6 +3344,7 @@ mod merkle_equiv_tests {
     // i.e. the incremental (live) leaf and a from-scratch rebuild agree on the SROOT contract leaf.
     #[test]
     fn v2_contract_storage_root_swept_and_rebuild_stable() {
+        let _guard = crate::state::MARKER_TEST_LOCK.write();
         use crate::{Transaction, TransactionType};
         let deployer = "deployer_eon_test";
         let mut d = Account::new(deployer.to_string());
@@ -3075,6 +3378,7 @@ mod merkle_equiv_tests {
     // (balance 0) also verifies; tampering the balance, holder, or a level fails.
     #[test]
     fn v2_token_balance_proof_round_trip() {
+        let _guard = crate::state::MARKER_TEST_LOCK.write();
         use crate::{Transaction, TransactionType};
         let deployer = "deployer_eon_tok";
         let mut d = Account::new(deployer.to_string());
@@ -3118,6 +3422,7 @@ mod merkle_equiv_tests {
     // storage_root stale → the SROOT leaf still matches state_root but balances are forged / fork on write).
     #[test]
     fn v2_tampered_contract_storage_snapshot_rejected() {
+        let _guard = crate::state::MARKER_TEST_LOCK.write();
         use crate::{Transaction, TransactionType};
         let deployer = "deployer_eon_bind";
         let mut d = Account::new(deployer.to_string());
@@ -3155,6 +3460,7 @@ mod merkle_equiv_tests {
     // incremental sweep never diverges from truth (a divergence would fork).
     #[test]
     fn v2_incremental_storage_root_equals_from_truth() {
+        let _guard = crate::state::MARKER_TEST_LOCK.write();
         use crate::{Transaction, TransactionType};
         let deployer = "dep_inc";
         let mut d = Account::new(deployer.to_string());
@@ -3229,6 +3535,7 @@ mod merkle_equiv_tests {
     // methods correct it AND commit the identical merkle leaf a from-truth restore would.
     #[test]
     fn v2_update_account_reroutes_contract_through_sweep() {
+        let _guard = crate::state::MARKER_TEST_LOCK.write();
         let mut c = Account::new("tok".to_string());
         c.is_contract = true;
         c.contract_storage.insert("type".to_string(), "qrc20".to_string());
@@ -3263,6 +3570,7 @@ mod merkle_equiv_tests {
     // cache-coherent and cannot fork a later block.
     #[test]
     fn v2_proof_read_path_populate_is_cache_coherent() {
+        let _guard = crate::state::MARKER_TEST_LOCK.write();
         use crate::{Transaction, TransactionType};
         let deployer = "dep_pc";
         let mut d = Account::new(deployer.to_string());
@@ -3311,6 +3619,7 @@ mod merkle_equiv_tests {
     // guarantee for the cold-join streaming rehydrate (no full-Vec allocation → no root drift → no fork).
     #[test]
     fn streamed_restore_root_equals_vec_restore() {
+        let _guard = crate::state::MARKER_TEST_LOCK.write();
         let accts: Vec<(String, Account)> =
             (0..64u64).map(|i| { let a = mk(i); (a.address.clone(), a) }).collect();
 
@@ -4603,3 +4912,246 @@ mod fork_flag_determinism_tests {
     }
 }
 
+
+#[cfg(test)]
+mod tests_smt_node_growth {
+    use super::*;
+
+    /// MEASURES the internal-node count per leaf. The declaration on
+    /// `intermediate_nodes` claims "Bounded by 2N entries"; this pins what the fold actually produces.
+    ///
+    /// Why it matters: the fold runs all TREE_DEPTH=256 levels unconditionally, and two random address
+    /// hashes only converge once the bits still in play can collide — around depth 256-log2(N). Every
+    /// level below that leaves each leaf alone with a default sibling, so each leaf carries a PRIVATE
+    /// chain of ~(256 - log2 N) stored nodes. That is the storage bound, the full-rebuild hash count,
+    /// and the size of the single write buffer a store-backed flush builds.
+    #[test]
+    fn measure_intermediate_nodes_per_leaf() {
+        for n in [64usize, 256, 1024, 4096] {
+            let mut t = StateMerkleTree::new();
+            for i in 0..n {
+                let mut a = Account::new(format!("addr_{:08}", i));
+                a.balance = 1000 + i as u64;
+                t.insert_lazy(&a.address.clone(), &a);
+            }
+            let _ = t.finalize();
+            let nodes = t.intermediate_nodes.len();
+            let per_leaf = nodes as f64 / n as f64;
+            let log2n = (n as f64).log2();
+            println!("[SMT] leaves={} nodes={} per_leaf={:.1} 256-log2(N)={:.1} claimed_bound=2N={}",
+                     n, nodes, per_leaf, 256.0 - log2n, 2 * n);
+            // Pins the MECHANISM, not the defect: the count tracks 256-log2(N) because every level
+            // below convergence stores one node for a leaf that is alone there. A compressed fold
+            // (leaf stubs instead of single-child chains) would bring this to the documented ~2.
+            assert!((per_leaf - (256.0 - log2n)).abs() < 1.0,
+                    "node growth should track 256-log2(N); got {:.1} vs {:.1}", per_leaf, 256.0 - log2n);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests_snapshot_supply_rollback {
+    use super::*;
+
+
+    /// Discarding a block must not leave its minted supply behind. total_supply and the emission
+    /// watermark live outside the accounts map, so an accounts-only rollback would keep the mint
+    /// while dropping its effects — and a later checkpoint would seal a supply the network does
+    /// not share, so the node's votes fail content comparison for that window.
+    #[test]
+    fn rollback_restores_minted_supply() {
+        let state = StateManager::new();
+        let (supply0, mb0) = state.supply_watermark();
+
+        let mut snap = BlockSnapshot::new(&DashMap::new(), 1);
+        snap.record_supply(supply0, mb0);
+
+        let minted = state.emit_rewards(1_000_000, 1).expect("emit");
+        assert!(minted > 0, "test needs a real mint");
+        assert!(state.supply_watermark().0 > supply0, "supply moved");
+
+        state.rollback_block(&snap);
+
+        assert_eq!(state.supply_watermark(), (supply0, mb0),
+                   "a discarded block's mint must be reversed, watermark included");
+    }
+
+    /// Capture is first-write-wins so a block that mints twice still restores its starting value.
+    #[test]
+    fn supply_capture_is_first_write_wins() {
+        let mut snap = BlockSnapshot::new(&DashMap::new(), 1);
+        snap.record_supply(100, 1);
+        snap.record_supply(999, 9);
+        assert_eq!(snap.supply_before(), Some((100, 1)));
+    }
+
+    /// The fee-credit marker is the same class of out-of-accounts state as the supply counters:
+    /// rollback restores the producer's balance, so it must release the marker too. If it did not,
+    /// re-applying that height would skip the credit, finalize_merkle() would miss the fees, and the
+    /// block could never reproduce its own state_root — a permanent, self-perpetuating wedge.
+    ///
+    /// NOTE: the marker set is process-global and the test binary is multi-threaded, so these tests
+    /// use private heights and release exactly those — never clear_credited_fees_cache(), which
+    /// would wipe a concurrently running test's markers.
+    #[test]
+    fn rollback_releases_fee_credit_marker_so_reapply_credits_again() {
+        let _guard = crate::state::MARKER_TEST_LOCK.write();
+        let state = StateManager::new();
+        let h = 991_001u64;
+        let wallet = "fee_rollback_wallet";
+
+        let mut snap = BlockSnapshot::new(&DashMap::new(), h);
+        snap.record_pre_images(&[wallet.to_string()], &state.accounts);
+        assert!(state.credit_producer_fees_once(h, wallet, 500, Some(&mut snap)).unwrap(),
+                "first credit is taken");
+        assert!(snap.fee_credit_marked(), "the apply that took the marker owns it");
+        assert_eq!(state.accounts.get(wallet).map(|a| a.balance), Some(500));
+
+        state.rollback_block(&snap);
+        assert!(state.accounts.get(wallet).is_none(), "credit reversed with the account");
+
+        // Re-apply the same height: the credit must land again.
+        let mut snap2 = BlockSnapshot::new(&DashMap::new(), h);
+        snap2.record_pre_images(&[wallet.to_string()], &state.accounts);
+        assert!(state.credit_producer_fees_once(h, wallet, 500, Some(&mut snap2)).unwrap(),
+                "re-apply must credit — the marker was released with the rollback");
+        assert_eq!(state.accounts.get(wallet).map(|a| a.balance), Some(500));
+        release_credited_fees(h);
+    }
+
+    /// An apply that merely FINDS the marker set does not own it, so its rollback must not release
+    /// another apply's live credit — that would open the double-credit the marker exists to prevent.
+    #[test]
+    fn rollback_does_not_release_a_marker_it_did_not_take() {
+        let _guard = crate::state::MARKER_TEST_LOCK.write();
+        let state = StateManager::new();
+        let h = 991_002u64;
+        let owner = "fee_owner_wallet";
+        let other = "fee_other_wallet";
+
+        // Apply A takes the marker and keeps it (no rollback).
+        let mut snap_a = BlockSnapshot::new(&DashMap::new(), h);
+        assert!(state.credit_producer_fees_once(h, owner, 700, Some(&mut snap_a)).unwrap());
+
+        // Apply B at the same height finds it taken, credits nothing, then rolls back.
+        let mut snap_b = BlockSnapshot::new(&DashMap::new(), h);
+        assert!(!state.credit_producer_fees_once(h, other, 700, Some(&mut snap_b)).unwrap(),
+                "second apply must not credit");
+        assert!(!snap_b.fee_credit_marked(), "it never took the marker");
+        state.rollback_block(&snap_b);
+
+        // A's credit is still the only one, and the marker still guards it.
+        assert!(!should_credit_fees(h), "marker must survive B's rollback");
+        assert_eq!(state.accounts.get(owner).map(|a| a.balance), Some(700));
+        release_credited_fees(h);
+    }
+
+    /// The accounts wipe is what destroys live fee credits, so the markers must not survive it.
+    /// This is the case a caller-side range release missed: fork recovery DELETES blocks above the
+    /// target too, and their credits die in the same wipe, but their markers were left set — the
+    /// first re-applied height above the target then skipped its credit forever.
+    #[test]
+    fn account_wipe_releases_fee_markers() {
+        let _guard = crate::state::MARKER_TEST_LOCK.write();
+        let state = StateManager::new();
+        let h_below = 992_001u64; // inside the replay window
+        let h_above = 992_500u64; // in the rollback-DELETED range — the range a caller-side fix missed
+        for h in [h_below, h_above] {
+            let mut snap = BlockSnapshot::new(&DashMap::new(), h);
+            assert!(state.credit_producer_fees_once(h, "wipe_wallet", 10, Some(&mut snap)).unwrap());
+        }
+
+        // restore_accounts is the fork-recovery wipe: it clears the whole map and reseeds from a
+        // snapshot, so EVERY credit above the snapshot is gone regardless of which range replays.
+        state.restore_accounts(Vec::new()).expect("restore");
+
+        assert!(should_credit_fees(h_below), "replay-window marker released");
+        assert!(should_credit_fees(h_above), "rollback-deleted marker released too");
+        release_credited_fees(h_below);
+        release_credited_fees(h_above);
+    }
+
+    fn commitment_tx(tx_type: crate::transaction::TransactionType) -> Transaction {
+        Transaction::new(
+            "system_test".to_string(), None, 0, 0, 0, 0, 0, None, tx_type, None,
+        )
+    }
+
+    fn bitmap_tx(genesis_id: &str, epoch: u64) -> Transaction {
+        commitment_tx(crate::transaction::TransactionType::LightNodeEligibilityBitmap {
+            genesis_id: genesis_id.to_string(),
+            epoch,
+            total_assigned: 0,
+            eligible_count: 0,
+            bitmap_compressed: Vec::new(),
+        })
+    }
+
+    fn registration_tx(node_id: &str, wallet: &str) -> Transaction {
+        commitment_tx(crate::transaction::TransactionType::NodeRegistration {
+            node_id: node_id.to_string(),
+            node_type: crate::account::NodeType::Super,
+            wallet_address: wallet.to_string(),
+            registration_proof: "genesis".to_string(),
+            api_endpoint: String::new(),
+            burn_tx: String::new(),
+            burn_wallet: String::new(),
+            burn_owner_sig: String::new(),
+            vrf_pk: Vec::new(),
+            burn_amount: 0,
+            burn_cost: 0,
+            burn_attestors: Vec::new(),
+            attest_epoch: 0,
+        })
+    }
+
+    /// The commitment-dedup maps are the same out-of-accounts class as the supply counters and the
+    /// fee marker. Without this, a discarded block leaves the chain marked as having seen a
+    /// commitment it never committed: the re-applied TX is skipped as a duplicate, its registry row
+    /// and registry_root delta are never written, and — because the TX has no account effect — the
+    /// state_root still matches, so the block is accepted and nothing alarms.
+    #[test]
+    fn rollback_restores_commitment_dedup_entries() {
+        let state = StateManager::new();
+
+        // A key with NO prior value must be REMOVED on rollback.
+        let fresh = bitmap_tx("genesis_node_001", 7);
+        let mut snap = BlockSnapshot::new(&DashMap::new(), 500);
+        state.record_commitment_pre_image(&fresh, &mut snap);
+        state.mark_epoch_committed("bitmap", "genesis_node_001", 7);
+        assert!(state.is_epoch_committed("bitmap", "genesis_node_001", 7));
+        state.rollback_block(&snap);
+        assert!(!state.is_epoch_committed("bitmap", "genesis_node_001", 7),
+                "a discarded block must not leave its commitment marked");
+
+        // A key with a PRIOR value must be restored to that value, not removed.
+        state.mark_epoch_committed("bitmap", "genesis_node_002", 3);
+        let bump = bitmap_tx("genesis_node_002", 9);
+        let mut snap2 = BlockSnapshot::new(&DashMap::new(), 501);
+        state.record_commitment_pre_image(&bump, &mut snap2);
+        state.mark_epoch_committed("bitmap", "genesis_node_002", 9);
+        state.rollback_block(&snap2);
+        assert!(state.is_epoch_committed("bitmap", "genesis_node_002", 3), "prior epoch restored");
+        assert!(!state.is_epoch_committed("bitmap", "genesis_node_002", 9), "block's epoch undone");
+    }
+
+    /// Node registration is the case with a consensus consequence: dropped silently, it costs the
+    /// node its registry_root delta while leaving state_root intact.
+    #[test]
+    fn rollback_restores_node_registration_dedup() {
+        let state = StateManager::new();
+        let mut snap = BlockSnapshot::new(&DashMap::new(), 600);
+
+        // Mirrors what the apply path does: journal, then mark.
+        assert!(!state.is_node_registered("node_X"));
+        let reg = registration_tx("node_X", "wallet_X");
+        state.record_commitment_pre_image(&reg, &mut snap);
+        state.mark_node_registered("node_X", "wallet_X");
+        assert!(state.is_node_registered("node_X"));
+
+        state.rollback_block(&snap);
+        assert!(!state.is_node_registered("node_X"),
+                "a discarded registration must be re-appliable, not silently deduped away");
+    }
+
+}

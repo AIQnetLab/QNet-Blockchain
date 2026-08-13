@@ -28,6 +28,10 @@ pub struct CheckpointConsensus {
     votes: HashMap<(u64, Hash), HashMap<NodeId, Vote>>,
     timeouts: HashMap<u64, HashMap<NodeId, TimeoutMsg>>,
     qcs: HashMap<u64, QuorumCertificate>,
+    /// Armed for recovery? PARTICIPATION only — it gates what this node proposes/votes/counts, never
+    /// what is VALID. `on_vote` recomputes the threshold from the live committee, so nothing is
+    /// captured here that `set_committee` could make stale.
+    relaxed: bool,
 }
 
 impl CheckpointConsensus {
@@ -38,7 +42,34 @@ impl CheckpointConsensus {
             high_qc: None, locked_index: 0, committed_index: 0,
             proposals: HashMap::new(), votes: HashMap::new(),
             timeouts: HashMap::new(), qcs: HashMap::new(),
+            relaxed: false,
         }
+    }
+
+    /// Arm/disarm the recovery span. `anchor_cp_index` is the anchor macroblock's checkpoint index;
+    /// the span is the RC_SPAN_INDICES indices strictly above it. Below RELAXED_MIN_COMMITTEE the
+    /// threshold is unchanged, so arming is a no-op there by construction.
+    pub fn set_recovery_span(&mut self, anchor_cp_index: Option<u64>) {
+        self.relaxed = anchor_cp_index.is_some();
+    }
+
+    /// Armed? Index-independent: the span is a range of windows, and a TimeoutCertificate breaks any
+    /// index/window lockstep. The window bound belongs to `verify_v2_macroblock`; this copy gates
+    /// participation only, so a loose answer costs liveness and can never fork.
+    pub fn relaxed_at(&self, _index: u64) -> bool { self.relaxed }
+
+    /// Highest index this replica has voted at. The recovery pin needs it: rewinding the view to a
+    /// position we already voted at would make our own second vote same-index equivocation evidence.
+    pub fn last_voted_index(&self) -> u64 { self.last_voted_index }
+
+    /// Move the view DOWN to `index`. Refused unless provably harmless: strictly above the safety lock
+    /// and above anything we have voted at (no same-index second vote). Unused by the recovery pin
+    /// since it stopped constraining the index; kept as a sound primitive.
+    pub fn rewind_view_to(&mut self, index: u64) -> bool {
+        if index >= self.current_index { return index == self.current_index; }
+        if index <= self.locked_index || index <= self.last_voted_index { return false; }
+        self.current_index = index;
+        true
     }
 
     fn quorum(&self) -> usize { quorum_size(self.committee.len()) }
@@ -62,7 +93,22 @@ impl CheckpointConsensus {
     /// it extends our lock (safety). `parent_hash` = hash(C_{index-1}).
     pub fn on_proposal(&mut self, cp: &Checkpoint, parent_hash: &Hash) -> Vec<Action> {
         if cp.index != self.current_index { return Vec::new(); }
-        if !self.is_leader(cp.index, &cp.proposer, parent_hash) { return Vec::new(); }
+        // Membership replaces leadership for pinned proposals: no TC can form while armed (it is never
+        // relaxed), so a dead leader cannot be rotated around. Safety cost none — two proposals at one
+        // index cannot both be certified without an attributable same-index double-vote. Liveness cost
+        // is NOT one view: with no TC the index cannot advance, so a split wedges it. That is why the
+        // caller's stagger is load-bearing, not an optimisation.
+        // Never vote for a pin we have not armed. The vote signs cp.hash(), which folds the pin, so an
+        // unarmed signature launders an honest quorum into a certificate the receiver evaluates under a
+        // committee and threshold the proposer chose.
+        if cp.recovery_anchor.is_some() && !self.relaxed_at(cp.index) { return Vec::new(); }
+        let pinned = cp.recovery_anchor.is_some();
+        let proposer_ok = if pinned {
+            self.committee.iter().any(|c| c == &cp.proposer)
+        } else {
+            self.is_leader(cp.index, &cp.proposer, parent_hash)
+        };
+        if !proposer_ok { return Vec::new(); }
         let pq_index = cp.parent_qc.as_ref().map(|q| q.index).unwrap_or(0);
         if cp.index > self.last_voted_index && pq_index >= self.locked_index {
             self.proposals.insert((cp.index, cp.hash()), cp.clone());
@@ -78,10 +124,19 @@ impl CheckpointConsensus {
     /// Vote (authenticated). Forms a QC at quorum, then adopts it.
     pub fn on_vote(&mut self, v: &Vote) -> Vec<Action> {
         if self.qcs.contains_key(&v.index) { return Vec::new(); }
+        // Resolved BEFORE the votes borrow. The relaxed threshold applies only when the checkpoint
+        // being voted on ACTUALLY carries the pin — a strict checkpoint at a span index still needs
+        // the strict quorum.
+        let pinned = self.proposals.get(&(v.index, v.checkpoint_hash))
+            .map(|cp| cp.recovery_anchor.is_some()).unwrap_or(false);
+        let q_eff = effective_quorum(self.committee.len(), pinned && self.relaxed_at(v.index));
         let qc_opt = {
             let entry = self.votes.entry((v.index, v.checkpoint_hash)).or_default();
             entry.insert(v.voter.clone(), v.clone());
-            if entry.len() >= quorum_size(self.committee.len()) {
+            // quorum_size(0) == 0: an unset committee would make ONE vote a QC. The other two quorum
+            // sites already guard this; this was the only one that did not.
+            let q = q_eff;
+            if q > 0 && entry.len() >= q {
                 let mut signers: Vec<NodeId> = entry.keys().cloned().collect();
                 signers.sort();
                 let sigs: Vec<Vec<u8>> = signers.iter().map(|s| entry[s].signature.clone()).collect();
@@ -222,33 +277,34 @@ mod tests {
         let vqc = |_: &QuorumCertificate| true;
         let tc = |idx: u64, ts: Vec<TimeoutMsg>| TimeoutCertificate { index: idx, timeouts: ts, high_qc: None };
         // valid: 3 distinct committee timeouts at view 5
-        assert!(tc(5, vec![tmo("n0", 5), tmo("n1", 5), tmo("n2", 5)]).verify(&c, vsig, vqc).is_ok());
+        assert!(tc(5, vec![tmo("n0", 5), tmo("n1", 5), tmo("n2", 5)]).verify(&c, quorum_size(c.len()), vsig, vqc).is_ok());
         // empty timeouts (the attack) → reject
-        assert!(tc(5, vec![]).verify(&c, vsig, vqc).is_err());
+        assert!(tc(5, vec![]).verify(&c, quorum_size(c.len()), vsig, vqc).is_err());
         // below quorum (2 < 3) → reject
-        assert!(tc(5, vec![tmo("n0", 5), tmo("n1", 5)]).verify(&c, vsig, vqc).is_err());
+        assert!(tc(5, vec![tmo("n0", 5), tmo("n1", 5)]).verify(&c, quorum_size(c.len()), vsig, vqc).is_err());
         // non-committee voter → reject
-        assert!(tc(5, vec![tmo("n0", 5), tmo("n1", 5), tmo("n9", 5)]).verify(&c, vsig, vqc).is_err());
+        assert!(tc(5, vec![tmo("n0", 5), tmo("n1", 5), tmo("n9", 5)]).verify(&c, quorum_size(c.len()), vsig, vqc).is_err());
         // duplicate voter → reject
-        assert!(tc(5, vec![tmo("n0", 5), tmo("n0", 5), tmo("n1", 5)]).verify(&c, vsig, vqc).is_err());
+        assert!(tc(5, vec![tmo("n0", 5), tmo("n0", 5), tmo("n1", 5)]).verify(&c, quorum_size(c.len()), vsig, vqc).is_err());
         // a timeout for a different view than the TC → reject
-        assert!(tc(5, vec![tmo("n0", 5), tmo("n1", 5), tmo("n2", 4)]).verify(&c, vsig, vqc).is_err());
+        assert!(tc(5, vec![tmo("n0", 5), tmo("n1", 5), tmo("n2", 4)]).verify(&c, quorum_size(c.len()), vsig, vqc).is_err());
         // bad signature → reject
         let mut bad = tmo("n2", 5); bad.signature = vec![0];
-        assert!(tc(5, vec![tmo("n0", 5), tmo("n1", 5), bad]).verify(&c, vsig, vqc).is_err());
+        assert!(tc(5, vec![tmo("n0", 5), tmo("n1", 5), bad]).verify(&c, quorum_size(c.len()), vsig, vqc).is_err());
         // carried high_qc that fails verification → reject
         let mut tc_hq = tc(5, vec![tmo("n0", 5), tmo("n1", 5), tmo("n2", 5)]);
         tc_hq.high_qc = Some(QuorumCertificate { checkpoint_hash: hh(1), index: 4, signers: vec![], sig_merkle_root: hh(0), sigs: vec![] });
-        assert!(tc_hq.verify(&c, vsig, |_| false).is_err());
+        assert!(tc_hq.verify(&c, quorum_size(c.len()), vsig, |_| false).is_err());
     }
 
     // Build the proposal that `leader(index)` would make, extending `parent_qc`.
     fn propose(c: &[NodeId], index: u64, parent_qc: Option<QuorumCertificate>, parent_hash: Hash) -> Checkpoint {
+        let parent_qc = parent_qc.as_ref().map(QcRef::from);
         let li = leader_index(index, &parent_hash, c.len());
         Checkpoint {
             index, parent_qc, window_head_height: index * 10,
             window_mb_hashes: vec![hh(index as u8)], state_root: hh(index as u8),
-            beacon: hh(0), epoch_commitment: hh(0), reward_root: hh(0), registry_root: hh(0), logs_root: hh(0), dilithium_pk_root: hh(0), total_supply: 0, timestamp: 0, proposer: c[li].clone(), proposer_sig: Vec::new(),
+            beacon: hh(0), epoch_commitment: hh(0), reward_root: hh(0), registry_root: hh(0), logs_root: hh(0), dilithium_pk_root: hh(0), reward_epoch_root: hh(0), total_supply: 0, timestamp: 0, proposer: c[li].clone(), proposer_sig: Vec::new(), recovery_anchor: None,
         }
     }
 
@@ -419,5 +475,156 @@ mod tests {
         assert_eq!(eng.committed_index, 10, "prune never regresses committed_index");
         eng.prune_below(0); // floor 0 is a no-op
         assert_eq!(eng.qcs.len(), 5);
+    }
+
+    // ── RECOVERY RELAXATION (engine) ───────────────────────────────────────────────────────────
+
+    // Build the checkpoint a MEMBER would propose under a pin, at the position the pin fixes.
+    fn propose_pinned(_c: &[NodeId], anchor_cp_index: u64, anchor_cp_head: u64, k: u64,
+                      parent_qc: Option<QuorumCertificate>, proposer: &str) -> Checkpoint {
+        let (index, head) = (anchor_cp_index + k, recovery_window_head(anchor_cp_head, k));
+        Checkpoint {
+            index, parent_qc: parent_qc.as_ref().map(QcRef::from), window_head_height: head,
+            window_mb_hashes: vec![hh(k as u8)], state_root: hh(k as u8),
+            beacon: hh(0), epoch_commitment: hh(0), reward_root: hh(0), registry_root: hh(0),
+            logs_root: hh(0), dilithium_pk_root: hh(0), reward_epoch_root: hh(0), total_supply: 0,
+            timestamp: 0, proposer: proposer.into(), proposer_sig: Vec::new(),
+            recovery_anchor: Some((3, hh(7))),
+        }
+    }
+
+    // 10 members, 4 permanently silent. Under the strict quorum (7) the remaining 6 can never form a
+    // QC — the halt this exists to end. Under the pin the same 6 clear the relaxed quorum (6).
+    #[test]
+    fn engine_relaxed_span_progresses_where_strict_wedges() {
+        let c = committee(10);
+        let live: Vec<NodeId> = c.iter().take(6).cloned().collect();
+        let (anchor_idx, anchor_head) = (3u64, 30u64);
+
+        // STRICT: six votes are one short of quorum_size(10)==7 ⇒ no QC, view never advances.
+        let mut strict = CheckpointConsensus::new("n0".into(), c.clone());
+        strict.current_index = anchor_idx + 1;
+        let cp = propose_pinned(&c, anchor_idx, anchor_head, 1, None, &c[leader_index(anchor_idx + 1, &hh(0), c.len())]);
+        strict.on_proposal(&cp, &hh(0));
+        let mut formed = false;
+        for v in &live {
+            for a in strict.on_vote(&Vote { checkpoint_hash: cp.hash(), index: cp.index, voter: v.clone(), signature: vec![1] }) {
+                if matches!(a, Action::FormedQc(_)) { formed = true; }
+            }
+        }
+        assert!(!formed, "six of ten must NOT reach the strict quorum");
+        assert_eq!(strict.current_index, anchor_idx + 1, "view must not advance");
+
+        // RELAXED: same six votes, same content, pin armed ⇒ QC forms and the view advances.
+        let mut eng = CheckpointConsensus::new("n0".into(), c.clone());
+        eng.current_index = anchor_idx + 1;
+        eng.set_recovery_span(Some(anchor_idx));
+        // relaxed_at is ARMED-ONLY and index-independent by design. The span is a range of WINDOWS,
+        // and a TimeoutCertificate breaks any index/window lockstep, so an index range here would make
+        // the relaxation unusable after one dead leader. The window bound is enforced where it is
+        // authoritative — verify_v2_macroblock, from the certificate's own bytes — and this copy only
+        // gates participation, so a loose answer costs liveness at worst and can never fork.
+        assert!(eng.relaxed_at(anchor_idx + 1));
+        assert!(eng.relaxed_at(anchor_idx + RC_SPAN_INDICES));
+        assert!(eng.relaxed_at(anchor_idx + RC_SPAN_INDICES + 1),
+                "participation must not depend on the index — the window bound is the authority's job");
+        // Under a pin ANY member may propose — no TC can rotate a dead leader while the index is fixed.
+        let non_leader = c.iter().find(|x| *x != &cp.proposer).unwrap().clone();
+        let cp2 = propose_pinned(&c, anchor_idx, anchor_head, 1, None, &non_leader);
+        let acts = eng.on_proposal(&cp2, &hh(0));
+        assert!(matches!(acts.as_slice(), [Action::Vote(_)]), "a member proposal must be votable under a pin");
+        let mut got_qc = false;
+        for v in &live {
+            for a in eng.on_vote(&Vote { checkpoint_hash: cp2.hash(), index: cp2.index, voter: v.clone(), signature: vec![1] }) {
+                if matches!(a, Action::FormedQc(_)) { got_qc = true; }
+            }
+        }
+        assert!(got_qc, "the relaxed quorum must certify");
+        assert_eq!(eng.current_index, anchor_idx + 2, "the view advances into the span");
+
+        // Disarming restores the strict rule immediately — nothing about the span is sticky.
+        eng.set_recovery_span(None);
+        assert!(!eng.relaxed_at(anchor_idx + 1));
+    }
+
+    // A view change and a window advance are DIFFERENT events. A dead leader at the stuck index yields
+    // a TimeoutCertificate — assembled from TIMEOUTS, not votes — so current_index climbs while
+    // next_window() stays put. The pin ties index to window, so its only legal position then sits
+    // BELOW the view and no member can ever propose it. Since no vote was cast at that index (there
+    // was no proposal to vote on — that is why the leader timed out), rewinding onto it is harmless.
+    #[test]
+    fn view_rewinds_onto_the_pin_but_never_over_a_vote_or_a_lock() {
+        let c = committee(10);
+
+        // Dead leader at index 4: two view changes, zero votes ⇒ the rewind is allowed.
+        let mut eng = CheckpointConsensus::new("n0".into(), c.clone());
+        eng.current_index = 6;
+        assert_eq!(eng.last_voted_index(), 0);
+        assert!(eng.rewind_view_to(4));
+        assert_eq!(eng.current_index, 4);
+        // Idempotent when already aligned; never used to jump the view FORWARD.
+        assert!(eng.rewind_view_to(4));
+        assert!(!eng.rewind_view_to(9));
+        assert_eq!(eng.current_index, 4, "rewind must not advance the view");
+
+        // We DID vote at 4 (a proposal existed, quorum just never formed): rewinding back onto 4 would
+        // make our second vote same-index equivocation evidence against us. Refused.
+        let mut voted = CheckpointConsensus::new("n0".into(), c.clone());
+        voted.current_index = 4;
+        let cp = propose(&c, 4, None, hh(0));
+        assert!(matches!(voted.on_proposal(&cp, &hh(0)).as_slice(), [Action::Vote(_)]));
+        assert_eq!(voted.last_voted_index(), 4);
+        voted.current_index = 6;
+        assert!(!voted.rewind_view_to(4), "must not re-open an index we voted at");
+        assert_eq!(voted.current_index, 6);
+
+        // And never below the safety lock: a certified index is final, whatever the pin wants.
+        let mut locked = CheckpointConsensus::new("n0".into(), c.clone());
+        locked.current_index = 9;
+        locked.adopt_qc(&QuorumCertificate {
+            checkpoint_hash: hh(1), index: 5, sig_merkle_root: hh(0), signers: vec![], sigs: vec![],
+        });
+        assert!(!locked.rewind_view_to(4), "must not rewind below the lock");
+        assert!(!locked.rewind_view_to(5), "must not rewind onto the lock either");
+    }
+
+    // A checkpoint WITHOUT the pin, at a span index, still needs the strict quorum: arming must not
+    // relax ordinary traffic that merely happens to fall inside the span.
+    #[test]
+    fn unpinned_checkpoint_in_span_keeps_the_strict_quorum() {
+        let c = committee(10);
+        let mut eng = CheckpointConsensus::new("n0".into(), c.clone());
+        eng.current_index = 4;
+        eng.set_recovery_span(Some(3));
+        let cp = propose(&c, 4, None, hh(0));           // recovery_anchor: None
+        assert!(cp.recovery_anchor.is_none());
+        eng.on_proposal(&cp, &hh(0));
+        let mut formed = false;
+        for v in c.iter().take(6) {
+            for a in eng.on_vote(&Vote { checkpoint_hash: cp.hash(), index: cp.index, voter: v.clone(), signature: vec![1] }) {
+                if matches!(a, Action::FormedQc(_)) { formed = true; }
+            }
+        }
+        assert!(!formed, "an unpinned checkpoint must not borrow the relaxed threshold");
+    }
+
+    // Below the committee floor arming is inert: the threshold is unchanged, so a 5-node genesis
+    // cannot relax anything even with the span set.
+    #[test]
+    fn arming_below_the_floor_changes_nothing() {
+        let c = committee(5);
+        let mut eng = CheckpointConsensus::new("n0".into(), c.clone());
+        eng.current_index = 2;
+        eng.set_recovery_span(Some(1));
+        let cp = propose_pinned(&c, 1, 10, 1, None, &c[0]);
+        eng.on_proposal(&cp, &hh(0));
+        let mut formed = false;
+        for v in c.iter().take(3) {                       // 3 of 5: below quorum_size(5)==4
+            for a in eng.on_vote(&Vote { checkpoint_hash: cp.hash(), index: cp.index, voter: v.clone(), signature: vec![1] }) {
+                if matches!(a, Action::FormedQc(_)) { formed = true; }
+            }
+        }
+        assert!(!formed, "the relaxation must be inert at genesis scale");
+        assert_eq!(relaxed_quorum(5), quorum_size(5));
     }
 }

@@ -13,7 +13,7 @@
 //!
 //! ## Architecture
 //!
-//! ```
+//! ```text
 //! ┌─────────────────────────────────────────────────────────────────┐
 //! │                    QUIC Transport Stack                         │
 //! ├─────────────────────────────────────────────────────────────────┤
@@ -70,7 +70,7 @@ const MAX_RETRY_DELAY_MS: u64 = 2_000;
 const CONNECT_RETRY_DELAY_MS: u64 = 1_000;
 
 /// v2.96: Connect-specific backoff ceiling (30 seconds).
-/// Aligned with production L1 backoff ranges (Avalanche: 1s-60s, CometBFT: 5s-8hrs).
+/// Aligned with production L1 backoff ranges (seconds to hours).
 const CONNECT_MAX_RETRY_DELAY_MS: u64 = 30_000;
 
 /// v2.96: Per-peer reconnect cooldown — minimum seconds between connect() attempts to same addr.
@@ -115,6 +115,9 @@ pub const QUIC_PORT: u16 = 10876;
 /// QUIC port offset from API port (8001 -> 10876)
 /// NOTE: peer.addr contains API port (8001), so offset = 10876 - 8001 = 2875
 pub const QUIC_PORT_OFFSET: u16 = 2875;
+
+/// Handshake frame ceiling. Read BEFORE any authentication, so it must not use the block ceiling.
+pub const MAX_HANDSHAKE_SIZE: usize = 64 * 1024;
 
 /// Maximum message size (10 MB - for macroblocks/block batches)
 pub const MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024;
@@ -190,8 +193,8 @@ const INCOMING_HANDSHAKE_TIMEOUT_SECS: u64 = 5;
 /// v2.96: Three-tier per-IP connection limits (aligned with production L1 patterns).
 ///
 /// Tier 1 — Genesis: unlimited (u32::MAX). Only 5 IPs, hardcoded. Consensus must never
-///   be blocked by rate limiting between genesis nodes. Equivalent to CometBFT
-///   `unconditional_peer_ids` and Polkadot `reserved-nodes`.
+///   be blocked by rate limiting between genesis nodes — the standard reserved/unconditional
+///   peer tier.
 ///
 /// Tier 2 — Known peers: 200. IPs that completed at least one successful QUIC handshake.
 ///   Covers activated super-nodes with burn proof. High limit accommodates cloud hosting
@@ -606,11 +609,42 @@ fn deserialize_handshake(data: &[u8]) -> Result<NodeHandshake, String> {
 ///     cannot be replayed in boot N+1 with a fresh keypair
 ///   - `block_height`: ties the proof to a specific chain epoch and makes
 ///     replay across reorgs detectable at the application layer
-pub fn handshake_challenge_message(node_id: &str, timestamp: u64, block_height: u64) -> String {
+pub fn handshake_challenge_message(
+    node_id: &str,
+    timestamp: u64,
+    block_height: u64,
+    channel_binding: &str,
+) -> String {
     format!(
-        "qnet-quic-handshake-v1:{}:{}:{}",
-        node_id, timestamp, block_height
+        "qnet-quic-handshake-v2:{}:{}:{}:{}",
+        node_id, timestamp, block_height, channel_binding
     )
+}
+
+/// TLS exporter over THIS connection — the channel binding. Both endpoints of one session derive the
+/// identical value, and no other session can reproduce it.
+///
+/// Without it the proof signed only public scalars, so it proved KEY POSSESSION and nothing about the
+/// connection carrying it: a captured proof replayed on a fresh session inside the (timestamp,
+/// block_height) window was indistinguishable from the real peer. Binding it here makes the signature a
+/// statement about this channel, which is also the prerequisite for any receipt that must attest
+/// delivery rather than knowledge.
+pub fn connection_channel_binding(conn: &quinn::Connection) -> Option<String> {
+    let mut out = [0u8; 32];
+    conn.export_keying_material(&mut out, b"qnet-quic-channel-binding-v1", b"")
+        .ok()
+        .map(|_| hex::encode(out))
+}
+
+/// The binding for THIS connection, or refuse the connection. NEVER a default value: if the exporter
+/// were unavailable, both ends would fold the same empty string, the challenge would match, and the
+/// proof would silently degrade to the replayable pre-v2 scheme while still verifying — the one
+/// outcome the binding exists to prevent. quinn only fails the exporter before the handshake
+/// completes, which cannot happen on an established `Connection`, so this is a hard invariant rather
+/// than an expected runtime branch; a failure means refuse, not downgrade.
+fn require_channel_binding(conn: &quinn::Connection) -> Result<String, String> {
+    connection_channel_binding(conn)
+        .ok_or_else(|| "channel_binding_unavailable".to_string())
 }
 
 /// v19: Best-effort generation of a Dilithium3 handshake proof.
@@ -626,12 +660,13 @@ pub async fn build_handshake_proof(
     node_id: &str,
     timestamp: u64,
     block_height: u64,
+    channel_binding: &str,
 ) -> Option<Vec<u8>> {
     let crypto = match crate::node::try_get_quantum_crypto() {
         Some(c) => c,
         None => return None,
     };
-    let challenge = handshake_challenge_message(node_id, timestamp, block_height);
+    let challenge = handshake_challenge_message(node_id, timestamp, block_height, channel_binding);
     match crypto.create_consensus_signature(node_id, &challenge).await {
         Ok(sig) => Some(sig.signature.into_bytes()),
         Err(_) => None,
@@ -659,6 +694,7 @@ pub async fn verify_handshake_proof(
     claimed_node_id: &str,
     timestamp: u64,
     block_height: u64,
+    channel_binding: &str,
     proof: Option<&[u8]>,
 ) -> Result<bool, String> {
     let proof_bytes = match proof {
@@ -691,7 +727,7 @@ pub async fn verify_handshake_proof(
     // PK is in registry — proof MUST verify under it. A failure here is
     // an attempted identity squat (someone produced a fake signature
     // for a known identity).
-    let challenge = handshake_challenge_message(claimed_node_id, timestamp, block_height);
+    let challenge = handshake_challenge_message(claimed_node_id, timestamp, block_height, channel_binding);
     if p2p
         .verify_dilithium_heartbeat_signature_async(&challenge, &proof_str, claimed_node_id)
         .await
@@ -1378,7 +1414,10 @@ impl QuicTransport {
             recv.read_exact(&mut len_buf).await.map_err(|e| format!("Read len failed: {}", e))?;
             let len = u32::from_be_bytes(len_buf) as usize;
 
-            if len > MAX_MESSAGE_SIZE {
+            // Bound the FIRST frame at the handshake's own size, not the 10 MB block ceiling: this read
+            // precedes the IP gate and the signature verify, so `len` is attacker-chosen. A handshake is
+            // node_id + two u64 + an ML-DSA proof (~3.3 KB) + pk (~2 KB).
+            if len > MAX_HANDSHAKE_SIZE {
                 return Err(format!("Handshake too large: {}", len));
             }
 
@@ -1409,10 +1448,14 @@ impl QuicTransport {
             // On Err the connection is aborted — we never reveal our own proof
             // to a peer that supplied a bogus one. On Ok(false) we proceed
             // (Phase 2.A backward compatibility) but emit an audit log.
+            // Derived from OUR end of the same session; the peer signed the identical value from its
+            // end, so a proof captured on any other connection simply will not verify.
+            let peer_binding = require_channel_binding(conn)?;
             match verify_handshake_proof(
                 &peer_handshake.node_id,
                 peer_handshake.timestamp,
                 peer_handshake.block_height,
+                &peer_binding,
                 peer_handshake.dilithium_proof.as_deref(),
             ).await {
                 Ok(true) => {
@@ -1470,10 +1513,14 @@ impl QuicTransport {
                 .as_secs();
             let our_block_height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT
                 .load(std::sync::atomic::Ordering::Relaxed);
+            // Same session both sides derive from, so a proof lifted off another connection cannot
+            // reproduce it.
+            let our_binding = require_channel_binding(conn)?;
             let our_proof = build_handshake_proof(
                 our_node_id,
                 our_timestamp,
                 our_block_height,
+                &our_binding,
             ).await;
 
             // Send our handshake
@@ -2186,10 +2233,12 @@ impl QuicTransport {
                 .as_secs();
             let our_block_height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT
                 .load(std::sync::atomic::Ordering::Relaxed);
+            let our_binding = require_channel_binding(conn)?;
             let our_proof = build_handshake_proof(
                 &self.node_id,
                 our_timestamp,
                 our_block_height,
+                &our_binding,
             ).await;
 
             // Our handshake
@@ -2223,7 +2272,10 @@ impl QuicTransport {
             recv.read_exact(&mut len_buf).await.map_err(|e| format!("Read len failed: {}", e))?;
             let len = u32::from_be_bytes(len_buf) as usize;
 
-            if len > MAX_MESSAGE_SIZE {
+            // Bound the FIRST frame at the handshake's own size, not the 10 MB block ceiling: this read
+            // precedes the IP gate and the signature verify, so `len` is attacker-chosen. A handshake is
+            // node_id + two u64 + an ML-DSA proof (~3.3 KB) + pk (~2 KB).
+            if len > MAX_HANDSHAKE_SIZE {
                 return Err(format!("Handshake too large: {}", len));
             }
 
@@ -2239,10 +2291,12 @@ impl QuicTransport {
             // (Phase 2.A backward compatibility) but logged for audit.
             // verified=true only on Ok(true) (Dilithium proof verified). Ok(false)=advisory admit
             // (PK unknown) → peer is usable for transport but its height must NOT be attested.
+            let peer_binding = require_channel_binding(conn)?;
             let verified = match verify_handshake_proof(
                 &peer_handshake.node_id,
                 peer_handshake.timestamp,
                 peer_handshake.block_height,
+                &peer_binding,
                 peer_handshake.dilithium_proof.as_deref(),
             ).await {
                 Ok(true) => {
@@ -3077,12 +3131,12 @@ mod tests_v19_handshake {
     /// over. Its byte representation MUST stay stable across protocol
     /// versions (sender and receiver each format it locally — any
     /// divergence would silently invalidate every proof). The format
-    /// `qnet-quic-handshake-v1:{node_id}:{timestamp}:{block_height}` is
-    /// load-bearing; this test pins it.
+    /// `qnet-quic-handshake-v2:{node_id}:{timestamp}:{block_height}:{channel_binding}`
+    /// is load-bearing; this test pins it.
     #[test]
     fn challenge_format_is_canonical() {
-        let m = handshake_challenge_message("node_001", 1_700_000_000, 12345);
-        assert_eq!(m, "qnet-quic-handshake-v1:node_001:1700000000:12345");
+        let m = handshake_challenge_message("node_001", 1_700_000_000, 12345, "cb");
+        assert_eq!(m, "qnet-quic-handshake-v2:node_001:1700000000:12345:cb");
     }
 
     /// A v19 sender produces a `NodeHandshake` with `dilithium_proof` set to
@@ -3159,7 +3213,7 @@ mod tests_v19_handshake {
     #[tokio::test]
     async fn verify_returns_ok_false_for_missing_proof() {
         let result =
-            verify_handshake_proof("node_001", 1_700_000_000, 100, None).await;
+            verify_handshake_proof("node_001", 1_700_000_000, 100, "cb", None).await;
         assert!(matches!(result, Ok(false)),
             "expected Ok(false) for missing proof, got {:?}", result);
     }
@@ -3173,7 +3227,7 @@ mod tests_v19_handshake {
     async fn verify_returns_ok_false_for_empty_proof() {
         let empty: &[u8] = &[];
         let result =
-            verify_handshake_proof("node_001", 1_700_000_000, 100, Some(empty)).await;
+            verify_handshake_proof("node_001", 1_700_000_000, 100, "cb", Some(empty)).await;
         assert!(matches!(result, Ok(false)),
             "expected Ok(false) for empty proof, got {:?}", result);
     }
@@ -3188,7 +3242,7 @@ mod tests_v19_handshake {
     async fn verify_returns_err_for_non_utf8_proof() {
         let bad: &[u8] = &[0xC0, 0xC1, 0xF5]; // invalid UTF-8 bytes
         let result =
-            verify_handshake_proof("node_001", 1_700_000_000, 100, Some(bad)).await;
+            verify_handshake_proof("node_001", 1_700_000_000, 100, "cb", Some(bad)).await;
         assert!(result.is_err(), "expected Err for non-UTF-8 proof, got {:?}", result);
     }
 
@@ -3217,6 +3271,7 @@ mod tests_v19_handshake {
             "v19_1_test_unknown_identity_must_admit",
             1_700_000_000,
             100,
+            "cb",
             Some(fake_proof),
         ).await;
         assert!(
@@ -3224,5 +3279,63 @@ mod tests_v19_handshake {
             "unknown identity with attached proof MUST advisory-admit (Ok(false)), got {:?}",
             result
         );
+    }
+
+    /// The channel binding is the one part of the v2 challenge never sent on the wire: each
+    /// side derives it from its own end of the same session. Asymmetry would be catastrophic,
+    /// not degraded — between two peers whose PKs ARE registered, a mismatch makes the proof
+    /// fail and `verify_handshake_proof` returns `Err`, which drops the connection. Every such
+    /// pair would partition. This raises a real loopback session with the production TLS
+    /// configuration (aws-lc-rs, TLS 1.3, ALPN qnet-p2p-v1) and pins the symmetry.
+    #[tokio::test]
+    async fn channel_binding_matches_on_both_ends() {
+        let cert = rcgen::generate_simple_self_signed(vec!["qnet-test".to_string()]).unwrap();
+        let cert_der = CertificateDer::from(cert.serialize_der().unwrap());
+        let key_der = PrivateKeyDer::Pkcs8(cert.get_key_pair().serialize_der().into());
+
+        let mut server_crypto = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+            .with_protocol_versions(&[&rustls::version::TLS13]).unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der], key_der).unwrap();
+        server_crypto.alpn_protocols = vec![b"qnet-p2p-v1".to_vec()];
+        let server_config = ServerConfig::with_crypto(Arc::new(
+            quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto).unwrap(),
+        ));
+        let server = Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = server.local_addr().unwrap();
+
+        let mut client_crypto = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+            .with_protocol_versions(&[&rustls::version::TLS13]).unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(SelfSignedCertVerifier))
+            .with_no_client_auth();
+        client_crypto.alpn_protocols = vec![b"qnet-p2p-v1".to_vec()];
+        let client_config = ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto).unwrap(),
+        ));
+        let mut client = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client.set_default_client_config(client_config);
+
+        let accepting = tokio::spawn(async move {
+            let incoming = server.accept().await.expect("no inbound connection");
+            incoming.await.expect("server handshake failed")
+        });
+        let client_conn = client
+            .connect(addr, "qnet-node").unwrap()
+            .await.expect("client handshake failed");
+        let server_conn = accepting.await.unwrap();
+
+        let from_client = connection_channel_binding(&client_conn)
+            .expect("client end could not export keying material");
+        let from_server = connection_channel_binding(&server_conn)
+            .expect("server end could not export keying material");
+
+        assert_eq!(from_client, from_server, "both ends must derive an identical binding");
+        assert_eq!(from_client.len(), 64, "binding is 32 bytes, hex-encoded");
+        assert_ne!(from_client, hex::encode([0u8; 32]), "binding must not be all-zero");
     }
 }

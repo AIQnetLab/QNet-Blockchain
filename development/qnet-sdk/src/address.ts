@@ -7,7 +7,7 @@
 // Checksum = SHA3-256(version || body)[0..4] encoded as 4-byte hex
 // ─────────────────────────────────────────────────────────────────────────────
 
-const ADDRESS_BODY_BYTES   = 20;  // 20 raw bytes (like Ethereum)
+const ADDRESS_BODY_BYTES   = 20;  // 20 raw bytes
 const CHECKSUM_BYTES       = 4;
 const ADDRESS_VERSION      = 0x19; // "eon" prefix encoding byte
 

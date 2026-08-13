@@ -10,6 +10,25 @@ use hex;
 /// Block hash type
 pub type BlockHash = [u8; 32];
 
+/// Fixed-width fold of an optional VRF output: 1 tag byte + 32 bytes, ALWAYS. A bare `if let Some`
+/// would leave the preimage ambiguous — absent and present-as-zeros would collide.
+///
+/// Sole caller is the EQUIVOCATION identity key. `MicroBlock::hash` deliberately excludes vrf_output
+/// (it is consensus-inert), so equivocation evidence still distinguishes two bodies that differ only
+/// in that field, while block identity does not.
+pub fn fold_vrf_output(hasher: &mut Sha3_256, vrf_output: &Option<[u8; 32]>) {
+    match vrf_output {
+        Some(v) => {
+            hasher.update([1u8]);
+            hasher.update(v);
+        }
+        None => {
+            hasher.update([0u8]);
+            hasher.update([0u8; 32]);
+        }
+    }
+}
+
 /// Block type enum for micro/macro architecture
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum BlockType {
@@ -40,10 +59,6 @@ pub struct MicroBlock {
     pub previous_hash: [u8; 32],
     /// Merkle root of transactions
     pub merkle_root: [u8; 32],
-    /// Verifiable Time Sequence hash at block creation
-    pub poh_hash: Vec<u8>,  // SHA3-512 produces 64 bytes
-    /// Verifiable Time Sequence counter at block creation
-    pub poh_count: u64,
     
     // ═══════════════════════════════════════════════════════════════════════════
     // v4.0: DILITHIUM3-VRF OUTPUT + PROOF (dual purpose)
@@ -142,10 +157,6 @@ pub struct MacroBlock {
     pub consensus_data: ConsensusData,
     /// Previous macroblock hash
     pub previous_hash: [u8; 32],
-    /// Verifiable Time Sequence hash at macroblock finalization
-    pub poh_hash: Vec<u8>,  // SHA3-512 produces 64 bytes
-    /// Verifiable Time Sequence counter at macroblock finalization
-    pub poh_count: u64,
 }
 
 /// Consensus data for macroblocks
@@ -260,6 +271,11 @@ pub struct ConsensusData {
     /// Recorded ONLY in EMISSION MacroBlocks (every 160th = 4 hours)
     /// v3.18: Pool 2 removed - fees go directly to block producer (always 0)
     /// All nodes use this SAME value for deterministic reward calculation
+    /// CONSENSUS DEPENDENCY: the emission-amount gate (node.rs expected_emission_amount) assumes
+    /// this is never written, so the expected amount is pure height arithmetic that every node
+    /// can check without loading this macroblock. If it is ever populated, that gate must read
+    /// the macroblock again AND handle its absence explicitly — a node that has pruned or never
+    /// synced it would otherwise compute a wrong expectation and reject an HONEST block.
     #[serde(default)]
     pub pool2_total_fees: Option<u64>,
     
@@ -280,6 +296,11 @@ pub struct ConsensusData {
     /// Distribution: Equal share to ALL eligible nodes (Light + Full + Super)
     /// Phase 1: Always None (Pool 3 disabled, 1DEV burn instead)
     /// Phase 2: Sum of all node activation QNC payments
+    /// CONSENSUS DEPENDENCY: the emission-amount gate (node.rs expected_emission_amount) assumes
+    /// this is never written, so the expected amount is pure height arithmetic that every node
+    /// can check without loading this macroblock. If it is ever populated, that gate must read
+    /// the macroblock again AND handle its absence explicitly — a node that has pruned or never
+    /// synced it would otherwise compute a wrong expectation and reject an HONEST block.
     #[serde(default)]
     pub pool3_total_activations: Option<u64>,
     
@@ -437,11 +458,6 @@ pub struct EfficientMicroBlock {
     pub previous_hash: [u8; 32],
     /// Merkle root of transaction hashes
     pub merkle_root: [u8; 32],
-    /// Verifiable Time Sequence hash at block creation (SHA3-512 produces 64 bytes)
-    pub poh_hash: Vec<u8>,
-    /// Verifiable Time Sequence counter at block creation
-    pub poh_count: u64,
-    
     // ═══════════════════════════════════════════════════════════════════════════
     // QUANTUM RANDOMNESS BEACON (QRB) v3.0
     // ═══════════════════════════════════════════════════════════════════════════
@@ -505,7 +521,6 @@ pub struct LightMicroBlock {
 // Architecture principles:
 // 1. First byte indicates version/format
 // 2. All formats can be converted to full MicroBlock when needed
-// 3. PoH state is stored separately for fast validation
 // ============================================================================
 
 /// Storage format version markers
@@ -570,25 +585,6 @@ impl StoredMicroBlock {
         }
     }
     
-    /// Get PoH state if available (not available for Light format)
-    pub fn poh_state(&self) -> Option<PoHState> {
-        match self {
-            StoredMicroBlock::V1Full(b) => Some(PoHState {
-                height: b.height,
-                poh_hash: b.poh_hash.clone(),
-                poh_count: b.poh_count,
-                previous_hash: b.previous_hash,
-            }),
-            StoredMicroBlock::V2Efficient(b) => Some(PoHState {
-                height: b.height,
-                poh_hash: b.poh_hash.clone(),
-                poh_count: b.poh_count,
-                previous_hash: b.previous_hash,
-            }),
-            StoredMicroBlock::V3Light(_) => None, // Light nodes don't store PoH
-        }
-    }
-    
     /// Check if this format can provide full transaction data
     pub fn has_full_transactions(&self) -> bool {
         matches!(self, StoredMicroBlock::V1Full(_))
@@ -636,87 +632,6 @@ impl StoredMicroBlock {
     }
 }
 
-/// VTS (Verifiable Time Sequence) state for a block
-/// Stored separately for fast validation without loading full block
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct PoHState {
-    /// Block height this PoH state belongs to
-    pub height: u64,
-    /// PoH hash at block creation (SHA3-512, 64 bytes)
-    pub poh_hash: Vec<u8>,
-    /// PoH counter at block creation
-    pub poh_count: u64,
-    /// Previous block hash (for chain verification)
-    pub previous_hash: [u8; 32],
-}
-
-impl PoHState {
-    /// Create new PoH state
-    pub fn new(height: u64, poh_hash: Vec<u8>, poh_count: u64, previous_hash: [u8; 32]) -> Self {
-        Self {
-            height,
-            poh_hash,
-            poh_count,
-            previous_hash,
-        }
-    }
-    
-    /// Create from MicroBlock
-    pub fn from_microblock(block: &MicroBlock) -> Self {
-        Self {
-            height: block.height,
-            poh_hash: block.poh_hash.clone(),
-            poh_count: block.poh_count,
-            previous_hash: block.previous_hash,
-        }
-    }
-    
-    /// Create from EfficientMicroBlock
-    pub fn from_efficient(block: &EfficientMicroBlock) -> Self {
-        Self {
-            height: block.height,
-            poh_hash: block.poh_hash.clone(),
-            poh_count: block.poh_count,
-            previous_hash: block.previous_hash,
-        }
-    }
-    
-    /// Validate PoH progression from previous state
-    /// Returns Ok(()) if valid, Err with reason if invalid
-    pub fn validate_progression(&self, prev: &PoHState) -> Result<(), String> {
-        // Height must be exactly one more than previous
-        if self.height != prev.height + 1 {
-            return Err(format!(
-                "Invalid height progression: expected {}, got {}",
-                prev.height + 1, self.height
-            ));
-        }
-        
-        // PoH count must be greater than previous (monotonic increase)
-        // Allow some tolerance for network delays (30 seconds max)
-        // 15M hashes at 500K/sec = 30 seconds < 90 sec macroblock interval
-        const MAX_ACCEPTABLE_REGRESSION: u64 = 15_000_000; // ~30 seconds at 500K/sec
-        
-        if self.poh_count <= prev.poh_count {
-            let regression = prev.poh_count - self.poh_count;
-            if regression > MAX_ACCEPTABLE_REGRESSION {
-                return Err(format!(
-                    "Severe PoH regression: {} <= {} (diff: {})",
-                    self.poh_count, prev.poh_count, regression
-                ));
-            }
-            // Minor regression is acceptable due to network delays
-        }
-        
-        Ok(())
-    }
-    
-    /// Check if PoH data is valid (non-empty)
-    pub fn is_valid(&self) -> bool {
-        !self.poh_hash.is_empty() && self.poh_count > 0
-    }
-}
-
 /// Block in the blockchain
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Block {
@@ -734,12 +649,6 @@ pub struct Block {
     pub producer: String,
     /// Producer's signature
     pub signature: Vec<u8>,
-    /// Verifiable Time Sequence hash (VTS/PoH)
-    #[serde(default)]
-    pub poh_hash: Vec<u8>,
-    /// Verifiable Time Sequence counter
-    #[serde(default)]
-    pub poh_count: u64,
     /// Block type indicator
     #[serde(default)]
     pub block_type: String,
@@ -790,8 +699,6 @@ impl Block {
             transactions,
             producer,
             signature: vec![],
-            poh_hash: vec![],
-            poh_count: 0,
             block_type: String::new(),
         }
     }
@@ -809,7 +716,7 @@ impl Block {
                 let hash_str = tx.calculate_hash();
                 let hash_bytes = hex::decode(&hash_str).unwrap_or_else(|_| vec![0u8; 32]);
                 let mut hash_array = [0u8; 32];
-                hash_array.copy_from_slice(&hash_bytes[..32.min(hash_bytes.len())]);
+                hash_array.copy_from_slice(&hash_bytes[..32.min(hash_bytes.len())]); // bytes, not str
                 hash_array
             })
             .collect();
@@ -893,10 +800,7 @@ impl MicroBlock {
             signature: vec![],
             previous_hash,
             merkle_root,
-            // Default PoH values for backward compatibility
-            poh_hash: vec![0u8; 64], // SHA3-512 produces 64 bytes
-            poh_count: 0,
-            // QRB v3.0: VRF fields (None for legacy/compatibility)
+            // VRF fields are consensus-inert (outside MicroBlock::hash and the beacon).
             vrf_output: None,
             vrf_proof: None,
             // v3.18: Direct fee collection (default 0)
@@ -932,7 +836,10 @@ impl MicroBlock {
         // Bind the carried rotation baseline: absolute round = timeout_round + carried_baseline, so
         // the reconstructed round is a property of the committed bytes (node-independent).
         hasher.update(&self.carried_baseline.to_le_bytes());
-
+        // vrf_output is NOT folded. It was, to stop two bodies with one hash carrying different beacon
+        // contributions — but the window beacon no longer reads it (it folds block hashes, which are
+        // QC-signed in window_mb_hashes), so the field is consensus-inert and binding it would only let
+        // a producer grind block identity for free.
         let result = hasher.finalize();
         let mut hash = [0u8; 32];
         hash.copy_from_slice(&result);
@@ -1005,8 +912,6 @@ impl EfficientMicroBlock {
             signature: vec![],
             previous_hash,
             merkle_root,
-            poh_hash: vec![],
-            poh_count: 0,
             // QRB v3.0: VRF fields (None for legacy/compatibility)
             vrf_output: None,
             vrf_proof: None,
@@ -1060,8 +965,6 @@ impl EfficientMicroBlock {
             signature: microblock.signature.clone(),
             previous_hash: microblock.previous_hash,
             merkle_root: microblock.merkle_root,
-            poh_hash: microblock.poh_hash.clone(),
-            poh_count: microblock.poh_count,
             // QRB v3.0: Copy VRF fields from source microblock
             vrf_output: microblock.vrf_output,
             vrf_proof: microblock.vrf_proof.clone(),
@@ -1113,6 +1016,8 @@ impl EfficientMicroBlock {
         hasher.update(&self.timeout_round.to_le_bytes());
         // MUST stay byte-identical to MicroBlock::hash: bind carried_baseline (see MicroBlock::hash).
         hasher.update(&self.carried_baseline.to_le_bytes());
+        // MUST stay byte-identical to MicroBlock::hash: bind the beacon contribution.
+        // vrf_output is consensus-inert; see MicroBlock::hash.
 
         let result = hasher.finalize();
         let mut hash = [0u8; 32];
@@ -1188,9 +1093,6 @@ impl MacroBlock {
             state_root,
             consensus_data,
             previous_hash,
-            // Default PoH values for backward compatibility
-            poh_hash: vec![0u8; 64], // SHA3-512 produces 64 bytes
-            poh_count: 0,
         }
     }
     
@@ -1253,3 +1155,54 @@ impl MacroBlock {
     }
 }
 
+#[cfg(test)]
+mod block_identity_tests {
+    use super::*;
+
+    fn mb(vrf: Option<[u8; 32]>) -> MicroBlock {
+        let mut b = MicroBlock::new(7, 1_700_000_000, [9u8; 32], vec![], "producer_1".into());
+        b.timeout_round = 2;
+        b.carried_baseline = 3;
+        b.vrf_output = vrf;
+        b
+    }
+
+    fn efficient_from(b: &MicroBlock) -> EfficientMicroBlock {
+        EfficientMicroBlock {
+            height: b.height,
+            timestamp: b.timestamp,
+            transaction_hashes: vec![],
+            producer: b.producer.clone(),
+            signature: b.signature.clone(),
+            previous_hash: b.previous_hash,
+            merkle_root: b.merkle_root,
+            vrf_output: b.vrf_output,
+            vrf_proof: b.vrf_proof.clone(),
+            fees_collected: b.fees_collected,
+            state_root: b.state_root,
+            timeout_round: b.timeout_round,
+            carried_baseline: b.carried_baseline,
+        }
+    }
+
+    /// vrf_output is OUTSIDE block identity, and must stay outside. It was folded in when the window
+    /// beacon read it; the beacon now folds block hashes, so folding it back would only hand a
+    /// producer a free knob to grind block identity — and through it the beacon.
+    #[test]
+    fn vrf_output_is_outside_block_identity() {
+        let base = mb(None).hash();
+        for v in [Some([0u8; 32]), Some([1u8; 32]), Some([2u8; 32]), Some([0xFFu8; 32])] {
+            assert_eq!(mb(v).hash(), base, "vrf_output={:?} changed block identity", v);
+        }
+    }
+
+    /// EfficientMicroBlock is the same block read through a different type. If the two digests drift,
+    /// the storage anti-fork guard compares hashes across read paths and sees a phantom fork.
+    #[test]
+    fn efficient_hash_mirrors_microblock_hash() {
+        for v in [None, Some([0u8; 32]), Some([7u8; 32])] {
+            let b = mb(v);
+            assert_eq!(b.hash(), efficient_from(&b).hash(), "digests drifted for vrf_output={:?}", v);
+        }
+    }
+}

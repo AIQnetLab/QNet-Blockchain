@@ -22,14 +22,15 @@ pub mod wasm_exec;         // Smart-contract WASM execution for apply (P3, GATED
 mod python_bindings;
 
 pub use account::{Account, AccountState, NodeType};
-pub use block::{Block, BlockHeader, ConsensusProof, BlockType, MicroBlock, MacroBlock, ConsensusData, LightMicroBlock, BlockHash, EfficientMicroBlock, StoredMicroBlock, PoHState, storage_version, EligibleProducer, RewardHeartbeat, HeartbeatSummary, ExcludedProducerEntry};
+pub use block::{Block, BlockHeader, ConsensusProof, BlockType, MicroBlock, MacroBlock, ConsensusData, LightMicroBlock, BlockHash, EfficientMicroBlock, StoredMicroBlock, storage_version, EligibleProducer, RewardHeartbeat, HeartbeatSummary, ExcludedProducerEntry};
 pub use transaction::{Transaction, TransactionReceipt, TransactionType, EquivocationHeader, gas_limits, PingSampleData, HeartbeatSampleData, ShardHeartbeatSummary, GAS_METERING_ACTIVATION_HEIGHT, MAX_CONTRACT_STORAGE_ENTRIES, DynamicGasPricing, init_dynamic_gas_pricing, update_dynamic_gas_pricing, get_dynamic_gas_pricing, OwnsDelta};
 pub use state_db::StateDB;
 pub use state_manager::StateManager;
 pub use errors::{StateError, StateResult};
 pub use state::{StateManager as State, MAX_QNC_SUPPLY, MAX_QNC_SUPPLY_NANO, StateMerkleTree, BalanceProof, TokenBalanceProof};
 // v3.26: Atomic fee crediting protection
-pub use state::{should_credit_fees, clear_credited_fees_cache, credited_fees_count};
+pub use state::{should_credit_fees, clear_credited_fees_cache, credited_fees_count,
+                release_credited_fees};
 // v3.39: Block-level snapshot for state_root mismatch recovery
 pub use state::BlockSnapshot;
 // v7.0: Fork gate for pending_rewards in Merkle hash
@@ -75,3 +76,10 @@ pub trait StateBackend {
 }
 
 // StateManager moved to state_manager.rs module 
+
+/// Char-safe prefix: the first `n` CHARS of `s`. Byte-slicing a string that came from the network
+/// panics when the index lands mid-UTF-8, and the release profile aborts, so one crafted request
+/// would kill the node. Identical to `&s[..n]` for ASCII.
+pub fn char_prefix(s: &str, n: usize) -> &str {
+    match s.char_indices().nth(n) { Some((i, _)) => &s[..i], None => s }
+}

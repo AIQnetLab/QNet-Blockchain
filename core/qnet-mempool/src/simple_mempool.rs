@@ -340,7 +340,7 @@ impl SimpleMempool {
             Ok(tx) => tx,
             Err(e) => {
                 eprintln!("[ERR][MEMPOOL] parse_failed hash={} error={}",
-                         &hash[..16.min(hash.len())], e);
+                         qnet_state::char_prefix(&hash, 16), e);
                 return false;
             }
         };
@@ -361,7 +361,16 @@ impl SimpleMempool {
         // System TXs are treated as highest priority for eviction purposes
         // (effective_priority = u64::MAX) so a spam flood of user TXs
         // cannot starve protocol bootstrap.
-        let effective_priority = if is_system { u64::MAX } else { gas_price };
+        // A merkle reward-claim keeps the min-fee bypass but NOT the consensus lane: at u64::MAX it
+        // would be packed ahead of every paying transaction. Floor priority instead — above free spam,
+        // below anyone who paid.
+        let effective_priority = if parsed_tx.is_merkle_reward_claim() {
+            self.config.min_gas_price
+        } else if is_system {
+            u64::MAX
+        } else {
+            gas_price
+        };
         if self.transactions.len() >= self.config.max_size {
             let mut priority_queue = self.by_gas_price.write();
             if let Some(mut lowest_entry) = priority_queue.first_entry() {
@@ -375,12 +384,33 @@ impl SimpleMempool {
                         }
                         self.transactions.remove(&tx_hash);
                         self.tx_timestamps.remove(&tx_hash);
+                        // Release the evicted tx's quota slot too: every other removal path is gated
+                        // on transactions.remove() succeeding, which is already false by here, so
+                        // without this the counter and tx_sender_map grow forever and eventually lock
+                        // the victim's wallet out of the mempool entirely.
+                        self.decrement_sender_for_hash(&tx_hash);
                         // v15.5: keep commitment dedup tables proportional to
                         // live mempool occupancy when low-priority eviction
                         // drops a commitment-class TX.
                         self.cleanup_commitment_indices_for_hash(&tx_hash);
                         println!("[INFO][MEMPOOL] evicted_low_priority gas={} for_new_gas={} new_is_system={}",
                                  lowest_gas, effective_priority, is_system);
+                    }
+                } else if parsed_tx.is_merkle_reward_claim() && lowest_gas <= self.config.min_gas_price {
+                    // A claim sits AT the floor, so `>` can never displace another floor entry. Rewards
+                    // must stay claimable under load, so let a claim take a floor slot on equal terms;
+                    // it cannot displace anyone who actually paid.
+                    if let Some(tx_hash) = lowest_entry.get().front().cloned() {
+                        lowest_entry.get_mut().pop_front();
+                        if lowest_entry.get().is_empty() {
+                            lowest_entry.remove();
+                        }
+                        self.transactions.remove(&tx_hash);
+                        self.tx_timestamps.remove(&tx_hash);
+                        self.decrement_sender_for_hash(&tx_hash);
+                        self.cleanup_commitment_indices_for_hash(&tx_hash);
+                    } else {
+                        return false;
                     }
                 } else {
                     println!("[WARN][MEMPOOL] pool_full size={} rejected_gas={} system={}",
@@ -408,7 +438,7 @@ impl SimpleMempool {
         let computed_hash = format!("{:x}", Sha3_256::digest(&canonical_bytes));
         if computed_hash != hash {
             eprintln!("[ERR][MEMPOOL] hash_mismatch expected={} got={}",
-                     &hash[..16.min(hash.len())], &computed_hash[..16.min(computed_hash.len())]);
+                     qnet_state::char_prefix(&hash, 16), qnet_state::char_prefix(&computed_hash, 16));
             return false;
         }
 
@@ -424,8 +454,8 @@ impl SimpleMempool {
             if self.is_commitment_already_on_chain(key) {
                 println!(
                     "[INFO][MEMPOOL] admission_rejected_already_on_chain id={} epoch={} type={} hash={}",
-                    &key.0[..16.min(key.0.len())], key.1, key.2,
-                    &hash[..16.min(hash.len())]
+                    qnet_state::char_prefix(&key.0, 16), key.1, key.2,
+                    qnet_state::char_prefix(&hash, 16)
                 );
                 return false;
             }
@@ -442,20 +472,20 @@ impl SimpleMempool {
         if let Some(ref key) = commitment_key {
             if let Some(old_hash) = self.replace_or_register_commitment(key.clone(), &hash) {
                 println!("[INFO][MEMPOOL] commitment_replaced id={} epoch={} type={} old={} new={}",
-                         &key.0[..16.min(key.0.len())], key.1, key.2,
-                         &old_hash[..16.min(old_hash.len())],
-                         &hash[..16.min(hash.len())]);
+                         qnet_state::char_prefix(&key.0, 16), key.1, key.2,
+                         qnet_state::char_prefix(&old_hash, 16),
+                         qnet_state::char_prefix(&hash, 16));
             }
         }
 
         // FIX L-M9: Per-sender limit defense-in-depth
         if !parsed_tx.from.is_empty() {
             let mut sender_count = self.tx_count_by_sender
-                .entry(parsed_tx.from.clone())
+                .entry(Self::quota_key(&parsed_tx))
                 .or_insert(0);
             if *sender_count >= self.max_per_sender {
                 println!("[WARN][MEMPOOL] per_sender_limit sender={} count={} max={}",
-                         &parsed_tx.from[..16.min(parsed_tx.from.len())], *sender_count, self.max_per_sender);
+                         qnet_state::char_prefix(&parsed_tx.from, 16), *sender_count, self.max_per_sender);
                 // v15.5: roll back the commitment registration we just made
                 // so a count-rejected TX does not leave a dangling forward-
                 // index entry pointing at a hash that never enters storage.
@@ -465,7 +495,7 @@ impl SimpleMempool {
                 return false;
             }
             *sender_count += 1;
-            self.tx_sender_map.insert(hash.clone(), parsed_tx.from.clone());
+            self.tx_sender_map.insert(hash.clone(), Self::quota_key(&parsed_tx));
         }
 
         // Store as binary if enabled (50% space saving)
@@ -517,6 +547,17 @@ impl SimpleMempool {
     /// 
     /// v2.67: CRITICAL FIX - Add to priority queue FIRST, then to transactions
     /// This ensures get_pending_transactions_with_hashes always sees consistent state
+    /// Spam-quota key. A merkle reward-claim's `from` is the shared `system_rewards_pool` literal, so
+    /// keying on it would make every wallet's claims compete for ONE bucket network-wide. Key those on
+    /// the recipient instead — the wallet whose signature authorized them. Written into
+    /// `tx_sender_map` at insert, so every decrement path uses the identical key.
+    fn quota_key(tx: &qnet_state::Transaction) -> String {
+        if tx.is_merkle_reward_claim() {
+            if let Some(to) = tx.to.as_ref() { return to.clone(); }
+        }
+        tx.from.clone()
+    }
+
     pub fn add_binary_transaction(&self, tx_bytes: Vec<u8>, hash: String, gas_price: u64) -> bool {
         // v14.8.4: Parse once up front so we can classify user vs system TX
         // and apply the correct fee policy. See `add_raw_transaction` for
@@ -525,7 +566,7 @@ impl SimpleMempool {
             Ok(tx) => tx,
             Err(e) => {
                 eprintln!("[ERR][MEMPOOL] deserialize_failed hash={} error={}",
-                         &hash[..16.min(hash.len())], e);
+                         qnet_state::char_prefix(&hash, 16), e);
                 return false;
             }
         };
@@ -539,7 +580,16 @@ impl SimpleMempool {
             return false;
         }
 
-        let effective_priority = if is_system { u64::MAX } else { gas_price };
+        // A merkle reward-claim keeps the min-fee bypass but NOT the consensus lane: at u64::MAX it
+        // would be packed ahead of every paying transaction. Floor priority instead — above free spam,
+        // below anyone who paid.
+        let effective_priority = if parsed_tx.is_merkle_reward_claim() {
+            self.config.min_gas_price
+        } else if is_system {
+            u64::MAX
+        } else {
+            gas_price
+        };
 
         // FIX M-H15: Evict lowest-priority TX when mempool is full
         let mut evicted_for_persist: Option<String> = None;
@@ -555,6 +605,11 @@ impl SimpleMempool {
                         }
                         self.transactions.remove(&tx_hash);
                         self.tx_timestamps.remove(&tx_hash);
+                        // Release the evicted tx's quota slot too: every other removal path is gated
+                        // on transactions.remove() succeeding, which is already false by here, so
+                        // without this the counter and tx_sender_map grow forever and eventually lock
+                        // the victim's wallet out of the mempool entirely.
+                        self.decrement_sender_for_hash(&tx_hash);
                         // v15.5: keep commitment dedup tables proportional to
                         // live mempool occupancy when low-priority eviction
                         // drops a commitment-class TX.
@@ -566,6 +621,25 @@ impl SimpleMempool {
                         evicted_for_persist = Some(tx_hash.clone());
                         println!("[INFO][MEMPOOL] evicted_low_priority gas={} for_new_gas={} new_is_system={}",
                                  lowest_gas, effective_priority, is_system);
+                    }
+                } else if parsed_tx.is_merkle_reward_claim() && lowest_gas <= self.config.min_gas_price {
+                    // A claim sits AT the floor, so `>` can never displace another floor entry. Rewards
+                    // must stay claimable under load, so let a claim take a floor slot on equal terms;
+                    // it cannot displace anyone who actually paid.
+                    if let Some(tx_hash) = lowest_entry.get().front().cloned() {
+                        lowest_entry.get_mut().pop_front();
+                        if lowest_entry.get().is_empty() {
+                            lowest_entry.remove();
+                        }
+                        self.transactions.remove(&tx_hash);
+                        self.tx_timestamps.remove(&tx_hash);
+                        self.decrement_sender_for_hash(&tx_hash);
+                        self.cleanup_commitment_indices_for_hash(&tx_hash);
+                        // Mirror removal too (deferred past the lock, same as the sibling branch) —
+                        // else the displaced tx resurrects from the persistent mempool on restart.
+                        evicted_for_persist = Some(tx_hash.clone());
+                    } else {
+                        return false;
                     }
                 } else {
                     println!("[WARN][MEMPOOL] pool_full size={} rejected_gas={} system={}",
@@ -601,7 +675,7 @@ impl SimpleMempool {
         let computed_hash = format!("{:x}", Sha3_256::digest(&canonical_bytes));
         if computed_hash != hash {
             eprintln!("[ERR][MEMPOOL] hash_mismatch expected={} got={}",
-                     &hash[..16.min(hash.len())], &computed_hash[..16.min(computed_hash.len())]);
+                     qnet_state::char_prefix(&hash, 16), qnet_state::char_prefix(&computed_hash, 16));
             return false;
         }
 
@@ -623,8 +697,8 @@ impl SimpleMempool {
             if self.is_commitment_already_on_chain(key) {
                 println!(
                     "[INFO][MEMPOOL] admission_rejected_already_on_chain id={} epoch={} type={} hash={}",
-                    &key.0[..16.min(key.0.len())], key.1, key.2,
-                    &hash[..16.min(hash.len())]
+                    qnet_state::char_prefix(&key.0, 16), key.1, key.2,
+                    qnet_state::char_prefix(&hash, 16)
                 );
                 return false;
             }
@@ -642,19 +716,19 @@ impl SimpleMempool {
         if let Some(ref key) = commitment_key {
             if let Some(old_hash) = self.replace_or_register_commitment(key.clone(), &hash) {
                 println!("[INFO][MEMPOOL] commitment_replaced id={} epoch={} type={} old={} new={}",
-                         &key.0[..16.min(key.0.len())], key.1, key.2,
-                         &old_hash[..16.min(old_hash.len())],
-                         &hash[..16.min(hash.len())]);
+                         qnet_state::char_prefix(&key.0, 16), key.1, key.2,
+                         qnet_state::char_prefix(&old_hash, 16),
+                         qnet_state::char_prefix(&hash, 16));
             }
         }
 
         // Per-sender limit (defense in depth)
         let sender = &parsed_tx.from;
         if !sender.is_empty() {
-            let mut sender_count = self.tx_count_by_sender.entry(sender.clone()).or_insert(0);
+            let mut sender_count = self.tx_count_by_sender.entry(Self::quota_key(&parsed_tx)).or_insert(0);
             if *sender_count >= self.max_per_sender {
                 println!("[WARN][MEMPOOL] per_sender_limit sender={}.. count={}",
-                         &sender[..16.min(sender.len())], *sender_count);
+                         qnet_state::char_prefix(&sender, 16), *sender_count);
                 // v15.5: roll back the commitment registration on count
                 // rejection to keep dedup indices in lockstep with storage.
                 if let Some(ref key) = commitment_key {
@@ -663,7 +737,7 @@ impl SimpleMempool {
                 return false;
             }
             *sender_count += 1;
-            self.tx_sender_map.insert(hash.clone(), sender.clone());
+            self.tx_sender_map.insert(hash.clone(), Self::quota_key(&parsed_tx));
         }
 
         // v2.67: CRITICAL - Add to BOTH structures atomically under priority queue lock
@@ -694,16 +768,19 @@ impl SimpleMempool {
 
             // v2.67: Verify consistency for system TX at top-priority slot
             if is_system {
-                let queue_has = priority_queue.get(&u64::MAX)
+                // Look in the queue this TX was actually filed under. Probing u64::MAX only was correct
+                // while every system TX sat at top priority; merkle reward claims do not, so a perfectly
+                // successful admission logged [ERR] every time.
+                let queue_has = priority_queue.get(&effective_priority)
                     .map(|v| v.contains(&hash))
                     .unwrap_or(false);
                 let tx_has = self.transactions.contains_key(&hash);
 
                 println!("[INFO][MEMPOOL] system_tx_added hash={} size={} queue={} tx={}",
-                        &hash[..16.min(hash.len())], self.transactions.len(), queue_has, tx_has);
+                        qnet_state::char_prefix(&hash, 16), self.transactions.len(), queue_has, tx_has);
 
                 if !queue_has || !tx_has {
-                    eprintln!("[ERR][MEMPOOL] system_tx_add_failed hash={}", &hash[..16.min(hash.len())]);
+                    eprintln!("[ERR][MEMPOOL] system_tx_add_failed hash={}", qnet_state::char_prefix(&hash, 16));
                 }
             }
         }
@@ -785,8 +862,8 @@ impl SimpleMempool {
                 if self.is_commitment_already_on_chain(key) {
                     println!(
                         "[INFO][MEMPOOL] admission_rejected_already_on_chain_trusted id={} epoch={} type={} hash={}",
-                        &key.0[..16.min(key.0.len())], key.1, key.2,
-                        &hash[..16.min(hash.len())]
+                        qnet_state::char_prefix(&key.0, 16), key.1, key.2,
+                        qnet_state::char_prefix(&hash, 16)
                     );
                     continue;
                 }
@@ -829,9 +906,9 @@ impl SimpleMempool {
                         hashes.retain(|h| h != &old);
                     }
                     println!("[INFO][MEMPOOL] commitment_replaced_trusted id={} epoch={} type={} old={} new={}",
-                             &key.0[..16.min(key.0.len())], key.1, key.2,
-                             &old[..16.min(old.len())],
-                             &hash[..16.min(hash.len())]);
+                             qnet_state::char_prefix(&key.0, 16), key.1, key.2,
+                             qnet_state::char_prefix(&old, 16),
+                             qnet_state::char_prefix(&hash, 16));
                     // v15.9: defer the persistent-mirror removal to AFTER
                     // the priority-queue lock is released.
                     pending_persist_remove.push(old);
@@ -1145,7 +1222,7 @@ impl SimpleMempool {
                     None => {
                         // v2.67: This should NEVER happen - log for debugging
                         eprintln!("[ERR][MEMPOOL] tx_in_queue_but_not_in_map hash={} gas_price={}", 
-                                 &hash[..16.min(hash.len())], gas_price);
+                                 qnet_state::char_prefix(&hash, 16), gas_price);
                         None
                     }
                 }

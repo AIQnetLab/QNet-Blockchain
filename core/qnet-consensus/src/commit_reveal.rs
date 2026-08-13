@@ -124,7 +124,7 @@ pub struct RoundState {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// PRODUCTION v2.62: PER-ROUND STORAGE (Like Ethereum 2.0 / Tendermint / Aptos)
+// PRODUCTION v2.62: PER-ROUND STORAGE
 // ═══════════════════════════════════════════════════════════════════════════════
 // Each round has its own independent storage for commits/reveals.
 // This prevents race conditions and data loss during round transitions.
@@ -203,7 +203,7 @@ impl Default for ConsensusConfig {
 }
 
 /// Main commit-reveal consensus engine
-/// PRODUCTION v2.62: Per-round storage like Ethereum 2.0 / Tendermint / Aptos
+/// PRODUCTION v2.62: per-round storage
 pub struct CommitRevealConsensus {
     config: ConsensusConfig,
     reputation: NodeReputation,
@@ -533,8 +533,8 @@ impl CommitRevealConsensus {
                 // EQUIVOCATION DETECTED — two different commits from the same node!
                 println!("[CRITICAL][CONS] equivocation_detected node={} round={} hash_a={} hash_b={}",
                          commit.node_id, block_height,
-                         &existing_commit.commit_hash[..16.min(existing_commit.commit_hash.len())],
-                         &commit.commit_hash[..16.min(commit.commit_hash.len())]);
+                         qnet_state::char_prefix(&existing_commit.commit_hash, 16),
+                         qnet_state::char_prefix(&commit.commit_hash, 16));
                 // Apply slashing penalty via reputation system
                 self.reputation.update_reputation(&commit.node_id, -30.0);
                 return Err(ConsensusError::InvalidCommit(

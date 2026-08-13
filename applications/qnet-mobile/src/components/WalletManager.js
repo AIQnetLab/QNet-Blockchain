@@ -3497,7 +3497,7 @@ export class WalletManager {
     // QC-anchored proof verification (MITM-proof); advisory flag surfaced to the caller.
     let verified = false;
     if (verify && data.merkle_proof && data.merkle_proof.length > 0) {
-      const proofValid = await this.verifyMerkleProof(address, balanceNanoStr, nonceStr, data.merkle_proof, data.state_root, pendingStr);
+      const proofValid = await this.verifyMerkleProof(address, balanceNanoStr, nonceStr, data.merkle_proof, data.state_root, pendingStr, data.last_claimed_epoch || 0);
       if (proofValid) {
         verified = await verifyMacroblockStateRoot(data.state_root, data.block_height, () => this.getRankedNodes(1)[0]);
       }
@@ -3762,7 +3762,7 @@ export class WalletManager {
     return current === root;
   }
 
-  async verifyMerkleProof(address, balance, nonce, proof, expectedRoot, pending = 0) {
+  async verifyMerkleProof(address, balance, nonce, proof, expectedRoot, pending = 0, lastClaimedEpoch = 0) {
     try {
       // Import js-sha3 for SHA3-256 (same as Rust implementation)
       const { sha3_256 } = await import('js-sha3');
@@ -3775,8 +3775,9 @@ export class WalletManager {
 
       // Account leaf — MUST match Rust hash_account (QNET_ACCOUNT_V2) EXACTLY, else the leaf
       // never matches the QC-committed root and the proof always fails. A plain wallet has
-      // is_contract=false, no code/storage, and (server proof leaf) heartbeat/last_claimed=0;
-      // pending_rewards is threaded from the account. Field order + widths are byte-exact.
+      // is_contract=false, no code/storage, and heartbeat=0 (a Heartbeat is keyed on node_id, so a
+      // wallet never carries a tally). pending_rewards and last_claimed_epoch are threaded from the
+      // account — hardcoding the latter broke every wallet that had ever claimed. Byte-exact order.
       const accountDataBytes = this.concatBytes(
         Buffer.from('QNET_ACCOUNT_V2:', 'utf8'),
         this.uint64ToBytes(balance),           // balance u64 LE
@@ -3788,9 +3789,11 @@ export class WalletManager {
         this.uint64ToBytes(0),                 // heartbeat_epoch u64 LE
         Buffer.from([0, 0]),                   // heartbeat_slots u16 LE
         this.uint64ToBytes(0),                 // heartbeat_final_epoch u64 LE
-        Buffer.from([0]),                      // heartbeat_final_count u8
+        Buffer.from([0, 0]),                   // heartbeat_final_slots u16 LE
         Buffer.from('LCE:', 'utf8'),
-        this.uint64ToBytes(0)                  // last_claimed_epoch u64 LE
+        this.uint64ToBytes(lastClaimedEpoch),  // last_claimed_epoch u64 LE
+        Buffer.from('BAN:', 'utf8'),
+        this.uint64ToBytes(0)                  // banned_at_height u64 LE (native wallets are never banned)
       );
       const leafHash = sha3_256(accountDataBytes);
       // Fold the account leaf up to the expected root via the shared SMT primitive.
@@ -3816,7 +3819,8 @@ export class WalletManager {
         storage_proof, account_proof,
         account_balance, account_nonce, account_pending_rewards,
         contract_code_hash, heartbeat_epoch, heartbeat_slots,
-        heartbeat_final_epoch, heartbeat_final_count, last_claimed_epoch,
+        heartbeat_final_epoch, heartbeat_final_slots, last_claimed_epoch,
+        banned_at_height,
         state_root,
       } = proofData;
 
@@ -3864,9 +3868,12 @@ export class WalletManager {
       const slots = heartbeat_slots || 0;
       parts.push(Buffer.from([slots & 0xff, (slots >> 8) & 0xff])); // u16 LE
       parts.push(this.uint64ToBytes(heartbeat_final_epoch || 0));
-      parts.push(Buffer.from([(heartbeat_final_count || 0) & 0xff]));
+      const finalSlots = heartbeat_final_slots || 0;
+      parts.push(Buffer.from([finalSlots & 0xff, (finalSlots >> 8) & 0xff])); // u16 LE
       parts.push(Buffer.from('LCE:', 'utf8'));
       parts.push(this.uint64ToBytes(last_claimed_epoch || 0));
+      parts.push(Buffer.from('BAN:', 'utf8'));
+      parts.push(this.uint64ToBytes(banned_at_height || 0));
       const contractLeafHex = sha3_256(this.concatBytes(...parts));
       if (!this._smtFold(contractLeafHex, contractAddrHashHex, account_proof, state_root, sha3_256)) return false;
 
@@ -4021,8 +4028,8 @@ export class WalletManager {
    * 
    * TOP L1 pattern:
    * - Solana: random sampling from active validators
-   * - Ethereum light clients: random peer selection
-   * - Cosmos: weighted random by stake
+   * - Common light clients: random peer selection
+   * - Stake-weighted networks: weighted random by stake
    * 
    * Our algorithm:
    * 1. Filter: rep >= 70%, lastSeen < 5 min, isSynced
@@ -5728,12 +5735,16 @@ export class WalletManager {
     }
 
     // Proof-of-ownership of the burning Solana wallet: sign with the Solana key, node verifies against
-    // burn_wallet. Binds THIS on-chain registration (which commits the immutable attestation root) to the
-    // wallet owner — stops an attacker front-running our first registration with our public burn_tx.
+    // burn_wallet. Binds THIS on-chain registration to the wallet owner — stops an attacker front-running
+    // our first registration with our public burn_tx. The trailing field is sha3-256 of the wallet
+    // Dilithium key, i.e. the attestation root this registration commits: for a Solana-derived QNet
+    // address nothing else ties that key to us, so the burner has to name it explicitly.
     {
       const solSecret = walletData.secretKey instanceof Uint8Array
         ? walletData.secretKey : new Uint8Array(walletData.secretKey);
-      const ownerMsg = `qnet_onchain_reg:${nodeId}:${walletAddress}:${registrationProof}:${timestamp}`;
+      const { sha3_256 } = require('js-sha3');
+      const attestRoot = sha3_256(Buffer.from(walletDilPkHex, 'hex'));
+      const ownerMsg = `qnet_onchain_reg:${nodeId}:${walletAddress}:${registrationProof}:${timestamp}:${attestRoot}:${burnTxHash || ''}`;
       const ownerSig = nacl.sign.detached(Buffer.from(ownerMsg, 'utf8'), solSecret);
       payload.owner_signature = Buffer.from(ownerSig).toString('hex');
     }
@@ -6238,14 +6249,117 @@ export class WalletManager {
           ...(dilithiumPublicKey && { dilithium_public_key: dilithiumPublicKey }),
         },
       });
-      const claimResult = claimRes.data || {};
+      let claimResult = claimRes.data || {};
       if (!claimRes.ok) {
         throw new Error(claimResult.error || claimResult.message || 'Failed to claim rewards');
       }
+
+      // Two-step claim: step 1 QUOTES the batch, we sign those exact bytes, step 2 submits them.
+      // On-chain apply credits only what this wallet's key authorized, so no relayer can aim a claim
+      // at us. The node still picks the batch, so refuse to sign a quote that does not cover the
+      // independently-polled pending total — a truncated batch would strand the epochs it omits.
+      if (claimResult.needs_signature) {
+        if (!claimResult.claims_data || !claimResult.sign_message) {
+          throw new Error('Node returned an incomplete claim quote');
+        }
+        // Check the batch SHAPE, not its total. Epochs a node cannot serve make an honest quote
+        // legitimately short, so comparing sums rejects honest nodes; what actually strands rewards is
+        // a batch that SKIPS epochs, because the on-chain watermark is monotonic. Requiring strictly
+        // ascending epochs starting just above the wallet's watermark makes a skip unsignable.
+        let claimsParsed;
+        try {
+          claimsParsed = JSON.parse(claimResult.claims_data).claims;
+        } catch (e) {
+          throw new Error('Node returned a malformed claim quote');
+        }
+        if (!Array.isArray(claimsParsed) || claimsParsed.length === 0) {
+          throw new Error('Node returned an empty claim quote');
+        }
+        const watermark = Number(claimResult.last_claimed_epoch ?? -1);
+        if (!Number.isInteger(watermark) || watermark < 0) {
+          throw new Error('Node did not report the claim watermark');
+        }
+        let prevEpoch = watermark;
+        for (const entry of claimsParsed) {
+          if (!Number.isInteger(entry.epoch) || entry.epoch <= prevEpoch) {
+            throw new Error('Node quoted a non-ascending claim batch — retry on another node');
+          }
+          prevEpoch = entry.epoch;
+        }
+        // The head is what a malicious quote would drop, so verify it against a DIFFERENT node —
+        // excluding the quoting one, which would otherwise be the top-ranked responder here too and
+        // simply confirm its own answer. Skipping the first earned epoch would burn it behind the
+        // monotonic watermark once this batch lands.
+        const others = this.getRankedNodes(3).filter((b) => b !== claimRes.base);
+        const headRes = others.length
+          ? await this._hedged(`/api/v1/rewards/pending/${encodeURIComponent(nodeId)}`,
+                               { timeoutMs: 6000, hedgeMs: 1200, nodes: others })
+          : { ok: false };
+        const expectedHead = headRes.ok ? headRes.data?.first_unclaimed_epoch : null;
+        if (!Number.isInteger(expectedHead)) {
+          // Fail CLOSED: unverified head means the quote's starting epoch is unchecked, and signing it
+          // is irreversible (the on-chain watermark only moves forward).
+          throw new Error('Could not verify the claim head against a second node — retry');
+        }
+        if (claimsParsed[0].epoch !== expectedHead) {
+          throw new Error(`Node quoted a batch starting at epoch ${claimsParsed[0].epoch}, expected ${expectedHead} — retry on another node`);
+        }
+        // nanoQNC exceeds 2^53, so the total is carried as a decimal string and compared as BigInt.
+        const quotedNano = BigInt(claimResult.amount_nano ?? '0');
+        if (quotedNano <= 0n) {
+          throw new Error('Node quoted a zero-value claim');
+        }
+        // NEVER sign a server-supplied string with the wallet key. This used to sign
+        // `claimResult.sign_message` verbatim with the SAME ML-DSA-65 key that signs
+        // `transfer:{from}:{to}:{amount}:{nonce}:{gas_price}:{gas_limit}`, and nothing anywhere
+        // rebuilt or checked the `qnet_claim_v1` prefix — so the prefix separated nothing and any
+        // node in the hedged pool could return a transfer-shaped string and drain the wallet, while
+        // the user saw only "Failed to submit signed claim".
+        //
+        // The preimage is fully derivable here: both inputs are values this client already holds and
+        // already sends back in the same POST, so the node's copy is pure convenience and is now
+        // treated as untrusted. Mirror of BlockchainNode::claim_sign_message.
+        const { sha3_256 } = require('js-sha3');
+        const claimTs = claimResult.claim_timestamp;
+        if (!Number.isInteger(claimTs) || claimTs <= 0) {
+          throw new Error('Node returned no claim timestamp — refusing to sign');
+        }
+        const signMessage =
+          `qnet_claim_v1:${walletAddress}:${claimTs}:${sha3_256(claimResult.claims_data)}`;
+        if (claimResult.sign_message && claimResult.sign_message !== signMessage) {
+          // Not fatal by itself — the locally built message is what gets signed either way — but a
+          // mismatch means the node asked for something else, and that is worth refusing loudly.
+          throw new Error('Node asked the wallet to sign a different message — refusing');
+        }
+        const { signWithDilithium } = require('../crypto/DilithiumCrypto');
+        const dilithiumKeys = await this._walletDilithiumKeys(password);
+        const claimsSignature = await signWithDilithium(
+          signMessage, dilithiumKeys.secretKey, dilithiumKeys.publicKey, nodeId);
+        const submitRes = await this._hedged('/api/v1/rewards/claim', {
+          method: 'POST', timeoutMs: 8000, hedgeMs: 1200,
+          body: {
+            node_id: nodeId,
+            wallet_address: walletAddress,
+            dilithium_signature: dilithiumSignature,
+            dilithium_public_key: dilithiumKeys.publicKey,
+            claims_data: claimResult.claims_data,
+            claims_signature: claimsSignature,
+            // Inside the signed message and reused as the TX timestamp, so the payload cannot be
+            // re-stamped into a fresh hash and replayed.
+            claim_timestamp: claimResult.claim_timestamp,
+          },
+        });
+        const submitted = submitRes.data || {};
+        if (!submitRes.ok || !submitted.success) {
+          throw new Error(submitted.error || submitted.message || 'Failed to submit signed claim');
+        }
+        claimResult = { ...submitted, epochs_claimed: claimResult.epochs_claimed };
+      }
+
       if (!claimResult.success) {
         throw new Error(claimResult.error || 'Claim failed on server');
       }
-      
+
       // Server returns amount_qnc (QNC) + epochs_claimed. The claim is SUBMITTED here and credited on
       // inclusion (the per-proof merkle claim finalizes within ~1 block); balance reconciles on the next
       // status poll. Previously read reward.total_qnc/amount which the handler never returns → always 0.

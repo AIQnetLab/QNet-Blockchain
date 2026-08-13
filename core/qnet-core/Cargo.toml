@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["QNet Team"]
 description = "Core blockchain engine for QNet"
-license = "MIT"
+license = "BUSL-1.1"
 
 [dependencies]
 # Async runtime

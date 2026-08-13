@@ -195,15 +195,20 @@ pub fn verify_msg(p2p: &SimplifiedP2P, committee: &[String], msg: &ConsensusMsg)
         ConsensusMsg::Vote(v) => in_committee(&v.voter)
             && vote_sig_compact_ok(&v.voter, &v.checkpoint_hash, &v.signature),
         ConsensusMsg::Timeout(tm) => in_committee(&tm.voter)
-            && sig_ok(p2p, &tm.voter, &sign_str("TMO", &timeout_bytes(tm.index, tm.high_qc_index)), &tm.signature),
+            && timeout_sig_ingest_ok(&tm.voter, tm.index, tm.high_qc_index, &tm.signature),
         ConsensusMsg::Qc(qc) => verify_qc(p2p, committee, qc),
         // H4: a TC must carry ≥2f+1 DISTINCT committee timeouts (each signed) for its own
         // view — not merely an optional high_qc. The old `unwrap_or(true)` accepted an
         // EMPTY-timeouts TC and let on_timeout_cert advance the view (`current_index = tc.index+1`),
         // which adopt_qc never rewinds ⇒ an unauthenticated, permanent view-desync DoS.
+        // The TC threshold is NEVER relaxed: a TC advances current_index without certifying a window,
+        // which would break the index<->window lockstep the recovery pin depends on. During a halt it
+        // therefore simply cannot form — that IS the lockstep, and leader failure inside a span is
+        // handled by membership-proposing instead.
         ConsensusMsg::Tc(tc) => tc.verify(
             committee,
-            |t| sig_ok(p2p, &t.voter, &sign_str("TMO", &timeout_bytes(t.index, t.high_qc_index)), &t.signature),
+            qnet_consensus::checkpoint_bft::quorum_size(committee.len()),
+            |t| timeout_sig_compact_ok(&t.voter, t.index, t.high_qc_index, &t.signature),
             |qc| verify_qc(p2p, committee, qc),
         ).is_ok(),
     }
@@ -235,6 +240,46 @@ fn vote_sig_compact_ok(voter: &str, checkpoint_hash: &[u8], sig: &[u8]) -> bool 
         voter, &sign_str("VOTE", checkpoint_hash), &compact, &pk)
 }
 
+/// Signer's consensus pk from COMMITTED state — the on-chain vrf_pk row, else the binary-pinned genesis
+/// anchor. Never the RAM registry: it is TOFV-capable and idle-evicted, so gating ingest on it would
+/// admit messages the certificate verifier can never reproduce.
+fn committed_pk(id: &str) -> Option<Vec<u8>> {
+    let storage = crate::node::try_get_storage()?;
+    // The vrf_pk_ row is not covered by registry_root, so bind it to the row that IS —
+    // node_<id>.vrf_pk_sha3 — before letting it authenticate a consensus message. Same cross-check the
+    // equivocation and heartbeat paths already apply. No commitment ⇒ genesis anchor or nothing.
+    if let Ok(Some(p)) = storage.load_vrf_public_key(id) {
+        if let Ok(Some(tag)) = storage.node_signer_key_commitment(id) {
+            use sha3::{Digest, Sha3_256};
+            if hex::encode(Sha3_256::digest(&p)) == tag { return Some(p); }
+        }
+    }
+    crate::genesis_constants::get_genesis_anchor_pk(id)
+}
+
+/// INGEST gate for a standalone timeout: the wire signature still carries the embedded pk, so strip it
+/// first and verify exactly what a TC will later hold. Same rule as votes.
+fn timeout_sig_ingest_ok(voter: &str, index: u64, high_qc_index: u64, sig: &[u8]) -> bool {
+    let pk = match committed_pk(voter) { Some(p) => p, None => return false };
+    let sig_str = match std::str::from_utf8(sig) { Ok(s) => s, Err(_) => return false };
+    let compact = match qnet_consensus::consensus_crypto::strip_embedded_pk(sig_str) { Some(c) => c, None => return false };
+    qnet_consensus::consensus_crypto::verify_consensus_signature_compact(
+        voter, &sign_str("TMO", &timeout_bytes(index, high_qc_index)), &compact, &pk)
+}
+
+/// CERTIFICATE gate: timeouts inside a TC are already pk-stripped, so verify them as-is. Stripping
+/// again would return None and reject every TC, wedging the view change.
+fn timeout_sig_compact_ok(voter: &str, index: u64, high_qc_index: u64, sig: &[u8]) -> bool {
+    let pk = match committed_pk(voter) { Some(p) => p, None => return false };
+    let sig_str = match std::str::from_utf8(sig) { Ok(s) => s, Err(_) => return false };
+    qnet_consensus::consensus_crypto::verify_consensus_signature_compact(
+        voter, &sign_str("TMO", &timeout_bytes(index, high_qc_index)), sig_str, &pk)
+}
+
+/// Live-gossip QC admission. The threshold comes from THIS node's recovery arm, which is advisory:
+/// an unarmed node simply does not adopt a relaxed QC live and instead accepts the macroblock through
+/// verify_v2_macroblock, the sole authority, which re-derives the pin from the certificate's bytes.
+/// So a disagreement here is liveness-only and can never fork.
 fn verify_qc(_p2p: &SimplifiedP2P, committee: &[String], qc: &QuorumCertificate) -> bool {
     // C-2: qc.sigs are pk-stripped — resolve each signer's pk from on-chain committee state (deterministic
     // + process-uniform: vrf_pk row, else the binary-pinned genesis anchor; NEVER the RAM registry) and
@@ -248,7 +293,7 @@ fn verify_qc(_p2p: &SimplifiedP2P, committee: &[String], qc: &QuorumCertificate)
             _ => crate::genesis_constants::get_genesis_anchor_pk(id).map(|p| (id.clone(), p)),
         }
     }).collect();
-    qc.verify(committee, |voter, body, sig| {
+    qc.verify(committee, crate::node::rc_effective_quorum(qc.index, committee.len()), |voter, body, sig| {
         let pk = match pk_map.get(voter) { Some(p) => p, None => return false };
         match std::str::from_utf8(sig) {
             Ok(s) => qnet_consensus::consensus_crypto::verify_consensus_signature_compact(
@@ -256,6 +301,17 @@ fn verify_qc(_p2p: &SimplifiedP2P, committee: &[String], qc: &QuorumCertificate)
             Err(_) => false,
         }
     }).is_ok()
+}
+
+/// The member a single-signature consensus message came from, or None for certificates (which carry
+/// many signers and are verified off-loop). Feeds the recovery arm's liveness view.
+fn msg_sender(m: &ConsensusMsg) -> Option<&str> {
+    match m {
+        ConsensusMsg::Proposal(cp) => Some(&cp.proposer),
+        ConsensusMsg::Vote(v) => Some(&v.voter),
+        ConsensusMsg::Timeout(tm) => Some(&tm.voter),
+        ConsensusMsg::Qc(_) | ConsensusMsg::Tc(_) => None,
+    }
 }
 
 /// Checkpoint index a wire message pertains to — used to gate handling until this
@@ -347,6 +403,14 @@ pub async fn execute(effects: Vec<Effect>, node_id: &str, p2p: &Arc<SimplifiedP2
             }
             Effect::Relay(m) => broadcast(p2p, &m).await,
             Effect::Persist { checkpoint, qc, eligible_producers, committee } => {
+                // Never seal a pinned checkpoint while the relaxation is off: all-seal writes without
+                // verifying, and every peer would reject the macroblock.
+                if !crate::node::RC_ENABLED && checkpoint.recovery_anchor.is_some() {
+                    if crate::node::is_warn() {
+                        println!("[WARN][BFT2] persist_refused reason=rc_disabled head={}", checkpoint.window_head_height);
+                    }
+                    return;
+                }
                 // Every committee member seals locally: the body is a pure function of the
                 // committed window (deterministic), so all produce a byte-identical block —
                 // no single-producer SPOF, no seal race. Macroblock HEIGHT = window (head/90),
@@ -356,13 +420,34 @@ pub async fn execute(effects: Vec<Effect>, node_id: &str, p2p: &Arc<SimplifiedP2
                 let window = checkpoint.window_head_height / 90;
                 // Idempotent: already sealed locally or received via broadcast/sync.
                 if storage.get_macroblock_by_height(window).ok().flatten().is_some() { continue; }
-                // Chain link: seal only when the parent macroblock is present, so previous_hash
-                // (= latest) chains it. Absent ⇒ defer; the leader's broadcast / sync provides it.
-                if window > 1 && storage.get_macroblock_by_height(window - 1).ok().flatten().is_none() {
-                    if crate::node::is_warn() { println!("[WARN][BFT2] seal_deferred window={} reason=parent_absent", window); }
-                    continue;
-                }
-                let previous_hash = storage.get_latest_macroblock_hash().unwrap_or([0u8; 32]);
+                // Chain link: seal only when the parent macroblock is present, and take previous_hash
+                // FROM THAT PARENT, by index.
+                //
+                // previous_hash is inside MacroBlock::hash(), and that hash is compared for equality
+                // ACROSS nodes (the two window-pin block rejects and the vote/TC anchor checks), so it
+                // must derive from committed data. `latest_macroblock_hash` is a single metadata key
+                // that save_macroblock overwrites on EVERY save at ANY index in ANY order — one
+                // out-of-order sync ingest points it at the wrong macroblock, the seal chains to the
+                // wrong parent, and since nothing verifies the link on receive the divergence is
+                // written into the next macroblock and becomes permanent.
+                // Read through macroblock_plaintext, not bare bincode: the stored form is uncompressed
+                // today but the sniffing helper is what every other macroblock reader on a consensus
+                // path uses, and a bare deserialize on a zstd body would return None here — i.e. defer
+                // the seal forever, which is a halt, not a degraded read.
+                let previous_hash = if window > 1 {
+                    match storage.get_macroblock_by_height(window - 1).ok().flatten()
+                        .and_then(crate::node::BlockchainNode::macroblock_plaintext)
+                        .and_then(|raw| bincode::deserialize::<qnet_state::MacroBlock>(&raw).ok())
+                    {
+                        Some(parent) => parent.hash(),
+                        None => {
+                            if crate::node::is_warn() { println!("[WARN][BFT2] seal_deferred window={} reason=parent_absent", window); }
+                            continue;
+                        }
+                    }
+                } else {
+                    [0u8; 32]
+                };
                 // Store (checkpoint, QC) so receivers reconstruct checkpoint.hash(), confirm
                 // it == qc.checkpoint_hash (binds this exact block), and full-verify the QC.
                 let qc_bytes = bincode::serialize(&(checkpoint.clone(), qc.clone())).unwrap_or_default();
@@ -378,10 +463,21 @@ pub async fn execute(effects: Vec<Effect>, node_id: &str, p2p: &Arc<SimplifiedP2
                 // instead of re-scanning from genesis (pruning-safe, scales to 100k). Pure
                 // function of the committed chain ⇒ every sealer produces the same bytes.
                 let banned_validators = {
-                    let mut v: Vec<String> =
-                        crate::node::BlockchainNode::compute_cumulative_ban_set(&storage, window)
-                            .await
-                            .into_iter().collect();
+                    // Underivable ⇒ abort the persist. Every sealer assembles this macroblock body
+                    // locally, so a guessed set here means two nodes store DIFFERENT bytes under the
+                    // same macroblock key — and that object is the roster/beacon source for the next
+                    // epochs. Not sealing leaves the window to the quorum that can derive it; this node
+                    // adopts the sealed object through sync.
+                    let set = match crate::node::BlockchainNode::compute_cumulative_ban_set(&storage, window).await {
+                        Some(b) => b,
+                        None => {
+                            // Same shape as parent_absent above: defer this window, do not seal a
+                            // body whose bytes would differ from every other sealer's.
+                            println!("[WARN][BFT2] seal_deferred window={} reason=ban_set_underivable", window);
+                            continue;
+                        }
+                    };
+                    let mut v: Vec<String> = set.into_iter().collect();
                     v.sort();
                     Some(bincode::serialize(&v).unwrap_or_default())
                 };
@@ -402,8 +498,6 @@ pub async fn execute(effects: Vec<Effect>, node_id: &str, p2p: &Arc<SimplifiedP2
                         ..Default::default()
                     },
                     previous_hash,
-                    poh_hash: Vec::new(),
-                    poh_count: 0,
                 };
                 match storage.save_macroblock(window, &mb).await {
                     Ok(_) => {
@@ -487,6 +581,7 @@ pub enum V2Event {
         reward_root: Hash,             // per-epoch reward merkle root ([0;32] off emission boundary)
         registry_root: Hash,           // deterministic Super/genesis registry digest (snapshot-forge defence)
         dilithium_pk_root: Hash,       // FIX-5: (address->pk) LtHash digest (elided-pk snapshot-forge defence)
+        reward_epoch_root: Hash,       // LtHash over held (epoch, reward root) pairs — lets a cold-join carry them
         logs_root: Hash,               // consensus event logs root (native QRC-20/721 + WASM), ACTIVE from genesis (gate=0)
         total_supply: u64,             // QC-bound total minted supply (cold-joiner reads this, not balance sum)
     },
@@ -511,24 +606,24 @@ struct WindowContent {
     reward_root: Hash,     // per-epoch reward merkle root, QC-certified via Checkpoint.reward_root
     registry_root: Hash,   // Super/genesis registry digest, QC-certified via Checkpoint.registry_root
     dilithium_pk_root: Hash, // FIX-5: (address->pk) digest, QC-certified via Checkpoint.dilithium_pk_root
+    reward_epoch_root: Hash, // held (epoch, reward root) digest, QC-certified via Checkpoint.reward_epoch_root
     logs_root: Hash,       // consensus event logs root (native QRC-20/721 + WASM), ACTIVE from genesis (gate=0)
     total_supply: u64,     // total minted supply, QC-certified via Checkpoint.total_supply
 }
 
 /// Recompute a window's tail (mb hashes + beacon) FRESH from canonical storage bodies — the same
-/// derivation check_content votes against. None if any body/vrf is absent (mid-rollback/resync:
+/// derivation check_content votes against. None if any body is absent (mid-rollback/resync:
 /// transient, the caller retries on its next trigger). O(win) reads, leader-proposal-path only.
 fn derive_window_tail(storage: &Storage, head: u64, win: usize) -> Option<(Vec<Hash>, Hash)> {
     if win == 0 || win as u64 > head { return None; }
     let start = head - (win as u64 - 1);
     let mut hashes = Vec::with_capacity(win);
-    let mut vrf: Vec<[u8; 32]> = Vec::with_capacity(win);
     for h in start..=head {
         let mb = storage.load_microblock_auto_format(h).ok().flatten()?;
-        vrf.push(mb.vrf_output?);
         hashes.push(mb.hash());
     }
-    Some((hashes, qnet_consensus::checkpoint_bft::accumulate_beacon(&vrf)))
+    let beacon = qnet_consensus::checkpoint_bft::accumulate_beacon(&hashes);
+    Some((hashes, beacon))
 }
 
 /// Adopt the in-flight window's committee and, if we lead the current round, propose the
@@ -561,7 +656,7 @@ fn try_propose(
             } else {
                 (c.mb_hashes.clone(), c.beacon)
             };
-            driver.build_proposal(w, mb_hashes, c.state_root, beacon, c.head_ts, c.committee.clone(), c.eligible.clone(), c.banned.clone(), c.reward_root, c.registry_root, c.dilithium_pk_root, c.logs_root, c.total_supply)
+            driver.build_proposal(w, mb_hashes, c.state_root, beacon, c.head_ts, c.committee.clone(), c.eligible.clone(), c.banned.clone(), c.reward_root, c.registry_root, c.dilithium_pk_root, c.reward_epoch_root, c.logs_root, c.total_supply)
         }
         None => Vec::new(),
     }
@@ -608,6 +703,7 @@ fn check_content(storage: &Storage, buf: &std::collections::HashMap<u64, WindowC
         || (qnet_state::feature_gates::is_active("registry_root_required", cp.window_head_height) && cp.dilithium_pk_root != c.dilithium_pk_root)
         || (qnet_state::feature_gates::is_active("logs_root_required", cp.window_head_height) && cp.logs_root != c.logs_root)
         || (qnet_state::feature_gates::is_active("registry_root_required", cp.window_head_height) && cp.total_supply != c.total_supply)
+        || (qnet_state::feature_gates::is_active("reward_epoch_root_required", cp.window_head_height) && cp.reward_epoch_root != c.reward_epoch_root)
     { return ContentCheck::Reject; }
     // Window SPAN comes from OUR OWN snapshot, not `k`: an intra checkpoint covers CHECKPOINT_INTERVAL
     // blocks, but the macroblock-boundary checkpoint (head = 90·mb_idx) covers the FULL macroblock
@@ -622,19 +718,18 @@ fn check_content(storage: &Storage, buf: &std::collections::HashMap<u64, WindowC
     // ⇒ reconcile (the caller pulls the certified-canonical block; fork-choice supersedes ours).
     let start = cp.window_head_height - (win as u64 - 1);
     let mut diverged = Vec::new();
-    let mut vrf: Vec<[u8; 32]> = Vec::with_capacity(win);
     for (i, h) in (start..=cp.window_head_height).enumerate() {
         match storage.load_microblock_auto_format(h).ok().flatten() {
-            Some(mb) if mb.hash() == cp.window_mb_hashes[i] => match mb.vrf_output {
-                Some(v) => vrf.push(v),
-                None => diverged.push(h), // hash matched but vrf absent ⇒ not-ready, can't form beacon
-            },
+            Some(mb) if mb.hash() == cp.window_mb_hashes[i] => {}
             _ => diverged.push(h), // divergent hash, or body absent ⇒ pull the certified-canonical block
         }
     }
     if !diverged.is_empty() { return ContentCheck::TailDiverged(diverged); }
     // All bodies matched ⇒ beacon derived from their VRF outputs must equal the proposer's; verify.
-    if qnet_consensus::checkpoint_bft::accumulate_beacon(&vrf) != cp.beacon { return ContentCheck::Reject; }
+    // The beacon is the fold over the tail hashes we just matched against the QC-signed list.
+    if qnet_consensus::checkpoint_bft::accumulate_beacon(&cp.window_mb_hashes) != cp.beacon {
+        return ContentCheck::Reject;
+    }
     ContentCheck::Ok
 }
 
@@ -782,13 +877,31 @@ pub fn route_inbound(data: Vec<u8>) {
 }
 
 /// Production loop calls this at each checkpoint-window boundary.
-pub fn signal_window_end(
-    index: u64, head_height: u64, mb_hashes: Vec<Hash>, state_root: Hash, beacon: Hash,
-    committee: Vec<String>, eligible_producers: Vec<u8>, banned: Vec<String>, reward_root: Hash,
-    registry_root: Hash, dilithium_pk_root: Hash, logs_root: Hash, total_supply: u64,
-) {
+/// Named fields, not positional args: five of these are `Hash`, so a positional call silently
+/// swaps roots between checkpoint fields and the types cannot catch it.
+pub struct WindowEndArgs {
+    pub index: u64,
+    pub head_height: u64,
+    pub mb_hashes: Vec<Hash>,
+    pub state_root: Hash,
+    pub beacon: Hash,
+    pub committee: Vec<String>,
+    pub eligible_producers: Vec<u8>,
+    pub banned: Vec<String>,
+    pub reward_root: Hash,
+    pub registry_root: Hash,
+    pub dilithium_pk_root: Hash,
+    pub reward_epoch_root: Hash,
+    pub logs_root: Hash,
+    pub total_supply: u64,
+}
+
+pub fn signal_window_end(a: WindowEndArgs) {
+    let WindowEndArgs { index, head_height, mb_hashes, state_root, beacon, committee,
+                        eligible_producers, banned, reward_root, registry_root,
+                        dilithium_pk_root, reward_epoch_root, logs_root, total_supply } = a;
     if let Some(tx) = V2_TX.get() {
-        let _ = tx.send(V2Event::WindowEnd { index, head_height, mb_hashes, state_root, beacon, committee, eligible_producers, banned, reward_root, registry_root, dilithium_pk_root, logs_root, total_supply });
+        let _ = tx.send(V2Event::WindowEnd { index, head_height, mb_hashes, state_root, beacon, committee, eligible_producers, banned, reward_root, registry_root, dilithium_pk_root, reward_epoch_root, logs_root, total_supply });
     }
 }
 
@@ -835,9 +948,23 @@ pub async fn run(
     // window from here at the current round — decoupling the window from a skippable round.
     let mut window_buf: std::collections::HashMap<u64, WindowContent> = std::collections::HashMap::new();
     const MAX_WINDOW_BUF: usize = 256;
+    // R15 interlock: the buffer must span the frozen horizon in CHECKPOINT windows (macro window =
+    // MACROBLOCK_INTERVAL/CHECKPOINT_INTERVAL = 3), with ≥2× headroom. A future horizon bump that
+    // outgrows this fails the build here instead of silently dropping in-flight windows during a freeze.
+    const _: () = assert!(
+        MAX_WINDOW_BUF as u64 >= 2 * (crate::node::BlockchainNode::MAX_DERIVED_ROSTER_WINDOWS as u64)
+            * (qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL / qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL),
+        "MAX_WINDOW_BUF must cover 2x the frozen horizon in checkpoint windows");
     // LIVENESS WATCHDOG state: the consensus dropout that motivated this was SILENT (Docker
     // reported "healthy" while the driver was frozen). Track sustained lag of the driver behind
     // the applied chain tip and alarm LOUDLY once per episode — re-armed on recovery.
+    // RECOVERY ARM state. `heard` is the signature-verified liveness view used by the halt test;
+    // `last_certified_at` is the stall clock. Both are local and advisory — they gate only what this
+    // node proposes/votes, never what is valid.
+    let mut heard: std::collections::HashMap<String, std::time::Instant> = std::collections::HashMap::new();
+    let mut last_certified_at = std::time::Instant::now();
+    let mut rc_ticks: u32 = 0;
+    let mut rc_last_index: u64 = 0;   // stagger resets when the pinned index moves
     let mut stuck_ticks: u32 = 0;
     let mut stuck_alarmed = false;
     if crate::node::is_info() {
@@ -903,6 +1030,11 @@ pub async fn run(
                                 dispatch_cert_verify(data, &p2p, &committee, driver.current_index());
                                 Vec::new()
                             } else if verify_msg(&p2p, &committee, &msg) {
+                                // Signature-verified ⇒ this member is demonstrably alive. Recording it
+                                // only AFTER the verify is what makes the halt test unspoofable.
+                                if let Some(sender) = msg_sender(&msg) {
+                                    heard.insert(sender.to_string(), std::time::Instant::now());
+                                }
                                 // Single-sig (Proposal/Vote/Timeout): the verify is cheap ⇒ inline is fine.
                                 process_authenticated(&msg, &mut driver, &storage, &window_buf, &p2p, &mut committee, &mut pending, MAX_PENDING)
                             } else {
@@ -925,15 +1057,23 @@ pub async fn run(
                             Err(_) => Vec::new(),
                         }
                     }
-                    V2Event::WindowEnd { index, head_height, mb_hashes, state_root, beacon, committee: cmt, eligible_producers, banned, reward_root, registry_root, dilithium_pk_root, logs_root, total_supply } => {
+                    V2Event::WindowEnd { index, head_height, mb_hashes, state_root, beacon, committee: cmt, eligible_producers, banned, reward_root, registry_root, dilithium_pk_root, reward_epoch_root, logs_root, total_supply } => {
                         // Buffer this window's content (head microblock's real timestamp rides in
                         // the QC-agreed checkpoint). Then propose the contiguous next window if we
                         // lead, and replay buffered inbound.
                         last_signaled = last_signaled.max(index);
                         let head_ts = storage.load_microblock_auto_format(head_height)
                             .ok().flatten().map(|m| m.timestamp).unwrap_or(0);
+                        // Inside an armed span the committee IS the anchor's C_S — the derived set for a
+                        // stuck window is read from the uncertified tail and has already been shrunk by
+                        // the inactivity filter. Overriding here is the SINGLE point that carries C_S into
+                        // the proposal, the epoch_commitment in check_content, and the QC verify set, so
+                        // the three can never disagree. `eligible` is deliberately NOT frozen: the shrink
+                        // is exactly what returns the chain to full quorum at A+3 and ends the span.
+                        // `index` is a CHECKPOINT window (head/30), not a macroblock index.
+                        let cmt = crate::node::rc_span_committee_cp(&storage, index).unwrap_or(cmt);
                         window_buf.insert(index, WindowContent {
-                            mb_hashes, state_root, beacon, head_ts, committee: cmt, eligible: eligible_producers, banned, reward_root, registry_root, dilithium_pk_root, logs_root, total_supply,
+                            mb_hashes, state_root, beacon, head_ts, committee: cmt, eligible: eligible_producers, banned, reward_root, registry_root, dilithium_pk_root, reward_epoch_root, logs_root, total_supply,
                         });
                         if window_buf.len() > MAX_WINDOW_BUF {
                             // NEVER evict the IN-FLIGHT window (audit F4): during a finality wedge
@@ -981,7 +1121,91 @@ pub async fn run(
                 // timeout-independent (commit needs a same-round 2f+1 QC). Time out only a window we
                 // hold data for and are committing; between windows the view idles — never time out then.
                 let committed = driver.committed_index();
-                if committed > last_committed { last_committed = committed; consec_timeouts = 0; ticks_stuck = 0; }
+                if committed > last_committed {
+                    last_committed = committed; consec_timeouts = 0; ticks_stuck = 0;
+                    last_certified_at = std::time::Instant::now();
+                }
+                // ── RECOVERY ARM ────────────────────────────────────────────────────────────────
+                {
+                    let now = std::time::Instant::now();
+                    let stall = std::time::Duration::from_secs(crate::node::RC_STALL_SECS);
+                    heard.retain(|_, t| now.duration_since(*t) < stall);
+                    let live: std::collections::HashSet<String> = heard.keys().cloned().collect();
+                    crate::node::rc_publish_heard(live.clone());
+                    match crate::node::rc_armed() {
+                        Some((a, _, _)) => {
+                            // The span ends by itself: index A+7 fails the pin, and the first seal above
+                            // A+2 means the strict threshold is reachable again.
+                            if storage.last_sealed_mb_index() > a + 2 {
+                                crate::node::rc_disarm();
+                                let _ = driver.set_recovery_span(None);
+                                rc_ticks = 0;
+                            } else {
+                                // Stagger: rank 0 speaks on the first tick, rank r on tick r+1 (~4 s
+                                // apart), so in practice the lowest-rank live member proposes alone.
+                                //
+                                // rc_ticks MUST reset when the pinned index moves. It used to reset only
+                                // on arm/disarm, so after one slow index every armed member had
+                                // rc_ticks > its own rank and they all self-granted on the SAME tick —
+                                // votes split, and since the vote rule is per-index and the TC is
+                                // deliberately never relaxed, that index becomes unvotable for good.
+                                let idx_now = driver.current_index();
+                                if idx_now != rc_last_index { rc_last_index = idx_now; rc_ticks = 0; }
+                                rc_ticks = rc_ticks.saturating_add(1);
+                                // And do not speak at all if this index already has something to vote
+                                // on: a second proposal there can only split the very quorum we are
+                                // trying to reach.
+                                let quiet = !driver.has_proposal_at(idx_now);
+                                let rank = driver.rc_propose_rank();
+                                if quiet && rank != usize::MAX && rc_ticks as usize > rank {
+                                    driver.rc_grant_propose();
+                                }
+                            }
+                        }
+                        None => {
+                            // An operator request shortens ONLY the wait. Every other condition is
+                            // re-checked below by the identical code the automatic path runs, and the
+                            // driver may still refuse — which is why the RPC hands the arm here rather
+                            // than writing the global itself.
+                            let operator_asked = crate::node::rc_take_arm_request();
+                            if operator_asked || now.duration_since(last_certified_at) >= stall {
+                                if let Ok(rc) = crate::node::rc_try_arm(&storage, &live, true) {
+                                    // The driver may refuse: the pinned position can be unreachable
+                                    // from this node's view (it voted there already). Arming anyway
+                                    // would emit checkpoints the pin rejects forever, which is worse
+                                    // than staying halted — so undo the arm and report it.
+                                    if !driver.set_recovery_span(Some(rc)) {
+                                        crate::node::rc_disarm();
+                                        if crate::node::is_warn() {
+                                            println!("[WARN][RC] arm_rejected reason=pin_unreachable view={} anchor_mb={}",
+                                                     driver.current_index(), rc.0);
+                                        }
+                                        continue;
+                                    }
+                                    rc_ticks = 0;
+                                    // Span windows were buffered LONG before the arm (production keeps
+                                    // signalling through a halt), so their snapshots still hold the
+                                    // DERIVED committee. Re-map them to C_S now, or this node's own
+                                    // check_content would reject the pinned proposal on epoch_commitment
+                                    // and try_propose would build one against the wrong set — the arm
+                                    // would be inert on exactly the node that armed.
+                                    // Iterate the span in CHECKPOINT-window units — the key space the
+                                    // buffer actually uses. Macroblock units here would address
+                                    // long-sealed windows and leave every real span window untouched.
+                                    if let Some((lo, hi)) = crate::node::rc_span_cp_windows() {
+                                        for w in lo..=hi {
+                                            if let (Some(cs), Some(wc)) =
+                                                (crate::node::rc_span_committee_cp(&storage, w), window_buf.get_mut(&w))
+                                            {
+                                                wc.committee = cs;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 if driver.current_index() == last_index && driver.next_window() <= last_signaled {
                     ticks_stuck = ticks_stuck.saturating_add(1);
                     let need = (1u32 << consec_timeouts.min(4)).min(15); // base ticks: 4,8,16,32,60s
@@ -1097,28 +1321,36 @@ mod content_gate_tests {
     // Persist one window's canonical bodies over `win` blocks; return (hashes, beacon) as THIS node
     // holds them. win = CHECKPOINT_INTERVAL for an intra checkpoint, the full macroblock for a boundary.
     fn seed_window(storage: &Storage, head: u64, win: u64, producer: &str, tr: u64, sr: [u8; 32]) -> (Vec<[u8; 32]>, [u8; 32]) {
-        let (mut hashes, mut vrfs) = (Vec::new(), Vec::new());
+        let mut hashes: Vec<[u8; 32]> = Vec::new();
+        // Chain the bodies: storage enforces parent linkage, so a window of unlinked blocks is not
+        // a state the node can ever hold.
+        let mut parent = storage.load_microblock_auto_format(head - win).ok().flatten().map(|p| p.hash())
+            .unwrap_or([0u8; 32]);
         for h in (head - (win - 1))..=head {
             let mut v = [0u8; 32]; v[0] = (h & 0xff) as u8; v[1] = ((h >> 8) & 0xff) as u8;
-            let mb = mk_block(h, producer, tr, sr, v);
-            hashes.push(mb.hash()); vrfs.push(v);
+            let mut mb = mk_block(h, producer, tr, sr, v);
+            mb.previous_hash = parent;
+            parent = mb.hash();
+            hashes.push(mb.hash());
             storage.save_microblock(h, &bincode::serialize(&mb).unwrap()).unwrap();
         }
-        (hashes, qnet_consensus::checkpoint_bft::accumulate_beacon(&vrfs))
+        // The beacon folds the window's BLOCK HASHES, mirroring accumulate_beacon's live callers.
+        let beacon = qnet_consensus::checkpoint_bft::accumulate_beacon(&hashes);
+        (hashes, beacon)
     }
 
     fn wc(hashes: Vec<[u8; 32]>, sr: [u8; 32], beacon: [u8; 32]) -> WindowContent {
         WindowContent { mb_hashes: hashes, state_root: sr, beacon, head_ts: 0, committee: vec![],
             eligible: vec![], banned: vec![], reward_root: [0u8; 32], registry_root: [0u8; 32], dilithium_pk_root: [0u8; 32],
-            logs_root: [0u8; 32], total_supply: 0 }
+            reward_epoch_root: [0u8; 32], logs_root: [0u8; 32], total_supply: 0 }
     }
 
     fn cp(head: u64, hashes: Vec<[u8; 32]>, sr: [u8; 32], beacon: [u8; 32]) -> Checkpoint {
         Checkpoint { index: head / qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL, parent_qc: None,
             window_head_height: head, window_mb_hashes: hashes, state_root: sr, beacon,
             epoch_commitment: qnet_consensus::checkpoint_bft::epoch_commitment(&[], &[], &[]),
-            reward_root: [0u8; 32], registry_root: [0u8; 32], dilithium_pk_root: [0u8; 32], logs_root: [0u8; 32], total_supply: 0,
-            timestamp: 0, proposer: "p".to_string(), proposer_sig: vec![] }
+            reward_root: [0u8; 32], registry_root: [0u8; 32], dilithium_pk_root: [0u8; 32], reward_epoch_root: [0u8; 32], logs_root: [0u8; 32], total_supply: 0,
+            timestamp: 0, proposer: "p".to_string(), proposer_sig: vec![], recovery_anchor: None }
     }
 
     // The boundary-failover unfreeze: state agrees ⇒ a divergent tail hash reconciles (not fail-stop);
@@ -1179,14 +1411,14 @@ mod content_gate_tests {
         // The leader's canonical tail: identical except height start+2 = the failover winner
         // (higher timeout_round + its own VRF ⇒ different hash, SAME state_root).
         let mut winner_vrf = [0u8; 32]; winner_vrf[0] = 0xAB;
-        let winner = mk_block(start + 2, "winner", 2, sr, winner_vrf);
+        let mut winner = mk_block(start + 2, "winner", 2, sr, winner_vrf);
+        // The winner replaces the loser at the SAME position, so it links to the same parent —
+        // storage rejects any other linkage.
+        winner.previous_hash = storage.load_microblock_auto_format(start + 1).unwrap().unwrap().hash();
         let mut canon = local.clone();
         canon[2] = winner.hash();
-        let mut vrfs: Vec<[u8; 32]> = (start..=head).map(|h| {
-            let mut v = [0u8; 32]; v[0] = (h & 0xff) as u8; v[1] = ((h >> 8) & 0xff) as u8; v
-        }).collect();
-        vrfs[2] = winner_vrf;
-        let canon_beacon = qnet_consensus::checkpoint_bft::accumulate_beacon(&vrfs);
+        // The beacon folds the CANONICAL tail hashes — the winner's hash replaces the loser's.
+        let canon_beacon = qnet_consensus::checkpoint_bft::accumulate_beacon(&canon);
         let proposal = ConsensusMsg::Proposal(cp(head, canon.clone(), sr, canon_beacon));
 
         // Before the canonical body lands: TailDiverged at exactly the contested height — never a vote.

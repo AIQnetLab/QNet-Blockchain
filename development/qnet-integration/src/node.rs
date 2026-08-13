@@ -693,17 +693,27 @@ pub fn get_clock_drift_peak_secs() -> u64 {
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // PRODUCER VALIDATION CACHE: Tracks expected producer per height
-// Populated by main consensus loop, checked in validate_received_microblock.
-// Prevents accepting blocks from wrong producers (e.g. node producing in isolation).
+// Populated by the main consensus loop; producer authority itself is enforced by the Category-B
+// ingest reject, the storage L4 anti-fork gate and equivocation slashing.
 // ═══════════════════════════════════════════════════════════════════════════════
 lazy_static::lazy_static! {
     static ref EXPECTED_PRODUCER_CACHE: ParkingRwLock<std::collections::HashMap<u64, (String, u64)>> =
         ParkingRwLock::new(std::collections::HashMap::new());
 }
 
-/// Cache the expected producer for a given block height (called from main loop)
+/// Cache the expected producer for a given block height (called from main loop).
+///
+/// An EMPTY producer is never cached. Empty means this node could not derive the roster and is
+/// abstaining; caching it would make `get_expected_producer` return Some(("", round)), every incoming
+/// block would then fail `mb.producer != expected`, and the abstaining node would HARD REJECT the whole
+/// chain instead of quietly following it. Absent-from-cache is the soft path, which is what abstention
+/// must mean.
 pub fn cache_expected_producer(height: u64, producer: &str, timeout_round: u64) {
     let mut cache = EXPECTED_PRODUCER_CACHE.write();
+    if producer.is_empty() {
+        cache.remove(&height);
+        return;
+    }
     cache.insert(height, (producer.to_string(), timeout_round));
     if cache.len() > 200 {
         let min_height = height.saturating_sub(100);
@@ -732,6 +742,22 @@ pub fn expected_producer_for_round(height: u64, round: u64) -> Option<String> {
     Some(candidates[(round0_idx + round as usize) % candidates.len()].0.clone())
 }
 
+/// The producer public key a block-validity check must resolve: RAM first, then the COMMITTED
+/// node_registry row, then the pinned genesis anchor.
+///
+/// RAM alone cannot carry a consensus verdict at scale. `VRF_PK_REGISTRY` is capped and REFUSES new
+/// inserts once full rather than evicting, and light-node registrations share the same map against a
+/// 10M-light target — so whether a super's key is present depends on what happened to fit, and a
+/// verdict that differs by cache contents forks honest nodes. The registry CF is the authority; RAM is
+/// a cache in front of it, and since the gossip installs were removed it holds only the pinned genesis
+/// set, chain-applied registrations and this node's own key. Ordering matters: RAM first keeps the
+/// common case a map lookup instead of a point-read on the per-block path.
+pub(crate) fn producer_verify_pk(storage: &Storage, node_id: &str) -> Option<Vec<u8>> {
+    crate::genesis_constants::get_vrf_public_key(node_id)
+        .or_else(|| storage.load_vrf_public_key(node_id).ok().flatten())
+        .or_else(|| crate::genesis_constants::get_genesis_anchor_pk(node_id))
+}
+
 /// SYNC producer-signature check for the fork-choice EQUAL-round tie-break. maybe_supersede runs on
 /// UNVERIFIED gossip/repair bytes (verify_stage is skipped for a stored-height duplicate), so a forged
 /// competitor whose (unsigned) `signature` field is ground to a lower hash could otherwise trigger a
@@ -740,11 +766,11 @@ pub fn expected_producer_for_round(height: u64, round: u64) -> Option<String> {
 /// who has the key) can win the tie-break. Mirrors the v4 path of the async verify_microblock_signature:
 /// Block_Sig_v23.1 digest + detached ML-DSA-65 against the producer's registered VRF PK. h==0/genesis
 /// never reaches here (maybe_supersede early-returns h==0); relaunch-from-scratch has no legacy sigs.
-pub(crate) fn verify_microblock_producer_sig_sync(mb: &qnet_state::MicroBlock) -> bool {
+pub(crate) fn verify_microblock_producer_sig_sync(storage: &Storage, mb: &qnet_state::MicroBlock) -> bool {
     let sig_str = match std::str::from_utf8(&mb.signature) { Ok(s) => s, Err(_) => return false };
     let sig_hex = match sig_str.strip_prefix("dilithium3_v4:") { Some(x) => x, None => return false };
     let sig_bytes = match hex::decode(sig_hex) { Ok(b) => b, Err(_) => return false };
-    let pk = match crate::genesis_constants::get_vrf_public_key(&mb.producer) { Some(p) => p, None => return false };
+    let pk = match producer_verify_pk(storage, &mb.producer) { Some(p) => p, None => return false };
     use sha3::Digest;
     let mut hasher = sha3::Sha3_256::new();
     hasher.update(b"Block_Sig_v23.1");
@@ -779,12 +805,22 @@ pub(crate) fn verify_microblock_producer_sig_sync(mb: &qnet_state::MicroBlock) -
 pub(crate) fn microblock_pk_digest(txs: &[qnet_state::Transaction]) -> [u8; 32] {
     use sha3::{Digest, Sha3_256};
     let mut h = Sha3_256::new();
-    h.update(b"pkdg1");
+    h.update(b"pkdg2");
     for tx in txs {
         match tx.dilithium_public_key.as_deref() {
             Some(pk) if !pk.is_empty() => {
                 h.update(&(pk.len() as u32).to_be_bytes());
                 h.update(pk);
+            }
+            _ => { h.update(&0u32.to_be_bytes()); }
+        }
+        // The signature is elided from canonical_bytes, so it is outside tx.hash and merkle_root. It
+        // decides whether a merkle claim is credited (claim_authorized), which makes it a consensus
+        // input — bind it here or a relay could strip it and split state_root off an intact block.
+        match tx.dilithium_signature.as_deref() {
+            Some(sig) if !sig.is_empty() => {
+                h.update(&(sig.len() as u32).to_be_bytes());
+                h.update(sig);
             }
             _ => { h.update(&0u32.to_be_bytes()); }
         }
@@ -876,6 +912,15 @@ mod fix5_kat_tests {
 
 #[cfg(test)]
 mod producer_round_tests {
+    /// The heartbeat admission lag is duplicated across crates (qnet-state cannot depend on
+    /// qnet-integration). Drift between them is a consensus split, so assert equality here.
+    #[test]
+    fn hb_anchor_lag_matches_across_crates() {
+        assert_eq!(crate::node::HB_ANCHOR_MAX_LAG,
+                   qnet_state::transaction::HB_ANCHOR_MAX_LAG_BLOCKS,
+                   "apply-side and producer-side heartbeat lag must agree");
+    }
+
     // A1 ingest hard-gate derivation: leader for an arbitrary round rotates deterministically off the
     // round-0 baseline, and a window we never computed yields None (caller keeps the soft path).
     #[test]
@@ -902,27 +947,27 @@ pub fn clear_expected_producer_cache_above(max_height: u64) {
 // ═══════════════════════════════════════════════════════════════════════════════
 // v33: MACROBLOCK WINDOW CONTENT ACCUMULATOR — deterministic checkpoint content.
 //
-// The checkpoint content (mb_hashes + beacon vrf_outputs) was computed by
+// The checkpoint content (the window's block hashes) was computed by
 // RE-READING the 90 window blocks from storage at window-end. That read is racy:
 // a block already applied to the chain but not yet flushed returns None, so a node
 // builds PARTIAL content (e.g. 89/90) that diverges from nodes with the full
 // window → the 2f+1 checkpoint can't form → finality stalls (the recurring stall).
 //
-// Fix: accumulate each block's (hash, vrf_output) at COMMIT time — when the block
-// is in hand — into a per-window buffer. At window-end the buffer is already
+// Fix: accumulate each block's hash at COMMIT time — when the block is in hand —
+// into a per-window buffer. At window-end the buffer is already
 // complete, in order, and IDENTICAL on every node (all apply the same canonical
 // blocks in the same order). No re-read, no race — deterministic by construction.
 // The head block's state_root (set only after TX apply) is still read separately
 // via the existing bounded head-wait.
 // ═══════════════════════════════════════════════════════════════════════════════
 lazy_static::lazy_static! {
-    /// Key: macroblock index. Value: per-position (block_hash, vrf_output) for the
-    /// 90-block window, indexed by (height - window_start).
-    static ref WINDOW_CONTENT_ACCUM: ParkingRwLock<std::collections::HashMap<u64, Vec<([u8; 32], Option<[u8; 32]>)>>> =
+    /// Key: macroblock index. Value: per-position block hash for the 90-block window, indexed by
+    /// (height - window_start). The beacon folds these same hashes.
+    static ref WINDOW_CONTENT_ACCUM: ParkingRwLock<std::collections::HashMap<u64, Vec<[u8; 32]>>> =
         ParkingRwLock::new(std::collections::HashMap::new());
 }
 
-/// Append a committed block's (hash, vrf_output) to its macroblock window buffer.
+/// Append a committed block's hash to its macroblock window buffer.
 /// Called at the canonical commit point on EVERY apply path (production + pipeline),
 /// so every node accumulates the identical window from the identical canonical chain.
 /// Position-based with truncate-on-reapply: a re-applied block (after a rollback)
@@ -934,7 +979,7 @@ pub fn accumulate_window_block(height: u64, mb: &qnet_state::MicroBlock) {
     let start_h = (mb_idx - 1) * 90 + 1;
     let pos = (height - start_h) as usize;
     if pos >= 90 { return; }
-    let entry = (mb.hash(), mb.vrf_output);
+    let entry = mb.hash();
     let mut map = WINDOW_CONTENT_ACCUM.write();
     let buf = map.entry(mb_idx).or_insert_with(Vec::new);
     if pos <= buf.len() {
@@ -950,17 +995,13 @@ pub fn accumulate_window_block(height: u64, mb: &qnet_state::MicroBlock) {
     }
 }
 
-/// Returns the deterministic (mb_hashes, vrf_outputs) for a fully-accumulated 90-block
-/// window, or None if the buffer is incomplete (caller falls back to the re-read).
-pub fn window_content_from_accum(mb_idx: u64) -> Option<(Vec<[u8; 32]>, Vec<[u8; 32]>)> {
+/// The window's block hashes for a fully-accumulated 90-block window, or None if the buffer is
+/// incomplete (caller falls back to the re-read). Both mb_hashes and the beacon fold this one vector.
+pub fn window_content_from_accum(mb_idx: u64) -> Option<Vec<[u8; 32]>> {
     let map = WINDOW_CONTENT_ACCUM.read();
     let buf = map.get(&mb_idx)?;
     if buf.len() != 90 { return None; }
-    let mb_hashes: Vec<[u8; 32]> = buf.iter().map(|(h, _)| *h).collect();
-    // vrf must be complete — a dropped None shortens the beacon → divergent content.
-    let mut vrf_outputs: Vec<[u8; 32]> = Vec::with_capacity(90);
-    for (_, v) in buf.iter() { vrf_outputs.push((*v)?); }
-    Some((mb_hashes, vrf_outputs))
+    Some(buf.clone())
 }
 
 /// v36: deterministic recent-Heartbeat liveness for Phase-2A producer eligibility.
@@ -1018,9 +1059,61 @@ pub(crate) fn light_roster_cutoff(epoch: u64) -> u64 {
 /// no block-body deserialization. Byte-identical to the body scan (`recent_heartbeat_senders_scan`,
 /// determinism-tested): the index is written on both apply paths and canonicalized at every height
 /// reset, so every node reads the same set for the same scan_end.
-fn recent_heartbeat_senders(storage: &crate::storage::Storage, scan_end: u64) -> std::collections::HashSet<String> {
+fn recent_heartbeat_senders(storage: &crate::storage::Storage, scan_end: u64) -> Option<std::collections::HashSet<String>> {
     let (cur_idx, prev_idx) = recency_subwindow_indices(scan_end);
-    storage.recent_heartbeat_senders_indexed(cur_idx, prev_idx, scan_end).unwrap_or_default()
+    match storage.recent_heartbeat_senders_indexed(cur_idx, prev_idx, scan_end) {
+        Ok(set) => Some(set),
+        // Pruned below the needed subwindow ⇒ the liveness answer for this window is no longer derivable
+        // here. `unwrap_or_default()` used to turn that into an EMPTY set, i.e. "nobody is live" — a
+        // silently different roster on this node alone.
+        Err(e) => {
+            if is_warn() { println!("[WARN][ROSTER] heartbeat_index_unusable scan_end={} err={}", scan_end, e); }
+            None
+        }
+    }
+}
+
+/// The window `w` randomness beacon, DERIVED from the microblock chain instead of read out of the
+/// macroblock that seals it.
+///
+/// The sealed value is `accumulate_beacon(hash of every microblock in the window)` — the same block
+/// hashes the checkpoint QC signs in `window_mb_hashes`, so the macroblock only STORES it; it is not
+/// the authority. Reading it from there made the seed unavailable the moment finality stopped, which
+/// is what turns a finality stall into a height stall.
+///
+/// None ⇒ some body in the window is missing ⇒ the caller abstains. Window w spans
+/// (w-1)*90+1 ..= w*90, i.e. at most 180 blocks behind the production point — always inside the
+/// 6-epoch body retention.
+pub(crate) fn derive_window_beacon(storage: &Storage, w: u64) -> Option<[u8; 32]> {
+    if w == 0 { return None; }
+    let (start, end) = ((w - 1) * 90 + 1, w * 90);
+    let mut v: Vec<[u8; 32]> = Vec::with_capacity(90);
+    for h in start..=end {
+        let mb = storage.load_microblock_auto_format(h).ok().flatten()?;
+        v.push(mb.hash());
+    }
+    Some(qnet_consensus::checkpoint_bft::accumulate_beacon(&v))
+}
+
+/// True iff `node_id` was equivocation-banned at or below `window_head`, read the way the reward roster
+/// already reads it: the LIVE applied state first, disk only for an evicted account.
+///
+/// The accounts column family is NOT the source of truth here. It is written asynchronously and
+/// best-effort after apply, and the producer-inline apply never writes it at all — so a node that just
+/// produced the block carrying an equivocation proof would disagree with every validator about its own
+/// block. The StateManager map IS what state_root is computed from, and `banned_at_height` is
+/// write-once monotone, so reading it at a later tip still answers the as-of-window question exactly.
+fn banned_at_or_below(
+    state_guard: &StateManager,
+    storage: &crate::storage::Storage,
+    node_id: &str,
+    window_head: u64,
+) -> bool {
+    let hit = |h: u64| h > 0 && h <= window_head;
+    match state_guard.accounts.get(node_id) {
+        Some(a) => hit(a.value().banned_at_height),
+        None => storage.load_account(node_id).ok().flatten().map_or(false, |a| hit(a.banned_at_height)),
+    }
 }
 
 /// Activation warmup (2 epochs): a registered super is producer-eligible only after its registration
@@ -1038,6 +1131,7 @@ const ACTIVATION_WARMUP_BLOCKS: u64 = 180;
 /// so only the recent∩registered set (a few thousand) hits disk — NOT the full 100k+ registrant set. This
 /// is a pure predicate reorder of an AND, so the output is byte-identical to gating on reg-height first.
 fn phase2a_eligible_additions(
+    state_guard: &StateManager,
     storage: &crate::storage::Storage,
     registered_super_nodes: &std::collections::HashSet<String>,
     recent_hb: &std::collections::HashSet<String>,
@@ -1046,17 +1140,26 @@ fn phase2a_eligible_additions(
     scan_end: u64,
     min_reputation_bp: u32,
 ) -> Vec<qnet_state::EligibleProducer> {
+    // A candidate re-admitted here is, by definition, NOT in consensus_participants, so the reputation
+    // fold above never saw it and `unwrap_or(INITIAL_REPUTATION)` below would hand a proven-Byzantine
+    // node a clean 70. The ban has to be read here too, from the same state_root-certified field.
     let mut regs: Vec<&String> = registered_super_nodes.iter().collect();
     regs.sort();
     let mut out: Vec<qnet_state::EligibleProducer> = Vec::new();
     for reg in regs {
         if already_eligible.contains(reg) { continue; }
+        // Restart bar, enforced here too: this arm re-admits any registered heartbeating identity, so
+        // filtering only the carry-over would return every barred node on the next window.
+        if crate::genesis_constants::restart_excludes(reg) { continue; }
         if !recent_hb.contains(reg) { continue; }
-        // Registration confirmed AND buried by the activation warmup before scan_end (the live srtr_
-        // pool can run ahead of scan_end under async production). Genesis (reg_height 0) is exempt.
+        // Buried by the activation warmup before scan_end. The pool is already height-bounded at the
+        // source, so this is the warmup rule alone. Genesis (reg_height 0) is exempt.
         match storage.node_reg_height(reg) {
             Ok(Some(h)) if h == 0 || h.saturating_add(ACTIVATION_WARMUP_BLOCKS) <= scan_end => {}
             _ => continue,
+        }
+        if banned_at_or_below(state_guard, storage, reg, scan_end) {
+            continue; // proven equivocator — never re-admitted
         }
         let rep = (reputation_map.get(reg).copied()
             .unwrap_or(qnet_consensus::deterministic_reputation::INITIAL_REPUTATION)
@@ -1077,6 +1180,8 @@ fn recent_heartbeat_senders_scan(storage: &crate::storage::Storage, scan_end: u6
         if let Ok(Some(block)) = storage.load_microblock_auto_format(h) {
             for tx in &block.transactions {
                 if let qnet_state::TransactionType::Heartbeat { node_id, anchor_height, .. } = &tx.tx_type {
+                    // Mirror index_heartbeat_inclusion: a stale or future anchor grants no liveness.
+                    if *anchor_height >= h || h - *anchor_height > HB_ANCHOR_MAX_LAG { continue; }
                     let s = anchor_height / 1440;
                     if s == cur_idx || s == prev_idx { set.insert(node_id.clone()); }
                 }
@@ -1116,6 +1221,20 @@ pub fn try_get_storage() -> Option<&'static Arc<Storage>> {
     GLOBAL_STORAGE_INSTANCE.get()
 }
 
+/// Applied state, published once at startup. The A1 roster derivation runs from an associated fn on the
+/// candidate path (no &self there) and needs the SAME map state_root is computed from — the accounts
+/// column family is an async best-effort mirror and must never back a consensus verdict.
+pub static GLOBAL_STATE_INSTANCE: OnceCell<Arc<RwLock<StateManager>>> = OnceCell::const_new();
+
+pub fn init_global_state(state: Arc<RwLock<StateManager>>) {
+    let _ = GLOBAL_STATE_INSTANCE.set(state);
+}
+
+#[inline]
+pub fn try_get_state() -> Option<&'static Arc<RwLock<StateManager>>> {
+    GLOBAL_STATE_INSTANCE.get()
+}
+
 // CRITICAL FIX: Track last block production time globally for stall detection
 // This prevents network from getting stuck when all nodes stop producing
 pub static LAST_BLOCK_PRODUCED_TIME: AtomicU64 = AtomicU64::new(0);
@@ -1150,6 +1269,61 @@ pub static PRODUCER_WATCHDOG_STARTED: AtomicU64 = AtomicU64::new(0);
 /// and the slot cadence is itself ~1s. Stored as wall-clock ms.
 pub static LAST_NETWORK_HEARTBEAT_MS: AtomicU64 = AtomicU64::new(0);
 const NETWORK_HEARTBEAT_INTERVAL_MS: u64 = 1_000;
+
+/// Self-restart budget for the stuck-height watchdog. A restart clears local transport and RAM
+/// state; if the block is still unobtainable after this many attempts the cause is structural and
+/// further restarts only destroy accumulated consensus state.
+const MAX_STUCK_SELF_RESTARTS: u32 = 3;
+/// Restart attempts survive the process, so the watchdog cannot reset its own budget by restarting.
+/// Path is bound to the SAME directory the storage opened — resolving it independently risks writing
+/// the budget to a path the deployment does not persist, silently restoring the infinite loop.
+static STUCK_RESTART_DIR: once_cell::sync::OnceCell<std::path::PathBuf> = once_cell::sync::OnceCell::new();
+
+/// Bind the restart-budget location to the node's actual data directory. Called once at storage init.
+pub fn bind_stuck_restart_dir(data_dir: &str) {
+    let _ = STUCK_RESTART_DIR.set(std::path::PathBuf::from(data_dir));
+}
+
+fn stuck_restart_file() -> std::path::PathBuf {
+    STUCK_RESTART_DIR.get().cloned()
+        .unwrap_or_else(|| std::path::PathBuf::from(
+            std::env::var("QNET_DATA_DIR").unwrap_or_else(|_| "/app/data".to_string())))
+        .join("stuck_restart_state")
+}
+
+/// Count one restart attempt for `height`; resets when the stuck height changes (real progress).
+fn record_stuck_restart_attempt(height: u64) -> u32 {
+    let path = stuck_restart_file();
+    let prev = std::fs::read_to_string(&path).ok()
+        .and_then(|s| {
+            let mut it = s.trim().split(':');
+            Some((it.next()?.parse::<u64>().ok()?, it.next()?.parse::<u32>().ok()?))
+        });
+    let attempts = match prev {
+        Some((h, n)) if h == height => n.saturating_add(1),
+        _ => 1,
+    };
+    // A failed write means the budget cannot persist and the node would restart forever. Report it
+    // loudly and treat this attempt as terminal — staying up degraded beats an invisible loop.
+    if let Err(e) = std::fs::write(&path, format!("{}:{}", height, attempts)) {
+        println!("[CRIT][NODE] restart_budget_write_failed path={} err={} action=treat_as_exhausted",
+                 path.display(), e);
+        return u32::MAX;
+    }
+    attempts
+}
+
+/// Clear the restart budget once the node makes real progress past the stuck height.
+pub fn clear_stuck_restart_state() {
+    let _ = std::fs::remove_file(stuck_restart_file());
+}
+
+/// Wall-clock ms of the last tick this node held production authority.
+static LAST_LEADERSHIP_MS: AtomicU64 = AtomicU64::new(0);
+/// Keep heartbeating this long after the rotation ends — covers peers still a few blocks behind
+/// that would otherwise read the handoff silence as producer death. Short, because verified blocks
+/// already feed liveness for free; this only bridges the gap between the last block and the handoff.
+const LEADER_HEARTBEAT_GRACE_MS: u64 = 5_000;
 
 #[inline]
 pub fn record_producer_heartbeat() {
@@ -1195,6 +1369,219 @@ pub(crate) const MAX_UNSEALED_WINDOWS: u64 = 2;
 /// liveness. Doubles as the ACCEPTANCE bound on the round dimension so a Byzantine committee member
 /// cannot mint unbounded distinct (window, round) vote keys.
 pub const MAX_FAILOVER_ROUND: u64 = 50;
+
+/// PARTICIPATION-only recovery arm: `(anchor_mb, anchor_mb_hash, anchor_cp_index)`.
+///
+/// This gates ONLY what this node will propose, vote and count. It NEVER gates validity: whether a
+/// certificate is relaxed is a pure function of that certificate's own bytes plus one final
+/// macroblock (see `resolve_recovery_pin`). Keeping the two predicates separate is what makes
+/// disagreement here cost liveness (no QC forms, retry) instead of forking the chain.
+pub static RC_ARMED: once_cell::sync::Lazy<parking_lot::RwLock<Option<(u64, [u8; 32], u64)>>> =
+    once_cell::sync::Lazy::new(|| parking_lot::RwLock::new(None));
+
+/// Seconds of certified-checkpoint silence before the recovery arm may engage. Two orders of
+/// magnitude above VIEW_TIMEOUT_MS so no transient, view change or rotation can reach it.
+pub const RC_STALL_SECS: u64 = 600;
+
+/// Master switch for the recovery relaxation. OFF.
+///
+/// The verifier path stays compiled and correct, but nothing can ever arm, so no checkpoint carries a
+/// `recovery_anchor` and the relaxed branch is unreachable dead code. Turning it on requires, at
+/// minimum: a per-(anchor, window_head) single-vote rule in CheckpointConsensus (without it no
+/// verifier can attribute a per-window double vote, so the freed index has no accountability arm); a
+/// window bound enforced at PROPOSE time, not only at arm time, so a span self-terminates instead of
+/// sealing an unpinnable macroblock at k>6; one canonical anchor per head (k <= 3 for a boundary head,
+/// else two anchors validate the same head and the single-C_S intersection argument is void);
+/// alignment of `rc_span_windows` with the failover key `floor(h/90)`; a TIMEOUT_VOTES purge on the
+/// anchor flip; and Effect::Persist routed through resolve_recovery_pin before save_macroblock, so a
+/// node never seals what its peers will reject.
+///
+/// It is inert at genesis anyway (RELAXED_MIN_COMMITTEE = 10 vs 5 nodes). Recovery from a halt is the
+/// coordinated restart — see documentation/technical/COORDINATED_RESTART_RUNBOOK.md.
+pub const RC_ENABLED: bool = false;
+
+/// The armed anchor, or None.
+pub fn rc_armed() -> Option<(u64, [u8; 32], u64)> { *RC_ARMED.read() }
+
+/// An operator asked to arm. The RPC must NOT write `RC_ARMED` directly — the driver has to be told
+/// too, and only the consensus loop does that. Writing the global alone left the driver unarmed and
+/// the loop in its already-armed branch forever, disabling the automatic arm. One-shot, consumed by
+/// the loop, so both paths run identical code and the operator shortens only the stall wait.
+static RC_ARM_REQUEST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn rc_request_arm() { RC_ARM_REQUEST.store(true, std::sync::atomic::Ordering::SeqCst); }
+
+/// Consume the request. True at most once per operator call.
+pub fn rc_take_arm_request() -> bool { RC_ARM_REQUEST.swap(false, std::sync::atomic::Ordering::SeqCst) }
+
+/// Checkpoint-index span `[lo, hi]` this node is armed for.
+pub fn rc_span_indices() -> Option<(u64, u64)> {
+    rc_armed().map(|(_, _, i)| (i + 1, i + qnet_consensus::checkpoint_bft::RC_SPAN_INDICES))
+}
+
+/// MACROBLOCK-window span `[A+1, A+2]` this node is armed for. Used by the failover paths, which key
+/// everything by macroblock index (`committee_for_height(w*90)`).
+pub fn rc_span_windows() -> Option<(u64, u64)> { rc_armed().map(|(a, _, _)| (a + 1, a + 2)) }
+
+/// The SAME span in CHECKPOINT-window units — `head / CHECKPOINT_INTERVAL`, which is how the driver's
+/// `next_window()` and the consensus loop's window buffer are keyed. The two unit systems differ by
+/// `MACROBLOCK_INTERVAL / CHECKPOINT_INTERVAL` (3), and mixing them silently disables the span: the
+/// committee override never matches a real span window, the pinned proposal then carries the DERIVED
+/// committee, and `verify_v2_macroblock`'s committee clause rejects it on every node.
+pub fn rc_span_cp_windows() -> Option<(u64, u64)> {
+    rc_armed().map(|(a, _, _)| rc_span_cp_windows_for(a))
+}
+
+/// Pure form of the above, so the unit conversion is testable without touching the global arm.
+pub fn rc_span_cp_windows_for(anchor_mb: u64) -> (u64, u64) {
+    use qnet_consensus::checkpoint_bft::{CHECKPOINT_INTERVAL, MACROBLOCK_INTERVAL, RC_SPAN_INDICES};
+    let per_mb = MACROBLOCK_INTERVAL / CHECKPOINT_INTERVAL;
+    (anchor_mb * per_mb + 1, anchor_mb * per_mb + RC_SPAN_INDICES)
+}
+
+/// Effective threshold for a certificate at checkpoint `index` under THIS node's arm. Advisory —
+/// used by the live-gossip and failover paths, never by the macroblock authority.
+pub fn rc_effective_quorum(index: u64, committee_len: usize) -> usize {
+    let relaxed = matches!(rc_span_indices(), Some((lo, hi)) if index >= lo && index <= hi);
+    qnet_consensus::checkpoint_bft::effective_quorum(committee_len, relaxed)
+}
+
+/// Same, for a failover certificate scoped to macroblock window `w`.
+pub fn rc_effective_quorum_window(w: u64, committee_len: usize) -> usize {
+    let relaxed = matches!(rc_span_windows(), Some((lo, hi)) if w >= lo && w <= hi);
+    qnet_consensus::checkpoint_bft::effective_quorum(committee_len, relaxed)
+}
+
+/// Committee members this node has a signature-verified consensus message from inside the stall
+/// window. Published by the consensus loop so the halt test and the operator RPC read ONE view —
+/// two different liveness answers would let an operator arm on numbers the engine disagrees with.
+pub static RC_HEARD: once_cell::sync::Lazy<parking_lot::RwLock<std::collections::HashSet<String>>> =
+    once_cell::sync::Lazy::new(|| parking_lot::RwLock::new(std::collections::HashSet::new()));
+
+pub fn rc_publish_heard(live: std::collections::HashSet<String>) { *RC_HEARD.write() = live; }
+
+pub fn rc_recent_consensus_senders() -> std::collections::HashSet<String> { RC_HEARD.read().clone() }
+
+/// Why an arm attempt was refused. Reported verbatim by node_armRecovery so an operator sees the
+/// reason rather than a silent false.
+pub enum RcArmRefusal {
+    /// Master switch off — see RC_ENABLED for what turning it on requires.
+    Disabled,
+    NotHalted,
+    AnchorMissing,
+    AnchorRelaxed,
+    CommitteeBelowFloor(usize),
+    QuorumStillReachable(usize, usize),
+    TooFewLive(usize, usize),
+}
+
+impl RcArmRefusal {
+    pub fn reason(&self) -> String {
+        match self {
+            RcArmRefusal::Disabled => "recovery_relaxation_disabled".to_string(),
+            RcArmRefusal::NotHalted => "not_halted".to_string(),
+            RcArmRefusal::AnchorMissing => "anchor_missing".to_string(),
+            RcArmRefusal::AnchorRelaxed => "anchor_relaxed".to_string(),
+            RcArmRefusal::CommitteeBelowFloor(n) => format!("committee_below_floor n={}", n),
+            RcArmRefusal::QuorumStillReachable(h, q) => format!("quorum_still_reachable heard={} q={}", h, q),
+            RcArmRefusal::TooFewLive(h, r) => format!("too_few_live heard={} relaxed_q={}", h, r),
+        }
+    }
+}
+
+/// Evaluate the halt condition and arm on success. `heard` = C_S members this node has a
+/// signature-verified consensus message from inside the stall window.
+///
+/// Every condition is mandatory for BOTH the operator RPC and the automatic path — the operator can
+/// only shorten the stall wait, never bypass the floor, the halt itself, or the no-chained-span rule.
+pub fn rc_try_arm(
+    storage: &Storage,
+    heard: &std::collections::HashSet<String>,
+    stalled: bool,
+) -> Result<(u64, [u8; 32], u64), RcArmRefusal> {
+    let out = rc_try_arm_dry(storage, heard, stalled)?;
+    *RC_ARMED.write() = Some(out);
+    if is_warn() {
+        println!("[WARN][RC] armed anchor_mb={} cp_index={}", out.0, out.2);
+    }
+    Ok(out)
+}
+
+/// Every condition of `rc_try_arm`, evaluated with NO side effect. Lets the operator RPC report the
+/// real refusal reason without arming, so the actual arm can be left to the consensus loop — which is
+/// the only place that can also tell the driver and honour its refusal.
+pub fn rc_try_arm_dry(
+    storage: &Storage,
+    heard: &std::collections::HashSet<String>,
+    stalled: bool,
+) -> Result<(u64, [u8; 32], u64), RcArmRefusal> {
+    if !RC_ENABLED { return Err(RcArmRefusal::Disabled); }
+    use qnet_consensus::checkpoint_bft::{Checkpoint, QuorumCertificate, RELAXED_MIN_COMMITTEE,
+                                         quorum_size, relaxed_quorum};
+    if !stalled { return Err(RcArmRefusal::NotHalted); }
+    let a = storage.last_sealed_mb_index();
+    if a == 0 { return Err(RcArmRefusal::AnchorMissing); }
+    let mb_a = storage.get_macroblock_by_height(a).ok().flatten()
+        .and_then(BlockchainNode::macroblock_plaintext)
+        .and_then(|b| bincode::deserialize::<qnet_state::MacroBlock>(&b).ok())
+        .ok_or(RcArmRefusal::AnchorMissing)?;
+    let (cp_a, _qc_a): (Checkpoint, QuorumCertificate) = mb_a.consensus_data.checkpoint_qc.as_ref()
+        .and_then(|b| bincode::deserialize(b).ok())
+        .ok_or(RcArmRefusal::AnchorMissing)?;
+    // No chained spans: the anchor must itself be full-quorum-sealed.
+    if cp_a.recovery_anchor.is_some() { return Err(RcArmRefusal::AnchorRelaxed); }
+    let cs = mb_a.consensus_data.consensus_committee.clone().unwrap_or_default();
+    if cs.len() < RELAXED_MIN_COMMITTEE { return Err(RcArmRefusal::CommitteeBelowFloor(cs.len())); }
+    let live = cs.iter().filter(|id| heard.contains(*id)).count();
+    let q = quorum_size(cs.len());
+    let qr = relaxed_quorum(cs.len());
+    // Strictly between the two thresholds: at or above `q` the chain is not quorum-blocked (the halt
+    // is something else and relaxing would not fix it); below `qr` the relaxation cannot help either.
+    if live >= q { return Err(RcArmRefusal::QuorumStillReachable(live, q)); }
+    if live < qr { return Err(RcArmRefusal::TooFewLive(live, qr)); }
+    let ah = mb_a.hash();
+    if is_warn() {
+        println!("[WARN][RC] arm_eligible anchor_mb={} cp_index={} committee={} q_strict={} q_relaxed={} live={}",
+                 a, cp_a.index, cs.len(), q, qr, live);
+    }
+    Ok((a, ah, cp_a.index))
+}
+
+/// Clear the arm. Called the instant a macroblock above `A + 2` seals — the span is over and the
+/// chain is back on the strict threshold.
+pub fn rc_disarm() {
+    if RC_ARMED.write().take().is_some() && is_warn() {
+        println!("[WARN][RC] disarmed reason=span_complete");
+    }
+}
+
+/// The armed anchor's committee (C_S), ignoring any window range. The committee derived for a stuck
+/// window is NOT C_S — its candidate set is read from the uncertified tail and has already been
+/// shrunk by the inactivity filter — so every span-scoped consensus decision must resolve it here
+/// instead of deriving it.
+fn rc_anchor_committee(storage: &Storage) -> Option<Vec<String>> {
+    let (a, ah, _) = rc_armed()?;
+    let mb = BlockchainNode::load_macroblock_checked(storage, a, &ah)?;
+    let cs = mb.consensus_data.consensus_committee.clone().unwrap_or_default();
+    if cs.len() < qnet_consensus::checkpoint_bft::RELAXED_MIN_COMMITTEE { return None; }
+    Some(cs)
+}
+
+/// C_S when MACROBLOCK window `w` is inside the armed span. For the failover paths.
+pub fn rc_span_committee_mb(storage: &Storage, w: u64) -> Option<Vec<String>> {
+    let (lo, hi) = rc_span_windows()?;
+    if w < lo || w > hi { return None; }
+    rc_anchor_committee(storage)
+}
+
+/// C_S when CHECKPOINT window `w` (`head / CHECKPOINT_INTERVAL`) is inside the armed span. For the
+/// driver's window buffer. Separate from the `_mb` form on purpose: the two callers key windows in
+/// different units, and one shared function silently answered `None` for every real span window.
+pub fn rc_span_committee_cp(storage: &Storage, w: u64) -> Option<Vec<String>> {
+    let (lo, hi) = rc_span_cp_windows()?;
+    if w < lo || w > hi { return None; }
+    rc_anchor_committee(storage)
+}
 
 /// Value-TX ML-DSA-65 verify concurrency, sized to cores. TWO reserved pools so a cheap mempool
 /// flood on the admission lane can never starve consensus block-validation (cross-lane DoS).
@@ -1257,11 +1644,15 @@ fn value_verify_cache_put(key: [u8; 32]) {
 /// young chain (last_finalized==0 / seal_base==0) is exempt. Output is a local pacing decision, never
 /// hashed into consensus. Extracted so the boundary invariant is pinned by a regression test.
 pub(crate) fn production_throttle_reason(next_block_height: u64, last_finalized: u64, seal_base: u64) -> Option<&'static str> {
-    const MAX_UNFINALIZED_BLOCKS: u64 = 3 * qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL;
-    const MAX_UNSEALED_BLOCKS: u64 = MAX_UNSEALED_WINDOWS * qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
-    let fin_over = last_finalized > 0 && next_block_height > last_finalized + MAX_UNFINALIZED_BLOCKS;
-    let seal_over = seal_base > 0 && next_block_height > seal_base + MAX_UNSEALED_BLOCKS;
-    if seal_over { Some("macroblock_seal") } else if fin_over { Some("bft_finality") } else { None }
+    let _ = last_finalized;
+    // A1: production does not stop when finality stops — roster and seed come from the frozen anchor
+    // M_A (frozen_roster / frozen_beacon), pure functions of sealed bytes. The one ceiling is the
+    // frozen horizon: MAX_DERIVED_ROSTER_WINDOWS windows past the last seal, then park and sync (an
+    // unbounded unfinalized tail is an unbounded reorg). Pure scalars ⇒ all nodes park at one height.
+    const MAX_DERIVED_BLOCKS: u64 = (BlockchainNode::MAX_DERIVED_ROSTER_WINDOWS as u64)
+        * qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
+    let seal_over = seal_base > 0 && next_block_height > seal_base + MAX_DERIVED_BLOCKS;
+    if seal_over { Some("roster_derivation_horizon") } else { None }
 }
 
 // failover_slot_height REMOVED: the failover vote key derives from the voter's OWN verified tip
@@ -1279,6 +1670,16 @@ pub static LAST_FINALIZED_CONSENSUS_ROUND: AtomicU64 = AtomicU64::new(0);
 // Updated when macroblock is saved (macroblock covers 90 microblocks).
 // All rollback paths MUST check this: rollback below finalized height is FORBIDDEN.
 // This provides the same guarantee as Casper FFG checkpoints.
+/// Max anchor lag the heartbeat admission rule allows. An epoch's liveness is therefore only SETTLED
+/// this many blocks past its end — sampling eligibility before that reads a set no later observer can
+/// reproduce.
+pub const HB_ANCHOR_MAX_LAG: u64 = 90;
+
+/// Height whose inline-apply rebuild failed. Non-zero ⇒ RAM state is UNVOUCHED and this node must
+/// not produce: shipping a block built on it would fork the node off. NEVER cleared in-process — a
+/// restart is the only way to rebuild RAM safely.
+pub static INLINE_APPLY_UNVOUCHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub static LAST_FINALIZED_HEIGHT: AtomicU64 = AtomicU64::new(0);
 
 /// FIX R23-F3: Weak subjectivity checkpoint — prevents long-range attacks.
@@ -1453,6 +1854,10 @@ pub fn check_finality_allows_rollback(target_height: u64) -> Result<(), String> 
 /// Prevents the bug where a new rollback path forgets to clear entropy/vote caches.
 /// Called after blocks are deleted and height is updated.
 pub fn complete_rollback_cleanup(target_height: u64) {
+    // Both caches are read ahead of storage; a stale entry above the rollback point lets an
+    // orphaned child pass chain-continuity and persist parentless.
+    if let Some(s) = try_get_storage() { s.invalidate_recent_microblocks_above(target_height); }
+    crate::unified_p2p::truncate_stored_height(target_height);
     crate::unified_p2p::clear_all_pending_sync();
     crate::unified_p2p::clear_all_pending_sync_macroblocks();
     clear_expected_producer_cache_above(target_height);
@@ -1504,11 +1909,53 @@ pub fn try_advance_finality(round: u64, context: &str) -> bool {
     drop(_finality_guard);
     if let Some(storage) = try_get_storage() {
         refresh_current_committee(&storage, round);
+        // Finality is irreversible, so branches at or below it can never be adopted — dropping
+        // them here is what bounds the retained tree. Throttled to macroblock boundaries: the scan
+        // is over headers, and running it every block would be pure overhead at 1 block/s.
+        if round % qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL == 0 {
+            let s = storage.clone();
+            tokio::spawn(async move {
+                tokio::task::spawn_blocking(move || { s.prune_branches_below_finality(round); }).await.ok();
+            });
+        }
     }
     if let Some(p2p) = try_get_p2p() {
         p2p.refresh_signed_head_throttled(round);
     }
     true
+}
+
+/// Re-feed the retained branch that continues from `from_height` back into the pipeline. After a
+/// rollback the competing branch is already in the store (kept by hash, not deleted), so the chain
+/// can continue from local data instead of a network round-trip. Returns how many blocks were
+/// re-submitted. Feeding through the normal ingest path means every gate still applies — this is a
+/// shortcut in transport only, never in validation.
+pub fn adopt_retained_successor(storage: &Arc<Storage>, from_height: u64) -> usize {
+    let ingest = match try_get_pipeline_ingest() { Some(i) => i, None => return 0 };
+    let parent_hash = match storage.canonical_hash_at(from_height) { Some(h) => h, None => return 0 };
+    let mut submitted = 0usize;
+    let mut cursor = parent_hash;
+    // Walk forward while exactly one retained child continues the chain. A branch point (more than
+    // one child) is left to fork-choice — adopting either side here would be an arbitrary decision.
+    loop {
+        let children = storage.children_of(&cursor);
+        if children.len() != 1 { break; }
+        let child = children[0];
+        let body = match storage.load_body_by_hash(&child) { Some(b) => b, None => break };
+        let bytes = match bincode::serialize(&body) { Ok(b) => b, Err(_) => break };
+        let ib = crate::block_pipeline::IngestBlock {
+            height: body.height,
+            data: bytes,
+            block_type: "micro".to_string(),
+            from_peer: "local_branch".to_string(),
+            received_at: 0,
+        };
+        if !ingest.submit(ib) { break; }
+        submitted += 1;
+        cursor = child;
+        if submitted >= 128 { break; } // bounded: the rest arrives through normal sync
+    }
+    submitted
 }
 
 /// Refresh the cached committee membership (anti-forgery head-clamp anchor) once per epoch. members =
@@ -1922,7 +2369,7 @@ pub static EQUIVOCATION_EVIDENCE: once_cell::sync::Lazy<DashMap<(u64, String), (
 ///
 /// Storage shape:
 ///   Key:   (height, producer_id) — one offence per (slot, validator)
-///   Value: BlockEquivocationEvidence { hash_a, hash_b, sig_a, sig_b, ts }
+///   Value: BlockEquivocationEvidence { hash_a, hash_b, ts, header_a, header_b }
 ///
 /// Both `(hash, sig)` pairs are kept so on-chain verifiers can re-check the
 /// Dilithium3 signatures against the canonical signing message format and
@@ -1935,8 +2382,6 @@ pub static EQUIVOCATION_EVIDENCE: once_cell::sync::Lazy<DashMap<(u64, String), (
 pub struct BlockEquivocationEvidence {
     pub hash_a: [u8; 32],
     pub hash_b: [u8; 32],
-    pub sig_a: Vec<u8>,
-    pub sig_b: Vec<u8>,
     pub detected_ts: u64,
     // Full signable headers of both conflicting blocks — used to build the on-chain
     // EquivocationProof TX (the rejected block is not in storage, so it is captured here).
@@ -1946,6 +2391,34 @@ pub struct BlockEquivocationEvidence {
 
 pub static BLOCK_EQUIVOCATION_EVIDENCE: once_cell::sync::Lazy<DashMap<(u64, String), BlockEquivocationEvidence>> =
     once_cell::sync::Lazy::new(|| DashMap::new());
+
+/// THE block-identity digest for equivocation — the fields that make two blocks DIFFERENT blocks.
+///
+/// Byte-identical to `MicroBlock::hash`'s field set, deliberately: the storage anti-fork guard
+/// produces the evidence when those hashes differ, and the on-chain acceptor decides the ban from it.
+/// If the two ever disagree, one of them is wrong about what a block IS.
+///
+/// It must NOT compare the signature or the VRF proof. Both are randomised ML-DSA outputs, so an
+/// honest producer re-emitting the same block after a rollback signs different bytes over the same
+/// digest — comparing them would turn a normal restart into a permanent, chain-committed ban.
+pub(crate) fn equivocation_identity_hash(
+    height: u64,
+    producer_id: &str,
+    h: &qnet_state::EquivocationHeader,
+) -> [u8; 32] {
+    let mut hasher = Sha3_256::new();
+    hasher.update(&height.to_le_bytes());
+    hasher.update(&h.timestamp.to_le_bytes());
+    hasher.update(&h.previous_hash);
+    hasher.update(&h.merkle_root);
+    hasher.update(producer_id.as_bytes());
+    hasher.update(&h.timeout_round.to_le_bytes());
+    hasher.update(&h.carried_baseline.to_le_bytes());
+    qnet_state::block::fold_vrf_output(&mut hasher, &h.vrf_output);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&hasher.finalize());
+    out
+}
 
 /// Records a block-equivocation offence for the next macroblock's slashing list.
 ///
@@ -1962,25 +2435,8 @@ pub fn record_block_equivocation(
     header_a: qnet_state::EquivocationHeader,
     header_b: qnet_state::EquivocationHeader,
 ) {
-    // Equivocation identity key over the signable header fields (height, ts, prev, merkle,
-    // producer, round, carried_baseline). carried_baseline is now a signed, hash-distinguishing
-    // field, so a same-producer double-sign that differs ONLY in carried_baseline must NOT collapse
-    // to the "same block" early-out below — otherwise that provable equivocation escapes slashing.
-    let block_hash = |h: &qnet_state::EquivocationHeader| -> [u8; 32] {
-        let mut hasher = Sha3_256::new();
-        hasher.update(&height.to_le_bytes());
-        hasher.update(&h.timestamp.to_le_bytes());
-        hasher.update(&h.previous_hash);
-        hasher.update(&h.merkle_root);
-        hasher.update(producer_id.as_bytes());
-        hasher.update(&h.timeout_round.to_le_bytes());
-        hasher.update(&h.carried_baseline.to_le_bytes());
-        let mut out = [0u8; 32];
-        out.copy_from_slice(&hasher.finalize());
-        out
-    };
-    let hash_a = block_hash(&header_a);
-    let hash_b = block_hash(&header_b);
+    let hash_a = equivocation_identity_hash(height, producer_id, &header_a);
+    let hash_b = equivocation_identity_hash(height, producer_id, &header_b);
     if hash_a == hash_b {
         return; // Same block — not equivocation.
     }
@@ -1990,24 +2446,27 @@ pub fn record_block_equivocation(
         .unwrap_or(0);
     let key = (height, producer_id.to_string());
     let already_recorded = BLOCK_EQUIVOCATION_EVIDENCE.contains_key(&key);
-    let sig_a = header_a.signature.clone();
-    let sig_b = header_b.signature.clone();
     BLOCK_EQUIVOCATION_EVIDENCE.entry(key)
         .or_insert(BlockEquivocationEvidence {
-            hash_a, hash_b, sig_a, sig_b, detected_ts: now_ts, header_a, header_b,
+            hash_a, hash_b, detected_ts: now_ts, header_a, header_b,
         });
-    if !already_recorded && is_warn() {
-        println!("[WARN][SLASH] block_equivocation_recorded h={} producer={} ts={}",
-                 height, producer_id, now_ts);
+    if !already_recorded {
+        if is_warn() {
+            println!("[WARN][SLASH] block_equivocation_recorded h={} producer={} ts={}",
+                     height, producer_id, now_ts);
+        }
+        // Publish immediately: whoever detects is almost never the next producer, and evidence held
+        // privately simply ages out. Only on the FIRST record, so a repeat sighting is not re-spam.
+        gossip_pending_equivocation_evidence();
     }
 }
 
 /// Drains pending block-equivocation evidence into canonical `EquivocationProof`
-/// system TXs for the block this node is producing. BLOCK-LEVEL ONLY — never
-/// gossiped, exactly like emission: the proof rides inside a producer-signed
-/// block, applies as a no-op to state, and is re-verified cryptographically in
-/// the deterministic reputation fold (a forged/invalid proof fails there → no
-/// false ban). Returns `(tx_hash, bincode_bytes)` pairs; drained entries are
+/// system TXs for the block this node is producing. Evidence is ALSO gossiped at detection
+/// (gossip_pending_equivocation_evidence) so a proof no longer depends on its own detector winning
+/// a slot; the proof applies to state (banned_at_height) and is cryptographically re-verified at
+/// admission and at block validity, so a forged one never lands.
+/// Returns `(tx_hash, bincode_bytes)` pairs; drained entries are
 /// removed (drain-once — multiple detectors give inclusion redundancy without
 /// re-spamming the chain).
 ///
@@ -2017,6 +2476,61 @@ pub fn record_block_equivocation(
 /// the ordered `block_a` (NO wall-clock — keeps the TX hash reproducible).
 /// `max` caps the per-block drain so an evidence burst can't blow the 1-sec
 /// production deadline; the remainder is picked up by the next block produced.
+/// Canonical `EquivocationProof` TX for one piece of evidence. SINGLE construction shared by the
+/// producer drain and the gossip publisher, so every detector emits byte-identical bytes and the
+/// chain dedups on hash instead of accumulating variants.
+fn build_block_equivocation_tx(
+    key: &(u64, String),
+    ev: &BlockEquivocationEvidence,
+) -> Option<(String, Vec<u8>)> {
+    // Canonical header order — smaller block-hash is block_a (detection-order-free).
+    let (block_a, block_b) = if ev.hash_a <= ev.hash_b {
+        (ev.header_a.clone(), ev.header_b.clone())
+    } else {
+        (ev.header_b.clone(), ev.header_a.clone())
+    };
+    let mut tx = qnet_state::Transaction {
+        hash: String::new(),
+        from: "system_slashing".to_string(),
+        to: None,
+        amount: 0,
+        nonce: 0,
+        gas_price: 0,
+        gas_limit: 0,
+        timestamp: block_a.timestamp, // deterministic (no SystemTime)
+        signature: None,
+        public_key: None,
+        tx_type: qnet_state::TransactionType::EquivocationProof {
+            offender: key.1.clone(),
+            height: key.0,
+            block_a,
+            block_b,
+        },
+        data: None,
+        dilithium_signature: None,
+        dilithium_public_key: None,
+        chain_id: 0,
+    };
+    tx.hash = tx.calculate_hash();
+    bincode::serialize(&tx).ok().map(|bytes| (tx.hash.clone(), bytes))
+}
+
+/// Publish pending block-equivocation evidence to peers WITHOUT draining it.
+///
+/// Evidence used to be block-level only, so a proof reached the chain solely if its own detector
+/// happened to produce a block before the evidence aged out — at any real validator count that is
+/// almost never, which is why the ban never fired. Gossiping cannot affect the VERDICT (the ban set
+/// is recomputed from COMMITTED proofs and each one is cryptographically re-verified at admission
+/// and at block validity); it only decides whether a proof ever reaches a producer at all.
+pub fn gossip_pending_equivocation_evidence() {
+    let p2p = match try_get_p2p() { Some(p) => p, None => return };
+    for entry in BLOCK_EQUIVOCATION_EVIDENCE.iter() {
+        if let Some((_, bytes)) = build_block_equivocation_tx(entry.key(), entry.value()) {
+            let _ = p2p.broadcast_transaction(bytes);
+        }
+    }
+}
+
 pub fn drain_equivocation_proof_txs(max: usize) -> Vec<(String, Vec<u8>)> {
     if BLOCK_EQUIVOCATION_EVIDENCE.is_empty() {
         return Vec::new();
@@ -2032,51 +2546,20 @@ pub fn drain_equivocation_proof_txs(max: usize) -> Vec<(String, Vec<u8>)> {
             Some(v) => v.clone(),
             None => continue,
         };
-        let (height, offender) = (key.0, key.1.clone());
-        // Canonical header order — smaller block-hash is block_a (detection-order-free).
-        let (block_a, block_b) = if ev.hash_a <= ev.hash_b {
-            (ev.header_a.clone(), ev.header_b.clone())
-        } else {
-            (ev.header_b.clone(), ev.header_a.clone())
-        };
-        let mut tx = qnet_state::Transaction {
-            hash: String::new(),
-            from: "system_slashing".to_string(),
-            to: None,
-            amount: 0,
-            nonce: 0,
-            gas_price: 0,
-            gas_limit: 0,
-            timestamp: block_a.timestamp, // deterministic (no SystemTime)
-            signature: None,
-            public_key: None,
-            tx_type: qnet_state::TransactionType::EquivocationProof {
-                offender: offender.clone(),
-                height,
-                block_a,
-                block_b,
-            },
-            data: None,
-            dilithium_signature: None,
-            dilithium_public_key: None,
-            chain_id: 0,
-        };
-        tx.hash = tx.calculate_hash();
-        match bincode::serialize(&tx) {
-            Ok(bytes) => {
-                let tx_hash = tx.hash.clone();
+        match build_block_equivocation_tx(&key, &ev) {
+            Some((tx_hash, bytes)) => {
                 BLOCK_EQUIVOCATION_EVIDENCE.remove(&key);
                 if is_warn() {
                     println!(
                         "[WARN][SLASH] equivocation_proof_tx_built offender={} h={} tx={}",
-                        offender, height, &tx_hash[..16.min(tx_hash.len())],
+                        key.1, key.0, qnet_state::char_prefix(&tx_hash, 16),
                     );
                 }
                 out.push((tx_hash, bytes));
             }
-            Err(e) => {
+            None => {
                 if is_warn() {
-                    println!("[WARN][SLASH] equivocation_proof_serialize_fail h={} err={}", height, e);
+                    println!("[WARN][SLASH] equivocation_proof_serialize_fail h={}", key.0);
                 }
             }
         }
@@ -2123,9 +2606,25 @@ static VOTE_FIRST_SEEN: once_cell::sync::Lazy<DashMap<(u64, String), ([u8; 32], 
 /// within one round, so a tight window bounds memory at any committee size.
 const VOTE_DETECT_WINDOW: u64 = 256;
 
+/// A round has ONE honest proposal; an equivocating leader has two. Anything beyond that proves
+/// nothing extra, and the admission gate accepts a Proposal from any committee MEMBER (not just the
+/// leader), so an uncapped cache is a remotely-driven allocation: committee_size distinct checkpoints
+/// per index, times the retention window, times megabytes each.
+const MAX_PROPOSALS_PER_INDEX: usize = 4;
+
+/// (round index) → how many distinct proposals were cached for it. Pruned with the caches below.
+static VOTE_PROPOSAL_COUNT: once_cell::sync::Lazy<DashMap<u64, usize>> =
+    once_cell::sync::Lazy::new(|| DashMap::new());
+
 /// Observe an authentic checkpoint PROPOSAL (call only AFTER its proposer sig verified): cache
-/// its preimage so a later equivocating vote on it can be proven.
+/// its preimage so a later equivocating vote on it can be proven. Capped per round.
 pub fn observe_checkpoint_proposal(index: u64, checkpoint_hash: [u8; 32], checkpoint_bytes: Vec<u8>) {
+    if VOTE_PROPOSAL_CACHE.contains_key(&(index, checkpoint_hash)) { return; }
+    {
+        let mut count = VOTE_PROPOSAL_COUNT.entry(index).or_insert(0);
+        if *count >= MAX_PROPOSALS_PER_INDEX { return; }
+        *count += 1;
+    }
     VOTE_PROPOSAL_CACHE.insert((index, checkpoint_hash), checkpoint_bytes);
 }
 
@@ -2165,6 +2664,7 @@ pub fn observe_checkpoint_vote(index: u64, voter: &str, checkpoint_hash: [u8; 32
                 let min_keep = index - VOTE_DETECT_WINDOW;
                 VOTE_FIRST_SEEN.retain(|k, _| k.0 >= min_keep);
                 VOTE_PROPOSAL_CACHE.retain(|k, _| k.0 >= min_keep);
+                VOTE_PROPOSAL_COUNT.retain(|k, _| *k >= min_keep);
             }
         }
     }
@@ -2216,7 +2716,7 @@ pub fn drain_vote_equivocation_proof_txs(max: usize) -> Vec<(String, Vec<u8>)> {
                 VOTE_EQUIVOCATION_EVIDENCE.remove(&key);
                 if is_warn() {
                     println!("[WARN][SLASH] vote_equivocation_proof_tx_built offender={} index={} tx={}",
-                             offender, key.0, &tx_hash[..16.min(tx_hash.len())]);
+                             offender, key.0, qnet_state::char_prefix(&tx_hash, 16));
                 }
                 out.push((tx_hash, bytes));
             }
@@ -2245,6 +2745,12 @@ static OOT_PRODUCER_COUNT: once_cell::sync::Lazy<DashMap<String, (u64, u32)>> =
 // SOLUTION: Remove entries older than current_height - CLEANUP_HEIGHT_WINDOW
 // ═══════════════════════════════════════════════════════════════════════════════
 const CLEANUP_HEIGHT_WINDOW: u64 = 500; // Keep last 500 microblocks (~8 min at 1 block/sec)
+/// Slashing horizon for UNSUBMITTED evidence — one epoch. Deliberately decoupled from the operational
+/// window above: that one is sized for vote/certificate churn, and reusing it silently gave a proof
+/// eight minutes to find a producer.
+const EVIDENCE_RETENTION_BLOCKS: u64 = 14_400;
+/// Hard cap on pending block-equivocation entries, newest heights kept.
+const MAX_PENDING_EVIDENCE: usize = 4_096;
 static LAST_DASHMAP_CLEANUP_HEIGHT: StdAtomicU64 = StdAtomicU64::new(0);
 
 /// v3.20: Cleanup old entries from global DashMaps to prevent memory leaks
@@ -2274,17 +2780,24 @@ pub fn cleanup_global_hashmaps(current_height: u64) {
     REQUESTED_CERTIFICATES.retain(|_, &mut timestamp| now.saturating_sub(timestamp) < 300);
     let cert_removed = cert_before.saturating_sub(REQUESTED_CERTIFICATES.len());
     
-    // v9.0: Cleanup stale equivocation evidence (keep last 500 blocks)
+    // Evidence gets its OWN, far longer horizon than the operational caches above. On the 500-block
+    // window a proof had ~8 minutes to reach a producer, which at any real validator count meant
+    // essentially never — the ban existed but could not be issued. One epoch is ample even across a
+    // partition, and the count cap keeps a repeat offender from turning self-incrimination into
+    // memory pressure.
+    let evidence_floor = current_height.saturating_sub(EVIDENCE_RETENTION_BLOCKS);
     let equivoc_before = EQUIVOCATION_EVIDENCE.len();
-    EQUIVOCATION_EVIDENCE.retain(|k, _| k.0 >= min_valid_height);
+    EQUIVOCATION_EVIDENCE.retain(|k, _| k.0 >= evidence_floor);
     let equivoc_removed = equivoc_before.saturating_sub(EQUIVOCATION_EVIDENCE.len());
 
-    // v15.11 L6: prune block-equivocation evidence on the same retention
-    // window so unsubmitted offences (e.g. detected during macroblock the
-    // committee couldn't finalize) do not accumulate beyond the active
-    // slashing horizon.
     let block_equivoc_before = BLOCK_EQUIVOCATION_EVIDENCE.len();
-    BLOCK_EQUIVOCATION_EVIDENCE.retain(|k, _| k.0 >= min_valid_height);
+    BLOCK_EQUIVOCATION_EVIDENCE.retain(|k, _| k.0 >= evidence_floor);
+    if BLOCK_EQUIVOCATION_EVIDENCE.len() > MAX_PENDING_EVIDENCE {
+        let mut heights: Vec<u64> = BLOCK_EQUIVOCATION_EVIDENCE.iter().map(|e| e.key().0).collect();
+        heights.sort_unstable();
+        let keep_from = heights[heights.len() - MAX_PENDING_EVIDENCE];
+        BLOCK_EQUIVOCATION_EVIDENCE.retain(|k, _| k.0 >= keep_from);
+    }
     let block_equivoc_removed = block_equivoc_before.saturating_sub(BLOCK_EQUIVOCATION_EVIDENCE.len());
 
     // Cleanup OOT producer tracking — remove entries with stale windows
@@ -2667,6 +3180,19 @@ pub fn try_get_mempool() -> Option<&'static Arc<qnet_mempool::SimpleMempool>> {
 pub static GLOBAL_P2P_INSTANCE: OnceCell<Arc<crate::unified_p2p::SimplifiedP2P>> = OnceCell::const_new();
 
 /// Initialize global P2P (call once during node startup, after P2P is ready)
+/// Process-wide pipeline ingest handle. Needed by paths that must re-feed locally-held blocks
+/// (branch adoption after a rollback) without owning a node reference.
+static GLOBAL_PIPELINE_INGEST: once_cell::sync::OnceCell<crate::block_pipeline::PipelineIngest> =
+    once_cell::sync::OnceCell::new();
+
+pub fn init_global_pipeline_ingest(ingest: crate::block_pipeline::PipelineIngest) {
+    let _ = GLOBAL_PIPELINE_INGEST.set(ingest);
+}
+
+pub fn try_get_pipeline_ingest() -> Option<&'static crate::block_pipeline::PipelineIngest> {
+    GLOBAL_PIPELINE_INGEST.get()
+}
+
 pub fn init_global_p2p(p2p: Arc<crate::unified_p2p::SimplifiedP2P>) {
     if GLOBAL_P2P_INSTANCE.set(p2p).is_err() {
         if is_warn() { println!("[WARN][P2P] global_p2p_already_initialized"); }
@@ -3172,11 +3698,6 @@ pub struct BlockchainNode {
     // Same pattern as heartbeat_commitment_tracker for consistency
     bitmap_commitment_tracker: Arc<DashMap<u64, HeartbeatCommitmentStatus>>,
     
-    // Verifiable Time Sequence (VTS) for time synchronization
-    poh: Option<Arc<crate::poh::PoH>>,
-    #[allow(dead_code)]
-    poh_receiver: Option<Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<crate::poh::PoHEntry>>>>,
-    
     // Parallel Executor for parallel transaction execution
     parallel_executor: Option<Arc<crate::parallel_executor::ParallelExecutor>>,
     
@@ -3220,12 +3741,25 @@ pub struct BlockchainNode {
     sync_handle: Option<crate::sync_manager::SyncHandle>,
 }
 
+/// What the schedule allows at a height. Total, and identical on every node — the verdict is pure
+/// height arithmetic, so there is no "cannot tell" arm and no cohort that skips enforcement.
+#[derive(Debug, PartialEq, Eq)]
+pub enum EmissionExpectation {
+    /// The schedule allows no emission at this height — any claimed amount is invalid.
+    NoneDue,
+    /// The single amount this height may mint.
+    Exact(u64),
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // v10.0: BlockApplyResult — returned by apply_block_to_state()
 // Contains merkle root + all deferred side effects for caller persistence.
 // ═══════════════════════════════════════════════════════════════════════
 pub struct BlockApplyResult {
     pub merkle_root: [u8; 32],
+    /// Set when a claim referenced an epoch whose certifying macroblock is absent. The block MUST
+    /// NOT be committed: fetch that macroblock and re-apply.
+    pub reward_epoch_missing: Option<u64>,
     pub reward_accruals: Vec<(String, u64)>,
     pub deferred_pool3: u64,
     // (node_id, type_str, wallet, burn_tx). burn_tx empty for non-NodeRegistration (activations).
@@ -3233,17 +3767,38 @@ pub struct BlockApplyResult {
     // vrf/consensus pubkey (tx.dilithium_public_key) → registry_root binds sha3 of it for light-client
     // committee verification. Empty for activation/pseudonym rows (the NodeRegistration row is authoritative).
     pub deferred_registrations: Vec<(String, String, String, String, String)>,
+    /// (node_id, wallet) of the NodeRegistration TXs applied in this block — the dedup reseed source.
+    /// Kept separate from deferred_registrations because activations write registry rows too, and an
+    /// activation-derived origin would make a restarted node reject the honest follow-on registration.
+    /// The producer marks these inline; a validator must mark exactly the same set or its dedup map is
+    /// incomplete after a restart and it admits a duplicate registration nobody else does.
+    pub deferred_registration_origins: Vec<(String, String)>,
     /// FIX-5: (sender_address, raw ML-DSA-65 pk) for each value-TX carrying a wire pk (first-use).
     /// Drained at commit into the dilithium_pk_root LtHash (marker-guarded ⇒ once per account).
     pub deferred_pk_binds: Vec<(String, Vec<u8>)>,
     pub deferred_emission_mbs: Vec<u64>,
     pub deferred_reward_clears: Vec<(String, u64)>,
-    /// (epoch, total, committed_root, c_per, c_cnt) — emission reward recompute the caller runs
     /// AFTER the state write-lock so the O(recipients) merkle build never blocks block apply.
-    pub deferred_emission_root: Option<(u64, u64, String, u64, u32)>,
     /// Boundary height whose committed light-eligibility the caller snapshots into the light_elig_ recency
     /// index — run AFTER the state write-lock so the O(roster) scan never blocks block apply at scale.
     pub deferred_light_elig: Option<u64>,
+    /// Durable side-index rows this block WOULD write. Both indices are write-once — `super_elig_`
+    /// is add-only, `light_bm_` keeps the lowest inclusion height — so a speculative apply that loses its slot can
+    /// never take its rows back. Held here and written only once the block is canonical.
+    pub side_indices: BlockSideIndices,
+}
+
+#[derive(Default, Debug)]
+pub struct BlockSideIndices {
+    /// (epoch, genesis shard index, inclusion height, bitmap)
+    pub light_bitmaps: Vec<(u64, usize, u64, Vec<u8>)>,
+    /// Display-only rich-list deltas. In no root, but still a durable write that must not happen
+    /// speculatively.
+    pub richlist: Vec<(String, Option<u64>)>,
+    /// (finalized epoch, eligible super node_ids) — computed under the state lock, written after.
+    pub super_eligible: Option<(u64, Vec<String>)>,
+    pub block_logs: Vec<(String, String, Vec<u8>)>,
+    pub token_rows: Vec<crate::storage::TokenTransferRow>,
 }
 
 /// Outcome of resolving a wallet's per-epoch claim against the sharded reward structure.
@@ -3260,6 +3815,61 @@ pub(crate) enum ShardClaim {
 }
 
 #[allow(dead_code)]
+/// The burn owner's authorization, carried to every attestor. An attestor that cannot verify it
+/// against the burning Solana address refuses to attest — otherwise the first caller to name ANY
+/// beneficiary for a PUBLIC burn_tx locks the per-attestor dedup and bricks the real owner's burn.
+/// Replayable source of an epoch's ELIGIBLE light nodes, in node_id order.
+///
+/// Holds only the 5 shard bitmaps and the roster cutoff — never the recipient list. `for_each`
+/// re-derives the eligible set from the on-disk roster scan on every call, so the reward build can
+/// COUNT and then EMIT without materialising ~10M entries (the collected vector was ~1.5 GB at the
+/// target). Deterministic across passes and nodes: the scan is node_id-ordered and the shard-local
+/// index is recomputed in that same order — exactly how the bitmap was written.
+#[derive(Default, Clone)]
+pub(crate) struct LightRewardSource {
+    cutoff: u64,
+    bitmaps: std::collections::BTreeMap<usize, Vec<u8>>,
+}
+
+impl LightRewardSource {
+    fn for_each(
+        &self,
+        storage: &crate::storage::Storage,
+        f: &mut dyn FnMut(&str, &str),
+    ) -> crate::errors::IntegrationResult<()> {
+        if self.bitmaps.is_empty() { return Ok(()); }
+        let mut counters = [0usize; 5];
+        // A truncated roster shifts every later node's shard-local index, so the bitmap would be read
+        // at the wrong offsets: not a smaller payout set, a DIFFERENT one. light_roster_for_each is
+        // fail-closed on a mid-scan error, which propagates here.
+        storage.light_roster_for_each(self.cutoff, |node_id, wallet| {
+            let gidx = light_shard_of(node_id);
+            let local_i = counters[gidx];
+            counters[gidx] += 1;
+            if let Some(bm) = self.bitmaps.get(&gidx) {
+                if bm.get(local_i / 8).map(|b| b & (1 << (local_i % 8)) != 0).unwrap_or(false) {
+                    f(node_id, wallet);
+                }
+            }
+        })
+    }
+}
+
+/// Frozen-roster disposition (A1 R1). Selected once per resolution from an atomic (L, B) read.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RosterMode { Sealed, Defer, Frozen }
+
+
+pub struct BurnOwnerProof<'a> {
+    pub node_id: &'a str,
+    pub registration_proof: &'a str,
+    pub timestamp: u64,
+    pub signature: &'a str,
+    /// sha3-256 tag of the registration's attestation root, so the attestor rebuilds the exact string
+    /// the owner signed without needing the 1952-byte key itself.
+    pub attest_root_tag: &'a str,
+}
+
 impl BlockchainNode {
     /// Get reward manager for RPC integration
     pub fn get_reward_manager(&self) -> Arc<RwLock<PhaseAwareRewardManager>> {
@@ -3424,70 +4034,11 @@ impl BlockchainNode {
         self.wallet_identity.clone()
     }
 
-    /// v4.0: Verify VRF proof in received microblock.
-    /// Uses producer's registered Dilithium3 public key from VRF_PK_REGISTRY.
-    ///
-    /// Genesis block (h=0) has no VRF fields and is bypassed by the caller
-    /// at `verify_microblock_signature` before reaching here. Every other
-    /// height MUST carry both `vrf_output` and `vrf_proof` — these are the
-    /// cryptographic witness that the producer was the leader elected for
-    /// `(previous_hash, height)`. Missing VRF fields previously got a free
-    /// pass under a "legacy block" comment, which let a forged or
-    /// non-elected producer's block in if accompanied by a valid producer
-    /// signature. We now reject hard.
-    pub fn verify_block_vrf_proof(
-        microblock: &qnet_state::MicroBlock,
-    ) -> Result<bool, String> {
-        use crate::crypto::vrf::DilithiumVrf;
-
-        // Genesis (h=0) is the only height for which no VRF election ran.
-        // Genuine height>0 microblocks always have both VRF fields populated
-        // by `sign_microblock_with_dilithium`'s producer path. Anything else
-        // is malformed or hostile.
-        if microblock.height == 0 {
-            return Ok(true);
-        }
-
-        let (vrf_output, vrf_proof) = match (&microblock.vrf_output, &microblock.vrf_proof) {
-            (Some(out), Some(proof)) => (*out, proof.clone()),
-            _ => {
-                if crate::node::is_warn() {
-                    println!(
-                        "[WARN][VRF] missing_vrf_fields h={} producer={} action=reject",
-                        microblock.height, microblock.producer
-                    );
-                }
-                return Ok(false);
-            }
-        };
-
-        // Lookup producer's registered VRF public key
-        let pk = match crate::genesis_constants::get_vrf_public_key(&microblock.producer) {
-            Some(pk) => pk,
-            None => {
-                // v4.6: Hard reject — VRF key MUST be registered (exchanged via VrfKeyAnnounce or on-chain NodeRegistration TX)
-                if crate::node::is_warn() {
-                    println!("[WARN][VRF] no_pk_registered producer={} h={} — block REJECTED",
-                             microblock.producer, microblock.height);
-                }
-                return Ok(false);
-            }
-        };
-
-        // Reconstruct slot_seed from block data
-        let slot_seed = DilithiumVrf::compute_slot_seed(
-            &microblock.previous_hash, microblock.height,
-        );
-
-        // Verify VRF proof
-        let vrf_out = crate::crypto::vrf::VrfOutput { output: vrf_output, proof: vrf_proof };
-        DilithiumVrf::verify_static(&pk, &slot_seed, &vrf_out)
-    }
     
     /// PRODUCTION v2.78 / v3.41: Cleanup ALL ephemeral data from RocksDB (>24h)
     /// Called every hour by continuous pinging loop
     /// SAFETY: Only removes data older than 24h, current epoch (4h) data is preserved
-    /// v3.41: Extended to clean ping_history, poh_state, consensus, failover_events,
+    /// v3.41: Extended to clean ping_history, consensus, failover_events,
     /// old snapshots + compaction to physically reclaim disk space
     pub async fn cleanup_old_storage_data(&self) {
         // CRITICAL: cutoff = now - 24h, so only data older than 24h is removed
@@ -3512,7 +4063,7 @@ impl BlockchainNode {
         }
         
         // v3.41: Cleanup ALL ephemeral CFs + compaction to reclaim disk space
-        // Gets current height for height-based cleanup (poh_state, consensus)
+        // Gets current height for height-based cleanup (consensus)
         let current_height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
         match self.storage.run_ephemeral_cleanup(current_height, cutoff) {
             Ok(()) => {}
@@ -3550,20 +4101,71 @@ impl BlockchainNode {
         total: u64,
         epoch: u64,
     ) -> (Vec<(String, u64)>, String) {
-        if eligible_node_wallets.is_empty() || total == 0 {
-            return (Vec::new(), String::new());
-        }
-        // Deterministic order for the remainder split: sort by node_id.
-        let mut ordered: Vec<&(String, String)> = eligible_node_wallets.iter().collect();
+        let mut wmap: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+        Self::accumulate_equal_share(&mut wmap, eligible_node_wallets, total);
+        if wmap.is_empty() { return (Vec::new(), String::new()); }
+        let wallet_vec: Vec<(String, u64)> = wmap.into_iter().collect();
+        let root = Self::epoch_reward_merkle_root(&wallet_vec, epoch);
+        (wallet_vec, root)
+    }
+
+    /// Split `pool` equally across `eligible` and ADD each share into `wmap`, keyed by wallet.
+    /// Accumulating instead of returning is what lets two pools produce ONE globally wallet-sorted leaf
+    /// set: a wallet holding both a super and a light identity must yield one aggregated leaf, or the
+    /// sharded claim path sees duplicate leaves for the same wallet. Order-independent (sorted by
+    /// node_id for the remainder, BTreeMap for the merge) and exactly conserving.
+    fn accumulate_equal_share(
+        wmap: &mut std::collections::BTreeMap<String, u64>,
+        eligible: &[(String, String)],
+        pool: u64,
+    ) {
+        if eligible.is_empty() || pool == 0 { return; }
+        let mut ordered: Vec<&(String, String)> = eligible.iter().collect();
         ordered.sort_by(|a, b| a.0.cmp(&b.0));
         let count = ordered.len() as u64;
-        let per_node = total / count;
-        let remainder = total % count;
-        let mut wmap: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+        let per_node = pool / count;
+        let remainder = pool % count;
         for (i, (_node_id, wallet)) in ordered.iter().enumerate() {
             let amt = per_node + if (i as u64) < remainder { 1 } else { 0 };
             *wmap.entry(wallet.clone()).or_insert(0) += amt;
         }
+    }
+
+    /// Operator (super/genesis) share of each emission, in basis points. The rest goes to users.
+    ///
+    /// A merged pool paid a phone and a 24/7 server the same amount, so at the target ratio of ~100
+    /// light clients per operator the operator's income could not cover a server and running one was
+    /// irrational. Splitting costs users little precisely because they outnumber operators: a quarter
+    /// of the pool moves ~25x more to each operator while each user gives up ~a quarter.
+    pub(crate) const OPERATOR_POOL_BP: u64 = 2_500;
+
+    /// Two-pool emission split. Both pools feed ONE wallet map, so the leaf set stays globally
+    /// wallet-sorted and duplicate-free. When one side has no eligible recipients its share goes to the
+    /// other: at launch there are no light clients, and minting a share nobody can ever claim would
+    /// silently strand it.
+    fn distribute_split_rewards(
+        supers: &[(String, String)],
+        lights: &[(String, String)],
+        total: u64,
+        epoch: u64,
+    ) -> (Vec<(String, u64)>, String) {
+        if total == 0 || (supers.is_empty() && lights.is_empty()) {
+            return (Vec::new(), String::new());
+        }
+        let (op_pool, user_pool) = match (supers.is_empty(), lights.is_empty()) {
+            (false, false) => {
+                let op = total / 10_000 * Self::OPERATOR_POOL_BP
+                    + (total % 10_000) * Self::OPERATOR_POOL_BP / 10_000;
+                (op, total - op)
+            }
+            (false, true) => (total, 0),
+            (true, false) => (0, total),
+            (true, true) => return (Vec::new(), String::new()),
+        };
+        let mut wmap: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+        Self::accumulate_equal_share(&mut wmap, supers, op_pool);
+        Self::accumulate_equal_share(&mut wmap, lights, user_pool);
+        if wmap.is_empty() { return (Vec::new(), String::new()); }
         let wallet_vec: Vec<(String, u64)> = wmap.into_iter().collect();
         let root = Self::epoch_reward_merkle_root(&wallet_vec, epoch);
         (wallet_vec, root)
@@ -3598,6 +4200,169 @@ impl BlockchainNode {
         hex::encode(h.finalize())
     }
 
+    /// Streamed epoch reward build for the 10M-recipient target: aggregate per wallet through the
+    /// `reward_agg` scratch CF (RocksDB orders bytewise = `BTreeMap<String,_>` order), then walk that
+    /// order once, hashing leaves a shard at a time. Peak RAM is ONE shard (REWARD_SHARD_SIZE), not the
+    /// whole leaf set — the in-memory path materialised the recipient map, the wallet vector AND the
+    /// leaf-hash vector, several GB at 10M lights, on the producer and on every validator recomputing.
+    ///
+    /// Byte-identical to `distribute_split_rewards` by construction: same per-NODE split with the
+    /// remainder to the first `remainder` node_ids, same wallet ordering, same leaf hash, and the
+    /// shard-roots recombine through `merkle_continue_root` to exactly `compute_merkle_root` over the
+    /// full set. Pinned by `streamed_reward_root_matches_in_memory`.
+    ///
+    /// Returns (recipient_count, total_paid, root_hex) — never the full vector, which is the point.
+    /// `on_shard` receives each completed shard's (index, sorted (wallet, amount) slice) so the caller
+    /// can persist it without a second pass.
+    fn build_epoch_rewards_streamed<L, F>(
+        storage: &crate::storage::Storage,
+        supers: &[(String, String)],
+        lights: L,
+        total: u64,
+        epoch: u64,
+        mut on_shard: F,
+    ) -> Option<(usize, u64, String)>
+    where
+        // Re-invokable so lights are COUNTED then EMITTED without ever being collected: at the 10M
+        // target the vector alone was ~1.5 GB. Must yield (node_id, wallet) in node_id order on both
+        // passes — the roster prefix scan does, and the remainder rule depends on that order.
+        L: Fn(&mut dyn FnMut(&str, &str)) -> crate::errors::IntegrationResult<()>,
+        F: FnMut(usize, &[(String, u64)], [u8; 32]),
+    {
+        let mut light_count = 0usize;
+        if let Err(e) = lights(&mut |_n, _w| { light_count += 1; }) {
+            println!("[CRIT][REWARD] light_count_failed epoch={} err={}", epoch, e);
+            return None;
+        }
+        if total == 0 || (supers.is_empty() && light_count == 0) {
+            return Some((0, 0, String::new()));
+        }
+        let (op_pool, user_pool) = match (supers.is_empty(), light_count == 0) {
+            (false, false) => {
+                let op = total / 10_000 * Self::OPERATOR_POOL_BP
+                    + (total % 10_000) * Self::OPERATOR_POOL_BP / 10_000;
+                (op, total - op)
+            }
+            (false, true) => (total, 0),
+            (true, false) => (0, total),
+            (true, true) => return Some((0, 0, String::new())),
+        };
+
+        // Private key range for THIS build: two builds for the same epoch can legitimately run at
+        // once (checkpoint/verify vs the producer), and a shared range would have one clearing while
+        // the other writes.
+        let build = storage.reward_agg_new_build();
+        if let Err(e) = storage.reward_agg_clear(build) {
+            println!("[CRIT][REWARD] agg_clear_failed epoch={} err={}", epoch, e);
+            return None;
+        }
+        // One PUT per eligible node, batched. The per-node amount is the same arithmetic the in-memory
+        // path uses; summing per wallet happens during the ordered scan below.
+        const PUT_BATCH: usize = 20_000;
+        let mut put_err = false;
+        let mut flush = |buf: &mut Vec<(String, String, u64)>, err: &mut bool| {
+            if buf.is_empty() || *err { buf.clear(); return; }
+            if let Err(e) = storage.reward_agg_put_batch(build, buf) {
+                println!("[CRIT][REWARD] agg_put_failed epoch={} err={}", epoch, e);
+                *err = true;
+            }
+            buf.clear();
+        };
+        if !supers.is_empty() && op_pool > 0 {
+            let mut ordered: Vec<&(String, String)> = supers.iter().collect();
+            ordered.sort_by(|a, b| a.0.cmp(&b.0));
+            let count = ordered.len() as u64;
+            let (per_node, remainder) = (op_pool / count, op_pool % count);
+            let mut buf: Vec<(String, String, u64)> = Vec::with_capacity(PUT_BATCH);
+            for (i, (node_id, wallet)) in ordered.iter().enumerate() {
+                buf.push((wallet.clone(), node_id.clone(),
+                          per_node + if (i as u64) < remainder { 1 } else { 0 }));
+                if buf.len() >= PUT_BATCH { flush(&mut buf, &mut put_err); }
+            }
+            flush(&mut buf, &mut put_err);
+        }
+        if light_count > 0 && user_pool > 0 && !put_err {
+            let count = light_count as u64;
+            let (per_node, remainder) = (user_pool / count, user_pool % count);
+            let mut buf: Vec<(String, String, u64)> = Vec::with_capacity(PUT_BATCH);
+            let mut i = 0u64;
+            let emit = lights(&mut |node_id, wallet| {
+                buf.push((wallet.to_string(), node_id.to_string(),
+                          per_node + if i < remainder { 1 } else { 0 }));
+                i += 1;
+                if buf.len() >= PUT_BATCH { flush(&mut buf, &mut put_err); }
+            });
+            flush(&mut buf, &mut put_err);
+            if emit.is_err() || i != count {
+                // A second pass that yields a different set means the source moved under us; the
+                // remainder assignment would no longer match any peer's.
+                println!("[CRIT][REWARD] light_emit_unstable epoch={} counted={} emitted={}", epoch, count, i);
+                let _ = storage.reward_agg_clear(build);
+                return None;
+            }
+        }
+        if put_err {
+            let _ = storage.reward_agg_clear(build);
+            return None;
+        }
+
+        let height = qnet_core::crypto::merkle::shard_height(Self::REWARD_SHARD_SIZE);
+        let mut shard: Vec<(String, u64)> = Vec::with_capacity(Self::REWARD_SHARD_SIZE);
+        let mut shard_roots: Vec<[u8; 32]> = Vec::new();
+        let mut shard_idx = 0usize;
+        let (mut count, mut paid) = (0usize, 0u64);
+        let mut build_err: Option<String> = None;
+        let scan = storage.reward_agg_for_each_wallet(build, |wallet, amt| {
+            if build_err.is_some() { return; }
+            count += 1;
+            paid = paid.saturating_add(amt);
+            shard.push((wallet.to_string(), amt));
+            if shard.len() == Self::REWARD_SHARD_SIZE {
+                let leaves: Vec<String> = shard.iter()
+                    .map(|(w, a)| Self::reward_leaf_hash_hex(w, epoch, *a)).collect();
+                match qnet_core::crypto::merkle::shard_subtree_root(&leaves, height) {
+                    Ok(r) => { shard_roots.push(r); on_shard(shard_idx, &shard, r); shard_idx += 1; }
+                    Err(e) => build_err = Some(e.to_string()),
+                }
+                shard.clear();
+            }
+        });
+        if let Err(e) = scan {
+            println!("[CRIT][REWARD] agg_scan_failed epoch={} err={}", epoch, e);
+            let _ = storage.reward_agg_clear(build);
+            return None;
+        }
+        if !shard.is_empty() && build_err.is_none() {
+            // Trailing partial shard: subtree_root pads to the same height, matching reward_shard_roots.
+            let leaves: Vec<String> = shard.iter()
+                .map(|(w, a)| Self::reward_leaf_hash_hex(w, epoch, *a)).collect();
+            let single = shard_roots.is_empty();
+            let r = if single {
+                qnet_core::crypto::merkle::compute_merkle_root(&leaves).ok()
+                    .and_then(|h| hex::decode(h).ok())
+                    .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+            } else {
+                qnet_core::crypto::merkle::shard_subtree_root(&leaves, height).ok()
+            };
+            match r {
+                Some(r) => { shard_roots.push(r); on_shard(shard_idx, &shard, r); }
+                None => build_err = Some("shard_root_failed".to_string()),
+            }
+        }
+        let _ = storage.reward_agg_clear(build);
+        if let Some(e) = build_err {
+            println!("[CRIT][REWARD] root_build_failed epoch={} err={}", epoch, e);
+            return None;
+        }
+        if shard_roots.is_empty() { return Some((0, 0, String::new())); }
+        let root = if shard_roots.len() == 1 {
+            hex::encode(shard_roots[0])
+        } else {
+            hex::encode(qnet_core::crypto::merkle::merkle_continue_root(&shard_roots))
+        };
+        Some((count, paid, root))
+    }
+
     /// Persist the per-epoch reward set as a SHARDED structure (10M-scale claim serving): the SORTED
     /// (wallet, amount) leaves split into REWARD_SHARD_SIZE-leaf shards + shard-meta (K subtree-roots +
     /// each shard's first wallet, for O(log K) locate). The shard-roots recombine to the SAME reward_root
@@ -3630,6 +4395,25 @@ impl BlockchainNode {
         }
         if let Err(e) = storage.save_epoch_shard_meta(epoch, &roots, &bounds) {
             println!("[WARN][REWARD] shard_persist_failed epoch={} kind=meta err={}", epoch, e);
+        }
+        Self::prune_reward_shard_cache(storage, epoch);
+    }
+
+    /// Bound the sharded leaf-set CACHE: keep the newest SHARD_CACHE_RETAIN epochs (~0.5GB/epoch at
+    /// 10M light ⇒ unbounded disk otherwise). Drops epoch_wshard_/epoch_shardmeta_ only —
+    /// root/super_elig_/light_bm_ stay, so an older claim self-heals through backfill_reward_shards.
+    /// Called from every shard writer so no path can forget it.
+    fn prune_reward_shard_cache(storage: &crate::storage::Storage, epoch: u64) {
+        // Retention is in EPOCHS, but the key is a macroblock index that advances by MB_PER_EPOCH per
+        // emission — subtracting the epoch count directly kept ~1.6 epochs, not 256.
+        const SHARD_CACHE_RETAIN_EPOCHS: u64 = 256;
+        let span = SHARD_CACHE_RETAIN_EPOCHS.saturating_mul(crate::reward_epoch::MB_PER_EPOCH);
+        if let Some(floor) = epoch.checked_sub(span) {
+            if floor > 0 {
+                if let Err(e) = storage.prune_epoch_reward_shards(floor) {
+                    println!("[WARN][REWARD] shard_prune_failed before_epoch={} err={}", floor, e);
+                }
+            }
         }
     }
 
@@ -3692,18 +4476,75 @@ impl BlockchainNode {
     /// independently recomputed root are byte-identical. Resolves the eligible set from the
     /// macroblock, then delegates the split to the pure `distribute_equal_rewards`.
     /// Returns (sorted wallet→amount pairs, merkle root hex); empty when no eligible / no emission.
-    pub(crate) fn compute_epoch_reward_distribution(
+    /// True iff epoch `epoch_num`'s settle point lies BELOW this node's cold-join anchor, i.e. its rows
+    /// were never delivered to this node. The only sound reason to abstain from a reward root: every
+    /// other absence is shared by the whole network and must be published, not deferred.
+    fn epoch_below_join_anchor(storage: &crate::storage::Storage, epoch_num: u64) -> bool {
+        let anchor_mb = storage.snapshot_join_anchor_mb();
+        if anchor_mb == 0 { return false; } // from-genesis node: it holds everything it should
+        // Epoch E settles at (E+1)*14400 + HB_ANCHOR_MAX_LAG; compare in macroblock indices.
+        // INCLUSIVE: the anchor macroblock itself is not replayed (its state arrives in the snapshot),
+        // so a settle point landing exactly on it left no side indices here either.
+        let settle_mb = ((epoch_num + 1) * 14_400 + HB_ANCHOR_MAX_LAG) / 90;
+        settle_mb <= anchor_mb
+    }
+
+    /// Streamed twin of `compute_epoch_reward_distribution`: same inputs, same root, but it never
+    /// materialises the recipient set. `persist_shards` writes each shard as it is produced, so the
+    /// producer path gets the claim-serving structure from the same single pass.
+    /// Returns (recipient_count, total_paid, root_hex). None = this node cannot reproduce the set.
+    pub(crate) fn compute_epoch_reward_root(
         storage: &crate::storage::Storage,
         macroblock_index: u64,
         total_emission: u64,
-    ) -> (Vec<(String, u64)>, String) {
-        // Rewarded epoch window from the emission macroblock index (= window = height/90;
-        // emission at window%160==0 rewards the prior 14400-block epoch).
-        if macroblock_index < 160 { return (Vec::new(), String::new()); }
+        persist_shards: Option<u64>,
+    ) -> Option<(usize, u64, String)> {
+        let (supers, lights) = Self::gather_epoch_reward_sets(storage, macroblock_index)?;
+        let epoch_for_leaf = macroblock_index;
+        match persist_shards {
+            Some(epoch) => {
+                let mut roots: Vec<[u8; 32]> = Vec::new();
+                let mut bounds: Vec<String> = Vec::new();
+                let light_iter = |f: &mut dyn FnMut(&str, &str)| lights.for_each(storage, f);
+                let out = Self::build_epoch_rewards_streamed(
+                    storage, &supers, light_iter, total_emission, epoch_for_leaf,
+                    |idx, shard, shard_root| {
+                        if let Err(e) = storage.save_epoch_reward_shard(epoch, idx, shard) {
+                            println!("[WARN][REWARD] shard_persist_failed epoch={} shard={} err={}", epoch, idx, e);
+                        }
+                        bounds.push(shard[0].0.clone());
+                        // The root the BUILDER used for the committed value — never a second
+                        // derivation. A recomputation here diverged for a single sub-shard epoch
+                        // (natural vs padded height) and made every claim read as Divergent.
+                        roots.push(shard_root);
+                    })?;
+                if !bounds.is_empty() {
+                    if let Err(e) = storage.save_epoch_shard_meta(epoch, &roots, &bounds) {
+                        println!("[WARN][REWARD] shard_persist_failed epoch={} kind=meta err={}", epoch, e);
+                    }
+                }
+                Self::prune_reward_shard_cache(storage, epoch);
+                Some(out)
+            }
+            None => Self::build_epoch_rewards_streamed(
+                storage, &supers, |f: &mut dyn FnMut(&str, &str)| lights.for_each(storage, f),
+                total_emission, epoch_for_leaf, |_, _, _| {}),
+        }
+    }
+
+    /// THE eligibility gather for an emission window: (supers, lights) as (node_id, wallet), both in
+    /// node_id order. Split out so the streamed root build and the legacy vector build read one source.
+    /// None = this node cannot reproduce the set (abstain, never guess).
+    fn gather_epoch_reward_sets(
+        storage: &crate::storage::Storage,
+        macroblock_index: u64,
+    ) -> Option<(Vec<(String, String)>, LightRewardSource)> {
+        if macroblock_index < 160 { return Some((Vec::new(), LightRewardSource::default())); }
         let ws = (macroblock_index / 160 - 1) * 14400;
         let epoch_num = ws / 14400;
 
-        let mut eligible: Vec<(String, String)> = Vec::new();
+        let mut super_eligible: Vec<(String, String)> = Vec::new();
+        let mut light_src = LightRewardSource::default();
 
         // SUPER/genesis: enumerate chain-registered nodes (deterministic CF) and keep those whose
         // on-chain heartbeat tally for the epoch is ≥ 9 — identical to the producer's emitter scan
@@ -3712,13 +4553,35 @@ impl BlockchainNode {
         // — and map each to its reward wallet via the registration set, instead of an O(registered)
         // per-account scan. Identical set (index = same on-chain tally ∩ registrations); the split
         // sorts internally so push order is irrelevant. Deterministic + recomputable on every node.
-        if let (Ok(eligible_ids), Ok(supers)) =
-            (storage.load_super_eligible(epoch_num), storage.super_registrations_sorted())
-        {
+        // A roster scan that FAILED is "cannot reproduce", not "no supers": silently skipping the
+        // branch builds a root without them, which every peer Rejects. Abstain, like the
+        // local-blindness paths below.
+        let super_read = (storage.load_super_eligible(epoch_num), storage.super_registrations_sorted());
+        if matches!(super_read, (Err(_), _) | (_, Err(_))) {
+            println!("[CRIT][REWARD] super_roster_unreadable epoch={} action=abstain", epoch_num);
+            return None;
+        }
+        if let (Ok(eligible_ids), Ok(supers)) = super_read {
+            // Same reasoning as the light branch below: super_elig_{E} lives in the pending_rewards CF,
+            // which a snapshot joiner does not hold below its anchor. An empty index while supers ARE
+            // registered means "cannot reproduce", not "no super was eligible" — and at relaunch, when
+            // the light roster is still empty, this is the branch that decides the whole root.
+            // Abstain ONLY when the absence is LOCAL. An empty index on a from-genesis node is the
+            // network-wide truth (nobody cleared the 9-of-10 bar), and returning None there makes EVERY
+            // node defer — a permanent halt instead of an epoch that paid nobody. A snapshot joiner, by
+            // contrast, simply does not hold the epoch's rows and must not vote on them.
+            if eligible_ids.is_empty() && !supers.is_empty()
+                && Self::epoch_below_join_anchor(storage, epoch_num)
+            {
+                if is_warn() {
+                    println!("[WARN][REWARD] super_eligible_below_anchor epoch={} — abstaining", epoch_num);
+                }
+                return None;
+            }
             let reg: std::collections::HashMap<String, String> = supers.into_iter().collect();
             for node_id in eligible_ids {
                 if let Some(wallet) = reg.get(&node_id) {
-                    if !wallet.is_empty() { eligible.push((node_id, wallet.clone())); }
+                    if !wallet.is_empty() { super_eligible.push((node_id, wallet.clone())); }
                 }
             }
         }
@@ -3731,22 +4594,124 @@ impl BlockchainNode {
         {
             let cutoff = light_roster_cutoff(epoch_num);
             let bitmaps = storage.load_light_bitmaps(epoch_num).unwrap_or_default();
-            if !bitmaps.is_empty() {
-                let mut counters = [0usize; 5];
-                let _ = storage.light_roster_for_each(cutoff, |node_id, wallet| {
-                    let gidx = light_shard_of(node_id);
-                    let local_i = counters[gidx];
-                    counters[gidx] += 1;
-                    if let Some(bm) = bitmaps.get(&gidx) {
-                        if bm.get(local_i / 8).map(|b| b & (1 << (local_i % 8)) != 0).unwrap_or(false) {
-                            eligible.push((node_id.to_string(), wallet.to_string()));
-                        }
+            // A snapshot joiner holds no data below its anchor, so an epoch whose light bitmaps were
+            // committed there reads back EMPTY here. Silently distributing to nobody produced a reward
+            // root that differed from every from-genesis node — and the content check turns that into a
+            // Reject, i.e. this node votes AGAINST every emission-window checkpoint forever. Absent
+            // bitmaps for an epoch that actually has a light roster means "cannot reproduce", not
+            // "nobody was eligible".
+            // Same rule as the super branch: only LOCAL blindness abstains. A missing bitmap that every
+            // node is missing (the shard owner was down through the commit window) costs that epoch its
+            // light payout — bad, but bounded and recoverable. Deferring on it instead stops the chain
+            // for good, because no later block can ever supply the row.
+            if bitmaps.is_empty() && Self::epoch_below_join_anchor(storage, epoch_num) {
+                let mut roster_nonempty = false;
+                // Err here would leave roster_nonempty=false and skip the abstain below on exactly
+                // the evidence that decides it.
+                if storage.light_roster_for_each(cutoff, |_id, _w| { roster_nonempty = true; }).is_err() {
+                    println!("[CRIT][REWARD] light_roster_unreadable epoch={} action=abstain", epoch_num);
+                    return None;
+                }
+                if roster_nonempty {
+                    if is_warn() {
+                        println!("[WARN][REWARD] light_bitmaps_below_anchor epoch={} — abstaining", epoch_num);
                     }
-                });
+                    return None;
+                }
+            }
+            if !bitmaps.is_empty() {
+                // NOT collected: the eligible lights are replayed on demand from the roster scan +
+                // bitmaps (both already on disk). At the 10M target the vector alone was ~1.5 GB, and
+                // the reward build needs two passes (count, then emit) — a replayable source gives
+                // both for O(1) RAM. Deterministic: the roster scan is node_id-ordered, and the
+                // shard-local index is derived in that same order on every pass and every node.
+                light_src = LightRewardSource { cutoff, bitmaps };
             }
         }
 
-        Self::distribute_equal_rewards(&eligible, total_emission, macroblock_index)
+        Some((super_eligible, light_src))
+    }
+
+    /// Legacy vector form, for the COLD callers that genuinely need the recipient list (claim serving
+    /// and the shard backfill). Consensus paths use `compute_epoch_reward_root` and never build this.
+    pub(crate) fn compute_epoch_reward_distribution(
+        storage: &crate::storage::Storage,
+        macroblock_index: u64,
+        total_emission: u64,
+    ) -> Option<(Vec<(String, u64)>, String)> {
+        let (supers, light_src) = Self::gather_epoch_reward_sets(storage, macroblock_index)?;
+        let mut lights: Vec<(String, String)> = Vec::new();
+        if light_src.for_each(storage, &mut |n, w| lights.push((n.to_string(), w.to_string()))).is_err() {
+            println!("[CRIT][REWARD] light_roster_unreadable mb={} action=abstain", macroblock_index);
+            return None;
+        }
+        Some(Self::distribute_split_rewards(&supers, &lights, total_emission, macroblock_index))
+    }
+
+    /// Upper bound on declared gas. Admission-only (both ingress points) plus a producer-side drop.
+    /// NOT a block rule and NOT in `Transaction::validate()` (the block path calls it): rejecting an
+    /// oversized TX at the block would halt the chain instead of costing one TX.
+    pub(crate) fn gas_limit_admissible(tx: &qnet_state::Transaction) -> bool {
+        tx.gas_limit <= qnet_state::gas_limits::MAX_GAS_LIMIT
+    }
+
+    /// The ONE emission amount that is valid in the block at `height` — the exact mirror of the
+    /// producer's build (node.rs, is_emission_block branch): Pool-1 from the height-derived halving
+    /// schedule plus the pool2/pool3 totals sealed in the rewarding epoch's macroblock.
+    ///
+    /// PURE FUNCTION OF HEIGHT — no storage read, so every node reaches the same verdict and the
+    /// rule is enforced by all of them. It used to load the rewarding epoch's macroblock for
+    /// pool2/pool3, which made enforcement depend on whether the node still held a macroblock ~2
+    /// epochs back: a recently synced node fell into a fail-open arm while long-running nodes
+    /// enforced, so a bad amount split total_supply between the two cohorts instead of being
+    /// rejected by everyone.
+    ///
+    /// PRECONDITION for dropping those terms: `ConsensusData::pool2_total_fees` and
+    /// `pool3_total_activations` are never written — the sole macroblock construction site
+    /// (consensus_v2_node.rs) leaves them `None`, so both sides always added 0. If either is ever
+    /// populated, this must read the macroblock again AND handle its absence explicitly, or a node
+    /// lacking it will compute a wrong expectation and reject an HONEST block. See
+    /// core/qnet-state/src/block.rs where those fields are declared.
+    pub(crate) fn expected_emission_amount(height: u64) -> EmissionExpectation {
+        const EMISSION_BLOCK_INTERVAL: u64 = 14400;
+        if height == 0 || height % EMISSION_BLOCK_INTERVAL != 0 {
+            return EmissionExpectation::NoneDue;
+        }
+        // Emission is delayed one full epoch (the rewarding macroblock must be finalized first), so
+        // the first two epochs have nothing to reward.
+        if height / EMISSION_BLOCK_INTERVAL <= 1 {
+            return EmissionExpectation::NoneDue;
+        }
+        // A ZERO amount is NOT an emission that must appear: once the halving schedule floors to 0 the
+        // producer builds no emission TX at all (`if total_emission > 0`), so every consumer that reads
+        // Exact(_) as "a TX must exist here" would wait forever — the block-accept presence gate would
+        // reject honest blocks and the reward-root scan would defer every window. NoneDue is the single
+        // verdict that keeps producer, validator and the window scan agreeing.
+        match qnet_consensus::lazy_rewards::pool1_base_emission_at_height(height) {
+            0 => EmissionExpectation::NoneDue,
+            n => EmissionExpectation::Exact(n),
+        }
+    }
+
+    /// The claimable distribution is driven by `total` in the emission TX body, NOT by `tx.amount` —
+    /// it sizes the per-epoch reward root that claims later prove against, and claim credit is
+    /// uncapped. Bounding it by the same schedule is what makes the emission rule cover the money
+    /// and not just the supply counter.
+    ///
+    /// The honest range is exactly the TWO-POINT set {0, expected}, not the interval below it:
+    /// `distribute_equal_rewards` conserves exactly (count*per_node + remainder == total) and the
+    /// producer sets `total` to the sum of that vector, so it is `expected`, or `0` when no node is
+    /// eligible. Admitting intermediate values would let an elected producer mint the full scheduled
+    /// supply while funding a distribution of 1 nano for the whole epoch — accepted at apply,
+    /// recomputed identically by the committee, certified by 2f+1, no divergence and no alarm.
+    /// Shared by block apply and the window-reward recompute so the committee-certified root cannot
+    /// carry a value the applier would have refused.
+    pub(crate) fn emission_total_within_schedule(height: u64, total: u64) -> bool {
+        match Self::expected_emission_amount(height) {
+            EmissionExpectation::Exact(expected) => total == 0 || total == expected,
+            // No emission is due at this height, so no distribution may be funded from it either.
+            EmissionExpectation::NoneDue => total == 0,
+        }
     }
 
     /// Emission for a checkpoint window: finds the window's v3 system_emission TX and recomputes
@@ -3755,37 +4720,103 @@ impl BlockchainNode {
     /// the producer/apply/claim use — NOT window_head_height/CHECKPOINT_INTERVAL). None off an
     /// emission boundary. Self-aligning with apply (same epoch/total inputs) ⇒ proposer/committee/
     /// apply roots are byte-identical. Cheap range gate avoids I/O on the 159/160 non-emission windows.
+    /// Root only: both consumers discarded the rest of the old 4-tuple, and building it materialised
+    /// the entire recipient set on every node. The root now comes from the streamed builder (peak RAM
+    /// = one shard).
     fn compute_window_reward(storage: &crate::storage::Storage, start_height: u64, end_height: u64)
-        -> Option<(String, Vec<(String, u64)>, u64, u64)> {
+        -> Option<String> {
         const EMISSION_BLOCK_INTERVAL: u64 = 14400;
         if !(start_height..=end_height).any(|h| h > 0 && h % EMISSION_BLOCK_INTERVAL == 0) {
             return None;
         }
         for h in start_height..=end_height {
+            // Only a height the schedule actually pays at can carry the window's emission. Without
+            // this the scan took the FIRST system_emission TX at ANY height in the window, so a
+            // producer of one of the 29 preceding slots could plant an inert decoy TX (rejected at
+            // apply, harmless there) and the scan would stop on it and return None — leaving the
+            // real emission at the window's last block with no 2f+1-certified reward_root at all.
+            if !matches!(Self::expected_emission_amount(h), EmissionExpectation::Exact(_)) {
+                continue;
+            }
             let mb = match storage.load_microblock_auto_format(h) { Ok(Some(m)) => m, _ => continue };
-            for tx in &mb.transactions {
+            // REVERSE: block apply is last-wins (its Phase-1 loop overwrites deferred_emission_root
+            // for every matching TX), so a first-wins scan here would certify a different root than
+            // the appliers installed if a producer put two v3 emission TXs in one block.
+            for tx in mb.transactions.iter().rev() {
                 if tx.from != "system_emission" { continue; }
                 let data = match tx.data.as_ref() { Some(d) => d, None => continue };
                 let parsed: serde_json::Value = match serde_json::from_str(data) { Ok(p) => p, _ => continue };
                 if parsed.get("v").and_then(|v| v.as_u64()) != Some(3) { continue; }
-                let epoch = parsed.get("epoch").and_then(|v| v.as_u64()).unwrap_or(0);
-                let total = parsed.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
-                let (wallets, root_hex) = Self::compute_epoch_reward_distribution(storage, epoch, total);
-                if root_hex.is_empty() { return None; }
-                return Some((root_hex, wallets, total, epoch));
+                // Height-derived epoch key, identical to the applier's — never the TX's field. The
+                // committee must not certify a root filed under a producer-chosen epoch, or one
+                // producer can make 2f+1 overwrite a past epoch's distribution.
+                let epoch = Self::emission_mb_index(h);
+                // Height-derived, like the epoch key and the mint amount. Reading it from the TX body
+                // let a producer that lacks the epoch's eligibility indices (a snapshot-cold-joined
+                // node) send total=0, which the schedule gate admits, and make the committee certify
+                // reward_root=[0;32] for a fully minted epoch — deterministic, network-wide, no alarm.
+                let total = crate::reward_epoch::canonical_total(epoch);
+                // None ⇒ this node cannot reproduce the epoch's leaf set (a snapshot joiner whose light
+                // bitmaps live below its anchor). Returning a computed-from-nothing root would make it
+                // vote AGAINST every emission-window checkpoint; report no root instead so the caller
+                // defers.
+                let root_hex = match Self::compute_epoch_reward_root(storage, epoch, total, None) {
+                    Some((_count, _paid, r)) => r,
+                    None => return None,
+                };
+                // Return the schedule-validated (total, epoch) EVEN when this node cannot recompute
+                // the leaf set. The root stays empty — callers that need a real root already treat
+                // that as "no root" — but the certified-root adoption at finalization needs `total`
+                // to size the epoch, and dropping it here wrote 0, which permanently disabled the
+                // leaf-set self-heal (distribute_equal_rewards returns empty for total==0, so the
+                // rebuilt root never matches and the epoch is memoised as unserveable).
+                return Some(root_hex);
             }
         }
         None
     }
 
+    /// The producer's inline apply has no journal, so an abandoned block leaves its transactions, mint
+    /// and fee credit in live RAM state. There is no safe in-process repair: rebuilding takes no apply
+    /// barrier, so it can rewind RAM below the storage tip and wedge the node for good. Fail CLOSED —
+    /// stop producing for this process. A restart replays from storage and rebuilds RAM cleanly, which
+    /// is the right remedy anyway: the only realistic trigger is a missing signing key.
+    fn abandon_inline_apply(saved_height: u64, abandoned_height: u64, reason: &str) {
+        INLINE_APPLY_UNVOUCHED.store(saved_height.max(1), std::sync::atomic::Ordering::SeqCst);
+        println!("[ERR][NODE] inline_apply_abandoned h={} reason={} vouched_to={} action=stop_producing_until_restart",
+                 abandoned_height, reason, saved_height);
+    }
+
     /// Checkpoint.reward_root for a window (2f+1-certified, [0;32] off an emission boundary).
-    fn compute_window_reward_root(storage: &crate::storage::Storage, start_height: u64, end_height: u64) -> [u8; 32] {
-        if let Some((root_hex, _, _, _)) = Self::compute_window_reward(storage, start_height, end_height) {
-            if let Ok(b) = hex::decode(&root_hex) {
-                if b.len() == 32 { let mut o = [0u8; 32]; o.copy_from_slice(&b); return o; }
+    /// `Some([0;32])` = this window is not an emission boundary (no root to publish).
+    /// `None` = it IS one and this node cannot reproduce the leaf set — the caller must NOT publish.
+    ///
+    /// Collapsing the second case into `[0;32]` published a well-formed root meaning "this epoch paid
+    /// nobody". If enough members were equally blind that root could be certified, and an entire epoch's
+    /// emission would be permanently unclaimable — silent fund loss, not a visible reject.
+    fn compute_window_reward_root(storage: &crate::storage::Storage, start_height: u64, end_height: u64) -> Option<[u8; 32]> {
+        match Self::compute_window_reward(storage, start_height, end_height) {
+            Some(root_hex) => {
+                if root_hex.is_empty() { return Some([0u8; 32]); }
+                let b = hex::decode(&root_hex).ok()?;
+                if b.len() != 32 { return None; }
+                let mut o = [0u8; 32];
+                o.copy_from_slice(&b);
+                Some(o)
+            }
+            // compute_window_reward returns None both off-boundary and when the leaf set is underivable.
+            // The discriminator MUST be the exact filter its scan loop uses — is there a height in this
+            // window the schedule actually pays at. `is_reward_epoch(end_height/90)` was not: it is true
+            // at height 14400 while expected_emission_amount(14400) is NoneDue, so the very first
+            // epoch boundary after genesis read as "underivable", nobody signalled, and the chain
+            // stopped ~4 h in. It also diverges again once the schedule floors to zero.
+            None => {
+                let pays = (start_height..=end_height).any(|h| {
+                    matches!(Self::expected_emission_amount(h), EmissionExpectation::Exact(_))
+                });
+                if pays { None } else { Some([0u8; 32]) }
             }
         }
-        [0u8; 32]
     }
 
 
@@ -3875,89 +4906,63 @@ impl BlockchainNode {
         qnet_state::wasm_exec::clear_wasm_logs();
 
         let mut result = BlockApplyResult {
+            side_indices: BlockSideIndices::default(),
             merkle_root: [0u8; 32],
             reward_accruals: Vec::new(),
             deferred_pool3: 0,
             deferred_registrations: Vec::new(),
+            deferred_registration_origins: Vec::new(),
             deferred_pk_binds: Vec::new(),
             deferred_emission_mbs: Vec::new(),
             deferred_reward_clears: Vec::new(),
-            deferred_emission_root: None,
+            reward_epoch_missing: None,
             deferred_light_elig: None,
         };
 
-        // ── Phase 1: Process emission TXs — update total_supply + parse reward accruals ──
-        const EMISSION_BLOCK_INTERVAL: u64 = 14400;
-        const MICROBLOCKS_PER_MB: u64 = 90;
-
-        for tx in &microblock.transactions {
-            if tx.tx_type != qnet_state::TransactionType::RewardDistribution
-               || tx.from != "system_emission" {
-                continue;
+        // ── Phase 1: Emission — mint only. The epoch's reward root is NOT written here; it is
+        // the certified field of macroblock E+MB_PER_EPOCH (see reward_epoch).
+        if let Some(em) = crate::reward_epoch::select_emission_at(&microblock.transactions, h) {
+            // Counters live outside the accounts map, so an accounts-only rollback would keep the mint.
+            if let Some(snap) = block_snapshot.as_deref_mut() {
+                let (supply, minted_mb) = state_guard.supply_watermark();
+                snap.record_supply(supply, minted_mb);
             }
-
-            // emit_rewards is watermark-idempotent (mints once per emission mb). The SAME mint runs
-            // on the producer-inline path via Self::emission_mb_index, so total_supply is byte-identical
-            // on every node and is never read live into the checkpoint.
-            let emission_mb_index = Self::emission_mb_index(h);
-            match state_guard.emit_rewards(tx.amount, emission_mb_index) {
+            match state_guard.emit_rewards(em.amount, em.epoch) {
                 Ok(minted) if minted > 0 => {
                     if is_info() {
-                        println!("[INFO][STATE] emission_from_tx mb={} amount={} total={} QNC h={}",
-                                 emission_mb_index, tx.amount / 1_000_000_000,
-                                 state_guard.get_total_supply() / 1_000_000_000, h);
+                        println!("[INFO][STATE] emission_minted epoch={} amount={} total={} h={}",
+                                 em.epoch, em.amount, state_guard.get_total_supply(), h);
                     }
-                    if emission_mb_index > 0 {
-                        result.deferred_emission_mbs.push(emission_mb_index);
-                    }
-                }
-                Ok(_) => {} // already minted at this mb — idempotent skip
-                Err(e) => eprintln!("[WARN][STATE] emission_failed err={}", e),
-            }
-
-            // v3 merkle-claim: persist the per-epoch reward root (+ params) and recompute it
-            // locally with the SAME pure fn the producer used to verify the commitment. NO eager
-            // accrual — rewards are credited later via proof-verified claim TXs (result.reward_accruals
-            // stays empty → Phase 4 is a no-op). During bulk replay the rewarding epoch's heartbeat
-            // bodies may be pruned; then trust the committed (consensus-applied) root from the TX.
-            if let Some(ref data) = tx.data {
-                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data) {
-                    if parsed.get("v").and_then(|v| v.as_u64()) == Some(3) {
-                        let epoch = parsed.get("epoch").and_then(|v| v.as_u64()).unwrap_or(0);
-                        let committed_root = parsed.get("root").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        let total = parsed.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
-                        let c_per = parsed.get("per_node").and_then(|v| v.as_u64()).unwrap_or(0);
-                        let c_cnt = parsed.get("count").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                        // Persist the locally recomputed distribution (deterministic from on-chain
-                        // data; in-order apply ⇒ correct). The single-producer TX `committed_root` is
-                        // NOT trusted — the committee-certified Checkpoint.reward_root is the consensus
-                        // reference and OVERWRITES this on macroblock finalization for a node whose
-                        // recompute differs (catch-up / incomplete data). Mint (emit_rewards above) is
-                        // separate + watermark-idempotent.
-                        // Defer the O(recipients) recompute+persist to the caller, AFTER the state
-                        // write-lock. It is a pure fn of storage (off state_root), so running it off
-                        // the lock keeps the merkle build out of the block-apply critical path.
-                        result.deferred_emission_root = Some((epoch, total, committed_root, c_per, c_cnt));
+                    if em.epoch > 0 {
+                        result.deferred_emission_mbs.push(em.epoch);
                     }
                 }
+                Ok(_) => {} // watermark-idempotent: already minted for this epoch
+                Err(e) => eprintln!("[WARN][STATE] emission_failed epoch={} err={}", em.epoch, e),
             }
         }
 
         // ── Phase 2: Apply all transactions + gas refund on success ──
-        // Metered WASM-compute fees accrued across this block's txs (heights >= the metering-activation
-        // height); credited to the producer in Phase 3 on top of the flat fees_collected. Identical on
-        // every node: it sums per-tx wasmi fuel (deterministic) × effective_gas_price (pure fn).
+        // Fees accrued for the Phase 3 producer credit, both accumulated ONLY on apply-Ok: the debit
+        // happens inside the tx apply arm, so a failed tx pays nothing and crediting it would mint QNC
+        // that no account was charged. Identical on every node (pure fns of the tx + deterministic fuel).
+        let mut block_flat_fees: u64 = 0;
         let mut block_wasm_fuel_fees: u64 = 0;
         for tx in &microblock.transactions {
             // Record pre-images BEFORE mutation (for rollback support)
             if let Some(ref mut snap) = block_snapshot {
                 let affected = tx.get_all_affected_addresses();
-                snap.record_pre_images(&affected, &state_guard.accounts);
+                state_guard.journal_pre_images(snap, &affected);
+                // Commitment-dedup entries live outside the accounts map and are the same class as
+                // the supply counters and the fee marker: journal them here or a discarded block
+                // leaves the chain marked as having seen a commitment it never committed.
+                state_guard.record_commitment_pre_image(tx, snap);
             }
 
-            // Index Light eligibility bitmaps at apply via the SHARED helper (byte-identical on the
-            // producer-inline path) so the emission recompute reads ≤5 keys, not a 14400-block scan.
-            Self::index_light_eligibility_bitmap(storage, h, tx);
+            // Light-eligibility bitmap index. Unconditional; the writer keeps the lowest inclusion height, so the stored
+            // value does not depend on the apply verdict — which is decided by a non-durable dedup
+            // map and therefore differs between a restarted node and a from-genesis one.
+            Self::collect_light_eligibility_bitmap(&mut result.side_indices.light_bitmaps, h, tx);
 
             // Capture QRC-20 owns-index deltas into the block journal when journaling is on (the
             // consensus persist path), so the wallet→token reverse index is written in the same batch.
@@ -3972,6 +4977,9 @@ impl BlockchainNode {
             // Take this tx's WASM fuel ONCE, on the same thread, right after apply (resets the slot for
             // the next tx — WASM or not) so the metered fee matches the producer-inline path exactly.
             let tx_wasm_fuel = qnet_state::wasm_exec::take_last_tx_wasm_fuel();
+            // A tx whose nonce was already consumed applies Ok WITHOUT debiting; refunding its unused
+            // gas or crediting its fee would mint QNC nobody paid.
+            let charged = apply_result.as_ref().map_or(false, |o| o.charged);
             if let Err(e) = apply_result {
                 // Rejected tx: drop any owns-deltas AND any partial WASM logs it emitted (its state
                 // mutations were discarded too), keeping the reverse index + logs_root aligned with
@@ -3986,13 +4994,24 @@ impl BlockchainNode {
             } else {
                 // Record post-mutation pre-image of sender (gas refund will modify it)
                 if let Some(ref mut snap) = block_snapshot {
-                    snap.record_pre_images(&[tx.from.clone()], &state_guard.accounts);
+                    state_guard.journal_pre_images(snap, &[tx.from.clone()]);
                 }
-                let _ = state_guard.apply_gas_refund(tx, h, tx_wasm_fuel);
-                // Accrue the metered WASM-compute fee (above activation) for the Phase 3 producer credit.
-                if h >= qnet_state::GAS_METERING_ACTIVATION_HEIGHT
-                    && !tx.from.starts_with("system_") && tx.gas_price > 0 && tx.gas_limit > 0 {
-                    block_wasm_fuel_fees = block_wasm_fuel_fees.saturating_add(tx.wasm_fuel_fee(tx_wasm_fuel));
+                if charged {
+                    let _ = state_guard.apply_gas_refund(tx, h, tx_wasm_fuel);
+                }
+                // Accrue this tx's NET fee — flat charged_gas, plus the metered WASM compute above the
+                // activation height. Same filter and same charged_gas the producer's fill loop uses.
+                if charged && !tx.from.starts_with("system_") && tx.gas_price > 0 && tx.gas_limit > 0 {
+                    let charged_gas = if h >= qnet_state::GAS_METERING_ACTIVATION_HEIGHT {
+                        tx.compute_gas_used()
+                    } else {
+                        tx.gas_limit
+                    };
+                    block_flat_fees = block_flat_fees
+                        .saturating_add(tx.effective_gas_price().saturating_mul(charged_gas));
+                    if h >= qnet_state::GAS_METERING_ACTIVATION_HEIGHT {
+                        block_wasm_fuel_fees = block_wasm_fuel_fees.saturating_add(tx.wasm_fuel_fee(tx_wasm_fuel));
+                    }
                 }
 
                 // FIX-5: collect the sender ML-DSA-65 pk for dilithium_pk_root (drained + marker-guarded
@@ -4032,8 +5051,11 @@ impl BlockchainNode {
                         // Bind the consensus pubkey ONLY for consensus participants (super/genesis): light
                         // nodes are mobile clients, never in the committee, so their key is irrelevant to QC
                         // verification — keep light rows' vrf empty (semantic + matches the registry recompute).
-                        let reg_vrf = if matches!(node_type, qnet_state::NodeType::Super) { tx.dilithium_public_key.as_ref().map(hex::encode).unwrap_or_default() } else { String::new() };
+                        let reg_vrf = if matches!(node_type, qnet_state::NodeType::Super) {
+                            Self::registration_consensus_pk(tx).map(hex::encode).unwrap_or_default()
+                        } else { String::new() };
                         result.deferred_registrations.push((node_id.clone(), type_str.to_string(), wallet_address.clone(), burn_tx.clone(), reg_vrf));
+                        result.deferred_registration_origins.push((node_id.clone(), wallet_address.clone()));
                     }
                     qnet_state::TransactionType::NodeActivation { node_type, .. } => {
                         // Super self-registers its canonical wallet-derived pseudonym (heartbeat/block signer)
@@ -4066,24 +5088,17 @@ impl BlockchainNode {
         // Block apply is never blocked; surface the error instead of dropping it silently.
         {
             let block_logs = qnet_state::wasm_exec::drain_wasm_logs();
-            // Reorg-consistency: a re-applied block at h fully replaces h's logs + token index. No-op on a fresh height.
-            storage.reset_block_token_data(h);
             if !block_logs.is_empty() {
-                if let Err(e) = storage.save_block_logs(h, &block_logs) {
-                    if crate::node::is_warn() {
-                        println!("[WARN][LOGS] block_logs_persist_failed h={} err={} (logs_root will diverge → stall out of 2f+1 until resync)", h, e);
-                    }
-                }
-                // P1: index this block's success-gated token transfers (from + to + contract).
-                Self::index_block_token_transfers(storage, &state_guard.accounts, h, microblock.timestamp, &block_logs);
-                // Sharded logs: store this block's level-1 sub-root so the macroblock seal folds ~90 sub-
-                // roots (not the whole window) and /logs/proof reads one block. Deterministic from block_logs.
-                let _ = storage.save_block_logs_root(h, &Self::block_logs_root_of(&block_logs));
+                // Token rows are built HERE because they read the post-apply accounts; writing them
+                // is the flush's job.
+                result.side_indices.token_rows =
+                    Self::build_token_transfer_rows(&state_guard.accounts, h, microblock.timestamp, &block_logs);
             }
+            result.side_indices.block_logs = block_logs;
         }
 
         // Epoch-boundary super reward-eligibility snapshot (deterministic; replaces per-TX writer).
-        Self::populate_super_elig_at_boundary(state_guard, storage, h);
+        result.side_indices.super_eligible = Self::compute_super_eligible_at_settle(state_guard, storage, h);
         // Defer the O(roster) light-eligibility snapshot to the caller, AFTER the state write-lock
         // (mirror deferred_emission_root) — a read-only recency index must never stall block apply at scale.
         if h != 0 && h % 14400 == 0 { result.deferred_light_elig = Some(h); }
@@ -4094,43 +5109,41 @@ impl BlockchainNode {
         // (no forfeiture). Each entry's proof binds wallet+epoch+amount against the locally-stored
         // epoch root; claim_reward enforces the monotonic last_claimed_epoch watermark (replay-safe).
         // Runs after Phase 2 so the claim TX's pre-images already exist for rollback.
-        Self::apply_merkle_claims(state_guard, storage, &microblock.transactions, block_snapshot.as_deref_mut());
+        if let Err(certifying_mb) = Self::apply_merkle_claims(
+            state_guard, storage, &microblock.transactions, h, block_snapshot.as_deref_mut()) {
+            result.reward_epoch_missing = Some(certifying_mb);
+        }
 
         // Producer fee-credit wallet for the rich-list touched-set (the credit below mutates it and it
         // is NOT in any tx's affected-addresses). Captured only when a credit is actually applied.
         let mut richlist_producer_wallet: Option<String> = None;
 
         // ── Phase 3: Credit producer fees (with recalculation) ──
-        if microblock.fees_collected > 0 {
-            // Recalculate actual fees from transactions to prevent overclaim
-            // Recompute the producer's flat fee total BYTE-IDENTICALLY to its block-build fill loop:
-            // SAME filter (!system && gas_price>0 && gas_limit>0) and SAME charged_gas (compute_gas_used
-            // at/above the metering-activation height, else gas_limit). Mapping all txs / a fixed formula
-            // here would diverge from the producer for a gas_limit==0 fee tx or below activation — and
-            // since we now credit this value DIRECTLY (no min(header,·) clamp), any divergence would fork
-            // the state_root. Plus the metered WASM compute measured during Phase 2 apply (same on every
-            // node). This sum equals the producer's block_fees_collected + block_wasm_fuel_fees exactly.
-            let actual_fees: u64 = microblock.transactions.iter()
-                .filter(|tx| !tx.from.starts_with("system_") && tx.gas_price > 0 && tx.gas_limit > 0)
-                .map(|tx| {
-                    let charged_gas = if h >= qnet_state::GAS_METERING_ACTIVATION_HEIGHT {
-                        tx.compute_gas_used()
-                    } else {
-                        tx.gas_limit
-                    };
-                    tx.effective_gas_price().saturating_mul(charged_gas)
-                })
-                .fold(0u64, |acc, fee| acc.saturating_add(fee))
-                .saturating_add(block_wasm_fuel_fees);
-            // The header's fees_collected is the producer's FLAT pre-execution estimate; the
-            // AUTHORITATIVE credit is this deterministically recomputed metered total (flat + measured
-            // fuel), which a malicious producer cannot inflate — it is recomputed, not read from the
-            // header. Log only a genuine overclaim (header exceeds the recomputed metered total).
-            if microblock.fees_collected > actual_fees {
-                println!("[WARN][VALIDATION] fees_overclaimed h={} claimed={} metered_actual={} producer={}",
-                         h, microblock.fees_collected, actual_fees, microblock.producer);
+        if block_flat_fees.saturating_add(block_wasm_fuel_fees) > 0 {
+            // The header's fees_collected is the producer's PRE-EXECUTION estimate over the whole tx
+            // list; the AUTHORITATIVE credit is what Phase 2 actually debited (accrued on apply-Ok
+            // only), so a failed tx pays nothing and earns the producer nothing. Recomputed, never
+            // read from the header, so a malicious producer cannot inflate it. The header legitimately
+            // exceeds this when a tx failed; only an excess over the whole-list upper bound is a claim
+            // the block could not have earned even with every tx succeeding.
+            let validated_fees = block_flat_fees.saturating_add(block_wasm_fuel_fees);
+            if microblock.fees_collected > validated_fees {
+                let list_upper_bound: u64 = microblock.transactions.iter()
+                    .filter(|tx| !tx.from.starts_with("system_") && tx.gas_price > 0 && tx.gas_limit > 0)
+                    .map(|tx| {
+                        let charged_gas = if h >= qnet_state::GAS_METERING_ACTIVATION_HEIGHT {
+                            tx.compute_gas_used()
+                        } else {
+                            tx.gas_limit
+                        };
+                        tx.effective_gas_price().saturating_mul(charged_gas)
+                    })
+                    .fold(0u64, |acc, fee| acc.saturating_add(fee));
+                if microblock.fees_collected > list_upper_bound {
+                    println!("[WARN][VALIDATION] fees_overclaimed h={} claimed={} upper_bound={} credited={} producer={}",
+                             h, microblock.fees_collected, list_upper_bound, validated_fees, microblock.producer);
+                }
             }
-            let validated_fees = actual_fees;
 
             let producer_wallet = match storage.load_node_registration(&microblock.producer) {
                 Ok(Some((_, wallet, _))) => wallet,
@@ -4144,14 +5157,16 @@ impl BlockchainNode {
             if !producer_wallet.is_empty() {
                 richlist_producer_wallet = Some(producer_wallet.clone());
                 if let Some(ref mut snap) = block_snapshot {
-                    snap.record_pre_images(&[producer_wallet.clone()], &state_guard.accounts);
+                    state_guard.journal_pre_images(snap, &[producer_wallet.clone()]);
                 }
-                match state_guard.credit_producer_fees_once(h, &producer_wallet, validated_fees) {
+                match state_guard.credit_producer_fees_once(
+                    h, &producer_wallet, validated_fees, block_snapshot.as_deref_mut(),
+                ) {
                     Ok(true) => {
                         if is_info() && validated_fees > 10_000_000 {
                             println!("[INFO][FEES] credited producer={} wallet={}... fees={} nanoQNC h={}",
                                      microblock.producer,
-                                     &producer_wallet[..16.min(producer_wallet.len())],
+                                     qnet_state::char_prefix(&producer_wallet, 16),
                                      validated_fees, h);
                         }
                     }
@@ -4176,12 +5191,14 @@ impl BlockchainNode {
 
         // Rich-list index (display-only, best-effort): reconcile this block's touched holders. Same
         // touched-set as the producer-inline path (tx affected-addrs ∪ credited producer wallet).
-        Self::reconcile_richlist_for_block(state_guard, storage, microblock, richlist_producer_wallet.as_deref());
+        result.side_indices.richlist =
+            Self::reconcile_richlist_for_block(state_guard, microblock, richlist_producer_wallet.as_deref());
 
         // ── Phase 6: Update chain_state.height ──
         {
             let mut chain_state = state_guard.chain_state.write();
             if h > chain_state.height {
+                if let Some(ref mut snap) = block_snapshot { snap.record_chain_height(chain_state.height); }
                 chain_state.height = h;
             }
         }
@@ -4202,10 +5219,9 @@ impl BlockchainNode {
     /// else `None` to drop it. Display-only + best-effort — never propagates the storage error.
     fn reconcile_richlist_for_block(
         state: &StateManager,
-        storage: &crate::storage::Storage,
         microblock: &MicroBlock,
         producer_wallet: Option<&str>,
-    ) {
+    ) -> Vec<(String, Option<u64>)> {
         use qnet_state::transaction::CANONICAL_BURN_ADDR;
         let mut touched: std::collections::HashSet<String> = std::collections::HashSet::new();
         for tx in &microblock.transactions {
@@ -4216,7 +5232,7 @@ impl BlockchainNode {
         if let Some(pw) = producer_wallet {
             if !pw.is_empty() { touched.insert(pw.to_string()); }
         }
-        if touched.is_empty() { return; }
+        if touched.is_empty() { return Vec::new(); }
         let mut updates: Vec<(String, Option<u64>)> = Vec::with_capacity(touched.len());
         for addr in touched {
             let upd = match state.get_account(&addr) {
@@ -4228,11 +5244,7 @@ impl BlockchainNode {
             };
             updates.push((addr, upd));
         }
-        if let Err(e) = storage.richlist_reconcile(&updates) {
-            if is_warn() {
-                println!("[WARN][RICHLIST] reconcile_failed h={} err={}", microblock.height, e);
-            }
-        }
+        updates
     }
 
     /// Full rebuild of the display-only rich-list index. Streams the AUTHORITATIVE `accounts` CF (complete
@@ -4388,6 +5400,9 @@ impl BlockchainNode {
             match restored_baseline {
                 Some((snap_height, snap_total_supply, accounts)) => {
                     if let Err(e) = (*sg).restore_accounts(accounts) {
+                        // Same as the rehydrate path: a mid-iteration failure leaves a partial
+                        // account prefix behind, and the caller resyncs from it. Wipe first.
+                        (*sg).clear();
                         return Err(format!("restore_accounts_failed err={:?}", e));
                     }
                     {
@@ -4399,6 +5414,22 @@ impl BlockchainNode {
                         cs.total_supply = snap_total_supply;
                         cs.last_minted_emission_mb = Self::emission_mb_index(snap_height);
                     }
+                    // The commitment-dedup maps are DERIVED from block history and survive the
+                    // accounts wipe, so after rolling back they still hold entries written by the
+                    // DELETED blocks: a re-applied NodeRegistration is then skipped as a duplicate,
+                    // its registry row and registry_root delta are never written, and — because a
+                    // registration has no account effect — the state_root still matches, so nothing
+                    // alarms. Reseeded from the durable registry, which the caller has already
+                    // pruned via rebuild_registry_lthash(target).
+                    if let Err(e) = storage.reseed_commitment_dedup(&*sg) {
+                        return Err(format!("reseed_commitment_dedup_failed err={:?}", e));
+                    }
+                    // Fee-credit markers are released by restore_accounts itself — the accounts wipe
+                    // is what destroys the credits, so the release belongs to that primitive, not
+                    // here. A caller-side range release was too narrow: it covered only the REPLAY
+                    // window (snap, target], while the rollback also DELETED (target, local_h],
+                    // whose credits the same wipe destroyed — those markers survived with nothing
+                    // behind them and wedged the first re-applied height above the target.
                     println!(
                         "[INFO][STATE] reconcile_snapshot_restored snap_h={} total_supply={} target={}",
                         snap_height, snap_total_supply, target_height,
@@ -4423,7 +5454,14 @@ impl BlockchainNode {
             // inside the loop, no opportunity for another task to slip in.
             let mut applied = 0u64;
             for mb in &blocks_to_replay {
-                let _ = Self::apply_block_to_state(&sg, mb, storage, None, None);
+                let r = Self::apply_block_to_state(&sg, mb, storage, None, None);
+                // Replaying a stored block: it already owns its slot, so its side indices are written
+                // straight away (idempotent — lowest-height-wins and add-only).
+                Self::flush_block_side_indices(storage, mb.height, &r.side_indices);
+                if let Some(certifying_mb) = r.reward_epoch_missing {
+                    return Err(format!("reconcile_reward_epoch_missing h={} certifying_mb={}",
+                                       mb.height, certifying_mb));
+                }
                 // Re-seal total_supply at checkpoint heads (see startup replay): a post-reconcile finality
                 // redrive reads get_total_supply_at(head), which does NOT recompute on miss → defer forever.
                 if mb.height % qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL == 0 {
@@ -4466,6 +5504,29 @@ impl BlockchainNode {
         }
         println!("[INFO][STATE] reconcile_verified target={} root={}",
                  target_height, hex::encode(&computed_root[..8]));
+
+        // Push the reconciled accounts back to disk. The accounts CF is written by a fire-and-forget
+        // task after apply and is NOT rolled back, so an orphaned block's values survive there. RAM is
+        // now proven canonical (the root check above), and the consensus reads go RAM-first — but an
+        // EVICTED account falls through to this CF, and a stale banned_at_height there would zero a
+        // node's reputation on this host and nowhere else, splitting epoch_commitment. Writing the
+        // proven state through closes the window instead of waiting for persist-before-evict.
+        {
+            let sg = state.read().await;
+            let restored: Vec<(String, qnet_state::Account)> = sg.accounts.iter()
+                .map(|e| (e.key().clone(), e.value().clone())).collect();
+            drop(sg);
+            let n = restored.len();
+            // Only the reconciled RAM set is written. A wholesale delete of non-resident rows was
+            // considered and REJECTED: eviction is normal, so that would drop live balances to correct a
+            // narrow staleness. The residual — an account banned on an orphaned branch AND evicted before
+            // the reorg — stays, self-healing on the next persist-before-evict.
+            if let Err(e) = storage.persist_accounts_batch(restored, Vec::new()).await {
+                println!("[WARN][STATE] reconcile_account_persist_failed target={} err={}", target_height, e);
+            } else if is_info() {
+                println!("[INFO][STATE] reconcile_accounts_persisted target={} n={}", target_height, n);
+            }
+        }
         Ok(())
     }
 
@@ -4553,6 +5614,7 @@ impl BlockchainNode {
         storage: &Storage,
         consensus_participants: &[String],
         macroblock_index: u64,
+        state_guard: &StateManager,
     ) -> std::collections::HashMap<String, f64> {
         use qnet_consensus::deterministic_reputation::INITIAL_REPUTATION;
         let mut rep: std::collections::HashMap<String, f64> = consensus_participants.iter()
@@ -4561,8 +5623,18 @@ impl BlockchainNode {
         // double-sign) → banned (0 → excluded by the ≥70 gate). The cumulative set is anchored
         // on the previous macroblock (O(window), pruning-safe); a forged proof never verifies,
         // so honest nodes are never banned.
-        for offender in Self::compute_cumulative_ban_set(storage, macroblock_index).await {
-            rep.insert(offender, 0.0);
+        // Bans come from APPLIED STATE, not from re-scanning the window's block bodies.
+        // `Account.banned_at_height` is write-once monotone, journaled (the offender is in
+        // get_all_affected_addresses) and unconditionally part of the account leaf hash — i.e. it is
+        // already inside state_root and therefore already agreed by the QC that certified it. Re-deriving
+        // it from bodies was a redundant computation whose ONLY new property was a dependency on which
+        // blocks this node still holds; under body pruning (6 epochs) it silently lost every ban in a
+        // pruned window.
+        let window_head = macroblock_index.saturating_mul(90);
+        for id in consensus_participants {
+            if banned_at_or_below(state_guard, storage, id, window_head) {
+                rep.insert(id.clone(), 0.0);
+            }
         }
         rep
     }
@@ -4579,6 +5651,78 @@ impl BlockchainNode {
         } else {
             Some(raw)
         }
+    }
+
+    /// Load macroblock `idx` and require its hash to equal `want`. The hash check is what makes the
+    /// anchor unforgeable: `MacroBlock::hash()` excludes consensus_data, so a hash-equal impostor
+    /// cannot be substituted for the committee source without also matching every hashed body field.
+    pub(crate) fn load_macroblock_checked(storage: &Storage, idx: u64, want: &[u8; 32]) -> Option<qnet_state::MacroBlock> {
+        let raw = storage.get_macroblock_by_height(idx).ok().flatten()?;
+        let bytes = Self::macroblock_plaintext(raw)?;
+        let mb = bincode::deserialize::<qnet_state::MacroBlock>(&bytes).ok()?;
+        if mb.hash()[..] != want[..] { return None; }
+        Some(mb)
+    }
+
+    /// Resolve `(committee, quorum)` for a checkpoint carrying a recovery pin, enforcing every clause
+    /// of the relaxed-QC validity rule. Reads ONLY the anchor macroblock — final, at or below the last
+    /// seal, retained forever (only microblock BODIES prune) — so the verdict on a given certificate
+    /// can never change with a reorg and can never expire.
+    fn resolve_recovery_pin(
+        storage: &Storage,
+        index: u64,
+        cp: &qnet_consensus::checkpoint_bft::Checkpoint,
+        a: u64,
+        ah: [u8; 32],
+    ) -> Result<(Vec<String>, usize), String> {
+        use qnet_consensus::checkpoint_bft::{Checkpoint, QuorumCertificate,
+                                             RELAXED_MIN_COMMITTEE, recovery_step_for_head, relaxed_quorum};
+        if a == 0 { return Err(format!("v2_rc_anchor_zero mb={}", index)); }
+        // Absent anchor is a DEFER, never a rejection: a node that has not yet pulled MB_A must fetch
+        // it and retry, exactly like the ordinary N-2 committee anchor. Rejecting would brick a cold
+        // join across the span permanently.
+        let raw = match storage.get_macroblock_by_height(a).ok().flatten() {
+            Some(r) => r,
+            None => return Err(format!("v2_rc_defer_anchor mb={} need_anchor={}", index, a)),
+        };
+        let bytes = Self::macroblock_plaintext(raw)
+            .ok_or_else(|| format!("v2_rc_anchor_corrupt mb={}", index))?;
+        let mb_a = bincode::deserialize::<qnet_state::MacroBlock>(&bytes)
+            .map_err(|_| format!("v2_rc_anchor_decode mb={}", index))?;
+        if mb_a.hash()[..] != ah[..] { return Err(format!("v2_rc_anchor_mismatch mb={}", index)); }
+        let anchor_qc = mb_a.consensus_data.checkpoint_qc.as_ref()
+            .ok_or_else(|| format!("v2_rc_anchor_noqc mb={}", index))?;
+        let (cp_a, qc_a): (Checkpoint, QuorumCertificate) = bincode::deserialize(anchor_qc)
+            .map_err(|_| format!("v2_rc_anchor_qc_decode mb={}", index))?;
+        // No consecutive spans: an anchor must ITSELF be full-quorum-sealed. This is the hard,
+        // chain-verifiable bound — relaxation cannot chain, so the network must seal at least one
+        // full-quorum macroblock before another relaxed span is possible.
+        if cp_a.recovery_anchor.is_some() { return Err(format!("v2_rc_chained mb={}", index)); }
+        if a.saturating_mul(90) != cp_a.window_head_height {
+            return Err(format!("v2_rc_anchor_offboundary mb={}", index));
+        }
+        let cs = mb_a.consensus_data.consensus_committee.clone().unwrap_or_default();
+        if cs.len() < RELAXED_MIN_COMMITTEE {
+            return Err(format!("v2_rc_floor mb={} n={}", index, cs.len()));
+        }
+        // Position pin on the WINDOW; the index is deliberately free (a TimeoutCertificate advances the
+        // view without certifying a window, so lockstep is unsatisfiable). The freed index has NO
+        // accountability arm yet — equivocation proofs are same-round only, and a per-(anchor,
+        // window_head) vote rule is one of the RC_ENABLED prerequisites (see its doc).
+        let k = match recovery_step_for_head(cp_a.window_head_height, cp.window_head_height) {
+            Some(k) => k,
+            None => return Err(format!("v2_rc_unpinned mb={} head={}", index, cp.window_head_height)),
+        };
+        // Parent link. At k==1 the parent IS the anchor's own QC; above it only contiguity is
+        // checkable here (intra-window checkpoints are sealed nowhere), and the hash link is enforced
+        // live by the engine's lock rule. Forging an intermediate still needs >=T C_S signatures.
+        match &cp.parent_qc {
+            Some(p) if p.index + 1 == cp.index
+                && (k > 1 || p.checkpoint_hash[..] == qc_a.checkpoint_hash[..]) => {}
+            _ => return Err(format!("v2_rc_parent mb={}", index)),
+        }
+        let q = relaxed_quorum(cs.len());
+        Ok((cs, q))
     }
 
     /// Loads the cumulative ban-set stored in macroblock `mb_index`'s body
@@ -4602,40 +5746,87 @@ impl BlockchainNode {
     /// macroblock body + this window). Full-scan fallback only when the anchor is absent
     /// (genesis window, or a pre-feature chain). Bans are permanent ⇒ the first verified proof
     /// for an offender wins; a forged proof never verifies ⇒ honest nodes are never banned.
-    pub async fn compute_cumulative_ban_set(storage: &Storage, mb_index: u64) -> std::collections::HashSet<String> {
+    /// Cryptographically verify an equivocation proof carried by a TX. Non-proof TXs pass untouched.
+    ///
+    /// This became MANDATORY the moment the proof gained an account-state effect (banned_at_height):
+    /// both admission paths used to wave these through as "self-verifying" because the apply arm was a
+    /// no-op, so a junk proof was harmless. It no longer is — without this any peer could ban any
+    /// identity. Verdict is a pure function of the TX bytes plus committed chain state (the offender's
+    /// key resolves through `load_vrf_public_key`, else the genesis anchor), so every node agrees.
+    pub async fn equivocation_proof_verified(storage: &Storage, tx: &qnet_state::Transaction) -> bool {
+        match &tx.tx_type {
+            qnet_state::TransactionType::EquivocationProof { offender, height, block_a, block_b } => {
+                Self::verify_equivocation_proof(storage, offender, *height, block_a, block_b)
+            }
+            qnet_state::TransactionType::VoteEquivocationProof {
+                offender, checkpoint_a, signature_a, checkpoint_b, signature_b
+            } => {
+                Self::verify_vote_equivocation_proof(
+                    storage, offender, checkpoint_a, signature_a, checkpoint_b, signature_b).await
+            }
+            _ => true,
+        }
+    }
+
+    /// The cumulative ban set at `mb_index`, or None when this node cannot derive it EXACTLY.
+    ///
+    /// FAIL-STOP, not fail-open. The set zeroes reputation in the eligible-producer snapshot, which is
+    /// folded into `epoch_commitment` and compared byte-for-byte by every validator — so a set that is
+    /// merely "what this node could reconstruct from what it happens to hold" is a divergence, not a
+    /// degraded answer. Two inputs can be locally absent:
+    ///   - the anchor set at mb_index-1. Rebuilding from height 1 instead is WRONG once body pruning has
+    ///     run (retention is 6 epochs), because every ban inside a pruned window silently disappears.
+    ///   - any microblock body in the window being scanned.
+    /// Either one ⇒ None ⇒ the caller abstains from producing a snapshot and syncs. Abstaining is safe:
+    /// the quorum that does hold the data keeps sealing, and an abstaining node still follows the chain.
+    pub async fn compute_cumulative_ban_set(storage: &Storage, mb_index: u64) -> Option<std::collections::HashSet<String>> {
         let window_head = mb_index.saturating_mul(90);
         let (mut bans, scan_start) = if mb_index >= 2 {
             match Self::load_macroblock_ban_set(storage, mb_index - 1) {
-                Some(anchor) => (anchor, (mb_index - 1) * 90 + 1), // fast path: anchor + this window
-                None => (std::collections::HashSet::new(), 1u64),  // pre-feature: rebuild fully
+                Some(anchor) => (anchor, (mb_index - 1) * 90 + 1),
+                None => {
+                    if is_warn() {
+                        println!("[WARN][BAN] anchor_absent mb={} — abstaining until sync", mb_index - 1);
+                    }
+                    crate::sync_manager::nudge_sync_check();
+                    return None;
+                }
             }
         } else {
             (std::collections::HashSet::new(), 1u64) // genesis window (mb_index 0/1)
         };
         let mut h = scan_start;
         while h <= window_head {
-            if let Ok(Some(b)) = storage.load_microblock_auto_format(h) {
-                for tx in &b.transactions {
-                    match &tx.tx_type {
-                        qnet_state::TransactionType::EquivocationProof { offender, height, block_a, block_b } => {
-                            if !bans.contains(offender)
-                                && Self::verify_equivocation_proof(offender, *height, block_a, block_b) {
-                                bans.insert(offender.clone());
-                            }
-                        }
-                        qnet_state::TransactionType::VoteEquivocationProof { offender, checkpoint_a, signature_a, checkpoint_b, signature_b } => {
-                            if !bans.contains(offender)
-                                && Self::verify_vote_equivocation_proof(offender, checkpoint_a, signature_a, checkpoint_b, signature_b).await {
-                                bans.insert(offender.clone());
-                            }
-                        }
-                        _ => {}
+            let b = match storage.load_microblock_auto_format(h) {
+                Ok(Some(b)) => b,
+                _ => {
+                    if is_warn() {
+                        println!("[WARN][BAN] body_absent h={} mb={} — abstaining until sync", h, mb_index);
                     }
+                    crate::sync_manager::nudge_sync_check();
+                    return None;
+                }
+            };
+            for tx in &b.transactions {
+                match &tx.tx_type {
+                    qnet_state::TransactionType::EquivocationProof { offender, height, block_a, block_b } => {
+                        if !bans.contains(offender)
+                            && Self::verify_equivocation_proof(storage, offender, *height, block_a, block_b) {
+                            bans.insert(offender.clone());
+                        }
+                    }
+                    qnet_state::TransactionType::VoteEquivocationProof { offender, checkpoint_a, signature_a, checkpoint_b, signature_b } => {
+                        if !bans.contains(offender)
+                            && Self::verify_vote_equivocation_proof(storage, offender, checkpoint_a, signature_a, checkpoint_b, signature_b).await {
+                            bans.insert(offender.clone());
+                        }
+                    }
+                    _ => {}
                 }
             }
             h += 1;
         }
-        bans
+        Some(bans)
     }
 
     /// Re-verify an on-chain checkpoint-vote-equivocation proof. SOUND double-vote ⇔ the two
@@ -4645,6 +5836,7 @@ impl BlockchainNode {
     /// async verifier vs the offender's registry PK; fail-safe (any mismatch → false → no ban).
     /// Identical on every node.
     async fn verify_vote_equivocation_proof(
+        storage: &Storage,
         offender: &str,
         checkpoint_a: &[u8],
         signature_a: &[u8],
@@ -4654,7 +5846,14 @@ impl BlockchainNode {
         use qnet_consensus::checkpoint_bft::Checkpoint;
         let ca: Checkpoint = match bincode::deserialize(checkpoint_a) { Ok(c) => c, Err(_) => return false };
         let cb: Checkpoint = match bincode::deserialize(checkpoint_b) { Ok(c) => c, Err(_) => return false };
-        if ca.index != cb.index { return false; } // must be the SAME round
+        // SAME ROUND only. A same-window arm was added for the freed-index pin and REMOVED: the engine's
+        // rule is one vote per INDEX (checkpoint_consensus on_proposal), and next_window() does not
+        // advance on a view change, so the protocol-mandated re-proposal of one window at a new index
+        // makes two conformant votes a valid ban proof. The TX is unsigned and anyone-submittable and
+        // the ban folds into epoch_commitment — a mass-ban primitive against conforming nodes. A
+        // verifier must not punish what the voter is instructed to do; per-window attribution first
+        // needs a per-(anchor, head) single-vote rule in the engine.
+        if ca.index != cb.index { return false; }
         let ha = ca.hash();
         let hb = cb.hash();
         if ha == hb { return false; } // same checkpoint — not equivocation
@@ -4662,8 +5861,35 @@ impl BlockchainNode {
         let msg_b = format!("QNET_BFT2_VOTE:{}", hex::encode(hb));
         let sa = match std::str::from_utf8(signature_a) { Ok(s) => s, Err(_) => return false };
         let sb = match std::str::from_utf8(signature_b) { Ok(s) => s, Err(_) => return false };
-        qnet_consensus::consensus_crypto::verify_consensus_signature(offender, &msg_a, sa).await
-            && qnet_consensus::consensus_crypto::verify_consensus_signature(offender, &msg_b, sb).await
+        // Pin the PK explicitly, exactly as the QC verifier does. The generic entry point resolves the
+        // key through the RAM registry, which is idle-evicted and can TOFU a first-seen key — two nodes
+        // would then derive different ban sets, and the set is folded into epoch_commitment, so the
+        // macroblock would fail to certify. Unknown key ⇒ no ban (fail-safe, mirrors the block path).
+        let pk_bytes = match Self::equivocation_offender_pk(storage, offender) {
+            Some(p) => p,
+            None => return false,
+        };
+        qnet_consensus::consensus_crypto::verify_consensus_signature_bound(offender, &msg_a, sa, &pk_bytes).await
+            && qnet_consensus::consensus_crypto::verify_consensus_signature_bound(offender, &msg_b, sb, &pk_bytes).await
+    }
+
+    /// Offender consensus PK from COMMITTED chain state (never the RAM registry, which is
+    /// idle-evicted and per-process ⇒ a fork source: this verdict feeds banned_validators, which is
+    /// folded into epoch_commitment and rejected on mismatch).
+    fn equivocation_offender_pk(storage: &Storage, offender: &str) -> Option<Vec<u8>> {
+        // The standalone vrf_pk_ row is NOT pruned when a branch is reorged out and is also writable
+        // off-chain, so on its own it is a local artefact. Cross-check it against the commitment in the
+        // canonical node_ registry row (reg_height-bounded, covered by registry_root, pruned on reorg):
+        // only a key the chain committed can produce a ban, and the ban is folded into epoch_commitment.
+        // Genesis identities fall back to the pinned anchor, which is stronger than any row.
+        if let Ok(Some(p)) = storage.load_vrf_public_key(offender) {
+            if let Ok(Some(tag)) = storage.node_signer_key_commitment(offender) {
+                if hex::encode(Sha3_256::digest(&p)) == tag {
+                    return Some(p);
+                }
+            }
+        }
+        crate::genesis_constants::get_genesis_anchor_pk(offender)
     }
 
     /// Re-verify an on-chain equivocation proof: both headers carry the offender's
@@ -4672,13 +5898,24 @@ impl BlockchainNode {
     /// unforgeable proof of double-signing. Deterministic (registry PK + Dilithium),
     /// identical on every node; fail-safe (anything off → false → no ban).
     fn verify_equivocation_proof(
+        storage: &Storage,
         offender: &str,
         height: u64,
         block_a: &qnet_state::EquivocationHeader,
         block_b: &qnet_state::EquivocationHeader,
     ) -> bool {
-        if block_a == block_b { return false; }
-        let pk_bytes = match qnet_consensus::consensus_crypto::get_consensus_pk(offender) {
+        // Compare BLOCK IDENTITY, never the whole struct. `EquivocationHeader` derives PartialEq and
+        // carries `signature`, so a struct compare called two copies of ONE genuine block "different"
+        // whenever their signature bytes differed — which happens with no attacker at all, because
+        // ML-DSA signing is randomised and an honest producer re-emits after a rollback. It was also
+        // forgeable outright: hex::decode accepts either case, so re-casing the hex of a single public
+        // signature yielded two "different" headers that both verify. Either way anyone could mint a
+        // valid proof against any producer from one public block, and the ban is permanent committed
+        // state — at n=5 two of them halt finality for good. This mirrors the vote-equivocation
+        // sibling, which has always compared checkpoint hashes.
+        if equivocation_identity_hash(height, offender, block_a)
+            == equivocation_identity_hash(height, offender, block_b) { return false; }
+        let pk_bytes = match Self::equivocation_offender_pk(storage, offender) {
             Some(p) => p,
             None => return false,
         };
@@ -4728,6 +5965,7 @@ impl BlockchainNode {
         _own_node_type: NodeType,
         macroblock_index: u64,
         storage: &Storage,
+        state_guard: &StateManager,
     ) -> Vec<qnet_state::EligibleProducer> {
         const MIN_REPUTATION_BP: u32 = 7000; // 70.00% eligibility floor (fixed-point centipercent)
 
@@ -4736,10 +5974,37 @@ impl BlockchainNode {
         // microblock rotation reward only on the producer and never replays it elsewhere → each
         // node's map differs → eligible/epoch_commitment diverge → checkpoint never reaches 2f+1.
         let reputation_map = Self::compute_consensus_reputation_map(
-            storage, consensus_participants, macroblock_index,
+            storage, consensus_participants, macroblock_index, state_guard,
         ).await;
 
+        // ── INACTIVITY SHRINK ──────────────────────────────────────────────────────────────────────
+        // Carrying every previous member forward unconditionally is what let a stalled quorum stay
+        // stalled forever: quorum(n) = n - (n-1)/3 is taken over the eligible set, so a set that never
+        // loses its dead members has a threshold that never becomes reachable again. This is the same
+        // failure an inactivity-leak design answers — keep producing, and shrink the denominator
+        // until the honest online remainder clears the bar.
+        //
+        // Liveness here is the node's ON-CHAIN heartbeat, not connectivity: the set is a function of
+        // committed blocks up to scan_end, so a partition does NOT give the two sides different sets —
+        // they read the same committed heartbeats and shrink identically. That is what makes shrinking
+        // safe to do without any record of who signed a QC (which can never enter a hash preimage).
+        //
+        // Requires A1: without production continuing past a stalled finality, no new heartbeat could
+        // ever land, so the set could never shrink and recovery was impossible by construction.
+        let live_scan_end = macroblock_index.saturating_mul(90);
+        let live_now = match recent_heartbeat_senders(storage, live_scan_end) {
+            Some(x) => x,
+            // Index unusable ⇒ abstain rather than shrink on a partial liveness view.
+            None => return Vec::new(),
+        };
         let mut eligible: Vec<qnet_state::EligibleProducer> = consensus_participants.iter()
+            .filter(|node_id| {
+                // Restart bar, checked before the genesis carve-out so a compromised genesis identity
+                // can also be retired.
+                if crate::genesis_constants::restart_excludes(node_id) { return false; }
+                // Genesis stays: it is the bootstrap floor and the set must never collapse below it.
+                node_id.starts_with("genesis_node_") || live_now.contains(*node_id)
+            })
             .map(|node_id| {
                 // reputation_map is 0–100; commit as centipercent u32 (×100, rounded) so the
                 // macroblock body is bit-identical across nodes — no f64 in the consensus hash.
@@ -4752,6 +6017,13 @@ impl BlockchainNode {
             })
             .filter(|p| p.reputation >= MIN_REPUTATION_BP)
             .collect();
+        if is_info() {
+            let dropped = consensus_participants.len().saturating_sub(eligible.len());
+            if dropped > 0 {
+                println!("[INFO][SNAP] inactivity_shrink mb={} carried={} dropped={} reason=no_recent_heartbeat",
+                         macroblock_index, eligible.len(), dropped);
+            }
+        }
 
         // O(1) membership index kept in lockstep with `eligible` so the L1/L2
         // "already present?" checks are O(1), not O(eligible) per candidate — the
@@ -4791,9 +6063,16 @@ impl BlockchainNode {
             // node re-enters through the Phase-2A heartbeat gate below WITHOUT re-registration. Phase-2A
             // (recent on-chain Heartbeat) absorbs any registration-timing edge: a just-applied
             // registration not yet heartbeated is filtered out, so eligible-set membership stays stable.
+            // Bounded to scan_end AT THE SOURCE. This set feeds eligible_producers -> epoch_commitment
+            // -> the QC, so it must be a function of the height, not of how far this node happens to have
+            // applied. The unbounded twin (super_registrations_sorted) let the live pool run ahead of
+            // scan_end; the downstream reg-height filter then had to undo it.
             let registered_super_nodes: std::collections::HashSet<String> =
-                match storage.super_registrations_sorted() {
+                match storage.super_registrations_as_of(scan_end) {
                     Ok(regs) => regs.into_iter().map(|(node_id, _w)| node_id).collect(),
+                    // Empty is this snapshot's ABSTAIN sentinel: it yields an empty eligible set, which
+                    // the WindowEnd guard turns into a defer. Never give this arm a fallback roster —
+                    // that would publish a set nobody else derives, straight into epoch_commitment.
                     Err(_) => std::collections::HashSet::new(),
                 };
 
@@ -4807,9 +6086,10 @@ impl BlockchainNode {
                 // Deterministic recent-Heartbeat set from committed block bodies bounded to end_height
                 // (NOT the async-lagging accounts CF, whose per-node persist lag gave a divergent eligible
                 // set → epoch_commitment split → finality stall). Computed once; identical on every member.
-                let recent_hb = recent_heartbeat_senders(storage, scan_end);
+                // Same committed-heartbeat set the carry-over filter used (scan_end == live_scan_end).
+                let recent_hb = &live_now;
                 let additions = phase2a_eligible_additions(
-                    storage, &registered_super_nodes, &recent_hb, &eligible_ids,
+                    state_guard, storage, &registered_super_nodes, recent_hb, &eligible_ids,
                     &reputation_map, scan_end, MIN_REPUTATION_BP,
                 );
                 let added_tally = additions.len();
@@ -4823,75 +6103,13 @@ impl BlockchainNode {
                 }
             }
 
-            // ── LEVEL 2: Carry-over from recent macroblock eligible sets ──
-            // Nodes that were in eligible_producers within the last 3 macroblocks
-            // are carried over ONLY IF they also participated in at least one of
-            // those macroblocks' BFT rounds (signed commits on-chain).
-            //
-            // Liveness-gated carryover: a node is carried over ONLY IF it has
-            // an on-chain commit in ≥1 of the last CARRYOVER_LOOKBACK
-            // macroblocks. Without this, any node in a recent eligible list
-            // was re-added with no activity check → phantom accumulation.
-            // Commits are signed (unforgeable) so a dead node auto-expires
-            // after the window. Deterministic (commits on disk, identical
-            // across nodes). O(peers × lookback).
-            const CARRYOVER_LOOKBACK: u64 = 3;
-            let carryover_start = macroblock_index.saturating_sub(CARRYOVER_LOOKBACK);
-
-            // Build liveness set: union of committers across lookback macroblocks.
-            let mut live_committers: std::collections::HashSet<String> = std::collections::HashSet::new();
-            for mb_idx in carryover_start..macroblock_index {
-                if mb_idx == 0 { continue; }
-                if let Ok(Some(mb_data)) = storage.get_macroblock_by_height(mb_idx) {
-                    if let Ok(mb) = bincode::deserialize::<qnet_state::MacroBlock>(&mb_data) {
-                        for committer in mb.consensus_data.commits.keys() {
-                            live_committers.insert(committer.clone());
-                        }
-                    }
-                }
-            }
-
-            let mut carryover_count = 0usize;
-            let mut carryover_excluded_dead = 0usize;
-
-            for mb_idx in carryover_start..macroblock_index {
-                if mb_idx == 0 { continue; }
-                if let Ok(Some(mb_data)) = storage.get_macroblock_by_height(mb_idx) {
-                    if let Ok(mb) = bincode::deserialize::<qnet_state::MacroBlock>(&mb_data) {
-                        if let Some(ref snapshot_data) = mb.consensus_data.eligible_producers {
-                            if let Ok(producers) = bincode::deserialize::<Vec<qnet_state::EligibleProducer>>(snapshot_data) {
-                                for p in &producers {
-                                    if eligible_ids.contains(&p.node_id) { continue; }
-
-                                    // v14.2: LIVENESS GATE — must have committed in lookback window
-                                    if !live_committers.contains(&p.node_id) {
-                                        carryover_excluded_dead += 1;
-                                        continue;
-                                    }
-
-                                    let reputation = reputation_map.get(&p.node_id).copied()
-                                        .map(|r| (r.clamp(0.0, 100.0) * 100.0).round() as u32)
-                                        .unwrap_or(p.reputation);
-                                    if reputation >= MIN_REPUTATION_BP {
-                                        eligible.push(qnet_state::EligibleProducer {
-                                            node_id: p.node_id.clone(),
-                                            reputation,
-                                        });
-                                        eligible_ids.insert(p.node_id.clone());
-                                        carryover_count += 1;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            if carryover_count > 0 || carryover_excluded_dead > 0 {
-                println!("[INFO][SNAP] v14.2 L2_CARRYOVER added={} excluded_dead={} live_committers={} mb_range={}-{} total={}",
-                         carryover_count, carryover_excluded_dead, live_committers.len(),
-                         carryover_start, macroblock_index.saturating_sub(1), eligible.len());
-            }
+            // LEVEL 2 (carry-over gated on on-chain commits) was DELETED, not disabled: it read
+            // `mb.consensus_data.commits`, which has no writer anywhere — v2 seals the macroblock with
+            // `..Default::default()` and the only producer lived in the removed commit/reveal path. So
+            // `live_committers` was always empty and the gate rejected every candidate it examined.
+            // Nothing is lost (the unconditional carry-forward above dominates), but its comment
+            // claimed a dead node "auto-expires after the window", which was never true and misread
+            // three separate analyses.
         }
 
         // Genesis floor: the 5 canonical genesis producers stay permanently eligible, so a fork or
@@ -4901,10 +6119,17 @@ impl BlockchainNode {
             const GENESIS_FLOOR_REP_BP: u32 = 10000; // 100.00% centipercent, ≥ MIN_REPUTATION_BP
             for i in 1..=5u32 {
                 let gid = format!("genesis_node_{:03}", i);
-                // Never resurrect a slashed genesis: a verified on-chain equivocation ban zeroes its
-                // reputation (compute_cumulative_ban_set) and the pipeline drops it — the floor must honour
-                // that, else a proven-Byzantine genesis would re-enter at max rep, bypassing slashing.
+                // Never resurrect a slashed genesis. The reputation map is keyed on THIS window's
+                // participants, and a banned genesis leaves that set one window after the ban — from then
+                // on the map has no entry for it and a map-only guard reads "not banned", re-admitting a
+                // proven equivocator at max reputation every other window. Read the ban itself.
+                if banned_at_or_below(state_guard, storage, &gid, macroblock_index.saturating_mul(90)) { continue; }
                 if reputation_map.get(&gid).map_or(false, |r| *r == 0.0) { continue; }
+                // The floor is ADDITIVE, so it re-admits regardless of what the two arms above
+                // filtered — and a restart bar sets neither `banned_at_height` nor reputation 0.
+                // Without this the one mechanism for retiring a compromised GENESIS key is a silent
+                // no-op, i.e. the set with the most authority is the only one a restart cannot clean.
+                if crate::genesis_constants::restart_excludes(&gid) { continue; }
                 if eligible_ids.insert(gid.clone()) {
                     eligible.push(qnet_state::EligibleProducer { node_id: gid, reputation: GENESIS_FLOOR_REP_BP });
                 }
@@ -4963,21 +6188,13 @@ impl BlockchainNode {
                             macroblock_index,
                         );
                     }
-                    // Nudge the single sync coordinator to backfill the N-2 seed macroblock; the
-                    // downstream v2 committee guard refuses to proceed until it arrives, so keeping
-                    // the full candidate list here is harmless.
+                    // ABSTAIN. Returning the UNTRUNCATED list would make the snapshot a function of
+                    // local RocksDB holdings: nodes that hold the seed emit 1000 producers, nodes that
+                    // do not emit all ~100k, and both land in epoch_commitment. "Every similarly-behind
+                    // node produces the same list" is not the bar — every node must produce the same
+                    // list. No seed, no snapshot.
                     crate::sync_manager::nudge_sync_check();
-                    // Short-circuit: abort the truncation branch entirely.
-                    // Return the current `eligible` list unchanged so the
-                    // caller gets a deterministic outcome (full list) that
-                    // every similarly-behind node also produces.
-                    if is_debug() {
-                        println!(
-                            "[DBG][SNAP] consensus_participants={} (N-2 seed missing, no truncation)",
-                            eligible.len(),
-                        );
-                    }
-                    return eligible;
+                    return Vec::new();
                 }
             };
 
@@ -5086,47 +6303,24 @@ impl BlockchainNode {
             return Some([0u8; 32]);
         }
         let n_minus_2 = macroblock_index - 2;
-        // P1.5 self-healing: strict N-2 froze finality irreversibly when N-2
-        // was absent (and every later epoch's N-2 in turn). Walk back to the
-        // most recent REAL finalized macroblock ≤ N-2 — IDENTICAL predicate
-        // and depth as the committee fallback (non-empty eligible_producers
-        // AND randomness_beacon present), so beacon + committee always come
-        // from the SAME macroblock → leader selection stays consistent
-        // network-wide. Bounded depth; deeper gap → None (abstain, needs sync).
-        const MAX_FALLBACK_DEPTH: u64 = 8;
-        let floor = n_minus_2.saturating_sub(MAX_FALLBACK_DEPTH).max(1);
-        let mut idx = n_minus_2;
-        loop {
-            match storage.get_macroblock_by_height(idx) {
-                Ok(Some(data)) => {
-                    if let Ok(mb) = bincode::deserialize::<qnet_state::MacroBlock>(&data) {
-                        let has_set = mb.consensus_data.eligible_producers.as_ref()
-                            .and_then(|s| bincode::deserialize::<Vec<qnet_state::EligibleProducer>>(s).ok())
-                            .map(|v| v.iter().any(|p| !p.node_id.is_empty()))
-                            .unwrap_or(false);
-                        if has_set {
-                            if let Some(b) = mb.consensus_data.randomness_beacon {
-                                if idx != n_minus_2 && crate::node::is_warn() {
-                                    println!("[WARN][VRF] beacon_fallback used_mb={} wanted_mb={} depth={} reason=n2_absent_self_heal",
-                                             idx, n_minus_2, n_minus_2 - idx);
-                                }
-                                return Some(b);
-                            }
-                        }
-                    }
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    if crate::node::is_warn() {
-                        println!("[WARN][VRF] seed_storage_error mb={} err={}", idx, e);
-                    }
+        // DERIVED from window N-2's microblocks, not read out of macroblock N-2. Same value by
+        // construction (the sealer folds exactly these block hashes), but it exists as soon as the window's
+        // blocks do — so the seed no longer disappears when finality stops. Absent body ⇒ abstain.
+        if let Some(b) = crate::node::derive_window_beacon(storage, n_minus_2) {
+            return Some(b);
+        }
+        // Fall back to the SEALED value. Identical by construction (the sealer folds exactly these
+        // block hashes), and a snapshot cold-joiner holds macroblocks at/above its anchor while holding no
+        // bodies below it — without this it would abstain for a full window after every cold join.
+        if let Ok(Some(data)) = storage.get_macroblock_by_height(n_minus_2) {
+            if let Ok(mb) = bincode::deserialize::<qnet_state::MacroBlock>(&data) {
+                if let Some(b) = mb.consensus_data.randomness_beacon {
+                    return Some(b);
                 }
             }
-            if idx <= floor { break; }
-            idx -= 1;
         }
         if crate::node::is_warn() {
-            println!("[WARN][VRF] seed_missing_local n2={} depth={} — node behind, trigger sync", n_minus_2, MAX_FALLBACK_DEPTH);
+            println!("[WARN][VRF] seed_underivable n2={} — no bodies and no seal, abstaining", n_minus_2);
         }
         None
     }
@@ -5180,28 +6374,49 @@ impl BlockchainNode {
     /// Deterministic consensus committee for the EPOCH of block height `h`, from the finalized
     /// N-2 macroblock snapshot — a pure function of on-chain state, so every validator computes the
     /// same set for the same `h` (required: a NodeRegistration is re-validated on every node).
-    /// window = epoch, seed = N-2 beacon, candidates = N-2 eligible_producers (sorted) — identical
-    /// parameterisation to the failover-voting committee (unified_p2p::deterministic_eligible_ids),
-    /// but keyed on `h` not the local tip and with NO walk-back (reject, don't guess, if N-2 is
-    /// absent locally). `None` = genesis era (no N-2 yet); the caller falls back to the genesis
+    /// window = epoch, seed = N-2 beacon, candidates = N-2 eligible_producers (sorted). THE single
+    /// resolver: `unified_p2p::deterministic_eligible_ids` now delegates here rather than answering
+    /// the same question with its own staleness policy. Keyed on `h`, not the local tip, and with NO
+    /// walk-back (reject, don't guess, if N-2 is absent locally). `None` = genesis era (no N-2 yet); the caller falls back to the genesis
     /// committee (the only nodes that exist then). NOT a crutch: post-genesis this IS the live
     /// committee; at genesis the committee simply IS the 5 genesis.
     pub(crate) fn committee_for_height(storage: &Storage, h: u64) -> Option<Vec<String>> {
         let epoch = (h.saturating_sub(1)) / 90 + 1;
         let n2 = epoch.saturating_sub(2);
         if n2 == 0 { return None; } // genesis era: epochs 1-2 have no N-2 snapshot
-        let raw = storage.get_macroblock_by_height(n2).ok()??;
-        let mb = bincode::deserialize::<qnet_state::MacroBlock>(&raw).ok()?;
+        // THE single committee resolver, STRICTLY at N-2. Absent => None, never a guess: a walk-back
+        // returns whichever macroblock the node happens to hold, and the VRF seed comes from THAT
+        // macroblock, so a different stop index is a different committee. It also deletes the defer
+        // valve, since `n2_committee_absent` IS this returning None — turning "every node stalls" into
+        // "honest nodes disagree on block validity". Cost: no failover committee past the seal
+        // frontier, so rotation waits for finality. A stall is recoverable; a split is not.
+        Self::committee_from_macroblock(storage, n2, epoch)
+    }
+
+    /// Sample the committee for `epoch` out of macroblock `idx`'s sealed snapshot, or None if that
+    /// macroblock is absent or carries no usable snapshot.
+    ///
+    /// Committee AND beacon must come from the SAME macroblock, or leader selection and committee
+    /// membership are computed against different randomness and the two consensus layers disagree.
+    fn committee_from_macroblock(storage: &Storage, idx: u64, epoch: u64) -> Option<Vec<String>> {
+        let raw = storage.get_macroblock_by_height(idx).ok()??;
+        let bytes = Self::macroblock_plaintext(raw)?;
+        let mb = bincode::deserialize::<qnet_state::MacroBlock>(&bytes).ok()?;
+        // Seed = this macroblock's OWN beacon. NOT try_load_macroblock_beacon(idx) — that subtracts 2
+        // AGAIN, giving epoch-4 randomness and a different VRF subset than the real committee.
+        let seed = mb.consensus_data.randomness_beacon?;
         let snap = mb.consensus_data.eligible_producers.as_ref()?;
         let eligible = bincode::deserialize::<Vec<qnet_state::EligibleProducer>>(snap).ok()?;
+        // restart_excludes filtered HERE (restart GAP B): the barred set is bound into the eligible
+        // FIELD only at the builder, but a restart resumes at K+1 whose committee samples the PRE-restart
+        // K-1/K macroblocks (WS-pin-frozen, freeloader-laden). Filtering the DERIVED voting set — not the
+        // stored field — excludes them from the tail windows while the WS-pin digest still verifies.
         let mut ids: Vec<String> = eligible.into_iter()
-            .map(|p| p.node_id).filter(|s| !s.is_empty()).collect();
+            .map(|p| p.node_id)
+            .filter(|s| !s.is_empty() && !crate::genesis_constants::restart_excludes(s))
+            .collect();
         if ids.is_empty() { return None; }
         ids.sort(); // byte-stable input to the VRF sample
-        // Seed = the N-2 macroblock's OWN beacon (matches deterministic_eligible_ids). NOT
-        // try_load_macroblock_beacon(n2) — that subtracts 2 AGAIN → epoch-4 randomness → a
-        // different VRF subset than the real consensus committee.
-        let seed = mb.consensus_data.randomness_beacon?;
         Some(qnet_consensus::checkpoint_bft::sample_committee(
             &ids, epoch, &seed, Self::COMMITTEE_THRESHOLD, Self::CONSENSUS_COMMITTEE_SIZE,
         ))
@@ -5211,11 +6426,6 @@ impl BlockchainNode {
     // NOTE: get_eligible_producers_for_height() was REMOVED in v2.46
     // Use calculate_qualified_candidates() instead - it's the SINGLE SOURCE OF TRUTH
     // and properly handles Genesis fallback + background sync for missing MacroBlocks
-    
-    /// Get Quantum VTS reference
-    pub fn get_poh(&self) -> &Option<Arc<crate::poh::PoH>> {
-        &self.poh
-    }
     
     /// Get Parallel Executor reference
     pub fn get_parallel_executor(&self) -> &Option<Arc<crate::parallel_executor::ParallelExecutor>> {
@@ -5270,6 +6480,7 @@ impl BlockchainNode {
             api_endpoint.to_string()
         };
         
+        let is_light = node_type == qnet_state::NodeType::Light;
         let mut tx = qnet_state::Transaction {
             hash: String::new(),
             from: wallet_address.to_string(),
@@ -5291,6 +6502,15 @@ impl BlockchainNode {
                 // is exempt; a burn-backed super fills these (burn_tx/amount/cost + 2f+1 committee quorum)
                 // via the attestation collection path before broadcasting.
                 burn_tx: String::new(),
+                burn_wallet: String::new(),
+                burn_owner_sig: String::new(),
+                // B1: announce the node's consensus/VRF pubkey on-chain (canonical carrier) so it rides
+                // the snapshot's node_registry copy. Light never signs consensus, so it carries none.
+                vrf_pk: if is_light {
+                    Vec::new()
+                } else {
+                    crate::genesis_constants::get_vrf_public_key(node_id).unwrap_or_default()
+                },
                 burn_amount: 0,
                 burn_cost: 0,
                 burn_attestors: Vec::new(),
@@ -5298,10 +6518,9 @@ impl BlockchainNode {
             },
             data: Some(format!("node_registration:{}:{}:{}:{}", node_id, wallet_address, registration_proof, final_endpoint)),
             dilithium_signature: None,
-            // B1: announce the node's VRF pubkey on-chain (canonical carrier) so it rides the snapshot's
-            // node_registry copy → a snapshot-joiner has every super's vrf_pk for committee sampling + the
-            // snapshot vrf_pk-completeness gate. None when the local key isn't installed yet (no regression).
-            dilithium_public_key: crate::genesis_constants::get_vrf_public_key(node_id),
+            // Envelope key = the WALLET key, filled in by the signer. Genesis TXs carry their anchored
+            // key here instead (they are protocol-minted and have no wallet-key proof).
+            dilithium_public_key: None,
             chain_id: 0,
         };
 
@@ -5375,7 +6594,7 @@ impl BlockchainNode {
             data: Some(format!(
                 "node_reactivation:{}:h={}:mb={}:{}",
                 node_id, current_height, last_macroblock_index,
-                &last_macroblock_hash[..16.min(last_macroblock_hash.len())]
+                qnet_state::char_prefix(&last_macroblock_hash, 16)
             )),
             dilithium_signature: None,    // Filled by caller for Super nodes
             dilithium_public_key: None,   // Filled by caller for Super nodes
@@ -5506,7 +6725,7 @@ impl BlockchainNode {
                             self.cache_node_registration(node_id, node_type.clone(), wallet_address.clone()).await;
                             if is_debug() { 
                                 println!("[DBG][REG] found_onchain node={} wallet={}... endpoint={} h={}", 
-                                         node_id, &wallet_address[..16.min(wallet_address.len())],
+                                         node_id, qnet_state::char_prefix(&wallet_address, 16),
                                          if api_endpoint.is_empty() { "hidden" } else { api_endpoint },
                                          height); 
                             }
@@ -5592,8 +6811,8 @@ impl BlockchainNode {
         for (node_id, (endpoint, node_type)) in registrations {
             let reputation = qnet_consensus::deterministic_reputation::INITIAL_REPUTATION;
             
-            // Only include nodes with good reputation (>=70%)
-            if reputation < 0.7 { continue; }
+            // Scale is 0..100, not 0..1 — compare against the shared constant, never a literal.
+            if reputation < qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION { continue; }
             
             // v3.35: Check online status and sync status
             let is_genesis = node_id.starts_with("genesis_node_");
@@ -5702,12 +6921,17 @@ impl BlockchainNode {
                     // QUIC accept-path IP-identity gate. Chain-authenticated
                     // (TX is signature-validated before this code path).
                     crate::genesis_constants::register_node_endpoint(node_id, api_endpoint);
+                    // Persist it too: the RAM map holds only what THIS process applied, so a restart or
+                    // a snapshot cold-join left every non-genesis committee member unreachable.
+                    if let Err(e) = storage.save_node_endpoint(node_id, api_endpoint) {
+                        if is_warn() { println!("[WARN][STORAGE] endpoint_save_failed node={} err={}", node_id, e); }
+                    }
                     // Level 2: RocksDB persistent cache (forward + reverse index)
                     if let Err(e) = storage.save_node_registration(node_id, type_str, wallet_address, INITIAL_REPUTATION) {
                         eprintln!("[WARN][REG] cache_from_block_fail node={} err={}", node_id, e);
                     } else if is_info() {
                         println!("[INFO][REG] cached_from_produced_block node={} wallet={}...",
-                                 node_id, &wallet_address[..wallet_address.len().min(16)]);
+                                 node_id, qnet_state::char_prefix(&wallet_address, 16));
                     }
                     // NOTE: the committed burn→wallet binding (cbw) is NO LONGER written here. It is
                     // materialised incrementally at apply BEFORE save_microblock (within-window
@@ -5717,37 +6941,49 @@ impl BlockchainNode {
 
                     // v4.6: Extract VRF public key from on-chain TX (non-genesis nodes).
                     // FIX-5: the TX carries the pk as RAW 1952 bytes (no hex hop).
-                    if let Some(ref pk_bytes) = tx.dilithium_public_key {
-                        if pk_bytes.len() == crate::crypto::vrf::D3_PK_BYTES {
+                    if let Some(pk_bytes) = Self::registration_consensus_pk(tx) {
+                        {
+                            let pk_bytes = &pk_bytes;
                             // Log if registering key from unsigned TX (no proof-of-possession)
                             if tx.dilithium_signature.is_none() || tx.dilithium_signature.as_ref().map(|s| s.is_empty()).unwrap_or(true) {
                                 // Genesis identities install their key from the trusted genesis block
                                 // (no proof-of-possession by design) — DBG. Only a NON-genesis unsigned
                                 // key warrants a WARN (real missing-PoP signal).
                                 if node_id.starts_with("genesis_node_") {
-                                    if is_debug() { println!("[DBG][VRF] genesis_key_registered node={}", &node_id[..16.min(node_id.len())]); }
+                                    if is_debug() { println!("[DBG][VRF] genesis_key_registered node={}", qnet_state::char_prefix(&node_id, 16)); }
                                 } else {
                                     println!("[WARN][VRF] key_registered_without_pop node={}",
-                                             &node_id[..16.min(node_id.len())]);
+                                             qnet_state::char_prefix(&node_id, 16));
                                 }
                             }
                             {
-                                // Persist to disk unconditionally so the registry CF — and every snapshot of
-                                // it — stays vrf-complete even when the key already arrived in RAM via gossip.
-                                // Storage keeps the hex format (registry-CF row convention unchanged).
+                                // Persist first, then mirror the COMMITTED row into RAM. The row is
+                                // immutable once stamped, so a second registration naming an existing
+                                // node_id (a state-level no-op the block still carries) cannot rebind
+                                // the identity in either place. RAM mirrors disk exactly, so the vote /
+                                // QC / producer-signature verifiers and the boot reload all resolve the
+                                // same key.
                                 if let Err(e) = storage.save_vrf_public_key(node_id, &hex::encode(pk_bytes)) {
                                     if crate::node::is_warn() {
                                         println!("[WARN][STORAGE] vrf_pk_save_failed node={} err={}", node_id, e);
                                     }
                                 }
-                                if !crate::genesis_constants::has_vrf_key(node_id) {
-                                    crate::genesis_constants::register_vrf_public_key(node_id, pk_bytes);
-                                    // TX was chain signature-validated before here ⇒ (node_id, pk) authenticated.
-                                    let _ = qnet_consensus::consensus_crypto::register_consensus_pk_from_chain(node_id, pk_bytes);
-                                    if is_info() {
-                                        println!("[INFO][VRF-KEY] on_chain_registered node={} pk_hash={}",
-                                                 node_id, hex::encode(&pk_bytes[..8]));
-                                    }
+                                let committed = storage.load_vrf_public_key(node_id).ok().flatten();
+                                let committed = match committed {
+                                    Some(c) if c.len() == crate::crypto::vrf::D3_PK_BYTES => c,
+                                    _ => continue,
+                                };
+                                if committed.as_slice() != pk_bytes.as_slice() {
+                                    println!("[ERR][VRF-KEY] rebind_refused node={} hint=identity_is_immutable",
+                                             qnet_state::char_prefix(node_id, 16));
+                                    continue;
+                                }
+                                let had_ram = crate::genesis_constants::has_vrf_key(node_id);
+                                crate::genesis_constants::register_vrf_public_key(node_id, &committed);
+                                let _ = qnet_consensus::consensus_crypto::register_consensus_pk_from_chain(node_id, &committed);
+                                if is_info() {
+                                    println!("[INFO][VRF-KEY] on_chain_registered node={} pk_hash={} had_ram={}",
+                                             node_id, hex::encode(&committed[..8]), had_ram);
                                 }
                             }
                         }
@@ -5795,7 +7031,7 @@ impl BlockchainNode {
     /// writer for this index, called from BOTH apply_block_to_state (validator) AND the producer-inline
     /// apply, so the producer of a bitmap-carrying block stamps its own shard IDENTICALLY — else its
     /// light reward roster diverges from validators at the emission boundary → reward_root fork.
-    fn index_light_eligibility_bitmap(storage: &crate::storage::Storage, h: u64, tx: &qnet_state::Transaction) {
+    fn collect_light_eligibility_bitmap(out: &mut Vec<(u64, usize, u64, Vec<u8>)>, h: u64, tx: &qnet_state::Transaction) {
         if let qnet_state::TransactionType::LightNodeEligibilityBitmap { genesis_id, epoch, bitmap_compressed, .. } = &tx.tx_type {
             if let Some(gidx) = genesis_id.strip_prefix("genesis_node_")
                 .and_then(|n| n.parse::<usize>().ok())
@@ -5809,23 +7045,18 @@ impl BlockchainNode {
                 let inc_epoch = h / 14400;
                 if *epoch <= inc_epoch && *epoch + 1 >= inc_epoch {
                     if let Ok(bm) = zstd::decode_all(&bitmap_compressed[..]) {
-                        let _ = storage.save_light_bitmap(*epoch, gidx, &bm);
+                        out.push((*epoch, gidx, h, bm));
                     }
                 }
             }
         }
     }
 
-    /// P1: index a block's success-gated token-transfer events (effect, not calldata). Keeps only
-    /// `t:xfer` logs whose EMITTING contract is a token (qrc20/qrc721) — a WASM contract emitting
-    /// look-alike bytes is rejected (anti-forgery). log_index = position in the block's emit-ordered
-    /// log stream. Off-consensus local index; identical logic on the validator + producer paths.
-    fn index_block_token_transfers(
-        storage: &crate::storage::Storage,
+    fn build_token_transfer_rows(
         accounts: &std::sync::Arc<dashmap::DashMap<String, qnet_state::Account>>,
         height: u64, timestamp: u64,
         logs: &[(String, String, Vec<u8>)],
-    ) {
+    ) -> Vec<crate::storage::TokenTransferRow> {
         let mut rows = Vec::new();
         for (log_index, (tx_hash, contract, data)) in logs.iter().enumerate() {
             if let Some(ev) = qnet_state::wasm_exec::decode_transfer_log(data) {
@@ -5840,11 +7071,7 @@ impl BlockchainNode {
                 });
             }
         }
-        if !rows.is_empty() {
-            if let Err(e) = storage.index_token_transfers(&rows) {
-                if is_warn() { println!("[WARN][STORAGE] token_xfer_index_failed h={} err={}", height, e); }
-            }
-        }
+        rows
     }
 
     /// Single canonical writer of ONE chain-confirmed NodeRegistration's registry row: stamps
@@ -5869,8 +7096,11 @@ impl BlockchainNode {
             dilithium_pk.filter(|v| v.len() == crate::crypto::vrf::D3_PK_BYTES).cloned()
         } else { None };
         let _ = storage.save_node_registration_at_height_burn_vrf(node_id, type_str, wallet, 1.0, height, burn_tx, vrf.as_deref());
+        // Registration-origin marker: the dedup reseed source. Activations write registry rows too,
+        // so reseeding from those would reject honest registrations.
+        let _ = storage.mark_node_registration_origin(node_id, wallet);
         if !burn_tx.is_empty() {
-            let _ = storage.committed_burn_wallet_put(burn_tx, wallet);
+            let _ = storage.committed_burn_wallet_put(burn_tx, node_id);
         }
     }
 
@@ -5878,7 +7108,7 @@ impl BlockchainNode {
     /// applying validator (reg_height 0, burn, vrf co-resident), so the creator's registry_root and
     /// reward roster are byte-identical to synced peers. Replaces the old height-only backfill that
     /// dropped vrf_pk and diverged the creator's registry_root. Idempotent (immutable once stamped).
-    fn apply_genesis_registrations(storage: &crate::storage::Storage, transactions: &[qnet_state::Transaction]) {
+    pub(crate) fn apply_genesis_registrations(storage: &crate::storage::Storage, transactions: &[qnet_state::Transaction]) {
         for tx in transactions {
             if let qnet_state::TransactionType::NodeRegistration { node_id, node_type, wallet_address, burn_tx, .. } = &tx.tx_type {
                 Self::write_registration_row(storage, node_id, node_type, wallet_address, burn_tx, tx.dilithium_public_key.as_ref(), 0);
@@ -5944,6 +7174,11 @@ impl BlockchainNode {
             // anchor installation would produce different TX hashes across
             // peers and the genesis block would itself fork.
             if let Some(anchor_pk) = crate::genesis_constants::get_genesis_anchor_pk(&node_id) {
+                // Consensus key rides the HASHED body field so no relayer can swap it. Sourced from the
+                // pinned anchor, not the local registry, so every node builds identical genesis bytes.
+                if let qnet_state::TransactionType::NodeRegistration { vrf_pk, .. } = &mut tx.tx_type {
+                    *vrf_pk = anchor_pk.to_vec();
+                }
                 tx.dilithium_public_key = Some(anchor_pk.to_vec());
                 tx.hash = tx.calculate_hash();
             } else if is_info() {
@@ -5955,9 +7190,9 @@ impl BlockchainNode {
 
             if is_info() {
                 println!("[INFO][REG] genesis_tx_created node={} wallet={}... endpoint={} hash={}... pk_anchored={}",
-                         node_id, &wallet[..16.min(wallet.len())],
+                         node_id, qnet_state::char_prefix(&wallet, 16),
                          api_endpoint,
-                         &tx.hash[..16.min(tx.hash.len())],
+                         qnet_state::char_prefix(&tx.hash, 16),
                          tx.dilithium_public_key.is_some());
             }
             txs.push(tx);
@@ -6093,7 +7328,7 @@ impl BlockchainNode {
 
     /// v34: build ONE unforgeable Heartbeat TX anchored to a recent block (current_height-2).
     /// `tx_type.signature` is the consensus Dilithium sig over the anchor (verified by
-    /// `verify_heartbeat_tx`: anchor must equal a real recent block hash + be timely + sig valid
+    /// Anchor rule: must equal a real recent block hash + be timely + sig valid (producer-gated)
     /// vs the node's registry PK ⇒ an offline node cannot fabricate it). The envelope carries the
     /// standard Dilithium3 sig like every system TX. Returns None if the anchor hash is unavailable or
     /// signing fails (caller skips this tick, retries next).
@@ -6101,13 +7336,17 @@ impl BlockchainNode {
         storage: &Arc<Storage>,
         node_id: &str,
         current_height: u64,
+        identity: Option<&crate::crypto::vrf::WalletIdentity>,
     ) -> Option<qnet_state::Transaction> {
         if current_height < 2 { return None; }
         let anchor_height = current_height - 2;
         let anchor_hash = storage.get_microblock_hash_hex(anchor_height).ok().flatten()?;
-        let crypto = try_get_quantum_crypto()?;
         let hb_msg = format!("QNET_HEARTBEAT:{}:{}:{}", node_id, anchor_height, anchor_hash);
-        let hb_sig = crypto.create_consensus_signature(node_id, &hb_msg).await.ok()?;
+        // RAW detached ML-DSA-65 signature (3309 B) instead of the base64 envelope that also carried a
+        // copy of the 1952-byte public key. The verifier resolves the key from committed state, so the
+        // copy was pure duplication: one heartbeat per node per subwindow, 100k nodes, is the single
+        // largest recurring wire cost in the protocol — this halves it.
+        let hb_sig = identity?.sign(hb_msg.as_bytes()).ok()?;
         let epoch = current_height / 14400;
         let subwindow = (current_height % 14400) / 1440;
         let current_time = std::time::SystemTime::now()
@@ -6120,7 +7359,6 @@ impl BlockchainNode {
                 node_id: node_id.to_string(),
                 anchor_height,
                 anchor_hash,
-                signature: String::new(),
             },
             timestamp: current_time,
             hash: String::new(),
@@ -6130,12 +7368,54 @@ impl BlockchainNode {
             gas_limit: 0,
             nonce: epoch * 10 + subwindow + 1,
             data: None,
-            dilithium_signature: Some(hb_sig.signature.into_bytes()),
+            dilithium_signature: Some(hb_sig),
+            // Signer LABEL, not a key: the consensus key is resolved from committed state.
             dilithium_public_key: Some(node_id.to_string().into_bytes()),
             chain_id: 0,
         };
         tx.hash = tx.calculate_hash();
         Some(tx)
+    }
+
+    /// Heartbeat authenticity: RAW detached signature verified against the node's COMMITTED consensus
+    /// key (RAM registry → committed vrf_pk row → pinned genesis anchor). The key is not on the wire, so
+    /// this is the one place it must be resolved; the resolver reads only committed data, so every node
+    /// reaches the same verdict. An unknown identity is a reject, never a pass.
+    pub(crate) fn verify_heartbeat_dilithium(tx: &qnet_state::Transaction, storage: &crate::storage::Storage) -> bool {
+        use pqcrypto_mldsa::mldsa65 as dilithium3;
+        use pqcrypto_traits::sign::{DetachedSignature as SigTrait, PublicKey as PkTrait};
+        let node_id = match &tx.tx_type {
+            qnet_state::TransactionType::Heartbeat { node_id, .. } => node_id.as_str(),
+            _ => return false,
+        };
+        let sig = match tx.dilithium_signature.as_deref() {
+            Some(x) if x.len() == 3309 => x,
+            _ => return false,
+        };
+        // The resolved key must match the commitment in the CANONICAL registry row. producer_verify_pk
+        // also reads the standalone vrf_pk_ row and the RAM registry, neither of which is pruned when a
+        // branch is reorged out — accepting a key that only those hold would make a block-validity
+        // verdict depend on which branches this node happened to apply. Genesis rows carry the same
+        // commitment (written by apply_genesis_registrations), so the rule is uniform.
+        let committed_tag = match storage.node_signer_key_commitment(node_id) {
+            Ok(Some(t)) => t,
+            _ => return false,
+        };
+        let pk = match crate::node::producer_verify_pk(storage, node_id) {
+            Some(p) if p.len() == 1952 => p,
+            _ => return false,
+        };
+        if hex::encode(Sha3_256::digest(&pk)) != committed_tag {
+            return false;
+        }
+        let d3_sig = match <dilithium3::DetachedSignature as SigTrait>::from_bytes(sig) {
+            Ok(x) => x, Err(_) => return false,
+        };
+        let d3_pk = match <dilithium3::PublicKey as PkTrait>::from_bytes(&pk) {
+            Ok(x) => x, Err(_) => return false,
+        };
+        dilithium3::verify_detached_signature(
+            &d3_sig, Self::build_canonical_verify_message(tx).as_bytes(), &d3_pk).is_ok()
     }
 
     /// v34: a node's UNFORGEABLE liveness count for `epoch`, read from its on-chain account tally
@@ -6146,7 +7426,7 @@ impl BlockchainNode {
         if account.heartbeat_epoch == epoch {
             account.heartbeat_slots.count_ones() as u8
         } else if account.heartbeat_final_epoch == epoch {
-            account.heartbeat_final_count
+            account.heartbeat_final_slots.count_ones() as u8
         } else {
             0
         }
@@ -6157,15 +7437,34 @@ impl BlockchainNode {
     /// popcount>=9 set deterministically from committed state into super_elig_{N}, one WriteBatch.
     /// Replaces the per-TX writer so producer and replicas (different apply paths) record an identical
     /// set; called from both apply_block_to_state and the producer inline-apply path. Idempotent.
-    pub(crate) fn populate_super_elig_at_boundary(
+    pub(crate) fn compute_super_eligible_at_settle(
         state_guard: &StateManager,
         storage: &crate::storage::Storage,
         h: u64,
-    ) {
+    ) -> Option<(u64, Vec<String>)> {
         const EPOCH_BLOCKS: u64 = 14400;
-        if h == 0 || h % EPOCH_BLOCKS != 0 { return; }
+        // Settle point, not the boundary: heartbeats anchored in the closing epoch are admissible for
+        // HB_ANCHOR_MAX_LAG more blocks, so a boundary sample is a set that no later observer — a
+        // snapshot joiner, a re-deriving node — can reproduce.
+        if h < EPOCH_BLOCKS || h % EPOCH_BLOCKS != HB_ANCHOR_MAX_LAG { return None; }
         let finalized_epoch = h / EPOCH_BLOCKS - 1;
-        let supers = match storage.super_registrations_sorted() { Ok(s) => s, Err(_) => return };
+        Self::compute_super_eligible_for_epoch(state_guard, storage, finalized_epoch)
+            .map(|e| (finalized_epoch, e))
+    }
+
+    /// The popcount>=9 super set for a FINALIZED epoch, read from committed account tallies. Valid at
+    /// any height inside epoch `finalized_epoch + 1`: the account keeps the finalized epoch's count
+    /// until the next roll, which is what lets a snapshot-joined node reproduce the row it never saw.
+    pub(crate) fn compute_super_eligible_for_epoch(
+        state_guard: &StateManager,
+        storage: &crate::storage::Storage,
+        finalized_epoch: u64,
+    ) -> Option<Vec<String>> {
+        // Same height-bounding as the producer snapshot: this roster decides an epoch's reward leaves,
+        // which are committed in reward_root, so it must not include a registration applied after the
+        // epoch it is settling. Registrations land at most at the settle height of epoch+1.
+        let settle_end = (finalized_epoch + 1) * 14_400 + HB_ANCHOR_MAX_LAG;
+        let supers = match storage.super_registrations_as_of(settle_end) { Ok(s) => s, Err(_) => return None };
         let mut eligible: Vec<String> = Vec::new();
         // Resident supers: read the committed tally from RAM (authoritative). Evicted (inactive) ones:
         // collect for ONE batched disk read below — avoids N sequential cold reads stalling the
@@ -6174,7 +7473,12 @@ impl BlockchainNode {
         for (node_id, _wallet) in &supers {
             match state_guard.accounts.get(node_id) {
                 Some(acct) => {
-                    if Self::account_heartbeat_count(acct.value(), finalized_epoch) >= 9 {
+                    // A banned identity earns nothing. The ban is read from ACCOUNT state — which the
+                    // snapshot already proves and every node reproduces identically — instead of being
+                    // looked up in the macroblock that certified it: that lookup is what made four
+                    // earlier attempts either non-deterministic across node classes or unhealable.
+                    if acct.banned_at_height == 0
+                        && Self::account_heartbeat_count(acct.value(), finalized_epoch) >= 9 {
                         eligible.push(node_id.clone());
                     }
                 }
@@ -6184,15 +7488,53 @@ impl BlockchainNode {
         if !evicted.is_empty() {
             for (node_id, acct) in evicted.iter().zip(storage.load_accounts_batch(&evicted)) {
                 if let Some(a) = acct {
-                    if Self::account_heartbeat_count(&a, finalized_epoch) >= 9 {
+                    if a.banned_at_height == 0
+                        && Self::account_heartbeat_count(&a, finalized_epoch) >= 9 {
                         eligible.push(node_id.clone());
                     }
                 }
             }
         }
-        match storage.save_super_eligible_batch(finalized_epoch, &eligible) {
-            Ok(()) => if is_info() { println!("[INFO][REWARDS] super_elig_snapshot epoch={} eligible={}", finalized_epoch, eligible.len()); },
-            Err(e) => if is_warn() { println!("[WARN][REWARDS] super_elig_snapshot_failed epoch={} err={}", finalized_epoch, e); },
+        Some(eligible)
+    }
+
+    /// Write a canonical block's side indices. THE single durable writer for them: called only after
+    /// the block owns its slot, so a losing sibling can never plant a row that lowest-height-wins and
+    /// add-only semantics make impossible to remove.
+    pub fn flush_block_side_indices(storage: &crate::storage::Storage, h: u64, s: &BlockSideIndices) {
+        // The global vote/certificate caches had a pruner with ZERO callers, so their retention
+        // window never executed and they grew for the process lifetime. This is the one hook that
+        // runs exactly once per canonical block on every path; the pruner self-throttles to every
+        // 10th block.
+        cleanup_global_hashmaps(h);
+        // A re-applied block at h fully replaces h's logs + token index. No-op on a fresh height.
+        storage.reset_block_token_data(h);
+        if !s.block_logs.is_empty() {
+            if let Err(e) = storage.save_block_logs(h, &s.block_logs) {
+                if is_warn() {
+                    println!("[WARN][LOGS] block_logs_persist_failed h={} err={} (logs_root will diverge → stall out of 2f+1 until resync)", h, e);
+                }
+            }
+            let _ = storage.save_block_logs_root(h, &Self::block_logs_root_of(&s.block_logs));
+        }
+        if !s.token_rows.is_empty() {
+            if let Err(e) = storage.index_token_transfers(&s.token_rows) {
+                if is_warn() { println!("[WARN][STORAGE] token_xfer_index_failed h={} err={}", h, e); }
+            }
+        }
+        if !s.richlist.is_empty() {
+            if let Err(e) = storage.richlist_reconcile(&s.richlist) {
+                if is_warn() { println!("[WARN][RICHLIST] reconcile_failed h={} err={}", h, e); }
+            }
+        }
+        for (epoch, gidx, inc_h, bm) in &s.light_bitmaps {
+            let _ = storage.save_light_bitmap(*epoch, *gidx, *inc_h, bm);
+        }
+        if let Some((epoch, eligible)) = &s.super_eligible {
+            match storage.save_super_eligible_batch(*epoch, eligible) {
+                Ok(()) => if is_info() { println!("[INFO][REWARDS] super_elig_snapshot epoch={} eligible={}", epoch, eligible.len()); },
+                Err(e) => if is_warn() { println!("[WARN][REWARDS] super_elig_snapshot_failed epoch={} err={}", epoch, e); },
+            }
         }
     }
 
@@ -6210,92 +7552,86 @@ impl BlockchainNode {
         }
     }
 
-    /// Recompute + persist the per-epoch local reward root. Pure over storage (off state_root); the
-    /// caller runs it OFF the apply write-lock so the O(recipients) merkle build never stalls block
-    /// apply. The committee-certified root overwrites this at macroblock finalization if it differs.
-    pub(crate) fn persist_local_reward_root(
-        storage: &crate::storage::Storage, epoch: u64, total: u64, committed_root: &str, c_per: u64, c_cnt: u32,
-    ) {
-        let (wallet_vec, recomputed_root) = Self::compute_epoch_reward_distribution(storage, epoch, total);
-        if !recomputed_root.is_empty() {
-            let rtotal: u64 = wallet_vec.iter().map(|(_, a)| *a).sum();
-            let rcount = wallet_vec.len() as u32;
-            let rper = if rcount > 0 { rtotal / rcount as u64 } else { 0 };
-            let _ = storage.save_epoch_reward_root(epoch, &recomputed_root, rper, rcount, rtotal);
-            // Freeze the leaf-set so the claim/pending RPC reads a node-independent committed set instead
-            // of re-deriving it at query time (a node whose light_bm_ index drifted would otherwise map
-            // bits→wallets short and reject a valid claim). Persist ONLY when the local recompute agrees
-            // with the committed root — a divergent node must not freeze a wrong claimable set.
-            if committed_root.is_empty() || recomputed_root == committed_root {
-                Self::save_epoch_reward_sharded(storage, epoch, &wallet_vec);
-            }
-            let _ = storage.append_reward_epoch(epoch);
-            if is_info() {
-                println!("[INFO][REWARDS] reward_root_applied epoch={} root={}.. count={} total={} QNC",
-                         epoch, &recomputed_root[..16.min(recomputed_root.len())], rcount, rtotal / 1_000_000_000);
-            }
-        } else if !committed_root.is_empty() {
-            // Bodies pruned ⇒ cannot recompute. Provisionally adopt the TX root so the epoch is
-            // indexed; finalization overwrites it with the certified root.
-            let _ = storage.save_epoch_reward_root(epoch, committed_root, c_per, c_cnt, total);
-            let _ = storage.append_reward_epoch(epoch);
-        }
-        // Bound the sharded leaf-set CACHE: keep the newest SHARD_CACHE_RETAIN epochs, drop older shards
-        // (epoch_wshard_/epoch_shardmeta_ only — root/super_elig_/light_bm_ stay, so an old claim self-heals
-        // via the claim/backfill re-derive). Caps ~0.5GB/epoch at 10M light; nothing becomes unclaimable.
-        const SHARD_CACHE_RETAIN: usize = 256;
-        if let Ok(eps) = storage.load_reward_epochs() {
-            if eps.len() > SHARD_CACHE_RETAIN {
-                let _ = storage.prune_epoch_reward_shards(eps[eps.len() - SHARD_CACHE_RETAIN]);
-            }
-        }
-    }
 
     /// Re-freeze any epoch that holds a 2f+1-certified reward_root but whose sharded leaf-set is Absent
     /// locally (freeze-race, or a snapshot/catch-up that carried the root but not the shard). Re-derives
     /// from the committed super_elig_/light_bm_ indices, verifies the set recombines to the certified root,
     /// then freezes — so pending/claim serve the node-independent certified amount on EVERY node (incl.
     /// snapshot-joined), not just those that froze at emission. Bounded to the recent claim window; an
-    /// unreconstructible epoch is memoised (shared with the claim path). Off consensus + off the public
-    /// endpoint (boot / post-snapshot); already-frozen epochs cost one point-read.
+    /// unreconstructible epoch is reported, not memoised. Off consensus + off the public endpoint
+    /// (boot / post-snapshot); already-frozen epochs cost one point-read.
     pub(crate) fn backfill_reward_shards(storage: &crate::storage::Storage) -> u32 {
         const WINDOW: usize = 128;
-        let epochs = match storage.load_reward_epochs() { Ok(e) => e, Err(_) => return 0 };
+        let epochs = match storage.reward_epochs_from(0) { Ok(e) => e, Err(_) => return 0 };
         let start = epochs.len().saturating_sub(WINDOW);
         let mut healed = 0u32;
         for &epoch in &epochs[start..] {
             if storage.load_epoch_shard_meta(epoch).ok().flatten().is_some() { continue; }
-            if crate::rpc::REWARD_REBUILD_SKIP.contains(&epoch) { continue; }
-            let (committed_root, ctotal) = match storage.load_epoch_reward_root(epoch) {
-                Ok(Some((r, _, _, t))) if !r.is_empty() => (r, t),
-                _ => continue,
+            let (committed_root, ctotal) = match storage.load_epoch_root(epoch) {
+                Ok(Some(r)) if r != [0u8; 32] => (hex::encode(r), crate::reward_epoch::canonical_total(epoch)),
+                _ => continue, // no root here yet, or the epoch distributed nothing
             };
-            let w = Self::compute_epoch_reward_distribution(storage, epoch, ctotal).0;
+            let w = Self::compute_epoch_reward_distribution(storage, epoch, ctotal)
+                .map(|x| x.0).unwrap_or_default();
             if !w.is_empty() && Self::epoch_reward_merkle_root(&w, epoch) == committed_root {
                 Self::save_epoch_reward_sharded(storage, epoch, &w);
-                crate::rpc::REWARD_REBUILD_SKIP.remove(&epoch);
                 healed += 1;
-            } else {
-                if crate::rpc::REWARD_REBUILD_SKIP.len() >= 16384 { crate::rpc::REWARD_REBUILD_SKIP.clear(); }
-                crate::rpc::REWARD_REBUILD_SKIP.insert(epoch);
+            } else if !w.is_empty() {
+                // Inputs present but they do not reproduce the certified root: corrupt, not missing.
+                println!("[ERR][REWARDS] epoch_rebuild_diverged epoch={} action=resync_needed", epoch);
             }
         }
         if healed > 0 && is_info() { println!("[INFO][REWARDS] reward_shard_backfill healed={}", healed); }
         healed
     }
 
-    /// v3 merkle-claim crediting (proof-verified). For each RewardDistribution-from-system_rewards_pool
-    /// TX carrying {claims:[{epoch,amount,proof}]}, verify each proof against the locally-stored epoch
-    /// reward root and credit via claim_reward (monotonic last_claimed_epoch watermark). SHARED by
-    /// apply_block_to_state and the producer inline-apply so a producer crediting claims in its OWN block
-    /// matches validators byte-for-byte (no state_root divergence). Entries sorted by epoch so the
-    /// monotonic watermark credits every one.
+    /// Credits proof-verified reward claims. Shared by apply_block_to_state and the producer's
+    /// inline apply so both reach the same state.
+    ///
+    /// Err(certifying_mb) = this node lacks that macroblock and cannot decide; the caller MUST abort
+    /// the block and fetch it. Crediting or skipping instead would fork state_root.
+    /// A merkle claim credits `to` whoever relays it, and the claim watermark is monotonic — so an
+    /// unauthenticated claim naming only the newest epoch strands every earlier one for that wallet,
+    /// permanently, on every node. Authorization therefore binds the wallet's own ML-DSA-65 key to
+    /// THIS payload: the pk must derive to `to` (eon = SHA512(pk)), and the signature must cover the
+    /// exact `data` bytes, so a signature lifted off a past claim cannot be re-aimed at a shorter one.
+    /// Pure function of the TX bytes ⇒ identical verdict on every node.
+    pub(crate) fn claim_authorized(tx: &qnet_state::Transaction, to: &str, data: &str) -> bool {
+        let pk_hex = match tx.dilithium_public_key.as_ref().and_then(|b| std::str::from_utf8(b).ok()) {
+            Some(s) => s,
+            None => return false,
+        };
+        let sig = match tx.dilithium_signature.as_ref().and_then(|b| std::str::from_utf8(b).ok()) {
+            Some(s) => s,
+            None => return false,
+        };
+        let pk = match hex::decode(pk_hex) { Ok(p) => p, Err(_) => return false };
+        match crate::crypto::solana_derivation::eon_from_qnet_dilithium_pubkey_bytes(&pk) {
+            Some(addr) if addr == to => {}
+            _ => return false,
+        }
+        crate::rpc::verify_mobile_dilithium_signature(
+            &Self::claim_sign_message(to, data, tx.timestamp), sig, pk_hex)
+    }
+
+    /// The message a wallet signs to authorize a claim payload. Built from the exact `data` string that
+    /// goes on the wire, so there is no canonicalization gap between signer and verifier, and bound to
+    /// the tx timestamp: without it the payload could be re-emitted forever with a bumped timestamp,
+    /// each copy a fresh hash that passes every gate and credits nothing. With it, the only replay that
+    /// verifies is hash-identical and the mempool dedups it.
+    pub(crate) fn claim_sign_message(to: &str, data: &str, timestamp: u64) -> String {
+        let mut h = Sha3_256::new();
+        h.update(data.as_bytes());
+        format!("qnet_claim_v1:{}:{}:{}", to, timestamp, hex::encode(h.finalize()))
+    }
+
     fn apply_merkle_claims(
         state_guard: &StateManager,
         storage: &crate::storage::Storage,
         transactions: &[qnet_state::Transaction],
+        height: u64,
         mut block_snapshot: Option<&mut qnet_state::BlockSnapshot>,
-    ) {
+    ) -> Result<(), u64> {
         for tx in transactions {
             if tx.tx_type != qnet_state::TransactionType::RewardDistribution
                || tx.from != "system_rewards_pool" {
@@ -6303,6 +7639,13 @@ impl BlockchainNode {
             }
             let to = match &tx.to { Some(w) => w, None => continue };
             let data = match &tx.data { Some(d) => d, None => continue };
+            if !Self::claim_authorized(tx, to, data) {
+                if is_warn() {
+                    println!("[WARN][REWARDS] claim_unauthorized wallet={} action=skip_tx",
+                             qnet_state::char_prefix(to, 16));
+                }
+                continue;
+            }
             let parsed = match serde_json::from_str::<serde_json::Value>(data) { Ok(p) => p, Err(_) => continue };
             let entries = match parsed.get("claims").and_then(|v| v.as_array()) { Some(a) => a, None => continue };
             let mut claims: Vec<(u64, u64, Vec<(String, bool)>)> = entries.iter().filter_map(|e| {
@@ -6315,46 +7658,60 @@ impl BlockchainNode {
                 Some((epoch, amount, proof))
             }).collect();
             claims.sort_by_key(|(e, _, _)| *e);
-            if !claims.is_empty() {
-                if let Some(ref mut snap) = block_snapshot {
-                    snap.record_pre_images(&[to.clone()], &state_guard.accounts);
-                }
+            if claims.is_empty() { continue; }
+            if let Some(ref mut snap) = block_snapshot {
+                state_guard.journal_pre_images(snap, &[to.clone()]);
             }
+
             for (epoch, amount, proof) in &claims {
-                // Claims are ascending: STOP (not skip) at the first uncreditable epoch so the monotonic
-                // watermark never advances past it — the wallet re-claims it next time (no silent
-                // forfeiture). All nodes hold the same reconciled roots + proofs, so the stop point is
-                // deterministic. A missing root means this node hasn't reconciled that epoch yet.
-                let root_hex = match storage.load_epoch_reward_root(*epoch) {
-                    Ok(Some((r, _, _, _))) => r,
-                    _ => break,
-                };
-                let mut hasher = Sha3_256::new();
-                hasher.update(to.as_bytes());
-                hasher.update(&epoch.to_le_bytes());
-                hasher.update(&amount.to_le_bytes());
-                let leaf_hex = hex::encode(hasher.finalize());
-                if !qnet_core::crypto::merkle::verify_merkle_proof(&leaf_hex, &root_hex, proof) {
-                    if is_warn() {
-                        eprintln!("[WARN][REWARDS] claim_proof_invalid wallet={}.. epoch={}", &to[..16.min(to.len())], epoch);
+                match crate::reward_epoch::root_for_apply(storage, *epoch, height) {
+                    crate::reward_epoch::ApplyRoot::Root(root) => {
+                        if root == [0u8; 32] { continue; } // epoch distributed nothing
+                        let mut hasher = Sha3_256::new();
+                        hasher.update(to.as_bytes());
+                        hasher.update(&epoch.to_le_bytes());
+                        hasher.update(&amount.to_le_bytes());
+                        let leaf_hex = hex::encode(hasher.finalize());
+                        if !qnet_core::crypto::merkle::verify_merkle_proof(&leaf_hex, &hex::encode(root), proof) {
+                            // STOP, never skip: last_claimed_epoch is monotonic, so crediting a LATER
+                            // epoch after skipping this one advances the watermark past it and burns
+                            // it for this wallet permanently, on every node.
+                            if is_warn() {
+                                println!("[WARN][REWARDS] claim_proof_invalid wallet={} epoch={} action=stop_batch",
+                                         to.chars().take(16).collect::<String>(), epoch);
+                            }
+                            break;
+                        }
+                        if state_guard.claim_reward(to, *epoch, *amount) && is_info() {
+                            println!("[INFO][REWARDS] claim_credited wallet={} epoch={} amount={}",
+                                     to.chars().take(16).collect::<String>(), epoch, amount);
+                        }
                     }
-                    break;
-                }
-                if state_guard.claim_reward(to, *epoch, *amount) {
-                    if is_info() {
-                        println!("[INFO][REWARDS] claim_credited wallet={}.. epoch={} amount={} QNC",
-                                 &to[..16.min(to.len())], epoch, amount / 1_000_000_000);
+                    // Rule says no: identical verdict on every node, so skipping is safe.
+                    crate::reward_epoch::ApplyRoot::RuleInvalid => continue,
+                    // Cannot decide locally. Crediting or skipping would fork state_root against
+                    // nodes that hold the macroblock, so refuse the whole block instead.
+                    crate::reward_epoch::ApplyRoot::LocalFault { certifying_mb } => {
+                        println!("[ERR][REWARDS] claim_unresolvable epoch={} certifying_mb={} h={} action=abort_block",
+                                 epoch, certifying_mb, height);
+                        return Err(certifying_mb);
                     }
                 }
             }
         }
+        Ok(())
     }
 
-    /// Admission/gossip pre-check for merkle reward-claims: reject if ANY claim whose epoch reward_root
-    /// is locally reconciled fails proof verification (junk/forged) — keeps no-op spam out of the
-    /// mempool/blocks. Claims for an un-reconciled epoch (sync lag) are accepted and re-verified at
-    /// apply (the final authority). Pure storage read; no state lock.
-    fn claim_proofs_admissible(storage: &crate::storage::Storage, tx: &qnet_state::Transaction) -> bool {
+    /// Admission/gossip pre-check for merkle reward-claims: reject unless the recipient wallet's key
+    /// authorises this exact payload, and reject if ANY claim whose epoch reward_root is locally
+    /// reconciled fails proof verification — keeps forged and no-op spam out of the mempool/blocks.
+    /// Claims for an un-reconciled epoch (sync lag) are accepted and re-verified at apply (the final
+    /// authority). Pure storage read; no state lock.
+    fn claim_proofs_admissible(
+        storage: &crate::storage::Storage,
+        tx: &qnet_state::Transaction,
+        last_claimed: u64,
+    ) -> bool {
         let to = match &tx.to { Some(w) => w, None => return false };
         let data = match &tx.data { Some(d) => d, None => return false };
         let entries = match serde_json::from_str::<serde_json::Value>(data).ok()
@@ -6362,6 +7719,15 @@ impl BlockchainNode {
             Some(a) if !a.is_empty() => a,
             _ => return false,
         };
+        // Cheapest gates first, so junk cannot buy an ML-DSA-65 verify or a merkle walk. Bound the
+        // entry count, then require the batch to still be worth applying: without the watermark check a
+        // credited payload stays admissible forever and can be re-flooded as a free no-op.
+        const MAX_CLAIM_ENTRIES: usize = 512;
+        if entries.len() > MAX_CLAIM_ENTRIES { return false; }
+        if !entries.iter().any(|e| e.get("epoch").and_then(|v| v.as_u64()).map_or(false, |ep| ep > last_claimed)) {
+            return false;
+        }
+        if !Self::claim_authorized(tx, to, data) { return false; }
         for e in &entries {
             let (epoch, amount) = match (e.get("epoch").and_then(|v| v.as_u64()), e.get("amount").and_then(|v| v.as_u64())) {
                 (Some(ep), Some(am)) => (ep, am),
@@ -6380,9 +7746,9 @@ impl BlockchainNode {
                 }
                 None => return false,
             };
-            let root_hex = match storage.load_epoch_reward_root(epoch) {
-                Ok(Some((r, _, _, _))) => r,
-                _ => continue, // root not reconciled yet — defer to apply
+            let root_hex = match crate::reward_epoch::root_for_apply(storage, epoch, u64::MAX) {
+                crate::reward_epoch::ApplyRoot::Root(r) => hex::encode(r),
+                _ => return false,
             };
             let mut hasher = Sha3_256::new();
             hasher.update(to.as_bytes());
@@ -7380,6 +8746,7 @@ impl BlockchainNode {
         
         // Initialize storage
         if is_debug() { println!("[DBG][NODE] storage_init path={}", data_dir); }
+        bind_stuck_restart_dir(data_dir);
         let storage = match Storage::new(data_dir) {
             Ok(storage) => {
                 if is_debug() { println!("[DBG][NODE] storage_init_ok"); }
@@ -7506,30 +8873,6 @@ impl BlockchainNode {
                     }
                 }
                 
-                // POH STATE MIGRATION (v2.19.13): Migrate existing blocks to have separate PoH state
-                // This enables O(1) PoH validation without loading full blocks
-                // Migration is idempotent and only runs once per block
-                match storage_arc.needs_poh_migration() {
-                    Ok(true) => {
-                        if is_info() { println!("[INFO][NODE] poh_migration_starting"); }
-                        match storage_arc.migrate_all_poh_states() {
-                            Ok(count) => {
-                                if is_info() { println!("[INFO][NODE] poh_migrated n={}", count); }
-                            }
-                            Err(e) => {
-                                // Non-fatal: PoH validation will fall back to loading blocks
-                                if is_warn() { println!("[WARN][NODE] poh_migration_fail err={}", e); }
-                            }
-                        }
-                    }
-                    Ok(false) => {
-                        if is_debug() { println!("[DBG][NODE] poh_already_migrated"); }
-                    }
-                    Err(e) => {
-                        if is_warn() { println!("[WARN][NODE] poh_migration_check_fail err={}", e); }
-                    }
-                }
-
                 // v10.2: HASH INDEX MIGRATION — build O(1) prev_hash lookup index.
                 // Enables prev_hash validation without loading full block body.
                 // Migration is idempotent (flag in metadata CF) and runs once.
@@ -7562,6 +8905,8 @@ impl BlockchainNode {
         
         // Initialize state manager
         let state = Arc::new(RwLock::new(StateManager::new()));
+        // Publish it: the A1 roster derivation reads applied state from an associated fn.
+        init_global_state(state.clone());
 
         // ═══════════════════════════════════════════════════════════════════════
         // v15.10 STAGE-2: WIRE DISK-BACKED ACCOUNT STORE + LRU CACHE BOUND
@@ -7592,47 +8937,24 @@ impl BlockchainNode {
             let state_setup = state.read().await;
             state_setup.set_disk_store(storage.clone() as Arc<dyn qnet_state::AccountStore>);
             state_setup.set_cache_capacity(cache_capacity);
-            // Phase C: opt-in disk-backed Merkle node store (DEFAULT OFF).
-            // "1" forces ON; "auto" flips ON only once persisted accounts cross
-            // the threshold (merkle RAM ~0.25GB/1M accounts — ~2.5M is where a
-            // 4-8GB super-node meets the ~0.6GB floor, ahead of the 10M cliff).
-            // Any other value or unset preserves relaunch behavior untouched.
-            let merkle_mode = std::env::var("QNET_MERKLE_NODE_STORE").unwrap_or_default();
-            let auto_threshold: usize = std::env::var("QNET_MERKLE_NODE_STORE_AUTO_THRESHOLD")
+            // Disk-backed Merkle node store: ALWAYS ON. The in-mem tree costs ~233 nodes/leaf
+            // (measured: tests_smt_node_growth::measure_intermediate_nodes_per_leaf; the old
+            // "bounded by 2N" note was false by ~245x), so at the 10M-account target the tree is
+            // ~2.35e9 entries. That cannot live in RAM, and a threshold that flips the backend
+            // mid-life would migrate the authority under a running chain. The store is the
+            // authority from block 0; `intermediate_nodes`/`leaves` become bounded read-through
+            // caches. Not a consensus knob: the root is a pure function of the leaf set, so a
+            // store-backed root is byte-identical to an in-mem one.
+            //
+            // Cache cap sizes RAM, not correctness — a cold entry reloads from the store.
+            let node_cache_cap: usize = std::env::var("QNET_MERKLE_NODE_CACHE_CAP")
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(2_500_000);
-            // Estimate is only needed for "auto"; O(1) RocksDB accounts CF probe.
-            let (enable, mode, est) = match merkle_mode.as_str() {
-                "1" => (true, "1", 0u64),
-                "auto" => {
-                    let est = storage.estimate_account_count();
-                    (est >= auto_threshold as u64, "auto", est)
-                }
-                _ => (false, "", 0u64),
-            };
-            if enable {
-                let node_cache_cap: usize = std::env::var("QNET_MERKLE_NODE_CACHE_CAP")
-                    .ok()
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(2_000_000);
-                state_setup.set_merkle_node_store(storage.merkle_node_store());
-                state_setup.set_merkle_node_cache_cap(node_cache_cap);
-                if is_info() {
-                    println!(
-                        "[INFO][MERKLE] node_store=rocksdb mode={} accounts~={} threshold={} cache_cap={}",
-                        mode, est, auto_threshold, node_cache_cap,
-                    );
-                }
-            } else if merkle_mode == "auto" {
-                if is_debug() {
-                    println!(
-                        "[DEBUG][MERKLE] node_store=in-mem accounts~={} < threshold={}",
-                        est, auto_threshold,
-                    );
-                }
-            } else if is_debug() {
-                println!("[DEBUG][MERKLE] node_store=in-mem (authority path)");
+                .unwrap_or(2_000_000);
+            state_setup.set_merkle_node_store(storage.merkle_node_store());
+            state_setup.set_merkle_node_cache_cap(node_cache_cap);
+            if is_info() {
+                println!("[INFO][MERKLE] node_store=rocksdb cache_cap={}", node_cache_cap);
             }
             drop(state_setup);
             if is_info() {
@@ -7769,13 +9091,38 @@ impl BlockchainNode {
                                     } else {
                                         eprintln!("[ERR][STATE] snapshot_merkle_mismatch expected={} computed={} action=clear_and_full_replay",
                                                   hex::encode(&state_root[..8]), hex::encode(&computed_merkle[..8]));
-                                        // Clear corrupted state — TIER 3 full replay will rebuild correctly
+                                        // Clear corrupted state — TIER 3 full replay will rebuild correctly.
+                                        // chain_state goes with it: the REJECTED snapshot's
+                                        // total_supply / height / emission watermark were seeded a few
+                                        // lines above and would otherwise survive the wipe, so the
+                                        // from-genesis replay would run against a supply baseline taken
+                                        // from the very snapshot just judged corrupt.
                                         state_guard.clear();
+                                        {
+                                            let mut cs = state_guard.chain_state.write();
+                                            cs.total_supply = 0;
+                                            cs.height = 0;
+                                            cs.last_minted_emission_mb = 0;
+                                        }
                                         restored_snapshot_height = 0;
                                     }
                                 }
                                 Err(e) => {
-                                    eprintln!("[WARN][STATE] restore_fail err={} — falling back to full replay", e);
+                                    // The restore wipes the map and then inserts row by row, so a
+                                    // mid-iteration failure leaves an arbitrary PREFIX of the
+                                    // snapshot behind. Falling through to a from-genesis replay on
+                                    // top of that would apply every credit, transfer and fee in the
+                                    // prefix a SECOND time and produce a root no peer shares. Clear
+                                    // first, exactly as the two sibling failure arms above do.
+                                    state_guard.clear();
+                                    {
+                                        let mut cs = state_guard.chain_state.write();
+                                        cs.total_supply = 0;
+                                        cs.height = 0;
+                                        cs.last_minted_emission_mb = 0;
+                                    }
+                                    restored_snapshot_height = 0;
+                                    eprintln!("[WARN][STATE] restore_fail err={} action=clear_and_full_replay", e);
                                 }
                             }
                         }
@@ -7842,6 +9189,15 @@ impl BlockchainNode {
                             let apply_result = Self::apply_block_to_state(
                                 &state_guard, &microblock, &storage, None, None,
                             );
+                            // Same as the reconcile replay: the block is canonical, so flush now.
+                            Self::flush_block_side_indices(&storage, microblock.height, &apply_result.side_indices);
+                            // A replay that credits fewer claims than the network produces a state
+                            // this node can never reconcile. Stop the replay rather than build on it.
+                            if let Some(certifying_mb) = apply_result.reward_epoch_missing {
+                                println!("[CRIT][STATE] replay_reward_epoch_missing h={} certifying_mb={} action=stop_replay",
+                                         microblock.height, certifying_mb);
+                                break;
+                            }
 
                             // v7.1: Persist fork flag on first activation during replay
                             if !fork_was_active && !apply_result.reward_accruals.is_empty()
@@ -8042,7 +9398,7 @@ impl BlockchainNode {
                     if let Err(e) = storage_admit.save_pending_tx(hash, payload, ts) {
                         if is_warn() {
                             println!("[WARN][MEMPOOL] persist_admit_failed hash={} err={:?}",
-                                     &hash[..16.min(hash.len())], e);
+                                     qnet_state::char_prefix(&hash, 16), e);
                         }
                     }
                 });
@@ -8051,7 +9407,7 @@ impl BlockchainNode {
                     if let Err(e) = storage_remove.delete_pending_tx(hash) {
                         if is_warn() {
                             println!("[WARN][MEMPOOL] persist_remove_failed hash={} err={:?}",
-                                     &hash[..16.min(hash.len())], e);
+                                     qnet_state::char_prefix(&hash, 16), e);
                         }
                     }
                 });
@@ -8556,7 +9912,7 @@ impl BlockchainNode {
                             reward_manager_guard.restore_pending_reward(node_id.clone(), reward);
                             if is_info() { 
                                 println!("[INFO][REWARDS] restored node={} amt={} QNC", 
-                                    &node_id[..node_id.len().min(20)], reward_amount / 1_000_000_000); 
+                                    qnet_state::char_prefix(&node_id, 20), reward_amount / 1_000_000_000); 
                             }
                         }
                         if is_info() { println!("[INFO][REWARDS] restored={}", reward_count); }
@@ -8596,7 +9952,7 @@ impl BlockchainNode {
                                         recovered += 1;
                                         if is_info() {
                                             println!("[INFO][REWARDS] RECOVERED node={} amt={} QNC from state_snapshot",
-                                                &node_id[..node_id.len().min(20)], pending / 1_000_000_000);
+                                                qnet_state::char_prefix(&node_id, 20), pending / 1_000_000_000);
                                         }
                                     }
                                     _ => {}
@@ -8657,129 +10013,6 @@ impl BlockchainNode {
             };
             if is_info() { println!("[INFO][NODE] archive_reg chunks={}", quota); }
         }
-        
-        if is_debug() { println!("[DBG][NODE] creating_struct"); }
-        
-        // =========================================================================
-        // QUANTUM VTS INITIALIZATION
-        // CRITICAL: VTS only runs on Super nodes (block producers).
-        // (v3.18: the "Full" tier was removed from the protocol.)
-        // Light nodes do NOT run PoH - they are mobile devices with limited resources
-        // =========================================================================
-        // v3.18: Super node type removed
-        let (poh, poh_receiver): (Option<Arc<crate::poh::PoH>>, Option<Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<crate::poh::PoHEntry>>>>) =
-            if matches!(node_type, NodeType::Super) {
-                if is_info() { println!("[INFO][POH] init type={:?}", node_type); }
-                
-                // Get genesis hash for PoH initialization
-                let genesis_hash = {
-                    match storage.load_microblock(0) {
-                        Ok(Some(genesis_data)) => {
-                            let mut hasher = Sha3_256::new();
-                            hasher.update(&genesis_data);
-                            let hash_result = hasher.finalize();
-                            let mut hash_vec = vec![0u8; 32];
-                            hash_vec.copy_from_slice(&hash_result);
-                            if is_debug() { println!("[DBG][POH] genesis_hash={:x}", 
-                                    u64::from_le_bytes([hash_vec[0], hash_vec[1], hash_vec[2], hash_vec[3],
-                                                       hash_vec[4], hash_vec[5], hash_vec[6], hash_vec[7]])); }
-                            hash_vec
-                        },
-                        _ => {
-                            let deterministic_seed = "qnet_genesis_block_2024";
-                            let mut hasher = Sha3_256::new();
-                            hasher.update(deterministic_seed.as_bytes());
-                            let hash_result = hasher.finalize();
-                            let mut hash_vec = vec![0u8; 32];
-                            hash_vec.copy_from_slice(&hash_result);
-                            if is_debug() { println!("[DBG][POH] deterministic_hash={:x}",
-                                    u64::from_le_bytes([hash_vec[0], hash_vec[1], hash_vec[2], hash_vec[3],
-                                                       hash_vec[4], hash_vec[5], hash_vec[6], hash_vec[7]])); }
-                            hash_vec
-                        }
-                    }
-                };
-                
-                // Try to load last PoH checkpoint from storage
-                let initial_poh_state = Self::load_last_poh_checkpoint(&storage).await;
-                
-                let (poh, receiver) = if let Some((hash, count)) = initial_poh_state {
-                    if is_info() { println!("[INFO][POH] checkpoint_restore count={}", count); }
-                    crate::poh::PoH::new_from_checkpoint(hash, count)
-                } else {
-                    if is_info() { println!("[INFO][POH] fresh_start"); }
-                    crate::poh::PoH::new(genesis_hash)
-                };
-                
-                let poh_arc = Arc::new(poh);
-                let receiver_arc = Arc::new(tokio::sync::Mutex::new(receiver));
-                
-                // Start PoH generator
-                let poh_clone = poh_arc.clone();
-                tokio::spawn(async move {
-                    poh_clone.start().await;
-                    if is_info() { println!("[INFO][POH] generator_started rate=500k/s"); }
-                });
-                
-                // Start PoH checkpoint processor
-                let receiver_clone = receiver_arc.clone();
-                let storage_clone = storage.clone();
-                tokio::spawn(async move {
-                    if is_debug() { println!("[DBG][POH] checkpoint_processor_start"); }
-                    let mut receiver = receiver_clone.lock().await;
-                    let mut last_checkpoint = 0u64;
-                    
-                    while let Some(entry) = receiver.recv().await {
-                        // Save checkpoint every 10 million hashes (~20 seconds at 500K/s)
-                        let current_million = entry.num_hashes / 1_000_000;
-                        let last_million = last_checkpoint / 1_000_000;
-                        
-                        if current_million >= last_million + 10 {
-                            let rounded_count = current_million * 1_000_000;
-                            
-                            let checkpoint_entry = crate::poh::PoHEntry {
-                                num_hashes: rounded_count,
-                                hash: entry.hash.clone(),
-                                data: entry.data.clone(),
-                                timestamp: entry.timestamp,
-                            };
-                            
-                            if let Ok(serialized) = bincode::serialize(&checkpoint_entry) {
-                                if let Ok(compressed) = zstd::encode_all(&serialized[..], 3) {
-                                    let key = format!("poh_checkpoint_{}", rounded_count);
-                                    
-                                    if let Err(e) = storage_clone.save_raw(&key, &compressed) {
-                                        if is_warn() { println!("[WARN][POH] checkpoint_save_fail count={} err={}", 
-                                                rounded_count, e); }
-                                    } else {
-                                        // Also update the index for O(1) lookup on restart
-                                        if let Ok(index_data) = bincode::serialize(&rounded_count) {
-                                            let _ = storage_clone.save_raw("poh_checkpoint_latest", &index_data);
-                                        }
-                                        
-                                        if is_debug() { println!("[DBG][POH] checkpoint_saved count={} compressed={}b", 
-                                                rounded_count, compressed.len()); }
-                                        last_checkpoint = rounded_count;
-                                    }
-                                }
-                            }
-                        }
-                        
-                        // Log progress every 10M hashes
-                        if entry.num_hashes % 10_000_000 == 0 {
-                            if is_debug() { println!("[DBG][POH] progress={}M", 
-                                    entry.num_hashes / 1_000_000); }
-                        }
-                    }
-                    if is_debug() { println!("[DBG][POH] checkpoint_processor_stopped"); }
-                });
-                
-                (Some(poh_arc), Some(receiver_arc))
-            } else {
-                // Light nodes do NOT run PoH - they are mobile devices
-                if is_debug() { println!("[DBG][POH] skipped_light_node"); }
-                (None, None)
-            };
         
         // Initialize Parallel Executor if sharding is enabled
         let parallel_executor = if let (Some(ref shard_coord), Some(ref parallel_val)) = (&shard_coordinator, &parallel_validator) {
@@ -8849,6 +10082,9 @@ impl BlockchainNode {
             Some(Arc::new(qnet_mempool::MevProtectedMempool::new(mempool.clone(), bundle_config)))
         };
         
+
+        if is_debug() { println!("[DBG][NODE] creating_struct"); }
+        
         let mut blockchain = Self {
             storage,
             state,
@@ -8887,8 +10123,6 @@ impl BlockchainNode {
             // v2.96: DashMap for confirmation tracking + retry
             heartbeat_commitment_tracker: Arc::new(DashMap::new()),
             bitmap_commitment_tracker: Arc::new(DashMap::new()),
-            poh,  // Option — None for Light nodes (no consensus), Some for Super
-            poh_receiver: poh_receiver,  // Already Option
             parallel_executor,
             adaptive_bft,
             pre_execution,
@@ -9042,11 +10276,15 @@ impl BlockchainNode {
         // every node would skip a PEER genesis attestor's sig → a non-genesis (super OR light) burn-
         // attested registration could never reach the 2f+1 quorum → onboarding is dead. Seed all pinned
         // genesis pks (O(5), idempotent, pre-P2P) so vrf_pk_ is byte-identical on every node.
+        // Written UNCONDITIONALLY, not only when absent: this is also the repair path. The row is
+        // reachable by anything that could once write it — the block-body registration scan does not
+        // filter by apply success — and a poisoned genesis row is the worst case, because the burn
+        // quorum above reads storage as its ONLY source and the boot reload re-imports the row into
+        // RAM without re-authenticating it. Re-stamping the pinned value every boot makes such a row
+        // survive at most until the next restart. O(5), idempotent, pre-P2P.
         for (gid, pk_hex) in crate::genesis_constants::GENESIS_CONSENSUS_PKS {
-            if matches!(blockchain.storage.load_vrf_public_key(gid), Ok(None)) {
-                if let Err(e) = blockchain.storage.save_vrf_public_key(gid, pk_hex) {
-                    println!("[WARN][NODE] genesis_vrf_seed_fail id={} err={}", gid, e);
-                }
+            if let Err(e) = blockchain.storage.save_vrf_public_key(gid, pk_hex) {
+                println!("[WARN][NODE] genesis_vrf_seed_fail id={} err={}", gid, e);
             }
         }
 
@@ -9121,6 +10359,7 @@ impl BlockchainNode {
                 Ok(_) => {}
                 Err(e) => println!("[WARN][NODE] cbw_rebuild_boot err={}", e),
             }
+
             // registry_root LtHash (metadata CF, not snapshot-carried): ONE scan recomputes the
             // accumulator at the boot tip AND prunes any crash-mid-reorg orphans (reg_height > tip), so a
             // restarted / snapshot-joined / crash-recovered node is byte-identical to a from-genesis node.
@@ -9129,6 +10368,19 @@ impl BlockchainNode {
                 Ok(n) if n > 0 => println!("[INFO][NODE] registry_lthash_rebuilt_at_boot orphans_pruned={} up_to={}", n, boot_h),
                 Ok(_) => {}
                 Err(e) => println!("[WARN][NODE] registry_lthash_rebuild_boot err={}", e),
+            }
+            // The commitment-dedup maps are derived from block history, and a snapshot restore
+            // rebuilds the chain view without them: a restarted node would hold dedup entries only
+            // for the blocks it replayed, so a duplicate NodeRegistration naming an already-known
+            // node_id is admitted here and rejected by from-genesis peers — the block still applies
+            // everywhere (a registration has no account effect, so state_root matches) while only
+            // this node rewrites the registry row and its registry_root delta. Reseeded from the
+            // durable registry AFTER the prune above, which drops rows above the tip.
+            {
+                let sg = blockchain.state.read().await;
+                if let Err(e) = blockchain.storage.reseed_commitment_dedup(&*sg) {
+                    println!("[WARN][NODE] commitment_dedup_reseed_boot err={:?}", e);
+                }
             }
             // FIX-5: dilithium_pk_root LtHash (metadata CF, not snapshot-carried) — recompute the pk
             // accumulator + count-markers so a restarted / crash-recovered node is byte-identical to a
@@ -9255,6 +10507,7 @@ impl BlockchainNode {
 
         let pipeline_ingest = crate::block_pipeline::BlockPipeline::start(pipeline_config, apply_ctx);
         blockchain.pipeline_ingest = Some(pipeline_ingest.clone());
+        init_global_pipeline_ingest(pipeline_ingest.clone());
         if is_info() { println!("[INFO][PIPELINE] started stages=3"); }
 
         // 4. Start SyncManager (wave-based block download)
@@ -9931,784 +11184,7 @@ impl BlockchainNode {
         Ok(blockchain)
     }
     
-    /// Validate received microblock
-    /// v34: verify an unforgeable-liveness `Heartbeat` TX against the canonical chain.
-    /// A heartbeat is valid ONLY if (1) its `anchor_height` is a recent PAST block relative to the
-    /// block including it (≤ HB_ANCHOR_MAX_LAG) — so it cannot be backfilled into an immutable old
-    /// block; (2) `anchor_hash` equals the canonical hash of that block — so it could not be
-    /// pre-signed before the block existed; (3) the Dilithium `signature` over the canonical message
-    /// verifies against the node's consensus registry PK — so only the real node (a registered
-    /// super/genesis) can emit it, never an impersonator. Together these make an OFFLINE node unable
-    /// to fabricate liveness: it has neither a fresh anchor nor a way to insert the TX after the fact.
-    async fn verify_heartbeat_tx(
-        node_id: &str,
-        anchor_height: u64,
-        anchor_hash: &str,
-        signature: &str,
-        inclusion_height: u64,
-        storage: &Arc<Storage>,
-        p2p: &Arc<SimplifiedP2P>,
-    ) -> Result<(), String> {
-        const HB_ANCHOR_MAX_LAG: u64 = 90;
-        if anchor_height >= inclusion_height {
-            return Err(format!("anchor_not_past node={} anchor={} incl={}", node_id, anchor_height, inclusion_height));
-        }
-        if inclusion_height - anchor_height > HB_ANCHOR_MAX_LAG {
-            return Err(format!("anchor_stale node={} lag={}", node_id, inclusion_height - anchor_height));
-        }
-        match storage.get_microblock_hash_hex(anchor_height) {
-            Ok(Some(h)) if h.eq_ignore_ascii_case(anchor_hash) => {}
-            Ok(Some(_)) => return Err(format!("anchor_hash_mismatch node={} anchor={}", node_id, anchor_height)),
-            Ok(None) => return Err(format!("anchor_block_missing node={} anchor={}", node_id, anchor_height)),
-            Err(e) => return Err(format!("anchor_lookup_err node={} anchor={} err={}", node_id, anchor_height, e)),
-        }
-        let msg = format!("QNET_HEARTBEAT:{}:{}:{}", node_id, anchor_height, anchor_hash);
-        if !p2p.verify_consensus_signature(node_id, &msg, signature) {
-            return Err(format!("bad_signature node={}", node_id));
-        }
-        Ok(())
-    }
 
-    async fn validate_received_microblock(
-        block: &crate::unified_p2p::ReceivedBlock,
-        storage: &Arc<Storage>,
-        p2p: Option<&Arc<SimplifiedP2P>>,
-        reward_manager: Option<&Arc<RwLock<PhaseAwareRewardManager>>>,
-    ) -> Result<(), String> {
-        // CRITICAL: Full validation to prevent chain manipulation attacks
-        
-        // PRODUCTION FIX: Decompress block data if compressed with Zstd
-        // Blocks are compressed during broadcast to save ~20% bandwidth
-        let decompressed_data = match zstd::decode_all(&block.data[..]) {
-            Ok(data) => {
-                // SECURITY: Bound decompressed size to prevent zstd bombs (max 50MB)
-                const MAX_DECOMPRESSED_SIZE: usize = 50 * 1024 * 1024;
-                if data.len() > MAX_DECOMPRESSED_SIZE {
-                    if is_warn() {
-                        println!("[WARN][BLOCK] zstd_bomb_rejected h={} compressed={} decompressed={} max={}",
-                                 block.height, block.data.len(), data.len(), MAX_DECOMPRESSED_SIZE);
-                    }
-                    return Err("Decompressed block exceeds maximum size limit".to_string());
-                }
-                // Successfully decompressed - block was compressed
-                if block.height % 10 == 0 {
-                    if is_debug() { println!("[DBG][BLOCK] decompressed h={} from={} to={}",
-                             block.height, block.data.len(), data.len()); }
-                }
-                data
-            },
-            Err(_) => {
-                // Not compressed or different compression - use as-is
-                // This handles legacy blocks or uncompressed small blocks
-                block.data.clone()
-            }
-        };
-        
-        // 1. Deserialize microblock (now from decompressed data)
-        let microblock: qnet_state::MicroBlock = bincode::deserialize(&decompressed_data)
-            .map_err(|e| format!("Failed to deserialize microblock: {}", e))?;
-        
-        // 2. Basic structure validation
-        if block.data.len() < 100 {
-            return Err("Microblock too small".to_string());
-        }
-        
-        // ═══════════════════════════════════════════════════════════════════════════
-        // v10.2: TIMESTAMP VALIDATION — VTS-AWARE
-        // ═══════════════════════════════════════════════════════════════════════════
-        // QNet has VTS (Verifiable Time Sequence) — cryptographic time ordering.
-        // Wall-clock timestamps are INFORMATIONAL during sync (VTS + chain hash
-        // continuity guarantee block ordering). Future check only in LIVE mode
-        // as DDoS protection against blocks with fabricated future timestamps.
-        //
-        // TWO MODES:
-        //   SYNC MODE: NO wall-clock checks. VTS monotonicity + chain hash = sufficient.
-        //   LIVE MODE: Future check (TIMESTAMP_FUTURE_TOLERANCE) + monotonicity.
-        // ═══════════════════════════════════════════════════════════════════════════
-        {
-            let local_time = get_timestamp_safe();
-
-            if microblock.height > 0 && local_time > 0 {
-                // Detect sync mode
-                const SYNC_MODE_THRESHOLD: u64 = 50;
-                let local_height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(Ordering::Relaxed);
-                let sync_target = coordinator_sync_target();
-                let is_consensus_confirmed = sync_target > 0 && microblock.height <= sync_target;
-                let is_syncing = coordinator_is_syncing()
-                    || is_consensus_confirmed
-                    || local_height + SYNC_MODE_THRESHOLD < microblock.height;
-
-                if !is_syncing {
-                    // LIVE MODE: Full validation — future check + monotonicity
-
-                    // Slot exact-match: block_ts = genesis_ts + height*SLOT; any other
-                    // value is invalid. Clock-independent — no median/parent/NTP.
-                    let g = genesis_timestamp(storage);
-                    if g != 0 {
-                        let expected_ts = expected_block_timestamp(g, microblock.height);
-                        if microblock.timestamp != expected_ts {
-                            METRIC_TIMESTAMP_REJECTIONS.fetch_add(1, Ordering::Relaxed);
-                            eprintln!("[ERR][TIMESTAMP] slot_mismatch h={} ts={} expected={}",
-                                     microblock.height, microblock.timestamp, expected_ts);
-                            return Err(format!(
-                                "TIMESTAMP_INVALID:slot:h={}:block_ts={}:expected={}",
-                                microblock.height, microblock.timestamp, expected_ts
-                            ));
-                        }
-                    }
-
-                } else {
-                    // SYNC MODE: Skip wall-clock checks.
-                    // VTS monotonicity (checked below) + chain hash continuity (checked above)
-                    // provide cryptographic ordering guarantees without wall-clock dependency.
-                    if is_debug() && microblock.height % 1000 == 0 {
-                        println!("[DBG][TIMESTAMP] sync_mode_skip h={} ts={} local={} delta={}s",
-                                 microblock.height, microblock.timestamp, local_time,
-                                 local_time.saturating_sub(microblock.timestamp));
-                    }
-                }
-
-                if is_debug() && microblock.height % 100 == 0 {
-                    println!("[DBG][TIMESTAMP] valid h={} ts={} local={} delta={}s syncing={}",
-                             microblock.height, microblock.timestamp, local_time,
-                             local_time.saturating_sub(microblock.timestamp), is_syncing);
-                }
-            }
-        }
-
-        // v34: UNFORGEABLE-LIVENESS heartbeat verification. A Heartbeat TX in this block must
-        // anchor to a real recent block hash + be timely + carry a valid Dilithium sig (see
-        // verify_heartbeat_tx) — else an offline node could fabricate liveness for rewards. INERT
-        // until heartbeat production lands (no Heartbeat TXs exist yet). LIVE-mode only: during
-        // sync the block is already network-validated and its anchors may not be local.
-        {
-            let hb_local_height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(Ordering::Relaxed);
-            let hb_sync_target = coordinator_sync_target();
-            let hb_is_syncing = coordinator_is_syncing()
-                || (hb_sync_target > 0 && microblock.height <= hb_sync_target)
-                || hb_local_height + 50 < microblock.height;
-            if !hb_is_syncing {
-                if let Some(p2p) = p2p {
-                    for tx in &microblock.transactions {
-                        if let qnet_state::TransactionType::Heartbeat { node_id, anchor_height, anchor_hash, .. } = &tx.tx_type {
-                            let hb_sig = tx.dilithium_signature.as_deref().map(|s| String::from_utf8_lossy(s).into_owned()).unwrap_or_default();
-                            Self::verify_heartbeat_tx(node_id, *anchor_height, anchor_hash, &hb_sig, microblock.height, storage, p2p)
-                                .await
-                                .map_err(|e| format!("invalid_heartbeat_tx: {}", e))?;
-                        }
-                    }
-                }
-            }
-        }
-
-        // ═══════════════════════════════════════════════════════════════════════════
-        // 3. CRITICAL: Verify chain continuity (previous_hash) for ALL blocks
-        // v10.2: THREE-TIER VALIDATION (fastest first):
-        //   Tier 1: O(1) hash index lookup (microblock_hash_{h} in metadata CF)
-        //   Tier 2: O(block_size) full block load + SHA3-256 (fallback if no index)
-        //   Tier 3: Self-healing — request missing block from peers (not reject!)
-        // ═══════════════════════════════════════════════════════════════════════════
-        if microblock.height == 0 {
-            // Genesis block must have zero previous_hash
-            if microblock.previous_hash != [0u8; 32] {
-                println!("[ERR][VALIDATION] genesis_invalid reason=nonzero_prev_hash");
-                return Err("Genesis block must have zero previous_hash".to_string());
-            }
-            if is_debug() { println!("[DBG][VALIDATION] genesis_valid h=0 prev_hash=zero"); }
-        } else if microblock.height >= 1 {
-            let prev_height = microblock.height - 1;
-
-            // TIER 1: O(1) hash index lookup — no block load needed
-            let hash_from_index = storage.load_microblock_hash(prev_height).unwrap_or(None);
-
-            if let Some(indexed_hash) = hash_from_index {
-                // Fast path: validate against indexed hash
-                if microblock.previous_hash != indexed_hash {
-                    eprintln!("[ERR][VALIDATION] prev_hash_mismatch h={} expected={} got={} → FORK_DETECTED!",
-                             microblock.height,
-                             hex::encode(&indexed_hash[0..8]),
-                             hex::encode(&microblock.previous_hash[0..8]));
-                    return Err(format!(
-                        "FORK_DETECTED:{}:{}",
-                        prev_height,
-                        microblock.producer
-                    ));
-                }
-                if is_debug() && microblock.height % 500 == 0 {
-                    println!("[DBG][VALIDATION] chain_ok h={} via=hash_index", microblock.height);
-                }
-            } else {
-                // TIER 2: Fallback — deserialize block, compute hash from struct fields
-                // v12.0: MUST use load_microblock_auto_format + block.hash(), NOT raw bytes SHA3.
-                // Raw bytes depend on storage format (EfficientMicroBlock, zstd), but block hash
-                // is a consensus property computed from block fields (height, ts, prev, merkle, producer).
-                let prev_block_result = storage.load_microblock_auto_format(prev_height);
-
-                match prev_block_result {
-                    Ok(Some(prev_block)) => {
-                        let prev_hash_computed = prev_block.hash();
-
-                        if microblock.previous_hash != prev_hash_computed {
-                            eprintln!("[ERR][VALIDATION] prev_hash_mismatch h={} expected={} got={} → FORK_DETECTED!",
-                                     microblock.height,
-                                     hex::encode(&prev_hash_computed[0..8]),
-                                     hex::encode(&microblock.previous_hash[0..8]));
-                            return Err(format!(
-                                "FORK_DETECTED:{}:{}",
-                                prev_height,
-                                microblock.producer
-                            ));
-                        }
-
-                        // Backfill hash index for this block (future lookups will be O(1))
-                        if let Err(e) = storage.save_microblock_hash(prev_height, &prev_hash_computed) {
-                            if crate::node::is_warn() {
-                                println!("[WARN][STORAGE] hash_index_backfill_failed h={} err={}", prev_height, e);
-                            }
-                        }
-
-                        if is_debug() { println!("[DBG][VALIDATION] chain_ok h={} via=block_hash+backfill", microblock.height); }
-                    },
-                    _ => {
-                        // TIER 3: Previous block not found — self-healing
-                        if microblock.height == 1 {
-                            if is_warn() { println!("[WARN][VALIDATION] genesis_missing action=sync_request"); }
-                            return Err("MISSING_PREVIOUS:0".to_string());
-                        }
-
-                        // Post-snapshot trust boundary
-                        let stored_height = storage.get_chain_height().unwrap_or(0);
-                        let is_post_snapshot_first_block = stored_height > 0
-                            && microblock.height == stored_height + 1
-                            && coordinator_is_syncing();
-
-                        if is_post_snapshot_first_block {
-                            println!("[INFO][VALIDATION] post_snapshot_trust h={} snap_h={} prev_hash_skip=trusted",
-                                     microblock.height, stored_height);
-                        } else {
-                            if is_warn() { println!("[WARN][VALIDATION] prev_block_missing h={} need={} action=request_download",
-                                     microblock.height, prev_height); }
-                            return Err(format!("MISSING_PREVIOUS:{}", prev_height));
-                        }
-                    }
-                }
-            }
-        }
-        
-        // 4. Verify height sequence
-        let current_height = storage.get_chain_height().unwrap_or(0);
-        if microblock.height > current_height + 100 {
-            return Err(format!(
-                "Block too far ahead! Current: {}, Received: {} (max gap: 100)",
-                current_height, microblock.height
-            ));
-        }
-        
-        // 5. Verify signature (CRYSTALS-Dilithium)
-        // SECURITY v2.28: Signature verification is ALWAYS MANDATORY for quantum-resistant blockchain
-        // NO EXCEPTIONS - even for sync blocks. This prevents malicious sync provider attacks.
-        // 
-        // For historical blocks where certificate might be expired:
-        // - Dilithium signature verification uses node_id (NOT certificate)
-        // - Ed25519 ephemeral signature requires certificate
-        // - If certificate unavailable → block is buffered and certificate requested
-        // - This is the CORRECT secure behavior for post-quantum blockchain
-        
-        if !Self::verify_microblock_signature(&microblock, &microblock.producer, p2p).await? {
-            // SECURITY: Invalid signature - ALWAYS reject
-            // This applies to ALL blocks (live, sync, any source)
-            eprintln!("[ERR][SEC] invalid_signature producer={}", microblock.producer);
-            
-            return Err(format!(
-                "Invalid signature on block #{} from producer {}",
-                microblock.height, microblock.producer
-            ));
-        }
-        
-        // v9.0 BUG-20: Verify merkle_root matches actual transactions.
-        // Without this, a producer could include a valid signature but fake transactions
-        // (e.g., extra transfers) while keeping the merkle_root from a different TX set.
-        if !microblock.transactions.is_empty() {
-            let computed_merkle = Self::calculate_merkle_root(&microblock.transactions);
-            if computed_merkle != microblock.merkle_root {
-                eprintln!("[ERR][SEC] merkle_root_mismatch h={} expected={} computed={}",
-                         microblock.height,
-                         hex::encode(&microblock.merkle_root[..8]),
-                         hex::encode(&computed_merkle[..8]));
-                return Err(format!(
-                    "MERKLE_ROOT_MISMATCH:h={}:producer={}",
-                    microblock.height, microblock.producer
-                ));
-            }
-        }
-
-        // 5.5. Verify PoH sequence (if PoH is available and block has PoH data)
-        // Only verify for blocks that have valid PoH data (not genesis or pre-PoH blocks)
-        // 
-        // ARCHITECTURE (v2.19.13): Use dedicated PoH state storage for O(1) validation
-        // This avoids loading full blocks which may be in different formats (MicroBlock vs EfficientMicroBlock)
-        if microblock.height > 0 && !microblock.poh_hash.is_empty() && microblock.poh_count > 0 {
-            // Get previous block's PoH state from dedicated storage (fast, format-agnostic)
-            let prev_poh_state = storage.load_poh_state(microblock.height - 1)
-                .ok()
-                .flatten();
-            
-            // If PoH state not in dedicated storage, try to extract from block (backward compat)
-            let prev_poh_count = if let Some(ref poh_state) = prev_poh_state {
-                poh_state.poh_count
-            } else {
-                // Fallback: try to load from block using auto-format detection
-                // v10.2: If block not available, skip VTS validation (don't deadlock!)
-                // Chain continuity is already verified above via hash index.
-                // VTS is an additional proof layer — missing it shouldn't kill the node.
-                match storage.load_microblock_auto_format(microblock.height - 1) {
-                    Ok(Some(prev_block)) => prev_block.poh_count,
-                    Ok(None) if microblock.height == 1 => 0,
-                    Ok(None) => {
-                        // v10.2: Skip VTS check if previous block unavailable.
-                        // prev_hash already validated above — chain integrity is guaranteed.
-                        if is_warn() { println!("[WARN][VTS] skip_check h={} reason=prev_block_unavailable", microblock.height); }
-                        0 // Will skip regression check since prev_poh_count=0
-                    }
-                    Err(e) => {
-                        if is_warn() { println!("[WARN][VTS] skip_check h={} reason=load_err err={}", microblock.height, e); }
-                        0
-                    }
-                }
-            };
-
-            // v10.2: VTS STRICT MONOTONICITY CHECK
-            // VTS counter MUST always increase. Any regression = potential history forgery.
-            // Byzantine consensus is the primary safety layer, VTS is cryptographic time proof.
-            // Small regressions (network drift) should not happen with correct VTS sync.
-            if prev_poh_count > 0 && microblock.poh_count <= prev_poh_count {
-                let regression = prev_poh_count - microblock.poh_count;
-
-                // STRICT: Reject any regression > 5M hashes (10 seconds).
-                // 10s is generous — normal block interval is 1s, VTS should always advance.
-                // Reduced from 30s (15M) to 10s (5M) for tighter security.
-                const MAX_ACCEPTABLE_REGRESSION: u64 = 5_000_000;
-
-                if regression > MAX_ACCEPTABLE_REGRESSION {
-                    eprintln!("[ERR][VTS] regression h={} count={} prev={} diff={}",
-                            microblock.height, microblock.poh_count, prev_poh_count, regression);
-                    return Err(format!(
-                        "VTS regression: block #{} count={} prev_count={} diff={}",
-                        microblock.height, microblock.poh_count, prev_poh_count, regression
-                    ));
-                } else if regression > 0 {
-                    if is_warn() { println!("[WARN][VTS] minor_regression h={} count={} prev={} diff={}",
-                            microblock.height, microblock.poh_count, prev_poh_count, regression); }
-                }
-            }
-            
-            // Log VTS progression (reduced frequency to avoid log spam)
-            if microblock.height % 100 == 0 {
-                if is_debug() { println!("[DBG][VTS] verified h={} count={} prev={}",
-                        microblock.height, microblock.poh_count, prev_poh_count); }
-            }
-        }
-        
-        // FIX R22-B5: Validate cumulative block gas against BLOCK_GAS_LIMIT
-        // Defense-in-depth: prevents malicious producers from stuffing blocks with
-        // high-gas transactions that pass byte-size limit but exceed computation budget.
-        {
-            let mut cumulative_gas: u64 = 0;
-            let mut cumulative_fuel: u64 = 0;
-            let gas_activation = qnet_state::GAS_METERING_ACTIVATION_HEIGHT;
-            for tx in &microblock.transactions {
-                if !tx.from.starts_with("system_") && tx.gas_price > 0 && tx.gas_limit > 0 {
-                    let tx_gas = if microblock.height >= gas_activation {
-                        tx.compute_gas_used()
-                    } else {
-                        tx.gas_limit
-                    };
-                    cumulative_gas = cumulative_gas.saturating_add(tx_gas);
-                    // SEPARATE CPU budget: gas prices bytes/base cost but does NOT bound compute — a
-                    // metered WASM call can burn up to gas_limit-intrinsic fuel while contributing only
-                    // its flat intrinsic to the gas total. Bound the block's summed RESERVED fuel (pure
-                    // fn of the signed gas_limit ⇒ identical on every node, no execution needed) so a
-                    // block can never force more interpreter work than the ~1s slot allows.
-                    cumulative_fuel = cumulative_fuel.saturating_add(tx.reserved_fuel());
-                }
-            }
-            if cumulative_gas > qnet_state::gas_limits::BLOCK_GAS_LIMIT {
-                return Err(format!(
-                    "BLOCK_GAS_LIMIT_EXCEEDED:h={}:gas={}:limit={}:producer={}",
-                    microblock.height, cumulative_gas,
-                    qnet_state::gas_limits::BLOCK_GAS_LIMIT, microblock.producer
-                ));
-            }
-            if cumulative_fuel > qnet_state::gas_limits::BLOCK_FUEL_LIMIT {
-                return Err(format!(
-                    "BLOCK_FUEL_LIMIT_EXCEEDED:h={}:fuel={}:limit={}:producer={}",
-                    microblock.height, cumulative_fuel,
-                    qnet_state::gas_limits::BLOCK_FUEL_LIMIT, microblock.producer
-                ));
-            }
-        }
-
-        // Producer validation: log mismatch but ACCEPT.
-        // Individual nodes may have different timeout_round during transitions
-        // (rolling updates, sync delays, network partitions). Rejecting blocks
-        // based on local producer expectation causes cascade failures.
-        // BFT consensus (4/5 confirmations) is the real fork protection —
-        // a block cannot be finalized without supermajority agreement.
-        if let Some((expected_producer, expected_round)) = get_expected_producer(microblock.height) {
-            if microblock.producer != expected_producer {
-                // Track out-of-turn production per producer within sliding window
-                let mut entry = OOT_PRODUCER_COUNT.entry(microblock.producer.clone())
-                    .or_insert((microblock.height, 0));
-                if microblock.height.saturating_sub(entry.0) < 100 {
-                    entry.1 += 1;
-                    if entry.1 > 3 {
-                        return Err(format!(
-                            "[ERR][VALIDATION] producer_banned_oot producer={} count={} window_start={}",
-                            &microblock.producer[..16.min(microblock.producer.len())], entry.1, entry.0
-                        ));
-                    }
-                } else {
-                    // Reset window
-                    *entry = (microblock.height, 1);
-                }
-                if is_warn() {
-                    println!(
-                        "[WARN][VALIDATION] producer_oot h={} expected={} got={} round={} count={}",
-                        microblock.height, expected_producer, microblock.producer, expected_round, entry.1
-                    );
-                }
-            }
-        }
-
-        // 6. CRITICAL: Detect database substitution attack
-        // If we already have this height, verify it's the same block
-        // v3.11 FIX: With EFFICIENT storage, raw bytes hash will NEVER match!
-        // EFFICIENT format stores TX hashes only (~32KB) vs RAW (~280KB)
-        // Solution: Compare merkle_root instead of raw bytes
-        if let Ok(Some(existing_data)) = storage.load_microblock(microblock.height) {
-            // v3.11: Load existing block and compare merkle_root (format-independent)
-            // Use load_microblock_auto_format to handle both EFFICIENT and RAW formats
-            match storage.load_microblock_auto_format(microblock.height) {
-                Ok(Some(existing_block)) => {
-                    // Compare merkle_root - this is format-independent
-                    if existing_block.merkle_root == microblock.merkle_root 
-                       && existing_block.signature == microblock.signature {
-                        // Same block (duplicate) - skip silently
-                        if is_debug() { 
-                            println!("[DBG][SEC] duplicate_block h={} merkle_match=true", microblock.height); 
-                        }
-                        // Return OK since it's the same block - just a duplicate reception
-                        return Ok(());
-                    } else {
-                        // REAL FORK: Same height but different content!
-                        if is_warn() {
-                            println!("[WARN][SEC] fork_detected h={} existing_merkle={:x} new_merkle={:x}",
-                                     microblock.height,
-                                     u64::from_le_bytes([existing_block.merkle_root[0], existing_block.merkle_root[1],
-                                                        existing_block.merkle_root[2], existing_block.merkle_root[3],
-                                                        existing_block.merkle_root[4], existing_block.merkle_root[5],
-                                                        existing_block.merkle_root[6], existing_block.merkle_root[7]]),
-                                     u64::from_le_bytes([microblock.merkle_root[0], microblock.merkle_root[1],
-                                                        microblock.merkle_root[2], microblock.merkle_root[3],
-                                                        microblock.merkle_root[4], microblock.merkle_root[5],
-                                                        microblock.merkle_root[6], microblock.merkle_root[7]]));
-                        }
-                        // Finality is irreversible: never replace a block at/below the 2f+1-finalized
-                        // height, whatever the round — the competing block is from a stale/minority fork.
-                        let finalized_h = LAST_FINALIZED_HEIGHT.load(std::sync::atomic::Ordering::SeqCst);
-                        if finalized_h > 0 && microblock.height <= finalized_h {
-                            if is_warn() {
-                                println!("[WARN][SEC] fork_below_finalized h={} finalized={} action=reject",
-                                         microblock.height, finalized_h);
-                            }
-                            return Err(format!("FORK_BELOW_FINALIZED:{}", microblock.height));
-                        }
-                        // Round-aware deterministic fork choice (single authority, consistent with the pipeline's
-                        // certified-round supersession + anchor_recovery): a strictly HIGHER rotation round wins
-                        // ONLY if 2f+1-certified (the block's proof was adopted at ingest; a raw uncertified higher
-                        // round must not win — that was the divergence source); equal round → lower Sha3(signature)
-                        // (VRF-bound, non-grindable). Identical on every node ⇒ no divergence.
-                        let new_sig_hash = Sha3_256::digest(&microblock.signature);
-                        let existing_sig_hash = Sha3_256::digest(&existing_block.signature);
-                        // Rank by ABSOLUTE round (relative + carried baseline), both from block bytes —
-                        // a same-height loser-apply can no longer inflate the ranking (baseline double-count).
-                        let incoming_abs = microblock.timeout_round.saturating_add(microblock.carried_baseline);
-                        let existing_abs = existing_block.timeout_round.saturating_add(existing_block.carried_baseline);
-                        let incoming_wins = match incoming_abs.cmp(&existing_abs) {
-                            std::cmp::Ordering::Greater =>
-                                crate::unified_p2p::failover_round_authorized(microblock.height / 90, microblock.timeout_round, microblock.carried_baseline),
-                            std::cmp::Ordering::Less => false,
-                            std::cmp::Ordering::Equal => new_sig_hash.as_slice() < existing_sig_hash.as_slice(),
-                        };
-                        if incoming_wins {
-                            // New block wins — replace existing. Will be saved below.
-                            println!("[INFO][SEC] fork_choice h={} winner=new — replacing existing block (lower sig_hash)",
-                                     microblock.height);
-                            // Invalidate caches for this height since block changes
-                            PRODUCER_VOTES.retain(|k, _| k.0 < microblock.height);
-                            // Fall through to save the new block
-                        } else {
-                            // Existing block wins — keep it, still signal fork for awareness
-                            println!("[INFO][SEC] fork_choice h={} winner=existing — keeping current block (lower sig_hash)",
-                                     microblock.height);
-                            return Err(format!(
-                                "FORK_DETECTED:{}:{}",
-                                microblock.height,
-                                microblock.producer
-                            ));
-                        }
-                    }
-                }
-                Ok(None) => {
-                    // Block data exists but couldn't deserialize - likely corruption
-                    // Log and continue with new block (will overwrite)
-                    if is_warn() { 
-                        println!("[WARN][SEC] existing_block_corrupt h={} bytes={}", 
-                                 microblock.height, existing_data.len()); 
-                    }
-                }
-                Err(e) => {
-                    // Deserialization error - log and continue
-                    if is_warn() { 
-                        println!("[WARN][SEC] existing_block_deser_fail h={} err={}", microblock.height, e); 
-                    }
-                }
-            }
-        }
-        
-        // v2.93: EMISSION TX VALIDATION - Industry Standard
-        // Emission TX created after emission MacroBlock (160, 320, 480...)
-        // TX appears in first microblock after MacroBlock finalization
-        // Validation: If emission TX present → verify correctness (amount, format)
-        
-        // Check if block contains emission transaction (optional - depends on MacroBlock timing)
-        let emission_tx = microblock.transactions.iter()
-            .find(|tx| tx.tx_type == qnet_state::TransactionType::RewardDistribution 
-                       && tx.from == "system_emission");
-        
-        if let Some(tx) = emission_tx {
-            if is_debug() { println!("[EMISSION][VALIDATION] found h={} amount={}", microblock.height, tx.amount / 1_000_000_000); }
-            
-            // Validate emission TX correctness (industry standard: deterministic rules)
-                
-                // CRITICAL: Validate emission amount through deterministic rules
-                // Phase 1: Basic sanity checks (full deterministic validation requires on-chain ping histories)
-                
-                use qnet_state::{MAX_QNC_SUPPLY, MAX_QNC_SUPPLY_NANO};
-                
-                // UNITS: All amounts in nanoQNC (10^9 precision)
-                // MAX_QNC_SUPPLY_NANO = 4.295B QNC * 10^9 = maximum supply in smallest units
-                
-                // 1. Amount must be > 0
-                if tx.amount == 0 {
-                    eprintln!("[ERR][EMISSION] amount_zero");
-                    return Err("Emission amount cannot be zero".to_string());
-                }
-                
-                // 2. Amount must not exceed MAX_SUPPLY (in nanoQNC)
-                if tx.amount > MAX_QNC_SUPPLY_NANO {
-                    eprintln!("[ERR][EMISSION] exceeds_max amount={} max={}", 
-                             tx.amount, MAX_QNC_SUPPLY);
-                    return Err("Emission amount exceeds maximum supply".to_string());
-                }
-                
-                // v2.93: Ping commitment validation (optional - depends on implementation)
-                let ping_commitment = microblock.transactions.iter()
-                    .find(|t| matches!(t.tx_type, qnet_state::TransactionType::PingCommitmentWithSampling { .. }));
-                
-                if let Some(commitment_tx) = ping_commitment {
-                    if let qnet_state::TransactionType::PingCommitmentWithSampling {
-                        window_start_height,
-                        window_end_height,
-                        merkle_root,
-                        total_ping_count,
-                        successful_ping_count,
-                        sample_seed,
-                        ping_samples,
-                    } = &commitment_tx.tx_type {
-                        if is_debug() { println!("[DBG][PING-COMMIT] validating_merkle"); }
-                        
-                        // Step 1: Verify window matches this emission block
-                        let expected_window_end = microblock.height;
-                        let expected_window_start = microblock.height.saturating_sub(EMISSION_INTERVAL_BLOCKS);
-                        
-                        if *window_start_height != expected_window_start || *window_end_height != expected_window_end {
-                            if is_warn() { println!("[WARN][PING-COMMIT] window_mismatch expected={}-{} got={}-{}",
-                                     expected_window_start, expected_window_end,
-                                     window_start_height, window_end_height); }
-                            return Err("Ping commitment window does not match emission block".to_string());
-                        }
-                        
-                        // Step 2: Verify sample_seed is deterministic
-                        let entropy_height = microblock.height.saturating_sub(FINALITY_WINDOW);
-                        let entropy_block = storage.load_microblock(entropy_height)
-                            .map_err(|e| format!("Failed to load entropy block: {}", e))?
-                            .ok_or_else(|| "Entropy block not found".to_string())?;
-                        
-                        // OPTIMIZED: SHA3-256 for deterministic seed verification
-                        let mut expected_seed_hasher = Sha3_256::new();
-                        expected_seed_hasher.update(b"QNet_Ping_Sampling_v1");
-                        expected_seed_hasher.update(&entropy_block);
-                        expected_seed_hasher.update(&window_start_height.to_le_bytes());
-                        let expected_seed = expected_seed_hasher.finalize();
-                        let expected_seed_hex = hex::encode(&expected_seed[..]);
-                        
-                        if sample_seed != &expected_seed_hex {
-                            if is_warn() { println!("[WARN][PING-COMMIT] sample_seed_mismatch"); }
-                            return Err("Ping commitment has invalid sample seed".to_string());
-                        }
-                        
-                        if is_debug() { println!("[DBG][PING-COMMIT] sample_seed_ok"); }
-                        
-                        // Step 3: Verify Merkle proofs for ALL samples
-                        use qnet_core::crypto::merkle::verify_merkle_proof;
-                        let mut verified_count = 0;
-                        
-                        for (idx, sample) in ping_samples.iter().enumerate() {
-                            // Calculate ping hash
-                            use blake3::Hasher;
-                            let mut ping_hasher = Hasher::new();
-                            ping_hasher.update(sample.from_node.as_bytes());
-                            ping_hasher.update(sample.to_node.as_bytes());
-                            ping_hasher.update(&sample.response_time_ms.to_le_bytes());
-                            ping_hasher.update(&[if sample.success { 1 } else { 0 }]);
-                            ping_hasher.update(&sample.timestamp.to_le_bytes());
-                            let ping_hash = ping_hasher.finalize().to_hex().to_string();
-                            
-                            // Verify Merkle proof
-                            if !verify_merkle_proof(&ping_hash, merkle_root, &sample.merkle_proof) {
-                                if is_warn() { println!("[WARN][PING-COMMIT] invalid_merkle_proof idx={}", idx); }
-                                return Err(format!("Invalid Merkle proof for ping sample #{}", idx));
-                            }
-                            verified_count += 1;
-                        }
-                        
-                        if is_debug() { println!("[DBG][PING-COMMIT] merkle_proofs_ok count={}", verified_count); }
-                        
-                        // Step 4: Verify sample size is sufficient
-                        // v2.89: Fixed sampling - min 10, max 500 (regardless of total pings)
-                        // This prevents TX bloat for Genesis nodes with 2M+ pings
-                        const MIN_SAMPLES: usize = 10;
-                        const MAX_SAMPLES: usize = 500;
-                        let expected_samples = std::cmp::min(
-                            MAX_SAMPLES,
-                            std::cmp::max(MIN_SAMPLES, *total_ping_count as usize)
-                        );
-                        
-                        if ping_samples.len() < expected_samples {
-                            if is_warn() { println!("[WARN][PING-COMMIT] insufficient_samples got={} need={} total={}", 
-                                     ping_samples.len(), expected_samples, total_ping_count); }
-                            return Err(format!("Insufficient ping samples: {} < {} (total={})", 
-                                             ping_samples.len(), expected_samples, total_ping_count));
-                        }
-                        
-                        if is_debug() { println!("[DBG][PING-COMMIT] sample_size_ok count={} total={} pct={:.1}%",
-                                 ping_samples.len(), total_ping_count,
-                                 (ping_samples.len() as f64 / *total_ping_count as f64) * 100.0); }
-                        
-                        println!("[INFO][PING-COMMITMENT] validated total={} ok={} root={}",
-                                 total_ping_count, successful_ping_count, &merkle_root[..16]);
-                    }
-                } else {
-                    // PRODUCTION: Ping commitment is now mandatory for reward transactions
-                    // All nodes should include ping commitment in emission blocks
-                    // Grace period: Log warning but don't reject (for rolling upgrades)
-                    if is_debug() { println!("[DBG][PING-COMMIT] no_commitment h={}", microblock.height); }
-                    
-                    // Track blocks without commitment for monitoring (static counter)
-                    use std::sync::atomic::{AtomicU64, Ordering};
-                    static MISSING_COMMITMENT_COUNT: AtomicU64 = AtomicU64::new(0);
-                    let missing_count = MISSING_COMMITMENT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-                    if missing_count % 100 == 0 {
-                        if is_warn() { println!("[WARN][PING-COMMIT] missing_commitment blocks={}", missing_count); }
-                    }
-                }
-                
-                // 3. RANGE VALIDATION: Verify emission within reasonable bounds
-                // NOTE: Full deterministic validation impossible without on-chain ping histories
-                // Current approach: validate against CONSERVATIVE maximum based on Pool1 + estimates
-                
-                if let Some(rm) = reward_manager {
-                    let reward_mgr = rm.read().await;
-                    
-                    // Get Pool 1 base emission with automatic halving calculation
-                    // ✅ DETERMINISTIC: Depends only on genesis_timestamp (same for all nodes)
-                    let pool1_emission = reward_mgr.get_pool1_base_emission();
-                    
-                    // Pool 2 & Pool 3: Use CONSERVATIVE estimates (NOT local values!)
-                    // ⚠️  CRITICAL: pool2_fees is LOCAL per node - cannot use for validation!
-                    // ⚠️  CRITICAL: pool3_activation_pool is LOCAL per node - cannot use!
-                    // 
-                    // Instead, use maximum theoretical values:
-                    // - Pool2: Max transaction fees realistically accumulated per 4h window
-                    // - Pool3: Max activation pool contribution per 4h window (Phase 2 only)
-                    
-                    const MAX_POOL2_ESTIMATE: u64 = 100_000 * 1_000_000_000; // 100K QNC (conservative)
-                    const MAX_POOL3_ESTIMATE: u64 = 100_000 * 1_000_000_000; // 100K QNC (conservative)
-                    
-                    // Calculate expected minimum (Pool 1 distributed to minimal eligible nodes)
-                    // In worst case: 0 (if no eligible nodes)
-                    let expected_minimum = 0;
-                    
-                    // Calculate expected maximum (Pool1 + conservative Pool2/Pool3 estimates)
-                    let expected_maximum = pool1_emission + MAX_POOL2_ESTIMATE + MAX_POOL3_ESTIMATE;
-                    
-                    if is_info() {
-                        println!("[INFO][EMISSION] range_validation pool1={} range={}-{} QNC (halving-aware)", 
-                                 pool1_emission / 1_000_000_000,
-                                 expected_minimum / 1_000_000_000,
-                                 expected_maximum / 1_000_000_000);
-                    }
-                    
-                    // Validate: emission must be within expected range
-                    if tx.amount > expected_maximum {
-                        println!("[ERR][EMISSION] amount={} exceeds_max={} QNC", 
-                                 tx.amount / 1_000_000_000, expected_maximum / 1_000_000_000);
-                        return Err(format!(
-                            "Emission amount {} exceeds expected maximum {} (Pool1: {}, Pool2 est: {}, Pool3 est: {})",
-                            tx.amount / 1_000_000_000, 
-                            expected_maximum / 1_000_000_000,
-                            pool1_emission / 1_000_000_000,
-                            MAX_POOL2_ESTIMATE / 1_000_000_000,
-                            MAX_POOL3_ESTIMATE / 1_000_000_000
-                        ));
-                    }
-                    
-                    if is_info() { println!("[INFO][EMISSION] validated amount={} QNC", tx.amount / 1_000_000_000); }
-                } else {
-                    if is_warn() { println!("[WARN][EMISSION] reward_manager unavailable, fallback_validation"); }
-                    
-                    // Fallback: Conservative maximum without reward manager
-                    // Use initial Pool1 value (251,432 QNC) + Pool2/Pool3 estimates
-                    const INITIAL_POOL1: u64 = 251_432 * 1_000_000_000; // Initial Pool1 (before halving)
-                    const MAX_POOL2_ESTIMATE: u64 = 100_000 * 1_000_000_000;
-                    const MAX_POOL3_ESTIMATE: u64 = 100_000 * 1_000_000_000;
-                    const REASONABLE_MAX_EMISSION_PER_WINDOW: u64 = INITIAL_POOL1 + MAX_POOL2_ESTIMATE + MAX_POOL3_ESTIMATE;
-                    
-                    if tx.amount > REASONABLE_MAX_EMISSION_PER_WINDOW {
-                        println!("[ERR][EMISSION] amount={} exceeds_fallback_max={} QNC", 
-                                 tx.amount / 1_000_000_000, REASONABLE_MAX_EMISSION_PER_WINDOW / 1_000_000_000);
-                        return Err(format!(
-                            "Emission amount {} exceeds reasonable maximum for single window",
-                            tx.amount
-                        ));
-                    }
-                }
-                
-                // 4. Signature should be None (no central authority)
-                if tx.signature.is_some() {
-                    if is_warn() { println!("[WARN][EMISSION] unexpected_signature (ignoring)"); }
-                }
-                
-                // 5. Final validation happens in StateManager.emit_rewards()
-                // which checks remaining supply and prevents exceeding MAX_SUPPLY
-                
-                if is_info() { println!("[INFO][EMISSION] tx_fully_validated halving_support=true"); }
-        }
-        
-        println!("[INFO][VALIDATION] microblock_validated h={}", microblock.height);
-        Ok(())
-    }
     
     
     /// Start the blockchain node
@@ -11054,8 +11530,10 @@ impl BlockchainNode {
                                         }
                                     }
                                     // Store as microblock at height 0 (validated above)
+                                    // Stored ONLY — a non-write here (storage in a mode that keeps
+                                    // no blocks) would let the node proceed as if it held genesis.
                                     match self.storage.save_microblock(0, &block_data) {
-                                        Ok(_) => {
+                                        Ok(crate::storage::SaveOutcome::Stored) => {
                                             if is_info() {
                                                 println!("[INFO][GEN] http_genesis_saved from={} size={}", ip, block_data.len());
                                             }
@@ -11082,12 +11560,19 @@ impl BlockchainNode {
                                                     }
                                                 }
                                                 Self::cache_node_registrations_from_transactions(&self.storage, &genesis_mb.transactions);
+                                                // Stamp reg_height=0 + vrf as well: an unstamped row is invisible to registry_root,
+                                                // so caching alone forks this node off every checkpoint until a restart stamps it.
+                                                Self::apply_genesis_registrations(&self.storage, &genesis_mb.transactions);
                                                 if is_info() {
                                                     println!("[INFO][GEN] genesis_registrations_cached tx_count={}", genesis_mb.transactions.len());
                                                 }
                                             }
                                             genesis_downloaded = true;
                                             break;
+                                        }
+                                        Ok(other) => {
+                                            println!("[ERR][GEN] http_genesis_not_stored from={} outcome={:?} action=ignore",
+                                                     ip, other);
                                         }
                                         Err(e) => {
                                             if is_warn() { println!("[WARN][GEN] save_failed from={} err={}", ip, e); }
@@ -11567,6 +12052,10 @@ impl BlockchainNode {
         let node_id = self.node_id.clone();
         let node_type = self.node_type.clone();
         let is_running = self.is_running.clone();
+        // The node's own consensus identity: the heartbeat signature must come from the SAME key the
+        // chain committed for this node_id, and the seed it derives from differs between operator nodes
+        // (QNET_WALLET_SEED) and genesis nodes (QNET_GENESIS_SEED).
+        let hb_identity = self.wallet_identity.clone();
 
         tokio::spawn(async move {
             const EMISSION_BLOCK_INTERVAL: u64 = 14400;
@@ -11590,7 +12079,8 @@ impl BlockchainNode {
 
                 // v34: emit ONE unforgeable Heartbeat TX per ~1440-block subwindow (10/epoch) for
                 // super/genesis nodes. Anchored to a recent block hash so it cannot be pre-signed or
-                // backfilled (verified in validate_received_microblock). Liveness is tallied on-chain
+                // backfilled. NOTE: that anchor check runs PRODUCER-SIDE ONLY (the block-build filter
+                // below); receivers do not re-verify it. Liveness is tallied on-chain
                 // in Account.heartbeat_slots (popcount ≥ 9). Skip while syncing: a heartbeat anchored
                 // to our lagging height would be stale at the tip and the producer would reject it.
                 if !matches!(node_type, NodeType::Light) && current_height >= 2 && !coordinator_is_syncing() {
@@ -11612,7 +12102,7 @@ impl BlockchainNode {
                         let first = !matches!(last_hb_emit, Some((e, s, _)) if e == hb_epoch && s == hb_subwindow);
                         let reanchor = matches!(last_hb_emit, Some((_, _, h)) if current_height.saturating_sub(h) >= HB_REEMIT_INTERVAL);
                         if !included && (first || reanchor) {
-                            if let Some(hb_tx) = Self::create_heartbeat_tx_static(&storage, &node_id, current_height).await {
+                            if let Some(hb_tx) = Self::create_heartbeat_tx_static(&storage, &node_id, current_height, hb_identity.as_deref()).await {
                                 if let Ok(hb_bytes) = bincode::serialize(&hb_tx) {
                                     let hb_gp = hb_tx.gas_price;
                                     if mempool.add_binary_transaction(hb_bytes.clone(), hb_tx.hash.clone(), hb_gp) {
@@ -11646,7 +12136,6 @@ impl BlockchainNode {
         let mempool = self.mempool.clone();
         let node_id = self.node_id.clone();
         let node_type = self.node_type.clone();
-        let poh = self.poh.clone();
         let bitmap_tracker = self.bitmap_commitment_tracker.clone();
         let is_running = self.is_running.clone();
         
@@ -11902,7 +12391,6 @@ impl BlockchainNode {
                                                             &node_id,
                                                             node_type.clone(),
                                                             Some(&storage),
-                                                            &poh,
                                                         ).await;
 
                                                         if producer.is_empty() || producer == node_id || sent_to.contains(&producer) {
@@ -12149,7 +12637,6 @@ impl BlockchainNode {
         let _last_block_attempt = self.last_block_attempt.clone();
         let _perf_config = self.perf_config.clone();
         let rotation_tracker = self.rotation_tracker.clone();
-        let poh_for_spawn = self.poh.clone();
         let parallel_executor_for_spawn = self.parallel_executor.clone();
         let adaptive_bft_for_spawn = self.adaptive_bft.clone();
         let pre_execution_for_spawn = self.pre_execution.clone();
@@ -12327,6 +12814,9 @@ impl BlockchainNode {
                                     }
                                 }
                                 Self::cache_node_registrations_from_transactions(&storage, &existing_genesis.transactions);
+                                // Stamp reg_height=0 + vrf as well: an unstamped row is invisible to registry_root,
+                                // so caching alone forks this node off every checkpoint until a restart stamps it.
+                                Self::apply_genesis_registrations(&storage, &existing_genesis.transactions);
                                 if is_info() {
                                     println!("[INFO][GEN] genesis_registrations_cached tx_count={}", existing_genesis.transactions.len());
                                 }
@@ -12392,6 +12882,15 @@ impl BlockchainNode {
                         // before this check ⇒ gen_above_zero>=1 ⇒ halt+rejoin, never a forking mint. A
                         // coordinated first launch brings >=2 siblings up at height 0 within the window ⇒
                         // mint proceeds; a partition leaving <2 genesis visible ⇒ halt (fail-closed).
+                        // GAP A: a WS restart pin (K>0) means the chain HAS history and recovery is a
+                        // cold-join from macroblock K, which preserves balances. Minting a fresh genesis
+                        // here re-seeds [0;32] state = the ledger wiped, and there is NO re-mint path.
+                        // Under a pin an empty node MUST await K, never mint — halt and retry sync.
+                        if crate::genesis_constants::ws_checkpoint_index() > 0 {
+                            eprintln!("[FATAL][GEN] WS restart pin active (K={}) with empty local chain — refusing to mint fresh genesis (would wipe balances, no re-mint path). Recovery MUST cold-join from macroblock K. Halting to retry sync.",
+                                      crate::genesis_constants::ws_checkpoint_index());
+                            std::process::exit(1);
+                        }
                         let (gen_connected, gen_above_zero) = match unified_p2p.as_ref() {
                             Some(p) => {
                                 let peers = p.get_validated_active_peers();
@@ -12441,8 +12940,6 @@ impl BlockchainNode {
                                 producer: "genesis".to_string(),
                                 merkle_root,
                                 signature: Vec::new(), // Will be signed with quantum crypto
-                                poh_hash: vec![0u8; 64], // Genesis has no PoH yet
-                                poh_count: 0, // Genesis starts at 0
                                 // QRB v3.0: Genesis has no VRF (no prev_hash to derive from)
                                 vrf_output: None,
                                 vrf_proof: None,
@@ -12508,7 +13005,7 @@ impl BlockchainNode {
                                         save_attempts += 1;
                                         
                                         match storage.save_microblock(0, &data) {
-                                            Ok(_) => {
+                                            Ok(crate::storage::SaveOutcome::Stored) => {
                                                 println!("[INFO][GEN] Genesis Block created and saved at height 0");
 
                                                 // v12.0: Export genesis.bin for file-based distribution
@@ -12762,6 +13259,16 @@ impl BlockchainNode {
                                                 
                                                 break;
                                             }
+                                            Ok(other) => {
+                                                // A non-write is as fatal as an error here: the node
+                                                // would run believing it holds genesis when it does not.
+                                                println!("[CRIT][GEN] genesis_not_stored outcome={:?} action=exit", other);
+                                                set_node_state(NodeState::Error {
+                                                    reason: format!("Genesis not stored: {:?}", other),
+                                                    recoverable: false,
+                                                });
+                                                std::process::exit(1);
+                                            }
                                             Err(e) => {
                                                 println!("[ERR][GEN] genesis_save_failed attempt={}/{} err={}",
                                                          save_attempts, MAX_SAVE_ATTEMPTS, e);
@@ -12834,6 +13341,9 @@ impl BlockchainNode {
                                     }
                                 }
                                 Self::cache_node_registrations_from_transactions(&storage, &genesis_block.transactions);
+                                // Stamp reg_height=0 + vrf as well: an unstamped row is invisible to registry_root,
+                                // so caching alone forks this node off every checkpoint until a restart stamps it.
+                                Self::apply_genesis_registrations(&storage, &genesis_block.transactions);
                                 if is_info() {
                                     println!("[INFO][GEN] genesis_registrations_cached tx_count={}", genesis_block.transactions.len());
                                 }
@@ -13017,6 +13527,9 @@ impl BlockchainNode {
                                 }
                             }
                             Self::cache_node_registrations_from_transactions(&storage, &genesis_block.transactions);
+                            // Stamp reg_height=0 + vrf as well: an unstamped row is invisible to registry_root,
+                            // so caching alone forks this node off every checkpoint until a restart stamps it.
+                            Self::apply_genesis_registrations(&storage, &genesis_block.transactions);
                             if is_info() {
                                 println!("[INFO][GEN] genesis_registrations_cached tx_count={}", genesis_block.transactions.len());
                             }
@@ -13089,7 +13602,6 @@ impl BlockchainNode {
             let mut last_production_height = 0u64;
             
             // QUANTUM VTS: Get reference for microblock production
-            let poh = poh_for_spawn.clone();
             
             // PARALLEL EXECUTOR: Get reference for parallel processing
             let parallel_executor = parallel_executor_for_spawn.clone();
@@ -13373,7 +13885,7 @@ impl BlockchainNode {
                                 if !quic_fallback_rate_check(&node_id) {
                                     if is_warn() {
                                         println!("[WARN][P2P] quic_fallback_rate_limited node={}", 
-                                                 &node_id[..node_id.len().min(8)]);
+                                                 qnet_state::char_prefix(&node_id, 8));
                                     }
                                 } else {
                                     if is_info() {
@@ -13965,13 +14477,18 @@ impl BlockchainNode {
                                 (own_w.max(tc_floor), None)
                             }
                         };
-                        // A slot beyond the seal throttle is a FINALITY stall, not a producer stall
-                        // — no rotation can fill it; checkpoint-BFT must advance the seal instead.
-                        // Same max(seal, QC-frontier) base and skip-at-zero as the throttle itself.
+                        // Bound by the SAME horizon production uses, not the old 2-window seal allowance.
+                        // While that mismatch stood, A1 was only half a decoupling: production could run
+                        // 32 windows past the seal, but the moment a DEAD producer's slot came up beyond
+                        // +180 rotation was suppressed — "no rotation can fill it" is true for a finality
+                        // stall and false for a producer stall, and past the seal those are exactly the
+                        // case that matters. With >1/3 dead a dead producer's slot arrives within a few
+                        // rotations, so the chain stopped at +180 regardless of the raised throttle.
                         let seal_base = storage.last_sealed_mb_index().saturating_mul(90)
                             .max(qc_verified_frontier_cached());
                         let seal_throttled = seal_base > 0
-                            && failover_height > seal_base + MAX_UNSEALED_WINDOWS * 90;
+                            && failover_height > seal_base
+                                + (BlockchainNode::MAX_DERIVED_ROSTER_WINDOWS as u64) * 90;
                         if seal_throttled && is_warn() {
                             println!("[WARN][PROD] failover_suppressed reason=seal_throttle h={} seal_base={}",
                                      failover_height, seal_base);
@@ -14012,6 +14529,13 @@ impl BlockchainNode {
                         const STALL_GRACE_SECS: u64 = 5;
                         const HEARTBEAT_SILENT_MS: u64 = 3_000;
                         const D2_PROGRESS_HARD_CEILING_SECS: u64 = 180;
+                        // A REMOTE producer's heartbeat is a CLAIM we cannot fully verify — binding it to
+                        // our own parent hash kills an invented frontier, but a script tracking the real
+                        // chain still passes. So a remote claim may buy far less delay than our own
+                        // self-yield path: a producer genuinely alive and targeting the frontier emits
+                        // within a block or two, and this stays well under one 30-block rotation, so a
+                        // liar cannot hold even a single rotation.
+                        const HEARTBEAT_SUPPRESS_CEILING_SECS: u64 = 15;
 
                         // On slot-leader silent > grace: emit a Dilithium3 TimeoutVote for (mb_idx, certified+1).
                         // n−f co-signs advance HIGHEST_CERTIFIED_ROUND[mb_idx] → every node re-elects the same
@@ -14055,7 +14579,7 @@ impl BlockchainNode {
                             // labels below stay relative (display only).
                             let expected_producer = if mb_idx == own_w {
                                 Some(Self::select_microblock_producer_with_round(
-                                    failover_height, &unified_p2p, &node_id, node_type, Some(&storage), &poh,
+                                    failover_height, &unified_p2p, &node_id, node_type, Some(&storage),
                                     crate::unified_p2p::highest_certified_round_for(mb_idx),
                                 ).await).filter(|p| !p.is_empty())
                             } else { None };
@@ -14103,7 +14627,8 @@ impl BlockchainNode {
                                             let targeting_our_slot = crate::unified_p2p::last_remote_producer_heartbeat_height(p)
                                                 .map(|h| h >= failover_height)
                                                 .unwrap_or(false);
-                                            if fresh && targeting_our_slot {
+                                            if fresh && targeting_our_slot
+                                                && round_age <= HEARTBEAT_SUPPRESS_CEILING_SECS {
                                                 Some("heartbeat_fresh")
                                             } else {
                                                 None
@@ -14279,6 +14804,8 @@ impl BlockchainNode {
                                         // (includes our forked tip block)
                                         let delete_from = rollback_to + 1;
                                         for h in delete_from..=local_h {
+                                            // Long loops must tick the watchdog, not just the phases.
+                                            if h % 256 == 0 { crate::storage::note_rollback_progress(); }
                                             if let Err(e) = storage.delete_microblock(h) {
                                                 if is_warn() {
                                                     println!("[WARN][FORK] delete_fail h={} err={}", h, e);
@@ -14300,6 +14827,7 @@ impl BlockchainNode {
                                         // rollback target so orphaned-block bindings (reg_height > rollback_to) drop
                                         // out, BEFORE the rollback barrier is released. No per-block delete ⇒ no
                                         // absence window; the canonical binding (reg_height ≤ target) survives.
+                                        crate::storage::note_rollback_progress();
                                         if let Err(e) = storage.rebuild_committed_burn_wallet(rollback_to) {
                                             if is_warn() { println!("[WARN][FORK] cbw_rebuild_fail to={} err={}", rollback_to, e); }
                                         }
@@ -14307,6 +14835,7 @@ impl BlockchainNode {
                                         // target) + seal cleanup at the rollback target in ONE scan,
                                         // BEFORE the barrier is released — unbounded reward rosters match a
                                         // from-genesis node; canonical re-added by the live pipeline.
+                                        crate::storage::note_rollback_progress();
                                         match storage.rebuild_registry_lthash(rollback_to) {
                                             Ok(n) if n > 0 => { if is_info() { println!("[INFO][FORK] registry_lthash_rebuilt orphans_pruned={} to={}", n, rollback_to); } }
                                             Err(e) => { if is_warn() { println!("[WARN][FORK] registry_lthash_rebuild_fail to={} err={}", rollback_to, e); } }
@@ -14315,6 +14844,7 @@ impl BlockchainNode {
                                         // dilithium_pk_root: subtract journaled orphan binds (height > target) —
                                         // exact inverse of the apply-time bind, inside the barrier (applies
                                         // quiesced ⇒ no concurrent bind). Symmetric with cbw/registry_lthash.
+                                        crate::storage::note_rollback_progress();
                                         match storage.rollback_dpk_binds_above(rollback_to) {
                                             Ok(n) if n > 0 => { if is_info() { println!("[INFO][FORK] dpk_binds_rolled_back n={} to={}", n, rollback_to); } }
                                             Err(e) => { if is_warn() { println!("[WARN][FORK] dpk_rollback_fail to={} err={}", rollback_to, e); } }
@@ -14327,6 +14857,7 @@ impl BlockchainNode {
                                         // divergent emission set → reward_root fork. Clear the orphan epochs here (inside
                                         // the barrier; per-index bounds in the fn doc); the live pipeline re-applies
                                         // canonical forward and re-derives the correct set. Reorg-path only.
+                                        crate::storage::note_rollback_progress();
                                         match storage.reconcile_reward_indices_above_epoch(rollback_to) {
                                             Ok(c) if c > 0 => { if is_info() { println!("[INFO][FORK] reward_indices_reconciled cleared={} to={}", c, rollback_to); } }
                                             Err(e) => { if is_warn() { println!("[WARN][FORK] reward_indices_reconcile_fail to={} err={}", rollback_to, e); } }
@@ -14339,6 +14870,14 @@ impl BlockchainNode {
                                         // heal loop forces a boot rebuild — else watermark>=tip skips it and the
                                         // reader under-reports those holdings forever. Cleared on heal success.
                                         storage.mark_owns_index_dirty();
+
+                                        // Caches that answer AHEAD of storage must be purged while saves are
+                                        // still barred. Releasing the barrier first leaves a window where the
+                                        // verify worker resolves a deleted block's hash from RAM, admits its
+                                        // orphan child, and storage cannot backstop it — the deleted parent is
+                                        // absent, and absent parents are legitimately allowed.
+                                        crate::storage::note_rollback_progress();
+                                        storage.invalidate_recent_microblocks_above(rollback_to);
 
                                         crate::storage::end_rollback_protection();
 
@@ -14412,14 +14951,21 @@ impl BlockchainNode {
 
                                         println!("[INFO][FORK] rollback_ok to={} deleted={} blocks",
                                                  rollback_to, local_h - rollback_to);
+
+                                        // Adopt from the retained tree ONLY after blocks were really
+                                        // removed. Running this when the rollback was refused or was a
+                                        // no-op re-submits still-canonical blocks for the pipeline to
+                                        // drop — wasted ingest during recovery, when it is scarcest.
+                                        let adopted = adopt_retained_successor(&storage, rollback_to);
+                                        if adopted > 0 {
+                                            println!("[INFO][FORK] rollback_done to={} action=adopt_retained blocks={}",
+                                                     rollback_to, adopted);
+                                        } else {
+                                            println!("[INFO][FORK] rollback_done to={} action=coordinator_sync", rollback_to);
+                                        }
                                     }
                                 }
 
-                                // Post-rollback the local tip dropped (below finality if we deleted, or
-                                // already behind the fork if we didn't) → hand off to the single sync
-                                // coordinator. Its check_desync fires execute_sync's snapshot fast-path +
-                                // catch-up to pull the canonical chain; no duplicate inline bulk fetch here.
-                                println!("[INFO][FORK] rollback_done to={} action=coordinator_sync", rollback_to);
                                 crate::sync_manager::nudge_sync_check();
                             }
                         }
@@ -14505,7 +15051,7 @@ impl BlockchainNode {
                             }
                         }
                     }
-                // v10.1: Two-mode sync system (like Bitcoin/Ethereum)
+                // v10.1: Two-mode sync system
                 // Mode 1: gap > 10 → FAST SYNC (parallel batch download, loop until caught up)
                 // Mode 2: gap <= 10 → LIVE SYNC (ShredProtocol real-time blocks)
                 // No more one-shot downloads or emergency sync.
@@ -14719,7 +15265,7 @@ impl BlockchainNode {
                     _ => 5,  // Round 2+: Normal tolerance (5 blocks)
                 };
                 
-                // v10.1: Two-mode sync (like Bitcoin/Ethereum). No more "emergency sync".
+                // v10.1: Two-mode sync. No more "emergency sync".
                 // Mode 1: gap > max_allowed_lag → skip consensus, let fast sync (below) handle it
                 // Mode 2: gap <= max_allowed_lag → participate in consensus (live sync via ShredProtocol)
                 if local_stored_height + max_allowed_lag < expected_height {
@@ -14752,7 +15298,7 @@ impl BlockchainNode {
                 // entry). Forensic h=174582: two nodes produced the same
                 // height because the pipeline hadn't caught up to the in-
                 // memory counter and the pre-save guard fired only after the
-                // heavy PoH+sign work. Read storage at cycle entry — if a
+                // heavy sign work. Read storage at cycle entry — if a
                 // block at next_block_height already exists, abort and yield
                 // (shrinks the race ~50ms → ~1-2ms). Idempotent (same
                 // producer no-op); different producer → yield; a fork attempt
@@ -14954,7 +15500,6 @@ impl BlockchainNode {
                     &node_id,
                     node_type,
                     Some(&storage),
-                    &poh,
                     certified_abs,
                 ).await;
 
@@ -14978,6 +15523,18 @@ impl BlockchainNode {
                 cache_expected_producer(next_block_height, &current_producer, certified_abs);
 
                 let mut is_my_turn_to_produce = current_producer == node_id;
+
+                // Unvouched RAM state (a failed inline-apply rebuild) ⇒ yield the slot. Applying a
+                // block above the failure point is proof the state validates, so clear it there.
+                // Unvouched RAM state (an abandoned inline apply) ⇒ never produce again this process.
+                // No clear path: storage presence does not prove the RAM state applied cleanly.
+                if INLINE_APPLY_UNVOUCHED.load(Ordering::SeqCst) != 0 {
+                    if is_my_turn_to_produce {
+                        println!("[ERR][PROD] production_suspended h={} reason=state_unvouched action=restart_required",
+                                 next_block_height);
+                    }
+                    is_my_turn_to_produce = false;
+                }
 
                 // Production ceiling: pause (never wedge) if the tip outruns finality or the
                 // sealed frontier. Base = max(contiguous seal, QC-verified frontier) — the SAME
@@ -15032,6 +15589,15 @@ impl BlockchainNode {
                                 }
                             }
                         }
+                        // A throttled leader is still the leader: stamp leadership before yielding so
+                        // the heartbeat grace covers the throttle window. Without this a leader that
+                        // pauses on backpressure goes silent and peers read it as dead.
+                        if is_my_turn_to_produce {
+                            LAST_LEADERSHIP_MS.store(
+                                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_millis() as u64).unwrap_or(0),
+                                std::sync::atomic::Ordering::Relaxed);
+                        }
                         tokio::time::sleep(Duration::from_secs(1)).await;
                         continue;
                     }
@@ -15047,18 +15613,36 @@ impl BlockchainNode {
                 // or not elected. Signed and verified vs the same registry as
                 // TimeoutVotes; advances no consensus state — only accelerates
                 // empty-slot entry, still gated by 2f+1.
+                // Heartbeat continues for a grace window after the rotation ends: peers lagging a
+                // few blocks still expect blocks from the outgoing leader, and an abrupt silence
+                // reads as death. Bounded to leader + recent-leader, so committee size does not
+                // multiply heartbeat traffic.
+                let now_ms_hb = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
                 if is_my_turn_to_produce {
-                    let now_ms = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_millis() as u64)
-                        .unwrap_or(0);
+                    LAST_LEADERSHIP_MS.store(now_ms_hb, std::sync::atomic::Ordering::Relaxed);
+                }
+                let in_leader_grace = now_ms_hb.saturating_sub(
+                    LAST_LEADERSHIP_MS.load(std::sync::atomic::Ordering::Relaxed)) <= LEADER_HEARTBEAT_GRACE_MS;
+                if is_my_turn_to_produce || in_leader_grace {
+                    let now_ms = now_ms_hb;
                     let last_hb = LAST_NETWORK_HEARTBEAT_MS.load(std::sync::atomic::Ordering::Relaxed);
                     if now_ms.saturating_sub(last_hb) >= NETWORK_HEARTBEAT_INTERVAL_MS {
                         if let Some(ref p2p) = unified_p2p {
                             let timestamp_secs = now_ms / 1000;
+                            // v2 binds the claimed slot to the CHAIN: the parent hash of the slot we say
+                            // we are producing. Without it `slot_height` was a free-form number and this
+                            // heartbeat SUPPRESSES the view-change vote, so one liar held a slot for the
+                            // whole progress ceiling. The receiver now checks the hash against its own
+                            // storage, which kills the cheapest lie (claim an arbitrary frontier).
+                            let anchor_hash = storage
+                                .get_microblock_hash_hex(next_block_height.saturating_sub(1))
+                                .ok().flatten().unwrap_or_default();
                             let msg_to_sign = format!(
-                                "QNET_PRODUCER_HEARTBEAT_V1:{}:{}:{}",
-                                node_id, timestamp_secs, next_block_height
+                                "QNET_PRODUCER_HEARTBEAT_V2:{}:{}:{}:{}",
+                                node_id, timestamp_secs, next_block_height, anchor_hash
                             );
                             // Sign with the consensus crypto path used for
                             // TimeoutVote so the receiver-side
@@ -15575,38 +16159,37 @@ impl BlockchainNode {
                                          next_block_height, current_epoch, rewarding_epoch, prev_macroblock_index);
                             }
                             
-                            // Load PREVIOUS MacroBlock (always ready - no waiting!)
-                            if let Ok(Some(mb_bytes)) = storage.get_macroblock_by_height(prev_macroblock_index) {
-                                if let Ok(macroblock) = bincode::deserialize::<qnet_state::MacroBlock>(&mb_bytes) {
-                            // Emission AMOUNT is independent of the recipient set: Pool-1 halving
-                            // schedule + the macroblock's sealed pool2/pool3 totals. The recipient
-                            // set + merkle root are recomputed from on-chain (Super: registry +
-                            // heartbeat tally; Light: bitmaps + roster) so the macroblock carries no
-                            // recipient list (O(1)) and every node rebuilds an identical root.
-                            let pool1_base_emission = {
-                                let reward_mgr = reward_manager_for_spawn.read().await;
-                                reward_mgr.get_pool1_base_emission()
-                            };
-                            let pool2_total = macroblock.consensus_data.pool2_total_fees.unwrap_or(0);
-                            let pool3_total = macroblock.consensus_data.pool3_total_activations.unwrap_or(0);
-                            let total_emission = pool1_base_emission + pool2_total + pool3_total;
+                            // EXACTLY what every validator recomputes (expected_emission_amount):
+                            // the height-derived schedule and nothing else. NO macroblock is loaded
+                            // here. It used to be, for pool2/pool3 — fields covered by no hash, no
+                            // signature and no commitment (MacroBlock::hash omits consensus_data), so
+                            // a peer could hand this node a forged one and it would build a block the
+                            // whole network refuses. Dropping the ADDENDS but keeping the LOAD was
+                            // worse still: a producer that simply lacked that macroblock (it sits ~2
+                            // epochs back, below a recently synced node's anchor) silently built NO
+                            // emission TX at all, so an entire epoch's rewards depended on WHICH node
+                            // happened to be elected. The amount is a pure function of height on both
+                            // sides; see the note at the pool2/pool3 declarations in
+                            // core/qnet-state/src/block.rs before reintroducing either.
+                            let total_emission =
+                                qnet_consensus::lazy_rewards::pool1_base_emission_at_height(next_block_height);
                             if total_emission > 0 {
                                 let reward_epoch = prev_macroblock_index;
-                                let (wallet_vec, reward_root_hex) =
-                                    Self::compute_epoch_reward_distribution(&storage, reward_epoch, total_emission);
-                                let reward_total: u64 = wallet_vec.iter().map(|(_, a)| *a).sum();
-                                let reward_count = wallet_vec.len() as u32;
+                                // Streamed: root + shard cache from ONE pass, peak RAM one shard. The
+                                // vector build materialised every recipient (GBs at the 10M target) on
+                                // the producer. Cannot reproduce the leaf set ⇒ no emission this block;
+                                // a wrong root here would be certified by the committee.
+                                let (reward_count, reward_total, reward_root_hex) =
+                                    match Self::compute_epoch_reward_root(
+                                        &storage, reward_epoch, total_emission, Some(reward_epoch)) {
+                                        Some((c, t, r)) => (c as u32, t, r),
+                                        None => (0u32, 0u64, String::new()),
+                                    };
                                 let reward_per_node = if reward_count > 0 { reward_total / reward_count as u64 } else { 0 };
                                 if reward_count > 0 {
-                                    if let Err(e) = storage.save_epoch_reward_root(reward_epoch, &reward_root_hex, reward_per_node, reward_count, reward_total) {
-                                        eprintln!("[WARN][EMISSION] reward_root_save_fail epoch={} err={}", reward_epoch, e);
-                                    }
-                                    // Freeze the canonical leaf-set as the sharded structure (this producer's
-                                    // computed root IS the committed root) so claims load one shard, not O(N).
-                                    Self::save_epoch_reward_sharded(&storage, reward_epoch, &wallet_vec);
                                     if is_info() {
                                         println!("[INFO][EMISSION] reward_root epoch={} root={}.. count={} total={} QNC",
-                                                 reward_epoch, &reward_root_hex[..16.min(reward_root_hex.len())],
+                                                 reward_epoch, qnet_state::char_prefix(&reward_root_hex, 16),
                                                  reward_count, reward_total / 1_000_000_000);
                                     }
                                 }
@@ -15649,18 +16232,13 @@ impl BlockchainNode {
                                         println!("[INFO][EMISSION] tx_created block={} mb={} amount={} QNC recipients={} size={}B hash={}",
                                                  next_block_height, prev_macroblock_index,
                                                  total_emission / 1_000_000_000, reward_count, tx_sz,
-                                                 &emission_tx.hash[..16.min(emission_tx.hash.len())]);
+                                                 qnet_state::char_prefix(&emission_tx.hash, 16));
                                     }
                                 } else {
                                     eprintln!("[ERR][EMISSION] tx_serialize_fail block={}", next_block_height);
                                 }
                             } else {
                                 eprintln!("[WARN][EMISSION] zero_emission block={} mb={}", next_block_height, prev_macroblock_index);
-                            }
-                                } // Close if let Ok(macroblock)
-                            } else {
-                                eprintln!("[ERR][EMISSION] macroblock_not_found block={} mb={}", 
-                                         next_block_height, prev_macroblock_index);
                             }
                         } // Close if current_epoch > 0
                     }
@@ -15933,13 +16511,15 @@ impl BlockchainNode {
                         .filter_map(|(hash, tx_opt)| tx_opt.map(|tx| (hash, tx)))
                         .map(|(hash, tx)| {
                             // v35: Heartbeat is a system TX (skip nonce/balance) but MUST carry a
-                            // fresh, real anchor or receivers' verify_heartbeat_tx rejects the whole
-                            // block (freeze). Gate at the production height (== inclusion height):
-                            // exclude a stale/forged-anchor heartbeat, never block the microblock.
-                            // Sig is already verified at mempool admission / self-signed. Mirrors
-                            // verify_heartbeat_tx: anchor past, ≤90 lag, hash == canonical chain hash.
+                            // fresh, real anchor. THIS IS THE ONLY PLACE THE ANCHOR IS CHECKED —
+                            // receivers do not re-verify it, so a Byzantine producer can still include
+                            // a stale/forged-anchor heartbeat (OPEN: receive-side gate; the pure
+                            // storage half is fork-safe, the signature half must go through the
+                            // shared system-TX authenticator, never the RAM consensus registry).
+                            // Gate at the production height (== inclusion height): exclude a
+                            // stale/forged-anchor heartbeat, never block the microblock.
+                            // Checks: anchor past, ≤90 lag, hash == canonical chain hash.
                             if let qnet_state::TransactionType::Heartbeat { anchor_height, anchor_hash, .. } = &tx.tx_type {
-                                const HB_ANCHOR_MAX_LAG: u64 = 90;
                                 let ah = *anchor_height;
                                 let ahash = anchor_hash.clone();
                                 let ok = tx.validate().is_ok()
@@ -15971,12 +16551,16 @@ impl BlockchainNode {
                                         eprintln!("[ERR][BLOCK] system_tx_validate_failed type={:?} from={} hash={}.. err={}",
                                             std::mem::discriminant(&tx.tx_type),
                                             &tx.from[..tx.from.len().min(20)],
-                                            &hash[..hash.len().min(16)],
+                                            qnet_state::char_prefix(&hash, 16),
                                             e
                                         );
                                         (false, Some(format!("validate: {}", e)))
                                     }
                                 }
+                            } else if !Self::gas_limit_admissible(&tx) {
+                                // Drop, never a block-level reject: an oversized TX that slipped past
+                                // admission must not reach a block.
+                                (false, Some("gas_limit_above_max".to_string()))
                             } else {
                                 // Production: full state validation (thread-safe read)
                                 let nonce_valid = if let Some(account) = state_snapshot.get_account(&tx.from) {
@@ -16074,7 +16658,7 @@ impl BlockchainNode {
                                 if is_info() {
                                     println!(
                                         "[INFO][BLOCK] dedup_already_on_chain hash={} from={} reason=epoch_already_committed",
-                                        &hash[..hash.len().min(16)], &tx.from
+                                        qnet_state::char_prefix(&hash, 16), &tx.from
                                     );
                                 }
                                 invalid_tx_hashes.push(hash);
@@ -16093,7 +16677,7 @@ impl BlockchainNode {
                             if is_dup_commitment {
                                 if is_info() {
                                     println!("[INFO][BLOCK] dedup_commitment type={:?} from={} hash={}",
-                                             std::mem::discriminant(&tx.tx_type), &tx.from, &hash[..hash.len().min(16)]);
+                                             std::mem::discriminant(&tx.tx_type), &tx.from, qnet_state::char_prefix(&hash, 16));
                                 }
                                 invalid_tx_hashes.push(hash);
                                 continue;
@@ -16123,7 +16707,7 @@ impl BlockchainNode {
                         // v3.1: Show detailed rejection reasons
                         for (hash, reason) in &rejection_reasons {
                             eprintln!("[WARN][MB] tx_rejected hash={}.. reason={}",
-                                     &hash[..hash.len().min(16)], reason);
+                                     qnet_state::char_prefix(&hash, 16), reason);
                         }
                         println!("[INFO][MB] invalid_tx_removed count={}", invalid_tx_hashes.len());
                     }
@@ -16400,100 +16984,10 @@ impl BlockchainNode {
                         PREV_HASH_RETRY_COUNTER.store(0, Ordering::SeqCst);
                     }
                     
-                    // CRITICAL FIX: Get PoH state from PREVIOUS BLOCK for consistency
-                    // This ensures all nodes use the same PoH baseline regardless of local state
-                    let (poh_hash, poh_count) = if next_block_height > 1 {
-                        // CRITICAL: At rotation boundaries, wait for previous block if needed
-                        // This prevents PoH regression when producer changes
-                        let is_rotation_start = next_block_height > 1 && ((next_block_height - 1) % ROTATION_INTERVAL_BLOCKS) == 0;
-                        
-                        // Use auto-format loader that handles both EfficientMicroBlock and legacy MicroBlock
-                        let mut prev_block_result = storage.load_microblock_auto_format(next_block_height - 1);
-                        
-                        // Retry mechanism for rotation boundaries ONLY
-                        if is_rotation_start && prev_block_result.as_ref().map(|r| r.is_none()).unwrap_or(false) {
-                            println!("[INFO][MB] poh_rotation_wait prev_h={}", next_block_height - 1);
-                            
-                            // Try up to 3 times with 500ms delay
-                            for retry in 1..=3 {
-                                tokio::time::sleep(Duration::from_millis(500)).await;
-                                prev_block_result = storage.load_microblock_auto_format(next_block_height - 1);
-                                if prev_block_result.as_ref().map(|r| r.is_some()).unwrap_or(false) {
-                                    println!("[INFO][MB] poh_prev_block_received retries={}", retry);
-                                    break;
-                                }
-                            }
-                        }
-                        
-                        // Load previous block to get its PoH state
-                        // Track retries to prevent infinite waiting
-                        static POH_WAIT_RETRY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-                        
-                        match prev_block_result {
-                            Ok(Some(prev_block)) => {
-                                // Reset retry counter on success
-                                POH_WAIT_RETRY.store(0, std::sync::atomic::Ordering::SeqCst);
-                                // Use previous block's PoH as baseline
-                                println!("[INFO][MB] poh_baseline h={} count={}",
-                                        prev_block.height, prev_block.poh_count);
-                                (prev_block.poh_hash.clone(), prev_block.poh_count)
-                            },
-                            Ok(None) => {
-                                let retry = POH_WAIT_RETRY.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-                                println!("[WARN][MB] poh_prev_missing h={} retry={}/5", next_block_height - 1, retry);
-                                
-                                if retry >= 5 {
-                                    // FALLBACK: Use local PoH to prevent node from getting stuck
-                                    POH_WAIT_RETRY.store(0, std::sync::atomic::Ordering::SeqCst);
-                                    println!("[WARN][MB] poh_fallback retries={} source=local", retry);
-                                    if let Some(ref poh) = poh {
-                                        let (hash, count, _slot) = poh.get_state().await;
-                                        (hash, count)
-                                    } else {
-                                        (vec![0u8; 64], next_block_height * 500_000) // Estimate based on block height
-                                    }
-                                } else {
-                                    // v3.4: CRITICAL - Clear broadcast flag before continue
-                                    crate::unified_p2p::BLOCK_BROADCAST_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
-                                    tokio::time::sleep(Duration::from_millis(200)).await;
-                                    continue;
-                                }
-                            },
-                            Err(e) => {
-                                let retry = POH_WAIT_RETRY.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-                                println!("[ERR][MB] poh_load_err h={} err={} retry={}/5", next_block_height - 1, e, retry);
-                                
-                                if retry >= 5 {
-                                    // FALLBACK: Use local PoH to prevent node from getting stuck
-                                    POH_WAIT_RETRY.store(0, std::sync::atomic::Ordering::SeqCst);
-                                    println!("[WARN][MB] poh_fallback_on_error retries={}", retry);
-                                    if let Some(ref poh) = poh {
-                                        let (hash, count, _slot) = poh.get_state().await;
-                                        (hash, count)
-                                    } else {
-                                        (vec![0u8; 64], next_block_height * 500_000) // Estimate based on block height
-                                    }
-                                } else {
-                                    // v3.4: CRITICAL - Clear broadcast flag before continue
-                                    crate::unified_p2p::BLOCK_BROADCAST_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
-                                    tokio::time::sleep(Duration::from_millis(200)).await;
-                                    continue;
-                                }
-                            }
-                        }
-                    } else {
-                        // Block #1: use local PoH or zero
-                        if let Some(ref poh) = poh {
-                            let (hash, count, _slot) = poh.get_state().await;
-                            (hash, count)
-                        } else {
-                            (vec![0u8; 64], 0u64)
-                        }
-                    };
                     
                     // ═══════════════════════════════════════════════════════════════════════════
                     // QUANTUM RANDOMNESS BEACON (QRB) v3.0
-                    // Generate randomness contribution for epoch accumulation (RANDAO-style)
+                    // Generate randomness contribution for epoch accumulation
                     // Each producer contributes signed randomness to beacon
                     // CRITICAL FIX: Use EXISTING PqCrypto instance (don't create new cert!)
                     // ═══════════════════════════════════════════════════════════════════════════
@@ -16507,50 +17001,11 @@ impl BlockchainNode {
                     // output: 32-byte pseudorandom (QRB + leader election)
                     // proof: ~3309-byte ML-DSA-65 detached signature (verifiable)
                     // ═══════════════════════════════════════════════════════════════════
-                    let (qrb_output, qrb_proof) = {
-                        let vrf = Self::get_vrf_static();
-                        if let Some(ref vrf) = vrf {
-                            let slot_seed = crate::crypto::vrf::DilithiumVrf::compute_slot_seed(
-                                &prev_hash, next_block_height,
-                            );
-                            match vrf.evaluate(&slot_seed) {
-                                Ok(vrf_out) => {
-                                if next_block_height % ROTATION_INTERVAL_BLOCKS == 1 {
-                                        println!("[INFO][VRF] h={} dilithium3=true pq=fips204_level3",
-                                                 next_block_height);
-                                    }
-                                    (Some(vrf_out.output), Some(vrf_out.proof))
-                                    }
-                                    Err(e) => {
-                                    println!("[CRIT][VRF] eval_failed h={} err={}", next_block_height, e);
-                                        (None, None)
-                                    }
-                                }
-                            } else {
-                            println!("[CRIT][VRF] not_initialized h={} — QNET_WALLET_SEED required", next_block_height);
-                                (None, None)
-                        }
-                    };
-                    
-                    // CRITICAL v2.32: Block MUST have valid cryptographic proof!
-                    // If crypto failed, skip this block - let emergency failover handle it
-                    if qrb_output.is_none() || qrb_proof.is_none() {
-                        println!("[CRIT][MB] crypto_proof_missing h={}", next_block_height);
-                        println!("[CRIT][MB] production_skipped reason=crypto_recovery");
-                        
-                        // STATE MACHINE: Error state
-                        set_node_state(NodeState::Error {
-                            reason: format!("Crypto failure at block {}", next_block_height),
-                            recoverable: true,
-                        });
-                        
-                        // Skip this block - let another node produce it
-                        // v3.4: CRITICAL - Clear broadcast flag before continue
-                        crate::unified_p2p::BLOCK_BROADCAST_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
-                        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                        continue;
-                    }
-                    
+                    // vrf_output/vrf_proof are no longer produced: the window beacon folds block
+                    // hashes, so the fields carried no consensus information while costing 3.3 KB of
+                    // ML-DSA proof per block (~289 MB/day at 1 s slots).
+                    let (qrb_output, qrb_proof): (Option<[u8; 32]>, Option<Vec<u8>>) = (None, None);
+
                     // ═══ VERIFY-BEFORE-APPLY (mirror the block-validator's verify stage EXACTLY) ═══
                     // Classify + verify the candidate set BEFORE the microblock body is frozen and BEFORE any
                     // state/registry mutation, so an inadmissible tx can never be applied+materialised into
@@ -16627,6 +17082,18 @@ impl BlockchainNode {
                     // v3.18: Calculate fees_collected BEFORE creating microblock
                     // Fees go directly to producer (Pool 2 removed)
                     // ═══════════════════════════════════════════════════════════════════
+                    // Two txs from one sender at the same nonce: the second applies Ok without debiting
+                    // (idempotent branch), so it pays nothing and earns nothing — it would just occupy
+                    // block space. Drop it here; this is block CONTENT selection, not a validity rule,
+                    // so it cannot diverge from a validator (which charges neither of them either).
+                    {
+                        let mut seen: std::collections::HashSet<(String, u64)> = std::collections::HashSet::new();
+                        let before = txs.len();
+                        txs.retain(|tx| tx.gas_limit == 0 || seen.insert((tx.from.clone(), tx.nonce)));
+                        if txs.len() != before && is_warn() {
+                            println!("[WARN][MB] dup_nonce_dropped h={} count={}", next_block_height, before - txs.len());
+                        }
+                    }
                     let mut block_fees_collected: u64 = 0;
                     let mut block_gas_used: u64 = 0;
                     let mut block_fuel_used: u64 = 0;
@@ -16635,7 +17102,9 @@ impl BlockchainNode {
                     for (idx, tx) in txs.iter().enumerate() {
                         // QUANTUM v2.25: Use effective_gas_price() for +50% Dilithium TX fee
                         // v3.36: Use compute_gas_used() for metered blocks (EIP-1559 gas refund)
-                        if !tx.from.starts_with("system_") && tx.gas_price > 0 && tx.gas_limit > 0 {
+                        // RESOURCE set: wider than the fee set — gas_price == 0 pays nothing but
+                        // still consumes compute. The receive-side gate uses this exact predicate.
+                        if !tx.from.starts_with("system_") && tx.gas_limit > 0 {
                             let charged_gas = if next_block_height >= qnet_state::GAS_METERING_ACTIVATION_HEIGHT {
                                 tx.compute_gas_used()
                             } else {
@@ -16654,8 +17123,11 @@ impl BlockchainNode {
                             }
                             block_gas_used = new_gas;
                             block_fuel_used = new_fuel;
-                            let fee_amount = tx.effective_gas_price().saturating_mul(charged_gas);
-                            block_fees_collected = block_fees_collected.saturating_add(fee_amount);
+                            // FEE set: unchanged — apply Phase 3 recomputes this exact filter.
+                            if tx.gas_price > 0 {
+                                let fee_amount = tx.effective_gas_price().saturating_mul(charged_gas);
+                                block_fees_collected = block_fees_collected.saturating_add(fee_amount);
+                            }
                         }
                     }
                     // FIX R22-B5: Truncate TX list if the block gas OR fuel limit was reached
@@ -16687,8 +17159,6 @@ impl BlockchainNode {
                         signature: vec![0u8; 64], // populated below by sign_microblock
                         merkle_root: Self::calculate_merkle_root(&txs),
                         previous_hash: prev_hash,
-                        poh_hash: poh_hash.clone(),
-                        poh_count,
                         vrf_output: qrb_output,
                         vrf_proof: qrb_proof,
                         fees_collected: block_fees_collected,
@@ -16724,6 +17194,51 @@ impl BlockchainNode {
                         } else { None },
                     };
                     
+                    // Authority re-check — the LAST point with zero side effects. A failover
+                    // certificate can land while this block is being assembled; producing then
+                    // means two blocks for one position. Everything below mutates shared state
+                    // (transactions, supply, fees, merkle) and writes durable rows, and the
+                    // producer path has no snapshot to roll back — so yielding must happen here,
+                    // not after. Yielding costs one empty slot; yielding late costs a diverged
+                    // state_root, a vote outside 2f+1, and a stalled checkpoint.
+                    {
+                        let round_now = crate::unified_p2p::highest_certified_round_for(next_block_height / 90);
+                        if round_now > certified_abs {
+                            println!("[WARN][PROD] production_yielded h={} round_at_start={} round_now={} reason=authority_changed",
+                                     next_block_height, certified_abs, round_now);
+                            crate::unified_p2p::BLOCK_BROADCAST_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
+                            continue;
+                        }
+                        // Slot already filled (a peer's block for this height landed while we were
+                        // assembling). Checked HERE, with the authority test, because every abort
+                        // below this point leaves state mutated with nothing to roll it back: the
+                        // producer would then sign a state_root no validator can reproduce.
+                        if next_block_height > 0 {
+                            if let Ok(Some(_)) = storage.load_microblock(next_block_height) {
+                                println!("[WARN][PROD] production_yielded h={} reason=slot_occupied", next_block_height);
+                                crate::unified_p2p::BLOCK_BROADCAST_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
+                                continue;
+                            }
+                        }
+                        // A claim this node cannot resolve is knowable from the selected TXs, so decide
+                        // it HERE. Discovering it during the inline apply is too late: that path has no
+                        // snapshot, so the mutations would stand and this node would sign a state_root
+                        // no validator reproduces.
+                        if let Err(certifying_mb) =
+                            crate::reward_epoch::claims_resolvable(&storage, &txs, next_block_height) {
+                            println!("[WARN][PROD] production_yielded h={} reason=claim_unresolvable certifying_mb={}",
+                                     next_block_height, certifying_mb);
+                            if let Some(p2p) = &unified_p2p {
+                                let p = p2p.clone();
+                                tokio::spawn(async move {
+                                    let _ = p.sync_macroblocks_repair(certifying_mb, certifying_mb).await;
+                                });
+                            }
+                            crate::unified_p2p::BLOCK_BROADCAST_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
+                            continue;
+                        }
+                    }
+
                     // ═══════════════════════════════════════════════════════════════════════════
                     // v3.27: COMPUTE STATE ROOT - TOP L1 PATTERN
                     // MUST happen BEFORE signing so signature covers state_root!
@@ -16746,6 +17261,15 @@ impl BlockchainNode {
                     // QRC-20 owns-index deltas for THIS producer's block — collected under the state lock,
                     // persisted AFTER the block is durably saved (below), so the watermark never leads the tip.
                     let mut block_owns: Vec<qnet_state::OwnsDelta> = Vec::new();
+                    // WASM logs + their token-transfer rows for THIS block. Same discipline as block_owns:
+                    // collected under the lock, WRITTEN only after the block claims the slot. logs_root is a
+                    // consensus commitment, and the writer (reset_block_token_data) deletes h's rows
+                    // unconditionally — doing that before the claim lets a same-height sibling that reaches
+                    // apply in the gap erase this block's logs, diverging our window logs_root from the
+                    // committee's and dropping us out of that window's 2f+1.
+                    let mut block_logs: Vec<(String, String, Vec<u8>)> = Vec::new();
+                    let mut block_token_rows: Vec<crate::storage::TokenTransferRow> = Vec::new();
+                    let mut side_idx = BlockSideIndices::default();
                     {
                         let state_guard = state.write().await;
 
@@ -16756,19 +17280,14 @@ impl BlockchainNode {
                         // clear-once/drain-once bracket could straddle a worker-thread migration and
                         // strand entries. clear→(sync)apply→drain around each tx keeps push+drain on one
                         // thread; the accumulator is a plain Vec, so it survives awaits safely.
-                        let mut block_logs: Vec<(String, String, Vec<u8>)> = Vec::new();
-                        // Metered WASM-compute fees for THIS producer's own block (heights >= metering
-                        // activation), credited on top of the flat block_fees_collected — computed the
-                        // SAME way the validator does in apply_block_to_state so both credit the identical
-                        // total (no reward / state_root divergence between producer and validators).
+                        // Fees for THIS producer's own block, accrued ONLY on apply-Ok — the header's
+                        // block_fees_collected is a pre-execution estimate over the whole tx list, and a
+                        // failed tx is never debited. Computed the SAME way the validator does in
+                        // apply_block_to_state so both credit the identical total (no state_root split).
+                        let mut block_flat_fees: u64 = 0;
                         let mut block_wasm_fuel_fees: u64 = 0;
                         // 1. Apply all transactions
                         for tx in &txs {
-                            // Index Light eligibility bitmaps via the SHARED helper (byte-identical to
-                            // the validator apply path) so the producer of a bitmap block stamps its own
-                            // shard → no reward_root divergence at the emission boundary.
-                            Self::index_light_eligibility_bitmap(&storage, next_block_height, tx);
-
                             // v3.33: Handle CLAIM transactions on producer side
                             if tx.tx_type == qnet_state::TransactionType::RewardDistribution
                                && tx.from == "system_rewards_pool" {
@@ -16799,8 +17318,25 @@ impl BlockchainNode {
                                 // (watermark-idempotent). The producer applies its own block inline, so
                                 // without this it stays one emission short → checkpoint total_supply
                                 // diverges from peers → macroblock never reaches 2f+1.
+                                // Mirror the validator's gate EXACTLY (apply_block_to_state Phase 1).
+                                // The producer built this amount itself, so a mismatch is a build bug —
+                                // but minting what validators will refuse is precisely how the producer
+                                // ends up with a total_supply no one else has, so both sides must reach
+                                // the same verdict from the same inputs.
+                                let emission_ok = match Self::expected_emission_amount(next_block_height) {
+                                    crate::node::EmissionExpectation::Exact(expected) if expected == tx.amount => true,
+                                    other => {
+                                        println!("[ERR][EMISSION] self_amount_rejected h={} claimed={} expectation={:?} action=skip_mint",
+                                                 next_block_height, tx.amount, other);
+                                        false
+                                    }
+                                };
                                 let emb = Self::emission_mb_index(next_block_height);
-                                match state_guard.emit_rewards(tx.amount, emb) {
+                                match if emission_ok {
+                                    state_guard.emit_rewards(tx.amount, emb)
+                                } else {
+                                    Ok(0) // skip the call outright, exactly as the validator does
+                                } {
                                     Ok(m) if m > 0 => {
                                         if is_info() {
                                             println!("[INFO][STATE] emission_minted_inline mb={} amount={} total={} QNC h={}",
@@ -16819,10 +17355,15 @@ impl BlockchainNode {
                             // clear→apply→drain brackets THIS tx's WASM logs on one thread (see block_logs).
                             qnet_state::wasm_exec::clear_wasm_logs();
                             let owns_mark = block_owns.len();
+                            // Mirror of the validator path: unconditional, collected not written.
+                            Self::collect_light_eligibility_bitmap(&mut side_idx.light_bitmaps, next_block_height, tx);
                             let apply_result = state_guard.apply_transaction_lazy_at_indexed(tx, next_block_height, &mut block_owns);
                             // Take this tx's WASM fuel ONCE, same thread, right after apply (resets the
                             // slot for the next tx) — byte-identical to the validator apply path.
                             let tx_wasm_fuel = qnet_state::wasm_exec::take_last_tx_wasm_fuel();
+                            // Mirror of the validator: an already-consumed nonce applies Ok without
+                            // debiting, so it earns no refund and no fee credit.
+                            let charged = apply_result.as_ref().map_or(false, |o| o.charged);
                             if let Err(e) = apply_result {
                                 // Rejected tx: drop any owns-deltas it emitted (its mutations were discarded).
                                 block_owns.truncate(owns_mark);
@@ -16831,12 +17372,22 @@ impl BlockchainNode {
                                 }
                             } else {
                                 block_logs.extend(qnet_state::wasm_exec::drain_wasm_logs());
-                                let _ = state_guard.apply_gas_refund(tx, next_block_height, tx_wasm_fuel);
-                                // Accrue the metered WASM-compute fee (above activation), mirroring the
-                                // validator so both credit the identical flat+fuel producer total.
-                                if next_block_height >= qnet_state::GAS_METERING_ACTIVATION_HEIGHT
-                                    && !tx.from.starts_with("system_") && tx.gas_price > 0 && tx.gas_limit > 0 {
-                                    block_wasm_fuel_fees = block_wasm_fuel_fees.saturating_add(tx.wasm_fuel_fee(tx_wasm_fuel));
+                                if charged {
+                                    let _ = state_guard.apply_gas_refund(tx, next_block_height, tx_wasm_fuel);
+                                }
+                                // Accrue this tx's NET fee (flat + metered WASM compute above activation),
+                                // mirroring the validator so both credit the identical producer total.
+                                if charged && !tx.from.starts_with("system_") && tx.gas_price > 0 && tx.gas_limit > 0 {
+                                    let charged_gas = if next_block_height >= qnet_state::GAS_METERING_ACTIVATION_HEIGHT {
+                                        tx.compute_gas_used()
+                                    } else {
+                                        tx.gas_limit
+                                    };
+                                    block_flat_fees = block_flat_fees
+                                        .saturating_add(tx.effective_gas_price().saturating_mul(charged_gas));
+                                    if next_block_height >= qnet_state::GAS_METERING_ACTIVATION_HEIGHT {
+                                        block_wasm_fuel_fees = block_wasm_fuel_fees.saturating_add(tx.wasm_fuel_fee(tx_wasm_fuel));
+                                    }
                                 }
                                 // Track BOTH NodeRegistration AND NodeActivation: the producer materialises
                                 // the SAME registry rows the validator's deferred_registrations does (incl.
@@ -16857,21 +17408,13 @@ impl BlockchainNode {
                             }
                         }
 
-                        // Persist this producer's OWN block WASM logs (validators persist theirs via
-                        // apply_block_to_state's drain) — closes the producer-side getLogs hole and makes
-                        // the producer's window logs_root match peers at activation. Plain Vec ⇒ await-safe.
-                        // Reorg-consistency (mirror validator): re-applied block fully replaces h data.
-                        storage.reset_block_token_data(next_block_height);
+                        // Token-transfer rows for this block's logs — decided HERE because it reads the
+                        // accounts map (contract type) and must see the same state the block was applied
+                        // against. The rows and the logs are written after the save (see below).
                         if !block_logs.is_empty() {
-                            if let Err(e) = storage.save_block_logs(next_block_height, &block_logs) {
-                                if crate::node::is_warn() {
-                                    println!("[WARN][LOGS] block_logs_persist_failed h={} err={} (logs_root will diverge → stall out of 2f+1 until resync)", next_block_height, e);
-                                }
-                            }
-                            // P1: index this block's success-gated token transfers (identical to validator path).
-                            Self::index_block_token_transfers(&*storage, &state_guard.accounts, next_block_height, microblock.timestamp, &block_logs);
-                            // Sharded logs: store this block's level-1 sub-root (identical to validator path).
-                            let _ = storage.save_block_logs_root(next_block_height, &Self::block_logs_root_of(&block_logs));
+                            block_token_rows = Self::build_token_transfer_rows(
+                                &state_guard.accounts, next_block_height, microblock.timestamp, &block_logs,
+                            );
                         }
 
                         // Owns-index (NON-consensus): persisted AFTER the block is durably saved (see the
@@ -16880,7 +17423,7 @@ impl BlockchainNode {
                         // gate would skip the rebuild over a block that never landed.
 
                         // Epoch-boundary super reward-eligibility snapshot (same fn as the apply path).
-                        Self::populate_super_elig_at_boundary(&state_guard, &*storage, next_block_height);
+                        side_idx.super_eligible = Self::compute_super_eligible_at_settle(&state_guard, &*storage, next_block_height);
                         // light_elig is a read-only recency index (backfilled at boot) — snapshot it OFF the
                         // state write-lock so the O(roster) scan never stalls the producer at scale.
                         if next_block_height != 0 && next_block_height % 14400 == 0 {
@@ -16892,7 +17435,13 @@ impl BlockchainNode {
 
                         // v3 merkle-claim credit (same fn as the apply path) BEFORE state_root so a
                         // producer crediting claims in its OWN block matches validators (no state_root split).
-                        Self::apply_merkle_claims(&state_guard, &*storage, &txs, None);
+                        // Unreachable: claims_resolvable ran at the zero-side-effect point above over
+                        // the same TXs and storage. Reaching it means that invariant broke.
+                        if let Err(certifying_mb) =
+                            Self::apply_merkle_claims(&state_guard, &*storage, &txs, next_block_height, None) {
+                            println!("[CRIT][REWARDS] claim_unresolvable_after_precheck certifying_mb={} h={}",
+                                     certifying_mb, next_block_height);
+                        }
 
                         // Merkle-only rewards: no eager accrual (emission writes the reward_root; claims
                         // credit later by proof). fork_was_active retained only for the legacy flag log below.
@@ -16916,21 +17465,24 @@ impl BlockchainNode {
                         // 3. Credit fees to producer (atomic): flat fees + metered WASM compute. The
                         // validator recomputes the IDENTICAL total in apply_block_to_state Phase 3, so
                         // producer and validators agree (no reward / state_root divergence).
-                        let producer_credit = block_fees_collected.saturating_add(block_wasm_fuel_fees);
+                        let producer_credit = block_flat_fees.saturating_add(block_wasm_fuel_fees);
                         // Producer fee-credit wallet for the rich-list touched-set (mirror of the
                         // validator path): captured only when a credit is actually applied.
                         let mut richlist_producer_wallet: Option<String> = None;
                         if producer_credit > 0 && !producer_wallet.is_empty() {
                             richlist_producer_wallet = Some(producer_wallet.clone());
+                            // None: the producer-inline path has no block journal and never rolls
+                            // back, so nothing may release this marker (see rollback_block).
                             match state_guard.credit_producer_fees_once(
                                 next_block_height,
                                 &producer_wallet,
-                                producer_credit
+                                producer_credit,
+                                None,
                             ) {
                                 Ok(true) => {
-                                    if is_info() && block_fees_collected > 10_000_000 {
+                                    if is_info() && producer_credit > 10_000_000 {
                                         println!("[INFO][FEES] producer_credited h={} fees={} nanoQNC",
-                                                 next_block_height, block_fees_collected);
+                                                 next_block_height, producer_credit);
                                     }
                                 }
                                 Ok(false) => {
@@ -16951,7 +17503,8 @@ impl BlockchainNode {
 
                         // Rich-list index (display-only, best-effort): reconcile this block's touched
                         // holders. SAME touched-set as the validator apply path.
-                        Self::reconcile_richlist_for_block(&state_guard, &*storage, &microblock, richlist_producer_wallet.as_deref());
+                        side_idx.richlist =
+                            Self::reconcile_richlist_for_block(&state_guard, &microblock, richlist_producer_wallet.as_deref());
 
                         if is_debug() {
                             println!("[DBG][STATE] state_root computed h={} root={}",
@@ -16966,52 +17519,6 @@ impl BlockchainNode {
                     // won't back (the consensus-root divergence that permanently split a producer from
                     // 2f+1). Mirror of the validator: materialise after acceptance, before save.
 
-                    // QUANTUM VTS: Mix microblock into VTS chain for cryptographic time proof
-                    if let Some(ref poh) = poh {
-                        let block_data = bincode::serialize(&microblock).unwrap_or_default();
-                        match poh.create_microblock_proof(&block_data).await {
-                            Ok(poh_entry) => {
-                                // CRITICAL FIX: If local PoH is behind network, sync it forward first!
-                                // This prevents nodes from getting stuck when receiving blocks from faster nodes
-                                if poh_entry.num_hashes <= poh_count {
-                                    println!("[WARN][POH] local_behind local={} network={}", 
-                                            poh_entry.num_hashes, poh_count);
-                                    
-                                    // Sync local PoH to network state + small increment
-                                    let synced_count = poh_count + 500_001; // Ensure we're ahead
-                                    poh.sync_from_checkpoint(&microblock.poh_hash, synced_count).await;
-                                    
-                                    // Create new proof with synced PoH
-                                    match poh.create_microblock_proof(&block_data).await {
-                                        Ok(synced_entry) => {
-                                            println!("[INFO][POH] mixed_after_sync h={} count={}",
-                                                    microblock_height, synced_entry.num_hashes);
-                                            microblock.poh_hash = synced_entry.hash;
-                                            microblock.poh_count = synced_entry.num_hashes;
-                                        },
-                                        Err(e) => {
-                                            println!("[WARN][POH] mix_after_sync_failed err={}", e);
-                                            // Use network baseline + increment as fallback
-                                            microblock.poh_count = synced_count;
-                                        }
-                                    }
-                                } else {
-                                    println!("[INFO][POH] mixed h={} count={}",
-                                            microblock_height, poh_entry.num_hashes);
-                                    // Update block with new PoH state after mixing
-                                    microblock.poh_hash = poh_entry.hash;
-                                    microblock.poh_count = poh_entry.num_hashes;
-                                }
-                            },
-                            Err(e) => {
-                                println!("[WARN][POH] mix_failed h={} err={} using_baseline", microblock_height, e);
-                                // Fallback: use baseline + increment instead of skipping
-                                // This prevents nodes from getting stuck
-                                microblock.poh_count = poh_count + 500_001;
-                            }
-                        }
-                    }
-                    
                     // PRODUCTION: Generate CRYSTALS-Dilithium signature for microblock
                     match Self::sign_microblock_with_dilithium(&microblock, &node_id, unified_p2p.as_ref()).await {
                         Ok(signature) => {
@@ -17057,6 +17564,7 @@ impl BlockchainNode {
                             println!("[ERR][CRYPTO] Failed to sign microblock #{}: {}", microblock_height, e);
                             // v3.4: CRITICAL - Clear broadcast flag before continue
                             crate::unified_p2p::BLOCK_BROADCAST_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
+                            Self::abandon_inline_apply(microblock_height, next_block_height, "sign_failed");
                             continue; // Skip this block if signing fails
                         }
                     }
@@ -17076,8 +17584,8 @@ impl BlockchainNode {
                     // Validate microblock (production checks)
                     if let Err(e) = Self::validate_microblock_production(&microblock) {
                         println!("[ERR][PROD] validation_failed err={}", e);
-                        // v3.4: CRITICAL - Clear broadcast flag before continue
                         crate::unified_p2p::BLOCK_BROADCAST_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
+                        Self::abandon_inline_apply(microblock_height, microblock.height, "validate_failed");
                         continue;
                     }
                     
@@ -17090,16 +17598,6 @@ impl BlockchainNode {
                     // Calculate TPS for this microblock
                     let tps = (txs.len() as f64) / current_interval.as_secs_f64();
                     
-                    // CRITICAL: Check if block already exists to prevent forks (skip for genesis)
-                    if microblock.height > 0 {
-                        if let Ok(Some(_)) = storage.load_microblock(microblock.height) {
-                            println!("[WARN][PROD] Block #{} already exists, skipping creation to prevent fork", microblock.height);
-                            // v3.4: CRITICAL - Clear broadcast flag before continue
-                            crate::unified_p2p::BLOCK_BROADCAST_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
-                            continue;
-                        }
-                    }
-
                     // Serialize the (now final) microblock BEFORE materialising durable registry state, so the
                     // ONLY step remaining after the seals is the block save — a serialize failure aborts with
                     // zero durable registry/seal writes (no orphaned registry_root delta).
@@ -17108,6 +17606,7 @@ impl BlockchainNode {
                         Err(e) => {
                             println!("[ERR][PROD] serialize_fail h={} err={}", microblock.height, e);
                             crate::unified_p2p::BLOCK_BROADCAST_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
+                            Self::abandon_inline_apply(microblock_height, microblock.height, "serialize_failed");
                             continue;
                         }
                     };
@@ -17133,7 +17632,8 @@ impl BlockchainNode {
                             } => {
                                 // Single canonical derivation (vrf super-only + cbw), byte-identical to the
                                 // peer-apply path — else the producer's own registry_root row diverges → fork.
-                                Self::write_registration_row(&storage, rid, rtype, rwallet, rburn, tx.dilithium_public_key.as_ref(), next_block_height);
+                                let rpk = Self::registration_consensus_pk(tx);
+                                Self::write_registration_row(&storage, rid, rtype, rwallet, rburn, rpk.as_ref(), next_block_height);
                             }
                             qnet_state::TransactionType::NodeActivation { node_type: ntype, phase, .. } => {
                                 // Mirror apply_block_to_state EXACTLY: Phase2 stamps NO registry rows (pool3
@@ -17198,18 +17698,36 @@ impl BlockchainNode {
                     // Save synchronously to ensure block exists before height increment
                     // This is FAST (just RocksDB write, ~10-50ms) and prevents race conditions
                     let save_result = storage_clone.save_block_with_delta(height_for_storage, &microblock_data);
-                    
-                    if let Ok(_) = save_result {
-                        // Publish the applied frontier the instant the block is durably stored, so
-                        // the invariant "block H in storage ⟺ LOCAL_BLOCKCHAIN_HEIGHT >= H" holds on
-                        // the producer path too (the apply-stage dedup fast-path relies on it). Without
-                        // this, a gossip-echo of our own block H arriving before the height publish
-                        // ~290 lines below would re-enter apply as a false non-duplicate (caught only
-                        // by the downstream state_root check). Idempotent with the height-bump below.
+
+                    // Anything but Stored means the block is NOT on disk, so it must not take the
+                    // commit branch below, which publishes the serve horizon and the finalized-round
+                    // baseline.
+                    if let Ok(crate::storage::SaveOutcome::Stored) = save_result {
+                        // Block logs (CONSENSUS: feeds the window logs_root, gate height 0) FIRST —
+                        // after the save, so a block that lost the slot race can never erase the
+                        // canonical block's rows, but BEFORE the height is published below. Publishing
+                        // the height first would open a window in which a window-end checkpoint task
+                        // sees block h as present and reads no logs for it, folding [0;32] into a
+                        // logs_root every peer computes differently. Every other gate that compute
+                        // reads (state_root in the block, dilithium_pk_root seal, total_supply seal)
+                        // is already satisfied before this point. reset_ stays unconditional so a
+                        // re-applied block fully replaces h's rows.
+                        side_idx.block_logs = std::mem::take(&mut block_logs);
+                        side_idx.token_rows = std::mem::take(&mut block_token_rows);
+                        Self::flush_block_side_indices(&storage, height_for_storage, &side_idx);
+
+                        // Publish the applied frontier now that the block AND its consensus-visible
+                        // side data are durable, so the invariant "block H in storage ⟺
+                        // LOCAL_BLOCKCHAIN_HEIGHT >= H" holds on the producer path too (the apply-stage
+                        // dedup fast-path relies on it). Without this, a gossip-echo of our own block H
+                        // arriving before the height publish ~290 lines below would re-enter apply as a
+                        // false non-duplicate (caught only by the downstream state_root check).
+                        // Idempotent with the height-bump below.
                         crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(
                             height_for_storage,
                             std::sync::atomic::Ordering::Release,
                         );
+                        crate::unified_p2p::note_block_stored(height_for_storage);
 
                         // Owns-index (NON-consensus): now that block H is durable, persist its deltas +
                         // advance the durable watermark — same after-save order as the validator pipeline,
@@ -17391,10 +17909,63 @@ impl BlockchainNode {
                             }
                         });
                     } else {
-                        println!("[ERR][NODE] microblock_save_failed h={}", height_for_storage);
-                        // Continue anyway - block will be retried
+                        // Fail-closed. This block was applied INLINE and the producer path has no
+                        // snapshot, so the mutations (transactions, mint, fee credit) are already in
+                        // state with nothing to reverse them. Broadcasting on top of that shipped a
+                        // block the node itself does not hold; the peers would build on it while this
+                        // node re-produced the same height. Two distinct cases:
+                        //   DeclinedRollback — a rollback is already driving to a lower target and
+                        //     will rebuild state; just drop the block.
+                        //   NotStoredMode — this node's storage keeps no blocks (a Super only reaches
+                        //     this through disk-pressure degradation). A fork recovery cannot fix a
+                        //     full disk, so escalating would spin forever; it is an operational fault
+                        //     and the node must stop producing, not silently re-produce over an
+                        //     inline apply nothing reversed.
+                        //   error — the store is the suspect; force fork recovery to rebuild state
+                        //     from a durable point, which is the only thing that can undo the inline
+                        //     apply (a hand-rolled reversal here would have to mirror every side
+                        //     effect of the apply path and would diverge the moment that path grows).
+                        match &save_result {
+                            Ok(crate::storage::SaveOutcome::DeclinedRollback) => {
+                                let (_in_progress, target) = crate::storage::get_rollback_status();
+                                println!("[WARN][NODE] microblock_save_declined h={} rollback_target={} action=drop",
+                                         height_for_storage, target);
+                            }
+                            Ok(crate::storage::SaveOutcome::NotStoredMode) => {
+                                // Same contamination as the pre-save aborts: the inline apply already
+                                // mutated RAM and nothing reverses it.
+                                Self::abandon_inline_apply(height_for_storage.saturating_sub(1),
+                                                           height_for_storage, "not_stored_mode");
+                            }
+                            Ok(crate::storage::SaveOutcome::Stored) => unreachable!("handled above"),
+                            Err(e) => {
+                                // Classify exactly as the pipeline does: a slot already held by a
+                                // canonical block we applied is a RACE, not a fault. Suspending
+                                // production on it retires an honest producer for the life of the
+                                // process, and those races are commonplace right after genesis.
+                                let err_text = format!("{:?}", e);
+                                let benign_race = err_text.contains("fork_conflict")
+                                    || err_text.contains("save_declined_rollback")
+                                    || err_text.contains("save_declined_not_stored");
+                                if !benign_race {
+                                    Self::abandon_inline_apply(height_for_storage.saturating_sub(1),
+                                                               height_for_storage, "save_failed");
+                                }
+                                println!("[{}][NODE] microblock_save_failed h={} err={:?} benign_race={} action=fork_recovery",
+                                         if benign_race { "WARN" } else { "ERR" },
+                                         height_for_storage, e, benign_race);
+                                let floor = LAST_FINALIZED_HEIGHT.load(std::sync::atomic::Ordering::SeqCst)
+                                    .max(SNAPSHOT_ANCHOR_MB.load(std::sync::atomic::Ordering::Acquire).saturating_mul(90));
+                                let target = height_for_storage.saturating_sub(1).max(floor).max(1);
+                                if target < height_for_storage {
+                                    crate::block_pipeline::signal_fork_recovery(target);
+                                }
+                            }
+                        }
+                        crate::unified_p2p::BLOCK_BROADCAST_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
+                        continue;
                     }
-                    
+
                     // OPTIMIZATION: ASYNC broadcast after storage save
                     // Block is already saved in storage, so we can broadcast async
                     // This allows 1 block/second production without waiting for broadcast
@@ -17899,6 +18470,7 @@ impl BlockchainNode {
                                         if sync_success {
                                             println!("[INFO][SYNC] failover_resolved h={} action=clearing",
                                                      expected_height_timeout);
+                                            clear_stuck_restart_state();
                                             FAILOVER_IN_PROGRESS.store(false, Ordering::Relaxed);
                                             return;
                                         } else {
@@ -17957,13 +18529,21 @@ impl BlockchainNode {
                                             }
 
                                             if stuck_duration > 600 {
-                                                // Stuck for 10+ minutes on the same block despite reconnects.
-                                                // This node is in an unrecoverable local state.
-                                                // Self-restart is the safest recovery: Docker will restart the
-                                                // container with clean QUIC connections and fresh state.
-                                                println!("[CRIT][FAILOVER] h={} stuck_for={}s action=self_restart",
-                                                         expected_height_timeout, stuck_duration);
-                                                std::process::exit(1);
+                                                // Restart only helps against local transport/state rot. If the
+                                                // block is unobtainable for a structural reason, restarting is
+                                                // pure harm: it wipes RAM consensus state (certified rounds,
+                                                // banked votes, adopt buffers) that recovery needs to accumulate.
+                                                // The attempt counter is persisted, so the loop cannot reset
+                                                // itself by restarting — past the budget the node stays up,
+                                                // degraded and loud, and keeps syncing.
+                                                let attempts = record_stuck_restart_attempt(expected_height_timeout);
+                                                if attempts <= MAX_STUCK_SELF_RESTARTS {
+                                                    println!("[CRIT][FAILOVER] h={} stuck_for={}s attempt={}/{} action=self_restart",
+                                                             expected_height_timeout, stuck_duration, attempts, MAX_STUCK_SELF_RESTARTS);
+                                                    std::process::exit(1);
+                                                }
+                                                println!("[CRIT][FAILOVER] h={} stuck_for={}s attempts={} action=stay_up_degraded reason=restart_budget_exhausted",
+                                                         expected_height_timeout, stuck_duration, attempts);
                                             }
 
                                             // Targeted frontier repair exhausted → hand off to the single
@@ -18271,11 +18851,10 @@ impl BlockchainNode {
         own_node_id: &str,
         own_node_type: NodeType,
         storage: Option<&Arc<Storage>>,
-        poh: &Option<Arc<crate::poh::PoH>>,
     ) -> String {
         // v3.8: Wrapper that calls internal function with timeout_round=0 (normal selection)
         Self::select_microblock_producer_with_round(
-            current_height, unified_p2p, own_node_id, own_node_type, storage, poh, 0
+            current_height, unified_p2p, own_node_id, own_node_type, storage, 0
         ).await
     }
     
@@ -18288,7 +18867,6 @@ impl BlockchainNode {
         own_node_id: &str,
         own_node_type: NodeType,
         storage: Option<&Arc<Storage>>,
-        _poh: &Option<Arc<crate::poh::PoH>>,
         timeout_round: u64,
     ) -> String {
         // PRODUCTION: deterministic PUBLIC leader election — leader = hash(N-2 macroblock seed ‖ round) % N.
@@ -18316,12 +18894,12 @@ impl BlockchainNode {
             // v2.96: Lock-free DashMap for hot path performance
             use producer_cache::CACHED_PRODUCER_SELECTION;
             
-            // CRITICAL FIX: Don't use cache if synchronization state might affect PoH usage
-            // Cache is only valid if all nodes have the same PoH availability
+            // A cached selection is only sound once this node holds every block of the PREVIOUS
+            // round: the selection reads that round's chain state, so caching it while still behind
+            // would pin a producer the rest of the network never elected.
             let mut can_use_cache = if leadership_round == 0 {
                 true  // Round 0 is always deterministic, cache is safe
             } else if let Some(store) = storage {
-                // For PoH rounds, check if we're fully synchronized
                 // CONSERVATIVE: Wait for FULL round completion before using cache
                 // This ensures all nodes have processed the entire previous round
                 let required_block = match leadership_round {
@@ -18547,23 +19125,31 @@ impl BlockchainNode {
                             if is_debug() { println!("[DBG][FINALITY] h={} ep={} mb={}", current_height, current_epoch, required_macroblock); }
                         }
                         
-                        // Single resolver: exact N-2 or bounded walk-back to the SAME
-                        // macroblock the candidate set uses — seed and set never diverge.
-                        match Self::resolve_producer_source_macroblock(store.as_ref(), required_macroblock) {
-                            Some((used_idx, mb)) => {
-                                if used_idx != required_macroblock && is_warn() {
-                                    println!("[WARN][FINALITY] seed_fallback used_mb={} wanted_mb={} h={}",
-                                             used_idx, required_macroblock, current_height);
+                        // A1: seed and candidate set MUST anchor on the same object, or a frozen roster
+                        // paired with a stale/zero seed elects a producer no one else does.
+                        //  - Sealed: exact N-2 macroblock hash.
+                        //  - Frozen: FrozenEntropy over M_A + this epoch's N-2 window index (R5).
+                        //  - Defer:  abstain (zero seed), same as truly-behind.
+                        match Self::roster_mode(store.as_ref(), current_epoch) {
+                            RosterMode::Sealed => match Self::resolve_producer_source_macroblock(store.as_ref(), required_macroblock) {
+                                Some((_used_idx, mb)) => Self::hash_macroblock_entropy(&mb),
+                                None => {
+                                    println!("[ERR][FINALITY] mb={} unresolved desync=true", required_macroblock);
+                                    set_node_state(NodeState::WaitingForMacroblock {
+                                        epoch: required_macroblock, macroblock_index: required_macroblock });
+                                    [0u8; 32]
                                 }
-                                Self::hash_macroblock_entropy(&mb)
                             },
-                            None => {
-                                // Not resolvable within the walk-back window → truly behind.
-                                println!("[ERR][FINALITY] mb={} unresolved desync=true", required_macroblock);
+                            RosterMode::Frozen => {
+                                let l = store.last_sealed_mb_index();
+                                match Self::frozen_anchor(store.as_ref(), l) {
+                                    Some((_a, anchor)) => Self::frozen_entropy(&anchor, current_epoch),
+                                    None => [0u8; 32], // anchor unusable ⇒ abstain (park)
+                                }
+                            }
+                            RosterMode::Defer => {
                                 set_node_state(NodeState::WaitingForMacroblock {
-                                    epoch: required_macroblock,
-                                    macroblock_index: required_macroblock,
-                                });
+                                    epoch: required_macroblock, macroblock_index: required_macroblock });
                                 [0u8; 32]
                             }
                         }
@@ -18705,7 +19291,10 @@ impl BlockchainNode {
     /// entropy). consensus_data is EXCLUDED (it carries next_leader, which differs mid-consensus).
     fn hash_macroblock_entropy(mb: &qnet_state::MacroBlock) -> [u8; 32] {
         let mut hasher = Sha3_256::new();
-        hasher.update(b"QNet_Deterministic_Entropy_v2.32");
+        // Domain bumped with the macroblock preimage change (PoH fields removed): the tag must
+        // change whenever the hashed field set does, or two builds derive different entropy from
+        // the same tag and elect different producers.
+        hasher.update(b"QNet_Deterministic_Entropy_v2.33");
         hasher.update(&mb.height.to_le_bytes());
         hasher.update(&mb.timestamp.to_le_bytes());
         for block_hash in &mb.micro_blocks {
@@ -18713,51 +19302,130 @@ impl BlockchainNode {
         }
         hasher.update(&mb.state_root);
         hasher.update(&mb.previous_hash);
-        hasher.update(&mb.poh_hash);
-        hasher.update(&mb.poh_count.to_le_bytes());
         let result = hasher.finalize();
         let mut hash = [0u8; 32];
         hash.copy_from_slice(&result);
         hash
     }
 
-    /// Resolve the single finalized macroblock that seeds BOTH the producer/committee
-    /// candidate set AND the VRF entropy for epoch N (required_macroblock = N-2). Exact
-    /// N-2 when it carries an eligible-producers snapshot (or commits); else a deterministic
-    /// bounded walk-back (depth 8) to the most recent finalized macroblock with a non-empty
-    /// eligible set AND a beacon — the SAME predicate the candidate-set / beacon readers use,
-    /// so seed and set can never land on different macroblocks (no honest producer fork).
-    /// None => desync past the window (abstain from this election).
+    /// Frozen horizon: how many windows past the last seal production continues on the frozen anchor
+    /// before a node parks and syncs. Caps unfinalized depth (an unbounded tail is an unbounded reorg).
+    /// 32 windows = 2880 blocks = ~48 minutes.
+    pub(crate) const MAX_DERIVED_ROSTER_WINDOWS: usize = 32;
+
+    /// Frozen-roster disposition for window `w`, from ONE atomic (L, B) read (A1 R1).
+    /// L = newest contiguously-sealed macroblock; B = newest window known QC-certified (B >= L).
+    ///  - Sealed: w-2 <= L          → sealed arm, verbatim.
+    ///  - Defer:  w-2 > L, L < B     → a certified anchor exists but is not held → pull, never derive.
+    ///  - Frozen: w-2 > L, L == B    → finality genuinely stalled → frozen arm (R4-R7).
+    /// Pre-first-seal (L == 0) is never Frozen: there is no sealed anchor to freeze on.
+    pub(crate) fn roster_mode(storage: &Storage, w: u64) -> RosterMode {
+        let l = storage.last_sealed_mb_index();
+        let b = (qc_verified_frontier_cached() / 90).max(l);
+        if w.saturating_sub(2) <= l { RosterMode::Sealed }
+        else if l < b { RosterMode::Defer }
+        else if l >= 1 { RosterMode::Frozen }
+        else { RosterMode::Defer }
+    }
+
+    /// M_A — the anchor a frozen window derives from: the newest sealed macroblock, descending the
+    /// contiguous prefix from L, that carries a usable eligible set AND a beacon (R2.1). Bounded to the
+    /// horizon so a run of unusable seals cannot become an unbounded scan. None ⇒ abstain (park).
+    pub(crate) fn frozen_anchor(storage: &Storage, l: u64) -> Option<(u64, qnet_state::MacroBlock)> {
+        let mut idx = l;
+        for _ in 0..=Self::MAX_DERIVED_ROSTER_WINDOWS {
+            if idx < 1 { return None; }
+            if let Some(mb) = storage.get_macroblock_by_height(idx).ok().flatten()
+                .and_then(Self::macroblock_plaintext)
+                .and_then(|raw| bincode::deserialize::<qnet_state::MacroBlock>(&raw).ok())
+            {
+                let usable = mb.consensus_data.eligible_producers.as_ref()
+                    .and_then(|x| bincode::deserialize::<Vec<qnet_state::EligibleProducer>>(x).ok())
+                    .map(|v| v.iter().any(|p| !p.node_id.is_empty())).unwrap_or(false);
+                if usable && mb.consensus_data.randomness_beacon.is_some() {
+                    return Some((idx, mb));
+                }
+            }
+            idx = idx.saturating_sub(1);
+        }
+        None
+    }
+
+    /// FrozenRoster: M_A's eligible set verbatim, empty ids dropped, canonically sorted — CONSTANT
+    /// across the whole horizon (R4). The per-window committee is sampled from this fixed set.
+    pub(crate) fn frozen_roster(anchor: &qnet_state::MacroBlock) -> Vec<qnet_state::EligibleProducer> {
+        anchor.consensus_data.eligible_producers.as_ref()
+            .and_then(|x| bincode::deserialize::<Vec<qnet_state::EligibleProducer>>(x).ok())
+            .map(|mut v| { v.retain(|p| !p.node_id.is_empty()); v.sort_by(|a, b| a.node_id.cmp(&b.node_id)); v })
+            .unwrap_or_default()
+    }
+
+    /// FrozenEntropy(w): producer + attestation seed during a freeze (R5). Folds only sealed bytes
+    /// (M_A's entropy) and the public window index — no branch-dependent tail.
+    pub(crate) fn frozen_entropy(anchor: &qnet_state::MacroBlock, w: u64) -> [u8; 32] {
+        let mut h = Sha3_256::new();
+        h.update(b"QNET_FROZEN_ENTROPY_V1");
+        h.update(Self::hash_macroblock_entropy(anchor));
+        h.update(w.to_le_bytes());
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&h.finalize());
+        out
+    }
+
+    /// FrozenBeacon(w): committee-sampling seed during a freeze (R6). Folds ZERO post-seal bytes, so
+    /// legal same-height failover siblings above the seal cannot poison it — immunity by construction.
+    pub(crate) fn frozen_beacon(anchor: &qnet_state::MacroBlock, w: u64) -> [u8; 32] {
+        let mut h = Sha3_256::new();
+        h.update(b"QNET_FROZEN_BEACON_V1");
+        h.update(anchor.consensus_data.randomness_beacon.unwrap_or([0u8; 32]));
+        h.update(w.to_le_bytes());
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&h.finalize());
+        out
+    }
+
+    /// FrozenCommittee(w) = sample_committee(FrozenRoster, w, FrozenBeacon(w)) via the single canonical
+    /// sampler (R7). At THRESHOLD=1000 with roster <=1000 this is the identity arm ⇒ == FrozenRoster.
+    /// The barred set from an active restart manifest is filtered here so a restart-tail window derives
+    /// a committee without the excluded identities even off a frozen anchor (restart GAP B).
+    pub(crate) fn frozen_committee(anchor: &qnet_state::MacroBlock, w: u64) -> Vec<String> {
+        let mut ids: Vec<String> = Self::frozen_roster(anchor).into_iter()
+            .map(|p| p.node_id)
+            .filter(|id| !crate::genesis_constants::restart_excludes(id))
+            .collect();
+        if ids.is_empty() { return Vec::new(); }
+        ids.sort();
+        qnet_consensus::checkpoint_bft::sample_committee(
+            &ids, w, &Self::frozen_beacon(anchor, w),
+            Self::COMMITTEE_THRESHOLD, Self::CONSENSUS_COMMITTEE_SIZE)
+    }
+
+    /// Resolve the finalized macroblock that seeds BOTH the producer/committee candidate set AND the
+    /// VRF entropy for epoch N (required_macroblock = N-2). STRICTLY N-2 — there is no walk-back.
+    ///
+    /// The bounded walk-back that used to live here returned the most recent macroblock this node
+    /// happened to hold, which makes the producer entropy a function of local RocksDB contents instead
+    /// of the height: two nodes with different holdings elect different producers for the same slot.
+    /// It was unreachable only because the candidate-set reader happened to return empty first, and it
+    /// is not the kind of thing to leave standing on an accident. None => abstain from this election.
     fn resolve_producer_source_macroblock(
         storage: &Storage,
         required_macroblock: u64,
     ) -> Option<(u64, qnet_state::MacroBlock)> {
         if required_macroblock == 0 { return None; }
-        const MAX_FALLBACK_DEPTH: u64 = 8;
-        let floor = required_macroblock.saturating_sub(MAX_FALLBACK_DEPTH).max(1);
-        let mut idx = required_macroblock;
-        loop {
-            if let Ok(Some(data)) = storage.get_macroblock_by_height(idx) {
-                if let Ok(mb) = bincode::deserialize::<qnet_state::MacroBlock>(&data) {
-                    let eligible_nonempty = mb.consensus_data.eligible_producers.as_ref()
-                        .and_then(|s| bincode::deserialize::<Vec<qnet_state::EligibleProducer>>(s).ok())
-                        .map(|v| v.iter().any(|p| !p.node_id.is_empty()))
-                        .unwrap_or(false);
-                    // Exact N-2 mirrors the candidate set's PRIMARY(eligible)/SECONDARY(commits)
-                    // acceptance (beacon-agnostic — seed derives from deterministic fields).
-                    // Walk-back requires eligible + beacon (matches beacon/committee readers).
-                    let usable = if idx == required_macroblock {
-                        eligible_nonempty || !mb.consensus_data.commits.is_empty()
-                    } else {
-                        eligible_nonempty && mb.consensus_data.randomness_beacon.is_some()
-                    };
-                    if usable { return Some((idx, mb)); }
-                }
-            }
-            if idx <= floor { break; }
-            idx -= 1;
+        let data = storage.get_macroblock_by_height(required_macroblock).ok().flatten()?;
+        let mb = bincode::deserialize::<qnet_state::MacroBlock>(&data).ok()?;
+        let eligible_nonempty = mb.consensus_data.eligible_producers.as_ref()
+            .and_then(|x| bincode::deserialize::<Vec<qnet_state::EligibleProducer>>(x).ok())
+            .map(|v| v.iter().any(|p| !p.node_id.is_empty()))
+            .unwrap_or(false);
+        // Mirrors the candidate set's PRIMARY(eligible)/SECONDARY(commits) acceptance; the seed itself
+        // derives from deterministic macroblock fields, so it is beacon-agnostic.
+        if eligible_nonempty || !mb.consensus_data.commits.is_empty() {
+            Some((required_macroblock, mb))
+        } else {
+            None
         }
-        None
     }
 
     /// Compute the deterministic per-height entropy used by both producer
@@ -18965,9 +19633,11 @@ impl BlockchainNode {
             let head = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT
                 .load(std::sync::atomic::Ordering::Acquire);
             let mb_index = head / 90; // macroblock index covering the local head
-            if Self::compute_cumulative_ban_set(storage.as_ref(), mb_index)
-                .await
-                .contains(node_id)
+            // Display/advisory only, so the cheap disk read is fine here: this path never feeds a
+            // consensus verdict (the doc above says so).
+            let window_head = mb_index.saturating_mul(90);
+            if storage.load_account(node_id).ok().flatten()
+                .map_or(false, |a| a.banned_at_height > 0 && a.banned_at_height <= window_head)
             {
                 return 0.0; // tombstoned → excluded
             }
@@ -19425,8 +20095,29 @@ impl BlockchainNode {
             if log_block(current_height) { println!("[DBG][CANDIDATES] h={} ep={} mb={}", current_height, current_epoch, required_macroblock); }
         }
         
-        // PRODUCTION v2.50: Lock-free storage access
+        // A1: the roster no longer REQUIRES macroblock N-2 to exist. Sealed ⇒ used verbatim below.
+        // Frozen (finality stalled) ⇒ the FROZEN roster of the sealed anchor M_A, a pure function of
+        // sealed bytes so every node derives the same set. Defer ⇒ a certified anchor exists but is
+        // unheld, so this node abstains and syncs rather than derive off a stale base.
         if let Some(storage) = try_get_storage() {
+            if required_macroblock > 0 {
+                match Self::roster_mode(&storage, current_epoch) {
+                    RosterMode::Frozen => {
+                        let l = storage.last_sealed_mb_index();
+                        if let Some((_a_idx, anchor)) = Self::frozen_anchor(&storage, l) {
+                            let mut derived: Vec<(String, f64)> = Self::frozen_roster(&anchor).into_iter()
+                                .filter(|p| !crate::genesis_constants::restart_excludes(&p.node_id))
+                                .map(|p| (p.node_id, p.reputation as f64 / 100.0))
+                                .collect();
+                            derived.sort_by(|a, b| a.0.cmp(&b.0));
+                            if !derived.is_empty() { return derived; }
+                        }
+                        return Vec::new(); // anchor unusable ⇒ abstain (park), never a stale base
+                    }
+                    RosterMode::Defer => return Vec::new(),
+                    RosterMode::Sealed => {}
+                }
+            }
             match storage.get_macroblock_by_height(required_macroblock) {
                 Ok(Some(macroblock_data)) => {
                     match bincode::deserialize::<qnet_state::MacroBlock>(&macroblock_data) {
@@ -19455,8 +20146,12 @@ impl BlockchainNode {
                             // excluded set stays a no-op (liveness exclusion must be on-chain/QC-bound).
                             if let Some(ref snapshot_data) = macroblock.consensus_data.eligible_producers {
                                 if let Ok(producers) = bincode::deserialize::<Vec<qnet_state::EligibleProducer>>(snapshot_data) {
+                                    // restart_excludes bars the barred set from the DERIVED producer/
+                                    // committee set (restart GAP B) without touching the QC-bound field.
                                     let mut all_qualified: Vec<(String, f64)> = producers.iter()
-                                        .filter(|p| !p.node_id.is_empty() && !excluded_node_ids.contains(&p.node_id))
+                                        .filter(|p| !p.node_id.is_empty()
+                                            && !excluded_node_ids.contains(&p.node_id)
+                                            && !crate::genesis_constants::restart_excludes(&p.node_id))
                                         .map(|p| (p.node_id.clone(), p.reputation as f64 / 100.0))
                                         .collect();
                                     if !all_qualified.is_empty() {
@@ -19504,7 +20199,8 @@ impl BlockchainNode {
                                 // identical so behaviour does not depend on which one
                                 // happens to fire.
                                 let mut all_qualified: Vec<(String, f64)> = macroblock.consensus_data.commits.keys()
-                                    .filter(|id| !excluded_node_ids.contains(*id))
+                                    .filter(|id| !excluded_node_ids.contains(*id)
+                                        && !crate::genesis_constants::restart_excludes(id))
                                     .map(|id| (id.clone(), det_rep))
                                     .collect();
                                 all_qualified.sort_by(|a, b| a.0.cmp(&b.0));
@@ -19541,59 +20237,15 @@ impl BlockchainNode {
                     // Nudge the single sync coordinator to backfill the missing macroblock; we abstain
                     // from this election round meanwhile (2f+1 others keep consensus alive).
                     crate::sync_manager::nudge_sync_check();
-                    // Not excluded: the bounded walk-back below self-heals the set from the most-recent
-                    // finalized snapshot; true desync is logged only if no fallback is found.
-                    
-                    // Duplicate macroblock backfill removed — the nudge above already drives the single
-                    // sync coordinator to fetch it; the bounded walk-back below self-heals the set.
-                    
-                    // P1.5 self-healing: N-2 absent must NOT collapse the
-                    // participant set to empty (that froze finality
-                    // irreversibly — a missing macroblock made every later
-                    // epoch's N-2 missing too). Deterministically walk back to
-                    // the most recent AVAILABLE finalized eligible_producers
-                    // snapshot ≤ N-2 (same rule/depth as
-                    // deterministic_eligible_ids → numerator==denominator
-                    // preserved). Macroblocks below the gap are 2f+1-finalized
-                    // and universally present; the set is sticky → honest
-                    // nodes converge and the gap is recoverable. Background
-                    // N-2 fetch (above) still runs to restore the exact set.
-                    const MAX_FALLBACK_DEPTH: u64 = 8;
-                    let fb_floor = required_macroblock.saturating_sub(MAX_FALLBACK_DEPTH).max(1);
-                    let mut fb_idx = required_macroblock;
-                    loop {
-                        if let Ok(Some(fb_data)) = storage.get_macroblock_by_height(fb_idx) {
-                            if let Ok(fb_mb) = bincode::deserialize::<qnet_state::MacroBlock>(&fb_data) {
-                                // Identical predicate as try_load_macroblock_beacon /
-                                // deterministic_eligible_ids: real finalized macroblock
-                                // (beacon present) → committee+beacon same macroblock.
-                                if fb_mb.consensus_data.randomness_beacon.is_none() {
-                                    if fb_idx <= fb_floor { break; }
-                                    fb_idx -= 1;
-                                    continue;
-                                }
-                                if let Some(ref snap) = fb_mb.consensus_data.eligible_producers {
-                                    if let Ok(prods) = bincode::deserialize::<Vec<qnet_state::EligibleProducer>>(snap) {
-                                        // Same empty-node_id filter as the seed resolver → identical predicate.
-                                        let mut fb: Vec<(String, f64)> = prods.iter()
-                                            .filter(|p| !p.node_id.is_empty())
-                                            .map(|p| (p.node_id.clone(), p.reputation as f64 / 100.0))
-                                            .collect();
-                                        if !fb.is_empty() {
-                                            fb.sort_by(|a, b| a.0.cmp(&b.0));
-                                            if fb_idx != required_macroblock {
-                                                println!("[WARN][CAND] committee_fallback used_mb={} wanted_mb={} depth={} reason=n2_absent_self_heal participants={}",
-                                                         fb_idx, required_macroblock, required_macroblock - fb_idx, fb.len());
-                                            }
-                                            return fb;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        if fb_idx <= fb_floor { break; }
-                        fb_idx -= 1;
-                    }
+                    // ABSTAIN — never substitute an older snapshot. The previous bounded walk-back
+                    // returned the most recent AVAILABLE eligible_producers set below N-2, which makes the
+                    // roster a function of what this node happens to hold in RocksDB rather than of the
+                    // height. Two nodes with different local availability then derive different rosters,
+                    // different committees and a different epoch_commitment, so the checkpoint can never
+                    // reach 2f+1 — and with production decoupled from finality it would be a fork instead
+                    // of a stall. Abstaining is safe: the 2f+1 that DO hold N-2 keep sealing, this node
+                    // follows their blocks (an empty roster is never cached, so ingest stays on the soft
+                    // path), and the sync coordinator nudged above repairs the macroblock deficit.
                     return Vec::new();
                 }
                 Err(e) => {
@@ -20036,7 +20688,7 @@ impl BlockchainNode {
         let macroblock_round = current_height / 90;
         
         // ═══════════════════════════════════════════════════════════════════════════
-        // UNIFIED v2.47: ENTROPY SOURCE FOR LEADER SELECTION (RANDAO-style)
+        // UNIFIED v2.47: ENTROPY SOURCE FOR LEADER SELECTION
         // Same source used by: should_initiate, compute_leader_for_round, PFP
         // 
         // Epoch 1-2 (macroblock #1, #2): Genesis block hash (microblock #0)
@@ -20072,7 +20724,7 @@ impl BlockchainNode {
             }
         } else {
             // Epoch 3+ (macroblock #3+): Use randomness_beacon from MB N-2
-            // This is the VRF XOR accumulator - RANDAO-style unpredictable entropy
+            // This is the VRF XOR accumulator - unpredictable entropy
             let n_minus_2_index = macroblock_round - 2;
             match storage.get_macroblock_by_height(n_minus_2_index) {
                 Ok(Some(macroblock_data)) => {
@@ -20209,7 +20861,7 @@ impl BlockchainNode {
         node_type: NodeType,
         // total_supply for checkpoint content is now read height-bound via storage seals
         // (get_total_supply_at), not from live state — so this handle is no longer read here.
-        _state: Arc<RwLock<StateManager>>,
+        state: Arc<RwLock<StateManager>>,
     ) {
         // Subscribe to block events (event-based, not polling!)
         let mut block_event_rx = self.block_event_tx.subscribe();
@@ -20237,7 +20889,7 @@ impl BlockchainNode {
                     // v9.3: Initialize finality from macroblock count, but CAP at actual chain_height.
                     // BUG FIX: If macroblocks 1-50 exist (synced) but microblocks only up to h=202,
                     // setting finality to 50*90=4500 blocks stall recovery from rolling back.
-                    // Every L1 (Ethereum FFG, Tendermint) only finalizes blocks that ACTUALLY exist.
+                    // Every L1 finalizes only blocks that ACTUALLY exist.
                     let round = highest * 90;
                     // CONTENT-GATED (P3): cap finality at the highest content-matching sealed window, so a
                     // restarted node that applied a losing fork (but wasn't yet repaired to canonical)
@@ -20384,7 +21036,14 @@ impl BlockchainNode {
                                     .collect();
                                 let head_ready = storage.load_microblock_auto_format(b).ok().flatten()
                                     .map(|mb| mb.state_root != [0u8; 32]).unwrap_or(false);
-                                if missing.is_empty() && head_ready {
+                                // Resolve the epoch-root commitment BEFORE the cursor moves: the spawned
+                                // task below cannot un-advance it, so a gap there would drop this
+                                // boundary permanently instead of retrying it.
+                                let epoch_root_ready = crate::reward_epoch::epoch_root_commitment(&storage, b);
+                                if epoch_root_ready.is_none() {
+                                    crate::reward_epoch::request_epoch_root_repair(&storage, b);
+                                }
+                                if missing.is_empty() && head_ready && epoch_root_ready.is_some() {
                                     last_intra_signalled = b; // advance ONLY on confirmed-ready content
                                     let cp_index = b / k;
                                     let macro_window = ((b - 1) / macro_i) + 1; // epoch committee of the host window
@@ -20392,6 +21051,15 @@ impl BlockchainNode {
                                     let p2p_cp = p2p_ref.clone();
                                     let node_id_cp = node_id.clone();
                                     tokio::spawn(async move {
+                                        // R16: same Sealed gate as the macro-boundary spawn. Without it a freeze
+                                        // buffers frozen-committee content here, and on resume the buffer wins
+                                        // the race against the sealed-arm redrive — certifying frozen values.
+                                        if !matches!(Self::roster_mode(&storage_cp, macro_window), RosterMode::Sealed) {
+                                            if is_warn() {
+                                                println!("[WARN][CONS] checkpoint_defer cp={} reason=anchor_unsealed_frozen", cp_index);
+                                            }
+                                            return;
+                                        }
                                         // Epoch committee — the SAME N-2 sample the macroblock uses (must match
                                         // peers, else content_ok diverges and the checkpoint never reaches 2f+1).
                                         let qualified = Self::calculate_qualified_candidates(
@@ -20400,33 +21068,34 @@ impl BlockchainNode {
                                         ids.sort();
                                         let committee = Self::select_consensus_committee(&ids, macro_window, &storage_cp);
                                         if !committee.iter().any(|id| id == &node_id_cp) { return; } // not voting ⇒ don't emit
-                                        // Checkpoint content = pure function of canonical bodies:
-                                        // hash from the body (NOT the O(1) index, which can lag a
-                                        // replacement), vrf complete-or-defer — never a partial v_vec
-                                        // (a short beacon diverges content_ok → finality stall).
+                                        // Checkpoint content = pure function of canonical bodies: hash from
+                                        // the body, NOT the O(1) index (which can lag a replacement).
+                                        // Complete-or-defer — a short window diverges content_ok.
                                         let mut h_vec: Vec<[u8; 32]> = Vec::new();
-                                        let mut v_vec: Vec<[u8; 32]> = Vec::new();
                                         for h in start..=b {
                                             let mb = match storage_cp.load_microblock_auto_format(h) {
                                                 Ok(Some(mb)) => mb,
                                                 _ => return, // body not yet readable → defer, retry next event
                                             };
                                             h_vec.push(mb.hash());
-                                            match mb.vrf_output {
-                                                Some(v) => v_vec.push(v),
-                                                None => return, // height>0 must carry vrf; missing → defer
-                                            }
                                         }
                                         let state_root = match storage_cp.load_microblock_auto_format(b) {
                                             Ok(Some(mb)) if mb.state_root != [0u8; 32] => mb.state_root,
                                             _ => return,
                                         };
-                                        let beacon = qnet_consensus::checkpoint_bft::accumulate_beacon(&v_vec);
+                                        let beacon = qnet_consensus::checkpoint_bft::accumulate_beacon(&h_vec);
                                         // Empty eligible/banned: an intra-window checkpoint publishes NO epoch
                                         // transition (only the macroblock-boundary checkpoint does).
                                         // registry_root as of this intra head — deterministic, enforced (gated)
                                         // by content_ok like every checkpoint; the field is in the QC hash regardless.
-                                        let registry_root = storage_cp.compute_registry_root(b);
+                                        // None ⇒ the roster scan failed ⇒ defer, never publish a short root.
+                                        let registry_root = match storage_cp.compute_registry_root(b) {
+                                            Some(r) => r,
+                                            None => {
+                                                println!("[CRIT][CONS] checkpoint_defer h={} reason=registry_root_unreadable", b);
+                                                return;
+                                            }
+                                        };
                                         // Seal-strict: None ⇒ not yet sealed ⇒ defer (mirrors total_supply
                                         // below). The lossy fallback is tip-scoped, not height-scoped, so
                                         // publishing it would silently diverge this node's checkpoint.
@@ -20440,10 +21109,21 @@ impl BlockchainNode {
                                             Some(t) => t,
                                             None => return,
                                         };
+                                        // A gap means this node cannot compute the value. Emitting a
+                                        // placeholder would seal it under 2f+1 and brick every cold
+                                        // join anchored here, so defer like the seals above.
+                                        let reward_epoch_root = match epoch_root_ready {
+                                            Some(r) => r,
+                                            None => return, // unreachable: the guard above gates this spawn
+                                        };
                                         crate::consensus_v2_node::signal_window_end(
-                                            cp_index, b, h_vec, state_root, beacon, committee, Vec::new(), Vec::new(), [0u8; 32],
-                                            registry_root, dilithium_pk_root, [0u8; 32], total_supply,
-                                        );
+                                            crate::consensus_v2_node::WindowEndArgs {
+                                                index: cp_index, head_height: b, mb_hashes: h_vec, state_root, beacon,
+                                                committee, eligible_producers: Vec::new(), banned: Vec::new(),
+                                                reward_root: [0u8; 32], registry_root, dilithium_pk_root,
+                                                reward_epoch_root,
+                                                logs_root: [0u8; 32], total_supply,
+                                            });
                                         if crate::node::is_info() {
                                             println!("[INFO][BFT2] intra_checkpoint_signalled cp_index={} head={} k={}", cp_index, b, k);
                                         }
@@ -20595,7 +21275,7 @@ impl BlockchainNode {
                             if is_validator && !is_committee_member {
                                 if is_info() {
                                     println!("[INFO][COMMITTEE] mb={} node={} NOT_IN_COMMITTEE total={} committee={} → skip_consensus (will receive MB via sync)",
-                                        macroblock_index, &node_id[..node_id.len().min(20)], all_qualified_ids.len(), committee.len());
+                                        macroblock_index, qnet_state::char_prefix(&node_id, 20), all_qualified_ids.len(), committee.len());
                                 }
                             }
                             
@@ -20679,6 +21359,9 @@ impl BlockchainNode {
                                 let storage_cons = storage.clone();
                                 let p2p_cons = p2p_ref.clone();
                                 let node_id_cons = node_id.clone();
+                                // The eligible snapshot reads the equivocation ban out of APPLIED state,
+                                // which is what state_root commits — not the async accounts mirror.
+                                let state_cons = state.clone();
                                 let mb_idx = macroblock_index;
 
                                 tokio::spawn(async move {
@@ -20695,6 +21378,17 @@ impl BlockchainNode {
                                     // macroblock consensus (legacy commit/reveal removed). The v2 runtime runs
                                     // since boot; here we assemble this window's inputs and hand off to it.
                                     if crate::consensus_v2_node::v2_enabled() {
+                                        // R16: propose/vote a checkpoint ONLY when its certification anchor
+                                        // (macroblock mb_idx-2) is sealed. While finality is stalled the anchor
+                                        // is unsealed, verify_v2_macroblock defers, and a proposal built now
+                                        // carries frozen-derived content peers Reject on resume. Defer; the
+                                        // finality-lag redrive rebuilds via the sealed arm once the anchor seals.
+                                        if !matches!(Self::roster_mode(&storage_cons, mb_idx), RosterMode::Sealed) {
+                                            if is_warn() {
+                                                println!("[WARN][CONS] checkpoint_defer mb={} reason=anchor_unsealed_frozen", mb_idx);
+                                            }
+                                            return;
+                                        }
                                         // Deterministic epoch committee (N-2 VRF sample, ≤100) for signing,
                                         // and the next-epoch eligible-producer snapshot (≤MAX_VALIDATORS)
                                         // the macroblock body publishes for N-2 selection — same selection
@@ -20705,12 +21399,28 @@ impl BlockchainNode {
                                         let mut ids: Vec<String> = qualified.iter().map(|(id, _)| id.clone()).collect();
                                         ids.sort();
                                         let committee = Self::select_consensus_committee(&ids, mb_idx, &storage_cons);
-                                        let eligible = Self::create_eligible_producers_snapshot(
-                                            &p2p_cons, &ids, &node_id_cons, node_type, mb_idx, &storage_cons,
-                                        ).await;
+                                        let eligible = {
+                                            let st = state_cons.read().await;
+                                            Self::create_eligible_producers_snapshot(
+                                                &p2p_cons, &ids, &node_id_cons, node_type, mb_idx,
+                                                &storage_cons, &st,
+                                            ).await
+                                        };
+                                        // Vec::new() is this snapshot's ABSTAIN sentinel (unusable heartbeat
+                                        // index, no VRF seed). Publishing it seals a macroblock whose
+                                        // eligible_producers is empty — and that object is the roster source
+                                        // for the next epochs, is QC-certified, and is never replaced, so the
+                                        // chain wedges permanently. Same guard the derived path already has.
+                                        if eligible.is_empty() || committee.is_empty() {
+                                            if is_warn() {
+                                                println!("[WARN][CONS] window_end_abstain mb={} eligible={} committee={} reason=underivable",
+                                                         mb_idx, eligible.len(), committee.len());
+                                            }
+                                            return;
+                                        }
                                         let eligible_bytes = bincode::serialize(&eligible).unwrap_or_default();
-                                        // Window hashes + XOR state-root, and the VRF beacon = XOR of signed
-                                        // microblock vrf_outputs (unbiasable randomness for next-epoch VRF).
+                                        // The window's committed block hashes: both the checkpoint's
+                                        // mb_hashes and the beacon fold this one vector.
                                         //
                                         // v33: deterministic checkpoint content from the commit-time accumulator.
                                         // Each block's (hash, vrf_output) was captured when it committed (in hand),
@@ -20721,9 +21431,9 @@ impl BlockchainNode {
                                         // (e.g. blocks that arrived via out-of-order bulk sync). state_root (the head
                                         // block's real account root, written only after TX apply) is read below.
                                         let mut state_root = [0u8; 32];
-                                        let (mb_hashes, vrf_outputs, content_src) =
+                                        let (mb_hashes, content_src) =
                                             match crate::node::window_content_from_accum(mb_idx) {
-                                                Some((h, v)) => (h, v, "accum"),
+                                                Some(h) => (h, "accum"),
                                                 None => {
                                                     // Fallback: bounded-wait for the full window to persist, actively
                                                     // REPAIRING any missing microblock heights from peers as we wait.
@@ -20761,22 +21471,17 @@ impl BlockchainNode {
                                                         }
                                                         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                                                     }
-                                                    // Body-derived, complete-or-defer (same as the intra path): hash
-                                                    // from the body not the O(1) index; any missing block/vrf → defer.
+                                                    // Body-derived, complete-or-defer (same as the intra path):
+                                                    // hash from the body, not the O(1) index.
                                                     let mut h_vec: Vec<[u8; 32]> = Vec::new();
-                                                    let mut v_vec: Vec<[u8; 32]> = Vec::new();
                                                     for h in start_height..=end_height {
                                                         let mb = match storage_cons.load_microblock_auto_format(h) {
                                                             Ok(Some(mb)) => mb,
                                                             _ => return, // incomplete window → defer to §4.5 sync
                                                         };
                                                         h_vec.push(mb.hash());
-                                                        match mb.vrf_output {
-                                                            Some(v) => v_vec.push(v),
-                                                            None => return,
-                                                        }
                                                     }
-                                                    (h_vec, v_vec, "reread")
+                                                    (h_vec, "reread")
                                                 }
                                             };
                                         // The head block's REAL account-state root (finalize_merkle) is written
@@ -20815,7 +21520,7 @@ impl BlockchainNode {
                                                 return;
                                             }
                                         }
-                                        let beacon = qnet_consensus::checkpoint_bft::accumulate_beacon(&vrf_outputs);
+                                        let beacon = qnet_consensus::checkpoint_bft::accumulate_beacon(&mb_hashes);
                                         // P2-D: never signal PARTIAL window content. The accumulator path is
                                         // always complete (window_content_from_accum returns None for an
                                         // incomplete buffer); only the re-read fallback can come up short if a
@@ -20824,7 +21529,7 @@ impl BlockchainNode {
                                         // instead — this node applies the macroblock via the §4.5 sync wire once
                                         // a quorum seals it. (Full window = 90 microblocks.)
                                         let expected_len = (end_height - start_height + 1) as usize;
-                                        if mb_hashes.len() < expected_len || vrf_outputs.len() < expected_len {
+                                        if mb_hashes.len() < expected_len {
                                             if is_warn() {
                                                 println!("[WARN][CONS] window_content_incomplete mb={} src={} have={} need={} — not signalling (defer to §4.5 sync)",
                                                          mb_idx, content_src, mb_hashes.len(), expected_len);
@@ -20837,9 +21542,14 @@ impl BlockchainNode {
                                         // relayer cannot corrupt the stored banned_validators without breaking
                                         // the checkpoint QC. Sorted for a byte-stable, order-independent commit.
                                         let banned_for_epoch = {
-                                            let mut v: Vec<String> =
-                                                Self::compute_cumulative_ban_set(&storage_cons, mb_idx)
-                                                    .await.into_iter().collect();
+                                            let set = match Self::compute_cumulative_ban_set(&storage_cons, mb_idx).await {
+                                                Some(b) => b,
+                                                // Underivable ⇒ do NOT signal. Publishing a guessed set would
+                                                // put it in epoch_commitment and split the QC; the §4.5 sync
+                                                // wire delivers this window once a quorum seals it.
+                                                None => return,
+                                            };
+                                            let mut v: Vec<String> = set.into_iter().collect();
                                             v.sort();
                                             v
                                         };
@@ -20848,11 +21558,27 @@ impl BlockchainNode {
                                         // intra-window checkpoints (signalled separately) carry K-block sub-windows.
                                         // Self-aligning emission reward root for this window (committee-verified
                                         // via Checkpoint.reward_root; [0;32] off an emission boundary).
-                                        let reward_root = Self::compute_window_reward_root(&storage_cons, start_height, end_height);
+                                        let reward_root = match Self::compute_window_reward_root(&storage_cons, start_height, end_height) {
+                                            Some(r) => r,
+                                            // Cannot reproduce this epoch's leaf set — defer like the four
+                                            // sibling guards below rather than certify "paid nobody".
+                                            None => {
+                                                if is_warn() {
+                                                    println!("[WARN][CONS] window_end_defer mb={} reason=reward_root_underivable", mb_idx);
+                                                }
+                                                return;
+                                            }
+                                        };
                                         // Deterministic Super/genesis registry digest as of the window head — QC-certified
                                         // via Checkpoint.registry_root so an untrusted-snapshot joiner can verify the
                                         // restored node_registry (source of cbw + attestor VRF keys). reg_height<=end_height.
-                                        let registry_root = storage_cons.compute_registry_root(end_height);
+                                        let registry_root = match storage_cons.compute_registry_root(end_height) {
+                                            Some(r) => r,
+                                            None => {
+                                                println!("[CRIT][CONS] window_end_defer mb={} reason=registry_root_unreadable", mb_idx);
+                                                return;
+                                            }
+                                        };
                                         // Seal-strict (mirrors total_supply below): None ⇒ not yet sealed ⇒ defer,
                                         // never publish the tip-scoped fallback into a QC-bound field.
                                         let dilithium_pk_root = match storage_cons.compute_dilithium_pk_root_sealed(end_height) {
@@ -20874,12 +21600,24 @@ impl BlockchainNode {
                                         let logs_root = if qnet_state::feature_gates::is_active("logs_root_required", end_height) {
                                             Self::compute_window_logs_root(&storage_cons, start_height, end_height)
                                         } else { [0u8; 32] };
+                                        // Gap ⇒ cannot compute; defer rather than seal a placeholder.
+                                        let reward_epoch_root = match crate::reward_epoch::epoch_root_commitment(&storage_cons, end_height) {
+                                            Some(r) => r,
+                                            None => {
+                                                crate::reward_epoch::request_epoch_root_repair(&storage_cons, end_height);
+                                                return;
+                                            }
+                                        };
                                         active_guard.signalled = true; // content delivered → keep the lock held
                                         crate::consensus_v2_node::signal_window_end(
-                                            end_height / qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL,
-                                            end_height, mb_hashes, state_root, beacon, committee, eligible_bytes, banned_for_epoch, reward_root,
-                                            registry_root, dilithium_pk_root, logs_root, total_supply,
-                                        );
+                                            crate::consensus_v2_node::WindowEndArgs {
+                                                index: end_height / qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL,
+                                                head_height: end_height, mb_hashes, state_root, beacon, committee,
+                                                eligible_producers: eligible_bytes, banned: banned_for_epoch,
+                                                reward_root, registry_root, dilithium_pk_root,
+                                                reward_epoch_root,
+                                                logs_root, total_supply,
+                                            });
                                         return;
                                     }
                                 });
@@ -21123,8 +21861,10 @@ impl BlockchainNode {
                 let qc_idx = s.last_sealed_mb_index();
                 let qc_hash = if qc_idx > 0 { s.get_latest_macroblock_hash().unwrap_or([0u8; 32]) } else { [0u8; 32] };
                 let tip = s.get_chain_height().unwrap_or(0);
+                // Canonical hash of our tip, read from the store — the height→hash RAM cache is gone,
+                // and a vote must carry the hash we actually hold, not a cached guess.
                 let tip_h = if tip > 0 {
-                    crate::block_pipeline::lookup_block_hash(tip).unwrap_or([0u8; 32])
+                    s.canonical_hash_at(tip).unwrap_or([0u8; 32])
                 } else { [0u8; 32] };
                 (qc_idx, qc_hash, tip, tip_h)
             }
@@ -21132,7 +21872,8 @@ impl BlockchainNode {
         };
 
         let vote_msg = crate::unified_p2p::timeout_vote_message(
-            mb_index, next_round, &anchor, high_qc_idx, &high_qc_hash, tip_height, &tip_hash);
+            mb_index, next_round, &anchor, high_qc_idx, &high_qc_hash, tip_height, &tip_hash,
+            crate::unified_p2p::rc_pin_for_window(mb_index));
 
         let crypto = match try_get_quantum_crypto() {
             Some(c) => c,
@@ -21175,7 +21916,7 @@ impl BlockchainNode {
     
     /// v3.11: Calculate real Merkle root using qnet-core implementation
     /// Enables trustless transaction proofs for Light clients and cross-shard verification
-    fn calculate_merkle_root(txs: &[qnet_state::Transaction]) -> [u8; 32] {
+    pub(crate) fn calculate_merkle_root(txs: &[qnet_state::Transaction]) -> [u8; 32] {
         if txs.is_empty() {
             // Return hash of empty for empty block (consistent with merkle.rs)
             let hasher = Sha3_256::new();
@@ -21334,6 +22075,7 @@ impl BlockchainNode {
     
     /// PRODUCTION: Verify PQ (Dilithium3) signature for received microblock (supports compact)
     pub async fn verify_microblock_signature(
+        storage: &Storage,
         microblock: &qnet_state::MicroBlock, 
         _producer_pubkey: &str,
         p2p: Option<&Arc<SimplifiedP2P>>
@@ -21385,8 +22127,8 @@ impl BlockchainNode {
                 }
             };
 
-            // Lookup producer's Dilithium3 public key
-            let pk = match crate::genesis_constants::get_vrf_public_key(&microblock.producer) {
+            // Lookup producer's Dilithium3 public key (committed source, see producer_verify_pk)
+            let pk = match crate::node::producer_verify_pk(storage, &microblock.producer) {
                 Some(pk) => pk,
                 None => {
                     // v4.6: Hard reject — Dilithium3 key MUST be registered
@@ -21448,8 +22190,12 @@ impl BlockchainNode {
                 }
             } else {
                 println!("[ERR][SIGN] dilithium3_invalid h={} producer={}", microblock.height, microblock.producer);
+                return Ok(false);
             }
-            return Ok(valid);
+
+            // No vrf_output check here, and none is needed: the window beacon folds block hashes, so
+            // the field feeds nothing in consensus and MicroBlock::hash() leaves it out.
+            return Ok(true);
         }
 
         // Legacy: compact_bin / compact signature formats (for pre-v4 blocks)
@@ -21483,7 +22229,7 @@ impl BlockchainNode {
             }
         } else {
             // Not a recognized signature format - reject
-            println!("[ERR][CRYPTO] Unknown signature format: {}", &sig_str[..sig_str.len().min(20)]);
+            println!("[ERR][CRYPTO] Unknown signature format: {}", qnet_state::char_prefix(&sig_str, 20));
             return Ok(false);
         };
         
@@ -21584,41 +22330,9 @@ impl BlockchainNode {
                 // vrf_proof contains ML-DSA-65 detached signature (~3309 bytes)
                 // Verified against producer's registered VRF public key
                 // ═══════════════════════════════════════════════════════════════════
-                let has_registered_vrf = crate::genesis_constants::has_vrf_key(&microblock.producer);
-                let vrf_verified = if microblock.vrf_proof.is_some() {
-                    match Self::verify_block_vrf_proof(microblock) {
-                        Ok(true) => {
-                            if microblock.height % 100 == 0 {
-                                println!("[INFO][VRF] block_proof_verified h={} producer={}",
-                                         microblock.height, microblock.producer);
-                            }
-                            true
-                        }
-                        Ok(false) => {
-                            if has_registered_vrf {
-                                println!("[WARN][VRF] block_rejected_invalid_proof producer={} h={}",
-                                         &microblock.producer[..16.min(microblock.producer.len())], microblock.height);
-                                return Ok(false);
-                            }
-                            false
-                        }
-                        Err(e) => {
-                            if has_registered_vrf {
-                                println!("[WARN][VRF] block_rejected_proof_error producer={} h={} err={}",
-                                         &microblock.producer[..16.min(microblock.producer.len())], microblock.height, e);
-                                return Ok(false);
-                            }
-                            false
-                        }
-                    }
-                } else {
-                    false
-                };
-
-                // v4.0: If VRF proof verified via Dilithium3, proceed
-                if vrf_verified && has_registered_vrf {
-                    true // Dilithium3-VRF verified, proceed
-                } else {
+                // vrf_proof is no longer a validity input: the beacon folds block hashes, so the field
+                // carries no consensus information and gating on it was a fork surface for nothing.
+                {
                     // No vrf_proof - request from online producer (legacy fallback)
                     let now = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
@@ -22002,7 +22716,6 @@ impl BlockchainNode {
             &self.node_id,
             self.node_type,
             Some(&self.storage),
-            &self.poh  // Pass PoH for quantum entropy
         ).await;
         
         // Additional check: only return true if we're synchronized
@@ -22141,7 +22854,6 @@ impl BlockchainNode {
         match self.storage.load_microblock_auto_format(height) {
             Ok(Some(microblock)) => {
                 // Convert MicroBlock to Block format for API compatibility
-                // v2.80: Include poh_hash and poh_count for VTS/PoH data in API response
                 let block = qnet_state::Block {
                     height: microblock.height,
                     timestamp: microblock.timestamp,
@@ -22150,8 +22862,6 @@ impl BlockchainNode {
                     transactions: microblock.transactions,
                     producer: microblock.producer.clone(),
                     signature: microblock.signature,
-                    poh_hash: microblock.poh_hash,
-                    poh_count: microblock.poh_count,
                     block_type: "MICROBLOCK".to_string(),
                 };
                 Ok(Some(block))
@@ -22187,6 +22897,10 @@ impl BlockchainNode {
         // PRODUCTION VALIDATION - reject invalid transactions immediately
         if let Err(validation_error) = tx.validate() {
             return Err(QNetError::ValidationError(format!("Transaction validation failed: {}", validation_error)));
+        }
+        if !Self::gas_limit_admissible(&tx) {
+            return Err(QNetError::ValidationError(format!(
+                "gas_limit {} exceeds MAX_GAS_LIMIT {}", tx.gas_limit, qnet_state::gas_limits::MAX_GAS_LIMIT)));
         }
 
         // ═══════════════════════════════════════════════════════════════════════
@@ -22268,17 +22982,17 @@ impl BlockchainNode {
                 // v2.53: Ping commitments are system transactions, validated by merkle proofs
                 if is_info() { println!("[INFO][REWARDS] ping_commitment_accepted system_tx"); }
             } else if tx.from == "system_rewards_pool" && matches!(tx.tx_type, qnet_state::TransactionType::RewardDistribution) {
-                // v2.70: Reward claims from system_rewards_pool
-                // Signature was already verified by API endpoint on message "claim_rewards:{node_id}:{wallet}"
-                // Here we just verify the TX has the required fields (signature, pubkey, data)
-                // PURE DILITHIUM: the claim's authorisation is the mandatory ML-DSA-65 sig (verified at the
-                // RPC endpoint over "claim_rewards:{node}:{wallet}") + the per-proof merkle re-verify below
-                // against the QC-certified reward_root (apply re-verifies as the final gate). Require the
-                // Dilithium sig present; Ed25519 is Solana-only and is not carried on this TX.
+                // Merkle reward-claim: authorised by the recipient wallet's own ML-DSA-65 signature over
+                // the exact claims payload (claim_authorized) plus the per-proof merkle re-verify against
+                // the QC-certified reward_root. Both re-run at apply, which is the final gate.
                 if tx.dilithium_signature.as_ref().map_or(true, |s| s.is_empty()) {
                     return Err(QNetError::ValidationError("Reward claim requires dilithium_signature".to_string()));
                 }
-                if !Self::claim_proofs_admissible(&self.get_storage(), &tx) {
+                let last_claimed = match &tx.to {
+                    Some(w) => self.get_state_manager().read().await.get_last_claimed_epoch(w),
+                    None => u64::MAX,
+                };
+                if !Self::claim_proofs_admissible(&self.get_storage(), &tx, last_claimed) {
                     return Err(QNetError::ValidationError("Reward claim has no valid merkle proofs".to_string()));
                 }
                 if is_info() { println!("[INFO][REWARDS] claim_tx_accepted from=system_rewards_pool quantum_safe=true"); }
@@ -22343,6 +23057,13 @@ impl BlockchainNode {
                     qnet_state::TransactionType::EquivocationProof { .. } |
                     qnet_state::TransactionType::VoteEquivocationProof { .. }
                 );
+                // "Self-verifying" now means "verify the EMBEDDED proof here": the apply arm marks the
+                // offender's account, so a junk proof must never reach it.
+                if self_verifying
+                    && !Self::equivocation_proof_verified(&self.get_storage(), &tx).await {
+                    return Err(QNetError::ValidationError(
+                        "[REJECT][AUTH] equivocation proof does not verify".to_string()));
+                }
                 if !self_verifying {
                     if tx.dilithium_public_key.as_ref().map_or(true, |k| k.is_empty())
                         || tx.dilithium_signature.as_ref().map_or(true, |s| s.is_empty()) {
@@ -22492,7 +23213,7 @@ impl BlockchainNode {
             // This is NORMAL for P2P: same TX received from multiple peers
             // Only log for system TX (gas_price == u64::MAX) as those are important
             if tx.gas_price == u64::MAX {
-                println!("[WARN][TX] system_tx_not_added hash={} (likely duplicate)", &tx_hash[..16.min(tx_hash.len())]);
+                println!("[WARN][TX] system_tx_not_added hash={} (likely duplicate)", qnet_state::char_prefix(&tx_hash, 16));
             }
             // DON'T return Err! TX might already be in mempool from another peer
         }
@@ -22511,7 +23232,7 @@ impl BlockchainNode {
         let effective_gas = tx.effective_gas_price() * tx.gas_limit;
         let quantum_flag = if tx.is_quantum_signed() { " quantum=true" } else { "" };
         println!("[INFO][NODE] tx_validated hash={} amount={} gas={}{}",
-                 &tx_hash[..16.min(tx_hash.len())], tx.amount, effective_gas, quantum_flag);
+                 qnet_state::char_prefix(&tx_hash, 16), tx.amount, effective_gas, quantum_flag);
         
         // v2.72: Broadcast PendingTx via WebSocket for real-time explorer updates
         if added {
@@ -22755,21 +23476,31 @@ impl BlockchainNode {
             // 2. CLIENT-SIGNED (new flow): wallet Dilithium3 (ML-DSA-65) key
             //    data field starts with "client_node_reg:" — set by handle_node_registration_client_submit
             //    Canonical: "client_node_reg:{node_id}:{wallet_address}:{registration_proof}:{timestamp}"
-            qnet_state::TransactionType::NodeRegistration { node_id, wallet_address, registration_proof, .. } => {
+            qnet_state::TransactionType::NodeRegistration {
+                node_id, wallet_address, registration_proof, node_type, vrf_pk, api_endpoint, ..
+            } => {
                 if tx.data.as_ref().map_or(false, |d| d.starts_with("client_node_reg:")) {
-                    format!("client_node_reg:{}:{}:{}:{}",
-                        node_id, wallet_address, registration_proof, tx.timestamp)
+                    Self::client_node_reg_message(node_id, wallet_address, registration_proof,
+                                                  tx.timestamp, node_type, vrf_pk, api_endpoint)
                 } else {
-                    // Legacy server-signed format
-                    format!("{}|{}|{}|{}|{}|{}|{}",
-                        tx.from, to_str, tx.amount, tx.nonce, tx.gas_price, tx.gas_limit, tx.timestamp)
+                    // Server-signed form. The payload MUST be bound: the bare header leaves node_id,
+                    // wallet_address and node_type outside the signature, so a relayer can retarget the
+                    // registration on the wire and the signature still verifies.
+                    format!("node_reg_v2:{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+                        tx.from, to_str, tx.amount, tx.nonce, tx.gas_price, tx.gas_limit, tx.timestamp,
+                        node_id, wallet_address, format!("{:?}", node_type))
                 }
             }
-            
+
             // === NODEACTIVATION (system TX, Dilithium-signed by producer) ===
-            qnet_state::TransactionType::NodeActivation { .. } => {
-                format!("{}|{}|{}|{}|{}|{}|{}",
-                    tx.from, to_str, tx.amount, tx.nonce, tx.gas_price, tx.gas_limit, tx.timestamp)
+            // node_type / phase / amount are consensus-relevant and were OUTSIDE the signature: a
+            // relayer could flip Light -> Super on a gossiped activation and earn a super roster row
+            // (which feeds eligible_producers -> epoch_commitment -> the QC) at the Light price, or
+            // flip the phase to move which entry-price floor validate() applies.
+            qnet_state::TransactionType::NodeActivation { node_type, amount, phase } => {
+                format!("node_act_v2:{}|{}|{}|{}|{}|{}|{}|{}|{}|{:?}",
+                    tx.from, to_str, tx.amount, tx.nonce, tx.gas_price, tx.gas_limit, tx.timestamp,
+                    format!("{:?}", node_type), amount, phase)
             }
 
             // NodeReactivation (Dilithium-signed by the returning node over its OWN canonical
@@ -22782,7 +23513,7 @@ impl BlockchainNode {
 
             // v35: Heartbeat carries ONE Dilithium sig (in dilithium_signature) over the anchor.
             // Ingest verifies authorship + anchor-binding here; block validation adds the stateful
-            // anchor==chain-hash + recency check (verify_heartbeat_tx). Same string in all three.
+            // anchor==chain-hash + recency check (producer-side gate). Same string in all three.
             qnet_state::TransactionType::Heartbeat { node_id, anchor_height, anchor_hash, .. } => {
                 format!("QNET_HEARTBEAT:{}:{}:{}", node_id, anchor_height, anchor_hash)
             }
@@ -22871,7 +23602,14 @@ impl BlockchainNode {
             };
         }
 
-        // FIX-5: node-signed SYSTEM TXs (Heartbeat/ping/commitment/bitmap) keep the registry-envelope
+        // Heartbeat carries a RAW detached signature and NO key (the key is resolved from committed
+        // state), so it never reaches the envelope path below.
+        if matches!(&tx.tx_type, qnet_state::TransactionType::Heartbeat { .. }) {
+            let storage = crate::node::get_storage();
+            return Ok(Self::verify_heartbeat_dilithium(tx, &storage));
+        }
+
+        // FIX-5: node-signed SYSTEM TXs (ping/commitment/bitmap) keep the registry-envelope
         // convention — a DIFFERENT, legitimate signature scheme from wallet value-TXs (node-identity
         // key resolved via CONSENSUS_PK_REGISTRY, not the eon address). Their signers store the
         // `dilithium_sig_{label}_{b64}` envelope as UTF-8 bytes in the Vec<u8> field; recover it here
@@ -23206,6 +23944,28 @@ impl BlockchainNode {
         !genesis_era && Self::committee_for_height(storage, height).is_none()
     }
 
+    /// True iff any burn-backed NodeRegistration in `txs` names an `attest_epoch` whose committee this
+    /// node cannot resolve — i.e. the burn gate failed because we are BEHIND, not because the block is bad.
+    ///
+    /// The verifier resolves the committee at `attest_rep_height = (attest_epoch-1)*90+1`, and attest_epoch
+    /// may legitimately trail the block's own epoch by up to MAX_ATTEST_EPOCH_LAG. Probing the BLOCK's
+    /// epoch instead therefore answered a different question: a joiner holding only the newest macroblocks
+    /// would find that committee present, skip the defer, and HARD REJECT a block every synced node
+    /// accepts. Ask about the same heights the verifier actually used.
+    pub fn burn_committee_absent_for(
+        storage: &crate::storage::Storage,
+        txs: &[qnet_state::Transaction],
+    ) -> bool {
+        txs.iter().any(|tx| match &tx.tx_type {
+            qnet_state::TransactionType::NodeRegistration { attest_epoch, burn_tx, .. }
+                if !burn_tx.is_empty() && *attest_epoch > 0 =>
+            {
+                Self::n2_committee_absent(storage, attest_epoch.saturating_sub(1) * 90 + 1)
+            }
+            _ => false,
+        })
+    }
+
     /// Phase-1 proof-of-burn consensus gate. The external Solana 1DEV burn is non-deterministic
     /// (live RPC) and cannot be re-checked in apply, so a Byzantine producer could otherwise inject
     /// a NodeRegistration with a fabricated burn that every honest node applies — minting a free
@@ -23222,18 +23982,87 @@ impl BlockchainNode {
     /// byte-identical on every validator regardless of sync mode. Enforced at block validation (the
     /// signature-check tier; apply trusts validated blocks); one-burn-one-node is enforced upstream
     /// by honest-genesis refusal to double-attest (≤f Byzantine cannot reach the 2f+1 quorum).
+    /// Canonical message a registrant's WALLET key signs. Light keeps the four-field form the mobile
+    /// client emits. Super appends the identity fields a relayer could otherwise rewrite for free — the
+    /// consensus key and the announced endpoint are in the TX hash, but nothing signs the hash, so
+    /// hash-membership alone left them substitutable in flight. node_type picks the form, and swapping
+    /// it swaps the form, so the signature no longer verifies either way.
+    pub(crate) fn client_node_reg_message(
+        node_id: &str, wallet: &str, reg_proof: &str, timestamp: u64,
+        node_type: &qnet_state::NodeType, vrf_pk: &[u8], api_endpoint: &str,
+    ) -> String {
+        let base = format!("client_node_reg:{}:{}:{}:{}", node_id, wallet, reg_proof, timestamp);
+        match node_type {
+            qnet_state::NodeType::Light => base,
+            _ => format!("{}:{}:{}", base, hex::encode(Sha3_256::digest(vrf_pk)), api_endpoint),
+        }
+    }
+
+    /// A registration's consensus key: the hashed `vrf_pk` body field, else the envelope key (genesis
+    /// TXs carry their anchored key there, and a Light row's attestation root is its wallet key).
+    /// The ONE resolver, so the apply-time registry row and the block-body scan can never disagree.
+    pub(crate) fn registration_consensus_pk(tx: &qnet_state::Transaction) -> Option<Vec<u8>> {
+        let (vrf_pk, node_type) = match &tx.tx_type {
+            qnet_state::TransactionType::NodeRegistration { vrf_pk, node_type, .. } => (vrf_pk, node_type),
+            _ => return None,
+        };
+        let envelope = match &tx.dilithium_public_key {
+            Some(pk) if pk.len() == crate::crypto::vrf::D3_PK_BYTES => Some(pk.clone()),
+            _ => None,
+        };
+        // Light never signs consensus: its committed key is the WALLET key from the envelope, the
+        // attestation root its liveness proofs are checked against.
+        if matches!(node_type, qnet_state::NodeType::Light) {
+            return envelope;
+        }
+        // Super: the hashed body field, and ONLY it. Keying the choice on tx.data would put a free
+        // attacker-chosen field back in charge of which key becomes a consensus identity. Genesis TXs
+        // carry the pinned anchor here too, so there is no case left needing the envelope.
+        if vrf_pk.len() == crate::crypto::vrf::D3_PK_BYTES {
+            return Some(vrf_pk.clone());
+        }
+        None
+    }
+
+    /// node_id MUST equal the deterministic pseudonym of wallet_address. Genesis identities are
+    /// protocol-minted (fixed ids anchored in the binary) and exempt. Pure function of TX fields —
+    /// same verdict on every node, at admission, producer-include and block validation alike.
+    pub(crate) fn registration_identity_bound(
+        node_id: &str, node_type: &qnet_state::NodeType, wallet: &str, reg_proof: &str,
+    ) -> bool {
+        if reg_proof == "genesis" && crate::genesis_constants::is_legacy_genesis_node(node_id) {
+            return true;
+        }
+        let expected = match node_type {
+            qnet_state::NodeType::Light => crate::rpc::generate_light_node_pseudonym(wallet),
+            _ => crate::rpc::generate_super_node_pseudonym(wallet),
+        };
+        node_id == expected
+    }
+
     pub(crate) async fn verify_burn_attestation_quorum(
         tx: &qnet_state::Transaction,
         height: u64,
         storage: &crate::storage::Storage,
     ) -> Result<(), QNetError> {
-        let (node_id, node_type, wallet, reg_proof, burn_tx, burn_amount, burn_cost, attest_epoch, attestors) = match &tx.tx_type {
+        let (node_id, node_type, wallet, reg_proof, burn_tx, burn_wallet, burn_owner_sig, burn_amount, burn_cost,
+             attest_epoch, attestors) = match &tx.tx_type {
             qnet_state::TransactionType::NodeRegistration {
-                node_id, node_type, wallet_address, registration_proof, burn_tx, burn_amount, burn_cost, attest_epoch, burn_attestors, ..
+                node_id, node_type, wallet_address, registration_proof, burn_tx, burn_wallet, burn_owner_sig,
+                burn_amount, burn_cost, attest_epoch, burn_attestors, ..
             } => (node_id.as_str(), node_type, wallet_address.as_str(), registration_proof.as_str(),
-                  burn_tx.as_str(), *burn_amount, *burn_cost, *attest_epoch, burn_attestors),
+                  burn_tx.as_str(), burn_wallet.as_str(), burn_owner_sig.as_str(), *burn_amount, *burn_cost,
+                  *attest_epoch, burn_attestors),
             _ => return Ok(()), // only NodeRegistration is gated
         };
+
+        // Identity bind FIRST (height-independent): node_id MUST be the deterministic wallet pseudonym.
+        // Without it a burn-backed registration can name any victim's derivable node_id and occupy it
+        // permanently (the apply dup-guard makes it irreversible).
+        if !Self::registration_identity_bound(node_id, node_type, wallet, reg_proof) {
+            return Err(QNetError::ValidationError(
+                "node_id is not the wallet pseudonym (anti-squat)".to_string()));
+        }
 
         // Inert below the coordinated activation height (Phase-1 era gate).
         if !qnet_state::feature_gates::is_active("burn_attestation_required", height) {
@@ -23253,6 +24082,40 @@ impl BlockchainNode {
             return Err(QNetError::ValidationError(
                 "burn_attestation_required: NodeRegistration missing burn_tx".to_string()));
         }
+        // Beneficiary binding. The burner address is inside the 2f+1-signed message and each attestor
+        // signs the fee payer IT verified on Solana, so burn_wallet is committee truth. The burn is the
+        // only Sybil cost, hence its owner is the sole authority on which node it activates: require an
+        // Ed25519 signature by that address over (node_id, wallet_address, registration_proof, timestamp).
+        // Without it a public burn_tx can be front-run — the beneficiary set to the attacker's wallet
+        // (burn theft) or to a victim's, squatting the node_id derived from it. Deterministic: a pure
+        // function of TX bytes, no external read.
+        if burn_wallet.is_empty() || burn_owner_sig.is_empty() {
+            return Err(QNetError::ValidationError(
+                "burn_attestation_required: NodeRegistration missing burn_wallet / burn_owner_sig".to_string()));
+        }
+        let attest_root = tx.dilithium_public_key.as_deref().unwrap_or(&[]);
+        let bind_msg = qnet_state::Transaction::burn_owner_bind_message(
+            node_id, wallet, reg_proof, tx.timestamp, attest_root, burn_tx);
+        let owner_ok = crate::crypto::solana_derivation::verify_ed25519_signature(
+            bind_msg.as_bytes(), burn_owner_sig, burn_wallet).unwrap_or(false);
+        if !owner_ok {
+            return Err(QNetError::ValidationError(
+                "burn_attestation_required: burn_owner_sig does not authorize this beneficiary".to_string()));
+        }
+        // BENEFICIARY consent. The burner's signature proves who paid, never that the named wallet
+        // agreed to be named: without this a burner could point its burn at any victim's wallet, and
+        // since node_id is that wallet's pseudonym the victim's identity is occupied forever. So
+        // wallet_address must derive from a credential the registrant demonstrably holds — the WALLET
+        // ML-DSA-65 key that signed this registration, or the burning Solana address itself.
+        let native_bound = tx.dilithium_public_key.as_deref()
+            .and_then(crate::crypto::solana_derivation::eon_from_qnet_dilithium_pubkey_bytes)
+            .as_deref() == Some(wallet)
+            && Self::verify_node_lifecycle_dilithium(tx);
+        let solana_bound = crate::crypto::solana_derivation::eon_from_solana_address(burn_wallet) == wallet;
+        if !native_bound && !solana_bound {
+            return Err(QNetError::ValidationError(
+                "burn_attestation_required: wallet_address proven by neither the signing wallet key nor burn_wallet".to_string()));
+        }
         // Cost gate: the committee-attested Phase-1 cost MUST be present (old no-cost format is rejected
         // while the gate is active), meet the protocol floor, and be covered by the bound amount. The
         // cost is part of the 2f+1-signed message below, so this binds the registration to the cost the
@@ -23265,14 +24128,16 @@ impl BlockchainNode {
             return Err(QNetError::ValidationError(
                 "burn_attestation_required: bound burn_amount below attested cost".to_string()));
         }
-        // On-chain burn→wallet uniqueness: a burn already committed-bound to a DIFFERENT wallet in an
-        // earlier block cannot back a second node (Sybil amplification under a rotating committee).
-        // Deterministic read of committed state ≤ H; same-block reuse is caught by the block-level
-        // burn_tx dedup in the pipeline. First-wins binding is written at registration apply.
+        // On-chain burn→NODE uniqueness: a burn already committed-bound to a different node in an earlier
+        // block cannot back a second one. Keyed on node_id, not the wallet: one wallet owns two distinct
+        // pseudonyms (super and light), the Phase-1 cost is tier-independent, and node_type is inside the
+        // attested message — so a wallet-keyed bind let ONE 1DEV burn activate BOTH, doubling that
+        // wallet's reward share for a single entry fee. Deterministic read of committed state ≤ H;
+        // same-block reuse is caught by the block-level burn_tx dedup in the pipeline.
         if let Ok(Some(bound)) = storage.committed_burn_wallet_get(burn_tx) {
-            if bound != wallet {
+            if bound != node_id {
                 return Err(QNetError::ValidationError(
-                    "burn_attestation_required: burn_tx already bound to a different wallet".to_string()));
+                    "burn_attestation_required: burn_tx already bound to a different node".to_string()));
             }
         }
 
@@ -23296,9 +24161,16 @@ impl BlockchainNode {
         }
         let attest_genesis_era = attest_epoch <= 2;
 
+        // Bound the attestor list before verifying anything: each entry costs an ML-DSA-65 open, and this
+        // runs on the unauthenticated gossip path.
+        if attestors.len() > 4 * crate::genesis_constants::genesis_node_count().max(256) {
+            return Err(QNetError::ValidationError(
+                "burn_attestation_required: attestor list too large".to_string()));
+        }
+
         // Recompute the exact message the committee signed (incl. attested cost AND attest_epoch); count
         // DISTINCT valid committee sigs.
-        let msg = qnet_state::Transaction::burn_attestation_message(burn_tx, wallet, burn_amount, node_type, burn_cost, attest_epoch);
+        let msg = qnet_state::Transaction::burn_attestation_message(burn_tx, burn_wallet, wallet, burn_amount, node_type, burn_cost, attest_epoch);
 
         // Committee = the deterministic consensus committee OF attest_epoch. committee_for_height is
         // epoch-constant, so the epoch's first height resolves the same set every node computes. PK comes
@@ -23391,8 +24263,10 @@ impl BlockchainNode {
     }
 
     pub fn sign_burn_attestation(
-        &self, burn_tx: &str, qnet_wallet: &str, amount: u64, node_type: qnet_state::NodeType, cost: u64, attest_epoch: u64,
+        &self, burn_tx: &str, burn_wallet: &str, qnet_wallet: &str, amount: u64, node_type: qnet_state::NodeType,
+        cost: u64, attest_epoch: u64,
     ) -> Option<(String, String)> {
+        if burn_wallet.is_empty() { return None; }
         // M-5: attest for the epoch the registrant will BIND (not own tip). Bound recent vs own tip so a
         // stale/forged epoch can't solicit a signature, and only if THIS node is in that epoch's committee.
         const MAX_ATTEST_EPOCH_LAG: u64 = 2;
@@ -23402,16 +24276,21 @@ impl BlockchainNode {
             return None;
         }
         if !self.is_committee_attestor_for_epoch(attest_epoch) { return None; }
-        // One burn → one wallet, PERSISTED (survives process restart; the prior in-memory map was
-        // wiped on restart, letting one burn back >1 node). Genesis-local, off-chain.
+        // One burn → one NODE, PERSISTED (survives process restart). Keyed on the node pseudonym, not the
+        // wallet: the same wallet's super and light ids are different nodes, and a wallet-keyed dedup
+        // happily attested both off one burn.
+        let attest_node_id = match node_type {
+            qnet_state::NodeType::Light => crate::rpc::generate_light_node_pseudonym(qnet_wallet),
+            _ => crate::rpc::generate_super_node_pseudonym(qnet_wallet),
+        };
         match self.storage.attested_burn_get(burn_tx) {
-            Ok(Some(w)) if w != qnet_wallet => return None,   // already attested for a different wallet
-            Ok(Some(_)) => {}                                 // same wallet ⇒ idempotent re-attest
-            _ => { let _ = self.storage.attested_burn_put(burn_tx, qnet_wallet); }
+            Ok(Some(n)) if n != attest_node_id => return None, // already attested for a different node
+            Ok(Some(_)) => {}                                  // same node ⇒ idempotent re-attest
+            _ => { let _ = self.storage.attested_burn_put(burn_tx, &attest_node_id); }
         }
         // Sign the cost the caller computed + verified against the real on-Solana burn, plus attest_epoch.
         // Bound INTO the message so the on-chain verifier trusts them by signature, never re-reading Solana.
-        let msg = qnet_state::Transaction::burn_attestation_message(burn_tx, qnet_wallet, amount, &node_type, cost, attest_epoch);
+        let msg = qnet_state::Transaction::burn_attestation_message(burn_tx, burn_wallet, qnet_wallet, amount, &node_type, cost, attest_epoch);
         let sig = self.wallet_identity.as_ref()?.sign_consensus(&self.node_id, msg.as_bytes()).ok()?;
         Some((self.node_id.clone(), sig))
     }
@@ -23428,7 +24307,7 @@ impl BlockchainNode {
     /// a fork). caller checks the count.
     pub async fn collect_burn_attestations(
         burn_tx: &str, solana_wallet: &str, qnet_wallet: &str, amount: u64, node_type: qnet_state::NodeType,
-        cost: u64, storage: &crate::storage::Storage,
+        cost: u64, owner: &BurnOwnerProof<'_>, storage: &crate::storage::Storage,
     ) -> (Vec<(String, String)>, u64, u64, u64) {
         let nt = match node_type { qnet_state::NodeType::Light => "light", _ => "super" };
         // Attestor set = the consensus committee for the current tip (genesis era ⇒ the genesis set,
@@ -23455,50 +24334,90 @@ impl BlockchainNode {
             "jsonrpc": "2.0", "id": 1, "method": "node_attestBurn",
             "params": { "burn_tx": burn_tx, "solana_wallet": solana_wallet,
                         "qnet_wallet": qnet_wallet, "amount": amount, "node_type": nt, "cost": cost,
-                        "attest_epoch": attest_epoch }
+                        "attest_epoch": attest_epoch,
+                        // Owner proof: each attestor re-verifies it against solana_wallet before doing any
+                        // work, so only the burn's owner can obtain attestations for it.
+                        "node_id": owner.node_id, "registration_proof": owner.registration_proof,
+                        "timestamp": owner.timestamp, "owner_signature": owner.signature,
+                        "attest_root": owner.attest_root_tag }
         });
         // Group sigs by the (cost, amount) PAIR each attestor signed; the embedded registration cost AND
         // amount are exactly what the quorum shares, so keep only the pair-bucket that first reaches
         // `need` distinct members. Returning the agreed amount lets the registrant embed committee truth.
         let mut by_pair: std::collections::BTreeMap<(u64, u64), Vec<(String, String)>> = std::collections::BTreeMap::new();
         let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        for member_id in &committee {
-            // Endpoint IP: chain-registered api_endpoint, else the pinned genesis IP for genesis members.
+        let mut unresolved = 0usize;
+
+        // Resolve endpoints first (pure local lookups), then query in BOUNDED-CONCURRENCY batches.
+        // The loop used to be strictly serial with a 30 s per-request timeout: at the 1000-member target
+        // committee a single slow member could push the whole collection past the 2-epoch attestation
+        // validity window, so onboarding could never complete at scale. Order-independent — the quorum is
+        // a set — so batching changes nothing except wall-clock.
+        let targets: Vec<(String, String)> = committee.iter().filter_map(|member_id| {
             let ip = crate::genesis_constants::get_node_endpoint_ip(member_id)
+                .or_else(|| storage.load_node_endpoint(member_id).ok().flatten()
+                    .map(|ep| crate::genesis_constants::endpoint_ip_only(&ep))
+                    .filter(|ip| !ip.is_empty()))
                 .or_else(|| crate::genesis_constants::genesis_ip_for_node_id(member_id).map(|s| s.to_string()));
-            let ip = match ip { Some(i) if !i.is_empty() => i, _ => continue };
-            let url = format!("http://{}:8001/", ip);
-            let resp = match client.post(&url).json(&body).send().await { Ok(r) => r, Err(_) => continue };
-            let json: serde_json::Value = match resp.json().await { Ok(j) => j, Err(_) => continue };
-            let result = match json.get("result") {
-                Some(r) => r,
-                None => {
-                    // -32050 attest_pending: the attestor's issuance throttle queued this burn —
-                    // a non-vote this round; the convergence driver re-collects next cooldown.
-                    // Tolerates absent data/retry_after (older attestors, plain errors).
-                    if let Some(err) = json.get("error") {
-                        if err.get("code").and_then(|c| c.as_i64()) == Some(-32050) {
-                            let ra = err.get("data").and_then(|d| d.get("retry_after_secs")).and_then(|v| v.as_u64()).unwrap_or(0);
-                            if is_info() { println!("[INFO][REG] attest_pending member={} retry_after={}s", member_id, ra); }
-                        }
-                    }
-                    continue;
-                }
-            };
-            let gid = result.get("genesis_id").and_then(|v| v.as_str()).unwrap_or("");
-            let sig = result.get("sig").and_then(|v| v.as_str()).unwrap_or("");
-            let signed_cost = result.get("cost").and_then(|v| v.as_u64()).unwrap_or(0);
-            // The attestor signed over the ACTUAL on-Solana burned amount; embed exactly that.
-            let signed_amount = result.get("amount").and_then(|v| v.as_u64()).unwrap_or(0);
-            // Count only a committee member's signed response (the verifier enforces membership too).
-            if gid.is_empty() || sig.is_empty() || signed_cost == 0 || signed_amount == 0
-                || !committee.iter().any(|m| m == gid) { continue; }
-            if !seen.insert(gid.to_string()) { continue; } // distinct only
-            let bucket = by_pair.entry((signed_cost, signed_amount)).or_default();
-            bucket.push((gid.to_string(), sig.to_string()));
-            if bucket.len() >= need {
-                return (bucket.clone(), signed_cost, signed_amount, attest_epoch);
+            match ip {
+                Some(i) if !i.is_empty() => Some((member_id.clone(), format!("http://{}:8001/", i))),
+                _ => None,
             }
+        }).collect();
+        unresolved = committee.len().saturating_sub(targets.len());
+
+        const ATTEST_FANOUT: usize = 32;
+        'outer: for chunk in targets.chunks(ATTEST_FANOUT) {
+            let calls = chunk.iter().map(|(member_id, url)| {
+                let client = client.clone();
+                let body = body.clone();
+                let member_id = member_id.clone();
+                let url = url.clone();
+                async move {
+                    let resp = client.post(&url).json(&body).send().await.ok()?;
+                    let json: serde_json::Value = resp.json().await.ok()?;
+                    Some((member_id, json))
+                }
+            });
+            for out in futures::future::join_all(calls).await {
+                let (member_id, json) = match out { Some(x) => x, None => continue };
+                let result = match json.get("result") {
+                    Some(r) => r,
+                    None => {
+                        // -32050 attest_pending: the attestor's issuance throttle queued this burn —
+                        // a non-vote this round; the convergence driver re-collects next cooldown.
+                        if let Some(err) = json.get("error") {
+                            if err.get("code").and_then(|c| c.as_i64()) == Some(-32050) {
+                                let ra = err.get("data").and_then(|d| d.get("retry_after_secs")).and_then(|v| v.as_u64()).unwrap_or(0);
+                                if is_info() { println!("[INFO][REG] attest_pending member={} retry_after={}s", member_id, ra); }
+                            }
+                        }
+                        continue;
+                    }
+                };
+                let gid = result.get("genesis_id").and_then(|v| v.as_str()).unwrap_or("");
+                let sig = result.get("sig").and_then(|v| v.as_str()).unwrap_or("");
+                let signed_cost = result.get("cost").and_then(|v| v.as_u64()).unwrap_or(0);
+                // The attestor signed over the ACTUAL on-Solana burned amount; embed exactly that.
+                let signed_amount = result.get("amount").and_then(|v| v.as_u64()).unwrap_or(0);
+                // The attestor echoes the burner address it verified and signed. A different one means it
+                // signed a different message than the one the registrant will embed.
+                let signed_burner = result.get("burn_wallet").and_then(|v| v.as_str()).unwrap_or("");
+                if gid.is_empty() || sig.is_empty() || signed_cost == 0 || signed_amount == 0
+                    || signed_burner != solana_wallet
+                    || !committee.iter().any(|m| m == gid) { continue; }
+                if !seen.insert(gid.to_string()) { continue; } // distinct only
+                let bucket = by_pair.entry((signed_cost, signed_amount)).or_default();
+                bucket.push((gid.to_string(), sig.to_string()));
+                if bucket.len() >= need { break 'outer; }
+            }
+        }
+        if let Some(((c, a), v)) = by_pair.iter().find(|(_, v)| v.len() >= need) {
+            return (v.clone(), *c, *a, attest_epoch);
+        }
+        if unresolved > 0 && committee.len().saturating_sub(unresolved) < need {
+            eprintln!("[WARN][REG] attestors_unreachable committee={} unresolved={} need={} — quorum impossible until endpoints are known",
+                      committee.len(), unresolved, need);
         }
         // No (cost, amount) bucket reached quorum — return the largest bucket + its pair so the caller can
         // log got/need and retry (e.g. a 10% boundary split, or attestors disagreeing on the amount).
@@ -23512,6 +24431,10 @@ impl BlockchainNode {
         // PRODUCTION VALIDATION - same as submit_transaction
         if let Err(validation_error) = tx.validate() {
             return Err(QNetError::ValidationError(format!("Transaction validation failed: {}", validation_error)));
+        }
+        if !Self::gas_limit_admissible(&tx) {
+            return Err(QNetError::ValidationError(format!(
+                "gas_limit {} exceeds MAX_GAS_LIMIT {}", tx.gas_limit, qnet_state::gas_limits::MAX_GAS_LIMIT)));
         }
 
         // v32.12: gossip-side activation admission rate limit. NodeRegistration
@@ -23702,11 +24625,14 @@ impl BlockchainNode {
 
             if matches!(tx.tx_type, qnet_state::TransactionType::RewardDistribution) && tx.from != "system_emission" {
                 if tx.from == "system_rewards_pool" {
-                    // Merkle reward-claim: authorized by re-verifying each proof against the QC-certified
-                    // reward_root, NOT a client signature (the claimed node_id is not carried on-chain).
-                    // Verify proofs here too so junk/forged claims are rejected at the door, not merely
-                    // dropped as no-ops at apply — keeps spam out of the mempool and blocks.
-                    if !Self::claim_proofs_admissible(&self.get_storage(), &tx) {
+                    // Merkle reward-claim: the recipient's own key must authorise this exact payload and
+                    // every proof must verify against the QC-certified reward_root. Checked here too so
+                    // forged claims are rejected at the door, not merely dropped as no-ops at apply.
+                    let last_claimed = match &tx.to {
+                        Some(w) => self.get_state_manager().read().await.get_last_claimed_epoch(w),
+                        None => u64::MAX,
+                    };
+                    if !Self::claim_proofs_admissible(&self.get_storage(), &tx, last_claimed) {
                         return Err(QNetError::ValidationError(
                             "Reward claim has no valid merkle proofs".to_string()
                         ));
@@ -23828,6 +24754,13 @@ impl BlockchainNode {
                     qnet_state::TransactionType::EquivocationProof { .. } |
                     qnet_state::TransactionType::VoteEquivocationProof { .. }
                 );
+                // "Self-verifying" now means "verify the EMBEDDED proof here": the apply arm marks the
+                // offender's account, so a junk proof must never reach it.
+                if self_verifying
+                    && !Self::equivocation_proof_verified(&self.get_storage(), &tx).await {
+                    return Err(QNetError::ValidationError(
+                        "[REJECT][AUTH] equivocation proof does not verify".to_string()));
+                }
                 if !self_verifying {
                     if tx.dilithium_public_key.as_ref().map_or(true, |k| k.is_empty())
                         || tx.dilithium_signature.as_ref().map_or(true, |s| s.is_empty()) {
@@ -23857,7 +24790,13 @@ impl BlockchainNode {
             qnet_state::TransactionType::LightNodeEligibilityBitmap { .. } |
             qnet_state::TransactionType::RewardDistribution { .. } |
             qnet_state::TransactionType::NodeRegistration { .. } |
-            qnet_state::TransactionType::NodeActivation { .. }
+            qnet_state::TransactionType::NodeActivation { .. } |
+            // Slashing proofs are built by a detector, not by an account: `from = "system_slashing"`
+            // with nonce 0. Without this the gossip path rejected every relayed proof on nonce while
+            // the RPC path let it through — which is why evidence could only ever reach the chain
+            // inside its own detector's block.
+            qnet_state::TransactionType::EquivocationProof { .. } |
+            qnet_state::TransactionType::VoteEquivocationProof { .. }
         );
         
         // PROTOCOL: State-level dedup check for commitment TXs (prevents duplicate per node per epoch)
@@ -23881,7 +24820,7 @@ impl BlockchainNode {
             };
             if is_duplicate {
                 return Err(QNetError::ValidationError(
-                    format!("duplicate commitment TX: already committed for this epoch hash={}", &tx.hash[..16.min(tx.hash.len())])
+                    format!("duplicate commitment TX: already committed for this epoch hash={}", qnet_state::char_prefix(&tx.hash, 16))
                 ));
             }
         }
@@ -24313,7 +25252,7 @@ impl BlockchainNode {
             //   with "3 peers did not respond for h=0-0" — infinite retry loop
             // SOLUTION: Send empty BlocksBatch so requester knows range is empty
             //   This is standard P2P protocol: every request gets a response.
-            //   (Ethereum devp2p, libp2p — always respond with data or empty)
+            //   (standard p2p practice — always respond with data or empty)
             if let Some(ref p2p) = self.unified_p2p {
                 let peer_addr = p2p.get_peer_address_by_id(&requester_id)
                     .or_else(|| {
@@ -24688,8 +25627,16 @@ impl BlockchainNode {
         };
         let (cp, qc): (qnet_consensus::checkpoint_bft::Checkpoint, qnet_consensus::checkpoint_bft::QuorumCertificate) =
             bincode::deserialize(cp_qc).map_err(|e| format!("v2_qc_decode mb={} err={}", index, e))?;
-        if cp.window_head_height / 90 != index || cp.hash() != qc.checkpoint_hash {
-            return Err(format!("v2_qc_unbound mb={}", index));
+        // EXACT boundary, not the quotient: heads N*90+30 and N*90+60 are honestly certified every 30
+        // blocks and both satisfy `head / 90 == N`. Accepting one stores a macroblock whose body is a
+        // 30-block window; save_macroblock is first-write-wins, so the real boundary macroblock can
+        // never replace it and every later one fails the parent link — a permanent wedge for any
+        // cold-joiner. Mirrors the sealer's own `head % macro_interval == 0`.
+        if cp.window_head_height != index.saturating_mul(90) || cp.hash() != qc.checkpoint_hash {
+            return Err(format!("v2_qc_unbound mb={} head={}", index, cp.window_head_height));
+        }
+        if macroblock.micro_blocks.len() != 90 {
+            return Err(format!("v2_qc_window_len mb={} len={}", index, macroblock.micro_blocks.len()));
         }
         // Weak-subjectivity trust root — INERT at the fresh-genesis pin (0,zeros). The cold-join lineage
         // walk re-verifies macroblock QCs UP from an EXOGENOUS root so a byzantine snapshot server cannot
@@ -24740,6 +25687,25 @@ impl BlockchainNode {
         if index < ws.0 {
             return Err(format!("v2_below_ws mb={} ws={}", index, ws.0));
         }
+        // Chain link, mirroring what the sealer now does. previous_hash is INSIDE MacroBlock::hash()
+        // but is NOT a Checkpoint field, so the 2f+1 QC does not cover it — every other body field
+        // below is QC-bound, this one was whatever the sending peer chose. A byzantine proposer could
+        // broadcast an otherwise fully-valid macroblock with a forged previous_hash; receivers stored
+        // it verbatim (save_macroblock is first-write-wins and nothing re-validates), so their
+        // macroblock hash diverged from everyone else's — permanently, and it propagates into the next
+        // previous_hash. An ABSENT parent stays permitted: pruned history, cold-join below the walk
+        // root and out-of-order backfill all reach here legitimately. Same rule the microblock path
+        // already applies — reject a PRESENT mismatching parent, allow an absent one.
+        if index > 1 {
+            if let Some(parent) = storage.get_macroblock_by_height(index - 1).ok().flatten()
+                .and_then(Self::macroblock_plaintext)
+                .and_then(|raw| bincode::deserialize::<qnet_state::MacroBlock>(&raw).ok())
+            {
+                if macroblock.previous_hash != parent.hash() {
+                    return Err(format!("v2_parent_link_mismatch mb={}", index));
+                }
+            }
+        }
         if cp.window_mb_hashes != macroblock.micro_blocks
             || cp.state_root != macroblock.state_root
             || macroblock.consensus_data.randomness_beacon != Some(cp.beacon)
@@ -24754,18 +25720,36 @@ impl BlockchainNode {
         // cold-join ASCENDING walk the N-2 anchor is not merely PRESENT but already VERIFIED (it was
         // verify-then-saved earlier in the same walk), so presence here implies a genesis/pin-rooted
         // committee source — never a peer-chosen one.
-        if let Some(n2) = Self::v2_committee_anchor_index(index) {
-            if n2 > ws.0 && storage.get_macroblock_by_height(n2).ok().flatten().is_none() {
-                return Err(format!("v2_qc_defer_anchor mb={} need_mb_n2={}", index, n2));
+        // Committee + threshold both come from ONE place, chosen by the certificate's own bytes.
+        // A pinned checkpoint bypasses local derivation entirely: the committee at a stuck window is
+        // NOT the anchor's committee (its candidate set is read from the uncertified tail and has
+        // already been shrunk by the inactivity filter), so deriving here would reject every relaxed
+        // macroblock on every node that did not seal it.
+        // The pin is attacker-chosen wire data folded into Checkpoint::hash, and it SELECTS the
+        // verifying committee and threshold below. While the feature is off it must be inert on the
+        // ACCEPTANCE path too, not only on the arm — otherwise one Byzantine leader proposes an
+        // otherwise-honest pinned checkpoint, the unarmed committee votes and seals it, and every
+        // non-sealer rejects it forever.
+        if !RC_ENABLED && cp.recovery_anchor.is_some() {
+            return Err(format!("v2_rc_disabled mb={}", index));
+        }
+        let (committee, quorum) = match cp.recovery_anchor {
+            None => {
+                if let Some(n2) = Self::v2_committee_anchor_index(index) {
+                    if n2 > ws.0 && storage.get_macroblock_by_height(n2).ok().flatten().is_none() {
+                        return Err(format!("v2_qc_defer_anchor mb={} need_mb_n2={}", index, n2));
+                    }
+                }
+                let qualified = Self::calculate_qualified_candidates(p2p, node_id, node_type, cp.window_head_height).await;
+                let mut ids: Vec<String> = qualified.iter().map(|(id, _)| id.clone()).collect();
+                ids.sort();
+                let committee = Self::select_consensus_committee(&ids, index, storage);
+                let q = qnet_consensus::checkpoint_bft::quorum_size(committee.len());
+                if q == 0 { return Err(format!("v2_qc_no_committee mb={}", index)); }
+                (committee, q)
             }
-        }
-        let qualified = Self::calculate_qualified_candidates(p2p, node_id, node_type, cp.window_head_height).await;
-        let mut ids: Vec<String> = qualified.iter().map(|(id, _)| id.clone()).collect();
-        ids.sort();
-        let committee = Self::select_consensus_committee(&ids, index, storage);
-        if qnet_consensus::checkpoint_bft::quorum_size(committee.len()) == 0 {
-            return Err(format!("v2_qc_no_committee mb={}", index));
-        }
+            Some((a, ah)) => Self::resolve_recovery_pin(storage, index, &cp, a, ah)?,
+        };
         let elig = macroblock.consensus_data.eligible_producers.as_deref().unwrap_or(&[]);
         let cmt = macroblock.consensus_data.consensus_committee.clone().unwrap_or_default();
         // The stored ban set is QC-bound via epoch_commitment: deserialize the body's bytes and
@@ -24775,6 +25759,12 @@ impl BlockchainNode {
             .and_then(|b| bincode::deserialize::<Vec<String>>(b).ok()).unwrap_or_default();
         if qnet_consensus::checkpoint_bft::epoch_commitment(elig, &cmt, &banned) != cp.epoch_commitment {
             return Err(format!("v2_epoch_uncertified mb={}", index));
+        }
+        // Under a pin the signature-checking set IS the anchor's committee, so the body must publish
+        // exactly that — otherwise a relaxed macroblock could commit one committee while being
+        // certified by another.
+        if cp.recovery_anchor.is_some() && cmt != committee {
+            return Err(format!("v2_rc_committee_mismatch mb={}", index));
         }
         // Observability backstop: independently re-derive the certified reward_root and ALARM on a
         // mismatch — but never reject. The committee already fail-stops on a divergent reward_root at
@@ -24788,8 +25778,12 @@ impl BlockchainNode {
         if cp.reward_root != [0u8; 32] {
             let ci = qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL;
             let start = cp.window_head_height.saturating_sub(ci).saturating_add(1);
-            if let Some((root_hex, _, _, _)) = Self::compute_window_reward(storage, start, cp.window_head_height) {
-                if root_hex != hex::encode(cp.reward_root) && is_warn() {
+            if let Some(root_hex) = Self::compute_window_reward(storage, start, cp.window_head_height) {
+                // Non-empty only: an empty root means this node could not recompute the leaf set at
+                // all (it now still returns the schedule-validated total for the adoption path), not
+                // that it recomputed a DIFFERENT root. Warning on it would report a divergence that
+                // does not exist.
+                if !root_hex.is_empty() && root_hex != hex::encode(cp.reward_root) && is_warn() {
                     println!("[WARN][REWARDS] reward_root_local_mismatch mb={} (trusting 2f+1 QC; adoption reconciles)", index);
                 }
             }
@@ -24804,7 +25798,7 @@ impl BlockchainNode {
                 _ => crate::genesis_constants::get_genesis_anchor_pk(id).map(|p| (id.clone(), p)),
             }
         }).collect();
-        let verified = qc.verify(&committee, |voter, body, sig| {
+        let verified = qc.verify(&committee, quorum, |voter, body, sig| {
             let pk = match pk_map.get(voter) { Some(p) => p, None => return false };
             match std::str::from_utf8(sig) {
                 Ok(s) => qnet_consensus::consensus_crypto::verify_consensus_signature_compact(
@@ -24948,65 +25942,8 @@ impl BlockchainNode {
             if is_info() {
                 println!("[INFO][MB] v2_qc_ok mb={}", index);
             }
-            // C2: adopt the committee-certified reward root. If this node's locally-applied root for
-            // an emission epoch differs (applied with incomplete data during catch-up), overwrite it
-            // with the QC-certified Checkpoint.reward_root + re-derive the leaf set from the synced
-            // window — never a single producer's TX root. Off state_root ⇒ cannot fork.
-            if let Ok((cp, _qc)) = bincode::deserialize::<(qnet_consensus::checkpoint_bft::Checkpoint, qnet_consensus::checkpoint_bft::QuorumCertificate)>(cp_qc) {
-                if cp.reward_root != [0u8; 32] {
-                    let ci = qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL;
-                    let mbi = qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
-                    let start = cp.window_head_height.saturating_sub(ci).saturating_add(1);
-                    let certified = hex::encode(cp.reward_root);
-                    // The reward root is committee-verified (content_ok) + QC-signed ⇒ the 2f+1
-                    // authority. Adopt it on EVERY finalizing node so claims verify everywhere. A
-                    // local recompute that disagrees means OUR data is incomplete (catch-up), not
-                    // that the root is wrong — never leave a node serving a divergent local root.
-                    match Self::compute_window_reward(&self.storage, start, cp.window_head_height) {
-                        // Re-derived root matches: store root + full leaf set (proofs available here).
-                        Some((root_hex, wallets, _, epoch)) if root_hex == certified => {
-                            let cur = self.storage.load_epoch_reward_root(epoch).ok().flatten().map(|(r, ..)| r);
-                            if cur.as_deref() != Some(certified.as_str()) {
-                                let rtotal: u64 = wallets.iter().map(|(_, a)| *a).sum();
-                                let rcount = wallets.len() as u32;
-                                let rper = if rcount > 0 { rtotal / rcount as u64 } else { 0 };
-                                let _ = self.storage.save_epoch_reward_root(epoch, &certified, rper, rcount, rtotal);
-                                let _ = self.storage.append_reward_epoch(epoch);
-                                if is_info() { println!("[INFO][REWARDS] reward_root_adopted epoch={} root={}..", epoch, &certified[..16.min(certified.len())]); }
-                            }
-                            // Freeze the sharded leaf-set INDEPENDENTLY of the root-idempotency above: it
-                            // re-derived to the 2f+1 CERTIFIED root (strongest authority). If an earlier
-                            // finalization adopted the root ROOT-ONLY (incomplete data), the structure is
-                            // still missing — write it now so claims load one shard, not a per-call recompute.
-                            if self.storage.load_epoch_shard_meta(epoch).ok().flatten().is_none() {
-                                Self::save_epoch_reward_sharded(&self.storage, epoch, &wallets);
-                            }
-                        }
-                        // Leaf set not re-derivable here (incomplete/pruned/divergent): still adopt the
-                        // certified ROOT under the canonical epoch so claims verify; wallets are served
-                        // by synced peers. Epoch = boundary-height index − macroblocks/epoch (no scan).
-                        other => {
-                            // Keep the CONSERVED total (available when a set was re-derived, even if it
-                            // mismatched the certified root) so a later recompute — once this node's data
-                            // heals — can rebuild the leaf-set; None ⇒ no emission info ⇒ 0.
-                            let (epoch, wtotal) = match other {
-                                Some((_, _, t, e)) => (e, t),
-                                None => ((cp.window_head_height / mbi).saturating_sub(14400 / mbi), 0),
-                            };
-                            let cur = self.storage.load_epoch_reward_root(epoch).ok().flatten().map(|(r, ..)| r);
-                            if cur.as_deref() != Some(certified.as_str()) {
-                                let _ = self.storage.save_epoch_reward_root(epoch, &certified, 0, 0, wtotal);
-                                // A structure frozen earlier no longer recombines to the adopted certified root
-                                // — drop it so the claim path rebuilds (verify-gated) instead of serving a stale
-                                // set; a healed node then serves correctly, meanwhile wallets come via peers.
-                                let _ = self.storage.delete_epoch_reward_shards(epoch);
-                                let _ = self.storage.append_reward_epoch(epoch);
-                                if is_warn() { println!("[WARN][REWARDS] reward_root_adopted_rootonly epoch={} (leaf set deferred; local recompute absent/divergent)", epoch); }
-                            }
-                        }
-                    }
-                }
-            }
+            // The certified reward root is persisted by save_macroblock, atomically with this
+            // macroblock. No adoption step: there is nothing to reconcile.
             // Catch-up safety-net (§4.5): hand the now-VERIFIED (checkpoint, QC) to the BFT2 driver so
             // a node whose consensus round fell behind the live quorum fast-forwards from committed
             // state. adopt_qc is monotonic ⇒ a no-op for a node already at/ahead of this checkpoint.
@@ -25631,14 +26568,14 @@ impl BlockchainNode {
                     ))?;
                 
                 println!("[INFO][ACTIVATION] solana_from_mnemonic={}...", 
-                    &solana_from_mnemonic[..16.min(solana_from_mnemonic.len())]);
+                    qnet_state::char_prefix(&solana_from_mnemonic, 16));
                 
                 // STATELESS XOR verification — compare code's embedded wallet with mnemonic's Solana address
                 // This is THE critical check: proves mnemonic owner == code owner
                 match registry.verify_code_ownership_stateless(code, &solana_from_mnemonic, &env_burn_tx, env_burn_amount) {
                     Ok(true) => {
                         println!("[INFO][ACTIVATION] code_verified method=mnemonic_xor_match solana={}...",
-                            &solana_from_mnemonic[..16.min(solana_from_mnemonic.len())]);
+                            qnet_state::char_prefix(&solana_from_mnemonic, 16));
                         // G3-L1: admission-advisory — re-verify the 1DEV burn ACTUALLY happened on
                         // Solana. The XOR check above only proves code↔wallet↔CLAIMED-burn-params
                         // consistency (the params are operator-supplied), NOT that a real burn occurred;
@@ -25653,7 +26590,7 @@ impl BlockchainNode {
                             Ok((true, _)) => {
                                 if is_info() {
                                     println!("[INFO][ACTIVATION] burn_verified_onchain tx={}...",
-                                        &env_burn_tx[..16.min(env_burn_tx.len())]);
+                                        qnet_state::char_prefix(&env_burn_tx, 16));
                                 }
                             }
                             Ok((false, _)) => return Err(QNetError::ValidationError(format!(
@@ -25667,7 +26604,7 @@ impl BlockchainNode {
                     }
                     Ok(false) => {
                         println!("[ERR][ACTIVATION] mnemonic_mismatch solana_from_seed={}... code_wallet=different",
-                            &solana_from_mnemonic[..16.min(solana_from_mnemonic.len())]);
+                            qnet_state::char_prefix(&solana_from_mnemonic, 16));
                         return Err(QNetError::ValidationError(
                             "Activation code does not belong to this mnemonic. \
                              The code was generated for a different wallet. \
@@ -25704,7 +26641,7 @@ impl BlockchainNode {
                 // An env-provided burn_tx is always a 1DEV burn = activation Phase 1.
                 let phase = 1;
                 println!("[INFO][ACTIVATION] using_env_burn_data tx={}... amount={} phase={}",
-                    &env_burn_tx[..16.min(env_burn_tx.len())], env_burn_amount, phase);
+                    qnet_state::char_prefix(&env_burn_tx, 16), env_burn_amount, phase);
                 (wallet, env_burn_tx, phase, env_burn_amount)
             } else {
                 // Legacy path: decrypt code to get wallet + burn_tx
@@ -25762,8 +26699,8 @@ impl BlockchainNode {
         };
         
         println!("[INFO][ACTIVATION] payload_extracted wallet={}... burn_tx={}... phase={} burn_amount={}",
-                 &wallet_address[..16.min(wallet_address.len())],
-                 &burn_tx_hash[..16.min(burn_tx_hash.len())],
+                 qnet_state::char_prefix(&wallet_address, 16),
+                 qnet_state::char_prefix(&burn_tx_hash, 16),
                  phase, burn_amount);
             
         // Create node info for blockchain registry with secure hash (SHA3-256 for NIST compliance)
@@ -25908,6 +26845,20 @@ impl BlockchainNode {
             &api_endpoint,
         );
 
+        // A Super MUST announce its consensus key in the hashed body: the committed row is immutable
+        // once stamped, so a keyless registration would permanently strand this identity (no votes, no
+        // production, never a burn attestor). Abort the arm instead — the driver retries once the key
+        // is installed.
+        if matches!(qnet_node_type, qnet_state::NodeType::Super) {
+            let has_key = matches!(&registration_tx.tx_type,
+                qnet_state::TransactionType::NodeRegistration { vrf_pk, .. }
+                    if vrf_pk.len() == crate::crypto::vrf::D3_PK_BYTES);
+            if !has_key {
+                eprintln!("[WARN][REG] vrf_pk_missing node={} — retrying arm once the consensus key is installed", node_id);
+                return Err(QNetError::NetworkError("vrf_pk_missing".to_string()));
+            }
+        }
+
         // Re-arm edge default: the current tip's epoch (pre-gate arms never carry attestations).
         let tip_h = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
         let mut armed_epoch = tip_h.saturating_sub(1) / 90 + 1;
@@ -25938,8 +26889,36 @@ impl BlockchainNode {
                     };
                     // The embedded burn_amount is the committee-certified agreed_amount (== what the
                     // counted 2f+1 signed); QNET_BURN_AMOUNT is only an operator hint.
+                    // Burner authorization: sign the beneficiary bind message with the SAME mnemonic-derived
+                    // Solana key that made the burn. Attestors verify it before signing, and block validation
+                    // re-verifies it from the TX — the burn can only ever activate the node its owner named,
+                    // running the attestation root its owner named. The wallet key is derived first because
+                    // its tag is inside that signed message.
+                    let (wallet_pk, _) = crate::crypto::genesis_key::derive_wallet_mldsa65_from_mnemonic(&mnemonic);
+                    let attest_root_tag = qnet_state::Transaction::attest_root_tag(&wallet_pk);
+                    let owner_sig = {
+                        use ed25519_dalek::Signer;
+                        let msg = qnet_state::Transaction::burn_owner_bind_message(
+                            &node_id, &wallet_address, &registration_proof, registration_tx.timestamp,
+                            &wallet_pk, &b_tx);
+                        match crate::crypto::solana_derivation::derive_solana_signing_key_from_mnemonic(&mnemonic) {
+                            Ok(sk) => hex::encode(sk.sign(msg.as_bytes()).to_bytes()),
+                            Err(e) => {
+                                eprintln!("[WARN][REG] burn_owner_sign_failed err={} — retrying arm", e);
+                                return Err(QNetError::NetworkError("burn_owner_sign_failed".to_string()));
+                            }
+                        }
+                    };
+                    let owner_proof = crate::node::BurnOwnerProof {
+                        node_id: &node_id,
+                        registration_proof: &registration_proof,
+                        timestamp: registration_tx.timestamp,
+                        signature: &owner_sig,
+                        attest_root_tag: &attest_root_tag,
+                    };
                     let (attestors, agreed_cost, agreed_amount, agreed_epoch) = Self::collect_burn_attestations(
-                        &b_tx, &solana_wallet, &wallet_address, b_amt, qnet_node_type, cost_hint, &storage).await;
+                        &b_tx, &solana_wallet, &wallet_address, b_amt, qnet_node_type, cost_hint,
+                        &owner_proof, &storage).await;
                     // Arm gate = quorum of the committee OF agreed_epoch — the SAME committee the
                     // attestors signed for and the on-chain verifier re-resolves (M-5). Genesis era ⇒
                     // the genesis set; post-genesis None ⇒ this node can't read that epoch's N-2
@@ -25965,32 +26944,43 @@ impl BlockchainNode {
                             "burn_attest_sub_quorum got={} need={}", attestors.len(), need)));
                     }
                     if let qnet_state::TransactionType::NodeRegistration {
-                        burn_tx: bt, burn_amount: ba, burn_cost: bc, burn_attestors: at, attest_epoch: ae, ..
+                        burn_tx: bt, burn_wallet: bw, burn_owner_sig: bos, burn_amount: ba, burn_cost: bc,
+                        burn_attestors: at, attest_epoch: ae, ..
                     } = &mut registration_tx.tx_type {
-                        *bt = b_tx; *ba = agreed_amount; *bc = agreed_cost; *at = attestors; *ae = agreed_epoch;
+                        *bt = b_tx; *bw = solana_wallet; *bos = owner_sig; *ba = agreed_amount; *bc = agreed_cost;
+                        *at = attestors; *ae = agreed_epoch;
                     }
                     armed_epoch = agreed_epoch;
                 }
             }
         }
 
-        // Pure ML-DSA-65 signing. Keys are created ON THIS NODE — the wallet MUST be the EON derived
-        // from this Dilithium key (native_bound, verified at block validation), so no block producer
-        // can forge a NodeRegistration for a foreign wallet.
+        // Beneficiary proof: sign with the WALLET ML-DSA-65 key, whose EON IS wallet_address. Block
+        // validation checks that binding, so a registration can only ever name a wallet the signer
+        // controls. The node's consensus key rides the hashed vrf_pk body field instead — the two are
+        // deliberately different keys and only the wallet one proves ownership.
         {
-            let canonical_msg = format!("client_node_reg:{}:{}:{}:{}",
-                node_id, wallet_address, registration_proof, registration_tx.timestamp);
-            if let Some(ref identity) = wallet_identity {
+            let canonical_msg = match &registration_tx.tx_type {
+                qnet_state::TransactionType::NodeRegistration { node_type, vrf_pk, api_endpoint, .. } =>
+                    Self::client_node_reg_message(&node_id, &wallet_address, &registration_proof,
+                                                  registration_tx.timestamp, node_type, vrf_pk, api_endpoint),
+                _ => String::new(),
+            };
+            {
                 // FIX-5 wire: RAW detached sig (3309 B) + RAW pk (1952 B) — the exact form the client-reg
-                // verifier (verify_node_lifecycle_dilithium) requires. The envelope form (sign_consensus)
-                // is length-gated out (len != 3309), which silently killed super-node onboarding.
-                match identity.sign(canonical_msg.as_bytes()) {
-                    Ok(detached_sig) => {
-                        registration_tx.dilithium_signature = Some(detached_sig);
-                        registration_tx.dilithium_public_key = Some(identity.dilithium_pk.to_vec());
+                // verifier (verify_node_lifecycle_dilithium) requires.
+                use pqcrypto_traits::sign::{DetachedSignature as _, SecretKey as _};
+                let mnemonic = std::env::var("QNET_WALLET_SEED").unwrap_or_default();
+                let (wpk, wsk) = crate::crypto::genesis_key::derive_wallet_mldsa65_from_mnemonic(&mnemonic);
+                match pqcrypto_mldsa::mldsa65::SecretKey::from_bytes(&wsk) {
+                    Ok(sk) => {
+                        let sig = pqcrypto_mldsa::mldsa65::detached_sign(canonical_msg.as_bytes(), &sk);
+                        registration_tx.dilithium_signature = Some(sig.as_bytes().to_vec());
+                        registration_tx.dilithium_public_key = Some(wpk);
                     }
                     Err(e) => {
-                        eprintln!("[WARN][REG] dilithium3_sign_failed: {}", e);
+                        eprintln!("[WARN][REG] wallet_key_sign_failed err={:?}", e);
+                        return Err(QNetError::NetworkError("wallet_key_sign_failed".to_string()));
                     }
                 }
             }
@@ -26009,8 +26999,8 @@ impl BlockchainNode {
             if is_info() {
                 println!("[INFO][REG] onchain_tx_submitted node={} wallet={}... hash={}...",
                          node_id,
-                         &wallet_address[..16.min(wallet_address.len())],
-                         &tx_hash[..16.min(tx_hash.len())]);
+                         qnet_state::char_prefix(&wallet_address, 16),
+                         qnet_state::char_prefix(&tx_hash, 16));
             }
             // Arm the backoff rebroadcast (field 3 = backoff tick, field 4 = re-arm edge epoch).
             if let Ok(mut pend) = PENDING_NODE_REGISTRATION.lock() {
@@ -26025,7 +27015,7 @@ impl BlockchainNode {
                 for ip in &genesis_ips {
                     p2p.send_network_message(&format!("{}:8001", ip), tx_msg.clone());
                 }
-                if is_info() { println!("[INFO][REG] registration_tx_broadcast hash={} genesis={}", &tx_hash[..16.min(tx_hash.len())], genesis_ips.len()); }
+                if is_info() { println!("[INFO][REG] registration_tx_broadcast hash={} genesis={}", qnet_state::char_prefix(&tx_hash, 16), genesis_ips.len()); }
             }
         } else {
             // Not in the local mempool ⇒ PENDING is NOT armed and the rebroadcast has nothing to send.
@@ -26325,7 +27315,7 @@ impl BlockchainNode {
             Ok(payload) => Ok(payload),
             Err(e) => {
                 println!("[ERR][ACTIVATION] quantum_decryption_failed err={}", e);
-                println!("   Code: {}...", &code[..8.min(code.len())]);
+                println!("   Code: {}...", qnet_state::char_prefix(&code, 8));
                 println!("   This activation code is invalid, corrupted, or crypto system is broken");
                 Err(QNetError::ValidationError(format!("Quantum decryption failed - invalid activation code: {}", e)))
             }
@@ -26369,8 +27359,8 @@ impl BlockchainNode {
                             if let Some(current_device) = json["device_id"].as_str() {
                                 if current_device != my_device {
                                     println!("[WARN][MIGRATION] device_changed my={} current={} action=shutdown",
-                                        &my_device[..8.min(my_device.len())],
-                                        &current_device[..8.min(current_device.len())]);
+                                        qnet_state::char_prefix(&my_device, 8),
+                                        qnet_state::char_prefix(&current_device, 8));
                                     return Ok(true);
                                 }
                                 // Same device — still active
@@ -27226,7 +28216,7 @@ impl BlockchainNode {
             let pseudonym = crate::rpc::generate_super_node_pseudonym(&wallet);
             println!("[INFO][NODE] super_pseudonym source=wallet id={}", pseudonym);
             println!("[DBG][NODE] id_priority4_hit id={} wallet_prefix={}",
-                     pseudonym, &wallet[..16.min(wallet.len())]);
+                     pseudonym, qnet_state::char_prefix(&wallet, 16));
             return pseudonym;
         }
         println!("[DBG][NODE] id_priority4_miss reason=no_wallet_seed");
@@ -27467,68 +28457,6 @@ fn verify_genesis_node_certificate(node_id: &str) -> bool {
     genesis_certificate.contains(&expected_hash)
 }
 
-impl BlockchainNode {
-    /// Load the last PoH checkpoint from storage
-    /// 
-    /// STRATEGY: First check the index for the latest checkpoint count,
-    /// then load that specific checkpoint. Falls back to scanning if no index.
-    /// 
-    /// SCALABILITY: Index-based lookup is O(1), scanning is O(n) but bounded.
-    async fn load_last_poh_checkpoint(storage: &Arc<Storage>) -> Option<(Vec<u8>, u64)> {
-        // 1. Try to load from index first (O(1) lookup)
-        if let Ok(Some(index_data)) = storage.load_raw("poh_checkpoint_latest") {
-            if let Ok(latest_count) = bincode::deserialize::<u64>(&index_data) {
-                let key = format!("poh_checkpoint_{}", latest_count);
-                if let Ok(Some(compressed_data)) = storage.load_raw(&key) {
-                    if let Ok(decompressed) = zstd::decode_all(&compressed_data[..]) {
-                        if let Ok(entry) = bincode::deserialize::<crate::poh::PoHEntry>(&decompressed) {
-                            println!("[INFO][NODE] poh_checkpoint_loaded source=index count={}", entry.num_hashes);
-                            return Some((entry.hash, entry.num_hashes));
-                        }
-                    }
-                }
-            }
-        }
-        
-        // 2. Fallback: Scan for checkpoints (for migration from old format)
-        // Scan in 10M increments (checkpoint interval) up to 100B hashes (~55 hours)
-        // This covers reasonable network uptime between restarts
-        println!("[DBG][NODE] poh_checkpoint_scan reason=no_index");
-        let mut latest_checkpoint: Option<(Vec<u8>, u64)> = None;
-        
-        // Scan from high to low, stop at first found (most recent)
-        // 100B hashes / 10M per checkpoint = 10,000 checkpoints max
-        // At 500K hashes/sec, 100B = ~55 hours
-        for checkpoint_num in (1..=10_000u64).rev() {
-            let count = checkpoint_num * 10_000_000; // Checkpoints at 10M intervals
-            let key = format!("poh_checkpoint_{}", count);
-            
-            if let Ok(Some(compressed_data)) = storage.load_raw(&key) {
-                if let Ok(decompressed) = zstd::decode_all(&compressed_data[..]) {
-                    if let Ok(entry) = bincode::deserialize::<crate::poh::PoHEntry>(&decompressed) {
-                        latest_checkpoint = Some((entry.hash.clone(), entry.num_hashes));
-                        println!("[INFO][NODE] poh_checkpoint_found count={}", entry.num_hashes);
-                        
-                        // Save index for next time
-                        if let Ok(index_data) = bincode::serialize(&entry.num_hashes) {
-                            if let Err(e) = storage.save_raw("poh_checkpoint_latest", &index_data) {
-                                if crate::node::is_warn() {
-                                    println!("[WARN][STORAGE] poh_checkpoint_save_failed err={}", e);
-                                }
-                            }
-                        }
-                        
-                        // Found most recent (scanning from high to low), no need to continue
-                        break;
-                    }
-                }
-            }
-        }
-        
-        latest_checkpoint
-    }
-}
-
 impl Clone for BlockchainNode {
     fn clone(&self) -> Self {
         Self {
@@ -27566,8 +28494,6 @@ impl Clone for BlockchainNode {
             parallel_validator: self.parallel_validator.clone(),
             archive_manager: self.archive_manager.clone(),
             reward_manager: self.reward_manager.clone(),
-            poh: self.poh.clone(),
-            poh_receiver: None, // Cannot clone receiver - use None for cloned instances
             parallel_executor: self.parallel_executor.clone(),
             adaptive_bft: self.adaptive_bft.clone(),
             pre_execution: self.pre_execution.clone(),
@@ -27607,9 +28533,29 @@ mod tests {
         qnet_state::MicroBlock {
             height, timestamp: 0, transactions: vec![], producer: "genesis_node_001".to_string(),
             signature: vec![0u8; 64], merkle_root: [tag; 32], previous_hash: [0u8; 32],
-            poh_hash: vec![], poh_count: 0, vrf_output: None, vrf_proof: None, fees_collected: 0,
+            vrf_output: None, vrf_proof: None, fees_collected: 0,
             state_root: [0u8; 32], timeout_round: 0, carried_baseline: 0, timeout_proof: None,
         }
+    }
+
+    /// Persist a chained run of p3 bodies — storage enforces parent linkage, so an unlinked run is
+    /// not a reachable state. Returns the stored hashes in height order.
+    #[cfg(test)]
+    fn p3_seed_chain(storage: &crate::storage::Storage, from: u64, to: u64, tag_of: impl Fn(u64) -> u8) -> Vec<[u8; 32]> {
+        let mut out = Vec::new();
+        // Continue from whatever is already stored below `from`, so successive calls extend one chain.
+        let mut parent = if from == 0 { [0u8; 32] } else {
+            storage.load_microblock_auto_format(from - 1).ok().flatten()
+                .map(|p| p.hash()).unwrap_or([0u8; 32])
+        };
+        for h in from..=to {
+            let mut mb = p3_micro(h, tag_of(h));
+            mb.previous_hash = parent;
+            parent = mb.hash();
+            out.push(mb.hash());
+            storage.save_microblock(h, &bincode::serialize(&mb).expect("ser")).expect("save");
+        }
+        out
     }
 
     // P3 SAFETY (content-not-presence finality): window_content_verdict is the comparator every
@@ -27622,12 +28568,7 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let storage = crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage");
 
-        let mut certified: Vec<[u8; 32]> = Vec::new();
-        for h in 1u64..=4 {
-            let mb = p3_micro(h, h as u8);
-            certified.push(mb.hash());
-            storage.save_microblock(h, &bincode::serialize(&mb).expect("ser")).expect("save");
-        }
+        let certified: Vec<[u8; 32]> = p3_seed_chain(&storage, 1, 4, |h| h as u8);
 
         // Honest window: stored == certified ⇒ nothing deferred (the happy path is never blocked).
         let (miss, mism) = BlockchainNode::window_content_verdict(&storage, &certified, 1, 4);
@@ -27666,19 +28607,12 @@ mod tests {
         async fn build(window2_forked: bool) -> (tempfile::TempDir, crate::storage::Storage) {
             let dir = tempfile::TempDir::new().expect("tempdir");
             let storage = crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage");
-            let mut w1 = Vec::new();
-            for h in 1u64..=90 {
-                let mb = p3_micro(h, (h % 250 + 1) as u8);
-                w1.push(mb.hash());
-                storage.save_microblock(h, &bincode::serialize(&mb).expect("ser")).expect("save");
-            }
-            let mut w2 = Vec::new();
-            for h in 91u64..=180 {
-                let mb = p3_micro(h, (h % 250 + 1) as u8);
-                // Certify the stored body when canonical; certify an obviously-wrong hash when forked.
-                w2.push(if window2_forked { [0xFF; 32] } else { mb.hash() });
-                storage.save_microblock(h, &bincode::serialize(&mb).expect("ser")).expect("save");
-            }
+            let w1 = p3_seed_chain(&storage, 1, 90, |h| (h % 250 + 1) as u8);
+            let stored_w2 = p3_seed_chain(&storage, 91, 180, |h| (h % 250 + 1) as u8);
+            // Certify the stored bodies when canonical; certify obviously-wrong hashes when forked.
+            let w2: Vec<[u8; 32]> = if window2_forked {
+                stored_w2.iter().map(|_| [0xFFu8; 32]).collect()
+            } else { stored_w2 };
             let cd = qnet_state::ConsensusData::default();
             storage.save_macroblock(1, &qnet_state::MacroBlock::new(1, 0, [0u8; 32], w1, [0u8; 32], cd.clone())).await.expect("mb1");
             storage.save_macroblock(2, &qnet_state::MacroBlock::new(2, 0, [0u8; 32], w2, [0u8; 32], cd)).await.expect("mb2");
@@ -27695,6 +28629,772 @@ mod tests {
         let (_d2, s_ok) = build(false).await;
         assert_eq!(BlockchainNode::boot_content_finality_ceiling(&s_ok, 180), 180,
                    "two canonical windows ⇒ full ceiling");
+    }
+
+    // ── RECOVERY RELAXATION (storage-backed) ───────────────────────────────────────────────────
+    //
+    // resolve_recovery_pin is THE authority: it decides the committee AND the threshold for a relaxed
+    // macroblock, reading nothing but the anchor macroblock — final, at or below the last seal, and
+    // retained forever (only microblock BODIES prune). These tests write NO microblock bodies at all,
+    // which is precisely the post-prune condition, so a pass here is also the prune-survival proof.
+
+    /// Build + store anchor macroblock `a` and return `(its hash, its checkpoint)`.
+    async fn rc_anchor(
+        storage: &crate::storage::Storage, a: u64, cp_index: u64, committee_len: usize,
+        chained: bool, head: u64,
+    ) -> ([u8; 32], qnet_consensus::checkpoint_bft::Checkpoint) {
+        use qnet_consensus::checkpoint_bft::{Checkpoint, QuorumCertificate, sig_merkle_root};
+        let committee: Vec<String> = (0..committee_len).map(|i| format!("cs_{:04}", i)).collect();
+        let cp = Checkpoint {
+            index: cp_index, parent_qc: None, window_head_height: head,
+            window_mb_hashes: vec![], state_root: [1u8; 32], beacon: [2u8; 32],
+            epoch_commitment: [3u8; 32], reward_root: [0u8; 32], registry_root: [0u8; 32],
+            logs_root: [0u8; 32], dilithium_pk_root: [0u8; 32], reward_epoch_root: [0u8; 32],
+            total_supply: 0, timestamp: 0, proposer: committee[0].clone(), proposer_sig: vec![],
+            // `chained` makes the anchor itself relaxed — the one thing that must never be an anchor.
+            recovery_anchor: if chained { Some((a - 1, [9u8; 32])) } else { None },
+        };
+        let sigs: Vec<Vec<u8>> = committee.iter().map(|s| s.as_bytes().to_vec()).collect();
+        let qc = QuorumCertificate {
+            checkpoint_hash: cp.hash(), index: cp.index,
+            sig_merkle_root: sig_merkle_root(&sigs), signers: committee.clone(), sigs,
+        };
+        let mut cd = qnet_state::ConsensusData::default();
+        cd.checkpoint_qc = Some(bincode::serialize(&(cp.clone(), qc)).unwrap());
+        cd.consensus_committee = Some(committee);
+        let mb = qnet_state::MacroBlock::new(a, 0, [0u8; 32], vec![], [1u8; 32], cd);
+        let h = mb.hash();
+        storage.save_macroblock(a, &mb).await.expect("save anchor");
+        (h, cp)
+    }
+
+    /// A relaxed checkpoint pinned to `(a, ah)` at step `k`, correct in every field by default.
+    fn rc_pinned_cp(
+        cp_a: &qnet_consensus::checkpoint_bft::Checkpoint, a: u64, ah: [u8; 32], k: u64,
+        parent_hash: [u8; 32],
+    ) -> qnet_consensus::checkpoint_bft::Checkpoint {
+        use qnet_consensus::checkpoint_bft::{Checkpoint, QcRef, recovery_window_head};
+        // Index tracks the anchor's here only so the parent link is contiguous; the pin does NOT
+        // constrain it, and `pinned_cp_at_index` below exercises exactly that.
+        let index = cp_a.index + k;
+        let head = recovery_window_head(cp_a.window_head_height, k);
+        Checkpoint {
+            index, parent_qc: Some(QcRef { index: index - 1, checkpoint_hash: parent_hash }),
+            window_head_height: head, window_mb_hashes: vec![], state_root: [4u8; 32],
+            beacon: [5u8; 32], epoch_commitment: [6u8; 32], reward_root: [0u8; 32],
+            registry_root: [0u8; 32], logs_root: [0u8; 32], dilithium_pk_root: [0u8; 32],
+            reward_epoch_root: [0u8; 32], total_supply: 0, timestamp: 0,
+            proposer: "cs_0000".into(), proposer_sig: vec![], recovery_anchor: Some((a, ah)),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_recovery_pin_accepts_defers_and_rejects() {
+        use qnet_consensus::checkpoint_bft::{RC_SPAN_INDICES, relaxed_quorum};
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage");
+        let (a, cp_index, n) = (4u64, 17u64, 12usize);
+        let (ah, cp_a) = rc_anchor(&storage, a, cp_index, n, false, a * 90).await;
+        let ok = rc_pinned_cp(&cp_a, a, ah, 1, cp_a.hash());
+
+        // ACCEPT: committee is the ANCHOR's C_S, threshold is the relaxed one — neither is derived.
+        let (cmt, q) = BlockchainNode::resolve_recovery_pin(&storage, a + 1, &ok, a, ah)
+            .expect("well-formed pin must resolve");
+        assert_eq!(cmt.len(), n);
+        assert_eq!(cmt[0], "cs_0000");
+        assert_eq!(q, relaxed_quorum(n));
+        assert!(q < qnet_consensus::checkpoint_bft::quorum_size(n), "the relaxation must actually lower the bar");
+
+        // DEFER, never reject: a node that has not pulled MB_A yet must fetch and retry. Rejecting
+        // here would brick every cold join across the span, permanently.
+        let e = BlockchainNode::resolve_recovery_pin(&storage, 99, &ok, 77, ah).unwrap_err();
+        assert!(e.contains("v2_rc_defer_anchor"), "absent anchor must DEFER, got {}", e);
+
+        // Anchor hash mismatch: the pin names a macroblock we hold under a different hash.
+        let e = BlockchainNode::resolve_recovery_pin(&storage, a + 1, &ok, a, [0xAB; 32]).unwrap_err();
+        assert!(e.contains("v2_rc_anchor_mismatch"), "got {}", e);
+
+        // Off-pin position: the window head is off the CHECKPOINT_INTERVAL grid.
+        let mut bad = ok.clone(); bad.window_head_height += 1;
+        assert!(BlockchainNode::resolve_recovery_pin(&storage, a + 1, &bad, a, ah)
+            .unwrap_err().contains("v2_rc_unpinned"));
+
+        // Past the span: k = RC_SPAN_INDICES + 1 has no legal window. The span is read out of the
+        // WINDOW now, so an out-of-span position is reported by the same clause as an off-grid one.
+        let over = rc_pinned_cp(&cp_a, a, ah, RC_SPAN_INDICES + 1, cp_a.hash());
+        assert!(BlockchainNode::resolve_recovery_pin(&storage, a + 3, &over, a, ah)
+            .unwrap_err().contains("v2_rc_unpinned"));
+
+        // k = 0 (the anchor's own window) is not a span position either.
+        let mut zero = ok.clone(); zero.index = cp_a.index; zero.window_head_height = cp_a.window_head_height;
+        assert!(BlockchainNode::resolve_recovery_pin(&storage, a, &zero, a, ah)
+            .unwrap_err().contains("v2_rc_unpinned"));
+
+        // Parent pin at k==1 must be the ANCHOR's own QC hash, not an arbitrary one.
+        let wrong_parent = rc_pinned_cp(&cp_a, a, ah, 1, [0xCD; 32]);
+        assert!(BlockchainNode::resolve_recovery_pin(&storage, a + 1, &wrong_parent, a, ah)
+            .unwrap_err().contains("v2_rc_parent"));
+
+        // Parent index must be exactly index-1 (no gaps inside the span).
+        let mut gap = ok.clone();
+        gap.parent_qc = Some(qnet_consensus::checkpoint_bft::QcRef { index: ok.index - 2, checkpoint_hash: cp_a.hash() });
+        assert!(BlockchainNode::resolve_recovery_pin(&storage, a + 1, &gap, a, ah)
+            .unwrap_err().contains("v2_rc_parent"));
+
+        // Anchor 0 is never a valid pin.
+        assert!(BlockchainNode::resolve_recovery_pin(&storage, 1, &ok, 0, ah)
+            .unwrap_err().contains("v2_rc_anchor_zero"));
+
+        // At k>1 the hash link is enforced live by the engine's lock rule, so only the index is
+        // checkable here — this must PASS, or the span could never reach its second checkpoint.
+        let k2 = rc_pinned_cp(&cp_a, a, ah, 2, [0xEE; 32]);
+        assert!(BlockchainNode::resolve_recovery_pin(&storage, a + 1, &k2, a, ah).is_ok());
+    }
+
+    // Two bounds that keep the relaxation from becoming a permanent state or a genesis-scale weapon.
+    #[tokio::test]
+    async fn resolve_recovery_pin_refuses_chained_spans_and_small_committees() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage");
+
+        // A relaxed span may only be anchored on a FULL-QUORUM macroblock. Otherwise spans chain and
+        // the network never has to return to the strict threshold.
+        let (ah, cp_a) = rc_anchor(&storage, 4, 17, 12, true, 4 * 90).await;
+        let cp = rc_pinned_cp(&cp_a, 4, ah, 1, cp_a.hash());
+        assert!(BlockchainNode::resolve_recovery_pin(&storage, 5, &cp, 4, ah)
+            .unwrap_err().contains("v2_rc_chained"));
+
+        // Below RELAXED_MIN_COMMITTEE the relaxation does not exist: at n=5 it would buy one node of
+        // liveness while making a single Byzantine member sufficient to break safety.
+        let (ah5, cp5) = rc_anchor(&storage, 6, 21, 5, false, 6 * 90).await;
+        let cp = rc_pinned_cp(&cp5, 6, ah5, 1, cp5.hash());
+        assert!(BlockchainNode::resolve_recovery_pin(&storage, 7, &cp, 6, ah5)
+            .unwrap_err().contains("v2_rc_floor"));
+
+        // The anchor must sit on a macroblock boundary (a*90); anything else is not a sealed anchor.
+        let (ah_off, cp_off) = rc_anchor(&storage, 8, 25, 12, false, 8 * 90 + 1).await;
+        let cp = rc_pinned_cp(&cp_off, 8, ah_off, 1, cp_off.hash());
+        assert!(BlockchainNode::resolve_recovery_pin(&storage, 9, &cp, 8, ah_off)
+            .unwrap_err().contains("v2_rc_anchor_offboundary"));
+    }
+
+    // GALC v2: consensus_committee is now the signature-checking set for a relaxed checkpoint, and
+    // banned_validators is already trusted verbatim by load_macroblock_ban_set. MacroBlock::hash()
+    // omits consensus_data entirely, so at the pin branches BOTH were unauthenticated — a hash-equal
+    // impostor could swap either. The digest must now move when they do.
+    #[test]
+    fn galc_committee_digest_binds_committee_and_bans() {
+        let mk = |cmt: Option<Vec<String>>, banned: Option<Vec<u8>>| {
+            let mut cd = qnet_state::ConsensusData::default();
+            cd.eligible_producers = Some(vec![1, 2, 3]);
+            cd.randomness_beacon = Some([7u8; 32]);
+            cd.consensus_committee = cmt;
+            cd.banned_validators = banned;
+            qnet_state::MacroBlock::new(5, 0, [0u8; 32], vec![], [1u8; 32], cd)
+        };
+        let base = mk(Some(vec!["a".into(), "b".into()]), Some(vec![9]));
+        let swap_cmt = mk(Some(vec!["a".into(), "c".into()]), Some(vec![9]));
+        let swap_ban = mk(Some(vec!["a".into(), "b".into()]), Some(vec![8]));
+        let none_cmt = mk(None, Some(vec![9]));
+        let empty_cmt = mk(Some(vec![]), Some(vec![9]));
+
+        // The bodies are hash-EQUAL — that is exactly why the digest has to carry them.
+        assert_eq!(base.hash(), swap_cmt.hash());
+        assert_eq!(base.hash(), swap_ban.hash());
+
+        let d = |m: &qnet_state::MacroBlock| crate::galc::committee_fields_digest(m);
+        assert_ne!(d(&base), d(&swap_cmt), "committee swap must move the digest");
+        assert_ne!(d(&base), d(&swap_ban), "ban-set swap must move the digest");
+        // Present/absent is tagged, so None and empty-Vec can never collide.
+        assert_ne!(d(&none_cmt), d(&empty_cmt));
+        assert_eq!(d(&base), d(&base));
+    }
+
+    // The invariant the whole design rests on: no signer set enters ANY hash or cross-node comparison,
+    // so two sealers holding byte-different valid QCs still agree on every compared value.
+    #[tokio::test]
+    async fn signer_set_enters_no_hash() {
+        use qnet_consensus::checkpoint_bft::{QuorumCertificate, sig_merkle_root};
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage");
+        let (ah, cp_a) = rc_anchor(&storage, 4, 17, 12, false, 4 * 90).await;
+
+        // Re-seal the SAME checkpoint under a different (smaller, differently-ordered) signer set.
+        let alt: Vec<String> = (0..7).map(|i| format!("cs_{:04}", 11 - i)).collect();
+        let sigs: Vec<Vec<u8>> = alt.iter().map(|s| s.as_bytes().to_vec()).collect();
+        let qc2 = QuorumCertificate {
+            checkpoint_hash: cp_a.hash(), index: cp_a.index,
+            sig_merkle_root: sig_merkle_root(&sigs), signers: alt, sigs,
+        };
+        let mut cd = qnet_state::ConsensusData::default();
+        cd.checkpoint_qc = Some(bincode::serialize(&(cp_a.clone(), qc2)).unwrap());
+        cd.consensus_committee = Some((0..12).map(|i| format!("cs_{:04}", i)).collect());
+        let mb2 = qnet_state::MacroBlock::new(4, 0, [0u8; 32], vec![], [1u8; 32], cd);
+
+        assert_eq!(mb2.hash(), ah, "MacroBlock::hash must not see the signer set");
+        // committee_fields_digest folds the committee, NOT who signed — otherwise two honest sealers
+        // would produce different GALC digests and the pin branches would reject each other.
+        let orig = storage.get_macroblock_by_height(4).ok().flatten()
+            .and_then(BlockchainNode::macroblock_plaintext)
+            .and_then(|b| bincode::deserialize::<qnet_state::MacroBlock>(&b).ok()).expect("stored");
+        assert_eq!(crate::galc::committee_fields_digest(&orig), crate::galc::committee_fields_digest(&mb2));
+    }
+
+    /// Store a macroblock carrying a usable committee snapshot at `idx`.
+    async fn seed_committee_mb(storage: &crate::storage::Storage, idx: u64, n: usize) {
+        let elig: Vec<qnet_state::EligibleProducer> = (0..n)
+            .map(|i| qnet_state::EligibleProducer { node_id: format!("node_{:04}", i), reputation: 7000 })
+            .collect();
+        let mut cd = qnet_state::ConsensusData::default();
+        cd.eligible_producers = Some(bincode::serialize(&elig).unwrap());
+        cd.randomness_beacon = Some([idx as u8; 32]);
+        let mb = qnet_state::MacroBlock::new(idx, 0, [0u8; 32], vec![], [1u8; 32], cd);
+        storage.save_macroblock(idx, &mb).await.expect("save");
+    }
+
+    // reward_root is a hashed checkpoint field: if the streamed build and the in-memory build ever
+    // disagree by one byte, the producer and every validator recomputing land on different roots and
+    // the window can never certify. Pin equality across shard boundaries and duplicate wallets.
+    #[tokio::test]
+    async fn streamed_reward_root_matches_in_memory() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let st = crate::storage::Storage::new(dir.path().to_str().unwrap()).unwrap();
+        // Sizes around REWARD_SHARD_SIZE=4096: single partial shard, exact multiple, and a spill.
+        for &(ns, nl) in &[(1usize, 0usize), (3, 7), (0, 4096), (5, 4091), (11, 9000)] {
+            let supers: Vec<(String, String)> = (0..ns)
+                .map(|i| (format!("super_{:06}", i), format!("wal_s{:06}", i))).collect();
+            // Every 3rd light reuses an earlier wallet, so the per-wallet summation is exercised.
+            let lights: Vec<(String, String)> = (0..nl)
+                .map(|i| (format!("light_{:06}", i), format!("wal_l{:06}", if i % 3 == 0 { i / 3 } else { i })))
+                .collect();
+            let epoch = 40 + ns as u64;
+            let total = 251_432_340_000_000u64;
+
+            let (want_vec, want_root) =
+                BlockchainNode::distribute_split_rewards(&supers, &lights, total, epoch);
+            let mut got_vec: Vec<(String, u64)> = Vec::new();
+            let light_iter = |f: &mut dyn FnMut(&str, &str)| {
+                for (n, w) in &lights { f(n, w); }
+                Ok(())
+            };
+            let (count, paid, got_root) = BlockchainNode::build_epoch_rewards_streamed(
+                &st, &supers, light_iter, total, epoch,
+                |_i, shard, _r| got_vec.extend_from_slice(shard),
+            ).expect("streamed build");
+
+            assert_eq!(got_root, want_root, "root differs at ns={} nl={}", ns, nl);
+            assert_eq!(got_vec, want_vec, "leaf set differs at ns={} nl={}", ns, nl);
+            assert_eq!(count, want_vec.len(), "count differs at ns={} nl={}", ns, nl);
+            assert_eq!(paid, want_vec.iter().map(|(_, a)| *a).sum::<u64>(), "total differs");
+            if !want_vec.is_empty() {
+                assert_eq!(paid, total, "emission must be conserved at ns={} nl={}", ns, nl);
+            }
+        }
+    }
+
+    /// The PERSISTED shard meta must recombine to the COMMITTED root. My first streamed persist arm
+    /// recomputed the shard root instead of using the builder's, and the two derivations disagreed for a
+    /// single sub-4096 shard (natural vs padded height) — every claim then read as Divergent on the
+    /// producing node. Sizes below span the divergence window that bug had (N <= 2048) and above it.
+    #[tokio::test]
+    async fn persisted_shard_meta_recombines_to_committed_root() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let st = crate::storage::Storage::new(dir.path().to_str().unwrap()).unwrap();
+        for &n in &[1usize, 2, 6, 100, 2048, 2049, 4096, 4097, 9000] {
+            let epoch = 160 + n as u64;
+            let supers: Vec<(String, String)> = (0..n)
+                .map(|i| (format!("super_{:07}", i), format!("wal_{:07}", i))).collect();
+            let mut roots: Vec<[u8; 32]> = Vec::new();
+            let (_c, _p, committed) = BlockchainNode::build_epoch_rewards_streamed(
+                &st, &supers, |_f: &mut dyn FnMut(&str, &str)| Ok(()),
+                251_432_340_000_000u64, epoch,
+                |_i, _shard, r| roots.push(r),
+            ).expect("build");
+            assert!(!roots.is_empty(), "n={} produced no shard", n);
+            let recombined = if roots.len() == 1 {
+                hex::encode(roots[0])
+            } else {
+                hex::encode(qnet_core::crypto::merkle::merkle_continue_root(&roots))
+            };
+            assert_eq!(recombined, committed,
+                       "persisted shard meta must recombine to the committed root at n={}", n);
+        }
+    }
+
+    // The scratch CF must never survive a build: leftovers would double-count on the next epoch.
+    #[tokio::test]
+    async fn reward_agg_scratch_is_cleared_after_build() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let st = crate::storage::Storage::new(dir.path().to_str().unwrap()).unwrap();
+        let supers: Vec<(String, String)> = (0..4)
+            .map(|i| (format!("super_{:06}", i), format!("wal_s{:06}", i))).collect();
+        BlockchainNode::build_epoch_rewards_streamed(
+            &st, &supers, |_f: &mut dyn FnMut(&str, &str)| Ok(()), 1_000, 7, |_, _, _| {})
+            .expect("build");
+        // Every build allocates a private range and clears it on exit, so no range holds rows.
+        let mut seen = 0usize;
+        for b in 0..8u64 { st.reward_agg_for_each_wallet(b, |_, _| seen += 1).expect("scan"); }
+        assert_eq!(seen, 0, "scratch rows survived the build");
+        // Two interleaved builds must not see each other's rows (the race the build id closes).
+        let a_id = st.reward_agg_new_build();
+        let b_id = st.reward_agg_new_build();
+        assert_ne!(a_id, b_id, "each build gets its own range");
+        st.reward_agg_put_batch(a_id, &[("w1".into(), "n1".into(), 5u64)]).unwrap();
+        let mut only_a = 0usize;
+        st.reward_agg_for_each_wallet(b_id, |_, _| only_a += 1).unwrap();
+        assert_eq!(only_a, 0, "build ranges must be isolated");
+    }
+
+    // ── A1 frozen-roster ──────────────────────────────────────────────────────────────────────────
+    /// Standalone anchor macroblock with `n` supers, tagged so two anchors differ in BOTH the beacon
+    /// (frozen_beacon input) and the state_root (a hash_macroblock_entropy input) — the frozen
+    /// derivations' only inputs.
+    fn mk_frozen_anchor(n: usize, tag: u8) -> qnet_state::MacroBlock {
+        let elig: Vec<qnet_state::EligibleProducer> = (0..n)
+            .map(|i| qnet_state::EligibleProducer { node_id: format!("super_{:04}", i), reputation: 7000 })
+            .collect();
+        let mut cd = qnet_state::ConsensusData::default();
+        cd.eligible_producers = Some(bincode::serialize(&elig).unwrap());
+        cd.randomness_beacon = Some([tag; 32]);
+        qnet_state::MacroBlock::new(10, 0, [0u8; 32], vec![[7u8; 32]], [tag; 32], cd)
+    }
+
+    /// R20.1 purity: every frozen derivation is a pure function of (anchor bytes, window). Roster is
+    /// CONSTANT across the horizon; entropy/beacon are deterministic per window, distinct across
+    /// windows, and bound to the anchor bytes — so two nodes on the same M_A agree byte-for-byte
+    /// regardless of any unfinalized tail (the tail is structurally unreadable here).
+    #[test]
+    fn frozen_derivations_are_pure_and_window_scoped() {
+        let a = mk_frozen_anchor(50, 0x11);
+        let r = BlockchainNode::frozen_roster(&a);
+        assert_eq!(r, BlockchainNode::frozen_roster(&a), "roster is a pure function of the anchor");
+        assert_eq!(r.len(), 50);
+        assert!(r.windows(2).all(|w| w[0].node_id <= w[1].node_id), "roster canonically sorted");
+        for w in [3u64, 4, 32] {
+            assert_eq!(BlockchainNode::frozen_entropy(&a, w), BlockchainNode::frozen_entropy(&a, w));
+            assert_eq!(BlockchainNode::frozen_beacon(&a, w), BlockchainNode::frozen_beacon(&a, w));
+        }
+        assert_ne!(BlockchainNode::frozen_entropy(&a, 3), BlockchainNode::frozen_entropy(&a, 4), "entropy varies per window");
+        assert_ne!(BlockchainNode::frozen_beacon(&a, 3), BlockchainNode::frozen_beacon(&a, 4), "beacon varies per window");
+        let b = mk_frozen_anchor(50, 0x22);
+        assert_ne!(BlockchainNode::frozen_beacon(&a, 3), BlockchainNode::frozen_beacon(&b, 3), "beacon binds anchor bytes");
+        assert_ne!(BlockchainNode::frozen_entropy(&a, 3), BlockchainNode::frozen_entropy(&b, 3), "entropy binds anchor bytes");
+    }
+
+    /// R20.8 identity arm: at COMMITTEE_THRESHOLD with a <=1000 roster the committee IS the roster for
+    /// every window (per-window resampling absorbs zero churn today), and it is deterministic.
+    #[test]
+    fn frozen_committee_is_identity_at_threshold() {
+        let a = mk_frozen_anchor(50, 0x11);
+        let mut roster: Vec<String> = BlockchainNode::frozen_roster(&a).into_iter().map(|p| p.node_id).collect();
+        roster.sort();
+        for w in [3u64, 10, 32] {
+            let c = BlockchainNode::frozen_committee(&a, w);
+            assert_eq!(c, BlockchainNode::frozen_committee(&a, w), "deterministic per window");
+            let mut cs = c.clone(); cs.sort();
+            assert_eq!(cs, roster, "committee == roster at threshold, window {}", w);
+        }
+    }
+
+    /// M_A selection descends the contiguous sealed prefix to the newest USABLE macroblock (R2.1).
+    #[tokio::test]
+    async fn frozen_anchor_selects_newest_usable() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = crate::storage::Storage::new(dir.path().to_str().unwrap()).unwrap();
+        seed_committee_mb(&s, 8, 50).await;
+        seed_committee_mb(&s, 10, 50).await;
+        assert_eq!(BlockchainNode::frozen_anchor(&s, 10).expect("anchor").0, 10, "newest usable at L");
+        assert_eq!(BlockchainNode::frozen_anchor(&s, 9).expect("descends").0, 8, "9 absent ⇒ descend to 8");
+        assert!(BlockchainNode::frozen_anchor(&s, 7).is_none(), "below the seeded floor ⇒ abstain");
+    }
+
+    /// R20.1 two-instance purity: two nodes sharing anchor M_A but with DIFFERENT unfinalized tails
+    /// derive byte-identical roster/beacon/entropy/committee for every horizon window — the tail is
+    /// structurally unreadable, so no partition can elect different producers off the same anchor.
+    #[tokio::test]
+    async fn frozen_derivations_agree_across_divergent_tails() {
+        let (da, db) = (tempfile::TempDir::new().unwrap(), tempfile::TempDir::new().unwrap());
+        let sa = crate::storage::Storage::new(da.path().to_str().unwrap()).unwrap();
+        let sb = crate::storage::Storage::new(db.path().to_str().unwrap()).unwrap();
+        for i in 1..=10u64 { seed_committee_mb(&sa, i, 40).await; seed_committee_mb(&sb, i, 40).await; }
+        seed_committee_mb(&sa, 99, 7).await; // A's divergent tail (above the L=10 seal); B has none.
+        let (ia, ma) = BlockchainNode::frozen_anchor(&sa, 10).unwrap();
+        let (ib, mb) = BlockchainNode::frozen_anchor(&sb, 10).unwrap();
+        assert_eq!(ia, ib, "same anchor index off the same seal");
+        for w in 11..=42u64 {
+            assert_eq!(BlockchainNode::frozen_roster(&ma), BlockchainNode::frozen_roster(&mb));
+            assert_eq!(BlockchainNode::frozen_beacon(&ma, w), BlockchainNode::frozen_beacon(&mb, w));
+            assert_eq!(BlockchainNode::frozen_entropy(&ma, w), BlockchainNode::frozen_entropy(&mb, w));
+            assert_eq!(BlockchainNode::frozen_committee(&ma, w), BlockchainNode::frozen_committee(&mb, w));
+        }
+    }
+
+    /// The three-way disposition (R1) on contiguously-sealed state with no higher QC frontier (L==B).
+    #[tokio::test]
+    async fn roster_mode_three_way() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = crate::storage::Storage::new(dir.path().to_str().unwrap()).unwrap();
+        for i in 1..=10u64 { seed_committee_mb(&s, i, 5).await; }
+        assert_eq!(s.last_sealed_mb_index(), 10, "contiguous seal ⇒ L=10");
+        assert_eq!(BlockchainNode::roster_mode(&s, 12), RosterMode::Sealed, "w-2=10 <= L");
+        assert_eq!(BlockchainNode::roster_mode(&s, 13), RosterMode::Frozen, "w-2=11 > L, L==B");
+    }
+
+    /// Restart GAP B: the barred set must be filtered at EVERY committee/producer derivation that reads
+    /// a macroblock's eligible field, or a restart re-stalls at the K+1/K+2 tail windows. Source-scan
+    /// (the manifest ships empty, so behaviour cannot be exercised without a crafted release).
+    #[test]
+    fn restart_excludes_filters_committee_readers() {
+        let src = include_str!("node.rs");
+        for anchor in ["fn committee_from_macroblock", "pub(crate) fn frozen_committee"] {
+            let i = src.find(anchor).unwrap_or_else(|| panic!("missing {}", anchor));
+            assert!(src[i..i + 1200].contains("restart_excludes"),
+                    "{} must filter restart_excludes (GAP B)", anchor);
+        }
+    }
+
+    /// Restart GAP A: the fresh-genesis mint must refuse while a WS restart pin is active, or a full
+    /// wipe re-seeds zero state and destroys the ledger (no re-mint path). process::exit is not
+    /// unit-testable, so pin the guard by source-scan just before the mint.
+    #[test]
+    fn mint_refused_under_active_ws_pin() {
+        let src = include_str!("node.rs");
+        let mint = src.find("first-ever launch confirmed").expect("mint site");
+        assert!(src[mint.saturating_sub(2500)..mint].contains("ws_checkpoint_index() > 0"),
+                "the genesis mint must refuse while a WS restart pin is active (GAP A)");
+    }
+
+    // DEFECT B + THE REVERT OF ITS FIRST FIX. Two independent functions used to answer "who is the
+    // committee for this window" with DIFFERENT staleness policies — one read macroblock N-2 with no
+    // walk-back, the other walked back 8. Two answers to one question is a fork surface that fires on
+    // an ordinary honest outage, with no adversary present. They are now ONE resolver.
+    //
+    // The first attempt at that unification gave the shared resolver a 32-deep walk-back so failover
+    // could form past the seal. That was WRONG and is the property this test now pins: the walk-back
+    // returned whichever macroblock the node happened to hold, the VRF seed comes from THAT macroblock,
+    // so two nodes stopping at different indices draw different committees — and the burn gate turns
+    // that into a HARD REJECT, while the defer valve (`n2_committee_absent`) is this very function
+    // returning None, so a walk-back deletes the defer. Stall, never guess.
+    #[tokio::test]
+    async fn committee_resolver_is_strict_and_never_guesses() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage");
+
+        // Only macroblock 10 is sealed. Nothing above it exists — the halt condition.
+        seed_committee_mb(&storage, 10, 40).await;
+
+        // N-2 present: resolved directly.
+        let at_12 = BlockchainNode::committee_for_height(&storage, 12 * 90);
+        assert_eq!(at_12.as_ref().map(|c| c.len()), Some(40), "N-2 sealed must resolve");
+
+        // N-2 absent: None on EVERY node, at every distance. Never "the newest macroblock I hold" —
+        // that makes a block-validity verdict a function of local RocksDB contents.
+        for back in [1u64, 2, 8, 16, 32, 40] {
+            let h = (12 + back) * 90;
+            assert!(BlockchainNode::committee_for_height(&storage, h).is_none(),
+                    "resolver guessed {} windows past the seal — that is a per-node committee", back);
+        }
+        // And the guess is not hiding one level down either.
+        assert!(BlockchainNode::committee_from_macroblock(&storage, 11, 13).is_none());
+
+        // Committee and beacon must come from the SAME macroblock, or leader selection and membership
+        // are computed against different randomness.
+        let src = include_str!("node.rs");
+        let f = src.find("fn committee_from_macroblock").expect("resolver");
+        let body = &src[f..f + 1200];
+        assert!(body.contains("mb.consensus_data.randomness_beacon"),
+                "the beacon must come from the same macroblock as the snapshot");
+
+        // And the resolved committee really is a function of THAT macroblock's beacon: two macroblocks
+        // with identical rosters but different beacons must sample differently once the roster exceeds
+        // the committee cap. Below the cap sample_committee returns the whole set, so seed a roster
+        // above COMMITTEE_THRESHOLD to make the seed observable.
+        let dir2 = tempfile::TempDir::new().expect("tempdir");
+        let s2 = crate::storage::Storage::new(dir2.path().to_str().unwrap()).expect("storage");
+        seed_committee_mb(&s2, 10, BlockchainNode::COMMITTEE_THRESHOLD + 500).await;
+        let dir3 = tempfile::TempDir::new().expect("tempdir");
+        let s3 = crate::storage::Storage::new(dir3.path().to_str().unwrap()).expect("storage");
+        seed_committee_mb(&s3, 11, BlockchainNode::COMMITTEE_THRESHOLD + 500).await;
+        let a = BlockchainNode::committee_for_height(&s2, 12 * 90).expect("a");
+        let b = BlockchainNode::committee_for_height(&s3, 13 * 90).expect("b");
+        assert_eq!(a.len(), BlockchainNode::CONSENSUS_COMMITTEE_SIZE);
+        assert_ne!(a, b, "a different macroblock beacon must yield a different VRF subset");
+    }
+
+    // THE REASON THE PIN NO LONGER BINDS THE INDEX. A TimeoutCertificate advances the view WITHOUT
+    // certifying a window, so after even one dead leader the checkpoint index runs permanently ahead
+    // of the window offset. While the pin required `index == anchor_index + k` no `k` could satisfy
+    // both equations and the relaxation was unusable on exactly the processes a halt grows out of.
+    // The pin now constrains the WINDOW only; the index is free.
+    #[tokio::test]
+    async fn pin_accepts_any_index_once_a_view_change_has_shifted_it() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage");
+        let (a, cp_index, n) = (4u64, 17u64, 12usize);
+        let (ah, cp_a) = rc_anchor(&storage, a, cp_index, n, false, a * 90).await;
+
+        // k=1 window, but the index sits 5 rounds above the anchor because five views timed out.
+        let mut shifted = rc_pinned_cp(&cp_a, a, ah, 1, cp_a.hash());
+        shifted.index = cp_a.index + 6;
+        shifted.parent_qc = Some(qnet_consensus::checkpoint_bft::QcRef {
+            index: shifted.index - 1, checkpoint_hash: cp_a.hash() });
+        // Under the old index pin this was `v2_rc_unpinned`. It must now resolve.
+        let (cmt, q) = BlockchainNode::resolve_recovery_pin(&storage, a + 1, &shifted, a, ah)
+            .expect("a shifted index must not make the pin unsatisfiable");
+        assert_eq!(cmt.len(), n);
+        assert_eq!(q, qnet_consensus::checkpoint_bft::relaxed_quorum(n));
+
+        // The WINDOW is still pinned, at every index: off the grid and past the span both fail.
+        let mut off_grid = shifted.clone();
+        off_grid.window_head_height += 1;
+        assert!(BlockchainNode::resolve_recovery_pin(&storage, a + 1, &off_grid, a, ah)
+            .unwrap_err().contains("v2_rc_unpinned"));
+        let mut past = shifted.clone();
+        past.window_head_height = cp_a.window_head_height
+            + (qnet_consensus::checkpoint_bft::RC_SPAN_INDICES + 1) * 30;
+        assert!(BlockchainNode::resolve_recovery_pin(&storage, a + 3, &past, a, ah)
+            .unwrap_err().contains("v2_rc_unpinned"));
+        // Parent contiguity is still required — that is what the index rule is FOR now.
+        let mut gap = shifted.clone();
+        gap.parent_qc = Some(qnet_consensus::checkpoint_bft::QcRef {
+            index: shifted.index - 2, checkpoint_hash: cp_a.hash() });
+        assert!(BlockchainNode::resolve_recovery_pin(&storage, a + 1, &gap, a, ah)
+            .unwrap_err().contains("v2_rc_parent"));
+    }
+
+    // Equivocation is SAME-ROUND only. A same-window arm was tried and removed: the engine's rule is
+    // one vote per index, and one window is legally re-proposed at a new index after a view change, so
+    // that arm turned two conformant votes into a valid ban proof — unsigned, anyone-submittable, and
+    // folded into epoch_commitment. A verifier must not punish what the voter is instructed to do.
+    #[test]
+    fn equivocation_is_same_round_only() {
+        let src = include_str!("node.rs");
+        let f = src.find("async fn verify_vote_equivocation_proof").expect("verifier");
+        let body = &src[f..f + 2400];
+        assert!(body.contains("if ca.index != cb.index { return false; }"),
+                "same-round is the only sound shape");
+        assert!(!body.contains("same_pinned_window"),
+                "the window arm convicts honest voters — it must not come back without a per-window                  single-vote rule in the engine");
+        // Full preimages are what prove same-round: the vote signature covers only the hash.
+        assert!(body.contains("bincode::deserialize(checkpoint_a)"));
+    }
+
+    // The relaxation ships OFF. Nothing can arm, so no checkpoint ever carries a recovery_anchor and
+    // the relaxed branch is unreachable. Six defects in it go live simultaneously at committee 10, and
+    // an armed node makes a halt LESS recoverable than an unarmed one, so half-armed is the worst state.
+    #[tokio::test]
+    async fn recovery_relaxation_ships_disabled() {
+        assert!(!crate::node::RC_ENABLED, "must ship OFF until the engine has a per-window vote rule");
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage");
+        let heard = std::collections::HashSet::new();
+        // Refused for the switch, ahead of every other condition — including a genuine halt.
+        assert_eq!(crate::node::rc_try_arm_dry(&storage, &heard, true).unwrap_err().reason(),
+                   "recovery_relaxation_disabled");
+        assert_eq!(crate::node::rc_try_arm(&storage, &heard, true).unwrap_err().reason(),
+                   "recovery_relaxation_disabled");
+        assert!(crate::node::rc_armed().is_none());
+
+        // THE part that matters: a well-formed pinned macroblock must be REJECTED. Gating only the arm
+        // left the field live for a Byzantine proposer — unarmed nodes voted on it, the committee
+        // sealed it, and every other node rejected it forever.
+        let (a, cp_index, n) = (4u64, 17u64, 12usize);
+        let (ah, cp_a) = rc_anchor(&storage, a, cp_index, n, false, a * 90).await;
+        let pinned = rc_pinned_cp(&cp_a, a, ah, 1, cp_a.hash());
+        assert!(pinned.recovery_anchor.is_some());
+        let src = include_str!("node.rs");
+        assert!(src.contains("if !RC_ENABLED && cp.recovery_anchor.is_some() {"),
+                "verify_v2_macroblock must refuse a pinned checkpoint while the feature is off");
+        let engine = include_str!("../../../core/qnet-consensus/src/checkpoint_consensus.rs");
+        assert!(engine.contains("if cp.recovery_anchor.is_some() && !self.relaxed_at(cp.index) { return Vec::new(); }"),
+                "on_proposal must never vote for a pin this node did not arm");
+        let seal = include_str!("consensus_v2_node.rs");
+        assert!(seal.contains("persist_refused reason=rc_disabled"),
+                "the seal path must refuse a pinned checkpoint while the feature is off");
+
+        // And every threshold stays strict, at any index or window.
+        for n in [10usize, 100, 1000] {
+            assert_eq!(crate::node::rc_effective_quorum(7, n),
+                       qnet_consensus::checkpoint_bft::quorum_size(n));
+            assert_eq!(crate::node::rc_effective_quorum_window(7, n),
+                       qnet_consensus::checkpoint_bft::quorum_size(n));
+        }
+    }
+
+    // B2. The NodeRegistration dedup set must be seeded from rows `registry_root` ACTUALLY covers.
+    // It was seeded from the `nreg_` prefix, which `compute_lt_state_cf` does not fold, while a
+    // cold-join snapshot is imported into the registry CF unfiltered — so ONE injected `nreg_<victim>`
+    // row made the joiner skip that node's real registration as a duplicate. The skip is per-TX, the
+    // block is still accepted, `state_root` still matches, and the joiner's `registry_root` is
+    // permanently one row short: a silent, unrecoverable exit from the quorum chosen by the server.
+    #[tokio::test]
+    async fn dedup_seed_ignores_registry_rows_outside_the_root() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage");
+        let cf = storage.registry_cf_for_test();
+
+        // A genuine, root-covered registration: reachable via srtr_, payload under node_<id>.
+        storage.put_registry_row_for_test(&cf, b"srtr_node_real", b"x");
+        storage.put_registry_row_for_test(&cf, b"node_node_real",
+            br#"{"reg_height":10,"wallet":"w_real","burn":"b","vrf_pk_sha3":""}"#);
+
+        // What a forged snapshot injects: an orphan nreg_ row for an identity that has NOT registered,
+        // plus a node_ payload with no roster row pointing at it. Neither is in registry_root.
+        storage.put_registry_row_for_test(&cf, b"nreg_node_victim", b"w_victim");
+        storage.put_registry_row_for_test(&cf, b"node_node_victim",
+            br#"{"reg_height":11,"wallet":"w_victim","burn":"b","vrf_pk_sha3":""}"#);
+
+        let covered = storage.registry_root_covered_origins().expect("covered");
+        assert_eq!(covered, vec![("node_real".to_string(), "w_real".to_string())],
+                   "the dedup seed must contain exactly the root-covered bindings");
+        assert!(!covered.iter().any(|(id, _)| id == "node_victim"),
+                "an injected orphan must not pre-seed the dedup set — that is the silent quorum exit");
+
+        // A roster row whose payload has no reg_height is an unconfirmed RPC/discovery cache write and
+        // is excluded by the root's own fold, so it must be excluded here too.
+        storage.put_registry_row_for_test(&cf, b"srtr_node_unconf", b"x");
+        storage.put_registry_row_for_test(&cf, b"node_node_unconf", br#"{"wallet":"w_u"}"#);
+        assert_eq!(storage.registry_root_covered_origins().expect("covered").len(), 1,
+                   "unconfirmed rows are outside the root and must stay outside the seed");
+    }
+
+    // B3. Reaching fork_conflict means the slot was taken during the save's own await — the slot-taken
+    // guard filters every already-occupied case — so this block DID write its durable deltas
+    // (registry_root LtHash add, cbw_, nreg_, dpk bind) that rollback_block cannot reverse. The apply
+    // arm must signal a rebuild exactly as the producer arm already does; leaving it silent keeps two
+    // hashed checkpoint fields permanently wrong on that node and the boot rebuilds re-fold the orphan.
+    #[test]
+    fn fork_conflict_on_the_apply_arm_signals_a_rebuild() {
+        let src = include_str!("../src/block_pipeline.rs");
+        let benign = src.find("let benign_race = err_text.contains(\"fork_conflict\")")
+            .expect("the benign-race classifier must still exist");
+        let arm = &src[benign..];
+        let sig = arm.find("signal_fork_recovery(")
+            .expect("the apply arm's fork_conflict case must signal a rebuild");
+        assert!(sig < 4_000, "the signal drifted out of the benign-race arm (offset {})", sig);
+        // And ONLY for fork_conflict: a rollback already in flight, or storage that keeps no blocks,
+        // materialised nothing, so signalling there would start a second, deeper recovery.
+        assert!(arm[..sig].contains("if err_text.contains(\"fork_conflict\")"),
+                "the signal must be gated on fork_conflict alone");
+    }
+
+    // DEFECT A (anchor half). The failover vote anchor read MacroBlock::hash(w-2) and returned None
+    // once that macroblock did not exist — i.e. ~3 minutes into any stall — so a TimeoutVote could be
+    // neither built nor verified exactly when rotation was needed.
+    // The anchor stays on macroblock w-2. A microblock-hash source was tried to reach past the seal
+    // frontier and is strictly WORSE: every caller resolves failover_committee_for_window first, which
+    // already needs that macroblock, while a snapshot joiner holds no microblock aliases below its
+    // anchor. Same availability, narrower source.
+    #[test]
+    fn failover_anchor_is_the_macroblock_the_committee_gate_already_needs() {
+        let src = include_str!("../src/unified_p2p.rs");
+        let f = src.find("pub fn sealed_anchor_for_window").expect("anchor fn");
+        let body = &src[f..f + 1400];
+        assert!(body.contains("get_macroblock_by_height(w - 2)"));
+        assert!(!body.contains("canonical_hash_at"));
+    }
+
+    // A restart is only a REPAIR if the barred identities stay out. The eligible set is not a
+    // carried-forward set that decays — `phase2a_eligible_additions` recomputes it every window as the
+    // fixed point {registered AND recently-heartbeating}, so filtering only the carry-over would put
+    // every barred identity back into the quorum denominator on the very next window and the restarted
+    // chain would re-halt on the same set within minutes. Both arms must enforce the bar.
+    #[test]
+    fn restart_bar_is_enforced_on_both_eligibility_arms() {
+        let src = include_str!("node.rs");
+        // Carry-over filter inside create_eligible_producers_snapshot.
+        let carry = src.find("// Restart bar, checked before the genesis carve-out")
+            .expect("carry-over arm must check the restart bar");
+        // Re-admission arm inside phase2a_eligible_additions.
+        let readmit = src.find("// Restart bar, enforced here too")
+            .expect("Phase-2A re-admission arm must check the restart bar");
+        assert_ne!(carry, readmit);
+        // Each anchor must be followed by the guard itself, not just by a comment claiming it. Counting
+        // occurrences file-wide cannot work here: this test reads its own source, so its string
+        // literals would be counted too.
+        let guard_gap = |from: usize| src[from..].find("restart_excludes(")
+            .expect("the guard must appear after its own comment");
+        assert!(guard_gap(carry) < 800, "carry-over arm: comment without the guard next to it");
+        assert!(guard_gap(readmit) < 800, "Phase-2A arm: comment without the guard next to it");
+
+        // The bar is checked BEFORE the genesis carve-out, so a compromised genesis identity can also
+        // be retired. Otherwise the set with the most authority is the one that can never be cleaned.
+        let genesis_carve = src.find("// Genesis stays: it is the bootstrap floor").expect("carve-out");
+        assert!(carry < genesis_carve, "the restart bar must precede the genesis carve-out");
+
+        // Inert in this binary: nothing is barred, so neither arm changes behaviour at genesis.
+        assert!(!crate::genesis_constants::restart_active());
+        assert!(!crate::genesis_constants::restart_excludes("genesis_node_001"));
+    }
+
+    // UNIT REGRESSION. The span lives in two key spaces: MACROBLOCK windows (the failover paths, which
+    // do committee_for_height(w*90)) and CHECKPOINT windows (head/30 — how the driver's next_window and
+    // the consensus loop's buffer are keyed). They differ by a factor of 3. Passing a checkpoint window
+    // to the macroblock-unit range test answers None for every REAL span window, so the C_S override
+    // never fires, the pinned proposal carries the derived committee, and verify_v2_macroblock's
+    // committee clause then rejects it on every node — the whole relaxation silently inert.
+    #[test]
+    fn span_window_units_are_not_interchangeable() {
+        use qnet_consensus::checkpoint_bft::{CHECKPOINT_INTERVAL, MACROBLOCK_INTERVAL, RC_SPAN_INDICES,
+                                             recovery_window_head};
+        for a in [1u64, 4, 100, 160_000] {
+            let (lo, hi) = crate::node::rc_span_cp_windows_for(a);
+            let (mb_lo, mb_hi) = (a + 1, a + 2);
+            assert_eq!(hi - lo + 1, RC_SPAN_INDICES, "the span is 6 checkpoint windows");
+
+            // Every pinned checkpoint's window head maps onto exactly one key in [lo, hi]...
+            let h_a = a * MACROBLOCK_INTERVAL;
+            for k in 1..=RC_SPAN_INDICES {
+                let head = recovery_window_head(h_a, k);
+                assert_eq!(head / CHECKPOINT_INTERVAL, lo + k - 1);
+                // ...and lands inside macroblock A+1 or A+2, never beyond.
+                let mb = (head + MACROBLOCK_INTERVAL - 1) / MACROBLOCK_INTERVAL;
+                assert!(mb == mb_lo || mb == mb_hi, "k={} landed on mb {}", k, mb);
+            }
+            // The last span head is exactly the A+2 boundary — 6 * 30 == 2 * 90.
+            let last = recovery_window_head(h_a, RC_SPAN_INDICES);
+            assert_eq!(last, (a + 2) * MACROBLOCK_INTERVAL);
+
+            // The two ranges genuinely do NOT overlap once the chain is past genesis, which is what
+            // made the mix-up silent rather than loud.
+            if a >= 2 {
+                assert!(mb_hi < lo, "a={}: macroblock span {:?} must not overlap cp span {:?}",
+                        a, (mb_lo, mb_hi), (lo, hi));
+            }
+        }
+    }
+
+    // The arm can only ever SHORTEN the stall wait. Every other condition is re-checked identically
+    // for the operator RPC and the automatic path, so an operator cannot relax a healthy network.
+    #[tokio::test]
+    async fn rc_arm_refuses_healthy_and_ineligible() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage");
+        let empty = std::collections::HashSet::new();
+
+        // The master switch answers first, before any other condition. `recovery_relaxation_ships_disabled`
+        // pins that; here we pin the ORDER of the remaining conditions, which is what will matter when
+        // the switch is turned on.
+        assert_eq!(crate::node::rc_try_arm(&storage, &empty, false).unwrap_err().reason(),
+                   if crate::node::RC_ENABLED { "not_halted" } else { "recovery_relaxation_disabled" });
+        assert_eq!(crate::node::rc_try_arm(&storage, &empty, true).unwrap_err().reason(),
+                   if crate::node::RC_ENABLED { "anchor_missing" } else { "recovery_relaxation_disabled" });
+
+        // Refusal reasons are distinct and legible — an operator must see WHY, not a bare false.
+        assert_eq!(crate::node::RcArmRefusal::CommitteeBelowFloor(5).reason(), "committee_below_floor n=5");
+        assert_eq!(crate::node::RcArmRefusal::QuorumStillReachable(9, 8).reason(),
+                   "quorum_still_reachable heard=9 q=8");
+        assert_eq!(crate::node::RcArmRefusal::TooFewLive(3, 6).reason(), "too_few_live heard=3 relaxed_q=6");
+        assert_eq!(crate::node::RcArmRefusal::AnchorRelaxed.reason(), "anchor_relaxed");
+
+        // Nothing above armed anything.
+        assert!(crate::node::rc_armed().is_none());
+        assert!(crate::node::rc_span_windows().is_none());
+        // Unarmed, every threshold is the strict one — the relaxation is off unless explicitly on.
+        assert_eq!(crate::node::rc_effective_quorum(5, 1000),
+                   qnet_consensus::checkpoint_bft::quorum_size(1000));
+        assert_eq!(crate::node::rc_effective_quorum_window(7, 1000),
+                   qnet_consensus::checkpoint_bft::quorum_size(1000));
     }
 
     // Phase-2A recency window (genesis rule, no gate): prev = cur-1 SPANS the epoch boundary so the
@@ -27750,7 +29450,7 @@ mod tests {
 
         let registered_super_nodes: HashSet<String> = storage.super_registrations_sorted()
             .unwrap().into_iter().map(|(id, _w)| id).collect();
-        let recent_hb = recent_heartbeat_senders(&storage, scan_end);
+        let recent_hb = recent_heartbeat_senders(&storage, scan_end).expect("index intact in test");
         // Consensus reputation supplied directly (this test isolates the eligibility predicates).
         let reputation_map: HashMap<String, f64> = [
             ("genesis_node_001", 80.0), ("super_c", 90.0), ("super_a", 90.0),
@@ -27759,8 +29459,9 @@ mod tests {
         let already: HashSet<String> = HashSet::new();
 
         // Inverted (production) path.
+        let st = qnet_state::State::new();
         let got = phase2a_eligible_additions(
-            &storage, &registered_super_nodes, &recent_hb, &already, &reputation_map, scan_end, FLOOR,
+            &st, &storage, &registered_super_nodes, &recent_hb, &already, &reputation_map, scan_end, FLOOR,
         );
 
         // OLD full-scan reference: iterate ALL registrants sorted, reg-height point-read FIRST, then the
@@ -27962,7 +29663,6 @@ mod tests {
                     node_id: node_id.to_string(),
                     anchor_height,
                     anchor_hash: String::new(),
-                    signature: String::new(),
                 },
                 timestamp: 0,
                 hash: format!("{:064x}", uniq),
@@ -27986,8 +29686,6 @@ mod tests {
                 signature: vec![0u8; 64],
                 merkle_root: [0u8; 32],
                 previous_hash: [0u8; 32],
-                poh_hash: vec![],
-                poh_count: 0,
                 vrf_output: None,
                 vrf_proof: None,
                 fees_collected: 0,
@@ -28003,35 +29701,37 @@ mod tests {
         let storage = crate::storage::Storage::new(_dir.path().to_str().unwrap()).expect("storage");
 
         // (height, node, anchor): spans subwindows 0..2, incl. a REPEAT inclusion for (sw1, super_a).
+        // Every anchor is strictly past and within HB_ANCHOR_MAX_LAG — the writer drops anything else,
+        // so a fixture that violated it would no longer describe a heartbeat the chain can carry.
         let blocks: Vec<(u64, &str, u64)> = vec![
-            (100, "super_a", 50),      // sw0
-            (1500, "super_b", 1499),   // sw1
-            (1600, "super_a", 1450),   // sw1 first inclusion
-            (2000, "super_a", 1900),   // sw1 repeat — min must stay 1600
-            (2950, "super_c", 2890),   // sw2
+            (100, "super_a", 50),      // sw0, lag 50
+            (1500, "super_b", 1499),   // sw1, lag 1
+            (1600, "super_a", 1550),   // sw1 first inclusion, lag 50
+            (2000, "super_a", 1950),   // sw1 repeat, lag 50 — min must stay 1600
+            (2950, "super_c", 2890),   // sw2, lag 60
         ];
         for (h, id, a) in &blocks {
             put_block(&storage, *h, vec![hb_tx(id, *a)]);
             storage.index_heartbeat_inclusion(id, *a, *h).expect("index"); // apply-path writer
         }
         for scan_end in [100u64, 1499, 1500, 1600, 1999, 2000, 2880, 2950, 3000] {
-            assert_eq!(recent_heartbeat_senders(&storage, scan_end),
+            assert_eq!(recent_heartbeat_senders(&storage, scan_end).expect("index intact"),
                        recent_heartbeat_senders_scan(&storage, scan_end),
                        "index != scan at scan_end={}", scan_end);
         }
         // Min-inclusion survives the repeat: reader at 1999 must already see super_a via 1600.
-        assert!(recent_heartbeat_senders(&storage, 1999).contains("super_a"));
+        assert!(recent_heartbeat_senders(&storage, 1999).expect("index intact").contains("super_a"));
 
         // Reorg to 1599: entries included above are dropped; index == scan at the new tip.
         storage.canonicalize_heartbeat_index(1599).expect("canonicalize");
-        assert_eq!(recent_heartbeat_senders(&storage, 1599),
+        assert_eq!(recent_heartbeat_senders(&storage, 1599).expect("index intact"),
                    recent_heartbeat_senders_scan(&storage, 1599), "post-reorg mismatch");
         // Re-apply of the (same) fork tail restores full equality — writer is idempotent.
         for (h, id, a) in blocks.iter().filter(|(h, _, _)| *h > 1599) {
             storage.index_heartbeat_inclusion(id, *a, *h).expect("re-index");
         }
         for scan_end in [2000u64, 2950, 3000] {
-            assert_eq!(recent_heartbeat_senders(&storage, scan_end),
+            assert_eq!(recent_heartbeat_senders(&storage, scan_end).expect("index intact"),
                        recent_heartbeat_senders_scan(&storage, scan_end),
                        "post-reapply index != scan at scan_end={}", scan_end);
         }
@@ -28071,15 +29771,50 @@ mod tests {
         let peer = crate::storage::Storage::new(_dp.path().to_str().unwrap()).expect("storage");
         let vrf = vec![0xABu8; crate::crypto::vrf::D3_PK_BYTES]; // FIX-5: raw pk bytes, same as the TX carries
         peer.save_node_registration_at_height_burn_vrf("genesis_node_001", "super", "walletG", 1.0, 0, "", Some(vrf.as_slice())).unwrap();
-        assert_eq!(creator.compute_registry_root(0), peer.compute_registry_root(0),
+        assert_eq!(creator.compute_registry_root(0).unwrap(), peer.compute_registry_root(0).unwrap(),
                    "genesis creator path must be byte-identical to the peer-apply path");
 
         // vrf is actually bound: a vrf-less write yields a DIFFERENT root (proves the regression is closed).
         let _dn = tempfile::TempDir::new().expect("tempdir");
         let novrf = crate::storage::Storage::new(_dn.path().to_str().unwrap()).expect("storage");
         novrf.save_node_registration_at_height_burn("genesis_node_001", "super", "walletG", 1.0, 0, "").unwrap();
-        assert_ne!(creator.compute_registry_root(0), novrf.compute_registry_root(0),
+        assert_ne!(creator.compute_registry_root(0).unwrap(), novrf.compute_registry_root(0).unwrap(),
                    "vrf_pk must be bound into registry_root (creator != vrf-less)");
+    }
+
+    // The genesis-INGEST paths (HTTP pull, file import, existing-store restore) cached the rows
+    // without stamping reg_height. registry_root folds only stamped rows, so such a node committed a
+    // root that omitted all 5 genesis nodes and was Rejected at every checkpoint until some later
+    // restart happened to stamp them. Pins that caching alone is NOT enough and that the pairing with
+    // apply_genesis_registrations is what makes an ingesting node agree with the creator.
+    #[test]
+    fn genesis_ingest_must_stamp_not_only_cache() {
+        let mut gtx = BlockchainNode::create_node_registration_tx_with_timestamp(
+            "genesis_node_001", qnet_state::NodeType::Super, "walletG", "genesis", "", Some(0));
+        gtx.dilithium_public_key = Some(vec![0xABu8; crate::crypto::vrf::D3_PK_BYTES]);
+
+        let _dc = tempfile::TempDir::new().expect("tempdir");
+        let creator = crate::storage::Storage::new(_dc.path().to_str().unwrap()).expect("storage");
+        BlockchainNode::cache_node_registrations_from_transactions(&creator, std::slice::from_ref(&gtx));
+        BlockchainNode::apply_genesis_registrations(&creator, std::slice::from_ref(&gtx));
+
+        // Cache-only: what every ingest path used to do on its own.
+        let _di = tempfile::TempDir::new().expect("tempdir");
+        let ingest = crate::storage::Storage::new(_di.path().to_str().unwrap()).expect("storage");
+        BlockchainNode::cache_node_registrations_from_transactions(&ingest, std::slice::from_ref(&gtx));
+        assert_ne!(creator.compute_registry_root(0).unwrap(), ingest.compute_registry_root(0).unwrap(),
+                   "cache-only must NOT already match — otherwise this guard proves nothing");
+        assert_eq!(ingest.compute_registry_root(0).unwrap(),
+                   crate::registry_lthash::LtHash::new().root(),
+                   "an unstamped row must be invisible to registry_root");
+
+        // Stamping afterwards converges it, and is idempotent.
+        BlockchainNode::apply_genesis_registrations(&ingest, std::slice::from_ref(&gtx));
+        assert_eq!(creator.compute_registry_root(0).unwrap(), ingest.compute_registry_root(0).unwrap(),
+                   "a stamped ingest path must agree with the creator");
+        BlockchainNode::apply_genesis_registrations(&ingest, std::slice::from_ref(&gtx));
+        assert_eq!(creator.compute_registry_root(0).unwrap(), ingest.compute_registry_root(0).unwrap(),
+                   "re-stamping must be idempotent");
     }
 
     // ── B cutover: merkle reward-claim determinism + security ──
@@ -28205,6 +29940,44 @@ mod tests {
         }
     }
 
+    /// The split must conserve exactly, aggregate per WALLET, and never strand a pool that has no
+    /// recipients — at launch there are no light clients, so a fixed 75% user share would mint value
+    /// nobody could ever claim.
+    #[test]
+    fn split_conserves_aggregates_and_never_strands() {
+        let sup: Vec<(String, String)> = (0..4)
+            .map(|i| (format!("super_node_{:04}", i), format!("wallet_s{}", i))).collect();
+        let lit: Vec<(String, String)> = (0..400)
+            .map(|i| (format!("light_node_{:04}", i), format!("wallet_l{}", i))).collect();
+        let total: u64 = 251_432_340_000_000;
+
+        let (v, _) = BlockchainNode::distribute_split_rewards(&sup, &lit, total, 160);
+        assert_eq!(v.iter().map(|(_, a)| *a).sum::<u64>(), total, "emission must be conserved exactly");
+        let op: u64 = v.iter().filter(|(w, _)| w.starts_with("wallet_s")).map(|(_, a)| *a).sum();
+        // 4 operators share 25%, 400 users share 75% ⇒ an operator earns ~33x a user.
+        let per_op = op / 4;
+        let per_user = (total - op) / 400;
+        assert!(per_op > per_user * 30 && per_op < per_user * 36, "per_op={} per_user={}", per_op, per_user);
+
+        // No users yet: operators take the whole emission, nothing is stranded.
+        let (v2, _) = BlockchainNode::distribute_split_rewards(&sup, &[], total, 160);
+        assert_eq!(v2.iter().map(|(_, a)| *a).sum::<u64>(), total);
+        // No operators: users take the whole emission.
+        let (v3, _) = BlockchainNode::distribute_split_rewards(&[], &lit, total, 160);
+        assert_eq!(v3.iter().map(|(_, a)| *a).sum::<u64>(), total);
+    }
+
+    /// One wallet holding BOTH a super and a light identity must produce ONE leaf. Two pools appending
+    /// separately would emit the wallet twice and break the sharded claim path.
+    #[test]
+    fn split_emits_one_leaf_per_wallet() {
+        let sup = vec![("super_node_0001".to_string(), "shared_wallet".to_string())];
+        let lit = vec![("light_node_0001".to_string(), "shared_wallet".to_string())];
+        let (v, _) = BlockchainNode::distribute_split_rewards(&sup, &lit, 1_000_000, 160);
+        assert_eq!(v.len(), 1, "a wallet must appear once, got {:?}", v);
+        assert_eq!(v[0].1, 1_000_000, "both pool shares must land on the same leaf");
+    }
+
     #[test]
     fn reward_claim_proof_round_trip() {
         // Producer builds the root; a claimant proves its exact (wallet, epoch, amount) leaf.
@@ -28244,7 +30017,7 @@ mod tests {
         acct.heartbeat_epoch = 5;
         acct.heartbeat_slots = 0b1_1111_1111; // 9 subwindows set
         acct.heartbeat_final_epoch = 4;
-        acct.heartbeat_final_count = 7;
+        acct.heartbeat_final_slots = 0x7F; // 7 subwindows
         assert_eq!(BlockchainNode::account_heartbeat_count(&acct, 5), 9, "current epoch → live popcount");
         assert_eq!(BlockchainNode::account_heartbeat_count(&acct, 4), 7, "previous epoch → finalized count");
         assert_eq!(BlockchainNode::account_heartbeat_count(&acct, 3), 0, "older epoch → 0 (not eligible)");
@@ -28358,14 +30131,25 @@ mod tests {
     // A false positive here would ban an honest node, so (2) is the critical set.
     // ═════════════════════════════════════════════════════════════════════════
 
-    fn eqv_gen_and_register(node_id: &str) -> (Vec<u8>, pqcrypto_mldsa::mldsa65::SecretKey) {
+    fn eqv_storage() -> (crate::storage::Storage, tempfile::TempDir) {
+        let d = tempfile::tempdir().expect("tempdir");
+        (crate::storage::Storage::new(d.path().to_str().unwrap()).expect("storage"), d)
+    }
+
+    /// Publishes the key to COMMITTED state, which is where the verifiers read it — the RAM registry
+    /// is deliberately not consulted (it is per-process and idle-evicted ⇒ a fork source).
+    fn eqv_gen_and_register(
+        storage: &crate::storage::Storage,
+        node_id: &str,
+    ) -> (Vec<u8>, pqcrypto_mldsa::mldsa65::SecretKey) {
         use pqcrypto_traits::sign::PublicKey as _;
         let (pk, sk) = pqcrypto_mldsa::mldsa65::keypair();
         let pk_bytes = pk.as_bytes().to_vec();
-        assert!(
-            qnet_consensus::consensus_crypto::register_consensus_pk_from_chain(node_id, &pk_bytes),
-            "register consensus pk for {}", node_id
-        );
+        storage.save_vrf_public_key(node_id, &hex::encode(&pk_bytes)).expect("publish vrf pk");
+        // A ban verdict resolves the offender key only when the CANONICAL registry row commits to it —
+        // the standalone key row survives a reorg that removed the registration, so it cannot stand alone.
+        storage.save_node_registration_at_height_burn_vrf(
+            node_id, "super", &format!("w_{}", node_id), 1.0, 1, "", Some(&pk_bytes)).expect("register");
         (pk_bytes, sk)
     }
 
@@ -28421,10 +30205,11 @@ mod tests {
             registry_root: [0u8; 32],
             logs_root: [0u8; 32],
             dilithium_pk_root: [0u8; 32],
+            reward_epoch_root: [0u8; 32],
             total_supply: 0,
             timestamp: 1000,
             proposer: node.to_string(),
-            proposer_sig: Vec::new(),
+            proposer_sig: Vec::new(), recovery_anchor: None,
         }
     }
 
@@ -28450,23 +30235,84 @@ mod tests {
         format!("dilithium_sig_{}_{}", node, general_purpose::STANDARD.encode(&combined)).into_bytes()
     }
 
+    /// ONE genuine public block must never yield a valid proof. The struct derives PartialEq and
+    /// carries `signature`, so comparing whole headers made two copies of the same block "different"
+    /// as soon as their signature bytes differed — and hex::decode accepts either case, so simply
+    /// re-casing the hex of a public signature produced two headers that both verify. Anyone could
+    /// have minted a permanent, chain-committed ban against any producer from a block they merely
+    /// read; at n=5, two such bans halt finality for good.
+    #[test]
+    fn eqv_recased_signature_of_one_block_is_not_equivocation() {
+        let node = "eqv_test_blk_recase";
+        let (_st, _d) = eqv_storage();
+        let (_pk, sk) = eqv_gen_and_register(&_st, node);
+        let h = 100u64;
+        let mut a = eqv_mk_header(1000, 1, 0);
+        a.signature = eqv_sign_block(&sk, h, node, &a);
+        let mut b = a.clone();
+        b.signature = String::from_utf8(a.signature.clone()).unwrap().to_uppercase().into_bytes();
+        // Same wire signature, different bytes — and the header structs now genuinely differ.
+        assert_ne!(a.signature, b.signature);
+        assert_ne!(a, b, "struct equality is exactly what must NOT decide this");
+        assert!(!BlockchainNode::verify_equivocation_proof(&_st, node, h, &a, &b),
+                "re-casing one block's signature hex must not forge an equivocation proof");
+    }
+
+    /// ML-DSA signing is randomised, so an honest producer that re-emits the same block after a
+    /// rollback signs different bytes over the identical digest. That is a restart, not a double
+    /// sign, and must never be slashable — no attacker required for this one.
+    #[test]
+    fn eqv_resigned_same_block_is_not_equivocation() {
+        let node = "eqv_test_blk_resign";
+        let (_st, _d) = eqv_storage();
+        let (_pk, sk) = eqv_gen_and_register(&_st, node);
+        let h = 100u64;
+        let mut a = eqv_mk_header(1000, 1, 0);
+        let mut b = a.clone();
+        a.signature = eqv_sign_block(&sk, h, node, &a);
+        b.signature = eqv_sign_block(&sk, h, node, &b);
+        assert_ne!(a.signature, b.signature, "ML-DSA signing is randomised");
+        assert!(!BlockchainNode::verify_equivocation_proof(&_st, node, h, &a, &b),
+                "re-signing the SAME block must not be slashable");
+    }
+
+    /// Two blocks that differ ONLY in the beacon contribution are the split that binding vrf_output
+    /// into block identity closed — so they must now be a slashable double-sign, not "the same block".
+    #[test]
+    fn eqv_differing_vrf_output_is_equivocation() {
+        let node = "eqv_test_blk_vrf";
+        let (_st, _d) = eqv_storage();
+        let (_pk, sk) = eqv_gen_and_register(&_st, node);
+        let h = 100u64;
+        let mut a = eqv_mk_header(1000, 1, 0);
+        let mut b = eqv_mk_header(1000, 1, 0);
+        a.vrf_output = Some([1u8; 32]);
+        b.vrf_output = Some([2u8; 32]);
+        a.signature = eqv_sign_block(&sk, h, node, &a);
+        b.signature = eqv_sign_block(&sk, h, node, &b);
+        assert!(BlockchainNode::verify_equivocation_proof(&_st, node, h, &a, &b),
+                "same hash, different beacon contribution IS a double-sign");
+    }
+
     #[test]
     fn eqv_block_valid_double_sign_is_detected() {
         let node = "eqv_test_blk_valid";
-        let (_pk, sk) = eqv_gen_and_register(node);
+        let (_st, _d) = eqv_storage();
+        let (_pk, sk) = eqv_gen_and_register(&_st, node);
         let h = 100u64;
         let mut a = eqv_mk_header(1000, 1, 0);
         let mut b = eqv_mk_header(1001, 2, 0); // same producer/height, different content
         a.signature = eqv_sign_block(&sk, h, node, &a);
         b.signature = eqv_sign_block(&sk, h, node, &b);
-        assert!(BlockchainNode::verify_equivocation_proof(node, h, &a, &b),
+        assert!(BlockchainNode::verify_equivocation_proof(&_st, node, h, &a, &b),
                 "a real same-height double-sign MUST verify (verifier non-vacuous)");
     }
 
     #[test]
     fn eqv_block_forged_sig_does_not_ban() {
         let node = "eqv_test_blk_forged";
-        let (_pk, sk) = eqv_gen_and_register(node);
+        let (_st, _d) = eqv_storage();
+        let (_pk, sk) = eqv_gen_and_register(&_st, node);
         let h = 100u64;
         let mut a = eqv_mk_header(1000, 1, 0);
         let mut b = eqv_mk_header(1001, 2, 0);
@@ -28474,42 +30320,45 @@ mod tests {
         b.signature = eqv_sign_block(&sk, h, node, &b);
         let n = b.signature.len() - 1;
         b.signature[n] ^= 0xFF; // corrupt one hex char of b's sig
-        assert!(!BlockchainNode::verify_equivocation_proof(node, h, &a, &b),
+        assert!(!BlockchainNode::verify_equivocation_proof(&_st, node, h, &a, &b),
                 "a forged signature MUST NOT ban (no false slashing)");
     }
 
     #[test]
     fn eqv_block_identical_does_not_ban() {
         let node = "eqv_test_blk_ident";
-        let (_pk, sk) = eqv_gen_and_register(node);
+        let (_st, _d) = eqv_storage();
+        let (_pk, sk) = eqv_gen_and_register(&_st, node);
         let h = 100u64;
         let mut a = eqv_mk_header(1000, 1, 0);
         a.signature = eqv_sign_block(&sk, h, node, &a);
         let b = a.clone();
-        assert!(!BlockchainNode::verify_equivocation_proof(node, h, &a, &b),
+        assert!(!BlockchainNode::verify_equivocation_proof(&_st, node, h, &a, &b),
                 "identical headers are not equivocation");
     }
 
     #[test]
     fn eqv_block_unregistered_offender_does_not_ban() {
         let node = "eqv_test_blk_unregistered_never";
+        let (_st, _d) = eqv_storage(); // empty chain state: the key was never published
         let a = eqv_mk_header(1000, 1, 0);
         let b = eqv_mk_header(1001, 2, 0);
-        assert!(!BlockchainNode::verify_equivocation_proof(node, 100, &a, &b),
-                "no registry PK ⇒ cannot ban");
+        assert!(!BlockchainNode::verify_equivocation_proof(&_st, node, 100, &a, &b),
+                "no on-chain PK ⇒ cannot ban");
     }
 
     #[tokio::test]
     async fn eqv_vote_same_round_double_sign_is_detected() {
         let node = "eqv_test_vote_same";
-        let (pk, sk) = eqv_gen_and_register(node);
+        let (_st, _d) = eqv_storage();
+        let (pk, sk) = eqv_gen_and_register(&_st, node);
         let ca = eqv_mk_checkpoint(node, 5, 7);
         let cb = eqv_mk_checkpoint(node, 5, 8); // SAME round, different content
         let sa = eqv_sign_vote(node, &pk, &sk, ca.hash());
         let sb = eqv_sign_vote(node, &pk, &sk, cb.hash());
         let ba = bincode::serialize(&ca).unwrap();
         let bb = bincode::serialize(&cb).unwrap();
-        assert!(BlockchainNode::verify_vote_equivocation_proof(node, &ba, &sa, &bb, &sb).await,
+        assert!(BlockchainNode::verify_vote_equivocation_proof(&_st, node, &ba, &sa, &bb, &sb).await,
                 "a real same-round double-vote MUST verify (verifier non-vacuous)");
     }
 
@@ -28518,39 +30367,42 @@ mod tests {
         // THE false-slashing trap: identical VALID sigs, only the round differs →
         // two honest votes in successive rounds, NOT equivocation.
         let node = "eqv_test_vote_diffround";
-        let (pk, sk) = eqv_gen_and_register(node);
+        let (_st, _d) = eqv_storage();
+        let (pk, sk) = eqv_gen_and_register(&_st, node);
         let ca = eqv_mk_checkpoint(node, 5, 7);
         let cb = eqv_mk_checkpoint(node, 6, 7); // DIFFERENT round
         let sa = eqv_sign_vote(node, &pk, &sk, ca.hash());
         let sb = eqv_sign_vote(node, &pk, &sk, cb.hash());
         let ba = bincode::serialize(&ca).unwrap();
         let bb = bincode::serialize(&cb).unwrap();
-        assert!(!BlockchainNode::verify_vote_equivocation_proof(node, &ba, &sa, &bb, &sb).await,
+        assert!(!BlockchainNode::verify_vote_equivocation_proof(&_st, node, &ba, &sa, &bb, &sb).await,
                 "two honest votes from DIFFERENT rounds MUST NOT ban (false-slashing guard)");
     }
 
     #[tokio::test]
     async fn eqv_vote_identical_does_not_ban() {
         let node = "eqv_test_vote_ident";
-        let (pk, sk) = eqv_gen_and_register(node);
+        let (_st, _d) = eqv_storage();
+        let (pk, sk) = eqv_gen_and_register(&_st, node);
         let ca = eqv_mk_checkpoint(node, 5, 7);
         let sa = eqv_sign_vote(node, &pk, &sk, ca.hash());
         let ba = bincode::serialize(&ca).unwrap();
-        assert!(!BlockchainNode::verify_vote_equivocation_proof(node, &ba, &sa, &ba, &sa).await,
+        assert!(!BlockchainNode::verify_vote_equivocation_proof(&_st, node, &ba, &sa, &ba, &sa).await,
                 "identical checkpoint is not equivocation");
     }
 
     #[tokio::test]
     async fn eqv_vote_forged_sig_does_not_ban() {
         let node = "eqv_test_vote_forged";
-        let (pk, sk) = eqv_gen_and_register(node);
+        let (_st, _d) = eqv_storage();
+        let (pk, sk) = eqv_gen_and_register(&_st, node);
         let ca = eqv_mk_checkpoint(node, 5, 7);
         let cb = eqv_mk_checkpoint(node, 5, 8);
         let sa = eqv_sign_vote(node, &pk, &sk, ca.hash());
         let ba = bincode::serialize(&ca).unwrap();
         let bb = bincode::serialize(&cb).unwrap();
         let forged = b"dilithium_sig_eqv_test_vote_forged_not_a_real_signature".to_vec();
-        assert!(!BlockchainNode::verify_vote_equivocation_proof(node, &ba, &sa, &bb, &forged).await,
+        assert!(!BlockchainNode::verify_vote_equivocation_proof(&_st, node, &ba, &sa, &bb, &forged).await,
                 "a forged vote signature MUST NOT ban");
     }
 
@@ -28614,28 +30466,55 @@ mod tests {
     // Default: cost == amount (at-cost), attest_epoch=1 (genesis committee at the GATE=0 height). Use
     // burn_reg_tx_cost for an explicit cost, burn_reg_tx_epoch for a non-genesis attest_epoch.
     fn burn_reg_tx(reg_proof: &str, burn_tx: &str, amount: u64, attestors: Vec<(String, String)>) -> qnet_state::Transaction {
-        burn_reg_tx_full("super_test", reg_proof, burn_tx, amount, amount, attestors, 1)
+        burn_reg_tx_full(&burn_node_id(), reg_proof, burn_tx, amount, amount, attestors, 1)
     }
     fn burn_reg_tx_epoch(reg_proof: &str, burn_tx: &str, amount: u64, attestors: Vec<(String, String)>, attest_epoch: u64) -> qnet_state::Transaction {
-        burn_reg_tx_full("super_test", reg_proof, burn_tx, amount, amount, attestors, attest_epoch)
+        burn_reg_tx_full(&burn_node_id(), reg_proof, burn_tx, amount, amount, attestors, attest_epoch)
     }
     fn burn_reg_tx_cost(reg_proof: &str, burn_tx: &str, amount: u64, cost: u64, attestors: Vec<(String, String)>) -> qnet_state::Transaction {
-        burn_reg_tx_full("super_test", reg_proof, burn_tx, amount, cost, attestors, 1)
+        burn_reg_tx_full(&burn_node_id(), reg_proof, burn_tx, amount, cost, attestors, 1)
     }
     fn burn_reg_tx_id(node_id: &str, reg_proof: &str, burn_tx: &str, amount: u64, attestors: Vec<(String, String)>) -> qnet_state::Transaction {
         burn_reg_tx_full(node_id, reg_proof, burn_tx, amount, amount, attestors, 1)
     }
+    /// Fixed test burner: the Solana address that "made" the burn plus its signing key. Deterministic
+    /// so every helper below produces the same attested burn_wallet and a verifiable owner signature.
+    fn burn_owner() -> (String, ed25519_dalek::SigningKey) {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        (bs58::encode(sk.verifying_key().to_bytes()).into_string(), sk)
+    }
+    /// Beneficiary wallet for the burn tests: derived from the burner's Solana address, so the
+    /// registration satisfies the beneficiary-consent rule by derivation (solana_bound).
+    fn burn_beneficiary() -> String {
+        crate::crypto::solana_derivation::eon_from_solana_address(&burn_owner().0)
+    }
+    fn burn_node_id() -> String {
+        crate::rpc::generate_super_node_pseudonym(&burn_beneficiary())
+    }
+    fn burn_owner_sig_for(node_id: &str, wallet: &str, reg_proof: &str, ts: u64) -> String {
+        burn_owner_sig_full(node_id, wallet, reg_proof, ts, &[], "")
+    }
+    fn burn_owner_sig_full(node_id: &str, wallet: &str, reg_proof: &str, ts: u64, root: &[u8], burn_tx: &str) -> String {
+        use ed25519_dalek::Signer;
+        let (_addr, sk) = burn_owner();
+        let msg = qnet_state::Transaction::burn_owner_bind_message(node_id, wallet, reg_proof, ts, root, burn_tx);
+        hex::encode(sk.sign(msg.as_bytes()).to_bytes())
+    }
     fn burn_reg_tx_full(node_id: &str, reg_proof: &str, burn_tx: &str, amount: u64, cost: u64, attestors: Vec<(String, String)>, attest_epoch: u64) -> qnet_state::Transaction {
+        let beneficiary = burn_beneficiary();
         let mut tx = qnet_state::Transaction {
-            hash: String::new(), from: "walletA".to_string(), to: None, amount: 0, nonce: 0,
+            hash: String::new(), from: beneficiary.clone(), to: None, amount: 0, nonce: 0,
             gas_price: 0, gas_limit: 0, timestamp: 1000, signature: None, public_key: None,
             tx_type: qnet_state::TransactionType::NodeRegistration {
                 node_id: node_id.to_string(),
                 node_type: qnet_state::NodeType::Super,
-                wallet_address: "walletA".to_string(),
+                wallet_address: beneficiary.clone(),
                 registration_proof: reg_proof.to_string(),
                 api_endpoint: String::new(),
                 burn_tx: burn_tx.to_string(),
+                vrf_pk: Vec::new(),
+                burn_wallet: burn_owner().0,
+                burn_owner_sig: burn_owner_sig_full(node_id, &beneficiary, reg_proof, 1000, &[], burn_tx),
                 burn_amount: amount,
                 burn_cost: cost,
                 burn_attestors: attestors,
@@ -28666,7 +30545,7 @@ mod tests {
         let burn_tx = "solBurnSig123";
         let amount = 1500u64;
         let cost = 1500u64; // default helper sets cost==amount; the signed message must carry it
-        let msg = qnet_state::Transaction::burn_attestation_message(burn_tx, "walletA", amount, &qnet_state::NodeType::Super, cost, 1);
+        let msg = qnet_state::Transaction::burn_attestation_message(burn_tx, &burn_owner().0, &burn_beneficiary(), amount, &qnet_state::NodeType::Super, cost, 1);
         let a1 = ("genesis_node_001".to_string(), burn_sign("genesis_node_001", &pk1, &sk1, &msg));
         let a2 = ("genesis_node_002".to_string(), burn_sign("genesis_node_002", &pk2, &sk2, &msg));
         let a3 = ("genesis_node_003".to_string(), burn_sign("genesis_node_003", &pk3, &sk3, &msg));
@@ -28710,7 +30589,7 @@ mod tests {
 
         // (6) on-chain burn→wallet uniqueness: a burn already committed-bound to a DIFFERENT wallet
         // ⇒ REJECT even with a full valid quorum (Sybil amplification under a rotating committee).
-        storage.committed_burn_wallet_put(burn_tx, "walletZ").unwrap();
+        storage.committed_burn_wallet_put(burn_tx, "super_some_other_node").unwrap();
         let txreuse = burn_reg_tx("burn", burn_tx, amount, vec![a1.clone(), a2.clone(), a3.clone(), a4.clone()]);
         assert!(BlockchainNode::verify_burn_attestation_quorum(&txreuse, GATE, &storage).await.is_err(), "burn reused for a different wallet must reject");
 
@@ -28718,7 +30597,7 @@ mod tests {
         // message with burn_amount >= cost ⇒ ACCEPT. The committee attested 1350, the joiner paid 1350.
         let burn_tx7 = "solBurnSig7";
         let cost7 = 1350u64;
-        let msg7 = qnet_state::Transaction::burn_attestation_message(burn_tx7, "walletA", cost7, &qnet_state::NodeType::Super, cost7, 1);
+        let msg7 = qnet_state::Transaction::burn_attestation_message(burn_tx7, &burn_owner().0, &burn_beneficiary(), cost7, &qnet_state::NodeType::Super, cost7, 1);
         let q7: Vec<(String, String)> = vec![
             ("genesis_node_001".to_string(), burn_sign("genesis_node_001", &pk1, &sk1, &msg7)),
             ("genesis_node_002".to_string(), burn_sign("genesis_node_002", &pk2, &sk2, &msg7)),
@@ -28734,7 +30613,7 @@ mod tests {
         let burn_tx8 = "solBurnSig8";
         let cost8 = 1500u64;
         let under = 300u64;
-        let msg8 = qnet_state::Transaction::burn_attestation_message(burn_tx8, "walletA", under, &qnet_state::NodeType::Super, cost8, 1);
+        let msg8 = qnet_state::Transaction::burn_attestation_message(burn_tx8, &burn_owner().0, &burn_beneficiary(), under, &qnet_state::NodeType::Super, cost8, 1);
         let q8: Vec<(String, String)> = vec![
             ("genesis_node_001".to_string(), burn_sign("genesis_node_001", &pk1, &sk1, &msg8)),
             ("genesis_node_002".to_string(), burn_sign("genesis_node_002", &pk2, &sk2, &msg8)),
@@ -28749,7 +30628,7 @@ mod tests {
         // genesis-derived there, the ≤2-epoch recency window covers it, and there is no downgrade guard to
         // permanently reject a legit genesis-era-armed registration (would strand the on-Solana burn).
         let burn_tx9 = "solBurnSig9";
-        let msg9 = qnet_state::Transaction::burn_attestation_message(burn_tx9, "walletA", amount, &qnet_state::NodeType::Super, amount, 2);
+        let msg9 = qnet_state::Transaction::burn_attestation_message(burn_tx9, &burn_owner().0, &burn_beneficiary(), amount, &qnet_state::NodeType::Super, amount, 2);
         let q9: Vec<(String, String)> = vec![
             ("genesis_node_001".to_string(), burn_sign("genesis_node_001", &pk1, &sk1, &msg9)),
             ("genesis_node_002".to_string(), burn_sign("genesis_node_002", &pk2, &sk2, &msg9)),
@@ -28759,6 +30638,306 @@ mod tests {
         let tx9 = burn_reg_tx_epoch("burn", burn_tx9, amount, q9, 2);
         assert!(BlockchainNode::verify_burn_attestation_quorum(&tx9, 210, &storage).await.is_ok(),
             "genesis-era attestation landing in early post-genesis must accept (no downgrade-strand)");
+
+        // (10) BURN THEFT: an attacker replays a public burn (+ its real quorum) naming its OWN wallet
+        // as beneficiary. The burner never signed that beneficiary ⇒ REJECT. Also covers the mirror
+        // case (squatting a victim's wallet): both fail the same owner-signature check.
+        let burn_tx10 = "solBurnSig10";
+        let stolen = qnet_state::Transaction::burn_attestation_message(
+            burn_tx10, &burn_owner().0, "walletThief", amount, &qnet_state::NodeType::Super, amount, 1);
+        let q10: Vec<(String, String)> = vec![
+            ("genesis_node_001".to_string(), burn_sign("genesis_node_001", &pk1, &sk1, &stolen)),
+            ("genesis_node_002".to_string(), burn_sign("genesis_node_002", &pk2, &sk2, &stolen)),
+            ("genesis_node_003".to_string(), burn_sign("genesis_node_003", &pk3, &sk3, &stolen)),
+            ("genesis_node_004".to_string(), burn_sign("genesis_node_004", &pk4, &sk4, &stolen)),
+        ];
+        let mut tx10 = burn_reg_tx("burn", burn_tx10, amount, q10);
+        if let qnet_state::TransactionType::NodeRegistration { wallet_address, .. } = &mut tx10.tx_type {
+            *wallet_address = "walletThief".to_string();
+        }
+        assert!(BlockchainNode::verify_burn_attestation_quorum(&tx10, GATE, &storage).await.is_err(),
+            "a burn cannot activate a beneficiary its owner never signed");
+
+        // (11) an absent owner signature is not a bypass, and a signature over a DIFFERENT beneficiary
+        // does not transfer: both REJECT with an otherwise-perfect quorum.
+        let burn_tx11 = "solBurnSig11";
+        let msg11 = qnet_state::Transaction::burn_attestation_message(
+            burn_tx11, &burn_owner().0, &burn_beneficiary(), amount, &qnet_state::NodeType::Super, amount, 1);
+        let q11: Vec<(String, String)> = vec![
+            ("genesis_node_001".to_string(), burn_sign("genesis_node_001", &pk1, &sk1, &msg11)),
+            ("genesis_node_002".to_string(), burn_sign("genesis_node_002", &pk2, &sk2, &msg11)),
+            ("genesis_node_003".to_string(), burn_sign("genesis_node_003", &pk3, &sk3, &msg11)),
+            ("genesis_node_004".to_string(), burn_sign("genesis_node_004", &pk4, &sk4, &msg11)),
+        ];
+        let mut tx11 = burn_reg_tx("burn", burn_tx11, amount, q11.clone());
+        if let qnet_state::TransactionType::NodeRegistration { burn_owner_sig, .. } = &mut tx11.tx_type {
+            burn_owner_sig.clear();
+        }
+        assert!(BlockchainNode::verify_burn_attestation_quorum(&tx11, GATE, &storage).await.is_err(),
+            "missing burn_owner_sig must reject");
+        let mut tx11b = burn_reg_tx("burn", burn_tx11, amount, q11);
+        if let qnet_state::TransactionType::NodeRegistration { burn_owner_sig, .. } = &mut tx11b.tx_type {
+            *burn_owner_sig = burn_owner_sig_for(&burn_node_id(), "walletOther", "burn", 1000);
+        }
+        assert!(BlockchainNode::verify_burn_attestation_quorum(&tx11b, GATE, &storage).await.is_err(),
+            "owner sig over a different beneficiary must not transfer");
+    }
+
+    // The ban that decides roster membership is read from state_root-certified account data, and the
+    // field is write-once monotone — so the answer for a PAST window must be exact even when read at a
+    // later tip. Both directions get a case, because getting either wrong splits epoch_commitment.
+    #[tokio::test]
+    async fn ban_is_read_from_state_and_bounded_by_the_window() {
+        let _dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = crate::storage::Storage::new(_dir.path().to_str().unwrap()).expect("storage");
+        let mut banned_early = qnet_state::Account::new("super_banned_early".to_string());
+        banned_early.banned_at_height = 100;          // inside window 2 (head = 180)
+        let mut banned_late = qnet_state::Account::new("super_banned_late".to_string());
+        banned_late.banned_at_height = 5_000;         // long after window 2
+        let clean = qnet_state::Account::new("super_clean".to_string());
+        storage.persist_accounts_batch(
+            vec![(banned_early.address.clone(), banned_early.clone()),
+                 (banned_late.address.clone(), banned_late.clone()),
+                 (clean.address.clone(), clean.clone())],
+            Vec::new()).await.expect("persist accounts");
+        let ids: Vec<String> = vec!["super_banned_early".into(), "super_banned_late".into(), "super_clean".into()];
+
+        let st = qnet_state::State::new();
+        let rep = BlockchainNode::compute_consensus_reputation_map(&storage, &ids, 2, &st).await;
+        assert_eq!(rep.get("super_banned_early").copied(), Some(0.0),
+            "a ban at or below the window head must zero reputation");
+        assert_ne!(rep.get("super_banned_late").copied(), Some(0.0),
+            "a ban ABOVE the window head must not apply retroactively to an earlier window");
+        assert_ne!(rep.get("super_clean").copied(), Some(0.0));
+
+        // The same account read at a much later window DOES count — write-once means the field keeps
+        // answering the as-of question for every window at or after the ban.
+        let later = BlockchainNode::compute_consensus_reputation_map(&storage, &ids, 100, &st).await;
+        assert_eq!(later.get("super_banned_early").copied(), Some(0.0));
+        assert_eq!(later.get("super_banned_late").copied(), Some(0.0),
+            "window head 9000 > 5000 ⇒ now banned");
+
+        // Re-admission must honour it too: phase2a never sees the reputation map for a node that is not
+        // a consensus participant, so it has to read the ban itself.
+        let registered: std::collections::HashSet<String> =
+            ids.iter().cloned().collect();
+        let recent: std::collections::HashSet<String> = ids.iter().cloned().collect();
+        for id in &ids {
+            storage.save_node_registration_at_height_burn_vrf(id, "super", "w", 1.0, 1, "", None).unwrap();
+        }
+        let empty_rep: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+        let added = super::phase2a_eligible_additions(
+            &st, &storage, &registered, &recent, &std::collections::HashSet::new(), &empty_rep, 9_000, 7000);
+        let added_ids: Vec<&str> = added.iter().map(|p| p.node_id.as_str()).collect();
+        assert!(!added_ids.contains(&"super_banned_early"), "a proven equivocator must never be re-admitted");
+        assert!(!added_ids.contains(&"super_banned_late"), "same, for a ban below the scan end");
+        assert!(added_ids.contains(&"super_clean"), "a clean registered super must still be admitted");
+    }
+
+    // An abstaining node must FOLLOW the chain, not reject it. Empty means "I could not derive the
+    // roster"; if that reached the expectation cache, every incoming block would mismatch and the node
+    // would hard-reject the whole chain. This is what made abstention unusable and forced the
+    // roster-substituting walk-back that was the fork surface.
+    #[test]
+    fn empty_producer_is_never_cached_as_an_expectation() {
+        crate::node::clear_expected_producer_cache_above(0);
+        crate::node::cache_expected_producer(4242, "super_real", 7);
+        assert_eq!(crate::node::get_expected_producer(4242), Some(("super_real".to_string(), 7)));
+        // Abstention must CLEAR the expectation, not overwrite it with "".
+        crate::node::cache_expected_producer(4242, "", 8);
+        assert_eq!(crate::node::get_expected_producer(4242), None,
+            "an abstaining node must fall to the soft path, never to a hard reject");
+        crate::node::cache_expected_producer(4243, "", 1);
+        assert_eq!(crate::node::get_expected_producer(4243), None);
+        crate::node::clear_expected_producer_cache_above(0);
+    }
+
+    // The producer roster feeds epoch_commitment and thence a QC, so it must be a function of the
+    // HEIGHT, never of how far this node happens to have applied. Pinned here because roster divergence
+    // is this codebase's documented cause of finality stalls.
+    #[test]
+    fn super_roster_is_bounded_by_height() {
+        let _dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = crate::storage::Storage::new(_dir.path().to_str().unwrap()).expect("storage");
+        for (id, h) in [("super_a", 10u64), ("super_b", 500), ("super_c", 5000)] {
+            storage.save_node_registration_at_height_burn_vrf(id, "super", &format!("w_{}", id), 1.0, h, "", None).unwrap();
+        }
+        let ids = |h: u64| {
+            let mut v: Vec<String> = storage.super_registrations_as_of(h).unwrap()
+                .into_iter().map(|(id, _)| id).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(ids(0), Vec::<String>::new(), "nothing is confirmed at height 0");
+        assert_eq!(ids(10), vec!["super_a"], "inclusive at the registration height");
+        assert_eq!(ids(499), vec!["super_a"], "a later registration is not visible earlier");
+        assert_eq!(ids(500), vec!["super_a", "super_b"]);
+        assert_eq!(ids(1_000_000), vec!["super_a", "super_b", "super_c"]);
+        // The unbounded twin returns everything applied, which is exactly why it must not feed consensus.
+        let mut unbounded: Vec<String> = storage.super_registrations_sorted().unwrap()
+            .into_iter().map(|(id, _)| id).collect();
+        unbounded.sort();
+        assert_eq!(unbounded.len(), 3);
+        assert_ne!(unbounded, ids(499), "the unbounded pool is a superset of the height-bounded one");
+    }
+
+    // The registration identity rules, pinned. Each one alone is enough to permanently occupy a
+    // victim's derivable node_id or to hand a relayer control of a node's consensus key, so each gets
+    // an explicit regression.
+    #[tokio::test]
+    async fn registration_identity_rules() {
+        const GATE: u64 = qnet_state::feature_gates::BURN_ATTESTATION_GATE_HEIGHT;
+        let _dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = crate::storage::Storage::new(_dir.path().to_str().unwrap()).expect("storage");
+
+        // node_id MUST be the wallet pseudonym: a burn cannot activate an id derived from a wallet
+        // other than the one it names (anti-squat), and the rule is height-independent.
+        let mut squat = burn_reg_tx("burn", "solBurnSquat", 1500, vec![]);
+        if let qnet_state::TransactionType::NodeRegistration { node_id, .. } = &mut squat.tx_type {
+            *node_id = "super_someone_elses_id".to_string();
+        }
+        assert!(BlockchainNode::verify_burn_attestation_quorum(&squat, GATE, &storage).await.is_err(),
+            "node_id that is not the wallet pseudonym must reject");
+        assert!(!BlockchainNode::registration_identity_bound(
+            "super_someone_elses_id", &qnet_state::NodeType::Super, &burn_beneficiary(), "burn"));
+        assert!(BlockchainNode::registration_identity_bound(
+            &burn_node_id(), &qnet_state::NodeType::Super, &burn_beneficiary(), "burn"));
+        // Genesis identities are protocol-minted and exempt; a non-genesis id claiming the exemption is not.
+        assert!(BlockchainNode::registration_identity_bound(
+            "genesis_node_001", &qnet_state::NodeType::Super, "any_wallet", "genesis"));
+        assert!(!BlockchainNode::registration_identity_bound(
+            "super_impostor", &qnet_state::NodeType::Super, "any_wallet", "genesis"));
+
+        // The consensus key lives in the HASHED body, so a relayer cannot swap it silently: any edit
+        // invalidates the TX hash. This is what stops an identity takeover mid-flight.
+        let mut tx = burn_reg_tx("burn", "solBurnVrf", 1500, vec![]);
+        let h0 = tx.hash.clone();
+        if let qnet_state::TransactionType::NodeRegistration { vrf_pk, .. } = &mut tx.tx_type {
+            *vrf_pk = vec![7u8; 1952];
+        }
+        assert_ne!(tx.calculate_hash(), h0, "vrf_pk must be inside the TX hash preimage");
+
+        // Beneficiary consent: a valid burn + a valid owner signature still cannot name a wallet the
+        // registrant does not control (neither wallet-key-derived nor burner-derived).
+        let mut foreign = burn_reg_tx("burn", "solBurnForeign", 1500, vec![]);
+        if let qnet_state::TransactionType::NodeRegistration { wallet_address, node_id, burn_owner_sig, .. } = &mut foreign.tx_type {
+            *wallet_address = "walletNotMine".to_string();
+            *node_id = crate::rpc::generate_super_node_pseudonym("walletNotMine");
+            *burn_owner_sig = burn_owner_sig_for(node_id, "walletNotMine", "burn", 1000);
+        }
+        assert!(BlockchainNode::verify_burn_attestation_quorum(&foreign, GATE, &storage).await.is_err(),
+            "a burn cannot name a beneficiary the registrant does not control");
+    }
+
+    // The heartbeat carries a RAW detached signature and no key. Its authenticity therefore rests
+    // entirely on resolving the signer's COMMITTED consensus key, so each way that resolution can be
+    // wrong gets a case.
+    #[test]
+    fn heartbeat_verifies_against_the_committed_key_only() {
+        use pqcrypto_mldsa::mldsa65 as d3;
+        use pqcrypto_traits::sign::{DetachedSignature as SigT, PublicKey as PkT, SecretKey as SkT};
+        let _dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = crate::storage::Storage::new(_dir.path().to_str().unwrap()).expect("storage");
+        let node_id = "super_hb_kat";
+        let (pk, sk) = d3::keypair();
+        storage.save_vrf_public_key(node_id, &hex::encode(PkT::as_bytes(&pk))).unwrap();
+        // The verdict keys on the CANONICAL registry row's commitment, so the identity must be
+        // registered on chain, not merely present in the standalone key row.
+        storage.save_node_registration_at_height_burn_vrf(
+            node_id, "super", "walletHB", 1.0, 1, "", Some(PkT::as_bytes(&pk))).unwrap();
+
+        let mk = |signer: &d3::SecretKey, anchor_hash: &str| {
+            let mut tx = qnet_state::Transaction {
+                from: node_id.to_string(), to: None, amount: 0,
+                tx_type: qnet_state::TransactionType::Heartbeat {
+                    node_id: node_id.to_string(), anchor_height: 100,
+                    anchor_hash: anchor_hash.to_string(),
+                },
+                timestamp: 1_700_000_000, hash: String::new(), signature: None, public_key: None,
+                gas_price: u64::MAX, gas_limit: 0, nonce: 1, data: None,
+                dilithium_signature: None,
+                dilithium_public_key: Some(node_id.to_string().into_bytes()),
+                chain_id: 0,
+            };
+            let msg = BlockchainNode::build_canonical_verify_message(&tx);
+            tx.dilithium_signature = Some(SigT::as_bytes(&d3::detached_sign(msg.as_bytes(), signer)).to_vec());
+            tx.hash = tx.calculate_hash();
+            tx
+        };
+
+        let good = mk(&sk, "abc");
+        assert_eq!(good.dilithium_signature.as_ref().map(|s| s.len()), Some(3309), "raw detached, no key rides along");
+        assert!(BlockchainNode::verify_heartbeat_dilithium(&good, &storage), "committed key must verify");
+
+        // Signed by a key the chain never committed for this id.
+        let (_opk, osk) = d3::keypair();
+        assert!(!BlockchainNode::verify_heartbeat_dilithium(&mk(&osk, "abc"), &storage),
+            "a foreign key must not verify");
+
+        // Message tamper: the anchor is inside the signed preimage.
+        let mut tampered = good.clone();
+        if let qnet_state::TransactionType::Heartbeat { anchor_hash, .. } = &mut tampered.tx_type {
+            *anchor_hash = "xyz".to_string();
+        }
+        assert!(!BlockchainNode::verify_heartbeat_dilithium(&tampered, &storage),
+            "a rewritten anchor must break the signature");
+
+        // A key that resolves locally but is NOT the one the canonical row commits must reject: that row
+        // is pruned on reorg, the standalone one is not.
+        let (fpk, _fsk) = d3::keypair();
+        storage.save_vrf_public_key("super_hb_stale", &hex::encode(PkT::as_bytes(&fpk))).unwrap();
+        let mut stale = good.clone();
+        if let qnet_state::TransactionType::Heartbeat { node_id, .. } = &mut stale.tx_type {
+            *node_id = "super_hb_stale".to_string();
+        }
+        assert!(!BlockchainNode::verify_heartbeat_dilithium(&stale, &storage),
+            "a key with no canonical registry commitment must reject");
+
+        // Unknown identity resolves no key ⇒ reject, never a pass.
+        let mut unknown = good.clone();
+        if let qnet_state::TransactionType::Heartbeat { node_id, .. } = &mut unknown.tx_type {
+            *node_id = "super_never_registered".to_string();
+        }
+        assert!(!BlockchainNode::verify_heartbeat_dilithium(&unknown, &storage),
+            "an unresolvable identity must reject");
+    }
+
+    // The burner authorizes a SPECIFIC beneficiary, attestation root and burn. Each field dropped from
+    // that message was a real hole, so each gets a case.
+    #[test]
+    fn burn_owner_message_binds_root_and_burn() {
+        let m = |root: &[u8], burn: &str| qnet_state::Transaction::burn_owner_bind_message(
+            "nid", "wallet", "proof", 1000, root, burn);
+        let base = m(&[1u8; 32], "burnA");
+        assert_eq!(base, m(&[1u8; 32], "burnA"), "deterministic");
+        assert_ne!(base, m(&[2u8; 32], "burnA"), "attestation root is bound");
+        assert_ne!(base, m(&[1u8; 32], "burnB"), "burn_tx is bound");
+        assert_ne!(base, m(&[], "burnA"), "an absent root is distinct from a present one");
+        assert_eq!(qnet_state::Transaction::attest_root_tag(&[]), "", "no root ⇒ empty tag");
+        assert_eq!(qnet_state::Transaction::attest_root_tag(&[1u8; 32]).len(), 64, "sha3-256 hex");
+    }
+
+    // Unbounded wire fields reach base58/hex decoders on the unauthenticated gossip path, and base58
+    // decode is quadratic. validate() is the bound, so it must reject before anything decodes.
+    #[test]
+    fn registration_fields_are_length_bounded() {
+        let mut tx = burn_reg_tx("burn", "solBurnLen", 1500, vec![]);
+        if let qnet_state::TransactionType::NodeRegistration { burn_wallet, .. } = &mut tx.tx_type {
+            *burn_wallet = "1".repeat(200_000);
+        }
+        tx.hash = tx.calculate_hash();
+        assert!(tx.validate().is_err(), "oversized burn_wallet must be rejected before any decode");
+
+        let mut tx2 = burn_reg_tx("burn", "solBurnLen2", 1500, vec![]);
+        if let qnet_state::TransactionType::NodeRegistration { burn_owner_sig, .. } = &mut tx2.tx_type {
+            *burn_owner_sig = "a".repeat(100_000);
+        }
+        tx2.hash = tx2.calculate_hash();
+        assert!(tx2.validate().is_err(), "oversized burn_owner_sig must be rejected");
+
+        // A well-formed registration still validates.
+        let ok = burn_reg_tx("burn", "solBurnLen3", 1500, vec![]);
+        assert!(ok.validate().is_ok(), "a well-formed registration must still validate");
     }
 
     // Fork-fix coverage: at a POST-genesis height with no locally-readable N-2 macroblock, verify
@@ -28780,7 +30959,7 @@ mod tests {
         storage.save_vrf_public_key("genesis_node_004", &hex::encode(&pk4)).unwrap();
         let burn_tx = "solBurnSigPG";
         let amount = 1500u64;
-        let msg = qnet_state::Transaction::burn_attestation_message(burn_tx, "walletA", amount, &qnet_state::NodeType::Super, amount, 4);
+        let msg = qnet_state::Transaction::burn_attestation_message(burn_tx, &burn_owner().0, &burn_beneficiary(), amount, &qnet_state::NodeType::Super, amount, 4);
         let attest = vec![
             ("genesis_node_001".to_string(), burn_sign("genesis_node_001", &pk1, &sk1, &msg)),
             ("genesis_node_002".to_string(), burn_sign("genesis_node_002", &pk2, &sk2, &msg)),
@@ -28833,7 +31012,7 @@ mod tests_v23_rotation_round {
 
     /// Leader rotation `(round0_idx + timeout_round) % N` is a PERMUTATION of 0..N for every base
     /// index — so as the 2f+1-certified timeout_round increments, every candidate is visited and an
-    /// honest producer is reached within f+1 rounds (the Tendermint bound; no reputation). Guards
+    /// honest producer is reached within f+1 rounds (the classical BFT bound; no reputation). Guards
     /// the round-robin coverage the liveness argument relies on.
     #[test]
     fn rotation_visits_every_candidate() {
@@ -28847,37 +31026,42 @@ mod tests_v23_rotation_round {
     }
 }
 
-/// Regression guard for the production ceiling boundary (production_throttle_reason): a pure
-/// committed-state function; seal precedence in the label; young chain (0 base) exempt.
+/// Regression guard for the production ceiling (production_throttle_reason). A1 removed the finality
+/// clause: production must NOT stop because the QC layer stopped, only when the roster derivation can no
+/// longer reach a sealed anchor. Pure function of committed scalars, so every node pauses at the same
+/// height.
 #[cfg(test)]
 mod tests_production_throttle {
-    use super::production_throttle_reason;
+    use super::{production_throttle_reason, BlockchainNode};
+
+    const HORIZON: u64 = (BlockchainNode::MAX_DERIVED_ROSTER_WINDOWS as u64) * 90;
 
     #[test]
-    fn finality_open_through_plus90_closed_at_plus91() {
-        let f: u64 = 33390; // checkpoint boundary; seal_base 0 keeps the seal branch inert
-        for next in (f + 1)..=(f + 90) {
-            assert_eq!(production_throttle_reason(next, f, 0), None, "must be OPEN at h={}", next);
+    fn finality_alone_never_throttles() {
+        // The whole point of A1: a frozen finality marker with a live seal base must not pause anyone.
+        let f: u64 = 33_390;
+        for next in [f + 1, f + 90, f + 91, f + 1_000, f + 100_000] {
+            assert_eq!(production_throttle_reason(next, f, 0), None,
+                "finality lag alone must never stop production (h={})", next);
         }
-        assert_eq!(production_throttle_reason(f + 91, f, 0), Some("bft_finality"), "must CLOSE at +91");
     }
 
     #[test]
-    fn advancing_finality_reopens() {
-        let f: u64 = 33390;
-        assert_eq!(production_throttle_reason(f + 91, f, 0), Some("bft_finality"));
-        assert_eq!(production_throttle_reason(f + 91, f + 30, 0), None, "advancing finality re-opens");
-        assert_eq!(production_throttle_reason(f + 120, f + 30, 0), None);
-        assert_eq!(production_throttle_reason(f + 121, f + 30, 0), Some("bft_finality"));
+    fn derivation_horizon_is_the_only_ceiling() {
+        let s: u64 = 33_480;
+        assert_eq!(production_throttle_reason(s + HORIZON, 0, s), None, "open through the horizon");
+        assert_eq!(production_throttle_reason(s + HORIZON + 1, 0, s), Some("roster_derivation_horizon"),
+            "closed one block past it");
+        // A stale finality marker does not change the verdict in either direction.
+        assert_eq!(production_throttle_reason(s + HORIZON, 1, s), None);
+        assert_eq!(production_throttle_reason(s + HORIZON + 1, 1, s), Some("roster_derivation_horizon"));
     }
 
     #[test]
-    fn seal_branch_and_precedence() {
-        let s: u64 = 33480;
-        assert_eq!(production_throttle_reason(s + 180, 0, s), None, "seal OPEN through +180");
-        assert_eq!(production_throttle_reason(s + 181, 0, s), Some("macroblock_seal"), "seal CLOSE at +181");
-        // Both over → seal label wins (matches the awaiting= field / original `if seal_over`).
-        assert_eq!(production_throttle_reason(s + 181, 1, s), Some("macroblock_seal"));
+    fn the_horizon_is_far_past_the_old_finality_wall() {
+        // The old ceiling was last_finalized + 90 and the structural wall was seal + 180. Both are now
+        // well inside the window production can run.
+        assert!(HORIZON > 180, "horizon {} must exceed the old (S+2)*90 structural wall", HORIZON);
     }
 
     #[test]

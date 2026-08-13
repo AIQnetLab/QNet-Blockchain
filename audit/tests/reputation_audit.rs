@@ -303,7 +303,7 @@ fn test_consensus_qualification() {
 fn test_emergency_mode_thresholds() {
     println!("\n{}", "=== EMERGENCY MODE THRESHOLDS TEST ===".green().bold());
     
-    let mut reputation = create_reputation_system();
+    let _reputation = create_reputation_system();
     
     // Simulate network-wide reputation scenarios
     let scenarios = vec![

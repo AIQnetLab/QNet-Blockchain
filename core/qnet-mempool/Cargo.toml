@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["QNet Team"]
 description = "Transaction mempool for QNet blockchain"
-license = "MIT"
+license = "BUSL-1.1"
 
 [lib]
 name = "qnet_mempool"

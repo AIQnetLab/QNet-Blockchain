@@ -26,7 +26,7 @@
 //! ## Signature Formats (v2.24)
 //!
 //! ### Compact Signature (Microblocks - ~2.6KB bincode)
-//! ```rust
+//! ```text
 //! pub struct CompactPqSignature {
 //!     pub node_id: String,
 //!     pub cert_serial: String,
@@ -38,7 +38,7 @@
 //! **Wire format**: `compact_bin:<base64(zstd(bincode(sig)))>`
 //!
 //! ### Full Signature (Macroblocks - ~5KB bincode)
-//! ```rust
+//! ```text
 //! pub struct PqSignature {
 //!     pub certificate: PqCertificate,
 //!     pub dilithium_key_signature: Vec<u8>,  // RAW bytes

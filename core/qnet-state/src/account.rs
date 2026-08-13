@@ -122,9 +122,11 @@ pub struct Account {
     /// snapshot read the just-completed epoch's count even after the node rolled to the next.
     #[serde(default)]
     pub heartbeat_final_epoch: u64,
-    /// popcount of `heartbeat_slots` for `heartbeat_final_epoch` (the finalized liveness count).
+    /// Subwindow bitmask for `heartbeat_final_epoch`. A BITMASK, not a count: a heartbeat that lands
+    /// after the epoch rolled (admission allows up to HB_ANCHOR_MAX_LAG blocks of anchor lag) folds in
+    /// idempotently, so eligibility cannot depend on inclusion order inside the admission window.
     #[serde(default)]
-    pub heartbeat_final_count: u8,
+    pub heartbeat_final_slots: u16,
 
     /// Highest reward epoch this account has already claimed (merkle-claim anti-replay).
     /// A claim TX is valid only for an epoch strictly greater than this and advances it on
@@ -152,6 +154,14 @@ pub struct Account {
     /// keep the bincode positional layout of the pre-FIX-5 fields.
     #[serde(default)]
     pub dilithium_public_key: Option<Vec<u8>>,
+
+    /// Height at which a verified equivocation proof banned this identity; 0 = not banned. Write-once
+    /// and permanent, matching the consensus ban. Lives HERE, in state the snapshot already proves,
+    /// because the reward decision happens at a settle height that cannot reach back to the macroblock
+    /// where the ban was certified — every attempt to bridge those two points was either
+    /// non-deterministic across node classes or unhealable once broken.
+    #[serde(default)]
+    pub banned_at_height: u64,
 }
 
 /// Account state (alias for compatibility)
@@ -207,8 +217,9 @@ impl Default for AccountState {
             heartbeat_epoch: 0,
             heartbeat_slots: 0,
             heartbeat_final_epoch: 0,
-            heartbeat_final_count: 0,
+            heartbeat_final_slots: 0,
             last_claimed_epoch: 0,
+            banned_at_height: 0,
             storage_root: *crate::state::EMPTY_STORAGE_ROOT,
             dilithium_public_key: None,
         }
@@ -290,8 +301,9 @@ impl Account {
             heartbeat_epoch: 0,
             heartbeat_slots: 0,
             heartbeat_final_epoch: 0,
-            heartbeat_final_count: 0,
+            heartbeat_final_slots: 0,
             last_claimed_epoch: 0,
+            banned_at_height: 0,
             storage_root: *crate::state::EMPTY_STORAGE_ROOT,
             dilithium_public_key: None, // FIX-5: bound at first-use apply, not construction
         }
@@ -316,8 +328,9 @@ impl Account {
             heartbeat_epoch: 0,
             heartbeat_slots: 0,
             heartbeat_final_epoch: 0,
-            heartbeat_final_count: 0,
+            heartbeat_final_slots: 0,
             last_claimed_epoch: 0,
+            banned_at_height: 0,
             storage_root: *crate::state::EMPTY_STORAGE_ROOT,
             dilithium_public_key: None, // FIX-5: bound at first-use apply, not construction
         }

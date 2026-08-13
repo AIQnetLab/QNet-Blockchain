@@ -65,6 +65,14 @@ const ACTIVATIONS: &[(&str, u64)] = &[
     ("registry_root_required", REGISTRY_ROOT_GATE_HEIGHT),
     ("light_reg_epoch_roster", LIGHT_REG_EPOCH_ROSTER_GATE_HEIGHT),
     ("logs_root_required", LOGS_ROOT_GATE_HEIGHT),
+    // ACTIVE FROM GENESIS. The commitment is now a pure function of certified chain data: it walks
+    // the epoch grid bounded at N-2 (a voting node holds that macroblock by construction), resolves
+    // each root from the certifying macroblock, and returns None on a gap — in which case the
+    // emitter DEFERS instead of sealing a placeholder. The comparison and the snapshot carry that
+    // proves against it must activate together: with the comparison off the field is QC-signed but
+    // validated by nobody, and with the carry off a cold-joined node can never obtain pre-anchor
+    // roots (their macroblocks sit below its weak-subjectivity floor).
+    ("reward_epoch_root_required", 0),
 ];
 
 /// Core gate: active iff `feature` is unlisted (genesis-active default) or `height` has reached

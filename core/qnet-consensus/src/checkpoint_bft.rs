@@ -19,6 +19,62 @@ pub fn quorum_size(committee_len: usize) -> usize {
     committee_len - f
 }
 
+/// Smallest committee for which the relaxation exists. Below it `relaxed_quorum` returns
+/// `quorum_size` unchanged, so it is inert at the 5-node genesis by construction: 3-of-5 would buy
+/// one node of liveness and let a single Byzantine member break safety.
+pub const RELAXED_MIN_COMMITTEE: usize = 10;
+
+/// Span length in windows = 2 macroblocks. `committee_for_height` reads macroblock w-2, so A+1/A+2
+/// resolve off sealed A-1/A, while A+3 resolves off A+1 whose eligible set the inactivity shrink has
+/// already cut to the live nodes — strict quorum is reachable again from there.
+pub const RC_SPAN_INDICES: u64 = 6;
+
+/// Recovery pin: `(anchor_macroblock_index, anchor_macroblock_hash)`.
+pub type RecoveryAnchor = (u64, Hash);
+
+/// Threshold under an ACTIVE recovery pin: a fixed function of |C_S| alone, so two nodes holding the
+/// same anchor macroblock can never disagree about it. Floored to `quorum_size` below
+/// RELAXED_MIN_COMMITTEE. `n/2+1` keeps `2*relaxed_quorum(n) > n`, so two relaxed quorums still
+/// intersect — the property that makes a conflicting pair attributable.
+pub fn relaxed_quorum(committee_len: usize) -> usize {
+    if committee_len < RELAXED_MIN_COMMITTEE { return quorum_size(committee_len); }
+    committee_len / 2 + 1
+}
+
+/// THE single effective-threshold fn. Every consensus quorum decision routes through this, so no
+/// subsystem can silently keep the old threshold while another relaxes — which would be strictly
+/// worse than the halt it is trying to end.
+pub fn effective_quorum(committee_len: usize, relaxed: bool) -> usize {
+    if relaxed { relaxed_quorum(committee_len) } else { quorum_size(committee_len) }
+}
+
+/// The ONLY `window_head_height` a relaxed checkpoint may occupy at step `k` in `1..=RC_SPAN_INDICES`.
+///
+/// Pins the WINDOW, never the index: a TimeoutCertificate advances the view without certifying a
+/// window, so index/window lockstep is unsatisfiable after one dead leader. Attributability comes
+/// from the proof instead — same anchor + same window head = a double-vote at any index.
+pub fn recovery_window_head(anchor_cp_head: u64, k: u64) -> u64 {
+    anchor_cp_head + k * CHECKPOINT_INTERVAL
+}
+
+/// Step `k` implied by a relaxed checkpoint's window head, or None if it is not on the span's grid.
+pub fn recovery_step_for_head(anchor_cp_head: u64, head: u64) -> Option<u64> {
+    let delta = head.checked_sub(anchor_cp_head)?;
+    if delta == 0 || delta % CHECKPOINT_INTERVAL != 0 { return None; }
+    let k = delta / CHECKPOINT_INTERVAL;
+    if k > RC_SPAN_INDICES { return None; }
+    Some(k)
+}
+
+/// Fold the recovery pin into a checkpoint hash. Tagged present/absent so `None` and
+/// `Some((0,[0;32]))` can never collide. Mirrored byte-for-byte in the mobile light client.
+fn fold_recovery_anchor(h: &mut Sha3_256, ra: &Option<RecoveryAnchor>) {
+    match ra {
+        None => { h.update([0u8]); }
+        Some((mb, hash)) => { h.update([1u8]); h.update(mb.to_le_bytes()); h.update(hash); }
+    }
+}
+
 /// Deterministic leader for checkpoint `index`, seeded ONLY by the committed
 /// parent hash — one agreed input ⇒ identical leader on every honest node.
 pub fn leader_index(index: u64, parent_checkpoint_hash: &Hash, committee_len: usize) -> usize {
@@ -126,12 +182,21 @@ pub fn sample_committee(
     scored.iter().map(|(idx, _)| sorted_candidates[*idx].clone()).collect()
 }
 
-/// VRF-only randomness beacon (§4.6): XOR-accumulate verifiable VRF outputs of an
-/// epoch's committed microblocks, then domain-hash. XOR is order-independent ⇒
-/// identical on every node regardless of collection order. Replaces RANDAO.
-pub fn accumulate_beacon(vrf_outputs: &[Hash]) -> Hash {
+/// Window randomness: XOR-fold of the window's committed block hashes, then domain-hash.
+/// Order-independent ⇒ identical on every node regardless of collection order.
+///
+/// It folded per-block `vrf_output` — sk-bound, so no verifier could recompute it and a producer
+/// chose it freely and UNDETECTABLY. Block hashes are QC-signed inside `Checkpoint.window_mb_hashes`,
+/// so the beacon is now a pure function of already-certified data (I6) and any bias is verifiable.
+///
+/// NOT unbiasable: the window's last producer sees the other contributions first and can grind its
+/// own block hash cheaply (permuting its transaction order changes merkle_root at no cost, and fees
+/// it pays itself round-trip). Bias is bounded by hashes-per-slot and is a strict improvement on the
+/// previous free-and-invisible grinding, but nothing downstream may assume this beacon is expensive
+/// to bias — that needs commit-reveal or a VDF, not a fold.
+pub fn accumulate_beacon(block_hashes: &[Hash]) -> Hash {
     let mut acc = [0u8; 32];
-    for o in vrf_outputs {
+    for o in block_hashes {
         for i in 0..32 { acc[i] ^= o[i]; }
     }
     let mut h = Sha3_256::new();
@@ -203,6 +268,27 @@ pub struct QuorumCertificate {
     pub sigs: Vec<Vec<u8>>, // aligned with `signers`
 }
 
+/// The parent link a checkpoint carries: the identity of the QC it extends, and nothing else.
+///
+/// A checkpoint used to embed the whole parent `QuorumCertificate`, but nothing ever read its
+/// signatures — every consumer takes only `checkpoint_hash` (the parent link) or `index` (the lock and
+/// 2-chain rules), and a parent QC arriving inside a proposal was never verified, because QCs are
+/// adopted from their own `ConsensusMsg::Qc`. At COMMITTEE_SIZE=1000 those unread signatures were
+/// ~3.05 MB of the ~3.08 MB proposal, re-sent to every peer every round, and the same bytes were
+/// duplicated twice more inside every `VoteEquivocationProof` preimage. A distinct type — rather than
+/// stripping the fields at send time — makes shipping them again impossible rather than merely unwise.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct QcRef {
+    pub checkpoint_hash: Hash,
+    pub index: u64,
+}
+
+impl From<&QuorumCertificate> for QcRef {
+    fn from(qc: &QuorumCertificate) -> Self {
+        Self { checkpoint_hash: qc.checkpoint_hash, index: qc.index }
+    }
+}
+
 /// One replica's timeout for view `index`, carrying its highest-QC index.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct TimeoutMsg {
@@ -224,7 +310,8 @@ pub struct TimeoutCertificate {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Checkpoint {
     pub index: u64,
-    pub parent_qc: Option<QuorumCertificate>,
+    /// Identity of the QC this checkpoint extends. See `QcRef` for why it is not the QC itself.
+    pub parent_qc: Option<QcRef>,
     pub window_head_height: u64,
     pub window_mb_hashes: Vec<Hash>,
     pub state_root: Hash,
@@ -256,6 +343,10 @@ pub struct Checkpoint {
     /// this root (→ snapshot rejected) instead of stalling that account's pk-elided TXs at 100k cold-
     /// join. [0;32] until the first pk is bound (all accounts still ship pk).
     pub dilithium_pk_root: Hash,
+    /// LtHash over every (epoch, certified reward root) this node holds. Lets a snapshot-joined node
+    /// carry the roots it can never re-derive (their macroblocks sit below its weak-subjectivity
+    /// floor) and prove them against 2f+1 instead of trusting the snapshot server.
+    pub reward_epoch_root: Hash,
     /// QC-signed total minted supply as of window_head_height. The apply-accumulated
     /// emission total (genesis=0, monotonic +emit_rewards). QC-signed ⇒ 2f+1 certify it ⇒
     /// a cold-joiner reads this QC-bound value instead of summing restored balances (which
@@ -269,6 +360,14 @@ pub struct Checkpoint {
     pub timestamp: u64,
     pub proposer: NodeId,
     pub proposer_sig: Vec<u8>,
+    /// `None` = ordinary full-quorum checkpoint (the only shape at genesis and in steady state).
+    /// `Some((anchor_mb, anchor_hash))` = this checkpoint is certified under the RELAXED quorum,
+    /// pinned to full-quorum-sealed macroblock `anchor_mb`. Bound into `hash()` ⇒ every QC signature
+    /// covers it ⇒ the ≥T signatures on this checkpoint ARE the recovery certificate. There is no
+    /// separate certificate object and no chain-inclusion test: "is this QC relaxed" is a pure
+    /// function of its own bytes plus one final macroblock, so it cannot depend on the reorg-able
+    /// tail and cannot become unverifiable after body pruning. `signers` is NEVER hashed.
+    pub recovery_anchor: Option<RecoveryAnchor>,
 }
 
 impl Checkpoint {
@@ -290,9 +389,11 @@ impl Checkpoint {
         h.update(self.registry_root);
         h.update(self.logs_root);
         h.update(self.dilithium_pk_root);
+        h.update(self.reward_epoch_root);
         h.update(self.total_supply.to_le_bytes());
         h.update(self.timestamp.to_le_bytes());
         h.update(self.proposer.as_bytes());
+        fold_recovery_anchor(&mut h, &self.recovery_anchor);   // last hashed field
         h.finalize().into()
     }
 }
@@ -472,12 +573,17 @@ pub fn sig_merkle_root(sigs: &[Vec<u8>]) -> Hash {
 impl QuorumCertificate {
     /// Structural + cryptographic validity. `verify_sig(voter, msg, sig)` is
     /// injected so this crate stays crypto-agnostic. `committee` = sorted epoch set.
+    ///
+    /// `quorum` is supplied by the CALLER, never derived here. A certificate must not be able to
+    /// choose its own threshold, and the caller is the only place that can decide whether the
+    /// recovery pin verified — pass `quorum_size(committee.len())` unless it did.
     pub fn verify<F: Fn(&str, &[u8], &[u8]) -> bool + Sync>(
         &self,
         committee: &[NodeId],
+        quorum: usize,
         verify_sig: F,
     ) -> Result<(), &'static str> {
-        let q = quorum_size(committee.len());
+        let q = quorum;
         if q == 0 || self.signers.len() < q { return Err("qc_below_quorum"); }
         if self.signers.len() != self.sigs.len() { return Err("qc_len_mismatch"); }
         let mut seen = HashSet::new();
@@ -506,9 +612,15 @@ impl TimeoutCertificate {
     /// from advancing a node's view: without it, `Tc { timeouts: [], high_qc: None }` was
     /// accepted and bumped `current_index` monotonically — an unauthenticated, non-self-healing
     /// view-desync DoS (adopt_qc never rewinds the view).
+    ///
+    /// `quorum` is caller-supplied for symmetry with `QuorumCertificate::verify`, but every caller
+    /// passes `quorum_size`: a TC advances `current_index` WITHOUT certifying a window, which would
+    /// break the index↔window lockstep the recovery pin depends on. Leaving it strict means it simply
+    /// cannot form during a halt — which is the lockstep we want.
     pub fn verify<F, Q>(
         &self,
         committee: &[NodeId],
+        quorum: usize,
         verify_timeout_sig: F,
         verify_qc: Q,
     ) -> Result<(), &'static str>
@@ -516,7 +628,7 @@ impl TimeoutCertificate {
         F: Fn(&TimeoutMsg) -> bool + Sync,
         Q: Fn(&QuorumCertificate) -> bool,
     {
-        let q = quorum_size(committee.len());
+        let q = quorum;
         if q == 0 || self.timeouts.len() < q { return Err("tc_below_quorum"); }
         // Cheap structural checks first (serial): a garbage TC is rejected here before the expensive sigs.
         let mut seen = HashSet::new();
@@ -618,7 +730,7 @@ mod tests {
         let mut c = Checkpoint {
             index: 1, parent_qc: None, window_head_height: 90,
             window_mb_hashes: vec![h(1), h(2)], state_root: h(3),
-            beacon: h(4), epoch_commitment: h(0), reward_root: h(0), registry_root: h(0), logs_root: h(0), dilithium_pk_root: h(0),total_supply: 0, timestamp: 0, proposer: "n1".into(), proposer_sig: vec![1,2,3],
+            beacon: h(4), epoch_commitment: h(0), reward_root: h(0), registry_root: h(0), logs_root: h(0), dilithium_pk_root: h(0), reward_epoch_root: h(0),total_supply: 0, timestamp: 0, proposer: "n1".into(), proposer_sig: vec![1,2,3], recovery_anchor: None,
         };
         let x = c.hash();
         c.proposer_sig = vec![9, 9, 9];   // sig change must NOT change hash
@@ -703,6 +815,32 @@ mod tests {
         }
     }
 
+    /// The parent link MUST be inside the QC-signed hash. It is what chains one checkpoint to the
+    /// next, so if it were dropped from the preimage a proposal could be re-parented onto a different
+    /// history and still carry a valid 2f+1 certificate. The other parent-link tests deliberately do
+    /// not call hash(), so without this one the fold could be deleted and the suite would stay green.
+    #[test]
+    fn checkpoint_hash_binds_parent_link() {
+        let base = Checkpoint {
+            index: 1, parent_qc: None, window_head_height: 90,
+            window_mb_hashes: vec![h(1), h(2)], state_root: h(3), beacon: h(4),
+            epoch_commitment: h(0), reward_root: h(0), registry_root: h(0), logs_root: h(0),
+            dilithium_pk_root: h(0), reward_epoch_root: h(0), total_supply: 1, timestamp: 0,
+            proposer: "n1".into(), proposer_sig: vec![1, 2, 3], recovery_anchor: None,
+        };
+        let mut linked = base.clone();
+        linked.parent_qc = Some(QcRef { checkpoint_hash: h(9), index: 0 });
+        assert_ne!(base.hash(), linked.hash(), "absent vs present parent must differ");
+
+        let mut other_parent = linked.clone();
+        other_parent.parent_qc = Some(QcRef { checkpoint_hash: h(8), index: 0 });
+        assert_ne!(linked.hash(), other_parent.hash(), "parent hash must be bound");
+
+        let mut other_index = linked.clone();
+        other_index.parent_qc = Some(QcRef { checkpoint_hash: h(9), index: 1 });
+        assert_ne!(linked.hash(), other_index.hash(), "parent index must be bound");
+    }
+
     #[test]
     fn checkpoint_hash_binds_total_supply() {
         // total_supply MUST be bound into the QC-signed hash: a cold-joiner trusts this value
@@ -711,7 +849,7 @@ mod tests {
         let c = Checkpoint {
             index: 1, parent_qc: None, window_head_height: 90,
             window_mb_hashes: vec![h(1), h(2)], state_root: h(3),
-            beacon: h(4), epoch_commitment: h(0), reward_root: h(0), registry_root: h(0), logs_root: h(0), dilithium_pk_root: h(0),total_supply: 1_000_000, timestamp: 0, proposer: "n1".into(), proposer_sig: vec![1,2,3],
+            beacon: h(4), epoch_commitment: h(0), reward_root: h(0), registry_root: h(0), logs_root: h(0), dilithium_pk_root: h(0), reward_epoch_root: h(0),total_supply: 1_000_000, timestamp: 0, proposer: "n1".into(), proposer_sig: vec![1,2,3], recovery_anchor: None,
         };
         let base = c.hash();
         assert_eq!(c.hash(), base, "hash must be deterministic for fixed fields");
@@ -730,13 +868,16 @@ mod tests {
             index: 1, parent_qc: None, window_head_height: 90,
             window_mb_hashes: vec![h(1), h(2)], state_root: h(3),
             beacon: h(4), epoch_commitment: h(0), reward_root: h(0), registry_root: h(0), logs_root: h(0),
-            dilithium_pk_root: h(7), total_supply: 0, timestamp: 0, proposer: "n1".into(), proposer_sig: vec![1,2,3],
+            dilithium_pk_root: h(7), reward_epoch_root: h(0), total_supply: 0, timestamp: 0, proposer: "n1".into(), proposer_sig: vec![1,2,3], recovery_anchor: None,
         };
         let base = c.hash();
         assert_eq!(c.hash(), base, "hash must be deterministic for fixed fields");
         let mut d = c.clone();
         d.dilithium_pk_root = h(8);        // value change MUST change hash
         assert_ne!(d.hash(), base, "dilithium_pk_root must be in the QC-signed hash");
+        let mut e = c.clone();
+        e.reward_epoch_root = h(9);
+        assert_ne!(e.hash(), base, "reward_epoch_root must be in the QC-signed hash");
     }
 
     #[test]
@@ -746,6 +887,93 @@ mod tests {
         let b = vec![vec![1u8,2], vec![3,4], vec![5,7]];
         assert_ne!(sig_merkle_root(&a), sig_merkle_root(&b));
         assert_eq!(sig_merkle_root(&[]), [0u8; 32]);
+    }
+
+    /// Measured, not estimated: what the parent link actually saves at COMMITTEE_SIZE=1000.
+    #[test]
+    fn measure_proposal_size_at_committee_1000() {
+        let a: Vec<NodeId> = (0..1000).map(|i| format!("node_{:04}", i)).collect();
+        // A real QC: 667 signers, each sig the compacted on-chain form (~4566 B).
+        let signers: Vec<NodeId> = a.iter().take(667).cloned().collect();
+        let sigs: Vec<Vec<u8>> = signers.iter().map(|_| vec![7u8; 4566]).collect();
+        let fat = QuorumCertificate {
+            checkpoint_hash: h(3), index: 11, sig_merkle_root: sig_merkle_root(&sigs), signers, sigs,
+        };
+        let cp = Checkpoint {
+            index: 12, parent_qc: Some(QcRef::from(&fat)), window_head_height: 1080,
+            window_mb_hashes: (0..30).map(|i| h(i as u8)).collect(),
+            state_root: h(1), beacon: h(2), epoch_commitment: h(3), reward_root: h(4),
+            registry_root: h(5), logs_root: h(6), dilithium_pk_root: h(7), reward_epoch_root: h(8),
+            total_supply: 1, timestamp: 1, proposer: "node_0001".into(), proposer_sig: vec![0u8; 7174], recovery_anchor: None,
+        };
+        let with_link = bincode::serialize(&cp).unwrap().len();
+        let embedded = with_link + bincode::serialize(&fat).unwrap().len();
+        println!("[MEASURE] proposal_with_link={} proposal_with_embedded_qc={} ratio={:.0}x",
+                 with_link, embedded, embedded as f64 / with_link as f64);
+        assert!(embedded / with_link > 100, "expected a >100x reduction, got {}x", embedded / with_link);
+    }
+
+    /// A checkpoint's parent link is the QC's IDENTITY, never its signatures. Two QCs certifying the
+    /// same parent with different signer sets must give the same checkpoint hash — the signer set is
+    /// the first-quorum-to-arrive at each node, so if it reached the hash the network would fork.
+    #[test]
+    fn parent_link_ignores_the_signer_set() {
+        let a: Vec<NodeId> = (0..10).map(|i| format!("node_{:02}", i)).collect();
+        let qc_few = mk_qc(&a, h(7), 4, 4);
+        let qc_many = mk_qc(&a, h(7), 4, 9);
+        assert_ne!(qc_few.signers, qc_many.signers, "the two QCs must differ in signers");
+        assert_eq!(QcRef::from(&qc_few), QcRef::from(&qc_many));
+    }
+
+    /// Regression guard on proposal size. The parent QC used to be embedded whole: at
+    /// COMMITTEE_SIZE=1000 that is ~3.05 MB of unread signatures in EVERY proposal, re-sent to every
+    /// peer every round, and duplicated twice more inside every VoteEquivocationProof. If someone
+    /// re-embeds a certificate in the checkpoint, this test is what catches it.
+    #[test]
+    fn checkpoint_stays_small_with_a_parent_link() {
+        let a: Vec<NodeId> = (0..1000).map(|i| format!("node_{:04}", i)).collect();
+        let fat = mk_qc(&a, h(3), 11, 667);
+        let cp = Checkpoint {
+            index: 12,
+            parent_qc: Some(QcRef::from(&fat)),
+            window_head_height: 1080,
+            window_mb_hashes: (0..30).map(|i| h(i as u8)).collect(),
+            state_root: h(1), beacon: h(2), epoch_commitment: h(3), reward_root: h(4),
+            registry_root: h(5), logs_root: h(6), dilithium_pk_root: h(7), reward_epoch_root: h(8),
+            total_supply: 1, timestamp: 1, proposer: "node_0001".into(), proposer_sig: vec![0u8; 64], recovery_anchor: None,
+        };
+        let n = bincode::serialize(&cp).unwrap().len();
+        assert!(n < 2048, "checkpoint grew to {} bytes — is a certificate embedded again?", n);
+        // And the certificate it links to really is the large object we refused to carry.
+        assert!(bincode::serialize(&fat).unwrap().len() > 20_000);
+    }
+
+    /// TimeoutCertificate size at the 1000-committee cap, with and without pk-elision on the timeout
+    /// signatures. The full envelope carries a redundant 1952-byte public key the verifier re-derives
+    /// from committee state anyway.
+    #[test]
+    fn measure_timeout_certificate_size() {
+        let q = quorum_size(1000);
+        let mk = |sig_len: usize| TimeoutCertificate {
+            index: 12,
+            timeouts: (0..q).map(|i| TimeoutMsg {
+                index: 12, voter: format!("node_{:04}", i), high_qc_index: 11,
+                signature: vec![7u8; sig_len],
+            }).collect(),
+            high_qc: Some(QuorumCertificate {
+                checkpoint_hash: h(3), index: 11,
+                signers: (0..q).map(|i| format!("node_{:04}", i)).collect(),
+                sig_merkle_root: h(4),
+                sigs: (0..q).map(|_| vec![7u8; 4555]).collect(),
+            }),
+        };
+        let full = bincode::serialize(&mk(7167)).unwrap().len();
+        let compact = bincode::serialize(&mk(4555)).unwrap().len();
+        println!("[MEASURE] tc_full={} tc_compact={} saved={} quorum={}",
+                 full, compact, full - compact, q);
+        assert!(compact < full);
+        // Must stay clear of the 10 MiB message ceiling with headroom at the shipped committee cap.
+        assert!(compact < 8 * 1024 * 1024, "compact TC {} exceeds headroom", compact);
     }
 
     fn mk_qc(committee: &[NodeId], hash: Hash, index: u64, n: usize) -> QuorumCertificate {
@@ -760,27 +988,27 @@ mod tests {
         let ok = |_v: &str, _m: &[u8], _s: &[u8]| true;
         // valid: 4 of 5 (quorum = n−f = 4)
         let qc = mk_qc(&committee, h(1), 7, 4);
-        assert!(qc.verify(&committee, ok).is_ok());
+        assert!(qc.verify(&committee, quorum_size(committee.len()), ok).is_ok());
         // below quorum
         let qc2 = mk_qc(&committee, h(1), 7, 3);
-        assert_eq!(qc2.verify(&committee, ok), Err("qc_below_quorum"));
+        assert_eq!(qc2.verify(&committee, quorum_size(committee.len()), ok), Err("qc_below_quorum"));
         // non-member
         let mut qc3 = mk_qc(&committee, h(1), 7, 4);
         qc3.signers[0] = "evil".into();
         qc3.sig_merkle_root = sig_merkle_root(&qc3.sigs);
-        assert_eq!(qc3.verify(&committee, ok), Err("qc_non_member"));
+        assert_eq!(qc3.verify(&committee, quorum_size(committee.len()), ok), Err("qc_non_member"));
         // duplicate signer
         let mut qc4 = mk_qc(&committee, h(1), 7, 4);
         qc4.signers[1] = qc4.signers[0].clone();
-        assert_eq!(qc4.verify(&committee, ok), Err("qc_duplicate_signer"));
+        assert_eq!(qc4.verify(&committee, quorum_size(committee.len()), ok), Err("qc_duplicate_signer"));
         // merkle mismatch
         let mut qc5 = mk_qc(&committee, h(1), 7, 4);
         qc5.sig_merkle_root = h(99);
-        assert_eq!(qc5.verify(&committee, ok), Err("qc_merkle_mismatch"));
+        assert_eq!(qc5.verify(&committee, quorum_size(committee.len()), ok), Err("qc_merkle_mismatch"));
         // bad sig
         let qc6 = mk_qc(&committee, h(1), 7, 4);
         let bad = |_v: &str, _m: &[u8], _s: &[u8]| false;
-        assert_eq!(qc6.verify(&committee, bad), Err("qc_bad_sig"));
+        assert_eq!(qc6.verify(&committee, quorum_size(committee.len()), bad), Err("qc_bad_sig"));
     }
 
     fn mk_tmo(voter: &str, index: u64) -> TimeoutMsg {
@@ -794,29 +1022,29 @@ mod tests {
         let vqc = |_q: &QuorumCertificate| true;
         // valid: 4 distinct committee timeouts at view 7 (quorum = n−f = 4)
         let good = TimeoutCertificate { index: 7, timeouts: vec![mk_tmo("n0",7), mk_tmo("n1",7), mk_tmo("n2",7), mk_tmo("n3",7)], high_qc: None };
-        assert!(good.verify(&committee, vsig, vqc).is_ok());
+        assert!(good.verify(&committee, quorum_size(committee.len()), vsig, vqc).is_ok());
         // EMPTY timeouts — the H4 attack (was accepted, advanced the view) → reject
         let empty = TimeoutCertificate { index: 7, timeouts: vec![], high_qc: None };
-        assert_eq!(empty.verify(&committee, vsig, vqc), Err("tc_below_quorum"));
+        assert_eq!(empty.verify(&committee, quorum_size(committee.len()), vsig, vqc), Err("tc_below_quorum"));
         // below quorum (3 < 4) → reject
         let short = TimeoutCertificate { index: 7, timeouts: vec![mk_tmo("n0",7), mk_tmo("n1",7), mk_tmo("n2",7)], high_qc: None };
-        assert_eq!(short.verify(&committee, vsig, vqc), Err("tc_below_quorum"));
+        assert_eq!(short.verify(&committee, quorum_size(committee.len()), vsig, vqc), Err("tc_below_quorum"));
         // a timeout for a DIFFERENT view → reject
         let wrongidx = TimeoutCertificate { index: 7, timeouts: vec![mk_tmo("n0",7), mk_tmo("n1",7), mk_tmo("n2",7), mk_tmo("n3",6)], high_qc: None };
-        assert_eq!(wrongidx.verify(&committee, vsig, vqc), Err("tc_index_mismatch"));
+        assert_eq!(wrongidx.verify(&committee, quorum_size(committee.len()), vsig, vqc), Err("tc_index_mismatch"));
         // duplicate voter → reject
         let dup = TimeoutCertificate { index: 7, timeouts: vec![mk_tmo("n0",7), mk_tmo("n0",7), mk_tmo("n1",7), mk_tmo("n2",7)], high_qc: None };
-        assert_eq!(dup.verify(&committee, vsig, vqc), Err("tc_duplicate_voter"));
+        assert_eq!(dup.verify(&committee, quorum_size(committee.len()), vsig, vqc), Err("tc_duplicate_voter"));
         // non-committee voter → reject
         let outsider = TimeoutCertificate { index: 7, timeouts: vec![mk_tmo("n0",7), mk_tmo("n1",7), mk_tmo("n2",7), mk_tmo("evil",7)], high_qc: None };
-        assert_eq!(outsider.verify(&committee, vsig, vqc), Err("tc_non_member"));
+        assert_eq!(outsider.verify(&committee, quorum_size(committee.len()), vsig, vqc), Err("tc_non_member"));
         // bad timeout signature → reject
         let mut bad_t = mk_tmo("n3",7); bad_t.signature = vec![0];
         let badsig = TimeoutCertificate { index: 7, timeouts: vec![mk_tmo("n0",7), mk_tmo("n1",7), mk_tmo("n2",7), bad_t], high_qc: None };
-        assert_eq!(badsig.verify(&committee, vsig, vqc), Err("tc_bad_sig"));
+        assert_eq!(badsig.verify(&committee, quorum_size(committee.len()), vsig, vqc), Err("tc_bad_sig"));
         // carries an invalid high_qc → reject
         let with_bad_qc = TimeoutCertificate { index: 7, timeouts: vec![mk_tmo("n0",7), mk_tmo("n1",7), mk_tmo("n2",7), mk_tmo("n3",7)], high_qc: Some(mk_qc(&committee, h(1), 6, 4)) };
-        assert_eq!(with_bad_qc.verify(&committee, vsig, |_q| false), Err("tc_bad_high_qc"));
+        assert_eq!(with_bad_qc.verify(&committee, quorum_size(committee.len()), vsig, |_q| false), Err("tc_bad_high_qc"));
     }
 
     #[test]
@@ -902,9 +1130,9 @@ mod tests {
         let committee: Vec<NodeId> = (0..5).map(|i| format!("n{}", i)).collect();
         let parent_qc = mk_qc(&committee, h(1), 4, 3);
         let child = Checkpoint {
-            index: 5, parent_qc: Some(parent_qc), window_head_height: 450,
+            index: 5, parent_qc: Some(QcRef::from(&parent_qc)), window_head_height: 450,
             window_mb_hashes: vec![h(1)], state_root: h(2), beacon: h(3),
-            epoch_commitment: h(0), reward_root: h(0), registry_root: h(0), logs_root: h(0), dilithium_pk_root: h(0),total_supply: 0, timestamp: 0, proposer: "n0".into(), proposer_sig: vec![],
+            epoch_commitment: h(0), reward_root: h(0), registry_root: h(0), logs_root: h(0), dilithium_pk_root: h(0), reward_epoch_root: h(0),total_supply: 0, timestamp: 0, proposer: "n0".into(), proposer_sig: vec![], recovery_anchor: None,
         };
         let child_qc = mk_qc(&committee, child.hash(), 5, 3);
         assert_eq!(commits_parent(&child, &child_qc), Some(4)); // C4 final
@@ -918,9 +1146,9 @@ mod tests {
         let committee: Vec<NodeId> = (0..5).map(|i| format!("n{}", i)).collect();
         let qc = mk_qc(&committee, h(1), 7, 3);
         let c = Checkpoint {
-            index: 7, parent_qc: Some(qc.clone()), window_head_height: 630,
+            index: 7, parent_qc: Some(QcRef::from(&qc)), window_head_height: 630,
             window_mb_hashes: vec![h(1), h(2)], state_root: h(3), beacon: h(4),
-            epoch_commitment: h(0), reward_root: h(0), registry_root: h(0), logs_root: h(0), dilithium_pk_root: h(0),total_supply: 0, timestamp: 0, proposer: "n1".into(), proposer_sig: vec![1,2,3],
+            epoch_commitment: h(0), reward_root: h(0), registry_root: h(0), logs_root: h(0), dilithium_pk_root: h(0), reward_epoch_root: h(0),total_supply: 0, timestamp: 0, proposer: "n1".into(), proposer_sig: vec![1,2,3], recovery_anchor: None,
         };
         let bytes = bincode::serialize(&c).unwrap();
         let back: Checkpoint = bincode::deserialize(&bytes).unwrap();
@@ -930,5 +1158,169 @@ mod tests {
         ], high_qc: Some(qc) };
         let tb = bincode::serialize(&tc).unwrap();
         assert_eq!(tc, bincode::deserialize::<TimeoutCertificate>(&tb).unwrap());
+    }
+
+    // ── RECOVERY RELAXATION ────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn recovery_anchor_is_bound_into_the_checkpoint_hash() {
+        let base = Checkpoint {
+            index: 1, parent_qc: None, window_head_height: 90,
+            window_mb_hashes: vec![h(1)], state_root: h(3), beacon: h(4),
+            epoch_commitment: h(0), reward_root: h(0), registry_root: h(0), logs_root: h(0),
+            dilithium_pk_root: h(0), reward_epoch_root: h(0), total_supply: 0, timestamp: 0,
+            proposer: "n1".into(), proposer_sig: vec![1, 2, 3], recovery_anchor: None,
+        };
+        let mut zero = base.clone(); zero.recovery_anchor = Some((0, [0u8; 32]));
+        let mut one  = base.clone(); one.recovery_anchor  = Some((1, [0u8; 32]));
+        let mut oneh = base.clone(); oneh.recovery_anchor = Some((1, h(9)));
+        // Present/absent is TAGGED, so None can never collide with Some((0, zeros)).
+        assert_ne!(base.hash(), zero.hash());
+        assert_ne!(zero.hash(), one.hash());
+        assert_ne!(one.hash(), oneh.hash());
+        // The pin rides inside what the QC signs => the >=T signatures ARE the certificate.
+        assert_eq!(one.hash(), one.clone().hash());
+    }
+
+    #[test]
+    fn relaxed_quorum_floor_and_intersection() {
+        // Inert below the floor: the relaxation must not exist at genesis scale.
+        for n in 0..RELAXED_MIN_COMMITTEE {
+            assert_eq!(relaxed_quorum(n), quorum_size(n), "n={} must be floored", n);
+        }
+        assert_eq!(relaxed_quorum(5), 4);
+        assert_eq!(relaxed_quorum(10), 6);
+        assert_eq!(relaxed_quorum(100), 51);
+        assert_eq!(relaxed_quorum(1000), 501);
+        for n in 1..=1000usize {
+            // Two RELAXED quorums intersect (the same-index double-signer the proof type needs)...
+            assert!(2 * relaxed_quorum(n) > n, "relaxed pair must intersect at n={}", n);
+            // ...and so do a relaxed one and a strict one, so mixing thresholds stays safe.
+            assert!(relaxed_quorum(n) + quorum_size(n) > n, "mixed pair must intersect at n={}", n);
+            assert!(relaxed_quorum(n) <= quorum_size(n), "relaxation must never RAISE the bar at n={}", n);
+        }
+    }
+
+    #[test]
+    fn effective_quorum_routes_both_ways() {
+        assert_eq!(effective_quorum(1000, false), quorum_size(1000));
+        assert_eq!(effective_quorum(1000, true), relaxed_quorum(1000));
+        // Below the floor the flag is inert — arming a small committee changes nothing.
+        assert_eq!(effective_quorum(5, true), effective_quorum(5, false));
+    }
+
+    #[test]
+    fn recovery_pin_is_injective_over_the_span() {
+        let (i0, h0) = (7u64, 630u64);
+        let mut idx = std::collections::HashSet::new();
+        let mut head = std::collections::HashSet::new();
+        for k in 1..=RC_SPAN_INDICES {
+            let hh = recovery_window_head(h0, k);
+            assert_eq!(hh, h0 + k * CHECKPOINT_INTERVAL);
+            assert_eq!(recovery_step_for_head(h0, hh), Some(k), "the step must be readable back");
+            assert!(idx.insert(k), "step repeats at k={}", k);
+            assert!(head.insert(hh), "window head repeats at k={}", k);
+        }
+        // Exactly two macroblocks of span: 6 * 30 == 180 == 2 * MACROBLOCK_INTERVAL.
+        assert_eq!(RC_SPAN_INDICES * CHECKPOINT_INTERVAL, 2 * MACROBLOCK_INTERVAL);
+        // Off-grid and out-of-span heads have no step at all.
+        assert_eq!(recovery_step_for_head(h0, h0), None, "k=0 is not a span position");
+        assert_eq!(recovery_step_for_head(h0, h0 + 1), None, "off the CHECKPOINT_INTERVAL grid");
+        assert_eq!(recovery_step_for_head(h0, h0 + (RC_SPAN_INDICES + 1) * CHECKPOINT_INTERVAL), None);
+        assert_eq!(recovery_step_for_head(h0, h0 - CHECKPOINT_INTERVAL), None, "below the anchor");
+    }
+
+    #[test]
+    fn qc_verify_takes_the_threshold_from_the_caller() {
+        // A certificate must never choose its own bar. Ten members, six signers: below the strict
+        // quorum, at the relaxed one.
+        let committee: Vec<NodeId> = (0..10).map(|i| format!("n{}", i)).collect();
+        let signers: Vec<NodeId> = committee.iter().take(6).cloned().collect();
+        let sigs: Vec<Vec<u8>> = signers.iter().map(|s| s.as_bytes().to_vec()).collect();
+        let qc = QuorumCertificate {
+            checkpoint_hash: h(1), index: 3,
+            sig_merkle_root: sig_merkle_root(&sigs), signers, sigs,
+        };
+        let ok = |_v: &str, _b: &[u8], _s: &[u8]| true;
+        assert_eq!(qc.verify(&committee, quorum_size(committee.len()), ok), Err("qc_below_quorum"));
+        assert!(qc.verify(&committee, relaxed_quorum(committee.len()), ok).is_ok());
+        // A zero threshold is still refused — an unset committee must never make one vote a QC.
+        assert_eq!(qc.verify(&committee, 0, ok), Err("qc_below_quorum"));
+    }
+
+    #[test]
+    fn same_index_conflict_forces_a_double_signer() {
+        // Quorum-intersection lemma: any two relaxed quorums over one committee share a member. This
+        // is what makes a SAME-INDEX conflict attributable; the pin no longer forces same-index, so
+        // per-window attribution needs a per-window vote rule in the engine before it can be claimed.
+        // Two relaxed quorums over a fixed committee then share >=1 member, who signed two different
+        // messages at the same index — exactly the shape VoteEquivocationProof attributes.
+        for n in RELAXED_MIN_COMMITTEE..=200usize {
+            let t = relaxed_quorum(n);
+            let a: std::collections::HashSet<usize> = (0..t).collect();
+            let b: std::collections::HashSet<usize> = (n - t..n).collect();
+            let shared = a.intersection(&b).count();
+            assert!(shared >= 2 * t - n, "n={} t={}", n, t);
+            assert!(shared >= 1, "two relaxed quorums must share a signer at n={}", n);
+        }
+    }
+
+    // CROSS-LANGUAGE PARITY VECTOR. These hex strings were produced by the shipped React Native light
+    // client (applications/qnet-mobile/src/crypto/QcLightClient.js, checkpointHash) over the identical
+    // checkpoint. The device recomputes this hash and verifies the QC against it, so ANY drift between
+    // the two implementations — field order, the recovery_anchor tag byte, u64 endianness — stops every
+    // wallet confirming while the chain runs happily. The tag byte is written UNCONDITIONALLY, so an
+    // ordinary unpinned checkpoint is covered by the `none` vector too, not just the pinned ones.
+    #[test]
+    fn checkpoint_hash_matches_the_mobile_client_byte_for_byte() {
+        let base = Checkpoint {
+            index: 4, parent_qc: Some(QcRef { index: 3, checkpoint_hash: h(2) }),
+            window_head_height: 120, window_mb_hashes: vec![h(1)], state_root: h(3), beacon: h(4),
+            epoch_commitment: h(5), reward_root: h(0), registry_root: h(0), logs_root: h(0),
+            dilithium_pk_root: h(0), reward_epoch_root: h(0), total_supply: 7, timestamp: 11,
+            proposer: "n1".into(), proposer_sig: vec![1], recovery_anchor: None,
+        };
+        let mut pinned = base.clone(); pinned.recovery_anchor = Some((2, h(8)));
+        let mut zero_pin = base.clone(); zero_pin.recovery_anchor = Some((0, h(0)));
+
+        assert_eq!(hex::encode(base.hash()),
+                   "13fe6687b356572863ca25a3d0c225a30b904a03f5fed4a8574b22a80bf29be7");
+        assert_eq!(hex::encode(pinned.hash()),
+                   "acc2f0a5102a91fc013b9e6f023ba77aa4843a2f056a2d97aa57ea1302993474");
+        assert_eq!(hex::encode(zero_pin.hash()),
+                   "8a463e680bb577b1ffb0569f2f4576bae6d23d7a1b2a92fa7e5e6c9428bf14f7");
+
+        // The device mirrors these three too; they gate which QCs it will accept.
+        assert_eq!(quorum_size(1000), 667);
+        assert_eq!(relaxed_quorum(1000), 501);
+        assert_eq!(relaxed_quorum(5), 4);
+        assert_eq!(recovery_window_head(630, 3), 720);
+    }
+
+    #[test]
+    fn no_signer_set_enters_the_checkpoint_preimage() {
+        // The whole design rests on this: two DIFFERENT valid signer subsets sign the IDENTICAL
+        // message and produce the IDENTICAL checkpoint hash, so byte-divergent QC blobs across
+        // sealers stay tolerated exactly as before.
+        let cp = Checkpoint {
+            index: 4, parent_qc: Some(QcRef { index: 3, checkpoint_hash: h(2) }),
+            window_head_height: 120, window_mb_hashes: vec![h(1)], state_root: h(3), beacon: h(4),
+            epoch_commitment: h(5), reward_root: h(0), registry_root: h(0), logs_root: h(0),
+            dilithium_pk_root: h(0), reward_epoch_root: h(0), total_supply: 7, timestamp: 11,
+            proposer: "n1".into(), proposer_sig: vec![1], recovery_anchor: Some((2, h(8))),
+        };
+        let want = cp.hash();
+        let mk = |ids: &[&str]| {
+            let signers: Vec<NodeId> = ids.iter().map(|s| s.to_string()).collect();
+            let sigs: Vec<Vec<u8>> = signers.iter().map(|s| s.as_bytes().to_vec()).collect();
+            QuorumCertificate { checkpoint_hash: cp.hash(), index: cp.index,
+                                sig_merkle_root: sig_merkle_root(&sigs), signers, sigs }
+        };
+        let q1 = mk(&["n0", "n1", "n2", "n3", "n4", "n5"]);
+        let q2 = mk(&["n4", "n5", "n6", "n7", "n8", "n9"]);
+        assert_ne!(q1.sig_merkle_root, q2.sig_merkle_root, "the subsets really are different");
+        assert_eq!(q1.checkpoint_hash, want);
+        assert_eq!(q2.checkpoint_hash, want);
+        assert_eq!(cp.hash(), want, "hashing is not affected by who signed");
     }
 }
