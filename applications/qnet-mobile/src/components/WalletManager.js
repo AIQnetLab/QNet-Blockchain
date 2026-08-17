@@ -2,6 +2,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { AppState } from 'react-native'; // Clear in-memory derived key when app backgrounds
 import CryptoJS from 'crypto-js'; // Required for generateQNetAddress, generateMnemonic
 import 'react-native-get-random-values'; // Must be imported first — polyfills crypto.getRandomValues
+import { smtFold } from '../crypto/SmtFold'; // pure; shared with the jest proof pin
 import { Connection, Keypair, PublicKey } from '@solana/web3.js';
 import { derivePath } from 'ed25519-hd-key';
 import * as bip39 from 'bip39';
@@ -3490,14 +3491,18 @@ export class WalletManager {
     const balanceNanoStr = balMatch ? balMatch[1] : String(data.balance || 0);
     const nonceMatch = /"nonce"\s*:\s*"?(\d+)"?/.exec(res.data);
     const nonceStr = nonceMatch ? nonceMatch[1] : String(data.nonce || 0);
-    // pending_rewards is in the account leaf, so the proof needs it (0 for a fresh wallet).
-    const pendMatch = /"pending_rewards"\s*:\s*"?(\d+)"?/.exec(res.data);
-    const pendingStr = pendMatch ? pendMatch[1] : '0';
+    // last_claimed_epoch is in the account leaf, so the proof needs it (0 for a wallet that
+    // never claimed). pending_rewards was dropped from the leaf and is not threaded at all.
+    const lceMatch = /"last_claimed_epoch"\s*:\s*"?(\d+)"?/.exec(res.data);
+    const lceStr = lceMatch ? lceMatch[1] : '0';
+    // is_node is in the leaf too: a wallet that activated a node hashes 1 here, and hardcoding 0
+    // would fail every operator's balance proof.
+    const isNode = /"is_node"\s*:\s*true/.test(res.data);
     const balanceQNC = Number(balanceNanoStr) / 1e9;
     // QC-anchored proof verification (MITM-proof); advisory flag surfaced to the caller.
     let verified = false;
     if (verify && data.merkle_proof && data.merkle_proof.length > 0) {
-      const proofValid = await this.verifyMerkleProof(address, balanceNanoStr, nonceStr, data.merkle_proof, data.state_root, pendingStr, data.last_claimed_epoch || 0);
+      const proofValid = await this.verifyMerkleProof(address, balanceNanoStr, nonceStr, data.merkle_proof, data.state_root, lceStr, isNode);
       if (proofValid) {
         verified = await verifyMacroblockStateRoot(data.state_root, data.block_height, () => this.getRankedNodes(1)[0]);
       }
@@ -3745,24 +3750,11 @@ export class WalletManager {
    * verify_proof / verify_raw_proof (SHA3-256 over sibling||current ordered by is_right).
    */
   _smtFold(leafHashHex, keyHashHex, proof, root, sha3_256) {
-    if (!Array.isArray(proof)) return false;
-    let current = leafHashHex;
-    for (let i = 0; i < proof.length; i++) {
-      const isRight = proof[i].is_right;
-      const byteIdx = Math.floor(i / 8);
-      const bitIdx = 7 - (i % 8);
-      const kByte = byteIdx < 32 ? parseInt(keyHashHex.substring(byteIdx * 2, byteIdx * 2 + 2), 16) : 0;
-      const expectedBit = ((kByte >> bitIdx) & 1) === 1;
-      if (isRight !== expectedBit) return false;
-      const sib = this.hexToBytes(proof[i].sibling);
-      const cur = this.hexToBytes(current);
-      const combined = isRight ? this.concatBytes(sib, cur) : this.concatBytes(cur, sib);
-      current = sha3_256(combined);
-    }
-    return current === root;
+    // One implementation, in src/crypto/SmtFold.js, so the jest pin guards the shipped code.
+    return smtFold(leafHashHex, keyHashHex, proof, root, sha3_256);
   }
 
-  async verifyMerkleProof(address, balance, nonce, proof, expectedRoot, pending = 0, lastClaimedEpoch = 0) {
+  async verifyMerkleProof(address, balance, nonce, proof, expectedRoot, lastClaimedEpoch = 0, isNode = false) {
     try {
       // Import js-sha3 for SHA3-256 (same as Rust implementation)
       const { sha3_256 } = await import('js-sha3');
@@ -3776,15 +3768,14 @@ export class WalletManager {
       // Account leaf — MUST match Rust hash_account (QNET_ACCOUNT_V2) EXACTLY, else the leaf
       // never matches the QC-committed root and the proof always fails. A plain wallet has
       // is_contract=false, no code/storage, and heartbeat=0 (a Heartbeat is keyed on node_id, so a
-      // wallet never carries a tally). pending_rewards and last_claimed_epoch are threaded from the
-      // account — hardcoding the latter broke every wallet that had ever claimed. Byte-exact order.
+      // wallet never carries a tally). last_claimed_epoch is threaded from the account —
+      // hardcoding it broke every wallet that had ever claimed. Byte-exact order.
       const accountDataBytes = this.concatBytes(
         Buffer.from('QNET_ACCOUNT_V2:', 'utf8'),
         this.uint64ToBytes(balance),           // balance u64 LE
         this.uint64ToBytes(nonce),             // nonce u64 LE
         Buffer.from(address, 'utf8'),          // address string bytes
         Buffer.from([0]),                      // is_contract = false
-        this.uint64ToBytes(pending),           // pending_rewards u64 LE
         Buffer.from('HB:', 'utf8'),
         this.uint64ToBytes(0),                 // heartbeat_epoch u64 LE
         Buffer.from([0, 0]),                   // heartbeat_slots u16 LE
@@ -3793,7 +3784,9 @@ export class WalletManager {
         Buffer.from('LCE:', 'utf8'),
         this.uint64ToBytes(lastClaimedEpoch),  // last_claimed_epoch u64 LE
         Buffer.from('BAN:', 'utf8'),
-        this.uint64ToBytes(0)                  // banned_at_height u64 LE (native wallets are never banned)
+        this.uint64ToBytes(0),                 // banned_at_height u64 LE (native wallets are never banned)
+        Buffer.from('NODE:', 'utf8'),
+        Buffer.from([isNode ? 1 : 0])          // is_node u8
       );
       const leafHash = sha3_256(accountDataBytes);
       // Fold the account leaf up to the expected root via the shared SMT primitive.
@@ -3817,10 +3810,10 @@ export class WalletManager {
       const {
         contract_address, holder, token_balance, storage_root,
         storage_proof, account_proof,
-        account_balance, account_nonce, account_pending_rewards,
+        account_balance, account_nonce,
         contract_code_hash, heartbeat_epoch, heartbeat_slots,
         heartbeat_final_epoch, heartbeat_final_slots, last_claimed_epoch,
-        banned_at_height,
+        banned_at_height, is_node,
         state_root,
       } = proofData;
 
@@ -3862,7 +3855,6 @@ export class WalletManager {
       }
       parts.push(Buffer.from('SROOT:', 'utf8'));
       parts.push(this.hexToBytes(storage_root)); // 32 RAW bytes (not hex text)
-      parts.push(this.uint64ToBytes(account_pending_rewards));
       parts.push(Buffer.from('HB:', 'utf8'));
       parts.push(this.uint64ToBytes(heartbeat_epoch || 0));
       const slots = heartbeat_slots || 0;
@@ -3874,6 +3866,8 @@ export class WalletManager {
       parts.push(this.uint64ToBytes(last_claimed_epoch || 0));
       parts.push(Buffer.from('BAN:', 'utf8'));
       parts.push(this.uint64ToBytes(banned_at_height || 0));
+      parts.push(Buffer.from('NODE:', 'utf8'));
+      parts.push(Buffer.from([is_node ? 1 : 0]));
       const contractLeafHex = sha3_256(this.concatBytes(...parts));
       if (!this._smtFold(contractLeafHex, contractAddrHashHex, account_proof, state_root, sha3_256)) return false;
 

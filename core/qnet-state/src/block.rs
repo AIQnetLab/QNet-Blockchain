@@ -233,18 +233,7 @@ pub struct ConsensusData {
     // ping-response attestation path.)
     // ═══════════════════════════════════════════════════════════════════════════
     
-    /// Aggregated heartbeat summaries for all nodes in this epoch
-    /// Format: bincode serialized Vec<HeartbeatSummary>
-    /// Deterministic: all nodes see same heartbeat data from blockchain
-    /// Used for reward calculation at emission blocks (every 4 hours)
-    #[serde(default)]
-    pub reward_heartbeats: Option<Vec<u8>>,
-    
-    /// Merkle root of all individual heartbeats for verification
-    /// Allows light clients to verify heartbeat inclusion without full data
-    #[serde(default)]
-    pub heartbeats_merkle_root: Option<[u8; 32]>,
-    
+
     // ═══════════════════════════════════════════════════════════════════════════
     // v2.78: LIGHT NODE ATTESTATIONS - Collected from PingCommitment TXs.
     // Each Super node submits a PingCommitment TX listing the Light nodes
@@ -836,6 +825,15 @@ impl MicroBlock {
         // Bind the carried rotation baseline: absolute round = timeout_round + carried_baseline, so
         // the reconstructed round is a property of the committed bytes (node-independent).
         hasher.update(&self.carried_baseline.to_le_bytes());
+        // Bind the post-apply state commitment. Without it two bodies at one height with
+        // DIFFERENT state roots are hash-identical, so storage L4 treats the second as an
+        // idempotent re-save and record_block_equivocation is never reached — a state-root
+        // fork would be neither hash-detectable nor slashable. Safe to bind because the
+        // signing digest (Block_Sig_v23.1) already covers state_root, so a mutation breaks
+        // the signature before it can change block identity. fees_collected is deliberately
+        // NOT bound: it is outside the signed digest, so binding it would let a mutation
+        // change the hash of a validly-signed block and frame an honest producer.
+        hasher.update(&self.state_root);
         // vrf_output is NOT folded. It was, to stop two bodies with one hash carrying different beacon
         // contributions — but the window beacon no longer reads it (it folds block hashes, which are
         // QC-signed in window_mb_hashes), so the field is consensus-inert and binding it would only let
@@ -1016,6 +1014,8 @@ impl EfficientMicroBlock {
         hasher.update(&self.timeout_round.to_le_bytes());
         // MUST stay byte-identical to MicroBlock::hash: bind carried_baseline (see MicroBlock::hash).
         hasher.update(&self.carried_baseline.to_le_bytes());
+        // MUST stay byte-identical to MicroBlock::hash: bind the post-apply state commitment.
+        hasher.update(&self.state_root);
         // MUST stay byte-identical to MicroBlock::hash: bind the beacon contribution.
         // vrf_output is consensus-inert; see MicroBlock::hash.
 
@@ -1204,5 +1204,43 @@ mod block_identity_tests {
             let b = mb(v);
             assert_eq!(b.hash(), efficient_from(&b).hash(), "digests drifted for vrf_output={:?}", v);
         }
+    }
+
+    /// state_root IS block identity. Two bodies at one height committing DIFFERENT state must be
+    /// two different blocks, or the storage anti-fork guard treats the second as an idempotent
+    /// re-save and a state-root fork is never recorded as equivocation.
+    #[test]
+    fn state_root_is_inside_block_identity() {
+        let mut a = mb(None);
+        let mut b = mb(None);
+        a.state_root = [1u8; 32];
+        b.state_root = [2u8; 32];
+        assert_ne!(a.hash(), b.hash(), "differing state_root must yield different block identity");
+        assert_ne!(efficient_from(&a).hash(), efficient_from(&b).hash());
+        assert_eq!(a.hash(), efficient_from(&a).hash());
+    }
+
+    /// fees_collected is OUTSIDE block identity: it is not covered by the Block_Sig_v23.1 signing
+    /// digest, so binding it would let a mutation change the hash of a validly-signed block and
+    /// frame an honest producer with a phantom equivocation.
+    #[test]
+    fn fees_collected_is_outside_block_identity() {
+        let mut a = mb(None);
+        let mut b = mb(None);
+        a.fees_collected = 0;
+        b.fees_collected = 12_345;
+        assert_eq!(a.hash(), b.hash(), "fees_collected must not change block identity");
+    }
+
+    /// The signature is OUTSIDE block identity — the property the fork-choice tie-break relies on.
+    /// It ranks equal-round siblings by block.hash(); ML-DSA signatures are randomized, so if the hash
+    /// covered the signature a producer could re-sign the same block to shift the tie at will.
+    #[test]
+    fn signature_is_outside_block_identity() {
+        let mut a = mb(None);
+        let mut b = mb(None);
+        a.signature = vec![1, 2, 3];
+        b.signature = vec![9, 9, 9, 9, 9];
+        assert_eq!(a.hash(), b.hash(), "re-signing the same block must not change its identity");
     }
 }

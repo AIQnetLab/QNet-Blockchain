@@ -123,6 +123,15 @@ pub(crate) fn mb_fmt_key(height: u64) -> String { format!("microblock_fmt_{:020}
 /// CF missing from the sweep pins the log indefinitely. Three hand-maintained copies of this list had
 /// each drifted from the descriptors; `all_cf_names_covers_every_descriptor` now fails the build's
 /// tests instead of leaking disk. Order is irrelevant.
+/// Retention for the transaction indexes, in blocks (one block per second, so ~27.8 h). BOTH index
+/// families are cut on this one height rule — `tx_by_address` keys carry the inclusion HEIGHT, not a
+/// transaction timestamp, so nothing an author controls can move a row out of reach of the prune.
+pub const TX_INDEX_RETENTION_BLOCKS: u64 = 100_000;
+
+/// How often the maintenance pass runs. The scan budgets below are derived from it, so a change
+/// here cannot silently stop retention from holding.
+pub const PRUNE_RUNS_PER_HOUR: u64 = 1;
+
 pub(crate) const ALL_CF_NAMES: [&str; 30] = [
     "blocks", "transactions", "accounts", "metadata",
     "microblocks", "consensus", "sync_state",
@@ -916,7 +925,10 @@ impl PersistentStorage {
         opts.create_missing_column_families(true);
         
         // v3.19: Reduced buffer sizes (64MB -> 16MB = 4x smaller WAL files)
-        opts.set_max_open_files(500);  // Reduced from 1000
+        // -1 = keep every table reader open. A capped count evicts readers, which unpins the L0
+        // filter/index blocks the block cache just paid for; reader memory is now bounded by the
+        // shared cache instead of by this number.
+        opts.set_max_open_files(-1);
         opts.set_use_fsync(true);      // Synchronous fsync: guarantees WAL durability on crash
         opts.set_bytes_per_sync(0);    // Disabled: fsync=true already guarantees durability
         opts.set_max_write_buffer_number(2);  // Reduced from 4
@@ -974,56 +986,121 @@ impl PersistentStorage {
         block_opts.set_bloom_filter(10.0, false); // Bloom filter for faster lookups
         opts.set_block_based_table_factory(&block_opts);
         
+        // ONE cache shared by every CF. Without an explicit cache each block-based factory
+        // gets its own ~8MiB default LRU, and caching index+filter blocks there would thrash:
+        // at 10M accounts the accounts-CF filter alone is ~12.5MB. A shared budget also means
+        // hot CFs can use the space cold ones do not. It is a cap, not an allocation.
+        const BLOCK_CACHE_BYTES: usize = 512 * 1024 * 1024;
+        let block_cache = rocksdb::Cache::new_lru_cache(BLOCK_CACHE_BYTES);
+
+        // Per-CF block table. Options::default() carries a DEFAULT block-based factory
+        // (4KB blocks, NO bloom filter) — the DB-level block_opts above do NOT reach a CF
+        // that declares its own Options, so every CF must set this explicitly or every
+        // point read binary-searches each SST index at each level.
+        //
+        // `partitioned` splits the filter and index into cache-sized pieces plus a small top
+        // level. Use it for CFs whose key count grows with the network (accounts, merkle):
+        // a monolithic 30MB filter block would otherwise be evicted and re-read whole.
+        let cf_block_opts = |partitioned: bool| -> rocksdb::BlockBasedOptions {
+            let mut b = rocksdb::BlockBasedOptions::default();
+            b.set_block_cache(&block_cache);
+            b.set_block_size(16384);
+            b.set_format_version(5);
+            b.set_bloom_filter(10.0, false);
+            b.set_cache_index_and_filter_blocks(true);
+            b.set_pin_l0_filter_and_index_blocks_in_cache(true);
+            if partitioned {
+                b.set_index_type(rocksdb::BlockBasedIndexType::TwoLevelIndexSearch);
+                b.set_partition_filters(true);
+            }
+            b
+        };
+
         // v3.19: Create optimized CF options with compression
-        fn create_cf_opts() -> Options {
+        let create_cf_opts = || -> Options {
             let mut cf_opts = Options::default();
             cf_opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
             cf_opts.set_write_buffer_size(8388608); // 8MB per CF
             cf_opts.set_max_write_buffer_number(2);
             cf_opts.set_target_file_size_base(16777216); // 16MB
+            cf_opts.set_block_based_table_factory(&cf_block_opts(false));
             cf_opts
-        }
-        
+        };
+
         // v3.19: Optimized CF for hot data (microblocks, heartbeats)
-        fn create_hot_cf_opts() -> Options {
+        let create_hot_cf_opts = || -> Options {
             let mut cf_opts = Options::default();
             cf_opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
             cf_opts.set_write_buffer_size(4194304); // 4MB - very small for hot data
             cf_opts.set_max_write_buffer_number(2);
             cf_opts.set_target_file_size_base(8388608); // 8MB
+            cf_opts.set_block_based_table_factory(&cf_block_opts(false));
             cf_opts
-        }
-        
+        };
+
         // v3.19: Optimized CF for cold data (old blocks)
-        fn create_cold_cf_opts() -> Options {
+        let create_cold_cf_opts = || -> Options {
             let mut cf_opts = Options::default();
             cf_opts.set_compression_type(rocksdb::DBCompressionType::Zstd); // Better compression
             cf_opts.set_write_buffer_size(16777216); // 16MB
             cf_opts.set_max_write_buffer_number(2);
             cf_opts.set_target_file_size_base(33554432); // 32MB
+            cf_opts.set_block_based_table_factory(&cf_block_opts(false));
             cf_opts
-        }
+        };
+
+        // CFs whose key count grows with the network. A monolithic filter for 10M keys is ~14MB
+        // and would be evicted and re-read whole; partitioning loads it in cache-sized pieces.
+        let create_indexed_cf_opts = || -> Options {
+            let mut cf_opts = Options::default();
+            cf_opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+            cf_opts.set_write_buffer_size(8388608);
+            cf_opts.set_max_write_buffer_number(2);
+            cf_opts.set_target_file_size_base(16777216);
+            cf_opts.set_block_based_table_factory(&cf_block_opts(true));
+            cf_opts
+        };
+
+        // Merkle store: reads are dominated by lookups for nodes that do NOT exist
+        // (empty subtrees on the descent), which is exactly what a whole-key bloom
+        // filter answers without touching an SST. Fixed-width keys, no prefix domain.
+        let create_merkle_cf_opts = || -> Options {
+            let mut cf_opts = Options::default();
+            cf_opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+            cf_opts.set_write_buffer_size(16777216);
+            cf_opts.set_max_write_buffer_number(3);
+            cf_opts.set_target_file_size_base(33554432);
+            // Point reads only (fixed-width keys, no prefix domain); leaves_under range-scans
+            // but a range scan never consults the filter, so whole-key filtering is the right mode.
+            let mut b = cf_block_opts(true);
+            b.set_whole_key_filtering(true);
+            cf_opts.set_block_based_table_factory(&b);
+            cf_opts
+        };
         
         // ColumnFamilyDescriptor doesn't implement Clone — rebuild on each retry attempt
-        fn build_column_families() -> Vec<ColumnFamilyDescriptor> {
+        let build_column_families = || -> Vec<ColumnFamilyDescriptor> {
             vec![
                 ColumnFamilyDescriptor::new("blocks", create_cold_cf_opts()),
-                ColumnFamilyDescriptor::new("transactions", create_cf_opts()),
-                ColumnFamilyDescriptor::new("accounts", create_cf_opts()),
+                ColumnFamilyDescriptor::new("transactions", create_indexed_cf_opts()),
+                ColumnFamilyDescriptor::new("accounts", create_indexed_cf_opts()),
                 ColumnFamilyDescriptor::new("metadata", create_cf_opts()),
                 ColumnFamilyDescriptor::new("microblocks", create_hot_cf_opts()),
                 ColumnFamilyDescriptor::new("consensus", create_hot_cf_opts()),
                 ColumnFamilyDescriptor::new("sync_state", create_cf_opts()),
+                // Despite the name (kept so a fresh genesis is not the only way to read old data),
+                // this holds the CERTIFIED per-epoch reward roots and the sharded leaf sets — the
+                // pull-claim's whole durable state. It is live; do not read the name as dead.
                 ColumnFamilyDescriptor::new("pending_rewards", create_cf_opts()),
-                ColumnFamilyDescriptor::new("node_registry", create_cf_opts()),
+                ColumnFamilyDescriptor::new("node_registry", create_indexed_cf_opts()),
                 ColumnFamilyDescriptor::new("ping_history", create_hot_cf_opts()),
                 ColumnFamilyDescriptor::new("failover_events", create_cf_opts()),
                 ColumnFamilyDescriptor::new("snapshots", create_cold_cf_opts()),
-                ColumnFamilyDescriptor::new("tx_index", create_cf_opts()),
-                ColumnFamilyDescriptor::new("tx_by_address", create_cf_opts()),
+                ColumnFamilyDescriptor::new("tx_index", create_indexed_cf_opts()),
+                ColumnFamilyDescriptor::new("tx_by_address", create_indexed_cf_opts()),
                 ColumnFamilyDescriptor::new("attestations", create_hot_cf_opts()),
                 ColumnFamilyDescriptor::new("heartbeats", create_hot_cf_opts()),
-                ColumnFamilyDescriptor::new("contract_storage", create_cf_opts()),
+                ColumnFamilyDescriptor::new("contract_storage", create_indexed_cf_opts()),
                 ColumnFamilyDescriptor::new("fcm_tokens", create_cf_opts()),
                 // Light-node ping delegation keys (operational, non-consensus): key=node_id, value JSON
                 // {ping_pubkey, ping_delegation_cert}. Read per-ping so the hot crypto stays off the RAM registry.
@@ -1065,23 +1142,21 @@ impl PersistentStorage {
                 // pruning task once an epoch has rolled).
                 ColumnFamilyDescriptor::new("cross_shard_pending", create_hot_cf_opts()),
                 ColumnFamilyDescriptor::new("cross_shard_receipts", create_hot_cf_opts()),
-                // Phase C (default-OFF): persistent Merkle store. Moving the committed
-                // node/leaf set off-heap into RocksDB is what cuts the ~2.5GB resident
-                // tree at 10M accounts. Leaf key = raw 32-byte addr_hash; node key =
-                // 4-byte big-endian depth ++ 32-byte node key. Created at open so a
-                // fresh genesis DB carries them even when the feature stays disabled.
-                ColumnFamilyDescriptor::new("merkle_leaves", create_cf_opts()),
-                ColumnFamilyDescriptor::new("merkle_nodes", create_cf_opts()),
+                // Persistent Merkle store (always on): the committed node/leaf set lives
+                // in RocksDB, the in-RAM maps are bounded read-through caches.
+                // Leaf key = raw 32-byte addr_hash; node key = 4-byte BE depth ++ 32-byte key.
+                ColumnFamilyDescriptor::new("merkle_leaves", create_merkle_cf_opts()),
+                ColumnFamilyDescriptor::new("merkle_nodes", create_merkle_cf_opts()),
                 // Wallet→token reverse index (NON-consensus): key `owns_{wallet}_{contract}` marks a
                 // live QRC-20 holding, maintained at apply from 0↔nonzero balance transitions. Turns the
                 // per-wallet token list from an O(N)-accounts scan into an O(held) prefix seek at scale.
-                ColumnFamilyDescriptor::new("wallet_token", create_cf_opts()),
+                ColumnFamilyDescriptor::new("wallet_token", create_indexed_cf_opts()),
                 // Per-epoch reward aggregation scratch: written once per eligible node, scanned
                 // once in wallet order, then range-deleted. Keeps the 10M-recipient root build
                 // O(shard) in RAM instead of materialising the whole leaf set.
                 ColumnFamilyDescriptor::new("reward_agg", create_cf_opts()),
             ]
-        }
+        };
 
         // Downgrade-safe open: rocksdb requires EVERY existing CF to be declared, so an older binary
         // opening a DB a newer binary extended would otherwise fail to start. Union our known CFs
@@ -1243,14 +1318,17 @@ impl PersistentStorage {
                 // INDEX: tx_hash -> block_height for O(1) transaction location
                 batch.put_cf(&tx_index_cf, tx_key.as_bytes(), &block.height.to_be_bytes());
 
-                // INDEX: address -> tx_hash for account transaction queries
-                // Key format: addr_{address}_{timestamp}_{tx_hash} for chronological ordering
-                let timestamp = tx.timestamp;
-                let from_key = format!("addr_{}_{:016x}_{}", tx.from, timestamp, tx.hash);
+                // INDEX: address -> tx_hash for account transaction queries.
+                // Key format: addr_{address}_{height:016x}_{tx_hash}. HEIGHT, not tx.timestamp: the
+                // sender picks the timestamp, and the retention scan cuts on this field — a row
+                // stamped in the future was unprunable forever. Height is also the true inclusion
+                // order, so the prefix scan stays chronological.
+                let stamp = block.height;
+                let from_key = format!("addr_{}_{:016x}_{}", tx.from, stamp, tx.hash);
                 batch.put_cf(&tx_by_addr_cf, from_key.as_bytes(), tx.hash.as_bytes());
 
                 if let Some(ref to) = tx.to {
-                    let to_key = format!("addr_{}_{:016x}_{}", to, timestamp, tx.hash);
+                    let to_key = format!("addr_{}_{:016x}_{}", to, stamp, tx.hash);
                     batch.put_cf(&tx_by_addr_cf, to_key.as_bytes(), tx.hash.as_bytes());
                 }
                 // QRC-20/721 counterparties are indexed from the success-gated transfer EVENTS
@@ -1596,16 +1674,16 @@ impl PersistentStorage {
     /// CRITICAL: Without compaction after delete operations, RocksDB marks
     /// keys as tombstones but doesn't physically reclaim disk space until
     /// compaction runs. This must be called after cleanup operations.
-    pub fn compact_all(&self) -> IntegrationResult<()> {
-        let cf_names = ALL_CF_NAMES;
-        
-        for cf_name in &cf_names {
+    pub fn compact_cfs(&self, cf_names: &[&str]) -> IntegrationResult<()> {
+        for cf_name in cf_names {
             if let Some(cf) = self.db.cf_handle(cf_name) {
                 self.db.compact_range_cf(&cf, None::<&[u8]>, None::<&[u8]>);
             }
         }
-        
-        println!("[INFO][STORAGE] compaction_triggered cfs={}", cf_names.len());
+        if crate::node::is_info() {
+            println!("[INFO][STORAGE] compaction_triggered cfs={} names={}",
+                     cf_names.len(), cf_names.join(","));
+        }
         Ok(())
     }
     
@@ -1619,33 +1697,6 @@ impl PersistentStorage {
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    // v7.1: FORK FLAG PERSISTENCE
-    // Persists consensus fork flags in RocksDB so they survive node restarts.
-    // Without this, a fork flag activated at block N would be lost on restart
-    // if the snapshot is taken after N and replay doesn't cover block N.
-    // ═══════════════════════════════════════════════════════════════════
-
-    /// Save a named fork flag to RocksDB metadata CF.
-    /// Fork flags are persisted as single-byte values: 1 = active, 0 = inactive.
-    pub fn save_fork_flag(&self, flag_name: &str, active: bool) -> IntegrationResult<()> {
-        let metadata_cf = self.db.cf_handle("metadata")
-            .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
-        let key = format!("fork_{}", flag_name);
-        self.db.put_cf(&metadata_cf, key.as_bytes(), &[active as u8])?;
-        Ok(())
-    }
-
-    /// Load a named fork flag from RocksDB metadata CF.
-    /// Returns None if the flag was never persisted (fresh DB or pre-v7.1 node).
-    pub fn load_fork_flag(&self, flag_name: &str) -> IntegrationResult<Option<bool>> {
-        let metadata_cf = self.db.cf_handle("metadata")
-            .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
-        let key = format!("fork_{}", flag_name);
-        match self.db.get_cf(&metadata_cf, key.as_bytes())? {
-            Some(data) if !data.is_empty() => Ok(Some(data[0] != 0)),
-            _ => Ok(None),
-        }
-    }
 
     /// DATA CONSISTENCY: Reset chain height to 0 (DANGEROUS - requires explicit confirmation)
     /// This function will ONLY work if QNET_FORCE_RESET=1 AND QNET_CONFIRM_RESET=YES
@@ -3854,6 +3905,50 @@ impl qnet_state::MerkleNodeStore for RocksMerkleNodeStore {
         }
     }
 
+    /// Leaf keys sort bytewise and a subtree is a contiguous key range, so the probe
+    /// is one seek plus at most `limit` steps — no full scan at any tree size.
+    fn leaves_under(&self, lo: &[u8; 32], hi: &[u8; 32], limit: usize) -> Vec<([u8; 32], [u8; 32])> {
+        let cf = match self.db.cf_handle(self.leaf_cf) {
+            Some(cf) => cf,
+            None => return Vec::new(),
+        };
+        let mut out = Vec::new();
+        if limit == 0 {
+            return out;
+        }
+        // Upper bound lets RocksDB skip files that cannot hold the range; fill_cache off keeps a
+        // probe from evicting hot data out of the shared block cache.
+        let mut ro = rocksdb::ReadOptions::default();
+        ro.set_iterate_upper_bound({
+            let mut end = hi.to_vec();
+            end.push(0u8); // inclusive `hi` -> exclusive bound
+            end
+        });
+        ro.fill_cache(false);
+        let mode = rocksdb::IteratorMode::From(&lo[..], rocksdb::Direction::Forward);
+        for item in self.db.iterator_cf_opt(&cf, ro, mode) {
+            let (k, v) = match item {
+                Ok(kv) => kv,
+                Err(_) => break,
+            };
+            if k.len() != 32 || k.as_ref() > &hi[..] {
+                break;
+            }
+            if v.len() != 32 {
+                continue;
+            }
+            let mut key = [0u8; 32];
+            let mut val = [0u8; 32];
+            key.copy_from_slice(&k);
+            val.copy_from_slice(&v);
+            out.push((key, val));
+            if out.len() >= limit {
+                break;
+            }
+        }
+        out
+    }
+
     fn all_leaves(&self) -> Vec<([u8; 32], [u8; 32])> {
         let cf = match self.db.cf_handle(self.leaf_cf) {
             Some(cf) => cf,
@@ -3875,6 +3970,15 @@ impl qnet_state::MerkleNodeStore for RocksMerkleNodeStore {
             out.push((key, val));
         }
         out
+    }
+
+    fn wipe_leaves(&self) -> Result<(), String> {
+        let leaf_cf = self.db.cf_handle(self.leaf_cf)
+            .ok_or_else(|| format!("merkle leaf CF '{}' not found", self.leaf_cf))?;
+        // Leaf keys are exactly 32 bytes, so a 33-byte upper bound covers every one of them.
+        let lo = [0u8; 1];
+        let hi = [0xFFu8; 33];
+        self.db.delete_range_cf(&leaf_cf, &lo[..], &hi[..]).map_err(|e| e.to_string())
     }
 
     fn put_batch(
@@ -4470,15 +4574,6 @@ impl Storage {
         self.persistent.reset_chain_height()
     }
 
-    /// v7.1: Save fork flag to persistent storage
-    pub fn save_fork_flag(&self, flag_name: &str, active: bool) -> IntegrationResult<()> {
-        self.persistent.save_fork_flag(flag_name, active)
-    }
-
-    /// v7.1: Load fork flag from persistent storage
-    pub fn load_fork_flag(&self, flag_name: &str) -> IntegrationResult<Option<bool>> {
-        self.persistent.load_fork_flag(flag_name)
-    }
     
     pub fn get_block_hash(&self, height: u64) -> IntegrationResult<Option<String>> {
         self.persistent.get_block_hash(height)
@@ -4816,14 +4911,15 @@ impl Storage {
             // INDEX: tx_hash -> block_height for O(1) transaction location
             batch.put_cf(&tx_index_cf, tx_key.as_bytes(), &height.to_be_bytes());
             
-            // INDEX: address -> tx_hash for account transaction queries
-            let timestamp = tx.timestamp;
-            let from_key = format!("addr_{}_{:016x}_{}", tx.from, timestamp, tx_hash_str);
+            // INDEX: address -> tx_hash. HEIGHT-stamped for the same reason as the sibling writer:
+            // the retention scan cuts on this field and tx.timestamp is author-supplied.
+            let stamp = height;
+            let from_key = format!("addr_{}_{:016x}_{}", tx.from, stamp, tx_hash_str);
             batch.put_cf(&tx_by_addr_cf, from_key.as_bytes(), tx_hash_str.as_bytes());
             
             // Index 'to' address (if present, including system addresses)
             let to_addr = tx.to.as_ref().map(|s| s.as_str()).unwrap_or(&tx.from);
-            let to_key = format!("addr_{}_{:016x}_{}", to_addr, timestamp, tx_hash_str);
+            let to_key = format!("addr_{}_{:016x}_{}", to_addr, stamp, tx_hash_str);
             batch.put_cf(&tx_by_addr_cf, to_key.as_bytes(), tx_hash_str.as_bytes());
 
             // QRC-20/721 counterparties are indexed from the success-gated transfer EVENTS
@@ -5633,11 +5729,13 @@ impl Storage {
                     raw_data
                 };
                 
-                // Verify it's a valid MacroBlock before sending
-                if bincode::deserialize::<qnet_state::MacroBlock>(&data).is_ok() {
-                    macroblocks.push((index, data));
-                } else {
-                    println!("[WARN][STORAGE] invalid_macroblock_data index={}", index);
+                // Verify it's a valid MacroBlock before sending, and that it still carries the
+                // signatures the requester's verify needs — past the retention horizon it does not,
+                // and serving it would look like a forged QC rather than an absent one.
+                match bincode::deserialize::<qnet_state::MacroBlock>(&data) {
+                    Ok(mb) if Self::macroblock_carries_qc_sigs(&mb) => macroblocks.push((index, data)),
+                    Ok(_) => println!("[INFO][STORAGE] macroblock_qc_pruned index={} action=serve_absent", index),
+                    Err(_) => println!("[WARN][STORAGE] invalid_macroblock_data index={}", index),
                 }
             }
         }
@@ -6688,198 +6786,11 @@ impl Storage {
         }
     }
     
-    /// PRODUCTION: Recompress old blocks with appropriate compression level
-    pub async fn recompress_old_blocks(&self) -> IntegrationResult<()> {
-        println!("[INFO][STORAGE] adaptive_recompress_start");
-        
-        let current_height = self.get_chain_height()?;
-        let microblocks_cf = self.persistent.db.cf_handle("microblocks")
-            .ok_or_else(|| IntegrationError::StorageError("microblocks column family not found".to_string()))?;
-        
-        let mut recompressed_count = 0;
-        let mut space_saved = 0i64;
-        
-        // Process blocks in batches
-        const BATCH_SIZE: u64 = 1000;
-        
-        // Process blocks in reverse order (newest to oldest)
-        let mut batch_starts: Vec<u64> = Vec::new();
-        let mut start = 1;
-        while start <= current_height {
-            batch_starts.push(start);
-            start += BATCH_SIZE;
-        }
-        
-        for batch_start in batch_starts.into_iter().rev() {
-            let batch_end = std::cmp::min(batch_start + BATCH_SIZE - 1, current_height);
-            let mut batch = WriteBatch::default();
-            
-            for height in batch_start..=batch_end {
-                let key = mb_body_key(height);
-                
-                if let Ok(Some(existing_data)) = self.persistent.db.get_cf(&microblocks_cf, key.as_bytes()) {
-                    let original_size = existing_data.len();
-                    let compression_level = self.get_compression_level(height);
-                    
-                    // Skip if already optimally compressed
-                    if compression_level == CompressionLevel::None {
-                        continue;
-                    }
-                    
-                    // Decompress if needed (check if compressed)
-                    let decompressed = if existing_data.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
-                        // Zstd magic number
-                        zstd::decode_all(&existing_data[..])
-                            .unwrap_or_else(|_| existing_data.clone())
-                    } else {
-                        existing_data.clone()
-                    };
-                    
-                    // Recompress with appropriate level
-                    let recompressed = self.compress_block_adaptive(&decompressed, height)?;
-                    
-                    if recompressed.len() < original_size {
-                        batch.put_cf(&microblocks_cf, key.as_bytes(), &recompressed);
-                        space_saved += (original_size as i64) - (recompressed.len() as i64);
-                        recompressed_count += 1;
-                    }
-                }
-            }
-            
-            // Apply batch
-            if !batch.is_empty() {
-                self.persistent.db.write(batch)?;
-                println!("[INFO][STORAGE] recompress_batch from={} to={} blocks={} saved_kb={}",
-                        batch_start, batch_end, recompressed_count, space_saved / 1024);
-            }
-            
-            // Limit processing to avoid blocking too long
-            if recompressed_count >= 10000 {
-                break;
-            }
-        }
-        
-        // Force compaction to reclaim space
-        self.persistent.db.compact_range_cf(&microblocks_cf, None::<&[u8]>, None::<&[u8]>);
-        
-        println!("[INFO][STORAGE] adaptive_recompress_done blocks={} saved_mb={}",
-                recompressed_count, space_saved / (1024 * 1024));
-        
-        // PRODUCTION: Also recompress old transactions with stronger Zstd
-        // Done synchronously to avoid Send issues with RocksDB handles
-        let tx_saved = self.recompress_old_transactions_sync()?;
-        if tx_saved > 0 {
-            println!("[INFO][STORAGE] tx_recompress_saved saved_mb={}", tx_saved / (1024 * 1024));
-        }
-        
-        Ok(())
-    }
-    
-    /// PRODUCTION: Recompress old transactions with stronger Zstd levels
-    /// Called from recompress_old_blocks() as background task
-    /// Synchronous to avoid Send issues with RocksDB column family handles
-    /// Processes in batches to avoid blocking too long
-    pub fn recompress_old_transactions_sync(&self) -> IntegrationResult<i64> {
-        let tx_cf = self.persistent.db.cf_handle("transactions")
-            .ok_or_else(|| IntegrationError::StorageError("transactions column family not found".to_string()))?;
-        let tx_index_cf = self.persistent.db.cf_handle("tx_index")
-            .ok_or_else(|| IntegrationError::StorageError("tx_index column family not found".to_string()))?;
-        
-        let current_height = self.get_chain_height()?;
-        let mut space_saved: i64 = 0;
-        let mut recompressed_count = 0;
-        
-        // Only recompress transactions older than 7 days (604800 blocks)
-        let old_threshold = current_height.saturating_sub(604800);
-        
-        let iter = self.persistent.db.iterator_cf(&tx_index_cf, rocksdb::IteratorMode::Start);
-        let mut batch = WriteBatch::default();
-        
-        for item in iter {
-            let (tx_key, height_data) = item?;
-            
-            if height_data.len() < 8 {
-                continue;
-            }
-            
-            let block_height = u64::from_be_bytes(height_data[..8].try_into().unwrap_or([0u8; 8]));
-            
-            // Skip recent transactions (keep fast access)
-            if block_height > old_threshold {
-                continue;
-            }
-            
-            // Get current transaction data
-            if let Ok(Some(tx_data)) = self.persistent.db.get_cf(&tx_cf, &tx_key) {
-                let original_size = tx_data.len();
-                
-                // Determine compression level based on age
-                let age_days = (current_height - block_height) / 86400;
-                let zstd_level = match age_days {
-                    0..=7 => continue,      // Skip recent
-                    8..=30 => 9,            // Medium compression
-                    31..=365 => 15,         // Heavy compression
-                    _ => 22,                // Extreme compression for old data
-                };
-                
-                // Decompress if already compressed
-                let decompressed = if tx_data.len() >= 4 && tx_data[0..4] == [0x28, 0xb5, 0x2f, 0xfd] {
-                    // Check current compression level (approximate by ratio)
-                    // Skip if already heavily compressed
-                    if let Ok(dec) = zstd::decode_all(&tx_data[..]) {
-                        let current_ratio = tx_data.len() as f64 / dec.len() as f64;
-                        if current_ratio < 0.3 && age_days < 365 {
-                            // Already well compressed, skip unless very old
-                            continue;
-                        }
-                        dec
-                    } else {
-                        continue;
-                    }
-                } else {
-                    tx_data.to_vec()
-                };
-                
-                // Recompress with stronger level
-                if let Ok(recompressed) = zstd::encode_all(&decompressed[..], zstd_level) {
-                    if recompressed.len() < original_size {
-                        batch.put_cf(&tx_cf, &tx_key, &recompressed);
-                        space_saved += (original_size as i64) - (recompressed.len() as i64);
-                        recompressed_count += 1;
-                        
-                        // Apply batch every 1000 transactions
-                        if recompressed_count % 1000 == 0 {
-                            self.persistent.db.write(batch)?;
-                            batch = WriteBatch::default();
-                            // Brief pause to allow other operations (non-blocking)
-                            std::thread::sleep(std::time::Duration::from_millis(1));
-                        }
-                    }
-                }
-            }
-            
-            // Limit total processing per run
-            if recompressed_count >= 10000 {
-                break;
-            }
-        }
-        
-        // Apply remaining batch
-        if !batch.is_empty() {
-            self.persistent.db.write(batch)?;
-        }
-        
-        // Compact to reclaim space
-        if space_saved > 0 {
-            self.persistent.db.compact_range_cf(&tx_cf, None::<&[u8]>, None::<&[u8]>);
-        }
-        
-        println!("[INFO][STORAGE] tx_recompress_done count={} saved_kb={}",
-                recompressed_count, space_saved / 1024);
-        
-        Ok(space_saved)
-    }
-    
+    // recompress_old_blocks/_transactions_sync removed: the minimum recompression age
+    // (2 days) exceeded MICROBLOCK_BODY_RETENTION_BLOCKS (1 day), so every candidate was
+    // already pruned. It could never save a byte, yet each call did a full O(height) scan
+    // plus an unconditional whole-CF compaction.
+
     /// Calculate recommended storage size based on blockchain age and activity
     pub fn get_recommended_storage_size_gb(&self) -> IntegrationResult<u64> {
         let stats = self.get_stats()?;
@@ -6917,39 +6828,6 @@ impl Storage {
         Ok(recommended)
     }
     
-    // ============================================
-    // SCALABILITY: PENDING REWARDS IN ROCKSDB
-    // ============================================
-    
-    /// Save pending reward for a node
-    pub fn save_pending_reward(&self, node_id: &str, reward: &qnet_consensus::lazy_rewards::PhaseAwareReward) -> IntegrationResult<()> {
-        let rewards_cf = self.persistent.db.cf_handle("pending_rewards")
-            .ok_or_else(|| IntegrationError::StorageError("pending_rewards column family not found".to_string()))?;
-        
-        let key = format!("reward_{}", node_id);
-        let data = bincode::serialize(reward)
-            .map_err(|e| IntegrationError::SerializationError(e.to_string()))?;
-        
-        self.persistent.db.put_cf(&rewards_cf, key.as_bytes(), &data)?;
-        Ok(())
-    }
-    
-    /// Load pending reward for a node
-    pub fn load_pending_reward(&self, node_id: &str) -> IntegrationResult<Option<qnet_consensus::lazy_rewards::PhaseAwareReward>> {
-        let rewards_cf = self.persistent.db.cf_handle("pending_rewards")
-            .ok_or_else(|| IntegrationError::StorageError("pending_rewards column family not found".to_string()))?;
-        
-        let key = format!("reward_{}", node_id);
-        match self.persistent.db.get_cf(&rewards_cf, key.as_bytes())? {
-            Some(data) => {
-                let reward = bincode::deserialize(&data)
-                    .map_err(|e| IntegrationError::DeserializationError(e.to_string()))?;
-                Ok(Some(reward))
-            },
-            None => Ok(None),
-        }
-    }
-
     // --- Sharded reward leaf-set (10M-scale claim serving) ---------------------------------------
     // The per-epoch reward set is partitioned into fixed-size shards of the SORTED (wallet, amount)
     // leaves. A claim loads exactly ONE shard + the shard-meta (K roots + K first-wallet bounds),
@@ -7372,6 +7250,50 @@ impl Storage {
 
     /// Key of the running registry_root LtHash accumulator (metadata CF). One 2048-byte blob updated
     /// incrementally by save_node_registration_inner; recomputed from scratch on reorg/boot/snapshot.
+    /// Monotone sources of `reg_index`, one per index space. In the metadata CF, not RAM: they feed
+    /// a hashed field. Value = INDEX_SPACES x u32 BE.
+    const REGISTRY_NEXT_INDEX_KEY: &'static [u8] = b"registry_next_index";
+
+    /// Index spaces: 0 = super/genesis, 1..=5 = light shard 0..4.
+    ///
+    /// A single global counter made every light shard's bitmap span the WHOLE registry, because the
+    /// shard is `blake3(node_id) % 5` and is independent of the index — so each shard's highest
+    /// member sat at the top of the space. At 10M lights that is a 1.26 MB raw bitmap per shard,
+    /// ~840 KB compressed, against a 500,000-byte per-transaction cap: the light reward path stops
+    /// emitting at ~60% of target. Ranking inside the node's own space keeps the ordinal just as
+    /// permanent (the shard is a pure function of an immutable id) and drops the span to the shard's
+    /// own size.
+    pub(crate) const INDEX_SPACES: usize = 6;
+
+    fn index_space_of(node_id: &str, node_type: &str) -> Option<usize> {
+        if node_id.starts_with("super_") || node_id.starts_with("genesis_node_") {
+            Some(0)
+        } else if node_type == "light" {
+            Some(1 + crate::node::light_shard_of(node_id))
+        } else {
+            None
+        }
+    }
+
+    fn load_next_indices(&self, meta_cf: &rocksdb::ColumnFamily) -> [u32; Self::INDEX_SPACES] {
+        let mut out = [0u32; Self::INDEX_SPACES];
+        if let Ok(Some(v)) = self.persistent.db.get_cf(meta_cf, Self::REGISTRY_NEXT_INDEX_KEY) {
+            if v.len() == Self::INDEX_SPACES * 4 {
+                for i in 0..Self::INDEX_SPACES {
+                    out[i] = u32::from_be_bytes([v[4 * i], v[4 * i + 1], v[4 * i + 2], v[4 * i + 3]]);
+                }
+            }
+        }
+        out
+    }
+
+    fn next_indices_bytes(v: &[u32; Self::INDEX_SPACES]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(Self::INDEX_SPACES * 4);
+        for n in v.iter() {
+            out.extend_from_slice(&n.to_be_bytes());
+        }
+        out
+    }
     const REGISTRY_LT_STATE_KEY: &'static [u8] = b"registry_lt_state";
     /// How far back per-checkpoint-head seals are retained (~1 epoch of 30-block heads). A read that
     /// misses a pruned seal falls back to the O(N) from-scratch recompute — correctness, not just perf.
@@ -7786,8 +7708,10 @@ impl Storage {
                 if h > up_to_height { continue; } // orphan/above-bound exclusion
                 let wallet = parsed["wallet"].as_str().unwrap_or("");
                 let burn = parsed["burn"].as_str().unwrap_or("");
+                let reg_index = parsed["reg_index"].as_u64().unwrap_or(0) as u32;
+                let ntype = parsed["node_type"].as_str().unwrap_or("");
                 let vrf = parsed["vrf_pk_sha3"].as_str().and_then(|s| hex::decode(s).ok()).unwrap_or_default();
-                lt.add(&crate::registry_lthash::row_lanes(&node_id, wallet, h, burn, &vrf));
+                lt.add(&crate::registry_lthash::row_lanes(&node_id, wallet, h, reg_index, ntype, burn, &vrf));
             }
         }
         Some(lt)
@@ -7819,8 +7743,12 @@ impl Storage {
                 let burn = parsed["burn"].as_str().unwrap_or("").to_string();
                 let vrf = parsed["vrf_pk_sha3"].as_str().unwrap_or("").to_string();
                 let vrf_bytes = hex::decode(&vrf).unwrap_or_default();
-                lt.add(&crate::registry_lthash::row_lanes(&node_id, &wallet, h, &burn, &vrf_bytes));
-                out.push(serde_json::json!({"node_id": node_id, "wallet": wallet, "reg_height": h, "burn": burn, "vrf_pk_sha3": vrf}));
+                let reg_index = parsed["reg_index"].as_u64().unwrap_or(0) as u32;
+                let ntype = parsed["node_type"].as_str().unwrap_or("").to_string();
+                lt.add(&crate::registry_lthash::row_lanes(&node_id, &wallet, h, reg_index, &ntype, &burn, &vrf_bytes));
+                out.push(serde_json::json!({"node_id": node_id, "wallet": wallet, "reg_height": h,
+                                            "reg_index": reg_index, "node_type": ntype,
+                                            "burn": burn, "vrf_pk_sha3": vrf}));
             }
         }
         (out, hex::encode(lt.root()))
@@ -7928,6 +7856,18 @@ impl Storage {
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut batch = rocksdb::WriteBatch::default(); // spans node_registry (prune) + metadata (lt/seals), atomic
         let mut pruned = 0u32;
+        // reg_index is the row's RANK in canonical (reg_height, node_id) order — a pure function of
+        // the surviving chain, not of the order this node happened to apply things. The live counter
+        // equals that rank because blocks apply in height order, reg_height is immutable once stamped,
+        // and a block's rows are stamped in node_id order (sort_registrations_canonically, called by
+        // the validator drain, the producer's inline stamp and the genesis apply alike). So on a chain
+        // this node never reorged, renumbering here is a verified no-op.
+        //
+        // It is NOT a no-op after a reorg, which is the whole reason it exists: pruning an orphan
+        // registered between two survivors leaves a gap a from-genesis node does not have. Ranking the
+        // survivors closes the gap and puts this node back on the network's numbering.
+        let mut survivors: Vec<(u64, String, serde_json::Value)> = Vec::new();
+        let mut next_index = [0u32; Self::INDEX_SPACES];
         for prefix in [b"srtr_".as_ref(), b"lrtr_".as_ref()] {
             for item in self.persistent.db.iterator_cf(&registry_cf, IteratorMode::From(prefix, Direction::Forward)) {
                 let (k, _) = match item {
@@ -7942,12 +7882,9 @@ impl Storage {
                 let val = match self.persistent.db.get_cf(&registry_cf, nk.as_bytes()) { Ok(Some(v)) => v, _ => continue };
                 let parsed: serde_json::Value = match serde_json::from_slice(&val) { Ok(p) => p, Err(_) => continue };
                 let h = match parsed["reg_height"].as_u64() { Some(h) => h, None => continue };
-                let wallet = parsed["wallet"].as_str().unwrap_or("");
                 if h <= up_to_height {
-                    let burn = parsed["burn"].as_str().unwrap_or("");
-                    let vrf = parsed["vrf_pk_sha3"].as_str()
-                        .and_then(|s| hex::decode(s).ok()).unwrap_or_default();
-                    lt.add(&crate::registry_lthash::row_lanes(&node_id, wallet, h, burn, &vrf));
+                    // Ranks are assigned in the second pass, once every survivor is known.
+                    survivors.push((h, node_id.clone(), parsed.clone()));
                 } else {
                     // orphan of a discarded block — prune node_ + both roster indices. No wallet_ reverse
                     // index exists (resolution derives the id), so nothing else to drop.
@@ -7961,8 +7898,33 @@ impl Storage {
                 }
             }
         }
+        // Canonical order, then contiguous ranks from 0. Rewriting the row is required: reg_index is
+        // hashed, so a stale value on disk would fold into a root nobody else computes.
+        survivors.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        for (h, node_id, mut parsed) in survivors.into_iter() {
+            let ntype_for_space = parsed["node_type"].as_str().unwrap_or("").to_string();
+            let sp = match Self::index_space_of(&node_id, &ntype_for_space) { Some(v) => v, None => continue };
+            let rank = next_index[sp];
+            next_index[sp] = rank.saturating_add(1);
+            if parsed["reg_index"].as_u64().map(|v| v as u32) != Some(rank) {
+                parsed["reg_index"] = serde_json::json!(rank);
+                batch.put_cf(
+                    &registry_cf,
+                    format!("node_{}", node_id).as_bytes(),
+                    parsed.to_string().as_bytes(),
+                );
+            }
+            let wallet = parsed["wallet"].as_str().unwrap_or("");
+            let burn = parsed["burn"].as_str().unwrap_or("");
+            let ntype = parsed["node_type"].as_str().unwrap_or("");
+            let vrf = parsed["vrf_pk_sha3"].as_str()
+                .and_then(|s| hex::decode(s).ok()).unwrap_or_default();
+            lt.add(&crate::registry_lthash::row_lanes(&node_id, wallet, h, rank, ntype, burn, &vrf));
+        }
+
         let root = lt.root();
         batch.put_cf(&meta_cf, Self::REGISTRY_LT_STATE_KEY, lt.to_bytes().as_ref());
+        batch.put_cf(&meta_cf, Self::REGISTRY_NEXT_INDEX_KEY, &Self::next_indices_bytes(&next_index));
         for item in self.persistent.db.iterator_cf(&meta_cf, IteratorMode::From(b"rr_seal_", Direction::Forward)) {
             let (k, _) = match item {
                 Ok(kv) => kv,
@@ -8031,15 +7993,14 @@ impl Storage {
         // Stable hash-shard (SAME as the bitmap builder + emission reader): bit i in shard g = the i-th
         // sorted roster node with light_shard_of()==g. Streamed (no O(roster) Vec), one walk.
         if !bitmaps.is_empty() {
-            let mut counters = [0usize; 5];
-            // A truncated roster shifts every later node's shard-local index, so bits are read at the
-            // wrong offsets and the recency index reports the WRONG nodes, not fewer of them.
-            let scan = self.light_roster_for_each(cutoff, |node_id, _w| {
+            // Bit position is the node's PERMANENT reg_index, not a position in this scan. A
+            // scan-relative ordinal shifted every later node whenever the roster changed, so the
+            // bitmap was read at the wrong offsets — reporting the WRONG nodes, not fewer of them.
+            let scan = self.light_roster_for_each(cutoff, |node_id, _w, reg_index| {
                 let gidx = crate::node::light_shard_of(node_id);
-                let local_i = counters[gidx];
-                counters[gidx] += 1;
+                let bit = reg_index as usize;
                 if let Some(bm) = bitmaps.get(&gidx) {
-                    if bm.get(local_i / 8).map(|b| b & (1 << (local_i % 8)) != 0).unwrap_or(false) {
+                    if bm.get(bit / 8).map(|b| b & (1 << (bit % 8)) != 0).unwrap_or(false) {
                         batch.put_cf(&cf, format!("light_elig_{:010}_{}", epoch, node_id).as_bytes(), &[]);
                         n += 1; inbatch += 1;
                         if inbatch >= 100_000 { let _ = self.persistent.db.write(std::mem::take(&mut batch)); inbatch = 0; }
@@ -8101,77 +8062,7 @@ impl Storage {
         }
     }
 
-    /// Delete pending reward after claim
-    pub fn delete_pending_reward(&self, node_id: &str) -> IntegrationResult<()> {
-        let rewards_cf = self.persistent.db.cf_handle("pending_rewards")
-            .ok_or_else(|| IntegrationError::StorageError("pending_rewards column family not found".to_string()))?;
-        
-        let key = format!("reward_{}", node_id);
-        self.persistent.db.delete_cf(&rewards_cf, key.as_bytes())?;
-        Ok(())
-    }
-    
-    // ============================================
-    // v2.90: PROCESSED EMISSION MACROBLOCKS
-    // Prevent double-processing on node restart
-    // ============================================
-    
-    /// Save processed emission MacroBlocks set
-    /// CRITICAL: Prevents duplicate reward distribution after node restart
-    pub fn save_processed_emission_macroblocks(&self, processed: &std::collections::HashSet<u64>) -> IntegrationResult<()> {
-        let rewards_cf = self.persistent.db.cf_handle("pending_rewards")
-            .ok_or_else(|| IntegrationError::StorageError("pending_rewards column family not found".to_string()))?;
-        
-        let key = b"processed_emission_macroblocks";
-        let data = bincode::serialize(processed)
-            .map_err(|e| IntegrationError::SerializationError(e.to_string()))?;
-        
-        self.persistent.db.put_cf(&rewards_cf, key, &data)?;
-        Ok(())
-    }
-    
-    /// Load processed emission MacroBlocks set from storage
-    /// Returns empty set if not found (new node or first run)
-    pub fn load_processed_emission_macroblocks(&self) -> IntegrationResult<std::collections::HashSet<u64>> {
-        let rewards_cf = self.persistent.db.cf_handle("pending_rewards")
-            .ok_or_else(|| IntegrationError::StorageError("pending_rewards column family not found".to_string()))?;
-        
-        let key = b"processed_emission_macroblocks";
-        match self.persistent.db.get_cf(&rewards_cf, key)? {
-            Some(data) => {
-                let processed = bincode::deserialize(&data)
-                    .map_err(|e| IntegrationError::DeserializationError(e.to_string()))?;
-                Ok(processed)
-            },
-            None => {
-                // First run or new node - return empty set
-                Ok(std::collections::HashSet::new())
-            }
-        }
-    }
-    
-    /// Get all pending rewards (for batch processing)
-    pub fn get_all_pending_rewards(&self) -> IntegrationResult<Vec<(String, qnet_consensus::lazy_rewards::PhaseAwareReward)>> {
-        let rewards_cf = self.persistent.db.cf_handle("pending_rewards")
-            .ok_or_else(|| IntegrationError::StorageError("pending_rewards column family not found".to_string()))?;
-        
-        let mut rewards = Vec::new();
-        let iter = self.persistent.db.iterator_cf(&rewards_cf, rocksdb::IteratorMode::Start);
-        
-        for item in iter {
-            let (key, value) = item?;
-            if let Ok(key_str) = std::str::from_utf8(&key) {
-                if key_str.starts_with("reward_") {
-                    let node_id = key_str.strip_prefix("reward_").expect("Checked starts_with above").to_string();
-                    let reward: qnet_consensus::lazy_rewards::PhaseAwareReward = bincode::deserialize(&value)
-                        .map_err(|e| IntegrationError::DeserializationError(e.to_string()))?;
-                    rewards.push((node_id, reward));
-                }
-            }
-        }
-        
-        Ok(rewards)
-    }
+
     
     // ============================================
     // SCALABILITY: NODE REGISTRY IN ROCKSDB
@@ -8207,6 +8098,27 @@ impl Storage {
         self.save_node_registration_inner(node_id, node_type, wallet, reputation, Some(reg_height), Some(burn_tx), vrf_pk)
     }
 
+    /// Roster-index value: `reg_height (8B BE) ++ reg_index (4B BE) ++ wallet`.
+    ///
+    /// reg_index rides here so a roster scan yields each node's permanent bitmap ordinal without a
+    /// per-entry JSON parse of `node_<id>` — which is the entire reason these indices exist.
+    fn roster_index_value(reg_height: u64, reg_index: u32, wallet: &str) -> Vec<u8> {
+        let mut val = Vec::with_capacity(12 + wallet.len());
+        val.extend_from_slice(&reg_height.to_be_bytes());
+        val.extend_from_slice(&reg_index.to_be_bytes());
+        val.extend_from_slice(wallet.as_bytes());
+        val
+    }
+
+    /// Inverse of `roster_index_value`. A short or non-UTF8 row is skipped, never defaulted.
+    fn decode_roster_index_value(v: &[u8]) -> Option<(u64, u32, &str)> {
+        if v.len() < 12 { return None; }
+        let h = u64::from_be_bytes(v[..8].try_into().ok()?);
+        let idx = u32::from_be_bytes(v[8..12].try_into().ok()?);
+        let wallet = std::str::from_utf8(&v[12..]).ok()?;
+        Some((h, idx, wallet))
+    }
+
     fn save_node_registration_inner(&self, node_id: &str, node_type: &str, wallet: &str, reputation: f64, reg_height: Option<u64>, burn_tx: Option<&str>, vrf_pk: Option<&[u8]>) -> IntegrationResult<()> {
         let registry_cf = self.persistent.db.cf_handle("node_registry")
             .ok_or_else(|| IntegrationError::StorageError("node_registry column family not found".to_string()))?;
@@ -8236,8 +8148,18 @@ impl Storage {
         } else {
             wallet.to_string()
         };
+        // node_type is IMMUTABLE once chain-stamped, same rule as wallet. It is now folded into
+        // row_lanes, and it decides light-roster membership at backfill — an RPC-cache write with a
+        // peer-supplied type must never rebind it.
+        let final_node_type = if reg_height.is_some() {
+            node_type.to_string()
+        } else if prior_height.is_some() {
+            prior.as_ref().and_then(|p| p["node_type"].as_str()).unwrap_or(node_type).to_string()
+        } else {
+            node_type.to_string()
+        };
         let mut data = json!({
-            "node_type": node_type,
+            "node_type": final_node_type,
             "wallet": final_wallet,
             "reputation": reputation,
             "timestamp": SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
@@ -8278,6 +8200,35 @@ impl Storage {
             },
         };
         if !vrf_sha3_hex.is_empty() { data["vrf_pk_sha3"] = json!(vrf_sha3_hex); }
+
+        // reg_index: the node's permanent ordinal, assigned once from a monotone counter in THIS
+        // batch. Bitmaps are indexed by it instead of by a position in a roster scan, where inserting
+        // one registration shifted every later ordinal. Gate is byte-identical to the LtHash gate
+        // below, so exactly the rows the root covers get an index. Immutable once stamped.
+        //
+        // The counter lives in the metadata CF, not in RAM: block apply is strictly serialized per
+        // node, so read-modify-write inside the batch is race-free, and a process-local counter would
+        // be RAM deciding a hashed field (I1).
+        let space = Self::index_space_of(node_id, &final_node_type);
+        let in_scope_for_index = space.is_some();
+        let prior_index = prior.as_ref().and_then(|p| p["reg_index"].as_u64()).map(|v| v as u32);
+        let final_index: u32 = match (prior_index, space) {
+            (Some(existing), _) => existing,
+            (None, Some(sp)) if reg_height.is_some() => {
+                let mut counters = self.load_next_indices(&metadata_cf);
+                let next = counters[sp];
+                counters[sp] = next.saturating_add(1);
+                batch.put_cf(&metadata_cf, Self::REGISTRY_NEXT_INDEX_KEY,
+                             &Self::next_indices_bytes(&counters));
+                next
+            }
+            _ => 0,
+        };
+        if reg_height.is_some() && in_scope_for_index {
+            data["reg_index"] = json!(final_index);
+        } else if let Some(existing) = prior_index {
+            data["reg_index"] = json!(existing);
+        }
         batch.put_cf(&registry_cf, key.as_bytes(), data.to_string().as_bytes());
 
         // No wallet→node reverse index: wallet→node is resolved by DERIVING the id (resolve_node_id) and
@@ -8301,12 +8252,10 @@ impl Storage {
                 // FIRST stamped height, so an apply-history node and a snapshot-rebuilt node derive
                 // byte-identical rosters for every cutoff.
                 let eff_h = prior_height.unwrap_or(h);
-                let mut val = Vec::with_capacity(8 + final_wallet.len());
-                val.extend_from_slice(&eff_h.to_be_bytes());
-                val.extend_from_slice(final_wallet.as_bytes());
-                batch.put_cf(&registry_cf, ik.as_bytes(), &val);
+                batch.put_cf(&registry_cf, ik.as_bytes(),
+                             &Self::roster_index_value(eff_h, final_index, &final_wallet));
             }
-            if node_type == "light" {
+            if final_node_type == "light" {
                 let ik = format!("lrtr_{}", node_id);
                 // Height IMMUTABLE once chain-stamped (mirror the node_ row above): keep the FIRST stamped
                 // height, not a re-presented one, so the cutoff-filtered roster is byte-identical between an
@@ -8314,10 +8263,8 @@ impl Storage {
                 // lrtr_ from node_'s first-stamped reg_height). Using the raw incoming h would re-stamp
                 // H1→H2 and, for any epoch cutoff in (H1,H2], shift the per-shard counter → reward_root fork.
                 let eff_h = prior_height.unwrap_or(h);
-                let mut val = Vec::with_capacity(8 + final_wallet.len());
-                val.extend_from_slice(&eff_h.to_be_bytes());
-                val.extend_from_slice(final_wallet.as_bytes());
-                batch.put_cf(&registry_cf, ik.as_bytes(), &val);
+                batch.put_cf(&registry_cf, ik.as_bytes(),
+                             &Self::roster_index_value(eff_h, final_index, &final_wallet));
             }
         }
 
@@ -8334,7 +8281,7 @@ impl Storage {
         // re-registration subtracts the old identity and adds the new; an idempotent re-apply of the
         // same block reads back its own row (old==new) → net zero.
         if reg_height.is_some() {
-            let in_scope = node_id.starts_with("super_") || node_id.starts_with("genesis_node_") || node_type == "light";
+            let in_scope = in_scope_for_index;
             if in_scope {
                 let mut lt = self.registry_lt_load();
                 // vrf_pk_sha3 is immutable, so old-row == new-row key bytes; decode both from their
@@ -8343,13 +8290,17 @@ impl Storage {
                 if let (Some(ph), Some(p)) = (prior_height, prior.as_ref()) {
                     let pw = p["wallet"].as_str().unwrap_or("");
                     let pb = p["burn"].as_str().unwrap_or("");
+                    let pi = p["reg_index"].as_u64().unwrap_or(0) as u32;
+                    let pt = p["node_type"].as_str().unwrap_or("");
                     let prior_vrf = p["vrf_pk_sha3"].as_str()
                         .and_then(|s| hex::decode(s).ok()).unwrap_or_default();
-                    lt.remove(&crate::registry_lthash::row_lanes(node_id, pw, ph, pb, &prior_vrf));
+                    lt.remove(&crate::registry_lthash::row_lanes(node_id, pw, ph, pi, pt, pb, &prior_vrf));
                 }
                 let nh = data["reg_height"].as_u64().unwrap_or(0);
                 let nb = data["burn"].as_str().unwrap_or("");
-                lt.add(&crate::registry_lthash::row_lanes(node_id, &final_wallet, nh, nb, &final_vrf));
+                let ni = data["reg_index"].as_u64().unwrap_or(0) as u32;
+                lt.add(&crate::registry_lthash::row_lanes(
+                    node_id, &final_wallet, nh, ni, &final_node_type, nb, &final_vrf));
                 batch.put_cf(&metadata_cf, Self::REGISTRY_LT_STATE_KEY, lt.to_bytes().as_ref());
             }
         }
@@ -8379,12 +8330,8 @@ impl Storage {
             };
             if !k.starts_with(prefix) { break; }
             let node_id = match std::str::from_utf8(&k[prefix.len()..]) { Ok(s) => s, Err(_) => continue };
-            if v.len() < 8 { continue; }
-            // Value = reg_height (8B BE) ++ wallet. Cutoff applied at READ (constraint b) so inserts of
-            // newer nodes never shift the hash-shard per-shard counter (local index) of older members.
-            let h = u64::from_be_bytes(v[..8].try_into().unwrap_or([0u8; 8]));
+            let (h, _idx, wallet) = match Self::decode_roster_index_value(&v) { Some(t) => t, None => continue };
             if h >= before_height { continue; }
-            let wallet = match std::str::from_utf8(&v[8..]) { Ok(s) => s, Err(_) => continue };
             if !wallet.is_empty() { out.push((node_id.to_string(), wallet.to_string())); }
         }
         Ok(out)
@@ -8505,15 +8452,21 @@ impl Storage {
     /// before-evict keeps it complete), not the bounded in-memory cache, so the index + holder_count are
     /// complete at any holder count. Runs entirely off the state lock; clears then repopulates in bounded
     /// batches. Returns Err on a storage failure so the caller can leave the one-time marker unset for retry.
-    pub fn richlist_rebuild_from_accounts(&self) -> IntegrationResult<()> {
+    /// Returns the number of account rows SCANNED — not holders. The caller uses it to decide
+    /// whether the one-time marker may be set: a rebuild that saw an empty accounts CF (a node that
+    /// has not restored state yet) did no work, and marking it done leaves the index permanently
+    /// dependent on the incremental path alone.
+    pub fn richlist_rebuild_from_accounts(&self) -> IntegrationResult<u64> {
         use qnet_state::transaction::CANONICAL_BURN_ADDR;
         self.richlist_clear()?;
         let accounts_cf = self.persistent.db.cf_handle("accounts")
             .ok_or_else(|| IntegrationError::StorageError("accounts column family not found".to_string()))?;
         let mut batch: Vec<(String, Option<u64>)> = Vec::with_capacity(10_000);
+        let mut scanned: u64 = 0;
         let mut total: u64 = 0;
         for item in self.persistent.db.iterator_cf(&accounts_cf, rocksdb::IteratorMode::Start) {
             let (k, v) = item.map_err(|e| IntegrationError::StorageError(format!("richlist_iter_err: {}", e)))?;
+            scanned = scanned.saturating_add(1);
             let addr = match String::from_utf8(k.to_vec()) { Ok(s) => s, Err(_) => continue };
             if addr.as_str() == CANONICAL_BURN_ADDR || addr.starts_with("system_") { continue; }
             let acct: qnet_state::Account = match bincode::deserialize(&v) { Ok(a) => a, Err(_) => continue };
@@ -8529,8 +8482,10 @@ impl Storage {
             total = total.saturating_add(batch.len() as u64);
             self.richlist_reconcile(&batch)?;
         }
-        if crate::node::is_info() { println!("[INFO][RICHLIST] index_rebuilt holders={}", total); }
-        Ok(())
+        if crate::node::is_info() {
+            println!("[INFO][RICHLIST] index_rebuilt holders={} scanned={}", total, scanned);
+        }
+        Ok(scanned)
     }
 
     /// Heartbeat liveness index write (apply path). Key `lhb_{anchor_subwindow:010}_{node_id}` →
@@ -8650,7 +8605,7 @@ impl Storage {
     /// Streaming lrtr_ walk (reg_height < before_height), node_id-ascending — same rows and order as
     /// `light_roster_sorted` but O(1) memory: the reward reader at millions of light nodes must not
     /// collect the roster into a Vec on the emission path.
-    pub fn light_roster_for_each<F: FnMut(&str, &str)>(&self, before_height: u64, mut f: F) -> IntegrationResult<()> {
+    pub fn light_roster_for_each<F: FnMut(&str, &str, u32)>(&self, before_height: u64, mut f: F) -> IntegrationResult<()> {
         use rocksdb::{IteratorMode, Direction};
         let registry_cf = self.persistent.db.cf_handle("node_registry")
             .ok_or_else(|| IntegrationError::StorageError("node_registry column family not found".to_string()))?;
@@ -8664,11 +8619,9 @@ impl Storage {
             };
             if !k.starts_with(prefix) { break; }
             let node_id = match std::str::from_utf8(&k[prefix.len()..]) { Ok(s) => s, Err(_) => continue };
-            if v.len() < 8 { continue; }
-            let h = u64::from_be_bytes(v[..8].try_into().unwrap_or([0u8; 8]));
+            let (h, idx, wallet) = match Self::decode_roster_index_value(&v) { Some(t) => t, None => continue };
             if h >= before_height { continue; }
-            let wallet = match std::str::from_utf8(&v[8..]) { Ok(s) => s, Err(_) => continue };
-            if !wallet.is_empty() { f(node_id, wallet); }
+            if !wallet.is_empty() { f(node_id, wallet, idx); }
         }
         Ok(())
     }
@@ -8714,7 +8667,7 @@ impl Storage {
     /// byte-identical to `super_registrations_sorted_scan` but O(supers) without a per-entry parse.
     pub fn super_registrations_sorted(&self) -> IntegrationResult<Vec<(String, String)>> {
         let mut out: Vec<(String, String)> = Vec::new();
-        self.super_roster_for_each(|node_id, wallet, _h| out.push((node_id.to_string(), wallet.to_string())))?;
+        self.super_roster_for_each(|node_id, wallet, _h, _idx| out.push((node_id.to_string(), wallet.to_string())))?;
         Ok(out)
     }
 
@@ -8732,7 +8685,7 @@ impl Storage {
     /// membership index; the `node_` row supplies the height and the wallet.
     pub fn super_registrations_as_of(&self, up_to_height: u64) -> IntegrationResult<Vec<(String, String)>> {
         let mut out: Vec<(String, String)> = Vec::new();
-        self.super_roster_for_each(|node_id, wallet, h| {
+        self.super_roster_for_each(|node_id, wallet, h, _idx| {
             if h <= up_to_height { out.push((node_id.to_string(), wallet.to_string())); }
         })?;
         Ok(out)
@@ -8741,7 +8694,7 @@ impl Storage {
     /// One ascending pass over the `srtr_` index, yielding (node_id, wallet, reg_height) straight from
     /// the index value. The single decoder for that value — every roster reader goes through it, so the
     /// encoding can never be read two different ways.
-    fn super_roster_for_each<F: FnMut(&str, &str, u64)>(&self, mut f: F) -> IntegrationResult<()> {
+    fn super_roster_for_each<F: FnMut(&str, &str, u64, u32)>(&self, mut f: F) -> IntegrationResult<()> {
         use rocksdb::{IteratorMode, Direction};
         let registry_cf = self.persistent.db.cf_handle("node_registry")
             .ok_or_else(|| IntegrationError::StorageError("node_registry column family not found".to_string()))?;
@@ -8757,11 +8710,9 @@ impl Storage {
             };
             if !k.starts_with(prefix) { break; }
             let node_id = match std::str::from_utf8(&k[prefix.len()..]) { Ok(x) => x, Err(_) => continue };
-            if v.len() < 8 { continue; }
-            let h = u64::from_be_bytes(v[..8].try_into().unwrap_or([0u8; 8]));
-            let wallet = match std::str::from_utf8(&v[8..]) { Ok(x) => x, Err(_) => continue };
+            let (h, idx, wallet) = match Self::decode_roster_index_value(&v) { Some(t) => t, None => continue };
             if wallet.is_empty() { continue; }
-            f(node_id, wallet, h);
+            f(node_id, wallet, h, idx);
         }
         Ok(())
     }
@@ -9179,28 +9130,21 @@ impl Storage {
             let h = match parsed["reg_height"].as_u64() { Some(h) => h, None => continue }; // chain-confirmed only
             let wallet = parsed["wallet"].as_str().unwrap_or("");
             let node_type = parsed["node_type"].as_str().unwrap_or("");
+            let reg_index = parsed["reg_index"].as_u64().unwrap_or(0) as u32;
             if node_id.starts_with("super_") || node_id.starts_with("genesis_node_") {
                 let ik = format!("srtr_{}", node_id);
-                {
-                    // AUTHORITATIVE, not skip-if-present: the index value is not covered by
-                    // registry_root, so a row that arrived any other way must be overwritten from the
-                    // covered node_<id>. Same encoding as the live writer: reg_height (8B BE) ++ wallet.
-                    let mut val = Vec::with_capacity(8 + wallet.len());
-                    val.extend_from_slice(&h.to_be_bytes());
-                    val.extend_from_slice(wallet.as_bytes());
-                    batch.put_cf(&registry_cf, ik.as_bytes(), &val);
-                    added += 1;
-                }
+                // AUTHORITATIVE, not skip-if-present: the index value is not covered by
+                // registry_root, so a row that arrived any other way must be overwritten from the
+                // covered node_<id>.
+                batch.put_cf(&registry_cf, ik.as_bytes(), &Self::roster_index_value(h, reg_index, wallet));
+                added += 1;
             }
             if node_type == "light" {
                 let ik = format!("lrtr_{}", node_id);
-                if self.persistent.db.get_cf(&registry_cf, ik.as_bytes())?.is_none() {
-                    let mut val = Vec::with_capacity(8 + wallet.len());
-                    val.extend_from_slice(&h.to_be_bytes());
-                    val.extend_from_slice(wallet.as_bytes());
-                    batch.put_cf(&registry_cf, ik.as_bytes(), &val);
-                    added += 1;
-                }
+                // Was skip-if-present while srtr_ was authoritative — the asymmetry meant a stale
+                // light row survived a rebuild that healed the super rows beside it.
+                batch.put_cf(&registry_cf, ik.as_bytes(), &Self::roster_index_value(h, reg_index, wallet));
+                added += 1;
             }
         }
         if added > 0 {
@@ -9211,7 +9155,7 @@ impl Storage {
     }
 
     // ── reward aggregation scratch (10M-recipient root build) ────────────────────────────────────
-    // Key: rag_{epoch:010}_{wallet} {node_id}. One PUT per eligible node — no read-modify-write.
+    // Key: rag_{epoch:010}_{wallet}\0{node_id}. One PUT per eligible node — no read-modify-write.
     // RocksDB orders bytewise, which for these keys is exactly `BTreeMap<String, _>` order over the
     // wallet, so an ordered scan reproduces the in-memory aggregation byte-for-byte while holding
     // only one shard in RAM.
@@ -10015,32 +9959,67 @@ impl Storage {
     }
     
     /// Cleanup old attestations (older than 24 hours)
-    pub fn cleanup_old_attestations(&self, cutoff_timestamp: u64) -> IntegrationResult<u32> {
-        let att_cf = self.persistent.db.cf_handle("attestations")
-            .ok_or_else(|| IntegrationError::StorageError("attestations column family not found".to_string()))?;
-        
-        let iter = self.persistent.db.iterator_cf(&att_cf, rocksdb::IteratorMode::Start);
+    /// Bounded, resumable sweep over a column family: examine at most `SWEEP_SCAN_CAP` rows
+    /// starting from a persisted cursor, delete the ones `is_stale` rejects, and store where to
+    /// resume. An unbounded pass over a CF that grows with the network is a multi-second stall on
+    /// whatever thread called it, and it accumulates one WriteBatch for the whole result.
+    fn bounded_sweep<F>(&self, cf_name: &str, cursor_key: &[u8], is_stale: F) -> IntegrationResult<u32>
+    where
+        F: Fn(&[u8], &[u8]) -> bool,
+    {
+        /// Rows examined per call. The hourly cadence catches up on the rest.
+        const SWEEP_SCAN_CAP: usize = 100_000;
+
+        let cf = self.persistent.db.cf_handle(cf_name)
+            .ok_or_else(|| IntegrationError::StorageError(format!("{} column family not found", cf_name)))?;
+        let meta_cf = self.persistent.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
+
+        let cursor = self.persistent.db.get_cf(&meta_cf, cursor_key).ok().flatten().unwrap_or_default();
+        let mode = if cursor.is_empty() {
+            rocksdb::IteratorMode::Start
+        } else {
+            rocksdb::IteratorMode::From(&cursor, rocksdb::Direction::Forward)
+        };
+
         let mut batch = WriteBatch::default();
         let mut removed = 0u32;
-        
-        for item in iter {
+        let mut examined = 0usize;
+        let mut last_key: Option<Vec<u8>> = None;
+
+        for item in self.persistent.db.iterator_cf(&cf, mode) {
             let (key, value) = item?;
-            if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&value) {
-                let timestamp = parsed["timestamp"].as_u64().unwrap_or(0);
-                if timestamp < cutoff_timestamp {
-                    batch.delete_cf(&att_cf, &key);
-                    removed += 1;
+            examined += 1;
+            last_key = Some(key.to_vec());
+            if is_stale(&key, &value) {
+                batch.delete_cf(&cf, &key);
+                removed += 1;
+                if removed % 5000 == 0 {
+                    self.persistent.db.write(batch)?;
+                    batch = WriteBatch::default();
                 }
             }
+            if examined >= SWEEP_SCAN_CAP {
+                break;
+            }
         }
-        
-        if batch.len() > 0 {
-            self.persistent.db.write(batch)?;
-        }
-        
+
+        // Cap reached -> resume here next call; scan finished -> wrap to the start.
+        let next: Vec<u8> = if examined >= SWEEP_SCAN_CAP { last_key.unwrap_or_default() } else { Vec::new() };
+        batch.put_cf(&meta_cf, cursor_key, &next);
+        self.persistent.db.write(batch)?;
         Ok(removed)
     }
-    
+
+    pub fn cleanup_old_attestations(&self, cutoff_timestamp: u64) -> IntegrationResult<u32> {
+        self.bounded_sweep("attestations", b"sweep_attestations_cursor", |_k, v| {
+            serde_json::from_slice::<serde_json::Value>(v)
+                .ok()
+                .and_then(|p| p["timestamp"].as_u64())
+                .map_or(false, |ts| ts < cutoff_timestamp)
+        })
+    }
+
     // ═══════════════════════════════════════════════════════════════════════════
     // v3.41: EPHEMERAL DATA CLEANUP - all CFs older than 24h
     // WAL files can only be deleted when ALL CFs flush. Rarely-written CFs
@@ -10050,35 +10029,14 @@ impl Storage {
     
     /// v3.41: Cleanup old ping_history entries (older than cutoff_timestamp)
     pub fn cleanup_old_pings_all(&self, cutoff_timestamp: u64) -> IntegrationResult<u32> {
-        let ping_cf = self.persistent.db.cf_handle("ping_history")
-            .ok_or_else(|| IntegrationError::StorageError("ping_history column family not found".to_string()))?;
-        
-        let iter = self.persistent.db.iterator_cf(&ping_cf, rocksdb::IteratorMode::Start);
-        let mut batch = WriteBatch::default();
-        let mut removed = 0u32;
-        
-        for item in iter {
-            let (key, value) = item?;
-            if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&value) {
-                let timestamp = parsed["timestamp"].as_u64().unwrap_or(0);
-                if timestamp > 0 && timestamp < cutoff_timestamp {
-                    batch.delete_cf(&ping_cf, &key);
-                    removed += 1;
-                    if removed % 1000 == 0 {
-                        self.persistent.db.write(batch)?;
-                        batch = WriteBatch::default();
-                    }
-                }
-            }
-        }
-        
-        if batch.len() > 0 {
-            self.persistent.db.write(batch)?;
-        }
-        
-        Ok(removed)
+        self.bounded_sweep("ping_history", b"sweep_ping_cursor", |_k, v| {
+            serde_json::from_slice::<serde_json::Value>(v)
+                .ok()
+                .and_then(|p| p["timestamp"].as_u64())
+                .map_or(false, |ts| ts > 0 && ts < cutoff_timestamp)
+        })
     }
-    
+
     /// v3.41: Cleanup old consensus rounds (keep only recent rounds)
     /// Consensus keys: "round_{number}" — only current round needed
     pub fn cleanup_old_consensus(&self, current_round: u64, retention_rounds: u64) -> IntegrationResult<u32> {
@@ -10231,8 +10189,18 @@ impl Storage {
     pub fn run_ephemeral_cleanup(&self, current_height: u64, cutoff_timestamp: u64) -> IntegrationResult<()> {
         let start = std::time::Instant::now();
         
-        // 1. Ping history (>24h)
+        // 1. Ping history + attestations (>24h). Both live here so the compaction decision
+        //    below sees every deletion this pass made.
         let pings_removed = self.cleanup_old_pings_all(cutoff_timestamp).unwrap_or(0);
+        let att_removed = match self.cleanup_old_attestations(cutoff_timestamp) {
+            Ok(n) => n,
+            Err(e) => {
+                if crate::node::is_warn() {
+                    println!("[WARN][CLEANUP] attestations_cleanup_failed err={}", e);
+                }
+                0
+            }
+        };
         
         
         // 3. Consensus rounds — keep last 1000 rounds
@@ -10249,7 +10217,6 @@ impl Storage {
         // 6. v9.0: Prune old tx_index + tx_by_address (runs on ALL node types including Super).
         // Retention: 100,000 blocks (~28h at 1 block/sec). Explorer API queries use tx_by_address;
         // keeping ~1 day is sufficient for most wallet UIs. Historical queries → archive node.
-        const TX_INDEX_RETENTION_BLOCKS: u64 = 100_000;
         let tx_pruned = if current_height > TX_INDEX_RETENTION_BLOCKS {
             let prune_before = current_height - TX_INDEX_RETENTION_BLOCKS;
             self.prune_old_transactions(prune_before).unwrap_or(0)
@@ -10257,20 +10224,32 @@ impl Storage {
             0
         };
 
-        let total_removed = pings_removed as u64 + consensus_removed as u64
+        let total_removed = pings_removed as u64 + att_removed as u64 + consensus_removed as u64
             + failover_removed as u64 + snapshots_removed as u64 + tx_pruned;
-        
-        // 7. Trigger compaction on ALL CFs to physically reclaim disk space
-        if total_removed > 0 {
-            if let Err(e) = self.persistent.compact_all() {
+
+        // 7. Compact ONLY the CFs that were deleted from, and only once enough rows
+        //    went to justify it. Compacting every CF rewrote microblocks + merkle_nodes
+        //    (which hold no tombstones) hourly, and `cleanup_old_snapshots` always
+        //    removes at least one row so the old `total_removed > 0` guard never closed.
+        const COMPACT_MIN_ROWS: u64 = 1_000;
+        let mut dirty_cfs: Vec<&str> = Vec::new();
+        if att_removed as u64 >= COMPACT_MIN_ROWS { dirty_cfs.push("attestations"); }
+        if pings_removed as u64 >= COMPACT_MIN_ROWS { dirty_cfs.push("ping_history"); }
+        if consensus_removed as u64 >= COMPACT_MIN_ROWS { dirty_cfs.push("consensus"); }
+        if failover_removed as u64 >= COMPACT_MIN_ROWS { dirty_cfs.push("failover_events"); }
+        if tx_pruned >= COMPACT_MIN_ROWS {
+            dirty_cfs.extend_from_slice(&["transactions", "tx_index", "tx_by_address"]);
+        }
+        if !dirty_cfs.is_empty() {
+            if let Err(e) = self.persistent.compact_cfs(&dirty_cfs) {
                 println!("[WARN][CLEANUP] compaction_failed err={}", e);
             }
         }
-        
+
         let elapsed = start.elapsed();
         if total_removed > 0 {
-            println!("[INFO][CLEANUP] ephemeral_cleanup_done elapsed={:?} pings={} consensus={} failover={} snapshots={} tx_idx={} total={}",
-                     elapsed, pings_removed, consensus_removed, failover_removed, snapshots_removed, tx_pruned, total_removed);
+            println!("[INFO][CLEANUP] ephemeral_cleanup_done elapsed={:?} pings={} attestations={} consensus={} failover={} snapshots={} tx_idx={} total={}",
+                     elapsed, pings_removed, att_removed, consensus_removed, failover_removed, snapshots_removed, tx_pruned, total_removed);
         }
         
         Ok(())
@@ -11806,101 +11785,166 @@ impl Storage {
     /// Uses HashSet for O(1) lookups (was O(n) Vec::contains — quadratic on large datasets).
     /// Called from prune_old_blocks() for non-Super nodes, and from run_ephemeral_cleanup()
     /// for ALL node types (Super nodes keep blocks but prune tx indices beyond retention).
+    /// Bounded per-call prune of `transactions` / `tx_index` / `tx_by_address`.
+    ///
+    /// The two index families are pruned on INDEPENDENT criteria: `tx_index` by the block height
+    /// it stores, `tx_by_address` by the timestamp embedded in its own key
+    /// (`addr_{address}_{ts:016x}_{tx_hash}`). Deriving the address rows from the set of hashes
+    /// collected in this call would orphan every matching row outside the window — the two column
+    /// families sort on unrelated orders, and once the `tx_index` row is gone the hash can never
+    /// be rediscovered.
+    ///
+    /// Both scans resume from a persisted cursor and stop at a row cap, so one call costs O(cap)
+    /// regardless of index size. Returns the number of transactions pruned; the hourly cadence
+    /// catches up.
     pub fn prune_old_transactions(&self, prune_before_height: u64) -> IntegrationResult<u64> {
+        // A fixed row cap is a throughput bet: set it below the production rate and retention stops
+        // holding, silently, exactly when the chain gets busy. Budget instead from the work that must
+        // be done — one full sweep of each index inside the retention window — measured from RocksDB's
+        // own key estimate, with a floor so a young chain still makes progress and a ceiling so one
+        // call cannot stall the maintenance thread.
+        let runs_in_window = (TX_INDEX_RETENTION_BLOCKS / 3_600).max(1) * PRUNE_RUNS_PER_HOUR;
+        let tx_scan_cap = self.sweep_budget("tx_index", runs_in_window);
+        let addr_scan_cap = self.sweep_budget("tx_by_address", runs_in_window);
+
         let tx_cf = self.persistent.db.cf_handle("transactions")
             .ok_or_else(|| IntegrationError::StorageError("transactions column family not found".to_string()))?;
         let tx_index_cf = self.persistent.db.cf_handle("tx_index")
             .ok_or_else(|| IntegrationError::StorageError("tx_index column family not found".to_string()))?;
         let tx_by_addr_cf = self.persistent.db.cf_handle("tx_by_address")
             .ok_or_else(|| IntegrationError::StorageError("tx_by_address column family not found".to_string()))?;
+        let meta_cf = self.persistent.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
+
+        let read_cursor = |k: &[u8]| -> Vec<u8> {
+            self.persistent.db.get_cf(&meta_cf, k).ok().flatten().unwrap_or_default()
+        };
 
         let mut batch = WriteBatch::default();
         let mut pruned_count: u64 = 0;
-        // v9.0: Use HashSet for O(1) membership test (was Vec::contains = O(n))
-        let mut tx_hashes_to_prune: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-        // Step 1: Find transactions in blocks before prune_before_height using tx_index
-        let iter = self.persistent.db.iterator_cf(&tx_index_cf, rocksdb::IteratorMode::Start);
-        for item in iter {
+        // ── transactions + tx_index, by stored block height ──
+        let tx_cursor = read_cursor(b"prune_tx_index_cursor");
+        let tx_mode = if tx_cursor.is_empty() {
+            rocksdb::IteratorMode::Start
+        } else {
+            rocksdb::IteratorMode::From(&tx_cursor, rocksdb::Direction::Forward)
+        };
+        let mut examined = 0usize;
+        let mut last_tx_key: Option<Vec<u8>> = None;
+        for item in self.persistent.db.iterator_cf(&tx_index_cf, tx_mode) {
             let (key, value) = item?;
-
-            // tx_index stores: tx_hash -> block_height (8 bytes BE)
+            examined += 1;
+            last_tx_key = Some(key.to_vec());
             if value.len() >= 8 {
                 let block_height = u64::from_be_bytes(value[..8].try_into().unwrap_or([0u8; 8]));
-
                 if block_height < prune_before_height {
-                    let tx_key = String::from_utf8_lossy(&key).to_string();
-                    tx_hashes_to_prune.insert(tx_key);
-                }
-            }
-        }
-
-        if tx_hashes_to_prune.is_empty() {
-            return Ok(0);
-        }
-
-        // Step 2: Delete transactions and their indices
-        for tx_key in &tx_hashes_to_prune {
-            batch.delete_cf(&tx_cf, tx_key.as_bytes());
-            batch.delete_cf(&tx_index_cf, tx_key.as_bytes());
-
-            pruned_count += 1;
-
-            // Apply batch every 5000 transactions to limit memory
-            if pruned_count % 5000 == 0 {
-                self.persistent.db.write(batch)?;
-                batch = WriteBatch::default();
-                if crate::node::is_info() {
-                    println!("[INFO][PRUNE] tx_progress count={}", pruned_count);
-                }
-            }
-        }
-
-        // Step 3: Clean up tx_by_address index
-        // Key format: addr_{address}_{timestamp_hex}_{tx_hash}
-        // v9.0: O(1) HashSet lookup per entry instead of O(n) Vec::contains
-        let addr_iter = self.persistent.db.iterator_cf(&tx_by_addr_cf, rocksdb::IteratorMode::Start);
-        let mut addr_pruned: u64 = 0;
-
-        for item in addr_iter {
-            let (key, _value) = item?;
-            let key_str = String::from_utf8_lossy(&key);
-
-            // Extract tx_hash from last segment of key
-            if let Some(tx_hash) = key_str.rsplit('_').next() {
-                let tx_key = format!("tx_{}", tx_hash);
-                if tx_hashes_to_prune.contains(&tx_key) {
-                    batch.delete_cf(&tx_by_addr_cf, &key);
-                    addr_pruned += 1;
-
-                    if addr_pruned % 5000 == 0 {
+                    batch.delete_cf(&tx_cf, &key);
+                    batch.delete_cf(&tx_index_cf, &key);
+                    pruned_count += 1;
+                    if pruned_count % 5000 == 0 {
                         self.persistent.db.write(batch)?;
                         batch = WriteBatch::default();
                     }
                 }
             }
+            if examined >= tx_scan_cap {
+                break;
+            }
         }
+        // Cap reached → resume here next call; scan finished → wrap to the start.
+        let next_tx_cursor: Vec<u8> = if examined >= tx_scan_cap {
+            last_tx_key.unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        batch.put_cf(&meta_cf, b"prune_tx_index_cursor", &next_tx_cursor);
 
-        // Apply remaining batch
+        // ── tx_by_address, by the inclusion HEIGHT in its own key ──
+        // Scanned independently of tx_index (the two families sort on unrelated orders, so deriving
+        // one from the other orphans rows), but cut on the SAME height rule. The key used to carry
+        // `tx.timestamp`, which the sender picks: one row stamped in the future was unreachable by
+        // any prune, forever.
+
+        let addr_cursor = read_cursor(b"prune_addr_cursor");
+        let addr_mode = if addr_cursor.is_empty() {
+            rocksdb::IteratorMode::Start
+        } else {
+            rocksdb::IteratorMode::From(&addr_cursor, rocksdb::Direction::Forward)
+        };
+        let mut addr_examined = 0usize;
+        let mut addr_pruned: u64 = 0;
+        let mut addr_unparsed: u64 = 0;
+        let mut last_addr_key: Option<Vec<u8>> = None;
+        for item in self.persistent.db.iterator_cf(&tx_by_addr_cf, addr_mode) {
+            let (key, _value) = item?;
+            addr_examined += 1;
+            last_addr_key = Some(key.to_vec());
+            match Self::addr_index_height(&key) {
+                Some(h) if h < prune_before_height => {
+                    batch.delete_cf(&tx_by_addr_cf, &key);
+                    addr_pruned += 1;
+                    if addr_pruned % 5000 == 0 {
+                        self.persistent.db.write(batch)?;
+                        batch = WriteBatch::default();
+                    }
+                }
+                Some(_) => {}
+                // Not a key this writer produces. Never deleted on a guess (a parse miss is not
+                // evidence of age), but counted so corruption is visible instead of silent.
+                None => addr_unparsed += 1,
+            }
+            if addr_examined >= addr_scan_cap {
+                break;
+            }
+        }
+        let next_addr_cursor: Vec<u8> = if addr_examined >= addr_scan_cap {
+            last_addr_key.unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        batch.put_cf(&meta_cf, b"prune_addr_cursor", &next_addr_cursor);
+
         if !batch.is_empty() {
             self.persistent.db.write(batch)?;
         }
 
-        // Force compaction on transaction CFs to reclaim space
-        if pruned_count > 0 {
-            self.persistent.db.compact_range_cf(&tx_cf, None::<&[u8]>, None::<&[u8]>);
-            self.persistent.db.compact_range_cf(&tx_index_cf, None::<&[u8]>, None::<&[u8]>);
-            self.persistent.db.compact_range_cf(&tx_by_addr_cf, None::<&[u8]>, None::<&[u8]>);
-
-            if crate::node::is_info() {
-                println!("[INFO][PRUNE] tx_done txs={} addr_entries={} before_h={}",
-                         pruned_count, addr_pruned, prune_before_height);
-            }
+        if addr_unparsed > 0 {
+            println!("[WARN][PRUNE] addr_index_unparsed rows={} action=retained", addr_unparsed);
         }
-        
+        if (pruned_count > 0 || addr_pruned > 0) && crate::node::is_info() {
+            println!("[INFO][PRUNE] tx_done txs={} addr_entries={} before_h={} tx_scanned={}/{} addr_scanned={}/{}",
+                     pruned_count, addr_pruned, prune_before_height,
+                     examined, tx_scan_cap, addr_examined, addr_scan_cap);
+        }
+
         Ok(pruned_count)
     }
-    
+
+    /// Inclusion height embedded in a `tx_by_address` key: `addr_{address}_{height:016x}_{tx_hash}`.
+    /// The address itself may contain `_`, so the field is located from the RIGHT.
+    fn addr_index_height(key: &[u8]) -> Option<u64> {
+        let s = std::str::from_utf8(key).ok()?;
+        let mut parts = s.rsplitn(3, '_');
+        let _tx_hash = parts.next()?;
+        let h_hex = parts.next()?;
+        u64::from_str_radix(h_hex, 16).ok()
+    }
+
+    /// Rows one maintenance pass may examine in a column family so that `runs_in_window` passes
+    /// sweep all of it. Uses RocksDB's own key estimate, so the budget tracks real load instead of
+    /// a number someone picked once. Floor: a young index still drains. Ceiling: one pass stays short
+    /// enough that the hourly maintenance thread never becomes the bottleneck.
+    fn sweep_budget(&self, cf_name: &str, runs_in_window: u64) -> usize {
+        const MIN_SWEEP: usize = 50_000;
+        const MAX_SWEEP: usize = 5_000_000;
+        let est = self.persistent.db.cf_handle(cf_name)
+            .and_then(|cf| self.persistent.db.property_int_value_cf(&cf, "rocksdb.estimate-num-keys").ok().flatten())
+            .unwrap_or(0);
+        let needed = (est / runs_in_window.max(1)) as usize;
+        needed.clamp(MIN_SWEEP, MAX_SWEEP)
+    }
+
     /// DEPRECATED — legacy "headers-only" Light pruning pass.
     ///
     /// Current Light tier (v3.18+) is a pure mobile API client with
@@ -12123,6 +12167,107 @@ impl Storage {
     /// binder (verify_snapshot_consensus_binding) so the two can never drift. ~2 weeks at 1 blk/s ⇒ realistic
     /// binary-WS-pin rotation cadence; a fresh GALC capsule normally keeps the real walk ≈ 0.
     const SNAPSHOT_MAX_WS_WALK_MB: u64 = 13_440;
+
+    /// Committee signatures are the bulk of a macroblock — 2f+1 ML-DSA-65 envelopes, ~3 MB at the
+    /// 1000-member target committee, against a few KB for everything else. They are read ONLY by
+    /// `verify_v2_macroblock`, which runs at INGEST; every reader of a STORED macroblock takes the
+    /// checkpoint half (reward roots, total_supply, registry_root, recovery anchor). So the sigs are
+    /// needed exactly as long as a cold joiner may still walk to this index — the binder budget below
+    /// — plus margin for tip skew between joiner and server and the walk's one-below descent.
+    ///
+    /// Without this, macroblock storage on a Super (which prunes nothing) grows ~1 TB/year at target
+    /// scale and has no horizon at all. Stripping is fork-free by construction: `MacroBlock::hash()`
+    /// excludes consensus_data, and `sig_merkle_root` stays, so the removed set is still committed.
+    const QC_SIG_RETENTION_MB: u64 = Self::SNAPSHOT_MAX_WS_WALK_MB + 1_440;
+
+    /// Strip committee signatures from macroblocks whose index is below the retention horizon, keeping
+    /// the checkpoint, the signer list and `sig_merkle_root`. Bounded and resumable: the cursor is the
+    /// highest index already swept, so runs form one monotone forward sweep and never re-read the tail.
+    /// Absent indices (a snapshot-joined node holds none below its anchor) advance the cursor for free.
+    /// Returns how many macroblocks were rewritten.
+    pub fn strip_macroblock_qc_sigs(&self) -> IntegrationResult<u64> {
+        /// Indices looked at per call. A miss is one bloom-filter probe, so this may be large — it is
+        /// what lets a snapshot-joined node sweep past its empty pre-anchor range in a few runs.
+        const EXAMINE_CAP: u64 = 50_000;
+        /// Macroblocks rewritten per call: the real work bound (decode + re-serialize + write).
+        const REWRITE_CAP: u64 = 512;
+
+        let tip_mb = self.get_chain_height()?.saturating_div(90);
+        let floor = match tip_mb.checked_sub(Self::QC_SIG_RETENTION_MB) {
+            Some(f) if f > 0 => f,
+            _ => return Ok(0), // young chain: nothing is outside the walk budget yet
+        };
+
+        let micro_cf = self.persistent.db.cf_handle("microblocks")
+            .ok_or_else(|| IntegrationError::StorageError("microblocks column family not found".to_string()))?;
+        let meta_cf = self.persistent.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
+
+        let mut swept = self.persistent.db.get_cf(&meta_cf, b"qc_sig_strip_cursor")?
+            .filter(|v| v.len() == 8)
+            .map(|v| u64::from_be_bytes(v[..8].try_into().unwrap_or([0u8; 8])))
+            .unwrap_or(0);
+
+        let mut batch = WriteBatch::default();
+        let mut rewritten: u64 = 0;
+        let mut examined: u64 = 0;
+        while swept < floor && examined < EXAMINE_CAP && rewritten < REWRITE_CAP {
+            let index = swept + 1;
+            examined += 1;
+            swept = index;
+            let key = format!("macroblock_{}", index);
+            let raw = match self.persistent.db.get_cf(&micro_cf, key.as_bytes())? {
+                Some(r) if !r.is_empty() => r,
+                _ => continue,
+            };
+            // Stored macroblocks may be zstd-framed; re-store in the SAME framing so no reader has to
+            // learn a new one.
+            let compressed = raw.len() >= 4 && raw[0..4] == [0x28, 0xb5, 0x2f, 0xfd];
+            let plain = if compressed {
+                match zstd::decode_all(&raw[..]) { Ok(d) => d, Err(_) => continue }
+            } else {
+                raw
+            };
+            let mut mb: qnet_state::MacroBlock = match bincode::deserialize(&plain) {
+                Ok(m) => m,
+                Err(_) => continue, // unreadable row: leave it exactly as found, never destroy
+            };
+            let qc_bytes = match mb.consensus_data.checkpoint_qc.as_ref() { Some(b) => b, None => continue };
+            let (cp, mut qc): (qnet_consensus::checkpoint_bft::Checkpoint,
+                               qnet_consensus::checkpoint_bft::QuorumCertificate) =
+                match bincode::deserialize(qc_bytes) { Ok(v) => v, Err(_) => continue };
+            if qc.sigs.is_empty() { continue; }
+            qc.sigs = Vec::new();
+            let restripped = match bincode::serialize(&(cp, qc)) { Ok(b) => b, Err(_) => continue };
+            mb.consensus_data.checkpoint_qc = Some(restripped);
+            let reserialized = match bincode::serialize(&mb) { Ok(b) => b, Err(_) => continue };
+            let out = if compressed {
+                match zstd::encode_all(&reserialized[..], 3) { Ok(c) => c, Err(_) => continue }
+            } else {
+                reserialized
+            };
+            batch.put_cf(&micro_cf, key.as_bytes(), &out);
+            rewritten += 1;
+        }
+
+        batch.put_cf(&meta_cf, b"qc_sig_strip_cursor", &swept.to_be_bytes());
+        self.persistent.db.write(batch)?;
+        if rewritten > 0 && crate::node::is_info() {
+            println!("[INFO][STORAGE] qc_sigs_stripped count={} up_to={} floor={}", rewritten, swept, floor);
+        }
+        Ok(rewritten)
+    }
+
+    /// True iff this stored macroblock still carries its committee signatures. A stripped one is
+    /// useless to a syncing peer: `verify_v2_macroblock` would read the empty set as an invalid QC and
+    /// score the honest server as byzantine, so the sync path serves it as ABSENT instead.
+    pub fn macroblock_carries_qc_sigs(mb: &qnet_state::MacroBlock) -> bool {
+        mb.consensus_data.checkpoint_qc.as_ref().map_or(false, |b| {
+            bincode::deserialize::<(qnet_consensus::checkpoint_bft::Checkpoint,
+                                    qnet_consensus::checkpoint_bft::QuorumCertificate)>(b)
+                .map_or(false, |(_, qc)| !qc.sigs.is_empty())
+        })
+    }
 
     /// Highest macroblock index contiguously present at/above the apply frontier (chain_height/90). Present
     /// ⟹ inductively QC-verified (stored only after verify_v2). SINGLE SOURCE for the selection ceiling AND
@@ -13787,6 +13932,111 @@ mod v32_9_pattern_c_tests {
         storage.persistent.db.put_cf(&cf, key, value).expect("put");
     }
 
+    /// A macroblock carrying a QC, stored at `index`, so the strip sweep has something to find.
+    fn put_macroblock_with_qc(storage: &Storage, index: u64, sigs: usize) {
+        use qnet_consensus::checkpoint_bft::{Checkpoint, QuorumCertificate};
+        let cp = Checkpoint {
+            index,
+            parent_qc: None,
+            window_head_height: index * 90,
+            window_mb_hashes: vec![[7u8; 32]],
+            state_root: [0xab; 32],
+            beacon: [0u8; 32],
+            epoch_commitment: [0u8; 32],
+            reward_root: [0u8; 32],
+            registry_root: [0u8; 32],
+            logs_root: [0u8; 32],
+            dilithium_pk_root: [0u8; 32],
+            reward_epoch_root: [0u8; 32],
+            total_supply: 0,
+            timestamp: 0,
+            proposer: "super_0000".to_string(),
+            proposer_sig: Vec::new(),
+            recovery_anchor: None,
+        };
+        let qc = QuorumCertificate {
+            checkpoint_hash: cp.hash(),
+            index,
+            signers: (0..sigs).map(|i| format!("super_{:04}", i)).collect(),
+            sig_merkle_root: [0xcd; 32],
+            sigs: (0..sigs).map(|i| vec![i as u8; 3309]).collect(),
+        };
+        let mut cd = qnet_state::ConsensusData::default();
+        cd.checkpoint_qc = Some(bincode::serialize(&(cp, qc)).unwrap());
+        let mb = qnet_state::MacroBlock::new(index * 90, 0, [0u8; 32], vec![[7u8; 32]], [1u8; 32], cd);
+        let cf = storage.persistent.db.cf_handle("microblocks").expect("microblocks CF");
+        storage.persistent.db
+            .put_cf(&cf, format!("macroblock_{}", index).as_bytes(), bincode::serialize(&mb).unwrap())
+            .expect("put");
+    }
+
+    fn load_mb(storage: &Storage, index: u64) -> qnet_state::MacroBlock {
+        let cf = storage.persistent.db.cf_handle("microblocks").expect("microblocks CF");
+        let raw = storage.persistent.db
+            .get_cf(&cf, format!("macroblock_{}", index).as_bytes()).unwrap().expect("row");
+        bincode::deserialize(&raw).expect("decode")
+    }
+
+    /// Signatures below the horizon go; the checkpoint half, the signer list and sig_merkle_root stay —
+    /// they are what every stored reader and the RPC proof endpoint need. Above the horizon nothing is
+    /// touched, or a cold joiner inside the walk budget could not verify.
+    #[test]
+    fn qc_sig_strip_drops_only_signatures_below_the_horizon() {
+        let (storage, _dir) = open_test_storage();
+        let retention = Storage::QC_SIG_RETENTION_MB;
+        let tip_mb = retention + 100;
+        storage.set_chain_height(tip_mb * 90).expect("height");
+        put_macroblock_with_qc(&storage, 1, 4);          // far below the floor
+        put_macroblock_with_qc(&storage, tip_mb - 1, 4); // inside the walk budget
+
+        let before = load_mb(&storage, 1);
+        let mut swept = 0u64;
+        for _ in 0..8 { swept += storage.strip_macroblock_qc_sigs().expect("strip"); }
+        assert_eq!(swept, 1, "exactly the one macroblock below the floor is rewritten");
+
+        let after = load_mb(&storage, 1);
+        assert!(!Storage::macroblock_carries_qc_sigs(&after), "signatures gone below the floor");
+        assert_eq!(after.hash(), before.hash(),
+                   "MacroBlock::hash() excludes consensus_data, so stripping must move no hash");
+        let (cp, qc): (qnet_consensus::checkpoint_bft::Checkpoint,
+                       qnet_consensus::checkpoint_bft::QuorumCertificate) =
+            bincode::deserialize(after.consensus_data.checkpoint_qc.as_ref().unwrap()).expect("decode");
+        assert_eq!(cp.state_root, [0xab; 32], "the checkpoint half every stored reader uses survives");
+        assert_eq!(cp.hash(), qc.checkpoint_hash, "the QC still binds its checkpoint");
+        assert_eq!(qc.signers.len(), 4, "signers stay: the proof endpoint resolves keys from them");
+        assert_eq!(qc.sig_merkle_root, [0xcd; 32], "the removed set is still committed");
+
+        assert!(Storage::macroblock_carries_qc_sigs(&load_mb(&storage, tip_mb - 1)),
+                "a macroblock inside the walk budget keeps its signatures");
+    }
+
+    /// The sweep is monotone: re-running it costs nothing and rewrites nothing, so the hourly cadence
+    /// cannot re-serialize the whole archive every pass.
+    #[test]
+    fn qc_sig_strip_is_monotone_and_idempotent() {
+        let (storage, _dir) = open_test_storage();
+        let tip_mb = Storage::QC_SIG_RETENTION_MB + 10;
+        storage.set_chain_height(tip_mb * 90).expect("height");
+        put_macroblock_with_qc(&storage, 2, 3);
+        let mut first = 0u64;
+        for _ in 0..8 { first += storage.strip_macroblock_qc_sigs().expect("strip"); }
+        assert_eq!(first, 1);
+        for _ in 0..8 {
+            assert_eq!(storage.strip_macroblock_qc_sigs().expect("strip"), 0,
+                       "a swept range is never revisited");
+        }
+    }
+
+    /// A young chain has nothing outside the walk budget — the sweep must be a no-op, not a wipe.
+    #[test]
+    fn qc_sig_strip_is_inert_before_the_horizon() {
+        let (storage, _dir) = open_test_storage();
+        storage.set_chain_height(90 * 100).expect("height");
+        put_macroblock_with_qc(&storage, 1, 3);
+        assert_eq!(storage.strip_macroblock_qc_sigs().expect("strip"), 0);
+        assert!(Storage::macroblock_carries_qc_sigs(&load_mb(&storage, 1)));
+    }
+
     #[test]
     fn canonical_root_is_deterministic() {
         let (storage, _dir) = open_test_storage();
@@ -14383,6 +14633,137 @@ mod v32_9_pattern_c_tests {
             s2.save_node_registration_at_height_burn(&la, "light", "walletL", 1.0, 60, "burnL").unwrap();
             s2.compute_lt_state(u64::MAX).unwrap().root()
         }, "post-prune roster == a from-genesis node with only the canonical registrations");
+    }
+
+    /// THE point of reg_index. Under the old rule bit `i` was the `i`-th node in a roster SCAN, so
+    /// removing one row shifted every later node's bit — the bitmap was then read at the wrong
+    /// offsets and paid a DIFFERENT set, not a smaller one. Indexed by reg_index nothing moves.
+    #[test]
+    fn removing_a_roster_row_shifts_no_other_bit() {
+        let (st, _d) = open_test_storage();
+        let mut ids: Vec<String> = Vec::new();
+        for i in 0..10u64 {
+            let w = format!("wl{}", i);
+            let id = crate::rpc::generate_light_node_pseudonym(&w);
+            st.save_node_registration_at_height_burn(&id, "light", &w, 1.0, 10 + i, "b").unwrap();
+            ids.push(id);
+        }
+
+        let snapshot = |st: &Storage| -> std::collections::BTreeMap<String, u32> {
+            let mut m = std::collections::BTreeMap::new();
+            st.light_roster_for_each(u64::MAX, |id, _w, idx| { m.insert(id.to_string(), idx); }).unwrap();
+            m
+        };
+
+        let before = snapshot(&st);
+        assert_eq!(before.len(), 10, "all ten in the roster");
+
+        // Drop the third registration exactly as a reorg prune does.
+        let victim = ids[2].clone();
+        let cf = st.persistent.db.cf_handle("node_registry").unwrap();
+        st.persistent.db.delete_cf(&cf, format!("lrtr_{}", victim).as_bytes()).unwrap();
+        st.persistent.db.delete_cf(&cf, format!("node_{}", victim).as_bytes()).unwrap();
+
+        let after = snapshot(&st);
+        assert_eq!(after.len(), 9, "only the removed node is gone");
+        assert!(!after.contains_key(&victim));
+        for (id, idx) in before.iter() {
+            if id == &victim { continue; }
+            assert_eq!(after.get(id), Some(idx),
+                       "bit position of {} moved after an unrelated removal", id);
+        }
+    }
+
+    /// reg_index is the row's RANK in canonical (reg_height, node_id) order. Pinning it here means a
+    /// future change that reintroduces an arrival counter fails loudly instead of forking the root
+    /// only on nodes that happened to apply out of order.
+    #[test]
+    fn reg_index_is_canonical_rank_regardless_of_apply_order() {
+        let ids: Vec<(String, u64)> = vec![
+            (crate::rpc::generate_super_node_pseudonym("w1"), 10),
+            (crate::rpc::generate_super_node_pseudonym("w2"), 20),
+            (crate::rpc::generate_super_node_pseudonym("w3"), 30),
+        ];
+        let root_of = |order: &[usize]| -> [u8; 32] {
+            let (st, _d) = open_test_storage();
+            for &i in order {
+                let (id, h) = &ids[i];
+                st.save_node_registration_at_height_burn(id, "super", &format!("w{}", i + 1), 1.0, *h, "b").unwrap();
+            }
+            // Rebuild is the canonicalising pass; a node that applied in order must match one that did not.
+            st.rebuild_registry_lthash(u64::MAX).unwrap();
+            st.compute_lt_state(u64::MAX).unwrap().root()
+        };
+        assert_eq!(root_of(&[0, 1, 2]), root_of(&[2, 0, 1]),
+                   "registry_root must not depend on the order registrations were applied");
+        assert_eq!(root_of(&[0, 1, 2]), root_of(&[2, 1, 0]));
+    }
+
+    /// The live stamp and the rebuild must agree WITHOUT a rebuild having run — that is the whole
+    /// point of reg_index. The prior test compared rebuild against rebuild, so it could not see this:
+    /// two registrations in ONE block are ranked by node_id, while transaction order is arbitrary, so
+    /// stamping in arrival order made every restart renumber and move registry_root.
+    #[test]
+    fn live_reg_index_equals_the_rebuild_rank_within_one_block() {
+        // One block ⇒ one reg_height for every row; the rank is then node_id alone.
+        const H: u64 = 77;
+        let mut rows: Vec<(String, String, String, String, String)> = (1..=4)
+            .map(|i| {
+                let w = format!("w{}", i);
+                (crate::rpc::generate_super_node_pseudonym(&w), "super".to_string(), w,
+                 format!("burn{}", i), String::new())
+            })
+            .collect();
+
+        let write_in = |order: &[(String, String, String, String, String)]| -> Storage {
+            let (st, dir) = open_test_storage();
+            std::mem::forget(dir); // the temp dir must outlive the returned handle
+            for (id, ty, w, b, _) in order {
+                st.save_node_registration_at_height_burn(id, ty, w, 1.0, H, b).unwrap();
+            }
+            st
+        };
+
+        // Deliberately NOT node_id order — this is what a block's transaction order looks like.
+        let mut arrival = rows.clone();
+        arrival.reverse();
+        let st_arrival = write_in(&arrival);
+        let live_arrival = st_arrival.compute_lt_state(u64::MAX).unwrap().root();
+
+        // The rule the producer, the validator drain and the genesis apply all go through.
+        crate::node::BlockchainNode::sort_registrations_canonically(&mut rows);
+        let st_canon = write_in(&rows);
+        let live_canon = st_canon.compute_lt_state(u64::MAX).unwrap().root();
+
+        // What a restarted / reorged node computes from the same surviving set.
+        st_canon.rebuild_registry_lthash(u64::MAX).unwrap();
+        let rebuilt = st_canon.compute_lt_state(u64::MAX).unwrap().root();
+
+        assert_eq!(live_canon, rebuilt,
+                   "a canonically stamped block must survive a restart with the same registry_root");
+        assert_ne!(live_arrival, rebuilt,
+                   "arrival order really does diverge — without the sort this test is vacuous");
+
+        // And the repair still works: the arrival-ordered node rejoins the network's numbering.
+        st_arrival.rebuild_registry_lthash(u64::MAX).unwrap();
+        assert_eq!(st_arrival.compute_lt_state(u64::MAX).unwrap().root(), rebuilt,
+                   "the rebuild must put a divergent node back on the canonical numbering");
+    }
+
+    /// node_type is hashed AND frozen. It decides light-roster membership at backfill, and it was the
+    /// one identity field an RPC-cache write could rebind with a peer-supplied value.
+    #[test]
+    fn node_type_is_frozen_after_chain_stamp() {
+        let (st, _d) = open_test_storage();
+        let id = crate::rpc::generate_super_node_pseudonym("wS");
+        st.save_node_registration_at_height_burn(&id, "super", "wS", 1.0, 50, "bS").unwrap();
+        let before = st.compute_lt_state(u64::MAX).unwrap().root();
+        // An un-stamped (RPC-cache) write claiming a different type must not rebind it.
+        st.save_node_registration(&id, "light", "wS", 1.0).unwrap();
+        assert_eq!(st.compute_lt_state(u64::MAX).unwrap().root(), before,
+                   "an RPC-cache write must not move registry_root");
+        assert!(st.light_roster_sorted(1000).unwrap().is_empty(),
+                "a super must not appear in the light roster after a type-flip attempt");
     }
 
     #[test]
@@ -15185,5 +15566,27 @@ mod tests_storage_format_gate {
         }
         let err = Storage::new(&path);
         assert!(err.is_err(), "a populated store with no format marker must refuse to open");
+    }
+}
+
+#[cfg(test)]
+mod tests_prune_addr_index {
+    use super::*;
+
+    /// `tx_by_address` keys are `addr_{address}_{ts:016x}_{tx_hash}`, and a QNet address itself
+    /// contains no delimiter guarantee — the timestamp must be located from the RIGHT or the
+    /// prune reads garbage and either spares everything or deletes live rows.
+    #[test]
+    fn addr_index_height_is_parsed_from_the_right() {
+        let key = format!("addr_{}_{:016x}_{}", "abc123def", 1_786_600u64, "f00dbabe");
+        assert_eq!(Storage::addr_index_height(key.as_bytes()), Some(1_786_600));
+
+        // An address carrying underscores must not shift the field.
+        let odd = format!("addr_{}_{:016x}_{}", "node_registry_alias", 42u64, "deadbeef");
+        assert_eq!(Storage::addr_index_height(odd.as_bytes()), Some(42));
+
+        // Malformed rows are skipped, never treated as height 0 (which would delete them).
+        assert_eq!(Storage::addr_index_height(b"addr_only"), None);
+        assert_eq!(Storage::addr_index_height(b"addr_x_zzzz_hash"), None);
     }
 }

@@ -343,18 +343,24 @@ export function sampleCommittee(sortedCandidates, window, seedHex, threshold = C
   return scored.map((s) => sortedCandidates[s.i]);
 }
 
-// ── 5a. LtHash per-row lane vector (byte-exact registry_lthash.rs::row_lanes) ─
+// ── 5a. LtHash per-row lane vector (byte-exact registry_lthash.rs::row_lanes, v4) ─
 // vrfPkSha3 is the hex of sha3-256(consensus_pubkey); light/keyless rows pass ''.
 export function ltHashRowLanes(entry) {
   const vrfBytes = hexToBytes(entry.vrf_pk_sha3 || '');
   const nodeId = utf8(entry.node_id);
   const wallet = utf8(entry.wallet);
   const burn = utf8(entry.burn || '');
+  const nodeType = utf8(entry.node_type || '');
+  // v4: reg_index (4-byte LE, NO length prefix — it mirrors reg_height) and a length-prefixed
+  // node_type. reg_index is the node's permanent bitmap ordinal; node_type decides light-roster
+  // membership, and without it in the preimage a flipped type folded to the SAME root.
   const seedHex = sha3_256(concat([
-    utf8('qnet-registry-row-v3'),
+    utf8('qnet-registry-row-v4'),
     u32le(nodeId.length), nodeId,
     u32le(wallet.length), wallet,
     u64le(entry.reg_height),
+    u32le(entry.reg_index || 0),
+    u32le(nodeType.length), nodeType,
     u32le(burn.length), burn,
     u32le(vrfBytes.length), vrfBytes,
   ]));

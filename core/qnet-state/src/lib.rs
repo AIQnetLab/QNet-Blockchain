@@ -34,7 +34,6 @@ pub use state::{should_credit_fees, clear_credited_fees_cache, credited_fees_cou
 // v3.39: Block-level snapshot for state_root mismatch recovery
 pub use state::BlockSnapshot;
 // v7.0: Fork gate for pending_rewards in Merkle hash
-pub use state::{activate_pending_rewards_in_merkle, is_pending_rewards_in_merkle, reset_pending_rewards_in_merkle};
 // v15.10 STAGE-2: read-through fallback trait for disk-backed accounts
 pub use state::AccountStore;
 // Read-through disk-backed node store for the merkle tree (default-off seam).

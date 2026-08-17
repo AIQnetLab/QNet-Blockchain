@@ -9,11 +9,13 @@ const { sha3_256 } = require('js-sha3');
 const { resolvePubkeys, recomputeRegistryRoot, quorumSize } = require('../src/crypto/QcLightClient');
 
 // A registry row binds a node to a pubkey by sha3(pk); the root is the LtHash over the rows.
-function entry(nodeId, pkHex, regHeight = 90) {
+function entry(nodeId, pkHex, regHeight = 90, regIndex = 0) {
   return {
     node_id: nodeId,
     wallet: 'w_' + nodeId,
     reg_height: regHeight,
+    reg_index: regIndex,
+    node_type: 'super',
     burn: '',
     vrf_pk_sha3: sha3_256(Buffer.from(pkHex, 'hex')),
   };
@@ -23,8 +25,8 @@ const COMMITTEE = ['n1', 'n2', 'n3', 'n4', 'n5'];
 const HONEST = Object.fromEntries(COMMITTEE.map((id, i) => [id, (String(i + 1).repeat(2)).repeat(16)]));
 const FORGED = Object.fromEntries(COMMITTEE.map((id, i) => [id, (String(9 - i).repeat(2)).repeat(16)]));
 
-const honestEntries = COMMITTEE.map((id) => entry(id, HONEST[id]));
-const forgedEntries = COMMITTEE.map((id) => entry(id, FORGED[id]));
+const honestEntries = COMMITTEE.map((id, i) => entry(id, HONEST[id], 90, i));
+const forgedEntries = COMMITTEE.map((id, i) => entry(id, FORGED[id], 90, i));
 const HONEST_ROOT = recomputeRegistryRoot(honestEntries);
 const FORGED_ROOT = recomputeRegistryRoot(forgedEntries);
 

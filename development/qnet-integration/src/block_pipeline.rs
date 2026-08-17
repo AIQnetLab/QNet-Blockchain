@@ -42,7 +42,6 @@ use crate::storage::Storage;
 use crate::consensus_state::{CoordinatorHandle, ConsensusEvent};
 use crate::node::{is_info, is_warn, is_debug, BlockchainNode};
 use crate::unified_p2p::SimplifiedP2P;
-use qnet_consensus::lazy_rewards::PhaseAwareRewardManager;
 
 // ============================================================================
 // v14.7.2: FORK RECOVERY SIGNAL (macroblock-divergence only)
@@ -204,16 +203,16 @@ pub(crate) fn signal_fork_recovery(target: u64) {
 ///      producer self-signing a sibling for a height it does not own is an equivocation/hijack — it must
 ///      NOT win a sig tie-break (that was the reorg-DoS: any registered node could grind a lower sig and
 ///      force a wasteful rollback);
-///   3. Sha3(incoming.sig) < Sha3(our.sig) — deterministic single winner (no oscillation);
+///   3. incoming.hash() < our.hash() — deterministic single winner. Keyed on the BLOCK HASH, not the
+///      signature: ML-DSA signatures are randomized, so a producer could re-sign the same block to
+///      shift a Sha3(sig) tie-break at will; block.hash() excludes the signature, so it cannot be
+///      ground, and two byte-identical blocks have one hash (nothing to tie-break);
 ///   4. incoming is VALIDLY producer-signed — closes signature-grinding (attacker has no producer key).
 /// Byte-identical rule at every pre-verify fork-choice site so fork-choice is one network-wide function.
-fn equal_round_selffork_supersedes(storage: &Storage, incoming: &qnet_state::MicroBlock, our: Option<(&str, &[u8])>) -> bool {
-    let (our_producer, our_sig) = match our { Some(t) => t, None => return false };
+fn equal_round_selffork_supersedes(storage: &Storage, incoming: &qnet_state::MicroBlock, our: Option<(&str, [u8; 32])>) -> bool {
+    let (our_producer, our_hash) = match our { Some(t) => t, None => return false };
     if incoming.producer != our_producer { return false; }
-    use sha3::Digest;
-    if sha3::Sha3_256::digest(&incoming.signature).as_slice() >= sha3::Sha3_256::digest(our_sig).as_slice() {
-        return false;
-    }
+    if incoming.hash() >= our_hash { return false; }
     crate::node::verify_microblock_producer_sig_sync(storage, incoming)
 }
 
@@ -235,8 +234,8 @@ fn maybe_supersede_by_certified_round(storage: &Arc<Storage>, block: &IngestBloc
     let finalized = crate::node::LAST_FINALIZED_HEIGHT.load(Ordering::SeqCst);
     if h <= finalized { return; } // never reorg finalized history
 
-    let (our_round, our_baseline, our_producer, our_sig, our_hash) = match storage.load_microblock_auto_format(h) {
-        Ok(Some(mb)) => { let hh = mb.hash(); (mb.timeout_round, mb.carried_baseline, mb.producer, mb.signature, hh) },
+    let (our_round, our_baseline, our_producer, our_hash) = match storage.load_microblock_auto_format(h) {
+        Ok(Some(mb)) => { let hh = mb.hash(); (mb.timeout_round, mb.carried_baseline, mb.producer, hh) },
         _ => return,
     };
     let mb_idx = h / 90;
@@ -342,7 +341,7 @@ fn maybe_supersede_by_certified_round(storage: &Arc<Storage>, block: &IngestBloc
         // UNVERIFIED gossip/repair bytes with no 2f+1-TC to lean on, so the producer-authorization +
         // signature check inside the helper is what stops a registered node grinding a lower sig to
         // force a wasteful reorg. See equal_round_selffork_supersedes.
-        equal_round_selffork_supersedes(storage, &incoming, Some((&our_producer, &our_sig)))
+        equal_round_selffork_supersedes(storage, &incoming, Some((&our_producer, our_hash)))
     } else {
         return; // strictly lower absolute round → keep ours
     };
@@ -1041,7 +1040,6 @@ pub struct ApplyContext {
     pub state: Arc<RwLock<crate::StateManager>>,
     pub coordinator: CoordinatorHandle,
     pub height: Arc<RwLock<u64>>,
-    pub reward_manager: Arc<RwLock<PhaseAwareRewardManager>>,
     pub unified_p2p: Option<Arc<SimplifiedP2P>>,
     pub block_event_tx: tokio::sync::broadcast::Sender<u64>,
     pub node_id: String,
@@ -1422,6 +1420,9 @@ impl BlockPipeline {
             // (nothing to apply) can't trip a spurious CRIT — stall is measured from first real progress.
             let mut last_verified_progress_ms: u64 = 0;
             let mut last_applied_progress_ms: u64 = 0;
+            // First hit is a WARN; only a stall that survives another window is a CRIT.
+            let mut verify_stuck_repeats: u32 = 0;
+            let mut apply_stuck_repeats: u32 = 0;
             let mut last_verify_dump_ms: u64 = 0;
             let mut last_apply_dump_ms: u64 = 0;
             let mut interval = tokio::time::interval(WATCHDOG_TICK);
@@ -1442,10 +1443,12 @@ impl BlockPipeline {
                 if verify_progress_now != last_verified {
                     last_verified = verify_progress_now;
                     last_verified_progress_ms = now;
+                    verify_stuck_repeats = 0; // a later, unrelated stall must open at WARN again
                 }
                 if apply_progress_now != last_applied {
                     last_applied = apply_progress_now;
                     last_applied_progress_ms = now;
+                    apply_stuck_repeats = 0; // a later, unrelated stall must open at WARN again
                 }
 
                 let verify_op = metrics_watchdog.verify_op.load(Ordering::Relaxed);
@@ -1460,14 +1463,19 @@ impl BlockPipeline {
                 let apply_stall_ms = now.saturating_sub(last_applied_progress_ms);
                 let apply_op_age_ms = now.saturating_sub(apply_op_started);
 
-                // VERIFY STALL DUMP: counter unchanged for ≥30 s and op != idle.
+                // VERIFY STALL: frozen progress counter. op_age CLASSIFIES the stall (a hang keeps
+                // one operation in flight; a livelock re-enters and re-zeroes the age) — it must not
+                // GATE the dump, or a repeated-failure loop resets the age and is never reported.
                 if verify_stall_ms >= STUCK_THRESHOLD_MS
                     && last_verified_progress_ms != 0
                     && verify_op != PIPELINE_OP_IDLE
                     && now.saturating_sub(last_verify_dump_ms) >= STUCK_THRESHOLD_MS
                 {
+                    verify_stuck_repeats += 1;
                     eprintln!(
-                        "[CRIT][PIPELINE] verify_stuck stall_ms={} hung_h={} op={} op_age_ms={} verified={} applied={} ingested={} decoded={} verify_fail={} future_drop={} defer_evict={}",
+                        "[{}][PIPELINE] verify_stuck mode={} stall_ms={} hung_h={} op={} op_age_ms={} verified={} applied={} ingested={} decoded={} verify_fail={} future_drop={} defer_evict={}",
+                        if verify_stuck_repeats > 1 { "CRIT" } else { "WARN" },
+                        if verify_op_age_ms >= STUCK_THRESHOLD_MS { "hang" } else { "livelock" },
                         verify_stall_ms,
                         verify_h,
                         op_name(verify_op),
@@ -1483,14 +1491,17 @@ impl BlockPipeline {
                     last_verify_dump_ms = now;
                 }
 
-                // APPLY STALL DUMP: counter unchanged for ≥30 s and op != idle.
+                // APPLY STALL: same rule as verify — op_age classifies hang vs livelock, never gates.
                 if apply_stall_ms >= STUCK_THRESHOLD_MS
                     && last_applied_progress_ms != 0
                     && apply_op != PIPELINE_OP_IDLE
                     && now.saturating_sub(last_apply_dump_ms) >= STUCK_THRESHOLD_MS
                 {
+                    apply_stuck_repeats += 1;
                     eprintln!(
-                        "[CRIT][PIPELINE] apply_stuck stall_ms={} hung_h={} op={} op_age_ms={} verified={} applied={} apply_fail={} dup_skip={}",
+                        "[{}][PIPELINE] apply_stuck mode={} stall_ms={} hung_h={} op={} op_age_ms={} verified={} applied={} apply_fail={} dup_skip={}",
+                        if apply_stuck_repeats > 1 { "CRIT" } else { "WARN" },
+                        if apply_op_age_ms >= STUCK_THRESHOLD_MS { "hang" } else { "livelock" },
                         apply_stall_ms,
                         apply_h,
                         op_name(apply_op),
@@ -2101,8 +2112,8 @@ impl BlockPipeline {
                             // Adopt the block's attached 2f+1 TimeoutProof so a higher round it carries advances
                             // our certified map in-band; a higher round then wins ONLY if 2f+1-certified
                             // (unforgeable — a raw round could not, which caused the rollback storm). Equal round
-                            // → lower Sha3(signature) (single deterministic winner, byte-identical to the apply-path
-                            // resolver, converges a same-round self-fork). One fork-choice rule network-wide.
+                            // → lower block.hash() (single deterministic winner, grind-immune since the hash
+                            // excludes the signature; byte-identical to the apply-path resolver). One rule network-wide.
                             if let (Some(pb), Some(p)) = (decoded.microblock.timeout_proof.as_ref(), unified_p2p.as_ref()) {
                                 p.adopt_timeout_proof_bytes(pb);
                             }
@@ -2116,7 +2127,7 @@ impl BlockPipeline {
                                 // Equal round: only a genuine same-producer self-fork (valid sig, lower hash)
                                 // supersedes, and only if we actually HOLD a competitor here (None ⇒ false).
                                 equal_round_selffork_supersedes(&storage, &decoded.microblock,
-                                    local_opt.as_ref().map(|b| (b.producer.as_str(), b.signature.as_slice())))
+                                    local_opt.as_ref().map(|b| (b.producer.as_str(), b.hash())))
                             } else {
                                 false
                             };
@@ -3310,11 +3321,6 @@ impl BlockPipeline {
                     }
                 }
 
-                // Get processed emission MBs for double-emission prevention
-                let processed_emission_set = {
-                    let reward_mgr = ctx.reward_manager.read().await;
-                    reward_mgr.get_processed_emission_macroblocks().clone()
-                };
 
                 // Slot check BEFORE apply: a sibling that cannot win the slot should not pay for a
                 // full apply. It can no longer corrupt anything either — apply is side-effect-free
@@ -3341,7 +3347,6 @@ impl BlockPipeline {
                     &block.microblock,
                     &ctx.storage,
                     block_snapshot.as_mut(),
-                    Some(&processed_emission_set),
                 );
                 let apply_state_elapsed = apply_state_start.elapsed();
                 if apply_state_elapsed > std::time::Duration::from_millis(500) {
@@ -3486,16 +3491,6 @@ impl BlockPipeline {
                 // caught. First-wins; the durable cbw set is reconciled from node_registry by
                 // rebuild_committed_burn_wallet on snapshot/reorg/boot.
                 for tx in &block.microblock.transactions {
-                    if let qnet_state::TransactionType::NodeRegistration { node_id, wallet_address, burn_tx, .. } = &tx.tx_type {
-                        // Scope = ANY NodeRegistration with a non-empty burn (super + LIGHT), MATCHING
-                        // rebuild_committed_burn_wallet (srtr_+lrtr_) and registry_root. Light is now
-                        // burn-attested on-chain (Option A), so its burn must bind cbw too; scope parity
-                        // between this live writer and the rebuild is what prevents a fork. Empty-burn
-                        // (genesis / not-yet-attested) regs auto-skip.
-                        if !burn_tx.is_empty() {
-                            let _ = ctx.storage.committed_burn_wallet_put(burn_tx, node_id);
-                        }
-                    }
                     // Heartbeat liveness index (lhb_): Phase-2A recency reads this instead of a
                     // 2-subwindow body scan. Mirrored by the producer's inline pre-save write.
                     if let qnet_state::TransactionType::Heartbeat { node_id, anchor_height, .. } = &tx.tx_type {
@@ -3518,6 +3513,14 @@ impl BlockPipeline {
                     // sha3 into registry_root for light-client committee verification.
                     let vrf = if vrf_pk_hex.is_empty() { None } else { hex::decode(vrf_pk_hex).ok() };
                     let _ = ctx.storage.save_node_registration_at_height_burn_vrf(node_id, type_str, wallet, 1.0, height, burn_tx, vrf.as_deref());
+                    // burn -> node binding, from the SAME apply-Ok set as the row above. Scope matches
+                    // rebuild_committed_burn_wallet (srtr_+lrtr_, super AND light), so the live index and
+                    // the rebuild agree. It used to be written from a separate pass over EVERY
+                    // registration in the block, including ones whose apply failed — rows the producer
+                    // never wrote and the rebuild does not reproduce.
+                    if !burn_tx.is_empty() {
+                        let _ = ctx.storage.committed_burn_wallet_put(burn_tx, node_id);
+                    }
                 }
                 // Registration-origin markers, the dedup reseed source. The producer stamps these inline;
                 // without the mirror here a validator rebuilds an incomplete dedup map after any restart
@@ -3778,27 +3781,6 @@ impl BlockPipeline {
                             tokio::task::spawn_blocking(move || {
                                 crate::node::BlockchainNode::populate_light_elig_at_boundary(&*st, h);
                             });
-                        }
-                        for mb_idx in &apply_result.deferred_emission_mbs {
-                            let mut reward_mgr = ctx.reward_manager.write().await;
-                            let mut processed_set = reward_mgr.get_processed_emission_macroblocks().clone();
-                            processed_set.insert(*mb_idx);
-                            reward_mgr.set_processed_emission_macroblocks(processed_set.clone());
-                            drop(reward_mgr);
-                            if let Err(e) = ctx.storage.save_processed_emission_macroblocks(&processed_set) {
-                                eprintln!("[WARN][PIPELINE] emission_save_fail mb={} err={}", mb_idx, e);
-                            }
-                        }
-                        for (node_id, amount) in &apply_result.deferred_reward_clears {
-                            {
-                                let mut reward_mgr = ctx.reward_manager.write().await;
-                                let _ = reward_mgr.clear_pending_reward(node_id);
-                            }
-                            if let Err(e) = ctx.storage.delete_pending_reward(node_id) {
-                                if is_debug() { println!("[DBG][PIPELINE] claim_delete_fail node={} err={}", node_id, e); }
-                            } else if is_info() {
-                                println!("[INFO][PIPELINE] synced_claim node={} amount={} QNC", node_id, amount / 1_000_000_000);
-                            }
                         }
 
                         // ── VRF key extraction from NodeRegistration TXs ──

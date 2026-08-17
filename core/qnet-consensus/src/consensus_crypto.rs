@@ -301,8 +301,13 @@ fn sig_reject_log_decision(claimed_node_id: &str) -> SigRejectLogAction {
 
     if let Some(n) = flood_summary {
         eprintln!(
-            "[WARN][SECURITY] sig_reject_flood claimed_node={} window_s={} suppressed={} action=window_rolled_still_under_attack",
-            claimed_node_id, SIG_REJECT_LOG_WINDOW_S, n
+            // This is a LOG-SUPPRESSION summary, not a verdict: it says how many reject lines
+            // were withheld, nothing about who is at fault. Calling it an attack made every
+            // operator read benign churn as hostility. `stale` is the benign cross-round count,
+            // carried here so it is observable without a per-frame line.
+            "[WARN][SECURITY] sig_reject_suppressed claimed_node={} window_s={} suppressed={} stale_total={} action=window_rolled",
+            claimed_node_id, SIG_REJECT_LOG_WINDOW_S, n,
+            SIG_STALE_MESSAGE_COUNT.load(std::sync::atomic::Ordering::Relaxed)
         );
     }
     action
@@ -1589,31 +1594,67 @@ async fn verify_dilithium_signature(
     }
 
     // CRITICAL: Call actual ML-DSA-65 verification through async runtime
-    let valid = verify_with_real_dilithium(node_id, message, &signature_bytes).await;
+    let verdict = verify_with_real_dilithium(node_id, message, &signature_bytes).await;
 
-    if valid {
-        println!("[INFO][CONSENSUS] sig_verified node={}", node_id);
-    } else {
-        // Governed: a spoofer flooding garbage under a claimed identity
-        // would otherwise emit one of these per frame. Rejection is
-        // already final (the inner verify returned false); this only
-        // rate-limits the log line.
-        log_sig_reject(node_id, &format!("[ERR][CONSENSUS] sig_invalid node={}", node_id));
+    match verdict {
+        SigVerdict::Ok => {
+            println!("[INFO][CONSENSUS] sig_verified node={}", node_id);
+        }
+        // Benign cross-round staleness. It must NOT reach the reject governor — doing that is
+        // what produced "under attack" verdicts against honest quorum members. But it also must
+        // not be invisible: the running total only ever printed as a rider on the governor's
+        // window summary, which never fires if a peer sends nothing BUT stale frames. Reported
+        // here on its own cadence, as a volume observation with no verdict attached.
+        SigVerdict::StaleMessage => report_stale_volume(node_id),
+        SigVerdict::Invalid => {
+            // Governed: a spoofer flooding garbage under a claimed identity
+            // would otherwise emit one of these per frame. Rejection is
+            // already final; this only rate-limits the log line.
+            log_sig_reject(node_id, &format!("[ERR][CONSENSUS] sig_invalid node={}", node_id));
+        }
     }
 
-    valid
+    verdict == SigVerdict::Ok
 }
 
 /// Verify signature with real CRYSTALS-Dilithium
+/// Why a consensus signature was refused. A signature that verifies under the node's
+/// registry-bound key but recovers a different message is cross-round staleness, not an
+/// attack — conflating the two kept the flood detector permanently asserting that honest
+/// quorum members were hostile.
+#[derive(Clone, Copy, PartialEq)]
+enum SigVerdict {
+    Ok,
+    StaleMessage,
+    Invalid,
+}
+
+/// Emit a stale-volume line at most once per window, once the running total crosses a multiple of
+/// the step. Deliberately NOT the reject governor: this is an observation about churn, never a
+/// verdict about a peer, so it can never make an honest node look hostile.
+fn report_stale_volume(node_id: &str) {
+    const STALE_REPORT_STEP: u64 = 1_000;
+    let total = SIG_STALE_MESSAGE_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+    if total > 0 && total % STALE_REPORT_STEP == 0 {
+        println!("[INFO][CONSENSUS] sig_stale_volume last_node={} total={} note=benign_cross_round",
+                 node_id, total);
+    }
+}
+
+/// Benign cross-round rejections since boot. Reported in the reject-governor window summary and
+/// readable by external metrics; never feeds the attack detector.
+pub static SIG_STALE_MESSAGE_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 async fn verify_with_real_dilithium(
     node_id: &str,
     message: &str,
     signature_bytes: &[u8],
-) -> bool {
+) -> SigVerdict {
     // Verify signature structure: all-zero is trivially invalid
     if signature_bytes.iter().all(|&b| b == 0) {
         log_sig_reject(node_id, &format!("[ERR][CONSENSUS] sig_all_zeros node={}", node_id));
-        return false;
+        return SigVerdict::Invalid;
     }
 
     // Entropy check on the ML-DSA-65 signature part (3309 bytes, CTILDEBYTES=48)
@@ -1622,13 +1663,13 @@ async fn verify_with_real_dilithium(
     if unique_bytes.len() < 200 {
         log_sig_reject(node_id, &format!("[ERR][CONSENSUS] sig_low_entropy node={} unique={} threshold=200",
                  node_id, unique_bytes.len()));
-        return false;
+        return SigVerdict::Invalid;
     }
 
     // Parse combined format: [sig_len(4)] + [SignedMessage(sig+msg)] + [pk_len(4)] + [pk(1952)]
     if signature_bytes.len() < 8 {
         log_sig_reject(node_id, &format!("[ERR][CONSENSUS] sig_too_short node={} size={}", node_id, signature_bytes.len()));
-        return false;
+        return SigVerdict::Invalid;
     }
 
     let signed_len = u32::from_le_bytes([
@@ -1641,14 +1682,14 @@ async fn verify_with_real_dilithium(
     // ML-DSA-65 SignedMessage must be at least 3309 bytes (sig) + 1 byte (msg) = 3310 minimum
     if signed_len <= 3309 || 4 + signed_len >= signature_bytes.len() {
         log_sig_reject(node_id, &format!("[ERR][CONSENSUS] sig_format_invalid node={} signed_len={}", node_id, signed_len));
-        return false;
+        return SigVerdict::Invalid;
     }
     
     // Extract public key from the end of signature
     let pk_len_start = 4 + signed_len;
     if pk_len_start + 4 > signature_bytes.len() {
         println!("[ERR][CONSENSUS_CRYPTO] missing_public_key_length_field");
-        return false;
+        return SigVerdict::Invalid;
     }
     
     let pk_len = u32::from_le_bytes([
@@ -1665,12 +1706,12 @@ async fn verify_with_real_dilithium(
     if pk_len != dilithium3::public_key_bytes() {
         log_sig_reject(node_id, &format!("[ERR][CONSENSUS] pk_size_invalid node={} got={} expected={}",
                  node_id, pk_len, dilithium3::public_key_bytes()));
-        return false;
+        return SigVerdict::Invalid;
     }
 
     if pk_start + pk_len != signature_bytes.len() {
         log_sig_reject(node_id, &format!("[ERR][CONSENSUS] sig_len_mismatch node={}", node_id));
-        return false;
+        return SigVerdict::Invalid;
     }
 
     // Extract components
@@ -1732,6 +1773,10 @@ async fn verify_with_real_dilithium(
     // wait-free; the write path runs exactly once per identity registration
     // (one-shot per node lifetime). The genesis prefix check is a fixed-cost
     // string comparison — O(1) regardless of network size.
+    // Whether the presented key is the one the registry BOUND to this identity. Only then can a
+    // message mismatch be read as this node's own stale frame; on the first-seen path the key is
+    // the sender's own choice, so a mismatch says nothing and must stay attacker-visible.
+    let mut identity_bound = false;
     {
         let registry = CONSENSUS_PK_REGISTRY.read();
         match registry.get(node_id) {
@@ -1741,6 +1786,7 @@ async fn verify_with_real_dilithium(
                 // hot path stays wait-free.
                 drop(registry);
                 observe_pk_activity(node_id);
+                identity_bound = true;
             }
             Some(entry) => {
                 // Tier 2: bound, mismatch — hostile identity claim.
@@ -1762,7 +1808,7 @@ async fn verify_with_real_dilithium(
                     "[WARN][SECURITY] identity_pk_mismatch node={} registered={}.. presented={}.. action=reject_message",
                     node_id, registered_for_log, pk_for_log,
                 ));
-                return false;
+                return SigVerdict::Invalid;
             }
             None => {
                 // Tier 3: policy depends on identity class.
@@ -1841,7 +1887,7 @@ async fn verify_with_real_dilithium(
                              hint=deploy_anchors_or_set_QNET_BOOTSTRAP_FRESH",
                             node_id, extracted_prefix, anchors_loaded, fresh_opt_in
                         );
-                        return false;
+                        return SigVerdict::Invalid;
                     }
                 } else {
                     // Non-genesis identity (Super-node, Light-node, etc.). TOFV
@@ -1862,7 +1908,7 @@ async fn verify_with_real_dilithium(
         Ok(pk) => pk,
         Err(_) => {
             eprintln!("[ERR][CONSENSUS] pk_parse_failed node={}", node_id);
-            return false;
+            return SigVerdict::Invalid;
         }
     };
 
@@ -1871,7 +1917,7 @@ async fn verify_with_real_dilithium(
         Ok(sm) => sm,
         Err(_) => {
             eprintln!("[ERR][CONSENSUS] signed_msg_parse_failed node={}", node_id);
-            return false;
+            return SigVerdict::Invalid;
         }
     };
 
@@ -1883,17 +1929,21 @@ async fn verify_with_real_dilithium(
             if ct_eq(recovered_message.as_slice(), expected_msg) {
                 println!("[INFO][CONSENSUS] mldsa65_verified node={} pk={}...",
                          node_id, hex::encode(&public_key_bytes[..8]));
-                return true;
-            } else {
-                // Recovered != expected: stale/cross-round signature or forgery. Rejection
-                // is unconditional (security boundary); expected at low rate ⇒ WARN, not ERR.
-                eprintln!("[WARN][CONSENSUS] sig_reject node={} reason=msg_mismatch", node_id);
-                return false;
+                return SigVerdict::Ok;
             }
+            // Only a REGISTRY-BOUND key makes a mismatch benign: it is then this node signing a
+            // different message, i.e. a stale or cross-round frame. On the first-seen path the key
+            // came from the sender, so `open` succeeding proves nothing and the rejection must stay
+            // in the governor where a repeat offender is visible.
+            if !identity_bound {
+                return SigVerdict::Invalid;
+            }
+            SIG_STALE_MESSAGE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            SigVerdict::StaleMessage
         }
         Err(_) => {
             eprintln!("[ERR][CONSENSUS] mldsa65_verify_failed node={}", node_id);
-            return false;
+            SigVerdict::Invalid
         }
     }
 }

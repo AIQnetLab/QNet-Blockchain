@@ -9,8 +9,6 @@ extern crate qnet_state;
 
 /// QNet Consensus Implementation
 pub mod lazy_rewards;
-pub mod reward_integration;
-pub mod batch_operations;
 pub mod commit_reveal;
 // Consensus v2 — Checkpoint-BFT types (spec: docs/CONSENSUS_V2_SPEC.md)
 pub mod checkpoint_bft;
@@ -29,12 +27,6 @@ pub mod sharded_consensus;
 pub mod cross_shard;
 
 // Re-export main types for public API
-pub use lazy_rewards::{PhaseAwareRewardManager, PhaseAwareReward, RewardClaimResult};
-pub use reward_integration::{RewardIntegrationManager, RewardInfo};
-pub use batch_operations::{
-    BatchOperationsManager, BatchRewardClaimRequest, BatchRewardClaimResult,
-    BatchNodeActivationRequest, BatchNodeActivationResult, BatchTransferRequest, BatchTransferResult
-};
 pub use commit_reveal::{CommitRevealConsensus, ConsensusConfig, ConsensusPhase, get_phase_for_block, is_in_consensus_window};
 pub use errors::ConsensusError;
 pub use reputation::{NodeReputation, ReputationConfig, MaliciousBehavior};
@@ -56,41 +48,10 @@ pub use cross_shard::{
 };
 
 // Common types used across modules
-pub use lazy_rewards::{NodeType, QNetPhase, HeartbeatSummaryData};
 
 // Type aliases for compatibility
 pub type ConsensusEngine = CommitRevealConsensus;
 pub type NodeId = String;
-
-/// Initialize consensus system with batch operations support
-pub fn initialize_consensus_with_batch_operations(
-    _genesis_timestamp: u64,
-    _dev_burn_percentage: f64,
-    _years_since_launch: u64,
-) -> (RewardIntegrationManager, BatchOperationsManager) {
-    // Initialize reward integration for standalone operations
-    let reward_integration = RewardIntegrationManager::new();
-    
-    // Initialize reward integration for batch operations (separate instance)
-    let reward_integration_for_batch = RewardIntegrationManager::new();
-    
-    // Wrap in Arc<Mutex> for batch operations
-    let reward_integration_shared = std::sync::Arc::new(parking_lot::Mutex::new(reward_integration_for_batch));
-    
-    // Initialize batch operations manager
-    let batch_manager = BatchOperationsManager::new(reward_integration_shared);
-    
-    (reward_integration, batch_manager)
-}
-
-/// Initialize consensus system (original function for backwards compatibility)
-pub fn initialize_consensus(
-    _genesis_timestamp: u64,
-    _dev_burn_percentage: f64,
-    _years_since_launch: u64,
-) -> RewardIntegrationManager {
-    RewardIntegrationManager::new()
-}
 
 /// Create new consensus engine
 pub fn create_consensus_engine(node_id: String) -> ConsensusEngine {
@@ -136,20 +97,6 @@ mod tests {
         assert!(rep >= 0.0 && rep <= 100.0);
     }
 
-    #[test]
-    fn test_consensus_initialization() {
-        let manager = initialize_consensus(0, 0.5, 0);
-        // Manager should be created successfully
-        assert!(std::mem::size_of_val(&manager) > 0);
-    }
-
-    #[test]
-    fn test_batch_operations_initialization() {
-        let (reward_manager, batch_manager) = initialize_consensus_with_batch_operations(0, 0.5, 0);
-        // Both managers should be created
-        assert!(std::mem::size_of_val(&reward_manager) > 0);
-        assert!(std::mem::size_of_val(&batch_manager) > 0);
-    }
 
     #[test]
     fn test_node_id_generation() {
@@ -220,23 +167,6 @@ mod tests {
     }
 
     #[test]
-    fn test_reward_claim_result() {
-        // Test that RewardClaimResult can be created with the actual
-        // canonical fields (`success`, `reward`, `message`,
-        // `next_claim_time`).
-        let result = RewardClaimResult {
-            success: true,
-            reward: None,
-            message: "Success".to_string(),
-            next_claim_time: 0,
-        };
-
-        assert!(result.success);
-        assert!(result.reward.is_none());
-        assert_eq!(result.message, "Success");
-    }
-
-    #[test]
     fn test_consensus_error_display() {
         // Use a variant that actually exists on the canonical
         // `ConsensusError` enum (see `errors.rs`).
@@ -245,27 +175,4 @@ mod tests {
         assert!(!error_str.is_empty());
     }
 
-    #[test]
-    fn test_phase_transition() {
-        // Test QNetPhase transitions. Canonical variants are `Phase1`
-        // (1DEV burn-to-join, Pool 3 disabled) and `Phase2` (QNC
-        // spend-to-Pool 3, Pool 3 enabled) — see `lazy_rewards.rs`.
-        let phase1 = QNetPhase::Phase1;
-        let phase2 = QNetPhase::Phase2;
-
-        assert_ne!(format!("{:?}", phase1), format!("{:?}", phase2));
-    }
-
-    #[test]
-    fn test_node_type_variants() {
-        // QNet ships only `Light` and `Super` node types (the legacy
-        // `Full` variant was removed). The dedup test below verifies
-        // both variants are distinct under `Debug` formatting.
-        let light_a = NodeType::Light;
-        let light_b = NodeType::Light;
-        let supr = NodeType::Super;
-
-        assert_eq!(format!("{:?}", light_a), format!("{:?}", light_b));
-        assert_ne!(format!("{:?}", light_a), format!("{:?}", supr));
-    }
 }

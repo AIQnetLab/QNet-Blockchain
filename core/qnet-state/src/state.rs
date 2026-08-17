@@ -3,7 +3,7 @@
 //! v3.26: Added atomic fee crediting protection (race condition fix)
 //! v3.39: Block snapshot for state_root mismatch recovery (rare error case)
 
-use std::collections::{HashMap, HashSet, BTreeMap};
+use std::collections::{HashMap, HashSet, BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use dashmap::DashMap;
@@ -21,32 +21,6 @@ pub struct ApplyOutcome {
 }
 use tracing::{info, debug, warn, error};
 
-/// v7.0: Gate for including pending_rewards in Merkle hash.
-/// Set to true when the first v7.0 emission TX (with `"v":2` accruals) is applied.
-/// Before activation, hash_account() excludes pending_rewards for backward compat
-/// with state_roots computed by pre-v7.0 code.
-static PENDING_REWARDS_IN_MERKLE: AtomicBool = AtomicBool::new(false);
-
-/// v7.0: Activate pending_rewards inclusion in Merkle hash.
-/// Called ONCE when the first v7.0 emission accrual is applied to state.
-/// After this point, all hash_account() calls include pending_rewards.
-pub fn activate_pending_rewards_in_merkle() {
-    if !PENDING_REWARDS_IN_MERKLE.load(Ordering::Acquire) {
-        PENDING_REWARDS_IN_MERKLE.store(true, Ordering::Release);
-        println!("[INFO][STATE] v7.0 FORK ACTIVATED: pending_rewards now included in Merkle state root");
-    }
-}
-
-/// v7.0: Check if pending_rewards is included in Merkle hash.
-pub fn is_pending_rewards_in_merkle() -> bool {
-    PENDING_REWARDS_IN_MERKLE.load(Ordering::Acquire)
-}
-
-/// v7.0: Reset pending_rewards flag for full state replay from genesis.
-/// During replay, the flag will be re-activated at the correct block via accrue_pending_rewards.
-pub fn reset_pending_rewards_in_merkle() {
-    PENDING_REWARDS_IN_MERKLE.store(false, Ordering::SeqCst);
-}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // v3.26: ATOMIC FEE CREDITING PROTECTION
@@ -133,6 +107,14 @@ const TREE_DEPTH: usize = 256; // v32.14: full address bit-width — guarantees 
 /// not hold the whole tree in RAM; cold entries reload via the store on demand.
 const DEFAULT_NODE_CACHE_CAP: usize = 2_000_000;
 
+/// Leaves a missing-branch repair may fold in place before it is deferred to a full recompute.
+///
+/// Bounded by the WORK, not by depth. A subtree's size is set by leaf DENSITY, not by its level:
+/// at 10M accounts a subtree holds two or more leaves only below depth ~234, so the old depth cap
+/// of 200 rejected every repair that could actually occur and sent all of them to a full O(N)
+/// recompute — the expensive path the cap existed to avoid.
+const REBUILD_SUBTREE_MAX_LEAVES: usize = 4_096;
+
 /// Optional disk-backed store for merkle leaves + internal nodes. The seam that
 /// lets a super-node stream the tree from disk instead of holding it all in RAM.
 /// qnet-state stays dependency-free — an integration-layer impl (e.g. RocksDB)
@@ -144,8 +126,20 @@ pub trait MerkleNodeStore: Send + Sync {
     fn get_leaf(&self, key: &[u8; 32]) -> Option<[u8; 32]>;
     /// Point read of a non-default internal node at (depth, key). None = default subtree.
     fn get_node(&self, depth: u32, key: &[u8; 32]) -> Option<[u8; 32]>;
+    /// Leaves in the inclusive key range `[lo, hi]`, stopping after `limit`. A subtree
+    /// is a contiguous range (see `StateMerkleTree::level_bit`), so this is the probe
+    /// that tells empty / single-leaf / branch apart without materialising the chain
+    /// below a single-leaf node.
+    fn leaves_under(&self, lo: &[u8; 32], hi: &[u8; 32], limit: usize) -> Vec<([u8; 32], [u8; 32])>;
     /// Bulk read of the full leaf set — used only for a full rebuild (recompute_root).
     fn all_leaves(&self) -> Vec<([u8; 32], [u8; 32])>;
+    /// Drop the ENTIRE leaf set, committed immediately.
+    ///
+    /// The per-finalize delta cannot express this: a full-state reset abandons its in-memory leaf
+    /// map without knowing which keys it held, so it emits no `leaf_dels` — and `recompute_root`
+    /// then seeds from `all_leaves()`, folding the abandoned state into the new root. Eager, not
+    /// deferred, because that seed read happens before the next flush.
+    fn wipe_leaves(&self) -> Result<(), String>;
     /// Durably persist one finalize's delta: leaf upserts, leaf deletes, node
     /// upserts, node deletes. ORDERING CONTRACT: a full rebuild can emit both a
     /// delete and a re-put for the same NODE key in one delta (clear-then-
@@ -172,9 +166,16 @@ pub trait MerkleNodeStore: Send + Sync {
     ) -> Result<(), String>;
 }
 
+/// What a subtree holds, capped at the two cases the fold has to tell apart.
+enum SubtreeSpan {
+    Empty,
+    Single([u8; HASH_SIZE], [u8; HASH_SIZE]),
+    Branch,
+}
+
 /// State Merkle Tree for account proofs
 /// Optimized for QNet's account structure with batch operations for 100K+ TPS
-/// 
+///
 /// # Performance Features
 /// - Lazy root computation (dirty flag)
 /// - Batch insert for block processing
@@ -240,7 +241,9 @@ pub struct StateMerkleTree {
     /// (2) the `leaf_dels` batch flushed at finalize so `all_leaves()` on a later
     ///     full rebuild doesn't re-surface the removed leaf. A re-insert of the
     ///     same key (`leaf_put`) cancels its pending deletion.
-    pending_leaf_dels: HashSet<[u8; HASH_SIZE]>,
+    /// Ordered, not a hash set: `subtree_probe` needs the tombstones inside ONE key range, and
+    /// counting them globally made a k-leaf rollback cost O(k^2) store reads.
+    pending_leaf_dels: BTreeSet<[u8; HASH_SIZE]>,
     /// Set by `recompute_root` (full rebuild) while a store is attached: the pass
     /// recomputes the COMPLETE non-default node set into `delta_node_puts`, so the
     /// flush must WIPE all store nodes before applying them — otherwise evicted
@@ -248,6 +251,9 @@ pub struct StateMerkleTree {
     /// survive and poison later incremental sibling reads. Consumed + reset at
     /// flush. Leaves are unaffected (maintained precisely via leaf_puts/leaf_dels).
     node_wipe_pending: bool,
+    /// Set when the incremental pass read a node it could not resolve. finalize discards the
+    /// result and redoes the pass as a full recompute rather than sealing a guessed root.
+    incremental_pass_invalid: bool,
 }
 
 impl StateMerkleTree {
@@ -284,8 +290,9 @@ impl StateMerkleTree {
             delta_leaf_puts: Vec::new(),
             delta_node_puts: Vec::new(),
             delta_node_dels: Vec::new(),
-            pending_leaf_dels: HashSet::new(),
+            pending_leaf_dels: BTreeSet::new(),
             node_wipe_pending: false,
+            incremental_pass_invalid: false,
         }
     }
 
@@ -303,12 +310,23 @@ impl StateMerkleTree {
     ///
     /// Full-state paths (clear, snapshot restore) used to assign a fresh `StateMerkleTree`, which
     /// silently detached the store attached at boot — from then on the node held the whole tree in RAM
-    /// (~233 nodes/leaf) and OOMed at scale. Node/leaf rows for the old state are superseded by the
-    /// restore that follows; stale entries are unreachable from the new root and pruned by the store's
-    /// own delete path.
+    /// (~233 nodes/leaf) and OOMed at scale.
+    ///
+    /// The store's LEAF set is wiped here, eagerly. Dropping the in-memory map alone left every prior
+    /// leaf on disk, and `recompute_root` seeds from `all_leaves()` — so the first root after a clear
+    /// or a snapshot restore covered the OLD state unioned with the new one, on exactly the paths a
+    /// relaunch exercises. Nodes need no wipe here: the rebuild that follows sets `node_wipe_pending`
+    /// and replaces the whole node set at flush.
     pub fn reset_preserving_store(&mut self) {
         let store = self.node_store.clone();
         let cap = self.node_cache_cap;
+        if let Some(ref st) = store {
+            // Fail LOUD: continuing would fold two states into one root, and every later block would
+            // be rejected by peers with nothing in the log to say why.
+            if let Err(e) = st.wipe_leaves() {
+                panic!("merkle leaf wipe failed on full-state reset: {}", e);
+            }
+        }
         *self = Self::new();
         self.node_store = store;
         self.node_cache_cap = cap;
@@ -505,12 +523,22 @@ impl StateMerkleTree {
             let use_incremental = self.incremental_enabled
                 && !self.intermediate_nodes.is_empty()
                 && k > 0;
+            let mut mode_incremental = use_incremental;
             if use_incremental {
+                self.incremental_pass_invalid = false;
                 self.recompute_levels();
+                if self.incremental_pass_invalid {
+                    // An unresolvable node makes the incremental root a guess. Throw it away.
+                    self.incremental_pass_invalid = false;
+                    mode_incremental = false;
+                    self.recompute_root();
+                }
+                self.dirty_paths.clear();
             } else {
                 self.recompute_root();
                 self.dirty_paths.clear();
             }
+            let use_incremental = mode_incremental;
             self.dirty = false;
             self.pending_updates = 0;
             if updates > 0 {
@@ -646,27 +674,27 @@ impl StateMerkleTree {
         let mut proof = Vec::with_capacity(TREE_DEPTH);
         let mut key = addr_hash;
 
+        // One binary search up front instead of a range probe per level: below `ffd` the
+        // sibling is provably empty, so those 200+ levels need no store access at all.
+        let ffd = self.first_foreign_depth(&addr_hash);
+
         for depth in 0..TREE_DEPTH {
             let mut sibling_key = key;
             Self::flip_bit(&mut sibling_key, depth);
 
-            let sibling_hash = if depth == 0 {
-                self.leaf_get(&sibling_key)
-                    .unwrap_or(self.default_hashes[0])
+            // node_resolve, not node_get: below a branch the sibling chain is not
+            // materialised, and treating it as a default subtree would emit a proof
+            // that cannot verify.
+            let sibling_hash = if depth + 1 < ffd {
+                self.default_hashes[depth]
             } else {
-                self.node_get(depth as u32, &sibling_key)
-                    .unwrap_or(self.default_hashes[depth])
+                self.node_resolve(depth, &sibling_key).0
             };
 
             let is_right = Self::get_bit(&addr_hash, depth);
             proof.push((sibling_hash, is_right));
 
-            // ascend: clear bit at depth to reach parent's level-(D+1) key
-            let byte_idx = depth / 8;
-            let bit_idx = 7 - (depth % 8);
-            if byte_idx < HASH_SIZE {
-                key[byte_idx] &= !(1 << bit_idx);
-            }
+            Self::clear_bit(&mut key, depth);
         }
 
         proof
@@ -678,21 +706,18 @@ impl StateMerkleTree {
         let leaf_hash = Self::hash_storage_key(key_preimage);
         let mut proof = Vec::with_capacity(TREE_DEPTH);
         let mut key = leaf_hash;
+        let ffd = self.first_foreign_depth(&leaf_hash);
         for depth in 0..TREE_DEPTH {
             let mut sibling_key = key;
             Self::flip_bit(&mut sibling_key, depth);
-            let sibling_hash = if depth == 0 {
-                self.leaf_get(&sibling_key).unwrap_or(self.default_hashes[0])
+            let sibling_hash = if depth + 1 < ffd {
+                self.default_hashes[depth]
             } else {
-                self.node_get(depth as u32, &sibling_key).unwrap_or(self.default_hashes[depth])
+                self.node_resolve(depth, &sibling_key).0
             };
             let is_right = Self::get_bit(&leaf_hash, depth);
             proof.push((sibling_hash, is_right));
-            let byte_idx = depth / 8;
-            let bit_idx = 7 - (depth % 8);
-            if byte_idx < HASH_SIZE {
-                key[byte_idx] &= !(1 << bit_idx);
-            }
+            Self::clear_bit(&mut key, depth);
         }
         proof
     }
@@ -850,37 +875,37 @@ impl StateMerkleTree {
         // (token balances, total_supply, allowances) is individually provable, and this leaf no longer
         // folds the whole map O(H). storage_root is kept == root(StorageMerkleTree(contract_storage)) by
         // a pure post-apply recompute, so it cannot drift. UNCONDITIONAL for contracts (fixed schema,
-        // same rule as pending/HB/LCE): an emptiness- or flag-conditional inclusion would fork running
+        // same rule as HB/LCE): an emptiness- or flag-conditional inclusion would fork running
         // vs rebuilt nodes. Non-contract accounts skip it (their storage is always empty) → the native
         // leaf is byte-identical to the pre-V2 schema, so native BalanceProofs keep verifying.
         if account.is_contract {
             hasher.update(b"SROOT:");
             hasher.update(&account.storage_root);
         }
-        // v32.15: pending_rewards ALWAYS in leaf hash — fixed schema for chain
-        // lifetime. A runtime flag here made hash_account non-deterministic:
-        // accounts hashed before the flip kept a no-pending hash, so any full
-        // rebuild (rollback/snapshot/restart) re-hashed them with-pending and
-        // diverged from the running incremental state → consensus split.
-        hasher.update(&account.pending_rewards.to_le_bytes());
         // v34: unforgeable liveness counter — ALWAYS in leaf hash (fixed schema, same rule as
-        // pending_rewards above). Reward eligibility reads popcount(heartbeat_slots), so the
+        // LCE below). Reward eligibility reads popcount(heartbeat_slots), so the
         // counter MUST be consensus-bound; conditional inclusion would split the chain.
         hasher.update(b"HB:");
         hasher.update(&account.heartbeat_epoch.to_le_bytes());
         hasher.update(&account.heartbeat_slots.to_le_bytes());
         hasher.update(&account.heartbeat_final_epoch.to_le_bytes());
         hasher.update(&account.heartbeat_final_slots.to_le_bytes());
-        // last_claimed_epoch: reward-claim watermark — ALWAYS in leaf hash (fixed schema,
-        // same rule as pending_rewards/HB). Anti-replay for merkle claims must be
-        // consensus-bound, else nodes diverge on which epochs an account already claimed.
+        // last_claimed_epoch: the merkle-claim watermark — ALWAYS in the leaf hash (fixed schema,
+        // same rule as HB). It gates the credit, so it must be consensus-bound; a node that hashed
+        // it conditionally would accept a replayed claim the rest of the network rejects.
         hasher.update(b"LCE:");
         hasher.update(&account.last_claimed_epoch.to_le_bytes());
-        // banned_at_height: the consensus ban carried in state — ALWAYS in the leaf hash (fixed schema,
-        // same rule as pending_rewards/HB/LCE). Reward eligibility reads it, so it must be
+        // banned_at_height: the consensus ban carried in state — ALWAYS in the leaf hash (fixed
+        // schema, same rule as HB/LCE). Reward eligibility reads it, so it must be
         // consensus-bound; a conditional inclusion would split running vs rebuilt nodes.
         hasher.update(b"BAN:");
         hasher.update(&account.banned_at_height.to_le_bytes());
+        // is_node: set only by the NodeActivation apply arm, and READ there to decide whether a
+        // second activation for the wallet is skipped. Unbound it was forgeable in a snapshot —
+        // one flipped byte and that node skips an activation the network applies, diverging on
+        // state_root from then on. Same fixed-schema rule as HB/LCE/BAN.
+        hasher.update(b"NODE:");
+        hasher.update(&[account.is_node as u8]);
         // FIX-5 (pk-elision): dilithium_public_key is DELIBERATELY EXCLUDED from the leaf hash. The
         // account `address` (hashed above) already IS a cryptographic commitment to the key —
         // address == format_eon(SHA512(pk)) — so folding the pk in would double-commit the same
@@ -890,31 +915,245 @@ impl StateMerkleTree {
         // proofs small and the leaf schema byte-identical to pre-FIX-5 for balance-proof verifiers.
         // EXCLUDED from hash (non-deterministic or metadata-only):
         //   - reputation: f64 is non-deterministic across platforms
-        //   - is_node, node_type, created_at, updated_at: metadata only
+        //   - node_type, created_at, updated_at: metadata only (read by no apply path)
         let result = hasher.finalize();
         let mut arr = [0u8; HASH_SIZE];
         arr.copy_from_slice(&result);
         arr
     }
     
+    /// Key bit consumed at `depth`. Depth 0 splits on the LAST bit and depth 255 on
+    /// the first, so a node at `depth` is identified by the leading 256-depth bits of
+    /// its key and its subtree is a CONTIGUOUS key range. That is what lets a
+    /// single-leaf subtree be located with one range probe (`subtree_probe`) instead
+    /// of being materialised one stored node per level.
+    #[inline]
+    fn level_bit(depth: usize) -> usize {
+        TREE_DEPTH - 1 - depth
+    }
+
     fn get_bit(hash: &[u8; HASH_SIZE], depth: usize) -> bool {
-        let byte_idx = depth / 8;
-        let bit_idx = 7 - (depth % 8);
+        let b = Self::level_bit(depth);
+        let byte_idx = b / 8;
+        let bit_idx = 7 - (b % 8);
         if byte_idx < HASH_SIZE {
             (hash[byte_idx] >> bit_idx) & 1 == 1
         } else {
             false
         }
     }
-    
+
     fn flip_bit(hash: &mut [u8; HASH_SIZE], depth: usize) {
-        let byte_idx = depth / 8;
-        let bit_idx = 7 - (depth % 8);
+        let b = Self::level_bit(depth);
+        let byte_idx = b / 8;
+        let bit_idx = 7 - (b % 8);
         if byte_idx < HASH_SIZE {
             hash[byte_idx] ^= 1 << bit_idx;
         }
     }
-    
+
+    /// Clear the bit `depth` splits on — turns a child key into its parent key.
+    #[inline]
+    fn clear_bit(hash: &mut [u8; HASH_SIZE], depth: usize) {
+        let b = Self::level_bit(depth);
+        let byte_idx = b / 8;
+        if byte_idx < HASH_SIZE {
+            hash[byte_idx] &= !(1 << (7 - (b % 8)));
+        }
+    }
+
+    /// Set the bit `depth` splits on — turns a parent key into its right child key.
+    #[inline]
+    fn set_bit(hash: &mut [u8; HASH_SIZE], depth: usize) {
+        let b = Self::level_bit(depth);
+        let byte_idx = b / 8;
+        if byte_idx < HASH_SIZE {
+            hash[byte_idx] |= 1 << (7 - (b % 8));
+        }
+    }
+
+    /// Inclusive key range covered by the subtree at (depth, key): the ascent has
+    /// cleared the trailing `depth` bits, so the subtree is every key sharing the
+    /// leading 256-depth bits.
+    fn subtree_bounds(depth: usize, key: &[u8; HASH_SIZE]) -> ([u8; HASH_SIZE], [u8; HASH_SIZE]) {
+        let mut lo = *key;
+        let mut hi = *key;
+        for b in (TREE_DEPTH - depth)..TREE_DEPTH {
+            let byte_idx = b / 8;
+            let bit = 1u8 << (7 - (b % 8));
+            lo[byte_idx] &= !bit;
+            hi[byte_idx] |= bit;
+        }
+        (lo, hi)
+    }
+
+    /// Hash of a subtree at `depth` that holds exactly one leaf: climb the leaf up
+    /// `depth` levels against default siblings. Pure function of the leaf, which is
+    /// why the chain below a single-leaf node never has to be stored.
+    fn lonely_chain_hash(
+        &self,
+        leaf_key: &[u8; HASH_SIZE],
+        leaf_hash: [u8; HASH_SIZE],
+        depth: usize,
+    ) -> [u8; HASH_SIZE] {
+        let mut acc = leaf_hash;
+        let mut buffer = [0u8; HASH_SIZE * 2];
+        for d in 0..depth {
+            let sibling = self.default_hashes[d];
+            if Self::get_bit(leaf_key, d) {
+                buffer[..HASH_SIZE].copy_from_slice(&sibling);
+                buffer[HASH_SIZE..].copy_from_slice(&acc);
+            } else {
+                buffer[..HASH_SIZE].copy_from_slice(&acc);
+                buffer[HASH_SIZE..].copy_from_slice(&sibling);
+            }
+            let mut hasher = Sha3_256::new();
+            hasher.update(&buffer);
+            acc.copy_from_slice(&hasher.finalize());
+        }
+        acc
+    }
+
+    /// What sits under (depth, key): nothing, exactly one leaf, or a branch. Capped
+    /// at two so the probe stays O(log N) regardless of subtree size.
+    fn subtree_probe(&self, depth: usize, key: &[u8; HASH_SIZE]) -> SubtreeSpan {
+        let (lo, hi) = Self::subtree_bounds(depth, key);
+        if let Some(ref store) = self.node_store {
+            // Over-fetch by the tombstones INSIDE this range: the store still holds rows deleted
+            // this finalize, and truncating at 2 RAW rows before filtering them can report a branch
+            // as a single leaf — which then derives a chain hash for a multi-leaf subtree. Bounded
+            // by the local overlap, not the global count, so a large rollback does not turn every
+            // probe into a full-set fetch.
+            let want = 2usize.saturating_add(self.pending_leaf_dels.range(lo..=hi).count());
+            let found = store.leaves_under(&lo, &hi, want);
+            let live: Vec<_> = found
+                .into_iter()
+                .filter(|(k, _)| !self.pending_leaf_dels.contains(k))
+                .take(2)
+                .collect();
+            // In-mem holds this finalize's not-yet-flushed puts; merge so a freshly
+            // inserted neighbour is visible to the probe.
+            let mut seen = live;
+            for (k, v) in self.leaves.range(lo..=hi) {
+                if seen.len() >= 2 {
+                    break;
+                }
+                if !seen.iter().any(|(sk, _)| sk == k) {
+                    seen.push((*k, *v));
+                }
+            }
+            return match seen.len() {
+                0 => SubtreeSpan::Empty,
+                1 => SubtreeSpan::Single(seen[0].0, seen[0].1),
+                _ => SubtreeSpan::Branch,
+            };
+        }
+        let mut it = self.leaves.range(lo..=hi);
+        match (it.next(), it.next()) {
+            (None, _) => SubtreeSpan::Empty,
+            (Some((k, v)), None) => SubtreeSpan::Single(*k, *v),
+            _ => SubtreeSpan::Branch,
+        }
+    }
+
+    /// Node hash at (depth, key) with the single-leaf chain derived on the fly.
+    /// Returns `(hash, is_branch)`; a stored hit reports `true` because a stored node
+    /// is either a branch or the top of a chain, and in both cases its ancestors must
+    /// keep being stored.
+    fn node_resolve(&mut self, depth: usize, key: &[u8; HASH_SIZE]) -> ([u8; HASH_SIZE], bool) {
+        if depth == 0 {
+            return match self.leaf_get(key) {
+                Some(v) => (v, false),
+                None => (self.default_hashes[0], false),
+            };
+        }
+        if let Some(v) = self.node_get(depth as u32, key) {
+            return (v, true);
+        }
+        match self.subtree_probe(depth, key) {
+            SubtreeSpan::Empty => (self.default_hashes[depth], false),
+            SubtreeSpan::Single(lk, lv) => (self.lonely_chain_hash(&lk, lv, depth), false),
+            // A branch is always stored, so reaching here means the node set lost an entry it
+            // must hold. Refuse to serve a default (that would silently fork the root) and
+            // rebuild — but only for a subtree small enough to bound the work. Higher up the
+            // range approaches the whole keyspace, and folding 10M leaves under the merkle lock
+            // on a panic=abort binary is worse than the miss: signal it and let the caller's
+            // next full recompute repair the set.
+            SubtreeSpan::Branch => {
+                println!("[WARN][MERKLE] branch_node_missing depth={} key={}",
+                         depth, hex::encode(&key[..8]));
+                // Rebuild in place only while the fold is bounded; otherwise mark the pass invalid
+                // and let finalize redo it as a full recompute. Folding 10M leaves under the merkle
+                // lock on a panic=abort binary is worse than the miss. The value returned here is
+                // never observed: the caller's result is discarded.
+                let (lo, hi) = Self::subtree_bounds(depth, key);
+                let probe = REBUILD_SUBTREE_MAX_LEAVES.saturating_add(1);
+                let under = match self.node_store.clone() {
+                    Some(store) => store.leaves_under(&lo, &hi, probe).len(),
+                    None => self.leaves.range(lo..=hi).take(probe).count(),
+                };
+                if under <= REBUILD_SUBTREE_MAX_LEAVES {
+                    (self.rebuild_subtree(depth, key), true)
+                } else {
+                    println!("[ERR][MERKLE] branch_rebuild_deferred depth={} leaves_over={} action=full_recompute",
+                             depth, REBUILD_SUBTREE_MAX_LEAVES);
+                    self.incremental_pass_invalid = true;
+                    (self.default_hashes[depth], true)
+                }
+            }
+        }
+    }
+
+    /// Recompute a subtree hash bottom-up straight from its leaves. Recovery path for
+    /// a branch node missing from the node set; never taken in steady state.
+    fn rebuild_subtree(&self, depth: usize, key: &[u8; HASH_SIZE]) -> [u8; HASH_SIZE] {
+        let (lo, hi) = Self::subtree_bounds(depth, key);
+        let mut level: BTreeMap<[u8; HASH_SIZE], [u8; HASH_SIZE]> = self
+            .leaves
+            .range(lo..=hi)
+            .map(|(k, v)| (*k, *v))
+            .collect();
+        if let Some(ref store) = self.node_store {
+            for (k, v) in store.leaves_under(&lo, &hi, usize::MAX) {
+                if !self.pending_leaf_dels.contains(&k) {
+                    level.entry(k).or_insert(v);
+                }
+            }
+        }
+        if level.is_empty() {
+            return self.default_hashes[depth];
+        }
+        let mut buffer = [0u8; HASH_SIZE * 2];
+        for d in 0..depth {
+            let default = self.default_hashes[d];
+            let mut next: BTreeMap<[u8; HASH_SIZE], [u8; HASH_SIZE]> = BTreeMap::new();
+            for (k, v) in level.iter() {
+                let mut parent = *k;
+                Self::clear_bit(&mut parent, d);
+                if next.contains_key(&parent) {
+                    continue;
+                }
+                let mut sib = *k;
+                Self::flip_bit(&mut sib, d);
+                let sibling = level.get(&sib).copied().unwrap_or(default);
+                if Self::get_bit(k, d) {
+                    buffer[..HASH_SIZE].copy_from_slice(&sibling);
+                    buffer[HASH_SIZE..].copy_from_slice(v);
+                } else {
+                    buffer[..HASH_SIZE].copy_from_slice(v);
+                    buffer[HASH_SIZE..].copy_from_slice(&sibling);
+                }
+                let mut hasher = Sha3_256::new();
+                let mut ph = [0u8; HASH_SIZE];
+                hasher.update(&buffer);
+                ph.copy_from_slice(&hasher.finalize());
+                next.insert(parent, ph);
+            }
+            level = next;
+        }
+        level.values().next().copied().unwrap_or(self.default_hashes[depth])
+    }
+
     fn recompute_root(&mut self) {
         // Full rebuild recomputes the ENTIRE non-default node set below; under a
         // store the flush must replace (not merge) the persisted node set so no
@@ -930,7 +1169,7 @@ impl StateMerkleTree {
         // the END of finalize, so `all_leaves()` alone would miss them. In-mem
         // wins on key collisions — it holds the newest value. BTreeMap keeps the
         // set sorted → order-independent, so the root is byte-identical to None.
-        let mut current_level: BTreeMap<[u8; HASH_SIZE], [u8; HASH_SIZE]> =
+        let current_level: BTreeMap<[u8; HASH_SIZE], [u8; HASH_SIZE]> =
             match self.node_store {
                 None => self.leaves.clone(),
                 Some(ref store) => {
@@ -961,12 +1200,17 @@ impl StateMerkleTree {
         self.clear_nodes();
         let mut buffer = [0u8; HASH_SIZE * 2];
 
+        // Value carries `is_branch` (≥2 leaves under it) alongside the hash: it is
+        // what decides whether a node has to be persisted at all.
+        let mut level: BTreeMap<[u8; HASH_SIZE], ([u8; HASH_SIZE], bool)> =
+            current_level.into_iter().map(|(k, v)| (k, (v, false))).collect();
+
         for depth in 0..TREE_DEPTH {
             let default = self.default_hashes[depth];
-            let mut next_level: BTreeMap<[u8; HASH_SIZE], [u8; HASH_SIZE]> = BTreeMap::new();
+            let mut next_level: BTreeMap<[u8; HASH_SIZE], ([u8; HASH_SIZE], bool)> = BTreeMap::new();
             let mut processed: std::collections::HashSet<[u8; HASH_SIZE]> = std::collections::HashSet::new();
 
-            for (key, value) in current_level.iter() {
+            for (key, (value, branch)) in level.iter() {
                 if processed.contains(key) {
                     continue;
                 }
@@ -974,7 +1218,21 @@ impl StateMerkleTree {
                 let is_right = Self::get_bit(key, depth);
                 let mut sibling_key = *key;
                 Self::flip_bit(&mut sibling_key, depth);
-                let sibling = current_level.get(&sibling_key).copied().unwrap_or(default);
+                let sib = level.get(&sibling_key).copied();
+                let (sibling, sib_branch) = sib.unwrap_or((default, false));
+
+                // STORE RULE: persist a node only when it is a branch or has a live
+                // sibling. Everything skipped is the interior of a single-leaf chain,
+                // which `node_resolve` derives from the leaf. This is what turns
+                // ~(256-log2 N) stored nodes per leaf into ~3.
+                if depth >= 1 {
+                    if sib.is_some() {
+                        self.node_put(depth as u32, *key, *value);
+                        self.node_put(depth as u32, sibling_key, sibling);
+                    } else if *branch {
+                        self.node_put(depth as u32, *key, *value);
+                    }
+                }
 
                 if is_right {
                     buffer[..HASH_SIZE].copy_from_slice(&sibling);
@@ -992,25 +1250,15 @@ impl StateMerkleTree {
 
                 // v3.40: parent key has bit at depth CLEARED (both siblings → same parent).
                 let mut actual_parent = *key;
-                let byte_idx = depth / 8;
-                let bit_idx = 7 - (depth % 8);
-                if byte_idx < HASH_SIZE {
-                    actual_parent[byte_idx] &= !(1 << bit_idx);
-                }
+                Self::clear_bit(&mut actual_parent, depth);
 
-                next_level.insert(actual_parent, parent_hash);
-                // v32.14: cache parent in intermediate_nodes (keyed by level depth+1).
-                // Skip storing default values to keep the map sparse. Routed
-                // through node_put so a store delta records the write.
-                let parent_level = (depth + 1) as u32;
-                if parent_hash != self.default_hashes[depth + 1] {
-                    self.node_put(parent_level, actual_parent, parent_hash);
-                }
+                let parent_branch = sib.is_some() || *branch || sib_branch;
+                next_level.insert(actual_parent, (parent_hash, parent_branch));
                 processed.insert(*key);
                 processed.insert(sibling_key);
             }
 
-            current_level = next_level;
+            level = next_level;
             // v32.14: true SMT semantics — always walk to TREE_DEPTH so root
             // sits at a fixed depth. Prior early-exit at len<=1 produced a
             // shallower root for sparse states and broke incremental↔full
@@ -1020,8 +1268,13 @@ impl StateMerkleTree {
 
         // TREE_DEPTH=HASH bits → all leaves converge to ONE entry at level TREE_DEPTH.
         // unwrap fallback only fires for an empty tree (already short-circuited above).
-        self.root = current_level.values().next().copied()
+        self.root = level.values().next().map(|(h, _)| *h)
             .unwrap_or(self.default_hashes[TREE_DEPTH]);
+        // The root is read back by name every incremental pass; it has no sibling,
+        // so the store rule above would never have written it.
+        if self.root != self.default_hashes[TREE_DEPTH] {
+            self.node_put(TREE_DEPTH as u32, [0u8; HASH_SIZE], self.root);
+        }
     }
 
     /// v32.14: level-synchronous BFS incremental update. Each level d reads
@@ -1030,76 +1283,126 @@ impl StateMerkleTree {
     /// via BTreeSet sorted iteration. Sibling dedup avoids double-computing
     /// shared parents. Produces identical root to recompute_root() for the
     /// same leaf set. O(k × log N) per finalize where k = changed leaves.
+    /// First depth whose subtree around `key` holds a leaf OTHER than `key`. Below it
+    /// the sibling on every level is provably empty, so the ascent reads nothing
+    /// there — without this the compressed fold would probe once per level.
+    /// Monotone in depth (subtrees only grow), so a binary search is exact.
+    fn first_foreign_depth(&self, key: &[u8; HASH_SIZE]) -> usize {
+        let foreign = |span: SubtreeSpan| match span {
+            SubtreeSpan::Empty => false,
+            SubtreeSpan::Single(k, _) => &k != key,
+            SubtreeSpan::Branch => true,
+        };
+        if !foreign(self.subtree_probe(TREE_DEPTH, key)) {
+            return TREE_DEPTH + 1; // alone in the whole tree
+        }
+        let (mut lo, mut hi) = (0usize, TREE_DEPTH);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if foreign(self.subtree_probe(mid, key)) { hi = mid; } else { lo = mid + 1; }
+        }
+        lo
+    }
+
     fn recompute_levels(&mut self) {
-        use std::collections::BTreeSet;
-        let mut current_dirty: BTreeSet<[u8; HASH_SIZE]> =
-            self.dirty_paths.drain().collect();
+        // Frontier value: (hash, is_branch, first_foreign_depth).
+        let dirty: Vec<[u8; HASH_SIZE]> = self.dirty_paths.drain().collect();
+        let mut frontier: BTreeMap<[u8; HASH_SIZE], ([u8; HASH_SIZE], bool, usize)> = BTreeMap::new();
+        for k in dirty {
+            let h = self.leaf_get(&k).unwrap_or(self.default_hashes[0]);
+            let ffd = self.first_foreign_depth(&k);
+            frontier.insert(k, (h, false, ffd));
+        }
 
         let mut buffer = [0u8; HASH_SIZE * 2];
 
         for depth in 0..TREE_DEPTH {
-            let mut next_dirty: BTreeSet<[u8; HASH_SIZE]> = BTreeSet::new();
-            let byte_idx = depth / 8;
-            let bit_idx = 7 - (depth % 8);
+            let default = self.default_hashes[depth];
+            let mut next: BTreeMap<[u8; HASH_SIZE], ([u8; HASH_SIZE], bool, usize)> = BTreeMap::new();
+            let keys: Vec<[u8; HASH_SIZE]> = frontier.keys().copied().collect();
+            let mut processed: std::collections::HashSet<[u8; HASH_SIZE]> =
+                std::collections::HashSet::new();
 
-            for key in &current_dirty {
-                // Parent key at depth+1: clear bit at depth (left child of pair).
-                let mut parent_key = *key;
-                if byte_idx < HASH_SIZE {
-                    parent_key[byte_idx] &= !(1 << bit_idx);
-                }
-                if !next_dirty.insert(parent_key) {
-                    // sibling already triggered this parent — skip duplicate work
+            for key in keys {
+                if processed.contains(&key) {
                     continue;
                 }
+                let (value, branch, ffd) = frontier[&key];
+                let mut sibling_key = key;
+                Self::flip_bit(&mut sibling_key, depth);
+                processed.insert(key);
+                processed.insert(sibling_key);
 
-                // Both children at depth d: left = bit_d=0, right = bit_d=1.
-                let left_key = parent_key;
-                let mut right_key = parent_key;
-                if byte_idx < HASH_SIZE {
-                    right_key[byte_idx] |= 1 << bit_idx;
+                // Sibling precedence: another dirty node at this depth, else the
+                // stored/derived node — skipped entirely below `ffd`, where no other
+                // leaf can exist.
+                // The sibling is part of the PARENT subtree, so it is provably empty
+                // only while the parent (depth+1) still holds no foreign leaf.
+                let (sibling, sib_branch) = match frontier.get(&sibling_key).copied() {
+                    Some((sv, sb, _)) => (sv, sb),
+                    None if depth + 1 < ffd => (default, false),
+                    None => self.node_resolve(depth, &sibling_key),
+                };
+
+                let value_live = value != default;
+                let sibling_live = sibling != default;
+
+                // STORE RULE (mirrors recompute_root): a node is persisted only when
+                // it is a branch or has a live sibling. Chain interiors are derived.
+                //
+                // "Not stored" MUST mean deleted, never skipped. recompute_root can leave the
+                // negative case implicit because it wipes the node set first; this path has no
+                // wipe, so a skip leaves a row that was a chain TOP before a deletion still
+                // holding its pre-deletion hash, and the next finalize writing into the vacated
+                // region folds that stale row straight back into the root.
+                if depth >= 1 {
+                    if value_live && (branch || sibling_live) {
+                        self.node_put(depth as u32, key, value);
+                    } else {
+                        self.node_del(depth as u32, key);
+                    }
+                    if sibling_live && (sib_branch || value_live) {
+                        self.node_put(depth as u32, sibling_key, sibling);
+                    } else {
+                        self.node_del(depth as u32, sibling_key);
+                    }
                 }
 
-                // Reads routed through accessors: pure map reads when store is
-                // None, read-through (cache-populating) when store is Some.
-                let left_hash = if depth == 0 {
-                    self.leaf_get(&left_key)
-                        .unwrap_or(self.default_hashes[0])
+                let mut parent_key = key;
+                Self::clear_bit(&mut parent_key, depth);
+                if Self::get_bit(&key, depth) {
+                    buffer[..HASH_SIZE].copy_from_slice(&sibling);
+                    buffer[HASH_SIZE..].copy_from_slice(&value);
                 } else {
-                    self.node_get(depth as u32, &left_key)
-                        .unwrap_or(self.default_hashes[depth])
-                };
-                let right_hash = if depth == 0 {
-                    self.leaf_get(&right_key)
-                        .unwrap_or(self.default_hashes[0])
-                } else {
-                    self.node_get(depth as u32, &right_key)
-                        .unwrap_or(self.default_hashes[depth])
-                };
-
-                buffer[..HASH_SIZE].copy_from_slice(&left_hash);
-                buffer[HASH_SIZE..].copy_from_slice(&right_hash);
+                    buffer[..HASH_SIZE].copy_from_slice(&value);
+                    buffer[HASH_SIZE..].copy_from_slice(&sibling);
+                }
                 let mut hasher = Sha3_256::new();
                 hasher.update(&buffer);
-                let result = hasher.finalize();
                 let mut parent_hash = [0u8; HASH_SIZE];
-                parent_hash.copy_from_slice(&result);
+                parent_hash.copy_from_slice(&hasher.finalize());
 
-                let parent_level = (depth + 1) as u32;
-                if parent_hash == self.default_hashes[depth + 1] {
-                    self.node_del(parent_level, parent_key);
-                } else {
-                    self.node_put(parent_level, parent_key, parent_hash);
-                }
+                let parent_branch = (value_live && sibling_live) || branch || sib_branch;
+                // Once merged the shortcut no longer applies; keep it only while the
+                // parent still covers a single leaf.
+                let parent_ffd = if parent_branch { 0 } else { ffd };
+                next.insert(parent_key, (parent_hash, parent_branch, parent_ffd));
             }
 
-            current_dirty = next_dirty;
+            frontier = next;
         }
 
         // TREE_DEPTH = address bit-width → all paths converge to the all-zero
         // canonical key at the top level. Empty/default subtree → default root.
-        self.root = self.node_get(TREE_DEPTH as u32, &[0u8; HASH_SIZE])
+        self.root = frontier
+            .get(&[0u8; HASH_SIZE])
+            .map(|(h, _, _)| *h)
             .unwrap_or(self.default_hashes[TREE_DEPTH]);
+        if self.root != self.default_hashes[TREE_DEPTH] {
+            self.node_put(TREE_DEPTH as u32, [0u8; HASH_SIZE], self.root);
+        } else {
+            self.node_del(TREE_DEPTH as u32, [0u8; HASH_SIZE]);
+        }
     }
 }
 
@@ -1118,20 +1421,17 @@ pub struct BalanceProof {
     pub balance: u64,
     /// Nonce
     pub nonce: u64,
-    /// FIX R23-C2: Include pending_rewards so verify_balance_proof can reconstruct
-    /// the correct Account hash after v7.0 fork (PENDING_REWARDS_IN_MERKLE=true).
-    /// Without this, all proofs for accounts with pending_rewards > 0 fail verification.
-    pub pending_rewards: u64,
     /// Every remaining input to the account leaf hash. Without them the light client reconstructs the
     /// leaf with zeros, so verification is permanently FALSE for any wallet that has ever claimed a
-    /// reward (last_claimed_epoch != 0) or any node that has ever heartbeated. Fixed schema, same rule
-    /// as pending_rewards: always present, never conditional.
+    /// reward (last_claimed_epoch != 0) or any node that has ever heartbeated. Fixed schema:
+    /// always present, never conditional.
     pub heartbeat_epoch: u64,
     pub heartbeat_slots: u16,
     pub heartbeat_final_epoch: u64,
     pub heartbeat_final_slots: u16,
     pub last_claimed_epoch: u64,
     pub banned_at_height: u64,
+    pub is_node: bool,
     /// Merkle proof (sibling_hash, is_right)
     pub proof: Vec<([u8; HASH_SIZE], bool)>,
     /// State root this proof is valid for
@@ -1150,16 +1450,17 @@ pub struct TokenBalanceProof {
     pub contract_address: String,
     pub account_balance: u64,
     pub account_nonce: u64,
-    pub account_pending_rewards: u64,
     pub contract_code_hash: Option<String>,
     pub storage_root: [u8; HASH_SIZE],
     pub heartbeat_epoch: u64,
     pub heartbeat_slots: u16,
     pub heartbeat_final_epoch: u64,
     pub heartbeat_final_slots: u16,
+    /// Claim watermark and consensus ban carried in the leaf — both must be reproduced or a
+    /// holder that ever claimed or was banned fails verification.
     pub last_claimed_epoch: u64,
-    /// Consensus ban carried in the leaf — must be reproduced or a banned holder's proof fails.
     pub banned_at_height: u64,
+    pub is_node: bool,
     pub account_proof: Vec<([u8; HASH_SIZE], bool)>,
     // Level-2: balance:{holder} leaf → storage_root
     pub holder: String,
@@ -2142,13 +2443,13 @@ impl StateManager {
             address: address.to_string(),
             balance: account.balance,
             nonce: account.nonce,
-            pending_rewards: account.pending_rewards,  // FIX R23-C2
             heartbeat_epoch: account.heartbeat_epoch,
             heartbeat_slots: account.heartbeat_slots,
             heartbeat_final_epoch: account.heartbeat_final_epoch,
             heartbeat_final_slots: account.heartbeat_final_slots,
             last_claimed_epoch: account.last_claimed_epoch,
             banned_at_height: account.banned_at_height,
+            is_node: account.is_node,
             proof,
             state_root,
             block_height: chain_state.height,
@@ -2199,15 +2500,15 @@ impl StateManager {
             contract_address: contract.to_string(),
             account_balance: account.balance,
             account_nonce: account.nonce,
-            account_pending_rewards: account.pending_rewards,
             contract_code_hash: account.contract_code_hash.clone(),
             storage_root: account.storage_root,
             heartbeat_epoch: account.heartbeat_epoch,
             heartbeat_slots: account.heartbeat_slots,
             heartbeat_final_epoch: account.heartbeat_final_epoch,
             heartbeat_final_slots: account.heartbeat_final_slots,
-            banned_at_height: account.banned_at_height,
             last_claimed_epoch: account.last_claimed_epoch,
+            banned_at_height: account.banned_at_height,
+            is_node: account.is_node,
             account_proof,
             holder: holder.to_string(),
             token_balance,
@@ -2234,17 +2535,16 @@ impl StateManager {
         // Copy the scalar metadata (O(1)) and DROP the account Ref before taking merkle_tree — never hold
         // an accounts shard lock across the tree lock (matches the apply-path lock order). A non-resident
         // (evicted) contract defers metadata capture to Level-2's off-lock disk read (need_disk=true).
-        let (need_disk, addr, balance, nonce, pending, code_hash, sroot, hb_e, hb_s, hb_fe, hb_fc, lce, ban_h) =
+        let (need_disk, addr, balance, nonce, code_hash, sroot, hb_e, hb_s, hb_fe, hb_fc, lce, ban_h, is_nd) =
             match self.accounts.get(contract) {
                 Some(acc) => {
                     if !acc.is_contract { return None; }
-                    (false, acc.address.clone(), acc.balance, acc.nonce, acc.pending_rewards,
+                    (false, acc.address.clone(), acc.balance, acc.nonce,
                      acc.contract_code_hash.clone(), acc.storage_root, acc.heartbeat_epoch, acc.heartbeat_slots,
                      acc.heartbeat_final_epoch, acc.heartbeat_final_slots, acc.last_claimed_epoch,
-                     acc.banned_at_height)
+                     acc.banned_at_height, acc.is_node)
                 }
-                None => (true, contract.to_string(), 0u64, 0u64, 0u64, None, [0u8; 32], 0u64, 0u16, 0u64, 0u16,
-                         0u64, 0u64),
+                None => (true, contract.to_string(), 0u64, 0u64, None, [0u8; 32], 0u64, 0u16, 0u64, 0u16, 0u64, 0u64, false),
             };
         let (account_proof, state_root) = {
             let mut tree = self.merkle_tree.write();
@@ -2254,9 +2554,10 @@ impl StateManager {
         let store = self.disk_store.read().clone(); // O(1) Arc clone — used only on the evicted (need_disk) path
         let partial = TokenBalanceProof {
             contract_address: addr, account_balance: balance, account_nonce: nonce,
-            account_pending_rewards: pending, contract_code_hash: code_hash, storage_root: sroot,
+            contract_code_hash: code_hash, storage_root: sroot,
             heartbeat_epoch: hb_e, heartbeat_slots: hb_s, heartbeat_final_epoch: hb_fe,
-            heartbeat_final_slots: hb_fc, last_claimed_epoch: lce, banned_at_height: ban_h, account_proof,
+            heartbeat_final_slots: hb_fc, last_claimed_epoch: lce, banned_at_height: ban_h,
+            is_node: is_nd, account_proof,
             holder: String::new(), token_balance: String::new(), storage_proof: Vec::new(),
             state_root, block_height: height,
         };
@@ -2295,7 +2596,6 @@ impl StateManager {
             partial.contract_address = acc.address.clone();
             partial.account_balance = acc.balance;
             partial.account_nonce = acc.nonce;
-            partial.account_pending_rewards = acc.pending_rewards;
             partial.contract_code_hash = acc.contract_code_hash.clone();
             partial.storage_root = acc.storage_root;
             partial.heartbeat_epoch = acc.heartbeat_epoch;
@@ -2304,6 +2604,7 @@ impl StateManager {
             partial.heartbeat_final_slots = acc.heartbeat_final_slots;
             partial.last_claimed_epoch = acc.last_claimed_epoch;
             partial.banned_at_height = acc.banned_at_height;
+            partial.is_node = acc.is_node;
             acc
         } else {
             let acc = accounts.get(contract)?.clone(); // O(holders) clone, OFF the outer state lock
@@ -2330,8 +2631,7 @@ impl StateManager {
             address: proof.address.clone(),
             balance: proof.balance,
             nonce: proof.nonce,
-            pending_rewards: proof.pending_rewards,
-            is_node: false,
+            is_node: proof.is_node,
             node_type: None,
             reputation: 0.70, // Default reputation
             created_at: 0,
@@ -2380,8 +2680,7 @@ impl StateManager {
             address: proof.contract_address.clone(),
             balance: proof.account_balance,
             nonce: proof.account_nonce,
-            pending_rewards: proof.account_pending_rewards,
-            is_node: false,
+            is_node: proof.is_node,
             node_type: None,
             reputation: 0.70,
             created_at: 0,
@@ -2929,92 +3228,6 @@ impl StateManager {
         self.chain_state.read().clone()
     }
     
-    /// v2.96: Update pending rewards for a node (after emission processing)
-    /// v3.11: Also updates State Merkle Tree
-    /// v3.22: Uses lazy Merkle update - call finalize_merkle() after batch
-    /// CRITICAL SECURITY: This ensures all nodes have same pending_rewards on-chain
-    /// Prevents manipulation of local RocksDB to claim fraudulent rewards
-    /// v2.100: BUGFIX - Use SET (=) not ADD (+=)!
-    /// get_all_pending_rewards() returns TOTAL accumulated amount from reward_manager
-    /// Using += caused DOUBLE accumulation: reward_manager accumulates + state accumulates again
-    pub fn update_pending_rewards(&self, node_wallet: &str, reward_amount: u64) -> StateResult<()> {
-        let mut account = self.accounts.entry(node_wallet.to_string())
-            .or_insert_with(|| Account::new(node_wallet.to_string()));
-
-        // SET not ADD — reward_amount is TOTAL accumulated from PhaseAwareRewardManager
-        account.pending_rewards = reward_amount;
-
-        // Merkle tree is NOT updated here — it will be updated deterministically
-        // when the next block's apply_transaction_lazy + finalize_merkle runs.
-        // Updating Merkle out-of-band causes state_root divergence between nodes
-        // that process MacroBlocks at different times.
-
-        println!("[INFO][STATE] pending_rewards_updated wallet={}... amount={} QNC",
-                 crate::char_prefix(&node_wallet, 16),
-                 reward_amount / 1_000_000_000);
-
-        Ok(())
-    }
-    
-    /// v7.0: Accrue pending rewards through deterministic block execution.
-    /// Uses ADD semantics (+=) because the delta comes from emission TX data.
-    /// Updates the Merkle tree so pending_rewards is verified by consensus.
-    /// Activates the PENDING_REWARDS_IN_MERKLE fork flag on first call.
-    pub fn accrue_pending_rewards(&self, node_wallet: &str, delta: u64) -> StateResult<()> {
-        // Activate fork: from this point, all hash_account() calls include pending_rewards
-        activate_pending_rewards_in_merkle();
-        
-        let mut account = self.accounts.entry(node_wallet.to_string())
-            .or_insert_with(|| Account::new(node_wallet.to_string()));
-
-        account.pending_rewards = account.pending_rewards.saturating_add(delta);
-
-        {
-            let mut tree = self.merkle_tree.write();
-            tree.insert_lazy(node_wallet, &account);
-        }
-
-        println!("[INFO][STATE] pending_rewards_accrued wallet={}... delta={} total={} QNC",
-                 crate::char_prefix(&node_wallet, 16),
-                 delta / 1_000_000_000,
-                 account.pending_rewards / 1_000_000_000);
-
-        Ok(())
-    }
-
-    /// v3 merkle-claim credit: credit a proof-verified reward into the wallet's balance and
-    /// advance the per-account claim watermark. Anti-replay: returns false (no-op) if the
-    /// account already claimed this epoch or a later one. The merkle proof itself is verified
-    /// by the caller (node.rs apply, which holds the epoch root); this enforces the watermark
-    /// and applies the balance credit + Merkle update atomically under the state lock.
-    pub fn claim_reward(&self, wallet: &str, epoch: u64, amount: u64) -> bool {
-        let mut account = self.accounts.entry(wallet.to_string())
-            .or_insert_with(|| Account::new(wallet.to_string()));
-        if epoch <= account.last_claimed_epoch {
-            return false;
-        }
-        account.balance = account.balance.saturating_add(amount);
-        account.last_claimed_epoch = epoch;
-        {
-            let mut tree = self.merkle_tree.write();
-            tree.insert_lazy(wallet, &account);
-        }
-        true
-    }
-
-    /// Highest reward epoch this account has already claimed (0 if never claimed).
-    /// The RPC uses it to find the next unclaimed epoch to build a merkle claim for.
-    pub fn get_last_claimed_epoch(&self, wallet: &str) -> u64 {
-        self.accounts.get(wallet).map(|a| a.last_claimed_epoch).unwrap_or(0)
-    }
-
-    /// v2.96: Get pending rewards for an account
-    pub fn get_pending_rewards(&self, wallet: &str) -> u64 {
-        self.accounts.get(wallet)
-            .map(|acc| acc.pending_rewards)
-            .unwrap_or(0)
-    }
-    
     /// v2.98: Get all accounts for state snapshot (blockchain persistence)
     /// 
     /// SCALABILITY:
@@ -3170,6 +3383,94 @@ impl StateManager {
         Ok(actual_emission)
     }
     
+    /// The account every minted reward lands in until it is collected. Emission used to move a
+    /// counter and credit nobody, so minted value belonged to no account and supply could never be
+    /// reconciled against balances. Holding it here gives the residue one deterministic destination.
+    pub const REWARDS_POOL: &'static str = "system_rewards_pool";
+
+    /// Credit freshly minted value to the rewards pool. Callers pass what `emit_rewards` ACTUALLY
+    /// returned, never the requested amount — the two differ at the supply cap.
+    ///
+    /// `warm_account` first: `accounts` is a bounded LRU, so an `entry().or_insert_with` on a cold
+    /// key would create a zero-balance account over the real one and journal the fabricated version
+    /// as the pre-image.
+    pub fn credit_rewards_pool(&self, minted: u64) {
+        if minted == 0 {
+            return;
+        }
+        self.warm_account(Self::REWARDS_POOL);
+        let mut account = self
+            .accounts
+            .entry(Self::REWARDS_POOL.to_string())
+            .or_insert_with(|| Account::new(Self::REWARDS_POOL.to_string()))
+            .clone();
+        account.balance = account.balance.saturating_add(minted);
+        // Must reach the merkle tree: total_supply enters state_root on its own, so a balance that
+        // skips insert_lazy is not committed anywhere.
+        self.merkle_tree.write().insert_lazy(Self::REWARDS_POOL, &account);
+        self.accounts.insert(Self::REWARDS_POOL.to_string(), account);
+    }
+
+    /// Credit a proof-verified epoch reward: move `amount` out of the rewards pool into `wallet`
+    /// and advance the monotonic claim watermark. Returns false when the claim is a replay
+    /// (epoch <= watermark) or the pool is short.
+    ///
+    /// BOTH leaves move, so the caller MUST list `wallet` AND `REWARDS_POOL` as affected addresses —
+    /// that list drives the lazy pre-load and the rollback journal alike. The pool debit is the
+    /// counterpart of `credit_rewards_pool`: without it a claim would mint a second time.
+    ///
+    /// A short pool is fail-closed and deterministic — the pool balance is in state_root, so every
+    /// node reaches the same verdict — and the watermark does not move, so the wallet may retry.
+    pub fn claim_reward(&self, wallet: &str, epoch: u64, amount: u64) -> bool {
+        self.warm_account(Self::REWARDS_POOL);
+        self.warm_account(wallet);
+        let mut pool = self
+            .accounts
+            .entry(Self::REWARDS_POOL.to_string())
+            .or_insert_with(|| Account::new(Self::REWARDS_POOL.to_string()))
+            .clone();
+        let mut account = self
+            .accounts
+            .entry(wallet.to_string())
+            .or_insert_with(|| Account::new(wallet.to_string()))
+            .clone();
+        if epoch <= account.last_claimed_epoch {
+            return false;
+        }
+        let remaining = match pool.balance.checked_sub(amount) {
+            Some(r) => r,
+            None => {
+                println!("[CRIT][REWARDS] pool_underfunded epoch={} amount={} pool={} action=refuse",
+                         epoch, amount, pool.balance);
+                return false;
+            }
+        };
+        let credited = match account.balance.checked_add(amount) {
+            Some(b) => b,
+            None => return false,
+        };
+        pool.balance = remaining;
+        account.balance = credited;
+        account.last_claimed_epoch = epoch;
+        {
+            let mut tree = self.merkle_tree.write();
+            tree.insert_lazy(Self::REWARDS_POOL, &pool);
+            tree.insert_lazy(wallet, &account);
+        }
+        self.accounts.insert(Self::REWARDS_POOL.to_string(), pool);
+        self.accounts.insert(wallet.to_string(), account);
+        true
+    }
+
+    /// Highest reward epoch this wallet has already claimed (0 when it never has).
+    ///
+    /// Through `read_account`, never a bare cache probe: `accounts` is a bounded LRU, so an evicted
+    /// wallet would read as watermark 0 and every caller would treat its already-credited epochs as
+    /// still owed — the claimable figure the wallet displays, and the quote it is asked to sign.
+    pub fn get_last_claimed_epoch(&self, wallet: &str) -> u64 {
+        self.read_account(wallet).map(|a| a.last_claimed_epoch).unwrap_or(0)
+    }
+
     /// Get current total supply
     pub fn get_total_supply(&self) -> u64 {
         self.chain_state.read().total_supply
@@ -3227,7 +3528,6 @@ mod merkle_equiv_tests {
         let mut a = Account::new(format!("acct{:060x}", i));
         a.balance = i.wrapping_mul(1_000_003);
         a.nonce = i % 7;
-        a.pending_rewards = i % 13;
         a
     }
 
@@ -3659,6 +3959,45 @@ mod merkle_equiv_tests {
                    "streamed per-row insert must equal insert_batch root (leaf-set-keyed)");
     }
 
+    /// A full-state reset must forget the old leaf set. Under a disk store the reset dropped only
+    /// the in-memory map, so recompute_root re-seeded from all_leaves() and the first root after a
+    /// clear or snapshot restore committed old ∪ new — a divergence on exactly the paths a relaunch
+    /// runs (restart, reorg reconcile, cold join).
+    #[test]
+    fn full_reset_forgets_the_stores_prior_leaf_set() {
+        let store = std::sync::Arc::new(MockNodeStore::new());
+
+        let mut old = StateMerkleTree::new();
+        old.set_node_store(store.clone());
+        for i in 0..8u64 {
+            let mut a = Account::new(format!("gone_{}", i));
+            a.balance = 500 + i;
+            old.insert_lazy(&a.address.clone(), &a);
+        }
+        old.finalize();
+        assert!(!store.all_leaves().is_empty(), "the store really holds the old state");
+
+        // The reset every full-state path goes through, then the new state.
+        old.reset_preserving_store();
+        let mut b = Account::new("kept".to_string());
+        b.balance = 42;
+        old.insert_lazy(&b.address.clone(), &b);
+        let after_reset = old.finalize();
+
+        // The same single-account state built with no history behind it.
+        let fresh_store = std::sync::Arc::new(MockNodeStore::new());
+        let mut fresh = StateMerkleTree::new();
+        fresh.set_node_store(fresh_store);
+        let mut c = Account::new("kept".to_string());
+        c.balance = 42;
+        fresh.insert_lazy(&c.address.clone(), &c);
+        let reference = fresh.finalize();
+
+        assert_eq!(after_reset, reference,
+                   "a reset tree must commit ONLY the state restored into it");
+        assert_eq!(store.all_leaves().len(), 1, "the abandoned leaves are gone from disk too");
+    }
+
     // In-memory MerkleNodeStore mock: a durable mirror behind a Mutex. Exercises
     // the read-through/eviction path without any external dependency.
     struct MockNodeStore {
@@ -3681,6 +4020,13 @@ mod merkle_equiv_tests {
         }
         fn all_leaves(&self) -> Vec<([u8; 32], [u8; 32])> {
             self.inner.lock().unwrap().0.iter().map(|(k, v)| (*k, *v)).collect()
+        }
+        fn wipe_leaves(&self) -> Result<(), String> {
+            self.inner.lock().unwrap().0.clear();
+            Ok(())
+        }
+        fn leaves_under(&self, lo: &[u8; 32], hi: &[u8; 32], limit: usize) -> Vec<([u8; 32], [u8; 32])> {
+            self.inner.lock().unwrap().0.range(*lo..=*hi).take(limit).map(|(k, v)| (*k, *v)).collect()
         }
         fn put_batch(
             &self,
@@ -3747,7 +4093,6 @@ mod merkle_equiv_tests {
                 let mut a = Account::new(addr.clone());
                 a.balance = r.wrapping_mul(7);
                 a.nonce = op % 11;
-                a.pending_rewards = r % 17;
                 (addr, a)
             } else {
                 // re-write an existing address with a deterministic index-derived
@@ -3910,24 +4255,6 @@ mod cache_tests {
 
     /// B cutover anti-replay: claim_reward credits once per epoch and is monotonic.
     /// last_claimed_epoch is consensus-bound (SMT leaf) so this property holds network-wide.
-    #[test]
-    fn claim_reward_is_replay_and_monotonic_safe() {
-        let sm = StateManager::new();
-        // First claim for epoch 5 credits and sets the watermark.
-        assert!(sm.claim_reward("w", 5, 100), "first claim must credit");
-        assert_eq!(sm.accounts.get("w").unwrap().balance, 100);
-        assert_eq!(sm.accounts.get("w").unwrap().last_claimed_epoch, 5);
-        // Replaying the SAME epoch must be a no-op (no double credit).
-        assert!(!sm.claim_reward("w", 5, 100), "replaying the same epoch must not credit");
-        assert_eq!(sm.accounts.get("w").unwrap().balance, 100);
-        // An OLDER epoch must be rejected (watermark is monotonic).
-        assert!(!sm.claim_reward("w", 4, 100), "older epoch must not credit");
-        assert_eq!(sm.accounts.get("w").unwrap().balance, 100);
-        // A NEWER epoch credits and advances the watermark.
-        assert!(sm.claim_reward("w", 6, 50), "newer epoch must credit");
-        assert_eq!(sm.accounts.get("w").unwrap().balance, 150);
-        assert_eq!(sm.accounts.get("w").unwrap().last_claimed_epoch, 6);
-    }
 
     #[test]
     fn test_warm_account_cache_hit() {
@@ -4846,71 +5173,6 @@ mod proof_tests {
     }
 }
 
-#[cfg(test)]
-mod fork_flag_determinism_tests {
-    use super::*;
-    use crate::Account;
-
-    fn acct_pr(balance: u64, pending: u64, addr: &str) -> Account {
-        let mut a = Account::default();
-        a.balance = balance;
-        a.address = addr.to_string();
-        a.pending_rewards = pending;
-        a
-    }
-
-    /// Reproduces production consensus split: a zero-pending account hashes
-    /// DIFFERENTLY depending on the runtime PENDING_REWARDS_IN_MERKLE flag.
-    /// This non-determinism is the root cause — any full rebuild after the flag
-    /// flips re-hashes genesis accounts differently from the running incremental
-    /// state. Must run single-threaded (global flag).
-    #[test]
-    fn hash_account_must_be_flag_independent() {
-        reset_pending_rewards_in_merkle();
-        let a = acct_pr(1000, 0, "genesis_acct"); // pending=0
-        let h_off = StateMerkleTree::hash_account(&a);
-        activate_pending_rewards_in_merkle();
-        let h_on = StateMerkleTree::hash_account(&a);
-        reset_pending_rewards_in_merkle();
-        assert_eq!(h_off, h_on,
-            "zero-pending account must hash identically regardless of flag — \
-             a flag-dependent hash makes merkle non-deterministic across \
-             running vs rebuilt nodes");
-    }
-
-    /// End-to-end: genesis hashed flag=false, flip flag, accrue, then full
-    /// rebuild with flag=true → incremental root must equal full rebuild root.
-    #[test]
-    fn incremental_must_equal_full_across_flag_flip() {
-        reset_pending_rewards_in_merkle();
-        let genesis: Vec<(String, Account)> = (0..10)
-            .map(|i| (format!("g_{}", i), acct_pr(1000 + i as u64, 0, &format!("g_{}", i))))
-            .collect();
-        let mut tree = StateMerkleTree::new();
-        for (a, c) in &genesis { tree.insert_lazy(a, c); }
-        let _ = tree.finalize(); // full rebuild, flag=false
-
-        activate_pending_rewards_in_merkle(); // emission flips flag
-        let r1 = acct_pr(0, 50286, "reward_1");
-        let r2 = acct_pr(0, 50286, "reward_2");
-        tree.insert_lazy("reward_1", &r1);
-        tree.insert_lazy("reward_2", &r2);
-        let incremental_root = tree.finalize(); // incremental; 10 genesis kept flag=false hashes
-
-        // Rollback/snapshot path: rebuild from scratch with flag=true.
-        let mut combined = genesis.clone();
-        combined.push(("reward_1".to_string(), r1));
-        combined.push(("reward_2".to_string(), r2));
-        let mut tree2 = StateMerkleTree::new();
-        for (a, c) in &combined { tree2.insert_lazy(a, c); }
-        tree2.incremental_enabled = false;
-        let full_root = tree2.finalize(); // full rebuild, flag=true → all re-hashed
-
-        reset_pending_rewards_in_merkle();
-        assert_eq!(incremental_root, full_root,
-            "running incremental root must equal post-rollback full rebuild root");
-    }
-}
 
 
 #[cfg(test)]
@@ -4938,13 +5200,158 @@ mod tests_smt_node_growth {
             let nodes = t.intermediate_nodes.len();
             let per_leaf = nodes as f64 / n as f64;
             let log2n = (n as f64).log2();
-            println!("[SMT] leaves={} nodes={} per_leaf={:.1} 256-log2(N)={:.1} claimed_bound=2N={}",
-                     n, nodes, per_leaf, 256.0 - log2n, 2 * n);
-            // Pins the MECHANISM, not the defect: the count tracks 256-log2(N) because every level
-            // below convergence stores one node for a leaf that is alone there. A compressed fold
-            // (leaf stubs instead of single-child chains) would bring this to the documented ~2.
-            assert!((per_leaf - (256.0 - log2n)).abs() < 1.0,
-                    "node growth should track 256-log2(N); got {:.1} vs {:.1}", per_leaf, 256.0 - log2n);
+            println!("[SMT] leaves={} nodes={} per_leaf={:.1} uncompressed_would_be={:.1}",
+                     n, nodes, per_leaf, 256.0 - log2n);
+            // The compressed fold stores only branch nodes and the top of each
+            // single-leaf chain, so the count is O(N) and independent of TREE_DEPTH.
+            // A regression to a per-level fold shows up here as ~(256-log2 N)/leaf.
+            assert!(per_leaf < 4.0,
+                    "compressed fold must stay O(1) nodes/leaf; got {:.1} at n={}", per_leaf, n);
+        }
+    }
+
+    /// Emits the vector pinned by the mobile verifier's jest test. The device folds
+    /// proofs in JS, so a bit-order change here silently breaks every light client
+    /// unless both sides are pinned to the same numbers.
+    #[test]
+    fn smt_cross_language_vector_is_pinned() {
+        let mut tree = StateMerkleTree::new();
+        let mut accts = Vec::new();
+        for i in 0..8u64 {
+            let mut a = Account::new(format!("vec_addr_{}", i));
+            a.balance = 1_000 + i;
+            a.nonce = i;
+            tree.insert_lazy(&a.address.clone(), &a);
+            accts.push(a);
+        }
+        let root = tree.finalize();
+        let target = &accts[3];
+        let proof = tree.generate_proof(&target.address);
+        assert!(StateMerkleTree::verify_proof(&target.address, target, &proof, &root));
+        println!("VECTOR_ADDRESS={}", target.address);
+        println!("VECTOR_BALANCE={}", target.balance);
+        println!("VECTOR_NONCE={}", target.nonce);
+        println!("VECTOR_ROOT={}", hex::encode(root));
+        // Mirrored verbatim by applications/qnet-mobile/__tests__/fixtures/smt_account_proof.json.
+        // Not a print-only emitter: with the assert on this side a leaf-preimage or bit-order change
+        // breaks `cargo test` in the commit that makes it, instead of leaving the device to fail
+        // every balance proof against a fixture nobody regenerated.
+        assert_eq!(hex::encode(root), "131d98ccffa9d5d3eb4a30001698c8020ec82a62594776fd8f911e22c8b24e12",
+                   "account leaf preimage or SMT bit order changed — regenerate the mobile fixture");
+        let items: Vec<String> = proof
+            .iter()
+            .map(|(s, r)| format!("{}:{}", hex::encode(s), if *r { 1 } else { 0 }))
+            .collect();
+        println!("VECTOR_PROOF={}", items.join(","));
+    }
+
+    /// The compressed fold's sharpest edge: a leaf landing next to an existing
+    /// single-leaf chain. The neighbour's chain interior is not stored, so an
+    /// ascent that read it as a default subtree would seal a different root than a
+    /// full rebuild — and only the inserting node would be wrong.
+    #[test]
+    fn insert_beside_lonely_chain_matches_full_rebuild() {
+        // Deterministic LCG; no rand dependency.
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+
+        let mut incremental = StateMerkleTree::new();
+        let mut live: Vec<Account> = Vec::new();
+
+        for round in 0..60 {
+            // Mix brand-new leaves (which create chains) with updates and removals.
+            let n_new = 1 + (next() % 3) as usize;
+            for _ in 0..n_new {
+                let mut a = Account::new(format!("acct_{:016x}", next()));
+                a.balance = next() % 1_000_000;
+                incremental.insert_lazy(&a.address.clone(), &a);
+                live.push(a);
+            }
+            if !live.is_empty() {
+                let idx = (next() as usize) % live.len();
+                live[idx].balance = live[idx].balance.wrapping_add(1 + next() % 999);
+                let a = live[idx].clone();
+                incremental.insert_lazy(&a.address.clone(), &a);
+            }
+            let root_inc = incremental.finalize();
+
+            // Same leaf set, built from scratch → the reference root.
+            let mut full = StateMerkleTree::new();
+            for a in live.iter() {
+                full.insert_lazy(&a.address.clone(), a);
+            }
+            let root_full = full.finalize();
+            assert_eq!(root_inc, root_full, "round {} leaves {}", round, live.len());
+
+            // Every live account must still prove against the incremental root.
+            for a in live.iter() {
+                let proof = incremental.generate_proof(&a.address);
+                assert!(
+                    StateMerkleTree::verify_proof(&a.address, a, &proof, &root_inc),
+                    "proof failed round {} addr {}", round, a.address
+                );
+            }
+        }
+    }
+
+    /// Same differential, but with REMOVALS in the mix. A removal turns the sibling chain-top
+    /// into a chain interior; if the fold merely stops storing that node instead of deleting it,
+    /// the stale row survives and the NEXT finalize that writes into the vacated region folds it
+    /// back into the root. The corruption is latent — the deleting finalize still looks correct —
+    /// so the check has to run for several rounds after each delete.
+    #[test]
+    fn removals_match_full_rebuild_across_rounds() {
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+
+        let mut incremental = StateMerkleTree::new();
+        let mut live: Vec<Account> = Vec::new();
+
+        for round in 0..120 {
+            for _ in 0..(1 + next() % 3) {
+                let mut a = Account::new(format!("del_acct_{:016x}", next()));
+                a.balance = next() % 1_000_000;
+                incremental.insert_lazy(&a.address.clone(), &a);
+                live.push(a);
+            }
+            if live.len() > 6 && next() % 2 == 0 {
+                let idx = (next() as usize) % live.len();
+                let gone = live.remove(idx);
+                incremental.remove_lazy(&gone.address);
+            }
+            if !live.is_empty() && next() % 3 == 0 {
+                let idx = (next() as usize) % live.len();
+                live[idx].balance = live[idx].balance.wrapping_add(1 + next() % 997);
+                let a = live[idx].clone();
+                incremental.insert_lazy(&a.address.clone(), &a);
+            }
+
+            let root_inc = incremental.finalize();
+
+            let mut full = StateMerkleTree::new();
+            for a in live.iter() {
+                full.insert_lazy(&a.address.clone(), a);
+            }
+            let root_full = full.finalize();
+            assert_eq!(root_inc, root_full, "round {} leaves {}", round, live.len());
+
+            for a in live.iter() {
+                let proof = incremental.generate_proof(&a.address);
+                assert!(
+                    StateMerkleTree::verify_proof(&a.address, a, &proof, &root_inc),
+                    "proof failed round {} addr {}", round, a.address
+                );
+            }
         }
     }
 }
@@ -4974,6 +5381,204 @@ mod tests_snapshot_supply_rollback {
 
         assert_eq!(state.supply_watermark(), (supply0, mb0),
                    "a discarded block's mint must be reversed, watermark included");
+    }
+
+    /// Killer #6: a 180-block reorg (the fork-choice adoption-depth bound K = 2 macroblocks) must be
+    /// bit-exact. The journal was previously exercised only ~100 deep; K=180 relies on it reversing
+    /// EVERY out-of-accounts scalar (supply, emission watermark, created accounts, pool debit) at full
+    /// depth. Assert the state_root returns bit-identical at every rollback depth, not just the end.
+    #[test]
+    fn deep_180_block_reorg_is_bit_exact() {
+        const K: u64 = 180;
+        let state = StateManager::new();
+        let genesis_root = state.finalize_merkle();
+        let genesis_watermark = state.supply_watermark();
+
+        // Forward: 180 blocks, each mints for a distinct macroblock and claims to a fresh wallet, so
+        // both created-account and pre-image rollback paths are exercised at depth.
+        let mut snaps: Vec<BlockSnapshot> = Vec::new();
+        let mut roots_before: Vec<[u8; HASH_SIZE]> = Vec::new();
+        for i in 1..=K {
+            roots_before.push(state.finalize_merkle());
+            let wallet = format!("reorg_w{}", i);
+            let mut snap = state.create_block_snapshot(i);
+            let (s0, mb0) = state.supply_watermark();
+            snap.record_supply(s0, mb0);
+            state.journal_pre_images(&mut snap, &[StateManager::REWARDS_POOL.to_string(), wallet.clone()]);
+            let minted = state.emit_rewards(1_000_000, i).expect("emit");
+            assert!(minted > 0, "block {} must mint", i);
+            state.credit_rewards_pool(minted);
+            assert!(state.claim_reward(&wallet, i, 100), "block {} claim credits", i);
+            snaps.push(snap);
+        }
+        assert_ne!(state.finalize_merkle(), genesis_root, "180 blocks moved the root");
+
+        // Reorg: roll the whole branch back in reverse; the root at each depth must match the forward
+        // root byte-for-byte, and the tail must return exactly to genesis.
+        for i in (1..=K).rev() {
+            state.rollback_block(&snaps[(i - 1) as usize]);
+            assert_eq!(state.finalize_merkle(), roots_before[(i - 1) as usize],
+                       "rollback to depth {} is not bit-exact", i - 1);
+        }
+        assert_eq!(state.finalize_merkle(), genesis_root, "full 180-block reorg must restore genesis root");
+        assert_eq!(state.supply_watermark(), genesis_watermark, "supply + emission watermark restored");
+        assert_eq!(state.get_account(StateManager::REWARDS_POOL).map(|a| a.balance).unwrap_or(0), 0,
+                   "the pool's 180 credits and debits all reversed");
+    }
+
+    /// Every minted nano must land in the pool account. Emission used to move a counter and credit
+    /// nobody, so minted value belonged to no account and supply could not be reconciled against
+    /// balances at all.
+    #[test]
+    fn rewards_pool_holds_every_minted_nano() {
+        let state = StateManager::new();
+        let mut expected: u64 = 0;
+        for mb in 1..=3u64 {
+            let minted = state.emit_rewards(1_000_000 * mb, mb).expect("emit");
+            assert!(minted > 0);
+            state.credit_rewards_pool(minted);
+            expected += minted;
+        }
+        let pool = state.get_account(StateManager::REWARDS_POOL).expect("pool exists");
+        assert_eq!(pool.balance, expected);
+        assert_eq!(pool.balance, state.get_total_supply(),
+                   "with nothing collected yet the pool IS the minted supply");
+    }
+
+    /// The pool is credited by the emission arm, not by any transaction, so it appears in no
+    /// affected-address set — nothing else journals it. Without an explicit pre-image capture a
+    /// discarded block keeps the credit while its supply counter is rolled back.
+    #[test]
+    fn emission_rollback_restores_pool() {
+        let state = StateManager::new();
+        let mut snap = BlockSnapshot::new(&DashMap::new(), 1);
+        let (supply0, mb0) = state.supply_watermark();
+        snap.record_supply(supply0, mb0);
+        state.journal_pre_images(&mut snap, &[StateManager::REWARDS_POOL.to_string()]);
+
+        let minted = state.emit_rewards(5_000_000, 1).expect("emit");
+        state.credit_rewards_pool(minted);
+        assert_eq!(state.get_account(StateManager::REWARDS_POOL).unwrap().balance, minted);
+
+        state.rollback_block(&snap);
+
+        assert_eq!(state.supply_watermark(), (supply0, mb0));
+        let after = state.get_account(StateManager::REWARDS_POOL).map(|a| a.balance).unwrap_or(0);
+        assert_eq!(after, 0, "a discarded emission must not leave its credit in the pool");
+    }
+
+    /// `emit_rewards` returns 0 on the watermark arm (idempotent re-apply, replay, restart resume).
+    /// Crediting the REQUESTED amount there would mint into the pool without moving total_supply.
+    #[test]
+    fn pool_credit_is_idempotent_across_reapply() {
+        let state = StateManager::new();
+        let first = state.emit_rewards(7_000_000, 4).expect("emit");
+        state.credit_rewards_pool(first);
+        let again = state.emit_rewards(7_000_000, 4).expect("re-emit");
+        assert_eq!(again, 0, "same emission macroblock mints once");
+        state.credit_rewards_pool(again);
+        assert_eq!(state.get_account(StateManager::REWARDS_POOL).unwrap().balance, first);
+        assert_eq!(state.get_total_supply(), first);
+    }
+
+    /// The watermark is the anti-replay: a claim is valid only strictly above it, and it advances on
+    /// success. Without it the same proof credits forever.
+    #[test]
+    fn claim_reward_is_replay_and_monotonic_safe() {
+        let sm = StateManager::new();
+        let minted = sm.emit_rewards(10_000, 1).expect("emit");
+        sm.credit_rewards_pool(minted);
+
+        assert!(sm.claim_reward("w", 5, 100), "first claim credits");
+        assert_eq!(sm.accounts.get("w").unwrap().balance, 100);
+        assert_eq!(sm.get_last_claimed_epoch("w"), 5);
+
+        assert!(!sm.claim_reward("w", 5, 100), "same epoch is a replay");
+        assert!(!sm.claim_reward("w", 4, 100), "an older epoch is behind the watermark");
+        assert_eq!(sm.accounts.get("w").unwrap().balance, 100, "neither credited");
+
+        assert!(sm.claim_reward("w", 6, 50), "a newer epoch credits");
+        assert_eq!(sm.accounts.get("w").unwrap().balance, 150);
+        assert_eq!(sm.get_last_claimed_epoch("w"), 6);
+    }
+
+    /// A claim MOVES value: what it credits must leave the pool. Crediting without the debit is a
+    /// second mint of the same emission, invisible in total_supply.
+    #[test]
+    fn claim_debits_the_pool_by_exactly_what_it_credits() {
+        let sm = StateManager::new();
+        let minted = sm.emit_rewards(1_000_000, 1).expect("emit");
+        sm.credit_rewards_pool(minted);
+        let supply = sm.get_total_supply();
+
+        assert!(sm.claim_reward("a", 1, 400));
+        assert!(sm.claim_reward("b", 1, 600));
+
+        let pool = sm.get_account(StateManager::REWARDS_POOL).unwrap().balance;
+        assert_eq!(pool, minted - 1_000, "the pool is short exactly the two credits");
+        assert_eq!(pool + 400 + 600, minted, "no nano created, none destroyed");
+        assert_eq!(sm.get_total_supply(), supply, "a claim moves value, it never mints");
+    }
+
+    /// Fail-closed on a short pool, and the watermark must NOT move — the pool balance is in
+    /// state_root, so every node reaches this verdict and the wallet can still claim later.
+    #[test]
+    fn a_claim_over_the_pool_balance_is_refused_without_burning_the_epoch() {
+        let sm = StateManager::new();
+        let minted = sm.emit_rewards(1_000, 1).expect("emit");
+        sm.credit_rewards_pool(minted);
+
+        assert!(!sm.claim_reward("w", 3, minted + 1), "cannot pay what the pool does not hold");
+        assert_eq!(sm.get_last_claimed_epoch("w"), 0, "the epoch stays claimable");
+        assert_eq!(sm.get_account(StateManager::REWARDS_POOL).unwrap().balance, minted);
+
+        assert!(sm.claim_reward("w", 3, minted), "the same epoch pays once the amount fits");
+        assert_eq!(sm.get_account(StateManager::REWARDS_POOL).unwrap().balance, 0);
+    }
+
+    /// Both leaves move, so both must be restorable. A journal that lists only the wallet leaves the
+    /// pool permanently short after a discarded block.
+    #[test]
+    fn claim_rollback_restores_both_leaves() {
+        let sm = StateManager::new();
+        let minted = sm.emit_rewards(1_000_000, 1).expect("emit");
+        sm.credit_rewards_pool(minted);
+
+        let mut snap = BlockSnapshot::new(&DashMap::new(), 1);
+        sm.journal_pre_images(&mut snap,
+            &["w".to_string(), StateManager::REWARDS_POOL.to_string()]);
+        assert!(sm.claim_reward("w", 2, 12_345));
+
+        sm.rollback_block(&snap);
+
+        assert_eq!(sm.get_account(StateManager::REWARDS_POOL).unwrap().balance, minted,
+                   "the pool debit is reversed");
+        assert_eq!(sm.get_account("w").map(|a| a.balance).unwrap_or(0), 0);
+        assert_eq!(sm.get_last_claimed_epoch("w"), 0, "the watermark rolls back with the credit");
+    }
+
+    /// The watermark is in the leaf hash, so two nodes that disagree about it disagree about
+    /// state_root. A conditional inclusion would fork running vs rebuilt nodes.
+    #[test]
+    fn last_claimed_epoch_is_inside_the_account_leaf() {
+        let mut a = Account::new("leaf_lce".to_string());
+        let before = StateMerkleTree::hash_account(&a);
+        a.last_claimed_epoch = 1;
+        assert_ne!(before, StateMerkleTree::hash_account(&a),
+                   "advancing the claim watermark must move the leaf hash");
+    }
+
+    /// is_node decides whether a second NodeActivation for a wallet is skipped, so two nodes that
+    /// disagree about it apply different state. It must move the leaf, or a snapshot could carry a
+    /// flipped flag past the state_root check.
+    #[test]
+    fn is_node_is_inside_the_account_leaf() {
+        let mut a = Account::new("leaf_node".to_string());
+        let before = StateMerkleTree::hash_account(&a);
+        a.activate_node("Super".to_string(), 1);
+        assert!(a.is_node);
+        assert_ne!(before, StateMerkleTree::hash_account(&a),
+                   "activating a node must move the leaf hash");
     }
 
     /// Capture is first-write-wins so a block that mints twice still restores its starting value.
@@ -5081,7 +5686,7 @@ mod tests_snapshot_supply_rollback {
         commitment_tx(crate::transaction::TransactionType::LightNodeEligibilityBitmap {
             genesis_id: genesis_id.to_string(),
             epoch,
-            total_assigned: 0,
+            index_span: 0,
             eligible_count: 0,
             bitmap_compressed: Vec::new(),
         })

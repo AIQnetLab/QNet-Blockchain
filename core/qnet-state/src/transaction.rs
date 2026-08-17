@@ -323,6 +323,14 @@ pub struct EquivocationHeader {
 }
 
 /// Transaction types
+/// Largest decompressed light-eligibility bitmap a node will accept, in bytes. One definition for
+/// both the wire-shape check in `validate()` and the bounded decompressor in the consumer, so the
+/// two cannot disagree about what is acceptable.
+pub const MAX_BITMAP_DECOMPRESSED: usize = 8 * 1024 * 1024;
+
+/// Largest addressable reg_index span, derived from the byte ceiling above (8 bits per byte).
+pub const MAX_BITMAP_INDEX_SPAN: u32 = (MAX_BITMAP_DECOMPRESSED as u32) * 8;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum TransactionType {
     /// Transfer QNC between accounts
@@ -568,13 +576,16 @@ pub enum TransactionType {
     /// - At epoch end, create ONE bitmap TX with all eligible nodes
     /// - MacroBlock collects all 5 bitmap TX and merges for reward distribution
     /// 
-    /// VERIFICATION:
-    /// - eligible_count must match popcount of decompressed bitmap
-    /// - bitmap size must match (total_assigned + 7) / 8 bytes
+    /// VERIFICATION is split by what each layer can afford:
+    /// - `validate()` (no decompressor available here) checks the declared shape: span within the
+    ///   decompression ceiling, count within span, compressed body non-empty.
+    /// - the consumer, which already holds the bounded-decompressed bitmap, checks the two facts
+    ///   that make `eligible_count` mean anything: byte length == (index_span + 7) / 8 and
+    ///   popcount == eligible_count. Both are pure functions of the TX bytes, so every node agrees.
     LightNodeEligibilityBitmap {
         genesis_id: String,              // Genesis node ID (genesis_node_001, etc.)
         epoch: u64,                      // Epoch number
-        total_assigned: u32,             // Total Light nodes assigned to this Genesis (e.g., 2M)
+        index_span: u32,             // Highest reg_index in this shard + 1 — the span the bitmap addresses
         eligible_count: u32,             // Count of eligible nodes (popcount of bitmap)
         bitmap_compressed: Vec<u8>,      // zstd-compressed bitmap (1 bit per Light node)
     },
@@ -1691,8 +1702,26 @@ impl Transaction {
         Ok(())
     }
 
+    /// Transaction types the chain no longer produces. They stay in the enum so historical bodies
+    /// still decode, but nothing may admit or include one. Verified by construction: none of these
+    /// variants is built anywhere in the tree — every remaining site is a match arm.
+    pub fn is_retired_type(&self) -> bool {
+        matches!(self.tx_type,
+            TransactionType::PingAttestation { .. }
+            | TransactionType::PingCommitmentWithSampling { .. }
+            | TransactionType::HeartbeatCommitment { .. }
+            | TransactionType::BatchRewardClaims { .. }
+            | TransactionType::BatchNodeActivations { .. })
+    }
     pub fn validate(&self) -> Result<(), String> {
         self.enforce_wire_limits()?;
+        // Retired types are refused before anything else: every one of them is fee-free and
+        // system-classed, so admitting one is a free write path into an arm no producer exercises.
+        // Here rather than at each gate, so admission, gossip and block validity share the rule and
+        // a block carrying one is invalid on every node.
+        if self.is_retired_type() {
+            return Err(format!("[REJECT][TX] retired_tx_type type={:?}", self.tx_type));
+        }
         // Basic validation
         if self.from.is_empty() {
             return Err("[REJECT][TX] empty_sender_address".to_string());
@@ -2118,7 +2147,7 @@ impl Transaction {
             TransactionType::LightNodeEligibilityBitmap {
                 genesis_id,
                 epoch,
-                total_assigned,
+                index_span,
                 eligible_count,
                 bitmap_compressed,
             } => {
@@ -2133,16 +2162,21 @@ impl Transaction {
                     return Err(format!("[REJECT][TX] invalid_genesis_id_format genesis_id={}", genesis_id));
                 }
                 
-                // Validate total_assigned (max 10M Light nodes per Genesis = 2M each for 5 Genesis)
-                if *total_assigned == 0 || *total_assigned > 10_000_000 {
-                    return Err(format!("[REJECT][TX] invalid_total_assigned value={}", total_assigned));
+                // The span is a reg_index bound, not a member count: reg_index is assigned across
+                // supers AND lights from one counter, so it tracks total registrations, not shard size.
+                // The ceiling is DERIVED from the decompression bound, not picked: a larger span
+                // describes a bitmap the consumer refuses to decompress, so the TX would pass here
+                // and be dropped there — accepted into a block and silently worthless.
+                if *index_span == 0 || *index_span > MAX_BITMAP_INDEX_SPAN {
+                    return Err(format!("[REJECT][TX] invalid_index_span value={} max={}",
+                                       index_span, MAX_BITMAP_INDEX_SPAN));
                 }
                 
-                // Validate eligible_count <= total_assigned
-                if *eligible_count > *total_assigned {
+                // Validate eligible_count <= index_span
+                if *eligible_count > *index_span {
                     return Err(format!(
                         "[REJECT][TX] eligible_exceeds_total eligible={} total={}",
-                        eligible_count, total_assigned
+                        eligible_count, index_span
                     ));
                 }
                 
@@ -3622,63 +3656,21 @@ impl Transaction {
                     return Err(StateError::InvalidTransaction(format!("[REJECT][REWARDS] unauthorized_sender sender={}", self.from)));
                 }
                 
-                // v2.99: CRITICAL - EMISSION TX vs CLAIM TX distinction
-                // EMISSION TX: system_emission → system_rewards_pool (record-keeping only)
-                // CLAIM TX: system_rewards_pool → user_wallet (actual claim)
-                
+                // Neither arm moves an account balance HERE. The emission arm of apply_block_to_state
+                // mints and credits system_rewards_pool; apply_merkle_claims debits that pool and credits
+                // the wallet after verifying the proof. This TX is the on-chain record of the emission.
                 if self.from == "system_emission" && self.to.as_ref().map(|t| t.as_str()) == Some("system_rewards_pool") {
-                    // v2.99: EMISSION TX - blockchain record ONLY!
-                    // Rewards ALREADY distributed via emit_rewards() + update_pending_rewards()
-                    // This TX is ONLY for transparency/auditing - DO NOT process rewards again!
                     if is_info_log() { println!("[INFO][EMISSION] emission_tx_recorded amount={} QNC", self.amount / 1_000_000_000); }
                     return Ok(()); // No account changes - already handled!
                 }
                 
-                // v2.96: CLAIM TX - validate and process reward claim
-                // This happens when user calls /api/v1/claim_rewards
-                if let Some(to) = &self.to {
-                    // v3 merkle-claim: the proofs were verified and balances credited in node.rs
-                    // apply Phase 2b (which has storage→epoch root). Skip the legacy pending_rewards
-                    // debit so a merkle claim is not double-applied here.
-                    if let Some(ref d) = self.data {
-                        if let Ok(p) = serde_json::from_str::<serde_json::Value>(d) {
-                            if p.get("claims").is_some() {
-                                return Ok(());
-                            }
-                        }
-                    }
-                    let recipient = accounts.entry(to.clone())
-                        .or_insert_with(|| Account::new(to.clone()));
-
-                    // v2.96: SECURITY - Check if recipient has sufficient pending rewards
-                    if self.amount > recipient.pending_rewards {
-                        return Err(StateError::InvalidTransaction(
-                            format!("[REJECT][REWARDS] insufficient_pending_rewards attempted={} available={}",
-                                    self.amount / 1_000_000_000,
-                                    recipient.pending_rewards / 1_000_000_000)
-                        ));
-                    }
-                    
-                    // Transfer from pending_rewards to balance (claim)
-                    recipient.pending_rewards = recipient.pending_rewards.checked_sub(self.amount)
-                        .ok_or_else(|| StateError::InvalidTransaction("[REJECT][REWARDS] pending_rewards_underflow".into()))?;
-                    recipient.balance = recipient.balance.checked_add(self.amount)
-                        .ok_or_else(|| StateError::InvalidTransaction("[REJECT][REWARDS] claim_balance_overflow".into()))?;
-                    
-                    if is_info_log() {
-                        println!("[INFO][REWARDS] reward_claimed amount={} QNC to={} pending_remaining={} QNC",
-                            self.amount / 1_000_000_000,
-                            crate::char_prefix(&to, 16),
-                            recipient.pending_rewards / 1_000_000_000);
-                    }
-                }
+                // A merkle claim reaches here as a no-op: apply_merkle_claims is the sole credit
+                // authority and has already moved the value. Debiting anything a second time here
+                // would pay the claim twice.
             }
             TransactionType::BatchRewardClaims { node_ids, .. } => {
-                // DEPRECATED: This TX type is never created in production.
-                // Architecture: 1 wallet = 1 node → no batch needed.
-                // handle_batch_claim_rewards() creates individual RewardDistribution TXs.
-                // This code path exists only for backward-compatible processing of
-                // historical blocks that might contain this TX type.
+                // RETIRED (see is_retired_type): nothing constructs this, and validate() refuses it,
+                // so no block can carry one. The arm remains only so historical bodies still decode.
                 // It only deducts the gas fee — actual claims go through RewardDistribution.
                 let sender = accounts.get_mut(&self.from)
                     .ok_or_else(|| StateError::AccountNotFound(self.from.clone()))?;
@@ -3891,7 +3883,7 @@ impl Transaction {
             TransactionType::LightNodeEligibilityBitmap {
                 genesis_id,
                 epoch,
-                total_assigned,
+                index_span,
                 eligible_count,
                 bitmap_compressed,
             } => {
@@ -3900,7 +3892,7 @@ impl Transaction {
                 // MacroBlock will collect and merge all bitmaps for reward distribution
                 if is_debug_log() {
                     println!("[DEBUG][LIGHT-BITMAP] genesis={} epoch={} eligible={}/{} compressed={} bytes",
-                        genesis_id, epoch, eligible_count, total_assigned, bitmap_compressed.len());
+                        genesis_id, epoch, eligible_count, index_span, bitmap_compressed.len());
                 }
                 // No state modification needed - bitmap will be read by MacroBlock
             }

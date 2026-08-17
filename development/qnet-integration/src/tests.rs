@@ -880,39 +880,6 @@ mod tests_emission_gate {
         }
     }
 
-    /// The claimable distribution is sized by `total` in the TX body, not by tx.amount, and claim
-    /// credit is uncapped — so `total` must be bound by the same schedule. The honest range is the
-    /// TWO-POINT set {0, expected}: the distribution conserves exactly, so a producer emits the full
-    /// figure, or 0 when no node is eligible. Anything between is unreachable by honest code, and
-    /// admitting it would let a producer mint the full supply while funding the epoch with 1 nano —
-    /// certified by 2f+1 with no divergence and no alarm.
-    #[test]
-    fn reward_total_is_bounded_by_the_schedule() {
-        let h = 2 * EMISSION_INTERVAL;
-        let expected = match BlockchainNode::expected_emission_amount(h) {
-            EmissionExpectation::Exact(v) => v,
-            other => panic!("expected Exact, got {:?}", other),
-        };
-
-        assert!(BlockchainNode::emission_total_within_schedule(h, expected), "the exact figure is allowed");
-        assert!(BlockchainNode::emission_total_within_schedule(h, 0), "an empty eligible set is honest");
-        assert!(!BlockchainNode::emission_total_within_schedule(h, expected - 1),
-                "dilution below the schedule is not honestly reachable and must be refused");
-        assert!(!BlockchainNode::emission_total_within_schedule(h, 1),
-                "funding an epoch with 1 nano while minting in full must be refused");
-        assert!(!BlockchainNode::emission_total_within_schedule(h, expected + 1), "one over is refused");
-        assert!(!BlockchainNode::emission_total_within_schedule(h, u64::MAX), "the inflation case is refused");
-    }
-
-    /// A height that owes no emission may not fund a distribution either.
-    #[test]
-    fn no_distribution_where_no_emission_is_due() {
-        for h in [1u64, EMISSION_INTERVAL, 3 * EMISSION_INTERVAL + 7] {
-            assert!(BlockchainNode::emission_total_within_schedule(h, 0));
-            assert!(!BlockchainNode::emission_total_within_schedule(h, 1),
-                    "no funding may ride a non-emission height h={}", h);
-        }
-    }
 }
 
 /// A merkle reward-claim is credited to `to` no matter who relays it, so the wallet's own key must

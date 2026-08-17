@@ -1443,6 +1443,17 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::addr::remote())
         .and(blockchain_filter.clone())
         .and_then(handle_registry_height);
+
+    // One-shot consensus health snapshot. The 41100 diagnosis needed correlating five servers' logs;
+    // these scalars make the primary signals (last_sealed growing, floor <= own window) a single GET.
+    let debug_consensus_position = api_v1
+        .and(warp::path("debug"))
+        .and(warp::path("consensus-position"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::addr::remote())
+        .and(blockchain_filter.clone())
+        .and_then(handle_debug_consensus_position);
     
     // Snapshot endpoints - For P2P Fast Sync (v2.19.12)
     // GET /api/v1/snapshot/latest - Get latest snapshot info
@@ -2437,6 +2448,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .or(macroblock_by_index)
         .or(macroblock_proof)
         .or(registry_height)
+        .or(debug_consensus_position)
         .or(snapshot_latest)
         .or(snapshot_download)
         .or(snapshot_manifest)
@@ -4088,13 +4100,13 @@ async fn handle_account_balance_with_proof(
                 "balance": proof.balance,
                 "nonce": proof.nonce,
                 // Every leaf input, or the client cannot rebuild the hash it is verifying.
-                "pending_rewards": proof.pending_rewards,
                 "heartbeat_epoch": proof.heartbeat_epoch,
                 "heartbeat_slots": proof.heartbeat_slots,
                 "heartbeat_final_epoch": proof.heartbeat_final_epoch,
                 "heartbeat_final_slots": proof.heartbeat_final_slots,
                 "last_claimed_epoch": proof.last_claimed_epoch,
                 "banned_at_height": proof.banned_at_height,
+                "is_node": proof.is_node,
                 "merkle_proof": proof_array,
                 "state_root": hex::encode(proof.state_root),
                 "block_height": proof.block_height,
@@ -4157,13 +4169,16 @@ async fn handle_token_balance_with_proof(
             // Level-1 (contract account leaf -> state_root): ALL leaf-determining fields
             "account_balance": p.account_balance.to_string(),
             "account_nonce": p.account_nonce,
-            "account_pending_rewards": p.account_pending_rewards.to_string(),
             "contract_code_hash": p.contract_code_hash,
             "heartbeat_epoch": p.heartbeat_epoch,
             "heartbeat_slots": p.heartbeat_slots,
             "heartbeat_final_epoch": p.heartbeat_final_epoch,
             "heartbeat_final_slots": p.heartbeat_final_slots,
+            // The leaf hashes last_claimed_epoch and banned_at_height; omitting either left the
+            // client unable to rebuild it.
             "last_claimed_epoch": p.last_claimed_epoch,
+            "banned_at_height": p.banned_at_height,
+            "is_node": p.is_node,
             "account_proof": hexvec(&p.account_proof),
             // Anchors
             "state_root": hex::encode(p.state_root),
@@ -4870,7 +4885,21 @@ async fn handle_block_by_height(
     }
     
     match blockchain.get_block(height).await {
-        Ok(Some(block)) => Ok(warp::reply::json(&block)),
+        Ok(Some(block)) => {
+            // Additive, backward-compatible: keep every existing top-level field and ADD the failover
+            // round from the microblock. abs_round = timeout_round + carried_baseline; a boundary
+            // round-reset (the 40950 fork) is invisible without it.
+            let mut v = serde_json::to_value(&block).unwrap_or_else(|_| json!({}));
+            if let (Some(obj), Some(mb)) = (
+                v.as_object_mut(),
+                blockchain.get_storage().load_microblock_auto_format(height).ok().flatten(),
+            ) {
+                obj.insert("timeout_round".into(), json!(mb.timeout_round));
+                obj.insert("carried_baseline".into(), json!(mb.carried_baseline));
+                obj.insert("abs_round".into(), json!(mb.timeout_round.saturating_add(mb.carried_baseline)));
+            }
+            Ok(warp::reply::json(&v))
+        }
         Ok(None) => {
             let error_response = json!({
                 "error": "Block not found",
@@ -4942,6 +4971,7 @@ async fn handle_block_by_hash(
                     "timestamp": block.timestamp,
                     "transactions": block.transactions,
                     "merkle_root": block.merkle_root,
+                    "producer": block.producer,
                     "signature": block.signature
                 }
             });
@@ -4970,22 +5000,7 @@ async fn handle_macroblock_by_index(
     
     match blockchain.get_macroblock(index).await {
         Ok(Some(macroblock)) => {
-            // v2.75: Decode heartbeat summaries if present
-            let heartbeat_info = macroblock.consensus_data.reward_heartbeats.as_ref()
-                .and_then(|data| bincode::deserialize::<Vec<qnet_state::HeartbeatSummary>>(data).ok())
-                .map(|summaries| {
-                    let eligible = summaries.iter().filter(|s| s.is_eligible).count();
-                    json!({
-                        "total_nodes": summaries.len(),
-                        "eligible_nodes": eligible,
-                        "nodes": summaries.iter().take(20).map(|s| json!({
-                            "node_id": s.node_id,
-                            "heartbeat_count": s.heartbeat_count,
-                            "is_eligible": s.is_eligible
-                        })).collect::<Vec<_>>()
-                    })
-                });
-            
+
             let response = json!({
                 "index": index,
                 "height": macroblock.height,
@@ -4999,8 +5014,7 @@ async fn handle_macroblock_by_index(
                     "next_leader": macroblock.consensus_data.next_leader,
                     "commits_count": macroblock.consensus_data.commits.len(),
                     "reveals_count": macroblock.consensus_data.reveals.len(),
-                    // v2.75: Reward data for emission macroblocks
-                    "reward_heartbeats": heartbeat_info,
+
                     "pool2_total_fees": macroblock.consensus_data.pool2_total_fees,
                     "pool3_total_activations": macroblock.consensus_data.pool3_total_activations,
                 },
@@ -5053,6 +5067,14 @@ async fn handle_macroblock_proof(
             Ok(v) => v,
             Err(_) => return Ok(warp::reply::json(&json!({"error": "qc_decode_failed", "index": index}))),
         };
+    // Past the retention horizon the committee signatures are stripped (the archive keeps the
+    // checkpoint half). Serving the proof anyway would hand the device a QC it can only fail to
+    // verify, which reads as a hostile node; say so instead so it re-pins on a recent anchor.
+    if qc.sigs.is_empty() {
+        return Ok(warp::reply::json(&json!({
+            "error": "qc_sigs_pruned", "index": index, "action": "repin_recent_anchor"
+        })));
+    }
     let storage = blockchain.get_storage();
     let committee = BlockchainNode::committee_for_height(&storage, mb.height).unwrap_or_default();
     // Pubkeys for the derived committee UNION the QC's actual signers. A recovery checkpoint is
@@ -5169,6 +5191,34 @@ async fn handle_registry_height(
     if let Err(rl) = check_api_rate_limit(remote_addr, "read_only") { return Ok(rl); }
     let (entries, root) = blockchain.get_storage().registry_entries_as_of(height);
     Ok(warp::reply::json(&json!({"registry_root": root, "entries": entries})))
+}
+
+/// GET /api/v1/debug/consensus-position — the scalars that reveal a boundary-fork stall at a glance.
+/// `sealed_lag` growing past ~2 windows while height climbs = finality decoupled (the pre-halt state);
+/// `tc_floor` must never exceed `own_window` (the wedge that deafened a rolled-back node).
+async fn handle_debug_consensus_position(
+    remote_addr: Option<std::net::SocketAddr>,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    if let Err(rl) = check_api_rate_limit(remote_addr, "read_only") { return Ok(rl); }
+    let storage = blockchain.get_storage();
+    let height = storage.get_chain_height().unwrap_or(0);
+    let tip_hash = storage.get_block_hash(height).ok().flatten().unwrap_or_default();
+    let last_sealed = storage.last_sealed_mb_index();
+    let finalized = crate::node::LAST_FINALIZED_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+    let own_window = height / 90;
+    let tc_floor = crate::unified_p2p::observed_tc_window_floor();
+    Ok(warp::reply::json(&json!({
+        "height": height,
+        "tip_hash": tip_hash,
+        "own_window": own_window,
+        "last_sealed_mb_index": last_sealed,
+        "sealed_lag_windows": own_window.saturating_sub(last_sealed),
+        "finalized_height": finalized,
+        "tc_window_floor": tc_floor,
+        "floor_above_window": tc_floor > own_window,
+        "certified_round_current_window": crate::unified_p2p::highest_certified_round_for(own_window),
+    })))
 }
 
 // =========================================================================
@@ -6467,8 +6517,12 @@ const LIGHT_CHALLENGE_TTL_SECS: u64 = 180;
 
 fn light_challenge_mac(node_id: &str, nonce: &[u8; 16], expiry: u64) -> [u8; 16] {
     use sha3::{Digest, Sha3_256};
-    let seed = std::env::var("QNET_WALLET_SEED")
-        .or_else(|_| std::env::var("QNET_GENESIS_SEED"))
+    // Must go through the accessor: reading the raw env var ignores QNET_WALLET_SEED_FILE, and a
+    // file-based deployment would silently key the MAC with an empty string — a constant anyone
+    // can compute from this repository, which restores exactly the self-attestation the challenge
+    // exists to stop.
+    let seed = crate::node::load_wallet_seed("QNET_WALLET_SEED")
+        .or_else(|| crate::node::load_wallet_seed("QNET_GENESIS_SEED"))
         .unwrap_or_default();
     let mut h = Sha3_256::new();
     h.update(b"qnet-light-challenge-secret-v1");
@@ -6579,7 +6633,6 @@ use parking_lot::Mutex as ParkingMutex;
 
 
 // Import lazy rewards system
-use qnet_consensus::lazy_rewards::NodeType as RewardNodeType;
 
 /// Pending challenge for polling-based Light nodes
 #[derive(Debug, Clone)]
@@ -7736,15 +7789,11 @@ async fn handle_node_secure_info(
         .unwrap_or_default()
         .as_secs();
     
-    // Get pending rewards from lazy reward system
-    let pending_rewards = {
-        let reward_manager_arc = blockchain.get_reward_manager();
-        let reward_manager = reward_manager_arc.read().await;
-        let node_id = format!("node_{}", blockchain.get_port());
-        match reward_manager.get_pending_reward(&node_id) {
-            Some(reward) => reward.total_reward,
-            None => 0
-        }
+    // Claimable = the merkle reward_root total this node's wallet can still prove. Single source
+    // with the claim endpoint, so display and payout cannot disagree.
+    let pending_rewards = match blockchain.get_node_wallet(&blockchain.get_node_id()).await {
+        Some(w) => wallet_claimable_qnc(&blockchain, &w).await,
+        None => 0,
     };
     
     let response = json!({
@@ -8079,8 +8128,6 @@ async fn handle_light_node_ping_response(
     
     // Record ping in reward system
     {
-        let reward_manager_arc = blockchain.get_reward_manager();
-        let mut reward_manager = reward_manager_arc.write().await;
         
         // v4.3: Get wallet address — try P2P registry first (authoritative, gossip-synced),
         // fall back to local LIGHT_NODE_REGISTRY (device cache), then RocksDB (blockchain state)
@@ -8120,10 +8167,8 @@ async fn handle_light_node_ping_response(
             format!("{}eon{}{}", part1, part2, checksum)
         });
         
-        // Register and record ping
+        // Ping + registration land in storage, which is the replicated source every node shares.
         use qnet_consensus::deterministic_reputation::INITIAL_REPUTATION;
-        let _ = reward_manager.register_node(node_id.clone(), RewardNodeType::Light, wallet_addr.clone());
-        let _ = reward_manager.record_ping_attempt(&node_id, true, 50);
         let _ = blockchain.get_storage().save_ping_attempt(&node_id, now, true, 50);
         let _ = blockchain.get_storage().save_node_registration(&node_id, "light", &wallet_addr, INITIAL_REPUTATION);
     }
@@ -8563,7 +8608,8 @@ async fn handle_server_node_status(
                 // This ensures ALL nodes return same value (on-chain consensus)
                 // Prevents manipulation of local RocksDB to show fraudulent rewards
                 // Memory can be lost on restart, blockchain is source of truth
-                // Merkle reward_root claimable (single-source; legacy pending removed).
+                // The merkle reward_root claimable for the ON-CHAIN registered wallet — the same
+                // figure the claim endpoint will quote, so every node answers alike.
                 let pending_rewards = match blockchain.get_node_wallet(found_id).await {
                     Some(wallet) => wallet_claimable_qnc(&blockchain, &wallet).await,
                     None => {
@@ -8602,7 +8648,7 @@ async fn handle_server_node_status(
                 if let Some(node) = p2p.get_light_node(target_id) {
                     let block_height = blockchain.get_height().await;
                     let pending_rewards = match blockchain.get_node_wallet(target_id).await {
-                        Some(wallet) => wallet_claimable_qnc(&blockchain, &wallet).await,
+                        Some(w) => wallet_claimable_qnc(&blockchain, &w).await,
                         None => 0,
                     };
                     // B: online = attested on-chain in the last committed epochs, OR attesting in the current
@@ -9142,6 +9188,14 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
         let mut last_reannounce = std::time::Instant::now();
         let mut last_flush = std::time::Instant::now(); // v3.41: WAL flush tracker
 
+        // Deterministic per-node slot within the hour, so maintenance is staggered
+        // across the roster instead of firing fleet-wide at the same instant.
+        let cleanup_slot_offset: u64 = {
+            let id = blockchain_for_pings.get_node_id();
+            let h = Sha3_256::digest(id.as_bytes());
+            u64::from_be_bytes(h[..8].try_into().unwrap_or([0u8; 8])) % 60
+        };
+
         loop {
             check_interval.tick().await;
             
@@ -9164,8 +9218,10 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
                     println!("[PING] 🔄 Re-announced as active node, cleaned stale nodes");
                 }
                 
-                // Cleanup old attestations every hour
-                if current_slot % 60 == 0 {
+                // Cleanup old attestations every hour, offset per node. The slot is derived
+                // from chain height, so an unoffset check fires within the same second on
+                // every node and no quorum member is left serving during the sweep.
+                if current_slot % 60 == cleanup_slot_offset {
                     // RAM cleanup
                     p2p.cleanup_old_attestations();
 
@@ -10011,84 +10067,21 @@ async fn handle_get_pending_rewards(
     };
     let is_eligible = heartbeat_count >= required_heartbeats;
     
-    // v3.34: TOTAL from StateManager (source of truth), BREAKDOWN from reward_manager
-    // Previously read everything from reward_manager which could diverge from blockchain state
-    let (pending_amount, pool1, pool2, pool3, phase, is_claimable) = {
-        // 1. Authoritative TOTAL = merkle reward-root claimable (the real lazy-reward mechanism) +
-        //    residual legacy pending. Reading only Account.pending_rewards undercounted to 0 because the
-        //    accrued reward lives in the per-epoch reward_roots, claimed by merkle proof — not that field.
-        let blockchain_total = {
-            if let Some(wallet) = blockchain.get_node_wallet(&node_id).await {
-                wallet_claimable_qnc(&blockchain, &wallet).await
-            } else {
-                0
-            }
-        };
-        
-        // 2. Get pool BREAKDOWN from reward_manager (StateManager only stores total)
-        let reward_manager_arc = blockchain.get_reward_manager();
-        let reward_manager = reward_manager_arc.read().await;
-        
-        // Emission is pure Pool-1: the authoritative total IS the pool1 base emission. Only trust the
-        // reward_manager per-pool split when it actually agrees with the on-chain total (else it's a
-        // stale/empty RAM view post-restart — report pool1=total honestly, no fabricated split, no noise).
-        if let Some(reward) = reward_manager.get_pending_reward(&node_id) {
-            if reward.total_reward == blockchain_total {
-                (
-                    blockchain_total,
-                    reward.pool1_base_emission,
-                    reward.pool2_transaction_fees,
-                    reward.pool3_activation_bonus,
-                    format!("{:?}", reward.current_phase),
-                    blockchain_total >= 1_000_000_000, // Claimable if >= 1 QNC
-                )
-            } else {
-                (
-                    blockchain_total,
-                    blockchain_total, // Pure Pool-1 emission: total is the base-emission pool
-                    0,
-                    0,
-                    format!("{:?}", reward.current_phase),
-                    blockchain_total >= 1_000_000_000,
-                )
-            }
-        } else {
-            // No breakdown in reward_manager — check if blockchain has a total anyway
-            if blockchain_total > 0 {
-                // Blockchain has rewards but reward_manager doesn't — show total without breakdown
-                let stats = reward_manager.get_reward_stats();
-                (
-                    blockchain_total,
-                    blockchain_total, // All in pool1 (no breakdown available)
-                    0,
-                    0,
-                    format!("{:?}", stats.current_phase),
-                    blockchain_total >= 1_000_000_000,
-                )
-            } else {
-                // FALLBACK: Check RocksDB for persisted pending rewards
-                let storage = blockchain.get_storage();
-                match storage.load_pending_reward(&node_id) {
-                    Ok(Some(reward)) => {
-                        (
-                            reward.total_reward,
-                            reward.pool1_base_emission,
-                            reward.pool2_transaction_fees,
-                            reward.pool3_activation_bonus,
-                            format!("{:?}", reward.current_phase),
-                            reward.total_reward >= 1_000_000_000,
-                        )
-                    }
-                    _ => {
-                        // No rewards yet - show 0 (NOT estimated!)
-                        let stats = reward_manager.get_reward_stats();
-                        let phase_str = format!("{:?}", stats.current_phase);
-                        (0, 0, 0, 0, phase_str, false)
-                    }
-                }
-            }
-        }
+    // The claimable total is the merkle reward_root sum for this node's ON-CHAIN wallet — the same
+    // number the claim endpoint quotes and apply credits. Emission is pure Pool-1, so pool1 IS the
+    // total and there is no split to invent.
+    let pending_amount = match blockchain.get_node_wallet(&node_id).await {
+        Some(w) => wallet_claimable_qnc(&blockchain, &w).await,
+        None => 0,
     };
+    let (pool1, pool2, pool3) = (pending_amount, 0u64, 0u64);
+    // Phase 2 begins at 90% of the 1DEV supply burned; the same rule every other endpoint uses.
+    let phase = if crate::GLOBAL_BURN_PERCENTAGE.load(std::sync::atomic::Ordering::Relaxed) as f64 / 100.0 >= 90.0 {
+        "Phase2".to_string()
+    } else {
+        "Phase1".to_string()
+    };
+    let is_claimable = pending_amount > 0;
     
     // Get last claim time from storage
     let last_claim = {
@@ -10250,23 +10243,14 @@ async fn handle_get_reward_pools(
     let burn_percentage = crate::GLOBAL_BURN_PERCENTAGE.load(std::sync::atomic::Ordering::Relaxed) as f64 / 100.0;
     let current_phase = if burn_percentage >= 90.0 { 2 } else { 1 };
     
-    // Get pending rewards with pool breakdown
-    let reward_manager_arc = blockchain.get_reward_manager();
-    let reward_manager = reward_manager_arc.read().await;
-    let pending_reward = reward_manager.get_pending_reward(&node_id).cloned();
-    drop(reward_manager);
-    
-    let (pool1, pool2, pool3, total, _phase_str) = if let Some(ref reward) = pending_reward {
-        (
-            reward.pool1_base_emission,
-            reward.pool2_transaction_fees,
-            reward.pool3_activation_bonus,
-            reward.total_reward,
-            format!("{:?}", reward.current_phase),
-        )
-    } else {
-        (0, 0, 0, 0, "Phase1".to_string())
+    // Emission is pure Pool-1, so the claimable total IS pool 1; the other two are reported as the
+    // zeros they are rather than a split this chain does not produce.
+    let total = match blockchain.get_node_wallet(&node_id).await {
+        Some(w) => wallet_claimable_qnc(&blockchain, &w).await,
+        None => 0,
     };
+    let (pool1, pool2, pool3, _phase_str) =
+        (total, 0u64, 0u64, if current_phase == 2 { "Phase2" } else { "Phase1" }.to_string());
     
     // Calculate current epoch info
     let current_height = blockchain.get_height().await;
@@ -10384,19 +10368,8 @@ async fn handle_get_rewards_by_wallet(
     let storage = blockchain.get_storage();
     let storage_nodes = storage.get_nodes_by_wallet(&wallet_address).unwrap_or_default();
     
-    // SECONDARY SOURCE - Also check reward_manager (may have additional runtime data)
-    let reward_manager_arc = blockchain.get_reward_manager();
-    let reward_manager = reward_manager_arc.read().await;
-    let rm_nodes = reward_manager.get_nodes_by_owner(&wallet_address);
-    drop(reward_manager);
     
-    // Merge both sources (storage is primary, rm adds any missing)
-    let mut nodes: Vec<String> = storage_nodes.iter().map(|(id, _, _)| id.clone()).collect();
-    for rm_node in rm_nodes {
-        if !nodes.contains(&rm_node) {
-            nodes.push(rm_node);
-        }
-    }
+    let nodes: Vec<String> = storage_nodes.iter().map(|(id, _, _)| id.clone()).collect();
     
     let mut nodes_info = Vec::new();
     let current_height = blockchain.get_height().await;
@@ -10420,11 +10393,6 @@ async fn handle_get_rewards_by_wallet(
             let w = blockchain.get_node_wallet(&node_id).await.unwrap_or_else(|| wallet_address.clone());
             wallet_claimable_qnc(&blockchain, &w).await
         };
-        
-        let reward_manager = blockchain.get_reward_manager();
-        let rm = reward_manager.read().await;
-        let pending = rm.get_pending_reward(&node_id).cloned();
-        drop(rm);
         
         // Determine node type from storage or from node_id prefix
         let node_type = {
@@ -10457,18 +10425,8 @@ async fn handle_get_rewards_by_wallet(
             .map(|(_, _, ls)| (now.saturating_sub(*ls) < 15 * 60, *ls)) // Online if seen in last 15 min
             .unwrap_or((false, 0)); // Not in active list = offline
         
-        // v3.34: Use blockchain_total as authoritative, breakdown from reward_manager
-        let (total, pool1, pool2, pool3, phase) = if let Some(ref reward) = pending {
-            let authoritative_total = if blockchain_total > 0 { blockchain_total } else { reward.total_reward };
-            (
-                authoritative_total as f64 / 1_000_000_000.0,
-                reward.pool1_base_emission as f64 / 1_000_000_000.0,
-                reward.pool2_transaction_fees as f64 / 1_000_000_000.0,
-                reward.pool3_activation_bonus as f64 / 1_000_000_000.0,
-                format!("{:?}", reward.current_phase),
-            )
-        } else if blockchain_total > 0 {
-            // Blockchain has rewards but reward_manager doesn't
+        // Emission is pure Pool-1; there is no per-pool split to report.
+        let (total, pool1, pool2, pool3, phase) = if blockchain_total > 0 {
             (blockchain_total as f64 / 1_000_000_000.0, blockchain_total as f64 / 1_000_000_000.0, 0.0, 0.0, "Phase1".to_string())
         } else {
             (0.0, 0.0, 0.0, 0.0, "Phase1".to_string())
@@ -10530,9 +10488,6 @@ async fn handle_get_pending_rewards_batch(
         })));
     }
     
-    let reward_manager_arc = blockchain.get_reward_manager();
-    let reward_manager = reward_manager_arc.read().await;
-    
     let current_height = blockchain.get_height().await;
     let current_epoch = (current_height / 14400).saturating_add(1);
     
@@ -10540,25 +10495,14 @@ async fn handle_get_pending_rewards_batch(
     let mut total_pending = 0.0f64;
 
     for node_id in &request.node_ids {
-        let pending = reward_manager.get_pending_reward(node_id).cloned();
-
         // Merkle reward_root claimable (single-source; legacy pending removed).
         let blockchain_total = match blockchain.get_node_wallet(node_id).await {
             Some(wallet) => wallet_claimable_qnc(&blockchain, &wallet).await,
             None => 0,
         };
         
-        let (total, pool1, pool2, pool3) = if let Some(ref reward) = pending {
-            let authoritative = if blockchain_total > 0 { blockchain_total } else { reward.total_reward };
-            let t = authoritative as f64 / 1_000_000_000.0;
-            total_pending += t;
-            (
-                t,
-                reward.pool1_base_emission as f64 / 1_000_000_000.0,
-                reward.pool2_transaction_fees as f64 / 1_000_000_000.0,
-                reward.pool3_activation_bonus as f64 / 1_000_000_000.0,
-            )
-        } else if blockchain_total > 0 {
+        // Emission is pure Pool-1; there is no per-pool split to report.
+        let (total, pool1, pool2, pool3) = if blockchain_total > 0 {
             let t = blockchain_total as f64 / 1_000_000_000.0;
             total_pending += t;
             (t, t, 0.0, 0.0)
@@ -10619,11 +10563,6 @@ async fn handle_get_reward_network_stats(
     let mut total_claims = 0u64;
     let mut total_distributed = 0u64;
     
-    // Get reward manager stats
-    let reward_manager_arc = blockchain.get_reward_manager();
-    let reward_manager = reward_manager_arc.read().await;
-    let _total_registered_nodes = reward_manager.get_nodes_by_owner("").len(); // Empty returns 0, but we count all
-    drop(reward_manager);
     
     // Scan storage for claim history
     for epoch in (0..=current_epoch).rev().take(50) {
@@ -10762,13 +10701,10 @@ async fn handle_get_reward_summary(
         }
     }
     
-    // Get current pending rewards
-    let pending_qnc = {
-        let reward_manager = blockchain.get_reward_manager();
-        let rm = reward_manager.read().await;
-        rm.get_pending_reward(&node_id)
-            .map(|r| r.total_reward as f64 / 1_000_000_000.0)
-            .unwrap_or(0.0)
+    // Current claimable, from the same merkle source as the claim endpoint.
+    let pending_qnc = match blockchain.get_node_wallet(&node_id).await {
+        Some(w) => wallet_claimable_qnc(&blockchain, &w).await as f64 / 1_000_000_000.0,
+        None => 0.0,
     };
     
     // Calculate averages
@@ -11340,28 +11276,6 @@ async fn handle_register_node(
     
     // Register with reward manager
     {
-        // FIXED: Use blockchain's reward_manager instead of global REWARD_MANAGER
-        let reward_manager_arc = blockchain.get_reward_manager();
-        let mut reward_manager = reward_manager_arc.write().await;
-        
-        // Register node with reward manager
-        use qnet_consensus::lazy_rewards::NodeType;
-        // v3.18: Full nodes removed
-        let node_type_enum = match node_type {
-            "light" => NodeType::Light,
-            "super" => NodeType::Super,
-            _ => NodeType::Light, // Ignore "full"
-        };
-        
-        // Register node with all required info (overwrite is safe — same node_id for migrations)
-        if let Err(e) = reward_manager.register_node(
-            node_id.clone(),
-            node_type_enum,
-            wallet_address.to_string()
-        ) {
-            println!("[WARN][REGISTER] reward_manager err={:?}", e);
-        }
-        
         // CRITICAL: Save node registration to storage (survive restarts)
         // For migrations: overwrites existing record with same node_id (RocksDB put = upsert)
         use qnet_consensus::deterministic_reputation::INITIAL_REPUTATION;
@@ -11977,13 +11891,9 @@ async fn handle_activations_by_wallet(
         let storage = blockchain.get_storage();
         let storage_nodes = storage.get_nodes_by_wallet(&wallet_address).unwrap_or_default();
         
-        // SECONDARY SOURCE - Query RewardManager for nodes (may have additional runtime data)
-        let reward_manager_arc = blockchain.get_reward_manager();
-        let reward_manager = reward_manager_arc.read().await;
-        let rm_nodes = reward_manager.get_nodes_by_wallet(&wallet_address);
-        
-        // Merge both sources into unified list
-        let mut nodes: Vec<(String, qnet_consensus::lazy_rewards::NodeType, u64)> = Vec::new();
+        // Storage is the single source: the RAM-side node registry it used to be merged with was a
+        // second, unreplicated view of the same rows.
+        let mut nodes: Vec<(String, String, u64)> = Vec::new();
         
         // Merkle reward_root claimable (single-source; legacy pending removed). 1 wallet = 1 node.
         let blockchain_pending = wallet_claimable_qnc(&blockchain, &wallet_address).await;
@@ -11992,21 +11902,13 @@ async fn handle_activations_by_wallet(
         for (node_id, node_type_str, _rep) in &storage_nodes {
             // v3.18: Full nodes removed — only Light and Super
             let node_type = match node_type_str.as_str() {
-                "light" => qnet_consensus::lazy_rewards::NodeType::Light,
-                "super" => qnet_consensus::lazy_rewards::NodeType::Super,
+                "light" | "super" => node_type_str.clone(),
                 _ => {
                     println!("[WARN][API] unknown_node_type node={} type={}", node_id, node_type_str);
                     continue; // Skip unknown types
                 }
             };
             nodes.push((node_id.clone(), node_type, blockchain_pending));
-        }
-        
-        // Add any additional nodes from reward_manager that weren't in storage
-        for (node_id, node_type, _pending) in &rm_nodes {
-            if !nodes.iter().any(|(id, _, _)| id == node_id) {
-                nodes.push((node_id.clone(), node_type.clone(), blockchain_pending));
-            }
         }
         
         // CRITICAL FIX v2.76: Genesis nodes are NOT in node_ownership!
@@ -12018,11 +11920,7 @@ async fn handle_activations_by_wallet(
             let genesis_id = format!("genesis_node_{}", bootstrap_id);
             if wallet_address == *genesis_wallet {
                 // v3.34: Get pending from StateManager (1 wallet = 1 genesis node)
-                nodes.push((
-                    genesis_id,
-                    qnet_consensus::lazy_rewards::NodeType::Super,
-                    blockchain_pending
-                ));
+                nodes.push((genesis_id, "super".to_string(), blockchain_pending));
             }
         }
         
@@ -12055,10 +11953,7 @@ async fn handle_activations_by_wallet(
         // Build nodes array with full info INCLUDING real online status
         let nodes_json: Vec<serde_json::Value> = nodes.iter().map(|(node_id, node_type, pending)| {
             // v3.18: Full node type removed - only Light and Super remain
-            let type_str = match node_type {
-                qnet_consensus::lazy_rewards::NodeType::Light => "light",
-                qnet_consensus::lazy_rewards::NodeType::Super => "super",
-            };
+            let type_str = node_type.as_str();
             
             // v3.1: Check REAL online status from active nodes list
             let (is_online, last_seen, status) = active_nodes.iter()
@@ -12472,24 +12367,6 @@ async fn handle_verify_activation_onchain(
         }
     }
 
-    // Level 3: RewardManager (runtime HashMap, O(1))
-    let reward_manager_arc = blockchain.get_reward_manager();
-    let reward_manager = reward_manager_arc.read().await;
-    let rm_nodes = reward_manager.get_nodes_by_wallet(&wallet_address);
-    if !rm_nodes.is_empty() {
-        let node = &rm_nodes[0];
-        let type_str = match node.1 {
-            qnet_consensus::lazy_rewards::NodeType::Light => "light",
-            qnet_consensus::lazy_rewards::NodeType::Super => "super",
-        };
-        return Ok(warp::reply::json(&json!({
-            "verified": true,
-            "source": "reward_manager",
-            "node_id": node.0,
-            "node_type": type_str,
-            "wallet_address": wallet_address
-        })));
-    }
 
     // Not found — wallet has no activation or registration on current blockchain
     let current_height = blockchain.get_height().await;

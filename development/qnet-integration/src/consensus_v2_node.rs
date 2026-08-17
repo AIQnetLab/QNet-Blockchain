@@ -493,7 +493,7 @@ pub async fn execute(effects: Vec<Effect>, node_id: &str, p2p: &Arc<SimplifiedP2
                         excluded_producers_for_next_epoch: excluded,
                         consensus_committee: Some(committee),
                         banned_validators,
-                        reward_heartbeats: None,
+
                         reward_light_nodes: None,
                         ..Default::default()
                     },

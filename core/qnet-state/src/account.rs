@@ -22,13 +22,6 @@ pub struct Account {
     pub created_at: u64,
     pub updated_at: u64,
     
-    // v2.96: CRITICAL SECURITY FIX - Store pending rewards in blockchain!
-    // This prevents manipulation of local RocksDB to claim fraudulent rewards
-    // All nodes can validate RewardDistribution TXs against this on-chain value
-    // CRITICAL: #[serde(default)] is MANDATORY for backward compatibility with old blocks!
-    #[serde(default)]
-    pub pending_rewards: u64,
-
     // v3.35: Smart contract support -- store contract code hash and metadata
     // is_contract = true when account is a deployed contract
     // contract_code_hash: SHA3-256 of deployed WASM bytecode (stored in storage separately)
@@ -210,7 +203,6 @@ impl Default for AccountState {
             reputation: 0.0,
             created_at: 0,
             updated_at: 0,
-            pending_rewards: 0,
             is_contract: false,
             contract_code_hash: None,
             contract_storage: HashMap::new(),
@@ -294,7 +286,6 @@ impl Account {
             reputation: 0.0,
             created_at: 0,
             updated_at: 0,
-            pending_rewards: 0,
             is_contract: false,
             contract_code_hash: None,
             contract_storage: HashMap::new(),
@@ -321,7 +312,6 @@ impl Account {
             reputation: 0.0,
             created_at: 0,
             updated_at: 0,
-            pending_rewards: 0,
             is_contract: false,
             contract_code_hash: None,
             contract_storage: HashMap::new(),

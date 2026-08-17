@@ -680,13 +680,21 @@ async fn is_five_years_passed_since_mainnet() -> bool {
         return false; // Genesis block not created yet
     }
     
-    use qnet_consensus::lazy_rewards::PhaseAwareRewardManager;
-    let reward_mgr = PhaseAwareRewardManager::new(genesis_ts);
-    let years_passed = reward_mgr.get_years_since_genesis();
+    let years_passed = years_since(genesis_ts);
     
     println!("📅 Time check: {} years passed since Genesis block", years_passed);
     
     years_passed >= 5
+}
+
+/// Whole years elapsed since the genesis timestamp. The emission schedule itself is keyed on
+/// HEIGHT (pool1_base_emission_at_height); this is only for operator-facing phase/halving display.
+fn years_since(genesis_ts: u64) -> u64 {
+    const SECS_PER_YEAR: u64 = 365 * 24 * 60 * 60;
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs().saturating_sub(genesis_ts) / SECS_PER_YEAR)
+        .unwrap_or(0)
 }
 
 // Detect current phase with proper transition logic
@@ -805,9 +813,7 @@ async fn get_years_since_mainnet() -> f64 {
         return 0.0;
     }
     
-    use qnet_consensus::lazy_rewards::PhaseAwareRewardManager;
-    let reward_mgr = PhaseAwareRewardManager::new(genesis_ts);
-    reward_mgr.get_years_since_genesis() as f64
+    years_since(genesis_ts) as f64
 }
 
 // Real blockchain data structure
@@ -2641,11 +2647,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ═══════════════════════════════════════════════════════════════════
     // v4.0: Wallet Seed → WalletIdentity + VRF
     // ═══════════════════════════════════════════════════════════════════
-    if let Ok(seed) = std::env::var("QNET_WALLET_SEED") {
+    if let Some(seed) = qnet_integration::node::load_wallet_seed("QNET_WALLET_SEED") {
         let wallet_addr = qnet_integration::crypto::vrf::WalletIdentity::derive_wallet_address(&seed);
         println!("[INFO][STARTUP] wallet_seed=present derived_addr={}", wallet_addr);
         println!("[INFO][STARTUP] vrf=dilithium3 mode=secret_leader_election");
-    } else if let Ok(genesis_seed) = std::env::var("QNET_GENESIS_SEED") {
+    } else if let Some(genesis_seed) = qnet_integration::node::load_wallet_seed("QNET_GENESIS_SEED") {
         let wallet_addr = qnet_integration::crypto::vrf::WalletIdentity::derive_wallet_address(&genesis_seed);
         println!("[INFO][STARTUP] genesis_seed=present derived_addr={}", wallet_addr);
     } else {
@@ -4063,7 +4069,7 @@ fn is_transfer_to_burn_address(instruction: &serde_json::Value) -> bool {
 fn extract_wallet_from_activation_code(_activation_code: &str) -> Result<String, String> {
     // Derive the real Solana wallet address from QNET_WALLET_SEED (BIP39 → SLIP-10 → Ed25519)
     // This matches the mobile app derivation and is required for Solana RPC queries.
-    let seed = std::env::var("QNET_WALLET_SEED")
+    let seed = qnet_integration::node::load_wallet_seed("QNET_WALLET_SEED").ok_or(std::env::VarError::NotPresent)
         .map_err(|_| "QNET_WALLET_SEED not set — cannot derive Solana wallet address for burn verification".to_string())?;
     qnet_integration::crypto::solana_derivation::derive_solana_address_from_mnemonic(&seed)
 }
@@ -4173,12 +4179,10 @@ async fn calculate_base_reward() -> Result<f64, String> {
         return Ok(0.0);
     }
     
-    use qnet_consensus::lazy_rewards::PhaseAwareRewardManager;
-    let reward_manager = PhaseAwareRewardManager::new(genesis_ts);
-    let pool1_emission = reward_manager.get_pool1_base_emission();
+    let years = years_since(genesis_ts);
+    let pool1_emission = qnet_consensus::lazy_rewards::pool1_base_emission_for_cycles(years / 4);
     
     // v2.87: Log halving/phase status every 4h (with reward claims)
-    let years = reward_manager.get_years_since_genesis();
     let halving_cycle = years / 4;
     let years_until_halving = 4 - (years % 4);
     let next_cycle = halving_cycle + 1;
@@ -4974,13 +4978,18 @@ async fn get_activation_with_auto_genesis() -> Result<(NodeType, String), Box<dy
     eprintln!("  -e QNET_ACTIVATION_CODE=\"QNET-SXXXXX-YYYYYY-ZZZZZZ\"");
     eprintln!("  -e QNET_BURN_TX_HASH=\"your_solana_burn_tx_signature\"");
     eprintln!("  -e QNET_BURN_AMOUNT=\"1500\"");
-    eprintln!("  -e QNET_WALLET_SEED=\"your twelve word mnemonic phrase here\"");
+    eprintln!("  QNET_WALLET_SEED_FILE=/run/secrets/qnet_seed   (file, mode 0600 — preferred)");
+    eprintln!("");
+    eprintln!("  The mnemonic is the SAME secret as your mobile wallet. Passing it with -e makes it");
+    eprintln!("  readable via `docker inspect` and /proc/<pid>/environ. Mount a 0600 file instead.");
     eprintln!("");
     eprintln!("Example:");
+    eprintln!("  printf %s \"your mnemonic here\" > ./qnet_seed && chmod 600 ./qnet_seed");
     eprintln!("  docker run -d --name qnet-super --restart=always \\");
     eprintln!("    -e QNET_PRODUCTION=1 \\");
     eprintln!("    -e DOCKER_ENV=1 \\");
-    eprintln!("    -e QNET_WALLET_SEED=\"your mnemonic here\" \\");
+    eprintln!("    -v $(pwd)/qnet_seed:/run/secrets/qnet_seed:ro \\");
+    eprintln!("    -e QNET_WALLET_SEED_FILE=/run/secrets/qnet_seed \\");
     eprintln!("    -e QNET_ACTIVATION_CODE=\"QNET-SXXXXX-YYYYYY-ZZZZZZ\" \\");
     eprintln!("    -e QNET_BURN_TX_HASH=\"solana_tx_signature\" \\");
     eprintln!("    -e QNET_BURN_AMOUNT=\"1500\" \\");

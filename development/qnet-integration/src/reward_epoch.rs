@@ -51,7 +51,11 @@ pub fn is_reward_epoch(epoch: u64) -> bool {
     epoch % MB_PER_EPOCH == 0
 }
 
-/// Amount epoch `E` distributes. A formula over height, never read from a TX.
+/// Amount epoch `E` distributes. A formula over height, NEVER read from a TX — which is what
+/// bounds the money rather than only the supply counter. A producer cannot mint the scheduled
+/// figure while funding the epoch with one nano, because it does not get to state the figure:
+/// every node derives it here, and `select_emission_at` additionally requires the minted amount
+/// to equal the same schedule at the same height.
 #[inline]
 pub fn canonical_total(epoch: u64) -> u64 {
     emission_height_of(epoch)
@@ -316,6 +320,25 @@ mod tests {
         assert_eq!(epoch_of_emission_mb(0), None);
         assert_eq!(epoch_of_emission_mb(MB_PER_EPOCH - 1), None);
         assert_eq!(epoch_of_emission_mb(MB_PER_EPOCH), Some(0));
+    }
+
+    /// Pool solvency rests on one identity: what the emission MINTS into system_rewards_pool at
+    /// height h is exactly what the epoch keyed at h distributes. If these ever diverged, the last
+    /// claimants of an epoch would hit the fail-closed short-pool path with no way to recover.
+    #[test]
+    fn the_pool_is_credited_exactly_what_its_epoch_distributes() {
+        for k in 2..5_000u64 {
+            let h = EMISSION_BLOCK_INTERVAL * k;
+            let minted = match crate::node::BlockchainNode::expected_emission_amount(h) {
+                crate::node::EmissionExpectation::Exact(v) => v,
+                crate::node::EmissionExpectation::NoneDue => continue,
+            };
+            let epoch = crate::node::BlockchainNode::emission_mb_index(h);
+            assert_eq!(emission_height_of(epoch), Some(h),
+                       "epoch<->height round trip broke at h={}", h);
+            assert_eq!(canonical_total(epoch), minted,
+                       "the distribution at epoch {} is not what height {} mints", epoch, h);
+        }
     }
 
     /// The epoch's value is the schedule's value at its emission height — one derivation, no TX input.

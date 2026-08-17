@@ -1229,7 +1229,6 @@ static HIGHEST_CERTIFIED_ROUND: Lazy<Arc<DashMap<u64, u64>>> =
 /// Window-monotonic floor: highest window with a locally-VERIFIED TC. A voter never emits below it
 /// — once a window certified, resuming a lower key would let ≤f cross-window Byzantine votes push
 /// two adjacent windows to quorum simultaneously (double-TC at a boundary straddle).
-static HIGHEST_OBSERVED_TC_WINDOW: AtomicU64 = AtomicU64::new(0);
 
 /// Failover committee cache, keyed by (window, anchor_hash). Anchor-keying (R17.1) makes an L-advance
 /// invalidate automatically: the sealed and frozen arms name different anchors, so a now-sealed window
@@ -1450,32 +1449,19 @@ pub fn window_has_vote_from(w: u64, voter: &str) -> bool {
         .any(|e| e.key().0 == w && e.key().1 > certified && e.value().contains_key(voter))
 }
 
-/// Current failover VIEW floor: no honest node emits, forms, accepts, or tallies a vote/TC for a
-/// window below it (anti-double-TC — once a window certified, an earlier window is a left view).
+/// Failover VIEW floor = the highest FINALIZED window. No honest node forms, accepts, or tallies a
+/// vote/TC for a window below it (anti-double-TC: a finalized window is sealed). DERIVED from finality,
+/// which is a ratchet and always ≤ this node's applied tip — so the floor can NEVER sit above the
+/// window the node is failing over at, the wedge that deafened a rolled-back node in its own window.
 pub fn observed_tc_window_floor() -> u64 {
-    HIGHEST_OBSERVED_TC_WINDOW.load(std::sync::atomic::Ordering::Relaxed)
+    crate::node::LAST_FINALIZED_HEIGHT.load(std::sync::atomic::Ordering::Relaxed)
+        / qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL
 }
 
-/// Raise the view floor to a newly-verified TC window and evict now-below-floor banked votes so
-/// stale keys cannot later be topped-up to quorum (the banked-vote double-TC vector). Idempotent.
-fn raise_tc_window_floor(w: u64) {
-    let prev = HIGHEST_OBSERVED_TC_WINDOW.fetch_max(w, std::sync::atomic::Ordering::Relaxed);
-    if w > prev {
-        TIMEOUT_VOTES.retain(|(h, _), _| *h >= w);
-    }
-}
-
-/// Lower the view floor after a finality-subordinate fork rollback moved this node's verified tip
-/// below it. The higher-window TCs referenced blocks the rollback orphaned, so the node must be
-/// able to fail over at its new (lower) tip. Safe vs double-TC: a rollback needs real blocks + the
-/// deterministic fork choice (never ≤f-forgeable), so an adversary cannot drive an honest floor down.
-/// MUST also drop the orphaned above-tip certs — else the 2s TC flush persists them and boot rehydrate
-/// re-raises the floor, permanently deafening the node to failover at its rolled-back tip.
-pub(crate) fn lower_tc_window_floor(w: u64) {
-    HIGHEST_OBSERVED_TC_WINDOW.fetch_min(w, std::sync::atomic::Ordering::Relaxed);
-    TIMEOUT_CERTIFICATES.retain(|(h, _), _| *h <= w);
-    HIGHEST_CERTIFIED_ROUND.retain(|h, _| *h <= w);
-    TIMEOUT_VOTES.retain(|(h, _), _| *h <= w);
+/// On a new 2f+1 TC for window `w`: evict banked votes below `w` so stale keys cannot later be
+/// topped-up to quorum (the banked-vote double-TC vector). The floor is finality-derived, not stored.
+fn evict_votes_below_certified(w: u64) {
+    TIMEOUT_VOTES.retain(|(h, _), _| *h >= w);
 }
 
 /// This node's highest-TC hint (window, round) for outbound SyncInfo claims.
@@ -1501,7 +1487,6 @@ pub(crate) fn test_clear_timeout_state() {
     TIMEOUT_VOTES.clear();
     TIMEOUT_CERTIFICATES.clear();
     HIGHEST_CERTIFIED_ROUND.clear();
-    HIGHEST_OBSERVED_TC_WINDOW.store(0, std::sync::atomic::Ordering::Relaxed);
     FAILOVER_COMMITTEE_CACHE.clear();
 }
 
@@ -1771,6 +1756,45 @@ pub fn record_producer_liveness_from_block(producer_id: &str, height: u64) {
 /// slot (>= next_height); an alive-but-stuck-below producer fails over fast.
 pub fn last_remote_producer_heartbeat_height(producer_id: &str) -> Option<u64> {
     REMOTE_PRODUCER_HEARTBEAT_HEIGHT.get(producer_id).map(|v| *v.value())
+}
+
+/// A verified heartbeat's anchor checked against our own chain. Match/Unknown both keep the leader
+/// alive; only Match may set the HEIGHT map that can suppress a view-change — an Unknown claim about a
+/// slot we cannot check must never silence the vote that would rotate it.
+#[derive(PartialEq, Eq, Debug)]
+pub(crate) enum HeartbeatAnchor { Match, Contradicts, Unknown }
+
+pub(crate) fn heartbeat_anchor_verdict(local: Option<&str>, wire: &str) -> HeartbeatAnchor {
+    match local {
+        Some(h) if h != wire => HeartbeatAnchor::Contradicts,
+        Some(_) => HeartbeatAnchor::Match,
+        None => HeartbeatAnchor::Unknown,
+    }
+}
+
+/// The heartbeat anchor rides the wire and is signed, so a behind receiver that does not hold slot-1
+/// still verifies the producer alive (Unknown) instead of failing signature reconstruction — the
+/// sig_reject storm's root. A wrong anchor for a slot we DO hold is a lie about the frontier (drop);
+/// a slot we cannot check must not gain the height that could suppress a rotation vote.
+#[cfg(test)]
+mod tests_heartbeat_anchor {
+    use super::{heartbeat_anchor_verdict, HeartbeatAnchor};
+
+    #[test]
+    fn behind_node_does_not_reject_an_honest_leader() {
+        // Receiver holds nothing at the leader's tip-1 ⇒ Unknown, not a rejection.
+        assert_eq!(heartbeat_anchor_verdict(None, "abc"), HeartbeatAnchor::Unknown);
+    }
+
+    #[test]
+    fn matching_anchor_is_full_trust() {
+        assert_eq!(heartbeat_anchor_verdict(Some("abc"), "abc"), HeartbeatAnchor::Match);
+    }
+
+    #[test]
+    fn a_lie_about_a_slot_we_hold_is_dropped() {
+        assert_eq!(heartbeat_anchor_verdict(Some("abc"), "def"), HeartbeatAnchor::Contradicts);
+    }
 }
 
 /// Regression guard: producer-silence age is measured against the OBSERVED (local-receive) map only,
@@ -12409,10 +12433,12 @@ pub enum NetworkMessage {
         /// their own tip to detect a stuck producer that broadcasts but
         /// hasn't caught up.
         slot_height: u64,
+        /// Canonical hash at slot_height-1, ON THE WIRE and inside the signed preimage. A behind
+        /// receiver verifies the signature over these exact bytes instead of reconstructing the
+        /// anchor from its own chain (which failed for every honest node not yet holding the tip).
+        anchor_hash: String,
         /// Dilithium3 detached signature over
-        /// "QNET_PRODUCER_HEARTBEAT_V2:{producer_id}:{timestamp}:{slot_height}:{parent_hash}",
-        /// where parent_hash is the canonical hash at slot_height-1. It is NOT on the wire — the
-        /// receiver reconstructs it from its own chain, so a claimed slot it does not hold cannot verify.
+        /// "QNET_PRODUCER_HEARTBEAT_V3:{producer_id}:{timestamp}:{slot_height}:{anchor_hash}".
         signature: Vec<u8>,
     },
     
@@ -13325,7 +13351,7 @@ impl SimplifiedP2P {
                 }
             }
 
-            NetworkMessage::ProducerHeartbeat { producer_id, timestamp, slot_height, signature } => {
+            NetworkMessage::ProducerHeartbeat { producer_id, timestamp, slot_height, anchor_hash, signature } => {
                 // v16.1: remote producer liveness signal. Verified Dilithium3
                 // signature proves the producer is alive and aware of the
                 // current slot. Receivers update REMOTE_PRODUCER_HEARTBEAT_MS
@@ -13365,20 +13391,11 @@ impl SimplifiedP2P {
                     }
                 }
 
-                // Verify signature against producer's registered consensus PK.
-                // This is the same registry used for TimeoutVote signatures —
-                // pk_mismatch class of failures still applies and would
-                // correctly reject a spoofed heartbeat.
-                // v2: the signed preimage includes the PARENT HASH of the claimed slot, and we
-                // reconstruct it from OUR OWN storage rather than trusting a wire field. A producer
-                // claiming a slot we do not have (the cheap lie — this heartbeat SUPPRESSES the
-                // view-change vote, so an invented frontier held the slot for the whole ceiling)
-                // yields a hash we cannot reproduce, so the signature simply fails.
-                let anchor_hash = self.storage.as_ref()
-                    .and_then(|st| st.get_microblock_hash_hex(slot_height.saturating_sub(1)).ok().flatten())
-                    .unwrap_or_default();
+                // Signature is verified over the WIRE anchor (self-authenticating), not a locally
+                // reconstructed one — an honest producer at its own tip we do not yet hold no longer
+                // fails here. Same registry as TimeoutVote (pk_mismatch still rejects a spoof).
                 let msg = format!(
-                    "QNET_PRODUCER_HEARTBEAT_V2:{}:{}:{}:{}",
+                    "QNET_PRODUCER_HEARTBEAT_V3:{}:{}:{}:{}",
                     producer_id, timestamp, slot_height, anchor_hash
                 );
                 let sig_str = match String::from_utf8(signature.clone()) {
@@ -13400,20 +13417,42 @@ impl SimplifiedP2P {
                     return;
                 }
 
-                // Update remote heartbeat tracking. Stored as wall-clock ms
-                // so the watchdog comparison stays simple.
+                // Anchor verdict against our own chain, three-valued:
+                //   CONTRADICTS  — we hold slot-1 and it differs ⇒ a lie about the frontier; drop.
+                //   MATCH        — we hold slot-1 and it agrees ⇒ full trust: update liveness AND the
+                //                  height map that can suppress a view-change.
+                //   UNKNOWN      — we do not hold slot-1 ⇒ signature is valid but unprovable: record
+                //                  liveness (leader is not dead) but NEVER the height, so a claim about a
+                //                  slot we cannot check can never suppress the vote that would rotate it.
+                let local = self.storage.as_ref()
+                    .and_then(|st| st.get_microblock_hash_hex(slot_height.saturating_sub(1)).ok().flatten());
+                let anchor_known = local.is_some();
                 let now_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis() as u64;
-                REMOTE_PRODUCER_HEARTBEAT_MS.insert(producer_id.clone(), timestamp);
-                REMOTE_PRODUCER_HEARTBEAT_OBSERVED_MS.insert(producer_id.clone(), now_ms);
-                REMOTE_PRODUCER_HEARTBEAT_HEIGHT.insert(producer_id.clone(), slot_height);
+                match heartbeat_anchor_verdict(local.as_deref(), &anchor_hash) {
+                    HeartbeatAnchor::Contradicts => {
+                        if crate::node::is_warn() {
+                            println!("[WARN][HEARTBEAT] anchor_contradicts producer={} slot_h={} action=drop", producer_id, slot_height);
+                        }
+                        return;
+                    }
+                    HeartbeatAnchor::Match => {
+                        REMOTE_PRODUCER_HEARTBEAT_MS.insert(producer_id.clone(), timestamp);
+                        REMOTE_PRODUCER_HEARTBEAT_OBSERVED_MS.insert(producer_id.clone(), now_ms);
+                        REMOTE_PRODUCER_HEARTBEAT_HEIGHT.insert(producer_id.clone(), slot_height);
+                    }
+                    HeartbeatAnchor::Unknown => {
+                        REMOTE_PRODUCER_HEARTBEAT_MS.insert(producer_id.clone(), timestamp);
+                        REMOTE_PRODUCER_HEARTBEAT_OBSERVED_MS.insert(producer_id.clone(), now_ms);
+                    }
+                }
 
                 if crate::node::is_debug() {
                     println!(
-                        "[DBG][HEARTBEAT] received producer={} slot_h={} ts={}",
-                        producer_id, slot_height, timestamp
+                        "[DBG][HEARTBEAT] received producer={} slot_h={} ts={} anchor_known={}",
+                        producer_id, slot_height, timestamp, anchor_known
                     );
                 }
             }
@@ -17231,50 +17270,6 @@ impl SimplifiedP2P {
     }
     
     
-    /// Calculate Merkle root of heartbeat summaries for light client verification
-    pub fn calculate_heartbeats_merkle_root(&self, summaries: &[qnet_state::HeartbeatSummary]) -> [u8; 32] {
-        use sha3::{Sha3_256, Digest};
-        
-        if summaries.is_empty() {
-            return [0u8; 32];
-        }
-        
-        // Create leaf hashes
-        let mut leaves: Vec<[u8; 32]> = summaries.iter().map(|s| {
-            let mut hasher = Sha3_256::new();
-            hasher.update(s.node_id.as_bytes());
-            hasher.update(&[s.node_type]);
-            hasher.update(&[s.heartbeat_count]);
-            hasher.update(&s.first_heartbeat.to_le_bytes());
-            hasher.update(&s.last_heartbeat.to_le_bytes());
-            hasher.update(&[if s.is_eligible { 1 } else { 0 }]);
-            let result = hasher.finalize();
-            let mut hash = [0u8; 32];
-            hash.copy_from_slice(&result);
-            hash
-        }).collect();
-        
-        // Build Merkle tree
-        while leaves.len() > 1 {
-            let mut new_leaves = Vec::new();
-            for chunk in leaves.chunks(2) {
-                let mut hasher = Sha3_256::new();
-                hasher.update(&chunk[0]);
-                if chunk.len() > 1 {
-                    hasher.update(&chunk[1]);
-                } else {
-                    hasher.update(&chunk[0]); // Duplicate for odd count
-                }
-                let result = hasher.finalize();
-                let mut hash = [0u8; 32];
-                hash.copy_from_slice(&result);
-                new_leaves.push(hash);
-            }
-            leaves = new_leaves;
-        }
-        
-        leaves[0]
-    }
     
     // ═══════════════════════════════════════════════════════════════════════════════
     // v2.50.0: POOL 2 & POOL 3 METHODS - Deterministic reward calculation
@@ -18111,8 +18106,9 @@ impl SimplifiedP2P {
     // sync hints only and must never derive a consensus key (eclipse/staleness split honest votes).
 
     /// Fresh (attested within TTL) last_block_height of currently-connected in-set peers (committee ∪
-    /// genesis). Shared builder for the head oracle and the failover frontier.
-    fn fresh_in_set_peer_heights(&self) -> Vec<u64> {
+    /// genesis). Shared builder for the head oracle, the failover frontier, and the production
+    /// corroboration gate — a stale or unattested height must never be evidence we are at the tip.
+    pub(crate) fn fresh_in_set_peer_heights(&self) -> Vec<u64> {
         let cc = CURRENT_COMMITTEE.read().clone();
         let now = self.current_timestamp();
         self.connected_peers_lockfree.iter()
@@ -20286,7 +20282,7 @@ fn is_genesis_node_ip(ip: &str) -> bool {
 /// Returns the decoded bytes on success. On overflow the error message
 /// names the cap that was breached so operators can correlate the WARN
 /// log to the configured ceiling.
-fn decompress_zstd_bounded(input: &[u8], max_output_bytes: usize) -> std::io::Result<Vec<u8>> {
+pub fn decompress_zstd_bounded(input: &[u8], max_output_bytes: usize) -> std::io::Result<Vec<u8>> {
     use std::io::Read;
     let mut decoder = zstd::Decoder::new(input)?;
     // Pre-size to a small constant; the bounded reader caps the upper end.
@@ -22472,7 +22468,7 @@ impl SimplifiedP2P {
         HIGHEST_CERTIFIED_ROUND.entry(height)
             .and_modify(|cur| { if timeout_round > *cur { *cur = timeout_round; } })
             .or_insert(timeout_round);
-        raise_tc_window_floor(height);
+        evict_votes_below_certified(height);
 
         if crate::node::is_info() {
             println!("[INFO][TC] certified mb={} round={} voters={}", height, timeout_round, votes.len());
@@ -22616,6 +22612,7 @@ impl SimplifiedP2P {
         &self,
         producer_id: String,
         slot_height: u64,
+        anchor_hash: String,
         signature_bytes: Vec<u8>,
         timestamp: u64,
     ) {
@@ -22623,6 +22620,7 @@ impl SimplifiedP2P {
             producer_id,
             timestamp,
             slot_height,
+            anchor_hash,
             signature: signature_bytes,
         };
         self.broadcast_consensus_message_parallel(msg);
@@ -23161,7 +23159,6 @@ pub fn rehydrate_timeout_certificates(bytes: &[u8]) -> usize {
             for (k, v) in entries {
                 // Structural consistency: key must match the proof's own fields, votes non-empty.
                 if v.height == k.0 && v.timeout_round == k.1 && !v.votes.is_empty() {
-                    raise_tc_window_floor(k.0);
                     TIMEOUT_CERTIFICATES.insert(k, v);
                     count += 1;
                 }
@@ -23326,7 +23323,7 @@ impl SimplifiedP2P {
         HIGHEST_CERTIFIED_ROUND.entry(height)
             .and_modify(|cur| { if timeout_round > *cur { *cur = timeout_round; } })
             .or_insert(timeout_round);
-        raise_tc_window_floor(height);
+        evict_votes_below_certified(height);
 
         if crate::node::is_info() {
             println!("[INFO][TC] certified mb={} round={} voters={} source=broadcast", height, timeout_round, signers);
@@ -25574,9 +25571,11 @@ mod tests {
         assert_eq!(lowest_window_with_support(1), Some(2), "strictly-above filter");
         assert_eq!(lowest_window_with_support(2), None, "nothing above");
 
-        // ── Rehydration hardening + window-monotonic TC floor. A certified-round pair installs
-        // ONLY when backed by a co-persisted structurally-consistent TC; the floor advances.
+        // ── Rehydration hardening. A certified-round pair installs ONLY when backed by a co-persisted
+        // structurally-consistent TC. Rehydrate must NOT raise the floor — that boot re-raise is what
+        // permanently deafened a rolled-back node in its own window; the floor is finality-derived.
         test_clear_timeout_state();
+        crate::node::LAST_FINALIZED_HEIGHT.store(0, std::sync::atomic::Ordering::SeqCst);
         let vote = SignedTimeoutVote {
             voter_id: "voter_a".into(), signature: vec![1],
             high_qc_idx: 0, high_qc_hash: [0u8; 32], tip_height: 629, tip_hash: [0u8; 32],
@@ -25585,25 +25584,27 @@ mod tests {
         let mismatched = TimeoutProof { height: 6, timeout_round: 1, anchor: [0u8; 32], votes: vec![vote] };
         let blob = bincode::serialize(&vec![((7u64, 3u64), good), ((8u64, 1u64), mismatched)]).unwrap();
         assert_eq!(rehydrate_timeout_certificates(&blob), 1, "key/field-mismatched TC rejected");
-        assert_eq!(observed_tc_window_floor(), 7, "floor = highest verified TC window");
+        assert_eq!(observed_tc_window_floor(), 0, "rehydrate installs certs but never raises the floor");
         let pairs = bincode::serialize(&vec![(7u64, 3u64), (9u64, 5u64)]).unwrap();
         assert_eq!(rehydrate_highest_certified_rounds(&pairs), 1, "unbacked pair NOT installed");
         assert_eq!(highest_certified_round_for(7), 3);
         assert_eq!(highest_certified_round_for(9), 0, "raw disk pair is not a production input");
 
-        // ── View floor raise prunes banked below-floor votes (banked-vote double-TC vector) and is
-        // monotone; rollback lowers it so a rolled-back tip can fail over again.
+        // ── Floor = finalized window (a ratchet, always ≤ tip). A rollback of UNFINALIZED blocks leaves
+        // finality AND the certs intact, so a re-advancing node re-elects the certified producer; the
+        // eviction still prunes banked votes below a freshly-certified window (double-TC belt).
         test_clear_timeout_state();
+        crate::node::LAST_FINALIZED_HEIGHT.store(2 * 90, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(observed_tc_window_floor(), 2, "floor = finalized window");
         test_insert_timeout_vote(4, 1, "voter_a"); // banked at window 4
         test_insert_timeout_vote(6, 1, "voter_b"); // at window 6
-        raise_tc_window_floor(5);
-        assert_eq!(observed_tc_window_floor(), 5, "floor raised");
-        assert!(!TIMEOUT_VOTES.contains_key(&(4, 1)), "below-floor banked vote pruned");
-        assert!(TIMEOUT_VOTES.contains_key(&(6, 1)), "at-or-above-floor vote retained");
-        raise_tc_window_floor(3);
-        assert_eq!(observed_tc_window_floor(), 5, "raise is monotone (no regress)");
-        lower_tc_window_floor(2); // fork rollback moved the tip into window 2
-        assert_eq!(observed_tc_window_floor(), 2, "rollback lowers the floor → re-vote enabled");
+        evict_votes_below_certified(5); // a TC certified window 5
+        assert!(!TIMEOUT_VOTES.contains_key(&(4, 1)), "below-certified banked vote pruned");
+        assert!(TIMEOUT_VOTES.contains_key(&(6, 1)), "at-or-above vote retained");
+        // A stuck node with tip in window 4-5 has floor 2 (finality) — it CAN still receive/form a TC
+        // for its own window, the wedge this fixes. Certified round survives (finality 2 < window 5).
+        assert_eq!(observed_tc_window_floor(), 2, "floor stays at finality, never above the tip");
+        crate::node::LAST_FINALIZED_HEIGHT.store(0, std::sync::atomic::Ordering::SeqCst);
 
         // ── A4 self-yield gate: the self-expected leader emits its single decisive view-change vote
         // once (quorum − 1) DISTINCT committee peers already want to rotate off it — never at f+1,

@@ -1510,10 +1510,8 @@ impl BlockchainActivationRegistry {
     /// Get eligible nodes for consensus (public interface)
     pub async fn get_eligible_nodes(&self) -> Vec<(String, f64, String)> {
         // CONSENSUS FIX: Use block height for cache invalidation instead of wall clock
-        let current_height = std::env::var("CURRENT_BLOCK_HEIGHT")
-            .unwrap_or_default()
-            .parse::<u64>()
-            .unwrap_or(0);
+        let current_height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT
+            .load(std::sync::atomic::Ordering::Relaxed);
         
         // ARCHITECTURE FIX: ALWAYS sync from blockchain for true decentralization
         // No special Genesis mode - all nodes equal from block #1
@@ -1604,10 +1602,8 @@ impl BlockchainActivationRegistry {
     fn calculate_node_reputation(&self, node: &NodeInfo) -> f64 {
         // CONSENSUS FIX: Use block height instead of wall clock for deterministic reputation
         // This ensures all nodes calculate the same reputation at the same block height
-        let current_height = std::env::var("CURRENT_BLOCK_HEIGHT")
-            .unwrap_or_default()
-            .parse::<u64>()
-            .unwrap_or(0);
+        let current_height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT
+            .load(std::sync::atomic::Ordering::Relaxed);
         
         // Convert block height to deterministic "time" (1 block = ~1 second)
         let current_time = node.activated_at + current_height;
@@ -1660,10 +1656,8 @@ impl BlockchainActivationRegistry {
         // All nodes must read the same blocks to get the same activation list
         
         // Use the block height from environment (set by microblock producer)
-        let current_height = std::env::var("CURRENT_BLOCK_HEIGHT")
-            .unwrap_or_default()
-            .parse::<u64>()
-            .unwrap_or(0);
+        let current_height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT
+            .load(std::sync::atomic::Ordering::Relaxed);
         
         // Read activations from deterministic range (aligned to 30-block boundaries)
         // This ensures all nodes see the same data at the same round
@@ -1826,10 +1820,8 @@ impl BlockchainActivationRegistry {
         // CONSENSUS FIX: Use deterministic block height from environment
         // This is set by the microblock producer and ensures all nodes use the same height
         
-        let current_height = std::env::var("CURRENT_BLOCK_HEIGHT")
-            .unwrap_or_default()
-            .parse::<u64>()
-            .unwrap_or(0);
+        let current_height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT
+            .load(std::sync::atomic::Ordering::Relaxed);
         
         Ok(current_height)
     }
