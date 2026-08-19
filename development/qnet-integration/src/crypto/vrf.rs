@@ -231,7 +231,7 @@ impl DilithiumVrf {
         Ok(true)
     }
 
-    // ── Secret Leader Election ───────────────────────────────────────────
+    // ── Leader election (PUBLIC deterministic hash — nothing here is secret) ──
 
     /// Compute slot seed from macroblock hash + round
     pub fn compute_slot_seed(mb_hash: &[u8; 32], round: u64) -> [u8; 32] {

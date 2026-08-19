@@ -52,7 +52,7 @@ fn create_test_transaction(id: u64, size: usize) -> Transaction {
         public_key: None,
         dilithium_signature: None,
         dilithium_public_key: None,
-        chain_id: 0,
+        chain_id: qnet_state::transaction::QNET_CHAIN_ID,
     }
 }
 

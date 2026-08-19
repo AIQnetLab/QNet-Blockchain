@@ -53,7 +53,7 @@ use crate::unified_p2p::SimplifiedP2P;
 // a single attacker spawning sockets.
 //
 // Canonical fork detection now lives at the macroblock layer:
-//   - Every 90-block boundary runs 2f+1 commit/reveal consensus on the
+//   - Every 90-block boundary runs n−f commit/reveal consensus on the
 //     finalized macroblock. Divergence there = confirmed Byzantine fork.
 //   - Until then, invalid blocks are rejected and the node waits for the
 //     canonical macroblock consensus to resolve.
@@ -61,7 +61,7 @@ use crate::unified_p2p::SimplifiedP2P;
 
 /// Global fork recovery signal: fork_height (0 = no signal).
 /// Set by the macroblock-divergence detector OR by the v16.2 observer-based
-/// 2f+1 BlockRejection aggregator (`unified_p2p::handle BlockRejection`);
+/// n−f BlockRejection aggregator (`unified_p2p::handle BlockRejection`);
 /// consumed by the main consensus loop. Public so the cross-module rejection
 /// aggregator can raise the signal directly without going through a separate
 /// IPC channel.
@@ -104,8 +104,8 @@ fn clear_apply_mismatch() {
 
 // Distinct-peer witness tracker for microblock minority-fork detection.
 // Height → set of distinct peer_ids that reported hash_chain_break there.
-// DETECTION threshold is f+1, NOT 2f+1: a node on a minority fork cannot
-// gather 2f+1 honest witnesses (it would never trip → stuck forever, the
+// DETECTION threshold is f+1, NOT the n−f quorum: a node on a minority fork cannot
+// gather n−f honest witnesses (it would never trip → stuck forever, the
 // v14.8.5 bug). f+1 = "at least one honest" and is Sybil-proof because each
 // witness is a Dilithium3-authenticated validator peer_id (a false positive
 // needs f+1 real keys, outside the ≤f fault model). Safe: an honest node
@@ -128,7 +128,7 @@ const FORK_RECOVERY_COOLDOWN_SECS: u64 = 60;
 // Cooldown for the failover-cert pull-on-reject. mb_idx → wall-clock secs of last request.
 // Bounds how often a node stuck on an uncertified failover block asks peers for that window's
 // timeout certificates (the request/serve already exists for sync and returns the same-round
-// 2f+1 TimeoutCertificate). 2s is fast enough to recover within a window, slow enough that
+// n−f TimeoutCertificate). 2s is fast enough to recover within a window, slow enough that
 // the repeated per-block reject loop can't flood peers.
 static FAILOVER_CERT_PULL_TIMES: once_cell::sync::Lazy<
     dashmap::DashMap<u64, u64>
@@ -201,7 +201,7 @@ pub(crate) fn signal_fork_recovery(target: u64) {
 ///      already the leader-verified canonical one, so a legitimate same-height/round competitor (a
 ///      restarted producer re-emitting a different block) must be the SAME producer. A DIFFERENT
 ///      producer self-signing a sibling for a height it does not own is an equivocation/hijack — it must
-///      NOT win a sig tie-break (that was the reorg-DoS: any registered node could grind a lower sig and
+///      NOT win the tie-break (that was the reorg-DoS: any registered node could grind a lower value and
 ///      force a wasteful rollback);
 ///   3. incoming.hash() < our.hash() — deterministic single winner. Keyed on the BLOCK HASH, not the
 ///      signature: ML-DSA signatures are randomized, so a producer could re-sign the same block to
@@ -217,14 +217,14 @@ fn equal_round_selffork_supersedes(storage: &Storage, incoming: &qnet_state::Mic
 }
 
 /// Deterministic microblock fork-choice (failover race): a same-height block from a STRICTLY HIGHER
-/// 2f+1-certified rotation round — or an EQUAL round self-fork (same producer, lower Sha3(signature),
+/// n−f-certified rotation round — or an EQUAL round self-fork (same producer, lower BLOCK HASH,
 /// validly signed) — supersedes the one we hold. This is the stored-height leg of the ONE network-wide
 /// fork-choice rule (gossip re-delivery AND solicited repair both funnel here), byte-identical to the
 /// anchor_recovery / apply-resolver sites via equal_round_selffork_supersedes.
 /// Routes it to the finality-guarded reorg via FORK_RECOVERY_HEIGHT — the existing
 /// recovery rolls back (never below finality), reconciles state, and resyncs to the
 /// certified chain. Both timeout_round values share the per-height baseline, so the
-/// higher one is the failover winner. Safety: round must be 2f+1-certified (≤f
+/// higher one is the failover winner. Safety: round must be n−f-certified (≤f
 /// Byzantine cannot forge a TC); height must be above finality; per-height cooldown
 /// bounds re-triggers; the resync re-verifies every block. One bounded decode, only
 /// for stored heights above finality.
@@ -265,20 +265,21 @@ fn maybe_supersede_by_certified_round(storage: &Arc<Storage>, block: &IngestBloc
     };
 
     // Fork-choice by ABSOLUTE round (relative + carried baseline, both from the block bytes — a
-    // same-height loser-apply can no longer pollute the ranking): a STRICTLY HIGHER 2f+1-certified round
-    // wins; on an EQUAL round, the lower Sha3(signature) wins. The equal-round tie-break converges a
+    // same-height loser-apply can no longer pollute the ranking): a STRICTLY HIGHER n−f-certified round
+    // wins; on an EQUAL round, the lower BLOCK HASH wins (block.hash() excludes the randomized ML-DSA
+    // signature, so the tie-break cannot be ground). The equal-round tie-break converges a
     // same-round self-fork (a restarted producer re-emitting a different block at h) that a strict `>`
     // gate would leave split forever — and it MUST live here because both gossip re-delivery AND solicited
     // repair funnel through this function, so without it a node holding the equal-round loser never
     // converges (boundary re-freeze). Byte-identical to the anchor_recovery / apply-resolver tie-break.
-    // Content-QC authority DOMINATES the round heuristic below finality: a 2f+1-QC-certified macroblock
+    // Content-QC authority DOMINATES the round heuristic below finality: an n−f-QC-certified macroblock
     // is stronger evidence than any TC-round rank. If h's window is sealed and the incoming body equals
     // the QC-certified hash at h while ours does NOT, adopt unconditionally — converging the case where a
     // LOWER-round original that WON the checkpoint is repair-delivered against a higher-round fork the
     // checkpoint rejected (the round gate below would refuse it and P3's content-defer would wedge
-    // forever). Hash match against the 2f+1 list is unforgeable → no round/producer/sig gate. The
+    // forever). Hash match against the n−f list is unforgeable → no round/producer/sig gate. The
     // macroblock is the same object the MB-SYNC deferral saved before soliciting this repair.
-    // Resolve h's 2f+1-QC-certified body hash (if its window macroblock is stored). Content-QC authority is
+    // Resolve h's n−f-QC-certified body hash (if its window macroblock is stored). Content-QC authority is
     // TOTAL below finality, in BOTH directions — a one-sided override turns the wedge into an A->B->A flap:
     //   * WE hold the certified body, the competitor does NOT  => never leave it (return). Otherwise the
     //     round heuristic below reorgs us onto the checkpoint-REJECTED higher-round sibling, and an adversary
@@ -299,14 +300,14 @@ fn maybe_supersede_by_certified_round(storage: &Arc<Storage>, block: &IngestBloc
     let incoming_wins = if content_wins {
         true
     } else if incoming_abs > our_abs {
-        // Adopt the competitor's ATTACHED 2f+1 TimeoutProof BEFORE reading the certified round, so a node
+        // Adopt the competitor's ATTACHED n−f TimeoutProof BEFORE reading the certified round, so a node
         // that missed the separate TC broadcast learns the round in-band; the higher round wins ONLY if
-        // 2f+1-certified (a forged round advances nothing → not certified → ignored). Adopt only in this
+        // n−f-certified (a forged round advances nothing → not certified → ignored). Adopt only in this
         // higher-round branch — an equal/lower round needs no new round authority.
         if let (Some(pb), Some(p)) = (incoming.timeout_proof.as_ref(), p2p) { p.adopt_timeout_proof_bytes(pb); }
         let certified_abs = crate::unified_p2p::highest_certified_round_for(mb_idx);
         if incoming_abs > certified_abs {
-            // Higher round not yet 2f+1-certified locally. The competitor's timeout_proof is WIRE-ONLY
+            // Higher round not yet n−f-certified locally. The competitor's timeout_proof is WIRE-ONLY
             // (storage serve strips it), and the one-shot TC broadcast may have been missed — so a copy
             // delivered via sync/repair carries no adoptable proof. Actively PULL this window's
             // TimeoutCertificate (rate-limited per mb_idx, shared bucket with verify_stage) so
@@ -333,19 +334,18 @@ fn maybe_supersede_by_certified_round(storage: &Arc<Storage>, block: &IngestBloc
         true
     } else if incoming_abs == our_abs {
         // Equal absolute round self-fork: the round is the one we already hold (== certified for it), so
-        // no new round authority is needed — converge on the lower Sha3(signature) (single deterministic
+        // no new round authority is needed — converge on the lower BLOCK HASH (single deterministic
         // winner). No cert pull: the round is not higher than what we already accepted.
         //
         // Equal-round self-fork: converge via the shared PRE-VERIFY tie-break (same producer as our
-        // leader-verified stored block + lower Sha3(sig) + valid producer signature). This runs on
-        // UNVERIFIED gossip/repair bytes with no 2f+1-TC to lean on, so the producer-authorization +
-        // signature check inside the helper is what stops a registered node grinding a lower sig to
-        // force a wasteful reorg. See equal_round_selffork_supersedes.
+        // leader-verified stored block + lower block hash + valid producer signature). This runs on
+        // UNVERIFIED gossip/repair bytes with no n−f TC to lean on, so the producer-authorization +
+        // signature check inside the helper is what stops a non-producer forcing a wasteful reorg. See equal_round_selffork_supersedes.
         equal_round_selffork_supersedes(storage, &incoming, Some((&our_producer, our_hash)))
     } else {
         return; // strictly lower absolute round → keep ours
     };
-    if !incoming_wins { return; } // equal round, but OUR signature is the canonical (lower) one
+    if !incoming_wins { return; } // equal round, but OUR block hash is the canonical (lower) one
 
     // Per-height cooldown (shared with macroblock-anchored recovery).
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
@@ -370,7 +370,7 @@ fn maybe_supersede_by_certified_round(storage: &Arc<Storage>, block: &IngestBloc
 
 /// Route a sync/repair-delivered block at an ALREADY-STORED height through the SAME fork-choice
 /// supersede the gossip decode path uses. The batch-sync ingress (handle_blocks_batch) drops stored
-/// heights before the pipeline, so without this a higher-2f+1-certified-round failover winner
+/// heights before the pipeline, so without this a failover winner on a higher n−f-certified round
 /// delivered by sync or by fix B's request_block_repair never reaches maybe_supersede — and a
 /// restarted/late voter that missed the live-gossip window can never converge its losing tail
 /// (boundary re-freeze). Cheap: maybe_supersede early-returns for finalized heights before any decode.
@@ -397,7 +397,7 @@ pub(crate) fn supersede_stored_from_sync(storage: &Arc<Storage>, height: u64, da
 /// DISTINCT peers SENT us a forked-looking block at the same height —
 /// not how many INDEPENDENT OBSERVERS detected the fork. With at most
 /// `f` Byzantine producers in a 3f+1 system, the maximum source count
-/// is `f` (typically 1 in practice), which means a 2f+1 source-based
+/// is `f` (typically 1 in practice), which means an n−f source-based
 /// rollback threshold is mathematically unreachable in the common
 /// failure scenario. The v16.1 destructive-rollback path was therefore
 /// dead code — never triggered in any observed deploy.
@@ -415,11 +415,11 @@ pub(crate) fn supersede_stored_from_sync(storage: &Arc<Storage>, height: u64, da
 ///
 /// A future extension (`v16.3+`) can introduce a true observer-based
 /// rollback by adding a `BlockRejection` gossip message: each honest
-/// node would broadcast a signed rejection on `verify_failed`, and 2f+1
+/// node would broadcast a signed rejection on `verify_failed`, and n−f
 /// distinct OBSERVER signatures for the same `(height, source_peer_id)`
 /// tuple would justify destructive action. Until that protocol exists,
 /// no destructive rollback fires from this path — recovery happens via
-/// the existing 2f+1 macroblock Checkpoint-BFT QC which finalises the
+/// the existing n−f macroblock Checkpoint-BFT QC which finalises the
 /// canonical branch every 90 microblocks regardless of microblock-level
 /// disagreement.
 ///
@@ -453,7 +453,7 @@ pub fn record_hash_chain_break_witness(height: u64, peer_id: &str) {
     // Advisory signal at f+1. Tags every reporter as a fork-source so the
     // canonical-aware sync peer selector deprioritises them. No state
     // mutation, no rollback — the local chain is preserved and the next
-    // 2f+1 macroblock Checkpoint-BFT QC naturally finalises the canonical
+    // n−f macroblock Checkpoint-BFT QC naturally finalises the canonical
     // branch every 90 microblocks.
     if witnesses == detection_threshold {
         if is_warn() {
@@ -1576,7 +1576,7 @@ impl BlockPipeline {
             }
 
             // Dedup: skip if already in storage. Exception — a same-height block from
-            // a higher 2f+1-certified rotation round (failover race) supersedes ours;
+            // a higher n−f-certified rotation round (failover race) supersedes ours;
             // route it to the finality-guarded reorg instead of silently dropping.
             if storage.load_microblock(block.height)
                 .map(|opt| opt.is_some())
@@ -1976,10 +1976,10 @@ impl BlockPipeline {
                     // (single-source ceiling); (2) destructive observer-based
                     // rejection — broadcast a Dilithium3-signed BlockRejection;
                     // receivers verify the observer sig, aggregate distinct
-                    // observer_ids per (height,source), and roll back at 2f+1.
+                    // observer_ids per (height,source), and roll back at n−f.
                     // BFT-canonical: a supermajority of independent observers
                     // justifies state mutation; one Byzantine source can't
-                    // (≤f can't reach 2f+1). Skip h=0 (no prev).
+                    // (≤f can't reach n−f). Skip h=0 (no prev).
                     if mb.height > 0 {
                         record_hash_chain_break_witness(
                             mb.height,
@@ -2074,7 +2074,7 @@ impl BlockPipeline {
                     }
 
                     // v32.10: macroblock-anchored fork recovery for minority
-                    // observers. Uses 2f+1-certified macroblock as trust anchor;
+                    // observers. Uses n−f-certified macroblock as trust anchor;
                     // bounded by begin_finality_guarded_rollback (cannot cross
                     // finality). Genesis bootstrap excluded ONLY during fresh-
                     // bootstrap phase (h < BOOTSTRAP_GRACE_HEIGHT); after that
@@ -2092,7 +2092,7 @@ impl BlockPipeline {
                                 .load(std::sync::atomic::Ordering::SeqCst);
                             let disputed_h = mb.height;
                             // Fork-choice at the DISPUTED height (finality-subordinate, deterministic):
-                            // prefer the strictly higher certified failover round (a round needs a 2f+1
+                            // prefer the strictly higher certified failover round (a round needs an n−f
                             // TimeoutCertificate — unforgeable, identical on every honest node); on EQUAL
                             // round, the lexicographically-lower block hash. The hash tie-break converges
                             // same-round self-forks (a restarted producer re-emitting a different block at the
@@ -2109,8 +2109,8 @@ impl BlockPipeline {
                             let (local_round, local_baseline) = local_opt.as_ref()
                                 .map(|b| (b.timeout_round, b.carried_baseline))
                                 .unwrap_or((0u64, 0u64));
-                            // Adopt the block's attached 2f+1 TimeoutProof so a higher round it carries advances
-                            // our certified map in-band; a higher round then wins ONLY if 2f+1-certified
+                            // Adopt the block's attached n−f TimeoutProof so a higher round it carries advances
+                            // our certified map in-band; a higher round then wins ONLY if n−f-certified
                             // (unforgeable — a raw round could not, which caused the rollback storm). Equal round
                             // → lower block.hash() (single deterministic winner, grind-immune since the hash
                             // excludes the signature; byte-identical to the apply-path resolver). One rule network-wide.
@@ -2198,7 +2198,7 @@ impl BlockPipeline {
             // require AggregatedTimeoutCert presence for round>0 microblocks;
             // the round>0 case is now structurally unreachable from honest
             // producers, and dishonest emitters are caught by the signature
-            // gate immediately below. Macroblock layer retains its own 2f+1
+            // gate immediately below. Macroblock layer retains its own n−f
             // Checkpoint-BFT QC finality — that path is unchanged.
 
             // 3. Signature verification
@@ -2306,7 +2306,7 @@ impl BlockPipeline {
             // Producer authority check (same-round mismatch ≡ HARD reject).
             //   A. timeout_divergence (block round != cached round): views of
             //      HIGHEST_CERTIFIED_ROUND diverged in transit. Soft —
-            //      log only; hash-chain + sig + 2f+1 commit resolve it. Expected
+            //      log only; hash-chain + sig + n−f commit resolve it. Expected
             //      producer is NOT re-derived on ingest (needs remote VRF preimage).
             //   B. same_round_mismatch (cached round == block round, wrong signer):
             //      cached producer is the sole authority for the slot via the
@@ -2318,8 +2318,8 @@ impl BlockPipeline {
             // catch-up blocks aren't judged vs live cache. O(1) lookup.
             if !snap.is_syncing() && mb.height > 0 {
                 // v33: failover authority gate. A block claiming rotation round R (>0)
-                // is authentic ONLY if a 2f+1 TimeoutCertificate for (height, R) exists.
-                // The cert is self-contained (2f+1 Dilithium votes, verified before store
+                // is authentic ONLY if an n−f TimeoutCertificate for (height, R) exists.
+                // The cert is self-contained (n−f Dilithium votes, verified before store
                 // in handle_timeout_proof_broadcast), so this check is IDENTICAL on every
                 // node — unlike the prior `highest_certified_round_for` drift window, whose
                 // local-certified term diverged across nodes (baseline skew) and let each
@@ -2336,10 +2336,10 @@ impl BlockPipeline {
                     // Authorise the failover round with the SAME predicate the producer used to
                     // pick it — `highest_certified_round_for(mb_idx) >= round + baseline`, keyed by
                     // mb_idx + ABSOLUTE round. HIGHEST_CERTIFIED_ROUND advances ONLY on a same-round
-                    // 2f+1 TimeoutCertificate, so the producer can be at round R only if the network
+                    // n−f TimeoutCertificate, so the producer can be at round R only if the network
                     // certified R — both sides read the same map and can never disagree. A forged
                     // round isn't certified ⇒ rejected; round 0 (happy path) needs no certificate.
-                    // #80: adopt the block's ATTACHED 2f+1 TimeoutProof first (self-authenticating,
+                    // #80: adopt the block's ATTACHED n−f TimeoutProof first (self-authenticating,
                     // verified inside), so a node that missed the separate TC broadcast learns the
                     // certified round in-band and authorises the block instead of wedging. A forged
                     // or absent proof advances nothing → round stays uncertified → pull/reject below.
@@ -2352,12 +2352,12 @@ impl BlockPipeline {
                         crate::unified_p2p::failover_round_authorized(mb.height / 90, mb.timeout_round, mb.carried_baseline);
                     if !round_certified {
                         // PULL-ON-REJECT: the round IS legitimate (a producer reached it via a
-                        // same-round 2f+1), but the proving TimeoutCertificate never arrived — its
+                        // same-round n−f), but the proving TimeoutCertificate never arrived — its
                         // broadcast is one-shot and vote gossip only re-fans on NEW votes, which stop
                         // once the storm settles, so a node that missed the brief window would stay
                         // stuck forever. Actively request this window's timeout certificates from
                         // peers (rate-limited per mb_idx); the existing serve returns the same-round
-                        // 2f+1 TimeoutCertificate, which advances our HIGHEST_CERTIFIED_ROUND so this
+                        // n−f TimeoutCertificate, which advances our HIGHEST_CERTIFIED_ROUND so this
                         // still-replayable block is accepted next pass. Reuses the sync catch-up
                         // request/serve — no new wire type.
                         let mb_idx = mb.height / 90;
@@ -2403,14 +2403,14 @@ impl BlockPipeline {
                         let incoming_abs_round = mb.timeout_round.saturating_add(mb.carried_baseline);
                         if incoming_abs_round != expected_round {
                             // Category A: block claims a DIFFERENT round than our cached view. The
-                            // round>0 gate above already proved that round is 2f+1-certified, so its
+                            // round>0 gate above already proved that round is n−f-certified, so its
                             // leader is deterministic — re-derive it for the BLOCK's round and HARD
                             // REJECT a producer that isn't that round's elected leader. Closes the
                             // certified-round production hijack (a Byzantine node borrowing a valid TC
                             // to produce off-slot at a height our cached round hasn't caught up to).
                             // Cache miss (we haven't computed that window's roster — lag/cold-join) ⇒
                             // keep soft: the block stays replayable and is re-checked once we derive
-                            // the roster or via macroblock 2f+1 finality.
+                            // the roster or via macroblock n−f finality.
                             match crate::node::expected_producer_for_round(mb.height, incoming_abs_round) {
                                 Some(leader) if mb.producer != leader => {
                                     if is_warn() {
@@ -2451,11 +2451,11 @@ impl BlockPipeline {
             // rotation counter, 0 on happy path) and HIGHEST_CERTIFIED_ROUND
             // (macroblock commit/reveal view round) are orthogonal — comparing
             // them rejected valid microblocks (liveness loss, no safety gain).
-            // Per-microblock QC verify is also removed (redundant with the 2f+1
+            // Per-microblock QC verify is also removed (redundant with the n−f
             // macroblock finality below + caused a rate-limit collision).
             // Microblock safety holds via: Dilithium3 producer sig; prev_hash
-            // continuity; VRF-deterministic producer (soft); 2f+1 macroblock
-            // commit/reveal retroactively ratifying (split-brain can't reach 2f+1).
+            // continuity; VRF-deterministic producer (soft); n−f macroblock
+            // commit/reveal retroactively ratifying (split-brain can't reach n−f).
 
             // Wire-limit gate BEFORE any per-TX work. Transactions inside a producer-signed block never
             // pass through mempool admission, so this is the only place their free-form fields meet a
@@ -2511,14 +2511,11 @@ impl BlockPipeline {
             // 3) authenticates only the ENVELOPE, not the TXs within — without this
             // a Byzantine producer could include forged TXs. Remote-block TXs bypass
             // the mempool (which verifies on ingest) and apply_transaction_lazy
-            // intentionally doesn't verify, so the pipeline must: Ed25519 batch +
-            // Dilithium3 (when present).
+            // intentionally doesn't verify, so the pipeline must: ML-DSA-65 per TX
+            // plus the shared system-TX bind gate below.
             // Genesis (h==0) bypass: genesis TXs use reserved-sender tokens, not
             // real sigs; safe via producer sig + genesis-hash determinism + one-time
-            // bootstrap. System TXs (RewardDistribution, CreateAccount bootstrap,
-            // BatchRewardClaims, BatchNodeActivations) are exempt (validated via
-            // on-chain proofs) — exemption set MUST mirror verify_ed25519_batch in
-            // node.rs. O(tx)/block, off the state lock.
+            // bootstrap. O(tx)/block, off the state lock.
             if mb.height == 0 {
                 if is_info() {
                     println!(
@@ -2530,29 +2527,6 @@ impl BlockPipeline {
             } else if !decoded.microblock.transactions.is_empty() {
                 metrics.mark_verify_op(mb.height, PIPELINE_OP_VERIFY_SIG);
                 let txsig_start = std::time::Instant::now();
-
-                // Ed25519 batch verification (shared helper with mempool path).
-                // Returns the indices of TXs whose Ed25519 sig verified OR which
-                // are in the system-TX exempt set. Any TX index NOT in the
-                // returned set has either a missing or invalid Ed25519 sig.
-                let valid_indices = crate::node::BlockchainNode::verify_ed25519_batch(
-                    &decoded.microblock.transactions,
-                );
-                let valid_set: std::collections::HashSet<usize> =
-                    valid_indices.into_iter().collect();
-
-                let total_txs = decoded.microblock.transactions.len();
-                if valid_set.len() != total_txs {
-                    let invalid_count = total_txs - valid_set.len();
-                    if is_warn() {
-                        println!(
-                            "[WARN][PIPELINE] tx_sig_invalid h={} invalid={}/{} producer={} from={} action=reject_block",
-                            mb.height, invalid_count, total_txs, mb.producer, decoded.from_peer
-                        );
-                    }
-                    metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
-                    continue; // HARD REJECT — Byzantine producer included forged TXs
-                }
 
                 // Dilithium3 verify for PQ-signed TXs. v25.2: delegate to the canonical
                 // helper (verify_dilithium_tx_signature_async ->
@@ -2650,7 +2624,7 @@ impl BlockPipeline {
                     if is_info() {
                         println!(
                             "[INFO][PIPELINE] tx_sig_verify h={} txs={} elapsed_ms={}",
-                            mb.height, total_txs, txsig_elapsed.as_millis()
+                            mb.height, decoded.microblock.transactions.len(), txsig_elapsed.as_millis()
                         );
                     }
                 }
@@ -2782,7 +2756,7 @@ impl BlockPipeline {
 
             // Phase-1 burn-attestation gate (a block-validation rule, like the signature checks
             // above — apply trusts validated blocks). When active at this height, a non-genesis
-            // NodeRegistration MUST carry ≥2f+1 distinct valid genesis attestations over its
+            // NodeRegistration MUST carry ≥ n−f distinct valid genesis attestations over its
             // canonical burn message; without it a Byzantine producer could inject a fake-burn
             // registration that every node would deterministically apply (free reward/producer-
             // eligible node). Deterministic: pure TX bytes + binary-pinned genesis keys. Inert
@@ -3270,7 +3244,7 @@ impl BlockPipeline {
 
                 // The WIRE tx.hash is inside the producer-signed merkle_root but nothing downstream
                 // recomputed it, and the apply arms push that wire hash into the WASM event logs →
-                // logs_root → the 2f+1 checkpoint content. One flipped character from a relay would
+                // logs_root → the n−f checkpoint content. One flipped character from a relay would
                 // leave balances and state_root identical while permanently splitting this node's
                 // logs_root out of every window. Recompute with the producer's own formula.
                 if BlockchainNode::calculate_merkle_root(&block.microblock.transactions)
@@ -4033,7 +4007,7 @@ impl BlockPipeline {
                 crate::node::LAST_BLOCK_PRODUCED_HEIGHT.store(height, Ordering::Relaxed);
 
                 // v14.8.10: observational clock-drift monitor. Feeds on-chain
-                // block timestamp (producer-signed wall clock, agreed by 2f+1
+                // block timestamp (producer-signed wall clock, agreed by n−f
                 // honest committee for finalised macroblocks) into an EMA of
                 // |local_now − block_ts|. Purely observational — triggers
                 // WARN log and async NTP re-sync on drift, NEVER participates
@@ -4089,7 +4063,7 @@ impl BlockPipeline {
             // from peers. The block's timeout_round is NOT used to advance
             // rotation directly (≤f byzantine could forge it) — it only
             // signals "a cert exists, fetch it"; the response path
-            // re-verifies 2f+1 sigs before advancing. Self-limiting via the
+            // re-verifies n−f sigs before advancing. Self-limiting via the
             // monotonic local_certified guard. ≤5-peer fan-out only on fire.
             let block_timeout_round = block.microblock.timeout_round;
             if block_timeout_round > 0 {
@@ -4111,7 +4085,7 @@ impl BlockPipeline {
                         }
                         // Request certificates for the macroblock window
                         // covering this block — peers serve the same-round
-                        // 2f+1 TimeoutCertificates for it.
+                        // n−f TimeoutCertificates for it.
                         p2p.request_timeout_proofs(mb_idx, mb_idx);
                     }
                 }
@@ -4213,9 +4187,7 @@ impl BlockPipeline {
                         block.microblock.timestamp,
                         std::sync::atomic::Ordering::Relaxed,
                     );
-                    crate::update_global_pricing_state(
-                        0.0_f64, 5_u64, block.microblock.timestamp,
-                    );
+                    crate::set_genesis_timestamp(block.microblock.timestamp);
                     if is_info() {
                         println!("[INFO][PIPELINE] genesis_globals_set ts={} path=pipeline_apply",
                                  block.microblock.timestamp);
@@ -4250,20 +4222,18 @@ impl BlockPipeline {
                 producer: block.microblock.producer.clone(),
             });
 
-            // Per-microblock BlockCommitVote (HotStuff-style blocking QC)
-            // remains DISABLED on this path. The previous quorum-certificate
-            // approach shared the "commit" rate-limit key with macroblock
-            // ConsensusCommit and starved real macroblock consensus from peers.
+            // Per-microblock BlockCommitVote (blocking QC) is DISABLED on this
+            // path: it competed with macroblock consensus for the same peers.
             //
             // Per-microblock confirmation is now provided by the COMMITTEE-
             // ATTESTATION layer (see `attestation_committee.rs` and the
             // BlockAttestationMsg / EmptySlotAttestationMsg handlers in
             // `unified_p2p.rs`). That layer is non-blocking — attestations
             // travel on a separate gossip channel, do not gate block
-            // production, and form the basis of the per-block 2f+1 fork-choice
-            // keep-local rule. It supplies that 2f+1 safety AND deterministic
+            // production, and form the basis of the per-block n−f fork-choice
+            // keep-local rule. It supplies that n−f safety AND deterministic
             // empty-slot failover, without sharing
-            // the macroblock commit rate-limit bucket. Macroblock 2f+1
+            // the macroblock commit rate-limit bucket. Macroblock n−f
             // commit/reveal at the 90-block boundary remains the canonical
             // finality anchor.
 

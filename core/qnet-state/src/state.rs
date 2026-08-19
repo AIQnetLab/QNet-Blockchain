@@ -3523,6 +3523,18 @@ mod merkle_equiv_tests {
     use crate::Account;
     use std::collections::{BTreeMap, HashMap};
 
+    // QRC-20 deploy payload carrying its own canonical code_hash — classify_contract_deploy
+    // re-derives and enforces it, so a fixture without it is not a valid deploy.
+    fn qrc20_deploy_data(initial_supply: u64, mintable: bool, burnable: bool) -> String {
+        let mut p = serde_json::json!({
+            "qrc20": true, "name": "T", "symbol": "T", "decimals": 9,
+            "initial_supply": initial_supply, "mintable": mintable, "burnable": burnable
+        });
+        p["code_hash"] = serde_json::json!(crate::transaction::deploy_code_hash(
+            crate::transaction::DeployKind::Qrc20, &p).unwrap());
+        p.to_string()
+    }
+
     // Deterministic pseudo-account at index i (no rand-crate dependency).
     fn mk(i: u64) -> Account {
         let mut a = Account::new(format!("acct{:060x}", i));
@@ -3655,9 +3667,9 @@ mod merkle_equiv_tests {
         let mut tx = Transaction {
             hash: String::new(), from: deployer.to_string(), to: None, amount: 0, nonce: 1,
             timestamp: 0, gas_price: 1, gas_limit: 1_000_000,
-            data: Some("{\"qrc20\":true,\"name\":\"T\",\"symbol\":\"T\",\"decimals\":9,\"initial_supply\":1000}".to_string()),
+            data: Some(qrc20_deploy_data(1000, false, false)),
             signature: None, public_key: None, tx_type: TransactionType::ContractDeploy,
-            dilithium_signature: None, dilithium_public_key: None, chain_id: 0,
+            dilithium_signature: None, dilithium_public_key: None, chain_id: crate::transaction::QNET_CHAIN_ID,
         };
         tx.hash = tx.calculate_hash();
         sm.apply_transaction_lazy_at(&tx, 1).unwrap();
@@ -3688,9 +3700,9 @@ mod merkle_equiv_tests {
         let mut tx = Transaction {
             hash: String::new(), from: deployer.to_string(), to: None, amount: 0, nonce: 1,
             timestamp: 0, gas_price: 1, gas_limit: 1_000_000,
-            data: Some("{\"qrc20\":true,\"name\":\"T\",\"symbol\":\"T\",\"decimals\":9,\"initial_supply\":1000}".to_string()),
+            data: Some(qrc20_deploy_data(1000, false, false)),
             signature: None, public_key: None, tx_type: TransactionType::ContractDeploy,
-            dilithium_signature: None, dilithium_public_key: None, chain_id: 0,
+            dilithium_signature: None, dilithium_public_key: None, chain_id: crate::transaction::QNET_CHAIN_ID,
         };
         tx.hash = tx.calculate_hash();
         sm.apply_transaction_lazy_at(&tx, 1).unwrap();
@@ -3732,9 +3744,9 @@ mod merkle_equiv_tests {
         let mut tx = Transaction {
             hash: String::new(), from: deployer.to_string(), to: None, amount: 0, nonce: 1,
             timestamp: 0, gas_price: 1, gas_limit: 1_000_000,
-            data: Some("{\"qrc20\":true,\"name\":\"T\",\"symbol\":\"T\",\"decimals\":9,\"initial_supply\":1000}".to_string()),
+            data: Some(qrc20_deploy_data(1000, false, false)),
             signature: None, public_key: None, tx_type: TransactionType::ContractDeploy,
-            dilithium_signature: None, dilithium_public_key: None, chain_id: 0,
+            dilithium_signature: None, dilithium_public_key: None, chain_id: crate::transaction::QNET_CHAIN_ID,
         };
         tx.hash = tx.calculate_hash();
         sm.apply_transaction_lazy_at(&tx, 1).unwrap();
@@ -3775,14 +3787,14 @@ mod merkle_equiv_tests {
                 hash: String::new(), from: from.to_string(), to, amount: 0, nonce,
                 timestamp: 0, gas_price: 1, gas_limit: 1_000_000, data: Some(data),
                 signature: None, public_key: None, tx_type: tt,
-                dilithium_signature: None, dilithium_public_key: None, chain_id: 0,
+                dilithium_signature: None, dilithium_public_key: None, chain_id: crate::transaction::QNET_CHAIN_ID,
             };
             tx.hash = tx.calculate_hash();
             tx
         };
 
         sm.apply_transaction_lazy_at(&mk(deployer, 1, TransactionType::ContractDeploy, None,
-            "{\"qrc20\":true,\"name\":\"T\",\"symbol\":\"T\",\"decimals\":9,\"initial_supply\":1000000,\"mintable\":true,\"burnable\":true}".to_string()), 1).unwrap();
+            qrc20_deploy_data(1000000, true, true)), 1).unwrap();
         let c = sm.get_all_accounts().into_iter().find(|(_, a)| a.is_contract).unwrap().0;
         // storage_root after deploy (None-branch build) == from truth.
         let a0 = sm.get_account(&c).unwrap();
@@ -3882,13 +3894,13 @@ mod merkle_equiv_tests {
                 hash: String::new(), from: from.to_string(), to, amount: 0, nonce,
                 timestamp: 0, gas_price: 1, gas_limit: 1_000_000, data: Some(data),
                 signature: None, public_key: None, tx_type: tt,
-                dilithium_signature: None, dilithium_public_key: None, chain_id: 0,
+                dilithium_signature: None, dilithium_public_key: None, chain_id: crate::transaction::QNET_CHAIN_ID,
             };
             tx.hash = tx.calculate_hash();
             tx
         };
         sm.apply_transaction_lazy_at(&mk(deployer, 1, TransactionType::ContractDeploy, None,
-            "{\"qrc20\":true,\"name\":\"T\",\"symbol\":\"T\",\"decimals\":9,\"initial_supply\":1000000,\"mintable\":true,\"burnable\":true}".to_string()), 1).unwrap();
+            qrc20_deploy_data(1000000, true, true)), 1).unwrap();
         let c = sm.get_all_accounts().into_iter().find(|(_, a)| a.is_contract).unwrap().0;
         sm.apply_transaction_lazy_at(&mk(deployer, 2, TransactionType::ContractCall, Some(c.clone()),
             "{\"method\":\"transfer\",\"args\":[\"alice\",\"400\"]}".to_string()), 1).unwrap();

@@ -21,7 +21,6 @@ use reed_solomon_erasure::galois_8::ReedSolomon;
 use futures::future;
 
 // Import QNet consensus components for proper peer validation
-use qnet_consensus::reputation::{NodeReputation, ReputationConfig, MaliciousBehavior};
 
 // ============================================================================
 // PRODUCTION CONSTANTS: Capacity limits for scalability
@@ -60,6 +59,20 @@ const MAX_ACTIVE_NODES_SIZE: usize = 10_000;
 /// LRU eviction when limit reached
 const MAX_CONNECTED_PEERS: usize = 1000;
 
+/// Max peers admitted from ONE PeerListResponse. A responder may return its whole table,
+/// so admitting a full response hands one gossiper the shape of our peer set; discovery
+/// converges over repeated exchange cycles instead.
+const MAX_GOSSIP_ADMITS_PER_RESPONSE: usize = 16;
+
+/// Max entries EXAMINED from one PeerListResponse. The admit cap alone bounds insertions, not the
+/// per-message work: a response can carry thousands of unbindable entries, and walking them all
+/// costs a scan plus a log line each. Work per message stays constant at any network size.
+const MAX_GOSSIP_PEERS_SCANNED: usize = 64;
+
+/// Max dial candidates held per region. The establishment sweep walks each Vec in full, so an
+/// unbounded list is both a heap sink and a CPU sink; oldest non-genesis candidate is evicted.
+const MAX_REGIONAL_PEERS_PER_REGION: usize = 256;
+
 /// FIX R23-P1: Minimum reserved outbound slots — prevents eclipse attacks.
 /// Inbound connections cannot fill more than (MAX_CONNECTED_PEERS - MIN_OUTBOUND_SLOTS) slots,
 /// ensuring we always maintain at least this many self-initiated connections.
@@ -70,15 +83,15 @@ const MIN_OUTBOUND_SLOTS: usize = 8;
 /// Genesis nodes and bootstrap peers bypass this check.
 const MIN_INBOUND_PEER_REPUTATION: f64 = 50.0;
 
-// Network-layer eclipse defence (IP subnet diversity). One provider can
-// spin up many cheap nodes from a single /24 or /16 and flood the peer
-// table → eclipse (2f+1 protects safety only when attacker KEYS are
-// bounded, not when the PEER LIST is biased). Cap concurrent inbound per
-// netblock: /24 ≤2 (strict floor), /16 ≤8 (soft regional, fits large DCs).
-// Env-overridable (QNET_MAX_PEERS_PER_24 / _16); genesis IPs and outbound
-// exempt. O(N≤1000) per admission, negligible vs the QUIC handshake.
-const DEFAULT_MAX_PEERS_PER_SUBNET_24: usize = 2;
-const DEFAULT_MAX_PEERS_PER_SUBNET_16: usize = 8;
+// Network-layer eclipse defence (IP subnet diversity). One provider can spin up many cheap nodes
+// from a single /24 or /16 and flood the peer table → eclipse (2f+1 protects safety only when
+// attacker KEYS are bounded, not when the PEER LIST is biased). At the target of hundreds of
+// thousands of Supers a healthy inbound set is spread over thousands of netblocks, so ≥124 distinct
+// /16s are needed to fill the 992 inbound slots and no single hoster can own more than ~0.8% of
+// them. Security parameters, never operator-tunable: a per-node override is an eclipse opt-out an
+// attacker can talk a victim into. Genesis IPs and outbound peers are exempt (we chose those).
+const MAX_PEERS_PER_SUBNET_24: usize = 2;
+const MAX_PEERS_PER_SUBNET_16: usize = 8;
 
 /// Stale node timeout (15 minutes without heartbeat/announcement)
 #[allow(dead_code)]
@@ -230,10 +243,12 @@ pub static SIGNED_HEAD_MAX: AtomicU64 = AtomicU64::new(0);
 /// BOTH so a strictly-higher height always passes even if the origin's wall-clock ts regresses (cold
 /// restart / NTP step), keeping the dedup as monotonic as the height-keyed oracle it guards.
 static LAST_HEAD_TS: Lazy<DashMap<String, (u64, u64)>> = Lazy::new(DashMap::new);
+/// One-shot guard for the required-task bring-up: every P2P entry path may call it.
+static REQUIRED_TASKS_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Latest locally-signed head, cached by the 15s emit tick. Co-sent on the serve channel and, by the
 /// transport, over the live inbound connection in reply to a behind peer's HealthPing — the durable,
-/// NAT-proof tip feed to a client-dialed follower the emit fan-out misses. (from, ts, height, sig, pk).
-pub(crate) static LATEST_SIGNED_HEAD: Lazy<RwLock<Option<(String, u64, u64, String, String)>>> = Lazy::new(|| RwLock::new(None));
+/// NAT-proof tip feed to a client-dialed follower the emit fan-out misses. (from, ts, height, sig).
+pub(crate) static LATEST_SIGNED_HEAD: Lazy<RwLock<Option<(String, u64, u64, String)>>> = Lazy::new(|| RwLock::new(None));
 /// Min height lead before we reply our signed head to a pinging peer — suppresses chatter between
 /// at-tip peers; only genuine followers (behind by more than one rotation) get the reply.
 pub(crate) const HEAD_REPLY_MIN_GAP: u64 = 8;
@@ -319,6 +334,11 @@ const SOFT_LIMIT_PENDING_SYNC_BLOCKS: usize = 1600;
 // hasn't emitted a signed height in 2 minutes is treated as height-unknown,
 // preventing stale or poisoned values from steering sync indefinitely.
 const PEER_HEIGHT_ATTEST_TTL_SECS: u64 = 120;
+/// Signed-head emit cadence. The boot delay is short because the attestation it produces is the
+/// ONLY renewable peer-height writer: both handshake writers are guarded on block_height > 0 and
+/// every node handshakes at 0 on a fresh genesis.
+pub const HEALTH_PING_BOOT_DELAY_SECS: u64 = 5;
+pub const HEALTH_PING_INTERVAL_SECS: u64 = 15;
 // Max a real head may sit above the genesis-attested median (1 macroblock): covers attest-staleness +
 // genesis spread; a head beyond it is a forged over-claim and is overruled by the median.
 const HEAD_OVERCLAIM_MARGIN: u64 = 90;
@@ -902,77 +922,12 @@ static SIGVERIFY_RUNTIME: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════════
-// PRODUCTION v2.57: DEDICATED BANKING RUNTIME
-// ═══════════════════════════════════════════════════════════════════════════════════
-// WHY: Transaction processing (validation, state reads, mempool ops) is I/O heavy
-// ADAPTIVE: 2-4 cores→1t, 8+ cores→2t (not active yet, reserved for future)
-// ENV: QNET_BANKING_THREADS - override thread count
-// ═══════════════════════════════════════════════════════════════════════════════════
-static BANKING_RUNTIME: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
-    let cpu_count = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
-    
-    // ADAPTIVE: Minimal for small configs (not active yet)
-    let default_threads = if cpu_count <= 4 { 1 } else { (cpu_count / 4).max(2) };
-    
-    let banking_threads = std::env::var("QNET_BANKING_THREADS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .map(|v| v.max(1).min(cpu_count))
-        .unwrap_or(default_threads);
-    
-    if crate::node::is_info() { println!("[INFO][BANKING] runtime_init cpus={} threads={}", cpu_count, banking_threads); }
-    
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(banking_threads)
-        .thread_name("qnet-banking")
-        .enable_all()
-        .build()
-        .expect("Failed to create dedicated banking runtime")
-});
-
-// ═══════════════════════════════════════════════════════════════════════════════════
-// PRODUCTION v2.57: DEDICATED REPLAY RUNTIME
-// ═══════════════════════════════════════════════════════════════════════════════════
-// WHY: State application (executing transactions, updating balances) is critical path
-// ADAPTIVE: 2-4 cores→1t, 8+ cores→2t (not active yet, reserved for future)
-// ENV: QNET_REPLAY_THREADS - override thread count
-// ═══════════════════════════════════════════════════════════════════════════════════
-static REPLAY_RUNTIME: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
-    let cpu_count = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
-    
-    // ADAPTIVE: Minimal for small configs (not active yet)
-    let default_threads = if cpu_count <= 4 { 1 } else { (cpu_count / 4).max(2) };
-    
-    let replay_threads = std::env::var("QNET_REPLAY_THREADS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .map(|v| v.max(1).min(cpu_count))
-        .unwrap_or(default_threads);
-    
-    if crate::node::is_info() { println!("[INFO][REPLAY] runtime_init cpus={} threads={}", cpu_count, replay_threads); }
-    
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(replay_threads)
-        .thread_name("qnet-replay")
-        .enable_all()
-        .build()
-        .expect("Failed to create dedicated replay runtime")
-});
-
-// ═══════════════════════════════════════════════════════════════════════════════════
-// RUNTIME DISTRIBUTION (Stage Pipeline):
-// ═══════════════════════════════════════════════════════════════════════════════════
-// Main Runtime:      Heartbeats, Peer discovery, API, Consensus
-// BROADCAST_RUNTIME: Shred protocol, chunk sending
-// SIGVERIFY_RUNTIME: Ed25519/Dilithium verification
-// BANKING_RUNTIME:   Transaction intake, mempool (25% cores)
-// REPLAY_RUNTIME:    State machine, execution (25% cores)
-// Total: ~125% cores (intentional oversubscription for I/O overlap)
-// ═══════════════════════════════════════════════════════════════════════════════════
+// Runtime split actually in force:
+//   Main:              consensus, failover, heartbeats, peer discovery, API
+//   BROADCAST_RUNTIME: shred fan-out, chunk forwarding, background repair
+//   SIGVERIFY_RUNTIME: ML-DSA-65 verification
+// Value-TX verify is additionally kept off consensus by a semaphore-bounded spawn_blocking pool,
+// so tx intake needs no runtime of its own.
 
 /// Spawn task on SIGVERIFY_RUNTIME for crypto verification
 pub fn spawn_sigverify<F>(future: F) -> tokio::task::JoinHandle<F::Output>
@@ -981,33 +936,6 @@ where
     F::Output: Send + 'static,
 {
     SIGVERIFY_RUNTIME.spawn(future)
-}
-
-/// Spawn task on BANKING_RUNTIME for transaction processing
-pub fn spawn_banking<F>(future: F) -> tokio::task::JoinHandle<F::Output>
-where
-    F: std::future::Future + Send + 'static,
-    F::Output: Send + 'static,
-{
-    BANKING_RUNTIME.spawn(future)
-}
-
-/// Spawn task on REPLAY_RUNTIME for state operations
-pub fn spawn_replay<F>(future: F) -> tokio::task::JoinHandle<F::Output>
-where
-    F: std::future::Future + Send + 'static,
-    F::Output: Send + 'static,
-{
-    REPLAY_RUNTIME.spawn(future)
-}
-
-/// Spawn task on BROADCAST_RUNTIME for block propagation
-pub fn spawn_broadcast<F>(future: F) -> tokio::task::JoinHandle<F::Output>
-where
-    F: std::future::Future + Send + 'static,
-    F::Output: Send + 'static,
-{
-    BROADCAST_RUNTIME.spawn(future)
 }
 
 /// Runtime statistics
@@ -1273,36 +1201,22 @@ pub fn timeout_vote_message(
     w: u64, round: u64, anchor: &[u8; 32],
     high_qc_idx: u64, high_qc_hash: &[u8; 32],
     tip_height: u64, tip_hash: &[u8; 32],
-    rc: Option<(u64, [u8; 32])>,
 ) -> String {
-    match rc {
-        // Byte-identical to the pre-pin form, so an unpinned vote is unchanged on the wire.
-        None => format!("QNET_TIMEOUT_V2:{}:{}:{}:{}:{}:{}:{}",
-                        w, round, hex::encode(anchor),
-                        high_qc_idx, hex::encode(high_qc_hash),
-                        tip_height, hex::encode(tip_hash)),
-        // Distinct domain tag: a relaxed vote can never be replayed as a strict one, and the pin it
-        // authorizes is inside what the voter signed.
-        Some((a, ah)) => format!("QNET_TIMEOUT_V2R:{}:{}:{}:{}:{}:{}:{}:{}:{}",
-                                 w, round, hex::encode(anchor),
-                                 high_qc_idx, hex::encode(high_qc_hash),
-                                 tip_height, hex::encode(tip_hash),
-                                 a, hex::encode(ah)),
-    }
+    format!("QNET_TIMEOUT_V2:{}:{}:{}:{}:{}:{}:{}",
+            w, round, hex::encode(anchor),
+            high_qc_idx, hex::encode(high_qc_hash),
+            tip_height, hex::encode(tip_hash))
 }
 
-/// Deterministic failover committee for vote window `w` (A1 R11.0). Resolution order: RC-span override
-/// → genesis (w<3) → sealed `committee_for_height(w*90)` when w-2 ≤ L → FrozenCommittee(w) off the
-/// sealed anchor M_A when finality is stalled → None (Defer: a certified anchor exists but is unheld,
-/// caller pulls). Removing the seal+2 wall is what keeps failover alive across the 32-window horizon.
+/// Deterministic failover committee for vote window `w` (A1 R11.0). Resolution order: genesis (w<3)
+/// → sealed `committee_for_height(w*90)` when w-2 ≤ L → FrozenCommittee(w) off the sealed anchor M_A
+/// when finality is stalled → None (Defer: a certified anchor exists but is unheld, caller pulls).
+/// Removing the seal+2 wall is what keeps failover alive across the 32-window horizon.
+///
+/// An armed recovery span does NOT substitute the anchor macroblock's C_S here. C_S and the derived
+/// set are independent VRF samples of one roster, so at scale they are near-disjoint and two
+/// certificates over one span window would not have to intersect.
 pub fn failover_committee_for_window(w: u64) -> Option<Arc<std::collections::HashSet<String>>> {
-    // Inside an armed recovery span the committee IS the anchor macroblock's C_S — first, and uncached
-    // (the arm is local and clears with the span).
-    if let Some(storage) = crate::node::try_get_storage() {
-        if let Some(cs) = crate::node::rc_span_committee_mb(storage, w) {
-            return Some(Arc::new(cs.into_iter().collect::<std::collections::HashSet<String>>()));
-        }
-    }
     if w < 3 {
         let key = (w, [0u8; 32]);
         if let Some(c) = FAILOVER_COMMITTEE_CACHE.get(&key) { return Some(c.value().clone()); }
@@ -1337,25 +1251,12 @@ pub fn failover_committee_for_window(w: u64) -> Option<Arc<std::collections::Has
     Some(arc)
 }
 
-/// Recovery pin governing failover for window `w`. Derived from `(w, local arm)` rather than carried
-/// on the wire, so the pin cannot be mixed across a vote set and no wire field can be forged into a
-/// relaxed threshold.
-pub fn rc_pin_for_window(w: u64) -> Option<(u64, [u8; 32])> {
-    let (lo, hi) = crate::node::rc_span_windows()?;
-    if w < lo || w > hi { return None; }
-    crate::node::rc_armed().map(|(a, ah, _)| (a, ah))
-}
-
 /// Deterministic sealed anchor for window `w`: hash(macroblock w-2), zeros for w<3 (genesis
 /// convention). None = anchor macroblock absent locally (refuse-and-fetch).
+/// A recovery span changes nothing here: the failover layer stays on the strict threshold and its
+/// vote preimage carries no pin, so armed and unarmed nodes derive the same anchor for one window
+/// and can verify each other's votes during the halt the span exists to end.
 pub fn sealed_anchor_for_window(w: u64) -> Option<[u8; 32]> {
-    // Span windows re-anchor to the pin's own macroblock so the TC anchor check agrees with the
-    // committee source above — otherwise the two would name different macroblocks.
-    if let Some((lo, hi)) = crate::node::rc_span_windows() {
-        if w >= lo && w <= hi {
-            if let Some((_, ah, _)) = crate::node::rc_armed() { return Some(ah); }
-        }
-    }
     if w < 3 { return Some([0u8; 32]); }
     let storage = crate::node::try_get_storage()?;
     // Sealed: hash(macroblock w-2). Frozen: hash(M_A) (R12) — the SAME anchor whose committee
@@ -1421,9 +1322,9 @@ pub fn lowest_window_with_support(above_w: u64) -> Option<u64> {
 /// and the node ceases to lead once the TC forms (exactly one leader per certified round). O(votes).
 pub fn round_one_short_of_quorum(w: u64, voter: &str) -> bool {
     let committee = match failover_committee_for_window(w) { Some(c) => c, None => return false };
-    // Must mirror the TC threshold exactly. A stale strict value here silently disables the
-    // self-yield that rotates the network off a stuck leader — precisely when the span needs it.
-    let quorum = crate::node::rc_effective_quorum_window(w, committee.len());
+    // Must mirror the TC threshold exactly, or the self-yield that rotates the network off a stuck
+    // leader fires at a bar no certificate is formed at.
+    let quorum = qnet_consensus::checkpoint_bft::quorum_size(committee.len());
     if quorum == 0 { return false; }
     let certified = highest_certified_round_for(w);
     for e in TIMEOUT_VOTES.iter() {
@@ -2041,7 +1942,7 @@ pub fn evict_stale_producer_heartbeats(max_age_ms: u64) {
 // signature uniqueness plus the on-chain DoubleSign slashing detector.
 
 // ═══════════════════════════════════════════════════════════════════
-// v4.0: VRF LEADER CLAIMS — secret leader election via VRF
+// v4.0: VRF LEADER CLAIMS — slot proofs for the PUBLIC deterministic leader schedule
 // Key: leadership_round → Vec<VerifiedLeaderClaim>
 // Collected from P2P gossip, verified before storage
 // ═══════════════════════════════════════════════════════════════════
@@ -2460,7 +2361,12 @@ pub struct SimplifiedP2P {
     port: u16,
     /// Our external IP address (to prevent self-connection)
     external_ip: Arc<RwLock<Option<String>>>,
-    
+
+    /// Weak handle to ourselves, published by `start`. Background discovery tasks are `'static`
+    /// and used to hold only a clone of the peer map, which let them write it without admission;
+    /// upgrading this keeps `add_peer_lockfree` the single writer.
+    self_ref: Arc<RwLock<std::sync::Weak<Self>>>,
+
     /// Regional peer management with load balancing
     regional_peers: Arc<Mutex<HashMap<Region, Vec<PeerInfo>>>>,
     
@@ -2508,9 +2414,6 @@ pub struct SimplifiedP2P {
     /// Leadership tracking for failover detection
     #[allow(dead_code)]
     previous_leader: Arc<Mutex<Option<String>>>,
-    
-    /// Reputation system for consensus (public for ping service access)
-    pub reputation_system: Arc<Mutex<NodeReputation>>,
     
     // DEPRECATED v2.38: slashing_collector removed
     // Slashing now determined on-chain via analyze_chain_for_slashing()
@@ -3391,6 +3294,7 @@ impl SimplifiedP2P {
             region: region.clone(),
             port,
             external_ip: Arc::new(RwLock::new(external_ip)),
+            self_ref: Arc::new(RwLock::new(std::sync::Weak::new())),
             regional_peers: Arc::new(Mutex::new(HashMap::new())),
             
             // QUANTUM OPTIMIZATION: Initialize lock-free structures
@@ -3415,56 +3319,6 @@ impl SimplifiedP2P {
             total_bytes_received: Arc::new(Mutex::new(0)),
             is_running: Arc::new(Mutex::new(false)),
             previous_leader: Arc::new(Mutex::new(None)),
-            reputation_system: {
-                let mut reputation_sys = NodeReputation::new(ReputationConfig::default());
-                
-                // PRODUCTION FIX: Initialize ALL Genesis nodes with same reputation
-                // This ensures consistent consensus candidate selection
-                if let Ok(bootstrap_id) = std::env::var("QNET_BOOTSTRAP_ID") {
-                    match bootstrap_id.as_str() {
-                        "001" | "002" | "003" | "004" | "005" => {
-                            // Set reputation for ALL Genesis nodes (not just self)
-                            // CRITICAL: All nodes start at INITIAL_REPUTATION (consensus threshold)
-                            use qnet_consensus::deterministic_reputation::INITIAL_REPUTATION;
-                            for i in 1..=5 {
-                                let genesis_id = format!("genesis_node_{:03}", i);
-                                reputation_sys.set_reputation(&genesis_id, INITIAL_REPUTATION);
-                            }
-                            if crate::node::is_info() { println!("[INFO][P2P] Genesis node {} initialized - all Genesis nodes set to {:.0}% reputation", bootstrap_id, INITIAL_REPUTATION); }
-                        }
-                        _ => {}
-                    }
-                } else if std::env::var("QNET_GENESIS_BOOTSTRAP").unwrap_or_default() == "1" {
-                    // Legacy Genesis nodes also initialize all peers
-                    use qnet_consensus::deterministic_reputation::INITIAL_REPUTATION;
-                    for i in 1..=5 {
-                        let genesis_id = format!("genesis_node_{:03}", i);
-                        reputation_sys.set_reputation(&genesis_id, INITIAL_REPUTATION);
-                    }
-                    // PRIVACY: Show pseudonym instead of node_id
-                    let display_id = if node_id.starts_with("genesis_node_") || node_id.starts_with("node_") || node_id.starts_with("super_") {
-                        node_id.clone()
-                    } else {
-                        get_privacy_id_for_addr(&node_id)
-                    };
-                    if crate::node::is_info() { println!("[INFO][P2P] Legacy Genesis node {} detected - reputation will be initialized by consensus system", display_id); }
-                } else {
-                    // Check activation code for Genesis codes
-                    if let Ok(activation_code) = std::env::var("QNET_ACTIVATION_CODE") {
-                        use crate::genesis_constants::GENESIS_BOOTSTRAP_CODES;
-                        
-                        for genesis_code in GENESIS_BOOTSTRAP_CODES {
-                            if activation_code == *genesis_code {
-                                // PRIVACY: Don't show node_id even in local logs
-                                if crate::node::is_info() { println!("[INFO][P2P] Genesis activation code {} detected - reputation will be initialized by consensus system", genesis_code); }
-                                break;
-                            }
-                        }
-                    }
-                }
-                
-                Arc::new(Mutex::new(reputation_sys))
-            },
             block_tx: Arc::new(Mutex::new(None)),
             sync_request_tx: None,
             shred_protocol_assemblies: Arc::new(DashMap::new()),
@@ -3690,9 +3544,6 @@ impl SimplifiedP2P {
         let quic_bulk_tx = self.quic_bulk_tx.clone();
         let quic_finality_tx = self.quic_finality_tx.clone();
 
-        // v6.5: Share peer_id_to_addr with QUIC transport for bidirectional mapping
-        transport.set_peer_id_to_addr(self.peer_id_to_addr.clone());
-
         let handler: MessageHandler = Arc::new(move |peer_addr, msg| {
             let peer_str = format!("{}:8001", peer_addr.ip());
 
@@ -3877,6 +3728,72 @@ impl SimplifiedP2P {
         }
     }
     
+    /// Resolve our external IP once. Genesis nodes get it from constants; every other node used to
+    /// receive it only as a side effect of internet announcement, so operator super nodes ran with
+    /// `external_ip = None` — self-connect filtering and the peer-admission self-check both misfire
+    /// on that. Best-effort with backoff: a resolver outage must not stop the node.
+    fn start_external_ip_resolution(&self) {
+        if self.external_ip.read().is_some() {
+            crate::boot_contract::started(crate::boot_contract::names::EXTERNAL_IP_RESOLVER);
+            return;
+        }
+        let store = self.external_ip.clone();
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+        handle.spawn(async move {
+            crate::boot_contract::started(crate::boot_contract::names::EXTERNAL_IP_RESOLVER);
+            let mut backoff = 5u64;
+            loop {
+                // Collapse to String at the call site: the boxed error is not Send and must not
+                // survive into the retry await.
+                let resolved = Self::get_our_ip_address().await.map_err(|e| e.to_string());
+                match resolved {
+                    Ok(ip) => {
+                        *store.write() = Some(ip.clone());
+                        if crate::node::is_info() {
+                            println!("[INFO][P2P] external_ip_resolved ip={}", get_privacy_id_for_addr(&ip));
+                        }
+                        return;
+                    }
+                    Err(reason) => {
+                        if crate::node::is_warn() {
+                            println!("[WARN][P2P] external_ip_unresolved err={} retry_in={}s", reason, backoff);
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+                        backoff = (backoff * 2).min(300);
+                    }
+                }
+            }
+        });
+    }
+
+    /// Periodic idle-QUIC reap. The only other caller of `cleanup_quic_idle` is the emergency
+    /// reconnect path, so on a healthy node connection state grew for the process lifetime —
+    /// an unbounded fd/memory path once peer churn is measured in thousands.
+    fn start_quic_idle_reaper(&self) {
+        let quic_transport = match self.quic_transport.clone() {
+            Some(t) => t,
+            None => {
+                crate::boot_contract::skipped(crate::boot_contract::names::QUIC_IDLE_REAPER, "no_quic_transport");
+                return;
+            }
+        };
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+        handle.spawn(async move {
+            crate::boot_contract::started(crate::boot_contract::names::QUIC_IDLE_REAPER);
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+                let t = quic_transport.read().await;
+                t.cleanup_idle();
+            }
+        });
+    }
+
     /// v4.2: Force reconnect to all bootstrap peers.
     /// Called when EMERGENCY SYNC is stuck — drops dead QUIC connections
     /// and re-establishes them from scratch.
@@ -3965,13 +3882,20 @@ impl SimplifiedP2P {
     }
     
     /// Start simplified P2P network with load balancing
-    pub fn start(&self) {
+    pub fn start(self: &Arc<Self>) {
         if crate::node::is_info() { println!("[INFO][P2P] Starting P2P network with intelligent load balancing"); }
-        
+
+        // Publish the self-handle FIRST: every background task spawned below admits peers through it.
+        *self.self_ref.write() = Arc::downgrade(self);
+
         // CRITICAL: Load jail statuses from persistent storage FIRST
         // This ensures banned nodes stay banned across restarts
         self.load_jail_statuses_on_startup();
-        
+
+        // Rehydrate node_id -> endpoint IP before any peer is admitted: the IP-identity gates
+        // consult it, and an empty map means "unbound, allow" for every claimed Super identity.
+        self.restore_node_endpoints();
+
         // PRIVACY: Use pseudonym even in startup logs
         let display_id = if self.node_id.starts_with("genesis_node_") || self.node_id.starts_with("node_") || self.node_id.starts_with("super_") {
             self.node_id.clone()
@@ -4201,21 +4125,25 @@ impl SimplifiedP2P {
         }
     }
     
+    /// Drop one address from the shard index of `peer_id`. Shard is a pure function of the id, so
+    /// this is the exact inverse of the push in add_peer_lockfree.
+    fn drop_shard_entry(&self, peer_id: &str, peer_addr: &str) {
+        let mut hasher = Sha3_256::new();
+        hasher.update(peer_id.as_bytes());
+        let peer_shard = hasher.finalize()[0];
+        if let Some(mut shard_peers) = self.peer_shards.get_mut(&peer_shard) {
+            shard_peers.retain(|addr| addr != peer_addr);
+        }
+    }
+
     /// QUANTUM OPTIMIZATION: Lock-free peer removal
+    /// The ONLY remover: it clears connected_peers_lockfree, peer_id_to_addr and the shard index
+    /// together. A bare map remove elsewhere leaves a dangling id → dead address route.
     pub fn remove_peer_lockfree(&self, peer_addr: &str) -> bool {
         if let Some((_, peer_info)) = self.connected_peers_lockfree.remove(peer_addr) {
             // Remove from ID index
             self.peer_id_to_addr.remove(&peer_info.id);
-
-            // Remove from shard mapping
-            let mut hasher = Sha3_256::new();
-            hasher.update(peer_info.id.as_bytes());
-            let hash = hasher.finalize();
-            let peer_shard = hash[0];
-
-            if let Some(mut shard_peers) = self.peer_shards.get_mut(&peer_shard) {
-                shard_peers.retain(|addr| addr != peer_addr);
-            }
+            self.drop_shard_entry(&peer_info.id, peer_addr);
 
             // v9.5: Recalculate BEST_PEER_HEIGHT when a peer disconnects.
             // Without this, BEST_PEER_HEIGHT sticks at the disconnected peer's height
@@ -4226,7 +4154,7 @@ impl SimplifiedP2P {
             }
 
             if crate::node::is_debug() {
-                println!("[DBG][P2P] peer_removed id={} shard={}", peer_info.id, peer_shard);
+                println!("[DBG][P2P] peer_removed id={} addr={}", peer_info.id, peer_addr);
             }
             true
         } else {
@@ -4236,31 +4164,6 @@ impl SimplifiedP2P {
     
     /// PRODUCTION: Clean up inactive peers to prevent memory leak
     /// Uses 30-minute timeout (independent of certificate lifetime)
-    pub fn cleanup_inactive_peers(&self) {
-        let now = self.current_timestamp();
-        let threshold = now.saturating_sub(PEER_INACTIVE_TIMEOUT_SECS);
-        
-        // Collect peers to remove (can't remove while iterating)
-        let mut peers_to_remove = Vec::new();
-        
-        // Check all peers in lock-free map
-        for entry in self.connected_peers_lockfree.iter() {
-            if entry.value().last_seen < threshold {
-                peers_to_remove.push(entry.key().clone());
-            }
-        }
-        
-        // Remove inactive peers (v2.51: fully lock-free)
-        for peer_addr in &peers_to_remove {
-            self.remove_peer_lockfree(peer_addr);
-        }
-        
-        if !peers_to_remove.is_empty() && crate::node::is_info() {
-            println!("[INFO][P2P] cleanup_inactive removed={} threshold_sec={}", 
-                     peers_to_remove.len(), PEER_INACTIVE_TIMEOUT_SECS);
-        }
-    }
-    
     /// Update peer network score based on event type
     /// ═══════════════════════════════════════════════════════════════════════════
     /// ARCHITECTURE v2.21: NETWORK EVENTS ONLY
@@ -4378,30 +4281,10 @@ impl SimplifiedP2P {
             return; // Already connected, nothing to do
         }
         
-        // PRODUCTION v2.21.4: Rate limit and capacity check to prevent phantom peers
-        // SCALABILITY: Essential for networks with 10,000+ nodes
-        let current_peer_count = self.connected_peers_lockfree.len();
-        
-        // Hard limit on connected peers (scalable for large networks)
-        // Uses global constant MAX_CONNECTED_PEERS = 1000
-        if current_peer_count >= MAX_CONNECTED_PEERS {
-            // LRU eviction: remove oldest peer to make room
-            let mut oldest_addr: Option<String> = None;
-            let mut oldest_time = u64::MAX;
-            
-            for entry in self.connected_peers_lockfree.iter() {
-                if entry.value().last_seen < oldest_time {
-                    oldest_time = entry.value().last_seen;
-                    oldest_addr = Some(entry.key().clone());
-                }
-            }
-            
-            if let Some(addr) = oldest_addr {
-                self.connected_peers_lockfree.remove(&addr);
-                if crate::node::is_info() { println!("[INFO][P2P] LRU eviction: removed oldest peer to add new one"); }
-            }
-        }
-        
+        // Capacity is enforced by add_peer_lockfree, whose LRU never evicts a committee or
+        // genesis link. Pre-evicting here used a plain LRU and could drop such a link for a
+        // newcomer the admission gates then refused — a net loss of one peer per message.
+
         // CRITICAL: Auto-add the peer since they successfully sent us a message
         // This proves they are reachable - no need for connectivity test!
         let ip = peer_addr.split(':').next().unwrap_or("");
@@ -4461,11 +4344,10 @@ impl SimplifiedP2P {
         }
     }
     
-    /// v30.C1: identity-bound HealthPing verification. The verifying PK is
-    /// resolved from CONSENSUS_PK_REGISTRY against the claimed `from` —
-    /// NEVER from the message body. The `pk_hex` argument is retained for
-    /// wire backward-compat but is ignored on the verify path. Closes the
-    /// last identity-squat hole at the height-gossip layer: an attacker
+    /// Identity-bound HealthPing verification. The verifying PK is resolved
+    /// from CONSENSUS_PK_REGISTRY against the claimed `from` — never from the
+    /// message, which carries no key at all. Closes the
+    /// identity-squat hole at the height-gossip layer: an attacker
     /// holding any valid ML-DSA-65 keypair would otherwise sign
     /// `QNET_HEALTH_PING_V1:genesis_node_001:<ts>:<h>` with their own SK,
     /// attach their PK, and have a poisoned height accepted as authentic.
@@ -4473,7 +4355,7 @@ impl SimplifiedP2P {
     /// NodeRegistration); unknown identities are rejected outright.
     /// Scalability: O(1) DashMap lookup — caps at hundreds of thousands of
     /// super-node identities without contention.
-    fn verify_health_ping_signature(from: &str, timestamp: u64, height: u64, sig_hex: &str, _pk_hex_ignored: &str) -> bool {
+    fn verify_health_ping_signature(from: &str, timestamp: u64, height: u64, sig_hex: &str) -> bool {
         use pqcrypto_traits::sign::{PublicKey as PqPublicKey, DetachedSignature as PqDetachedSignature};
         let registered_pk = match qnet_consensus::consensus_crypto::get_consensus_pk(from) {
             Some(pk) => pk,
@@ -4556,9 +4438,10 @@ impl SimplifiedP2P {
                 // is still attested by every signed HealthPing it emits).
                 peer.last_height_attested_at = current_time;
                 let increased = h > peer.last_block_height;
-                // v33: authoritative (committed) REPLACES — heals a stale over-report;
-                // block-relay only RAISES — keeps the sync view fresh between pings.
-                if authoritative || increased {
+                // Authoritative REPLACES (heals a stale over-report), relay only RAISES. h == 0 is the
+                // channel's "unknown" sentinel — a peer rebooting into empty storage must not zero the
+                // height every other node already knows for it.
+                if (authoritative && h > 0) || increased {
                     peer.last_block_height = h;
                 }
                 if increased {
@@ -4582,8 +4465,8 @@ impl SimplifiedP2P {
                         // v30.A3: same attestation refresh as the primary branch
                         entry.last_height_attested_at = current_time;
                         let increased = h > entry.last_block_height;
-                        // v33: authoritative REPLACES (heals), block-relay only RAISES.
-                        if authoritative || increased {
+                        // Same rule as the primary branch: a signed h=0 attests liveness, not a height.
+                        if (authoritative && h > 0) || increased {
                             entry.last_block_height = h;
                         }
                         if increased {
@@ -4599,32 +4482,55 @@ impl SimplifiedP2P {
             }
     }
 
-    /// v15.9: Count currently connected peers whose IPv4 address matches
-    /// the given netblock prefix. `octets` selects the prefix granularity:
-    ///   3 → /24 (first three dotted octets equal),
-    ///   2 → /16 (first two dotted octets equal).
-    /// Used by the eclipse-defence subnet-diversity check at admission
-    /// time. Skips outbound peers and entries whose host part fails IPv4
-    /// parsing (the diversity rule applies only to inbound IPv4 peers,
-    /// matching the rejection guard in `add_peer_lockfree`).
-    fn count_peers_in_subnet_prefix(&self, prefix: &str, octets: usize) -> usize {
-        if prefix.is_empty() || !(1..=4).contains(&octets) {
-            return 0;
-        }
-        let mut count = 0usize;
+    /// Inbound admission counters in ONE pass: (total inbound, inbound in the
+    /// candidate /24, inbound in the candidate /16). Outbound peers are excluded —
+    /// we chose them, so they neither consume the inbound reserve nor the subnet caps.
+    /// Cost is O(MAX_CONNECTED_PEERS), a compile-time bound that does not grow with
+    /// network size, and it holds no per-known-peer state.
+    fn inbound_admission_counts(
+        &self,
+        prefix_24: Option<&str>,
+        prefix_16: Option<&str>,
+    ) -> (usize, usize, usize) {
+        let (mut inbound, mut in_24, mut in_16) = (0usize, 0usize, 0usize);
         for entry in self.connected_peers_lockfree.iter() {
             let p = entry.value();
             if p.is_outbound {
                 continue;
             }
+            inbound = inbound.saturating_add(1);
             let peer_ip = p.addr.split(':').next().unwrap_or("");
-            if let Some(peer_prefix) = extract_subnet_prefix(peer_ip, octets) {
-                if peer_prefix == prefix {
-                    count = count.saturating_add(1);
+            if let Some(pfx) = prefix_24 {
+                if extract_subnet_prefix(peer_ip, 3).as_deref() == Some(pfx) {
+                    in_24 = in_24.saturating_add(1);
+                }
+            }
+            if let Some(pfx) = prefix_16 {
+                if extract_subnet_prefix(peer_ip, 2).as_deref() == Some(pfx) {
+                    in_16 = in_16.saturating_add(1);
                 }
             }
         }
-        count
+        (inbound, in_24, in_16)
+    }
+
+    /// Identity we are willing to bind to a gossiped address, or None to refuse the entry.
+    /// A pinned genesis address answers from the binary, never from the wire. Any other
+    /// address must carry a chain-registered identity whose committed endpoint IP matches:
+    /// admitting an unverifiable claim installs a node_id → address route that every later
+    /// directed send would follow, which is a free black-hole for the claimed identity.
+    /// O(1): one pinned-table lookup or one DashMap get.
+    fn gossip_bound_identity(claimed_id: &str, ip: &str) -> Option<String> {
+        if let Some(gid) = crate::genesis_constants::get_genesis_id_by_ip(ip) {
+            return Some(format!("genesis_node_{}", gid));
+        }
+        if claimed_id.starts_with("genesis_node_") {
+            return None; // genesis identity claimed from a non-genesis address
+        }
+        match crate::genesis_constants::get_node_endpoint_ip(claimed_id) {
+            Some(expected) if expected == ip => Some(claimed_id.to_string()),
+            _ => None,
+        }
     }
 
     /// QUANTUM OPTIMIZATION: Lock-free peer addition for millions of nodes
@@ -4670,34 +4576,11 @@ impl SimplifiedP2P {
         }
     }
 
+    /// Every reject path runs BEFORE the global-cap LRU eviction: a candidate the self-check, the
+    /// address/identity dedup or an inbound gate is about to refuse must never cost a live peer its
+    /// slot, or repeated refused attempts drain the table down to the pinned set — an eclipse
+    /// primitive that survives the very caps meant to stop it.
     pub fn add_peer_lockfree(&self, mut peer_info: PeerInfo) -> bool {
-        // PRODUCTION v2.21.4: Check global peer limit FIRST
-        // This prevents phantom peer accumulation across all buckets
-        let current_count = self.connected_peers_lockfree.len();
-        if current_count >= MAX_CONNECTED_PEERS {
-            // LRU eviction: find and remove oldest peer, but NEVER a committee/genesis link — they are the
-            // anti-forgery corroboration anchor; membership-derived so a rotated-out member auto-unpins at
-            // the next epoch swap (no stale-pin flag).
-            let cc = CURRENT_COMMITTEE.read().clone();
-            let mut oldest_addr: Option<String> = None;
-            let mut oldest_time = u64::MAX;
-            for entry in self.connected_peers_lockfree.iter() {
-                let p = entry.value();
-                let pinned = cc.members.contains(&p.id) || cc.genesis_ids.contains(&p.id)
-                    || crate::genesis_constants::get_genesis_id_by_ip(p.addr.split(':').next().unwrap_or("")).is_some();
-                if pinned { continue; }
-                if p.last_seen < oldest_time {
-                    oldest_time = p.last_seen;
-                    oldest_addr = Some(entry.key().clone());
-                }
-            }
-            if let Some(addr) = oldest_addr {
-                self.remove_peer_lockfree(&addr);
-            } else {
-                return false; // Can't add if at limit and no peers to evict
-            }
-        }
-        
         // CRITICAL: Prevent self-connection at the earliest stage
         let peer_ip = peer_info.addr.split(':').next().unwrap_or("");
         let external_ip_guard = self.external_ip.read();
@@ -4706,90 +4589,100 @@ impl SimplifiedP2P {
         } else {
             false
         };
-        
+        drop(external_ip_guard);
+
         if peer_info.id == self.node_id || is_self_by_ip {
             if crate::node::is_info() { println!("[INFO][P2P] add_peer_lockfree: Rejecting self-connection {}",
                      get_privacy_id_for_addr(&peer_info.addr)); }
             return false;
         }
 
-        // FIX R23-P1: Eclipse protection — reserve outbound slots.
-        // If this is an inbound connection, check that we're not using up outbound-reserved slots.
+        // LOCK-FREE: Check if already exists (O(1))
+        if self.connected_peers_lockfree.contains_key(&peer_info.addr) {
+            return false;
+        }
+
+        // IDENTITY DEDUP — same node_id at a different address (a peer listens on 3 ports).
+        // Refresh the live entry instead of inserting a duplicate, which would inflate BFT
+        // validator counts. Height is NOT taken from peer_info: the gossip sources that reach
+        // here are unauthenticated for the claimed peer; only its signed HealthPing attests a tip.
+        // A mapping with NO live entry is a dangling index, not a connection: it is dropped and the
+        // admission continues, or the identity would be permanently unadmittable on this node.
+        if !peer_info.id.is_empty() {
+            let existing_addr = self.peer_id_to_addr.get(&peer_info.id).map(|e| e.value().clone());
+            if let Some(existing_addr) = existing_addr {
+                let live = if let Some(mut entry) = self.connected_peers_lockfree.get_mut(&existing_addr) {
+                    entry.last_seen = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    true
+                } else {
+                    false
+                };
+                if live {
+                    if crate::node::is_debug() {
+                        println!("[DBG][P2P] peer_dedup id={} existing_addr={} new_addr={} — refreshed (skipping insert)",
+                                 peer_info.id, existing_addr, peer_info.addr);
+                    }
+                    return false;
+                }
+                self.peer_id_to_addr.remove(&peer_info.id);
+                self.drop_shard_entry(&peer_info.id, &existing_addr);
+                if crate::node::is_debug() {
+                    println!("[DBG][P2P] peer_index_stale id={} stale_addr={} new_addr={} action=readmit",
+                             peer_info.id, existing_addr, peer_info.addr);
+                }
+            }
+        }
+
+        // Inbound admission gates: outbound-slot reserve (eclipse), reputation floor (sybil)
+        // and per-netblock diversity caps. Outbound peers bypass — we chose them. Genesis IPs
+        // bypass reputation and diversity — the pinned set is vetted by the binary.
+        // All three read ONE bounded pass over the peer table, so a burst of admissions does
+        // not multiply scans.
         if !peer_info.is_outbound {
-            let inbound_count = self.connected_peers_lockfree.iter()
-                .filter(|entry| !entry.value().is_outbound)
-                .count();
+            let is_genesis_ip = crate::genesis_constants::get_genesis_id_by_ip(peer_ip).is_some();
+            let prefix_24 = if is_genesis_ip { None } else { extract_subnet_prefix(peer_ip, 3) };
+            let prefix_16 = if is_genesis_ip { None } else { extract_subnet_prefix(peer_ip, 2) };
+            let (inbound_count, count_24, count_16) =
+                self.inbound_admission_counts(prefix_24.as_deref(), prefix_16.as_deref());
+
             let max_inbound = MAX_CONNECTED_PEERS.saturating_sub(MIN_OUTBOUND_SLOTS);
             if inbound_count >= max_inbound {
-                if crate::node::is_info() {
-                    println!("[INFO][P2P] inbound_slot_full inbound={} max={} outbound_reserved={}",
+                if crate::node::is_warn() {
+                    println!("[WARN][P2P] peer_admission_rejected reason=inbound_slot_full inbound={} max={} outbound_reserved={}",
                              inbound_count, max_inbound, MIN_OUTBOUND_SLOTS);
                 }
                 return false;
             }
-        }
 
-        // FIX R23-P2: Sybil protection — require minimum reputation for inbound peers.
-        // Genesis nodes always accepted. Outbound connections always accepted (we chose them).
-        if !peer_info.is_outbound {
-            let is_genesis_ip = crate::genesis_constants::get_genesis_id_by_ip(peer_ip).is_some();
             if !is_genesis_ip && peer_info.reputation < MIN_INBOUND_PEER_REPUTATION {
-                if crate::node::is_info() {
-                    println!("[INFO][P2P] sybil_reject peer={} rep={:.1} min={:.1}",
-                             get_privacy_id_for_addr(&peer_info.addr), peer_info.reputation, MIN_INBOUND_PEER_REPUTATION);
+                if crate::node::is_warn() {
+                    println!("[WARN][P2P] peer_admission_rejected reason=reputation peer={} rep={:.1} min={:.1}",
+                             get_privacy_id_for_addr(&peer_info.addr),
+                             peer_info.reputation, MIN_INBOUND_PEER_REPUTATION);
                 }
                 return false;
             }
-        }
 
-        // ═══════════════════════════════════════════════════════════════════════════
-        // v15.9: SUBNET DIVERSITY CHECK — eclipse-attack defence
-        // ───────────────────────────────────────────────────────────────────────────
-        // Cap concurrent inbound peers per /24 and /16 netblock to prevent a
-        // single hosting provider / cloud region from saturating our peer
-        // table. Outbound connections (we initiated them) and genesis IPs
-        // (vetted set) bypass — only inbound non-genesis peers are limited.
-        //
-        // Behaviour matches the existing eclipse / sybil checks above: a
-        // rejection at this layer logs a single INFO line and returns
-        // false; the connection is closed by the caller. The check runs
-        // BEFORE k-bucket / shard insertion so a rejected peer leaves no
-        // residual state in any DashMap.
-        // ═══════════════════════════════════════════════════════════════════════════
-        if !peer_info.is_outbound {
-            let is_genesis_ip = crate::genesis_constants::get_genesis_id_by_ip(peer_ip).is_some();
-            if !is_genesis_ip {
-                let max_per_24 = std::env::var("QNET_MAX_PEERS_PER_24")
-                    .ok()
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(DEFAULT_MAX_PEERS_PER_SUBNET_24);
-                let max_per_16 = std::env::var("QNET_MAX_PEERS_PER_16")
-                    .ok()
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(DEFAULT_MAX_PEERS_PER_SUBNET_16);
-
-                if let Some(prefix_24) = extract_subnet_prefix(peer_ip, 3) {
-                    let count_24 = self.count_peers_in_subnet_prefix(&prefix_24, 3);
-                    if count_24 >= max_per_24 {
-                        if crate::node::is_info() {
-                            println!("[INFO][P2P] subnet_reject_24 peer={} prefix={}/24 existing={} max={}",
-                                     get_privacy_id_for_addr(&peer_info.addr),
-                                     prefix_24, count_24, max_per_24);
-                        }
-                        return false;
+            if let Some(ref pfx) = prefix_24 {
+                if count_24 >= MAX_PEERS_PER_SUBNET_24 {
+                    if crate::node::is_warn() {
+                        println!("[WARN][P2P] peer_admission_rejected reason=subnet_24 peer={} prefix={}/24 existing={} max={}",
+                                 get_privacy_id_for_addr(&peer_info.addr), pfx, count_24, MAX_PEERS_PER_SUBNET_24);
                     }
+                    return false;
                 }
+            }
 
-                if let Some(prefix_16) = extract_subnet_prefix(peer_ip, 2) {
-                    let count_16 = self.count_peers_in_subnet_prefix(&prefix_16, 2);
-                    if count_16 >= max_per_16 {
-                        if crate::node::is_info() {
-                            println!("[INFO][P2P] subnet_reject_16 peer={} prefix={}/16 existing={} max={}",
-                                     get_privacy_id_for_addr(&peer_info.addr),
-                                     prefix_16, count_16, max_per_16);
-                        }
-                        return false;
+            if let Some(ref pfx) = prefix_16 {
+                if count_16 >= MAX_PEERS_PER_SUBNET_16 {
+                    if crate::node::is_warn() {
+                        println!("[WARN][P2P] peer_admission_rejected reason=subnet_16 peer={} prefix={}/16 existing={} max={}",
+                                 get_privacy_id_for_addr(&peer_info.addr), pfx, count_16, MAX_PEERS_PER_SUBNET_16);
                     }
+                    return false;
                 }
             }
         }
@@ -4801,53 +4694,21 @@ impl SimplifiedP2P {
         let peer_shard = hash[0];
         peer_info.bucket_index = self.get_bucket_index(&peer_info.id);
         
-        // LOCK-FREE: Check if already exists (O(1))
-        if self.connected_peers_lockfree.contains_key(&peer_info.addr) {
-            return false;
-        }
-
-        // ═══════════════════════════════════════════════════════════════════════════
-        // v14.1: IDENTITY DEDUP — same node_id at different address
-        // ═══════════════════════════════════════════════════════════════════════════
-        // If this node_id is already connected via a different address (e.g., HTTP
-        // on :8001 and QUIC on :9876 for the same peer), refresh the existing entry
-        // rather than inserting a duplicate. This prevents connected_peers_lockfree
-        // from storing multiple entries per peer and inflating BFT validator counts.
-        //
-        // This is critical at genesis: each Super node listens on 3 ports. Without
-        // this check, a 5-node network appears as 13 phantom validators in the BFT
-        // threshold calculation, breaking liveness.
-        // ═══════════════════════════════════════════════════════════════════════════
-        if !peer_info.id.is_empty() {
-            if let Some(existing_addr_entry) = self.peer_id_to_addr.get(&peer_info.id) {
-                let existing_addr = existing_addr_entry.value().clone();
-                drop(existing_addr_entry);
-                // v30.A3: refresh last_seen ONLY; height is NOT taken from
-                // peer_info on this gossip-discovered path because its source
-                // (PeerListResponse / DHT relay) is unauthenticated for the
-                // claimed peer. The peer's own signed HealthPing / inbound
-                // block delivery is the canonical attestation channel.
-                if let Some(mut entry) = self.connected_peers_lockfree.get_mut(&existing_addr) {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    entry.last_seen = now;
-                }
-                if crate::node::is_debug() {
-                    println!("[DBG][P2P] peer_dedup id={} existing_addr={} new_addr={} — refreshed (skipping insert)",
-                             peer_info.id, existing_addr, peer_info.addr);
-                }
-                return false;
-            }
-        }
-
-        // K-BUCKET MANAGEMENT: Check bucket size (max 20 per bucket)
+        // K-BUCKET MANAGEMENT: Check bucket size (max 20 per bucket).
+        // Committee/genesis links are excluded from victim selection for the same reason the global
+        // cap pins them: a higher-reputation inbound peer must not be able to evict the corroboration
+        // anchor out of its bucket.
+        let cc_pins = CURRENT_COMMITTEE.read().clone();
         let bucket_peers: Vec<_> = self.connected_peers_lockfree.iter()
             .filter(|entry| entry.value().bucket_index == peer_info.bucket_index)
+            .filter(|entry| {
+                let p = entry.value();
+                !(cc_pins.members.contains(&p.id) || cc_pins.genesis_ids.contains(&p.id)
+                  || crate::genesis_constants::get_genesis_id_by_ip(p.addr.split(':').next().unwrap_or("")).is_some())
+            })
             .map(|entry| (entry.key().clone(), entry.value().combined_reputation()))
             .collect();
-        
+
         if bucket_peers.len() >= KADEMLIA_K {
             // Find peer with lowest combined reputation in this bucket
             if let Some((worst_addr, worst_rep)) = bucket_peers.iter()
@@ -4866,6 +4727,29 @@ impl SimplifiedP2P {
             }
         }
         
+        // Global cap, LAST: every reject is behind us, so this eviction only ever pays for a peer
+        // we do insert. NEVER evicts a committee/genesis link — the anti-forgery corroboration
+        // anchor; membership-derived, so a rotated-out member auto-unpins at the next epoch swap.
+        if self.connected_peers_lockfree.len() >= MAX_CONNECTED_PEERS {
+            let cc = CURRENT_COMMITTEE.read().clone();
+            let mut oldest_addr: Option<String> = None;
+            let mut oldest_time = u64::MAX;
+            for entry in self.connected_peers_lockfree.iter() {
+                let p = entry.value();
+                let pinned = cc.members.contains(&p.id) || cc.genesis_ids.contains(&p.id)
+                    || crate::genesis_constants::get_genesis_id_by_ip(p.addr.split(':').next().unwrap_or("")).is_some();
+                if pinned { continue; }
+                if p.last_seen < oldest_time {
+                    oldest_time = p.last_seen;
+                    oldest_addr = Some(entry.key().clone());
+                }
+            }
+            match oldest_addr {
+                Some(addr) => { self.remove_peer_lockfree(&addr); }
+                None => return false, // at limit and every peer is pinned
+            }
+        }
+
         // LOCK-FREE: Add to all indices simultaneously
         self.connected_peers_lockfree.insert(peer_info.addr.clone(), peer_info.clone());
         self.peer_id_to_addr.insert(peer_info.id.clone(), peer_info.addr.clone());
@@ -4887,6 +4771,25 @@ impl SimplifiedP2P {
     /// v2.51: Always uses lock-free DashMap
     pub fn add_peer_safe(&self, peer_info: PeerInfo) -> bool {
         self.add_peer_lockfree(peer_info)
+    }
+
+    /// Self-handle for `'static` background tasks.
+    fn self_weak(&self) -> std::sync::Weak<Self> {
+        self.self_ref.read().clone()
+    }
+
+    /// Admit a regional dial candidate we probed reachable, from a background task. Provenance is
+    /// carried on `peer.is_outbound`: an address WE chose skips the inbound eclipse/reputation/subnet
+    /// gates, a gossip-learned one does not. Never skips the global cap, the self-connection check or
+    /// the id/shard indices — that is what a raw map insert used to lose.
+    fn admit_regional_candidate(me: &std::sync::Weak<Self>, mut peer: PeerInfo) -> bool {
+        let node = match me.upgrade() { Some(n) => n, None => return false };
+        // Re-resolve the score AT admission: the candidate may have sat in the regional map for
+        // minutes, and a node banned in the meantime would otherwise clear the floor on a stale 70.
+        let rep = node.get_node_reputation_from_blockchain(&peer.id);
+        peer.reputation = rep;
+        peer.consensus_score = rep;
+        node.add_peer_lockfree(peer)
     }
 
     /// Connect to bootstrap peers OR use internet-wide peer discovery
@@ -4959,7 +4862,10 @@ impl SimplifiedP2P {
             }
             
             match self.parse_peer_address(peer_addr) {
-                Ok(peer_info) => {
+                Ok(mut peer_info) => {
+                    // Bootstrap/committee addresses are ones WE chose to dial — provenance the
+                    // regional sweep needs, since a gossip-learned candidate must not look the same.
+                    peer_info.is_outbound = true;
                     // Also check by node_id
                     if peer_info.id == self.node_id {
                         if crate::node::is_info() { println!("[INFO][P2P] Skipping self by node_id: {}", peer_info.id); }
@@ -5133,32 +5039,53 @@ impl SimplifiedP2P {
         }
     }
     
-    /// Start internet-wide peer discovery using external IP and peer registry
+    /// Internet-wide peer discovery. Fallback for a node with no configured bootstrap peers; it
+    /// carries ONLY discovery. The background tasks every node needs live in
+    /// `start_required_background_tasks` — bundling them here made all of them conditional on an
+    /// empty bootstrap list, i.e. dead on every real deployment.
     fn start_internet_peer_discovery(&self) {
-        if crate::node::is_info() { println!("[INFO][P2P] Starting internet-wide peer discovery..."); }
-        
-        // Announce our node to the internet
+        if crate::node::is_info() { println!("[INFO][P2P] internet_discovery_start"); }
         self.announce_node_to_internet();
-        
-        // Search for other QNet nodes on the internet
         self.search_internet_peers();
-        
-        // Start reputation-based peer validation
+    }
+
+    /// Background tasks required on every node regardless of how it finds peers. Idempotent: safe
+    /// on any P2P bring-up path (initial connect, reconnect, committee dial).
+    pub fn start_required_background_tasks(&self) {
+        if REQUIRED_TASKS_STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+
+        use crate::boot_contract::{names, require};
+        for n in [
+            names::SIGNED_HEAD_EMITTER,
+            names::PEER_CLEANUP,
+            names::BACKGROUND_REPAIR,
+            names::BACKGROUND_HEIGHT_SYNC,
+            names::REPUTATION_VALIDATION,
+            names::REGIONAL_CLUSTERING,
+            names::TX_CACHE_CLEANUP,
+            names::RATE_LIMITER_CLEANUP,
+            names::STATIC_CACHE_CLEANUP,
+            names::QUIC_IDLE_REAPER,
+            names::EXTERNAL_IP_RESOLVER,
+        ] {
+            require(n);
+        }
+
         self.start_reputation_validation();
-        
-        // PRODUCTION: Start reputation sync task for network-wide consistency
-        self.start_reputation_sync_task();
-        
-        // API DEADLOCK FIX: Start background height synchronization
         self.start_background_height_sync();
-        
-        // PRODUCTION: Start periodic peer cleanup to prevent memory leak
         self.start_peer_cleanup_task();
-        
-        // Start regional peer clustering
         self.start_regional_clustering();
-        
-        if crate::node::is_info() { println!("[INFO][P2P] Internet-wide peer discovery started"); }
+        self.start_quic_health_check_task();
+        self.start_tx_cache_cleanup_task();
+        self.start_rate_limiter_cleanup_task();
+        self.start_static_cache_cleanup_task();
+        self.start_background_repair_task();
+        self.start_quic_idle_reaper();
+        self.start_external_ip_resolution();
+
+        if crate::node::is_info() { println!("[INFO][P2P] required_tasks_started count=11"); }
     }
     
     /// Announce our node to the internet for peer discovery
@@ -5264,10 +5191,10 @@ impl SimplifiedP2P {
         let region = self.region.clone();
         let regional_peers = self.regional_peers.clone();
         let connected_peers = self.connected_peers_lockfree.clone();
+        let me = self.self_weak();
         let _port = self.port;
         let _node_type = self.node_type.clone();
-        let _reputation_system = self.reputation_system.clone();  // Clone for async block
-        
+
         handle.spawn(async move {
             if crate::node::is_info() { println!("[INFO][P2P] Searching for QNet peers with cryptographic verification..."); }
             
@@ -5444,15 +5371,9 @@ impl SimplifiedP2P {
             let validated_peers = Self::validate_activation_codes_static(&discovered_peers);
             if crate::node::is_info() { println!("[INFO][P2P] Activation validation: {}/{} peers passed", validated_peers.len(), discovered_peers.len()); }
             
-            // Add validated peers to regional map
-            {
-                let mut regional_peers = regional_peers.lock();
-                for peer in validated_peers.iter() {
-                    regional_peers
-                        .entry(peer.region.clone())
-                        .or_insert_with(Vec::new)
-                        .push(peer.clone());
-                }
+            // Add validated peers to regional map through the bounded, deduping insert.
+            for peer in validated_peers.iter() {
+                Self::push_regional_peer(&regional_peers, peer.clone());
             }
             
             // v2.51: Add validated peers using lock-free DashMap
@@ -5462,10 +5383,8 @@ impl SimplifiedP2P {
                 let is_reachable = tokio::task::spawn_blocking(move || {
                     Self::test_peer_connectivity_static(&addr_clone)
                 }).await.unwrap_or(false);
-                if is_reachable {
-                    if !connected_peers.contains_key(&peer.addr) {
-                        connected_peers.insert(peer.addr.clone(), peer.clone());
-                    }
+                if is_reachable && !connected_peers.contains_key(&peer.addr) {
+                    Self::admit_regional_candidate(&me, peer.clone());
                 }
             }
 
@@ -5494,6 +5413,7 @@ impl SimplifiedP2P {
         let connected_peers = self.connected_peers_lockfree.clone();
         
         handle.spawn(async move {
+            crate::boot_contract::started(crate::boot_contract::names::BACKGROUND_HEIGHT_SYNC);
             if crate::node::is_info() { println!("[INFO][SYNC] Starting background height synchronization..."); }
             
             // Initial delay to let network form
@@ -5574,6 +5494,7 @@ impl SimplifiedP2P {
         let quic_transport = self.quic_transport.clone();
         
         handle.spawn(async move {
+            crate::boot_contract::started(crate::boot_contract::names::PEER_CLEANUP);
             if crate::node::is_info() { println!("[INFO][P2P] Starting periodic peer cleanup task (every 5 minutes)..."); }
             
             // Initial delay to let network stabilize
@@ -5684,12 +5605,22 @@ impl SimplifiedP2P {
                         })
                         .collect();
 
+                    // The shard index is cleared with the entry: the loser address would otherwise
+                    // linger in its shard bucket for the process lifetime.
                     for addr in &dup_to_remove {
-                        connected_peers_lockfree.remove(addr);
+                        if let Some((_, lost)) = connected_peers_lockfree.remove(addr) {
+                            let mut hasher = sha3::Sha3_256::new();
+                            hasher.update(lost.id.as_bytes());
+                            let peer_shard = hasher.finalize()[0];
+                            if let Some(mut shard_peers) = peer_shards.get_mut(&peer_shard) {
+                                shard_peers.retain(|a| a != addr);
+                            }
+                        }
                         dup_removed += 1;
                     }
 
-                    // Re-point peer_id_to_addr to the winner address for each node_id
+                    // Re-point peer_id_to_addr to the winner address for each node_id. Every winner
+                    // is a live entry by construction, so this repairs the index, never dangles it.
                     for (id, (winner_addr, _)) in &best_per_id {
                         peer_id_to_addr.insert(id.clone(), winner_addr.clone());
                     }
@@ -5728,21 +5659,6 @@ impl SimplifiedP2P {
             }
         });
         
-        // v2.24: Start frequent QUIC health check task (every 15 seconds)
-        self.start_quic_health_check_task();
-        
-        // v2.25: Start TX cache cleanup task (prevents memory leak)
-        self.start_tx_cache_cleanup_task();
-        
-        // v3.0: Start rate limiter cleanup task (CRITICAL: prevents memory leak + network isolation)
-        self.start_rate_limiter_cleanup_task();
-        
-        // v3.1: Start static cache cleanup task (CRITICAL: prevents memory leak at scale with millions of nodes)
-        self.start_static_cache_cleanup_task();
-        
-        // PRODUCTION v2.56: Start background repair task for incomplete block assemblies
-        // CRITICAL: Ensures repair happens independently of chunk arrival
-        self.start_background_repair_task();
     }
     
     /// v2.25: Periodic cleanup of seen_tx_hashes to prevent memory leak
@@ -5757,6 +5673,7 @@ impl SimplifiedP2P {
         let seen_announcements = Arc::clone(&self.seen_announcements);
 
         handle.spawn(async move {
+            crate::boot_contract::started(crate::boot_contract::names::TX_CACHE_CLEANUP);
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
 
             loop {
@@ -5795,6 +5712,7 @@ impl SimplifiedP2P {
         let nonce_validator = Arc::clone(&self.nonce_validator);
         
         handle.spawn(async move {
+            crate::boot_contract::started(crate::boot_contract::names::RATE_LIMITER_CLEANUP);
             // Cleanup every 5 minutes
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(300));
             
@@ -5876,6 +5794,7 @@ impl SimplifiedP2P {
         };
         
         handle.spawn(async move {
+            crate::boot_contract::started(crate::boot_contract::names::STATIC_CACHE_CLEANUP);
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(600)); // Every 10 minutes
             
             loop {
@@ -6021,6 +5940,7 @@ impl SimplifiedP2P {
         // CRITICAL: Use BROADCAST_RUNTIME, not main Tokio runtime
         // This ensures repair never competes with heartbeats, peer discovery, API
         BROADCAST_RUNTIME.spawn(async move {
+            crate::boot_contract::started(crate::boot_contract::names::BACKGROUND_REPAIR);
             // v15.11: Check every 100ms (was 500ms). At 1-sec block time, 100ms
             // poll lets repair complete a full chunk-fetch round-trip and
             // reconstruction inside the same block slot the chunks arrived in.
@@ -6225,14 +6145,15 @@ impl SimplifiedP2P {
         let wallet_identity = self.wallet_identity.clone();
         
         handle.spawn(async move {
-            if crate::node::is_info() { println!("[INFO][QUIC] health_check_task_started interval=15s signing=Dilithium3"); }
-            
-            // Initial delay to let network stabilize
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-            
+            crate::boot_contract::started(crate::boot_contract::names::SIGNED_HEAD_EMITTER);
+            if crate::node::is_info() {
+                println!("[INFO][QUIC] health_check_task_started boot_delay={}s interval={}s signing=ML-DSA-65",
+                         HEALTH_PING_BOOT_DELAY_SECS, HEALTH_PING_INTERVAL_SECS);
+            }
+
+            tokio::time::sleep(std::time::Duration::from_secs(HEALTH_PING_BOOT_DELAY_SECS)).await;
+
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
-                
                 if let Some(ref quic_transport) = quic_transport {
                     let transport = quic_transport.read().await;
                     
@@ -6249,24 +6170,20 @@ impl SimplifiedP2P {
                         .unwrap_or_default()
                         .as_secs();
 
-                    // v5.0: Sign HealthPing payload with Dilithium3
-                    let (sig_hex, pk_hex) = {
+                    let sig_hex = {
                         let id_guard = wallet_identity.read();
                         if let Some(ref identity) = *id_guard {
                             let payload = format!("QNET_HEALTH_PING_V1:{}:{}:{}", node_id, ts, current_height);
-                            match identity.sign(payload.as_bytes()) {
-                                Ok(sig) => (hex::encode(&sig), hex::encode(&identity.dilithium_pk)),
-                                Err(_) => (String::new(), String::new()),
-                            }
+                            identity.sign(payload.as_bytes()).map(hex::encode).unwrap_or_default()
                         } else {
-                            (String::new(), String::new())
+                            String::new()
                         }
                     };
 
                     // Cache the signed head for the block-serve co-send path (reaches cold-joiners the
                     // get_connected_peers fan-out misses).
                     if !sig_hex.is_empty() {
-                        *LATEST_SIGNED_HEAD.write() = Some((node_id.clone(), ts, current_height, sig_hex.clone(), pk_hex.clone()));
+                        *LATEST_SIGNED_HEAD.write() = Some((node_id.clone(), ts, current_height, sig_hex.clone()));
                     }
 
                     let (hint_mb, hint_round) = current_tc_hint();
@@ -6278,7 +6195,6 @@ impl SimplifiedP2P {
                             cert_mb: hint_mb,
                             cert_round: hint_round,
                             signature: sig_hex.clone(),
-                            public_key: pk_hex.clone(),
                         };
                         
                         // Try to send HealthPing - if it fails, connection is zombie
@@ -6355,6 +6271,7 @@ impl SimplifiedP2P {
                         }
                     }
                 }
+                tokio::time::sleep(std::time::Duration::from_secs(HEALTH_PING_INTERVAL_SECS)).await;
             }
         });
     }
@@ -6377,6 +6294,7 @@ impl SimplifiedP2P {
         ];
 
         handle.spawn(async move {
+            crate::boot_contract::started(crate::boot_contract::names::REPUTATION_VALIDATION);
             loop {
                 let is_bootstrap = std::env::var("QNET_BOOTSTRAP_ID")
                     .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
@@ -6479,202 +6397,6 @@ impl SimplifiedP2P {
 
     // REMOVED: start_kademlia_peer_discovery was a stub, now using Kademlia fields directly in PeerInfo
     
-    /// PRODUCTION v2.19.21: Broadcast block via QUIC (async, binary protocol)
-    /// 
-    /// - Uses QUIC with persistent connections
-    /// - Binary protocol (bincode) - no JSON overhead
-    /// - Parallel sending to all peers
-    /// - Post-quantum authenticated (Dilithium)
-    pub async fn broadcast_block(&self, height: u64, block_data: Vec<u8>) -> Result<(), String> {
-        use std::sync::Arc;
-        use futures::future::join_all;
-        use crate::p2p_transport::QUIC_PORT_OFFSET;
-        
-        // Get validated active peers
-        let mut validated_peers = self.get_validated_active_peers();
-        
-        // OPTIMIZATION: Sort peers by latency for priority broadcast
-        validated_peers.sort_by_key(|p| p.latency_ms);
-        
-        if validated_peers.is_empty() {
-            if height % 10 == 0 {
-                if crate::node::is_warn() { println!("[WARN][P2P] No validated peers available - block #{} not broadcasted", height); }
-            }
-            return Ok(());
-        }
-        
-        // Log broadcast only every 10 blocks
-        if height % 10 == 0 {
-            if crate::node::is_info() { println!("[INFO][QUIC] Broadcasting block #{} to {} validated peers (binary protocol)", height, validated_peers.len()); }
-        }
-        
-        // Create NetworkMessage for block
-        let block_msg = NetworkMessage::Block {
-            height,
-            data: block_data.clone(),
-            block_type: if height % 90 == 0 { "macro".to_string() } else { "micro".to_string() },
-        };
-        
-        // QUIC mode: Use binary protocol with persistent connections
-        if self.quic_enabled.load(std::sync::atomic::Ordering::Relaxed) {
-            if let Some(ref quic_transport) = self.quic_transport {
-                let transport = quic_transport.read().await;
-                
-                // Filter peers by node type.
-                //
-                // Light nodes are PURE API clients — they do not store
-                // blockchain data and never appear in `connected_peers`
-                // (they sit in the separate `light_node_registry` and
-                // interact only via direct ping/attestation). The two
-                // `NodeType::Light` arms below are therefore defensive
-                // no-ops under the current architecture; kept so the
-                // match stays total and future regressions (e.g., a
-                // stale Light entry leaking into connected_peers) cannot
-                // result in unintended block broadcasts to a device that
-                // has no storage for them.
-                let filtered_peers: Vec<PeerInfo> = validated_peers.iter()
-                    .filter(|peer| {
-                        match (&self.node_type, &peer.node_type) {
-                            (NodeType::Light, _) => false,  // never reached: Light has no P2P broadcast path
-                            (_, NodeType::Light) => false,  // never reached: Light not in connected_peers
-                            _ => true,                       // Super → Super block propagation
-                        }
-                    })
-                    .cloned()
-                    .collect();
-                
-                // CRITICAL: Get our IP to skip self-broadcasts
-                let our_ip = self.external_ip.read().clone();
-                
-                // ═══════════════════════════════════════════════════════════════════════════
-                // CRITICAL FIX v2.93: PARALLEL broadcast to all peers
-                // ═══════════════════════════════════════════════════════════════════════════
-                // SOLUTION: Parallel broadcast with individual timeouts
-                // - All peers receive simultaneously
-                // - One bad peer doesn't block others
-                // - Total time = max(individual times), not sum
-                // ═══════════════════════════════════════════════════════════════════════════
-                
-                // Prepare broadcast targets (filter self and parse addresses)
-                let mut broadcast_targets: Vec<(String, std::net::SocketAddr)> = Vec::new();
-                for peer in &filtered_peers {
-                    if peer.id == self.node_id {
-                        continue;
-                    }
-                    
-                    let parts: Vec<&str> = peer.addr.split(':').collect();
-                    if parts.len() != 2 { continue; }
-                    
-                    if let Some(ref own_ip) = our_ip {
-                        if parts[0] == own_ip {
-                            continue;
-                        }
-                    }
-                    
-                    if let (Ok(ip), Ok(port)) = (parts[0].parse::<std::net::IpAddr>(), parts[1].parse::<u16>()) {
-                        let quic_port = port.saturating_add(QUIC_PORT_OFFSET);
-                        let quic_addr = std::net::SocketAddr::new(ip, quic_port);
-                        broadcast_targets.push((peer.addr.clone(), quic_addr));
-                    }
-                }
-                
-                // Release read lock before spawning tasks
-                drop(transport);
-                
-                // Spawn parallel broadcast tasks
-                let transport_arc = quic_transport.clone();
-                let block_msg_arc = Arc::new(block_msg.clone());
-                
-                let tasks: Vec<_> = broadcast_targets.into_iter()
-                    .map(|(peer_addr, quic_addr)| {
-                        let transport_clone = transport_arc.clone();
-                        let msg_clone = block_msg_arc.clone();
-                        
-                        tokio::spawn(async move {
-                            let start = std::time::Instant::now();
-                            let transport = transport_clone.read().await;
-                            
-                            match transport.broadcast_to(quic_addr, &msg_clone).await {
-                                Ok(_) => crate::p2p_transport::BroadcastResult {
-                                    peer_addr,
-                                    success: true,
-                                    rtt_ms: Some(start.elapsed().as_millis() as u64),
-                                    error: None,
-                                },
-                                Err(e) => crate::p2p_transport::BroadcastResult {
-                                    peer_addr,
-                                    success: false,
-                                    rtt_ms: None,
-                                    error: Some(format!("{}", e)),
-                                },
-                            }
-                        })
-                    })
-                    .collect();
-                
-                // Wait for all broadcasts with global timeout (prevents infinite hang)
-                let results: Vec<crate::p2p_transport::BroadcastResult> = match tokio::time::timeout(
-                    std::time::Duration::from_secs(10),  // 10s global timeout for all broadcasts
-                    join_all(tasks)
-                ).await {
-                    Ok(task_results) => {
-                        task_results.into_iter()
-                            .filter_map(|r| r.ok())
-                            .collect()
-                    }
-                    Err(_) => {
-                        if crate::node::is_warn() {
-                            println!("[WARN][BROADCAST] h={} global_timeout=10s", height);
-                        }
-                        Vec::new()
-                    }
-                };
-                
-                // Count successes
-                let success_count = results.iter().filter(|r| r.success).count();
-                let total = results.len();
-                
-                if height % 10 == 0 || height <= 5 {
-                    if success_count > 0 {
-                        let avg_rtt: u64 = results.iter()
-                            .filter_map(|r| r.rtt_ms)
-                            .sum::<u64>()
-                            .checked_div(success_count as u64)
-                            .unwrap_or(0);
-                        if crate::node::is_info() {
-                            println!("[INFO][QUIC] Block #{} sent to {}/{} peers (avg RTT: {}ms)",
-                                height, success_count, total, avg_rtt);
-                        }
-                    } else if total > 0 {
-                        if crate::node::is_info() {
-                            println!("[WARN][QUIC] Failed to send block #{} to any peer", height);
-                        }
-                    }
-                }
-                
-                // Log failures for debugging
-                for result in results.iter().filter(|r| !r.success) {
-                    if height <= 5 {
-                        if crate::node::is_info() {
-                            println!("[WARN][QUIC] Failed to send block #{} to {}: {:?}",
-                                height, get_privacy_id_for_addr(&result.peer_addr), result.error);
-                        }
-                    }
-                }
-                
-                return Ok(());
-            }
-        }
-        
-        // NO HTTP FALLBACK - QUIC only mode
-        if crate::node::is_info() {
-            println!("[ERR][QUIC] QUIC not initialized - block #{} cannot be sent", height);
-        }
-        if crate::node::is_info() {
-            println!("[INFO][QUIC] ensure init_quic() was called during startup");
-        }
-        Err("QUIC transport not initialized".into())
-    }
     
     /// PRODUCTION v2.19.21: Broadcast Genesis block via QUIC (async)
     /// Genesis is critical and must be delivered reliably to all peers
@@ -11262,18 +10984,41 @@ impl SimplifiedP2P {
         })
     }
 
-    /// Add peer to regional map. Dedup by addr: repeated dial attempts at a never-connecting peer
-    /// (bootstrap retries, arm-ladder dials) must not grow the Vec unboundedly — the establishment
-    /// sweep iterates it in full.
-    fn add_peer_to_region(&self, peer: PeerInfo) {
-        let mut regional_peers = self.regional_peers.lock();
-        let entry = regional_peers
-            .entry(peer.region.clone())
-            .or_insert_with(Vec::new);
+    /// Insert a dial candidate into the regional map. Dedup by addr and cap the region at
+    /// MAX_REGIONAL_PEERS_PER_REGION, evicting the oldest non-genesis candidate — otherwise a
+    /// gossip source grows the Vec without bound and the establishment sweep walks it in full.
+    /// `peer.is_outbound` carries provenance: true only for addresses WE chose to dial.
+    fn push_regional_peer(
+        regional_peers: &Arc<Mutex<HashMap<Region, Vec<PeerInfo>>>>,
+        peer: PeerInfo,
+    ) -> bool {
+        let mut map = regional_peers.lock();
+        let entry = map.entry(peer.region.clone()).or_insert_with(Vec::new);
         if entry.iter().any(|p| p.addr == peer.addr) {
-            return;
+            return false;
+        }
+        if entry.len() >= MAX_REGIONAL_PEERS_PER_REGION {
+            let victim = entry.iter().enumerate()
+                .filter(|(_, p)| !is_genesis_node_ip(p.addr.split(':').next().unwrap_or("")))
+                .min_by_key(|(_, p)| p.last_seen)
+                .map(|(i, _)| i);
+            match victim {
+                Some(i) => { entry.swap_remove(i); }
+                None => {
+                    if crate::node::is_warn() {
+                        println!("[WARN][P2P] regional_candidate_rejected reason=region_full region={} cap={}",
+                                 region_string(&peer.region), MAX_REGIONAL_PEERS_PER_REGION);
+                    }
+                    return false;
+                }
+            }
         }
         entry.push(peer);
+        true
+    }
+
+    fn add_peer_to_region(&self, peer: PeerInfo) {
+        Self::push_regional_peer(&self.regional_peers, peer);
     }
     
     /// STARTUP FIX: Start regional connection establishment asynchronously (non-blocking startup)  
@@ -11291,11 +11036,12 @@ impl SimplifiedP2P {
         
         let regional_peers = self.regional_peers.clone();
         let connected_peers = self.connected_peers_lockfree.clone();
+        let me = self.self_weak();
         let primary_region = self.primary_region.clone();
         let backup_regions = self.backup_regions.clone();
         let node_id = self.node_id.clone();
         let port = self.port;
-        
+
         // EXISTING PATTERN: Use handle.spawn for non-blocking startup
         handle.spawn(async move {
             if crate::node::is_info() {
@@ -11324,8 +11070,7 @@ impl SimplifiedP2P {
                     let is_connected = tokio::task::spawn_blocking(move || {
                         Self::is_peer_actually_connected_static(&addr_clone, ap)
                     }).await.unwrap_or(false);
-                    if is_connected {
-                        connected_peers.insert(peer.addr.clone(), peer.clone());
+                    if is_connected && Self::admit_regional_candidate(&me, peer.clone()) {
                         if crate::node::is_debug() {
                             println!("[DBG][P2P] regional_added peer={}", peer.id);
                         }
@@ -11357,7 +11102,6 @@ impl SimplifiedP2P {
                                             cert_mb: hint_mb,
                                             cert_round: hint_round,
                                             signature: String::new(),
-                                            public_key: String::new(),
                                         };
                                         transport.send_message(quic_addr, &ping).await.is_ok()
                                     } else { false }
@@ -11398,7 +11142,7 @@ impl SimplifiedP2P {
                                 Self::is_peer_actually_connected_static(&addr_clone, ap)
                             }).await.unwrap_or(false);
                             if is_connected {
-                                connected_peers.insert(peer.addr.clone(), peer.clone());
+                                Self::admit_regional_candidate(&me, peer.clone());
                             }
                         }
                     }
@@ -11419,7 +11163,7 @@ impl SimplifiedP2P {
                                     Self::is_peer_actually_connected_static(&addr_clone, cp)
                                 }).await.unwrap_or(false);
                                 if is_connected {
-                                    connected_peers.insert(peer.addr.clone(), peer.clone());
+                                    Self::admit_regional_candidate(&me, peer.clone());
                                 }
                             }
                         }
@@ -11644,20 +11388,25 @@ impl SimplifiedP2P {
             .map(|entry| entry.key().clone())
             .collect();
         
+        // Full removal, not a bare map delete: an orphaned peer_id_to_addr row would make the very
+        // peers this rebalance re-admits below unadmittable, draining the table toward the pinned set.
         for addr in &to_remove {
-            self.connected_peers_lockfree.remove(addr);
+            self.remove_peer_lockfree(addr);
         }
-        
+
         let dropped_count = to_remove.len();
-        
+
         if dropped_count > 0 {
+            // Replacements come from the regional discovery map, i.e. off the wire — they take the
+            // same admission path as any other peer.
             let optimal_peers = self.select_optimal_peers(dropped_count);
+            let mut readmitted = 0usize;
             for peer in optimal_peers {
-                self.connected_peers_lockfree.insert(peer.addr.clone(), peer);
+                if self.add_peer_lockfree(peer) { readmitted = readmitted.saturating_add(1); }
             }
-            
+
             if crate::node::is_info() {
-                println!("[INFO][P2P] Rebalancing complete: dropped {}, reconnected to optimal peers", dropped_count);
+                println!("[INFO][P2P] rebalance_complete dropped={} readmitted={}", dropped_count, readmitted);
             }
             true
         } else {
@@ -11819,7 +11568,7 @@ impl SimplifiedP2P {
     /// Returns true if message should be DROPPED (rate exceeded).
     ///
     /// v18 USAGE NOTE: signature-verified consensus messages (TimeoutVote,
-    /// ConsensusCommit/Reveal, ProducerHeartbeat, ProducerReady, ReadyAck,
+    /// ProducerHeartbeat, ProducerReady, ReadyAck,
     /// BlockRejection, VrfLeaderClaim, BlockAttestation, EmptySlotAttestation,
     /// VrfKeyAnnounce) NO LONGER consult this helper — those handlers verify
     /// the Dilithium3 signature against the consensus PK registry as the
@@ -11895,6 +11644,7 @@ impl SimplifiedP2P {
         let is_running = self.is_running.clone();
         
         handle.spawn(async move {
+            crate::boot_contract::started(crate::boot_contract::names::REGIONAL_CLUSTERING);
             if crate::node::is_info() {
                 println!("[INFO][P2P] Starting regional clustering for region: {:?}", region);
             }
@@ -12271,12 +12021,11 @@ pub enum NetworkMessage {
         cert_mb: u64,
         #[serde(default)]
         cert_round: u64,
-        /// Dilithium3 detached signature (hex-encoded), empty = unsigned (backward compat)
+        /// ML-DSA-65 detached signature (hex), empty = unsigned. The verifying key is NEVER carried
+        /// here — it is resolved from CONSENSUS_PK_REGISTRY by `from`, so a wire key would be both
+        /// 3904 hex chars of dead weight per ping and an identity-squat invitation.
         #[serde(default)]
         signature: String,
-        /// Signer's Dilithium3 public key (hex-encoded), empty = unsigned
-        #[serde(default)]
-        public_key: String,
     },
 
     /// v16.2: OBSERVER-BASED BLOCK REJECTION — supermajority fork detection.
@@ -12448,25 +12197,6 @@ pub enum NetworkMessage {
         ipfs_cid: String,
         sender_id: String,
     },
-
-    /// Consensus commit message
-    ConsensusCommit {
-        round_id: u64,
-        node_id: String,
-        commit_hash: String,
-        signature: String,  // CONSENSUS FIX: Add signature field for Byzantine consensus validation
-        timestamp: u64,
-    },
-
-    /// Consensus reveal message
-    ConsensusReveal {
-        round_id: u64,
-        node_id: String,
-        reveal_data: String,
-        nonce: String,  // CRITICAL: Include nonce for reveal verification
-        timestamp: u64,
-        signature: String,  // v2.48: Dilithium signature for Byzantine safety
-    },
     
     /// BFT Timeout Vote v2 — certificate-anchored failover. Signed payload = timeout_vote_message
     /// (domain "QNET_TIMEOUT_V2"): (window, round, sealed anchor) + the voter's OWN high_qc/tip.
@@ -12516,11 +12246,11 @@ pub enum NetworkMessage {
 
     // v14.7.2: per-microblock BlockCommitVote / BlockCommitCertificate
     // message variants REMOVED. Microblock BFT safety is delivered by the
-    // canonical macroblock commit/reveal path (ConsensusCommit / Reveal);
     // per-block vote streams duplicated that layer and created a rate-limit
     // collision that starved the real consensus.
 
-    /// v4.3: VRF Leader Claim — secret leader election with gossip relay
+    /// v4.3: VRF Leader Claim — slot proof with gossip relay. The schedule is a public
+    /// deterministic hash of on-chain inputs; the claim only proves who holds the slot.
     /// Each elected node broadcasts its VRF proof at rotation boundary
     /// All nodes verify, store, and RELAY to peers (TTL-limited gossip)
     /// vrf_public_key included so claims are self-verifiable without prior key exchange
@@ -12563,28 +12293,6 @@ pub enum NetworkMessage {
     /// ShredProtocol chunk for efficient block propagation
     ShredProtocolChunk {
         chunk: ShredProtocolChunk,
-    },
-    
-    /// DEPRECATED: ReputationSync removed for security
-    /// ═══════════════════════════════════════════════════════════════════════════
-    /// WHY REMOVED:
-    /// 1. Sybil Attack: Fake nodes can inflate/deflate reputation
-    /// 2. Ephemeral Key Forgery: Signatures don't prove identity
-    /// 3. Non-deterministic: Different nodes have different state
-    /// 4. Jail Manipulation: Any node can ban any other node
-    /// 
-    /// NEW ARCHITECTURE:
-    /// - Reputation computed ONLY from blockchain (deterministic_reputation.rs)
-    /// - Slashing events recorded in MacroBlocks with cryptographic proof
-    /// - Jail is automatic when missing N consecutive assigned blocks
-    /// ═══════════════════════════════════════════════════════════════════════════
-    #[deprecated(note = "Use DeterministicReputationState from blockchain data")]
-    ReputationSyncDeprecated {
-        node_id: String,
-        reputation_updates: Vec<(String, f64)>,
-        jail_updates: Vec<(String, u64, u32, String)>,
-        timestamp: u64,
-        signature: Vec<u8>,
     },
     
     /// Request blocks for sync
@@ -13005,8 +12713,6 @@ impl SimplifiedP2P {
                 // Consensus v2 (Checkpoint-BFT): route raw bytes to the v2 runtime task.
                 crate::consensus_v2_node::route_inbound(data);
             }
-            // Legacy commit/reveal (pre-v2) — ignored: macroblock consensus is Checkpoint-BFT only.
-            NetworkMessage::ConsensusCommit { .. } | NetworkMessage::ConsensusReveal { .. } => {}
             NetworkMessage::Block { height, data, block_type } => {
                 // Liveness only: the relayed block height is an availability fact, not the peer tip.
                 self.update_peer_last_seen(from_peer);
@@ -13098,16 +12804,10 @@ impl SimplifiedP2P {
                                 }
                             }
 
-                            // No re-gossip here, deliberately. This lane has NO honest originator:
-                            // producers propagate via ShredProtocol, sync/repair via BlocksBatch, and
-                            // the only builders of NetworkMessage::Block are the genesis broadcast
-                            // (height 0, which the old `height > 5` guard skipped anyway) and
-                            // broadcast_block — reachable solely from broadcast_emergency_finalization
-                            // and broadcast_critical_alert, both of which have zero callers. So the
-                            // forward existed only for attacker-injected traffic, and it ran BEFORE any
-                            // validation, with fanout 2, no TTL, no seen-set and no sender exclusion:
-                            // N injected copies multiplied across the mesh. Ingest below still accepts
-                            // the block; only the amplifier is gone.
+                            // No re-gossip here, deliberately. This lane has no honest originator:
+                            // producers propagate via ShredProtocol and sync/repair via BlocksBatch, so
+                            // forwarding would only amplify attacker-injected traffic. Ingest below
+                            // still accepts the block.
                         }
                         Err(e) => {
                             // v3.0: Clear pending on error so block can be retried
@@ -13278,14 +12978,41 @@ impl SimplifiedP2P {
             }
             
             NetworkMessage::PeerDiscovery { requesting_node } => {
+                // Same admission funnel as PeerListResponse: the identity bound to an address comes
+                // from the pinned genesis table or the chain-committed endpoint, never from the wire,
+                // and every wire-supplied id/region/score/height is discarded. The entry is a dial
+                // CANDIDATE only — it still faces the full inbound gate when the sweep admits it.
+                let ip = requesting_node.addr.split(':').next().unwrap_or("");
+                let bound_id = match Self::gossip_bound_identity(&requesting_node.id, ip) {
+                    Some(id) => id,
+                    None => {
+                        if crate::node::is_warn() {
+                            println!("[WARN][P2P] peer_admission_rejected reason=unbound_identity via=peer_discovery peer={} relay={}",
+                                     get_privacy_id_for_addr(ip), get_privacy_id_for_addr(from_peer));
+                        }
+                        return;
+                    }
+                };
+                if bound_id == self.node_id { return; }
+                let mut peer_info = match Self::parse_peer_address_static(&requesting_node.addr) {
+                    Ok(pi) => pi,
+                    Err(_) => return,
+                };
+                peer_info.id = bound_id;
+                peer_info.reputation = self.get_node_reputation_from_blockchain(&peer_info.id);
+                peer_info.consensus_score = peer_info.reputation;
+                peer_info.last_block_height = 0;
+                peer_info.last_height_attested_at = 0;
+                // Learned from gossip, never chosen by us ⇒ consumes an inbound slot.
+                peer_info.is_outbound = false;
                 if crate::node::is_info() {
-                    println!("[INFO][P2P] Peer discovery from {} in {:?}", 
-                             requesting_node.id, requesting_node.region);
+                    println!("[INFO][P2P] peer_discovery id={} region={}",
+                             peer_info.id, region_string(&peer_info.region));
                 }
-                self.add_peer_to_region(requesting_node);
+                Self::push_regional_peer(&self.regional_peers, peer_info);
             }
             
-            NetworkMessage::HealthPing { from, timestamp, height, cert_mb, cert_round, signature, public_key } => {
+            NetworkMessage::HealthPing { from, timestamp, height, cert_mb, cert_round, signature } => {
                 // SyncInfo FIRST (pull-only, cooldown-gated — cannot poison state or the dedup floor).
                 self.process_tc_claim(cert_mb, cert_round);
                 // Dedup BEFORE verify+rate-limit. The serve-envelope co-sends the cached head on every
@@ -13315,11 +13042,8 @@ impl SimplifiedP2P {
                     .as_secs();
                 let age_secs = if now_ts >= timestamp { now_ts - timestamp } else { timestamp - now_ts };
 
-                let sig_verified = if !signature.is_empty() && !public_key.is_empty() {
-                    Self::verify_health_ping_signature(&from, timestamp, height, &signature, &public_key)
-                } else {
-                    false
-                };
+                let sig_verified = !signature.is_empty()
+                    && Self::verify_health_ping_signature(&from, timestamp, height, &signature);
 
                 if sig_verified {
                     // Authenticated head = the tip oracle (never a served-block height). Advance the dedup
@@ -13337,7 +13061,7 @@ impl SimplifiedP2P {
                         self.relay_signed_head(NetworkMessage::HealthPing {
                             from: from.clone(), timestamp, height,
                             cert_mb: hint_mb, cert_round: hint_round,
-                            signature: signature.clone(), public_key: public_key.clone(),
+                            signature: signature.clone(),
                         }, &from, from_peer, 6);
                     }
                     if crate::node::is_debug() && height % 100 == 0 {
@@ -14258,27 +13982,6 @@ impl SimplifiedP2P {
                 // IGNORED: No action taken - use BFT Timeout Protocol for failover
             }
             
-            #[allow(deprecated)]
-            #[allow(deprecated)]
-            NetworkMessage::ReputationSyncDeprecated { node_id, reputation_updates: _, jail_updates: _, timestamp: _, signature: _ } => {
-                // ═══════════════════════════════════════════════════════════════
-                // DEPRECATED: ReputationSync disabled for security
-                // 
-                // VULNERABILITIES:
-                // 1. Sybil Attack: Fake nodes can manipulate reputation
-                // 2. Ephemeral Key Forgery: Signatures don't prove identity
-                // 3. Jail Manipulation: Any node can ban others
-                //
-                // NEW ARCHITECTURE:
-                // - Reputation computed ONLY from blockchain data
-                // - Slashing requires cryptographic proof in MacroBlock
-                // - Jail is automatic when missing N consecutive blocks
-                // ═══════════════════════════════════════════════════════════════
-                if crate::node::is_info() {
-                    println!("[WARN][REP] IGNORED ReputationSync from {} - use blockchain-based reputation",
-                             if node_id.starts_with("genesis_node_") { node_id.clone() } else { get_privacy_id_for_addr(&node_id) });
-                }
-            }
 
             // v4.6: VRF Key Announcement — register peer's VRF public key
             NetworkMessage::VrfKeyAnnounce { node_id, vrf_public_key, self_signature, timestamp: _ } => {
@@ -14375,65 +14078,81 @@ impl SimplifiedP2P {
                 if crate::node::is_info() {
                     println!("[INFO][P2P] PeerListResponse from {}: {} peers via QUIC", sender_id, peers.len());
                 }
-                // ═══════════════════════════════════════════════════════════════════
-                // v14.1: DEDUP BY node_id — prevent peer list inflation
-                // ═══════════════════════════════════════════════════════════════════
-                // Previously we only checked `addr`. A single peer advertising multiple
-                // endpoints (HTTP :8001, QUIC-main :9876, QUIC-alt :9877) would be
-                // inserted 3 times under 3 different addresses but same node_id.
-                // This inflated connected_peers_lockfree.len() by 3× and broke BFT
-                // threshold calculation (13 phantom validators for 5 real nodes).
-                //
-                // Now: for any incoming peer, if node_id is already mapped to some
-                // address via peer_id_to_addr, we UPDATE last_seen on the existing
-                // entry rather than inserting a duplicate. This preserves connection
-                // diversity (multiple transports) without inflating the validator
-                // count — the latest-seen transport wins.
-                // ═══════════════════════════════════════════════════════════════════
-                for (addr, peer_id, _gossiped_height) in &peers {
-                    if peer_id != &self.node_id && !addr.is_empty() && !peer_id.is_empty() {
-                        // v30.A3: PeerListResponse is relayed gossip from a peer
-                        // about OTHER peers' state. The gossiped `height` field
-                        // is NOT authenticated against the claimed peer's
-                        // identity key, so it must NEVER drive `last_block_height`.
-                        // Identity-bound height attestation flows only through
-                        // signed HealthPings, applied blocks, and certified
-                        // shreds. Liveness (`last_seen`) is refreshed because
-                        // the relay itself is an authenticated peer.
-                        if let Some(existing_addr_entry) = self.peer_id_to_addr.get(peer_id) {
-                            let existing_addr = existing_addr_entry.value().clone();
-                            drop(existing_addr_entry);
-                            if let Some(mut entry) = self.connected_peers_lockfree.get_mut(&existing_addr) {
-                                let now = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_secs();
-                                entry.last_seen = now;
-                            }
-                            if crate::node::is_debug() {
-                                println!("[DBG][P2P] peer_dedup id={} existing_addr={} gossiped_addr={} — refreshed",
-                                         peer_id, existing_addr, addr);
-                            }
+                // Gossiped peers go through the SAME admission path as dialed/handshaked ones:
+                // global cap, outbound-slot reserve, reputation floor and subnet-diversity caps.
+                // The identity bound to an address comes from the pinned genesis table or from the
+                // chain-committed endpoint, never from the relay's claim, and only a bounded number
+                // of new peers is taken from any single response.
+                let mut admitted = 0usize;
+                let mut unbound = 0usize;
+                // Scan cap, not just an admit cap: the work this message costs must not scale with
+                // what the relay chose to put in it. One aggregate log line, not one per entry.
+                for (addr, peer_id, _gossiped_height) in peers.iter().take(MAX_GOSSIP_PEERS_SCANNED) {
+                    if peer_id == &self.node_id || addr.is_empty() || peer_id.is_empty() {
+                        continue;
+                    }
+                    let ip = addr.split(':').next().unwrap_or("");
+                    // Genesis nodes bootstrap against the pinned set only.
+                    if std::env::var("QNET_BOOTSTRAP_ID").is_ok() && !is_genesis_node_ip(ip) {
+                        continue;
+                    }
+                    let bound_id = match Self::gossip_bound_identity(peer_id, ip) {
+                        Some(id) => id,
+                        None => {
+                            unbound += 1;
                             continue;
                         }
-                        if let Ok(mut peer_info) = Self::parse_peer_address_static(addr) {
-                            peer_info.id = peer_id.clone();
-                            // v30.A3: leave last_block_height at 0; new peer's
-                            // height is established by its own signed signal,
-                            // not by the gossip relay's claim.
-                            // New node_id — insert (address uniqueness preserved by DashMap)
-                            if !self.connected_peers_lockfree.contains_key(addr) {
-                                let ip = addr.split(':').next().unwrap_or("");
-                                if is_genesis_node_ip(ip) || !std::env::var("QNET_BOOTSTRAP_ID").is_ok() {
-                                    self.connected_peers_lockfree.insert(addr.clone(), peer_info.clone());
-                                    self.peer_id_to_addr.insert(peer_id.clone(), addr.clone());
-                                    if crate::node::is_info() {
-                                        println!("[INFO][P2P] peer_added id={} addr={} via=gossip", peer_id, addr);
-                                    }
-                                }
-                            }
+                    };
+                    // Known identity: refresh liveness only. The gossiped height is NOT
+                    // authenticated against that identity's key, so it never drives
+                    // last_block_height - only signed HealthPings and applied blocks do.
+                    if let Some(existing_addr_entry) = self.peer_id_to_addr.get(&bound_id) {
+                        let existing_addr = existing_addr_entry.value().clone();
+                        drop(existing_addr_entry);
+                        if let Some(mut entry) = self.connected_peers_lockfree.get_mut(&existing_addr) {
+                            entry.last_seen = self.current_timestamp();
                         }
+                        continue;
                     }
+                    if self.connected_peers_lockfree.contains_key(addr) {
+                        continue;
+                    }
+                    if admitted >= MAX_GOSSIP_ADMITS_PER_RESPONSE {
+                        if crate::node::is_warn() {
+                            println!("[WARN][P2P] peer_admission_rejected reason=gossip_batch_cap relay={} cap={} offered={}",
+                                     sender_id, MAX_GOSSIP_ADMITS_PER_RESPONSE, peers.len());
+                        }
+                        break;
+                    }
+                    let mut peer_info = match Self::parse_peer_address_static(addr) {
+                        Ok(pi) => pi,
+                        Err(_) => continue,
+                    };
+                    peer_info.id = bound_id;
+                    // The parser fills a placeholder INITIAL_REPUTATION, which can never fall below
+                    // the inbound floor — resolve the committed score so a zeroed node is refused
+                    // here exactly as it is when it connects directly.
+                    peer_info.reputation = self.get_node_reputation_from_blockchain(&peer_info.id);
+                    peer_info.consensus_score = peer_info.reputation;
+                    peer_info.last_block_height = 0;
+                    peer_info.last_height_attested_at = 0;
+                    // We did not dial this peer, so it consumes an inbound slot and is
+                    // subject to every inbound gate.
+                    peer_info.is_outbound = false;
+                    if self.add_peer_lockfree(peer_info) {
+                        admitted += 1;
+                    }
+                }
+                if admitted > 0 {
+                    self.invalidate_peer_cache();
+                    if crate::node::is_info() {
+                        println!("[INFO][P2P] gossip_peers_admitted relay={} admitted={} offered={}",
+                                 sender_id, admitted, peers.len());
+                    }
+                }
+                if unbound > 0 && crate::node::is_warn() {
+                    println!("[WARN][P2P] peer_admission_rejected reason=unbound_identity via=gossip relay={} count={} scanned={}",
+                             sender_id, unbound, peers.len().min(MAX_GOSSIP_PEERS_SCANNED));
                 }
             }
 
@@ -14749,7 +14468,6 @@ impl SimplifiedP2P {
                         // Report as critical attack for instant ban (1 year)
                         let _ = self.report_critical_attack(
                             &node_id,
-                            MaliciousBehavior::ProtocolViolation,  // Certificate spoofing is a protocol violation
                             0, // block_height not relevant for cert attacks
                             &format!("CERTIFICATE_SPOOFING: Attempted to spoof certificate for node: {}", cert.node_id)
                         );
@@ -14850,7 +14568,6 @@ impl SimplifiedP2P {
                 let certificate_clone = certificate.clone();
                 let cert_manager_clone = self.certificate_manager.clone();
                 let node_id_clone = node_id.clone();
-                let reputation_system_clone = self.reputation_system.clone();
                 
                 handle.spawn(async move {
                     // Recreate cert preimage for verification (P8 re-root: node_id || issued_at)
@@ -14933,9 +14650,6 @@ impl SimplifiedP2P {
                             if crate::node::is_info() {
                                 println!("[INFO][CERT] removed serial={} reason=invalid", cert_serial_clone);
                             }
-                            
-                            // Apply reputation penalty
-                            reputation_system_clone.lock().update_reputation(&node_id_clone, -10.0);
                         }
                         Err(e) => {
                             if crate::node::is_warn() {
@@ -15575,28 +15289,17 @@ impl SimplifiedP2P {
                     return;
                 }
                 
-                // SECURITY FIX: Use REAL reputation from blockchain (v2.21.5)
-                // Don't trust the reputation value in the announcement - it could be faked!
+                // The announced score is attacker-chosen; only the committed one counts. Consensus
+                // reputation is binary {INITIAL_REPUTATION | 0 tombstoned} and an unknown node reads
+                // the floor, so 0 means BANNED here — never "new node, give it the default".
                 let real_reputation = self.get_node_reputation_from_blockchain(&node_id);
                 use qnet_consensus::deterministic_reputation::INITIAL_REPUTATION;
-                
-                // REPUTATION FILTER: Only track nodes with rep >= INITIAL_REPUTATION
-                // Use REAL reputation, not the claimed one from announcement
                 if real_reputation < INITIAL_REPUTATION {
-                    // If we don't know this node yet, give them benefit of doubt with INITIAL_REPUTATION
-                    // New nodes start at INITIAL_REPUTATION, so this is fair
-                    if real_reputation == 0.0 {
-                        // Unknown node - accept with default reputation
-                        if crate::node::is_info() {
-                            println!("[INFO][ACTIVE] new_node node={} default_rep={:.1}", node_id, INITIAL_REPUTATION);
-                        }
-                    } else {
-                        if crate::node::is_warn() {
-                            println!("[WARN][ACTIVE] reject_low_rep node={} real={:.1} claimed={:.1}", 
-                                     node_id, real_reputation, reputation);
-                        }
-                        return;
+                    if crate::node::is_warn() {
+                        println!("[WARN][ACTIVE] reject_low_rep node={} real={:.1} claimed={:.1}",
+                                 node_id, real_reputation, reputation);
                     }
+                    return;
                 }
                 
                 // Inflation check removed: reputation is synced via blocks
@@ -15616,13 +15319,9 @@ impl SimplifiedP2P {
                     }
                 }
                 
-                // v2.45.1: Use real blockchain reputation, fallback to INITIAL_REPUTATION
-                let effective_reputation = if real_reputation > 0.0 { 
-                    real_reputation 
-                } else { 
-                    qnet_consensus::deterministic_reputation::INITIAL_REPUTATION 
-                };
-                
+                // Committed score only — the filter above already refused anything below the floor.
+                let effective_reputation = real_reputation;
+
                 // Update active nodes map (v2.51: lock-free)
                 let should_update = self.active_full_super_nodes.get(&node_id)
                     .map(|e| e.last_seen < timestamp)
@@ -17367,6 +17066,43 @@ impl SimplifiedP2P {
         }
     }
     
+    /// Rehydrate the node_id -> endpoint IP registry from the committed node_registry CF.
+    /// The RAM map is written only by the block-apply registration scan, so after a restart it
+    /// is empty and every IP-identity gate that consults it falls through to "unbound, allow" —
+    /// the pre-verify cutoff that refuses an impostor before the ML-DSA verify is then off for
+    /// the whole post-restart window. Genesis addresses come from the pinned binary table, so a
+    /// persisted row must never restate one.
+    fn restore_node_endpoints(&self) {
+        let storage = match self.storage.as_deref()
+            .or_else(|| crate::node::try_get_storage().map(|s| s.as_ref()))
+        {
+            Some(s) => s,
+            None => return,
+        };
+
+        let endpoints = match storage.load_all_node_endpoints() {
+            Ok(e) => e,
+            Err(e) => {
+                if crate::node::is_warn() {
+                    println!("[WARN][REG] node_endpoints_restore_failed err={}", e);
+                }
+                return;
+            }
+        };
+
+        let mut restored = 0usize;
+        for (node_id, endpoint) in &endpoints {
+            if node_id.starts_with("genesis_node_") { continue; }
+            if crate::genesis_constants::get_node_endpoint_ip(node_id).is_some() { continue; }
+            crate::genesis_constants::register_node_endpoint(node_id, endpoint);
+            restored = restored.saturating_add(1);
+        }
+
+        if crate::node::is_info() {
+            println!("[INFO][REG] node_endpoints_restored count={} scanned={}", restored, endpoints.len());
+        }
+    }
+
     /// v4.3: Restore light node registry from blockchain storage (RocksDB) on startup.
     /// Populates the in-memory P2P registry from persisted NodeRegistration data.
     /// Called once during node initialization so registry survives restarts.
@@ -17376,7 +17112,7 @@ impl SimplifiedP2P {
     pub fn restore_light_nodes_from_storage(&self, nodes: Vec<(String, String, String, u64)>) -> usize {
         let mut added = 0;
         let mut registry = self.light_node_registry.write();
-        
+
         for (node_id, wallet_address, _node_type, registered_at) in nodes {
             if !registry.contains_key(&node_id) {
                 // B: liveness is derived from on-chain attestation recency, not a persisted flag — seed
@@ -18232,7 +17968,7 @@ impl SimplifiedP2P {
         let ts = self.current_timestamp();
         let payload = format!("QNET_HEALTH_PING_V1:{}:{}:{}", self.node_id, ts, height);
         if let Ok(sig) = identity.sign(payload.as_bytes()) {
-            *LATEST_SIGNED_HEAD.write() = Some((self.node_id.clone(), ts, height, hex::encode(&sig), hex::encode(&identity.dilithium_pk)));
+            *LATEST_SIGNED_HEAD.write() = Some((self.node_id.clone(), ts, height, hex::encode(&sig)));
         }
     }
 
@@ -19414,10 +19150,14 @@ impl SimplifiedP2P {
     // END MACROBLOCK SYNC METHODS
     // =========================================================================
     
-    /// Handle sync status update from peer
+    /// Handle sync status update from peer. Refreshes liveness only — the peer table is keyed by
+    /// address, so the id must be resolved through the admission-owned index first.
     pub fn handle_sync_status(&self, node_id: String, _current_height: u64, _target_height: u64, _syncing: bool) {
-        // v2.51: Lock-free sync status update
-        if let Some(mut peer) = self.connected_peers_lockfree.get_mut(&node_id) {
+        let addr = match self.peer_id_to_addr.get(&node_id) {
+            Some(e) => e.value().clone(),
+            None => return,
+        };
+        if let Some(mut peer) = self.connected_peers_lockfree.get_mut(&addr) {
             peer.last_seen = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -20412,8 +20152,6 @@ impl SimplifiedP2P {
             }
         };
         
-        let connected_peers = self.connected_peers_lockfree.clone();
-        let node_id = self.node_id.clone();
         let _node_type = self.node_type.clone();
         let _region = self.region.clone();
         let _port = self.port;
@@ -20460,107 +20198,13 @@ impl SimplifiedP2P {
                         max_exchange_peers, initial_peers.len(),
                         if force_refresh { " (forced)" } else { "" });
             }
-            
-            // Request peer lists from limited set of connected nodes
+            // Fire-and-forget: the reply arrives asynchronously as a PeerListResponse and is
+            // admitted there through the normal add_peer_lockfree gates.
             for peer in initial_peers.iter().take(max_exchange_peers) {
-                if let Ok(new_peers) = Self::request_peer_list_from_node(&peer.addr).await {
-                    if crate::node::is_info() {
-                        println!("[INFO][P2P] Received {} new peers from {}", new_peers.len(), get_privacy_id_for_addr(&peer.addr));
-                    }
-                    
-                    // CRITICAL FIX v2.21.3: Validate peers before adding - NO PHANTOM PEERS!
-                    if !new_peers.is_empty() {
-                        let mut added_count = 0;
-                        let mut validated_count = 0;
-                        
-                        // Get allowed Genesis IPs for validation
-                        let genesis_ips: Vec<String> = get_genesis_bootstrap_ips()
-                            .iter()
-                            .map(|s| s.to_string())
-                            .collect();
-                        
-                        for mut new_peer in new_peers {
-                            // CRITICAL v2.21.3: Genesis nodes ONLY accept genesis_node_* peers
-                            if is_genesis_node {
-                                // Check if peer ID is a valid Genesis node
-                                if !new_peer.id.starts_with("genesis_node_") {
-                                    continue; // Silent reject for Genesis mode
-                                }
-                                
-                                // Check if peer IP is in allowed Genesis IPs
-                                let peer_ip = new_peer.addr.split(':').next().unwrap_or("");
-                                if !genesis_ips.iter().any(|ip| ip == peer_ip) {
-                                    continue; // Silent reject - IP not in Genesis list
-                                }
-                            } else {
-                                // CRITICAL v2.21.3: Regular nodes - validate peer is reachable
-                                // Quick connectivity check before adding (prevents phantom peers)
-                                let peer_ip = new_peer.addr.split(':').next().unwrap_or("");
-                                let check_url = format!("http://{}:8001/health", peer_ip);
-                                
-                                let is_reachable = match reqwest::Client::builder()
-                                    .timeout(std::time::Duration::from_secs(2))
-                                    .build()
-                                {
-                                    Ok(client) => {
-                                        match client.get(&check_url).send().await {
-                                            Ok(resp) => resp.status().is_success(),
-                                            Err(_) => false,
-                                        }
-                                    }
-                                    Err(_) => false,
-                                };
-                                
-                                if !is_reachable {
-                                    // Peer not responding - don't add phantom
-                                    continue;
-                                }
-                                validated_count += 1;
-                            }
-                            
-                            // v2.51: Lock-free duplicate check
-                            if !connected_peers.contains_key(&new_peer.addr) {
-                                // EXISTING: Calculate Kademlia fields (from add_peer_safe)
-                                if new_peer.node_id_hash.is_empty() {
-                                    let mut hasher = Sha3_256::new();
-                                    hasher.update(new_peer.id.as_bytes());
-                                    new_peer.node_id_hash = hasher.finalize().to_vec();
-                                }
-                                // Calculate bucket index using node_id
-                                new_peer.bucket_index = {
-                                    let mut hasher = Sha3_256::new();
-                                    hasher.update(node_id.as_bytes());
-                                    hasher.update(&new_peer.node_id_hash);
-                                    let hash = hasher.finalize();
-                                    (hash[0] as usize) % 256
-                                };
-                                
-                                // v2.51: Direct lock-free insertion
-                                if !connected_peers.contains_key(&new_peer.addr) && new_peer.id != node_id {
-                                    connected_peers.insert(new_peer.addr.clone(), new_peer.clone());
-                                    added_count += 1;
-                                    if crate::node::is_debug() {
-                                        println!("[DBG][P2P] exchange_added peer={}", get_privacy_id_for_addr(&new_peer.addr));
-                                    }
-                                }
-                            }
-                        }
-                        
-                        if crate::node::is_info() {
-                            println!("[INFO][P2P] peer_exchange_complete added={}", added_count);
-                        }
-                        
-                        let _ = validated_count; // tracked but not aggregated further
-                        // CACHE FIX v2.57: Invalidate CacheActor after adding peers through exchange
-                        if added_count > 0 {
-                            // Invalidate actor-based cache (primary)
-                            let new_epoch = CACHE_ACTOR.increment_epoch();
-                            *CACHE_ACTOR.peers_cache.write() = None;
-
-                            if crate::node::is_info() {
-                                println!("[INFO][P2P] peer_cache_invalidated after_exchange added={} epoch={}", added_count, new_epoch);
-                            }
-                        }
+                if let Err(e) = Self::request_peer_list_from_node(&peer.addr).await {
+                    if crate::node::is_debug() {
+                        println!("[DBG][P2P] peer_list_request_failed peer={} err={}",
+                                 get_privacy_id_for_addr(&peer.addr), e);
                     }
                 }
             }
@@ -20572,37 +20216,20 @@ impl SimplifiedP2P {
         });
     }
     
-    /// Request peer list from a connected node for decentralized discovery
-    /// v33: QUIC-only (HTTP fallback removed) — UDP transport bypasses TCP blocks.
-    async fn request_peer_list_from_node(node_addr: &str) -> Result<Vec<PeerInfo>, String> {
-
+    /// Ask a peer for its peer list. QUIC-only: the reply arrives asynchronously as a
+    /// PeerListResponse, so this returns once the request is on the wire.
+    async fn request_peer_list_from_node(node_addr: &str) -> Result<(), String> {
         let ip = node_addr.split(':').next().unwrap_or(node_addr);
 
-        if crate::node::is_info() {
-            println!("[INFO][P2P] Requesting peer list from {}", get_privacy_id_for_addr(ip));
+        if crate::node::is_debug() {
+            println!("[DBG][P2P] peer_list_requested peer={}", get_privacy_id_for_addr(ip));
         }
 
-        // === Phase 1: Try QUIC (UDP) — bypasses TCP firewall blocks ===
-        let quic_result = Self::request_peer_list_via_quic(ip).await;
-        if let Ok(ref peers) = quic_result {
-            if !peers.is_empty() {
-                if crate::node::is_info() {
-                    println!("[INFO][P2P] Got {} peers from {} via QUIC", peers.len(), get_privacy_id_for_addr(ip));
-                }
-                return quic_result;
-            }
-        }
-
-        // === v33: QUIC-only (top-L1) — HTTP peer-list fallback removed. ===
-        // The QUIC peer exchange above is the sole inter-node discovery path; an
-        // empty/failed result self-heals on the next exchange cycle (and genesis
-        // nodes hold the bootstrap set), so discovery never depends on a single
-        // round. Removes the inter-VPS http_fallback_failed churn entirely.
-        quic_result
+        Self::request_peer_list_via_quic(ip).await
     }
 
-    /// v2.95: Request peer list via QUIC transport (UDP-based, firewall-friendly)
-    async fn request_peer_list_via_quic(ip: &str) -> Result<Vec<PeerInfo>, String> {
+    /// Send a PeerListRequest over QUIC (UDP, bypasses TCP firewall blocks).
+    async fn request_peer_list_via_quic(ip: &str) -> Result<(), String> {
         use crate::quic_transport::QUIC_PORT_OFFSET;
         use std::net::SocketAddr;
 
@@ -20626,32 +20253,31 @@ impl SimplifiedP2P {
 
         let transport = transport_arc.read().await;
         transport.send_message(quic_addr, &request).await
-            .map_err(|e| format!("QUIC send: {}", e))?;
-
-        // PeerListResponse will arrive asynchronously via message handler
-        // and peers will be added to connected_peers_lockfree directly.
-        // Return empty OK to indicate QUIC request was sent successfully.
-        Ok(Vec::new())
+            .map_err(|e| format!("QUIC send: {}", e))
     }
     
-    /// PRODUCTION: Get shared reputation system for consensus integration
-    #[deprecated(note = "Use get_node_reputation_from_blockchain() instead")]
-    pub fn get_reputation_system(&self) -> Arc<Mutex<NodeReputation>> {
-        self.reputation_system.clone()
-    }
     
-    /// ═══════════════════════════════════════════════════════════════════════
-    /// BLOCKCHAIN-BASED REPUTATION (v2.21.5) - Replaces old NodeReputation!
-    /// ═══════════════════════════════════════════════════════════════════════
-    
-    /// Get node reputation from blockchain (DeterministicReputationState)
-    /// Returns 0-100 range (same as old system for compatibility)
-    pub fn get_node_reputation_from_blockchain(&self, _node_id: &str) -> f64 {
-        // RAM reputation engine removed. The P2P layer no longer holds a per-node
-        // reputation view; consensus eligibility is decided by the deterministic chain
-        // fold ({70 floor | 0 if tombstoned}) + the macroblock eligible_producers snapshot.
-        // This helper returns the floor for connectivity/telemetry callers.
-        qnet_consensus::deterministic_reputation::INITIAL_REPUTATION
+    /// Node reputation from the chain fold, 0-100: {INITIAL_REPUTATION floor | 0 if tombstoned}.
+    /// The tombstone lives in `Account.banned_at_height`, written by the equivocation-proof apply.
+    /// Returning a constant floor here made every reputation gate structurally unreachable — the
+    /// inbound admission floor compared 70.0 < 50.0 and could never refuse a banned node.
+    pub fn get_node_reputation_from_blockchain(&self, node_id: &str) -> f64 {
+        use qnet_consensus::deterministic_reputation::INITIAL_REPUTATION;
+        if node_id.is_empty() { return INITIAL_REPUTATION; }
+        // Applied state is the source of truth (it is what state_root is computed from); the
+        // accounts CF is its async best-effort mirror and only answers for an evicted account.
+        // O(1) either way, and never blocks the caller: a contended lock falls through to disk.
+        if let Some(state) = crate::node::try_get_state() {
+            if let Ok(guard) = state.try_read() {
+                if let Some(acct) = guard.accounts.get(node_id) {
+                    return if acct.value().banned_at_height > 0 { 0.0 } else { INITIAL_REPUTATION };
+                }
+            }
+        }
+        match crate::node::try_get_storage().and_then(|s| s.load_account(node_id).ok().flatten()) {
+            Some(acct) if acct.banned_at_height > 0 => 0.0,
+            _ => INITIAL_REPUTATION,
+        }
     }
     
     /// Check if node can participate in consensus (reputation >= MIN_CONSENSUS_REPUTATION)
@@ -22050,9 +21676,9 @@ impl SimplifiedP2P {
     /// advances past its own frontier and it keeps syncing instead of falsely flipping synced.
     pub fn cosend_signed_head(&self, addr: &str) {
         let head = LATEST_SIGNED_HEAD.read().clone();
-        if let Some((from, timestamp, height, signature, public_key)) = head {
+        if let Some((from, timestamp, height, signature)) = head {
             let (cert_mb, cert_round) = current_tc_hint();
-            self.send_network_message(addr, NetworkMessage::HealthPing { from, timestamp, height, cert_mb, cert_round, signature, public_key });
+            self.send_network_message(addr, NetworkMessage::HealthPing { from, timestamp, height, cert_mb, cert_round, signature });
         }
     }
 
@@ -22080,7 +21706,6 @@ impl SimplifiedP2P {
         // CRITICAL FIX v2.86: Also log Transaction errors to diagnose delivery issues
         let should_log = match &message {
             NetworkMessage::Block { height, .. } => height % 10 == 0,
-            NetworkMessage::ConsensusCommit { .. } | NetworkMessage::ConsensusReveal { .. } => true,
             NetworkMessage::Transaction { .. } => true, // DEBUG: Log TX delivery
             _ => false,
         };
@@ -22088,8 +21713,6 @@ impl SimplifiedP2P {
         if should_log {
             let message_type = match &message {
                 NetworkMessage::Block { height, .. } => format!("Block #{}", height),
-                NetworkMessage::ConsensusCommit { round_id, .. } => format!("Consensus round {}", round_id),
-                NetworkMessage::ConsensusReveal { round_id, .. } => format!("Reveal round {}", round_id),
                 _ => "Message".to_string(),
             };
             // PRIVACY: Use pseudonym in logs
@@ -22252,8 +21875,7 @@ impl SimplifiedP2P {
 
         // Signature LAST (the ~5ms cost) — only after the cheap floor/round/committee/anchor gates.
         let vote_msg = timeout_vote_message(height, timeout_round, &anchor_arr,
-                                            high_qc_idx, &qc_hash_arr, tip_height, &tip_hash_arr,
-                                            rc_pin_for_window(height));
+                                            high_qc_idx, &qc_hash_arr, tip_height, &tip_hash_arr);
         if !self.verify_timeout_vote_signature(&voter_id, &vote_msg, &signature) {
             if crate::node::is_warn() {
                 println!("[WARN][TIMEOUT] vote_sig_invalid h={} voter={}", height, voter_id);
@@ -22268,10 +21890,10 @@ impl SimplifiedP2P {
             return;
         }
 
-        // n−f quorum over the WINDOW committee (same quorum fn as Checkpoint-BFT).
-        // Production must relax alongside finality: a relaxed checkpoint with no rotation behind it
-        // certifies nothing, and relaxing only one of the two is strictly worse than the halt.
-        let byzantine_threshold = crate::node::rc_effective_quorum_window(height, committee.len());
+        // n−f quorum over the WINDOW committee (same quorum fn as Checkpoint-BFT). Never relaxed:
+        // the threshold and the vote preimage would both come from LOCAL arm state, so armed and
+        // unarmed nodes would certify different rotation rounds — two producers for one height.
+        let byzantine_threshold = qnet_consensus::checkpoint_bft::quorum_size(committee.len());
 
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
@@ -23151,21 +22773,20 @@ pub fn snapshot_highest_certified_rounds() -> Vec<u8> {
 // stop invoking them, and any legacy on-disk blob is simply ignored (we
 // always re-derive state from TIMEOUT_CERTIFICATES on boot).
 
-pub fn rehydrate_timeout_certificates(bytes: &[u8]) -> usize {
-    if bytes.is_empty() { return 0; }
+/// Rehydrated TC counts: (installed, rejected).
+pub type RehydrateCounts = (usize, usize);
+
+/// Structural pre-filter over a persisted TC blob: key must match the proof's own fields and the
+/// vote set must be non-empty. Pure and cheap — it decides nothing on its own; every survivor still
+/// has to pass signature verification before it may enter TIMEOUT_CERTIFICATES.
+pub fn tc_blob_structural(bytes: &[u8]) -> Vec<((u64, u64), TimeoutCertificate)> {
+    if bytes.is_empty() { return Vec::new(); }
     match bincode::deserialize::<Vec<((u64, u64), TimeoutCertificate)>>(bytes) {
-        Ok(entries) => {
-            let mut count = 0usize;
-            for (k, v) in entries {
-                // Structural consistency: key must match the proof's own fields, votes non-empty.
-                if v.height == k.0 && v.timeout_round == k.1 && !v.votes.is_empty() {
-                    TIMEOUT_CERTIFICATES.insert(k, v);
-                    count += 1;
-                }
-            }
-            count
-        }
-        Err(_) => 0,
+        Ok(entries) => entries
+            .into_iter()
+            .filter(|(k, v)| v.height == k.0 && v.timeout_round == k.1 && !v.votes.is_empty())
+            .collect(),
+        Err(_) => Vec::new(),
     }
 }
 
@@ -23210,6 +22831,31 @@ impl SimplifiedP2P {
     /// remaining Dilithium signatures in parallel. Returns the distinct committee signers iff
     /// they reach quorum — so a replayed single vote or a non-committee key can never inflate
     /// the count and illegitimately advance the leader-selection round.
+    /// Rehydrate persisted TimeoutCertificates through the SAME verifier the live wire path uses.
+    /// A structural check (key matches the proof, votes non-empty) is only a pre-filter: on-disk
+    /// bytes are attacker-reachable, and an unverified TC installs a certified round, which is a
+    /// production and view-change input. Votes stored are the verifier's RETURNED set, so a proof
+    /// padded with junk signatures cannot smuggle them into RAM.
+    pub fn rehydrate_timeout_certificates_verified(&self, bytes: &[u8]) -> RehydrateCounts {
+        let entries = tc_blob_structural(bytes);
+        let (mut installed, mut rejected) = (0usize, 0usize);
+        for (k, v) in entries {
+            match self.verify_timeout_certificate(v.height, v.timeout_round, v.anchor, &v.votes) {
+                Some(verified_votes) => {
+                    TIMEOUT_CERTIFICATES.insert(k, TimeoutProof {
+                        height: v.height,
+                        timeout_round: v.timeout_round,
+                        anchor: v.anchor,
+                        votes: verified_votes,
+                    });
+                    installed += 1;
+                }
+                None => rejected += 1,
+            }
+        }
+        (installed, rejected)
+    }
+
     fn verify_timeout_certificate(
         &self, height: u64, timeout_round: u64, anchor: [u8; 32],
         votes: &[SignedTimeoutVote],
@@ -23238,7 +22884,7 @@ impl SimplifiedP2P {
             }
             None => { self.request_window_anchor(height); return None; }
         }
-        let quorum = crate::node::rc_effective_quorum_window(height, committee.len());
+        let quorum = qnet_consensus::checkpoint_bft::quorum_size(committee.len());
         // Dedup by voter BEFORE verify; drop non-committee voters.
         let mut by_voter: std::collections::HashMap<String, SignedTimeoutVote> = std::collections::HashMap::new();
         for v in votes {
@@ -23256,8 +22902,7 @@ impl SimplifiedP2P {
             .filter(|v| {
                 let msg = timeout_vote_message(height, timeout_round, &anchor,
                                                v.high_qc_idx, &v.high_qc_hash,
-                                               v.tip_height, &v.tip_hash,
-                                               rc_pin_for_window(height));
+                                               v.tip_height, &v.tip_hash);
                 self.verify_timeout_vote_signature(&v.voter_id, &msg, &v.signature)
             })
             .collect();
@@ -24355,7 +24000,6 @@ impl SimplifiedP2P {
                 if confirmations >= 3 {
                     // CONSENSUS REACHED: 3+ nodes confirm block missing
                     // Aggressive Catch-up in node.rs will handle resync (15s/5 blocks)
-                    // Round Tolerance ±90 in commit_reveal.rs handles message acceptance
                     if crate::node::is_info() {
                         println!("[INFO][CONS] Block #{} missing - CONSENSUS REACHED ({} confirmations)",
                                  block_height_log, confirmations);
@@ -24409,429 +24053,14 @@ impl SimplifiedP2P {
     }
     
     
-    /// DEPRECATED: P2P reputation sync - DISABLED for security
-    /// ═══════════════════════════════════════════════════════════════════════════
-    /// REMOVED because:
-    /// 1. Sybil Attack: Fake nodes can manipulate reputation
-    /// 2. Ephemeral Key Forgery: Signatures don't prove identity
-    /// 3. Non-deterministic: Different nodes have different state
-    /// 4. Jail Manipulation: Any node could ban others
-    ///
-    /// NEW ARCHITECTURE (deterministic_reputation.rs):
-    /// - Reputation computed ONLY from blockchain data
-    /// - Slashing requires cryptographic proof in MacroBlock
-    /// - All nodes compute same result from same blocks
-    /// ═══════════════════════════════════════════════════════════════════════════
-    #[allow(dead_code, unused_variables)]
-    fn handle_reputation_sync(&self, from_node: String, reputation_updates: Vec<(String, f64)>, jail_updates: Vec<(String, u64, u32, String)>, timestamp: u64, signature: Vec<u8>) {
-        // DISABLED: This entire function is deprecated
-        // Reputation sync via P2P is a security vulnerability
-        let from_display = if from_node.starts_with("genesis_node_") || from_node.starts_with("node_") {
-            from_node.clone()
-        } else {
-            get_privacy_id_for_addr(&from_node)
-        };
-        
-        if crate::node::is_info() {
-            println!("[WARN][REP] IGNORED ReputationSync from {} - P2P reputation sync DISABLED", from_display);
-        }
-        if crate::node::is_info() {
-            println!("[INFO][REP] Use DeterministicReputationState from blockchain instead");
-        }
-        
-        // DO NOTHING - reputation comes from blockchain only
-    }
     
     
-    /// DEPRECATED: P2P reputation signature verification - DISABLED
-    /// ═══════════════════════════════════════════════════════════════════════════
-    /// This function was used to verify signatures on ReputationSync messages.
-    /// It used EPHEMERAL Ed25519 keys which DON'T prove node identity!
-    /// 
-    /// SECURITY VULNERABILITY:
-    /// - Ephemeral keys can be generated by anyone
-    /// - No binding between ephemeral key and node's Dilithium identity
-    /// - Sybil attack possible: create 100 fake nodes, all sign same update
-    ///
-    /// NEW ARCHITECTURE:
-    /// - Reputation computed from blockchain (deterministic)
-    /// - Slashing requires proof recorded in MacroBlock
-    /// - All nodes compute same result = no P2P sync needed
-    /// ═══════════════════════════════════════════════════════════════════════════
-    #[deprecated(note = "P2P reputation sync disabled - use DeterministicReputationState")]
-    #[allow(unused_variables)]
-    pub async fn verify_reputation_signature_async(&self, node_id: &str, updates: &[(String, f64)], timestamp: u64, signature: &[u8]) -> bool {
-        // DISABLED: Always returns false - reputation sync via P2P is a security vulnerability
-        if crate::node::is_info() {
-            println!("[WARN][REP] verify_reputation_signature DISABLED - use blockchain reputation");
-        }
-        false
-    }
-    
-    /// DEPRECATED: PQ reputation signature verification - DISABLED
-    #[deprecated(note = "P2P reputation sync disabled")]
-    #[allow(unused_variables)]
-    #[allow(dead_code)]
-    async fn verify_pq_reputation_signature_async(&self, message: &str, compact_sig: &crate::pq_crypto::CompactPqSignature, node_id: &str) -> bool {
-        // DISABLED: Part of P2P reputation sync which is now removed
-        false
-    }
     
     
-    /// DEPRECATED: P2P reputation broadcast - DISABLED for security
-    /// ═══════════════════════════════════════════════════════════════════════════
-    /// This function broadcast reputation updates via P2P gossip.
-    /// REMOVED because:
-    /// 1. Sybil Attack: Fake nodes can flood network with fake updates
-    /// 2. Ephemeral Key Forgery: Signatures don't prove node identity
-    /// 3. Non-deterministic: Creates state divergence between nodes
-    /// 4. Scalability issue: O(n²) messages at scale
-    ///
-    /// NEW ARCHITECTURE:
-    /// - Reputation computed from blockchain (deterministic)
-    /// - All nodes compute same result from same blocks
-    /// - No broadcast needed
-    /// ═══════════════════════════════════════════════════════════════════════════
-    #[deprecated(note = "P2P reputation sync disabled - use DeterministicReputationState")]
-    pub async fn broadcast_reputation_sync_async(&self) -> Result<(), String> {
-        // DISABLED: Returns Ok but does nothing
-        if crate::node::is_info() {
-            println!("[WARN][REP] broadcast_reputation_sync DISABLED - reputation from blockchain only");
-        }
-        Ok(())
-    }
     
-    /// DEPRECATED: P2P reputation broadcast (SYNC) - DISABLED
-    /// See broadcast_reputation_sync_async for details
-    #[deprecated(note = "P2P reputation sync disabled - use DeterministicReputationState")]
-    pub fn broadcast_reputation_sync(&self) -> Result<(), String> {
-        // DISABLED: Returns Ok but does nothing
-        Ok(())
-    }
     
-    /// DEPRECATED: Old SYNC implementation - preserved for reference
-    #[allow(dead_code)]
-    fn _broadcast_reputation_sync_legacy(&self) -> Result<(), String> {
-        use crate::pq_crypto::{PqCrypto, GLOBAL_PQ_INSTANCES};
-        use std::sync::Arc;
-        
-        // Get current reputation state and jail statuses
-        let (reputation_updates, jail_updates) = {
-            let reputation = self.reputation_system.lock();
-            (
-                reputation.get_all_reputations().into_iter().collect::<Vec<_>>(),
-                reputation.get_all_jail_statuses()
-            )
-        };
-        
-        if reputation_updates.is_empty() {
-            return Ok(()); // Nothing to sync
-        }
-        
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        
-        // Create message from reputation updates
-        let mut message = String::new();
-        message.push_str(&format!("REPUTATION:{}:{}", self.node_id, timestamp));
-        
-        for (node, reputation) in &reputation_updates {
-            message.push_str(&format!(":{}={}", node, reputation));
-        }
-        
-        // CRITICAL: Generate PQ signature (SYNC - creates new runtime)
-        let node_id = self.node_id.clone();
-        let message_for_sign = message.clone();
-
-        let signature = match tokio::runtime::Runtime::new() {
-            Ok(rt) => {
-                let result = rt.block_on(async move {
-                    // Get or create PQ crypto instance
-                    let instances = GLOBAL_PQ_INSTANCES.get_or_init(|| async {
-                        Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()))
-                    }).await;
-
-                    let mut instances_guard = instances.lock().await;
-
-                    // v2.24: Use node_id directly
-                    let normalized_node_id = node_id.clone();
-
-                    // Create instance if not exists
-                    if !instances_guard.contains_key(&normalized_node_id) {
-                        let mut pq = PqCrypto::new(normalized_node_id.clone());
-                        pq.initialize().await?;
-                        instances_guard.insert(normalized_node_id.clone(), pq);
-                    }
-
-                    let pq = match instances_guard.get_mut(&normalized_node_id) {
-            Some(h) => h,
-            None => return Err(anyhow::anyhow!("PQ instance missing")),
-        };
-
-                    // Check certificate rotation
-                    if pq.needs_rotation() {
-                        let _ = pq.rotate_certificate().await;
-                    }
-
-                    // Sign RAW message with pure Dilithium3 (hashes before signing)
-                    pq.sign_raw_message_compact(message_for_sign.as_bytes()).await
-                });
-                
-                match result {
-                    Ok(compact_sig) => {
-                        // OPTIMIZED v2.24: bincode+zstd
-                        match compact_sig.to_binary_compressed() {
-                            Ok(binary_data) => {
-                                let base64_data = base64::engine::general_purpose::STANDARD.encode(&binary_data);
-                                let sig_with_prefix = format!("compact_bin:{}", base64_data);
-                                if crate::node::is_info() {
-                                    println!("[INFO][P2P] Generated PQ signature for reputation sync (bincode v2.24)");
-                                }
-                                sig_with_prefix.as_bytes().to_vec()
-                            }
-                            Err(e) => {
-                                if crate::node::is_info() {
-                                    println!("[ERR][P2P] Failed to serialize PQ signature: {}", e);
-                                }
-                                Vec::new()
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        if crate::node::is_info() {
-                            println!("[ERR][P2P] Failed to generate PQ signature: {}", e);
-                        }
-                        Vec::new()
-                    }
-                }
-            }
-            Err(e) => {
-                if crate::node::is_info() {
-                    println!("[ERR][P2P] Cannot create runtime for signature: {}", e);
-                }
-                Vec::new()
-            }
-        };
-        
-        // Check if signature is valid before sending
-        if signature.is_empty() {
-            if crate::node::is_info() {
-                println!("[WARN][P2P] Cannot broadcast reputation sync without valid signature - skipping");
-            }
-            return Err("Cannot broadcast without valid quantum-resistant signature".to_string());
-        }
-        
-        #[allow(deprecated)]
-        let sync_msg = NetworkMessage::ReputationSyncDeprecated {
-            node_id: self.node_id.clone(),
-            reputation_updates,
-            jail_updates,
-            timestamp,
-            signature,
-        };
-        
-        // v2.51: Lock-free broadcast
-        let mut successful = 0;
-        for entry in self.connected_peers_lockfree.iter() {
-            self.send_network_message(&entry.value().addr, sync_msg.clone());
-            successful += 1;
-        }
-        
-        if crate::node::is_info() {
-            println!("[INFO][REP] sync_broadcast peers={}", successful);
-        }
-        Ok(())
-    }
     
-    /// PRODUCTION: Start reputation sync task for network-wide consistency
-    fn start_reputation_sync_task(&self) {
-        let node_id = self.node_id.clone();
-        let reputation_system = self.reputation_system.clone();
-        let connected_peers = self.connected_peers_lockfree.clone();
-        let connected_peers_lockfree = self.connected_peers_lockfree.clone();
-        let _peer_id_to_addr = self.peer_id_to_addr.clone();
-        let _peer_shards = self.peer_shards.clone();
-        
-        thread::spawn(move || {
-            // PRIVACY: Use pseudonym for logging
-            let display_id = if node_id.starts_with("genesis_node_") || node_id.starts_with("node_") || node_id.starts_with("super_") {
-                node_id.clone()
-            } else {
-                get_privacy_id_for_addr(&node_id)
-            };
-            
-            if crate::node::is_info() {
-                println!("[INFO][REP] Starting reputation sync task for {}", display_id);
-            }
-            let mut iteration = 0u64;
-            
-            loop {
-                thread::sleep(Duration::from_secs(300)); // Sync every 5 minutes
-                iteration += 1;
-                
-                // Get current reputation state and jail statuses
-                let (reputation_updates, jail_updates) = {
-                    let reputation = reputation_system.lock();
-                    let all_reps = reputation.get_all_reputations();
-                    let all_jails = reputation.get_all_jail_statuses();
-                    if all_reps.is_empty() && all_jails.is_empty() {
-                        continue; // Nothing to sync
-                    }
-                    (all_reps.into_iter().collect::<Vec<_>>(), all_jails)
-                };
-                
-                // Create signature for updates
-                let timestamp = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                
-                // PRODUCTION: Create quantum-resistant signature using SHA3-256
-                use sha3::{Sha3_256, Digest};
-                let mut hasher = Sha3_256::new();
-                hasher.update(node_id.as_bytes());
-                hasher.update(timestamp.to_le_bytes());
-                
-                for (node, reputation) in &reputation_updates {
-                    hasher.update(node.as_bytes());
-                    hasher.update(reputation.to_le_bytes());
-                }
-                
-                hasher.update(b"QNET_REPUTATION_SYNC_V1");
-                let message_hash = hasher.finalize();
-                
-                let mut signature = vec![0u8; 64];
-                signature[..32].copy_from_slice(&message_hash);
-                
-                let mut node_hasher = Sha3_256::new();
-                node_hasher.update(node_id.as_bytes());
-                node_hasher.update(&message_hash);
-                node_hasher.update(b"QNET_NODE_SIGNATURE");
-                let node_sig = node_hasher.finalize();
-                signature[32..].copy_from_slice(&node_sig);
-                
-                // Create sync message with jail updates
-                #[allow(deprecated)]
-                let sync_msg = NetworkMessage::ReputationSyncDeprecated {
-                    node_id: node_id.clone(),
-                    reputation_updates: reputation_updates.clone(),
-                    jail_updates: jail_updates.clone(),
-                    timestamp,
-                    signature: signature.clone(),
-                };
-                
-                // Serialize message
-                let _message_json = match serde_json::to_string(&sync_msg) {
-                    Ok(json) => json,
-                    Err(e) => {
-                        if crate::node::is_info() {
-                            println!("[ERR][REP] Failed to serialize sync message: {}", e);
-                        }
-                        continue;
-                    }
-                };
-                
-                // v2.51: Lock-free gossip peer selection
-                let qualified_peers: Vec<PeerInfo> = connected_peers.iter()
-                    .filter(|entry| {
-                        let peer = entry.value();
-                        peer.node_type != NodeType::Light && peer.is_consensus_qualified()
-                    })
-                    .map(|entry| entry.value().clone())
-                    .collect();
-                
-                if qualified_peers.is_empty() {
-                    if crate::node::is_info() {
-                        println!("[WARN][REP] No qualified peers for gossip sync - skipping iteration #{}", iteration);
-                    }
-                    continue;
-                }
-                
-                // ADAPTIVE FANOUT: Use same fanout as ShredProtocol for consistency
-                // PRODUCTION: Fanout=4 (small network) to fanout=32 (large network)
-                let gossip_fanout = {
-                    let producers = qualified_peers.len();
-                    let avg_latency = connected_peers_lockfree.iter()
-                        .filter(|e| e.value().is_consensus_qualified())
-                        .map(|e| e.value().latency_ms as u64)
-                        .sum::<u64>() / qualified_peers.len().max(1) as u64;
-                    
-                    // v2.60: Updated to match get_shred_protocol_fanout() with genesis latency fix
-                    match (producers, avg_latency) {
-                        // Genesis: LAN uses fanout=4, WAN sends to ALL peers
-                        (0..=50, 0..=50) => 4,
-                        (0..=50, _) => producers.max(4),  // v2.60: All peers for high latency
-                        (51..=200, 0..=50) => 8,
-                        (51..=200, _) => 16,
-                        (201..=1000, 0..=50) => 8,
-                        (201..=1000, _) => 16,
-                        _ => 32,
-                    }
-                };
-                
-                // KADEMLIA-BASED RANDOM SELECTION: Use XOR distance for peer diversity
-                // ARCHITECTURE: Same as ShredProtocol routing (no duplication)
-                let mut selection_hasher = Sha3_256::new();
-                selection_hasher.update(node_id.as_bytes());
-                selection_hasher.update(&iteration.to_le_bytes());
-                selection_hasher.update(b"QNET_GOSSIP_REPUTATION_V1");
-                let selection_seed = selection_hasher.finalize();
-                
-                let mut sorted_peers: Vec<PeerInfo> = qualified_peers.into_iter().collect();
-                sorted_peers.sort_by_key(|peer| {
-                    let mut peer_hasher = Sha3_256::new();
-                    peer_hasher.update(peer.addr.as_bytes());
-                    peer_hasher.update(&selection_seed);
-                    let peer_hash = peer_hasher.finalize();
-                    u64::from_le_bytes([
-                        peer_hash[0], peer_hash[1], peer_hash[2], peer_hash[3],
-                        peer_hash[4], peer_hash[5], peer_hash[6], peer_hash[7],
-                    ])
-                });
-                
-                let gossip_targets: Vec<PeerInfo> = sorted_peers.into_iter()
-                    .take(gossip_fanout)
-                    .collect();
-                
-                let mut successful = 0;
-                
-                if let Ok(_rt) = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build() {
-                    for peer in gossip_targets {
-                        let peer_addr_str = peer.addr.clone();
-                        let _sync_msg_clone = sync_msg.clone();
-                        
-                        // Parse peer address to QUIC port
-                        let parts: Vec<&str> = peer_addr_str.split(':').collect();
-                        if parts.len() == 2 {
-                            if let (Ok(ip), Ok(port)) = (parts[0].parse::<std::net::IpAddr>(), parts[1].parse::<u16>()) {
-                                let quic_port = port.saturating_add(crate::quic_transport::QUIC_PORT_OFFSET);
-                                let quic_addr = std::net::SocketAddr::new(ip, quic_port);
-                                
-                                // Check TCP connectivity first (quick test)
-                                if let Ok(_) = std::net::TcpStream::connect_timeout(
-                                    &quic_addr, 
-                                    std::time::Duration::from_secs(2)
-                                ) {
-                                    successful += 1;
-                                }
-                            }
-                        }
-                    }
-                }
-                
-                if successful > 0 {
-                    if crate::node::is_info() {
-                        println!("[INFO][REP] Gossip #{}: Sent {} reputations to {}/{} peers (fanout={})",
-                                 iteration, reputation_updates.len(), successful, gossip_fanout, gossip_fanout);
-                    }
-                }
-            }
-        });
-    }
+    
     
     /// Check if a node is a genesis/bootstrap node that should be protected
     fn is_genesis_node(&self, node_id: &str) -> bool {
@@ -24909,7 +24138,6 @@ impl SimplifiedP2P {
             // Report as critical attack
             let _ = self.report_critical_attack(
                 node_id,
-                MaliciousBehavior::ProtocolViolation,
                 0,  // No block height for certificate attacks
                 &format!("Repeated invalid certificates: {} in {}s - {}", count, elapsed.as_secs(), reason)
             );
@@ -24963,7 +24191,6 @@ impl SimplifiedP2P {
             // Report as critical attack
             let _ = self.report_critical_attack(
                 producer,
-                MaliciousBehavior::ProtocolViolation,
                 block_height,
                 &format!("Repeated invalid signatures: {} blocks in {}s", count, elapsed.as_secs())
             );
@@ -25057,7 +24284,6 @@ impl SimplifiedP2P {
     pub fn report_critical_attack(
         &self,
         attacker: &str,
-        attack_type: MaliciousBehavior,
         block_height: u64,
         evidence: &str
     ) -> Result<(), String> {
@@ -25072,16 +24298,9 @@ impl SimplifiedP2P {
         // 5. BFT Timeout Protocol handles failover if attacker was producer
         // ═══════════════════════════════════════════════════════════════════════════
         
-        let change_type = match attack_type {
-            MaliciousBehavior::DatabaseSubstitution => "DATABASE_SUBSTITUTION",
-            MaliciousBehavior::ChainFork => "CHAIN_FORK",
-            MaliciousBehavior::StorageDeletion => "CRITICAL_STORAGE_DELETION",
-            _ => "CRITICAL_ATTACK",
-        };
-        
         // Log for monitoring and future on-chain inclusion
         if crate::node::is_warn() {
-            println!("[CRIT][SECURITY] attack_detected attacker={} h={} type={}", attacker, block_height, change_type);
+            println!("[CRIT][SECURITY] attack_detected attacker={} h={}", attacker, block_height);
         }
         if crate::node::is_warn() {
             println!("[CRIT][SECURITY] evidence={}", evidence);
@@ -25544,11 +24763,11 @@ mod tests {
 
         // ── Canonical vote payload: versioned domain tag; every field changes the signed bytes.
         let a = [1u8; 32]; let qh = [2u8; 32]; let th = [3u8; 32];
-        let m = timeout_vote_message(7, 3, &a, 5, &qh, 640, &th, None);
+        let m = timeout_vote_message(7, 3, &a, 5, &qh, 640, &th);
         assert!(m.starts_with("QNET_TIMEOUT_V2:7:3:"), "domain-tagged + versioned");
-        assert_ne!(m, timeout_vote_message(7, 3, &[9u8; 32], 5, &qh, 640, &th, None), "anchor binds");
-        assert_ne!(m, timeout_vote_message(7, 3, &a, 5, &qh, 641, &th, None), "tip binds");
-        assert_ne!(m, timeout_vote_message(8, 3, &a, 5, &qh, 640, &th, None), "window binds");
+        assert_ne!(m, timeout_vote_message(7, 3, &[9u8; 32], 5, &qh, 640, &th), "anchor binds");
+        assert_ne!(m, timeout_vote_message(7, 3, &a, 5, &qh, 641, &th), "tip binds");
+        assert_ne!(m, timeout_vote_message(8, 3, &a, 5, &qh, 640, &th), "window binds");
 
         // ── Genesis-era committee (w<3): the fixed genesis set, n=5 ⇒ f=1, quorum=4 — never
         // signature-only. Anchor = zeros.
@@ -25583,12 +24802,14 @@ mod tests {
         let good = TimeoutProof { height: 7, timeout_round: 3, anchor: [0u8; 32], votes: vec![vote.clone()] };
         let mismatched = TimeoutProof { height: 6, timeout_round: 1, anchor: [0u8; 32], votes: vec![vote] };
         let blob = bincode::serialize(&vec![((7u64, 3u64), good), ((8u64, 1u64), mismatched)]).unwrap();
-        assert_eq!(rehydrate_timeout_certificates(&blob), 1, "key/field-mismatched TC rejected");
-        assert_eq!(observed_tc_window_floor(), 0, "rehydrate installs certs but never raises the floor");
+        assert_eq!(tc_blob_structural(&blob).len(), 1, "key/field-mismatched TC dropped by the pre-filter");
+        assert_eq!(observed_tc_window_floor(), 0, "rehydrate never raises the floor");
+        // Nothing was signature-verified, so TIMEOUT_CERTIFICATES stays empty and the certified-round
+        // tracker cannot be seeded from disk alone — raw pairs are not a production input.
         let pairs = bincode::serialize(&vec![(7u64, 3u64), (9u64, 5u64)]).unwrap();
-        assert_eq!(rehydrate_highest_certified_rounds(&pairs), 1, "unbacked pair NOT installed");
-        assert_eq!(highest_certified_round_for(7), 3);
-        assert_eq!(highest_certified_round_for(9), 0, "raw disk pair is not a production input");
+        assert_eq!(rehydrate_highest_certified_rounds(&pairs), 0, "unverified pairs NOT installed");
+        assert_eq!(highest_certified_round_for(7), 0);
+        assert_eq!(highest_certified_round_for(9), 0);
 
         // ── Floor = finalized window (a ratchet, always ≤ tip). A rollback of UNFINALIZED blocks leaves
         // finality AND the certs intact, so a re-advancing node re-elects the certified producer; the
@@ -26331,3 +25552,209 @@ mod shred_fec_tests {
     }
 }
 
+
+// =============================================================================
+// PEER ADMISSION: one funnel, bounded tables, gate-before-evict
+// =============================================================================
+#[cfg(test)]
+mod tests_peer_admission {
+    use super::*;
+
+    fn fixture_peer(id: &str, ip: &str, last_seen: u64, is_outbound: bool) -> PeerInfo {
+        PeerInfo {
+            id: id.to_string(),
+            addr: format!("{}:8001", ip),
+            node_type: NodeType::Super,
+            region: Region::Europe,
+            last_seen,
+            is_stable: true,
+            latency_ms: 0,
+            connection_count: 1,
+            bandwidth_usage: 0,
+            node_id_hash: Vec::new(),
+            // Out of reach of get_bucket_index (first differing bit of two SHA3 digests),
+            // so the fixture never trips K-bucket replacement.
+            bucket_index: 250,
+            reputation: 70.0,
+            consensus_score: 70.0,
+            network_score: 100.0,
+            reputation_score: None,
+            successful_pings: 0,
+            failed_pings: 0,
+            last_block_height: 0,
+            last_height_attested_at: 0,
+            is_outbound,
+        }
+    }
+
+    /// A gossiped address may only carry an identity the pinned table or the chain committed.
+    /// This is the single binding both PeerListResponse and PeerDiscovery resolve through.
+    #[test]
+    fn gossip_identity_comes_from_pin_or_chain_never_the_wire() {
+        let (gip, gid) = crate::genesis_constants::GENESIS_NODE_IPS[0];
+        // Pinned address answers from the binary, whatever the relay claimed.
+        assert_eq!(
+            SimplifiedP2P::gossip_bound_identity("attacker_claimed_id", gip),
+            Some(format!("genesis_node_{}", gid)),
+        );
+        // A genesis identity claimed from any other address is refused outright.
+        assert_eq!(SimplifiedP2P::gossip_bound_identity("genesis_node_001", "203.0.113.7"), None);
+        // An unregistered identity has no committed endpoint, so it is refused.
+        assert_eq!(SimplifiedP2P::gossip_bound_identity("super_unbound", "203.0.113.7"), None);
+        // A chain-registered identity binds only to its committed IP.
+        crate::genesis_constants::register_node_endpoint("super_bound_a", "http://203.0.113.8:8001");
+        assert_eq!(
+            SimplifiedP2P::gossip_bound_identity("super_bound_a", "203.0.113.8"),
+            Some("super_bound_a".to_string()),
+        );
+        assert_eq!(SimplifiedP2P::gossip_bound_identity("super_bound_a", "203.0.113.9"), None);
+    }
+
+    /// The regional dial-candidate map is a gossip sink: it must dedup and stay capped, or one
+    /// connection grows it without bound and the establishment sweep walks every entry.
+    #[test]
+    fn regional_candidates_dedup_and_stay_capped() {
+        let map: Arc<Mutex<HashMap<Region, Vec<PeerInfo>>>> = Arc::new(Mutex::new(HashMap::new()));
+
+        assert!(SimplifiedP2P::push_regional_peer(&map, fixture_peer("p0", "198.51.100.1", 100, false)));
+        assert!(!SimplifiedP2P::push_regional_peer(&map, fixture_peer("p0b", "198.51.100.1", 200, false)),
+                "same addr is deduped");
+        assert_eq!(map.lock().get(&Region::Europe).map(|v| v.len()), Some(1));
+
+        // Fill past the cap with distinct addresses; the region never exceeds it.
+        for i in 0..(MAX_REGIONAL_PEERS_PER_REGION + 64) {
+            let ip = format!("198.51.{}.{}", 100 + i / 200, 2 + (i % 200));
+            SimplifiedP2P::push_regional_peer(&map, fixture_peer(&format!("p{}", i), &ip, 1000 + i as u64, false));
+        }
+        let region_len = map.lock().get(&Region::Europe).map(|v| v.len()).unwrap_or(0);
+        assert_eq!(region_len, MAX_REGIONAL_PEERS_PER_REGION, "region is hard-capped");
+        // The oldest candidate is the one evicted.
+        assert!(!map.lock().get(&Region::Europe).unwrap().iter().any(|p| p.addr == "198.51.100.1:8001"),
+                "oldest candidate evicted first");
+    }
+
+    /// A candidate an inbound gate is about to refuse must not cost a live peer its slot,
+    /// or repeated refused attempts drain the table down to the pinned set.
+    #[test]
+    fn gate_rejected_candidate_evicts_nothing() {
+        let node = SimplifiedP2P::new("test_gate_node".into(), NodeType::Super, Region::Europe, 8001);
+
+        // Fill the table to the global cap directly: add_peer_lockfree's own K-bucket rule would
+        // stop long before 1000, and what is under test is behaviour AT the cap.
+        for i in 0..MAX_CONNECTED_PEERS {
+            let (a, b) = ((i / 250) as u8, (i % 250) as u8);
+            let p = if i < 2 {
+                fixture_peer(&format!("inb{}", i), &format!("203.0.113.{}", i + 1), 5000 + i as u64, false)
+            } else {
+                fixture_peer(&format!("out{}", i), &format!("198.{}.{}.7", 20 + a, b + 1), 5000 + i as u64, true)
+            };
+            node.peer_id_to_addr.insert(p.id.clone(), p.addr.clone());
+            node.connected_peers_lockfree.insert(p.addr.clone(), p);
+        }
+        assert_eq!(node.connected_peers_lockfree.len(), MAX_CONNECTED_PEERS);
+        let before: std::collections::HashSet<String> =
+            node.connected_peers_lockfree.iter().map(|e| e.key().clone()).collect();
+
+        // Third inbound peer from 203.0.113.0/24: refused by the subnet-diversity cap.
+        let refused = fixture_peer("attacker", "203.0.113.9", 9_000, false);
+        assert!(!node.add_peer_lockfree(refused), "subnet-capped candidate is refused");
+        let after: std::collections::HashSet<String> =
+            node.connected_peers_lockfree.iter().map(|e| e.key().clone()).collect();
+        assert_eq!(before, after, "a refused candidate evicted nobody");
+
+        // A candidate that IS admissible still pays the LRU eviction: the cap holds, oldest goes.
+        let admitted = fixture_peer("chosen", "198.19.19.19", 9_001, true);
+        assert!(node.add_peer_lockfree(admitted), "outbound candidate admitted at cap");
+        assert_eq!(node.connected_peers_lockfree.len(), MAX_CONNECTED_PEERS, "cap holds");
+        assert!(node.connected_peers_lockfree.contains_key("198.19.19.19:8001"));
+        assert!(!node.connected_peers_lockfree.contains_key("203.0.113.1:8001"),
+                "oldest non-pinned peer is the one evicted");
+    }
+
+    /// A zeroed (banned/jailed) Super with a matching committed endpoint passes the identity
+    /// binding, so the reputation floor is the only thing left to refuse it: it must see the
+    /// committed score, never the parser's placeholder.
+    #[test]
+    fn inbound_reputation_floor_refuses_a_zeroed_peer() {
+        let node = SimplifiedP2P::new("test_rep_node".into(), NodeType::Super, Region::Europe, 8001);
+        let mut zeroed = fixture_peer("super_zeroed", "198.51.100.42", 1, false);
+        zeroed.reputation = 0.0;
+        zeroed.consensus_score = 0.0;
+        assert!(!node.add_peer_lockfree(zeroed), "reputation below the inbound floor is refused");
+        // The parser's placeholder is above the floor, which is exactly why the gossip paths must
+        // overwrite it with the committed value before calling in.
+        assert!(qnet_consensus::deterministic_reputation::INITIAL_REPUTATION >= MIN_INBOUND_PEER_REPUTATION);
+    }
+
+    /// The gossip paths resolve the score through get_node_reputation_from_blockchain, so that
+    /// helper must actually read the committed tombstone: while it returned a constant floor,
+    /// every reputation gate in the file was structurally unreachable.
+    #[test]
+    fn committed_tombstone_resolves_to_zero_reputation() {
+        use qnet_consensus::deterministic_reputation::INITIAL_REPUTATION;
+        if crate::node::try_get_state().is_none() {
+            crate::node::init_global_state(std::sync::Arc::new(
+                tokio::sync::RwLock::new(qnet_state::State::new()),
+            ));
+        }
+        // Insert into whichever applied-state map is installed, so the test is independent of
+        // who won the process-wide OnceCell.
+        let state = crate::node::try_get_state().expect("applied state installed");
+        {
+            let guard = state.try_read().expect("applied state uncontended in tests");
+            let mut banned = qnet_state::Account::new("super_tombstoned".to_string());
+            banned.banned_at_height = 7;
+            guard.accounts.insert("super_tombstoned".to_string(), banned);
+            guard.accounts.insert(
+                "super_clean".to_string(),
+                qnet_state::Account::new("super_clean".to_string()),
+            );
+        }
+
+        let node = SimplifiedP2P::new("test_tomb_node".into(), NodeType::Super, Region::Europe, 8001);
+        assert_eq!(node.get_node_reputation_from_blockchain("super_tombstoned"), 0.0,
+                   "a tombstoned account reads as zero");
+        assert_eq!(node.get_node_reputation_from_blockchain("super_clean"), INITIAL_REPUTATION,
+                   "an un-banned account reads the floor");
+
+        // And the inbound gate then refuses it, which is the point of resolving the real score.
+        let mut peer = fixture_peer("super_tombstoned", "198.51.100.77", 1, false);
+        peer.reputation = node.get_node_reputation_from_blockchain(&peer.id);
+        peer.consensus_score = peer.reputation;
+        assert!(!node.add_peer_lockfree(peer), "a tombstoned peer is refused by the inbound floor");
+    }
+
+    /// A peer_id_to_addr row whose peer table entry is gone is a DANGLING INDEX, not a connection.
+    /// While the dedup treated it as "already connected", any identity that ever lost its entry
+    /// outside remove_peer_lockfree — an inbound QUIC handshake, a rebalance drop — became
+    /// permanently unadmittable, and every directed send kept routing to the dead address.
+    #[test]
+    fn a_dangling_id_index_does_not_lock_a_peer_out() {
+        let node = SimplifiedP2P::new("test_dangle_node".into(), NodeType::Super, Region::Europe, 8001);
+
+        let p = fixture_peer("super_dangle", "198.51.100.55", 42, true);
+        assert!(node.add_peer_lockfree(p.clone()), "first admission");
+        assert_eq!(node.get_peer_address_by_id("super_dangle").as_deref(), Some("198.51.100.55:8001"));
+
+        // Orphan the index the way a bare map delete used to: entry gone, id → addr left behind.
+        node.connected_peers_lockfree.remove(&p.addr);
+        assert!(node.peer_id_to_addr.contains_key("super_dangle"), "index is now dangling");
+
+        // Readmission at the SAME address, and at a new one, must both succeed.
+        assert!(node.add_peer_lockfree(p.clone()), "readmitted over a dangling index");
+        node.remove_peer_lockfree(&p.addr);
+        assert!(!node.peer_id_to_addr.contains_key("super_dangle"),
+                "the only remover clears the id index with the entry");
+
+        let moved = fixture_peer("super_dangle", "198.51.100.56", 43, true);
+        assert!(node.add_peer_lockfree(moved.clone()));
+        node.connected_peers_lockfree.remove(&moved.addr);
+        let relocated = fixture_peer("super_dangle", "198.51.100.57", 44, true);
+        assert!(node.add_peer_lockfree(relocated.clone()), "readmitted at a new address");
+        assert_eq!(node.get_peer_address_by_id("super_dangle").as_deref(), Some("198.51.100.57:8001"));
+
+        // A LIVE duplicate is still deduped — the fix must not turn the dedup off.
+        let dup = fixture_peer("super_dangle", "198.51.100.58", 45, true);
+        assert!(!node.add_peer_lockfree(dup), "a live entry at the mapped address still dedups");
+    }
+}

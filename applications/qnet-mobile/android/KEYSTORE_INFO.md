@@ -12,7 +12,8 @@ This app requires a keystore file for signing releases. The keystore is NOT incl
 
 ### If you're creating a new keystore:
 
-1. Update the passwords in `android/app/build.gradle` (lines 96-99)
+1. Put the store path, alias and passwords in `android/keystore.properties`, which is
+   gitignored and read by `android/app/build.gradle`. Do not hardcode passwords in Gradle files.
 2. Keep the keystore file SAFE and NEVER commit it
 3. Share securely with team members who need it
 

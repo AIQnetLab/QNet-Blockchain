@@ -323,16 +323,16 @@ pub fn generate_pq_transaction_from_snapshot(
         },
         dilithium_signature: None,
         dilithium_public_key: None,
-        chain_id: 0,
+        chain_id: qnet_state::transaction::QNET_CHAIN_ID,
     };
 
     tx.hash = tx.calculate_hash();
 
     // Canonical message — same 7-pipe format verified by node.rs::submit_benchmark_batch_pq
-    let message = format!(
+    let message = crate::node::BlockchainNode::chain_bind(&format!(
         "{}|{}|{}|{}|{}|{}|{}",
         tx.from, receiver.address, amount, nonce, tx.gas_price, tx.gas_limit, timestamp
-    );
+    ));
     let msg_bytes = message.as_bytes();
 
     // Dilithium3 (ML-DSA-65) signature only — pure post-quantum path
@@ -683,7 +683,7 @@ impl BenchmarkManager {
             },
             dilithium_signature: None,
             dilithium_public_key: None,
-            chain_id: 0,
+            chain_id: qnet_state::transaction::QNET_CHAIN_ID,
         };
 
         // Calculate hash (real SHA3-256)
@@ -691,10 +691,10 @@ impl BenchmarkManager {
 
         // Sign with Dilithium3 (ML-DSA-65) — MUST match node.rs::submit_benchmark_batch_pq.
         // Canonical message: from|to|amount|nonce|gas_price|gas_limit|timestamp
-        let message = format!(
+        let message = crate::node::BlockchainNode::chain_bind(&format!(
             "{}|{}|{}|{}|{}|{}|{}",
             tx.from, receiver.address, amount, nonce, tx.gas_price, tx.gas_limit, timestamp
-        );
+        ));
         let pq_signed = dilithium3::detached_sign(message.as_bytes(), &sender.pq_sk);
         tx.dilithium_signature  = Some(pq_signed.as_bytes().to_vec());
         tx.dilithium_public_key = Some(sender.pq_pk.as_bytes().to_vec());

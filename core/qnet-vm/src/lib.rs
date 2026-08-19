@@ -1,9 +1,9 @@
-//! Deterministic on-chain smart-contract VM — Phase 1 (foundation, INERT).
+//! Deterministic on-chain smart-contract VM: the deploy-time module VALIDATOR
+//! plus the fuel-metered wasmi interpreter that executes contracts.
 //!
-//! This crate is a LEAF: it depends on no consensus code and is NOT wired into
-//! `apply_to_state`, so nothing here can change a `state_root` (zero fork risk).
-//! P1 delivers the deploy-time module VALIDATOR — the determinism gate every
-//! WASM contract must pass before it could ever execute (P2 dry-run, P3 cut-over).
+//! This crate is a LEAF (it depends on no consensus code), but `qnet-state`
+//! drives it from `apply_to_state`, so contract execution here DOES change the
+//! `state_root` — every rule below is consensus-critical.
 //!
 //! DETERMINISM CONTRACT enforced here (a single divergent byte across nodes forks
 //! the chain, so the accepted feature set is deliberately minimal):
@@ -12,11 +12,11 @@
 //!   - NO threads/atomics, SIMD, reference-types, GC, tail-calls, exceptions,
 //!     bulk-memory-beyond-MVP, etc. — rejected via a restricted feature set.
 //!   - Bounded linear memory (page cap) and bounded module/code size.
-//! The interpreter itself (P2) will additionally cap call-stack depth + meter fuel.
+//! The interpreter additionally caps call-stack depth and meters fuel.
 
 use wasmparser::{Parser, Payload, Validator, WasmFeatures};
 
-/// Protocol-constant limits (P1 defaults; frozen as consensus constants before P3).
+/// Protocol-constant limits. Consensus constants: changing one is a hard fork.
 #[derive(Debug, Clone, Copy)]
 pub struct VmLimits {
     /// Max linear-memory pages a module may declare/grow (64 KiB/page). 256 = 16 MiB.
@@ -157,12 +157,10 @@ pub fn validate_wasm_module(bytes: &[u8], limits: &VmLimits) -> Result<(), VmErr
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// P2 (shadow/dry-run, OFF the consensus path): fuel-metered execution.
-// This runs a validated module under a strict fuel budget and reports the fuel
-// consumed + whether it trapped. NO host functions / state access yet (that is
-// the next P2 step) and NOTHING here is wired into apply_to_state — so it cannot
-// change a state_root. It exists to PROVE the interpreter is deterministic +
-// haltable in our workspace before any of it approaches consensus.
+// Fuel-metered execution core: the deterministic engine configuration plus a
+// no-imports smoke entry that runs a validated module under a strict fuel budget
+// and reports fuel consumed + whether it trapped. Fuel guarantees halting, which
+// is what makes execution safe to run inside block apply.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Outcome of a metered execution.
@@ -171,8 +169,8 @@ pub struct ExecOutcome {
     /// Fuel consumed (gas). Deterministic for a given (module, entry, arg).
     pub fuel_consumed: u64,
     /// True iff execution trapped (out-of-fuel, div-by-zero, OOB, unreachable...).
-    /// On a trap the caller must revert ALL state (the overlay is dropped) — that
-    /// atomic-rollback wiring lands with the host/state step, not here.
+    /// On a trap the caller must revert ALL state: the apply path in `qnet-state`
+    /// drops the account overlay so no partial write reaches the `state_root`.
     pub trapped: bool,
     /// i64 return value when the entry returned one and did not trap.
     pub result: Option<i64>,
@@ -189,7 +187,8 @@ fn deterministic_engine() -> wasmi::Engine {
 
 /// Run a validated module's `entry(i64)->i64` under `fuel_budget`, no host imports.
 /// Halting is guaranteed: fuel strictly decreases; exhaustion traps deterministically.
-/// P2 smoke surface — the real dry-run (host functions + state overlay) builds on this.
+/// Import-free smoke surface; the host-bound entries (`dry_run`, `execute_call_tree`)
+/// build on the same engine configuration.
 pub fn execute_metered_smoke(
     wasm: &[u8],
     entry: &str,
@@ -228,10 +227,10 @@ pub fn execute_metered_smoke(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// P2 host layer (OFF consensus): the deterministic syscall surface a contract may
-// call, marshalled through the contract's own linear memory. STILL not wired into
-// apply_to_state. The integration layer (P3) will implement `HostContext` over
-// Account.contract_storage; P2 uses an in-mem impl for the dry-run harness + corpus.
+// Host layer: the deterministic syscall surface a contract may call, marshalled
+// through the contract's own linear memory. `qnet-state` implements `HostContext`
+// over Account.contract_storage for apply; the in-mem impl below serves views and
+// the determinism corpus.
 // ─────────────────────────────────────────────────────────────────────────────
 
 use std::collections::BTreeMap;
@@ -261,10 +260,10 @@ pub trait HostContext {
     fn emit_log(&mut self, data: &[u8]);
 }
 
-/// In-memory `HostContext` for the P2 dry-run + determinism corpus. Storage is a
+/// In-memory `HostContext` for `dry_run` + the determinism corpus. Storage is a
 /// BTreeMap (SORTED → deterministic iteration, mirroring the state-layer discipline).
 /// Captures writes + logs so a caller can inspect them — and DISCARD them when the
-/// run trapped (the overlay-atomicity contract; P3 drops the account overlay instead).
+/// run trapped (the overlay-atomicity contract; apply drops the account overlay instead).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemHost {
     storage: BTreeMap<Vec<u8>, Vec<u8>>,
@@ -343,8 +342,8 @@ fn mem_write<H>(caller: &mut wasmi::Caller<'_, H>, mem: &wasmi::Memory, ptr: i32
 /// Run a validated module's `entry()` under `fuel_budget` with the host imports
 /// bound (module "env"). Returns the outcome + the (possibly-mutated) host state:
 /// on `trapped == true` the caller MUST DISCARD that host state (it may hold partial
-/// writes) — that is the overlay-atomicity contract the P3 apply wiring enforces by
-/// dropping the account overlay. OFF the consensus path; changes no state_root.
+/// writes). This single-contract entry serves read-only RPC views: it commits nothing,
+/// so it changes no state_root. Consensus execution runs `execute_call_tree` instead.
 ///
 /// Host ABI (module "env", all pointers/lengths index the contract's linear memory):
 ///   storage_write(key_ptr,key_len,val_ptr,val_len)
@@ -438,10 +437,10 @@ pub fn dry_run<H: HostContext + Send + Sync + 'static>(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// P5 cross-contract calls (VM CORE — OFF consensus; the apply-layer wiring is gated
-// and additionally BLOCKED on a working-set loader redesign, see wasm_exec.rs). A
-// contract may synchronously call ANOTHER contract's exported entry, passing args +
-// a value context and receiving return bytes. Determinism + safety are enforced here:
+// Cross-contract calls (VM core; the apply layer resolves callees from the tx
+// access list, see qnet-state wasm_exec.rs). A contract may synchronously call
+// ANOTHER contract's exported entry, passing args + a value context and receiving
+// return bytes. Determinism + safety are enforced here:
 //   - bounded call DEPTH (MAX_CALL_DEPTH) — no unbounded native recursion,
 //   - REENTRANCY forbidden: a contract already on the call stack cannot be re-entered
 //     (the conservative default — kills the classic reentrancy-drain at the VM layer),
@@ -783,7 +782,8 @@ fn run_frame(
 /// Execute a cross-contract call tree from `entry_addr::entry_name(args)` under a
 /// shared `fuel` budget. Deterministic + reentrancy-safe + depth-bounded. PURE: mutates
 /// no external state — the caller commits `CallTreeOutcome.writes` (per contract) and the
-/// `logs` ONLY when `!trapped`. OFF the consensus path; changes no state_root.
+/// `logs` ONLY when `!trapped`. This is the consensus execution entry: `qnet-state` calls
+/// it from apply and its committed writes fold into the `state_root`.
 pub fn execute_call_tree(
     resolver: Rc<dyn ContractResolver>,
     entry_addr: &[u8],

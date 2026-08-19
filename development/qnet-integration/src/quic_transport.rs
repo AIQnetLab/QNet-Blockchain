@@ -152,15 +152,13 @@ fn max_size_for_message_type(msg_type: u8) -> usize {
         // its QC — the 2 MB catch-all silently dropped them → finality stall at scale. Full 10 MB.
         10 => MAX_MESSAGE_SIZE,        // ConsensusV2 / MacroblocksBatch
         8 => 512 * 1024 + 256,        // ShredProtocolChunk: 512 KB data + header
-        // Consensus messages: 64 KB max (signatures + metadata only)
-        5 => 64 * 1024,               // ConsensusCommit
-        6 => 64 * 1024,               // ConsensusReveal
-        // Small control messages: 8 KB
-        4 => 8 * 1024,                // HealthPing (Dilithium sig ~3KB + metadata)
+        // HealthPing: hex ML-DSA-65 signature (6618) + node id + 4 u64 + framing ≈ 6.7 KB.
+        // Sized with headroom so a future field cannot silently push the frame past its own cap;
+        // wire_cap_covers_worst_case_frame pins this.
+        4 => 16 * 1024,               // HealthPing
         3 => 256 * 1024,              // PeerDiscovery (can contain many peers)
         // Deprecated: reject entirely
         7 => 0,                        // EmergencyProducerChange (deprecated)
-        9 => 0,                        // ReputationSyncDeprecated
         // Type 0 = catch-all (Transaction, VrfLeaderClaim, TimeoutVote, SyncStatus,
         //   BlocksBatch, MacroblocksBatch, ProducerHeartbeat, etc.)
         // Use 2 MB — large enough for tx batches but not full 10 MB abuse
@@ -250,15 +248,27 @@ fn canonical_ip_str(ip: &std::net::IpAddr) -> String {
 //       refused at accept time for a cooldown period. Genesis IPs are
 //       NEVER banned (consensus path is privileged).
 //
-// Scalability: DashMap is sharded → O(1) under contention; ban entries are
-// ~40 bytes; even with a million unique attacker IPs total RAM stays under
-// 50 MB. Cleanup is implicit: window rollover + cooldown expiry are checked
-// inline, so stale entries clear themselves on next touch.
+// Scalability: DashMap is sharded → O(1) under contention. The map is HARD
+// CAPPED: a failing IP never produces the successful handshake that clears
+// its entry, so "clears itself on next touch" is exactly what an attacker
+// spraying one bad frame per source address never does. Growth is bounded by
+// HANDSHAKE_FAIL_MAX_ENTRIES with amortised sweep + batch eviction below.
 // ============================================================================
 
 const HANDSHAKE_FAIL_WINDOW_SECS: u64 = 60;
 const HANDSHAKE_FAIL_THRESHOLD: u64 = 20;
 const HANDSHAKE_FAIL_BAN_SECS: u64 = 600;
+
+/// Hard ceiling on tracked source IPs (~56 bytes/entry ⇒ under 1 MB). Same order as TOFU_MAX_PINS.
+const HANDSHAKE_FAIL_MAX_ENTRIES: usize = 16_384;
+
+/// Minimum spacing between full sweeps, so the O(n) pass is amortised to once per second no matter
+/// how fast distinct source IPs arrive.
+const HANDSHAKE_FAIL_SWEEP_MIN_SECS: u64 = 1;
+
+/// Fraction of the map dropped in one eviction pass when a sweep frees nothing (all entries live).
+/// Evicting a batch amortises the O(n) scan over that many subsequent inserts.
+const HANDSHAKE_FAIL_EVICT_DIVISOR: usize = 8;
 
 struct HandshakeFailState {
     fail_count: AtomicU64,
@@ -279,6 +289,10 @@ impl Default for HandshakeFailState {
 static HANDSHAKE_FAIL_TRACKER: once_cell::sync::Lazy<
     DashMap<std::net::IpAddr, HandshakeFailState>
 > = once_cell::sync::Lazy::new(DashMap::new);
+
+/// Unix second of the last full sweep, so the O(n) pass runs at most once per
+/// HANDSHAKE_FAIL_SWEEP_MIN_SECS regardless of the arrival rate of new source IPs.
+static HANDSHAKE_FAIL_LAST_SWEEP: AtomicU64 = AtomicU64::new(0);
 
 /// Total ip_identity_gate rejects since boot. Security signal: a registered
 /// identity claimed from a non-registered IP (key compromise or misconfig).
@@ -315,6 +329,55 @@ fn is_handshake_ip_banned(ip: std::net::IpAddr) -> bool {
         .unwrap_or(false)
 }
 
+/// Make room for one NEW tracked IP. First drop every entry that is neither banned nor inside a live
+/// fail window (rate-limited to one pass per second); if that frees nothing, evict the batch closest
+/// to expiry so the scan is amortised over the next 1/DIVISOR inserts. Returns true if there is room.
+fn reserve_handshake_fail_slot(now: u64) -> bool {
+    if HANDSHAKE_FAIL_TRACKER.len() < HANDSHAKE_FAIL_MAX_ENTRIES {
+        return true;
+    }
+    let last = HANDSHAKE_FAIL_LAST_SWEEP.load(Ordering::Relaxed);
+    if now.saturating_sub(last) >= HANDSHAKE_FAIL_SWEEP_MIN_SECS
+        && HANDSHAKE_FAIL_LAST_SWEEP
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        HANDSHAKE_FAIL_TRACKER.retain(|_, s| {
+            s.banned_until_secs.load(Ordering::Relaxed) > now
+                || now.saturating_sub(s.window_start_secs.load(Ordering::Relaxed))
+                    <= HANDSHAKE_FAIL_WINDOW_SECS
+        });
+        if HANDSHAKE_FAIL_TRACKER.len() < HANDSHAKE_FAIL_MAX_ENTRIES {
+            return true;
+        }
+        // Every slot is live: drop the batch whose ban/window expires soonest. Keeping the
+        // longest-lived bans is the defensive choice — those are the confirmed abusers.
+        let mut by_expiry: Vec<(u64, std::net::IpAddr)> = HANDSHAKE_FAIL_TRACKER
+            .iter()
+            .map(|e| {
+                let s = e.value();
+                let ban = s.banned_until_secs.load(Ordering::Relaxed);
+                let win = s.window_start_secs.load(Ordering::Relaxed)
+                    .saturating_add(HANDSHAKE_FAIL_WINDOW_SECS);
+                (ban.max(win), *e.key())
+            })
+            .collect();
+        let drop_n = (by_expiry.len() / HANDSHAKE_FAIL_EVICT_DIVISOR).max(1);
+        by_expiry.sort_unstable_by_key(|(exp, _)| *exp);
+        for (_, victim) in by_expiry.into_iter().take(drop_n) {
+            HANDSHAKE_FAIL_TRACKER.remove(&victim);
+        }
+        if crate::node::is_warn() {
+            println!("[WARN][QUIC] handshake_fail_tracker_evicted dropped={} cap={}",
+                     drop_n, HANDSHAKE_FAIL_MAX_ENTRIES);
+        }
+        return true;
+    }
+    // At cap between sweeps: do not grow. The cryptographic handshake still gates this IP;
+    // only the cheap pre-TLS cooldown is unavailable for it until a slot frees.
+    false
+}
+
 /// Record one failed handshake from `ip`. Window rollover and cooldown
 /// promotion happen inline. Genesis IPs are exempt.
 fn record_handshake_fail(ip: std::net::IpAddr) {
@@ -322,6 +385,9 @@ fn record_handshake_fail(ip: std::net::IpAddr) {
         return;
     }
     let now = unix_secs_now();
+    if !HANDSHAKE_FAIL_TRACKER.contains_key(&ip) && !reserve_handshake_fail_slot(now) {
+        return;
+    }
     let entry = HANDSHAKE_FAIL_TRACKER.entry(ip).or_default();
     let window_start = entry.window_start_secs.load(Ordering::Relaxed);
     if window_start == 0 || now.saturating_sub(window_start) > HANDSHAKE_FAIL_WINDOW_SECS {
@@ -499,16 +565,10 @@ fn build_adaptive_transport(initial_rtt_ms: u64) -> quinn::TransportConfig {
     transport
 }
 
-// NODE HANDSHAKE — v19: authenticated identity binding (anti-spoof).
-// Handshake carries an OPTIONAL dilithium_proof = Dilithium3_sign(SK,
-// "qnet-quic-handshake-v1:{node_id}:{ts}:{block_height}"); receiver
-// verifies via consensus_crypto::verify_consensus_signature against the
-// immutable CONSENSUS_PK_REGISTRY (genesis anchors + on-chain super regs),
-// subordinating the old X.509-SAN/TOFU admit to a crypto identity gate.
-// Phase 2.A: proof is Option — pre-v19 (None) still admitted + [WARN];
-// enforcement ADVISORY (verify-and-log); Phase 2.B → strict refuse after
-// the migration window. Challenge bound to (node_id,ts,height) → no
-// cross-identity / stale-boot replay. ~1 Dilithium verify per conn.
+// NODE HANDSHAKE — authenticated identity binding (anti-spoof).
+// ONE canonical wire format. Every handshake carries a mandatory Dilithium3 proof over
+// (node_id, timestamp, block_height, channel_binding); a frame that does not decode, or a
+// proof that fails under a REGISTERED PK, refuses the connection. Cost: <=1 verify per conn.
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeHandshake {
@@ -517,86 +577,19 @@ pub struct NodeHandshake {
     pub protocol_version: u8,
     pub node_type: String,
     pub timestamp: u64,
-    /// v9.7: Block height at handshake time — peers know real height from first second.
-    /// Without this, all peers start at height 0 and sync determines wrong network_height
-    /// (100 instead of 5220) → sync completes prematurely → node declared synchronized
-    /// while thousands of blocks behind → VRF selects it → network stalls.
+    /// Sender's committed tip. Without it every peer starts at 0, sync resolves a network
+    /// height far below the real head and declares itself synchronized while thousands of
+    /// blocks behind.
     pub block_height: u64,
-    /// v19: Optional Dilithium3 proof of identity. Set by v19+ senders;
-    /// `None` from older peers during the Phase 2.A migration window.
-    /// Verification is advisory in Phase 2.A and strict in Phase 2.B.
-    #[serde(default)]
-    pub dilithium_proof: Option<Vec<u8>>,
+    /// Mandatory ML-DSA-65 proof of identity over the canonical handshake challenge.
+    pub dilithium_proof: Vec<u8>,
 }
 
-/// v9.7: Pre-v19 handshake format with `block_height` but no Dilithium proof.
-/// Used for backward-compatible deserialization when connecting to v9.7..v18 nodes.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct NodeHandshakeV2 {
-    pub node_id: String,
-    pub cert_serial: String,
-    pub protocol_version: u8,
-    pub node_type: String,
-    pub timestamp: u64,
-    pub block_height: u64,
-}
-
-/// Pre-v9.7 legacy handshake format without `block_height` (and without proof).
-/// Used for backward-compatible deserialization when connecting to oldest peers.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct NodeHandshakeLegacy {
-    pub node_id: String,
-    pub cert_serial: String,
-    pub protocol_version: u8,
-    pub node_type: String,
-    pub timestamp: u64,
-}
-
-impl NodeHandshakeV2 {
-    fn into_handshake(self) -> NodeHandshake {
-        NodeHandshake {
-            node_id: self.node_id,
-            cert_serial: self.cert_serial,
-            protocol_version: self.protocol_version,
-            node_type: self.node_type,
-            timestamp: self.timestamp,
-            block_height: self.block_height,
-            dilithium_proof: None, // v18 and older — no proof, advisory log on verify path
-        }
-    }
-}
-
-impl NodeHandshakeLegacy {
-    fn into_handshake(self) -> NodeHandshake {
-        NodeHandshake {
-            node_id: self.node_id,
-            cert_serial: self.cert_serial,
-            protocol_version: self.protocol_version,
-            node_type: self.node_type,
-            timestamp: self.timestamp,
-            block_height: 0, // Legacy node — height unknown, will be set by first HealthPing
-            dilithium_proof: None,
-        }
-    }
-}
-
-/// v19: Deserialize handshake with three-way backward compatibility.
-/// Try the v19 format first (with optional Dilithium proof), fall back to
-/// the v9.7 format (with block_height), then the pre-v9.7 legacy format.
-fn deserialize_handshake(data: &[u8]) -> Result<NodeHandshake, String> {
-    // Try v19 format first (includes optional dilithium_proof field)
-    if let Ok(hs) = bincode::deserialize::<NodeHandshake>(data) {
-        return Ok(hs);
-    }
-    // Fallback: v9.7 format without proof (pre-v19 peers)
-    if let Ok(v2) = bincode::deserialize::<NodeHandshakeV2>(data) {
-        return Ok(v2.into_handshake());
-    }
-    // Fallback: pre-v9.7 legacy format without block_height
-    match bincode::deserialize::<NodeHandshakeLegacy>(data) {
-        Ok(legacy) => Ok(legacy.into_handshake()),
-        Err(e) => Err(format!("Handshake deserialize failed (all formats): {}", e)),
-    }
+/// Decode the single canonical handshake format. No fallback ladder: an undecodable frame
+/// is refused, which keeps the attacker-chosen deserialisation surface to one shape.
+fn decode_handshake(data: &[u8]) -> Result<NodeHandshake, String> {
+    bincode::deserialize::<NodeHandshake>(data)
+        .map_err(|e| format!("handshake_decode_failed: {}", e))
 }
 
 /// v19: Build the canonical handshake challenge string that the Dilithium
@@ -647,97 +640,80 @@ fn require_channel_binding(conn: &quinn::Connection) -> Result<String, String> {
         .ok_or_else(|| "channel_binding_unavailable".to_string())
 }
 
-/// v19: Best-effort generation of a Dilithium3 handshake proof.
-///
-/// The proof is built by signing `handshake_challenge_message` with the
-/// local node's persisted Dilithium keypair via the same path that
-/// produces consensus signatures (`create_consensus_signature`). When the
-/// crypto subsystem is not yet initialised — only possible during a
-/// brief window at very early boot — the helper returns `None` and the
-/// handshake field stays empty. The receiver tolerates this gracefully
-/// during the Phase 2.A migration window.
+/// Sign the canonical handshake challenge with the local node's Dilithium key, through the
+/// same path that produces consensus signatures. A node that cannot prove its own identity
+/// must not complete a handshake, so every failure here refuses the connection instead of
+/// putting an unprovable identity on the wire.
 pub async fn build_handshake_proof(
     node_id: &str,
     timestamp: u64,
     block_height: u64,
     channel_binding: &str,
-) -> Option<Vec<u8>> {
-    let crypto = match crate::node::try_get_quantum_crypto() {
-        Some(c) => c,
-        None => return None,
-    };
+) -> Result<Vec<u8>, String> {
+    let crypto = crate::node::try_get_quantum_crypto()
+        .ok_or_else(|| "local_crypto_uninitialized".to_string())?;
     let challenge = handshake_challenge_message(node_id, timestamp, block_height, channel_binding);
-    match crypto.create_consensus_signature(node_id, &challenge).await {
-        Ok(sig) => Some(sig.signature.into_bytes()),
-        Err(_) => None,
-    }
+    crypto
+        .create_consensus_signature(node_id, &challenge)
+        .await
+        .map(|sig| sig.signature.into_bytes())
+        .map_err(|_| "local_proof_sign_failed".to_string())
 }
 
-/// v19.1: advisory handshake-proof verification. Three-state contract:
-///   Ok(true)  — proof supplied AND verified under the claimed identity's
-///               REGISTERED Dilithium PK (cryptographically authenticated).
-///   Ok(false) — admitted via a documented advisory path (NOT a sig-gate
-///               violation): (a) no proof (pre-v19 sender), (b) crypto not
-///               yet initialised, or (c) PK not yet in the consensus
-///               registry — a fresh-bootstrap joiner whose binding is set
-///               by its inbound self-signed VrfKeyAnnounce.
-///   Err       — proof supplied AND PK IS registered AND sig failed: the
-///               only drop path (real squat vs unknown-PK first contact).
-/// "PK absent" is split out of the failure path because the L1 invariant
-/// requires connection establishment to NOT need pre-knowledge of the peer
-/// key (identity binds via signed messages over the conn) — else fresh
-/// boot deadlocks. Security: Ok(false) admits but does NOT authenticate;
-/// every consensus message still passes verify_consensus_signature /
-/// heartbeat / VrfKeyAnnounce verify, so a fake proof for an unknown id
-/// gains nothing. O(1) lookup + <=1 Dilithium verify.
+/// Outcome of a handshake proof that was NOT refused. Refusal is the `Err` arm of
+/// `verify_handshake_proof`; this enum only separates authenticated from uncheckable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandshakeVerdict {
+    /// Proof verified under the claimed identity's registered Dilithium PK.
+    Verified,
+    /// The claimed identity cannot be resolved to a PK locally, so the proof is not
+    /// checkable yet. Admitted as unauthenticated transport only — nothing it asserts is
+    /// trusted until a message of its own verifies at the message layer.
+    NotYetVerifiable(&'static str),
+}
+
+/// Verify a peer's mandatory handshake proof. O(1) registry lookup plus at most one
+/// ML-DSA verify; no per-peer state is retained.
+///
+/// `Err` refuses the connection: absent, malformed, or forged-under-a-registered-PK proof.
+/// `Ok(NotYetVerifiable)` admits without authenticating — see the branch comments; refusing
+/// there would make cold join impossible.
 pub async fn verify_handshake_proof(
     claimed_node_id: &str,
     timestamp: u64,
     block_height: u64,
     channel_binding: &str,
-    proof: Option<&[u8]>,
-) -> Result<bool, String> {
-    let proof_bytes = match proof {
-        Some(p) if !p.is_empty() => p,
-        _ => return Ok(false), // (a) No proof attached — legacy peer
-    };
-    let proof_str = match std::str::from_utf8(proof_bytes) {
-        Ok(s) => s.to_string(),
-        Err(_) => return Err("handshake proof is not valid UTF-8".to_string()),
-    };
+    proof: &[u8],
+) -> Result<HandshakeVerdict, &'static str> {
+    if proof.is_empty() {
+        return Err("proof_missing");
+    }
+    let proof_str = std::str::from_utf8(proof).map_err(|_| "proof_not_utf8")?;
 
-    // (b) Crypto/P2P subsystems not yet ready — extremely early boot.
-    // The QUIC port only opens AFTER P2P comes online, so under
-    // production this branch should be unreachable; defended in depth.
-    let p2p = match crate::node::try_get_p2p() {
-        Some(p) => p,
-        None => return Ok(false),
-    };
-
-    // (c) v19.1: PK-miss path — peer is a fresh joiner whose identity
-    // binding is not yet in the consensus PK registry. Admit the
-    // connection so the peer's `VrfKeyAnnounce` (carrying its
-    // self-signed identity proof) can flow over it. Inline verify on
-    // that message is the canonical install path; until then the
-    // connection is a transport channel, not an authenticated peer.
+    // Claimed identity has no PK in the consensus registry: a joiner's key is not on chain
+    // yet and it installs the binding with the signed VrfKeyAnnounce that flows OVER this
+    // connection. Refusing here would deadlock every cold join, so the connection is a
+    // transport channel until that announce verifies.
     if !qnet_consensus::consensus_crypto::has_consensus_pk(claimed_node_id) {
-        return Ok(false);
+        return Ok(HandshakeVerdict::NotYetVerifiable("pk_unregistered"));
     }
 
-    // PK is in registry — proof MUST verify under it. A failure here is
-    // an attempted identity squat (someone produced a fake signature
-    // for a known identity).
+    // The verifier lives behind the P2P singleton, which is published shortly after the QUIC
+    // listener opens. Uncheckable, not invalid — same unauthenticated-transport treatment.
+    let p2p = match crate::node::try_get_p2p() {
+        Some(p) => p,
+        None => return Ok(HandshakeVerdict::NotYetVerifiable("verifier_unavailable")),
+    };
+
+    // PK is registered, so the proof MUST verify under it: a failure is an identity squat.
     let challenge = handshake_challenge_message(claimed_node_id, timestamp, block_height, channel_binding);
     if p2p
-        .verify_dilithium_heartbeat_signature_async(&challenge, &proof_str, claimed_node_id)
+        .verify_dilithium_heartbeat_signature_async(&challenge, proof_str, claimed_node_id)
         .await
     {
-        Ok(true)
+        Ok(HandshakeVerdict::Verified)
     } else {
-        Err(format!(
-            "handshake proof did not verify under registered PK for {}",
-            claimed_node_id
-        ))
+        Err("proof_verify_failed")
     }
 }
 
@@ -829,9 +805,6 @@ pub struct QuicTransport {
     stats: Arc<RwLock<QuicStats>>,
     /// Per-peer RTT cache for adaptive initial_rtt on reconnect (v6.3)
     rtt_cache: Arc<Mutex<PeerRttCache>>,
-    /// v6.5: node_id → "IP:8001" mapping shared with P2P layer
-    /// Populated on QUIC handshake so genesis nodes know how to reach new peers
-    peer_id_to_addr: Option<Arc<DashMap<String, String>>>,
     /// v9.0: TOFU (Trust On First Use) cert fingerprint pinning.
     /// Maps node_id → SHA3-256(cert DER) on first successful connection.
     /// Subsequent connections from same node_id MUST present same cert fingerprint.
@@ -867,7 +840,6 @@ impl QuicTransport {
             message_handler: None,
             stats: Arc::new(RwLock::new(QuicStats::default())),
             rtt_cache: Arc::new(Mutex::new(PeerRttCache::new())),
-            peer_id_to_addr: None,
             cert_fingerprint_pins: Arc::new(DashMap::new()),
             per_ip_connections: Arc::new(DashMap::new()),
             known_peer_ips: Arc::new(DashMap::new()),
@@ -877,12 +849,6 @@ impl QuicTransport {
         }
     }
     
-    /// v6.5: Set peer_id_to_addr mapping shared with P2P layer
-    /// Called before start_server() to enable bidirectional peer discovery
-    pub fn set_peer_id_to_addr(&mut self, map: Arc<DashMap<String, String>>) {
-        self.peer_id_to_addr = Some(map);
-    }
-
     /// Set message handler callback
     pub fn set_message_handler(&mut self, handler: MessageHandler) {
         self.message_handler = Some(handler);
@@ -1059,7 +1025,6 @@ impl QuicTransport {
         let node_id = self.node_id.clone();
         let cert_serial = self.cert_serial.clone();
         let node_type = self.node_type.clone();
-        let peer_id_to_addr_map = self.peer_id_to_addr.clone();
         let tofu_pins = self.cert_fingerprint_pins.clone();
         let per_ip_conns = self.per_ip_connections.clone();
         let known_ips = self.known_peer_ips.clone();
@@ -1168,7 +1133,6 @@ impl QuicTransport {
                 let stats_clone = stats.clone();
                 let node_id_clone = node_id.clone();
                 let cert_serial_clone = cert_serial.clone();
-                let peer_id_map_clone = peer_id_to_addr_map.clone();
                 let node_type_clone = node_type.clone();
                 let tofu_pins_clone = tofu_pins.clone();
                 let per_ip_conns_clone = per_ip_conns.clone();
@@ -1348,23 +1312,11 @@ impl QuicTransport {
                     known_ips_clone.insert(peer_ip_clone, ());
                     if is_info() { println!("[INFO][QUIC] conn_stored peer={} node={} type={} ip_tier=known", get_privacy_id_for_addr(&peer_addr.to_string()), remote_node_id, remote_node_type); }
 
-                    // v6.5 FIX: Map remote_node_id → "IP:8001" in P2P peer_id_to_addr
-                    // PROBLEM: Genesis nodes couldn't route responses to new nodes because
-                    //   ensure_peer_connected() uses privacy hash IDs, not real node_ids.
-                    //   QUIC handshake extracts remote_node_id but never mapped it.
-                    // SOLUTION: On every successful QUIC handshake (server side),
-                    //   insert remote_node_id → "peer_ip:8001" into shared DashMap.
-                    //   This enables handle_sync_request() and broadcast_transaction()
-                    //   to find the address of newly connected peers.
-                    if let Some(ref pid_map) = peer_id_map_clone {
-                        let peer_api_addr = format!("{}:8001", peer_addr.ip());
-                        pid_map.insert(remote_node_id.clone(), peer_api_addr.clone());
-                        if is_info() { println!("[INFO][QUIC] peer_mapped node_id={} addr={}", remote_node_id, peer_api_addr); }
-                    }
-
                     // Register the inbound (client-dialed) peer for signed-head relay reachability:
                     // is_outbound=false keeps eclipse/reputation/subnet caps; height 0 until its first
                     // signed HealthPing attests the tip (so it is not quorum-counted early).
+                    // This is the ONLY writer of the shared node_id → address index: writing it here
+                    // would route directed sends to an identity the admission gates refused.
                     if let Some(p2p) = crate::node::try_get_p2p() {
                         p2p.attest_connected_peer(&remote_node_id, &peer_addr.ip().to_string(), &remote_node_type, 0, false, false);
                     }
@@ -1424,8 +1376,7 @@ impl QuicTransport {
             let mut data = vec![0u8; len];
             recv.read_exact(&mut data).await.map_err(|e| format!("Read data failed: {}", e))?;
 
-            // v9.7: Backward-compatible deserialization (supports pre-v9.7 nodes)
-            let peer_handshake = deserialize_handshake(&data)?;
+            let peer_handshake = decode_handshake(&data)?;
 
             // v30.B1: early IP-identity gate. Reject impersonation BEFORE
             // the ~ms Dilithium verify pass. Genesis identity from a non-
@@ -1444,21 +1395,19 @@ impl QuicTransport {
                 return Err("ip_identity_gate_reject".to_string());
             }
 
-            // v19: Verify peer's Dilithium identity proof BEFORE sending ours.
-            // On Err the connection is aborted — we never reveal our own proof
-            // to a peer that supplied a bogus one. On Ok(false) we proceed
-            // (Phase 2.A backward compatibility) but emit an audit log.
-            // Derived from OUR end of the same session; the peer signed the identical value from its
-            // end, so a proof captured on any other connection simply will not verify.
+            // Verify the peer's identity proof BEFORE sending ours, so a peer that supplied a
+            // bogus one never sees our proof. Binding derived from OUR end of the same session;
+            // the peer signed the identical value, so a proof lifted off another connection
+            // cannot verify here.
             let peer_binding = require_channel_binding(conn)?;
             match verify_handshake_proof(
                 &peer_handshake.node_id,
                 peer_handshake.timestamp,
                 peer_handshake.block_height,
                 &peer_binding,
-                peer_handshake.dilithium_proof.as_deref(),
+                &peer_handshake.dilithium_proof,
             ).await {
-                Ok(true) => {
+                Ok(HandshakeVerdict::Verified) => {
                     if is_info() {
                         println!("[INFO][HANDSHAKE] dilithium_proof_verified side=server node={} h={}",
                                  peer_handshake.node_id, peer_handshake.block_height);
@@ -1479,34 +1428,24 @@ impl QuicTransport {
                         }
                     }
                 }
-                Ok(false) => {
-                    // v19.1: Advisory admit. Three causes possible (in order
-                    // of likelihood for a fresh cluster):
-                    //   (c) PK not yet in CONSENSUS_PK_REGISTRY — peer's
-                    //       VrfKeyAnnounce will install it;
-                    //   (a) peer is pre-v19 and did not attach a proof;
-                    //   (b) local crypto subsystem not yet initialised.
-                    // None of these are attacks — the peer is admitted,
-                    // and every consensus message it later sends still
-                    // goes through full Dilithium3 verification.
+                Ok(HandshakeVerdict::NotYetVerifiable(reason)) => {
+                    // Admitted as transport only: the peer's identity is not resolvable here
+                    // yet, and everything it later asserts still passes message-layer verify.
                     if crate::node::is_warn() {
-                        println!("[WARN][HANDSHAKE] advisory_admit side=server node={} reason=pk_unknown_or_no_proof hint=will_authenticate_via_VrfKeyAnnounce_or_consensus_msg",
-                                 peer_handshake.node_id);
+                        println!("[WARN][QUIC] handshake_unverified side=server peer={} reason={}",
+                                 get_privacy_id_for_addr(&peer_addr.to_string()), reason);
                     }
                 }
-                Err(e) => {
+                Err(reason) => {
                     if crate::node::is_warn() {
-                        println!("[WARN][HANDSHAKE] dilithium_proof_invalid side=server node={} reason={} action=close",
-                                 peer_handshake.node_id, e);
+                        println!("[WARN][QUIC] handshake_refused side=server peer={} reason={}",
+                                 get_privacy_id_for_addr(&peer_addr.to_string()), reason);
                     }
-                    return Err(format!("handshake_proof_invalid: {}", e));
+                    return Err(format!("handshake_refused: {}", reason));
                 }
             }
 
-            // v19: Build our own Dilithium proof for the response leg.
-            // `build_handshake_proof` returns `None` only if the local crypto
-            // subsystem is not yet initialised (early boot) — peers tolerate
-            // this during the migration window.
+            // Our own proof for the response leg. Refuse rather than answer unprovably.
             let our_timestamp = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -1521,7 +1460,7 @@ impl QuicTransport {
                 our_timestamp,
                 our_block_height,
                 &our_binding,
-            ).await;
+            ).await?;
 
             // Send our handshake
             let our_handshake = NodeHandshake {
@@ -1530,9 +1469,7 @@ impl QuicTransport {
                 protocol_version: PROTOCOL_VERSION,
                 node_type: our_node_type.to_string(),
                 timestamp: our_timestamp,
-                // v9.7: Include our current block height so peer knows it immediately
                 block_height: our_block_height,
-                // v19: Authenticated identity binding (Phase 2.A: advisory)
                 dilithium_proof: our_proof,
             };
 
@@ -1748,11 +1685,11 @@ impl QuicTransport {
         // OWN signed head, so no per-ping verify here (the follower re-verifies on ingest — I1). Gate only
         // on the lead: reply iff we are >= HEAD_REPLY_MIN_GAP ahead — suppresses at-tip chatter, O(1)/conn.
         let head = crate::unified_p2p::LATEST_SIGNED_HEAD.read().clone();
-        let (h_from, h_ts, h_height, h_sig, h_pk) = match head { Some(h) => h, None => return };
+        let (h_from, h_ts, h_height, h_sig) = match head { Some(h) => h, None => return };
         if h_height < peer_height.saturating_add(crate::unified_p2p::HEAD_REPLY_MIN_GAP) { return; }
         // Re-emit OUR signed head over THIS live conn (same framing as try_broadcast_once, no dial).
         let (hint_mb, hint_round) = crate::unified_p2p::current_tc_hint();
-        let reply = crate::unified_p2p::NetworkMessage::HealthPing { from: h_from, timestamp: h_ts, height: h_height, cert_mb: hint_mb, cert_round: hint_round, signature: h_sig, public_key: h_pk };
+        let reply = crate::unified_p2p::NetworkMessage::HealthPing { from: h_from, timestamp: h_ts, height: h_height, cert_mb: hint_mb, cert_round: hint_round, signature: h_sig };
         if let Ok(wire) = Self::serialize_message(&reply) {
             // Bounded like try_broadcast_once so a stalled stream never pins this per-stream task's permit.
             let _ = tokio::time::timeout(Duration::from_secs(MESSAGE_TIMEOUT_SECS), async {
@@ -2173,12 +2110,8 @@ impl QuicTransport {
         
         if is_info() { println!("[INFO][QUIC] connected peer={} node={} type={}", get_privacy_id_for_addr(&peer_addr.to_string()), remote_node_id, remote_node_type); }
 
-        // v6.5: Map remote_node_id → address on client side too
-        if let Some(ref pid_map) = self.peer_id_to_addr {
-            let peer_api_addr = format!("{}:8001", peer_addr.ip());
-            pid_map.insert(remote_node_id.clone(), peer_api_addr.clone());
-            if is_info() { println!("[INFO][QUIC] peer_mapped_client node_id={} addr={}", remote_node_id, peer_api_addr); }
-        }
+        // The node_id → address index is written by attest_connected_peer above, through
+        // add_peer_lockfree: a peer the admission gates refuse must not be routable here.
 
         // Store connection
         let quic_conn = Arc::new(QuicConnection {
@@ -2224,9 +2157,8 @@ impl QuicTransport {
         let handshake_timeout = Duration::from_secs(CONNECT_TIMEOUT_SECS);
 
         tokio::time::timeout(handshake_timeout, async {
-            // v19: Build Dilithium identity proof BEFORE constructing handshake.
-            // The proof binds (node_id, timestamp, block_height) so a captured
-            // proof cannot be replayed against a different identity or epoch.
+            // Identity proof first: it binds (node_id, timestamp, block_height, binding), so a
+            // captured proof cannot be replayed under another identity, epoch or session.
             let our_timestamp = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -2239,7 +2171,7 @@ impl QuicTransport {
                 our_timestamp,
                 our_block_height,
                 &our_binding,
-            ).await;
+            ).await?;
 
             // Our handshake
             let our_handshake = NodeHandshake {
@@ -2248,9 +2180,7 @@ impl QuicTransport {
                 protocol_version: PROTOCOL_VERSION,
                 node_type: self.node_type.clone(),
                 timestamp: our_timestamp,
-                // v9.7: Include our current block height
                 block_height: our_block_height,
-                // v19: Authenticated identity binding (Phase 2.A: advisory)
                 dilithium_proof: our_proof,
             };
 
@@ -2282,44 +2212,38 @@ impl QuicTransport {
             let mut data = vec![0u8; len];
             recv.read_exact(&mut data).await.map_err(|e| format!("Read data failed: {}", e))?;
 
-            // v9.7: Backward-compatible deserialization (supports pre-v9.7 nodes)
-            let peer_handshake = deserialize_handshake(&data)?;
+            let peer_handshake = decode_handshake(&data)?;
 
-            // v19: Verify peer's Dilithium identity proof on the response leg.
-            // On Err the connection is aborted — caller drops the conn after
-            // we return Err. On Ok(false) the peer is treated as legacy
-            // (Phase 2.A backward compatibility) but logged for audit.
-            // verified=true only on Ok(true) (Dilithium proof verified). Ok(false)=advisory admit
-            // (PK unknown) → peer is usable for transport but its height must NOT be attested.
+            // Verify the peer's proof on the response leg. `verified` gates height attestation:
+            // an unverified peer is usable as transport but its claimed tip is not attested.
             let peer_binding = require_channel_binding(conn)?;
             let verified = match verify_handshake_proof(
                 &peer_handshake.node_id,
                 peer_handshake.timestamp,
                 peer_handshake.block_height,
                 &peer_binding,
-                peer_handshake.dilithium_proof.as_deref(),
+                &peer_handshake.dilithium_proof,
             ).await {
-                Ok(true) => {
+                Ok(HandshakeVerdict::Verified) => {
                     if is_info() {
                         println!("[INFO][HANDSHAKE] dilithium_proof_verified side=client node={} h={}",
                                  peer_handshake.node_id, peer_handshake.block_height);
                     }
                     true
                 }
-                Ok(false) => {
-                    // Advisory admit: consensus messages over this connection still get full Dilithium3 verify.
+                Ok(HandshakeVerdict::NotYetVerifiable(reason)) => {
                     if crate::node::is_warn() {
-                        println!("[WARN][HANDSHAKE] advisory_admit side=client node={} reason=pk_unknown_or_no_proof hint=will_authenticate_via_VrfKeyAnnounce_or_consensus_msg",
-                                 peer_handshake.node_id);
+                        println!("[WARN][QUIC] handshake_unverified side=client peer={} reason={}",
+                                 get_privacy_id_for_addr(&conn.remote_address().to_string()), reason);
                     }
                     false
                 }
-                Err(e) => {
+                Err(reason) => {
                     if crate::node::is_warn() {
-                        println!("[WARN][HANDSHAKE] dilithium_proof_invalid side=client node={} reason={} action=close",
-                                 peer_handshake.node_id, e);
+                        println!("[WARN][QUIC] handshake_refused side=client peer={} reason={}",
+                                 get_privacy_id_for_addr(&conn.remote_address().to_string()), reason);
                     }
-                    return Err(format!("handshake_proof_invalid: {}", e));
+                    return Err(format!("handshake_refused: {}", reason));
                 }
             };
 
@@ -2582,15 +2506,24 @@ impl QuicTransport {
     fn serialize_message(msg: &NetworkMessage) -> Result<Vec<u8>, String> {
         let payload = bincode::serialize(msg)
             .map_err(|e| format!("Serialize failed: {}", e))?;
-        
-        if payload.len() > MAX_MESSAGE_SIZE {
-            return Err(format!("Message too large: {}", payload.len()));
+
+        // Enforce the SAME per-type cap the receiver applies. Without this the sender only checked
+        // the global ceiling, so a type whose frame outgrew its own cap was accepted here and
+        // dropped by every peer before deserialization — alive on send, dead on receive, silent on
+        // both sides. Fail loudly at the source instead.
+        let msg_type = Self::get_message_type(msg);
+        let type_limit = max_size_for_message_type(msg_type);
+        if payload.len() > type_limit {
+            return Err(format!(
+                "type={} payload={}B exceeds type_limit={}B",
+                msg_type, payload.len(), type_limit
+            ));
         }
-        
+
         // Build wire format: version (1) + type (1) + length (4) + payload
         let mut wire_data = Vec::with_capacity(6 + payload.len());
         wire_data.push(PROTOCOL_VERSION);
-        wire_data.push(Self::get_message_type(msg));
+        wire_data.push(msg_type);
         wire_data.extend_from_slice(&(payload.len() as u32).to_be_bytes());
         wire_data.extend_from_slice(&payload);
         
@@ -2604,13 +2537,9 @@ impl QuicTransport {
             NetworkMessage::Transaction { .. } => 2,
             NetworkMessage::PeerDiscovery { .. } => 3,
             NetworkMessage::HealthPing { .. } => 4,
-            NetworkMessage::ConsensusCommit { .. } => 5,
-            NetworkMessage::ConsensusReveal { .. } => 6,
             #[allow(deprecated)]
             NetworkMessage::EmergencyProducerChange { .. } => 7,
             NetworkMessage::ShredProtocolChunk { .. } => 8,
-            #[allow(deprecated)]
-            NetworkMessage::ReputationSyncDeprecated { .. } => 9,
             // Large consensus frames: a 1000-committee QC (no PQ sig aggregation) + macroblocks that
             // embed it exceed the 2 MB catch-all → dedicated type with the full 10 MB cap. A same-round
             // 2f+1 TimeoutCertificate carries the SAME committee sig-set (~667-1000 ML-DSA sigs ≈ 2-3.4 MB),
@@ -3112,19 +3041,15 @@ impl QuicTransport {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// v19: REGRESSION TESTS — DILITHIUM HANDSHAKE BINDING
+// REGRESSION TESTS — DILITHIUM HANDSHAKE BINDING
 // ═══════════════════════════════════════════════════════════════════════════
-// Verifies the offline (no-network, no-crypto-init) properties of the new
-// authenticated handshake helpers:
-//   * canonical challenge format is byte-stable across versions
-//   * three-way deserialize ladder accepts every legacy on-wire shape
-//   * verify_handshake_proof has the documented `Ok(false)` legacy fallback
-//     and `Err` for malformed proofs
-// Tests that require a live Dilithium keypair / `try_get_p2p` are intentionally
-// out-of-scope for unit tests — those properties are exercised end-to-end on
-// the testnet in the deploy gate.
+// Offline (no-network, no-crypto-init) properties of the authenticated handshake:
+//   * canonical challenge format is byte-stable
+//   * exactly one wire shape decodes
+//   * a proof-less or malformed proof refuses; an unregistered identity does not
+// Properties needing a live keypair / `try_get_p2p` are covered end-to-end in the deploy gate.
 #[cfg(test)]
-mod tests_v19_handshake {
+mod tests_handshake {
     use super::*;
 
     /// The handshake challenge is the message that the Dilithium proof signs
@@ -3139,11 +3064,8 @@ mod tests_v19_handshake {
         assert_eq!(m, "qnet-quic-handshake-v2:node_001:1700000000:12345:cb");
     }
 
-    /// A v19 sender produces a `NodeHandshake` with `dilithium_proof` set to
-    /// `Some(...)`. That MUST round-trip through bincode without losing the
-    /// proof field. Without this, every handshake would arrive with `proof
-    /// = None` and the receiver would log every peer as legacy — the
-    /// migration-window WARN noise would drown out genuine attacks.
+    /// The proof must survive the wire intact: a decoder that silently dropped it would
+    /// turn every peer into an unverifiable one and disarm the whole gate.
     #[test]
     fn handshake_with_proof_round_trips() {
         let hs = NodeHandshake {
@@ -3153,131 +3075,79 @@ mod tests_v19_handshake {
             node_type: "super".into(),
             timestamp: 1_700_000_000,
             block_height: 12345,
-            dilithium_proof: Some(vec![1, 2, 3, 4, 5]),
+            dilithium_proof: vec![1, 2, 3, 4, 5],
         };
         let bytes = bincode::serialize(&hs).expect("serialize");
-        let decoded = deserialize_handshake(&bytes).expect("deserialize");
+        let decoded = decode_handshake(&bytes).expect("deserialize");
         assert_eq!(decoded.node_id, "node_001");
         assert_eq!(decoded.block_height, 12345);
-        assert_eq!(decoded.dilithium_proof.as_deref(), Some(&[1, 2, 3, 4, 5][..]));
+        assert_eq!(decoded.dilithium_proof, vec![1, 2, 3, 4, 5]);
     }
 
-    /// A pre-v19 (v9.7..v18) sender produces `NodeHandshakeV2` — same fields
-    /// minus `dilithium_proof`. The three-way deserialize ladder MUST
-    /// recognise that shape and translate it to a `NodeHandshake` with
-    /// `proof = None`. A failure here would block legacy peers from
-    /// connecting at all — defeating the Phase 2.A backward-compat goal.
+    /// One canonical format: a frame carrying every field EXCEPT the proof must not decode.
+    /// Any tolerated proof-less shape is a free bypass of the identity gate.
     #[test]
-    fn handshake_v2_back_compat_yields_no_proof() {
-        let v2 = NodeHandshakeV2 {
-            node_id: "legacy_v18".into(),
+    fn proofless_frame_does_not_decode() {
+        #[derive(Serialize)]
+        struct ProoflessFrame {
+            node_id: String,
+            cert_serial: String,
+            protocol_version: u8,
+            node_type: String,
+            timestamp: u64,
+            block_height: u64,
+        }
+        let bytes = bincode::serialize(&ProoflessFrame {
+            node_id: "no_proof".into(),
             cert_serial: "abc".into(),
             protocol_version: PROTOCOL_VERSION,
             node_type: "super".into(),
             timestamp: 1_700_000_000,
             block_height: 999,
-        };
-        let bytes = bincode::serialize(&v2).expect("serialize");
-        let decoded = deserialize_handshake(&bytes).expect("deserialize");
-        assert_eq!(decoded.node_id, "legacy_v18");
-        assert_eq!(decoded.block_height, 999);
-        assert!(decoded.dilithium_proof.is_none());
+        })
+        .expect("serialize");
+        assert!(decode_handshake(&bytes).is_err(), "proof-less frame must be refused");
     }
 
-    /// A pre-v9.7 sender produces `NodeHandshakeLegacy` — no proof and no
-    /// `block_height`. The deserialize ladder MUST recognise it and return
-    /// a normalised `NodeHandshake` with `block_height = 0` (the receiver
-    /// will let the first HealthPing populate the real value).
-    #[test]
-    fn handshake_legacy_back_compat_zero_height() {
-        let legacy = NodeHandshakeLegacy {
-            node_id: "ancient".into(),
-            cert_serial: "abc".into(),
-            protocol_version: PROTOCOL_VERSION,
-            node_type: "super".into(),
-            timestamp: 1_700_000_000,
-        };
-        let bytes = bincode::serialize(&legacy).expect("serialize");
-        let decoded = deserialize_handshake(&bytes).expect("deserialize");
-        assert_eq!(decoded.node_id, "ancient");
-        assert_eq!(decoded.block_height, 0);
-        assert!(decoded.dilithium_proof.is_none());
-    }
-
-    /// `verify_handshake_proof` returns `Ok(false)` when the peer did not
-    /// supply a proof. This is the documented Phase 2.A backward-compat
-    /// path — a peer running v18 connects, supplies no proof, and the
-    /// connection is admitted but logged as `[WARN][HANDSHAKE]
-    /// no_dilithium_proof`. Returning `Err` here would refuse legacy peers
-    /// outright and break the migration window.
+    /// An empty proof is a refusal, not an admit. This is the branch that used to
+    /// advisory-admit every peer that simply attached nothing.
     #[tokio::test]
-    async fn verify_returns_ok_false_for_missing_proof() {
-        let result =
-            verify_handshake_proof("node_001", 1_700_000_000, 100, "cb", None).await;
-        assert!(matches!(result, Ok(false)),
-            "expected Ok(false) for missing proof, got {:?}", result);
+    async fn verify_refuses_empty_proof() {
+        let result = verify_handshake_proof("node_001", 1_700_000_000, 100, "cb", &[]).await;
+        assert_eq!(result, Err("proof_missing"),
+            "empty proof MUST refuse, got {:?}", result);
     }
 
-    /// An empty-but-present proof byte slice is treated identically to
-    /// `None`. Without this, a Byzantine peer could trivially bypass the
-    /// "no proof" path by sending `Some(vec![])` to opt out of the
-    /// migration-window WARN logging while still being admitted — the
-    /// audit log MUST fire on every legacy peer.
+    /// Real signatures from `create_consensus_signature` are ASCII-prefixed strings
+    /// (`pq_p2p_bin:`, `compact_bin:`, `dilithium_sig_`), so non-UTF-8 bytes cannot be
+    /// one and the connection is dropped.
     #[tokio::test]
-    async fn verify_returns_ok_false_for_empty_proof() {
-        let empty: &[u8] = &[];
-        let result =
-            verify_handshake_proof("node_001", 1_700_000_000, 100, "cb", Some(empty)).await;
-        assert!(matches!(result, Ok(false)),
-            "expected Ok(false) for empty proof, got {:?}", result);
+    async fn verify_refuses_non_utf8_proof() {
+        let bad: &[u8] = &[0xC0, 0xC1, 0xF5];
+        let result = verify_handshake_proof("node_001", 1_700_000_000, 100, "cb", bad).await;
+        assert_eq!(result, Err("proof_not_utf8"),
+            "non-UTF-8 proof MUST refuse, got {:?}", result);
     }
 
-    /// A non-UTF-8 proof byte slice is rejected with `Err`. Real Dilithium3
-    /// signatures from `create_consensus_signature` are ASCII-prefixed
-    /// strings (`pq_p2p_bin:...`, `compact_bin:...`, `dilithium_sig_...`)
-    /// — anything that is not valid UTF-8 cannot be one of those formats
-    /// and is structurally invalid. Returning `Err` here is what causes
-    /// the receiver to drop the connection (handshake abort).
+    /// THE cold-join invariant: an identity with no PK in the consensus registry is NOT
+    /// refused. A joiner's key reaches the registry through the signed VrfKeyAnnounce that
+    /// travels over this very connection, so refusing here makes cold join impossible and
+    /// the "PK unknown" condition self-perpetuating. Empty test-process registry reproduces
+    /// exactly that state.
     #[tokio::test]
-    async fn verify_returns_err_for_non_utf8_proof() {
-        let bad: &[u8] = &[0xC0, 0xC1, 0xF5]; // invalid UTF-8 bytes
-        let result =
-            verify_handshake_proof("node_001", 1_700_000_000, 100, "cb", Some(bad)).await;
-        assert!(result.is_err(), "expected Err for non-UTF-8 proof, got {:?}", result);
-    }
-
-    /// v19.1: When a peer presents a syntactically valid proof for an
-    /// identity whose PK is NOT YET in the consensus PK registry, the
-    /// helper MUST return `Ok(false)` (advisory admit), not `Err`.
-    ///
-    /// Rationale: at fresh-cluster boot, every peer's first connection
-    /// arrives BEFORE that peer's PK has been cross-registered via
-    /// `VrfKeyAnnounce`. Returning `Err` in this state was the v19.0
-    /// regression that bricked fresh bootstrap — connections dropped
-    /// before the announce gossip could populate the registry, making
-    /// the "PK not in registry" condition self-perpetuating.
-    ///
-    /// Test methodology:
-    /// `try_get_p2p()` is `None` in unit-test context, which is itself an
-    /// `Ok(false)` branch (PK is also unknown — `has_consensus_pk`
-    /// returns false on an empty registry). We use a clearly fake but
-    /// well-formed UTF-8 proof string targeting an identity that
-    /// definitely is NOT in the test-process registry. The expected
-    /// outcome is `Ok(false)`.
-    #[tokio::test]
-    async fn verify_returns_ok_false_for_unknown_pk_with_proof() {
-        let fake_proof = b"compact_bin:never_registered_test_payload";
+    async fn verify_admits_unregistered_identity_unverified() {
+        let proof = b"compact_bin:never_registered_test_payload";
         let result = verify_handshake_proof(
-            "v19_1_test_unknown_identity_must_admit",
+            "test_unknown_identity_must_admit",
             1_700_000_000,
             100,
             "cb",
-            Some(fake_proof),
+            proof,
         ).await;
-        assert!(
-            matches!(result, Ok(false)),
-            "unknown identity with attached proof MUST advisory-admit (Ok(false)), got {:?}",
-            result
+        assert_eq!(
+            result,
+            Ok(HandshakeVerdict::NotYetVerifiable("pk_unregistered")),
+            "unregistered identity MUST admit unverified, got {:?}", result
         );
     }
 
@@ -3337,5 +3207,90 @@ mod tests_v19_handshake {
         assert_eq!(from_client, from_server, "both ends must derive an identical binding");
         assert_eq!(from_client.len(), 64, "binding is 32 bytes, hex-encoded");
         assert_ne!(from_client, hex::encode([0u8; 32]), "binding must not be all-zero");
+    }
+
+    /// The per-IP fail bucket is fed by remote addresses and a failing IP never produces the
+    /// successful handshake that clears its entry, so the map must be hard-capped: an attacker
+    /// spraying one bad frame per source address otherwise grows it until OOM.
+    #[test]
+    fn handshake_fail_tracker_stays_bounded() {
+        HANDSHAKE_FAIL_TRACKER.clear();
+        HANDSHAKE_FAIL_LAST_SWEEP.store(0, Ordering::Relaxed);
+        // 4x the cap of distinct, never-repeating source IPs (an IPv6 /64 sprayed one frame each).
+        for i in 0..(HANDSHAKE_FAIL_MAX_ENTRIES as u64 * 4) {
+            let ip = std::net::IpAddr::V6(std::net::Ipv6Addr::from(
+                0x2001_0db8_0000_0000_0000_0000_0000_0000u128 + i as u128,
+            ));
+            record_handshake_fail(ip);
+            assert!(
+                HANDSHAKE_FAIL_TRACKER.len() <= HANDSHAKE_FAIL_MAX_ENTRIES,
+                "tracker exceeded its cap at i={}", i,
+            );
+        }
+        assert!(HANDSHAKE_FAIL_TRACKER.len() > 0, "the cap bounds the map, it does not disable it");
+
+        // Bounding must not cost the defence: a tracked IP still bans on threshold breach and
+        // still clears on a confirmed-successful handshake.
+        HANDSHAKE_FAIL_TRACKER.clear();
+        let known = std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 5));
+        for _ in 0..HANDSHAKE_FAIL_THRESHOLD {
+            record_handshake_fail(known);
+        }
+        assert!(is_handshake_ip_banned(known), "threshold breach still bans");
+        clear_handshake_fail(known);
+        assert!(!is_handshake_ip_banned(known), "a successful handshake clears the ban");
+        HANDSHAKE_FAIL_TRACKER.clear();
+    }
+
+}
+
+#[cfg(test)]
+mod tests_wire_caps {
+    use super::*;
+    use crate::unified_p2p::NetworkMessage;
+
+    /// The receiver rejects any frame above `max_size_for_message_type` BEFORE deserializing, so a
+    /// message whose real frame outgrows its own cap is dropped by every peer with no log on either
+    /// side. That is how the signed-head emitter went silently dark. This pins the worst case of the
+    /// smallest-capped type: hex ML-DSA-65 signature (3309 B -> 6618 chars) plus a full-length node id.
+    #[test]
+    fn healthping_worst_case_fits_its_cap() {
+        let msg = NetworkMessage::HealthPing {
+            from: "super_QNET-XXXXXX-XXXXXX-XXXXXX".to_string(),
+            timestamp: u64::MAX,
+            height: u64::MAX,
+            cert_mb: u64::MAX,
+            cert_round: u64::MAX,
+            signature: "a".repeat(3309 * 2),
+        };
+        let wire = QuicTransport::serialize_message(&msg).expect("worst-case frame exceeds its own type cap");
+        let cap = max_size_for_message_type(4);
+        assert!(
+            wire.len() - 6 <= cap,
+            "HealthPing payload {}B over cap {}B",
+            wire.len() - 6,
+            cap
+        );
+    }
+
+    /// Every type the table caps below the global ceiling must round-trip its own frame: send-side
+    /// enforcement and receive-side enforcement read the same function, so a cap of 0 or a cap below
+    /// a type's fixed overhead would make that message class unusable in one direction only.
+    #[test]
+    fn capped_types_are_self_consistent() {
+        for t in [0u8, 1, 2, 3, 4, 8, 10] {
+            let cap = max_size_for_message_type(t);
+            assert!(cap >= 8 * 1024, "type {} cap {}B is below the minimum useful frame", t, cap);
+            assert!(cap <= MAX_MESSAGE_SIZE, "type {} cap {}B exceeds the global ceiling", t, cap);
+        }
+        assert_eq!(max_size_for_message_type(7), 0, "deprecated type must stay rejected");
+        // Consensus frames must keep the FULL ceiling: at committee 1000 a QuorumCertificate carries
+        // up to 1000 ML-DSA-65 signatures (~3.3 MB) and a macroblock embeds one. The sync path batches
+        // by bytes under this cap; shrinking it would silently break macroblock sync at scale.
+        assert_eq!(max_size_for_message_type(10), MAX_MESSAGE_SIZE, "ConsensusV2/MacroblocksBatch cap");
+        assert!(
+            max_size_for_message_type(10) >= 2 * 1000 * 3309,
+            "type 10 must hold a full 1000-signer certificate with room for the block it rides in"
+        );
     }
 }

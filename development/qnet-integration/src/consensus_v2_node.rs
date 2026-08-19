@@ -276,7 +276,8 @@ fn timeout_sig_compact_ok(voter: &str, index: u64, high_qc_index: u64, sig: &[u8
         voter, &sign_str("TMO", &timeout_bytes(index, high_qc_index)), sig_str, &pk)
 }
 
-/// Live-gossip QC admission. The threshold comes from THIS node's recovery arm, which is advisory:
+/// Live-gossip QC admission. The threshold follows the PIN THE CERTIFIED CHECKPOINT CARRIES, which is
+/// advisory:
 /// an unarmed node simply does not adopt a relaxed QC live and instead accepts the macroblock through
 /// verify_v2_macroblock, the sole authority, which re-derives the pin from the certificate's bytes.
 /// So a disagreement here is liveness-only and can never fork.
@@ -293,7 +294,7 @@ fn verify_qc(_p2p: &SimplifiedP2P, committee: &[String], qc: &QuorumCertificate)
             _ => crate::genesis_constants::get_genesis_anchor_pk(id).map(|p| (id.clone(), p)),
         }
     }).collect();
-    qc.verify(committee, crate::node::rc_effective_quorum(qc.index, committee.len()), |voter, body, sig| {
+    qc.verify(committee, crate::node::rc_effective_quorum(qc.index, &qc.checkpoint_hash, committee.len()), |voter, body, sig| {
         let pk = match pk_map.get(voter) { Some(p) => p, None => return false };
         match std::str::from_utf8(sig) {
             Ok(s) => qnet_consensus::consensus_crypto::verify_consensus_signature_compact(
@@ -380,6 +381,38 @@ pub(crate) fn checkpoint_finalizable(chain_h: u64, head_height: u64, local_state
     head_height > 0 && chain_h >= head_height && local_state_root == Some(checkpoint_state_root)
 }
 
+/// Seal-path threshold self-check. All-seal writes the macroblock LOCALLY, never through
+/// `verify_v2_macroblock`, so without re-applying that authority's clauses here a node seals exactly
+/// what its peers reject — a permanent partition with zero Byzantine nodes. Runs for PINNED AND
+/// UNPINNED certificates alike: relaxing is the pin's business, but re-proving the threshold is every
+/// certificate's. FAIL-CLOSED: a DEFER (anchor not held yet) refuses too, because not sealing costs
+/// one window and sealing an unresolvable pin costs the chain.
+fn rc_seal_ok(
+    storage: &Storage,
+    checkpoint: &qnet_consensus::checkpoint_bft::Checkpoint,
+    qc: &QuorumCertificate,
+    committee: &[String],
+) -> Result<(), (&'static str, String)> {
+    let mb = checkpoint.window_head_height / qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
+    if qc.checkpoint_hash != checkpoint.hash() {
+        return Err(("rc_qc_unbound", format!("mb={}", mb)));
+    }
+    // The pin lowers the THRESHOLD only; the signing set is the committee this window was driven
+    // with, exactly as verify_v2_macroblock derives it. Signatures were verified when this QC was
+    // adopted; re-opening <=1000 ML-DSA sigs on the seal path would only re-prove that, so only the
+    // set, the distinctness and the count are re-checked.
+    let q = match checkpoint.recovery_anchor {
+        None => qnet_consensus::checkpoint_bft::quorum_size(committee.len()),
+        Some((a, ah)) => {
+            if !crate::node::RC_ENABLED { return Err(("rc_disabled", format!("mb={}", mb))); }
+            crate::node::BlockchainNode::resolve_recovery_pin(storage, mb, checkpoint, a, ah, committee.len())
+                .map_err(|e| ("rc_unresolved", e))?
+        }
+    };
+    qc.verify(committee, q, |_, _, _| true).map_err(|e| ("rc_qc_rejected", format!("mb={} err={}", mb, e)))?;
+    Ok(())
+}
+
 /// Execute driver Effects: sign+broadcast outbound, persist QCs, record finality.
 pub async fn execute(effects: Vec<Effect>, node_id: &str, p2p: &Arc<SimplifiedP2P>, storage: &Arc<Storage>) {
     for e in effects {
@@ -391,7 +424,19 @@ pub async fn execute(effects: Vec<Effect>, node_id: &str, p2p: &Arc<SimplifiedP2
                     broadcast(p2p, &ConsensusMsg::Proposal(cp)).await;
                 }
             }
-            Effect::Vote { index, checkpoint_hash } => {
+            Effect::Vote { index, checkpoint_hash, commit } => {
+                // The commitment reaches DISK before the vote reaches the wire. The engine refuses a
+                // second vote at one index/head and peers CONVICT that pair, so a commitment lost
+                // across a restart is a permanent ban on an honest node. Fail-closed: no record, no
+                // vote — withholding costs one round.
+                if let Err(e) = storage.record_checkpoint_vote(
+                    commit.index, commit.window_head, &commit.content_digest,
+                    commit.pinned, commit.parent_index, &commit.parent_hash) {
+                    if crate::node::is_warn() {
+                        println!("[WARN][BFT2] vote_withheld reason=commitment_not_durable index={} err={}", index, e);
+                    }
+                    continue;
+                }
                 if let Some(s) = sign_payload(node_id, "VOTE", &checkpoint_hash).await {
                     broadcast(p2p, &ConsensusMsg::Vote(Vote { checkpoint_hash, index, voter: node_id.to_string(), signature: s })).await;
                 }
@@ -403,13 +448,14 @@ pub async fn execute(effects: Vec<Effect>, node_id: &str, p2p: &Arc<SimplifiedP2
             }
             Effect::Relay(m) => broadcast(p2p, &m).await,
             Effect::Persist { checkpoint, qc, eligible_producers, committee } => {
-                // Never seal a pinned checkpoint while the relaxation is off: all-seal writes without
-                // verifying, and every peer would reject the macroblock.
-                if !crate::node::RC_ENABLED && checkpoint.recovery_anchor.is_some() {
+                // Fail-closed pin self-check before anything is written. `continue`, never `return` —
+                // a return would also drop the Finalize queued behind this effect.
+                if let Err((reason, detail)) = rc_seal_ok(storage, &checkpoint, &qc, &committee) {
                     if crate::node::is_warn() {
-                        println!("[WARN][BFT2] persist_refused reason=rc_disabled head={}", checkpoint.window_head_height);
+                        println!("[WARN][BFT2] persist_refused reason={} head={} detail={}",
+                                 reason, checkpoint.window_head_height, detail);
                     }
-                    return;
+                    continue;
                 }
                 // Every committee member seals locally: the body is a pure function of the
                 // committed window (deterministic), so all produce a byte-identical block —
@@ -688,6 +734,9 @@ enum ContentCheck {
 /// Single source of truth for the live inbound path AND drain_pending (replay = the same gate).
 fn check_content(storage: &Storage, buf: &std::collections::HashMap<u64, WindowContent>, msg: &ConsensusMsg) -> ContentCheck {
     let cp = match msg { ConsensusMsg::Proposal(cp) => cp, _ => return ContentCheck::Ok };
+    // The pin is attacker-chosen wire data that selects a lower threshold. While the feature is off
+    // no node may sign one, or an unarmed committee certifies a checkpoint every peer then rejects.
+    if !crate::node::RC_ENABLED && cp.recovery_anchor.is_some() { return ContentCheck::Reject; }
     let k = qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL;
     // Absent window snapshot = this node hasn't derived its own view of this checkpoint yet (apply-lag /
     // eviction), NOT a divergence. Defer (buffer + retry) so a lagging voter never silently fail-stops on a
@@ -932,6 +981,26 @@ pub async fn run(
     // committee rotates each epoch (N-2 VRF sample); kept here for verify_msg and
     // mirrored into the driver/engine via build_proposal.
     let mut driver = ConsensusDriver::new(node_id.clone(), committee.clone(), genesis_hash);
+    // Reload what this node already voted for. Unreadable ⇒ do not run consensus: a replica that
+    // cannot know its own commitments re-votes at a head it already voted at and is convicted for it.
+    match storage.load_checkpoint_votes() {
+        Ok(recs) => {
+            let commits: Vec<crate::consensus_v2_driver::VoteCommitment> = recs.into_iter()
+                .map(|r: (u64, u64, [u8; 32], bool, u64, [u8; 32])|
+                    crate::consensus_v2_driver::VoteCommitment {
+                        index: r.0, window_head: r.1, content_digest: r.2,
+                        pinned: r.3, parent_index: r.4, parent_hash: r.5 })
+                .collect();
+            if !commits.is_empty() && crate::node::is_info() {
+                println!("[INFO][BFT2] vote_commitments_restored count={}", commits.len());
+            }
+            driver.restore_vote_commitments(&commits);
+        }
+        Err(e) => {
+            println!("[ERROR][BFT2] consensus_not_started reason=vote_commitments_unreadable err={}", e);
+            return;
+        }
+    }
     // Consensus pacing — network-uniform const, NOT an operator env (per-node tuning desyncs
     // view-change timing and churns liveness). Change = rebuild the whole network.
     let timeout_ms: u64 = qnet_consensus::checkpoint_bft::VIEW_TIMEOUT_MS;
@@ -1064,14 +1133,9 @@ pub async fn run(
                         last_signaled = last_signaled.max(index);
                         let head_ts = storage.load_microblock_auto_format(head_height)
                             .ok().flatten().map(|m| m.timestamp).unwrap_or(0);
-                        // Inside an armed span the committee IS the anchor's C_S — the derived set for a
-                        // stuck window is read from the uncertified tail and has already been shrunk by
-                        // the inactivity filter. Overriding here is the SINGLE point that carries C_S into
-                        // the proposal, the epoch_commitment in check_content, and the QC verify set, so
-                        // the three can never disagree. `eligible` is deliberately NOT frozen: the shrink
-                        // is exactly what returns the chain to full quorum at A+3 and ends the span.
-                        // `index` is a CHECKPOINT window (head/30), not a macroblock index.
-                        let cmt = crate::node::rc_span_committee_cp(&storage, index).unwrap_or(cmt);
+                        // No span override: a pinned window is proposed, content-checked and certified
+                        // over the SAME derived committee as a strict one — the pin moves the threshold,
+                        // never the signing set, so all three views agree by construction.
                         window_buf.insert(index, WindowContent {
                             mb_hashes, state_root, beacon, head_ts, committee: cmt, eligible: eligible_producers, banned, reward_root, registry_root, dilithium_pk_root, reward_epoch_root, logs_root, total_supply,
                         });
@@ -1132,11 +1196,23 @@ pub async fn run(
                     heard.retain(|_, t| now.duration_since(*t) < stall);
                     let live: std::collections::HashSet<String> = heard.keys().cloned().collect();
                     crate::node::rc_publish_heard(live.clone());
+                    // The committee `heard` is filtered to by verify_msg IS the arm's denominator and
+                    // the set a relaxed certificate is checked over. Publish one view so the halt test
+                    // and the operator RPC can never measure liveness over a different population.
+                    crate::node::rc_publish_committee(committee.clone());
+                    let operator_disarm = crate::node::rc_take_disarm_request();
                     match crate::node::rc_armed() {
                         Some((a, _, _)) => {
-                            // The span ends by itself: index A+7 fails the pin, and the first seal above
-                            // A+2 means the strict threshold is reachable again.
-                            if storage.last_sealed_mb_index() > a + 2 {
+                            // The span ends by itself, on either edge: the first seal above A+2 means the
+                            // strict threshold is reachable again, and the driver drops its own pin the
+                            // moment the window it is about to propose leaves the span. Mirror that here
+                            // or the global arm would keep relaxing the threshold for a span the driver
+                            // has already left. An operator disarm lands on the same edge, so global and
+                            // driver can never end up disagreeing.
+                            let (_, span_hi) = qnet_consensus::checkpoint_bft::recovery_failover_windows(a);
+                            if operator_disarm
+                                || storage.last_sealed_mb_index() > span_hi
+                                || !driver.rc_armed() {
                                 crate::node::rc_disarm();
                                 let _ = driver.set_recovery_span(None);
                                 rc_ticks = 0;
@@ -1146,9 +1222,9 @@ pub async fn run(
                                 //
                                 // rc_ticks MUST reset when the pinned index moves. It used to reset only
                                 // on arm/disarm, so after one slow index every armed member had
-                                // rc_ticks > its own rank and they all self-granted on the SAME tick —
-                                // votes split, and since the vote rule is per-index and the TC is
-                                // deliberately never relaxed, that index becomes unvotable for good.
+                                // rc_ticks > its own rank and they all self-granted on the SAME tick,
+                                // splitting the vote across proposals that are individually short of
+                                // the relaxed quorum — a wasted round on every index.
                                 let idx_now = driver.current_index();
                                 if idx_now != rc_last_index { rc_last_index = idx_now; rc_ticks = 0; }
                                 rc_ticks = rc_ticks.saturating_add(1);
@@ -1163,12 +1239,23 @@ pub async fn run(
                             }
                         }
                         None => {
-                            // An operator request shortens ONLY the wait. Every other condition is
-                            // re-checked below by the identical code the automatic path runs, and the
-                            // driver may still refuse — which is why the RPC hands the arm here rather
-                            // than writing the global itself.
+                            // Global unarmed but the driver still pinned: an arm that the global side
+                            // dropped (operator disarm, or a re-arm that now refuses) would otherwise
+                            // leave the driver emitting pinned checkpoints nobody accepts for the rest
+                            // of the span. Unconditional, so the two can never disagree.
+                            if driver.rc_armed() {
+                                let _ = driver.set_recovery_span(None);
+                                rc_ticks = 0;
+                                if crate::node::is_warn() {
+                                    println!("[WARN][RC] driver_disarmed reason=global_unarmed");
+                                }
+                            }
+                            // An operator disarm also suppresses the automatic re-arm for this tick;
+                            // otherwise the halt conditions are unchanged and the disarm is a no-op the
+                            // operator cannot see.
                             let operator_asked = crate::node::rc_take_arm_request();
-                            if operator_asked || now.duration_since(last_certified_at) >= stall {
+                            if !operator_disarm
+                                && (operator_asked || now.duration_since(last_certified_at) >= stall) {
                                 if let Ok(rc) = crate::node::rc_try_arm(&storage, &live, true) {
                                     // The driver may refuse: the pinned position can be unreachable
                                     // from this node's view (it voted there already). Arming anyway
@@ -1183,24 +1270,8 @@ pub async fn run(
                                         continue;
                                     }
                                     rc_ticks = 0;
-                                    // Span windows were buffered LONG before the arm (production keeps
-                                    // signalling through a halt), so their snapshots still hold the
-                                    // DERIVED committee. Re-map them to C_S now, or this node's own
-                                    // check_content would reject the pinned proposal on epoch_commitment
-                                    // and try_propose would build one against the wrong set — the arm
-                                    // would be inert on exactly the node that armed.
-                                    // Iterate the span in CHECKPOINT-window units — the key space the
-                                    // buffer actually uses. Macroblock units here would address
-                                    // long-sealed windows and leave every real span window untouched.
-                                    if let Some((lo, hi)) = crate::node::rc_span_cp_windows() {
-                                        for w in lo..=hi {
-                                            if let (Some(cs), Some(wc)) =
-                                                (crate::node::rc_span_committee_cp(&storage, w), window_buf.get_mut(&w))
-                                            {
-                                                wc.committee = cs;
-                                            }
-                                        }
-                                    }
+                                    // Nothing to re-map: buffered span windows already hold the derived
+                                    // committee, which is the set the pin is certified over.
                                 }
                             }
                         }
@@ -1518,5 +1589,105 @@ mod content_gate_tests {
         assert!(matches!(
             check_content(&storage, &buf, &ConsensusMsg::Proposal(cp(head, short, sr, beacon))),
             ContentCheck::Reject));
+    }
+
+    // ── SEAL-PATH PIN SELF-CHECK ─────────────────────────────────────────────────────────────────
+
+    /// Store anchor macroblock `a` at a boundary head with an `n`-member committee; return its hash.
+    async fn seal_anchor(storage: &Storage, a: u64, n: usize) -> ([u8; 32], Checkpoint) {
+        use qnet_consensus::checkpoint_bft::sig_merkle_root;
+        let committee: Vec<String> = (0..n).map(|i| format!("cs_{:04}", i)).collect();
+        let mut cp_a = cp(a * qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL, vec![], [1u8; 32], [2u8; 32]);
+        cp_a.index = 17;
+        let sigs: Vec<Vec<u8>> = committee.iter().map(|s| s.as_bytes().to_vec()).collect();
+        let qc = QuorumCertificate {
+            checkpoint_hash: cp_a.hash(), index: cp_a.index,
+            sig_merkle_root: sig_merkle_root(&sigs), signers: committee.clone(), sigs,
+        };
+        let mut cd = qnet_state::ConsensusData::default();
+        cd.checkpoint_qc = Some(bincode::serialize(&(cp_a.clone(), qc)).unwrap());
+        cd.consensus_committee = Some(committee);
+        let mb = qnet_state::MacroBlock::new(a, 0, [0u8; 32], vec![], [1u8; 32], cd);
+        storage.save_macroblock(a, &mb).await.expect("save anchor");
+        // The pin names its anchor by the anchor CHECKPOINT's content digest, not by the block hash.
+        (qnet_consensus::checkpoint_bft::checkpoint_content_digest(&cp_a), cp_a)
+    }
+
+    fn qc_over(cp: &Checkpoint, signers: &[String]) -> QuorumCertificate {
+        let sigs: Vec<Vec<u8>> = signers.iter().map(|s| s.as_bytes().to_vec()).collect();
+        QuorumCertificate {
+            checkpoint_hash: cp.hash(), index: cp.index,
+            sig_merkle_root: qnet_consensus::checkpoint_bft::sig_merkle_root(&sigs),
+            signers: signers.to_vec(), sigs,
+        }
+    }
+
+    // THE SHIPPED STATE. Behaviour, not text: the content gate must accept a pinned proposal exactly
+    // as it accepts an unpinned one (the pin changes the threshold, not the content), and the seal
+    // gate must re-prove the threshold for BOTH — relaxed only for a certificate whose pin RESOLVES
+    // against committed data, strict for everything else, including an unresolvable pin.
+    #[tokio::test]
+    async fn every_seal_re_proves_its_own_threshold() {
+        use qnet_consensus::checkpoint_bft::{quorum_size, relaxed_quorum};
+        // Shipped OFF: a pin resolves to no relaxation, so every seal proves the strict threshold.
+        assert!(!crate::node::RC_ENABLED);
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = Storage::new(dir.path().to_str().unwrap()).unwrap();
+        let (a, n) = (4u64, 12usize);
+        let (ah, cp_a) = seal_anchor(&storage, a, n).await;
+        let cs: Vec<String> = (0..n).map(|i| format!("cs_{:04}", i)).collect();
+
+        // VOTE PATH: the pin is not a content change, so a pinned proposal content-checks like any
+        // other. Whether this node will SIGN it is the engine's business — it signs only the pin it
+        // armed — never the content gate's.
+        let k = qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL;
+        let head = 2 * k;
+        let sr = [5u8; 32];
+        let (local, beacon) = seed_window(&storage, head, k, "p", 0, sr);
+        let mut buf = std::collections::HashMap::new();
+        buf.insert(head / k, wc(local.clone(), sr, beacon));
+        let plain_cp = cp(head, local.clone(), sr, beacon);
+        assert!(matches!(check_content(&storage, &buf, &ConsensusMsg::Proposal(plain_cp.clone())),
+                         ContentCheck::Ok));
+        // A pinned proposal is refused outright while the relaxation is off, so no node signs a
+        // checkpoint the acceptance path would then reject for everyone.
+        let mut pinned_cp = plain_cp.clone();
+        pinned_cp.recovery_anchor = Some((a, ah));
+        assert!(matches!(check_content(&storage, &buf, &ConsensusMsg::Proposal(pinned_cp)),
+                         ContentCheck::Reject), "a pin is refused while the relaxation is off");
+        let mut forged = plain_cp.clone();
+        forged.state_root = [0xAB; 32];
+        assert!(matches!(check_content(&storage, &buf, &ConsensusMsg::Proposal(forged)),
+                         ContentCheck::Reject));
+
+        // SEAL PATH, pinned: refused before the resolver is consulted, at any signer count.
+        let mut span = cp(qnet_consensus::checkpoint_bft::recovery_window_head(cp_a.window_head_height, 3),
+                          vec![], [4u8; 32], [5u8; 32]);
+        span.index = cp_a.index + 3;
+        span.parent_qc = Some(qnet_consensus::checkpoint_bft::QcRef {
+            index: span.index - 1, checkpoint_hash: [0xEE; 32] });
+        span.recovery_anchor = Some((a, ah));
+        assert!(relaxed_quorum(n) < quorum_size(n), "the relaxed bar would be lower if it were live");
+        assert_eq!(rc_seal_ok(&storage, &span, &qc_over(&span, &cs[..relaxed_quorum(n)]), &cs)
+                       .unwrap_err().0, "rc_disabled");
+        assert_eq!(rc_seal_ok(&storage, &span, &qc_over(&span, &cs), &cs).unwrap_err().0, "rc_disabled");
+
+        // ...and an UNPINNED certificate is not waved through: the seal gate re-proves the STRICT
+        // threshold, which is what stops a gossiped sub-quorum QC from being written locally.
+        let full = qc_over(&plain_cp, &cs);
+        assert!(rc_seal_ok(&storage, &plain_cp, &full, &cs).is_ok());
+        let thin = qc_over(&plain_cp, &cs[..quorum_size(n) - 1]);
+        assert_eq!(rc_seal_ok(&storage, &plain_cp, &thin, &cs).unwrap_err().0, "rc_qc_rejected");
+        let relaxed_unpinned = qc_over(&plain_cp, &cs[..relaxed_quorum(n)]);
+        assert_eq!(rc_seal_ok(&storage, &plain_cp, &relaxed_unpinned, &cs).unwrap_err().0, "rc_qc_rejected");
+        let mut outsider: Vec<String> = cs[..quorum_size(n) - 1].to_vec();
+        outsider.push("not_a_member".into());
+        assert_eq!(rc_seal_ok(&storage, &plain_cp, &qc_over(&plain_cp, &outsider), &cs).unwrap_err().0,
+                   "rc_qc_rejected");
+        // The certificate must bind THIS checkpoint, pinned or not.
+        let mut unbound = full.clone();
+        unbound.checkpoint_hash = [0x77; 32];
+        assert_eq!(rc_seal_ok(&storage, &plain_cp, &unbound, &cs).unwrap_err().0, "rc_qc_unbound");
     }
 }

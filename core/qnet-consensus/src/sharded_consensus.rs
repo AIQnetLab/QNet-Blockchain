@@ -30,7 +30,7 @@
 //! assignment into a real throughput multiplier: instead of a single global
 //! 2f+1 quorum signing every macroblock, the active validator set is
 //! stratified into N independent sub-committees, one per shard, each
-//! running its own commit-reveal flow in parallel.
+//! running its own Checkpoint-BFT flow in parallel.
 //!
 //! WHAT THIS MODULE DELIVERS (Stage-2B foundation)
 //! ────────────────────────────────────────────────────────────────────────────
@@ -50,7 +50,7 @@
 //!
 //! WHAT IT DOES *NOT* YET DELIVER
 //! ────────────────────────────────────────────────────────────────────────────
-//! Wiring this scaffold into the live commit-reveal path is the second
+//! Wiring this scaffold into the live Checkpoint-BFT path is the second
 //! half of Stage 2B and lives outside this module — it touches:
 //!   * the per-microblock producer-rotation tick (currently global,
 //!     becomes per-shard parallel),
@@ -61,10 +61,10 @@
 //!   * the timeout-certificate aggregator (today a single global
 //!     `AggregatedTimeoutCertificate`, post-2B one per shard).
 //!
-//! The commit-reveal engine itself does NOT change — every shard runs
-//! the existing `CommitRevealConsensus` against its own committee.
-//! That keeps the cryptographic guarantees of the canonical path
-//! (Dilithium3 + 2f+1 + view-change) intact at the per-shard level.
+//! The consensus engine itself does NOT change — every shard runs
+//! Checkpoint-BFT against its own committee. That keeps the guarantees
+//! of the canonical path (Dilithium3 + n−f QC + view-change) intact at
+//! the per-shard level.
 //!
 //! SCALABILITY (1 000+ super-node committees, target 100M+ users)
 //! ────────────────────────────────────────────────────────────────────────────
@@ -292,8 +292,8 @@ pub fn assign_committees(
 /// for `round` is the validator at position `(base_idx + round) % size`,
 /// where `base_idx` is a deterministic seed-and-shard-mixed offset.
 ///
-/// This mirrors the global rotation in `commit_reveal::compute_leader_for_round`
-/// but operates on the shard's committee. Same epoch_seed is mixed in so
+/// This mirrors the global producer rotation but operates on the
+/// shard's committee. Same epoch_seed is mixed in so
 /// rotations across shards are independent (a validator that's leader of
 /// shard 5 round 0 is generally NOT leader of shard 7 round 0).
 pub fn compute_shard_leader<'a>(

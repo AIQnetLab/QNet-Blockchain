@@ -206,6 +206,8 @@ qnet-network/qnet-network
 qnet-network/qnet-network.exe
 *.wasm
 *.wat
+# Example contract source is tracked: a test compiles and deploys it
+!development/qnet-contracts/examples/*.wat
 
 # Solana
 test-ledger/

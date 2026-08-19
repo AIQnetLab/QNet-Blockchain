@@ -19,25 +19,28 @@ import type {
   DeployContractResult,
   CallContractParams,
   ContractCallResult,
-  ContractLog,
+  ViewContractParams,
+  ContractViewResult,
+  ContractLogsResult,
 } from './contract';
+import { QNET_CHAIN_TAG } from './wallet';
 
 /**
  * Refuse to hand the node's string to the wallet's signing key unless it is unmistakably a claim.
  *
  * The claim flow used to sign `quote.signMessage` verbatim with the SAME key that signs
- * `transfer:{from}:{to}:{amount}:{nonce}:{gas_price}:{gas_limit}`, and nothing rebuilt or checked the
+ * `q{chain_id}|transfer:{from}:{to}:{amount}:{nonce}:{gas_price}:{gas_limit}`, and nothing rebuilt or checked the
  * `qnet_claim_v1` prefix — so the prefix separated nothing and a malicious node could return a
  * transfer-shaped string and drain the wallet.
  *
- * The node's preimage is `qnet_claim_v1:{wallet}:{timestamp}:{hex(sha3_256(claims_data))}`. This SDK
+ * The node's preimage is `q{chain_id}|qnet_claim_v1:{wallet}:{timestamp}:{hex(sha3_256(claims_data))}`. This SDK
  * has no sha3 dependency, so it pins everything else: the domain tag, the wallet it is signing for,
  * the timestamp it will echo, and that the tail is a 32-byte hex digest and nothing else. A transfer
  * — or any other domain — cannot satisfy it. Callers that want the digest verified too should hash
  * `quote.claimsData` themselves and compare before signing; the mobile wallet does exactly that.
  */
 export function assertClaimMessageShape(msg: string, wallet: string, timestamp: number): void {
-  const expectedPrefix = `qnet_claim_v1:${wallet}:${timestamp}:`;
+  const expectedPrefix = `${QNET_CHAIN_TAG}qnet_claim_v1:${wallet}:${timestamp}:`;
   if (typeof msg !== 'string' || !msg.startsWith(expectedPrefix)) {
     throw new Error('Node asked the wallet to sign a non-claim message — refusing');
   }
@@ -174,7 +177,7 @@ export class QNetClient {
    *
    * @param nodeId    - On-chain node id
    * @param wallet    - Node wallet address (must match the on-chain registration)
-   * @param signature - ML-DSA-65 signature over `"claim_rewards:<nodeId>:<wallet>"`
+   * @param signature - ML-DSA-65 signature over `"q<chainId>|claim_rewards:<nodeId>:<wallet>"`
    * @param publicKey - Hex-encoded 1952-byte ML-DSA-65 public key
    */
   async quoteRewardClaim(
@@ -243,7 +246,7 @@ export class QNetClient {
     publicKey: string,
     sign: DilithiumSigner,
   ): Promise<RewardClaimResult | null> {
-    const authSig = await sign(`claim_rewards:${nodeId}:${wallet}`);
+    const authSig = await sign(`${QNET_CHAIN_TAG}claim_rewards:${nodeId}:${wallet}`);
     const quote = await this.quoteRewardClaim(nodeId, wallet, authSig, publicKey);
     if (!quote) return null;
     assertClaimMessageShape(quote.signMessage, wallet, quote.claimTimestamp);
@@ -269,57 +272,67 @@ export class QNetClient {
   // ── Contracts ─────────────────────────────────────────────────────────────
 
   /**
-   * Deploy a new contract to the QNet PQ-EVM.
-   * Returns the deployed contract address and transaction hash.
+   * Deploy a WASM module as a contract. The node validates the module against the
+   * deploy-time determinism rules before submitting the transaction, and derives the
+   * contract address on-chain from `from` and `nonce`.
    */
   async deployContract(params: DeployContractParams): Promise<DeployContractResult> {
-    return this.post<DeployContractResult>('/api/v1/contract/deploy', {
-      from:            params.from,
-      bytecode:        params.bytecode,
-      constructorArgs: params.constructorArgs ?? '',
-      gasLimit:        params.gasLimit ?? 5_000_000,
-      value:           params.value ?? '0',
-      signature:       params.signature,
+    return this.post<DeployContractResult>('/api/v1/wasm/deploy', {
+      from:                  params.from,
+      code:                  params.code,
+      nonce:                 params.nonce,
+      dilithium_signature:   params.dilithiumSignature,
+      dilithium_public_key:  params.dilithiumPublicKey,
     });
   }
 
   /**
-   * Execute a read-only contract call (no transaction, no gas cost).
+   * Submit a state-changing contract call. The signature is mandatory; the node
+   * queues the transaction and it takes effect when the block applying it is produced.
    */
   async callContract(params: CallContractParams): Promise<ContractCallResult> {
     return this.post<ContractCallResult>('/api/v1/contract/call', {
-      to:       params.contractAddress,
-      from:     params.from,
-      data:     params.calldata,
-      gasLimit: params.gasLimit ?? 1_000_000,
-      value:    params.value ?? '0',
+      from:                 params.from,
+      contract_address:     params.contractAddress,
+      method:               params.method,
+      args:                 params.args ?? '',
+      gas_limit:            params.gasLimit ?? 1_000_000,
+      gas_price:            params.gasPrice ?? 1_000,
+      nonce:                params.nonce,
+      dilithium_signature:  params.dilithiumSignature,
+      dilithium_public_key: params.dilithiumPublicKey,
+      is_view:              false,
     });
   }
 
   /**
-   * Send a signed state-mutating call to a deployed contract.
+   * Read from committed state without a transaction, signature or fee. The gas fields
+   * are structurally required by the endpoint and are not charged for a view.
    */
-  async sendContractCall(params: CallContractParams & { signature: string }): Promise<ContractCallResult> {
-    return this.post<ContractCallResult>('/api/v1/contract/send', {
-      to:        params.contractAddress,
-      from:      params.from,
-      data:      params.calldata,
-      gasLimit:  params.gasLimit ?? 1_000_000,
-      value:     params.value ?? '0',
-      signature: params.signature,
+  async viewContract(params: ViewContractParams): Promise<ContractViewResult> {
+    return this.post<ContractViewResult>('/api/v1/contract/call', {
+      from:             params.from,
+      contract_address: params.contractAddress,
+      method:           params.method,
+      args:             params.args ?? [],
+      gas_limit:        10_000,
+      gas_price:        10,
+      nonce:            0,
+      is_view:          true,
     });
   }
 
   /**
-   * Fetch contract event logs for a given address in block range `[from, to]`.
+   * Fetch contract events in block range `[from, to]`. The node caps the scan at 500
+   * blocks and reports the height below which its log store has been pruned.
    */
   async getContractLogs(
     address: string,
     fromHeight: number,
     toHeight: number,
-  ): Promise<ContractLog[]> {
-    return this.get<ContractLog[]>(
-      `/api/v1/contract/${address}/logs?from=${fromHeight}&to=${toHeight}`,
+  ): Promise<ContractLogsResult> {
+    return this.get<ContractLogsResult>(
+      `/api/v1/logs?contract=${encodeURIComponent(address)}&from=${fromHeight}&to=${toHeight}`,
     );
   }
 

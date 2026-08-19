@@ -16,7 +16,7 @@ pub mod state_manager;
 pub mod errors;
 pub mod state;
 pub mod feature_gates;
-pub mod wasm_exec;         // Smart-contract WASM execution for apply (P3, GATED default-OFF)
+pub mod wasm_exec;         // Smart-contract WASM execution on the apply path (VM enabled)
 
 #[cfg(feature = "python")]
 mod python_bindings;

@@ -57,6 +57,15 @@ pub struct BlockHeaderIdx {
     pub tx_count: u32,
 }
 
+/// Checkpoint vote-commitment key: `cpv_` ++ index BIG-endian, so a prefix scan is index-ordered.
+#[inline]
+pub(crate) fn checkpoint_vote_key(index: u64) -> Vec<u8> {
+    let mut k = Vec::with_capacity(4 + 8);
+    k.extend_from_slice(b"cpv_");
+    k.extend_from_slice(&index.to_be_bytes());
+    k
+}
+
 /// Header index key: `hdr_` ++ hash. Hash-keyed, so no ordering requirement.
 #[inline]
 pub(crate) fn block_header_key(hash: &[u8; 32]) -> Vec<u8> {
@@ -518,6 +527,8 @@ pub struct TransactionPool {
 /// v3.0: Maximum transaction pool size to prevent memory leak
 /// ~200K transactions × ~1KB average = ~200MB RAM (v4.1: 2x)
 const MAX_TRANSACTION_POOL_SIZE: usize = 200_000;
+/// Durable anti-double-sign watermark (metadata CF).
+const HIGHEST_SIGNED_HEIGHT_KEY: &[u8] = b"highest_signed_microblock_height";
 
 impl TransactionPool {
     /// Create new transaction pool with default TTL of 24 hours
@@ -2070,6 +2081,68 @@ impl PersistentStorage {
         Ok(self.db.get_cf(&cf, b"snapshot_anchor")?)
     }
 
+    // Checkpoint-BFT vote commitments (metadata CF, key `cpv_<index BE>`). A vote is a commitment,
+    // not a cache: the engine refuses a second vote at one index/head, and peers CONVICT that pair,
+    // so a commitment lost across a restart is a ban. Written with sync=true BEFORE the vote is
+    // signed and broadcast, and pruned below the retention window — a head under the committed
+    // frontier can never be proposed again, so forgetting it refuses nothing that could recur.
+    // One record per checkpoint index (~one per CHECKPOINT_INTERVAL blocks), so the sync write is
+    // per-minute, not per-block.
+    pub fn record_checkpoint_vote(&self, index: u64, window_head: u64, content_digest: &[u8; 32],
+                                  pinned: bool, parent_index: u64, parent_hash: &[u8; 32])
+        -> IntegrationResult<()> {
+        let cf = self.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
+        let mut val = Vec::with_capacity(81);
+        val.extend_from_slice(&window_head.to_be_bytes());
+        val.extend_from_slice(content_digest);
+        val.push(pinned as u8);
+        val.extend_from_slice(&parent_index.to_be_bytes());
+        val.extend_from_slice(parent_hash);
+        let mut wopts = rocksdb::WriteOptions::default();
+        wopts.set_sync(true);
+        self.db.put_cf_opt(&cf, checkpoint_vote_key(index), &val, &wopts)?;
+        let floor = index.saturating_sub(qnet_consensus::checkpoint_bft::CONSENSUS_STATE_RETAIN);
+        if floor > 0 {
+            let mut batch = WriteBatch::default();
+            for (k, _) in self.iter_checkpoint_votes(&cf)?.into_iter().filter(|(i, _)| *i < floor) {
+                batch.delete_cf(&cf, checkpoint_vote_key(k));
+            }
+            self.db.write(batch)?;
+        }
+        Ok(())
+    }
+
+    /// Every stored vote commitment: `(index, window_head, content_digest, pinned, parent_index,
+    /// parent_hash)`. An Err here means the node cannot know what it already voted for — the caller
+    /// must refuse to run consensus rather than vote blind.
+    pub fn load_checkpoint_votes(&self)
+        -> IntegrationResult<Vec<(u64, u64, [u8; 32], bool, u64, [u8; 32])>> {
+        let cf = self.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
+        Ok(self.iter_checkpoint_votes(&cf)?.into_iter().map(|(i, v)| (i, v.0, v.1, v.2, v.3, v.4)).collect())
+    }
+
+    fn iter_checkpoint_votes(&self, cf: &impl rocksdb::AsColumnFamilyRef)
+        -> IntegrationResult<Vec<(u64, (u64, [u8; 32], bool, u64, [u8; 32]))>> {
+        const P: &[u8] = b"cpv_";
+        let mut out = Vec::new();
+        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::From(P, rocksdb::Direction::Forward));
+        for item in iter {
+            let (k, v) = item?;
+            if !k.starts_with(P) { break; }
+            if k.len() != P.len() + 8 || v.len() != 81 { continue; }
+            let mut idx = [0u8; 8]; idx.copy_from_slice(&k[P.len()..]);
+            let mut head = [0u8; 8]; head.copy_from_slice(&v[0..8]);
+            let mut digest = [0u8; 32]; digest.copy_from_slice(&v[8..40]);
+            let mut pi = [0u8; 8]; pi.copy_from_slice(&v[41..49]);
+            let mut ph = [0u8; 32]; ph.copy_from_slice(&v[49..81]);
+            out.push((u64::from_be_bytes(idx),
+                      (u64::from_be_bytes(head), digest, v[40] != 0, u64::from_be_bytes(pi), ph)));
+        }
+        Ok(out)
+    }
+
     // (sync, called at a macroblock boundary under the apply context) Flush the
     // hot in-memory account set to the accounts CF, then pin a consistent
     // point-in-time DB view. With persist-before-evict keeping cold accounts in
@@ -2831,6 +2904,34 @@ impl PersistentStorage {
         }
     }
 
+    /// Highest microblock height this node has ever SIGNED as producer. Monotone and durable: it is
+    /// the only thing standing between a rollback-then-re-produce and a permanent, chain-committed
+    /// equivocation ban, which neither fork-choice nor certification can undo. Written with fsync
+    /// BEFORE the signature is produced, so a crash in between costs one skipped slot rather than a
+    /// second signature at a height.
+    pub fn save_highest_signed_height(&self, height: u64) -> IntegrationResult<()> {
+        let metadata_cf = self.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
+        let mut opts = rocksdb::WriteOptions::default();
+        opts.set_sync(true);
+        self.db.put_cf_opt(&metadata_cf, HIGHEST_SIGNED_HEIGHT_KEY, &height.to_be_bytes(), &opts)?;
+        Ok(())
+    }
+
+    /// Reads the durable anti-double-sign watermark. None means this node has never produced.
+    pub fn load_highest_signed_height(&self) -> IntegrationResult<Option<u64>> {
+        let metadata_cf = self.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
+        match self.db.get_cf(&metadata_cf, HIGHEST_SIGNED_HEIGHT_KEY)? {
+            Some(data) if data.len() == 8 => {
+                let mut b = [0u8; 8];
+                b.copy_from_slice(&data);
+                Ok(Some(u64::from_be_bytes(b)))
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// v10.2: O(1) microblock hash lookup from index.
     /// Returns SHA3-256 hash of stored block data without loading the full block.
     /// Used for prev_hash validation — eliminates O(block_size) load+hash overhead.
@@ -2999,8 +3100,8 @@ impl PersistentStorage {
     /// - Overwriting valid macroblocks with different data
     /// v15.9: SAVE MACROBLOCK ON BLOCKING POOL
     /// ────────────────────────────────────────────────────────────────────
-    /// Macroblocks carry the full ConsensusData (commits + reveals +
-    /// signatures + skip-cert + reputation deltas) plus the entire
+    /// Macroblocks carry the full ConsensusData (checkpoint QC + eligible-
+    /// producer snapshot + ban set) plus the entire
     /// microblock-hash list. Serialised payload grows with the active
     /// committee size; at 1 000+ super nodes the bincode of a single
     /// macroblock can reach hundreds of KB. The idempotent get + RocksDB
@@ -4127,6 +4228,15 @@ impl Storage {
         self.persistent.verify_and_repair_chain_height()
     }
 
+    /// Anti-double-sign watermark — proxy to PersistentStorage.
+    pub fn save_highest_signed_height(&self, height: u64) -> IntegrationResult<()> {
+        self.persistent.save_highest_signed_height(height)
+    }
+
+    pub fn load_highest_signed_height(&self) -> IntegrationResult<Option<u64>> {
+        self.persistent.load_highest_signed_height()
+    }
+
     /// Phase C: RocksDB-backed persistent Merkle store over the two dedicated
     /// column families ("merkle_leaves", "merkle_nodes"). Both CFs are created at
     /// open (build_column_families), so on a fresh genesis DB they always exist.
@@ -4141,7 +4251,7 @@ impl Storage {
         })
     }
 
-    // Smart-contract VM (P2): WASM code blobs are stored via the existing
+    // Smart-contract VM: WASM code blobs are stored via the existing
     // `save_contract_code` / `get_contract_code` (content-addressed by code_hash,
     // `contract:code:{hash}` in the raw store). No new CF needed.
 
@@ -7287,6 +7397,14 @@ impl Storage {
         out
     }
 
+    /// Chain-confirmed registered-node count: the sum of the per-index-space monotone counters,
+    /// each advanced only by a registration that reached chain-apply. O(1) point read. Feeds the
+    /// Phase-2 price multiplier, which needs a COMMITTED network size rather than a peer count.
+    pub fn registered_node_count(&self) -> u64 {
+        let meta_cf = match self.persistent.db.cf_handle("metadata") { Some(c) => c, None => return 0 };
+        self.load_next_indices(&meta_cf).iter().map(|n| *n as u64).sum()
+    }
+
     fn next_indices_bytes(v: &[u32; Self::INDEX_SPACES]) -> Vec<u8> {
         let mut out = Vec::with_capacity(Self::INDEX_SPACES * 4);
         for n in v.iter() {
@@ -9433,6 +9551,32 @@ impl Storage {
         }
     }
 
+    /// Every persisted Super/genesis endpoint as (node_id, endpoint), for the boot rehydrate of the
+    /// in-RAM endpoint registry. node_ids are type-prefixed, so the two seeks below cover exactly the
+    /// same set `srtr_` indexes and never enter the `nep_light_*` key range (10M-scale, always empty
+    /// because a light registration carries no endpoint) — bounded by the Super count, not the roster.
+    pub fn load_all_node_endpoints(&self) -> IntegrationResult<Vec<(String, String)>> {
+        use rocksdb::{IteratorMode, Direction};
+        let cf = self.persistent.db.cf_handle("node_registry")
+            .ok_or_else(|| IntegrationError::StorageError("node_registry CF not found".to_string()))?;
+        let mut out: Vec<(String, String)> = Vec::new();
+        for prefix in [b"nep_genesis_node_".as_ref(), b"nep_super_".as_ref()] {
+            for item in self.persistent.db.iterator_cf(&cf, IteratorMode::From(prefix, Direction::Forward)) {
+                let (k, v) = match item {
+                    Ok(kv) => kv,
+                    Err(e) => return Err(IntegrationError::StorageError(
+                        format!("load_all_node_endpoints iterator failed: {}", e))),
+                };
+                if !k.starts_with(prefix) { break; }
+                let node_id = match std::str::from_utf8(&k[4..]) { Ok(s) => s, Err(_) => continue };
+                let endpoint = match std::str::from_utf8(&v) { Ok(s) => s, Err(_) => continue };
+                if node_id.is_empty() || endpoint.is_empty() { continue; }
+                out.push((node_id.to_string(), endpoint.to_string()));
+            }
+        }
+        Ok(out)
+    }
+
     /// v4.0: Save VRF public key for node (persists across restarts)
     pub fn save_vrf_public_key(&self, node_id: &str, pk_hex: &str) -> IntegrationResult<()> {
         // Same rule as the RAM registry: a genesis identity's key is pinned in the binary and nothing
@@ -10428,6 +10572,16 @@ impl Storage {
             .unwrap_or(0)
     }
 
+    pub fn record_checkpoint_vote(&self, index: u64, window_head: u64, content_digest: &[u8; 32],
+                                  pinned: bool, parent_index: u64, parent_hash: &[u8; 32])
+        -> IntegrationResult<()> {
+        self.persistent.record_checkpoint_vote(index, window_head, content_digest, pinned,
+                                               parent_index, parent_hash)
+    }
+    pub fn load_checkpoint_votes(&self)
+        -> IntegrationResult<Vec<(u64, u64, [u8; 32], bool, u64, [u8; 32])>> {
+        self.persistent.load_checkpoint_votes()
+    }
     pub fn put_galc_held(&self, bytes: &[u8]) -> IntegrationResult<()> { self.persistent.put_galc_held(bytes) }
     pub fn get_galc_held(&self) -> IntegrationResult<Option<Vec<u8>>> { self.persistent.get_galc_held() }
     /// The macroblock index this node cold-joined at, or 0 for a from-genesis node.

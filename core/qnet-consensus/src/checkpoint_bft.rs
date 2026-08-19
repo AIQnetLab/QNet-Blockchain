@@ -1,6 +1,6 @@
 // Checkpoint-BFT types (spec: docs/CONSENSUS_V2_SPEC.md).
 // One consensus object — the Checkpoint — commits a window of K leader-streamed
-// microblocks via a 2f+1 QC. Dilithium sigs are non-aggregatable, so a QC keeps
+// microblocks via an n−f-signer QC. Dilithium sigs are non-aggregatable, so a QC keeps
 // a signer set + Merkle root for compact light-client verification.
 
 use serde::{Deserialize, Serialize};
@@ -29,13 +29,26 @@ pub const RELAXED_MIN_COMMITTEE: usize = 10;
 /// already cut to the live nodes — strict quorum is reachable again from there.
 pub const RC_SPAN_INDICES: u64 = 6;
 
-/// Recovery pin: `(anchor_macroblock_index, anchor_macroblock_hash)`.
+/// Compile-time guard: the span must be a whole number of macroblocks, or its last step would land
+/// mid-window and the span could never hand the chain back on a sealed boundary.
+const _: () = assert!((RC_SPAN_INDICES * CHECKPOINT_INTERVAL) % MACROBLOCK_INTERVAL == 0,
+                      "the recovery span must cover whole macroblocks");
+
+/// Recovery pin: `(anchor_macroblock_index, anchor_checkpoint_content_digest)`.
+///
+/// The second element is `checkpoint_content_digest(cp_anchor)`, NOT `MacroBlock::hash()`: the block
+/// hash omits `consensus_data`, so the window head and epoch data the resolver reads out of the
+/// anchor would be un-covered wire-chosen data. The content digest covers exactly those, is identical
+/// across a legal re-proposal, and — because it excludes the anchor's OWN pin — is also identical
+/// across a pinned and an unpinned certificate for one window. Only fields inside it may decide
+/// validity; anything else a certificate carries differs between conformant variants of one
+/// macroblock and would make one verdict a function of which variant a node happens to store.
 pub type RecoveryAnchor = (u64, Hash);
 
-/// Threshold under an ACTIVE recovery pin: a fixed function of |C_S| alone, so two nodes holding the
-/// same anchor macroblock can never disagree about it. Floored to `quorum_size` below
-/// RELAXED_MIN_COMMITTEE. `n/2+1` keeps `2*relaxed_quorum(n) > n`, so two relaxed quorums still
-/// intersect — the property that makes a conflicting pair attributable.
+/// Threshold under an ACTIVE recovery pin, over the SAME committee a strict certificate for that head
+/// would use — the pin lowers the bar, never the signing set, so the two quorums provably intersect.
+/// Floored to `quorum_size` below RELAXED_MIN_COMMITTEE. `n/2+1` keeps `2*relaxed_quorum(n) > n`, so
+/// two relaxed quorums intersect too — the property that makes a conflicting pair attributable.
 pub fn relaxed_quorum(committee_len: usize) -> usize {
     if committee_len < RELAXED_MIN_COMMITTEE { return quorum_size(committee_len); }
     committee_len / 2 + 1
@@ -50,9 +63,10 @@ pub fn effective_quorum(committee_len: usize, relaxed: bool) -> usize {
 
 /// The ONLY `window_head_height` a relaxed checkpoint may occupy at step `k` in `1..=RC_SPAN_INDICES`.
 ///
-/// Pins the WINDOW, never the index: a TimeoutCertificate advances the view without certifying a
-/// window, so index/window lockstep is unsatisfiable after one dead leader. Attributability comes
-/// from the proof instead — same anchor + same window head = a double-vote at any index.
+/// Pins the WINDOW, never the index: a view change advances the round without certifying a window, so
+/// index/window lockstep is unsatisfiable after one dead leader. Attributability comes from the proof
+/// instead — same window head + DIFFERENT committed content, at least one pinned = a double vote at
+/// any index (`pinned_double_vote`).
 pub fn recovery_window_head(anchor_cp_head: u64, k: u64) -> u64 {
     anchor_cp_head + k * CHECKPOINT_INTERVAL
 }
@@ -64,6 +78,69 @@ pub fn recovery_step_for_head(anchor_cp_head: u64, head: u64) -> Option<u64> {
     let k = delta / CHECKPOINT_INTERVAL;
     if k > RC_SPAN_INDICES { return None; }
     Some(k)
+}
+
+/// The span's windows in the FAILOVER key space. That key is `(h-1)/MACROBLOCK_INTERVAL + 1`, so
+/// window `w` covers heights `(w-1)*90+1 ..= w*90` and the span's heights `(A*90, A*90+180]` are
+/// exactly windows `A+1` and `A+2` — the anchor's own window `A` is already sealed and must stay on
+/// the strict threshold.
+pub fn recovery_failover_windows(anchor_mb: u64) -> (u64, u64) {
+    (anchor_mb + 1,
+     anchor_mb + RC_SPAN_INDICES * CHECKPOINT_INTERVAL / MACROBLOCK_INTERVAL)
+}
+
+/// Digest of everything a checkpoint COMMITS — the window content and the epoch data — with the
+/// consensus-position fields (index, parent link, proposer) AND the recovery pin deliberately
+/// excluded.
+///
+/// Two checkpoints agreeing here seal a byte-identical macroblock (`MacroBlock::hash` omits
+/// consensus_data), so signing both is CONFORMANT: a view change legally re-proposes one window at a
+/// new index, and the recovery pin re-proposes one window with the threshold changed. A rule keyed on
+/// `hash()` — which folds both — would convict every replica that follows the protocol, and would
+/// make the pinned re-proposal of a stuck window unvotable for everyone who already voted there.
+/// Two checkpoints that DISAGREE here are the real conflict — two different macroblocks at one
+/// position.
+pub fn checkpoint_content_digest(cp: &Checkpoint) -> Hash {
+    let mut h = Sha3_256::new();
+    h.update(b"qnet-checkpoint-content-v2");
+    h.update(cp.window_head_height.to_le_bytes());
+    h.update((cp.window_mb_hashes.len() as u64).to_le_bytes());
+    for mh in &cp.window_mb_hashes { h.update(mh); }
+    h.update(cp.state_root);
+    h.update(cp.beacon);
+    h.update(cp.epoch_commitment);
+    h.update(cp.reward_root);
+    h.update(cp.registry_root);
+    h.update(cp.logs_root);
+    h.update(cp.dilithium_pk_root);
+    h.update(cp.reward_epoch_root);
+    h.update(cp.total_supply.to_le_bytes());
+    h.update(cp.timestamp.to_le_bytes());
+    h.finalize().into()
+}
+
+/// Attributable SAME-ROUND double vote: two checkpoints at one index committing DIFFERENT content.
+///
+/// Keyed on the content digest, never `hash()`. A pin frees the index (`CheckpointConsensus`
+/// deliberately lets one replica vote twice at the stuck round — once unpinned, once pinned — over
+/// the identical position), and those two votes carry different hashes, so a hash-keyed same-round
+/// rule would convict every replica that follows the protocol.
+pub fn same_round_double_vote(a: &Checkpoint, b: &Checkpoint) -> bool {
+    a.index == b.index && checkpoint_content_digest(a) != checkpoint_content_digest(b)
+}
+
+/// Attributable PINNED double vote: same window head, DIFFERENT committed content, at least one of
+/// the two carrying a pin. This is the accountability arm the freed index needs — any two quorums
+/// over one head intersect (both are taken over the same derived committee), and the shared signer is
+/// convictable here even though its votes sit at different rounds, which same-round equivocation
+/// cannot see. Exactly the pair `CheckpointConsensus::on_proposal` refuses to create, so an honest
+/// replica never emits it; a re-proposal at a new index is not one (same content), and an
+/// unpinned/unpinned pair stays the same-round rule's business (a rollback may legally re-vote an
+/// uncertified window).
+pub fn pinned_double_vote(a: &Checkpoint, b: &Checkpoint) -> bool {
+    (a.recovery_anchor.is_some() || b.recovery_anchor.is_some())
+        && a.window_head_height == b.window_head_height
+        && checkpoint_content_digest(a) != checkpoint_content_digest(b)
 }
 
 /// Fold the recovery pin into a checkpoint hash. Tagged present/absent so `None` and
@@ -100,7 +177,7 @@ pub const COMMITTEE_SIZE: usize = 1000;
 /// rotation, N-2 snapshot) every MACROBLOCK_INTERVAL microblocks. A true network constant.
 pub const MACROBLOCK_INTERVAL: u64 = 90;
 
-/// Finality-checkpoint cadence: a 2f+1 QC finalizes microblocks every CHECKPOINT_INTERVAL
+/// Finality-checkpoint cadence: an n−f-signer QC finalizes microblocks every CHECKPOINT_INTERVAL
 /// blocks. MUST divide MACROBLOCK_INTERVAL (every macroblock boundary is also a checkpoint).
 /// CONSENSUS PARAMETER — every node MUST use the same value, or the checkpoint chains diverge
 /// (fork). Changing it = rebuild + relaunch the whole network from genesis. 30 (default) =
@@ -112,13 +189,21 @@ pub const CHECKPOINT_INTERVAL: u64 = 30;
 /// boundary would not coincide with a checkpoint and the seal cadence would be undefined.
 const _: () = assert!(MACROBLOCK_INTERVAL % CHECKPOINT_INTERVAL == 0, "CHECKPOINT_INTERVAL must divide MACROBLOCK_INTERVAL");
 
-/// How many checkpoint indices BELOW the committed frontier the driver + engine retain before
-/// evicting per-index consensus state (proposals/votes/timeouts/qcs/heads/seal_data). Bounds the
-/// always-on consensus task's memory to O(RETAIN·committee) instead of O(chain length): everything
-/// below `committed_index` is final, the 2-chain commit rule looks back ≤2 indices, and anything
-/// pruned that a lagging node still needs is reconstructed from §4.5 macroblock sync — never a wedge.
-/// 128 ≈ ~1 h of checkpoints at the 30-block cadence, ample slack for reordering/partitions.
+/// How many checkpoint indices BELOW THE VIEW BEING DRIVEN the driver + engine retain before evicting
+/// per-index consensus state (proposals/votes/qcs/heads/seal_data). Bounds the always-on consensus
+/// task's memory to O(RETAIN·committee) instead of O(chain length) — and anchoring it to the view
+/// rather than to the commit is what keeps that true during a content-divergence halt, where the
+/// commit is frozen while the view keeps advancing. The 2-chain commit rule looks back ≤2 indices, and
+/// anything pruned that a lagging node still needs is reconstructed from §4.5 macroblock sync — never
+/// a wedge. 128 ≈ ~1 h of checkpoints at the 30-block cadence, ample slack for reordering/partitions.
 pub const CONSENSUS_STATE_RETAIN: u64 = 128;
+
+/// Views of TIMEOUT messages retained, far shorter than the state window above. A TimeoutCertificate
+/// forms on the quorum-crossing insert and only ever moves the view FORWARD, and the f+1 jump reads
+/// indices ABOVE the current view — so a timeout at an index the view has already left can neither
+/// form a useful certificate nor advance anything. This is the one map a divergence halt refills with
+/// a full committee of ML-DSA signatures every single view, so it is the one that must stay small.
+pub const TIMEOUT_STATE_RETAIN: u64 = 8;
 
 /// Checkpoint-BFT view (round) timeout in ms: how long a replica waits for the leader's proposal
 /// before broadcasting a TimeoutVote toward a view change. CONSENSUS PACING — must be network-uniform;
@@ -205,27 +290,6 @@ pub fn accumulate_beacon(block_hashes: &[Hash]) -> Hash {
     h.finalize().into()
 }
 
-/// Proof-of-Continuous-Availability challenge selector (v34). A node is "challenged" at a block
-/// iff `H3("QNET_POCA_v1" ‖ block_hash ‖ node_id)`'s first 8 bytes (LE u64) fall below
-/// `u64::MAX / rate_denominator` — i.e. each node is independently selected with probability
-/// ≈ `1/rate_denominator` per block. UNPREDICTABLE before the block exists (depends on its hash),
-/// yet deterministic + publicly verifiable once known ⇒ every node agrees who was challenged. A
-/// challenged node must answer in real time (the answer anchors to this `block_hash` and must be
-/// included on-chain within a short window — enforced at the integration layer), which an offline
-/// node cannot fake retroactively. This is what makes liveness UNFORGEABLE without a self-claim.
-/// Pure & deterministic.
-pub fn poca_challenged(block_hash: &Hash, node_id: &NodeId, rate_denominator: u64) -> bool {
-    if rate_denominator == 0 { return false; }
-    let mut h = Sha3_256::new();
-    h.update(b"QNET_POCA_v1");
-    h.update(&block_hash[..]);
-    h.update(node_id.as_bytes());
-    let d = h.finalize();
-    let mut x = [0u8; 8];
-    x.copy_from_slice(&d[..8]);
-    u64::from_le_bytes(x) < (u64::MAX / rate_denominator)
-}
-
 /// Commitment over a checkpoint's epoch-transition data: the next-epoch eligible-producer
 /// snapshot (opaque bytes), the committee (order-independent), and the cumulative ban set
 /// (order-independent). Bound into the checkpoint hash ⇒ the QC certifies the validator set
@@ -258,7 +322,7 @@ pub struct Vote {
     pub signature: Vec<u8>,
 }
 
-/// 2f+1 distinct committee votes over one checkpoint.
+/// A quorum (n−f) of distinct committee votes over one checkpoint.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct QuorumCertificate {
     pub checkpoint_hash: Hash,
@@ -298,7 +362,7 @@ pub struct TimeoutMsg {
     pub signature: Vec<u8>,
 }
 
-/// 2f+1 timeouts ⇒ advance the checkpoint view; carries the highest QC seen.
+/// n−f timeouts ⇒ advance the checkpoint view; carries the highest QC seen.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct TimeoutCertificate {
     pub index: u64,
@@ -317,38 +381,38 @@ pub struct Checkpoint {
     pub state_root: Hash,
     pub beacon: Hash,
     /// Commitment to the epoch-transition data this checkpoint publishes (next-epoch
-    /// eligible producers + committee). In the QC-signed hash ⇒ 2f+1 certify the
+    /// eligible producers + committee). In the QC-signed hash ⇒ the quorum certifies the
     /// validator set, so syncing (non-committee) nodes trust it without re-deriving.
     pub epoch_commitment: Hash,
     /// Per-epoch reward merkle root for the emission-boundary window ([0;32] otherwise);
-    /// QC-signed ⇒ 2f+1 certify it ⇒ nodes adopt this root for claims, never a single
+    /// QC-signed ⇒ the quorum certifies it ⇒ nodes adopt this root for claims, never a single
     /// producer's unverified value (no Byzantine/lag reward divergence).
     pub reward_root: Hash,
     /// Deterministic digest of the chain-confirmed Super/genesis registry identity
-    /// (node_id, wallet, reg_height, burn, sha3(vrf_pk)) as of the window head. QC-signed ⇒ 2f+1
-    /// certify the registry, so a node joining via an UNTRUSTED snapshot verifies the restored
+    /// (node_id, wallet, reg_height, burn, sha3(vrf_pk)) as of the window head. QC-signed ⇒ the quorum
+    /// certifies the registry, so a node joining via an UNTRUSTED snapshot verifies the restored
     /// node_registry — the source of cbw and attestor VRF keys — against this committed root,
     /// closing the forgeable-snapshot Sybil/fork vector.
     pub registry_root: Hash,
     /// QC-signed merkle root over this window's committed event logs — native QRC-20/721 transfers +
     /// WASM emit_log. ACTIVE from genesis (`logs_root_required` gate=0): the producer feeds
     /// logs_merkle_root(window logs), content_ok's WindowContent recomputes it BYTE-IDENTICALLY, and
-    /// 2f+1 certify it exactly like reward_root — giving trustless light-client event proofs. CONSENSUS-
+    /// the quorum certifies it exactly like reward_root — giving trustless light-client event proofs. CONSENSUS-
     /// CRITICAL: block_logs must be byte-identical across the validator + producer drain paths, else
-    /// this root diverges and the macroblock QC never reaches 2f+1. [0;32] only for a log-less window.
+    /// this root diverges and the macroblock QC never reaches quorum. [0;32] only for a log-less window.
     pub logs_root: Hash,
     /// FIX-5: QC-signed LtHash digest over all committed (address -> ML-DSA-65 pk) bindings.
-    /// 2f+1 certify it ⇒ a node joining via an UNTRUSTED snapshot verifies its restored per-account
+    /// The quorum certifies it ⇒ a node joining via an UNTRUSTED snapshot verifies its restored per-account
     /// pubkeys match the committed set — a malicious snapshot that omits/alters an account's pk fails
     /// this root (→ snapshot rejected) instead of stalling that account's pk-elided TXs at 100k cold-
     /// join. [0;32] until the first pk is bound (all accounts still ship pk).
     pub dilithium_pk_root: Hash,
     /// LtHash over every (epoch, certified reward root) this node holds. Lets a snapshot-joined node
     /// carry the roots it can never re-derive (their macroblocks sit below its weak-subjectivity
-    /// floor) and prove them against 2f+1 instead of trusting the snapshot server.
+    /// floor) and prove them against the n−f quorum instead of trusting the snapshot server.
     pub reward_epoch_root: Hash,
     /// QC-signed total minted supply as of window_head_height. The apply-accumulated
-    /// emission total (genesis=0, monotonic +emit_rewards). QC-signed ⇒ 2f+1 certify it ⇒
+    /// emission total (genesis=0, monotonic +emit_rewards). QC-signed ⇒ the quorum certifies it ⇒
     /// a cold-joiner reads this QC-bound value instead of summing restored balances (which
     /// diverges at epoch≥2 once rewards are minted-then-claimed-later). total_supply is
     /// consensus-critical (emission cap) but not in state_root (account-only), so it is
@@ -738,7 +802,7 @@ mod tests {
         c.state_root = h(7);              // field change MUST change hash
         assert_ne!(c.hash(), x);
         // reward_root MUST be bound into the hash: the QC signs cp.hash(), so a checkpoint
-        // differing only in reward_root must produce a different hash (else 2f+1 could not
+        // differing only in reward_root must produce a different hash (else the quorum could not
         // certify the reward distribution and a proposer-chosen root would ride uncertified).
         let mut a = c.clone();
         a.reward_root = h(0);
@@ -817,7 +881,7 @@ mod tests {
 
     /// The parent link MUST be inside the QC-signed hash. It is what chains one checkpoint to the
     /// next, so if it were dropped from the preimage a proposal could be re-parented onto a different
-    /// history and still carry a valid 2f+1 certificate. The other parent-link tests deliberately do
+    /// history and still carry a valid n−f-signer certificate. The other parent-link tests deliberately do
     /// not call hash(), so without this one the fold could be deleted and the suite would stay green.
     #[test]
     fn checkpoint_hash_binds_parent_link() {
@@ -844,7 +908,7 @@ mod tests {
     #[test]
     fn checkpoint_hash_binds_total_supply() {
         // total_supply MUST be bound into the QC-signed hash: a cold-joiner trusts this value
-        // (2f+1 certify it) instead of summing balances, so a checkpoint differing only in
+        // (the quorum certifies it) instead of summing balances, so a checkpoint differing only in
         // total_supply must produce a different hash. Otherwise stable + deterministic.
         let c = Checkpoint {
             index: 1, parent_qc: None, window_head_height: 90,
@@ -861,7 +925,7 @@ mod tests {
     #[test]
     fn checkpoint_hash_binds_dilithium_pk_root() {
         // dilithium_pk_root MUST be bound into the QC-signed hash: an untrusted-snapshot joiner verifies its
-        // restored per-account ML-DSA-65 pubkeys against this 2f+1-certified digest. If the field were
+        // restored per-account ML-DSA-65 pubkeys against this quorum-certified digest. If the field were
         // dropped from the preimage, a node could publish any value without breaking the QC — the elided-pk
         // snapshot attack this field exists to close. Mirrors checkpoint_hash_binds_total_supply.
         let c = Checkpoint {
@@ -1098,34 +1162,6 @@ mod tests {
     }
 
     #[test]
-    fn poca_challenged_deterministic_and_rate() {
-        let bh = h(7);
-        let id: NodeId = "node-x".into();
-        // Deterministic: same (block_hash, node_id, rate) ⇒ same verdict on every node.
-        assert_eq!(poca_challenged(&bh, &id, 100), poca_challenged(&bh, &id, 100));
-        // Degenerate rates.
-        assert!(!poca_challenged(&bh, &id, 0), "rate 0 ⇒ never challenged");
-        assert!(poca_challenged(&bh, &id, 1), "rate 1 ⇒ (almost) always challenged");
-        // Selection rate ≈ 1/denominator over many distinct block hashes (a fixed node).
-        let denom = 10u64;
-        let trials = 5000u64;
-        let mut hits = 0u64;
-        for i in 0..trials {
-            let mut bb = [0u8; 32];
-            bb[..8].copy_from_slice(&i.to_le_bytes());
-            if poca_challenged(&bb, &id, denom) { hits += 1; }
-        }
-        let expected = trials / denom; // ≈500
-        let diff = if hits > expected { hits - expected } else { expected - hits };
-        assert!(diff < 200, "poca selection rate off: hits={} expected≈{}", hits, expected);
-        // Distinct nodes get independent challenge patterns at the same blocks.
-        let id2: NodeId = "node-y".into();
-        let a: Vec<bool> = (0..32u8).map(|n| poca_challenged(&h(n), &id, 4)).collect();
-        let b: Vec<bool> = (0..32u8).map(|n| poca_challenged(&h(n), &id2, 4)).collect();
-        assert_ne!(a, b, "distinct nodes must not share an identical challenge pattern");
-    }
-
-    #[test]
     fn two_chain_commit() {
         let committee: Vec<NodeId> = (0..5).map(|i| format!("n{}", i)).collect();
         let parent_qc = mk_qc(&committee, h(1), 4, 3);
@@ -1211,7 +1247,7 @@ mod tests {
 
     #[test]
     fn recovery_pin_is_injective_over_the_span() {
-        let (i0, h0) = (7u64, 630u64);
+        let (a0, h0) = (7u64, 630u64);
         let mut idx = std::collections::HashSet::new();
         let mut head = std::collections::HashSet::new();
         for k in 1..=RC_SPAN_INDICES {
@@ -1228,6 +1264,18 @@ mod tests {
         assert_eq!(recovery_step_for_head(h0, h0 + 1), None, "off the CHECKPOINT_INTERVAL grid");
         assert_eq!(recovery_step_for_head(h0, h0 + (RC_SPAN_INDICES + 1) * CHECKPOINT_INTERVAL), None);
         assert_eq!(recovery_step_for_head(h0, h0 - CHECKPOINT_INTERVAL), None, "below the anchor");
+
+        // FAILOVER key space: window w covers heights (w-1)*90+1 ..= w*90, so the span's heights
+        // (A*90, A*90+180] are windows A+1 and A+2. The anchor's own window A is already sealed and
+        // must stay strict — including it would relax a window nobody is stuck on.
+        assert_eq!(h0 / MACROBLOCK_INTERVAL, a0, "h0 is the anchor's macroblock boundary");
+        assert_eq!(recovery_failover_windows(a0), (a0 + 1, a0 + 2));
+        for k in 1..=RC_SPAN_INDICES {
+            let head = recovery_window_head(h0, k);
+            let w = (head - 1) / MACROBLOCK_INTERVAL + 1;
+            let (lo, hi) = recovery_failover_windows(a0);
+            assert!(w >= lo && w <= hi, "k={} lands on failover window {}", k, w);
+        }
     }
 
     #[test]
@@ -1290,11 +1338,31 @@ mod tests {
         assert_eq!(hex::encode(zero_pin.hash()),
                    "8a463e680bb577b1ffb0569f2f4576bae6d23d7a1b2a92fa7e5e6c9428bf14f7");
 
-        // The device mirrors these three too; they gate which QCs it will accept.
+        // The device mirrors quorum_size and judges EVERY checkpoint at it; the relaxed threshold
+        // exists only here, and a checkpoint carrying an anchor is refused on both sides.
         assert_eq!(quorum_size(1000), 667);
         assert_eq!(relaxed_quorum(1000), 501);
         assert_eq!(relaxed_quorum(5), 4);
         assert_eq!(recovery_window_head(630, 3), 720);
+
+        // Same checkpoint under checkpoint_content_digest — mirrored in
+        // applications/qnet-mobile/__tests__/QcLightClient.test.js. Unlike hash() it length-prefixes
+        // window_mb_hashes, so it needs its own vector.
+        assert_eq!(hex::encode(checkpoint_content_digest(&base)),
+                   "5b9d0304967b92246400630f54df59d6ee2ae7388aa8cf0b7c25dd8d7360eba1");
+        // Position fields AND the pin are excluded: a legal re-proposal of one window at a new
+        // index/proposer, and the pinned re-proposal of that same window, must digest identically —
+        // that is what makes the one-content-per-head rule votable and the pin resolvable from
+        // whichever certificate for the anchor window a node happens to hold.
+        let mut moved = base.clone();
+        moved.index = 9; moved.proposer = "n2".into();
+        moved.parent_qc = Some(QcRef { index: 8, checkpoint_hash: h(9) });
+        assert_eq!(checkpoint_content_digest(&moved), checkpoint_content_digest(&base));
+        assert_eq!(checkpoint_content_digest(&pinned), checkpoint_content_digest(&base));
+        assert_eq!(checkpoint_content_digest(&zero_pin), checkpoint_content_digest(&base));
+        // ...while hash() still folds the pin, so the QC signatures cover it and a pin cannot be
+        // pasted onto a certificate that was gathered without one.
+        assert_ne!(pinned.hash(), base.hash());
     }
 
     #[test]

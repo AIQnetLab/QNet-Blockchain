@@ -1,4 +1,4 @@
-//! Smart-contract WASM execution for the apply path (P3).
+//! Smart-contract WASM execution for the apply path.
 //!
 //! `WASM_VM_ENABLED` is a COMPILE-TIME const (never an env var — a per-node env gate on
 //! a consensus path would be a fork vector; a compile-time constant guarantees every node
@@ -29,7 +29,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 use crate::account::Account;
 
-/// P3 activation gate — ENABLED for the from-genesis contract launch. Wrapped in a fn so
+/// VM activation gate — ENABLED for the from-genesis contract launch. Wrapped in a fn so
 /// the apply branches are not const-folded into dead-code lints. Same compile-time value on
 /// every node ⇒ identical consensus rules (no per-node divergence). A change requires a
 /// fresh genesis + a live multi-node state_root equivalence run.
@@ -163,7 +163,7 @@ pub fn take_last_tx_wasm_fuel() -> u64 {
 /// Canonical merkle leaf for one persisted log entry, KEYED by its receipt coordinates:
 /// `sha3(tx_hash || u32le(log_index) || contract_hex || 0x00 || data)`. Binding (tx_hash, log_index)
 /// makes a light-client inclusion proof commit to the EXACT receipt — a node cannot replay one entry's
-/// proof under a different tx_hash. Used by BOTH the consensus logs_root and the P4 /logs/proof endpoint.
+/// proof under a different tx_hash. Used by BOTH the consensus logs_root and the /logs/proof endpoint.
 pub fn log_leaf(tx_hash: &str, log_index: u32, contract_hex: &str, data: &[u8]) -> Vec<u8> {
     use sha3::{Digest, Sha3_256};
     let mut h = Sha3_256::new();

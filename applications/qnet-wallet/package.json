@@ -12,6 +12,7 @@
   },
   "scripts": {
     "build:dilithium": "node tools/dilithium-wasm/build.js",
-    "build": "npm run build:dilithium"
+    "build": "npm run build:dilithium",
+    "test": "node tools/dilithium-wasm/compat_test.js"
   }
 }

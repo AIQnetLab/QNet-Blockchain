@@ -803,10 +803,14 @@ struct NodeReactivationRequest {
     last_macroblock_hash: String,
     /// Index of the latest macroblock
     last_macroblock_index: u64,
+    /// Public API endpoint to republish ("" hides the IP). Omitted ⇒ the node's own configured
+    /// endpoint, so a restart on a new IP refreshes the committed address without an operator flag.
+    #[serde(default)]
+    api_endpoint: Option<String>,
 }
 
 /// v6.0: Client-created NodeRegistration TX submit request
-/// Client signs: "client_node_reg:{node_id}:{wallet_address}:{registration_proof}:{timestamp}"
+/// Client signs: "q{chain}|client_node_reg:{node_id}:{wallet_address}:{registration_proof}:{timestamp}"
 /// This endpoint accepts the signed TX and routes it directly to the current producer.
 #[derive(Debug, Deserialize)]
 struct NodeRegistrationClientRequest {
@@ -2301,8 +2305,8 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(blockchain_filter.clone())
         .and_then(handle_nft_deploy);
 
-    // Deploy a generic WASM smart contract (P3; the tx is rejected at apply while
-    // the VM gate WASM_VM_ENABLED is off — this endpoint is ready for activation).
+    // Deploy a generic WASM smart contract. This is the live path for executable
+    // contract code; the module is validated up front and executed at apply.
     let wasm_deploy = api_v1
         .and(warp::path("wasm"))
         .and(warp::path("deploy"))
@@ -2961,13 +2965,135 @@ fn attest_throttle_admit(burn_tx: &str, burner: &str) -> Result<(), u64> {
 static SUPPLY_CACHE: Lazy<parking_lot::Mutex<Option<(std::time::Instant, (u64, u64))>>> =
     Lazy::new(|| parking_lot::Mutex::new(None));
 
+/// SINGLE-FLIGHT gate: at most one upstream getTokenSupply is in flight network-wide-per-process,
+/// no matter how many callers miss at once. Without it, every TTL expiry fans 10M polling light
+/// clients out to one external endpoint at once, and the 429s that follow starve the ADMISSION
+/// path, which reads the same cache.
+static SUPPLY_REFRESH: Lazy<tokio::sync::Mutex<()>> = Lazy::new(|| tokio::sync::Mutex::new(()));
+
+const SUPPLY_TTL_SECS: u64 = 30;
+
+/// Cached value with its age in seconds, without touching the network.
+fn supply_cache_peek() -> Option<((u64, u64), u64)> {
+    let cur = *SUPPLY_CACHE.lock();
+    cur.map(|(at, v)| (v, at.elapsed().as_secs()))
+}
+
+/// Fresh-or-fetch. MONEY paths only (quotes, admission): a value older than the TTL is refreshed,
+/// and a refresh failure is an error, never a stale price.
 async fn cached_solana_1dev_supply() -> Result<(u64, u64), String> {
-    if let Some((at, v)) = *SUPPLY_CACHE.lock() {
-        if at.elapsed().as_secs() < 30 { return Ok(v); }
+    if let Some((v, age)) = supply_cache_peek() {
+        if age < SUPPLY_TTL_SECS { return Ok(v); }
+    }
+    let _flight = SUPPLY_REFRESH.lock().await;
+    // Re-check: the flight we queued behind may have just refilled the cache.
+    if let Some((v, age)) = supply_cache_peek() {
+        if age < SUPPLY_TTL_SECS { return Ok(v); }
     }
     let v = fetch_solana_1dev_supply().await?;
     *SUPPLY_CACHE.lock() = Some((std::time::Instant::now(), v));
     Ok(v)
+}
+
+/// Last known value at ANY age, reported with that age; fetches only when nothing is cached yet
+/// (still single-flight). DISPLAY paths only — a read endpoint must never be able to trigger an
+/// upstream fetch that the admission path depends on.
+async fn cached_solana_1dev_supply_stale_ok() -> Result<((u64, u64), u64), String> {
+    if let Some(hit) = supply_cache_peek() { return Ok(hit); }
+    let _flight = SUPPLY_REFRESH.lock().await;
+    if let Some(hit) = supply_cache_peek() { return Ok(hit); }
+    let v = fetch_solana_1dev_supply().await?;
+    *SUPPLY_CACHE.lock() = Some((std::time::Instant::now(), v));
+    Ok((v, 0))
+}
+
+/// Activation pricing derived from ONE live 1DEV supply read, through the same integer helpers the
+/// burn attestors sign over. Every path that quotes a price or a phase goes through this, so a quote
+/// can never disagree with what admission and attestation accept.
+pub struct ActivationPricing {
+    /// Share of the original 1DEV supply burned, display only — never an input to a price.
+    pub burn_pct: f64,
+    pub phase: u8,
+    /// Phase-1 cost in whole 1DEV; universal across node types.
+    pub phase1_cost: u64,
+    /// Age in seconds of the 1DEV supply read this quote came from. 0 on a fresh fetch.
+    pub age_secs: u64,
+}
+
+impl ActivationPricing {
+    /// Phase-2 QNC cost for a node type: the shared consensus-side price table, evaluated at the
+    /// CHAIN-CONFIRMED registered-node count. Not the local peer count — that stays in the tens at
+    /// any network size, so it would pin the multiplier to the cheapest tier forever and make the
+    /// same query answer differently on two honest nodes.
+    pub fn phase2_cost(&self, node_type: &str) -> u64 {
+        let registered = crate::GLOBAL_REGISTERED_NODES.load(std::sync::atomic::Ordering::Relaxed);
+        let nt = if node_type.eq_ignore_ascii_case("super") {
+            qnet_state::account::NodeType::Super
+        } else {
+            qnet_state::account::NodeType::Light
+        };
+        qnet_state::transaction::phase2_activation_cost_qnc(&nt, registered)
+    }
+
+    /// Cost quoted for this node type in the current phase (1DEV in Phase 1, QNC in Phase 2).
+    pub fn cost_for(&self, node_type: &str) -> u64 {
+        if self.phase == 1 { self.phase1_cost } else { self.phase2_cost(node_type) }
+    }
+
+    pub fn currency(&self) -> &'static str {
+        if self.phase == 1 { "1DEV" } else { "QNC" }
+    }
+}
+
+/// Live activation pricing. Fails closed: a Solana supply outage is a retryable error, never a
+/// default price, because a defaulted quote makes the user over-burn irreversibly.
+pub async fn live_activation_pricing() -> Result<ActivationPricing, String> {
+    let (total_burned, current_supply) = cached_solana_1dev_supply().await?;
+    let age = supply_cache_peek().map(|(_, a)| a).unwrap_or(0);
+    let (genesis_ts, now_secs) = phase_clock();
+    Ok(pricing_from_supply(total_burned, current_supply, age, genesis_ts, now_secs))
+}
+
+/// Inputs to the age half of the phase rule: the committed genesis-block timestamp this node tracks,
+/// and wall-clock now. 0 genesis (block 0 not applied yet) keeps the age trigger shut.
+fn phase_clock() -> (u64, u64) {
+    let genesis_ts = crate::GLOBAL_GENESIS_TIMESTAMP.load(std::sync::atomic::Ordering::Relaxed);
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    (genesis_ts, now_secs)
+}
+
+/// THE phase/price resolver. Phase 2 begins at 90% of the 1DEV supply burned OR five years since
+/// genesis, whichever comes first — both halves evaluated by the shared consensus-side rule.
+fn pricing_from_supply(
+    total_burned: u64, current_supply: u64, age_secs: u64, genesis_ts: u64, now_secs: u64,
+) -> ActivationPricing {
+    let phase2 = qnet_state::Transaction::is_phase2(total_burned, current_supply, genesis_ts, now_secs);
+    ActivationPricing {
+        burn_pct: qnet_state::Transaction::burn_pct_tenths(total_burned, current_supply) as f64 / 10.0,
+        phase: if phase2 { 2 } else { 1 },
+        phase1_cost: qnet_state::Transaction::phase1_activation_cost(total_burned, current_supply),
+        age_secs,
+    }
+}
+
+/// Best-effort variant for display-only fields, which report `null` rather than fail a whole query.
+/// Serves the last known supply read at whatever age it has (reported in `age_secs`) instead of
+/// forcing a refresh, so a public read endpoint can never spend the admission path's upstream quota.
+/// Never quote or gate a burn from this — use `live_activation_pricing` so an outage is visible.
+pub async fn live_activation_pricing_opt() -> Option<ActivationPricing> {
+    match cached_solana_1dev_supply_stale_ok().await {
+        Ok(((total_burned, current_supply), age)) => {
+            let (genesis_ts, now_secs) = phase_clock();
+            Some(pricing_from_supply(total_burned, current_supply, age, genesis_ts, now_secs))
+        }
+        Err(e) => {
+            println!("[WARN][PRICING] supply_read_unavailable err={}", e);
+            None
+        }
+    }
 }
 
 /// Genesis-side burn-attestation RPC (PRODUCTION half of the burn-oracle). A joining super queries
@@ -2993,12 +3119,16 @@ async fn node_arm_recovery(blockchain: Arc<BlockchainNode>) -> Result<Value, Rpc
     if dry.is_ok() { crate::node::rc_request_arm(); }
     match dry {
         Ok((a, ah, cpi)) => {
-            let cs = crate::node::rc_span_committee_mb(&storage, a + 1).unwrap_or_default();
+            let cs = crate::node::rc_current_committee();
+            let (lo, hi) = qnet_consensus::checkpoint_bft::recovery_failover_windows(a);
             Ok(json!({
                 "armed": true,
                 "anchor_mb": a,
-                "anchor_hash": hex::encode(ah),
-                "span_indices": [cpi + 1, cpi + qnet_consensus::checkpoint_bft::RC_SPAN_INDICES],
+                "anchor_cp_index": cpi,
+                "anchor_digest": hex::encode(ah),
+                // The span pins WINDOWS, never checkpoint indices: a view change advances the round
+                // without certifying a window, so an index range would describe nothing.
+                "span_windows": [lo, hi],
                 "committee": cs.len(),
                 "quorum_size": qnet_consensus::checkpoint_bft::quorum_size(cs.len()),
                 "relaxed_quorum": qnet_consensus::checkpoint_bft::relaxed_quorum(cs.len()),
@@ -3008,30 +3138,34 @@ async fn node_arm_recovery(blockchain: Arc<BlockchainNode>) -> Result<Value, Rpc
     }
 }
 
+/// Hand the disarm to the consensus loop, exactly as the arm is handed over. Clearing the global here
+/// would leave the DRIVER pinned — it would keep emitting relaxed checkpoints — and the loop's unarmed
+/// branch would simply re-arm on the next tick, so the operator would see no effect at all.
 async fn node_disarm_recovery() -> Result<Value, RpcError> {
-    crate::node::rc_disarm();
-    Ok(json!({ "armed": false }))
+    crate::node::rc_request_disarm();
+    Ok(json!({ "disarm_requested": true, "armed": crate::node::rc_armed().is_some() }))
 }
 
-async fn node_recovery_status(blockchain: Arc<BlockchainNode>) -> Result<Value, RpcError> {
-    let storage = blockchain.get_storage();
+async fn node_recovery_status(_blockchain: Arc<BlockchainNode>) -> Result<Value, RpcError> {
     let heard = crate::node::rc_recent_consensus_senders();
     match crate::node::rc_armed() {
         Some((a, ah, cpi)) => {
-            let cs = crate::node::rc_span_committee_mb(&storage, a + 1).unwrap_or_default();
+            let cs = crate::node::rc_current_committee();
+            let (lo, hi) = qnet_consensus::checkpoint_bft::recovery_failover_windows(a);
             Ok(json!({
                 "armed": true,
                 "anchor_mb": a,
-                "anchor_hash": hex::encode(ah),
-                "span_indices": [cpi + 1, cpi + qnet_consensus::checkpoint_bft::RC_SPAN_INDICES],
-                "span_windows": [a + 1, a + 2],
+                "anchor_cp_index": cpi,
+                "anchor_digest": hex::encode(ah),
+                "span_windows": [lo, hi],
                 "heard_from": cs.iter().filter(|id| heard.contains(*id)).count(),
                 "committee": cs.len(),
                 "quorum_size": qnet_consensus::checkpoint_bft::quorum_size(cs.len()),
                 "relaxed_quorum": qnet_consensus::checkpoint_bft::relaxed_quorum(cs.len()),
             }))
         }
-        None => Ok(json!({ "armed": false, "heard_from": heard.len() })),
+        None => Ok(json!({ "armed": false, "enabled": crate::node::RC_ENABLED,
+                           "heard_from": heard.len() })),
     }
 }
 
@@ -3181,17 +3315,23 @@ async fn node_attest_burn(blockchain: Arc<BlockchainNode>, params: Option<Value>
 /// Read the live 1DEV (total_burned, current_supply) from Solana via getTokenSupply on the configured
 /// 1DEV mint. total_supply is the fixed 1B 1DEV genesis cap; total_burned = cap − current. Used ONLY on
 /// the attestor admission path (live RPC, per-node, NEVER consensus) to recompute the Phase-1 cost.
-pub(crate) async fn fetch_solana_1dev_supply() -> Result<(u64, u64), String> {
+pub async fn fetch_solana_1dev_supply() -> Result<(u64, u64), String> {
     const ONEDEV_TOTAL_SUPPLY: u64 = 1_000_000_000; // 1B 1DEV genesis cap
     let network_config = crate::network_config::get_network_config();
     let body = serde_json::json!({
         "jsonrpc": "2.0", "id": 1, "method": "getTokenSupply",
         "params": [network_config.solana.onedev_mint]
     });
-    let client = reqwest::Client::new();
-    let resp = client.post(&network_config.solana.rpc_url)
+    // One shared client: a fresh reqwest::Client per call means a fresh TLS handshake and a
+    // discarded connection pool on every supply read.
+    static SUPPLY_HTTP: Lazy<reqwest::Client> = Lazy::new(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    });
+    let resp = SUPPLY_HTTP.post(&network_config.solana.rpc_url)
         .json(&body)
-        .timeout(std::time::Duration::from_secs(10))
         .send().await
         .map_err(|e| format!("rpc: {}", e))?;
     let json: serde_json::Value = resp.json().await.map_err(|e| format!("parse: {}", e))?;
@@ -3415,7 +3555,7 @@ async fn tx_submit(
         // FIX-5: JSON hop carries HEX of the raw detached sig (3309 B) / raw pk (1952 B, elidable → None)
         dilithium_signature: dilithium_signature.as_deref().and_then(|s| hex::decode(s).ok()),
         dilithium_public_key: dilithium_public_key.as_deref().and_then(|s| hex::decode(s).ok()),
-        chain_id: 0,
+        chain_id: qnet_state::transaction::QNET_CHAIN_ID,
     };
 
     // Calculate hash
@@ -3588,7 +3728,7 @@ async fn mempool_submit(
             // FIX-5: hex(raw detached sig) / hex(raw pk) -> bytes
             dilithium_signature: hex::decode(dil_sig).ok(),
             dilithium_public_key: hex::decode(dil_pk).ok(),
-            chain_id: 0,
+            chain_id: qnet_state::transaction::QNET_CHAIN_ID,
         };
 
         // Calculate hash
@@ -5111,30 +5251,8 @@ async fn handle_macroblock_proof(
             Err(_) => return Ok(warp::reply::json(&json!({"error": "banned_decode_failed", "index": index}))),
         },
     };
-    let checkpoint = json!({
-        "index": cp.index,
-        "parent_qc": cp.parent_qc.as_ref().map(|p| json!({
-            "checkpoint_hash": hex::encode(p.checkpoint_hash), "index": p.index })),
-        "window_head_height": cp.window_head_height,
-        "window_mb_hashes": cp.window_mb_hashes.iter().map(hex::encode).collect::<Vec<_>>(),
-        "state_root": hex::encode(cp.state_root),
-        "beacon": hex::encode(cp.beacon),
-        "epoch_commitment": hex::encode(cp.epoch_commitment),
-        "reward_root": hex::encode(cp.reward_root),
-        "registry_root": hex::encode(cp.registry_root),
-        "logs_root": hex::encode(cp.logs_root),
-        "dilithium_pk_root": hex::encode(cp.dilithium_pk_root), // FIX-5: hashed after logs_root (see checkpointHash)
-        "reward_epoch_root": hex::encode(cp.reward_epoch_root), // hashed after dilithium_pk_root
-        // STRING, not a JSON number: nanoQNC supply crosses 2^53, and the device folds this into the
-        // checkpoint hash — a JSON.parse double would silently round and false-reject every checkpoint.
-        "total_supply": cp.total_supply.to_string(),
-        "timestamp": cp.timestamp,
-        "proposer": cp.proposer,
-        // Last hashed field. The device folds it TAGGED, so omitting it here would make every
-        // recomputed checkpoint hash wrong, not just a relaxed one.
-        "recovery_anchor": cp.recovery_anchor.map(|(a, ah)| json!([a, hex::encode(ah)])),
-    });
-    let recovery_anchor_info = recovery_anchor_json(&blockchain.get_storage(), &cp);
+    let checkpoint = checkpoint_json(&cp);
+    let recovery_anchor_checkpoint = recovery_anchor_json(&blockchain.get_storage(), &cp);
     let qc_json = json!({
         "signers": qc.signers,
         // sigs are the ASCII "dilithium_sig_<id>_<b64>" strings; lossless from_utf8 drops any non-UTF8
@@ -5150,34 +5268,57 @@ async fn handle_macroblock_proof(
         "committee_pubkeys": serde_json::Value::Object(committee_pubkeys),
         "eligible_raw": eligible_raw,
         "banned": banned,
-        // Under a pin the certifying set is the ANCHOR's committee at the relaxed threshold, and a
-        // device holds no chain to resolve it. Serve it alongside so one round trip is enough; the
-        // client still re-checks every pin clause it can and refuses a malformed one.
-        "recovery_anchor_info": recovery_anchor_info,
+        // Under a pin the certifying set is unchanged and only the threshold drops, but the device
+        // must still resolve the pin. Serve the ANCHOR CHECKPOINT so one round trip is enough; the
+        // device re-digests it and compares against the QC-signed pin, so nothing here is trusted.
+        "recovery_anchor_checkpoint": recovery_anchor_checkpoint,
     })))
 }
 
-/// The anchor macroblock's pin-resolution data for a relaxed checkpoint, or Null. Everything here is
-/// re-derivable by any full node from committed data — it is a convenience for light clients, never a
-/// trust root: the device compares `mb_hash` against the hash inside the QC-signed `recovery_anchor`.
+/// Canonical light-client JSON for a Checkpoint. Field-for-field the preimage `checkpointHash` folds,
+/// in that order — a device that recomputes the hash from anything else rejects every checkpoint.
+fn checkpoint_json(cp: &qnet_consensus::checkpoint_bft::Checkpoint) -> serde_json::Value {
+    json!({
+        "index": cp.index,
+        "parent_qc": cp.parent_qc.as_ref().map(|p| json!({
+            "checkpoint_hash": hex::encode(p.checkpoint_hash), "index": p.index })),
+        "window_head_height": cp.window_head_height,
+        "window_mb_hashes": cp.window_mb_hashes.iter().map(hex::encode).collect::<Vec<_>>(),
+        "state_root": hex::encode(cp.state_root),
+        "beacon": hex::encode(cp.beacon),
+        "epoch_commitment": hex::encode(cp.epoch_commitment),
+        "reward_root": hex::encode(cp.reward_root),
+        "registry_root": hex::encode(cp.registry_root),
+        "logs_root": hex::encode(cp.logs_root),
+        "dilithium_pk_root": hex::encode(cp.dilithium_pk_root), // FIX-5: hashed after logs_root
+        "reward_epoch_root": hex::encode(cp.reward_epoch_root), // hashed after dilithium_pk_root
+        // STRING, not a JSON number: nanoQNC supply crosses 2^53, and the device folds this into the
+        // checkpoint hash — a JSON.parse double would silently round and false-reject every checkpoint.
+        "total_supply": cp.total_supply.to_string(),
+        "timestamp": cp.timestamp,
+        "proposer": cp.proposer,
+        // Last hashed field. The device folds it TAGGED, so omitting it would make every recomputed
+        // checkpoint hash wrong, not just a relaxed one.
+        "recovery_anchor": cp.recovery_anchor.map(|(a, ah)| json!([a, hex::encode(ah)])),
+    })
+}
+
+/// The ANCHOR CHECKPOINT a relaxed checkpoint pins to, or Null. Not a trust root: the pin names its
+/// anchor by `checkpoint_content_digest`, which the device recomputes from exactly these fields and
+/// compares against the QC-signed `recovery_anchor` — so a server that alters any of them is caught.
+/// The digest, never `MacroBlock::hash()`, is the pin's identity: the block hash omits consensus_data
+/// and therefore authenticates nothing the pin rule reads. It also excludes the anchor's own pin, so
+/// whichever certificate for that window this node stored, the device resolves the same digest.
 fn recovery_anchor_json(storage: &crate::storage::Storage, cp: &qnet_consensus::checkpoint_bft::Checkpoint) -> serde_json::Value {
     let (a, _ah) = match cp.recovery_anchor { Some(x) => x, None => return serde_json::Value::Null };
     let mb = match storage.get_macroblock_by_height(a).ok().flatten()
         .and_then(crate::node::BlockchainNode::macroblock_plaintext)
         .and_then(|b| bincode::deserialize::<qnet_state::MacroBlock>(&b).ok())
     { Some(m) => m, None => return serde_json::Value::Null };
-    let (cp_a, qc_a): (qnet_consensus::checkpoint_bft::Checkpoint, qnet_consensus::checkpoint_bft::QuorumCertificate) =
+    let (cp_a, _qc_a): (qnet_consensus::checkpoint_bft::Checkpoint, qnet_consensus::checkpoint_bft::QuorumCertificate) =
         match mb.consensus_data.checkpoint_qc.as_ref().and_then(|b| bincode::deserialize(b).ok())
         { Some(x) => x, None => return serde_json::Value::Null };
-    json!({
-        "mb": a,
-        "mb_hash": hex::encode(mb.hash()),
-        "cp_index": cp_a.index,
-        "cp_head": cp_a.window_head_height,
-        "qc_checkpoint_hash": hex::encode(qc_a.checkpoint_hash),
-        "committee": mb.consensus_data.consensus_committee.clone().unwrap_or_default(),
-        "recovery_anchor": cp_a.recovery_anchor.map(|(x, xh)| json!([x, hex::encode(xh)])),
-    })
+    checkpoint_json(&cp_a)
 }
 
 /// Light-client registry dump as of {height}: the chain-confirmed roster (node_id, wallet, reg_height,
@@ -5468,7 +5609,8 @@ async fn handle_transaction_submit(
     // PURE DILITHIUM (F0.1): QNet value TX are authorised by ML-DSA-65 ONLY. Ed25519 is a Solana-only
     // credential and is NOT checked here. Require the Dilithium sig+pubkey, bind `from` to the key via
     // the address (closes API-1 forge-from-any), then verify the signature the SAME way the ingest/
-    // gossip path does (over the canonical "transfer:{from}:{to}:{amount}:{nonce}:{gas_price}:{gas_limit}").
+    // gossip path does (over the canonical
+    // "q{chain}|transfer:{from}:{to}:{amount}:{nonce}:{gas_price}:{gas_limit}").
     let dil_sig = match tx_request.dilithium_signature.as_ref().filter(|s| !s.is_empty()) {
         Some(s) => s.clone(),
         None => return Ok(warp::reply::json(&json!({
@@ -7327,19 +7469,23 @@ async fn handle_light_node_register(
         // v4.5: DYNAMIC PRICING — verify burn_amount >= current activation price
         // Prevents underpaying (user burns 300 when price is 1500)
         {
-            let burn_pct = crate::GLOBAL_BURN_PERCENTAGE.load(std::sync::atomic::Ordering::Relaxed) as f64 / 100.0;
-            let current_phase = if burn_pct >= 90.0 { 2u8 } else { 1u8 };
-            let minimum_required = if current_phase == 1 {
-                let reduction_tiers = (burn_pct / 10.0).floor() as u64;
-                let total_reduction = reduction_tiers * 150;
-                std::cmp::max(1500u64.saturating_sub(total_reduction), 300)
-            } else {
-                let active = crate::GLOBAL_ACTIVE_NODES.load(std::sync::atomic::Ordering::Relaxed) as u64;
-                let base = 10000u64; // Light node base
-                let mult = if active <= 100_000 { 0.5 } else if active <= 300_000 { 1.0 } else if active <= 1_000_000 { 2.0 } else { 3.0 };
-                (base as f64 * mult).round() as u64
+            // Phase and price come from the ONE canonical resolver — the same value attestors
+            // recompute and sign, so admission cannot disagree with attestation. A supply-read
+            // failure is a retryable error, never a silent default.
+            let pricing = match live_activation_pricing().await {
+                Ok(p) => p,
+                Err(e) => {
+                    println!("[ERROR][LIGHT] activation_price_unavailable err={}", e);
+                    return Ok(warp::reply::json(&json!({
+                        "success": false,
+                        "error": format!("Activation price unavailable: {}", e),
+                        "retryable": true
+                    })));
+                }
             };
-            
+            let current_phase = pricing.phase;
+            let minimum_required = pricing.cost_for("light");
+
             if burn_amount < minimum_required {
                 println!("[WARN][LIGHT] insufficient_burn amount={} required={} phase={}",
                     burn_amount, minimum_required, current_phase);
@@ -9658,7 +9804,10 @@ async fn handle_claim_rewards(
     // over "claim_rewards:{node_id}:{wallet_address}", the on-chain registered-wallet match, and the
     // per-proof merkle re-verify against the QC-certified reward_root at apply. Ed25519 is Solana-only
     // and is NOT verified on this QNet path.
-    let claim_message = format!("claim_rewards:{}:{}", claim_request.node_id, claim_request.wallet_address);
+    // Chain-bound: the same wallet key signs transfers, so an authorization minted on one chain
+    // must not be replayable on another.
+    let claim_message = crate::node::BlockchainNode::chain_bind(
+        &format!("claim_rewards:{}:{}", claim_request.node_id, claim_request.wallet_address));
     
     // v5.0: MANDATORY Dilithium3 (ML-DSA-65) signature for ALL reward claims — no exceptions.
     // Android (NDK/JNI) and iOS (ObjC bridge) both support Dilithium since v5.0.
@@ -9771,7 +9920,7 @@ async fn handle_claim_rewards(
             data: Some(data.clone()),
             dilithium_signature: Some(sig.clone().into_bytes()),
             dilithium_public_key: claim_request.dilithium_public_key.clone().map(String::into_bytes),
-            chain_id: 0,
+            chain_id: qnet_state::transaction::QNET_CHAIN_ID,
         };
         tx.hash = tx.calculate_hash();
         if !crate::node::BlockchainNode::claim_authorized(&tx, &wallet_address, data) {
@@ -10075,11 +10224,12 @@ async fn handle_get_pending_rewards(
         None => 0,
     };
     let (pool1, pool2, pool3) = (pending_amount, 0u64, 0u64);
-    // Phase 2 begins at 90% of the 1DEV supply burned; the same rule every other endpoint uses.
-    let phase = if crate::GLOBAL_BURN_PERCENTAGE.load(std::sync::atomic::Ordering::Relaxed) as f64 / 100.0 >= 90.0 {
-        "Phase2".to_string()
-    } else {
-        "Phase1".to_string()
+    // Phase 2 begins at 90% of the 1DEV supply burned; display-only, so an outage reads "unknown"
+    // rather than silently claiming Phase 1.
+    let phase = match live_activation_pricing_opt().await {
+        Some(p) if p.phase == 2 => "Phase2".to_string(),
+        Some(_) => "Phase1".to_string(),
+        None => "unknown".to_string(),
     };
     let is_claimable = pending_amount > 0;
     
@@ -10239,10 +10389,9 @@ async fn handle_get_reward_pools(
         return Ok(rate_limit_response);
     }
     
-    // Get current phase
-    let burn_percentage = crate::GLOBAL_BURN_PERCENTAGE.load(std::sync::atomic::Ordering::Relaxed) as f64 / 100.0;
-    let current_phase = if burn_percentage >= 90.0 { 2 } else { 1 };
-    
+    // Get current phase (display only — an outage reports phase 0 = unknown, not a false Phase 1)
+    let current_phase = live_activation_pricing_opt().await.map(|p| p.phase).unwrap_or(0);
+
     // Emission is pure Pool-1, so the claimable total IS pool 1; the other two are reported as the
     // zeros they are rather than a split this chain does not produce.
     let total = match blockchain.get_node_wallet(&node_id).await {
@@ -10312,10 +10461,10 @@ async fn handle_get_reward_pools(
         "node_id": node_id,
         "node_type": node_type,
         "current_phase": current_phase,
-        "phase_description": if current_phase == 1 { 
-            "Phase 1: 1DEV burn (Pool3 disabled)" 
-        } else { 
-            "Phase 2: QNC payment (Pool3 active)" 
+        "phase_description": match current_phase {
+            1 => "Phase 1: 1DEV burn (Pool3 disabled)",
+            2 => "Phase 2: QNC payment (Pool3 active)",
+            _ => "Unknown: 1DEV supply read unavailable",
         },
         
         // Node's pending rewards breakdown
@@ -11128,19 +11277,23 @@ async fn handle_register_node(
             
             // v4.5: DYNAMIC PRICING — verify burn_amount >= current activation price
             {
-                let burn_pct = crate::GLOBAL_BURN_PERCENTAGE.load(std::sync::atomic::Ordering::Relaxed) as f64 / 100.0;
-                let current_phase = if burn_pct >= 90.0 { 2u8 } else { 1u8 };
-                let minimum_required = if current_phase == 1 {
-                    let reduction_tiers = (burn_pct / 10.0).floor() as u64;
-                    let total_reduction = reduction_tiers * 150;
-                    std::cmp::max(1500u64.saturating_sub(total_reduction), 300)
-                } else {
-                    let active = crate::GLOBAL_ACTIVE_NODES.load(std::sync::atomic::Ordering::Relaxed) as u64;
-                    let base = if node_type == "super" { 7500u64 } else { 10000u64 };
-                    let mult = if active <= 100_000 { 0.5 } else if active <= 300_000 { 1.0 } else if active <= 1_000_000 { 2.0 } else { 3.0 };
-                    (base as f64 * mult).round() as u64
+                // Phase and price come from the ONE canonical resolver — the same value attestors
+                // recompute and sign, so admission cannot disagree with attestation. A supply-read
+                // failure is a retryable error, never a silent default.
+                let pricing = match live_activation_pricing().await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        println!("[ERROR][REGISTER] activation_price_unavailable err={}", e);
+                        return Ok(warp::reply::json(&json!({
+                            "success": false,
+                            "error": format!("Activation price unavailable: {}", e),
+                            "retryable": true
+                        })));
+                    }
                 };
-                
+                let current_phase = pricing.phase;
+                let minimum_required = pricing.cost_for(&node_type);
+
                 if burn_amount < minimum_required {
                     println!("[WARN][REGISTER] insufficient_burn amount={} required={} phase={} type={}",
                         burn_amount, minimum_required, current_phase, node_type);
@@ -11374,6 +11527,20 @@ async fn handle_register_node(
         // v4.9: If migration — broadcast deactivation signal to old server via P2P gossip
         // Old server runs check_device_deactivation every 30s → graceful_shutdown_due_to_migration
         if is_migration {
+            // The phase comes from the ONE resolver, never a literal: this record can reach
+            // register_activation_on_blockchain, which mints an on-chain NodeActivation whose phase
+            // decides which entry-price rule applies. Fail closed on a supply-read outage.
+            let phase = match live_activation_pricing().await {
+                Ok(p) => p.phase,
+                Err(e) => {
+                    println!("[ERROR][REGISTER] activation_price_unavailable err={}", e);
+                    return Ok(warp::reply::json(&json!({
+                        "success": false,
+                        "error": format!("Activation price unavailable: {}", e),
+                        "retryable": true
+                    })));
+                }
+            };
             let registry = &*GLOBAL_ACTIVATION_REGISTRY;
             if let Err(e) = registry.register_or_migrate_device(
                 activation_code,
@@ -11387,7 +11554,7 @@ async fn handle_register_node(
                     migration_count: 1,
                     node_id: node_id.clone(),
                     burn_tx_hash: body["burn_tx_hash"].as_str().unwrap_or("").to_string(),
-                    phase: 1,
+                    phase,
                     burn_amount: body["burn_amount"].as_u64().unwrap_or(0),
                 },
                 device_id,
@@ -12047,7 +12214,33 @@ async fn handle_generate_activation_code(
     if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "activation") {
         return Ok(rate_limit_response);
     }
-    
+
+    // ONE phase resolver, ahead of everything that branches on a phase. It derives from the live 1DEV
+    // supply — the same number the burn attestors sign — and NEVER from the request: the phase selects
+    // which entry-price rule the on-chain NodeActivation is judged by, so an applicant choosing it is
+    // choosing its own Sybil cost. Fail-closed on a supply-read outage; a request that declares a
+    // different phase is rejected rather than silently corrected, because it would pay under one rule
+    // and be recorded under the other.
+    let pricing = match live_activation_pricing().await {
+        Ok(p) => p,
+        Err(e) => {
+            println!("[ERROR][GENERATE] activation_price_unavailable err={}", e);
+            return Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": format!("Activation price unavailable: {}", e),
+                "retryable": true
+            })));
+        }
+    };
+    if request.phase != pricing.phase {
+        println!("[WARN][GENERATE] phase_mismatch declared={} network={}", request.phase, pricing.phase);
+        return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": format!("Declared phase {} is not the network phase {}", request.phase, pricing.phase),
+            "phase": pricing.phase
+        })));
+    }
+
     // SECURITY: Validate wallet addresses
     // Phase 1: wallet_address = Solana (burn), qnet_reward_wallet = EON (rewards) - REQUIRED
     // Phase 2: wallet_address = EON (burn + rewards)
@@ -12055,7 +12248,7 @@ async fn handle_generate_activation_code(
     // Determine the QNet EON address for rewards (used for "1 wallet = 1 node" check)
     let qnet_wallet_for_rewards: String;
     
-    if request.phase == 2 {
+    if pricing.phase == 2 {
         // Phase 2: wallet_address is EON, used for everything
         if let Err(e) = validate_eon_address_with_error(&request.wallet_address) {
             return Ok(warp::reply::json(&json!({
@@ -12125,11 +12318,11 @@ async fn handle_generate_activation_code(
     println!("   Wallet: {}", qnet_state::char_prefix(&request.wallet_address, 8));
     println!("   Burn TX: {}", qnet_state::char_prefix(&request.burn_tx_hash, 8));
     println!("   Node Type: {}", request.node_type);
-    println!("   Amount: {} {}", request.burn_amount, if request.phase == 1 { "1DEV" } else { "QNC" });
-    println!("   Phase: {}", request.phase);
+    println!("   Amount: {} {}", request.burn_amount, if pricing.phase == 1 { "1DEV" } else { "QNC" });
+    println!("   Phase: {}", pricing.phase);
 
     // CRITICAL: Verify burn transaction actually exists on Solana/QNet blockchain
-    match verify_burn_transaction_exists(&request.burn_tx_hash, &request.wallet_address, request.burn_amount, request.phase).await {
+    match verify_burn_transaction_exists(&request.burn_tx_hash, &request.wallet_address, request.burn_amount, pricing.phase).await {
         Ok((false, _)) => {
             println!("❌ Burn transaction verification failed");
             let error_response = json!({
@@ -12155,50 +12348,31 @@ async fn handle_generate_activation_code(
         }
     }
     
-    // ═══════════════════════════════════════════════════════════════════════════════
-    // v4.5: DYNAMIC PRICING — burn_amount MUST be >= current activation price!
-    // This prevents users from burning less than required and faking XOR codes.
-    // Price = 1500 - (burn% / 10) * 150, minimum 300 (Phase 1)
-    // ═══════════════════════════════════════════════════════════════════════════════
+    // DYNAMIC PRICING — burn_amount MUST be >= the current activation price, so a user cannot
+    // underpay and still get an XOR code. Phase and price come from the live 1DEV supply through
+    // the canonical helper, the same number attestors sign, so a discounted tier is accepted.
     {
-        let burn_percentage = crate::GLOBAL_BURN_PERCENTAGE.load(std::sync::atomic::Ordering::Relaxed) as f64 / 100.0;
-        let current_phase = if burn_percentage >= 90.0 { 2u8 } else { 1u8 };
-        
-        let minimum_required = if current_phase == 1 {
-            // Phase 1: Dynamic 1DEV pricing
-            let reduction_tiers = (burn_percentage / 10.0).floor() as u64;
-            let total_reduction = reduction_tiers * 150;
-            std::cmp::max(1500u64.saturating_sub(total_reduction), 300)
-        } else {
-            // Phase 2: QNC pricing based on node type
-            let active_nodes = crate::GLOBAL_ACTIVE_NODES.load(std::sync::atomic::Ordering::Relaxed) as u64;
-            let base = if request.node_type.to_lowercase() == "super" { 7500u64 } else { 10000u64 };
-            let multiplier = if active_nodes <= 100_000 { 0.5 }
-                else if active_nodes <= 300_000 { 1.0 }
-                else if active_nodes <= 1_000_000 { 2.0 }
-                else { 3.0 };
-            (base as f64 * multiplier).round() as u64
-        };
-        
+        let minimum_required = pricing.cost_for(&request.node_type);
+
         if request.burn_amount < minimum_required {
-            println!("[WARN][GENERATE] insufficient_burn amount={} required={} phase={} burn_pct={:.1}%",
-                request.burn_amount, minimum_required, current_phase, burn_percentage);
+            println!("[WARN][GENERATE] insufficient_burn amount={} required={} phase={} burn_pct={:.1}",
+                request.burn_amount, minimum_required, pricing.phase, pricing.burn_pct);
             return Ok(warp::reply::json(&json!({
                 "success": false,
-                "error": format!("Insufficient burn amount: {} provided, {} required", 
+                "error": format!("Insufficient burn amount: {} provided, {} required",
                     request.burn_amount, minimum_required),
                 "required_amount": minimum_required,
                 "provided_amount": request.burn_amount,
-                "phase": current_phase,
-                "burn_percentage": burn_percentage,
-                "currency": if current_phase == 1 { "1DEV" } else { "QNC" },
-                "hint": format!("Current activation price is {} {}. Burn at least this amount.", 
-                    minimum_required, if current_phase == 1 { "1DEV" } else { "QNC" })
+                "phase": pricing.phase,
+                "burn_percentage": pricing.burn_pct,
+                "currency": pricing.currency(),
+                "hint": format!("Current activation price is {} {}. Burn at least this amount.",
+                    minimum_required, pricing.currency())
             })));
         }
-        
+
         println!("[INFO][GENERATE] price_check_passed amount={} required={} phase={}",
-            request.burn_amount, minimum_required, current_phase);
+            request.burn_amount, minimum_required, pricing.phase);
     }
     
     // ═══════════════════════════════════════════════════════════════════════════════
@@ -12232,7 +12406,7 @@ async fn handle_generate_activation_code(
         }
         // Check 2: By Solana wallet (in case light node was registered with Solana address)
         // Phase 1: wallet_address = Solana, qnet_reward_wallet = EON — check both
-        if request.phase == 1 && request.wallet_address != qnet_wallet_for_rewards {
+        if pricing.phase == 1 && request.wallet_address != qnet_wallet_for_rewards {
             match storage.get_nodes_by_wallet(&request.wallet_address) {
                 Ok(nodes) if !nodes.is_empty() => {
                     let (existing_node_id, existing_type, _rep) = &nodes[0];
@@ -12280,7 +12454,7 @@ async fn handle_generate_activation_code(
                 migration_count: 0,
                 node_id: String::new(), // Will be populated when node starts on server
                 burn_tx_hash: request.burn_tx_hash.clone(), // CRITICAL: Store burn_tx for XOR decryption
-                phase: request.phase,
+                phase: pricing.phase,
                 burn_amount: request.burn_amount, // CRITICAL: Store exact amount for XOR key derivation
             };
 
@@ -12294,7 +12468,7 @@ async fn handle_generate_activation_code(
                 "activation_code": activation_code,
                 "wallet_address": request.wallet_address,
                 "node_type": request.node_type,
-                "phase": request.phase,
+                "phase": pricing.phase,
                 "burn_tx_hash": request.burn_tx_hash,
                 "generated_at": chrono::Utc::now().timestamp(),
                 "permanent": true,
@@ -12643,7 +12817,7 @@ fn extract_burn_amount_from_token_balances(tx_data: &serde_json::Value) -> Resul
 /// Verify burn transaction actually exists on blockchain
 /// Returns (valid, actual_burned) where actual_burned is the ACTUAL on-Solana burned amount in whole
 /// 1DEV units (0 on any false/early-exit path). Callers needing only validity use `.0`.
-pub(crate) async fn verify_burn_transaction_exists(
+pub async fn verify_burn_transaction_exists(
     burn_tx_hash: &str,
     wallet_address: &str,  // v4.7: MUST be the Solana address that signed the burn TX
     burn_amount: u64,
@@ -12654,7 +12828,7 @@ pub(crate) async fn verify_burn_transaction_exists(
 
 /// Same, with an explicit retry budget. The relay/attestor path passes 1 so an unauthenticated caller
 /// cannot multiply its request into several upstream Solana round-trips.
-pub(crate) async fn verify_burn_transaction_exists_attempts(
+pub async fn verify_burn_transaction_exists_attempts(
     burn_tx_hash: &str,
     wallet_address: &str,
     burn_amount: u64,
@@ -13040,9 +13214,13 @@ async fn handle_public_stats(
     
     let total_nodes = light_nodes + super_nodes; // v3.18: full_nodes removed
     
-    // Determine current phase
-    let burn_percentage = crate::GLOBAL_BURN_PERCENTAGE.load(std::sync::atomic::Ordering::Relaxed) as f64 / 100.0;
-    let phase = if burn_percentage >= 90.0 { 2 } else { 1 };
+    // Burn progress and phase from the last 1DEV supply read; both report null on an outage rather
+    // than a fabricated 0% / Phase 1. `supply_age_seconds` tells the client how old that read is —
+    // display endpoints never force a refresh, so the money path keeps the upstream budget.
+    let pricing = live_activation_pricing_opt().await;
+    let burn_percentage = pricing.as_ref().map(|p| p.burn_pct);
+    let phase = pricing.as_ref().map(|p| p.phase);
+    let supply_age = pricing.as_ref().map(|p| p.age_secs);
 
     // Native QNC removed from circulation via the canonical burn sink (an unspendable EON address):
     // clients compute circulating = total_supply − qnc_burned. Read-only; the sink can never be spent.
@@ -13057,6 +13235,7 @@ async fn handle_public_stats(
         "height": height,
         "phase": phase,
         "burn_percentage": burn_percentage,
+        "supply_age_seconds": supply_age,
         "burn_address": qnet_state::transaction::CANONICAL_BURN_ADDR,
         "qnc_burned": qnc_burned,
         "cached_at": chrono::Utc::now().to_rfc3339(),
@@ -13079,21 +13258,25 @@ async fn handle_activation_price(
     _blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
     let node_type = params.get("type").map(|s| s.as_str()).unwrap_or("light");
-    
-    // Get current phase
-    let burn_percentage = crate::GLOBAL_BURN_PERCENTAGE.load(std::sync::atomic::Ordering::Relaxed) as f64 / 100.0;
-    let phase = if burn_percentage >= 90.0 { 2 } else { 1 };
-    
-    if phase == 1 {
-        // Phase 1: 1DEV burn pricing
-        // Price = 1500 - (burn% / 10) * 150, minimum 300
-        let reduction_tiers = (burn_percentage / 10.0).floor() as u64;
-        let total_reduction = reduction_tiers * 150;
-        let price = std::cmp::max(1500u64.saturating_sub(total_reduction), 300);
-        
-        let savings = 1500 - price;
+
+    // The quote a wallet burns against. Fail closed on a supply outage: quoting the base tier here
+    // makes the user over-burn irreversibly, and quoting a stale discount gets the burn rejected.
+    let pricing = match live_activation_pricing().await {
+        Ok(p) => p,
+        Err(e) => {
+            println!("[ERROR][PRICING] activation_price_unavailable err={}", e);
+            return Ok(warp::reply::json(&json!({
+                "error": format!("Activation price unavailable: {}", e),
+                "retryable": true
+            })));
+        }
+    };
+
+    if pricing.phase == 1 {
+        let price = pricing.phase1_cost;
+        let savings = 1500u64.saturating_sub(price);
         let savings_percent = (savings as f64 / 1500.0 * 100.0).round() as u64;
-        
+
         return Ok(warp::reply::json(&json!({
             "phase": 1,
             "node_type": node_type,
@@ -13101,45 +13284,32 @@ async fn handle_activation_price(
             "currency": "1DEV",
             "base_cost": 1500,
             "min_cost": 300,
-            "burn_percentage": burn_percentage,
+            "burn_percentage": pricing.burn_pct,
             "savings": savings,
             "savings_percent": savings_percent,
             "mechanism": "burn",
             "universal_price": true // Same for all node types in Phase 1
         })));
     }
-    
-    // Phase 2: QNC pricing with network multiplier
-    let active_nodes = crate::GLOBAL_ACTIVE_NODES.load(std::sync::atomic::Ordering::Relaxed);
-    
-    // Base costs (Phase 2)
-    // v3.18: Only Light and Super nodes (Full removed)
-    let base_cost = match node_type {
-        "light" => 10000u64,  // Light node: 10,000 QNC base
-        "super" => 7500u64,   // Super node: 7,500 QNC base
-        _ => 10000u64,        // Default to light
-    };
-    
-    // Network multiplier (canonical thresholds)
-    let multiplier = if active_nodes <= 100_000 {
-        0.5 // ≤100K: Early adopter discount
-    } else if active_nodes <= 300_000 {
-        1.0 // ≤300K: Base price
-    } else if active_nodes <= 1_000_000 {
-        2.0 // ≤1M: High demand
+
+    // Phase 2: QNC pricing with the network-size multiplier, both from the shared price table.
+    let nt = if node_type.eq_ignore_ascii_case("super") {
+        qnet_state::account::NodeType::Super
     } else {
-        3.0 // >1M: Maximum
+        qnet_state::account::NodeType::Light
     };
-    
-    let final_cost = (base_cost as f64 * multiplier).round() as u64;
-    
+    let base_cost = qnet_state::transaction::phase2_base_qnc(&nt);
+    let registered = crate::GLOBAL_REGISTERED_NODES.load(std::sync::atomic::Ordering::Relaxed);
+    let final_cost = pricing.phase2_cost(node_type);
+
     Ok(warp::reply::json(&json!({
         "phase": 2,
         "node_type": node_type,
         "cost": final_cost,
         "currency": "QNC",
         "base_cost": base_cost,
-        "multiplier": multiplier,
+        "registered_nodes": registered,
+        "multiplier": qnet_state::transaction::phase2_size_mult_tenths(registered) as f64 / 10.0,
         "mechanism": "transfer_to_pool3",
         "universal_price": false
     })))
@@ -13522,7 +13692,9 @@ async fn handle_node_registration_client_submit(
             })));
         }
         // Local Phase-1 cost hint (advisory only); each attestor recomputes + signs its own value.
-        let cost_hint = match fetch_solana_1dev_supply().await {
+        // Through the single-flight cache: an uncached read here is one Solana round-trip per
+        // registration attempt, i.e. an attacker-paced fan-out to one external endpoint.
+        let cost_hint = match cached_solana_1dev_supply().await {
             Ok((tb, cs)) => qnet_state::Transaction::phase1_activation_cost(tb, cs),
             Err(_) => 0,
         };
@@ -13684,12 +13856,27 @@ async fn handle_node_reactivation_submit(
         })));
     }
 
+    // Endpoint to republish: the caller's explicit value, else this node's own configured endpoint.
+    // Same validator the block-validity check runs, so a bad address is refused here instead of
+    // being signed, gossiped and rejected network-wide.
+    let api_endpoint = req.api_endpoint.clone().unwrap_or_else(|| {
+        crate::node::BlockchainNode::self_public_api_endpoint(crate::node::NodeType::Super)
+    });
+    if let Err(e) = qnet_state::transaction::validate_public_api_endpoint(&api_endpoint) {
+        println!("[REJECT][RPC] reactivation_bad_endpoint node={} err={}", req.node_id, e);
+        return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": e
+        })));
+    }
+
     // Create NodeReactivation TX (sync, same pattern as NodeRegistration)
     let mut react_tx = crate::node::BlockchainNode::create_node_reactivation_tx(
         &req.node_id,
         req.current_height,
         &req.last_macroblock_hash,
         req.last_macroblock_index,
+        &api_endpoint,
     );
 
     // Sign with pure Dilithium3 (ML-DSA-65) — the node's registered post-quantum identity key
@@ -14097,7 +14284,7 @@ async fn handle_contract_deploy(
     
     // PURE DILITHIUM (F0.2): structural presence check only. The AUTHORITATIVE verify is the value-TX
     // gate in submit_transaction (verify_user_tx_dilithium): it opens the ML-DSA-65 signature over the
-    // SAME canonical message build_canonical_verify_message() rebuilds — "contract_deploy:{from}:
+    // SAME canonical message build_canonical_verify_message() rebuilds — "q{chain}|contract_deploy:{from}:
     // {code_hash}:{nonce}" (code_hash = hex(sha3(wasm)), read from tx.data) — AND binds
     // eon_from_qnet_dilithium_pubkey(dpk)==from. The client MUST sign that exact message in the
     // "dilithium_sig_{pk}_{b64([sig_len][SignedMessage][pk_len][pk])}" wire format with a wallet
@@ -14147,17 +14334,57 @@ async fn handle_contract_deploy(
             "error": "Invalid WASM bytecode - missing magic bytes"
         })));
     }
-    
+
+    // Same deterministic module gate the apply path enforces — fail fast instead of burning a
+    // nonce on a deploy that apply will reject.
+    if !qnet_state::wasm_exec::wasm_vm_enabled() {
+        return Ok(warp::reply::json(&json!({
+            "success": false, "error": "WASM VM is disabled on this node (WASM_VM_ENABLED=false)"
+        })));
+    }
+    if let Err(e) = qnet_vm::validate_wasm_module(&wasm_code, &qnet_vm::VmLimits::default()) {
+        return Ok(warp::reply::json(&json!({
+            "success": false, "error": "invalid WASM module", "details": format!("{}", e)
+        })));
+    }
+
+    // Constructors are not executed at deploy — accepting arguments that can never run would
+    // silently discard the caller's intent, so a non-empty value is refused.
+    let constructor_args_empty = match &request.constructor_args {
+        Value::Null => true,
+        Value::Array(a) => a.is_empty(),
+        Value::Object(o) => o.is_empty(),
+        Value::String(s) => s.is_empty(),
+        _ => false,
+    };
+    if !constructor_args_empty {
+        return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "constructor_args are not supported — contracts are deployed without constructor execution",
+            "hint": "Send an empty constructor_args and initialise state with a contract call"
+        })));
+    }
+
     // Single-source on-chain derivation; apply ignores caller-supplied `to` (no address squatting)
     let contract_address = qnet_state::transaction::derive_contract_address(&request.from, request.nonce);
 
-    // Calculate code hash (SHA3-256 - NIST FIPS 202)
-    let code_hash = {
-        let mut hasher = Sha3_256::new();
-        hasher.update(&wasm_code);
-        hex::encode(hasher.finalize())
+    // ONE canonical deploy payload, byte-shape-identical to /api/v1/wasm/deploy: the executable code
+    // travels on-chain so apply stores a runnable contract, never a code-hash-only stub. code_hash is
+    // derived from that payload by the shared helper, so the signed digest and the stored bytes are
+    // bound together — classify_contract_deploy re-derives and rejects any mismatch.
+    let mut deploy_data = json!({
+        "wasm": true,
+        "code": hex::encode(&wasm_code),
+    });
+    let code_hash = match qnet_state::transaction::deploy_code_hash(
+        qnet_state::transaction::DeployKind::Wasm, &deploy_data) {
+        Ok(h) => h,
+        Err(e) => return Ok(warp::reply::json(&json!({
+            "success": false, "error": "Invalid WASM deploy payload", "details": e
+        }))),
     };
-    
+    deploy_data["code_hash"] = json!(code_hash);
+
     // Create ContractDeploy transaction with security metadata
     let mut tx = qnet_state::Transaction::new(
         request.from.clone(),                      // from
@@ -14169,19 +14396,10 @@ async fn handle_contract_deploy(
         chrono::Utc::now().timestamp() as u64,     // timestamp
         None,                                      // signature (pure-Dilithium; Ed25519 not on a QNet path)
         qnet_state::TransactionType::ContractDeploy,  // tx_type
-        Some(serde_json::to_string(&json!({        // data
-            "code_hash": code_hash,
-            "code_size": wasm_code.len(),
-            "constructor_args": request.constructor_args,
-            "security": {
-                "dilithium_verified": is_quantum_secure,
-                "nist_compliant": true,
-                "standards": ["FIPS 202", "FIPS 204"]
-            }
-        })).unwrap_or_default()),
+        Some(serde_json::to_string(&deploy_data).unwrap_or_default()), // data
     );
     // Carry the caller's ML-DSA-65 signature so the value-TX gate verifies it (over the canonical
-    // "contract_deploy:{from}:{code_hash}:{nonce}" message) and binds the key to `from`.
+    // "q{chain}|contract_deploy:{from}:{code_hash}:{nonce}" message) and binds the key to `from`.
     // FIX-5: hex(raw detached) -> bytes; value gate verifies
     tx.dilithium_signature = hex::decode(&request.dilithium_signature).ok();
     tx.dilithium_public_key = hex::decode(&request.dilithium_public_key).ok();
@@ -14526,7 +14744,7 @@ async fn handle_contract_call(
     
     // PURE DILITHIUM (F0.2): structural presence check only — the AUTHORITATIVE verify is the value-TX
     // gate in submit_transaction (verify_user_tx_dilithium), which opens the ML-DSA-65 sig over the SAME
-    // canonical message build_canonical_verify_message() rebuilds — "contract_call:{from}:{sha3(tx.data
+    // canonical message build_canonical_verify_message() rebuilds — "q{chain}|contract_call:{from}:{sha3(tx.data
     // calldata)}:{nonce}" (AC-1: the exact calldata bytes are bound, so method/recipient/amount can't be
     // tampered and no cross-impl re-serialization can diverge) — AND binds
     // eon_from_qnet_dilithium_pubkey(dpk)==from. The client MUST sign that exact message in the
@@ -14551,11 +14769,31 @@ async fn handle_contract_call(
         })));
     }
 
+    // A WASM contract takes calldata as a HEX STRING; apply rejects any other shape rather than
+    // executing with empty args. Report it at the door when the target is already on-chain
+    // (unknown/pending targets are simply left to the binding apply-side gate).
+    if let Ok(Some(account)) = blockchain.get_account(&request.contract_address).await {
+        let is_wasm = account.contract_storage.get("type").map(|t| t == "wasm").unwrap_or(false);
+        let args_ok = match &request.args {
+            Value::Null => true,
+            Value::String(s) => hex::decode(s).is_ok(),
+            _ => false,
+        };
+        if is_wasm && !args_ok {
+            return Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": "args for a WASM contract must be a hex-encoded calldata string",
+                "contract_address": request.contract_address,
+                "method": request.method
+            })));
+        }
+    }
+
     // Create ContractCall transaction; tx.data is the exact calldata bound by the AC-1 signature
     let mut tx = qnet_state::Transaction::new(
         request.from.clone(),                      // from
         Some(request.contract_address.clone()),    // to: contract address
-        0,                                         // amount: 0 for call (unless payable)
+        0,                                         // amount: a call carries no native value
         request.nonce,                             // nonce
         request.gas_price,                         // gas_price
         request.gas_limit,                         // gas_limit
@@ -14569,7 +14807,7 @@ async fn handle_contract_call(
         })).unwrap_or_default()),
     );
     // Carry the caller's ML-DSA-65 signature so the value-TX gate verifies it (over the canonical
-    // "contract_call:{from}:{sha3(tx.data calldata)}:{nonce}" message) and binds the key to `from`.
+    // "q{chain}|contract_call:{from}:{sha3(tx.data calldata)}:{nonce}" message) and binds the key to `from`.
     // FIX-5: hex(raw detached) -> bytes; value gate verifies
     tx.dilithium_signature = hex::decode(&dilithium_sig).ok();
     // Elided pk stays None all the way into the mempool — never re-added to the wire (FIX-5 TPS win).
@@ -15225,14 +15463,14 @@ async fn handle_ws_connection_with_cleanup(
 // QRC-20 TOKEN HANDLERS (v2.19.12)
 // ============================================================================
 
-/// Request to deploy a generic WASM smart contract (P3).
+/// Request to deploy a generic WASM smart contract.
 #[derive(Debug, Deserialize)]
 struct WasmDeployRequest {
     /// Creator's EON address
     from: String,
     /// WASM module bytes, hex-encoded
     code: String,
-    /// Replay-protection nonce (signed into "contract_deploy:{from}:{code_hash}:{nonce}").
+    /// Replay-protection nonce (signed into "q{chain}|contract_deploy:{from}:{code_hash}:{nonce}").
     nonce: u64,
     /// Dilithium3 signature + public key (MANDATORY; pure ML-DSA-65)
     dilithium_signature: String,
@@ -15241,10 +15479,9 @@ struct WasmDeployRequest {
 
 /// Handle a generic WASM contract deploy. Builds a ContractDeploy value-TX with
 /// data {"wasm":true,"code":<hex>,"code_hash":<sha3(code)>}; the value-TX gate
-/// verifies the ML-DSA-65 sig over canonical "contract_deploy:{from}:{code_hash}:
-/// {nonce}" (code_hash = hex(sha3(code_bytes))). NOTE: while the VM gate
-/// WASM_VM_ENABLED is OFF the tx is rejected at apply — this endpoint is wired for
-/// activation. Validates the module up-front for fast, honest feedback.
+/// verifies the ML-DSA-65 sig over canonical "q{chain}|contract_deploy:{from}:{code_hash}:
+/// {nonce}" (code_hash = hex(sha3(code_bytes))). Validates the module up-front for
+/// fast, honest feedback; the same validator runs again at apply.
 async fn handle_wasm_deploy(
     request: WasmDeployRequest,
     remote_addr: Option<std::net::SocketAddr>,
@@ -15286,13 +15523,20 @@ async fn handle_wasm_deploy(
 
     let nonce = request.nonce;
     let contract_address = qnet_state::transaction::derive_contract_address(&request.from, nonce);
-    // Signature-binding digest = sha3(code bytes); build_canonical_verify_message
-    // reads this "code_hash" tx.data field.
-    let code_hash = {
-        let mut hasher = Sha3_256::new();
-        hasher.update(&code);
-        hex::encode(hasher.finalize())
+    // Canonical deploy payload FIRST, then its digest — sha3(module bytes) for WASM, re-derived by
+    // classify_contract_deploy on every node so the stored code cannot differ from the signed hash.
+    let mut deploy_data = json!({
+        "wasm": true,
+        "code": request.code.trim(),
+    });
+    let code_hash = match qnet_state::transaction::deploy_code_hash(
+        qnet_state::transaction::DeployKind::Wasm, &deploy_data) {
+        Ok(h) => h,
+        Err(e) => return Ok(warp::reply::json(&json!({
+            "success": false, "error": "Invalid WASM deploy payload", "details": e
+        }))),
     };
+    deploy_data["code_hash"] = json!(code_hash);
     let gas_price = 1000u64;
     let gas_limit = 200_000u64;
 
@@ -15308,15 +15552,11 @@ async fn handle_wasm_deploy(
         signature: None,
         public_key: None,
         tx_type: qnet_state::TransactionType::ContractDeploy,
-        data: Some(serde_json::to_string(&json!({
-            "wasm": true,
-            "code": request.code.trim(),
-            "code_hash": code_hash
-        })).unwrap_or_default()),
+        data: Some(serde_json::to_string(&deploy_data).unwrap_or_default()),
         // FIX-5: hex(raw detached) -> bytes; value gate verifies
         dilithium_signature: hex::decode(&request.dilithium_signature).ok(),
         dilithium_public_key: hex::decode(&request.dilithium_public_key).ok(),
-        chain_id: 0,
+        chain_id: qnet_state::transaction::QNET_CHAIN_ID,
     };
     tx.hash = tx.calculate_hash();
     let tx_hash = tx.hash.clone();
@@ -15350,7 +15590,7 @@ struct NftDeployRequest {
     /// Collection symbol
     symbol: String,
     /// Replay-protection nonce (client signs it into the canonical
-    /// "contract_deploy:{from}:{code_hash}:{nonce}" message the value-TX gate verifies).
+    /// "q{chain}|contract_deploy:{from}:{code_hash}:{nonce}" message the value-TX gate verifies).
     nonce: u64,
     /// Dilithium3 signature (MANDATORY; pure ML-DSA-65)
     dilithium_signature: String,
@@ -15361,9 +15601,10 @@ struct NftDeployRequest {
 /// Handle QRC-721 (NFT) collection deployment. Mirrors handle_token_deploy: builds a
 /// ContractDeploy value-TX with data {"qrc721":true,...} that apply_to_state materializes
 /// on every node; authorisation is the value-TX gate (verify_user_tx_dilithium) over the
-/// canonical "contract_deploy:{from}:{code_hash}:{nonce}" where code_hash = hex(sha3(
-/// "QRC721:"+name+":"+symbol)) — the client MUST sign THAT message with a wallet ML-DSA-65
-/// key whose eon address == from. Individual NFTs are minted afterwards via ContractCall.
+/// canonical "q{chain}|contract_deploy:{from}:{code_hash}:{nonce}" where code_hash is the canonical
+/// deploy digest (qnet_state::transaction::deploy_code_hash) over the payload built below — the
+/// client MUST sign THAT message with a wallet ML-DSA-65 key whose eon address == from. Individual
+/// NFTs are minted afterwards via ContractCall.
 async fn handle_nft_deploy(
     request: NftDeployRequest,
     remote_addr: Option<std::net::SocketAddr>,
@@ -15395,16 +15636,21 @@ async fn handle_nft_deploy(
 
     let nonce = request.nonce;
     let contract_address = qnet_state::transaction::derive_contract_address(&request.from, nonce);
-    // Signature-binding digest (NOT the on-chain contract_code_hash, which apply recomputes
-    // as sha3(data_str)); build_canonical_verify_message reads this "code_hash" tx.data field.
-    let code_hash = {
-        let mut hasher = Sha3_256::new();
-        hasher.update(b"QRC721:");
-        hasher.update(request.name.as_bytes());
-        hasher.update(b":");
-        hasher.update(request.symbol.as_bytes());
-        hex::encode(hasher.finalize())
+    // Canonical deploy payload FIRST, then its digest — the value the client signs and that
+    // classify_contract_deploy re-derives on every node, binding name/symbol to the signature.
+    let mut deploy_data = json!({
+        "qrc721": true,
+        "name": request.name,
+        "symbol": request.symbol,
+    });
+    let code_hash = match qnet_state::transaction::deploy_code_hash(
+        qnet_state::transaction::DeployKind::Qrc721, &deploy_data) {
+        Ok(h) => h,
+        Err(e) => return Ok(warp::reply::json(&json!({
+            "success": false, "error": "Invalid NFT deploy payload", "details": e
+        }))),
     };
+    deploy_data["code_hash"] = json!(code_hash);
     let gas_price = 1000u64;
     let gas_limit = 50_000u64;
 
@@ -15420,16 +15666,11 @@ async fn handle_nft_deploy(
         signature: None,
         public_key: None,
         tx_type: qnet_state::TransactionType::ContractDeploy,
-        data: Some(serde_json::to_string(&json!({
-            "qrc721": true,
-            "name": request.name,
-            "symbol": request.symbol,
-            "code_hash": code_hash
-        })).unwrap_or_default()),
+        data: Some(serde_json::to_string(&deploy_data).unwrap_or_default()),
         // FIX-5: hex(raw detached) -> bytes; value gate verifies
         dilithium_signature: hex::decode(&request.dilithium_signature).ok(),
         dilithium_public_key: hex::decode(&request.dilithium_public_key).ok(),
-        chain_id: 0,
+        chain_id: qnet_state::transaction::QNET_CHAIN_ID,
     };
     tx.hash = tx.calculate_hash();
     let tx_hash = tx.hash.clone();
@@ -15475,13 +15716,17 @@ struct TokenDeployRequest {
     decimals: u8,
     /// Initial supply
     initial_supply: u64,
-    /// Optional token logo — an emoji or https URL (sanitized + capped at apply; not part of
-    /// code_hash, so it never affects the deploy address or the signed canonical message). Empty
-    /// ⇒ clients render a generated avatar.
+    /// Optional token logo — an emoji or https URL (sanitized + capped at apply). Empty ⇒ clients
+    /// render a generated avatar.
     #[serde(default)]
     logo: String,
+    /// Opt-in supply mutation. Absent ⇒ false, i.e. an immutable-supply token.
+    #[serde(default)]
+    mintable: bool,
+    #[serde(default)]
+    burnable: bool,
     /// Replay-protection nonce (client-provided; the caller signs it into the canonical
-    /// "contract_deploy:{from}:{code_hash}:{nonce}" message the value-TX gate verifies).
+    /// "q{chain}|contract_deploy:{from}:{code_hash}:{nonce}" message the value-TX gate verifies).
     nonce: u64,
     /// Dilithium3 signature (MANDATORY v6.1)
     dilithium_signature: String,
@@ -15542,8 +15787,9 @@ async fn handle_token_deploy(
     // PURE DILITHIUM (F0.2): structural presence check only. A QRC-20 token deploy IS a ContractDeploy
     // value-TX, so the AUTHORITATIVE verify is the value-TX gate in submit_transaction
     // (verify_user_tx_dilithium): it opens the ML-DSA-65 sig over the canonical message
-    // build_canonical_verify_message() rebuilds — "contract_deploy:{from}:{code_hash}:{nonce}" where
-    // code_hash = hex(sha3("QRC20:"+name+":"+symbol)) — AND binds eon_from_qnet_dilithium_pubkey(dpk)==from.
+    // build_canonical_verify_message() rebuilds — "q{chain}|contract_deploy:{from}:{code_hash}:{nonce}" where
+    // code_hash is the canonical deploy digest over the payload built below (it commits to every
+    // applied field) — AND binds eon_from_qnet_dilithium_pubkey(dpk)==from.
     // The client MUST sign THAT message (NOT "token_deploy:..") in the "dilithium_sig_{pk}_{b64}" wire
     // format with a wallet ML-DSA-65 key whose eon address == from, and provide the matching `nonce`.
     if request.dilithium_signature.is_empty() || request.dilithium_public_key.is_empty() {
@@ -15554,23 +15800,37 @@ async fn handle_token_deploy(
     }
 
     // Client-provided nonce (replay protection is enforced at apply). It MUST match the nonce the caller
-    // signed into the canonical "contract_deploy:{from}:{code_hash}:{nonce}" message, else the value-TX
+    // signed into the canonical "q{chain}|contract_deploy:{from}:{code_hash}:{nonce}" message, else the value-TX
     // gate rejects the derived ContractDeploy at ingest.
     let nonce = request.nonce;
     
     // Single-source on-chain derivation; apply ignores caller-supplied `to` (no address squatting)
     let contract_address = qnet_state::transaction::derive_contract_address(&request.from, nonce);
 
-    // v3.40: Code hash for QRC-20 standard (deterministic from token params)
-    let code_hash = {
-        let mut hasher = Sha3_256::new();
-        hasher.update(b"QRC20:");
-        hasher.update(request.name.as_bytes());
-        hasher.update(b":");
-        hasher.update(request.symbol.as_bytes());
-        hex::encode(hasher.finalize())
+    // Canonical deploy payload FIRST, then its digest: code_hash commits to every field apply reads
+    // (name/symbol/decimals/supply/flags/logo), so nothing here is malleable under the client's
+    // signature. The client signs the same digest — see WalletManager.js deployToken.
+    let mut deploy_data = json!({
+        "qrc20": true,
+        "name": request.name,
+        "symbol": request.symbol,
+        "decimals": request.decimals,
+        // Optional on-chain logo (emoji / https URL) — sanitized at apply; "" ⇒ generated avatar.
+        "logo": request.logo,
+        // STRING (exact past 2^53); apply + explorer both accept number-or-string.
+        "initial_supply": request.initial_supply.to_string(),
+        "mintable": request.mintable,
+        "burnable": request.burnable,
+    });
+    let code_hash = match qnet_state::transaction::deploy_code_hash(
+        qnet_state::transaction::DeployKind::Qrc20, &deploy_data) {
+        Ok(h) => h,
+        Err(e) => return Ok(warp::reply::json(&json!({
+            "success": false, "error": "Invalid token deploy payload", "details": e
+        }))),
     };
-    
+    deploy_data["code_hash"] = json!(code_hash);
+
     // v3.40: Create ContractDeploy transaction — goes to mempool -> block -> all nodes
     // QRC-20 metadata is stored in tx.data as JSON so apply_to_state can parse it
     let gas_price = 1000u64; // Standard QRC-20 deploy gas price
@@ -15588,21 +15848,11 @@ async fn handle_token_deploy(
         signature: None,
         public_key: None,
         tx_type: qnet_state::TransactionType::ContractDeploy,
-        data: Some(serde_json::to_string(&json!({
-            "qrc20": true,
-            "name": request.name,
-            "symbol": request.symbol,
-            "decimals": request.decimals,
-            // Optional on-chain logo (emoji / https URL) — sanitized at apply; "" ⇒ generated avatar.
-            "logo": request.logo,
-            // STRING (exact past 2^53); apply + explorer both accept number-or-string.
-            "initial_supply": request.initial_supply.to_string(),
-            "code_hash": code_hash
-        })).unwrap_or_default()),
+        data: Some(serde_json::to_string(&deploy_data).unwrap_or_default()),
         // FIX-5: hex(raw detached) -> bytes; value gate verifies
         dilithium_signature: hex::decode(&request.dilithium_signature).ok(),
         dilithium_public_key: hex::decode(&request.dilithium_public_key).ok(),
-        chain_id: 0,
+        chain_id: qnet_state::transaction::QNET_CHAIN_ID,
     };
 
     // Calculate hash BEFORE submit (same as all other TX handlers)
@@ -16810,4 +17060,35 @@ async fn handle_benchmark_presets(
         "formula": "TPS = shards × 50,000",
         "max_theoretical": "12.8M TPS (256 shards × 50K)"
     })))
+}
+
+#[cfg(test)]
+mod tests_activation_phase_resolver {
+    use super::*;
+
+    /// The one resolver must apply BOTH halves of the phase rule — 90% of the 1DEV supply burned OR
+    /// five years since genesis. Losing the age half strands the network in Phase 1 if burning stalls.
+    #[test]
+    fn resolver_applies_burn_and_age_halves() {
+        const G: u64 = 1_700_000_000;
+        let five_years = G + qnet_state::Transaction::PHASE2_AGE_SECS;
+
+        // Neither trigger: Phase 1, quoted in 1DEV.
+        let p = pricing_from_supply(0, 1_000, 0, G, G);
+        assert_eq!(p.phase, 1);
+        assert_eq!(p.currency(), "1DEV");
+
+        // Burn trigger alone, clock at genesis.
+        assert_eq!(pricing_from_supply(900, 100, 0, G, G).phase, 2);
+
+        // Age trigger alone, nothing burned.
+        assert_eq!(pricing_from_supply(0, 1_000, 0, G, five_years - 1).phase, 1);
+        let aged = pricing_from_supply(0, 1_000, 0, G, five_years);
+        assert_eq!(aged.phase, 2, "five years flips the phase with zero burned");
+        assert_eq!(aged.currency(), "QNC");
+        assert_eq!(aged.burn_pct, 0.0, "the age trigger does not fake a burn percentage");
+
+        // Genesis not applied yet: the age half stays shut.
+        assert_eq!(pricing_from_supply(0, 1_000, 0, 0, five_years).phase, 1);
+    }
 }

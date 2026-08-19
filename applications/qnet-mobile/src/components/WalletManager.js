@@ -15,6 +15,10 @@ import { GENESIS_NODES, NODE_DISCOVERY, getRandomGenesisNode, getSolanaRpcUrl, r
 // (replaces the MITM-bypassable 2/3 peer-poll). MITM-proof at any network size.
 import { verifyMacroblockStateRoot, verifyLogInclusion, verifyLogWindowInclusion, verifyMacroblockLogsRoot, transferLogLeaf } from '../crypto/QcLightClient';
 
+// Canonical identity + signed-preimage construction, pinned cross-language against the node and the
+// extension by __tests__/fix5_kat.test.js.
+import { QNET_CHAIN_TAG, walletSeedString, eonFromPublicKeyBytes, transferPreimage } from '../crypto/WalletIdentity';
+
 export class WalletManager {
   constructor() {
     this.keyCache = null;       // Uint8Array (32-byte AES key), NOT the password
@@ -2183,8 +2187,7 @@ export class WalletManager {
   async generateQNetAddress(seed, accountIndex = 0) {
     try {
       // Canonical wallet seed string — MUST byte-match the node's WALLET_SEED_PREFIX + hex(bip39_seed64).
-      const seedHex = Array.from(seed).map(b => b.toString(16).padStart(2, '0')).join('');
-      const seedString = `QNET_WALLET_MLDSA65_v1:${seedHex}`;
+      const seedString = walletSeedString(seed);
 
       // Native ML-DSA-65 keygen: shake256(seedString) -> 32-byte xi -> keypair (hex pk 1952B / sk 4032B).
       const { generateRawDilithiumKeypair } = require('../crypto/DilithiumCrypto');
@@ -2192,14 +2195,7 @@ export class WalletManager {
       const pkBytes = Uint8Array.from(kp.publicKey.match(/.{1,2}/g).map(h => parseInt(h, 16)));
       const skBytes = Uint8Array.from(kp.secretKey.match(/.{1,2}/g).map(h => parseInt(h, 16)));
 
-      // EON = SHA512(raw ML-DSA-65 pk bytes), formatted: 19 + "eon" + 15 + 8-hex SHA3-256 checksum.
-      const addressHash = CryptoJS.SHA512(CryptoJS.lib.WordArray.create(pkBytes));
-      const fullHash = addressHash.toString(CryptoJS.enc.Hex);
-      const part1 = fullHash.substring(0, 19).toLowerCase();
-      const part2 = fullHash.substring(19, 34).toLowerCase();
-      const { sha3_256 } = require('js-sha3');
-      const checksum = sha3_256(part1 + 'eon' + part2).substring(0, 8).toLowerCase();
-      const address = `${part1}eon${part2}${checksum}`;
+      const address = eonFromPublicKeyBytes(pkBytes);
 
       // keypair keeps a byte-array shape (publicKey/privateKey Uint8Array) so existing storage sites
       // (Array.from(...)) keep working; the bytes are now the ML-DSA-65 wallet key, not Ed25519.
@@ -5677,7 +5673,7 @@ export class WalletManager {
 
   // v6.0: Create a NodeRegistration TX client-side and submit it to the current producer.
   // Called after /api/v1/light-node/register returns registration_proof.
-  // Signing message: "client_node_reg:{node_id}:{wallet_address}:{registration_proof}:{timestamp}"
+  // Signing message: "q{chain}|client_node_reg:{node_id}:{wallet_address}:{registration_proof}:{timestamp}"
   async createAndSubmitNodeRegistrationTx(nodeId, walletAddress, registrationProof, password, dilithiumKeys, burnTxHash, burnAmount, burnWallet) {
     const walletData = await this.loadWallet(password);
     if (!walletData || !walletData.secretKey) {
@@ -5695,7 +5691,7 @@ export class WalletManager {
     const walletDilSkHex = Buffer.from(new Uint8Array(qk.privateKey)).toString('hex');
 
     const timestamp = Math.floor(Date.now() / 1000);
-    const message = `client_node_reg:${nodeId}:${walletAddress}:${registrationProof}:${timestamp}`;
+    const message = `${QNET_CHAIN_TAG}client_node_reg:${nodeId}:${walletAddress}:${registrationProof}:${timestamp}`;
 
     const payload = {
       from: walletAddress,
@@ -6212,9 +6208,10 @@ export class WalletManager {
       }
       
       // PURE DILITHIUM (F0.2): the reward claim is authorised ONLY by the ML-DSA-65 signature below over
-      // "claim_rewards:{node_id}:{wallet_address}" (the node also matches the on-chain wallet + re-verifies
-      // the merkle proof). Ed25519 is Solana-only and no longer sent on this QNet path.
-      const message = `claim_rewards:${nodeId}:${walletAddress}`;
+      // "{chain_tag}claim_rewards:{node_id}:{wallet_address}" (the node also matches the on-chain wallet +
+      // re-verifies the merkle proof). Ed25519 is Solana-only and no longer sent on this QNet path.
+      // Chain-bound like every other preimage: mirror of rpc.rs handle_claim_rewards.
+      const message = `${QNET_CHAIN_TAG}claim_rewards:${nodeId}:${walletAddress}`;
 
       // Dilithium3 signature — quantum-safe proof of node ownership (NIST FIPS 204)
       // Activation code is used as seed so the same keypair is deterministically recovered
@@ -6305,7 +6302,7 @@ export class WalletManager {
         }
         // NEVER sign a server-supplied string with the wallet key. This used to sign
         // `claimResult.sign_message` verbatim with the SAME ML-DSA-65 key that signs
-        // `transfer:{from}:{to}:{amount}:{nonce}:{gas_price}:{gas_limit}`, and nothing anywhere
+        // `q{chain}|transfer:{from}:{to}:{amount}:{nonce}:{gas_price}:{gas_limit}`, and nothing anywhere
         // rebuilt or checked the `qnet_claim_v1` prefix — so the prefix separated nothing and any
         // node in the hedged pool could return a transfer-shaped string and drain the wallet, while
         // the user saw only "Failed to submit signed claim".
@@ -6319,7 +6316,7 @@ export class WalletManager {
           throw new Error('Node returned no claim timestamp — refusing to sign');
         }
         const signMessage =
-          `qnet_claim_v1:${walletAddress}:${claimTs}:${sha3_256(claimResult.claims_data)}`;
+          `${QNET_CHAIN_TAG}qnet_claim_v1:${walletAddress}:${claimTs}:${sha3_256(claimResult.claims_data)}`;
         if (claimResult.sign_message && claimResult.sign_message !== signMessage) {
           // Not fatal by itself — the locally built message is what gets signed either way — but a
           // mismatch means the node asked for something else, and that is worth refusing loudly.
@@ -6481,7 +6478,7 @@ export class WalletManager {
       const { signDetached } = require('../crypto/DilithiumCrypto');
 
       // Sign + submit for a nonce. The canonical message MUST byte-match the node's
-      // build_canonical_verify_message Transfer arm: "transfer:from:to:amount:nonce:gas_price:gas_limit".
+      // build_canonical_verify_message Transfer arm: "q{chain}|transfer:from:to:amount:nonce:gas_price:gas_limit".
       // FIX-5: send the RAW detached ML-DSA-65 signature as hex (3309 B → 6618 hex chars) and the RAW
       // pubkey as hex (1952 B → 3904 hex chars) — no "dilithium_sig_" envelope, no 3× pubkey. The node
       // hex-decodes both to raw bytes and verifies via verify_user_tx_dilithium (verify_detached).
@@ -6493,7 +6490,7 @@ export class WalletManager {
       // that binding tx APPLIES before any elided tx, so rehydrate always resolves — no defer-livelock. On a
       // nonce error the retry re-resolves fresh (→ txNonce 1 if the account is truly empty) and re-includes pk.
       const buildAndSubmit = async (txNonce) => {
-        const message = `transfer:${fromAddress}:${toAddress}:${amountSmallest}:${txNonce}:${gasPrice}:${gasLimit}`;
+        const message = transferPreimage(fromAddress, toAddress, amountSmallest, txNonce, gasPrice, gasLimit);
         const dilSig = await signDetached(message, dilSkHex);
         const payload = {
           from: fromAddress, to: toAddress, amount: amountSmallest,
@@ -6542,7 +6539,7 @@ export class WalletManager {
   // Same wallet-load, ML-DSA-65 signer, local-nonce and hedged-submit path as
   // sendQNC. The node builds tx.data server-side from the request fields, so the
   // signature MUST bind the EXACT byte string it will reproduce:
-  //   ContractCall   canonical: contract_call:{from}:{sha3_256_hex(dataStr)}:{nonce}
+  //   ContractCall   canonical: q{chain}|contract_call:{from}:{sha3_256_hex(dataStr)}:{nonce}
   //                  dataStr = serde_json::to_string(json!({"contract","method","args"})).
   //                  serde_json here has preserve_order OFF (Map = BTreeMap), so the node
   //                  emits keys ALPHABETICALLY: `{"args":..,"contract":..,"method":..}`.
@@ -6590,7 +6587,7 @@ export class WalletManager {
       // sorts object keys, so the keys MUST be alphabetical — args, contract, method.
       const dataStr = JSON.stringify({ args: argList, contract: contractAddress, method });
       const dataHash = sha3_256(dataStr); // hex; matches Rust Sha3_256::digest(tx.data)
-      const message = `contract_call:${from}:${dataHash}:${txNonce}`;
+      const message = `${QNET_CHAIN_TAG}contract_call:${from}:${dataHash}:${txNonce}`;
       const dilSig = await signDetached(message, dilSkHex); // FIX-5: raw detached hex; pk sent as hex(dilPkHex)
       // pk-ELISION (same rule as sendQNC): omit the pubkey once bound on-chain (txNonce>=2); include it on
       // the first-ever tx (txNonce===1) so the node can bind it. Nonce ordering ⇒ rehydrate always resolves.
@@ -6698,16 +6695,21 @@ export class WalletManager {
     return this.buildContractCall(contract, 'transferFrom', [from, to, this._tokenId(tokenId)], password, opts);
   }
 
+  // One length-prefixed field of a canonical deploy digest: "{utf8_byte_len}:{value}". Mirrors
+  // deploy_digest_field in qnet-state; the length prefix is what stops a relayer re-splitting
+  // ':'-joined fields (name "A:B" vs symbol "B:C") under an unchanged signature.
+  _deployField(value) {
+    const s = typeof value === 'boolean' ? (value ? 'true' : 'false') : String(value);
+    return `${new TextEncoder().encode(s).length}:${s}`;
+  }
+
   // Deploy a QRC-20 token via the node's /api/v1/token/deploy endpoint. The node
   // derives the on-chain contract address (derive_contract_address(from, nonce)) and
   // builds tx.data itself, so the signature binds the canonical deploy message it
-  // reproduces: contract_deploy:{from}:{code_hash}:{nonce} with
-  //   code_hash = sha3_256_hex("QRC20:" + name + ":" + symbol).
-  // NOTE: the current node token/deploy handler hardcodes tx.data WITHOUT the
-  // mintable/burnable flags, so those keys are inert until the node forwards them
-  // (state.rs already reads them from tx.data). We send them anyway for
-  // forward-compatibility; today a token deploys as immutable-supply.
-  async deployToken({ name, symbol, decimals = 9, initialSupply, mintable = false, burnable = false }, password, opts = {}) {
+  // reproduces: q{chain}|contract_deploy:{from}:{code_hash}:{nonce}, where code_hash is
+  // the canonical deploy digest below — it commits to EVERY field the chain applies, so
+  // no relayer can alter the token under this signature.
+  async deployToken({ name, symbol, decimals = 9, initialSupply, mintable = false, burnable = false, logo = '' }, password, opts = {}) {
     if (!name || !symbol) throw new Error('name and symbol are required');
     if (!(initialSupply > 0)) throw new Error('initialSupply must be greater than 0');
     const { from, dilPkHex, dilSkHex } = await this._loadContractSigner(password);
@@ -6716,15 +6718,19 @@ export class WalletManager {
     const { sha3_256 } = require('js-sha3');
 
     const buildAndSubmit = async (txNonce) => {
-      // code_hash the node signs over: sha3("QRC20:"+name+":"+symbol) — NIST FIPS 202.
-      const codeHash = sha3_256(`QRC20:${name}:${symbol}`);
-      const message = `contract_deploy:${from}:${codeHash}:${txNonce}`;
+      // Mirrors qnet-state deploy_code_hash(DeployKind::Qrc20, ..) — NIST FIPS 202.
+      const codeHash = sha3_256(
+        'QRC20|' + this._deployField(name) + this._deployField(symbol) +
+        this._deployField(decimals) + this._deployField(initialSupply) +
+        this._deployField(!!mintable) + this._deployField(!!burnable) +
+        this._deployField(logo));
+      const message = `${QNET_CHAIN_TAG}contract_deploy:${from}:${codeHash}:${txNonce}`;
       const dilSig = await signDetached(message, dilSkHex); // FIX-5: raw detached hex; pk sent as hex(dilPkHex)
       const res = await this._hedged('/api/v1/token/deploy', {
         method: 'POST', timeoutMs: 5000, hedgeMs: 900,
         body: {
           from, name, symbol, decimals, initial_supply: initialSupply, nonce: txNonce,
-          mintable, burnable, // inert on the current node handler (see NOTE above)
+          mintable, burnable, logo,
           dilithium_signature: dilSig, dilithium_public_key: dilPkHex,
         },
       });
@@ -6755,17 +6761,9 @@ export class WalletManager {
   // Deploy a QRC-721 (NFT) collection. Mirrors deployToken's ContractDeploy path exactly:
   // the node derives the on-chain contract address (derive_contract_address(from, nonce)),
   // builds tx.data server-side as {"qrc721":true,"name":..,"symbol":..}, and the value-TX gate
-  // rebuilds the SAME canonical deploy message this signs — contract_deploy:{from}:{code_hash}:{nonce}
-  // with code_hash = sha3_256_hex("QRC721:"+name+":"+symbol) — then binds the ML-DSA-65 key to `from`.
-  // The digest prefix mirrors the node's token/deploy scheme (QRC20:) with the qrc721 discriminant;
-  // it must byte-match the node's nft/deploy handler's code_hash construction (name/symbol UTF-8,
-  // ':' separators, NIST FIPS 202).
-  //
-  // NOTE: this targets a dedicated /api/v1/nft/deploy endpoint. The current node exposes only
-  // token/deploy (hardcoded qrc20) and contract/deploy (WASM); neither emits the qrc721 tx.data
-  // that qnet-state's deploy branch parses. Until that handler lands, this wrapper is byte-correct
-  // but will 404 — see the SDK stage report. NFT *method calls* (nftMint/Transfer/Approve/
-  // TransferFrom) go through the live contract/call path and work today.
+  // rebuilds the SAME canonical deploy message this signs — q{chain}|contract_deploy:{from}:{code_hash}:{nonce}
+  // — then binds the ML-DSA-65 key to `from`. The digest mirrors qnet-state
+  // deploy_code_hash(DeployKind::Qrc721, ..) byte for byte.
   async deployNftCollection({ name, symbol }, password, opts = {}) {
     if (!name || !symbol) throw new Error('name and symbol are required');
     const { from, dilPkHex, dilSkHex } = await this._loadContractSigner(password);
@@ -6774,9 +6772,9 @@ export class WalletManager {
     const { sha3_256 } = require('js-sha3');
 
     const buildAndSubmit = async (txNonce) => {
-      // code_hash the node signs over: sha3("QRC721:"+name+":"+symbol) — NIST FIPS 202.
-      const codeHash = sha3_256(`QRC721:${name}:${symbol}`);
-      const message = `contract_deploy:${from}:${codeHash}:${txNonce}`;
+      // Mirrors qnet-state deploy_code_hash(DeployKind::Qrc721, ..) — NIST FIPS 202.
+      const codeHash = sha3_256('QRC721|' + this._deployField(name) + this._deployField(symbol));
+      const message = `${QNET_CHAIN_TAG}contract_deploy:${from}:${codeHash}:${txNonce}`;
       const dilSig = await signDetached(message, dilSkHex); // FIX-5: raw detached hex; pk sent as hex(dilPkHex)
       const res = await this._hedged('/api/v1/nft/deploy', {
         method: 'POST', timeoutMs: 5000, hedgeMs: 900,

@@ -39,42 +39,6 @@ static SIGNATURE_CACHE: once_cell::sync::Lazy<DashMap<String, CachedSignature>> 
 static KEY_MANAGER_CACHE: once_cell::sync::Lazy<DashMap<String, CachedKeyManager>> = 
     once_cell::sync::Lazy::new(|| DashMap::new());
 
-/// Blockchain phase state for dynamic pricing calculations
-#[derive(Debug, Clone)]
-pub struct BlockchainPhaseState {
-    pub is_phase_1: bool,
-    pub burn_percentage: f64,      // % of 1DEV burned (Phase 1)
-    pub total_active_nodes: u64,   // Total active nodes (Phase 2)
-    pub genesis_timestamp: u64,    // Genesis block timestamp
-    pub current_timestamp: u64,    // Current timestamp
-}
-
-impl BlockchainPhaseState {
-    /// Check if currently in Phase 1 (1DEV burning phase)
-    pub fn is_phase1(&self) -> bool {
-        self.is_phase_1
-    }
-
-    /// Get 1DEV burn percentage for Phase 1 pricing
-    pub fn get_1dev_burn_percentage(&self) -> f64 {
-        self.burn_percentage
-    }
-
-    /// Get total active nodes for Phase 2 network multipliers
-    pub fn get_total_active_nodes(&self) -> u64 {
-        self.total_active_nodes
-    }
-
-    /// Check if phase transition conditions are met
-    pub fn should_transition_to_phase2(&self) -> bool {
-        // Transition if 90% burned OR 5 years since genesis
-        let five_years_seconds = 5 * 365 * 24 * 60 * 60; // 5 years in seconds
-        let years_passed = self.current_timestamp >= self.genesis_timestamp + five_years_seconds;
-        
-        self.burn_percentage >= 90.0 || years_passed
-    }
-}
-
 /// Cached activation data for zero-copy operations
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -162,17 +126,6 @@ pub struct QuantumAlgorithms {
     pub signature: String,
     pub encryption: String,
     pub hash: String,
-}
-
-/// Compatible activation data structure for integration with existing economic logic
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-struct CompatibleActivationData {
-    pub node_type: NodeType,
-    pub qnc_amount: u64,
-    pub tx_hash: String,
-    pub wallet_address: String,
-    pub phase: u8,
 }
 
 /// Quantum-secure crypto system for QNet activation codes
@@ -657,131 +610,6 @@ impl QNetQuantumCrypto {
 
 
 
-    /// Decode activation code using existing economic logic (quantum-enhanced)
-    #[allow(dead_code)]
-    fn decode_activation_code_compatible(&self, code: &str) -> Result<CompatibleActivationData> {
-        // Use existing logic from the original decode_activation_code function
-        
-        // Check for genesis bootstrap codes first
-        const BOOTSTRAP_WHITELIST: &[&str] = &[
-            "QNET-BOOT-0001-STRAP", "QNET-BOOT-0002-STRAP", "QNET-BOOT-0003-STRAP", 
-            "QNET-BOOT-0004-STRAP", "QNET-BOOT-0005-STRAP"
-        ];
-        
-        if BOOTSTRAP_WHITELIST.contains(&code) {
-            // Extract bootstrap ID and create consistent wallet format
-            let bootstrap_id = code
-                .split('-')
-                .nth(2)
-                .unwrap_or("000")
-                .trim_start_matches('0');
-            
-            let genesis_node_id = format!("genesis_node_{:03}", bootstrap_id.parse::<u32>().unwrap_or(1));
-            
-            // GENESIS: Use predefined wallet from genesis_constants.rs
-            // These are the REAL wallets created via mobile app
-            let bootstrap_id_str = format!("{:03}", bootstrap_id.parse::<u32>().unwrap_or(1));
-            let wallet_address = crate::genesis_constants::get_genesis_wallet_by_id(&bootstrap_id_str)
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| {
-                    // Fallback: Generate proper EON address format: {19}eon{15}{8 checksum} = 45 chars
-                    use sha3::{Sha3_256, Digest};
-                    let hash = blake3::hash(genesis_node_id.as_bytes()).to_hex();
-                    let part1 = &hash[..19];
-                    let part2 = &hash[19..34];
-                    let checksum_input = format!("{}eon{}", part1, part2);
-                    let checksum = hex::encode(&Sha3_256::digest(checksum_input.as_bytes())[..4]);
-                    format!("{}eon{}{}", part1, part2, checksum)
-                });
-            
-            // Return dummy data for genesis codes
-            return Ok(CompatibleActivationData {
-                node_type: NodeType::Super,
-                qnc_amount: 0,
-                tx_hash: "genesis_bootstrap".to_string(),
-                wallet_address,  // Now consistent!
-                phase: 1,
-            });
-        }
-        
-        // Validate format: QNET-XXXXXX-XXXXXX-XXXXXX (25 chars) for regular codes (genesis codes 20 chars)
-        if !code.starts_with("QNET-") || (code.len() != 25 && code.len() != 20) {
-            return Err(anyhow!("Invalid activation code format"));
-        }
-
-        let parts: Vec<&str> = code.split('-').collect();
-        if parts.len() != 4 || parts[0] != "QNET" {
-            return Err(anyhow!("Invalid activation code structure"));
-        }
-
-        // Extract data using existing algorithm
-        let encoded_data = format!("{}{}{}", parts[1], parts[2], parts[3]);
-        
-        // Decode node type from first segment (existing logic)
-        let node_type = match &encoded_data[0..1] {
-            "L" | "l" | "1" | "2" | "3" | "A" | "B" | "C" => NodeType::Light,
-            "F" | "f" | "4" | "5" | "6" | "D" | "E" => NodeType::Super, 
-            "S" | "s" | "7" | "8" | "9" => NodeType::Super,
-            _ => {
-                // Fallback logic (SHA3-256 for consistency)
-                let mut hasher = Sha3_256::new();
-                hasher.update(encoded_data.as_bytes());
-                let hash = hasher.finalize();
-                match hash[0] % 3 {
-                    0 => NodeType::Light,
-                    1 => NodeType::Super,
-                    2 => NodeType::Super,
-                    _ => NodeType::Super,
-                }
-            }
-        };
-
-        // Decode phase from second segment (existing logic)
-        let phase = match &encoded_data[1..2] {
-            "1" | "A" | "B" | "C" => 1,
-            "2" | "D" | "E" | "F" => 2,
-            _ => 1, // Default to Phase 1
-        };
-
-        // Generate transaction hash from remaining segments (existing logic)
-        let tx_hash = format!("0x{}", &encoded_data[2..]);
-        
-        // Generate wallet address from activation code
-        // PRODUCTION FORMAT: 19 + 3 + 15 + 8 = 45 characters
-        let wallet_hash = {
-            let mut hasher = Sha3_256::new();
-            hasher.update(code.as_bytes());
-            hasher.finalize()
-        };
-        let full_hex = hex::encode(&wallet_hash);
-        let part1 = &full_hex[..19];
-        let part2 = &full_hex[19..34];
-        // SHA3-256 checksum (4 bytes = 32-bit collision resistance)
-        let checksum_input = format!("{}eon{}", part1, part2);
-        use sha3::{Sha3_256, Digest};
-        let checksum = hex::encode(&Sha3_256::digest(checksum_input.as_bytes())[..4]);
-        let wallet_address = format!("{}eon{}{}", part1, part2, checksum);
-
-        // Calculate amount based on phase and node type (EXISTING ECONOMIC LOGIC)
-        let qnc_amount = match phase {
-            1 => 1500, // Phase 1: 1500 1DEV (universal pricing from economic model)
-            2 => match node_type {
-                // v3.18: Updated Phase 2 pricing
-                NodeType::Light => 10000,  // Phase 2: 10000 QNC for Mobile Node (Light)
-                NodeType::Super => 7500,   // Phase 2: 7500 QNC for Server Node (Super)
-            },
-            _ => return Err(anyhow!("Invalid phase in activation code")),
-        };
-
-        Ok(CompatibleActivationData {
-            node_type,
-            qnc_amount,
-            tx_hash,
-            wallet_address,
-            phase,
-        })
-    }
-
     /// PRODUCTION: Create REAL Dilithium signature for consensus/blockchain operations  
     pub async fn create_consensus_signature(&self, node_id: &str, data: &str) -> Result<DilithiumSignature> {
         if !self.initialized {
@@ -1030,36 +858,23 @@ impl QNetQuantumCrypto {
                 .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string()))
         );
         
+        // Phase AND price come from the SAME verified source — the live 1DEV supply, through the one
+        // helper every price path uses. The phase is never inferred from the shape of `payload`,
+        // which is attacker-authored: a caller must not get to choose which phase's rules price
+        // their own activation. A supply outage fails the activation closed.
+        let pricing = crate::rpc::live_activation_pricing().await
+            .map_err(|e| anyhow!("Activation price unavailable: {}", e))?;
+        let phase = pricing.phase;
+
         // CRITICAL: burn_amount is the EXACT amount burned on Solana to generate the activation code.
         // Required for XOR key: key_material = f"{burn_tx}:{node_type}:{burn_amount}"
         // Source 1: QNET_BURN_AMOUNT env var (Docker -e QNET_BURN_AMOUNT=...)
-        // Source 2: Dynamic calculation from GLOBAL_BURN_PERCENTAGE (same formula as mobile & server API)
-        let burn_amount = std::env::var("QNET_BURN_AMOUNT")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or_else(|| {
-                // Fallback: calculate current dynamic price (identical formula to handle_activation_price)
-                let burn_pct = crate::GLOBAL_BURN_PERCENTAGE
-                    .load(std::sync::atomic::Ordering::Relaxed) as f64 / 100.0;
-                if burn_pct < 90.0 {
-                    // Phase 1: 1DEV burn — universal price for all node types
-                    let reduction_tiers = (burn_pct / 10.0).floor() as u64;
-                    let total_reduction = reduction_tiers * 150;
-                    std::cmp::max(1500u64.saturating_sub(total_reduction), 300)
-                } else {
-                    // Phase 2: QNC pricing — base differs by node type
-                    let active = crate::GLOBAL_ACTIVE_NODES
-                        .load(std::sync::atomic::Ordering::Relaxed) as u64;
-                    let base = if payload.node_type.to_lowercase() == "super" { 7500u64 } else { 10000u64 };
-                    let mult = if active <= 100_000 { 0.5 } else if active <= 300_000 { 1.0 }
-                               else if active <= 1_000_000 { 2.0 } else { 3.0 };
-                    (base as f64 * mult).round() as u64
-                }
-            });
-        
-        // Determine phase from burn_tx format (genesis_ = phase 1, pool3_ = phase 2)
-        let phase = if payload.burn_tx.starts_with("pool3_") { 2u8 } else { 1u8 };
-        
+        // Source 2: the live activation quote for this node type.
+        let burn_amount = match std::env::var("QNET_BURN_AMOUNT").ok().and_then(|s| s.parse::<u64>().ok()) {
+            Some(amount) => amount,
+            None => pricing.cost_for(&payload.node_type),
+        };
+
         // Create node info for blockchain registry
         let node_info = crate::activation_validation::NodeInfo {
             activation_code: activation_code.to_string(),
@@ -1209,132 +1024,6 @@ impl QNetQuantumCrypto {
         std::process::exit(1);
     }
     
-
-    /// Get DYNAMIC burn amount based on current blockchain state (PHASE 1 or PHASE 2)
-    /// 
-    /// ARCHITECTURE: This is the SINGLE SOURCE OF TRUTH for pricing logic.
-    /// Python config (core/qnet-core/src/config.py) contains only BASE CONSTANTS
-    /// and documentation. All actual pricing calculations happen HERE.
-    /// 
-    /// Phase 1 Formula: price = max(300, 1500 - (burn_percentage / 10) * 150)
-    /// Phase 2 Formula: price = base_price[node_type] * network_multiplier(total_nodes)
-    #[allow(dead_code)]
-    async fn get_dynamic_burn_amount(&self, _activation_code: &str, node_type: &str) -> Result<u64> {
-        // PRODUCTION: Query real blockchain state
-        let blockchain_state = self.get_blockchain_phase_state().await?;
-        
-        if blockchain_state.is_phase1() {
-            // ============== PHASE 1: Dynamic 1DEV pricing ==============
-            // Price DECREASES as more 1DEV is burned (incentivizes early adoption)
-            // Synced with: config.py TokenConfig.one_dev_* parameters
-            let burn_percentage = blockchain_state.get_1dev_burn_percentage();
-            
-            const BASE_PRICE: u64 = 1_500;           // TokenConfig.one_dev_base_price
-            const REDUCTION_PER_10_PCT: u64 = 150;   // TokenConfig.one_dev_reduction_per_10_percent
-            const MIN_PRICE: u64 = 300;              // TokenConfig.one_dev_min_price
-            
-            // Formula: 1500 - (burn_percentage / 10) * 150, floor at 300
-            let reduction_steps = (burn_percentage as u64) / 10;
-            let dynamic_price = BASE_PRICE.saturating_sub(reduction_steps * REDUCTION_PER_10_PCT);
-            let final_price = dynamic_price.max(MIN_PRICE);
-            
-            println!("[INFO][PRICING] phase1_price burned={:.2}% price={}_1DEV", burn_percentage, final_price);
-            Ok(final_price)
-            
-        } else {
-            // ============== PHASE 2: Dynamic QNC pricing ==============
-            // Price INCREASES with network size (prevents node inflation)
-            // Synced with: config.py TokenConfig.qnc_base_prices
-            let network_size = blockchain_state.get_total_active_nodes();
-            let network_multiplier = self.calculate_network_multiplier(network_size);
-            
-            // Base prices per node type (TokenConfig.qnc_base_prices)
-            // v3.18: Only Light and Super nodes (Full node type removed)
-            let base_price = match node_type {
-                "light" => 10_000u64,  // 10,000 QNC base
-                "super" => 7_500u64,   // 7,500 QNC base
-                _ => 10_000u64,        // Default to light
-            };
-            
-            // Apply network multiplier (0.5x to 3.0x)
-            let final_price = ((base_price as f64) * network_multiplier) as u64;
-            
-            println!("[INFO][PRICING] phase2_price active_nodes={} multiplier={}x price={}_QNC",
-                    network_size, network_multiplier, final_price);
-            Ok(final_price)
-        }
-    }
-
-    /// Get current blockchain phase state (CRITICAL for dynamic pricing)
-    /// 
-    /// PRODUCTION: This queries REAL blockchain state from storage.
-    /// NO FALLBACKS - if data unavailable, return error.
-    #[allow(dead_code)]
-    async fn get_blockchain_phase_state(&self) -> Result<BlockchainPhaseState> {
-        let current_timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        
-        // PRODUCTION: Get REAL data from global state (set by node sync process)
-        // These are populated by the running node from actual blockchain data
-        
-        // 1. Get burn percentage from Solana bridge monitor
-        let burn_percentage = crate::GLOBAL_BURN_PERCENTAGE
-            .load(std::sync::atomic::Ordering::Relaxed) as f64 / 100.0;
-        
-        // 2. Get total active nodes from P2P network state
-        let total_active_nodes = crate::GLOBAL_ACTIVE_NODES
-            .load(std::sync::atomic::Ordering::Relaxed);
-        
-        // 3. Get genesis timestamp from Genesis block (block #0)
-        let genesis_timestamp = crate::GLOBAL_GENESIS_TIMESTAMP
-            .load(std::sync::atomic::Ordering::Relaxed);
-        
-        // STRICT VALIDATION: All values must be set by the running node
-        if genesis_timestamp == 0 {
-            return Err(anyhow!("Genesis timestamp not available - node not fully synced"));
-        }
-        
-        if total_active_nodes == 0 {
-            return Err(anyhow!("Active nodes count not available - P2P not initialized"));
-        }
-        
-        // Phase 1 if <90% burned AND <5 years since genesis
-        let years_since_genesis = (current_timestamp - genesis_timestamp) / (365 * 24 * 60 * 60);
-        let is_phase_1 = burn_percentage < 90.0 && years_since_genesis < 5;
-        
-        println!("[INFO][PRICING] live_state phase={}, burned={:.2}%, active_nodes={}, genesis={}",
-                 if is_phase_1 { "1" } else { "2" }, burn_percentage, total_active_nodes, genesis_timestamp);
-        
-        Ok(BlockchainPhaseState {
-            is_phase_1,
-            burn_percentage,
-            total_active_nodes,
-            genesis_timestamp,
-            current_timestamp,
-        })
-    }
-
-    /// Calculate network multiplier for Phase 2 (0.5x to 3.0x based on network size)
-    /// 
-    /// CANONICAL VALUES - same across all components (JS, Python, Rust)
-    /// 
-    /// | Network Size | Multiplier | Super Node Price |
-    /// |--------------|------------|------------------|
-    /// | ≤100K nodes  | 0.5x       | 5,000 QNC        |
-    /// | ≤300K nodes  | 1.0x       | 10,000 QNC       |
-    /// | ≤1M nodes    | 2.0x       | 20,000 QNC       |
-    /// | >1M nodes    | 3.0x       | 30,000 QNC (max) |
-    #[allow(dead_code)]
-    fn calculate_network_multiplier(&self, total_nodes: u64) -> f64 {
-        match total_nodes {
-            0..=100_000 => 0.5,          // ≤100K: Early adopter discount
-            100_001..=300_000 => 1.0,    // ≤300K: Base price
-            300_001..=1_000_000 => 2.0,  // ≤1M: High demand
-            _ => 3.0,                    // >1M: Maximum (cap)
-        }
-    }
 
     /// SHA3-256 hash function (NIST SP 800-186 compliant)
     fn sha3_hash(&self, data: &str) -> String {

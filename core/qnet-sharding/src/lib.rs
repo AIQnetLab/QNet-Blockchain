@@ -61,7 +61,7 @@
 //!     committee splits into N sub-committees of size 1 000/N (minimum
 //!     committee size enforced — small networks fall back to a single
 //!     shard until the active validator count supports multiple).
-//!   * Each shard runs its own commit-reveal round in parallel with
+//!   * Each shard runs its own Checkpoint-BFT round in parallel with
 //!     every other shard; the existing Pacemaker view-change machinery
 //!     is reused per-shard with shard-local timeout certificates.
 //!   * `MacroBlock` becomes a vector of per-shard sub-blocks plus a

@@ -239,7 +239,7 @@ pub async fn apply_genesis_state(
         block.timestamp,
         std::sync::atomic::Ordering::Relaxed,
     );
-    crate::update_global_pricing_state(0.0, 5, block.timestamp);
+    crate::set_genesis_timestamp(block.timestamp);
 }
 
 /// Export genesis block to file (for distribution to other nodes).

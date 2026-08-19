@@ -26,8 +26,6 @@ const utf8 = (s) => new TextEncoder().encode(s.normalize('NFKD'));
 const rawUtf8 = (s) => new TextEncoder().encode(s);
 const toHex = (u) => Array.from(u, (b) => b.toString(16).padStart(2, '0')).join('');
 const fromHex = (h) => Uint8Array.from(h.match(/../g).map((x) => parseInt(x, 16)));
-// btoa on a large array without spread (avoids call-stack limits on ~7.4 KB buffers).
-const bytesToB64 = (buf) => { let s = ''; for (let i = 0; i < buf.length; i++) s += String.fromCharCode(buf[i]); return btoa(s); };
 
 // Standard BIP39 seed: PBKDF2-HMAC-SHA512(mnemonic, "mnemonic"+passphrase, 2048, 64).
 function bip39Seed(mnemonic, passphrase = '') {
@@ -89,25 +87,19 @@ export const QNetDilithium = {
   },
 
   /**
-   * Sign a QNet canonical message and return the node wire format the value-TX gate expects:
-   *   "dilithium_sig_{pk_hex}_{base64([sig_len:4LE][SignedMessage=sig||msg][pk_len:4LE][pk])}"
-   * message: the exact canonical string (e.g. "transfer:{from}:{to}:{amount}:{nonce}:{gas_price}:{gas_limit}").
+   * Sign a canonical QNet message (chain tag included, e.g.
+   * "q{chain_id}|transfer:{from}:{to}:{amount}:{nonce}:{gas_price}:{gas_limit}") and return the node
+   * wire format: hex of the RAW 3309-byte DETACHED ML-DSA-65 signature, which the node hex-decodes
+   * and feeds to verify_detached_signature. publicKeyHex only self-verifies, so a mismatched keypair
+   * throws here instead of producing bytes the chain rejects.
    */
   signQNet(message, secretKeyHex, publicKeyHex) {
-    const sk = fromHex(secretKeyHex);
-    const pk = fromHex(publicKeyHex);
     const msg = rawUtf8(message);
-    const sig = ml_dsa65.sign(msg, sk); // 3309-byte detached
-    const signedMsg = new Uint8Array(sig.length + msg.length);
-    signedMsg.set(sig, 0);
-    signedMsg.set(msg, sig.length);
-    const buf = new Uint8Array(4 + signedMsg.length + 4 + pk.length);
-    const dv = new DataView(buf.buffer);
-    dv.setUint32(0, signedMsg.length, true);
-    buf.set(signedMsg, 4);
-    dv.setUint32(4 + signedMsg.length, pk.length, true);
-    buf.set(pk, 4 + signedMsg.length + 4);
-    return 'dilithium_sig_' + publicKeyHex + '_' + bytesToB64(buf);
+    const sig = ml_dsa65.sign(msg, fromHex(secretKeyHex)); // 3309-byte detached
+    if (sig.length !== 3309 || !ml_dsa65.verify(sig, msg, fromHex(publicKeyHex))) {
+      throw new Error('ML-DSA-65 signing failed: signature does not verify under the account public key');
+    }
+    return toHex(sig);
   },
 
   PK_SIZE: 1952,

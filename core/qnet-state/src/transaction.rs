@@ -331,6 +331,76 @@ pub const MAX_BITMAP_DECOMPRESSED: usize = 8 * 1024 * 1024;
 /// Largest addressable reg_index span, derived from the byte ceiling above (8 bits per byte).
 pub const MAX_BITMAP_INDEX_SPAN: u32 = (MAX_BITMAP_DECOMPRESSED as u32) * 8;
 
+/// Contract standard declared by a ContractDeploy. Every deployed contract is one of these;
+/// there is no typeless contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeployKind {
+    Qrc20,
+    Qrc721,
+    Wasm,
+}
+
+/// Deploy-payload field readers. The deploy DIGEST and the deploy APPLY arm must read tx.data the
+/// same way, or the signature would bind a value different from the one materialized on-chain.
+pub fn deploy_str(v: &serde_json::Value, k: &str) -> String {
+    v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string()
+}
+/// Number or numeric string (a supply past 2^53 loses precision as a JSON number on JS clients).
+pub fn deploy_u64(v: &serde_json::Value, k: &str, default: u64) -> u64 {
+    v.get(k)
+        .and_then(|x| x.as_u64().or_else(|| x.as_str().and_then(|s| s.parse::<u64>().ok())))
+        .unwrap_or(default)
+}
+pub fn deploy_bool(v: &serde_json::Value, k: &str) -> bool {
+    v.get(k).and_then(|x| x.as_bool()).unwrap_or(false)
+}
+
+/// Length-prefixed field feed: `{byte_len}:{bytes}`. Without the length prefix, ':'-joined fields
+/// are ambiguous — name="A:B",symbol="C" would digest identically to name="A",symbol="B:C", letting
+/// a relayer re-split a token's identity under an unchanged signature.
+fn deploy_digest_field(h: &mut Sha3_256, s: &str) {
+    Digest::update(h, s.len().to_string().as_bytes());
+    Digest::update(h, b":");
+    Digest::update(h, s.as_bytes());
+}
+
+/// Canonical deploy digest: the value bound into the `contract_deploy` signature preimage and
+/// re-derived by `classify_contract_deploy` on every node. It commits to EVERY tx.data field the
+/// deploy apply arm reads, so nothing in the payload is malleable under a valid signature. Mirrored
+/// by the mobile signer (WalletManager.js deployToken / deployNftCollection).
+pub fn deploy_code_hash(kind: DeployKind, parsed: &serde_json::Value) -> Result<String, String> {
+    let mut h = Sha3_256::new();
+    match kind {
+        DeployKind::Wasm => {
+            // Digest = sha3(module bytes): the code IS the whole consensus-relevant payload.
+            let code_hex = parsed.get("code").and_then(|c| c.as_str())
+                .ok_or_else(|| "[REJECT][TX] deploy_wasm_missing_code".to_string())?;
+            if code_hex.is_empty() {
+                return Err("[REJECT][TX] deploy_wasm_empty_code".to_string());
+            }
+            let code = hex::decode(code_hex)
+                .map_err(|_| "[REJECT][TX] deploy_wasm_code_not_hex".to_string())?;
+            Digest::update(&mut h, &code);
+        }
+        DeployKind::Qrc20 => {
+            Digest::update(&mut h, b"QRC20|");
+            deploy_digest_field(&mut h, &deploy_str(parsed, "name"));
+            deploy_digest_field(&mut h, &deploy_str(parsed, "symbol"));
+            deploy_digest_field(&mut h, &deploy_u64(parsed, "decimals", 9).to_string());
+            deploy_digest_field(&mut h, &deploy_u64(parsed, "initial_supply", 0).to_string());
+            deploy_digest_field(&mut h, &deploy_bool(parsed, "mintable").to_string());
+            deploy_digest_field(&mut h, &deploy_bool(parsed, "burnable").to_string());
+            deploy_digest_field(&mut h, &deploy_str(parsed, "logo"));
+        }
+        DeployKind::Qrc721 => {
+            Digest::update(&mut h, b"QRC721|");
+            deploy_digest_field(&mut h, &deploy_str(parsed, "name"));
+            deploy_digest_field(&mut h, &deploy_str(parsed, "symbol"));
+        }
+    }
+    Ok(hex::encode(h.finalize()))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum TransactionType {
     /// Transfer QNC between accounts
@@ -555,7 +625,8 @@ pub enum TransactionType {
     /// account-state increments on apply. Reward eligibility = popcount(bitmask) >= 9.
     /// `from` (Transaction.from) = node wallet (the account whose counter increments);
     /// `node_id` = consensus pseudonym for PK lookup. The authenticator is the standard
-    /// `Transaction.dilithium_signature` envelope over QNET_HEARTBEAT:node_id:anchor_height:anchor_hash,
+    /// `Transaction.dilithium_signature` envelope over
+    /// q{chain_id}|QNET_HEARTBEAT:node_id:anchor_height:anchor_hash,
     /// verified at block validation against the node's registry PK (apply trusts validated blocks).
     Heartbeat {
         node_id: String,        // genesis_node_00X / super_xxx — consensus identity (PK lookup)
@@ -582,12 +653,13 @@ pub enum TransactionType {
     /// - the consumer, which already holds the bounded-decompressed bitmap, checks the two facts
     ///   that make `eligible_count` mean anything: byte length == (index_span + 7) / 8 and
     ///   popcount == eligible_count. Both are pure functions of the TX bytes, so every node agrees.
+    /// One shard's light-reward eligibility for one epoch, published by that shard's genesis node.
     LightNodeEligibilityBitmap {
-        genesis_id: String,              // Genesis node ID (genesis_node_001, etc.)
-        epoch: u64,                      // Epoch number
-        index_span: u32,             // Highest reg_index in this shard + 1 — the span the bitmap addresses
-        eligible_count: u32,             // Count of eligible nodes (popcount of bitmap)
-        bitmap_compressed: Vec<u8>,      // zstd-compressed bitmap (1 bit per Light node)
+        genesis_id: String,
+        epoch: u64,
+        index_span: u32,
+        eligible_count: u32,
+        bitmap_compressed: Vec<u8>,
     },
     /// v9.4: Node reactivation after offline period
     /// Sent by returning nodes after sync to re-enter eligible producers set.
@@ -602,6 +674,10 @@ pub enum TransactionType {
         /// Macroblock index of the latest macroblock
         #[serde(default)]
         last_macroblock_index: u64,
+        /// Public API endpoint this node is reachable on now ("" = IP hidden). A returning node may
+        /// come back on a different IP, so reactivation republishes it exactly as registration does;
+        /// it is inside the signed preimage, so a relayer cannot rewrite it in flight.
+        api_endpoint: String,
     },
 
     /// FIX R23-K1: Key rotation transaction — allows nodes to rotate their Dilithium3
@@ -736,11 +812,11 @@ pub struct Transaction {
     #[serde(default)]
     pub dilithium_public_key: Option<Vec<u8>>,
 
-    /// FIX R23-M1: Chain ID for cross-chain replay protection.
-    /// Testnet=1337, Mainnet=1, Devnet=31337. Included in canonical_bytes() so
-    /// signatures are chain-specific — a TX signed for testnet is invalid on mainnet.
-    /// Default 0 for backward compat with pre-R23 TXs (accepted on any chain).
-    #[serde(default)]
+    /// Chain identifier, always `QNET_CHAIN_ID`. It is inside canonical_bytes(), so it is inside the
+    /// TX hash. The SIGNATURE binds the chain through `chain_tag()`, a compile-time prefix on every
+    /// preimage — not through this field — so the field is checked structurally instead, by
+    /// `enforce_wire_limits()`, which BOTH ingress and block validation run. Cross-chain replay is
+    /// blocked by the tag; mutating this field in flight is blocked by that check.
     pub chain_id: u64,
 }
 
@@ -1053,18 +1129,102 @@ fn refund_storage_deposit(
 
 /// Max anchor lag a Heartbeat may carry, enforced at APPLY on every path. Mirrors
 /// `qnet_integration::node::HB_ANCHOR_MAX_LAG`; drift between them is a consensus split.
+/// Phase-2 base entry price per node type, in whole QNC, before the network-size multiplier.
+pub const PHASE2_BASE_SUPER_QNC: u64 = 7_500;
+pub const PHASE2_BASE_LIGHT_QNC: u64 = 10_000;
+
+/// Base Phase-2 entry price for `node_type`, in whole QNC.
+pub fn phase2_base_qnc(node_type: &NodeType) -> u64 {
+    match node_type {
+        NodeType::Super => PHASE2_BASE_SUPER_QNC,
+        NodeType::Light => PHASE2_BASE_LIGHT_QNC,
+    }
+}
+
+/// Anti-inflation network-size multiplier, in TENTHS, as `(inclusive upper bound on the registered-
+/// node count, multiplier)` in ascending order. Tenths and integer math, never f64, so every node
+/// quoting the same registry size produces the same price. Tier 0 is the cheapest by construction
+/// and the entry floor below is derived from it, so quote and floor can never drift apart.
+pub const PHASE2_MULT_TIERS_TENTHS: [(u64, u64); 4] =
+    [(100_000, 5), (300_000, 10), (1_000_000, 20), (u64::MAX, 30)];
+
+/// Multiplier (tenths) for a registry of `registered_nodes` chain-confirmed nodes.
+pub fn phase2_size_mult_tenths(registered_nodes: u64) -> u64 {
+    for (upper, mult) in PHASE2_MULT_TIERS_TENTHS.iter() {
+        if registered_nodes <= *upper { return *mult; }
+    }
+    PHASE2_MULT_TIERS_TENTHS[PHASE2_MULT_TIERS_TENTHS.len() - 1].1
+}
+
+/// Quoted Phase-2 entry price in whole QNC. Pure function of the node type and the CHAIN-CONFIRMED
+/// registered-node count, so the same query answered by two honest nodes agrees. Never feed it a
+/// node-local quantity (peer count, discovery cache) — that makes the price disagree per node.
+pub fn phase2_activation_cost_qnc(node_type: &NodeType, registered_nodes: u64) -> u64 {
+    phase2_base_qnc(node_type)
+        .saturating_mul(phase2_size_mult_tenths(registered_nodes)) / 10
+}
+
 /// Phase-2 entry price FLOOR in nanoQNC — the chain rule, so an activation crafted outside the RPC
 /// that issues codes still cannot enter for free.
 ///
-/// It is base × 0.5, not base: the network-size multiplier applied when quoting a code has a DISCOUNT
-/// tier (0.5× below 100k nodes, the whole early-network era), so a floor at base would reject every
-/// honestly-priced activation at exactly 2× the price the operator was charged. Floor = the minimum
-/// over that table. The multiplier itself cannot be a chain rule — it reads a process-local node
-/// counter, and a consensus rule needs a COMMITTED count.
-pub const PHASE2_SUPER_MIN_NANO: u64 = 3_750 * NANO_PER_QNC;
-pub const PHASE2_LIGHT_MIN_NANO: u64 = 5_000 * NANO_PER_QNC;
+/// It is the CHEAPEST tier of the quote table above, not the base: quoting has a discount tier
+/// (0.5x below 100k nodes, the whole early-network era), so a floor at base would reject every
+/// honestly-priced early activation. The multiplier itself cannot be a chain rule — a consensus
+/// rule may not read a count that a node learns at a height of its own choosing.
+pub const PHASE2_MIN_MULT_TENTHS: u64 = PHASE2_MULT_TIERS_TENTHS[0].1;
+pub const PHASE2_SUPER_MIN_NANO: u64 =
+    PHASE2_BASE_SUPER_QNC * PHASE2_MIN_MULT_TENTHS / 10 * NANO_PER_QNC;
+pub const PHASE2_LIGHT_MIN_NANO: u64 =
+    PHASE2_BASE_LIGHT_QNC * PHASE2_MIN_MULT_TENTHS / 10 * NANO_PER_QNC;
+
+/// Entry-price floor for a Phase-2 activation of `node_type`, in nanoQNC.
+pub fn phase2_entry_floor_nano(node_type: &NodeType) -> u64 {
+    match node_type {
+        NodeType::Super => PHASE2_SUPER_MIN_NANO,
+        NodeType::Light => PHASE2_LIGHT_MIN_NANO,
+    }
+}
 
 pub const HB_ANCHOR_MAX_LAG_BLOCKS: u64 = 90;
+
+/// Chain identifier carried by every transaction and bound into every transaction SIGNATURE
+/// preimage (`chain_tag()`), so a signature is valid on exactly one chain and the field cannot be
+/// mutated in flight. Compile-time only: a runtime-configurable value would let two nodes compute
+/// different preimages for the same transaction and silently partition the network. Changing
+/// networks means changing this constant and rebuilding.
+pub const QNET_CHAIN_ID: u64 = 1337;
+
+/// The chain tag every canonical transaction sign-preimage is prefixed with. One builder, so signer
+/// and verifier — Rust, mobile, browser extension — can never drift.
+pub fn chain_tag() -> String {
+    format!("q{}|", QNET_CHAIN_ID)
+}
+
+/// Rules for a publicly announced node API endpoint. Empty = the operator chose to hide the IP.
+/// Non-empty must be http(s) and must not name a loopback/RFC-1918/link-local address, so a
+/// committed endpoint can never point peers at their own network (SSRF). THE single copy: both
+/// NodeRegistration and NodeReactivation announce an endpoint, and a second list would drift.
+pub fn validate_public_api_endpoint(api_endpoint: &str) -> Result<(), String> {
+    if api_endpoint.is_empty() {
+        return Ok(());
+    }
+    if !api_endpoint.starts_with("http://") && !api_endpoint.starts_with("https://") {
+        return Err("[REJECT][TX] invalid_api_endpoint_scheme".to_string());
+    }
+    const PRIVATE_MARKERS: [&str; 26] = [
+        "localhost", "127.0.0.1", "192.168.", "10.",
+        "172.16.", "172.17.", "172.18.", "172.19.",
+        "172.20.", "172.21.", "172.22.", "172.23.",
+        "172.24.", "172.25.", "172.26.", "172.27.",
+        "172.28.", "172.29.", "172.30.", "172.31.",
+        "169.254.", "0.0.0.0", "[::1]", "[fc", "[fd", "[fe80",
+    ];
+    let ep_lower = api_endpoint.to_lowercase();
+    if PRIVATE_MARKERS.iter().any(|m| ep_lower.contains(m)) {
+        return Err("[REJECT][TX] private_api_endpoint".to_string());
+    }
+    Ok(())
+}
 
 impl Transaction {
     /// Calculate transaction hash as Vec<u8>
@@ -1101,7 +1261,7 @@ impl Transaction {
             data,
             dilithium_signature: None, // QUANTUM v2.25: Optional post-quantum signature
             dilithium_public_key: None, // QUANTUM v2.25: Optional post-quantum pubkey
-            chain_id: 0, // FIX R23-M1: Default 0 for backward compat
+            chain_id: QNET_CHAIN_ID,
         };
         tx.hash = tx.calculate_hash();
         tx
@@ -1322,13 +1482,40 @@ impl Transaction {
     /// cost except exactly at a 10% boundary (there the registration just retries — a liveness hiccup,
     /// not a fork).
     pub fn phase1_activation_cost(total_burned: u64, current_supply: u64) -> u64 {
-        // burn% = burned / ORIGINAL supply; original = burned + current(remaining). Denominator is their
-        // SUM, not the remaining alone (else 50% burned would read as 100%). current_supply is the live
-        // Solana getTokenSupply (remaining); the sum reconstructs the original cap.
-        let original = total_burned.saturating_add(current_supply);
-        let burn_pct_tenths = if original == 0 { 0 } else { total_burned * 1000 / original };
-        let tiers = burn_pct_tenths / 100; // each complete 10%
+        let tiers = Self::burn_pct_tenths(total_burned, current_supply) / 100; // each complete 10%
         1500u64.saturating_sub(150 * tiers.min(8)).max(300)
+    }
+
+    /// Share of the ORIGINAL 1DEV supply burned, in tenths of a percent, integer math only.
+    /// `original = burned + current(remaining)`: the denominator is their SUM, not the remaining
+    /// alone (else 50% burned would read as 100%). `current_supply` is the live Solana
+    /// getTokenSupply, so the sum reconstructs the original cap.
+    pub fn burn_pct_tenths(total_burned: u64, current_supply: u64) -> u64 {
+        let original = total_burned.saturating_add(current_supply);
+        if original == 0 { 0 } else { total_burned.saturating_mul(1000) / original }
+    }
+
+    /// Seconds in the Phase-2 age trigger: five years of 365 days, the same 1825 days the 1DEV burn
+    /// contract uses, so both sides flip on the same instant.
+    pub const PHASE2_AGE_SECS: u64 = 1825 * 24 * 60 * 60;
+
+    /// Burn half of the phase rule: 90% of the ORIGINAL 1DEV supply burned.
+    pub fn is_phase2_by_burn(total_burned: u64, current_supply: u64) -> bool {
+        Self::burn_pct_tenths(total_burned, current_supply) >= 900
+    }
+
+    /// Age half of the phase rule: five years since the genesis block. `genesis_ts == 0` means the
+    /// genesis timestamp is not known yet and resolves to Phase 1, the phase that demands MORE proof.
+    pub fn is_phase2_by_age(genesis_ts: u64, now_secs: u64) -> bool {
+        genesis_ts != 0 && now_secs.saturating_sub(genesis_ts) >= Self::PHASE2_AGE_SECS
+    }
+
+    /// THE phase rule: Phase 2 begins when 90% of the original 1DEV supply is burned OR five years
+    /// have passed since genesis, whichever comes first. Single resolver for pricing, admission and
+    /// display, so a quoted phase can never disagree with the one the burn attestors derive.
+    pub fn is_phase2(total_burned: u64, current_supply: u64, genesis_ts: u64, now_secs: u64) -> bool {
+        Self::is_phase2_by_burn(total_burned, current_supply)
+            || Self::is_phase2_by_age(genesis_ts, now_secs)
     }
 
     pub fn is_system_tx(&self) -> bool {
@@ -1480,7 +1667,8 @@ impl Transaction {
     /// The user pays for gas_used, not gas_limit.
     /// gas_limit serves as maximum cap (out-of-gas if exceeded).
     /// For ContractDeploy/Call: includes per-byte cost for code/data.
-    /// For future WASM VM: will return execution-measured gas instead of estimates.
+    /// This is the flat intrinsic component only; WASM execution is billed on top of it
+    /// from the fuel the VM actually consumed (see wasm_exec).
     pub fn compute_gas_used(&self) -> u64 {
         match &self.tx_type {
             TransactionType::Transfer { .. } => gas_limits::TRANSFER,
@@ -1619,6 +1807,16 @@ impl Transaction {
     /// downstream decoder that is superlinear in its input (base58 is quadratic) then becomes a CPU bomb
     /// a Byzantine producer can plant. Both paths call THIS.
     pub fn enforce_wire_limits(&self) -> Result<(), String> {
+        // Chain binding. Here, not in validate(), because validate() is not on the block-validation
+        // path: a Byzantine producer could otherwise retag a signed TX (the signature covers the
+        // constant chain_tag(), not this field), rehash it, and have it applied under a hash the
+        // submitter never computed. enforce_wire_limits runs on BOTH ingress and block validation.
+        if self.chain_id != QNET_CHAIN_ID {
+            return Err(format!(
+                "[REJECT][TX] chain_id_mismatch tx={} expected={}",
+                self.chain_id, QNET_CHAIN_ID
+            ));
+        }
         const MAX_ADDR: usize = 128;
         const MAX_DATA: usize = 262_144;
         const MAX_SIG: usize = 16_384;
@@ -1675,8 +1873,10 @@ impl Transaction {
                     return Err("[REJECT][TX] vrf_pk_bad_length".to_string());
                 }
             }
-            TransactionType::NodeReactivation { node_id, last_macroblock_hash, .. } => {
-                if node_id.len() > MAX_ID || last_macroblock_hash.len() > MAX_ID {
+            TransactionType::NodeReactivation { node_id, last_macroblock_hash, api_endpoint, .. } => {
+                if node_id.len() > MAX_ID || last_macroblock_hash.len() > MAX_ID
+                    || api_endpoint.len() > MAX_ENDPOINT
+                {
                     return Err("[REJECT][TX] reactivation_field_too_long".to_string());
                 }
             }
@@ -1713,6 +1913,96 @@ impl Transaction {
             | TransactionType::BatchRewardClaims { .. }
             | TransactionType::BatchNodeActivations { .. })
     }
+
+    /// Node-activation entry-price rule. Phase 1 pays nothing on-chain (the 1DEV burn happens on
+    /// Solana); Phase 2 must pay at least the floor for its node type. Pure function of the
+    /// transaction and consensus constants — no state, no height, no node-local input — so every
+    /// node reaches the same verdict and enforcing it cannot split state_root.
+    ///
+    /// Enforced at APPLY, the path every node runs when accepting a block, so the price binds a
+    /// producer that seals its OWN activation exactly as it binds a submitted one; validate() calls
+    /// the same function at admission so the two rules can never drift.
+    pub fn check_node_activation_price(&self) -> Result<(), String> {
+        let (node_type, amount, phase) = match &self.tx_type {
+            TransactionType::NodeActivation { node_type, amount, phase } => (node_type, *amount, phase),
+            _ => return Ok(()),
+        };
+        match phase {
+            // A nonzero Phase-1 amount is debited from the sender and credited to no pool (Pool 3
+            // collection is Phase-2 only), i.e. it destroys supply outside the emission rules.
+            ActivationPhase::Phase1 => {
+                if amount != 0 {
+                    return Err(format!("[REJECT][TX] phase1_nonzero_amount amount={}", amount));
+                }
+            }
+            ActivationPhase::Phase2 => {
+                let min_nano = phase2_entry_floor_nano(node_type);
+                if amount < min_nano {
+                    return Err(format!(
+                        "[REJECT][TX] phase2_entry_below_floor node_type={:?} amount={} min={}",
+                        node_type, amount, min_nano
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Contract standard a ContractDeploy declares, and the BINDING of the declared `code_hash` to
+    /// the payload it names. Exactly one standard must be declared, a WASM deploy must carry
+    /// hex-encoded executable code, and `code_hash` must equal `deploy_code_hash(tx.data)` — the
+    /// same digest the signature preimage carries. Without that equality a relayer could swap the
+    /// code (or a token's supply/flags) under a signature that still verifies. Pure function of
+    /// tx.data, so admission (validate) and apply always reach the same verdict.
+    pub fn classify_contract_deploy(&self) -> Result<DeployKind, String> {
+        let data = self.data.as_deref()
+            .ok_or_else(|| "[REJECT][TX] deploy_missing_data".to_string())?;
+        let parsed: serde_json::Value = serde_json::from_str(data)
+            .map_err(|_| "[REJECT][TX] deploy_data_not_json".to_string())?;
+        let flag = |k: &str| parsed.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
+        let declared: Vec<DeployKind> = [
+            (DeployKind::Qrc20, flag("qrc20")),
+            (DeployKind::Qrc721, flag("qrc721")),
+            (DeployKind::Wasm, flag("wasm")),
+        ].iter().filter(|(_, on)| *on).map(|(k, _)| *k).collect();
+        let kind = match declared.len() {
+            1 => declared[0],
+            0 => return Err("[REJECT][TX] deploy_no_contract_type".to_string()),
+            n => return Err(format!("[REJECT][TX] deploy_ambiguous_contract_type declared={}", n)),
+        };
+        let computed = deploy_code_hash(kind, &parsed)?;
+        let claimed = parsed.get("code_hash").and_then(|v| v.as_str())
+            .ok_or_else(|| "[REJECT][TX] deploy_missing_code_hash".to_string())?;
+        if !claimed.eq_ignore_ascii_case(&computed) {
+            return Err(format!(
+                "[REJECT][TX] deploy_code_hash_mismatch kind={:?} claimed={} computed={}",
+                kind, crate::char_prefix(claimed, 16), crate::char_prefix(&computed, 16)));
+        }
+        Ok(kind)
+    }
+
+    /// Canonical deploy digest of this transaction's payload, or an error if the payload is not a
+    /// well-formed deploy. Same value `classify_contract_deploy` binds.
+    pub fn contract_deploy_code_hash(&self) -> Result<String, String> {
+        let data = self.data.as_deref()
+            .ok_or_else(|| "[REJECT][TX] deploy_missing_data".to_string())?;
+        let parsed: serde_json::Value = serde_json::from_str(data)
+            .map_err(|_| "[REJECT][TX] deploy_data_not_json".to_string())?;
+        let kind = self.classify_contract_deploy()?;
+        deploy_code_hash(kind, &parsed)
+    }
+
+    /// Native QNC may not be attached to a ContractCall. The VM exposes no native-transfer host
+    /// function and a contract address is hash-derived with no key, so value credited to a
+    /// contract can never be moved out again — accepting it is a pure loss channel.
+    pub fn check_contract_call_value(&self) -> Result<(), String> {
+        if matches!(self.tx_type, TransactionType::ContractCall) && self.amount > 0 {
+            return Err(format!(
+                "[REJECT][TX] contract_call_value_not_supported amount={}", self.amount));
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         self.enforce_wire_limits()?;
         // Retired types are refused before anything else: every one of them is fee-free and
@@ -1773,7 +2063,10 @@ impl Transaction {
                 std::mem::discriminant(&self.tx_type)
             ));
         }
-        
+
+        // Chain binding is enforced by enforce_wire_limits() above — the one gate the block path
+        // also runs.
+
         // Type-specific validation
         match &self.tx_type {
             TransactionType::Transfer { from, amount, .. } => {
@@ -1805,47 +2098,23 @@ impl Transaction {
                     ));
                 }
             }
-            TransactionType::NodeActivation { amount, phase, node_type, .. } => {
-                // Phase 1: amount = 0 (only activation record, 1DEV burned externally on Solana)
-                // Phase 2: amount > 0 (QNC transferred to Pool 3 for redistribution to all nodes)
-                match phase {
-                    ActivationPhase::Phase1 => {
-                        if *amount != 0 {
-                            return Err("[REJECT][NODE-ACTIVATION] phase1_nonzero_amount".to_string());
-                        }
-                    }
-                    ActivationPhase::Phase2 => {
-                        // Entry price is the one Sybil lever no amount of protocol work can replace, and
-                        // it used to be checked only where activation codes are issued, so a hand-built
-                        // TX gossiped straight in for one nano. Pure function of node_type, so every
-                        // node agrees; `amount` is nanoQNC, the unit apply debits from the balance.
-                        //
-                        // SCOPE, precisely: validate() is an ADMISSION filter — mempool, gossip, RPC
-                        // submit and the honest producer's fill loop. NOTHING calls it when a block is
-                        // accepted (block_pipeline has no validate() call site; MicroBlock::validate is
-                        // uncalled), so this does not bind a byzantine producer that seals the TX
-                        // itself. Making it bind means a check in the block-accept path beside the
-                        // NodeActivation burn-attestation gate, behind a feature_gates height.
-                        let min_nano = match node_type {
-                            NodeType::Super => PHASE2_SUPER_MIN_NANO,
-                            NodeType::Light => PHASE2_LIGHT_MIN_NANO,
-                        };
-                        if *amount < min_nano {
-                            return Err(format!(
-                                "[REJECT][NODE-ACTIVATION] phase2_below_min amount={} min={}",
-                                amount, min_nano
-                            ));
-                        }
-                    }
-                }
+            TransactionType::NodeActivation { .. } => {
+                // Entry price is the one Sybil lever no protocol work can replace. The rule itself
+                // lives in check_node_activation_price and is BINDING at apply; this call only
+                // filters the offender out of the mempool before a producer wastes a slot on it.
+                self.check_node_activation_price()?;
             }
             TransactionType::ContractDeploy => {
-                // No additional validation needed for ContractDeploy
+                // A deploy must declare one standard and, for WASM, carry runnable code. Binding
+                // rule lives in classify_contract_deploy, enforced again at apply; this call only
+                // keeps a dead-stub deploy out of the mempool before a producer wastes a slot.
+                self.classify_contract_deploy()?;
             }
             TransactionType::ContractCall => {
                 if self.to.as_ref().map(|s| s.is_empty()).unwrap_or(true) {
                     return Err("[REJECT][CONTRACT] empty_contract_address".to_string());
                 }
+                self.check_contract_call_value()?;
             }
             TransactionType::Swap { from, token_in, token_out, amount_in, amount_out_min, pool_address, .. } => {
                 if from.is_empty() {
@@ -2244,33 +2513,14 @@ impl Transaction {
                 if *node_type == NodeType::Light && !api_endpoint.is_empty() {
                     return Err("[REJECT][NODE-ACTIVATION] light_node_api_endpoint_forbidden".to_string());
                 }
-                // Validate api_endpoint format if present (non-empty = public)
-                if !api_endpoint.is_empty() {
-                    if !api_endpoint.starts_with("http://") && !api_endpoint.starts_with("https://") {
-                        return Err("[REJECT][NODE-ACTIVATION] invalid_api_endpoint_scheme".to_string());
-                    }
-                    // Block private IPs (SSRF protection)
-                    // FIX M4: Comprehensive SSRF protection — block all RFC 1918 + link-local + loopback
-                    let ep_lower = api_endpoint.to_lowercase();
-                    if ep_lower.contains("localhost") || ep_lower.contains("127.0.0.1") ||
-                       ep_lower.contains("192.168.") || ep_lower.contains("10.") ||
-                       ep_lower.contains("172.16.") || ep_lower.contains("172.17.") ||
-                       ep_lower.contains("172.18.") || ep_lower.contains("172.19.") ||
-                       ep_lower.contains("172.20.") || ep_lower.contains("172.21.") ||
-                       ep_lower.contains("172.22.") || ep_lower.contains("172.23.") ||
-                       ep_lower.contains("172.24.") || ep_lower.contains("172.25.") ||
-                       ep_lower.contains("172.26.") || ep_lower.contains("172.27.") ||
-                       ep_lower.contains("172.28.") || ep_lower.contains("172.29.") ||
-                       ep_lower.contains("172.30.") || ep_lower.contains("172.31.") ||
-                       ep_lower.contains("169.254.") || ep_lower.contains("0.0.0.0") ||
-                       ep_lower.contains("[::1]") || ep_lower.contains("[fc") ||
-                       ep_lower.contains("[fd") || ep_lower.contains("[fe80") {
-                        return Err("[REJECT][NODE-ACTIVATION] private_api_endpoint".to_string());
-                    }
-                }
-                // Empty api_endpoint = node chose to hide IP (valid for Super nodes)
+                validate_public_api_endpoint(api_endpoint)?;
             }
-            TransactionType::NodeReactivation { node_id, current_height, last_macroblock_hash, last_macroblock_index } => {
+            TransactionType::NodeReactivation {
+                node_id, current_height, last_macroblock_hash, last_macroblock_index, api_endpoint,
+            } => {
+                // Reactivation republishes the endpoint on exactly the registration terms — one
+                // shared validator, so the two announcements can never accept different sets.
+                validate_public_api_endpoint(api_endpoint)?;
                 // v9.4: Validate reactivation TX
                 if node_id.is_empty() {
                     return Err("[REJECT][NODE-ACTIVATION] reactivation_empty_node_id".to_string());
@@ -2574,6 +2824,14 @@ impl Transaction {
             }
 
             TransactionType::NodeActivation { node_type, amount, .. } => {
+                // ENTRY PRICE, enforced HERE because this is the only path every node runs when a
+                // block is accepted: a byzantine producer sealing its own activation for one nano is
+                // bound by the same floor as a gossiped one. Checked before the idempotent
+                // short-circuits below so an underpaid activation can never be replayed in, and
+                // before any mutation so a rejected TX leaves no partial state.
+                self.check_node_activation_price()
+                    .map_err(StateError::InvalidTransaction)?;
+
                 // v14.8.4: Account may not exist yet when a freshly-activated wallet
                 // submits its FIRST NodeActivation TX (no prior transfers → no state
                 // row). Create an empty Account rather than rejecting — the activation
@@ -2644,6 +2902,13 @@ impl Transaction {
                 // Contract deployment -- v3.40: FULL blockchain state (QRC-20 + generic WASM)
                 // ALL contract/token state is stored in Account.contract_storage
                 // which is part of the Merkle tree -> replicated to ALL nodes via blocks
+                //
+                // BINDING contract-shape rule: exactly one declared standard, and executable code
+                // for WASM. Checked before the idempotent short-circuit and before any mutation, so
+                // a producer cannot seal a deploy that would write a non-executable stub.
+                let kind = self.classify_contract_deploy()
+                    .map_err(StateError::InvalidTransaction)?;
+
                 let sender = accounts.get_mut(&self.from)
                     .ok_or_else(|| StateError::AccountNotFound(self.from.clone()))?;
 
@@ -2681,33 +2946,16 @@ impl Transaction {
                 // an arbitrary address (the old self.to branch let any address be named).
                 let contract_address = derive_contract_address(&self.from, self.nonce);
 
-                // Parse tx.data to determine contract type
+                // tx.data parsed and shape-checked by classify_contract_deploy above.
                 let data_str = self.data.as_ref().ok_or_else(|| {
                     StateError::InvalidTransaction("[REJECT][CONTRACT] missing_data_field".to_string())
                 })?;
-                
-                // FIX M6: Parse JSON first, then check for QRC-20 via proper field access
-                let is_qrc20 = serde_json::from_str::<serde_json::Value>(data_str)
-                    .ok()
-                    .and_then(|v| v.get("qrc20").and_then(|q| q.as_bool()))
-                    .unwrap_or(false);
-                // QRC-721 (NFT) is a CONTAINED standard on the SAME tx types, flagged by "qrc721": true.
-                let is_qrc721 = serde_json::from_str::<serde_json::Value>(data_str)
-                    .ok()
-                    .and_then(|v| v.get("qrc721").and_then(|q| q.as_bool()))
-                    .unwrap_or(false);
-                // Generic WASM contract, flagged by "wasm": true (P3, GATED default-OFF).
-                let is_wasm = serde_json::from_str::<serde_json::Value>(data_str)
-                    .ok()
-                    .and_then(|v| v.get("wasm").and_then(|q| q.as_bool()))
-                    .unwrap_or(false);
 
-                // Compute code hash
-                let code_hash = {
-                    let mut hasher = Sha3_256::new();
-                    hasher.update(data_str.as_bytes());
-                    hex::encode(hasher.finalize())
-                };
+                // The contract's code hash IS the canonical deploy digest classify_contract_deploy
+                // just bound to the signature — not a hash of the JSON envelope, which extra
+                // unsigned keys could vary without changing anything the contract does.
+                let code_hash = self.contract_deploy_code_hash()
+                    .map_err(StateError::InvalidTransaction)?;
 
                 // INIT-ONCE: never overwrite a live deployed contract. Unreachable on honest paths
                 // (nonce-derived address is unique per (sender,nonce)) but makes overwrite of an
@@ -2742,20 +2990,19 @@ impl Transaction {
                 // v3.40: QRC-20 token initialization — FULL state in blockchain
                 // This is the SINGLE SOURCE OF TRUTH for token data.
                 // contract_vm.rs reads FROM this state (via StateManager/RocksDB).
-                if is_qrc20 {
+                match kind {
+                    DeployKind::Qrc20 => {
                     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data_str) {
-                        let name = parsed.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                        let symbol = parsed.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
-                        let decimals = parsed.get("decimals").and_then(|v| v.as_u64()).unwrap_or(9);
-                        // Accept number OR numeric string (a large supply as a JSON number loses precision
-                        // past 2^53 on JS clients; the string form is exact). Absent/malformed ⇒ 0.
-                        let initial_supply = parsed.get("initial_supply")
-                            .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok())))
-                            .unwrap_or(0);
+                        // Read through the SAME field readers the deploy digest uses, so every value
+                        // materialized here is one the signature bound.
+                        let name = deploy_str(&parsed, "name");
+                        let symbol = deploy_str(&parsed, "symbol");
+                        let decimals = deploy_u64(&parsed, "decimals", 9);
+                        let initial_supply = deploy_u64(&parsed, "initial_supply", 0);
                         // Supply is IMMUTABLE by default: mint/burn stay disabled unless the deployer
                         // explicitly opts in. Absent flag ⇒ false, so an unset field can never enable them.
-                        let mintable = parsed.get("mintable").and_then(|v| v.as_bool()).unwrap_or(false);
-                        let burnable = parsed.get("burnable").and_then(|v| v.as_bool()).unwrap_or(false);
+                        let mintable = deploy_bool(&parsed, "mintable");
+                        let burnable = deploy_bool(&parsed, "burnable");
 
                         // Token metadata — stored on-chain, readable by all nodes
                         contract.contract_storage.insert("type".to_string(), "qrc20".to_string());
@@ -2768,7 +3015,8 @@ impl Transaction {
                         // attribute-breakout (quotes/angle-brackets/space/backtick/control chars) into an
                         // explorer/wallet <img> render, and capped so it cannot bloat the consensus
                         // storage_root. Pure string ops ⇒ every node derives the byte-identical value.
-                        let logo_raw = parsed.get("logo").and_then(|v| v.as_str()).unwrap_or("").trim();
+                        let logo_field = deploy_str(&parsed, "logo");
+                        let logo_raw = logo_field.trim();
                         let logo: String = {
                             let capped: String = logo_raw.chars().take(256).collect();
                             let lower = capped.to_ascii_lowercase();
@@ -2824,13 +3072,15 @@ impl Transaction {
                                 crate::char_prefix(&self.from, 16));
                         }
                     }
-                } else if is_qrc721 {
+                    }
+                    DeployKind::Qrc721 => {
                     // QRC-721 (NFT) init — CONTAINED standard modeled on QRC-20 but with NO total_supply
                     // (NFTs are minted individually via owner-only mint). Ownership lives in per-token
                     // "owner:{token_id}" entries created at mint; the "deployer" gates mint authority.
                     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data_str) {
-                        let name = parsed.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                        let symbol = parsed.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
+                        // Same readers the deploy digest uses (see DeployKind::Qrc20 arm).
+                        let name = deploy_str(&parsed, "name");
+                        let symbol = deploy_str(&parsed, "symbol");
 
                         contract.contract_storage.insert("type".to_string(), "qrc721".to_string());
                         contract.contract_storage.insert("name".to_string(), name.to_string());
@@ -2844,11 +3094,11 @@ impl Transaction {
                                 crate::char_prefix(&self.from, 16));
                         }
                     }
-                } else if is_wasm {
-                    // Generic WASM contract deploy (P3, GATED default-OFF). Disabled →
-                    // reject, so no type=="wasm" contract can exist and the call-side
-                    // wasm path stays unreachable (whole VM path inert). When enabled:
-                    // validate the module (float-free + bounded) and store the code.
+                    }
+                    DeployKind::Wasm => {
+                    // Generic WASM contract deploy: validate the module (float-free +
+                    // bounded) and store the code. The gate check below is defense-in-depth;
+                    // the VM is enabled, so this branch is the live deploy path.
                     if !crate::wasm_exec::wasm_vm_enabled() {
                         return Err(StateError::InvalidTransaction("[REJECT][VM] wasm_disabled".to_string()));
                     }
@@ -2866,13 +3116,6 @@ impl Transaction {
                             crate::char_prefix(&contract_address, 20), code.len(),
                             crate::char_prefix(&self.from, 16));
                     }
-                } else {
-                    // Generic contract (WASM) — just store code_hash + deployer
-                    if is_info_log() {
-                        println!("[INFO][CONTRACT] deployed addr={} code_hash={}..{} fee={} by={}",
-                            crate::char_prefix(&contract_address, 20),
-                            &code_hash[..8], &code_hash[code_hash.len()-8..],
-                            fee, crate::char_prefix(&self.from, 16));
                     }
                 }
 
@@ -2888,6 +3131,21 @@ impl Transaction {
             TransactionType::ContractCall => {
                 // Contract interaction -- v3.40: QRC-20 token operations execute ON-CHAIN
                 // transfer, approve, transferFrom all modify contract_storage in blockchain state
+                //
+                // BINDING: no native value may ride a call (the VM cannot move it back out).
+                // Checked before the idempotent short-circuit and before any mutation.
+                self.check_contract_call_value()
+                    .map_err(StateError::InvalidTransaction)?;
+                // Calldata is mandatory and must parse — a call whose data is absent or malformed
+                // used to charge the fee and dispatch nothing.
+                match self.data.as_deref() {
+                    Some(d) if serde_json::from_str::<serde_json::Value>(d).is_ok() => {}
+                    Some(_) => return Err(StateError::InvalidTransaction(
+                        "[REJECT][TX] contract_call_data_not_json".to_string())),
+                    None => return Err(StateError::InvalidTransaction(
+                        "[REJECT][TX] contract_call_missing_data".to_string())),
+                }
+
                 let sender = accounts.get_mut(&self.from)
                     .ok_or_else(|| StateError::AccountNotFound(self.from.clone()))?;
 
@@ -2903,21 +3161,20 @@ impl Transaction {
                     )));
                 }
                 
-                // Check balance for call fee + value (QUANTUM v2.25: +50% for Dilithium TX)
+                // Check balance for the call fee (QUANTUM v2.25: +50% for Dilithium TX). A call
+                // carries no value, so the fee is the whole debit.
                 let fee = self.effective_gas_price().checked_mul(self.gas_limit)
                     .ok_or_else(|| StateError::InvalidTransaction("[REJECT][TX] gas_fee_overflow".into()))?;
-                let total_cost = fee.checked_add(self.amount)
-                    .ok_or_else(|| StateError::InvalidTransaction("[REJECT][TX] total_amount_overflow".into()))?;
-                
-                if sender.balance < total_cost {
+
+                if sender.balance < fee {
                     return Err(StateError::InsufficientBalance {
                         have: sender.balance,
-                        need: total_cost,
+                        need: fee,
                     });
                 }
-                
-                // Deduct fee and value
-                sender.balance = sender.balance.checked_sub(total_cost)
+
+                // Deduct fee
+                sender.balance = sender.balance.checked_sub(fee)
                     .ok_or_else(|| StateError::InvalidTransaction("[REJECT][TX] sender_balance_underflow".into()))?;
                 sender.nonce = sender.nonce.checked_add(1)
                     .ok_or_else(|| StateError::InvalidTransaction("[REJECT][TX] nonce_overflow".into()))?;
@@ -2928,9 +3185,9 @@ impl Transaction {
                     StateError::InvalidTransaction("[REJECT][CONTRACT] missing_to_address".to_string())
                 })?.clone();
 
-                // Ensure the contract account exists, then verify + credit value in a short borrow
-                // scope. We deliberately do NOT hold a &mut contract across the QRC-20 dispatch:
-                // the refundable storage deposit is a native-QNC MOVE between OTHER accounts (sender
+                // Ensure the contract account exists, then verify it in a short borrow scope. We
+                // deliberately do NOT hold a &mut contract across the QRC-20 dispatch: the
+                // refundable storage deposit is a native-QNC MOVE between OTHER accounts (sender
                 // and escrow), so each contract_storage read/write is re-acquired in its own scope.
                 {
                     let contract = accounts.entry(contract_addr.clone())
@@ -2940,10 +3197,6 @@ impl Transaction {
                             "[REJECT][CONTRACT] not_a_contract addr={}", contract_addr
                         )));
                     }
-                    if self.amount > 0 {
-                        contract.balance = contract.balance.checked_add(self.amount)
-                            .ok_or_else(|| StateError::InvalidTransaction("[REJECT][CONTRACT] balance_overflow".into()))?;
-                    }
                 }
 
                 // v3.40: Execute QRC-20 operations ON-CHAIN (deterministic on all nodes)
@@ -2952,7 +3205,7 @@ impl Transaction {
                 let is_qrc721 = accounts.get(&contract_addr)
                     .and_then(|c| c.contract_storage.get("type"))
                     .map(|t| t == "qrc721").unwrap_or(false);
-                // Generic WASM contract dispatch (P3, GATED default-OFF).
+                // Generic WASM contract dispatch.
                 let is_wasm = accounts.get(&contract_addr)
                     .and_then(|c| c.contract_storage.get("type"))
                     .map(|t| t == "wasm").unwrap_or(false);
@@ -3518,35 +3771,61 @@ impl Transaction {
                         }
                     }
                 } else if is_wasm {
-                    // Generic WASM contract call (P3, GATED default-OFF). When enabled:
-                    // run the (possibly cross-contract) call tree over the access-list
-                    // working set, commit EACH contract's delta ONLY on a non-trap tree;
-                    // a trap consumes the fee (charged above) and commits nothing
-                    // (call-level atomicity; reentrancy + depth bounded inside qnet_vm).
+                    // Generic WASM contract call: run the (possibly cross-contract) call
+                    // tree over the access-list working set and commit EACH contract's delta
+                    // ONLY on a non-trap tree; a trap consumes the fee (charged above) and
+                    // commits nothing (call-level atomicity; reentrancy + depth bounded
+                    // inside qnet_vm). This is the live contract-execution path.
                     //
-                    // The gate Err below is defense-in-depth and unreachable on a from-genesis
-                    // network while gated: reaching this branch needs a type=="wasm" contract,
-                    // which the deploy path (same compile-time flag) cannot create when OFF. And
-                    // even if hit, the fee charged above does NOT persist — the lazy-apply caller
-                    // mutates a throwaway working copy and discards it on any Err (no leak).
+                    // The gate Err below is defense-in-depth. If it were ever hit, the fee
+                    // charged above does NOT persist — the lazy-apply caller mutates a
+                    // throwaway working copy and discards it on any Err (no leak).
                     if !crate::wasm_exec::wasm_vm_enabled() {
                         return Err(StateError::InvalidTransaction("[REJECT][VM] wasm_disabled".to_string()));
                     }
                     // Entry (method), args, and the declared access list come from the SIGNED tx
                     // data (identical on every node → deterministic resolution). Every reachable
                     // contract is already pre-loaded (get_all_affected_addresses added the list).
+                    // Every field is decoded FAIL-CLOSED: calldata this arm cannot decode (e.g. a
+                    // JSON array where hex is required) is rejected, never silently read as empty.
                     let mut entry = "run".to_string();
                     let mut args: Vec<u8> = Vec::new();
                     let mut call_set: Vec<String> = Vec::new();
-                    if let Some(ref data) = self.data {
-                        if let Ok(p) = serde_json::from_str::<serde_json::Value>(data) {
-                            if let Some(m) = p.get("method").and_then(|v| v.as_str()) { entry = m.to_string(); }
-                            if let Some(a) = p.get("args").and_then(|v| v.as_str()) {
-                                if let Ok(b) = hex::decode(a) { args = b; }
+                    {
+                        let data = self.data.as_deref().unwrap_or("{}");
+                        let p: serde_json::Value = serde_json::from_str(data)
+                            .map_err(|_| StateError::InvalidTransaction(
+                                "[REJECT][TX] wasm_call_data_not_json".to_string()))?;
+                        match p.get("method") {
+                            None | Some(serde_json::Value::Null) => {}
+                            Some(v) => {
+                                entry = v.as_str().ok_or_else(|| StateError::InvalidTransaction(
+                                    "[REJECT][TX] wasm_call_method_not_string".to_string()))?.to_string();
                             }
-                            if let Some(list) = p.get("accessList").and_then(|v| v.as_array()) {
-                                for it in list.iter().take(crate::wasm_exec::MAX_WASM_ACCESS_LIST) {
-                                    if let Some(s) = it.as_str() { call_set.push(s.to_string()); }
+                        }
+                        match p.get("args") {
+                            None | Some(serde_json::Value::Null) => {}
+                            Some(v) => {
+                                let a = v.as_str().ok_or_else(|| StateError::InvalidTransaction(
+                                    "[REJECT][TX] wasm_call_args_not_hex_string".to_string()))?;
+                                args = hex::decode(a).map_err(|_| StateError::InvalidTransaction(
+                                    "[REJECT][TX] wasm_call_args_not_hex".to_string()))?;
+                            }
+                        }
+                        match p.get("accessList") {
+                            None | Some(serde_json::Value::Null) => {}
+                            Some(v) => {
+                                let list = v.as_array().ok_or_else(|| StateError::InvalidTransaction(
+                                    "[REJECT][TX] wasm_call_access_list_not_array".to_string()))?;
+                                if list.len() > crate::wasm_exec::MAX_WASM_ACCESS_LIST {
+                                    return Err(StateError::InvalidTransaction(format!(
+                                        "[REJECT][TX] wasm_call_access_list_too_long len={} max={}",
+                                        list.len(), crate::wasm_exec::MAX_WASM_ACCESS_LIST)));
+                                }
+                                for it in list {
+                                    let s = it.as_str().ok_or_else(|| StateError::InvalidTransaction(
+                                        "[REJECT][TX] wasm_call_access_list_entry_not_string".to_string()))?;
+                                    call_set.push(s.to_string());
                                 }
                             }
                         }
@@ -3594,27 +3873,12 @@ impl Transaction {
                         for (contract, data) in &result.logs {
                             crate::wasm_exec::push_wasm_log(&self.hash, contract, data.clone());
                         }
-                    } else {
-                        // TRAP or storage-cap: commit NOTHING (call-level atomicity — result.writes is
-                        // already empty/discarded). REVERT SEMANTICS: the msg.value credited to the
-                        // target before execution must be RETURNED to the caller — value sent to a
-                        // reverting call is not consumed; only the gas/fee is (pay for the work done).
-                        // The VM never touches native balances (WasmTreeResult carries only storage
-                        // writes), so reversing the single pre-execution credit fully restores value.
-                        // Deterministic: trap/over_cap are identical on every node, and this is a plain
-                        // balance move folded into the same state_root all nodes recompute.
-                        if self.amount > 0 {
-                            if let Some(c) = accounts.get_mut(&contract_addr) {
-                                c.balance = c.balance.saturating_sub(self.amount);
-                            }
-                            if let Some(s) = accounts.get_mut(&sender_addr) {
-                                s.balance = s.balance.saturating_add(self.amount);
-                            }
-                        }
-                        if over_cap && is_info_log() {
-                            println!("[WARN][VM] wasm_storage_cap_exceeded contract={} — commit skipped, value returned (fee consumed)",
-                                crate::char_prefix(&contract_addr, 20));
-                        }
+                    } else if over_cap && is_info_log() {
+                        // TRAP or storage-cap: commit NOTHING (call-level atomicity — result.writes
+                        // is already empty/discarded); only the fee is consumed. No balance to
+                        // reverse: a call carries no native value.
+                        println!("[WARN][VM] wasm_storage_cap_exceeded contract={} — commit skipped (fee consumed)",
+                            crate::char_prefix(&contract_addr, 20));
                     }
                     if is_info_log() {
                         println!("[INFO][VM] wasm_calltree contract={} fuel={} trapped={} contracts={} h={}",
@@ -3622,23 +3886,18 @@ impl Transaction {
                             result.trapped, result.writes.len(), block_height);
                     }
                 } else {
-                    // Generic contract call — record in storage (capped)
-                    const MAX_CALL_RECORDS: usize = 10_000;
-                    let contract = accounts.get_mut(&contract_addr).unwrap();
-                    if contract.contract_storage.len() < MAX_CALL_RECORDS {
-                        let call_key = format!("call:{}:{}", self.timestamp, crate::char_prefix(&sender_addr, 16));
-                        let call_value = format!("value={},gas={},data_len={}",
-                            self.amount, fee,
-                            self.data.as_ref().map(|d| d.len()).unwrap_or(0));
-                        contract.contract_storage.insert(call_key, call_value);
-                    }
+                    // A contract with no declared standard has no dispatch and can never execute.
+                    // Deploys that would create one are refused, so this is a malformed target:
+                    // fail closed instead of charging a fee to write an unpriced junk record.
+                    return Err(StateError::InvalidTransaction(format!(
+                        "[REJECT][TX] contract_not_executable addr={}", contract_addr)));
                 }
 
                 if is_info_log() && !is_qrc20 {
-                    println!("[INFO][CONTRACT-CALL] {} -> {} fee={} value={} nanoQNC",
+                    println!("[INFO][CONTRACT-CALL] {} -> {} fee={} nanoQNC",
                         crate::char_prefix(&sender_addr, 16),
                         crate::char_prefix(&contract_addr, 20),
-                        fee, self.amount);
+                        fee);
                 }
             }
             TransactionType::Swap { .. } => {
@@ -4438,7 +4697,7 @@ mod tests_v34_heartbeat {
             // FIX-5: raw-byte fields — test-only placeholder bytes (structural test, not a real sig).
             dilithium_signature: Some(b"deadbeef".to_vec()),
             dilithium_public_key: Some(node_id.as_bytes().to_vec()),
-            chain_id: 0,
+            chain_id: QNET_CHAIN_ID,
         };
         tx.hash = tx.calculate_hash();
         tx
@@ -4689,7 +4948,7 @@ mod tests_v17_swap_sender {
             data: None,
             dilithium_signature: None,
             dilithium_public_key: None,
-            chain_id: 0,
+            chain_id: QNET_CHAIN_ID,
         };
         tx.hash = tx.calculate_hash();
         tx
@@ -4720,7 +4979,7 @@ mod tests_v17_swap_sender {
             data: None,
             dilithium_signature: None,
             dilithium_public_key: None,
-            chain_id: 0,
+            chain_id: QNET_CHAIN_ID,
         };
         tx.hash = tx.calculate_hash();
         tx
@@ -4877,7 +5136,7 @@ mod tests_qrc20_self_transfer {
             tx_type: TransactionType::ContractCall,
             dilithium_signature: None,
             dilithium_public_key: None,
-            chain_id: 0,
+            chain_id: QNET_CHAIN_ID,
         };
         tx.hash = tx.calculate_hash();
         tx
@@ -5028,6 +5287,14 @@ mod tests_qrc20_self_transfer {
 
     // Build a QRC-20 ContractDeploy tx (contract address is derived from from+nonce).
     fn qrc20_deploy(deployer: &str, initial_supply: u64) -> Transaction {
+        // code_hash is BINDING (classify_contract_deploy re-derives it), so a deploy fixture must
+        // carry the canonical digest of its own payload.
+        let mut payload = serde_json::json!({
+            "qrc20": true, "name": "T", "symbol": "T", "decimals": 9,
+            "initial_supply": initial_supply
+        });
+        payload["code_hash"] =
+            serde_json::json!(deploy_code_hash(DeployKind::Qrc20, &payload).unwrap());
         let mut tx = Transaction {
             hash: String::new(),
             from: deployer.to_string(),
@@ -5037,15 +5304,13 @@ mod tests_qrc20_self_transfer {
             timestamp: 0,
             gas_price: 1,
             gas_limit: 1_000_000,
-            data: Some(format!(
-                "{{\"qrc20\":true,\"name\":\"T\",\"symbol\":\"T\",\"decimals\":9,\"initial_supply\":{}}}",
-                initial_supply)),
+            data: Some(payload.to_string()),
             signature: None,
             public_key: None,
             tx_type: TransactionType::ContractDeploy,
             dilithium_signature: None,
             dilithium_public_key: None,
-            chain_id: 0,
+            chain_id: QNET_CHAIN_ID,
         };
         tx.hash = tx.calculate_hash();
         tx
@@ -5662,20 +5927,22 @@ mod tests_wasm_e2e {
             amount: 0, nonce, timestamp: 0, gas_price: 1, gas_limit: 2_000_000,
             data: Some(data.to_string()), signature: None, public_key: None,
             tx_type: TransactionType::ContractCall,
-            dilithium_signature: None, dilithium_public_key: None, chain_id: 0,
+            dilithium_signature: None, dilithium_public_key: None, chain_id: QNET_CHAIN_ID,
         };
         tx.hash = tx.calculate_hash();
         tx
     }
     fn wasm_deploy(sender: &str, nonce: u64, wat: &str) -> Transaction {
         let code = wat::parse_str(wat).unwrap();
-        let data = format!("{{\"wasm\":true,\"code\":\"{}\"}}", hex::encode(&code));
+        // code_hash is BINDING: it must equal sha3(module bytes) or the deploy is refused.
+        let data = format!("{{\"wasm\":true,\"code\":\"{}\",\"code_hash\":\"{}\"}}",
+            hex::encode(&code), hex::encode(Sha3_256::digest(&code)));
         let mut tx = Transaction {
             hash: String::new(), from: sender.to_string(), to: None,
             amount: 0, nonce, timestamp: 0, gas_price: 1, gas_limit: 2_000_000,
             data: Some(data), signature: None, public_key: None,
             tx_type: TransactionType::ContractDeploy,
-            dilithium_signature: None, dilithium_public_key: None, chain_id: 0,
+            dilithium_signature: None, dilithium_public_key: None, chain_id: QNET_CHAIN_ID,
         };
         tx.hash = tx.calculate_hash();
         tx
@@ -5744,5 +6011,285 @@ mod tests_wasm_e2e {
         assert_eq!(stored(&accounts, &addr, b"k").map(|s| s.as_str()), Some(hexk(b"v").as_str()),
             "deploy→call end-to-end committed the contract's write");
     }
+
+    /// The shipped example contract must stay deployable and runnable: it passes the
+    /// deploy-time determinism validator and its counter advances over the real
+    /// deploy → call path, so the documentation cannot drift away from the VM.
+    #[test]
+    fn example_counter_wat_is_deployable_and_runs() {
+        const COUNTER_WAT: &str =
+            include_str!("../../../development/qnet-contracts/examples/counter.wat");
+        let code = wat::parse_str(COUNTER_WAT).expect("example WAT parses");
+        qnet_vm::validate_wasm_module(&code, &qnet_vm::VmLimits::default())
+            .expect("example passes the deploy-time determinism validator");
+
+        let mut accounts = HashMap::new();
+        accounts.insert("alice".to_string(), funded(100_000_000));
+        wasm_deploy("alice", 1, COUNTER_WAT).apply_to_state(&mut accounts).expect("deploy applies");
+        let addr = derive_contract_address("alice", 1);
+        let counter = |accts: &HashMap<String, Account>| stored(accts, &addr, b"count").cloned();
+
+        wasm_call("alice", &addr, 2, r#"{"method":"run"}"#)
+            .apply_to_state(&mut accounts).expect("run applies");
+        assert_eq!(counter(&accounts), Some(hex::encode(1u64.to_le_bytes())),
+            "first run wrote count=1 (little-endian i64, hex-encoded)");
+        wasm_call("alice", &addr, 3, r#"{"method":"run"}"#)
+            .apply_to_state(&mut accounts).expect("second run applies");
+        assert_eq!(counter(&accounts), Some(hex::encode(2u64.to_le_bytes())),
+            "the counter reads its own committed value back and advances");
+        wasm_call("alice", &addr, 4, r#"{"method":"reset"}"#)
+            .apply_to_state(&mut accounts).expect("reset applies");
+        assert_eq!(counter(&accounts), Some(hex::encode(0u64.to_le_bytes())),
+            "data.method selects the entry point: reset zeroed the counter");
+    }
+
+    fn deploy_with_data(sender: &str, nonce: u64, data: &str) -> Transaction {
+        let mut tx = Transaction {
+            hash: String::new(), from: sender.to_string(), to: None,
+            amount: 0, nonce, timestamp: 0, gas_price: 1, gas_limit: 2_000_000,
+            data: Some(data.to_string()), signature: None, public_key: None,
+            tx_type: TransactionType::ContractDeploy,
+            dilithium_signature: None, dilithium_public_key: None, chain_id: QNET_CHAIN_ID,
+        };
+        tx.hash = tx.calculate_hash();
+        tx
+    }
+
+    /// A deploy that declares no standard would produce a contract that can never execute.
+    /// Refused at admission AND at apply, so no endpoint and no producer can create one.
+    #[test]
+    fn typeless_deploy_is_rejected() {
+        let mut accounts = HashMap::new();
+        accounts.insert("alice".to_string(), funded(100_000_000));
+        let tx = deploy_with_data("alice", 1, r#"{"code_hash":"aa","code_size":4}"#);
+        assert!(tx.validate().is_err(), "typeless deploy refused at admission");
+        assert!(tx.apply_to_state(&mut accounts).is_err(), "typeless deploy refused at apply");
+        assert!(!accounts.contains_key(&derive_contract_address("alice", 1)),
+            "no stub account written");
+    }
+
+    #[test]
+    fn wasm_deploy_without_executable_code_is_rejected() {
+        let mut accounts = HashMap::new();
+        accounts.insert("alice".to_string(), funded(100_000_000));
+        for data in [r#"{"wasm":true}"#, r#"{"wasm":true,"code":""}"#, r#"{"wasm":true,"code":"zz"}"#] {
+            let tx = deploy_with_data("alice", 1, data);
+            assert!(tx.validate().is_err(), "refused at admission: {}", data);
+            assert!(tx.apply_to_state(&mut accounts).is_err(), "refused at apply: {}", data);
+        }
+    }
+
+    #[test]
+    fn ambiguous_deploy_is_rejected() {
+        let mut accounts = HashMap::new();
+        accounts.insert("alice".to_string(), funded(100_000_000));
+        let tx = deploy_with_data("alice", 1, r#"{"qrc20":true,"wasm":true,"code":"0061736d"}"#);
+        assert!(tx.validate().is_err(), "two declared standards is ambiguous");
+        assert!(tx.apply_to_state(&mut accounts).is_err());
+    }
+
+    /// The signature preimage carries only code_hash, so a relayer that swaps `code` and leaves
+    /// code_hash alone keeps a valid signature. classify_contract_deploy re-derives the digest, so
+    /// the swap is refused on every node — at admission and at apply.
+    #[test]
+    fn wasm_deploy_with_swapped_code_is_rejected() {
+        let mut accounts = HashMap::new();
+        accounts.insert("alice".to_string(), funded(100_000_000));
+        let victim = wat::parse_str(WRITE_KV).unwrap();
+        let attacker = wat::parse_str(B_WRITES).unwrap();
+        let data = format!("{{\"wasm\":true,\"code\":\"{}\",\"code_hash\":\"{}\"}}",
+            hex::encode(&attacker), hex::encode(Sha3_256::digest(&victim)));
+        let tx = deploy_with_data("alice", 1, &data);
+        assert!(tx.validate().is_err(), "swapped code refused at admission");
+        assert!(tx.apply_to_state(&mut accounts).is_err(), "swapped code refused at apply");
+        assert!(!accounts.contains_key(&derive_contract_address("alice", 1)),
+            "attacker code never lands at the victim's deploy address");
+    }
+
+    #[test]
+    fn wasm_deploy_without_code_hash_is_rejected() {
+        let mut accounts = HashMap::new();
+        accounts.insert("alice".to_string(), funded(100_000_000));
+        let code = wat::parse_str(WRITE_KV).unwrap();
+        let tx = deploy_with_data("alice", 1,
+            &format!("{{\"wasm\":true,\"code\":\"{}\"}}", hex::encode(&code)));
+        assert!(tx.validate().is_err(), "an unbound deploy shape is refused, not defaulted");
+        assert!(tx.apply_to_state(&mut accounts).is_err());
+    }
+
+    /// Every QRC-20 field apply materializes is inside the digest — flipping any one of them
+    /// invalidates the declared code_hash.
+    #[test]
+    fn qrc20_deploy_binds_every_applied_field() {
+        let base = serde_json::json!({
+            "qrc20": true, "name": "Tok", "symbol": "TK", "decimals": 9,
+            "initial_supply": "1000", "mintable": false, "burnable": false, "logo": ""
+        });
+        let good = deploy_code_hash(DeployKind::Qrc20, &base).unwrap();
+        for (k, v) in [
+            ("name", serde_json::json!("Evil")), ("symbol", serde_json::json!("EV")),
+            ("decimals", serde_json::json!(2)), ("initial_supply", serde_json::json!("999999")),
+            ("mintable", serde_json::json!(true)), ("burnable", serde_json::json!(true)),
+            ("logo", serde_json::json!("https://x.example/y.png")),
+        ] {
+            let mut tampered = base.clone();
+            tampered[k] = v;
+            assert_ne!(good, deploy_code_hash(DeployKind::Qrc20, &tampered).unwrap(),
+                "digest must change when {} changes", k);
+
+            let mut with_claim = tampered.clone();
+            with_claim["code_hash"] = serde_json::json!(good.clone());
+            let tx = deploy_with_data("alice", 1, &with_claim.to_string());
+            assert!(tx.classify_contract_deploy().is_err(),
+                "tampered {} under the original code_hash is refused", k);
+        }
+        let mut ok = base.clone();
+        ok["code_hash"] = serde_json::json!(good);
+        assert_eq!(deploy_with_data("alice", 1, &ok.to_string()).classify_contract_deploy(),
+            Ok(DeployKind::Qrc20));
+    }
+
+    /// Length-prefixed fields: re-splitting name/symbol around a ':' must not collide.
+    #[test]
+    fn deploy_digest_fields_are_unambiguous() {
+        let a = serde_json::json!({"qrc721": true, "name": "A:B", "symbol": "C"});
+        let b = serde_json::json!({"qrc721": true, "name": "A", "symbol": "B:C"});
+        assert_ne!(deploy_code_hash(DeployKind::Qrc721, &a).unwrap(),
+                   deploy_code_hash(DeployKind::Qrc721, &b).unwrap());
+    }
+
+    /// The VM has no native-transfer host function, so value credited to a contract is
+    /// unrecoverable. A call carrying value is refused rather than swallowing the funds.
+    #[test]
+    fn call_with_native_value_is_rejected() {
+        let mut accounts = HashMap::new();
+        accounts.insert("alice".to_string(), funded(100_000_000));
+        accounts.insert("c".to_string(), wasm_contract_acc(WRITE_KV));
+        let mut tx = wasm_call("alice", "c", 1, r#"{"method":"run"}"#);
+        tx.amount = 1;
+        tx.hash = tx.calculate_hash();
+        assert!(tx.validate().is_err(), "value-bearing call refused at admission");
+        assert!(tx.apply_to_state(&mut accounts).is_err(), "value-bearing call refused at apply");
+        assert_eq!(accounts.get("alice").map(|a| a.balance), Some(100_000_000),
+            "caller balance untouched");
+    }
+
+    #[test]
+    fn call_to_typeless_contract_is_rejected() {
+        let mut accounts = HashMap::new();
+        accounts.insert("alice".to_string(), funded(100_000_000));
+        let mut stub = Account::default();
+        stub.is_contract = true;
+        accounts.insert("stub".to_string(), stub);
+        assert!(wasm_call("alice", "stub", 1, r#"{"method":"run"}"#)
+            .apply_to_state(&mut accounts).is_err(), "no dispatch exists for a typeless contract");
+        assert!(accounts.get("stub").map(|a| a.contract_storage.is_empty()).unwrap_or(false),
+            "no junk call record written");
+    }
+
+    /// Calldata this arm cannot decode must fail, never execute with silently empty args.
+    #[test]
+    fn wasm_call_with_non_hex_args_is_rejected() {
+        for data in [r#"{"method":"run","args":["a","b"]}"#, r#"{"method":"run","args":"zz"}"#] {
+            let mut accounts = HashMap::new();
+            accounts.insert("alice".to_string(), funded(100_000_000));
+            accounts.insert("c".to_string(), wasm_contract_acc(WRITE_KV));
+            assert!(wasm_call("alice", "c", 1, data).apply_to_state(&mut accounts).is_err(),
+                "refused: {}", data);
+            assert!(stored(&accounts, "c", b"k").is_none(), "nothing executed: {}", data);
+        }
+    }
+
+    #[test]
+    fn wasm_call_with_malformed_access_list_is_rejected() {
+        for data in [r#"{"method":"run","accessList":"B"}"#, r#"{"method":"run","accessList":[7]}"#] {
+            let mut accounts = HashMap::new();
+            accounts.insert("alice".to_string(), funded(100_000_000));
+            accounts.insert("A".to_string(), wasm_contract_acc(A_CALLS_B));
+            accounts.insert("B".to_string(), wasm_contract_acc(B_WRITES));
+            assert!(wasm_call("alice", "A", 1, data).apply_to_state(&mut accounts).is_err(),
+                "refused: {}", data);
+        }
+    }
 }
 
+
+
+#[cfg(test)]
+mod tests_activation_pricing_and_chain_binding {
+    use super::*;
+
+    /// The floor the chain enforces is the cheapest tier of the table the RPC quotes from. If the
+    /// two ever drift, honestly-priced early activations get rejected (or free ones accepted).
+    #[test]
+    fn phase2_floor_is_the_cheapest_quote_tier() {
+        for nt in [NodeType::Super, NodeType::Light] {
+            let cheapest = PHASE2_MULT_TIERS_TENTHS.iter().map(|(_, m)| *m).min().unwrap();
+            assert_eq!(PHASE2_MIN_MULT_TENTHS, cheapest, "tier 0 must be the minimum multiplier");
+            assert_eq!(phase2_entry_floor_nano(&nt),
+                       phase2_activation_cost_qnc(&nt, 0) * NANO_PER_QNC,
+                       "floor == quote at the cheapest tier");
+        }
+    }
+
+    /// The anti-inflation curve must actually engage as the registry grows — the defect was a
+    /// multiplier fed by the local peer count, which stays in the tens and pinned it at 0.5x.
+    #[test]
+    fn phase2_price_rises_with_the_registered_node_count() {
+        let s = |n| phase2_activation_cost_qnc(&NodeType::Super, n);
+        assert_eq!(s(5), 3_750);
+        assert_eq!(s(100_000), 3_750);
+        assert_eq!(s(100_001), 7_500);
+        assert_eq!(s(300_001), 15_000);
+        assert_eq!(s(1_000_001), 22_500);
+        assert_eq!(phase2_activation_cost_qnc(&NodeType::Light, 100_001), 10_000);
+        // Monotone: a larger registry never quotes cheaper.
+        let mut prev = 0;
+        for n in [0u64, 100_000, 100_001, 300_000, 300_001, 1_000_000, 1_000_001, u64::MAX] {
+            let c = s(n);
+            assert!(c >= prev, "price must never fall as the registry grows (n={})", n);
+            prev = c;
+        }
+    }
+
+    /// chain_id lives outside every signature preimage (the preimage carries the constant chain
+    /// tag), so it is checked structurally instead — by the one gate the BLOCK path also runs.
+    /// A producer that retags a signed TX and rehashes it must not get it applied.
+    #[test]
+    fn foreign_chain_id_is_rejected_by_the_gate_the_block_path_runs() {
+        let mut tx = Transaction::new(
+            "a".repeat(45), Some("b".repeat(45)), 10, 1, 1, 21_000, 0, None,
+            TransactionType::Transfer { from: "a".repeat(45), to: "b".repeat(45), amount: 10 },
+            None,
+        );
+        tx.chain_id = QNET_CHAIN_ID + 1;
+        tx.hash = tx.calculate_hash();
+        let err = tx.enforce_wire_limits().unwrap_err();
+        assert!(err.contains("chain_id_mismatch"), "unexpected error: {}", err);
+        assert!(tx.validate().is_err(), "admission refuses it too");
+    }
+
+    /// Both halves of the phase rule, and only those: 90% burned OR five years since genesis.
+    /// A regression that drops either half strands the network in Phase 1 forever.
+    #[test]
+    fn phase2_needs_ninety_percent_burned_or_five_years() {
+        const G: u64 = 1_700_000_000;
+        let day = 24 * 60 * 60;
+        let five_years = G + Transaction::PHASE2_AGE_SECS;
+
+        // Burn half, evaluated at genesis time so the age half cannot carry it.
+        assert!(!Transaction::is_phase2(899, 101, G, G), "89.9% burned is still Phase 1");
+        assert!(Transaction::is_phase2(900, 100, G, G), "90.0% burned flips to Phase 2");
+        assert!(Transaction::is_phase2(1000, 0, G, G), "fully burned is Phase 2");
+
+        // Age half, evaluated at zero burn so the burn half cannot carry it.
+        assert!(!Transaction::is_phase2(0, 1000, G, five_years - 1), "one second short is Phase 1");
+        assert!(Transaction::is_phase2(0, 1000, G, five_years), "five years flips to Phase 2");
+        assert!(Transaction::is_phase2(0, 1000, G, five_years + day), "and stays Phase 2");
+        assert_eq!(Transaction::PHASE2_AGE_SECS, 1825 * day, "1825 days, as the burn contract");
+
+        // Unknown genesis and a clock behind genesis keep the age trigger shut.
+        assert!(!Transaction::is_phase2(0, 1000, 0, five_years), "genesis_ts=0 never triggers");
+        assert!(!Transaction::is_phase2(0, 1000, G, G - 1), "clock behind genesis never triggers");
+    }
+}

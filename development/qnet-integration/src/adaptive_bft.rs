@@ -1,5 +1,5 @@
-// QNet Adaptive BFT - Adaptive timeout management for Byzantine consensus
-// Integrates with existing consensus mechanisms
+// Adaptive per-height timeout used by the block-production failover path.
+// Scales the base timeout by observed peer RTT and packet loss.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -203,54 +203,8 @@ impl AdaptiveBft {
         network_state.active_peers = count;
     }
     
-    /// Get timeout for Byzantine consensus phases
-    pub fn get_consensus_timeout(&self, phase: ConsensusPhase) -> Duration {
-        match phase {
-            ConsensusPhase::Commit => Duration::from_secs(15),
-            ConsensusPhase::Reveal => Duration::from_secs(15),
-            ConsensusPhase::Finalize => Duration::from_secs(5),
-        }
-    }
     
-    /// Calculate validator stake-weighted timeout
-    pub async fn get_stake_weighted_timeout(
-        &self,
-        height: u64,
-        validator_stakes: &HashMap<String, u64>,
-    ) -> Duration {
-        let base_timeout = self.get_timeout(height, 0).await;
-        
-        if validator_stakes.is_empty() {
-            return base_timeout;
-        }
-        
-        // Calculate total stake
-        let total_stake: u64 = validator_stakes.values().sum();
-        if total_stake == 0 {
-            return base_timeout;
-        }
-        
-        // Weight timeout based on stake distribution
-        let stake_variance = self.calculate_stake_variance(validator_stakes, total_stake);
-        
-        // High variance means uneven distribution - need more time
-        let multiplier = 1.0 + (stake_variance * 0.5).min(0.5);
-        
-        Duration::from_millis((base_timeout.as_millis() as f64 * multiplier) as u64)
-    }
     
-    /// Calculate stake variance for timeout adjustment
-    fn calculate_stake_variance(&self, stakes: &HashMap<String, u64>, total: u64) -> f64 {
-        let mean = total as f64 / stakes.len() as f64;
-        let variance: f64 = stakes.values()
-            .map(|&stake| {
-                let diff = stake as f64 - mean;
-                diff * diff
-            })
-            .sum::<f64>() / stakes.len() as f64;
-        
-        (variance / (mean * mean)).sqrt()
-    }
     
     /// Clear old cached timeouts
     pub async fn clear_old_timeouts(&self, current_height: u64) {
@@ -258,47 +212,3 @@ impl AdaptiveBft {
         timeouts.retain(|&height, _| height >= current_height.saturating_sub(100));
     }
 }
-
-/// Consensus phase for timeout calculation
-#[derive(Debug, Clone, Copy)]
-pub enum ConsensusPhase {
-    Commit,
-    Reveal,
-    Finalize,
-}
-
-/// Vote state for Adaptive BFT
-#[derive(Debug, Clone)]
-pub struct VoteState {
-    pub height: u64,
-    pub slot: u64,
-    pub confirmations: u32,
-    pub last_vote_time: Instant,
-}
-
-impl VoteState {
-    pub fn new(height: u64, slot: u64) -> Self {
-        Self {
-            height,
-            slot,
-            confirmations: 0,
-            last_vote_time: Instant::now(),
-        }
-    }
-    
-    /// Check if vote has expired based on timeout
-    pub fn is_expired(&self, timeout: Duration) -> bool {
-        self.last_vote_time.elapsed() > timeout
-    }
-    
-    /// Increment confirmation count
-    pub fn confirm(&mut self) {
-        self.confirmations += 1;
-        self.last_vote_time = Instant::now();
-    }
-}
-
-// Backward compatibility aliases
-pub type TowerBftConfig = AdaptiveBftConfig;
-pub type TowerBft = AdaptiveBft;
-

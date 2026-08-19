@@ -7,6 +7,7 @@
 //! This module integrates all QNet components into a cohesive blockchain system.
 
 pub mod errors;
+pub mod boot_contract;     // Required-subsystem registry: a task that never spawns fails the node
 pub mod storage;
 pub mod unified_p2p;
 pub mod node;
@@ -30,7 +31,6 @@ pub mod block_pipeline;    // Staged block processing pipeline (ingest → decod
 pub mod attestation_committee;  // Deterministic attestation committee selection (per-microblock BFT layer)
 pub mod genesis_config;    // File-based genesis loader (not p2p)
 pub mod sync_manager;      // Block download coordinator (sequential waves, ordered buffer)
-pub mod p2p_extensions;
 pub mod quic_transport;    // PRODUCTION v2.19.21: QUIC transport layer
 pub mod p2p_transport;     // PRODUCTION v2.19.21: P2P transport abstraction + binary protocol
 pub mod preflight_checks;  // PRODUCTION v2.19.22: Pre-flight port/connectivity validation
@@ -55,7 +55,7 @@ pub use crypto::key_manager;
 // v3.22: Use State (not StateManager) - State has optimized Merkle methods
 pub use qnet_state::{State as StateManager, Account, Transaction, Block, StateDB, StateError, StateResult};
 pub use qnet_mempool::{SimpleMempool, SimpleMempoolConfig};
-pub use qnet_consensus::{ConsensusEngine, ConsensusConfig, NodeId};
+pub use qnet_consensus::NodeId;
 pub use qnet_sharding::{ShardCoordinator, ParallelValidator};
 
 // Import NetworkMessage for compilation
@@ -80,19 +80,27 @@ use std::sync::atomic::{AtomicU64, Ordering};
 // GLOBAL STATE FOR DYNAMIC PRICING (updated by node sync process)
 // ============================================================================
 
-/// Global 1DEV burn percentage (multiplied by 100 for precision, e.g., 4500 = 45.00%)
-pub static GLOBAL_BURN_PERCENTAGE: AtomicU64 = AtomicU64::new(0);
+// 1DEV burn progress is NOT mirrored here: it lives on Solana and survives a fresh QNet genesis,
+// so every phase and price is derived from a live supply read via rpc::live_activation_pricing().
 
-/// Global total active nodes count (from P2P network)
-pub static GLOBAL_ACTIVE_NODES: AtomicU64 = AtomicU64::new(0);
+/// CHAIN-CONFIRMED registered-node count — the Phase-2 QNC price multiplier input. It must be a
+/// committed quantity: the local peer table stays in the tens at any network size, so quoting off it
+/// pins the multiplier to its cheapest tier forever and makes two honest nodes quote different
+/// prices. Refreshed from storage by the node maintenance loop.
+pub static GLOBAL_REGISTERED_NODES: AtomicU64 = AtomicU64::new(0);
 
 /// Global Genesis block timestamp (set once from block #0)
 pub static GLOBAL_GENESIS_TIMESTAMP: AtomicU64 = AtomicU64::new(0);
 
-/// Update global pricing state (called by node sync process)
-pub fn update_global_pricing_state(burn_pct: f64, active_nodes: u64, genesis_ts: u64) {
-    GLOBAL_BURN_PERCENTAGE.store((burn_pct * 100.0) as u64, Ordering::Relaxed);
-    GLOBAL_ACTIVE_NODES.store(active_nodes, Ordering::Relaxed);
+/// Refresh the registered-node count from the chain-confirmed registry (node maintenance loop).
+pub fn update_registered_node_count(registered_nodes: u64) {
+    GLOBAL_REGISTERED_NODES.store(registered_nodes, Ordering::Relaxed);
+}
+
+/// Latch the genesis timestamp on first sight of block #0. Separate from the count above: the
+/// block-ingest sites know the timestamp and nothing about the registry, and folding the two
+/// together made every genesis sighting clobber the price multiplier's input.
+pub fn set_genesis_timestamp(genesis_ts: u64) {
     if genesis_ts > 0 && GLOBAL_GENESIS_TIMESTAMP.load(Ordering::Relaxed) == 0 {
         GLOBAL_GENESIS_TIMESTAMP.store(genesis_ts, Ordering::Relaxed);
     }

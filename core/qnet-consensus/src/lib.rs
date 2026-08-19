@@ -1,38 +1,29 @@
 //! QNet Consensus Module
-//! 
-//! High-performance consensus mechanism for QNet blockchain
-//! with advanced features like dynamic timing, commit-reveal,
-//! and Byzantine fault tolerance.
+//!
+//! Consensus primitives for the QNet blockchain. Finality is
+//! Checkpoint-BFT v2 (see `checkpoint_bft` / `checkpoint_consensus`);
+//! consensus reputation is the binary on-chain `deterministic_reputation`.
 
 // External crates
 extern crate qnet_state;
 
 /// QNet Consensus Implementation
 pub mod lazy_rewards;
-pub mod commit_reveal;
 // Consensus v2 — Checkpoint-BFT types (spec: docs/CONSENSUS_V2_SPEC.md)
 pub mod checkpoint_bft;
 // Consensus v2 — Checkpoint-BFT state machine (propose/vote/QC/commit + pacemaker)
 pub mod checkpoint_consensus;
 pub mod consensus_crypto;
-pub mod dynamic_timing;
 pub mod errors;
-pub mod reputation;
-pub mod kademlia;
 pub mod deterministic_reputation;
-pub mod macro_consensus;
 // v15.10 STAGE-2B — per-shard committee assignment + leader rotation
 pub mod sharded_consensus;
 // v15.10 STAGE-2C — cross-shard 2PC: locks, envelopes, receipts, coordinator
 pub mod cross_shard;
 
 // Re-export main types for public API
-pub use commit_reveal::{CommitRevealConsensus, ConsensusConfig, ConsensusPhase, get_phase_for_block, is_in_consensus_window};
 pub use errors::ConsensusError;
-pub use reputation::{NodeReputation, ReputationConfig, MaliciousBehavior};
-pub use kademlia::{KademliaDht, KademliaNode, generate_node_id};
 pub use deterministic_reputation::{INITIAL_REPUTATION, MIN_CONSENSUS_REPUTATION};
-pub use macro_consensus::{FinalityCheckpoint, FinalityManager, FINALITY_DEPTH, FINALITY_THRESHOLD};
 // v15.10 STAGE-2B — per-shard committee primitives
 pub use sharded_consensus::{
     ShardCommittee, ShardCommitteeAssignment, ShardCommitteeCache,
@@ -48,27 +39,7 @@ pub use cross_shard::{
 };
 
 // Common types used across modules
-
-// Type aliases for compatibility
-pub type ConsensusEngine = CommitRevealConsensus;
 pub type NodeId = String;
-
-/// Create new consensus engine
-pub fn create_consensus_engine(node_id: String) -> ConsensusEngine {
-    let config = ConsensusConfig::default();
-    CommitRevealConsensus::new(node_id, config)
-}
-
-/// Create new node reputation manager
-pub fn create_reputation_manager() -> NodeReputation {
-    let config = ReputationConfig::default();
-    NodeReputation::new(config)
-}
-
-/// Create new Kademlia DHT instance (async wrapper)
-pub async fn create_kademlia_dht(addr: String, port: u16) -> Result<KademliaDht, Box<dyn std::error::Error>> {
-    KademliaDht::new(addr, port).await
-}
 
 // ============================================================================
 // Unit Tests
@@ -79,91 +50,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_consensus_engine_creation() {
-        // Engine instantiation must succeed without panicking. The
-        // value is opaque (no `get_current_round` accessor on the
-        // canonical engine type), so we only assert via
-        // `mem::size_of_val` that an instance was actually built.
-        let engine = create_consensus_engine("test_node_001".to_string());
-        assert!(std::mem::size_of_val(&engine) > 0);
-    }
-
-    #[test]
-    fn test_reputation_manager_creation() {
-        let manager = create_reputation_manager();
-        // New manager should have no nodes registered
-        let rep = manager.get_reputation("nonexistent_node");
-        // Default reputation should be returned for unknown nodes
-        assert!(rep >= 0.0 && rep <= 100.0);
-    }
-
-
-    #[test]
-    fn test_node_id_generation() {
-        // The canonical `generate_node_id` is a parameterless
-        // randomness-source — every call returns a fresh 32-byte
-        // identifier. The test verifies (a) two calls return distinct
-        // ids (uniqueness with overwhelming probability) and (b) the
-        // id is the expected 32-byte width.
-        let id1 = generate_node_id();
-        let id2 = generate_node_id();
-        assert_ne!(id1, id2, "successive ids must differ");
-        // NodeId is the kademlia 256-bit type; sanity-check its size.
-        assert!(std::mem::size_of_val(&id1) > 0);
-    }
-
-    #[test]
-    fn test_consensus_config_default() {
-        let config = ConsensusConfig::default();
-
-        // Verify sensible defaults using the actual canonical fields
-        // (`commit_phase_duration`, `reveal_phase_duration`,
-        // `min_participants`, `max_participants`,
-        // `max_validators_per_round`).
-        assert!(config.min_participants > 0);
-        assert!(config.max_participants >= config.min_participants);
-        assert!(config.commit_phase_duration.as_secs() > 0);
-        assert!(config.reveal_phase_duration.as_secs() > 0);
-        // The 1000-validator sampling cap matches the global runtime
-        // constant — sampling is the safety floor for scaling beyond
-        // the active-committee budget on networks with thousands of
-        // Super nodes.
-        assert!(config.max_validators_per_round > 0);
-    }
-
-    #[test]
-    fn test_reputation_bounds() {
-        let config = ReputationConfig::default();
-        let manager = NodeReputation::new(config);
-
-        // Test reputation bounds using the actual canonical accessor.
-        // `get_reputation` returns the configured default for unknown
-        // nodes (typically the `initial_reputation` from config).
-        let rep = manager.get_reputation("new_node");
-        assert!(rep >= 0.0, "Reputation should not be negative");
-        assert!(rep <= 100.0, "Reputation should not exceed 100");
-    }
-
-    #[test]
-    fn test_malicious_behavior_penalty() {
-        let config = ReputationConfig::default();
-        let mut manager = NodeReputation::new(config);
-
-        // Set a known starting reputation via the canonical
-        // `update_reputation` (positive delta lifts the node above
-        // the default).
-        manager.update_reputation("test_node", 10.0);
-        let initial_rep = manager.get_reputation("test_node");
-        assert!(initial_rep > 0.0);
-
-        // Apply a punitive delta that mirrors a malicious-behavior
-        // penalty.
-        manager.update_reputation("test_node", -25.0);
-        let after_rep = manager.get_reputation("test_node");
-
-        assert!(after_rep < initial_rep,
-                "Negative reputation delta must decrease score: {} → {}",
-                initial_rep, after_rep);
+    fn test_consensus_reputation_is_binary() {
+        // The floor a node starts at and the gate that admits it to consensus are the SAME
+        // value: reputation is {INITIAL_REPUTATION | 0}, never a graduated score.
+        assert_eq!(INITIAL_REPUTATION, MIN_CONSENSUS_REPUTATION);
+        assert!(INITIAL_REPUTATION >= MIN_CONSENSUS_REPUTATION);
+        assert!(0.0 < MIN_CONSENSUS_REPUTATION);
     }
 
     #[test]

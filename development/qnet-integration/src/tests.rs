@@ -133,12 +133,11 @@ pub const API_ENDPOINTS: &[(&str, &str)] = &[
     // Gas
     ("GET", "/api/v1/gas/recommendations"),
     
-    // ShredProtocol metrics
-    ("GET", "/api/v1/turbine/metrics"),
-    ("GET", "/api/v1/sealevel/metrics"),
+    // Execution and BFT timing
+    ("GET", "/api/v1/parallel-executor/metrics"),
     ("GET", "/api/v1/pre-execution/status"),
-    ("GET", "/api/v1/tower-bft/timeouts"),
-    
+    ("GET", "/api/v1/adaptive-bft/timeouts"),
+
     // Health
     ("GET", "/health"),
 ];

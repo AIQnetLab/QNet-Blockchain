@@ -100,18 +100,19 @@ pub async fn run_preflight_checks(external_ip: Option<&str>) -> Result<Preflight
                 ip
             }
             Err(e) => {
-                println!("   ⚠️ Could not detect external IP: {}", e);
-                println!("   ℹ️ Skipping external connectivity checks");
-                
+                // Returning passed:true here printed "[INFO][PREFLIGHT] passed" while phases 3-6
+                // never ran — a false all-clear. Report the real coverage instead; the caller
+                // decides, and the operator sees which phases were skipped.
+                println!("[WARN][PREFLIGHT] external_ip_undetected err={} skipped=phases_3_6", e);
+
                 checks.push(CheckResult {
                     name: "External IP Detection".to_string(),
                     passed: false,
                     message: e.clone(),
                 });
-                
-                // Not critical - continue without external checks
+
                 return Ok(PreflightResult {
-                    passed: true,
+                    passed: false,
                     checks,
                     critical_failures: vec![],
                 });

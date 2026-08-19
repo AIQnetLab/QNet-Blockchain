@@ -62,12 +62,13 @@ pub struct MicroBlock {
     
     // ═══════════════════════════════════════════════════════════════════════════
     // v4.0: DILITHIUM3-VRF OUTPUT + PROOF (dual purpose)
-    // 1. Secret Leader Election: VRF(wallet_sk, slot_seed) → election proof
+    // 1. Leader election proof: the schedule itself is a PUBLIC deterministic hash of
+    //    on-chain inputs; this VRF output only proves the named leader signed its slot.
     // 2. Quantum Randomness Beacon (QRB): accumulated for epoch randomness
     // ═══════════════════════════════════════════════════════════════════════════
     
     /// VRF output: SHA3-256(Dilithium3_detached_sign(sk, slot_seed)) = 32 bytes
-    /// Used for: leader election verification + QRB randomness accumulation
+    /// Used for: leader-slot proof verification + QRB randomness accumulation
     #[serde(default)]
     pub vrf_output: Option<[u8; 32]>,
     
@@ -153,7 +154,7 @@ pub struct MacroBlock {
     pub micro_blocks: Vec<[u8; 32]>,
     /// State root after applying all microblocks
     pub state_root: [u8; 32],
-    /// Consensus data (commit-reveal)
+    /// Consensus data for this macroblock
     pub consensus_data: ConsensusData,
     /// Previous macroblock hash
     pub previous_hash: [u8; 32],
@@ -275,7 +276,7 @@ pub struct ConsensusData {
 
     /// Committee members selected for this MacroBlock's BFT consensus
     /// When total validators > COMMITTEE_THRESHOLD, a VRF-subsampled committee
-    /// of COMMITTEE_SIZE nodes handles commit-reveal. Other nodes accept the result.
+    /// of COMMITTEE_SIZE nodes certifies the checkpoint. Other nodes accept the result.
     /// Format: sorted Vec<String> of node_ids
     #[serde(default)]
     pub consensus_committee: Option<Vec<String>>,
@@ -333,7 +334,7 @@ pub struct ConsensusData {
     // Snapshot binding for trustless bootstrap: SHA3-256 of the canonical
     // snapshot bytes at a snapshot-boundary macroblock. Identical across the
     // committee (deterministic apply-stage materialisation + canonical key
-    // ordering) and implicitly endorsed by the 2f+1 commit-reveal that
+    // ordering) and implicitly endorsed by the n−f checkpoint QC that
     // finalises the macroblock. A bootstrapping node computes the digest
     // locally and accepts the downloaded snapshot only when it matches.
     /// SHA3-256 digest of the canonical snapshot artefact at this macroblock's
@@ -343,7 +344,7 @@ pub struct ConsensusData {
     pub snapshot_root: Option<[u8; 32]>,
 
     /// v32.10: SHA3-256 of the canonical SnapshotManifest bytes at the same
-    /// boundary. Bound by the same 2f+1 commit-reveal as snapshot_root.
+    /// boundary. Bound by the same checkpoint QC as snapshot_root.
     /// Joiner verifies downloaded manifest matches this BEFORE chunk fetch —
     /// rejects byzantine manifest early, saves bandwidth.
     #[serde(default)]
@@ -1115,44 +1116,6 @@ impl MacroBlock {
         hash
     }
     
-    /// Validate macroblock
-    pub fn validate(&self) -> Result<(), StateError> {
-        // Check timestamp
-        if self.timestamp == 0 {
-            return Err(StateError::InvalidBlock("Invalid timestamp".to_string()));
-        }
-
-        // Check microblock count (should be ~90 for 90 seconds)
-        if self.micro_blocks.is_empty() || self.micro_blocks.len() > 100 {
-            return Err(StateError::InvalidBlock("Invalid microblock count".to_string()));
-        }
-
-        // ═══════════════════════════════════════════════════════════════════════
-        // SKIP-MARKER MACROBLOCK VALIDATION (v15.7)
-        // ═══════════════════════════════════════════════════════════════════════
-        // Skip-marker macroblocks substitute the commit-reveal evidence with a
-        // 2f+1-signed AggregatedTimeoutCertificate carried in `skip_certificate`,
-        // so the standard "≥3 reveals" check does not apply. The certificate
-        // itself must be present at this layer; cryptographic verification of
-        // its signatures and certified-round threshold is performed in the
-        // network layer (`SimplifiedP2P::verify_skip_certificate_bytes`)
-        // because that is where the active validator set is available.
-        if self.consensus_data.is_skip_marker {
-            if self.consensus_data.skip_certificate.is_none() {
-                return Err(StateError::InvalidBlock(
-                    "skip_marker_macroblock_missing_skip_certificate".to_string(),
-                ));
-            }
-            return Ok(());
-        }
-
-        // Verify consensus data has enough participants
-        if self.consensus_data.reveals.len() < 3 {
-            return Err(StateError::InvalidBlock("Insufficient consensus participants".to_string()));
-        }
-
-        Ok(())
-    }
 }
 
 #[cfg(test)]

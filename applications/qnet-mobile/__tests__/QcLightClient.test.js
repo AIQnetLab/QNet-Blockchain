@@ -118,3 +118,164 @@ test('checkpointHash is stable for ordinary in-range supplies', () => {
   const v = '251432340000000';
   expect(checkpointHash(cpWith(v))).toEqual(checkpointHash(cpWith(Number(v))));
 });
+
+// ── recovery anchor on device ──────────────────────────────────────────────
+// The device applies the NODE's rule: a checkpoint carrying a recovery anchor is refused outright,
+// and the bar a certificate must meet is always the strict quorum. Accepting a relaxed certificate
+// would confirm a balance the chain never finalized — a verifying client that accepts what the
+// network rejects is worse than a trusting one.
+const { checkpointContentDigest, checkpointQuorum } = require('../src/crypto/QcLightClient');
+
+function anchorCp(overrides) {
+  return Object.assign({
+    index: 17, parent_qc: null, window_head_height: 4 * 90,
+    window_mb_hashes: [], state_root: '01'.repeat(32), beacon: '02'.repeat(32),
+    epoch_commitment: '03'.repeat(32), reward_root: '00'.repeat(32),
+    registry_root: '00'.repeat(32), logs_root: '00'.repeat(32),
+    dilithium_pk_root: '00'.repeat(32), reward_epoch_root: '00'.repeat(32),
+    total_supply: '0', timestamp: 0, proposer: 'cs_0000', recovery_anchor: null,
+  }, overrides || {});
+}
+
+test('content digest excludes the consensus position and the anchor', () => {
+  const base = anchorCp();
+  // A legal re-proposal of one window at a new index by another member digests IDENTICALLY: the
+  // digest names WHAT a checkpoint commits, never where in the round order it sat.
+  expect(checkpointContentDigest(anchorCp({ index: 25, proposer: 'cs_0003' })))
+    .toEqual(checkpointContentDigest(base));
+  // The anchor is outside it too — carrying one changes a checkpoint's admissibility, not its content.
+  expect(checkpointContentDigest(anchorCp({ recovery_anchor: [3, 'ab'.repeat(32)] })))
+    .toEqual(checkpointContentDigest(base));
+  expect(checkpointContentDigest(anchorCp({ state_root: 'ff'.repeat(32) })))
+    .not.toEqual(checkpointContentDigest(base));
+});
+
+// CROSS-LANGUAGE PARITY VECTOR for checkpointContentDigest and checkpointHash. The same checkpoints
+// and the same hex strings are pinned in core/qnet-consensus/src/checkpoint_bft.rs
+// (checkpoint_hash_matches_the_mobile_client_byte_for_byte). checkpointHash is the QC vote preimage:
+// a drift in field order, the anchor tag byte, the length prefix on window_mb_hashes or u64
+// endianness makes the device reject every honest checkpoint, with the chain running happily.
+const KAT = {
+  index: 4,
+  parent_qc: { index: 3, checkpoint_hash: '02'.repeat(32) },
+  window_head_height: 120,
+  window_mb_hashes: ['01'.repeat(32)],
+  state_root: '03'.repeat(32), beacon: '04'.repeat(32), epoch_commitment: '05'.repeat(32),
+  reward_root: '00'.repeat(32), registry_root: '00'.repeat(32), logs_root: '00'.repeat(32),
+  dilithium_pk_root: '00'.repeat(32), reward_epoch_root: '00'.repeat(32),
+  total_supply: 7, timestamp: 11, proposer: 'n1', recovery_anchor: null,
+};
+
+test('checkpoint digests match the Rust vectors byte for byte', () => {
+  const pinned  = Object.assign({}, KAT, { recovery_anchor: [2, '08'.repeat(32)] });
+  const zeroPin = Object.assign({}, KAT, { recovery_anchor: [0, '00'.repeat(32)] });
+
+  // The anchor is NOT in the content digest, so all three digest identically. It IS in the hash,
+  // which the QC signatures cover — which is why the device must fold it to check any signature.
+  expect(checkpointContentDigest(KAT))
+    .toEqual('5b9d0304967b92246400630f54df59d6ee2ae7388aa8cf0b7c25dd8d7360eba1');
+  expect(checkpointContentDigest(pinned)).toEqual(checkpointContentDigest(KAT));
+  expect(checkpointContentDigest(zeroPin)).toEqual(checkpointContentDigest(KAT));
+
+  expect(checkpointHash(KAT))
+    .toEqual('13fe6687b356572863ca25a3d0c225a30b904a03f5fed4a8574b22a80bf29be7');
+  expect(checkpointHash(pinned))
+    .toEqual('acc2f0a5102a91fc013b9e6f023ba77aa4843a2f056a2d97aa57ea1302993474');
+  expect(checkpointHash(zeroPin))
+    .toEqual('8a463e680bb577b1ffb0569f2f4576bae6d23d7a1b2a92fa7e5e6c9428bf14f7');
+});
+
+test('the bar is the strict quorum, and an anchored checkpoint has no bar at all', () => {
+  const committee = Array.from({ length: 12 }, (_, i) => 'cs_' + String(i).padStart(4, '0'));
+  expect(checkpointQuorum(anchorCp(), committee)).toEqual(quorumSize(committee.length));
+  // n/2+1 was the old relaxed bar; nothing on the wire may select it any more.
+  expect(checkpointQuorum(anchorCp(), committee)).toBeGreaterThan(committee.length / 2 + 1);
+  // Any anchor refuses — well-formed or not. The device does not judge the pin, it rejects the
+  // checkpoint, which is what every full node does.
+  expect(checkpointQuorum(anchorCp({ recovery_anchor: [4, 'ab'.repeat(32)] }), committee)).toBeNull();
+  expect(checkpointQuorum(anchorCp({ recovery_anchor: [0, '00'.repeat(32)] }), committee)).toBeNull();
+});
+
+// ── the refusal, end to end ────────────────────────────────────────────────
+// A malicious server serving a well-formed, fully-signed checkpoint that carries a recovery anchor
+// must not confirm a state_root. This is the finding: the chain rejects such a macroblock outright,
+// so a device that accepted it would show a balance the network never finalized.
+const {
+  verifyMacroblockStateRoot, clearQcCache, epochCommitment,
+} = require('../src/crypto/QcLightClient');
+const { GENESIS_NODE_IDS } = require('../src/config/genesisConsensus');
+const { verifyDilithium } = require('../src/crypto/DilithiumCrypto');
+
+// bincode Vec<EligibleProducer>: u64le count, then per entry u64le len ++ utf8 id ++ u32le reputation.
+function eligibleRawHex(ids) {
+  const head = Buffer.alloc(8);
+  head.writeBigUInt64LE(BigInt(ids.length));
+  const parts = [head];
+  for (const id of ids) {
+    const l = Buffer.alloc(8); l.writeBigUInt64LE(BigInt(id.length));
+    const r = Buffer.alloc(4); r.writeUInt32LE(7000);
+    parts.push(l, Buffer.from(id, 'utf8'), r);
+  }
+  return Buffer.concat(parts).toString('hex');
+}
+
+// "dilithium_sig_<id>_<b64>" where b64 = u32le(len) ++ [3309-byte detached sig][msg].
+function wireSig(nodeId) {
+  const sig = Buffer.alloc(3309, 7);
+  const len = Buffer.alloc(4); len.writeUInt32LE(sig.length);
+  return 'dilithium_sig_' + nodeId + '_' + Buffer.concat([len, sig]).toString('base64');
+}
+
+const GENESIS_STATE_ROOT = 'aa'.repeat(32);
+const ELIGIBLE_HEX = eligibleRawHex(GENESIS_NODE_IDS);
+
+// Macroblock 2 sits in the genesis era, so the committee and its pubkeys are binary-pinned and the
+// walk needs no served registry — the smallest proof that reaches the QC gate.
+function genesisProof(recoveryAnchor) {
+  const cp = {
+    index: 2, parent_qc: null, window_head_height: 180, window_mb_hashes: [],
+    state_root: GENESIS_STATE_ROOT, beacon: 'bb'.repeat(32),
+    epoch_commitment: epochCommitment(Buffer.from(ELIGIBLE_HEX, 'hex'), GENESIS_NODE_IDS, []),
+    reward_root: '00'.repeat(32), registry_root: '00'.repeat(32), logs_root: '00'.repeat(32),
+    dilithium_pk_root: '00'.repeat(32), reward_epoch_root: '00'.repeat(32),
+    total_supply: '0', timestamp: 0, proposer: 'genesis_node_001',
+    recovery_anchor: recoveryAnchor || null,
+  };
+  const signers = GENESIS_NODE_IDS.slice(0, quorumSize(GENESIS_NODE_IDS.length));
+  return {
+    index: 2, checkpoint: cp, eligible_raw: ELIGIBLE_HEX, banned: [],
+    qc: { signers, sigs: signers.map(wireSig) },
+  };
+}
+
+function serve(proof) {
+  global.fetch = jest.fn(async () => ({ ok: true, json: async () => proof }));
+  return () => 'http://server';
+}
+
+beforeEach(() => {
+  clearQcCache();
+  verifyDilithium.mockReset();
+  verifyDilithium.mockResolvedValue(true); // every served signature is genuine
+});
+
+test('an honest genesis-era macroblock certifies its state_root', async () => {
+  const boot = serve(genesisProof(null));
+  await expect(verifyMacroblockStateRoot(GENESIS_STATE_ROOT, 180, boot)).resolves.toBe(true);
+  expect(verifyDilithium).toHaveBeenCalled();
+});
+
+test('refuses an anchored checkpoint even when every committee signature verifies', async () => {
+  const boot = serve(genesisProof([1, '08'.repeat(32)]));
+  await expect(verifyMacroblockStateRoot(GENESIS_STATE_ROOT, 180, boot)).resolves.toBe(false);
+  // Refused on the anchor alone: no signature is ever opened, so no signer count can rescue it.
+  expect(verifyDilithium).not.toHaveBeenCalled();
+});
+
+test('refuses an anchored checkpoint signed by the WHOLE committee', async () => {
+  const proof = genesisProof([1, '08'.repeat(32)]);
+  proof.qc.signers = GENESIS_NODE_IDS.slice();
+  proof.qc.sigs = proof.qc.signers.map(wireSig);
+  const boot = serve(proof);
+  await expect(verifyMacroblockStateRoot(GENESIS_STATE_ROOT, 180, boot)).resolves.toBe(false);
+});

@@ -205,7 +205,7 @@ impl PyTransaction {
             public_key: None,
             dilithium_signature: None,
             dilithium_public_key: None,
-            chain_id: 0,
+            chain_id: crate::transaction::QNET_CHAIN_ID,
         };
         tx.hash = tx.calculate_hash();
         Self { inner: tx }
@@ -248,7 +248,7 @@ impl PyTransaction {
             public_key: None,
             dilithium_signature: None,
             dilithium_public_key: None,
-            chain_id: 0,
+            chain_id: crate::transaction::QNET_CHAIN_ID,
         };
         tx.hash = tx.calculate_hash();
         Self { inner: tx }

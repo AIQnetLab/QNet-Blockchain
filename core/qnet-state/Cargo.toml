@@ -11,7 +11,7 @@ name = "qnet_state"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-# Smart-contract VM (P3 apply dispatch; GATED default-OFF via WASM_VM_ENABLED)
+# Smart-contract VM — executes WASM contracts on the apply path.
 qnet-vm = { path = "../qnet-vm" }
 # Storage
 rocksdb = "0.21"

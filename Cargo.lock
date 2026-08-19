@@ -1298,7 +1298,6 @@ checksum = "70e796c081cee67dc755e1a36a0a172b897fab85fc3f6bc48307991f64e4eca9"
 dependencies = [
  "curve25519-dalek",
  "ed25519",
- "merlin",
  "rand_core 0.6.4",
  "serde",
  "sha2",
@@ -2361,18 +2360,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "merlin"
-version = "3.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "58c38e2799fc0978b65dfff8023ec7843e2330bb462f19198840b34b6582397d"
-dependencies = [
- "byteorder",
- "keccak",
- "rand_core 0.6.4",
- "zeroize",
-]
-
-[[package]]
 name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3151,18 +3138,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pyo3-asyncio"
-version = "0.20.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6ea6b68e93db3622f3bb3bf363246cf948ed5375afe7abff98ccbdd50b184995"
-dependencies = [
- "futures",
- "once_cell",
- "pin-project-lite",
- "pyo3",
-]
-
-[[package]]
 name = "pyo3-build-config"
 version = "0.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3249,7 +3224,6 @@ dependencies = [
  "blake3",
  "bytes",
  "chrono",
- "criterion",
  "crossbeam",
  "dashmap",
  "ed25519-dalek",
@@ -3262,8 +3236,6 @@ dependencies = [
  "pqcrypto-traits",
  "prometheus",
  "proptest",
- "pyo3",
- "pyo3-asyncio",
  "qnet-state",
  "rand 0.8.5",
  "rayon",

@@ -310,24 +310,68 @@ mod kat {
         println!("---8<--- GENESIS_CONSENSUS_PKS END ---8<---");
     }
 
-    /// Pre-launch identity linkage gate (#[ignore]d, mnemonics from env — no
-    /// secrets in repo). Proves GENESIS_WALLETS[i] and GENESIS_CONSENSUS_PKS[i]
-    /// come from the SAME seed i: derives BOTH the consensus PK (block-signing
-    /// domain) and the wallet eon (reward/claim domain) from each mnemonic and
-    /// asserts each equals its committed constant. A pass means a genesis
-    /// operator importing seed i sees exactly GENESIS_WALLETS[i] in the app and
-    /// the node credits rewards there. MUST be run green before any fresh launch:
-    ///   QNET_GEN_SEED_001..005=".." cargo test -p qnet-integration \
-    ///     verify_genesis_identity_linkage -- --ignored --nocapture
+    /// Shape of the two committed genesis tables, checked on every run: five aligned entries, each
+    /// consensus PK a 1952-byte ML-DSA-65 key, each wallet a well-formed distinct eon address.
+    /// Catches a corrupted or half-edited table without needing any seed.
     #[test]
-    #[ignore]
+    fn genesis_constant_tables_are_well_formed() {
+        use crate::genesis_constants::{GENESIS_CONSENSUS_PKS, GENESIS_WALLETS};
+        const IDS: [&str; 5] = ["001", "002", "003", "004", "005"];
+        assert_eq!(GENESIS_CONSENSUS_PKS.len(), IDS.len());
+        assert_eq!(GENESIS_WALLETS.len(), IDS.len());
+        for (idx, id) in IDS.iter().enumerate() {
+            assert_eq!(GENESIS_CONSENSUS_PKS[idx].0, format!("genesis_node_{}", id));
+            assert_eq!(GENESIS_WALLETS[idx].0, *id);
+            let pk = hex::decode(GENESIS_CONSENSUS_PKS[idx].1).expect("consensus pk must be hex");
+            assert_eq!(pk.len(), MLDSA65_PK_LEN, "consensus pk size for {}", id);
+            let w = GENESIS_WALLETS[idx].1;
+            assert_eq!(w.len(), 45, "eon length for {}", id);
+            assert_eq!(&w[19..22], "eon", "positional eon tag for {}", id);
+        }
+        for i in 0..IDS.len() {
+            for j in (i + 1)..IDS.len() {
+                assert_ne!(GENESIS_CONSENSUS_PKS[i].1, GENESIS_CONSENSUS_PKS[j].1, "duplicate pk");
+                assert_ne!(GENESIS_WALLETS[i].1, GENESIS_WALLETS[j].1, "duplicate wallet");
+            }
+        }
+    }
+
+    /// Pre-launch identity linkage gate. Proves GENESIS_WALLETS[i] and
+    /// GENESIS_CONSENSUS_PKS[i] come from the SAME seed i: derives BOTH the
+    /// consensus PK (block-signing domain) and the wallet eon (reward/claim
+    /// domain) from each mnemonic and asserts each equals its committed
+    /// constant. A pass means a genesis operator importing seed i sees exactly
+    /// GENESIS_WALLETS[i] in the app and the node credits rewards there.
+    ///
+    /// Runs in the ordinary suite — no `--ignored` — and needs the five genesis
+    /// mnemonics, which are never in the repo. Supply them as files (preferred,
+    /// mode 0600) or as env vars, then run the normal command:
+    ///   QNET_GEN_SEED_001_FILE=/run/secrets/gen001 .. QNET_GEN_SEED_005_FILE=..
+    ///   cargo test -p qnet-integration --lib verify_genesis_identity_linkage -- --nocapture
+    /// With no seeds supplied it reports SKIPPED and proves nothing; with some
+    /// but not all it FAILS, because a partially-configured gate is the one that
+    /// silently passes at launch.
+    #[test]
     fn verify_genesis_identity_linkage() {
         use crate::crypto::vrf::WalletIdentity;
         use crate::genesis_constants::{GENESIS_CONSENSUS_PKS, GENESIS_WALLETS};
-        for (idx, id) in ["001", "002", "003", "004", "005"].iter().enumerate() {
-            let var = format!("QNET_GEN_SEED_{}", id);
-            let mnemonic = std::env::var(&var)
-                .unwrap_or_else(|_| panic!("missing env {}", var));
+        const IDS: [&str; 5] = ["001", "002", "003", "004", "005"];
+        let seeds: Vec<Option<String>> = IDS.iter()
+            .map(|id| crate::node::load_wallet_seed(&format!("QNET_GEN_SEED_{}", id)))
+            .collect();
+        let supplied = seeds.iter().filter(|s| s.is_some()).count();
+        if supplied == 0 {
+            println!("[WARN][GENESIS] identity_linkage_skipped reason=seeds_absent \
+                      action=set_QNET_GEN_SEED_001..005[_FILE]_before_a_fresh_launch");
+            return;
+        }
+        assert_eq!(
+            supplied, IDS.len(),
+            "partial genesis seed set ({}/{}): supply all five or none — a partial gate passes \
+             without proving the missing seeds", supplied, IDS.len()
+        );
+        for (idx, id) in IDS.iter().enumerate() {
+            let mnemonic = seeds[idx].as_deref().expect("checked above");
             let mnemonic = mnemonic.trim();
 
             // Consensus domain (block signing) — the boot-time anchor.

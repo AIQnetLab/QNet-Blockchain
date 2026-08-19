@@ -18,11 +18,26 @@ pub enum ConsensusMsg {
     Tc(TimeoutCertificate),
 }
 
+/// What a vote commits this replica to, carried with the vote so the node can make it DURABLE before
+/// the vote reaches the wire. Refusal (the engine's one-position-per-index and one-content-per-head
+/// rules) and conviction (`same_round_double_vote` / `pinned_double_vote`) must have identical scope
+/// in time: a commitment forgotten across a restart is a ban.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct VoteCommitment {
+    pub index: u64,
+    pub window_head: u64,
+    pub content_digest: Hash,
+    pub pinned: bool,
+    pub parent_index: u64,
+    pub parent_hash: Hash,
+}
+
 /// What the node must DO. The driver is pure; the node owns crypto/net/disk.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Effect {
     Propose(Checkpoint),                        // sign cp.hash() → set proposer_sig → broadcast Proposal
-    Vote { index: u64, checkpoint_hash: Hash }, // sign hash → Vote → broadcast
+    // persist `commit` (fail-closed) → sign hash → Vote → broadcast
+    Vote { index: u64, checkpoint_hash: Hash, commit: VoteCommitment },
     Timeout { index: u64, high_qc_index: u64 }, // sign timeout_bytes → Timeout → broadcast
     Relay(ConsensusMsg),                        // Qc / Tc: already complete, just broadcast
     // Proposer seals the macroblock: QC (finality) + next-epoch eligible producers + committee.
@@ -111,19 +126,27 @@ impl ConsensusDriver {
     /// believing it was recovering.
     pub fn set_recovery_span(&mut self, rc: Option<(u64, Hash, u64)>) -> bool {
         self.rc = rc;
-        self.eng.set_recovery_span(rc.map(|(_, _, i)| i));
-        let (a, _, _) = match rc { Some(x) => x, None => return true };
+        self.eng.set_recovery_span(rc.map(|(a, ah, _)| (a, ah)));
+        if rc.is_none() { return true; }
         // The window must still be inside the span — arming for a window the pin can never accept
-        // would emit checkpoints the authority rejects. The INDEX is not checked and no view rewind
-        // happens: the pin constrains the window only, so whatever round the engine is on is legal.
-        let per_mb = self.macro_interval / self.cp_interval;
-        let k = match self.next_window().checked_sub(a * per_mb) { Some(k) => k, None => return false };
-        if k == 0 || k > RC_SPAN_INDICES {
+        // would emit checkpoints the authority rejects. The INDEX is not checked: the pin constrains
+        // the window only, so whatever round the engine is on is legal.
+        if self.rc_step_for_window(self.next_window()).is_none() {
             self.rc = None;
             self.eng.set_recovery_span(None);
             return false;
         }
         true
+    }
+
+    /// Span step `k` for a CHECKPOINT window under the current pin, or None when the window is outside
+    /// it. The single derivation used by the arm gate, the diagnostics and — decisively — the
+    /// propose-time bound, so all three read one grid. The anchor's head is `anchor_mb * macro_interval`
+    /// by construction (`v2_rc_anchor_offboundary` rejects anything else), which is what lets the driver
+    /// evaluate the pin without holding the anchor checkpoint.
+    fn rc_step_for_window(&self, window: u64) -> Option<u64> {
+        let (a, _, _) = self.rc?;
+        recovery_step_for_head(a.checked_mul(self.macro_interval)?, window.checked_mul(self.cp_interval)?)
     }
 
     /// Do we already hold a proposal at `index`? Gates the RC arm: a second proposal at an index we
@@ -132,19 +155,10 @@ impl ConsensusDriver {
         self.proposals.keys().any(|(i, _)| *i == index)
     }
 
-    /// The pinned index this node would drive, for diagnostics.
-    pub fn rc_pinned_index(&self) -> Option<u64> {
-        let (a, _, i_a) = self.rc?;
-        let per_mb = self.macro_interval / self.cp_interval;
-        let k = self.next_window().checked_sub(a * per_mb)?;
-        if k == 0 || k > RC_SPAN_INDICES { return None; }
-        Some(i_a + k)
-    }
-
-    /// Is the pin armed? Index-independent, for the same reason as `CheckpointConsensus::relaxed_at`:
+    /// Is the pin armed? Index-independent, for the same reason as `CheckpointConsensus::is_relaxed`:
     /// the span is a range of windows, and a TimeoutCertificate breaks any index/window lockstep. The
     /// window bound is enforced at the macroblock authority, from the certificate's own bytes.
-    pub fn rc_active_for(&self, _index: u64) -> bool { self.rc.is_some() }
+    pub fn rc_armed(&self) -> bool { self.rc.is_some() }
 
     /// This node's position in the leader permutation for the CURRENT round. Under a pin the index is
     /// fixed to the window and no TC can rotate a dead leader, so members propose in rank order after
@@ -216,11 +230,20 @@ impl ConsensusDriver {
         // Seal inputs keyed by ROUND (seal_if_ready looks up by qc.index) and buffered on
         // every member so any can seal the macroblock locally on QC (all-seal).
         self.seal_data.insert(round, (eligible_producers, committee));
+        // SPAN SELF-TERMINATION, at the position we are about to SIGN — not at the position we armed
+        // for. The arm gate ran once, windows earlier; without re-deriving here a span walks past its
+        // last legal step and seals a macroblock whose pin no peer can resolve (`v2_rc_unpinned`),
+        // which is unrecoverable rather than merely stalled. Dropping the pin ends the span; this
+        // window is then proposed strictly.
+        if self.rc.is_some() && self.rc_step_for_window(window).is_none() {
+            self.rc = None;
+            self.eng.set_recovery_span(None);
+        }
         // Under a pin: any committee member may propose (no TC can rotate a dead leader while the
         // index is fixed to the window), gated by a one-shot stagger grant so exactly one member
         // normally speaks, and NOT gated by last_proposed_round — the index cannot advance, so a
         // failed attempt must be retryable or the span wedges on its first vote split.
-        let pinned = self.rc_active_for(round);
+        let pinned = self.rc_armed();
         let may_propose = if pinned {
             let grant = self.rc_propose_ok;
             self.rc_propose_ok = false;
@@ -281,6 +304,7 @@ impl ConsensusDriver {
 
     /// Handle an ALREADY-VERIFIED wire message (node checked sigs first).
     pub fn handle(&mut self, msg: &ConsensusMsg) -> Vec<Effect> {
+        let mut commit: Option<VoteCommitment> = None;
         let acts = match msg {
             ConsensusMsg::Proposal(cp) => {
                 // Contiguity invariant: a checkpoint's head MUST be the CONTIGUOUS next window (build_proposal
@@ -294,11 +318,28 @@ impl ConsensusDriver {
                 if cp.window_head_height != self.next_window().saturating_mul(self.cp_interval) {
                     return Vec::new();
                 }
+                // A pinned proposal must satisfy the POSITIONAL clauses the macroblock authority
+                // re-derives from the certificate's own bytes (`resolve_recovery_pin`): the head on
+                // the span grid, and a strictly-lower parent link. Without this mirror an armed node
+                // votes for an off-grid pin, adopts the relaxed QC, advances its finality marker —
+                // and can then never seal that window, because the authority refuses the same pin.
+                if cp.recovery_anchor.is_some() {
+                    let step_ok = self.rc_step_for_window(cp.window_head_height / self.cp_interval).is_some();
+                    let parent_ok = cp.parent_qc.as_ref().map(|p| p.index < cp.index).unwrap_or(false);
+                    if !step_ok || !parent_ok { return Vec::new(); }
+                }
                 let ph = cp.parent_qc.as_ref().map(|q| q.checkpoint_hash).unwrap_or(self.genesis_hash);
                 self.heads.insert(cp.index, cp.window_head_height);
                 self.state_roots.insert(cp.index, cp.state_root);
                 self.mb_hashes.insert(cp.index, cp.window_mb_hashes.clone());
                 self.proposals.insert((cp.index, cp.hash()), cp.clone());
+                let (pi, phh) = cp.parent_qc.as_ref().map(|q| (q.index, q.checkpoint_hash))
+                    .unwrap_or((0, [0u8; 32]));
+                commit = Some(VoteCommitment {
+                    index: cp.index, window_head: cp.window_head_height,
+                    content_digest: checkpoint_content_digest(cp),
+                    pinned: cp.recovery_anchor.is_some(), parent_index: pi, parent_hash: phh,
+                });
                 self.eng.on_proposal(cp, &ph)
             }
             ConsensusMsg::Vote(v) => {
@@ -342,10 +383,24 @@ impl ConsensusDriver {
             ConsensusMsg::Tc(tc) => self.eng.on_timeout_cert(tc),
         };
         let mut out = self.translate(acts);
+        if let Some(c) = commit {
+            for e in out.iter_mut() {
+                if let Effect::Vote { commit, .. } = e { *commit = c.clone(); }
+            }
+        }
         // Seal also on a QC the node ADOPTED from a relay (didn't form locally): otherwise
         // the macroblock body is never written whenever the QC forms on another node first.
         if let ConsensusMsg::Qc(qc) = msg { out.extend(self.seal_if_ready(qc)); }
         out
+    }
+
+    /// Reload the vote commitments this node persisted before releasing those votes. Called once at
+    /// startup, before any inbound message is handled.
+    pub fn restore_vote_commitments(&mut self, recs: &[VoteCommitment]) {
+        for r in recs {
+            self.eng.restore_vote(r.index, r.window_head, r.content_digest, r.pinned,
+                                  r.parent_index, r.parent_hash);
+        }
     }
 
     /// Emit Persist for `qc`'s checkpoint once (deduped). Every committee member seals
@@ -371,7 +426,10 @@ impl ConsensusDriver {
         let mut out = Vec::new();
         for a in actions {
             match a {
-                Action::Vote(v) => out.push(Effect::Vote { index: v.index, checkpoint_hash: v.checkpoint_hash }),
+                // `commit` is filled by `handle` from the proposal that produced this vote — the only
+                // place that holds it. A Vote can be produced by nothing else.
+                Action::Vote(v) => out.push(Effect::Vote {
+                    index: v.index, checkpoint_hash: v.checkpoint_hash, commit: VoteCommitment::default() }),
                 Action::FormedQc(qc) => {
                     out.extend(self.seal_if_ready(&qc));
                     out.push(Effect::Relay(ConsensusMsg::Qc(qc)));
@@ -405,7 +463,17 @@ impl ConsensusDriver {
     /// served by §4.5 macroblock sync, never a wedge. Called at the end of `translate` — the single
     /// funnel run after every engine step. No-op below the retention window (early boot).
     fn prune(&mut self) {
-        let floor = self.eng.committed_index.saturating_sub(CONSENSUS_STATE_RETAIN);
+        // Anchored to the VIEW, not to the commit. A content-divergence halt keeps forming
+        // TimeoutCertificates, so `current_index` advances every view while `committed_index` is
+        // frozen — a commit-derived floor never moves and these maps grow for the whole outage. Every
+        // reader here (next_window's high_qc head, refresh_high_window, Commit's Finalize inputs,
+        // seal_if_ready) touches the round being driven or its parent; `next_window` additionally
+        // falls back to the monotone `high_window` high-water mark when the head is gone, so an
+        // evicted head cannot lower it. In the happy path committed_index tracks the view, so this is
+        // the same retention as before.
+        let floor = self.eng.current_index.saturating_sub(CONSENSUS_STATE_RETAIN);
+        let commit_floor = self.eng.committed_index.saturating_sub(CONSENSUS_STATE_RETAIN);
+        self.eng.prune_below(floor, commit_floor);
         if floor == 0 { return; }
         self.proposals.retain(|(idx, _), _| *idx >= floor);
         self.heads.retain(|idx, _| *idx >= floor);
@@ -417,7 +485,6 @@ impl ConsensusDriver {
         // existing macroblock), so dropping the dedup entry costs at most one no-op write.
         let win_floor = floor.saturating_mul(self.cp_interval) / self.macro_interval;
         self.sealed.retain(|w| *w >= win_floor);
-        self.eng.prune_below(floor);
     }
 }
 
@@ -437,7 +504,7 @@ mod tests {
     fn exec(n: &mut Node, e: Effect) -> Vec<ConsensusMsg> {
         match e {
             Effect::Propose(mut cp) => { cp.proposer_sig = sign(&n.id, &cp.hash()); vec![ConsensusMsg::Proposal(cp)] }
-            Effect::Vote { index, checkpoint_hash } => vec![ConsensusMsg::Vote(Vote {
+            Effect::Vote { index, checkpoint_hash, .. } => vec![ConsensusMsg::Vote(Vote {
                 checkpoint_hash, index, voter: n.id.clone(), signature: sign(&n.id, &checkpoint_hash),
             })],
             Effect::Timeout { index, high_qc_index } => vec![ConsensusMsg::Timeout(TimeoutMsg {
@@ -951,8 +1018,9 @@ mod tests {
             d.sealed.insert(i);
         }
         d.eng.committed_index = total;
+        d.eng.current_index = total + 1;
         d.prune();
-        let floor = total - CONSENSUS_STATE_RETAIN; // 10
+        let floor = total + 1 - CONSENSUS_STATE_RETAIN; // 11
         assert!(d.heads.keys().all(|k| *k >= floor), "heads pruned below floor");
         assert!(d.proposals.keys().all(|(idx, _)| *idx >= floor), "proposals pruned below floor");
         assert!(d.state_roots.keys().all(|k| *k >= floor), "state_roots pruned below floor");
@@ -960,6 +1028,32 @@ mod tests {
         assert!(d.sealed.iter().all(|w| *w >= floor), "sealed windows pruned below floor");
         assert!(d.heads.len() <= CONSENSUS_STATE_RETAIN as usize + 1, "bounded, not O(chain length)");
         assert_eq!(d.eng.committed_index, total, "prune never regresses committed_index");
+    }
+
+    // The halt this chain actually hits: TimeoutCertificates keep forming, so the VIEW advances every
+    // 4 s while `committed_index` is frozen by the content divergence. Retention must still bound the
+    // driver's maps — a commit-derived floor would never move and the node would OOM during the very
+    // outage it has to survive.
+    #[test]
+    fn prune_bounds_driver_maps_while_the_commit_is_frozen() {
+        let c: Vec<NodeId> = (0..4).map(|i| format!("n{}", i)).collect();
+        let mut d = ConsensusDriver::new("n0".into(), c.clone(), [7u8; 32]);
+        d.set_intervals(90, 90);
+        // 2000 views, no commit — 15x the retention window.
+        for i in 1..=2000u64 {
+            d.heads.insert(i, 90);
+            d.state_roots.insert(i, [1u8; 32]);
+            d.mb_hashes.insert(i, vec![[1u8; 32]]);
+            d.seal_data.insert(i, (Vec::new(), Vec::new()));
+            d.eng.current_index = i + 1;
+            d.prune();
+        }
+        assert_eq!(d.eng.committed_index, 0, "nothing committed during the halt");
+        let bound = CONSENSUS_STATE_RETAIN as usize + 2;
+        assert!(d.heads.len() <= bound, "heads unbounded during halt: {}", d.heads.len());
+        assert!(d.state_roots.len() <= bound, "state_roots unbounded during halt: {}", d.state_roots.len());
+        assert!(d.mb_hashes.len() <= bound, "mb_hashes unbounded during halt: {}", d.mb_hashes.len());
+        assert!(d.seal_data.len() <= bound, "seal_data unbounded during halt: {}", d.seal_data.len());
     }
 
     // ============================================================================================
@@ -1071,5 +1165,141 @@ mod tests {
         let committed = nodes[0].committed;
         assert!(committed >= 3, "finality must advance under adopt, got {}", committed);
         assert!(nodes.iter().all(|n| n.committed == committed), "all nodes finalize the same height");
+    }
+
+    // ── RECOVERY SPAN, PROPOSE SIDE ──────────────────────────────────────────────────────────────
+
+    /// A driver parked at checkpoint window `w`, with production cadence (30 / 90).
+    fn rc_driver(w: u64) -> ConsensusDriver {
+        let c: Vec<NodeId> = (0..12).map(|i| format!("cs_{:04}", i)).collect();
+        let mut d = ConsensusDriver::new(c[0].clone(), c, [7u8; 32]);
+        d.high_window = w.saturating_sub(1);
+        d
+    }
+
+    fn rc_build(d: &mut ConsensusDriver, w: u64) -> Vec<Effect> {
+        let c = d.committee().to_vec();
+        d.build_proposal(w, vec![[1u8; 32]], [2u8; 32], [0u8; 32], 0, c, Vec::new(), Vec::new(),
+                         [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], 0)
+    }
+
+    // A SPAN MUST SELF-TERMINATE AT PROPOSE TIME. The arm gate runs once, windows before the proposal
+    // is built; if the bound is not re-derived from the head about to be signed, the span walks past
+    // its last legal step and seals a macroblock no peer can pin (`v2_rc_unpinned`) — unrecoverable,
+    // not merely stalled.
+    #[test]
+    fn a_span_cannot_be_proposed_past_its_bound() {
+        let a = 4u64;
+        let per_mb = MACROBLOCK_INTERVAL / CHECKPOINT_INTERVAL;   // 3 checkpoint windows per macroblock
+        let first = a * per_mb + 1;                               // k = 1
+        let last = a * per_mb + RC_SPAN_INDICES;                  // k = RC_SPAN_INDICES
+
+        // Inside the span the pin is carried on the proposal.
+        let mut d = rc_driver(first);
+        assert!(d.set_recovery_span(Some((a, [9u8; 32], 17))));
+        d.rc_grant_propose();
+        match rc_build(&mut d, first).as_slice() {
+            [Effect::Propose(cp)] => assert_eq!(cp.recovery_anchor, Some((a, [9u8; 32]))),
+            other => panic!("expected a pinned proposal, got {:?}", other),
+        }
+
+        // The last legal step still carries it...
+        let mut d = rc_driver(last);
+        assert!(d.set_recovery_span(Some((a, [9u8; 32], 17))));
+        d.rc_grant_propose();
+        match rc_build(&mut d, last).as_slice() {
+            [Effect::Propose(cp)] => assert!(cp.recovery_anchor.is_some()),
+            other => panic!("expected a pinned proposal at the last step, got {:?}", other),
+        }
+
+        // ...and one window further the pin is DROPPED rather than stretched. The span ends; whatever
+        // this node proposes from here is strict, and the global arm mirrors the drop off rc_armed.
+        let mut d = rc_driver(last + 1);
+        d.rc = Some((a, [9u8; 32], 17));
+        d.eng.set_recovery_span(Some((a, [9u8; 32])));
+        assert!(d.rc_armed());
+        let effs = rc_build(&mut d, last + 1);
+        assert!(!d.rc_armed(), "the span must self-terminate at the first out-of-bound head");
+        assert!(effs.iter().all(|e| !matches!(e, Effect::Propose(cp) if cp.recovery_anchor.is_some())),
+                "no proposal may carry a pin the authority cannot resolve");
+
+        // And arming for a window already past the span is refused outright.
+        let mut d = rc_driver(last + 1);
+        assert!(!d.set_recovery_span(Some((a, [9u8; 32], 17))));
+        assert!(!d.rc_armed());
+    }
+
+    /// The pinned checkpoint an armed member would receive at span step `k`, positioned correctly.
+    fn rc_inbound(d: &ConsensusDriver, a: u64, k: u64) -> Checkpoint {
+        let per_mb = MACROBLOCK_INTERVAL / CHECKPOINT_INTERVAL;
+        let idx = d.current_index();
+        Checkpoint {
+            index: idx,
+            parent_qc: Some(QcRef { index: idx.saturating_sub(1), checkpoint_hash: [3u8; 32] }),
+            window_head_height: (a * per_mb + k) * CHECKPOINT_INTERVAL,
+            window_mb_hashes: vec![[1u8; 32]], state_root: [2u8; 32], beacon: [0u8; 32],
+            epoch_commitment: [0u8; 32], reward_root: [0u8; 32], registry_root: [0u8; 32],
+            logs_root: [0u8; 32], dilithium_pk_root: [0u8; 32], reward_epoch_root: [0u8; 32],
+            total_supply: 0, timestamp: 0, proposer: "cs_0005".into(), proposer_sig: vec![1],
+            recovery_anchor: Some((a, [9u8; 32])),
+        }
+    }
+
+    // ── RECOVERY SPAN, VOTE SIDE ─────────────────────────────────────────────────────────────────
+
+    // The vote a pinned proposal produces must carry the commitment the node has to make DURABLE, and
+    // the driver must refuse any pinned position the macroblock authority would not resolve. Adopting
+    // a relaxed QC over an off-grid pin advances this node's finality marker for a window it can then
+    // never seal — a wedge with no way back.
+    #[test]
+    fn a_pinned_proposal_is_gated_like_the_authority_and_carries_its_commitment() {
+        let a = 4u64;
+        let per_mb = MACROBLOCK_INTERVAL / CHECKPOINT_INTERVAL;
+        let first = a * per_mb + 1;
+        let mut d = rc_driver(first);
+        assert!(d.set_recovery_span(Some((a, [9u8; 32], 17))));
+
+        // OFF THE SPAN GRID: the head is contiguous but not a span position ⇒ no vote.
+        let mut off = rc_inbound(&d, a, 1);
+        off.window_head_height += 1;
+        assert!(d.handle(&ConsensusMsg::Proposal(off)).is_empty());
+        // NO PARENT LINK: `resolve_recovery_pin` requires a strictly-lower parent ⇒ no vote.
+        let mut orphan = rc_inbound(&d, a, 1);
+        orphan.parent_qc = None;
+        assert!(d.handle(&ConsensusMsg::Proposal(orphan)).is_empty());
+
+        // A well-positioned pinned proposal votes, and the vote carries exactly what must reach disk
+        // before it reaches the wire.
+        let cp = rc_inbound(&d, a, 1);
+        match d.handle(&ConsensusMsg::Proposal(cp.clone())).as_slice() {
+            [Effect::Vote { index, checkpoint_hash, commit }] => {
+                assert_eq!(*index, cp.index);
+                assert_eq!(*checkpoint_hash, cp.hash());
+                assert_eq!(commit.window_head, cp.window_head_height);
+                assert_eq!(commit.content_digest, checkpoint_content_digest(&cp));
+                assert!(commit.pinned);
+                assert_eq!(commit.parent_index, cp.index - 1);
+            }
+            other => panic!("expected a pinned vote with its commitment, got {:?}", other),
+        }
+
+        // A RESTARTED node that reloads that commitment refuses the conflicting re-proposal its peers
+        // would convict it for; the same node without the record emits exactly that pair.
+        let mut conflict = cp.clone();
+        conflict.state_root = [0xEE; 32];
+        let commit = VoteCommitment {
+            index: cp.index, window_head: cp.window_head_height,
+            content_digest: checkpoint_content_digest(&cp), pinned: true,
+            parent_index: cp.index - 1, parent_hash: [3u8; 32],
+        };
+        let mut forgot = rc_driver(first);
+        assert!(forgot.set_recovery_span(Some((a, [9u8; 32], 17))));
+        assert!(!forgot.handle(&ConsensusMsg::Proposal(conflict.clone())).is_empty());
+
+        let mut restored = rc_driver(first);
+        restored.restore_vote_commitments(&[commit]);
+        assert!(restored.set_recovery_span(Some((a, [9u8; 32], 17))));
+        assert!(restored.handle(&ConsensusMsg::Proposal(conflict)).is_empty(),
+                "a reloaded commitment must refuse what conviction punishes");
     }
 }

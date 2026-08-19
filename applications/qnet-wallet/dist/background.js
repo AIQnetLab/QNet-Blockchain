@@ -49,13 +49,16 @@ if (typeof self !== 'undefined') {
 // NO single point of failure - random node selection from the start!
 // ============================================================================
 
-// ALL Genesis nodes (load distributed from first request!)
+// ALL Genesis nodes — the ONE list; every node fetch in this worker resolves through it.
+// Plain HTTP on the unified API port 8001: no TLS terminator is deployed, so an https:// URL
+// simply cannot connect. The transport carries public chain data + already-signed TXs — fund
+// safety rests on the ML-DSA-65 signature, not on TLS. Mirrors qnet-mobile src/config/nodes.js.
 const QNET_GENESIS_NODES = [
-    'https://154.38.160.39:8001',   // North America
-    'https://62.171.157.44:8001',   // Europe  
-    'https://161.97.86.81:8001',    // Europe
-    'https://5.189.130.160:8001',   // Europe
-    'https://162.244.25.114:8001'   // Europe
+    'http://154.38.160.39:8001',   // North America
+    'http://62.171.157.44:8001',   // Europe
+    'http://161.97.86.81:8001',    // Europe
+    'http://5.189.130.160:8001',   // Europe
+    'http://162.244.25.114:8001'   // Europe
 ];
 
 // Minimum reputation for verification nodes
@@ -318,8 +321,9 @@ async function discoverQNetHighRepNodes() {
                         peer.address.includes(':') &&
                         (peer.reputation || 0) >= QNET_MIN_REPUTATION
                     )
+                    // Peers announce host:port for the same plain-HTTP unified API as the genesis list.
                     .map(peer => ({
-                        url: `https://${peer.address}`,
+                        url: `http://${peer.address}`,
                         reputation: peer.reputation,
                         nodeType: peer.node_type
                     }))
@@ -3626,15 +3630,9 @@ class SolanaRPC {
             return this._networkSizeCache;
         }
         
-        // PRODUCTION: Real Genesis node IPs (from genesis_constants.rs)
-        const bootstrapNodes = [
-            'https://154.38.160.39:8080',   // Genesis #1 - North America
-            'https://62.171.157.44:8080',   // Genesis #2 - Europe
-            'https://161.97.86.81:8080',    // Genesis #3 - Europe
-            'https://5.189.130.160:8080',   // Genesis #4 - Europe
-            'https://162.244.25.114:8080'   // Genesis #5 - Europe
-        ];
-        
+        // The ONE genesis list — a second copy here drifted to a port the node never served.
+        const bootstrapNodes = QNET_GENESIS_NODES;
+
         // Try multiple bootstrap nodes for reliability
         for (const apiUrl of bootstrapNodes) {
             try {
@@ -6216,14 +6214,15 @@ function getQNetSigner() {
 }
 
 /**
- * Fetch the account's current on-chain nonce from the node (used as the transfer nonce). Falls back
- * to 1 if unavailable. The node re-derives and verifies the signed message against this exact nonce.
+ * Next transfer nonce = committed account nonce + 1 (the node rejects anything else:
+ * `tx.nonce != sender.nonce + 1` -> invalid_nonce). A never-used account reports 0, so its first
+ * TX is nonce 1 — which is also the fallback when the account read fails.
  */
 async function getQNetAccountNonce(nodeUrl, address) {
     try {
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), 5000);
-        const response = await fetch(`${nodeUrl}/api/v1/account/${address}/balance`, {
+        const response = await fetch(`${nodeUrl}/api/v1/account/${address}`, {
             method: 'GET',
             headers: { 'Content-Type': 'application/json' },
             signal: controller.signal
@@ -6231,7 +6230,7 @@ async function getQNetAccountNonce(nodeUrl, address) {
         clearTimeout(timeoutId);
         if (response.ok) {
             const data = await response.json();
-            if (Number.isInteger(data.nonce)) return data.nonce;
+            if (Number.isInteger(data.nonce)) return data.nonce + 1;
         }
     } catch (e) { /* fall through to default */ }
     return 1;
@@ -6255,11 +6254,11 @@ async function sendTransaction(transactionData) {
             return { signature: txHash, confirmed: true };
 
         } else {
-            // QNet transaction — pure-Dilithium signed (ML-DSA-65). No more random stub.
-            // Build the canonical transfer message the node's value-TX gate verifies, sign it with the
-            // account's ML-DSA-65 secret key via the bundle, and POST the wire-format signature + public
-            // key to /api/v1/transaction. `from` is the canonical EON address; amount is integer nano-QNC.
-            // No plaintext private key is ever transmitted.
+            // QNet transaction — pure-Dilithium signed (ML-DSA-65). Build the canonical transfer message
+            // the node's value-TX gate verifies, sign it with the account's ML-DSA-65 secret key via the
+            // bundle, and POST hex(raw 3309-byte detached sig) + hex(raw 1952-byte pubkey) to
+            // /api/v1/transaction — the node hex-decodes both and calls verify_detached_signature.
+            // `from` is the canonical EON address; amount is integer nano-QNC. No private key is ever sent.
             const { from, skHex, pkHex } = getActiveQNetKeys();
             const Q = getQNetSigner();
             const nodeUrl = await getQNetNodeUrl();
@@ -6268,8 +6267,10 @@ async function sendTransaction(transactionData) {
             if (!to || typeof to !== 'string') {
                 throw new Error('Invalid recipient address');
             }
-            const amountNano = Math.floor(Number(transactionData.amount) * 1_000_000_000); // integer nano-QNC
-            if (!Number.isFinite(amountNano) || amountNano <= 0) {
+            // Round, never floor: QNC*1e9 in binary floats lands just under the integer (0.29 ->
+            // 289999999.99999994), so floor would silently send one nano short of what the user typed.
+            const amountNano = Math.round(Number(transactionData.amount) * 1_000_000_000); // integer nano-QNC
+            if (!Number.isSafeInteger(amountNano) || amountNano <= 0) {
                 throw new Error('Invalid transaction amount');
             }
             const gasPrice = Number.isInteger(transactionData.gasPrice) ? transactionData.gasPrice : 10;
@@ -6279,7 +6280,9 @@ async function sendTransaction(transactionData) {
                 : await getQNetAccountNonce(nodeUrl, from);
 
             // Canonical message — EXACTLY the string the node re-derives and verifies against.
-            const message = `transfer:${from}:${to}:${amountNano}:${nonce}:${gasPrice}:${gasLimit}`;
+            // 'q1337|' is the chain tag; it MUST byte-match QNET_CHAIN_ID in the node
+            // (core/qnet-state/src/transaction.rs) or the signature is rejected.
+            const message = `q1337|transfer:${from}:${to}:${amountNano}:${nonce}:${gasPrice}:${gasLimit}`;
             const dilithiumSignature = Q.signQNet(message, skHex, pkHex);
 
             const controller = new AbortController();
@@ -6499,6 +6502,11 @@ async function executeSwapWithFee(swapData) {
  */
 async function getSupportedTokens(network = 'solana') {
     try {
+        // Same 1DEV mint the burn and balance paths use, so a table read and a live read can never
+        // name different tokens for the selected network.
+        const localData = await chrome.storage.local.get(['mainnet']);
+        const isMainnet = localData.mainnet === true;
+        const oneDevMint = isMainnet ? ONE_DEV_TOKEN_MINT.mainnet : ONE_DEV_TOKEN_MINT.devnet;
         // Production token configuration with real addresses
         const SUPPORTED_TOKENS = {
             solana: {
@@ -6513,7 +6521,7 @@ async function getSupportedTokens(network = 'solana') {
                     symbol: "1DEV",
                     name: "1DEV Token",
                     decimals: 6,  // 1DEV has 6 decimals
-                    mintAddress: "62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ", // Real testnet 1DEV address
+                    mintAddress: oneDevMint,
                     logoURI: "/icons/1dev-token.png"
                 },
                 USDC: {
@@ -6528,7 +6536,9 @@ async function getSupportedTokens(network = 'solana') {
                 QNC: {
                     symbol: "QNC",
                     name: "QNet Coin",
-                    decimals: 18,
+                    // nano-QNC: NANO_PER_QNC = 1e9 in core/qnet-state (transaction.rs), which is what
+                    // the send path already multiplies by. 18 rendered every balance 1e9x too large.
+                    decimals: 9,
                     address: "qnet_native_qnc",
                     logoURI: "/icons/qnc-token.png"
                 }
@@ -6900,15 +6910,9 @@ async function getNetworkSize() {
         };
     }
     
-    // PRODUCTION: Real Genesis node IPs (from genesis_constants.rs)
-    const bootstrapNodes = [
-        'https://154.38.160.39:8080',
-        'https://62.171.157.44:8080',
-        'https://161.97.86.81:8080',
-        'https://5.189.130.160:8080',
-        'https://162.244.25.114:8080'
-    ];
-    
+    // The ONE genesis list — a second copy here drifted to a port the node never served.
+    const bootstrapNodes = QNET_GENESIS_NODES;
+
     for (const apiUrl of bootstrapNodes) {
         try {
             const response = await fetch(`${apiUrl}/api/v1/network/stats`, {

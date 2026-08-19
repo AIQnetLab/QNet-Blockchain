@@ -12,7 +12,7 @@
 #![allow(dead_code)]
 #![allow(unused_mut)]
 
-//! QNet Production Node - 100k+ TPS Ready
+//! QNet production node
 //! 
 //! PRODUCTION DEPLOYMENT: Docker Environment Variables Only
 //! - Genesis: QNET_BOOTSTRAP_ID + QNET_WALLET_SEED
@@ -20,7 +20,7 @@
 //! - No interactive menu — env vars only (same architecture as genesis nodes)
 //! 
 //! Features:
-//! - Microblocks as default mode for 100k+ TPS
+//! - Microblocks as the default production mode
 //! - Production-grade batch processing
 //! - Smart synchronization and compression
 //! - Enterprise security and monitoring
@@ -256,8 +256,20 @@ use qnet_integration::genesis_constants::{GENESIS_BOOTSTRAP_CODES, GENESIS_NODE_
 const BOOTSTRAP_WHITELIST: &[&str] = GENESIS_BOOTSTRAP_CODES;
 
 // Check if this is a genesis bootstrap node
+/// Genesis detection. Memoised: the duplicate-identity scan inside performs BLOCKING TCP probes
+/// against the whole roster, and this is called from a dozen sites — on a simultaneous fresh
+/// launch, when no peer is listening yet, each uncached call cost tens of seconds of blocking I/O
+/// on the async runtime.
 fn is_genesis_bootstrap_node() -> bool {
-    println!("[DEBUG] === is_genesis_bootstrap_node() called ===");
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if let Some(v) = CACHED.get() {
+        return *v;
+    }
+    let verdict = is_genesis_bootstrap_node_uncached();
+    *CACHED.get_or_init(|| verdict)
+}
+
+fn is_genesis_bootstrap_node_uncached() -> bool {
     
     // GENESIS NODE DETECTION: First 5 nodes can start without activation code
     
@@ -538,10 +550,13 @@ async fn verify_activation_burn(code: &str, node_type: &NodeType) -> Result<(), 
     
     // Extract wallet address from code
     let wallet_address = extract_wallet_from_activation_code(code)?;
-    
-    // Required burn amount (Phase 1: 1500 1DEV universal)
-    let required_burn = 1500.0;
-    
+
+    // Phase-1 price is the live tier, read from Solana through the canonical integer formula.
+    // A hardcoded base price rejects every legitimate burn made at a reduced tier.
+    let (total_burned, current_supply) = qnet_integration::rpc::fetch_solana_1dev_supply().await
+        .map_err(|e| format!("solana_supply_unavailable: {}", e))?;
+    let required_burn = qnet_state::Transaction::phase1_activation_cost(total_burned, current_supply);
+
     // Verify burn transaction exists
     let burn_verified = verify_solana_burn_transaction(&wallet_address, required_burn).await?;
     
@@ -656,7 +671,7 @@ async fn interactive_node_setup() -> Result<(NodeType, String), Box<dyn std::err
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("🚀 Node Type: {:?} | 🔐 Post-Quantum Security: ACTIVE", node_type);
     println!("🛡️  Quantum Algorithms: CRYSTALS-Dilithium3 (ML-DSA-65) signatures + X25519Kyber768 (ML-KEM-768) hybrid TLS KEX");
-    println!("⚡ Performance Target: 100,000+ TPS | ⏱️  Block Time: 1s microblocks");
+    println!("⏱️  Block time: 1s microblocks");
     println!("🌐 Network: Production Ready | 💎 Consensus: Byzantine-BFT");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("✅ Quantum Node Ready - Blockchain Operations Starting...");
@@ -672,21 +687,6 @@ struct PricingInfo {
     network_multiplier: f64, // Phase 2: network size multiplier
 }
     
-// Check if 5 years have passed since QNet mainnet launch
-async fn is_five_years_passed_since_mainnet() -> bool {
-    // PRODUCTION v2.85: Use PhaseAwareRewardManager (real Genesis timestamp)
-    let genesis_ts = GLOBAL_GENESIS_TIMESTAMP.load(std::sync::atomic::Ordering::Relaxed);
-    if genesis_ts == 0 {
-        return false; // Genesis block not created yet
-    }
-    
-    let years_passed = years_since(genesis_ts);
-    
-    println!("📅 Time check: {} years passed since Genesis block", years_passed);
-    
-    years_passed >= 5
-}
-
 /// Whole years elapsed since the genesis timestamp. The emission schedule itself is keyed on
 /// HEIGHT (pool1_base_emission_at_height); this is only for operator-facing phase/halving display.
 fn years_since(genesis_ts: u64) -> u64 {
@@ -700,29 +700,24 @@ fn years_since(genesis_ts: u64) -> u64 {
 // Detect current phase with proper transition logic
 async fn detect_current_phase() -> (u8, PricingInfo) {
     println!("🔍 Detecting current network phase...");
-    
+
+    // The phase comes from the ONE canonical resolver every price path and every admission gate
+    // uses, which applies both halves of the rule (90% of 1DEV burned OR five years since genesis).
+    // A second local rule here would let this node skip its Phase-1 burn checks while the network is
+    // still charging for them. Unreadable supply ⇒ Phase 1, the phase that demands MORE proof.
+    let canonical_phase = qnet_integration::rpc::live_activation_pricing().await
+        .map(|p| p.phase)
+        .unwrap_or_else(|e| { println!("⚠️  Phase resolver unavailable ({}) — assuming Phase 1", e); 1 });
+
     // Try to get real data from Solana contract
     match fetch_burn_tracker_data().await {
         Ok(burn_data) => {
             println!("✅ Real blockchain data loaded");
-            
-            // Phase 2 transition logic: 90% burned OR 5 years passed (whichever comes first)
-            let five_years_passed = is_five_years_passed_since_mainnet().await;
-            
-            // CRITICAL: Automatic phase transition logic
-            let current_phase = if burn_data.burn_percentage >= 90.0 {
-                println!("🔥 PHASE TRANSITION: 90% of 1DEV burned - transitioning to Phase 2");
-                2 // Phase 2: QNC economy
-            } else if five_years_passed {
-                println!("⏰ PHASE TRANSITION: 5 years since mainnet - transitioning to Phase 2");
-                2 // Phase 2: QNC economy
-            } else {
-                println!("🔥 Phase 1 active: {:.1}% burned, {:.1} years elapsed", 
-                    burn_data.burn_percentage, 
-                    get_years_since_mainnet().await);
-                1 // Phase 1: 1DEV burn
-            };
-            
+
+            let current_phase = canonical_phase;
+            println!("🔥 Phase {} active: {:.1}% burned, {:.1} years elapsed",
+                current_phase, burn_data.burn_percentage, get_years_since_mainnet().await);
+
             let network_multiplier = calculate_network_multiplier(burn_data.total_nodes_activated);
             
             let pricing_info = PricingInfo {
@@ -739,19 +734,20 @@ async fn detect_current_phase() -> (u8, PricingInfo) {
             println!("   Error: {}", e);
             println!("   Trying backup RPC nodes...");
             
-            // Try backup RPC nodes (network-aware)
+            // Backup RPCs must stay on the network the node is configured for: only mainnet may
+            // fall back to mainnet endpoints, testnet and local both stay on devnet.
             let network_config = qnet_integration::network_config::get_network_config();
-            let backup_rpcs = if network_config.is_testnet() {
-                vec![
-                    "https://api.devnet.solana.com",
-                    "https://devnet.helius-rpc.com", 
-                    "https://solana-devnet.g.alchemy.com/v2/demo",
-                ]
-            } else {
+            let backup_rpcs = if network_config.is_production() {
                 vec![
                     "https://api.mainnet-beta.solana.com",
                     "https://solana-mainnet.g.alchemy.com/v2/demo",
                     "https://mainnet.helius-rpc.com",
+                ]
+            } else {
+                vec![
+                    "https://api.devnet.solana.com",
+                    "https://devnet.helius-rpc.com",
+                    "https://solana-devnet.g.alchemy.com/v2/demo",
                 ]
             };
             
@@ -761,19 +757,7 @@ async fn detect_current_phase() -> (u8, PricingInfo) {
                     Ok(supply_data) => {
                         println!("✅ Data retrieved from backup RPC!");
                         
-                        // Phase 2 transition logic: 90% burned OR 5 years passed
-                        let five_years_passed = is_five_years_passed_since_mainnet().await;
-                        
-                        let current_phase = if supply_data.burn_percentage >= 90.0 {
-                            println!("🔥 PHASE TRANSITION: 90% of 1DEV burned - transitioning to Phase 2");
-                            2
-                        } else if five_years_passed {
-                            println!("⏰ PHASE TRANSITION: 5 years since mainnet - transitioning to Phase 2");
-                            2
-                        } else {
-                            1
-                        };
-                        
+                        let current_phase = canonical_phase;
                         let network_multiplier = calculate_network_multiplier(supply_data.total_burned / 1500);
                         let pricing_info = PricingInfo {
                             network_size: supply_data.total_burned / 1500,
@@ -799,8 +783,8 @@ async fn detect_current_phase() -> (u8, PricingInfo) {
                 burn_percentage: 0.0,
                 network_multiplier: 0.5,
             };
-            
-            (1, fallback_pricing)
+
+            (canonical_phase, fallback_pricing)
         }
     }
 }
@@ -839,29 +823,15 @@ struct RealNodeCounts {
 
 // Fetch real data from Solana contract
 async fn fetch_burn_tracker_data() -> Result<BurnTrackerData, String> {
-    // Network-aware Solana RPC configuration
+    // Endpoint and mint come from the node's own network configuration only — an env override
+    // here would silently read a different Solana network than the burn verifier does.
     let network_config = qnet_integration::network_config::get_network_config();
-    let rpc_url = std::env::var("SOLANA_RPC_URL").unwrap_or_else(|_| {
-        network_config.solana.rpc_url.clone()
-    });
-    
-    let program_id = std::env::var("BURN_TRACKER_PROGRAM_ID").unwrap_or_else(|_| {
-        // Production program ID for 1DEV burn tracker on Solana
-        // Deployed and verified - tracks 1DEV token burns for QNet activation
-        "CCZSessk1TbWie6Ye2JX2cNEWHTEWxCwe5sLz8JaFriw".to_string()
-    });
-    
-    println!("📋 Burn Tracker Program ID: {}", program_id);
-    
-    // PRODUCTION 1DEV token mint address on Solana devnet
-    let one_dev_mint = std::env::var("ONE_DEV_MINT_ADDRESS").unwrap_or_else(|_| {
-        "62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ".to_string()
-    });
-    
-    println!("🔗 Connecting to Solana devnet RPC: {}", rpc_url);
-    println!("📋 Burn Tracker Program ID: {}", program_id);
-    println!("💰 1DEV Token Mint (devnet): {}", one_dev_mint);
-    
+    let rpc_url = network_config.solana.rpc_url.clone();
+    let one_dev_mint = network_config.solana.onedev_mint.clone();
+
+    println!("🔗 Connecting to Solana RPC: {}", rpc_url);
+    println!("💰 1DEV Token Mint: {}", one_dev_mint);
+
     // Try to get real token supply from Solana
     match get_real_token_supply(&rpc_url, &one_dev_mint).await {
         Ok(supply_data) => {
@@ -1041,13 +1011,8 @@ async fn get_real_token_supply(rpc_url: &str, token_mint: &str) -> Result<TokenS
 // This function removed - now using real network scanning instead of token burn estimation
 
 fn calculate_network_multiplier(network_size: u64) -> f64 {
-    // CANONICAL VALUES - same across all components
-    match network_size {
-        0..=100_000 => 0.5,          // ≤100K: Early adopter discount
-        100_001..=300_000 => 1.0,    // ≤300K: Base price
-        300_001..=1_000_000 => 2.0,  // ≤1M: High demand
-        _ => 3.0                     // >1M: Maximum (cap)
-    }
+    // The shared table — the same tiers the quote and the chain floor are derived from.
+    qnet_state::transaction::phase2_size_mult_tenths(network_size) as f64 / 10.0
 }
 
 #[allow(dead_code)]
@@ -1509,28 +1474,19 @@ fn check_genesis_node_duplication(bootstrap_id: &str) -> bool {
             if test_connection_quick(&addr) {
                 println!("[SECURITY] 🚨 FOUND ACTIVE GENESIS NODE at: {}", addr);
                 
-                // CRITICAL FIX: Only block if this is the SAME Genesis node ID
-                // Check if this IP belongs to our Genesis node using our mapping
-                let genesis_ip_mapping = vec![
-                    ("001", "154.38.160.39"),
-                    ("002", "62.171.157.44"),
-                    ("003", "161.97.86.81"), 
-                    ("004", "5.189.130.160"),
-                    ("005", "162.244.25.114"),
-                ];
-                
-                let mut is_our_genesis_node = false;
-                for (id, genesis_ip) in &genesis_ip_mapping {
-                    if bootstrap_id == *id && ip == *genesis_ip {
-                        println!("[SECURITY] 🔒 DUPLICATE: Found our Genesis {} running at: {}", id, addr);
-                        println!("[SECURITY] 🚨 BLOCKING: Genesis node {} already exists!", id);
-                        is_our_genesis_node = true;
-                        break;
-                    }
-                }
-                
-                if is_our_genesis_node {
-                    return true; // Duplicate of OUR Genesis node detected - block startup
+                // Block only when the responder sits at OUR OWN id's address AND we know we are
+                // not that host. Without the second condition a failed self-IP detection made the
+                // node find its own listener, declare itself a duplicate and exit — the roster is
+                // read from constants, never re-hardcoded here.
+                let our_genesis_ip = qnet_integration::genesis_constants::get_genesis_ip_by_id(bootstrap_id);
+                let responder_is_our_slot = our_genesis_ip == Some(ip.as_str());
+                let we_are_that_host = our_current_ip.as_str() == ip.as_str();
+
+                if responder_is_our_slot && !we_are_that_host {
+                    println!("[SECURITY] 🔒 DUPLICATE: Genesis {} already answering at {}", bootstrap_id, addr);
+                    return true;
+                } else if responder_is_our_slot {
+                    println!("[SECURITY] ⏭️  Service at our own address {} — this node", addr);
                 } else {
                     println!("[SECURITY] ✅ Different Genesis node active at: {} (not Genesis {})", addr, bootstrap_id);
                     println!("[SECURITY] 🔓 Continuing startup - this is a different Genesis node");
@@ -2432,6 +2388,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = std::io::stderr().flush();
     }));
 
+    // Apply QNET_LOG_LEVEL before the first log line. Without this call the level stayed pinned at
+    // the INFO default and the documented variable did nothing — at scale operators need to turn
+    // per-node volume down without rebuilding.
+    qnet_integration::node::init_logging();
+
     // Restart manifest sanity, before anything opens storage or touches the network. A malformed
     // manifest is a broken RELEASE, not a runtime condition — refuse to start rather than run a binary
     // whose restart anchor could hash-trust the wrong branch or silently bar identities.
@@ -2471,63 +2432,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     env_logger::init();
     
-    // ═══════════════════════════════════════════════════════════════════════════
-    // AUTO NTP SYNC - Force time sync at startup before any consensus logic
-    // ═══════════════════════════════════════════════════════════════════════════
-    {
-        println!("[INFO][NTP] Attempting automatic time synchronization at startup...");
-        let mut synced = false;
-
-        // Try systemd-timesyncd (most Linux distros)
-        if !synced {
-            if let Ok(out) = std::process::Command::new("timedatectl")
-                .args(&["set-ntp", "true"])
-                .output()
-            {
-                if out.status.success() {
-                    // Trigger immediate step sync
-                    let _ = std::process::Command::new("systemctl")
-                        .args(&["restart", "systemd-timesyncd"])
-                        .output();
-                    println!("[INFO][NTP] systemd-timesyncd sync triggered");
-                    synced = true;
-                }
-            }
-        }
-
-        // Try chrony (alternative NTP daemon)
-        if !synced {
-            if let Ok(out) = std::process::Command::new("chronyc")
-                .args(&["makestep"])
-                .output()
-            {
-                if out.status.success() {
-                    println!("[INFO][NTP] chrony makestep sync triggered");
-                    synced = true;
-                }
-            }
-        }
-
-        // Try ntpdate (legacy fallback)
-        if !synced {
-            if let Ok(out) = std::process::Command::new("ntpdate")
-                .args(&["-u", "pool.ntp.org"])
-                .output()
-            {
-                if out.status.success() {
-                    println!("[INFO][NTP] ntpdate sync triggered");
-                    synced = true;
-                }
-            }
-        }
-
-        if !synced {
-            println!("[WARN][NTP] Auto-sync unavailable (no permissions or tools). Ensure host NTP is active.");
-        }
-
-        // Brief wait for time daemon to apply correction
-        std::thread::sleep(std::time::Duration::from_millis(500));
-    }
+    // Clock correction is the host's job: the runtime image ships none of timedatectl/chronyc/
+    // ntpdate and the container has no CAP_SYS_TIME, so an in-process sync attempt can only fail.
+    // The drift check below still runs and is what actually guards consensus timing.
 
     // ═══════════════════════════════════════════════════════════════════════════
     // v3.10: NTP DRIFT CHECK - Fail-fast if system time is too far off
@@ -2650,7 +2557,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(seed) = qnet_integration::node::load_wallet_seed("QNET_WALLET_SEED") {
         let wallet_addr = qnet_integration::crypto::vrf::WalletIdentity::derive_wallet_address(&seed);
         println!("[INFO][STARTUP] wallet_seed=present derived_addr={}", wallet_addr);
-        println!("[INFO][STARTUP] vrf=dilithium3 mode=secret_leader_election");
+        println!("[INFO][STARTUP] vrf=dilithium3 mode=deterministic_leader_election");
     } else if let Some(genesis_seed) = qnet_integration::node::load_wallet_seed("QNET_GENESIS_SEED") {
         let wallet_addr = qnet_integration::crypto::vrf::WalletIdentity::derive_wallet_address(&genesis_seed);
         println!("[INFO][STARTUP] genesis_seed=present derived_addr={}", wallet_addr);
@@ -2673,7 +2580,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let network_config = qnet_integration::network_config::get_network_config();
     println!("🌐 Network: {}", network_config.network_name());
     println!("   Environment: {:?}", network_config.environment);
-    println!("   Chain ID: {}", network_config.chain_id);
+    println!("   Chain ID: {}", qnet_state::transaction::QNET_CHAIN_ID);
     println!("   QNet RPC: {}", network_config.endpoints.qnet_rpc);
     println!("   Bridge API: {}", network_config.endpoints.bridge_api);
     println!("   Solana RPC: {}", network_config.solana.rpc_url);
@@ -2768,12 +2675,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let node_label = if is_genesis { "GENESIS" } else { "SUPER" };
         if is_info() { println!("[INFO][PREFLIGHT] start node_type={}", node_label); }
         let external_ip = get_physical_ip().await.ok();
-        if let Err(e) = qnet_integration::preflight_checks::run_preflight_checks(external_ip.as_deref()).await {
-            eprintln!("[FATAL][PREFLIGHT] checks_failed node_type={} err={}", node_label, e);
-            std::process::exit(1);
+        match qnet_integration::preflight_checks::run_preflight_checks(external_ip.as_deref()).await {
+            Err(e) => {
+                eprintln!("[FATAL][PREFLIGHT] checks_failed node_type={} err={}", node_label, e);
+                std::process::exit(1);
+            }
+            Ok(r) => {
+                std::env::set_var("QNET_PREFLIGHT_DONE", "1");
+                if r.passed {
+                    if is_info() { println!("[INFO][PREFLIGHT] passed node_type={}", node_label); }
+                } else {
+                    // Partial coverage is not a pass. Non-fatal: a node that cannot reach the IP
+                    // resolver may still reach its peers.
+                    let failed: Vec<&str> = r.checks.iter().filter(|c| !c.passed).map(|c| c.name.as_str()).collect();
+                    if is_warn() { println!("[WARN][PREFLIGHT] incomplete node_type={} failed={}", node_label, failed.join(",")); }
+                }
+            }
         }
-        std::env::set_var("QNET_PREFLIGHT_DONE", "1");
-        if is_info() { println!("[INFO][PREFLIGHT] passed node_type={}", node_label); }
     }
 
     let mut genesis_signal_listener: Option<tokio::net::TcpListener> = None;
@@ -2811,23 +2729,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         if is_info() { println!("[INFO][GENESIS] signal_listener_ready port=8001"); }
 
-        let genesis_ips = vec![
-            "154.38.160.39",
-            "62.171.157.44",
-            "161.97.86.81",
-            "5.189.130.160",
-            "162.244.25.114",
-        ];
+        // Single source for the roster; a second hardcoded copy here would silently diverge.
+        let genesis_ips: Vec<&str> = qnet_integration::genesis_constants::GENESIS_NODE_IPS
+            .iter()
+            .map(|(ip, _)| *ip)
+            .collect();
 
-        let our_ip = get_physical_ip().await.unwrap_or_else(|_| "127.0.0.1".to_string());
+        // Self-identify by bootstrap id, not by detected IP. IP detection failing fell back to
+        // 127.0.0.1, which matches no genesis address — the node then probed ITSELF, found its own
+        // listener up and counted itself, releasing the barrier one real peer short.
+        let our_ip: String = match std::env::var("QNET_BOOTSTRAP_ID")
+            .ok()
+            .and_then(|id| qnet_integration::genesis_constants::get_genesis_ip_by_id(&id))
+        {
+            Some(ip) => ip.to_string(),
+            None => {
+                if is_warn() { println!("[WARN][GENESIS] self_ip_unresolved src=bootstrap_id fallback=probe"); }
+                get_physical_ip().await.unwrap_or_default()
+            }
+        };
         let mut ready_count = 0;
         let mut attempts = 0;
-        const MAX_ATTEMPTS: u32 = 60; // 60 * 2s = 120 seconds max wait
-        const REQUIRED_PEERS: usize = 4; // Need ALL 4 other Genesis nodes ready (5 total - 1 self = 4)
+        // Prefer the full roster, but never start producing below what can certify a block:
+        // quorum_size(n) = n - f, f = (n-1)/3, minus ourselves. Derived from the roster so a
+        // different genesis size stays correct.
+        let roster_n = genesis_ips.len();
+        let quorum_min_peers = roster_n.saturating_sub((roster_n.saturating_sub(1)) / 3).saturating_sub(1);
+        let required_peers = roster_n.saturating_sub(1);
+        const MAX_ATTEMPTS: u32 = 60; // 60 * 2s = 120s before relaxing to the quorum floor
 
-        if is_info() { println!("[INFO][GENESIS] waiting_for_peers required={}", REQUIRED_PEERS); }
+        if is_info() {
+            println!("[INFO][GENESIS] waiting_for_peers required={} quorum_floor={}",
+                     required_peers, quorum_min_peers);
+        }
 
-        while ready_count < REQUIRED_PEERS && attempts < MAX_ATTEMPTS {
+        while ready_count < required_peers && attempts < MAX_ATTEMPTS {
             attempts += 1;
             ready_count = 0;
 
@@ -2863,17 +2799,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            if ready_count >= REQUIRED_PEERS {
-                if is_info() { println!("[INFO][GENESIS] peers_ready count={} required={}", ready_count, REQUIRED_PEERS); }
+            if ready_count >= required_peers {
+                if is_info() { println!("[INFO][GENESIS] peers_ready count={} required={}", ready_count, required_peers); }
                 break;
             }
 
-            if is_debug() { println!("[DEBUG][GENESIS] waiting ready={}/{} attempt={}/{}", ready_count, REQUIRED_PEERS, attempts, MAX_ATTEMPTS); }
+            if is_debug() { println!("[DEBUG][GENESIS] waiting ready={}/{} attempt={}/{}", ready_count, required_peers, attempts, MAX_ATTEMPTS); }
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         }
 
-        if ready_count < REQUIRED_PEERS {
-            if is_warn() { println!("[WARN][GENESIS] partial_start ready={} attempts={} max={}", ready_count, attempts, MAX_ATTEMPTS); }
+        // Below the quorum floor the barrier does NOT release. Starting a fresh chain alone means
+        // minting blocks no one can certify, then forking when the rest arrive — the timeout used
+        // to let exactly that happen. Waiting is recoverable; a genesis-height fork is not.
+        if ready_count < quorum_min_peers {
+            if is_warn() {
+                println!("[WARN][GENESIS] below_quorum ready={} floor={} action=hold",
+                         ready_count, quorum_min_peers);
+            }
+            let mut holds = 0u32;
+            while ready_count < quorum_min_peers {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                holds += 1;
+                ready_count = 0;
+                for ip in &genesis_ips {
+                    if *ip == our_ip { continue; }
+                    let up = matches!(tokio::time::timeout(
+                        std::time::Duration::from_secs(1),
+                        tokio::net::TcpStream::connect(format!("{}:8001", ip))
+                    ).await, Ok(Ok(_)));
+                    if up { ready_count += 1; }
+                }
+                if holds % 12 == 0 && is_warn() {
+                    println!("[WARN][GENESIS] still_below_quorum ready={} floor={} waited={}s",
+                             ready_count, quorum_min_peers, holds * 5);
+                }
+            }
+            if is_info() { println!("[INFO][GENESIS] quorum_reached ready={}", ready_count); }
+        } else if ready_count < required_peers {
+            if is_warn() {
+                println!("[WARN][GENESIS] partial_start ready={} required={} quorum_floor={}",
+                         ready_count, required_peers, quorum_min_peers);
+            }
         }
 
         // CRITICAL FIX v2.21.8: DO NOT drop listener here!
@@ -3142,7 +3108,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-// Redirect stdout/stderr to log file for daemon mode
 async fn redirect_logs_to_file(log_path: &std::path::Path) -> Result<(), std::io::Error> {
     use std::fs::OpenOptions;
     use std::io::Write;
@@ -3188,7 +3153,9 @@ fn configure_production_mode() {
     std::env::set_var("QNET_MICROBLOCK_PRODUCER", "1");
     
     std::env::set_var("QNET_HIGH_FREQUENCY", "1");
-    std::env::set_var("QNET_MEMPOOL_SIZE", "20000000");
+    // QNET_MEMPOOL_SIZE is NOT set here: the process setting its own override made the
+    // network-size auto-scaling in mempool config unreachable and pinned every node at a fixed
+    // 20M-entry mempool. Left unset so auto-scaling runs and the variable stays an operator knob.
     std::env::set_var("QNET_BATCH_SIZE", "200000");
     std::env::set_var("QNET_PARALLEL_VALIDATION", "1");
     std::env::set_var("QNET_PARALLEL_THREADS", "16");
@@ -3594,15 +3561,14 @@ fn display_node_config(config: &AutoConfig, node_type: &NodeType, region: &Regio
         },
     }
     
-    println!("  Mode: Production (Microblocks + 100k+ TPS)");
-    println!("  Performance: Ultra High (100k+ TPS optimizations)");
+    println!("  Mode: Production (microblocks)");
     
     println!("  🚀 Server deployment ready!");
     println!("  📱 Light nodes: Use mobile app only");
     println!("  💰 Activation costs: Dynamic pricing active");
 }
 
-async fn verify_1dev_burn(node_type: &NodeType) -> Result<(), String> {
+async fn verify_1dev_burn(_node_type: &NodeType) -> Result<(), String> {
     // GENESIS NODES: Skip burn verification for bootstrap nodes
     if is_genesis_bootstrap_node() {
         println!("🚀 Genesis bootstrap node detected - skipping 1DEV burn verification");
@@ -3612,16 +3578,17 @@ async fn verify_1dev_burn(node_type: &NodeType) -> Result<(), String> {
     }
     
     // Production 1DEV burn verification - Dynamic pricing based on current burn percentage
-    let (current_phase, pricing_info) = detect_current_phase().await;
-    let required_burn = if current_phase == 1 {
-        // Use dynamic pricing for Phase 1
-        calculate_node_price(1, *node_type, &pricing_info)
-    } else {
+    let (current_phase, _pricing_info) = detect_current_phase().await;
+    if current_phase != 1 {
         // Phase 2: No 1DEV burn required
         println!("⚠️  Phase 2 detected - 1DEV burn verification skipped (QNC era)");
         return Ok(());
-    };
-    
+    }
+    // Phase-1 price from the live 1DEV supply via the canonical integer tier formula.
+    let (total_burned, current_supply) = qnet_integration::rpc::fetch_solana_1dev_supply().await
+        .map_err(|e| format!("solana_supply_unavailable: {}", e))?;
+    let required_burn = qnet_state::Transaction::phase1_activation_cost(total_burned, current_supply);
+
     println!("🔐 Verifying 1DEV burn on Solana blockchain...");
     
     // Real Solana burn verification
@@ -3643,427 +3610,78 @@ async fn verify_1dev_burn(node_type: &NodeType) -> Result<(), String> {
     Ok(())
 }
 
-async fn verify_solana_burn_transaction(wallet_address: &str, required_amount: f64) -> Result<bool, String> {
-    println!("📡 Querying Solana devnet for burn transaction...");
-
-    let network_config = qnet_integration::network_config::get_network_config();
-    let solana_rpc = &network_config.solana.rpc_url;
-    let onedev_mint = &network_config.solana.onedev_mint;
-    let required_amount_decimals = (required_amount * 1_000_000.0) as u64;
-
-    // Priority: if QNET_BURN_TX_HASH is set, verify that specific TX directly
-    let specific_tx = std::env::var("QNET_BURN_TX_HASH").unwrap_or_default();
-    let signatures_to_check: Vec<String> = if !specific_tx.is_empty() {
-        vec![specific_tx]
-    } else {
-        // Fallback: scan recent signatures for the wallet
-        let request_body = serde_json::json!({
-            "jsonrpc": "2.0", "id": 1,
-            "method": "getSignaturesForAddress",
-            "params": [wallet_address, {"limit": 100, "commitment": "confirmed"}]
-        });
-        let client = reqwest::Client::new();
-        let response = client.post(solana_rpc).json(&request_body).send().await
-            .map_err(|e| format!("Solana RPC request failed: {}", e))?;
-        let rpc_response: serde_json::Value = response.json().await
-            .map_err(|e| format!("Failed to parse Solana RPC response: {}", e))?;
-        rpc_response["result"].as_array()
-            .map(|txs| txs.iter().filter_map(|tx| tx["signature"].as_str().map(String::from)).collect())
-            .unwrap_or_default()
-    };
-
-    let client = reqwest::Client::new();
-    for signature in &signatures_to_check {
-        let tx_request = serde_json::json!({
-            "jsonrpc": "2.0", "id": 1,
-            "method": "getTransaction",
-            "params": [signature, {"encoding": "jsonParsed", "commitment": "confirmed", "maxSupportedTransactionVersion": 0}]
-        });
-        if let Ok(tx_resp) = client.post(solana_rpc).json(&tx_request).send().await {
-            if let Ok(tx_data) = tx_resp.json::<serde_json::Value>().await {
-                // Method A: check SPL Token instructions (burn or burnChecked)
-                if let Some(instructions) = tx_data["result"]["transaction"]["message"]["instructions"].as_array() {
-                    for ix in instructions {
-                        if ix["program"].as_str() != Some("spl-token") { continue; }
-                        let ix_type = ix["parsed"]["type"].as_str().unwrap_or("");
-                        if ix_type != "burn" && ix_type != "burnChecked" { continue; }
-                        let info = &ix["parsed"]["info"];
-                        let mint_ok = info["mint"].as_str() == Some(onedev_mint.as_str());
-                        let amount_ok = info["amount"].as_str()
-                            .and_then(|a| a.parse::<u64>().ok())
-                            .map(|a| a >= required_amount_decimals)
-                            .unwrap_or(false);
-                        if mint_ok && amount_ok {
-                            let burned = info["amount"].as_str()
-                                .and_then(|a| a.parse::<u64>().ok())
-                                .unwrap_or(0);
-                            println!("✅ Found valid SPL Token burn: {} (burned {} 1DEV)", &signature, burned / 1_000_000);
-                            return Ok(true);
-                        }
-                    }
-                }
-
-                // Method B: pre/post token balance comparison (fallback for any burn mechanism)
-                let pre = tx_data["result"]["meta"]["preTokenBalances"].as_array();
-                let post = tx_data["result"]["meta"]["postTokenBalances"].as_array();
-                if let (Some(pre_balances), Some(post_balances)) = (pre, post) {
-                    for pre_b in pre_balances {
-                        if pre_b["mint"].as_str() != Some(onedev_mint.as_str()) { continue; }
-                        let pre_amount = pre_b["uiTokenAmount"]["amount"].as_str()
-                            .and_then(|a| a.parse::<u64>().ok()).unwrap_or(0);
-                        let acct_index = pre_b["accountIndex"].as_u64();
-                        let post_amount = post_balances.iter()
-                            .find(|pb| pb["accountIndex"].as_u64() == acct_index && pb["mint"].as_str() == Some(onedev_mint.as_str()))
-                            .and_then(|pb| pb["uiTokenAmount"]["amount"].as_str())
-                            .and_then(|a| a.parse::<u64>().ok())
-                            .unwrap_or(0);
-                        if pre_amount > post_amount && (pre_amount - post_amount) >= required_amount_decimals {
-                            println!("✅ Found valid burn via balance diff: {} (burned {} 1DEV)",
-                                &signature, (pre_amount - post_amount) / 1_000_000);
-                            return Ok(true);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    println!("❌ No valid burn transaction found for required amount: {} 1DEV", required_amount);
-    Ok(false)
+/// Local-startup burn check when no TX hash is known: the operator may pin one via
+/// QNET_BURN_TX_HASH, otherwise the wallet's recent signatures are enumerated as candidates.
+async fn verify_solana_burn_transaction(wallet_address: &str, required_amount: u64) -> Result<bool, String> {
+    let pinned_tx = std::env::var("QNET_BURN_TX_HASH").unwrap_or_default();
+    verify_solana_burn_for_activation(wallet_address, &pinned_tx, required_amount).await
 }
 
-#[allow(dead_code)]
+/// Local-startup Solana burn check. Delegates every soundness decision to the node's single
+/// token-aware verifier (canonical 1DEV mint, genuine burn instruction or transfer to the
+/// incinerator, amount in 6-decimal base units, fee payer == the claimed wallet).
 async fn verify_solana_burn_for_activation(wallet_address: &str, expected_tx_hash: &str, required_amount: u64) -> Result<bool, String> {
-    println!("📡 PRODUCTION: Verifying 1DEV burn on Solana for node activation...");
-    
-    // PRODUCTION: Use network-aware RPC configuration.
-    // Honor an operator-supplied SOLANA_RPC_URL (mirrors the other Solana call sites): the default
-    // public devnet RPC has a tiny history-retention window and returns null for real-but-older burns
-    // (archival RPCs still serve them), which blocks re-onboarding a node whose burn is not recent.
-    let network_config = qnet_integration::network_config::get_network_config();
-    let solana_rpc_override = std::env::var("SOLANA_RPC_URL").ok();
-    let solana_rpc: &str = solana_rpc_override.as_deref().unwrap_or(&network_config.solana.rpc_url);
-    let onedev_mint = &network_config.solana.onedev_mint;
-    let burn_address = &network_config.solana.burn_address;
-    
-    // Convert to 6 decimals for comparison
-    let required_amount_decimals = required_amount * 1_000_000;
-    let client = reqwest::Client::new();
+    println!("📡 Verifying 1DEV burn on Solana for node activation (required {} 1DEV)...", required_amount);
 
-    // PRIORITY PATH: When a specific TX hash is known, verify it directly via getTransaction.
-    // This bypasses the wallet-address-based lookup entirely and works even when the
-    // wallet is a short XOR-decoded prefix (first-time registration before registry exists).
-    if !expected_tx_hash.is_empty() {
-        println!("🔍 Direct TX verification: {}...", qnet_state::char_prefix(&expected_tx_hash, 16));
-        let tx_request = serde_json::json!({
-            "jsonrpc": "2.0", "id": 1,
-            "method": "getTransaction",
-            "params": [expected_tx_hash, {"encoding": "jsonParsed", "commitment": "finalized", "maxSupportedTransactionVersion": 0}]
-        });
-        if let Ok(tx_response) = client.post(solana_rpc).json(&tx_request).send().await {
-            if let Ok(tx_data) = tx_response.json::<serde_json::Value>().await {
-                if let Some(result) = tx_data.get("result") {
-                    if let Some(transaction) = result.get("transaction") {
-                        if let Some(message) = transaction.get("message") {
-                            if let Some(instructions) = message.get("instructions").and_then(|i| i.as_array()) {
-                                for instruction in instructions {
-                                    if instruction.get("program").and_then(|p| p.as_str()) == Some("spl-token") {
-                                        if let Some(parsed) = instruction.get("parsed") {
-                                            let ix_type = parsed.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                                            if let Some(info) = parsed.get("info") {
-                                                let mint_ok = info.get("mint").and_then(|m| m.as_str()) == Some(onedev_mint);
-                                                let amount_ok = info.get("amount")
-                                                    .and_then(|a| a.as_str())
-                                                    .and_then(|a| a.parse::<u64>().ok())
-                                                    .map(|a| a >= required_amount_decimals)
-                                                    .unwrap_or(false);
-                                                let dest_ok = info.get("destination").and_then(|d| d.as_str()) == Some(burn_address);
-
-                                                if (ix_type == "transfer" || ix_type == "transferChecked") && mint_ok && dest_ok && amount_ok {
-                                                    println!("✅ VERIFIED (direct TX): Burn to incinerator confirmed!");
-                                                    println!("   TX: {}...", qnet_state::char_prefix(&expected_tx_hash, 16));
-                                                    return Ok(true);
-                                                }
-                                                if (ix_type == "burn" || ix_type == "burnChecked") && mint_ok && amount_ok {
-                                                    println!("✅ VERIFIED (direct TX): SPL Token burn confirmed!");
-                                                    println!("   TX: {}...", qnet_state::char_prefix(&expected_tx_hash, 16));
-                                                    return Ok(true);
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        println!("[WARN] Direct TX verification found no matching burn instruction; falling back to wallet lookup...");
-    }
-
-    // FALLBACK: wallet-address-based lookup (used when no TX hash, or direct path missed).
-    // Guard: skip if wallet address is too short for a valid Solana address (32-44 chars base58).
+    // The fee-payer bind needs the full base58 Solana address, not a decoded 5-byte prefix.
     if wallet_address.len() < 32 {
-        println!("❌ VERIFICATION FAILED: No valid burn found for {} 1DEV", required_amount);
-        println!("   Wallet '{}' is too short for Solana address lookup", wallet_address);
+        println!("[ERROR][BURN] wallet_too_short_for_solana_lookup len={}", wallet_address.len());
         return Ok(false);
     }
 
-    // Build RPC request to check burn transactions by wallet
+    if !expected_tx_hash.is_empty() {
+        // Known TX: use the retrying entry point — a fresh burn takes 5-15s to index on Solana.
+        return match qnet_integration::rpc::verify_burn_transaction_exists(
+            expected_tx_hash, wallet_address, required_amount, 1).await
+        {
+            Ok((valid, burned)) => {
+                if valid {
+                    println!("[INFO][BURN] activation_burn_verified tx={}... burned={} required={}",
+                        qnet_state::char_prefix(&expected_tx_hash, 16), burned, required_amount);
+                } else {
+                    println!("[ERROR][BURN] activation_burn_not_found tx={}...",
+                        qnet_state::char_prefix(&expected_tx_hash, 16));
+                }
+                Ok(valid)
+            }
+            Err(e) => {
+                println!("[ERROR][BURN] activation_burn_rejected tx={}... err={}",
+                    qnet_state::char_prefix(&expected_tx_hash, 16), e);
+                Ok(false)
+            }
+        };
+    }
+
+    // No TX hash: enumerate the wallet's recent signatures and let the verifier decide. One
+    // attempt per candidate — these are already-indexed historical transactions.
+    let network_config = qnet_integration::network_config::get_network_config();
+    let solana_rpc = &network_config.solana.rpc_url;
     let request_body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
+        "jsonrpc": "2.0", "id": 1,
         "method": "getSignaturesForAddress",
-        "params": [
-            wallet_address,
-            {
-                "limit": 50,
-                "commitment": "finalized"
-            }
-        ]
+        "params": [wallet_address, {"limit": 50, "commitment": "finalized"}]
     });
-
-    let response = client
-        .post(solana_rpc)
-        .json(&request_body)
-        .send()
-        .await
+    let client = reqwest::Client::new();
+    let response = client.post(solana_rpc).json(&request_body).send().await
         .map_err(|e| format!("Solana RPC request failed: {}", e))?;
+    let data: serde_json::Value = response.json().await
+        .map_err(|e| format!("Failed to parse Solana RPC response: {}", e))?;
+    let signatures: Vec<String> = data["result"].as_array()
+        .map(|txs| txs.iter().filter_map(|tx| tx["signature"].as_str().map(String::from)).collect())
+        .unwrap_or_default();
 
-    let data: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| format!("JSON parse failed: {}", e))?;
-
-    if let Some(result) = data.get("result") {
-        if let Some(signatures) = result.as_array() {
-            println!("📋 Found {} recent transactions for wallet {}", signatures.len(), qnet_state::char_prefix(&wallet_address, 8));
-            
-            // Check each signature for burn transactions to incinerator
-            for sig_info in signatures {
-                if let Some(signature) = sig_info.get("signature").and_then(|s| s.as_str()) {
-                    
-                    // If specific TX hash expected from activation code, check it matches
-                    if !expected_tx_hash.is_empty() && signature != expected_tx_hash {
-                        continue;
-                    }
-                    
-                    // Get transaction details to verify burn
-                    let tx_request = serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "id": 1,
-                        "method": "getTransaction",
-                        "params": [
-                            signature,
-                            {
-                                "encoding": "jsonParsed",
-                                "commitment": "finalized",
-                                "maxSupportedTransactionVersion": 0
-                            }
-                        ]
-                    });
-                    
-                    if let Ok(tx_response) = client.post(solana_rpc).json(&tx_request).send().await {
-                        if let Ok(tx_data) = tx_response.json::<serde_json::Value>().await {
-                            if let Some(result) = tx_data.get("result") {
-                                if let Some(transaction) = result.get("transaction") {
-                                    // Check if this is a token transfer to burn address
-                                    if let Some(message) = transaction.get("message") {
-                                        if let Some(instructions) = message.get("instructions").and_then(|i| i.as_array()) {
-                                            for instruction in instructions {
-                                                if instruction.get("program").and_then(|p| p.as_str()) == Some("spl-token") {
-                                                    if let Some(parsed) = instruction.get("parsed") {
-                                                        let ix_type = parsed.get("type").and_then(|t| t.as_str()).unwrap_or("");
-
-                                                        // Method 1: SPL Token transfer to incinerator address
-                                                        if ix_type == "transfer" || ix_type == "transferChecked" {
-                                                            if let Some(info) = parsed.get("info") {
-                                                                let mint_match = info.get("mint").and_then(|m| m.as_str()) == Some(onedev_mint);
-                                                                let dest_match = info.get("destination").and_then(|d| d.as_str()) == Some(burn_address);
-                                                                let amount_match = info.get("amount")
-                                                                    .and_then(|a| a.as_str())
-                                                                    .and_then(|a| a.parse::<u64>().ok())
-                                                                    .map(|a| a >= required_amount_decimals)
-                                                                    .unwrap_or(false);
-
-                                                                if mint_match && dest_match && amount_match {
-                                                                    let burned_amount = info.get("amount")
-                                                                        .and_then(|a| a.as_str())
-                                                                        .and_then(|a| a.parse::<u64>().ok())
-                                                                        .unwrap_or(0);
-
-                                                                    println!("✅ VERIFIED: Valid burn transaction found (transfer to incinerator)!");
-                                                                    println!("   TX: {}", &signature);
-                                                                    println!("   Burned: {} 1DEV (required: {})", burned_amount / 1_000_000, required_amount);
-                                                                    println!("   Token: {} (1DEV mint)", onedev_mint);
-                                                                    println!("   Destination: {} (official incinerator)", burn_address);
-                                                                    return Ok(true);
-                                                                }
-                                                            }
-                                                        }
-
-                                                        // Method 2: SPL Token burn instruction (directly destroys supply)
-                                                        // Mobile app uses this: TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA Burn instruction
-                                                        if ix_type == "burn" || ix_type == "burnChecked" {
-                                                            if let Some(info) = parsed.get("info") {
-                                                                let mint_match = info.get("mint").and_then(|m| m.as_str()) == Some(onedev_mint);
-                                                                let amount_match = info.get("amount")
-                                                                    .and_then(|a| a.as_str())
-                                                                    .and_then(|a| a.parse::<u64>().ok())
-                                                                    .map(|a| a >= required_amount_decimals)
-                                                                    .unwrap_or(false);
-
-                                                                if mint_match && amount_match {
-                                                                    let burned_amount = info.get("amount")
-                                                                        .and_then(|a| a.as_str())
-                                                                        .and_then(|a| a.parse::<u64>().ok())
-                                                                        .unwrap_or(0);
-                                                                    let authority = info.get("authority").and_then(|a| a.as_str()).unwrap_or("unknown");
-
-                                                                    println!("✅ VERIFIED: Valid burn transaction found (SPL Token burn)!");
-                                                                    println!("   TX: {}", &signature);
-                                                                    println!("   Burned: {} 1DEV (required: {})", burned_amount / 1_000_000, required_amount);
-                                                                    println!("   Token: {} (1DEV mint)", onedev_mint);
-                                                                    println!("   Authority (burner): {}", authority);
-                                                                    println!("   Method: SPL Token burn (direct supply reduction)");
-                                                                    return Ok(true);
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+    for signature in &signatures {
+        if let Ok((true, burned)) = qnet_integration::rpc::verify_burn_transaction_exists_attempts(
+            signature, wallet_address, required_amount, 1, 1).await
+        {
+            println!("[INFO][BURN] activation_burn_verified tx={}... burned={} required={}",
+                qnet_state::char_prefix(&signature, 16), burned, required_amount);
+            return Ok(true);
         }
     }
 
-    println!("❌ VERIFICATION FAILED: No valid burn transaction found for {} 1DEV", required_amount);
-    println!("   Checked: transfer to incinerator ({}) AND SPL Token burn instruction", burn_address);
-    println!("   Token: {} (1DEV mint)", onedev_mint);
+    println!("[ERROR][BURN] activation_burn_not_found scanned={} required={}", signatures.len(), required_amount);
     Ok(false)
-}
-
-async fn is_burn_transaction(signature: &str) -> Result<bool, String> {
-    // Query transaction details to check if it's a burn to 1DEV burn address
-    let network_config = qnet_integration::network_config::get_network_config();
-    let solana_rpc = &network_config.solana.rpc_url;
-    
-    let request_body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "getTransaction",
-        "params": [
-            signature,
-            {
-                "encoding": "json",
-                "commitment": "confirmed"
-            }
-        ]
-    });
-    
-    let client = reqwest::Client::new();
-    let response = client
-        .post(solana_rpc)
-        .json(&request_body)
-        .send()
-        .await
-        .map_err(|e| format!("Failed to query transaction: {}", e))?;
-    
-    let rpc_response: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse transaction response: {}", e))?;
-    
-    // Check if transaction transfers to burn address
-    if let Some(transaction) = rpc_response["result"]["transaction"].as_object() {
-        if let Some(instructions) = transaction["message"]["instructions"].as_array() {
-            for instruction in instructions {
-                // Check if instruction is a transfer to burn address
-                if is_transfer_to_burn_address(instruction) {
-                    return Ok(true);
-                }
-            }
-        }
-    }
-    
-    Ok(false)
-}
-
-async fn get_burned_amount(signature: &str) -> Result<f64, String> {
-    // Parse burn amount from transaction
-    let network_config = qnet_integration::network_config::get_network_config();
-    let solana_rpc = &network_config.solana.rpc_url;
-    
-    let request_body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "getTransaction",
-        "params": [
-            signature,
-            {
-                "encoding": "json",
-                "commitment": "confirmed"
-            }
-        ]
-    });
-    
-    let client = reqwest::Client::new();
-    let response = client
-        .post(solana_rpc)
-        .json(&request_body)
-        .send()
-        .await
-        .map_err(|e| format!("Failed to query burn amount: {}", e))?;
-    
-    let rpc_response: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse burn amount response: {}", e))?;
-    
-    // Extract burn amount from transaction
-    if let Some(pre_token_balances) = rpc_response["result"]["meta"]["preTokenBalances"].as_array() {
-        if let Some(post_token_balances) = rpc_response["result"]["meta"]["postTokenBalances"].as_array() {
-            // Calculate amount burned by comparing pre and post balances
-            for (pre, post) in pre_token_balances.iter().zip(post_token_balances.iter()) {
-                if let (Some(pre_amount), Some(post_amount)) = (
-                    pre["uiTokenAmount"]["uiAmount"].as_f64(),
-                    post["uiTokenAmount"]["uiAmount"].as_f64()
-                ) {
-                    let burned = pre_amount - post_amount;
-                    if burned > 0.0 {
-                        return Ok(burned);
-                    }
-                }
-            }
-        }
-    }
-    
-    Ok(0.0)
-}
-
-fn is_transfer_to_burn_address(instruction: &serde_json::Value) -> bool {
-    // Check if instruction transfers to 1DEV burn address
-    const BURN_ADDRESS: &str = "1nc1nerator11111111111111111111111111111111"; // Official Solana incinerator address
-    
-    if let Some(accounts) = instruction["accounts"].as_array() {
-        for account in accounts {
-            if let Some(account_str) = account.as_str() {
-                if account_str == BURN_ADDRESS {
-                    return true;
-                }
-            }
-        }
-    }
-    
-    false
 }
 
 fn extract_wallet_from_activation_code(_activation_code: &str) -> Result<String, String> {
@@ -4099,26 +3717,34 @@ async fn start_metrics_server(port: u16) {
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
+        // Real values only. Hardcoded zeros here are worse than no endpoint: an alert built on
+        // them can never fire, and the operator believes the node is monitored.
+        let started_at = std::time::Instant::now();
         let metrics_route = warp::path("metrics")
             .and(warp::get())
-            .map(|| {
+            .map(move || {
+                let (applied, target, behind) = qnet_integration::node::network_status();
+                let peers = qnet_integration::node::try_get_p2p()
+                    .map(|p| p.get_peer_count_lockfree())
+                    .unwrap_or(0);
                 format!(
-                    "# HELP qnet_node_uptime_seconds Total uptime of the node\n\
-                     # TYPE qnet_node_uptime_seconds counter\n\
-                     qnet_node_uptime_seconds {}\n\
-                     # HELP qnet_blocks_height Current blockchain height\n\
-                     # TYPE qnet_blocks_height gauge\n\
-                     qnet_blocks_height 0\n\
-                     # HELP qnet_peers_connected Number of connected peers\n\
-                     # TYPE qnet_peers_connected gauge\n\
-                     qnet_peers_connected 0\n\
-                     # HELP qnet_transactions_total Total number of transactions\n\
-                     # TYPE qnet_transactions_total counter\n\
-                     qnet_transactions_total 0\n",
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs()
+                    "# HELP qnet_node_uptime_seconds Seconds since the metrics server started
+                     # TYPE qnet_node_uptime_seconds counter
+                     qnet_node_uptime_seconds {}
+                     # HELP qnet_blocks_height Applied microblock height
+                     # TYPE qnet_blocks_height gauge
+                     qnet_blocks_height {}
+                     # HELP qnet_network_height Best height observed on the network
+                     # TYPE qnet_network_height gauge
+                     qnet_network_height {}
+                     # HELP qnet_blocks_behind Blocks this node is behind the network
+                     # TYPE qnet_blocks_behind gauge
+                     qnet_blocks_behind {}
+                     # HELP qnet_peers_connected Connected peers
+                     # TYPE qnet_peers_connected gauge
+                     qnet_peers_connected {}
+",
+                    started_at.elapsed().as_secs(), applied, target, behind, peers
                 )
             });
         
@@ -4148,29 +3774,6 @@ async fn start_metrics_server(port: u16) {
     });
 }
 
-async fn start_reward_claiming_service(wallet_key: String, node_type: String) {
-    println!("💰 Starting automatic reward claiming service...");
-    
-    tokio::spawn(async move {
-        let mut interval = interval(Duration::from_secs(4 * 60 * 60)); // Every 4 hours
-        
-        loop {
-            interval.tick().await;
-            
-            let wallet_preview = wallet_key.as_str();
-        println!("💰 Claiming rewards for wallet: {}...", wallet_preview);
-            
-            // In production: Claim rewards from blockchain
-            let reward_amount = calculate_base_reward().await.unwrap_or(0.0);
-            let fee_share = calculate_fee_share(&node_type).await.unwrap_or(0.0);
-            let total_reward = reward_amount + fee_share;
-            
-            println!("✅ Rewards claimed: {:.2} QNC (Base: {:.2} + Fees: {:.2})", 
-                     total_reward, reward_amount, fee_share);
-        }
-    });
-}
-
 async fn calculate_base_reward() -> Result<f64, String> {
     // PRODUCTION v2.85: Use PhaseAwareRewardManager (no duplication!)
     // Real halving logic is in core/qnet-consensus/src/lazy_rewards.rs
@@ -4189,10 +3792,12 @@ async fn calculate_base_reward() -> Result<f64, String> {
     let halving_type = if next_cycle == 5 { "÷10_SHARP" } else { "÷2" };
     let emission_qnc = (pool1_emission as f64) / 1_000_000_000.0;
     
-    let burn_pct = qnet_integration::GLOBAL_BURN_PERCENTAGE.load(std::sync::atomic::Ordering::Relaxed) as f64 / 100.0;
-    let phase = if burn_pct >= 90.0 || years >= 5 { 2 } else { 1 };
-    
-    println!("[REWARD][ECON] 4h_window phase={} years={} halving_cycle={} next_halving={}y halving_type={} pool1_emission={:.2}", 
+    // Phase for the operator log: from the one resolver, which already applies both halves of the
+    // rule (90% of 1DEV burned OR five years since genesis). Unreadable supply reads as Phase 1.
+    let phase = qnet_integration::rpc::live_activation_pricing_opt().await
+        .map(|p| p.phase).unwrap_or(1);
+
+    println!("[REWARD][ECON] 4h_window phase={} years={} halving_cycle={} next_halving={}y halving_type={} pool1_emission={:.2}",
         phase, years, halving_cycle, years_until_halving, halving_type, emission_qnc);
     
     // Convert from nanoQNC to QNC
@@ -4228,8 +3833,7 @@ async fn print_microblock_status() {
     println!("🔗 Microblock Architecture Status:");
     println!("   📦 Microblocks: 1-second intervals (fast finality)");
     println!("   🏗️  Macroblocks: 90-second intervals (permanent finality)");
-    println!("   ⚡ Target TPS: 100,000+ transactions per second");
-    println!("   🌐 Network scaling: Ready for 10M+ nodes");
+
 }
 
 fn parse_bootstrap_peers(peers_str: &Option<String>) -> Vec<String> {

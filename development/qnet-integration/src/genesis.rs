@@ -137,7 +137,7 @@ pub fn create_genesis_block(config: GenesisConfig) -> IntegrationResult<Block> {
         data: Some("Genesis account - source of initial token distribution".to_string()),
         dilithium_signature: None,
         dilithium_public_key: None,
-        chain_id: 0,
+        chain_id: qnet_state::transaction::QNET_CHAIN_ID,
     };
     // CRITICAL: Calculate SHA3-256 hash for transaction
     genesis_account_tx.hash = genesis_account_tx.calculate_hash();
@@ -166,7 +166,7 @@ pub fn create_genesis_block(config: GenesisConfig) -> IntegrationResult<Block> {
         data: Some("System rewards pool for lazy rewards distribution".to_string()),
         dilithium_signature: None,   // Genesis TX - no quantum sig
         dilithium_public_key: None,
-        chain_id: 0,
+        chain_id: qnet_state::transaction::QNET_CHAIN_ID,
     };
     // CRITICAL: Calculate SHA3-256 hash for transaction
     rewards_pool_tx.hash = rewards_pool_tx.calculate_hash();
@@ -195,7 +195,7 @@ pub fn create_genesis_block(config: GenesisConfig) -> IntegrationResult<Block> {
             data: Some(format!("Genesis allocation to {}", address)),
             dilithium_signature: None,   // Genesis TX - no quantum sig
             dilithium_public_key: None,
-            chain_id: 0,
+            chain_id: qnet_state::transaction::QNET_CHAIN_ID,
         };
         // CRITICAL: Calculate SHA3-256 hash for transaction
         tx.hash = tx.calculate_hash();

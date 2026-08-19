@@ -153,8 +153,10 @@ ENV QNET_DATA_DIR=/app/data
 ENV QNET_LOG_DIR=/app/logs
 
 # Health check for production monitoring
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8001/api/v1/node/health || exit 1
+# /healthz is the lock-free liveness probe: one atomic load, no blockchain/P2P/mempool state.
+# /api/v1/node/health touches all of it and has frozen in production - never probe it.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:8001/healthz || exit 1
 
 # Expose required ports (QNet specific)
 # 9876 - P2P HTTP

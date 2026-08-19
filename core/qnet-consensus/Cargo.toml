@@ -69,18 +69,9 @@ lazy_static = "1.4"
 # Network
 bytes = "1.5"
 
-# Python bindings
-pyo3 = { version = "0.20", features = ["extension-module"], optional = true }
-pyo3-asyncio = { version = "0.20", optional = true }
-
 [dev-dependencies]
-criterion = "0.5"
 proptest = "1.4"
 
 [features]
 default = []  # MANDATORY: Dilithium is now a required dependency, not optional
-python = ["pyo3", "pyo3-asyncio"]
-
-[[bench]]
-name = "consensus_bench"
-harness = false 
+ 

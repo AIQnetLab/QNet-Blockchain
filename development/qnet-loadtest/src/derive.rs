@@ -58,11 +58,16 @@ pub fn eon_from_pubkey(pk_bytes: &[u8]) -> String {
     format!("{}eon{}{}", part1, part2, chk)
 }
 
+/// Chain tag prefixed onto every canonical sign-preimage. MUST equal `QNET_CHAIN_ID` in
+/// core/qnet-state/src/transaction.rs, or nothing this harness signs verifies on the node.
+pub const QNET_CHAIN_TAG: &str = "q1337|";
+
 /// Canonical signing message for a Transfer (node build_canonical_verify_message).
 pub fn transfer_message(
     from: &str, to: &str, amount: u64, nonce: u64, gas_price: u64, gas_limit: u64,
 ) -> String {
-    format!("transfer:{}:{}:{}:{}:{}:{}", from, to, amount, nonce, gas_price, gas_limit)
+    format!("{}transfer:{}:{}:{}:{}:{}:{}",
+        QNET_CHAIN_TAG, from, to, amount, nonce, gas_price, gas_limit)
 }
 
 /// Produce the node wire signature string:

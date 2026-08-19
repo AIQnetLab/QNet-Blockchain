@@ -83,13 +83,19 @@ export function buildUnsignedTransfer(params: {
 }
 
 /**
+ * Chain tag the node prefixes onto every canonical sign-preimage. MUST byte-match QNET_CHAIN_ID in
+ * core/qnet-state/src/transaction.rs, or every signature this SDK produces is rejected.
+ */
+export const QNET_CHAIN_TAG = 'q1337|';
+
+/**
  * The request-auth message for a reward claim, verified verbatim as UTF-8 by the node.
  *
  * This authorizes the REQUEST only. The credit itself is authorized by a second signature over the
  * quoted payload (`RewardClaimQuote.signMessage`) — see `QNetClient.claimRewards()`.
  */
 export function buildRewardClaimPayload(nodeId: string, address: QNetAddress): string {
-  return `claim_rewards:${nodeId}:${address}`;
+  return `${QNET_CHAIN_TAG}claim_rewards:${nodeId}:${address}`;
 }
 
 /**

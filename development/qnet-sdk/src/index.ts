@@ -19,15 +19,17 @@ export { isValidQNetAddress,
 
 // ── Contract interaction ──────────────────────────────────────────────────────
 export { ContractHandle,
-         encodeCalldata,
-         decodeUint64,
-         decodeBool }                 from './contract';
+         toHex,
+         fromHex }                    from './contract';
 export type {
   DeployContractParams,
   DeployContractResult,
   CallContractParams,
   ContractCallResult,
+  ViewContractParams,
+  ContractViewResult,
   ContractLog,
+  ContractLogsResult,
 }                                     from './contract';
 
 // ── Event subscriptions (class-based) ────────────────────────────────────────

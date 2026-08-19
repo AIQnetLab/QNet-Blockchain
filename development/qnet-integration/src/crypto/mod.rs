@@ -18,8 +18,7 @@
 //! ├── pq_crypto.rs        - Pure ML-DSA-65 (Dilithium3) signatures
 //! ├── quantum_crypto.rs   - Quantum-resistant cryptography core
 //! ├── vrf.rs              - Legacy VRF (deprecated)
-//! ├── key_manager.rs      - Key generation and management
-//! └── crypto_integration.rs - Service integration layer
+//! └── key_manager.rs      - Key generation and management
 //! ```
 //!
 //! ## Security Audit Scope
@@ -66,10 +65,6 @@ pub mod genesis_key;
 /// Used to verify mnemonic ownership during server node activation
 pub mod solana_derivation;
 
-// NOTE: crypto_integration.rs is deprecated (uses non-existent qnet_core::crypto)
-// The pq_crypto and quantum_crypto modules handle all production crypto needs
-// pub mod crypto_integration;
-
 // ============================================================================
 // RE-EXPORTS FOR CONVENIENCE
 // ============================================================================
@@ -86,7 +81,6 @@ pub use pq_crypto::{
 // Quantum crypto types
 pub use quantum_crypto::{
     QNetQuantumCrypto,
-    BlockchainPhaseState,
     DilithiumSignature,
     QuantumCryptoStatus,
     QuantumAlgorithms,

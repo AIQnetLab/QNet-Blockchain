@@ -54,8 +54,7 @@
 //   * `CrossShardCoordinator` — the per-coordinator-node state machine.
 //     Tracks every in-flight 2PC, applies deadlines, and surfaces
 //     stuck transactions for the failover hook (a standby coordinator
-//     picks up via the existing view-change machinery — see
-//     `commit_reveal::compute_leader_for_round`).
+//     picks up via the Checkpoint-BFT pacemaker's view change).
 //
 // SCALABILITY (1 000+ super-node committees, 100M+ accounts)
 // ────────────────────────────────────────────────────────────────────────────
@@ -68,7 +67,7 @@
 // bounded by the number of in-flight cross-shard TXs.
 //
 // Coordinator failover follows the same Pacemaker view-change model
-// already shipped for the global commit-reveal path: when a
+// already shipped for the global Checkpoint-BFT path: when a
 // coordinator misses its deadline, the standby (next validator in
 // the rotation) inherits the pending set and resumes the protocol
 // from the recorded state. No state is lost on coordinator crash.

@@ -6,9 +6,8 @@ import {
   computeChecksum,
   buildUnsignedTransfer,
   buildRewardClaimPayload,
-  encodeCalldata,
-  decodeUint64,
-  decodeBool,
+  toHex,
+  fromHex,
 } from './index';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -170,63 +169,36 @@ describe('buildRewardClaimPayload', () => {
   it('is the exact message the node verifies', () => {
     const addr    = publicKeyHashToAddress(new Uint8Array(20).fill(0x77));
     const payload = buildRewardClaimPayload('super_node_007', addr);
-    expect(payload).toBe(`claim_rewards:super_node_007:${addr}`);
+    expect(payload).toBe(`q1337|claim_rewards:super_node_007:${addr}`);
   });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Contract calldata encoding / decoding
+// Contract argument / payload hex
 // ─────────────────────────────────────────────────────────────────────────────
 
-describe('encodeCalldata', () => {
-  it('encodes the selector as the first 4 bytes', () => {
-    const data = encodeCalldata(1, []);
-    expect(data).toBe('0x00000001');
+describe('toHex', () => {
+  it('encodes bytes without a prefix, two lowercase digits each', () => {
+    expect(toHex(new Uint8Array([0x00, 0x0f, 0xa0, 0xff]))).toBe('000fa0ff');
   });
 
-  it('encodes a uint64 argument correctly', () => {
-    const data = encodeCalldata(2, [{ type: 'uint64', value: 256n }]);
-    // selector 0x00000002 + 8-byte 256 = 0x0000000000000100
-    expect(data).toBe('0x000000020000000000000100');
-  });
-
-  it('encodes a bool true', () => {
-    const data = encodeCalldata(3, [{ type: 'bool', value: true }]);
-    expect(data.endsWith('01')).toBe(true);
-  });
-
-  it('encodes a bool false', () => {
-    const data = encodeCalldata(3, [{ type: 'bool', value: false }]);
-    expect(data.endsWith('00')).toBe(true);
-  });
-
-  it('handles multiple mixed arguments', () => {
-    const addr = publicKeyHashToAddress(new Uint8Array(20).fill(0xAA));
-    const data = encodeCalldata(1, [
-      { type: 'address', value: addr },
-      { type: 'uint64',  value: 1_000_000_000n },
-    ]);
-    expect(data.startsWith('0x00000001')).toBe(true);
-    expect(data.length).toBeGreaterThan(10);
+  it('encodes empty arguments as an empty string', () => {
+    expect(toHex(new Uint8Array())).toBe('');
   });
 });
 
-describe('decodeUint64', () => {
-  it('decodes a known value', () => {
-    expect(decodeUint64('0000000000000001')).toBe(1n);
-    expect(decodeUint64('0000000000000064')).toBe(100n);
+describe('fromHex', () => {
+  it('decodes a payload back to the same bytes', () => {
+    const bytes = new Uint8Array([1, 2, 3, 250]);
+    expect(Array.from(fromHex(toHex(bytes)))).toEqual([1, 2, 3, 250]);
   });
 
-  it('handles 0x prefix', () => {
-    expect(decodeUint64('0x0000000000000005')).toBe(5n);
+  it('accepts a 0x prefix', () => {
+    expect(Array.from(fromHex('0x0102'))).toEqual([1, 2]);
   });
-});
 
-describe('decodeBool', () => {
-  it('decodes true', () => {
-    expect(decodeBool('0x01')).toBe(true);
-  });
-  it('decodes false', () => {
-    expect(decodeBool('0x00')).toBe(false);
+  it('rejects a non-hex or odd-length payload', () => {
+    expect(() => fromHex('0102030')).toThrow();
+    expect(() => fromHex('zz')).toThrow();
   });
 });

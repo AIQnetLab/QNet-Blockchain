@@ -56,18 +56,6 @@ name = "storage_audit"
 path = "tests/storage_audit.rs"
 
 [[test]]
-name = "reputation_audit"
-path = "tests/reputation_audit.rs"
-
-[[test]]
-name = "consensus_audit"
-path = "tests/consensus_audit.rs"
-
-[[test]]
-name = "consensus_scalability"
-path = "tests/consensus_scalability_tests.rs"
-
-[[test]]
 name = "activation_security"
 path = "tests/activation_security_test.rs"
 
