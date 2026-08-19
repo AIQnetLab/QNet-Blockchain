@@ -5255,6 +5255,29 @@ mod tests_smt_node_growth {
             .map(|(s, r)| format!("{}:{}", hex::encode(s), if *r { 1 } else { 0 }))
             .collect();
         println!("VECTOR_PROOF={}", items.join(","));
+
+        // Machine-enforce the mirror. The assert above only breaks THIS side; a stale device
+        // fixture stays self-consistent and its jest pin keeps passing while every real balance
+        // proof fails on the phone. Compare the shipped fixture directly instead.
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../applications/qnet-mobile/__tests__/fixtures/smt_account_proof.json");
+        let raw = std::fs::read_to_string(&fixture)
+            .unwrap_or_else(|e| panic!("mobile SMT fixture unreadable at {:?}: {}", fixture, e));
+        let v: serde_json::Value = serde_json::from_str(&raw).expect("mobile SMT fixture is not JSON");
+        assert_eq!(v["state_root"].as_str(), Some(hex::encode(root).as_str()),
+                   "mobile fixture root diverged — regenerate smt_account_proof.json");
+        assert_eq!(v["address"].as_str(), Some(target.address.as_str()));
+        // u64 fields are STRINGS in the fixture on purpose: a JS number loses precision above 2^53,
+        // so the device parses them with BigInt. Compare in that form.
+        assert_eq!(v["balance"].as_str(), Some(target.balance.to_string().as_str()));
+        assert_eq!(v["nonce"].as_str(), Some(target.nonce.to_string().as_str()));
+        assert_eq!(v["proof"].as_array().map(|a| a.len()), Some(proof.len()),
+                   "mobile fixture proof depth diverged");
+        for (i, (sib, is_right)) in proof.iter().enumerate() {
+            let e = &v["proof"][i];
+            assert_eq!(e["sibling"].as_str(), Some(hex::encode(sib).as_str()), "sibling {} diverged", i);
+            assert_eq!(e["is_right"].as_bool(), Some(*is_right), "is_right {} diverged", i);
+        }
     }
 
     /// The compressed fold's sharpest edge: a leaf landing next to an existing
