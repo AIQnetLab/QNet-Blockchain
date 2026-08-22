@@ -25,6 +25,7 @@ pub mod names {
     pub const STATIC_CACHE_CLEANUP: &str = "static_cache_cleanup";
     pub const QUIC_IDLE_REAPER: &str = "quic_idle_reaper";
     pub const EXTERNAL_IP_RESOLVER: &str = "external_ip_resolver";
+    pub const COMMITTEE_LINKS: &str = "committee_links";
     pub const DEVICE_MIGRATION_MONITOR: &str = "device_migration_monitor";
 }
 

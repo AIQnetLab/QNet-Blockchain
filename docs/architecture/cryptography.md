@@ -167,7 +167,7 @@ in one context can never be replayed as a valid preimage in another. The main in
 | `qnet-checkpoint-v2` | `Checkpoint::hash()` |
 | `QNET_BFT2_VOTE:` / `QNET_BFT2_TMO:` / `QNET_BFT2_CKPT:` | checkpoint vote, view-change timeout and checkpoint-proposal signing strings |
 | `qnet-timeout-v2` | timeout signing body prefix (the driver's timeout bytes) |
-| `QNET_TIMEOUT_V2:` / `QNET_TIMEOUT_V2R:` | P2P failover `TimeoutVote` preimage, unanchored / anchored — distinct from the driver prefix above |
+| `QNET_TIMEOUT_V2:` | P2P failover `TimeoutVote` preimage — distinct from the driver prefix above |
 | `leaf` / `node` | quorum-certificate signature merkle tree |
 | `log-leaf` / `log-node`, `logw-leaf` / `logw-node` | event-log tree, level 1 and window level 2 |
 | `qnet-registry-root-v2`, `qnet-registry-row-v4`, `qnet-dpk-row-v1`, `qnet-reward-epoch-root-v1` | LtHash digests and row seeds |
@@ -239,7 +239,7 @@ The `sha3` crate is used for FIPS 202 SHA3-256, SHA3-512 and SHAKE-256. Transact
 
 ## VRF and leader selection
 
-The VRF is a Dilithium3 construction:
+The VRF is an ML-DSA-65 construction:
 
 ```
 output = SHA3-512("QNet_VRF_v7_OUTPUT" || pk || sk || input)[0..32]

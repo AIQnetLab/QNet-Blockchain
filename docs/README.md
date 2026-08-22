@@ -8,9 +8,10 @@ disagree, the code is authoritative — report the discrepancy rather than trust
 ## The system in short
 
 A single elected producer streams microblocks on a one-second slot. Producer rotation happens every
-`ROTATION_INTERVAL_BLOCKS = 30` blocks; every `MACROBLOCK_INTERVAL = 90` microblocks a macroblock is
-sealed; finality comes from Checkpoint-BFT v2 quorum certificates taken every
-`CHECKPOINT_INTERVAL = 30` microblocks. Every consensus, identity and gossip signature is ML-DSA-65
+`ROTATION_INTERVAL_BLOCKS = 30` blocks. Finality comes from Checkpoint-BFT v2: a checkpoint is taken
+every `CHECKPOINT_INTERVAL = 30` microblocks and certified by a quorum certificate, and a checkpoint
+is committed by the two-chain rule; each `MACROBLOCK_INTERVAL = 90`-microblock window seals its
+macroblock on that commit. Every consensus, identity and gossip signature is ML-DSA-65
 (FIPS 204, CRYSTALS-Dilithium3). Bulk block and consensus traffic runs over QUIC; the node
 additionally makes HTTP-over-TCP node-to-node calls for block fetch, peer authentication and health
 probes, so TCP 9876/9877/8001 are required alongside UDP 10876. State is a flat account model

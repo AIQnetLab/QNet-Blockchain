@@ -119,7 +119,7 @@ those fields rather than match on the class.
 ## Wire formats
 
 Transactions, accounts and blocks are `bincode`-serialised Rust types in `core/qnet-state`, and the
-canonical signing messages are built in `development/qnet-integration/src/node.rs`.
+canonical signing messages are built in `development/qnet-integration/src/node/transactions.rs`.
 
 ## Related documents
 

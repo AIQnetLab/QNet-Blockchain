@@ -68,7 +68,7 @@ Gas and fuel are two separate budgets with two separate ceilings.
 **Intrinsic gas.** `compute_gas_used()` is a pure function of the transaction type and data length:
 `CONTRACT_DEPLOY` = 500000 plus 10 per byte of transaction data; `CONTRACT_CALL` = 100000 plus 5 per
 byte. `MAX_GAS_LIMIT` is 1000000 per transaction. The effective gas price is `gas_price`, plus 50 per
-cent for a Dilithium-signed transaction (`effective_gas_price`).
+cent for an ML-DSA-65-signed transaction (`effective_gas_price`).
 
 **Fuel.** The interpreter receives `gas_limit - compute_gas_used()` as its fuel budget. Fuel is
 `wasmi`'s instruction counter. The one explicit host-side fuel charge is `emit_log`, priced at

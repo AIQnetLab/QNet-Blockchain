@@ -2,7 +2,7 @@
 //!
 //! ## Overview
 //! Provides quantum-resistant signature verification for Byzantine consensus with a
-//! single pure CRYSTALS-Dilithium3 (ML-DSA-65) signature. Defense-in-depth: both P2P and Consensus
+//! single pure CRYSTALS-ML-DSA-65 (ML-DSA-65) signature. Defense-in-depth: both P2P and Consensus
 //! layers perform cryptographic verification.
 //!
 //! ## Architecture (Defense-in-Depth)
@@ -14,7 +14,7 @@
 //!
 //! ### Development Layer (qnet-integration)
 //! - **Purpose**: Full cryptographic verification at P2P level
-//! - **Validates**: Dilithium3 signatures, certificates
+//! - **Validates**: ML-DSA-65 signatures, certificates
 //! - **Location**: `node.rs::verify_microblock_signature()`
 //!
 //! ## Signature Formats (v2.24 - Bincode + Zstd)
@@ -57,7 +57,7 @@
 //!
 //! ### Layer 1: P2P Verification (node.rs)
 //! 1. All received blocks verified with full crypto
-//! 2. CRYSTALS-Dilithium3 signature verification (NIST post-quantum) — sole authenticator
+//! 2. CRYSTALS-ML-DSA-65 signature verification (NIST post-quantum) — sole authenticator
 //! 3. Certificate validation from cache/network
 //! 4. **Only verified blocks enter consensus**
 //!
@@ -68,9 +68,9 @@
 //! 4. **Malicious blocks cannot reach consensus threshold**
 //!
 //! ## NIST/Cisco Compliance
-//! - **Post-Quantum**: CRYSTALS-Dilithium3 / ML-DSA-65 (NIST standard) — sole authenticator
+//! - **Post-Quantum**: CRYSTALS-ML-DSA-65 / ML-DSA-65 (NIST standard) — sole authenticator
 //! - **Hashing**: SHA3-256 (NIST approved)
-//! - **Signature**: a single pure Dilithium3 signature establishes validity
+//! - **Signature**: a single pure ML-DSA-65 signature establishes validity
 //!
 //! ## Performance
 //! - **Compact signatures**: 75% bandwidth reduction
@@ -87,7 +87,7 @@ use pqcrypto_traits::sign::{PublicKey as PQPublicKey, SignedMessage as PQSignedM
 //      genesis_anchor_pks(), immutable, PINNED (never evicted) — closes
 //      the "race node_001 to register a fake PK first" window.
 //   2) PROOF-OF-OWNERSHIP: post-genesis super joiners must pass
-//      register_consensus_pk_with_proof() — a Dilithium3 sig over
+//      register_consensus_pk_with_proof() — a ML-DSA-65 sig over
 //      "qnet-pk-register-v1:{node_id}" by the private key for `pk`.
 // Once registered a PK is IMMUTABLE for the process lifetime (different-PK
 // re-register rejected; same-PK is an idempotent no-op).
@@ -123,7 +123,7 @@ lazy_static::lazy_static! {
     /// Permanent attacker PK blacklist (canonical SECURITY surface).
     ///
     /// Keyed by the 32-byte SHA3-256 fingerprint of the EXTRACTED
-    /// (attacker-supplied) Dilithium3 public key — NOT by node_id,
+    /// (attacker-supplied) ML-DSA-65 public key — NOT by node_id,
     /// because a single attacker key can be replayed under many spoofed
     /// identities and a single node_id can be squatted by many
     /// attacker keys. The fingerprint is post-quantum collision-
@@ -154,7 +154,7 @@ lazy_static::lazy_static! {
     /// BOUNDED MEMORY: Map size is soft-capped at `ATTACKER_PK_BLACKLIST_CAP`.
     /// At the cap we evict the oldest 25% by `last_seen_unix_s` so a
     /// key-rotating attacker (each spoofed connection presents a fresh
-    /// Dilithium3 keypair) cannot grow the table unboundedly. At cap
+    /// ML-DSA-65 keypair) cannot grow the table unboundedly. At cap
     /// (≤ 1 MB resident) this still retains 12 000 distinct attacker
     /// keys — well above any realistic adversary's churn budget.
     static ref ATTACKER_PK_BLACKLIST: dashmap::DashMap<[u8; 32], AttackerRecord> =
@@ -688,7 +688,7 @@ pub fn deactivate_consensus_pk(node_id: &str) -> bool {
 }
 
 /// Build the canonical challenge string for proof-of-ownership.
-/// The joiner MUST sign exactly this byte string with their Dilithium3 key.
+/// The joiner MUST sign exactly this byte string with their ML-DSA-65 key.
 #[inline]
 pub fn pk_register_challenge(node_id: &str) -> String {
     format!("{}{}", PK_REGISTER_CHALLENGE_PREFIX, node_id)
@@ -753,7 +753,7 @@ pub fn register_genesis_pk(node_id: &str, pk_bytes: &[u8]) -> bool {
 /// of a signature-validated NodeRegistration transaction on-chain.
 ///
 /// This is the production path: when a NodeRegistration TX is applied to
-/// state, the block's canonical order + the TX's Dilithium3 signature over
+/// state, the block's canonical order + the TX's ML-DSA-65 signature over
 /// `canonical_bytes` already constitute cryptographic proof that the
 /// submitter holds the private key corresponding to `pk_bytes`. All nodes
 /// processing the same block agree on the (node_id, pk) binding, so there
@@ -772,7 +772,7 @@ pub fn register_consensus_pk_from_chain(node_id: &str, pk_bytes: &[u8]) -> bool 
         return false;
     }
 
-    // Structural validation: PK must parse as a Dilithium3 public key
+    // Structural validation: PK must parse as a ML-DSA-65 public key
     use pqcrypto_mldsa::mldsa65 as dilithium3;
     if dilithium3::PublicKey::from_bytes(pk_bytes).is_err() {
         eprintln!("[ERR][CONSENSUS] chain_pk_parse_failed node={}", node_id);
@@ -838,7 +838,7 @@ pub fn register_consensus_pk_from_chain(node_id: &str, pk_bytes: &[u8]) -> bool 
 
 /// Register a non-genesis node PK with cryptographic proof-of-ownership.
 ///
-/// The joiner must provide a Dilithium3 detached signature over the canonical
+/// The joiner must provide a ML-DSA-65 detached signature over the canonical
 /// challenge string `qnet-pk-register-v1:{node_id}` using the private key
 /// corresponding to `pk_bytes`. Signature is verified against `pk_bytes`
 /// before the entry is written.
@@ -873,7 +873,7 @@ pub fn register_consensus_pk_with_proof(
         }
     }
 
-    // 3. Cryptographic proof-of-ownership: verify Dilithium3 detached signature
+    // 3. Cryptographic proof-of-ownership: verify ML-DSA-65 detached signature
     //    over canonical challenge using the pk being registered
     use pqcrypto_mldsa::mldsa65 as dilithium3;
     let public_key = match dilithium3::PublicKey::from_bytes(pk_bytes) {
@@ -1032,7 +1032,7 @@ pub fn set_genesis_anchor_pks(anchors: std::collections::HashMap<String, Vec<u8>
     true
 }
 
-/// Verify consensus signature using pure Dilithium3 (ML-DSA-65) cryptography
+/// Verify consensus signature using pure ML-DSA-65 (ML-DSA-65) cryptography
 pub async fn verify_consensus_signature(
     node_id: &str,
     message: &str,
@@ -1309,7 +1309,7 @@ async fn verify_compact_pq_signature(
     false
 }
 
-/// OPTIMIZED v2.24: Verify binary PQ (Dilithium3) signature (bincode+zstd instead of JSON)
+/// OPTIMIZED v2.24: Verify binary PQ (ML-DSA-65) signature (bincode+zstd instead of JSON)
 /// Size: ~5KB vs 27KB JSON - 81% reduction!
 async fn verify_pq_binary_signature(
     node_id: &str,
@@ -1440,7 +1440,7 @@ async fn verify_pq_binary_signature(
     true
 }
 
-/// Verify PQ signature (pure Dilithium3 / ML-DSA-65 with certificate)
+/// Verify PQ signature (pure ML-DSA-65 / ML-DSA-65 with certificate)
 /// CRITICAL FIX: Now performs REAL Dilithium verification per NIST/Cisco requirements
 async fn verify_pq_signature(
     node_id: &str,
@@ -1701,7 +1701,7 @@ async fn verify_with_real_dilithium(
     
     let pk_start = pk_len_start + 4;
     
-    // CRITICAL: Dilithium3 public key MUST be exactly 1952 bytes (NIST standard)
+    // CRITICAL: ML-DSA-65 public key MUST be exactly 1952 bytes (NIST standard)
     use pqcrypto_mldsa::mldsa65 as dilithium3;
     if pk_len != dilithium3::public_key_bytes() {
         log_sig_reject(node_id, &format!("[ERR][CONSENSUS] pk_size_invalid node={} got={} expected={}",
@@ -1733,7 +1733,7 @@ async fn verify_with_real_dilithium(
     //
     // Tier 2 (HARD REJECT — non-match): registry has a binding for `node_id`
     //   and the extracted PK does NOT match. This is a hostile identity
-    //   claim — a peer holding their own valid Dilithium3 keypair attempting
+    //   claim — a peer holding their own valid ML-DSA-65 keypair attempting
     //   to spoof an already-bound identity. Reject. There is NO legitimate
     //   reason to accept a different PK for an identity once the registry
     //   has locked one in (registry entries are immutable for the process
@@ -1763,7 +1763,7 @@ async fn verify_with_real_dilithium(
     //     a freshly-joined Super-node's first announcement be accepted in
     //     the small window between its TX broadcast and chain finality.
     //
-    // NOTE on math: regardless of tier, the Dilithium3 signature is
+    // NOTE on math: regardless of tier, the ML-DSA-65 signature is
     // cryptographically verified under `dilithium3::open` further down. This
     // tier block only governs the identity → key binding decision, not the
     // mathematical validity of the signature itself.
@@ -1948,7 +1948,7 @@ async fn verify_with_real_dilithium(
     }
 }
 
-/// Verify a consensus Dilithium3 signature against an EXPLICIT expected public key, bypassing the
+/// Verify a consensus ML-DSA-65 signature against an EXPLICIT expected public key, bypassing the
 /// in-RAM CONSENSUS_PK_REGISTRY identity binding. Burn-attestation validation MUST be a pure
 /// function of on-chain state: the registry is RAM-resident + idle-evicted (non-deterministic across
 /// nodes → fork) and its Tier-3 path TOFV-accepts a first-seen PK (forge surface for non-genesis).
@@ -2237,7 +2237,7 @@ mod tests_v20_pk_registry {
     use super::*;
     use std::sync::atomic::Ordering;
 
-    /// Build a syntactically valid 1952-byte Dilithium3 PK seed for tests.
+    /// Build a syntactically valid 1952-byte ML-DSA-65 PK seed for tests.
     /// Real cryptographic validity is irrelevant for these registry-level
     /// tests because they exercise the storage + eviction logic, not the
     /// signature math (covered separately by `tests_v17_security`).
@@ -2474,7 +2474,7 @@ mod tests_v20_pk_registry {
 
 // Regression tests pinning the Tier-3 first-seen genesis policy: anchors
 // loaded → strict reject (anchor squat). Asserted via the pure policy
-// helper below, which isolates the decision from the Dilithium3 math
+// helper below, which isolates the decision from the ML-DSA-65 math
 // (keypair/signature path is covered by integration tests).
 
 /// Pure-logic helper for the Tier 3 first-seen genesis policy.

@@ -39,26 +39,26 @@ pub struct Account {
     //
     // FIELD 1: `require_pq_signature` (gate flag)
     //   When `true`, every non-system transaction from this account MUST carry
-    //   a valid Dilithium3 (ML-DSA-65) signature. Transactions without one are
+    //   a valid ML-DSA-65 (ML-DSA-65) signature. Transactions without one are
     //   rejected at apply time, preventing forged TXs even after a CRQC breaks
     //   classical ECC.
     //
     // FIELD 2: `dilithium_public_key` (registered key binding)
-    //   The Dilithium3 (ML-DSA-65) public key that the account holder
+    //   The ML-DSA-65 (ML-DSA-65) public key that the account holder
     //   committed to at the moment of upgrade. Stored as hex (3904 chars,
     //   1952 bytes decoded). All future hybrid TXs from this account MUST
-    //   present a Dilithium3 signature verifiable under THIS exact public key.
+    //   present a ML-DSA-65 signature verifiable under THIS exact public key.
     //
     //   WITHOUT this binding the gate is bypassable: an attacker with a
-    //   forged Ed25519 sig could simply attach their OWN Dilithium3 keypair
+    //   forged Ed25519 sig could simply attach their OWN ML-DSA-65 keypair
     //   to the TX (each TX is currently self-contained for sig verification).
     //   The TX would pass the "has_dilithium" check while the attacker did
-    //   not actually compromise the holder's Dilithium3 key.
+    //   not actually compromise the holder's ML-DSA-65 key.
     //
     //   By binding the registered key into the account, every hybrid TX from
-    //   a locked account must verify under the SAME Dilithium3 public key the
+    //   a locked account must verify under the SAME ML-DSA-65 public key the
     //   holder committed during upgrade. An attacker would need to compromise
-    //   THAT specific lattice key — which CRQC cannot do (Dilithium3 is
+    //   THAT specific lattice key — which CRQC cannot do (ML-DSA-65 is
     //   quantum-resistant by construction, unaffected by Shor's algorithm).
     //
     // SEMANTICS — ONE-WAY UPGRADE
@@ -69,8 +69,8 @@ pub struct Account {
     //
     // ESTABLISHMENT
     //   Set via `SetPQRequirement` transaction signed with BOTH Ed25519 and
-    //   Dilithium3 (dual-signature requirement proves the holder owns both
-    //   keypairs at the moment of upgrade). The Dilithium3 public key on the
+    //   ML-DSA-65 (dual-signature requirement proves the holder owns both
+    //   keypairs at the moment of upgrade). The ML-DSA-65 public key on the
     //   upgrade TX becomes the registered key for the account.
     //
     // SCALABILITY (thousands of validators)
@@ -82,16 +82,16 @@ pub struct Account {
     //
     // SECURITY ANALYSIS
     //   * Pre-CRQC era (today): no operational difference for unflagged
-    //     accounts. Flag accounts pay one extra Dilithium3 verify per TX
+    //     accounts. Flag accounts pay one extra ML-DSA-65 verify per TX
     //     (~3 ms) — same cost as voluntary hybrid signing today.
     //   * Post-CRQC era: forged Ed25519 sigs alone CANNOT spend a flagged
-    //     account because the attacker would also need to forge a Dilithium3
-    //     signature verifiable under the holder's REGISTERED Dilithium3
+    //     account because the attacker would also need to forge a ML-DSA-65
+    //     signature verifiable under the holder's REGISTERED ML-DSA-65
     //     public key — quantum-resistant by construction.
     //   * "Harvest now, decrypt later": flagged accounts are immune. An
     //     adversary recording today's traffic and decrypting it under a
     //     future CRQC cannot replay or forge TXs from these accounts because
-    //     the Dilithium3 binding remains unbroken.
+    //     the ML-DSA-65 binding remains unbroken.
     // PURE DILITHIUM (F0.1): per-account `require_pq_signature` + `dilithium_public_key`
     // removed — PQ signing is mandatory network-wide and the address IS the key binding,
     // so a per-wallet opt-in flag + registered-key field are obsolete.

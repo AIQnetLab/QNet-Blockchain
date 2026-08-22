@@ -2,7 +2,7 @@
 
 /// Genesis bootstrap activation codes (PRODUCTION)
 /// These are the ONLY 5 codes that can bootstrap the QNet blockchain
-/// Security: codes are protected by IP whitelist + wallet binding + Dilithium3 signature,
+/// Security: codes are protected by IP whitelist + wallet binding + ML-DSA-65 signature,
 /// so the sequential pattern is not a vulnerability.
 pub const GENESIS_BOOTSTRAP_CODES: &[&str] = &[
     "QNET-BOOT-0001-STRAP",
@@ -304,7 +304,7 @@ pub fn get_genesis_wallet_by_id(bootstrap_id: &str) -> Option<&'static str> {
 
 // =========================================================================
 // v4.0: VRF Public Key Registry for producer verification
-// Maps node_id → Dilithium3 public key (hex)
+// Maps node_id → ML-DSA-65 public key (hex)
 // Populated during node registration, used for VRF proof verification
 // =========================================================================
 

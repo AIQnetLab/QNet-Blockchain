@@ -63,7 +63,7 @@
 //!
 //! The consensus engine itself does NOT change — every shard runs
 //! Checkpoint-BFT against its own committee. That keeps the guarantees
-//! of the canonical path (Dilithium3 + n−f QC + view-change) intact at
+//! of the canonical path (ML-DSA-65 + n−f QC + view-change) intact at
 //! the per-shard level.
 //!
 //! SCALABILITY (1 000+ super-node committees, target 100M+ users)
@@ -72,7 +72,7 @@
 //! validator set is partitioned across N shards, each sub-committee
 //! is bounded by `1 000 / N`, which keeps:
 //!   * per-shard signature aggregation linear in committee size
-//!     (≤ 1 000 / N Dilithium3 sigs per shard sub-block);
+//!     (≤ 1 000 / N ML-DSA-65 sigs per shard sub-block);
 //!   * per-shard produce/verify cost bounded by the same factor;
 //!   * gossip/sync bandwidth per shard scaled by the same factor.
 //! Total network capacity scales with N (modulo cross-shard 2PC

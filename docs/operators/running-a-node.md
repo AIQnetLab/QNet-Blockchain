@@ -151,6 +151,13 @@ If none of `QNET_BOOTSTRAP_ID`, `QNET_ACTIVATION_CODE` or a previously saved act
 
 The five genesis identities start with `QNET_BOOTSTRAP_ID` set to `001`–`005` and a wallet seed, with no activation code or burn data; burn verification is skipped for them. The five ids and the genesis IP list are pinned in the binary. Genesis mode is also entered by setting `QNET_GENESIS_BOOTSTRAP=1` or by a source-IP match against the pinned genesis list. Do not set these variables on an ordinary Super node.
 
+The boot barrier on a genesis node clears on a **quorum** of the genesis set. It prefers a
+connection to each of the other four identities, and once the two-minute wait window elapses it
+clears on `MIN_PEERS_FOR_QUORUM` — three connected peers, which with this node makes the
+four-of-five quorum. Below that the wait resets and the barrier keeps trying, so a partially
+connected set never starts producing, while one absent identity leaves the other four able to
+start. `MIN_PEERS_FOR_QUORUM` is defined in `development/qnet-integration/src/node/lifecycle.rs`.
+
 Before a fresh launch, prove the five seeds against the identities compiled into the binary. `verify_genesis_identity_linkage` derives both the consensus public key and the wallet eon address from each mnemonic and asserts each equals its committed constant, so the operator who imports seed *i* holds exactly the wallet the node credits its rewards to. Supply the mnemonics as files, one per identity, mode `0600`:
 
 ```bash
@@ -172,11 +179,11 @@ Light nodes run inside the mobile app and register through the wallet. They keep
 
 A first start proceeds in this order, and each stage is logged:
 
-1. **Guards.** Restart-manifest sanity check, container check, NTP synchronisation attempt, and a system-clock plausibility check that aborts on an implausible timestamp.
+1. **Guards.** Restart-manifest sanity check, container check, and a system-clock plausibility check that aborts on an implausible timestamp.
 2. **Auto-configuration.** Port selection and bind probing, data-directory selection.
 3. **Activation.** The activation source is resolved (genesis id, environment code, or a saved record), then the code is format-checked, phase- and price-checked, checked for prior use on chain, and the Solana 1DEV burn is verified. A failure at this stage is fatal.
 4. **Pre-flight.** Local port availability, external IP detection, external reachability of the required ports, QUIC readiness, NTP status. A critical failure exits the process.
-5. **Node start.** Memory check, storage open, P2P and API servers.
+5. **Node start.** Memory check, storage open, P2P and API servers, then a boot barrier that holds the node out of production until it has connected to enough peers for consensus — three peers on an ordinary Super node, a quorum of the genesis set on a genesis node (see below).
 6. **Sync.** The node joins the network over QUIC and catches up. A node far behind the tip jumps to a verified state snapshot and then replays the tail; a node close to the tip replays blocks directly.
 7. **Registration.** A boot-spawned convergence driver collects committee burn attestations and submits the on-chain `NodeRegistration`.
 8. **Warmup.** A registered Super node becomes producer-eligible only after `ACTIVATION_WARMUP_BLOCKS = 180` blocks (two macroblock epochs) have been buried above its registration height. Expect to be a non-producing participant for that period.
@@ -228,11 +235,12 @@ instead of running degraded. A healthy boot prints one line per subsystem and th
 docker logs <container> | grep '\[BOOT\]'
 ```
 
-Expected: twelve `subsystem_started` lines followed by `contract_satisfied`. The subsystems are
+Expected: thirteen `subsystem_started` lines followed by `contract_satisfied`. The subsystems are
 `signed_head_emitter`, `peer_cleanup`, `background_repair`, `background_height_sync`,
 `reputation_validation`, `regional_clustering`, `tx_cache_cleanup`, `rate_limiter_cleanup`,
-`static_cache_cleanup`, `quic_idle_reaper`, `external_ip_resolver` and
-`device_migration_monitor`.
+`static_cache_cleanup`, `quic_idle_reaper`, `external_ip_resolver`, `committee_links` and
+`device_migration_monitor`. A branch that deliberately does not spawn one signs in as
+`subsystem_skipped` with a reason, which satisfies the contract in its place.
 
 ### Chain-halt alert
 

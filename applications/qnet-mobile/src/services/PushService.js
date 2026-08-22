@@ -286,8 +286,11 @@ export async function checkPendingChallenge() {
     if (result.success && result.has_challenge) {
       console.log('[Polling] 📥 Challenge received:', result.challenge);
       
-      // Sign and respond
-      await respondToChallenge(nodeInfo.nodeId, result.challenge);
+      // Respond to the node that ISSUED the challenge. The stamp is a MAC keyed by that node's
+      // own seed, so any other node rejects it as unrecognized — and with 5 bootstrap nodes an
+      // independent second draw matched only 1 time in 5. The push and self-attest paths already
+      // pass their URL through; this one dropped it.
+      await respondToChallenge(nodeInfo.nodeId, result.challenge, apiUrl);
       
       return result;
     } else if (result.next_ping_time) {
@@ -344,8 +347,8 @@ export async function respondToChallenge(nodeId, challenge, responseUrl) {
   try {
       const Keychain = require('react-native-keychain');
 
-    // ── PATH A: Dilithium3 ping delegation key (v7.1) — background-safe ──────
-    // Loads Dilithium3 ping secret key from Keychain (AFTER_FIRST_UNLOCK).
+    // ── PATH A: ML-DSA-65 ping delegation key (v7.1) — background-safe ──────
+    // Loads ML-DSA-65 ping secret key from Keychain (AFTER_FIRST_UNLOCK).
     // No password needed. Full quantum safety for ping responses.
     const pingNodeId = nodeId || await AsyncStorage.getItem('qnet_ping_node_id');
     if (pingNodeId) {
@@ -397,7 +400,7 @@ export async function respondToChallenge(nodeId, challenge, responseUrl) {
       }
     }
 
-    // PATH A is the only signing path — Keychain ping delegation key (Dilithium3).
+    // PATH A is the only signing path — Keychain ping delegation key (ML-DSA-65).
     // No fallback: if Keychain is unavailable the ping is missed and will be retried
     // on the next ping window. The node is NOT penalised for a single missed ping.
     console.warn('[Push] Dilithium3 ping key unavailable — ping missed (will retry next window)');
@@ -635,7 +638,7 @@ export async function refreshFcmTokenOnServer(nodeId) {
       return { success: true, updated: false, reason: 'debounced' };
     }
 
-    // Dilithium3 ping-delegation signature: "token_refresh:{node_id}:{timestamp}".
+    // ML-DSA-65 ping-delegation signature: "token_refresh:{node_id}:{timestamp}".
     // Load ping SK from Keychain + ping PK from AsyncStorage (same path as selfAttestIfNeeded).
     const { signWithDilithium, isDilithiumAvailable } = require('../crypto/DilithiumCrypto');
     if (!isDilithiumAvailable()) {

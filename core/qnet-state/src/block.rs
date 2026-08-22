@@ -215,7 +215,7 @@ pub struct ConsensusData {
     /// Quantum Randomness Beacon - accumulated from epoch's randomness outputs
     /// Formula: QRB = XOR(output_1, output_2, ..., output_90)
     /// Use cases: gambling, NFT mints, fair auctions, leader election
-    /// Quantum-safe: All signatures use Dilithium3 (NIST FIPS 204)
+    /// Quantum-safe: All signatures use ML-DSA-65 (NIST FIPS 204)
     #[serde(default)]
     pub randomness_beacon: Option<[u8; 32]>,
     
@@ -317,7 +317,7 @@ pub struct ConsensusData {
     // the AggregatedTimeoutCertificate as evidence, is_skip_marker=true,
     // no rewards / no state mutations (only preserves previous_hash linkage).
     // Validation requires: flag set; skip_certificate decodes; cert verifies
-    // 2f+1 Dilithium3 votes at round ≥ MAX_VIEW_CHANGE_ROUNDS. Never
+    // 2f+1 ML-DSA-65 votes at round ≥ MAX_VIEW_CHANGE_ROUNDS. Never
     // speculative — the 2f+1 view-change votes ARE the proof of failure.
 
     /// True iff this macroblock is a skip-marker placeholder produced after

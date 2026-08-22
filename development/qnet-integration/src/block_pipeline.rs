@@ -107,7 +107,7 @@ fn clear_apply_mismatch() {
 // DETECTION threshold is f+1, NOT the n−f quorum: a node on a minority fork cannot
 // gather n−f honest witnesses (it would never trip → stuck forever, the
 // v14.8.5 bug). f+1 = "at least one honest" and is Sybil-proof because each
-// witness is a Dilithium3-authenticated validator peer_id (a false positive
+// witness is a ML-DSA-65-authenticated validator peer_id (a false positive
 // needs f+1 real keys, outside the ≤f fault model). Safe: an honest node
 // only reports a break on a real parent_hash mismatch from a signed peer
 // envelope. Lock-free DashMap/DashSet; bounded by cleanup_break_tracker.
@@ -234,9 +234,20 @@ fn maybe_supersede_by_certified_round(storage: &Arc<Storage>, block: &IngestBloc
     let finalized = crate::node::LAST_FINALIZED_HEIGHT.load(Ordering::SeqCst);
     if h <= finalized { return; } // never reorg finalized history
 
+    // Ok(None) is genuinely absent - the ordinary ingest path installs it. Err is different: we
+    // HOLD bytes we cannot read, so every presence check says "have it" and nothing ever replaces
+    // them. Defend nothing in that case and let the certified competitor through below.
+    let mut hold_nothing = false;
     let (our_round, our_baseline, our_producer, our_hash) = match storage.load_microblock_auto_format(h) {
         Ok(Some(mb)) => { let hh = mb.hash(); (mb.timeout_round, mb.carried_baseline, mb.producer, hh) },
-        _ => return,
+        Ok(None) => return,
+        Err(e) => {
+            if crate::node::is_warn() {
+                println!("[WARN][FORK] local_body_unreadable h={} err={} action=adopt_certified_only", h, e);
+            }
+            hold_nothing = true;
+            (0, 0, String::new(), [0u8; 32])
+        }
     };
     let mb_idx = h / 90;
 
@@ -295,6 +306,8 @@ fn maybe_supersede_by_certified_round(storage: &Arc<Storage>, block: &IngestBloc
         if our_hash == c && incoming.hash() != c { return; } // keep the certified body — content dominates round
     }
     let content_wins = certified_hash.map_or(false, |c| incoming.hash() == c && our_hash != c);
+    // Holding unreadable bytes buys no authority over rounds: adopt the CERTIFIED body only.
+    if hold_nothing && !content_wins { return; }
     let incoming_abs = incoming.timeout_round.saturating_add(incoming.carried_baseline);
     let our_abs = our_round.saturating_add(our_baseline);
     let incoming_wins = if content_wins {
@@ -770,7 +783,7 @@ pub struct IngestBlock {
 /// Block after successful decoding (decompressed + deserialized).
 ///
 /// v25 H14: `sig_pre_verified` lets the multi-worker verify pool pass an
-/// already-verified Dilithium3 signature result forward to `verify_stage`
+/// already-verified ML-DSA-65 signature result forward to `verify_stage`
 /// so the canonical state-bound stage does not pay for a redundant
 /// per-block signature check. When the parallel verify pool is enabled
 /// (`verify_workers > 1`), the worker that pre-verifies sets this to
@@ -786,7 +799,7 @@ pub struct DecodedBlock {
     pub decompressed: Vec<u8>,
     pub microblock: qnet_state::MicroBlock,
     pub from_peer: String,
-    /// True when the producer's Dilithium3 signature was already
+    /// True when the producer's ML-DSA-65 signature was already
     /// successfully verified upstream of `verify_stage` (e.g., in the
     /// parallel worker pool of `block_pipeline`). Default `false` for
     /// any path that has not explicitly run the check.
@@ -1186,7 +1199,7 @@ impl BlockPipeline {
         ));
 
         // v25: N-worker parallel signature-verify pool. decode_rx -> N workers
-        // (Dilithium3 producer-sig verify, CPU-bound, parallel) -> sig_verified_rx
+        // (ML-DSA-65 producer-sig verify, CPU-bound, parallel) -> sig_verified_rx
         // FIFO -> verify_stage (state-bound: deferred buffer + hash-chain,
         // single-threaded) -> apply. Parallel pre-verify is safe: verify is a pure
         // fn; downstream out-of-order handled by the deferred buffer. Super-node
@@ -1205,7 +1218,7 @@ impl BlockPipeline {
             // ── Multi-worker path ──
             // The dispatcher owns `decode_rx` and round-robins blocks across
             // N internal per-worker channels. Each worker takes one block at
-            // a time, runs Dilithium3 producer-signature verification on
+            // a time, runs ML-DSA-65 producer-signature verification on
             // tokio's blocking pool (so the C-binding never starves a tokio
             // runtime thread), and forwards the pre-verified block to the
             // shared `sig_verified_tx` for state-bound processing.
@@ -1314,7 +1327,7 @@ impl BlockPipeline {
                         }
                         // v25 H14: signal that signature has already been
                         // verified — `verify_stage` will skip the redundant
-                        // Dilithium3 check on this block. Only set on the
+                        // ML-DSA-65 check on this block. Only set on the
                         // non-genesis path (genesis has its own dedicated
                         // verifier in verify_stage and stays unmarked so
                         // that path still runs).
@@ -1632,7 +1645,7 @@ impl BlockPipeline {
                         from_peer: block.from_peer,
                         // v25 H14: signature has NOT been verified yet at the
                         // decode stage. The parallel verify pool (when active)
-                        // flips this to `true` once Dilithium3 verify succeeds;
+                        // flips this to `true` once ML-DSA-65 verify succeeds;
                         // the single-worker pass-through leaves it `false` so
                         // `verify_stage` runs the canonical check itself.
                         sig_pre_verified: false,
@@ -1672,7 +1685,7 @@ impl BlockPipeline {
         node_id: String,
         unified_p2p: Option<Arc<SimplifiedP2P>>,
         // v24: bounded signature-verification parallelism. The semaphore is
-        // acquired around each Dilithium3 verify call (producer signature,
+        // acquired around each ML-DSA-65 verify call (producer signature,
         // attestations) so up to `permits` blocks can verify concurrently
         // without re-ordering the deferred-buffer / hash-chain state.
         verify_permits: Arc<tokio::sync::Semaphore>,
@@ -1806,6 +1819,25 @@ impl BlockPipeline {
             // state, not microblocks), so a cold joiner's first live block anchor_h+1 has no parent to
             // hash-chain against — admit it on the adopted finality; slot-ts/signature/state verify still
             // run below. anchor_h+2.. chain normally (anchor_h+1's hash is cached at its apply-commit).
+            // GENESIS IS ACCEPTED ONCE. Every authentication gate in this stage is wrapped in
+            // `mb.height > 0` - producer signature, producer authority, hash chain, slot timestamp,
+            // state_root, forbidden-TX types - so a SECOND block 0 would be applied over an existing
+            // chain with none of them. The tx-signature bypass below justifies itself with a
+            // "one-time bootstrap"; this guard is what makes that true.
+            if mb.height == 0 {
+                let s2 = storage.clone();
+                let have_genesis = tokio::task::spawn_blocking(move || {
+                    s2.canonical_hash_at(0).is_some()
+                }).await.unwrap_or(false);
+                if have_genesis {
+                    if is_warn() {
+                        println!("[WARN][PIPELINE] genesis_refused reason=chain_already_rooted producer={}",
+                                 mb.producer);
+                    }
+                    metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+            }
             let anchor_h = crate::node::SNAPSHOT_ANCHOR_MB.load(Ordering::Acquire).saturating_mul(90);
             if mb.height > 0 && !(anchor_h > 0 && mb.height == anchor_h + 1) {
                 metrics.mark_verify_op(mb.height, PIPELINE_OP_VERIFY_LOAD_PREV);
@@ -1974,7 +2006,7 @@ impl BlockPipeline {
                     // break: (1) advisory source-witness counting — records
                     // from_peer for resync-source steering, non-destructive
                     // (single-source ceiling); (2) destructive observer-based
-                    // rejection — broadcast a Dilithium3-signed BlockRejection;
+                    // rejection — broadcast a ML-DSA-65-signed BlockRejection;
                     // receivers verify the observer sig, aggregate distinct
                     // observer_ids per (height,source), and roll back at n−f.
                     // BFT-canonical: a supermajority of independent observers
@@ -2223,7 +2255,7 @@ impl BlockPipeline {
                     continue;
                 }
 
-                // v15.4 DIAG: mark op as signature verify. Dilithium3
+                // v15.4 DIAG: mark op as signature verify. ML-DSA-65
                 // verify is a sync C-binding called via an async
                 // wrapper; if it ever blocks the runtime worker
                 // thread under load, the watchdog will surface this
@@ -2235,7 +2267,7 @@ impl BlockPipeline {
                 // ───────────────────────────────────────────────────────────
                 // When the parallel verify worker pool is enabled (the
                 // production configuration), each block already had its
-                // Dilithium3 signature verified upstream of this stage. The
+                // ML-DSA-65 signature verified upstream of this stage. The
                 // worker that performed the verify flips
                 // `decoded.sig_pre_verified` to `true`. Re-running the same
                 // signature verify here is pure waste: same key, same
@@ -2260,7 +2292,7 @@ impl BlockPipeline {
                     }
                 } else {
                     let sig_start = std::time::Instant::now();
-                    // v24: acquire a verify-pool permit before running Dilithium3
+                    // v24: acquire a verify-pool permit before running ML-DSA-65
                     // verification. The permit count is `config.verify_workers`
                     // (default 2, prod 4). Concurrent blocks queue here without
                     // blocking the deferred-buffer / hash-chain state above —
@@ -2311,7 +2343,7 @@ impl BlockPipeline {
             //   B. same_round_mismatch (cached round == block round, wrong signer):
             //      cached producer is the sole authority for the slot via the
             //      deterministic VRF formula (base_idx + round) % N. HARD REJECT.
-            // Fork-safe: cache = stored BFT-agreed round (pure fn of Dilithium3-
+            // Fork-safe: cache = stored BFT-agreed round (pure fn of ML-DSA-65-
             // verified votes + on-chain VRF) → every honest node derives the same
             // expected producer; all reject or none. (Pre-v14.8.10 used local
             // non-deterministic state and did fork.) Gated to !is_syncing() so
@@ -2453,7 +2485,7 @@ impl BlockPipeline {
             // them rejected valid microblocks (liveness loss, no safety gain).
             // Per-microblock QC verify is also removed (redundant with the n−f
             // macroblock finality below + caused a rate-limit collision).
-            // Microblock safety holds via: Dilithium3 producer sig; prev_hash
+            // Microblock safety holds via: ML-DSA-65 producer sig; prev_hash
             // continuity; VRF-deterministic producer (soft); n−f macroblock
             // commit/reveal retroactively ratifying (split-brain can't reach n−f).
 
@@ -2528,7 +2560,7 @@ impl BlockPipeline {
                 metrics.mark_verify_op(mb.height, PIPELINE_OP_VERIFY_SIG);
                 let txsig_start = std::time::Instant::now();
 
-                // Dilithium3 verify for PQ-signed TXs. v25.2: delegate to the canonical
+                // ML-DSA-65 verify for PQ-signed TXs. v25.2: delegate to the canonical
                 // helper (verify_dilithium_tx_signature_async ->
                 // consensus_crypto::verify_consensus_signature) used by gossip/RPC, so
                 // apply-path verdicts are byte-identical to gossip for every signer class.
@@ -3528,7 +3560,17 @@ impl BlockPipeline {
                         crate::node::LAST_FINALIZED_HEIGHT.load(std::sync::atomic::Ordering::Relaxed));
                     // Same head: seal total_supply as-of this height (apply-deterministic on both paths)
                     // so the checkpoint reads a height-bound value, never the live counter.
-                    let _ = ctx.storage.seal_total_supply(height, state_guard.get_total_supply());
+                    // The only seal here with no reader-side fallback: a dropped write makes
+                    // get_total_supply_at return None for good, and both checkpoint builders then
+                    // defer this head forever. Retry once and surface it, like the dpk seal above.
+                    let supply_now = state_guard.get_total_supply();
+                    if ctx.storage.seal_total_supply(height, supply_now).is_err() {
+                        if let Err(e) = ctx.storage.seal_total_supply(height, supply_now) {
+                            if crate::node::is_warn() {
+                                println!("[WARN][SEAL] total_supply_seal_fail h={} err={} impact=checkpoint_muted", height, e);
+                            }
+                        }
+                    }
                 }
 
                 // State verified — save block.
@@ -4226,9 +4268,8 @@ impl BlockPipeline {
             // path: it competed with macroblock consensus for the same peers.
             //
             // Per-microblock confirmation is now provided by the COMMITTEE-
-            // ATTESTATION layer (see `attestation_committee.rs` and the
-            // BlockAttestationMsg / EmptySlotAttestationMsg handlers in
-            // `unified_p2p.rs`). That layer is non-blocking — attestations
+            // ATTESTATION layer: the EmptySlotAttestationMsg handler in
+            // `unified_p2p`. Non-blocking — attestations
             // travel on a separate gossip channel, do not gate block
             // production, and form the basis of the per-block n−f fork-choice
             // keep-local rule. It supplies that n−f safety AND deterministic

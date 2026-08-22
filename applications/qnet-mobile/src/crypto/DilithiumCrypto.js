@@ -34,7 +34,7 @@ const DILITHIUM_SALT_KEY = 'qnet_dilithium_salt';
 // PBKDF2 parameters — OWASP 2024
 const PBKDF2_ITERATIONS = 600_000;
 
-// Valid pqclean Dilithium3 SK: 4032 raw bytes = 8064 hex chars
+// Valid pqclean ML-DSA-65 SK: 4032 raw bytes = 8064 hex chars
 const EXPECTED_SK_HEX_LEN = 4032 * 2;
 
 // ---------------------------------------------------------------------------

@@ -2,7 +2,7 @@
 
 This document is the reference for the HTTP surface a QNet node exposes. Every node runs a single
 [warp](https://crates.io/crates/warp) server, started by `start_rpc_server(blockchain, port)` in
-`development/qnet-integration/src/rpc.rs`, and that one server carries four surfaces: two plain-text
+`development/qnet-integration/src/rpc/mod.rs`, and that one server carries four surfaces: two plain-text
 liveness probes, a WebSocket subscription endpoint, a JSON-RPC 2.0 endpoint registered at two paths,
 and the REST routes under `/api/v1`.
 
@@ -40,10 +40,6 @@ their name, which return JSON.
 Container health checks should target `/healthz`. It reads no blockchain, P2P or mempool state, so it
 stays accurate even when the heavier API surfaces are blocked. `/api/v1/node/health` reads all of that
 state and is intended for monitoring dashboards rather than orchestrator liveness.
-
-`/health` doubles as a peer-reachability check: a node that learns of this one through peer exchange
-calls it before recording the address, so keeping it reachable from the network keeps the node in
-other nodes' peer tables. See [networking.md](../architecture/networking.md#http-node-to-node-calls).
 
 ## Authentication
 
@@ -134,6 +130,7 @@ deployment.
   | `POST /rpc`, `POST /` | 1 MiB |
   | `POST /api/v1/transaction` | 64 KiB |
   | `POST /api/v1/node-registration/submit` | 128 KiB (large ML-DSA-65 signature) |
+  | `POST /api/v1/light-node/ping-response` | 64 KiB (enveloped ML-DSA-65 signatures) |
   | `POST /api/v1/rewards/claim` | 256 KiB |
   | `POST /api/v1/p2p/message` | 2 MiB |
   | `POST /api/v1/contract/deploy` | 2 MiB |
@@ -285,15 +282,16 @@ commits to.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| GET | `/api/v1/macroblock/{index}/proof` | Full bundle: `{index, epoch, checkpoint, qc{signers, sigs}, committee, committee_pubkeys, eligible_raw, banned}` |
+| GET | `/api/v1/macroblock/{index}/proof` | Full bundle: `{index, epoch, checkpoint, qc{signers, sigs}, committee, committee_pubkeys, eligible_raw, banned, recovery_anchor_checkpoint}`. `committee_pubkeys` covers the derived committee union the QC's actual signers. |
 | GET | `/api/v1/registry/height/{height}` | `{registry_root, entries}` — the chain-confirmed roster as of that height plus its LtHash root |
 | GET | `/api/v1/validators/proof` | `{validators[], epoch, merkle_root, last_update_height, current_height, total_validators, active_validators}`; the root is SHA3-256 over the tag `QNET_VALIDATOR_SET:` + epoch + each sorted validator's fields |
 | GET | `/api/v1/account/{address}/balance/proof` | Balance, nonce, all four heartbeat leaf fields, `last_claimed_epoch`, `banned_at_height`, `is_node`, `merkle_proof[{sibling, is_right}]`, `state_root`, `block_height`, `proof_valid` |
 | GET | `/api/v1/token/{contract}/{holder}/balance/proof` | Two-level proof: `storage_proof`/`storage_root` for the balance leaf plus `account_proof` and every contract-account leaf field, anchored by `state_root` and `block_height` |
 | GET | `/api/v1/logs/proof?tx_hash=&log_index=` | Sharded two-level inclusion proof: `{tx_hash, log_index, window_start, window_end, block_index, leaf, proof, block_root, window_proof, logs_root}` |
 
-The macroblock proof endpoint has four distinct error returns: `macroblock_not_found`,
-`no_checkpoint_qc`, `qc_decode_failed` and `qc_sigs_pruned` (with `action: "repin_recent_anchor"`).
+The macroblock proof endpoint has five distinct error returns: `macroblock_not_found`,
+`no_checkpoint_qc`, `qc_decode_failed`, `banned_decode_failed`, and `qc_sigs_pruned` (with
+`action: "repin_recent_anchor"`).
 The log-proof endpoint answers an unfinalized window with `{error:"window_not_finalized"}` and a
 pruned window with `{error:"window_pruned", oldest_available}`.
 
@@ -410,7 +408,7 @@ makes it refetch.
 | GET | `/api/v1/node/status` | Accepts `node_id`, `wallet` or `activation_code`; the wallet may also arrive in `X-QNet-Wallet`. Resolves through the on-chain wallet reverse index before falling back to activation-code mapping. |
 | POST | `/api/v1/light-node/register` | Light-node registration with per-wallet failed-attempt limiting (max 5 failures per 600 s, independent of IP), EON validation, and `already_registered` / reactivation results |
 | POST | `/api/v1/light-node/token-refresh` | Requires a signature prefixed `ping_dilithium:` over `token_refresh:{node_id}:{timestamp}`, a timestamp within 300 s, and a delegation certificate `delegate_ping:{ping_pubkey}:{node_id}` verified against the on-chain VRF key |
-| GET, POST | `/api/v1/light-node/ping-response` | Registered twice — GET with query parameters, POST with a JSON map body — both routed to the same handler |
+| GET, POST | `/api/v1/light-node/ping-response` | Registered twice — GET with query parameters, POST with a JSON map body under a 64 KiB cap — both routed to the same handler. A signed response carries enveloped ML-DSA-65 signatures, so POST is the form that fits. |
 | GET | `/api/v1/light-node/status?node_id=` | `{success, node_id, is_active, registered_at, push_type, has_attestation_current_slot, next_ping_time, next_ping_window, needs_reactivation, onchain_registered}` |
 | GET | `/api/v1/light-node/next-ping?node_id=` | `{success, node_id, next_ping_time, next_ping_window, current_slot, current_window, slots_per_window: 240, window_duration_seconds: 14400}` |
 | GET | `/api/v1/light-node/pending-challenge?node_id=` | Serves nodes whose `push_type` is `Polling`; `{success, node_id, has_challenge, challenge, created_at, expires_at}` with a 180-second expiry |
@@ -446,7 +444,7 @@ microblock hash within the same 14 400-block epoch. See
 | GET | `/api/v1/rewards/pools/{node_id}` | `current_phase`, `phase_description`, pending-rewards pool breakdown, `epoch_accumulated` |
 | GET | `/api/v1/rewards/by-wallet/{wallet_address}` | `{wallet_address, total_nodes, total_pending_qnc, current_epoch, nodes[]}` from the storage wallet→nodes index |
 | GET | `/api/v1/rewards/network/stats` | `current_epoch`, `current_height`, `blocks_until_next_epoch`, `epoch_accumulated`, `network_totals`, `emission_rate`. Served from a 30-second cache. |
-| GET | `/api/v1/rewards/summary/{node_id}` | `lifetime_totals`, `epochs{total, claimed, missed, claim_rate_percent}`, `first_claim`, `last_claim`, `averages`, `current_pending_qnc`. Cached per node id, evicted above 5000 entries. |
+| GET | `/api/v1/rewards/summary/{node_id}` | `lifetime_totals`, `epochs{total_epochs, epochs_claimed, epochs_missed, claim_rate_percent}`, `first_claim`, `last_claim`, `averages`, `current_pending_qnc`. Cached per node id, evicted above 5000 entries. |
 
 The heartbeat requirement reported by `/api/v1/rewards/pending/{node_id}` is 9 for Super, 8 for Full
 and 1 for Light. See [economics](../economics/overview.md).
@@ -499,7 +497,7 @@ refuses a second concurrent claim for the same `node_id`. See
 | POST | `/api/v1/wasm/deploy` | Deploy executable WASM: hex-decodes the code, runs `qnet_vm::validate_wasm_module`, returns `{success, tx_hash, contract{contract_address, creator}}` | `activation` |
 | POST | `/api/v1/token/deploy` | QRC-20 deployment | `activation` |
 | POST | `/api/v1/nft/deploy` | QRC-721 deployment | `activation` |
-| POST | `/api/v1/contract/deploy` | Registers a contract account from a signed `code_hash`, `code_size`, `constructor_args` and `security` payload, up to 2 MiB | `activation` |
+| POST | `/api/v1/contract/deploy` | Deploy base64-encoded WASM up to 2 MiB: checks the magic bytes, runs `qnet_vm::validate_wasm_module`, requires an empty `constructor_args`, and returns `{success, contract_address, code_hash, code_size, gas_limit, deployer, security{...}}` | `activation` |
 | POST | `/api/v1/contract/call` | Call a contract; `is_view: true` needs no signature and reads directly from state | `read_only` for views, `transaction` otherwise |
 | POST | `/api/v1/contract/estimate-gas` | Gas figure from `operation` (`deploy`/`call`/`view`) plus code and argument sizes | `general` |
 | GET | `/api/v1/contract/{address}` | `{success, contract{address, deployer, deployed_at, code_hash, version, total_gas_used, call_count, is_active}}` | `read_only` |

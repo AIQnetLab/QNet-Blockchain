@@ -133,10 +133,11 @@ balance checked against a committee quorum certificate is available in
 ### Faucet
 
 The claim route signs with `FAUCET_PRIVATE_KEY`, which is read at runtime and must be present for the
-route to serve. The cooldown is keyed on the `(address, token type)` pair, so parallel claims of
-different tokens do not block each other, and is 24 hours in both environments. Per-claim maxima are
-1500 1DEV in both environments, with 1.0 SOL and 50,000 QNC on testnet and 0.1 SOL and 1,000 QNC on
-mainnet.
+route to serve. Per-claim maxima are 1500 1DEV in both environments, with 1.0 SOL and 50,000 QNC on
+testnet and 0.1 SOL and 1,000 QNC on mainnet. Outside testnet the route also applies a 24-hour
+cooldown and an hourly per-IP request cap; the cooldown is keyed on the `(address, token type)` pair,
+so parallel claims of different tokens do not block each other, and the slot is reserved before the
+transaction is dispatched and released again only when the send definitively cannot have landed.
 
 ## Environment variables
 

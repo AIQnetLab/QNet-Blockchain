@@ -1581,7 +1581,7 @@ impl BlockchainActivationRegistry {
         };
 
         // Pure ML-DSA-65: NodeActivation is authenticated solely by this node's consensus
-        // Dilithium3 key (registered on-chain at NodeRegistration). Admission requires + verifies
+        // ML-DSA-65 key (registered on-chain at NodeRegistration). Admission requires + verifies
         // it via verify_dilithium_tx_signature_async (signer_id = dilithium_public_key) over the
         // canonical message (build_canonical_verify_message's NodeActivation arm). Ed25519 was an
         // illusory leg that proved no identity and is quantum-breakable — removed.

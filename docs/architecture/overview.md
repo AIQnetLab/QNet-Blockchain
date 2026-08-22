@@ -24,7 +24,7 @@ finality without stopping block production.
 | Committee cap | `COMMITTEE_SIZE` = `COMMITTEE_THRESHOLD` | 1000 |
 | BFT quorum | `quorum_size(n)` | `n − floor((n−1)/3)` |
 | Checkpoint view timeout | `VIEW_TIMEOUT_MS` | 4000 ms |
-| Reward emission interval | `EMISSION_INTERVAL_BLOCKS` | 14400 microblocks |
+| Reward emission interval | `EMISSION_BLOCK_INTERVAL` | 14400 microblocks |
 | Frozen-roster production horizon | `MAX_DERIVED_ROSTER_WINDOWS` | 32 windows (2880 blocks) |
 
 Consequences of the arithmetic:
@@ -33,8 +33,8 @@ Consequences of the arithmetic:
   that `CHECKPOINT_INTERVAL` divides `MACROBLOCK_INTERVAL`, so every macroblock boundary is also a
   checkpoint boundary.
 - Finality advances within a window. Checkpoints at 30 and 60 blocks into a window finalize
-  microblocks without sealing; a checkpoint whose `window_head_height` is a multiple of 90 also seals
-  a macroblock.
+  microblocks without sealing; a checkpoint whose `window_head_height` is a multiple of 90 also
+  carries a macroblock seal, held until the 2-chain commit reaches its index and releases it.
 - A checkpoint's `index` is the BFT view and may skip on timeout; a macroblock's height is the window
   (`head / 90`). They are different quantities, so a skipped view leaves no macroblock gap.
 - The quorum is `n − f`, which equals `2f+1` only when `n = 3f+1`. At the five genesis identities the
@@ -130,9 +130,10 @@ Details: [node activation](../economics/node-activation.md), [mobile wallet](../
 
 A Super node runs these concurrently; each owns a distinct module.
 
-- **Production loop** (`node.rs`) — slot timer, producer election for the current rotation round,
-  mempool drain, block signing and broadcast. It re-checks authority immediately before mutating state
-  and yields the slot if the certified round advanced or storage already holds the height.
+- **Production loop** (`node/production.rs`) — slot timer, producer election for the current rotation
+  round, mempool drain, block signing and broadcast. It re-checks authority immediately before
+  mutating state and yields the slot if the certified round advanced or storage already holds the
+  height.
 - **Block pipeline** (`block_pipeline.rs`) — the staged ingest path, fork choice at contested heights,
   the apply-stage circuit breaker, and fork-recovery signalling.
 - **Consensus coordinator** (`consensus_state.rs`) — one async task owning the node's consensus phase
@@ -146,17 +147,17 @@ A Super node runs these concurrently; each owns a distinct module.
   consensus select loop, the view timer, proposal and vote handling, macroblock sealing. Certificate
   verification runs off the loop on blocking workers behind a two-permit semaphore so an
   O(committee) signature verify cannot starve the view-change timer.
-- **P2P layer** (`unified_p2p.rs`, `quic_transport.rs`, `p2p_transport.rs`) — peer registry and
+- **P2P layer** (`unified_p2p/`, `quic_transport.rs`, `p2p_transport.rs`) — peer registry and
   discovery, block and transaction gossip, timeout-vote collection and re-gossip, and the QUIC
   transport. See [networking](./networking.md).
 - **Sync manager** (`sync_manager.rs`) — initial catch-up, desync recovery and post-rollback resync,
   in sequential waves bounded by pipeline backpressure.
-- **Storage** (`storage.rs`) — RocksDB with 30 declared column families, plus an hourly cleanup pass
+- **Storage** (`storage/`) — RocksDB with 30 declared column families, plus an hourly cleanup pass
   that applies the per-artifact retention rules. See [state and storage](./state.md).
-- **RPC and WebSocket server** (`rpc.rs`) — the HTTP API, rate limiting, and event subscriptions. See
+- **RPC and WebSocket server** (`rpc/`) — the HTTP API, rate limiting, and event subscriptions. See
   [RPC API](../developers/rpc-api.md).
-- **Liveness loops** (`node.rs`) — periodic anchored Heartbeat transactions for Super nodes and the
-  light-node eligibility bitmap, both of which feed reward eligibility.
+- **Liveness loops** (`node/lifecycle.rs`) — periodic anchored Heartbeat transactions for Super nodes
+  and the light-node eligibility bitmap, both of which feed reward eligibility.
 - **Reward machinery** (`reward_epoch.rs`, `reward_sharding.rs`) — epoch roots, shard maintenance and
   the claim path. See [economics](../economics/overview.md).
 
@@ -171,10 +172,21 @@ The Cargo workspace has nine members.
 | `qnet-mempool` | `core/qnet-mempool` | `SimpleMempool` (the one the node uses), priority, validation, eviction, MEV bundle protection, metrics |
 | `qnet-vm` | `core/qnet-vm` | Deterministic contract VM on the `wasmi` interpreter, fuel as gas, deploy-time module validation |
 | `qnet-core` | `core/qnet-core` | Merkle helpers used by the reward shard tree, security configuration, file encryption |
-| `qnet-sharding` | `core/qnet-sharding` | Parallel transaction validator used on the verify path |
-| `qnet-integration` | `development/qnet-integration` | The node itself: `node.rs`, `block_pipeline.rs`, `unified_p2p.rs`, `storage.rs`, `rpc.rs`, the consensus v2 driver and runtime, `sync_manager.rs`, `registry_lthash.rs`, `reward_epoch.rs`, `activation_validation.rs`, `genesis_constants.rs`, and the `qnet-node` binary |
+| `qnet-sharding` | `core/qnet-sharding` | Shard coordinator and parallel validator. Single-shard operation is the shipped configuration: the coordinator is not constructed, so cross-shard routing and the parallel executor are inactive |
+| `qnet-integration` | `development/qnet-integration` | The node itself: the `node/`, `unified_p2p/`, `rpc/` and `storage/` modules, `block_pipeline.rs`, the consensus v2 driver and runtime, `sync_manager.rs`, `registry_lthash.rs`, `reward_epoch.rs`, `activation_validation.rs`, `genesis_constants.rs`, and the `qnet-node` binary |
 | `qnet-loadtest` | `development/qnet-loadtest` | External harness that drives the production transaction path from outside the validators |
 | `qnet-audit` | `audit` | Security and correctness test suite over the core crates |
+
+Inside `qnet-integration` the four largest subsystems are directory modules. `node/` splits into
+`lifecycle` (construction, bring-up and background-task wiring), `production` (the microblock
+producer loop), `consensus`, `committee`, `leader` (election, rotation, frozen roster),
+`registration`, `activation`, `rewards`, `state_apply`, `sync`, `transactions` and `monitoring`.
+`unified_p2p/` splits into `transport`, `peer_table`, `peers`, `propagation`, `shred`, `dispatch`,
+`queries`, `sync_serve`, `consensus_msgs`, `certificates`, `kademlia` and `background_tasks`. `rpc/`
+splits into `tx_api`, `queries_api`, `registration_api`, `light_nodes`, `rewards_api`,
+`contracts_api`, `misc_api` and `benchmark`. `storage/` splits into `persistent` (the RocksDB layer
+and its column families), `blocks`, `chain_reads`, `snapshots`, `roster`, `registry`, `node_records`,
+`reward_store`, `contracts` and `compression`.
 
 Outside the Rust workspace: `applications/qnet-mobile` (the [mobile wallet](../applications/mobile-wallet.md)),
 `applications/qnet-wallet` (the [browser extension](../applications/browser-wallet.md)),
@@ -198,11 +210,13 @@ applies the block, compares the resulting state root, and either commits or roll
 fork recovery → `Notify` updates heights and publishes events.
 
 **Finality path.** At a checkpoint boundary the driver proposes or awaits a `Checkpoint` for the
-window → committee members reproduce the window content locally and sign only what they reproduce →
-votes accumulate into a quorum certificate → the 2-chain rule finalizes the parent → the `Finalize`
-effect re-verifies tip, state root and every body hash → the finality marker ratchets forward → at a
-90-block boundary every committee member also writes the macroblock locally, and only the proposer
-broadcasts it.
+window → a proposal is refused unless its parent quorum certificate is exactly the receiving node's
+own `high_qc` → committee members reproduce the window content locally and sign only what they
+reproduce → votes accumulate into a quorum certificate → the 2-chain rule finalizes the parent → the
+`Finalize` effect re-verifies tip, state root and every body hash → the finality marker ratchets
+forward. At a 90-block boundary the quorum certificate builds a macroblock seal that is held until
+the 2-chain commit reaches its index; on release every committee member writes the macroblock
+locally, and only the proposer broadcasts it.
 
 **Failover path.** When a slot goes unfilled past the grace conditions, validated committee members
 broadcast signed timeout votes over a `(window, round, sealed anchor)` tuple. A quorum of same-round

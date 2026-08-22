@@ -4,7 +4,7 @@ This document describes the QNet node-to-node layer: the QUIC transport and its 
 handshake that binds a peer identity to a connection, the bincode wire frame and the `NetworkMessage` catalogue, how
 peers are discovered and admitted, how blocks and transactions propagate, the layered denial-of-service defences, the
 HTTP calls nodes make to one another, the ports a node exposes, and the NAT and log-privacy facilities. The implementation lives in
-`development/qnet-integration/src/unified_p2p.rs` and `quic_transport.rs`. Consensus semantics of these messages are in
+`development/qnet-integration/src/unified_p2p/` and `quic_transport.rs`. Consensus semantics of these messages are in
 [consensus.md](consensus.md); signature and hash primitives in [cryptography.md](cryptography.md).
 
 ## Transport
@@ -54,7 +54,7 @@ NodeHandshake { node_id, cert_serial, protocol_version, node_type,
 The frame has exactly one canonical bincode shape and a frame that does not decode into it refuses the connection, so
 the attacker-chosen deserialization surface is a single form.
 
-`dilithium_proof` is a mandatory ML-DSA-65 (Dilithium3) signature over
+`dilithium_proof` is a mandatory ML-DSA-65 signature over
 `qnet-quic-handshake-v2:{node_id}:{timestamp}:{block_height}:{channel_binding}`. The channel binding is a TLS
 keying-material export over that specific connection, label `qnet-quic-channel-binding-v1`, hex-encoded, so a proof
 captured from one session cannot be replayed on another. If the exporter is unavailable the connection is refused. Each
@@ -71,7 +71,7 @@ tuple, so a non-zero height attests the peer's tip immediately without waiting f
 per message rather than per connection: every consensus-bearing message carries its own signature, verified against the
 registry.
 
-Before any Dilithium work, `ip_identity_gate` binds claimed identity to source IP: a `genesis_node_*` identity must
+Before any ML-DSA-65 work, `ip_identity_gate` binds claimed identity to source IP: a `genesis_node_*` identity must
 originate from its pinned address in `GENESIS_NODE_IPS`, an identity present in `NODE_ENDPOINT_REGISTRY` must match its
 registered on-chain endpoint IP, and an identity with no registry record is admitted (the first-contact window).
 
@@ -108,7 +108,7 @@ alone.
 | 1 | `Block` | 10 MB |
 | 2 | `Transaction` | 1 MB |
 | 3 | `PeerDiscovery` | 256 KB |
-| 4 | `HealthPing` | 8 KB |
+| 4 | `HealthPing` | 16 KB |
 | 8 | `ShredProtocolChunk` | 512 KB + 256 |
 | 10 | `ConsensusV2`, `MacroblocksBatch`, `TimeoutCertificateBroadcast`, `TimeoutCertificatesResponse` | 10 MB |
 | 0 | every other variant, and any unrecognised byte (catch-all) | 2 MB |
@@ -133,14 +133,13 @@ Related request/response pairs share one row below.
 | `RequestMacroblockAnchor` | 0 | Control-lane request for one QC-bound macroblock by index, answered with `MacroblocksBatch` |
 | `ShredProtocolChunk` | 8 | One Reed-Solomon data or parity shred of a block body |
 | `RequestMissingChunks` / `MissingChunksResponse` | 0 | Ask for, and serve, specific missing shred indices |
-| `ConsensusV2` | 10 | Opaque Checkpoint-BFT frame routed to the consensus v2 runtime |
+| `ConsensusV2` | 10 | Opaque Checkpoint-BFT frame routed to the consensus v2 runtime. A completed quorum or timeout certificate is relayed to `RELAY_FANOUT` (8) peers, not to every peer: committee members rebuild the same certificate from the votes they already collected, so the relay is redundancy rather than the delivery path |
 | `TimeoutVote` | 0 | Signed failover vote for a window and round, carrying the voter's own high-QC and tip |
 | `TimeoutCertificateBroadcast` | 10 | Aggregated per-voter timeout proofs forming a round certificate |
 | `RequestTimeoutCertificates` | 0 | Pull timeout certificates for a height range |
 | `TimeoutCertificatesResponse` | 10 | Serve those certificates with full per-voter payloads |
 | `ProducerReady` / `ReadyAck` | 0 | Round-change handshake; fires only at failover round above 0, both signed |
 | `ProducerHeartbeat` | 0 | Signed producer liveness beacon over the wire-supplied anchor hash |
-| `EmptySlotAttestationMsg` | 0 | Signed declaration that a slot's producer failed to deliver |
 | `BlockRejection` | 0 | Signed observer report of a rejected block, aggregated per (height, source) |
 | `VrfLeaderClaim` / `VrfKeyAnnounce` | 0 | Self-verifiable VRF leadership claim with gossip TTL; self-signed VRF public-key announcement |
 | `RequestConsensusState` | 0 | Ask a peer for consensus state at a round |
@@ -148,8 +147,8 @@ Related request/response pairs share one row below.
 | `Transaction` / `TransactionBatch` | 2 / 0 | One serialized transaction; or many in one frame with a batch timestamp |
 | `PeerDiscovery` | 3 | Introduce the requesting node's `PeerInfo` |
 | `PeerListRequest` / `PeerListResponse` | 0 | Ask for, and serve, `(addr, node_id, height)` peer triples |
-| `FindNode` / `FindNodeResponse` | 0 | Kademlia lookup by target hash, answered with K closest pairs |
-| `HealthPing` | 4 | Signed liveness and height beacon, plus unsigned certificate sync hints |
+| `FindNode` / `FindNodeResponse` | 0 | Lookup by target hash, answered from the routing table with the K closest pairs. The responder is live; nodes discover peers through bootstrap dial and peer exchange rather than by issuing lookups |
+| `HealthPing` | 4 | Signed liveness and height beacon, plus unsigned certificate sync hints. Carries no public key: the verifying key is resolved from the consensus registry by sender id |
 | `ActiveNodeAnnouncement` | 0 | Signed announcement of an active Super node with shard and reputation |
 | `ActiveNodesRequest` / `ActiveNodesResponse` | 0 | Ask for, and serve, the active-node list |
 | `SystemEvent` | 0 | Broadcast of a system-level event with JSON payload |
@@ -166,8 +165,8 @@ finality:
 - **Finality lane** (reserved): `ConsensusV2`, `TimeoutVote`, `TimeoutCertificateBroadcast`, `ProducerReady`,
   `ReadyAck` — non-redundant quorum frames with no repair path. Overflow increments `FINALITY_LANE_DROPPED`, meaning
   unrepairable consensus loss; a non-zero value warrants investigation.
-- **Bulk lane** (bounded, drop-on-full): `RequestBlocks`, `RequestMacroblocks`, `BlocksBatch`, `MacroblocksBatch`.
-  Overflow increments `BULK_LANE_DROPPED` and is benign shedding.
+- **Bulk lane** (bounded, drop-on-full): `RequestBlocks`, `RequestMacroblocks`, `BlocksBatch`, `MacroblocksBatch`,
+  `StateSnapshot`. Overflow increments `BULK_LANE_DROPPED` and is benign shedding.
 - **Default lane**: everything else, including all gossip. A control-lane set — `RequestMacroblockAnchor`,
   `RequestGenesisCheckpoint`, `GenesisCheckpointSig`, `GenesisCheckpoint` — is kept out of the bulk classification so
   the anchor fetch every cold joiner must complete keeps a reserved serve quota on this lane.
@@ -193,7 +192,7 @@ a responder serves its full connected-peer map. What the handler does with a rep
 [peer admission](#peer-admission-scoring-and-eviction).
 
 **Kademlia routing.** Node ids are hashed with SHA3-256 into a 256-bit space (`KADEMLIA_BITS` 256) with `KADEMLIA_K` 20
-per bucket, `KADEMLIA_ALPHA` 3 concurrent queries and `KADEMLIA_REFRESH_INTERVAL_SECS` 600. A full bucket evicts its
+per bucket and `KADEMLIA_REFRESH_INTERVAL_SECS` 600. A full bucket evicts its
 lowest-reputation member only if the newcomer's reputation is strictly higher; `FindNode` is answered with up to K
 closest entries, excluding the requester.
 
@@ -243,7 +242,7 @@ selection.
 
 The peer blacklist distinguishes soft reasons (sync timeout, connection failure, slow response), hard reasons (invalid
 blocks, malicious behaviour) and an identity-hard reason (public-key impersonation) whose authoritative enforcement
-lives at the QUIC handshake against the presented Dilithium3 public key. Unresponsive peers get exponential cooldown
+lives at the QUIC handshake against the presented ML-DSA-65 public key. Unresponsive peers get exponential cooldown
 from `PEER_COOLDOWN_BASE_SECS` 2 to `PEER_COOLDOWN_MAX_SECS` 30; traffic within `PEER_ALIVE_FRESHNESS_SECS` 60 counts
 as alive and skips the probe. The peer map is capped at `MAX_CONNECTED_PEERS` 1000 with LRU eviction.
 
@@ -262,9 +261,9 @@ checked before full validation. The producer certificate is replicated onto chun
 `CERT_REDUNDANT_PARITY` (4) parity chunks, so chunk arrival order is irrelevant.
 
 Relay follows a rotated F-ary heap over the canonical committee roster from `committee_for_height`, with the tier-0
-root chosen as `chunk_index % roster_len` so every member builds a byte-identical tree. Tree fanout is a pure function
-of roster size — 8 for m ≤ 64, 16 for 65..1024, 32 above — so two honest members always derive the same value and no
-index band is orphaned. Committee members are the tree; every other node obtains finalized blocks through
+root chosen as `chunk_index % roster_len` so every member builds a byte-identical tree. `shred_tree_fanout` is a pure
+function of roster size — 8 for m ≤ 64, 16 for 65..1024, 32 above — so two honest members always derive the same value
+and no index band is orphaned. Committee members are the tree; every other node obtains finalized blocks through
 `RequestBlocks`. Forwarding is a duty independent of local reconstruction, guarded by a per-`(block_height,
 chunk_index)` forward-once set. In genesis epochs, before a roster exists, the producer relays over a Kademlia-sorted
 peer list shuffled by a SplitMix64-seeded Fisher-Yates keyed on block height, using the adaptive fanout.
@@ -304,7 +303,7 @@ Inbound work is filtered in a fixed order, cheapest first:
    promotion to the known tier after a first successful handshake.
 3. `MAX_CONCURRENT_HANDSHAKES` 64 permits. On exhaustion the accept loop refuses and sleeps 10 ms so it cannot spin at
    accept/refuse speed. A handshake exceeding `INCOMING_HANDSHAKE_TIMEOUT_SECS` 5 releases its permit immediately.
-4. `ip_identity_gate`, then Dilithium proof verification.
+4. `ip_identity_gate`, then ML-DSA-65 proof verification.
 5. Per-type payload ceiling, applied before deserialization.
 6. Per-request serve rate limits, keyed jointly on `(source IP, requester node-id prefix)` so that neither a shared
    address nor a rotating identity defeats them.

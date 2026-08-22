@@ -1,7 +1,7 @@
 //! QNet Benchmark Module - Real Transaction Load Testing
 //!
 //! Generates REAL Transfer transactions between test accounts with full
-//! cryptographic validation (pure ML-DSA-65 / Dilithium3 signatures).
+//! cryptographic validation (pure ML-DSA-65 / ML-DSA-65 signatures).
 //!
 //! This is NOT synthetic - transactions go through the entire pipeline:
 //! - Full post-quantum signature validation
@@ -105,8 +105,8 @@ pub struct BenchmarkConfig {
     pub num_accounts: usize,
     /// Initial balance for each test account (in nanoQNC)
     pub initial_balance: u64,
-    /// Retained for API/serde back-compat. Production is pure ML-DSA-65 (Dilithium3);
-    /// every benchmark TX is signed with Dilithium3 regardless of this flag.
+    /// Retained for API/serde back-compat. Production is pure ML-DSA-65 (ML-DSA-65);
+    /// every benchmark TX is signed with ML-DSA-65 regardless of this flag.
     #[serde(default)]
     pub use_pq_sig: bool,
 }
@@ -199,7 +199,7 @@ pub struct BenchmarkResults {
     pub success_rate: f64,
 }
 
-/// Test account for benchmark — pure ML-DSA-65 (Dilithium3) keypair.
+/// Test account for benchmark — pure ML-DSA-65 (ML-DSA-65) keypair.
 pub struct BenchmarkAccount {
     pub address: String,
     pub pq_pk: dilithium3::PublicKey,
@@ -238,11 +238,11 @@ impl BenchmarkAccount {
     }
 }
 
-/// Post-quantum test account: pure ML-DSA-65 (Dilithium3) keypair.
+/// Post-quantum test account: pure ML-DSA-65 (ML-DSA-65) keypair.
 ///
 /// Kept as a distinct type (used by `generate_pq_transaction_from_snapshot`
 /// and the rpc.rs generator) for API stability, but it is now identical in
-/// crypto to `BenchmarkAccount` — Dilithium3 only, no Ed25519.
+/// crypto to `BenchmarkAccount` — ML-DSA-65 only, no Ed25519.
 pub struct PqBenchmarkAccount {
     pub address: String,
     pub pq_pk: dilithium3::PublicKey,
@@ -277,8 +277,8 @@ impl PqBenchmarkAccount {
     }
 }
 
-/// Generate a pure Dilithium3-signed transaction from a pre-cloned snapshot (NO LOCK).
-/// Only the ML-DSA-65 (Dilithium3) signature is computed and embedded in the TX.
+/// Generate a pure ML-DSA-65-signed transaction from a pre-cloned snapshot (NO LOCK).
+/// Only the ML-DSA-65 (ML-DSA-65) signature is computed and embedded in the TX.
 pub fn generate_pq_transaction_from_snapshot(
     accounts: &[PqBenchmarkAccount],
 ) -> Option<qnet_state::Transaction> {
@@ -315,7 +315,7 @@ pub fn generate_pq_transaction_from_snapshot(
         gas_limit: GAS_LIMIT_TRANSFER,
         data: None,
         signature: None,                                          // Ed25519 field unused (pure PQ)
-        public_key: Some(hex::encode(sender.pq_pk.as_bytes())),   // Dilithium3 pubkey hex
+        public_key: Some(hex::encode(sender.pq_pk.as_bytes())),   // ML-DSA-65 pubkey hex
         tx_type: qnet_state::TransactionType::Transfer {
             from: sender.address.clone(),
             to: receiver.address.clone(),
@@ -335,7 +335,7 @@ pub fn generate_pq_transaction_from_snapshot(
     ));
     let msg_bytes = message.as_bytes();
 
-    // Dilithium3 (ML-DSA-65) signature only — pure post-quantum path
+    // ML-DSA-65 (ML-DSA-65) signature only — pure post-quantum path
     let pq_signed = dilithium3::detached_sign(msg_bytes, &sender.pq_sk);
     tx.dilithium_signature  = Some(pq_signed.as_bytes().to_vec());
     tx.dilithium_public_key = Some(sender.pq_pk.as_bytes().to_vec());
@@ -347,9 +347,9 @@ pub fn generate_pq_transaction_from_snapshot(
 pub struct BenchmarkManager {
     /// Configuration
     config: RwLock<BenchmarkConfig>,
-    /// Dilithium3 (ML-DSA-65) test accounts
+    /// ML-DSA-65 (ML-DSA-65) test accounts
     accounts: RwLock<Vec<BenchmarkAccount>>,
-    /// Alternate Dilithium3 account pool used by the rpc.rs PQ generator path
+    /// Alternate ML-DSA-65 account pool used by the rpc.rs PQ generator path
     pq_accounts: RwLock<Vec<PqBenchmarkAccount>>,
     /// Running state
     is_running: AtomicBool,
@@ -392,8 +392,8 @@ impl BenchmarkManager {
         }
     }
 
-    /// Initialize benchmark accounts (pure Dilithium3 / ML-DSA-65).
-    /// Dilithium3 keygen is CPU-heavy, so we log progress every 100 accounts.
+    /// Initialize benchmark accounts (pure ML-DSA-65 / ML-DSA-65).
+    /// ML-DSA-65 keygen is CPU-heavy, so we log progress every 100 accounts.
     pub async fn initialize(&self, num_accounts: usize) {
         let mut accounts = self.accounts.write().await;
         accounts.clear();
@@ -411,8 +411,8 @@ impl BenchmarkManager {
     }
 
     /// Initialize the PQ account pool used by the rpc.rs generator path
-    /// (pure Dilithium3 / ML-DSA-65). Kept for API stability.
-    /// Dilithium3 keygen is CPU-heavy, so we log progress every 100 accounts.
+    /// (pure ML-DSA-65 / ML-DSA-65). Kept for API stability.
+    /// ML-DSA-65 keygen is CPU-heavy, so we log progress every 100 accounts.
     pub async fn initialize_pq(&self, num_accounts: usize) {
         let mut pq = self.pq_accounts.write().await;
         pq.clear();
@@ -634,7 +634,7 @@ impl BenchmarkManager {
 
     /// Generate transaction from pre-cloned accounts snapshot (NO LOCK!)
     /// This is the HIGH-PERFORMANCE path for benchmark workers.
-    /// Pure Dilithium3 (ML-DSA-65) signing — matches production consensus.
+    /// Pure ML-DSA-65 (ML-DSA-65) signing — matches production consensus.
     pub fn generate_transaction_from_snapshot(
         accounts: &[BenchmarkAccount],
     ) -> Option<qnet_state::Transaction> {
@@ -675,7 +675,7 @@ impl BenchmarkManager {
             gas_limit: GAS_LIMIT_TRANSFER,
             data: None,
             signature: None,                                          // Ed25519 field unused (pure PQ)
-            public_key: Some(hex::encode(sender.pq_pk.as_bytes())),   // Dilithium3 pubkey hex
+            public_key: Some(hex::encode(sender.pq_pk.as_bytes())),   // ML-DSA-65 pubkey hex
             tx_type: qnet_state::TransactionType::Transfer {
                 from: sender.address.clone(),
                 to: receiver.address.clone(),
@@ -689,7 +689,7 @@ impl BenchmarkManager {
         // Calculate hash (real SHA3-256)
         tx.hash = tx.calculate_hash();
 
-        // Sign with Dilithium3 (ML-DSA-65) — MUST match node.rs::submit_benchmark_batch_pq.
+        // Sign with ML-DSA-65 (ML-DSA-65) — MUST match node.rs::submit_benchmark_batch_pq.
         // Canonical message: from|to|amount|nonce|gas_price|gas_limit|timestamp
         let message = crate::node::BlockchainNode::chain_bind(&format!(
             "{}|{}|{}|{}|{}|{}|{}",
@@ -770,7 +770,7 @@ mod tests {
 
         let manager = BenchmarkManager::new();
 
-        // Initialize test accounts (Dilithium3 keygen is slow, so use a modest count)
+        // Initialize test accounts (ML-DSA-65 keygen is slow, so use a modest count)
         let num_accounts = 1_000;
         println!("🔑 Generating {} Dilithium3 (ML-DSA-65) keypairs...", num_accounts);
         let key_start = Instant::now();
@@ -861,10 +861,10 @@ mod tests {
     }
 
     // =========================================================================
-    // SIGNATURE BENCHMARK — pure ML-DSA-65 (Dilithium3)
+    // SIGNATURE BENCHMARK — pure ML-DSA-65 (ML-DSA-65)
     //
-    // Production consensus/identity signs only Dilithium3, so the micro-bench
-    // measures the Dilithium3 sign/verify path exclusively.
+    // Production consensus/identity signs only ML-DSA-65, so the micro-bench
+    // measures the ML-DSA-65 sign/verify path exclusively.
     //
     // Presets (4 load levels):
     //   small  — light smoke test, fast
@@ -880,7 +880,7 @@ mod tests {
     // =========================================================================
 
     // -------------------------------------------------------------------------
-    // Shared helper: run one Dilithium3 sign+verify loop, return (sign_tps, verify_tps)
+    // Shared helper: run one ML-DSA-65 sign+verify loop, return (sign_tps, verify_tps)
     // -------------------------------------------------------------------------
     fn run_dilithium_bench(n: usize) -> (f64, f64) {
         let (pq_pk, pq_sk) = dilithium3::keypair();
@@ -914,7 +914,7 @@ mod tests {
     }
 
     // =========================================================================
-    // ML-DSA-65 (Dilithium3) sign/verify micro-benchmarks
+    // ML-DSA-65 (ML-DSA-65) sign/verify micro-benchmarks
     //
     // These are HARDWARE-DEPENDENT performance benchmarks, not correctness
     // regression tests. They assert minimum throughput thresholds that hold
@@ -928,7 +928,7 @@ mod tests {
     //
     //   cargo test --release -p qnet-integration --lib bench_dilithium -- --ignored --nocapture
     //
-    // Dilithium3 is ~50× slower than Ed25519, so TX counts are proportionally
+    // ML-DSA-65 is ~50× slower than Ed25519, so TX counts are proportionally
     // smaller to keep test runtime reasonable.
     // =========================================================================
 
@@ -963,7 +963,7 @@ mod tests {
     }
 
     /// Custom preset: 100K TX, target 100K TPS.
-    /// Per-core Dilithium3 verify is the real bottleneck; multiply by CPU core
+    /// Per-core ML-DSA-65 verify is the real bottleneck; multiply by CPU core
     /// count for total node capacity.
     #[test]
     #[ignore = "hardware-dependent benchmark; run with --ignored"]
@@ -985,7 +985,7 @@ mod tests {
     // Simulates the FULL pipeline — not just mempool:
     //   TX signed → mempool accepted (verify) → microblock produced → MacroBlock finalized
     //
-    // Measures the honest E2E numbers with pure ML-DSA-65 (Dilithium3):
+    // Measures the honest E2E numbers with pure ML-DSA-65 (ML-DSA-65):
     //   - sign_tps       : how fast client can produce signed TX
     //   - mempool_tps    : how fast node accepts TX (verify gate)
     //   - e2e_tps        : TX finalized per wall-second (includes block production time)
@@ -998,14 +998,14 @@ mod tests {
     const MICROBLOCKS_PER_MACRO:  u64 = 90;      // MacroBlock every 90 microblocks
     const MAX_TX_PER_BLOCK:       u64 = 200_000; // max TX included per microblock
 
-    /// E2E finality simulation with pure Dilithium3 signatures.
+    /// E2E finality simulation with pure ML-DSA-65 signatures.
     /// Use this to get the honest finality TPS rather than the mempool-only number.
     #[test]
     #[ignore = "hardware-dependent benchmark; run with --ignored"]
     fn bench_e2e_finality_simulation() {
         use std::collections::VecDeque;
 
-        // Dilithium3 is ~50× slower than Ed25519 → keep TX count modest
+        // ML-DSA-65 is ~50× slower than Ed25519 → keep TX count modest
         let num_accounts = 1_000usize;
         let total_tx     = 20_000u64;
 
@@ -1013,7 +1013,7 @@ mod tests {
         println!("📊 E2E FINALITY SIMULATION — ML-DSA-65 (Dilithium3), {} TX, {} accounts", total_tx, num_accounts);
         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
-        // Generate Dilithium3 keypairs for each account
+        // Generate ML-DSA-65 keypairs for each account
         let pq_pairs: Vec<_> = (0..num_accounts).map(|_| dilithium3::keypair()).collect();
         let msg_base = "qnet_e2e_transfer";
 
@@ -1201,9 +1201,9 @@ mod tests {
     }
 
     // =========================================================================
-    // ML-DSA-65 (Dilithium3) server benchmarks -- 4 presets
+    // ML-DSA-65 (ML-DSA-65) server benchmarks -- 4 presets
     // Server generates + signs TX internally via submit_benchmark_batch_pq
-    // (pure Dilithium3 verify gate). Full sig verification, P2P broadcast,
+    // (pure ML-DSA-65 verify gate). Full sig verification, P2P broadcast,
     // block inclusion.
     // =========================================================================
 
@@ -1259,8 +1259,8 @@ mod tests {
         print_live_results(&client, &base, "Dilithium3 custom (100K TPS, 1M TX)");
     }
 
-    // NOTE: The server benchmark generator now signs pure Dilithium3 (ML-DSA-65)
-    // and submits via submit_benchmark_batch_pq (Dilithium3 verify gate).
+    // NOTE: The server benchmark generator now signs pure ML-DSA-65 (ML-DSA-65)
+    // and submits via submit_benchmark_batch_pq (ML-DSA-65 verify gate).
     // Per-core sign/verify numbers come from the bench_dilithium_* tests above;
     // multiply by CPU core count for estimated server throughput.
 

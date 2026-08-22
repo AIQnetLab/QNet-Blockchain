@@ -12,7 +12,7 @@ performs no Phase 2 operation. Two node types exist here, `Light` and `Super`, a
 `full_nodes` counter that stays zero for layout compatibility.
 
 Source: `development/qnet-contracts/1dev-burn-contract/`. Everything below is stated from that source
-and from `development/qnet-integration/src/rpc.rs`, the path a running node uses. Where a comment in
+and from `development/qnet-integration/src/rpc/registration_api.rs`, the path a running node uses. Where a comment in
 the source contradicts the code, the code is what is documented here.
 
 ## Crate layout
@@ -115,7 +115,7 @@ since `genesis_timestamp`. Phase 2 constants stored for reporting are 10,000 QNC
 ## How a QNet node verifies a burn
 
 Verification lives in `verify_burn_transaction_exists` in
-`development/qnet-integration/src/rpc.rs`. For Phase 1 the node:
+`development/qnet-integration/src/rpc/registration_api.rs`. For Phase 1 the node:
 
 1. Issues a `getTransaction` JSON-RPC call for the burn signature against the Solana endpoint of the
    active network profile, with `encoding` `jsonParsed`, `commitment` `finalized` and
@@ -127,16 +127,21 @@ Verification lives in `verify_burn_transaction_exists` in
    registering wallet. A mismatch fails verification, so one burn cannot be presented by a second
    wallet.
 4. Requires a burn indicator: a parsed `burn` or `burnChecked` instruction among the outer or the
-   inner instructions, or the Solana incinerator address among the account keys. A transfer to any
-   other destination is refused.
-5. Derives the amount from `preTokenBalances` and `postTokenBalances`, summing `pre - post` over the
-   entries whose `mint` equals the canonical 1DEV mint and pairing pre to post by `accountIndex` and
-   mint. A balance entry for any other mint contributes nothing, and a missing post entry counts as
-   zero, which is the closed-account case.
+   inner instructions, or the Solana incinerator address among the account keys. A parsed `transfer`
+   is not an indicator on its own, so a transfer to any other destination is refused.
+5. Derives the amount from `preTokenBalances` and `postTokenBalances` as net destruction over the
+   entries whose `mint` equals the canonical 1DEV mint, pairing pre to post by `accountIndex` and
+   mint across the union of both sides. Decreases accumulate into a destroyed total; increases
+   accumulate into a retained total that is subtracted from it, so a movement between two accounts of
+   one owner nets to zero rather than reading as a burn. An increase on an account owned by the
+   Solana incinerator is destruction, not a retained balance, and is not subtracted. A balance entry
+   for any other mint contributes nothing; an account present only in `pre` counts its whole balance
+   as destroyed, which is the closed-account case, and an account present only in `post` is an
+   increase from zero.
 6. Requires that total to reach the quoted price converted to base units at six decimals. A larger
    burn is accepted, and the actual burned amount in whole 1DEV is what the node reports.
 
-The result is what a genesis attestor signs; the quorum of those attestations is what block
+The result is what a committee attestor signs; the quorum of those attestations is what block
 validation re-verifies deterministically, so the Solana read itself stays on the admission side. See
 [../economics/node-activation.md](../economics/node-activation.md).
 

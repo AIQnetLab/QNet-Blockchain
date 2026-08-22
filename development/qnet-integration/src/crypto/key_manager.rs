@@ -378,7 +378,7 @@ impl DilithiumKeyManager {
         Ok((pk, sk))
     }
 
-    /// Get public key bytes (1952 bytes for Dilithium3)
+    /// Get public key bytes (1952 bytes for ML-DSA-65)
     pub fn get_public_key(&self) -> Result<Vec<u8>> {
         let (public_key, _) = self.get_keypair()?;
         
@@ -387,12 +387,12 @@ impl DilithiumKeyManager {
     }
     
     /// Sign data and return FULL SignedMessage (signature + message)
-    /// PRODUCTION: Use this for proper Dilithium3 verification with dilithium3::open()
+    /// PRODUCTION: Use this for proper ML-DSA-65 verification with dilithium3::open()
     /// Format: [signature(3309 bytes)] + [original message]  (ML-DSA-65 FIPS 204)
     pub fn sign_full(&self, data: &[u8]) -> Result<Vec<u8>> {
         let (_pk, sk) = self.get_keypair()?;
         
-        // Sign with REAL Dilithium3 algorithm
+        // Sign with REAL ML-DSA-65 algorithm
         let signature = dilithium3::sign(data, &sk);
         
         // Return the FULL SignedMessage bytes (signature + message)
@@ -419,7 +419,7 @@ impl DilithiumKeyManager {
             return Ok(false);
         }
         
-        // PRODUCTION: Use REAL Dilithium3 verification
+        // PRODUCTION: Use REAL ML-DSA-65 verification
         let pk = <dilithium3::PublicKey as PublicKeyTrait>::from_bytes(public_key_bytes)
             .map_err(|_| anyhow!("Invalid public key format"))?;
         

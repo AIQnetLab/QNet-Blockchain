@@ -42,7 +42,7 @@ contracts at your own risk. See [SECURITY.md](SECURITY.md) for how to report a v
 | Emission | One emission every `EMISSION_BLOCK_INTERVAL = 14_400` microblocks, split 25% operators / 75% light nodes when both cohorts are non-empty; when either cohort is empty the other receives the whole emission. Rewards are pull-only via signed claims |
 | Transaction fees | Credited in full to the block producer's registered wallet |
 | Smart contracts | WASM contracts execute on the apply path in the deterministic `qnet-vm` interpreter (fuel-metered, float-free), so contract state is part of the state root. QRC-20 and QRC-721 are native transaction arms in the state crate |
-| P2P transport | QUIC over TLS 1.3, built on the aws-lc-rs provider whose post-quantum hybrid key-exchange group is X25519MLKEM768 (ML-KEM-768, FIPS 203). Block fetch, peer authentication and health probes run over HTTP/TCP |
+| P2P transport | QUIC over TLS 1.3 on the aws-lc-rs provider. Peer identity is proved by an ML-DSA-65 signature bound to the session through exported keying material; the negotiated key-exchange group is the provider default. Block fetch, peer authentication and health probes run over HTTP/TCP |
 
 ## Node types
 

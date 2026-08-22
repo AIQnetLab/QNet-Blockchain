@@ -5756,7 +5756,7 @@ export class WalletManager {
   }
 
   // Register node with activation code
-  // PRODUCTION: Uses real Dilithium3 (ML-DSA-65) signatures + PushService for correct API
+  // PRODUCTION: Uses real ML-DSA-65 (ML-DSA-65) signatures + PushService for correct API
   // FALLBACK: If Dilithium not available, stores locally and registers without quantum sig
   async registerNodeWithCode(activationCode, walletAddress, password) {
     // Hoisted so catch block can reference them for storeActivationCode + on-chain recovery
@@ -5768,7 +5768,7 @@ export class WalletManager {
       const nodeType = 'light';
       const systemPseudonym = this.generateLightNodePseudonym(walletAddress);
 
-      // Try Dilithium3 registration first (full quantum-secure)
+      // Try ML-DSA-65 registration first (full quantum-secure)
       let registrationResult = null;
       let quantumSecured = false;
 
@@ -5777,10 +5777,10 @@ export class WalletManager {
         const { registerLightNode } = require('../services/PushService');
 
         if (isDilithiumAvailable()) {
-          // Generate or load Dilithium3 keypair
+          // Generate or load ML-DSA-65 keypair
           const dilithiumKeys = await this._walletDilithiumKeys(password);
 
-          // Part 1 (Dilithium3): Sign wallet_address — quantum-resistant identity proof
+          // Part 1 (ML-DSA-65): Sign wallet_address — quantum-resistant identity proof
           // Server verifies: verify_mobile_dilithium_signature(wallet_address, sig, pubkey)
           const registrationMessage = walletAddress;
           const quantumSignature = await signWithDilithium(
@@ -5790,11 +5790,11 @@ export class WalletManager {
             systemPseudonym
           );
 
-          // Pure ML-DSA-65: the Dilithium3 Part-1 signature above is the sole gossip authenticator.
+          // Pure ML-DSA-65: the ML-DSA-65 Part-1 signature above is the sole gossip authenticator.
           // The former Part-2 Ed25519 (light_node_gossip:...) proof is removed.
 
-          // ── PING DELEGATION v7.1: Dilithium3 (full quantum safety) ──────
-          // Dedicated Dilithium3 ping keypair stored in Keychain (hardware-encrypted).
+          // ── PING DELEGATION v7.1: ML-DSA-65 (full quantum safety) ──────
+          // Dedicated ML-DSA-65 ping keypair stored in Keychain (hardware-encrypted).
           // The wallet Dilithium key signs a delegation cert authorizing the ping key.
           // Background FCM handler signs with ping key — wallet key stays encrypted.
           let pingPubkeyHex = null;
@@ -6015,7 +6015,7 @@ export class WalletManager {
         throw dilithiumError;
       }
 
-      // No fallback — Dilithium3 is mandatory for node registration
+      // No fallback — ML-DSA-65 is mandatory for node registration
       if (!registrationResult) {
         throw new Error('Dilithium3 module not available. Quantum signature is required for node registration.');
       }
@@ -6132,10 +6132,10 @@ export class WalletManager {
         throw new Error('Dilithium3 module required for node ping. Rebuild app with native module.');
       }
 
-      // Load Dilithium3 keys (mandatory — no Ed25519 fallback)
+      // Load ML-DSA-65 keys (mandatory — no Ed25519 fallback)
       const dilithiumKeys = await this._walletDilithiumKeys(password);
 
-      // Sign challenge with Dilithium3
+      // Sign challenge with ML-DSA-65
       const dilithiumSig = await signWithDilithium(
         challenge,
         dilithiumKeys.secretKey,
@@ -6213,7 +6213,7 @@ export class WalletManager {
       // Chain-bound like every other preimage: mirror of rpc.rs handle_claim_rewards.
       const message = `${QNET_CHAIN_TAG}claim_rewards:${nodeId}:${walletAddress}`;
 
-      // Dilithium3 signature — quantum-safe proof of node ownership (NIST FIPS 204)
+      // ML-DSA-65 signature — quantum-safe proof of node ownership (NIST FIPS 204)
       // Activation code is used as seed so the same keypair is deterministically recovered
       let dilithiumSignature = null;
       let dilithiumPublicKey = null;

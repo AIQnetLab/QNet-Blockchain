@@ -300,7 +300,7 @@ pub type TxHash = String;
 /// One side of an equivocation proof: the per-block signable header fields of a
 /// microblock (height + producer are shared across both sides, kept on the TX).
 /// Carries enough to reconstruct the exact `Block_Sig_v23.1` signing digest and
-/// re-verify the producer's Dilithium3 signature on-chain — no trust in the reporter.
+/// re-verify the producer's ML-DSA-65 signature on-chain — no trust in the reporter.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EquivocationHeader {
     pub timestamp: u64,
@@ -412,7 +412,7 @@ pub enum TransactionType {
 
     /// Cryptographic proof that `offender` signed two DIFFERENT microblocks at the
     /// same `height` — provable equivocation. Both `EquivocationHeader.signature`s are
-    /// the offender's Dilithium3 sigs over the `Block_Sig_v23.1` digest of their fields;
+    /// the offender's ML-DSA-65 sigs over the `Block_Sig_v23.1` digest of their fields;
     /// unforgeable. Verified on-chain against the offender's registry PK and applied
     /// deterministically in the reputation fold (offender → reputation 0 + ban). No
     /// balance effect. Fail-safe: an invalid/forged proof simply fails verification.
@@ -680,14 +680,14 @@ pub enum TransactionType {
         api_endpoint: String,
     },
 
-    /// FIX R23-K1: Key rotation transaction — allows nodes to rotate their Dilithium3
+    /// FIX R23-K1: Key rotation transaction — allows nodes to rotate their ML-DSA-65
     /// public key on-chain. Required for post-quantum key hygiene and key compromise recovery.
     /// The old key signs the rotation TX (proving ownership), the new key is registered.
     /// Signature verification ensures only the current key owner can rotate.
     KeyRotation {
         /// Node ID performing the rotation
         node_id: String,
-        /// New Dilithium3 public key (hex-encoded, 1952 bytes decoded)
+        /// New ML-DSA-65 public key (hex-encoded, 1952 bytes decoded)
         new_dilithium_pk: String,
         /// Signature of new_dilithium_pk by the OLD key (proves ownership transition)
         old_key_signature: String,
@@ -719,7 +719,7 @@ pub struct HeartbeatSampleData {
     pub heartbeat_index: u8,               // Index in epoch (0-9)
     pub timestamp: u64,                    // Unix timestamp
     pub block_height: u64,                 // Block height when sent
-    pub signature: String,                 // HYBRID signature (Ed25519 + Dilithium3, ~2.6KB bincode)
+    pub signature: String,                 // HYBRID signature (Ed25519 + ML-DSA-65, ~2.6KB bincode)
     pub merkle_proof: Vec<(String, bool)>, // (hash, is_left) - proof of inclusion
 }
 
@@ -1419,7 +1419,7 @@ impl Transaction {
     ///   - Each burn_tx hash / activation code is recorded on-chain and can
     ///     be used exactly once; a replay lands in a dedup set and is
     ///     rejected at apply_to_state.
-    ///   - Ping/Heartbeat/Attestation TXs carry Dilithium3 sender signatures
+    ///   - Ping/Heartbeat/Attestation TXs carry ML-DSA-65 sender signatures
     ///     verified pre-mempool; impostors cannot spam.
     ///
     /// Consistent with `compute_gas_used() == 0` for every variant listed
@@ -2079,7 +2079,7 @@ impl Transaction {
                 }
                 // SENDER-IDENTITY ENFORCEMENT
                 // ────────────────────────────
-                // The TX-level sender (`self.from`) is the wallet whose Dilithium3
+                // The TX-level sender (`self.from`) is the wallet whose ML-DSA-65
                 // keypair signed the canonical bytes; it is also the wallet whose
                 // registered PK is checked against `self.dilithium_public_key` at
                 // apply time. The payload `from` field inside `Transfer` MUST equal
@@ -2551,7 +2551,7 @@ impl Transaction {
                 if node_id.is_empty() {
                     return Err("[REJECT][KEY-ROTATION] empty_node_id".to_string());
                 }
-                // Dilithium3 public key = 1952 bytes = 3904 hex chars
+                // ML-DSA-65 public key = 1952 bytes = 3904 hex chars
                 if new_dilithium_pk.len() != 3904 {
                     return Err(format!(
                         "[REJECT][KEY-ROTATION] invalid_pk_size expected=3904_hex got={}",
@@ -2567,7 +2567,7 @@ impl Transaction {
                 let _ = effective_height; // effective_height=0 means immediate
             }
             TransactionType::EquivocationProof { offender, block_a, block_b, .. } => {
-                // Structural check only — the cryptographic verification (Dilithium3 over
+                // Structural check only — the cryptographic verification (ML-DSA-65 over
                 // the Block_Sig_v23.1 digest against the offender's registry PK) runs at the
                 // integration layer, which holds the consensus PK registry.
                 if offender.is_empty() {
@@ -2635,16 +2635,16 @@ impl Transaction {
         // ═══════════════════════════════════════════════════════════════════════
         // STAGE 1: Presence check — if the sender account has opted into
         //   mandatory post-quantum signing (account.require_pq_signature == true),
-        //   reject any non-system TX that lacks a Dilithium3 signature.
+        //   reject any non-system TX that lacks a ML-DSA-65 signature.
         //
         // STAGE 2: Key binding — if the sender account has a registered
-        //   Dilithium3 public key (account.dilithium_public_key.is_some()),
+        //   ML-DSA-65 public key (account.dilithium_public_key.is_some()),
         //   the TX's `dilithium_public_key` MUST byte-match the registered key.
-        //   This prevents the "any-Dilithium3-key" bypass: an attacker with a
+        //   This prevents the "any-ML-DSA-65-key" bypass: an attacker with a
         //   forged Ed25519 signature cannot satisfy the gate by attaching their
-        //   own Dilithium3 keypair, because the TX would fail the registered-key
+        //   own ML-DSA-65 keypair, because the TX would fail the registered-key
         //   binding check. The attacker would need to compromise the holder's
-        //   specific Dilithium3 secret key — quantum-resistant by FIPS 204.
+        //   specific ML-DSA-65 secret key — quantum-resistant by FIPS 204.
         //
         // System TXs (NodeRegistration, RewardDistribution, KeyRotation, etc.)
         // are exempt — they are protocol-internal and authorised by other
@@ -2655,7 +2655,7 @@ impl Transaction {
         // marginal cost for accounts that haven't opted in. At thousands of
         // validators, the only cost is one HashMap lookup per applied TX.
         //
-        // The Dilithium3 signature itself is verified at ingest time (block
+        // The ML-DSA-65 signature itself is verified at ingest time (block
         // pipeline TX-sig verification and mempool admission). This gate
         // enforces presence + key binding only; signature validity is already
         // proven before apply.

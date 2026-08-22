@@ -1,4 +1,4 @@
-// QNet Dilithium3-VRF: Post-Quantum Verifiable Random Function
+// QNet ML-DSA-65-VRF: Post-Quantum Verifiable Random Function
 // NIST FIPS 204 (ML-DSA-65) + SHA3-256
 //
 // Construction:
@@ -6,7 +6,7 @@
 //   verify(pk, input, output, proof) -> bool
 //
 // SHA3-256 for domain separation + output derivation
-// Dilithium3 detached_sign for proof generation (deterministic in PQClean)
+// ML-DSA-65 detached_sign for proof generation (deterministic in PQClean)
 
 use pqcrypto_mldsa::mldsa65 as dilithium3;
 use pqcrypto_traits::sign::{
@@ -58,7 +58,7 @@ pub const D3_SIG_BYTES: usize = 3309;
 pub struct VrfOutput {
     /// Pseudorandom output (32 bytes)
     pub output: [u8; 32],
-    /// Dilithium3 detached signature proof
+    /// ML-DSA-65 detached signature proof
     pub proof: Vec<u8>,
 }
 
@@ -289,7 +289,7 @@ impl DilithiumVrf {
 }
 
 // =========================================================================
-// WalletIdentity — seed → wallet address + Dilithium3 keypair
+// WalletIdentity — seed → wallet address + ML-DSA-65 keypair
 // =========================================================================
 
 pub struct WalletIdentity {
@@ -341,7 +341,7 @@ impl WalletIdentity {
         format!("{}eon{}{}", p1, p2, ck)
     }
 
-    /// Sign data with Dilithium3 (detached)
+    /// Sign data with ML-DSA-65 (detached)
     pub fn sign(&self, data: &[u8]) -> Result<Vec<u8>, String> {
         let sk = dilithium3::SecretKey::from_bytes(&self.dilithium_sk)
             .map_err(|e| format!("[ERR][WALLET] sk_parse err={:?}", e))?;

@@ -9,7 +9,7 @@
 //!   - X25519 (classical ECDH) + ML-KEM 768 (post-quantum KEM)
 //!   - If quantum computer breaks X25519 → ML-KEM still protects
 //!   - If ML-KEM has vulnerability → X25519 still protects
-//! Combined with Dilithium3 signatures = full post-quantum P2P security.
+//! Combined with ML-DSA-65 signatures = full post-quantum P2P security.
 //!
 //! ## Architecture
 //!
@@ -566,7 +566,7 @@ fn build_adaptive_transport(initial_rtt_ms: u64) -> quinn::TransportConfig {
 }
 
 // NODE HANDSHAKE — authenticated identity binding (anti-spoof).
-// ONE canonical wire format. Every handshake carries a mandatory Dilithium3 proof over
+// ONE canonical wire format. Every handshake carries a mandatory ML-DSA-65 proof over
 // (node_id, timestamp, block_height, channel_binding); a frame that does not decode, or a
 // proof that fails under a REGISTERED PK, refuses the connection. Cost: <=1 verify per conn.
 
@@ -2435,9 +2435,14 @@ impl QuicTransport {
     
     /// Broadcast message (unidirectional, no response) with retry
     pub async fn broadcast_to(&self, peer_addr: SocketAddr, msg: &NetworkMessage) -> Result<(), String> {
-        // Serialize message once
         let wire_data = Self::serialize_message(msg)?;
-        
+        self.broadcast_wire_to(peer_addr, &wire_data).await
+    }
+
+    /// broadcast_to with the frame already on the wire format. A fan-out that serializes per peer
+    /// holds one copy per in-flight send, and a certificate at a 1000-member committee carries that
+    /// many un-aggregated ML-DSA-65 signatures - so the caller serializes once and shares the bytes.
+    pub async fn broadcast_wire_to(&self, peer_addr: SocketAddr, wire_data: &[u8]) -> Result<(), String> {
         // Retry loop for broadcast attempts
         let mut last_error = String::new();
         for attempt in 1..=CONNECT_RETRY_ATTEMPTS {
@@ -2503,6 +2508,11 @@ impl QuicTransport {
     }
     
     /// Serialize message to wire format
+    /// Wire encoding for a broadcast frame, so a fan-out can serialize once for all peers.
+    pub fn serialize_for_broadcast(msg: &NetworkMessage) -> Result<Vec<u8>, String> {
+        Self::serialize_message(msg)
+    }
+
     fn serialize_message(msg: &NetworkMessage) -> Result<Vec<u8>, String> {
         let payload = bincode::serialize(msg)
             .map_err(|e| format!("Serialize failed: {}", e))?;

@@ -26,7 +26,7 @@
 //! ## Security Model
 //!
 //! 1. **Transport Encryption**: QUIC with TLS 1.3
-//! 2. **Peer Authentication**: PqCertificate (ML-DSA-65 / Dilithium3)
+//! 2. **Peer Authentication**: PqCertificate (ML-DSA-65 / ML-DSA-65)
 //! 3. **Message Integrity**: Dilithium signatures on all messages
 //! 4. **Post-Quantum**: NIST FIPS 204 compliant (ML-DSA/Dilithium)
 //!

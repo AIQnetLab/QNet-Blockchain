@@ -31,8 +31,8 @@ cryptography bundle. The pages that run — the popup and the setup flow — loa
 - Content security policy for extension pages: `script-src 'self'; object-src 'none'; style-src
   'self' 'unsafe-inline';`.
 - One content script, `content.js`, injected into `<all_urls>` at `document_start`.
-- `web_accessible_resources` exposes `setup.html`, `setup.js`, `app.html`, `app.js` and the
-  `styles/`, `scripts/`, `src/`, `icons/` and `lib/` directories to all URLs.
+- `web_accessible_resources` exposes `setup.html`, `setup.js`, `app.html`, `app.js`, `inject.js` and
+  the `styles/`, `scripts/`, `src/`, `icons/` and `lib/` directories to all URLs.
 - Localisation files exist for 11 languages under `dist/src/i18n/locales/`.
 
 ## Build
@@ -49,7 +49,7 @@ npm run build          # runs tools/dilithium-wasm/build.js
 canonical wallet derivation into `dist/lib/noble-pq-ml-dsa.js` as an IIFE that sets the global
 `QNetDilithiumLib`. The output is plain JavaScript. Build targets are `chrome89`, `firefox89` and
 `safari15`. `tools/dilithium-wasm/compat_test.js` checks key and signature sizes, deterministic
-keygen and the envelope wire format.
+keygen, the golden derivation vector, the chain-bound transfer preimage and the raw-hex wire format.
 
 ## Identity and derivation
 
@@ -87,6 +87,8 @@ Endpoints used by the shipped service worker:
 | Endpoint | Purpose |
 | --- | --- |
 | `GET /api/v1/account/{address}/balance` | QNC balance in nanoQNC |
+| `GET /api/v1/account/{address}` | Committed account nonce, from which the next transfer nonce is derived |
+| `GET /api/v1/account/{address}/balance/proof` | Balance, account proof and the node-claimed `state_root` |
 | `GET /api/v1/macroblock/{index}` | `state_root` for the balance cross-check |
 | `GET /api/v1/node/{address}/info` | Node status shown on the node tab |
 | `GET /api/v1/network/stats` | Network summary |
@@ -107,16 +109,19 @@ q{chain_id}|transfer:{from}:{to}:{amount_nano}:{nonce}:{gas_price}:{gas_limit}
 
 `q{chain_id}` is the chain tag (`q1337` on testnet); it must byte-match the node's `QNET_CHAIN_ID`.
 
-The nonce is read from the node when the caller does not supply one; the defaults are `gas_price = 10`
-and `gas_limit = 21000`. The signature and public key are posted to `/api/v1/transaction`, with the
-signature carried in the `dilithium_sig_{pk_hex}_{base64}` envelope emitted by the bundle's
-`signQNet`.
+When the caller does not supply a nonce it is read from `/api/v1/account/{address}` as the committed
+account nonce plus one; the defaults are `gas_price = 10` and `gas_limit = 21000`. The bundle's
+`signQNet` self-verifies the signature under the account public key and returns the node wire format:
+hex of the raw 3309-byte detached signature, with no envelope. That string is posted to
+`/api/v1/transaction` as `dilithium_signature`, together with the hex public key as
+`dilithium_public_key`.
 
 ### Balance cross-check
 
-`VERIFY_QNC_BALANCE` queries `/api/v1/macroblock/{index}` on up to five discovered nodes and accepts
-the `state_root` when at least two thirds of the responding nodes agree. The flag the popup shows
-reports that agreement. Balances checked against a committee quorum certificate and a folded
+`VERIFY_QNC_BALANCE` reads `/api/v1/account/{address}/balance/proof`, checks that the served proof is
+well formed, then queries `/api/v1/macroblock/{index}` on up to five discovered nodes and accepts the
+`state_root` when at least two nodes respond and two thirds of the responders agree. The flag the
+popup shows requires both. Balances checked against a committee quorum certificate and a folded
 sparse-Merkle proof are available in the [mobile wallet](mobile-wallet.md).
 
 ## Page provider API

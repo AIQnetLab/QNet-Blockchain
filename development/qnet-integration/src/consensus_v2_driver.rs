@@ -63,7 +63,9 @@ pub struct ConsensusDriver {
     state_roots: HashMap<u64, Hash>, // round → checkpoint state_root (Finalize carries it; verified locally, no macroblock body needed)
     mb_hashes: HashMap<u64, Vec<Hash>>, // round → QC'd per-height body hashes (Finalize content-verifies local bodies against these before advancing — intra checkpoints have no stored macroblock)
     seal_data: HashMap<u64, (Vec<u8>, Vec<NodeId>)>, // round → (eligible_producers, committee)
-    sealed: std::collections::HashSet<u64>, // windows we already emitted Persist for (dedup)
+    sealed: std::collections::HashSet<u64>, // windows the node CONFIRMED durably stored (dedup)
+    seal_skipped: Option<u64>,              // last window skipped for want of seal inputs (observability)
+    pending_seals: Vec<(u64, Effect)>,      // Persists built on a QC, released by the 2-chain commit
     last_proposed_round: u64,               // one proposal per round we lead
     high_window: u64,                       // monotonic high-water-mark of the QC'd window; next_window never
                                             // regresses below it, so a head-less relayed QC/TC cannot collapse
@@ -80,7 +82,8 @@ impl ConsensusDriver {
             eng: CheckpointConsensus::new(node_id.clone(), committee.clone()),
             committee, genesis_hash, node_id,
             proposals: HashMap::new(), heads: HashMap::new(), state_roots: HashMap::new(), mb_hashes: HashMap::new(), seal_data: HashMap::new(),
-            sealed: std::collections::HashSet::new(), last_proposed_round: 0, high_window: 0,
+            sealed: std::collections::HashSet::new(), seal_skipped: None, pending_seals: Vec::new(),
+            last_proposed_round: 0, high_window: 0,
             cp_interval: CHECKPOINT_INTERVAL, macro_interval: MACROBLOCK_INTERVAL,
             rc: None, rc_propose_ok: false,
         }
@@ -318,6 +321,25 @@ impl ConsensusDriver {
                 if cp.window_head_height != self.next_window().saturating_mul(self.cp_interval) {
                     return Vec::new();
                 }
+                // Same doctrine for the INDEX. The engine refuses any index but its current one
+                // (checkpoint_consensus on_proposal), so recording one here writes maps the engine will
+                // never act on - and heads/state_roots/mb_hashes feed the finality inputs. A proposal
+                // that is merely early is buffered and replayed by the node loop, so nothing is lost.
+                if cp.index != self.eng.current_index {
+                    return Vec::new();
+                }
+                // Same doctrine for the INDEX. The engine refuses any index but its current one
+                // (checkpoint_consensus on_proposal), so recording one here writes maps the engine will
+                // never act on - and heads/state_roots/mb_hashes feed the finality inputs. A proposal
+                // that is merely early is buffered and replayed by the node loop, so nothing is lost.
+                // Same doctrine for the INDEX. The engine refuses any index but its current one
+                // (checkpoint_consensus on_proposal), so recording one here writes maps the engine will
+                // never act on - and heads/state_roots/mb_hashes feed the finality inputs. A proposal
+                // that is merely early is buffered and replayed by the node loop, so nothing is lost.
+                // Same doctrine for the INDEX. The engine refuses any index but its current one
+                // (checkpoint_consensus on_proposal), so recording one here writes maps the engine will
+                // never act on - and heads/state_roots/mb_hashes feed the finality inputs. A proposal
+                // that is merely early is buffered and replayed by the node loop, so nothing is lost.
                 // A pinned proposal must satisfy the POSITIONAL clauses the macroblock authority
                 // re-derives from the certificate's own bytes (`resolve_recovery_pin`): the head on
                 // the span grid, and a strictly-lower parent link. Without this mirror an armed node
@@ -328,7 +350,35 @@ impl ConsensusDriver {
                     let parent_ok = cp.parent_qc.as_ref().map(|p| p.index < cp.index).unwrap_or(false);
                     if !step_ok || !parent_ok { return Vec::new(); }
                 }
-                let ph = cp.parent_qc.as_ref().map(|q| q.checkpoint_hash).unwrap_or(self.genesis_hash);
+                // THE PARENT LINK IS A CLAIM WE CHECK, NOT A SOURCE OF TRUTH. Leader election is
+                // SHA3(index || parent_hash), so taking that hash from the proposal lets one committee
+                // member grind 32 bytes until the function elects it, copy the honest window content
+                // and emit a second valid proposal at the same index - a vote split that is not
+                // equivocation, so nothing convicts it, repeated every round.
+                //
+                // Requiring the claim to equal what WE certified adds no honest refusal: QcRef carries
+                // no signatures, so two independently-formed QCs for one checkpoint are byte-identical,
+                // and the head gate above already passes only when our next_window equals the
+                // proposer's - which pins high_qc to the same index, where an honest QC is unique.
+                // Logged, so if it ever fires on the live network it is visible immediately.
+                let ph = if cp.recovery_anchor.is_some() {
+                    // Pinned: bound by the span's positional clauses above, and refused outright by
+                    // the node content gate while the relaxation is off.
+                    cp.parent_qc.as_ref().map(|q| q.checkpoint_hash).unwrap_or(self.genesis_hash)
+                } else {
+                    let ours = self.eng.high_qc.as_ref()
+                        .map(qnet_consensus::checkpoint_bft::QcRef::from);
+                    if cp.parent_qc != ours {
+                        if crate::node::is_warn() {
+                            println!("[WARN][BFT2] proposal_parent_mismatch idx={} claimed={:?} ours={:?}",
+                                     cp.index,
+                                     cp.parent_qc.as_ref().map(|q| q.index),
+                                     ours.as_ref().map(|q| q.index));
+                        }
+                        return Vec::new();
+                    }
+                    self.parent_hash()
+                };
                 self.heads.insert(cp.index, cp.window_head_height);
                 self.state_roots.insert(cp.index, cp.state_root);
                 self.mb_hashes.insert(cp.index, cp.window_mb_hashes.clone());
@@ -416,11 +466,35 @@ impl ConsensusDriver {
         // at macro_interval while finality runs at the faster cp_interval.
         if cp.window_head_height % self.macro_interval != 0 { return Vec::new(); }
         let window = cp.window_head_height / self.macro_interval; // dedup by macroblock window
-        if self.sealed.contains(&window) { return Vec::new(); } // a skipped round re-proposes it.
-        self.sealed.insert(window);
-        let (eligible_producers, committee) = self.seal_data.get(&qc.index).cloned().unwrap_or_default();
-        vec![Effect::Persist { checkpoint: cp, qc: qc.clone(), eligible_producers, committee }]
+        if self.sealed.contains(&window) { return Vec::new(); } // confirmed durable by the node
+        // Seal inputs absent (round pruned): a default-empty producer set builds a body
+        // byte-different from every other sealer's, and an empty committee makes quorum_size 0.
+        // Fail closed; the node reports it.
+        let (eligible_producers, committee) = match self.seal_data.get(&qc.index) {
+            Some(d) => d.clone(),
+            None => { self.seal_skipped = Some(window); return Vec::new(); }
+        };
+        // HELD, not emitted: a 1-chain QC is not final. Action::Commit releases it below. A SET,
+        // not one slot: at a 1:1 cadence the next boundary QC arrives in the same translate pass as
+        // the commit that would release this one, and a single slot would lose it.
+        let effect = Effect::Persist { checkpoint: cp, qc: qc.clone(), eligible_producers, committee };
+        // Already 2-chain committed: emit now. This is also the RETRY path - a re-delivered
+        // certificate for a window the node failed to store must produce Persist again, and no
+        // new Commit action will fire for an index the frontier has already passed.
+        if self.eng.committed_index >= qc.index { return vec![effect]; }
+        const MAX_PENDING_SEALS: usize = 4;
+        self.pending_seals.retain(|(i, _)| *i != qc.index);
+        self.pending_seals.push((qc.index, effect));
+        if self.pending_seals.len() > MAX_PENDING_SEALS { self.pending_seals.remove(0); }
+        Vec::new()
     }
+
+    /// The node confirms `window` is durably stored. Presuming it on EMIT lost the window
+    /// forever whenever the node then refused to persist, because the dedup set already held it.
+    pub fn mark_sealed(&mut self, window: u64) { self.sealed.insert(window); }
+
+    /// Drain the last window skipped for want of seal inputs (the driver itself stays pure).
+    pub fn take_seal_skipped(&mut self) -> Option<u64> { self.seal_skipped.take() }
 
     fn translate(&mut self, actions: Vec<Action>) -> Vec<Effect> {
         let mut out = Vec::new();
@@ -435,6 +509,18 @@ impl ConsensusDriver {
                     out.push(Effect::Relay(ConsensusMsg::Qc(qc)));
                 }
                 Action::Commit(idx) => {
+                    // The macroblock is the durable epoch object, so it seals on the 2-chain
+                    // commit and nowhere else. A window whose QC never gets a child QC never
+                    // commits and therefore never seals - which is the safety property: two
+                    // byte-different contents at one window head can each reach a 1-chain QC
+                    // across rounds, but only the branch that continues can commit.
+                    // Released when the commit frontier REACHES the held index, not only when the
+                    // commit lands exactly on it: a skipped round commits r+2 whose parent is r, so
+                    // an equality test would strand that window unsealed for good.
+                    let (released, kept): (Vec<_>, Vec<_>) = self.pending_seals
+                        .drain(..).partition(|(i, _)| *i <= idx);
+                    self.pending_seals = kept;
+                    for (_, e) in released { out.push(e); }
                     // Finalize with the committed checkpoint's OWN QC'd head + state_root — NEVER a
                     // head=0 placeholder (that defers forever and freezes the finality marker, which
                     // is what wedged the chain). Missing locally ⇒ we committed via a relayed QC
@@ -512,7 +598,12 @@ mod tests {
                 signature: sign(&n.id, &timeout_bytes(index, high_qc_index)),
             })],
             Effect::Relay(m) => vec![m],
-            Effect::Persist { checkpoint, .. } => { n.sealed.push(checkpoint.window_head_height / 90); vec![] }
+            Effect::Persist { checkpoint, .. } => {
+                let w = checkpoint.window_head_height / 90;
+                n.sealed.push(w);
+                n.d.mark_sealed(w); // models the node confirming a successful save
+                vec![]
+            }
             Effect::Finalize { index, .. } => { if index > n.committed { n.committed = index; } vec![] }
         }
     }
@@ -788,7 +879,9 @@ mod tests {
             Node { d, id: id.clone(), committed: 0, sealed: Vec::new() }
         }).collect();
         // 6 checkpoints ⇒ heads 30,60,90,120,150,180.
-        for index in 1..=6u64 {
+        // The 7th checkpoint is NOT a boundary (210 % 90 = 30): it only supplies the child
+        // QC that 2-chain commits index 6, which is when window 2 seals.
+        for index in 1..=7u64 {
             let mut seed = Vec::new();
             for k in 0..nodes.len() {
                 let effs = nodes[k].d.build_proposal(index, vec![[index as u8; 32]], [index as u8; 32], [0u8; 32], index * 1000, c.clone(), Vec::new(), Vec::new(), [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], 0);
@@ -849,6 +942,8 @@ mod tests {
         // The uncommitted window is re-proposed at the skipped-to round (no gap).
         step(&mut nodes, &c, 3);
         step(&mut nodes, &c, 4);
+        // Window 4 seals on its 2-chain commit, which window 5 supplies.
+        step(&mut nodes, &c, 5);
         for k in 0..nodes.len() {
             let mut s = nodes[k].sealed.clone(); s.sort(); s.dedup();
             assert_eq!(s, vec![1, 2, 3, 4], "node {} windows not contiguous across skip: {:?}", k, s);
@@ -1302,4 +1397,285 @@ mod tests {
         assert!(restored.handle(&ConsensusMsg::Proposal(conflict)).is_empty(),
                 "a reloaded commitment must refuse what conviction punishes");
     }
+
+
+    // Catch-up is ONE-WAY. A node restored by sync then receives an old certificate - a stale relay,
+    // a slow peer, a replay. Neither the window it will accept next nor its committed index may move
+    // backwards, or it would re-propose a window the chain has already passed and wedge on it.
+    #[test]
+    fn catch_up_is_not_undone_by_a_stale_certificate() {
+        let (c, mut nodes, mut tails) = five_node_harness();
+        let (mut cps, mut qcs) = (Vec::new(), Vec::new());
+        for w in 1..=5u64 {
+            for t in tails.iter_mut() { *t = vec![[w as u8; 32]]; }
+            let seed = propose_window(&mut nodes, &tails, &c, w);
+            let (p, q) = deliver_capture(&mut nodes, &mut tails, &c, seed, false);
+            cps.extend(p);
+            qcs.extend(q);
+        }
+        let certified = |i: u64| -> (Checkpoint, QuorumCertificate) {
+            let qc = qcs.iter().find(|q| q.index == i).expect("window must certify").clone();
+            let cp = cps.iter().find(|p| p.index == i && p.hash() == qc.checkpoint_hash)
+                .expect("certified checkpoint").clone();
+            (cp, qc)
+        };
+
+        let mut d = ConsensusDriver::new(c[0].clone(), c.clone(), [7u8; 32]);
+        d.set_intervals(30, 90);
+        for i in 1..=5u64 { let (cp, qc) = certified(i); let _ = d.sync(&cp, &qc); }
+        let (window_after, committed_after) = (d.next_window(), d.committed_index());
+        assert!(window_after > 1, "sanity: the replica caught up");
+
+        let (_, stale) = certified(1);
+        let _ = d.handle(&ConsensusMsg::Qc(stale));
+        assert_eq!(d.next_window(), window_after, "a stale certificate must not walk the window back");
+        assert!(d.committed_index() >= committed_after, "finality must never regress");
+    }
+
+    // OFF-INDEX PROPOSAL. A proposal whose head is contiguous but whose INDEX the engine has left
+    // must touch nothing: heads/state_roots/mb_hashes are the finality inputs, and the engine refuses
+    // that index anyway, so recording it only lets a committee member write state nobody will act on.
+    #[test]
+    fn a_proposal_at_an_index_the_view_has_left_records_nothing() {
+        let (c, mut nodes, mut tails) = five_node_harness();
+        warm_three_windows(&mut nodes, &mut tails, &c, false);
+        let d = &mut nodes[0].d;
+        let before_window = d.next_window();
+        let before_committed = d.committed_index();
+
+        // Contiguous head, an index the view never occupied.
+        let stale = Checkpoint {
+            index: 99, parent_qc: None, window_head_height: before_window * 30,
+            window_mb_hashes: vec![[0xAAu8; 32]], state_root: [0xAAu8; 32], beacon: [0u8; 32],
+            epoch_commitment: [0u8; 32], reward_root: [0u8; 32], registry_root: [0u8; 32],
+            dilithium_pk_root: [0u8; 32], reward_epoch_root: [0u8; 32], logs_root: [0u8; 32],
+            total_supply: 0, timestamp: 0, proposer: c[0].clone(), proposer_sig: Vec::new(),
+            recovery_anchor: None,
+        };
+        assert!(d.handle(&ConsensusMsg::Proposal(stale)).is_empty(),
+                "an off-index proposal must produce no effect");
+        // The maps are what matter: a later certificate at that index would read them back as the
+        // head and state to finalize, so the write itself is the defect, not the missing vote.
+        assert!(!d.heads.contains_key(&99), "off-index proposal wrote heads");
+        assert!(!d.state_roots.contains_key(&99), "off-index proposal wrote state_roots");
+        assert!(!d.mb_hashes.contains_key(&99), "off-index proposal wrote mb_hashes");
+        assert_eq!(d.next_window(), before_window, "and must not move the window");
+        assert_eq!(d.committed_index(), before_committed, "nor the committed frontier");
+    }
+
+    // SEAL CONFIRMATION. The driver used to mark a window sealed the moment it EMITTED Persist, while
+    // the node's Persist arm refuses at four places (pin check, parent absent, ban set underivable,
+    // save error). After any refusal the dedup set already held the window, so every later certificate
+    // returned early and the macroblock was never written and never retried - a silent permanent loss.
+    // This node never confirms, so under presumption the second certificate yields nothing.
+    #[test]
+    fn a_seal_the_node_never_confirmed_is_retried() {
+        let (c, mut nodes, mut tails) = five_node_harness();
+        let (mut cps, mut qcs) = (Vec::new(), Vec::new());
+        for w in 1..=4u64 {
+            for t in tails.iter_mut() { *t = vec![[w as u8; 32]]; }
+            let seed = propose_window(&mut nodes, &tails, &c, w);
+            let (p, q) = deliver_capture(&mut nodes, &mut tails, &c, seed, false);
+            cps.extend(p);
+            qcs.extend(q);
+        }
+        let certified = |i: u64| -> (Checkpoint, QuorumCertificate) {
+            let qc = qcs.iter().find(|q| q.index == i).expect("window must certify").clone();
+            let cp = cps.iter().find(|p| p.index == i && p.hash() == qc.checkpoint_hash)
+                .expect("the certified checkpoint must be on the wire").clone();
+            (cp, qc)
+        };
+
+        // A replica caught up to window 2, then handed window 3 - the head-90 macroblock boundary.
+        let mut d = ConsensusDriver::new(c[0].clone(), c.clone(), [7u8; 32]);
+        d.set_intervals(30, 90);
+        for i in 1..=2u64 { let (cp, qc) = certified(i); let _ = d.sync(&cp, &qc); }
+        // Every member runs build_proposal: it buffers the window's seal inputs before the
+        // leader gate, which is what lets any member seal locally on the QC (all-seal).
+        let _ = d.build_proposal(3, vec![[3u8; 32]], [3u8; 32], [0u8; 32], 3000, c.clone(),
+                                 Vec::new(), Vec::new(), [0u8; 32], [0u8; 32], [0u8; 32],
+                                 [0u8; 32], [0u8; 32], 0);
+        let (cp3, qc3) = certified(3);
+        let _ = d.handle(&ConsensusMsg::Proposal(cp3));
+
+        // The boundary QC alone is not final: the seal is HELD until the 2-chain commit,
+        // which the next certified index supplies.
+        assert!(!d.handle(&ConsensusMsg::Qc(qc3.clone())).iter()
+                    .any(|e| matches!(e, Effect::Persist { .. })),
+                "a 1-chain QC must not seal the macroblock");
+        let (cp4, qc4) = certified(4);
+        let _ = d.build_proposal(4, vec![[4u8; 32]], [4u8; 32], [0u8; 32], 4000, c.clone(),
+                                 Vec::new(), Vec::new(), [0u8; 32], [0u8; 32], [0u8; 32],
+                                 [0u8; 32], [0u8; 32], 0);
+        let _ = d.handle(&ConsensusMsg::Proposal(cp4));
+        let first = d.handle(&ConsensusMsg::Qc(qc4));
+        assert!(first.iter().any(|e| matches!(e, Effect::Persist { .. })),
+                "the 2-chain commit must ask the node to seal");
+
+        // The node refused to store it and therefore never confirmed. The next certificate must retry.
+        let second = d.handle(&ConsensusMsg::Qc(qc3.clone()));
+        assert!(second.iter().any(|e| matches!(e, Effect::Persist { .. })),
+                "a window the node never stored must be re-emitted, not presumed sealed");
+
+        // Once the node confirms, the same certificate must not seal twice.
+        d.mark_sealed(cp3_window(&qc3, &cps));
+        let third = d.handle(&ConsensusMsg::Qc(qc3));
+        assert!(!third.iter().any(|e| matches!(e, Effect::Persist { .. })),
+                "a confirmed window must never be sealed a second time");
+    }
+
+    /// Macroblock window of the checkpoint `qc` certifies.
+    fn cp3_window(qc: &QuorumCertificate, cps: &[Checkpoint]) -> u64 {
+        cps.iter().find(|p| p.index == qc.index && p.hash() == qc.checkpoint_hash)
+            .expect("certified checkpoint").window_head_height / 90
+    }
+
+    // ============================================================================================
+    // FAULT INJECTION (halt 47250). The sims above all check that something BAD is refused, or that one
+    // past wedge converges. None injects an HONEST node with INCOMPLETE data - which is what happened:
+    // a node lost microblock bodies inside a window, could not vote its boundary checkpoint, and the
+    // other four (exactly quorum, n-f = 4 of 5) certified without it. These inject that fault and assert
+    // LIVENESS. They deliberately separate two obligations: what the DRIVER owes (accept a certified
+    // catch-up and resume voting) from what the NODE LAYER owes (notice the gap and feed that catch-up).
+    // ============================================================================================
+
+    // deliver_gated, plus a record of every checkpoint and certificate that crossed the wire. Catch-up
+    // needs the artefacts themselves, not just their effect on the nodes that already had them.
+    fn deliver_capture(nodes: &mut Vec<Node>, tails: &mut Vec<Vec<Hash>>, c: &[NodeId],
+                       seed: Vec<ConsensusMsg>, adopt: bool)
+                       -> (Vec<Checkpoint>, Vec<QuorumCertificate>) {
+        let (mut cps, mut qcs) = (Vec::new(), Vec::new());
+        let mut queue = seed;
+        let mut rounds = 0;
+        while !queue.is_empty() && rounds < 4000 {
+            rounds += 1;
+            let mut next = Vec::new();
+            for m in queue.drain(..) {
+                match &m {
+                    ConsensusMsg::Proposal(cp) => cps.push(cp.clone()),
+                    ConsensusMsg::Qc(qc) => qcs.push(qc.clone()),
+                    _ => {}
+                }
+                for k in 0..nodes.len() {
+                    if !verify_msg(c, &m) { continue; }
+                    if let ConsensusMsg::Proposal(cp) = &m {
+                        if tails[k] != cp.window_mb_hashes {
+                            if adopt { tails[k] = cp.window_mb_hashes.clone(); } else { continue; }
+                        }
+                    }
+                    let effs = nodes[k].d.handle(&m);
+                    for e in effs { next.extend(exec(&mut nodes[k], e)); }
+                }
+            }
+            queue = next;
+        }
+        (cps, qcs)
+    }
+
+    // Drive `w` as a clean window every node can vote.
+    fn clean_window(nodes: &mut Vec<Node>, tails: &mut Vec<Vec<Hash>>, c: &[NodeId], w: u64) {
+        for t in tails.iter_mut() { *t = vec![[w as u8; 32]]; }
+        let seed = propose_window(nodes, tails, c, w);
+        deliver_gated(nodes, tails, c, seed, false);
+    }
+
+    // Window `w` with node 0 unable to derive it (lost bodies => its content gate withholds the vote).
+    // Returns the certified checkpoint and certificate the other four produced without it.
+    fn window_lost_by_node0(nodes: &mut Vec<Node>, tails: &mut Vec<Vec<Hash>>, c: &[NodeId], w: u64)
+                            -> (Checkpoint, QuorumCertificate) {
+        for k in 0..5 { tails[k] = if k == 0 { vec![[0xDEu8; 32]] } else { vec![[w as u8; 32]] }; }
+        let seed = propose_window(nodes, tails, c, w);
+        let (cps, qcs) = deliver_capture(nodes, tails, c, seed, false);
+        let qc = qcs.into_iter().find(|q| q.index == w)
+            .expect("four honest nodes are exactly quorum and must certify without the fifth");
+        let cp = cps.into_iter().find(|p| p.index == w && p.hash() == qc.checkpoint_hash)
+            .expect("the certified checkpoint must be on the wire");
+        (cp, qc)
+    }
+
+    // THE DRIVER'S OBLIGATION. A node that missed one window is handed the certified checkpoint and its
+    // certificate - the honest catch-up path - and must then be a full participant again: not merely
+    // numerically level with the cluster, but voting, so the next window still certifies with it in the
+    // count. A driver that accepts catch-up but stays mute leaves the cluster one fault from a halt.
+    #[test]
+    fn a_node_restored_by_sync_votes_again() {
+        let (c, mut nodes, mut tails) = five_node_harness();
+        warm_three_windows(&mut nodes, &mut tails, &c, false);
+        for n in &nodes { assert_eq!(n.d.next_window(), 4, "warm-up must reach window 4"); }
+
+        let (cp, qc) = window_lost_by_node0(&mut nodes, &mut tails, &c, 4);
+        assert_eq!(nodes[0].d.next_window(), 4, "the damaged node must not advance on its own");
+
+        let _ = nodes[0].d.sync(&cp, &qc);
+        assert!(nodes[0].d.next_window() > 4,
+                "a certified checkpoint must restore the node: still at {}", nodes[0].d.next_window());
+
+        // It must now carry its share: window 5 is proposed with node 0 present and healthy.
+        clean_window(&mut nodes, &mut tails, &c, 5);
+        let level = nodes.iter().filter(|n| n.d.next_window() == nodes[1].d.next_window()).count();
+        assert_eq!(level, 5, "every node must be level after catch-up: {:?}",
+                   nodes.iter().map(|n| n.d.next_window()).collect::<Vec<_>>());
+        assert!(nodes[0].committed >= nodes[1].committed,
+                "the restored node must finalize with the cluster, not trail it");
+    }
+
+    // THE NODE LAYER'S OBLIGATION, stated as a gap. Without catch-up the damaged node can NEVER return on
+    // its own: a proposal is refused unless its head already equals `next_window * 30`, and a bare
+    // certificate deliberately does not move `next_window` (adopting a head-less QC once collapsed it to
+    // 1 and wedged the net - see headless_qc_adopt_does_not_collapse_next_window). Both refusals are
+    // correct in isolation. Together they mean recovery is neither optional nor automatic: something
+    // above the driver MUST notice the gap and deliver checkpoint+QC. Nothing did, and the node sat out.
+    #[test]
+    fn a_damaged_node_cannot_return_without_catch_up() {
+        let (c, mut nodes, mut tails) = five_node_harness();
+        warm_three_windows(&mut nodes, &mut tails, &c, false);
+
+        let (_, qc) = window_lost_by_node0(&mut nodes, &mut tails, &c, 4);
+        let _ = nodes[0].d.handle(&ConsensusMsg::Qc(qc));
+
+        // Its data is repaired and the chain runs on. Repair alone changes nothing.
+        for w in 5..=6u64 { clean_window(&mut nodes, &mut tails, &c, w); }
+        assert_eq!(nodes[0].d.next_window(), 4,
+                   "documents the gap: repair and certificates alone must not be mistaken for recovery");
+        assert!(nodes[1].d.next_window() > 4, "the healthy majority must have moved on");
+    }
+
+    // Every node's view timer fires; the resulting timeouts (and any TC they form) are delivered.
+    fn fire_timeouts(nodes: &mut Vec<Node>, tails: &mut Vec<Vec<Hash>>, c: &[NodeId]) {
+        let mut seed = Vec::new();
+        for k in 0..nodes.len() {
+            let effs = nodes[k].d.on_timeout();
+            for e in effs { seed.extend(exec(&mut nodes[k], e)); }
+        }
+        deliver_gated(nodes, tails, c, seed, false);
+    }
+
+    // RECOVERY FROM A FAILED WINDOW. A window that fell short of quorum cannot be re-proposed at the same
+    // view - `round > last_proposed_round` allows one proposal per index, which is correct and deliberate.
+    // Recovery therefore runs entirely through the view change: the view timers fire, a timeout
+    // certificate rotates the round, and the SAME window is proposed again by the new leader and
+    // certifies. If that path does not close, one bad round halts the chain permanently, because nothing
+    // else can ever move the index.
+    #[test]
+    fn a_failed_window_recovers_through_the_view_change() {
+        let (c, mut nodes, mut tails) = five_node_harness();
+        warm_three_windows(&mut nodes, &mut tails, &c, false);
+
+        // Window 4 falls short: two nodes hold a divergent tail, leaving 3 < quorum 4.
+        for k in 0..5 { tails[k] = if k < 2 { vec![[0xBEu8; 32]] } else { vec![[4u8; 32]] }; }
+        let seed = propose_window(&mut nodes, &tails, &c, 4);
+        deliver_gated(&mut nodes, &mut tails, &c, seed, false);
+        assert!(nodes.iter().all(|n| n.d.next_window() == 4), "sanity: the window must have failed");
+
+        // The mismatch clears, the view timers fire, and the same window is proposed under a new round.
+        for t in tails.iter_mut() { *t = vec![[4u8; 32]]; }
+        fire_timeouts(&mut nodes, &mut tails, &c);
+        let seed = propose_window(&mut nodes, &tails, &c, 4);
+        deliver_gated(&mut nodes, &mut tails, &c, seed, false);
+
+        assert!(nodes.iter().all(|n| n.d.next_window() > 4),
+                "a failed window must recover through the view change: {:?}",
+                nodes.iter().map(|n| n.d.next_window()).collect::<Vec<_>>());
+    }
+
 }

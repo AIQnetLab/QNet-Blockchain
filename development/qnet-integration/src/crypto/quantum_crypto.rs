@@ -1,5 +1,5 @@
 //! QNet Quantum-Resistant Cryptography Module for Server
-//! Production implementation using CRYSTALS-Dilithium3 and XOR-based activation code encryption
+//! Production implementation using CRYSTALS-ML-DSA-65 and XOR-based activation code encryption
 //! Server-side activation code decryption and validation
 
 use sha3::{Sha3_256, Digest};
@@ -548,7 +548,7 @@ impl QNetQuantumCrypto {
         // 3. Verify through the consensus-layer canonical path.
         //
         //    `verify_consensus_signature` is the ONE function authorised to
-        //    accept or reject a Dilithium3 signature for an identity-bearing
+        //    accept or reject a ML-DSA-65 signature for an identity-bearing
         //    wire message. It performs the FULL chain of checks:
         //      a) Decodes the on-the-wire format ("dilithium_sig_<id>_<b64>",
         //         "compact_bin:<b64>", "pq_bin:<b64>", etc.);
@@ -566,7 +566,7 @@ impl QNetQuantumCrypto {
         //    that — when the consensus-layer call returned `false` — re-parsed
         //    the same combined format locally and ran ONLY the math check,
         //    skipping the registry binding from step (c). That branch let any
-        //    peer with their own valid Dilithium3 keypair forge messages
+        //    peer with their own valid ML-DSA-65 keypair forge messages
         //    claiming any node identity (most damagingly genesis identities
         //    operated from non-genesis IPs). The math passed because the
         //    signature WAS valid for the embedded PK; the spoof succeeded

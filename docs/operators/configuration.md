@@ -50,7 +50,7 @@ Several settings are resolved from more than one source. The order is fixed in c
 - **Advertised external address.** `QNET_EXTERNAL_IP`, then `DOCKER_HOST_IP`, then STUN discovery against public servers.
 - **Advertised API endpoint (on chain).** Suppressed entirely by `QNET_HIDE_IP`; otherwise `QNET_PUBLIC_IP`, then `EXTERNAL_IP`, then `HOST_IP`.
 - **Pre-flight reachability address.** Detected by HTTP query to public IP services (`api.ipify.org`, `ifconfig.me`, `icanhazip.com`). When detection fails, the external reachability checks are skipped.
-- **Genesis node list.** `QNET_GENESIS_NODES` (each entry security-validated), then a `genesis-nodes.json` file searched at `./`, `config/` and `/etc/qnet/` (files over 10 KB or listing more than 10 nodes are skipped), then the addresses pinned in the binary.
+- **Genesis node list.** `QNET_GENESIS_NODES` (each entry security-validated), then a `genesis-nodes.json` file searched at `./`, `config/`, `/etc/qnet/` and `~/.qnet/` (files over 10 KB or listing more than 10 nodes are skipped), then the addresses pinned in the binary.
 - **Genesis RPC base URL.** `QNET_RPC_URL`, then the first entry of `QNET_GENESIS_NODES` on port 8001, then `http://127.0.0.1:8001`.
 - **Key-encryption secret.** `QNET_KEY_ENCRYPTION_SECRET` when it is exactly 64 hex characters, otherwise a `.qnet_encryption_secret` file in the key directory, generated on first use and integrity-tagged.
 
@@ -119,7 +119,8 @@ Microblock-body pruning is fixed. Bodies are retained for `MICROBLOCK_BODY_RETEN
 
 | Variable | Purpose | Default | Example |
 |----------|---------|---------|---------|
-| `RUST_LOG` | Standard `env_logger` filter. If unset the node sets it to `info` before initialising the logger. | `info` | `info,qnet=debug` |
+| `QNET_LOG_LEVEL` | In-process verbosity of the node's own `[LEVEL][MODULE]` lines, on the scale 0=OFF, 1=ERROR, 2=WARN, 3=INFO, 4=DEBUG, 5=TRACE. Read once before the first log line; values above 5 clamp to 5. | `3` (INFO) | `2` |
+| `RUST_LOG` | Standard `env_logger` filter, governing output emitted through the `log` crate. If unset the node sets it to `info` before initialising the logger. | `info` | `info,qnet=debug` |
 | `QNET_DETAILED_LOGGING` | `1` enables extra diagnostics in the endpoint registry. | unset | `1` |
 
 Container-level log rotation is the operator's responsibility; the node is verbose at the default level. The reference compose file uses `max-size: 200m` with `max-file: 50`.
@@ -170,7 +171,7 @@ These affect local CPU and memory allocation. Most defaults adapt to the detecte
 |----------|---------|-------|
 | `QNET_HALT_HEIGHT` | The node stops at this block height. | For coordinated upgrades. Meaningful only if the whole network agrees on the height; halting one node alone takes it offline. |
 | `QNET_WEAK_SUBJECTIVITY_CHECKPOINT` | A syncing node refuses a chain whose tip is below this height, mitigating long-range attacks. | `0` by default. A value above the real tip makes the node unable to sync at all. Use only a height you have independently verified. |
-| `QNET_CLEAN_DATA` | `1` deletes the known data directories and peer cache at startup. | Destructive and unconfirmed. It runs before storage is opened, after the startup guards (restart manifest, container check, logger, NTP sync, clock plausibility). |
+| `QNET_CLEAN_DATA` | `1` deletes the known data directories and peer cache at startup. | Destructive and unconfirmed. It runs before storage is opened, after the startup guards (restart manifest, container check, logger, clock plausibility). |
 | `QNET_FORCE_RESET` + `QNET_CONFIRM_RESET` | Resets stored chain height. Requires `QNET_FORCE_RESET=1` **and** `QNET_CONFIRM_RESET=YES`; either alone is refused. | Destructive; recovery procedure only. |
 
 ## Development and test only

@@ -447,10 +447,10 @@ rewritten.
 
 `TransactionType` has exactly 20 variants. Five are named by `is_retired_type` and rejected by
 `validate()` immediately after the structural `enforce_wire_limits` check and before every semantic
-check, so admission, gossip and block validity share one rule and a block carrying one is invalid on
-every node. They remain in the enum so stored block bodies decode. Separately, the RPC
-and gossip ingress whitelists in `node.rs` reject three further non-retired types — `CreateAccount`,
-`Swap` and `BatchTransfers` — so those never reach the mempool either.
+check, so the RPC ingress, the gossip ingress and block packing all share one rule.
+They remain in the enum so stored block bodies decode. Separately, the RPC
+and gossip ingress whitelists in `node/transactions.rs` reject three further non-retired types —
+`CreateAccount`, `Swap` and `BatchTransfers` — so those never reach the mempool either.
 
 | Variant | Status | Description |
 | --- | --- | --- |
@@ -497,8 +497,8 @@ Both block hashes bind `state_root`: `MicroBlock::hash` binds height, timestamp,
 root, producer, `timeout_round`, carried baseline and `state_root` (not `fees_collected`, not
 `vrf_output`), with `EfficientMicroBlock::hash` a byte-identical mirror; `MacroBlock::hash` covers
 height, timestamp, previous hash, `state_root` and every included microblock hash, excluding
-`consensus_data`. A microblock is rejected above 50,000 transactions; a macroblock must be non-empty
-and hold at most 100 microblocks.
+`consensus_data`. A microblock is rejected above 50,000 transactions, and `verify_v2_macroblock`
+rejects a macroblock whose window is not exactly 90 microblock hashes.
 
 ### The shared system-transaction gate
 
@@ -514,6 +514,7 @@ verdict byte-identical on every node and therefore safe on the apply path.
 | `LightNodeEligibilityBitmap` | the signer equals the declared `genesis_id`, so a shard's bitmap can only be published by the genesis identity that owns the shard |
 | `PingCommitmentWithSampling` | the signer equals `tx.from`, matching the field apply deduplicates on |
 | `Heartbeat` | `tx.from`, the declared `node_id` and the signer are all equal, so liveness credited on `from` is the liveness the signature attests to |
+| `NodeReactivation` | `tx.from` equals the declared `node_id`, because apply writes the endpoint registry under `node_id` while the signature preimage is built from `from` |
 | `KeyRotation` | rejected, as described in the type table above |
 
 `NodeRegistration` and `NodeActivation` are outside this gate by design: they carry their own

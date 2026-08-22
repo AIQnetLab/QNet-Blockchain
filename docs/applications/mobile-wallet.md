@@ -18,7 +18,8 @@ Light node.
 
 The UI is a single wallet screen with six tabs: assets, receive, activate, history, node, settings.
 It includes QR receive, clipboard copy, hideable balances, spam-token hiding and a QNet/Solana
-network switch.
+network switch. Interface strings are localised into 11 languages in `src/i18n/translations.js`, with
+the language selected in settings.
 
 ## Identity and key derivation
 
@@ -148,7 +149,6 @@ is therefore refreshed by app release on a cadence inside that window, which is 
 | Constant | Value |
 | --- | --- |
 | `MACROBLOCK_INTERVAL` | 90 |
-| `CHECKPOINT_INTERVAL` | 30 |
 | `COMMITTEE_THRESHOLD` / `COMMITTEE_SIZE` | 1000 / 1000 (at or below the threshold the whole eligible set is the committee) |
 | `DILITHIUM_SIG_LEN` | 3309 |
 | LtHash `LANES` / `STATE_BYTES` | 1024 / 2048 |
@@ -280,9 +280,12 @@ pushes to a killed app are not lost.
 
 Two paths prove liveness:
 
-- **Push challenge.** The node pushes a challenge; the app signs the response with the keychain-held
-  delegation key and returns it with the delegation certificate. If the keychain is unavailable the
-  ping window is missed and retried in the next window.
+- **Push challenge.** The node pushes a challenge; the app signs it with the keychain-held delegation
+  key and POSTs `node_id`, the challenge, the `ping_dilithium:`-prefixed signature, the ping public
+  key and the delegation certificate as a JSON body to `/api/v1/light-node/ping-response`. The route
+  takes POST with a 64 KB body limit because each enveloped ML-DSA-65 signature embeds its own
+  message, so the response is far larger than a query string will carry. If the keychain is
+  unavailable the ping window is missed and retried in the next window.
 - **Pull self-attestation.** On any wakeup the app builds the challenge `selfattest:{height-2}:{hash}`
   from the `previous_hash` of block `height-1`, deduplicated per 14,400-block epoch, and submits it
   through the same ping-response endpoint. This proves same-epoch liveness without depending on push

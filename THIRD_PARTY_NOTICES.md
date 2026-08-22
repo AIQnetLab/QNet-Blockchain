@@ -43,7 +43,7 @@ recipient may pick either. Transitive dependencies are not listed except where n
 | --- | --- | --- |
 | `quinn` | MIT OR Apache-2.0 | QUIC transport (RFC 9000) for all node-to-node traffic |
 | `rustls` | Apache-2.0 OR ISC OR MIT | TLS 1.3 under QUIC, restricted to the `aws_lc_rs` provider |
-| `aws-lc-rs` / `aws-lc-sys` (transitive, pulled in by `rustls`'s `aws_lc_rs` feature) | ISC AND (Apache-2.0 OR ISC); `aws-lc-sys` additionally bundles OpenSSL-licensed code | The rustls crypto provider, which supplies the ML-KEM hybrid key exchange used by the QUIC handshake |
+| `aws-lc-rs` / `aws-lc-sys` (transitive, pulled in by `rustls`'s `aws_lc_rs` feature) | ISC AND (Apache-2.0 OR ISC); `aws-lc-sys` additionally bundles OpenSSL-licensed code | The rustls crypto provider backing the QUIC handshake |
 | `rcgen` | MIT OR Apache-2.0 | Generating the node's self-signed QUIC certificate |
 | `x509-parser` | MIT OR Apache-2.0 | Parsing peer certificates during the handshake |
 | `warp` | MIT | The node's HTTP JSON-RPC and REST server |

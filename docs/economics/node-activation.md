@@ -10,8 +10,8 @@ that gate consensus.
 
 The protocol defines exactly two node types. `NodeType` in `core/qnet-state/src/account.rs` has the
 variants `Light` and `Super`, and the same enum is mirrored in the P2P layer
-(`development/qnet-integration/src/unified_p2p.rs`) and the integration crate
-(`development/qnet-integration/src/node.rs`). The activation-code endpoint accepts the node-type
+(`development/qnet-integration/src/unified_p2p/mod.rs`) and the integration crate
+(`development/qnet-integration/src/node/mod.rs`). The activation-code endpoint accepts the node-type
 strings `light` and `super`, and a registry row stores `"super"` or `"light"`.
 
 The difference is structural capability, not an economic tier:
@@ -179,7 +179,12 @@ the genesis set, which would diverge from synced validators.
 **Attestor behaviour.** The `node_attestBurn` RPC verifies the burner's owner signature *before* any
 epoch resolution or Solana I/O, rejects a `burn_tx` that is not a base58 Solana signature decoding to
 64 bytes, recomputes the Phase 1 cost from its own supply read, and signs only its own observed
-`(cost, actual_burned)` pair. Each attestor also persists a one-burn-to-one-node dedup keyed on the
+`(cost, actual_burned)` pair. The observed burn is net destruction on the 1DEV mint: the decreases
+across the transaction's token balances less any increase that is retained, an increase on the
+incinerator account not counting as retained, so tokens moved between two accounts of one owner net
+to zero. The transaction must also carry a burn indicator — a parsed `burn` or `burnChecked`
+instruction, or the incinerator among its account keys; a plain transfer to any other destination
+does not qualify. Each attestor also persists a one-burn-to-one-node dedup keyed on the
 node pseudonym and refuses to re-attest the same burn for a different node. Attestor eligibility is
 committee-wide: the set is the deterministic consensus committee of `attest_epoch`, falling back to
 the five genesis nodes only in the genesis era, so attestation decentralises as the network grows.

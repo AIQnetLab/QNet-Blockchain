@@ -13,12 +13,12 @@ Macroblocks are sealed at the coarser cadence and carry the epoch snapshot the n
 
 | Parameter | Name | Value | Defined in |
 |---|---|---|---|
-| Microblock slot | `MICROBLOCK_INTERVAL_SECS` | 1 second | `development/qnet-integration/src/node.rs` |
-| Producer rotation | `ROTATION_INTERVAL_BLOCKS` | 30 microblocks | `development/qnet-integration/src/node.rs` |
+| Microblock slot | `MICROBLOCK_INTERVAL_SECS` | 1 second | `development/qnet-integration/src/node/mod.rs` |
+| Producer rotation | `ROTATION_INTERVAL_BLOCKS` | 30 microblocks | `development/qnet-integration/src/node/mod.rs` |
 | Finality checkpoint | `CHECKPOINT_INTERVAL` | 30 microblocks | `core/qnet-consensus/src/checkpoint_bft.rs` |
 | Macroblock / epoch | `MACROBLOCK_INTERVAL` | 90 microblocks | `core/qnet-consensus/src/checkpoint_bft.rs` |
 | Committee cap | `COMMITTEE_SIZE` / `COMMITTEE_THRESHOLD` | 1000 / 1000 | `core/qnet-consensus/src/checkpoint_bft.rs` |
-| Producer roster cap | `MAX_VALIDATORS` | 1000 | `development/qnet-integration/src/node.rs` |
+| Producer roster cap | `MAX_VALIDATORS` | 1000 | `development/qnet-integration/src/node/mod.rs` |
 | BFT view timeout | `VIEW_TIMEOUT_MS` | 4000 ms | `core/qnet-consensus/src/checkpoint_bft.rs` |
 | Consensus state retained | `CONSENSUS_STATE_RETAIN` | 128 checkpoint indices | `core/qnet-consensus/src/checkpoint_bft.rs` |
 
@@ -250,9 +250,11 @@ it can change block identity. Block production, block signing, timeout voting an
 
 A producer will not produce block `H` unless it holds `H-1`; it pre-checks storage at cycle entry and yields if the target
 height is already filled; and it re-checks authority immediately before any state mutation, yielding if the certified round
-advanced past the round it started with. Past a bootstrap floor of 10 blocks it fails closed without a corroborating fresh
-peer height, and tolerated sync lag before abstaining is 2 blocks in round 0, 3 in round 1, 5 in round 2 and above. The
-rotation-vote path is independent of these, so a node blocked from producing still drives failover.
+advanced past the round it started with. It also refuses to build at or below its own finality marker. Tolerated sync lag
+before abstaining is 2 blocks in round 0, 3 in round 1, 5 in round 2 and above. Every one of these reads local state only:
+the right to produce never depends on observing other nodes, because an input shared by every member of a connected mesh
+cannot distinguish isolation from a silent observation channel. The rotation-vote path is independent of these, so a node
+blocked from producing still drives failover.
 
 ## Finality
 
@@ -262,9 +264,10 @@ quorum certificate of committee ML-DSA-65 signatures.
 ### Checkpoints, indices and windows
 
 A checkpoint's `index` is the BFT view/round and may skip when a view times out. Its `window_head_height` is the contiguous
-chain position, always a multiple of `CHECKPOINT_INTERVAL`. A macroblock is sealed only when `window_head_height %
-MACROBLOCK_INTERVAL == 0`; intra-window checkpoints advance finality without sealing. The macroblock's height is the
-*window* (`head / 90`), decoupled from the consensus round, so a skipped round leaves no macroblock gap. The checkpoint hash
+chain position, always a multiple of `CHECKPOINT_INTERVAL`. A macroblock is sealed only at a boundary checkpoint —
+`window_head_height % MACROBLOCK_INTERVAL == 0` — and only once the 2-chain commit releases that seal; intra-window
+checkpoints advance finality without sealing. The macroblock's height is the *window* (`head / 90`), decoupled from the
+consensus round, so a skipped round leaves no macroblock gap. The checkpoint hash
 preimage (domain `qnet-checkpoint-v2`) covers `index`, the parent link (`checkpoint_hash` and `index` of the parent QC),
 `window_head_height`, every `window_mb_hash`, `state_root`, `beacon`, `epoch_commitment`, `reward_root`, `registry_root`,
 `logs_root`, `dilithium_pk_root`, `reward_epoch_root`, `total_supply`, `timestamp` and `proposer`. `proposer_sig` is
@@ -306,11 +309,25 @@ Committee members sign `"QNET_BFT2_VOTE:" + hex(checkpoint_hash)` for votes, `"Q
 timeouts, and `"QNET_BFT2_CKPT:" + hex(cp.hash())` for proposals, where `timeout_bytes = "qnet-timeout-v2" || index_le ||
 high_qc_index_le`.
 
+A completed certificate — quorum or timeout — is relayed to a bounded random subset of peers, `RELAY_FANOUT = 8` in
+`development/qnet-integration/src/consensus_v2_node.rs`, rather than to every peer. Relay is redundancy, not the
+delivery path: every committee member assembles the identical certificate from the votes it has already collected, so
+the fanout only covers members whose own tally lagged. At the genesis size the fanout exceeds the peer count, so every
+peer receives it anyway; at a 1000-member committee a certificate is megabytes and relaying it to all peers would make
+the step quadratic in committee size.
+
 ### Safety rule and commit rule
 
 A replica votes for a proposal only if `cp.index > last_voted_index` **and** `proposal.parent_qc.index >= locked_index`,
 where `locked_index` is the highest certified index it has seen. The commit rule is 2-chain: given child checkpoint `C_i`
 and its QC at index `i`, if `C_i.parent_qc.index == i-1` then index `i-1` becomes final.
+
+Ahead of that, the node layer refuses any proposal whose `parent_qc` is not byte-equal to its own `high_qc` reference.
+The parent link is a claim, not a source of truth: leader election is `SHA3(index || parent_hash)`, so a committee
+member free to name the parent could grind 32 bytes until the function elects it, copy the honest window content and
+emit a second valid proposal at the same index — a vote split that is not equivocation and convicts nobody. The rule
+costs no honest refusal, because a `QcRef` carries no signatures and two independently formed certificates for one
+checkpoint are byte-identical.
 
 ### The finality ratchet
 
@@ -379,6 +396,12 @@ below. It is kept separate from `effective_ws_checkpoint()`, the finality floor:
 advances finality, which stays gated on the full snapshot binding.
 
 ### Sealing a macroblock
+
+The seal is built on the boundary window's quorum certificate and held, not written: the 2-chain commit releases it, and
+a window whose certificate never acquires a child certificate never commits and therefore never seals. That is the safety
+property — two byte-different bodies at one window head can each reach a single-certificate quorum across rounds, but only
+the branch that continues can commit. The held set is bounded, and the commit frontier releases every held index at or
+below the index it reaches, so a skipped round that commits `r+2` off a parent at `r` does not strand window `r`.
 
 Sealing is all-seal: every committee member writes the macroblock locally, because the body is a pure function of the
 committed window and therefore byte-identical everywhere. Only the proposer broadcasts it, to avoid N-fold traffic. A

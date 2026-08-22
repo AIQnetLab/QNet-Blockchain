@@ -1,14 +1,14 @@
 //! # QNet Post-Quantum Cryptography Module (v2.24)
 //!
 //! ## Overview
-//! Implements pure post-quantum signatures with CRYSTALS-Dilithium3 (ML-DSA-65),
+//! Implements pure post-quantum signatures with CRYSTALS-ML-DSA-65 (ML-DSA-65),
 //! NIST FIPS 204. Ed25519 was removed in P8 — a single Dilithium signature is the
 //! sole authenticator. Optimized for minimal bandwidth with bincode + zstd compression.
 //!
 //! ## Architecture (v2.24 - Bincode + Zstd optimization)
 //!
 //! ### Signature System (pure ML-DSA-65 after P8)
-//! - **CRYSTALS-Dilithium3 / ML-DSA-65**: Post-quantum signatures (~2500 bytes RAW)
+//! - **CRYSTALS-ML-DSA-65 / ML-DSA-65**: Post-quantum signatures (~2500 bytes RAW)
 //! - **Preimage**: Single Dilithium signature covers message_hash + timestamp
 //! - **Format**: Bincode + Zstd compression (90% size reduction vs JSON)
 //!
@@ -58,7 +58,7 @@
 //! Thread-safe, globally accessible cache of PqCrypto instances for all nodes.
 //!
 //! ## NIST Compliance (pure ML-DSA-65 after P8)
-//! - **Post-Quantum**: CRYSTALS-Dilithium3 / ML-DSA-65 (NIST PQC Level 3, FIPS 204)
+//! - **Post-Quantum**: CRYSTALS-ML-DSA-65 / ML-DSA-65 (NIST PQC Level 3, FIPS 204)
 //! - **Hashing**: SHA3-256 (NIST FIPS 202)
 //! - **Key Binding**: Dilithium signs message_hash || timestamp
 
@@ -361,7 +361,7 @@ fn evict_certificate_cache_if_needed() {
     println!("[INFO][CRYPTO] certificate_cache_eviction removed={} remaining={}", to_remove.len(), CERTIFICATE_CACHE.len());
 }
 
-/// Post-Quantum (Dilithium3 / ML-DSA-65) Cryptography System for QNet
+/// Post-Quantum (ML-DSA-65 / ML-DSA-65) Cryptography System for QNet
 pub struct PqCrypto {
     /// Current certificate for this node
     current_certificate: Option<PqCertificate>,
@@ -382,7 +382,7 @@ pub struct PqCrypto {
 }
 
 impl PqCrypto {
-    /// Create new PQ (Dilithium3 / ML-DSA-65) crypto system
+    /// Create new PQ (ML-DSA-65 / ML-DSA-65) crypto system
     pub fn new(node_id: String) -> Self {
         println!("🔐 Initializing Post-Quantum Cryptography for node: {}", node_id);
         Self {
