@@ -5408,6 +5408,40 @@ mod tests {
         assert_eq!(BlockchainNode::roster_mode(&s, 13), RosterMode::Frozen, "w-2=11 > L, L==B");
     }
 
+    /// Election entropy must be a pure function of macroblock N-2. Height, round and candidate set
+    /// were identical on two honest nodes at h=272 — `round=9 timeout=1` with 5 candidates on both —
+    /// yet one elected index 0 and the other index 2, because the seed was taken from different
+    /// objects: one node's roster_mode said Sealed (seed = N-2) and the other's said Frozen
+    /// (seed = frozen_anchor(L)). L is last_sealed_mb_index, node-local runtime state, so a few
+    /// seconds of ingest skew was enough for both to elect THEMSELVES and produce. Anything
+    /// node-local in this derivation is a fork with no adversary present.
+    #[test]
+    fn election_entropy_never_reads_node_local_seal_state() {
+        let src = include_str!("leader.rs");
+        let i = src.find("let vrf_entropy = {").expect("entropy derivation");
+        // Brace-matched to the derivation block: the surrounding selection may legitimately read
+        // other state, so a fixed-size window would either miss the end or overrun into it.
+        let (mut depth, mut end) = (0i32, i);
+        for (k, ch) in src[i..].char_indices() {
+            if ch == '{' { depth += 1; }
+            else if ch == '}' { depth -= 1; if depth == 0 { end = i + k; break; } }
+        }
+        // Comments in this block explain WHY the local sources are excluded, so scan code only.
+        let body: String = src[i..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("
+");
+        let body = body.as_str();
+        for local in ["roster_mode", "frozen_anchor", "frozen_entropy", "last_sealed_mb_index"] {
+            assert!(!body.contains(local),
+                    "election entropy consults node-local seal state ({local}) — two honest nodes                      with different ingest timing would seed differently and both self-elect");
+        }
+        assert!(body.contains("resolve_producer_source_macroblock"),
+                "entropy must come from the N-2 macroblock");
+    }
+
     /// FAILOVER_COMMITTEE_CACHE memoizes the failover committee on (window, last_sealed_mb_index) on
     /// the stated premise that the seal frontier "moves exactly when the answer can", and the memo is
     /// read BEFORE roster_mode. So roster_mode's answer must depend on L and on nothing else. Making

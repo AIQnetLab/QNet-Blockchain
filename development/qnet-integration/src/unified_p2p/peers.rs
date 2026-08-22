@@ -1224,6 +1224,78 @@ impl SimplifiedP2P {
                 self.update_peer_last_seen(from_peer);
             }
 
+            // Empty-slot attestation — committee declares producer at slot_height failed
+            NetworkMessage::EmptySlotAttestationMsg { slot_height, expected_producer, attester_id, signature, timestamp } => {
+                self.update_peer_last_seen(from_peer);
+
+                // Drop stale empty-slot attestations from unsynced peers
+                // (same staleness gate as block attestations)
+                let local_h = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+                if local_h > 20 && slot_height.saturating_add(20) < local_h {
+                    return;
+                }
+
+                // Skip unsigned attestations (empty sig = invalid)
+                if signature.is_empty() {
+                    return;
+                }
+
+                // v17.1: IP-anchor gate intentionally NOT applied here.
+                // Same rationale as BlockAttestation above — gossip-relayed
+                // `from_peer` is the relay; the ML-DSA-65 verification
+                // below against the attester's registered PK is the
+                // canonical, gossip-safe security gate.
+
+                // Verify ML-DSA-65 signature: "QNET_EMPTY_SLOT:{slot_height}:{expected_producer}"
+                //
+                // No "bootstrap grace" branch — see block attestation handler
+                // above. Empty-slot attestations are aggregated by producers
+                // to skip silent leaders; phantom signatures from unbound
+                // identities would let an attacker force-skip an honest leader.
+                let sig_ok = if let Some(pk_bytes) = crate::genesis_constants::get_vrf_public_key(&attester_id) {
+                    use pqcrypto_mldsa::mldsa65 as dilithium3;
+                    use pqcrypto_traits::sign::{PublicKey as PkTrait, DetachedSignature as SigTrait};
+                    let attest_msg = format!("QNET_EMPTY_SLOT:{}:{}", slot_height, expected_producer);
+                    let pk_ok = dilithium3::PublicKey::from_bytes(&pk_bytes).ok();
+                    let sig_ok_decode = dilithium3::DetachedSignature::from_bytes(&signature).ok();
+                    match (pk_ok, sig_ok_decode) {
+                        (Some(pk), Some(sig)) => {
+                            dilithium3::verify_detached_signature(&sig, attest_msg.as_bytes(), &pk).is_ok()
+                        }
+                        _ => false,
+                    }
+                } else {
+                    if crate::node::is_warn() {
+                        println!(
+                            "[WARN][EMPTY_SLOT] attester_pk_unknown attester={} slot_h={} action=reject",
+                            attester_id, slot_height
+                        );
+                    }
+                    false
+                };
+
+                if !sig_ok {
+                    if crate::node::is_warn() {
+                        println!("[WARN][EMPTY-SLOT] invalid_sig h={} expected={} from={}",
+                                 slot_height, expected_producer, attester_id);
+                    }
+                    return;
+                }
+
+                submit_empty_slot_attestation(EmptySlotAttestation {
+                    slot_height,
+                    expected_producer: expected_producer.clone(),
+                    attester_id: attester_id.clone(),
+                    signature,
+                    timestamp,
+                });
+                if crate::node::is_debug() {
+                    let total = get_empty_slot_attestation_count(slot_height, &expected_producer);
+                    println!("[DBG][EMPTY-SLOT] verified h={} expected={} from={} total={}",
+                             slot_height, expected_producer, attester_id, total);
+                }
+            }
+
 
             #[allow(deprecated)]
             NetworkMessage::EmergencyProducerChange { failed_producer, new_producer, block_height, change_type, timestamp: _, sender_node_id: _ } => {

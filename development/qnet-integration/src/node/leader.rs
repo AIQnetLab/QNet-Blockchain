@@ -368,29 +368,27 @@ impl BlockchainNode {
                             if is_debug() { println!("[DBG][FINALITY] h={} ep={} mb={}", current_height, current_epoch, required_macroblock); }
                         }
                         
-                        // A1: seed and candidate set MUST anchor on the same object, or a frozen roster
-                        // paired with a stale/zero seed elects a producer no one else does.
-                        //  - Sealed: exact N-2 macroblock hash.
-                        //  - Frozen: FrozenEntropy over M_A + this epoch's N-2 window index (R5).
-                        //  - Defer:  abstain (zero seed), same as truly-behind.
-                        match Self::roster_mode(store.as_ref(), current_epoch) {
-                            RosterMode::Sealed => match Self::resolve_producer_source_macroblock(store.as_ref(), required_macroblock) {
-                                Some((_used_idx, mb)) => Self::hash_macroblock_entropy(&mb),
-                                None => {
-                                    println!("[ERR][FINALITY] mb={} unresolved desync=true", required_macroblock);
-                                    set_node_state(NodeState::WaitingForMacroblock {
-                                        epoch: required_macroblock, macroblock_index: required_macroblock });
-                                    [0u8; 32]
+                        // Election entropy comes from macroblock N-2 and from nothing else. It is the
+                        // ONE input that must be identical on every node: same height, same round and
+                        // same candidate set still elect different producers if the seed differs.
+                        //
+                        // The frozen arm cannot supply it. Its anchor is frozen_anchor(L), and L is
+                        // last_sealed_mb_index() — the node's LOCAL contiguous seal prefix. Two honest
+                        // nodes whose macroblock ingest is a few seconds apart hold different L, take
+                        // different arms and derive different seeds, so each elects ITSELF for the same
+                        // (height, round) and both produce. That is a fork with no adversary present,
+                        // observed at h=272 with round=9 timeout=1 on both sides and idx 0 vs 2.
+                        //
+                        // Absent N-2 ⇒ abstain. A node that cannot name the seed everyone else uses must
+                        // not produce: the quorum that holds N-2 keeps the chain moving, and a stall is
+                        // recoverable where a fork is not.
+                        match Self::resolve_producer_source_macroblock(store.as_ref(), required_macroblock) {
+                            Some((_used_idx, mb)) => Self::hash_macroblock_entropy(&mb),
+                            None => {
+                                if is_warn() {
+                                    println!("[WARN][FINALITY] entropy_unavailable mb={} h={} action=abstain",
+                                             required_macroblock, current_height);
                                 }
-                            },
-                            RosterMode::Frozen => {
-                                let l = store.last_sealed_mb_index();
-                                match Self::frozen_anchor(store.as_ref(), l) {
-                                    Some((_a, anchor)) => Self::frozen_entropy(&anchor, current_epoch),
-                                    None => [0u8; 32], // anchor unusable ⇒ abstain (park)
-                                }
-                            }
-                            RosterMode::Defer => {
                                 set_node_state(NodeState::WaitingForMacroblock {
                                     epoch: required_macroblock, macroblock_index: required_macroblock });
                                 [0u8; 32]

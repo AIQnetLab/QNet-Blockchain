@@ -179,6 +179,21 @@ pub(crate) fn fork_recovery_target() -> u64 {
     FORK_RECOVERY_HEIGHT.load(Ordering::SeqCst)
 }
 
+/// Recovery target for a verify LIVELOCK, or None while the stall may still be transient.
+///
+/// A livelock re-enters verify on ONE height and never advances: every incoming block fails the
+/// parent link because the block below `hung_h` is not the one the network built on. Forward sync
+/// can never resolve that — it re-downloads blocks that keep failing the same check — so the node
+/// stays dead until it rolls back to the last height it shares with the network.
+///
+/// A `hang` (one operation stuck in flight) is a different fault and is excluded. Two watchdog
+/// windows are required so a brief stall does not arm recovery. The caller's recovery path still
+/// checks finality before rolling anything back, so this only nominates a target.
+pub(crate) fn livelock_recovery_target(hung_h: u64, is_livelock: bool, repeats: u32) -> Option<u64> {
+    if !is_livelock || repeats < 2 || hung_h <= 1 { return None; }
+    Some(hung_h.saturating_sub(1))
+}
+
 pub(crate) fn signal_fork_recovery(target: u64) {
     if target == 0 { return; } // 0 is the "no signal" sentinel — never store it as a target
     let mut prev = FORK_RECOVERY_HEIGHT.load(Ordering::SeqCst);
@@ -1502,6 +1517,20 @@ impl BlockPipeline {
                         metrics_watchdog.deferred_evicted.load(Ordering::Relaxed),
                     );
                     last_verify_dump_ms = now;
+
+                    // A livelock here is not lag: the node re-enters verify on one height forever
+                    // because the block below it is off the network chain. Nominate the last height
+                    // it can still share with the network; the consumer re-checks finality before
+                    // rolling back, and signal_fork_recovery keeps the deepest pending target.
+                    if let Some(target) = livelock_recovery_target(
+                        verify_h, verify_op_age_ms < STUCK_THRESHOLD_MS, verify_stuck_repeats)
+                    {
+                        if fork_recovery_target() != target {
+                            eprintln!("[WARN][PIPELINE] livelock_recovery_armed hung_h={} target={} stall_ms={}",
+                                      verify_h, target, verify_stall_ms);
+                        }
+                        signal_fork_recovery(target);
+                    }
                 }
 
                 // APPLY STALL: same rule as verify — op_age classifies hang vs livelock, never gates.
@@ -4597,6 +4626,44 @@ mod tests_rollback_cache_invalidation {
         let src = include_str!("block_pipeline.rs");
         assert!(!src.contains(&banned),
                 "height-keyed hash cache reintroduced — parent resolution must stay content-addressed");
+    }
+
+    /// A node whose verify stage re-enters one height forever is FORKED, not behind: the block
+    /// below it is off the network chain, so every incoming block fails the parent link and forward
+    /// sync re-downloads blocks that keep failing the same check. Node 001 sat at h=272 for 21
+    /// minutes this way — 28k blocks ingested, 26k verify failures, zero progress — because the only
+    /// fork detector left runs at the macroblock layer, which a wedged node can never reach.
+    /// The watchdog already measures the condition exactly; it must nominate a recovery target.
+    #[test]
+    fn verify_livelock_nominates_a_recovery_target() {
+        // Two windows of a re-entering stall at a real height ⇒ recover from the height below.
+        assert_eq!(livelock_recovery_target(273, true, 2), Some(272));
+        assert_eq!(livelock_recovery_target(273, true, 9), Some(272));
+
+        // One window is not yet evidence — a brief stall must not arm recovery.
+        assert_eq!(livelock_recovery_target(273, true, 1), None);
+
+        // A hang holds ONE operation in flight; that is a different fault and rolling back would
+        // discard a correct chain over a stuck read.
+        assert_eq!(livelock_recovery_target(273, false, 9), None);
+
+        // Genesis has nothing below it to recover to.
+        assert_eq!(livelock_recovery_target(1, true, 9), None);
+        assert_eq!(livelock_recovery_target(0, true, 9), None);
+    }
+
+    /// Pins the wiring, not just the decision: the watchdog that measures the livelock must arm
+    /// recovery. It carried a "pure observation — never gates flow or consensus" contract, which is
+    /// why it watched a node die for 21 minutes without acting.
+    #[test]
+    fn watchdog_arms_recovery_on_verify_livelock() {
+        let src = include_str!("block_pipeline.rs");
+        let i = src.find("verify_stuck mode=").expect("verify watchdog");
+        let window = &src[i..i + 1600];
+        assert!(window.contains("livelock_recovery_target"),
+                "the verify watchdog must consult the livelock recovery decision");
+        assert!(window.contains("signal_fork_recovery"),
+                "the verify watchdog must arm fork recovery, not only log");
     }
 
     /// Concurrent detectors report different divergence points; the deepest must win, otherwise a

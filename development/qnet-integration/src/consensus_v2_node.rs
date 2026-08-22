@@ -355,9 +355,12 @@ async fn sign_payload(node_id: &str, domain: &str, body: &[u8]) -> Option<Vec<u8
 /// exceeds the peer count, so every peer still receives it and the behaviour is unchanged.
 const RELAY_FANOUT: usize = 8;
 
-/// Relay an already-complete certificate. No self-route: we are the node that built it.
+/// Relay an already-complete certificate. Self-routed like every other consensus send: the node
+/// that formed it is part of its own quorum, and the inbound path is where certificate adoption
+/// updates the state the microblock rotation reads.
 fn relay_certificate(p2p: &Arc<SimplifiedP2P>, msg: &ConsensusMsg) {
     if let Ok(data) = bincode::serialize(msg) {
+        route_inbound(data.clone());
         p2p.gossip_to_random_peers(NetworkMessage::ConsensusV2 { data }, RELAY_FANOUT);
     }
 }

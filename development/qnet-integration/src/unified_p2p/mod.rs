@@ -739,6 +739,96 @@ pub(crate) use dashmap::DashMap as AttestDashMap;
 
 
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// EMPTY-SLOT ATTESTATION — DETERMINISTIC PRODUCER FAILOVER FOR MICROBLOCKS
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Purpose:
+//   When a microblock producer fails to broadcast within the slot grace period,
+//   the attestation committee signs an empty-slot attestation. Once 2f+1 distinct
+//   empty-slot attestations are observed for the same (slot_height, expected_producer)
+//   pair, the network deterministically advances to the next producer in rotation.
+//
+// Why this replaces reactive timeout_round for microblocks:
+//   * Reactive timeout_round depends on local wall-clock & gossip race ordering.
+//     Different nodes converge at slightly different rounds, producing
+//     timeout_divergence (different `our_round` vs `block_round`) under normal
+//     propagation gap.
+//   * Empty-slot attestations are signed locally but aggregated supermajority-style.
+//     Once 2f+1 honest validators agree the slot is empty, the failover is
+//     cryptographically certified — a 2f+1 supermajority is by definition outside
+//     the Byzantine bound.
+//   * Convergence is bounded by attestation gossip latency (~1 RTT), not by
+//     timeout grace period escalation (which scales with 1-second voting rounds).
+//
+// Signature format:
+//   message = "QNET_EMPTY_SLOT:{slot_height}:{expected_producer}"
+//   signed with the attester's ML-DSA-65 (ML-DSA-65) secret key
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Single empty-slot attestation from a committee member.
+///
+/// Attestation declares: "I, attester, was waiting for `expected_producer` to
+/// produce block at `slot_height`, but the slot grace period elapsed without
+/// receiving a valid block from that producer. The slot should be treated as
+/// empty and the network should advance to the next producer."
+#[derive(Debug, Clone)]
+pub struct EmptySlotAttestation {
+    pub slot_height: u64,
+    pub expected_producer: String,
+    pub attester_id: String,
+    pub signature: Vec<u8>,
+    pub timestamp: u64,
+}
+
+/// Empty-slot attestation store: keyed by (slot_height) → Vec<EmptySlotAttestation>.
+/// Multiple expected_producer values may coexist at the same slot if rotation
+/// state is itself contested; threshold checks always filter on a specific
+/// expected_producer to maintain BFT-safe quorum semantics.
+static EMPTY_SLOT_ATTESTATIONS: once_cell::sync::Lazy<AttestDashMap<u64, Vec<EmptySlotAttestation>>> =
+    once_cell::sync::Lazy::new(|| AttestDashMap::new());
+
+/// Submit an empty-slot attestation.
+/// Deduplication: one entry per (slot_height, attester_id, expected_producer).
+pub fn submit_empty_slot_attestation(attestation: EmptySlotAttestation) {
+    let h = attestation.slot_height;
+    let mut entry = EMPTY_SLOT_ATTESTATIONS
+        .entry(h)
+        .or_insert_with(Vec::new);
+    let already = entry.iter().any(|a|
+        a.attester_id == attestation.attester_id
+            && a.expected_producer == attestation.expected_producer
+    );
+    if !already {
+        entry.push(attestation);
+    }
+}
+
+/// Count empty-slot attestations for a given (slot_height, expected_producer).
+pub fn get_empty_slot_attestation_count(slot_height: u64, expected_producer: &str) -> usize {
+    EMPTY_SLOT_ATTESTATIONS
+        .get(&slot_height)
+        .map(|v| v.iter().filter(|a| a.expected_producer == expected_producer).count())
+        .unwrap_or(0)
+}
+
+/// All empty-slot attestations for a given slot height (any producer).
+pub fn get_empty_slot_attestations(slot_height: u64) -> Vec<EmptySlotAttestation> {
+    EMPTY_SLOT_ATTESTATIONS
+        .get(&slot_height)
+        .map(|v| v.clone())
+        .unwrap_or_default()
+}
+
+/// Cleanup empty-slot attestations older than 100 blocks behind current tip.
+/// Called from the same cleanup path as block attestations.
+pub fn cleanup_old_empty_slot_attestations(current_height: u64) {
+    if current_height <= 100 { return; }
+    let cutoff = current_height - 100;
+    EMPTY_SLOT_ATTESTATIONS.retain(|h, _| *h > cutoff);
+}
+
 /// v3.1: Cleanup stale entries from PENDING_SYNC_MACROBLOCKS
 pub fn cleanup_pending_sync_macroblocks() -> usize {
     let now = std::time::SystemTime::now()
@@ -3758,6 +3848,20 @@ pub enum NetworkMessage {
     /// in rotation. Once 2f+1 distinct attestations accumulate for the
     /// same (slot_height, expected_producer), failover is deterministic.
     /// Replaces reactive timeout_round for microblock-level rotation.
+    /// Empty-slot attestation — committee member declares that the producer
+    /// for `slot_height` failed to broadcast a valid block within the slot
+    /// grace period, and the network should advance to the next producer
+    /// in rotation. Once 2f+1 distinct attestations accumulate for the
+    /// same (slot_height, expected_producer), failover is deterministic.
+    /// Replaces reactive timeout_round for microblock-level rotation.
+    EmptySlotAttestationMsg {
+        slot_height: u64,
+        expected_producer: String,
+        attester_id: String,
+        signature: Vec<u8>,        // ML-DSA-65 over "QNET_EMPTY_SLOT:{slot_height}:{expected_producer}"
+        timestamp: u64,
+    },
+
     /// v4.6: VRF Public Key Announcement — exchange ML-DSA-65 VRF keys between nodes.
     /// Broadcast on startup and at every macroblock boundary.
     /// Receiver verifies self-signature (proves ownership of secret key).

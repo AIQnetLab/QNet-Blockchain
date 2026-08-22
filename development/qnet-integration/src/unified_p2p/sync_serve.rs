@@ -2403,6 +2403,70 @@ impl SimplifiedP2P {
 
 
     /// v4.0: Get verified leader claims for a given round
+    /// Broadcast an empty-slot attestation to all validators.
+    ///
+    /// Called by committee members when the producer for `slot_height` fails to
+    /// broadcast a valid block within the slot grace period. Once 2f+1 distinct
+    /// empty-slot attestations accumulate for the same (slot_height, expected_producer)
+    /// pair, the network deterministically advances to the next producer.
+    pub fn broadcast_empty_slot_attestation(
+        &self,
+        slot_height: u64,
+        expected_producer: String,
+        signature: Vec<u8>,
+    ) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // Store our own attestation locally
+        submit_empty_slot_attestation(EmptySlotAttestation {
+            slot_height,
+            expected_producer: expected_producer.clone(),
+            attester_id: self.node_id.clone(),
+            signature: signature.clone(),
+            timestamp: now,
+        });
+
+        let msg = NetworkMessage::EmptySlotAttestationMsg {
+            slot_height,
+            expected_producer: expected_producer.clone(),
+            attester_id: self.node_id.clone(),
+            signature,
+            timestamp: now,
+        };
+
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+
+        let peers = self.get_all_validator_addresses();
+        let quic_transport = self.quic_transport.clone();
+        let quic_enabled = self.quic_enabled.load(std::sync::atomic::Ordering::Relaxed);
+
+        handle.spawn(async move {
+            if quic_enabled {
+                if let Some(ref qt_lock) = quic_transport {
+                    let qt = qt_lock.read().await;
+                    for peer_str in &peers {
+                        let ip = peer_str.split(':').next().unwrap_or(peer_str);
+                        let quic_addr_str = format!("{}:10876", ip);
+                        if let Ok(peer_addr) = quic_addr_str.parse::<std::net::SocketAddr>() {
+                            let _ = qt.broadcast_to(peer_addr, &msg).await;
+                        }
+                    }
+                }
+            }
+        });
+
+        if crate::node::is_debug() {
+            println!("[DBG][EMPTY-SLOT] broadcast h={} expected={}",
+                     slot_height, expected_producer);
+        }
+    }
+
     pub fn get_leader_claims(round: u64) -> Vec<VerifiedLeaderClaim> {
         LEADER_CLAIMS.get(&round)
             .map(|v| v.value().clone())
