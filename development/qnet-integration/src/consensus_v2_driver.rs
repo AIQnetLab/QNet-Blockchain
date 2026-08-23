@@ -42,6 +42,11 @@ pub enum Effect {
     Relay(ConsensusMsg),                        // Qc / Tc: already complete, just broadcast
     // Proposer seals the macroblock: QC (finality) + next-epoch eligible producers + committee.
     Persist { checkpoint: Checkpoint, qc: QuorumCertificate, eligible_producers: Vec<u8>, committee: Vec<NodeId> },
+    // Proposal refused because its parent certificate is one this node does not hold. The wire
+    // carries only a QcRef (hash + index, no signatures), so the proposal cannot deliver the
+    // missing certificate itself — without a pull the refusal is a dead end and the node can never
+    // rejoin the view.
+    CatchUp { qc_index: u64, window: u64 },
     Finalize { index: u64, head_height: u64, state_root: Hash, mb_hashes: Vec<Hash> }, // checkpoint final ⇒ microblocks ≤ head_height irreversible; state_root + per-height mb_hashes = the QC'd window content, re-checked against local bodies before advancing the marker (never finalize a same-state-different-body fork tail)
 }
 
@@ -66,6 +71,11 @@ pub struct ConsensusDriver {
     sealed: std::collections::HashSet<u64>, // windows the node CONFIRMED durably stored (dedup)
     seal_skipped: Option<u64>,              // last window skipped for want of seal inputs (observability)
     pending_seals: Vec<(u64, Effect)>,      // Persists built on a QC, released by the 2-chain commit
+    // Recent certificates, so a peer one QC behind can be served. The wire carries only a QcRef
+    // (hash + index, no signatures), so a proposal cannot deliver the certificate it names and a
+    // lagging node has no other way to obtain it. Bounded: the last few rounds are all a catch-up
+    // can use, and an unbounded map on a consensus-hot path is a memory target.
+    recent_qcs: std::collections::BTreeMap<u64, QuorumCertificate>,
     last_proposed_round: u64,               // one proposal per round we lead
     high_window: u64,                       // monotonic high-water-mark of the QC'd window; next_window never
                                             // regresses below it, so a head-less relayed QC/TC cannot collapse
@@ -83,6 +93,7 @@ impl ConsensusDriver {
             committee, genesis_hash, node_id,
             proposals: HashMap::new(), heads: HashMap::new(), state_roots: HashMap::new(), mb_hashes: HashMap::new(), seal_data: HashMap::new(),
             sealed: std::collections::HashSet::new(), seal_skipped: None, pending_seals: Vec::new(),
+            recent_qcs: std::collections::BTreeMap::new(),
             last_proposed_round: 0, high_window: 0,
             cp_interval: CHECKPOINT_INTERVAL, macro_interval: MACROBLOCK_INTERVAL,
             rc: None, rc_propose_ok: false,
@@ -94,7 +105,48 @@ impl ConsensusDriver {
     #[cfg(test)]
     pub(crate) fn set_intervals(&mut self, cp: u64, macro_: u64) { self.cp_interval = cp; self.macro_interval = macro_; }
 
+    /// Keep the newest certificates so a lagging peer can be served one. Bounded to RECENT_QC_KEEP
+    /// rounds: older ones are useless for catch-up because the window has moved past them.
+    fn remember_qc(&mut self, qc: &QuorumCertificate) {
+        const RECENT_QC_KEEP: usize = 64;
+        self.recent_qcs.insert(qc.index, qc.clone());
+        while self.recent_qcs.len() > RECENT_QC_KEEP {
+            let oldest = match self.recent_qcs.keys().next() { Some(k) => *k, None => break };
+            self.recent_qcs.remove(&oldest);
+        }
+    }
+
+    /// Index of the newest retained certificate — cheap probe before paying for a bundle.
+    pub fn newest_qc_index(&self) -> Option<u64> { self.recent_qcs.keys().next_back().copied() }
+
+    /// Complete catch-up bundle for the newest certificate: the checkpoint AND the certificate.
+    /// A certificate ALONE cannot advance a peer — adopt_qc commits only an index whose checkpoint is
+    /// already in its proposals map — so serving one without the other leaves the asker exactly where
+    /// it was. None while the pair is incomplete; there is nothing useful to serve then.
+    pub fn newest_catchup_bundle(&self) -> Option<(u64, Vec<ConsensusMsg>)> {
+        let (idx, qc) = self.recent_qcs.iter().next_back()?;
+        let cp = self.proposals.get(&(*idx, qc.checkpoint_hash))?;
+        Some((*idx, vec![ConsensusMsg::Proposal(cp.clone()), ConsensusMsg::Qc(qc.clone())]))
+    }
+
+    /// Certificate for `index`, or the newest one below it — what a peer asking for `index` can use.
+    pub fn qc_for_catchup(&self, index: u64) -> Option<QuorumCertificate> {
+        self.recent_qcs.get(&index).cloned()
+            .or_else(|| self.recent_qcs.range(..=index).next_back().map(|(_, q)| q.clone()))
+    }
+
+    /// The checkpoint a certificate certifies, needed alongside it: adopt_qc can only commit an
+    /// index whose proposal the node already holds.
+    pub fn checkpoint_for(&self, index: u64, hash: &Hash) -> Option<Checkpoint> {
+        self.proposals.get(&(index, *hash)).cloned()
+    }
+
     pub fn committed_index(&self) -> u64 { self.eng.committed_index }
+    /// Newest certificate this node holds, as a wire message — what a lagging peer pulls.
+    #[cfg(test)]
+    pub fn high_qc_msg(&self) -> Option<ConsensusMsg> {
+        self.eng.high_qc.clone().map(ConsensusMsg::Qc)
+    }
     pub fn current_index(&self) -> u64 { self.eng.current_index }
     pub fn committee(&self) -> &[NodeId] { &self.committee }
 
@@ -319,6 +371,11 @@ impl ConsensusDriver {
                 // never false-trip: the node loop routes a Proposal to handle() only once msg_index <=
                 // current_index (frontier caught up ⇒ next_window == this proposal's window); stale/forged is refused.
                 if cp.window_head_height != self.next_window().saturating_mul(self.cp_interval) {
+                    if crate::node::is_warn() {
+                        println!("[WARN][BFT2] proposal_dropped reason=window idx={} head={} want_head={}",
+                                 cp.index, cp.window_head_height,
+                                 self.next_window().saturating_mul(self.cp_interval));
+                    }
                     return Vec::new();
                 }
                 // Same doctrine for the INDEX. The engine refuses any index but its current one
@@ -326,6 +383,10 @@ impl ConsensusDriver {
                 // never act on - and heads/state_roots/mb_hashes feed the finality inputs. A proposal
                 // that is merely early is buffered and replayed by the node loop, so nothing is lost.
                 if cp.index != self.eng.current_index {
+                    if crate::node::is_warn() {
+                        println!("[WARN][BFT2] proposal_dropped reason=index idx={} ours={} head={}",
+                                 cp.index, self.eng.current_index, cp.window_head_height);
+                    }
                     return Vec::new();
                 }
                 // Same doctrine for the INDEX. The engine refuses any index but its current one
@@ -375,7 +436,13 @@ impl ConsensusDriver {
                                      cp.parent_qc.as_ref().map(|q| q.index),
                                      ours.as_ref().map(|q| q.index));
                         }
-                        return Vec::new();
+                        // Ask for the certificate we are MISSING, by its own index. The proposal
+                        // names it in parent_qc; a window number is a different counter entirely
+                        // (index 124 vs window 117 for one and the same checkpoint) and would never
+                        // match the serve store.
+                        return vec![Effect::CatchUp {
+                            qc_index: cp.parent_qc.as_ref().map(|q| q.index).unwrap_or(0),
+                            window: cp.window_head_height / self.cp_interval.max(1) }];
                     }
                     self.parent_hash()
                 };
@@ -413,7 +480,10 @@ impl ConsensusDriver {
                     None => self.eng.on_vote(v),
                 }
             }
-            ConsensusMsg::Qc(qc) => self.eng.adopt_qc(qc),
+            ConsensusMsg::Qc(qc) => {
+                self.remember_qc(qc);
+                self.eng.adopt_qc(qc)
+            }
             ConsensusMsg::Timeout(tm) => {
                 // Strip the embedded pk before the timeout enters a TC — on_timeout_msg copies the
                 // signature verbatim, so at a 1000-committee this drops ~1.74 MB from every TC. Same
@@ -505,6 +575,10 @@ impl ConsensusDriver {
                 Action::Vote(v) => out.push(Effect::Vote {
                     index: v.index, checkpoint_hash: v.checkpoint_hash, commit: VoteCommitment::default() }),
                 Action::FormedQc(qc) => {
+                    // Serve store must be filled by the node that BUILDS the certificate: the
+                    // self-routed copy comes back below its own index and the staleness filter
+                    // drops it, so relying on the inbound path leaves every frontier node empty.
+                    self.remember_qc(&qc);
                     out.extend(self.seal_if_ready(&qc));
                     out.push(Effect::Relay(ConsensusMsg::Qc(qc)));
                 }
@@ -597,6 +671,9 @@ mod tests {
                 index, voter: n.id.clone(), high_qc_index,
                 signature: sign(&n.id, &timeout_bytes(index, high_qc_index)),
             })],
+            // No transport in the harness: a pull is a no-op here, the property under test is
+            // whether the driver ASKS instead of dead-ending.
+            Effect::CatchUp { .. } => vec![],
             Effect::Relay(m) => vec![m],
             Effect::Persist { checkpoint, .. } => {
                 let w = checkpoint.window_head_height / 90;
@@ -1194,6 +1271,149 @@ mod tests {
                 }
             }
             queue = next;
+        }
+    }
+
+    /// Deterministic ASYNCHRONOUS delivery: every (message, receiver) pair gets an independent
+    /// delay, so a certificate reaches different nodes in different rounds.
+    ///
+    /// `deliver_gated` hands every message to every node in one round. Under that schedule all
+    /// nodes hold the same high_qc at all times, so a rule that refuses a proposal whose parent
+    /// certificate differs from the receiver's own can never fire on an honest node — which is why
+    /// a full green suite coexisted with a network that stopped. Skew is the whole point.
+    fn deliver_skewed(
+        nodes: &mut Vec<Node>, tails: &mut Vec<Vec<Hash>>, c: &[NodeId],
+        seed: Vec<ConsensusMsg>, skew_seed: u64, max_rounds: usize,
+    ) {
+        // Reproducible per-scenario schedule; no wall clock, no thread order.
+        let mut rng = skew_seed | 1;
+        let mut next_delay = |bound: u64| -> usize {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((rng >> 33) % bound) as usize
+        };
+
+        // pending[round] = messages to hand to a specific node in that round.
+        let mut pending: Vec<Vec<(usize, ConsensusMsg)>> = vec![Vec::new(); max_rounds + 8];
+        let mut enqueue = |pending: &mut Vec<Vec<(usize, ConsensusMsg)>>,
+                           at: usize, m: &ConsensusMsg, from: usize,
+                           delay: &mut dyn FnMut(u64) -> usize| {
+            for k in 0..5 {
+                // Self-delivery is the in-process route_inbound: never delayed, never lost. A node
+                // that can lose its OWN vote is a modelling error, not a network condition, and it
+                // masks every property under test.
+                if k == from { let last = pending.len() - 1; pending[(at + 1).min(last)].push((k, m.clone())); continue; }
+                // Certificates are SHED, not only delayed: dispatch_cert_verify drops one when the
+                // verify semaphore is full, and re-gossip is its only retry. A lost certificate is
+                // what turns "one round behind" into "behind forever" when the proposal that would
+                // carry it is refused too. One in five, deterministic per schedule.
+                if delay(20) == 0 { continue; }
+                let last = pending.len() - 1;
+                let r = (at + 1 + delay(4)).min(last);
+                pending[r].push((k, m.clone()));
+            }
+        };
+        for m in &seed { enqueue(&mut pending, 0, m, usize::MAX, &mut next_delay); }
+
+        // Highest certificate seen on the wire, kept so a lagging node can PULL it. The live node
+        // has three catch-up paths (re-gossip, catchup_pull, sync); without at least one of them a
+        // single lost certificate is fatal on its own and no refusal rule can be told apart from
+        // plain message loss.
+        let mut best_qc: Option<ConsensusMsg> = None;
+        // Proposals seen on the wire. A lagging node needs the CONTENT, not just the certificate:
+        // adopt_qc can only commit an index whose proposal it already holds, so a node that missed
+        // the proposal is stuck even after receiving the QC. The live node fetches it by range sync.
+        let mut seen_props: Vec<ConsensusMsg> = Vec::new();
+
+        for round in 0..max_rounds {
+            // Catch-up tick: every node behind the frontier pulls the newest certificate.
+            if round % 12 == 11 {
+                if let Some(qc) = best_qc.clone() {
+                    let lead = nodes.iter().map(|n| n.d.committed_index()).max().unwrap_or(0);
+                    for k in 0..nodes.len() {
+                        if nodes[k].d.committed_index() < lead {
+                            for p in &seen_props { let _ = nodes[k].d.handle(p); }
+                            let effs = nodes[k].d.handle(&qc);
+                            for e in effs {
+                                for out in exec(&mut nodes[k], e) {
+                                    enqueue(&mut pending, round, &out, k, &mut next_delay);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let batch: Vec<(usize, ConsensusMsg)> = std::mem::take(&mut pending[round]);
+            if batch.is_empty() { continue; }
+            for (k, m) in batch {
+                if !verify_msg(c, &m) { continue; }
+                if let ConsensusMsg::Proposal(cp) = &m {
+                    // Adopt the leader's tail: content divergence is a separate fault and would
+                    // mask the property under test.
+                    if tails[k] != cp.window_mb_hashes { tails[k] = cp.window_mb_hashes.clone(); }
+                }
+                let effs = nodes[k].d.handle(&m);
+                for e in effs {
+                    for out in exec(&mut nodes[k], e) {
+                        if let ConsensusMsg::Proposal(_) = &out { seen_props.push(out.clone()); }
+                        if let ConsensusMsg::Qc(q) = &out {
+                            let better = best_qc.as_ref().map_or(true, |b| match b {
+                                ConsensusMsg::Qc(bq) => q.index > bq.index, _ => true });
+                            if better { best_qc = Some(out.clone()); }
+                        }
+                        enqueue(&mut pending, round, &out, k, &mut next_delay);
+                    }
+                }
+            }
+        }
+    }
+
+    /// THE property every single-driver test in this file is structurally unable to express:
+    /// under skewed delivery, honest nodes must still CONVERGE.
+    ///
+    /// Safety alone is not enough. Every refusal rule added to handle() preserved safety and
+    /// destroyed liveness — nodes drifted one certificate apart, then refused each other's
+    /// proposals forever, and the live network stopped with 720 unit tests green. This test
+    /// asserts the OUTCOME (all nodes agree AND advanced) and deliberately names no mechanism,
+    /// so a wrong model cannot encode itself into the expectation the way
+    /// `a_proposal_at_an_index_the_view_has_left_records_nothing` did.
+    #[test]
+    #[ignore = "NOT EVIDENCE: the schedule starves one node deterministically, so this cannot tell protocol behaviour from its own message loss. Four configurations, including all three proposal bars disabled, gave the byte-identical result. Fix by driving the real inbound path instead of this simplified copy; until then red or green here means nothing."]
+    fn honest_nodes_converge_under_delivery_skew() {
+        for skew in [1u64, 7, 13, 29, 101] {
+            let (c, mut nodes, mut tails) = five_node_harness();
+            for w in 1..=6u64 {
+                for t in tails.iter_mut() { *t = vec![[w as u8; 32]]; }
+                let seed = propose_window(&mut nodes, &tails, &c, w);
+                deliver_skewed(&mut nodes, &mut tails, &c, seed, skew, 600);
+
+                // Cross-window catch-up: a node behind the frontier pulls the newest certificate
+                // the leaders hold. Modelled between windows because that is where the live
+                // catchup_pull runs — inside one window it has nothing newer to fetch.
+                let lead = nodes.iter().map(|n| n.d.committed_index()).max().unwrap_or(0);
+                let donor = nodes.iter().position(|n| n.d.committed_index() == lead);
+                if let Some(di) = donor {
+                    if let Some(qc) = nodes[di].d.high_qc_msg() {
+                        for k in 0..nodes.len() {
+                            if nodes[k].d.committed_index() < lead {
+                                let effs = nodes[k].d.handle(&qc);
+                                for e in effs { let _ = exec(&mut nodes[k], e); }
+                            }
+                        }
+                    }
+                }
+            }
+
+            let committed: Vec<u64> = nodes.iter().map(|n| n.d.committed_index()).collect();
+            let windows: Vec<u64> = nodes.iter().map(|n| n.d.next_window()).collect();
+
+            // LIVENESS: the schedule is delayed, never dropped, so every honest node must end on
+            // the same committed index.
+            assert!(committed.iter().all(|x| *x == committed[0]),
+                    "skew={skew}: nodes ended on different committed indexes {committed:?}                      (windows {windows:?}) — a delivery delay became a permanent split");
+
+            // And it must have MOVED. Agreeing on zero is a halt, not consensus.
+            assert!(committed[0] > 0,
+                    "skew={skew}: nothing committed under skewed delivery {committed:?}                      (windows {windows:?}) — honest nodes cannot make progress out of lock-step");
         }
     }
 

@@ -973,6 +973,17 @@ impl SimplifiedP2P {
     }
     
     /// Handle consensus state request
+    /// Ask peers for the certificate of `round`. Sent when a proposal names a parent certificate
+    /// this node does not hold: the wire carries only a QcRef, so the proposal cannot deliver it and
+    /// refusing without asking leaves the node permanently one certificate behind. Bounded fanout —
+    /// one answer is enough and the serve side is rate-limited.
+    pub fn request_consensus_state(&self, round: u64) {
+        const CATCHUP_ASK_PEERS: usize = 3;
+        self.gossip_to_random_peers(NetworkMessage::RequestConsensusState {
+            round, requester_id: self.node_id.clone(),
+        }, CATCHUP_ASK_PEERS);
+    }
+
     pub fn handle_consensus_state_request(&self, from_peer: &str, round: u64, requester_id: String) {
         // Update last_seen for requesting peer
         self.update_peer_last_seen(from_peer);
@@ -1030,7 +1041,26 @@ impl SimplifiedP2P {
             println!("[INFO][CONS] Preparing consensus state for round {} for {}", round, requester_id);
         }
         
-        // This will be connected to consensus storage when node.rs implements it
+        // Serve the certificate for that round. A proposal names its parent by a 40-byte QcRef with
+        // no signatures, so a peer one certificate behind cannot obtain it from the proposal and has
+        // nothing else to ask. The bytes are an already-verified wire message and the requester
+        // re-verifies on its own inbound path, so serving costs no trust.
+        match crate::consensus_v2_node::catchup_bundle(round) {
+            Some(state_data) => {
+                if crate::node::is_info() {
+                    println!("[INFO][CONS] serve_catchup round={} to={} bytes={}",
+                             round, requester_id, state_data.len());
+                }
+                self.send_network_message(from_peer, NetworkMessage::ConsensusState {
+                    round, state_data, sender_id: self.node_id.clone(),
+                });
+            }
+            None => {
+                if crate::node::is_debug() {
+                    println!("[DBG][CONS] serve_catchup_miss round={} to={}", round, requester_id);
+                }
+            }
+        }
     }
     
     /// Handle consensus state received
@@ -1042,8 +1072,13 @@ impl SimplifiedP2P {
             println!("[INFO][CONS] Processing consensus state for round {} from {} ({} bytes)",
                      round, sender_id, state_data.len());
         }
-        
-        // This will be connected to consensus recovery when node.rs implements it
+
+        // Route each carried message through the NORMAL inbound path: it re-verifies signatures
+        // and quorum against the committee, so a served certificate is trusted exactly as much as
+        // a gossiped one. Anything unparsable is dropped without touching consensus state.
+        // Not route_inbound: that path prunes by round and would discard both halves of a pair
+        // whose index is below ours — which is every catch-up by definition.
+        crate::consensus_v2_node::route_catchup(state_data);
     }
     
     /// Request blocks from peers for sync

@@ -2560,6 +2560,10 @@ impl QuicTransport {
             NetworkMessage::MacroblocksBatch { .. } => 10,
             NetworkMessage::TimeoutCertificateBroadcast { .. } => 10,
             NetworkMessage::TimeoutCertificatesResponse { .. } => 10,
+            // Catch-up reply: carries a checkpoint plus its full certificate, so it is the same
+            // size class as the frames above. On the 2 MB catch-all it is refused at the sender,
+            // silently, above roughly a 680-member committee.
+            NetworkMessage::ConsensusState { .. } => 10,
             _ => 0,
         }
     }

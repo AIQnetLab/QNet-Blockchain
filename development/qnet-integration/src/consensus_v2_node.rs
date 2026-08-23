@@ -93,6 +93,18 @@ fn process_authenticated(
     match check_content(storage, window_buf, msg) {
         ContentCheck::Ok => {
             let mut effs = driver.handle(msg);
+            // Refresh what this node can serve a lagging peer. Both halves or nothing: a
+            // certificate without its checkpoint cannot advance the asker.
+            // Only when the servable index MOVES. A certificate is megabytes at committee scale;
+            // re-cloning and re-serializing it on every inbound message would put that cost on the
+            // consensus loop itself.
+            if let Some(idx) = driver.newest_qc_index() {
+                if CATCHUP_LAST_RECORDED.swap(idx, Ordering::Relaxed) != idx {
+                    if let Some((i, pair)) = driver.newest_catchup_bundle() {
+                        if let Ok(b) = bincode::serialize(&pair) { record_catchup_bundle(i, b); }
+                    }
+                }
+            }
             effs.extend(try_propose(driver, window_buf, storage, committee));
             effs.extend(drain_pending(driver, window_buf, storage, p2p, committee, pending, max_pending, heard));
             effs
@@ -448,6 +460,18 @@ pub async fn execute(effects: Vec<Effect>, node_id: &str, p2p: &Arc<SimplifiedP2
     let mut sealed_now: Vec<u64> = Vec::new();
     for e in effects {
         match e {
+            // The refused proposal named a parent certificate we do not hold. Pull the window so
+            // the content is in place when that certificate arrives; refusing without asking is a
+            // dead end, which is how a node one certificate behind stayed behind forever.
+            Effect::CatchUp { qc_index, window } => {
+                if crate::node::is_warn() {
+                    println!("[WARN][BFT2] catchup_on_parent_miss window={}", window);
+                }
+                request_window_recovery(storage, window);
+                // And ask for the certificate itself — the window content alone cannot commit an
+                // index whose certificate the node never receives.
+                p2p.request_consensus_state(qc_index);
+            }
             Effect::Propose(mut cp) => {
                 if let Some(s) = sign_payload(node_id, "CKPT", &cp.hash()).await {
                     cp.proposer_sig = s;
@@ -660,6 +684,11 @@ pub enum V2Event {
     // task (dispatch_cert_verify). INTERNAL + trusted: only that worker emits it (external peers can
     // only reach the loop via route_inbound → Inbound), so the loop processes it WITHOUT re-verifying.
     CertVerified(Vec<u8>),
+    // A served catch-up pair: bincode(Vec<ConsensusMsg>) = [Proposal, Qc] for an index BELOW our
+    // own. It must not take the Inbound path: that path prunes by round (a proposal under the
+    // current view can never yield a vote, a certificate under it is stale) and both rules are
+    // about VOTING, while catch-up needs the pair to COMMIT. Verified here, then driver.sync.
+    CatchUpPair(Vec<u8>),
     WindowEnd {
         index: u64, head_height: u64, mb_hashes: Vec<Hash>, state_root: Hash, beacon: Hash,
         committee: Vec<String>,        // epoch committee (N-2 VRF sample) for this window
@@ -929,6 +958,33 @@ const MAX_RETAINED_GATED: usize = 4;
 /// marker cannot stand in for it: several writers advance that marker in whole macroblocks, so a
 /// marker-derived target overshoots by one checkpoint whenever the macro path wrote it last.
 static V2_NEXT_WINDOW_HEAD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Newest index already serialized into the serve store; guards the multi-MB re-serialize.
+static CATCHUP_LAST_RECORDED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Catch-up bundles this node can serve: index -> bincode(Vec<ConsensusMsg>) holding the
+/// checkpoint and its certificate. A proposal names its parent certificate by a 40-byte QcRef with
+/// no signatures, so it cannot deliver the certificate itself; without this a node one certificate
+/// behind has no way to obtain it and never rejoins the view. Written by the consensus loop, read
+/// by the p2p serve path. Bounded by the driver retention that fills it.
+static CATCHUP_BUNDLES: once_cell::sync::Lazy<dashmap::DashMap<u64, Vec<u8>>> =
+    once_cell::sync::Lazy::new(dashmap::DashMap::new);
+
+/// Serve one catch-up bundle, or the newest at or below `index`.
+pub fn catchup_bundle(index: u64) -> Option<Vec<u8>> {
+    if let Some(v) = CATCHUP_BUNDLES.get(&index) { return Some(v.value().clone()); }
+    CATCHUP_BUNDLES.iter().filter(|e| *e.key() <= index)
+        .max_by_key(|e| *e.key()).map(|e| e.value().clone())
+}
+
+/// Record what this node can serve for `index`. Keeps the map to the same horizon as the driver.
+pub fn record_catchup_bundle(index: u64, bytes: Vec<u8>) {
+    const KEEP: usize = 64;
+    CATCHUP_BUNDLES.insert(index, bytes);
+    while CATCHUP_BUNDLES.len() > KEEP {
+        let oldest = CATCHUP_BUNDLES.iter().map(|e| *e.key()).min();
+        match oldest { Some(k) => { CATCHUP_BUNDLES.remove(&k); } None => break }
+    }
+}
 
 /// 0 until the runtime has driven at least one tick.
 pub fn v2_next_window_head() -> u64 { V2_NEXT_WINDOW_HEAD.load(Ordering::Relaxed) }
@@ -1086,6 +1142,11 @@ fn evict_superseded_proposal(pending: &mut Vec<Vec<u8>>, index: u64, proposer: &
 }
 
 /// P2P dispatch calls this for NetworkMessage::ConsensusV2 (no-op until run() starts).
+/// Hand a served catch-up pair to the consensus loop. Same byte budget as any inbound frame.
+pub fn route_catchup(data: Vec<u8>) {
+    if let Some(tx) = V2_TX.get() { let _ = tx.send(V2Event::CatchUpPair(data)); }
+}
+
 pub fn route_inbound(data: Vec<u8>) {
     if let Some(tx) = V2_TX.get() {
         // Reserve the message's bytes; drop under flood so a peer cannot OOM the node. The
@@ -1225,7 +1286,9 @@ pub async fn run(
     // than waiting for the watchdog below to detect it reactively. driver.sync is monotonic +
     // content-checked, and the stored QC was verified at apply time, so a fresh first boot (no
     // macroblock yet) is a harmless no-op. The watchdog remains as the mid-run backstop.
-    if let Ok(idx) = storage.get_latest_macroblock_index() {
+    // The SEAL frontier, not chain_height/90 — see the note at the watchdog below.
+    {
+        let idx = storage.last_sealed_mb_index();
         if idx > 0 {
             match stored_checkpoint_qc(&storage, idx) {
                 Some((cp, qc)) => {
@@ -1429,7 +1492,11 @@ pub async fn run(
                     stuck_ticks = stuck_ticks.saturating_add(1);
                     if stuck_ticks >= STUCK_TICKS {
                         // Self-heal from local committed state: adopt the latest stored macroblock's QC.
-                        if let Ok(idx) = storage.get_latest_macroblock_index() {
+                        // Self-heal must target the newest macroblock this node actually
+                        // holds. get_latest_macroblock_index() is chain_height/90, so on a lagging
+                        // node it names one that was never sealed and the QC lookup can only miss.
+                        {
+                            let idx = storage.last_sealed_mb_index();
                             match stored_checkpoint_qc(&storage, idx) {
                                 Some((cp, qc)) => {
                                     let effs = driver.sync(&cp, &qc);
@@ -1519,6 +1586,30 @@ pub async fn run(
                         }
                         Err(_) => Vec::new(),
                     },
+                    V2Event::CatchUpPair(data) => {
+                        // Verify the certificate against the committee exactly as any other
+                        // certificate, then adopt through the monotonic, content-checked sync entry.
+                        let pair = bincode::deserialize::<Vec<ConsensusMsg>>(&data).unwrap_or_default();
+                        let cp = pair.iter().find_map(|m| match m {
+                            ConsensusMsg::Proposal(p) => Some(p.clone()), _ => None });
+                        let qc = pair.iter().find_map(|m| match m {
+                            ConsensusMsg::Qc(q) => Some(q.clone()), _ => None });
+                        match (cp, qc) {
+                            (Some(cp), Some(qc)) if verify_msg(&p2p, &committee, &ConsensusMsg::Qc(qc.clone()))
+                                && cp.hash() == qc.checkpoint_hash => {
+                                if crate::node::is_info() {
+                                    println!("[INFO][BFT2] catchup_adopted idx={} head={}", qc.index, cp.window_head_height);
+                                }
+                                driver.sync(&cp, &qc)
+                            }
+                            _ => {
+                                if crate::node::is_warn() {
+                                    println!("[WARN][BFT2] catchup_rejected bytes={}", data.len());
+                                }
+                                Vec::new()
+                            }
+                        }
+                    }
                     V2Event::CertVerified(data) => {
                         // A checkpoint cert (Qc/Tc) whose O(committee) signature dispatch_cert_verify already
                         // verified OFF this loop. Trusted (only that worker emits this variant; external peers
