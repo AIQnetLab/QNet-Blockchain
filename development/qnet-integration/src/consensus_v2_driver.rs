@@ -346,6 +346,24 @@ impl ConsensusDriver {
         self.translate(acts)
     }
 
+    /// The index of a certified checkpoint whose HEAD this node never learned, if any.
+    ///
+    /// Votes are counted against a checkpoint HASH, not against a checkpoint, so a node that misses
+    /// one proposal but receives the quorum's votes certifies an index it cannot place. heads[index]
+    /// stays empty, refresh_high_window has nothing to raise, and the window frontier stops there
+    /// for good: every later proposal fails the contiguity gate and the node never votes again.
+    /// Reported so the node can ask for what it is missing instead of sitting blind.
+    pub fn frontier_blind(&self) -> Option<u64> {
+        let idx = self.eng.high_qc.as_ref()?.index;
+        if self.heads.contains_key(&idx) { return None; }
+        // A head prune() dropped is not a blind spot. prune keeps the last CONSENSUS_STATE_RETAIN
+        // indices, and current_index advances on a TC while high_qc does not, so an old high_qc can
+        // fall below the floor with nothing wrong. A wedged node is the opposite case: its
+        // current_index sits at idx+1, so idx is always far above the floor.
+        let floor = self.eng.current_index.saturating_sub(CONSENSUS_STATE_RETAIN);
+        if idx < floor { None } else { Some(idx) }
+    }
+
     /// Catch-up: ingest a VERIFIED committed checkpoint + QC.
     pub fn sync(&mut self, cp: &Checkpoint, qc: &QuorumCertificate) -> Vec<Effect> {
         if cp.index != qc.index || cp.hash() != qc.checkpoint_hash { return Vec::new(); }
@@ -1084,6 +1102,65 @@ mod tests {
     // no head for that index ⇒ heads.get == None ⇒ .unwrap_or(0)) must NOT collapse next_window to 1 —
     // that seed let a node runaway-propose window 1 at a high round and wedge the whole net. The monotonic
     // high_window floor holds next_window at the last KNOWN window; it may only advance (head arrives),
+    /// The wedge that froze nodes in the field. Votes are tallied against a HASH, so a node that
+    /// misses one proposal but receives the quorum's votes certifies an index it cannot place. The
+    /// frontier then has nothing to raise and stops there for good — every later proposal fails the
+    /// contiguity gate and the node never votes again. Nothing asked for the missing checkpoint,
+    /// because the catch-up pull keys on lacking CONTENT and this node lacks only the FRONTIER.
+    /// So the state must be visible, and any newer certified pair must clear it.
+    #[test]
+    fn a_blind_frontier_is_reported_and_cleared_by_a_newer_certified_pair() {
+        let c: Vec<NodeId> = (0..4).map(|i| format!("n{}", i)).collect();
+        let genesis = [7u8; 32];
+        let mut d = ConsensusDriver::new("n9".into(), c.clone(), genesis);
+        d.set_intervals(90, 90);
+
+        let certify = |i: u64, prev: Option<&QuorumCertificate>| {
+            let cp = Checkpoint {
+                index: i, parent_qc: prev.map(qnet_consensus::checkpoint_bft::QcRef::from),
+                window_head_height: i * 90, window_mb_hashes: vec![[i as u8; 32]],
+                state_root: [i as u8; 32], beacon: [0u8; 32], epoch_commitment: [0u8; 32],
+                reward_root: [0u8; 32], registry_root: [0u8; 32], dilithium_pk_root: [0u8; 32],
+                reward_epoch_root: [0u8; 32], logs_root: [0u8; 32], total_supply: 0, timestamp: 0,
+                proposer: c[0].clone(), proposer_sig: Vec::new(), recovery_anchor: None,
+            };
+            let signers: Vec<NodeId> = c.iter().take(3).cloned().collect();
+            let sigs: Vec<Vec<u8>> = signers.iter().map(|s| s.as_bytes().to_vec()).collect();
+            let qc = QuorumCertificate {
+                checkpoint_hash: cp.hash(), index: i,
+                sig_merkle_root: sig_merkle_root(&sigs), signers, sigs,
+            };
+            (cp, qc)
+        };
+
+        let mut prev: Option<QuorumCertificate> = None;
+        for i in 1..=5u64 {
+            let (cp, qc) = certify(i, prev.as_ref());
+            let _ = d.sync(&cp, &qc);
+            prev = Some(qc);
+        }
+        assert_eq!(d.frontier_blind(), None, "a checkpoint this node holds is not a blind spot");
+        assert_eq!(d.next_window(), 6);
+
+        // The quorum's votes arrive; the proposal they are about does not.
+        let signers: Vec<NodeId> = c.iter().take(3).cloned().collect();
+        let sigs: Vec<Vec<u8>> = signers.iter().map(|s| s.as_bytes().to_vec()).collect();
+        let headless = QuorumCertificate {
+            checkpoint_hash: [9u8; 32], index: 6,
+            sig_merkle_root: sig_merkle_root(&sigs), signers, sigs,
+        };
+        let _ = d.handle(&ConsensusMsg::Qc(headless));
+        assert_eq!(d.frontier_blind(), Some(6),
+                   "a certified index with no head must be reported, not sat on");
+        assert_eq!(d.next_window(), 6, "the frontier is frozen exactly here");
+
+        // Any newer certified pair carries a head, so it repairs and advances in one step.
+        let (cp7, qc7) = certify(7, None);
+        let _ = d.sync(&cp7, &qc7);
+        assert_eq!(d.frontier_blind(), None, "the blind spot is cleared");
+        assert_eq!(d.next_window(), 8, "and the frontier moves past the window it was stuck on");
+    }
+
     // never regress.
     #[test]
     fn headless_qc_adopt_does_not_collapse_next_window() {

@@ -3,9 +3,9 @@
 mod misc_api;
 pub(crate) use misc_api::*;
 mod tx_api;
-pub(crate) use tx_api::*;
+use tx_api::*;
 mod queries_api;
-pub(crate) use queries_api::*;
+use queries_api::*;
 mod rewards_api;
 use rewards_api::*;
 mod light_nodes;

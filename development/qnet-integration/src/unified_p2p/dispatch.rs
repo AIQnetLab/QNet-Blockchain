@@ -979,6 +979,9 @@ impl SimplifiedP2P {
     /// one answer is enough and the serve side is rate-limited.
     pub fn request_consensus_state(&self, round: u64) {
         const CATCHUP_ASK_PEERS: usize = 3;
+        // Arm the receive side for exactly the peers asked: a served pair costs an O(committee)
+        // verify, so unasked ones are refused before they reach the consensus loop.
+        crate::consensus_v2_node::expect_catchup(CATCHUP_ASK_PEERS);
         self.gossip_to_random_peers(NetworkMessage::RequestConsensusState {
             round, requester_id: self.node_id.clone(),
         }, CATCHUP_ASK_PEERS);

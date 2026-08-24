@@ -1,6 +1,9 @@
 //! QUIC transport lifecycle: init, send, broadcast, connection reaping and shutdown.
 
 use super::*;
+/// Rate limiter for the unroutable-peer report below.
+static UNROUTABLE_REPORTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 
 impl SimplifiedP2P {
     /// PRODUCTION v2.19.21: Initialize QUIC transport for high-performance P2P
@@ -145,6 +148,7 @@ impl SimplifiedP2P {
     }
     
     /// PRODUCTION v2.19.21: Broadcast NetworkMessage to all peers via QUIC
+
     pub async fn broadcast_quic(&self, message: &NetworkMessage) -> Vec<crate::p2p_transport::BroadcastResult> {
         use crate::p2p_transport::BroadcastResult;
         use crate::quic_transport::QUIC_PORT_OFFSET;
@@ -177,17 +181,29 @@ impl SimplifiedP2P {
             }
         };
         use futures::stream::StreamExt;
+        // An address that does not parse silently excluded that peer from EVERY consensus broadcast
+        // for the process lifetime. Count and report it: a peer missing from the fan-out is
+        // indistinguishable at the sender from a peer that received the frame.
+        let offered = peers.len();
+        let mut unroutable = 0usize;
         let targets: Vec<(String, std::net::SocketAddr)> = peers.into_iter().filter_map(|peer| {
             let parts: Vec<&str> = peer.addr.split(':').collect();
-            if parts.len() != 2 { return None; }
+            if parts.len() != 2 { unroutable += 1; return None; }
             match (parts[0].parse::<std::net::IpAddr>(), parts[1].parse::<u16>()) {
                 (Ok(ip), Ok(port)) => Some((
                     peer.addr.clone(),
                     std::net::SocketAddr::new(ip, port.saturating_add(QUIC_PORT_OFFSET)),
                 )),
-                _ => None,
+                _ => { unroutable += 1; None }
             }
         }).collect();
+        if unroutable > 0 {
+            let c = UNROUTABLE_REPORTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if (c < 3 || c % 256 == 0) && crate::node::is_warn() {
+                println!("[WARN][P2P] broadcast_unroutable_peers dropped={} of={} — address is not ip:port",
+                         unroutable, offered);
+            }
+        }
         let transport = quic_transport.read().await;
         let results: Vec<BroadcastResult> = futures::stream::iter(targets)
             .map(|(addr, quic_addr)| {

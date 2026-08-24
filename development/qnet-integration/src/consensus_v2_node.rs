@@ -70,6 +70,42 @@ fn dispatch_cert_verify(data: Vec<u8>, p2p: &Arc<SimplifiedP2P>, committee: &[St
     });
 }
 
+/// OFF-LOOP verify of a served catch-up pair. A certificate check is O(committee) — 667 ML-DSA
+/// verifications at a 1000-member committee — and the select-loop task also drives the view timer,
+/// so running it inline starves timeouts at exactly the moment the node is trying to recover.
+///
+/// The committee comes from the SERVED checkpoint's own window, read from storage on the worker.
+/// It cannot come from the driver: this path exists to repair a frozen frontier, and the loop
+/// committee is resolved from that frontier.
+fn dispatch_catchup_verify(data: Vec<u8>, p2p: &Arc<SimplifiedP2P>, storage: &Arc<Storage>) {
+    let permit = match CERT_VERIFY_SEM.try_acquire() {
+        Ok(p) => p,
+        Err(_) => { CERT_SHED.fetch_add(1, Ordering::Relaxed); return; }
+    };
+    let p2p = p2p.clone();
+    let storage = storage.clone();
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let pair = bincode::deserialize::<Vec<ConsensusMsg>>(&data).unwrap_or_default();
+        let cp = pair.iter().find_map(|m| match m {
+            ConsensusMsg::Proposal(p) => Some(p.clone()), _ => None });
+        let qc = pair.iter().find_map(|m| match m {
+            ConsensusMsg::Qc(q) => Some(q.clone()), _ => None });
+        let ok = match (&cp, &qc) {
+            (Some(cp), Some(qc)) => cp.hash() == qc.checkpoint_hash
+                && committee_for_window(&storage,
+                       cp.window_head_height / qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL)
+                    .is_some_and(|cmt| verify_msg(&p2p, &cmt, &ConsensusMsg::Qc(qc.clone()))),
+            _ => false,
+        };
+        if ok {
+            if let Some(tx) = V2_TX.get() { let _ = tx.send(V2Event::CatchUpVerified(data)); }
+        } else if crate::node::is_warn() {
+            println!("[WARN][BFT2] catchup_rejected bytes={}", data.len());
+        }
+    });
+}
+
 /// Shared post-authentication processing for a message whose signature already passed — verify_msg (a cheap
 /// single-sig Proposal/Vote/Timeout, inline) OR an OFF-LOOP cert verify (Qc/Tc, re-injected as CertVerified).
 /// Runs the accountable-safety observers + the independent content re-derivation gate (check_content) + the
@@ -377,15 +413,84 @@ fn relay_certificate(p2p: &Arc<SimplifiedP2P>, msg: &ConsensusMsg) {
     }
 }
 
+/// Broadcasts report DELIVERY. broadcast_quic returns per-peer success/failure and the result used
+/// to be discarded, so a proposal that reached nobody logged exactly like one that reached everyone
+/// — the blind spot behind two macroblock-boundary halts. Proposals always report (one per checkpoint
+/// window, so the line is cheap at any committee size); the per-second kinds report only a total
+/// blackout, rate-limited, because one dead peer must not drown the log.
 async fn broadcast(p2p: &Arc<SimplifiedP2P>, msg: &ConsensusMsg) {
-    if let Ok(data) = bincode::serialize(msg) {
-        // Self-route: a node is part of its own quorum (counts its own vote/timeout,
-        // and the proposer votes on its own proposal). Without this, quorum n−f cannot
-        // be met when one peer is down (the node's own vote would never be counted).
-        route_inbound(data.clone());
-        let _ = p2p.broadcast_quic(&NetworkMessage::ConsensusV2 { data }).await;
-    }
+    let (kind, index, head) = match msg {
+        ConsensusMsg::Proposal(cp) => ("proposal", cp.index, cp.window_head_height),
+        ConsensusMsg::Vote(v) => ("vote", v.index, 0),
+        ConsensusMsg::Timeout(t) => ("timeout", t.index, 0),
+        ConsensusMsg::Qc(q) => ("qc", q.index, 0),
+        ConsensusMsg::Tc(t) => ("tc", t.index, 0),
+    };
+    let data = match bincode::serialize(msg) {
+        Ok(d) => d,
+        Err(e) => {
+            if crate::node::is_warn() {
+                println!("[WARN][BFT2] broadcast_serialize_failed kind={} index={} err={}", kind, index, e);
+            }
+            return;
+        }
+    };
+    let bytes = data.len();
+    let is_proposal = matches!(msg, ConsensusMsg::Proposal(_));
+    // A boundary proposal seals a macroblock; a lost one is terminal, so it is called out by name.
+    let boundary = is_proposal && head % qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL == 0;
+    // Self-route: a node is part of its own quorum (counts its own vote/timeout,
+    // and the proposer votes on its own proposal). Without this, quorum n−f cannot
+    // be met when one peer is down (the node's own vote would never be counted).
+    // INLINE and first — the node's own view must advance before anything else runs.
+    route_inbound(data.clone());
+    // The network fan-out leaves the consensus loop. broadcast_quic waits for EVERY peer, each with
+    // dial retries and 10 s stream timeouts, so awaiting it here let ONE unreachable peer stall the
+    // loop that processes votes and view changes. Bounded: saturation means that many fan-outs are
+    // still stuck in the transport, so the peers are already gone and reporting beats an unbounded
+    // task backlog.
+    let permit = match BROADCAST_SLOTS.try_acquire() {
+        Ok(p) => p,
+        Err(_) => {
+            if crate::node::is_warn() {
+                println!("[WARN][BFT2] broadcast_saturated kind={} index={} head_h={} bytes={} inflight={} — frame dropped",
+                         kind, index, head, bytes, BROADCAST_INFLIGHT);
+            }
+            return;
+        }
+    };
+    let p2p = p2p.clone();
+    tokio::spawn(async move {
+        let _permit = permit; // released when the fan-out finishes
+        let res = p2p.broadcast_quic(&NetworkMessage::ConsensusV2 { data }).await;
+        let peers = res.len();
+        let delivered = res.iter().filter(|r| r.success).count();
+        let report = if is_proposal { delivered < peers || peers == 0 } else {
+            delivered == 0 && {
+                let c = BROADCAST_BLACKOUTS.fetch_add(1, Ordering::Relaxed);
+                c < 3 || c % 64 == 0
+            }
+        };
+        if report {
+            if crate::node::is_warn() {
+                let err = res.iter().find(|r| !r.success).and_then(|r| r.error.clone())
+                    .unwrap_or_else(|| "no_targets".to_string());
+                println!("[WARN][BFT2] broadcast_incomplete kind={} index={} head_h={} boundary={} bytes={} peers={} delivered={} err={}",
+                         kind, index, head, boundary as u8, bytes, peers, delivered, err);
+            }
+        } else if is_proposal && crate::node::is_info() {
+            println!("[INFO][BFT2] broadcast_ok kind=proposal index={} head_h={} boundary={} bytes={} peers={} delivered={}",
+                     index, head, boundary as u8, bytes, peers, delivered);
+        }
+    });
 }
+
+/// Concurrent off-loop fan-outs allowed at once.
+const BROADCAST_INFLIGHT: usize = 32;
+static BROADCAST_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(BROADCAST_INFLIGHT);
+
+/// Total-blackout counter for the per-second message kinds (see broadcast).
+static BROADCAST_BLACKOUTS: AtomicUsize = AtomicUsize::new(0);
 
 /// Failover exclusions for the next epoch (≥2 failovers in this epoch ⇒ skip).
 /// Deterministic from on-chain failover history, so every node reads the same
@@ -473,10 +578,18 @@ pub async fn execute(effects: Vec<Effect>, node_id: &str, p2p: &Arc<SimplifiedP2
                 p2p.request_consensus_state(qc_index);
             }
             Effect::Propose(mut cp) => {
-                if let Some(s) = sign_payload(node_id, "CKPT", &cp.hash()).await {
-                    cp.proposer_sig = s;
-                    if crate::node::is_info() { println!("[INFO][BFT2] propose index={} head_h={}", cp.index, cp.window_head_height); }
-                    broadcast(p2p, &ConsensusMsg::Proposal(cp)).await;
+                match sign_payload(node_id, "CKPT", &cp.hash()).await {
+                    Some(s) => {
+                        cp.proposer_sig = s;
+                        if crate::node::is_info() { println!("[INFO][BFT2] propose index={} head_h={}", cp.index, cp.window_head_height); }
+                        broadcast(p2p, &ConsensusMsg::Proposal(cp)).await;
+                    }
+                    // A leader that cannot sign emits NOTHING. Silent here meant the round looked like
+                    // one nobody led, and the window stalled with no evidence of why.
+                    None => if crate::node::is_warn() {
+                        println!("[WARN][BFT2] propose_unsigned index={} head_h={} — consensus key unavailable",
+                                 cp.index, cp.window_head_height);
+                    },
                 }
             }
             Effect::Vote { index, checkpoint_hash, commit } => {
@@ -606,7 +719,28 @@ pub async fn execute(effects: Vec<Effect>, node_id: &str, p2p: &Arc<SimplifiedP2
                         if checkpoint.proposer == node_id {
                             if let Ok(ser) = bincode::serialize(&mb) {
                                 let compressed = zstd::encode_all(&ser[..], 3).unwrap_or(ser);
-                                let _ = p2p.broadcast_macroblock(window, compressed, window).await;
+                                // Multi-MB, and it fires exactly at a macroblock boundary — the same loop
+                                // that must keep answering votes and view changes. Off-loop like every other
+                                // fan-out, and no longer discarding its outcome.
+                                let bytes = compressed.len();
+                                match BROADCAST_SLOTS.try_acquire() {
+                                    Ok(permit) => {
+                                        let p2p = p2p.clone();
+                                        tokio::spawn(async move {
+                                            let _permit = permit;
+                                            if let Err(e) = p2p.broadcast_macroblock(window, compressed, window).await {
+                                                if crate::node::is_warn() {
+                                                    println!("[WARN][BFT2] macroblock_broadcast_failed window={} bytes={} err={}",
+                                                             window, bytes, e);
+                                                }
+                                            }
+                                        });
+                                    }
+                                    Err(_) => if crate::node::is_warn() {
+                                        println!("[WARN][BFT2] macroblock_broadcast_saturated window={} bytes={} inflight={}",
+                                                 window, bytes, BROADCAST_INFLIGHT);
+                                    },
+                                }
                             }
                         }
                         if crate::node::is_info() {
@@ -689,6 +823,10 @@ pub enum V2Event {
     // current view can never yield a vote, a certificate under it is stale) and both rules are
     // about VOTING, while catch-up needs the pair to COMMIT. Verified here, then driver.sync.
     CatchUpPair(Vec<u8>),
+    // The same pair after its O(committee) certificate check ran on a blocking worker
+    // (dispatch_catchup_verify). INTERNAL + trusted, exactly like CertVerified: only that worker
+    // emits it, so the loop adopts it without paying the verify a second time.
+    CatchUpVerified(Vec<u8>),
     WindowEnd {
         index: u64, head_height: u64, mb_hashes: Vec<Hash>, state_root: Hash, beacon: Hash,
         committee: Vec<String>,        // epoch committee (N-2 VRF sample) for this window
@@ -934,6 +1072,8 @@ static V2_TX: OnceCell<mpsc::UnboundedSender<V2Event>> = OnceCell::new();
 /// is never dropped outside an active flood. A MEMORY bound, not a rate — cannot throttle
 /// legitimate throughput (unlike the v17.x per-minute limit that stalled the net).
 static V2_INBOUND_BYTES: AtomicUsize = AtomicUsize::new(0);
+/// Frames refused by the gate above, for the rate-limited report.
+static V2_INBOUND_DROPS: AtomicUsize = AtomicUsize::new(0);
 const V2_INBOUND_BYTE_CAP: usize = 64 * 1024 * 1024; // 64 MiB of queued inbound consensus bytes
 /// Companion BYTE bound on the driver's `pending` replay buffer. The 256-ENTRY
 /// count cap alone still allows 256 × msg_size (a large-proposal flood ⇒ hundreds of MiB),
@@ -972,17 +1112,26 @@ static CATCHUP_BUNDLES: once_cell::sync::Lazy<dashmap::DashMap<u64, Vec<u8>>> =
 /// Serve one catch-up bundle, or the newest at or below `index`.
 pub fn catchup_bundle(index: u64) -> Option<Vec<u8>> {
     if let Some(v) = CATCHUP_BUNDLES.get(&index) { return Some(v.value().clone()); }
-    CATCHUP_BUNDLES.iter().filter(|e| *e.key() <= index)
-        .max_by_key(|e| *e.key()).map(|e| e.value().clone())
+    // Newest at or below the ask, and failing that the newest held at all. The receiver checks the
+    // certificate against the committee of ITS OWN window, so a LATER pair repairs a stale frontier
+    // just as well as the exact one — and a node further behind than the retained span would
+    // otherwise be answered with nothing and stay stuck for good.
+    CATCHUP_BUNDLES.iter().filter(|e| *e.key() <= index).max_by_key(|e| *e.key())
+        .or_else(|| CATCHUP_BUNDLES.iter().max_by_key(|e| *e.key()))
+        .map(|e| e.value().clone())
 }
 
-/// Record what this node can serve for `index`. Keeps the map to the same horizon as the driver.
+/// Record what this node can serve for `index`.
 pub fn record_catchup_bundle(index: u64, bytes: Vec<u8>) {
-    const KEEP: usize = 64;
+    // Bounded by BYTES, not by entry count: one pair carries a full certificate, ~3 MB at a
+    // 1000-member committee, so a fixed 64-entry store would sit on ~200 MB at target scale.
+    const KEEP_BYTES: usize = 64 * 1024 * 1024;
+    const KEEP_MIN: usize = 4; // always serve a few, however large the committee grows
     CATCHUP_BUNDLES.insert(index, bytes);
-    while CATCHUP_BUNDLES.len() > KEEP {
-        let oldest = CATCHUP_BUNDLES.iter().map(|e| *e.key()).min();
-        match oldest { Some(k) => { CATCHUP_BUNDLES.remove(&k); } None => break }
+    let mut total: usize = CATCHUP_BUNDLES.iter().map(|e| e.value().len()).sum();
+    while total > KEEP_BYTES && CATCHUP_BUNDLES.len() > KEEP_MIN {
+        let oldest = match CATCHUP_BUNDLES.iter().map(|e| *e.key()).min() { Some(k) => k, None => break };
+        match CATCHUP_BUNDLES.remove(&oldest) { Some((_, v)) => total -= v.len(), None => break }
     }
 }
 
@@ -1141,10 +1290,43 @@ fn evict_superseded_proposal(pending: &mut Vec<Vec<u8>>, index: u64, proposer: &
     });
 }
 
-/// P2P dispatch calls this for NetworkMessage::ConsensusV2 (no-op until run() starts).
-/// Hand a served catch-up pair to the consensus loop. Same byte budget as any inbound frame.
+/// Arm the node to accept `n` served catch-up pairs. Called for every outgoing request so the
+/// count matches the peers actually asked.
+pub fn expect_catchup(n: usize) { CATCHUP_EXPECTED.store(n, Ordering::Release); }
+
+/// Pairs this node still expects; anything beyond them was not asked for.
+static CATCHUP_EXPECTED: AtomicUsize = AtomicUsize::new(0);
+static CATCHUP_UNSOLICITED: AtomicUsize = AtomicUsize::new(0);
+
+/// Hand a served catch-up pair to the consensus loop.
+///
+/// Only a pair this node ASKED for is admitted: verifying one costs an O(committee) certificate
+/// check on the consensus loop, and nothing stops a peer from sending these unasked. Admitted
+/// frames are charged against the same inbound budget as any other consensus frame.
 pub fn route_catchup(data: Vec<u8>) {
-    if let Some(tx) = V2_TX.get() { let _ = tx.send(V2Event::CatchUpPair(data)); }
+    let solicited = CATCHUP_EXPECTED
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| if n == 0 { None } else { Some(n - 1) })
+        .is_ok();
+    if !solicited {
+        let c = CATCHUP_UNSOLICITED.fetch_add(1, Ordering::Relaxed);
+        if (c < 3 || c % 256 == 0) && crate::node::is_warn() {
+            println!("[WARN][BFT2] catchup_unsolicited bytes={} dropped={}", data.len(), c + 1);
+        }
+        return;
+    }
+    if let Some(tx) = V2_TX.get() {
+        let n = data.len();
+        if V2_INBOUND_BYTES.fetch_add(n, Ordering::AcqRel) + n > V2_INBOUND_BYTE_CAP {
+            V2_INBOUND_BYTES.fetch_sub(n, Ordering::AcqRel);
+            if crate::node::is_warn() {
+                println!("[WARN][BFT2] catchup_dropped bytes={} cap={}", n, V2_INBOUND_BYTE_CAP);
+            }
+            return;
+        }
+        if tx.send(V2Event::CatchUpPair(data)).is_err() {
+            V2_INBOUND_BYTES.fetch_sub(n, Ordering::AcqRel);
+        }
+    }
 }
 
 pub fn route_inbound(data: Vec<u8>) {
@@ -1154,7 +1336,15 @@ pub fn route_inbound(data: Vec<u8>) {
         let n = data.len();
         if V2_INBOUND_BYTES.fetch_add(n, Ordering::AcqRel) + n > V2_INBOUND_BYTE_CAP {
             V2_INBOUND_BYTES.fetch_sub(n, Ordering::AcqRel);
-            return; // dropped under flood — consensus re-gossips / the pacemaker re-proposes
+            // Dropped under flood. Rate-limited but NEVER silent: this admission gate discards a
+            // consensus frame the sender believes it delivered, and at committee scale the largest
+            // frames are the first to be refused.
+            let c = V2_INBOUND_DROPS.fetch_add(1, Ordering::Relaxed);
+            if (c < 3 || c % 256 == 0) && crate::node::is_warn() {
+                println!("[WARN][BFT2] inbound_dropped bytes={} queued={} cap={} drops={}",
+                         n, V2_INBOUND_BYTES.load(Ordering::Relaxed), V2_INBOUND_BYTE_CAP, c + 1);
+            }
+            return;
         }
         if tx.send(V2Event::Inbound(data)).is_err() {
             V2_INBOUND_BYTES.fetch_sub(n, Ordering::AcqRel); // channel gone (shutdown)
@@ -1275,6 +1465,12 @@ pub async fn run(
     let mut rc_last_index: u64 = 0;   // stagger resets when the pinned index moves
     let mut stuck_ticks: u32 = 0;
     let mut catchup_ticks: u32 = 0; // sustained ticks behind the quorum, gates the pull
+    // Ticks the frontier must stay blind before asking. Two reasons not to be eager: a QC can
+    // briefly precede its proposal, and the serving side rate-limits consensus-state requests to
+    // 5/min per peer, which this cadence stays under.
+    const BLIND_TICKS_BEFORE_PULL: u32 = 4;
+    let mut blind_ticks: u32 = 0;
+    let mut blind_pulls: u32 = 0;
     let mut committee_window: u64 = u64::MAX; // window `committee` was resolved for
     let mut stuck_alarmed = false;
     if crate::node::is_info() {
@@ -1458,6 +1654,34 @@ pub async fn run(
                         println!("[WARN][BFT2] seal_skipped window={} reason=seal_inputs_absent", w);
                     }
                 }
+                // FRONTIER BLIND SPOT. A certified index whose checkpoint never arrived freezes the
+                // window frontier permanently, and no existing repair reaches it: the catch-up pull
+                // requires next_window > last_signaled, while a blind node has the content and a stale
+                // frontier — the opposite condition. Ask for the EXACT missing index, never for
+                // "your newest": the committee rotates every macroblock, and a wedged node resolves
+                // its committee from the frozen window, so a later-epoch certificate would fail as a
+                // non-member and the repair could never land. The certificate at this index was
+                // signed by the committee this node still holds. Sustained, because a QC legitimately
+                // arrives before its proposal now and then.
+                match driver.frontier_blind() {
+                    Some(idx) => {
+                        blind_ticks = blind_ticks.saturating_add(1);
+                        // Back off 16s, 32s, 64s, 128s. A blind spot is usually cleared by the first
+                        // answer; if it is not, the peers cannot serve it, and a fixed cadence would
+                        // have every blinded node in a correlated event asking at the same rate.
+                        let need = BLIND_TICKS_BEFORE_PULL << blind_pulls.min(3);
+                        if blind_ticks >= need {
+                            blind_ticks = 0;
+                            blind_pulls = blind_pulls.saturating_add(1);
+                            if crate::node::is_warn() {
+                                println!("[WARN][BFT2] frontier_blind qc_index={} next_window={} — pulling that checkpoint",
+                                         idx, driver.next_window());
+                            }
+                            p2p.request_consensus_state(idx);
+                        }
+                    }
+                    None => { blind_ticks = 0; blind_pulls = 0; }
+                }
                 if driver.current_index() == last_index && driver.next_window() <= last_signaled {
                     ticks_stuck = ticks_stuck.saturating_add(1);
                     let need = (1u32 << consec_timeouts.min(4)).min(15); // base ticks: 4,8,16,32,60s
@@ -1541,7 +1765,7 @@ pub async fn run(
             Some(ev) = rx.recv() => {
                 // Release the inbound-backpressure reservation (taken in route_inbound) as soon
                 // as a PEER message leaves the queue. Control events are not counted → never gated.
-                if let V2Event::Inbound(ref d) = ev {
+                if let V2Event::Inbound(ref d) | V2Event::CatchUpPair(ref d) = ev {
                     V2_INBOUND_BYTES.fetch_sub(d.len(), Ordering::AcqRel);
                 }
                 let effects = match ev {
@@ -1577,6 +1801,19 @@ pub async fn run(
                                 if let Some(sender) = msg_sender(&msg) {
                                     heard.insert(sender.to_string(), std::time::Instant::now());
                                 }
+                                // The receive half of the delivery ledger: the proposer reports how many
+                                // peers it believes it reached, each peer reports what it assembled. Only
+                                // boundary proposals — one per macroblock, and the frame whose loss halts the
+                                // chain. Placed AFTER verify_msg: the proposer field is peer-supplied, so an
+                                // unauthenticated frame must never reach a format string.
+                                if let ConsensusMsg::Proposal(ref cp) = msg {
+                                    if cp.window_head_height % qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL == 0
+                                        && crate::node::is_info() {
+                                        let who: String = cp.proposer.chars().take(48).collect();
+                                        println!("[INFO][BFT2] boundary_proposal_recv index={} head_h={} bytes={} proposer={}",
+                                                 cp.index, cp.window_head_height, data.len(), who);
+                                    }
+                                }
                                 // Single-sig (Proposal/Vote/Timeout): the verify is cheap ⇒ inline is fine.
                                 process_authenticated(&msg, &mut driver, &storage, &window_buf, &p2p, &mut committee, &mut pending, MAX_PENDING, &mut heard)
                             } else {
@@ -1587,27 +1824,27 @@ pub async fn run(
                         Err(_) => Vec::new(),
                     },
                     V2Event::CatchUpPair(data) => {
-                        // Verify the certificate against the committee exactly as any other
-                        // certificate, then adopt through the monotonic, content-checked sync entry.
+                        // The certificate check is O(committee); it runs on a blocking worker and
+                        // comes back as the trusted CatchUpVerified below.
+                        dispatch_catchup_verify(data, &p2p, &storage);
+                        Vec::new()
+                    }
+                    V2Event::CatchUpVerified(data) => {
+                        // Signature already checked off-loop against the served window's committee.
+                        // driver.sync is monotonic and content-checked, so a stale pair is a no-op.
                         let pair = bincode::deserialize::<Vec<ConsensusMsg>>(&data).unwrap_or_default();
                         let cp = pair.iter().find_map(|m| match m {
                             ConsensusMsg::Proposal(p) => Some(p.clone()), _ => None });
                         let qc = pair.iter().find_map(|m| match m {
                             ConsensusMsg::Qc(q) => Some(q.clone()), _ => None });
                         match (cp, qc) {
-                            (Some(cp), Some(qc)) if verify_msg(&p2p, &committee, &ConsensusMsg::Qc(qc.clone()))
-                                && cp.hash() == qc.checkpoint_hash => {
+                            (Some(cp), Some(qc)) => {
                                 if crate::node::is_info() {
                                     println!("[INFO][BFT2] catchup_adopted idx={} head={}", qc.index, cp.window_head_height);
                                 }
                                 driver.sync(&cp, &qc)
                             }
-                            _ => {
-                                if crate::node::is_warn() {
-                                    println!("[WARN][BFT2] catchup_rejected bytes={}", data.len());
-                                }
-                                Vec::new()
-                            }
+                            _ => Vec::new(),
                         }
                     }
                     V2Event::CertVerified(data) => {
@@ -2091,5 +2328,38 @@ mod catchup_tests {
     #[test]
     fn no_peer_evidence_is_never_behind() {
         assert!(!is_behind_quorum(10, 9, 0, 3));
+    }
+}
+
+#[cfg(test)]
+mod catchup_store_tests {
+    use super::*;
+
+    /// One test, because the served store is process-global and two would race each other.
+    ///
+    /// Two properties. A node further behind than the retained span used to be answered with
+    /// NOTHING, which left it wedged for good — the serving side now falls back to the newest pair
+    /// it holds, and the receiver checks that pair against the committee of the SERVED window, so a
+    /// later pair repairs a stale frontier just as well as the exact one. And the store is bounded
+    /// by BYTES: one pair carries a full certificate, about 3 MB at a 1000-member committee, so a
+    /// fixed entry count would sit on hundreds of MB at target scale.
+    #[test]
+    fn served_store_answers_a_stale_ask_and_stays_within_its_byte_budget() {
+        CATCHUP_BUNDLES.clear();
+        record_catchup_bundle(500, vec![5u8; 16]);
+        record_catchup_bundle(501, vec![6u8; 16]);
+        assert_eq!(catchup_bundle(501).as_deref(), Some(&[6u8; 16][..]), "exact index wins");
+        assert_eq!(catchup_bundle(600).as_deref(), Some(&[6u8; 16][..]), "ahead of us: newest at or below");
+        assert_eq!(catchup_bundle(10).as_deref(), Some(&[6u8; 16][..]),
+                   "further behind than anything retained must still get an answer");
+
+        CATCHUP_BUNDLES.clear();
+        let big = 8 * 1024 * 1024; // 8 MiB per pair => the 64 MiB budget holds 8
+        for i in 0..20u64 { record_catchup_bundle(i, vec![0u8; big]); }
+        let total: usize = CATCHUP_BUNDLES.iter().map(|e| e.value().len()).sum();
+        assert!(total <= 64 * 1024 * 1024, "byte budget respected, got {total}");
+        assert!(CATCHUP_BUNDLES.len() < 20, "older pairs evicted, kept {}", CATCHUP_BUNDLES.len());
+        assert!(CATCHUP_BUNDLES.contains_key(&19), "the newest pair is always retained");
+        CATCHUP_BUNDLES.clear();
     }
 }

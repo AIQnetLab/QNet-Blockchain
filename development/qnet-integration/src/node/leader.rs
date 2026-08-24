@@ -605,18 +605,6 @@ impl BlockchainNode {
             .unwrap_or_default()
     }
 
-    /// FrozenEntropy(w): producer + attestation seed during a freeze (R5). Folds only sealed bytes
-    /// (M_A's entropy) and the public window index — no branch-dependent tail.
-    pub(crate) fn frozen_entropy(anchor: &qnet_state::MacroBlock, w: u64) -> [u8; 32] {
-        let mut h = Sha3_256::new();
-        h.update(b"QNET_FROZEN_ENTROPY_V1");
-        h.update(Self::hash_macroblock_entropy(anchor));
-        h.update(w.to_le_bytes());
-        let mut out = [0u8; 32];
-        out.copy_from_slice(&h.finalize());
-        out
-    }
-
     /// FrozenBeacon(w): committee-sampling seed during a freeze (R6). Folds ZERO post-seal bytes, so
     /// legal same-height failover siblings above the seal cannot poison it — immunity by construction.
     pub(crate) fn frozen_beacon(anchor: &qnet_state::MacroBlock, w: u64) -> [u8; 32] {

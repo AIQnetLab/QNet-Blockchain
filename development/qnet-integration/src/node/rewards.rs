@@ -155,7 +155,7 @@ impl BlockchainNode {
         // path uses; summing per wallet happens during the ordered scan below.
         const PUT_BATCH: usize = 20_000;
         let mut put_err = false;
-        let mut flush = |buf: &mut Vec<(String, String, u64)>, err: &mut bool| {
+        let flush = |buf: &mut Vec<(String, String, u64)>, err: &mut bool| {
             if buf.is_empty() || *err { buf.clear(); return; }
             if let Err(e) = storage.reward_agg_put_batch(build, buf) {
                 println!("[CRIT][REWARD] agg_put_failed epoch={} err={}", epoch, e);

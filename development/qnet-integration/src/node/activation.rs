@@ -515,7 +515,6 @@ impl BlockchainNode {
         storage: Arc<Storage>,
         mempool: Arc<qnet_mempool::SimpleMempool>,
         unified_p2p: Option<Arc<crate::unified_p2p::SimplifiedP2P>>,
-        wallet_identity: Option<Arc<crate::crypto::vrf::WalletIdentity>>,
     ) -> Result<(), QNetError> {
         let qnet_node_type = match node_type {
             NodeType::Super => qnet_state::NodeType::Super,
@@ -761,7 +760,6 @@ impl BlockchainNode {
         let storage = self.storage.clone();
         let mempool = self.mempool.clone();
         let unified_p2p = self.unified_p2p.clone();
-        let wallet_identity = self.wallet_identity.clone();
         let wallet_address = self.get_wallet_address();
         let device_sig = self.get_device_signature();
         let qnet_rpc = Self::resolve_genesis_rpc_url();
@@ -810,7 +808,7 @@ impl BlockchainNode {
                 match Self::drive_registration_convergence(
                     node_id.clone(), node_type, wallet_address.clone(), registration_proof.clone(),
                     api_endpoint.clone(), code.clone(), device_sig.clone(), qnet_rpc.clone(),
-                    storage.clone(), mempool.clone(), unified_p2p.clone(), wallet_identity.clone(),
+                    storage.clone(), mempool.clone(), unified_p2p.clone(),
                 ).await {
                     Ok(()) => { if is_info() { println!("[INFO][REG] convergence_armed id={}", node_id); } }
                     Err(e) => println!("[WARN][REG] convergence_attempt_failed err={} — retry", e),

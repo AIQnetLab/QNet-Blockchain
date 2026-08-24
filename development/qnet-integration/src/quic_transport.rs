@@ -122,6 +122,10 @@ pub const MAX_HANDSHAKE_SIZE: usize = 64 * 1024;
 /// Maximum message size (10 MB - for macroblocks/block batches)
 pub const MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024;
 
+/// Inbound uni-stream losses — rate limiters for the two reports in handle_uni_stream.
+static UNI_READ_FAILS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static UNI_READ_TIMEOUTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// S2b: bulk serve-response send-concurrency bound. Reserves QUIC-stream + CPU headroom for
 /// consensus so a cold-sync flood (100k joiners) cannot starve failover/checkpoint sends — the
 /// onboarding wedge was a lost failover vote when sync churn saturated the shared streams.
@@ -1756,19 +1760,22 @@ impl QuicTransport {
         ).await {
             Ok(Ok(d)) => d,
             Ok(Err(e)) => {
-                // One-way broadcast uni-stream read error (mostly a benign early stream close) — the
-                // payload still arrives from other peers / repair, so this is DBG, not a node fault.
-                if crate::node::is_debug() {
-                    println!("[DBG][QUIC] uni_read_failed peer={} err={:?}",
-                        get_privacy_id_for_addr(&peer_addr.to_string()), e);
+                // A frame the sender counted as delivered but this node never assembled. Usually a
+                // benign early close, which is why it is rate-limited — but never DBG-only: at DBG the
+                // production log cannot distinguish "not sent" from "sent and lost on receive".
+                let c = UNI_READ_FAILS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if (c < 3 || c % 128 == 0) && crate::node::is_warn() {
+                    println!("[WARN][QUIC] uni_read_failed peer={} fails={} err={:?}",
+                        get_privacy_id_for_addr(&peer_addr.to_string()), c + 1, e);
                 }
                 return;
             }
             Err(_) => {
                 // Idle broadcast uni-stream whose body lands after the read window — normal under load,
                 // not a fault (bulk sync payloads arrive in one write_all+finish). DBG to avoid spam.
-                if crate::node::is_debug() {
-                    println!("[DBG][QUIC] uni_read_timeout peer={} timeout={}ms",
+                let c = UNI_READ_TIMEOUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if (c < 3 || c % 128 == 0) && crate::node::is_warn() {
+                    println!("[WARN][QUIC] uni_read_timeout peer={} timeout={}ms",
                         get_privacy_id_for_addr(&peer_addr.to_string()),
                         adaptive_timeout.as_millis());
                 }
@@ -2442,6 +2449,23 @@ impl QuicTransport {
     /// broadcast_to with the frame already on the wire format. A fan-out that serializes per peer
     /// holds one copy per in-flight send, and a certificate at a 1000-member committee carries that
     /// many un-aggregated ML-DSA-65 signatures - so the caller serializes once and shares the bytes.
+    /// Time left on the reconnect cooldown when a fresh dial is the ONLY way to reach this peer.
+    /// None whenever a channel can still appear on its own: a live cached connection, a live
+    /// NAT-reuse connection the peer opened to us, or a dial another task already has in flight.
+    /// Those are exactly connect()'s pre-cooldown exits, so the retry loop stops only for a peer
+    /// connect() would genuinely refuse — not for one that is about to become reachable.
+    fn dial_blocked_for(&self, peer_addr: &SocketAddr) -> Option<Duration> {
+        if self.connect_in_progress.contains_key(peer_addr) { return None; }
+        let live = |c: Option<Arc<QuicConnection>>| c.is_some_and(|c| is_connection_alive(&c));
+        if live(self.connections.get(peer_addr).map(|r| r.clone())) { return None; }
+        if live(INBOUND_CONN_BY_LISTEN_ADDR.get(peer_addr).map(|r| r.value().clone())) { return None; }
+        let cooldown = Duration::from_secs(PEER_RECONNECT_COOLDOWN_SECS);
+        self.last_connect_attempt.get(peer_addr).and_then(|last| {
+            let elapsed = last.value().elapsed();
+            if elapsed < cooldown { Some(cooldown - elapsed) } else { None }
+        })
+    }
+
     pub async fn broadcast_wire_to(&self, peer_addr: SocketAddr, wire_data: &[u8]) -> Result<(), String> {
         // Retry loop for broadcast attempts
         let mut last_error = String::new();
@@ -2460,6 +2484,12 @@ impl QuicTransport {
                     }
                     if attempt < CONNECT_RETRY_ATTEMPTS {
                         let delay = Duration::from_millis((RETRY_DELAY_MS * (1 << (attempt - 1))).min(MAX_RETRY_DELAY_MS));
+                        // A dial the cooldown will still be refusing after `delay` cannot be retried
+                        // into success — sleeping only holds the caller (the consensus loop) hostage.
+                        // Stop now and report; the next broadcast dials once the window opens.
+                        if self.dial_blocked_for(&peer_addr).is_some_and(|left| left > delay) {
+                            return Err(format!("dial cooldown: {}", last_error));
+                        }
                         tokio::time::sleep(delay).await;
                     }
                 }

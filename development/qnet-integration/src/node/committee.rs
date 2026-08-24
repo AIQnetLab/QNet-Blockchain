@@ -250,12 +250,34 @@ impl BlockchainNode {
     /// the quorum that does hold the data keeps sealing, and an abstaining node still follows the chain.
     pub async fn compute_cumulative_ban_set(storage: &Storage, mb_index: u64) -> Option<std::collections::HashSet<String>> {
         let window_head = mb_index.saturating_mul(90);
+        // Walk back to the newest anchor this node holds, then scan forward from it. Bans are
+        // write-once monotone over committed bodies, so starting one macroblock earlier and scanning
+        // one window more yields the IDENTICAL set — only the work differs. Exactness is unchanged:
+        // a missing body inside the scanned span still returns None below.
+        //
+        // Not a rebuild from height 1, which would be wrong after pruning. The walk is bounded to the
+        // roster horizon; deeper than that the node is behind enough that syncing is the answer.
         let (mut bans, scan_start) = if mb_index >= 2 {
-            match Self::load_macroblock_ban_set(storage, mb_index - 1) {
-                Some(anchor) => (anchor, (mb_index - 1) * 90 + 1),
+            let mut found = None;
+            for back in 1..=Self::MAX_DERIVED_ROSTER_WINDOWS as u64 {
+                let anchor_idx = match mb_index.checked_sub(back) { Some(a) if a >= 1 => a, _ => break };
+                if let Some(set) = Self::load_macroblock_ban_set(storage, anchor_idx) {
+                    found = Some((set, anchor_idx * 90 + 1, anchor_idx));
+                    break;
+                }
+            }
+            match found {
+                Some((set, start, anchor_idx)) => {
+                    if anchor_idx != mb_index - 1 && is_info() {
+                        println!("[INFO][BAN] anchor_walkback mb={} used={} spans={}",
+                                 mb_index, anchor_idx, mb_index - anchor_idx);
+                    }
+                    (set, start)
+                }
                 None => {
                     if is_warn() {
-                        println!("[WARN][BAN] anchor_absent mb={} — abstaining until sync", mb_index - 1);
+                        println!("[WARN][BAN] anchor_absent mb={} depth={} — abstaining until sync",
+                                 mb_index - 1, Self::MAX_DERIVED_ROSTER_WINDOWS);
                     }
                     crate::sync_manager::nudge_sync_check();
                     return None;

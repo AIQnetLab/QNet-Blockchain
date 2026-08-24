@@ -42,6 +42,12 @@ pub(crate) fn node_sources() -> String {
         include_str!("sync.rs"),
         include_str!("transactions.rs"),
     ].concat()
+        // include_str! keeps the checkout's line endings, and git rewrites them on Windows. The
+        // scanners below match multi-line patterns, so normalise once here rather than have a
+        // source-shape assertion depend on how the tree happens to be checked out.
+        .replace("
+", "
+")
 }
 
 pub(crate) use crate::{
@@ -4920,6 +4926,58 @@ mod tests {
                    "two canonical windows ⇒ full ceiling");
     }
 
+    // ── BAN-SET ANCHOR WALK-BACK (storage-backed) ──────────────────────────────────────────────
+    //
+    // A single macroblock that never sealed used to make EVERY later window underivable, which is
+    // terminal: the window is also the N-2 election anchor two epochs on. Walking back to an older
+    // anchor and scanning further is exact — bans are write-once monotone over committed bodies — so
+    // the only thing that may change is the work, never the answer. What must NOT change is fail-stop:
+    // a body missing anywhere in the widened span still abstains.
+
+    /// Storage holding microblocks 1..=270 plus whichever macroblock anchors `mbs` names.
+    async fn ban_env(mbs: &[u64], banned: &[&str], drop_body: Option<u64>)
+        -> (tempfile::TempDir, crate::storage::Storage) {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage");
+        for h in 1..=270u64 {
+            if Some(h) == drop_body { continue; }
+            p3_seed_chain(&storage, h, h, |x| (x % 250 + 1) as u8);
+        }
+        let list: Vec<String> = banned.iter().map(|s| s.to_string()).collect();
+        for &i in mbs {
+            let mut cd = qnet_state::ConsensusData::default();
+            cd.banned_validators = Some(bincode::serialize(&list).expect("ser bans"));
+            let mb = qnet_state::MacroBlock::new(i, 0, [0u8; 32], vec![], [0u8; 32], cd);
+            storage.save_macroblock(i, &mb).await.expect("save mb");
+        }
+        (dir, storage)
+    }
+
+    #[tokio::test]
+    async fn ban_set_walks_back_to_an_older_anchor_without_weakening_fail_stop() {
+        // Baseline: the immediate anchor is present.
+        let (_d, s) = ban_env(&[1, 2], &["offender"], None).await;
+        let direct = BlockchainNode::compute_cumulative_ban_set(&s, 3).await;
+        assert!(direct.as_ref().is_some_and(|b| b.contains("offender")),
+                "with anchor mb2 present the set must carry the anchored ban");
+
+        // Same question, anchor mb2 missing: the walk reaches mb1 and scans one window further.
+        let (_d2, s2) = ban_env(&[1], &["offender"], None).await;
+        let walked = BlockchainNode::compute_cumulative_ban_set(&s2, 3).await;
+        assert_eq!(walked, direct,
+                   "a walked-back anchor must yield the IDENTICAL set, not merely a usable one");
+
+        // Fail-stop is untouched: a body missing inside the widened span still abstains.
+        let (_d3, s3) = ban_env(&[1], &["offender"], Some(100)).await;
+        assert_eq!(BlockchainNode::compute_cumulative_ban_set(&s3, 3).await, None,
+                   "a pruned/absent body in the scanned span must still abstain");
+
+        // No anchor at all within the horizon: abstain, exactly as before.
+        let (_d4, s4) = ban_env(&[], &[], None).await;
+        assert_eq!(BlockchainNode::compute_cumulative_ban_set(&s4, 3).await, None,
+                   "no reachable anchor ⇒ abstain until sync");
+    }
+
     // ── RECOVERY RELAXATION (storage-backed) ───────────────────────────────────────────────────
     //
     // resolve_recovery_pin is THE authority: it decides the committee AND the threshold for a relaxed
@@ -5339,14 +5397,11 @@ mod tests {
         assert_eq!(r.len(), 50);
         assert!(r.windows(2).all(|w| w[0].node_id <= w[1].node_id), "roster canonically sorted");
         for w in [3u64, 4, 32] {
-            assert_eq!(BlockchainNode::frozen_entropy(&a, w), BlockchainNode::frozen_entropy(&a, w));
             assert_eq!(BlockchainNode::frozen_beacon(&a, w), BlockchainNode::frozen_beacon(&a, w));
         }
-        assert_ne!(BlockchainNode::frozen_entropy(&a, 3), BlockchainNode::frozen_entropy(&a, 4), "entropy varies per window");
         assert_ne!(BlockchainNode::frozen_beacon(&a, 3), BlockchainNode::frozen_beacon(&a, 4), "beacon varies per window");
         let b = mk_frozen_anchor(50, 0x22);
         assert_ne!(BlockchainNode::frozen_beacon(&a, 3), BlockchainNode::frozen_beacon(&b, 3), "beacon binds anchor bytes");
-        assert_ne!(BlockchainNode::frozen_entropy(&a, 3), BlockchainNode::frozen_entropy(&b, 3), "entropy binds anchor bytes");
     }
 
     /// R20.8 identity arm: at COMMITTEE_THRESHOLD with a <=1000 roster the committee IS the roster for
@@ -5392,7 +5447,6 @@ mod tests {
         for w in 11..=42u64 {
             assert_eq!(BlockchainNode::frozen_roster(&ma), BlockchainNode::frozen_roster(&mb));
             assert_eq!(BlockchainNode::frozen_beacon(&ma, w), BlockchainNode::frozen_beacon(&mb, w));
-            assert_eq!(BlockchainNode::frozen_entropy(&ma, w), BlockchainNode::frozen_entropy(&mb, w));
             assert_eq!(BlockchainNode::frozen_committee(&ma, w), BlockchainNode::frozen_committee(&mb, w));
         }
     }

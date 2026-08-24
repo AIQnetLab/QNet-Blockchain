@@ -726,7 +726,7 @@ impl SimplifiedP2P {
                 let mut cleaned_requests = 0;
                 
                 // First pass: unblock expired entries and clean old requests
-                rate_limiter.retain(|key, entry| {
+                rate_limiter.retain(|_key, entry| {
                     // Unblock if block time has passed
                     if entry.blocked_until > 0 && entry.blocked_until <= current_time {
                         entry.blocked_until = 0;
