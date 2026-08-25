@@ -95,6 +95,43 @@ fn record_apply_mismatch() -> bool {
     APPLY_MISMATCH_COUNT.fetch_add(1, Ordering::Relaxed) + 1 >= APPLY_MISMATCH_BREAKER
 }
 
+/// Make room in the deferred buffer for a block closer to the tip.
+///
+/// Deferred blocks all sit ABOVE the applied tip, so the lowest height is the one applied first.
+/// Evicting the highest-height entry keeps the same bound while retaining the blocks the node
+/// actually needs next; dropping the arrival instead discards the very block it is waiting for.
+/// `only_producer` restricts the search to one producer, preserving the per-producer bound.
+fn evict_farthest_deferred(
+    deferred: &mut HashMap<[u8; 32], Vec<(u64, DecodedBlock)>>,
+    by_producer: &mut HashMap<String, usize>,
+    count: &mut usize,
+    only_producer: Option<&str>,
+    incoming_h: u64,
+) -> bool {
+    let mut victim: Option<([u8; 32], usize, u64, String)> = None;
+    for (k, v) in deferred.iter() {
+        for (i, (_, d)) in v.iter().enumerate() {
+            if only_producer.is_some_and(|q| q != d.microblock.producer) { continue; }
+            let h = d.microblock.height;
+            if victim.as_ref().map_or(true, |(_, _, vh, _)| h > *vh) {
+                victim = Some((*k, i, h, d.microblock.producer.clone()));
+            }
+        }
+    }
+    match victim {
+        Some((k, i, h, p)) if h > incoming_h => {
+            if let Some(v) = deferred.get_mut(&k) {
+                v.remove(i);
+                if v.is_empty() { deferred.remove(&k); }
+            }
+            *count = count.saturating_sub(1);
+            if let Some(c) = by_producer.get_mut(&p) { *c = c.saturating_sub(1); }
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Reset the breaker after a clean apply.
 fn clear_apply_mismatch() {
     if APPLY_MISMATCH_COUNT.load(Ordering::Relaxed) != 0 {
@@ -1958,7 +1995,10 @@ impl BlockPipeline {
                         const DEFERRED_MAX_PER_PRODUCER: usize = 2 * crate::node::ROTATION_INTERVAL_BLOCKS as usize;
                         let from_this_producer = *deferred_by_producer
                             .get(&decoded.microblock.producer).unwrap_or(&0usize);
-                        if from_this_producer >= DEFERRED_MAX_PER_PRODUCER {
+                        if from_this_producer >= DEFERRED_MAX_PER_PRODUCER
+                            && !evict_farthest_deferred(&mut deferred, &mut deferred_by_producer,
+                                                        &mut deferred_count,
+                                                        Some(&decoded.microblock.producer), child_h) {
                             if is_warn() {
                                 println!("[WARN][PIPELINE] deferred_producer_cap h={} producer={} held={}",
                                          child_h, decoded.microblock.producer, from_this_producer);
@@ -1968,7 +2008,9 @@ impl BlockPipeline {
                             continue;
                         }
                         // Previous block not yet available — park it under the parent it waits for.
-                        if deferred_count < DEFERRED_MAX {
+                        if deferred_count < DEFERRED_MAX
+                            || evict_farthest_deferred(&mut deferred, &mut deferred_by_producer,
+                                                       &mut deferred_count, None, child_h) {
                             if is_debug() {
                                 println!("[DBG][PIPELINE] block_deferred h={} need_h={} buf={}",
                                          child_h, parent_h, deferred_count);
@@ -4777,3 +4819,55 @@ mod tests_deferred_capacity_rules {
                    "released slots must return to the producer, or one burst blocks it forever");
     }
 }
+
+#[cfg(test)]
+mod deferred_eviction_tests {
+    use super::*;
+
+    fn parked(h: u64, producer: &str) -> (u64, DecodedBlock) {
+        let mb = qnet_state::MicroBlock {
+            height: h, timestamp: 0, transactions: vec![], producer: producer.to_string(),
+            signature: vec![0u8; 64], merkle_root: [0u8; 32], previous_hash: [0u8; 32],
+            vrf_output: None, vrf_proof: None, fees_collected: 0,
+            state_root: [0u8; 32], timeout_round: 0, carried_baseline: 0, timeout_proof: None,
+        };
+        (0u64, DecodedBlock {
+            height: h, raw_data: Vec::new(), decompressed: Vec::new(),
+            microblock: mb, from_peer: "p".into(), sig_pre_verified: true,
+        })
+    }
+
+    /// A node two blocks behind used to discard the block it was waiting for and keep sixty it would
+    /// not need for another minute. The bound stays the same; what changes is which block is kept.
+    #[test]
+    fn the_block_closest_to_the_tip_wins_a_full_buffer() {
+        let mut deferred: HashMap<[u8; 32], Vec<(u64, DecodedBlock)>> = HashMap::new();
+        let mut by_producer: HashMap<String, usize> = HashMap::new();
+        let mut count = 0usize;
+        for (i, h) in [500u64, 540, 560].iter().enumerate() {
+            deferred.insert([i as u8; 32], vec![parked(*h, "prod_a")]);
+            *by_producer.entry("prod_a".into()).or_insert(0) += 1;
+            count += 1;
+        }
+
+        // An arrival closer to the tip evicts the farthest entry, not itself.
+        assert!(evict_farthest_deferred(&mut deferred, &mut by_producer, &mut count, Some("prod_a"), 501));
+        assert_eq!(count, 2, "one entry evicted");
+        assert_eq!(by_producer["prod_a"], 2, "producer count follows the eviction");
+        let heights: Vec<u64> = deferred.values().flatten().map(|(_, d)| d.microblock.height).collect();
+        assert!(!heights.contains(&560), "the farthest block is the one dropped");
+        assert!(heights.contains(&500) && heights.contains(&540), "nearer blocks are kept");
+
+        // An arrival farther than everything held changes nothing — the bound still holds.
+        assert!(!evict_farthest_deferred(&mut deferred, &mut by_producer, &mut count, Some("prod_a"), 9_000));
+        assert_eq!(count, 2, "nothing evicted for a block we need last");
+
+        // Another producer's entries are untouched by a per-producer eviction.
+        deferred.insert([9u8; 32], vec![parked(700, "prod_b")]);
+        *by_producer.entry("prod_b".into()).or_insert(0) += 1;
+        count += 1;
+        assert!(evict_farthest_deferred(&mut deferred, &mut by_producer, &mut count, Some("prod_a"), 501));
+        assert_eq!(by_producer["prod_b"], 1, "a different producer is never the victim");
+    }
+}
+

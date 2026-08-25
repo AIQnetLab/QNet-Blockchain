@@ -1371,7 +1371,7 @@ mod tests {
 
         // pending[round] = messages to hand to a specific node in that round.
         let mut pending: Vec<Vec<(usize, ConsensusMsg)>> = vec![Vec::new(); max_rounds + 8];
-        let mut enqueue = |pending: &mut Vec<Vec<(usize, ConsensusMsg)>>,
+        let enqueue = |pending: &mut Vec<Vec<(usize, ConsensusMsg)>>,
                            at: usize, m: &ConsensusMsg, from: usize,
                            delay: &mut dyn FnMut(u64) -> usize| {
             for k in 0..5 {

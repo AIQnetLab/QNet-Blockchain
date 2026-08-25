@@ -2513,12 +2513,6 @@ lazy_static::lazy_static! {
 
 }
 
-/// v9.0: Equivocation evidence queue for timeout vote double-voting.
-/// Key: (height, voter_id), Value: (round, detected_timestamp).
-/// Drained at macroblock creation and included as slashing events.
-pub static EQUIVOCATION_EVIDENCE: once_cell::sync::Lazy<DashMap<(u64, String), (u64, u64)>> =
-    once_cell::sync::Lazy::new(|| DashMap::new());
-
 /// v15.11 L6: Block-equivocation evidence — cryptographic proof that a producer
 /// signed two different microblocks at the same height. Both signatures are
 /// individually valid ML-DSA-65 attestations, which together form unforgeable
@@ -3106,10 +3100,6 @@ pub fn cleanup_global_hashmaps(current_height: u64) {
     // partition, and the count cap keeps a repeat offender from turning self-incrimination into
     // memory pressure.
     let evidence_floor = current_height.saturating_sub(EVIDENCE_RETENTION_BLOCKS);
-    let equivoc_before = EQUIVOCATION_EVIDENCE.len();
-    EQUIVOCATION_EVIDENCE.retain(|k, _| k.0 >= evidence_floor);
-    let equivoc_removed = equivoc_before.saturating_sub(EQUIVOCATION_EVIDENCE.len());
-
     let block_equivoc_before = BLOCK_EQUIVOCATION_EVIDENCE.len();
     BLOCK_EQUIVOCATION_EVIDENCE.retain(|k, _| k.0 >= evidence_floor);
     if BLOCK_EQUIVOCATION_EVIDENCE.len() > MAX_PENDING_EVIDENCE {
@@ -3128,9 +3118,9 @@ pub fn cleanup_global_hashmaps(current_height: u64) {
     // evicts entries not refreshed in the window, so active producers are never dropped.
     crate::unified_p2p::evict_stale_producer_heartbeats(600_000);
 
-    if (votes_removed > 0 || cert_removed > 0 || equivoc_removed > 0 || block_equivoc_removed > 0) && is_info() {
-        println!("[INFO][MEM] cleanup h={} votes={} certs={} equivoc={} block_equivoc={}",
-                 current_height, votes_removed, cert_removed, equivoc_removed, block_equivoc_removed);
+    if (votes_removed > 0 || cert_removed > 0 || block_equivoc_removed > 0) && is_info() {
+        println!("[INFO][MEM] cleanup h={} votes={} certs={} block_equivoc={}",
+                 current_height, votes_removed, cert_removed, block_equivoc_removed);
     }
 }
 
@@ -7405,7 +7395,7 @@ mod tests {
     #[test]
     fn heartbeat_verifies_against_the_committed_key_only() {
         use pqcrypto_mldsa::mldsa65 as d3;
-        use pqcrypto_traits::sign::{DetachedSignature as SigT, PublicKey as PkT, SecretKey as SkT};
+        use pqcrypto_traits::sign::{DetachedSignature as SigT, PublicKey as PkT};
         let _dir = tempfile::TempDir::new().expect("tempdir");
         let storage = crate::storage::Storage::new(_dir.path().to_str().unwrap()).expect("storage");
         let node_id = "super_hb_kat";
@@ -7709,6 +7699,23 @@ mod tests_vote_detector_retention {
 #[cfg(test)]
 mod tests_production_predicate {
     use super::*;
+
+    /// The right to produce must not read a phase the node's own idleness can clear. Gating on the
+    /// coordinator's Synchronized phase made a stalled producer forbidden to produce, so it could
+    /// neither lead nor yield. The gate takes a fact: the parent it would extend.
+    #[test]
+    fn production_gate_reads_a_fact_not_a_phase() {
+        // production.rs directly, not node_sources(): the concatenation includes this file, so the
+        // search string would match this test's own text first.
+        let src = include_str!("production.rs");
+        let start = src.find("let prod_unlocked = PRODUCTION_UNLOCKED")
+            .expect("the production gate must exist");
+        let body = &src[start..start + 900];
+        assert!(!body.contains("coordinator_is_synchronized"),
+                "production gate reads the FSM phase again — its own idleness would forbid it to produce");
+        assert!(body.contains("LOCAL_BLOCKCHAIN_HEIGHT"),
+                "the gate must key on the applied tip, i.e. holding the parent");
+    }
 
     /// The right to produce must not read peer state. A network-observation term here is identical
     /// on every member of a connected mesh, so failing closed on it stops the whole cluster at once

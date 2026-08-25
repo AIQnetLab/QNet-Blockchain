@@ -1997,7 +1997,12 @@ impl BlockchainNode {
                         // resetting the height-based ceiling. Re-stamp only on a genuine view change /
                         // init / backward-wall step (mirrors the STALL_PROGRESS_WALL guard above), so
                         // round_age grows monotonically through a true deadlock and the ceiling matures.
-                        let view_key = (mb_idx << 8) | failover_round.min(0xFF);
+                        // Key the view timer on the ABSOLUTE certified round: monotone per macroblock and
+                        // identical on every node. The relative round subtracts a LOCAL finalized baseline,
+                        // so it shifts when that baseline shifts, re-stamping the entry wall below and
+                        // starving both escape ceilings that depend on round_age.
+                        let view_key = (mb_idx << 8)
+                            | crate::unified_p2p::highest_certified_round_for(mb_idx).min(0xFF);
                         let prev_view = ROUND_ENTRY_VIEW.swap(view_key, Ordering::Relaxed);
                         let ventry = ROUND_ENTRY_WALL.load(Ordering::Relaxed);
                         if view_key != prev_view || ventry == 0 || wall_now < ventry {
@@ -3147,7 +3152,7 @@ impl BlockchainNode {
                                             next_block_height, now_ms_hb).await;
                 }
 
-                // v11.0+v32.3: HARD GATE — no production while not synced.
+                // HARD GATE — a producer must hold the parent it extends.
                 // v32.3 addition: if local is far behind quorum peer max, trigger
                 // CHRONIC_STALL_REQUESTED so the bulk catch-up handler engages on
                 // next iteration. Without this, the gate just blocks forever
@@ -3155,17 +3160,21 @@ impl BlockchainNode {
                 if is_my_turn_to_produce {
                     let sync_active = coordinator_is_syncing();
                     let prod_unlocked = PRODUCTION_UNLOCKED.load(Ordering::Relaxed) == 1;
-                    let node_synced = coordinator_is_synchronized();
+                    // Producing block N needs exactly one thing: N-1 applied. The FSM phase is derived
+                    // state that this node's own idleness clears, so gating on it turned "failed to
+                    // produce" into "forbidden to produce" — the node could neither lead nor yield.
+                    let have_parent = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(Ordering::Relaxed)
+                        >= next_block_height.saturating_sub(1);
 
-                    if sync_active || (!prod_unlocked && microblock_height > 5) || !node_synced {
+                    if sync_active || (!prod_unlocked && microblock_height > 5) || !have_parent {
                         if is_info() {
-                            println!("[INFO][PROD] gate_blocked h={} sync={} unlocked={} synced={}",
-                                     next_block_height, sync_active, prod_unlocked, node_synced);
+                            println!("[INFO][PROD] gate_blocked h={} sync={} unlocked={} parent={}",
+                                     next_block_height, sync_active, prod_unlocked, have_parent);
                         }
                         is_my_turn_to_produce = false;
 
                         // v32.3: when blocked due to !node_synced, drive bulk catch-up.
-                        if !node_synced && !sync_active {
+                        if !have_parent && !sync_active {
                             if let Some(ref p2p) = unified_p2p {
                                 let local_h = next_block_height.saturating_sub(1);
                                 let quorum_peak = p2p.get_max_peer_height();

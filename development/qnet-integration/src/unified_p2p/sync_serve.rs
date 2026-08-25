@@ -1805,10 +1805,14 @@ impl SimplifiedP2P {
             let mut entry = TIMEOUT_VOTES.entry((height, timeout_round)).or_insert_with(HashMap::new);
             if let Some(existing) = entry.get(&voter_id) {
                 if existing.anchor != anchor_arr {
+                    // A different chain view, not misbehaviour: the anchor is macroblock w-2, and an
+                    // honest node legitimately replaces a locally sealed macroblock with the network's
+                    // during reconciliation. Drop the vote so views never aggregate, but mint no
+                    // evidence — evidence must be something no honest node can produce.
                     if crate::node::is_warn() {
-                        println!("[WARN][TIMEOUT] vote_equivocation h={} voter={}", height, voter_id);
+                        println!("[WARN][TIMEOUT] vote_anchor_changed h={} voter={} action=drop",
+                                 height, voter_id);
                     }
-                    self.report_timeout_equivocation(&voter_id, height, timeout_round);
                     return;
                 }
                 let progressed = tip_height > existing.tip_height || high_qc_idx > existing.high_qc_idx;
@@ -1935,22 +1939,6 @@ impl SimplifiedP2P {
             }
         };
         self.verify_consensus_signature(voter_id, message, &sig_str)
-    }
-    
-    /// Report timeout equivocation for slashing.
-    /// v9.0: Stores evidence in global queue, drained at macroblock creation.
-    pub(super) fn report_timeout_equivocation(&self, voter_id: &str, height: u64, round: u64) {
-        if crate::node::is_warn() {
-            println!("[WARN][SLASH] timeout_equivocation voter={} h={} round={}", voter_id, height, round);
-        }
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        crate::node::EQUIVOCATION_EVIDENCE.insert(
-            (height, voter_id.to_string()),
-            (round, now),
-        );
     }
     
     /// Generate and broadcast TimeoutProof when n−f votes collected.

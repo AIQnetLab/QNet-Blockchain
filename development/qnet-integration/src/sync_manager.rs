@@ -294,7 +294,7 @@ impl SyncManager {
     /// FIX M-H16: Don't trust a single peer if height is significantly ahead.
     /// Verify against bootstrap nodes before accepting large jumps.
     async fn detect_network_height_hint(&self) -> u64 {
-        let local_h = self.coordinator.chain_height();
+        let local_h = self.storage.get_chain_height().unwrap_or(0);
         let best = self.p2p.get_best_peer_height();
 
         // Trust the authenticated best-peer head directly whenever a signed head exists OR best is not
@@ -374,7 +374,9 @@ impl SyncManager {
         // redundant sync — only a node genuinely below finality (or still cold) catches up here.
         let network_h = self.detect_network_height().await;
         let frontier = crate::node::qc_verified_frontier_cached();
-        let local_h = snap.chain_height;
+        // Applied tip, not snap.chain_height: the gap that drives catch-up must be measured against
+        // what this node holds, never against the highest height it has merely seen.
+        let local_h = self.storage.get_chain_height().unwrap_or(snap.chain_height);
 
         // Three independent deficit dimensions, ONE mechanism (execute_sync) — never parallel drivers.
         // Keys on the NETWORK height, not the node's own frontier: a follower whose own frontier stalled
@@ -513,7 +515,16 @@ impl SyncManager {
     ///   would verify (missing previous_hash for genesis) — triggering a cycle
     ///   of deferred_full drops until genesis eventually arrives randomly.
     async fn execute_sync(&self, target: u64) {
-        let mut local_h = self.coordinator.chain_height();
+        // APPLIED tip, from storage. The coordinator height is a monotone max over OBSERVED heights,
+        // so one out-of-order block raises it above what this node actually holds and the gap check
+        // below then reads "nothing to fetch" — the node stops asking and never recovers.
+        let mut local_h = self.storage.get_chain_height().unwrap_or(0);
+        let observed = self.coordinator.chain_height();
+        if observed > local_h.saturating_add(qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL)
+            && is_warn() {
+            println!("[WARN][SYNC] height_divergence applied={} observed={} — coordinator ran ahead",
+                     local_h, observed);
+        }
 
         // Floor the target at the QC-verified finality frontier (never sync below finality); reach the
         // caller's bootstrap-validated target above it. Blocks are QC/Dilithium-verified on apply, so
