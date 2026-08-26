@@ -1273,6 +1273,11 @@ impl SimplifiedP2P {
                 }
 
                 let backing = record_block_attestation(block_height, hash, attester_id);
+                // Receive half of the same once-per-window heartbeat as the emitter.
+                if crate::node::is_info() && block_height % crate::node::ROTATION_INTERVAL_BLOCKS == 0 {
+                    println!("[INFO][ATTEST] backing h={} attesters={} committee={}",
+                             block_height, backing, roster.len());
+                }
 
                 // Our block unattested while a rival carries f+1 signatures is evidence that WE are
                 // the minority side — the one thing a diverged node cannot learn from its own state.

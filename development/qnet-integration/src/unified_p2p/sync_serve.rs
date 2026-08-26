@@ -2553,8 +2553,13 @@ impl SimplifiedP2P {
                 }
             }
         });
-        if crate::node::is_debug() {
-            println!("[DBG][ATTEST] emitted h={} committee={}", height, roster.len());
+        // One line per rotation window: enough for an operator to see the loop is alive at INFO,
+        // and far too rare to be noise. A subsystem observable only at DEBUG cannot be verified in
+        // production, where DEBUG is never on.
+        if crate::node::is_info() && height % crate::node::ROTATION_INTERVAL_BLOCKS == 0 {
+            println!("[INFO][ATTEST] emitted h={} committee={} slice={}",
+                     height, roster.len(),
+                     crate::node::attesters_for_height(&roster, height, producer).len());
         }
     }
 
