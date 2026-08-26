@@ -5149,7 +5149,7 @@ mod view_divergence_tests {
     enum MarkPolicy {
         /// Never sign at or below the highest height ever signed, whatever the view.
         HeightOnly,
-        /// The (view, height) pair must be strictly new, ordered view-first.
+        /// A height above the highest ever signed, or a strictly higher round in the SAME window.
         ViewFirst,
     }
 
@@ -5185,22 +5185,32 @@ mod view_divergence_tests {
         let mut view = MAJORITY_VIEW;
         let mut hwm_h = [0u64; NODES];
         let mut hwm_view = [0u64; NODES];
+        let mut hwm_win = [0u64; NODES];
+        let mut hwm_last = [0u64; NODES];
         hwm_h[rolled_back] = signed_to;     // signed on the abandoned branch, at view 0
+        hwm_win[rolled_back] = signed_to.saturating_sub(1) / 90 + 1;
+        hwm_last[rolled_back] = signed_to;
         let (mut reclaimed, mut ticks) = (0u64, 0u64);
         while tip < target && ticks < MAX_TICKS {
             ticks += 1;
             let h = tip + 1;
             let p = producer_for(h, view);
+            let win = h.saturating_sub(1) / 90 + 1;
             let may_sign = match mp {
                 MarkPolicy::HeightOnly => h > hwm_h[p],
-                MarkPolicy::ViewFirst => (view, h) > (hwm_view[p], hwm_h[p]),
+                // Rounds live per window, so they are only comparable inside one.
+                MarkPolicy::ViewFirst =>
+                    h > hwm_h[p] || (win == hwm_win[p] && (view, h) > (hwm_view[p], hwm_last[p])),
             };
             if may_sign {
                 if p == rolled_back && h <= signed_to { reclaimed += 1; }
                 tip = h;
                 match mp {
                     MarkPolicy::HeightOnly => hwm_h[p] = hwm_h[p].max(h),
-                    MarkPolicy::ViewFirst => { hwm_h[p] = h; hwm_view[p] = view; }
+                    MarkPolicy::ViewFirst => {
+                        hwm_h[p] = hwm_h[p].max(h);
+                        hwm_win[p] = win; hwm_view[p] = view; hwm_last[p] = h;
+                    }
                 }
             } else if failover {
                 view += 1;                  // a TimeoutCertificate hands the slot on
@@ -5229,11 +5239,14 @@ mod view_divergence_tests {
     /// lets it sign nothing it already signed, and with failover gone the chain simply stops there.
     #[test]
     fn a_height_keyed_mark_deadlocks_the_chain_when_failover_is_gone() {
-        let (stuck, none_back) = drive(MarkPolicy::HeightOnly, false, 0, 200, 140, 400);
+        // An INTRA-window rollback: node 2 signed to 250 and rolled back to 200, and 201..250 all
+        // sit in one window. A deeper rollback would cross a window boundary, which is below
+        // finality and must stay refused — rounds from two windows are not comparable.
+        let (stuck, none_back) = drive(MarkPolicy::HeightOnly, false, 2, 250, 200, 400);
         assert_eq!(none_back, 0, "a height-keyed mark must reclaim nothing it already signed");
-        assert!(stuck < 200, "the chain must stall inside the signed range, reached {}", stuck);
+        assert!(stuck < 250, "the chain must stall inside the signed range, reached {}", stuck);
 
-        let (ran, back) = drive(MarkPolicy::ViewFirst, false, 0, 200, 140, 400);
+        let (ran, back) = drive(MarkPolicy::ViewFirst, false, 2, 250, 200, 400);
         assert!(back > 0, "a view-keyed mark must let the rejoined producer sign again");
         assert_eq!(ran, 400, "and the chain must reach the target, reached {}", ran);
     }
@@ -5242,17 +5255,21 @@ mod view_divergence_tests {
     /// height and bar every height after the first re-signed one.
     #[test]
     fn a_rejoined_producer_extends_a_full_window_not_a_single_block() {
-        let (_, reclaimed) = drive(MarkPolicy::ViewFirst, false, 0, 200, 140, 400);
+        let (_, reclaimed) = drive(MarkPolicy::ViewFirst, false, 2, 250, 200, 400);
         assert!(reclaimed >= ROTATION,
                 "expected a full window re-extended, got {} blocks", reclaimed);
     }
 
     /// Pins the harness to the shipped gate: policy tests prove which rule works, this proves the
-    /// production path uses it.
+    /// Production must DELEGATE the signing rule, never re-inline one. The rule is proved directly
+    /// in `node::tests::a_new_window_is_never_barred_by_the_previous_window_round`; a second copy
+    /// here would drift from it silently.
     #[test]
-    fn the_shipped_mark_orders_view_first() {
+    fn production_delegates_the_signing_rule() {
         let src = include_str!("node/production.rs");
-        assert!(src.contains("if (certified_abs, next_block_height) <= (hwm_r, hwm_h)"),
-                "production must compare the (view, height) pair, never height alone");
+        assert!(src.contains("crate::node::may_sign("),
+                "production must call may_sign, not spell the rule out again");
+        assert!(!src.contains("(certified_abs, next_block_height) > (last_r, last_h)"),
+                "the rule must live in one place only");
     }
 }

@@ -735,10 +735,12 @@ impl BlockchainNode {
 
             // The anti-double-sign watermark must survive the restart, or a node that rolled back and
             // came up again would happily sign a height it already signed.
-            let (signed_hwm, signed_round) =
-                storage.load_highest_signed_mark().ok().flatten().unwrap_or((0, 0));
+            let (signed_hwm, signed_window, signed_round, signed_last_h) =
+                storage.load_highest_signed_mark().ok().flatten().unwrap_or((0, 0, 0, 0));
             HIGHEST_SIGNED_HEIGHT.store(signed_hwm, std::sync::atomic::Ordering::SeqCst);
-            HIGHEST_SIGNED_ROUND.store(signed_round, std::sync::atomic::Ordering::SeqCst);
+            LAST_SIGNED_WINDOW.store(signed_window, std::sync::atomic::Ordering::SeqCst);
+            LAST_SIGNED_ROUND.store(signed_round, std::sync::atomic::Ordering::SeqCst);
+            LAST_SIGNED_HEIGHT.store(signed_last_h, std::sync::atomic::Ordering::SeqCst);
 
             if is_info() {
                 println!("[INFO][STATE] restart_statics_init chain_h={} metric_reset=now vrf_announce_h={} finalized_round={} signed_hwm={}",

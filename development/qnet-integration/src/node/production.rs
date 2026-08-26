@@ -4693,27 +4693,28 @@ impl BlockchainNode {
                         // persisted with fsync BEFORE signing, so a crash costs one slot, not a signature.
                         {
                             let hwm_h = HIGHEST_SIGNED_HEIGHT.load(std::sync::atomic::Ordering::SeqCst);
-                            let hwm_r = HIGHEST_SIGNED_ROUND.load(std::sync::atomic::Ordering::SeqCst);
-                            // Ordered VIEW-first, and the pair is STORED, not maxed per field: a higher
-                            // view may re-sign any height, and inside one view heights must climb. A
-                            // componentwise max would keep the old height and bar everything after the
-                            // first block, so a rolled-back producer could never finish its window.
-                            // A crash inside the 2s certificate flush can restore a lower view and
-                            // costs one view rotation — bounded, and failover recovers it.
-                            if (certified_abs, next_block_height) <= (hwm_r, hwm_h) {
-                                println!("[WARN][PROD] production_yielded h={} round={} hwm_h={} hwm_r={} reason=already_signed_this_round",
-                                         next_block_height, certified_abs, hwm_h, hwm_r);
+                            let last_w = LAST_SIGNED_WINDOW.load(std::sync::atomic::Ordering::SeqCst);
+                            let last_r = LAST_SIGNED_ROUND.load(std::sync::atomic::Ordering::SeqCst);
+                            let last_h = LAST_SIGNED_HEIGHT.load(std::sync::atomic::Ordering::SeqCst);
+                            let win = crate::node::window_of_height(next_block_height);
+                            if !crate::node::may_sign(
+                                next_block_height, certified_abs, hwm_h, last_w, last_r, last_h) {
+                                println!("[WARN][PROD] production_yielded h={} win={} round={} hwm_h={} last_w={} last_r={} reason=already_signed_this_round",
+                                         next_block_height, win, certified_abs, hwm_h, last_w, last_r);
                                 crate::unified_p2p::BLOCK_BROADCAST_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
                                 continue;
                             }
-                            if let Err(e) = storage.save_highest_signed_mark(next_block_height, certified_abs) {
+                            if let Err(e) = storage.save_highest_signed_mark(
+                                next_block_height.max(hwm_h), win, certified_abs, next_block_height) {
                                 println!("[ERR][PROD] production_yielded h={} reason=hwm_persist_failed err={}",
                                          next_block_height, e);
                                 crate::unified_p2p::BLOCK_BROADCAST_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
                                 continue;
                             }
-                            HIGHEST_SIGNED_HEIGHT.store(next_block_height, std::sync::atomic::Ordering::SeqCst);
-                            HIGHEST_SIGNED_ROUND.store(certified_abs, std::sync::atomic::Ordering::SeqCst);
+                            HIGHEST_SIGNED_HEIGHT.fetch_max(next_block_height, std::sync::atomic::Ordering::SeqCst);
+                            LAST_SIGNED_WINDOW.store(win, std::sync::atomic::Ordering::SeqCst);
+                            LAST_SIGNED_ROUND.store(certified_abs, std::sync::atomic::Ordering::SeqCst);
+                            LAST_SIGNED_HEIGHT.store(next_block_height, std::sync::atomic::Ordering::SeqCst);
                         }
                         // A claim this node cannot resolve is knowable from the selected TXs, so decide
                         // it HERE. Discovering it during the inline apply is too late: that path has no

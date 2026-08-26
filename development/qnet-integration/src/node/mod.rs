@@ -1865,13 +1865,34 @@ static LAST_VRF_KEY_ANNOUNCE_HEIGHT: AtomicU64 = AtomicU64::new(0);
 // This prevents round mismatch between nodes
 pub static LAST_FINALIZED_CONSENSUS_ROUND: AtomicU64 = AtomicU64::new(0);
 
-/// Highest (height, round) this node has ever signed as producer, ordered ROUND-first. Mirrors the
-/// durable metadata mark; monotone, never lowered by rollback. Round-first is what lets a node that
-/// rolled back re-extend the branch it adopted: a strictly higher round is a different (height,
-/// round), so it is not equivocation — and a higher round needs an n−f TimeoutCertificate to be
-/// accepted, so this cannot mint unbounded variants at one height.
+/// Anti-double-sign state. Two independent facts, because the certified round is per-WINDOW and
+/// rounds from different windows are different counters that must never be compared:
+///   * HIGHEST_SIGNED_HEIGHT — monotone max over every height ever signed. Above it, a height was
+///     never signed at all, so producing there cannot equivocate whatever the round.
+///   * LAST_SIGNED_WINDOW / ROUND / HEIGHT — the most recent signature. Inside one window
+///     signatures form a strictly increasing (round, height) sequence, so any pair above it is new.
+///     Comparing the round alone would admit exactly one block per round and stall the producer
+///     mid-window; the height must break the tie.
 pub static HIGHEST_SIGNED_HEIGHT: AtomicU64 = AtomicU64::new(0);
-pub static HIGHEST_SIGNED_ROUND: AtomicU64 = AtomicU64::new(0);
+pub static LAST_SIGNED_WINDOW: AtomicU64 = AtomicU64::new(0);
+pub static LAST_SIGNED_ROUND: AtomicU64 = AtomicU64::new(0);
+pub static LAST_SIGNED_HEIGHT: AtomicU64 = AtomicU64::new(0);
+
+/// Macroblock window a microblock height belongs to.
+pub(crate) fn window_of_height(height: u64) -> u64 {
+    height.saturating_sub(1) / qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL + 1
+}
+
+/// May this node sign at `(height, round)`? Two independent safe cases:
+///   * above the highest height ever signed, the height was never signed at all — any round is new;
+///   * inside the SAME window, signatures climb in `(round, height)`, so a pair above the last one
+///     has not been used. Both terms are needed: the round alone admits one block per round.
+/// Rounds from DIFFERENT windows are separate counters and are never compared.
+pub(crate) fn may_sign(height: u64, round: u64,
+                       highest_h: u64, last_w: u64, last_r: u64, last_h: u64) -> bool {
+    height > highest_h
+        || (window_of_height(height) == last_w && (round, height) > (last_r, last_h))
+}
 
 // v3.33: FORMAL FINALITY — blocks at or below this height are IRREVERSIBLE.
 // Updated when macroblock is saved (macroblock covers 90 microblocks).
@@ -5593,6 +5614,33 @@ mod tests {
                         "producer {} attested its own block at h={}", p, h);
             }
         }
+    }
+
+    /// The numbers below are lifted verbatim from the live stall, so this test fails on the rule
+    /// that caused it. The chain advanced exactly one 90-block window then froze on its last block:
+    /// the mark carried window 270's final round 5, the first heights of window 272 arrived at
+    /// round 2, and comparing those two counters barred production until failover burned five
+    /// rounds. They are separate counters and must never be compared.
+    #[test]
+    fn a_new_window_is_never_barred_by_the_previous_window_round() {
+        // Observed: production_yielded h=24390 round=2 hwm_h=24270 hwm_r=5
+        let (hwm_h, last_w, last_r, last_h) = (24270u64, super::window_of_height(24270), 5u64, 24270u64);
+        assert!(super::may_sign(24390, 2, hwm_h, last_w, last_r, last_h),
+                "a height above the highest ever signed must be admitted whatever the round");
+        // And the whole window that followed it, not just the first block.
+        for h in 24391..=24400 {
+            assert!(super::may_sign(h, 2, hwm_h, last_w, last_r, last_h), "barred at h={}", h);
+        }
+        // Heights strictly inside one window (24391..24480 is window 272), so the checks below are
+        // about the rule and not about a boundary.
+        let w = super::window_of_height(24396);
+        assert_eq!(w, super::window_of_height(24395), "test heights must share a window");
+        // Safety is untouched: the same (height, round) already used in this window is refused.
+        assert!(!super::may_sign(24395, 2, 24400, w, 2, 24395),
+                "re-signing one (height, round) inside a window must stay refused");
+        // A rolled-back producer re-extends its window at a higher round, block after block.
+        assert!(super::may_sign(24396, 7, 24400, w, 2, 24395), "higher round in the same window");
+        assert!(super::may_sign(24397, 7, 24400, w, 7, 24396), "and the next height at that round");
     }
 
     /// The snapshot merkle check must hash what the snapshot RESTORED. Seeding chain_state first and

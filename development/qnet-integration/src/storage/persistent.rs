@@ -2002,33 +2002,43 @@ impl PersistentStorage {
     /// chain-committed equivocation ban, which neither fork-choice nor certification can undo.
     /// Written with fsync BEFORE the signature is produced, so a crash in between costs one skipped
     /// slot rather than a second signature at one (height, round).
-    pub fn save_highest_signed_mark(&self, height: u64, round: u64) -> IntegrationResult<()> {
+    pub fn save_highest_signed_mark(&self, height: u64, window: u64, round: u64, last_height: u64) -> IntegrationResult<()> {
         let metadata_cf = self.db.cf_handle("metadata")
             .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
         let mut opts = rocksdb::WriteOptions::default();
         opts.set_sync(true);
-        let mut buf = [0u8; 16];
+        let mut buf = [0u8; 32];
         buf[..8].copy_from_slice(&height.to_be_bytes());
-        buf[8..].copy_from_slice(&round.to_be_bytes());
+        buf[8..16].copy_from_slice(&window.to_be_bytes());
+        buf[16..24].copy_from_slice(&round.to_be_bytes());
+        buf[24..].copy_from_slice(&last_height.to_be_bytes());
         self.db.put_cf_opt(&metadata_cf, HIGHEST_SIGNED_HEIGHT_KEY, &buf, &opts)?;
         Ok(())
     }
 
-    /// Reads the durable anti-double-sign mark as (height, round). None means never produced.
-    /// A legacy 8-byte record predates round-keying and reads back as round 0 — the round every
-    /// pre-upgrade signature actually used, so the ordering stays sound across the upgrade.
-    pub fn load_highest_signed_mark(&self) -> IntegrationResult<Option<(u64, u64)>> {
+    /// Reads the mark as (highest height, window, round, last height). None means never produced.
+    /// A shorter record predates a field; each older shape derives what it lacks from the height,
+    /// which is where that signature necessarily sat, so the upgrade cannot admit a pair an older
+    /// binary would have refused.
+    pub fn load_highest_signed_mark(&self) -> IntegrationResult<Option<(u64, u64, u64, u64)>> {
+        const MB: u64 = qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
         let metadata_cf = self.db.cf_handle("metadata")
             .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
+        let rd = |b: &[u8]| { let mut x = [0u8; 8]; x.copy_from_slice(b); u64::from_be_bytes(x) };
         match self.db.get_cf(&metadata_cf, HIGHEST_SIGNED_HEIGHT_KEY)? {
-            Some(data) if data.len() == 16 => {
-                let mut h = [0u8; 8]; h.copy_from_slice(&data[..8]);
-                let mut r = [0u8; 8]; r.copy_from_slice(&data[8..]);
-                Ok(Some((u64::from_be_bytes(h), u64::from_be_bytes(r))))
+            Some(d) if d.len() == 32 =>
+                Ok(Some((rd(&d[..8]), rd(&d[8..16]), rd(&d[16..24]), rd(&d[24..])))),
+            Some(d) if d.len() == 24 => {
+                let h = rd(&d[..8]);
+                Ok(Some((h, rd(&d[8..16]), rd(&d[16..]), h)))
             }
-            Some(data) if data.len() == 8 => {
-                let mut h = [0u8; 8]; h.copy_from_slice(&data);
-                Ok(Some((u64::from_be_bytes(h), 0)))
+            Some(d) if d.len() == 16 => {
+                let h = rd(&d[..8]);
+                Ok(Some((h, h.saturating_sub(1) / MB + 1, rd(&d[8..]), h)))
+            }
+            Some(d) if d.len() == 8 => {
+                let h = rd(&d);
+                Ok(Some((h, h.saturating_sub(1) / MB + 1, 0, h)))
             }
             _ => Ok(None),
         }
