@@ -2556,7 +2556,7 @@ impl SimplifiedP2P {
         // One line per rotation window: enough for an operator to see the loop is alive at INFO,
         // and far too rare to be noise. A subsystem observable only at DEBUG cannot be verified in
         // production, where DEBUG is never on.
-        if crate::node::is_info() && height % crate::node::ROTATION_INTERVAL_BLOCKS == 0 {
+        if crate::node::is_info() && attest_heartbeat_due(height, true) {
             println!("[INFO][ATTEST] emitted h={} committee={} slice={}",
                      height, roster.len(),
                      crate::node::attesters_for_height(&roster, height, producer).len());

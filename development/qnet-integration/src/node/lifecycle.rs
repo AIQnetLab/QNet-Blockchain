@@ -498,45 +498,37 @@ impl BlockchainNode {
                             let state_guard = state.write().await;
                             match (*state_guard).restore_accounts(accounts.clone()) {
                                 Ok(_) => {
-                                    // Restore chain_state from snapshot (total_supply + height)
-                                    if snap_total_supply > 0 {
-                                        // snapshot_height is a MICROBLOCK HEIGHT (snapshots keyed by height). Restore
-                                        // chain height, the TIER-2 replay floor (restored_snapshot_height) AND the
-                                        // emission watermark from it — so the replay mints ONLY the gap (snap, tip]
-                                        // and never re-applies pre-snapshot history or re-mints counted emissions.
+                                    // Verify BEFORE seeding chain_state, so the check hashes exactly what the
+                                    // snapshot restored. `state_root` is the anchor macroblock's QC-bound root,
+                                    // so a match proves the accounts reproduce certified state.
+                                    //
+                                    // total_supply is NOT a format discriminator: 0 is legitimate on a chain that
+                                    // has not emitted yet, and `anchor_root_and_supply` already returns None (⇒
+                                    // full replay) when the supply is genuinely unavailable. Gating on the VALUE
+                                    // discarded sound snapshots and paid a from-genesis replay on every restart.
+                                    let computed_merkle = state_guard.finalize_merkle();
+                                    if computed_merkle == state_root {
+                                        // snapshot_height is a MICROBLOCK HEIGHT. Restore chain height, the TIER-2
+                                        // replay floor and the emission watermark from it — the replay then mints
+                                        // ONLY the gap (snap, tip] and never re-mints counted emissions.
                                         {
                                             let mut cs = state_guard.chain_state.write();
                                             cs.total_supply = snap_total_supply;
                                             cs.height = snapshot_height;
                                             cs.last_minted_emission_mb = Self::emission_mb_index(snapshot_height);
                                         }
-                                        println!("[INFO][STATE] snapshot_restored height={} accounts={} total_supply={} size={}KB",
-                                                 snapshot_height, accounts.len(), snap_total_supply, accounts_data.len() / 1024);
                                         restored_snapshot_height = snapshot_height;
-                                    } else {
-                                        // v5.2: Legacy v1 snapshot has no total_supply — force full replay
-                                        // Clear already-restored accounts to prevent double-counting
-                                        state_guard.clear();
-                                        eprintln!("[WARN][STATE] v1_snapshot_no_total_supply height={} action=clear_and_full_replay",
-                                                  snapshot_height);
-                                        // Don't set restored_snapshot_height → TIER 3 will run
-                                    }
-
-                                    // FIX R23-S10: Verify merkle root matches snapshot — REJECT on mismatch.
-                                    // A corrupted or tampered snapshot could poison the entire state.
-                                    let computed_merkle = state_guard.finalize_merkle();
-                                    if computed_merkle == state_root {
-                                        println!("[INFO][STATE] snapshot_merkle_verified root={}...",
-                                                 hex::encode(&state_root[..8]));
+                                        if is_info() {
+                                            println!("[INFO][STATE] snapshot_verified h={} accounts={} total_supply={} root={} size={}KB",
+                                                     snapshot_height, accounts.len(), snap_total_supply,
+                                                     hex::encode(&state_root[..8]), accounts_data.len() / 1024);
+                                        }
                                     } else {
                                         eprintln!("[ERR][STATE] snapshot_merkle_mismatch expected={} computed={} action=clear_and_full_replay",
                                                   hex::encode(&state_root[..8]), hex::encode(&computed_merkle[..8]));
-                                        // Clear corrupted state — TIER 3 full replay will rebuild correctly.
-                                        // chain_state goes with it: the REJECTED snapshot's
-                                        // total_supply / height / emission watermark were seeded a few
-                                        // lines above and would otherwise survive the wipe, so the
-                                        // from-genesis replay would run against a supply baseline taken
-                                        // from the very snapshot just judged corrupt.
+                                        // The accounts do not reproduce certified state — clear them so the
+                                        // from-genesis replay rebuilds from nothing, and zero chain_state with
+                                        // them so no baseline survives from the snapshot just rejected.
                                         state_guard.clear();
                                         {
                                             let mut cs = state_guard.chain_state.write();
@@ -862,8 +854,21 @@ impl BlockchainNode {
                         Vec::new()
                     });
                 let total = entries.len();
-                let mut admitted = 0u64;
-                for (tx_hash, payload, _admission_ts) in entries {
+                let (mut admitted, mut expired) = (0u64, 0u64);
+                // TTL is measured from an in-process Instant, so rehydration hands every entry a
+                // fresh age and a TX that has been pending for days looks new after each restart —
+                // it could never expire. The persisted admission wall-clock is the real age: drop
+                // what is already past the TTL and purge it, so stale entries cannot outlive
+                // restarts, re-enter blocks and fail apply forever.
+                let ttl_secs: u64 = crate::node::mempool_ttl_secs();
+                let now_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                for (tx_hash, payload, admission_ts) in entries {
+                    if admission_ts > 0 && now_secs.saturating_sub(admission_ts) > ttl_secs {
+                        let _ = storage_load.delete_pending_tx(&tx_hash);
+                        expired += 1;
+                        continue;
+                    }
                     // Best-effort gas_price decode for priority-queue ordering.
                     // If the persisted payload deserialises as a Transaction
                     // we use its `gas_price`; otherwise we admit at 0 (system
@@ -876,12 +881,12 @@ impl BlockchainNode {
                         admitted += 1;
                     }
                 }
-                (total, admitted)
+                (total, admitted, expired)
             }).await {
-                Ok((total, admitted)) => {
-                    if total > 0 {
-                        println!("[INFO][MEMPOOL] persist_restore total={} admitted={}",
-                                 total, admitted);
+                Ok((total, admitted, expired)) => {
+                    if total > 0 && is_info() {
+                        println!("[INFO][MEMPOOL] persist_restore total={} admitted={} expired={}",
+                                 total, admitted, expired);
                     }
                 }
                 Err(e) => {

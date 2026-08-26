@@ -1213,6 +1213,19 @@ pub fn attestation_admissible(height: u64, block_hash: &[u8; 32], attester: &str
     true
 }
 
+/// Last rotation window each attestation half logged its INFO heartbeat in. Keying the line on a
+/// fixed height would always land on one slot, so a single committee member printed it and the rest
+/// looked silent; keying on the window gives every node one line per window whatever its slot.
+static ATTEST_LOG_WINDOW_EMIT: AtomicU64 = AtomicU64::new(u64::MAX);
+static ATTEST_LOG_WINDOW_RECV: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// True once per rotation window, for the caller's half of the loop.
+pub fn attest_heartbeat_due(height: u64, emitting: bool) -> bool {
+    let win = height.saturating_sub(1) / crate::node::ROTATION_INTERVAL_BLOCKS;
+    let slot = if emitting { &ATTEST_LOG_WINDOW_EMIT } else { &ATTEST_LOG_WINDOW_RECV };
+    slot.swap(win, std::sync::atomic::Ordering::Relaxed) != win
+}
+
 /// Records one verified attestation; returns how many distinct attesters now back this (height, hash).
 pub fn record_block_attestation(height: u64, block_hash: [u8; 32], attester: String) -> usize {
     let n = {
@@ -5402,5 +5415,25 @@ mod attestation_admission_tests {
         }
         assert!(!attestation_admissible(h, &a(99), "n1"),
                 "a fresh hash past the per-height cap must be refused");
+    }
+}
+
+#[cfg(test)]
+mod attest_heartbeat_tests {
+    use super::*;
+
+    /// One line per rotation window per half. Keying the heartbeat on a fixed height always landed
+    /// on one slot, so a single committee member printed it and the loop looked dead everywhere else.
+    #[test]
+    fn the_heartbeat_fires_once_per_window_and_the_halves_are_independent() {
+        let w = 900_000u64 * crate::node::ROTATION_INTERVAL_BLOCKS;
+        assert!(attest_heartbeat_due(w + 1, true), "first height of a window must fire");
+        assert!(!attest_heartbeat_due(w + 2, true), "same window must not fire twice");
+        assert!(!attest_heartbeat_due(w + crate::node::ROTATION_INTERVAL_BLOCKS, true),
+                "still the same window");
+        assert!(attest_heartbeat_due(w + crate::node::ROTATION_INTERVAL_BLOCKS + 1, true),
+                "the next window must fire again");
+        // The receive half tracks its own window, so one side cannot silence the other.
+        assert!(attest_heartbeat_due(w + 1, false), "receive half is independent");
     }
 }

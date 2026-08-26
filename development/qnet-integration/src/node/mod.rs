@@ -44,10 +44,10 @@ pub(crate) fn node_sources() -> String {
     ].concat()
         // include_str! keeps the checkout's line endings, and git rewrites them on Windows. The
         // scanners below match multi-line patterns, so normalise once here rather than have a
-        // source-shape assertion depend on how the tree happens to be checked out.
-        .replace("
-", "
-")
+        // source-shape assertion depend on how the tree happens to be checked out. Written as
+        // ESCAPES: spelling these literals with real line breaks makes the pattern itself a victim
+        // of the very conversion it exists to undo, and the call silently becomes a no-op.
+        .replace("\r\n", "\n")
 }
 
 pub(crate) use crate::{
@@ -818,6 +818,13 @@ pub fn expected_producer_for_round(height: u64, round: u64) -> Option<String> {
     if candidates.is_empty() { return None; }
     let round0_idx = candidates.iter().position(|(id, _)| id == round0_producer)?;
     Some(candidates[(round0_idx + round as usize) % candidates.len()].0.clone())
+}
+
+/// Mempool TTL in seconds. ONE source: the periodic sweep and the boot-rehydration filter must
+/// agree, or a restart re-admits exactly what the sweep is dropping.
+pub(crate) fn mempool_ttl_secs() -> u64 {
+    std::env::var("QNET_MEMPOOL_TTL").ok()
+        .and_then(|s| s.parse().ok()).filter(|&t| t > 0).unwrap_or(1800)
 }
 
 /// Deterministic attester slice for `height`, partitioning a SORTED committee across the checkpoint
@@ -5588,6 +5595,38 @@ mod tests {
         }
     }
 
+    /// The snapshot merkle check must hash what the snapshot RESTORED. Seeding chain_state first and
+    /// clearing on a value test (`total_supply > 0`, which 0 legitimately fails before any emission)
+    /// made the check hash an emptied state and reject sound snapshots, paying a from-genesis replay
+    /// on every restart.
+    #[test]
+    fn the_snapshot_check_precedes_any_clear_and_ignores_the_supply_value() {
+        let src = include_str!("lifecycle.rs");
+        let code: String = src.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!code.contains("if snap_total_supply > 0"),
+                "total_supply is not a format discriminator — 0 is legitimate pre-emission");
+        let check = code.find("let computed_merkle = state_guard.finalize_merkle();")
+            .expect("snapshot merkle check");
+        let seed = code.find("cs.total_supply = snap_total_supply;").expect("chain_state seed");
+        assert!(check < seed,
+                "the merkle check must run BEFORE chain_state is seeded from the snapshot");
+    }
+
+    /// A rehydrated mempool entry must age from its PERSISTED admission time. Measuring from an
+    /// in-process instant hands every entry a fresh age at boot, so a stale TX survives every
+    /// restart, re-enters blocks and fails apply forever.
+    #[test]
+    fn rehydrated_mempool_entries_age_from_the_persisted_timestamp() {
+        let src = include_str!("lifecycle.rs");
+        assert!(!src.contains("for (tx_hash, payload, _admission_ts) in entries"),
+                "rehydration discards the persisted admission timestamp — TTL can never expire");
+        assert!(src.contains("delete_pending_tx(&tx_hash)"),
+                "an entry past its TTL must be purged from the CF, not just skipped");
+    }
+
     /// The rotation interval must have ONE source. A literal beside the constant keeps working until
     /// the constant moves, and then the two halves of the election disagree — a fork with no
     /// adversary present.
@@ -7887,9 +7926,9 @@ mod tests_production_predicate {
         let start = src.find("pub(crate) fn production_local_precondition(")
             .expect("production_local_precondition must exist");
         let body = &src[start..start + 1600];
-        let end = body.find("
-}
-").expect("function body must terminate");
+        // Escaped, not a real line break: a CRLF checkout would rewrite the pattern itself and it
+        // would stop matching the LF-normalised body.
+        let end = body.find("\n}\n").expect("function body must terminate");
         let body = &body[..end];
         for forbidden in [
             "fresh_in_set_peer_heights",

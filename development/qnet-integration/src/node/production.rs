@@ -78,12 +78,11 @@ impl BlockchainNode {
         }
 
         // Periodic mempool TTL sweep (60s): drop never-confirmed TXs (underpriced / nonce-gapped) so a
-        // stuck TX cannot hold a slot + sender quota forever. QNET_MEMPOOL_TTL secs (default 1800).
+        // stuck TX cannot hold a slot + sender quota forever. Interval from `mempool_ttl_secs()`.
         // Expired != confirmed, so it is NOT added to included_tx_hashes — re-submission stays open.
         {
             let mempool_ttl = self.mempool.clone();
-            let ttl_secs: u64 = std::env::var("QNET_MEMPOOL_TTL").ok()
-                .and_then(|s| s.parse().ok()).filter(|&t| t > 0).unwrap_or(1800);
+            let ttl_secs: u64 = crate::node::mempool_ttl_secs();
             tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(tokio::time::Duration::from_secs(60));
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
