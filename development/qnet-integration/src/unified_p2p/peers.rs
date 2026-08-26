@@ -1220,8 +1220,73 @@ impl SimplifiedP2P {
             // the former per-height store admitted an entry from any registered (non-committee) VRF
             // identity, so a flood could bloat memory and force an honest producer to yield its slot.
             // (EmptySlotAttestation below is a separate, live mechanism.)
-            NetworkMessage::BlockAttestationMsg { .. } => {
+            NetworkMessage::BlockAttestationMsg { block_height, block_hash, attester_id, signature, .. } => {
                 self.update_peer_last_seen(from_peer);
+                if block_hash.len() != 32 || signature.is_empty() { return; }
+                let local_h = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+                if local_h > 20 && block_height.saturating_add(20) < local_h { return; }
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(&block_hash);
+
+                // Deterministic slice FIRST — the cheap gate. Admitting any registered identity is
+                // what forced this mechanism off before: a flood cost the sender nothing and bloated
+                // memory. Membership is a pure function of (committee, height), so every node agrees.
+                let window = block_height.saturating_sub(1)
+                    / qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL + 1;
+                let roster = match sorted_committee_for_window(window) {
+                    Some(r) => r,
+                    None => return,
+                };
+                if !crate::node::attesters_for_height(&roster, block_height, "").contains(&attester_id) {
+                    if crate::node::is_warn() {
+                        println!("[WARN][ATTEST] not_in_slice h={} attester={} action=drop",
+                                 block_height, attester_id);
+                    }
+                    return;
+                }
+                // Replay and hash-flood are refused BEFORE the verify, so neither buys CPU.
+                if !attestation_admissible(block_height, &hash, &attester_id) { return; }
+
+                // Signature LAST (~5ms), only past the slice and admission gates.
+                let storage = match crate::node::try_get_storage() { Some(s) => s, None => return };
+                let pk_bytes = match crate::node::producer_verify_pk(&storage, &attester_id) {
+                    Some(p) => p,
+                    None => return,
+                };
+                let msg = crate::node::block_attestation_message(block_height, &hash);
+                let sig_ok = {
+                    use pqcrypto_mldsa::mldsa65 as dilithium3;
+                    use pqcrypto_traits::sign::{PublicKey as _, DetachedSignature as _};
+                    match (dilithium3::PublicKey::from_bytes(&pk_bytes).ok(),
+                           dilithium3::DetachedSignature::from_bytes(&signature).ok()) {
+                        (Some(pk), Some(sig)) =>
+                            dilithium3::verify_detached_signature(&sig, &msg, &pk).is_ok(),
+                        _ => false,
+                    }
+                };
+                if !sig_ok {
+                    if crate::node::is_warn() {
+                        println!("[WARN][ATTEST] invalid_sig h={} attester={} action=drop",
+                                 block_height, attester_id);
+                    }
+                    return;
+                }
+
+                let backing = record_block_attestation(block_height, hash, attester_id);
+
+                // Our block unattested while a rival carries f+1 signatures is evidence that WE are
+                // the minority side — the one thing a diverged node cannot learn from its own state.
+                // Action is a pull, never a rollback: fork choice stays the sole canonical authority.
+                if let Ok(Some(ours)) = storage.load_microblock_hash(block_height) {
+                    if ours != hash && backing >= roster.len() / 3 + 1
+                        && block_attestation_count(block_height, &ours) == 0 {
+                        if crate::node::is_warn() {
+                            println!("[WARN][ATTEST] branch_unattested h={} rival_backing={} need={} action=reconcile",
+                                     block_height, backing, roster.len() / 3 + 1);
+                        }
+                        self.request_window_anchor(window);
+                    }
+                }
             }
 
             // Empty-slot attestation — committee declares producer at slot_height failed

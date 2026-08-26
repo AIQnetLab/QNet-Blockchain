@@ -722,13 +722,13 @@ pub fn release_sync_slot(from_height: u64) {
 
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Block-validity attestation (v3.33) — RETIRED. Fork-choice is round-based: a same-round 2f+1
-// TimeoutCertificate rotates the producer, certified-round supersede (block_pipeline) resolves a
-// same-height dispute, and the 2f+1 macroblock Checkpoint is finality. No honest node ever emitted a
-// BlockAttestation, and the per-height store admitted an entry from any registered (non-committee)
-// VRF identity — an ungated memory-DoS + producer-censorship surface — so the whole mechanism (store
-// + submit/count/broadcast helpers + inbound-handler body) was removed. EmptySlotAttestation below is
-// a SEPARATE, live producer-failover mechanism.
+// Block-validity attestation. Fork choice stays round-based — a same-round 2f+1 TimeoutCertificate
+// rotates the producer, certified-round supersede resolves a same-height dispute, and the 2f+1
+// macroblock Checkpoint is finality. Attestations add none of that: they are evidence that a branch
+// is being followed, so a diverged node learns it is alone within a block or two instead of at the
+// next checkpoint. The earlier version admitted any registered identity and was an ungated memory
+// DoS; entry now requires the height's deterministic committee slice. EmptySlotAttestation below is
+// a SEPARATE producer-failover mechanism.
 // ═══════════════════════════════════════════════════════════════════════════════
 
 pub(crate) use dashmap::DashMap as AttestDashMap;
@@ -1163,6 +1163,74 @@ pub struct StoredTimeoutVote {
 /// Collected timeout votes per (window = target_height/90, round).
 static TIMEOUT_VOTES: Lazy<Arc<DashMap<(u64, u64), HashMap<String, StoredTimeoutVote>>>> =
     Lazy::new(|| Arc::new(DashMap::new()));
+
+/// Committee members seen voting on a DIFFERENT sealed w-2 anchor, keyed (window, their_anchor).
+/// A local mismatch alone cannot tell "they forked" from "we forked", so dropping the vote leaves a
+/// minority node deaf forever. n−f distinct SIGNED foreign anchors can tell, and is the only sound
+/// trigger for it to reconcile. Bounded: entries evicted once the window falls behind.
+static FOREIGN_ANCHOR_WITNESSES: Lazy<Arc<DashMap<(u64, [u8; 32]), std::collections::HashSet<String>>>> =
+    Lazy::new(|| Arc::new(DashMap::new()));
+
+/// Attesters seen for each (height, block_hash). EVIDENCE ONLY — never a production gate and never a
+/// fork-choice input: gossip is partial, so counts differ per node, and a node-dependent count cannot
+/// pick a branch. Its one use is noticing early that our held block is unattested while a competitor
+/// is, then pulling the canonical anchor. Bounded by eviction below the applied tip.
+static BLOCK_ATTESTATIONS: Lazy<Arc<DashMap<(u64, [u8; 32]), std::collections::HashSet<String>>>> =
+    Lazy::new(|| Arc::new(DashMap::new()));
+
+/// Sorted window roster, memoized on the SAME (window, seal) key the committee cache uses so it can
+/// never go stale against it. Without this both the emitter (every applied block) and the receiver
+/// (every attestation) would clone and sort up to COMMITTEE_SIZE ids per message.
+static SORTED_COMMITTEE_CACHE: Lazy<Arc<DashMap<(u64, u64), Arc<Vec<String>>>>> =
+    Lazy::new(|| Arc::new(DashMap::new()));
+
+pub fn sorted_committee_for_window(w: u64) -> Option<Arc<Vec<String>>> {
+    let seal = crate::node::try_get_storage().map(|s| s.last_sealed_mb_index()).unwrap_or(0);
+    if let Some(c) = SORTED_COMMITTEE_CACHE.get(&(w, seal)) { return Some(c.value().clone()); }
+    let mut v: Vec<String> = failover_committee_for_window(w)?.iter().cloned().collect();
+    v.sort();
+    let arc = Arc::new(v);
+    SORTED_COMMITTEE_CACHE.insert((w, seal), arc.clone());
+    SORTED_COMMITTEE_CACHE.retain(|k, _| k.0 + 4 >= w);
+    Some(arc)
+}
+
+/// Distinct block hashes tracked per height. Honest divergence yields one or two; the cap stops an
+/// attacker minting unbounded map keys by varying the hash, which is free for the sender.
+const MAX_ATTESTED_HASHES_PER_HEIGHT: usize = 4;
+
+/// True when this attester is already recorded for (height, hash) — checked BEFORE the ~5ms
+/// signature verify so a replay cannot buy CPU, and false when the per-height hash cap is full.
+pub fn attestation_admissible(height: u64, block_hash: &[u8; 32], attester: &str) -> bool {
+    if BLOCK_ATTESTATIONS.get(&(height, *block_hash)).is_some_and(|s| s.contains(attester)) {
+        return false;
+    }
+    if !BLOCK_ATTESTATIONS.contains_key(&(height, *block_hash))
+        && BLOCK_ATTESTATIONS.iter().filter(|e| e.key().0 == height).count()
+            >= MAX_ATTESTED_HASHES_PER_HEIGHT {
+        return false;
+    }
+    true
+}
+
+/// Records one verified attestation; returns how many distinct attesters now back this (height, hash).
+pub fn record_block_attestation(height: u64, block_hash: [u8; 32], attester: String) -> usize {
+    let n = {
+        let mut e = BLOCK_ATTESTATIONS.entry((height, block_hash))
+            .or_insert_with(std::collections::HashSet::new);
+        e.insert(attester);
+        e.len()
+    };
+    // One checkpoint window of history is all the evidence is ever read for.
+    let floor = height.saturating_sub(qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL);
+    BLOCK_ATTESTATIONS.retain(|k, _| k.0 >= floor);
+    n
+}
+
+/// Distinct attesters backing a given (height, hash).
+pub fn block_attestation_count(height: u64, block_hash: &[u8; 32]) -> usize {
+    BLOCK_ATTESTATIONS.get(&(height, *block_hash)).map(|s| s.len()).unwrap_or(0)
+}
 
 /// Generated timeout certificates (cached for block validation)
 /// Key: (macroblock_index, timeout_round), Value: TimeoutCertificate
@@ -5308,5 +5376,31 @@ mod tests_peer_admission {
         // A LIVE duplicate is still deduped — the fix must not turn the dedup off.
         let dup = fixture_peer("super_dangle", "198.51.100.58", 45, true);
         assert!(!node.add_peer_lockfree(dup), "a live entry at the mapped address still dedups");
+    }
+}
+
+#[cfg(test)]
+mod attestation_admission_tests {
+    use super::*;
+
+    /// The gates that keep an attestation flood cheap for us and costly for the sender: a replay is
+    /// refused before the ~5ms verify, and the per-height hash cap stops unbounded map keys — the
+    /// exact hole that forced this mechanism off before.
+    #[test]
+    fn replays_and_hash_floods_are_refused_before_the_verify() {
+        let h = 9_000_001u64;               // distinct height: the store is process-wide
+        let a = |n: u8| { let mut x = [0u8; 32]; x[0] = n; x };
+
+        assert!(attestation_admissible(h, &a(1), "n1"), "a fresh attester must be admissible");
+        record_block_attestation(h, a(1), "n1".to_string());
+        assert!(!attestation_admissible(h, &a(1), "n1"), "a replay must be refused before verify");
+        assert!(attestation_admissible(h, &a(1), "n2"), "a second attester on one hash is fine");
+
+        for n in 2..=MAX_ATTESTED_HASHES_PER_HEIGHT as u8 {
+            assert!(attestation_admissible(h, &a(n), "n1"));
+            record_block_attestation(h, a(n), "n1".to_string());
+        }
+        assert!(!attestation_admissible(h, &a(99), "n1"),
+                "a fresh hash past the per-height cap must be refused");
     }
 }

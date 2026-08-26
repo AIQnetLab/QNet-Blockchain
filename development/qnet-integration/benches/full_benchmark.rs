@@ -4,7 +4,6 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
 use qnet_integration::storage::PersistentStorage;
 use sha3::{Sha3_512, Sha3_256, Digest};
-use std::time::Duration;
 
 
 // VRF init/evaluate/verify + producer-selection benches REMOVED with the deleted vrf/vrf_hybrid

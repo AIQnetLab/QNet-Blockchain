@@ -120,16 +120,15 @@ impl BlockchainNode {
         if let Some(p2p) = unified_p2p {
             // PERFORMANCE FIX: Cache producer selection for entire 30-block period to prevent HTTP spam
             // Producer is SAME for all blocks in rotation period (blocks 1-30, 31-60, etc.)
-            let rotation_interval = 30u64; // EXISTING: 30-block rotation from MICROBLOCK_ARCHITECTURE_PLAN.md
-            // CRITICAL FIX: Proper round calculation for blocks 1-30, 31-60, 61-90...
-            // Round 0: blocks 1-30, Round 1: blocks 31-60, Round 2: blocks 61-90, etc.
+            let rotation_interval = ROTATION_INTERVAL_BLOCKS;
+            // Rotation round: the first interval is round 0, then (height-1)/interval. Every term
+            // reads ROTATION_INTERVAL_BLOCKS — a literal beside it would elect a different leader
+            // the moment the constant moves.
             let leadership_round = if current_height == 0 {
-                0  // Genesis block - special case, not part of regular rotation
-            } else if current_height <= 30 {
-                0  // Blocks 1-30 are round 0
+                0  // Genesis is outside the rotation
+            } else if current_height <= rotation_interval {
+                0
             } else {
-                // Formula for blocks > 30: (height - 1) / 30
-                // This ensures: 1-30 → round 0, 31-60 → round 1, 61-90 → round 2
                 (current_height - 1) / rotation_interval
             };
             
@@ -148,7 +147,7 @@ impl BlockchainNode {
                 let required_block = match leadership_round {
                     1 => 30,  // Round 1: wait for block 30
                     2 => 60,  // Round 2: wait for block 60 (full Round 1 completion)
-                    _ => leadership_round * 30  // Round N: wait for N*30 (full previous round)
+                    _ => leadership_round * ROTATION_INTERVAL_BLOCKS
                 };
                 let local_height = store.get_chain_height().unwrap_or(0);
                 local_height >= required_block  // Only use cache if we have all required blocks
@@ -323,13 +322,13 @@ impl BlockchainNode {
                             let result = hasher.finalize();
                             let mut hash = [0u8; 32];
                             hash.copy_from_slice(&result);
-                            hash
+                            Some(hash)
                         },
                         _ => {
                             // FATAL: Genesis must exist for network to function
                             println!("[CRIT][MB] genesis_missing cannot_select_producer=true");
                             println!("[CRIT][MB] network_halted reason=no_genesis");
-                            [0u8; 32] // Will cause producer selection to fail safely
+                            None
                         }
                     }
                 } else {
@@ -358,9 +357,15 @@ impl BlockchainNode {
                                 let result = hasher.finalize();
                                 let mut hash = [0u8; 32];
                                 hash.copy_from_slice(&result);
-                                hash
+                                Some(hash)
                             },
-                            _ => [0u8; 32]
+                            _ => {
+                                if is_warn() {
+                                    println!("[WARN][FINALITY] genesis_seed_unavailable h={} action=abstain",
+                                             current_height);
+                                }
+                                None
+                            }
                         }
                     } else {
                         // Epoch 3+: Use MacroBlock N-2 (Byzantine finalized)
@@ -383,7 +388,7 @@ impl BlockchainNode {
                         // not produce: the quorum that holds N-2 keeps the chain moving, and a stall is
                         // recoverable where a fork is not.
                         match Self::resolve_producer_source_macroblock(store.as_ref(), required_macroblock) {
-                            Some((_used_idx, mb)) => Self::hash_macroblock_entropy(&mb),
+                            Some((_used_idx, mb)) => Some(Self::hash_macroblock_entropy(&mb)),
                             None => {
                                 if is_warn() {
                                     println!("[WARN][FINALITY] entropy_unavailable mb={} h={} action=abstain",
@@ -391,17 +396,26 @@ impl BlockchainNode {
                                 }
                                 set_node_state(NodeState::WaitingForMacroblock {
                                     epoch: required_macroblock, macroblock_index: required_macroblock });
-                                [0u8; 32]
+                                None
                             }
                         }
                     }
                 };
                 prev_hash
             } else {
-                println!("[WARN][VRF] no_storage — using zero entropy");
-                [0u8; 32]
+                if is_warn() { println!("[WARN][VRF] no_storage h={} action=abstain", current_height); }
+                None
             };
             
+                // Absent seed ⇒ abstain, never elect from a default. A zero seed is a VALID-LOOKING
+                // seed: it elects a leader that differs from the one nodes holding the real seed
+                // compute, so both produce and the chain forks with no adversary present. Yielding
+                // the slot is recoverable (TimeoutCertificate failover); a fork is not.
+                let entropy_source = match entropy_source {
+                    Some(seed) => seed,
+                    None => return String::new(),
+                };
+
                 // Add finality window entropy (ONLY source for determinism!)
                 hasher.update(&entropy_source);
                 
@@ -443,7 +457,9 @@ impl BlockchainNode {
                 // v4.6 FIX: Use ROUND START HEIGHT (deterministic, identical on all nodes)
                 // instead of current_height which varies depending on when cache miss occurs.
                 // Round 0 → height 1, round 1 → height 31, round N → N*30+1
-                let round_start_height = if leadership_round == 0 { 1u64 } else { leadership_round * 30 + 1 };
+                let round_start_height =
+                    if leadership_round == 0 { 1u64 }
+                    else { leadership_round * ROTATION_INTERVAL_BLOCKS + 1 };
 
                 let selected_idx = if timeout_round == 0 {
                     DilithiumVrf::deterministic_leader(
@@ -456,19 +472,10 @@ impl BlockchainNode {
                     // No exclusion sets, no collisions, no stalls.
                     // Dead node at any position is skipped within 6s (next timeout round).
                     //
-                    // v16.2: NOTE on excluded producers — the candidate list passed
-                    // here has ALREADY been filtered through
-                    // `excluded_producers_for_next_epoch` from macroblock N-2 inside
-                    // `calculate_qualified_candidates`. That excluded set is on-
-                    // chain canonical state (n−f finalised), so the filtering is
-                    // deterministic across every honest node — they all start from
-                    // the same `candidates` ordering and compute the same
-                    // `(round0_idx + R) % N` index. Adding a runtime skip-forward
-                    // here over `EXCLUDED_PRODUCERS` (a per-node DashMap populated
-                    // by local detection events) would introduce non-determinism
-                    // — different nodes would have different runtime exclusion
-                    // states and select different producers from the same round.
-                    // The canonical filter is the only authoritative source.
+                    // The candidate list is the N-2 eligible snapshot minus restart_excludes, and
+                    // nothing else: every honest node starts from the same ordering and computes the
+                    // same `(round0_idx + R) % N`. A runtime skip-forward over any locally-observed
+                    // exclusion set would make selection node-dependent — that is a fork, not a filter.
                     let round0_idx = DilithiumVrf::deterministic_leader(
                         &slot_input, round_start_height, leadership_round, 0, candidates.len(),
                     );
@@ -661,69 +668,6 @@ impl BlockchainNode {
         }
     }
 
-    /// Compute the deterministic per-height entropy used by both producer
-    /// selection and attestation committee selection.
-    ///
-    /// Returns the same value for all honest nodes given identical local state:
-    ///   * Round 0 (genesis epoch, height ≤ 30): SHA3-256(genesis_block ‖ leadership_round)
-    ///   * Round N (height > 30): macroblock-N-2 deterministic-fields hash
-    ///
-    /// The deterministic-fields hash excludes `consensus_data.next_leader` (which
-    /// can differ across nodes mid-consensus); see `select_microblock_producer_with_round`
-    /// for the canonical format. Returns [0u8; 32] on storage error / desync.
-    pub fn compute_microblock_entropy_for_height(
-        height: u64,
-        storage: &Arc<Storage>,
-    ) -> [u8; 32] {
-        let leadership_round: u64 = if height == 0 {
-            0
-        } else if height <= ROTATION_INTERVAL_BLOCKS {
-            0
-        } else {
-            (height - 1) / ROTATION_INTERVAL_BLOCKS
-        };
-
-        if leadership_round == 0 {
-            match storage.load_microblock(0) {
-                Ok(Some(genesis_data)) => {
-                    let mut hasher = Sha3_256::new();
-                    hasher.update(&genesis_data);
-                    hasher.update(&leadership_round.to_le_bytes());
-                    let result = hasher.finalize();
-                    let mut hash = [0u8; 32];
-                    hash.copy_from_slice(&result);
-                    hash
-                }
-                _ => [0u8; 32],
-            }
-        } else {
-            let current_epoch = (height - 1) / 90 + 1;
-            let required_macroblock = current_epoch.saturating_sub(2);
-            if required_macroblock == 0 {
-                match storage.load_microblock(0) {
-                    Ok(Some(genesis_data)) => {
-                        let mut hasher = Sha3_256::new();
-                        hasher.update(&genesis_data);
-                        let result = hasher.finalize();
-                        let mut hash = [0u8; 32];
-                        hash.copy_from_slice(&result);
-                        hash
-                    }
-                    _ => [0u8; 32],
-                }
-            } else {
-                // Single resolver → same macroblock as the candidate set (no seed/set divergence).
-                match Self::resolve_producer_source_macroblock(storage.as_ref(), required_macroblock) {
-                    Some((_used, mb)) => {
-                        Self::hash_macroblock_entropy(&mb)
-                    }
-                    None => [0u8; 32],
-                }
-            }
-        }
-    }
-
-    
     /// CRITICAL FIX: Invalidate producer cache during emergency failover
     /// This prevents the network from selecting failed producers repeatedly
     pub fn invalidate_producer_cache() {
@@ -816,256 +760,6 @@ impl BlockchainNode {
                 // If we can't get history, assume node is OK (fail-open for availability)
                 0
             }
-        }
-    }
-    
-    /// DEPRECATED v4.1: Emergency producer selection replaced by BFT Timeout Protocol
-    /// BFT uses select_microblock_producer_with_round(height, certified_timeout_round)
-    /// which deterministically excludes failed producers by round number.
-    /// This function is kept for reference but no longer called.
-    #[allow(dead_code)]
-    pub(super) async fn select_emergency_producer(
-        failed_producer: &str,
-        current_height: u64,
-        unified_p2p: &Option<Arc<SimplifiedP2P>>,
-        own_node_id: &str, // CRITICAL: Include own node as emergency candidate
-        own_node_type: NodeType, // CRITICAL: Use real node type for accurate filtering
-        storage: Option<Arc<Storage>>, // Pass storage for failover tracking
-    ) -> String {
-        if let Some(p2p) = unified_p2p {
-            // ═══════════════════════════════════════════════════════════════════════════
-            // CRITICAL FIX v2.92: FULLY DETERMINISTIC emergency candidate selection
-            // ═══════════════════════════════════════════════════════════════════════════
-            // Use ONLY calculate_qualified_candidates which returns:
-            // - Genesis epoch (1-180): Static Genesis node list (same for ALL nodes)
-            // - Normal epoch (181+): Macroblock N-2 snapshot (same for ALL nodes)
-            //
-            // NO separate own_node handling - all candidates from qualified list!
-            // NO peer_heights filtering - it's non-deterministic during network split!
-            // ═══════════════════════════════════════════════════════════════════════════
-            
-            let mut candidates = Vec::new();
-            
-            println!("[INFO][MB] emergency_exclude producer={}", failed_producer);
-            
-            // v3.10 BUG 3 FIX: Exclude failed producer globally
-            // Blocks from this producer will be ignored for the next rotation cycle
-            // This prevents forked nodes from spamming and blocking emergency recovery
-            let rotation_interval = 30u64;
-            let exclude_until = ((current_height / rotation_interval) + 2) * rotation_interval;
-            exclude_producer(failed_producer, "emergency_failover", exclude_until);
-            if is_info() {
-                println!("[INFO][EMERGENCY] producer_excluded id={} until_h={}", failed_producer, exclude_until);
-            }
-            
-            // Use same candidate source as normal production
-            {
-                // ARCHITECTURE: Use SAME calculate_qualified_candidates for determinism
-                // This ensures emergency selection uses same list as normal selection
-                println!("[INFO][MB] emergency_candidates source=standard");
-                
-                // v3.16: Pass current_height for deterministic epoch calculation
-                let qualified = Self::calculate_qualified_candidates(p2p, own_node_id, own_node_type, current_height).await;
-                
-                // CRITICAL FIX v2.44: If qualified is empty, node is DESYNC'd - abort!
-                if qualified.is_empty() {
-                    println!("[ERR][EMERGENCY] no_qualified_candidates node_desync=true h={}", current_height);
-                    println!("[ERR][EMERGENCY] Returning failed_producer to prevent fork: {}", failed_producer);
-                    return failed_producer.to_string();
-                }
-                
-                // Deterministic emergency candidate selection. Any per-node
-                // input (peer_heights, get_failed_producers() local DashMap)
-                // differs across nodes during a split → different candidate
-                // lists → different SHA3 pick → each selects itself → FORK.
-                // Use only deterministic data: qualified list from the N-2
-                // snapshot, exclude ONLY the failed_producer param (same on
-                // every node via the emergency message), SHA3-512 from the
-                // finality block. An unsynced pick self-excludes → timeout →
-                // next deterministic selection (same chain on all nodes).
-                
-                for (node_id, reputation) in qualified {
-                    // DETERMINISTIC: Exclude ONLY the explicitly passed failed_producer
-                    // This is the SAME value on ALL nodes receiving the emergency message
-                    if node_id == failed_producer {
-                        println!("[INFO][EMERGENCY] peer={} status=excluded reason=failed_producer", node_id);
-                        continue;
-                    }
-                    
-                    // v3.6: NO local state filtering! All other candidates are included.
-                    // If selected emergency producer is also down:
-                    //   1. It self-excludes (doesn't produce)
-                    //   2. Timeout triggers NEW emergency with IT as failed_producer
-                    //   3. All nodes AGAIN select SAME next candidate (deterministic)
-                    println!("[INFO][EMERGENCY] peer={} status=candidate rep={:.1}", 
-                             node_id, reputation * 100.0);
-                    candidates.push((node_id.clone(), reputation));
-                }
-            }
-            
-            
-            
-            // VALIDATION: Filter out any fallback IDs (process-based) from candidates
-            let valid_candidates: Vec<(String, f64)> = candidates.into_iter()
-                .filter(|(id, _)| {
-                    // Reject fallback IDs that contain process IDs
-                    if id.contains("_legacy_") || id.chars().any(|c| c.is_ascii_hexdigit() && id.len() > 20) {
-                        if is_debug() { println!("[DBG][EMERG] filter_invalid id={}", id); }
-                        false
-                    } else {
-                        true
-                    }
-                })
-                .collect();
-            
-            // ═══════════════════════════════════════════════════════════════════════════
-            // v2.105: REMOVED NON-DETERMINISTIC FILTERING!
-            // ═══════════════════════════════════════════════════════════════════════════
-            // CRITICAL BUG FIX: get_recent_producer_failures(storage) was using LOCAL storage
-            // which differs between nodes → different failure_count → different candidates → FORK!
-            //
-            // CORRECT APPROACH: Use ONLY N-2 macroblock snapshot (already done above)
-            // Failed producers are excluded via `all_failed` list (deterministic)
-            // NO LOCAL STORAGE QUERIES FOR CANDIDATE FILTERING!
-            // ═══════════════════════════════════════════════════════════════════════════
-            let stable_candidates = valid_candidates;
-            
-            if is_info() {
-            println!("[INFO][EMERGENCY] candidates={} excluded={}", 
-                     stable_candidates.len(), failed_producer);
-            }
-            
-            // Empty candidate set is resolved deterministically by the SHA3 selection
-            // below (its empty-guard returns failed_producer). No per-node reputation
-            // degradation path — that reads local peer state and would fork on a split.
-
-            let candidates = stable_candidates;
-            
-            // CRITICAL: Apply MAX_VALIDATORS limit BEFORE sorting (for scalability)
-            let limited_candidates = if candidates.len() <= MAX_VALIDATORS {
-                candidates.clone()
-            } else {
-                println!("[INFO][MB] emergency_candidates_limited from={} to={}",
-                        candidates.len(), MAX_VALIDATORS);
-                candidates.iter()
-                    .take(MAX_VALIDATORS)
-                    .cloned()
-                    .collect()
-            };
-            
-            // CRITICAL: Sort candidates to ensure deterministic ordering across all nodes
-            let mut sorted_candidates = limited_candidates;
-            sorted_candidates.sort_by(|a, b| a.0.cmp(&b.0));  // Sort by node_id alphabetically
-            
-            // PRODUCTION: Deterministic SHA3-512 selection for quantum-resistant emergency producer
-            // Same cryptographic guarantees as normal producer selection (NIST FIPS 204)
-            println!("[INFO][MB] emergency_selection h={} algo=sha3_512", current_height);
-            
-            // CRITICAL FIX v2.25.2: Use FINALITY WINDOW block hash for determinism
-            // This ensures ALL synchronized nodes compute IDENTICAL emergency producer
-            // Without this, different nodes may select different emergency producers → FORK!
-            let finality_hash = if let Some(ref store) = storage {
-                let finality_block_height = current_height.saturating_sub(FINALITY_WINDOW);
-                if finality_block_height > 0 {
-                    Self::get_finality_block_hash(store, finality_block_height, current_height).await
-                } else {
-                    // For very early blocks, use genesis
-                    match store.load_microblock(0) {
-                        Ok(Some(genesis_data)) => {
-                            let mut h = Sha3_256::new();
-                            h.update(&genesis_data);
-                            let r = h.finalize();
-                            let mut hash = [0u8; 32];
-                            hash.copy_from_slice(&r);
-                            hash
-                        },
-                        _ => [0u8; 32]
-                    }
-                }
-            } else {
-                println!("[WARN][MB] emergency_zero_entropy risk=fork");
-                [0u8; 32]
-            };
-            
-            // Create deterministic entropy for emergency selection
-            // CRITICAL: Include finality_hash for cross-node determinism!
-            // CRITICAL FIX v2.64: Emergency entropy uses ONLY deterministic data
-            // - finality_hash: All synchronized nodes have same finality block
-            // - current_height: All nodes agree on height
-            // - sorted_candidates: All nodes have same list (minus failed_producer)
-            // This ensures ALL nodes select SAME emergency producer
-            let emergency_entropy = {
-                let mut hasher = Sha3_256::new();
-                hasher.update(b"EMERGENCY_VRF_ENTROPY_V8"); // Version bump for new algorithm
-                hasher.update(&finality_hash);  // CRITICAL: Finality window block hash!
-                hasher.update(&current_height.to_le_bytes());
-                hasher.update(failed_producer.as_bytes()); // Include failed producer for entropy variation
-                for (node_id, _) in &sorted_candidates {
-                    hasher.update(node_id.as_bytes());
-                }
-                let result = hasher.finalize();
-                let mut entropy = [0u8; 32];
-                entropy.copy_from_slice(&result);
-                entropy
-            };
-            
-            println!("[INFO][MB] finality_entropy h={}",
-                     current_height.saturating_sub(FINALITY_WINDOW));
-            
-            // ═══════════════════════════════════════════════════════════════════════════
-            // EMERGENCY: DETERMINISTIC SHA3 SELECTION (Same as normal selection)
-            // ═══════════════════════════════════════════════════════════════════════════
-            // All nodes compute IDENTICAL result → no forks during emergency
-            // Quantum-resistant via SHA3-512 (2^128 security)
-            // ═══════════════════════════════════════════════════════════════════════════
-            
-            let mut selector = Sha3_512::new();
-            selector.update(b"QNet_Emergency_Producer_Selection_v6");
-            selector.update(&emergency_entropy);
-            selector.update(&current_height.to_le_bytes());
-            
-            // Include sorted candidate list for determinism
-            for (candidate_id, _) in &sorted_candidates {
-                selector.update(candidate_id.as_bytes());
-            }
-            
-            let selection_hash = selector.finalize();
-            let selection_value = u64::from_le_bytes([
-                selection_hash[0], selection_hash[1], selection_hash[2], selection_hash[3],
-                selection_hash[4], selection_hash[5], selection_hash[6], selection_hash[7],
-            ]);
-            
-            // v9.1: Guard against empty candidates (would panic on % 0)
-            if sorted_candidates.is_empty() {
-                println!("[WARN][FAILOVER] emergency_no_candidates h={}", current_height);
-                return failed_producer.to_string();
-            }
-            let selection_index = (selection_value as usize) % sorted_candidates.len();
-            let emergency_producer = sorted_candidates[selection_index].0.clone();
-            
-            println!("[WARN][MB] emergency_producer={} algo=sha3_deterministic", emergency_producer);
-            println!("[INFO][MB] selection=quantum_resistant");
-            
-            // Save failover event to storage for monitoring
-            if let Some(ref storage) = storage {
-                let event = crate::storage::FailoverEvent {
-                    height: current_height,
-                    failed_producer: failed_producer.to_string(),
-                    emergency_producer: emergency_producer.clone(),
-                    reason: "timeout_5s".to_string(),
-                    timestamp: chrono::Utc::now().timestamp(),
-                    block_type: "microblock".to_string(),
-                };
-                
-                if let Err(e) = storage.save_failover_event(&event) {
-                    println!("[WARN][MB] failover_save_err err={}", e);
-                }
-            }
-            
-            emergency_producer
-        } else {
-            // Solo mode - no alternatives
-            failed_producer.to_string()
         }
     }
     
@@ -1255,16 +949,13 @@ impl BlockchainNode {
                             // ONLY — the single canonical, QC-bound (via epoch_commitment) source, so
                             // every honest node derives the SAME set → no fork. TWO non-canonical
                             // filters are NEUTRALISED here (both no-ops today ⇒ behaviour-preserving):
-                            //  • excluded_producers_for_next_epoch — was derived from each node's LOCAL
-                            //    get_failover_history (NOT on-chain, NOT QC-bound), so a re-enabled
-                            //    failover writer would make nodes filter DIFFERENT producers →
-                            //    divergent N-2 candidate set two epochs later → honest split. Its writer
-                            //    (save_failover_event via select_emergency_producer) is dead ⇒ the set
-                            //    is always empty; we stop READING the un-bound field entirely. Liveness-
-                            //    based exclusion, if reintroduced, MUST be on-chain deterministic + QC-bound.
-                            //  • is_validator_ejected (filters removed below) — a per-node locally-observed
-                            //    set gated by QNET_LIVENESS_EJECTION; enabling it made selection node-
-                            //    dependent → split. Local liveness must NOT mutate the canonical set.
+                            //  • excluded_producers_for_next_epoch — derived from each node's LOCAL
+                            //    failover history, neither on-chain nor QC-bound, so reading it would
+                            //    filter DIFFERENT producers per node → honest split two epochs later.
+                            //  • is_validator_ejected — a per-node locally-observed set; enabling it
+                            //    made selection node-dependent → split.
+                            // Liveness exclusion, when introduced, MUST be on-chain and QC-bound. The
+                            // checkpoint QC's signer list is the only certified participation record.
                             let excluded_node_ids: std::collections::HashSet<String> =
                                 std::collections::HashSet::new();
                             

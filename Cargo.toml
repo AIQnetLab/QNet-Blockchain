@@ -43,6 +43,12 @@ codegen-units = 1
 panic = "abort"
 overflow-checks = false
 
+[profile.dev]
+# Line tables only. Full debug info grew the crate rlib past 4 GB, which link.exe cannot read as an
+# archive — it silently skips the library and the build dies on thousands of unresolved symbols.
+# Panics still carry file:line.
+debug = 1
+
 [profile.test]
 opt-level = 2  # Optimize tests for better performance
 

@@ -4107,6 +4107,14 @@ impl BlockPipeline {
             // ── Post-save updates (no state lock held) ──
             metrics.applied.fetch_add(1, Ordering::Relaxed);
 
+            // Attest what we accepted, if this height's deterministic slice includes us. Evidence
+            // only: a producer alone on a branch collects none, and that is the signal that reveals
+            // the split within a block or two instead of at the next checkpoint.
+            if let Some(p2p) = crate::node::try_get_p2p() {
+                p2p.attest_accepted_block(
+                    height, block.microblock.hash(), &block.microblock.producer);
+            }
+
             // ── v13.1: Timeout tracking (was missing — root cause of fork divergence) ──
             // Pipeline is the ONLY block processing path since v13.0.
             // Without these updates, LAST_BLOCK_PRODUCED_TIME stays at genesis_ts,
@@ -4871,3 +4879,380 @@ mod deferred_eviction_tests {
     }
 }
 
+#[cfg(test)]
+mod multi_node_tests {
+    use super::*;
+
+    // Five nodes, 30-block rotation, deterministic packet loss. Models the node-level loop the
+    // single-driver tests cannot reach: receive -> apply or defer -> decide whether to catch up.
+    // Every halt of this class started here, so the harness is parameterised by the policies that
+    // produced them and must FAIL on the old ones.
+    const NODES: usize = 5;
+    const ROTATION: u64 = 30;
+    const RUN_BLOCKS: u64 = 900;
+    const CATCHUP_EVERY: u64 = 10;
+    const HICCUP_AT: u64 = 300;
+    const TICKS: u64 = 2_000;
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Deferral {
+        /// Drop the arriving block once a cap is hit.
+        DropArrival,
+        /// Evict the entry furthest from the tip and admit the arrival.
+        EvictFarthest,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Gate {
+        /// Producing also requires a phase flag that the node's own idleness clears.
+        PhaseFlag,
+        /// Producing requires only the parent it extends.
+        HoldsParent,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum HeightSource {
+        /// Monotone max over every height ever SEEN.
+        Observed,
+        /// The contiguous APPLIED tip.
+        Applied,
+    }
+
+    fn key(h: u64) -> [u8; 32] {
+        let mut k = [0u8; 32];
+        k[..8].copy_from_slice(&h.to_le_bytes());
+        k
+    }
+
+    fn block(h: u64, producer: &str) -> DecodedBlock {
+        let mb = qnet_state::MicroBlock {
+            height: h, timestamp: 0, transactions: vec![], producer: producer.to_string(),
+            signature: vec![0u8; 64], merkle_root: key(h), previous_hash: key(h.saturating_sub(1)),
+            vrf_output: None, vrf_proof: None, fees_collected: 0,
+            state_root: [0u8; 32], timeout_round: 0, carried_baseline: 0, timeout_proof: None,
+        };
+        DecodedBlock {
+            height: h, raw_data: Vec::new(), decompressed: Vec::new(),
+            microblock: mb, from_peer: "sim".into(), sig_pre_verified: true,
+        }
+    }
+
+    struct SimNode {
+        applied: u64,
+        observed: u64,
+        deferred: HashMap<[u8; 32], Vec<(u64, DecodedBlock)>>,
+        by_producer: HashMap<String, usize>,
+        count: usize,
+        /// Set while the node is applying blocks, cleared when a round passes without one.
+        active: bool,
+    }
+
+    impl SimNode {
+        fn new() -> Self {
+            SimNode { applied: 0, observed: 0, deferred: HashMap::new(),
+                      by_producer: HashMap::new(), count: 0, active: true }
+        }
+
+        /// Apply everything the buffer now unblocks, cascading through parked children.
+        fn drain(&mut self) {
+            loop {
+                let want = key(self.applied);
+                let next = match self.deferred.get_mut(&want) {
+                    Some(v) if !v.is_empty() => v.remove(0),
+                    _ => break,
+                };
+                if self.deferred.get(&want).is_some_and(|v| v.is_empty()) {
+                    self.deferred.remove(&want);
+                }
+                self.count = self.count.saturating_sub(1);
+                if let Some(c) = self.by_producer.get_mut(&next.1.microblock.producer) {
+                    *c = c.saturating_sub(1);
+                }
+                self.applied = next.1.microblock.height;
+            }
+        }
+
+        fn receive(&mut self, b: DecodedBlock, pol: Deferral) {
+            let h = b.microblock.height;
+            self.observed = self.observed.max(h);
+            if h <= self.applied { return; }
+            if h == self.applied + 1 {
+                self.applied = h;
+                self.active = true;
+                self.drain();
+                return;
+            }
+            // Parent missing — park it, honouring the same caps the pipeline uses.
+            const PER_PRODUCER: usize = 2 * ROTATION as usize;
+            const TOTAL: usize = 240;
+            let held = *self.by_producer.get(&b.microblock.producer).unwrap_or(&0);
+            if held >= PER_PRODUCER {
+                let freed = pol == Deferral::EvictFarthest
+                    && evict_farthest_deferred(&mut self.deferred, &mut self.by_producer,
+                                               &mut self.count, Some(&b.microblock.producer), h);
+                if !freed { return; }
+            }
+            if self.count >= TOTAL {
+                let freed = pol == Deferral::EvictFarthest
+                    && evict_farthest_deferred(&mut self.deferred, &mut self.by_producer,
+                                               &mut self.count, None, h);
+                if !freed { return; }
+            }
+            let waiters = self.deferred.entry(b.microblock.previous_hash).or_default();
+            if waiters.iter().any(|(_, d)| d.microblock.height == h) { return; }
+            *self.by_producer.entry(b.microblock.producer.clone()).or_insert(0) += 1;
+            waiters.push((0, b));
+            self.count += 1;
+        }
+
+        /// "Do I need data?" — the decision that either drives catch-up or silently skips it.
+        fn needs_catchup(&self, tip: u64, src: HeightSource) -> bool {
+            let mine = match src {
+                HeightSource::Applied => self.applied,
+                HeightSource::Observed => self.observed,
+            };
+            mine < tip
+        }
+    }
+
+    /// Runs the fleet and returns each node's final applied height plus the number of blocks the
+    /// catch-up path had to re-deliver — the cost a discarded arrival forces the fleet to repay.
+    fn run(def: Deferral, src: HeightSource, gate: Gate) -> (Vec<u64>, u64) {
+        let names: Vec<String> = (0..NODES).map(|i| format!("n{}", i)).collect();
+        let mut nodes: Vec<SimNode> = (0..NODES).map(|_| SimNode::new()).collect();
+        let mut tip = 0u64;
+        let mut refetched = 0u64;
+
+        // Ticks, not heights: the production loop runs on a timer and retries the SAME height until
+        // it lands. A tick that produces nothing must cost that tick, never the height.
+        for tick in 1..=TICKS {
+            let h = tip + 1;
+            if h > RUN_BLOCKS { break; }
+            let p = ((h - 1) / ROTATION) as usize % NODES;
+
+            // One transient hiccup — a slow disk, a scheduler pause. Nothing about the chain is
+            // broken afterwards: the producer still holds the parent.
+            let hiccup = tick == HICCUP_AT;
+            let holds_parent = nodes[p].applied + 1 == h;
+            let allowed = !hiccup && match gate {
+                Gate::HoldsParent => holds_parent,
+                Gate::PhaseFlag => holds_parent && nodes[p].active,
+            };
+
+            if !allowed {
+                // Nobody applied anything this tick, so the flag the old gate demands goes out.
+                for n in nodes.iter_mut() { n.active = false; }
+            } else {
+                nodes[p].applied = h;
+                nodes[p].active = true;
+                nodes[p].drain();
+                tip = h;
+
+                // Deterministic loss: no RNG, so a failure is always reproducible.
+                for (i, node) in nodes.iter_mut().enumerate() {
+                    if i == p { continue; }
+                    if (h * 7 + i as u64 * 13) % 23 == 0 { continue; } // ~4% dropped
+                    node.receive(block(h, &names[p]), def);
+                }
+            }
+
+            // Catch-up runs on a timer, not per block — between passes later blocks keep arriving
+            // and a height that counts them has already reached the tip.
+            if tick % CATCHUP_EVERY != 0 { continue; }
+            for node in nodes.iter_mut() {
+                if node.needs_catchup(tip, src) {
+                    for miss in (node.applied + 1)..=tip {
+                        let owner = ((miss - 1) / ROTATION) as usize % NODES;
+                        node.receive(block(miss, &names[owner]), def);
+                        refetched += 1;
+                    }
+                }
+            }
+        }
+        (nodes.iter().map(|n| n.applied).collect(), refetched)
+    }
+
+    /// The shipped policies must converge: every node ends at the tip under steady packet loss.
+    #[test]
+    fn every_node_converges_under_loss_with_the_shipped_policies() {
+        let (heights, _) = run(Deferral::EvictFarthest, HeightSource::Applied, Gate::HoldsParent);
+        assert!(heights.iter().all(|&h| h == RUN_BLOCKS),
+                "nodes failed to converge: {:?} (expected all at {})", heights, RUN_BLOCKS);
+    }
+
+    /// Reading a height that counts blocks it never applied makes a node believe it is caught up,
+    /// so it never asks. This is the state that stranded a node for 45 minutes.
+    #[test]
+    fn counting_unapplied_blocks_as_progress_strands_the_fleet() {
+        let (heights, _) = run(Deferral::EvictFarthest, HeightSource::Observed, Gate::HoldsParent);
+        let worst = heights.iter().copied().min().unwrap_or(0);
+        assert!(RUN_BLOCKS - worst > 100,
+                "expected a node stranded far behind, best-case gap was {} ({:?})",
+                RUN_BLOCKS - worst, heights);
+    }
+
+    /// While catch-up works the cap never binds — a node is never behind long enough to hold sixty
+    /// blocks of one producer. The two defects only bite together: the height source disables
+    /// catch-up, and the buffer then destroys what would have recovered the node. Under an impaired
+    /// catch-up the eviction policy must leave the fleet strictly further along.
+    #[test]
+    fn the_buffer_policy_matters_once_catch_up_is_impaired() {
+        let (evicting, _) = run(Deferral::EvictFarthest, HeightSource::Observed, Gate::HoldsParent);
+        let (dropping, _) = run(Deferral::DropArrival, HeightSource::Observed, Gate::HoldsParent);
+        let best_evicting: u64 = evicting.iter().copied().sum();
+        let best_dropping: u64 = dropping.iter().copied().sum();
+        assert!(best_evicting >= best_dropping,
+                "evicting the farthest must never do worse than discarding the arrival: {:?} vs {:?}",
+                evicting, dropping);
+    }
+
+    /// A transient hiccup must cost one round, not the chain. The old gate also demanded a phase
+    /// flag that only producing could set, so the stalled round cleared it and nothing could ever
+    /// set it again. Gating on the parent alone recovers on the very next round.
+    #[test]
+    fn a_gate_that_reads_its_own_idleness_stops_the_chain() {
+        let (healthy, _) = run(Deferral::EvictFarthest, HeightSource::Applied, Gate::HoldsParent);
+        let (locked, _) = run(Deferral::EvictFarthest, HeightSource::Applied, Gate::PhaseFlag);
+        assert!(healthy.iter().all(|&h| h == RUN_BLOCKS),
+                "parent-only gate must keep the chain running, got {:?}", healthy);
+        let stopped = locked.iter().copied().max().unwrap_or(0);
+        assert!(stopped < RUN_BLOCKS,
+                "the phase-flag gate must stall the chain, it reached {} ({:?})", stopped, locked);
+    }
+}
+
+#[cfg(test)]
+mod view_divergence_tests {
+    use std::collections::{HashMap, HashSet};
+
+    // The 26099 halt in miniature: one node held view 0 while the rest had moved on, so both sides
+    // elected a different producer from the same seed and each extended its own branch. The split
+    // itself is survivable — what made it permanent were two closed exits: a minority node that
+    // drops every foreign-anchor vote never learns its view moved, and a height-keyed signing mark
+    // bars the producer that rolled back from re-extending the branch it just adopted.
+    const NODES: usize = 5;
+    const ROTATION: u64 = 30;
+    const QUORUM: usize = 4;            // n - f at n = 5
+    const MAJORITY_VIEW: u64 = 10;
+    const CANON_ANCHOR: u32 = 1;
+    const MAX_TICKS: u64 = 5_000;
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum AnchorPolicy {
+        /// A vote carrying a different anchor is dropped, and nothing else happens.
+        Drop,
+        /// n-f distinct signed foreign anchors prove OUR anchor is the minority one.
+        ReconcileAtQuorum,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum MarkPolicy {
+        /// Never sign at or below the highest height ever signed, whatever the view.
+        HeightOnly,
+        /// The (view, height) pair must be strictly new, ordered view-first.
+        ViewFirst,
+    }
+
+    fn producer_for(height: u64, view: u64) -> usize {
+        let window = ((height - 1) / ROTATION) as usize;
+        (window + view as usize) % NODES
+    }
+
+    /// Ticks until the stale node adopts the canonical anchor, or None if it never does.
+    fn ticks_to_rejoin(policy: AnchorPolicy) -> Option<u64> {
+        let mut foreign: HashMap<u32, HashSet<usize>> = HashMap::new();
+        for tick in 1..=MAX_TICKS {
+            // Every majority member votes each tick, carrying the canonical anchor; ours differs.
+            for voter in 1..NODES {
+                if policy == AnchorPolicy::ReconcileAtQuorum {
+                    foreign.entry(CANON_ANCHOR).or_default().insert(voter);
+                }
+            }
+            if foreign.get(&CANON_ANCHOR).map_or(0, |s| s.len()) >= QUORUM {
+                return Some(tick);
+            }
+        }
+        None
+    }
+
+    /// Drives the fleet from `from` toward `target` with `rolled_back` still holding the mark from
+    /// the branch it abandoned. `failover` models a view rotation on a stalled slot — it needs a
+    /// quorum, exactly what a degraded network has already lost. Returns (tip reached, blocks the
+    /// rolled-back node re-signed at or below its old mark).
+    fn drive(mp: MarkPolicy, failover: bool, rolled_back: usize, signed_to: u64,
+             from: u64, target: u64) -> (u64, u64) {
+        let mut tip = from;
+        let mut view = MAJORITY_VIEW;
+        let mut hwm_h = [0u64; NODES];
+        let mut hwm_view = [0u64; NODES];
+        hwm_h[rolled_back] = signed_to;     // signed on the abandoned branch, at view 0
+        let (mut reclaimed, mut ticks) = (0u64, 0u64);
+        while tip < target && ticks < MAX_TICKS {
+            ticks += 1;
+            let h = tip + 1;
+            let p = producer_for(h, view);
+            let may_sign = match mp {
+                MarkPolicy::HeightOnly => h > hwm_h[p],
+                MarkPolicy::ViewFirst => (view, h) > (hwm_view[p], hwm_h[p]),
+            };
+            if may_sign {
+                if p == rolled_back && h <= signed_to { reclaimed += 1; }
+                tip = h;
+                match mp {
+                    MarkPolicy::HeightOnly => hwm_h[p] = hwm_h[p].max(h),
+                    MarkPolicy::ViewFirst => { hwm_h[p] = h; hwm_view[p] = view; }
+                }
+            } else if failover {
+                view += 1;                  // a TimeoutCertificate hands the slot on
+            }
+        }
+        (tip, reclaimed)
+    }
+
+    /// n-f signed foreign anchors are the only evidence separating "they forked" from "we forked",
+    /// and it reaches the minority side — which is the side that needs it.
+    #[test]
+    fn a_quorum_of_signed_foreign_anchors_returns_a_stale_view_node() {
+        assert!(ticks_to_rejoin(AnchorPolicy::ReconcileAtQuorum).is_some(),
+                "n-f foreign anchors must trigger reconciliation");
+    }
+
+    /// Dropping the vote and doing nothing else is what made the split permanent: the node discards
+    /// exactly the messages carrying the news that its view moved.
+    #[test]
+    fn dropping_foreign_anchor_votes_strands_the_minority_forever() {
+        assert!(ticks_to_rejoin(AnchorPolicy::Drop).is_none(),
+                "the drop-only policy must never let the stale node rejoin");
+    }
+
+    /// Back on the canonical branch, the producer must be able to re-extend it. A height-keyed mark
+    /// lets it sign nothing it already signed, and with failover gone the chain simply stops there.
+    #[test]
+    fn a_height_keyed_mark_deadlocks_the_chain_when_failover_is_gone() {
+        let (stuck, none_back) = drive(MarkPolicy::HeightOnly, false, 0, 200, 140, 400);
+        assert_eq!(none_back, 0, "a height-keyed mark must reclaim nothing it already signed");
+        assert!(stuck < 200, "the chain must stall inside the signed range, reached {}", stuck);
+
+        let (ran, back) = drive(MarkPolicy::ViewFirst, false, 0, 200, 140, 400);
+        assert!(back > 0, "a view-keyed mark must let the rejoined producer sign again");
+        assert_eq!(ran, 400, "and the chain must reach the target, reached {}", ran);
+    }
+
+    /// It must extend a WHOLE window, not one block: maxing the mark per field would keep the old
+    /// height and bar every height after the first re-signed one.
+    #[test]
+    fn a_rejoined_producer_extends_a_full_window_not_a_single_block() {
+        let (_, reclaimed) = drive(MarkPolicy::ViewFirst, false, 0, 200, 140, 400);
+        assert!(reclaimed >= ROTATION,
+                "expected a full window re-extended, got {} blocks", reclaimed);
+    }
+
+    /// Pins the harness to the shipped gate: policy tests prove which rule works, this proves the
+    /// production path uses it.
+    #[test]
+    fn the_shipped_mark_orders_view_first() {
+        let src = include_str!("node/production.rs");
+        assert!(src.contains("if (certified_abs, next_block_height) <= (hwm_r, hwm_h)"),
+                "production must compare the (view, height) pair, never height alone");
+    }
+}

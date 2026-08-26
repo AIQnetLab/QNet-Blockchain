@@ -1293,12 +1293,12 @@ impl Storage {
     }
 
     /// Anti-double-sign watermark — proxy to PersistentStorage.
-    pub fn save_highest_signed_height(&self, height: u64) -> IntegrationResult<()> {
-        self.persistent.save_highest_signed_height(height)
+    pub fn save_highest_signed_mark(&self, height: u64, round: u64) -> IntegrationResult<()> {
+        self.persistent.save_highest_signed_mark(height, round)
     }
 
-    pub fn load_highest_signed_height(&self) -> IntegrationResult<Option<u64>> {
-        self.persistent.load_highest_signed_height()
+    pub fn load_highest_signed_mark(&self) -> IntegrationResult<Option<(u64, u64)>> {
+        self.persistent.load_highest_signed_mark()
     }
 
     /// Phase C: RocksDB-backed persistent Merkle store over the two dedicated

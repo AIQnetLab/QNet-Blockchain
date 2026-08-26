@@ -168,6 +168,7 @@ in one context can never be replayed as a valid preimage in another. The main in
 | `QNET_BFT2_VOTE:` / `QNET_BFT2_TMO:` / `QNET_BFT2_CKPT:` | checkpoint vote, view-change timeout and checkpoint-proposal signing strings |
 | `qnet-timeout-v2` | timeout signing body prefix (the driver's timeout bytes) |
 | `QNET_TIMEOUT_V2:` | P2P failover `TimeoutVote` preimage — distinct from the driver prefix above |
+| `QNET_ATTEST:` | block-attestation preimage over height and block hash, prefixed with the chain tag |
 | `leaf` / `node` | quorum-certificate signature merkle tree |
 | `log-leaf` / `log-node`, `logw-leaf` / `logw-node` | event-log tree, level 1 and window level 2 |
 | `qnet-registry-root-v2`, `qnet-registry-row-v4`, `qnet-dpk-row-v1`, `qnet-reward-epoch-root-v1` | LtHash digests and row seeds |

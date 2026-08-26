@@ -3291,11 +3291,11 @@ impl BlockchainNode {
                 // + certified-round supersede + 2f+1 macroblock Checkpoint settle the winner).
 
                 if is_my_turn_to_produce {
-                    // Fork-choice authority is round-based: a same-round 2f+1 TimeoutCertificate rotates
-                    // the producer and the 2f+1 macroblock Checkpoint settles the winner. The old
-                    // attestation-based competing-producer yield was retired — no honest node emits a
-                    // BlockAttestation (its store was never populated benignly), so the check could only
-                    // ever fire on adversarial gossip, censoring the honest producer's own slot.
+                    // Fork-choice authority is round-based: a same-round 2f+1 TimeoutCertificate
+                    // rotates the producer and the 2f+1 macroblock Checkpoint settles the winner.
+                    // Block attestations are EVIDENCE only and deliberately gate nothing here: an
+                    // input every node shares cannot tell isolation from a dead attestation channel,
+                    // so yielding on it would halt the whole cluster on one symmetric fault.
 
                     // PRODUCTION: This node is selected as microblock producer for this round
                     *is_leader.write().await = true;
@@ -4686,26 +4686,35 @@ impl BlockchainNode {
                                 continue;
                             }
                         }
-                        // Anti-double-sign watermark. Two validly-signed bodies by one producer at one
-                        // height are a PERMANENT chain-committed ban that fork-choice cannot undo — the
-                        // one damage certification does not cover. Monotone and never lowered, including
-                        // by rollback; persisted with fsync BEFORE signing, so a crash in between costs
-                        // one slot instead of a second signature.
+                        // Anti-double-sign mark, ordered ROUND-first. Two validly-signed bodies at one
+                        // (height, ROUND) are a PERMANENT chain-committed ban that fork-choice cannot
+                        // undo — the one damage certification does not cover. A strictly higher round is
+                        // a different pair, so a node that rolled back can re-extend the branch it
+                        // adopted instead of being locked out of every height it ever signed. Monotone;
+                        // persisted with fsync BEFORE signing, so a crash costs one slot, not a signature.
                         {
-                            let signed_hwm = HIGHEST_SIGNED_HEIGHT.load(std::sync::atomic::Ordering::SeqCst);
-                            if next_block_height <= signed_hwm {
-                                println!("[WARN][PROD] production_yielded h={} hwm={} reason=already_signed_this_height",
-                                         next_block_height, signed_hwm);
+                            let hwm_h = HIGHEST_SIGNED_HEIGHT.load(std::sync::atomic::Ordering::SeqCst);
+                            let hwm_r = HIGHEST_SIGNED_ROUND.load(std::sync::atomic::Ordering::SeqCst);
+                            // Ordered VIEW-first, and the pair is STORED, not maxed per field: a higher
+                            // view may re-sign any height, and inside one view heights must climb. A
+                            // componentwise max would keep the old height and bar everything after the
+                            // first block, so a rolled-back producer could never finish its window.
+                            // A crash inside the 2s certificate flush can restore a lower view and
+                            // costs one view rotation — bounded, and failover recovers it.
+                            if (certified_abs, next_block_height) <= (hwm_r, hwm_h) {
+                                println!("[WARN][PROD] production_yielded h={} round={} hwm_h={} hwm_r={} reason=already_signed_this_round",
+                                         next_block_height, certified_abs, hwm_h, hwm_r);
                                 crate::unified_p2p::BLOCK_BROADCAST_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
                                 continue;
                             }
-                            if let Err(e) = storage.save_highest_signed_height(next_block_height) {
+                            if let Err(e) = storage.save_highest_signed_mark(next_block_height, certified_abs) {
                                 println!("[ERR][PROD] production_yielded h={} reason=hwm_persist_failed err={}",
                                          next_block_height, e);
                                 crate::unified_p2p::BLOCK_BROADCAST_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
                                 continue;
                             }
                             HIGHEST_SIGNED_HEIGHT.store(next_block_height, std::sync::atomic::Ordering::SeqCst);
+                            HIGHEST_SIGNED_ROUND.store(certified_abs, std::sync::atomic::Ordering::SeqCst);
                         }
                         // A claim this node cannot resolve is knowable from the selected TXs, so decide
                         // it HERE. Discovering it during the inline apply is too late: that path has no

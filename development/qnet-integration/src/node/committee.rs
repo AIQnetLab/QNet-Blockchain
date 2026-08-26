@@ -410,6 +410,14 @@ impl BlockchainNode {
         // valid proof against any producer from one public block, and the ban is permanent committed
         // state — at n=5 two of them halt finality for good. This mirrors the vote-equivocation
         // sibling, which has always compared checkpoint hashes.
+        // Equivocation is two bodies at one (height, ABSOLUTE round). The view is
+        // timeout_round + carried_baseline: the relative round alone splits one view across two
+        // baselines AND merges two views under one relative number. A different view at one height is
+        // how failover re-extends a stalled height, and it already needs an n−f TimeoutCertificate to
+        // be accepted; slashing it would ban the producer that adopted the canonical branch. Both
+        // fields are inside the signed preimage, so neither can be flipped to dodge this.
+        if block_a.timeout_round.saturating_add(block_a.carried_baseline)
+            != block_b.timeout_round.saturating_add(block_b.carried_baseline) { return false; }
         if equivocation_identity_hash(height, offender, block_a)
             == equivocation_identity_hash(height, offender, block_b) { return false; }
         let pk_bytes = match Self::equivocation_offender_pk(storage, offender) {

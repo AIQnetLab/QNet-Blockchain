@@ -1760,8 +1760,45 @@ impl SimplifiedP2P {
         // (different sealed w-2) is rejected by every honest node.
         match sealed_anchor_for_window(height) {
             Some(local_anchor) if local_anchor != anchor_arr => {
-                if crate::node::is_warn() {
-                    println!("[WARN][TIMEOUT] vote_anchor_mismatch h={} voter={} action=drop", height, voter_id);
+                // Never TALLY across views — two views must not combine into one quorum. But dropping
+                // and nothing else leaves a minority node deaf: it discards every majority vote, its
+                // view can never advance, and it keeps producing on a branch no one accepts. Count
+                // distinct SIGNED foreign anchors; n−f of them proves OUR anchor is the minority one.
+                let already = FOREIGN_ANCHOR_WITNESSES.get(&(height, anchor_arr))
+                    .map(|s| s.contains(&voter_id)).unwrap_or(false);
+                if already { return; }
+                // Dedup precedes the ~5ms verify, so a flood of forged voter ids costs at most one
+                // signature check per committee member per window.
+                let probe = timeout_vote_message(height, timeout_round, &anchor_arr,
+                                                 high_qc_idx, &qc_hash_arr, tip_height, &tip_hash_arr);
+                if !self.verify_timeout_vote_signature(&voter_id, &probe, &signature) { return; }
+                // Cap distinct anchors per window: honest divergence yields one or two, while a single
+                // committee member could otherwise mint an unbounded number of map keys by signing a
+                // fresh anchor per vote. Voter sets stay bounded by committee size.
+                const MAX_FOREIGN_ANCHORS_PER_WINDOW: usize = 4;
+                {
+                    let known = FOREIGN_ANCHOR_WITNESSES.contains_key(&(height, anchor_arr));
+                    let distinct = FOREIGN_ANCHOR_WITNESSES.iter().filter(|e| e.key().0 == height).count();
+                    if !known && distinct >= MAX_FOREIGN_ANCHORS_PER_WINDOW { return; }
+                }
+                let witnesses = {
+                    let mut e = FOREIGN_ANCHOR_WITNESSES
+                        .entry((height, anchor_arr))
+                        .or_insert_with(std::collections::HashSet::new);
+                    e.insert(voter_id.clone());
+                    e.len()
+                };
+                FOREIGN_ANCHOR_WITNESSES.retain(|k, _| k.0 + 8 >= height);
+                let need = qnet_consensus::checkpoint_bft::quorum_size(committee.len());
+                if witnesses >= need {
+                    if crate::node::is_warn() {
+                        println!("[WARN][TIMEOUT] foreign_anchor_quorum win={} witnesses={} need={} action=reconcile",
+                                 height, witnesses, need);
+                    }
+                    self.request_window_anchor(height);
+                } else if crate::node::is_warn() {
+                    println!("[WARN][TIMEOUT] vote_anchor_mismatch h={} voter={} witnesses={}/{} action=drop",
+                             height, voter_id, witnesses, need);
                 }
                 return;
             }
@@ -2452,6 +2489,72 @@ impl SimplifiedP2P {
         if crate::node::is_debug() {
             println!("[DBG][EMPTY-SLOT] broadcast h={} expected={}",
                      slot_height, expected_producer);
+        }
+    }
+
+    /// Attest a block this node accepted, if it holds this height's deterministic attester slot.
+    /// The slice partitions the committee across the checkpoint window, so per-block evidence costs
+    /// about one checkpoint QC per window — the same bandwidth, delivered thirty times sooner.
+    pub fn attest_accepted_block(&self, height: u64, block_hash: [u8; 32], producer: &str) {
+        if producer == self.node_id { return; }   // self-attestation is not external evidence
+        let window = height.saturating_sub(1)
+            / qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL + 1;
+        let roster = match sorted_committee_for_window(window) {
+            Some(r) => r,
+            None => return,
+        };
+        if !crate::node::attesters_for_height(&roster, height, producer).contains(&self.node_id) {
+            return;
+        }
+
+        let preimage = crate::node::block_attestation_message(height, &block_hash);
+        let signature: Vec<u8> = {
+            use pqcrypto_mldsa::mldsa65 as dilithium3;
+            use pqcrypto_traits::sign::SecretKey as SkTrait;
+            use pqcrypto_traits::sign::DetachedSignature as SigTrait;
+            crate::node::GLOBAL_VRF_INSTANCE.lock().clone()
+                .and_then(|vrf| vrf.get_secret_key_bytes())
+                .and_then(|sk_bytes| SkTrait::from_bytes(&sk_bytes).ok()
+                    .map(|sk: dilithium3::SecretKey| {
+                        SigTrait::as_bytes(&dilithium3::detached_sign(&preimage, &sk)).to_vec()
+                    }))
+                .unwrap_or_default()
+        };
+        if signature.is_empty() { return; }
+
+        record_block_attestation(height, block_hash, self.node_id.clone());
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        let msg = NetworkMessage::BlockAttestationMsg {
+            block_height: height,
+            block_hash: block_hash.to_vec(),
+            attester_id: self.node_id.clone(),
+            signature,
+            timestamp: now,
+        };
+
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+        let peers = self.get_all_validator_addresses();
+        let quic_transport = self.quic_transport.clone();
+        let quic_enabled = self.quic_enabled.load(std::sync::atomic::Ordering::Relaxed);
+        handle.spawn(async move {
+            if !quic_enabled { return; }
+            if let Some(ref qt_lock) = quic_transport {
+                let qt = qt_lock.read().await;
+                for peer_str in &peers {
+                    let ip = peer_str.split(':').next().unwrap_or(peer_str);
+                    if let Ok(addr) = format!("{}:10876", ip).parse::<std::net::SocketAddr>() {
+                        let _ = qt.broadcast_to(addr, &msg).await;
+                    }
+                }
+            }
+        });
+        if crate::node::is_debug() {
+            println!("[DBG][ATTEST] emitted h={} committee={}", height, roster.len());
         }
     }
 

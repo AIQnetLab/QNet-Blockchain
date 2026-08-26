@@ -492,31 +492,6 @@ static BROADCAST_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_n
 /// Total-blackout counter for the per-second message kinds (see broadcast).
 static BROADCAST_BLACKOUTS: AtomicUsize = AtomicUsize::new(0);
 
-/// Failover exclusions for the next epoch (≥2 failovers in this epoch ⇒ skip).
-/// Deterministic from on-chain failover history, so every node reads the same
-/// set from macroblock N-2; bincode of Vec<ExcludedProducerEntry>.
-fn excluded_producers(storage: &Storage, mb_index: u64) -> Option<Vec<u8>> {
-    const FAILOVER_THRESHOLD: u32 = 2;
-    let epoch_start = mb_index.saturating_sub(1) * 90;
-    let epoch_end = mb_index * 90;
-    let events = storage.get_failover_history(epoch_start, 100).ok()?;
-    let mut counts: std::collections::HashMap<String, (u32, Vec<u64>)> = std::collections::HashMap::new();
-    for e in events.iter().filter(|e| e.height >= epoch_start && e.height <= epoch_end) {
-        let c = counts.entry(e.failed_producer.clone()).or_insert((0, Vec::new()));
-        c.0 += 1; c.1.push(e.height);
-    }
-    let mut excluded: Vec<qnet_state::ExcludedProducerEntry> = counts.into_iter()
-        .filter(|(_, (n, _))| *n >= FAILOVER_THRESHOLD)
-        .map(|(node_id, (n, heights))| qnet_state::ExcludedProducerEntry {
-            node_id, failover_count: n, failover_heights: heights,
-            exclusion_blocks: 90, reason: format!("failover_{}_epoch_{}", n, mb_index),
-        }).collect();
-    // HashMap drains in arbitrary order; sort so the serialized body is byte-identical
-    // on every node that seals this window (required once all committee members seal).
-    excluded.sort_by(|a, b| a.node_id.cmp(&b.node_id));
-    if excluded.is_empty() { None } else { bincode::serialize(&excluded).ok() }
-}
-
 /// Pure finalize predicate: a checkpoint is finalizable iff our local chain reached its head AND our
 /// locally-applied state at that head matches the checkpoint's QC'd state_root. NO macroblock body
 /// required — an intra-window checkpoint (head not on a /macro_interval boundary) finalizes identically,
@@ -665,7 +640,10 @@ pub async fn execute(effects: Vec<Effect>, node_id: &str, p2p: &Arc<SimplifiedP2
                 // Store (checkpoint, QC) so receivers reconstruct checkpoint.hash(), confirm
                 // it == qc.checkpoint_hash (binds this exact block), and full-verify the QC.
                 let qc_bytes = bincode::serialize(&(checkpoint.clone(), qc.clone())).unwrap_or_default();
-                let excluded = excluded_producers(storage, window);
+                // Sealed as None: the only source was each node's LOCAL failover history, so two
+                // sealers could write different bytes for one macroblock. No reader remains, and
+                // liveness exclusion must be re-derived from certified QC signers when introduced.
+                let excluded: Option<Vec<u8>> = None;
                 // Reward recipients are NOT sealed in the macroblock — apply recomputes both Super
                 // (registry + per-epoch heartbeat tally) and Light (on-chain eligibility bitmaps +
                 // deterministic roster), giving an O(1) macroblock with an identical reward root on

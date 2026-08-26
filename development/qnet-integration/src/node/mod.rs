@@ -811,12 +811,42 @@ pub fn get_expected_producer(height: u64) -> Option<(String, u64)> {
 /// None ⇒ this node hasn't computed that window's roster yet (lag/cold-join) ⇒ caller keeps the
 /// soft path (the round is already TC-certified, the block stays replayable). O(N), N ≤ 1000.
 pub fn expected_producer_for_round(height: u64, round: u64) -> Option<String> {
-    let lr = if height <= 30 { 0 } else { (height - 1) / 30 };
+    let lr = if height <= ROTATION_INTERVAL_BLOCKS { 0 }
+             else { (height - 1) / ROTATION_INTERVAL_BLOCKS };
     let entry = producer_cache::CACHED_PRODUCER_SELECTION.get(&lr)?;
     let (round0_producer, candidates) = entry.value();
     if candidates.is_empty() { return None; }
     let round0_idx = candidates.iter().position(|(id, _)| id == round0_producer)?;
     Some(candidates[(round0_idx + round as usize) % candidates.len()].0.clone())
+}
+
+/// Deterministic attester slice for `height`, partitioning a SORTED committee across the checkpoint
+/// window so each member attests about once per window. Total signatures per window then match one
+/// checkpoint QC, but the evidence arrives every block instead of every thirtieth — which is what
+/// lets a diverged branch be noticed in a block or two rather than at the next checkpoint.
+///
+/// The block's own producer is excluded: self-attestation is not external evidence. Pure function of
+/// (committee, height) — every node derives the identical set, so membership is checkable on receipt.
+pub(crate) fn attesters_for_height(committee: &[String], height: u64, producer: &str) -> Vec<String> {
+    let n = committee.len();
+    if n == 0 || height == 0 { return Vec::new(); }
+    let interval = qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL as usize;
+    // Round up so the slices cover the whole committee across one window.
+    let k = ((n + interval - 1) / interval).max(1);
+    let slot = ((height - 1) % interval as u64) as usize;
+    let mut out = Vec::with_capacity(k);
+    for i in 0..k {
+        let id = &committee[(slot * k + i) % n];
+        if id != producer && !out.contains(id) { out.push(id.clone()); }
+    }
+    out
+}
+
+/// The message an attester signs. Binds height and block hash so a signature cannot be replayed onto
+/// another block, and carries the chain tag so it cannot be replayed onto another network.
+pub(crate) fn block_attestation_message(height: u64, block_hash: &[u8; 32]) -> Vec<u8> {
+    format!("{}QNET_ATTEST:{}:{}", qnet_state::transaction::chain_tag(),
+            height, hex::encode(block_hash)).into_bytes()
 }
 
 /// The producer public key a block-validity check must resolve: RAM first, then the COMMITTED
@@ -1828,9 +1858,13 @@ static LAST_VRF_KEY_ANNOUNCE_HEIGHT: AtomicU64 = AtomicU64::new(0);
 // This prevents round mismatch between nodes
 pub static LAST_FINALIZED_CONSENSUS_ROUND: AtomicU64 = AtomicU64::new(0);
 
-/// Highest microblock height this node has ever signed as producer. Mirrors the durable
-/// metadata watermark; monotone, never lowered by rollback.
+/// Highest (height, round) this node has ever signed as producer, ordered ROUND-first. Mirrors the
+/// durable metadata mark; monotone, never lowered by rollback. Round-first is what lets a node that
+/// rolled back re-extend the branch it adopted: a strictly higher round is a different (height,
+/// round), so it is not equivocation — and a higher round needs an n−f TimeoutCertificate to be
+/// accepted, so this cannot mint unbounded variants at one height.
 pub static HIGHEST_SIGNED_HEIGHT: AtomicU64 = AtomicU64::new(0);
+pub static HIGHEST_SIGNED_ROUND: AtomicU64 = AtomicU64::new(0);
 
 // v3.33: FORMAL FINALITY — blocks at or below this height are IRREVERSIBLE.
 // Updated when macroblock is saved (macroblock covers 90 microblocks).
@@ -2600,6 +2634,13 @@ pub fn record_block_equivocation(
     header_a: qnet_state::EquivocationHeader,
     header_b: qnet_state::EquivocationHeader,
 ) {
+    // Mirrors verify_equivocation_proof: the offence is two bodies at one (height, ABSOLUTE round),
+    // where the view is timeout_round + carried_baseline. A body in a different view is failover
+    // re-extending a stalled height and already needs an n−f TimeoutCertificate to be accepted.
+    if header_a.timeout_round.saturating_add(header_a.carried_baseline)
+        != header_b.timeout_round.saturating_add(header_b.carried_baseline) {
+        return;
+    }
     let hash_a = equivocation_identity_hash(height, producer_id, &header_a);
     let hash_b = equivocation_identity_hash(height, producer_id, &header_b);
     if hash_a == hash_b {
@@ -5486,6 +5527,93 @@ mod tests {
                 "entropy must come from the N-2 macroblock");
     }
 
+    /// An absent seed must ABSTAIN, never elect from a default. A zero seed is a valid-LOOKING seed:
+    /// nodes holding the real one elect a different leader, both produce, and the chain forks with no
+    /// adversary present. The rule was stated in this file's comments long before the code obeyed it.
+    #[test]
+    fn election_abstains_when_the_seed_is_absent() {
+        let src = include_str!("leader.rs");
+        let i = src.find("let vrf_entropy = {").expect("entropy derivation");
+        let (mut depth, mut end) = (0i32, i);
+        for (k, ch) in src[i..].char_indices() {
+            if ch == '{' { depth += 1; }
+            else if ch == '}' { depth -= 1; if depth == 0 { end = i + k; break; } }
+        }
+        let body: String = src[i..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!body.contains("=> [0u8; 32]"),
+                "a match arm yields a DEFAULT seed — an absent seed must abstain, never elect");
+        assert!(body.contains("None => return String::new()"),
+                "the absent-seed arm must return the abstain sentinel every caller already honours");
+    }
+
+    /// Slice membership is checked on receipt, so a node-dependent slice would drop honest
+    /// attestations and admit none. One window must also cover the committee at about one
+    /// checkpoint quorum's worth of signatures — that is the whole per-block-evidence argument.
+    #[test]
+    fn attester_slices_are_pure_and_cover_one_committee_per_window() {
+        let committee: Vec<String> = (0..1000).map(|i| format!("n{:04}", i)).collect();
+        let interval = qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL;
+
+        for h in [1u64, 2, 29, 30, 31, 12_345] {
+            assert_eq!(super::attesters_for_height(&committee, h, ""),
+                       super::attesters_for_height(&committee, h, ""),
+                       "the slice must be a pure function of (committee, height)");
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        let mut total = 0usize;
+        for h in 1..=interval {
+            let slice = super::attesters_for_height(&committee, h, "");
+            total += slice.len();
+            for id in slice { seen.insert(id); }
+        }
+        assert_eq!(seen.len(), committee.len(), "one window must cover the whole committee");
+        assert!(total <= committee.len() + interval as usize,
+                "per-window attestations {} must stay near committee size {}", total, committee.len());
+    }
+
+    /// Attesting your own block is not external evidence, so a producer is never in its own slice.
+    #[test]
+    fn a_producer_is_never_in_its_own_attester_slice() {
+        let committee: Vec<String> = (0..5).map(|i| format!("n{}", i)).collect();
+        for h in 1..=60u64 {
+            for p in &committee {
+                assert!(!super::attesters_for_height(&committee, h, p).contains(p),
+                        "producer {} attested its own block at h={}", p, h);
+            }
+        }
+    }
+
+    /// The rotation interval must have ONE source. A literal beside the constant keeps working until
+    /// the constant moves, and then the two halves of the election disagree — a fork with no
+    /// adversary present.
+    #[test]
+    fn rotation_arithmetic_never_uses_a_literal() {
+        let src = include_str!("leader.rs");
+        let code: String = src.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for bad in ["* 30", "/ 30", "% 30", "30u64", "<= 30"] {
+            assert!(!code.contains(bad),
+                    "rotation arithmetic on a literal ({bad}) beside ROTATION_INTERVAL_BLOCKS");
+        }
+    }
+
+    /// The bootstrap committee is five nodes; it must still put an attester on most heights.
+    #[test]
+    fn a_five_node_committee_still_yields_attesters() {
+        let committee: Vec<String> = (0..5).map(|i| format!("n{}", i)).collect();
+        let covered = (1..=30u64)
+            .filter(|h| !super::attesters_for_height(&committee, *h, "n0").is_empty())
+            .count();
+        assert!(covered >= 24, "expected most heights to carry an attester, got {}", covered);
+    }
+
     /// FAILOVER_COMMITTEE_CACHE memoizes the failover committee on (window, last_sealed_mb_index) on
     /// the stated premise that the seal frontier "moves exactly when the answer can", and the memo is
     /// read BEFORE roster_mode. So roster_mode's answer must depend on L and on nothing else. Making
@@ -6797,6 +6925,39 @@ mod tests {
         b.signature = eqv_sign_block(&sk, h, node, &b);
         assert!(BlockchainNode::verify_equivocation_proof(&_st, node, h, &a, &b),
                 "same hash, different beacon contribution IS a double-sign");
+    }
+
+    /// A different body at a HIGHER round is view change re-extending a stalled height, not a double
+    /// sign — and a higher round already needs an n−f TimeoutCertificate to be accepted. Slashing it
+    /// turned every rollback into a permanent lockout at the heights the producer had already signed.
+    #[test]
+    fn eqv_same_height_higher_round_is_not_equivocation() {
+        let node = "eqv_test_blk_round";
+        let (_st, _d) = eqv_storage();
+        let (_pk, sk) = eqv_gen_and_register(&_st, node);
+        let h = 100u64;
+        let mut a = eqv_mk_header(1000, 1, 0);
+        let mut b = eqv_mk_header(2000, 2, 7);
+        a.signature = eqv_sign_block(&sk, h, node, &a);
+        b.signature = eqv_sign_block(&sk, h, node, &b);
+        assert!(!BlockchainNode::verify_equivocation_proof(&_st, node, h, &a, &b),
+                "two views at one height is failover, never a double-sign");
+        // Same view reached by a DIFFERENT (relative, baseline) split: 5+0 == 0+5, so these two
+        // bodies sit in ONE view and must stay slashable. Keying on the relative round alone
+        // would wave this through.
+        a.timeout_round = 5; a.carried_baseline = 0;
+        b.timeout_round = 0; b.carried_baseline = 5;
+        a.signature = eqv_sign_block(&sk, h, node, &a);
+        b.signature = eqv_sign_block(&sk, h, node, &b);
+        assert!(BlockchainNode::verify_equivocation_proof(&_st, node, h, &a, &b),
+                "one absolute view, two bodies — must remain a double-sign");
+        // The mirror error: one relative round split across two baselines is TWO views, not one.
+        a.timeout_round = 2; a.carried_baseline = 0;
+        b.timeout_round = 2; b.carried_baseline = 30;
+        a.signature = eqv_sign_block(&sk, h, node, &a);
+        b.signature = eqv_sign_block(&sk, h, node, &b);
+        assert!(!BlockchainNode::verify_equivocation_proof(&_st, node, h, &a, &b),
+                "views 2 and 32 are different views — not a double-sign");
     }
 
     #[test]

@@ -1997,29 +1997,38 @@ impl PersistentStorage {
         }
     }
 
-    /// Highest microblock height this node has ever SIGNED as producer. Monotone and durable: it is
-    /// the only thing standing between a rollback-then-re-produce and a permanent, chain-committed
-    /// equivocation ban, which neither fork-choice nor certification can undo. Written with fsync
-    /// BEFORE the signature is produced, so a crash in between costs one skipped slot rather than a
-    /// second signature at a height.
-    pub fn save_highest_signed_height(&self, height: u64) -> IntegrationResult<()> {
+    /// Highest (height, round) this node has ever SIGNED as producer, ordered ROUND-first. Monotone
+    /// and durable: the only thing standing between a rollback-then-re-produce and a permanent,
+    /// chain-committed equivocation ban, which neither fork-choice nor certification can undo.
+    /// Written with fsync BEFORE the signature is produced, so a crash in between costs one skipped
+    /// slot rather than a second signature at one (height, round).
+    pub fn save_highest_signed_mark(&self, height: u64, round: u64) -> IntegrationResult<()> {
         let metadata_cf = self.db.cf_handle("metadata")
             .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
         let mut opts = rocksdb::WriteOptions::default();
         opts.set_sync(true);
-        self.db.put_cf_opt(&metadata_cf, HIGHEST_SIGNED_HEIGHT_KEY, &height.to_be_bytes(), &opts)?;
+        let mut buf = [0u8; 16];
+        buf[..8].copy_from_slice(&height.to_be_bytes());
+        buf[8..].copy_from_slice(&round.to_be_bytes());
+        self.db.put_cf_opt(&metadata_cf, HIGHEST_SIGNED_HEIGHT_KEY, &buf, &opts)?;
         Ok(())
     }
 
-    /// Reads the durable anti-double-sign watermark. None means this node has never produced.
-    pub fn load_highest_signed_height(&self) -> IntegrationResult<Option<u64>> {
+    /// Reads the durable anti-double-sign mark as (height, round). None means never produced.
+    /// A legacy 8-byte record predates round-keying and reads back as round 0 — the round every
+    /// pre-upgrade signature actually used, so the ordering stays sound across the upgrade.
+    pub fn load_highest_signed_mark(&self) -> IntegrationResult<Option<(u64, u64)>> {
         let metadata_cf = self.db.cf_handle("metadata")
             .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
         match self.db.get_cf(&metadata_cf, HIGHEST_SIGNED_HEIGHT_KEY)? {
+            Some(data) if data.len() == 16 => {
+                let mut h = [0u8; 8]; h.copy_from_slice(&data[..8]);
+                let mut r = [0u8; 8]; r.copy_from_slice(&data[8..]);
+                Ok(Some((u64::from_be_bytes(h), u64::from_be_bytes(r))))
+            }
             Some(data) if data.len() == 8 => {
-                let mut b = [0u8; 8];
-                b.copy_from_slice(&data);
-                Ok(Some(u64::from_be_bytes(b)))
+                let mut h = [0u8; 8]; h.copy_from_slice(&data);
+                Ok(Some((u64::from_be_bytes(h), 0)))
             }
             _ => Ok(None),
         }

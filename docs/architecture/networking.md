@@ -141,6 +141,7 @@ Related request/response pairs share one row below.
 | `ProducerReady` / `ReadyAck` | 0 | Round-change handshake; fires only at failover round above 0, both signed |
 | `ProducerHeartbeat` | 0 | Signed producer liveness beacon over the wire-supplied anchor hash |
 | `BlockRejection` | 0 | Signed observer report of a rejected block, aggregated per (height, source) |
+| `BlockAttestation` | 0 | Signed confirmation of an accepted block, emitted only by that height's committee slice |
 | `VrfLeaderClaim` / `VrfKeyAnnounce` | 0 | Self-verifiable VRF leadership claim with gossip TTL; self-signed VRF public-key announcement |
 | `RequestConsensusState` | 0 | Ask a peer for consensus state at a round |
 | `GenesisCheckpointSig` / `GenesisCheckpoint` / `RequestGenesisCheckpoint` | 0 | A genesis node's partial signature, the quorum-signed capsule, and the cold-join pull for it |

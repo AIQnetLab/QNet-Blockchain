@@ -250,7 +250,14 @@ it can change block identity. Block production, block signing, timeout voting an
 
 A producer will not produce block `H` unless it holds `H-1`; it pre-checks storage at cycle entry and yields if the target
 height is already filled; and it re-checks authority immediately before any state mutation, yielding if the certified round
-advanced past the round it started with. It also refuses to build at or below its own finality marker. Tolerated sync lag
+advanced past the round it started with. It also refuses to build at or below its own finality marker.
+
+A durable anti-double-sign mark, ordered view-first as `(absolute round, height)`, is written with `fsync` before the
+signature is produced, so a crash between the two costs one slot rather than a second signature. A block is signable when
+that pair is strictly new: within one view heights must climb, and a strictly higher view may re-sign any height. The
+higher view is what lets a producer that rolled back re-extend the branch it adopted — a different view at one height is
+failover, not a double sign, and it already needs an n-f timeout certificate to be accepted. Keying the mark on height
+alone would bar such a producer from every height it had signed on the branch it abandoned. Tolerated sync lag
 before abstaining is 2 blocks in round 0, 3 in round 1, 5 in round 2 and above. Every one of these reads local state only:
 the right to produce never depends on observing other nodes, because an input shared by every member of a connected mesh
 cannot distinguish isolation from a silent observation channel. The rotation-vote path is independent of these, so a node
@@ -410,9 +417,9 @@ every other sealer's — `seal_deferred window=… reason=parent_absent` when it
 `previous_hash` is taken from, and `reason=ban_set_underivable` when the window's cumulative equivocation ban set cannot
 be computed. The window is left to the quorum that can derive it and the deferring node adopts the sealed object through
 sync; two nodes storing different bytes under one macroblock key would poison the roster and beacon source for every
-later epoch. A sealed body also carries `excluded_producers_for_next_epoch`, the sealing node's own report of producers
-its local failover-event log saw fail at least twice in the epoch, stamped with an exclusion span of 90 blocks and sorted
-by node id. It sits outside `epoch_commitment`; the candidate roster is derived from `eligible_producers` alone.
+later epoch. Nothing node-local enters a sealed body for the same reason: the candidate roster is derived from
+`eligible_producers` alone, and a liveness exclusion would be admissible only if it were itself derived from certified,
+replayable data that every sealer reproduces byte for byte.
 
 `verify_v2_macroblock` is the single authority for macroblock acceptance, and it resolves in this order.
 
@@ -487,8 +494,15 @@ going terminal.
 votes are re-gossiped to a rotated subset of the node's connected peers — self and the original voter excluded, with no
 committee filter on the recipients — with fanout 5 when the window committee exceeds 100 members and 3 otherwise. The
 subset is rotated by `(window XOR round) % peers`, so different votes pick different peers and coverage accumulates over
-the wave. A voter re-voting with a *different anchor* for the same `(window, round)` is recorded as equivocation; a re-vote
-with an advanced tip or high-QC is a legitimate rate-bounded update.
+the wave. A re-vote with an advanced tip or high-QC is a legitimate rate-bounded update.
+
+A vote whose anchor differs from the receiver's sealed `w-2` is never tallied — two views must not combine into one
+quorum — but it is not evidence either, because an honest node legitimately replaces a locally sealed macroblock with the
+network's during reconciliation. Dropping it and doing nothing more would leave a node on a minority view deaf: it would
+discard exactly the messages carrying the news that the view moved. Distinct *signed* foreign anchors are therefore
+counted per `(window, anchor)`, and n-f of them is proof that the receiver's own anchor is the minority one, at which
+point it pulls the window anchor. Signature verification runs only for an anchor-voter pair not already counted, and
+distinct anchors per window are capped, so neither a replay nor a flood of fresh anchors buys work.
 
 ### Certificates and round advance
 
@@ -541,6 +555,31 @@ Equivocation is detected within one round, so the tight detection window bounds 
 evidence horizon is deliberately a full epoch: sizing it for vote churn would give a sound proof only minutes to reach a
 producer.
 
+## Block attestation
+
+Between checkpoints a leader streams blocks that carry no quorum signatures, so without a second signal a branch nobody
+follows looks exactly like a branch everybody follows until the window closes. Block attestation supplies that signal at
+per-block granularity.
+
+The committee is partitioned across the checkpoint window rather than polled in full every block. For a height, the
+attester slice is `k = ceil(committee / CHECKPOINT_INTERVAL)` members taken from the sorted roster at offset
+`slot * k`, where `slot = (height-1) % CHECKPOINT_INTERVAL`, with the block's own producer excluded because
+self-attestation is not external evidence. Each member therefore attests about once per window, and the signatures spent
+per window are close to those in a single checkpoint quorum certificate — the same bandwidth, delivered a window
+earlier. The slice is a pure function of committee and height, so membership is checkable on receipt.
+
+An attester signs `chain_tag || "QNET_ATTEST:" || height || block_hash` with its ML-DSA-65 key on accepting the block and
+gossips it to the validator set. A receiver admits the message only from a member of that height's slice, refuses a pair
+it has already counted and a fresh block hash once the per-height cap is reached — both before the signature verify, so
+neither a replay nor a hash flood buys work — and then verifies the signature against the consensus key registry.
+
+Two properties are deliberate. Attestation **never gates production**: an input shared by every node cannot distinguish
+isolation from a dead attestation channel, so yielding on a shortfall would stop every producer at once on a single
+symmetric fault. Attestation **never enters fork choice**: gossip is partial, so counts differ between nodes, and a
+node-dependent count cannot select a branch. Its one action is a pull — when a node's own block at a height carries no
+attestations while a competing hash carries `f+1`, it requests the window anchor, and the deterministic rules below
+decide the branch once the data arrives.
+
 ## Fork choice
 
 At a stored height above finality, `maybe_supersede_by_certified_round` decides between the block a node holds and an
@@ -587,7 +626,7 @@ The pipeline carries its own bounded machinery so a contested or gappy tail is r
 | Fork-source peer cooldown — a peer that supplied a forked-branch block is deprioritised by the sync peer selector, falling back to the full set if every candidate is in cooldown | `FORKED_PEER_COOLDOWN_MS` = 5 minutes |
 | Missing-parent request, deduplicated per height | `MISSING_BLOCK_REQUEST_TTL_MS` = 30 s |
 | Range repair, preferred over a cascade of single-height requests once the gap is large enough | `RANGE_SYNC_GAP_THRESHOLD` = 5 blocks, `RANGE_SYNC_WINDOW` = 500 (one serve-side batch), `RANGE_SYNC_RETRY_MS` = 10 s |
-| Deferred-block buffer, keyed by parent hash so siblings racing for one slot coexist instead of overwriting each other | `DEFERRED_MAX` = 2000, `DEFERRED_MAX_PER_PRODUCER` = 2 × `ROTATION_INTERVAL_BLOCKS`, `DEFERRED_MAX_AGE_SECS` = 120 |
+| Deferred-block buffer, keyed by parent hash so siblings racing for one slot coexist instead of overwriting each other. At either cap the entry furthest from the tip is evicted and the arrival admitted, since the arrival is the one closer to what the node needs next | `DEFERRED_MAX` = 2000, `DEFERRED_MAX_PER_PRODUCER` = 2 × `ROTATION_INTERVAL_BLOCKS`, `DEFERRED_MAX_AGE_SECS` = 120 |
 | Gossip acceptance horizon above the local chain height | `GOSSIP_HORIZON` = 200 blocks |
 
 Hash-chain breaks are witnessed per `(height, peer)` rather than acted on from a single report, and the pipeline tracks
