@@ -6,6 +6,8 @@ use serde_json::Value;
 
 /// Flat request body accepted by `POST /api/v1/transaction` (node
 /// `TransactionRequest`). Server sets timestamp/hash/tx_type itself.
+/// `dilithium_public_key`: hex(raw 1952 B) on an account's FIRST tx; None
+/// afterwards — the node rehydrates the elided pk from committed state.
 #[derive(Serialize, Debug)]
 pub struct TxRequest {
     pub from: String,
@@ -15,7 +17,8 @@ pub struct TxRequest {
     pub gas_limit: u64,
     pub nonce: u64,
     pub dilithium_signature: String,
-    pub dilithium_public_key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dilithium_public_key: Option<String>,
 }
 
 #[derive(Clone)]

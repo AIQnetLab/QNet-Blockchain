@@ -51,12 +51,23 @@ qnet-loadtest \
   --target-tps 0 \           # 0 = as fast as free accounts allow
   --duration 120 \
   --amount 1 --gas-price 10 --gas-limit 10000 \
+  --concurrency 256 \        # max in-flight submits; bounds node-side sockets
+  --stale-secs 30 \          # un-included this long => treat as dropped, reclaim
   --proof-sample 20 \        # P3b (needs logs_root deployed); 0 to skip
   --out loadtest_report.json
 ```
 For distributed ingress, pass all node RPCs to `--nodes` (submissions round-robin).
 Run on a genesis node so localhost bypasses the rate limit; for a fully
 off-validator ceiling, run on a separate box and whitelist its IP.
+
+**Raise the node's file-descriptor limit before loading it.** Docker defaults to
+`nofile=1024`; under submit load RocksDB runs out of descriptors, block writes fail
+(`put_batch failed: Too many open files`) and the node forks off the chain. Set it
+once per host in `/etc/docker/daemon.json` so it survives restarts:
+```json
+{ "default-ulimits": { "nofile": { "Name": "nofile", "Soft": 524288, "Hard": 524288 } } }
+```
+then `systemctl restart docker`. Verify: `grep "Max open files" /proc/$(docker inspect -f '{{.State.Pid}}' <container>)/limits`.
 
 ## Output
 A human summary plus `loadtest_report.json`: throughput (submitted / confirmed /
@@ -75,7 +86,8 @@ is CPU-bound; if not, it is consensus/network-bound.
 
 ## Honest caveats (disclose in any published result)
 - Hard-finality latency is an **upper bound** (sampled at first-observed-final;
-  includes tracker poll lag).
+  includes tracker poll lag). A run whose `finalized` count is 0 means the chain
+  was not sealing macroblocks — report it as a failed run, never as a TPS result.
 - Confirmed TPS is capped by `funded_accounts × block_rate` — fund enough accounts.
 - If the client runs on the validators, signing shares node CPU (state where it ran).
 - Network is single-shard in the current configuration.

@@ -22,8 +22,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
-/// An accepted tx still un-included past this is treated as mempool-dropped and its account reclaimed.
-const STALE_INFLIGHT: Duration = Duration::from_secs(30);
+// (stale threshold is --stale-secs: at high TPS the tracker's full-block JSON scans lag,
+//  and a fixed 30s would misclassify slow-tracked txs as dropped → duplicate-nonce churn)
 
 #[derive(Parser, Debug)]
 #[command(name = "qnet-loadtest", about = "QNet real-/transaction confirmed-TPS + finality-latency harness")]
@@ -63,6 +63,14 @@ struct Args {
     /// 0 (default) = no assumption: finality is counted only when the node itself reports it.
     #[arg(long, default_value_t = 0)]
     committee: u64,
+    /// An accepted tx still un-included past this many seconds is treated as
+    /// mempool-dropped and its account reclaimed (resubmits the same nonce).
+    #[arg(long, default_value_t = 30)]
+    stale_secs: u64,
+    /// Max concurrent in-flight HTTP submissions. Bounds the node-side socket/fd
+    /// count — unbounded spawning exhausted the node's fd limit and broke RocksDB.
+    #[arg(long, default_value_t = 256)]
+    concurrency: usize,
     /// JSON report output path.
     #[arg(long, default_value = "loadtest_report.json")]
     out: String,
@@ -71,7 +79,6 @@ struct Args {
 struct Acct {
     addr: String,
     pk_hex: String,
-    pk_bytes: Vec<u8>,
     sk_bytes: Vec<u8>,
 }
 
@@ -99,7 +106,7 @@ async fn main() {
     let accounts: Arc<Vec<Acct>> = Arc::new(
         (0..args.accounts).map(|i| {
             let (pk, sk) = derive::keypair_from_xi(&derive::loadtest_xi(i));
-            Acct { addr: derive::eon_from_pubkey(&pk), pk_hex: hex::encode(&pk), pk_bytes: pk, sk_bytes: sk }
+            Acct { addr: derive::eon_from_pubkey(&pk), pk_hex: hex::encode(&pk), sk_bytes: sk }
         }).collect(),
     );
     let n = accounts.len();
@@ -144,6 +151,7 @@ async fn main() {
         let dropped = dropped.clone();
         let free_tx = free_tx.clone();
         let poll = Duration::from_millis(args.poll_ms);
+        let stale_inflight = Duration::from_secs(args.stale_secs);
         let sample_cap = args.proof_sample as usize;
         let committee_fallback = args.committee as usize;
         tokio::spawn(async move {
@@ -200,12 +208,12 @@ async fn main() {
                     *pf = still;
                 }
                 // Reclaim accounts whose accepted tx was mempool-dropped without inclusion (in-flight past
-                // STALE_INFLIGHT). The tracker scans every height and never lags that long, so a still-present
-                // entry was dropped, not applied → free it (resubmits the same nonce) to keep the pool full.
+                // --stale-secs). A still-present entry that old was dropped, not applied → free it
+                // (resubmits the same nonce) to keep the pool full.
                 {
                     let mut fl = inflight.lock().await;
                     let stale: Vec<(String, usize)> = fl.iter()
-                        .filter(|(_, inf)| inf.submit.elapsed() > STALE_INFLIGHT)
+                        .filter(|(_, inf)| inf.submit.elapsed() > stale_inflight)
                         .map(|(h, inf)| (h.clone(), inf.idx)).collect();
                     for (h, idx) in stale {
                         fl.remove(&h);
@@ -225,6 +233,7 @@ async fn main() {
         Some(tokio::time::interval(Duration::from_secs_f64(1.0 / args.target_tps as f64)))
     } else { None };
 
+    let http_gate = Arc::new(tokio::sync::Semaphore::new(args.concurrency));
     loop {
         if Instant::now() >= submit_deadline { break; }
         let idx = tokio::select! {
@@ -232,6 +241,11 @@ async fn main() {
             v = free_rx.recv() => match v { Some(i) => i, None => break },
         };
         if let Some(t) = ticker.as_mut() { t.tick().await; }
+        // Acquire BEFORE spawning so the submit loop itself back-pressures.
+        let permit = match http_gate.clone().acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => break,
+        };
 
         let accounts = accounts.clone();
         let clients = clients.clone();
@@ -244,6 +258,7 @@ async fn main() {
         let (amount, gas_price, gas_limit) = (args.amount, args.gas_price, args.gas_limit);
 
         tokio::spawn(async move {
+            let _permit = permit; // held until the HTTP round-trip completes
             let to_idx = {
                 let mut r = rand::thread_rng();
                 let mut j = r.gen_range(0..accounts.len());
@@ -252,18 +267,22 @@ async fn main() {
             };
             let from = &accounts[idx];
             let to = &accounts[to_idx];
-            let nonce = committed[idx].load(Ordering::SeqCst) + 1;
+            let committed_nonce = committed[idx].load(Ordering::SeqCst);
+            let nonce = committed_nonce + 1;
             let msg = derive::transfer_message(&from.addr, &to.addr, amount, nonce, gas_price, gas_limit);
-            let sig = match derive::sign_wire(msg.as_bytes(), &from.sk_bytes, &from.pk_bytes) {
+            let sig = match derive::sign_wire(msg.as_bytes(), &from.sk_bytes) {
                 Ok(s) => s,
                 Err(_) => { errors.fetch_add(1, Ordering::SeqCst); free_tx.send(idx).ok(); return; }
             };
+            // ELISION: after the account's first tx APPLIES, its pk is committed in state
+            // (store-on-first-use) and the node rehydrates it — stop shipping the 1952 B key.
+            let pk = if committed_nonce == 0 { Some(from.pk_hex.clone()) } else { None };
             let req = net::TxRequest {
                 from: from.addr.clone(),
                 to: to.addr.clone(),
                 amount, gas_price, gas_limit, nonce,
                 dilithium_signature: sig,
-                dilithium_public_key: from.pk_hex.clone(),
+                dilithium_public_key: pk,
             };
             let ci = (rr.fetch_add(1, Ordering::Relaxed) as usize) % clients.len();
             match clients[ci].submit_tx(&req).await {

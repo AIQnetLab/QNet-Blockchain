@@ -5,8 +5,8 @@
 //!           crypto/genesis_key.rs::derive_mldsa65_from_xi).
 //! ADDRESS = SHA512(pk) formatted `{19}eon{15}{8-checksum}` (== node
 //!           crypto/solana_derivation.rs::eon_from_qnet_dilithium_pubkey).
-//! SIGN    = pqcrypto-mldsa combined SignedMessage (`sign`/`open`), the exact
-//!           mode node.rs::verify_user_tx_dilithium expects (NOT detached).
+//! SIGN    = raw detached ML-DSA-65 signature, hex on the wire (node
+//!           verify_user_tx_dilithium: sig 3309 B + pk 1952 B, verify_detached).
 //! The fips204→pqcrypto byte-compatibility is proven by the node's own boot KAT.
 
 use sha2::{Digest as _, Sha512};
@@ -14,10 +14,11 @@ use sha3::Sha3_256;
 use fips204::ml_dsa_65;
 use fips204::traits::{KeyGen, SerDes};
 use pqcrypto_mldsa::mldsa65;
-use pqcrypto_traits::sign::{SecretKey as _, SignedMessage as _};
+use pqcrypto_traits::sign::{DetachedSignature as _, SecretKey as _};
 
 pub const MLDSA65_PK_LEN: usize = 1952;
 pub const MLDSA65_SK_LEN: usize = 4032;
+pub const MLDSA65_SIG_LEN: usize = 3309;
 
 /// KeyGen-seed domain for the loadtest account pool. genesis.rs derives the
 /// funded addresses from the SAME string, so funded address == signing key.
@@ -70,22 +71,14 @@ pub fn transfer_message(
         QNET_CHAIN_TAG, from, to, amount, nonce, gas_price, gas_limit)
 }
 
-/// Produce the node wire signature string:
-/// combined = u32le(len sm) || sm || u32le(len pk) || pk ;
-/// sig = "dilithium_sig_" + hex(pk) + "_" + base64std(combined).
-/// `sm` is the pqcrypto combined SignedMessage (verified node-side via `open`).
-pub fn sign_wire(msg: &[u8], sk_bytes: &[u8], pk_bytes: &[u8]) -> Result<String, String> {
-    use base64::Engine as _;
+/// Node wire signature: hex of the RAW 3309-byte detached ML-DSA-65 signature.
+/// The REST layer hex-decodes it; verify_user_tx_dilithium requires exactly
+/// sig==3309 B (+ pk==1952 B, on the wire or rehydrated from committed state).
+pub fn sign_wire(msg: &[u8], sk_bytes: &[u8]) -> Result<String, String> {
     let sk = mldsa65::SecretKey::from_bytes(sk_bytes).map_err(|e| format!("sk_parse {:?}", e))?;
-    let sm = mldsa65::sign(msg, &sk);
-    let sm_bytes = sm.as_bytes();
-    let mut combined = Vec::with_capacity(8 + sm_bytes.len() + pk_bytes.len());
-    combined.extend_from_slice(&(sm_bytes.len() as u32).to_le_bytes());
-    combined.extend_from_slice(sm_bytes);
-    combined.extend_from_slice(&(pk_bytes.len() as u32).to_le_bytes());
-    combined.extend_from_slice(pk_bytes);
-    let b64 = base64::engine::general_purpose::STANDARD.encode(&combined);
-    Ok(format!("dilithium_sig_{}_{}", hex::encode(pk_bytes), b64))
+    let sig = mldsa65::detached_sign(msg, &sk);
+    debug_assert_eq!(sig.as_bytes().len(), MLDSA65_SIG_LEN);
+    Ok(hex::encode(sig.as_bytes()))
 }
 
 #[cfg(test)]
@@ -112,16 +105,18 @@ mod tests {
         assert_eq!(eon_from_pubkey(&pk), "d9fa370374e24333242eon847d1d354dcd87fe873823e");
     }
 
-    /// fips204-derived keys must sign+open under the pqcrypto-mldsa path the node verifies with.
+    /// fips204-derived keys must produce a detached sig that verify_detached accepts —
+    /// the exact node-side check (verify_user_tx_dilithium_inner).
     #[test]
-    fn keygen_signs_and_opens() {
+    fn keygen_signs_detached_and_verifies() {
         let (pk_b, sk_b) = keypair_from_xi(&loadtest_xi(7));
-        let sk = mldsa65::SecretKey::from_bytes(&sk_b).unwrap();
         let pk = mldsa65::PublicKey::from_bytes(&pk_b).unwrap();
         let msg = transfer_message("aaa", "bbb", 1, 1, 10, 10_000);
-        let sm = mldsa65::sign(msg.as_bytes(), &sk);
-        let opened = mldsa65::open(&sm, &pk).expect("open must succeed");
-        assert_eq!(opened, msg.as_bytes());
+        let sig_hex = sign_wire(msg.as_bytes(), &sk_b).unwrap();
+        let sig_bytes = hex::decode(&sig_hex).unwrap();
+        assert_eq!(sig_bytes.len(), MLDSA65_SIG_LEN);
+        let sig = mldsa65::DetachedSignature::from_bytes(&sig_bytes).unwrap();
+        mldsa65::verify_detached_signature(&sig, msg.as_bytes(), &pk).expect("must verify");
     }
 
     #[test]
@@ -131,7 +126,9 @@ mod tests {
         assert_eq!(a.len(), 45);
         assert_eq!(&a[19..22], "eon");
         assert_eq!(a, eon_from_pubkey(&pk)); // deterministic
-        assert!(sign_wire(b"m", &keypair_from_xi(&loadtest_xi(0)).1, &pk).unwrap()
-            .starts_with("dilithium_sig_"));
+        // hex(3309 B) = 6618 chars, all lowercase hex
+        let s = sign_wire(b"m", &keypair_from_xi(&loadtest_xi(0)).1).unwrap();
+        assert_eq!(s.len(), MLDSA65_SIG_LEN * 2);
+        assert!(s.bytes().all(|c| c.is_ascii_hexdigit()));
     }
 }
