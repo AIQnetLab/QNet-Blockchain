@@ -1024,15 +1024,21 @@ impl SimplifiedP2P {
                             .filter(|(_, c)| c.is_none())
                             .map(|(i, _)| i)
                             .collect();
-                        
-                        // Add missing parity indices
-                        let parity_missing: Vec<usize> = assembly.parity_chunks.iter()
-                            .enumerate()
-                            .filter(|(_, c)| c.is_none())
-                            .map(|(i, _)| total_chunks + i)
-                            .collect();
-                        missing_indices.extend(parity_missing);
-                        
+
+                        // Cert-only gap: data already reconstructable, so ONE cert-bearing
+                        // chunk (any data chunk) suffices — never re-pull the whole block.
+                        if total_received >= required && !cert_present {
+                            missing_indices.truncate(1);
+                        } else {
+                            // Add missing parity indices
+                            let parity_missing: Vec<usize> = assembly.parity_chunks.iter()
+                                .enumerate()
+                                .filter(|(_, c)| c.is_none())
+                                .map(|(i, _)| total_chunks + i)
+                                .collect();
+                            missing_indices.extend(parity_missing);
+                        }
+
                         if !missing_indices.is_empty() {
                             assemblies_to_repair.push((height, missing_indices, total_received, required));
                         }
@@ -1066,35 +1072,47 @@ impl SimplifiedP2P {
                         continue;
                     }
                     
-                    // Send repair requests via QUIC
+                    // Send repair requests via QUIC. Indices are SHARDED across peers (peer i
+                    // takes every n-th index) — the old identical-list-to-every-peer tripled
+                    // repair traffic — and each ask is capped to the serve-side byte budget so
+                    // it can never be truncated into an ask-everything retry loop.
+                    const REPAIR_ASK_MAX_CHUNKS: usize = 16; // 16 x 512 KB = serve-side MAX_REPAIR_BYTES
                     if quic_enabled.load(std::sync::atomic::Ordering::Relaxed) {
                         if let Some(ref transport) = quic_transport {
                             let transport_guard = transport.read().await;
-                            
-                            for peer_addr in &repair_targets {
-                                // Build repair request message
+                            let n = repair_targets.len();
+                            // Rotate shard->peer by attempt so a peer that lacks its slice
+                            // is not asked for the same slice on every retry.
+                            let att = shred_protocol_assemblies.get(&height)
+                                .map(|a| a.retransmit_attempts as usize).unwrap_or(0);
+
+                            for (pi, peer_addr) in repair_targets.iter().enumerate() {
+                                let shard: Vec<usize> = missing_indices.iter()
+                                    .skip((pi + att) % n).step_by(n).take(REPAIR_ASK_MAX_CHUNKS)
+                                    .copied().collect();
+                                if shard.is_empty() { continue; }
                                 let request = NetworkMessage::RequestMissingChunks {
                                     block_height: height,
-                                    missing_indices: missing_indices.clone(),
+                                    missing_indices: shard,
                                     requester_id: node_id.clone(),
                                     timestamp: std::time::SystemTime::now()
                                         .duration_since(std::time::UNIX_EPOCH)
                                         .unwrap_or_default()
                                         .as_secs(),
                                 };
-                                
+
                                 // Parse peer address
                                 let parts: Vec<&str> = peer_addr.split(':').collect();
                                 if parts.len() == 2 {
                                     if let (Ok(ip), Ok(port)) = (parts[0].parse::<std::net::IpAddr>(), parts[1].parse::<u16>()) {
                                         let quic_port = port.saturating_add(crate::quic_transport::QUIC_PORT_OFFSET);
                                         let quic_addr = std::net::SocketAddr::new(ip, quic_port);
-                                        
+
                                         let _ = transport_guard.broadcast_to(quic_addr, &request).await;
                                     }
                                 }
                             }
-                            
+
                             if crate::node::is_info() { println!("[INFO][REPAIR] requests_sent h={} peers={} chunks={}",
                                 height, repair_targets.len(), missing_count); }
                         }

@@ -71,6 +71,26 @@ pub fn transfer_message(
         QNET_CHAIN_TAG, from, to, amount, nonce, gas_price, gas_limit)
 }
 
+/// Canonical signing message for BatchTransfers — must byte-match the node:
+/// the digest binds every (recipient, amount, memo); nonce+gas close replay.
+pub fn batch_transfer_message(
+    from: &str, transfers: &[(String, u64)], batch_id: &str,
+    nonce: u64, gas_price: u64, gas_limit: u64,
+) -> String {
+    use sha3::Digest as _;
+    let total: u64 = transfers.iter().map(|(_, a)| a).sum();
+    let mut h = Sha3_256::new();
+    for (to, amount) in transfers {
+        h.update(to.as_bytes());
+        h.update(amount.to_le_bytes());
+        h.update([0u8]); // no memo
+        h.update([0xffu8]);
+    }
+    format!("{}batch_transfer:{}:{}:{}:{}:{}:{}:{}:{}",
+        QNET_CHAIN_TAG, from, total, transfers.len(), batch_id,
+        hex::encode(h.finalize()), nonce, gas_price, gas_limit)
+}
+
 /// Node wire signature: hex of the RAW 3309-byte detached ML-DSA-65 signature.
 /// The REST layer hex-decodes it; verify_user_tx_dilithium requires exactly
 /// sig==3309 B (+ pk==1952 B, on the wire or rehydrated from committed state).

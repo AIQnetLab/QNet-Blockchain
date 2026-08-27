@@ -43,10 +43,21 @@ impl BlockchainNode {
                     "[REJECT][RPC] BatchNodeActivations is deprecated — not accepted via RPC".to_string()
                 ));
             }
-            qnet_state::TransactionType::BatchTransfers { .. } => {
-                return Err(QNetError::ValidationError(
-                    "[REJECT][RPC] BatchTransfers is unused — not accepted via RPC".to_string()
-                ));
+            qnet_state::TransactionType::BatchTransfers { transfers, .. } => {
+                // Signed batch path: one ML-DSA-65 signature amortized over ≤1000
+                // transfers. Bounds here; the signature gate runs downstream like
+                // any value TX (canonical covers from/total/count/batch_id/nonce/gas).
+                if transfers.is_empty() || transfers.len() > 1000 {
+                    return Err(QNetError::ValidationError(
+                        "[REJECT][RPC] BatchTransfers count must be 1..=1000".to_string()
+                    ));
+                }
+                if transfers.iter().any(|t| t.amount == 0
+                    || t.memo.as_ref().map_or(false, |m| m.len() > 128)) {
+                    return Err(QNetError::ValidationError(
+                        "[REJECT][RPC] BatchTransfers: zero amount or memo > 128 bytes".to_string()
+                    ));
+                }
             }
             // Swap/DEX is dormant: apply is fail-closed (no on-chain pool pricing deployed), so an
             // admitted Swap would be gossiped + block-included then silently dropped — wasted block
@@ -117,7 +128,7 @@ impl BlockchainNode {
             // binding (closes API-1 forge-from-any-address) and PQ is mandatory (closes AC-3).
             // Ed25519 is NOT the authorization for these classes. Non-value user TX (registration/
             // activation/proofs) keep the existing signature path (migrated in later F0.1 sub-steps).
-            // Shared value-class predicate (Transfer|ContractDeploy|ContractCall|Swap) — MUST match the
+            // Shared value-class predicate (Transfer|BatchTransfers|ContractDeploy|ContractCall|Swap) — MUST match the
             // apply/producer/bind set, or an elided-pk TX admission rejects but apply accepts (accept-set drift).
             let is_value_tx = tx.is_value_class();
             if is_value_tx {
@@ -414,13 +425,23 @@ impl BlockchainNode {
                     tx.from, to_str, tx.amount, tx.nonce, tx.gas_price, tx.gas_limit)
             }
             
-            // BatchTransfers: matches rpc.rs:4645
-            // CRITICAL FIX v3.31.1: 4th param is batch_id (NOT nonce!)
-            // RPC signs: batch_transfer:{from}:{total_amount}:{count}:{batch_id}
+            // BatchTransfers: the digest binds every recipient/amount/memo (total+count
+            // alone permit recipient rewriting under the same signature), and nonce+gas
+            // are in the preimage so the signature cannot replay at another nonce.
             qnet_state::TransactionType::BatchTransfers { transfers, batch_id } => {
+                use sha3::{Digest, Sha3_256};
                 let total_amount: u64 = transfers.iter().map(|t| t.amount).sum();
-                format!("batch_transfer:{}:{}:{}:{}",
-                    tx.from, total_amount, transfers.len(), batch_id)
+                let mut h = Sha3_256::new();
+                for t in transfers {
+                    h.update(t.to_address.as_bytes());
+                    h.update(t.amount.to_le_bytes());
+                    h.update([0u8]);
+                    if let Some(m) = &t.memo { h.update(m.as_bytes()); }
+                    h.update([0xff]);
+                }
+                format!("batch_transfer:{}:{}:{}:{}:{}:{}:{}:{}",
+                    tx.from, total_amount, transfers.len(), batch_id,
+                    hex::encode(h.finalize()), tx.nonce, tx.gas_price, tx.gas_limit)
             }
             
             // ContractDeploy: matches rpc.rs:10825
@@ -1598,13 +1619,18 @@ impl BlockchainNode {
                     "[REJECT][GOSSIP] BatchNodeActivations is deprecated — must not arrive via gossip".to_string()
                 ));
             }
-            qnet_state::TransactionType::BatchTransfers { .. } => {
-                if crate::node::is_warn() {
-                    println!("[WARN][TX-GOSSIP] reject_gossip_batch_transfers reason=unused_enum_variant");
+            qnet_state::TransactionType::BatchTransfers { transfers, .. } => {
+                // Same bounds as the RPC gate; the ML-DSA-65 signature gate runs downstream.
+                if transfers.is_empty() || transfers.len() > 1000
+                    || transfers.iter().any(|t| t.amount == 0
+                        || t.memo.as_ref().map_or(false, |m| m.len() > 128)) {
+                    if crate::node::is_warn() {
+                        println!("[WARN][TX-GOSSIP] reject_gossip_batch_transfers reason=bounds count={}", transfers.len());
+                    }
+                    return Err(QNetError::ValidationError(
+                        "[REJECT][GOSSIP] BatchTransfers bounds: count 1..=1000, amount > 0, memo <= 128".to_string()
+                    ));
                 }
-                return Err(QNetError::ValidationError(
-                    "[REJECT][GOSSIP] BatchTransfers is unused — must not arrive via gossip".to_string()
-                ));
             }
             // Mirror of the RPC-path Swap reject: dormant, apply-fail-closed. Drop at gossip admission
             // so a crafted Swap can't be relayed or block-included; block-apply keeps its fail-close.
@@ -1777,7 +1803,7 @@ impl BlockchainNode {
             // PURE DILITHIUM (F0.1): mirror the RPC ingest — value-moving user classes require ONE
             // mandatory ML-DSA-65 signature bound to `from` via the address (API-1 + AC-3). A forged
             // TX must never even enter the mempool, so the same gate runs on the gossip path.
-            // Shared value-class predicate (Transfer|ContractDeploy|ContractCall|Swap) — MUST match the
+            // Shared value-class predicate (Transfer|BatchTransfers|ContractDeploy|ContractCall|Swap) — MUST match the
             // apply/producer/bind set, or an elided-pk TX admission rejects but apply accepts (accept-set drift).
             let is_value_tx = tx.is_value_class();
             if is_value_tx {

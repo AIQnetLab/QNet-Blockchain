@@ -155,7 +155,10 @@ fn max_size_for_message_type(msg_type: u8) -> usize {
         // quorum_size(1000) ML-DSA sigs (no PQ aggregation) ≈ several MB, and each macroblock embeds
         // its QC — the 2 MB catch-all silently dropped them → finality stall at scale. Full 10 MB.
         10 => MAX_MESSAGE_SIZE,        // ConsensusV2 / MacroblocksBatch
-        8 => 512 * 1024 + 256,        // ShredProtocolChunk: 512 KB data + header
+        // ShredProtocolChunk: 512 KB data + producer certificate (~7 KB serialized) + header.
+        // The old +256 headroom silently dropped every cert-carrying chunk of a full-size block,
+        // so no shredded block ever delivered its certificate.
+        8 => 512 * 1024 + 16 * 1024,  // ShredProtocolChunk
         // HealthPing: hex ML-DSA-65 signature (6618) + node id + 4 u64 + framing ≈ 6.7 KB.
         // Sized with headroom so a future field cannot silently push the frame past its own cap;
         // wire_cap_covers_worst_case_frame pins this.
@@ -3336,5 +3339,35 @@ mod tests_wire_caps {
             max_size_for_message_type(10) >= 2 * 1000 * 3309,
             "type 10 must hold a full 1000-signer certificate with room for the block it rides in"
         );
+    }
+
+    /// A FULL 512 KB data chunk carrying a worst-case producer certificate must fit the
+    /// type-8 cap. The old +256 headroom failed exactly this: every cert-carrying chunk
+    /// of a large block was dropped at receive, so no shredded block ever delivered its
+    /// certificate — 100% reproducible, not loss.
+    #[test]
+    fn full_chunk_with_certificate_fits_type8_cap() {
+        let chunk = crate::unified_p2p::ShredProtocolChunk {
+            block_height: u64::MAX,
+            chunk_index: usize::MAX,
+            total_chunks: usize::MAX,
+            data: vec![0xA5u8; 512 * 1024],
+            is_parity: false,
+            original_block_size: usize::MAX,
+            is_macroblock: false,
+            certificate: Some(crate::unified_p2p::ProducerCertificate {
+                serial_number: "S".repeat(96),
+                node_id: "n".repeat(64),
+                certificate_bytes: vec![0x5Au8; 8 * 1024], // serialized PqCertificate upper bound
+            }),
+            block_hash: Some([0xEEu8; 32]),
+            num_coding_shreds: usize::MAX,
+        };
+        let msg = crate::unified_p2p::NetworkMessage::ShredProtocolChunk { chunk };
+        let wire = QuicTransport::serialize_message(&msg).expect("serialize");
+        let cap = max_size_for_message_type(8);
+        assert!(wire.len() <= cap,
+            "cert-carrying full chunk {}B exceeds type-8 cap {}B — receivers drop it silently",
+            wire.len(), cap);
     }
 }

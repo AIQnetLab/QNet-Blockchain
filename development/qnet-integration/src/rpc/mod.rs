@@ -922,6 +922,15 @@ struct BatchTransferRequest {
     transfers: Vec<TransferData>,
     /// Unique batch identifier
     batch_id: String,
+    /// Sender nonce (committed nonce + 1); inside the signed preimage
+    nonce: u64,
+    gas_price: u64,
+    gas_limit: u64,
+    /// hex(raw 3309 B detached ML-DSA-65) over the batch canonical preimage
+    dilithium_signature: String,
+    /// hex(raw 1952 B); omit once the sender's pk is committed on-chain (elision)
+    #[serde(default)]
+    dilithium_public_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

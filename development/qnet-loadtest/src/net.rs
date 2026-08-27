@@ -21,6 +21,28 @@ pub struct TxRequest {
     pub dilithium_public_key: Option<String>,
 }
 
+/// One transfer inside a batch (`POST /api/v1/batch/transfer`).
+#[derive(Serialize, Debug)]
+pub struct BatchTransferItem {
+    pub from: String,
+    pub to_address: String,
+    pub amount: u64,
+    pub memo: Option<String>,
+}
+
+/// Signed batch request: one ML-DSA-65 signature over up to 1000 transfers.
+#[derive(Serialize, Debug)]
+pub struct BatchTxRequest {
+    pub transfers: Vec<BatchTransferItem>,
+    pub batch_id: String,
+    pub nonce: u64,
+    pub gas_price: u64,
+    pub gas_limit: u64,
+    pub dilithium_signature: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dilithium_public_key: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct NodeClient {
     http: reqwest::Client,
@@ -48,6 +70,32 @@ impl NodeClient {
         } else {
             Err(v.get("error").and_then(|e| e.as_str()).unwrap_or("submit failed").to_string())
         }
+    }
+
+    /// Submit a signed batch; returns the server-assigned batch tx hash.
+    pub async fn submit_batch(&self, req: &BatchTxRequest) -> Result<String, String> {
+        let url = format!("{}/api/v1/batch/transfer", self.base);
+        let resp = self.http.post(&url).json(req).send().await.map_err(|e| e.to_string())?;
+        let v: Value = resp.json().await.map_err(|e| e.to_string())?;
+        if v.get("success").and_then(|s| s.as_bool()) == Some(true) {
+            v.get("transaction_hash").and_then(|h| h.as_str()).map(String::from)
+                .ok_or_else(|| "response missing transaction_hash".to_string())
+        } else {
+            Err(v.get("error").and_then(|e| e.as_str()).unwrap_or("batch submit failed").to_string())
+        }
+    }
+
+    /// Committed nonce + whether the account's ML-DSA pk is already on-chain.
+    /// The node checks nonce against COMMITTED state, so this is the only
+    /// authoritative next-nonce source: a tracker-derived guess drifts the moment
+    /// the tracker lags, and every later submit is then rejected as a replay.
+    pub async fn account_state(&self, addr: &str) -> Result<(u64, bool), String> {
+        let url = format!("{}/api/v1/account/{}", self.base, addr);
+        let v: Value = self.http.get(&url).send().await.map_err(|e| e.to_string())?
+            .json().await.map_err(|e| e.to_string())?;
+        let nonce = v.get("nonce").and_then(|n| n.as_u64()).ok_or("no nonce field")?;
+        let has_pk = v.get("has_dilithium_pk").and_then(|b| b.as_bool()).unwrap_or(false);
+        Ok((nonce, has_pk))
     }
 
     /// Current local microblock height.

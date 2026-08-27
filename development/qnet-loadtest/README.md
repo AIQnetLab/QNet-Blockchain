@@ -53,9 +53,13 @@ qnet-loadtest \
   --amount 1 --gas-price 10 --gas-limit 10000 \
   --concurrency 256 \        # max in-flight submits; bounds node-side sockets
   --stale-secs 30 \          # un-included this long => treat as dropped, reclaim
+  --resync-every 16 \        # re-read committed nonce from the node every N sends
+  --batch-size 0 \           # N>1 = BatchTransfers: one ML-DSA-65 sig over N transfers
   --proof-sample 20 \        # P3b (needs logs_root deployed); 0 to skip
   --out loadtest_report.json
 ```
+Batch mode reports tx/s AND transfers/s separately — never conflate the two in
+any published number.
 For distributed ingress, pass all node RPCs to `--nodes` (submissions round-robin).
 Run on a genesis node so localhost bypasses the rate limit; for a fully
 off-validator ceiling, run on a separate box and whitelist its IP.

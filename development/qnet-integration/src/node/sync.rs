@@ -34,11 +34,33 @@ impl BlockchainNode {
             println!("[DBG][SYNC] serve_request from={} addr={} heights={}-{}", requester_id, from_peer_addr, from_height, to_height);
         }
 
-        // Get microblocks from storage (already in network format)
-        let blocks_data = self.storage.get_microblocks_range(from_height, to_height).await?;
-        
-        if is_trace() { 
-            println!("[TRC][SYNC] get_range({}, {}) blocks={}", from_height, to_height, blocks_data.len()); 
+        // Load incrementally under a byte budget. A count-capped request spans 2 MB
+        // (empty blocks) to 200+ MB (full blocks); serving it whole was the congestion
+        // collapse. The requester's round re-scan picks up the truncated tail.
+        const RESPONSE_BUDGET_BYTES: usize = 8_000_000;
+        let mut blocks_data: Vec<(u64, Vec<u8>)> = Vec::new();
+        let mut served_bytes: usize = 0;
+        let mut truncated_at: Option<u64> = None;
+        for h in from_height..=to_height {
+            let mut one = self.storage.get_microblocks_range(h, h).await?;
+            if let Some((_, data)) = one.pop() {
+                if !blocks_data.is_empty() && served_bytes.saturating_add(data.len()) > RESPONSE_BUDGET_BYTES {
+                    truncated_at = Some(h);
+                    break;
+                }
+                served_bytes = served_bytes.saturating_add(data.len());
+                blocks_data.push((h, data));
+            }
+        }
+        if let Some(cut) = truncated_at {
+            if is_info() {
+                println!("[INFO][SYNC] serve_truncated req={}-{} served_to={} bytes={} reason=byte_budget",
+                         from_height, to_height, cut - 1, served_bytes);
+            }
+        }
+
+        if is_trace() {
+            println!("[TRC][SYNC] get_range({}, {}) blocks={}", from_height, to_height, blocks_data.len());
         }
         
         if blocks_data.is_empty() {

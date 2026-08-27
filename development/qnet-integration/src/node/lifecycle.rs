@@ -1956,10 +1956,22 @@ impl BlockchainNode {
         // v5.6: Now receives from_peer_addr for routing to unregistered peers
         let blockchain_clone = blockchain.clone();
         tokio::spawn(async move {
+            // Bounded-parallel serving: one multi-MB serve must not head-of-line
+            // block every other peer's request behind it.
+            const SYNC_SERVE_CONCURRENCY: usize = 4;
+            let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(SYNC_SERVE_CONCURRENCY));
             while let Some((from_height, to_height, requester_id, from_peer_addr)) = sync_request_rx.recv().await {
-                if let Err(e) = blockchain_clone.handle_sync_request(from_height, to_height, requester_id, from_peer_addr).await {
-                    eprintln!("[ERR][SYNC] handle_request_failed err={}", e);
-                }
+                let permit = match permits.clone().acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => break,
+                };
+                let bc = blockchain_clone.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    if let Err(e) = bc.handle_sync_request(from_height, to_height, requester_id, from_peer_addr).await {
+                        eprintln!("[ERR][SYNC] handle_request_failed err={}", e);
+                    }
+                });
             }
         });
         

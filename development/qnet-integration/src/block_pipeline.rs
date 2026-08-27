@@ -95,37 +95,67 @@ fn record_apply_mismatch() -> bool {
     APPLY_MISMATCH_COUNT.fetch_add(1, Ordering::Relaxed) + 1 >= APPLY_MISMATCH_BREAKER
 }
 
+/// Heights currently parked in the deferred buffer (refcounted: siblings can share a
+/// height). The sync missing-scan consults this so RAM-held blocks are not re-downloaded.
+static DEFERRED_HEIGHTS: once_cell::sync::Lazy<dashmap::DashMap<u64, u32>> =
+    once_cell::sync::Lazy::new(dashmap::DashMap::new);
+
+pub(crate) fn deferred_holds(h: u64) -> bool {
+    DEFERRED_HEIGHTS.contains_key(&h)
+}
+
+fn deferred_track(h: u64) {
+    *DEFERRED_HEIGHTS.entry(h).or_insert(0) += 1;
+}
+
+fn deferred_untrack(h: u64) {
+    if let Some(mut e) = DEFERRED_HEIGHTS.get_mut(&h) {
+        if *e > 1 { *e -= 1; } else { drop(e); DEFERRED_HEIGHTS.remove(&h); }
+    }
+}
+
 /// Make room in the deferred buffer for a block closer to the tip.
 ///
-/// Deferred blocks all sit ABOVE the applied tip, so the lowest height is the one applied first.
-/// Evicting the highest-height entry keeps the same bound while retaining the blocks the node
-/// actually needs next; dropping the arrival instead discards the very block it is waiting for.
+/// A stale entry (height ≤ applied tip) is evicted first — it can never apply.
+/// Otherwise the highest-height entry goes, but only if it is farther than the
+/// arrival: dropping the arrival instead discards the very block being waited on.
 /// `only_producer` restricts the search to one producer, preserving the per-producer bound.
 fn evict_farthest_deferred(
     deferred: &mut HashMap<[u8; 32], Vec<(u64, DecodedBlock)>>,
     by_producer: &mut HashMap<String, usize>,
     count: &mut usize,
+    bytes: &mut usize,
     only_producer: Option<&str>,
     incoming_h: u64,
+    local_tip: u64,
 ) -> bool {
-    let mut victim: Option<([u8; 32], usize, u64, String)> = None;
+    let mut victim: Option<([u8; 32], usize, u64, String, usize)> = None;
+    let mut stale = false;
     for (k, v) in deferred.iter() {
         for (i, (_, d)) in v.iter().enumerate() {
             if only_producer.is_some_and(|q| q != d.microblock.producer) { continue; }
             let h = d.microblock.height;
-            if victim.as_ref().map_or(true, |(_, _, vh, _)| h > *vh) {
-                victim = Some((*k, i, h, d.microblock.producer.clone()));
+            if h <= local_tip {
+                victim = Some((*k, i, h, d.microblock.producer.clone(), d.raw_data.len()));
+                stale = true;
+                break;
+            }
+            if victim.as_ref().map_or(true, |(_, _, vh, _, _)| h > *vh) {
+                victim = Some((*k, i, h, d.microblock.producer.clone(), d.raw_data.len()));
             }
         }
+        if stale { break; }
     }
     match victim {
-        Some((k, i, h, p)) if h > incoming_h => {
+        Some((k, i, h, p, sz)) if stale || h > incoming_h => {
             if let Some(v) = deferred.get_mut(&k) {
                 v.remove(i);
                 if v.is_empty() { deferred.remove(&k); }
             }
             *count = count.saturating_sub(1);
+            *bytes = bytes.saturating_sub(sz);
             if let Some(c) = by_producer.get_mut(&p) { *c = c.saturating_sub(1); }
+            deferred_untrack(h);
             true
         }
         _ => false,
@@ -1780,6 +1810,10 @@ impl BlockPipeline {
         // lookup of "who was waiting for the block I just verified".
         let mut deferred: HashMap<[u8; 32], Vec<(u64, DecodedBlock)>> = HashMap::new();
         let mut deferred_count: usize = 0;
+        // Byte occupancy: count-only bounds let 2000 multi-MB blocks pin gigabytes of RAM.
+        let mut deferred_bytes: usize = 0;
+        // A restarted pipeline dropped its buffer; stale holds would mask sync forever.
+        DEFERRED_HEIGHTS.clear();
         // Per-producer occupancy, maintained incrementally: counting by scanning the whole buffer
         // on every deferral is O(buffer) per block on the verify path.
         let mut deferred_by_producer: HashMap<String, usize> = HashMap::new();
@@ -1993,12 +2027,20 @@ impl BlockPipeline {
                         // arrive out of order — a cap below that would drop honest traffic. Two
                         // rotations of headroom still bounds an attacker to 64 instead of 2000.
                         const DEFERRED_MAX_PER_PRODUCER: usize = 2 * crate::node::ROTATION_INTERVAL_BLOCKS as usize;
+                        // Bytes bound RAM; count bounds index churn.
+                        const DEFERRED_MAX_BYTES: usize = 512 * 1024 * 1024;
+                        // Within this many blocks of the tip a long single-producer run is the
+                        // legitimate lone-survivor case (peers down, one producer carries the
+                        // chain) — the per-producer cap must not reject exactly those blocks.
+                        const DEFERRED_NEAR_HORIZON: u64 = 2 * qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
+                        let tip_now = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(Ordering::Relaxed);
+                        let near_tip = child_h <= tip_now.saturating_add(DEFERRED_NEAR_HORIZON);
                         let from_this_producer = *deferred_by_producer
                             .get(&decoded.microblock.producer).unwrap_or(&0usize);
-                        if from_this_producer >= DEFERRED_MAX_PER_PRODUCER
+                        if !near_tip && from_this_producer >= DEFERRED_MAX_PER_PRODUCER
                             && !evict_farthest_deferred(&mut deferred, &mut deferred_by_producer,
-                                                        &mut deferred_count,
-                                                        Some(&decoded.microblock.producer), child_h) {
+                                                        &mut deferred_count, &mut deferred_bytes,
+                                                        Some(&decoded.microblock.producer), child_h, tip_now) {
                             if is_warn() {
                                 println!("[WARN][PIPELINE] deferred_producer_cap h={} producer={} held={}",
                                          child_h, decoded.microblock.producer, from_this_producer);
@@ -2008,12 +2050,20 @@ impl BlockPipeline {
                             continue;
                         }
                         // Previous block not yet available — park it under the parent it waits for.
-                        if deferred_count < DEFERRED_MAX
-                            || evict_farthest_deferred(&mut deferred, &mut deferred_by_producer,
-                                                       &mut deferred_count, None, child_h) {
+                        let incoming_sz = decoded.raw_data.len();
+                        let mut fits = deferred_count < DEFERRED_MAX
+                            && deferred_bytes.saturating_add(incoming_sz) <= DEFERRED_MAX_BYTES;
+                        while !fits {
+                            if !evict_farthest_deferred(&mut deferred, &mut deferred_by_producer,
+                                                        &mut deferred_count, &mut deferred_bytes,
+                                                        None, child_h, tip_now) { break; }
+                            fits = deferred_count < DEFERRED_MAX
+                                && deferred_bytes.saturating_add(incoming_sz) <= DEFERRED_MAX_BYTES;
+                        }
+                        if fits {
                             if is_debug() {
-                                println!("[DBG][PIPELINE] block_deferred h={} need_h={} buf={}",
-                                         child_h, parent_h, deferred_count);
+                                println!("[DBG][PIPELINE] block_deferred h={} need_h={} buf={} buf_mb={}",
+                                         child_h, parent_h, deferred_count, deferred_bytes / (1024 * 1024));
                             }
                             let parked_at = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
@@ -2022,13 +2072,15 @@ impl BlockPipeline {
                             // Drop an exact duplicate re-delivery; distinct siblings both survive.
                             if !waiters.iter().any(|(_, d)| d.microblock.hash() == decoded.microblock.hash()) {
                                 *deferred_by_producer.entry(decoded.microblock.producer.clone()).or_insert(0) += 1;
+                                deferred_track(child_h);
+                                deferred_bytes = deferred_bytes.saturating_add(incoming_sz);
                                 waiters.push((parked_at, decoded));
                                 deferred_count += 1;
                             }
                         } else {
                             if is_info() {
-                                println!("[INFO][PIPELINE] deferred_full h={} dropped (buf={})",
-                                         child_h, DEFERRED_MAX);
+                                println!("[INFO][PIPELINE] deferred_full h={} dropped (buf={} buf_mb={})",
+                                         child_h, deferred_count, deferred_bytes / (1024 * 1024));
                             }
                             metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
                         }
@@ -2040,8 +2092,7 @@ impl BlockPipeline {
                         // and the gap stays open forever (observed h=180-241).
                         // Size-adaptive: small gap → per-height single-flight;
                         // large gap → batched range request via sync_blocks.
-                        let local_tip = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT
-                            .load(Ordering::Relaxed);
+                        let local_tip = tip_now;
                         let gap = child_h.saturating_sub(local_tip);
                         if gap > RANGE_SYNC_GAP_THRESHOLD {
                             let from = local_tip.saturating_add(1);
@@ -3069,6 +3120,8 @@ impl BlockPipeline {
                     if let Some(c) = deferred_by_producer.get_mut(&def.microblock.producer) {
                         *c = c.saturating_sub(1);
                     }
+                    deferred_bytes = deferred_bytes.saturating_sub(def.raw_data.len());
+                    deferred_untrack(def.height);
                     to_process.push(def);
                 }
             }
@@ -3091,11 +3144,15 @@ impl BlockPipeline {
                     for waiters in deferred.values_mut() {
                         waiters.retain(|(parked_at, d)| {
                             let too_old = now_secs.saturating_sub(*parked_at) > DEFERRED_MAX_AGE_SECS;
-                            d.microblock.height > cutoff && !too_old
+                            let keep = d.microblock.height > cutoff && !too_old;
+                            if !keep { deferred_untrack(d.height); }
+                            keep
                         });
                     }
                     deferred.retain(|_, waiters| !waiters.is_empty());
                     deferred_count = deferred.values().map(|v| v.len()).sum();
+                    deferred_bytes = deferred.values().flat_map(|v| v.iter())
+                        .map(|(_, d)| d.raw_data.len()).sum();
                     let evicted = before - deferred_count;
                     // Rebuild the index ONLY when something was actually evicted. The enclosing
                     // condition is a buffer-size threshold, not an eviction event, so it holds on
@@ -4852,6 +4909,7 @@ mod deferred_eviction_tests {
         let mut deferred: HashMap<[u8; 32], Vec<(u64, DecodedBlock)>> = HashMap::new();
         let mut by_producer: HashMap<String, usize> = HashMap::new();
         let mut count = 0usize;
+        let mut bytes = 0usize;
         for (i, h) in [500u64, 540, 560].iter().enumerate() {
             deferred.insert([i as u8; 32], vec![parked(*h, "prod_a")]);
             *by_producer.entry("prod_a".into()).or_insert(0) += 1;
@@ -4859,7 +4917,7 @@ mod deferred_eviction_tests {
         }
 
         // An arrival closer to the tip evicts the farthest entry, not itself.
-        assert!(evict_farthest_deferred(&mut deferred, &mut by_producer, &mut count, Some("prod_a"), 501));
+        assert!(evict_farthest_deferred(&mut deferred, &mut by_producer, &mut count, &mut bytes, Some("prod_a"), 501, 0));
         assert_eq!(count, 2, "one entry evicted");
         assert_eq!(by_producer["prod_a"], 2, "producer count follows the eviction");
         let heights: Vec<u64> = deferred.values().flatten().map(|(_, d)| d.microblock.height).collect();
@@ -4867,14 +4925,14 @@ mod deferred_eviction_tests {
         assert!(heights.contains(&500) && heights.contains(&540), "nearer blocks are kept");
 
         // An arrival farther than everything held changes nothing — the bound still holds.
-        assert!(!evict_farthest_deferred(&mut deferred, &mut by_producer, &mut count, Some("prod_a"), 9_000));
+        assert!(!evict_farthest_deferred(&mut deferred, &mut by_producer, &mut count, &mut bytes, Some("prod_a"), 9_000, 0));
         assert_eq!(count, 2, "nothing evicted for a block we need last");
 
         // Another producer's entries are untouched by a per-producer eviction.
         deferred.insert([9u8; 32], vec![parked(700, "prod_b")]);
         *by_producer.entry("prod_b".into()).or_insert(0) += 1;
         count += 1;
-        assert!(evict_farthest_deferred(&mut deferred, &mut by_producer, &mut count, Some("prod_a"), 501));
+        assert!(evict_farthest_deferred(&mut deferred, &mut by_producer, &mut count, &mut bytes, Some("prod_a"), 501, 0));
         assert_eq!(by_producer["prod_b"], 1, "a different producer is never the victim");
     }
 }
@@ -4943,6 +5001,7 @@ mod multi_node_tests {
         deferred: HashMap<[u8; 32], Vec<(u64, DecodedBlock)>>,
         by_producer: HashMap<String, usize>,
         count: usize,
+        bytes: usize,
         /// Set while the node is applying blocks, cleared when a round passes without one.
         active: bool,
     }
@@ -4950,7 +5009,7 @@ mod multi_node_tests {
     impl SimNode {
         fn new() -> Self {
             SimNode { applied: 0, observed: 0, deferred: HashMap::new(),
-                      by_producer: HashMap::new(), count: 0, active: true }
+                      by_producer: HashMap::new(), count: 0, bytes: 0, active: true }
         }
 
         /// Apply everything the buffer now unblocks, cascading through parked children.
@@ -4989,13 +5048,13 @@ mod multi_node_tests {
             if held >= PER_PRODUCER {
                 let freed = pol == Deferral::EvictFarthest
                     && evict_farthest_deferred(&mut self.deferred, &mut self.by_producer,
-                                               &mut self.count, Some(&b.microblock.producer), h);
+                                               &mut self.count, &mut self.bytes, Some(&b.microblock.producer), h, 0);
                 if !freed { return; }
             }
             if self.count >= TOTAL {
                 let freed = pol == Deferral::EvictFarthest
                     && evict_farthest_deferred(&mut self.deferred, &mut self.by_producer,
-                                               &mut self.count, None, h);
+                                               &mut self.count, &mut self.bytes, None, h, 0);
                 if !freed { return; }
             }
             let waiters = self.deferred.entry(b.microblock.previous_hash).or_default();

@@ -1562,6 +1562,7 @@ impl Transaction {
     pub fn is_value_class(&self) -> bool {
         matches!(&self.tx_type,
             TransactionType::Transfer { .. }
+            | TransactionType::BatchTransfers { .. }
             | TransactionType::ContractDeploy
             | TransactionType::ContractCall
             | TransactionType::Swap { .. })
@@ -2201,10 +2202,17 @@ impl Transaction {
                 if transfers.len() > 1000 {
                     return Err("[REJECT][BATCH-TX] batch_too_large max=1000".to_string());
                 }
-                // Validate each transfer amount
+                // Fee floor: gas_limit must cover the whole batch (fee = price x limit,
+                // charged once) — else 1000 transfers ride for the fee of none.
+                if self.gas_limit < gas_limits::TRANSFER.saturating_mul(transfers.len() as u64) {
+                    return Err("[REJECT][BATCH-TX] gas_limit_below_batch_floor".to_string());
+                }
                 for transfer in transfers {
                     if transfer.amount == 0 {
                         return Err("[REJECT][BATCH-TX] zero_transfer_amount".to_string());
+                    }
+                    if transfer.memo.as_ref().map_or(false, |m| m.len() > 128) {
+                        return Err("[REJECT][BATCH-TX] memo_too_long max=128".to_string());
                     }
                 }
             }
@@ -4009,13 +4017,11 @@ impl Transaction {
                         "[REJECT][BATCH-TRANSFER] overflow: sum of transfer amounts exceeds u64::MAX".to_string()
                     ))
                 })?;
-                let per_tx_fee = self.effective_gas_price().checked_mul(self.gas_limit)
+                // gas_limit already covers the WHOLE batch (required gas = TRANSFER x count);
+                // multiplying by count again squared the fee.
+                let total_fee = self.effective_gas_price().checked_mul(self.gas_limit)
                     .ok_or_else(|| StateError::InvalidTransaction(
                         "[REJECT][BATCH-TRANSFER] overflow: gas_price * gas_limit exceeds u64::MAX".to_string()
-                    ))?;
-                let total_fee = per_tx_fee.checked_mul(transfers.len() as u64)
-                    .ok_or_else(|| StateError::InvalidTransaction(
-                        "[REJECT][BATCH-TRANSFER] overflow: per_tx_fee * count exceeds u64::MAX".to_string()
                     ))?;
                 let total_cost = total_transfer_amount.checked_add(total_fee)
                     .ok_or_else(|| StateError::InvalidTransaction(

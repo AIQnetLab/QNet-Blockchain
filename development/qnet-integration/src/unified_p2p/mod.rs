@@ -1881,6 +1881,19 @@ pub static EJECTED_VALIDATORS: Lazy<DashSet<String>> = Lazy::new(DashSet::new);
 pub static FORWARDED_SHRED_CHUNKS: Lazy<DashSet<(u64, u32)>> =
     Lazy::new(DashSet::new);
 
+/// EMA (1/8 weight) of received block sizes in bytes. Sizes the byte-aware sync
+/// shard: under load a "block" spans 20 KB empty to multi-MB full, and a
+/// count-only request window ranged 2 MB to 200+ MB — the congestion collapse.
+pub static SYNC_BLOCK_SIZE_EMA: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn note_sync_block_size(len: usize) {
+    let l = len as u64;
+    let old = SYNC_BLOCK_SIZE_EMA.load(std::sync::atomic::Ordering::Relaxed);
+    let new = if old == 0 { l } else { old - old / 8 + l / 8 };
+    SYNC_BLOCK_SIZE_EMA.store(new, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Drop `FORWARDED_SHRED_CHUNKS` entries for blocks that are now part of
 /// finalised history (≤ `keep_above`). Called from the existing periodic
 /// cleanup that prunes timeout state and gap-sync entries.
@@ -3074,8 +3087,10 @@ impl SimplifiedP2P {
     }
 
     /// True for floodable bulk-serving / bulk-transfer messages that must NOT
-    /// share the consensus FIFO. Everything else (consensus, tip blocks,
-    /// shred chunks, tx, discovery) stays on the high-priority lane.
+    /// share the consensus FIFO. Shred chunks and chunk repair are here too:
+    /// their handlers move megabytes, and inline on the priority drain they
+    /// queued consensus frames behind block-data floods. Everything else
+    /// (consensus, tx forward, discovery) stays on the high-priority lane.
     #[inline]
     fn is_bulk_lane_message(msg: &NetworkMessage) -> bool {
         matches!(msg,
@@ -3084,6 +3099,9 @@ impl SimplifiedP2P {
             | NetworkMessage::BlocksBatch { .. }
             | NetworkMessage::MacroblocksBatch { .. }
             | NetworkMessage::StateSnapshot { .. }
+            | NetworkMessage::ShredProtocolChunk { .. }
+            | NetworkMessage::RequestMissingChunks { .. }
+            | NetworkMessage::MissingChunksResponse { .. }
         )
     }
 

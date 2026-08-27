@@ -603,13 +603,23 @@ pub(super) async fn handle_batch_transfer(
         return Ok(rate_limit_response);
     }
 
-    // SECURITY: Validate all EON addresses in batch
+    // Bounds first — cheap rejects before any crypto.
+    if request.transfers.is_empty() || request.transfers.len() > 1000 {
+        return Ok(warp::reply::json(&json!({
+            "success": false, "error": "batch size must be 1..=1000"
+        })));
+    }
+    let from_address = request.transfers[0].from.clone();
+    if let Err(e) = validate_eon_address_with_error(&from_address) {
+        return Ok(warp::reply::json(&json!({
+            "success": false, "error": "Invalid sender address", "details": e
+        })));
+    }
     for (i, transfer) in request.transfers.iter().enumerate() {
-        if let Err(e) = validate_eon_address_with_error(&transfer.from) {
+        if transfer.from != from_address {
             return Ok(warp::reply::json(&json!({
                 "success": false,
-                "error": format!("Invalid sender address in transfer #{}", i + 1),
-                "details": e
+                "error": format!("All transfers must share one sender; transfer #{} differs", i + 1)
             })));
         }
         if let Err(e) = validate_eon_address_with_error(&transfer.to_address) {
@@ -619,56 +629,45 @@ pub(super) async fn handle_batch_transfer(
                 "details": e
             })));
         }
-    }
-    
-    // =========================================================================
-    // CRITICAL SECURITY: Ed25519 Signature Verification (NIST FIPS 186-5)
-    // All transfers in batch must be from the same sender (verified by signature)
-    // =========================================================================
-    
-    // Get sender address (must be same for all transfers in batch)
-    let from_address = request.transfers.first().map(|t| t.from.clone()).unwrap_or_else(|| "unknown".to_string());
-    
-    // Verify all transfers are from the same sender
-    for (i, transfer) in request.transfers.iter().enumerate() {
-        if transfer.from != from_address {
+        if transfer.amount == 0 || transfer.memo.as_ref().map_or(false, |m| m.len() > 128) {
             return Ok(warp::reply::json(&json!({
                 "success": false,
-                "error": format!("All transfers in batch must be from same sender. Transfer #{} has different sender.", i + 1),
-                "expected_from": from_address,
-                "actual_from": transfer.from
+                "error": format!("transfer #{}: zero amount or memo > 128 bytes", i + 1)
             })));
         }
     }
-    
-    // PRODUCTION: Process real batch transfers via blockchain transaction
+
     let total_amount: u64 = request.transfers.iter().map(|t| t.amount).fold(0u64, |acc, a| acc.saturating_add(a));
-    
-    // v3.34: Read correct sequential nonce from StateManager
-    // Previously used timestamp as nonce which ALWAYS failed nonce check (nonce != sender.nonce + 1)
-    let nonce = {
-        let state = blockchain.get_state_manager();
-        let state_guard = state.read().await;
-        match state_guard.get_account(&from_address) {
-            Some(acc) => acc.nonce + 1,
-            None => 1, // First transaction for new account
+
+    // Pure-PQ: one ML-DSA-65 signature over the batch canonical preimage
+    // (from/total/count/batch_id/transfers-digest/nonce/gas). Elided pk is
+    // rehydrated from committed state by the shared ingest gate.
+    if request.dilithium_signature.is_empty() {
+        return Ok(warp::reply::json(&json!({
+            "success": false, "error": "batch requires dilithium_signature (pure-PQ)"
+        })));
+    }
+    let dil_pk = request.dilithium_public_key.as_ref().filter(|p| !p.is_empty()).cloned();
+    if let Some(ref p) = dil_pk {
+        match crate::crypto::solana_derivation::eon_from_qnet_dilithium_pubkey(p) {
+            Some(d) if d == from_address => {}
+            _ => return Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": "from not derived from dilithium_public_key (ownership unproven)"
+            }))),
         }
-    };
-    
-    // PURE DILITHIUM (F0.2): Ed25519 is Solana-only, never verified on a QNet path. NOTE: the
-    // BatchTransfers TX type is admission-rejected at node.rs ingest (RPC + gossip), so this handler
-    // builds a TX that never applies; no signature is stamped.
-    
+    }
+
     let batch_tx = qnet_state::Transaction::new(
-        from_address.clone(),                      // from
-        Some("batch_transfers".to_string()),       // to: batch marker address
-        total_amount,                              // amount: total of all transfers
-        nonce,                                     // nonce
-        100_000,                                   // gas_price: base gas price
-        request.transfers.len() as u64 * 10_000,   // gas_limit: per transfer (optimized)
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),  // timestamp
-        None,                                      // signature (pure-Dilithium; Ed25519 not on a QNet path)
-        qnet_state::TransactionType::BatchTransfers {  // tx_type
+        from_address.clone(),
+        Some("batch_transfers".to_string()),
+        total_amount,
+        request.nonce,
+        request.gas_price,
+        request.gas_limit,
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
+        None, // no Ed25519 on QNet
+        qnet_state::TransactionType::BatchTransfers {
             transfers: request.transfers.iter().map(|t| BatchTransferData {
                 to_address: t.to_address.clone(),
                 amount: t.amount,
@@ -676,14 +675,20 @@ pub(super) async fn handle_batch_transfer(
             }).collect(),
             batch_id: request.batch_id.clone()
         },
-        None,                                      // data
+        None,
+    )
+    .with_quantum_signature(
+        hex::decode(&request.dilithium_signature).ok(),
+        dil_pk.as_deref().and_then(|p| hex::decode(p).ok()),
     );
     
     // Submit batch transaction to blockchain
     match blockchain.submit_transaction(batch_tx).await {
         Ok(tx_hash) => {
-            println!("[BATCH] ✅ Batch transfer submitted: {} transfers, total {} QNC, hash: {}", 
-                   request.transfers.len(), total_amount, tx_hash);
+            if crate::node::is_info() {
+                println!("[INFO][BATCH] submitted transfers={} total={} hash={}",
+                       request.transfers.len(), total_amount, tx_hash);
+            }
             
             let response = json!({
                 "success": true,

@@ -306,6 +306,7 @@ impl SimplifiedP2P {
             let skipped_backpressure = 0u32;
             
             for (height, data) in blocks {
+                super::note_sync_block_size(data.len());
                 // v11.1: Dedup at STORAGE level only — never skip delivered blocks
                 // Previous dup_pending skip caused deadlock: block marked pending on first
                 // request, then every re-delivery skipped → block never reached sync_order_buffer.
@@ -1388,9 +1389,13 @@ impl SimplifiedP2P {
             let mut missing: Vec<(u64, u64)> = Vec::new();
             let mut run_start: Option<u64> = None;
             for h in from_height..=to_height {
+                // Deferred-held blocks are already in RAM awaiting their parent —
+                // re-downloading them doubled sync traffic. Their tracker entries
+                // expire with the deferred TTL, so a dropped block is re-requested.
                 let present = storage.load_microblock(h)
                     .map(|opt| opt.is_some())
-                    .unwrap_or(false);
+                    .unwrap_or(false)
+                    || crate::block_pipeline::deferred_holds(h);
                 if present {
                     if let Some(s) = run_start.take() {
                         missing.push((s, h - 1));
@@ -1434,10 +1439,13 @@ impl SimplifiedP2P {
             // intervals into a height list, then split contiguously.
             let total_missing: u64 = missing.iter().map(|&(a, b)| b - a + 1).sum();
             let peers_n = round_peers.len().max(1) as u64;
-            // Cap each shard at the server's per-response batch (handle_block_request serves
-            // <=100/req) so one shard == one served batch; the overflow tail is picked up by the
-            // next round's re-scan rather than wasted on a truncated response.
-            let shard_size = ((total_missing + peers_n - 1) / peers_n).min(100); // ceil, server-cap
+            // Per-peer shard cap in BLOCKS derived from a per-peer BYTE budget over the
+            // observed block-size EMA. Count-only capping (100 blocks) spanned 2 MB empty
+            // to 200+ MB full — the request itself caused the congestion collapse.
+            const SYNC_PEER_BUDGET_BYTES: u64 = 4_000_000;
+            let ema = super::SYNC_BLOCK_SIZE_EMA.load(std::sync::atomic::Ordering::Relaxed);
+            let byte_cap = if ema > 0 { (SYNC_PEER_BUDGET_BYTES / ema.max(1)).max(1) } else { 100 };
+            let shard_size = ((total_missing + peers_n - 1) / peers_n).min(100).min(byte_cap);
             let mut sent_to_peers: Vec<String> = Vec::new();
             let mut peer_idx = 0usize;
             let mut budget = shard_size;

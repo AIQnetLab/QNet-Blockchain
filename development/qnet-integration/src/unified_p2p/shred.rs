@@ -295,8 +295,9 @@ impl SimplifiedP2P {
                 is_parity: false,
                 original_block_size,  // CRITICAL: Include original size
                 is_macroblock,  // PRODUCTION: Tag block type
-                // v2.26: Certificate only in chunk #0 (saves bandwidth, still atomic)
-                certificate: if chunk_index == 0 { producer_certificate.clone() } else { None },
+                // Cert on EVERY data chunk: any delivered chunk carries it, so no single
+                // loss can strip the block of its certificate. ~7 KB per chunk (≤1.6%).
+                certificate: producer_certificate.clone(),
                 block_hash: Some(block_hash),  // FIX R23-P3
                 num_coding_shreds: parity_count,  // self-describing FEC: decoder matches our RS dimensions
             };
@@ -2486,7 +2487,11 @@ impl SimplifiedP2P {
             
             // Truncate to original size (remove padding)
             block_data.truncate(original_size);
-            
+
+            // Large blocks arrive ONLY via shreds — without this the size EMA saw just
+            // small batched blocks and the byte-aware sync shard went blind under load.
+            super::note_sync_block_size(block_data.len());
+
             let elapsed = assembly.started_at.elapsed();
             if crate::node::is_info() {
                 println!("[INFO][SHRED] Block #{} reconstructed with Reed-Solomon in {:?}", height, elapsed);

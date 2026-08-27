@@ -71,6 +71,14 @@ struct Args {
     /// count — unbounded spawning exhausted the node's fd limit and broke RocksDB.
     #[arg(long, default_value_t = 256)]
     concurrency: usize,
+    /// Re-read an account's committed nonce from the node every N sends (0 = only
+    /// on a nonce rejection). The tracker's view drifts under load; state does not.
+    #[arg(long, default_value_t = 16)]
+    resync_every: u64,
+    /// Transfers per transaction. 0/1 = single Transfer mode; N>1 = BatchTransfers
+    /// (one ML-DSA-65 signature over N transfers). Report shows tx/s AND transfers/s.
+    #[arg(long, default_value_t = 0)]
+    batch_size: u64,
     /// JSON report output path.
     #[arg(long, default_value = "loadtest_report.json")]
     out: String,
@@ -112,6 +120,7 @@ async fn main() {
     let n = accounts.len();
     if n < 2 { eprintln!("[loadtest] need >= 2 accounts"); std::process::exit(1); }
     eprintln!("[loadtest] account[0] = {}", accounts[0].addr);
+    let resync_every = args.resync_every;
 
     let clients: Arc<Vec<net::NodeClient>> = Arc::new(
         args.nodes.split(',').filter(|s| !s.is_empty()).map(net::NodeClient::new).collect(),
@@ -120,6 +129,7 @@ async fn main() {
 
     // Shared state.
     let committed: Arc<Vec<AtomicU64>> = Arc::new((0..n).map(|_| AtomicU64::new(0)).collect());
+    let sent_count: Arc<Vec<AtomicU64>> = Arc::new((0..n).map(|_| AtomicU64::new(0)).collect());
     let inflight: Arc<Mutex<HashMap<String, InFlight>>> = Arc::new(Mutex::new(HashMap::new()));
     let incl_lat: Arc<Mutex<Vec<f64>>> = Arc::new(Mutex::new(Vec::new()));
     let hard_lat: Arc<Mutex<Vec<f64>>> = Arc::new(Mutex::new(Vec::new()));
@@ -251,11 +261,13 @@ async fn main() {
         let clients = clients.clone();
         let inflight = inflight.clone();
         let committed = committed.clone();
+        let sent_count = sent_count.clone();
         let submitted = submitted.clone();
         let errors = errors.clone();
         let free_tx = free_tx.clone();
         let rr = rr.clone();
-        let (amount, gas_price, gas_limit) = (args.amount, args.gas_price, args.gas_limit);
+        let (amount, gas_price, gas_limit, batch_size) =
+            (args.amount, args.gas_price, args.gas_limit, args.batch_size);
 
         tokio::spawn(async move {
             let _permit = permit; // held until the HTTP round-trip completes
@@ -267,31 +279,78 @@ async fn main() {
             };
             let from = &accounts[idx];
             let to = &accounts[to_idx];
+            let ci = (rr.fetch_add(1, Ordering::Relaxed) as usize) % clients.len();
+            // Periodically re-anchor to committed state. Inclusion-derived nonces drift
+            // whenever the tracker lags, and one drifted account then fails forever.
+            let sends = sent_count[idx].fetch_add(1, Ordering::Relaxed);
+            if resync_every > 0 && sends % resync_every == 0 {
+                if let Ok((n, _)) = clients[ci].account_state(&from.addr).await {
+                    committed[idx].store(n, Ordering::SeqCst);
+                }
+            }
             let committed_nonce = committed[idx].load(Ordering::SeqCst);
             let nonce = committed_nonce + 1;
-            let msg = derive::transfer_message(&from.addr, &to.addr, amount, nonce, gas_price, gas_limit);
-            let sig = match derive::sign_wire(msg.as_bytes(), &from.sk_bytes) {
-                Ok(s) => s,
-                Err(_) => { errors.fetch_add(1, Ordering::SeqCst); free_tx.send(idx).ok(); return; }
-            };
             // ELISION: after the account's first tx APPLIES, its pk is committed in state
             // (store-on-first-use) and the node rehydrates it — stop shipping the 1952 B key.
             let pk = if committed_nonce == 0 { Some(from.pk_hex.clone()) } else { None };
-            let req = net::TxRequest {
-                from: from.addr.clone(),
-                to: to.addr.clone(),
-                amount, gas_price, gas_limit, nonce,
-                dilithium_signature: sig,
-                dilithium_public_key: pk,
+
+            let sent = if batch_size > 1 {
+                // One signature over batch_size transfers, spread over random recipients.
+                let transfers: Vec<(String, u64)> = (0..batch_size).map(|k| {
+                    let j = (to_idx + k as usize) % accounts.len();
+                    let j = if j == idx { (j + 1) % accounts.len() } else { j };
+                    (accounts[j].addr.clone(), amount)
+                }).collect();
+                let batch_id = format!("lt-{}-{}", idx, nonce);
+                let b_gas_limit = gas_limit.saturating_mul(batch_size); // required gas = TRANSFER x count
+                let msg = derive::batch_transfer_message(
+                    &from.addr, &transfers, &batch_id, nonce, gas_price, b_gas_limit);
+                match derive::sign_wire(msg.as_bytes(), &from.sk_bytes) {
+                    Ok(sig) => {
+                        let req = net::BatchTxRequest {
+                            transfers: transfers.iter().map(|(to_a, amt)| net::BatchTransferItem {
+                                from: from.addr.clone(), to_address: to_a.clone(),
+                                amount: *amt, memo: None,
+                            }).collect(),
+                            batch_id, nonce, gas_price, gas_limit: b_gas_limit,
+                            dilithium_signature: sig,
+                            dilithium_public_key: pk,
+                        };
+                        clients[ci].submit_batch(&req).await
+                    }
+                    Err(e) => Err(e),
+                }
+            } else {
+                let msg = derive::transfer_message(&from.addr, &to.addr, amount, nonce, gas_price, gas_limit);
+                match derive::sign_wire(msg.as_bytes(), &from.sk_bytes) {
+                    Ok(sig) => {
+                        let req = net::TxRequest {
+                            from: from.addr.clone(),
+                            to: to.addr.clone(),
+                            amount, gas_price, gas_limit, nonce,
+                            dilithium_signature: sig,
+                            dilithium_public_key: pk,
+                        };
+                        clients[ci].submit_tx(&req).await
+                    }
+                    Err(e) => Err(e),
+                }
             };
-            let ci = (rr.fetch_add(1, Ordering::Relaxed) as usize) % clients.len();
-            match clients[ci].submit_tx(&req).await {
+
+            match sent {
                 Ok(hash) => {
                     inflight.lock().await.insert(hash, InFlight { idx, nonce, submit: Instant::now() });
                     submitted.fetch_add(1, Ordering::SeqCst);
                 }
-                Err(_) => {
+                Err(e) => {
                     errors.fetch_add(1, Ordering::SeqCst);
+                    // A nonce rejection means our view of this account is stale — re-anchor
+                    // to committed state so the retry is not a guaranteed second failure.
+                    if e.contains("nonce") || e.contains("Nonce") {
+                        if let Ok((n, _)) = clients[ci].account_state(&from.addr).await {
+                            committed[idx].store(n, Ordering::SeqCst);
+                        }
+                    }
                     tokio::time::sleep(Duration::from_millis(50)).await;
                     free_tx.send(idx).ok(); // free to retry
                 }
@@ -350,6 +409,9 @@ async fn main() {
             "included_onchain": included_n, "included_tps": included_tps,
             "finalized": finalized_n, "finalized_tps": finalized_tps,
             "success_rate_pct": success,
+            "batch_size": args.batch_size,
+            "included_transfers_per_sec": included_tps * args.batch_size.max(1) as f64,
+            "finalized_transfers_per_sec": finalized_tps * args.batch_size.max(1) as f64,
         },
         "inclusion_latency_ms": {
             "count": incl.len(), "mean": mean(&incl),
@@ -367,6 +429,10 @@ async fn main() {
         submitted_n, included_n, finalized_n, errors_n, dropped_n, success);
     println!("INCLUDED (soft/microblock) TPS = {:.0}   FINALIZED (hard/macroblock-QC) TPS = {:.0}  (over {:.1}s)",
         included_tps, finalized_tps, active_secs);
+    if args.batch_size > 1 {
+        println!("BATCH MODE ({} transfers/tx): included TRANSFERS/s = {:.0}   finalized TRANSFERS/s = {:.0}",
+            args.batch_size, included_tps * args.batch_size as f64, finalized_tps * args.batch_size as f64);
+    }
     println!("inclusion (soft) latency ms:  p50={:.0} p95={:.0} p99={:.0} (n={})",
         pct(&incl, 50.0), pct(&incl, 95.0), pct(&incl, 99.0), incl.len());
     println!("hard finality latency ms (upper bound): p50={:.0} p95={:.0} p99={:.0} (n={})",
