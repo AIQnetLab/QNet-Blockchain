@@ -78,19 +78,21 @@ current height, so the elected index is stable for the whole rotation window reg
 Election is a deterministic hash evaluated in three stages. All inputs are on-chain, so every synchronized node computes the
 same result with no message exchange.
 
-**1. Epoch entropy.** For a window whose epoch is `N = (height-1)/90 + 1`, the entropy source is the deterministic-field
-hash of macroblock `N-2`:
+**1. Epoch entropy.** For a window whose epoch is `N = (height-1)/90 + 1`, the entropy source is derived from the chain
+itself — the hash of the microblock at height `(N-2)·90`:
 
 ```
-entropy_source = SHA3-256( "QNet_Deterministic_Entropy_v2.33"
-                         || height_le || timestamp_le || each micro_blocks hash
-                         || state_root || previous_hash )
+entropy_source = SHA3-256( "QNet_Chain_Entropy_v1" || seed_height_le || microblock_hash )
 ```
 
-`consensus_data` is deliberately excluded, which is what makes the value byte-stable across nodes. Round 0 and epochs 1-2
-substitute a genesis-derived value — `required_macroblock = N-2` saturates to 0 for both of the first two epochs, so no
-height up to 180 reads an on-chain macroblock for entropy. A stalled window substitutes `FrozenEntropy`, described under
-[Frozen roster](#frozen-roster-when-finality-stalls).
+The seed block sits 91-180 blocks below every height of epoch `N`, so a producer holding its contiguous chain always has
+it: production creates its own seed input and the seed can never lag production. Because the block is
+`previous_hash`-committed, every node on one branch derives the identical value, and nothing node-local — seal prefix,
+roster arm — enters the derivation. At the healthy finality gap the seed block is already below the certified frontier;
+a fork deeper than the seed distance is bounded by the rollback floor and resolved by certified-round fork choice, so
+branch-local seeds there behave like any chain-accumulated randomness. Deriving the seed from the *finalized* macroblock
+instead coupled production liveness to finality liveness: a sealing stall of more than two windows halted the chain.
+Round 0 and epochs 1-2 substitute a genesis-derived value, so no height up to 180 reads a chain seed.
 
 **2. Round seed.** The entropy source is folded with the round and the ordered candidate list:
 
@@ -110,8 +112,8 @@ round0_idx = SHA3-256( "QNET_LEADER_V4.5" || slot_seed
 
 `candidates` is sorted by `node_id`, so the index-to-identity mapping is identical everywhere.
 
-Election is public and computable in advance: any observer holding macroblock `N-2` can derive the leader for every slot of
-the coming windows, roughly two macroblock windows ahead. Liveness under leader targeting comes from timeout-certificate
+Election is public and computable in advance: any observer holding the chain through height `(N-2)*90` and the roster
+snapshot can derive the leader for every slot of the coming windows, roughly two macroblock windows ahead. Liveness under leader targeting comes from timeout-certificate
 failover.
 
 ### Failover rotation and the absolute round
@@ -139,10 +141,10 @@ round-0 roster with the same formula and a mismatch is rejected; only an underiv
 The candidate roster for the window covering epoch `N` is the `eligible_producers` snapshot stored inside macroblock `N-2`,
 deserialized and sorted by `node_id`. `N-2` rather than `N-1` because macroblock `N-1`'s consensus has not finished when
 block `N*90+1` already needs a roster. The rule is strictly `N-2` with no walk-back. A node that does not hold macroblock
-`N-2` abstains rather than substituting the nearest macroblock it happens to have. This is load-bearing: the seed comes from
-whichever macroblock the resolver stops at, so a different stop index means a different seed, a different roster and a fork.
-The same rule governs the Checkpoint-BFT committee (`committee_for_height`), and committee and seed are always read from the
-*same* macroblock — the beacon is that macroblock's own `randomness_beacon`. Above height 180, an empty roster means the
+`N-2` abstains rather than substituting the nearest macroblock it happens to have. This is load-bearing: a walk-back makes
+the roster a function of local holdings instead of the height, so a different stop index means a different roster and a fork.
+The same rule governs the Checkpoint-BFT committee (`committee_for_height`), and committee and beacon are always read from
+the *same* macroblock — the beacon is that macroblock's own `randomness_beacon`. Above height 180, an empty roster means the
 node is desynchronized: producer selection returns an empty string, the node excludes itself from production and enters a
 recoverable error state pending background sync.
 
@@ -172,12 +174,11 @@ Production is deliberately not gated on finality. `roster_mode(window)` classifi
 macroblock `w-2` verbatim); `Defer` when `w-2 > L` and `L < B` (a certified anchor exists but is not held — abstain and
 pull, never derive); `Frozen` when `w-2 > L` and `L == B` (finality genuinely stalled). Pre-first-seal (`L == 0`) is never
 `Frozen`. In `Frozen` mode the anchor `M_A` is the newest sealed macroblock, descending the contiguous prefix from `L`, that
-carries both a usable eligible set and a beacon. Roster, entropy, beacon and committee are then pure functions of that
-macroblock's bytes plus the public window index:
+carries both a usable eligible set and a beacon. Roster, beacon and committee are then pure functions of that macroblock's
+bytes plus the public window index; the election seed needs no frozen substitute, because it is chain-derived in every mode:
 
 ```
 FrozenRoster       = M_A.eligible_producers, empty ids dropped, sorted by node_id (constant across the horizon)
-FrozenEntropy(w)   = SHA3-256( "QNET_FROZEN_ENTROPY_V1" || hash_macroblock_entropy(M_A) || w_le )
 FrozenBeacon(w)    = SHA3-256( "QNET_FROZEN_BEACON_V1"  || M_A.randomness_beacon || w_le )
 FrozenCommittee(w) = sample_committee(FrozenRoster, w, FrozenBeacon(w), 1000, 1000)
 ```

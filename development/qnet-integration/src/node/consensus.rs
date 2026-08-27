@@ -402,11 +402,11 @@ impl BlockchainNode {
                         let tip = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
                         let macro_i = qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
                         let k = qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL;
-                        // Ask the driver for the boundary it is waiting on. Fall back to the 2-chain
-                        // estimate only before the runtime has published one.
                         let published = crate::consensus_v2_node::v2_next_window_head();
-                        let b = if published > 0 { published } else { (fin / k + 2) * k };
-                        if tip.saturating_sub(fin) > 2 * k && b <= tip {
+                        // The oldest unsealed window wins over the driver's cursor — the cursor can
+                        // outrun the tip and silence this guard forever; see redrive_boundary.
+                        if let Some(b) = crate::node::redrive_boundary(
+                            fin, tip, published, storage.last_sealed_mb_index()) {
                             // Intra frontier: re-arm the cursor so the intra path re-attempts exactly b.
                             if b % macro_i != 0 {
                                 last_intra_signalled.store(b.saturating_sub(k), std::sync::atomic::Ordering::Relaxed);

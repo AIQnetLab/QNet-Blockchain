@@ -4709,7 +4709,7 @@ mod tests_rollback_cache_invalidation {
     fn watchdog_arms_recovery_on_verify_livelock() {
         let src = include_str!("block_pipeline.rs");
         let i = src.find("verify_stuck mode=").expect("verify watchdog");
-        let window = &src[i..i + 1600];
+        let window: String = src[i..].chars().take(1600).collect();
         assert!(window.contains("livelock_recovery_target"),
                 "the verify watchdog must consult the livelock recovery decision");
         assert!(window.contains("signal_fork_recovery"),

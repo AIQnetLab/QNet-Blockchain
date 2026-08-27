@@ -820,6 +820,29 @@ pub fn expected_producer_for_round(height: u64, round: u64) -> Option<String> {
     Some(candidates[(round0_idx + round as usize) % candidates.len()].0.clone())
 }
 
+/// Boundary the finality redrive should re-signal, or None when finality is current.
+/// The oldest UNSEALED macroblock boundary overrides the driver's cursor: the cursor can run past
+/// the tip (checkpoints certified through the tip while a window's body was never assembled), and a
+/// cursor-only guard then never fires again — the halt at sealed=346 / tip=31320 / cursor=31350.
+/// The oldest unsealed window is always actionable: its blocks exist once the next window has
+/// begun, and its committee derives from last_sealed−1, sealed by definition.
+pub(crate) fn redrive_boundary(fin: u64, tip: u64, published: u64, last_sealed_mb: u64) -> Option<u64> {
+    let k = qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL;
+    let mb = qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
+    let oldest_unsealed = last_sealed_mb.saturating_add(1).saturating_mul(mb);
+    // Two independent lag signals. Intra checkpoints finalize WITHOUT sealing, so fin can sit at
+    // the tip over an unsealed window — a fin-only guard is then silent while elections starve two
+    // windows later. Seal lag gets one checkpoint of slack so a normal in-flight seal never fires it.
+    let fin_lagging = tip.saturating_sub(fin) > 2 * k;
+    let seal_lagging = tip >= oldest_unsealed.saturating_add(k);
+    if !fin_lagging && !seal_lagging {
+        return None;
+    }
+    let cursor = if published > 0 { published } else { (fin / k + 2) * k };
+    let b = if oldest_unsealed <= tip { cursor.min(oldest_unsealed) } else { cursor };
+    if b <= tip { Some(b) } else { None }
+}
+
 /// Mempool TTL in seconds. ONE source: the periodic sweep and the boot-rehydration filter must
 /// agree, or a restart re-admits exactly what the sweep is dropping.
 pub(crate) fn mempool_ttl_secs() -> u64 {
@@ -5431,9 +5454,8 @@ mod tests {
     }
 
     // ── A1 frozen-roster ──────────────────────────────────────────────────────────────────────────
-    /// Standalone anchor macroblock with `n` supers, tagged so two anchors differ in BOTH the beacon
-    /// (frozen_beacon input) and the state_root (a hash_macroblock_entropy input) — the frozen
-    /// derivations' only inputs.
+    /// Standalone anchor macroblock with `n` supers, tagged so two anchors differ in the beacon and
+    /// the state_root — the frozen derivations' inputs.
     fn mk_frozen_anchor(n: usize, tag: u8) -> qnet_state::MacroBlock {
         let elig: Vec<qnet_state::EligibleProducer> = (0..n)
             .map(|i| qnet_state::EligibleProducer { node_id: format!("super_{:04}", i), reputation: 7000 })
@@ -5551,8 +5573,8 @@ mod tests {
             assert!(!body.contains(local),
                     "election entropy consults node-local seal state ({local}) — two honest nodes                      with different ingest timing would seed differently and both self-elect");
         }
-        assert!(body.contains("resolve_producer_source_macroblock"),
-                "entropy must come from the N-2 macroblock");
+        assert!(body.contains("QNet_Chain_Entropy_v1"),
+                "entropy must come from the chain block at (N-2)*90, domain-separated");
     }
 
     /// An absent seed must ABSTAIN, never elect from a default. A zero seed is a valid-LOOKING seed:
@@ -5614,6 +5636,29 @@ mod tests {
                         "producer {} attested its own block at h={}", p, h);
             }
         }
+    }
+
+    /// Live numbers from the seal wedge, measured: sealed=346, fin=31200, tip=31320, and the driver
+    /// cursor ended at 31350. The old guard first drove the CURSOR boundary 31320 (the fruitless
+    /// `propose head_h=31320` re-broadcasts) and went silent once the cursor passed the tip; the
+    /// missing seal was window 347's boundary 31230, whose committee derives from sealed 345.
+    #[test]
+    fn the_redrive_targets_the_oldest_unsealed_window_not_the_cursor() {
+        assert_eq!(super::redrive_boundary(31200, 31320, 31350, 346), Some(31230),
+                   "the wedge case must re-signal the oldest unsealed boundary");
+        assert_eq!(super::redrive_boundary(31200, 31320, 0, 346), Some(31230),
+                   "without a published cursor the oldest unsealed boundary still wins");
+        // Intra checkpoints finalize without sealing, so fin can reach the tip over an unsealed
+        // window — a fin-only guard is silent here and elections starve two windows later.
+        assert_eq!(super::redrive_boundary(31320, 31320, 31350, 346), Some(31230),
+                   "seal lag must fire the redrive even when finality reached the tip");
+        assert_eq!(super::redrive_boundary(31260, 31320, 31350, 347), None,
+                   "healthy: fin gap inside 2k and the in-flight seal within its slack");
+        // Oldest window still incomplete (tip short of its boundary): a runaway cursor yields
+        // nothing (elections stay live at this lag and the chain reaches the boundary on its own),
+        // while an unpublished cursor falls back to the 2-chain estimate and drives the intra one.
+        assert_eq!(super::redrive_boundary(31140, 31229, 31350, 346), None);
+        assert_eq!(super::redrive_boundary(31140, 31229, 0, 346), Some(31200));
     }
 
     /// The numbers below are lifted verbatim from the live stall, so this test fails on the rule
@@ -5739,7 +5784,10 @@ mod tests {
             (include_str!("leader.rs"), "fn frozen_committee"),
         ] {
             let i = src.find(anchor).unwrap_or_else(|| panic!("missing {}", anchor));
-            assert!(src[i..i + 1200].contains("restart_excludes"),
+            // Char-based window: a byte slice panics whenever content shifts a boundary into the
+            // middle of a multi-byte character.
+            let window: String = src[i..].chars().take(1200).collect();
+            assert!(window.contains("restart_excludes"),
                     "{} must filter restart_excludes (GAP B)", anchor);
         }
     }
@@ -5751,7 +5799,9 @@ mod tests {
     fn mint_refused_under_active_ws_pin() {
         let src = include_str!("production.rs");
         let mint = src.find("first-ever launch confirmed").expect("mint site");
-        assert!(src[mint.saturating_sub(2500)..mint].contains("ws_checkpoint_index() > 0"),
+        let mut lo = mint.saturating_sub(2500);
+        while !src.is_char_boundary(lo) { lo += 1; }
+        assert!(src[lo..mint].contains("ws_checkpoint_index() > 0"),
                 "the genesis mint must refuse while a WS restart pin is active (GAP A)");
     }
 
@@ -7958,7 +8008,8 @@ mod tests_production_predicate {
         let src = include_str!("production.rs");
         let start = src.find("let prod_unlocked = PRODUCTION_UNLOCKED")
             .expect("the production gate must exist");
-        let body = &src[start..start + 900];
+        let body: String = src[start..].chars().take(900).collect();
+        let body = body.as_str();
         assert!(!body.contains("coordinator_is_synchronized"),
                 "production gate reads the FSM phase again — its own idleness would forbid it to produce");
         assert!(body.contains("LOCAL_BLOCKCHAIN_HEIGHT"),
@@ -7973,7 +8024,8 @@ mod tests_production_predicate {
         let src = &node_sources();
         let start = src.find("pub(crate) fn production_local_precondition(")
             .expect("production_local_precondition must exist");
-        let body = &src[start..start + 1600];
+        let body: String = src[start..].chars().take(1600).collect();
+        let body = body.as_str();
         // Escaped, not a real line break: a CRLF checkout would rewrite the pattern itself and it
         // would stop matching the LF-normalised body.
         let end = body.find("\n}\n").expect("function body must terminate");

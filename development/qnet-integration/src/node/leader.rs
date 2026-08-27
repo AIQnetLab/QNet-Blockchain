@@ -368,34 +368,39 @@ impl BlockchainNode {
                             }
                         }
                     } else {
-                        // Epoch 3+: Use MacroBlock N-2 (Byzantine finalized)
+                        // Epoch N >= 3: seed from the CHAIN, not from finality. The block at height
+                        // (N-2)*90 sits 91..180 blocks below every height of epoch N, so a producer
+                        // holding its contiguous chain always has it and the seed can never lag
+                        // production — a finality stall slows finality, never the chain. The bytes
+                        // are previous_hash-committed, so every node on one branch derives the same
+                        // seed, and NOTHING node-local (seal prefix, roster arm) enters it — the
+                        // h=272 different-arms fork cannot recur. At the healthy 31-59 finality gap
+                        // the seed block is already certified; a deeper fork than the seed distance
+                        // is bounded by the rollback floor and resolved by certified-round supersede.
+                        let seed_h = required_macroblock.saturating_mul(
+                            qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL);
                         if log_block(current_height) {
-                            if is_debug() { println!("[DBG][FINALITY] h={} ep={} mb={}", current_height, current_epoch, required_macroblock); }
+                            if is_debug() { println!("[DBG][FINALITY] h={} ep={} seed_h={}", current_height, current_epoch, seed_h); }
                         }
-                        
-                        // Election entropy comes from macroblock N-2 and from nothing else. It is the
-                        // ONE input that must be identical on every node: same height, same round and
-                        // same candidate set still elect different producers if the seed differs.
-                        //
-                        // The frozen arm cannot supply it. Its anchor is frozen_anchor(L), and L is
-                        // last_sealed_mb_index() — the node's LOCAL contiguous seal prefix. Two honest
-                        // nodes whose macroblock ingest is a few seconds apart hold different L, take
-                        // different arms and derive different seeds, so each elects ITSELF for the same
-                        // (height, round) and both produce. That is a fork with no adversary present,
-                        // observed at h=272 with round=9 timeout=1 on both sides and idx 0 vs 2.
-                        //
-                        // Absent N-2 ⇒ abstain. A node that cannot name the seed everyone else uses must
-                        // not produce: the quorum that holds N-2 keeps the chain moving, and a stall is
-                        // recoverable where a fork is not.
-                        match Self::resolve_producer_source_macroblock(store.as_ref(), required_macroblock) {
-                            Some((_used_idx, mb)) => Some(Self::hash_macroblock_entropy(&mb)),
+                        let seed_hash = store.load_microblock_hash(seed_h).ok().flatten()
+                            .or_else(|| store.load_microblock_auto_format(seed_h).ok().flatten()
+                                .map(|b| b.hash()));
+                        match seed_hash {
+                            Some(bh) => {
+                                let mut h = Sha3_256::new();
+                                h.update(b"QNet_Chain_Entropy_v1");
+                                h.update(&seed_h.to_le_bytes());
+                                h.update(&bh);
+                                let mut out = [0u8; 32];
+                                out.copy_from_slice(&h.finalize());
+                                Some(out)
+                            }
+                            // Absent only when the node lacks its own contiguous chain — abstain.
                             None => {
                                 if is_warn() {
-                                    println!("[WARN][FINALITY] entropy_unavailable mb={} h={} action=abstain",
-                                             required_macroblock, current_height);
+                                    println!("[WARN][FINALITY] entropy_unavailable seed_h={} h={} action=abstain",
+                                             seed_h, current_height);
                                 }
-                                set_node_state(NodeState::WaitingForMacroblock {
-                                    epoch: required_macroblock, macroblock_index: required_macroblock });
                                 None
                             }
                         }
@@ -533,28 +538,6 @@ impl BlockchainNode {
         }
     }
 
-    /// Deterministic per-macroblock VRF entropy: SHA3-256 over the macroblock's consensus-invariant
-    /// fields (domain-separated). Shared by the producer seed AND the attestation-committee seed so the
-    /// hashed-field set can change in exactly ONE place (a divergent copy would fork producer vs committee
-    /// entropy). consensus_data is EXCLUDED (it carries next_leader, which differs mid-consensus).
-    pub(super) fn hash_macroblock_entropy(mb: &qnet_state::MacroBlock) -> [u8; 32] {
-        let mut hasher = Sha3_256::new();
-        // Domain bumped with the macroblock preimage change (PoH fields removed): the tag must
-        // change whenever the hashed field set does, or two builds derive different entropy from
-        // the same tag and elect different producers.
-        hasher.update(b"QNet_Deterministic_Entropy_v2.33");
-        hasher.update(&mb.height.to_le_bytes());
-        hasher.update(&mb.timestamp.to_le_bytes());
-        for block_hash in &mb.micro_blocks {
-            hasher.update(block_hash);
-        }
-        hasher.update(&mb.state_root);
-        hasher.update(&mb.previous_hash);
-        let result = hasher.finalize();
-        let mut hash = [0u8; 32];
-        hash.copy_from_slice(&result);
-        hash
-    }
 
     /// Frozen horizon: how many windows past the last seal production continues on the frozen anchor
     /// before a node parks and syncs. Caps unfinalized depth (an unbounded tail is an unbounded reorg).
@@ -640,33 +623,6 @@ impl BlockchainNode {
             Self::COMMITTEE_THRESHOLD, Self::CONSENSUS_COMMITTEE_SIZE)
     }
 
-    /// Resolve the finalized macroblock that seeds BOTH the producer/committee candidate set AND the
-    /// VRF entropy for epoch N (required_macroblock = N-2). STRICTLY N-2 — there is no walk-back.
-    ///
-    /// The bounded walk-back that used to live here returned the most recent macroblock this node
-    /// happened to hold, which makes the producer entropy a function of local RocksDB contents instead
-    /// of the height: two nodes with different holdings elect different producers for the same slot.
-    /// It was unreachable only because the candidate-set reader happened to return empty first, and it
-    /// is not the kind of thing to leave standing on an accident. None => abstain from this election.
-    pub(super) fn resolve_producer_source_macroblock(
-        storage: &Storage,
-        required_macroblock: u64,
-    ) -> Option<(u64, qnet_state::MacroBlock)> {
-        if required_macroblock == 0 { return None; }
-        let data = storage.get_macroblock_by_height(required_macroblock).ok().flatten()?;
-        let mb = bincode::deserialize::<qnet_state::MacroBlock>(&data).ok()?;
-        let eligible_nonempty = mb.consensus_data.eligible_producers.as_ref()
-            .and_then(|x| bincode::deserialize::<Vec<qnet_state::EligibleProducer>>(x).ok())
-            .map(|v| v.iter().any(|p| !p.node_id.is_empty()))
-            .unwrap_or(false);
-        // Mirrors the candidate set's PRIMARY(eligible)/SECONDARY(commits) acceptance; the seed itself
-        // derives from deterministic macroblock fields, so it is beacon-agnostic.
-        if eligible_nonempty || !mb.consensus_data.commits.is_empty() {
-            Some((required_macroblock, mb))
-        } else {
-            None
-        }
-    }
 
     /// CRITICAL FIX: Invalidate producer cache during emergency failover
     /// This prevents the network from selecting failed producers repeatedly
@@ -959,10 +915,7 @@ impl BlockchainNode {
                             let excluded_node_ids: std::collections::HashSet<String> =
                                 std::collections::HashSet::new();
                             
-                            // PRIMARY: eligible_producers snapshot. Filter empty node_ids so the SET's
-                            // usability predicate is byte-identical to the seed resolver's
-                            // (resolve_producer_source_macroblock: any !node_id.is_empty()) — makes the
-                            // same-macroblock invariant structural, not luck-of-honest-roster. The
+                            // PRIMARY: eligible_producers snapshot, empty node_ids dropped. The
                             // excluded set stays a no-op (liveness exclusion must be on-chain/QC-bound).
                             if let Some(ref snapshot_data) = macroblock.consensus_data.eligible_producers {
                                 if let Ok(producers) = bincode::deserialize::<Vec<qnet_state::EligibleProducer>>(snapshot_data) {

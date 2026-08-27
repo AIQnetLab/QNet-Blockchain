@@ -173,6 +173,7 @@ in one context can never be replayed as a valid preimage in another. The main in
 | `log-leaf` / `log-node`, `logw-leaf` / `logw-node` | event-log tree, level 1 and window level 2 |
 | `qnet-registry-root-v2`, `qnet-registry-row-v4`, `qnet-dpk-row-v1`, `qnet-reward-epoch-root-v1` | LtHash digests and row seeds |
 | `QNet_VRF_v7_OUTPUT` / `QNet_VRF_v7_PROOF`, `QNet_VRF_SlotSeed_v4`, `QNET_LEADER_V4.5` | VRF output and proof, slot seed, deterministic leader selection |
+| `QNet_Chain_Entropy_v1` | epoch election seed over the height and hash of the chain block at `(N-2)*90` |
 | `COMMITTEE_VRF_v3.36` | per-member checkpoint-committee selection score, seeded from the eligible set and beacon of macroblock `j-2` |
 | `qnet-epoch-v2` | `epoch_commitment` over the eligible bytes, the derived committee and the banned list |
 | `QNET_VALIDATOR_SET:` | flat digest of the node-discovery validator set served to light clients, over the epoch and the sorted per-validator fields |
