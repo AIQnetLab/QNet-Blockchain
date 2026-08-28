@@ -1588,7 +1588,7 @@ impl BlockchainNode {
         //                            Any post-genesis CreateAccount is an attack.
         //   * BatchRewardClaims   — DEPRECATED enum variant, never instantiated.
         //   * BatchNodeActivations — DEPRECATED enum variant, never instantiated.
-        //   * BatchTransfers      — UNUSED handler-only enum variant.
+        //   * BatchTransfers      — LIVE signed value class; bounds checked below.
         //
         // SCALABILITY: O(1) match per gossip TX. Identical cost at 5 or 5000
         // validators — no cross-node coordination, purely local check.

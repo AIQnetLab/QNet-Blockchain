@@ -1800,6 +1800,11 @@ impl qnet_state::AccountStore for Storage {
         }
     }
 
+    fn load_accounts_batch(&self, addresses: &[String]) -> Vec<Option<qnet_state::Account>> {
+        // One RocksDB multi_get over the accounts CF (reward_store.rs).
+        Storage::load_accounts_batch(self, addresses)
+    }
+
     fn persist_accounts(&self, accounts: &[(String, qnet_state::Account)]) -> bool {
         match self.persistent.persist_accounts_sync(accounts) {
             Ok(_) => true,

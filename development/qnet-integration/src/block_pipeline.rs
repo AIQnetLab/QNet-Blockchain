@@ -2644,15 +2644,15 @@ impl BlockPipeline {
             // Internal-only TX type guard: post-genesis, HARD REJECT the whole
             // block (+ peer reputation penalty) if it carries a genesis-only or
             // deprecated variant (CreateAccount / BatchRewardClaims /
-            // BatchNodeActivations / BatchTransfers) — a Byzantine producer
-            // could embed one bypassing mempool admission. O(tx_count).
+            // BatchNodeActivations) — a Byzantine producer could embed one
+            // bypassing mempool admission. BatchTransfers is a live signed value
+            // class (bounds + ML-DSA gate run at verify/apply). O(tx_count).
             if mb.height > 0 {
                 for tx in &decoded.microblock.transactions {
                     let forbidden = matches!(tx.tx_type,
                         qnet_state::TransactionType::CreateAccount { .. } |
                         qnet_state::TransactionType::BatchRewardClaims { .. } |
-                        qnet_state::TransactionType::BatchNodeActivations { .. } |
-                        qnet_state::TransactionType::BatchTransfers { .. }
+                        qnet_state::TransactionType::BatchNodeActivations { .. }
                     );
                     if forbidden {
                         if is_warn() {

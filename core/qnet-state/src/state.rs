@@ -1700,6 +1700,14 @@ pub trait AccountStore: Send + Sync {
     /// the canonical "account not found" path).
     fn load_account(&self, address: &str) -> Option<Account>;
 
+    /// Batched best-effort read; result order matches `addresses`. Default is N
+    /// single reads so simple stores stay correct; the RocksDB store overrides
+    /// this with one multi_get — the block-apply warm was N sequential point
+    /// reads, the dominant cost of applying a loaded block.
+    fn load_accounts_batch(&self, addresses: &[String]) -> Vec<Option<Account>> {
+        addresses.iter().map(|a| self.load_account(a)).collect()
+    }
+
     /// Durable batch write of accounts. Called by the eviction sweep BEFORE dropping entries from the
     /// cache; returns true IFF the write durably succeeded. The evictor removes ONLY a successfully-
     /// persisted batch, so a failed persist (I/O error, or no store) keeps the accounts resident —
@@ -1921,11 +1929,37 @@ impl StateManager {
     /// to ensure every sender / receiver / contract address the block
     /// touches is resident before the apply mutates state. Returns the
     /// count of addresses that ended up resident (cache hit + disk hit).
+    /// Misses are loaded in ONE multi_get instead of per-address point reads.
     pub fn warm_accounts(&self, addresses: &[String]) -> usize {
         let mut hit = 0usize;
+        let mut misses: Vec<String> = Vec::new();
         for addr in addresses {
-            if self.warm_account(addr) {
+            if self.accounts.contains_key(addr) {
+                self.cache_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.touch_access(addr);
                 hit = hit.saturating_add(1);
+            } else {
+                self.cache_misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                misses.push(addr.clone());
+            }
+        }
+        if misses.is_empty() { return hit; }
+        let store_guard = self.disk_store.read();
+        if let Some(ref store) = *store_guard {
+            for (addr, loaded) in misses.iter().zip(store.load_accounts_batch(&misses)) {
+                match loaded {
+                    Some(account) => {
+                        self.disk_load_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        // Race-tolerant: keep an entry inserted concurrently — identical
+                        // bytes, load_accounts_batch is deterministic on the same store.
+                        self.accounts.entry(addr.clone()).or_insert(account);
+                        self.touch_access(addr);
+                        hit = hit.saturating_add(1);
+                    }
+                    None => {
+                        self.disk_load_misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
             }
         }
         hit
