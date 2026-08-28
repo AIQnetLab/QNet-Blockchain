@@ -1622,6 +1622,22 @@ impl BlockPipeline {
                     );
                     last_apply_dump_ms = now;
                 }
+
+                // APPLY STARVED: op says idle yet verified blocks queue unapplied — the recv
+                // (or the task itself) is not making progress. The idle exemption above hid
+                // exactly this signature during a live wedge; it must be loud, not silent.
+                if apply_op == PIPELINE_OP_IDLE
+                    && verified_now > applied_now + 8
+                    && apply_stall_ms >= STUCK_THRESHOLD_MS
+                    && last_applied_progress_ms != 0
+                    && now.saturating_sub(last_apply_dump_ms) >= STUCK_THRESHOLD_MS
+                {
+                    eprintln!(
+                        "[CRIT][PIPELINE] apply_starved stall_ms={} verified={} applied={} gap={} — idle recv with a non-empty queue",
+                        apply_stall_ms, verified_now, applied_now, verified_now.saturating_sub(applied_now),
+                    );
+                    last_apply_dump_ms = now;
+                }
             }
         });
 

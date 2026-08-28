@@ -251,6 +251,11 @@ pub struct StateMerkleTree {
     /// survive and poison later incremental sibling reads. Consumed + reset at
     /// flush. Leaves are unaffected (maintained precisely via leaf_puts/leaf_dels).
     node_wipe_pending: bool,
+    /// True while the node cache provably holds every store-resident node row
+    /// (after a full rebuild, until the first eviction). Lets node_del skip the
+    /// store tombstone for rows that never existed — a loaded block's lone-climb
+    /// otherwise pushed millions of no-op deletes into the store every finalize.
+    node_cache_complete: bool,
     /// Set when the incremental pass read a node it could not resolve. finalize discards the
     /// result and redoes the pass as a full recompute rather than sealing a guessed root.
     incremental_pass_invalid: bool,
@@ -292,6 +297,7 @@ impl StateMerkleTree {
             delta_node_dels: Vec::new(),
             pending_leaf_dels: BTreeSet::new(),
             node_wipe_pending: false,
+            node_cache_complete: true,
             incremental_pass_invalid: false,
         }
     }
@@ -301,6 +307,7 @@ impl StateMerkleTree {
     /// was chosen. Consensus-neutral: the produced root is unchanged.
     pub fn set_node_store(&mut self, store: std::sync::Arc<dyn MerkleNodeStore>) {
         self.node_store = Some(store);
+        self.node_cache_complete = false; // store may hold rows the cache does not
         if self.node_cache_cap == 0 {
             self.node_cache_cap = DEFAULT_NODE_CACHE_CAP;
         }
@@ -328,6 +335,7 @@ impl StateMerkleTree {
             }
         }
         *self = Self::new();
+        self.node_cache_complete = store.is_none();
         self.node_store = store;
         self.node_cache_cap = cap;
     }
@@ -412,8 +420,9 @@ impl StateMerkleTree {
     /// Delete an internal node (subtree became default). Store None → exactly
     /// `intermediate_nodes.remove`.
     fn node_del(&mut self, depth: u32, key: [u8; HASH_SIZE]) {
-        self.intermediate_nodes.remove(&(depth, key));
-        if self.node_store.is_some() {
+        let existed = self.intermediate_nodes.remove(&(depth, key)).is_some();
+        // With a complete cache a miss proves the store has no row either — no tombstone.
+        if self.node_store.is_some() && (existed || !self.node_cache_complete) {
             self.delta_node_dels.push((depth, key));
         }
     }
@@ -612,6 +621,7 @@ impl StateMerkleTree {
                 for k in victims {
                     self.intermediate_nodes.remove(&k);
                 }
+                self.node_cache_complete = false;
             }
         }
     }
@@ -1161,6 +1171,8 @@ impl StateMerkleTree {
         // reset at flush) when no store is attached.
         if self.node_store.is_some() {
             self.node_wipe_pending = true;
+            // The rebuild re-puts the complete node set into the cache.
+            self.node_cache_complete = true;
         }
         // Working leaf set: store None → clone the in-mem authority (unchanged);
         // store Some → bulk-read the full set from disk, then OVERLAY the in-mem
@@ -1306,39 +1318,102 @@ impl StateMerkleTree {
 
     fn recompute_levels(&mut self) {
         // Frontier value: (hash, is_branch, first_foreign_depth).
-        let dirty: Vec<[u8; HASH_SIZE]> = self.dirty_paths.drain().collect();
-        let mut frontier: BTreeMap<[u8; HASH_SIZE], ([u8; HASH_SIZE], bool, usize)> = BTreeMap::new();
+        let mut dirty: Vec<[u8; HASH_SIZE]> = self.dirty_paths.drain().collect();
+        dirty.sort_unstable();
+        let mut inits: Vec<([u8; HASH_SIZE], [u8; HASH_SIZE], usize)> = Vec::with_capacity(dirty.len());
         for k in dirty {
             let h = self.leaf_get(&k).unwrap_or(self.default_hashes[0]);
             let ffd = self.first_foreign_depth(&k);
-            frontier.insert(k, (h, false, ffd));
+            inits.push((k, h, ffd));
         }
 
-        let mut buffer = [0u8; HASH_SIZE * 2];
-
-        for depth in 0..TREE_DEPTH {
-            let default = self.default_hashes[depth];
-            let mut next: BTreeMap<[u8; HASH_SIZE], ([u8; HASH_SIZE], bool, usize)> = BTreeMap::new();
-            let keys: Vec<[u8; HASH_SIZE]> = frontier.keys().copied().collect();
-            let mut processed: std::collections::HashSet<[u8; HASH_SIZE]> =
-                std::collections::HashSet::new();
-
-            for key in keys {
-                if processed.contains(&key) {
-                    continue;
+        // LONE CLIMB: below ffd-1 a leaf provably has no neighbour, so its whole
+        // path segment is hash(value, default) per level with both child rows
+        // deleted — no maps involved. Pure per leaf → parallel. Climb regions of
+        // distinct leaves are disjoint (a shared ancestor implies a foreign leaf,
+        // contradicting ffd), so the emitted delete set is exactly the old one.
+        // This cuts map traffic from O(k x depth) to O(k x meet-levels).
+        let defaults = self.default_hashes.clone();
+        let climb = |&(key, val, ffd): &([u8; HASH_SIZE], [u8; HASH_SIZE], usize)| {
+            let act = ffd.saturating_sub(1).min(TREE_DEPTH);
+            let mut cur = key;
+            let mut v = val;
+            let mut dels: Vec<(u32, [u8; HASH_SIZE])> = Vec::with_capacity(act.saturating_sub(1) * 2);
+            let mut buffer = [0u8; HASH_SIZE * 2];
+            for d in 0..act {
+                if d >= 1 {
+                    let mut sib = cur;
+                    Self::flip_bit(&mut sib, d);
+                    dels.push((d as u32, cur));
+                    dels.push((d as u32, sib));
                 }
-                let (value, branch, ffd) = frontier[&key];
-                let mut sibling_key = key;
-                Self::flip_bit(&mut sibling_key, depth);
-                processed.insert(key);
-                processed.insert(sibling_key);
+                if Self::get_bit(&cur, d) {
+                    buffer[..HASH_SIZE].copy_from_slice(&defaults[d]);
+                    buffer[HASH_SIZE..].copy_from_slice(&v);
+                } else {
+                    buffer[..HASH_SIZE].copy_from_slice(&v);
+                    buffer[HASH_SIZE..].copy_from_slice(&defaults[d]);
+                }
+                let mut hasher = Sha3_256::new();
+                hasher.update(&buffer);
+                v.copy_from_slice(&hasher.finalize());
+                Self::clear_bit(&mut cur, d);
+            }
+            (act, cur, v, ffd, dels)
+        };
+        let climbed: Vec<(usize, [u8; HASH_SIZE], [u8; HASH_SIZE], usize, Vec<(u32, [u8; HASH_SIZE])>)> =
+            if inits.len() >= 16 {
+                use rayon::prelude::*;
+                inits.par_iter().map(climb).collect()
+            } else {
+                inits.iter().map(climb).collect()
+            };
+        // Buckets: entries join the level machinery at their activation depth.
+        let mut buckets: Vec<Vec<([u8; HASH_SIZE], ([u8; HASH_SIZE], bool, usize))>> =
+            (0..=TREE_DEPTH).map(|_| Vec::new()).collect();
+        for (act, key, v, ffd, dels) in climbed {
+            for (d, k) in dels { self.node_del(d, k); }
+            buckets[act].push((key, (v, false, ffd)));
+        }
 
-                // Sibling precedence: another dirty node at this depth, else the
-                // stored/derived node — skipped entirely below `ffd`, where no other
-                // leaf can exist.
-                // The sibling is part of the PARENT subtree, so it is provably empty
-                // only while the parent (depth+1) still holds no foreign leaf.
-                let (sibling, sib_branch) = match frontier.get(&sibling_key).copied() {
+        // Meet levels: group siblings by bit-cleared canonical key, resolve + apply
+        // the store rule serially, hash pairs in parallel. HashMaps throughout —
+        // order affects neither the root (pure function) nor the node set (distinct
+        // keys). This whole recompute was 99% of block-apply cost.
+        let mut frontier: std::collections::HashMap<[u8; HASH_SIZE], ([u8; HASH_SIZE], bool, usize)> =
+            std::collections::HashMap::new();
+        for depth in 0..TREE_DEPTH {
+            for (k, v) in buckets[depth].drain(..) { frontier.insert(k, v); }
+            if frontier.is_empty() { continue; }
+            let default = self.default_hashes[depth];
+
+            let mut pairs: std::collections::HashMap<[u8; HASH_SIZE],
+                [Option<([u8; HASH_SIZE], bool, usize)>; 2]> =
+                std::collections::HashMap::with_capacity(frontier.len());
+            for (key, val) in std::mem::take(&mut frontier) {
+                let mut canon = key;
+                Self::clear_bit(&mut canon, depth);
+                let side = Self::get_bit(&key, depth) as usize;
+                pairs.entry(canon).or_default()[side] = Some(val);
+            }
+
+            // (canon, hash-input, parent_branch, parent_ffd)
+            let mut jobs: Vec<([u8; HASH_SIZE], [u8; HASH_SIZE * 2], bool, usize)> =
+                Vec::with_capacity(pairs.len());
+
+            for (canon, [lo, hi]) in pairs {
+                let mut hi_key = canon;
+                Self::flip_bit(&mut hi_key, depth);
+                // `value` = the dirty member (low side first, as before); the other side
+                // is the sibling: another dirty node, else default below `ffd` (no other
+                // leaf can exist there — the parent subtree holds no foreign leaf yet),
+                // else the stored/derived node.
+                let (key, sibling_key, value, branch, ffd, sib_dirty) = match (lo, hi) {
+                    (Some((v, b, f)), other) => (canon, hi_key, v, b, f, other),
+                    (None, Some((v, b, f))) => (hi_key, canon, v, b, f, None),
+                    (None, None) => continue,
+                };
+                let (sibling, sib_branch) = match sib_dirty {
                     Some((sv, sb, _)) => (sv, sb),
                     None if depth + 1 < ffd => (default, false),
                     None => self.node_resolve(depth, &sibling_key),
@@ -1349,12 +1424,8 @@ impl StateMerkleTree {
 
                 // STORE RULE (mirrors recompute_root): a node is persisted only when
                 // it is a branch or has a live sibling. Chain interiors are derived.
-                //
-                // "Not stored" MUST mean deleted, never skipped. recompute_root can leave the
-                // negative case implicit because it wipes the node set first; this path has no
-                // wipe, so a skip leaves a row that was a chain TOP before a deletion still
-                // holding its pre-deletion hash, and the next finalize writing into the vacated
-                // region folds that stale row straight back into the root.
+                // "Not stored" MUST mean deleted, never skipped: with no wipe, a skip
+                // leaves a stale pre-deletion row that a later finalize folds back in.
                 if depth >= 1 {
                     if value_live && (branch || sibling_live) {
                         self.node_put(depth as u32, key, value);
@@ -1368,8 +1439,7 @@ impl StateMerkleTree {
                     }
                 }
 
-                let mut parent_key = key;
-                Self::clear_bit(&mut parent_key, depth);
+                let mut buffer = [0u8; HASH_SIZE * 2];
                 if Self::get_bit(&key, depth) {
                     buffer[..HASH_SIZE].copy_from_slice(&sibling);
                     buffer[HASH_SIZE..].copy_from_slice(&value);
@@ -1377,20 +1447,35 @@ impl StateMerkleTree {
                     buffer[..HASH_SIZE].copy_from_slice(&value);
                     buffer[HASH_SIZE..].copy_from_slice(&sibling);
                 }
-                let mut hasher = Sha3_256::new();
-                hasher.update(&buffer);
-                let mut parent_hash = [0u8; HASH_SIZE];
-                parent_hash.copy_from_slice(&hasher.finalize());
-
                 let parent_branch = (value_live && sibling_live) || branch || sib_branch;
                 // Once merged the shortcut no longer applies; keep it only while the
                 // parent still covers a single leaf.
                 let parent_ffd = if parent_branch { 0 } else { ffd };
-                next.insert(parent_key, (parent_hash, parent_branch, parent_ffd));
+                jobs.push((canon, buffer, parent_branch, parent_ffd));
             }
 
-            frontier = next;
+            let hash_job = |(canon, buffer, pb, pffd): ([u8; HASH_SIZE], [u8; HASH_SIZE * 2], bool, usize)| {
+                let mut hasher = Sha3_256::new();
+                hasher.update(&buffer);
+                let mut parent_hash = [0u8; HASH_SIZE];
+                parent_hash.copy_from_slice(&hasher.finalize());
+                (canon, (parent_hash, pb, pffd))
+            };
+            // Fork-join pays off only on loaded levels; a 1-2 tx block stays sequential.
+            // Par side collects a Vec (no per-shard map merging), then one serial fill.
+            if jobs.len() >= 64 {
+                use rayon::prelude::*;
+                let hashed: Vec<_> = jobs.into_par_iter().map(hash_job).collect();
+                frontier = std::collections::HashMap::with_capacity(hashed.len());
+                for (k, v) in hashed { frontier.insert(k, v); }
+            } else {
+                frontier = std::collections::HashMap::with_capacity(jobs.len());
+                for (k, v) in jobs.into_iter().map(hash_job) { frontier.insert(k, v); }
+            };
         }
+
+        // A leaf alone in the whole tree climbs straight to the top bucket.
+        for (k, v) in buckets[TREE_DEPTH].drain(..) { frontier.insert(k, v); }
 
         // TREE_DEPTH = address bit-width → all paths converge to the all-zero
         // canonical key at the top level. Empty/default subtree → default root.
@@ -5828,4 +5913,265 @@ mod tests_snapshot_supply_rollback {
                 "a discarded registration must be re-appliable, not silently deduped away");
     }
 
+}
+
+#[cfg(test)]
+mod bench_batch_apply {
+    use super::*;
+    use crate::transaction::{Transaction, TransactionType, BatchTransferData};
+
+    fn eon(i: u64) -> String {
+        // Shape-only address; apply does not re-validate the checksum.
+        format!("{:0>19}eon{:0>15}{:0>8}", i, i, i)
+    }
+
+    /// Profiles the state cost of one loaded batch block: 40 batches x 100
+    /// recipients into a 10k-account state. Run explicitly:
+    /// cargo test -p qnet-state --release bench_batch_block -- --nocapture --ignored
+    #[test]
+    #[ignore]
+    fn bench_batch_block_apply_profile() {
+        let state = StateManager::new();
+        for i in 0..10_000u64 {
+            let a = eon(i);
+            let mut ac = Account::new(a.clone());
+            ac.balance = 1_000_000_000_000;
+            state.accounts.insert(a, ac);
+        }
+        let t0 = std::time::Instant::now();
+        let txs: Vec<Transaction> = (0..40u64).map(|b| {
+            let transfers: Vec<BatchTransferData> = (0..100u64).map(|k| BatchTransferData {
+                to_address: eon(1000 + (b * 137 + k * 13) % 9000),
+                amount: 1,
+                memo: None,
+            }).collect();
+            Transaction::new(
+                eon(b), Some("batch_transfers".into()), 100, 1, 10, 1_000_000,
+                1_700_000_000, None,
+                TransactionType::BatchTransfers { transfers, batch_id: format!("bench-{b}") },
+                None,
+            )
+        }).collect();
+        let t_build = t0.elapsed();
+
+        let t1 = std::time::Instant::now();
+        let applied = state.apply_block_batch_at_height(&txs, 100).expect("apply");
+        let t_apply = t1.elapsed();
+
+        let t2 = std::time::Instant::now();
+        let root = state.finalize_merkle();
+        let t_final = t2.elapsed();
+
+        println!("BENCH build={:?} apply={:?} ({} txs, {} transfers, {:?}/transfer) finalize={:?} root={}",
+            t_build, t_apply, applied, applied * 100,
+            t_apply / (applied as u32 * 100).max(1), t_final, hex::encode(&root[..8]));
+        assert_eq!(applied, 40);
+    }
+
+    /// Scaling probe: same 4000 transfers as singles and as batches of 10.
+    #[test]
+    #[ignore]
+    fn bench_batch_scaling_profile() {
+        for (label, nb, k) in [("singles", 4000u64, 1u64), ("batch10", 400, 10), ("batch100", 40, 100)] {
+            let state = StateManager::new();
+            for i in 0..10_000u64 {
+                let a = eon(i);
+                let mut ac = Account::new(a.clone());
+                ac.balance = 1_000_000_000_000;
+                state.accounts.insert(a, ac);
+            }
+            let txs: Vec<Transaction> = (0..nb).map(|b| {
+                if k == 1 {
+                    let to = eon(1000 + (b * 13) % 9000);
+                    Transaction::new(eon(b % 9000), Some(to.clone()), 1, 1 + b / 9000, 10, 10_000,
+                        1_700_000_000, None,
+                        TransactionType::Transfer { from: eon(b % 9000), to, amount: 1 }, None)
+                } else {
+                    let transfers: Vec<BatchTransferData> = (0..k).map(|q| BatchTransferData {
+                        to_address: eon(1000 + (b * 137 + q * 13) % 9000), amount: 1, memo: None,
+                    }).collect();
+                    Transaction::new(eon(b), Some("batch_transfers".into()), k, 1, 10, 10_000 * k,
+                        1_700_000_000, None,
+                        TransactionType::BatchTransfers { transfers, batch_id: format!("s-{b}") }, None)
+                }
+            }).collect();
+            let t = std::time::Instant::now();
+            let applied = state.apply_block_batch_at_height(&txs, 100).expect("apply");
+            let el = t.elapsed();
+            println!("SCALE {label}: txs={applied} transfers={} total={:?} per_transfer={:?}",
+                applied as u64 * k, el, el / (applied as u32 * k as u32).max(1));
+        }
+    }
+
+    /// Phase breakdown of the lazy apply path over 4000 single transfers.
+    #[test]
+    #[ignore]
+    fn bench_apply_phase_breakdown() {
+        let state = StateManager::new();
+        for i in 0..10_000u64 {
+            let a = eon(i);
+            let mut ac = Account::new(a.clone());
+            ac.balance = 1_000_000_000_000;
+            state.accounts.insert(a, ac);
+        }
+        let txs: Vec<Transaction> = (0..4000u64).map(|b| {
+            let to = eon(1000 + (b * 13) % 9000);
+            Transaction::new(eon(b % 9000), Some(to.clone()), 1, 1 + b / 9000, 10, 10_000,
+                1_700_000_000, None,
+                TransactionType::Transfer { from: eon(b % 9000), to, amount: 1 }, None)
+        }).collect();
+
+        let (mut t_addr, mut t_warm, mut t_apply, mut t_merkle, mut t_wb) =
+            (std::time::Duration::ZERO, std::time::Duration::ZERO, std::time::Duration::ZERO,
+             std::time::Duration::ZERO, std::time::Duration::ZERO);
+        for tx in &txs {
+            let t = std::time::Instant::now();
+            let addrs = tx.get_all_affected_addresses();
+            t_addr += t.elapsed();
+
+            let t = std::time::Instant::now();
+            let mut map: HashMap<String, Account> = HashMap::new();
+            for a in &addrs {
+                self_warm(&state, a);
+                if let Some(acc) = state.accounts.get(a) { map.insert(a.clone(), acc.clone()); }
+            }
+            t_warm += t.elapsed();
+
+            let t = std::time::Instant::now();
+            let mut owns = Vec::new();
+            tx.apply_to_state_at_indexed(&mut map, 100, &mut owns).expect("apply");
+            t_apply += t.elapsed();
+
+            let t = std::time::Instant::now();
+            {
+                let mut tree = state.merkle_tree.write();
+                for (a, acc) in &map { tree.insert_lazy(a, acc); }
+            }
+            t_merkle += t.elapsed();
+
+            let t = std::time::Instant::now();
+            for (a, acc) in map { state.accounts.insert(a, acc); }
+            t_wb += t.elapsed();
+        }
+        println!("PHASES addr={:?} warm_clone={:?} apply={:?} merkle={:?} writeback={:?}  (4000 tx)",
+                 t_addr, t_warm, t_apply, t_merkle, t_wb);
+    }
+
+    fn self_warm(sm: &StateManager, a: &str) { sm.warm_account(a); }
+
+    /// Direct apply_transaction_lazy loop — isolates fn-internal cost from the block wrapper.
+    #[test]
+    #[ignore]
+    fn bench_lazy_direct() {
+        let state = StateManager::new();
+        for i in 0..10_000u64 {
+            let a = eon(i);
+            let mut ac = Account::new(a.clone());
+            ac.balance = 1_000_000_000_000;
+            state.accounts.insert(a, ac);
+        }
+        let txs: Vec<Transaction> = (0..4000u64).map(|b| {
+            let to = eon(1000 + (b * 13) % 9000);
+            Transaction::new(eon(b % 9000), Some(to.clone()), 1, 1 + b / 9000, 10, 10_000,
+                1_700_000_000, None,
+                TransactionType::Transfer { from: eon(b % 9000), to, amount: 1 }, None)
+        }).collect();
+        let t = std::time::Instant::now();
+        let mut ok = 0usize;
+        for tx in &txs { if state.apply_transaction_lazy(tx).is_ok() { ok += 1; } }
+        println!("LAZY_DIRECT ok={} total={:?} per_tx={:?}", ok, t.elapsed(), t.elapsed() / (ok as u32).max(1));
+    }
+
+    /// Times finalize_merkle alone over ~8000 dirty leaves.
+    #[test]
+    #[ignore]
+    fn bench_finalize_only() {
+        let state = StateManager::new();
+        for i in 0..10_000u64 {
+            let a = eon(i);
+            let mut ac = Account::new(a.clone());
+            ac.balance = 1_000_000_000_000;
+            state.accounts.insert(a, ac);
+        }
+        let txs: Vec<Transaction> = (0..4000u64).map(|b| {
+            let to = eon(1000 + (b * 13) % 9000);
+            Transaction::new(eon(b % 9000), Some(to.clone()), 1, 1 + b / 9000, 10, 10_000,
+                1_700_000_000, None,
+                TransactionType::Transfer { from: eon(b % 9000), to, amount: 1 }, None)
+        }).collect();
+        let t0 = std::time::Instant::now();
+        for tx in &txs { let _ = state.apply_transaction_lazy(tx); }
+        let t_apply = t0.elapsed();
+        let t1 = std::time::Instant::now();
+        let root = state.finalize_merkle();
+        println!("FINALIZE apply_loop={:?} finalize={:?} root={}",
+                 t_apply, t1.elapsed(), hex::encode(&root[..8]));
+    }
+
+    /// Randomized (fixed-seed) equivalence: many rounds of inserts AND updates —
+    /// updates flip chain-tops to derived and back, the store-rule negative case.
+    #[test]
+    fn incremental_root_equals_full_rebuild_randomized() {
+        let mut lcg: u64 = 0x9E3779B97F4A7C15;
+        let mut next = move || { lcg = lcg.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); lcg };
+        let mut inc = StateMerkleTree::new();
+        let mut live: std::collections::BTreeMap<String, Account> = std::collections::BTreeMap::new();
+        for _round in 0..12 {
+            for _ in 0..40 {
+                let fresh = next() % 3 != 0 || live.is_empty();
+                let addr = if fresh {
+                    format!("{:0>19}eon{:0>15}{:0>8}", next() % 1_000_000, next() % 1_000_000, 1u64)
+                } else {
+                    let idx = (next() as usize) % live.len();
+                    live.keys().nth(idx).unwrap().clone()
+                };
+                let mut ac = Account::new(addr.clone());
+                ac.balance = next();
+                ac.nonce = next() % 1000;
+                inc.insert_lazy(&addr, &ac);
+                live.insert(addr, ac);
+            }
+            inc.finalize();
+        }
+        let root_incremental = inc.finalize();
+
+        let mut full = StateMerkleTree::new();
+        for (a, ac) in &live { full.insert_lazy(a, ac); }
+        full.recompute_root();
+        assert_eq!(root_incremental, full.root,
+                   "incremental finalize must equal full rebuild under random insert+update rounds");
+    }
+
+    /// Times the INCREMENTAL finalize (warm intermediate_nodes) — the real per-block
+    /// path on a running node; the cold first finalize takes the full-rebuild branch.
+    #[test]
+    #[ignore]
+    fn bench_finalize_incremental() {
+        let state = StateManager::new();
+        for i in 0..10_000u64 {
+            let a = eon(i);
+            let mut ac = Account::new(a.clone());
+            ac.balance = 1_000_000_000_000;
+            state.accounts.insert(a, ac);
+        }
+        {
+            let mut tree = state.merkle_tree.write();
+            for e in state.accounts.iter() { tree.insert_lazy(e.key(), e.value()); }
+        }
+        let t_warm = std::time::Instant::now();
+        state.finalize_merkle();
+        let warm = t_warm.elapsed();
+
+        let txs: Vec<Transaction> = (0..4000u64).map(|b| {
+            let to = eon(1000 + (b * 13) % 9000);
+            Transaction::new(eon(b % 9000), Some(to.clone()), 1, 1 + b / 9000, 10, 10_000,
+                1_700_000_000, None,
+                TransactionType::Transfer { from: eon(b % 9000), to, amount: 1 }, None)
+        }).collect();
+        for tx in &txs { let _ = state.apply_transaction_lazy(tx); }
+        let t = std::time::Instant::now();
+        let root = state.finalize_merkle();
+        println!("INCR warm_full={:?} incremental_8k_dirty={:?} root={}",
+                 warm, t.elapsed(), hex::encode(&root[..8]));
+    }
 }
