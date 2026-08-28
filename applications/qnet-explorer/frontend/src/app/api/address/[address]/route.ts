@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getTransactionsByAddress, getAddressTokenTransfers, getContractDeployByAddress } from '../../../../../lib/db';
+import { getTransactionsByAddress, getAddressTokenTransfers, getContractDeployByAddress, getBatchCreditsByAddress } from '../../../../../lib/db';
 import { mapTxType, formatAmount } from '@/lib/tx-mapping';
 import { formatTokenAmount } from '@/lib/token-format';
 import { sanitizeLogo } from '@/lib/sanitize-logo';
@@ -196,6 +196,7 @@ export async function GET(
       }).then(r => r.ok ? r.json() : null).catch(() => null),
       fetchAddressTokens(address, NODE_API, nodeHeaders),
       getTransactionsByAddress(address, 1, 100),
+      getBatchCreditsByAddress(address, 100),
       getAddressTokenTransfers(address, 50),
     ]);
 
@@ -267,7 +268,23 @@ export async function GET(
     }
     
     // Map transactions to response format
-    const txData = transactions.map(tx => ({
+    const creditRows = batchCredits.map(c => ({
+      hash: c.tx_hash,
+      from_address: c.from_address,
+      to_address: c.to_address,
+      amount: c.amount,
+      timestamp: c.timestamp,
+      block: c.block,
+      tx_type: 'BatchTransfers',
+      data: null as string | null,
+      status: 'confirmed',
+    }));
+    // Incoming batch credits merged in (the envelope's to_address is a marker,
+    // so these rows never appear via the plain to_address query).
+    const merged = [...transactions, ...creditRows]
+      .sort((a, b) => Number(b.block) - Number(a.block))
+      .slice(0, 100);
+    const txData = merged.map(tx => ({
       hash: tx.hash,
       type: mapTxType(tx.tx_type, tx.from_address, tx.data),
       from: tx.from_address,

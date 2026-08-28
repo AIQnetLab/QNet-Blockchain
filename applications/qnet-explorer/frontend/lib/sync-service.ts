@@ -1,4 +1,4 @@
-import { getDbPool, insertTransactionsBatch, updateSyncState, getSyncState, query, insertBlock, getBlockByHeight } from './db';
+import { getDbPool, insertTransactionsBatch, insertBatchTransferRows, updateSyncState, getSyncState, query, insertBlock, getBlockByHeight } from './db';
 import type { BlockRow } from './db';
 import { verifyTransactionHash, verifyTransactionIntegrity, logSecurityEvent } from './security';
 import WebSocket from 'ws';
@@ -257,6 +257,20 @@ function extractTxTypeData(rawType: string | object | undefined): Record<string,
     const body = (rawType as Record<string, unknown>).LightNodeEligibilityBitmap as Record<string, unknown> | undefined;
     if (body && typeof body === 'object') {
       return { genesis_id: body.genesis_id, epoch: body.epoch, eligible_count: body.eligible_count };
+    }
+    // BatchTransfers: keep every recipient (<=1000 by consensus rule) so the tx
+    // page can expand them and the side table can index per-recipient credits.
+    const batch = (rawType as Record<string, unknown>).BatchTransfers as Record<string, unknown> | undefined;
+    if (batch && typeof batch === 'object' && Array.isArray(batch.transfers)) {
+      const transfers = batch.transfers as Array<Record<string, unknown>>;
+      return {
+        batch_id: batch.batch_id,
+        transfer_count: transfers.length,
+        recipients: transfers.map(t => ({
+          to: String(t.to_address ?? ''),
+          amount: String(t.amount ?? '0'),
+        })),
+      };
     }
   }
   return null;
@@ -588,6 +602,18 @@ async function processSingleBlock(height: number): Promise<number> {
           is_quantum_signed: tx.is_quantum_signed
         })));
         insertedOk = true;
+        // Side table: one row per inner batch recipient (address-page credits).
+        const batchRows = batch.flatMap(tx => {
+          const d = tx.tx_type_data as { recipients?: Array<{ to: string; amount: string }> } | null;
+          if (!d?.recipients?.length) return [];
+          return d.recipients.map((r, i) => ({
+            tx_hash: tx.hash, tx_index: i, block: tx.block, timestamp: tx.timestamp,
+            from_address: tx.from, to_address: r.to, amount: r.amount,
+          }));
+        });
+        if (batchRows.length > 0) {
+          await insertBatchTransferRows(batchRows);
+        }
       } catch (err) {
         error(`[Sync] Failed to insert batch for block ${height}:`, err);
         // Return 0 so retry mechanism picks this up

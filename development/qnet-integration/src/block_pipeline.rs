@@ -218,7 +218,12 @@ static REPAIR_SOLICITED: once_cell::sync::Lazy<
 const REPAIR_SOLICITED_TTL_SECS: u64 = 30;
 // = the pipeline's max_block_bytes, so a legit stored block (any size the pipeline accepted) is never
 // false-rejected — otherwise a restarted voter could not converge to a large failover winner.
-const MAX_SUPERSEDE_INPUT: usize = 50 * 1024 * 1024;
+const MAX_SUPERSEDE_INPUT: usize = HARD_BLOCK_SIZE_BYTES;
+
+/// ONE hard block-size ceiling for build AND accept. The producer built up to
+/// 80 MB while every receiver's pipeline rejected past 50 MB — a legal 60 MB
+/// block would have wedged the whole network at decode.
+pub const HARD_BLOCK_SIZE_BYTES: usize = 32 * 1024 * 1024;
 
 /// Mark a height as SOLICITED for repair — the node asked a peer for it (e.g. TailDiverged reconcile),
 /// so a stored-height batch delivery of exactly this height is routed to fork-choice supersede rather
@@ -339,7 +344,7 @@ fn maybe_supersede_by_certified_round(storage: &Arc<Storage>, block: &IngestBloc
     // that MUST fall back to the raw bytes, NOT return, or every sync/repair-delivered competitor
     // dead-ends before the cert-pull + supersede below (boundary re-freeze for restarted voters).
     // Mirrors decode_stage's three-branch decode.
-    const MAX_DECOMPRESSED: usize = 50 * 1024 * 1024;
+    const MAX_DECOMPRESSED: usize = HARD_BLOCK_SIZE_BYTES;
     let decompressed = match zstd::stream::Decoder::new(&block.data[..]) {
         Ok(dec) => {
             use std::io::Read;
@@ -1095,7 +1100,7 @@ impl Default for PipelineConfig {
             decode_buffer: 2048,
             verify_buffer: 1024,
             verify_workers: 2,
-            max_block_bytes: 50 * 1024 * 1024, // 50 MB max
+            max_block_bytes: HARD_BLOCK_SIZE_BYTES,
         }
     }
 }
@@ -1108,7 +1113,7 @@ impl PipelineConfig {
             decode_buffer: 128,
             verify_buffer: 64,
             verify_workers: 1,
-            max_block_bytes: 50 * 1024 * 1024,
+            max_block_bytes: HARD_BLOCK_SIZE_BYTES,
         }
     }
 
@@ -1119,7 +1124,7 @@ impl PipelineConfig {
             decode_buffer: 4096,
             verify_buffer: 2048,
             verify_workers: 4,
-            max_block_bytes: 50 * 1024 * 1024,
+            max_block_bytes: HARD_BLOCK_SIZE_BYTES,
         }
     }
 }
@@ -1518,6 +1523,7 @@ impl BlockPipeline {
             // First hit is a WARN; only a stall that survives another window is a CRIT.
             let mut verify_stuck_repeats: u32 = 0;
             let mut apply_stuck_repeats: u32 = 0;
+            let mut last_starved_gap: u64 = 0;
             let mut last_verify_dump_ms: u64 = 0;
             let mut last_apply_dump_ms: u64 = 0;
             let mut interval = tokio::time::interval(WATCHDOG_TICK);
@@ -1623,21 +1629,24 @@ impl BlockPipeline {
                     last_apply_dump_ms = now;
                 }
 
-                // APPLY STARVED: op says idle yet verified blocks queue unapplied — the recv
-                // (or the task itself) is not making progress. The idle exemption above hid
-                // exactly this signature during a live wedge; it must be loud, not silent.
+                // APPLY STARVED: op says idle while the verified-vs-applied gap GROWS — new
+                // blocks verify but nothing applies. A static gap is history (dup-skips on a
+                // node at tip fired a false CRIT here); only growth marks live starvation.
+                let gap_now = verified_now.saturating_sub(applied_now);
                 if apply_op == PIPELINE_OP_IDLE
-                    && verified_now > applied_now + 8
+                    && gap_now > last_starved_gap
+                    && last_starved_gap > 0
                     && apply_stall_ms >= STUCK_THRESHOLD_MS
                     && last_applied_progress_ms != 0
                     && now.saturating_sub(last_apply_dump_ms) >= STUCK_THRESHOLD_MS
                 {
                     eprintln!(
-                        "[CRIT][PIPELINE] apply_starved stall_ms={} verified={} applied={} gap={} — idle recv with a non-empty queue",
-                        apply_stall_ms, verified_now, applied_now, verified_now.saturating_sub(applied_now),
+                        "[CRIT][PIPELINE] apply_starved stall_ms={} verified={} applied={} gap={} — verify advances while apply sits idle",
+                        apply_stall_ms, verified_now, applied_now, gap_now,
                     );
                     last_apply_dump_ms = now;
                 }
+                last_starved_gap = gap_now;
             }
         });
 

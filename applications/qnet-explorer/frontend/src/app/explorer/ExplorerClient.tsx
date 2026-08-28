@@ -80,7 +80,9 @@ const ActivityRow = memo(function ActivityRow({ item }: { item: ActivityItem }) 
           <span className="addr">{item.from || 'N/A'}</span>
         )}
         <span className="arr">→</span>
-        {item.to && item.to.length > 10 && item.to.includes('eon') ? (
+        {item.to === 'batch_transfers' ? (
+          <span className="addr">batch recipients</span>
+        ) : item.to && item.to.length > 10 && item.to.includes('eon') ? (
           <Link href={`/explorer/address/${item.to}`} className="addr">
             {item.to.slice(0, 6)}...{item.to.slice(-4)}
           </Link>

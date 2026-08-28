@@ -3888,9 +3888,15 @@ impl BlockchainNode {
                     // PRODUCTION v2.63: Block size limit to prevent ShredProtocol overflow
                     // ═══════════════════════════════════════════════════════════════════════════
                     // DEFENSE LEVEL 1: Limit block size at creation time
-                    // MAX_BLOCK_SIZE = 80MB (v4.1: 2x increase, less than ShredProtocol max of 87MB)
+                    // One shared ceiling (HARD_BLOCK_SIZE_BYTES) for build and accept; under the 87 MB shred max.
                     // This prevents deadlock where block is created but cannot be transmitted
-                    const MAX_BLOCK_SIZE_BYTES: usize = 80_000_000; // 80MB hard limit (v4.1: was 40MB)
+                    // Same ceiling the receive pipeline enforces — build and accept must agree.
+                    const MAX_BLOCK_SIZE_BYTES: usize = crate::block_pipeline::HARD_BLOCK_SIZE_BYTES;
+                    // Fill cap, producer-local policy (validators accept up to the hard limit).
+                    // A backlogged mempool once drained into one 16 MB block — at 1 s cadence
+                    // that is >= a follower's whole link, so it could never propagate live and
+                    // wedged sync behind it. The tail drains over the following blocks instead.
+                    const BLOCK_FILL_SOFT_BYTES: usize = 4_000_000;
 
                     let mut accumulated_size: usize = 0;
                     let original_tx_count = tx_bytes_list.len();
@@ -3898,7 +3904,7 @@ impl BlockchainNode {
                         .into_iter()
                         .take_while(|(_, tx_bytes)| {
                             let new_size = accumulated_size + tx_bytes.len();
-                            if new_size > MAX_BLOCK_SIZE_BYTES {
+                            if new_size > BLOCK_FILL_SOFT_BYTES.min(MAX_BLOCK_SIZE_BYTES) {
                                 false // Stop taking TX - block is full
                             } else {
                                 accumulated_size = new_size;
@@ -3908,7 +3914,7 @@ impl BlockchainNode {
                         .collect();
 
                     if tx_bytes_list.len() < original_tx_count {
-                        println!("[INFO][BLOCK] size_limit_applied original_tx={} included_tx={} size_mb={:.2} max_mb=80",
+                        println!("[INFO][BLOCK] size_limit_applied original_tx={} included_tx={} size_mb={:.2} soft_mb=4",
                                  original_tx_count, tx_bytes_list.len(),
                                  accumulated_size as f64 / 1_000_000.0);
                     }

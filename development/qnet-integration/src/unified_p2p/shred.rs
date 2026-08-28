@@ -129,7 +129,7 @@ impl SimplifiedP2P {
         // ═══════════════════════════════════════════════════════════════════════════
         // PRODUCTION v2.63: Block size validation
         // ═══════════════════════════════════════════════════════════════════════════
-        // With Level 1 (80MB block size limit at creation) and Level 2 (87MB ShredProtocol max),
+        // With Level 1 (HARD_BLOCK_SIZE_BYTES at creation) and Level 2 (87MB ShredProtocol max),
         // blocks should NEVER exceed the limit. If they do, log error and reject.
         if block_data.len() > max_shred_size {
             if crate::node::is_warn() {
@@ -2124,8 +2124,11 @@ impl SimplifiedP2P {
                 // Solution: Send in batches of 10 chunks with 5ms delay between batches
                 // This matches broadcast pacing strategy and prevents UDP burst loss
                 // ═══════════════════════════════════════════════════════════════════════════
-                const REPAIR_BATCH_SIZE: usize = 10;  // 10 chunks × 512KB = 5.12MB per batch (v4.1)
-                const REPAIR_BATCH_DELAY_MS: u64 = 5; // 5ms between batches for pacing
+                // Rate-based: 10-chunk batches at 5 ms burst 8+ Gbit/s — repair volleys
+                // suffered the same measured loss as unpaced serves. ~50 Mbit/s effective.
+                const REPAIR_BATCH_SIZE: usize = 2;
+                const REPAIR_BATCH_DELAY_MS: u64 =
+                    (2 * SHRED_PROTOCOL_CHUNK_SIZE as u64 * 8 * 1000) / 50_000_000;
                 
                 let total_chunks = chunks_to_send.len();
                 let num_batches = (total_chunks + REPAIR_BATCH_SIZE - 1) / REPAIR_BATCH_SIZE;
@@ -2636,7 +2639,13 @@ impl SimplifiedP2P {
         }
 
         // Send chunks with pacing (5ms between chunks)
-        const CHUNK_PACING_MS: u64 = 5;
+        // Rate-based pacing: a fixed per-chunk delay let a 16 MB serve burst at
+        // 150+ Mbit/s into ~120 Mbit links — 69% chunk loss measured, RS 1.5x
+        // only covers 33%, and the block could never assemble. 50 Mbit/s keeps a
+        // couple of concurrent serves under link capacity; sync tolerates seconds.
+        const SERVE_TARGET_BITS_PER_SEC: u64 = 50_000_000;
+        let chunk_pacing_ms: u64 =
+            (SHRED_PROTOCOL_CHUNK_SIZE as u64 * 8 * 1000 / SERVE_TARGET_BITS_PER_SEC).max(1);
         let mut sent_count = 0;
 
         let transport = transport_arc.read().await;
@@ -2662,7 +2671,7 @@ impl SimplifiedP2P {
                 sent_count += 1;
             }
 
-            tokio::time::sleep(std::time::Duration::from_millis(CHUNK_PACING_MS)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(chunk_pacing_ms)).await;
         }
 
         // Send parity chunks
@@ -2686,7 +2695,7 @@ impl SimplifiedP2P {
                 sent_count += 1;
             }
             
-            tokio::time::sleep(std::time::Duration::from_millis(CHUNK_PACING_MS)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(chunk_pacing_ms)).await;
         }
         
         let total_time = start_time.elapsed();

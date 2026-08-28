@@ -336,6 +336,44 @@ export async function insertTransaction(tx: Omit<TransactionRow, 'created_at' | 
   );
 }
 
+// One row per inner recipient of a BatchTransfers envelope.
+export interface BatchTransferRow {
+  tx_hash: string;
+  tx_index: number;
+  block: number;
+  timestamp: number;
+  from_address: string;
+  to_address: string;
+  amount: string;
+}
+
+export async function insertBatchTransferRows(rows: BatchTransferRow[]): Promise<void> {
+  if (rows.length === 0) return;
+  const pool = getDbPool();
+  const values: unknown[] = [];
+  const placeholders = rows.map((r, i) => {
+    const o = i * 7;
+    values.push(r.tx_hash, r.tx_index, r.block, r.timestamp, r.from_address, r.to_address, r.amount);
+    return `($${o + 1},$${o + 2},$${o + 3},$${o + 4},$${o + 5},$${o + 6},$${o + 7})`;
+  }).join(',');
+  await pool.query(
+    `INSERT INTO batch_transfers (tx_hash, tx_index, block, timestamp, from_address, to_address, amount)
+     VALUES ${placeholders} ON CONFLICT (tx_hash, tx_index) DO NOTHING`,
+    values
+  );
+}
+
+export async function getBatchCreditsByAddress(address: string, limit: number = 100): Promise<BatchTransferRow[]> {
+  validateAddress(address);
+  const pool = getDbPool();
+  const res = await pool.query(
+    `SELECT tx_hash, tx_index, block, timestamp, from_address, to_address, amount
+     FROM batch_transfers WHERE to_address = $1 ORDER BY block DESC LIMIT $2`,
+    [address, Math.min(Math.max(limit, 1), 500)]
+  );
+  return res.rows as BatchTransferRow[];
+}
+
 // Lock for batch insert to prevent race conditions
 let isBatchInserting = false;
 

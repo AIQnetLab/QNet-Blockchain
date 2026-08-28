@@ -374,6 +374,27 @@ export default function TransactionPage() {
         const call = decodeTokenCall(tx.data, tx.to);
         if (call) return <TokenTransferCard call={call} />;
 
+        // BatchTransfers: expand every inner recipient as its own row.
+        const recipients = tx.tx_type_data?.recipients as Array<{ to: string; amount: string }> | undefined;
+        if (Array.isArray(recipients) && recipients.length > 0) {
+          return (
+            <div className="block-card">
+              <h2 className="card-title">Batch Transfers — {recipients.length} recipients</h2>
+              <div className="details-grid">
+                {recipients.map((r, i) => (
+                  <div className="detail-row" key={i}>
+                    <span className="detail-label">#{i + 1}</span>
+                    <span className="detail-value">
+                      <Link href={`/explorer/address/${r.to}`} className="addr">{r.to}</Link>
+                      {' — '}{(Number(r.amount) / 1e9).toFixed(9)} QNC
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          );
+        }
+
         // Fallback: type-specific public data (bitmap epoch/eligible_count,
         // reward pool, etc.) for non-token transactions.
         return tx.tx_type_data && Object.keys(tx.tx_type_data).length > 0 ? (
