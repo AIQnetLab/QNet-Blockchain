@@ -1812,6 +1812,11 @@ impl BlockPipeline {
         let mut deferred_count: usize = 0;
         // Byte occupancy: count-only bounds let 2000 multi-MB blocks pin gigabytes of RAM.
         let mut deferred_bytes: usize = 0;
+        // Verified-but-not-yet-applied parent hashes. Storage only answers at apply-commit
+        // (600+ ms later under load) while children release at VERIFY — a child arriving in
+        // that window found neither and parked forever. Same task as the release, so reads
+        // here are exact, with no lock and no timing.
+        let mut verified_recent: HashMap<[u8; 32], u64> = HashMap::new();
         // A restarted pipeline dropped its buffer; stale holds would mask sync forever.
         DEFERRED_HEIGHTS.clear();
         // Per-producer occupancy, maintained incrementally: counting by scanning the whole buffer
@@ -1975,8 +1980,13 @@ impl BlockPipeline {
                         );
                     }
                 }
+                let parent_verified_in_flight =
+                    verified_recent.get(&mb.previous_hash).copied() == Some(mb.height.saturating_sub(1));
                 let prev_hash_ok = match load_result {
                     Ok(Some(prev_hash)) => mb.previous_hash == prev_hash,
+                    // Parent verified in this loop but its apply-commit hasn't reached storage
+                    // yet — proceed; FIFO to the apply stage preserves parent-before-child.
+                    Ok(None) if parent_verified_in_flight => true,
                     Ok(None) => {
                         // Capture height fields BEFORE moving `decoded` into
                         // the deferred map — `mb` is borrowed from `decoded`
@@ -2068,9 +2078,13 @@ impl BlockPipeline {
                             let parked_at = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .map(|d| d.as_secs()).unwrap_or(0);
+                            let parked_hash = decoded.microblock.hash();
                             let waiters = deferred.entry(mb.previous_hash).or_default();
                             // Drop an exact duplicate re-delivery; distinct siblings both survive.
-                            if !waiters.iter().any(|(_, d)| d.microblock.hash() == decoded.microblock.hash()) {
+                            // No recheck needed after this insert: the verified-in-flight guard above
+                            // runs in the SAME task as the release, so a parent is either seen there
+                            // or verifies later and drains us.
+                            if !waiters.iter().any(|(_, d)| d.microblock.hash() == parked_hash) {
                                 *deferred_by_producer.entry(decoded.microblock.producer.clone()).or_insert(0) += 1;
                                 deferred_track(child_h);
                                 deferred_bytes = deferred_bytes.saturating_add(incoming_sz);
@@ -3065,6 +3079,8 @@ impl BlockPipeline {
             let block_height = decoded.height;
             // Identity of the block just verified — the key its waiting children were parked under.
             let verified_hash = decoded.microblock.hash();
+            // Answers "parent verified, apply-commit pending" for the parking guard above.
+            verified_recent.insert(verified_hash, block_height);
 
             // Liveness is NOT recorded here. A signature-verified block only proves the producer
             // signed something — a block that fails apply (bad state_root, unresolvable pk, breaker)
@@ -3132,7 +3148,17 @@ impl BlockPipeline {
             // enough: blocks parked ABOVE the tip are never "behind" it, and during the very stall
             // where this buffer matters the tip does not advance — so a height-only rule can never
             // reclaim them. An age rule always can.
-            if deferred_count > 100 {
+            // Verified-in-flight entries are only useful until apply-commit lands in storage;
+            // anything 500 below the tip is long-committed (or long-dead).
+            if verified_recent.len() > 1024 {
+                let tip = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(Ordering::Relaxed);
+                verified_recent.retain(|_, h| h.saturating_add(500) > tip);
+            }
+
+            // Unconditional: the TTL is an invariant, not a large-buffer-only rule. A single
+            // orphan parked below the old >100 gate lived forever — and with the deferred set
+            // masking its height from sync, that single entry wedged the whole node.
+            if deferred_count > 0 {
                 let chain_h = storage.get_chain_height().unwrap_or(0);
                 {
                     const DEFERRED_MAX_AGE_SECS: u64 = 120;
