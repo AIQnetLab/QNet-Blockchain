@@ -930,7 +930,14 @@ impl SimplifiedP2P {
                 && match (assembly.expected_block_hash, chunk.block_hash) {
                     (Some(eh), Some(bh)) => eh == bh,
                     _ => true, // a chunk without a hash can't contradict; the hash-bearing majority sets it
-                };
+                }
+                // Parity bytes depend on the (data, coding) matrix. DATA chunks are
+                // interchangeable across the live and sync splits; a PARITY chunk from a
+                // different coding count feeds the decoder a foreign code row — the mixed
+                // rebuild yields plausible-length garbage.
+                && (!chunk.is_parity
+                    || chunk.num_coding_shreds == 0
+                    || chunk.num_coding_shreds == assembly.parity_count);
             if !framing_ok {
                 if crate::node::is_warn() {
                     println!("[WARN][SHRED] framing_mismatch h={} drop_chunk idx={} from={}",
@@ -2490,6 +2497,22 @@ impl SimplifiedP2P {
             
             // Truncate to original size (remove padding)
             block_data.truncate(original_size);
+
+            // Same gate as the direct-reconstruction path: this repair-fed path shipped
+            // UNVERIFIED bytes to the pipeline — a mixed-code rebuild decoded to garbage
+            // (bincode "tag not valid" / zstd io error) and the node retried forever.
+            if let Some(expected_hash) = assembly.expected_block_hash {
+                use sha3::{Sha3_256, Digest};
+                let mut hasher = Sha3_256::new();
+                hasher.update(&block_data);
+                let computed = hasher.finalize();
+                if computed.as_slice() != &expected_hash[..] {
+                    eprintln!("[ERR][SHRED] block_hash_mismatch h={} expected={} computed={} action=discard path=parity",
+                             height, hex::encode(&expected_hash[..8]), hex::encode(&computed[..8]));
+                    self.processed_shred_blocks.remove(&height);
+                    return;
+                }
+            }
 
             // Large blocks arrive ONLY via shreds — without this the size EMA saw just
             // small batched blocks and the byte-aware sync shard went blind under load.
