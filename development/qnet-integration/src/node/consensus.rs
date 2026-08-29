@@ -57,9 +57,15 @@ impl BlockchainNode {
             return false; // Cannot initiate or participate if not synced
         }
         
-        // Check if node is TOO FAR AHEAD (should not happen, but safety check)
-        if stored_height > current_height + consensus_lookahead {
-            println!("[WARN][CONS] local_ahead h={} round={}", 
+        // Check if node is TOO FAR AHEAD (should not happen, but safety check).
+        // EXCEPT a redriven PAST macroblock boundary: the redrive exists to seal
+        // windows the tip has already left behind, so "ahead of the target" is
+        // its normal state — this veto silently killed every redriven seal once
+        // the tip moved 30+ blocks past the boundary.
+        let past_boundary = current_height <= stored_height
+            && current_height % qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL == 0;
+        if stored_height > current_height + consensus_lookahead && !past_boundary {
+            println!("[WARN][CONS] local_ahead h={} round={}",
                      stored_height, current_height);
             return false;
         }
