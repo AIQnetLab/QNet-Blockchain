@@ -248,6 +248,8 @@ impl SimplifiedP2P {
             parity_for_cache,
             original_block_size,
             is_macroblock,
+            Some(block_hash),
+            parity_count,
         );
         
         if height <= 100 || height % 50 == 0 {
@@ -1041,20 +1043,38 @@ impl SimplifiedP2P {
                         original_block_size: chunk.original_block_size,
                         is_macroblock: chunk.is_macroblock,
                         cached_at: Instant::now(),
+                        block_hash: chunk.block_hash,
+                        num_coding: chunk.num_coding_shreds,
                     }
                 });
-            
+
+            // The cache is repair's source of truth, so it obeys the same identity rules
+            // as the assembly: one block per entry, one parity code per entry.
+            if cache_entry.block_hash.is_none() {
+                cache_entry.block_hash = chunk.block_hash;
+            }
+            let identity_ok = match (cache_entry.block_hash, chunk.block_hash) {
+                (Some(eh), Some(bh)) => eh == bh,
+                _ => true,
+            };
+            if identity_ok && chunk.is_parity && cache_entry.num_coding == 0 {
+                cache_entry.num_coding = chunk.num_coding_shreds;
+            }
+
             // Store this chunk in cache
-            if chunk.is_parity {
+            if identity_ok && chunk.is_parity {
+                let code_ok = chunk.num_coding_shreds == 0
+                    || cache_entry.num_coding == 0
+                    || chunk.num_coding_shreds == cache_entry.num_coding;
                 let parity_idx = chunk.chunk_index.saturating_sub(total_chunks);
                 // Expand parity vec if needed
-                if parity_idx >= cache_entry.parity_chunks.len() {
+                if code_ok && parity_idx >= cache_entry.parity_chunks.len() {
                     cache_entry.parity_chunks.resize(parity_idx + 1, None);
                 }
-                if parity_idx < cache_entry.parity_chunks.len() {
+                if code_ok && parity_idx < cache_entry.parity_chunks.len() {
                     cache_entry.parity_chunks[parity_idx] = Some(chunk.data.clone());
                 }
-            } else {
+            } else if identity_ok {
                 if chunk.chunk_index < cache_entry.chunks.len() {
                     cache_entry.chunks[chunk.chunk_index] = Some(chunk.data.clone());
                 }
@@ -2152,6 +2172,8 @@ impl SimplifiedP2P {
                 let original_block_size = cache_entry.original_block_size;
                 let is_macroblock = cache_entry.is_macroblock;
                 let sender_id = self.node_id.clone();
+                let served_hash = cache_entry.block_hash;
+                let served_coding = cache_entry.num_coding;
                 
                 handle.spawn(async move {
                     let parts: Vec<&str> = peer_addr.split(':').collect();
@@ -2170,6 +2192,8 @@ impl SimplifiedP2P {
                                             original_block_size,
                                             is_macroblock,
                                             sender_id: sender_id.clone(),
+                                            block_hash: served_hash,
+                                            num_coding: served_coding,
                                         };
                                         
                                         let transport_guard = transport.read().await;
@@ -2197,14 +2221,33 @@ impl SimplifiedP2P {
         _original_block_size: usize,
         _is_macroblock: bool,
         sender_id: &str,
+        block_hash: Option<[u8; 32]>,
+        num_coding: usize,
     ) {
         if self.processed_shred_blocks.contains(&block_height) {
             return;
         }
         if let Some(mut assembly) = self.shred_protocol_assemblies.get_mut(&block_height) {
+            // Repair bytes obey the SAME identity rules as live chunks. This handler used
+            // to merge unchecked — the one door through which another block's bytes (or a
+            // foreign parity code) entered an assembly and every rebuild hashed wrong.
+            if assembly.expected_block_hash.is_none() {
+                assembly.expected_block_hash = block_hash;
+            }
+            if let (Some(eh), Some(bh)) = (assembly.expected_block_hash, block_hash) {
+                if eh != bh {
+                    if crate::node::is_warn() {
+                        println!("[WARN][SHRED] repair_identity_mismatch h={} from={} drop=response",
+                                 block_height, sender_id);
+                    }
+                    return;
+                }
+            }
+            let parity_code_ok = num_coding == 0 || num_coding == assembly.parity_count;
             let mut added_count = 0;
             for (idx, data, is_parity) in chunks {
                 if is_parity {
+                    if !parity_code_ok { continue; }
                     let parity_idx = idx - assembly.total_chunks;
                     if parity_idx < assembly.parity_chunks.len() && assembly.parity_chunks[parity_idx].is_none() {
                         assembly.parity_chunks[parity_idx] = Some(data);
@@ -2240,7 +2283,8 @@ impl SimplifiedP2P {
         }
     }
     
-    /// PRODUCTION v2.21.3: Cache chunks after successful block reconstruction for retransmit
+    /// Cache the full chunk set of a HASH-VERIFIED reconstruction for retransmit.
+    /// Overwrites any receiver-cache partials for the height — this set is authoritative.
     pub(super) fn cache_chunks_for_retransmit(
         &self,
         height: u64,
@@ -2248,6 +2292,8 @@ impl SimplifiedP2P {
         parity_chunks: Vec<Option<Vec<u8>>>,
         original_block_size: usize,
         is_macroblock: bool,
+        block_hash: Option<[u8; 32]>,
+        num_coding: usize,
     ) {
         // Cleanup old entries if cache is full
         if self.shred_chunk_cache.len() >= SHRED_CHUNK_CACHE_SIZE {
@@ -2267,6 +2313,8 @@ impl SimplifiedP2P {
             original_block_size,
             is_macroblock,
             cached_at: Instant::now(),
+            block_hash,
+            num_coding,
         });
     }
     
@@ -2297,20 +2345,11 @@ impl SimplifiedP2P {
             "shred_protocol".to_string()
         };
         
-        // PRODUCTION v2.21.3: Cache chunks for retransmit before processing
-        self.cache_chunks_for_retransmit(
-            height,
-            assembly.chunks_received.clone(),
-            assembly.parity_chunks.clone(),
-            assembly.original_block_size,
-            assembly.is_macroblock,
-        );
-        
         let mut block_data = Vec::new();
 
-        for chunk_opt in assembly.chunks_received {
+        for chunk_opt in &assembly.chunks_received {
             if let Some(chunk) = chunk_opt {
-                block_data.extend(chunk);
+                block_data.extend_from_slice(chunk);
             }
         }
 
@@ -2319,7 +2358,9 @@ impl SimplifiedP2P {
             block_data.truncate(assembly.original_block_size);
         }
 
-        // FIX R23-P3: Verify block hash after reconstruction — detect chunk tampering
+        // FIX R23-P3: Verify block hash after reconstruction — detect chunk tampering.
+        // On mismatch also purge the height's chunk cache: caching the bad set BEFORE
+        // this check re-served the poison to every repairing peer, sustaining the loop.
         if let Some(expected_hash) = assembly.expected_block_hash {
             use sha3::{Sha3_256, Digest};
             let mut hasher = Sha3_256::new();
@@ -2328,10 +2369,26 @@ impl SimplifiedP2P {
             if computed.as_slice() != &expected_hash[..] {
                 eprintln!("[ERR][SHRED] block_hash_mismatch h={} expected={} computed={} action=discard",
                          height, hex::encode(&expected_hash[..8]), hex::encode(&computed[..8]));
+                self.shred_chunk_cache.remove(&height);
                 self.processed_shred_blocks.remove(&height);
                 return;
             }
+        } else if crate::node::is_warn() {
+            // Every current sender stamps block_hash; a hashless assembly ships to the
+            // pipeline UNVERIFIED. Loud so a zero-occurrence run justifies rejecting these.
+            println!("[WARN][SHRED] unverified_reconstruction h={} reason=no_expected_hash", height);
         }
+
+        // Cache the verified set for retransmit, stamped with its identity.
+        self.cache_chunks_for_retransmit(
+            height,
+            assembly.chunks_received,
+            assembly.parity_chunks,
+            assembly.original_block_size,
+            assembly.is_macroblock,
+            assembly.expected_block_hash,
+            assembly.parity_count,
+        );
 
         let elapsed = assembly.started_at.elapsed();
         if height % 10 == 0 {
@@ -2391,15 +2448,6 @@ impl SimplifiedP2P {
             } else {
                 "shred_protocol-rs".to_string()
             };
-            
-            // PRODUCTION v2.21.3: Cache chunks for retransmit before processing
-            self.cache_chunks_for_retransmit(
-                height,
-                assembly.chunks_received.clone(),
-                assembly.parity_chunks.clone(),
-                assembly.original_block_size,
-                assembly.is_macroblock,
-            );
             
             let data_count = assembly.total_chunks;
             let parity_count = assembly.parity_count;
@@ -2501,6 +2549,7 @@ impl SimplifiedP2P {
             // Same gate as the direct-reconstruction path: this repair-fed path shipped
             // UNVERIFIED bytes to the pipeline — a mixed-code rebuild decoded to garbage
             // (bincode "tag not valid" / zstd io error) and the node retried forever.
+            // On mismatch also purge the height's chunk cache so the poison is not re-served.
             if let Some(expected_hash) = assembly.expected_block_hash {
                 use sha3::{Sha3_256, Digest};
                 let mut hasher = Sha3_256::new();
@@ -2509,9 +2558,31 @@ impl SimplifiedP2P {
                 if computed.as_slice() != &expected_hash[..] {
                     eprintln!("[ERR][SHRED] block_hash_mismatch h={} expected={} computed={} action=discard path=parity",
                              height, hex::encode(&expected_hash[..8]), hex::encode(&computed[..8]));
+                    self.shred_chunk_cache.remove(&height);
                     self.processed_shred_blocks.remove(&height);
                     return;
                 }
+            } else if crate::node::is_warn() {
+                println!("[WARN][SHRED] unverified_reconstruction h={} reason=no_expected_hash path=parity", height);
+            }
+
+            // Cache the verified, fully-recovered shard set for retransmit, stamped with
+            // its identity. The pre-verification cache of the PARTIAL set is what spread
+            // mixed-block bytes to repairing peers.
+            {
+                let cached_data: Vec<Option<Vec<u8>>> = shards.iter().take(data_count)
+                    .map(|opt| opt.as_ref().map(|b| b.to_vec())).collect();
+                let cached_parity: Vec<Option<Vec<u8>>> = shards.iter().skip(data_count)
+                    .map(|opt| opt.as_ref().map(|b| b.to_vec())).collect();
+                self.cache_chunks_for_retransmit(
+                    height,
+                    cached_data,
+                    cached_parity,
+                    assembly.original_block_size,
+                    assembly.is_macroblock,
+                    assembly.expected_block_hash,
+                    assembly.parity_count,
+                );
             }
 
             // Large blocks arrive ONLY via shreds — without this the size EMA saw just

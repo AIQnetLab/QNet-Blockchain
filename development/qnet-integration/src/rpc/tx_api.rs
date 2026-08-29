@@ -685,8 +685,8 @@ pub(super) async fn handle_batch_transfer(
     // Submit batch transaction to blockchain
     match blockchain.submit_transaction(batch_tx).await {
         Ok(tx_hash) => {
-            if crate::node::is_info() {
-                println!("[INFO][BATCH] submitted transfers={} total={} hash={}",
+            if crate::node::is_debug() {
+                println!("[DBG][BATCH] submitted transfers={} total={} hash={}",
                        request.transfers.len(), total_amount, tx_hash);
             }
             

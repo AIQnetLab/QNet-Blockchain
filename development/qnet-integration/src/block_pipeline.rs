@@ -3526,13 +3526,15 @@ impl BlockPipeline {
                 // I/O, so unlikely to hang from external contention.
                 metrics.mark_apply_op(height, PIPELINE_OP_APPLY_STATE);
                 let apply_state_start = std::time::Instant::now();
-                // Apply all state mutations via shared function
-                let apply_result = BlockchainNode::apply_block_to_state(
+                // Apply all state mutations via shared function. block_in_place: CPU-bound
+                // section on a runtime worker — hand the thread back to the scheduler so
+                // message intake and votes keep flowing while the block applies.
+                let apply_result = tokio::task::block_in_place(|| BlockchainNode::apply_block_to_state(
                     &state_guard,
                     &block.microblock,
                     &ctx.storage,
                     block_snapshot.as_mut(),
-                );
+                ));
                 let apply_state_elapsed = apply_state_start.elapsed();
                 if apply_state_elapsed > std::time::Duration::from_millis(500) {
                     if is_warn() {

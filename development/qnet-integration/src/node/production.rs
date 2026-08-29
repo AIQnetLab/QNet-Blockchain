@@ -3944,12 +3944,15 @@ impl BlockchainNode {
                         .map(|v| v == "true" || v == "1")
                         .unwrap_or(false);
                     
-                    // STEP 1: Parallel deserialization (CPU-bound, perfect for rayon)
+                    // STEP 1: Parallel deserialization (CPU-bound, perfect for rayon).
+                    // block_in_place: the calling worker blocks on rayon's join — hand the
+                    // thread back to the runtime so message intake keeps running.
                     let deser_start = std::time::Instant::now();
-                    let deserialized: Vec<(String, Option<qnet_state::Transaction>)> = tx_bytes_list
+                    let deserialized: Vec<(String, Option<qnet_state::Transaction>)> =
+                        tokio::task::block_in_place(|| tx_bytes_list
                         .par_iter()
                         .map(|(mempool_hash, tx_bytes)| {
-                            let tx_opt: Option<qnet_state::Transaction> = 
+                            let tx_opt: Option<qnet_state::Transaction> =
                                 bincode::deserialize::<qnet_state::Transaction>(tx_bytes).ok()
                                 .or_else(|| {
                                     String::from_utf8(tx_bytes.clone()).ok()
@@ -3957,7 +3960,7 @@ impl BlockchainNode {
                                 });
                             (mempool_hash.clone(), tx_opt)
                         })
-                        .collect();
+                        .collect());
                     
                     let deser_time = deser_start.elapsed();
                     if is_debug() && deser_time.as_millis() > 10 {
@@ -3977,7 +3980,8 @@ impl BlockchainNode {
                     }
                     
                     // v3.1: Include rejection reason in tuple for better diagnostics
-                    let validated: Vec<(String, qnet_state::Transaction, bool, Option<String>)> = deserialized
+                    let validated: Vec<(String, qnet_state::Transaction, bool, Option<String>)> =
+                        tokio::task::block_in_place(|| deserialized
                         .into_par_iter()
                         .filter_map(|(hash, tx_opt)| tx_opt.map(|tx| (hash, tx)))
                         .map(|(hash, tx)| {
@@ -4061,8 +4065,8 @@ impl BlockchainNode {
                             
                             (hash, tx, is_valid, reject_reason)
                         })
-                        .collect();
-                    
+                        .collect());
+
                     let valid_time = valid_start.elapsed();
                     if is_debug() && valid_time.as_millis() > 10 {
                         println!("[DBG][PARALLEL] valid_time={:?} tx_count={}", valid_time, validated.len());
@@ -4777,6 +4781,10 @@ impl BlockchainNode {
                     let mut side_idx = BlockSideIndices::default();
                     {
                         let state_guard = state.write().await;
+                        // The write guard is held through apply + Merkle finalize: every state
+                        // reader (gossip TX validation included) waits on it, so this section's
+                        // duration is bounded by BLOCK_GAS_LIMIT and measured in block_timing.
+                        let t_apply = std::time::Instant::now();
 
                         // Per-block WASM event logs, captured the SAME way the validator path does
                         // (apply_block_to_state) so getLogs is complete and the gated window logs_root
@@ -4971,10 +4979,19 @@ impl BlockchainNode {
                             }
                         }
                         
-                        // 4. Finalize Merkle and get state_root
-                        let computed_state_root = state_guard.finalize_merkle();
+                        // 4. Finalize Merkle and get state_root. CPU-bound: run via block_in_place
+                        // so this worker thread is handed back to the runtime's scheduler.
+                        let apply_ms = t_apply.elapsed().as_millis();
+                        let t_merkle = std::time::Instant::now();
+                        let computed_state_root =
+                            tokio::task::block_in_place(|| state_guard.finalize_merkle());
                         microblock.state_root = computed_state_root;
                         producer_supply_head = state_guard.get_total_supply();
+                        if is_info() {
+                            println!("[INFO][PROD] block_timing h={} txs={} apply_ms={} merkle_ms={}",
+                                     next_block_height, microblock.transactions.len(),
+                                     apply_ms, t_merkle.elapsed().as_millis());
+                        }
 
                         // Rich-list index (display-only, best-effort): reconcile this block's touched
                         // holders. SAME touched-set as the validator apply path.

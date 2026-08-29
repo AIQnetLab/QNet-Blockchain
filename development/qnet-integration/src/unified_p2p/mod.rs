@@ -2870,6 +2870,11 @@ struct ShredChunkCacheEntry {
     original_block_size: usize,
     is_macroblock: bool,
     cached_at: Instant,
+    // Block identity + parity code of the cached set. Failover legitimately produces two
+    // blocks at one height; an identity-less cache mixed their chunks and repair then
+    // spread the mix — every rebuild of it hashed wrong and was discarded, forever.
+    block_hash: Option<[u8; 32]>,
+    num_coding: usize,
 }
 
 #[allow(dead_code)]
@@ -3897,6 +3902,11 @@ pub enum NetworkMessage {
         original_block_size: usize,
         is_macroblock: bool,
         sender_id: String,
+        // Identity of the served set: which block these bytes belong to and which
+        // Reed-Solomon coding count produced the parity rows. The receiver rejects a
+        // response that contradicts its assembly instead of merging foreign bytes.
+        block_hash: Option<[u8; 32]>,
+        num_coding: usize,
     },
     
     /// PRODUCTION v2.37: Dedicated MacroBlock broadcast (NOT via ShredProtocol!)
@@ -4691,14 +4701,18 @@ mod tests {
             original_block_size: 4096,
             is_macroblock: false,
             cached_at: std::time::Instant::now(),
+            block_hash: Some([9u8; 32]),
+            num_coding: 2,
         };
-        
+
         assert_eq!(entry.chunks.len(), 4);
         assert_eq!(entry.parity_chunks.len(), 2);
         assert!(entry.chunks[0].is_some());
         assert!(entry.chunks[2].is_none());
         assert_eq!(entry.original_block_size, 4096);
         assert!(!entry.is_macroblock);
+        assert_eq!(entry.block_hash, Some([9u8; 32]));
+        assert_eq!(entry.num_coding, 2);
     }
     
     /// Test adaptive peer selection for retransmit requests
@@ -4820,13 +4834,15 @@ mod tests {
             original_block_size: 12000,
             is_macroblock: false,
             sender_id: "genesis_node_002".to_string(),
+            block_hash: Some([7u8; 32]),
+            num_coding: 6,
         };
-        
+
         let serialized = serde_json::to_string(&msg).expect("Serialization should work");
         let deserialized: NetworkMessage = serde_json::from_str(&serialized).expect("Deserialization should work");
-        
+
         match deserialized {
-            NetworkMessage::MissingChunksResponse { block_height, chunks, original_block_size, is_macroblock, sender_id } => {
+            NetworkMessage::MissingChunksResponse { block_height, chunks, original_block_size, is_macroblock, sender_id, block_hash, num_coding } => {
                 assert_eq!(block_height, 12345);
                 assert_eq!(chunks.len(), 2);
                 assert_eq!(chunks[0].0, 1);  // index
@@ -4836,6 +4852,8 @@ mod tests {
                 assert_eq!(original_block_size, 12000);
                 assert!(!is_macroblock);
                 assert_eq!(sender_id, "genesis_node_002");
+                assert_eq!(block_hash, Some([7u8; 32]));
+                assert_eq!(num_coding, 6);
             }
             _ => panic!("Wrong message type after deserialization"),
         }
@@ -4850,6 +4868,8 @@ mod tests {
             original_block_size: 50000,
             is_macroblock: true,  // ← MACROBLOCK
             sender_id: "test".to_string(),
+            block_hash: None,
+            num_coding: 0,
         };
         
         match msg {

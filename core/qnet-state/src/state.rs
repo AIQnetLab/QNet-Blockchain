@@ -527,6 +527,7 @@ impl StateMerkleTree {
     /// recompute on cold start (empty intermediate_nodes cache).
     pub fn finalize(&mut self) -> [u8; HASH_SIZE] {
         if self.dirty {
+            let t0 = std::time::Instant::now();
             let updates = self.pending_updates;
             let k = self.dirty_paths.len();
             let use_incremental = self.incremental_enabled
@@ -552,9 +553,10 @@ impl StateMerkleTree {
             self.pending_updates = 0;
             if updates > 0 {
                 println!(
-                    "[INFO][MERKLE] state_root_finalized updates={} leaves={} dirty={} mode={} root={}",
+                    "[INFO][MERKLE] state_root_finalized updates={} leaves={} dirty={} mode={} ms={} root={}",
                     updates, self.leaves.len(), k,
                     if use_incremental { "incremental" } else { "full" },
+                    t0.elapsed().as_millis(),
                     hex::encode(&self.root[..8]),
                 );
             }

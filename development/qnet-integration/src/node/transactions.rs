@@ -348,10 +348,12 @@ impl BlockchainNode {
         }
 
         // QUANTUM v2.25: Log effective gas (includes +50% for Dilithium)
-        let effective_gas = tx.effective_gas_price() * tx.gas_limit;
-        let quantum_flag = if tx.is_quantum_signed() { " quantum=true" } else { "" };
-        println!("[INFO][NODE] tx_validated hash={} amount={} gas={}{}",
-                 qnet_state::char_prefix(&tx_hash, 16), tx.amount, effective_gas, quantum_flag);
+        if is_debug() {
+            let effective_gas = tx.effective_gas_price() * tx.gas_limit;
+            let quantum_flag = if tx.is_quantum_signed() { " quantum=true" } else { "" };
+            println!("[DBG][NODE] tx_validated hash={} amount={} gas={}{}",
+                     qnet_state::char_prefix(&tx_hash, 16), tx.amount, effective_gas, quantum_flag);
+        }
         
         // v2.72: Broadcast PendingTx via WebSocket for real-time explorer updates
         if added {

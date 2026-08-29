@@ -546,8 +546,17 @@ impl BlockchainNode {
     /// Upper bound on declared gas. Admission-only (both ingress points) plus a producer-side drop.
     /// NOT a block rule and NOT in `Transaction::validate()` (the block path calls it): rejecting an
     /// oversized TX at the block would halt the chain instead of costing one TX.
+    /// BatchTransfers scale the ceiling with their transfer count: validate() floors their
+    /// gas_limit at TRANSFER x count, which crosses MAX_GAS_LIMIT past 100 transfers — a flat
+    /// ceiling made every larger batch inadmissible while the floor demanded more.
     pub(crate) fn gas_limit_admissible(tx: &qnet_state::Transaction) -> bool {
-        tx.gas_limit <= qnet_state::gas_limits::MAX_GAS_LIMIT
+        let cap = match &tx.tx_type {
+            qnet_state::TransactionType::BatchTransfers { transfers, .. } =>
+                qnet_state::gas_limits::MAX_GAS_LIMIT
+                    .max(qnet_state::gas_limits::TRANSFER.saturating_mul(transfers.len() as u64)),
+            _ => qnet_state::gas_limits::MAX_GAS_LIMIT,
+        };
+        tx.gas_limit <= cap
     }
 
     /// The ONE emission amount that is valid in the block at `height` — the exact mirror of the

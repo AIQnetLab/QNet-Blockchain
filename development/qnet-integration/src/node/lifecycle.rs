@@ -2252,8 +2252,8 @@ impl BlockchainNode {
                         
                         match tx_result {
                             Ok(tx) => {
-                                if is_info() {
-                                    println!("[INFO][TX-RECV] OK type={:?} sig={} from={}", 
+                                if is_debug() {
+                                    println!("[DBG][TX-RECV] OK type={:?} sig={} from={}",
                                         std::mem::discriminant(&tx.tx_type),
                                         tx.signature.as_ref().map_or(0, |s| s.len()),
                                         received_tx.from_peer);

@@ -144,6 +144,31 @@ async fn main() {
     let (free_tx, mut free_rx) = tokio::sync::mpsc::unbounded_channel::<usize>();
     for i in 0..n { free_tx.send(i).ok(); }
 
+    // Anchor every account's nonce to committed state up front. On a network that has
+    // already processed txs from these accounts, assuming 0 makes each first send a
+    // guaranteed nonce rejection — and with more accounts than sends, the free queue
+    // never wraps around to give the re-anchored account its second try.
+    {
+        let t0 = Instant::now();
+        let gate = Arc::new(tokio::sync::Semaphore::new(64));
+        let tasks: Vec<_> = (0..n).map(|i| {
+            let gate = gate.clone();
+            let clients = clients.clone();
+            let accounts = accounts.clone();
+            let committed = committed.clone();
+            tokio::spawn(async move {
+                let _p = gate.acquire_owned().await.ok()?;
+                let ci = i % clients.len();
+                if let Ok((nonce, _)) = clients[ci].account_state(&accounts[i].addr).await {
+                    if nonce > 0 { committed[i].store(nonce, Ordering::SeqCst); }
+                }
+                Some(())
+            })
+        }).collect();
+        for t in tasks { let _ = t.await; }
+        eprintln!("[loadtest] nonce prefetch done in {:.1}s", t0.elapsed().as_secs_f64());
+    }
+
     let start = Instant::now();
     let submit_deadline = start + Duration::from_secs(args.duration);
     let track_deadline = submit_deadline + Duration::from_secs(args.drain);

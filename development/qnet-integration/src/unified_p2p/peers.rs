@@ -187,8 +187,8 @@ impl SimplifiedP2P {
                     // Send to node for validation and mempool addition
                     match tx_sender.try_send(received_tx) {
                         Ok(_) => {
-                            if crate::node::is_info() {
-                                println!("[INFO][P2P] Transaction {} from {} queued for processing",
+                            if crate::node::is_debug() {
+                                println!("[DBG][P2P] Transaction {} from {} queued for processing",
                                          qnet_state::char_prefix(&tx_hash, 16), from_peer);
                             }
                         }
@@ -1121,8 +1121,8 @@ impl SimplifiedP2P {
             }
             
             // PRODUCTION v2.21.3: Handle chunk retransmit responses
-            NetworkMessage::MissingChunksResponse { block_height, chunks, original_block_size, is_macroblock, sender_id } => {
-                self.handle_missing_chunks_response(block_height, chunks, original_block_size, is_macroblock, &sender_id);
+            NetworkMessage::MissingChunksResponse { block_height, chunks, original_block_size, is_macroblock, sender_id, block_hash, num_coding } => {
+                self.handle_missing_chunks_response(block_height, chunks, original_block_size, is_macroblock, &sender_id, block_hash, num_coding);
             }
             
             // PRODUCTION v2.37: Handle dedicated MacroBlock broadcast (NOT ShredProtocol!)

@@ -1616,9 +1616,9 @@ impl SimplifiedP2P {
                 _ => "Message".to_string(),
             };
             // PRIVACY: Use pseudonym in logs
-            if crate::node::is_info() {
-                println!("[INFO][P2P] → Sending {} to {} via {}",
-                    message_type, 
+            if crate::node::is_debug() {
+                println!("[DBG][P2P] → Sending {} to {} via {}",
+                    message_type,
                     get_privacy_id_for_addr(&peer_addr),
                     if quic_enabled { "QUIC" } else { "HTTP" });
             }
@@ -1663,8 +1663,8 @@ impl SimplifiedP2P {
                             match transport.send_message(quic_addr, &message_clone).await {
                                 Ok(_) => {
                                     if should_log {
-                                        if crate::node::is_info() {
-                                            println!("[INFO][QUIC] Message sent to {} (binary)", get_privacy_id_for_addr(&resolved_addr));
+                                        if crate::node::is_debug() {
+                                            println!("[DBG][QUIC] Message sent to {} (binary)", get_privacy_id_for_addr(&resolved_addr));
                                         }
                                     }
                                     return; // Success, no need for HTTP fallback

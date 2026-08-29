@@ -272,12 +272,14 @@ pub mod gas_limits {
     /// Maximum gas limit per transaction
     pub const MAX_GAS_LIMIT: u64 = 1_000_000; // Reduced from 2M
 
-    /// FIX R22-B5: Maximum cumulative gas per block (protocol constant)
-    /// Limits computational work per block independently of byte size.
-    /// 200K TX × avg 10K gas ≈ 2B gas. Set to 10B for headroom with contract calls.
-    /// Defense-in-depth: block byte limit (80MB) + block gas limit (10B) together
-    /// prevent both size-based and computation-based DoS.
-    pub const BLOCK_GAS_LIMIT: u64 = 10_000_000_000; // 10 billion gas units
+    /// Maximum cumulative gas per block (protocol constant) — the per-block WORK budget,
+    /// same role as Ethereum's block gas limit. Producer fill and validator acceptance
+    /// enforce the same bound, so a produced block always re-verifies.
+    /// Sized so state apply + Merkle finalize fit the 1-second slot with margin:
+    /// 50M / TRANSFER(10K) = 5000 transfers per block. The old 10B bound admitted
+    /// ~90 seconds of apply into one block; production then overran the slot, failover
+    /// double-produced heights, and the block-time cadence collapsed.
+    pub const BLOCK_GAS_LIMIT: u64 = 50_000_000;
 
     /// Maximum cumulative WASM fuel a block may RESERVE (protocol constant).
     /// The intrinsic gas (BLOCK_GAS_LIMIT) prices bytes/base cost, but a metered WASM call can burn
@@ -4049,8 +4051,8 @@ impl Transaction {
                         .ok_or_else(|| StateError::InvalidTransaction("[REJECT][BATCH-TRANSFER] recipient_balance_overflow".into()))?;
                 }
 
-                if is_info_log() {
-                    println!("[INFO][BATCH-TRANSFER] {} nanoQNC to {} recipients by {} fee={} nanoQNC",
+                if is_debug_log() {
+                    println!("[DBG][BATCH-TRANSFER] {} nanoQNC to {} recipients by {} fee={} nanoQNC",
                         total_transfer_amount, transfers.len(),
                         crate::char_prefix(&self.from, 16), total_fee);
                 }
