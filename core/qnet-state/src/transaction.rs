@@ -275,11 +275,11 @@ pub mod gas_limits {
     /// Maximum cumulative gas per block (protocol constant) — the per-block WORK budget,
     /// same role as Ethereum's block gas limit. Producer fill and validator acceptance
     /// enforce the same bound, so a produced block always re-verifies.
-    /// Sized so the slowest committee hardware holds the 1-second slot: 50M /
-    /// TRANSFER(10K) = 5000 transfers per block. Measured at that load: apply ~45ms,
-    /// delta flush ~60ms, tree recompute bounded by hashing once sibling probes are
-    /// RAM-served (the store range-scans behind them were 95%+ of finalize cost).
-    pub const BLOCK_GAS_LIMIT: u64 = 50_000_000;
+    /// 200M / TRANSFER(10K) = 20000 transfers per block — a safety ceiling above the
+    /// measured steady rate, so throughput probes are driven by submission rate alone
+    /// instead of a rebuild per step. Measured at 5000/block: apply ~45ms, tree
+    /// ~150-420ms, delta flush ~60ms — under half the 1-second slot fleet-wide.
+    pub const BLOCK_GAS_LIMIT: u64 = 200_000_000;
 
     /// Maximum cumulative WASM fuel a block may RESERVE (protocol constant).
     /// The intrinsic gas (BLOCK_GAS_LIMIT) prices bytes/base cost, but a metered WASM call can burn
