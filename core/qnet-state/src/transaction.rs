@@ -275,10 +275,10 @@ pub mod gas_limits {
     /// Maximum cumulative gas per block (protocol constant) — the per-block WORK budget,
     /// same role as Ethereum's block gas limit. Producer fill and validator acceptance
     /// enforce the same bound, so a produced block always re-verifies.
-    /// Sized so state apply + Merkle finalize fit the 1-second slot with margin:
-    /// 50M / TRANSFER(10K) = 5000 transfers per block. The old 10B bound admitted
-    /// ~90 seconds of apply into one block; production then overran the slot, failover
-    /// double-produced heights, and the block-time cadence collapsed.
+    /// Sized so the slowest committee hardware holds the 1-second slot: 50M /
+    /// TRANSFER(10K) = 5000 transfers per block. Measured at that load: apply ~45ms,
+    /// delta flush ~60ms, tree recompute bounded by hashing once sibling probes are
+    /// RAM-served (the store range-scans behind them were 95%+ of finalize cost).
     pub const BLOCK_GAS_LIMIT: u64 = 50_000_000;
 
     /// Maximum cumulative WASM fuel a block may RESERVE (protocol constant).

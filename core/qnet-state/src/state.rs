@@ -256,6 +256,10 @@ pub struct StateMerkleTree {
     /// store tombstone for rows that never existed — a loaded block's lone-climb
     /// otherwise pushed millions of no-op deletes into the store every finalize.
     node_cache_complete: bool,
+    // `leaves` provably holds EVERY live leaf. While true, sibling probes and leaf
+    // reads are answered from RAM — the store range-scans behind first_foreign_depth
+    // (~9 per dirty leaf) were 95%+ of finalize cost under batch load.
+    leaves_complete: bool,
     /// Set when the incremental pass read a node it could not resolve. finalize discards the
     /// result and redoes the pass as a full recompute rather than sealing a guessed root.
     incremental_pass_invalid: bool,
@@ -298,6 +302,7 @@ impl StateMerkleTree {
             pending_leaf_dels: BTreeSet::new(),
             node_wipe_pending: false,
             node_cache_complete: true,
+            leaves_complete: true,
             incremental_pass_invalid: false,
         }
     }
@@ -308,6 +313,7 @@ impl StateMerkleTree {
     pub fn set_node_store(&mut self, store: std::sync::Arc<dyn MerkleNodeStore>) {
         self.node_store = Some(store);
         self.node_cache_complete = false; // store may hold rows the cache does not
+        self.leaves_complete = false;     // same for leaves, until a full rebuild
         if self.node_cache_cap == 0 {
             self.node_cache_cap = DEFAULT_NODE_CACHE_CAP;
         }
@@ -356,7 +362,8 @@ impl StateMerkleTree {
         if let Some(v) = self.leaves.get(key).copied() {
             return Some(v);
         }
-        if self.node_store.is_some() {
+        // A complete RAM set makes a miss authoritative — no store read.
+        if self.node_store.is_some() && !self.leaves_complete {
             // Deleted this finalize but not yet flushed: the store still holds a
             // stale copy — treat as absent so a rebuild/path-walk can't resurrect
             // it. Inert when store is None (set is empty and unused).
@@ -379,10 +386,14 @@ impl StateMerkleTree {
         if let Some(v) = self.intermediate_nodes.get(&(depth, *key)).copied() {
             return Some(v);
         }
-        if let Some(ref store) = self.node_store {
-            if let Some(v) = store.get_node(depth, key) {
-                self.intermediate_nodes.insert((depth, *key), v);
-                return Some(v);
+        // A complete node cache makes a miss authoritative — derived (chain-interior)
+        // nodes are never stored, so this point read missed on every one of them.
+        if !self.node_cache_complete {
+            if let Some(ref store) = self.node_store {
+                if let Some(v) = store.get_node(depth, key) {
+                    self.intermediate_nodes.insert((depth, *key), v);
+                    return Some(v);
+                }
             }
         }
         None
@@ -551,18 +562,20 @@ impl StateMerkleTree {
             let use_incremental = mode_incremental;
             self.dirty = false;
             self.pending_updates = 0;
+            let tree_ms = t0.elapsed().as_millis();
+            // Store attached → persist this finalize's delta, then bound the
+            // read-through caches. No-op when store is None (default path).
+            let t_flush = std::time::Instant::now();
+            self.flush_delta_and_evict();
             if updates > 0 {
                 println!(
-                    "[INFO][MERKLE] state_root_finalized updates={} leaves={} dirty={} mode={} ms={} root={}",
+                    "[INFO][MERKLE] state_root_finalized updates={} leaves={} dirty={} mode={} tree_ms={} flush_ms={} root={}",
                     updates, self.leaves.len(), k,
                     if use_incremental { "incremental" } else { "full" },
-                    t0.elapsed().as_millis(),
+                    tree_ms, t_flush.elapsed().as_millis(),
                     hex::encode(&self.root[..8]),
                 );
             }
-            // Store attached → persist this finalize's delta, then bound the
-            // read-through caches. No-op when store is None (default path).
-            self.flush_delta_and_evict();
         }
         self.root
     }
@@ -615,6 +628,7 @@ impl StateMerkleTree {
                 for k in victims {
                     self.leaves.remove(&k);
                 }
+                self.leaves_complete = false;
             }
             if self.intermediate_nodes.len() > cap {
                 let excess = self.intermediate_nodes.len() - cap;
@@ -1030,6 +1044,11 @@ impl StateMerkleTree {
     /// at two so the probe stays O(log N) regardless of subtree size.
     fn subtree_probe(&self, depth: usize, key: &[u8; HASH_SIZE]) -> SubtreeSpan {
         let (lo, hi) = Self::subtree_bounds(depth, key);
+        // Complete RAM leaf set → answer from the BTreeMap below (deletes are already
+        // applied to it, so no tombstone filtering is needed). The store arm is the
+        // fallback for an incomplete cache only: its range scan is the unit of cost
+        // that made finalize scale with disk latency instead of hashing.
+        if !self.leaves_complete {
         if let Some(ref store) = self.node_store {
             // Over-fetch by the tombstones INSIDE this range: the store still holds rows deleted
             // this finalize, and truncating at 2 RAW rows before filtering them can report a branch
@@ -1059,6 +1078,7 @@ impl StateMerkleTree {
                 1 => SubtreeSpan::Single(seen[0].0, seen[0].1),
                 _ => SubtreeSpan::Branch,
             };
+        }
         }
         let mut it = self.leaves.range(lo..=hi);
         match (it.next(), it.next()) {
@@ -1201,6 +1221,13 @@ impl StateMerkleTree {
                     set
                 }
             };
+
+        // The complete live set is materialized anyway — make the RAM cache
+        // authoritative so probes stop touching the store until an eviction.
+        if self.node_store.is_some() {
+            self.leaves = current_level.clone();
+            self.leaves_complete = true;
+        }
 
         if current_level.is_empty() {
             self.root = self.default_hashes[TREE_DEPTH];

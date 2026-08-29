@@ -1673,7 +1673,25 @@ impl BlockPipeline {
         max_block_bytes: usize,
         unified_p2p: Option<Arc<SimplifiedP2P>>,
     ) {
+        // Entry horizon (== deferred window). The verify-stage filter sits BEHIND decode
+        // work and two bounded channels: on a deep-behind node, live blocks thousands
+        // ahead filled every queue before it could act, and the frontier blocks the node
+        // actually needed bounced off the full ingest channel. Drop them at the door.
+        const INGEST_HORIZON: u64 = 2000;
+        let mut tip_cache: u64 = 0;
+        let mut tip_cache_age: u32 = 0;
         while let Some(block) = rx.recv().await {
+            if tip_cache_age == 0 {
+                tip_cache = storage.get_chain_height().unwrap_or(0);
+            }
+            tip_cache_age = (tip_cache_age + 1) & 0xF;
+            if block.height > tip_cache.saturating_add(INGEST_HORIZON) {
+                metrics.future_dropped.fetch_add(1, Ordering::Relaxed);
+                if is_debug() {
+                    println!("[DBG][PIPELINE] entry_horizon_drop h={} tip={}", block.height, tip_cache);
+                }
+                continue;
+            }
             // v14.8: local apply-quarantine — drop blocks from peers that
             // have repeatedly produced state_root mismatches or invalid
             // payloads. Cheap DashMap lookup; lets us skip decode/verify
@@ -1721,8 +1739,10 @@ impl BlockPipeline {
                 continue;
             }
 
-            // Decompress (zstd or raw) with size limit to prevent decompression bombs
-            const MAX_DECOMPRESSED_SIZE: usize = 50 * 1024 * 1024; // 50MB limit
+            // Decompress (zstd or raw) with size limit to prevent decompression bombs.
+            // Same ceiling as build/accept: a compressed input can never legitimately
+            // inflate past the hard block size.
+            const MAX_DECOMPRESSED_SIZE: usize = HARD_BLOCK_SIZE_BYTES;
             let decompressed = match zstd::stream::Decoder::new(&block.data[..]) {
                 Ok(decoder) => {
                     use std::io::Read;
