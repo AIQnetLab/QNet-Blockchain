@@ -3921,7 +3921,14 @@ impl BlockchainNode {
 
                     // FIX R22-B5: Track cumulative block gas for BLOCK_GAS_LIMIT enforcement
                     // Applied AFTER size filter, BEFORE TX validation — early rejection of gas overflow
-                    let block_gas_limit = qnet_state::gas_limits::BLOCK_GAS_LIMIT;
+                    // Producer fill TARGET under the consensus LIMIT (target/limit model).
+                    // A mempool backlog once drained into limit-sized blocks; the slowest
+                    // committee nodes applied those for multiple seconds, the cadence fell,
+                    // the backlog grew — a stable degraded spiral. The target bounds every
+                    // block to work the whole fleet applies inside the 1s slot; validators
+                    // keep accepting up to the full limit.
+                    const BLOCK_FILL_SOFT_GAS: u64 = 80_000_000;
+                    let block_gas_limit = qnet_state::gas_limits::BLOCK_GAS_LIMIT.min(BLOCK_FILL_SOFT_GAS);
                     
                     // CRITICAL v2.26: Track TX hashes for mempool cleanup after block
                     // IMPORTANT: Use the SAME hash from mempool, not recalculated!
