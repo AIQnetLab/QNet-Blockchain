@@ -3926,9 +3926,21 @@ impl BlockchainNode {
                     // committee nodes applied those for multiple seconds, the cadence fell,
                     // the backlog grew — a stable degraded spiral. The target bounds every
                     // block to work the whole fleet applies inside the 1s slot; validators
-                    // keep accepting up to the full limit.
+                    // keep accepting up to the full limit. Producer-local POLICY (not a
+                    // consensus parameter), so the throughput ladder may override it per
+                    // step via env — always clamped to the consensus ceiling.
                     const BLOCK_FILL_SOFT_GAS: u64 = 120_000_000;
-                    let block_gas_limit = qnet_state::gas_limits::BLOCK_GAS_LIMIT.min(BLOCK_FILL_SOFT_GAS);
+                    static FILL_GAS_TARGET: once_cell::sync::Lazy<u64> = once_cell::sync::Lazy::new(|| {
+                        let v = std::env::var("QNET_BLOCK_FILL_GAS").ok()
+                            .and_then(|s| s.parse::<u64>().ok())
+                            .unwrap_or(BLOCK_FILL_SOFT_GAS)
+                            .clamp(10_000_000, qnet_state::gas_limits::BLOCK_GAS_LIMIT);
+                        if v != BLOCK_FILL_SOFT_GAS && is_warn() {
+                            println!("[WARN][PROD] fill_gas_target_override target={} default={}", v, BLOCK_FILL_SOFT_GAS);
+                        }
+                        v
+                    });
+                    let block_gas_limit = *FILL_GAS_TARGET;
                     
                     // CRITICAL v2.26: Track TX hashes for mempool cleanup after block
                     // IMPORTANT: Use the SAME hash from mempool, not recalculated!
