@@ -3929,7 +3929,11 @@ impl BlockchainNode {
                     // keep accepting up to the full limit. Producer-local POLICY (not a
                     // consensus parameter), so the throughput ladder may override it per
                     // step via env — always clamped to the consensus ceiling.
-                    const BLOCK_FILL_SOFT_GAS: u64 = 120_000_000;
+                    // Calibrated by the boundary ladder: 13 batches/block is the highest
+                    // rung that holds a 10-min run at >=99% on floor hardware (schedule
+                    // catch-up supplies the drain margin); 14 runs a ~3 batch/s deficit,
+                    // 16 holds only 5-min bursts, 20 (the limit) breaks cadence sustained.
+                    const BLOCK_FILL_SOFT_GAS: u64 = 130_000_000;
                     static FILL_GAS_TARGET: once_cell::sync::Lazy<u64> = once_cell::sync::Lazy::new(|| {
                         let v = std::env::var("QNET_BLOCK_FILL_GAS").ok()
                             .and_then(|s| s.parse::<u64>().ok())
