@@ -879,7 +879,10 @@ impl BlockchainNode {
                     let gas_price = bincode::deserialize::<qnet_state::Transaction>(&payload)
                         .map(|tx| tx.gas_price)
                         .unwrap_or(0);
-                    if mempool_load.add_binary_transaction(payload, tx_hash, gas_price) {
+                    // Rehydrated admit keeps the ORIGINAL admission age (RAM clock
+                    // back-dated, disk ts restored) — the plain path re-stamped both
+                    // with `now`, granting survivors a fresh TTL on every restart.
+                    if mempool_load.add_binary_transaction_rehydrated(payload, tx_hash, gas_price, admission_ts) {
                         admitted += 1;
                     }
                 }

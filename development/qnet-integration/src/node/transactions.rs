@@ -1536,6 +1536,15 @@ impl BlockchainNode {
         if let Err(validation_error) = tx.validate() {
             return Err(QNetError::ValidationError(format!("Transaction validation failed: {}", validation_error)));
         }
+        // Gossip cannot resurrect what this node already TTL-expired: peers hold an
+        // evicted tx for up to their own TTL and keep re-pushing it (a drained pool
+        // regrew by thousands from tx-sync alone). validate() just pinned tx.hash to
+        // the canonical bytes, so the tombstone lookup is sound — and it runs BEFORE
+        // the ML-DSA verify so the re-push costs nothing. RPC resubmission bypasses
+        // this by design (network ingress only).
+        if self.mempool.is_recently_expired(&tx.hash) {
+            return Err(QNetError::ValidationError("recently_expired".to_string()));
+        }
         if !Self::gas_limit_admissible(&tx) {
             return Err(QNetError::ValidationError(format!(
                 "gas_limit {} exceeds MAX_GAS_LIMIT {}", tx.gas_limit, qnet_state::gas_limits::MAX_GAS_LIMIT)));

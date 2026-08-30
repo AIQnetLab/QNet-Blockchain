@@ -3540,6 +3540,12 @@ impl BlockchainNode {
                         .unwrap_or_default()
                         .parse::<usize>()
                         .unwrap_or(200_000);  // Default 200K TX/microblock (v4.1)
+                    // Byte budget for the mempool pull: the block is capped at
+                    // BLOCK_FILL_SOFT_BYTES (4 MB) below, so cloning + classifying
+                    // more than a small multiple of that per slot is pure waste —
+                    // an 8k-batch backlog used to cost ~0.5 GB of memcpy + decode
+                    // per block. 4x covers skips (future-nonce, deferred, dead).
+                    const FILL_PULL_BYTE_BUDGET: usize = 16_000_000;
                         
                     let _high_performance = std::env::var("QNET_HIGH_FREQUENCY").unwrap_or_default() == "1";
                     let compression_enabled = std::env::var("QNET_COMPRESSION").unwrap_or_default() == "1";
@@ -3763,7 +3769,7 @@ impl BlockchainNode {
                         let remaining_space = max_tx_per_microblock.saturating_sub(block_txs.len());
                         if remaining_space > 0 {
                             // v2.26: Direct access - SimpleMempool is already thread-safe
-                            let public_txs = mempool.get_pending_transactions_with_hashes(remaining_space);
+                            let public_txs = mempool.get_pending_for_fill(remaining_space, FILL_PULL_BYTE_BUDGET);
                             block_txs.extend(public_txs);
                         }
                         
@@ -3792,7 +3798,7 @@ impl BlockchainNode {
                             println!("[INFO][MEMPOOL] pre_fetch h={} size={}", next_block_height, mempool_size);
                         }
                         
-                        mempool.get_pending_transactions_with_hashes(max_tx_per_microblock)
+                        mempool.get_pending_for_fill(max_tx_per_microblock, FILL_PULL_BYTE_BUDGET)
                     };
                     
                     // v2.99: Prepend emission TX if this is an emission block
@@ -4060,13 +4066,16 @@ impl BlockchainNode {
                                 // admission must not reach a block.
                                 (false, Some("gas_limit_above_max".to_string()))
                             } else {
-                                // Production: full state validation (thread-safe read)
-                                let nonce_valid = if let Some(account) = state_snapshot.get_account(&tx.from) {
-                                    tx.nonce == account.nonce + 1
-                                } else {
-                                    tx.nonce == 1
-                                };
-                                
+                                // Production: full state validation (thread-safe read).
+                                // Nonce is tri-state, and only CONSUMED is a death sentence:
+                                //   consumed (<= account.nonce)  → evict, the signed bytes can never apply;
+                                //   next     (== account.nonce+1) → includable;
+                                //   future   (>  account.nonce+1) → SKIP but KEEP — the sender's earlier tx
+                                //     is still in flight (same pool or an unapplied block); evicting here
+                                //     used to kill the second of any two back-to-back txs from one wallet.
+                                let account_nonce = state_snapshot.get_account(&tx.from)
+                                    .map(|a| a.nonce).unwrap_or(0);
+
                                 let balance_valid = if let qnet_state::TransactionType::Transfer { .. } = &tx.tx_type {
                                     let balance = state_snapshot.get_balance(&tx.from);
                                     // SECURITY: checked arithmetic to prevent overflow → false balance_valid
@@ -4076,10 +4085,14 @@ impl BlockchainNode {
                                 } else {
                                     true
                                 };
-                                
-                                if !nonce_valid {
-                                    (false, Some("bad_nonce".to_string()))
+
+                                if tx.nonce <= account_nonce {
+                                    (false, Some("nonce_consumed".to_string()))
+                                } else if tx.nonce > account_nonce + 1 {
+                                    (false, Some("nonce_future".to_string()))
                                 } else if !balance_valid {
+                                    // Keep, don't evict: funding may land in a following block
+                                    // (chained transfers). TTL reaps it if it never becomes payable.
                                     (false, Some("insufficient_balance".to_string()))
                                 } else {
                                     (true, None)
@@ -4100,6 +4113,7 @@ impl BlockchainNode {
                     let mut system_txs: Vec<qnet_state::Transaction> = Vec::new();
                     let mut user_txs: Vec<qnet_state::Transaction> = Vec::new();
                     let mut rejection_reasons: Vec<(String, String)> = Vec::new(); // v3.1: Track reasons
+                    let mut skipped_keep: usize = 0; // transient rejects left in the pool
                     
                     // Producer-side commitment dedup (last line of defence
                     // before block sealing). The mempool's commitment_index
@@ -4190,13 +4204,25 @@ impl BlockchainNode {
                         } else {
                             // v3.1: Track rejection reason
                             if let Some(reason) = reject_reason {
+                                // Transient conditions stay POOLED: a future nonce becomes next
+                                // once the sender's in-flight tx applies, an unfunded transfer
+                                // becomes payable when funding lands. Only deterministically
+                                // dead txs are evicted below; TTL reaps the rest.
+                                if reason == "nonce_future" || reason == "insufficient_balance" {
+                                    skipped_keep += 1;
+                                    continue;
+                                }
                                 rejection_reasons.push((hash.clone(), reason));
                             }
                             invalid_tx_hashes.push(hash);
                         }
                     }
-                    
+
                     drop(state_snapshot);  // Release read lock
+
+                    if skipped_keep > 0 && is_info() {
+                        println!("[INFO][MB] fill_skipped_kept h={} count={}", next_block_height, skipped_keep);
+                    }
                     
                     // CRITICAL v2.26: Remove invalid transactions from mempool immediately!
                     // v3.1: Log actual rejection reasons instead of generic message

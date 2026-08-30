@@ -72,6 +72,12 @@ pub struct SimpleMempool {
     included_tx_hashes: Arc<DashMap<String, std::time::Instant>>,
     /// Timestamp when each TX was added (for TTL eviction)
     tx_timestamps: DashMap<String, std::time::Instant>,
+    /// TTL-evicted hashes, kept for one gossip horizon so peers re-pushing an
+    /// expired tx cannot resurrect it (observed: a drained pool regrew by
+    /// thousands from tx-sync alone). Consulted ONLY by the network ingress —
+    /// direct RPC re-submission stays open, and a successful local re-admission
+    /// clears the entry. Pruned by the same sweep that populates it.
+    expired_tx_hashes: Arc<DashMap<String, std::time::Instant>>,
     /// Per-sender TX count for spam protection
     tx_count_by_sender: DashMap<String, u32>,
     /// FIX R24-M2: Track tx_hash → sender for decrementing count on removal
@@ -166,6 +172,7 @@ impl SimpleMempool {
             use_binary,
             included_tx_hashes: Arc::new(DashMap::new()),
             tx_timestamps: DashMap::new(),
+            expired_tx_hashes: Arc::new(DashMap::new()),
             tx_count_by_sender: DashMap::new(),
             tx_sender_map: DashMap::new(),
             max_per_sender,
@@ -574,6 +581,9 @@ impl SimpleMempool {
 
             self.tx_store_insert(hash.clone(), storage);
             self.tx_timestamps.insert(hash.clone(), std::time::Instant::now());
+            // A deliberate local re-admission (RPC resubmit) lifts this node's
+            // expiry tombstone; peers clear their own the same way.
+            self.expired_tx_hashes.remove(&hash);
             // v14.8.4: System TXs keyed at u64::MAX so block producers drain
             // them first — protocol bootstrap cannot be delayed by user TXs.
             priority_queue
@@ -809,6 +819,9 @@ impl SimpleMempool {
             // Add to transactions first
             self.tx_store_insert(hash.clone(), TxStorage::Binary(tx_bytes));
             self.tx_timestamps.insert(hash.clone(), std::time::Instant::now());
+            // A deliberate local re-admission (RPC resubmit) lifts this node's
+            // expiry tombstone; peers clear their own the same way.
+            self.expired_tx_hashes.remove(&hash);
 
             // Then add to priority queue (same lock scope)
             priority_queue
@@ -976,6 +989,9 @@ impl SimpleMempool {
             // Insert into BOTH structures within the same lock scope
             self.tx_store_insert(hash.clone(), TxStorage::Binary(tx_bytes));
             self.tx_timestamps.insert(hash.clone(), std::time::Instant::now());
+            // A deliberate local re-admission (RPC resubmit) lifts this node's
+            // expiry tombstone; peers clear their own the same way.
+            self.expired_tx_hashes.remove(&hash);
             priority_queue
                 .entry(gas_price)
                 .or_insert_with(VecDeque::new)
@@ -1115,6 +1131,7 @@ impl SimpleMempool {
         self.commitment_index.clear();
         self.commitment_reverse.clear();
         self.pending_registration_hashes.clear();
+        self.expired_tx_hashes.clear();
 
         // v15.9: mirror the wipe to RocksDB. Each hash gets its own
         // persist_remove call so the CF stays consistent with RAM.
@@ -1149,7 +1166,7 @@ impl SimpleMempool {
         self.enforce_included_cap();
 
         // Step 1: Remove from transactions map (fast O(1) per hash)
-        let mut removed_count = 0;
+        let mut removed_hashes: Vec<&String> = Vec::new();
         for hash in hashes {
             if self.tx_store_remove(hash) {
                 self.tx_timestamps.remove(hash.as_str());
@@ -1159,12 +1176,12 @@ impl SimpleMempool {
                 // v15.5: clear commitment dedup tables for every hash that
                 // actually existed in storage. Idempotent and O(1) per hash.
                 self.cleanup_commitment_indices_for_hash(hash);
-                removed_count += 1;
+                removed_hashes.push(hash);
             }
         }
 
         // Step 2: Clean priority queue in one pass (more efficient than individual removes)
-        if removed_count > 0 {
+        if !removed_hashes.is_empty() {
             let hash_set: std::collections::HashSet<&String> = hashes.iter().collect();
             let mut priority_queue = self.by_gas_price.write();
             for (_gas_price, queue_hashes) in priority_queue.iter_mut() {
@@ -1172,10 +1189,16 @@ impl SimpleMempool {
             }
             // Remove empty gas_price levels
             priority_queue.retain(|_, queue_hashes| !queue_hashes.is_empty());
-        }
-        
-        if removed_count > 0 {
-            println!("[INFO][MEMPOOL] block_cleanup removed={} included_set={}", removed_count, self.included_tx_hashes.len());
+            drop(priority_queue);
+
+            // Mirror every removal to the persistent pool (outside the lock).
+            // This was the one removal path without the mirror: a fully drained
+            // RAM pool left thousands of entries on disk, and every restart
+            // rehydrated them back as an unincludable backlog.
+            for hash in &removed_hashes {
+                self.fire_persist_remove(hash);
+            }
+            println!("[INFO][MEMPOOL] block_cleanup removed={} included_set={}", removed_hashes.len(), self.included_tx_hashes.len());
         }
     }
     
@@ -1353,6 +1376,7 @@ impl SimpleMempool {
             }
         });
 
+        let expired_count = expired_hashes.len();
         if !expired_hashes.is_empty() {
             // IMPORTANT: Do NOT use batch_remove_transactions here!
             // That method adds hashes to included_tx_hashes, which would
@@ -1383,12 +1407,84 @@ impl SimpleMempool {
             // would re-admit, producing zombie entries that get
             // re-evicted on the next TTL pass — wasted disk traffic and
             // a misleading mempool size on restart.
-            for hash in &expired_hashes {
-                self.fire_persist_remove(hash);
+            let now = std::time::Instant::now();
+            for hash in expired_hashes.drain(..) {
+                self.fire_persist_remove(&hash);
+                // Tombstone for the network ingress: peers still hold this tx
+                // for up to their own TTL and keep re-gossiping it.
+                self.expired_tx_hashes.insert(hash, now);
             }
         }
 
-        expired_hashes.len()
+        // Prune tombstones past the gossip horizon (peer TTL + slack) and hard-cap
+        // the set so a sustained eviction storm cannot grow it unboundedly.
+        let horizon = ttl_secs.saturating_mul(2).max(60);
+        self.expired_tx_hashes.retain(|_h, evicted_at| evicted_at.elapsed().as_secs() <= horizon);
+        const MAX_EXPIRED_TOMBSTONES: usize = 500_000;
+        let len = self.expired_tx_hashes.len();
+        if len > MAX_EXPIRED_TOMBSTONES {
+            let mut by_age: Vec<(String, std::time::Instant)> = self.expired_tx_hashes
+                .iter().map(|e| (e.key().clone(), *e.value())).collect();
+            by_age.sort_by_key(|(_, t)| *t); // oldest first
+            for (hash, _) in by_age.into_iter().take(len - MAX_EXPIRED_TOMBSTONES) {
+                self.expired_tx_hashes.remove(&hash);
+            }
+        }
+
+        expired_count
+    }
+
+    /// True while `hash` sits in the TTL-eviction tombstone window. Network
+    /// ingress (tx-sync) consults this BEFORE signature work so peers cannot
+    /// resurrect what this node already expired; RPC submission does not.
+    pub fn is_recently_expired(&self, hash: &str) -> bool {
+        self.expired_tx_hashes.contains_key(hash)
+    }
+
+    /// Boot-time rehydration admit: same as add_binary_transaction, but the tx keeps its
+    /// ORIGINAL admission age. The plain path stamps a fresh RAM Instant AND re-fires the
+    /// persist hook with ts=now, so every restart used to grant surviving entries a full
+    /// extra TTL. Back-date the RAM clock and restore the original wall-clock on disk.
+    pub fn add_binary_transaction_rehydrated(&self, tx_bytes: Vec<u8>, hash: String, gas_price: u64, admitted_unix_ts: u64) -> bool {
+        let payload_for_persist = tx_bytes.clone();
+        if !self.add_binary_transaction(tx_bytes, hash.clone(), gas_price) {
+            return false;
+        }
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        let age = now_secs.saturating_sub(admitted_unix_ts);
+        if admitted_unix_ts > 0 && age > 0 {
+            if let Some(back) = std::time::Instant::now().checked_sub(std::time::Duration::from_secs(age)) {
+                if let Some(mut t) = self.tx_timestamps.get_mut(&hash) { *t = back; }
+            }
+            if let Some(cb) = self.persist_admit.read().as_ref() {
+                cb(&hash, &payload_for_persist, admitted_unix_ts);
+            }
+        }
+        true
+    }
+
+    /// Producer fill pull: get_pending_transactions_with_hashes bounded by cumulative
+    /// payload BYTES as well as count. The fill previously cloned and classified the
+    /// entire pool head every block (an 8k-batch backlog = ~0.5 GB of memcpy + decode
+    /// per slot) while the block itself is byte-capped far lower — pulling past a small
+    /// multiple of that cap is pure waste. Returns at least one entry when non-empty.
+    pub fn get_pending_for_fill(&self, count_limit: usize, byte_budget: usize) -> Vec<(String, Vec<u8>)> {
+        let priority_queue = self.by_gas_price.read();
+        let mut out: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut bytes = 0usize;
+        'outer: for (_gas_price, hashes) in priority_queue.iter().rev() {
+            for h in hashes.iter() {
+                if out.len() >= count_limit { break 'outer; }
+                if let Some(data) = self.get_binary_transaction(h) {
+                    let sz = data.len();
+                    if !out.is_empty() && bytes.saturating_add(sz) > byte_budget { break 'outer; }
+                    bytes = bytes.saturating_add(sz);
+                    out.push((h.clone(), data));
+                }
+            }
+        }
+        out
     }
 
     /// Add binary transaction with sender tracking for spam protection
@@ -1426,3 +1522,124 @@ impl SimpleMempool {
         (tx_count, queue_count, is_consistent)
     }
 } 
+#[cfg(test)]
+mod hygiene_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    fn test_pool() -> SimpleMempool {
+        SimpleMempool::new(SimpleMempoolConfig {
+            max_size: 1000,
+            min_gas_price: 1,
+            max_per_sender: 100,
+        })
+    }
+
+    /// A structurally valid Transfer whose provided hash matches the canonical bytes,
+    /// so it clears the admission hash check.
+    fn test_tx(from: &str, nonce: u64) -> (Vec<u8>, String) {
+        let tx = Transaction::new(
+            from.to_string(),
+            Some("eon_recipient_addr".to_string()),
+            1_000,
+            nonce,
+            10,
+            10_000,
+            1_700_000_000 + nonce,
+            None,
+            qnet_state::TransactionType::Transfer {
+                from: from.to_string(),
+                to: "eon_recipient_addr".to_string(),
+                amount: 1_000,
+            },
+            None,
+        );
+        let hash = format!("{:x}", Sha3_256::digest(&tx.canonical_bytes()));
+        (bincode::serialize(&tx).unwrap(), hash)
+    }
+
+    #[test]
+    fn batch_remove_mirrors_to_persistent_pool() {
+        let pool = test_pool();
+        let removed: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let removed_cb = removed.clone();
+        pool.set_persistence_hooks(
+            Arc::new(|_h, _p, _ts| {}),
+            Arc::new(move |h| removed_cb.lock().unwrap().push(h.to_string())),
+        );
+        let (b1, h1) = test_tx("eon_sender_a", 1);
+        let (b2, h2) = test_tx("eon_sender_b", 1);
+        let (b3, h3) = test_tx("eon_sender_c", 1);
+        assert!(pool.add_binary_transaction(b1, h1.clone(), 10));
+        assert!(pool.add_binary_transaction(b2, h2.clone(), 10));
+        assert!(pool.add_binary_transaction(b3, h3.clone(), 10));
+
+        pool.batch_remove_transactions(&[h1.clone(), h2.clone()]);
+
+        let fired = removed.lock().unwrap().clone();
+        assert!(fired.contains(&h1) && fired.contains(&h2),
+                "block-inclusion removal must reach the persistent pool: {:?}", fired);
+        assert!(!fired.contains(&h3));
+        assert_eq!(pool.size(), 1);
+    }
+
+    #[test]
+    fn ttl_eviction_tombstones_gossip_but_not_resubmission() {
+        let pool = test_pool();
+        let (b, h) = test_tx("eon_sender_d", 1);
+        // Admit pre-aged (rehydrated path back-dates the RAM clock) so a
+        // short TTL expires it deterministically without sleeping.
+        let old_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() - 10;
+        assert!(pool.add_binary_transaction_rehydrated(b.clone(), h.clone(), 10, old_ts));
+
+        assert_eq!(pool.cleanup_expired_transactions(5), 1);
+        assert!(pool.is_recently_expired(&h), "TTL eviction must tombstone the hash");
+        assert_eq!(pool.size(), 0);
+
+        // Deliberate local re-admission (the RPC path) stays open and lifts the tombstone.
+        assert!(pool.add_binary_transaction(b, h.clone(), 10));
+        assert!(!pool.is_recently_expired(&h));
+    }
+
+    #[test]
+    fn rehydrated_admit_keeps_original_age() {
+        let pool = test_pool();
+        let persisted_ts: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+        let ts_cb = persisted_ts.clone();
+        pool.set_persistence_hooks(
+            Arc::new(move |_h, _p, ts| ts_cb.lock().unwrap().push(ts)),
+            Arc::new(|_h| {}),
+        );
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let admitted_ts = now - 100;
+
+        let (b, h) = test_tx("eon_sender_e", 1);
+        assert!(pool.add_binary_transaction_rehydrated(b, h.clone(), 10, admitted_ts));
+
+        // Disk record ends with the ORIGINAL timestamp, not a fresh one.
+        assert_eq!(*persisted_ts.lock().unwrap().last().unwrap(), admitted_ts);
+        // RAM clock is back-dated: a 50s TTL must reap a 100s-old entry immediately.
+        assert_eq!(pool.cleanup_expired_transactions(50), 1);
+        assert_eq!(pool.size(), 0);
+    }
+
+    #[test]
+    fn fill_pull_respects_byte_budget_and_count() {
+        let pool = test_pool();
+        let mut sizes = Vec::new();
+        for i in 0..3u64 {
+            let (b, h) = test_tx(&format!("eon_sender_f{}", i), 1);
+            sizes.push(b.len());
+            assert!(pool.add_binary_transaction(b, h, 10));
+        }
+        // Budget for exactly two payloads: the third must not be pulled.
+        let budget = sizes[0] + sizes[1];
+        assert_eq!(pool.get_pending_for_fill(10, budget).len(), 2);
+        // Count limit binds independently of bytes.
+        assert_eq!(pool.get_pending_for_fill(1, usize::MAX).len(), 1);
+        // A budget smaller than one payload still yields one entry (progress guarantee).
+        assert_eq!(pool.get_pending_for_fill(10, 1).len(), 1);
+    }
+}
