@@ -124,9 +124,9 @@ const HomeSection = React.memo(function HomeSection({ setActiveSection }: { setA
               <div className="stat-trend">{stats ? `+${(stats.activeLightNodes ?? 0).toLocaleString()} light (prev epoch)` : 'Live data'}</div>
             </div>
             <div className="stat-card">
-              <div className="stat-number">~100k</div>
-              <div className="stat-label">TPS PER SHARD</div>
-              <div className="stat-trend">256 shards available</div>
+              <div className="stat-number">13k</div>
+              <div className="stat-label">TRANSFERS/SEC</div>
+              <div className="stat-trend">measured E2E · 40-80k on validator hardware</div>
             </div>
             <div className="stat-card">
               <div className="stat-number">{stats?.currentRound !== undefined ? stats.currentRound : '—'}</div>
@@ -189,10 +189,11 @@ const HomeSection = React.memo(function HomeSection({ setActiveSection }: { setA
               <div className="feature-icon-wrapper">
                   <div className="lightning-icon"></div>
               </div>
-              <h3>~100k TPS per Shard</h3>
+              <h3>13,000 Transfers/sec Measured</h3>
               <p>
-                  Scalable sharding architecture with 256 shards. Each shard achieves ~100k TPS. 
-                  Microblock architecture with pBFT consensus for high throughput.
+                  13,000 finalized transfers per second measured end-to-end on a 5-node testnet
+                  with 1-second blocks and post-quantum signatures. Validator-grade hardware
+                  projects to 40-80k.
               </p>
           </div>
           

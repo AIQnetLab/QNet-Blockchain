@@ -51,6 +51,36 @@ reorg depth.
 
 Full treatment: [consensus](./consensus.md).
 
+## Measured performance
+
+Every figure below is an end-to-end measurement over public RPC on a live 5-node network of
+budget VPS hosts (8 vCPU class), taken by a load harness that counts a transfer only after the
+block containing it is certified by a checkpoint: submitted → included → finalized. Nothing here
+is a single-process benchmark.
+
+- **Sustained throughput: 13,000 transfers/s** — the highest load rung that held ≥99% inclusion
+  and finalization over a continuous 10-minute run (99.79%, 12,975 finalized transfers/s).
+  12,000/s ran at 99.97% with exactly one block per second end to end (932 blocks in 932 s).
+- **Peak throughput: 16,000 transfers/s** over 5-minute windows (99.79%). Sustained rungs above
+  13k degrade gracefully: the pool queues and self-drains with no forks and no network halt
+  (14k settles at ~9.2k/s effective, 20k at ~11k/s).
+- **Single-signature transactions: ~450/s** on this hardware. Each carries its own 3,309-byte
+  ML-DSA-65 signature and there is no standardized batch verification for ML-DSA, so the
+  per-signer rate is bound by signature-adjacent work and scales with cores.
+- **Batch transfers** put up to 1,000 payments under one ML-DSA-65 signature (3.3 signature
+  bytes per transfer). The batch is signed and verified as one plain FIPS 204 message — no
+  custom cryptography — which is what moves the throughput bound from signatures to state
+  application.
+- **Finality latency**: inclusion is seconds (p50 2–5 s at moderate load); hard BFT finality is
+  the checkpoint certificate — p50 ~109 s measured at maximum sustained load (including ~30 s of
+  inclusion queueing), bounded by the checkpoint cadence when idle.
+
+The block work budget is calibrated from these runs (Ethereum-style target/limit split):
+`BLOCK_GAS_LIMIT` = 200M (20 batches — the measured burst boundary: a backlog of limit-sized
+blocks drains without a cadence avalanche but cannot be sustained on floor hardware) and the
+producer fill target `BLOCK_FILL_SOFT_GAS` = 130M (13 batches — the highest 10-minute-sustained
+rung, with the slot-schedule catch-up supplying the drain margin).
+
 ## Lifecycle of a transaction
 
 1. **Construction.** The client builds the transaction and signs it with ML-DSA-65. The sender address

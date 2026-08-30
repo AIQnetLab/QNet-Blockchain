@@ -134,6 +134,22 @@ Producer-authority checks are two-sided. If a block's absolute round equals the 
 differs, it is rejected. If the block claims a different round, the leader for *that* round is recomputed from the cached
 round-0 roster with the same formula and a mismatch is rejected; only an underivable roster leaves the soft path.
 
+### The failover pacemaker task
+
+Timeout-vote emission, window amplification and the chronic-stall nudge run in a dedicated task
+(`run_failover_pacemaker`, 1 s tick), not inside the production loop. The loop can legitimately park in
+long awaits — sync scans, macroblock consensus, rollback — and when the liveness organs lived inside it
+they died with it: during one observed wedge four healthy validators could not assemble a timeout
+certificate for ~10 minutes because their loops were parked. The task reads only atomics and shared
+handles; a tick that exceeds 2 s is cancelled and retried, which is safe because emission is idempotent
+under the per-window pacing and every acceptance check (signature, window committee, voter dedup, the
+TC window floor) lives on the receiver.
+
+When a node's vote key is amplified to a higher committee-supported window, it votes for its **own**
+window in the same tick as well (cross-key voting; the receiver dedups per voter, the TC floor still
+bars re-entering a certified window). Delaying the own-window vote used to split the quorum across two
+keys — amplified votes stalling at 3-of-4 while the own-window round starved at 1-of-4.
+
 ## Candidate roster
 
 ### The N-2 snapshot

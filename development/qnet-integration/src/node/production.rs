@@ -3,6 +3,474 @@
 use super::*;
 
 impl BlockchainNode {
+    /// One pacemaker tick: the certificate-anchored failover emission block, verbatim
+    /// from the production loop. Reads only atomics, globals and the Arc handles passed
+    /// in; the receiver enforces signature, window committee, voter dedup and the TC
+    /// floor, so a duplicate or early vote is inert by construction.
+    async fn failover_pacemaker_tick(
+        storage: &std::sync::Arc<crate::storage::Storage>,
+        unified_p2p: &Option<std::sync::Arc<crate::unified_p2p::SimplifiedP2P>>,
+        node_id: &String,
+        node_type: crate::node::NodeType,
+    ) {
+        let node_id = node_id.clone();
+        // Applied tip + 1 — same value the loop derived from its height view.
+        let next_height = LAST_BLOCK_PRODUCED_HEIGHT.load(Ordering::Relaxed) + 1;
+        if next_height <= 1 { return; } // nothing applied yet — nothing to fail over
+        // Local liveness timer: wall-seconds since OUR applied height last
+        // advanced. Slot-anchored block_ts must NOT drive this — it carries the
+        // chain's lifetime production deficit and would trip the pacemaker against
+        // a healthy leader. Per-node by design; rotation safety is the same-round
+        // n−f certificate, not this gate. Clock-behind self-heals: the marker is
+        // re-stamped from this node's wall every time height advances.
+        let wall_now = get_timestamp_safe();
+        let cur_applied_h = LAST_BLOCK_PRODUCED_HEIGHT.load(Ordering::Relaxed);
+        let prev_progress_h = STALL_PROGRESS_HEIGHT.swap(cur_applied_h, Ordering::Relaxed);
+        let anchor = STALL_PROGRESS_WALL.load(Ordering::Relaxed);
+        // Re-stamp on height advance, init, or a BACKWARD wall step (SystemTime is
+        // non-monotonic) — the rewind case keeps a clock step-back from suppressing votes.
+        if cur_applied_h != prev_progress_h || anchor == 0 || wall_now < anchor {
+            STALL_PROGRESS_WALL.store(wall_now, Ordering::Relaxed);
+        }
+        let local_delay = wall_now.saturating_sub(STALL_PROGRESS_WALL.load(Ordering::Relaxed));
+
+        // v11.0: STALE LBPT PROTECTION after restart
+        // After restart, LBPT comes from replay (last saved block timestamp).
+        // If node was offline 30min, local_delay=1800s → timeout_round=1797 →
+        // completely wrong producer selection → consensus stall.
+        // FIX: Until PRODUCTION_UNLOCKED (set when first network block arrives),
+        // cap local_delay to prevent stale-LBPT-driven round inflation.
+        // Node still uses the n−f-certified round from the BFT protocol.
+        let mut production_unlocked = PRODUCTION_UNLOCKED.load(Ordering::Relaxed) == 1;
+
+        // v11.1: Auto-unlock when node is synchronized after restart
+        // Without this, restarted nodes with existing data stay locked until
+        // a new block is saved — creating a chicken-and-egg deadlock
+        if !production_unlocked {
+            let our_h = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+            let best_h = if let Some(ref p2p) = unified_p2p {
+                p2p.get_best_peer_height()
+            } else { 0 };
+            let peer_count = if let Some(ref p2p) = unified_p2p {
+                p2p.get_validated_active_peers().len()
+            } else { 0 };
+            // Unlock if: has data, has peers, and within 20 blocks of best peer
+            if our_h > 0 && peer_count > 0 && (best_h == 0 || our_h + 20 >= best_h) {
+                PRODUCTION_UNLOCKED.store(1, Ordering::Relaxed);
+                production_unlocked = true;
+                if is_info() {
+                    println!("[INFO][STATE] auto_unlock our_h={} best_h={} peers={}", our_h, best_h, peer_count);
+                }
+            }
+        }
+
+        let local_delay = if !production_unlocked && local_delay > 30 {
+            // After restart with stale LBPT: cap delay to 30s
+            // This prevents wrong timeout_round while allowing normal stall detection
+            if is_info() {
+                println!("[INFO][TIMEOUT] lbpt_stale_cap raw_delay={}s capped=30s production_locked=true", local_delay);
+            }
+            30
+        } else {
+            local_delay
+        };
+
+        // BFT-certified rotation invariant (microblock layer).
+        // Leader rotation is driven STRICTLY by the same-round n−f
+        // HIGHEST_CERTIFIED_ROUND — only a supermajority is safe for
+        // rotation-state advancement. Forensic (do NOT reintroduce):
+        // an f+1 `adopted` round once fed rotation via `certified.max(
+        // adopted)`, but the divergent f+1 caused split-brain (h=556),
+        // so adopted was removed entirely; a later clock-derived bypass
+        // (empty_slot_offset from local_now; NTP drift >1s → different
+        // fallback producer) caused fork h=4742, so the clock is removed
+        // from leader-selection inputs too — both now structurally
+        // impossible.
+
+        // CERTIFICATE-ANCHORED FAILOVER. The vote key is a pure function of this
+        // node's OWN verified chain — never a peer-height sample (eclipse/gossip
+        // staleness must not split honest keys) — plus f+1 committee-signed window
+        // amplification (min-target, bounded by the SAME constant as the production
+        // throttle). Safe: emission never touches acceptance — rotation still needs
+        // a same-round n−f TC, ingest still gates a round>0 block on
+        // failover_round_authorized, and a stale restart is fenced by
+        // production_unlocked + the lbpt cap.
+        let boot_wall = {
+            let b = NODE_BOOT_WALL.load(Ordering::Relaxed);
+            if b == 0 { NODE_BOOT_WALL.store(wall_now, Ordering::Relaxed); wall_now } else { b }
+        };
+        let peers_esc = unified_p2p.as_ref().map(|p| p.get_validated_active_peers().len()).unwrap_or(0);
+        let meshed_esc = peers_esc >= TIMEOUT_ESCALATION_MIN_PEERS;
+        let boot_ok_esc = wall_now.saturating_sub(boot_wall) >= TIMEOUT_ESCALATION_BOOT_FLOOR_SECS;
+        let failover_height = next_height; // own verified tip + 1
+        let own_w = failover_height / 90;
+        let tc_floor = crate::unified_p2p::observed_tc_window_floor();
+        let bound_w = crate::unified_p2p::certified_view_bound_windows();
+        // f+1 amplification: adopt the LOWEST committee-supported window above own
+        // (≥1 honest witness proves it real), capped by the producibility bound. Only
+        // scanned during an actual stall — the scan clones voter ids O(votes), and in
+        // steady state (no failover) there is nothing to amplify toward.
+        let amplified_w = if local_delay > STALL_GRACE_SECS {
+            crate::unified_p2p::lowest_window_with_support(own_w)
+                .filter(|w| bound_w == u64::MAX || *w <= bound_w.saturating_add(1))
+        } else { None };
+        // Own-window key is voted IN ADDITION to an amplified one from the FIRST
+        // tick (cross-key voting is legal; the receiver dedups per voter). The old
+        // 3-tick delay split the quorum during the h=601 fork: amplified votes sat
+        // at 3/4 while the own-window round starved at 1/4. Floor still enforced —
+        // once a window certified, no honest vote re-enters a lower window.
+        let (mb_idx, also_emit_own_w) = match amplified_w {
+            Some(w) => {
+                let prev = AMPLIFIED_WINDOW.swap(w, Ordering::Relaxed);
+                let ticks = if prev == w {
+                    AMPLIFY_STUCK_TICKS.fetch_add(1, Ordering::Relaxed) + 1
+                } else {
+                    AMPLIFY_STUCK_TICKS.store(0, Ordering::Relaxed);
+                    0
+                };
+                if is_warn() {
+                    println!("[WARN][TIMEOUT] window_amplified from={} to={} floor={} ticks={}",
+                             own_w, w, tc_floor, ticks);
+                }
+                let own_ok = own_w >= tc_floor && own_w < w;
+                (w.max(tc_floor), if own_ok { Some(own_w) } else { None })
+            }
+            None => {
+                AMPLIFIED_WINDOW.store(0, Ordering::Relaxed);
+                AMPLIFY_STUCK_TICKS.store(0, Ordering::Relaxed);
+                (own_w.max(tc_floor), None)
+            }
+        };
+        // Bound by the SAME horizon production uses, not the old 2-window seal allowance.
+        // While that mismatch stood, A1 was only half a decoupling: production could run
+        // 32 windows past the seal, but the moment a DEAD producer's slot came up beyond
+        // +180 rotation was suppressed — "no rotation can fill it" is true for a finality
+        // stall and false for a producer stall, and past the seal those are exactly the
+        // case that matters. With >1/3 dead a dead producer's slot arrives within a few
+        // rotations, so the chain stopped at +180 regardless of the raised throttle.
+        let seal_base = storage.last_sealed_mb_index().saturating_mul(90)
+            .max(qc_verified_frontier_cached());
+        let seal_throttled = seal_base > 0
+            && failover_height > seal_base
+                + (BlockchainNode::MAX_DERIVED_ROSTER_WINDOWS as u64) * 90;
+        if seal_throttled && is_warn() {
+            println!("[WARN][PROD] parked reason=roster_derivation_horizon h={} seal_base={} rotation=live",
+                     failover_height, seal_base);
+        }
+        // Same-round n−f certified rotation round for the FRONTIER macroblock — the sole
+        // rotation input, identical on every node once the round cert propagates.
+        let failover_round = crate::unified_p2p::get_certified_rotation_round(mb_idx);
+        update_failover_metrics(local_delay, failover_round);
+
+        // A4: no-progress age keyed on the certified VIEW (mb_idx, failover_round), NOT
+        // applied height — B's tail-convergence reorgs thrash the height anchor and kept
+        // resetting the height-based ceiling. Re-stamp only on a genuine view change /
+        // init / backward-wall step (mirrors the STALL_PROGRESS_WALL guard above), so
+        // round_age grows monotonically through a true deadlock and the ceiling matures.
+        // Key the view timer on the ABSOLUTE certified round: monotone per macroblock and
+        // identical on every node. The relative round subtracts a LOCAL finalized baseline,
+        // so it shifts when that baseline shifts, re-stamping the entry wall below and
+        // starving both escape ceilings that depend on round_age.
+        let view_key = (mb_idx << 8)
+            | crate::unified_p2p::highest_certified_round_for(mb_idx).min(0xFF);
+        let prev_view = ROUND_ENTRY_VIEW.swap(view_key, Ordering::Relaxed);
+        let ventry = ROUND_ENTRY_WALL.load(Ordering::Relaxed);
+        if view_key != prev_view || ventry == 0 || wall_now < ventry {
+            ROUND_ENTRY_WALL.store(wall_now, Ordering::Relaxed);
+        }
+        let round_age = wall_now.saturating_sub(ROUND_ENTRY_WALL.load(Ordering::Relaxed));
+
+        // At MAX_FAILOVER_ROUND, >MAX rotations in one window is a sync/partition issue, not
+        // producer liveness. HOLD, don't go terminal: the vote round is clamped to the cap in
+        // emit_macroblock_view_change_vote (DoS bound — no runaway climb), the pacemaker keeps
+        // emitting the bounded round so progress resumes the instant the partition heals, and
+        // we drive sync recovery in parallel. Keyed on the SAME frontier mb the vote uses.
+        let failover_capped = failover_round >= MAX_FAILOVER_ROUND;
+        if failover_capped {
+            if is_warn() {
+                println!("[WARN][TIMEOUT] failover_round_capped round={} cap={} mb={} action=hold+recovery_sync",
+                         failover_round, MAX_FAILOVER_ROUND, mb_idx);
+            }
+            CHRONIC_STALL_REQUESTED.store(true, Ordering::Relaxed);
+        }
+
+        // Silent-leader grace, heartbeat-freshness threshold, and 180s no-progress hard ceiling.
+        const STALL_GRACE_SECS: u64 = 5;
+        const HEARTBEAT_SILENT_MS: u64 = 3_000;
+        const D2_PROGRESS_HARD_CEILING_SECS: u64 = 180;
+        // A REMOTE producer's heartbeat is a CLAIM we cannot fully verify — binding it to
+        // our own parent hash kills an invented frontier, but a script tracking the real
+        // chain still passes. So a remote claim may buy far less delay than our own
+        // self-yield path: a producer genuinely alive and targeting the frontier emits
+        // within a block or two, and this stays well under one 30-block rotation, so a
+        // liar cannot hold even a single rotation.
+        const HEARTBEAT_SUPPRESS_CEILING_SECS: u64 = 15;
+
+        // On slot-leader silent > grace: emit a ML-DSA-65 TimeoutVote for (mb_idx, certified+1).
+        // n−f co-signs advance HIGHEST_CERTIFIED_ROUND[mb_idx] → every node re-elects the same
+        // fallback leader. Exponentially-paced per mb/node; receiver verifies sig + window
+        // committee + anchor + voter-dedup; TC only at n−f (≤f Byzantine cannot rotate).
+        // Leader self-yield fast path: a stored (sig-verified, committee-checked) rotation
+        // vote from the slot's own expected producer is authoritative about its
+        // unavailability — co-sign without waiting out the silent-leader grace. Only vote
+        // TIMING changes; forging a yield still needs the leader's key.
+        let leader_yielded = get_expected_producer(failover_height)
+            .map(|(p, _)| !p.is_empty() && p != node_id
+                && crate::unified_p2p::window_has_vote_from(own_w, &p))
+            .unwrap_or(false);
+        // No !failover_capped gate — at the cap the pacemaker HOLDS (keeps emitting) rather
+        // than going terminal; emit_macroblock_view_change_vote clamps the round to the cap.
+        // The vote to rotate a dead leader is NOT gated on production_unlocked: that is a
+        // per-node sync flag, and gating on it drops exactly the stragglers a stall left
+        // behind from the quorum that would rescue it. Round is certified+1 (not derived
+        // from local_delay), so a stale node emits one bounded vote, never a round storm.
+        // Rotation parks on the CONSENSUS-VISIBLE frontier, not on seal_base: that came
+        // from this node's own contiguous-seal scan, so a node behind on backfill parked
+        // before its peers and fell out of the quorum that rotates a dead leader. The
+        // gate itself must stay - failover rounds are bounded and a vote whose round
+        // already carries a TC is dropped, so a fully parked committee co-signing every
+        // tau would burn the budget and leave the window unable to rotate at all.
+        let rotation_base = qc_verified_frontier_cached();
+        let rotation_throttled = rotation_base > 0
+            && failover_height > rotation_base
+                + (BlockchainNode::MAX_DERIVED_ROSTER_WINDOWS as u64) * 90;
+        if (local_delay > STALL_GRACE_SECS || leader_yielded)
+            && meshed_esc && boot_ok_esc && !rotation_throttled {
+            let now_u64 = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+
+            // v23.2: pre-emit gate — consult signed producer
+            // heartbeat before voting for rotation. Decision tree:
+            //
+            //   expected_producer cached?
+            //       └ self → skip (never vote against self)
+            //       └ other → heartbeat age ≤ threshold?
+            //               └ yes → skip (leader proven alive)
+            //               └ no  → proceed to emit
+            //       └ not cached → proceed to emit (defensive)
+            // Deterministic leader (pure fn of height+certified round+candidates),
+            // not the evictable cache: chronic-stall clears the cache, which left the
+            // failover with expected=- and unable to re-elect a producer for the gap.
+            // Own-window only: for an amplified (higher) target the local expected-
+            // producer is meaningless — no suppression, no miss-recording there.
+            // Elect on the ABSOLUTE certified round (node-independent), matching the
+            // producer election + A1 gate. `failover_round` (get_certified_rotation_round)
+            // is RELATIVE and depends on the local baseline; using it here would diverge
+            // this node's expected-producer from the canonical leader. The metrics/view-key
+            // labels below stay relative (display only).
+            let expected_producer = if mb_idx == own_w {
+                Some(Self::select_microblock_producer_with_round(
+                    failover_height, &unified_p2p, &node_id, node_type, Some(&storage),
+                    crate::unified_p2p::highest_certified_round_for(mb_idx),
+                ).await).filter(|p| !p.is_empty())
+            } else { None };
+
+            // v26 D2: heartbeat/self may only DELAY view-change,
+            // never veto it indefinitely. Suppression honoured only
+            // while no-progress < ceiling; past it the timeout-vote
+            // fires unconditionally (pacemaker on lack of PROGRESS,
+            // not liveness). Fixes the alive-but-stuck permanent
+            // lock (h=144001 self_exclude missing_prev).
+            // A4: view-keyed age (thrash-immune) drives the hard ceiling, so B's reorg
+            // height-churn can't keep starving the deadlock escape. STALL_GRACE_SECS
+            // (line above) still uses local_delay — healthy-path timing unchanged.
+            let progress_ceiling_exceeded =
+                round_age > D2_PROGRESS_HARD_CEILING_SECS;
+
+            let suppression_reason: Option<&'static str> =
+                if progress_ceiling_exceeded {
+                    None // ceiling passed → emit unconditionally
+                } else {
+                    match expected_producer.as_deref() {
+                        Some(p) if p == node_id.as_str() => {
+                            // A4 self-yield: never withhold the single decisive view-change
+                            // vote once ≥ n−f−1 distinct committee peers already want to
+                            // rotate off us (same absolute-round TIMEOUT_VOTES the TC tally
+                            // reads — no f+1, no clock). We stop leading once the TC forms,
+                            // so still exactly one leader per certified round. Otherwise the
+                            // 4-of-5 alive-but-stuck deadlock waits out the full hard ceiling.
+                            if crate::unified_p2p::round_one_short_of_quorum(mb_idx, &node_id) {
+                                None
+                            } else {
+                                Some("self_expected")
+                            }
+                        }
+                        Some(p) => {
+                            // Suppress only if the producer's heartbeat is FRESH and targeting
+                            // the frontier slot (advertised slot_height >= failover_height). An
+                            // alive-but-stuck-below producer (targeting a lower slot — the
+                            // common onboarding/desync case) is NOT suppressed ⇒ fast fail-over.
+                            // A producer lying about slot_height is still bounded by the 180s
+                            // progress ceiling above.
+                            let fresh = crate::unified_p2p::last_remote_producer_heartbeat_age_ms(p)
+                                .map(|age_ms| age_ms <= HEARTBEAT_SILENT_MS)
+                                .unwrap_or(false);
+                            let targeting_our_slot = crate::unified_p2p::last_remote_producer_heartbeat_height(p)
+                                .map(|h| h >= failover_height)
+                                .unwrap_or(false);
+                            if fresh && targeting_our_slot
+                                && round_age <= HEARTBEAT_SUPPRESS_CEILING_SECS {
+                                Some("heartbeat_fresh")
+                            } else {
+                                None
+                            }
+                        }
+                        None => None,
+                    }
+                };
+
+            if let Some(reason) = suppression_reason {
+                // Suppress emission. Log at INFO with structured
+                // fields so operator dashboards can correlate
+                // suppression rate vs production rate.
+                if is_info() {
+                    let hb_age = expected_producer
+                        .as_deref()
+                        .and_then(crate::unified_p2p::last_remote_producer_heartbeat_age_ms)
+                        .map(|m| m as i64)
+                        .unwrap_or(-1);
+                    println!(
+                        "[INFO][TIMEOUT] emit_suppressed h={} mb={} expected={} hb_age_ms={} delay={}s reason={}",
+                        failover_height, mb_idx,
+                        expected_producer.as_deref().unwrap_or("-"),
+                        hb_age, local_delay, reason
+                    );
+                }
+            } else {
+                // Heartbeat stale OR no cache: exponential re-emit pacing per mb —
+                // tau(rel_round) ≈ 5s·1.5^round capped at 128s, reset naturally on
+                // progress (round/mb change). Guarantees growing honest overlap
+                // under unknown post-GST delay without burning MAX_FAILOVER_ROUND.
+                const TAU_SECS: [u64; 9] = [5, 7, 11, 16, 25, 38, 56, 85, 128];
+                let tau = TAU_SECS[failover_round.min(8) as usize];
+                let should_emit = {
+                    let last = LAST_TIMEOUT_EMIT_PER_MB
+                        .get(&mb_idx)
+                        .map(|v| *v)
+                        .unwrap_or(0);
+                    now_u64.saturating_sub(last) >= tau
+                };
+                if should_emit {
+                    LAST_TIMEOUT_EMIT_PER_MB.insert(mb_idx, now_u64);
+                    if is_info() {
+                        let hb_age = expected_producer
+                            .as_deref()
+                            .and_then(crate::unified_p2p::last_remote_producer_heartbeat_age_ms)
+                            .map(|m| m as i64)
+                            .unwrap_or(-1);
+                        println!(
+                            "[INFO][TIMEOUT] emit_microblock_vote h={} mb={} cert_round={} delay={}s expected={} hb_age_ms={} reason=primary_silent",
+                            failover_height, mb_idx, failover_round,
+                            local_delay,
+                            expected_producer.as_deref().unwrap_or("-"),
+                            hb_age
+                        );
+                    }
+
+                    // Validator liveness — miss path. Emit a
+                    // primary-silent timeout vote at most once per
+                    // STALL_GRACE_SECS/mb (debounced) and record one miss
+                    // against the expected producer (record_validator_miss
+                    // is itself idempotent on (validator_id, height)).
+                    // SELF-EJECT GUARD: its staleness filter only consults
+                    // the REMOTE heartbeat map (the local node never
+                    // appears there), so without an explicit
+                    // expected_id != node_id check a node could record a
+                    // miss against itself and self-eject during its own
+                    // stall. Observation-only unless QNET_LIVENESS_EJECTION
+                    // is set. O(1)/call.
+                    // ═══════════════════════════════════════════════════════
+                    if let Some(ref expected_id) = expected_producer {
+                        if !expected_id.is_empty() && expected_id != &node_id {
+                            let _ = crate::unified_p2p::record_validator_miss(
+                                expected_id,
+                                failover_height,
+                            );
+                        }
+                    }
+
+                    // Canonical emission helper: signs the QNET_TIMEOUT_V2 payload
+                    // and broadcasts via `broadcast_timeout_vote` — the same path
+                    // the macroblock-boundary view-change uses.
+                    Self::emit_macroblock_view_change_vote(
+                        mb_idx.saturating_mul(90),
+                        &node_id,
+                        &unified_p2p,
+                        Some(&storage),
+                    ).await;
+                    // Resume valve: amplified-window sync stalled ≥3 ticks — emit
+                    // the own-window key IN ADDITION (delay, never park; the TC
+                    // floor above keeps this from re-entering a certified window).
+                    if let Some(own_w) = also_emit_own_w {
+                        Self::emit_macroblock_view_change_vote(
+                            own_w.saturating_mul(90),
+                            &node_id,
+                            &unified_p2p,
+                            Some(&storage),
+                        ).await;
+                    }
+                }
+            }
+        }
+
+        // v23: chronic-stall safety net — peer-driven resync after
+        // 120 s of zero progress. Operator-grade fallback for the
+        // rare case where n−f timeout vote aggregation itself
+        // cannot complete (e.g. asymmetric partition during a
+        // macroblock window). Independent of consensus path;
+        // macroblock finality at the next 90-block boundary
+        // remains the canonical recovery anchor and this block
+        // ensures lagging nodes catch up to it.
+        // v14.7.2 (retained in v22): CHRONIC STALL RECOVERY — peer-driven
+        // resync after 120 s with no progress. Operator-grade safety net
+        // independent of consensus mechanism. Macroblock finality at the
+        // next 90-block boundary remains the canonical path; this
+        // ensures syncing nodes catch up to it.
+        // Chronic-stall safety net: after 120s of zero progress (or an escalation request
+        // raised by the production gate / failover cap), nudge the SINGLE sync coordinator
+        // to catch up and drop the stale producer election so a fresh one is computed. The
+        // old inline peer-resync (macroblock repair + bulk sync_blocks) duplicated
+        // execute_sync's pipeline and raced it; the SyncManager now owns all catch-up.
+        let escalation_requested = CHRONIC_STALL_REQUESTED
+            .swap(false, std::sync::atomic::Ordering::Relaxed);
+        if local_delay > 120 || escalation_requested {
+            if is_warn() {
+                println!("[WARN][STALL] chronic_stall h={} delay={}s action=nudge_sync",
+                         next_height, local_delay);
+            }
+            clear_expected_producer_cache_above(next_height.saturating_sub(1));
+            crate::sync_manager::nudge_sync_check();
+        }
+
+    }
+
+    /// Failover liveness pacemaker — a dedicated task, deliberately OUTSIDE the
+    /// production loop. During the h=601 wedge that loop parked in a long await for
+    /// minutes and every liveness organ inside it (timeout votes, chronic-stall nudge)
+    /// died with it: four healthy validators could not assemble a TC for ~10 minutes.
+    /// A slow tick is cancelled, never awaited into a stall — emission is idempotent
+    /// under the per-window pacing, so the next second simply retries.
+    pub(super) async fn run_failover_pacemaker(
+        storage: std::sync::Arc<crate::storage::Storage>,
+        unified_p2p: Option<std::sync::Arc<crate::unified_p2p::SimplifiedP2P>>,
+        node_id: String,
+        node_type: crate::node::NodeType,
+    ) {
+        let mut ticker = tokio::time::interval(tokio::time::Duration::from_secs(1));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            if tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                Self::failover_pacemaker_tick(&storage, &unified_p2p, &node_id, node_type),
+            ).await.is_err() && is_warn() {
+                println!("[WARN][TIMEOUT] pacemaker_tick_cancelled reason=tick_over_2s");
+            }
+        }
+    }
+
     pub(super) async fn start_microblock_production(&mut self) {
         // PRODUCTION: Start health monitor for sync flags (deadlock prevention)
         Self::start_sync_health_monitor();
@@ -17,6 +485,21 @@ impl BlockchainNode {
             std::sync::atomic::Ordering::SeqCst,
         ).is_ok() {
             Self::start_producer_watchdog();
+        }
+
+        // Liveness pacemaker task (see run_failover_pacemaker). Once per process.
+        if PACEMAKER_STARTED.compare_exchange(
+            0, 1,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        ).is_ok() {
+            let pm_storage = self.storage.clone();
+            let pm_p2p = self.unified_p2p.clone();
+            let pm_node_id = self.node_id.clone();
+            let pm_node_type = self.node_type;
+            tokio::spawn(async move {
+                Self::run_failover_pacemaker(pm_storage, pm_p2p, pm_node_id, pm_node_type).await;
+            });
         }
 
         // ═══════════════════════════════════════════════════════════════════════
@@ -1826,7 +2309,6 @@ impl BlockchainNode {
                     // ±2s drift flipped the round across nodes → fork. delay>5s
                     // → timeout_round 1,2,3…
                     let genesis_ts = crate::GLOBAL_GENESIS_TIMESTAMP.load(std::sync::atomic::Ordering::Relaxed);
-                    let next_height = microblock_height + 1;
                     let current_time = get_timestamp_safe();
                     
                     // Only proceed if genesis timestamp is set
@@ -1847,432 +2329,10 @@ impl BlockchainNode {
                         //   - All nodes use certificate's timeout_round for producer selection
                         // ═══════════════════════════════════════════════════════════════════════
                         
-                        // Local liveness timer: wall-seconds since OUR applied height last
-                        // advanced. Slot-anchored block_ts must NOT drive this — it carries the
-                        // chain's lifetime production deficit and would trip the pacemaker against
-                        // a healthy leader. Per-node by design; rotation safety is the same-round
-                        // n−f certificate, not this gate. Clock-behind self-heals: the marker is
-                        // re-stamped from this node's wall every time height advances.
-                        let wall_now = get_timestamp_safe();
-                        let cur_applied_h = LAST_BLOCK_PRODUCED_HEIGHT.load(Ordering::Relaxed);
-                        let prev_progress_h = STALL_PROGRESS_HEIGHT.swap(cur_applied_h, Ordering::Relaxed);
-                        let anchor = STALL_PROGRESS_WALL.load(Ordering::Relaxed);
-                        // Re-stamp on height advance, init, or a BACKWARD wall step (SystemTime is
-                        // non-monotonic) — the rewind case keeps a clock step-back from suppressing votes.
-                        if cur_applied_h != prev_progress_h || anchor == 0 || wall_now < anchor {
-                            STALL_PROGRESS_WALL.store(wall_now, Ordering::Relaxed);
-                        }
-                        let local_delay = wall_now.saturating_sub(STALL_PROGRESS_WALL.load(Ordering::Relaxed));
-
-                        // v11.0: STALE LBPT PROTECTION after restart
-                        // After restart, LBPT comes from replay (last saved block timestamp).
-                        // If node was offline 30min, local_delay=1800s → timeout_round=1797 →
-                        // completely wrong producer selection → consensus stall.
-                        // FIX: Until PRODUCTION_UNLOCKED (set when first network block arrives),
-                        // cap local_delay to prevent stale-LBPT-driven round inflation.
-                        // Node still uses the n−f-certified round from the BFT protocol.
-                        let mut production_unlocked = PRODUCTION_UNLOCKED.load(Ordering::Relaxed) == 1;
-
-                        // v11.1: Auto-unlock when node is synchronized after restart
-                        // Without this, restarted nodes with existing data stay locked until
-                        // a new block is saved — creating a chicken-and-egg deadlock
-                        if !production_unlocked {
-                            let our_h = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
-                            let best_h = if let Some(ref p2p) = unified_p2p {
-                                p2p.get_best_peer_height()
-                            } else { 0 };
-                            let peer_count = if let Some(ref p2p) = unified_p2p {
-                                p2p.get_validated_active_peers().len()
-                            } else { 0 };
-                            // Unlock if: has data, has peers, and within 20 blocks of best peer
-                            if our_h > 0 && peer_count > 0 && (best_h == 0 || our_h + 20 >= best_h) {
-                                PRODUCTION_UNLOCKED.store(1, Ordering::Relaxed);
-                                production_unlocked = true;
-                                if is_info() {
-                                    println!("[INFO][STATE] auto_unlock our_h={} best_h={} peers={}", our_h, best_h, peer_count);
-                                }
-                            }
-                        }
-
-                        let local_delay = if !production_unlocked && local_delay > 30 {
-                            // After restart with stale LBPT: cap delay to 30s
-                            // This prevents wrong timeout_round while allowing normal stall detection
-                            if is_info() {
-                                println!("[INFO][TIMEOUT] lbpt_stale_cap raw_delay={}s capped=30s production_locked=true", local_delay);
-                            }
-                            30
-                        } else {
-                            local_delay
-                        };
-
-                        // BFT-certified rotation invariant (microblock layer).
-                        // Leader rotation is driven STRICTLY by the same-round n−f
-                        // HIGHEST_CERTIFIED_ROUND — only a supermajority is safe for
-                        // rotation-state advancement. Forensic (do NOT reintroduce):
-                        // an f+1 `adopted` round once fed rotation via `certified.max(
-                        // adopted)`, but the divergent f+1 caused split-brain (h=556),
-                        // so adopted was removed entirely; a later clock-derived bypass
-                        // (empty_slot_offset from local_now; NTP drift >1s → different
-                        // fallback producer) caused fork h=4742, so the clock is removed
-                        // from leader-selection inputs too — both now structurally
-                        // impossible.
-
-                        // CERTIFICATE-ANCHORED FAILOVER. The vote key is a pure function of this
-                        // node's OWN verified chain — never a peer-height sample (eclipse/gossip
-                        // staleness must not split honest keys) — plus f+1 committee-signed window
-                        // amplification (min-target, bounded by the SAME constant as the production
-                        // throttle). Safe: emission never touches acceptance — rotation still needs
-                        // a same-round n−f TC, ingest still gates a round>0 block on
-                        // failover_round_authorized, and a stale restart is fenced by
-                        // production_unlocked + the lbpt cap.
-                        let boot_wall = {
-                            let b = NODE_BOOT_WALL.load(Ordering::Relaxed);
-                            if b == 0 { NODE_BOOT_WALL.store(wall_now, Ordering::Relaxed); wall_now } else { b }
-                        };
-                        let peers_esc = unified_p2p.as_ref().map(|p| p.get_validated_active_peers().len()).unwrap_or(0);
-                        let meshed_esc = peers_esc >= TIMEOUT_ESCALATION_MIN_PEERS;
-                        let boot_ok_esc = wall_now.saturating_sub(boot_wall) >= TIMEOUT_ESCALATION_BOOT_FLOOR_SECS;
-                        let failover_height = next_height; // own verified tip + 1
-                        let own_w = failover_height / 90;
-                        let tc_floor = crate::unified_p2p::observed_tc_window_floor();
-                        let bound_w = crate::unified_p2p::certified_view_bound_windows();
-                        // f+1 amplification: adopt the LOWEST committee-supported window above own
-                        // (≥1 honest witness proves it real), capped by the producibility bound. Only
-                        // scanned during an actual stall — the scan clones voter ids O(votes), and in
-                        // steady state (no failover) there is nothing to amplify toward.
-                        let amplified_w = if local_delay > STALL_GRACE_SECS {
-                            crate::unified_p2p::lowest_window_with_support(own_w)
-                                .filter(|w| bound_w == u64::MAX || *w <= bound_w.saturating_add(1))
-                        } else { None };
-                        // 3-tick resume valve: while syncing toward an amplified window suppress the
-                        // own lower key; if its blocks don't arrive, resume the own key IN ADDITION
-                        // (cross-key voting is legal) — but never below the TC floor (monotonicity:
-                        // once a window certified, no honest vote re-enters a lower window).
-                        let (mb_idx, also_emit_own_w) = match amplified_w {
-                            Some(w) => {
-                                let prev = AMPLIFIED_WINDOW.swap(w, Ordering::Relaxed);
-                                let ticks = if prev == w {
-                                    AMPLIFY_STUCK_TICKS.fetch_add(1, Ordering::Relaxed) + 1
-                                } else {
-                                    AMPLIFY_STUCK_TICKS.store(0, Ordering::Relaxed);
-                                    0
-                                };
-                                if is_warn() {
-                                    println!("[WARN][TIMEOUT] window_amplified from={} to={} floor={} ticks={}",
-                                             own_w, w, tc_floor, ticks);
-                                }
-                                let own_ok = ticks >= 3 && own_w >= tc_floor && own_w < w;
-                                (w.max(tc_floor), if own_ok { Some(own_w) } else { None })
-                            }
-                            None => {
-                                AMPLIFIED_WINDOW.store(0, Ordering::Relaxed);
-                                AMPLIFY_STUCK_TICKS.store(0, Ordering::Relaxed);
-                                (own_w.max(tc_floor), None)
-                            }
-                        };
-                        // Bound by the SAME horizon production uses, not the old 2-window seal allowance.
-                        // While that mismatch stood, A1 was only half a decoupling: production could run
-                        // 32 windows past the seal, but the moment a DEAD producer's slot came up beyond
-                        // +180 rotation was suppressed — "no rotation can fill it" is true for a finality
-                        // stall and false for a producer stall, and past the seal those are exactly the
-                        // case that matters. With >1/3 dead a dead producer's slot arrives within a few
-                        // rotations, so the chain stopped at +180 regardless of the raised throttle.
-                        let seal_base = storage.last_sealed_mb_index().saturating_mul(90)
-                            .max(qc_verified_frontier_cached());
-                        let seal_throttled = seal_base > 0
-                            && failover_height > seal_base
-                                + (BlockchainNode::MAX_DERIVED_ROSTER_WINDOWS as u64) * 90;
-                        if seal_throttled && is_warn() {
-                            println!("[WARN][PROD] parked reason=roster_derivation_horizon h={} seal_base={} rotation=live",
-                                     failover_height, seal_base);
-                        }
-                        // Same-round n−f certified rotation round for the FRONTIER macroblock — the sole
-                        // rotation input, identical on every node once the round cert propagates.
-                        let failover_round = crate::unified_p2p::get_certified_rotation_round(mb_idx);
-                        update_failover_metrics(local_delay, failover_round);
-
-                        // A4: no-progress age keyed on the certified VIEW (mb_idx, failover_round), NOT
-                        // applied height — B's tail-convergence reorgs thrash the height anchor and kept
-                        // resetting the height-based ceiling. Re-stamp only on a genuine view change /
-                        // init / backward-wall step (mirrors the STALL_PROGRESS_WALL guard above), so
-                        // round_age grows monotonically through a true deadlock and the ceiling matures.
-                        // Key the view timer on the ABSOLUTE certified round: monotone per macroblock and
-                        // identical on every node. The relative round subtracts a LOCAL finalized baseline,
-                        // so it shifts when that baseline shifts, re-stamping the entry wall below and
-                        // starving both escape ceilings that depend on round_age.
-                        let view_key = (mb_idx << 8)
-                            | crate::unified_p2p::highest_certified_round_for(mb_idx).min(0xFF);
-                        let prev_view = ROUND_ENTRY_VIEW.swap(view_key, Ordering::Relaxed);
-                        let ventry = ROUND_ENTRY_WALL.load(Ordering::Relaxed);
-                        if view_key != prev_view || ventry == 0 || wall_now < ventry {
-                            ROUND_ENTRY_WALL.store(wall_now, Ordering::Relaxed);
-                        }
-                        let round_age = wall_now.saturating_sub(ROUND_ENTRY_WALL.load(Ordering::Relaxed));
-
-                        // At MAX_FAILOVER_ROUND, >MAX rotations in one window is a sync/partition issue, not
-                        // producer liveness. HOLD, don't go terminal: the vote round is clamped to the cap in
-                        // emit_macroblock_view_change_vote (DoS bound — no runaway climb), the pacemaker keeps
-                        // emitting the bounded round so progress resumes the instant the partition heals, and
-                        // we drive sync recovery in parallel. Keyed on the SAME frontier mb the vote uses.
-                        let failover_capped = failover_round >= MAX_FAILOVER_ROUND;
-                        if failover_capped {
-                            if is_warn() {
-                                println!("[WARN][TIMEOUT] failover_round_capped round={} cap={} mb={} action=hold+recovery_sync",
-                                         failover_round, MAX_FAILOVER_ROUND, mb_idx);
-                            }
-                            CHRONIC_STALL_REQUESTED.store(true, Ordering::Relaxed);
-                        }
-
-                        // Silent-leader grace, heartbeat-freshness threshold, and 180s no-progress hard ceiling.
-                        const STALL_GRACE_SECS: u64 = 5;
-                        const HEARTBEAT_SILENT_MS: u64 = 3_000;
-                        const D2_PROGRESS_HARD_CEILING_SECS: u64 = 180;
-                        // A REMOTE producer's heartbeat is a CLAIM we cannot fully verify — binding it to
-                        // our own parent hash kills an invented frontier, but a script tracking the real
-                        // chain still passes. So a remote claim may buy far less delay than our own
-                        // self-yield path: a producer genuinely alive and targeting the frontier emits
-                        // within a block or two, and this stays well under one 30-block rotation, so a
-                        // liar cannot hold even a single rotation.
-                        const HEARTBEAT_SUPPRESS_CEILING_SECS: u64 = 15;
-
-                        // On slot-leader silent > grace: emit a ML-DSA-65 TimeoutVote for (mb_idx, certified+1).
-                        // n−f co-signs advance HIGHEST_CERTIFIED_ROUND[mb_idx] → every node re-elects the same
-                        // fallback leader. Exponentially-paced per mb/node; receiver verifies sig + window
-                        // committee + anchor + voter-dedup; TC only at n−f (≤f Byzantine cannot rotate).
-                        // Leader self-yield fast path: a stored (sig-verified, committee-checked) rotation
-                        // vote from the slot's own expected producer is authoritative about its
-                        // unavailability — co-sign without waiting out the silent-leader grace. Only vote
-                        // TIMING changes; forging a yield still needs the leader's key.
-                        let leader_yielded = get_expected_producer(failover_height)
-                            .map(|(p, _)| !p.is_empty() && p != node_id
-                                && crate::unified_p2p::window_has_vote_from(own_w, &p))
-                            .unwrap_or(false);
-                        // No !failover_capped gate — at the cap the pacemaker HOLDS (keeps emitting) rather
-                        // than going terminal; emit_macroblock_view_change_vote clamps the round to the cap.
-                        // The vote to rotate a dead leader is NOT gated on production_unlocked: that is a
-                        // per-node sync flag, and gating on it drops exactly the stragglers a stall left
-                        // behind from the quorum that would rescue it. Round is certified+1 (not derived
-                        // from local_delay), so a stale node emits one bounded vote, never a round storm.
-                        // Rotation parks on the CONSENSUS-VISIBLE frontier, not on seal_base: that came
-                        // from this node's own contiguous-seal scan, so a node behind on backfill parked
-                        // before its peers and fell out of the quorum that rotates a dead leader. The
-                        // gate itself must stay - failover rounds are bounded and a vote whose round
-                        // already carries a TC is dropped, so a fully parked committee co-signing every
-                        // tau would burn the budget and leave the window unable to rotate at all.
-                        let rotation_base = qc_verified_frontier_cached();
-                        let rotation_throttled = rotation_base > 0
-                            && failover_height > rotation_base
-                                + (BlockchainNode::MAX_DERIVED_ROSTER_WINDOWS as u64) * 90;
-                        if (local_delay > STALL_GRACE_SECS || leader_yielded)
-                            && meshed_esc && boot_ok_esc && !rotation_throttled {
-                            let now_u64 = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs();
-
-                            // v23.2: pre-emit gate — consult signed producer
-                            // heartbeat before voting for rotation. Decision tree:
-                            //
-                            //   expected_producer cached?
-                            //       └ self → skip (never vote against self)
-                            //       └ other → heartbeat age ≤ threshold?
-                            //               └ yes → skip (leader proven alive)
-                            //               └ no  → proceed to emit
-                            //       └ not cached → proceed to emit (defensive)
-                            // Deterministic leader (pure fn of height+certified round+candidates),
-                            // not the evictable cache: chronic-stall clears the cache, which left the
-                            // failover with expected=- and unable to re-elect a producer for the gap.
-                            // Own-window only: for an amplified (higher) target the local expected-
-                            // producer is meaningless — no suppression, no miss-recording there.
-                            // Elect on the ABSOLUTE certified round (node-independent), matching the
-                            // producer election + A1 gate. `failover_round` (get_certified_rotation_round)
-                            // is RELATIVE and depends on the local baseline; using it here would diverge
-                            // this node's expected-producer from the canonical leader. The metrics/view-key
-                            // labels below stay relative (display only).
-                            let expected_producer = if mb_idx == own_w {
-                                Some(Self::select_microblock_producer_with_round(
-                                    failover_height, &unified_p2p, &node_id, node_type, Some(&storage),
-                                    crate::unified_p2p::highest_certified_round_for(mb_idx),
-                                ).await).filter(|p| !p.is_empty())
-                            } else { None };
-
-                            // v26 D2: heartbeat/self may only DELAY view-change,
-                            // never veto it indefinitely. Suppression honoured only
-                            // while no-progress < ceiling; past it the timeout-vote
-                            // fires unconditionally (pacemaker on lack of PROGRESS,
-                            // not liveness). Fixes the alive-but-stuck permanent
-                            // lock (h=144001 self_exclude missing_prev).
-                            // A4: view-keyed age (thrash-immune) drives the hard ceiling, so B's reorg
-                            // height-churn can't keep starving the deadlock escape. STALL_GRACE_SECS
-                            // (line above) still uses local_delay — healthy-path timing unchanged.
-                            let progress_ceiling_exceeded =
-                                round_age > D2_PROGRESS_HARD_CEILING_SECS;
-
-                            let suppression_reason: Option<&'static str> =
-                                if progress_ceiling_exceeded {
-                                    None // ceiling passed → emit unconditionally
-                                } else {
-                                    match expected_producer.as_deref() {
-                                        Some(p) if p == node_id.as_str() => {
-                                            // A4 self-yield: never withhold the single decisive view-change
-                                            // vote once ≥ n−f−1 distinct committee peers already want to
-                                            // rotate off us (same absolute-round TIMEOUT_VOTES the TC tally
-                                            // reads — no f+1, no clock). We stop leading once the TC forms,
-                                            // so still exactly one leader per certified round. Otherwise the
-                                            // 4-of-5 alive-but-stuck deadlock waits out the full hard ceiling.
-                                            if crate::unified_p2p::round_one_short_of_quorum(mb_idx, &node_id) {
-                                                None
-                                            } else {
-                                                Some("self_expected")
-                                            }
-                                        }
-                                        Some(p) => {
-                                            // Suppress only if the producer's heartbeat is FRESH and targeting
-                                            // the frontier slot (advertised slot_height >= failover_height). An
-                                            // alive-but-stuck-below producer (targeting a lower slot — the
-                                            // common onboarding/desync case) is NOT suppressed ⇒ fast fail-over.
-                                            // A producer lying about slot_height is still bounded by the 180s
-                                            // progress ceiling above.
-                                            let fresh = crate::unified_p2p::last_remote_producer_heartbeat_age_ms(p)
-                                                .map(|age_ms| age_ms <= HEARTBEAT_SILENT_MS)
-                                                .unwrap_or(false);
-                                            let targeting_our_slot = crate::unified_p2p::last_remote_producer_heartbeat_height(p)
-                                                .map(|h| h >= failover_height)
-                                                .unwrap_or(false);
-                                            if fresh && targeting_our_slot
-                                                && round_age <= HEARTBEAT_SUPPRESS_CEILING_SECS {
-                                                Some("heartbeat_fresh")
-                                            } else {
-                                                None
-                                            }
-                                        }
-                                        None => None,
-                                    }
-                                };
-
-                            if let Some(reason) = suppression_reason {
-                                // Suppress emission. Log at INFO with structured
-                                // fields so operator dashboards can correlate
-                                // suppression rate vs production rate.
-                                if is_info() {
-                                    let hb_age = expected_producer
-                                        .as_deref()
-                                        .and_then(crate::unified_p2p::last_remote_producer_heartbeat_age_ms)
-                                        .map(|m| m as i64)
-                                        .unwrap_or(-1);
-                                    println!(
-                                        "[INFO][TIMEOUT] emit_suppressed h={} mb={} expected={} hb_age_ms={} delay={}s reason={}",
-                                        failover_height, mb_idx,
-                                        expected_producer.as_deref().unwrap_or("-"),
-                                        hb_age, local_delay, reason
-                                    );
-                                }
-                            } else {
-                                // Heartbeat stale OR no cache: exponential re-emit pacing per mb —
-                                // tau(rel_round) ≈ 5s·1.5^round capped at 128s, reset naturally on
-                                // progress (round/mb change). Guarantees growing honest overlap
-                                // under unknown post-GST delay without burning MAX_FAILOVER_ROUND.
-                                const TAU_SECS: [u64; 9] = [5, 7, 11, 16, 25, 38, 56, 85, 128];
-                                let tau = TAU_SECS[failover_round.min(8) as usize];
-                                let should_emit = {
-                                    let last = LAST_TIMEOUT_EMIT_PER_MB
-                                        .get(&mb_idx)
-                                        .map(|v| *v)
-                                        .unwrap_or(0);
-                                    now_u64.saturating_sub(last) >= tau
-                                };
-                                if should_emit {
-                                    LAST_TIMEOUT_EMIT_PER_MB.insert(mb_idx, now_u64);
-                                    if is_info() {
-                                        let hb_age = expected_producer
-                                            .as_deref()
-                                            .and_then(crate::unified_p2p::last_remote_producer_heartbeat_age_ms)
-                                            .map(|m| m as i64)
-                                            .unwrap_or(-1);
-                                        println!(
-                                            "[INFO][TIMEOUT] emit_microblock_vote h={} mb={} cert_round={} delay={}s expected={} hb_age_ms={} reason=primary_silent",
-                                            failover_height, mb_idx, failover_round,
-                                            local_delay,
-                                            expected_producer.as_deref().unwrap_or("-"),
-                                            hb_age
-                                        );
-                                    }
-
-                                    // Validator liveness — miss path. Emit a
-                                    // primary-silent timeout vote at most once per
-                                    // STALL_GRACE_SECS/mb (debounced) and record one miss
-                                    // against the expected producer (record_validator_miss
-                                    // is itself idempotent on (validator_id, height)).
-                                    // SELF-EJECT GUARD: its staleness filter only consults
-                                    // the REMOTE heartbeat map (the local node never
-                                    // appears there), so without an explicit
-                                    // expected_id != node_id check a node could record a
-                                    // miss against itself and self-eject during its own
-                                    // stall. Observation-only unless QNET_LIVENESS_EJECTION
-                                    // is set. O(1)/call.
-                                    // ═══════════════════════════════════════════════════════
-                                    if let Some(ref expected_id) = expected_producer {
-                                        if !expected_id.is_empty() && expected_id != &node_id {
-                                            let _ = crate::unified_p2p::record_validator_miss(
-                                                expected_id,
-                                                failover_height,
-                                            );
-                                        }
-                                    }
-
-                                    // Canonical emission helper: signs the QNET_TIMEOUT_V2 payload
-                                    // and broadcasts via `broadcast_timeout_vote` — the same path
-                                    // the macroblock-boundary view-change uses.
-                                    Self::emit_macroblock_view_change_vote(
-                                        mb_idx.saturating_mul(90),
-                                        &node_id,
-                                        &unified_p2p,
-                                        Some(&storage),
-                                    ).await;
-                                    // Resume valve: amplified-window sync stalled ≥3 ticks — emit
-                                    // the own-window key IN ADDITION (delay, never park; the TC
-                                    // floor above keeps this from re-entering a certified window).
-                                    if let Some(own_w) = also_emit_own_w {
-                                        Self::emit_macroblock_view_change_vote(
-                                            own_w.saturating_mul(90),
-                                            &node_id,
-                                            &unified_p2p,
-                                            Some(&storage),
-                                        ).await;
-                                    }
-                                }
-                            }
-                        }
-
-                        // v23: chronic-stall safety net — peer-driven resync after
-                        // 120 s of zero progress. Operator-grade fallback for the
-                        // rare case where n−f timeout vote aggregation itself
-                        // cannot complete (e.g. asymmetric partition during a
-                        // macroblock window). Independent of consensus path;
-                        // macroblock finality at the next 90-block boundary
-                        // remains the canonical recovery anchor and this block
-                        // ensures lagging nodes catch up to it.
-                        // v14.7.2 (retained in v22): CHRONIC STALL RECOVERY — peer-driven
-                        // resync after 120 s with no progress. Operator-grade safety net
-                        // independent of consensus mechanism. Macroblock finality at the
-                        // next 90-block boundary remains the canonical path; this
-                        // ensures syncing nodes catch up to it.
-                        // Chronic-stall safety net: after 120s of zero progress (or an escalation request
-                        // raised by the production gate / failover cap), nudge the SINGLE sync coordinator
-                        // to catch up and drop the stale producer election so a fresh one is computed. The
-                        // old inline peer-resync (macroblock repair + bulk sync_blocks) duplicated
-                        // execute_sync's pipeline and raced it; the SyncManager now owns all catch-up.
-                        let escalation_requested = CHRONIC_STALL_REQUESTED
-                            .swap(false, std::sync::atomic::Ordering::Relaxed);
-                        if local_delay > 120 || escalation_requested {
-                            if is_warn() {
-                                println!("[WARN][STALL] chronic_stall h={} delay={}s action=nudge_sync",
-                                         next_height, local_delay);
-                            }
-                            clear_expected_producer_cache_above(next_height.saturating_sub(1));
-                            crate::sync_manager::nudge_sync_check();
-                        }
-
+                        // Failover pacemaker (timeout-vote emission, window amplification,
+                        // chronic-stall nudge) runs in its OWN task — run_failover_pacemaker.
+                        // It lived here until the h=601 wedge: this loop parked in a long
+                        // await for minutes and vote emission died with it.
                         // ═══════════════════════════════════════════════════════════════════
                         // v13.2: PIPELINE FORK RECOVERY (OUTSIDE is_synced_enough gate)
                         // ═══════════════════════════════════════════════════════════════════
@@ -2496,6 +2556,9 @@ impl BlockchainNode {
                         // - 5 block gap → trigger sync (was 50)
                         // - Byzantine median height (median of peer heights, not a BFT quorum)
                         // ═══════════════════════════════════════════════════════════════════
+                        // Read-only view of the stall age; the pacemaker task owns the anchor.
+                        let local_delay = get_timestamp_safe()
+                            .saturating_sub(STALL_PROGRESS_WALL.load(Ordering::Relaxed));
                         if local_delay > 15 {
                             if let Some(p2p) = &unified_p2p {
                                 // v2.44: Use Byzantine median from peer heights (QUIC HealthPing data)
