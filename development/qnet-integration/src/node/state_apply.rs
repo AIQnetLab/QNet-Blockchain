@@ -74,6 +74,46 @@ impl BlockchainNode {
         // that no account was charged. Identical on every node (pure fns of the tx + deterministic fuel).
         let mut block_flat_fees: u64 = 0;
         let mut block_wasm_fuel_fees: u64 = 0;
+
+        // Pure-transfer blocks take the deterministic parallel path: per-sender debit
+        // streams + commutative credit sums (intra-block credits land after all debits).
+        // Everything a transfer can produce — fee accrual, gas refund, pk bind — is
+        // reproduced below from the outcomes; WASM logs/owns/side-effects don't exist
+        // for these types. Path choice is a pure function of block content.
+        let pure_transfers = microblock.transactions.len() >= 32
+            && microblock.transactions.iter().all(|t| matches!(t.tx_type,
+                qnet_state::TransactionType::Transfer { .. }
+                | qnet_state::TransactionType::BatchTransfers { .. }));
+        if pure_transfers {
+            let outcomes = state_guard.apply_transfers_parallel(
+                &microblock.transactions, block_snapshot.as_deref_mut());
+            for (tx, outcome) in microblock.transactions.iter().zip(outcomes) {
+                let charged = outcome.as_ref().map_or(false, |o| o.charged);
+                if let Err(e) = outcome {
+                    if is_debug() {
+                        println!("[DBG][STATE] tx_skip h={} err={}", h, e);
+                    }
+                    continue;
+                }
+                if charged {
+                    let _ = state_guard.apply_gas_refund(tx, h, 0);
+                }
+                if charged && !tx.from.starts_with("system_") && tx.gas_price > 0 && tx.gas_limit > 0 {
+                    let charged_gas = if h >= qnet_state::GAS_METERING_ACTIVATION_HEIGHT {
+                        tx.compute_gas_used()
+                    } else {
+                        tx.gas_limit
+                    };
+                    block_flat_fees = block_flat_fees
+                        .saturating_add(tx.effective_gas_price().saturating_mul(charged_gas));
+                }
+                if tx.binds_dilithium_pk() {
+                    if let Some(pk) = tx.dilithium_public_key.as_ref() {
+                        result.deferred_pk_binds.push((tx.from.clone(), pk.clone()));
+                    }
+                }
+            }
+        } else {
         for tx in &microblock.transactions {
             // Record pre-images BEFORE mutation (for rollback support)
             if let Some(ref mut snap) = block_snapshot {
@@ -194,6 +234,7 @@ impl BlockchainNode {
 
             }
         }
+        } // end pure_transfers / sequential branch
 
         // Persist this block's captured WASM event logs (RPC getLogs), drained in tx-apply order. These
         // leaves ALSO feed the gate-0 `logs_root` consensus commitment, so a persist failure diverges

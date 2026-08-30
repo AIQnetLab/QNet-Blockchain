@@ -185,6 +185,15 @@ enum SubtreeSpan {
     Branch,
 }
 
+/// One finalize's persisted delta, handed to the write-behind flusher.
+struct FlushJob {
+    leaf_puts: Vec<([u8; HASH_SIZE], [u8; HASH_SIZE])>,
+    leaf_dels: Vec<[u8; HASH_SIZE]>,
+    node_puts: Vec<((u32, [u8; HASH_SIZE]), [u8; HASH_SIZE])>,
+    node_dels: Vec<(u32, [u8; HASH_SIZE])>,
+    wipe_nodes: bool,
+}
+
 /// State Merkle Tree for account proofs
 /// Optimized for QNet's account structure with batch operations for 100K+ TPS
 ///
@@ -272,6 +281,10 @@ pub struct StateMerkleTree {
     // reads are answered from RAM — the store range-scans behind first_foreign_depth
     // (~9 per dirty leaf) were 95%+ of finalize cost under batch load.
     leaves_complete: bool,
+    // Write-behind flusher (see set_node_store / flush_barrier).
+    flush_tx: Option<std::sync::mpsc::SyncSender<FlushJob>>,
+    flush_done: Option<std::sync::Arc<(std::sync::Mutex<u64>, std::sync::Condvar)>>,
+    flush_sent: u64,
     /// Set when the incremental pass read a node it could not resolve. finalize discards the
     /// result and redoes the pass as a full recompute rather than sealing a guessed root.
     incremental_pass_invalid: bool,
@@ -315,6 +328,9 @@ impl StateMerkleTree {
             node_wipe_pending: false,
             node_cache_complete: true,
             leaves_complete: true,
+            flush_tx: None,
+            flush_done: None,
+            flush_sent: 0,
             incremental_pass_invalid: false,
         }
     }
@@ -323,11 +339,53 @@ impl StateMerkleTree {
     /// into bounded read-through caches. Sets a sane default cache cap if none
     /// was chosen. Consensus-neutral: the produced root is unchanged.
     pub fn set_node_store(&mut self, store: std::sync::Arc<dyn MerkleNodeStore>) {
-        self.node_store = Some(store);
+        self.node_store = Some(store.clone());
         self.node_cache_complete = false; // store may hold rows the cache does not
         self.leaves_complete = false;     // same for leaves, until a full rebuild
         if self.node_cache_cap == 0 {
             self.node_cache_cap = DEFAULT_NODE_CACHE_CAP;
+        }
+        // Write-behind flusher: finalize hands each delta to this thread and returns.
+        // Used ONLY while both caches are complete (store reads never happen then);
+        // an incomplete cache falls back to the synchronous path. Bounded channel =
+        // natural backpressure if the disk cannot keep up.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<FlushJob>(4);
+        let done = std::sync::Arc::new((std::sync::Mutex::new(0u64), std::sync::Condvar::new()));
+        let done_w = done.clone();
+        std::thread::Builder::new().name("merkle-flush".into()).spawn(move || {
+            while let Ok(job) = rx.recv() {
+                if let Err(e) = store.put_batch(&job.leaf_puts, &job.leaf_dels, &job.node_puts, &job.node_dels, job.wipe_nodes) {
+                    println!("[WARN][MERKLE] node_store put_batch failed: {}", e);
+                }
+                let (lock, cv) = &*done_w;
+                *lock.lock().unwrap() += 1;
+                cv.notify_all();
+            }
+        }).ok();
+        self.flush_tx = Some(tx);
+        self.flush_done = Some(done);
+        self.flush_sent = 0;
+    }
+
+    /// True when no flush job is still queued or in flight.
+    fn flush_fully_drained(&self) -> bool {
+        match self.flush_done {
+            None => true,
+            Some(ref done) => *done.0.lock().unwrap() >= self.flush_sent,
+        }
+    }
+
+    /// Block until every queued flush job has been written to the store. Required
+    /// before any operation that READS the store past the write-behind queue
+    /// (full rebuild with an incomplete cache, store wipe on reset).
+    pub fn flush_barrier(&self) {
+        if let Some(ref done) = self.flush_done {
+            let (lock, cv) = &**done;
+            let mut n = lock.lock().unwrap();
+            while *n < self.flush_sent {
+                let (g, _) = cv.wait_timeout(n, std::time::Duration::from_millis(100)).unwrap();
+                n = g;
+            }
         }
     }
 
@@ -345,6 +403,9 @@ impl StateMerkleTree {
     pub fn reset_preserving_store(&mut self) {
         let store = self.node_store.clone();
         let cap = self.node_cache_cap;
+        // Queued write-behind jobs still carry OLD-state rows; land them before the
+        // wipe or they would resurrect after it.
+        self.flush_barrier();
         if let Some(ref st) = store {
             // Fail LOUD: continuing would fold two states into one root, and every later block would
             // be rejected by peers with nothing in the log to say why.
@@ -353,8 +414,11 @@ impl StateMerkleTree {
             }
         }
         *self = Self::new();
-        self.node_cache_complete = store.is_none();
-        self.node_store = store;
+        if let Some(st) = store {
+            // Re-arm the store AND its flusher (set_node_store marks caches incomplete;
+            // the rebuild that follows restores completeness).
+            self.set_node_store(st);
+        }
         self.node_cache_cap = cap;
     }
 
@@ -620,7 +684,16 @@ impl StateMerkleTree {
             leaf_puts.retain(|(k, _)| !leaf_dels_set.contains(k));
         }
         let leaf_dels: Vec<[u8; HASH_SIZE]> = leaf_dels_set.into_iter().collect();
-        if let Some(ref store) = self.node_store {
+        // Complete caches mean the store is never read: hand the delta to the
+        // write-behind thread and return. An incomplete cache (or no flusher)
+        // persists synchronously — read-through must see every prior write.
+        let async_ok = self.leaves_complete && self.node_cache_complete && self.flush_tx.is_some();
+        if async_ok {
+            let job = FlushJob { leaf_puts, leaf_dels, node_puts, node_dels, wipe_nodes };
+            if self.flush_tx.as_ref().unwrap().send(job).is_ok() {
+                self.flush_sent += 1;
+            }
+        } else if let Some(ref store) = self.node_store {
             if let Err(e) = store.put_batch(&leaf_puts, &leaf_dels, &node_puts, &node_dels, wipe_nodes) {
                 // Persist failure is non-fatal to the in-mem root (still correct
                 // for this finalize); surface it so the operator can react.
@@ -628,9 +701,10 @@ impl StateMerkleTree {
             }
         }
         // Bound the caches. Entries are re-loadable via get_leaf/get_node, so a
-        // simple drain of the excess is safe and never changes the root.
+        // simple drain of the excess is safe and never changes the root — but only
+        // once every queued flush landed, or an evicted key may exist nowhere yet.
         let cap = self.node_cache_cap;
-        if cap > 0 {
+        if cap > 0 && self.flush_fully_drained() {
             if self.leaves.len() > cap {
                 let excess = self.leaves.len() - cap;
                 // Drain the smallest keys (deterministic pick; any subset is
@@ -1338,7 +1412,17 @@ impl StateMerkleTree {
         let current_level: BTreeMap<[u8; HASH_SIZE], [u8; HASH_SIZE]> =
             match self.node_store {
                 None => self.leaves.clone(),
+                Some(_) if self.leaves_complete => self.leaves.clone(),
                 Some(ref store) => {
+                    // Reading past the write-behind queue: land queued jobs first.
+                    if let Some(ref done) = self.flush_done {
+                        let (lock, cv) = &**done;
+                        let mut n = lock.lock().unwrap();
+                        while *n < self.flush_sent {
+                            let (g, _) = cv.wait_timeout(n, std::time::Duration::from_millis(100)).unwrap();
+                            n = g;
+                        }
+                    }
                     let mut set: BTreeMap<[u8; HASH_SIZE], [u8; HASH_SIZE]> =
                         store.all_leaves().into_iter().collect();
                     // Subtract leaves removed this finalize (still stale in the
@@ -1494,17 +1578,141 @@ impl StateMerkleTree {
         lo
     }
 
+    /// Read-only node_resolve for the parallel fold: caches are complete, so a miss
+    /// is authoritative and the store is never touched. Third field flags a missing
+    /// branch too large to rebuild in place (pass invalidated after join).
+    fn node_resolve_ro(&self, depth: usize, key: &[u8; HASH_SIZE]) -> ([u8; HASH_SIZE], bool, bool) {
+        if depth <= BUCKET_DEPTH {
+            return (self.bucket_hash_at(&Self::bucket_of(key)), false, false);
+        }
+        if let Some(v) = self.intermediate_nodes.get(&(depth as u32, *key)).copied() {
+            return (v, true, false);
+        }
+        match self.subtree_probe(depth, key) {
+            SubtreeSpan::Empty => (self.default_hashes[depth], false, false),
+            SubtreeSpan::Single(b, bh) => (self.lonely_chain_hash(&b, bh, depth), false, false),
+            SubtreeSpan::Branch => {
+                let (lo, hi) = Self::subtree_bounds(depth, key);
+                let under = self.leaves.range(lo..=hi).take(REBUILD_SUBTREE_MAX_LEAVES + 1).count();
+                if under <= REBUILD_SUBTREE_MAX_LEAVES {
+                    (self.rebuild_subtree(depth, key), true, false)
+                } else {
+                    (self.default_hashes[depth], true, true)
+                }
+            }
+        }
+    }
+
+    /// One partition's level fold for depths BUCKET_DEPTH..split_depth, read-only
+    /// against self; node mutations come back as deltas the caller applies serially.
+    /// Entries arrive as (activation_depth, (key, frontier_value)).
+    #[allow(clippy::type_complexity)]
+    fn fold_partition(
+        &self,
+        entries: &[(usize, ([u8; HASH_SIZE], ([u8; HASH_SIZE], bool, usize)))],
+        split_depth: usize,
+    ) -> (
+        Vec<([u8; HASH_SIZE], ([u8; HASH_SIZE], bool, usize))>,
+        Vec<((u32, [u8; HASH_SIZE]), [u8; HASH_SIZE])>,
+        Vec<(u32, [u8; HASH_SIZE])>,
+        bool,
+    ) {
+        let mut puts: Vec<((u32, [u8; HASH_SIZE]), [u8; HASH_SIZE])> = Vec::new();
+        let mut dels: Vec<(u32, [u8; HASH_SIZE])> = Vec::new();
+        let mut invalid = false;
+        let mut frontier: std::collections::HashMap<[u8; HASH_SIZE], ([u8; HASH_SIZE], bool, usize)> =
+            std::collections::HashMap::new();
+        for depth in BUCKET_DEPTH..split_depth {
+            for (act, (k, v)) in entries.iter() {
+                if *act == depth { frontier.insert(*k, *v); }
+            }
+            if frontier.is_empty() { continue; }
+            let default = self.default_hashes[depth];
+            let mut pairs: std::collections::HashMap<[u8; HASH_SIZE],
+                [Option<([u8; HASH_SIZE], bool, usize)>; 2]> =
+                std::collections::HashMap::with_capacity(frontier.len());
+            for (key, val) in std::mem::take(&mut frontier) {
+                let mut canon = key;
+                Self::clear_bit(&mut canon, depth);
+                let side = Self::get_bit(&key, depth) as usize;
+                pairs.entry(canon).or_default()[side] = Some(val);
+            }
+            frontier = std::collections::HashMap::with_capacity(pairs.len());
+            let mut buffer = [0u8; HASH_SIZE * 2];
+            for (canon, [lo, hi]) in pairs {
+                let mut hi_key = canon;
+                Self::flip_bit(&mut hi_key, depth);
+                let (key, sibling_key, value, branch, ffd, sib_dirty) = match (lo, hi) {
+                    (Some((v, b, f)), other) => (canon, hi_key, v, b, f, other),
+                    (None, Some((v, b, f))) => (hi_key, canon, v, b, f, None),
+                    (None, None) => continue,
+                };
+                let (sibling, sib_branch) = match sib_dirty {
+                    Some((sv, sb, _)) => (sv, sb),
+                    None if depth + 1 < ffd => (default, false),
+                    None => {
+                        let (s, b, inv) = self.node_resolve_ro(depth, &sibling_key);
+                        invalid |= inv;
+                        (s, b)
+                    }
+                };
+                let value_live = value != default;
+                let sibling_live = sibling != default;
+                if depth >= BUCKET_DEPTH + 1 {
+                    if value_live && (branch || sibling_live) {
+                        puts.push(((depth as u32, key), value));
+                    } else {
+                        dels.push((depth as u32, key));
+                    }
+                    if sibling_live && (sib_branch || value_live) {
+                        puts.push(((depth as u32, sibling_key), sibling));
+                    } else {
+                        dels.push((depth as u32, sibling_key));
+                    }
+                }
+                if Self::get_bit(&key, depth) {
+                    buffer[..HASH_SIZE].copy_from_slice(&sibling);
+                    buffer[HASH_SIZE..].copy_from_slice(&value);
+                } else {
+                    buffer[..HASH_SIZE].copy_from_slice(&value);
+                    buffer[HASH_SIZE..].copy_from_slice(&sibling);
+                }
+                let mut hasher = Sha3_256::new();
+                hasher.update(&buffer);
+                let mut parent_hash = [0u8; HASH_SIZE];
+                parent_hash.copy_from_slice(&hasher.finalize());
+                let parent_branch = (value_live && sibling_live) || branch || sib_branch;
+                let parent_ffd = if parent_branch { 0 } else { ffd };
+                frontier.insert(canon, (parent_hash, parent_branch, parent_ffd));
+            }
+        }
+        (frontier.into_iter().collect(), puts, dels, invalid)
+    }
+
     fn recompute_levels(&mut self) {
         // Fold dirty leaves into their (deduped) buckets; the tree walk starts at the
         // bucket layer. Frontier value: (hash, is_branch, first_foreign_depth).
         let dirty_buckets: BTreeSet<[u8; HASH_SIZE]> =
             self.dirty_paths.drain().map(|k| Self::bucket_of(&k)).collect();
-        let mut inits: Vec<([u8; HASH_SIZE], [u8; HASH_SIZE], usize)> = Vec::with_capacity(dirty_buckets.len());
-        for b in dirty_buckets {
-            let h = self.bucket_hash_at(&b);
-            let ffd = self.first_foreign_depth(&b);
-            inits.push((b, h, ffd));
-        }
+        // With complete caches every read is RAM: bucket hashing and the ffd binary
+        // searches fan out across cores; the level fold below then runs partitioned.
+        let par_ok = self.leaves_complete && self.node_cache_complete;
+        let inits: Vec<([u8; HASH_SIZE], [u8; HASH_SIZE], usize)> =
+            if par_ok && dirty_buckets.len() >= 128 {
+                use rayon::prelude::*;
+                let this: &Self = self;
+                dirty_buckets.iter().collect::<Vec<_>>().par_iter().map(|b| {
+                    (**b, this.bucket_hash_at(b), this.first_foreign_depth(b))
+                }).collect()
+            } else {
+                let mut v = Vec::with_capacity(dirty_buckets.len());
+                for b in dirty_buckets {
+                    let h = self.bucket_hash_at(&b);
+                    let ffd = self.first_foreign_depth(&b);
+                    v.push((b, h, ffd));
+                }
+                v
+            };
 
         // LONE CLIMB: below ffd-1 a leaf provably has no neighbour, so its whole
         // path segment is hash(value, default) per level with both child rows
@@ -1555,13 +1763,43 @@ impl StateMerkleTree {
             buckets[act].push((key, (v, false, ffd)));
         }
 
-        // Meet levels: group siblings by bit-cleared canonical key, resolve + apply
-        // the store rule serially, hash pairs in parallel. HashMaps throughout —
-        // order affects neither the root (pure function) nor the node set (distinct
-        // keys). This whole recompute was 99% of block-apply cost.
+        // Meet levels. With complete caches and enough work, depths below the split
+        // fold as independent key-prefix partitions in parallel (each collects its
+        // node deltas; applied serially after the join), and only the top
+        // PARTITION_BITS levels run in the single-frontier loop below.
+        const PARTITION_BITS: usize = 6;
+        let split_depth = TREE_DEPTH - PARTITION_BITS;
+        let low_entries: usize = buckets[BUCKET_DEPTH..split_depth].iter().map(|b| b.len()).sum();
         let mut frontier: std::collections::HashMap<[u8; HASH_SIZE], ([u8; HASH_SIZE], bool, usize)> =
             std::collections::HashMap::new();
-        for depth in BUCKET_DEPTH..TREE_DEPTH {
+        let serial_start = if par_ok && low_entries >= 128 {
+            let mut parts: Vec<Vec<(usize, ([u8; HASH_SIZE], ([u8; HASH_SIZE], bool, usize)))>> =
+                (0..1usize << PARTITION_BITS).map(|_| Vec::new()).collect();
+            for depth in BUCKET_DEPTH..split_depth {
+                for (k, v) in buckets[depth].drain(..) {
+                    parts[(k[0] >> (8 - PARTITION_BITS)) as usize].push((depth, (k, v)));
+                }
+            }
+            use rayon::prelude::*;
+            let this: &Self = self;
+            let results: Vec<_> = parts.par_iter()
+                .map(|entries| this.fold_partition(entries, split_depth))
+                .collect();
+            let mut invalid = false;
+            for (tops, puts, dels, inv) in results {
+                invalid |= inv;
+                for ((d, k), v) in puts { self.node_put(d, k, v); }
+                for (d, k) in dels { self.node_del(d, k); }
+                for (k, v) in tops { frontier.insert(k, v); }
+            }
+            if invalid {
+                self.incremental_pass_invalid = true;
+            }
+            split_depth
+        } else {
+            BUCKET_DEPTH
+        };
+        for depth in serial_start..TREE_DEPTH {
             for (k, v) in buckets[depth].drain(..) { frontier.insert(k, v); }
             if frontier.is_empty() { continue; }
             let default = self.default_hashes[depth];
@@ -1879,6 +2117,18 @@ impl BlockSnapshot {
     /// True once this address is journaled either way (pre-image or created).
     pub fn has_journal_entry(&self, addr: &str) -> bool {
         self.pre_images.contains_key(addr) || self.created_keys.contains(addr)
+    }
+
+    /// Merge one pre-image captured off-thread (parallel apply). First write wins,
+    /// same as record_pre_images; None = the account did not exist before the block.
+    pub fn merge_pre_image(&mut self, addr: &str, pre: Option<Account>) {
+        if self.has_journal_entry(addr) {
+            return;
+        }
+        match pre {
+            Some(a) => { self.pre_images.insert(addr.to_string(), a); }
+            None => { self.created_keys.insert(addr.to_string()); }
+        }
     }
 
     /// Legacy accessor — returns pre-images for rollback
@@ -3290,6 +3540,163 @@ impl StateManager {
         Ok(ApplyOutcome { charged })
     }
 
+    /// Deterministic parallel apply for a PURE-TRANSFER block (Transfer | BatchTransfers
+    /// only; the caller guarantees the type set). Each sender's txs execute in tx order
+    /// against the sender's pre-block state; intra-block CREDITS are not spendable —
+    /// they land after every debit, as commutative per-recipient sums. Every verdict is
+    /// a pure function of (sender pre-state, sender tx order), so the result is
+    /// byte-identical on every node regardless of thread scheduling. Check/mutation
+    /// rules mirror the sequential arms exactly.
+    pub fn apply_transfers_parallel(
+        &self,
+        txs: &[Transaction],
+        mut snapshot: Option<&mut BlockSnapshot>,
+    ) -> Vec<StateResult<ApplyOutcome>> {
+        use rayon::prelude::*;
+        let mut by_sender: HashMap<&str, Vec<usize>> = HashMap::new();
+        let mut order: Vec<&str> = Vec::new();
+        for (i, tx) in txs.iter().enumerate() {
+            by_sender.entry(tx.from.as_str())
+                .or_insert_with(|| { order.push(tx.from.as_str()); Vec::new() })
+                .push(i);
+        }
+
+        struct SenderOut {
+            sender: String,
+            pre: Option<Account>,
+            post: Option<Account>,
+            results: Vec<(usize, StateResult<ApplyOutcome>)>,
+            credits: Vec<(String, u64)>,
+        }
+
+        let outs: Vec<SenderOut> = order.par_iter().map(|sender| {
+            self.warm_account(sender);
+            let pre = self.accounts.get(*sender).map(|a| a.clone());
+            let mut cur = pre.clone();
+            let mut results = Vec::with_capacity(by_sender[sender].len());
+            let mut credits: Vec<(String, u64)> = Vec::new();
+            for &i in &by_sender[sender] {
+                let tx = &txs[i];
+                let r: StateResult<ApplyOutcome> = (|| {
+                    if tx.gas_limit > 0 {
+                        let gas_used = tx.compute_gas_used();
+                        if gas_used > tx.gas_limit {
+                            return Err(StateError::InvalidTransaction(format!(
+                                "[REJECT][TX] out_of_gas gas_used={} gas_limit={}", gas_used, tx.gas_limit)));
+                        }
+                    }
+                    // pk bind precedes the arm in the sequential dispatcher — mirror that,
+                    // including binding on a tx the nonce check then skips.
+                    if let (Some(pk), Some(acct)) = (tx.dilithium_public_key.as_ref(), cur.as_mut()) {
+                        if tx.binds_dilithium_pk() && acct.dilithium_public_key.is_none() {
+                            acct.dilithium_public_key = Some(pk.clone());
+                        }
+                    }
+                    let (amount_sum, fee) = match &tx.tx_type {
+                        TransactionType::Transfer { from, amount, .. } => {
+                            if from != &tx.from {
+                                return Err(StateError::InvalidTransaction(format!(
+                                    "[REJECT][TX] transfer_sender_mismatch_at_apply tx_from={} payload_from={}",
+                                    crate::char_prefix(&tx.from, 20), crate::char_prefix(from, 20))));
+                            }
+                            let fee = tx.effective_gas_price().checked_mul(tx.gas_limit)
+                                .ok_or_else(|| StateError::InvalidTransaction("[REJECT][TX] gas_fee_overflow".into()))?;
+                            (*amount, fee)
+                        }
+                        TransactionType::BatchTransfers { transfers, .. } => {
+                            let sum: u64 = transfers.iter().try_fold(0u64, |acc, t| {
+                                acc.checked_add(t.amount).ok_or_else(|| StateError::InvalidTransaction(
+                                    "[REJECT][BATCH-TRANSFER] overflow: sum of transfer amounts exceeds u64::MAX".to_string()))
+                            })?;
+                            let fee = tx.effective_gas_price().checked_mul(tx.gas_limit)
+                                .ok_or_else(|| StateError::InvalidTransaction(
+                                    "[REJECT][BATCH-TRANSFER] overflow: gas_price * gas_limit exceeds u64::MAX".to_string()))?;
+                            (sum, fee)
+                        }
+                        _ => return Err(StateError::InvalidTransaction("[REJECT][TX] non_transfer_in_parallel_apply".into())),
+                    };
+                    let acct = cur.as_mut().ok_or_else(|| StateError::AccountNotFound(tx.from.clone()))?;
+                    if tx.nonce <= acct.nonce {
+                        return Ok(ApplyOutcome { charged: false }); // idempotent replay skip
+                    }
+                    if tx.nonce != acct.nonce + 1 {
+                        return Err(StateError::InvalidTransaction(format!(
+                            "[REJECT][TX] invalid_nonce expected={} got={}", acct.nonce + 1, tx.nonce)));
+                    }
+                    let total = amount_sum.checked_add(fee)
+                        .ok_or_else(|| StateError::InvalidTransaction("[REJECT][TX] total_amount_overflow".into()))?;
+                    if acct.balance < total {
+                        return Err(StateError::InsufficientBalance { have: acct.balance, need: total });
+                    }
+                    acct.balance = acct.balance.checked_sub(total)
+                        .ok_or_else(|| StateError::InvalidTransaction("[REJECT][TX] sender_balance_underflow".into()))?;
+                    acct.nonce = acct.nonce.checked_add(1)
+                        .ok_or_else(|| StateError::InvalidTransaction("[REJECT][TX] nonce_overflow".into()))?;
+                    match &tx.tx_type {
+                        TransactionType::Transfer { to, amount, .. } => credits.push((to.clone(), *amount)),
+                        TransactionType::BatchTransfers { transfers, .. } => {
+                            for t in transfers { credits.push((t.to_address.clone(), t.amount)); }
+                        }
+                        _ => unreachable!(),
+                    }
+                    Ok(ApplyOutcome { charged: tx.gas_debit() > 0 })
+                })();
+                results.push((i, r));
+            }
+            SenderOut { sender: sender.to_string(), pre, post: cur, results, credits }
+        }).collect();
+
+        // Serial merge: journal pre-images (first write wins), write senders back,
+        // fold credits into deterministic per-recipient sums.
+        let mut results_vec: Vec<StateResult<ApplyOutcome>> =
+            (0..txs.len()).map(|_| Ok(ApplyOutcome { charged: false })).collect();
+        let mut credit_sums: BTreeMap<String, u64> = BTreeMap::new();
+        let mut touched: Vec<String> = Vec::with_capacity(order.len());
+        for out in outs {
+            if let Some(ref mut snap) = snapshot {
+                snap.merge_pre_image(&out.sender, out.pre);
+            }
+            for (i, r) in out.results { results_vec[i] = r; }
+            for (addr, amt) in out.credits {
+                let e = credit_sums.entry(addr).or_insert(0);
+                *e = e.saturating_add(amt); // overflow unreachable under the supply cap
+            }
+            if let Some(acc) = out.post {
+                self.accounts.insert(out.sender.clone(), acc);
+            }
+            touched.push(out.sender);
+        }
+
+        // Credits: recipients are distinct keys, so the fold is embarrassingly parallel;
+        // a recipient that is also a sender credits on top of its post-debit state.
+        let credit_list: Vec<(String, u64)> = credit_sums.into_iter().collect();
+        let credited: Vec<(String, Option<Account>, Account)> = credit_list.par_iter().map(|(addr, sum)| {
+            self.warm_account(addr);
+            let pre = self.accounts.get(addr).map(|a| a.clone());
+            let mut acc = pre.clone().unwrap_or_else(|| Account::new(addr.clone()));
+            acc.balance = acc.balance.saturating_add(*sum);
+            (addr.clone(), pre, acc)
+        }).collect();
+        for (addr, pre, acc) in credited {
+            if let Some(ref mut snap) = snapshot {
+                snap.merge_pre_image(&addr, pre);
+            }
+            self.accounts.insert(addr.clone(), acc);
+            touched.push(addr);
+        }
+
+        // One tree pass over every touched account.
+        {
+            let mut tree = self.merkle_tree.write();
+            for addr in &touched {
+                if let Some(acc) = self.accounts.get(addr) {
+                    tree.insert_lazy(addr, &acc);
+                }
+            }
+        }
+        results_vec
+    }
+
     /// v3.36: Apply gas refund for metered blocks (EIP-1559 style)
     /// Returns unused gas (gas_limit - gas_used) * effective_gas_price to sender.
     /// ACTIVATION: Only for blocks at height >= GAS_METERING_ACTIVATION_HEIGHT.
@@ -3817,6 +4224,142 @@ impl StateManager {
 //   * warm_account is idempotent on cache hits and updates the timestamp
 // ════════════════════════════════════════════════════════════════════════════
 #[cfg(test)]
+mod parallel_apply_tests {
+    use super::*;
+    use crate::{Account, Transaction, TransactionType};
+
+    fn seed(sm: &StateManager, n: u64, bal: u64) {
+        for i in 0..n {
+            let mut a = Account::new(format!("pa_{:04}", i));
+            a.balance = bal;
+            sm.accounts.insert(a.address.clone(), a.clone());
+            sm.merkle_tree.write().insert_lazy(&format!("pa_{:04}", i), &a);
+        }
+        sm.finalize_merkle();
+    }
+
+    fn transfer(from: u64, to: u64, amount: u64, nonce: u64) -> Transaction {
+        let f = format!("pa_{:04}", from);
+        let t = format!("pa_{:04}", to);
+        Transaction::new(
+            f.clone(), Some(t.clone()), amount, nonce, 10, 10_000, 1000, None,
+            TransactionType::Transfer { from: f, to: t, amount }, None,
+        )
+    }
+
+    fn batch(from: u64, tos: &[(u64, u64)], nonce: u64) -> Transaction {
+        let f = format!("pa_{:04}", from);
+        let transfers: Vec<crate::transaction::BatchTransferData> = tos.iter()
+            .map(|(to, amt)| crate::transaction::BatchTransferData {
+                to_address: format!("pa_{:04}", to), amount: *amt, memo: None,
+            }).collect();
+        let n = transfers.len() as u64;
+        let total: u64 = tos.iter().map(|(_, a)| a).sum();
+        Transaction::new(
+            f, None, total, nonce, 10, 10_000 * n, 1000, None,
+            TransactionType::BatchTransfers { transfers, batch_id: format!("b{}", nonce) }, None,
+        )
+    }
+
+    /// A block that exercises every verdict class: multiple txs per sender,
+    /// a stale nonce (skip), a future nonce (reject), an over-balance debit
+    /// (reject), and an intra-block credit-spend attempt (MUST reject: credits
+    /// land after all debits). Parallel result must byte-match a second
+    /// parallel run AND the hand-computed expectation.
+    #[test]
+    fn parallel_transfer_apply_is_deterministic_and_correct() {
+        let block: Vec<Transaction> = vec![
+            transfer(0, 1, 100, 1),          // ok
+            transfer(0, 2, 200, 2),          // ok (same sender, sequential nonce)
+            transfer(0, 3, 300, 1),          // stale nonce -> silent skip, uncharged
+            transfer(1, 4, 100_000_000, 1),  // needs the credit from tx0 -> MUST fail (have 1000 gas-only... amount too big anyway)
+            transfer(2, 5, 400, 5),          // future nonce -> reject
+            batch(3, &[(6, 10), (7, 20), (0, 30)], 1), // ok, credits back to sender 0
+            transfer(4, 0, 999_999_999_999, 1), // over balance -> reject
+        ];
+
+        let run = || {
+            let sm = StateManager::new();
+            seed(&sm, 8, 1_000_000);
+            let out = sm.apply_transfers_parallel(&block, None);
+            let root = sm.finalize_merkle();
+            let bal = |i: u64| sm.accounts.get(&format!("pa_{:04}", i)).map(|a| (a.balance, a.nonce)).unwrap();
+            (out.iter().map(|r| r.is_ok()).collect::<Vec<_>>(),
+             (0..8).map(bal).collect::<Vec<_>>(), root)
+        };
+        let (ok1, bal1, root1) = run();
+        let (ok2, bal2, root2) = run();
+        assert_eq!(root1, root2, "parallel apply must be run-to-run deterministic");
+        assert_eq!(bal1, bal2);
+        assert_eq!(ok1, ok2);
+
+        // Verdicts: [ok, ok, ok(skip), err, err, ok, err]
+        assert_eq!(ok1, vec![true, true, true, false, false, true, false]);
+        let fee1 = 10 * 10_000u64;      // unsigned test txs: no quantum surcharge
+        let fee3 = 10 * 30_000u64;      // batch of 3
+        // Sender 0: -100-fee, -200-fee, +30 credit from the batch; nonce 2.
+        assert_eq!(bal1[0], (1_000_000 - 100 - fee1 - 200 - fee1 + 30, 2));
+        // Sender 1: credit +100 only (its own spend rejected); nonce unchanged.
+        assert_eq!(bal1[1], (1_000_000 + 100, 0));
+        // Sender 2: credit +200; its future-nonce tx rejected.
+        assert_eq!(bal1[2], (1_000_000 + 200, 0));
+        // Sender 3: batch ok: -(10+20+30)-fee3; nonce 1.
+        assert_eq!(bal1[3], (1_000_000 - 60 - fee3, 1));
+        // 4: rejected spend, no debit; 5 got nothing (its tx rejected), 6/7 credited.
+        assert_eq!(bal1[4], (1_000_000, 0));
+        assert_eq!(bal1[5], (1_000_000, 0));
+        assert_eq!(bal1[6], (1_000_000 + 10, 0));
+        assert_eq!(bal1[7], (1_000_000 + 20, 0));
+    }
+
+    /// The partitioned level fold engages only at >=128 dirty buckets — force it and
+    /// compare against a from-scratch rebuild of the same leaf set.
+    #[test]
+    fn partitioned_tree_fold_matches_full_rebuild() {
+        let mut incremental = StateMerkleTree::new();
+        let mut all: Vec<Account> = Vec::new();
+        for i in 0..400u64 {
+            let mut a = Account::new(format!("pt_{:06}", i));
+            a.balance = 10_000 + i;
+            incremental.insert_lazy(&a.address.clone(), &a);
+            all.push(a);
+        }
+        incremental.finalize(); // full rebuild, caches complete
+        for a in all.iter_mut().take(300) {
+            a.balance += 7;
+            incremental.insert_lazy(&a.address.clone(), a); // 300 dirty -> parallel path
+        }
+        let par_root = incremental.finalize();
+
+        let mut reference = StateMerkleTree::new();
+        for a in &all {
+            reference.insert_lazy(&a.address.clone(), a);
+        }
+        assert_eq!(par_root, reference.finalize(),
+                   "partitioned incremental fold must match a from-scratch rebuild");
+    }
+
+    /// Snapshot + rollback across the parallel path restores the exact pre-block root.
+    #[test]
+    fn parallel_apply_rollback_restores_root() {
+        let sm = StateManager::new();
+        seed(&sm, 8, 1_000_000);
+        let pre_root = sm.finalize_merkle();
+        let block = vec![
+            transfer(0, 1, 100, 1),
+            batch(2, &[(3, 5), (9, 7)], 1), // recipient pa_0009 does not exist -> created
+        ];
+        let mut snap = BlockSnapshot::new(&sm.accounts, 1);
+        let _ = sm.apply_transfers_parallel(&block, Some(&mut snap));
+        let mid_root = sm.finalize_merkle();
+        assert_ne!(pre_root, mid_root);
+        sm.rollback_block(&snap);
+        assert_eq!(sm.finalize_merkle(), pre_root, "rollback must restore the pre-block root");
+        assert!(sm.accounts.get("pa_0009").is_none(), "created recipient must be removed");
+    }
+}
+
+#[cfg(test)]
 mod merkle_equiv_tests {
     use super::*;
     use crate::Account;
@@ -4286,6 +4829,7 @@ mod merkle_equiv_tests {
             old.insert_lazy(&a.address.clone(), &a);
         }
         old.finalize();
+        old.flush_barrier(); // the delta lands on a write-behind thread
         assert!(!store.all_leaves().is_empty(), "the store really holds the old state");
 
         // The reset every full-state path goes through, then the new state.
@@ -4306,6 +4850,7 @@ mod merkle_equiv_tests {
 
         assert_eq!(after_reset, reference,
                    "a reset tree must commit ONLY the state restored into it");
+        old.flush_barrier();
         assert_eq!(store.all_leaves().len(), 1, "the abandoned leaves are gone from disk too");
     }
 

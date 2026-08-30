@@ -3,6 +3,19 @@
 use super::*;
 
 impl BlockchainNode {
+    /// Admission gas-price floor stepped by local backlog: x1 under 5k pending,
+    /// x2 to 20k, x4 to 100k, x8 above. Not a consensus rule — each node prices
+    /// its own intake; a queued-out sender resubmits at the current floor.
+    pub(crate) fn congestion_gas_floor(pending: usize) -> u64 {
+        let base = qnet_state::transaction::MIN_GAS_PRICE;
+        match pending {
+            0..=4_999 => base,
+            5_000..=19_999 => base * 2,
+            20_000..=99_999 => base * 4,
+            _ => base * 8,
+        }
+    }
+
     pub async fn submit_transaction(&self, tx: qnet_state::Transaction) -> Result<String, QNetError> {
         // PRODUCTION VALIDATION - reject invalid transactions immediately
         if let Err(validation_error) = tx.validate() {
@@ -260,10 +273,14 @@ impl BlockchainNode {
             // mempool silently drop a below-floor TX while the RPC still reports success (which
             // stranded user transfers as a permanent fake "Pending"). Mirrors the mempool floor so
             // the two never disagree.
-            if tx.gas_price < qnet_state::transaction::MIN_GAS_PRICE {
+            // Congestion floor: admission-only (never consensus), stepped by local
+            // backlog so spam prices itself out while the queue is deep. Fees still
+            // go to the producer in full.
+            let floor = Self::congestion_gas_floor(self.mempool.size());
+            if tx.gas_price < floor {
                 return Err(QNetError::ValidationError(format!(
-                    "gas_price {} below minimum {} (0.0001 QNC/transfer floor)",
-                    tx.gas_price, qnet_state::transaction::MIN_GAS_PRICE
+                    "gas_price {} below current floor {} (rises with mempool backlog)",
+                    tx.gas_price, floor
                 )));
             }
 

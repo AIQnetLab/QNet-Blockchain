@@ -36,11 +36,30 @@ enum TxStorage {
     Binary(Vec<u8>),
 }
 
+impl TxStorage {
+    /// Payload bytes plus fixed per-entry index overhead.
+    #[inline]
+    fn approx_bytes(&self) -> usize {
+        64 + match self {
+            TxStorage::Json(s) => s.len(),
+            TxStorage::Binary(v) => v.len(),
+        }
+    }
+}
+
+/// Byte ceiling for the whole pool. The count cap alone let 55KB batch
+/// transactions balloon RAM (500k x 55KB is tens of GB); admission fails
+/// closed on either bound and the client resubmits.
+const MAX_MEMPOOL_BYTES: usize = 512 * 1024 * 1024;
+
 /// Optimized mempool implementation with binary support and priority queue
 /// ARCHITECTURE: Priority-based transaction ordering for spam protection
 pub struct SimpleMempool {
     config: SimpleMempoolConfig,
     transactions: Arc<DashMap<String, TxStorage>>, // hash -> json or binary
+    /// Payload bytes currently held; maintained ONLY via tx_store_insert /
+    /// tx_store_remove / clear so no removal path can leak the counter.
+    total_bytes: Arc<std::sync::atomic::AtomicUsize>,
     // PRODUCTION: Priority queue (BTreeMap) sorted by gas_price descending
     // Key: gas_price (u64), Value: FIFO queue of tx hashes at that price
     by_gas_price: Arc<RwLock<BTreeMap<u64, VecDeque<String>>>>,
@@ -105,6 +124,36 @@ pub struct SimpleMempool {
 impl SimpleMempool {
     /// Create new optimized mempool with priority queue
     /// PRODUCTION: Priority-based ordering for spam protection (highest gas_price first)
+    /// Sole insert path for the tx map — keeps the byte counter exact.
+    fn tx_store_insert(&self, hash: String, storage: TxStorage) {
+        use std::sync::atomic::Ordering;
+        let add = storage.approx_bytes();
+        if let Some(old) = self.transactions.insert(hash, storage) {
+            self.total_bytes.fetch_sub(old.approx_bytes(), Ordering::Relaxed);
+        }
+        self.total_bytes.fetch_add(add, Ordering::Relaxed);
+    }
+
+    /// Sole remove path for the tx map — mirror of tx_store_insert.
+    fn tx_store_remove(&self, hash: &str) -> bool {
+        use std::sync::atomic::Ordering;
+        match self.transactions.remove(hash) {
+            Some((_, old)) => {
+                self.total_bytes.fetch_sub(old.approx_bytes(), Ordering::Relaxed);
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub fn total_bytes(&self) -> usize {
+        self.total_bytes.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn bytes_full(&self) -> bool {
+        self.total_bytes() >= MAX_MEMPOOL_BYTES
+    }
+
     pub fn new(config: SimpleMempoolConfig) -> Self {
         // Use binary for large mempools (>100k)
         let use_binary = config.max_size > 100_000;
@@ -112,6 +161,7 @@ impl SimpleMempool {
         Self {
             config,
             transactions: Arc::new(DashMap::new()),
+            total_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             by_gas_price: Arc::new(RwLock::new(BTreeMap::new())),
             use_binary,
             included_tx_hashes: Arc::new(DashMap::new()),
@@ -256,7 +306,7 @@ impl SimpleMempool {
         // and either ordering converges on a consistent state.
         if let Some(ref old) = old_hash {
             self.commitment_reverse.remove(old);
-            self.transactions.remove(old);
+            self.tx_store_remove(old);
             self.tx_timestamps.remove(old);
             if let Some((_, sender)) = self.tx_sender_map.remove(old) {
                 if let Some(mut count) = self.tx_count_by_sender.get_mut(&sender) {
@@ -371,7 +421,7 @@ impl SimpleMempool {
         } else {
             gas_price
         };
-        if self.transactions.len() >= self.config.max_size {
+        if self.transactions.len() >= self.config.max_size || self.bytes_full() {
             let mut priority_queue = self.by_gas_price.write();
             if let Some(mut lowest_entry) = priority_queue.first_entry() {
                 let lowest_gas = *lowest_entry.key();
@@ -382,7 +432,7 @@ impl SimpleMempool {
                         if lowest_entry.get().is_empty() {
                             lowest_entry.remove();
                         }
-                        self.transactions.remove(&tx_hash);
+                        self.tx_store_remove(&tx_hash);
                         self.tx_timestamps.remove(&tx_hash);
                         // Release the evicted tx's quota slot too: every other removal path is gated
                         // on transactions.remove() succeeding, which is already false by here, so
@@ -405,7 +455,7 @@ impl SimpleMempool {
                         if lowest_entry.get().is_empty() {
                             lowest_entry.remove();
                         }
-                        self.transactions.remove(&tx_hash);
+                        self.tx_store_remove(&tx_hash);
                         self.tx_timestamps.remove(&tx_hash);
                         self.decrement_sender_for_hash(&tx_hash);
                         self.cleanup_commitment_indices_for_hash(&tx_hash);
@@ -522,7 +572,7 @@ impl SimpleMempool {
                 return false;
             }
 
-            self.transactions.insert(hash.clone(), storage);
+            self.tx_store_insert(hash.clone(), storage);
             self.tx_timestamps.insert(hash.clone(), std::time::Instant::now());
             // v14.8.4: System TXs keyed at u64::MAX so block producers drain
             // them first — protocol bootstrap cannot be delayed by user TXs.
@@ -593,7 +643,7 @@ impl SimpleMempool {
 
         // FIX M-H15: Evict lowest-priority TX when mempool is full
         let mut evicted_for_persist: Option<String> = None;
-        if self.transactions.len() >= self.config.max_size {
+        if self.transactions.len() >= self.config.max_size || self.bytes_full() {
             let mut priority_queue = self.by_gas_price.write();
             if let Some(mut lowest_entry) = priority_queue.first_entry() {
                 let lowest_gas = *lowest_entry.key();
@@ -603,7 +653,7 @@ impl SimpleMempool {
                         if lowest_entry.get().is_empty() {
                             lowest_entry.remove();
                         }
-                        self.transactions.remove(&tx_hash);
+                        self.tx_store_remove(&tx_hash);
                         self.tx_timestamps.remove(&tx_hash);
                         // Release the evicted tx's quota slot too: every other removal path is gated
                         // on transactions.remove() succeeding, which is already false by here, so
@@ -631,7 +681,7 @@ impl SimpleMempool {
                         if lowest_entry.get().is_empty() {
                             lowest_entry.remove();
                         }
-                        self.transactions.remove(&tx_hash);
+                        self.tx_store_remove(&tx_hash);
                         self.tx_timestamps.remove(&tx_hash);
                         self.decrement_sender_for_hash(&tx_hash);
                         self.cleanup_commitment_indices_for_hash(&tx_hash);
@@ -757,7 +807,7 @@ impl SimpleMempool {
             persist_payload = tx_bytes.clone();
 
             // Add to transactions first
-            self.transactions.insert(hash.clone(), TxStorage::Binary(tx_bytes));
+            self.tx_store_insert(hash.clone(), TxStorage::Binary(tx_bytes));
             self.tx_timestamps.insert(hash.clone(), std::time::Instant::now());
 
             // Then add to priority queue (same lock scope)
@@ -809,7 +859,7 @@ impl SimpleMempool {
         }
 
         let available_space = self.config.max_size.saturating_sub(self.transactions.len());
-        if available_space == 0 {
+        if available_space == 0 || self.bytes_full() {
             return 0;
         }
 
@@ -895,7 +945,7 @@ impl SimpleMempool {
                     // lock so the transition is atomic with the new
                     // insertion below.
                     self.commitment_reverse.remove(&old);
-                    self.transactions.remove(&old);
+                    self.tx_store_remove(&old);
                     self.tx_timestamps.remove(&old);
                     if let Some((_, sender)) = self.tx_sender_map.remove(&old) {
                         if let Some(mut count) = self.tx_count_by_sender.get_mut(&sender) {
@@ -924,7 +974,7 @@ impl SimpleMempool {
 
             // TRUSTED: Skip hash verification - caller guarantees correctness
             // Insert into BOTH structures within the same lock scope
-            self.transactions.insert(hash.clone(), TxStorage::Binary(tx_bytes));
+            self.tx_store_insert(hash.clone(), TxStorage::Binary(tx_bytes));
             self.tx_timestamps.insert(hash.clone(), std::time::Instant::now());
             priority_queue
                 .entry(gas_price)
@@ -1015,7 +1065,7 @@ impl SimpleMempool {
     /// Remove transaction (must remove from both transactions map AND priority queue)
     /// CRITICAL: Maintains consistency between storage and priority queue
     pub fn remove_transaction(&self, hash: &str) -> bool {
-        if self.transactions.remove(hash).is_some() {
+        if self.tx_store_remove(hash) {
             self.tx_timestamps.remove(hash);
             // FIX R24-M2: Decrement per-sender count on removal
             if let Some((_, sender)) = self.tx_sender_map.remove(hash) {
@@ -1056,6 +1106,7 @@ impl SimpleMempool {
             .collect();
 
         self.transactions.clear();
+        self.total_bytes.store(0, std::sync::atomic::Ordering::Relaxed);
         self.by_gas_price.write().clear();
         self.tx_sender_map.clear();
         self.tx_count_by_sender.clear();
@@ -1100,7 +1151,7 @@ impl SimpleMempool {
         // Step 1: Remove from transactions map (fast O(1) per hash)
         let mut removed_count = 0;
         for hash in hashes {
-            if self.transactions.remove(hash).is_some() {
+            if self.tx_store_remove(hash) {
                 self.tx_timestamps.remove(hash.as_str());
                 // Decrement ONLY the removed sender's counter; a wholesale reset
                 // would let a spammer refill their whole quota every block.
@@ -1307,7 +1358,7 @@ impl SimpleMempool {
             // That method adds hashes to included_tx_hashes, which would
             // incorrectly block re-submission of expired (never-confirmed) TXs.
             for hash in &expired_hashes {
-                self.transactions.remove(hash);
+                self.tx_store_remove(hash);
                 // Release this sender's quota slot for the one expired tx only;
                 // a wholesale reset would hand a spammer a free per-block refill.
                 self.decrement_sender_for_hash(hash);

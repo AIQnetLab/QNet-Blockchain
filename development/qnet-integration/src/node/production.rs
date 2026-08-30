@@ -3927,7 +3927,7 @@ impl BlockchainNode {
                     // the backlog grew — a stable degraded spiral. The target bounds every
                     // block to work the whole fleet applies inside the 1s slot; validators
                     // keep accepting up to the full limit.
-                    const BLOCK_FILL_SOFT_GAS: u64 = 80_000_000;
+                    const BLOCK_FILL_SOFT_GAS: u64 = 120_000_000;
                     let block_gas_limit = qnet_state::gas_limits::BLOCK_GAS_LIMIT.min(BLOCK_FILL_SOFT_GAS);
                     
                     // CRITICAL v2.26: Track TX hashes for mempool cleanup after block
@@ -4806,7 +4806,43 @@ impl BlockchainNode {
                         // apply_block_to_state so both credit the identical total (no state_root split).
                         let mut block_flat_fees: u64 = 0;
                         let mut block_wasm_fuel_fees: u64 = 0;
-                        // 1. Apply all transactions
+                        // 1. Apply all transactions. Pure-transfer blocks take the SAME
+                        // deterministic parallel path as the validator (state_apply.rs):
+                        // per-sender debit streams, credits after all debits. Outcome
+                        // bookkeeping mirrors the sequential branch below exactly.
+                        let pure_transfers = txs.len() >= 32
+                            && txs.iter().all(|t| matches!(t.tx_type,
+                                qnet_state::TransactionType::Transfer { .. }
+                                | qnet_state::TransactionType::BatchTransfers { .. }));
+                        if pure_transfers {
+                            let outcomes = state_guard.apply_transfers_parallel(&txs, None);
+                            for (tx, outcome) in txs.iter().zip(outcomes) {
+                                let charged = outcome.as_ref().map_or(false, |o| o.charged);
+                                if let Err(e) = outcome {
+                                    if is_warn() {
+                                        println!("[WARN][STATE] producer_tx_apply_failed hash={} err={}", tx.hash, e);
+                                    }
+                                    continue;
+                                }
+                                if charged {
+                                    let _ = state_guard.apply_gas_refund(tx, next_block_height, 0);
+                                }
+                                if charged && !tx.from.starts_with("system_") && tx.gas_price > 0 && tx.gas_limit > 0 {
+                                    let charged_gas = if next_block_height >= qnet_state::GAS_METERING_ACTIVATION_HEIGHT {
+                                        tx.compute_gas_used()
+                                    } else {
+                                        tx.gas_limit
+                                    };
+                                    block_flat_fees = block_flat_fees
+                                        .saturating_add(tx.effective_gas_price().saturating_mul(charged_gas));
+                                }
+                                if tx.binds_dilithium_pk() {
+                                    if let Some(pk) = tx.dilithium_public_key.as_ref() {
+                                        applied_pk_binds.push((tx.from.clone(), pk.clone()));
+                                    }
+                                }
+                            }
+                        } else {
                         for tx in &txs {
                             // v3.33: Handle CLAIM transactions on producer side
                             
@@ -4910,6 +4946,7 @@ impl BlockchainNode {
                                 }
                             }
                         }
+                        } // end pure_transfers / sequential branch
 
                         // Token-transfer rows for this block's logs — decided HERE because it reads the
                         // accounts map (contract type) and must see the same state the block was applied
