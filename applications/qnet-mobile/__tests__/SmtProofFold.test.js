@@ -38,7 +38,7 @@ const addrHash = sha3_256(concatBytes(Buffer.from('QNET_ADDR:', 'utf8'), Buffer.
 const leaf = accountLeaf(vector.address, vector.balance, vector.nonce);
 
 test('proof is a full-depth SMT proof', () => {
-  expect(vector.proof).toHaveLength(256);
+  expect(vector.proof).toHaveLength(40);
 });
 
 test('the shipped fold reproduces the Rust state_root', () => {

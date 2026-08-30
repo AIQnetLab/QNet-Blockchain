@@ -100,7 +100,19 @@ pub const MAX_QNC_SUPPLY_NANO: u64 = MAX_QNC_SUPPLY * 1_000_000_000;
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const HASH_SIZE: usize = 32;
-const TREE_DEPTH: usize = 256; // v32.14: full address bit-width — guarantees ALL leaves converge to ONE root
+const TREE_DEPTH: usize = 256; // full address bit-width — guarantees ALL leaves converge to ONE root
+/// Depths 0..BUCKET_DEPTH are collapsed into BUCKETS: a leaf's bucket is every leaf
+/// sharing its leading PROOF_DEPTH bits, hashed as one sorted, domain-tagged blob.
+/// Only depths BUCKET_DEPTH..TREE_DEPTH are hashed as tree levels, cutting the
+/// per-leaf climb (hashes, node map traffic, proof size) from 256 levels to 40.
+/// Bucket collisions need matching 40-bit prefixes: ~2^20 grinding per extra entry,
+/// and a fat bucket only grows its own members' proofs — bounded griefing.
+const BUCKET_DEPTH: usize = 216;
+/// Tree levels above the bucket layer == proof length.
+pub const PROOF_DEPTH: usize = TREE_DEPTH - BUCKET_DEPTH;
+/// Domain tag for bucket blobs: bucket preimages are 1 + 64*n bytes, never the
+/// exact 64 bytes of an interior-node preimage — the layers cannot collide.
+const BUCKET_TAG: u8 = 0xB5;
 
 /// Default read-through node cache cap when a store is attached. Bounds the
 /// in-mem `leaves`/`intermediate_nodes` maps so a 10M-account super-node need
@@ -697,52 +709,75 @@ impl StateMerkleTree {
     /// store. When store is None those are pure map reads → `&mut` is inert.
     pub fn generate_proof(&mut self, address: &str) -> Vec<([u8; HASH_SIZE], bool)> {
         let addr_hash = Self::hash_address(address);
-        let mut proof = Vec::with_capacity(TREE_DEPTH);
-        let mut key = addr_hash;
-
-        // One binary search up front instead of a range probe per level: below `ffd` the
-        // sibling is provably empty, so those 200+ levels need no store access at all.
-        let ffd = self.first_foreign_depth(&addr_hash);
-
-        for depth in 0..TREE_DEPTH {
-            let mut sibling_key = key;
-            Self::flip_bit(&mut sibling_key, depth);
-
-            // node_resolve, not node_get: below a branch the sibling chain is not
-            // materialised, and treating it as a default subtree would emit a proof
-            // that cannot verify.
-            let sibling_hash = if depth + 1 < ffd {
-                self.default_hashes[depth]
-            } else {
-                self.node_resolve(depth, &sibling_key).0
-            };
-
-            let is_right = Self::get_bit(&addr_hash, depth);
-            proof.push((sibling_hash, is_right));
-
-            Self::clear_bit(&mut key, depth);
-        }
-
-        proof
+        self.generate_leaf_proof(&addr_hash)
     }
 
-    /// V2: proof for a RAW storage leaf (level-2 of a TokenBalanceProof). Same sibling walk as
+    /// V2: proof for a RAW storage leaf (level-2 of a TokenBalanceProof). Same walk as
     /// generate_proof but keyed by hash_storage_key(key_preimage) instead of hash_address.
     pub fn generate_raw_proof(&mut self, key_preimage: &str) -> Vec<([u8; HASH_SIZE], bool)> {
         let leaf_hash = Self::hash_storage_key(key_preimage);
-        let mut proof = Vec::with_capacity(TREE_DEPTH);
-        let mut key = leaf_hash;
-        let ffd = self.first_foreign_depth(&leaf_hash);
-        for depth in 0..TREE_DEPTH {
+        self.generate_leaf_proof(&leaf_hash)
+    }
+
+    /// Uniform proof: the in-bucket mini-merkle path first (position-dependent
+    /// flags, 0 steps for a single-entry bucket), then exactly PROOF_DEPTH tree
+    /// steps whose flags are the key's leading bits. One (sibling, is_right) shape
+    /// throughout, so wire formats and the light-client fold stay a single walk.
+    fn generate_leaf_proof(&mut self, leaf_key: &[u8; HASH_SIZE]) -> Vec<([u8; HASH_SIZE], bool)> {
+        let bucket = Self::bucket_of(leaf_key);
+        let entries = self.bucket_entries(&bucket);
+        let mut proof = Vec::with_capacity(PROOF_DEPTH + 4);
+
+        let found = entries.iter().position(|(k, _)| k == leaf_key);
+        if found.is_none() && !entries.is_empty() {
+            // Absence is only provable against an EMPTY bucket (seed = its default);
+            // a foreign co-bucket entry (2^-40 per existing key) makes it unservable.
+            return proof;
+        }
+        let mut idx = found.unwrap_or(0);
+        let mut level: Vec<[u8; HASH_SIZE]> = if found.is_some() {
+            entries.iter().map(|(k, v)| Self::bucket_leaf(k, v)).collect()
+        } else {
+            Vec::new() // empty bucket: no in-bucket steps, tree walk only
+        };
+        while level.len() > 1 {
+            let sib = idx ^ 1;
+            if sib < level.len() {
+                proof.push((level[sib], idx & 1 == 1));
+            }
+            let mut next = Vec::with_capacity(level.len().div_ceil(2));
+            let mut buffer = [0u8; HASH_SIZE * 2];
+            for pair in level.chunks(2) {
+                if pair.len() == 2 {
+                    buffer[..HASH_SIZE].copy_from_slice(&pair[0]);
+                    buffer[HASH_SIZE..].copy_from_slice(&pair[1]);
+                    let mut hasher = Sha3_256::new();
+                    hasher.update(&buffer);
+                    let mut h = [0u8; HASH_SIZE];
+                    h.copy_from_slice(&hasher.finalize());
+                    next.push(h);
+                } else {
+                    next.push(pair[0]);
+                }
+            }
+            level = next;
+            idx /= 2;
+        }
+
+        // One binary search up front: below `ffd` the sibling is provably empty.
+        let ffd = self.first_foreign_depth(leaf_key);
+        let mut key = bucket;
+        for depth in BUCKET_DEPTH..TREE_DEPTH {
             let mut sibling_key = key;
             Self::flip_bit(&mut sibling_key, depth);
+            // node_resolve, not node_get: a non-materialised sibling chain must be
+            // derived, or the emitted proof cannot verify.
             let sibling_hash = if depth + 1 < ffd {
                 self.default_hashes[depth]
             } else {
                 self.node_resolve(depth, &sibling_key).0
             };
-            let is_right = Self::get_bit(&leaf_hash, depth);
-            proof.push((sibling_hash, is_right));
+            proof.push((sibling_hash, Self::get_bit(leaf_key, depth)));
             Self::clear_bit(&mut key, depth);
         }
         proof
@@ -755,55 +790,63 @@ impl StateMerkleTree {
         proof: &[([u8; HASH_SIZE], bool)],
         root: &[u8; HASH_SIZE]
     ) -> bool {
-        if proof.len() != TREE_DEPTH {
-            return false;
-        }
-        
         let addr_hash = Self::hash_address(address);
-        let mut current = Self::hash_account(account);
-        let mut buffer = [0u8; HASH_SIZE * 2];
-        
-        for (depth, (sibling, is_right)) in proof.iter().enumerate() {
-            let expected_bit = Self::get_bit(&addr_hash, depth);
-            if *is_right != expected_bit {
-                return false;
-            }
-            
-            if *is_right {
-                buffer[..HASH_SIZE].copy_from_slice(sibling);
-                buffer[HASH_SIZE..].copy_from_slice(&current);
-            } else {
-                buffer[..HASH_SIZE].copy_from_slice(&current);
-                buffer[HASH_SIZE..].copy_from_slice(sibling);
-            }
-            
-            let mut hasher = Sha3_256::new();
-            hasher.update(&buffer);
-            let result = hasher.finalize();
-            current.copy_from_slice(&result);
-        }
-        
-        current == *root
+        Self::verify_leaf_proof(&addr_hash, Self::hash_account(account), proof, root)
     }
 
-    /// V2: verify a RAW storage-leaf proof (level-2 of a TokenBalanceProof). Seeds current = leaf_value
-    /// (NOT hash_account) and keys the walk by hash_storage_key(key_preimage). Proves value ∈ storage_root.
+    /// V2: verify a RAW storage-leaf proof (level-2 of a TokenBalanceProof). Seeds with
+    /// leaf_value (NOT hash_account), keyed by hash_storage_key(key_preimage).
     pub fn verify_raw_proof(
         key_preimage: &str,
         leaf_value: [u8; HASH_SIZE],
         proof: &[([u8; HASH_SIZE], bool)],
         root: &[u8; HASH_SIZE],
     ) -> bool {
-        if proof.len() != TREE_DEPTH {
+        let leaf_hash = Self::hash_storage_key(key_preimage);
+        Self::verify_leaf_proof(&leaf_hash, leaf_value, proof, root)
+    }
+
+    /// One continuous fold from the tagged bucket leaf to the root. The first
+    /// len-PROOF_DEPTH steps are the in-bucket path (flags are positional); the
+    /// last PROOF_DEPTH steps are tree levels whose flags MUST equal the key's
+    /// bits. The tagged seed binds key+value, so no path can prove a foreign key.
+    fn verify_leaf_proof(
+        leaf_key: &[u8; HASH_SIZE],
+        leaf_value: [u8; HASH_SIZE],
+        proof: &[([u8; HASH_SIZE], bool)],
+        root: &[u8; HASH_SIZE],
+    ) -> bool {
+        // Bucket path bound: 64 steps covers any feasible bucket, caps verifier work.
+        if proof.len() < PROOF_DEPTH || proof.len() > PROOF_DEPTH + 64 {
             return false;
         }
-        let leaf_hash = Self::hash_storage_key(key_preimage);
-        let mut current = leaf_value;
-        let mut buffer = [0u8; HASH_SIZE * 2];
-        for (depth, (sibling, is_right)) in proof.iter().enumerate() {
-            let expected_bit = Self::get_bit(&leaf_hash, depth);
-            if *is_right != expected_bit {
+        let bucket_steps = proof.len() - PROOF_DEPTH;
+        // All-zero value = ABSENCE (a real leaf hash is never zero): the key's bucket
+        // must be empty, so the fold seeds from the default bucket hash directly.
+        let mut current = if leaf_value == [0u8; HASH_SIZE] {
+            if bucket_steps != 0 {
                 return false;
+            }
+            let mut d = [0u8; HASH_SIZE];
+            let mut buf = [0u8; HASH_SIZE * 2];
+            for _ in 0..BUCKET_DEPTH {
+                buf[..HASH_SIZE].copy_from_slice(&d);
+                buf[HASH_SIZE..].copy_from_slice(&d);
+                let mut hasher = Sha3_256::new();
+                hasher.update(&buf);
+                d.copy_from_slice(&hasher.finalize());
+            }
+            d
+        } else {
+            Self::bucket_leaf(leaf_key, &leaf_value)
+        };
+        let mut buffer = [0u8; HASH_SIZE * 2];
+        for (i, (sibling, is_right)) in proof.iter().enumerate() {
+            if i >= bucket_steps {
+                let depth = BUCKET_DEPTH + (i - bucket_steps);
+                if *is_right != Self::get_bit(leaf_key, depth) {
+                    return false;
+                }
             }
             if *is_right {
                 buffer[..HASH_SIZE].copy_from_slice(sibling);
@@ -814,8 +857,7 @@ impl StateMerkleTree {
             }
             let mut hasher = Sha3_256::new();
             hasher.update(&buffer);
-            let result = hasher.finalize();
-            current.copy_from_slice(&result);
+            current.copy_from_slice(&hasher.finalize());
         }
         current == *root
     }
@@ -1013,20 +1055,92 @@ impl StateMerkleTree {
         (lo, hi)
     }
 
+    /// Canonical bucket key: the leaf key with its trailing BUCKET_DEPTH bits cleared.
+    #[inline]
+    fn bucket_of(key: &[u8; HASH_SIZE]) -> [u8; HASH_SIZE] {
+        Self::subtree_bounds(BUCKET_DEPTH, key).0
+    }
+
+    /// In-bucket leaf: domain-tagged (65-byte preimage — disjoint from 64-byte nodes).
+    #[inline]
+    fn bucket_leaf(key: &[u8; HASH_SIZE], value: &[u8; HASH_SIZE]) -> [u8; HASH_SIZE] {
+        let mut hasher = Sha3_256::new();
+        hasher.update([BUCKET_TAG]);
+        hasher.update(key);
+        hasher.update(value);
+        let mut out = [0u8; HASH_SIZE];
+        out.copy_from_slice(&hasher.finalize());
+        out
+    }
+
+    /// Mini-merkle over one bucket's sorted tagged leaves: pairwise H(l||r), an odd
+    /// element promotes unchanged. Single entry => its tagged leaf. Proofs through a
+    /// bucket are ordinary (sibling, is_right) steps, so the wire shape is uniform.
+    fn bucket_fold(mut level: Vec<[u8; HASH_SIZE]>) -> [u8; HASH_SIZE] {
+        debug_assert!(!level.is_empty());
+        let mut buffer = [0u8; HASH_SIZE * 2];
+        while level.len() > 1 {
+            let mut next = Vec::with_capacity(level.len().div_ceil(2));
+            for pair in level.chunks(2) {
+                if pair.len() == 2 {
+                    buffer[..HASH_SIZE].copy_from_slice(&pair[0]);
+                    buffer[HASH_SIZE..].copy_from_slice(&pair[1]);
+                    let mut hasher = Sha3_256::new();
+                    hasher.update(&buffer);
+                    let mut h = [0u8; HASH_SIZE];
+                    h.copy_from_slice(&hasher.finalize());
+                    next.push(h);
+                } else {
+                    next.push(pair[0]);
+                }
+            }
+            level = next;
+        }
+        level[0]
+    }
+
+    /// Sorted live entries of one bucket: RAM when the leaf set is complete, else
+    /// merged with the store (tombstones filtered) exactly like subtree_probe.
+    fn bucket_entries(&self, bucket_key: &[u8; HASH_SIZE]) -> Vec<([u8; HASH_SIZE], [u8; HASH_SIZE])> {
+        let (lo, hi) = Self::subtree_bounds(BUCKET_DEPTH, bucket_key);
+        if self.leaves_complete || self.node_store.is_none() {
+            return self.leaves.range(lo..=hi).map(|(k, v)| (*k, *v)).collect();
+        }
+        let store = self.node_store.as_ref().unwrap();
+        let mut set: BTreeMap<[u8; HASH_SIZE], [u8; HASH_SIZE]> =
+            store.leaves_under(&lo, &hi, usize::MAX).into_iter()
+                .filter(|(k, _)| !self.pending_leaf_dels.contains(k))
+                .collect();
+        for (k, v) in self.leaves.range(lo..=hi) {
+            set.insert(*k, *v);
+        }
+        set.into_iter().collect()
+    }
+
+    /// Bucket layer hash: mini-merkle root of the bucket's tagged leaves; empty
+    /// bucket == default_hashes[BUCKET_DEPTH].
+    fn bucket_hash_at(&self, bucket_key: &[u8; HASH_SIZE]) -> [u8; HASH_SIZE] {
+        let entries = self.bucket_entries(bucket_key);
+        if entries.is_empty() {
+            return self.default_hashes[BUCKET_DEPTH];
+        }
+        Self::bucket_fold(entries.iter().map(|(k, v)| Self::bucket_leaf(k, v)).collect())
+    }
+
     /// Hash of a subtree at `depth` that holds exactly one leaf: climb the leaf up
     /// `depth` levels against default siblings. Pure function of the leaf, which is
     /// why the chain below a single-leaf node never has to be stored.
     fn lonely_chain_hash(
         &self,
-        leaf_key: &[u8; HASH_SIZE],
-        leaf_hash: [u8; HASH_SIZE],
+        bucket_key: &[u8; HASH_SIZE],
+        bucket_hash: [u8; HASH_SIZE],
         depth: usize,
     ) -> [u8; HASH_SIZE] {
-        let mut acc = leaf_hash;
+        let mut acc = bucket_hash;
         let mut buffer = [0u8; HASH_SIZE * 2];
-        for d in 0..depth {
+        for d in BUCKET_DEPTH..depth {
             let sibling = self.default_hashes[d];
-            if Self::get_bit(leaf_key, d) {
+            if Self::get_bit(bucket_key, d) {
                 buffer[..HASH_SIZE].copy_from_slice(&sibling);
                 buffer[HASH_SIZE..].copy_from_slice(&acc);
             } else {
@@ -1042,50 +1156,53 @@ impl StateMerkleTree {
 
     /// What sits under (depth, key): nothing, exactly one leaf, or a branch. Capped
     /// at two so the probe stays O(log N) regardless of subtree size.
+    /// First live leaf key in [lo, hi]: RAM when the leaf set is complete, else the
+    /// minimum over the store scan (tombstones filtered) and the in-mem overlay.
+    fn first_live_leaf_in(&self, lo: &[u8; HASH_SIZE], hi: &[u8; HASH_SIZE]) -> Option<[u8; HASH_SIZE]> {
+        let ram = self.leaves.range(*lo..=*hi).next().map(|(k, _)| *k);
+        if self.leaves_complete || self.node_store.is_none() {
+            return ram;
+        }
+        let store = self.node_store.as_ref().unwrap();
+        // Over-fetch by the tombstones inside the range: the store still holds rows
+        // deleted this finalize, and truncating before filtering them would skip a
+        // live successor.
+        let want = 1usize.saturating_add(self.pending_leaf_dels.range(*lo..=*hi).count());
+        let disk = store.leaves_under(lo, hi, want).into_iter()
+            .map(|(k, _)| k)
+            .filter(|k| !self.pending_leaf_dels.contains(k))
+            .min();
+        match (ram, disk) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// Classify the subtree at (depth, key) by BUCKET occupancy: Empty, exactly one
+    /// bucket (its key + content hash), or leaves in two or more buckets. depth is
+    /// always >= BUCKET_DEPTH; at BUCKET_DEPTH the range IS one bucket, so Branch
+    /// is impossible there by construction.
     fn subtree_probe(&self, depth: usize, key: &[u8; HASH_SIZE]) -> SubtreeSpan {
         let (lo, hi) = Self::subtree_bounds(depth, key);
-        // Complete RAM leaf set → answer from the BTreeMap below (deletes are already
-        // applied to it, so no tombstone filtering is needed). The store arm is the
-        // fallback for an incomplete cache only: its range scan is the unit of cost
-        // that made finalize scale with disk latency instead of hashing.
-        if !self.leaves_complete {
-        if let Some(ref store) = self.node_store {
-            // Over-fetch by the tombstones INSIDE this range: the store still holds rows deleted
-            // this finalize, and truncating at 2 RAW rows before filtering them can report a branch
-            // as a single leaf — which then derives a chain hash for a multi-leaf subtree. Bounded
-            // by the local overlap, not the global count, so a large rollback does not turn every
-            // probe into a full-set fetch.
-            let want = 2usize.saturating_add(self.pending_leaf_dels.range(lo..=hi).count());
-            let found = store.leaves_under(&lo, &hi, want);
-            let live: Vec<_> = found
-                .into_iter()
-                .filter(|(k, _)| !self.pending_leaf_dels.contains(k))
-                .take(2)
-                .collect();
-            // In-mem holds this finalize's not-yet-flushed puts; merge so a freshly
-            // inserted neighbour is visible to the probe.
-            let mut seen = live;
-            for (k, v) in self.leaves.range(lo..=hi) {
-                if seen.len() >= 2 {
-                    break;
-                }
-                if !seen.iter().any(|(sk, _)| sk == k) {
-                    seen.push((*k, *v));
-                }
+        let first = match self.first_live_leaf_in(&lo, &hi) {
+            None => return SubtreeSpan::Empty,
+            Some(k) => k,
+        };
+        let bucket = Self::bucket_of(&first);
+        let (_, bucket_hi) = Self::subtree_bounds(BUCKET_DEPTH, &bucket);
+        if bucket_hi < hi {
+            let mut next_lo = bucket_hi;
+            // bucket_hi < hi rules out overflow: increment to the key just past the bucket.
+            for i in (0..HASH_SIZE).rev() {
+                let (v, carry) = next_lo[i].overflowing_add(1);
+                next_lo[i] = v;
+                if !carry { break; }
             }
-            return match seen.len() {
-                0 => SubtreeSpan::Empty,
-                1 => SubtreeSpan::Single(seen[0].0, seen[0].1),
-                _ => SubtreeSpan::Branch,
-            };
+            if self.first_live_leaf_in(&next_lo, &hi).is_some() {
+                return SubtreeSpan::Branch;
+            }
         }
-        }
-        let mut it = self.leaves.range(lo..=hi);
-        match (it.next(), it.next()) {
-            (None, _) => SubtreeSpan::Empty,
-            (Some((k, v)), None) => SubtreeSpan::Single(*k, *v),
-            _ => SubtreeSpan::Branch,
-        }
+        SubtreeSpan::Single(bucket, self.bucket_hash_at(&bucket))
     }
 
     /// Node hash at (depth, key) with the single-leaf chain derived on the fly.
@@ -1093,11 +1210,9 @@ impl StateMerkleTree {
     /// is either a branch or the top of a chain, and in both cases its ancestors must
     /// keep being stored.
     fn node_resolve(&mut self, depth: usize, key: &[u8; HASH_SIZE]) -> ([u8; HASH_SIZE], bool) {
-        if depth == 0 {
-            return match self.leaf_get(key) {
-                Some(v) => (v, false),
-                None => (self.default_hashes[0], false),
-            };
+        if depth <= BUCKET_DEPTH {
+            // The bucket layer is derived straight from leaves, never stored as nodes.
+            return (self.bucket_hash_at(&Self::bucket_of(key)), false);
         }
         if let Some(v) = self.node_get(depth as u32, key) {
             return (v, true);
@@ -1155,8 +1270,25 @@ impl StateMerkleTree {
         if level.is_empty() {
             return self.default_hashes[depth];
         }
+        // Fold leaves into bucket mini-merkle roots, then climb the tree levels.
+        let mut folded: BTreeMap<[u8; HASH_SIZE], [u8; HASH_SIZE]> = BTreeMap::new();
+        {
+            let mut it = level.into_iter().peekable();
+            while let Some((k, v)) = it.next() {
+                let bucket = Self::bucket_of(&k);
+                let (_, bucket_hi) = Self::subtree_bounds(BUCKET_DEPTH, &bucket);
+                let mut tagged = vec![Self::bucket_leaf(&k, &v)];
+                while let Some((nk, _)) = it.peek() {
+                    if *nk > bucket_hi { break; }
+                    let (nk, nv) = it.next().unwrap();
+                    tagged.push(Self::bucket_leaf(&nk, &nv));
+                }
+                folded.insert(bucket, Self::bucket_fold(tagged));
+            }
+        }
+        let mut level = folded;
         let mut buffer = [0u8; HASH_SIZE * 2];
-        for d in 0..depth {
+        for d in BUCKET_DEPTH..depth {
             let default = self.default_hashes[d];
             let mut next: BTreeMap<[u8; HASH_SIZE], [u8; HASH_SIZE]> = BTreeMap::new();
             for (k, v) in level.iter() {
@@ -1241,12 +1373,26 @@ impl StateMerkleTree {
         self.clear_nodes();
         let mut buffer = [0u8; HASH_SIZE * 2];
 
-        // Value carries `is_branch` (≥2 leaves under it) alongside the hash: it is
-        // what decides whether a node has to be persisted at all.
-        let mut level: BTreeMap<[u8; HASH_SIZE], ([u8; HASH_SIZE], bool)> =
-            current_level.into_iter().map(|(k, v)| (k, (v, false))).collect();
+        // Fold the sorted leaf set into bucket mini-merkle roots; the level walk
+        // starts at the bucket layer. Value carries `is_branch` (≥2 buckets under
+        // it) alongside the hash: it decides whether a node has to be persisted.
+        let mut level: BTreeMap<[u8; HASH_SIZE], ([u8; HASH_SIZE], bool)> = BTreeMap::new();
+        {
+            let mut it = current_level.into_iter().peekable();
+            while let Some((k, v)) = it.next() {
+                let bucket = Self::bucket_of(&k);
+                let (_, bucket_hi) = Self::subtree_bounds(BUCKET_DEPTH, &bucket);
+                let mut tagged = vec![Self::bucket_leaf(&k, &v)];
+                while let Some((nk, _)) = it.peek() {
+                    if *nk > bucket_hi { break; }
+                    let (nk, nv) = it.next().unwrap();
+                    tagged.push(Self::bucket_leaf(&nk, &nv));
+                }
+                level.insert(bucket, (Self::bucket_fold(tagged), false));
+            }
+        }
 
-        for depth in 0..TREE_DEPTH {
+        for depth in BUCKET_DEPTH..TREE_DEPTH {
             let default = self.default_hashes[depth];
             let mut next_level: BTreeMap<[u8; HASH_SIZE], ([u8; HASH_SIZE], bool)> = BTreeMap::new();
             let mut processed: std::collections::HashSet<[u8; HASH_SIZE]> = std::collections::HashSet::new();
@@ -1263,10 +1409,10 @@ impl StateMerkleTree {
                 let (sibling, sib_branch) = sib.unwrap_or((default, false));
 
                 // STORE RULE: persist a node only when it is a branch or has a live
-                // sibling. Everything skipped is the interior of a single-leaf chain,
-                // which `node_resolve` derives from the leaf. This is what turns
-                // ~(256-log2 N) stored nodes per leaf into ~3.
-                if depth >= 1 {
+                // sibling. Everything skipped is the interior of a single-bucket chain,
+                // which `node_resolve` derives from the leaves. Bucket-layer hashes
+                // (depth == BUCKET_DEPTH) are always derived, never stored.
+                if depth >= BUCKET_DEPTH + 1 {
                     if sib.is_some() {
                         self.node_put(depth as u32, *key, *value);
                         self.node_put(depth as u32, sibling_key, sibling);
@@ -1328,16 +1474,19 @@ impl StateMerkleTree {
     /// the sibling on every level is provably empty, so the ascent reads nothing
     /// there — without this the compressed fold would probe once per level.
     /// Monotone in depth (subtrees only grow), so a binary search is exact.
+    /// First depth (>= BUCKET_DEPTH+1) whose subtree holds a FOREIGN bucket. A key's
+    /// own co-bucket members are inside its seed hash, so they are never foreign.
     fn first_foreign_depth(&self, key: &[u8; HASH_SIZE]) -> usize {
+        let own = Self::bucket_of(key);
         let foreign = |span: SubtreeSpan| match span {
             SubtreeSpan::Empty => false,
-            SubtreeSpan::Single(k, _) => &k != key,
+            SubtreeSpan::Single(b, _) => b != own,
             SubtreeSpan::Branch => true,
         };
         if !foreign(self.subtree_probe(TREE_DEPTH, key)) {
             return TREE_DEPTH + 1; // alone in the whole tree
         }
-        let (mut lo, mut hi) = (0usize, TREE_DEPTH);
+        let (mut lo, mut hi) = (BUCKET_DEPTH, TREE_DEPTH);
         while lo < hi {
             let mid = (lo + hi) / 2;
             if foreign(self.subtree_probe(mid, key)) { hi = mid; } else { lo = mid + 1; }
@@ -1346,14 +1495,15 @@ impl StateMerkleTree {
     }
 
     fn recompute_levels(&mut self) {
-        // Frontier value: (hash, is_branch, first_foreign_depth).
-        let mut dirty: Vec<[u8; HASH_SIZE]> = self.dirty_paths.drain().collect();
-        dirty.sort_unstable();
-        let mut inits: Vec<([u8; HASH_SIZE], [u8; HASH_SIZE], usize)> = Vec::with_capacity(dirty.len());
-        for k in dirty {
-            let h = self.leaf_get(&k).unwrap_or(self.default_hashes[0]);
-            let ffd = self.first_foreign_depth(&k);
-            inits.push((k, h, ffd));
+        // Fold dirty leaves into their (deduped) buckets; the tree walk starts at the
+        // bucket layer. Frontier value: (hash, is_branch, first_foreign_depth).
+        let dirty_buckets: BTreeSet<[u8; HASH_SIZE]> =
+            self.dirty_paths.drain().map(|k| Self::bucket_of(&k)).collect();
+        let mut inits: Vec<([u8; HASH_SIZE], [u8; HASH_SIZE], usize)> = Vec::with_capacity(dirty_buckets.len());
+        for b in dirty_buckets {
+            let h = self.bucket_hash_at(&b);
+            let ffd = self.first_foreign_depth(&b);
+            inits.push((b, h, ffd));
         }
 
         // LONE CLIMB: below ffd-1 a leaf provably has no neighbour, so its whole
@@ -1364,13 +1514,13 @@ impl StateMerkleTree {
         // This cuts map traffic from O(k x depth) to O(k x meet-levels).
         let defaults = self.default_hashes.clone();
         let climb = |&(key, val, ffd): &([u8; HASH_SIZE], [u8; HASH_SIZE], usize)| {
-            let act = ffd.saturating_sub(1).min(TREE_DEPTH);
+            let act = ffd.saturating_sub(1).clamp(BUCKET_DEPTH, TREE_DEPTH);
             let mut cur = key;
             let mut v = val;
-            let mut dels: Vec<(u32, [u8; HASH_SIZE])> = Vec::with_capacity(act.saturating_sub(1) * 2);
+            let mut dels: Vec<(u32, [u8; HASH_SIZE])> = Vec::with_capacity(act.saturating_sub(BUCKET_DEPTH) * 2);
             let mut buffer = [0u8; HASH_SIZE * 2];
-            for d in 0..act {
-                if d >= 1 {
+            for d in BUCKET_DEPTH..act {
+                if d >= BUCKET_DEPTH + 1 {
                     let mut sib = cur;
                     Self::flip_bit(&mut sib, d);
                     dels.push((d as u32, cur));
@@ -1411,7 +1561,7 @@ impl StateMerkleTree {
         // keys). This whole recompute was 99% of block-apply cost.
         let mut frontier: std::collections::HashMap<[u8; HASH_SIZE], ([u8; HASH_SIZE], bool, usize)> =
             std::collections::HashMap::new();
-        for depth in 0..TREE_DEPTH {
+        for depth in BUCKET_DEPTH..TREE_DEPTH {
             for (k, v) in buckets[depth].drain(..) { frontier.insert(k, v); }
             if frontier.is_empty() { continue; }
             let default = self.default_hashes[depth];
@@ -1455,7 +1605,8 @@ impl StateMerkleTree {
                 // it is a branch or has a live sibling. Chain interiors are derived.
                 // "Not stored" MUST mean deleted, never skipped: with no wipe, a skip
                 // leaves a stale pre-deletion row that a later finalize folds back in.
-                if depth >= 1 {
+                // Bucket-layer hashes (depth == BUCKET_DEPTH) derive from leaves.
+                if depth >= BUCKET_DEPTH + 1 {
                     if value_live && (branch || sibling_live) {
                         self.node_put(depth as u32, key, value);
                     } else {
@@ -5199,7 +5350,7 @@ mod proof_tests {
         let root = tree.finalize();
 
         let proof = tree.generate_proof("alice");
-        assert_eq!(proof.len(), TREE_DEPTH, "proof length must equal TREE_DEPTH");
+        assert_eq!(proof.len(), PROOF_DEPTH, "single-entry bucket proof is exactly the tree walk");
         assert!(
             StateMerkleTree::verify_proof("alice", &alice, &proof, &root),
             "single-account proof must verify against real state_root"
@@ -5396,7 +5547,7 @@ mod tests_smt_node_growth {
         // Not a print-only emitter: with the assert on this side a leaf-preimage or bit-order change
         // breaks `cargo test` in the commit that makes it, instead of leaving the device to fail
         // every balance proof against a fixture nobody regenerated.
-        assert_eq!(hex::encode(root), "131d98ccffa9d5d3eb4a30001698c8020ec82a62594776fd8f911e22c8b24e12",
+        assert_eq!(hex::encode(root), "a47ca2f297d81d7627b8000645afd26470b2ab5edba78e8744327c8f1b86058c",
                    "account leaf preimage or SMT bit order changed — regenerate the mobile fixture");
         let items: Vec<String> = proof
             .iter()

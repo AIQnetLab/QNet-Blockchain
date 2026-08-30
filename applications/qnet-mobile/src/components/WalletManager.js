@@ -3821,9 +3821,10 @@ export class WalletManager {
       // The proof's own state_root MUST equal the root we independently trust (QC-verified).
       if (expectedStateRoot && state_root !== expectedStateRoot) return false;
 
-      // Both levels are canonical 256-deep SMT proofs; fold each with the ONE shared primitive.
-      if (!Array.isArray(storage_proof) || storage_proof.length !== 256) return false;
-      if (!Array.isArray(account_proof) || account_proof.length !== 256) return false;
+      // Bucketed SMT proofs: 40 tree steps + optional in-bucket steps; smtFold
+      // enforces the exact bounds and flag rules.
+      if (!Array.isArray(storage_proof) || storage_proof.length < 40) return false;
+      if (!Array.isArray(account_proof) || account_proof.length < 40) return false;
 
       // ── Level-2: balance:{holder} ∈ storage_root ──
       const storageKey = 'balance:' + holder;
