@@ -545,6 +545,9 @@ impl SimplifiedP2P {
     /// - 3 total sends (1 producer + 2 backup) vs 4 random
     /// - Enables 30-40K TPS instead of 15-20K TPS
     pub fn broadcast_transaction(&self, tx_data: Vec<u8>) -> Result<(), String> {
+        // Origin marks its own tx as seen: the gossip echo dies at the anti-storm
+        // gate instead of re-entering the pipeline (51k singles → 49k re-validations).
+        self.seen_tx_hashes.insert(format!("{:x}", sha3::Sha3_256::digest(&tx_data)));
         let tx_msg = NetworkMessage::Transaction {
             data: tx_data,
         };
@@ -594,6 +597,10 @@ impl SimplifiedP2P {
             return Ok(());
         }
         
+        // Origin-side seen marking — same echo suppression as the single-tx path.
+        for tx in &transactions {
+            self.seen_tx_hashes.insert(format!("{:x}", sha3::Sha3_256::digest(tx)));
+        }
         let batch_msg = NetworkMessage::TransactionBatch {
             transactions,
             timestamp: std::time::SystemTime::now()

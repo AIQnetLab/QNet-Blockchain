@@ -3,6 +3,232 @@
 use super::*;
 
 impl BlockchainNode {
+    /// Fork-recovery consumer — its own task, for the same reason as the pacemaker:
+    /// it used to live in the production loop, and during the h=601 wedge an armed
+    /// recovery target waited minutes for a parked loop to consume it. Rollback is
+    /// never cancelled mid-flight (no timeout wrapper); the finality guard and the
+    /// rollback barrier already make it safe against concurrent apply.
+    pub(super) async fn run_fork_recovery_consumer(
+        state: std::sync::Arc<tokio::sync::RwLock<qnet_state::State>>,
+        height: std::sync::Arc<tokio::sync::RwLock<u64>>,
+        storage: std::sync::Arc<crate::storage::Storage>,
+        unified_p2p: Option<std::sync::Arc<crate::unified_p2p::SimplifiedP2P>>,
+    ) {
+        let mut ticker = tokio::time::interval(tokio::time::Duration::from_secs(1));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+                // ═══════════════════════════════════════════════════════════════════
+                // v13.2: PIPELINE FORK RECOVERY (OUTSIDE is_synced_enough gate)
+                // ═══════════════════════════════════════════════════════════════════
+                // Forked nodes are >20 blocks behind best peer → is_synced_enough=false.
+                // If recovery is gated behind is_synced_enough, fork is PERMANENT.
+                // Must run unconditionally so any node can recover from pipeline-detected fork.
+                // ═══════════════════════════════════════════════════════════════════
+                if let Some(fork_h) = crate::block_pipeline::take_fork_recovery_signal() {
+                    let local_h = *height.read().await;
+                    // v33: FORK_RECOVERY_HEIGHT is the deterministic highest-good height —
+                    // disputed_height-1 (n−f minority-fork observer) or finalized_h+1 (anchor
+                    // recovery), both agreed across nodes. Roll back TO it: keep ≤ fork_h,
+                    // delete fork_h+1..=local_h. The prior `min(fork_h, local_h)-1` folded in
+                    // the LOCAL tip, so nodes at different heights rolled to DIFFERENT targets
+                    // → baseline (LAST_FINALIZED_ROUND_PER_MB) diverged → producer election
+                    // diverged → competing forks (the rollback storm); it also over-deleted one
+                    // good block (the extra -1). A node behind the fork (local_h ≤ fork_h)
+                    // deletes nothing here (guard below) — it pulls the canonical chain via sync.
+                    // Never roll the contiguous frontier below the adopted snapshot/finality
+                    // floor: the anchor is n−f-QC-final and the snapshot holds sub-anchor state,
+                    // so a target below it is not a real reorg point. Clamping up means a target
+                    // ≥ local_h makes the destructive delete below no-op (rollback_to < local_h
+                    // guard) and the node re-syncs cleanly instead of stranding chain_height under
+                    // a higher monotonic anchor (the wedge). Complements the LAST_FINALIZED guard
+                    // inside begin_finality_guarded_rollback.
+                    let anchor_floor = SNAPSHOT_ANCHOR_MB
+                        .load(std::sync::atomic::Ordering::Acquire).saturating_mul(90);
+                    let rollback_to = fork_h.max(anchor_floor);
+                    println!("[WARN][FORK] pipeline_detected fork_h={} local_h={} rollback_to={} anchor_floor={}",
+                             fork_h, local_h, rollback_to, anchor_floor);
+
+                    if unified_p2p.is_some() {
+                        // 1. Rollback local chain to before fork point
+                        if rollback_to > 0 && rollback_to < local_h {
+                            // v14.8: Atomic claim + finality check.
+                            let finalized_h = LAST_FINALIZED_HEIGHT.load(std::sync::atomic::Ordering::SeqCst);
+                            if let Err(reason) = crate::storage::begin_finality_guarded_rollback(rollback_to, finalized_h) {
+                                println!("[WARN][FORK] rollback_skipped reason={}", reason);
+                            } else {
+                                // Delete ALL blocks from rollback_to+1 to local_h
+                                // (includes our forked tip block)
+                                let delete_from = rollback_to + 1;
+                                for h in delete_from..=local_h {
+                                    // Long loops must tick the watchdog, not just the phases.
+                                    if h % 256 == 0 { crate::storage::note_rollback_progress(); }
+                                    if let Err(e) = storage.delete_microblock(h) {
+                                        if is_warn() {
+                                            println!("[WARN][FORK] delete_fail h={} err={}", h, e);
+                                        }
+                                    }
+                                }
+
+                                // v10.2: DISK FIRST, RAM SECOND (crash-safe order)
+                                if let Err(e) = storage.set_chain_height(rollback_to) {
+                                    eprintln!("[ERR][FORK] set_chain_height_fail h={} err={}", rollback_to, e);
+                                }
+                                *height.write().await = rollback_to;
+                                LAST_BLOCK_PRODUCED_HEIGHT.store(rollback_to, Ordering::Relaxed);
+                                crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(
+                                    rollback_to, std::sync::atomic::Ordering::Release
+                                );
+
+                                // cbw is validation-critical: rebuild it from node_registry bounded by the
+                                // rollback target so orphaned-block bindings (reg_height > rollback_to) drop
+                                // out, BEFORE the rollback barrier is released. No per-block delete ⇒ no
+                                // absence window; the canonical binding (reg_height ≤ target) survives.
+                                crate::storage::note_rollback_progress();
+                                if let Err(e) = storage.rebuild_committed_burn_wallet(rollback_to) {
+                                    if is_warn() { println!("[WARN][FORK] cbw_rebuild_fail to={} err={}", rollback_to, e); }
+                                }
+                                // registry_root LtHash recompute + orphan prune (reg_height >
+                                // target) + seal cleanup at the rollback target in ONE scan,
+                                // BEFORE the barrier is released — unbounded reward rosters match a
+                                // from-genesis node; canonical re-added by the live pipeline.
+                                crate::storage::note_rollback_progress();
+                                match storage.rebuild_registry_lthash(rollback_to) {
+                                    Ok(n) if n > 0 => { if is_info() { println!("[INFO][FORK] registry_lthash_rebuilt orphans_pruned={} to={}", n, rollback_to); } }
+                                    Err(e) => { if is_warn() { println!("[WARN][FORK] registry_lthash_rebuild_fail to={} err={}", rollback_to, e); } }
+                                    _ => {}
+                                }
+                                // dilithium_pk_root: subtract journaled orphan binds (height > target) —
+                                // exact inverse of the apply-time bind, inside the barrier (applies
+                                // quiesced ⇒ no concurrent bind). Symmetric with cbw/registry_lthash.
+                                crate::storage::note_rollback_progress();
+                                match storage.rollback_dpk_binds_above(rollback_to) {
+                                    Ok(n) if n > 0 => { if is_info() { println!("[INFO][FORK] dpk_binds_rolled_back n={} to={}", n, rollback_to); } }
+                                    Err(e) => { if is_warn() { println!("[WARN][FORK] dpk_rollback_fail to={} err={}", rollback_to, e); } }
+                                    _ => {}
+                                }
+
+                                // Consensus reward side-indices (super_elig_/light_bm_) are non-height-keyed,
+                                // so an orphan block that wrote a current/future-epoch entry above rollback_to
+                                // leaves a phantom the canonical re-apply overwrites per-key but never CLEARS →
+                                // divergent emission set → reward_root fork. Clear the orphan epochs here (inside
+                                // the barrier; per-index bounds in the fn doc); the live pipeline re-applies
+                                // canonical forward and re-derives the correct set. Reorg-path only.
+                                crate::storage::note_rollback_progress();
+                                match storage.reconcile_reward_indices_above_epoch(rollback_to) {
+                                    Ok(c) if c > 0 => { if is_info() { println!("[INFO][FORK] reward_indices_reconciled cleared={} to={}", c, rollback_to); } }
+                                    Err(e) => { if is_warn() { println!("[WARN][FORK] reward_indices_reconcile_fail to={} err={}", rollback_to, e); } }
+                                    _ => {}
+                                }
+
+                                // Owns-index (NON-consensus): orphaned blocks advanced the durable
+                                // watermark past rollback_to (incl. Clears for holdings the canonical
+                                // chain restores). Mark dirty INSIDE the barrier so a crash before the
+                                // heal loop forces a boot rebuild — else watermark>=tip skips it and the
+                                // reader under-reports those holdings forever. Cleared on heal success.
+                                storage.mark_owns_index_dirty();
+
+                                // Caches that answer AHEAD of storage must be purged while saves are
+                                // still barred. Releasing the barrier first leaves a window where the
+                                // verify worker resolves a deleted block's hash from RAM, admits its
+                                // orphan child, and storage cannot backstop it — the deleted parent is
+                                // absent, and absent parents are legitimately allowed.
+                                crate::storage::note_rollback_progress();
+                                storage.invalidate_recent_microblocks_above(rollback_to);
+
+                                crate::storage::end_rollback_protection();
+
+                                // Clear stale caches
+                                clear_expected_producer_cache_above(rollback_to);
+                                complete_rollback_cleanup(rollback_to);
+
+                                // STATE RECONCILIATION (pipeline fork recovery path). Rollback
+                                // deleted microblocks from RocksDB but the in-memory StateManager
+                                // (accounts DashMap + merkle) was mutated up to the forked tip, so
+                                // it MUST be rebuilt to the canonical rollback_to state — reconcile
+                                // restores the freshest snapshot ≤ target + replays (bounded). Only
+                                // if reconcile cannot PROVE the rebuilt state canonical do we fall
+                                // to a clean n−f-QC-bound fast-sync (genesis/pin-rooted, fail-closed)
+                                // and let the tail re-sync verify-then-apply.
+                                if let Err(e) = Self::reconcile_state_after_rollback(
+                                    &state,
+                                    &storage,
+                                    rollback_to,
+                                ).await {
+                                    // Reconcile couldn't PROVE the rebuilt state canonical. Don't run
+                                    // a second inline fetch here — the single sync coordinator owns
+                                    // catch-up: post-rollback the local tip drops below finality, so
+                                    // its snapshot fast-path restores wholesale state (and owns) on the
+                                    // nudge below. Mark owns dirty so a crash before that re-derives it.
+                                    storage.mark_owns_index_dirty();
+                                    println!(
+                                        "[WARN][STATE] reconcile_unproven target={} err={} action=coordinator_state_sync",
+                                        rollback_to, e,
+                                    );
+                                } else {
+                                    println!(
+                                        "[INFO][STATE] reconcile_after_pipeline_fork_ok target={}",
+                                        rollback_to,
+                                    );
+                                    // dilithium_pk_root already healed INSIDE the rollback barrier
+                                    // (rollback_dpk_binds_above) — no state-dependent rebuild here.
+                                    // Heal the NON-consensus wallet→token reverse index against the
+                                    // reconciled truth. Owns-deltas are a best-effort background write
+                                    // that is NOT rolled back, so an orphaned block's flushed Clear for a
+                                    // balance the reorg restores would leave the pair missing → the reader
+                                    // under-reports it (the tail resync only re-emits 0→nonzero, not the
+                                    // rollback baseline holdings). Re-derive from the authoritative
+                                    // in-memory contracts (the accounts CF is best-effort/stale here);
+                                    // stale entries left behind are balance-rechecked away by the reader.
+                                    // Sibling of cbw/registry_lthash rebuild. Rare path, O(live holders).
+                                    let owns_heal: Vec<(String, std::collections::HashMap<String, String>)> = {
+                                        let sg = state.read().await;
+                                        sg.accounts.iter()
+                                            .filter(|e| e.value().is_contract)
+                                            .map(|e| (e.key().clone(), e.value().contract_storage.clone()))
+                                            .collect()
+                                    };
+                                    let mut healed = 0usize;
+                                    let mut heal_ok = true;
+                                    for (contract, cs) in &owns_heal {
+                                        if storage.resync_owns_for_contract(contract, cs).is_ok() { healed += 1; }
+                                        else { heal_ok = false; }
+                                    }
+                                    // Full heal → re-stamp built+clean at the rolled-back tip (clears the
+                                    // dirty mark set above, watermark==tip → boot skips rebuild). Any Err
+                                    // leaves it dirty so the next boot rebuilds.
+                                    if heal_ok { let _ = storage.set_owns_index_built(rollback_to); }
+                                    if is_info() { println!("[INFO][FORK] owns_index_resynced contracts={} to={} clean={}", healed, rollback_to, heal_ok); }
+
+                                    // Rich-list index (display-only): balances changed by the
+                                    // rollback+replay, so rebuild UNCONDITIONALLY (ignore the boot
+                                    // marker). Sibling of the owns resync above.
+                                    let _ = Self::rebuild_richlist_index().await;
+                                }
+
+                                println!("[INFO][FORK] rollback_ok to={} deleted={} blocks",
+                                         rollback_to, local_h - rollback_to);
+
+                                // Adopt from the retained tree ONLY after blocks were really
+                                // removed. Running this when the rollback was refused or was a
+                                // no-op re-submits still-canonical blocks for the pipeline to
+                                // drop — wasted ingest during recovery, when it is scarcest.
+                                let adopted = adopt_retained_successor(&storage, rollback_to);
+                                if adopted > 0 {
+                                    println!("[INFO][FORK] rollback_done to={} action=adopt_retained blocks={}",
+                                             rollback_to, adopted);
+                                } else {
+                                    println!("[INFO][FORK] rollback_done to={} action=coordinator_sync", rollback_to);
+                                }
+                            }
+                        }
+
+                        crate::sync_manager::nudge_sync_check();
+                    }
+                }
+        }
+    }
+
     /// One pacemaker tick: the certificate-anchored failover emission block, verbatim
     /// from the production loop. Reads only atomics, globals and the Arc handles passed
     /// in; the receiver enforces signature, window committee, voter dedup and the TC
@@ -234,8 +460,13 @@ impl BlockchainNode {
         let rotation_throttled = rotation_base > 0
             && failover_height > rotation_base
                 + (BlockchainNode::MAX_DERIVED_ROSTER_WINDOWS as u64) * 90;
+        // Past the hard no-progress ceiling the mesh gate is void: a network-wide
+        // freeze starves peer validation, which muted the exact votes that end the
+        // freeze (h=601: two nodes silent for 9 min). Votes are receiver-gated, so
+        // unconditional emission after the ceiling is safe by construction.
+        let mesh_or_ceiling = meshed_esc || round_age > D2_PROGRESS_HARD_CEILING_SECS;
         if (local_delay > STALL_GRACE_SECS || leader_yielded)
-            && meshed_esc && boot_ok_esc && !rotation_throttled {
+            && mesh_or_ceiling && boot_ok_esc && !rotation_throttled {
             let now_u64 = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -499,6 +730,21 @@ impl BlockchainNode {
             let pm_node_type = self.node_type;
             tokio::spawn(async move {
                 Self::run_failover_pacemaker(pm_storage, pm_p2p, pm_node_id, pm_node_type).await;
+            });
+        }
+
+        // Fork-recovery consumer task (see run_fork_recovery_consumer). Once per process.
+        if FORK_CONSUMER_STARTED.compare_exchange(
+            0, 1,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        ).is_ok() {
+            let fc_state = self.state.clone();
+            let fc_height = self.height.clone();
+            let fc_storage = self.storage.clone();
+            let fc_p2p = self.unified_p2p.clone();
+            tokio::spawn(async move {
+                Self::run_fork_recovery_consumer(fc_state, fc_height, fc_storage, fc_p2p).await;
             });
         }
 
@@ -2333,214 +2579,8 @@ impl BlockchainNode {
                         // chronic-stall nudge) runs in its OWN task — run_failover_pacemaker.
                         // It lived here until the h=601 wedge: this loop parked in a long
                         // await for minutes and vote emission died with it.
-                        // ═══════════════════════════════════════════════════════════════════
-                        // v13.2: PIPELINE FORK RECOVERY (OUTSIDE is_synced_enough gate)
-                        // ═══════════════════════════════════════════════════════════════════
-                        // Forked nodes are >20 blocks behind best peer → is_synced_enough=false.
-                        // If recovery is gated behind is_synced_enough, fork is PERMANENT.
-                        // Must run unconditionally so any node can recover from pipeline-detected fork.
-                        // ═══════════════════════════════════════════════════════════════════
-                        if let Some(fork_h) = crate::block_pipeline::take_fork_recovery_signal() {
-                            let local_h = *height.read().await;
-                            // v33: FORK_RECOVERY_HEIGHT is the deterministic highest-good height —
-                            // disputed_height-1 (n−f minority-fork observer) or finalized_h+1 (anchor
-                            // recovery), both agreed across nodes. Roll back TO it: keep ≤ fork_h,
-                            // delete fork_h+1..=local_h. The prior `min(fork_h, local_h)-1` folded in
-                            // the LOCAL tip, so nodes at different heights rolled to DIFFERENT targets
-                            // → baseline (LAST_FINALIZED_ROUND_PER_MB) diverged → producer election
-                            // diverged → competing forks (the rollback storm); it also over-deleted one
-                            // good block (the extra -1). A node behind the fork (local_h ≤ fork_h)
-                            // deletes nothing here (guard below) — it pulls the canonical chain via sync.
-                            // Never roll the contiguous frontier below the adopted snapshot/finality
-                            // floor: the anchor is n−f-QC-final and the snapshot holds sub-anchor state,
-                            // so a target below it is not a real reorg point. Clamping up means a target
-                            // ≥ local_h makes the destructive delete below no-op (rollback_to < local_h
-                            // guard) and the node re-syncs cleanly instead of stranding chain_height under
-                            // a higher monotonic anchor (the wedge). Complements the LAST_FINALIZED guard
-                            // inside begin_finality_guarded_rollback.
-                            let anchor_floor = SNAPSHOT_ANCHOR_MB
-                                .load(std::sync::atomic::Ordering::Acquire).saturating_mul(90);
-                            let rollback_to = fork_h.max(anchor_floor);
-                            println!("[WARN][FORK] pipeline_detected fork_h={} local_h={} rollback_to={} anchor_floor={}",
-                                     fork_h, local_h, rollback_to, anchor_floor);
-
-                            if unified_p2p.is_some() {
-                                // 1. Rollback local chain to before fork point
-                                if rollback_to > 0 && rollback_to < local_h {
-                                    // v14.8: Atomic claim + finality check.
-                                    let finalized_h = LAST_FINALIZED_HEIGHT.load(std::sync::atomic::Ordering::SeqCst);
-                                    if let Err(reason) = crate::storage::begin_finality_guarded_rollback(rollback_to, finalized_h) {
-                                        println!("[WARN][FORK] rollback_skipped reason={}", reason);
-                                    } else {
-                                        // Delete ALL blocks from rollback_to+1 to local_h
-                                        // (includes our forked tip block)
-                                        let delete_from = rollback_to + 1;
-                                        for h in delete_from..=local_h {
-                                            // Long loops must tick the watchdog, not just the phases.
-                                            if h % 256 == 0 { crate::storage::note_rollback_progress(); }
-                                            if let Err(e) = storage.delete_microblock(h) {
-                                                if is_warn() {
-                                                    println!("[WARN][FORK] delete_fail h={} err={}", h, e);
-                                                }
-                                            }
-                                        }
-
-                                        // v10.2: DISK FIRST, RAM SECOND (crash-safe order)
-                                        if let Err(e) = storage.set_chain_height(rollback_to) {
-                                            eprintln!("[ERR][FORK] set_chain_height_fail h={} err={}", rollback_to, e);
-                                        }
-                                        *height.write().await = rollback_to;
-                                        LAST_BLOCK_PRODUCED_HEIGHT.store(rollback_to, Ordering::Relaxed);
-                                        crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(
-                                            rollback_to, std::sync::atomic::Ordering::Release
-                                        );
-
-                                        // cbw is validation-critical: rebuild it from node_registry bounded by the
-                                        // rollback target so orphaned-block bindings (reg_height > rollback_to) drop
-                                        // out, BEFORE the rollback barrier is released. No per-block delete ⇒ no
-                                        // absence window; the canonical binding (reg_height ≤ target) survives.
-                                        crate::storage::note_rollback_progress();
-                                        if let Err(e) = storage.rebuild_committed_burn_wallet(rollback_to) {
-                                            if is_warn() { println!("[WARN][FORK] cbw_rebuild_fail to={} err={}", rollback_to, e); }
-                                        }
-                                        // registry_root LtHash recompute + orphan prune (reg_height >
-                                        // target) + seal cleanup at the rollback target in ONE scan,
-                                        // BEFORE the barrier is released — unbounded reward rosters match a
-                                        // from-genesis node; canonical re-added by the live pipeline.
-                                        crate::storage::note_rollback_progress();
-                                        match storage.rebuild_registry_lthash(rollback_to) {
-                                            Ok(n) if n > 0 => { if is_info() { println!("[INFO][FORK] registry_lthash_rebuilt orphans_pruned={} to={}", n, rollback_to); } }
-                                            Err(e) => { if is_warn() { println!("[WARN][FORK] registry_lthash_rebuild_fail to={} err={}", rollback_to, e); } }
-                                            _ => {}
-                                        }
-                                        // dilithium_pk_root: subtract journaled orphan binds (height > target) —
-                                        // exact inverse of the apply-time bind, inside the barrier (applies
-                                        // quiesced ⇒ no concurrent bind). Symmetric with cbw/registry_lthash.
-                                        crate::storage::note_rollback_progress();
-                                        match storage.rollback_dpk_binds_above(rollback_to) {
-                                            Ok(n) if n > 0 => { if is_info() { println!("[INFO][FORK] dpk_binds_rolled_back n={} to={}", n, rollback_to); } }
-                                            Err(e) => { if is_warn() { println!("[WARN][FORK] dpk_rollback_fail to={} err={}", rollback_to, e); } }
-                                            _ => {}
-                                        }
-
-                                        // Consensus reward side-indices (super_elig_/light_bm_) are non-height-keyed,
-                                        // so an orphan block that wrote a current/future-epoch entry above rollback_to
-                                        // leaves a phantom the canonical re-apply overwrites per-key but never CLEARS →
-                                        // divergent emission set → reward_root fork. Clear the orphan epochs here (inside
-                                        // the barrier; per-index bounds in the fn doc); the live pipeline re-applies
-                                        // canonical forward and re-derives the correct set. Reorg-path only.
-                                        crate::storage::note_rollback_progress();
-                                        match storage.reconcile_reward_indices_above_epoch(rollback_to) {
-                                            Ok(c) if c > 0 => { if is_info() { println!("[INFO][FORK] reward_indices_reconciled cleared={} to={}", c, rollback_to); } }
-                                            Err(e) => { if is_warn() { println!("[WARN][FORK] reward_indices_reconcile_fail to={} err={}", rollback_to, e); } }
-                                            _ => {}
-                                        }
-
-                                        // Owns-index (NON-consensus): orphaned blocks advanced the durable
-                                        // watermark past rollback_to (incl. Clears for holdings the canonical
-                                        // chain restores). Mark dirty INSIDE the barrier so a crash before the
-                                        // heal loop forces a boot rebuild — else watermark>=tip skips it and the
-                                        // reader under-reports those holdings forever. Cleared on heal success.
-                                        storage.mark_owns_index_dirty();
-
-                                        // Caches that answer AHEAD of storage must be purged while saves are
-                                        // still barred. Releasing the barrier first leaves a window where the
-                                        // verify worker resolves a deleted block's hash from RAM, admits its
-                                        // orphan child, and storage cannot backstop it — the deleted parent is
-                                        // absent, and absent parents are legitimately allowed.
-                                        crate::storage::note_rollback_progress();
-                                        storage.invalidate_recent_microblocks_above(rollback_to);
-
-                                        crate::storage::end_rollback_protection();
-
-                                        // Clear stale caches
-                                        clear_expected_producer_cache_above(rollback_to);
-                                        complete_rollback_cleanup(rollback_to);
-
-                                        // STATE RECONCILIATION (pipeline fork recovery path). Rollback
-                                        // deleted microblocks from RocksDB but the in-memory StateManager
-                                        // (accounts DashMap + merkle) was mutated up to the forked tip, so
-                                        // it MUST be rebuilt to the canonical rollback_to state — reconcile
-                                        // restores the freshest snapshot ≤ target + replays (bounded). Only
-                                        // if reconcile cannot PROVE the rebuilt state canonical do we fall
-                                        // to a clean n−f-QC-bound fast-sync (genesis/pin-rooted, fail-closed)
-                                        // and let the tail re-sync verify-then-apply.
-                                        if let Err(e) = Self::reconcile_state_after_rollback(
-                                            &state,
-                                            &storage,
-                                            rollback_to,
-                                        ).await {
-                                            // Reconcile couldn't PROVE the rebuilt state canonical. Don't run
-                                            // a second inline fetch here — the single sync coordinator owns
-                                            // catch-up: post-rollback the local tip drops below finality, so
-                                            // its snapshot fast-path restores wholesale state (and owns) on the
-                                            // nudge below. Mark owns dirty so a crash before that re-derives it.
-                                            storage.mark_owns_index_dirty();
-                                            println!(
-                                                "[WARN][STATE] reconcile_unproven target={} err={} action=coordinator_state_sync",
-                                                rollback_to, e,
-                                            );
-                                        } else {
-                                            println!(
-                                                "[INFO][STATE] reconcile_after_pipeline_fork_ok target={}",
-                                                rollback_to,
-                                            );
-                                            // dilithium_pk_root already healed INSIDE the rollback barrier
-                                            // (rollback_dpk_binds_above) — no state-dependent rebuild here.
-                                            // Heal the NON-consensus wallet→token reverse index against the
-                                            // reconciled truth. Owns-deltas are a best-effort background write
-                                            // that is NOT rolled back, so an orphaned block's flushed Clear for a
-                                            // balance the reorg restores would leave the pair missing → the reader
-                                            // under-reports it (the tail resync only re-emits 0→nonzero, not the
-                                            // rollback baseline holdings). Re-derive from the authoritative
-                                            // in-memory contracts (the accounts CF is best-effort/stale here);
-                                            // stale entries left behind are balance-rechecked away by the reader.
-                                            // Sibling of cbw/registry_lthash rebuild. Rare path, O(live holders).
-                                            let owns_heal: Vec<(String, std::collections::HashMap<String, String>)> = {
-                                                let sg = state.read().await;
-                                                sg.accounts.iter()
-                                                    .filter(|e| e.value().is_contract)
-                                                    .map(|e| (e.key().clone(), e.value().contract_storage.clone()))
-                                                    .collect()
-                                            };
-                                            let mut healed = 0usize;
-                                            let mut heal_ok = true;
-                                            for (contract, cs) in &owns_heal {
-                                                if storage.resync_owns_for_contract(contract, cs).is_ok() { healed += 1; }
-                                                else { heal_ok = false; }
-                                            }
-                                            // Full heal → re-stamp built+clean at the rolled-back tip (clears the
-                                            // dirty mark set above, watermark==tip → boot skips rebuild). Any Err
-                                            // leaves it dirty so the next boot rebuilds.
-                                            if heal_ok { let _ = storage.set_owns_index_built(rollback_to); }
-                                            if is_info() { println!("[INFO][FORK] owns_index_resynced contracts={} to={} clean={}", healed, rollback_to, heal_ok); }
-
-                                            // Rich-list index (display-only): balances changed by the
-                                            // rollback+replay, so rebuild UNCONDITIONALLY (ignore the boot
-                                            // marker). Sibling of the owns resync above.
-                                            let _ = Self::rebuild_richlist_index().await;
-                                        }
-
-                                        println!("[INFO][FORK] rollback_ok to={} deleted={} blocks",
-                                                 rollback_to, local_h - rollback_to);
-
-                                        // Adopt from the retained tree ONLY after blocks were really
-                                        // removed. Running this when the rollback was refused or was a
-                                        // no-op re-submits still-canonical blocks for the pipeline to
-                                        // drop — wasted ingest during recovery, when it is scarcest.
-                                        let adopted = adopt_retained_successor(&storage, rollback_to);
-                                        if adopted > 0 {
-                                            println!("[INFO][FORK] rollback_done to={} action=adopt_retained blocks={}",
-                                                     rollback_to, adopted);
-                                        } else {
-                                            println!("[INFO][FORK] rollback_done to={} action=coordinator_sync", rollback_to);
-                                        }
-                                    }
-                                }
-
-                                crate::sync_manager::nudge_sync_check();
-                            }
-                        }
+                        // Fork recovery is consumed by run_fork_recovery_consumer (own
+                        // task) — an armed target must never wait on this loop's awaits.
 
                         // ═══════════════════════════════════════════════════════════════════
                         // PRODUCTION v2.44: AGGRESSIVE CATCH-UP (15s/5 blocks)
@@ -5566,20 +5606,10 @@ impl BlockchainNode {
                         let _ = block_event_tx_for_spawn.send(height_for_storage);
                         
                         
-                        // Spawn async task for rotation tracking (logging only)
-                        tokio::spawn(async move {
-                            if let Some((rotation_producer, blocks_created)) = 
-                                rotation_tracker_clone.check_rotation_complete(height_for_storage).await {
-                                
-                                if blocks_created == ROTATION_INTERVAL_BLOCKS as u32 {
-                                    println!("[INFO][MB] rotation_complete producer={} blocks={}/30",
-                                            rotation_producer, blocks_created);
-                                } else {
-                                    println!("[WARN][MB] rotation_partial producer={} blocks={}/30",
-                                            rotation_producer, blocks_created);
-                                }
-                            }
-                        });
+                        // Rotation accounting lives at the single track→check site below;
+                        // a second async check raced it at every boundary (removed the
+                        // round before the closing block's track → phantom 29/30 + 1/30).
+                        let _ = &rotation_tracker_clone;
                     } else {
                         // Fail-closed. This block was applied INLINE and the producer path has no
                         // snapshot, so the mutations (transactions, mint, fee credit) are already in
@@ -5773,12 +5803,15 @@ impl BlockchainNode {
                     if let Some((rotation_producer, blocks_created)) = 
                         rotation_tracker.check_rotation_complete(microblock.height).await {
                         
+                        // Label = the round that just CLOSED ((h-1)/30), matching the
+                        // tracker's bins — h/30 stamped the next round's number on it.
+                        let closed_round = (microblock.height - 1) / ROTATION_INTERVAL_BLOCKS;
                         if blocks_created == ROTATION_INTERVAL_BLOCKS as u32 {
                             println!("[INFO][MB] rotation_complete producer={} rotation={} blocks={}/{}",
-                                    rotation_producer, microblock.height / ROTATION_INTERVAL_BLOCKS, blocks_created, ROTATION_INTERVAL_BLOCKS);
+                                    rotation_producer, closed_round, blocks_created, ROTATION_INTERVAL_BLOCKS);
                         } else {
                             println!("[WARN][MB] rotation_partial producer={} rotation={} blocks={}/{}",
-                                    rotation_producer, microblock.height / ROTATION_INTERVAL_BLOCKS, blocks_created, ROTATION_INTERVAL_BLOCKS);
+                                    rotation_producer, closed_round, blocks_created, ROTATION_INTERVAL_BLOCKS);
                         }
                     }
                     

@@ -263,7 +263,28 @@ pub(crate) fn fork_recovery_target() -> u64 {
 /// checks finality before rolling anything back, so this only nominates a target.
 pub(crate) fn livelock_recovery_target(hung_h: u64, is_livelock: bool, repeats: u32) -> Option<u64> {
     if !is_livelock || repeats < 2 || hung_h <= 1 { return None; }
-    Some(hung_h.saturating_sub(1))
+    // Deepen exponentially while the livelock persists: a one-block step found the
+    // h=601 divergence one level per consumed rollback (minutes each). Depth doubles
+    // per unresolved watchdog window; the consumer still clamps to the finality
+    // floor, so this can never cross certified history.
+    let depth = 1u64 << (repeats.saturating_sub(2)).min(6);
+    Some(hung_h.saturating_sub(depth).max(1))
+}
+
+#[cfg(test)]
+mod livelock_target_tests {
+    use super::livelock_recovery_target;
+
+    #[test]
+    fn deepens_exponentially_and_clamps() {
+        assert_eq!(livelock_recovery_target(602, false, 5), None);
+        assert_eq!(livelock_recovery_target(602, true, 1), None);
+        assert_eq!(livelock_recovery_target(602, true, 2), Some(601)); // depth 1
+        assert_eq!(livelock_recovery_target(602, true, 3), Some(600)); // depth 2
+        assert_eq!(livelock_recovery_target(602, true, 4), Some(598)); // depth 4
+        assert_eq!(livelock_recovery_target(602, true, 10), Some(538)); // depth capped at 64
+        assert_eq!(livelock_recovery_target(3, true, 10), Some(1)); // never below 1
+    }
 }
 
 pub(crate) fn signal_fork_recovery(target: u64) {
@@ -4816,9 +4837,11 @@ mod tests_rollback_cache_invalidation {
     /// The watchdog already measures the condition exactly; it must nominate a recovery target.
     #[test]
     fn verify_livelock_nominates_a_recovery_target() {
-        // Two windows of a re-entering stall at a real height ⇒ recover from the height below.
+        // Two windows of a re-entering stall at a real height ⇒ recover from the height below;
+        // a stall that survives more windows deepens the target exponentially (the h=601
+        // divergence sat one level below a one-block step for minutes per consumed rollback).
         assert_eq!(livelock_recovery_target(273, true, 2), Some(272));
-        assert_eq!(livelock_recovery_target(273, true, 9), Some(272));
+        assert_eq!(livelock_recovery_target(273, true, 9), Some(209));
 
         // One window is not yet evidence — a brief stall must not arm recovery.
         assert_eq!(livelock_recovery_target(273, true, 1), None);

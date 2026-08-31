@@ -1441,6 +1441,15 @@ impl SimpleMempool {
         self.expired_tx_hashes.contains_key(hash)
     }
 
+    /// O(1) "already have it" check for the network ingress: pending, recently
+    /// included, or tombstoned. Runs BEFORE any crypto so a gossip echo costs a
+    /// hash lookup, not an ML-DSA verify.
+    pub fn already_known(&self, hash: &str) -> bool {
+        self.transactions.contains_key(hash)
+            || self.included_tx_hashes.contains_key(hash)
+            || self.expired_tx_hashes.contains_key(hash)
+    }
+
     /// Boot-time rehydration admit: same as add_binary_transaction, but the tx keeps its
     /// ORIGINAL admission age. The plain path stamps a fresh RAM Instant AND re-fires the
     /// persist hook with ts=now, so every restart used to grant surviving entries a full
@@ -1525,6 +1534,9 @@ impl SimpleMempool {
 #[cfg(test)]
 mod hygiene_tests {
     use super::*;
+
+    pub(crate) fn test_pool_pub() -> SimpleMempool { test_pool() }
+    pub(crate) fn test_tx_pub(from: &str, nonce: u64) -> (Vec<u8>, String) { test_tx(from, nonce) }
     use std::sync::Mutex;
 
     fn test_pool() -> SimpleMempool {
@@ -1641,5 +1653,23 @@ mod hygiene_tests {
         assert_eq!(pool.get_pending_for_fill(1, usize::MAX).len(), 1);
         // A budget smaller than one payload still yields one entry (progress guarantee).
         assert_eq!(pool.get_pending_for_fill(10, 1).len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod ingress_gate_tests {
+    use super::*;
+
+    #[test]
+    fn already_known_covers_pending_included_and_expired() {
+        let pool = super::hygiene_tests::test_pool_pub();
+        let (b, h) = super::hygiene_tests::test_tx_pub("eon_sender_k", 1);
+        assert!(!pool.already_known(&h));
+
+        assert!(pool.add_binary_transaction(b.clone(), h.clone(), 10));
+        assert!(pool.already_known(&h), "pending must be known");
+
+        pool.batch_remove_transactions(&[h.clone()]);
+        assert!(pool.already_known(&h), "included tombstone must be known");
     }
 }

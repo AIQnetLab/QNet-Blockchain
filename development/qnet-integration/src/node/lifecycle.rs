@@ -2216,11 +2216,15 @@ impl BlockchainNode {
         // Processes transactions received from P2P network and adds to mempool
         let blockchain_for_transactions = blockchain.clone();
         tokio::spawn(async move {
-            // Track processed transactions to avoid duplicates (deduplication cache)
-            let mut processed_txs: std::collections::HashSet<String> = std::collections::HashSet::new();
-            let mut last_cleanup = std::time::Instant::now();
-            const MAX_CACHE_SIZE: usize = 200_000; // 200K transactions (v4.1: 2x)
-            const CLEANUP_INTERVAL_SECS: u64 = 300; // 5 minutes
+            // Generational seen-cache: two fixed sets, rotate whole generations O(1).
+            // A hash is recorded at FIRST TOUCH regardless of validation outcome, so
+            // a re-delivered echo never re-enters the pipeline (the old set recorded
+            // only successes and cloned half of itself to shrink).
+            const SEEN_GEN_CAP: usize = 200_000;
+            let mut seen_cur: std::collections::HashSet<String> =
+                std::collections::HashSet::with_capacity(SEEN_GEN_CAP);
+            let mut seen_prev: std::collections::HashSet<String> =
+                std::collections::HashSet::with_capacity(SEEN_GEN_CAP);
             
             // PRODUCTION v2.25.2: Batch accumulator for Ed25519 batch verification
             // Optimal: 1000 TX gives ~3x speedup from batch verify
@@ -2239,10 +2243,15 @@ impl BlockchainNode {
                 
                 match received {
                     Ok(Some(received_tx)) => {
-                // DEDUPLICATION: Skip already processed transactions
-                if processed_txs.contains(&received_tx.tx_hash) {
+                // Seen at first touch: insert-or-skip before any work.
+                if seen_cur.contains(&received_tx.tx_hash) || seen_prev.contains(&received_tx.tx_hash) {
                     continue;
                 }
+                if seen_cur.len() >= SEEN_GEN_CAP {
+                    std::mem::swap(&mut seen_cur, &mut seen_prev);
+                    seen_cur.clear();
+                }
+                seen_cur.insert(received_tx.tx_hash.clone());
                 
                         // PRODUCTION v2.25: Deserialize transaction (bincode first, JSON fallback)
                         let tx_result: Result<qnet_state::Transaction, String> = 
@@ -2288,37 +2297,23 @@ impl BlockchainNode {
                     for (received_tx, tx) in tx_batch.drain(..) {
                         // Full validation (nonce, balance, etc.) and add to mempool
                         match blockchain_for_transactions.validate_and_add_network_transaction(tx).await {
-                            Ok(_hash) => {
-                                processed_txs.insert(received_tx.tx_hash.clone());
-                                added += 1;
-                            }
+                            Ok(_hash) => { added += 1; }
                             Err(e) => {
                                 rejected_val += 1;
-                                if is_warn() {
-                                    println!("[WARN][TX-SYNC] validation_failed hash={} err={}", 
+                                // already_known is the echo fast-path, not a failure.
+                                if is_debug() || (is_warn() && !e.to_string().contains("already_known")) {
+                                    println!("[WARN][TX-SYNC] validation_failed hash={} err={}",
                                         &received_tx.tx_hash[..16], e);
                                 }
                             }
                         }
                     }
-                    
+
                     if added > 0 || rejected_val > 0 {
                         if is_info() { println!("[INFO][TX-SYNC] batch_added count={} rejected_val={}", added, rejected_val); }
                     }
-                    
+
                     last_batch_time = std::time::Instant::now();
-                }
-                
-                // MEMORY MANAGEMENT: Periodic cleanup of deduplication cache
-                if last_cleanup.elapsed().as_secs() > CLEANUP_INTERVAL_SECS || processed_txs.len() > MAX_CACHE_SIZE {
-                    if processed_txs.len() > MAX_CACHE_SIZE / 2 {
-                        let to_remove: Vec<_> = processed_txs.iter().take(processed_txs.len() / 2).cloned().collect();
-                        for key in to_remove {
-                            processed_txs.remove(&key);
-                        }
-                        if is_debug() { println!("[DBG][TX-SYNC] cache_cleanup remaining={}", processed_txs.len()); }
-                    }
-                    last_cleanup = std::time::Instant::now();
                 }
             }
         });

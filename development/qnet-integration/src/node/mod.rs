@@ -1455,6 +1455,19 @@ pub static PRODUCER_WATCHDOG_STARTED: AtomicU64 = AtomicU64::new(0);
 // Once-guard for the failover pacemaker task (run_failover_pacemaker).
 pub static PACEMAKER_STARTED: AtomicU64 = AtomicU64::new(0);
 
+/// OOM-backoff marker lives in the PERSISTENT data dir (the container volume) —
+/// a relative path resolved against WORKDIR does not survive a restart.
+pub fn oom_backoff_path() -> std::path::PathBuf {
+    std::env::var("QNET_DATA_DIR").map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            let docker = std::path::PathBuf::from("/app/data");
+            if docker.is_dir() { docker } else { std::path::PathBuf::from("data") }
+        })
+        .join("oom_backoff")
+}
+// Once-guard for the fork-recovery consumer task (run_fork_recovery_consumer).
+pub static FORK_CONSUMER_STARTED: AtomicU64 = AtomicU64::new(0);
+
 /// v16.1: Throttle for the network-broadcast heartbeat. The local
 /// `record_producer_heartbeat` runs at every production-loop iteration
 /// (sub-second), but the network broadcast must respect a 1s minimum
@@ -3894,6 +3907,25 @@ impl RotationTracker {
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod rotation_tracker_tests {
+    use super::RotationTracker;
+
+    #[tokio::test]
+    async fn boundary_block_bins_into_closing_round_and_checks_once() {
+        let t = RotationTracker::new();
+        for h in 31..=60 {
+            t.track_block(h, "p1").await;
+        }
+        // Heights 31-60 are one round; the closing block must complete it 30/30.
+        assert_eq!(t.check_rotation_complete(60).await, Some(("p1".to_string(), 30)));
+        // A second check at the same boundary must be a no-op (the old duplicate
+        // async check raced the closing block's track into 29/30 + 1/30 pairs).
+        assert_eq!(t.check_rotation_complete(60).await, None);
+        assert_eq!(t.check_rotation_complete(45).await, None);
     }
 }
 

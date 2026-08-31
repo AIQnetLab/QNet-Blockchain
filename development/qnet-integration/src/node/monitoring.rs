@@ -553,28 +553,24 @@ impl BlockchainNode {
                     .map(|bytes| bytes / 1024 / 1024); // Convert to MB
                 
                 if let Some(cgroup_mb) = cgroup_limit {
-                    // Docker container - use 85% of container limit
+                    // Container with an explicit limit — use 85% of it.
                     let limit = cgroup_mb * 85 / 100;
-                    println!("[INFO][MEMORY] mode=docker container_limit={}MB node_limit={}MB", 
+                    println!("[INFO][MEMORY] mode=docker container_limit={}MB node_limit={}MB",
                              cgroup_mb, limit);
                     limit
-                } else if let Some(available) = mem_available_mb {
-                    // Bare metal / VM - use 70% of AVAILABLE memory
-                    // This automatically accounts for other processes!
-                    let limit = available * 70 / 100;
-                    // Ensure minimum 2GB, maximum 80% of total
-                    let final_limit = limit.max(2_000).min(mem_total_mb * 80 / 100);
-                    println!("[INFO][MEMORY] mode=auto total={}MB available={}MB node_limit={}MB", 
-                             mem_total_mb, available, final_limit);
-                    final_limit
                 } else {
-                    // Can't determine available - use 60% of total (conservative)
-                    let limit = mem_total_mb * 60 / 100;
-                    println!("[INFO][MEMORY] mode=fallback total={}MB node_limit={}MB", 
+                    // DETERMINISTIC budget: fixed fraction of TOTAL RAM, identical on
+                    // every start of the same machine. The old 70%-of-AVAILABLE read
+                    // shrank after each restart (dead process + page cache still held
+                    // the host) — every reboot got a lower limit than the last, which
+                    // turned one OOM shutdown into a self-tightening restart storm.
+                    let limit = (mem_total_mb * 70 / 100).max(2_000);
+                    println!("[INFO][MEMORY] mode=auto total={}MB node_limit={}MB",
                              mem_total_mb, limit);
                     limit
                 }
             };
+            let _ = mem_available_mb; // informational only — never a budget input
             
             // Thresholds are FIXED percentages - no user input needed
             // These are well-tested values that work across all memory sizes
@@ -642,10 +638,22 @@ impl BlockchainNode {
                 
                 // Get static cache sizes
                 let producer_cache_size = producer_cache::CACHED_PRODUCER_SELECTION.len();
-                
+
+                // Per-holder breakdown: printed every tick AND with every CRIT so a
+                // memory incident is attributable from one log line.
+                let (mp_txs, mp_mb) = crate::node::GLOBAL_MEMPOOL_INSTANCE.get()
+                    .map(|m| (m.size(), m.total_bytes() / 1_048_576))
+                    .unwrap_or((0, 0));
+                let breakdown = format!(
+                    "mempool_txs={} mempool_mb={} tx_pool={} sync_q={} macro_q={} peers={} rate_limit={} producer_cache={}",
+                    mp_txs, mp_mb, tx_pool_stats.0,
+                    crate::unified_p2p::get_pending_sync_count(),
+                    crate::unified_p2p::get_pending_macroblock_count(),
+                    peers_count, rate_limiter_count, producer_cache_size);
+
                 // Log memory stats
-                println!("[INFO][MEMORY] node={} rss_mb={} virt_mb={} delta_mb={} tx_pool={} peers={} rate_limit={} producer_cache={}",
-                         node_id, rss_mb, virt_mb, delta_mb, tx_pool_stats.0, peers_count, rate_limiter_count, producer_cache_size);
+                println!("[INFO][MEMORY] node={} rss_mb={} virt_mb={} delta_mb={} {}",
+                         node_id, rss_mb, virt_mb, delta_mb, breakdown);
                 
                 // CRITICAL: Warn if memory growing too fast (>100MB in 5 minutes)
                 if delta_mb > 100 {
@@ -654,8 +662,8 @@ impl BlockchainNode {
                 
                 // v3.1: DYNAMIC - Warn if RSS > warn_mb (default 60% of system RAM)
                 if rss_mb > warn_mb {
-                    println!("[CRIT][MEMORY] node={} rss_mb={} warn_limit={} HIGH_MEMORY action=investigate", 
-                             node_id, rss_mb, warn_mb);
+                    println!("[CRIT][MEMORY] node={} rss_mb={} warn_limit={} HIGH_MEMORY {}",
+                             node_id, rss_mb, warn_mb, breakdown);
                 }
                 
                 // v3.1: DYNAMIC - Emergency if RSS > emergency_mb (default 75% of system RAM)
@@ -690,12 +698,26 @@ impl BlockchainNode {
                     }
                 }
                 
-                // v3.1: DYNAMIC - If RSS > fatal_mb (default 90% of RAM), graceful shutdown
-                // Better to restart cleanly than be killed by OOM
+                // Graceful shutdown only on a CONFIRMED breach: the emergency cleanup
+                // above just ran, so re-measure after 30s before killing the process —
+                // a transient spike (replay burst, drain in flight) must not restart
+                // the node. On confirmed exit, persist a backoff marker so boot can
+                // pace itself instead of storming.
                 if rss_mb > fatal_mb {
-                    println!("[CRIT][MEMORY] node={} rss_mb={} limit={} OOM_IMMINENT graceful_shutdown", 
-                             node_id, rss_mb, fatal_mb);
-                    
+                    println!("[CRIT][MEMORY] node={} rss_mb={} limit={} FATAL_BREACH recheck_in=30s {}",
+                             node_id, rss_mb, fatal_mb, breakdown);
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    let recheck_mb = std::fs::read_to_string("/proc/self/statm").ok()
+                        .and_then(|s| s.split_whitespace().nth(1).map(|p| p.parse::<u64>().unwrap_or(0)))
+                        .map(|pages| pages * 4096 / 1024 / 1024)
+                        .unwrap_or(rss_mb);
+                    if recheck_mb <= fatal_mb {
+                        println!("[WARN][MEMORY] fatal_breach_receded rss_mb={} limit={}", recheck_mb, fatal_mb);
+                        continue;
+                    }
+                    println!("[CRIT][MEMORY] node={} rss_mb={} limit={} OOM_IMMINENT graceful_shutdown",
+                             node_id, recheck_mb, fatal_mb);
+
                     // Final flush before exit
                     if let Err(e) = storage.flush_all() {
                         if crate::node::is_warn() {
@@ -703,10 +725,26 @@ impl BlockchainNode {
                         }
                     }
                     println!("[INFO][MEMORY] final_flush_complete");
-                    
+
+                    // Backoff marker: consecutive OOM exits within 10 min escalate the
+                    // boot delay (read in main before node start).
+                    let now_ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                    let marker = crate::node::oom_backoff_path();
+                    let prev_count = std::fs::read_to_string(&marker)
+                        .ok()
+                        .and_then(|s| {
+                            let mut it = s.split_whitespace();
+                            let ts: u64 = it.next()?.parse().ok()?;
+                            let n: u32 = it.next()?.parse().ok()?;
+                            (now_ts.saturating_sub(ts) < 600).then_some(n)
+                        })
+                        .unwrap_or(0);
+                    let _ = std::fs::write(&marker, format!("{} {}", now_ts, prev_count + 1));
+
                     // Give time for logs to be written
                     tokio::time::sleep(Duration::from_millis(100)).await;
-                    
+
                     // Exit with code 137 (OOM) so Docker knows to restart
                     std::process::exit(137);
                 }

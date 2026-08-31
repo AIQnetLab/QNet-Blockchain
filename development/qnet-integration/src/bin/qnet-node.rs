@@ -13,7 +13,7 @@
 #![allow(unused_mut)]
 
 //! QNet production node
-//! 
+//!
 //! PRODUCTION DEPLOYMENT: Docker Environment Variables Only
 //! - Genesis: QNET_BOOTSTRAP_ID + QNET_WALLET_SEED
 //! - Super:   QNET_ACTIVATION_CODE + QNET_BURN_TX_HASH + QNET_BURN_AMOUNT + QNET_WALLET_SEED
@@ -24,6 +24,16 @@
 //! - Production-grade batch processing
 //! - Smart synchronization and compression
 //! - Enterprise security and monitoring
+
+// jemalloc with background decay: freed pages actually return to the OS, so
+// post-load rss reflects live data instead of allocator retention.
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+#[cfg(not(target_env = "msvc"))]
+#[export_name = "malloc_conf"]
+pub static MALLOC_CONF: &[u8] = b"background_thread:true,dirty_decay_ms:10000,muzzy_decay_ms:10000\0";
 
 use qnet_integration::node::{BlockchainNode, NodeType, Region, is_info, is_warn, is_debug};
 use qnet_integration::quantum_crypto::{QNetQuantumCrypto, ActivationPayload};
@@ -2392,6 +2402,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the INFO default and the documented variable did nothing — at scale operators need to turn
     // per-node volume down without rebuilding.
     qnet_integration::node::init_logging();
+
+    // OOM restart backoff: consecutive memory shutdowns within 10 min pace the next
+    // boot exponentially (15s..120s) instead of storming. Marker written by the
+    // memory watchdog; a stale marker is dropped here.
+    let oom_marker = qnet_integration::node::oom_backoff_path();
+    if let Ok(s) = std::fs::read_to_string(&oom_marker) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        let mut it = s.split_whitespace();
+        match (it.next().and_then(|v| v.parse::<u64>().ok()),
+               it.next().and_then(|v| v.parse::<u32>().ok())) {
+            (Some(ts), Some(n)) if now.saturating_sub(ts) < 600 && n >= 1 => {
+                let delay = (15u64 << (n.min(4) - 1)).min(120);
+                eprintln!("[WARN][MEMORY] oom_backoff boot_delay={}s consecutive={}", delay, n);
+                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+            }
+            _ => { let _ = std::fs::remove_file(&oom_marker); }
+        }
+    }
 
     // Restart manifest sanity, before anything opens storage or touches the network. A malformed
     // manifest is a broken RELEASE, not a runtime condition — refuse to start rather than run a binary

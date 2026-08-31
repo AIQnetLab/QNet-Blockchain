@@ -207,8 +207,9 @@ impl SimplifiedP2P {
                 
                 // GOSSIP: Forward transaction to other peers (low fanout to avoid spam)
                 // OPTIMIZATION: Moved OUTSIDE lock to prevent holding mutex during network ops
+                // Never relay back to the peer it came from — echo suppression.
                 let gossip_msg = NetworkMessage::Transaction { data };
-                self.gossip_to_random_peers(gossip_msg, 2);
+                self.gossip_to_random_peers_excluding(gossip_msg, 2, from_peer);
             }
             
             // PRODUCTION v2.25: Transaction batch processing for high-throughput
@@ -278,16 +279,16 @@ impl SimplifiedP2P {
                 }
                 drop(tx_guard);
                 
-                // GOSSIP: Forward ONLY NEW transactions to 2 random peers
+                // GOSSIP: Forward ONLY NEW transactions, never back to the sender.
                 if !new_txs.is_empty() {
-                    let gossip_msg = NetworkMessage::TransactionBatch { 
-                        transactions: new_txs, 
+                    let gossip_msg = NetworkMessage::TransactionBatch {
+                        transactions: new_txs,
                         timestamp: std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs(),
                     };
-                    self.gossip_to_random_peers(gossip_msg, 2);
+                    self.gossip_to_random_peers_excluding(gossip_msg, 2, from_peer);
                 }
             }
             
@@ -598,13 +599,28 @@ impl SimplifiedP2P {
                     // sync peer selection (non-destructive). The canonical chain itself is
                     // chosen by round-based fork-choice + macroblock-anchored recovery, so
                     // observer rejections never trigger a rollback on their own.
-                    if crate::node::is_warn() {
-                        println!(
-                            "[WARN][REJECT] fork_source_flagged h={} source={} observers={}/{}",
-                            height, source_peer_id, count_after, two_f_plus_1
-                        );
+                    // Consensus outranks the heuristic: the producer the certified round
+                    // elects for this height is NEVER quarantined — during the h=601 reorg
+                    // the flag cut sync off from the only holder of the canonical branch.
+                    let certified_leader = crate::node::get_expected_producer(height)
+                        .map(|(p, _)| p == source_peer_id)
+                        .unwrap_or(false);
+                    if certified_leader {
+                        if crate::node::is_warn() {
+                            println!(
+                                "[WARN][REJECT] fork_flag_suppressed h={} source={} reason=certified_leader observers={}/{}",
+                                height, source_peer_id, count_after, two_f_plus_1
+                            );
+                        }
+                    } else {
+                        if crate::node::is_warn() {
+                            println!(
+                                "[WARN][REJECT] fork_source_flagged h={} source={} observers={}/{}",
+                                height, source_peer_id, count_after, two_f_plus_1
+                            );
+                        }
+                        crate::block_pipeline::mark_peer_as_fork_source(&source_peer_id);
                     }
-                    crate::block_pipeline::mark_peer_as_fork_source(&source_peer_id);
                 }
             }
 

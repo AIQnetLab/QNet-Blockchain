@@ -151,3 +151,8 @@ python = []
 [[bin]]
 name = "qnet-node"
 path = "src/bin/qnet-node.rs" 
+
+# Returns freed pages to the OS (decay) and exposes real allocator stats —
+# glibc arenas retained multi-GB rss after load spikes. Linux targets only.
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = "0.6"

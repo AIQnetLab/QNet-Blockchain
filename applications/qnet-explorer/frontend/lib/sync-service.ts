@@ -1087,9 +1087,16 @@ async function runBackfillScan(fromHeight: number, toHeight: number): Promise<vo
       }
     }
     
+    // Ranges the in-run retries could not fill go to the persistent gap ledger;
+    // the sweeper owns them until the blocks table has no holes. "3 attempts and
+    // forget" left 854 permanently missing blocks after one node restart storm.
+    if (failedBatchRanges.length > 0) {
+      await recordGaps(failedBatchRanges);
+    }
+
     const totalTime = ((Date.now() - startTime) / 1000).toFixed(1);
     console.log(`[Backfill] DONE: scanned ${scanned} in ${totalTime}s | ${txBlocksSaved} TX-blocks, ${totalTxSaved} TX saved`);
-    
+
   } finally {
     isBackfillRunning = false;
   }
@@ -1242,6 +1249,100 @@ async function ingestTokenTransfers(fromHeight: number, toHeight: number): Promi
 }
 
 // FAST BATCH: Save multiple blocks to DB in one batch
+// ═══════════════════════════════════════════════════════════════════
+// Gap ledger: completeness is an invariant (gaps table empty), not a
+// best-effort. Failed fetch ranges are recorded and swept until filled;
+// ranges halve on repeated failure down to single blocks, and a periodic
+// hole scan over the blocks table re-enqueues anything lost elsewhere.
+// ═══════════════════════════════════════════════════════════════════
+
+async function ensureGapTable(): Promise<void> {
+  await query(`CREATE TABLE IF NOT EXISTS sync_gaps (
+    start_h BIGINT PRIMARY KEY,
+    end_h BIGINT NOT NULL,
+    tries INT NOT NULL DEFAULT 0,
+    next_retry_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  )`);
+}
+
+async function recordGaps(ranges: { start: number; end: number }[]): Promise<void> {
+  try {
+    await ensureGapTable();
+    for (const r of ranges) {
+      await query(
+        `INSERT INTO sync_gaps (start_h, end_h) VALUES ($1, $2)
+         ON CONFLICT (start_h) DO UPDATE SET end_h = GREATEST(sync_gaps.end_h, EXCLUDED.end_h)`,
+        [r.start, r.end]
+      );
+    }
+    console.log(`[Gaps] recorded ${ranges.length} range(s)`);
+  } catch (err) {
+    console.error('[Gaps] record failed:', err);
+  }
+}
+
+let isSweepingGaps = false;
+
+async function sweepGaps(maxRanges: number = 4): Promise<void> {
+  if (isSweepingGaps) return;
+  isSweepingGaps = true;
+  try {
+    await ensureGapTable();
+
+    // Re-enqueue holes the blocks table itself shows (any loss path, any era).
+    const holes = await query<{ gap_start: string; gap_end: string }>(
+      `WITH g AS (SELECT height, lead(height) OVER (ORDER BY height) nxt FROM blocks)
+       SELECT height + 1 AS gap_start, nxt - 1 AS gap_end
+       FROM g WHERE nxt - height > 1 LIMIT 20`
+    );
+    if (holes.rows.length > 0) {
+      await recordGaps(holes.rows.map(r => ({ start: Number(r.gap_start), end: Number(r.gap_end) })));
+    }
+
+    const due = await query<{ start_h: string; end_h: string; tries: number }>(
+      `SELECT start_h, end_h, tries FROM sync_gaps WHERE next_retry_at <= now()
+       ORDER BY start_h LIMIT $1`, [maxRanges]
+    );
+    for (const row of due.rows) {
+      const start = Number(row.start_h);
+      const end = Number(row.end_h);
+      try {
+        const blocks = await fetchBlocksViaHttpRpc(start, end - start + 1);
+        if (blocks.length > 0) {
+          const all: { height: number; block: BlockData }[] = blocks.map((b, i) => ({
+            height: typeof (b as BlockData).height === 'number' ? (b as BlockData).height as number : start + i,
+            block: b as BlockData,
+          }));
+          await saveBlocksBatch(all);
+          await query('DELETE FROM sync_gaps WHERE start_h = $1', [start]);
+          console.log(`[Gaps] filled ${start}-${end} (${all.length} blocks)`);
+          continue;
+        }
+        throw new Error('empty response');
+      } catch (err) {
+        if (end > start) {
+          // Halve: heavy ranges pass block-by-block eventually.
+          const mid = Math.floor((start + end) / 2);
+          await query('DELETE FROM sync_gaps WHERE start_h = $1', [start]);
+          await recordGaps([{ start, end: mid }, { start: mid + 1, end }]);
+          console.warn(`[Gaps] split ${start}-${end} after failure: ${(err as Error).message}`);
+        } else {
+          await query(
+            `UPDATE sync_gaps SET tries = tries + 1,
+             next_retry_at = now() + make_interval(secs => LEAST(600, 30 * POWER(2, tries)))
+             WHERE start_h = $1`, [start]
+          );
+          console.warn(`[Gaps] block ${start} still failing (try ${row.tries + 1}): ${(err as Error).message}`);
+        }
+      }
+    }
+  } catch (err) {
+    console.error('[Gaps] sweep failed:', err);
+  } finally {
+    isSweepingGaps = false;
+  }
+}
+
 async function saveBlocksBatch(blocks: { height: number; block: BlockData }[]): Promise<number> {
   let totalTx = 0;
   
@@ -1906,6 +2007,7 @@ function disconnectWebSocket(): void {
 let syncInterval: NodeJS.Timeout | null = null;
 let integrityInterval: NodeJS.Timeout | null = null;
 let recoveryInterval: NodeJS.Timeout | null = null;
+let gapSweepInterval: NodeJS.Timeout | null = null;
 let isSyncing = false;
 
 let initialSyncDone = false;
@@ -1968,6 +2070,13 @@ export function startSyncService(): void {
     });
   }, RECOVERY_INTERVAL);
 
+  // Gap sweeper: retries recorded holes until the blocks table is contiguous.
+  gapSweepInterval = setInterval(() => {
+    sweepGaps().catch(err => {
+      error('[Gaps] Sweep error:', err);
+    });
+  }, 60000);
+
   console.log('[Sync] Sync service started (with periodic recovery every 5min)');
 }
 
@@ -1997,7 +2106,11 @@ export async function stopSyncService(): Promise<void> {
     clearInterval(recoveryInterval);
     recoveryInterval = null;
   }
-  
+  if (gapSweepInterval) {
+    clearInterval(gapSweepInterval);
+    gapSweepInterval = null;
+  }
+
   // Wait for current sync to finish
   if (isSyncing) {
     log('[Sync] Waiting for current sync to finish...');
