@@ -315,56 +315,70 @@ impl Storage {
         // NOT the retired live-captured state_snap_ (whose content drifted past its label height). accounts
         // come from the snapshot; state_root + total_supply come from the anchor macroblock's QC-bound
         // checkpoint (the cold-join source), never a drifting live read.
-        let latest_height = match self.persistent.db.get_cf(&snapshots_cf, b"latest_full_snap")? {
-            Some(data) if data.len() >= 8 => u64::from_le_bytes(data[..8].try_into()
-                .map_err(|_| IntegrationError::StorageError("Invalid latest_full_snap pointer".to_string()))?),
-            _ => {
-                let mut max_h = 0u64;
-                for item in self.persistent.db.iterator_cf(&snapshots_cf, rocksdb::IteratorMode::Start) {
-                    if let Ok((key, _)) = item {
-                        if let Some(h_str) = String::from_utf8_lossy(&key).strip_prefix("full_snap_") {
-                            if let Ok(h) = h_str.parse::<u64>() { if h > max_h { max_h = h; } }
-                        }
-                    }
+        // Candidates newest→oldest, NOT only the pointer: a snapshot taken past a finality stall has no
+        // sealed anchor macroblock, and giving up there turned every restart during the stall into a
+        // from-genesis replay while perfectly anchored older snapshots sat one key away.
+        let mut candidates: Vec<u64> = Vec::new();
+        if let Some(data) = self.persistent.db.get_cf(&snapshots_cf, b"latest_full_snap")? {
+            if data.len() >= 8 {
+                candidates.push(u64::from_le_bytes(data[..8].try_into()
+                    .map_err(|_| IntegrationError::StorageError("Invalid latest_full_snap pointer".to_string()))?));
+            }
+        }
+        for item in self.persistent.db.iterator_cf(&snapshots_cf, rocksdb::IteratorMode::Start) {
+            if let Ok((key, _)) = item {
+                if let Some(h_str) = String::from_utf8_lossy(&key).strip_prefix("full_snap_") {
+                    if let Ok(h) = h_str.parse::<u64>() { if !candidates.contains(&h) { candidates.push(h); } }
                 }
-                if max_h == 0 { return Ok(None); }
-                max_h
             }
-        };
+        }
+        candidates.sort_unstable_by(|a, b| b.cmp(a));
+        if candidates.is_empty() { return Ok(None); }
 
-        let key = format!("full_snap_{}", latest_height);
-        let value = match self.persistent.db.get_cf(&snapshots_cf, key.as_bytes())? {
-            Some(v) => v,
-            None => {
-                eprintln!("[WARN][SNAPSHOT] latest_full_snap pointer h={} key missing", latest_height);
-                return Ok(None);
+        for height in candidates {
+            let value = match self.persistent.db.get_cf(&snapshots_cf, format!("full_snap_{}", height).as_bytes())? {
+                Some(v) => v,
+                None => {
+                    eprintln!("[WARN][SNAPSHOT] full_snap_ h={} key missing — trying older", height);
+                    continue;
+                }
+            };
+
+            // decode_snapshot_accounts verifies integrity + decompresses + parses the full_snap_ payload
+            // (Format A: accounts then the rewards/contracts/registry sections). Re-serialize as the bincode
+            // Vec the TIER-1 consumer expects, so the restore path below is unchanged.
+            let accounts = match self.decode_snapshot_accounts(&value) {
+                Ok(a) => a,
+                Err(e) => {
+                    eprintln!("[WARN][SNAPSHOT] full_snap_ h={} decode_fail err={} — trying older", height, e);
+                    continue;
+                }
+            };
+
+            // full_snap_ heights are macroblock boundaries (h=90 + multiples of SNAPSHOT_INCREMENTAL_INTERVAL),
+            // so the anchor macroblock at height/90 carries the apply-bound state_root + QC total_supply.
+            let mb_idx = height / 90;
+            let (state_root, total_supply) = match self.anchor_root_and_supply(mb_idx, &accounts) {
+                Some(rs) => rs,
+                None => {
+                    eprintln!("[WARN][SNAPSHOT] full_snap_ h={} anchor mb={} unavailable — trying older", height, mb_idx);
+                    continue;
+                }
+            };
+
+            let accounts_data = bincode::serialize(&accounts)
+                .map_err(|e| IntegrationError::SerializationError(format!("reserialize_full_snap_accounts: {}", e)))?;
+
+            if crate::node::is_info() {
+                println!("[INFO][SNAPSHOT] full_snap_loaded h={} total_supply={} accounts={}",
+                         height, total_supply, accounts.len());
             }
-        };
 
-        // decode_snapshot_accounts verifies integrity + decompresses + parses the full_snap_ payload
-        // (Format A: accounts then the rewards/contracts/registry sections). Re-serialize as the bincode
-        // Vec the TIER-1 consumer expects, so the restore path below is unchanged.
-        let accounts = self.decode_snapshot_accounts(&value)?;
-        let accounts_data = bincode::serialize(&accounts)
-            .map_err(|e| IntegrationError::SerializationError(format!("reserialize_full_snap_accounts: {}", e)))?;
-
-        // full_snap_ heights are macroblock boundaries (h=90 + multiples of SNAPSHOT_INCREMENTAL_INTERVAL),
-        // so the anchor macroblock at latest_height/90 carries the apply-bound state_root + QC total_supply.
-        let mb_idx = latest_height / 90;
-        let (state_root, total_supply) = match self.anchor_root_and_supply(mb_idx, &accounts) {
-            Some(rs) => rs,
-            None => {
-                eprintln!("[WARN][SNAPSHOT] full_snap_ h={} anchor mb={} unavailable — full replay", latest_height, mb_idx);
-                return Ok(None);
-            }
-        };
-
-        if crate::node::is_info() {
-            println!("[INFO][SNAPSHOT] full_snap_loaded h={} total_supply={} accounts={}",
-                     latest_height, total_supply, accounts.len());
+            return Ok(Some((height, state_root, accounts_data, total_supply)));
         }
 
-        Ok(Some((latest_height, state_root, accounts_data, total_supply)))
+        eprintln!("[WARN][SNAPSHOT] no anchored full_snap_ — full replay");
+        Ok(None)
     }
     
     /// v2.99: Load state snapshot by height and restore into StateManager
