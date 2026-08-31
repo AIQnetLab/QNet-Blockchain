@@ -1721,6 +1721,9 @@ pub async fn run(
                     ticks_stuck = ticks_stuck.saturating_add(1);
                     let need = (1u32 << consec_timeouts.min(4)).min(15); // base ticks: 4,8,16,32,60s
                     if ticks_stuck >= need {
+                        if crate::node::is_debug() {
+                            println!("[DBG][BFT2] local_timeout_fired round={}", driver.current_index());
+                        }
                         let effects = driver.on_timeout();
                         for w in execute(effects, &node_id, &p2p, &storage).await { driver.mark_sealed(w); }
                         consec_timeouts = consec_timeouts.saturating_add(1);

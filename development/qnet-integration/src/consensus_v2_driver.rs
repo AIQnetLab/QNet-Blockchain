@@ -503,6 +503,10 @@ impl ConsensusDriver {
                 self.eng.adopt_qc(qc)
             }
             ConsensusMsg::Timeout(tm) => {
+                if crate::node::is_debug() {
+                    println!("[DBG][BFT2] timeout_recv from={} idx={} our_round={}",
+                             tm.voter, tm.index, self.eng.current_index);
+                }
                 // Strip the embedded pk before the timeout enters a TC — on_timeout_msg copies the
                 // signature verbatim, so at a 1000-committee this drops ~1.74 MB from every TC. Same
                 // rule and same transform as votes; the TC verifier re-derives the pk from committee
