@@ -1152,6 +1152,24 @@ pub(crate) fn peer_window_from(heights: Vec<u64>, local_tip: u64) -> u64 {
         / qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL
 }
 
+/// Certified pair for the checkpoint at `head_height`, from the WAL. O(RETAIN) scan of small pairs.
+pub fn certified_pair_by_head(storage: &Storage, head_height: u64)
+    -> Option<(qnet_consensus::checkpoint_bft::Checkpoint, QuorumCertificate)>
+{
+    for (_, bytes) in storage.load_certified_pairs().ok()? {
+        if let Ok(pair) = bincode::deserialize::<Vec<ConsensusMsg>>(&bytes) {
+            let cp = pair.iter().find_map(|m| match m { ConsensusMsg::Proposal(p) => Some(p.clone()), _ => None });
+            let qc = pair.iter().find_map(|m| match m { ConsensusMsg::Qc(q) => Some(q.clone()), _ => None });
+            if let (Some(cp), Some(qc)) = (cp, qc) {
+                if cp.window_head_height == head_height && cp.hash() == qc.checkpoint_hash {
+                    return Some((cp, qc));
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Serialized [Proposal, Qc] pair for the newest SEALED macroblock in storage, recorded into the
 /// RAM store as a side effect. The RAM store dies with the process and refills only on the next
 /// QC — during a finality stall that is never, so storage is the only restart-proof serve source.
@@ -1945,7 +1963,26 @@ pub async fn run(
                                 .or_else(|| window_buf.keys().copied().filter(|k| *k != nw).max());
                             if let Some(v) = victim { window_buf.remove(&v); }
                         }
-                        let mut effs = try_propose(&mut driver, &window_buf, &storage, &mut committee);
+                        let mut effs = Vec::new();
+                        // Restart-proof seal: a certified macro boundary whose Persist died with a
+                        // previous process (seal inputs are round-keyed RAM) re-seals from the WAL
+                        // pair plus this window's re-signalled epoch data. mark_sealed dedups.
+                        let mi = qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
+                        if head_height % mi == 0 && head_height / mi > storage.last_sealed_mb_index() {
+                            if let Some((cp, qc)) = certified_pair_by_head(&storage, head_height) {
+                                if crate::node::is_warn() {
+                                    println!("[WARN][BFT2] reseal_from_wal window={} head={} qc_index={}",
+                                             head_height / mi, head_height, qc.index);
+                                }
+                                let c = window_buf.get(&index).map(|w| w.committee.clone()).unwrap_or_default();
+                                effs.push(Effect::Persist {
+                                    checkpoint: cp, qc,
+                                    eligible_producers: window_buf.get(&index).map(|w| w.eligible.clone()).unwrap_or_default(),
+                                    committee: c,
+                                });
+                            }
+                        }
+                        effs.extend(try_propose(&mut driver, &window_buf, &storage, &mut committee));
                         effs.extend(drain_pending(&mut driver, &window_buf, &storage, &p2p, &committee, &mut pending, MAX_PENDING, &mut heard));
                         effs
                         }
