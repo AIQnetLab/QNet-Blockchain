@@ -1069,6 +1069,9 @@ pub static BULK_LANE_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::
 /// frame shed). A NON-ZERO value is unrepairable consensus loss (SEV-1), unlike the
 /// benign bulk shedding above. Log-governed by the finality drain task.
 pub static FINALITY_LANE_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Gossip messages shed because every pool worker was busy past the wait bound —
+/// nonzero sustained = wedged handlers eating workers.
+pub static GOSSIP_POOL_SHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// QUIC Fallback Metrics (global counters for monitoring)
 pub static QUIC_FALLBACK_SUCCESS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

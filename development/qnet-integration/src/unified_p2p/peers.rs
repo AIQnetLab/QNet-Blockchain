@@ -1785,10 +1785,24 @@ impl SimplifiedP2P {
                     return;
                 }
                 
+                // Dedup FIRST: a re-announced cached cert is a no-op, and it must not feed the
+                // rate limiter — an unpromoted joiner re-announces until acked, and counting
+                // those as offenses escalated a legitimate join into an attacker verdict.
+                {
+                    let cm = self.certificate_manager.read();
+                    if cm.remote_certificates.contains_key(&cert_serial) ||
+                       cm.pending_certificates.contains_key(&cert_serial) {
+                        if crate::node::is_debug() {
+                            println!("[DBG][P2P] cert_reannounce_dedup serial={} from={}", cert_serial, node_id);
+                        }
+                        return;
+                    }
+                }
+
                 if crate::node::is_info() {
                     println!("[INFO][P2P] Certificate announcement from {} (serial: {})", node_id, cert_serial);
                 }
-                
+
                 // SECURITY: Rate limiting to prevent certificate flooding attacks
                 // Maximum 10 certificate announcements per minute per peer (40 for Genesis nodes)
                 let now = self.current_timestamp();
@@ -1840,12 +1854,11 @@ impl SimplifiedP2P {
                 };
                 
                 if rate_limited {
-                    if crate::node::is_info() {
-                        println!("[ERR][P2P] Certificate announcement rejected due to rate limiting");
+                    // Traffic shaping only: drop + the limiter's own mute window. A rate pattern
+                    // is not evidence of a fault — only a VERIFIED-invalid cert feeds the tracker.
+                    if crate::node::is_warn() {
+                        println!("[WARN][P2P] cert_announce_rate_limited from={} action=drop", node_id);
                     }
-                    // SECURITY: Rate limiting violation indicates potential DoS attack
-                    self.update_peer_reputation(&node_id, ReputationEvent::ConnectionFailure);
-                    self.track_invalid_certificate(&node_id, "RATE_LIMIT_EXCEEDED");
                     return;
                 }
                 

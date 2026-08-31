@@ -76,6 +76,15 @@ pub(crate) fn checkpoint_vote_key(index: u64) -> Vec<u8> {
     k
 }
 
+/// Certified (Checkpoint, QC) pair key: `cpq_` ++ index BIG-endian, index-ordered prefix scan.
+#[inline]
+pub(crate) fn certified_pair_key(index: u64) -> Vec<u8> {
+    let mut k = Vec::with_capacity(4 + 8);
+    k.extend_from_slice(b"cpq_");
+    k.extend_from_slice(&index.to_be_bytes());
+    k
+}
+
 /// Header index key: `hdr_` ++ hash. Hash-keyed, so no ordering requirement.
 #[inline]
 pub(crate) fn block_header_key(hash: &[u8; 32]) -> Vec<u8> {
@@ -2955,6 +2964,36 @@ mod v32_9_pattern_c_tests {
         assert_eq!(dump_cf(&src, "node_registry"), dump_cf(&dst, "node_registry"));
     }
 }
+#[cfg(test)]
+mod tests_certified_pair_wal {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn open_test_storage() -> (Storage, TempDir) {
+        let dir = TempDir::new().expect("tempdir");
+        let storage = Storage::new(dir.path().to_str().unwrap()).expect("storage init");
+        (storage, dir)
+    }
+
+    #[test]
+    fn certified_pairs_roundtrip_ascending_and_prune() {
+        let (s, _d) = open_test_storage();
+        s.record_certified_pair(514, b"pair514").unwrap();
+        s.record_certified_pair(513, b"pair513").unwrap();
+        s.record_certified_pair(515, b"pair515").unwrap();
+        let got = s.load_certified_pairs().unwrap();
+        assert_eq!(got.iter().map(|(i, _)| *i).collect::<Vec<_>>(), vec![513, 514, 515],
+                   "index-ascending, restart re-adopts in order");
+        assert_eq!(got[1].1, b"pair514");
+        // A far-ahead record prunes everything below index - CONSENSUS_STATE_RETAIN.
+        let far = 515 + qnet_consensus::checkpoint_bft::CONSENSUS_STATE_RETAIN + 10;
+        s.record_certified_pair(far, b"new").unwrap();
+        let after = s.load_certified_pairs().unwrap();
+        assert_eq!(after.iter().map(|(i, _)| *i).collect::<Vec<_>>(), vec![far],
+                   "stale pairs below the retain floor are pruned");
+    }
+}
+
 #[cfg(test)]
 mod tests_parent_linkage_invariant {
     use super::*;

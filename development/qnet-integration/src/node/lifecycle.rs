@@ -2079,43 +2079,49 @@ impl BlockchainNode {
             }
         });
         
-        // Start QUIC message handler. Per-message CPU offload for crypto-
-        // heavy handlers: the legacy single-task loop dispatched every
-        // message synchronously, but a ML-DSA-65-verify handler
-        // (ConsensusCommit/Reveal, TimeoutVote, TC broadcast,
-        // ProducerHeartbeat, VrfLeaderClaim) costs 1-2 ms — a 1000-validator
-        // commit-reveal burst of 667+667 serialized ≥2 s, starving Block/
-        // BlockChunk drain and drifting the macroblock deadline. So route
-        // only the crypto-heavy types through spawn_blocking (parallel
-        // off-core verify, loop returns in µs); they are keyed-idempotent so
-        // out-of-order is safe. Cheap messages keep the synchronous path.
+        // Gossip-lane drain: the drain NEVER runs handler code. Every message goes to a
+        // bounded spawn_blocking pool, so one wedged handler eats one worker — not the lane
+        // (a single poisoned message once deadlocked this consumer fleet-wide). Bounded wait
+        // then shed: gossip is re-gossiped/idempotent, and an exhausted pool must not turn
+        // back into a blocked drain.
         let blockchain_for_quic = blockchain.clone();
         tokio::spawn(async move {
+            const GOSSIP_POOL_WORKERS: usize = 8;
+            const GOSSIP_POOL_WAIT_MS: u64 = 5_000;
+            let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(GOSSIP_POOL_WORKERS));
+            let mut last_shed_log = std::time::Instant::now();
+            let mut last_shed: u64 = 0;
             while let Some((from_peer, message)) = quic_message_rx.recv().await {
                 crate::node::GOSSIP_LANE_DRAINED_MS.store(
                     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default().as_millis() as u64,
                     std::sync::atomic::Ordering::Relaxed);
-                if let Some(ref p2p) = blockchain_for_quic.unified_p2p {
-                    // TimeoutVote/TimeoutCertificateBroadcast now arrive on the dedicated
-                    // finality lane (offloaded there), so they no longer reach this consumer.
-                    let needs_offload = matches!(&message,
-                        crate::unified_p2p::NetworkMessage::ProducerHeartbeat { .. }
-                        | crate::unified_p2p::NetworkMessage::VrfLeaderClaim { .. }
-                    );
-                    if needs_offload {
-                        let p2p_clone = p2p.clone();
-                        let from_peer_owned = from_peer.clone();
-                        // Fire-and-forget: handler emits its own success/error
-                        // logs; spawn_blocking guarantees the task makes
-                        // progress without contending for tokio worker cores.
-                        tokio::task::spawn_blocking(move || {
-                            p2p_clone.handle_message(&from_peer_owned, message);
-                        });
-                    } else {
-                        // Cheap dispatch: keep the synchronous fast path.
-                        p2p.handle_message(&from_peer, message);
+                if last_shed_log.elapsed().as_secs() >= 30 {
+                    let s = crate::unified_p2p::GOSSIP_POOL_SHED
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    if s > last_shed && is_warn() {
+                        println!("[WARN][QUIC] gossip_pool_shed total={} delta={} window=30s reason=workers_busy",
+                                 s, s - last_shed);
                     }
+                    last_shed = s;
+                    last_shed_log = std::time::Instant::now();
+                }
+                if let Some(ref p2p) = blockchain_for_quic.unified_p2p {
+                    let permit = match tokio::time::timeout(
+                        std::time::Duration::from_millis(GOSSIP_POOL_WAIT_MS),
+                        permits.clone().acquire_owned()).await {
+                        Ok(Ok(p)) => p,
+                        _ => {
+                            crate::unified_p2p::GOSSIP_POOL_SHED
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            continue;
+                        }
+                    };
+                    let p2p_clone = p2p.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
+                        p2p_clone.handle_message(&from_peer, message);
+                    });
                 }
             }
         });

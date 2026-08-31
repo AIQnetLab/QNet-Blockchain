@@ -1299,16 +1299,15 @@ impl SimplifiedP2P {
     /// Track invalid certificate from a node for malicious behavior detection
     /// SECURITY: Escalating punishment - 5 invalid certs in 10 minutes = ban
     pub fn track_invalid_certificate(&self, node_id: &str, reason: &str) {
-        // v3.20: Using global INVALID_CERT_TRACKER (moved from local static for cleanup)
-        
-        let entry = INVALID_CERT_TRACKER
-            .entry(node_id.to_string())
-            .or_insert((AtomicU64::new(0), Instant::now()));
-        
-        let count = entry.0.fetch_add(1, Ordering::Relaxed) + 1;
-        let first_seen = entry.1;
-        let elapsed = first_seen.elapsed();
-        
+        // Read-and-drop: the entry guard locks its shard, and the remove() calls below on the
+        // SAME map would self-deadlock the calling thread if the guard were still alive.
+        let (count, elapsed) = {
+            let entry = INVALID_CERT_TRACKER
+                .entry(node_id.to_string())
+                .or_insert((AtomicU64::new(0), Instant::now()));
+            (entry.0.fetch_add(1, Ordering::Relaxed) + 1, entry.1.elapsed())
+        };
+
         if crate::node::is_info() {
             println!("[WARN][SECURITY] Invalid certificate from {}: {} (count: {}, window: {}s)",
                      node_id, reason, count, elapsed.as_secs());
@@ -1369,15 +1368,14 @@ impl SimplifiedP2P {
     /// Track invalid block from a producer for malicious behavior detection
     /// SECURITY: Soft punishment approach - tolerates occasional errors but bans repeated offenders
     pub fn track_invalid_block(&self, producer: &str, block_height: u64, reason: &str) {
-        // SCALABILITY: Lock-free tracking for millions of nodes
-        let entry = INVALID_BLOCKS_TRACKER
-            .entry(producer.to_string())
-            .or_insert((AtomicU64::new(0), Instant::now()));
-        
-        let count = entry.0.fetch_add(1, Ordering::Relaxed) + 1;
-        let first_seen = entry.1;
-        let elapsed = first_seen.elapsed();
-        
+        // Read-and-drop, same shard-deadlock rule as track_invalid_certificate.
+        let (count, elapsed) = {
+            let entry = INVALID_BLOCKS_TRACKER
+                .entry(producer.to_string())
+                .or_insert((AtomicU64::new(0), Instant::now()));
+            (entry.0.fetch_add(1, Ordering::Relaxed) + 1, entry.1.elapsed())
+        };
+
         if crate::node::is_info() {
             println!("[WARN][SECURITY] Invalid block from {}: {} (count: {}, window: {}s)",
                      producer, reason, count, elapsed.as_secs());

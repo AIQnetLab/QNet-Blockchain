@@ -48,6 +48,12 @@ impl Storage {
         -> IntegrationResult<Vec<(u64, u64, [u8; 32], bool, u64, [u8; 32])>> {
         self.persistent.load_checkpoint_votes()
     }
+    pub fn record_certified_pair(&self, index: u64, bytes: &[u8]) -> IntegrationResult<()> {
+        self.persistent.record_certified_pair(index, bytes)
+    }
+    pub fn load_certified_pairs(&self) -> IntegrationResult<Vec<(u64, Vec<u8>)>> {
+        self.persistent.load_certified_pairs()
+    }
     pub fn put_galc_held(&self, bytes: &[u8]) -> IntegrationResult<()> { self.persistent.put_galc_held(bytes) }
     pub fn get_galc_held(&self) -> IntegrationResult<Option<Vec<u8>>> { self.persistent.get_galc_held() }
     /// The macroblock index this node cold-joined at, or 0 for a from-genesis node.

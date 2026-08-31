@@ -1468,6 +1468,33 @@ pub async fn run(
     if catchup_bundle_from_storage(&storage).is_some() && crate::node::is_info() {
         println!("[INFO][BFT2] catchup_store_seeded mb_idx={}", storage.last_sealed_mb_index());
     }
+    // Re-adopt certified-but-unsealed pairs so the driver reboots at the CERTIFIED frontier —
+    // booting at the sealed one splits the committee across windows after any mid-trail restart.
+    match storage.load_certified_pairs() {
+        Ok(pairs) => {
+            let n = pairs.len();
+            for (_, bytes) in pairs {
+                if let Ok(pair) = bincode::deserialize::<Vec<ConsensusMsg>>(&bytes) {
+                    let cp = pair.iter().find_map(|m| match m { ConsensusMsg::Proposal(p) => Some(p.clone()), _ => None });
+                    let qc = pair.iter().find_map(|m| match m { ConsensusMsg::Qc(q) => Some(q.clone()), _ => None });
+                    if let (Some(cp), Some(qc)) = (cp, qc) {
+                        record_catchup_bundle(qc.index, bytes.clone());
+                        let effs = driver.sync(&cp, &qc);
+                        if !effs.is_empty() {
+                            for w in execute(effs, &node_id, &p2p, &storage).await { driver.mark_sealed(w); }
+                        }
+                    }
+                }
+            }
+            if n > 0 && crate::node::is_info() {
+                println!("[INFO][BFT2] certified_wal_restored pairs={} next_window={}", n, driver.next_window());
+            }
+        }
+        Err(e) => {
+            if crate::node::is_warn() { println!("[WARN][BFT2] certified_wal_unreadable err={}", e); }
+        }
+    }
+    let mut last_walled: u64 = driver.newest_qc_index().unwrap_or(0);
     if crate::node::is_info() {
         println!("[INFO][BFT2] runtime_started committee={} view_timeout_ms={}", committee.len(), timeout_ms);
     }
@@ -1920,6 +1947,23 @@ pub async fn run(
                         }
                     }
                 };
+                // WAL: persist the newest certified pair the moment the QC frontier moves, over
+                // every arrival path (inbound, cert-verified, catch-up). Restart-proof liveness.
+                if let Some(i) = driver.newest_qc_index() {
+                    if i != last_walled {
+                        // Advance the cursor only on a WRITTEN pair: a QC can precede its
+                        // proposal, and skipping then would never persist that index at all.
+                        if let Some((idx, pair)) = driver.newest_catchup_bundle() {
+                            if let Ok(b) = bincode::serialize(&pair) {
+                                if let Err(e) = storage.record_certified_pair(idx, &b) {
+                                    if crate::node::is_warn() { println!("[WARN][BFT2] certified_wal_write_fail idx={} err={}", idx, e); }
+                                }
+                                record_catchup_bundle(idx, b);
+                                last_walled = i;
+                            }
+                        }
+                    }
+                }
                 for w in execute(effects, &node_id, &p2p, &storage).await { driver.mark_sealed(w); }
                 last_index = driver.current_index();
             }

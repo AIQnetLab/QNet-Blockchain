@@ -1847,6 +1847,10 @@ impl BlockchainNode {
             // OPTIMIZATION: Track last round when certificate was broadcasted
             // Prevents redundant broadcasts (30× per round → 1× per round)
             let mut last_certificate_broadcast_round: Option<u64> = None;
+            // Announce backoff: a joiner that cannot reach the ack threshold yet must not
+            // retry every pass — at fleet scale that is a standing announce storm.
+            let mut cert_announce_backoff_secs: u64 = 3;
+            let mut cert_announce_next: Option<std::time::Instant> = None;
             
             while *is_running.read().await {
                 // v15.11: Heartbeat tick — emitted at the very top of every iteration
@@ -3432,7 +3436,9 @@ impl BlockchainNode {
                     // OPTIMIZATION: Only broadcast ONCE per round (not every block)
                     // This prevents "certificate not found" errors during producer rotation
                     // while avoiding redundant broadcasts (30× per round → 1× per round)
-                    let should_broadcast = match last_certificate_broadcast_round {
+                    let backoff_active = cert_announce_next
+                        .map_or(false, |t| std::time::Instant::now() < t);
+                    let should_broadcast = !backoff_active && match last_certificate_broadcast_round {
                         None => true,  // First time as producer
                         Some(last_round) => last_round != current_round,  // New round
                     };
@@ -3463,14 +3469,22 @@ impl BlockchainNode {
                                                 println!("[INFO][CERT] producer_cert_delivered threshold=byzantine");
                                                 // Mark this round as broadcasted
                                                 last_certificate_broadcast_round = Some(current_round);
+                                                cert_announce_backoff_secs = 3;
+                                                cert_announce_next = None;
                                             }
                                             Err(e) => {
-                                                println!("[WARN][CERT] byzantine_threshold_not_reached err={}", e);
-                                                println!("[INFO][CERT] fallback=async_rebroadcast");
-                                                // Fallback: async broadcast for remaining peers (gossip will propagate)
+                                                if is_warn() {
+                                                    println!("[WARN][CERT] byzantine_threshold_not_reached err={} retry_in={}s",
+                                                             e, cert_announce_backoff_secs);
+                                                }
+                                                // Fallback: async broadcast for remaining peers (gossip will propagate),
+                                                // then back off exponentially instead of retrying every pass.
                                                 if let Err(e2) = p2p.broadcast_certificate_announce(cert.serial_number, cert_bytes) {
                                                     println!("[ERR][CERT] fallback_broadcast_failed err={}", e2);
                                                 }
+                                                cert_announce_next = Some(std::time::Instant::now()
+                                                    + std::time::Duration::from_secs(cert_announce_backoff_secs));
+                                                cert_announce_backoff_secs = (cert_announce_backoff_secs * 2).min(60);
                                             }
                                         }
                                     }

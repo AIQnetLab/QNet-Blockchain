@@ -1206,6 +1206,47 @@ impl PersistentStorage {
         Ok(())
     }
 
+    /// Certified-but-unsealed (Checkpoint, QC) pair (metadata CF, key `cpq_<index BE>`) — the
+    /// liveness complement of the vote commitments: on restart the driver re-adopts these and
+    /// reboots at the CERTIFIED frontier, so a reboot between certification and seal can no longer
+    /// split the committee across windows. Async write: a lost pair is re-fetched, never a fault.
+    pub fn record_certified_pair(&self, index: u64, bytes: &[u8]) -> IntegrationResult<()> {
+        let cf = self.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
+        self.db.put_cf(&cf, super::certified_pair_key(index), bytes)?;
+        let floor = index.saturating_sub(qnet_consensus::checkpoint_bft::CONSENSUS_STATE_RETAIN);
+        if floor > 0 {
+            let mut batch = WriteBatch::default();
+            for (k, _) in self.iter_certified_pairs(&cf)? {
+                if k < floor { batch.delete_cf(&cf, super::certified_pair_key(k)); }
+            }
+            if !batch.is_empty() { self.db.write(batch)?; }
+        }
+        Ok(())
+    }
+
+    /// All stored certified pairs, index-ascending.
+    pub fn load_certified_pairs(&self) -> IntegrationResult<Vec<(u64, Vec<u8>)>> {
+        let cf = self.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
+        self.iter_certified_pairs(&cf)
+    }
+
+    fn iter_certified_pairs(&self, cf: &impl rocksdb::AsColumnFamilyRef)
+        -> IntegrationResult<Vec<(u64, Vec<u8>)>> {
+        const P: &[u8] = b"cpq_";
+        let mut out = Vec::new();
+        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::From(P, rocksdb::Direction::Forward));
+        for item in iter {
+            let (k, v) = item?;
+            if !k.starts_with(P) { break; }
+            if k.len() != P.len() + 8 { continue; }
+            let mut idx = [0u8; 8]; idx.copy_from_slice(&k[P.len()..]);
+            out.push((u64::from_be_bytes(idx), v.to_vec()));
+        }
+        Ok(out)
+    }
+
     /// Every stored vote commitment: `(index, window_head, content_digest, pinned, parent_index,
     /// parent_hash)`. An Err here means the node cannot know what it already voted for — the caller
     /// must refuse to run consensus rather than vote blind.
