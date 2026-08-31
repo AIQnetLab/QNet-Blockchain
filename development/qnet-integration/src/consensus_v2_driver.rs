@@ -539,6 +539,8 @@ impl ConsensusDriver {
             self.eng.restore_vote(r.index, r.window_head, r.content_digest, r.pinned,
                                   r.parent_index, r.parent_hash);
         }
+        // Never reboot INSIDE voted territory: those views are unvotable by the rules above.
+        self.eng.enter_first_votable_view();
     }
 
     /// Emit Persist for `qc`'s checkpoint once (deduped). Every committee member seals

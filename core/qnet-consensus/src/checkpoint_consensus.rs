@@ -113,6 +113,13 @@ impl CheckpointConsensus {
     /// a pinned one is admitted at the identical position instead (`index_votes`).
     pub fn last_voted_index(&self) -> u64 { self.last_voted_index }
 
+    /// Enter the first votable view. Views at or below the vote ceiling can never be voted
+    /// (anti-equivocation), so a restart that re-enters them idles through a timeout crawl the
+    /// height of its own vote history. Forward view skips are always safe.
+    pub fn enter_first_votable_view(&mut self) {
+        self.current_index = self.current_index.max(self.last_voted_index.saturating_add(1));
+    }
+
     fn quorum(&self) -> usize { quorum_size(self.committee.len()) }
     fn f(&self) -> usize { self.committee.len().saturating_sub(1) / 3 }
 
@@ -860,6 +867,20 @@ mod tests {
         assert!(restored.on_proposal(&rival, &hh(0)).is_empty());
         assert_eq!(restored.voted_content_at(first.window_head_height), Some(pos.1));
         assert_eq!(restored.last_voted_index(), first.index);
+    }
+
+    // A restart must not re-enter voted territory: those views are unvotable, so idling there
+    // costs a timeout crawl the height of the vote history (observed live: hours after a stall).
+    #[test]
+    fn restore_then_first_votable_view_skips_the_voted_ceiling() {
+        let c = committee(4);
+        let mut eng = CheckpointConsensus::new("n0".into(), c);
+        eng.restore_vote(600, 15420, hh(1), false, 568, hh(2));
+        eng.restore_vote(597, 15420, hh(1), false, 568, hh(2));
+        eng.enter_first_votable_view();
+        assert_eq!(eng.current_index, 601, "boots at ceiling+1, not below it");
+        eng.enter_first_votable_view();
+        assert_eq!(eng.current_index, 601, "idempotent; never moves backward");
     }
 
     // THE accountability arm for the freed index. Any two quorums over one window head share a
