@@ -355,6 +355,7 @@ impl BlockchainNode {
             let mut lag_timer = tokio::time::interval(
                 std::time::Duration::from_millis(qnet_consensus::checkpoint_bft::VIEW_TIMEOUT_MS));
             lag_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut redrive_flip = false;
             loop {
                 let current_height = tokio::select! {
                     ev = block_event_rx.recv() => match ev {
@@ -411,8 +412,14 @@ impl BlockchainNode {
                         let published = crate::consensus_v2_node::v2_next_window_head();
                         // The oldest unsealed window wins over the driver's cursor — the cursor can
                         // outrun the tip and silence this guard forever; see redrive_boundary.
-                        if let Some(b) = crate::node::redrive_boundary(
+                        if let Some(b0) = crate::node::redrive_boundary(
                             fin, tip, published, storage.last_sealed_mb_index()) {
+                            // Alternate with the driver's frontier: a boundary the driver already
+                            // CERTIFIED (cursor past it) seals only via the 2-chain commit that the
+                            // frontier window delivers, while a body-less boundary still needs its
+                            // own re-signal — alternating serves both without distinguishing.
+                            let b = if published > b0 && published <= tip && redrive_flip { published } else { b0 };
+                            redrive_flip = !redrive_flip;
                             // Intra frontier: re-arm the cursor so the intra path re-attempts exactly b.
                             if b % macro_i != 0 {
                                 last_intra_signalled.store(b.saturating_sub(k), std::sync::atomic::Ordering::Relaxed);
