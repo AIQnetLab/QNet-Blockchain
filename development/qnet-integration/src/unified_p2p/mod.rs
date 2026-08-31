@@ -3069,6 +3069,12 @@ impl SimplifiedP2P {
     
     /// PRODUCTION v2.19.22: Set QUIC message channel for full message processing
     /// All QUIC messages are routed through this channel to handle_message()
+    /// True if the peer registry holds a PROMOTED peer at this `ip:port` address.
+    /// Used by the QUIC transport to recycle connections that never promoted.
+    pub fn has_connected_peer_addr(&self, addr: &str) -> bool {
+        self.connected_peers_lockfree.contains_key(addr)
+    }
+
     pub fn set_quic_message_channel(&mut self, quic_message_tx: tokio::sync::mpsc::Sender<(String, NetworkMessage)>) {
         let mut guard = self.quic_message_tx.lock();
         *guard = Some(quic_message_tx);
@@ -3112,8 +3118,11 @@ impl SimplifiedP2P {
 
     /// Reserved lane for non-redundant 2f+1 msgs with no repair path: checkpoint-BFT
     /// (ConsensusV2 = Proposal/Vote/Qc/Timeout/Tc), failover pacemaker (TimeoutVote/
-    /// TimeoutCertificateBroadcast), round-change handshake (ProducerReady/ReadyAck).
-    /// MUST NOT share the gossip FIFO; excludes high-volume gossip and pull-repair.
+    /// TimeoutCertificateBroadcast), round-change handshake (ProducerReady/ReadyAck),
+    /// and the checkpoint catch-up pair (RequestConsensusState/ConsensusState) — it is
+    /// bounded (server rate-limit 5/min/peer, responses solicited-only) and it is the
+    /// repair that must land exactly when a finality stall saturates the gossip FIFO.
+    /// MUST NOT share the gossip FIFO; excludes high-volume gossip and bulk pull-repair.
     #[inline]
     fn is_finality_lane_message(msg: &NetworkMessage) -> bool {
         matches!(msg,
@@ -3122,6 +3131,8 @@ impl SimplifiedP2P {
             | NetworkMessage::TimeoutCertificateBroadcast { .. }
             | NetworkMessage::ProducerReady { .. }
             | NetworkMessage::ReadyAck { .. }
+            | NetworkMessage::RequestConsensusState { .. }
+            | NetworkMessage::ConsensusState { .. }
         )
     }
 

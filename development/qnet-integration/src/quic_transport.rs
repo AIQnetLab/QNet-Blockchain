@@ -2656,7 +2656,7 @@ impl QuicTransport {
     pub fn cleanup_idle(&self) {
         let now_ms = Self::current_time_ms();
         let mut to_remove = Vec::new();
-        
+
         for entry in self.connections.iter() {
             let last_ms = entry.value().last_activity_ms.load(Ordering::Relaxed);
             let idle_secs = (now_ms.saturating_sub(last_ms)) / 1000;
@@ -2664,9 +2664,37 @@ impl QuicTransport {
                 to_remove.push(*entry.key());
             }
         }
-        
+
         for addr in to_remove {
             self.disconnect(&addr);
+        }
+
+        // A connection that never PROMOTED into the peer registry carries no
+        // gossip: promotion happens only at connection setup, so a conn dialed
+        // before the counterpart's key announce was warm stays transport-only
+        // FOREVER — a joiner's registration tx then has no path in (observed:
+        // the 6th node sat unregistered for hours; one fresh re-handshake fixed
+        // it instantly). Recycle such conns; the peer re-dials and promotes.
+        const UNPROMOTED_MAX_AGE_SECS: u64 = 300;
+        if let Some(p2p) = crate::node::try_get_p2p() {
+            let mut recycle = Vec::new();
+            for entry in self.connections.iter() {
+                if entry.value().connected_at.elapsed().as_secs() <= UNPROMOTED_MAX_AGE_SECS {
+                    continue;
+                }
+                let ip = entry.key().ip();
+                if is_genesis_ip(&ip) { continue; }
+                if !p2p.has_connected_peer_addr(&format!("{}:8001", ip)) {
+                    recycle.push(*entry.key());
+                }
+            }
+            for addr in recycle {
+                if crate::node::is_warn() {
+                    println!("[WARN][QUIC] unpromoted_conn_recycled addr={} age_over={}s",
+                             get_privacy_id_for_addr(&addr.to_string()), UNPROMOTED_MAX_AGE_SECS);
+                }
+                self.disconnect(&addr);
+            }
         }
     }
     

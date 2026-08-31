@@ -1060,8 +1060,23 @@ impl SimplifiedP2P {
                 });
             }
             None => {
-                if crate::node::is_debug() {
-                    println!("[DBG][CONS] serve_catchup_miss round={} to={}", round, requester_id);
+                // RAM store empty (fresh restart; no QC formed since). Fall back to the sealed
+                // frontier in storage — during a finality stall it is the only serve source left.
+                let served = crate::node::try_get_storage()
+                    .and_then(|s| crate::consensus_v2_node::catchup_bundle_from_storage(s));
+                match served {
+                    Some(state_data) => {
+                        if crate::node::is_info() {
+                            println!("[INFO][CONS] serve_catchup_from_storage round={} to={} bytes={}",
+                                     round, requester_id, state_data.len());
+                        }
+                        self.send_network_message(from_peer, NetworkMessage::ConsensusState {
+                            round, state_data, sender_id: self.node_id.clone(),
+                        });
+                    }
+                    None => if crate::node::is_debug() {
+                        println!("[DBG][CONS] serve_catchup_miss round={} to={}", round, requester_id);
+                    }
                 }
             }
         }

@@ -2092,6 +2092,10 @@ impl BlockchainNode {
         let blockchain_for_quic = blockchain.clone();
         tokio::spawn(async move {
             while let Some((from_peer, message)) = quic_message_rx.recv().await {
+                crate::node::GOSSIP_LANE_DRAINED_MS.store(
+                    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default().as_millis() as u64,
+                    std::sync::atomic::Ordering::Relaxed);
                 if let Some(ref p2p) = blockchain_for_quic.unified_p2p {
                     // TimeoutVote/TimeoutCertificateBroadcast now arrive on the dedicated
                     // finality lane (offloaded there), so they no longer reach this consumer.

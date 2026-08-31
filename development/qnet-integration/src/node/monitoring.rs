@@ -654,6 +654,18 @@ impl BlockchainNode {
                 // Log memory stats
                 println!("[INFO][MEMORY] node={} rss_mb={} virt_mb={} delta_mb={} {}",
                          node_id, rss_mb, virt_mb, delta_mb, breakdown);
+
+                // Gossip-lane consumer liveness: a wedged consumer silently drops the whole
+                // default lane at ingress — the exact failure that starves checkpoint repair.
+                let drained = crate::node::GOSSIP_LANE_DRAINED_MS.load(std::sync::atomic::Ordering::Relaxed);
+                if drained > 0 {
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+                    let age_s = now_ms.saturating_sub(drained) / 1000;
+                    if age_s > 120 {
+                        println!("[CRIT][P2P] gossip_lane_consumer_stalled last_drain_age_s={}", age_s);
+                    }
+                }
                 
                 // CRITICAL: Warn if memory growing too fast (>100MB in 5 minutes)
                 if delta_mb > 100 {

@@ -1147,6 +1147,17 @@ pub(crate) fn peer_window_from(heights: Vec<u64>, local_tip: u64) -> u64 {
         / qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL
 }
 
+/// Serialized [Proposal, Qc] pair for the newest SEALED macroblock in storage, recorded into the
+/// RAM store as a side effect. The RAM store dies with the process and refills only on the next
+/// QC — during a finality stall that is never, so storage is the only restart-proof serve source.
+pub fn catchup_bundle_from_storage(storage: &Storage) -> Option<Vec<u8>> {
+    let (cp, qc) = stored_checkpoint_qc(storage, storage.last_sealed_mb_index())?;
+    let idx = qc.index;
+    let bytes = bincode::serialize(&vec![ConsensusMsg::Proposal(cp), ConsensusMsg::Qc(qc)]).ok()?;
+    record_catchup_bundle(idx, bytes.clone());
+    Some(bytes)
+}
+
 /// (Checkpoint, QC) of stored macroblock `idx`, read through the same zstd-sniffing reader every
 /// other consensus path uses. A bare bincode returns None on a compressed body, which silently
 /// disables the recovery it is called for.
@@ -1451,6 +1462,12 @@ pub async fn run(
     let mut blind_pulls: u32 = 0;
     let mut committee_window: u64 = u64::MAX; // window `committee` was resolved for
     let mut stuck_alarmed = false;
+    // Seed the RAM catch-up store from the sealed frontier: after a restart no new QC may ever
+    // arrive (a stalled network cannot form one), and an empty store makes this node useless to
+    // exactly the peers whose repair would end the stall.
+    if catchup_bundle_from_storage(&storage).is_some() && crate::node::is_info() {
+        println!("[INFO][BFT2] catchup_store_seeded mb_idx={}", storage.last_sealed_mb_index());
+    }
     if crate::node::is_info() {
         println!("[INFO][BFT2] runtime_started committee={} view_timeout_ms={}", committee.len(), timeout_ms);
     }

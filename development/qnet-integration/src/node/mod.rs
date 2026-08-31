@@ -1454,6 +1454,11 @@ pub static PRODUCER_HEARTBEAT_MS: AtomicU64 = AtomicU64::new(0);
 pub static PRODUCER_WATCHDOG_STARTED: AtomicU64 = AtomicU64::new(0);
 // Once-guard for the failover pacemaker task (run_failover_pacemaker).
 pub static PACEMAKER_STARTED: AtomicU64 = AtomicU64::new(0);
+// Gossip-lane consumer heartbeat (ms since epoch), stamped each drained message.
+// A wedged consumer drops the ENTIRE default lane at ingress ("no available
+// capacity" storms) while the node otherwise looks healthy — monitoring alarms
+// on a stale stamp. Log-only, like the producer watchdog above.
+pub static GOSSIP_LANE_DRAINED_MS: AtomicU64 = AtomicU64::new(0);
 
 /// OOM-backoff marker lives in the PERSISTENT data dir (the container volume) —
 /// a relative path resolved against WORKDIR does not survive a restart.
