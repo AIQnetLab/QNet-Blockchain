@@ -1815,7 +1815,14 @@ pub async fn run(
                             // skip on timeout) — replayed as we advance. Bounded against DoS.
                             // Gate on MEMBERSHIP: unknown committee means we cannot authenticate anything.
                             // Holding the window's bodies is a separate question, decided by check_content.
-                            if committee.is_empty() || msg_index(&msg) > driver.current_index() {
+                            // View-sync class crosses round boundaries BY DESIGN: a node behind the
+                            // quorum re-converges only through higher-round Timeouts/TCs, and buffering
+                            // them until the round catches up is circular — the round cannot catch up
+                            // without them (the post-stall view deadlock). Timeouts verify inline
+                            // (same cost as at-round ones); TCs go to the async cert worker.
+                            let view_sync = matches!(&msg, ConsensusMsg::Timeout(_) | ConsensusMsg::Tc(_));
+                            if committee.is_empty()
+                                || (!view_sync && msg_index(&msg) > driver.current_index()) {
                                 // Future-round / pre-committee inbound: buffer for replay — PRE-authentication
                                 // (a cert sig can't be checked inline), so this is the UNAUTHENTICATED class:
                                 // half-caps in buffer_pending + the view horizon here (an attacker-chosen far-

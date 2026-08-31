@@ -293,6 +293,23 @@ impl CheckpointConsensus {
     pub fn on_timeout_msg(&mut self, tm: &TimeoutMsg) -> Vec<Action> {
         let q = self.quorum();
         let f = self.f();
+        // Tally only near the current view: one member spraying far-future indices must not grow
+        // the per-index map unboundedly. peer_views (one slot per member) still records it, so the
+        // f+1-distinct jump below works at ANY distance and the tally resumes once we arrive.
+        if tm.index > self.current_index.saturating_add(crate::checkpoint_bft::CONSENSUS_STATE_RETAIN) {
+            self.peer_views.insert(tm.voter.clone(), tm.index);
+            let mut ahead: Vec<u64> = self.peer_views.values().copied()
+                .filter(|i| *i > self.current_index).collect();
+            if ahead.len() >= f + 1 {
+                ahead.sort_unstable_by(|a, b| b.cmp(a));
+                let target = ahead[f];
+                if target > self.current_index {
+                    self.current_index = target;
+                    return vec![Action::EnterView(self.current_index)];
+                }
+            }
+            return Vec::new();
+        }
         let (count, snapshot) = {
             let entry = self.timeouts.entry(tm.index).or_default();
             entry.insert(tm.voter.clone(), tm.clone());
@@ -901,6 +918,16 @@ mod tests {
         assert!(acts.iter().any(|a| matches!(a, Action::EnterView(705))),
                 "jumps to the 2nd-highest announced view, where >=1 honest sits");
         assert_eq!(eng.current_index, 705);
+        // Far beyond the tally horizon (a node hundreds of views behind after a stall): the
+        // per-member view record still drives the jump, without growing the per-index map.
+        let mut far = CheckpointConsensus::new(c[0].clone(), c.clone());
+        far.current_index = 100;
+        let _ = far.on_timeout_msg(&TimeoutMsg { index: 700, voter: c[1].clone(), high_qc_index: 0, signature: Vec::new() });
+        assert_eq!(far.current_index, 100, "one far announcement is not evidence");
+        assert!(far.timeouts.get(&700).is_none(), "far-future indices never enter the tally");
+        let acts = far.on_timeout_msg(&TimeoutMsg { index: 705, voter: c[2].clone(), high_qc_index: 0, signature: Vec::new() });
+        assert!(acts.iter().any(|a| matches!(a, Action::EnterView(700))));
+        assert_eq!(far.current_index, 700);
         // A member leaving the committee no longer counts toward the evidence (f stays 1).
         let mut eng2 = CheckpointConsensus::new(c[0].clone(), c.clone());
         eng2.current_index = 690;
