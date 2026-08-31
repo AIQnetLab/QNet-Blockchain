@@ -27,6 +27,9 @@ pub struct CheckpointConsensus {
     proposals: HashMap<(u64, Hash), Checkpoint>,
     votes: HashMap<(u64, Hash), HashMap<NodeId, Vote>>,
     timeouts: HashMap<u64, HashMap<NodeId, TimeoutMsg>>,
+    /// Newest timeout index seen per member — the view-sync input for the f+1 jump across
+    /// DISTINCT indices (views scattered by restarts never meet on one index otherwise).
+    peer_views: HashMap<NodeId, u64>,
     qcs: HashMap<u64, QuorumCertificate>,
     /// The recovery anchor this node armed for, or None. PARTICIPATION only — it gates what this node
     /// proposes/votes/counts, never what is VALID. `on_vote` recomputes the threshold from the live
@@ -65,7 +68,7 @@ impl CheckpointConsensus {
             node_id, committee, current_index: 1, last_voted_index: 0,
             high_qc: None, locked_index: 0, committed_index: 0,
             proposals: HashMap::new(), votes: HashMap::new(),
-            timeouts: HashMap::new(), qcs: HashMap::new(),
+            timeouts: HashMap::new(), peer_views: HashMap::new(), qcs: HashMap::new(),
             relaxed: None, head_votes: HashMap::new(), index_votes: HashMap::new(),
         }
     }
@@ -134,6 +137,7 @@ impl CheckpointConsensus {
     /// committees sampled from up to MAX_VALIDATORS eligible producers.
     pub fn set_committee(&mut self, mut committee: Vec<NodeId>) {
         committee.sort();
+        self.peer_views.retain(|id, _| committee.binary_search(id).is_ok());
         self.committee = committee;
     }
 
@@ -313,6 +317,20 @@ impl CheckpointConsensus {
         } else if count >= f + 1 && tm.index > self.current_index {
             self.current_index = tm.index; // Bracha: ≥1 honest is here
             out.push(Action::EnterView(self.current_index));
+        }
+        // View sync across DISTINCT indices: restarts scatter views (each reboots at its own vote
+        // ceiling), and same-index counts then never reach f+1. f+1 members announcing views ahead
+        // of ours ⇒ jump to the (f+1)-th highest announced — ≥1 honest is at or above it.
+        self.peer_views.insert(tm.voter.clone(), tm.index);
+        let mut ahead: Vec<u64> = self.peer_views.values().copied()
+            .filter(|i| *i > self.current_index).collect();
+        if ahead.len() >= f + 1 {
+            ahead.sort_unstable_by(|a, b| b.cmp(a));
+            let target = ahead[f];
+            if target > self.current_index {
+                self.current_index = target;
+                out.push(Action::EnterView(self.current_index));
+            }
         }
         out
     }
@@ -867,6 +885,32 @@ mod tests {
         assert!(restored.on_proposal(&rival, &hh(0)).is_empty());
         assert_eq!(restored.voted_content_at(first.window_head_height), Some(pos.1));
         assert_eq!(restored.last_voted_index(), first.index);
+    }
+
+    // Views scattered by restarts (each node reboots at its own vote ceiling) never meet on one
+    // index, so the same-index f+1 rule alone deadlocks. f+1 DISTINCT members announcing views
+    // ahead must pull us to the (f+1)-th highest announced — ≥1 honest is at or above it.
+    #[test]
+    fn f_plus_one_distinct_higher_views_pull_us_up() {
+        let c = committee(5); // f=1, so 2 distinct higher views suffice
+        let mut eng = CheckpointConsensus::new(c[0].clone(), c.clone());
+        eng.current_index = 690;
+        let acts = eng.on_timeout_msg(&TimeoutMsg { index: 705, voter: c[1].clone(), high_qc_index: 0, signature: Vec::new() });
+        assert!(acts.is_empty(), "one voter ahead is not evidence");
+        let acts = eng.on_timeout_msg(&TimeoutMsg { index: 710, voter: c[2].clone(), high_qc_index: 0, signature: Vec::new() });
+        assert!(acts.iter().any(|a| matches!(a, Action::EnterView(705))),
+                "jumps to the 2nd-highest announced view, where >=1 honest sits");
+        assert_eq!(eng.current_index, 705);
+        // A member leaving the committee no longer counts toward the evidence (f stays 1).
+        let mut eng2 = CheckpointConsensus::new(c[0].clone(), c.clone());
+        eng2.current_index = 690;
+        let _ = eng2.on_timeout_msg(&TimeoutMsg { index: 705, voter: c[1].clone(), high_qc_index: 0, signature: Vec::new() });
+        let mut without_c1 = c.clone();
+        without_c1.remove(1);
+        eng2.set_committee(without_c1);
+        let acts = eng2.on_timeout_msg(&TimeoutMsg { index: 710, voter: c[2].clone(), high_qc_index: 0, signature: Vec::new() });
+        assert!(!acts.iter().any(|a| matches!(a, Action::EnterView(_))),
+                "the departed member's announcement was pruned");
     }
 
     // A restart must not re-enter voted territory: those views are unvotable, so idling there
