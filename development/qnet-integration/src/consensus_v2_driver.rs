@@ -724,6 +724,30 @@ mod tests {
         }
     }
 
+    // deliver + per-generation wire census (diagnostic twin of deliver).
+    fn deliver_probed(nodes: &mut Vec<Node>, committee: &[NodeId], seed: Vec<ConsensusMsg>, tick: usize, props: usize) {
+        let mut queue = seed;
+        let mut gen = 0;
+        while !queue.is_empty() && gen < 2000 {
+            gen += 1;
+            let votes = queue.iter().filter(|m| matches!(m, ConsensusMsg::Vote(_))).count();
+            let qcs = queue.iter().filter(|m| matches!(m, ConsensusMsg::Qc(_))).count();
+            if tick < 3 && (props > 0 || votes > 0 || qcs > 0) {
+                println!("tick={} gen={} wire: props={} votes={} qcs={}", tick, gen,
+                         queue.iter().filter(|m| matches!(m, ConsensusMsg::Proposal(_))).count(), votes, qcs);
+            }
+            let mut next = Vec::new();
+            for m in queue.drain(..) {
+                for k in 0..nodes.len() {
+                    if !verify_msg(committee, &m) { continue; }
+                    let effects = nodes[k].d.handle(&m);
+                    for e in effects { next.extend(exec(&mut nodes[k], e)); }
+                }
+            }
+            queue = next;
+        }
+    }
+
     fn deliver(nodes: &mut Vec<Node>, committee: &[NodeId], seed: Vec<ConsensusMsg>) {
         let mut queue = seed;
         let mut rounds = 0;
@@ -993,6 +1017,55 @@ mod tests {
             let mut s = nodes[k].sealed.clone(); s.sort(); s.dedup();
             assert_eq!(s, vec![1, 2], "node {} must seal a macroblock only at 90-boundaries, got {:?}", k, s);
         }
+    }
+
+    // The live post-stall boot layout: vote ceilings scatter the views (boot-jump puts each node
+    // at its own ceiling+1), and recovery must still converge to a QC via timeouts + view sync.
+    #[test]
+    fn scattered_ceiling_reboots_reconverge_and_certify() {
+        let c: Vec<NodeId> = (0..5).map(|i| format!("n{}", i)).collect();
+        let genesis = [7u8; 32];
+        let ceilings = [852u64, 852, 852, 840, 709];
+        let mut nodes: Vec<Node> = c.iter().enumerate().map(|(i, id)| {
+            let mut d = ConsensusDriver::new(id.clone(), c.clone(), genesis);
+            d.set_intervals(30, 90);
+            d.restore_vote_commitments(&[VoteCommitment {
+                index: ceilings[i], window_head: 15390, content_digest: [3u8; 32],
+                pinned: false, parent_index: 568, parent_hash: [4u8; 32],
+            }]);
+            Node { d, id: id.clone(), committed: 0, sealed: Vec::new() }
+        }).collect();
+        for (i, n) in nodes.iter().enumerate() {
+            assert!(n.d.current_index() > ceilings[i], "node {} must boot above its ceiling", i);
+        }
+        // Each "tick": every node re-attempts the window proposal (WindowEnd redrive), then — if no
+        // QC yet — every node's view timer fires (on_timeout) and the timeouts are delivered.
+        let mut qc_formed = false;
+        for _tick in 0..40 {
+            let mut seed = Vec::new();
+            for k in 0..nodes.len() {
+                let w = nodes[k].d.next_window();
+                let effs = nodes[k].d.build_proposal(
+                    w, vec![[w as u8; 32]], [w as u8; 32], [0u8; 32], w * 1000,
+                    c.clone(), Vec::new(), Vec::new(), [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], 0);
+                for e in effs { seed.extend(exec(&mut nodes[k], e)); }
+            }
+            let before: Vec<u64> = nodes.iter().map(|n| n.d.next_window()).collect();
+            deliver(&mut nodes, &c, seed);
+            if nodes.iter().any(|n| n.committed > 0 || !n.sealed.is_empty()) { qc_formed = true; break; }
+            // Timers fire only on a stalled view (live semantics: the redrive re-proposes within
+            // the view long before the backed-off timeout).
+            if nodes.iter().map(|n| n.d.next_window()).collect::<Vec<_>>() == before {
+                let mut tmo = Vec::new();
+                for k in 0..nodes.len() {
+                    for e in nodes[k].d.on_timeout() { tmo.extend(exec(&mut nodes[k], e)); }
+                }
+                deliver(&mut nodes, &c, tmo);
+                if nodes.iter().any(|n| n.committed > 0 || !n.sealed.is_empty()) { qc_formed = true; break; }
+            }
+        }
+        assert!(qc_formed, "scattered reboots never re-certified: views {:?}",
+                nodes.iter().map(|n| n.d.current_index()).collect::<Vec<_>>());
     }
 
     #[test]

@@ -888,7 +888,12 @@ fn try_propose(
             } else {
                 (c.mb_hashes.clone(), c.beacon)
             };
-            driver.build_proposal(w, mb_hashes, c.state_root, beacon, c.head_ts, c.committee.clone(), c.eligible.clone(), c.banned.clone(), c.reward_root, c.registry_root, c.dilithium_pk_root, c.reward_epoch_root, c.logs_root, c.total_supply)
+            let effs = driver.build_proposal(w, mb_hashes, c.state_root, beacon, c.head_ts, c.committee.clone(), c.eligible.clone(), c.banned.clone(), c.reward_root, c.registry_root, c.dilithium_pk_root, c.reward_epoch_root, c.logs_root, c.total_supply);
+            if effs.is_empty() && driver.is_leader_now() && crate::node::is_debug() {
+                println!("[DBG][BFT2] propose_refused round={} window={} committee={}",
+                         driver.current_index(), w, c.committee.len());
+            }
+            effs
         }
         None => Vec::new(),
     }
@@ -1460,6 +1465,7 @@ pub async fn run(
     const BLIND_TICKS_BEFORE_PULL: u32 = 4;
     let mut blind_ticks: u32 = 0;
     let mut blind_pulls: u32 = 0;
+    let mut view_dbg_ticks: u32 = 0;
     let mut committee_window: u64 = u64::MAX; // window `committee` was resolved for
     let mut stuck_alarmed = false;
     // Seed the RAM catch-up store from the sealed frontier: after a restart no new QC may ever
@@ -1662,6 +1668,13 @@ pub async fn run(
                     driver.next_window()
                         .saturating_mul(qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL),
                     Ordering::Relaxed);
+                // View liveness at debug: the whole view machine is otherwise silent between seals.
+                view_dbg_ticks = view_dbg_ticks.wrapping_add(1);
+                if view_dbg_ticks % 8 == 0 && crate::node::is_debug() {
+                    println!("[DBG][BFT2] view_state round={} next_window={} last_signaled={} committee={} leader_now={} buf={}",
+                             driver.current_index(), driver.next_window(), last_signaled,
+                             driver.committee().len(), driver.is_leader_now(), window_buf.len());
+                }
                 let rejects = CONTENT_REJECTS.swap(0, Ordering::Relaxed);
                 let vfails = VERIFY_FAILS.swap(0, Ordering::Relaxed);
                 let shed = CERT_SHED.swap(0, Ordering::Relaxed);
