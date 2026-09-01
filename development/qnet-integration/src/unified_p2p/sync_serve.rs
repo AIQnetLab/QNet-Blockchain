@@ -1840,27 +1840,26 @@ impl SimplifiedP2P {
         // bounded) — never slashed, so honest supersession/progress mid-stall is safe.
         let votes_count = {
             let mut entry = TIMEOUT_VOTES.entry((height, timeout_round)).or_insert_with(HashMap::new);
-            if let Some(existing) = entry.get(&voter_id) {
-                if existing.anchor != anchor_arr {
-                    // A different chain view, not misbehaviour: the anchor is macroblock w-2, and an
-                    // honest node legitimately replaces a locally sealed macroblock with the network's
-                    // during reconciliation. Drop the vote so views never aggregate, but mint no
-                    // evidence — evidence must be something no honest node can produce.
+            match entry.get(&voter_id) {
+                Some(existing) if existing.anchor != anchor_arr => {
+                    // The STORED vote is the stale view: this vote already passed the local-anchor
+                    // gate above, so it carries the canonical anchor and the squatter must yield —
+                    // one pre-reconciliation vote per voter otherwise poisons the tally forever.
+                    // Views still never aggregate: every tallied vote matches the local anchor.
                     if crate::node::is_warn() {
-                        println!("[WARN][TIMEOUT] vote_anchor_changed h={} voter={} action=drop",
+                        println!("[WARN][TIMEOUT] vote_anchor_superseded h={} voter={}",
                                  height, voter_id);
                     }
-                    return;
                 }
-                let progressed = tip_height > existing.tip_height || high_qc_idx > existing.high_qc_idx;
-                let rate_ok = now_secs > existing.updated_at;
-                if !(progressed && rate_ok) { return; } // duplicate / non-progress / too-fast update
-                entry.insert(voter_id.clone(), stored);
-                entry.len()
-            } else {
-                entry.insert(voter_id.clone(), stored);
-                entry.len()
+                Some(existing) => {
+                    let progressed = tip_height > existing.tip_height || high_qc_idx > existing.high_qc_idx;
+                    let rate_ok = now_secs > existing.updated_at;
+                    if !(progressed && rate_ok) { return; } // duplicate / non-progress / too-fast update
+                }
+                None => {}
             }
+            entry.insert(voter_id.clone(), stored);
+            entry.len()
         };
 
         if crate::node::is_info() {
