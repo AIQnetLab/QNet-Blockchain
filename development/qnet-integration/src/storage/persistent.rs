@@ -1225,6 +1225,17 @@ impl PersistentStorage {
         Ok(())
     }
 
+    /// Force the sealed-macroblock watermark DOWN to `idx` (recovery decree only). The normal
+    /// path is monotonic-up; a decree that prunes above target must also retract this marker,
+    /// or last_sealed_mb_index keeps reporting the pruned frontier and the node chases a
+    /// non-existent height forever.
+    pub fn force_last_sealed_mb(&self, idx: u64) -> IntegrationResult<()> {
+        let cf = self.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
+        self.db.put_cf(&cf, b"last_sealed_mb", &idx.to_le_bytes())?;
+        Ok(())
+    }
+
     /// Applied recovery-decree sequence (replay floor). 0 = none applied.
     pub fn applied_decree_seq(&self) -> u64 {
         self.db.cf_handle("metadata")

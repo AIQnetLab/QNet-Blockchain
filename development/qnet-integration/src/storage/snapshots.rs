@@ -64,6 +64,9 @@ impl Storage {
     pub fn delete_macroblock_pub(&self, idx: u64) -> IntegrationResult<()> {
         self.persistent.delete_macroblock(idx)
     }
+    pub fn force_last_sealed_mb(&self, idx: u64) -> IntegrationResult<()> {
+        self.persistent.force_last_sealed_mb(idx)
+    }
     pub fn delete_microblocks_range_pub(&self, from: u64, to: u64) -> IntegrationResult<u64> {
         self.persistent.delete_microblocks_range(from, to)
     }

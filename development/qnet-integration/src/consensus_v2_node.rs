@@ -1207,6 +1207,9 @@ pub fn execute_recovery_decree(storage: &Storage, seq: u64, target: u64) -> ! {
         let _ = storage.delete_microblocks_range_pub(target + 1, tip);
         let _ = storage.set_chain_height(target);
     }
+    // Retract the sealed-macroblock watermark to the target boundary: it is monotonic-up on the
+    // normal path, so without this the pruned frontier is still reported and the node chases it.
+    let _ = storage.force_last_sealed_mb(target / mi);
     let _ = storage.set_applied_decree_seq(seq);
     println!("[WARN][DECREE] executed seq={} target={} pruned_to_mb={} action=process_restart",
              seq, target, target / mi);
