@@ -1710,6 +1710,28 @@ impl SimplifiedP2P {
                 }
             }
 
+            NetworkMessage::RecoveryDecree { seq, target_height, sigs } => {
+                let storage = match crate::node::try_get_storage() { Some(s) => s, None => return };
+                if seq <= storage.applied_decree_seq() { return; } // replay floor
+                let genesis_hash = match storage.load_microblock_auto_format(0).ok().flatten() {
+                    Some(g) => g.hash(), None => return,
+                };
+                if !crate::consensus_v2_node::verify_recovery_decree(&genesis_hash, seq, target_height, &sigs) {
+                    if crate::node::is_warn() {
+                        println!("[WARN][DECREE] rejected seq={} target={} reason=signatures", seq, target_height);
+                    }
+                    return;
+                }
+                if crate::node::is_warn() {
+                    println!("[WARN][DECREE] accepted seq={} target={} — regossip then execute", seq, target_height);
+                }
+                // Re-gossip BEFORE executing: execution prunes and restarts this process.
+                self.gossip_to_random_peers(NetworkMessage::RecoveryDecree {
+                    seq, target_height, sigs: sigs.clone() }, 8);
+                std::thread::sleep(std::time::Duration::from_secs(2)); // let the fan-out flush
+                crate::consensus_v2_node::execute_recovery_decree(&storage, seq, target_height);
+            }
+
             NetworkMessage::RequestConsensusState { round, requester_id } => {
                 // Handle consensus state request
                 if crate::node::is_info() {

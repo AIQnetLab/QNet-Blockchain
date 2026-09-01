@@ -90,9 +90,19 @@ pub fn take_fork_recovery_signal() -> Option<u64> {
 static APPLY_MISMATCH_COUNT: AtomicU64 = AtomicU64::new(0);
 const APPLY_MISMATCH_BREAKER: u64 = 3;
 
+/// State-suspect latch: set when the breaker trips, cleared ONLY by a PROVEN reconcile.
+/// While set, this node abstains from checkpoint voting — a contaminated quorum must not
+/// certify, and a member that cannot trust its own derivation must not count toward n−f.
+static STATE_SUSPECT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub fn state_suspect() -> bool { STATE_SUSPECT.load(Ordering::Acquire) }
+pub fn mark_state_suspect() { STATE_SUSPECT.store(true, Ordering::Release); }
+pub fn clear_state_suspect() { STATE_SUSPECT.store(false, Ordering::Release); }
+
 /// Record an apply failure; returns true once it trips the breaker.
 fn record_apply_mismatch() -> bool {
-    APPLY_MISMATCH_COUNT.fetch_add(1, Ordering::Relaxed) + 1 >= APPLY_MISMATCH_BREAKER
+    let tripped = APPLY_MISMATCH_COUNT.fetch_add(1, Ordering::Relaxed) + 1 >= APPLY_MISMATCH_BREAKER;
+    if tripped { mark_state_suspect(); }
+    tripped
 }
 
 /// Heights currently parked in the deferred buffer (refcounted: siblings can share a

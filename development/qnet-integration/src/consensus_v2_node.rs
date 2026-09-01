@@ -925,6 +925,10 @@ enum ContentCheck {
 /// Single source of truth for the live inbound path AND drain_pending (replay = the same gate).
 fn check_content(storage: &Storage, buf: &std::collections::HashMap<u64, WindowContent>, msg: &ConsensusMsg) -> ContentCheck {
     let cp = match msg { ConsensusMsg::Proposal(cp) => cp, _ => return ContentCheck::Ok };
+    // A node whose apply-breaker tripped cannot trust its own derivation: abstain from
+    // voting (Defer, replayed after a PROVEN reconcile) — a contaminated quorum must not
+    // certify its shared contamination into finalized history.
+    if crate::block_pipeline::state_suspect() { return ContentCheck::Defer; }
     // The pin is attacker-chosen wire data that selects a lower threshold. While the feature is off
     // no node may sign one, or an unarmed committee certifies a checkpoint every peer then rejects.
     if !crate::node::RC_ENABLED && cp.recovery_anchor.is_some() { return ContentCheck::Reject("pin"); }
@@ -1150,6 +1154,63 @@ pub(crate) fn peer_window_from(heights: Vec<u64>, local_tip: u64) -> u64 {
     let hs: Vec<u64> = heights.into_iter().map(|h| h.min(ceiling)).collect();
     crate::unified_p2p::frontier_order_statistic(hs)
         / qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL
+}
+
+/// Coordinated-recovery decree: an operator directive "recover from height H", valid only under
+/// a quorum of genesis consensus signatures. Chain-bound (genesis block hash) + replay-floored
+/// (monotonic seq). Execution prunes everything above H and restarts the process — boot then
+/// re-derives finality and state from certified storage alone.
+pub fn recovery_decree_msg(genesis_hash: &[u8; 32], seq: u64, target: u64) -> String {
+    format!("RDCR:{}:{}:{}", hex::encode(genesis_hash), seq, target)
+}
+
+pub fn verify_recovery_decree(genesis_hash: &[u8; 32], seq: u64, target: u64,
+                              sigs: &[(String, Vec<u8>)]) -> bool {
+    let msg = recovery_decree_msg(genesis_hash, seq, target);
+    let mut valid: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for (id, sig) in sigs {
+        if valid.contains(id.as_str()) { continue; }
+        let pk = match crate::genesis_constants::get_genesis_anchor_pk(id) { Some(p) => p, None => continue };
+        let sig_str = match std::str::from_utf8(sig) { Ok(s) => s, Err(_) => continue };
+        let compact = match qnet_consensus::consensus_crypto::strip_embedded_pk(sig_str) {
+            Some(c) => c, None => sig_str.to_string(),
+        };
+        if qnet_consensus::consensus_crypto::verify_consensus_signature_compact(id, &msg, &compact, &pk) {
+            valid.insert(id.as_str());
+        }
+    }
+    valid.len() >= qnet_consensus::checkpoint_bft::quorum_size(
+        crate::genesis_constants::GENESIS_CONSENSUS_PKS.len())
+}
+
+/// Prune all consensus/chain artifacts above `target`, then persist the seq (idempotent deletes:
+/// a crash mid-prune re-executes on redelivery), then exit for a clean boot.
+pub fn execute_recovery_decree(storage: &Storage, seq: u64, target: u64) -> ! {
+    if let Ok(pairs) = storage.load_certified_pairs() {
+        for (idx, bytes) in pairs {
+            let head = bincode::deserialize::<Vec<ConsensusMsg>>(&bytes).ok()
+                .and_then(|p| p.iter().find_map(|m| match m {
+                    ConsensusMsg::Proposal(cp) => Some(cp.window_head_height), _ => None }));
+            if head.map(|h| h > target).unwrap_or(true) {
+                let _ = storage.delete_certified_pair(idx);
+            }
+        }
+    }
+    let mi = qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
+    let last_mb = storage.last_sealed_mb_index();
+    for mb in (target / mi + 1)..=last_mb.max(target / mi + 1) {
+        let _ = storage.delete_macroblock_pub(mb);
+    }
+    let tip = storage.get_chain_height().unwrap_or(target);
+    // A node at/below the target has nothing to prune — never RAISE the height marker.
+    if tip > target {
+        let _ = storage.delete_microblocks_range_pub(target + 1, tip);
+        let _ = storage.set_chain_height(target);
+    }
+    let _ = storage.set_applied_decree_seq(seq);
+    println!("[WARN][DECREE] executed seq={} target={} pruned_to_mb={} action=process_restart",
+             seq, target, target / mi);
+    std::process::exit(0);
 }
 
 /// Certified pair for the checkpoint at `head_height`, from the WAL. O(RETAIN) scan of small pairs.

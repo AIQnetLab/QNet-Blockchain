@@ -1225,6 +1225,28 @@ impl PersistentStorage {
         Ok(())
     }
 
+    /// Applied recovery-decree sequence (replay floor). 0 = none applied.
+    pub fn applied_decree_seq(&self) -> u64 {
+        self.db.cf_handle("metadata")
+            .and_then(|cf| self.db.get_cf(&cf, b"rdcr_seq").ok().flatten())
+            .filter(|v| v.len() >= 8)
+            .map(|v| u64::from_le_bytes(v[..8].try_into().unwrap_or_default()))
+            .unwrap_or(0)
+    }
+    pub fn set_applied_decree_seq(&self, seq: u64) -> IntegrationResult<()> {
+        let cf = self.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
+        self.db.put_cf(&cf, b"rdcr_seq", seq.to_le_bytes())?;
+        Ok(())
+    }
+
+    pub fn delete_certified_pair(&self, index: u64) -> IntegrationResult<()> {
+        let cf = self.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
+        self.db.delete_cf(&cf, super::certified_pair_key(index))?;
+        Ok(())
+    }
+
     /// All stored certified pairs, index-ascending.
     pub fn load_certified_pairs(&self) -> IntegrationResult<Vec<(u64, Vec<u8>)>> {
         let cf = self.db.cf_handle("metadata")

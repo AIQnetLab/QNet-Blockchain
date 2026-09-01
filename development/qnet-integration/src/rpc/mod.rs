@@ -2804,7 +2804,8 @@ async fn handle_rpc(
         // interface: on 0.0.0.0 they were reachable by anyone on the internet, and while neither can
         // relax a healthy network (rc_try_arm re-checks every condition), disarming during a genuine
         // halt is a free denial of the one recovery path the node has.
-        "node_armRecovery" | "node_disarmRecovery" | "node_recoveryStatus" => {
+        "node_armRecovery" | "node_disarmRecovery" | "node_recoveryStatus"
+        | "node_decreeEndorse" | "node_decreeSubmit" => {
             let ip = remote_addr.map(|a| a.ip().to_string()).unwrap_or_default();
             if !is_internal_ip(&ip) {
                 Err(RpcError { code: -32004, message: "operator method: local interface only".to_string(), data: None })
@@ -2812,6 +2813,8 @@ async fn handle_rpc(
                 match request.method.as_str() {
                     "node_armRecovery" => node_arm_recovery(blockchain).await,
                     "node_disarmRecovery" => node_disarm_recovery().await,
+                    "node_decreeEndorse" => node_decree_endorse(blockchain, request.params).await,
+                    "node_decreeSubmit" => node_decree_submit(blockchain, request.params).await,
                     _ => node_recovery_status(blockchain).await,
                 }
             }
@@ -3140,6 +3143,58 @@ pub async fn live_activation_pricing_opt() -> Option<ActivationPricing> {
 ///
 /// Arming has no consensus effect by itself: it changes what this node proposes and counts, never what
 /// is valid. Validity is decided by each certificate's own bytes at the macroblock gate.
+/// Operator: sign the recovery-decree payload with this node's consensus key.
+async fn node_decree_endorse(blockchain: Arc<BlockchainNode>, params: Option<Value>) -> Result<Value, RpcError> {
+    let p = params.ok_or(RpcError { code: -32602, message: "params required".into(), data: None })?;
+    let seq = p["seq"].as_u64().ok_or(RpcError { code: -32602, message: "seq required".into(), data: None })?;
+    let target = p["target_height"].as_u64().ok_or(RpcError { code: -32602, message: "target_height required".into(), data: None })?;
+    let storage = blockchain.get_storage();
+    let genesis_hash = storage.load_microblock_auto_format(0).ok().flatten()
+        .map(|g| g.hash())
+        .ok_or(RpcError { code: -32000, message: "genesis block unavailable".into(), data: None })?;
+    let msg = crate::consensus_v2_node::recovery_decree_msg(&genesis_hash, seq, target);
+    let crypto = crate::node::try_get_quantum_crypto()
+        .ok_or(RpcError { code: -32000, message: "crypto unavailable".into(), data: None })?;
+    let node_id = blockchain.get_node_id();
+    match crypto.create_consensus_signature(&node_id, &msg).await {
+        Ok(sig) => Ok(json!({ "node_id": node_id, "sig": hex::encode(sig.signature.into_bytes()) })),
+        Err(e) => Err(RpcError { code: -32000, message: format!("sign failed: {}", e), data: None }),
+    }
+}
+
+/// Operator: validate the assembled decree and inject it (gossip + local execution).
+async fn node_decree_submit(blockchain: Arc<BlockchainNode>, params: Option<Value>) -> Result<Value, RpcError> {
+    let p = params.ok_or(RpcError { code: -32602, message: "params required".into(), data: None })?;
+    let seq = p["seq"].as_u64().ok_or(RpcError { code: -32602, message: "seq required".into(), data: None })?;
+    let target = p["target_height"].as_u64().ok_or(RpcError { code: -32602, message: "target_height required".into(), data: None })?;
+    let sigs: Vec<(String, Vec<u8>)> = p["sigs"].as_array()
+        .ok_or(RpcError { code: -32602, message: "sigs required".into(), data: None })?
+        .iter()
+        .filter_map(|e| Some((e["node_id"].as_str()?.to_string(), hex::decode(e["sig"].as_str()?).ok()?)))
+        .collect();
+    let storage = blockchain.get_storage();
+    if seq <= storage.applied_decree_seq() {
+        return Err(RpcError { code: -32000, message: "seq at or below applied floor".into(), data: None });
+    }
+    let genesis_hash = storage.load_microblock_auto_format(0).ok().flatten()
+        .map(|g| g.hash())
+        .ok_or(RpcError { code: -32000, message: "genesis block unavailable".into(), data: None })?;
+    if !crate::consensus_v2_node::verify_recovery_decree(&genesis_hash, seq, target, &sigs) {
+        return Err(RpcError { code: -32000, message: "decree signature quorum not met".into(), data: None });
+    }
+    if let Some(p2p) = blockchain.get_unified_p2p() {
+        p2p.gossip_to_random_peers(crate::unified_p2p::NetworkMessage::RecoveryDecree {
+            seq, target_height: target, sigs }, 16);
+    }
+    // Execute after the HTTP response flushes; execution prunes and restarts the process.
+    let storage2 = storage.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        crate::consensus_v2_node::execute_recovery_decree(&storage2, seq, target);
+    });
+    Ok(json!({ "accepted": true, "seq": seq, "target_height": target }))
+}
+
 async fn node_arm_recovery(blockchain: Arc<BlockchainNode>) -> Result<Value, RpcError> {
     let storage = blockchain.get_storage();
     let heard = crate::node::rc_recent_consensus_senders();

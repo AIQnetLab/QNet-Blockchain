@@ -4037,6 +4037,14 @@ pub enum NetworkMessage {
     RequestGenesisCheckpoint {
         requester_id: String,
     },
+
+    /// Coordinated-recovery decree: "recover from target_height", valid only under a quorum of
+    /// genesis consensus signatures over the chain-bound payload. Replay-floored by seq.
+    RecoveryDecree {
+        seq: u64,
+        target_height: u64,
+        sigs: Vec<(String, Vec<u8>)>,
+    },
 }
 
 /// PRODUCTION: Active node info for gossip sync

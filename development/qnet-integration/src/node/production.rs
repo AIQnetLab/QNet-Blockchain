@@ -170,6 +170,7 @@ impl BlockchainNode {
                                         rollback_to, e,
                                     );
                                 } else {
+                                    crate::block_pipeline::clear_state_suspect();
                                     println!(
                                         "[INFO][STATE] reconcile_after_pipeline_fork_ok target={}",
                                         rollback_to,
@@ -236,7 +237,7 @@ impl BlockchainNode {
                             if prev == 0 || local_h > prev {
                                 TIP_RECONCILE_ATTEMPTS.store(0, Ordering::Relaxed);
                                 match Self::reconcile_state_after_rollback(&state, &storage, local_h).await {
-                                    Ok(_) => println!("[INFO][FORK] state_reconciled_at_tip h={}", local_h),
+                                    Ok(_) => { crate::block_pipeline::clear_state_suspect(); println!("[INFO][FORK] state_reconciled_at_tip h={}", local_h); }
                                     Err(e) => {
                                         storage.mark_owns_index_dirty();
                                         println!("[WARN][FORK] tip_reconcile_unproven h={} err={} action=coordinator_state_sync",
@@ -255,7 +256,7 @@ impl BlockchainNode {
                                     // Descent bottomed at the certified base with the fault still
                                     // present — rebuild state against it; certified content is clean.
                                     match Self::reconcile_state_after_rollback(&state, &storage, local_h).await {
-                                        Ok(_) => println!("[INFO][FORK] state_reconciled_at_floor h={}", local_h),
+                                        Ok(_) => { crate::block_pipeline::clear_state_suspect(); println!("[INFO][FORK] state_reconciled_at_floor h={}", local_h); }
                                         Err(e) => {
                                             storage.mark_owns_index_dirty();
                                             println!("[WARN][FORK] floor_reconcile_unproven h={} err={} action=coordinator_state_sync",

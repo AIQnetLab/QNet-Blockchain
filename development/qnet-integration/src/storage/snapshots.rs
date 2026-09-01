@@ -54,6 +54,19 @@ impl Storage {
     pub fn load_certified_pairs(&self) -> IntegrationResult<Vec<(u64, Vec<u8>)>> {
         self.persistent.load_certified_pairs()
     }
+    pub fn delete_certified_pair(&self, index: u64) -> IntegrationResult<()> {
+        self.persistent.delete_certified_pair(index)
+    }
+    pub fn applied_decree_seq(&self) -> u64 { self.persistent.applied_decree_seq() }
+    pub fn set_applied_decree_seq(&self, seq: u64) -> IntegrationResult<()> {
+        self.persistent.set_applied_decree_seq(seq)
+    }
+    pub fn delete_macroblock_pub(&self, idx: u64) -> IntegrationResult<()> {
+        self.persistent.delete_macroblock(idx)
+    }
+    pub fn delete_microblocks_range_pub(&self, from: u64, to: u64) -> IntegrationResult<u64> {
+        self.persistent.delete_microblocks_range(from, to)
+    }
     pub fn put_galc_held(&self, bytes: &[u8]) -> IntegrationResult<()> { self.persistent.put_galc_held(bytes) }
     pub fn get_galc_held(&self) -> IntegrationResult<Option<Vec<u8>>> { self.persistent.get_galc_held() }
     /// The macroblock index this node cold-joined at, or 0 for a from-genesis node.
