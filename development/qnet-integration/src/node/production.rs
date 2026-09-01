@@ -228,17 +228,12 @@ impl BlockchainNode {
                         } else {
                             // Target at/above the local tip: nothing to delete, but the breaker
                             // fired, so the RAM state no longer reproduces the stored chain.
-                            // Rebuild it; if the SAME tip trips again the stored chain itself
-                            // holds the losing branch — deepen into a real rollback progressively.
-                            if TIP_RECONCILED_AT.swap(local_h, Ordering::Relaxed) == local_h {
-                                let attempts = TIP_RECONCILE_ATTEMPTS.fetch_add(1, Ordering::Relaxed) + 1;
-                                let target = local_h.saturating_sub(1u64 << attempts.min(6)).max(1);
-                                crate::block_pipeline::signal_fork_recovery(target);
-                                if is_warn() {
-                                    println!("[WARN][FORK] tip_reconcile_repeat h={} attempts={} deepen_to={}",
-                                             local_h, attempts, target);
-                                }
-                            } else {
+                            // First trip at a tip rebuilds state; repeats mean the stored chain
+                            // holds the losing branch — deepen into a real rollback, exponentially
+                            // across the whole DESCENT (a rollback lowers the tip, which must not
+                            // reset the counter — that made the descent linear). Reset on progress.
+                            let prev = TIP_RECONCILED_AT.swap(local_h, Ordering::Relaxed);
+                            if prev == 0 || local_h > prev {
                                 TIP_RECONCILE_ATTEMPTS.store(0, Ordering::Relaxed);
                                 match Self::reconcile_state_after_rollback(&state, &storage, local_h).await {
                                     Ok(_) => println!("[INFO][FORK] state_reconciled_at_tip h={}", local_h),
@@ -247,6 +242,14 @@ impl BlockchainNode {
                                         println!("[WARN][FORK] tip_reconcile_unproven h={} err={} action=coordinator_state_sync",
                                                  local_h, e);
                                     }
+                                }
+                            } else {
+                                let attempts = TIP_RECONCILE_ATTEMPTS.fetch_add(1, Ordering::Relaxed) + 1;
+                                let target = local_h.saturating_sub(1u64 << attempts.min(6)).max(1);
+                                crate::block_pipeline::signal_fork_recovery(target);
+                                if is_warn() {
+                                    println!("[WARN][FORK] tip_reconcile_repeat h={} attempts={} deepen_to={}",
+                                             local_h, attempts, target);
                                 }
                             }
                         }
