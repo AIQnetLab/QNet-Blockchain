@@ -245,10 +245,24 @@ impl BlockchainNode {
                                 }
                             } else {
                                 let attempts = TIP_RECONCILE_ATTEMPTS.fetch_add(1, Ordering::Relaxed) + 1;
-                                let target = local_h.saturating_sub(1u64 << attempts.min(6)).max(1);
+                                // Clamped to the finality floor: certified history never rolls back,
+                                // and an unclamped target below it is refused forever (deepen livelock).
+                                let fin_floor = LAST_FINALIZED_HEIGHT.load(std::sync::atomic::Ordering::SeqCst);
+                                let target = local_h.saturating_sub(1u64 << attempts.min(6)).max(fin_floor).max(1);
                                 // No rollback room below the snapshot anchor: the only remedy left
                                 // is a wholesale state restore, not an endless deepen loop.
-                                if target <= anchor_floor {
+                                if target >= local_h {
+                                    // Descent bottomed at the certified base with the fault still
+                                    // present — rebuild state against it; certified content is clean.
+                                    match Self::reconcile_state_after_rollback(&state, &storage, local_h).await {
+                                        Ok(_) => println!("[INFO][FORK] state_reconciled_at_floor h={}", local_h),
+                                        Err(e) => {
+                                            storage.mark_owns_index_dirty();
+                                            println!("[WARN][FORK] floor_reconcile_unproven h={} err={} action=coordinator_state_sync",
+                                                     local_h, e);
+                                        }
+                                    }
+                                } else if target <= anchor_floor {
                                     storage.mark_owns_index_dirty();
                                     if is_warn() {
                                         println!("[WARN][FORK] deepen_exhausted h={} anchor_floor={} action=coordinator_state_sync",
