@@ -26,6 +26,10 @@ impl BlockchainNode {
                 // Must run unconditionally so any node can recover from pipeline-detected fork.
                 // ═══════════════════════════════════════════════════════════════════
                 if let Some(fork_h) = crate::block_pipeline::take_fork_recovery_signal() {
+                    // Tip-level reconcile dedup: same-tip repeats mean the stored chain is the
+                    // fault, not the state — tracked to drive the progressive deepening below.
+                    static TIP_RECONCILED_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    static TIP_RECONCILE_ATTEMPTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                     let local_h = *height.read().await;
                     // v33: FORK_RECOVERY_HEIGHT is the deterministic highest-good height —
                     // disputed_height-1 (n−f minority-fork observer) or finalized_h+1 (anchor
@@ -219,6 +223,30 @@ impl BlockchainNode {
                                              rollback_to, adopted);
                                 } else {
                                     println!("[INFO][FORK] rollback_done to={} action=coordinator_sync", rollback_to);
+                                }
+                            }
+                        } else {
+                            // Target at/above the local tip: nothing to delete, but the breaker
+                            // fired, so the RAM state no longer reproduces the stored chain.
+                            // Rebuild it; if the SAME tip trips again the stored chain itself
+                            // holds the losing branch — deepen into a real rollback progressively.
+                            if TIP_RECONCILED_AT.swap(local_h, Ordering::Relaxed) == local_h {
+                                let attempts = TIP_RECONCILE_ATTEMPTS.fetch_add(1, Ordering::Relaxed) + 1;
+                                let target = local_h.saturating_sub(1u64 << attempts.min(6)).max(1);
+                                crate::block_pipeline::signal_fork_recovery(target);
+                                if is_warn() {
+                                    println!("[WARN][FORK] tip_reconcile_repeat h={} attempts={} deepen_to={}",
+                                             local_h, attempts, target);
+                                }
+                            } else {
+                                TIP_RECONCILE_ATTEMPTS.store(0, Ordering::Relaxed);
+                                match Self::reconcile_state_after_rollback(&state, &storage, local_h).await {
+                                    Ok(_) => println!("[INFO][FORK] state_reconciled_at_tip h={}", local_h),
+                                    Err(e) => {
+                                        storage.mark_owns_index_dirty();
+                                        println!("[WARN][FORK] tip_reconcile_unproven h={} err={} action=coordinator_state_sync",
+                                                 local_h, e);
+                                    }
                                 }
                             }
                         }
