@@ -246,10 +246,20 @@ impl BlockchainNode {
                             } else {
                                 let attempts = TIP_RECONCILE_ATTEMPTS.fetch_add(1, Ordering::Relaxed) + 1;
                                 let target = local_h.saturating_sub(1u64 << attempts.min(6)).max(1);
-                                crate::block_pipeline::signal_fork_recovery(target);
-                                if is_warn() {
-                                    println!("[WARN][FORK] tip_reconcile_repeat h={} attempts={} deepen_to={}",
-                                             local_h, attempts, target);
+                                // No rollback room below the snapshot anchor: the only remedy left
+                                // is a wholesale state restore, not an endless deepen loop.
+                                if target <= anchor_floor {
+                                    storage.mark_owns_index_dirty();
+                                    if is_warn() {
+                                        println!("[WARN][FORK] deepen_exhausted h={} anchor_floor={} action=coordinator_state_sync",
+                                                 local_h, anchor_floor);
+                                    }
+                                } else {
+                                    crate::block_pipeline::signal_fork_recovery(target);
+                                    if is_warn() {
+                                        println!("[WARN][FORK] tip_reconcile_repeat h={} attempts={} deepen_to={}",
+                                                 local_h, attempts, target);
+                                    }
                                 }
                             }
                         }
