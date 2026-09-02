@@ -3163,9 +3163,8 @@ async fn node_decree_endorse(blockchain: Arc<BlockchainNode>, params: Option<Val
     let seq = p["seq"].as_u64().ok_or(RpcError { code: -32602, message: "seq required".into(), data: None })?;
     let target = p["target_height"].as_u64().ok_or(RpcError { code: -32602, message: "target_height required".into(), data: None })?;
     let storage = blockchain.get_storage();
-    let genesis_hash = storage.load_microblock_auto_format(0).ok().flatten()
-        .map(|g| g.hash())
-        .ok_or(RpcError { code: -32000, message: "genesis block unavailable".into(), data: None })?;
+    let genesis_hash = storage.genesis_anchor()
+        .ok_or(RpcError { code: -32000, message: "genesis hash unavailable".into(), data: None })?;
     let msg = crate::consensus_v2_node::recovery_decree_msg(&genesis_hash, seq, target);
     let crypto = crate::node::try_get_quantum_crypto()
         .ok_or(RpcError { code: -32000, message: "crypto unavailable".into(), data: None })?;
@@ -3190,9 +3189,8 @@ async fn node_decree_submit(blockchain: Arc<BlockchainNode>, params: Option<Valu
     if seq <= storage.applied_decree_seq() {
         return Err(RpcError { code: -32000, message: "seq at or below applied floor".into(), data: None });
     }
-    let genesis_hash = storage.load_microblock_auto_format(0).ok().flatten()
-        .map(|g| g.hash())
-        .ok_or(RpcError { code: -32000, message: "genesis block unavailable".into(), data: None })?;
+    let genesis_hash = storage.genesis_anchor()
+        .ok_or(RpcError { code: -32000, message: "genesis hash unavailable".into(), data: None })?;
     if !crate::consensus_v2_node::verify_recovery_decree(&genesis_hash, seq, target, &sigs) {
         return Err(RpcError { code: -32000, message: "decree signature quorum not met".into(), data: None });
     }

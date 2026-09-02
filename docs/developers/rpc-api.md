@@ -268,7 +268,7 @@ rate limit returns `-32029`.
 | GET | `/api/v1/block/latest` | Block at the current tip |
 | GET | `/api/v1/block/{height}` | Block JSON plus `timeout_round`, `carried_baseline` and `abs_round` (= sum of the two) injected from the stored microblock |
 | GET | `/api/v1/block/hash/{hash}` | `{hash, found, block{...}}`; searches the last 1000 blocks, recomputing each hash |
-| GET | `/api/v1/genesis/block` | Raw block-0 bincode bytes as `application/octet-stream`, so a cold-joining node's hash matches byte-for-byte; HTTP 404 `{error:"genesis_block_unavailable"}` otherwise |
+| GET | `/api/v1/genesis/block` | Full block 0 with its transactions, bincode + zstd, as `application/octet-stream` (computed once per process; identical bytes on every node, so a joining node's multi-source hash vote agrees); HTTP 404 `{error:"genesis_block_unavailable"}` when the node cannot reconstruct block 0 |
 | GET | `/api/v1/microblock/{height}` | Deserialized microblock; HTTP 404 `Block not yet produced` for a future height, `Block not found` for a missing one; HTTP 500 `Failed to load block` on a storage error |
 | GET | `/api/v1/microblocks?from=&to=` | `{from, to, items[{height, data}]}` with `data` as base64 raw bytes; `to` is clamped to `from + 100` |
 | GET | `/api/v1/macroblock/{index}` | `{index, height, timestamp, micro_blocks_count, micro_blocks[], state_root, consensus_data{...}, previous_hash}` |

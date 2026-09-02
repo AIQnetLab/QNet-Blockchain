@@ -1713,8 +1713,12 @@ impl SimplifiedP2P {
             NetworkMessage::RecoveryDecree { seq, target_height, sigs } => {
                 let storage = match crate::node::try_get_storage() { Some(s) => s, None => return };
                 if seq <= storage.applied_decree_seq() { return; } // replay floor
-                let genesis_hash = match storage.load_microblock_auto_format(0).ok().flatten() {
-                    Some(g) => g.hash(), None => return,
+                let genesis_hash = match storage.genesis_anchor() {
+                    Some(h) => h,
+                    None => {
+                        if crate::node::is_warn() { println!("[WARN][DECREE] ignored seq={} reason=no_genesis_hash", seq); }
+                        return;
+                    }
                 };
                 if !crate::consensus_v2_node::verify_recovery_decree(&genesis_hash, seq, target_height, &sigs) {
                     if crate::node::is_warn() {

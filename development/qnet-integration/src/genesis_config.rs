@@ -37,6 +37,10 @@ pub enum GenesisResult {
     },
     /// This is genesis node 001, needs to CREATE genesis
     NeedsCreation,
+    /// Header row retained but the tx rows expired: timing is known, the body arrives via P2P backfill
+    HeaderOnly {
+        timestamp: u64,
+    },
     /// Genesis not available — fatal error
     NotAvailable {
         tried: Vec<String>,
@@ -182,8 +186,18 @@ pub async fn load_genesis(
         }
     }
 
+    // Expired body, retained header: the node keeps genesis timing and stays consensus-capable
+    // (and node 001 never re-creates a genesis it already holds);
+    // the tx rows come back store-only with the next delivery of block 0.
+    if let Ok(Some(timestamp)) = storage.block_timestamp_at(0) {
+        if is_warn() {
+            println!("[WARN][GENESIS] body_expired using_header_ts={} tried={:?}", timestamp, tried);
+        }
+        return GenesisResult::HeaderOnly { timestamp };
+    }
+
     // === Priority 4: Create (node 001 only) ===
-    if config.bootstrap_id.as_deref() == Some("001") {
+    if config.bootstrap_id.as_deref() == Some("001") && storage.get_chain_height().unwrap_or(0) == 0 {
         if is_info() {
             println!("[INFO][GENESIS] needs_creation bootstrap_id=001");
         }
@@ -243,13 +257,78 @@ pub async fn apply_genesis_state(
 }
 
 /// Export genesis block to file (for distribution to other nodes).
+/// A node that already holds block 0's hash accepts only THAT genesis from file/HTTP; a foreign
+/// block 0 (another network incarnation, a tampered file, a MITM body) is refused outright and is
+/// never adopted in RAM either.
+fn foreign_genesis(storage: &Arc<Storage>, block: &qnet_state::MicroBlock) -> Option<String> {
+    match storage.genesis_anchor() {
+        Some(held) if held != block.hash() => Some(format!(
+            "foreign genesis: held={} offered={}", hex::encode(&held[..8]), hex::encode(&block.hash()[..8]))),
+        _ => None,
+    }
+}
+
+/// Genesis on the wire (file export and `/api/v1/genesis/block`): the FULL block with its
+/// transactions, bincode + zstd. The raw CF row is an EfficientMicroBlock without transactions
+/// and no loader can turn that back into genesis.
+pub fn genesis_wire_bytes(block: &qnet_state::MicroBlock) -> Result<Vec<u8>, String> {
+    let raw = bincode::serialize(block).map_err(|e| format!("serialize: {}", e))?;
+    zstd::encode_all(&raw[..], 3).map_err(|e| format!("zstd: {}", e))
+}
+
+/// Everything a WARM node takes from a re-loaded genesis besides account state (its state is
+/// already replayed): registration cache/stamps and timing. Idempotent.
+pub fn adopt_genesis_metadata(block: &qnet_state::MicroBlock, storage: &Arc<Storage>) {
+    crate::node::BlockchainNode::cache_node_registrations_from_transactions(storage, &block.transactions);
+    crate::node::BlockchainNode::apply_genesis_registrations(storage, &block.transactions);
+    crate::GLOBAL_GENESIS_TIMESTAMP.store(block.timestamp, std::sync::atomic::Ordering::Relaxed);
+    crate::set_genesis_timestamp(block.timestamp);
+}
+
+/// Boot found no complete genesis (row absent, or header only). Keep trying the loaders in the
+/// background with backoff (60 s -> 15 min) until the body is back, then unlock the coordinator.
+/// The P2P body backfill may win the race; the loop just stops when block 0 reconstructs.
+pub fn spawn_genesis_restore(storage: Arc<Storage>, coordinator: crate::consensus_state::CoordinatorHandle) {
+    tokio::spawn(async move {
+        let cfg = GenesisConfig::from_env();
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            let delay = (60u64 << (attempt / 10).min(4)).min(900);
+            tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+            let s = storage.clone();
+            let complete = tokio::task::spawn_blocking(move || s.load_microblock_auto_format(0)).await;
+            let block = match complete {
+                Ok(Ok(Some(b))) => b, // restored by the P2P backfill
+                _ => match load_genesis(&storage, &cfg).await {
+                    GenesisResult::Loaded { block, source } => {
+                        println!("[INFO][GENESIS] restored source={} txs={} attempt={}", source, block.transactions.len(), attempt);
+                        block
+                    }
+                    _ => {
+                        if attempt % 10 == 0 {
+                            println!("[WARN][GENESIS] restore_pending attempt={} next_in_s={}", attempt, delay);
+                        }
+                        continue;
+                    }
+                },
+            };
+            adopt_genesis_metadata(&block, &storage);
+            coordinator.try_send(crate::consensus_state::ConsensusEvent::GenesisLoaded { timestamp: block.timestamp });
+            let _ = export_genesis(&storage, &PathBuf::from("/app/data/genesis.bin")).await;
+            return;
+        }
+    });
+}
+
 pub async fn export_genesis(
     storage: &Arc<Storage>,
     output_path: &Path,
 ) -> Result<(), String> {
-    let data = storage.load_microblock(0)
+    let block = storage.load_microblock_auto_format(0)
         .map_err(|e| format!("load: {}", e))?
         .ok_or_else(|| "genesis not in storage".to_string())?;
+    let data = genesis_wire_bytes(&block)?;
 
     std::fs::write(output_path, &data)
         .map_err(|e| format!("write: {}", e))?;
@@ -307,19 +386,32 @@ async fn load_from_file(
     if block.height != 0 {
         return Err(format!("not genesis: height={}", block.height));
     }
+    if let Some(why) = foreign_genesis(storage, &block) {
+        println!("[ERR][GENESIS] file_rejected path={} reason={}", path.display(), why);
+        return Err(why);
+    }
+    // A populated chain with no anchor is deciding its identity. One local file is not evidence for
+    // that (anyone with volume access writes it); the fixed-IP multi-source vote is. The file still
+    // serves an anchored node, where it is checked against the anchor above.
+    if storage.genesis_anchor().is_none() && storage.get_chain_height().unwrap_or(0) > 0 {
+        println!("[WARN][GENESIS] file_unanchored path={} — identity must come from the multi-source vote",
+                 path.display());
+        return Ok(None);
+    }
 
     // Save to storage for future use
     // Not fatal — the block is in memory — but a non-write must still be visible: it means this
     // node will not have genesis on disk after a restart.
-    match storage.save_microblock(0, &data) {
+    match storage.store_genesis(&block, &decompressed) {
         Ok(crate::storage::SaveOutcome::Stored) => {}
         Ok(other) => {
             println!("[ERR][GENESIS] save_to_storage_not_stored outcome={:?}", other);
         }
         Err(e) => {
-            if is_warn() {
-                println!("[WARN][GENESIS] save_to_storage_failed err={}", e);
-            }
+            // The store is what makes this genesis this node's own; adopting it in RAM only would
+            // run the node on a genesis its own storage refused.
+            println!("[ERR][GENESIS] file_store_refused path={} err={}", path.display(), e);
+            return Err(format!("store refused: {}", e));
         }
     }
 
@@ -352,7 +444,6 @@ async fn load_from_http(
 
     for ip in &config.bootstrap_ips {
         let urls = [
-            format!("http://{}:{}/api/v1/block/0", ip, config.api_port),
             format!("http://{}:{}/api/v1/genesis/block", ip, config.api_port),
         ];
 
@@ -377,7 +468,7 @@ async fn load_from_http(
                                         println!("[INFO][GENESIS] http_response ip={} hash={}", ip, &hash[..16]);
                                     }
                                     hash_votes.entry(hash.clone()).or_default().push(ip.clone());
-                                    genesis_by_hash.entry(hash).or_insert((data, block, ip.clone()));
+                                    genesis_by_hash.entry(hash).or_insert((decompressed, block, ip.clone()));
                                     break; // Got valid response from this IP, move to next
                                 }
                                 Ok(block) => {
@@ -423,13 +514,23 @@ async fn load_from_http(
     }
 
     if let Some((data, block, ip)) = genesis_by_hash.remove(&best_hash) {
+        if let Some(why) = foreign_genesis(storage, &block) {
+            eprintln!("[ERR][GENESIS] http_rejected from={} reason={}", ip, why);
+            return Err(why);
+        }
+        // A populated chain with no held block-0 hash has no local anchor: one source is not
+        // enough there (a fresh node keeps the single-source bootstrap; a held hash is the anchor).
+        let anchored = storage.genesis_anchor() == Some(block.hash());
+        if voters.len() < 2 && !anchored && storage.get_chain_height().unwrap_or(0) > 0 {
+            eprintln!("[ERR][GENESIS] http_single_source_unanchored from={} — waiting for a second source", ip);
+            return Err("single genesis source without a local anchor".to_string());
+        }
         if is_info() {
             println!("[INFO][GENESIS] http_verified hash={}.. sources={}/{} from={}",
                      &best_hash[..16], voters.len(), total_responses, ip);
         }
 
-        // Save to storage
-        match storage.save_microblock(0, &data) {
+        match storage.store_genesis(&block, &data) {
             Ok(crate::storage::SaveOutcome::Stored) => {}
             Ok(other) => {
                 println!("[ERR][GENESIS] http_save_not_stored ip={} outcome={:?}", ip, other);
@@ -458,4 +559,53 @@ async fn load_from_http(
     }
 
     Ok(None)
+}
+
+#[cfg(test)]
+mod genesis_rebuild_tool {
+    use super::*;
+
+    /// Operator tool: rebuild the full genesis in wire format from a node's JSON block view
+    /// (transactions) and its raw EfficientMicroBlock row (header). Every tx hash and the merkle
+    /// root are recomputed, so the output is the genuine block or the tool fails.
+    /// QNET_GENESIS_VIEW_JSON=… QNET_GENESIS_ROW=… QNET_GENESIS_OUT=… \
+    ///   cargo test -p qnet-integration rebuild_genesis_wire -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn rebuild_genesis_wire() {
+        let view = std::env::var("QNET_GENESIS_VIEW_JSON").expect("QNET_GENESIS_VIEW_JSON");
+        let row = std::env::var("QNET_GENESIS_ROW").expect("QNET_GENESIS_ROW");
+        let out = std::env::var("QNET_GENESIS_OUT").expect("QNET_GENESIS_OUT");
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&view).unwrap()).unwrap();
+        let txs: Vec<qnet_state::Transaction> = serde_json::from_value(v["transactions"].clone()).expect("transactions");
+        let raw = std::fs::read(&row).unwrap();
+        let raw = if raw.len() >= 4 && raw[0..4] == [0x28, 0xb5, 0x2f, 0xfd] { zstd::decode_all(&raw[..]).unwrap() } else { raw };
+        let eb: qnet_state::EfficientMicroBlock = bincode::deserialize(&raw).expect("efficient row");
+        assert_eq!(eb.height, 0);
+        assert_eq!(eb.transaction_hashes.len(), txs.len(), "tx count");
+        for (i, tx) in txs.iter().enumerate() {
+            assert_eq!(tx.calculate_hash(), tx.hash, "tx {} hash", i);
+            assert_eq!(hex::encode(eb.transaction_hashes[i]), tx.hash, "tx {} order", i);
+        }
+        let mb = qnet_state::MicroBlock {
+            height: 0,
+            timestamp: eb.timestamp,
+            transactions: txs,
+            producer: eb.producer.clone(),
+            signature: eb.signature.clone(),
+            previous_hash: eb.previous_hash,
+            merkle_root: eb.merkle_root,
+            vrf_output: eb.vrf_output,
+            vrf_proof: eb.vrf_proof.clone(),
+            fees_collected: eb.fees_collected,
+            state_root: eb.state_root,
+            timeout_round: eb.timeout_round,
+            carried_baseline: eb.carried_baseline,
+            timeout_proof: None,
+        };
+        assert_eq!(crate::node::BlockchainNode::calculate_merkle_root(&mb.transactions), mb.merkle_root, "merkle");
+        let wire = genesis_wire_bytes(&mb).unwrap();
+        std::fs::write(&out, &wire).unwrap();
+        println!("genesis_hash={} txs={} wire_bytes={}", hex::encode(mb.hash()), mb.transactions.len(), wire.len());
+    }
 }

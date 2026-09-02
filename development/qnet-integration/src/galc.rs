@@ -153,7 +153,7 @@ pub fn effective_pin_checkpoint() -> (u64, [u8; 32], [u8; 32], [u8; 32]) {
 /// Local network identity = genesis block (height 0) hash. Deterministic across honest nodes; binds a
 /// capsule to THIS chain (anti cross-network/relaunch replay). None before block 0 is held.
 pub fn local_network_id(storage: &crate::storage::Storage) -> Option<[u8; 32]> {
-    storage.load_microblock_auto_format(0).ok().flatten().map(|b| b.hash())
+    storage.genesis_anchor() // durable: outlives the body, the tx rows AND the height->hash alias
 }
 
 /// Cheap pre-checks (no post-quantum opens): version (fail-closed on unknown), network_id, index ≥ 2

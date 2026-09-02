@@ -320,7 +320,11 @@ impl SimplifiedP2P {
                     // pipeline, so fix B's request_block_repair reconcile can never converge a restarted/
                     // late voter that missed the seconds-long live-gossip window (boundary re-freeze).
                     crate::block_pipeline::supersede_stored_from_sync(&storage, height, &data, &sender_id, self);
-                    continue;
+                    // A height this node ASKED for may be held with expired tx rows: it goes on to the
+                    // pipeline, whose apply stage restores the body store-only (never re-executes it).
+                    if !crate::block_pipeline::solicited_body_backfill(height) {
+                        continue;
+                    }
                 }
                 // Mark as pending (tracking only, not a gate)
                 mark_block_pending_sync(height);

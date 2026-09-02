@@ -2431,7 +2431,7 @@ pub fn genesis_timestamp(storage: &crate::storage::Storage) -> u64 {
     if g != 0 { return g; }
     let c = GENESIS_TS_CACHE.load(Ordering::Relaxed);
     if c != 0 { return c; }
-    let ts = storage.load_microblock_auto_format(0).ok().flatten().map(|b| b.timestamp).unwrap_or(0);
+    let ts = storage.block_timestamp_at(0).ok().flatten().unwrap_or(0); // header row only
     if ts != 0 { GENESIS_TS_CACHE.store(ts, Ordering::Relaxed); }
     ts
 }

@@ -71,6 +71,24 @@ fn take_sync_nudge() -> bool {
 /// cannot self-heal, so the next sync pass must take the QC-verified peer-snapshot path
 /// regardless of gap size. One-shot: consumed by a single execute_sync attempt; the
 /// requester re-arms (with its own cooldown) if that attempt fails.
+/// Last time a latched suspect state re-armed the wholesale request (unix secs).
+static SUSPECT_REARM_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A latched suspect state cannot be proven locally, so it keeps asking for a wholesale resync
+/// until one succeeds (or a proven reconcile lifts it). Rate-limited with per-node jitter: a fleet
+/// latched by one shared fault must not stampede the snapshot holders in lockstep.
+fn arm_suspect_resync() {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs()).unwrap_or(0);
+    // 2-4 min: same per-node jitter source as the reconcile escalation (production.rs).
+    let jitter = 120 + std::env::var("QNET_BOOTSTRAP_ID").ok()
+        .or_else(|| std::env::var("QNET_NODE_ID").ok())
+        .map(|id| blake3::hash(id.as_bytes()).as_bytes()[0] as u64 % 120)
+        .unwrap_or(0);
+    if now.saturating_sub(SUSPECT_REARM_SECS.load(Ordering::Relaxed)) < jitter { return; }
+    SUSPECT_REARM_SECS.store(now, Ordering::Relaxed);
+    WHOLESALE_STATE_RESYNC.store(true, Ordering::SeqCst);
+}
 static WHOLESALE_STATE_RESYNC: AtomicBool = AtomicBool::new(false);
 
 pub fn request_wholesale_state_resync() {
@@ -446,11 +464,14 @@ impl SyncManager {
             }
         };
 
-        if bulk_behind || stall_behind || mb_behind || seal_frozen {
+        // An unprovable state is a fifth desync dimension: the node tracks the tip perfectly (so
+        // none of the four fire) yet cannot certify or produce, and only a wholesale resync clears it.
+        let suspect = crate::block_pipeline::state_suspect();
+        if bulk_behind || stall_behind || mb_behind || seal_frozen || suspect {
             if is_info() {
-                println!("[INFO][SYNC] desync_detected local={} frontier={} target={} gap={} bulk={} stall={} mb={} seal_frozen={}",
+                println!("[INFO][SYNC] desync_detected local={} frontier={} target={} gap={} bulk={} stall={} mb={} seal_frozen={} suspect={}",
                          local_h, frontier, network_h, network_h.saturating_sub(local_h),
-                         bulk_behind, stall_behind, mb_behind, seal_frozen);
+                         bulk_behind, stall_behind, mb_behind, seal_frozen, suspect);
             }
             self.execute_sync(network_h).await;
         }
@@ -556,6 +577,7 @@ impl SyncManager {
         // Consume a wholesale request up front: it must bypass BOTH the at-target early-return
         // (the coordinator's observed height can be stale while the state is wedged) and the
         // gap threshold below — the peer-snapshot negotiation finds the real tip itself.
+        if crate::block_pipeline::state_suspect() { arm_suspect_resync(); }
         let wholesale = WHOLESALE_STATE_RESYNC.swap(false, Ordering::SeqCst);
 
         if !wholesale && local_h >= target {
@@ -646,8 +668,11 @@ impl SyncManager {
                             println!("[INFO][SYNC] snapshot_restored h={} target={} tail={} wholesale={}",
                                      restored, target, target.saturating_sub(restored), wholesale);
                         }
-                    } else if is_info() {
-                        println!("[INFO][SYNC] snapshot_no_advance local={} — fallback block_sync", local_h);
+                    } else {
+                        if wholesale { request_wholesale_state_resync(); } // nothing restored — keep asking
+                        if is_info() {
+                            println!("[INFO][SYNC] snapshot_no_advance local={} — fallback block_sync", local_h);
+                        }
                     }
                 }
                 Err(e) => {
@@ -655,6 +680,7 @@ impl SyncManager {
                     // one. Bail to the desync tick (gated !active), which re-drives cold-join once the
                     // co-sent capsule arrives — never fall to O(height) block-replay from the h=90 anchor.
                     if matches!(e, crate::errors::IntegrationError::AnchorPending) {
+                        if wholesale { request_wholesale_state_resync(); }
                         if is_info() { println!("[INFO][SYNC] coldjoin_await_anchor — bail to tick"); }
                         self.active.store(false, Ordering::SeqCst);
                         return;
@@ -662,6 +688,9 @@ impl SyncManager {
                     if is_info() {
                         println!("[INFO][SYNC] snapshot_unavailable reason={:?} fallback=block_sync", e);
                     }
+                    // A wholesale request is the only self-heal for an unprovable state: it must
+                    // outlive a failed attempt (no peer snapshot yet) instead of being consumed once.
+                    if wholesale { request_wholesale_state_resync(); }
                 }
             }
         }

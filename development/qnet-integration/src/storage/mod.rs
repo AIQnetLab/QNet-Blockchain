@@ -3647,3 +3647,108 @@ mod tests_prune_addr_index {
         assert_eq!(Storage::addr_index_height(b"addr_x_zzzz_hash"), None);
     }
 }
+
+#[cfg(test)]
+mod tests_finalized_backfill {
+    use super::*;
+
+    fn blk(height: u64, parent: [u8; 32], tag: u8) -> qnet_state::MicroBlock {
+        let from = format!("acct_{}", tag);
+        let tx = qnet_state::Transaction::new(
+            from.clone(), Some("acct_dst".to_string()), 1_000, 0, 10, 10_000, 1_700_000_000 + height, None,
+            qnet_state::TransactionType::Transfer { from: from.clone(), to: "acct_dst".to_string(), amount: 1_000 },
+            None,
+        );
+        let mut b = qnet_state::MicroBlock::new(height, 1000 + height, parent, vec![tx], "genesis_node_001".to_string());
+        b.merkle_root = crate::node::BlockchainNode::calculate_merkle_root(&b.transactions);
+        b
+    }
+
+    /// Expired tx rows of a finalized slot (genesis included) come back through the store-only
+    /// backfill: the body reconstructs again, chain_height is untouched, and only bytes matching
+    /// the canonical hash are accepted.
+    #[test]
+    fn backfill_restores_expired_finalized_body_without_moving_height() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = Storage::new(dir.path().to_str().unwrap()).unwrap();
+
+        let g = blk(0, [0u8; 32], 1);
+        let b1 = blk(1, g.hash(), 2);
+        let b2 = blk(2, b1.hash(), 3);
+        for b in [&g, &b1, &b2] {
+            storage.save_microblock(b.height, &bincode::serialize(b).unwrap()).unwrap();
+        }
+        assert_eq!(storage.get_chain_height().unwrap(), 2);
+
+        // Expiry: the tx rows of block 0 are gone, the header row stays.
+        let tx_cf = storage.persistent.db.cf_handle("transactions").unwrap();
+        for tx in &g.transactions {
+            storage.persistent.db.delete_cf(&tx_cf, format!("tx_{}", tx.hash).as_bytes()).unwrap();
+        }
+        assert!(storage.load_microblock_auto_format(0).ok().flatten().is_none(), "expired body is not reconstructable");
+
+        // A forged block 0 (same height, different content) is refused and restores nothing.
+        let forged = blk(0, [0u8; 32], 9);
+        assert!(!storage.backfill_finalized_block(0, &bincode::serialize(&forged).unwrap()).unwrap());
+        assert!(storage.load_microblock_auto_format(0).ok().flatten().is_none());
+
+        // The canonical bytes are accepted; height does not move; the body reconstructs again.
+        assert!(storage.backfill_finalized_block(0, &bincode::serialize(&g).unwrap()).unwrap());
+        assert_eq!(storage.get_chain_height().unwrap(), 2, "backfill never moves chain_height");
+        let back = storage.load_microblock_auto_format(0).unwrap().expect("reconstructed");
+        assert_eq!(back.hash(), g.hash());
+        assert_eq!(back.transactions.len(), 1);
+
+        // Nothing expired any more → no-op.
+        assert!(!storage.backfill_finalized_block(0, &bincode::serialize(&g).unwrap()).unwrap());
+    }
+}
+
+#[cfg(test)]
+mod tests_genesis_anchor {
+    use super::*;
+
+    fn blk(height: u64, parent: [u8; 32], tag: u8) -> qnet_state::MicroBlock {
+        let from = format!("acct_{}", tag);
+        let tx = qnet_state::Transaction::new(
+            from.clone(), Some("acct_dst".to_string()), 1_000, 0, 10, 10_000, 1_700_000_000 + height, None,
+            qnet_state::TransactionType::Transfer { from: from.clone(), to: "acct_dst".to_string(), amount: 1_000 },
+            None,
+        );
+        let mut b = qnet_state::MicroBlock::new(height, 1000 + height, parent, vec![tx], "genesis_node_001".to_string());
+        b.merkle_root = crate::node::BlockchainNode::calculate_merkle_root(&b.transactions);
+        b
+    }
+
+    /// The durable anchor is what makes a node that LOST its block-0 row (the 002/003 case) still
+    /// refuse a foreign genesis and still accept the genuine one over P2P.
+    #[test]
+    fn genesis_anchor_survives_a_deleted_block0_row() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = Storage::new(dir.path().to_str().unwrap()).unwrap();
+
+        let g = blk(0, [0u8; 32], 1);
+        let b1 = blk(1, g.hash(), 2);
+        for b in [&g, &b1] {
+            storage.save_microblock(b.height, &bincode::serialize(b).unwrap()).unwrap();
+        }
+        assert_eq!(storage.genesis_anchor(), Some(g.hash()));
+
+        // The old corrupt-clear: body row + height→hash alias are gone.
+        storage.delete_microblock(0).unwrap();
+        assert!(storage.load_microblock_hash(0).unwrap().is_none(), "alias deleted");
+        assert_eq!(storage.genesis_anchor(), Some(g.hash()), "durable marker still anchors the node");
+
+        // A foreign genesis is refused against that anchor — through EVERY writer, including the
+        // raw block-0 save that a mint or an ad-hoc download would use.
+        let foreign = blk(0, [0u8; 32], 9);
+        assert!(storage.store_genesis(&foreign, &bincode::serialize(&foreign).unwrap()).is_err());
+        assert!(storage.save_microblock(0, &bincode::serialize(&foreign).unwrap()).is_err(),
+                "a conflicting block-0 write is refused, not merely logged");
+        assert_eq!(storage.genesis_anchor(), Some(g.hash()), "anchor unchanged after the refusal");
+        assert!(storage.backfill_finalized_block(0, &bincode::serialize(&foreign).unwrap()).unwrap() == false);
+        assert!(storage.backfill_finalized_block(0, &bincode::serialize(&g).unwrap()).unwrap(), "genuine genesis restored via P2P");
+        assert_eq!(storage.load_microblock_auto_format(0).unwrap().map(|b| b.hash()), Some(g.hash()));
+        assert_eq!(storage.get_chain_height().unwrap(), 1, "backfill never moves chain_height");
+    }
+}

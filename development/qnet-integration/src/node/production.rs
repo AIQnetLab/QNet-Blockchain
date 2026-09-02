@@ -1065,6 +1065,44 @@ impl BlockchainNode {
                     }
                     match resolved {
                         Some(exists) => exists,
+                        // Header intact, only the tx rows expired: not corruption. The row stays (its
+                        // hash is the anchor the P2P backfill verifies against) and the body is solicited
+                        // in the background; the node runs fully meanwhile.
+                        None if storage.block_timestamp_at(0).ok().flatten().is_some() => {
+                            println!("[WARN][GEN] genesis_body_incomplete action=solicit_repair header_kept=true");
+                            if let Some(p2p) = unified_p2p.clone() {
+                                let storage_bf = storage.clone();
+                                tokio::spawn(async move {
+                                    let cfg = crate::genesis_config::GenesisConfig::from_env();
+                                    let mut attempt = 0u32;
+                                    loop {
+                                        attempt += 1;
+                                        // Backoff 30 s -> 10 min, never giving up: a peer may regain the body later.
+                                        let delay = (30u64 << (attempt / 8).min(5)).min(600);
+                                        let _ = p2p.request_block_repair(0).await;
+                                        crate::block_pipeline::mark_repair_solicited_for(0, delay + 60); // outlive the wait
+                                        tokio::time::sleep(Duration::from_secs(delay)).await;
+                                        let s = storage_bf.clone();
+                                        if matches!(tokio::task::spawn_blocking(move || s.load_microblock_auto_format(0)).await, Ok(Ok(Some(_)))) {
+                                            println!("[INFO][GEN] genesis_body_restored attempt={}", attempt);
+                                            return;
+                                        }
+                                        if attempt % 4 == 0 {
+                                            if let crate::genesis_config::GenesisResult::Loaded { .. } =
+                                                crate::genesis_config::load_genesis(&storage_bf, &cfg).await
+                                            {
+                                                println!("[INFO][GEN] genesis_body_restored source=http attempt={}", attempt);
+                                                return;
+                                            }
+                                        }
+                                        if attempt % 10 == 0 {
+                                            println!("[WARN][GEN] genesis_body_repair_pending attempt={}", attempt);
+                                        }
+                                    }
+                                });
+                            }
+                            true
+                        }
                         None => {
                             // Persistent Err reading block 0 = bytes ARE present at key 0 but do NOT
                             // deserialize (a truly empty DB returns Ok(None), handled above). That is a
@@ -1106,7 +1144,14 @@ impl BlockchainNode {
                 
                 println!("[INFO][GEN] bootstrap_mode={} bootstrap_id={}", is_bootstrap_mode, bootstrap_id);
                 
-                if is_bootstrap_mode && bootstrap_id == "001" {
+                // A node that ever held block 0 keeps its anchor: minting a second genesis on top of
+                // an existing chain is the one unrecoverable fork, so an anchored 001 waits for the
+                // real one exactly like 002-005 instead of creating a competing chain.
+                let anchored = storage.genesis_anchor().is_some();
+                if anchored && is_bootstrap_mode && bootstrap_id == "001" {
+                    println!("[WARN][GEN] mint_refused reason=anchored — waiting for the held genesis");
+                }
+                if is_bootstrap_mode && bootstrap_id == "001" && !anchored {
                     // v5.0: Before creating genesis, check if network already has one.
                     // If node_001 restarts with empty storage but the network is running,
                     // creating a new genesis (with current timestamp) would produce an
@@ -1631,8 +1676,8 @@ impl BlockchainNode {
                         Err(e) => println!("[ERR][GEN] genesis_create_failed err={}", e),
                     }
                     } // end of `if !synced_from_network` else block
-                } else if is_bootstrap_mode {
-                    // Other bootstrap nodes (002-005) wait for Genesis from node_001
+                } else if is_bootstrap_mode || anchored {
+                    // Other bootstrap nodes (002-005), and an anchored 001, wait for the real genesis
                     println!("[INFO][GEN] waiting_for_primary node={}", bootstrap_id);
                     
                     // CRITICAL: ACTIVELY request Genesis immediately - don't wait passively!
@@ -1705,15 +1750,23 @@ impl BlockchainNode {
                                 
                                 // v5.5: Use genesis block's on-chain timestamp for LBPT.
                                 // All nodes must have identical LBPT for deterministic timeout_round.
-                                LAST_BLOCK_PRODUCED_TIME.store(genesis_block.timestamp, std::sync::atomic::Ordering::Relaxed);
-                                LAST_BLOCK_PRODUCED_HEIGHT.store(0, std::sync::atomic::Ordering::Relaxed);
+                                if microblock_height == 0 { // a warm chain keeps its live pacing
+                                    LAST_BLOCK_PRODUCED_TIME.store(genesis_block.timestamp, std::sync::atomic::Ordering::Relaxed);
+                                    LAST_BLOCK_PRODUCED_HEIGHT.store(0, std::sync::atomic::Ordering::Relaxed);
+                                }
                                 // v5.5: Received genesis from network — unlock production
                                 PRODUCTION_UNLOCKED.store(1, Ordering::Relaxed);
                                 if is_info() { println!("[INFO][GEN] genesis_synced ts={} production_unlocked", genesis_block.timestamp); }
 
                                 // Also update reward manager with correct genesis timestamp
                                 crate::set_genesis_timestamp(genesis_block.timestamp);
-                                
+                                // The coordinator leaves LoadingGenesis only on this event.
+                                if let Some(coord) = GLOBAL_COORDINATOR.read().clone() {
+                                    coord.try_send(crate::consensus_state::ConsensusEvent::GenesisLoaded {
+                                        timestamp: genesis_block.timestamp,
+                                    });
+                                }
+
                                 // CRITICAL FIX: Broadcast certificate AFTER Genesis reception
                                 // This ensures ALL Genesis nodes have certificates for verification
                                 if let Some(ref p2p) = unified_p2p {
@@ -1773,12 +1826,21 @@ impl BlockchainNode {
                                 break;
                             }
                             _ => {
-                                // CRITICAL: Request Genesis EVERY attempt (every 2 seconds)
-                                // This is much more aggressive than waiting passively
-                                if let Some(p2p) = &unified_p2p {
-                                    if genesis_wait_attempts % 2 == 0 {
+                                // Peers may hold header rows only. Every 60 s run the multi-source HTTP
+                                // loader: on a warm chain it restores the rows without moving the height.
+                                if genesis_wait_attempts % 30 == 0 {
+                                    let cfg = crate::genesis_config::GenesisConfig::from_env();
+                                    if let crate::genesis_config::GenesisResult::Loaded { .. } =
+                                        crate::genesis_config::load_genesis(&storage, &cfg).await
+                                    {
+                                        continue;
+                                    }
+                                }
+                                // P2P request every 10 s (each reply is a full genesis from up to 3 peers)
+                                if let (Some(p2p), true) = (&unified_p2p, genesis_wait_attempts % 5 == 0) {
+                                    if genesis_wait_attempts % 10 == 0 {
                                         println!("[INFO][GEN] genesis_request attempt={}",
-                                                genesis_wait_attempts / 2);
+                                                genesis_wait_attempts / 5);
                                     }
                                     
                                     // Block 0 by height, not the general sweep: sync_blocks(0,0)
@@ -3362,7 +3424,24 @@ impl BlockchainNode {
                 }
                 let in_leader_grace = now_ms_hb.saturating_sub(
                     LAST_LEADERSHIP_MS.load(std::sync::atomic::Ordering::Relaxed)) <= LEADER_HEARTBEAT_GRACE_MS;
-                if is_my_turn_to_produce || in_leader_grace {
+                // The gate is evaluated BEFORE the heartbeat: a heartbeat claims the slot and makes
+                // every peer withhold its timeout vote for it, so a node that is about to refuse the
+                // slot must stay silent instead. Forensic h=167760: the assigned producer was wedged
+                // 1259 blocks behind, kept heartbeating, and the network sat at one height with
+                // `failover result=uncertain cache=0/5` until an operator intervened.
+                let sync_active = coordinator_is_syncing();
+                let prod_unlocked = PRODUCTION_UNLOCKED.load(Ordering::Relaxed) == 1;
+                // Producing block N needs exactly one thing: N-1 applied. The FSM phase is derived
+                // state that this node's own idleness clears, so gating on it turned "failed to
+                // produce" into "forbidden to produce" — the node could neither lead nor yield.
+                let have_parent = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(Ordering::Relaxed)
+                    >= next_block_height.saturating_sub(1);
+                // An unproven state produces a block every peer rejects on state_root: the slot is
+                // lost either way, and yielding it to failover costs the network far less.
+                let suspect = crate::block_pipeline::state_suspect();
+                let producer_gated = sync_active || (!prod_unlocked && microblock_height > 5)
+                    || !have_parent || suspect;
+                if (is_my_turn_to_produce || in_leader_grace) && !producer_gated {
                     emit_producer_heartbeat(&node_id, &storage, &unified_p2p,
                                             next_block_height, now_ms_hb).await;
                 }
@@ -3373,18 +3452,10 @@ impl BlockchainNode {
                 // next iteration. Without this, the gate just blocks forever
                 // waiting for sync that no path is driving.
                 if is_my_turn_to_produce {
-                    let sync_active = coordinator_is_syncing();
-                    let prod_unlocked = PRODUCTION_UNLOCKED.load(Ordering::Relaxed) == 1;
-                    // Producing block N needs exactly one thing: N-1 applied. The FSM phase is derived
-                    // state that this node's own idleness clears, so gating on it turned "failed to
-                    // produce" into "forbidden to produce" — the node could neither lead nor yield.
-                    let have_parent = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(Ordering::Relaxed)
-                        >= next_block_height.saturating_sub(1);
-
-                    if sync_active || (!prod_unlocked && microblock_height > 5) || !have_parent {
+                    if producer_gated {
                         if is_info() {
-                            println!("[INFO][PROD] gate_blocked h={} sync={} unlocked={} parent={}",
-                                     next_block_height, sync_active, prod_unlocked, have_parent);
+                            println!("[INFO][PROD] gate_blocked h={} sync={} unlocked={} parent={} suspect={}",
+                                     next_block_height, sync_active, prod_unlocked, have_parent, suspect);
                         }
                         is_my_turn_to_produce = false;
 

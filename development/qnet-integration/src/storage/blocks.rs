@@ -466,7 +466,170 @@ impl Storage {
     /// - TX indices → tx_index, tx_by_address CFs
     /// 
     /// Storage savings: ~80% compared to legacy MicroBlock format
+    /// This chain's genesis hash: the height→hash alias if it is still there, else the durable
+    /// marker written the first time this node stored block 0. Survives body/tx expiry AND a lost
+    /// block-0 row, so it stays the anchor every genesis write is checked against.
+    pub fn genesis_anchor(&self) -> Option<[u8; 32]> {
+        // Marker FIRST: the height->hash alias is rewritten by every block-0 write and deleted with
+        // the row, so it can neither prove nor refuse anything. The alias is only the fallback that
+        // adopts the anchor on a database written before the marker existed.
+        if let Some(cf) = self.persistent.db.cf_handle("metadata") {
+            if let Ok(Some(v)) = self.persistent.db.get_cf(&cf, b"genesis_hash") {
+                if v.len() == 32 {
+                    let mut h = [0u8; 32]; h.copy_from_slice(&v); return Some(h);
+                }
+            }
+        }
+        self.persistent.load_microblock_hash(0).ok().flatten()
+    }
+
+    /// The parent named by block 1, when this node still holds it (full body, or the header index
+    /// that outlives a pruned body). It IS the genesis hash, verifiable without any peer.
+    fn block1_parent(&self) -> Option<[u8; 32]> {
+        if let Ok(Some(b1)) = self.load_microblock_auto_format(1) {
+            return Some(b1.previous_hash);
+        }
+        let h1 = self.persistent.load_microblock_hash(1).ok().flatten()?;
+        self.persistent.header_index(&h1).map(|hd| hd.previous_hash)
+    }
+
+    /// Adopt the height->hash alias as this node's durable anchor once, at boot. A node that has
+    /// held block 0 all along never rewrites it, so without this it would keep no anchor of its own
+    /// and a later loss of the alias would leave it unable to prove which genesis is its own.
+    pub fn adopt_genesis_anchor(&self) {
+        if let Some(cf) = self.persistent.db.cf_handle("metadata") {
+            if matches!(self.persistent.db.get_cf(&cf, b"genesis_hash"), Ok(Some(v)) if v.len() == 32) {
+                return;
+            }
+        }
+        if let Ok(Some(h)) = self.persistent.load_microblock_hash(0) {
+            let _ = self.record_genesis_anchor(&h);
+        }
+    }
+
+    /// Write-once. A recorded anchor is this node's chain identity: a block-0 write that disagrees
+    /// with it is refused here, so no path (mint, sync, repair, loader) can re-root the node.
+    fn record_genesis_anchor(&self, hash: &[u8; 32]) -> IntegrationResult<()> {
+        let cf = self.persistent.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata CF not found".to_string()))?;
+        match self.persistent.db.get_cf(&cf, b"genesis_hash") {
+            Ok(Some(v)) if v.len() == 32 => {
+                if v.as_slice() != hash.as_slice() {
+                    println!("[ERR][STORAGE] genesis_anchor_conflict held={:x?} offered={:x?} action=refuse_write",
+                             &v[..8], &hash[..8]);
+                    return Err(IntegrationError::StorageError(format!(
+                        "genesis_anchor_conflict held={:x?} offered={:x?}", &v[..8], &hash[..8])));
+                }
+                Ok(())
+            }
+            _ => {
+                self.persistent.db.put_cf(&cf, b"genesis_hash", hash.as_slice())?;
+                if crate::node::is_info() {
+                    println!("[INFO][STORAGE] genesis_anchor_recorded hash={:x?}", &hash[..8]);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Content binding for bodies that bypass the pipeline's verify stage: every tx hash string is
+    /// recomputed from its content and the tx merkle root from those strings, so the header hash
+    /// (already matched against the chain) vouches for the exact transactions being written.
+    fn block_content_bound(mb: &qnet_state::MicroBlock) -> bool {
+        mb.transactions.iter().all(|tx| tx.calculate_hash() == tx.hash)
+            && crate::node::BlockchainNode::calculate_merkle_root(&mb.transactions) == mb.merkle_root
+    }
+
+    /// Store-only re-persist of an already-final slot whose body/tx rows expired (genesis
+    /// included). Executes nothing and never moves chain_height. Accepts only bytes whose hash
+    /// equals the canonical hash already held for the slot, so a peer cannot rewrite history here.
+    pub fn backfill_finalized_block(&self, height: u64, data: &[u8]) -> IntegrationResult<bool> {
+        if !can_save_block(height) || self.get_effective_storage_mode() == StorageMode::Light {
+            return Ok(false);
+        }
+        let mb = match bincode::deserialize::<qnet_state::MicroBlock>(data) {
+            Ok(m) if m.height == height => m,
+            _ => return Ok(false),
+        };
+        let canonical = match if height == 0 { self.genesis_anchor() } else { self.persistent.load_microblock_hash(height)? } {
+            Some(h) => h,
+            None => {
+                if height == 0 && crate::node::is_warn() {
+                    println!("[WARN][STORAGE] genesis_unanchored action=await_multi_source — a delivery cannot be trusted alone");
+                }
+                return Ok(false); // nothing canonical to match against — not a backfill case
+            }
+        };
+        if mb.hash() != canonical {
+            if crate::node::is_warn() {
+                println!("[WARN][STORAGE] backfill_rejected h={} reason=hash_mismatch canonical={:x?} offered={:x?}",
+                         height, &canonical[..8], &mb.hash()[..8]);
+            }
+            return Ok(false);
+        }
+        if !Self::block_content_bound(&mb) {
+            if crate::node::is_warn() {
+                println!("[WARN][STORAGE] backfill_rejected h={} reason=content_unbound", height);
+            }
+            return Ok(false);
+        }
+        // Bodies below the retention window were removed on purpose and the prune watermark has
+        // passed them; re-materialising them would be permanent. Genesis is never pruned.
+        let tip = self.persistent.get_chain_height().unwrap_or(0);
+        if height != 0 && height.saturating_add(crate::node::MICROBLOCK_BODY_RETENTION_BLOCKS) <= tip {
+            return Ok(false);
+        }
+        if self.load_microblock_auto_format(height).ok().flatten().is_some() {
+            return Ok(false); // body still reconstructable — nothing expired
+        }
+        self.write_block_rows(height, &mb, false)?;
+        if crate::node::is_info() {
+            println!("[INFO][STORAGE] finalized_body_backfilled h={} txs={}", height, mb.transactions.len());
+        }
+        Ok(true)
+    }
+
+    /// Genesis handed in by file/HTTP. An empty chain takes the ordinary save; a WARM chain (row lost
+    /// or tx rows expired) gets the rows back without touching chain_height, and never accepts a
+    /// genesis that differs from the hash it already holds.
+    pub fn store_genesis(&self, mb: &qnet_state::MicroBlock, bytes: &[u8]) -> IntegrationResult<SaveOutcome> {
+        if mb.height != 0 {
+            return Err(IntegrationError::StorageError(format!("not genesis: height={}", mb.height)));
+        }
+        if !Self::block_content_bound(mb) {
+            return Err(IntegrationError::StorageError("genesis content_unbound (tx hashes / merkle root)".to_string()));
+        }
+        if let Some(held) = self.genesis_anchor() {
+            if held != mb.hash() {
+                return Err(IntegrationError::StorageError(format!(
+                    "genesis_hash_mismatch held={:x?} offered={:x?}", &held[..8], &mb.hash()[..8])));
+            }
+        }
+        // Block 1 names its parent. Where that linkage survived (body or header index), it is proof
+        // this node can check on its own — no vote, no trust — so use it before anything is written.
+        if let Some(parent) = self.block1_parent() {
+            if parent != mb.hash() {
+                return Err(IntegrationError::StorageError(format!(
+                    "genesis_contradicts_chain block1_parent={:x?} offered={:x?}", &parent[..8], &mb.hash()[..8])));
+            }
+        }
+        if self.persistent.get_chain_height().unwrap_or(0) == 0 {
+            return self.save_microblock(0, bytes);
+        }
+        if self.load_microblock_auto_format(0).ok().flatten().is_some() {
+            return Ok(SaveOutcome::Stored); // complete already
+        }
+        self.write_block_rows(0, mb, false)?;
+        println!("[INFO][STORAGE] genesis_rows_restored txs={}", mb.transactions.len());
+        Ok(SaveOutcome::Stored)
+    }
+
     pub(super) fn save_microblock_efficient(&self, height: u64, microblock: &qnet_state::MicroBlock) -> IntegrationResult<()> {
+        self.write_block_rows(height, microblock, true)
+    }
+
+    /// `advance_height=false` is the backfill of an already-final slot: identical rows, chain_height untouched.
+    fn write_block_rows(&self, height: u64, microblock: &qnet_state::MicroBlock, advance_height: bool) -> IntegrationResult<()> {
         let tx_cf = self.persistent.db.cf_handle("transactions")
             .ok_or_else(|| IntegrationError::StorageError("transactions column family not found".to_string()))?;
         let tx_index_cf = self.persistent.db.cf_handle("tx_index")
@@ -591,6 +754,7 @@ impl Storage {
         // Block hash is a consensus property: SHA3(height + timestamp + prev_hash + merkle_root + producer).
         // Raw bytes depend on storage format (EfficientMicroBlock, zstd) and must NOT affect consensus hash.
         let block_hash = microblock.hash();
+        if height == 0 { self.record_genesis_anchor(&block_hash)?; }
         let hash_key = mb_hash_key(height);
 
         // v12.1: Format discriminator — explicit metadata key eliminates bincode guessing.
@@ -600,7 +764,9 @@ impl Storage {
         let fmt_key = mb_fmt_key(height);
 
         batch.put_cf(&microblocks_cf, block_key.as_bytes(), &compressed_block);
-        batch.put_cf(&metadata_cf, b"chain_height", &height.to_be_bytes());
+        if advance_height {
+            batch.put_cf(&metadata_cf, b"chain_height", &height.to_be_bytes());
+        }
         batch.put_cf(&metadata_cf, hash_key.as_bytes(), block_hash.as_slice());
         batch.put_cf(&metadata_cf, fmt_key.as_bytes(), &[0x02u8]); // 0x02 = EfficientMicroBlock
         // Header + child link written in the SAME batch as the body, so the hash-addressed view can

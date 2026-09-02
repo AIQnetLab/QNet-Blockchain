@@ -14,9 +14,11 @@ impl Storage {
             .ok_or_else(|| IntegrationError::StorageError("transactions column family not found".to_string()))?;
         
         for height in from..=to {
-            if let Some(raw_data) = self.load_microblock(height)? {
-                // CRITICAL: Convert EfficientMicroBlock back to full MicroBlock for network sync
-                // First try to deserialize as EfficientMicroBlock (new format)
+            if let Some(raw_row) = self.load_microblock(height)? {
+                // The row may be zstd-compressed (a warm-chain genesis restore writes it that way).
+                let raw_data = if raw_row.len() >= 4 && raw_row[0..4] == [0x28, 0xb5, 0x2f, 0xfd] {
+                    zstd::decode_all(&raw_row[..]).unwrap_or(raw_row)
+                } else { raw_row };
                 if let Ok(efficient_block) = bincode::deserialize::<qnet_state::EfficientMicroBlock>(&raw_data) {
                     // Reconstruct full MicroBlock with transactions from PERSISTENT storage
                     let mut transactions = Vec::with_capacity(efficient_block.transaction_hashes.len());
@@ -49,6 +51,12 @@ impl Storage {
                     }
                     
                     // Create full MicroBlock (including QRB VRF data)
+                    if transactions.len() != efficient_block.transaction_hashes.len() {
+                        // Never ship a hollow body: its header hash still matches, so a requester
+                        // would burn its repair budget on it. Same rule as a missing row — stop at
+                        // the gap rather than return a sparse batch that hides it.
+                        break;
+                    }
                     let full_block = qnet_state::MicroBlock {
                         height: efficient_block.height,
                         timestamp: efficient_block.timestamp,
@@ -495,6 +503,22 @@ impl Storage {
     /// MicroBlock and never feeds the tx pool (whose insert is O(pool) once full), so a deep
     /// rollback's candidate scan stays one point read per tx. Ok(None) ⇒ block absent.
     /// Txs missing from the tx CF are counted and logged — they are a coverage gap, not an error.
+    /// Block timestamp from the retained header row alone — no tx rows needed, so it survives body
+    /// expiry (genesis timing must never depend on reconstructable transactions).
+    pub fn block_timestamp_at(&self, height: u64) -> IntegrationResult<Option<u64>> {
+        let raw = match self.load_microblock(height)? { Some(d) => d, None => return Ok(None) };
+        let data = if raw.len() >= 4 && raw[0..4] == [0x28, 0xb5, 0x2f, 0xfd] {
+            zstd::decode_all(&raw[..]).map_err(|e| IntegrationError::Other(format!("zstd: {}", e)))?
+        } else { raw };
+        if let Ok(eb) = bincode::deserialize::<qnet_state::EfficientMicroBlock>(&data) {
+            if eb.height == height { return Ok(Some(eb.timestamp)); }
+        }
+        if let Ok(mb) = bincode::deserialize::<qnet_state::MicroBlock>(&data) {
+            if mb.height == height { return Ok(Some(mb.timestamp)); }
+        }
+        Ok(None)
+    }
+
     pub fn touched_addresses_at(&self, height: u64) -> IntegrationResult<Option<(Vec<String>, String)>> {
         let raw = match self.load_microblock(height)? { Some(d) => d, None => return Ok(None) };
         let data = if raw.len() >= 4 && raw[0..4] == [0x28, 0xb5, 0x2f, 0xfd] {
@@ -591,7 +615,9 @@ impl Storage {
                     }
                 }
                 Ok(None) => {
-                    println!("[WARN][STORAGE] tx_not_found tx={} block={}", tx_hash_hex, height);
+                    if crate::node::is_debug() {
+                        println!("[DBG][STORAGE] tx_not_found tx={} block={}", tx_hash_hex, height);
+                    }
                 }
                 Err(e) => {
                     println!("[WARN][STORAGE] tx_load_err tx={} err={}", tx_hash_hex, e);

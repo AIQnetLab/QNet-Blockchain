@@ -1592,7 +1592,7 @@ impl Storage {
             last_tx_key = Some(key.to_vec());
             if value.len() >= 8 {
                 let block_height = u64::from_be_bytes(value[..8].try_into().unwrap_or([0u8; 8]));
-                if block_height < prune_before_height {
+                if block_height < prune_before_height && block_height > 0 { // genesis txs are never expired
                     batch.delete_cf(&tx_cf, &key);
                     batch.delete_cf(&tx_index_cf, &key);
                     pruned_count += 1;
@@ -1635,7 +1635,7 @@ impl Storage {
             addr_examined += 1;
             last_addr_key = Some(key.to_vec());
             match Self::addr_index_height(&key) {
-                Some(h) if h < prune_before_height => {
+                Some(h) if h < prune_before_height && h > 0 => {
                     batch.delete_cf(&tx_by_addr_cf, &key);
                     addr_pruned += 1;
                     if addr_pruned % 5000 == 0 {

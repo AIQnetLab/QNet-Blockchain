@@ -623,6 +623,21 @@ impl BlockchainNode {
                 boot_state_proven = true; // snapshot root already anchor-verified, no tail
             }
 
+            if replay_start == 0 {
+                // A full replay executes block 0. Its body is loaded from disk, so the genesis
+                // restore (file/HTTP) has to happen HERE — the boot's own load_genesis runs long
+                // after this loop, and a replay without genesis builds an unprovable state.
+                let have_genesis = matches!(storage.load_microblock_auto_format(0), Ok(Some(_)));
+                if !have_genesis {
+                    let cfg = crate::genesis_config::GenesisConfig::from_env();
+                    match crate::genesis_config::load_genesis(&storage, &cfg).await {
+                        crate::genesis_config::GenesisResult::Loaded { block, source } => {
+                            println!("[INFO][GENESIS] pre_replay_restored source={} txs={}", source, block.transactions.len());
+                        }
+                        _ => println!("[ERR][GENESIS] pre_replay_unavailable — replay will start above genesis"),
+                    }
+                }
+            }
             if replay_start <= pre_snapshot_chain_height {
                 let replay_end = pre_snapshot_chain_height;
                 let replay_count = replay_end.saturating_sub(replay_start).saturating_add(1);
@@ -679,12 +694,22 @@ impl BlockchainNode {
                                 println!("[WARN][REPLAY] block_missing h={}", h);
                             }
                             replay_errors += 1;
+                            if h == 0 {
+                                // A state built without genesis is unprovable; ask for the rebuild here,
+                                // not only at the post-replay root check (which this may never reach).
+                                crate::block_pipeline::mark_state_suspect();
+                                crate::sync_manager::request_wholesale_state_resync();
+                            }
                         }
                         Err(e) => {
                             if replay_errors < 5 {
                                 eprintln!("[WARN][REPLAY] load_fail h={} err={}", h, e);
                             }
                             replay_errors += 1;
+                            if h == 0 {
+                                crate::block_pipeline::mark_state_suspect();
+                                crate::sync_manager::request_wholesale_state_resync();
+                            }
                         }
                     }
                 }
@@ -732,6 +757,8 @@ impl BlockchainNode {
                                           hex::encode(&last_block.state_root[..8]),
                                           hex::encode(&final_merkle[..8]),
                                           pre_snapshot_chain_height);
+                                crate::block_pipeline::mark_state_suspect(); // abstain from certifying until resynced
+                                crate::sync_manager::request_wholesale_state_resync(); // self-heal, no operator restart
                             }
                         }
                     }
@@ -1326,6 +1353,7 @@ impl BlockchainNode {
         // NEVER fallback to SystemTime::now() — that creates a per-node genesis_ts
         // causing ALL synced blocks to fail TIMESTAMP_INVALID validation.
         // Sentinel 0 disables timestamp checks until the real genesis block arrives.
+        storage.adopt_genesis_anchor(); // one-time: pin the identity a long-running node already has
         let genesis_timestamp = match storage.load_microblock_auto_format(0) {
             Ok(Some(genesis_block)) => {
                 if is_info() { println!("[INFO][GEN] loaded_ts={}", genesis_block.timestamp); }
@@ -1340,8 +1368,15 @@ impl BlockchainNode {
                 0 // Sentinel — timestamp validation disabled until genesis synced
             }
             Err(e) => {
-                eprintln!("[ERR][GEN] load_fail err={} sentinel=0 waiting_for_network", e);
-                0 // Sentinel — timestamp validation disabled until genesis synced
+                // Expired tx rows with the header retained: timing comes from the header (registrations
+                // are already stamped from an earlier boot); the body returns via store-only backfill.
+                let header_ts = storage.block_timestamp_at(0).ok().flatten().unwrap_or(0);
+                if header_ts > 0 {
+                    println!("[WARN][GEN] body_unreadable err={} using_header_ts={}", e, header_ts);
+                } else {
+                    eprintln!("[ERR][GEN] load_fail err={} sentinel=0 waiting_for_network", e);
+                }
+                header_ts
             }
         };
         
@@ -1851,8 +1886,16 @@ impl BlockchainNode {
                     if is_info() { println!("[INFO][GENESIS] node_001_creation_mode"); }
                     // Node 001 will create genesis in the production loop
                 }
+                crate::genesis_config::GenesisResult::HeaderOnly { timestamp } => {
+                    // Timing is authoritative from the header; the coordinator must not sit in
+                    // LoadingGenesis (is_syncing) for the whole uptime over expired tx rows.
+                    crate::set_genesis_timestamp(timestamp);
+                    coordinator_handle.try_send(crate::consensus_state::ConsensusEvent::GenesisLoaded { timestamp });
+                    crate::genesis_config::spawn_genesis_restore(blockchain.storage.clone(), coordinator_handle.clone());
+                }
                 crate::genesis_config::GenesisResult::NotAvailable { tried } => {
                     eprintln!("[WARN][GENESIS] not_available tried={:?} — will wait for p2p sync", tried);
+                    crate::genesis_config::spawn_genesis_restore(blockchain.storage.clone(), coordinator_handle.clone());
                     // Genesis will arrive via sync — not fatal
                 }
             }
@@ -2888,9 +2931,9 @@ impl BlockchainNode {
                                     // a peer — or self — whose genesis is not minted yet) must NOT be saved
                                     // as block 0: a garbage block 0 then fails every load_microblock_auto_format
                                     // and forces the boot reread/delete/recover dance (and historically risked
-                                    // a fork). Reject and try the next endpoint. Genesis is always a full
-                                    // MicroBlock (EfficientMicroBlock is height>0 only), so this never rejects a
-                                    // valid genesis.
+                                    // a fork). Reject and try the next endpoint. The wire form is the full
+                                    // MicroBlock, bincode + zstd (genesis_wire_bytes).
+                                    let block_data = zstd::decode_all(&block_data[..]).unwrap_or(block_data);
                                     match bincode::deserialize::<qnet_state::MicroBlock>(&block_data) {
                                         Ok(ref mb) if mb.height == 0 => {
                                             println!("[INFO][NODE] genesis_downloaded consensus_hash={}", &hex::encode(mb.hash())[..16]);
@@ -2903,7 +2946,13 @@ impl BlockchainNode {
                                     // Store as microblock at height 0 (validated above)
                                     // Stored ONLY — a non-write here (storage in a mode that keeps
                                     // no blocks) would let the node proceed as if it held genesis.
-                                    match self.storage.save_microblock(0, &block_data) {
+                                    // Through store_genesis: content binding + the durable anchor. A
+                                    // single unauthenticated source must never plant this node's identity.
+                                    let parsed = match bincode::deserialize::<qnet_state::MicroBlock>(&block_data) {
+                                        Ok(mb) => mb,
+                                        Err(_) => continue,
+                                    };
+                                    match self.storage.store_genesis(&parsed, &block_data) {
                                         Ok(crate::storage::SaveOutcome::Stored) => {
                                             if is_info() {
                                                 println!("[INFO][GEN] http_genesis_saved from={} size={}", ip, block_data.len());

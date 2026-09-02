@@ -367,6 +367,12 @@ impl ConsensusCoordinator {
             ConsensusEvent::GenesisLoaded { timestamp } => {
                 snap.genesis_loaded = true;
                 snap.genesis_timestamp = timestamp;
+                // Genesis can now arrive long after boot (the background restore). It unblocks the
+                // LoadingGenesis phase and nothing else: overwriting a live Syncing/Producing phase
+                // would tell the node it is caught up when it is not.
+                if !matches!(snap.phase, ConsensusPhase::LoadingGenesis) {
+                    return;
+                }
                 // Transition: LoadingGenesis → Syncing (or Synchronized if height > 0)
                 if snap.chain_height > 0 {
                     snap.phase = ConsensusPhase::Synchronized {

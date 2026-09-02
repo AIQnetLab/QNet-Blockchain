@@ -249,6 +249,21 @@ pub(crate) fn is_repair_solicited(height: u64) -> bool {
         .map(|d| d.as_secs()).unwrap_or(0);
     REPAIR_SOLICITED.get(&height).map(|e| *e > now).unwrap_or(false)
 }
+/// Solicit with an explicit lifetime (a slow shred stream must not outlive the mark).
+pub(crate) fn mark_repair_solicited_for(height: u64, ttl_secs: u64) {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs()).unwrap_or(0);
+    REPAIR_SOLICITED.insert(height, now.saturating_add(ttl_secs));
+}
+/// A solicited delivery may bypass the stored-height dedup only where the sole possible outcome is
+/// a store-only body backfill: genesis, or a height at/below local finality. Above finality the
+/// supersede path handles it, and the bypass would let a replayed tip block cost a full re-verify.
+pub(crate) fn solicited_body_backfill(height: u64) -> bool {
+    if !is_repair_solicited(height) { return false; }
+    if height == 0 { return true; }
+    let fin = crate::node::LAST_FINALIZED_HEIGHT.load(Ordering::SeqCst);
+    fin > 0 && height <= fin
+}
 
 
 
@@ -299,6 +314,11 @@ mod livelock_target_tests {
 
 pub(crate) fn signal_fork_recovery(target: u64) {
     if target == 0 { return; } // 0 is the "no signal" sentinel — never store it as a target
+    // Finalized history is not a reorg point, but the livelock watchdog deliberately descends past
+    // it and relies on the consumer clamping. CLAMP here (never drop): dropping disarmed that
+    // descent entirely, while a sub-finality target parked as-is would shadow every real one.
+    let fin = crate::node::LAST_FINALIZED_HEIGHT.load(Ordering::SeqCst);
+    let target = if fin > 0 { target.max(fin) } else { target };
     let mut prev = FORK_RECOVERY_HEIGHT.load(Ordering::SeqCst);
     loop {
         if prev != 0 && prev <= target { return; }
@@ -1766,8 +1786,12 @@ impl BlockPipeline {
                 .unwrap_or(false)
             {
                 maybe_supersede_by_certified_round(&storage, &block, unified_p2p.as_deref());
-                metrics.duplicates_skipped.fetch_add(1, Ordering::Relaxed);
-                continue;
+                // A height we asked for may be held with expired tx rows: the apply stage decides
+                // (store-only backfill against the canonical hash), never a re-execution.
+                if !solicited_body_backfill(block.height) {
+                    metrics.duplicates_skipped.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
             }
 
             // Decompress (zstd or raw) with size limit to prevent decompression bombs.
@@ -2007,10 +2031,10 @@ impl BlockPipeline {
             // "one-time bootstrap"; this guard is what makes that true.
             if mb.height == 0 {
                 let s2 = storage.clone();
-                let have_genesis = tokio::task::spawn_blocking(move || {
-                    s2.canonical_hash_at(0).is_some()
-                }).await.unwrap_or(false);
-                if have_genesis {
+                let held = tokio::task::spawn_blocking(move || s2.genesis_anchor()).await.unwrap_or(None);
+                // The SAME genesis re-delivered is a body restore (expired tx rows) and goes on to the
+                // apply-stage backfill, which never executes it; a different block 0 is refused.
+                if held.map_or(false, |h| h != mb.hash()) {
                     if is_warn() {
                         println!("[WARN][PIPELINE] genesis_refused reason=chain_already_rooted producer={}",
                                  mb.producer);
@@ -3343,7 +3367,20 @@ impl BlockPipeline {
                 .load(std::sync::atomic::Ordering::Acquire).saturating_mul(90);
             let applied_tip = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT
                 .load(std::sync::atomic::Ordering::Acquire);
-            let already_applied = if anchor_floor > 0 && height <= anchor_floor {
+            let finalized = crate::node::LAST_FINALIZED_HEIGHT.load(std::sync::atomic::Ordering::Acquire);
+            let already_applied = if (finalized > 0 && height <= finalized) || (height == 0 && applied_tip > 0) {
+                // Finalized history is immutable and — finality ≤ applied tip — already executed
+                // here. A re-delivery (solicited repair, re-gossip, a genesis re-fetch after its
+                // tx rows expired) must never run again: it corrupts state and trips the breaker.
+                // Only the BODY may be missing locally — backfill it, canonical bytes only.
+                let storage_bf = ctx.storage.clone();
+                let bytes = block.decompressed.clone();
+                // A block-0 delivery can only ever RESTORE the body this node already anchors.
+                // Adopting an identity from the P2P lane is not possible: the sender writes its own
+                // id, so the fixed-IP HTTP vote is the only trust set that can anchor a node.
+                let _ = tokio::task::spawn_blocking(move || storage_bf.backfill_finalized_block(height, &bytes)).await;
+                true
+            } else if anchor_floor > 0 && height <= anchor_floor {
                 true // at/below the adopted snapshot anchor ⇒ already-final; the snapshot omits sub-anchor
                      // bodies, so re-executing one would corrupt the bound state
             } else if height > applied_tip {

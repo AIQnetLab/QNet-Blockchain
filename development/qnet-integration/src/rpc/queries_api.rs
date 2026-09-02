@@ -798,11 +798,20 @@ pub(super) async fn handle_genesis_block(
         return Ok(rate_limit_response.into_response());
     }
     let storage = blockchain.get_storage();
-    match storage.load_microblock(0) {
-        Ok(Some(bytes)) => {
+    // Genesis is immutable: reconstruct + encode once per process, then serve the cached bytes.
+    static GENESIS_WIRE: std::sync::OnceLock<Arc<Vec<u8>>> = std::sync::OnceLock::new();
+    let wire = match GENESIS_WIRE.get() {
+        Some(w) => Some(w.clone()),
+        None => tokio::task::spawn_blocking(move || {
+            storage.load_microblock_auto_format(0).ok().flatten()
+                .and_then(|b| crate::genesis_config::genesis_wire_bytes(&b).ok())
+        }).await.ok().flatten().map(|bytes| GENESIS_WIRE.get_or_init(|| Arc::new(bytes)).clone()),
+    };
+    match wire {
+        Some(bytes) => {
             let resp = warp::http::Response::builder()
                 .header("content-type", "application/octet-stream")
-                .body(warp::hyper::Body::from(bytes))
+                .body(warp::hyper::Body::from(bytes.as_ref().clone()))
                 .unwrap_or_else(|_| warp::http::Response::new(warp::hyper::Body::empty()));
             Ok(resp)
         }
