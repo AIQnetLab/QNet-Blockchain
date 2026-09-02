@@ -562,9 +562,14 @@ impl BlockchainNode {
         // back-pressure naturally — exactly the desired behaviour
         // because they MUST NOT advance against the still-rebuilding
         // state.
+        // Canonical root at target, read BEFORE the lock so the repair below can run inside it.
+        // The same per-block root every validator checked at apply, stored in the surviving block.
+        let expected_root: Option<[u8; 32]> = storage.load_microblock_auto_format(target_height)
+            .ok().flatten().map(|mb| mb.state_root);
+        let mut repaired_phantom: Option<String> = None;
         let replayed: u64;
         let mode: &'static str;
-        let computed_root: [u8; 32];
+        let mut computed_root: [u8; 32];
         {
             let sg = state.write().await;
 
@@ -644,7 +649,23 @@ impl BlockchainNode {
             // Root captured under the SAME lock: after release a concurrent apply may advance the
             // state past target and a post-release read would spuriously mismatch.
             computed_root = sg.finalize_merkle();
+            // Repair UNDER the same lock: one extra leaf over the canonical root is the
+            // accounts-CF phantom the restored snapshot carried. Done here, the probe sees
+            // exactly the state whose root was measured — a block landing after the release
+            // could otherwise add a legitimate leaf the probe would name instead.
+            if let Some(exp) = expected_root {
+                if computed_root != exp {
+                    if let Some(addr) = sg.repair_single_phantom(&exp) {
+                        repaired_phantom = Some(addr);
+                        computed_root = exp;
+                    }
+                }
+            }
         } // <-- single lock release after full reconcile
+        if let Some(addr) = &repaired_phantom {
+            storage.purge_phantom_account(addr);
+            println!("[WARN][STATE] reconcile_repaired_phantom target={} addr={}", target_height, addr);
+        }
 
         println!(
             "[INFO][STATE] reconcile_complete mode={} replay_from={} target={} replayed={} load_errors={}",
@@ -663,11 +684,9 @@ impl BlockchainNode {
         // the surviving microblock. Any other outcome ⇒ Err ⇒ caller resyncs from canonical QC state.
         // (The former gate read consensus_data.snapshot_root, which no producer ever sets — the binder
         // migrated to macroblock.state_root — so reconcile could never prove and ALWAYS fell to resync.)
-        let expected_root = match storage.load_microblock_auto_format(target_height) {
-            Ok(Some(mb)) => mb.state_root,
-            _ => {
-                return Err(format!("reconcile_no_target_block target={} action=resync", target_height));
-            }
+        let expected_root = match expected_root {
+            Some(r) => r,
+            None => return Err(format!("reconcile_no_target_block target={} action=resync", target_height)),
         };
         if computed_root != expected_root {
             return Err(format!(

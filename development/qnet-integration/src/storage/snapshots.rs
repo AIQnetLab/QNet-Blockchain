@@ -101,6 +101,13 @@ impl Storage {
     pub fn load_trueup_candidates(&self) -> Vec<String> { self.persistent.load_trueup_candidates() }
     pub fn clear_trueup_candidates(&self) { self.persistent.clear_trueup_candidates() }
 
+    /// Drop a phantom account everywhere it was mirrored: its accounts-CF row and, for a
+    /// contract, its contract_storage rows (RPC-visible garbage otherwise).
+    pub fn purge_phantom_account(&self, addr: &str) {
+        let _ = self.delete_accounts_cf_keys(&[addr.to_string()]);
+        let _ = self.persistent.delete_contract_storage(addr);
+    }
+
     /// O(1) RocksDB estimate of total persisted accounts — the TOTAL on-disk
     /// account count (every hot ∪ cold row in the "accounts" CF), NOT the bounded
     /// LRU cache size. Best-effort: unwraps to 0 on missing CF / None / Err so it
@@ -1865,6 +1872,28 @@ impl Storage {
         self.recompute_account_merkle_root_cf("accounts")
     }
 
+    /// Repair a STAGED snapshot that exceeds the QC-bound root by exactly one leaf: rebuild the
+    /// scratch tree from accounts_stage, find the extra leaf (find_single_extra_leaf — verified
+    /// against the certified root, not guessed), delete that staged row and return its address.
+    /// None ⇒ no single removal reaches the root; the caller keeps its fail-closed discard.
+    pub(super) fn repair_staged_phantom(&self, expected_root: &[u8; 32]) -> Option<String> {
+        let cf = self.persistent.db.cf_handle("accounts_stage")?;
+        let mut tree = qnet_state::StateMerkleTree::new();
+        let mut addrs: Vec<String> = Vec::new();
+        for item in self.persistent.db.iterator_cf(&cf, rocksdb::IteratorMode::Start) {
+            let (k, v) = item.ok()?;
+            let addr = String::from_utf8(k.to_vec()).ok()?;
+            let account: qnet_state::Account = bincode::deserialize(&v).ok()?;
+            tree.insert_lazy(&addr, &account);
+            addrs.push(addr);
+        }
+        let _ = tree.finalize();
+        let key = tree.find_single_extra_leaf(expected_root)?;
+        let addr = addrs.into_iter().find(|a| qnet_state::StateMerkleTree::hash_address(a) == key)?;
+        self.persistent.db.delete_cf(&cf, addr.as_bytes()).ok()?;
+        Some(addr)
+    }
+
     /// Account merkle over an explicit CF: "accounts" (live) or "accounts_stage" (cold-join verify).
     /// Streams the CF row-by-row into a throwaway tree (no full Vec) — the finalized root is identical
     /// (the tree is leaf-set-keyed, so insertion streaming vs batch yields the same root).
@@ -2540,8 +2569,20 @@ impl Storage {
         // Pattern C: snapshot bytes are staged in accounts_stage. Recompute the SAME account merkle the
         // consensus committed (finalize_merkle) from the STAGED accounts and compare to the QC-bound
         // mb.state_root; a forged snapshot yields a different root.
-        let computed = self.recompute_account_merkle_root_cf("accounts_stage")
+        let mut computed = self.recompute_account_merkle_root_cf("accounts_stage")
             .map_err(|e| IntegrationError::Other(format!("merkle_recompute_err h={} err={:?}", snapshot_height, e)))?;
+
+        if computed != expected_root {
+            // A peer snapshot ONE leaf over the QC-bound root is the accounts-CF phantom a
+            // rolled-back block left in every node's mirror. Repair it against the certified
+            // root here, BEFORE the discard — this binder is the only gate a cold-joiner or a
+            // wholesale resync ever passes; the post-promote rehydrate check is just the belt.
+            if let Some(addr) = self.repair_staged_phantom(&expected_root) {
+                println!("[WARN][SNAPSHOT] staged_repaired_phantom h={} addr={}", snapshot_height, addr);
+                computed = self.recompute_account_merkle_root_cf("accounts_stage")
+                    .map_err(|e| IntegrationError::Other(format!("merkle_recompute_err h={} err={:?}", snapshot_height, e)))?;
+            }
+        }
 
         if computed != expected_root {
             // Real rollback: a peer served state that doesn't match the 2f+1-bound root.
@@ -3457,13 +3498,24 @@ impl Storage {
             }
         };
         if computed != anchor_state_root {
-            println!("[ERR][STATE] rehydrate_merkle_mismatch expected={} computed={} action=clear_block_replay",
-                     hex::encode(&anchor_state_root[..8]), hex::encode(&computed[..8]));
-            sg.clear();
-            return Err(IntegrationError::StorageError(format!(
-                "rehydrate_merkle_mismatch h={} expected={} computed={}",
-                anchor_height, hex::encode(&anchor_state_root[..8]), hex::encode(&computed[..8])
-            )));
+            // A peer snapshot carrying one phantom row (rollback write-through never reversed)
+            // is repaired against the QC-bound root rather than rejected — same verified-not-
+            // guessed rule as the boot and reconcile sites; the promoted CF row goes too.
+            match sg.repair_single_phantom(&anchor_state_root) {
+                Some(addr) => {
+                    self.purge_phantom_account(&addr);
+                    println!("[WARN][STATE] rehydrate_repaired_phantom h={} addr={}", anchor_height, addr);
+                }
+                None => {
+                    println!("[ERR][STATE] rehydrate_merkle_mismatch expected={} computed={} action=clear_block_replay",
+                             hex::encode(&anchor_state_root[..8]), hex::encode(&computed[..8]));
+                    sg.clear();
+                    return Err(IntegrationError::StorageError(format!(
+                        "rehydrate_merkle_mismatch h={} expected={} computed={}",
+                        anchor_height, hex::encode(&anchor_state_root[..8]), hex::encode(&computed[..8])
+                    )));
+                }
+            }
         }
         // Verified — seed chain_state now that the bound merkle is confirmed.
         {

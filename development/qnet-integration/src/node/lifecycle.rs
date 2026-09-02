@@ -529,6 +529,21 @@ impl BlockchainNode {
                                                      snapshot_height, accounts.len(), snap_total_supply,
                                                      hex::encode(&state_root[..8]), accounts_data.len() / 1024);
                                         }
+                                    } else if let Some(addr) = state_guard.repair_single_phantom(&state_root) {
+                                        // One extra leaf over the certified root — the accounts-CF phantom
+                                        // a rolled-back block left behind. Repaired against the 2f+1 root
+                                        // (verified, not guessed); its CF row goes too, so no later
+                                        // snapshot resurrects it. State is now the certified state.
+                                        storage.purge_phantom_account(&addr);
+                                        println!("[WARN][STATE] snapshot_repaired_phantom h={} addr={} root={}",
+                                                 snapshot_height, addr, hex::encode(&state_root[..8]));
+                                        {
+                                            let mut cs = state_guard.chain_state.write();
+                                            cs.total_supply = snap_total_supply;
+                                            cs.height = snapshot_height;
+                                            cs.last_minted_emission_mb = Self::emission_mb_index(snapshot_height);
+                                        }
+                                        restored_snapshot_height = snapshot_height;
                                     } else {
                                         eprintln!("[ERR][STATE] snapshot_merkle_mismatch expected={} computed={} action=clear_and_full_replay",
                                                   hex::encode(&state_root[..8]), hex::encode(&computed_merkle[..8]));

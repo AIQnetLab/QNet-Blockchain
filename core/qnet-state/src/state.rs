@@ -758,6 +758,32 @@ impl StateMerkleTree {
         self.dirty_paths.insert(addr_hash); // v32.14: path-walk needed for default-fill
     }
     
+    /// Root-guided single-leaf repair probe: the ONE leaf whose removal makes this leaf set
+    /// hash to `target`, or None. A restored set that exceeds the certified state by exactly
+    /// one row — the accounts-CF phantom a rolled-back block leaves behind — is the only shape
+    /// this repairs, and the answer is verified, not guessed: a set hashing to a 2f+1-certified
+    /// root IS that state. Runs on a scratch tree (no store, no log lines): one full build,
+    /// then an O(log N) incremental delete/restore per candidate. Needs the complete leaf set.
+    pub fn find_single_extra_leaf(&self, target: &[u8; HASH_SIZE]) -> Option<[u8; HASH_SIZE]> {
+        if self.leaves.is_empty() || (self.node_store.is_some() && !self.leaves_complete) {
+            return None;
+        }
+        let mut t = StateMerkleTree::new();
+        for (k, v) in &self.leaves { t.leaves.insert(*k, *v); }
+        t.dirty = true;
+        t.pending_updates = 0; // keeps finalize silent
+        let _ = t.finalize();  // cold start: full rebuild seeds the node cache
+        let keys: Vec<[u8; HASH_SIZE]> = t.leaves.keys().copied().collect();
+        for k in keys {
+            let v = match t.leaves.get(&k) { Some(v) => *v, None => continue };
+            t.leaf_del(k); t.dirty_paths.insert(k); t.dirty = true; t.pending_updates = 0;
+            let r = t.finalize();
+            t.leaf_put(k, v); t.dirty_paths.insert(k); t.dirty = true; t.pending_updates = 0;
+            if &r == target { return Some(k); }
+        }
+        None
+    }
+
     /// Get current root (with lazy recomputation if dirty)
     /// Safe to call anytime - will finalize if needed
     pub fn root(&mut self) -> [u8; HASH_SIZE] {
@@ -953,7 +979,7 @@ impl StateMerkleTree {
         }
     }
 
-    fn hash_address(address: &str) -> [u8; HASH_SIZE] {
+    pub fn hash_address(address: &str) -> [u8; HASH_SIZE] {
         let mut hasher = Sha3_256::new();
         hasher.update(b"QNET_ADDR:");
         hasher.update(address.as_bytes());
@@ -3976,6 +4002,22 @@ impl StateManager {
         self.merkle_tree.read().leaves_complete
     }
 
+    /// Repair a restored state that exceeds the certified root by exactly one leaf: locate it
+    /// (find_single_extra_leaf), drop it from the accounts map and the tree, and return its
+    /// address once the recomputed root equals `target`. None ⇒ nothing matched (state may
+    /// have been left as-is or, on the never-expected verify miss, already mutated — callers
+    /// treat None as the original mismatch and clear).
+    pub fn repair_single_phantom(&self, target: &[u8; HASH_SIZE]) -> Option<String> {
+        let key = self.merkle_tree.read().find_single_extra_leaf(target)?;
+        let addr = self.accounts.iter()
+            .find(|e| StateMerkleTree::hash_address(e.key()) == key)
+            .map(|e| e.key().clone())?;
+        self.merkle_tree.write().remove_lazy(&addr);
+        self.accounts.remove(&addr);
+        self.token_trees.write().remove(&addr);
+        if self.finalize_merkle() == *target { Some(addr) } else { None }
+    }
+
     /// Exact committed-leaf count (equals the account count the state_root commits to).
     /// Authoritative only while merkle_leaves_complete() — callers must gate on it.
     pub fn merkle_leaf_count(&self) -> usize {
@@ -5751,6 +5793,30 @@ mod level_sync_tests {
         let root = tree.finalize();
         tree.incremental_enabled = true;
         root
+    }
+
+    #[test]
+    fn single_extra_leaf_probe_finds_the_phantom_and_nothing_else() {
+        let base: Vec<(String, Account)> = (0..40)
+            .map(|i| (format!("addr_{}", i), acct(100 * i, i, &format!("addr_{}", i))))
+            .collect();
+        let mut tree = StateMerkleTree::new();
+        for (a, c) in &base { tree.insert_lazy(a, c); }
+        let certified = tree.finalize();
+        // One phantom row on top: the probe must name exactly it, with the tree left intact.
+        let phantom = acct(7, 1, "phantom_addr");
+        tree.insert_lazy("phantom_addr", &phantom);
+        let dirty_root = tree.finalize();
+        assert_ne!(dirty_root, certified);
+        assert_eq!(tree.find_single_extra_leaf(&certified),
+                   Some(StateMerkleTree::hash_address("phantom_addr")));
+        assert_eq!(tree.finalize(), dirty_root, "probe must not mutate the live tree");
+        // No single removal reaches an unrelated root.
+        assert_eq!(tree.find_single_extra_leaf(&[0x5au8; 32]), None);
+        // Two extra rows are out of scope: no single removal can reach the certified root.
+        tree.insert_lazy("phantom_2", &acct(9, 2, "phantom_2"));
+        let _ = tree.finalize();
+        assert_eq!(tree.find_single_extra_leaf(&certified), None);
     }
 
     #[test]
