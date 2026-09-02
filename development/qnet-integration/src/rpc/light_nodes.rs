@@ -100,46 +100,58 @@ pub(super) async fn handle_light_node_token_refresh(
         })));
     }
 
-    // Deduplicate: skip if token hash is unchanged
-    let existing_hash = blockchain.get_storage()
-        .get_fcm_data(&req.node_id)
-        .map(|(t, _, _)| blake3::hash(t.as_bytes()).to_hex().to_string());
-    let new_hash = blake3::hash(req.device_token.as_bytes()).to_hex().to_string();
-    if existing_hash.as_deref() == Some(new_hash.as_str()) {
-        if crate::node::is_debug() {
-            println!("[DBG][LIGHT] token_refresh_skip node={} reason=unchanged", req.node_id);
-        }
-        return Ok(warp::reply::json(&serde_json::json!({
-            "success": true, "updated": false, "reason": "token_unchanged"
-        })));
-    }
-
-    // Save to RocksDB
     let pt = match req.push_type.as_str() {
         "unifiedpush" => "unifiedpush",
         "polling"     => "polling",
         _             => "fcm",
     };
-    if let Err(e) = blockchain.get_storage().save_fcm_token(
-        &req.node_id, &req.device_token, pt, req.endpoint.as_deref(),
-    ) {
-        println!("[WARN][LIGHT] token_refresh_save_failed node={} err={}", req.node_id, e);
-        return Ok(warp::reply::json(&serde_json::json!({
-            "success": false, "error": "Storage error"
-        })));
+
+    // LWW record: an unchanged triple keeps its original stamp; a changed one is stamped now
+    // by this (serving) genesis — the ordering authority for the update. The peer fan-out runs
+    // in BOTH cases: the old unchanged-skip also skipped the sync, so a peer that missed the
+    // original update (the shard-owner pinger included) stayed stale forever.
+    let stored = blockchain.get_storage().get_fcm_record(&req.node_id);
+    let unchanged = stored.as_ref().map(|(t, p, e, _)|
+        t == &req.device_token && p == pt && e.as_deref() == req.endpoint.as_deref()
+    ).unwrap_or(false);
+    // Monotonic bump past the stored stamp: a genuinely newer event must supersede even
+    // when this genesis's clock lags the one that stamped the old record.
+    let record_ts = if unchanged {
+        stored.as_ref().map(|r| r.3).unwrap_or(now)
+    } else {
+        std::cmp::max(now, stored.as_ref().map(|r| r.3.saturating_add(1)).unwrap_or(now))
+    };
+
+    if !unchanged {
+        if let Err(e) = blockchain.get_storage().save_fcm_token(
+            &req.node_id, &req.device_token, pt, req.endpoint.as_deref(), record_ts,
+        ) {
+            println!("[WARN][LIGHT] token_refresh_save_failed node={} err={}", req.node_id, e);
+            return Ok(warp::reply::json(&serde_json::json!({
+                "success": false, "error": "Storage error"
+            })));
+        }
+        if let Some(p2p) = blockchain.get_unified_p2p() {
+            p2p.update_light_node_push_type(&req.node_id, pt, now);
+        }
+        if crate::node::is_info() {
+            println!("[INFO][LIGHT] token_refreshed node={} push={}", req.node_id, pt);
+        }
+    } else if crate::node::is_debug() {
+        println!("[DBG][LIGHT] token_refresh_unchanged node={} resync_peers=true", req.node_id);
     }
 
-    // Update in-memory push_type + last_seen in P2P registry
-    if let Some(p2p) = blockchain.get_unified_p2p() {
-        p2p.update_light_node_push_type(&req.node_id, pt, now);
+    // Sync to peer genesis nodes (fire-and-forget), carrying the record's authoritative ts.
+    // Unchanged-record rebroadcasts (anti-stale heal) are bounded to one per node per hour.
+    fn fanout_dedup() -> &'static dashmap::DashMap<String, u64> {
+        static M: std::sync::OnceLock<dashmap::DashMap<String, u64>> = std::sync::OnceLock::new();
+        M.get_or_init(dashmap::DashMap::new)
     }
-
-    if crate::node::is_info() {
-        println!("[INFO][LIGHT] token_refreshed node={} push={}", req.node_id, pt);
-    }
-
-    // Sync to peer genesis nodes (fire-and-forget)
-    {
+    let skip_fanout = unchanged && fanout_dedup().get(&req.node_id)
+        .map(|t| now.saturating_sub(*t.value()) < 3600).unwrap_or(false);
+    if !skip_fanout {
+        if fanout_dedup().len() > 65_536 { fanout_dedup().clear(); }
+        fanout_dedup().insert(req.node_id.clone(), now);
         use crate::genesis_constants::GENESIS_NODE_IPS;
         let node_id_clone = req.node_id.clone();
         let token_clone = req.device_token.clone();
@@ -151,12 +163,12 @@ pub(super) async fn handle_light_node_token_refresh(
                 .map(|(ip, _)| ip.to_string()).unwrap_or_default()
         };
         tokio::spawn(async move {
-            sync_fcm_token_to_genesis_peers(&node_id_clone, &token_clone, &pt_clone, ep_clone.as_deref(), &our_ip).await;
+            sync_fcm_token_to_genesis_peers(&node_id_clone, &token_clone, &pt_clone, ep_clone.as_deref(), &our_ip, record_ts).await;
         });
     }
 
     Ok(warp::reply::json(&serde_json::json!({
-        "success": true, "updated": true
+        "success": true, "updated": !unchanged
     })))
 }
 
@@ -745,11 +757,16 @@ pub(super) async fn handle_light_node_register(
                 crate::unified_p2p::PushType::UnifiedPush => "unifiedpush",
                 crate::unified_p2p::PushType::Polling => "polling",
             };
+            // Same monotonic bump as token-refresh so a re-register supersedes regardless of skew.
+            let reg_ts = std::cmp::max(now, blockchain.get_storage()
+                .get_fcm_record(&light_node_pseudonym)
+                .map(|r| r.3.saturating_add(1)).unwrap_or(now));
             match blockchain.get_storage().save_fcm_token(
                 &light_node_pseudonym,
                 &register_request.device_token,
                 pt_str,
                 register_request.unified_push_endpoint.as_deref(),
+                reg_ts,
             ) {
                 Ok(()) => {
                     if crate::node::is_info() {
@@ -778,6 +795,7 @@ pub(super) async fn handle_light_node_register(
                                 &pt_str_clone,
                                 endpoint_clone.as_deref(),
                                 &our_ip,
+                                reg_ts,
                             ).await;
                         });
                     }
@@ -1527,12 +1545,69 @@ pub(super) fn validate_unified_push_endpoint(endpoint: &str) -> Result<(), Strin
     }
 }
 
+/// Owner-shard verdict proxy: the current-epoch attestation view is shard-owner RAM
+/// (bounded at 10M nodes), so a non-owner consults the owner before declaring a node
+/// inactive — every genesis then returns ONE verdict and the app stops flip-flopping
+/// with the node it happens to poll. 60s per-node cache (64k cap); None on any error
+/// (caller keeps its local verdict). `fwd=1` marks a proxied call — never recursed.
+async fn shard_owner_says_active(node_id: &str) -> Option<bool> {
+    use crate::genesis_constants::GENESIS_NODE_IPS;
+    fn cache() -> &'static dashmap::DashMap<String, (bool, u64)> {
+        static M: std::sync::OnceLock<dashmap::DashMap<String, (bool, u64)>> = std::sync::OnceLock::new();
+        M.get_or_init(dashmap::DashMap::new)
+    }
+    // Per-owner negative cache: an unreachable owner must not cost every status poll a
+    // 2s timeout — skip its shard's proxying for 15s after a failure.
+    fn owner_down() -> &'static dashmap::DashMap<usize, u64> {
+        static M: std::sync::OnceLock<dashmap::DashMap<usize, u64>> = std::sync::OnceLock::new();
+        M.get_or_init(dashmap::DashMap::new)
+    }
+    // Global in-flight bound: the proxy is reachable from a public endpoint, so outbound
+    // fan-in to the owner is capped process-wide; overflow degrades to the local verdict.
+    fn inflight() -> &'static tokio::sync::Semaphore {
+        static S: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+        S.get_or_init(|| tokio::sync::Semaphore::new(16))
+    }
+    let owner = crate::node::light_shard_of(node_id);
+    let our_idx = std::env::var("QNET_BOOTSTRAP_ID").ok()
+        .and_then(|id| id.parse::<usize>().ok())
+        .map(|n| n.saturating_sub(1));
+    if our_idx == Some(owner) { return None; }
+    let (ip, _) = GENESIS_NODE_IPS.get(owner)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    if let Some(e) = cache().get(node_id) { if e.value().1 > now { return Some(e.value().0); } }
+    if let Some(d) = owner_down().get(&owner) { if *d.value() > now { return None; } }
+    if cache().len() > 65_536 { cache().clear(); }
+    let _permit = inflight().try_acquire().ok()?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2)).build().ok()?;
+    let url = format!("http://{}:8001/api/v1/light-node/status?node_id={}&fwd=1", ip, node_id);
+    let v: Option<serde_json::Value> = match client.get(&url).send().await {
+        Ok(r) if r.status().is_success() => r.json().await.ok(),
+        _ => None,
+    };
+    // Only a transport-level failure marks the owner down; a well-formed reply without
+    // a verdict (e.g. the owner does not know the node) is a per-node None, not an outage.
+    let v = match v {
+        Some(v) => v,
+        None => { owner_down().insert(owner, now + 15); return None; }
+    };
+    let active = v["is_active"].as_bool()?;
+    cache().insert(node_id.to_string(), (active, now + 60));
+    Some(active)
+}
+
 /// Handle Light node status check
 /// Returns current activity status and failure count
 pub(super) async fn handle_light_node_status(
     params: HashMap<String, String>,
+    remote_addr: Option<std::net::SocketAddr>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "read_only") {
+        return Ok(rate_limit_response);
+    }
     let node_id = match params.get("node_id") {
         Some(id) => id.clone(),
         None => return Ok(warp::reply::json(&json!({
@@ -1570,7 +1645,10 @@ pub(super) async fn handle_light_node_status(
             let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
             let fresh = now_secs.saturating_sub(node.registered_at) < WAKE_GRACE_SECS;
             let attested_now = p2p.has_attestation_in_window(&node_id);
-            let needs_reactivation = needs_reactivation && !attested_now && !fresh;
+            let mut needs_reactivation = needs_reactivation && !attested_now && !fresh;
+            if needs_reactivation && !params.contains_key("fwd") {
+                if shard_owner_says_active(&node_id).await == Some(true) { needs_reactivation = false; }
+            }
             return Ok(warp::reply::json(&json!({
                 "success": true,
                 "node_id": node_id,
@@ -1591,7 +1669,10 @@ pub(super) async fn handle_light_node_status(
     // RAM-hit branch so the verdict is identical across genesis (honors "any genesis returns the same answer").
     if onchain_registered {
         let attested_now = blockchain.get_unified_p2p().map(|p| p.has_attestation_in_window(&node_id)).unwrap_or(false);
-        let needs_reactivation = needs_reactivation && !attested_now;
+        let mut needs_reactivation = needs_reactivation && !attested_now;
+        if needs_reactivation && !params.contains_key("fwd") {
+            if shard_owner_says_active(&node_id).await == Some(true) { needs_reactivation = false; }
+        }
         return Ok(warp::reply::json(&json!({
             "success": true,
             "node_id": node_id,
@@ -1793,9 +1874,11 @@ pub(super) async fn handle_server_node_status(
                     // so a just-(re)activated live node is not reported OFFLINE for up to a full epoch.
                     const WAKE_GRACE_SECS: u64 = 3 * 14400;
                     let fresh = now.saturating_sub(node.registered_at) < WAKE_GRACE_SECS;
-                    let is_online = blockchain.get_storage().light_attested_recent_onchain(target_id, block_height)
+                    let mut is_online = blockchain.get_storage().light_attested_recent_onchain(target_id, block_height)
                         || p2p.has_attestation_in_window(target_id)
                         || fresh;
+                    // Same owner-shard verdict as handle_light_node_status (cached) — one answer everywhere.
+                    if !is_online && shard_owner_says_active(target_id).await == Some(true) { is_online = true; }
                     // Strict on-chain registration truth; is_online stays a labeled approximation.
                     let onchain = blockchain.get_storage().is_node_registration_onchain(target_id);
                     return Ok(warp::reply::json(&json!({

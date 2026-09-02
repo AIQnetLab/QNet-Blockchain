@@ -490,6 +490,56 @@ impl Storage {
         ))
     }
 
+    /// Addresses a stored block touched (every tx's affected set) plus its producer id, read
+    /// straight from the stored form. Unlike load_microblock_auto_format this never rebuilds a
+    /// MicroBlock and never feeds the tx pool (whose insert is O(pool) once full), so a deep
+    /// rollback's candidate scan stays one point read per tx. Ok(None) ⇒ block absent.
+    /// Txs missing from the tx CF are counted and logged — they are a coverage gap, not an error.
+    pub fn touched_addresses_at(&self, height: u64) -> IntegrationResult<Option<(Vec<String>, String)>> {
+        let raw = match self.load_microblock(height)? { Some(d) => d, None => return Ok(None) };
+        let data = if raw.len() >= 4 && raw[0..4] == [0x28, 0xb5, 0x2f, 0xfd] {
+            zstd::decode_all(&raw[..]).map_err(|e| IntegrationError::Other(format!("zstd: {}", e)))?
+        } else { raw };
+        let fmt = self.persistent.db.cf_handle("metadata")
+            .and_then(|cf| self.persistent.db.get_cf(&cf, mb_fmt_key(height).as_bytes()).ok())
+            .flatten().and_then(|v| v.first().copied());
+        let mut out = Vec::new();
+        if fmt != Some(0x01) {
+            if let Ok(eb) = bincode::deserialize::<qnet_state::EfficientMicroBlock>(&data) {
+                if eb.height == height {
+                    let tx_cf = match self.persistent.db.cf_handle("transactions") {
+                        Some(c) => c,
+                        None => return Ok(Some((out, eb.producer))),
+                    };
+                    let mut missing = 0u32;
+                    for h in &eb.transaction_hashes {
+                        let key = format!("tx_{}", hex::encode(h));
+                        let td = match self.persistent.db.get_cf(&tx_cf, key.as_bytes()) {
+                            Ok(Some(d)) => d,
+                            _ => { missing += 1; continue; }
+                        };
+                        let td = if td.len() >= 4 && td[0..4] == [0x28, 0xb5, 0x2f, 0xfd] {
+                            zstd::decode_all(&td[..]).unwrap_or(td)
+                        } else { td };
+                        match bincode::deserialize::<qnet_state::Transaction>(&td) {
+                            Ok(tx) => out.extend(tx.get_all_affected_addresses()),
+                            Err(_) => missing += 1,
+                        }
+                    }
+                    if missing > 0 {
+                        println!("[WARN][STORAGE] touched_scan_txs_missing h={} missing={}", height, missing);
+                    }
+                    return Ok(Some((out, eb.producer)));
+                }
+            }
+        }
+        if let Ok(mb) = bincode::deserialize::<qnet_state::MicroBlock>(&data) {
+            for tx in &mb.transactions { out.extend(tx.get_all_affected_addresses()); }
+            return Ok(Some((out, mb.producer)));
+        }
+        Err(IntegrationError::StorageError(format!("touched_scan_unknown_format h={}", height)))
+    }
+
     /// Reconstruct a full MicroBlock from EfficientMicroBlock binary data.
     /// Loads transactions from persistent RocksDB storage and in-memory cache.
     pub(super) fn reconstruct_from_efficient(&self, data: &[u8], height: u64) -> IntegrationResult<Option<qnet_state::MicroBlock>> {

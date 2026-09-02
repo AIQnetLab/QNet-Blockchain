@@ -2,6 +2,19 @@
 
 use super::*;
 
+/// Wholesale-resync escalation window: lifts the two forward-only regress guards
+/// (download negotiation + promote) for the single fast_sync call that set it. The
+/// sync coordinator serializes fast_sync calls, so a plain flag is race-free; the
+/// promote/rehydrate root verification still gates every restore.
+static ALLOW_SNAPSHOT_REGRESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// RAII window for ALLOW_SNAPSHOT_REGRESS — clears on drop so a panic or task abort
+/// inside the download/promote chain can never leave the permission latched.
+struct RegressWindow;
+impl Drop for RegressWindow {
+    fn drop(&mut self) { ALLOW_SNAPSHOT_REGRESS.store(false, std::sync::atomic::Ordering::SeqCst); }
+}
+
 impl Storage {
     /// Create state snapshot at the given height (snapshot system for fast
     /// node sync; runs at every INCREMENTAL_INTERVAL boundary).
@@ -24,6 +37,69 @@ impl Storage {
     ) -> IntegrationResult<PinnedDbSnapshot> {
         self.persistent.prepare_snapshot_view(hot_accounts)
     }
+
+    pub fn accounts_cf_keys_page(&self, after: Option<&[u8]>, limit: usize)
+        -> IntegrationResult<(Vec<String>, Option<Vec<u8>>)> {
+        self.persistent.accounts_cf_keys_page(after, limit)
+    }
+    pub fn delete_accounts_cf_keys(&self, keys: &[String]) -> IntegrationResult<()> {
+        self.persistent.delete_accounts_cf_keys(keys)
+    }
+    pub fn stage_trueup_candidates(&self, addrs: &[String]) -> IntegrationResult<usize> {
+        self.persistent.stage_trueup_candidates(addrs)
+    }
+
+    /// Stage every address the blocks in `from..=to` touched, for the post-reconcile CF true-up.
+    /// Their write-through rows in the accounts CF outlive a prune, so this journal is the
+    /// candidate set. Mirrors what apply can create: the tx sets plus the two protocol-level
+    /// credits that appear in no transaction (producer fee wallet, rewards pool). Flushed in
+    /// batches so peak RAM is bounded by the batch, not by the depth of the rollback; stops
+    /// collecting once the durable journal is full. Ticks the rollback watchdog.
+    /// Returns (staged, dropped_at_cap).
+    pub fn stage_trueup_for_range(&self, from: u64, to: u64) -> (usize, usize) {
+        const FLUSH_EVERY: usize = 20_000;
+        let mut batch: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        batch.insert(crate::StateManager::REWARDS_POOL.to_string());
+        let (mut staged, mut dropped) = (0usize, 0usize);
+        for h in from..=to {
+            // Every height, not every N: the scan runs inside the rollback barrier and each
+            // block is real I/O — a coarse tick lets the watchdog reap the barrier mid-scan.
+            crate::storage::note_rollback_progress();
+            if let Ok(Some((addrs, producer))) = self.touched_addresses_at(h) {
+                batch.extend(addrs);
+                if let Ok(Some((_, wallet, _))) = self.load_node_registration(&producer) {
+                    if !wallet.is_empty() { batch.insert(wallet); }
+                }
+            }
+            if batch.len() >= FLUSH_EVERY {
+                let (s, d) = self.flush_trueup_batch(&mut batch);
+                staged += s; dropped += d;
+                crate::storage::note_rollback_progress();
+                if dropped > 0 { break; } // journal full — further collecting cannot help
+            }
+        }
+        let (s, d) = self.flush_trueup_batch(&mut batch);
+        staged += s; dropped += d;
+        crate::storage::note_rollback_progress();
+        (staged, dropped)
+    }
+
+    /// Persist one true-up batch, emptying it. Returns (staged, dropped) — a failed write counts
+    /// the whole batch as dropped so the caller's coverage alarm fires; silence here would let
+    /// the later clear_trueup_candidates make the uncovered phantoms permanent.
+    fn flush_trueup_batch(&self, batch: &mut std::collections::BTreeSet<String>) -> (usize, usize) {
+        if batch.is_empty() { return (0, 0); }
+        let v: Vec<String> = std::mem::take(batch).into_iter().collect();
+        match self.stage_trueup_candidates(&v) {
+            Ok(d) => (v.len().saturating_sub(d), d),
+            Err(e) => {
+                println!("[WARN][STATE] trueup_stage_failed n={} err={}", v.len(), e);
+                (0, v.len())
+            }
+        }
+    }
+    pub fn load_trueup_candidates(&self) -> Vec<String> { self.persistent.load_trueup_candidates() }
+    pub fn clear_trueup_candidates(&self) { self.persistent.clear_trueup_candidates() }
 
     /// O(1) RocksDB estimate of total persisted accounts — the TOTAL on-disk
     /// account count (every hot ∪ cold row in the "accounts" CF), NOT the bounded
@@ -92,6 +168,7 @@ impl Storage {
         &self,
         height: u64,
         view: PinnedDbSnapshot,
+        expected_leaves: Option<u64>,
     ) -> IntegrationResult<()> {
         // v32.6: caller (node.rs) controls trigger heights — early anchor
         // at h=90 + baseline every 3600. This function only enforces
@@ -99,7 +176,7 @@ impl Storage {
         if height == 0 {
             return Ok(());
         }
-        self.create_state_snapshot(height, view).await
+        self.create_state_snapshot(height, view, expected_leaves).await
     }
     
     /// Create full state snapshot at specified height
@@ -123,6 +200,7 @@ impl Storage {
         &self,
         height: u64,
         view: PinnedDbSnapshot,
+        expected_leaves: Option<u64>,
     ) -> IntegrationResult<()> {
         // Caller (create_incremental_snapshot) already enforces trigger heights.
         if height == 0 {
@@ -192,6 +270,17 @@ impl Storage {
                     feed!(encoder, uncompressed_len, &(value.len() as u32).to_le_bytes());
                     feed!(encoder, uncompressed_len, &value);
                     account_count += 1;
+                }
+                // Fail-closed: a pinned account set that diverges from the committed leaf set can
+                // never restore to a provable root — abort rather than persist a poison snapshot.
+                // Walk-back keeps older candidates; the next cycle retries after true-up.
+                if let Some(exp) = expected_leaves {
+                    if exp != account_count {
+                        eprintln!("[CRIT][SNAPSHOT] snapshot_aborted_cf_divergent h={} cf_accounts={} merkle_leaves={}",
+                                  height, account_count, exp);
+                        return Err(IntegrationError::StorageError(format!(
+                            "snapshot_cf_divergent h={} cf={} leaves={}", height, account_count, exp)));
+                    }
                 }
 
                 // 5. v2.75: Include pending_rewards for fast sync (lazy rewards survive restart)
@@ -329,7 +418,7 @@ impl Storage {
         Some((mb.state_root, ts))
     }
 
-    pub async fn load_latest_state_snapshot(&self) -> IntegrationResult<Option<(u64, [u8; 32], Vec<u8>, u64)>> {
+    pub async fn load_latest_state_snapshot(&self, exclude: &[u64]) -> IntegrationResult<Option<(u64, [u8; 32], Vec<u8>, u64)>> {
         let snapshots_cf = self.persistent.db.cf_handle("snapshots")
             .ok_or_else(|| IntegrationError::StorageError("snapshots column family not found".to_string()))?;
 
@@ -358,6 +447,8 @@ impl Storage {
         if candidates.is_empty() { return Ok(None); }
 
         for height in candidates {
+            // Caller-rejected candidates (e.g. restored root failed the anchor verify) — walk older.
+            if exclude.contains(&height) { continue; }
             let value = match self.persistent.db.get_cf(&snapshots_cf, format!("full_snap_{}", height).as_bytes())? {
                 Some(v) => v,
                 None => {
@@ -2116,7 +2207,7 @@ impl Storage {
         // below-local anchor for a node already past it (e.g. capsule-less + advanced via replay) — fall
         // to block replay instead, which continues forward.
         let local_h = self.get_chain_height().unwrap_or(0);
-        if target_height <= local_h {
+        if target_height <= local_h && !ALLOW_SNAPSHOT_REGRESS.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(IntegrationError::Other(format!(
                 "snapshot_not_forward target={} local={} action=block_replay", target_height, local_h
             )));
@@ -2606,15 +2697,41 @@ impl Storage {
         // replayed past the snapshot height — set_chain_height below is not forward-only.
         let live_h = self.get_chain_height().map_err(|e| IntegrationError::StorageError(
             format!("promote_height_read_failed h={} err={:?}", height, e)))?;
-        if live_h > height {
+        if live_h > height && !ALLOW_SNAPSHOT_REGRESS.load(std::sync::atomic::Ordering::SeqCst) {
             let _ = self.persistent.db.delete_cf(&meta, b"promote_pending");
             let _ = self.discard_snapshot_state(height);
             return Err(IntegrationError::StorageError(format!(
                 "promote_refused_regress snapshot_h={} live_h={}", height, live_h)));
         }
+        // Honest producers snapshot only on macroblock boundaries and adopt_snapshot_finality
+        // refuses anything else — refuse HERE, before anything destructive, or a peer-advertised
+        // off-boundary height leaves the tail half-pruned with finality retracted and no anchor.
+        if height % qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL != 0 {
+            let _ = self.discard_snapshot_state(height);
+            return Err(IntegrationError::StorageError(format!("promote_refused_off_boundary h={}", height)));
+        }
+        let regress = live_h > height;
         let mut marker = height.to_le_bytes().to_vec();
         marker.extend_from_slice(&anchor_hash);
+        // Regress authorization must survive a crash: boot recovery re-enters this promote
+        // with the volatile flag off, and refusing then would discard the only state that
+        // can finish the job (live accounts may already be partially replaced).
+        marker.push(regress as u8);
         self.persistent.db.put_cf(&meta, b"promote_pending", &marker)?;
+        // A regress runs on a LIVE node: bar saves and materialisation above the restored tip for
+        // the whole destructive window (CF swap, rebuilds, tail prune), or a concurrent apply lands
+        // rows behind the very scans that exist to remove them. Guard drops on every exit path.
+        // Nothing destructive has run yet, so a busy slot just hands the retry token back.
+        let _slot = if regress {
+            match crate::storage::claim_rollback_slot(height) {
+                Ok(g) => Some(g),
+                Err(e) => {
+                    let _ = self.persistent.db.delete_cf(&meta, b"promote_pending");
+                    let _ = self.discard_snapshot_state(height);
+                    return Err(IntegrationError::StorageError(format!("promote_regress_slot_busy h={} err={}", height, e)));
+                }
+            }
+        } else { None };
 
         // Epoch reward roots: PROVE before anything destructive runs. Their macroblocks sit below
         // this node's weak-subjectivity floor and can never be re-fetched, so they must be carried —
@@ -2657,7 +2774,10 @@ impl Storage {
                 }
                 batch.put_cf(&l, &k, &v);
                 n += 1;
-                if n % 10_000 == 0 { self.persistent.db.write(std::mem::take(&mut batch))?; }
+                if n % 10_000 == 0 {
+                    self.persistent.db.write(std::mem::take(&mut batch))?;
+                    crate::storage::note_rollback_progress(); // no-op unless a regress slot is held
+                }
             }
             self.persistent.db.write(batch)?;
             if dropped > 0 {
@@ -2670,9 +2790,13 @@ impl Storage {
         // height). Propagate errors BEFORE committing height/floors/marker-delete: a failed rebuild must
         // NOT finalize the anchor with a stale cbw/registry_lthash (silent fork). On Err the marker +
         // staging survive, so recover_pending_snapshot_promote retries on next boot.
+        crate::storage::note_rollback_progress();
         self.backfill_roster_indices()?;
+        crate::storage::note_rollback_progress();
         self.rebuild_committed_burn_wallet(height)?;
+        crate::storage::note_rollback_progress();
         self.rebuild_registry_lthash(height)?;
+        crate::storage::note_rollback_progress();
         // FIX-5: dilithium_pk_root LtHash from the promoted live accounts — same fail-closed discipline
         // as cbw/registry (Err leaves staging + marker so the promote retries, never finalizes stale).
         self.rebuild_dilithium_pk_lthash()?;
@@ -2692,6 +2816,53 @@ impl Storage {
         self.mark_owns_index_dirty();
         let _ = self.clear_cf("wallet_token");
         if self.backfill_owns_indices().is_ok() { let _ = self.set_owns_index_built(height); }
+        // Wholesale regress: drop the stored tail above the restored anchor, or it stays
+        // present-but-unapplied forever — sync's missing-range scan keys on storage presence
+        // and the pipeline dedups re-delivered stored blocks, so nothing would ever re-apply
+        // it. Same sequence as the recovery decree, monotonic seal watermark included; the
+        // deleted range is re-fetched, verified and applied by the normal tail sync.
+        if regress {
+            // Saves above `height` are barred by the slot, so this read is the final tip.
+            let cur = self.get_chain_height().unwrap_or(live_h);
+            if cur > height {
+                let anchor_mb = height / 90;
+                // WAL pairs by the WINDOW they certify — the pair index is the view counter, not
+                // a macroblock index — same rule as the recovery decree.
+                for (idx, bytes) in self.load_certified_pairs().unwrap_or_default() {
+                    let head = bincode::deserialize::<Vec<crate::consensus_v2_driver::ConsensusMsg>>(&bytes).ok()
+                        .and_then(|p| p.iter().find_map(|m| match m {
+                            crate::consensus_v2_driver::ConsensusMsg::Proposal(cp) => Some(cp.window_head_height),
+                            _ => None,
+                        }));
+                    if head.map(|h| h > height).unwrap_or(true) { let _ = self.delete_certified_pair(idx); }
+                }
+                for idx in (anchor_mb + 1)..=(cur / 90 + 1) {
+                    let _ = self.delete_macroblock_pub(idx);
+                }
+                // Reward side-indices are add-only / first-write-wins: the canonical re-apply of
+                // the tail can never remove an orphan row, so clear them like every other prune.
+                match self.reconcile_reward_indices_above_epoch(height) {
+                    Ok(c) if c > 0 => println!("[INFO][SYNC] regress_reward_indices_cleared n={} to={}", c, height),
+                    Err(e) => println!("[WARN][SYNC] regress_reward_indices_fail to={} err={}", height, e),
+                    _ => {}
+                }
+                let _ = self.delete_microblocks_range_pub(height + 1, cur);
+                let _ = self.force_last_sealed_mb(anchor_mb);
+                // The mandatory post-destruction cleanup every other prune path runs: drop the
+                // read-through body cache (it would keep answering presence checks for deleted
+                // heights) and lower the stored-height marker (monotone-up otherwise).
+                self.invalidate_recent_microblocks_above(height);
+                crate::node::complete_rollback_cleanup(height);
+                // Plain store: the serve horizon is max(this, stored-height) and this half is
+                // raise-only everywhere else — left high, the node advertises the range it just
+                // deleted and answers empty batches for it.
+                crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(height, std::sync::atomic::Ordering::SeqCst);
+                // Markers above the restored tip would deafen this node in exactly the windows
+                // it must re-drive — retract them with the tail they were certifying.
+                crate::node::retract_finality_to(height);
+                println!("[WARN][SYNC] regress_tail_pruned from={} to={} anchor_mb={}", cur, height, anchor_mb);
+            }
+        }
         // Commit height + finality/WS floors + durable anchor (adopt_snapshot_finality persists it).
         self.set_chain_height(height)?;
         crate::node::adopt_snapshot_finality(height, anchor_hash);
@@ -2699,6 +2870,9 @@ impl Storage {
         if let Some(snaps) = self.persistent.db.cf_handle("snapshots") {
             let _ = self.persistent.db.put_cf(&snaps, b"latest_full_snap", &height.to_le_bytes());
         }
+        // The accounts CF was replaced wholesale by the verified snapshot — any staged
+        // phantom candidates died with it, so the journal must not outlive them.
+        self.clear_trueup_candidates();
         self.persistent.db.delete_cf(&meta, b"promote_pending")?;
         // Clear staging CFs ONLY (keep the blob for serving).
         for cf in &["accounts_stage", "node_registry_stage", "pending_rewards_stage", "contract_storage_stage"] {
@@ -2720,14 +2894,23 @@ impl Storage {
     ) {
         let meta = match self.persistent.db.cf_handle("metadata") { Some(c) => c, None => return };
         let bytes = match self.persistent.db.get_cf(&meta, b"promote_pending") {
-            Ok(Some(b)) if b.len() == 40 => b,
+            Ok(Some(b)) if b.len() == 40 || b.len() == 41 => b,
             _ => return,
         };
         let height = u64::from_le_bytes(bytes[..8].try_into().unwrap_or([0u8; 8]));
         let mut anchor = [0u8; 32];
         anchor.copy_from_slice(&bytes[8..40]);
-        println!("[WARN][SYNC] promote_recovery h={} replay=staged", height);
-        if let Err(e) = self.promote_snapshot_staging(height, anchor).await {
+        // Re-arm a crash-interrupted regress promote: the marker byte is the durable
+        // authorization the volatile flag cannot carry across a restart.
+        let regress_authorized = bytes.len() == 41 && bytes[40] == 1;
+        let regress_window = if regress_authorized {
+            ALLOW_SNAPSHOT_REGRESS.store(true, std::sync::atomic::Ordering::SeqCst);
+            Some(RegressWindow)
+        } else { None };
+        println!("[WARN][SYNC] promote_recovery h={} replay=staged regress={}", height, regress_authorized);
+        let promote_res = self.promote_snapshot_staging(height, anchor).await;
+        drop(regress_window);
+        if let Err(e) = promote_res {
             // Keep the marker AND staging: this failure may have landed after live accounts were
             // already replaced, and they are the only state that can finish the job. A
             // pre-destructive failure has already cleared both inside promote, so nothing latches
@@ -2780,6 +2963,7 @@ impl Storage {
     // ═══════════════════════════════════════════════════════════════════════════
 
     pub(super) const SNAPSHOT_CHUNK_SIZE: usize = 4 * 1024 * 1024; // 4MB per chunk
+
     // v32.10: hard bounds on untrusted manifest fields. Prevents OOM DoS via
     // forged total_size / chunk_count from byzantine peer.
     pub(super) const MAX_SNAPSHOT_SIZE: u64 = 100 * 1024 * 1024 * 1024; // 100 GB
@@ -3103,14 +3287,17 @@ impl Storage {
         self.download_snapshot_chunked(p2p, &[peer_addr.to_string()], height).await
     }
 
-    /// Fast sync with snapshot for new nodes
+    /// Fast sync with snapshot for new nodes. `allow_regress` (wholesale escalation from a
+    /// wedged-at-tip state) lifts the two forward-only guards for THIS call — the promote /
+    /// rehydrate verification still gates safety; the sync coordinator serializes calls.
     pub async fn fast_sync_with_snapshot(
         &self,
         p2p: &crate::unified_p2p::SimplifiedP2P,
         target_height: u64,
         state: &std::sync::Arc<tokio::sync::RwLock<crate::StateManager>>,
+        allow_regress: bool,
     ) -> IntegrationResult<()> {
-        println!("[INFO][STORAGE] fast_sync_start target_height={}", target_height);
+        println!("[INFO][STORAGE] fast_sync_start target_height={} allow_regress={}", target_height, allow_regress);
 
         // Light nodes do not perform fast-sync at all — they are pure
         // mobile API clients with zero on-device chain storage. All
@@ -3121,8 +3308,15 @@ impl Storage {
             return Ok(());
         }
 
+        let regress_window = if allow_regress {
+            ALLOW_SNAPSHOT_REGRESS.store(true, std::sync::atomic::Ordering::SeqCst);
+            Some(RegressWindow)
+        } else { None };
+        let res = self.download_and_load_snapshot(p2p).await;
+        drop(regress_window);
+
         // Try to find and load a snapshot
-        match self.download_and_load_snapshot(p2p).await {
+        match res {
             Ok(snapshot_height) => {
                 println!("[INFO][STORAGE] snapshot_loaded height={}", snapshot_height);
 

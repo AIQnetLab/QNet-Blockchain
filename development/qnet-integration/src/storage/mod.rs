@@ -304,6 +304,37 @@ pub fn end_rollback_protection() {
     println!("[INFO][ROLLBACK] protection_ended target_was={}", target);
 }
 
+/// Claim the rollback slot for a VERIFIED regression that legitimately goes below finality — a
+/// coordinated recovery decree, or a wholesale peer-snapshot restore whose root is proven against
+/// the QC-bound anchor. Same slot, stamp, target and materialisation drain as
+/// begin_finality_guarded_rollback, minus its finality check (the caller retracts the markers
+/// itself). Returned guard releases the slot on drop, so no exit path can leave saves barred.
+pub fn claim_rollback_slot(target_height: u64) -> Result<RollbackSlotGuard, String> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let guard = FINALITY_MUTEX.lock();
+    if ROLLBACK_IN_PROGRESS.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+        let start = ROLLBACK_START_TIME.load(Ordering::Relaxed);
+        if now.saturating_sub(start) < ROLLBACK_TIMEOUT_SECS {
+            return Err(format!("rollback_slot_busy other_target={}", ROLLBACK_TARGET_HEIGHT.load(Ordering::Relaxed)));
+        }
+        println!("[WARN][ROLLBACK] stale_slot_force_claim age_secs={}", now.saturating_sub(start));
+        ROLLBACK_IN_PROGRESS.store(true, Ordering::SeqCst);
+    }
+    ROLLBACK_START_TIME.store(now, Ordering::SeqCst);
+    ROLLBACK_TARGET_HEIGHT.store(target_height, Ordering::SeqCst);
+    drop(guard);
+    drain_materialise_inflight(2_000);
+    println!("[INFO][STORAGE] rollback_slot_claimed target_h={} mode=verified_regress", target_height);
+    Ok(RollbackSlotGuard)
+}
+
+/// Releases the rollback slot on drop (see claim_rollback_slot).
+pub struct RollbackSlotGuard;
+impl Drop for RollbackSlotGuard {
+    fn drop(&mut self) { end_rollback_protection(); }
+}
+
 /// Re-stamp the rollback clock. The rollback body calls this between phases so the watchdog measures
 /// time since the last PROGRESS, not since the start.
 ///
@@ -1053,15 +1084,39 @@ impl RocksMerkleNodeStore {
     }
 }
 
+/// Store read failures observed by get_leaf. A deletion authority must distinguish
+/// "absent" from "unreadable": the CF true-up snapshots this counter around each page
+/// and vetoes deletions when it moved — an IO error must never read as certain absence.
+pub static MERKLE_LEAF_READ_ERRS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 impl qnet_state::MerkleNodeStore for RocksMerkleNodeStore {
     fn get_leaf(&self, key: &[u8; 32]) -> Option<[u8; 32]> {
-        let cf = self.db.cf_handle(self.leaf_cf)?;
-        let v = self.db.get_cf(&cf, &key[..]).ok().flatten()?;
+        // EVERY unreadable outcome — missing CF, IO error, malformed value — bumps the
+        // counter: a probe that cannot read a leaf must never be taken as proof of absence
+        // (see MERKLE_LEAF_READ_ERRS). Only a clean miss returns an un-flagged None.
+        let cf = match self.db.cf_handle(self.leaf_cf) {
+            Some(cf) => cf,
+            None => {
+                MERKLE_LEAF_READ_ERRS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return None;
+            }
+        };
+        // Keys-only probes must not evict the hot working set from the block cache.
+        let mut ro = rocksdb::ReadOptions::default();
+        ro.fill_cache(false);
+        let v = match self.db.get_cf_opt(&cf, &key[..], &ro) {
+            Ok(v) => v?,
+            Err(_) => {
+                MERKLE_LEAF_READ_ERRS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return None;
+            }
+        };
         if v.len() == 32 {
             let mut out = [0u8; 32];
             out.copy_from_slice(&v);
             Some(out)
         } else {
+            MERKLE_LEAF_READ_ERRS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             None
         }
     }
@@ -1130,11 +1185,17 @@ impl qnet_state::MerkleNodeStore for RocksMerkleNodeStore {
         };
         let mut out = Vec::new();
         for item in self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start) {
+            // A dropped row here silently SHRINKS the leaf set that recompute_root then
+            // declares complete — the authority the CF true-up deletes against. Flag it.
             let (k, v) = match item {
                 Ok(kv) => kv,
-                Err(_) => continue, // skip malformed rows defensively
+                Err(_) => {
+                    MERKLE_LEAF_READ_ERRS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    continue;
+                }
             };
             if k.len() != 32 || v.len() != 32 {
+                MERKLE_LEAF_READ_ERRS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 continue;
             }
             let mut key = [0u8; 32];
@@ -2884,6 +2945,40 @@ mod v32_9_pattern_c_tests {
                    "post-backfill lrtr_ index != node_ scan (re-register)");
     }
 
+    #[test]
+    fn accounts_cf_page_scan_and_phantom_delete() {
+        let (src, _sd) = open_test_storage();
+        put_account(&src, b"acct_a", b"1");
+        put_account(&src, b"acct_b", b"2");
+        put_account(&src, b"acct_c", b"3");
+        let (p1, cont) = src.accounts_cf_keys_page(None, 2).expect("page1");
+        assert_eq!(p1, vec!["acct_a".to_string(), "acct_b".to_string()]);
+        let cont = cont.expect("continuation after a full page");
+        let (p2, cont2) = src.accounts_cf_keys_page(Some(&cont), 2).expect("page2");
+        assert_eq!(p2, vec!["acct_c".to_string()]);
+        assert!(cont2.is_none(), "exhausted scan ends the continuation");
+        src.delete_accounts_cf_keys(&["acct_b".to_string()]).expect("delete");
+        let (all, _) = src.accounts_cf_keys_page(None, 10).expect("rescan");
+        assert_eq!(all, vec!["acct_a".to_string(), "acct_c".to_string()]);
+    }
+
+    #[test]
+    fn snapshot_aborts_on_cf_leaf_divergence() {
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let (src, _sd) = open_test_storage();
+        put_account(&src, b"acct_a", b"1");
+        put_account(&src, b"acct_b", b"2");
+        let view = src.prepare_snapshot_view(&[]).expect("view");
+        assert!(rt.block_on(src.create_state_snapshot(90, view, Some(1))).is_err(),
+                "CF/leaf divergence must abort the snapshot");
+        let cf = src.persistent.db.cf_handle("snapshots").unwrap();
+        assert!(src.persistent.db.get_cf(&cf, b"full_snap_90").unwrap().is_none(),
+                "aborted snapshot must not persist a frame");
+        let view = src.prepare_snapshot_view(&[]).expect("view2");
+        rt.block_on(src.create_state_snapshot(90, view, Some(2))).expect("clean snapshot");
+        assert!(src.persistent.db.get_cf(&cf, b"full_snap_90").unwrap().is_some());
+    }
+
     // Read every (key, value) row of a CF into a sorted map for set-equality checks.
     fn dump_cf(storage: &Storage, cf_name: &str) -> std::collections::BTreeMap<Vec<u8>, Vec<u8>> {
         let cf = storage.persistent.db.cf_handle(cf_name).expect("cf handle");
@@ -2925,7 +3020,7 @@ mod v32_9_pattern_c_tests {
         // and materialize the compressed frame under full_snap_<h>.
         let height = 90u64;
         let view = src.prepare_snapshot_view(&[]).expect("view");
-        rt.block_on(src.create_state_snapshot(height, view)).expect("create snapshot");
+        rt.block_on(src.create_state_snapshot(height, view, None)).expect("create snapshot");
 
         // The frame must be a valid single zstd stream with the unchanged [hash(32)|len(8)|zstd] header.
         let src_snaps = src.persistent.db.cf_handle("snapshots").expect("snapshots cf");

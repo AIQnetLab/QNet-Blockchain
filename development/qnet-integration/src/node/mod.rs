@@ -2027,6 +2027,26 @@ pub fn effective_ws_checkpoint() -> (u64, [u8; 32]) {
 /// anchor height without replaying sub-anchor microblocks. `anchor_hash` is stored only as the local
 /// skip-reverify marker (the END of the verified lineage), never as the inductive root for a future
 /// joiner — that root stays the binary WS pin / genesis keys.
+/// Retract the finality markers DOWN to `height` after a wholesale-regress restore. The ratchet
+/// invariant is "finality ≤ this node's applied tip": a regress lowers the tip, and markers left
+/// above it make the node drop every vote/TC for the windows it must now re-drive, and let
+/// SYNC-ADOPT treat the just-pruned range as content-verified. Lowering only, under the same
+/// finality lock adopt/try_advance use.
+pub fn retract_finality_to(height: u64) {
+    use std::sync::atomic::Ordering::SeqCst;
+    let _g = crate::storage::lock_finality_state();
+    let mut lowered = false;
+    // CONTENT_VERIFIED_FRONTIER included: SYNC-ADOPT floors on it, and left stale it lets the
+    // just-pruned range pass as content-verified without re-checking the re-fetched bodies.
+    for m in [&LAST_FINALIZED_HEIGHT, &LAST_FINALIZED_CONSENSUS_ROUND, &WEAK_SUBJECTIVITY_CHECKPOINT,
+              &QC_VERIFIED_FRONTIER, &CONTENT_VERIFIED_FRONTIER] {
+        if m.load(SeqCst) > height { m.store(height, SeqCst); lowered = true; }
+    }
+    if lowered {
+        println!("[WARN][SNAPSHOT] finality_retracted to={} reason=wholesale_regress", height);
+    }
+}
+
 pub fn adopt_snapshot_finality(snapshot_height: u64, anchor_hash: [u8; 32]) {
     let anchor_mb = snapshot_height / 90;
     if anchor_mb == 0 { return; }

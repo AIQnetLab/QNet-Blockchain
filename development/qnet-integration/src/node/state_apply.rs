@@ -439,7 +439,20 @@ impl BlockchainNode {
     // microblocks up to target via apply_block_to_state (full replay from
     // genesis if no snapshot). Gated by 60–300 s cooldown, fork-evidence only.
     // Err → caller must resync; do NOT keep producing on unvouched state.
+    /// Rebuild state at `target_height` and PROVE it against the canonical block's state_root.
+    /// Any Err leaves a non-authoritative leaf set resident, so the suspect latch is set HERE,
+    /// on the single exit — no future early-return inside can forget it.
     pub(super) async fn reconcile_state_after_rollback(
+        state: &Arc<tokio::sync::RwLock<StateManager>>,
+        storage: &Arc<Storage>,
+        target_height: u64,
+    ) -> Result<(), String> {
+        let r = Self::reconcile_state_after_rollback_inner(state, storage, target_height).await;
+        if r.is_err() { crate::block_pipeline::mark_state_suspect(); }
+        r
+    }
+
+    async fn reconcile_state_after_rollback_inner(
         state: &Arc<tokio::sync::RwLock<StateManager>>,
         storage: &Arc<Storage>,
         target_height: u64,
@@ -560,6 +573,7 @@ impl BlockchainNode {
                     if let Err(e) = (*sg).restore_accounts(accounts) {
                         // Same as the rehydrate path: a mid-iteration failure leaves a partial
                         // account prefix behind, and the caller resyncs from it. Wipe first.
+                        // Latch suspect: the resident leaf set is no longer an authority.
                         (*sg).clear();
                         return Err(format!("restore_accounts_failed err={:?}", e));
                     }
@@ -651,7 +665,9 @@ impl BlockchainNode {
         // migrated to macroblock.state_root — so reconcile could never prove and ALWAYS fell to resync.)
         let expected_root = match storage.load_microblock_auto_format(target_height) {
             Ok(Some(mb)) => mb.state_root,
-            _ => return Err(format!("reconcile_no_target_block target={} action=resync", target_height)),
+            _ => {
+                return Err(format!("reconcile_no_target_block target={} action=resync", target_height));
+            }
         };
         if computed_root != expected_root {
             return Err(format!(
@@ -659,6 +675,10 @@ impl BlockchainNode {
                 target_height, hex::encode(&expected_root[..8]), hex::encode(&computed_root[..8]),
             ));
         }
+        // The root just proved the rebuilt state canonical — lift the latch HERE so the
+        // true-up below (and any reader between now and the caller's clear) sees a proven
+        // authority. The callers' clears become no-ops.
+        crate::block_pipeline::clear_state_suspect();
         println!("[INFO][STATE] reconcile_verified target={} root={}",
                  target_height, hex::encode(&computed_root[..8]));
 
@@ -684,7 +704,166 @@ impl BlockchainNode {
                 println!("[INFO][STATE] reconcile_accounts_persisted target={} n={}", target_height, n);
             }
         }
+        // Drop CF phantoms against the just-proven leaf set (safe here precisely because the
+        // root was verified above — see trueup_accounts_cf).
+        Self::trueup_staged_candidates(state, storage).await;
         Ok(())
+    }
+
+    /// Targeted CF true-up: check ONLY the addresses the rolled-back blocks touched (staged by
+    /// the rollback barrier) instead of sweeping the whole accounts CF. Phantoms are born at
+    /// exactly one place — a block whose write-through mirror was never reversed — so the
+    /// rollback's own journal is the complete candidate set. O(rolled-back addresses), no hot-path
+    /// scan, and correct at any account count. Runs only on a PROVEN state (its single caller is
+    /// the reconcile tail, past the root verify). Returns (checked, removed).
+    pub async fn trueup_staged_candidates(
+        state: &Arc<tokio::sync::RwLock<StateManager>>,
+        storage: &Arc<Storage>,
+    ) -> (u64, u64) {
+        let candidates = storage.load_trueup_candidates();
+        if candidates.is_empty() { return (0, 0); }
+        // A leaf-store read error anywhere in this process makes "absent" unprovable, so the
+        // candidates stay staged for a later run rather than being deleted on a guess.
+        if crate::storage::MERKLE_LEAF_READ_ERRS.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+            println!("[WARN][STATE] cf_trueup_deferred reason=leaf_store_read_errs candidates={}",
+                     candidates.len());
+            return (candidates.len() as u64, 0);
+        }
+        let errs_before = crate::storage::MERKLE_LEAF_READ_ERRS.load(std::sync::atomic::Ordering::Relaxed);
+        let phantoms: Vec<String> = {
+            let sg = state.read().await;
+            if sg.merkle_leaf_count() == 0 { return (candidates.len() as u64, 0); }
+            sg.merkle_absent_leaves(&candidates)
+        };
+        // This is the one true-up path that actually reaches the leaf store (a trimmed cache
+        // falls through to get_leaf), so the veto must bracket the probe — a fault DURING it
+        // is exactly the case where "absent" is a guess. Journal kept for a later run.
+        if crate::storage::MERKLE_LEAF_READ_ERRS.load(std::sync::atomic::Ordering::Relaxed) != errs_before {
+            println!("[WARN][STATE] cf_trueup_deferred reason=leaf_store_read_err_during_probe candidates={}",
+                     candidates.len());
+            return (candidates.len() as u64, 0);
+        }
+        let mut removed = 0u64;
+        if !phantoms.is_empty() {
+            match storage.delete_accounts_cf_keys(&phantoms) {
+                Ok(()) => {
+                    removed = phantoms.len() as u64;
+                    println!("[WARN][STATE] cf_phantoms_removed n={} checked={} sample={:?}",
+                             removed, candidates.len(), &phantoms[..phantoms.len().min(8)]);
+                }
+                Err(e) => {
+                    println!("[WARN][STATE] cf_trueup_delete_failed n={} err={}", phantoms.len(), e);
+                    return (candidates.len() as u64, 0); // keep the journal for the next attempt
+                }
+            }
+        } else if is_info() {
+            println!("[INFO][STATE] cf_trueup_clean checked={}", candidates.len());
+        }
+        storage.clear_trueup_candidates();
+        (candidates.len() as u64, removed)
+    }
+
+    /// CF↔merkle true-up: delete `accounts` CF rows with no committed merkle leaf.
+    /// The CF is the source every snapshot streams from, and its write-through mirror is
+    /// append/update-only — a row persisted for a block that later rolled back (reorg,
+    /// fork recovery) stays forever, so every snapshot resurrects it and restore can
+    /// never reproduce a certified state_root. Leaf membership — not RAM residency — is
+    /// the deletion test, and ONLY while the RAM leaf set is complete (store-trimmed or
+    /// empty ⇒ no authority ⇒ no-op): an evicted-but-live account must never be touched.
+    /// Deletions are capped per run (max(1000, 5% of scanned)) — a legit mass-rollback
+    /// converges over successive runs while a corrupt authority cannot wipe the CF.
+    /// Chunked, one short read-lock per page; normally removes nothing.
+    /// Returns (scanned, removed).
+    pub async fn trueup_accounts_cf(
+        state: &Arc<tokio::sync::RwLock<StateManager>>,
+        storage: &Arc<Storage>,
+    ) -> (u64, u64) {
+        let t0 = std::time::Instant::now();
+        // No deletions off an unproven or empty leaf set: a tripped apply-breaker means the
+        // live state is suspect, and an empty tree means no state was built at all.
+        if crate::block_pipeline::state_suspect() {
+            println!("[WARN][STATE] cf_trueup_skipped reason=state_suspect");
+            return (0, 0);
+        }
+        // Any leaf-store read error makes "absent" unprovable for the whole process — a probe
+        // that could not read is not a proof of absence.
+        if crate::storage::MERKLE_LEAF_READ_ERRS.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+            println!("[WARN][STATE] cf_trueup_skipped reason=leaf_store_read_errs");
+            return (0, 0);
+        }
+        {
+            let sg = state.read().await;
+            if sg.merkle_leaf_count() == 0 {
+                println!("[WARN][STATE] cf_trueup_skipped reason=empty_leafset");
+                return (0, 0);
+            }
+            // Store-trimmed leaf cache ⇒ every miss would cost a random point read (millions at
+            // target scale). The rollback-staged candidates cover phantoms at their source, so the
+            // full sweep is the small-deployment belt only.
+            if !sg.merkle_leaves_complete() {
+                println!("[INFO][STATE] cf_trueup_skipped reason=leafset_trimmed (targeted true-up covers it)");
+                return (0, 0);
+            }
+        }
+        let mut after: Option<Vec<u8>> = None;
+        let (mut scanned, mut removed, mut deferred) = (0u64, 0u64, 0u64);
+        let mut sample: Vec<String> = Vec::new();
+        loop {
+            let (keys, last) = match storage.accounts_cf_keys_page(after.as_deref(), 10_000) {
+                Ok(p) => p,
+                Err(e) => { println!("[WARN][STATE] cf_trueup_scan_failed err={}", e); break; }
+            };
+            if keys.is_empty() { break; }
+            scanned += keys.len() as u64;
+            // Re-check the gates every page: a concurrent recovery can trip the breaker or
+            // clear the tree mid-scan, and a store read error must veto the page (an
+            // unreadable leaf is not an absent leaf).
+            let errs_before = crate::storage::MERKLE_LEAF_READ_ERRS.load(std::sync::atomic::Ordering::Relaxed);
+            let phantoms: Vec<String> = {
+                let sg = state.read().await;
+                if crate::block_pipeline::state_suspect() || sg.merkle_leaf_count() == 0 {
+                    println!("[WARN][STATE] cf_trueup_aborted reason=authority_lost scanned={}", scanned);
+                    break;
+                }
+                sg.merkle_absent_leaves(&keys)
+            };
+            if crate::storage::MERKLE_LEAF_READ_ERRS.load(std::sync::atomic::Ordering::Relaxed) != errs_before {
+                println!("[WARN][STATE] cf_trueup_page_vetoed reason=leaf_store_read_err scanned={}", scanned);
+                after = last;
+                if after.is_none() { break; }
+                continue;
+            }
+            if !phantoms.is_empty() {
+                let cap = std::cmp::max(1000, scanned / 20);
+                let room = cap.saturating_sub(removed) as usize;
+                deferred += phantoms.len().saturating_sub(room) as u64;
+                let batch: Vec<String> = phantoms.into_iter().take(room).collect();
+                if !batch.is_empty() {
+                    match storage.delete_accounts_cf_keys(&batch) {
+                        Ok(()) => {
+                            removed += batch.len() as u64;
+                            for p in batch.into_iter().take(8usize.saturating_sub(sample.len())) {
+                                sample.push(p);
+                            }
+                        }
+                        Err(e) => println!("[WARN][STATE] cf_trueup_delete_failed n={} err={}", batch.len(), e),
+                    }
+                }
+            }
+            after = last;
+            if after.is_none() { break; }
+        }
+        if deferred > 0 {
+            eprintln!("[CRIT][STATE] cf_trueup_capped removed={} deferred={} scanned={} — excess converges on next runs",
+                      removed, deferred, scanned);
+        }
+        if removed > 0 {
+            println!("[WARN][STATE] cf_phantoms_removed n={} scanned={} sample={:?} ms={}",
+                     removed, scanned, sample, t0.elapsed().as_millis());
+        } else if is_info() {
+            println!("[INFO][STATE] cf_trueup_clean scanned={} ms={}", scanned, t0.elapsed().as_millis());
+        }
+        (scanned, removed)
     }
 
     // analyze_chain_for_slashing (legacy in-memory SlashingEvent path) was removed:

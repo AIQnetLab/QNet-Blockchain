@@ -4385,14 +4385,22 @@ impl BlockPipeline {
                     || height % crate::node::SNAPSHOT_INCREMENTAL_INTERVAL == 0)
                 && crate::node::should_materialize_snapshot(&ctx.node_id, height)
             {
-                let snapshot_accounts = ctx.state.read().await.get_all_accounts();
+                // No CF sweep here: phantoms are removed at their source (the rollback's staged
+                // candidates, applied by the reconcile tail), so the pin stays off the apply path.
+                // The count gate below is the residual fail-closed check.
+                let (snapshot_accounts, expected_leaves) = {
+                    let sg = ctx.state.read().await;
+                    // Strict count gate only while the RAM leaf set is the complete authority.
+                    let exp = if sg.merkle_leaves_complete() { Some(sg.merkle_leaf_count() as u64) } else { None };
+                    (sg.get_all_accounts(), exp)
+                };
                 match ctx.storage.prepare_snapshot_view(&snapshot_accounts) {
                     Ok(view) => {
                         let storage_for_snapshot = ctx.storage.clone();
                         let snapshot_height = height;
                         tokio::spawn(async move {
                             if let Err(e) = storage_for_snapshot
-                                .create_state_snapshot(snapshot_height, view).await
+                                .create_state_snapshot(snapshot_height, view, expected_leaves).await
                             {
                                 if is_warn() {
                                     println!("[WARN][PIPELINE] snapshot_create_failed h={} err={:?}", snapshot_height, e);

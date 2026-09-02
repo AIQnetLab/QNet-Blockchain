@@ -994,6 +994,82 @@ impl PersistentStorage {
         Ok(accounts.len())
     }
 
+    /// One page of raw `accounts` CF keys, ascending, starting strictly after `after`.
+    /// Returns (keys, last_key) — pass last_key back to continue; None page-end = CF exhausted.
+    pub fn accounts_cf_keys_page(&self, after: Option<&[u8]>, limit: usize)
+        -> IntegrationResult<(Vec<String>, Option<Vec<u8>>)>
+    {
+        let accounts_cf = self.db.cf_handle("accounts")
+            .ok_or_else(|| IntegrationError::StorageError("accounts column family not found".to_string()))?;
+        let mode = match after {
+            Some(k) => rocksdb::IteratorMode::From(k, rocksdb::Direction::Forward),
+            None => rocksdb::IteratorMode::Start,
+        };
+        // Keys-only sweep: keep the hot working set in the block cache.
+        let mut ro = rocksdb::ReadOptions::default();
+        ro.fill_cache(false);
+        let mut keys = Vec::with_capacity(limit);
+        for item in self.db.iterator_cf_opt(&accounts_cf, ro, mode) {
+            let (key, _) = item?;
+            if let Some(a) = after { if key.as_ref() == a { continue; } }
+            let raw = key.to_vec();
+            keys.push(String::from_utf8_lossy(&raw).into_owned());
+            if keys.len() >= limit { return Ok((keys, Some(raw))); }
+        }
+        Ok((keys, None))
+    }
+
+    /// Stage the addresses touched by rolled-back blocks for the post-reconcile CF true-up.
+    /// Durable (metadata CF) so a crash between the rollback and the proof cannot lose them.
+    /// Additive across successive rollbacks; capped so the blob stays bounded.
+    /// Returns how many candidates were DROPPED at the cap — a non-zero value means the
+    /// journal is no longer the complete candidate set and the caller must say so loudly.
+    pub fn stage_trueup_candidates(&self, addrs: &[String]) -> IntegrationResult<usize> {
+        if addrs.is_empty() { return Ok(0); }
+        let cf = self.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
+        let mut set: std::collections::BTreeSet<String> = match self.db.get_cf(&cf, b"trueup_pending")? {
+            Some(b) => bincode::deserialize(&b).unwrap_or_default(),
+            None => Default::default(),
+        };
+        const MAX_CANDIDATES: usize = 200_000;
+        let mut dropped = 0usize;
+        for a in addrs {
+            if set.len() >= MAX_CANDIDATES && !set.contains(a) { dropped += 1; continue; }
+            set.insert(a.clone());
+        }
+        let bytes = bincode::serialize(&set)
+            .map_err(|e| IntegrationError::SerializationError(e.to_string()))?;
+        self.db.put_cf(&cf, b"trueup_pending", &bytes)?;
+        Ok(dropped)
+    }
+
+    /// The staged true-up candidates (empty when none). Cleared only after they are applied.
+    pub fn load_trueup_candidates(&self) -> Vec<String> {
+        let cf = match self.db.cf_handle("metadata") { Some(c) => c, None => return Vec::new() };
+        let raw = match self.db.get_cf(&cf, b"trueup_pending") { Ok(Some(b)) => b, _ => return Vec::new() };
+        let set: std::collections::BTreeSet<String> = bincode::deserialize(&raw).unwrap_or_default();
+        set.into_iter().collect()
+    }
+
+    pub fn clear_trueup_candidates(&self) {
+        if let Some(cf) = self.db.cf_handle("metadata") {
+            let _ = self.db.delete_cf(&cf, b"trueup_pending");
+        }
+    }
+
+    /// Batch-delete `accounts` CF rows. Used by the CF↔merkle true-up to drop phantom
+    /// rows (persisted by a block whose rollback never reached the CF mirror).
+    pub fn delete_accounts_cf_keys(&self, keys: &[String]) -> IntegrationResult<()> {
+        if keys.is_empty() { return Ok(()); }
+        let accounts_cf = self.db.cf_handle("accounts")
+            .ok_or_else(|| IntegrationError::StorageError("accounts column family not found".to_string()))?;
+        let mut batch = WriteBatch::default();
+        for k in keys { batch.delete_cf(&accounts_cf, k.as_bytes()); }
+        self.db.write(batch)?;
+        Ok(())
+    }
+
     // ── Wallet→token reverse index (wallet_token CF, NON-consensus) ──
     // Key `owns|{wallet}|{contract}` (the `|` separator never occurs in an address, so a shorter
     // wallet can't prefix-alias a longer one). Value is a single marker byte. Maintained at apply

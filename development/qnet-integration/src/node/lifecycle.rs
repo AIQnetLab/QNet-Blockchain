@@ -476,9 +476,15 @@ impl BlockchainNode {
         let pre_snapshot_chain_height = storage.get_chain_height().unwrap_or(0);
         let mut restored_snapshot_height: u64 = 0;
 
-        // ── TIER 1: Try loading state snapshot ──
-        match storage.load_latest_state_snapshot().await {
+        // ── TIER 1: Try loading state snapshots, newest anchored first. A candidate whose
+        // restored root fails the QC-bound anchor verify is rejected and the next-older one
+        // is tried — one bad snapshot must not force a from-genesis replay while a provable
+        // older candidate sits one key away.
+        let mut rejected_snapshots: Vec<u64> = Vec::new();
+        'tier1: while restored_snapshot_height == 0 {
+        match storage.load_latest_state_snapshot(&rejected_snapshots).await {
             Ok(Some((snapshot_height, state_root, accounts_data, snap_total_supply))) => {
+                rejected_snapshots.push(snapshot_height);
                 if snapshot_height > pre_snapshot_chain_height {
                     eprintln!("[WARN][STATE] snapshot_ahead_of_chain snapshot_h={} chain_h={} action=discard",
                               snapshot_height, pre_snapshot_chain_height);
@@ -567,11 +573,16 @@ impl BlockchainNode {
                 }
             }
             Ok(None) => {
-                if is_info() { println!("[INFO][STATE] no_snapshot fresh_start"); }
+                if rejected_snapshots.is_empty() {
+                    if is_info() { println!("[INFO][STATE] no_snapshot fresh_start"); }
+                }
+                break 'tier1;
             }
             Err(e) => {
                 eprintln!("[WARN][STATE] snapshot_load_fail err={} — falling back to full replay", e);
+                break 'tier1;
             }
+        }
         }
 
         // ═══════════════════════════════════════════════════════════════════
@@ -580,6 +591,11 @@ impl BlockchainNode {
         // TIER 3: If snapshot FAILED → replay ALL blocks from genesis
         // This ensures state is NEVER empty after restart.
         // ═══════════════════════════════════════════════════════════════════
+        // Set only when the boot state is PROVEN canonical: a verified snapshot with no
+        // tail to replay, or a zero-error replay whose final root matched the tip block.
+        // Gates the boot CF true-up — deleting against an unproven leaf set would turn a
+        // designed local stall into durable-mirror destruction.
+        let mut boot_state_proven = false;
         if pre_snapshot_chain_height > 0 {
             let replay_start = if restored_snapshot_height > 0 {
                 // TIER 2: Snapshot loaded — only replay blocks after snapshot
@@ -588,6 +604,9 @@ impl BlockchainNode {
                 // TIER 3: Snapshot failed — full replay from genesis (block 0)
                 0
             };
+            if replay_start > pre_snapshot_chain_height && restored_snapshot_height > 0 {
+                boot_state_proven = true; // snapshot root already anchor-verified, no tail
+            }
 
             if replay_start <= pre_snapshot_chain_height {
                 let replay_end = pre_snapshot_chain_height;
@@ -686,6 +705,7 @@ impl BlockchainNode {
                             let state_guard = state.write().await;
                             let final_merkle = state_guard.finalize_merkle();
                             if final_merkle == last_block.state_root {
+                                boot_state_proven = replay_errors == 0;
                                 println!("[INFO][STATE] replay_verified merkle_root={} h={}",
                                          hex::encode(&final_merkle[..8]), pre_snapshot_chain_height);
                             } else {
@@ -703,7 +723,17 @@ impl BlockchainNode {
                 }
             }
         }
-        
+
+        // CF↔merkle true-up at boot — ONLY on a proven state (verified snapshot with no
+        // tail, or zero-error replay whose root matched the tip). An unproven leaf set
+        // must never drive CF deletions.
+        if boot_state_proven {
+            // Staged candidates first (a rollback or decree prune that never reached its
+            // reconcile), then the small-deployment full sweep as the belt.
+            Self::trueup_staged_candidates(&state, &storage).await;
+            Self::trueup_accounts_cf(&state, &storage).await;
+        }
+
         // v5.1: Initialize restart-sensitive statics from recovered chain state
         // Without this, statics start at 0 and cause spurious behavior on first tick:
         //   - METRIC_LAST_RESET=0 → immediate metrics dump with empty/stale data
@@ -960,7 +990,9 @@ impl BlockchainNode {
                 // A recovered promote may have advanced chain_height — re-read so the rest of boot
                 // (integrity checks, p2p height) uses the promoted height, not the pre-recovery value.
                 let height = try_get_storage().and_then(|s| s.get_chain_height().ok()).unwrap_or(height);
-                crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.fetch_max(height, std::sync::atomic::Ordering::Release);
+                // Plain store, not fetch_max: a recovered REGRESS promote legitimately LOWERS the
+                // height, and no concurrent height writer is live yet at this point of boot.
+                crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(height, std::sync::atomic::Ordering::Release);
                 if is_debug() { println!("[DBG][NODE] p2p_height_init={}", height); }
 
                 height

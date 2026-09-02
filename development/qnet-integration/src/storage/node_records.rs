@@ -536,12 +536,15 @@ impl Storage {
 
     /// Persist the real FCM device token for a light node (GDPR: stored only on the
     /// genesis node that received the registration, never gossiped).
+    /// `ts` is the record's authoritative event time (stamped by the genesis that served the
+    /// original refresh) — carried through peer sync verbatim so every copy converges LWW.
     pub fn save_fcm_token(
         &self,
         node_id: &str,
         token: &str,
         push_type: &str,
         endpoint: Option<&str>,
+        ts: u64,
     ) -> IntegrationResult<()> {
         let fcm_cf = self.persistent.db.cf_handle("fcm_tokens")
             .ok_or_else(|| IntegrationError::StorageError("fcm_tokens column family not found".to_string()))?;
@@ -550,14 +553,20 @@ impl Storage {
             "token": token,
             "push_type": push_type,
             "endpoint": endpoint.unwrap_or(""),
-            "updated_at": SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs()
+            "updated_at": ts,
         });
 
         self.persistent.db.put_cf(&fcm_cf, node_id.as_bytes(), data.to_string().as_bytes())?;
         Ok(())
+    }
+
+    /// Full FCM record incl. its LWW timestamp: (token, push_type, endpoint, updated_at).
+    pub fn get_fcm_record(&self, node_id: &str) -> Option<(String, String, Option<String>, u64)> {
+        let (token, push_type, endpoint) = self.get_fcm_data(node_id)?;
+        let fcm_cf = self.persistent.db.cf_handle("fcm_tokens")?;
+        let raw = self.persistent.db.get_cf(&fcm_cf, node_id.as_bytes()).ok()??;
+        let json: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+        Some((token, push_type, endpoint, json["updated_at"].as_u64().unwrap_or(0)))
     }
 
     /// Load FCM data for a light node.

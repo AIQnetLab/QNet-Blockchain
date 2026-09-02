@@ -30,6 +30,44 @@ impl BlockchainNode {
                     // fault, not the state — tracked to drive the progressive deepening below.
                     static TIP_RECONCILED_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                     static TIP_RECONCILE_ATTEMPTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                    // Escalation tracker: N consecutive reconcile failures with the SAME computed
+                    // root prove the local base (snapshots + stored replay) cannot self-heal —
+                    // hand recovery to the QC-verified peer-snapshot path instead of looping.
+                    static RECONCILE_FAIL_SIG: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+                    static RECONCILE_FAIL_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                    static LAST_WHOLESALE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    fn note_reconcile_failure(err: &str) {
+                        let sig = err.split("computed=").nth(1)
+                            .and_then(|s| s.split_whitespace().next())
+                            .unwrap_or(err).to_string();
+                        let count = {
+                            let mut prev = RECONCILE_FAIL_SIG.lock().unwrap();
+                            if prev.as_deref() == Some(sig.as_str()) {
+                                RECONCILE_FAIL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+                            } else {
+                                *prev = Some(sig);
+                                RECONCILE_FAIL_COUNT.store(1, std::sync::atomic::Ordering::Relaxed);
+                                1
+                            }
+                        };
+                        if count >= 3 {
+                            let now_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+                            let last = LAST_WHOLESALE_MS.load(std::sync::atomic::Ordering::Relaxed);
+                            // 10-min cooldown + per-node jitter (0..~5min) so a fleet poisoned by one
+                            // shared fork does not stampede the snapshot holders in lockstep.
+                            let jitter_ms = std::env::var("QNET_BOOTSTRAP_ID").ok()
+                                .or_else(|| std::env::var("QNET_NODE_ID").ok())
+                                .map(|s| (blake3::hash(s.as_bytes()).as_bytes()[0] as u64) * 1200)
+                                .unwrap_or(0);
+                            if now_ms.saturating_sub(last) >= 600_000 + jitter_ms {
+                                LAST_WHOLESALE_MS.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+                                RECONCILE_FAIL_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+                                println!("[WARN][FORK] reconcile_escalate fails={} action=wholesale_state_resync", count);
+                                crate::sync_manager::request_wholesale_state_resync();
+                            }
+                        }
+                    }
                     let local_h = *height.read().await;
                     // v33: FORK_RECOVERY_HEIGHT is the deterministic highest-good height —
                     // disputed_height-1 (n−f minority-fork observer) or finalized_h+1 (anchor
@@ -64,6 +102,18 @@ impl BlockchainNode {
                                 // Delete ALL blocks from rollback_to+1 to local_h
                                 // (includes our forked tip block)
                                 let delete_from = rollback_to + 1;
+                                // Journal the addresses these blocks touched BEFORE the bodies are
+                                // gone — their accounts-CF rows are not reversed by the in-memory
+                                // rollback, and this is the candidate set the post-reconcile
+                                // true-up checks.
+                                let (staged, dropped) = storage.stage_trueup_for_range(delete_from, local_h);
+                                if dropped > 0 {
+                                    println!("[CRIT][FORK] trueup_candidates_truncated staged={} dropped={} — phantom coverage incomplete",
+                                             staged, dropped);
+                                } else if is_info() {
+                                    println!("[INFO][FORK] trueup_candidates_staged n={} range={}-{}",
+                                             staged, delete_from, local_h);
+                                }
                                 for h in delete_from..=local_h {
                                     // Long loops must tick the watchdog, not just the phases.
                                     if h % 256 == 0 { crate::storage::note_rollback_progress(); }
@@ -165,6 +215,7 @@ impl BlockchainNode {
                                     // its snapshot fast-path restores wholesale state (and owns) on the
                                     // nudge below. Mark owns dirty so a crash before that re-derives it.
                                     storage.mark_owns_index_dirty();
+                                    note_reconcile_failure(&e);
                                     println!(
                                         "[WARN][STATE] reconcile_unproven target={} err={} action=coordinator_state_sync",
                                         rollback_to, e,
@@ -240,6 +291,7 @@ impl BlockchainNode {
                                     Ok(_) => { crate::block_pipeline::clear_state_suspect(); println!("[INFO][FORK] state_reconciled_at_tip h={}", local_h); }
                                     Err(e) => {
                                         storage.mark_owns_index_dirty();
+                                        note_reconcile_failure(&e);
                                         println!("[WARN][FORK] tip_reconcile_unproven h={} err={} action=coordinator_state_sync",
                                                  local_h, e);
                                     }
@@ -259,6 +311,7 @@ impl BlockchainNode {
                                         Ok(_) => { crate::block_pipeline::clear_state_suspect(); println!("[INFO][FORK] state_reconciled_at_floor h={}", local_h); }
                                         Err(e) => {
                                             storage.mark_owns_index_dirty();
+                                            note_reconcile_failure(&e);
                                             println!("[WARN][FORK] floor_reconcile_unproven h={} err={} action=coordinator_state_sync",
                                                      local_h, e);
                                         }
@@ -5907,9 +5960,16 @@ impl BlockchainNode {
                         // With persist-before-evict the pinned accounts CF is the COMPLETE committed tree
                         // leaf set, so a cold joiner's recompute reproduces the bound state_root past the
                         // LRU cap; the heavy serialization runs off-reactor on the frozen view.
-                        let snapshot_accounts = state.read().await.get_all_accounts();
+                        // No CF sweep here: phantoms are removed at their source (the rollback's staged
+                        // candidates, applied by the reconcile tail), so production never stalls on it.
+                        let (snapshot_accounts, expected_leaves) = {
+                            let sg = state.read().await;
+                            // Strict count gate only while the RAM leaf set is the complete authority.
+                            let exp = if sg.merkle_leaves_complete() { Some(sg.merkle_leaf_count() as u64) } else { None };
+                            (sg.get_all_accounts(), exp)
+                        };
                         let snap_res = match storage.prepare_snapshot_view(&snapshot_accounts) {
-                            Ok(view) => storage.create_incremental_snapshot(microblock_height, view).await,
+                            Ok(view) => storage.create_incremental_snapshot(microblock_height, view, expected_leaves).await,
                             Err(e) => Err(e),
                         };
                         match snap_res {

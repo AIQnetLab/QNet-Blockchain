@@ -1196,6 +1196,29 @@ pub fn execute_recovery_decree(storage: &Storage, seq: u64, target: u64) -> ! {
             }
         }
     }
+    // The node is live and the candidate scan below is O(tail): bar saves above the target for
+    // the whole prune, or a block saved meanwhile survives above the lowered height —
+    // stored-but-unapplied forever. Never proceed without the slot: a busy one belongs to a
+    // fork rollback or a wholesale promote whose barrier lifts at an arbitrary point mid-prune.
+    // The wait is bounded (a live holder finishes; a dead one is force-claimed after
+    // ROLLBACK_TIMEOUT_SECS) and the process exits right after, so latency is irrelevant.
+    // block_in_place on a multi-thread runtime so the RPC path does not pin the worker the
+    // holder may need; the spawn_blocking P2P path degrades to a plain sleep loop.
+    let wait_for_slot = || loop {
+        match crate::storage::claim_rollback_slot(target) {
+            Ok(g) => break g,
+            Err(e) => {
+                println!("[WARN][DECREE] rollback_slot_busy err={} action=wait", e);
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+        }
+    };
+    let _slot = match tokio::runtime::Handle::try_current() {
+        Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(wait_for_slot)
+        }
+        _ => wait_for_slot(),
+    };
     let mi = qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
     let last_mb = storage.last_sealed_mb_index();
     for mb in (target / mi + 1)..=last_mb.max(target / mi + 1) {
@@ -1204,6 +1227,26 @@ pub fn execute_recovery_decree(storage: &Storage, seq: u64, target: u64) -> ! {
     let tip = storage.get_chain_height().unwrap_or(target);
     // A node at/below the target has nothing to prune — never RAISE the height marker.
     if tip > target {
+        // Same journal the fork rollback stages: these blocks were applied, so their
+        // write-through rows in the accounts CF outlive the prune. The post-boot reconcile
+        // applies the journal; without it the phantoms are permanent past the leaf-cache cap.
+        let (staged, dropped) = storage.stage_trueup_for_range(target + 1, tip);
+        if dropped > 0 {
+            println!("[CRIT][DECREE] trueup_candidates_truncated staged={} dropped={}", staged, dropped);
+        }
+        // Prune to the FRESHEST tip: the scan took time, and a save that slipped in before the
+        // slot settled must not survive above the lowered height marker.
+        let tip = storage.get_chain_height().unwrap_or(tip).max(tip);
+        // The pruned blocks also advanced two indices the canonical re-apply overwrites per-key
+        // but never CLEARS — the same cleanup the fork rollback runs. Without it the orphan rows
+        // survive: a stale wallet→token index (silent, permanent) and an orphan entry in the
+        // epoch's eligible set (divergent emission ⇒ reward_root fork).
+        storage.mark_owns_index_dirty();
+        match storage.reconcile_reward_indices_above_epoch(target) {
+            Ok(c) if c > 0 => println!("[INFO][DECREE] reward_indices_reconciled cleared={} to={}", c, target),
+            Err(e) => println!("[WARN][DECREE] reward_indices_reconcile_fail err={}", e),
+            _ => {}
+        }
         let _ = storage.delete_microblocks_range_pub(target + 1, tip);
         let _ = storage.set_chain_height(target);
     }

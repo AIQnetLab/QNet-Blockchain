@@ -170,6 +170,10 @@ pub(super) struct FcmTokenSyncRequest {
     pub(super) endpoint:   Option<String>,
     /// Originating genesis node IP — used to avoid echo-back.
     pub(super) origin_ip:  String,
+    /// LWW event time stamped by the genesis that served the original refresh.
+    /// Absent from a pre-upgrade sender ⇒ receiver stamps arrival time (legacy behavior).
+    #[serde(default)]
+    pub(super) ts:         Option<u64>,
 }
 
 /// Fire-and-forget: broadcast a newly-registered FCM token to all peer genesis nodes
@@ -180,6 +184,7 @@ pub(super) async fn sync_fcm_token_to_genesis_peers(
     push_type: &str,
     endpoint:  Option<&str>,
     our_ip:    &str,
+    ts:        u64,
 ) {
     use crate::genesis_constants::GENESIS_NODE_IPS;
     let client = reqwest::Client::builder()
@@ -193,6 +198,7 @@ pub(super) async fn sync_fcm_token_to_genesis_peers(
         push_type: push_type.to_string(),
         endpoint:  endpoint.map(|s| s.to_string()),
         origin_ip: our_ip.to_string(),
+        ts:        Some(ts),
     };
 
     for (ip, _id) in GENESIS_NODE_IPS {
@@ -254,18 +260,37 @@ pub(super) async fn handle_internal_fcm_token_sync(
         ));
     }
 
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    let incoming_ts = req.ts.unwrap_or(now);
+
+    // LWW merge: an older incoming record must never clobber a newer local one — that is
+    // exactly how a pinger ended up holding a stale push channel and silently never waking
+    // the device. Equal ts (re-broadcast of the same record) is applied idempotently.
+    if let Some((_, _, _, stored_ts)) = blockchain.get_storage().get_fcm_record(&req.pseudonym) {
+        if incoming_ts < stored_ts {
+            if crate::node::is_debug() {
+                println!("[DBG][LIGHT] fcm_sync_stale_ignored pseudonym={} incoming_ts={} stored_ts={}",
+                         req.pseudonym, incoming_ts, stored_ts);
+            }
+            return Ok(warp::reply::with_status(
+                warp::reply::json(&serde_json::json!({"success": true, "applied": false, "reason": "stale"})),
+                warp::http::StatusCode::OK,
+            ));
+        }
+    }
+
     match blockchain.get_storage().save_fcm_token(
         &req.pseudonym,
         &req.token,
         &req.push_type,
         req.endpoint.as_deref(),
+        incoming_ts,
     ) {
         Ok(()) => {
             // Update in-memory push_type so ping service uses FCM immediately
             // (without waiting for node restart / update_device_tokens_from_storage)
             if let Some(p2p) = blockchain.get_unified_p2p() {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
                 p2p.update_light_node_push_type(&req.pseudonym, &req.push_type, now);
             }
             if crate::node::is_info() {
@@ -284,6 +309,46 @@ pub(super) async fn handle_internal_fcm_token_sync(
                 warp::http::StatusCode::INTERNAL_SERVER_ERROR,
             ))
         }
+    }
+}
+
+/// Handler: GET /api/v1/internal/fcm-token-get?node_id=X
+/// Genesis-only: serves the local push-channel record with its LWW ts, so a shard
+/// owner whose copy degraded (missed a sync while down) can pull and re-merge it.
+pub(super) async fn handle_internal_fcm_token_get(
+    remote_addr: Option<std::net::SocketAddr>,
+    params:      std::collections::HashMap<String, String>,
+    blockchain:  Arc<BlockchainNode>,
+) -> Result<impl warp::Reply, warp::Rejection> {
+    use crate::genesis_constants::GENESIS_NODE_IPS;
+    let caller_ip = remote_addr.map(|a| a.ip().to_string()).unwrap_or_default();
+    let allowed = GENESIS_NODE_IPS.iter().any(|(ip, _)| *ip == caller_ip)
+        || caller_ip == "127.0.0.1" || caller_ip == "::1";
+    if !allowed {
+        return Ok(warp::reply::with_status(
+            warp::reply::json(&serde_json::json!({"success": false, "error": "Unauthorized"})),
+            warp::http::StatusCode::FORBIDDEN,
+        ));
+    }
+    let node_id = match params.get("node_id") {
+        Some(id) if !id.is_empty() => id,
+        _ => return Ok(warp::reply::with_status(
+            warp::reply::json(&serde_json::json!({"success": false, "error": "node_id required"})),
+            warp::http::StatusCode::BAD_REQUEST,
+        )),
+    };
+    match blockchain.get_storage().get_fcm_record(node_id) {
+        Some((token, push_type, endpoint, ts)) => Ok(warp::reply::with_status(
+            warp::reply::json(&serde_json::json!({
+                "success": true, "token": token, "push_type": push_type,
+                "endpoint": endpoint.unwrap_or_default(), "ts": ts,
+            })),
+            warp::http::StatusCode::OK,
+        )),
+        None => Ok(warp::reply::with_status(
+            warp::reply::json(&serde_json::json!({"success": false, "error": "not_found"})),
+            warp::http::StatusCode::OK,
+        )),
     }
 }
 

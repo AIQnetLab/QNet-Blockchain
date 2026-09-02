@@ -1854,13 +1854,15 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(blockchain_filter.clone())
         .and_then(handle_light_node_ping_response);
 
-    // Light node status endpoint (check if active/inactive)
+    // Light node status endpoint (check if active/inactive) — rate-limited: it can
+    // trigger an outbound shard-owner proxy hop, so it must not be free to hammer.
     let light_node_status = api_v1
         .and(warp::path("light-node"))
         .and(warp::path("status"))
         .and(warp::path::end())
         .and(warp::get())
         .and(warp::query::<HashMap<String, String>>())
+        .and(warp::addr::remote())
         .and(blockchain_filter.clone())
         .and_then(handle_light_node_status);
 
@@ -2563,6 +2565,17 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(blockchain_filter.clone())
         .and_then(handle_internal_fcm_token_sync);
 
+    // Internal genesis-to-genesis FCM record read (IP-restricted) — shard-owner pull-heal
+    let internal_fcm_get = api_v1
+        .and(warp::path("internal"))
+        .and(warp::path("fcm-token-get"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::addr::remote())
+        .and(warp::query::<std::collections::HashMap<String, String>>())
+        .and(blockchain_filter.clone())
+        .and_then(handle_internal_fcm_token_get);
+
     // Public: lightweight FCM token refresh (Ed25519-signed)
     let light_node_token_refresh = api_v1
         .and(warp::path("light-node"))
@@ -2586,6 +2599,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .or(light_node_next_ping)
         .or(light_node_pending_challenge)
         .or(internal_fcm_sync)
+        .or(internal_fcm_get)
         .or(claim_rewards)
         .or(pending_rewards)
         .or(reward_history)

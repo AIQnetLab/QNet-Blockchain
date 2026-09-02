@@ -2630,6 +2630,11 @@ impl SimplifiedP2P {
                 if block_height / 14400 == local_epoch
                     && self.node_in_my_shard_for_epoch(local_epoch, &light_node_id) {
                     self.record_light_epoch_eligible(block_height, &light_node_id);
+                    // Shard-owner self-heal: the attestor's copy of this node's push channel is
+                    // provably live (it just served the attestation). If ours looks degraded
+                    // (missing/polling), pull it and LWW-merge — automatic push pings resume
+                    // without waiting for an app-side token refresh. Once per node per epoch.
+                    Self::maybe_pull_push_channel(&light_node_id, &pinger_id, local_epoch);
                 }
 
                 // WHITEPAPER: Light nodes have FIXED reputation of 70

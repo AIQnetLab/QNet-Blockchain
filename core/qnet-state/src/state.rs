@@ -938,6 +938,21 @@ impl StateMerkleTree {
 
     // Internal helpers
 
+    /// Full-authority leaf presence at any scale: RAM map, then — when the map is a
+    /// trimmed cache — the unflushed delta overlay (dels beat the store, puts confirm),
+    /// then the attached leaf store. No store + incomplete cannot occur (completeness
+    /// is only cleared under an attached store); errs toward present.
+    pub(crate) fn leaf_present_full(&self, key: &[u8; HASH_SIZE]) -> bool {
+        if self.leaves.contains_key(key) { return true; }
+        if self.leaves_complete || self.node_store.is_none() { return false; }
+        if self.pending_leaf_dels.contains(key) { return false; }
+        if self.delta_leaf_puts.iter().any(|(k, _)| k == key) { return true; }
+        match &self.node_store {
+            Some(s) => s.get_leaf(key).is_some(),
+            None => true,
+        }
+    }
+
     fn hash_address(address: &str) -> [u8; HASH_SIZE] {
         let mut hasher = Sha3_256::new();
         hasher.update(b"QNET_ADDR:");
@@ -3952,6 +3967,31 @@ impl StateManager {
         self.accounts.iter()
             .map(|entry| (entry.key().clone(), entry.value().clone()))
             .collect()
+    }
+
+    /// True iff the RAM leaf map holds the COMPLETE committed leaf set. With a node
+    /// store attached the map is a bounded cache (trimmed past the cap), so any
+    /// membership/count read of it is authoritative ONLY while this returns true.
+    pub fn merkle_leaves_complete(&self) -> bool {
+        self.merkle_tree.read().leaves_complete
+    }
+
+    /// Exact committed-leaf count (equals the account count the state_root commits to).
+    /// Authoritative only while merkle_leaves_complete() — callers must gate on it.
+    pub fn merkle_leaf_count(&self) -> usize {
+        self.merkle_tree.read().leaves.len()
+    }
+
+    /// Of `addrs`, the ones with NO committed merkle leaf — phantom candidates in the
+    /// `accounts` CF (a row persisted by a block whose rollback never reached the CF
+    /// mirror). Full authority at any scale: RAM map first, then (when store-trimmed)
+    /// the unflushed delta overlay and the attached leaf store. Errs toward PRESENT —
+    /// a deletion authority must be certain. One tree read-lock per batch.
+    pub fn merkle_absent_leaves(&self, addrs: &[String]) -> Vec<String> {
+        let tree = self.merkle_tree.read();
+        addrs.iter()
+            .filter(|a| !tree.leaf_present_full(&StateMerkleTree::hash_address(a)))
+            .cloned().collect()
     }
     
     /// v2.98: Restore accounts from snapshot (after node restart or sync)

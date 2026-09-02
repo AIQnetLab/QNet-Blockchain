@@ -1958,6 +1958,65 @@ impl SimplifiedP2P {
         result
     }
     
+    /// Shard-owner push-channel self-heal: when our stored record for a my-shard node is
+    /// missing or polling while another genesis just served its attestation, pull that
+    /// genesis's record and feed it through our OWN internal sync endpoint (localhost) —
+    /// the same LWW receiver every peer sync uses, so storage + RAM registry stay in one
+    /// path. Bounded: only degraded my-shard nodes, once per (node, epoch), 64k dedup cap.
+    pub(super) fn maybe_pull_push_channel(node_id: &str, attestor_id: &str, epoch: u64) {
+        fn pull_dedup() -> &'static dashmap::DashMap<String, u64> {
+            static M: std::sync::OnceLock<dashmap::DashMap<String, u64>> = std::sync::OnceLock::new();
+            M.get_or_init(dashmap::DashMap::new)
+        }
+        let degraded = match crate::node::try_get_storage() {
+            Some(s) => s.get_fcm_record(node_id)
+                .map(|(_, pt, _, _)| pt.eq_ignore_ascii_case("polling"))
+                .unwrap_or(true),
+            None => return,
+        };
+        if !degraded { return; }
+        // Pad so the legacy unpadded id form ("genesis_node_1") still resolves.
+        let digits: String = attestor_id.chars().filter(|c| c.is_ascii_digit()).collect();
+        let digits = format!("{:0>3}", digits);
+        if std::env::var("QNET_BOOTSTRAP_ID").ok().as_deref() == Some(digits.as_str()) { return; }
+        let Some((ip, _)) = crate::genesis_constants::GENESIS_NODE_IPS.iter()
+            .find(|(_, id)| *id == digits) else { return; };
+        if pull_dedup().len() > 65_536 { pull_dedup().clear(); }
+        if pull_dedup().insert(node_id.to_string(), epoch) == Some(epoch) { return; }
+        let node = node_id.to_string();
+        let src_ip = ip.to_string();
+        tokio::spawn(async move {
+            let client = match reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5)).build() { Ok(c) => c, Err(_) => return };
+            let url = format!("http://{}:8001/api/v1/internal/fcm-token-get?node_id={}", src_ip, node);
+            let v: serde_json::Value = match client.get(&url).send().await.ok()
+                .and_then(|r| if r.status().is_success() { Some(r) } else { None })
+            {
+                Some(r) => match r.json().await { Ok(v) => v, Err(_) => return },
+                None => return,
+            };
+            let (token, pt) = (v["token"].as_str().unwrap_or(""), v["push_type"].as_str().unwrap_or(""));
+            if v["success"].as_bool() != Some(true) || token.is_empty() || pt.is_empty() { return; }
+            let body = serde_json::json!({
+                "pseudonym": node, "token": token, "push_type": pt,
+                "endpoint": v["endpoint"].as_str().filter(|s| !s.is_empty()),
+                "origin_ip": src_ip, "ts": v["ts"].as_u64(),
+            });
+            match client.post("http://127.0.0.1:8001/api/v1/internal/fcm-token-sync")
+                .json(&body).send().await
+            {
+                Ok(r) if r.status().is_success() => {
+                    if crate::node::is_info() {
+                        println!("[INFO][LIGHT] push_channel_pulled node={} from={} push={}", node, src_ip, pt);
+                    }
+                }
+                _ => if crate::node::is_debug() {
+                    println!("[DBG][LIGHT] push_channel_pull_failed node={} from={}", node, src_ip);
+                },
+            }
+        });
+    }
+
     /// Update push_type + last_seen for a light node (called on token-refresh).
     pub fn update_light_node_push_type(&self, node_id: &str, push_type_str: &str, timestamp: u64) {
         let mut registry = self.light_node_registry.write();

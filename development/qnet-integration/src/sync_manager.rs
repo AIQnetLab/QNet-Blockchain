@@ -66,6 +66,18 @@ fn take_sync_nudge() -> bool {
     SYNC_EVENT_NUDGE.swap(false, Ordering::Relaxed)
 }
 
+/// Wholesale state-resync request: set by fork recovery once repeated reconciles keep
+/// producing the SAME non-canonical root — the local base (snapshots + replay) provably
+/// cannot self-heal, so the next sync pass must take the QC-verified peer-snapshot path
+/// regardless of gap size. One-shot: consumed by a single execute_sync attempt; the
+/// requester re-arms (with its own cooldown) if that attempt fails.
+static WHOLESALE_STATE_RESYNC: AtomicBool = AtomicBool::new(false);
+
+pub fn request_wholesale_state_resync() {
+    WHOLESALE_STATE_RESYNC.store(true, Ordering::SeqCst);
+    SYNC_EVENT_NUDGE.store(true, Ordering::Relaxed);
+}
+
 /// RAII marker for the bulk catch-up window: storage disables the WAL while set (~10× apply throughput,
 /// the difference between a far-behind node converging and falling further behind). Cleared on EVERY
 /// execute_sync exit path so a produced block never applies WAL-off. Production is gated off during
@@ -541,7 +553,12 @@ impl SyncManager {
         // the seal frontier that feeds SYNC-ADOPT, re-opening the finality gap while blocks look current.
         self.sync_macroblock_deficit(target).await;
 
-        if local_h >= target {
+        // Consume a wholesale request up front: it must bypass BOTH the at-target early-return
+        // (the coordinator's observed height can be stale while the state is wedged) and the
+        // gap threshold below — the peer-snapshot negotiation finds the real tip itself.
+        let wholesale = WHOLESALE_STATE_RESYNC.swap(false, Ordering::SeqCst);
+
+        if !wholesale && local_h >= target {
             if is_debug() {
                 println!("[DBG][SYNC] already_at_target local={} target={}", local_h, target);
             }
@@ -551,6 +568,7 @@ impl SyncManager {
         // Check minimum peers
         let peer_count = self.p2p.get_peer_count();
         if peer_count < self.config.min_peers_for_sync {
+            if wholesale { WHOLESALE_STATE_RESYNC.store(true, Ordering::SeqCst); } // re-arm, not drop
             if is_warn() {
                 println!("[WARN][SYNC] insufficient_peers count={} need={}",
                          peer_count, self.config.min_peers_for_sync);
@@ -598,7 +616,7 @@ impl SyncManager {
         // walk roots near the tip (bounded) at ANY chain age — NOT only at local_h==0 (a long-offline warm
         // node also needs it). Cold join (local_h==0) first ensures block 0 (network_id). Best-effort +
         // async-verified by the handler; falls back to the binary pin if unavailable.
-        if local_h == 0 || target.saturating_sub(local_h) > SNAPSHOT_FAST_PATH_GAP {
+        if wholesale || local_h == 0 || target.saturating_sub(local_h) > SNAPSHOT_FAST_PATH_GAP {
             if local_h == 0 && self.storage.load_microblock(0).map(|o| o.is_none()).unwrap_or(true) {
                 let _ = self.p2p.sync_blocks(0, 0).await;
                 tokio::time::sleep(Duration::from_millis(800)).await;
@@ -609,17 +627,24 @@ impl SyncManager {
             tokio::time::sleep(Duration::from_millis(1200)).await;
         }
 
-        if local_h == 0 || target.saturating_sub(local_h) > SNAPSHOT_FAST_PATH_GAP {
-            match self.storage.fast_sync_with_snapshot(&self.p2p, target, &self.state).await {
+        if wholesale || local_h == 0 || target.saturating_sub(local_h) > SNAPSHOT_FAST_PATH_GAP {
+            if wholesale && is_warn() {
+                println!("[WARN][SYNC] wholesale_state_resync local={} target={}", local_h, target);
+            }
+            match self.storage.fast_sync_with_snapshot(&self.p2p, target, &self.state, wholesale).await {
                 Ok(()) => {
                     let restored = self.storage.get_chain_height().unwrap_or(local_h);
-                    if restored > local_h {
+                    if restored > local_h || (wholesale && restored > 0) {
+                        // fast_sync Ok ⇒ the restore was verify-gated inside (rehydrate rejects any
+                        // root that does not reproduce the QC-bound anchor) — a PROVEN rebuild, so
+                        // the wholesale path may lift the suspect latch.
+                        if wholesale { crate::block_pipeline::clear_state_suspect(); }
                         local_h = restored;
                         self.progress_height.store(restored, Ordering::Relaxed);
                         crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(restored, Ordering::Release);
                         if is_info() {
-                            println!("[INFO][SYNC] snapshot_restored h={} target={} tail={}",
-                                     restored, target, target.saturating_sub(restored));
+                            println!("[INFO][SYNC] snapshot_restored h={} target={} tail={} wholesale={}",
+                                     restored, target, target.saturating_sub(restored), wholesale);
                         }
                     } else if is_info() {
                         println!("[INFO][SYNC] snapshot_no_advance local={} — fallback block_sync", local_h);
