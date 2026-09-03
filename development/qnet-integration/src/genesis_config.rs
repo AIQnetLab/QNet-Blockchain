@@ -534,11 +534,13 @@ async fn load_from_http(
             Ok(crate::storage::SaveOutcome::Stored) => {}
             Ok(other) => {
                 println!("[ERR][GENESIS] http_save_not_stored ip={} outcome={:?}", ip, other);
+                return Err(format!("genesis not stored: {:?}", other));
             }
             Err(e) => {
-                if is_warn() {
-                    println!("[WARN][GENESIS] http_save_failed ip={} err={}", ip, e);
-                }
+                // The store is what makes this genesis this node's own — its refusal (foreign hash,
+                // or a block 1 that names another parent) must fail the load, not be logged past.
+                println!("[ERR][GENESIS] http_store_refused ip={} err={}", ip, e);
+                return Err(format!("store refused: {}", e));
             }
         }
 

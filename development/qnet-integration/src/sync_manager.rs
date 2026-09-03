@@ -80,11 +80,10 @@ static SUSPECT_REARM_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 fn arm_suspect_resync() {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs()).unwrap_or(0);
-    // 2-4 min: same per-node jitter source as the reconcile escalation (production.rs).
-    let jitter = 120 + std::env::var("QNET_BOOTSTRAP_ID").ok()
-        .or_else(|| std::env::var("QNET_NODE_ID").ok())
-        .map(|id| blake3::hash(id.as_bytes()).as_bytes()[0] as u64 % 120)
-        .unwrap_or(0);
+    // 2-4 min, spread by the node's own identity: a fleet latched by one shared fault must not
+    // re-ask in lockstep. GLOBAL_NODE_ID is set on every node; the env vars are genesis-only.
+    let id = crate::unified_p2p::GLOBAL_NODE_ID.read().clone();
+    let jitter = 120 + if id.is_empty() { 0 } else { blake3::hash(id.as_bytes()).as_bytes()[0] as u64 % 120 };
     if now.saturating_sub(SUSPECT_REARM_SECS.load(Ordering::Relaxed)) < jitter { return; }
     SUSPECT_REARM_SECS.store(now, Ordering::Relaxed);
     WHOLESALE_STATE_RESYNC.store(true, Ordering::SeqCst);
@@ -669,7 +668,7 @@ impl SyncManager {
                                      restored, target, target.saturating_sub(restored), wholesale);
                         }
                     } else {
-                        if wholesale { request_wholesale_state_resync(); } // nothing restored — keep asking
+                        if wholesale && !crate::block_pipeline::state_suspect() { request_wholesale_state_resync(); } // nothing restored — keep asking
                         if is_info() {
                             println!("[INFO][SYNC] snapshot_no_advance local={} — fallback block_sync", local_h);
                         }
@@ -680,7 +679,7 @@ impl SyncManager {
                     // one. Bail to the desync tick (gated !active), which re-drives cold-join once the
                     // co-sent capsule arrives — never fall to O(height) block-replay from the h=90 anchor.
                     if matches!(e, crate::errors::IntegrationError::AnchorPending) {
-                        if wholesale { request_wholesale_state_resync(); }
+                        if wholesale && !crate::block_pipeline::state_suspect() { request_wholesale_state_resync(); }
                         if is_info() { println!("[INFO][SYNC] coldjoin_await_anchor — bail to tick"); }
                         self.active.store(false, Ordering::SeqCst);
                         return;
@@ -690,7 +689,7 @@ impl SyncManager {
                     }
                     // A wholesale request is the only self-heal for an unprovable state: it must
                     // outlive a failed attempt (no peer snapshot yet) instead of being consumed once.
-                    if wholesale { request_wholesale_state_resync(); }
+                    if wholesale && !crate::block_pipeline::state_suspect() { request_wholesale_state_resync(); }
                 }
             }
         }

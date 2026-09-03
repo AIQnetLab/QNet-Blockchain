@@ -1676,7 +1676,7 @@ impl BlockchainNode {
                         Err(e) => println!("[ERR][GEN] genesis_create_failed err={}", e),
                     }
                     } // end of `if !synced_from_network` else block
-                } else if is_bootstrap_mode || anchored {
+                } else if is_bootstrap_mode {
                     // Other bootstrap nodes (002-005), and an anchored 001, wait for the real genesis
                     println!("[INFO][GEN] waiting_for_primary node={}", bootstrap_id);
                     

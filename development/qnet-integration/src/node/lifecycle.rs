@@ -2892,123 +2892,25 @@ impl BlockchainNode {
 
                 if !has_genesis_already {
                     println!("[INFO][GEN] http_download_start source=genesis_nodes");
-
-                    use crate::unified_p2p::get_genesis_bootstrap_ips;
-                    let genesis_ips = get_genesis_bootstrap_ips();
-                    let mut genesis_downloaded = false;
-
-                    for ip in &genesis_ips {
-                        if genesis_downloaded { break; }
-
-                        // Only the canonical raw-bincode genesis endpoint. The other two — a nonexistent
-                        // 404 route and a JSON block the bincode decode rejects — never delivered and spammed
-                        // a per-IP WARN storm on every joiner. Response is still decode-gated to height-0 below.
-                        let urls = vec![
-                            format!("http://{}:8001/api/v1/genesis/block", ip),
-                        ];
-
-                        for url in &urls {
-                            match tokio::time::timeout(
-                                std::time::Duration::from_secs(10),
-                                async {
-                                    let client = reqwest::Client::builder()
-                                        .timeout(std::time::Duration::from_secs(8))
-                                        .build()
-                                        .map_err(|e| format!("client_build: {}", e))?;
-                                    let resp = client.get(url).send().await
-                                        .map_err(|e| format!("request: {}", e))?;
-                                    if !resp.status().is_success() {
-                                        return Err(format!("status: {}", resp.status()));
-                                    }
-                                    let bytes = resp.bytes().await
-                                        .map_err(|e| format!("body: {}", e))?;
-                                    Ok::<_, String>(bytes.to_vec())
-                                }
-                            ).await {
-                                Ok(Ok(block_data)) if !block_data.is_empty() => {
-                                    // Only a response that DECODES to the genesis MicroBlock (height 0)
-                                    // is real. A 200-with-garbage body (observed: a 38-byte empty/404 from
-                                    // a peer — or self — whose genesis is not minted yet) must NOT be saved
-                                    // as block 0: a garbage block 0 then fails every load_microblock_auto_format
-                                    // and forces the boot reread/delete/recover dance (and historically risked
-                                    // a fork). Reject and try the next endpoint. The wire form is the full
-                                    // MicroBlock, bincode + zstd (genesis_wire_bytes).
-                                    let block_data = zstd::decode_all(&block_data[..]).unwrap_or(block_data);
-                                    match bincode::deserialize::<qnet_state::MicroBlock>(&block_data) {
-                                        Ok(ref mb) if mb.height == 0 => {
-                                            println!("[INFO][NODE] genesis_downloaded consensus_hash={}", &hex::encode(mb.hash())[..16]);
-                                        }
-                                        _ => {
-                                            if is_warn() { println!("[WARN][NODE] genesis_download_rejected from={} bytes={} reason=not_genesis_block", ip, block_data.len()); }
-                                            continue;
-                                        }
-                                    }
-                                    // Store as microblock at height 0 (validated above)
-                                    // Stored ONLY — a non-write here (storage in a mode that keeps
-                                    // no blocks) would let the node proceed as if it held genesis.
-                                    // Through store_genesis: content binding + the durable anchor. A
-                                    // single unauthenticated source must never plant this node's identity.
-                                    let parsed = match bincode::deserialize::<qnet_state::MicroBlock>(&block_data) {
-                                        Ok(mb) => mb,
-                                        Err(_) => continue,
-                                    };
-                                    match self.storage.store_genesis(&parsed, &block_data) {
-                                        Ok(crate::storage::SaveOutcome::Stored) => {
-                                            if is_info() {
-                                                println!("[INFO][GEN] http_genesis_saved from={} size={}", ip, block_data.len());
-                                            }
-                                            // v11.1: Apply genesis TXs to state and register PKs.
-                                            // Without this, genesis is stored but PK registrations
-                                            // never processed — Dilithium keys missing, all blocks rejected.
-                                            let storage_for_genesis = self.storage.clone();
-                                            if let Ok(Ok(Some(genesis_mb))) = tokio::task::spawn_blocking(move || {
-                                                storage_for_genesis.load_microblock_auto_format(0)
-                                            }).await {
-                                                {
-                                                    let state_guard = self.state.write().await;
-                                                    match state_guard.apply_block_batch(&genesis_mb.transactions) {
-                                                        Ok(count) => {
-                                                            if is_info() {
-                                                                println!("[INFO][GEN] genesis_tx_applied count={}", count);
-                                                            }
-                                                        }
-                                                        Err(e) => {
-                                                            if is_warn() {
-                                                                println!("[WARN][GEN] genesis_tx_apply_failed err={}", e);
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                                Self::cache_node_registrations_from_transactions(&self.storage, &genesis_mb.transactions);
-                                                // Stamp reg_height=0 + vrf as well: an unstamped row is invisible to registry_root,
-                                                // so caching alone forks this node off every checkpoint until a restart stamps it.
-                                                Self::apply_genesis_registrations(&self.storage, &genesis_mb.transactions);
-                                                if is_info() {
-                                                    println!("[INFO][GEN] genesis_registrations_cached tx_count={}", genesis_mb.transactions.len());
-                                                }
-                                            }
-                                            genesis_downloaded = true;
-                                            break;
-                                        }
-                                        Ok(other) => {
-                                            println!("[ERR][GEN] http_genesis_not_stored from={} outcome={:?} action=ignore",
-                                                     ip, other);
-                                        }
-                                        Err(e) => {
-                                            if is_warn() { println!("[WARN][GEN] save_failed from={} err={}", ip, e); }
-                                        }
-                                    }
-                                }
-                                Ok(Ok(_)) => {
-                                    if is_debug() { println!("[DBG][GEN] empty_response from={} url={}", ip, url); }
-                                }
-                                Ok(Err(e)) => {
-                                    if is_debug() { println!("[DBG][GEN] http_fail from={} err={}", ip, e); }
-                                }
-                                Err(_) => {
-                                    if is_debug() { println!("[DBG][GEN] timeout from={}", ip); }
-                                }
+                    // Through load_genesis: it collects every fixed source and requires them to
+                    // agree. Taking the first responder here would let one of them pin this node's
+                    // write-once identity behind the vote's back.
+                    let cfg = crate::genesis_config::GenesisConfig::from_env();
+                    let genesis_downloaded = matches!(
+                        crate::genesis_config::load_genesis(&self.storage, &cfg).await,
+                        crate::genesis_config::GenesisResult::Loaded { .. }
+                    );
+                    if genesis_downloaded {
+                        if let Ok(Ok(Some(g))) = tokio::task::spawn_blocking({
+                            let s = self.storage.clone();
+                            move || s.load_microblock_auto_format(0)
+                        }).await {
+                            {
+                                let state_guard = self.state.write().await;
+                                let _ = state_guard.apply_block_batch(&g.transactions);
                             }
+                            crate::genesis_config::adopt_genesis_metadata(&g, &self.storage);
+                            println!("[INFO][GEN] http_genesis_ready txs={}", g.transactions.len());
                         }
                     }
 

@@ -2032,9 +2032,10 @@ impl BlockPipeline {
             if mb.height == 0 {
                 let s2 = storage.clone();
                 let held = tokio::task::spawn_blocking(move || s2.genesis_anchor()).await.unwrap_or(None);
-                // The SAME genesis re-delivered is a body restore (expired tx rows) and goes on to the
-                // apply-stage backfill, which never executes it; a different block 0 is refused.
-                if held.map_or(false, |h| h != mb.hash()) {
+                // A body restore for the genesis this node already anchors is the ONLY thing the
+                // P2P lane may do at height 0: every authentication gate below is `height > 0`, so
+                // an unanchored node would otherwise take its chain identity from one peer frame.
+                if held.map_or(true, |h| h != mb.hash()) {
                     if is_warn() {
                         println!("[WARN][PIPELINE] genesis_refused reason=chain_already_rooted producer={}",
                                  mb.producer);
