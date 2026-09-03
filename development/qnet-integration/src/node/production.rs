@@ -603,7 +603,7 @@ impl BlockchainNode {
             let expected_producer = if mb_idx == own_w {
                 Some(Self::select_microblock_producer_with_round(
                     failover_height, &unified_p2p, &node_id, node_type, Some(&storage),
-                    crate::unified_p2p::highest_certified_round_for(mb_idx),
+                    crate::unified_p2p::certified_round_for_slot(failover_height),
                 ).await).filter(|p| !p.is_empty())
             } else { None };
 
@@ -3270,7 +3270,7 @@ impl BlockchainNode {
                 // `get_certified_rotation_round` is identical on every honest node,
                 // so all nodes elect the same producer — the h=556 split-brain fix.
                 let (timeout_round, carried_baseline): (u64, u64) =
-                    crate::unified_p2p::rotation_round_and_baseline(mb_idx);
+                    crate::unified_p2p::rotation_round_and_baseline_for_slot(next_block_height);
                 // Elect on the ABSOLUTE certified round (= timeout_round + carried_baseline ==
                 // HIGHEST_CERTIFIED_ROUND[mb], node-independent), NOT the RELATIVE timeout_round. The
                 // relative round subtracts the LOCAL, pollutable get_baseline_round, so two honest nodes
@@ -5011,7 +5011,7 @@ impl BlockchainNode {
                         // and its receiver's ingest gate now demands certified>=carried_baseline — so
                         // the proof must ride along for in-band adoption. Pure happy path (abs=0) → None.
                         timeout_proof: if timeout_round > 0 || carried_baseline > 0 {
-                            crate::unified_p2p::certified_timeout_proof_bytes(next_block_height / 90)
+                            crate::unified_p2p::certified_timeout_proof_for_slot(next_block_height)
                         } else { None },
                     };
                     
@@ -5023,7 +5023,7 @@ impl BlockchainNode {
                     // not after. Yielding costs one empty slot; yielding late costs a diverged
                     // state_root, a vote outside n−f, and a stalled checkpoint.
                     {
-                        let round_now = crate::unified_p2p::highest_certified_round_for(next_block_height / 90);
+                        let round_now = crate::unified_p2p::certified_round_for_slot(next_block_height);
                         if round_now > certified_abs {
                             println!("[WARN][PROD] production_yielded h={} round_at_start={} round_now={} reason=authority_changed",
                                      next_block_height, certified_abs, round_now);

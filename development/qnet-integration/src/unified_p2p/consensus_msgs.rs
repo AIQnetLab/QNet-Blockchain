@@ -72,18 +72,6 @@ impl SimplifiedP2P {
                 return None;
             }
         };
-        // The anchor is DETERMINISTIC per window — re-derive locally and compare; a TC minted on a
-        // fork with a different sealed w-2 fails here on every honest node.
-        match sealed_anchor_for_window(height) {
-            Some(local_anchor) if local_anchor == anchor => {}
-            Some(_) => {
-                if crate::node::is_warn() {
-                    println!("[WARN][TC] anchor_mismatch mb={} round={} action=reject", height, timeout_round);
-                }
-                return None;
-            }
-            None => { self.request_window_anchor(height); return None; }
-        }
         let quorum = qnet_consensus::checkpoint_bft::quorum_size(committee.len());
         // Dedup by voter BEFORE verify; drop non-committee voters.
         let mut by_voter: std::collections::HashMap<String, SignedTimeoutVote> = std::collections::HashMap::new();
@@ -93,6 +81,34 @@ impl SimplifiedP2P {
             }
         }
         if by_voter.len() < quorum { return None; }
+        // AUTHENTICATE BEFORE PAYING FOR THE DESCENT. Committee ids are public chain data, so
+        // `by_voter.len() >= quorum` is arithmetic anyone can satisfy; the descent is a bounded but
+        // real storage walk. One verified committee signature over THIS (window, round, anchor)
+        // proves the frame carries genuine evidence — the same rule the vote path applies.
+        // Exactly ONE — every vote in an honest certificate verifies, so a single check proves the
+        // frame carries genuine evidence; iterating the set would let a forged frame buy
+        // quorum-many ML-DSA verifies, which is the amplification this gate exists to stop.
+        let authenticated = by_voter.values().next().map_or(false, |v| {
+            let msg = timeout_vote_message(height, timeout_round, &anchor,
+                                           v.high_qc_idx, &v.high_qc_hash, v.tip_height, &v.tip_hash);
+            self.verify_timeout_vote_signature(&v.voter_id, &msg, &v.signature)
+        });
+        if !authenticated {
+            if crate::node::is_warn() {
+                println!("[WARN][TC] unauthenticated mb={} round={} action=drop", height, timeout_round);
+            }
+            return None;
+        }
+        // Resolution, not equality with a locally re-derived value: equality made acceptance a
+        // function of the receiver's own seal frontier, so honest nodes on a byte-identical chain
+        // rejected each other's certificates and the failover layer partitioned itself.
+        if !anchor_resolves_for_window(height, &anchor) {
+            if crate::node::is_warn() {
+                println!("[WARN][TC] anchor_unresolved mb={} round={} action=defer_fetch", height, timeout_round);
+            }
+            self.request_window_anchor(height);
+            return None;
+        }
         let candidates: Vec<SignedTimeoutVote> = by_voter.into_values().collect();
         use rayon::prelude::*;
         // Per-voter payload reconstruction: each signature verifies over the voter's OWN fields —

@@ -1465,9 +1465,31 @@ impl SimplifiedP2P {
                 // node then rejected every real block from the victim. The write also reached disk, and
                 // boot reloads disk into RAM as "chain-validated", so it outlived restarts.
                 //
-                // Nothing installs here any more. (node_id, pk) comes only from the chain-apply path,
-                // where the transaction's own signature authenticates the pair; genesis identities are
-                // pre-pinned into both registries at startup and never depended on this.
+                // Nothing is installed on the sender's word. But the CHAIN already answers the
+                // question the self-signature cannot: the committed registry row binds this node_id
+                // to sha3(pk). A node that missed the registration block (snapshot cold-join, or the
+                // post-commit key write lost to a crash) otherwise rejects that producer's blocks
+                // forever, with no path to the key — the wedge that took node 002 out of consensus.
+                // Install ONLY on a digest match, and only over an empty slot: the sender is never
+                // trusted, the chain is.
+                if sig_ok {
+                    if let Some(storage) = crate::node::try_get_storage() {
+                        let committed = storage.vrf_pk_commitment(&node_id);
+                        let offered = {
+                            use sha3::{Digest, Sha3_256};
+                            hex::encode(Sha3_256::digest(&vrf_public_key))
+                        };
+                        if committed.as_deref() == Some(offered.as_str())
+                            && storage.load_vrf_public_key(&node_id).ok().flatten().is_none()
+                        {
+                            if storage.save_vrf_public_key(&node_id, &hex::encode(&vrf_public_key)).is_ok() {
+                                crate::genesis_constants::register_vrf_public_key(&node_id, &vrf_public_key);
+                                let _ = qnet_consensus::consensus_crypto::register_consensus_pk_from_chain(&node_id, &vrf_public_key);
+                                println!("[INFO][VRF-KEY] installed node={} source=announce_chain_committed", node_id);
+                            }
+                        }
+                    }
+                }
                 if !sig_ok {
                     if crate::node::is_warn() {
                         println!("[WARN][VRF-KEY] bad_self_sig node={}", node_id);

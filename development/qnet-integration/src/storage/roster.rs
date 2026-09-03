@@ -386,6 +386,24 @@ impl Storage {
             }
         }
 
+        // The raw consensus key rides the registration's own batch. Its only other writer is a
+        // post-commit side effect that a replay never runs and a crash can lose, which is how a
+        // restored node ended up unable to verify a producer it had committed to its own registry —
+        // and a missing key is a hard block reject, so that node could never catch up again.
+        // Same guards the standalone writer applies: never restate a pinned genesis identity, never
+        // rebind an existing one.
+        if let Some(pk) = vrf_pk {
+            if !pk.is_empty() {
+                let vrf_key = format!("vrf_pk_{}", node_id);
+                let held = self.persistent.db.get_cf(&registry_cf, vrf_key.as_bytes()).ok().flatten();
+                let anchor = qnet_consensus::consensus_crypto::get_consensus_pk_anchor(node_id);
+                if held.is_none()
+                    && !crate::genesis_constants::genesis_pk_overwrite_refused(anchor.as_deref(), pk)
+                {
+                    batch.put_cf(&registry_cf, vrf_key.as_bytes(), hex::encode(pk).as_bytes());
+                }
+            }
+        }
         self.persistent.db.write(batch)?;
 
         Ok(())

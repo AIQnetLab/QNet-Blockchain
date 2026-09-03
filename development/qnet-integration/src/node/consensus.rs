@@ -1323,6 +1323,8 @@ impl BlockchainNode {
         // Base = certified+1 (consensus-visible, identical on every node). f+1 round amplification:
         // jump to the highest round ≥1 honest validator already reached. Leader election still reads
         // only the n−f-certified round, so amplifying the TARGET cannot cause dual production.
+        // Strictly the window's own certified round: MAX_FAILOVER_ROUND is a PER-WINDOW bound, and
+        // seeding from a carried round would make it a cross-window ratchet with an absorbing state.
         let current_cert = p2p.get_highest_certified_round(mb_index);
         let f = committee.len().saturating_sub(1) / 3;
         let observed = crate::unified_p2p::highest_failover_round_with_support(mb_index, f + 1);

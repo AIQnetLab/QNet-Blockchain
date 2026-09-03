@@ -1756,22 +1756,40 @@ impl SimplifiedP2P {
         let mut qc_hash_arr = [0u8; 32]; qc_hash_arr.copy_from_slice(&high_qc_hash);
         let mut tip_hash_arr = [0u8; 32]; tip_hash_arr.copy_from_slice(&tip_hash);
 
-        // Deterministic anchor must match our sealed state (cheap, pre-sig): a vote minted on a fork
-        // (different sealed w-2) is rejected by every honest node.
-        match sealed_anchor_for_window(height) {
+        // The anchor must name a macroblock THIS node holds at or below the window's roster base
+        // (cheap, pre-sig). Resolution, not equality with a locally re-derived value: equality made
+        // admission a function of the receiver's own seal frontier, so a vote from an honest peer on
+        // a byte-identical chain was discarded as foreign. A vote minted on a fork still resolves to
+        // nothing here, because macroblock storage is index-keyed and first-write-wins.
+        // A resolved anchor carries ITSELF into the match: `None` already means "anchor absent
+        // locally, pull and defer" in the arm below, so folding the resolved case into None would
+        // discard exactly the votes this gate exists to admit.
+        let local_anchor_opt = local_anchor_for_window_cached(height);
+        let matches_local = local_anchor_opt.map_or(false, |a| a == anchor_arr);
+        // The signed payload is identical for every gate below, so build it once.
+        let vote_msg = timeout_vote_message(height, timeout_round, &anchor_arr,
+                                            high_qc_idx, &qc_hash_arr, tip_height, &tip_hash_arr);
+        // A vote whose anchor is not ours may still be honest — the anchor a node signs is derived
+        // from its own seal frontier, which legitimately lags. Resolving it against the macroblocks
+        // we hold is a bounded storage descent, so it is paid ONLY for an authenticated vote:
+        // ahead of the signature it was a 33-read amplifier for anyone who could open a connection.
+        let admitted = if matches_local {
+            true
+        } else {
+            // A voter already recorded against this exact foreign anchor buys nothing new, so the
+            // dedup keeps its place ahead of the ~5 ms verify.
+            if FOREIGN_ANCHOR_WITNESSES.get(&(height, anchor_arr))
+                .map(|s| s.contains(&voter_id)).unwrap_or(false) { return; }
+            if !self.verify_timeout_vote_signature(&voter_id, &vote_msg, &signature) { return; }
+            anchor_resolves_for_window(height, &anchor_arr)
+        };
+        match if admitted { Some(anchor_arr) } else { local_anchor_opt } {
             Some(local_anchor) if local_anchor != anchor_arr => {
                 // Never TALLY across views — two views must not combine into one quorum. But dropping
                 // and nothing else leaves a minority node deaf: it discards every majority vote, its
                 // view can never advance, and it keeps producing on a branch no one accepts. Count
                 // distinct SIGNED foreign anchors; n−f of them proves OUR anchor is the minority one.
-                let already = FOREIGN_ANCHOR_WITNESSES.get(&(height, anchor_arr))
-                    .map(|s| s.contains(&voter_id)).unwrap_or(false);
-                if already { return; }
-                // Dedup precedes the ~5ms verify, so a flood of forged voter ids costs at most one
-                // signature check per committee member per window.
-                let probe = timeout_vote_message(height, timeout_round, &anchor_arr,
-                                                 high_qc_idx, &qc_hash_arr, tip_height, &tip_hash_arr);
-                if !self.verify_timeout_vote_signature(&voter_id, &probe, &signature) { return; }
+                // Reached only for an authenticated vote: the signature was checked above.
                 // Cap distinct anchors per window: honest divergence yields one or two, while a single
                 // committee member could otherwise mint an unbounded number of map keys by signing a
                 // fresh anchor per vote. Voter sets stay bounded by committee size.
@@ -1806,10 +1824,9 @@ impl SimplifiedP2P {
             _ => {}
         }
 
-        // Signature LAST (the ~5ms cost) — only after the cheap floor/round/committee/anchor gates.
-        let vote_msg = timeout_vote_message(height, timeout_round, &anchor_arr,
-                                            high_qc_idx, &qc_hash_arr, tip_height, &tip_hash_arr);
-        if !self.verify_timeout_vote_signature(&voter_id, &vote_msg, &signature) {
+        // Signature (the ~5ms cost) — after the cheap floor/round/committee/anchor gates. Already
+        // paid above when the anchor was not ours, so verify here only for the matching-anchor path.
+        if !matches_local {} else if !self.verify_timeout_vote_signature(&voter_id, &vote_msg, &signature) {
             if crate::node::is_warn() {
                 println!("[WARN][TIMEOUT] vote_sig_invalid h={} voter={}", height, voter_id);
             }
@@ -1842,10 +1859,12 @@ impl SimplifiedP2P {
             let mut entry = TIMEOUT_VOTES.entry((height, timeout_round)).or_insert_with(HashMap::new);
             match entry.get(&voter_id) {
                 Some(existing) if existing.anchor != anchor_arr => {
-                    // The STORED vote is the stale view: this vote already passed the local-anchor
-                    // gate above, so it carries the canonical anchor and the squatter must yield —
-                    // one pre-reconciliation vote per voter otherwise poisons the tally forever.
-                    // Views still never aggregate: every tallied vote matches the local anchor.
+                    // One live claim per voter: the newer vote replaces the older view. Views still
+                    // never aggregate — the quorum below counts only the votes sharing THIS anchor.
+                    // Rate-bounded like any other re-vote, but not STRICTLY: a correction landing in
+                    // the same wall-clock second as the vote it replaces is exactly the honest case,
+                    // and dropping it holds the tally one short of quorum.
+                    if now_secs < existing.updated_at { return; }
                     if crate::node::is_warn() {
                         println!("[WARN][TIMEOUT] vote_anchor_superseded h={} voter={}",
                                  height, voter_id);
@@ -1859,7 +1878,11 @@ impl SimplifiedP2P {
                 None => {}
             }
             entry.insert(voter_id.clone(), stored);
-            entry.len()
+            // Count THIS anchor's group, not the bucket. Admission resolves an anchor against the
+            // chain rather than against the receiver's seal frontier, so two honest anchors can now
+            // share a (window, round) bucket; a certificate stamps ONE anchor and every verifier
+            // rebuilds all preimages from it, so a mixed set mints a proof nobody can verify.
+            entry.values().filter(|v| v.anchor == anchor_arr).count()
         };
 
         if crate::node::is_info() {
@@ -1993,6 +2016,7 @@ impl SimplifiedP2P {
         };
 
         let signed_votes: Vec<SignedTimeoutVote> = votes.iter()
+            .filter(|(_, v)| v.anchor == anchor) // anchor-uniform, or the proof fails its own verifier
             .map(|(voter_id, v)| SignedTimeoutVote {
                 voter_id: voter_id.clone(),
                 signature: v.signature.clone(),
@@ -2003,6 +2027,18 @@ impl SimplifiedP2P {
             })
             .collect();
 
+        // The tally counted this anchor's group; re-check it on the set actually shipped. The two
+        // are computed at different moments and a voter can supersede its anchor in between, so
+        // without this a sub-quorum certificate would install locally and advance the round.
+        let committee_len = failover_committee_for_window(height).map(|c| c.len()).unwrap_or(0);
+        let quorum = qnet_consensus::checkpoint_bft::quorum_size(committee_len);
+        if committee_len == 0 || signed_votes.len() < quorum {
+            if crate::node::is_warn() {
+                println!("[WARN][TIMEOUT] proof_gen_short h={} round={} have={} need={}",
+                         height, timeout_round, signed_votes.len(), quorum);
+            }
+            return;
+        }
         let proof = TimeoutProof { height, timeout_round, anchor, votes: signed_votes.clone() };
         TIMEOUT_CERTIFICATES.insert((height, timeout_round), proof);
 

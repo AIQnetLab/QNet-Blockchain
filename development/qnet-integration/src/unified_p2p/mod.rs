@@ -1320,6 +1320,83 @@ pub fn timeout_vote_message(
             tip_height, hex::encode(tip_hash))
 }
 
+/// This node's OWN anchor per (window, seal frontier). `sealed_anchor_for_window` reads a macroblock
+/// and dispatches on the roster mode, and it sits pre-signature on every inbound vote; the committee
+/// on the same path is already memoized on the same key.
+static LOCAL_ANCHOR_CACHE: Lazy<DashMap<(u64, u64), Option<[u8; 32]>>> = Lazy::new(DashMap::new);
+
+/// This node's own anchor for the window, memoized. The name deliberately does NOT share a prefix
+/// with `sealed_anchor_for_window`: a source-scanning invariant test locates that function by prefix.
+/// The key carries the seal frontier the answer derives from,
+/// so the entry self-invalidates the moment that frontier moves.
+pub fn local_anchor_for_window_cached(w: u64) -> Option<[u8; 32]> {
+    let seal = crate::node::try_get_storage().map(|s| s.last_sealed_mb_index()).unwrap_or(0);
+    if let Some(v) = LOCAL_ANCHOR_CACHE.get(&(w, seal)) { return *v; }
+    let v = sealed_anchor_for_window(w);
+    if LOCAL_ANCHOR_CACHE.len() > 512 { LOCAL_ANCHOR_CACHE.clear(); }
+    LOCAL_ANCHOR_CACHE.insert((w, seal), v);
+    v
+}
+
+/// Anchors this node has already resolved for a window, so the descent below runs once per
+/// (window, anchor) rather than per vote.
+static RESOLVED_ANCHORS: Lazy<DashMap<(u64, [u8; 32]), (bool, u64)>> = Lazy::new(DashMap::new);
+/// How long a NEGATIVE resolution is trusted. A positive is chain data and never changes; a
+/// negative only means "not held yet", and both callers answer it by pulling the macroblock and
+/// waiting for a retransmission — which a permanent memo would answer with the same stale no.
+const ANCHOR_MISS_TTL_SECS: u64 = 30;
+/// A positive is chain data, but a macroblock can be rolled back, so it expires too — slowly.
+const ANCHOR_HIT_TTL_SECS: u64 = 3600;
+
+/// Does `anchor` name a macroblock this node HOLDS at or below window `w`'s roster base?
+///
+/// This is the acceptance predicate for failover evidence, and it deliberately does NOT re-derive
+/// the anchor the way the signer picks one. `sealed_anchor_for_window` dispatches on `roster_mode`,
+/// which reads this node's own seal frontier and QC-frontier cache — node-local, mutable, and 0 at
+/// every boot. Two honest nodes holding byte-identical macroblocks therefore derived different
+/// anchors after a staggered restart and hard-rejected each other's votes and certificates
+/// (`anchor_mismatch mb=1887`), partitioning the failover layer with no adversary present.
+///
+/// Resolution keeps every guarantee the equality check provided: macroblock storage is index-keyed
+/// and first-write-wins, so an anchor minted on another branch resolves to nothing here, and the
+/// descent is bounded by the same horizon the frozen roster uses. What it drops is the requirement
+/// that the sender's seal frontier equal the receiver's.
+pub fn anchor_resolves_for_window(w: u64, anchor: &[u8; 32]) -> bool {
+    if w < 3 { return anchor == &[0u8; 32]; }
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs()).unwrap_or(0);
+    if let Some(v) = RESOLVED_ANCHORS.get(&(w, *anchor)) {
+        let (found, expiry) = *v;
+        if expiry > now { return found; }
+    }
+    let storage = match crate::node::try_get_storage() { Some(s) => s, None => return false };
+    let start = w.saturating_sub(2);
+    // A frozen anchor is derived by descending up to MAX_DERIVED_ROSTER_WINDOWS from the SIGNER's own
+    // seal frontier, which can sit below w-2 — so the floor has to cover that range from wherever our
+    // own frontier is, not just from w-2, or an honest frozen vote resolves for nobody.
+    let horizon = crate::node::BlockchainNode::MAX_DERIVED_ROSTER_WINDOWS as u64;
+    let own_seal = crate::node::try_get_storage().map(|s| s.last_sealed_mb_index()).unwrap_or(0);
+    let floor = start.min(own_seal.max(1)).saturating_sub(horizon);
+    let mut idx = start;
+    let mut found = false;
+    while idx >= 1 && idx >= floor.max(1) {
+        if let Some(mb) = storage.get_macroblock_by_height(idx).ok().flatten()
+            .and_then(crate::node::BlockchainNode::macroblock_plaintext)
+            .and_then(|raw| bincode::deserialize::<qnet_state::MacroBlock>(&raw).ok())
+        {
+            if mb.hash() == *anchor { found = true; break; }
+        }
+        idx -= 1;
+    }
+    if RESOLVED_ANCHORS.len() > 4096 {
+        RESOLVED_ANCHORS.retain(|_, v| v.1 > now);
+        if RESOLVED_ANCHORS.len() > 4096 { RESOLVED_ANCHORS.clear(); }
+    }
+    let ttl = if found { ANCHOR_HIT_TTL_SECS } else { ANCHOR_MISS_TTL_SECS };
+    RESOLVED_ANCHORS.insert((w, *anchor), (found, now.saturating_add(ttl)));
+    found
+}
+
 /// Deterministic failover committee for vote window `w` (A1 R11.0). Resolution order: genesis (w<3)
 /// → sealed `committee_for_height(w*90)` when w-2 ≤ L → FrozenCommittee(w) off the sealed anchor M_A
 /// when finality is stalled → None (Defer: a certified anchor exists but is unheld, caller pulls).
@@ -1445,7 +1522,13 @@ pub fn round_one_short_of_quorum(w: u64, voter: &str) -> bool {
         if kw != w || kr <= certified { continue; } // live rounds only — a consumed round is no rotation demand
         let voters = e.value();
         if voters.contains_key(voter) { continue; }  // we already voted this round ⇒ not withholding
-        if voters.keys().filter(|v| v.as_str() != voter).count() >= quorum.saturating_sub(1) {
+        // Per ANCHOR group, mirroring the certificate tally: a bucket can now hold two honest
+        // anchors, and a certificate is only ever minted from one of them.
+        let anchors: std::collections::HashSet<[u8; 32]> = voters.values().map(|v| v.anchor).collect();
+        let best = anchors.iter()
+            .map(|a| voters.iter().filter(|(v, sv)| v.as_str() != voter && sv.anchor == *a).count())
+            .max().unwrap_or(0);
+        if best >= quorum.saturating_sub(1) {
             return true;
         }
     }
@@ -1500,6 +1583,12 @@ pub(crate) fn test_insert_timeout_vote(w: u64, round: u64, voter: &str) {
         },
     );
 }
+
+/// Shared by every test that reads or writes the process-global failover maps — the harness runs
+/// tests in parallel threads, and a sibling's `test_clear_timeout_state()` would otherwise wipe
+/// state mid-assertion.
+#[cfg(test)]
+pub(crate) static TEST_FAILOVER_STATE_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 #[cfg(test)]
 pub(crate) fn test_clear_timeout_state() {
@@ -1584,6 +1673,49 @@ pub fn get_baseline_round(mb_index: u64) -> u64 {
 /// Scalability: O(1) DashMap reads. Identical cost from 5 to 10 000 super-
 /// nodes.
 /// ═══════════════════════════════════════════════════════════════════════════
+/// The certified rotation round that governs SLOT `h`.
+///
+/// The failover round is keyed by macroblock window (`h/90`) while a leader tenure is 30 blocks,
+/// and 90 = 3 x 30 — so every window rollover lands on the LAST slot of a tenure. Keying that slot
+/// on the new (empty) window discards the certificate the network just used to rotate off a dead
+/// leader and re-elects it for exactly one slot, once every 90 blocks. Forensic h=169830: the
+/// network had produced 29 consecutive slots past a wedged leader on a certified round, then the
+/// key rolled to window 1887, the round read 0, and the wedged leader was re-elected — one
+/// un-skippable slot, and the chain stopped there.
+///
+/// A tenure spans at most two windows, so the round governing a slot is the higher of its own
+/// window and the window its tenure began in. Both operands are certificate-driven, so this stays
+/// a pure function of n-f-certified state — no clock, no node-local frontier.
+pub fn certified_round_for_slot(h: u64) -> u64 {
+    // The two intervals must keep a tenure inside at most two windows, or reading two is not enough.
+    const _: () = assert!(crate::node::ROTATION_INTERVAL_BLOCKS <= qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL);
+    let w = h / qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
+    let read = |k: u64| HIGHEST_CERTIFIED_ROUND.get(&k).map(|v| *v).unwrap_or(0);
+    let tenure_start = (h.saturating_sub(1) / crate::node::ROTATION_INTERVAL_BLOCKS)
+        .saturating_mul(crate::node::ROTATION_INTERVAL_BLOCKS)
+        .saturating_add(1);
+    let w0 = tenure_start / qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
+    // Certified entries ONLY. The apply baseline is RAM-resident, never persisted and never
+    // repopulated by the boot replay, so folding it in here would make the ceiling — which drives
+    // both the election and the ingest gate — differ between a restarted node and its peers. It is
+    // also the wrong unit: a rotation round belongs to the tenure that certified it, not to every
+    // later tenure that happens to share a window.
+    if w0 == w { read(w) } else { read(w).max(read(w0)) }
+}
+
+/// Slot-keyed (relative round, baseline) for the producer, mirroring `rotation_round_and_baseline`
+/// but with the tenure-carried round above. Both fields come from the same baseline, so the
+/// verifier's `block_round + carried_baseline` reconstructs exactly this absolute round.
+pub fn rotation_round_and_baseline_for_slot(h: u64) -> (u64, u64) {
+    let certified = certified_round_for_slot(h);
+    // Clamp the baseline to the slot's ceiling. Applying a carried-round block records that round
+    // as the NEXT window's baseline while its certified entry is still 0; an unclamped baseline
+    // would then be stamped whole, putting the block's absolute round above the ceiling every
+    // honest node checks it against — the boundary repair would just move the halt one slot on.
+    let baseline = get_baseline_round(h / qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL).min(certified);
+    (certified.saturating_sub(baseline), baseline)
+}
+
 pub fn get_certified_rotation_round(mb_index: u64) -> u64 {
     let baseline = get_baseline_round(mb_index);
     let certified = HIGHEST_CERTIFIED_ROUND.get(&mb_index).map(|v| *v).unwrap_or(0);
@@ -1608,6 +1740,23 @@ pub fn certified_timeout_proof_bytes(mb_index: u64) -> Option<Vec<u8>> {
     let abs = HIGHEST_CERTIFIED_ROUND.get(&mb_index).map(|v| *v).unwrap_or(0);
     if abs == 0 { return None; }
     let proof = TIMEOUT_CERTIFICATES.get(&(mb_index, abs))?;
+    bincode::serialize(&*proof).ok()
+}
+
+/// The proof for the round SLOT `h` is elected under. A tenure that straddles a window boundary
+/// runs on a round certified in the previous window, so the boundary block's proof lives under that
+/// window's key — looking only under the block's own window found nothing exactly there, and the
+/// receiver then had to pull a certificate the sender was holding all along.
+pub fn certified_timeout_proof_for_slot(h: u64) -> Option<Vec<u8>> {
+    let abs = certified_round_for_slot(h);
+    if abs == 0 { return None; }
+    let w = h / qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
+    let tenure_start = (h.saturating_sub(1) / crate::node::ROTATION_INTERVAL_BLOCKS)
+        .saturating_mul(crate::node::ROTATION_INTERVAL_BLOCKS)
+        .saturating_add(1);
+    let w0 = tenure_start / qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
+    let proof = TIMEOUT_CERTIFICATES.get(&(w, abs))
+        .or_else(|| TIMEOUT_CERTIFICATES.get(&(w0, abs)))?;
     bincode::serialize(&*proof).ok()
 }
 
@@ -1639,6 +1788,12 @@ pub fn highest_failover_round_with_support(mb_index: u64, support: usize) -> u64
 /// Both the producer and this gate read the same `HIGHEST_CERTIFIED_ROUND[mb_idx]`, advanced
 /// only by a same-round 2f+1 `TimeoutProof`, so they can never disagree on whether a round is
 /// authorised. A round>0 block is admitted iff its absolute round is 2f+1-certified. O(1).
+pub fn failover_round_authorized_for_slot(h: u64, block_round: u64, carried_baseline: u64) -> bool {
+    // Same slot rule the producer elected under: a tenure that straddles a window boundary keeps
+    // its certified round, so the last slot of that tenure is authorised by it.
+    certified_round_for_slot(h) >= block_round.saturating_add(carried_baseline)
+}
+
 pub fn failover_round_authorized(mb_index: u64, block_round: u64, carried_baseline: u64) -> bool {
     // ABSOLUTE round = block_round + the baseline the block CARRIES (node-independent), NOT the local
     // get_baseline_round (which a same-height loser-apply pollutes). Compare to the window-keyed 2f+1 ceiling.
@@ -4442,6 +4597,7 @@ mod tests {
     // ONE test fn: these invariants share module statics — parallel test threads must not interleave.
     #[test]
     fn failover_view_sync_invariants() {
+        let _guard = TEST_FAILOVER_STATE_LOCK.lock();
         test_clear_timeout_state();
 
         // ── Canonical vote payload: versioned domain tag; every field changes the signed bytes.
@@ -4546,6 +4702,7 @@ mod tests {
     /// so the gate and the producer can never disagree on whether a failover round is authorised.
     #[test]
     fn failover_round_authorized_matches_producer_authority() {
+        let _guard = TEST_FAILOVER_STATE_LOCK.lock();
         // Unique mb_idx values so the global consensus DashMaps don't collide with other tests.
         // baseline is now CARRIED in the block (3rd arg), not read from LAST_FINALIZED_ROUND_PER_MB.
         let mb = 9_100_001u64;
@@ -5495,5 +5652,63 @@ mod attest_heartbeat_tests {
                 "the next window must fire again");
         // The receive half tracks its own window, so one side cannot silence the other.
         assert!(attest_heartbeat_due(w + 1, false), "receive half is independent");
+    }
+}
+
+#[cfg(test)]
+mod tests_failover_slot_key {
+    use super::*;
+
+    /// Forensic h=169830. The failover round is keyed by macroblock window (h/90) while a leader
+    /// tenure is 30 blocks; 90 = 3 x 30, so every window rollover lands on the LAST slot of a
+    /// tenure. Keying that slot on the fresh window read round 0 and re-elected the leader the
+    /// network had already skipped for 29 consecutive slots — one un-skippable slot, and the chain
+    /// stopped there. The round must follow the tenure across the boundary.
+    /// Windows far from any other test's keys, and only this test's own entries are touched:
+    /// the maps are process-global and the harness runs tests in parallel threads.
+    const W0: u64 = 900_000;         // tenure begins here
+    const H_MID: u64 = W0 * 90 - 1;  // mid-tenure slot, own window
+    const H_BOUNDARY: u64 = W0 * 90; // last slot of the tenure, first of the next window
+    const H_NEXT: u64 = W0 * 90 + 1; // fresh tenure in the new window
+
+    #[test]
+    fn a_tenure_keeps_its_certified_round_across_a_window_boundary() {
+        let _guard = TEST_FAILOVER_STATE_LOCK.lock();
+        HIGHEST_CERTIFIED_ROUND.insert(W0 - 1, 3); // the round the network rotated onto
+        assert_eq!(certified_round_for_slot(H_MID), 3, "mid-tenure slot, own window");
+        assert_eq!(certified_round_for_slot(H_BOUNDARY), 3,
+                   "last slot of the tenure: the boundary must not discard the certified skip");
+        // A NEW tenure starting in the new window is not entitled to the old round.
+        assert_eq!(certified_round_for_slot(H_NEXT), 0, "fresh tenure, fresh window");
+        // The election and the ingest gate must agree on that slot, or the block is refused.
+        assert!(failover_round_authorized_for_slot(H_BOUNDARY, 3, 0),
+                "the block the carried round elects is authorised by the same rule");
+        assert!(!failover_round_authorized_for_slot(H_BOUNDARY, 4, 0), "an uncertified round is still refused");
+
+        // Applying that boundary block records its absolute round as the NEW window's baseline.
+        // The next slot must still be able to stamp it, or the repair just moves the halt one slot.
+        LAST_FINALIZED_ROUND_PER_MB.insert(W0, 3);
+        let (rel, carried) = rotation_round_and_baseline_for_slot(H_NEXT);
+        assert_eq!(rel.saturating_add(carried), 0,
+                   "a fresh tenure stamps its own round, not the one carried into the window");
+        assert!(failover_round_authorized_for_slot(H_NEXT, rel, carried),
+                "the block the next slot stamps is authorised by every honest node");
+        // The ceiling must stay a function of CERTIFIED state only: a restarted peer, whose apply
+        // baseline is empty, has to compute the same answer.
+        assert_eq!(certified_round_for_slot(H_NEXT), 0, "the apply baseline never raises the ceiling");
+
+        HIGHEST_CERTIFIED_ROUND.remove(&(W0 - 1));
+        LAST_FINALIZED_ROUND_PER_MB.remove(&W0);
+    }
+
+    /// Both operands are certificate-driven, so the carry cannot invent a round: with nothing
+    /// certified anywhere the slot stays at 0 and the round-0 leader is elected as usual.
+    #[test]
+    fn the_carry_never_invents_a_round() {
+        let _guard = TEST_FAILOVER_STATE_LOCK.lock();
+        // Untouched windows: nothing certified anywhere, so every slot stays at round 0.
+        assert_eq!(certified_round_for_slot(800_000 * 90), 0);
+        assert_eq!(certified_round_for_slot(800_000 * 90 + 1), 0);
+        assert_eq!(certified_round_for_slot(800_001 * 90 - 1), 0);
     }
 }

@@ -148,6 +148,17 @@ impl Storage {
         Ok(())
     }
     
+    /// The digest of the consensus key this node's committed registry row binds to `node_id`
+    /// (`node_<id>.vrf_pk_sha3`, covered by registry_root). It is what makes a key offered on the
+    /// wire verifiable without trusting the sender.
+    pub fn vrf_pk_commitment(&self, node_id: &str) -> Option<String> {
+        let registry_cf = self.persistent.db.cf_handle("node_registry")?;
+        let raw = self.persistent.db.get_cf(&registry_cf, format!("node_{}", node_id).as_bytes()).ok().flatten()?;
+        let parsed: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+        parsed["reg_height"].as_u64()?; // chain-confirmed rows only
+        parsed["vrf_pk_sha3"].as_str().filter(|t| !t.is_empty()).map(|t| t.to_string())
+    }
+
     /// v4.0: Load VRF public key for node
     pub fn load_vrf_public_key(&self, node_id: &str) -> IntegrationResult<Option<Vec<u8>>> {
         let registry_cf = self.persistent.db.cf_handle("node_registry")

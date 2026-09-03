@@ -456,7 +456,9 @@ fn maybe_supersede_by_certified_round(storage: &Arc<Storage>, block: &IngestBloc
         // n−f-certified (a forged round advances nothing → not certified → ignored). Adopt only in this
         // higher-round branch — an equal/lower round needs no new round authority.
         if let (Some(pb), Some(p)) = (incoming.timeout_proof.as_ref(), p2p) { p.adopt_timeout_proof_bytes(pb); }
-        let certified_abs = crate::unified_p2p::highest_certified_round_for(mb_idx);
+        // Slot rule, not window: a tenure that straddles a window boundary keeps its certified
+        // round, so a competitor elected under it is already certified here.
+        let certified_abs = crate::unified_p2p::certified_round_for_slot(incoming.height);
         if incoming_abs > certified_abs {
             // Higher round not yet n−f-certified locally. The competitor's timeout_proof is WIRE-ONLY
             // (storage serve strips it), and the one-shot TC broadcast may have been missed — so a copy
@@ -2391,7 +2393,7 @@ impl BlockPipeline {
                             let incoming_abs = mb.timeout_round.saturating_add(mb.carried_baseline);
                             let local_abs = local_round.saturating_add(local_baseline);
                             let incoming_outranks = if incoming_abs > local_abs {
-                                crate::unified_p2p::failover_round_authorized(mb.height / 90, mb.timeout_round, mb.carried_baseline)
+                                crate::unified_p2p::failover_round_authorized_for_slot(mb.height, mb.timeout_round, mb.carried_baseline)
                             } else if incoming_abs == local_abs {
                                 // Equal round: only a genuine same-producer self-fork (valid sig, lower hash)
                                 // supersedes, and only if we actually HOLD a competitor here (None ⇒ false).
@@ -2618,7 +2620,7 @@ impl BlockPipeline {
                         p2p.adopt_timeout_proof_bytes(pb);
                     }
                     let round_certified =
-                        crate::unified_p2p::failover_round_authorized(mb.height / 90, mb.timeout_round, mb.carried_baseline);
+                        crate::unified_p2p::failover_round_authorized_for_slot(mb.height, mb.timeout_round, mb.carried_baseline);
                     if !round_certified {
                         // PULL-ON-REJECT: the round IS legitimate (a producer reached it via a
                         // same-round n−f), but the proving TimeoutCertificate never arrived — its
@@ -4388,7 +4390,7 @@ impl BlockPipeline {
             let block_timeout_round = block.microblock.timeout_round;
             if block_timeout_round > 0 {
                 let mb_idx = height / 90;
-                let local_certified = crate::unified_p2p::highest_certified_round_for(mb_idx);
+                let local_certified = crate::unified_p2p::certified_round_for_slot(height);
                 // v34: mb.timeout_round is RELATIVE to the per-mb_idx baseline; local_certified is
                 // ABSOLUTE. Reconstruct the block's absolute round before comparing — else, when
                 // baseline>0 (a 2nd+ failover in the same window), the relative LHS is understated
@@ -4403,10 +4405,15 @@ impl BlockPipeline {
                                 height, mb_idx, block_timeout_round, local_certified,
                             );
                         }
-                        // Request certificates for the macroblock window
-                        // covering this block — peers serve the same-round
-                        // n−f TimeoutCertificates for it.
-                        p2p.request_timeout_proofs(mb_idx, mb_idx);
+                        // Request certificates for the macroblock window covering this block AND
+                        // the window its tenure began in — peers serve the same-round n−f
+                        // TimeoutCertificates for either, and a boundary slot runs on the round
+                        // certified in the earlier one, so asking only for this window found nothing.
+                        let tenure_start = (height.saturating_sub(1) / crate::node::ROTATION_INTERVAL_BLOCKS)
+                            .saturating_mul(crate::node::ROTATION_INTERVAL_BLOCKS)
+                            .saturating_add(1);
+                        let w0 = tenure_start / 90;
+                        p2p.request_timeout_proofs(w0.min(mb_idx), mb_idx);
                     }
                 }
             }
