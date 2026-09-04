@@ -6155,6 +6155,33 @@ mod tests {
         assert!(!body.contains("canonical_hash_at"));
     }
 
+    // `Instant` is anchored to system boot and `Instant - Duration` PANICS on underflow, so an
+    // unchecked subtraction kills a node started on a freshly booted server — the exact case of a user
+    // bringing up a new machine. Needles are built with concat! so this test's own source cannot match.
+    #[test]
+    fn no_unchecked_instant_subtraction() {
+        let needles = [concat!("Instant::now() ", "- "), concat!("SystemTime::now() ", "- ")];
+        let sources = [
+            ("node/mod.rs", include_str!("mod.rs")),
+            ("node/registration.rs", include_str!("registration.rs")),
+            ("node/production.rs", include_str!("production.rs")),
+            ("node/lifecycle.rs", include_str!("lifecycle.rs")),
+            ("sync_manager.rs", include_str!("../sync_manager.rs")),
+            ("unified_p2p/mod.rs", include_str!("../unified_p2p/mod.rs")),
+            ("rpc/registration_api.rs", include_str!("../rpc/registration_api.rs")),
+        ];
+        for (name, src) in sources {
+            // Code lines only: the comment documenting this very bug quotes the broken expression.
+            for line in src.lines().filter(|l| !l.trim_start().starts_with("//")) {
+                for needle in needles {
+                    assert!(!line.contains(needle),
+                            "{} subtracts from a boot-anchored clock without checked_sub: {}",
+                            name, line.trim());
+                }
+            }
+        }
+    }
+
     // Boot height recovery must find the real tip, not stop at a constant. The previous probe walked
     // one read per height and gave up at 200k, so a node past that recovered to a height below the
     // blocks it held — and then reported and served that lower height.

@@ -302,7 +302,9 @@ impl BlockchainNode {
         static API_NODES_CACHE: once_cell::sync::Lazy<
             parking_lot::Mutex<(std::time::Instant, Vec<(String, String, qnet_state::NodeType, f64, u64, bool)>)>
         > = once_cell::sync::Lazy::new(|| {
-            parking_lot::Mutex::new((std::time::Instant::now() - std::time::Duration::from_secs(120), Vec::new()))
+            parking_lot::Mutex::new((std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(120))
+                .unwrap_or_else(std::time::Instant::now), Vec::new()))
         });
 
         {

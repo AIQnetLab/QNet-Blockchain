@@ -2242,7 +2242,9 @@ pub(super) async fn handle_stats(
 /// Cached public stats - updated every 10 minutes
 /// Safe to call frequently from website - same data for everyone
 pub(super) static PUBLIC_STATS_CACHE: Lazy<parking_lot::RwLock<(serde_json::Value, std::time::Instant)>> =
-    Lazy::new(|| parking_lot::RwLock::new((json!({}), std::time::Instant::now() - std::time::Duration::from_secs(600))));
+    Lazy::new(|| parking_lot::RwLock::new((json!({}), std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(600))
+        .unwrap_or_else(std::time::Instant::now))));
 
 /// Handle public stats request (cached 10 minutes)
 /// GET /api/v1/public/stats

@@ -194,7 +194,8 @@ static DOWNLOADING_BLOCKS: Lazy<Arc<RwLock<HashSet<u64>>>> =
 
 // RACE CONDITION FIX: Cache blockchain height to prevent excessive queries
 static CACHED_BLOCKCHAIN_HEIGHT: Lazy<Arc<Mutex<(u64, Instant)>>> =
-    Lazy::new(|| Arc::new(Mutex::new((0, Instant::now() - Duration::from_secs(3600)))));
+    Lazy::new(|| Arc::new(Mutex::new((0,
+        Instant::now().checked_sub(Duration::from_secs(3600)).unwrap_or_else(Instant::now)))));
 
 // v14.8.5: Lock-free mirror of the cached network height. Written alongside
 // every update of CACHED_BLOCKCHAIN_HEIGHT; read by the stuck-chain watchdog
@@ -4822,7 +4823,8 @@ mod tests {
         // Create entry with short duration that will be checked
         let expired_entry = BlacklistEntry {
             reason: BlacklistReason::SyncTimeout,
-            timestamp: Instant::now() - std::time::Duration::from_secs(1000),
+            timestamp: Instant::now().checked_sub(std::time::Duration::from_secs(1000))
+                .unwrap_or_else(Instant::now),
             duration_secs: 100, // Expired 900 seconds ago
             attempts: 1,
         };

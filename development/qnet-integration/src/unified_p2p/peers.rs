@@ -1338,7 +1338,15 @@ impl SimplifiedP2P {
                 // above. Empty-slot attestations are aggregated by producers
                 // to skip silent leaders; phantom signatures from unbound
                 // identities would let an attacker force-skip an honest leader.
-                let sig_ok = if let Some(pk_bytes) = crate::genesis_constants::get_vrf_public_key(&attester_id) {
+                // Resolve through the canonical resolver, not the RAM map alone: that map is capped and
+                // REFUSES inserts once full, and light registrations share it, so a legitimate attester's
+                // key can simply not fit — and a rejected attestation here means a silent leader cannot
+                // be skipped. producer_verify_pk falls through to the registry CF and the pinned anchor,
+                // making the verdict independent of cache contents.
+                let attester_pk = crate::node::try_get_storage()
+                    .and_then(|st| crate::node::producer_verify_pk(&st, &attester_id))
+                    .or_else(|| crate::genesis_constants::get_vrf_public_key(&attester_id));
+                let sig_ok = if let Some(pk_bytes) = attester_pk {
                     use pqcrypto_mldsa::mldsa65 as dilithium3;
                     use pqcrypto_traits::sign::{PublicKey as PkTrait, DetachedSignature as SigTrait};
                     let attest_msg = format!("QNET_EMPTY_SLOT:{}:{}", slot_height, expected_producer);

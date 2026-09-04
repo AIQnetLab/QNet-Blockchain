@@ -751,7 +751,8 @@ impl SyncManager {
                 println!("[INFO][SYNC] genesis_priority fetching h=0 before pipelined_catchup");
             }
             let deadline = Instant::now() + GENESIS_WAIT;
-            let mut last_request = Instant::now() - Duration::from_secs(10);
+            let mut last_request = Instant::now().checked_sub(Duration::from_secs(10))
+                .unwrap_or_else(Instant::now);
             let mut attempts = 0u32;
             loop {
                 if self.storage.load_microblock(0).map(|o| o.is_some()).unwrap_or(false) {
