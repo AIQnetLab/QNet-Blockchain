@@ -1109,8 +1109,10 @@ impl BlockchainNode {
     /// Epochs holding a certified reward_root that this node cannot serve — exactly where
     /// `wallet_claimable_qnc` stops and starts under-reporting every wallet. Newest first, bounded.
     pub(crate) fn unservable_reward_epochs(storage: &crate::storage::Storage, max: usize) -> Vec<(u64, String)> {
-        let mut epochs = storage.reward_epochs_from(0).unwrap_or_default();
-        epochs.reverse();
+        // ASCENDING, deliberately: `wallet_claimable_qnc` walks epochs in order and STOPS at the first
+        // one it cannot serve, so the oldest gap is the one truncating the total. Repairing the newest
+        // first would leave the figure unchanged for as many passes as there are gaps.
+        let epochs = storage.reward_epochs_from(0).unwrap_or_default();
         let mut out = Vec::new();
         for &epoch in epochs.iter() {
             let root = match storage.load_epoch_root(epoch) {
@@ -1133,11 +1135,16 @@ impl BlockchainNode {
         // Hard ceiling on what a peer can make this node allocate. One entry per recipient, so this is
         // twice the 10M-light target and still refuses an unbounded stream.
         const MAX_LEAVES: usize = 20_000_000;
+        // Whole-fetch budget, not just a per-request timeout: at the 10M target the set is ~2400 shards,
+        // and a slow peer would otherwise hold this pass open for hours. Expiry drops to the next peer.
+        const BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+        let started = std::time::Instant::now();
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10)).build().ok()?;
         let mut all: Vec<(String, u64)> = Vec::new();
         let mut shard = 0usize;
         loop {
+            if started.elapsed() > BUDGET { return None; }
             let url = format!("{}/api/v1/rewards/epoch/{}/leafset?shard={}", base, epoch, shard);
             let v: serde_json::Value = client.get(&url).send().await.ok()?.json().await.ok()?;
             let shards = v["shards"].as_u64().unwrap_or(0) as usize;
