@@ -1333,6 +1333,19 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(blockchain_filter.clone())
         .and_then(handle_account_transactions);
 
+    // Permanent node-lifecycle feed: the registration TX is pruned with the rest of the tx index, but
+    // the registry row behind it is not, so a wallet keeps its own activation in view.
+    // GET /api/v1/account/{address}/node-events
+    let account_node_events = api_v1
+        .and(warp::path("account"))
+        .and(warp::path::param::<String>())
+        .and(warp::path("node-events"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::addr::remote())
+        .and(blockchain_filter.clone())
+        .and_then(handle_account_node_events);
+
     // Decoded token-transfer feeds (effect-sourced, success-gated) — P2.
     // GET /api/v1/account/{address}/token-transfers?limit=&before=
     let account_token_transfers = api_v1
@@ -2497,6 +2510,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .or(token_balance_proof)  // V2: trustless QRC-20 token balance proof
         .or(validators_proof)       // v3.32: Validator set with Merkle proof
         .or(account_transactions)
+        .or(account_node_events)
         .or(account_token_transfers)
         .or(token_transfers_feed)
         .or(token_transfers_range)

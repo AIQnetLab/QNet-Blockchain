@@ -1320,6 +1320,44 @@ pub fn timeout_vote_message(
             tip_height, hex::encode(tip_hash))
 }
 
+/// Per-window, per-voter SIGNED `high_qc_idx` — the voter's own last sealed macroblock. Recorded for
+/// every AUTHENTICATED vote, including one whose anchor this node cannot resolve: that is precisely
+/// the case that matters, since a node behind on macroblocks resolves none of the majority's anchors,
+/// so nothing ever reaches its tally and it could never learn from the tally that it is the one behind.
+static VOTER_SEALED_CLAIM: Lazy<DashMap<(u64, String), u64>> = Lazy::new(DashMap::new);
+
+/// Record an authenticated committee voter's own sealed index for window `w`. Monotone per voter.
+/// Bounded by committee size x the retained window span; both callers sit behind the committee filter
+/// and a verified signature, so this is not remotely inflatable.
+pub fn note_sealed_claim(w: u64, voter_id: &str, high_qc_idx: u64) {
+    {
+        let mut e = VOTER_SEALED_CLAIM.entry((w, voter_id.to_string())).or_insert(0);
+        if high_qc_idx > *e { *e = high_qc_idx; }
+    }
+    if VOTER_SEALED_CLAIM.len() > 8192 { VOTER_SEALED_CLAIM.retain(|k, _| k.0.saturating_add(8) >= w); }
+}
+
+/// Highest sealed-macroblock index that >= `support` DISTINCT committee voters have SIGNED. At
+/// support = f+1 at least one signer is honest, so the macroblock it names really is sealed somewhere —
+/// which is what separates "the network's finality is stalled" from "mine is behind it".
+///
+/// Folded per VOTER across every retained window, not per window: a sealed index is a property of the
+/// signer, and the node this answer protects is by definition voting on an OLDER window than the peers
+/// whose seals it needs to hear about, so a per-window lookup would go silent in its own case. A stale
+/// claim stays sound — a sealed macroblock is final, and high_qc_idx only climbs.
+pub fn sealed_frontier_with_support(support: usize) -> u64 {
+    if support == 0 { return 0; }
+    let mut per_voter: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    for e in VOTER_SEALED_CLAIM.iter() {
+        let slot = per_voter.entry(e.key().1.clone()).or_insert(0);
+        if *e.value() > *slot { *slot = *e.value(); }
+    }
+    if per_voter.len() < support { return 0; }
+    let mut vals: Vec<u64> = per_voter.into_values().collect();
+    vals.sort_unstable_by(|a, b| b.cmp(a));
+    vals[support - 1]
+}
+
 /// This node's OWN anchor per (window, seal frontier). `sealed_anchor_for_window` reads a macroblock
 /// and dispatches on the roster mode, and it sits pre-signature on every inbound vote; the committee
 /// on the same path is already memoized on the same key.
@@ -1584,6 +1622,40 @@ pub(crate) fn test_insert_timeout_vote(w: u64, round: u64, voter: &str) {
     );
 }
 
+#[cfg(test)]
+mod tests_sealed_claim {
+    use super::*;
+
+    const W: u64 = 700_000;
+
+    // The evidence that separates a stalled network from a lagging node must be unmovable by <= f
+    // liars, and must never drift downward for one voter.
+    #[test]
+    fn a_seal_claim_is_f_plus_one_evidence_and_never_walks_back() {
+        let _g = TEST_FAILOVER_STATE_LOCK.lock();
+        VOTER_SEALED_CLAIM.clear();
+
+        note_sealed_claim(W, "a", 900);
+        assert_eq!(sealed_frontier_with_support(2), 0, "one signer is not f+1 evidence");
+
+        // A later vote from the same signer carrying a LOWER seal must not lower its claim: high_qc_idx
+        // is monotone for an honest node, and a walk-back would let a re-vote erase the evidence.
+        note_sealed_claim(W, "a", 40);
+        note_sealed_claim(W, "b", 40);
+        note_sealed_claim(W, "liar", 9_000);
+        assert_eq!(sealed_frontier_with_support(2), 900, "monotone per voter");
+        // Two honest signers at 40 outrank the liar: the answer is the highest index `support` signers
+        // stand behind, so f Byzantine claims can never push this node into deferring.
+        assert_eq!(sealed_frontier_with_support(3), 40, "f liars cannot move the honest floor");
+
+        // A claim carried by a NEWER window still counts: the node this evidence protects is the one
+        // voting on the older window, so folding per voter across windows is the whole point.
+        note_sealed_claim(W + 1, "c", 40);
+        assert_eq!(sealed_frontier_with_support(4), 40, "evidence follows the signer, not the window");
+        VOTER_SEALED_CLAIM.clear();
+    }
+}
+
 /// Shared by every test that reads or writes the process-global failover maps — the harness runs
 /// tests in parallel threads, and a sibling's `test_clear_timeout_state()` would otherwise wipe
 /// state mid-assertion.
@@ -1592,6 +1664,7 @@ pub(crate) static TEST_FAILOVER_STATE_LOCK: parking_lot::Mutex<()> = parking_lot
 
 #[cfg(test)]
 pub(crate) fn test_clear_timeout_state() {
+    VOTER_SEALED_CLAIM.clear();
     TIMEOUT_VOTES.clear();
     TIMEOUT_CERTIFICATES.clear();
     HIGHEST_CERTIFIED_ROUND.clear();

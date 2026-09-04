@@ -464,10 +464,7 @@ impl BlockchainNode {
     }
 
     pub(super) async fn create_eligible_producers_snapshot(
-        _p2p: &Arc<SimplifiedP2P>,
         consensus_participants: &[String],
-        _own_node_id: &str,
-        _own_node_type: NodeType,
         macroblock_index: u64,
         storage: &Storage,
         state_guard: &StateManager,
@@ -502,13 +499,18 @@ impl BlockchainNode {
             // Index unusable ⇒ abstain rather than shrink on a partial liveness view.
             None => return Vec::new(),
         };
+        let decidable = liveness_decidable_at(live_scan_end);
         let mut eligible: Vec<qnet_state::EligibleProducer> = consensus_participants.iter()
             .filter(|node_id| {
-                // Restart bar, checked before the genesis carve-out so a compromised genesis identity
-                // can also be retired.
+                // Restart bar first, so a compromised genesis identity can also be retired.
                 if crate::genesis_constants::restart_excludes(node_id) { return false; }
-                // Genesis stays: it is the bootstrap floor and the set must never collapse below it.
-                node_id.starts_with("genesis_node_") || live_now.contains(*node_id)
+                // Genesis is NOT carved out. Its standing is a floor on set SIZE (applied below), not
+                // permanent membership: an id that stops answering otherwise stays in the quorum
+                // denominator forever and raises the threshold for everyone still running. Re-entry is
+                // automatic and needs no re-registration — genesis holds an srtr_ row at reg_height 0,
+                // so one on-chain heartbeat readmits it through Phase-2A, which exempts height 0 from
+                // the activation warmup.
+                !decidable || live_now.contains(*node_id)
             })
             .map(|node_id| {
                 // reputation_map is 0–100; commit as centipercent u32 (×100, rounded) so the
@@ -617,12 +619,17 @@ impl BlockchainNode {
             // three separate analyses.
         }
 
-        // Genesis floor: the 5 canonical genesis producers stay permanently eligible, so a fork or
-        // quiet epoch that collapses the committed roster to one committer cannot degenerate the
-        // leader candidate set to len==1 (the mb-boundary production pin). Additive + deterministic.
+        // Genesis floor: a floor on set SIZE, not a membership grant. Below MIN_BFT_SET no Byzantine
+        // fault tolerance is left, and an empty set is the abstain sentinel that wedges the chain, so a
+        // collapsed roster is refilled from the canonical genesis ids in ascending order. At or above
+        // it the floor stays out of the way: padding the set with an id that is not answering only
+        // raises quorum(n) for the members that are. Additive + deterministic either way.
         {
             const GENESIS_FLOOR_REP_BP: u32 = 10000; // 100.00% centipercent, ≥ MIN_REPUTATION_BP
+            // Smallest n that still tolerates one Byzantine member: quorum(4) = 3.
+            const MIN_BFT_SET: usize = 4;
             for i in 1..=5u32 {
+                if eligible.len() >= MIN_BFT_SET { break; }
                 let gid = format!("genesis_node_{:03}", i);
                 // Never resurrect a slashed genesis. The reputation map is keyed on THIS window's
                 // participants, and a banned genesis leaves that set one window after the ban — from then

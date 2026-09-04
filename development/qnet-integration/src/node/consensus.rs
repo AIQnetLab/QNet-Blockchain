@@ -867,8 +867,7 @@ impl BlockchainNode {
                                         let eligible = {
                                             let st = state_cons.read().await;
                                             Self::create_eligible_producers_snapshot(
-                                                &p2p_cons, &ids, &node_id_cons, node_type, mb_idx,
-                                                &storage_cons, &st,
+                                                &ids, mb_idx, &storage_cons, &st,
                                             ).await
                                         };
                                         // Vec::new() is this snapshot's ABSTAIN sentinel (unusable heartbeat
@@ -1314,6 +1313,28 @@ impl BlockchainNode {
         // with a 1000-committee the wasted flood would be the dominant stall traffic.
         if !committee.contains(node_id) {
             return false;
+        }
+        // The FROZEN arm anchors on this node's OWN seal frontier, which is only the window's anchor
+        // while the network's finality is genuinely stalled. f+1 SIGNED committee claims above our own
+        // seal prove >=1 honest voter holds a macroblock we do not, so we are behind, not frozen: pull
+        // and abstain rather than mint a minority anchor. Restricted to the frozen arm — a sealed
+        // window's anchor is hash(mb[w-2]), a pure function of the window, and stays correct however
+        // far this node lags beyond it.
+        if let Some(s) = storage {
+            if matches!(Self::roster_mode(s, mb_index), RosterMode::Frozen) {
+                let own_seal = s.last_sealed_mb_index();
+                let peer_seal = crate::unified_p2p::sealed_frontier_with_support(
+                    committee.len().saturating_sub(1) / 3 + 1);
+                if peer_seal > own_seal {
+                    p2p.request_window_anchor(mb_index);
+                    crate::sync_manager::nudge_sync_check();
+                    if is_warn() {
+                        println!("[WARN][TIMEOUT] emit_deferred mb={} reason=behind_not_frozen own_seal={} peer_seal={} action=fetch",
+                                 mb_index, own_seal, peer_seal);
+                    }
+                    return false;
+                }
+            }
         }
         let anchor = match crate::unified_p2p::sealed_anchor_for_window(mb_index) {
             Some(a) => a,

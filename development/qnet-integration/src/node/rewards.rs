@@ -644,7 +644,14 @@ impl BlockchainNode {
                 // bitmaps live below its anchor). Returning a computed-from-nothing root would make it
                 // vote AGAINST every emission-window checkpoint; report no root instead so the caller
                 // defers.
-                let root_hex = match Self::compute_epoch_reward_root(storage, epoch, total, None) {
+                // PERSIST the shards here, not only on the producer. This recompute is the point where
+                // EVERY node derives the epoch's leaf set from the applied chain; the producer path was
+                // the only one passing Some(epoch), so the claim-serving structure was a by-product of
+                // authorship instead of a function of apply. On a 6-node net each node therefore held
+                // shards for ~1/6 of epochs and `wallet_claimable_qnc` — which stops at the first epoch
+                // it cannot serve — truncated the total differently on every node. The set is already
+                // computed in full right here, so persisting it costs the write and nothing else.
+                let root_hex = match Self::compute_epoch_reward_root(storage, epoch, total, Some(epoch)) {
                     Some((_count, _paid, r)) => r,
                     None => return None,
                 };

@@ -1213,8 +1213,20 @@ pub fn window_content_from_accum(mb_idx: u64) -> Option<Vec<[u8; 32]>> {
 /// whole non-genesis eligible set every epoch start. Pure fn of scan_end (the deterministic N-2 boundary,
 /// identical on every committee member — NOT the live tip), so it never diverges. The set feeds
 /// epoch_commitment→QC, so this MUST be a genesis rule, identical on every node. Pure ⇒ deterministic.
+/// Blocks per liveness subwindow. Heartbeat emission is spread across it by a per-node offset, so a
+/// silent node only becomes evidence of absence once a whole subwindow has closed.
+pub(crate) const HB_SUBWINDOW_BLOCKS: u64 = 1440;
+
+/// True iff the absence of a heartbeat is evidence at all. Emission is spread across a whole
+/// subwindow by a per-node offset, so before the first one closes a silent node is indistinguishable
+/// from one whose offset has simply not come up yet — shrinking there would eject the bootstrap set of
+/// a chain that is behaving perfectly. Pure fn of the deterministic snapshot boundary.
+pub(crate) fn liveness_decidable_at(live_scan_end: u64) -> bool {
+    live_scan_end >= HB_SUBWINDOW_BLOCKS
+}
+
 fn recency_subwindow_indices(scan_end: u64) -> (u64, u64) {
-    let cur_idx = scan_end / 1440;
+    let cur_idx = scan_end / HB_SUBWINDOW_BLOCKS;
     (cur_idx, cur_idx.saturating_sub(1))
 }
 
@@ -4473,6 +4485,9 @@ impl BlockchainNode {
                     println!("[WARN][CLEANUP] ephemeral_cleanup_failed err={}", e);
                 }
             }
+            // Reward shards, so a gap cannot outlive the process that opened it. Root-verified: an
+            // epoch is only healed when the rebuilt leaf-set hashes to the committed reward_root.
+            Self::backfill_reward_shards(&storage);
             // Macroblocks are never pruned on a Super (archival role), so their committee signatures
             // are the one store with no horizon. Strip them past the cold-join walk budget; the
             // checkpoint half every stored reader uses stays.
@@ -6127,6 +6142,24 @@ mod tests {
         assert!(!body.contains("canonical_hash_at"));
     }
 
+    // The reward shards are what a claim (and the pending figure the wallet shows) is served from, and
+    // `wallet_claimable_qnc` stops at the first epoch it cannot serve. So the structure has to exist on
+    // EVERY node, which means it has to be written where every node derives the leaf set — the window
+    // recompute — and not only on the emission block's producer. While the producer path was the sole
+    // writer, each node on a 6-node net held shards for ~1/6 of epochs and the six of them reported six
+    // different totals for the same wallet.
+    #[test]
+    fn the_window_recompute_persists_shards_on_every_node_not_just_the_producer() {
+        let src = include_str!("rewards.rs");
+        let f = src.find("pub(super) fn compute_window_reward").expect("window recompute");
+        let body = &src[f..(f + 4000).min(src.len())];
+        let call = body.find("compute_epoch_reward_root(storage, epoch, total,")
+            .expect("the window recompute must derive the epoch root");
+        let args = &body[call..(call + 120).min(body.len())];
+        assert!(args.contains("Some(epoch)"),
+                "the window recompute must PERSIST the shards it computes, not pass None");
+    }
+
     // A restart is only a REPAIR if the barred identities stay out. The eligible set is not a
     // carried-forward set that decays — `phase2a_eligible_additions` recomputes it every window as the
     // fixed point {registered AND recently-heartbeating}, so filtering only the carry-over would put
@@ -6134,26 +6167,27 @@ mod tests {
     // chain would re-halt on the same set within minutes. Both arms must enforce the bar.
     #[test]
     fn restart_bar_is_enforced_on_both_eligibility_arms() {
-        let src = &node_sources();
-        // Carry-over filter inside create_eligible_producers_snapshot.
-        let carry = src.find("// Restart bar, checked before the genesis carve-out")
+        // Anchored in the files the ARMS live in, never in node_sources(): that concatenation begins
+        // with mod.rs — this test's own source — so every anchor string matched its own literal, the
+        // guard was "found" in the assertion at the bottom of this very test, and the whole check
+        // passed without once looking at the arms.
+        let committee = include_str!("committee.rs");
+        let carry = committee.find("pub(super) async fn create_eligible_producers_snapshot")
+            .expect("carry-over arm");
+        let carry_body = &committee[carry..(carry + 6000).min(committee.len())];
+        let bar = carry_body.find("restart_excludes(")
             .expect("carry-over arm must check the restart bar");
-        // Re-admission arm inside phase2a_eligible_additions.
-        let readmit = src.find("// Restart bar, enforced here too")
-            .expect("Phase-2A re-admission arm must check the restart bar");
-        assert_ne!(carry, readmit);
-        // Each anchor must be followed by the guard itself, not just by a comment claiming it. Counting
-        // occurrences file-wide cannot work here: this test reads its own source, so its string
-        // literals would be counted too.
-        let guard_gap = |from: usize| src[from..].find("restart_excludes(")
-            .expect("the guard must appear after its own comment");
-        assert!(guard_gap(carry) < 800, "carry-over arm: comment without the guard next to it");
-        assert!(guard_gap(readmit) < 800, "Phase-2A arm: comment without the guard next to it");
+        // Ahead of the liveness predicate, so a compromised genesis identity is retired whether or not
+        // it is still answering — otherwise the set with the most authority is the only one a restart
+        // cannot clean.
+        let live = carry_body.find("live_now.contains").expect("liveness predicate");
+        assert!(bar < live, "the restart bar must precede the liveness predicate");
 
-        // The bar is checked BEFORE the genesis carve-out, so a compromised genesis identity can also
-        // be retired. Otherwise the set with the most authority is the one that can never be cleaned.
-        let genesis_carve = src.find("// Genesis stays: it is the bootstrap floor").expect("carve-out");
-        assert!(carry < genesis_carve, "the restart bar must precede the genesis carve-out");
+        let src = &node_sources();
+        let readmit = src.find("fn phase2a_eligible_additions").expect("Phase-2A arm");
+        let readmit_body = &src[readmit..(readmit + 2600).min(src.len())];
+        assert!(readmit_body.contains("restart_excludes("),
+                "Phase-2A re-admission arm must check the restart bar");
 
         // Inert in this binary: nothing is barred, so neither arm changes behaviour at genesis.
         assert!(!crate::genesis_constants::restart_active());
@@ -6317,6 +6351,92 @@ mod tests {
         // super_lowrep (floor), super_future (reg > scan_end), light_x (not in srtr_).
         let ids: Vec<&str> = got.iter().map(|p| p.node_id.as_str()).collect();
         assert_eq!(ids, vec!["genesis_node_001", "super_a", "super_c"]);
+    }
+
+    /// Seed `storage` with the 5 genesis (reg_height 0) plus two supers, and an on-chain heartbeat for
+    /// every id in `live`. Returns the participant list the snapshot carries forward.
+    #[cfg(test)]
+    fn seed_liveness_fixture(storage: &crate::storage::Storage, scan_end: u64, live: &[&str]) -> Vec<String> {
+        let all: Vec<String> = (1..=5u32).map(|i| format!("genesis_node_{:03}", i))
+            .chain(["super_a".to_string(), "super_b".to_string()]).collect();
+        for id in &all {
+            let reg_h = if id.starts_with("genesis_node_") { 0 } else { 100 };
+            storage.save_node_registration_at_height(id, "super", &format!("w_{}", id), 90.0, reg_h).unwrap();
+        }
+        let (cur, _prev) = recency_subwindow_indices(scan_end);
+        let anchor_h = cur * HB_SUBWINDOW_BLOCKS + 10;
+        for id in live {
+            storage.index_heartbeat_inclusion(id, anchor_h, anchor_h + 5).unwrap();
+        }
+        all
+    }
+
+    // quorum(n) = n - (n-1)/3 is taken over the eligible set, so an id that stops answering and never
+    // leaves raises the threshold every survivor has to clear. Genesis used to be carved out of the
+    // shrink by literal prefix, which made the five identities with the most authority the only ones
+    // the mechanism could not touch — the 169830 shape, where one dead genesis held n=6 at a 5-vote bar.
+    #[tokio::test]
+    async fn a_silent_genesis_leaves_the_quorum_denominator() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage");
+        let st = qnet_state::State::new();
+        let mb: u64 = 200; // scan_end 18_000 — far past the first closed subwindow
+        let live = ["genesis_node_001", "genesis_node_003", "genesis_node_004",
+                    "genesis_node_005", "super_a", "super_b"];
+        let all = seed_liveness_fixture(&storage, mb * 90, &live);
+
+        let got = BlockchainNode::create_eligible_producers_snapshot(&all, mb, &storage, &st).await;
+        let ids: Vec<&str> = got.iter().map(|p| p.node_id.as_str()).collect();
+        assert!(!ids.contains(&"genesis_node_002"), "silent genesis must leave the set: {:?}", ids);
+        assert_eq!(ids.len(), live.len(), "every answering member stays: {:?}", ids);
+    }
+
+    // Emission is spread across a whole subwindow by a per-node offset, so before the first one closes
+    // a silent node is indistinguishable from one whose offset has not come up yet. Shrinking there
+    // would eject the whole bootstrap set of a chain that is behaving perfectly.
+    #[test]
+    fn silence_is_not_evidence_before_the_first_subwindow_closes() {
+        assert!(!liveness_decidable_at(0), "genesis boundary carries no liveness evidence");
+        assert!(!liveness_decidable_at(HB_SUBWINDOW_BLOCKS - 1), "first subwindow still open");
+        assert!(liveness_decidable_at(HB_SUBWINDOW_BLOCKS), "one closed subwindow is evidence");
+    }
+
+    // Rolling-upgrade safety, verified rather than assumed: while every member is answering, the new
+    // rule and the legacy carve-out select the SAME set — the shrink drops nobody and the floor adds
+    // nobody — so a half-upgraded fleet cannot diverge on epoch_commitment.
+    #[tokio::test]
+    async fn a_fully_live_fleet_selects_the_same_set_the_legacy_rule_did() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage");
+        let st = qnet_state::State::new();
+        let mb: u64 = 200;
+        let live = ["genesis_node_001", "genesis_node_002", "genesis_node_003", "genesis_node_004",
+                    "genesis_node_005", "super_a", "super_b"];
+        let all = seed_liveness_fixture(&storage, mb * 90, &live);
+
+        let got = BlockchainNode::create_eligible_producers_snapshot(&all, mb, &storage, &st).await;
+        let ids: Vec<String> = got.iter().map(|p| p.node_id.clone()).collect();
+        let mut want = all.clone();
+        want.sort();
+        assert_eq!(ids, want, "a live fleet is unchanged by the rule — mixed versions agree");
+    }
+
+    // The genesis floor is a floor on SET SIZE, not a membership grant: it refills a collapsed roster
+    // to the smallest n that still tolerates one Byzantine member, and stops there. Padding past that
+    // with ids that are not answering only raises quorum(n) for the ones that are.
+    #[tokio::test]
+    async fn the_floor_refills_a_collapsed_set_and_stops_at_the_bft_minimum() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage");
+        let st = qnet_state::State::new();
+        let mb: u64 = 200;
+        let all = seed_liveness_fixture(&storage, mb * 90, &[]); // nobody answers
+
+        let got = BlockchainNode::create_eligible_producers_snapshot(&all, mb, &storage, &st).await;
+        let ids: Vec<&str> = got.iter().map(|p| p.node_id.as_str()).collect();
+        assert_eq!(ids, vec!["genesis_node_001", "genesis_node_002",
+                             "genesis_node_003", "genesis_node_004"],
+                   "collapsed set refills from the canonical genesis ids, ascending, and stops at 4");
     }
 
     // Light-reward roster cutoff. light_reg_epoch_roster is genesis-active (gate=0) for a fresh genesis,

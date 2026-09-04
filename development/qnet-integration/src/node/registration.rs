@@ -1119,11 +1119,20 @@ impl BlockchainNode {
         let start = epochs.len().saturating_sub(WINDOW);
         let mut healed = 0u32;
         for &epoch in &epochs[start..] {
-            if storage.load_epoch_shard_meta(epoch).ok().flatten().is_some() { continue; }
             let (committed_root, ctotal) = match storage.load_epoch_root(epoch) {
                 Ok(Some(r)) if r != [0u8; 32] => (hex::encode(r), crate::reward_epoch::canonical_total(epoch)),
                 _ => continue, // no root here yet, or the epoch distributed nothing
             };
+            // PRESENT is not CORRECT. A shard set that no longer recombines to the certified root serves
+            // nothing — reward_proof_from_shard returns Divergent and wallet_claimable_qnc stops there —
+            // so skipping on mere presence would leave that epoch truncated for the life of the node.
+            // Same O(K) recombine the read path performs, once an hour per epoch.
+            let healthy = storage.load_epoch_shard_meta(epoch).ok().flatten()
+                .map_or(false, |(roots, bounds)| {
+                    !roots.is_empty() && bounds.len() == roots.len()
+                        && hex::encode(qnet_core::crypto::merkle::merkle_continue_root(&roots)) == committed_root
+                });
+            if healthy { continue; }
             let w = Self::compute_epoch_reward_distribution(storage, epoch, ctotal)
                 .map(|x| x.0).unwrap_or_default();
             if !w.is_empty() && Self::epoch_reward_merkle_root(&w, epoch) == committed_root {

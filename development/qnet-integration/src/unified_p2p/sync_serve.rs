@@ -1781,6 +1781,9 @@ impl SimplifiedP2P {
             if FOREIGN_ANCHOR_WITNESSES.get(&(height, anchor_arr))
                 .map(|s| s.contains(&voter_id)).unwrap_or(false) { return; }
             if !self.verify_timeout_vote_signature(&voter_id, &vote_msg, &signature) { return; }
+            // Authenticated. Record the signed seal claim BEFORE the anchor verdict — a vote dropped
+            // for an unresolvable anchor still proves what its signer has sealed.
+            note_sealed_claim(height, &voter_id, high_qc_idx);
             anchor_resolves_for_window(height, &anchor_arr)
         };
         match if admitted { Some(anchor_arr) } else { local_anchor_opt } {
@@ -1831,6 +1834,8 @@ impl SimplifiedP2P {
                 println!("[WARN][TIMEOUT] vote_sig_invalid h={} voter={}", height, voter_id);
             }
             return;
+        } else {
+            note_sealed_claim(height, &voter_id, high_qc_idx);
         }
 
         if TIMEOUT_CERTIFICATES.contains_key(&(height, timeout_round)) {

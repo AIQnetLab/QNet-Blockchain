@@ -358,6 +358,44 @@ pub(super) async fn handle_account_transactions(
     }
 }
 
+/// GET /api/v1/account/{address}/node-events — the wallet's node lifecycle, read from the permanent
+/// registry rather than the tx index.
+///
+/// The registration TX itself is pruned with every other transaction below TX_INDEX_RETENTION_BLOCKS,
+/// so a wallet whose only history is its own node activation goes blank about a day after activating.
+/// The `node_<id>` registry row is kept for the life of the chain and is snapshot-bound, so it answers
+/// the same question without keeping 5.5 KB of Dilithium-signed TX per node forever.
+///
+/// `timestamp` is the registering block's own, and 0 once that body has been pruned — the height is
+/// always exact, so a client renders the height and uses the timestamp only when it is real.
+pub(super) async fn handle_account_node_events(
+    address: String,
+    remote_addr: Option<std::net::SocketAddr>,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    if let Err(r) = check_api_rate_limit(remote_addr, "read_only") { return Ok(r); }
+    if address.len() > 128 {
+        return Ok(warp::reply::json(&json!({"error": "Invalid address"})));
+    }
+    let storage = blockchain.get_storage();
+    let events: Vec<serde_json::Value> = storage.wallet_node_records(&address).unwrap_or_default()
+        .into_iter()
+        .map(|(node_id, node_type, height, burn_tx)| {
+            let timestamp = storage.load_microblock_auto_format(height).ok().flatten()
+                .map(|b| b.timestamp).unwrap_or(0);
+            json!({
+                "type": "node_activation",
+                "node_id": node_id,
+                "node_type": node_type,
+                "height": height,
+                "timestamp": timestamp,
+                "burn_tx": burn_tx,
+            })
+        })
+        .collect();
+    Ok(warp::reply::json(&json!({ "address": address, "count": events.len(), "events": events })))
+}
+
 #[derive(Debug, serde::Deserialize)]
 pub(super) struct TokenTransfersQuery {
     pub(super) limit: Option<usize>,

@@ -289,6 +289,39 @@ impl Storage {
         Ok(vec![(id, node_type, reputation)])
     }
 
+    /// Every node identity this wallet owns, with the permanent registry facts a client needs to render
+    /// its own node lifecycle: (node_id, node_type, reg_height, burn_tx). Unlike `resolve_node_id` this
+    /// returns ALL matches — one wallet can hold a Super and a Light identity at once — and it reads only
+    /// the `node_<id>` row, which is retained for the life of the chain, so the answer survives the
+    /// tx-index retention that removes the registration TX itself.
+    pub fn wallet_node_records(&self, wallet: &str) -> IntegrationResult<Vec<(String, String, u64, String)>> {
+        let cf = self.persistent.db.cf_handle("node_registry")
+            .ok_or_else(|| IntegrationError::StorageError("node_registry column family not found".to_string()))?;
+        let mut cands: Vec<String> = Vec::with_capacity(3);
+        for (id, w) in crate::genesis_constants::GENESIS_WALLETS {
+            if *w == wallet { cands.push(format!("genesis_node_{}", id)); break; }
+        }
+        cands.push(crate::rpc::generate_super_node_pseudonym(wallet));
+        cands.push(crate::rpc::generate_light_node_pseudonym(wallet));
+        let mut out = Vec::new();
+        for id in cands {
+            let raw = match self.persistent.db.get_cf(&cf, format!("node_{}", id).as_bytes()) {
+                Ok(Some(v)) => v,
+                _ => continue,
+            };
+            let p: serde_json::Value = match serde_json::from_slice(&raw) { Ok(v) => v, Err(_) => continue };
+            // Chain-confirmed only: an RPC/discovery cache row carries no reg_height and is not an event.
+            let h = match p["reg_height"].as_u64() { Some(h) => h, None => continue };
+            out.push((
+                id,
+                p["node_type"].as_str().unwrap_or("").to_string(),
+                h,
+                p["burn_tx"].as_str().unwrap_or("").to_string(),
+            ));
+        }
+        Ok(out)
+    }
+
     /// Derive the wallet's candidate node ids (pure functions of the wallet: genesis constant map, else
     /// super_node_<h> / light_mobile_<h>) and return the first whose node_<id> row exists. Recomputed
     /// identically on every node — resolution never reads a mutable, race-able reverse slot.

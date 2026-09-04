@@ -55,7 +55,14 @@ test('a tampered balance breaks the fold', () => {
   expect(smtFold(bad, addrHash, vector.proof, vector.state_root, sha3_256)).toBe(false);
 });
 
+// The positional flag of every TREE step is pinned to the key's own bits, so flipping one must be
+// refused before a single hash is computed. Indexed from the end: the proof is 40 tree steps plus
+// however many in-bucket steps this key needs, and only the tree steps carry the rule. (This flipped
+// index 250 of a 40-entry proof, so `map` never reached it and the assertion ran against an untouched
+// proof — the test could only ever fail, and it proved nothing when it did.)
 test('a flipped is_right bit is rejected before hashing', () => {
-  const tampered = vector.proof.map((p, i) => (i === 250 ? { ...p, is_right: !p.is_right } : p));
+  const at = vector.proof.length - 1;
+  const tampered = vector.proof.map((p, i) => (i === at ? { ...p, is_right: !p.is_right } : p));
+  expect(tampered[at].is_right).not.toBe(vector.proof[at].is_right);
   expect(smtFold(leaf, addrHash, tampered, vector.state_root, sha3_256)).toBe(false);
 });

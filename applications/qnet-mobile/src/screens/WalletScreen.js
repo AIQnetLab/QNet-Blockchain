@@ -140,6 +140,40 @@ function TxCoinMark({ token }) {
 const CANONICAL_BURN_ADDR = '0000000000000000000eon00000000000000036877022';
 
 const TxRow = React.memo(function TxRow({ tx, onCopy, hideAmounts }) {
+  // Node lifecycle row. Sourced from the permanent node registry, not the tx index — the registration
+  // TX is pruned with all other transactions after ~28 h, which is why a wallet whose only history was
+  // its own activation went blank. Carries no amount and no counterparty, so it renders its own way.
+  if (tx.nodeEvent) {
+    const d = tx.timestamp ? new Date(tx.timestamp) : null;
+    const p = (n) => String(n).padStart(2, '0');
+    const when = d
+      ? `${p(d.getDate())}.${p(d.getMonth() + 1)}.${d.getFullYear()}, ${p(d.getHours())}:${p(d.getMinutes())}`
+      : `Block ${tx.height}`;
+    return (
+      <TouchableOpacity
+        style={{ backgroundColor: '#16213e', borderRadius: 12, padding: 16, marginBottom: 12, borderWidth: 1, borderColor: '#1a1a2e' }}
+        onPress={() => onCopy(tx.nodeId)}
+      >
+        <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+          {/* No icon: the transfer rows carry an arrow because it encodes DIRECTION, and an activation
+              has none — no amount, no counterparty, nothing for a glyph to say. */}
+          <View>
+            <Text style={{ color: '#fff', fontSize: 16, fontWeight: '600' }}>Node activated</Text>
+            <Text style={{ color: '#666', fontSize: 12 }}>{when}</Text>
+          </View>
+          <Text style={{ color: '#00d4ff', fontSize: 14, fontWeight: '600' }}>
+            {tx.nodeType ? tx.nodeType.charAt(0).toUpperCase() + tx.nodeType.slice(1) : 'Node'}
+          </Text>
+        </View>
+        <View style={{ borderTopWidth: 1, borderTopColor: '#1a1a2e', paddingTop: 8 }}>
+          <Text style={{ color: '#888', fontSize: 11 }}>
+            {'Node: '}
+            <Text style={{ color: '#00d4ff', fontFamily: 'monospace' }}>{tx.nodeId}</Text>
+          </Text>
+        </View>
+      </TouchableOpacity>
+    );
+  }
   const isSend = tx.type === 'send';
   // Burn: a success-gated token burn event (kind), or a native/token transfer to the burn address.
   const isBurn = tx.tokenKind === 'burn' || (typeof tx.to === 'string' && tx.to === CANONICAL_BURN_ADDR);
@@ -338,6 +372,10 @@ const WalletScreen = () => {
   // adding it self-retriggers); a ref gives stale closures the current value without touching deps.
   const nodePseudonymRef = useRef(nodePseudonym);
   useEffect(() => { nodePseudonymRef.current = nodePseudonym; }, [nodePseudonym]);
+  // Same reason as above: the foreground handler is installed with [wallet, password] deps, so it must
+  // read the CURRENT tab and node type through refs or it would refresh whatever was open at mount.
+  const activeTabRef = useRef('assets');
+  const activatedNodeTypeRef = useRef(null);
   const [showActivationInput, setShowActivationInput] = useState(false); // Show activation code input modal
   const [activationInputCode, setActivationInputCode] = useState(''); // Input activation code
   const [lightNodeStatus, setLightNodeStatus] = useState(null); // Light node network status
@@ -1008,7 +1046,20 @@ const WalletScreen = () => {
       }
       // B: reactivation = self-attest. A forced self-attest records this-epoch eligibility on-chain, which
       // IS the return — no separate reactivate endpoint. Also refresh the FCM token (may have changed offline).
-      const attested = await selfAttestIfNeeded(nodePseudonym, true);
+      //
+      // Resolve the node id through every source before attesting. `nodePseudonym` is state loaded from
+      // `node_pseudonym_<code>`, which the Recover-Code and seed-restore paths never write, and
+      // selfAttestIfNeeded's own fallback is `qnet_ping_node_id`, written inside the best-effort ping
+      // delegation block. With both missing the button reported "could not attest" while the authoritative
+      // id sat in `qnet_light_node_info` — the very record read two lines above.
+      let attestId = nodePseudonymRef.current || nodePseudonym;
+      if (!attestId) {
+        try {
+          const ni = JSON.parse(localInfo || '{}');
+          attestId = ni.nodeId || (await AsyncStorage.getItem('qnet_ping_node_id')) || '';
+        } catch (_) { /* fall through to the empty id — selfAttestIfNeeded fails closed */ }
+      }
+      const attested = await selfAttestIfNeeded(attestId, true);
       if (attested) {
         try {
           const nodeInfoStr = await AsyncStorage.getItem('qnet_light_node_info');
@@ -1950,6 +2001,9 @@ const WalletScreen = () => {
     }
   }, [wallet, isTestnet, selectedNetwork, activeTab]); // Reload on any network or tab change
 
+  useEffect(() => { activeTabRef.current = activeTab; }, [activeTab]);
+  useEffect(() => { activatedNodeTypeRef.current = activatedNodeType; }, [activatedNodeType]);
+
   // v3.35: Auto-refresh TX history when on History tab
   // Without this, TX history only refreshes on manual pull-to-refresh or tab click
   // With WebSocket fix (NewBlock events), most updates come via WS,
@@ -2055,7 +2109,26 @@ const WalletScreen = () => {
         }
       } catch (_) { /* silent */ }
 
-      // ── 2. FCM token auto-refresh (debounced, lightweight) ──
+      // ── 2. Refresh what is ON SCREEN. Coming back from background (screen unlock included) left the
+      //       UI on pre-background state: node status polls every 30 s and the history poll only runs
+      //       while the History tab is already open, so an activated node and its transactions both
+      //       appeared "missing" for seconds after every unlock. Fire the same loads the tab's own
+      //       pull-to-refresh would, without the spinner.
+      try {
+        const tab = activeTabRef.current;
+        const nodeType = activatedNodeTypeRef.current;
+        const jobs = [];
+        if (tab === 'history' && wallet?.qnetAddress) jobs.push(loadTxHistory());
+        if (tab === 'assets' && wallet?.publicKey) jobs.push(loadBalance(wallet.publicKey));
+        if (tab === 'node') {
+          jobs.push(loadAllUserNodes());
+          if (nodeType === 'light') jobs.push(loadLightNodeStatus());
+          if (nodeType) jobs.push(loadServerNodeStatus());
+        }
+        await Promise.all(jobs.map(p => Promise.resolve(p).catch(() => {})));
+      } catch (_) { /* a refresh failure must never block the token refresh below */ }
+
+      // ── 3. FCM token auto-refresh (debounced, lightweight) ──
       try {
         const needed = await isTokenRefreshNeeded();
         if (!needed) return;
@@ -3085,6 +3158,15 @@ const WalletScreen = () => {
         { method: 'GET', headers: { 'Content-Type': 'application/json' }, signal: controller.signal }
       ).finally(() => clearTimeout(t));
       const tokenEventsPromise = walletManager.getAccountTokenTransfers(wallet.qnetAddress, 50);
+      // Node lifecycle, from the registry rather than the tx index: the registration TX is pruned with
+      // every other transaction below the node's retention horizon, so this is the only feed that still
+      // has the wallet's own activation a day after it happened.
+      const nodeEventsCtl = new AbortController();
+      const nodeEventsT = setTimeout(() => nodeEventsCtl.abort(), 5000);
+      const nodeEventsPromise = fetch(
+        `${apiUrl}/api/v1/account/${wallet.qnetAddress}/node-events`,
+        { method: 'GET', headers: { 'Content-Type': 'application/json' }, signal: nodeEventsCtl.signal }
+      ).then(r => (r.ok ? r.json() : null)).catch(() => null).finally(() => clearTimeout(nodeEventsT));
 
       // Token rows first: node-decoded QRC-20/721 events, metadata embedded per row (no metadata fetch).
       // u64 amounts stay STRINGS. Direction: 'receive' iff the tokens land on me and I'm not the sender.
@@ -3162,9 +3244,27 @@ const WalletScreen = () => {
           }));
       }
 
+      // Lifecycle rows. Sorted in with the rest by timestamp; a pruned block body leaves timestamp 0,
+      // and the row then shows its block height instead of a date rather than claiming "Genesis".
+      const nodeEventsData = await nodeEventsPromise;
+      const nodeEventTxs = ((nodeEventsData && nodeEventsData.events) || []).map(ev => ({
+        hash: `node:${ev.node_id}`,
+        nodeEvent: true,
+        nodeId: ev.node_id,
+        nodeType: ev.node_type,
+        height: ev.height,
+        from: myAddress,
+        to: null,
+        amount: 0,
+        fee: 0,
+        status: 'confirmed',
+        timestamp: (ev.timestamp || 0) * 1000,
+        type: 'receive',
+      }));
+
       // Merge + sort newest-first so native + token rows interleave chronologically (a native Transfer
       // and a token event never share a hash, so no further dedup is needed).
-      const formattedTxs = [...nativeTxs, ...tokenTxs]
+      const formattedTxs = [...nativeTxs, ...tokenTxs, ...nodeEventTxs]
         .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
 
       // MERGE with pending TXs instead of replacing, but ONLY pending sent from THIS wallet —
