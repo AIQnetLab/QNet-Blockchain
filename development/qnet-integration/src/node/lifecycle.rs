@@ -1747,9 +1747,23 @@ impl BlockchainNode {
             }
         }
 
+        // Settle-point index first — it is the INPUT the shard heal below rebuilds from, and the one
+        // write in this chain that gets a single block per epoch and no retry. A node that was catching
+        // up across that block heals here instead of carrying the gap for the life of its database.
+        {
+            let boot_h = blockchain.storage.get_chain_height().unwrap_or(0);
+            let sm = blockchain.get_state_manager();
+            let st = sm.read().await;
+            crate::node::BlockchainNode::backfill_settle_indices(&st, &blockchain.storage, boot_h);
+            crate::node::BlockchainNode::backfill_light_recency(&blockchain.storage, boot_h);
+        }
+
         // Heal any reward epoch holding a certified root but an Absent local shard (freeze-race / snapshot
         // join) so pending/claim serve the certified amount identically to a from-genesis node.
         let _ = crate::node::BlockchainNode::backfill_reward_shards(&blockchain.storage);
+        // Anything the local rebuild could not reproduce — its inputs are gone — is pulled from a peer
+        // and accepted only against this node's own certified root.
+        crate::node::BlockchainNode::repair_unservable_reward_epochs(&blockchain.storage).await;
 
         // Rebuild the committed burn→wallet index (cbw) from node_registry at boot: migrates a pre-cbw
         // DB and self-heals a stale cbw left by a crash mid-reorg. Unconditional but super-scoped

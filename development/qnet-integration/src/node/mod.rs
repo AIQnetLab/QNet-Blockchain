@@ -4472,6 +4472,19 @@ impl BlockchainNode {
             }
         }
 
+        // Settle-point index first: the shard heal below needs it as INPUT, and it is the write that has
+        // no retry of its own. Short read lock, one index probe when nothing is missing.
+        {
+            let sm = self.get_state_manager();
+            let st = sm.read().await;
+            Self::backfill_settle_indices(&st, &self.storage, current_height);
+        }
+        // Same shape, and it decides what the wallet shows about a light node being online.
+        Self::backfill_light_recency(&self.storage, current_height);
+        // Whatever could not be rebuilt from local inputs is pulled from a peer and accepted only
+        // against this node's own certified root — the one repair that works after the inputs are gone.
+        Self::repair_unservable_reward_epochs(&self.storage).await;
+
         // The RocksDB sweep is multi-second synchronous FFI (measured 3-6s, and it grows
         // with the database). Awaiting it on the consensus runtime stalls block apply and
         // starves the producer watchdog, which then reports the node as silent.
@@ -6140,6 +6153,79 @@ mod tests {
         let body = &src[f..f + 1400];
         assert!(body.contains("get_macroblock_by_height(w - 2)"));
         assert!(!body.contains("canonical_hash_at"));
+    }
+
+    // The settle-point index gets ONE block per epoch and no retry, so a node catching up across that
+    // block never obtains it — and then cannot rebuild the epoch's shards, which truncates the claimable
+    // figure it reports for every wallet. Pin that the miss is recovered while the epoch is still
+    // derivable, and that a present index is left alone (the hourly pass must cost one probe).
+    #[tokio::test]
+    async fn a_missed_settle_index_is_re_derived_while_its_epoch_is_still_in_reach() {
+        const EPOCH: u64 = 14_400;
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage");
+        let st = qnet_state::State::new();
+
+        let finalized = 1u64;                       // still derivable while the chain is inside epoch 2
+        let h = (finalized + 1) * EPOCH + 500;
+
+        let sid = crate::rpc::generate_super_node_pseudonym("w1");
+        storage.save_node_registration_at_height(&sid, "super", "w1", 90.0, 100).unwrap();
+        let mut acct = qnet_state::Account::default();
+        acct.heartbeat_final_epoch = finalized;
+        acct.heartbeat_final_slots = 0x03FF;        // 10 of 10 subwindows ⇒ clears the >=9 bar
+        st.accounts.insert(sid.clone(), acct);
+
+        assert!(storage.load_super_eligible(finalized).unwrap().is_empty(), "index starts missing");
+        assert_eq!(BlockchainNode::backfill_settle_indices(&st, &storage, h), 1, "the miss must heal");
+        assert_eq!(storage.load_super_eligible(finalized).unwrap(), vec![sid], "recovered set");
+        assert_eq!(BlockchainNode::backfill_settle_indices(&st, &storage, h), 0, "present ⇒ untouched");
+    }
+
+    // A node whose local inputs for an epoch are gone can still recover it — from a PEER, accepted only
+    // when the assembled set hashes to the reward_root its own certified macroblock carries. Pin the
+    // targeting (an epoch with a root but no servable shards is exactly where the claim figure stops)
+    // and the gate (a set that is not the certified one cannot produce the certified root).
+    #[test]
+    fn an_unservable_epoch_is_targeted_and_only_the_certified_set_can_repair_it() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage");
+        let epoch = 320u64;
+
+        let good: Vec<(String, u64)> = vec![("wa".to_string(), 10), ("wb".to_string(), 20)];
+        let root = BlockchainNode::epoch_reward_merkle_root(&good, epoch);
+        let mut rb = [0u8; 32];
+        rb.copy_from_slice(&hex::decode(&root).expect("hex root"));
+        storage.seed_epoch_root_for_test(epoch, rb);
+
+        assert_eq!(BlockchainNode::unservable_reward_epochs(&storage, 4), vec![(epoch, root.clone())],
+                   "a certified root with no servable shards is the repair target");
+
+        let tampered: Vec<(String, u64)> = vec![("wa".to_string(), 11), ("wb".to_string(), 20)];
+        assert_ne!(BlockchainNode::epoch_reward_merkle_root(&tampered, epoch), root,
+                   "one altered amount must not reproduce the certified root");
+
+        BlockchainNode::save_epoch_reward_sharded(&storage, epoch, &good);
+        assert!(BlockchainNode::unservable_reward_epochs(&storage, 4).is_empty(),
+                "the genuine set clears the target");
+    }
+
+    // The light recency index is written on one block per epoch, and its ABSENCE is read as "did not
+    // attest" — so a node that missed that block tells the wallet a live light client is offline. Pin
+    // that the miss heals, and that a quiet epoch (nobody attested, legitimately empty) is marked
+    // derived so the O(roster) scan is not repeated for the life of the node.
+    #[test]
+    fn a_missed_light_recency_snapshot_heals_and_a_quiet_epoch_is_not_rescanned() {
+        const EPOCH: u64 = 14_400;
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage");
+        let h = 6 * EPOCH; // the verdict reads epochs 5 and 4
+
+        assert!(!storage.light_elig_derived(5), "starts underived");
+        assert_eq!(BlockchainNode::backfill_light_recency(&storage, h), 2, "both read epochs heal");
+        assert!(storage.light_elig_derived(5) && storage.light_elig_derived(4), "marked derived");
+        assert_eq!(BlockchainNode::backfill_light_recency(&storage, h), 0,
+                   "a derived — even if empty — epoch must never be rescanned");
     }
 
     // The reward shards are what a claim (and the pending figure the wallet shows) is served from, and

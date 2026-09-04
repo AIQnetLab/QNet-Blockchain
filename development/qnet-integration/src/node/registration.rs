@@ -1106,6 +1106,174 @@ impl BlockchainNode {
         }
     }
 
+    /// Epochs holding a certified reward_root that this node cannot serve — exactly where
+    /// `wallet_claimable_qnc` stops and starts under-reporting every wallet. Newest first, bounded.
+    pub(crate) fn unservable_reward_epochs(storage: &crate::storage::Storage, max: usize) -> Vec<(u64, String)> {
+        let mut epochs = storage.reward_epochs_from(0).unwrap_or_default();
+        epochs.reverse();
+        let mut out = Vec::new();
+        for &epoch in epochs.iter() {
+            let root = match storage.load_epoch_root(epoch) {
+                Ok(Some(r)) if r != [0u8; 32] => hex::encode(r),
+                _ => continue, // absent, or an epoch that certifiably distributed nothing
+            };
+            let servable = storage.load_epoch_shard_meta(epoch).ok().flatten()
+                .map_or(false, |(roots, bounds)| {
+                    !roots.is_empty() && bounds.len() == roots.len()
+                        && hex::encode(qnet_core::crypto::merkle::merkle_continue_root(&roots)) == root
+                });
+            if !servable { out.push((epoch, root)); }
+            if out.len() >= max { break; }
+        }
+        out
+    }
+
+    /// Pull one epoch's reward leaf-set from a peer, shard by shard.
+    async fn fetch_epoch_leafset(base: &str, epoch: u64) -> Option<Vec<(String, u64)>> {
+        // Hard ceiling on what a peer can make this node allocate. One entry per recipient, so this is
+        // twice the 10M-light target and still refuses an unbounded stream.
+        const MAX_LEAVES: usize = 20_000_000;
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10)).build().ok()?;
+        let mut all: Vec<(String, u64)> = Vec::new();
+        let mut shard = 0usize;
+        loop {
+            let url = format!("{}/api/v1/rewards/epoch/{}/leafset?shard={}", base, epoch, shard);
+            let v: serde_json::Value = client.get(&url).send().await.ok()?.json().await.ok()?;
+            let shards = v["shards"].as_u64().unwrap_or(0) as usize;
+            if shards == 0 { return None; } // that peer cannot serve it either
+            for w in v["wallets"].as_array()? {
+                let a = w.as_array()?;
+                all.push((a.first()?.as_str()?.to_string(), a.get(1)?.as_u64()?));
+            }
+            if all.len() > MAX_LEAVES { return None; }
+            shard += 1;
+            if shard >= shards { break; }
+        }
+        Some(all)
+    }
+
+    /// Rebuild epochs this node cannot serve by fetching their leaf-set from a peer.
+    ///
+    /// The peer is NOT trusted: the assembled set is accepted only when it hashes to the reward_root
+    /// this node's own QC-certified macroblock carries, which is the same gate the local rebuild passes
+    /// through. That is what makes a repair possible at all for an epoch whose local inputs are gone —
+    /// the account tallies a rebuild reads are overwritten one epoch later, so a node that was catching
+    /// up across an epoch settle could otherwise never recover it, and would under-report every wallet
+    /// for the life of its database.
+    ///
+    /// Bounded per pass and run off the hot path; a peer that answers wrongly simply fails the check.
+    pub(crate) async fn repair_unservable_reward_epochs(storage: &crate::storage::Storage) -> u32 {
+        const PER_PASS: usize = 2;
+        let targets = Self::unservable_reward_epochs(storage, PER_PASS);
+        if targets.is_empty() { return 0; }
+        // Correctness comes from the root check below, never from WHO answered, so any reachable node
+        // is a valid source. The well-known set is simply the one every node can address.
+        let self_idx = std::env::var("QNET_BOOTSTRAP_ID").ok()
+            .and_then(|id| id.parse::<usize>().ok()).map(|n| n.saturating_sub(1));
+        let mut healed = 0u32;
+        for (epoch, committed_root) in targets {
+            for (i, (ip, _)) in crate::genesis_constants::GENESIS_NODE_IPS.iter().enumerate() {
+                if self_idx == Some(i) { continue; }
+                let base = format!("http://{}:8001", ip);
+                let set = match Self::fetch_epoch_leafset(&base, epoch).await {
+                    Some(s) if !s.is_empty() => s,
+                    _ => continue,
+                };
+                if Self::epoch_reward_merkle_root(&set, epoch) != committed_root {
+                    if is_warn() {
+                        println!("[WARN][REWARDS] epoch_repair_rejected epoch={} peer={} reason=root_mismatch",
+                                 epoch, ip);
+                    }
+                    continue;
+                }
+                Self::save_epoch_reward_sharded(storage, epoch, &set);
+                healed += 1;
+                println!("[INFO][REWARDS] epoch_repaired_from_peer epoch={} peer={} recipients={}",
+                         epoch, ip, set.len());
+                break;
+            }
+        }
+        healed
+    }
+
+    /// Re-derive `super_elig_` for the epoch still inside its validity window.
+    ///
+    /// The index is written at exactly ONE block per epoch (`h % 14400 == HB_ANCHOR_MAX_LAG`) with no
+    /// retry, so a node that is catching up when that single block applies never obtains it — and then
+    /// cannot rebuild the epoch's reward shards, which makes `wallet_claimable_qnc` stop there and
+    /// under-report every wallet, permanently and silently.
+    ///
+    /// The set stays derivable for the whole epoch that FOLLOWS it: `compute_super_eligible_for_epoch`
+    /// reads account tallies that only roll at the next boundary. So exactly one epoch is recoverable at
+    /// any moment, and a periodic pass recovers a missed write while recovery is still possible. Older
+    /// gaps are beyond reach here — `backfill_reward_shards` reports them as `epoch_rebuild_no_inputs`.
+    ///
+    /// Costs one index probe when nothing is missing, which is the normal case.
+    pub(crate) fn backfill_settle_indices(
+        state_guard: &StateManager,
+        storage: &crate::storage::Storage,
+        current_height: u64,
+    ) -> u32 {
+        const EPOCH_BLOCKS: u64 = 14400;
+        if current_height < EPOCH_BLOCKS { return 0; }
+        let finalized_epoch = current_height / EPOCH_BLOCKS - 1;
+
+        // An empty index while supers ARE registered is "this node never wrote it", not "nobody cleared
+        // the bar" — the same distinction gather_epoch_reward_sets draws. Re-derive only then, and save
+        // only a non-empty result, so a genuinely empty epoch is never rewritten.
+        let missing = storage.load_super_eligible(finalized_epoch).map(|v| v.is_empty()).unwrap_or(false)
+            && storage.super_registrations_as_of(current_height).map(|s| !s.is_empty()).unwrap_or(false);
+        if !missing { return 0; }
+
+        let eligible = match Self::compute_super_eligible_for_epoch(state_guard, storage, finalized_epoch) {
+            Some(e) if !e.is_empty() => e,
+            _ => return 0,
+        };
+        match storage.save_super_eligible_batch(finalized_epoch, &eligible) {
+            Ok(()) => {
+                println!("[INFO][REWARDS] super_elig_rederived epoch={} eligible={}",
+                         finalized_epoch, eligible.len());
+                1
+            }
+            Err(e) => {
+                if is_warn() {
+                    println!("[WARN][REWARDS] super_elig_rederive_failed epoch={} err={}", finalized_epoch, e);
+                }
+                0
+            }
+        }
+    }
+
+    /// Re-derive the light recency index for the epochs the online verdict actually reads.
+    ///
+    /// `light_elig_` is written at one block per epoch (`h % 14400 == 0`) with no retry, and
+    /// `light_attested_recent_onchain` reads its ABSENCE as "did not attest". So a node that was catching
+    /// up across that block reports every light client as offline for two epochs, and the wallet shows
+    /// "Node Inactive — Reactivation needed" to someone whose attestation is on the chain. Not consensus
+    /// — but it is the screen the user is looking at.
+    ///
+    /// Derivable for as long as the epoch's light bitmaps are retained. Gated on the derivation MARKER,
+    /// not on row count: an epoch where nobody attested is legitimately empty and must not be rescanned.
+    pub(crate) fn backfill_light_recency(storage: &crate::storage::Storage, current_height: u64) -> u32 {
+        const EPOCH_BLOCKS: u64 = 14400;
+        let e = current_height / EPOCH_BLOCKS;
+        let mut healed = 0u32;
+        for ep in [e.saturating_sub(1), e.saturating_sub(2)] {
+            if ep == 0 || storage.light_elig_derived(ep) { continue; }
+            match storage.snapshot_light_eligible(ep, light_roster_cutoff(ep)) {
+                Ok(n) => {
+                    healed += 1;
+                    println!("[INFO][REWARDS] light_elig_rederived epoch={} attested={}", ep, n);
+                }
+                Err(err) => if is_warn() {
+                    println!("[WARN][REWARDS] light_elig_rederive_failed epoch={} err={}", ep, err);
+                },
+            }
+        }
+        healed
+    }
+
     /// Re-freeze any epoch that holds a 2f+1-certified reward_root but whose sharded leaf-set is Absent
     /// locally (freeze-race, or a snapshot/catch-up that carried the root but not the shard). Re-derives
     /// from the committed super_elig_/light_bm_ indices, verifies the set recombines to the certified root,

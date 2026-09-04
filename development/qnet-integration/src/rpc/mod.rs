@@ -1333,6 +1333,21 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(blockchain_filter.clone())
         .and_then(handle_account_transactions);
 
+    // One shard of an epoch's reward leaf-set, so a node with a gap can rebuild it from a peer. Safe to
+    // serve to anyone: the caller verifies what it assembles against its own certified reward_root.
+    // GET /api/v1/rewards/epoch/{epoch}/leafset?shard=N
+    let epoch_leafset = api_v1
+        .and(warp::path("rewards"))
+        .and(warp::path("epoch"))
+        .and(warp::path::param::<u64>())
+        .and(warp::path("leafset"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::query::<LeafsetQuery>())
+        .and(warp::addr::remote())
+        .and(blockchain_filter.clone())
+        .and_then(handle_epoch_leafset);
+
     // Permanent node-lifecycle feed: the registration TX is pruned with the rest of the tx index, but
     // the registry row behind it is not, so a wallet keeps its own activation in view.
     // GET /api/v1/account/{address}/node-events
@@ -2509,6 +2524,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .or(account_balance_proof)  // v3.11: Balance with Merkle proof
         .or(token_balance_proof)  // V2: trustless QRC-20 token balance proof
         .or(validators_proof)       // v3.32: Validator set with Merkle proof
+        .or(epoch_leafset)
         .or(account_transactions)
         .or(account_node_events)
         .or(account_token_transfers)

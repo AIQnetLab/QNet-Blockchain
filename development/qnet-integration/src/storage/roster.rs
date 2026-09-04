@@ -93,8 +93,25 @@ impl Storage {
             batch.delete_range_cf(&cf, b"light_elig_0000000000_".as_ref(),
                 format!("light_elig_{:010}_", epoch - 3).as_bytes());
         }
+        // Derivation marker, written by the single deriver so every caller sets it. Distinguishes "not
+        // derived here" from "derived, and nobody attested" — the latter is a legitimate empty epoch and
+        // must not be rescanned forever.
+        batch.put_cf(&cf, Self::light_elig_done_key(epoch).as_bytes(), &[]);
         self.persistent.db.write(batch)?;
         Ok(n)
+    }
+
+    fn light_elig_done_key(epoch: u64) -> String { format!("light_elig_done_{:010}", epoch) }
+
+    /// True iff `snapshot_light_eligible` has run for `epoch` on THIS node. The recency verdict below
+    /// reads absence as "did not attest", so a snapshot this node never ran reports a live light node as
+    /// offline and the wallet shows "Node Inactive — Reactivation needed" for a node that did attest.
+    pub fn light_elig_derived(&self, epoch: u64) -> bool {
+        match self.persistent.db.cf_handle("pending_rewards") {
+            Some(cf) => self.persistent.db.get_cf(&cf, Self::light_elig_done_key(epoch).as_bytes())
+                .ok().flatten().is_some(),
+            None => false,
+        }
     }
 
     /// B: did node_id attest in either of the last two COMMITTED epochs? Node-independent, two O(1)

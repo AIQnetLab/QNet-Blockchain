@@ -510,6 +510,43 @@ pub(super) async fn handle_get_pending_rewards(
 }
 
 // PRODUCTION v2.43.1: GET /api/v1/rewards/history/{node_id}?offset=0&limit=10 - Get reward history by epochs
+/// GET /api/v1/rewards/epoch/{epoch}/leafset?shard=N — one shard of an epoch's reward leaf-set.
+///
+/// Exists so a node that cannot rebuild an epoch locally can obtain it from a peer. The caller does not
+/// have to trust this node: the set it assembles is accepted only if it hashes to the reward_root the
+/// caller's own QC-certified macroblock carries, so a wrong or malicious answer is rejected on arrival.
+/// Shard-paged because the leaf-set is one entry per recipient — 10M at the target.
+pub(super) async fn handle_epoch_leafset(
+    epoch: u64,
+    q: LeafsetQuery,
+    remote_addr: Option<std::net::SocketAddr>,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    if let Err(r) = check_api_rate_limit(remote_addr, "read_only") { return Ok(r); }
+    let storage = blockchain.get_storage();
+    let (roots, _bounds) = match storage.load_epoch_shard_meta(epoch) {
+        Ok(Some(m)) => m,
+        _ => return Ok(warp::reply::json(&json!({"epoch": epoch, "shards": 0, "wallets": []}))),
+    };
+    let shard = q.shard.unwrap_or(0);
+    let wallets = if shard < roots.len() {
+        storage.load_epoch_reward_shard(epoch, shard).ok().flatten().unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    Ok(warp::reply::json(&json!({
+        "epoch": epoch,
+        "shard": shard,
+        "shards": roots.len(),
+        "wallets": wallets,
+    })))
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct LeafsetQuery {
+    pub(super) shard: Option<usize>,
+}
+
 pub(super) async fn handle_get_reward_history(
     node_id: String,
     query: RewardHistoryQuery,
@@ -521,80 +558,72 @@ pub(super) async fn handle_get_reward_history(
         return Ok(rate_limit_response);
     }
     
+    // Truth, from the certified reward root — not from `rewards:{node}:epoch:{N}` contract state, which
+    // has no writer anywhere in the reward system (that lives on the merkle root, the shards and the
+    // claim watermark). Every read of those keys returned None, so this endpoint reported 0.0 for every
+    // epoch and labelled each one "missed": unclaimed rewards shown to their owner as lost.
     let current_height = blockchain.get_height().await;
-    let current_epoch = (current_height / 14400).saturating_add(1);
-    
-    // Pagination: default offset=0, limit=10, max limit=100
-    let offset = query.offset.unwrap_or(0) as u64;
-    let limit = query.limit.unwrap_or(10).min(100) as usize;
-    
-    // Get claimed rewards history from storage
     let storage = blockchain.get_storage();
-    let mut epochs_history = Vec::new();
-    
-    // Calculate which epochs to scan based on offset
-    let total_epochs = current_epoch;  // v2.63: 1-based epochs
-    let start_epoch = if offset < total_epochs { 
-        current_epoch.saturating_sub(offset) 
-    } else { 
-        1  // v2.63: minimum epoch is 1
+    let offset = query.offset.unwrap_or(0) as usize;
+    let limit = query.limit.unwrap_or(10).min(100) as usize;
+
+    // Rewards are credited to the node's WALLET, so the history is the wallet's, resolved from the
+    // node id the caller asked about.
+    let wallet = blockchain.get_node_wallet(&node_id).await.unwrap_or_default();
+    let last_claimed = if wallet.is_empty() { 0 } else {
+        let g = blockchain.get_state_manager();
+        let s = g.read().await;
+        s.get_last_claimed_epoch(&wallet)
     };
-    
-    // Scan epochs with pagination (v2.63: epochs start from 1)
-    let mut scanned = 0usize;
-    for epoch in (1..=start_epoch).rev() {
-        if scanned >= limit {
-            break;
-        }
-        
-        // v2.63: Convert 1-based epoch to block range
-        let epoch_start_block = (epoch - 1) * 14400;
-        let epoch_end_block = epoch * 14400;
-        
-        // Get claimed amount for this epoch from storage
-        let claimed_key = format!("rewards:{}:epoch:{}", node_id, epoch);
-        let claimed = storage.get_contract_state(&claimed_key, "claimed")
-            .ok()
-            .flatten()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0);
-        
-        // Get pool breakdown for this epoch
-        let pool1 = storage.get_contract_state(&claimed_key, "pool1")
-            .ok().flatten().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
-        let pool2 = storage.get_contract_state(&claimed_key, "pool2")
-            .ok().flatten().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
-        let pool3 = storage.get_contract_state(&claimed_key, "pool3")
-            .ok().flatten().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
-        
-        let claim_time = storage.get_contract_state(&claimed_key, "claim_time")
-            .ok().flatten().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
-        
+
+    // The real epoch keys this chain paid, newest first — NOT a 1..=N sequence invented from the
+    // height, which does not line up with the macroblock-indexed keys the roots are filed under.
+    let mut epochs = storage.reward_epochs_from(0).unwrap_or_default();
+    epochs.sort_unstable();
+    epochs.reverse();
+    let total_epochs = epochs.len();
+
+    let mut epochs_history = Vec::new();
+    for &epoch in epochs.iter().skip(offset).take(limit) {
+        let end_h = crate::reward_epoch::emission_height_of(epoch).unwrap_or(0);
+        let start_h = end_h.saturating_sub(14_400);
+        // Amount + servability in one resolution, verified against the 2f+1-committed root.
+        let (amount, servable) = match storage.load_epoch_root(epoch) {
+            Ok(Some(r)) if r != [0u8; 32] && !wallet.is_empty() => {
+                match crate::node::BlockchainNode::reward_proof_from_shard(
+                    &storage, epoch, &hex::encode(r), &wallet, false) {
+                    crate::node::ShardClaim::Proof(a, _) => (a, true),
+                    crate::node::ShardClaim::NotRecipient => (0, true),
+                    // Absent/Divergent: THIS node cannot serve the epoch. Reporting it as zero would
+                    // repeat the original lie in a new place.
+                    _ => (0, false),
+                }
+            }
+            Ok(Some(_)) => (0, true), // certified as distributing nothing
+            _ => (0, false),
+        };
+        let status = if !servable { "unavailable" }
+            else if epoch <= last_claimed { "claimed" }
+            else if amount > 0 { "claimable" }
+            else { "not_eligible" };
         epochs_history.push(json!({
             "epoch": epoch,
-            "block_range": format!("{}-{}", epoch_start_block, epoch_end_block),
-            "claimed_qnc": claimed as f64 / 1_000_000_000.0,
-            "pools": {
-                "pool1_base": pool1 as f64 / 1_000_000_000.0,
-                "pool2_fees": pool2 as f64 / 1_000_000_000.0,
-                "pool3_activation": pool3 as f64 / 1_000_000_000.0
-            },
-            "claim_time": claim_time,
-            "status": if claimed > 0 { "claimed" } else if epoch == current_epoch { "pending" } else { "missed" }
+            "block_range": format!("{}-{}", start_h, end_h),
+            "amount_qnc": amount as f64 / 1_000_000_000.0,
+            "status": status,
         }));
-        
-        scanned += 1;
     }
-    
+
     Ok(warp::reply::json(&json!({
         "node_id": node_id,
-        "current_epoch": current_epoch,
+        "wallet": wallet,
         "current_height": current_height,
+        "last_claimed_epoch": last_claimed,
         "pagination": {
             "offset": offset,
             "limit": limit,
             "total_epochs": total_epochs,
-            "has_more": offset + limit as u64 <= total_epochs
+            "has_more": offset + limit < total_epochs
         },
         "history": epochs_history
     })))
