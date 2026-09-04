@@ -6155,6 +6155,19 @@ mod tests {
         assert!(!body.contains("canonical_hash_at"));
     }
 
+    // The re-anchor is the step that makes this loop's height mirror follow a rollback down. Placed
+    // after the behind-check it is unreachable in exactly that state: the check measures the gap
+    // against the stale mirror and skips the iteration, so the mirror never comes down and the real
+    // gap below it is requested by nobody.
+    #[test]
+    fn height_reanchor_runs_before_the_behind_check_skips_the_iteration() {
+        let src = include_str!("production.rs");
+        let reanchor = src.find("height_reanchor").expect("re-anchor must exist");
+        let behind = src.find(r#"behind={} local={} network={}"#).expect("behind-check must exist");
+        assert!(reanchor < behind,
+                "the re-anchor must precede the behind-check that can `continue` past it");
+    }
+
     // The settle-point index gets ONE block per epoch and no retry, so a node catching up across that
     // block never obtains it — and then cannot rebuild the epoch's shards, which truncates the claimable
     // figure it reports for every wallet. Pin that the miss is recovered while the epoch is still

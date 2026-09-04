@@ -2029,6 +2029,22 @@ impl BlockchainNode {
                 // from "loop blocked inside an await". Atomic store is wait-free.
                 record_producer_heartbeat();
 
+                // Re-anchor the working height to the applied tip, first thing and unconditionally.
+                // A rollback lowers storage but not this loop's mirror; every gate below (sync range,
+                // catch-up target, production slot) reads the mirror, and the behind-check `continue`s
+                // on it — so a stale mirror makes the node ask for blocks it already has and never
+                // request the gap underneath.
+                {
+                    let applied_tip = storage.get_chain_height().unwrap_or(0);
+                    if microblock_height > applied_tip {
+                        if is_warn() {
+                            println!("[WARN][PROD] height_reanchor working={} applied={}",
+                                     microblock_height, applied_tip);
+                        }
+                        microblock_height = applied_tip;
+                    }
+                }
+
                 // v16.1: Halt escalation. Set by the state-machine escalation ladder
                 // (Phase 2.A) after sustained recoverable-error cycles. Matches the
                 // existing watchdog convention of process::exit(1) — Docker/orchestrator
@@ -2998,17 +3014,6 @@ impl BlockchainNode {
 
                 // CRITICAL: Synchronization check before participating in consensus
                 let local_stored_height = storage.get_chain_height().unwrap_or(0);
-
-                // Anchor production to the APPLIED tip. A working counter advanced ahead by
-                // gossip/scan (stored-but-unapplied, or a stale peer height claim) targets a
-                // block we cannot chain → self_exclude → failover runaway. Real gaps close via
-                // the sync path below; the pre-save precheck guards against duplicate produce.
-                if microblock_height > local_stored_height {
-                    if is_warn() {
-                        println!("[WARN][PROD] height_reanchor working={} applied={}", microblock_height, local_stored_height);
-                    }
-                    microblock_height = local_stored_height;
-                }
 
                 // Peer heights are a SYNC HINT for the lag gate below: they may lower our production
                 // target, never authorize it. The right to produce is decided after leader election by

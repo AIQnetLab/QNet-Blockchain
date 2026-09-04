@@ -1874,7 +1874,11 @@ pub(super) async fn handle_server_node_status(
                     // so a just-(re)activated live node is not reported OFFLINE for up to a full epoch.
                     const WAKE_GRACE_SECS: u64 = 3 * 14400;
                     let fresh = now.saturating_sub(node.registered_at) < WAKE_GRACE_SECS;
-                    let mut is_online = blockchain.get_storage().light_attested_recent_onchain(target_id, block_height)
+                    // On-chain attestation is the light tier's liveness fact; keep it separate from the
+                    // display verdict, which also honours the grace and the owner-shard proxy.
+                    let attested_onchain = blockchain.get_storage()
+                        .light_attested_recent_onchain(target_id, block_height);
+                    let mut is_online = attested_onchain
                         || p2p.has_attestation_in_window(target_id)
                         || fresh;
                     // Same owner-shard verdict as handle_light_node_status (cached) — one answer everywhere.
@@ -1889,7 +1893,9 @@ pub(super) async fn handle_server_node_status(
                         "is_online": is_online,
                         "last_seen": node.last_seen,
                         "last_seen_ago_seconds": now.saturating_sub(node.last_seen),
-                        "heartbeat_count": 0,
+                        // A light node proves liveness by one attestation per epoch, not by heartbeats.
+                        // The hardcoded 0 reached the wallet as "0 of 1" for a node that had attested.
+                        "heartbeat_count": u8::from(attested_onchain),
                         "required_heartbeats": 1,
                         "is_reward_eligible": onchain && is_online,
                         "reputation": null,
