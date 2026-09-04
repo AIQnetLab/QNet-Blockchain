@@ -178,7 +178,12 @@ impl BlockchainNode {
                     }
                 }
                 Ok(None) => {
-                    println!("[ERR][CONS] Macroblock #{} not found - node not synchronized!", n_minus_2_index);
+                    // Absent locally is the normal catch-up state, not a fault — abstaining here is
+                    // correct and it resolves on sync. At ERR it made a rolling restart look identical
+                    // to a real failure in the one signal used to tell them apart.
+                    if crate::node::is_warn() {
+                        println!("[WARN][CONS] mb_absent idx={} action=abstain", n_minus_2_index);
+                    }
                     return false;
                 }
                 Err(e) => {
