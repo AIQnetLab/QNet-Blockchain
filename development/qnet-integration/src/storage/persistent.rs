@@ -2136,6 +2136,23 @@ impl PersistentStorage {
             .map_err(|e| IntegrationError::SecurityError(format!("UTF-8 decoding failed: {}", e)))
     }
     
+    /// Highest microblock height held on disk, read from the index rather than probed.
+    /// `mb_body_key` is zero-padded to 20 digits, so lexicographic order is numeric order and one
+    /// reverse seek answers this in O(1) with no height ceiling.
+    pub fn highest_stored_microblock(&self) -> IntegrationResult<Option<u64>> {
+        let cf = self.db.cf_handle("microblocks")
+            .ok_or_else(|| IntegrationError::StorageError("microblocks column family not found".to_string()))?;
+        // `~` sorts above every digit, so this lands just past the last microblock_<digits> key.
+        let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::From(b"microblock_~", rocksdb::Direction::Reverse));
+        for item in iter {
+            let (k, _) = item?;
+            let key = match std::str::from_utf8(&k) { Ok(s) => s, Err(_) => continue };
+            let digits = match key.strip_prefix("microblock_") { Some(d) => d, None => break };
+            if let Ok(h) = digits.parse::<u64>() { return Ok(Some(h)); }
+        }
+        Ok(None)
+    }
+
     pub fn load_microblock(&self, height: u64) -> IntegrationResult<Option<Vec<u8>>> {
         let microblocks_cf = self.db.cf_handle("microblocks")
             .ok_or_else(|| IntegrationError::StorageError("microblocks column family not found".to_string()))?;

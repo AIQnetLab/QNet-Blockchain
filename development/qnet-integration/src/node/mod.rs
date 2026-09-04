@@ -6155,6 +6155,23 @@ mod tests {
         assert!(!body.contains("canonical_hash_at"));
     }
 
+    // Boot height recovery must find the real tip, not stop at a constant. The previous probe walked
+    // one read per height and gave up at 200k, so a node past that recovered to a height below the
+    // blocks it held — and then reported and served that lower height.
+    #[test]
+    fn boot_height_recovery_finds_the_tip_above_any_hardcoded_ceiling() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage");
+        assert_eq!(storage.highest_stored_microblock().unwrap(), None, "empty store has no tip");
+
+        for h in [0u64, 250_000, 400_000] {
+            let mb = p3_micro(h, 0);
+            storage.put_microblock_row_for_test(h, &bincode::serialize(&mb).expect("ser")).expect("put");
+        }
+        assert_eq!(storage.highest_stored_microblock().unwrap(), Some(400_000),
+                   "the tip is read from the index, not capped at a constant");
+    }
+
     // The re-anchor is the step that makes this loop's height mirror follow a rollback down. Placed
     // after the behind-check it is unreachable in exactly that state: the check measures the gap
     // against the stale mirror and skips the iteration, so the mirror never comes down and the real

@@ -304,20 +304,11 @@ impl BlockchainNode {
                         if let Ok(Some(_)) = storage_arc.load_microblock(0) {
                             // Genesis exists — scan forward to find actual height
                             if is_info() { println!("[INFO][NODE] chain_height_zero_but_genesis_exists scanning"); }
-                            let mut scan_h = 0u64;
-                            let mut last_found = 0u64;
-                            let mut gap = 0u64;
-                            loop {
-                                scan_h += 1;
-                                if storage_arc.load_microblock(scan_h).unwrap_or(None).is_some() {
-                                    last_found = scan_h;
-                                    gap = 0;
-                                } else {
-                                    gap += 1;
-                                    if gap > 10 { break; } // Same gap tolerance as verify_and_repair
-                                }
-                                if scan_h > 200_000 { break; } // Safety limit
-                            }
+                            // Index seek, not a probe: the previous linear walk cost one read per height
+                            // and stopped at a hardcoded 200k, so a node past that recovered to a height
+                            // far below the blocks it actually held. Blocks are written only by the apply
+                            // path, in order, so the highest key IS the tip.
+                            let last_found = storage_arc.highest_stored_microblock().unwrap_or(None).unwrap_or(0);
                             if last_found > 0 {
                                 println!("[INFO][NODE] chain_height_recovered from_scan h={}", last_found);
                                 let _ = storage_arc.set_chain_height(last_found);

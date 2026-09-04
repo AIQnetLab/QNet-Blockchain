@@ -816,6 +816,21 @@ impl Storage {
         self.persistent.load_microblock(height)
     }
 
+    /// Highest microblock height on disk (index seek, no scan, no ceiling).
+    pub fn highest_stored_microblock(&self) -> IntegrationResult<Option<u64>> {
+        self.persistent.highest_stored_microblock()
+    }
+
+    /// Write a body row without the parent-linkage gate. Test-only: the tip seek must be exercised at
+    /// heights a linked seed run cannot reach in a unit test.
+    #[cfg(test)]
+    pub fn put_microblock_row_for_test(&self, height: u64, bytes: &[u8]) -> IntegrationResult<()> {
+        let cf = self.persistent.db.cf_handle("microblocks")
+            .ok_or_else(|| IntegrationError::StorageError("microblocks CF not found".to_string()))?;
+        self.persistent.db.put_cf(&cf, crate::storage::mb_body_key(height).as_bytes(), bytes)?;
+        Ok(())
+    }
+
     /// v32.7: durable flush — used by fast-sync exit path to persist
     /// WAL-disabled writes accumulated during catch-up.
     pub fn flush_db(&self) {
