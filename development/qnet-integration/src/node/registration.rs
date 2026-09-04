@@ -1141,6 +1141,13 @@ impl BlockchainNode {
             } else if !w.is_empty() {
                 // Inputs present but they do not reproduce the certified root: corrupt, not missing.
                 println!("[ERR][REWARDS] epoch_rebuild_diverged epoch={} action=resync_needed", epoch);
+            } else {
+                // The remaining silent path, made loud: the epoch's inputs are unreadable here, so this
+                // node can never serve it and wallet_claimable_qnc stops there — truncating the figure
+                // for every wallet. Legitimate only below a snapshot cold-join anchor; anywhere else it
+                // is a missing index that needs to be seen, not a quiet skip.
+                println!("[WARN][REWARDS] epoch_rebuild_no_inputs epoch={} below_join_anchor={}",
+                         epoch, Self::epoch_below_join_anchor(storage, epoch));
             }
         }
         if healed > 0 && is_info() { println!("[INFO][REWARDS] reward_shard_backfill healed={}", healed); }
