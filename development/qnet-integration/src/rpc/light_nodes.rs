@@ -2422,6 +2422,7 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
             u64::from_be_bytes(h[..8].try_into().unwrap_or([0u8; 8])) % 60
         };
 
+        let mut last_reward_heal_slot = u64::MAX;
         loop {
             check_interval.tick().await;
             
@@ -2444,6 +2445,18 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
                     println!("[PING] 🔄 Re-announced as active node, cleaned stale nodes");
                 }
                 
+                // Reward shards, every slot (~1 min). An epoch that settles while this node is
+                // restarting leaves no shards, and the claimable figure then stops at that epoch and
+                // under-reports every wallet until the gap closes. One index probe per retained epoch,
+                // so a healthy node pays nothing; the hourly cycle was too coarse for a money figure.
+                if last_reward_heal_slot != current_slot {
+                    last_reward_heal_slot = current_slot;
+                    let st = blockchain_for_pings.get_storage();
+                    tokio::task::spawn_blocking(move || {
+                        crate::node::BlockchainNode::backfill_reward_shards(&st);
+                    });
+                }
+
                 // Cleanup old attestations every hour, offset per node. The slot is derived
                 // from chain height, so an unoffset check fires within the same second on
                 // every node and no quorum member is left serving during the sweep.
