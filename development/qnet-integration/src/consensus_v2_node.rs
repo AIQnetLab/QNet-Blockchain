@@ -9,7 +9,7 @@ use crate::storage::Storage;
 use qnet_consensus::checkpoint_bft::{Hash, QuorumCertificate, TimeoutMsg, Vote};
 use once_cell::sync::OnceCell;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use tokio::sync::mpsc;
 
 /// Checkpoint-BFT (v2) is the ONLY macroblock consensus since the legacy commit/reveal
@@ -91,17 +91,28 @@ fn dispatch_catchup_verify(data: Vec<u8>, p2p: &Arc<SimplifiedP2P>, storage: &Ar
             ConsensusMsg::Proposal(p) => Some(p.clone()), _ => None });
         let qc = pair.iter().find_map(|m| match m {
             ConsensusMsg::Qc(q) => Some(q.clone()), _ => None });
-        let ok = match (&cp, &qc) {
-            (Some(cp), Some(qc)) => cp.hash() == qc.checkpoint_hash
-                && committee_for_window(&storage,
-                       cp.window_head_height / qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL)
-                    .is_some_and(|cmt| verify_msg(&p2p, &cmt, &ConsensusMsg::Qc(qc.clone()))),
-            _ => false,
+        let reason: Option<String> = match (&cp, &qc) {
+            (Some(cp), Some(qc)) => {
+                if cp.hash() != qc.checkpoint_hash { Some("hash_mismatch".into()) } else {
+                    let w = cp.window_head_height / qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL;
+                    match committee_for_window(&storage, w) {
+                        None => Some(format!("committee_unresolved win={}", w)),
+                        Some(cmt) => if verify_msg(&p2p, &cmt, &ConsensusMsg::Qc(qc.clone())) { None } else {
+                            let foreign = qc.signers.iter().filter(|s| !cmt.contains(s)).count();
+                            Some(format!("qc_invalid win={} signers={} committee={} quorum={} foreign_signers={}",
+                                         w, qc.signers.len(), cmt.len(),
+                                         qnet_consensus::checkpoint_bft::quorum_size(cmt.len()), foreign))
+                        },
+                    }
+                }
+            }
+            _ => Some("pair_incomplete".into()),
         };
-        if ok {
-            if let Some(tx) = V2_TX.get() { let _ = tx.send(V2Event::CatchUpVerified(data)); }
-        } else if crate::node::is_warn() {
-            println!("[WARN][BFT2] catchup_rejected bytes={}", data.len());
+        match reason {
+            None => { if let Some(tx) = V2_TX.get() { let _ = tx.send(V2Event::CatchUpVerified(data)); } }
+            Some(r) => if crate::node::is_warn() {
+                println!("[WARN][BFT2] catchup_rejected idx={} reason={}", qc.as_ref().map(|q| q.index).unwrap_or(0), r);
+            },
         }
     });
 }
@@ -253,6 +264,8 @@ pub fn verify_msg(p2p: &SimplifiedP2P, committee: &[String], msg: &ConsensusMsg)
         ConsensusMsg::Timeout(tm) => in_committee(&tm.voter)
             && timeout_sig_ingest_ok(&tm.voter, tm.index, tm.high_qc_index, &tm.signature),
         ConsensusMsg::Qc(qc) => verify_qc(p2p, committee, qc),
+        // Never verified inline: routed to the catch-up verifier against its own window's committee.
+        ConsensusMsg::Justify(..) => false,
         // H4: a TC must carry ≥2f+1 DISTINCT committee timeouts (each signed) for its own
         // view — not merely an optional high_qc. The old `unwrap_or(true)` accepted an
         // EMPTY-timeouts TC and let on_timeout_cert advance the view (`current_index = tc.index+1`),
@@ -367,7 +380,7 @@ fn msg_sender(m: &ConsensusMsg) -> Option<&str> {
         ConsensusMsg::Proposal(cp) => Some(&cp.proposer),
         ConsensusMsg::Vote(v) => Some(&v.voter),
         ConsensusMsg::Timeout(tm) => Some(&tm.voter),
-        ConsensusMsg::Qc(_) | ConsensusMsg::Tc(_) => None,
+        ConsensusMsg::Qc(_) | ConsensusMsg::Tc(_) | ConsensusMsg::Justify(..) => None,
     }
 }
 
@@ -380,6 +393,7 @@ fn msg_index(m: &ConsensusMsg) -> u64 {
         ConsensusMsg::Qc(qc) => qc.index,
         ConsensusMsg::Timeout(tm) => tm.index,
         ConsensusMsg::Tc(tc) => tc.index,
+        ConsensusMsg::Justify(_, qc) => qc.index,
     }
 }
 
@@ -425,6 +439,7 @@ async fn broadcast(p2p: &Arc<SimplifiedP2P>, msg: &ConsensusMsg) {
         ConsensusMsg::Timeout(t) => ("timeout", t.index, 0),
         ConsensusMsg::Qc(q) => ("qc", q.index, 0),
         ConsensusMsg::Tc(t) => ("tc", t.index, 0),
+        ConsensusMsg::Justify(cp, q) => ("justify", q.index, cp.window_head_height),
     };
     let data = match bincode::serialize(msg) {
         Ok(d) => d,
@@ -871,12 +886,36 @@ fn derive_window_tail(storage: &Storage, head: u64, win: usize) -> Option<(Vec<H
 /// the voters' state gate rather than be papered over here. Mid-rollback (body missing) ⇒ fall
 /// back to the snapshot tail: build_proposal must still run on EVERY member (all-seal buffers
 /// seal_data unconditionally), and a dead-tail proposal is no worse than the pre-fix status quo.
+static V2_VIEW_SYNCED: AtomicBool = AtomicBool::new(false);
+static V2_BOOT_MS: AtomicU64 = AtomicU64::new(0);
+static V2_HELD_LOGGED: AtomicBool = AtomicBool::new(false);
+
+fn note_view_heard() { V2_VIEW_SYNCED.store(true, Ordering::Relaxed); }
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+/// A process that has not yet heard the live view may hold a reboot-old parent; proposing on it
+/// re-certifies a head the quorum already passed. Bounded so an idle network is still proposed into.
+fn may_propose_after_boot(view_synced: bool, boot_age_ms: u64) -> bool {
+    view_synced || boot_age_ms >= 3 * qnet_consensus::checkpoint_bft::VIEW_TIMEOUT_MS
+}
+
 fn try_propose(
     driver: &mut ConsensusDriver,
     buf: &std::collections::HashMap<u64, WindowContent>,
     storage: &Storage,
     committee: &mut Vec<String>,
 ) -> Vec<Effect> {
+    if !may_propose_after_boot(V2_VIEW_SYNCED.load(Ordering::Relaxed),
+                               now_ms().saturating_sub(V2_BOOT_MS.load(Ordering::Relaxed))) {
+        if !V2_HELD_LOGGED.swap(true, Ordering::Relaxed) && crate::node::is_info() {
+            println!("[INFO][BFT2] propose_held reason=view_not_synced");
+        }
+        return Vec::new();
+    }
     let w = driver.next_window();
     match buf.get(&w) {
         Some(c) => {
@@ -1331,8 +1370,16 @@ fn refresh_committee(committee: &mut Vec<String>, cached_for: &mut u64,
                      buf: &std::collections::HashMap<u64, WindowContent>) {
     let w = driver.next_window();
     if *cached_for == w { return; }
-    let resolved = buf.get(&w).map(|c| c.committee.clone())
-        .or_else(|| committee_for_window(storage, w));
+    let committed = committee_for_window(storage, w);
+    let local = buf.get(&w).map(|c| c.committee.clone());
+    if let (Some(a), Some(b)) = (&committed, &local) {
+        let mut a2 = a.clone(); a2.sort();
+        let mut b2 = b.clone(); b2.sort();
+        if a2 != b2 && crate::node::is_warn() {
+            println!("[WARN][BFT2] committee_divergence win={} committed={} local={}", w, a.len(), b.len());
+        }
+    }
+    let resolved = committed.or(local);
     match resolved {
         Some(c) => {
             *cached_for = w;
@@ -1527,6 +1574,7 @@ pub async fn run(
     // committee rotates each epoch (N-2 VRF sample); kept here for verify_msg and
     // mirrored into the driver/engine via build_proposal.
     let mut driver = ConsensusDriver::new(node_id.clone(), committee.clone(), genesis_hash);
+    V2_BOOT_MS.store(now_ms(), Ordering::Relaxed);
     // Reload what this node already voted for. Unreadable ⇒ do not run consensus: a replica that
     // cannot know its own commitments re-votes at a head it already voted at and is convicted for it.
     match storage.load_checkpoint_votes() {
@@ -1946,7 +1994,15 @@ pub async fn run(
                             // without them (the post-stall view deadlock). Timeouts verify inline
                             // (same cost as at-round ones); TCs go to the async cert worker.
                             let view_sync = matches!(&msg, ConsensusMsg::Timeout(_) | ConsensusMsg::Tc(_));
-                            if committee.is_empty()
+                            if let ConsensusMsg::Justify(cp, qc) = &msg {
+                                if qc.index > driver.newest_qc_index().unwrap_or(0) {
+                                    if let Ok(pair) = bincode::serialize(&vec![
+                                        ConsensusMsg::Proposal(cp.clone()), ConsensusMsg::Qc(qc.clone())]) {
+                                        dispatch_catchup_verify(pair, &p2p, &storage);
+                                    }
+                                }
+                                Vec::new()
+                            } else if committee.is_empty()
                                 || (!view_sync && msg_index(&msg) > driver.current_index()) {
                                 // Future-round / pre-committee inbound: buffer for replay — PRE-authentication
                                 // (a cert sig can't be checked inline), so this is the UNAUTHENTICATED class:
@@ -1966,6 +2022,7 @@ pub async fn run(
                                 dispatch_cert_verify(data, &p2p, &committee, driver.current_index());
                                 Vec::new()
                             } else if verify_msg(&p2p, &committee, &msg) {
+                                note_view_heard();
                                 // Signature-verified ⇒ this member is demonstrably alive. Recording it
                                 // only AFTER the verify is what makes the halt test unspoofable.
                                 if let Some(sender) = msg_sender(&msg) {
@@ -2009,6 +2066,7 @@ pub async fn run(
                             ConsensusMsg::Qc(q) => Some(q.clone()), _ => None });
                         match (cp, qc) {
                             (Some(cp), Some(qc)) => {
+                                note_view_heard();
                                 if crate::node::is_info() {
                                     println!("[INFO][BFT2] catchup_adopted idx={} head={}", qc.index, cp.window_head_height);
                                 }
@@ -2024,6 +2082,7 @@ pub async fn run(
                         // Adopt the in-flight committee (as the Inbound path does) before processing.
                         match bincode::deserialize::<ConsensusMsg>(&data) {
                             Ok(msg) => {
+                                note_view_heard();
                                 refresh_committee(&mut committee, &mut committee_window, &mut driver, &storage, &window_buf);
                                 process_authenticated(&msg, &mut driver, &storage, &window_buf, &p2p, &mut committee, &mut pending, MAX_PENDING, &mut heard)
                             }
@@ -2102,6 +2161,7 @@ pub async fn run(
                         // advance, re-adopt committee, propose if we now lead, and replay buffered inbound.
                         match bincode::deserialize::<(qnet_consensus::checkpoint_bft::Checkpoint, QuorumCertificate)>(&cp_qc) {
                             Ok((cp, qc)) => {
+                                note_view_heard();
                                 let mut effs = driver.sync(&cp, &qc);
                                 if !effs.is_empty() {
                                     refresh_committee(&mut committee, &mut committee_window, &mut driver, &storage, &window_buf);
@@ -2567,5 +2627,30 @@ mod catchup_store_tests {
         assert!(CATCHUP_BUNDLES.len() < 20, "older pairs evicted, kept {}", CATCHUP_BUNDLES.len());
         assert!(CATCHUP_BUNDLES.contains_key(&19), "the newest pair is always retained");
         CATCHUP_BUNDLES.clear();
+    }
+
+    // A fresh process may hold a reboot-old parent; it proposes only after hearing the live view,
+    // and an idle network is still proposed into after three view timeouts.
+    #[test]
+    fn a_fresh_process_holds_proposals_until_it_hears_the_live_view() {
+        let t = qnet_consensus::checkpoint_bft::VIEW_TIMEOUT_MS;
+        assert!(!may_propose_after_boot(false, 0));
+        assert!(!may_propose_after_boot(false, 3 * t - 1));
+        assert!(may_propose_after_boot(false, 3 * t));
+        assert!(may_propose_after_boot(true, 0));
+    }
+
+    // Votes for a window are counted against the committee the N-2 macroblock certified, never
+    // against a set this node derived locally; the local set is only a fallback for a window whose
+    // anchor is not held yet.
+    #[test]
+    fn committee_resolution_prefers_the_committed_set() {
+        let src = include_str!("consensus_v2_node.rs");
+        let f = src.find("fn refresh_committee(").expect("resolver");
+        let body = &src[f..f + 2000];
+        let committed = body.find("committee_for_window(storage, w)").expect("committed lookup");
+        let local = body.find("buf.get(&w)").expect("local lookup");
+        let merged = body.find("committed.or(local)").expect("precedence");
+        assert!(committed < local && local < merged, "committed first, local as fallback");
     }
 }

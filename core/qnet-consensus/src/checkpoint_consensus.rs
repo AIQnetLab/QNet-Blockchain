@@ -116,6 +116,15 @@ impl CheckpointConsensus {
     /// a pinned one is admitted at the identical position instead (`index_votes`).
     pub fn last_voted_index(&self) -> u64 { self.last_voted_index }
 
+    /// Highest certified index (the safety lock).
+    pub fn locked_index(&self) -> u64 { self.locked_index }
+
+    /// The member the leader rule elects for `index` under `parent_hash`, if the committee is set.
+    pub fn leader_for(&self, index: u64, parent_hash: &Hash) -> Option<&NodeId> {
+        if self.committee.is_empty() { return None; }
+        self.committee.get(leader_index(index, parent_hash, self.committee.len()))
+    }
+
     /// Enter the first votable view. Views at or below the vote ceiling can never be voted
     /// (anti-equivocation), so a restart that re-enters them idles through a timeout crawl the
     /// height of its own vote history. Forward view skips are always safe.
