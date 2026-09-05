@@ -1019,6 +1019,8 @@ pub struct PipelineMetrics {
     pub deferred_bytes: AtomicU64,
     pub committee_deferred_n: AtomicU64,
     pub committee_deferred_bytes: AtomicU64,
+    pub apply_held_n: AtomicU64,
+    pub apply_held_bytes: AtomicU64,
 }
 
 /// v15.4: Op codes for per-stage progress markers. Read by the watchdog
@@ -1065,6 +1067,88 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Apply-stage reorder window. Verify releases a child the moment its parent is VERIFIED, so under
+/// catch-up a child regularly reaches apply while its parent is still applying. Dropping it turned
+/// every such pair into a refetch round trip and a lagging node caught up no faster than production.
+/// Blocks ahead of the applied frontier wait here in height order instead. Bounded by count, bytes
+/// and age; past any bound they are dropped as before and the catch-up loop refetches them.
+const APPLY_HELD_MAX: usize = 512;
+const APPLY_HELD_MAX_BYTES: usize = 256 * 1024 * 1024;
+const APPLY_HELD_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(20);
+
+type Held<T> = std::collections::BTreeMap<u64, (T, std::time::Instant)>;
+
+/// Park `block` (height `h`, `size` bytes) until the frontier reaches its parent. False when the
+/// window is full, in which case the caller drops it exactly as before.
+fn hold_ahead<T>(held: &mut Held<T>, bytes: &mut usize, h: u64, size: usize, block: T, now: std::time::Instant) -> bool {
+    if held.contains_key(&h) { return true; } // the same height is already waiting
+    if held.len() >= APPLY_HELD_MAX || bytes.saturating_add(size) > APPLY_HELD_MAX_BYTES { return false; }
+    held.insert(h, (block, now));
+    *bytes = bytes.saturating_add(size);
+    true
+}
+
+/// The lowest held block the frontier at `tip` can now execute (height <= tip + 1), if any.
+/// Entries older than the age bound are dropped on the way; `size_of` keeps the byte count honest.
+fn take_ready_held<T>(held: &mut Held<T>, bytes: &mut usize, tip: u64, now: std::time::Instant,
+                      size_of: impl Fn(&T) -> usize) -> (Option<T>, usize) {
+    let mut expired = 0usize;
+    loop {
+        let (h, at) = match held.iter().next() { Some((h, (_, at))) => (*h, *at), None => return (None, expired) };
+        let (block, _) = match held.remove(&h) { Some(e) => e, None => return (None, expired) };
+        *bytes = bytes.saturating_sub(size_of(&block));
+        if now.duration_since(at) > APPLY_HELD_MAX_AGE { expired += 1; continue; }
+        if h <= tip.saturating_add(1) { return (Some(block), expired); }
+        // Not executable yet: put it back and wait for the frontier.
+        *bytes = bytes.saturating_add(size_of(&block));
+        held.insert(h, (block, at));
+        return (None, expired);
+    }
+}
+
+#[cfg(test)]
+mod apply_reorder_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    // A child that arrives before its parent finished applying is executed right after it, not
+    // dropped; nothing is handed out until the frontier reaches it.
+    #[test]
+    fn a_child_ahead_of_the_frontier_waits_and_then_runs() {
+        let now = Instant::now();
+        let mut held: Held<u64> = Held::new();
+        let mut bytes = 0usize;
+        assert!(hold_ahead(&mut held, &mut bytes, 102, 10, 102, now));
+        assert!(hold_ahead(&mut held, &mut bytes, 101, 10, 101, now));
+        assert_eq!(bytes, 20);
+        assert_eq!(take_ready_held(&mut held, &mut bytes, 99, now, |_| 10).0, None, "frontier at 99 runs nothing");
+        assert_eq!(take_ready_held(&mut held, &mut bytes, 100, now, |_| 10).0, Some(101));
+        assert_eq!(take_ready_held(&mut held, &mut bytes, 100, now, |_| 10).0, None, "102 still waits for 101");
+        assert_eq!(take_ready_held(&mut held, &mut bytes, 101, now, |_| 10).0, Some(102));
+        assert_eq!(bytes, 0);
+    }
+
+    // The window is bounded three ways: count, bytes and age.
+    #[test]
+    fn the_window_is_bounded_by_count_bytes_and_age() {
+        let now = Instant::now();
+        let mut held: Held<u64> = Held::new();
+        let mut bytes = 0usize;
+        for h in 0..APPLY_HELD_MAX as u64 { assert!(hold_ahead(&mut held, &mut bytes, 1000 + h, 1, h, now)); }
+        assert!(!hold_ahead(&mut held, &mut bytes, 5000, 1, 5000, now), "count bound");
+        let mut big: Held<u64> = Held::new();
+        let mut big_bytes = 0usize;
+        assert!(!hold_ahead(&mut big, &mut big_bytes, 10, APPLY_HELD_MAX_BYTES + 1, 10, now), "byte bound");
+        let mut old: Held<u64> = Held::new();
+        let mut old_bytes = 0usize;
+        assert!(hold_ahead(&mut old, &mut old_bytes, 7, 5, 7, now));
+        let later = now + APPLY_HELD_MAX_AGE + Duration::from_secs(1);
+        let (got, expired) = take_ready_held(&mut old, &mut old_bytes, 6, later, |_| 5);
+        assert_eq!((got, expired), (None, 1), "an aged entry is dropped, never executed");
+        assert_eq!(old_bytes, 0);
+    }
+}
+
 /// Entry counts of the pipeline's height/peer-keyed holders, for the memory census.
 pub fn holder_census() -> Vec<(&'static str, u64)> {
     let mut out = vec![
@@ -1077,6 +1161,8 @@ pub fn holder_census() -> Vec<(&'static str, u64)> {
         out.push(("pipe_deferred_mb", m.deferred_bytes.load(Ordering::Relaxed) >> 20));
         out.push(("pipe_committee_deferred", m.committee_deferred_n.load(Ordering::Relaxed)));
         out.push(("pipe_committee_deferred_mb", m.committee_deferred_bytes.load(Ordering::Relaxed) >> 20));
+        out.push(("pipe_apply_held", m.apply_held_n.load(Ordering::Relaxed)));
+        out.push(("pipe_apply_held_mb", m.apply_held_bytes.load(Ordering::Relaxed) >> 20));
     }
     out
 }
@@ -1104,6 +1190,8 @@ impl PipelineMetrics {
             deferred_bytes: AtomicU64::new(0),
             committee_deferred_n: AtomicU64::new(0),
             committee_deferred_bytes: AtomicU64::new(0),
+            apply_held_n: AtomicU64::new(0),
+            apply_held_bytes: AtomicU64::new(0),
         }
     }
 
@@ -3397,7 +3485,27 @@ impl BlockPipeline {
         ctx: ApplyContext,
         metrics: Arc<PipelineMetrics>,
     ) {
-        while let Some(block) = rx.recv().await {
+        let mut held: Held<VerifiedBlock> = Held::new();
+        let mut held_bytes: usize = 0;
+        loop {
+            // A held block the frontier has reached goes first; otherwise the channel. While
+            // something is held the wait is bounded, so an aged entry is released even if the
+            // channel stays silent.
+            let tip_now = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(Ordering::Relaxed);
+            let (ready, expired) = take_ready_held(&mut held, &mut held_bytes, tip_now, std::time::Instant::now(),
+                                                   |b: &VerifiedBlock| b.decompressed.len());
+            if expired > 0 { metrics.future_dropped.fetch_add(expired as u64, Ordering::Relaxed); }
+            metrics.apply_held_n.store(held.len() as u64, Ordering::Relaxed);
+            metrics.apply_held_bytes.store(held_bytes as u64, Ordering::Relaxed);
+            let block = match ready {
+                Some(b) => b,
+                None if held.is_empty() => match rx.recv().await { Some(b) => b, None => break },
+                None => match tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await {
+                    Ok(Some(b)) => b,
+                    Ok(None) => break,
+                    Err(_) => continue,
+                },
+            };
             let height = block.height;
             let producer = block.microblock.producer.clone();
             let tx_count = block.microblock.transactions.len();
@@ -3479,12 +3587,19 @@ impl BlockPipeline {
             if height > applied_tip + 1 {
                 let tip = ctx.storage.get_chain_height().unwrap_or(0).max(applied_tip);
                 if height > tip + 1 {
+                    metrics.mark_apply_idle();
+                    let size = block.decompressed.len();
+                    if hold_ahead(&mut held, &mut held_bytes, height, size, block, std::time::Instant::now()) {
+                        if is_debug() {
+                            println!("[DBG][PIPELINE] apply_held h={} applied_tip={} held={}", height, tip, held.len());
+                        }
+                        continue;
+                    }
                     static OOO_LAST_TIP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
                     metrics.future_dropped.fetch_add(1, Ordering::Relaxed);
                     if OOO_LAST_TIP.swap(tip, Ordering::Relaxed) != tip && is_warn() {
-                        println!("[WARN][PIPELINE] apply_out_of_order h={} applied_tip={} action=skip", height, tip);
+                        println!("[WARN][PIPELINE] apply_out_of_order h={} applied_tip={} action=skip reason=window_full", height, tip);
                     }
-                    metrics.mark_apply_idle();
                     continue;
                 }
             }
