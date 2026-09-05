@@ -44,16 +44,28 @@ impl PersistentStorage {
         // shared cache instead of by this number.
         opts.set_max_open_files(-1);
         opts.set_use_fsync(true);      // Synchronous fsync: guarantees WAL durability on crash
-        opts.set_bytes_per_sync(0);    // Disabled: fsync=true already guarantees durability
-        opts.set_max_write_buffer_number(2);  // Reduced from 4
-        opts.set_write_buffer_size(16777216); // 16MB (was 64MB) - 4x smaller WAL!
-        opts.set_target_file_size_base(16777216); // 16MB (was 64MB)
+        // Write path sized for the design rate, not for a small-RAM footprint. A block of 13k
+        // transfers rewrites ~13k account rows plus their rich-list keys; with 4-16 MB memtables,
+        // two per CF and two background threads, a memtable filled every couple of blocks, the
+        // flush could not keep up on VPS disks, and RocksDB STOPPED WRITES ("2 immutable memtables
+        // waiting for flush") - block apply hung inside the write, the producer went silent, and a
+        // failover round, a fork and a rollback followed. Larger memtables flush less often, four
+        // per CF let flushes queue instead of stall, six background jobs let flush and compaction
+        // run side by side, and the global memtable budget below caps the total footprint.
+        opts.set_bytes_per_sync(1_048_576);   // stream SST writes in 1 MB steps instead of one burst
+        opts.set_max_write_buffer_number(4);
+        opts.set_write_buffer_size(64 * 1024 * 1024);
+        opts.set_target_file_size_base(64 * 1024 * 1024);
         opts.set_min_write_buffer_number_to_merge(1); // Merge immediately
-        opts.set_level_zero_stop_writes_trigger(8);   // Reduced
-        opts.set_level_zero_slowdown_writes_trigger(4); // Reduced
+        opts.set_level_zero_stop_writes_trigger(36);   // RocksDB defaults; the old 8/4 stalled
+        opts.set_level_zero_slowdown_writes_trigger(20); // writes on a handful of L0 files
         opts.set_compaction_style(rocksdb::DBCompactionStyle::Level);
-        opts.set_max_background_jobs(2);  // Reduced from 4
+        opts.set_max_background_jobs(6);
+        opts.set_max_subcompactions(2);
         opts.set_disable_auto_compactions(false);
+        // Total memtable memory across every CF: past this the largest memtable is flushed, so the
+        // per-CF sizes above are a ceiling per CF, not a sum.
+        opts.set_db_write_buffer_size(1024 * 1024 * 1024);
         
         // v3.41: CRITICAL WAL CLEANUP - limits total WAL size to 64MB
         // Without this, WAL files accumulate indefinitely with 17 column families
@@ -62,7 +74,9 @@ impl PersistentStorage {
         // preventing WAL deletion → 463 files / 1.8GB in 23 hours.
         // With this setting, RocksDB force-flushes oldest CF memtables when
         // total WAL exceeds 64MB, enabling old WAL cleanup.
-        opts.set_max_total_wal_size(67_108_864); // 64MB max WAL (was: unlimited)
+        // 512 MB: at the design rate the WAL grows several MB per block, and a 64 MB cap forced a
+        // memtable flush every few blocks on top of the size-triggered ones.
+        opts.set_max_total_wal_size(512 * 1024 * 1024);
 
         // v25.3: BOUND RocksDB's internal diagnostic LOG file.
         // Default RocksDB behaviour is a SINGLE `LOG` file that grows
@@ -134,9 +148,9 @@ impl PersistentStorage {
         let create_cf_opts = || -> Options {
             let mut cf_opts = Options::default();
             cf_opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
-            cf_opts.set_write_buffer_size(8388608); // 8MB per CF
-            cf_opts.set_max_write_buffer_number(2);
-            cf_opts.set_target_file_size_base(16777216); // 16MB
+            cf_opts.set_write_buffer_size(32 * 1024 * 1024);
+            cf_opts.set_max_write_buffer_number(4);
+            cf_opts.set_target_file_size_base(64 * 1024 * 1024);
             cf_opts.set_block_based_table_factory(&cf_block_opts(false));
             cf_opts
         };
@@ -145,9 +159,9 @@ impl PersistentStorage {
         let create_hot_cf_opts = || -> Options {
             let mut cf_opts = Options::default();
             cf_opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
-            cf_opts.set_write_buffer_size(4194304); // 4MB - very small for hot data
-            cf_opts.set_max_write_buffer_number(2);
-            cf_opts.set_target_file_size_base(8388608); // 8MB
+            cf_opts.set_write_buffer_size(16 * 1024 * 1024);
+            cf_opts.set_max_write_buffer_number(4);
+            cf_opts.set_target_file_size_base(32 * 1024 * 1024);
             cf_opts.set_block_based_table_factory(&cf_block_opts(false));
             cf_opts
         };
@@ -156,9 +170,9 @@ impl PersistentStorage {
         let create_cold_cf_opts = || -> Options {
             let mut cf_opts = Options::default();
             cf_opts.set_compression_type(rocksdb::DBCompressionType::Zstd); // Better compression
-            cf_opts.set_write_buffer_size(16777216); // 16MB
-            cf_opts.set_max_write_buffer_number(2);
-            cf_opts.set_target_file_size_base(33554432); // 32MB
+            cf_opts.set_write_buffer_size(32 * 1024 * 1024);
+            cf_opts.set_max_write_buffer_number(4);
+            cf_opts.set_target_file_size_base(64 * 1024 * 1024);
             cf_opts.set_block_based_table_factory(&cf_block_opts(false));
             cf_opts
         };
@@ -168,9 +182,10 @@ impl PersistentStorage {
         let create_indexed_cf_opts = || -> Options {
             let mut cf_opts = Options::default();
             cf_opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
-            cf_opts.set_write_buffer_size(8388608);
-            cf_opts.set_max_write_buffer_number(2);
-            cf_opts.set_target_file_size_base(16777216);
+            // accounts and transactions take the bulk of every block's writes.
+            cf_opts.set_write_buffer_size(64 * 1024 * 1024);
+            cf_opts.set_max_write_buffer_number(4);
+            cf_opts.set_target_file_size_base(64 * 1024 * 1024);
             cf_opts.set_block_based_table_factory(&cf_block_opts(true));
             cf_opts
         };
@@ -181,9 +196,9 @@ impl PersistentStorage {
         let create_merkle_cf_opts = || -> Options {
             let mut cf_opts = Options::default();
             cf_opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
-            cf_opts.set_write_buffer_size(16777216);
-            cf_opts.set_max_write_buffer_number(3);
-            cf_opts.set_target_file_size_base(33554432);
+            cf_opts.set_write_buffer_size(32 * 1024 * 1024);
+            cf_opts.set_max_write_buffer_number(4);
+            cf_opts.set_target_file_size_base(64 * 1024 * 1024);
             // Point reads only (fixed-width keys, no prefix domain); leaves_under range-scans
             // but a range scan never consults the filter, so whole-key filtering is the right mode.
             let mut b = cf_block_opts(true);
