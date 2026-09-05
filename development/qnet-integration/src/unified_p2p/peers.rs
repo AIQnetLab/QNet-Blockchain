@@ -337,7 +337,7 @@ impl SimplifiedP2P {
                 // count-limit is reached only by genuinely new heads. Key = claimed `from`; the marker is
                 // advanced ONLY after a successful verify below, so a spoofed future-ts (invalid sig)
                 // cannot poison a real origin's dedup floor.
-                let (last_head_ts, last_head_h) = LAST_HEAD_TS.get(&from).map(|e| *e.value()).unwrap_or((0, 0));
+                let (last_head_ts, last_head_h) = LAST_HEAD_TS.get(&from).map(|e| (e.value().0, e.value().1)).unwrap_or((0, 0));
                 if timestamp <= last_head_ts && height <= last_head_h {
                     return;
                 }
@@ -361,12 +361,19 @@ impl SimplifiedP2P {
                     && Self::verify_health_ping_signature(&from, timestamp, height, &signature);
 
                 if sig_verified {
-                    // Authenticated head = the tip oracle (never a served-block height). Advance the dedup
-                    // marker (post-verify: anti-poison + anti-replay), then the monotonic oracle for any
-                    // verified peer.
-                    LAST_HEAD_TS.insert(from.clone(), (timestamp.max(last_head_ts), height.max(last_head_h)));
-                    let prev_max = SIGNED_HEAD_MAX.fetch_max(height, std::sync::atomic::Ordering::Relaxed);
-                    self.update_peer_last_seen_with_height(&from, Some(height), true);
+                    // Authenticated head = the tip oracle (never a served-block height). The origin's
+                    // newest head replaces its attested height even when lower: a peer that rolled back
+                    // must be able to lower its own claim, or every node keeps a phantom target and no
+                    // coordinator reads "synchronized" again. A replayed older head changes nothing.
+                    let now = self.current_timestamp();
+                    let newest = note_signed_head(&from, timestamp, height, now);
+                    let prev_max = SIGNED_HEAD_MAX.load(std::sync::atomic::Ordering::Relaxed);
+                    SIGNED_HEAD_MAX.store(signed_head_fresh_max(now), std::sync::atomic::Ordering::Relaxed);
+                    if newest {
+                        self.update_peer_last_seen_with_height(&from, Some(height), true);
+                    } else {
+                        self.update_peer_last_seen_with_height(&from, None, false);
+                    }
                     // Relay outward only a head that jumps the known tip by >= HEAD_REPLY_MIN_GAP. Heads
                     // arrive in ~emit-interval jumps, so this quenches the gossip wave at caught-up nodes
                     // (no relay when already near the head) while a lagging node still learns the real tip

@@ -270,10 +270,45 @@ pub static BEST_PEER_HEIGHT: AtomicU64 = AtomicU64::new(0);
 /// direct or relayed. NEVER fed by served-block heights, so a follower's own sync progress cannot
 /// poison it; the genesis (always present) keep it at the true tip. Floors get_best_peer_height.
 pub static SIGNED_HEAD_MAX: AtomicU64 = AtomicU64::new(0);
-/// Per-origin high-water (ts, height) of accepted signed heads: dedup + anti-replay + relay-once. Keyed on
-/// BOTH so a strictly-higher height always passes even if the origin's wall-clock ts regresses (cold
-/// restart / NTP step), keeping the dedup as monotonic as the height-keyed oracle it guards.
-static LAST_HEAD_TS: Lazy<DashMap<String, (u64, u64)>> = Lazy::new(DashMap::new);
+/// Latest accepted signed head per origin: (origin ts, height, local receive time). A head is the
+/// origin's claim about NOW, so its newest head (by its own ts) replaces an older higher one - a peer
+/// that rolled back lowers its own claim. Also the dedup + anti-replay floor.
+static LAST_HEAD_TS: Lazy<DashMap<String, (u64, u64, u64)>> = Lazy::new(DashMap::new);
+/// A signed head older than this (by local receive time) no longer speaks for its origin.
+pub(crate) const SIGNED_HEAD_FRESH_SECS: u64 = 300;
+
+/// Record a verified signed head. True when it is the origin's newest by its own ts - only then may it
+/// replace the peer's attested height; a replayed older head verifies but changes nothing.
+pub(crate) fn note_signed_head(origin: &str, ts: u64, height: u64, now: u64) -> bool {
+    let mut newest = true;
+    LAST_HEAD_TS.entry(origin.to_string())
+        .and_modify(|e| { if ts >= e.0 { *e = (ts, height, now); } else { newest = false; } })
+        .or_insert((ts, height, now));
+    newest
+}
+
+/// Highest fresh signed head across origins, 0 when none is fresh. The network tip is what the peers
+/// say NOW, never the highest thing any peer ever said: a monotone maximum survives every rollback
+/// of the peer that set it and parks the whole mesh below a phantom target.
+pub(crate) fn signed_head_fresh_max(now: u64) -> u64 {
+    LAST_HEAD_TS.iter()
+        .filter(|e| now.saturating_sub(e.value().2) <= SIGNED_HEAD_FRESH_SECS)
+        .map(|e| e.value().1)
+        .max()
+        .unwrap_or(0)
+}
+
+/// Highest attested height among peers attested within the freshness window; every peer when none
+/// is fresh (a joiner with only stale entries still needs a target). Corrupt values are ignored.
+pub(crate) fn best_of_attested(entries: impl Iterator<Item = (u64, u64)>, now: u64) -> u64 {
+    let (mut fresh, mut any) = (0u64, 0u64);
+    for (h, attested_at) in entries {
+        if h >= 2_000_000_000 { continue; }
+        any = any.max(h);
+        if now.saturating_sub(attested_at) <= SIGNED_HEAD_FRESH_SECS { fresh = fresh.max(h); }
+    }
+    if fresh > 0 { fresh } else { any }
+}
 /// One-shot guard for the required-task bring-up: every P2P entry path may call it.
 static REQUIRED_TASKS_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Latest locally-signed head, cached by the 15s emit tick. Co-sent on the serve channel and, by the
@@ -5976,5 +6011,38 @@ mod superseded_tail_tests {
         assert_eq!(superseded_tail_first(base + 20, round1), Some((base + 13, 1, 2, base + 12)));
         assert_eq!(round_protected_floor(base + 2, base + 20, |_| Some(3)), base + 2,
                    "a round above what this node certified vouches for nothing");
+    }
+}
+
+#[cfg(test)]
+mod signed_head_tests {
+    use super::*;
+
+    // The origin's newest head wins even when lower; a replayed older head changes nothing; a head
+    // that is not refreshed stops speaking for its origin.
+    #[test]
+    fn a_newer_lower_head_replaces_the_origins_claim_and_the_fresh_max_follows() {
+        let o = "signed_head_test_origin_a";
+        assert!(note_signed_head(o, 100, 500, 1_000));
+        assert_eq!(signed_head_fresh_max(1_000), signed_head_fresh_max(1_000).max(500));
+        assert!(note_signed_head(o, 120, 480, 1_010), "newer ts: the lower head is the claim now");
+        assert_eq!(LAST_HEAD_TS.get(o).map(|e| e.value().1), Some(480));
+        assert!(!note_signed_head(o, 110, 500, 1_020), "an older head is a replay, not a claim");
+        assert_eq!(LAST_HEAD_TS.get(o).map(|e| e.value().1), Some(480));
+        let far = 1_010 + SIGNED_HEAD_FRESH_SECS + 1;
+        assert!(LAST_HEAD_TS.iter().filter(|e| far.saturating_sub(e.value().2) <= SIGNED_HEAD_FRESH_SECS)
+                    .all(|e| e.key() != o), "past the window the head is no longer counted");
+    }
+
+    // The peer table's best is the freshest attested height, falling back to any attested height only
+    // when nothing is fresh.
+    #[test]
+    fn best_of_attested_prefers_fresh_entries_and_falls_back_to_all() {
+        let now = 10_000u64;
+        assert_eq!(best_of_attested(vec![(700, now - 10), (900, now - 1_000)].into_iter(), now), 700,
+                   "a stale higher claim does not outrank a fresh lower one");
+        assert_eq!(best_of_attested(vec![(900, now - 1_000)].into_iter(), now), 900, "nothing fresh: any entry");
+        assert_eq!(best_of_attested(vec![(u64::MAX, now)].into_iter(), now), 0, "corrupt values are ignored");
+        assert_eq!(best_of_attested(std::iter::empty(), now), 0);
     }
 }

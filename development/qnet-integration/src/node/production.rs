@@ -3126,12 +3126,10 @@ impl BlockchainNode {
                 // Each 30-block period selects ONE producer using cryptographic hash from qualified candidates
                 // Producer selection is cryptographically random but deterministic for consensus (Byzantine safety)
                 
-                // Height for deterministic validator sampling lives in LOCAL_BLOCKCHAIN_HEIGHT.
-                // It used to be published through an env var written once per block while readers
-                // called getenv concurrently — setenv can reallocate `environ`, which is undefined
-                // behaviour against a concurrent read and, under panic=abort, process death.
-                crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT
-                    .fetch_max(microblock_height, std::sync::atomic::Ordering::Relaxed);
+                // The loop's height mirror is never published as the node's head: the apply stage, the
+                // producer save and every rollback own LOCAL_BLOCKCHAIN_HEIGHT. Publishing the mirror here
+                // raced a concurrent rollback back up to the deleted tip, and the node then advertised
+                // that tip in every handshake and signed head.
 
                 // CRITICAL FIX: Use LOCAL height for deterministic producer selection
                 // All nodes at the same height will select the same producer
@@ -3859,7 +3857,11 @@ impl BlockchainNode {
                             // Synced per the SINGLE coordinator oracle (frontier-gated via the FSM —
                             // the duplicate inline frontier derivation is removed) AND within 10 of the
                             // production target, so we never produce far ahead of our stored tip.
-                            coordinator_is_synchronized()
+                            // Synchronized per the coordinator, or holding everything the committee has
+                            // certified: a stale height oracle must never withhold a slot from a node at
+                            // the certified frontier.
+                            (coordinator_is_synchronized()
+                                || qc_verified_frontier_cached() <= current_stored_height)
                                 && current_stored_height + 10 >= microblock_height
                         } else {
                             // Genesis phase: STRICT local-height check (coordinator is Synchronized{0}

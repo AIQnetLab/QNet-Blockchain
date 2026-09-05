@@ -2548,8 +2548,17 @@ impl SimplifiedP2P {
     /// v9.5: Highest reported height among connected peers — the tip oracle for the behind-decision,
     /// production-unlock and fork-resync, over-claim-clamped against the committee/genesis median.
     pub fn get_best_peer_height(&self) -> u64 {
-        let raw = BEST_PEER_HEIGHT.load(std::sync::atomic::Ordering::Relaxed)
-            .max(SIGNED_HEAD_MAX.load(std::sync::atomic::Ordering::Relaxed));
+        // Re-derived from what the peers say NOW (freshly attested table heights, fresh signed heads),
+        // never from a monotone high-water: after the highest peers rolled back, the old maximum kept
+        // every node "behind" a target nobody held and production stayed gated on all six.
+        let now = self.current_timestamp();
+        let table = best_of_attested(
+            self.connected_peers_lockfree.iter()
+                .map(|e| (e.value().last_block_height, e.value().last_height_attested_at)),
+            now,
+        );
+        let raw = table.max(signed_head_fresh_max(now));
+        BEST_PEER_HEIGHT.store(raw, std::sync::atomic::Ordering::Relaxed);
         self.clamp_overclaim(raw)
     }
 
@@ -2572,13 +2581,14 @@ impl SimplifiedP2P {
     /// was >= current BEST_PEER_HEIGHT). Also called periodically (every 30s) as safety net.
     /// O(N) where N = connected peers, but runs infrequently.
     pub fn recalculate_best_peer_height(&self) {
-        // Monotonic: only RAISE. Never lower the best-known head from currently-connected (served-low)
-        // peers — lowering re-collapses the target. Stale-high is bounded by the QC frontier floor.
-        let new_best = self.connected_peers_lockfree.iter()
-            .map(|entry| entry.value().last_block_height)
-            .max()
-            .unwrap_or(0);
-        BEST_PEER_HEIGHT.fetch_max(new_best, std::sync::atomic::Ordering::Relaxed);
+        // Follows the peers down as well as up; get_best_peer_height re-derives the same value.
+        let now = self.current_timestamp();
+        let new_best = best_of_attested(
+            self.connected_peers_lockfree.iter()
+                .map(|e| (e.value().last_block_height, e.value().last_height_attested_at)),
+            now,
+        ).max(signed_head_fresh_max(now));
+        BEST_PEER_HEIGHT.store(new_best, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Get node reputation by ID
