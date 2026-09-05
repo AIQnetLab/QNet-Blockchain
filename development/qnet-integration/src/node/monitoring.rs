@@ -651,9 +651,13 @@ impl BlockchainNode {
                     crate::unified_p2p::get_pending_macroblock_count(),
                     peers_count, rate_limiter_count, producer_cache_size);
 
-                // Log memory stats
-                println!("[INFO][MEMORY] node={} rss_mb={} virt_mb={} delta_mb={} {}",
-                         node_id, rss_mb, virt_mb, delta_mb, breakdown);
+                // Log memory stats. The RocksDB trio is what makes the total attributable: without it
+                // the breakdown showed every owned structure flat while RSS quadrupled.
+                let (db_cache_mb, db_memtable_mb, db_readers_mb) = storage.rocksdb_memory_mb();
+                println!("[INFO][MEMORY] node={} rss_mb={} virt_mb={} delta_mb={} \
+db_cache_mb={} db_memtable_mb={} db_readers_mb={} {}",
+                         node_id, rss_mb, virt_mb, delta_mb,
+                         db_cache_mb, db_memtable_mb, db_readers_mb, breakdown);
 
                 // Gossip-lane consumer liveness: a wedged consumer silently drops the whole
                 // default lane at ingress — the exact failure that starves checkpoint repair.

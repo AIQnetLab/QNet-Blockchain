@@ -2,6 +2,16 @@
 
 use super::*;
 
+/// Every column family this node opens. One list, shared by the opener and the memory probe.
+pub(crate) const ALL_COLUMN_FAMILIES: &[&str] = &[
+    "blocks", "transactions", "accounts", "metadata", "microblocks", "consensus",
+    "sync_state", "pending_rewards", "node_registry", "ping_history", "failover_events",
+    "snapshots", "tx_index", "tx_by_address", "attestations", "heartbeats",
+    "contract_storage", "fcm_tokens", "light_ping_keys", "mempool", "cross_shard_pending", "cross_shard_receipts",
+    "accounts_stage", "node_registry_stage", "pending_rewards_stage", "contract_storage_stage",
+    "merkle_leaves", "merkle_nodes", "wallet_token", "reward_agg",
+];
+
 impl PersistentStorage {
     /// Save raw data with a custom key
     pub fn save_raw(&self, key: &str, data: &[u8]) -> IntegrationResult<()> {
@@ -267,14 +277,7 @@ impl PersistentStorage {
         // with any extra ones already on disk (opened with generic opts). Forward (missing CF) is
         // covered by create_missing_column_families; this covers the reverse. Keep list in sync with
         // build_column_families() above.
-        const KNOWN_CF_NAMES: &[&str] = &[
-            "blocks", "transactions", "accounts", "metadata", "microblocks", "consensus",
-            "sync_state", "pending_rewards", "node_registry", "ping_history", "failover_events",
-            "snapshots", "tx_index", "tx_by_address", "attestations", "heartbeats",
-            "contract_storage", "fcm_tokens", "light_ping_keys", "mempool", "cross_shard_pending", "cross_shard_receipts",
-            "accounts_stage", "node_registry_stage", "pending_rewards_stage", "contract_storage_stage",
-            "merkle_leaves", "merkle_nodes", "wallet_token", "reward_agg",
-        ];
+        const KNOWN_CF_NAMES: &[&str] = ALL_COLUMN_FAMILIES;
         let open_descriptors = || -> Vec<ColumnFamilyDescriptor> {
             let mut cfs = build_column_families();
             if let Ok(existing) = DB::list_cf(&Options::default(), path) {
@@ -2151,6 +2154,27 @@ impl PersistentStorage {
             if let Ok(h) = digits.parse::<u64>() { return Ok(Some(h)); }
         }
         Ok(None)
+    }
+
+    /// RocksDB's own memory, in MB: (shared block cache, live memtables, open table readers).
+    /// The cache is one shared LRU so it is read once; the other two are per-CF and summed.
+    pub fn rocksdb_memory_mb(&self) -> (u64, u64, u64) {
+        const MB: u64 = 1024 * 1024;
+        let names = ALL_COLUMN_FAMILIES;
+        let mut cache = 0u64;
+        let (mut memtables, mut readers) = (0u64, 0u64);
+        for name in names {
+            let cf = match self.db.cf_handle(name) { Some(c) => c, None => continue };
+            if cache == 0 {
+                cache = self.db.property_int_value_cf(&cf, "rocksdb.block-cache-usage")
+                    .ok().flatten().unwrap_or(0);
+            }
+            memtables += self.db.property_int_value_cf(&cf, "rocksdb.cur-size-all-mem-tables")
+                .ok().flatten().unwrap_or(0);
+            readers += self.db.property_int_value_cf(&cf, "rocksdb.estimate-table-readers-mem")
+                .ok().flatten().unwrap_or(0);
+        }
+        (cache / MB, memtables / MB, readers / MB)
     }
 
     pub fn load_microblock(&self, height: u64) -> IntegrationResult<Option<Vec<u8>>> {

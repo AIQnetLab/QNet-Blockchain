@@ -816,6 +816,11 @@ impl Storage {
         self.persistent.load_microblock(height)
     }
 
+    /// RocksDB's own memory in MB: (block cache, memtables, table readers).
+    pub fn rocksdb_memory_mb(&self) -> (u64, u64, u64) {
+        self.persistent.rocksdb_memory_mb()
+    }
+
     /// Highest microblock height on disk (index seek, no scan, no ceiling).
     pub fn highest_stored_microblock(&self) -> IntegrationResult<Option<u64>> {
         self.persistent.highest_stored_microblock()
