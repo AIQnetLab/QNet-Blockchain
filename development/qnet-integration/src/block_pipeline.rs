@@ -1030,6 +1030,7 @@ pub const PIPELINE_OP_APPLY_SAVE_BLOCK: u64 = 25;
 pub const PIPELINE_OP_APPLY_SET_HEIGHT: u64 = 26;
 pub const PIPELINE_OP_APPLY_DEFERRED_FX: u64 = 27;
 pub const PIPELINE_OP_APPLY_SEAL_WAIT: u64 = 28;
+pub const PIPELINE_OP_APPLY_WARM_LOCK: u64 = 29;
 
 /// Decode an op marker into a short human-readable string for diagnostics.
 fn op_name(op: u64) -> &'static str {
@@ -1046,6 +1047,7 @@ fn op_name(op: u64) -> &'static str {
         PIPELINE_OP_APPLY_SET_HEIGHT => "apply:set_chain_height",
         PIPELINE_OP_APPLY_DEFERRED_FX => "apply:deferred_side_effects",
         PIPELINE_OP_APPLY_SEAL_WAIT => "apply:seal_backpressure_wait",
+        PIPELINE_OP_APPLY_WARM_LOCK => "apply:account_warm_lock",
         _ => "unknown",
     }
 }
@@ -3213,6 +3215,7 @@ impl BlockPipeline {
             // lock, this await will block. Watchdog reading op=verify:
             // send_to_apply with a stuck `applied` counter implicates
             // apply-stage backpressure as the root cause.
+            crate::unified_p2p::note_block_verified(block_height);
             metrics.mark_verify_op(block_height, PIPELINE_OP_VERIFY_SEND);
             let send_start = std::time::Instant::now();
             if let Err(_) = tx.send(verified).await {
@@ -3423,6 +3426,25 @@ impl BlockPipeline {
                 continue;
             }
 
+            // Executable only as the child of the applied frontier. Verify checks that the parent
+            // is STORED; after a rollback or a state resync the store holds bodies above the
+            // applied tip, and applying one runs it on the wrong state — every mismatch after
+            // that is this one out-of-order apply repeated. Skipped WITHOUT clearing pending: the
+            // catch-up loop re-delivers it once the frontier reaches its parent. The storage read
+            // sits on the slow path only, so a stale in-memory mirror can never wedge the stage.
+            if height > applied_tip + 1 {
+                let tip = ctx.storage.get_chain_height().unwrap_or(0).max(applied_tip);
+                if height > tip + 1 {
+                    static OOO_LAST_TIP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+                    metrics.future_dropped.fetch_add(1, Ordering::Relaxed);
+                    if OOO_LAST_TIP.swap(tip, Ordering::Relaxed) != tip && is_warn() {
+                        println!("[WARN][PIPELINE] apply_out_of_order h={} applied_tip={} action=skip", height, tip);
+                    }
+                    metrics.mark_apply_idle();
+                    continue;
+                }
+            }
+
             // OB1: while a snapshot rehydrate is repopulating the in-mem StateManager, an above-anchor
             // tail block would apply over empty/partial state → wrong state_root → rollback → apply-breaker
             // churn. Skip WITHOUT clearing pending so the catch-up loop re-delivers it once rehydrate has
@@ -3506,6 +3528,7 @@ impl BlockPipeline {
                 }
                 if !warm_set.is_empty() {
                     let warm_vec: Vec<String> = warm_set.into_iter().collect();
+                    metrics.mark_apply_op(height, PIPELINE_OP_APPLY_WARM_LOCK);
                     let sg_warm = ctx.state.read().await;
                     let hit = sg_warm.warm_accounts(&warm_vec);
                     drop(sg_warm);

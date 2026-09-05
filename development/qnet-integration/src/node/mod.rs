@@ -6212,6 +6212,56 @@ mod tests {
                 "the re-anchor must precede the behind-check that can `continue` past it");
     }
 
+    // Verify admits a block whose parent is STORED; after a rollback or a state resync the store holds
+    // bodies above the applied tip. Pin that apply refuses anything but the child of the applied
+    // frontier, and does so before the state lock — every mismatch storm after a rollback was this
+    // one out-of-order apply repeated.
+    #[test]
+    fn apply_refuses_a_block_above_the_applied_frontier_before_taking_the_state_lock() {
+        let src = include_str!("../block_pipeline.rs");
+        let dedup = src.find("if already_applied {").expect("dedup verdict must exist");
+        let order = src.find("apply_out_of_order").expect("out-of-order refusal must exist");
+        let lock = src.find("mark_apply_op(height, PIPELINE_OP_APPLY_STATE_LOCK)").expect("state lock mark");
+        assert!(dedup < order && order < lock,
+                "the frontier check must sit between the dedup verdict and the state lock");
+    }
+
+    // A lagging producer holds the network's block for its own next height in the verify->apply
+    // queue, where a storage read cannot see it. Pin that the slot check reads the verified frontier,
+    // that it is repeated under the state lock, and that a rollback lowers that frontier again.
+    #[test]
+    fn a_verified_block_in_flight_yields_the_producer_and_a_rollback_releases_it() {
+        let src = include_str!("production.rs");
+        let inflight = src.find("slot_occupied_inflight").expect("in-flight yield must exist");
+        let under_lock = src.find("slot_occupied_under_lock").expect("under-lock yield must exist");
+        let apply = src.find("block_timing h=").expect("inline apply timing");
+        assert!(inflight < under_lock && under_lock < apply,
+                "both yields must precede the inline apply");
+        crate::unified_p2p::note_block_verified(u64::MAX / 2);
+        crate::unified_p2p::truncate_stored_height(1_000);
+        assert!(crate::unified_p2p::highest_verified_height() <= 1_000,
+                "a rollback must lower the verified frontier with the stored one");
+    }
+
+    // Reconcile replayed 2000 heavy blocks under the state lock and compared ONE root at the end;
+    // a replay that could not reproduce the chain then descended and re-replayed them 36 times.
+    // Pin that every replayed block is checked against the root it carries, and that a divergent
+    // replay escalates to the peer-sourced resync instead of deepening.
+    #[test]
+    fn a_replayed_block_is_verified_against_its_own_root_and_a_divergence_escalates() {
+        let apply = include_str!("state_apply.rs");
+        let replay = apply.find("for mb in &blocks_to_replay").expect("replay loop");
+        let per_block = apply.find("replay_diverged").expect("per-block verification");
+        let end = apply.find("reconcile_complete mode=").expect("end-of-replay report");
+        assert!(replay < per_block && per_block < end, "the check must run inside the replay loop");
+        let prod = include_str!("production.rs");
+        let noted = prod.find("fn note_reconcile_failure").expect("failure counter");
+        let escalate = prod.find(r#"err.starts_with("replay_diverged")"#).expect("immediate escalation");
+        let wholesale = prod[escalate..].find("request_wholesale_state_resync").expect("resync request");
+        assert!(noted < escalate && wholesale < 2_000,
+                "a divergent replay must reach the wholesale request without a descent");
+    }
+
     // The settle-point index gets ONE block per epoch and no retry, so a node catching up across that
     // block never obtains it — and then cannot rebuild the epoch's shards, which truncates the claimable
     // figure it reports for every wallet. Pin that the miss is recovered while the epoch is still

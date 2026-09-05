@@ -226,6 +226,22 @@ pub fn note_block_stored(height: u64) {
 /// batches forever.
 pub fn truncate_stored_height(target: u64) {
     HIGHEST_STORED_HEIGHT.fetch_min(target, std::sync::atomic::Ordering::Relaxed);
+    HIGHEST_VERIFIED_HEIGHT.fetch_min(target, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Highest height that passed the verify stage on this node. It runs ahead of apply, so this is
+/// the earliest local proof that the network already holds a block for a height — a producer that
+/// still builds it forks itself. Bounded by stored+1 (verify needs the stored parent); lowered with
+/// the stored watermark on rollback.
+pub static HIGHEST_VERIFIED_HEIGHT: Lazy<Arc<AtomicU64>> =
+    Lazy::new(|| Arc::new(AtomicU64::new(0)));
+
+pub fn note_block_verified(height: u64) {
+    HIGHEST_VERIFIED_HEIGHT.fetch_max(height, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn highest_verified_height() -> u64 {
+    HIGHEST_VERIFIED_HEIGHT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Serve horizon: the highest height this node can answer for.

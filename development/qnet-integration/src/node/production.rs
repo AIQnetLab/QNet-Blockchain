@@ -50,7 +50,7 @@ impl BlockchainNode {
                                 1
                             }
                         };
-                        if count >= 3 {
+                        if count >= 3 || err.starts_with("replay_diverged") {
                             let now_ms = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
                             let last = LAST_WHOLESALE_MS.load(std::sync::atomic::Ordering::Relaxed);
@@ -5040,8 +5040,13 @@ impl BlockchainNode {
                         // below this point leaves state mutated with nothing to roll it back: the
                         // producer would then sign a state_root no validator can reproduce.
                         if next_block_height > 0 {
-                            if let Ok(Some(_)) = storage.load_microblock(next_block_height) {
-                                println!("[WARN][PROD] production_yielded h={} reason=slot_occupied", next_block_height);
+                            // Blocks are saved at apply, so a lagging node holds the network's block
+                            // for this height in its verify->apply queue long before storage sees it.
+                            let stored = matches!(storage.load_microblock(next_block_height), Ok(Some(_)));
+                            let verified = crate::unified_p2p::highest_verified_height() >= next_block_height;
+                            if stored || verified {
+                                println!("[WARN][PROD] production_yielded h={} reason={}", next_block_height,
+                                         if stored { "slot_occupied" } else { "slot_occupied_inflight" });
                                 crate::unified_p2p::BLOCK_BROADCAST_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
                                 continue;
                             }
@@ -5132,6 +5137,18 @@ impl BlockchainNode {
                     let mut side_idx = BlockSideIndices::default();
                     {
                         let state_guard = state.write().await;
+                        // Re-checked under the lock: the pipeline cannot interleave here, and a peer's
+                        // block for this height applied since the check above would otherwise be built
+                        // over — the producer path records no diff, so that costs a snapshot restore.
+                        if crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::SeqCst) >= next_block_height
+                            || crate::unified_p2p::highest_verified_height() >= next_block_height
+                            || storage.canonical_hash_at(next_block_height).is_some()
+                        {
+                            println!("[WARN][PROD] production_yielded h={} reason=slot_occupied_under_lock", next_block_height);
+                            drop(state_guard);
+                            crate::unified_p2p::BLOCK_BROADCAST_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
+                            continue;
+                        }
                         // The write guard is held through apply + Merkle finalize: every state
                         // reader (gossip TX validation included) waits on it, so this section's
                         // duration is bounded by BLOCK_GAS_LIMIT and measured in block_timing.

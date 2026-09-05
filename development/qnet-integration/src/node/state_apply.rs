@@ -631,6 +631,20 @@ impl BlockchainNode {
             let mut applied = 0u64;
             for mb in &blocks_to_replay {
                 let r = Self::apply_block_to_state(&sg, mb, storage, None);
+                // Per-block verification: a divergence is located at its first height, and a
+                // replay that cannot reproduce the chain fails in one block, not after all of
+                // them. The one-leaf phantom repair stays available at every step.
+                if mb.state_root != [0u8; 32] {
+                    let got = sg.finalize_merkle();
+                    if got != mb.state_root {
+                        match sg.repair_single_phantom(&mb.state_root) {
+                            Some(addr) => { repaired_phantom = Some(addr); }
+                            None => return Err(format!(
+                                "replay_diverged h={} expected={} computed={} replay_from={}",
+                                mb.height, hex::encode(&mb.state_root[..8]), hex::encode(&got[..8]), replay_from)),
+                        }
+                    }
+                }
                 // Replaying a stored block: it already owns its slot, so its side indices are written
                 // straight away (idempotent — lowest-height-wins and add-only).
                 Self::flush_block_side_indices(storage, mb.height, &r.side_indices);

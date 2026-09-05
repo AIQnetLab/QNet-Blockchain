@@ -654,9 +654,12 @@ impl BlockchainNode {
                 // Log memory stats. The RocksDB trio is what makes the total attributable: without it
                 // the breakdown showed every owned structure flat while RSS quadrupled.
                 let (db_cache_mb, db_memtable_mb, db_readers_mb) = storage.rocksdb_memory_mb();
+                let (heap_alloc_mb, heap_resident_mb, heap_retained_mb) = allocator_mb();
                 println!("[INFO][MEMORY] node={} rss_mb={} virt_mb={} delta_mb={} \
+heap_alloc_mb={} heap_resident_mb={} heap_retained_mb={} \
 db_cache_mb={} db_memtable_mb={} db_readers_mb={} {}",
                          node_id, rss_mb, virt_mb, delta_mb,
+                         heap_alloc_mb, heap_resident_mb, heap_retained_mb,
                          db_cache_mb, db_memtable_mb, db_readers_mb, breakdown);
 
                 // Gossip-lane consumer liveness: a wedged consumer silently drops the whole
@@ -990,3 +993,17 @@ db_cache_mb={} db_memtable_mb={} db_readers_mb={} {}",
     }
     
 }
+
+/// jemalloc's view of the Rust heap, in MB: (live allocations, resident pages, retained virtual).
+/// resident - allocated is allocator retention; rss - resident is memory outside jemalloc
+/// (RocksDB's C++ heap, thread stacks, code). Zero on targets that do not link jemalloc.
+#[cfg(not(target_env = "msvc"))]
+fn allocator_mb() -> (u64, u64, u64) {
+    use tikv_jemalloc_ctl::{epoch, stats};
+    if epoch::advance().is_err() { return (0, 0, 0); }
+    let mb = |r: Result<usize, _>| r.map(|b| (b >> 20) as u64).unwrap_or(0);
+    (mb(stats::allocated::read()), mb(stats::resident::read()), mb(stats::retained::read()))
+}
+
+#[cfg(target_env = "msvc")]
+fn allocator_mb() -> (u64, u64, u64) { (0, 0, 0) }

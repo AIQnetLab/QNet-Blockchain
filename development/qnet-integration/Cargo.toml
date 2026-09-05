@@ -156,3 +156,4 @@ path = "src/bin/qnet-node.rs"
 # glibc arenas retained multi-GB rss after load spikes. Linux targets only.
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = "0.6"
+tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
