@@ -88,6 +88,18 @@ impl BlockchainNode {
                     let anchor_floor = SNAPSHOT_ANCHOR_MB
                         .load(std::sync::atomic::Ordering::Acquire).saturating_mul(90);
                     let rollback_to = fork_h.max(anchor_floor);
+                    // Blocks produced under a certified failover round stay: only a higher certified
+                    // round can supersede them, never this heuristic. The round-1 leader once rolled
+                    // its own certified chain back to adopt a round-0 branch it could not verify.
+                    let protected = crate::unified_p2p::round_protected_floor(rollback_to, local_h, |h| {
+                        storage.load_microblock_auto_format(h).ok().flatten()
+                            .map(|b| b.timeout_round.saturating_add(b.carried_baseline))
+                    });
+                    if protected > rollback_to {
+                        println!("[WARN][FORK] rollback_floor_raised from={} to={} reason=certified_round_blocks",
+                                 rollback_to, protected);
+                    }
+                    let rollback_to = protected;
                     println!("[WARN][FORK] pipeline_detected fork_h={} local_h={} rollback_to={} anchor_floor={}",
                              fork_h, local_h, rollback_to, anchor_floor);
 
@@ -352,6 +364,7 @@ impl BlockchainNode {
         // Applied tip + 1 — same value the loop derived from its height view.
         let next_height = LAST_BLOCK_PRODUCED_HEIGHT.load(Ordering::Relaxed) + 1;
         if next_height <= 1 { return; } // nothing applied yet — nothing to fail over
+        Self::drop_superseded_tail(storage, next_height - 1);
         // Local liveness timer: wall-seconds since OUR applied height last
         // advanced. Slot-anchored block_ts must NOT drive this — it carries the
         // chain's lifetime production deficit and would trip the pacemaker against
@@ -784,6 +797,36 @@ impl BlockchainNode {
             crate::sync_manager::nudge_sync_check();
         }
 
+    }
+
+    /// A certified failover round supersedes every lower-round block above the tips the quorum
+    /// certified from. A node holding such blocks - it produced or adopted them without the
+    /// certificate - is off the network's chain until it drops them, and nothing else pulls it
+    /// back: peers reject its branch and it rejects theirs. Re-checked only when a certificate
+    /// lands (rounds of the current and previous window) or every 30 s.
+    fn drop_superseded_tail(storage: &std::sync::Arc<crate::storage::Storage>, tip: u64) {
+        static LAST: parking_lot::Mutex<(u64, u64, u64, u64)> = parking_lot::Mutex::new((0, 0, 0, 0));
+        let w = tip / 90;
+        let (r_w, r_prev) = (crate::unified_p2p::highest_certified_round_for(w),
+                             crate::unified_p2p::highest_certified_round_for(w.saturating_sub(1)));
+        if r_w == 0 && r_prev == 0 { return; }
+        let now = get_timestamp_safe();
+        {
+            let mut g = LAST.lock();
+            if g.0 == w && g.1 == r_w && g.2 == r_prev && now.saturating_sub(g.3) < 30 { return; }
+            *g = (w, r_w, r_prev, now);
+        }
+        let s = storage.clone();
+        if let Some((first, block_round, certified, quorum_tip)) =
+            crate::unified_p2p::superseded_tail_first(tip, |h| {
+                s.load_microblock_auto_format(h).ok().flatten()
+                    .map(|b| b.timeout_round.saturating_add(b.carried_baseline))
+            })
+        {
+            println!("[WARN][FORK] superseded_tail first_h={} block_round={} certified={} quorum_tip={} tip={} action=rollback_to={}",
+                     first, block_round, certified, quorum_tip, tip, first - 1);
+            crate::block_pipeline::signal_fork_recovery(first - 1);
+        }
     }
 
     /// Failover liveness pacemaker — a dedicated task, deliberately OUTSIDE the
@@ -2917,18 +2960,18 @@ impl BlockchainNode {
                         // Old: fast sync at >10, consensus blocked at >5 → gap 6-10 = no download, no consensus
                         // New: fast sync at >3 → covers all cases where consensus is blocked (max_allowed_lag=2-5)
                         if height_difference > 3 {
-                            println!("[WARN][SYNC] behind={} local={} network={}",
-                                     height_difference, microblock_height, network_height);
-
-                            // Behind the network → nudge the single sync coordinator; its check_desync
-                            // fires execute_sync (snapshot fast-path + pipelined microblock catch-up +
-                            // macroblock pass). Production stays withheld by the hard sync gate until
-                            // caught up, so no inline fetch or per-driver flag is needed here.
+                            // Advertised heights drive the catch-up, never the slot. Finality above our
+                            // tip is the one proof of being behind: n-f members sealed blocks we do not
+                            // hold. A higher head with nothing certified above us is a claim - two nodes
+                            // on a superseded branch advertised +70 and the four holding the certified
+                            // chain skipped every slot here while each failover round elected one of them.
+                            let behind_finality = frontier > microblock_height;
+                            behind_log(height_difference, microblock_height, network_height, frontier, behind_finality);
                             crate::sync_manager::nudge_sync_check();
-
-                            // Skip this production cycle — node is syncing
-                            tokio::time::sleep(Duration::from_millis(100)).await;
-                            continue;
+                            if behind_finality {
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                                continue;
+                            }
                         }
                     }
                 }
@@ -3063,15 +3106,17 @@ impl BlockchainNode {
                 // v10.1: Two-mode sync. No more "emergency sync".
                 // Mode 1: gap > max_allowed_lag → skip consensus, let fast sync (below) handle it
                 // Mode 2: gap <= max_allowed_lag → participate in consensus (live sync via ShredProtocol)
-                if local_stored_height + max_allowed_lag < expected_height {
+                // The peer median is a catch-up signal; the slot is skipped only below finality.
+                if local_stored_height + max_allowed_lag < expected_height
+                    && qc_verified_frontier_cached() > local_stored_height
+                {
                     let gap = expected_height.saturating_sub(local_stored_height);
-                    println!("[WARN][SYNC] not_synced local={} expected={} gap={} round={}",
-                            local_stored_height, expected_height, gap, current_round);
-
-                    // Don't participate in consensus — fall through to fast sync check below
-                    // (no `continue` here — fast sync section handles the actual downloading)
+                    if is_warn() {
+                        println!("[WARN][SYNC] not_synced local={} expected={} gap={} round={} frontier={}",
+                                 local_stored_height, expected_height, gap, current_round, qc_verified_frontier_cached());
+                    }
                     tokio::time::sleep(Duration::from_millis(100)).await;
-                    continue; // Skip consensus but loop back to fast sync check at top
+                    continue;
                 }
                 
                 if is_info() { println!("[INFO][MB] production_start nodes={} local={} expected={} lag={}", 
@@ -3222,10 +3267,12 @@ impl BlockchainNode {
                     // Allow 5-block tolerance for normal variance
                     const SYNC_LAG_THRESHOLD: u64 = 5;
                     
-                    if lag > SYNC_LAG_THRESHOLD && network_height > 0 {
-                        println!("[WARN][SYNC] Node is BEHIND network: local={}, network={}, lag={}", 
-                                 our_height, network_height, lag);
-                        println!("[WARN][SYNC] skipping_producer_selection reason=behind_network");
+                    // Same rule as the loop head: a claim of a higher head does not take the slot;
+                    // certified blocks above our tip do.
+                    if lag > SYNC_LAG_THRESHOLD && network_height > 0 && qc_verified_frontier_cached() > our_height {
+                        println!("[WARN][SYNC] Node is BEHIND network: local={}, network={}, lag={}, frontier={}",
+                                 our_height, network_height, lag, qc_verified_frontier_cached());
+                        println!("[WARN][SYNC] skipping_producer_selection reason=behind_finality");
                         
                         // STATE MACHINE: Update to Syncing
                         let progress = ((our_height as f64 / network_height as f64) * 100.0) as u8;
@@ -3248,13 +3295,19 @@ impl BlockchainNode {
                 // v4.6: Periodically announce VRF public key to peers (startup + every 90 blocks)
                 {
                     let last_announced = LAST_VRF_KEY_ANNOUNCE_HEIGHT.load(Ordering::Relaxed);
+                    // By height AND by wall time: a peer that lost this node's key row (a snapshot
+                    // promote) can only get it back from an announce, and on a stalled chain the
+                    // height never moves.
+                    static LAST_VRF_KEY_ANNOUNCE_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    let now_secs = get_timestamp_safe();
                     let should_announce = last_announced == 0
                         || next_block_height >= last_announced + 90
-                        || (next_block_height <= 5 && last_announced == 0);
+                        || now_secs >= LAST_VRF_KEY_ANNOUNCE_SECS.load(Ordering::Relaxed).saturating_add(300);
                     if should_announce {
                         if let Some(ref p2p) = unified_p2p {
                             p2p.broadcast_vrf_key_announce();
                             LAST_VRF_KEY_ANNOUNCE_HEIGHT.store(next_block_height, Ordering::Relaxed);
+                            LAST_VRF_KEY_ANNOUNCE_SECS.store(now_secs, Ordering::Relaxed);
                         }
                     }
                 }
@@ -3322,6 +3375,27 @@ impl BlockchainNode {
                 cache_expected_producer(next_block_height, &current_producer, certified_abs);
 
                 let mut is_my_turn_to_produce = current_producer == node_id;
+
+                // A tip block stamped with a failover round above what this node certified proves a
+                // certificate it has not adopted; electing on the lower round makes it the leader of a
+                // superseded round (a node synced the round-1 blocks and produced round 0 on top of
+                // them). Abstain until the certificate lands; the pull is re-issued here.
+                if is_my_turn_to_produce && microblock_height > 0 {
+                    if let Ok(Some(tip)) = storage.load_microblock_auto_format(microblock_height) {
+                        let tip_abs = tip.timeout_round.saturating_add(tip.carried_baseline);
+                        let slot_certified = crate::unified_p2p::certified_round_for_slot(microblock_height);
+                        if tip_abs > slot_certified {
+                            if is_warn() {
+                                println!("[WARN][PROD] round_evidence_ahead h={} tip_round={} certified={} action=abstain",
+                                         next_block_height, tip_abs, slot_certified);
+                            }
+                            if let Some(ref p2p) = unified_p2p {
+                                p2p.request_timeout_proofs(microblock_height / 90, next_block_height / 90);
+                            }
+                            is_my_turn_to_produce = false;
+                        }
+                    }
+                }
 
                 // Unvouched RAM state (a failed inline-apply rebuild) ⇒ yield the slot. Applying a
                 // block above the failure point is proof the state validates, so clear it there.
@@ -3435,6 +3509,9 @@ impl BlockchainNode {
                 // 1259 blocks behind, kept heartbeating, and the network sat at one height with
                 // `failover result=uncertain cache=0/5` until an operator intervened.
                 let sync_active = coordinator_is_syncing();
+                // Behind FINALITY, not behind a claim: the coordinator syncs toward advertised heads,
+                // which a superseded branch inflates; certified blocks above our tip cannot be faked.
+                let behind_finality = qc_verified_frontier_cached() > microblock_height;
                 let prod_unlocked = PRODUCTION_UNLOCKED.load(Ordering::Relaxed) == 1;
                 // Producing block N needs exactly one thing: N-1 applied. The FSM phase is derived
                 // state that this node's own idleness clears, so gating on it turned "failed to
@@ -3444,7 +3521,7 @@ impl BlockchainNode {
                 // An unproven state produces a block every peer rejects on state_root: the slot is
                 // lost either way, and yielding it to failover costs the network far less.
                 let suspect = crate::block_pipeline::state_suspect();
-                let producer_gated = sync_active || (!prod_unlocked && microblock_height > 5)
+                let producer_gated = behind_finality || (!prod_unlocked && microblock_height > 5)
                     || !have_parent || suspect;
                 if (is_my_turn_to_produce || in_leader_grace) && !producer_gated {
                     emit_producer_heartbeat(&node_id, &storage, &unified_p2p,
@@ -3459,8 +3536,8 @@ impl BlockchainNode {
                 if is_my_turn_to_produce {
                     if producer_gated {
                         if is_info() {
-                            println!("[INFO][PROD] gate_blocked h={} sync={} unlocked={} parent={} suspect={}",
-                                     next_block_height, sync_active, prod_unlocked, have_parent, suspect);
+                            println!("[INFO][PROD] gate_blocked h={} finality_behind={} sync={} unlocked={} parent={} suspect={}",
+                                     next_block_height, behind_finality, sync_active, prod_unlocked, have_parent, suspect);
                         }
                         is_my_turn_to_produce = false;
 
@@ -6718,5 +6795,18 @@ pub(super) async fn emit_producer_heartbeat(
             }
         }
         Err(e) => if is_warn() { println!("[WARN][HEARTBEAT] sign_failed err={}", e); },
+    }
+}
+
+/// The behind line at most once per 10 s per process: it used to print on every 100 ms pass.
+fn behind_log(gap: u64, local: u64, network: u64, frontier: u64, gate: bool) {
+    static LAST_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64).unwrap_or(0);
+    if now.saturating_sub(LAST_MS.load(Ordering::Relaxed)) < 10_000 { return; }
+    LAST_MS.store(now, Ordering::Relaxed);
+    if is_warn() {
+        println!("[WARN][SYNC] behind={} local={} network={} frontier={} gate={}",
+                 gap, local, network, frontier, if gate { "finality" } else { "none" });
     }
 }

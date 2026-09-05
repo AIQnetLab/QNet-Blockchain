@@ -1841,6 +1841,66 @@ pub fn certified_round_for_slot(h: u64) -> u64 {
     if w0 == w { read(w) } else { read(w).max(read(w0)) }
 }
 
+/// Windows a slot's certified round may be keyed under: its own, and the window its tenure started
+/// in when the tenure straddles a boundary (the same pair `certified_round_for_slot` reads).
+fn slot_windows(h: u64) -> (u64, u64) {
+    let mi = qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
+    let tenure_start = (h.saturating_sub(1) / crate::node::ROTATION_INTERVAL_BLOCKS)
+        .saturating_mul(crate::node::ROTATION_INTERVAL_BLOCKS)
+        .saturating_add(1);
+    (h / mi, tenure_start / mi)
+}
+
+/// A block at `h` carrying failover round `block_round` is superseded when this node holds a
+/// certificate for a higher round of that slot whose voters' tips all sit below `h`: the quorum
+/// moved on without the block. Returns (certified round, quorum tip) of the lowest such certificate.
+/// A missing certificate proves nothing and supersedes nothing.
+pub fn superseded_by_certified_round(h: u64, block_round: u64) -> Option<(u64, u64)> {
+    let certified = certified_round_for_slot(h);
+    if block_round >= certified { return None; }
+    let (w, w0) = slot_windows(h);
+    for r in (block_round + 1)..=certified {
+        let tc = TIMEOUT_CERTIFICATES.get(&(w, r))
+            .or_else(|| if w0 != w { TIMEOUT_CERTIFICATES.get(&(w0, r)) } else { None });
+        if let Some(tc) = tc {
+            let quorum_tip = tc.votes.iter().map(|v| v.tip_height).max().unwrap_or(0);
+            if h > quorum_tip { return Some((r, quorum_tip)); }
+        }
+    }
+    None
+}
+
+/// First height in the current and previous window whose stored block is superseded by a certified
+/// round: (height, block round, certified round, quorum tip). `load_round` yields a block's absolute
+/// failover round. Windows without a certified round cost nothing.
+pub fn superseded_tail_first(tip: u64, load_round: impl Fn(u64) -> Option<u64>) -> Option<(u64, u64, u64, u64)> {
+    let mi = qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
+    let lo = (tip / mi).saturating_sub(1).saturating_mul(mi).max(1);
+    for h in lo..=tip {
+        if certified_round_for_slot(h) == 0 { continue; }
+        let block_round = match load_round(h) { Some(r) => r, None => continue };
+        if let Some((certified, quorum_tip)) = superseded_by_certified_round(h, block_round) {
+            return Some((h, block_round, certified, quorum_tip));
+        }
+    }
+    None
+}
+
+/// The highest height in (rollback_to, local_h] holding a block produced under a certified failover
+/// round that no higher certificate has superseded; a heuristic rollback keeps it and everything
+/// under it. Bounded to two windows above `rollback_to`.
+pub fn round_protected_floor(rollback_to: u64, local_h: u64, load_round: impl Fn(u64) -> Option<u64>) -> u64 {
+    let mi = qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
+    let mut floor = rollback_to;
+    for h in (rollback_to + 1)..=local_h.min(rollback_to.saturating_add(2 * mi)) {
+        let certified = certified_round_for_slot(h);
+        if certified == 0 { continue; }
+        let r = match load_round(h) { Some(r) if r > 0 && r <= certified => r, _ => continue };
+        if superseded_by_certified_round(h, r).is_none() { floor = h; }
+    }
+    floor
+}
+
 /// Slot-keyed (relative round, baseline) for the producer, mirroring `rotation_round_and_baseline`
 /// but with the tenure-carried round above. Both fields come from the same baseline, so the
 /// verifier's `block_round + carried_baseline` reconstructs exactly this absolute round.
@@ -5862,5 +5922,59 @@ mod tests_failover_slot_key {
         assert_eq!(certified_round_for_slot(800_000 * 90), 0);
         assert_eq!(certified_round_for_slot(800_000 * 90 + 1), 0);
         assert_eq!(certified_round_for_slot(800_001 * 90 - 1), 0);
+    }
+}
+
+#[cfg(test)]
+mod superseded_tail_tests {
+    use super::*;
+
+    fn tc(w: u64, round: u64, tips: &[u64]) -> TimeoutProof {
+        TimeoutProof {
+            height: w, timeout_round: round, anchor: [0u8; 32],
+            votes: tips.iter().enumerate().map(|(i, t)| SignedTimeoutVote {
+                voter_id: format!("v{}", i), signature: Vec::new(), high_qc_idx: 0, high_qc_hash: [0u8; 32],
+                tip_height: *t, tip_hash: [0u8; 32],
+            }).collect(),
+        }
+    }
+    fn certify(w: u64, round: u64, tips: &[u64]) {
+        TIMEOUT_CERTIFICATES.insert((w, round), tc(w, round, tips));
+        HIGHEST_CERTIFIED_ROUND.entry(w).and_modify(|c| { if round > *c { *c = round; } }).or_insert(round);
+    }
+
+    // A round-1 certificate whose voters stood at +10 supersedes the round-0 blocks above +10 and
+    // nothing at or below it; a block that carries round 1 is not superseded by it.
+    #[test]
+    fn lower_round_blocks_above_the_quorum_tip_are_superseded() {
+        let _g = TEST_FAILOVER_STATE_LOCK.lock();
+        let w = 9_300_010u64;
+        let base = w * 90;
+        certify(w, 1, &[base + 10, base + 10, base + 9]);
+        let rounds = |h: u64| -> Option<u64> { if h <= base + 15 { Some(0) } else { None } };
+        assert_eq!(superseded_tail_first(base + 15, rounds), Some((base + 11, 0, 1, base + 10)),
+                   "the first round-0 block above the quorum tip");
+        assert_eq!(superseded_by_certified_round(base + 10, 0), None, "at the quorum tip: the voters had it");
+        assert_eq!(superseded_by_certified_round(base + 11, 1), None, "the round the certificate elected");
+        assert_eq!(superseded_tail_first(base + 9, |_| Some(0)), None, "nothing above the tip");
+    }
+
+    // The descent keeps certified-round blocks and everything under them, but not the ones a higher
+    // certificate formed below has already superseded.
+    #[test]
+    fn the_rollback_floor_stops_under_the_last_protected_block() {
+        let _g = TEST_FAILOVER_STATE_LOCK.lock();
+        let w = 9_300_020u64;
+        let base = w * 90;
+        certify(w, 1, &[base + 5, base + 5, base + 5]);
+        let round1 = |h: u64| -> Option<u64> { if h > base + 5 { Some(1) } else { Some(0) } };
+        assert_eq!(round_protected_floor(base + 2, base + 20, round1), base + 20,
+                   "every round-1 block is protected while round 1 is the highest certified");
+        certify(w, 2, &[base + 12, base + 12, base + 11]);
+        assert_eq!(round_protected_floor(base + 2, base + 20, round1), base + 12,
+                   "round-1 blocks above the round-2 quorum tip are superseded");
+        assert_eq!(superseded_tail_first(base + 20, round1), Some((base + 13, 1, 2, base + 12)));
+        assert_eq!(round_protected_floor(base + 2, base + 20, |_| Some(3)), base + 2,
+                   "a round above what this node certified vouches for nothing");
     }
 }

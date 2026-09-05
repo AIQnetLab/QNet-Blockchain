@@ -559,16 +559,17 @@ impl BlockchainNode {
                 return Err(format!("v2_qc_defer_anchor mb={} need_mb_n2={}", index, n2));
             }
         }
-        // The committee MUST be resolved exactly as the voters resolved it — same function, same
-        // roster mode. A verifier that derives a purer set than the signers used cannot check their
-        // signatures against it, which turns a local disagreement into a network-wide reject.
-        let qualified = Self::calculate_qualified_candidates(p2p, node_id, node_type, cp.window_head_height).await;
-        let mut ids: Vec<String> = qualified.iter().map(|(id, _)| id.clone()).collect();
-        ids.sort();
-        let committee = Self::select_consensus_committee(&ids, index, storage);
-        if qnet_consensus::checkpoint_bft::quorum_size(committee.len()) == 0 {
-            return Err(format!("v2_qc_no_committee mb={}", index));
-        }
+        // The committee is resolved exactly as the voters resolved it: the committed N-2 sample,
+        // through the same resolver the certificate verifier on the consensus loop uses. The
+        // roster-mode derivation this used before answered from the verifier's OWN seal frontier
+        // (Frozen/Defer), so a node behind on seals rejected certificates formed under the sealed set.
+        let committee: Vec<String> = match Self::committee_for_height(storage, cp.window_head_height) {
+            Some(c) if !c.is_empty() => c,
+            _ if index < 3 => crate::genesis_constants::GENESIS_CONSENSUS_PKS
+                .iter().map(|(id, _)| id.to_string()).collect(),
+            _ => return Err(format!("v2_qc_no_committee mb={}", index)),
+        };
+        let _ = (p2p, node_id, node_type);
         let quorum = match cp.recovery_anchor {
             None => qnet_consensus::checkpoint_bft::quorum_size(committee.len()),
             Some((a, ah)) => Self::resolve_recovery_pin(storage, index, &cp, a, ah, committee.len())?,
@@ -612,25 +613,30 @@ impl BlockchainNode {
             }
         }
         // C-2: qc.sigs are pk-stripped (compact). Resolve each signer's pk from on-chain committee state
-        // (deterministic + process-uniform: vrf_pk row, else the binary-pinned genesis anchor — NEVER the
-        // RAM registry, which is idle-evicted/TOFV ⇒ a fork source in a consensus verifier). Pre-resolved
-        // into a Sync map because the per-sig check runs inside QuorumCertificate::verify's rayon par_iter.
-        let pk_map: std::collections::HashMap<String, Vec<u8>> = qc.signers.iter().filter_map(|id| {
-            match storage.load_vrf_public_key(id) {
-                Ok(Some(p)) => Some((id.clone(), p)),
-                _ => crate::genesis_constants::get_genesis_anchor_pk(id).map(|p| (id.clone(), p)),
-            }
-        }).collect();
-        let verified = qc.verify(&committee, quorum, |voter, body, sig| {
+        // (committed_signer_pk: the pinned anchor, else a key bound to the chain's digest - the row, or
+        // the RAM copy re-stamped into it). Pre-resolved into a Sync map because the per-sig check runs
+        // inside QuorumCertificate::verify's rayon par_iter.
+        let pk_map: std::collections::HashMap<String, Vec<u8>> = qc.signers.iter()
+            .filter_map(|id| storage.committed_signer_pk(id).map(|p| (id.clone(), p))).collect();
+        let check = |voter: &str, body: &[u8], sig: &[u8]| -> bool {
             let pk = match pk_map.get(voter) { Some(p) => p, None => return false };
             match std::str::from_utf8(sig) {
                 Ok(s) => qnet_consensus::consensus_crypto::verify_consensus_signature_compact(
                     voter, &format!("QNET_BFT2_VOTE:{}", hex::encode(body)), s, pk),
                 Err(_) => false,
             }
-        }).is_ok();
-        if !verified {
-            return Err(format!("v2_qc_invalid mb={} signers={} committee={}", index, qc.signers.len(), committee.len()));
+        };
+        if let Err(why) = qc.verify(&committee, quorum, &check) {
+            // Name the member that fails: a certificate rejected for one signer is a fleet fault (a
+            // dropped key row, a divergent committee), and the bare count hid it for a day.
+            let bad = qc.signers.iter().zip(qc.sigs.iter()).find_map(|(v, s)| {
+                if !committee.iter().any(|c| c == v) { Some(format!("{}:non_member", v)) }
+                else if !pk_map.contains_key(v) { Some(format!("{}:pk_unresolved", v)) }
+                else if !check(v, &qc.checkpoint_hash, s) { Some(format!("{}:bad_sig", v)) }
+                else { None }
+            }).unwrap_or_default();
+            return Err(format!("v2_qc_invalid mb={} why={} signers={} committee={} quorum={} first_bad={}",
+                               index, why, qc.signers.len(), committee.len(), quorum, bad));
         }
         Ok(())
     }

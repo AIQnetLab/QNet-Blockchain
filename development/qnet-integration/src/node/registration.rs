@@ -450,6 +450,40 @@ impl BlockchainNode {
         }
     }
 
+    /// Boot backfill of signer-key rows from the chain: a super row whose committed key no source can
+    /// vouch for gets it back from its registration block (the NodeRegistration carries the raw key,
+    /// the row carries its digest). One block read per missing key, yielding between reads. A node
+    /// that lost the rows to a snapshot promote otherwise fails every certificate that member signs
+    /// until the member happens to announce its key again.
+    pub async fn backfill_signer_keys(storage: std::sync::Arc<crate::storage::Storage>) {
+        use sha3::{Digest, Sha3_256};
+        let rows = storage.super_roster_rows().unwrap_or_default();
+        let (mut restored, mut missing) = (0usize, 0usize);
+        for (i, (node_id, _, reg_height)) in rows.iter().enumerate() {
+            if storage.committed_signer_pk(node_id).is_some() { continue; }
+            missing += 1;
+            let tag = match storage.node_signer_key_commitment(node_id).ok().flatten() { Some(t) => t, None => continue };
+            let block = match storage.load_microblock_auto_format(*reg_height).ok().flatten() { Some(b) => b, None => continue };
+            let pk = block.transactions.iter().find_map(|tx| match &tx.tx_type {
+                qnet_state::TransactionType::NodeRegistration { node_id: id, .. } if id == node_id =>
+                    tx.dilithium_public_key.clone(),
+                _ => None,
+            });
+            if let Some(pk) = pk {
+                if hex::encode(Sha3_256::digest(&pk)) == tag && storage.save_vrf_public_key(node_id, &hex::encode(&pk)).is_ok() {
+                    crate::genesis_constants::register_vrf_public_key(node_id, &pk);
+                    let _ = qnet_consensus::consensus_crypto::register_consensus_pk_from_chain(node_id, &pk);
+                    restored += 1;
+                }
+            }
+            if i % 16 == 15 { tokio::task::yield_now().await; }
+        }
+        if (missing > 0 || restored > 0) && is_info() {
+            println!("[INFO][REGISTRY] signer_keys_backfilled restored={} unresolved={} rows={}",
+                     restored, missing - restored, rows.len());
+        }
+    }
+
     /// Cache node registration for fast lookups
     pub(super) async fn cache_node_registration(&self, node_id: &str, node_type: qnet_state::NodeType, wallet: String) {
         // Use storage for persistence
@@ -1620,5 +1654,55 @@ mod api_endpoint_index_tests {
         let rows = storage.super_roster_rows().expect("rows");
         assert_eq!(rows.iter().filter(|(id, _, h)| *h == 7 && id.starts_with("super_")).count(), 2,
                    "both supers sit in the roster index the list is built from");
+    }
+}
+
+#[cfg(test)]
+mod signer_key_backfill_tests {
+    use super::*;
+
+    fn reg_tx(node_id: &str, pk: Vec<u8>) -> qnet_state::Transaction {
+        let mut tx = qnet_state::Transaction {
+            hash: String::new(), from: "w".to_string(), to: None, amount: 0, nonce: 0,
+            gas_price: 0, gas_limit: 0, timestamp: 1000, signature: None, public_key: None,
+            tx_type: qnet_state::TransactionType::NodeRegistration {
+                node_id: node_id.to_string(), node_type: qnet_state::NodeType::Super,
+                wallet_address: "w".to_string(), registration_proof: String::new(),
+                api_endpoint: String::new(), burn_tx: String::new(), vrf_pk: Vec::new(),
+                burn_wallet: String::new(), burn_owner_sig: String::new(), burn_amount: 0, burn_cost: 0,
+                burn_attestors: Vec::new(), attest_epoch: 0,
+            },
+            data: None, dilithium_signature: None, dilithium_public_key: Some(pk),
+            chain_id: qnet_state::transaction::QNET_CHAIN_ID,
+        };
+        tx.hash = tx.calculate_hash();
+        tx
+    }
+
+    // A signer-key row a promote dropped comes back from the registration block at boot, bound to
+    // the row's digest; a key that does not hash to the commitment is never stamped.
+    #[tokio::test]
+    async fn a_missing_signer_key_row_is_restored_from_the_registration_block() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = std::sync::Arc::new(crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage"));
+        let raw = vec![0x42u8; 1952];
+        let mb = qnet_state::MicroBlock::new(9, 1009, [0u8; 32],
+            vec![reg_tx("super_bk", raw.clone()), reg_tx("super_bk_bad", vec![0x43u8; 1952])], "genesis_node_001".to_string());
+        storage.save_microblock(9, &bincode::serialize(&mb).expect("ser")).expect("save");
+        storage.save_node_registration_at_height_burn_vrf("super_bk", "super", "w", 1.0, 9, "", Some(&raw)).expect("row");
+        // The second row commits to a DIFFERENT key than its block carries.
+        storage.save_node_registration_at_height_burn_vrf("super_bk_bad", "super", "w", 1.0, 9, "", Some(&vec![0x44u8; 1952])).expect("row");
+        storage.delete_registry_row_for_test("node_registry", b"vrf_pk_super_bk");
+        storage.delete_registry_row_for_test("node_registry", b"vrf_pk_super_bk_bad");
+        assert!(crate::genesis_constants::get_vrf_public_key("super_bk").is_none(), "no RAM copy in this process");
+        assert_eq!(storage.committed_signer_pk("super_bk"), None, "nothing vouches for the key");
+
+        BlockchainNode::backfill_signer_keys(storage.clone()).await;
+
+        assert_eq!(storage.load_vrf_public_key("super_bk").expect("read").as_deref(), Some(raw.as_slice()),
+                   "the row is back from the chain");
+        assert_eq!(storage.committed_signer_pk("super_bk").as_deref(), Some(raw.as_slice()));
+        assert_eq!(storage.load_vrf_public_key("super_bk_bad").expect("read"), None,
+                   "a block key that does not match the commitment is not stamped");
     }
 }

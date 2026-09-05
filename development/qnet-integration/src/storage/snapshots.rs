@@ -2796,6 +2796,7 @@ impl Storage {
             let mut batch = WriteBatch::default();
             let mut n = 0u64;
             let mut dropped = 0u64;
+            let mut dropped_keys = 0u64;
             for item in self.persistent.db.iterator_cf(&s, rocksdb::IteratorMode::Start) {
                 let (k, v) = item?;
                 // WHITELIST. registry_root folds only srtr_/lrtr_ -> node_<id>, so every OTHER prefix in
@@ -2811,7 +2812,11 @@ impl Storage {
                         .and_then(|id| std::str::from_utf8(id).ok())
                         .map(|id| Self::staged_vrf_pk_matches_commitment(&self.persistent.db, &s, id, &v))
                         .unwrap_or(false);
-                    if !bound { dropped += 1; continue; }
+                    if !bound {
+                        dropped += 1;
+                        if k.starts_with(b"vrf_pk_") { dropped_keys += 1; }
+                        continue;
+                    }
                 }
                 batch.put_cf(&l, &k, &v);
                 n += 1;
@@ -2821,7 +2826,11 @@ impl Storage {
                 }
             }
             self.persistent.db.write(batch)?;
-            if dropped > 0 {
+            if dropped_keys > 0 {
+                // A signer key the certificate verifiers resolve against is gone from this node.
+                println!("[ERR][SNAPSHOT] registry_rows_dropped={} signer_keys_dropped={} reason=not_covered_by_registry_root",
+                         dropped, dropped_keys);
+            } else if dropped > 0 {
                 println!("[WARN][SNAPSHOT] registry_rows_dropped={} reason=not_covered_by_registry_root", dropped);
             }
         }

@@ -176,6 +176,37 @@ impl Storage {
         }
     }
     
+    /// The consensus signing key committed for `node_id`. With a chain commitment
+    /// (`node_<id>.vrf_pk_sha3`): the vrf_pk row iff it hashes to it, else the RAM copy of that same
+    /// key (chain apply or announce) re-stamped into the row a snapshot promote dropped, else the
+    /// pinned genesis anchor - every source is checked against the digest. Without a commitment the
+    /// row stands as it always did, then the anchor. None: the caller fails closed.
+    pub fn committed_signer_pk(&self, node_id: &str) -> Option<Vec<u8>> {
+        use sha3::{Digest, Sha3_256};
+        let row = self.load_vrf_public_key(node_id).ok().flatten();
+        let tag = match self.node_signer_key_commitment(node_id).ok().flatten() {
+            Some(t) => t,
+            // No chain commitment to check against: the row as it always was, else the anchor.
+            None => return row.or_else(|| crate::genesis_constants::get_genesis_anchor_pk(node_id)),
+        };
+        let bound = |pk: &[u8]| hex::encode(Sha3_256::digest(pk)) == tag;
+        if let Some(p) = row.as_ref() {
+            if bound(p) { return Some(p.clone()); }
+        }
+        if let Some(ram) = crate::genesis_constants::get_vrf_public_key(node_id)
+            .or_else(|| qnet_consensus::consensus_crypto::get_consensus_pk(node_id))
+        {
+            if bound(&ram) {
+                if row.is_none() {
+                    let _ = self.save_vrf_public_key(node_id, &hex::encode(&ram));
+                    println!("[INFO][STORAGE] signer_key_restamped node={} source=ram_digest_bound", node_id);
+                }
+                return Some(ram);
+            }
+        }
+        crate::genesis_constants::get_genesis_anchor_pk(node_id)
+    }
+
     /// v4.0: Load ALL stored VRF public keys (for startup restoration)
     pub fn load_all_vrf_public_keys(&self) -> IntegrationResult<Vec<(String, Vec<u8>)>> {
         let registry_cf = self.persistent.db.cf_handle("node_registry")
@@ -1130,4 +1161,36 @@ impl Storage {
         Ok(())
     }
     
+}
+
+#[cfg(test)]
+mod committed_signer_key_tests {
+    // The resolver answers from the committed row, heals a dropped row from the digest-bound RAM copy,
+    // and stays silent for an identity the chain never committed.
+    #[test]
+    fn a_dropped_signer_key_row_is_restamped_from_the_committed_ram_copy() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let s = crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage");
+        let raw = vec![7u8; 1952];
+        s.save_node_registration_at_height_burn_vrf("super_key_t", "super", "w", 1.0, 5, "", Some(&raw)).expect("row");
+        assert_eq!(s.committed_signer_pk("super_key_t").as_deref(), Some(raw.as_slice()), "row bound to the commitment");
+        assert!(s.load_vrf_public_key("super_key_t").expect("read").is_some(), "the registration wrote the key row");
+
+        // The promote whitelist dropped the row; RAM still holds the key the chain committed.
+        let dropped = tempfile::TempDir::new().expect("tempdir");
+        let d = crate::storage::Storage::new(dropped.path().to_str().unwrap()).expect("storage");
+        s.super_roster_for_each(|_, _, _, _| {}).expect("roster"); // the row set above is readable
+        let commit = s.node_signer_key_commitment("super_key_t").expect("commit").expect("tag");
+        let row = format!(r#"{{"reg_height":5,"wallet":"w","node_type":"super","vrf_pk_sha3":"{}"}}"#, commit);
+        d.put_registry_row_for_test("node_registry", b"node_super_key_t", row.as_bytes());
+        assert_eq!(d.committed_signer_pk("super_key_t"), None, "no row, no RAM copy: nothing to vouch for");
+        crate::genesis_constants::register_vrf_public_key("super_key_t", &raw);
+        assert_eq!(d.committed_signer_pk("super_key_t").as_deref(), Some(raw.as_slice()), "the RAM copy matches the digest");
+        assert_eq!(d.load_vrf_public_key("super_key_t").expect("read").as_deref(), Some(raw.as_slice()),
+                   "the row is stamped back for the next verifier");
+
+        let other = vec![9u8; 1952];
+        crate::genesis_constants::register_vrf_public_key("super_key_u", &other);
+        assert_eq!(d.committed_signer_pk("super_key_u"), None, "a RAM key without a chain commitment never authenticates");
+    }
 }

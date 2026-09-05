@@ -312,10 +312,7 @@ fn sig_ok(p2p: &SimplifiedP2P, signer: &str, msg: &str, sig: &[u8]) -> bool {
 /// reject. Honest votes carry embedded==vrf_pk ⇒ pass (no liveness cost).
 fn vote_sig_compact_ok(voter: &str, checkpoint_hash: &[u8], sig: &[u8]) -> bool {
     let storage = match crate::node::try_get_storage() { Some(s) => s, None => return false };
-    let pk = match storage.load_vrf_public_key(voter) {
-        Ok(Some(p)) => p,
-        _ => match crate::genesis_constants::get_genesis_anchor_pk(voter) { Some(p) => p, None => return false },
-    };
+    let pk = match storage.committed_signer_pk(voter) { Some(p) => p, None => return false };
     let sig_str = match std::str::from_utf8(sig) { Ok(s) => s, Err(_) => return false };
     let compact = match qnet_consensus::consensus_crypto::strip_embedded_pk(sig_str) { Some(c) => c, None => return false };
     qnet_consensus::consensus_crypto::verify_consensus_signature_compact(
@@ -326,17 +323,13 @@ fn vote_sig_compact_ok(voter: &str, checkpoint_hash: &[u8], sig: &[u8]) -> bool 
 /// anchor. Never the RAM registry: it is TOFV-capable and idle-evicted, so gating ingest on it would
 /// admit messages the certificate verifier can never reproduce.
 fn committed_pk(id: &str) -> Option<Vec<u8>> {
+    // Timeouts stay strict: an identity the chain never committed authenticates only as a genesis
+    // anchor, never through a bare row.
     let storage = crate::node::try_get_storage()?;
-    // The vrf_pk_ row is not covered by registry_root, so bind it to the row that IS —
-    // node_<id>.vrf_pk_sha3 — before letting it authenticate a consensus message. Same cross-check the
-    // equivocation and heartbeat paths already apply. No commitment ⇒ genesis anchor or nothing.
-    if let Ok(Some(p)) = storage.load_vrf_public_key(id) {
-        if let Ok(Some(tag)) = storage.node_signer_key_commitment(id) {
-            use sha3::{Digest, Sha3_256};
-            if hex::encode(Sha3_256::digest(&p)) == tag { return Some(p); }
-        }
+    match storage.node_signer_key_commitment(id) {
+        Ok(Some(_)) => storage.committed_signer_pk(id),
+        _ => crate::genesis_constants::get_genesis_anchor_pk(id),
     }
-    crate::genesis_constants::get_genesis_anchor_pk(id)
 }
 
 /// INGEST gate for a standalone timeout: the wire signature still carries the embedded pk, so strip it
@@ -364,26 +357,50 @@ fn timeout_sig_compact_ok(voter: &str, index: u64, high_qc_index: u64, sig: &[u8
 /// verify_v2_macroblock, the sole authority, which re-derives the pin from the certificate's bytes.
 /// So a disagreement here is liveness-only and can never fork.
 fn verify_qc(_p2p: &SimplifiedP2P, committee: &[String], qc: &QuorumCertificate) -> bool {
-    // C-2: qc.sigs are pk-stripped — resolve each signer's pk from on-chain committee state (deterministic
-    // + process-uniform: vrf_pk row, else the binary-pinned genesis anchor; NEVER the RAM registry) and
-    // verify compact. Pre-resolve a Sync map (the per-sig check runs in QuorumCertificate::verify's rayon
+    // C-2: qc.sigs are pk-stripped — resolve each signer's pk from committed state (committed_signer_pk:
+    // the pinned anchor, else a key bound to the chain's digest) and verify compact. Pre-resolve a Sync map (the per-sig check runs in QuorumCertificate::verify's rayon
     // par_iter). Storage not yet initialized ⇒ reject (cannot authenticate). MUST stay byte-identical to
     // the apply-time verifier (verify_v2_macroblock) or live-gossip and stored QC verify would diverge.
     let storage = match crate::node::try_get_storage() { Some(s) => s, None => return false };
-    let pk_map: std::collections::HashMap<String, Vec<u8>> = qc.signers.iter().filter_map(|id| {
-        match storage.load_vrf_public_key(id) {
-            Ok(Some(p)) => Some((id.clone(), p)),
-            _ => crate::genesis_constants::get_genesis_anchor_pk(id).map(|p| (id.clone(), p)),
-        }
-    }).collect();
-    qc.verify(committee, crate::node::rc_effective_quorum(qc.index, &qc.checkpoint_hash, committee.len()), |voter, body, sig| {
+    let pk_map: std::collections::HashMap<String, Vec<u8>> = qc.signers.iter()
+        .filter_map(|id| storage.committed_signer_pk(id).map(|p| (id.clone(), p))).collect();
+    let check = |voter: &str, body: &[u8], sig: &[u8]| -> bool {
         let pk = match pk_map.get(voter) { Some(p) => p, None => return false };
         match std::str::from_utf8(sig) {
             Ok(s) => qnet_consensus::consensus_crypto::verify_consensus_signature_compact(
                 voter, &sign_str("VOTE", body), s, pk),
             Err(_) => false,
         }
-    }).is_ok()
+    };
+    let quorum = crate::node::rc_effective_quorum(qc.index, &qc.checkpoint_hash, committee.len());
+    match qc.verify(committee, quorum, &check) {
+        Ok(()) => true,
+        Err(why) => {
+            // One unverifiable member fails the whole certificate; a bare verdict hid a dropped key
+            // row for a day. Name the first member that fails and how.
+            if crate::node::is_warn() {
+                println!("[WARN][BFT2] qc_rejected index={} why={} signers={} committee={} quorum={} {}",
+                         qc.index, why, qc.signers.len(), committee.len(), quorum,
+                         qc_reject_detail(committee, qc, &pk_map, &check));
+            }
+            false
+        }
+    }
+}
+
+/// `first_bad=<member>:<non_member|pk_unresolved|bad_sig>` for a rejected certificate, else "".
+fn qc_reject_detail(
+    committee: &[String], qc: &QuorumCertificate,
+    pk_map: &std::collections::HashMap<String, Vec<u8>>, check: &dyn Fn(&str, &[u8], &[u8]) -> bool,
+) -> String {
+    for (v, s) in qc.signers.iter().zip(qc.sigs.iter()) {
+        let why = if !committee.iter().any(|c| c == v) { "non_member" }
+            else if !pk_map.contains_key(v) { "pk_unresolved" }
+            else if !check(v, &qc.checkpoint_hash, s) { "bad_sig" }
+            else { continue };
+        return format!("first_bad={}:{}", v, why);
+    }
+    String::new()
 }
 
 /// The member a single-signature consensus message came from, or None for certificates (which carry

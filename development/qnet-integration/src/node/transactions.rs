@@ -1307,20 +1307,15 @@ impl BlockchainNode {
             // Tier-3 TOFV → forge). A non-registered attestor (no on-chain PK) cannot count. Genesis
             // attestors fall back to the binary-pinned anchor (deterministic + process-uniform on every
             // node) — belt-and-suspenders for the storage seed, never a forgeable RAM source.
-            let pk = match storage.load_vrf_public_key(attestor_id) {
-                Ok(Some(p)) => p,
-                _ => match crate::genesis_constants::get_genesis_anchor_pk(attestor_id) {
-                    Some(p) => p,
-                    None => {
-                        // vrf_pk unresolved (storage gap, e.g. an incomplete snapshot) ⇒ this attestor
-                        // cannot count toward the quorum. Surface it so a snapshot-completeness failure
-                        // is diagnosable rather than a silent sub-quorum drop.
-                        if is_warn() {
-                            println!("[WARN][BURN] attestor_pk_unresolved id={} reason=vrf_pk_absent", attestor_id);
-                        }
-                        continue;
+            let pk = match storage.committed_signer_pk(attestor_id) {
+                Some(p) => p,
+                None => {
+                    // No committed key resolvable: this attestor cannot count toward the quorum.
+                    if is_warn() {
+                        println!("[WARN][BURN] attestor_pk_unresolved id={} reason=no_committed_key", attestor_id);
                     }
-                },
+                    continue;
+                }
             };
             if qnet_consensus::consensus_crypto::verify_consensus_signature_bound(
                 attestor_id, &msg, sig, &pk).await

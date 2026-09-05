@@ -1023,7 +1023,10 @@ impl BlockchainNode {
                 // is indexed and indexes a bounded number of rows per call meanwhile.
                 if let Some(s) = try_get_storage() {
                     let s = s.clone();
-                    tokio::spawn(async move { Self::backfill_api_endpoints(s).await; });
+                    tokio::spawn(async move {
+                        Self::backfill_signer_keys(s.clone()).await;
+                        Self::backfill_api_endpoints(s).await;
+                    });
                 }
                 reload_snapshot_anchor();
                 // A recovered promote may have advanced chain_height — re-read so the rest of boot

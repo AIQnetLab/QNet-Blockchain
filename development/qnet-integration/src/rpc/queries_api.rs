@@ -1072,7 +1072,9 @@ pub(super) async fn handle_macroblock_proof(
         })));
     }
     let storage = blockchain.get_storage();
-    let committee = BlockchainNode::committee_for_height(&storage, mb.height).unwrap_or_default();
+    // At the window head the certificate covers - mb.height is the macroblock index here, and read
+    // as a height it named the genesis-era committee for every macroblock.
+    let committee = BlockchainNode::committee_for_height(&storage, cp.window_head_height).unwrap_or_default();
     // Pubkeys for the derived committee UNION the QC's actual signers. A recovery checkpoint is
     // certified by a different committee than committee_for_height derives, so the derived set alone
     // leaves the client unable to resolve a signer's pk. Serving extra keys expands nothing: the
@@ -1091,7 +1093,7 @@ pub(super) async fn handle_macroblock_proof(
             committee_pubkeys.insert(nid.clone(), json!(hex::encode(&pk)));
         }
     }
-    let epoch = (mb.height.saturating_sub(1)) / 90 + 1;
+    let epoch = (cp.window_head_height.saturating_sub(1)) / 90 + 1;
     // This macroblock's OWN epoch-transition data, ALL bound into checkpoint.epoch_commitment (QC-signed):
     // the raw eligible_producers bincode (the light client hashes these exact bytes AND parses node_ids
     // for the NEXT epoch's committee) and the cumulative ban set. The client anchors them via

@@ -908,7 +908,14 @@ impl Storage {
         match parsed["vrf_pk_sha3"].as_str() {
             Some(tag) if !tag.is_empty() => {
                 use sha3::{Digest, Sha3_256};
-                hex::encode(Sha3_256::digest(pk)) == tag
+                // The row holds the key as hex text (save_vrf_public_key); the commitment is the sha3
+                // of the RAW key. Hashing the text dropped every staged key at promote, and the joiner
+                // then failed each certificate carrying a non-genesis signature.
+                let raw = match std::str::from_utf8(pk).ok().and_then(|s| hex::decode(s).ok()) {
+                    Some(r) => r,
+                    None => return false,
+                };
+                hex::encode(Sha3_256::digest(&raw)) == tag
             }
             _ => false,
         }
@@ -970,6 +977,12 @@ impl Storage {
 
     #[cfg(test)]
     pub fn registry_cf_for_test(&self) -> String { "node_registry".to_string() }
+
+    #[cfg(test)]
+    pub fn delete_registry_row_for_test(&self, cf: &str, key: &[u8]) {
+        let h = self.persistent.db.cf_handle(cf).expect("registry CF");
+        self.persistent.db.delete_cf(&h, key).expect("delete registry row");
+    }
 
     #[cfg(test)]
     pub fn wipe_epoch_root_cache_for_test(&self) {
@@ -1484,4 +1497,28 @@ impl Storage {
         }
     }
 
+}
+
+#[cfg(test)]
+mod promote_key_binding_tests {
+    use sha3::{Digest, Sha3_256};
+
+    // A staged signer-key row is admitted iff its hex-encoded key hashes to the committed digest.
+    #[test]
+    fn a_staged_key_binds_to_its_commitment_through_the_hex_encoding() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let s = crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage");
+        let raw = vec![0x5Au8; 1952];
+        let tag = hex::encode(Sha3_256::digest(&raw));
+        let row = format!(r#"{{"reg_height":7,"wallet":"w","vrf_pk_sha3":"{}"}}"#, tag);
+        s.put_registry_row_for_test("node_registry_stage", b"node_super_x", row.as_bytes());
+        let cf = s.persistent.db.cf_handle("node_registry_stage").expect("stage cf");
+        let db = &s.persistent.db;
+        assert!(crate::storage::Storage::staged_vrf_pk_matches_commitment(db, &cf, "super_x", hex::encode(&raw).as_bytes()),
+                "the committed key, as the row stores it, is admitted");
+        assert!(!crate::storage::Storage::staged_vrf_pk_matches_commitment(db, &cf, "super_x", hex::encode(vec![1u8; 1952]).as_bytes()),
+                "a different key is refused");
+        assert!(!crate::storage::Storage::staged_vrf_pk_matches_commitment(db, &cf, "super_x", &raw),
+                "raw bytes are not the row encoding");
+    }
 }
