@@ -119,6 +119,23 @@ impl CheckpointConsensus {
     /// Highest certified index (the safety lock).
     pub fn locked_index(&self) -> u64 { self.locked_index }
 
+    /// Hash of the certificate held at `index`, if any.
+    pub fn qc_hash_at(&self, index: u64) -> Option<Hash> {
+        self.qcs.get(&index).map(|q| q.checkpoint_hash)
+            .or_else(|| self.high_qc.as_ref().filter(|q| q.index == index).map(|q| q.checkpoint_hash))
+    }
+
+    /// Entry counts of the per-round maps, for the memory census.
+    pub fn census(&self) -> [(&'static str, u64); 7] {
+        [("eng_proposals", self.proposals.len() as u64),
+         ("eng_votes", self.votes.values().map(|m| m.len()).sum::<usize>() as u64),
+         ("eng_timeouts", self.timeouts.values().map(|m| m.len()).sum::<usize>() as u64),
+         ("eng_qcs", self.qcs.len() as u64),
+         ("eng_peer_views", self.peer_views.len() as u64),
+         ("eng_head_votes", self.head_votes.len() as u64),
+         ("eng_index_votes", self.index_votes.len() as u64)]
+    }
+
     /// The member the leader rule elects for `index` under `parent_hash`, if the committee is set.
     pub fn leader_for(&self, index: u64, parent_hash: &Hash) -> Option<&NodeId> {
         if self.committee.is_empty() { return None; }

@@ -26,7 +26,8 @@
 //! - Enterprise security and monitoring
 
 // jemalloc with background decay: freed pages actually return to the OS, so
-// post-load rss reflects live data instead of allocator retention.
+// post-load rss reflects live data instead of allocator retention. Built unprefixed, it is the
+// process-wide malloc (RocksDB included), and `malloc_conf` below is the symbol it reads.
 #[cfg(not(target_env = "msvc"))]
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;

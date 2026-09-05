@@ -487,6 +487,7 @@ impl BlockchainNode {
         let node_id = self.node_id.clone();
         let storage = self.storage.clone();
         let unified_p2p = self.unified_p2p.clone();
+        let state = self.state.clone();
         
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(300)); // Every 5 minutes
@@ -662,6 +663,24 @@ db_cache_mb={} db_memtable_mb={} db_readers_mb={} {}",
                          node_id, rss_mb, virt_mb, delta_mb,
                          heap_alloc_mb, heap_resident_mb, heap_retained_mb,
                          db_cache_mb, db_memtable_mb, db_readers_mb, breakdown);
+
+                // Holder census: every RAM structure that grows per height, round or peer, as entry
+                // counts (`_mb` = bytes). Empty holders are omitted; a leak is a name that keeps
+                // climbing from tick to tick.
+                let mut census: Vec<(&'static str, u64)> = Vec::new();
+                census.extend(crate::consensus_v2_node::holder_census());
+                census.extend(crate::unified_p2p::holder_census());
+                if let Some(ref p2p) = unified_p2p { census.extend(p2p.holder_census()); }
+                census.extend(crate::block_pipeline::holder_census());
+                census.extend(crate::node::accountability_census());
+                census.extend(crate::galc::holder_census());
+                census.extend(crate::quantum_crypto::holder_census());
+                census.extend(crate::pq_crypto::holder_census());
+                if let Some(m) = crate::node::GLOBAL_MEMPOOL_INSTANCE.get() { census.extend(m.holder_census()); }
+                if let Ok(sm) = state.try_read() { census.push(("state_merkle_leaves", sm.merkle_leaf_count() as u64)); }
+                let line = census.iter().filter(|(_, v)| *v > 0)
+                    .map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join(" ");
+                println!("[INFO][MEMORY] census node={} {}", node_id, line);
 
                 // Gossip-lane consumer liveness: a wedged consumer silently drops the whole
                 // default lane at ingress — the exact failure that starves checkpoint repair.
@@ -995,9 +1014,10 @@ db_cache_mb={} db_memtable_mb={} db_readers_mb={} {}",
     
 }
 
-/// jemalloc's view of the Rust heap, in MB: (live allocations, resident pages, retained virtual).
-/// resident - allocated is allocator retention; rss - resident is memory outside jemalloc
-/// (RocksDB's C++ heap, thread stacks, code). Zero on targets that do not link jemalloc.
+/// jemalloc's view of the process heap, in MB: (live allocations, resident pages, retained virtual).
+/// jemalloc is the unprefixed system allocator on Linux, so this covers RocksDB's C++ heap too;
+/// resident - allocated is allocator retention; rss - resident is stacks, code and mmaps. Zero on
+/// targets that do not link jemalloc.
 #[cfg(not(target_env = "msvc"))]
 fn allocator_mb() -> (u64, u64, u64) {
     use tikv_jemalloc_ctl::{epoch, stats};

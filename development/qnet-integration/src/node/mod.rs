@@ -2931,6 +2931,25 @@ const VOTE_SIG_WINDOW: u64 = 8;
 const VOTE_SWEEP_STEP: u64 = 64;
 static VOTE_SWEEP_NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Entry counts (and bytes of the proposal/signature stores) of the accountability caches, for
+/// the memory census.
+pub fn accountability_census() -> Vec<(&'static str, u64)> {
+    vec![
+        ("acc_vote_first_seen", VOTE_FIRST_SEEN.len() as u64),
+        ("acc_vote_first_sig", VOTE_FIRST_SIG.len() as u64),
+        ("acc_vote_first_sig_mb", (VOTE_FIRST_SIG.iter().map(|e| e.value().len()).sum::<usize>() >> 20) as u64),
+        ("acc_proposal_cache", VOTE_PROPOSAL_CACHE.len() as u64),
+        ("acc_proposal_cache_mb", (VOTE_PROPOSAL_CACHE.iter().map(|e| e.value().len()).sum::<usize>() >> 20) as u64),
+        ("acc_proposal_meta", VOTE_PROPOSAL_META.len() as u64),
+        ("acc_head_first_seen", VOTE_HEAD_FIRST_SEEN.len() as u64),
+        ("acc_vote_evidence", VOTE_EQUIVOCATION_EVIDENCE.len() as u64),
+        ("acc_block_evidence", BLOCK_EQUIVOCATION_EVIDENCE.len() as u64),
+        ("acc_value_verify_cache", VALUE_VERIFY_CACHE.len() as u64),
+        ("acc_oot_producers", OOT_PRODUCER_COUNT.len() as u64),
+        ("rc_heard", RC_HEARD.read().len() as u64),
+    ]
+}
+
 /// Evict everything outside the retention windows. Driven by a monotone WATERMARK, not by
 /// `index % STEP`: a view jump can step over every multiple of the step, and a halt advances the
 /// index one view at a time while nothing commits — under a modulus the sweep could then never fire

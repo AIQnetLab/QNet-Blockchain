@@ -44,12 +44,18 @@ fn sign_str(domain: &str, body: &[u8]) -> String {
 /// bounded CPU, the loop untouched. 2 concurrent is generous vs the legit rate (~1 cert per checkpoint, ≪1/s).
 static CERT_VERIFY_SEM: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 
+/// How a TC's embedded high QC is checked: skipped when this node already holds that exact
+/// certificate, else over the committee of the window it certifies.
+#[derive(Debug, PartialEq)]
+enum HighQcCheck { Held, Over(Vec<String>) }
+
 /// OFF-LOOP verify of a checkpoint cert (Qc/Tc). Stale (below our monotonic frontier) ⇒ drop; else take a
 /// concurrency permit (over-limit ⇒ drop, re-gossiped) and verify on a blocking worker. On success, re-inject
 /// V2Event::CertVerified(bytes) — the INTERNAL trusted variant — so the loop applies it WITHOUT the expensive
-/// re-verify. The committee is captured at dispatch (deterministic per window index), so the verify is correct
-/// even if the driver advances before the result returns; a then-stale cert is a monotonic no-op in the driver.
-fn dispatch_cert_verify(data: Vec<u8>, p2p: &Arc<SimplifiedP2P>, committee: &[String], current: u64) {
+/// re-verify. `committee` is the set of the window the certificate itself certifies (cert_plan resolved it on
+/// the loop), so the check stays correct across an epoch boundary and while the driver advances; a then-stale
+/// cert is a monotonic no-op in the driver.
+fn dispatch_cert_verify(data: Vec<u8>, p2p: &Arc<SimplifiedP2P>, committee: Vec<String>, high_qc: HighQcCheck, current: u64) {
     let msg = match bincode::deserialize::<ConsensusMsg>(&data) { Ok(m) => m, Err(_) => return };
     if msg_index(&msg) < current { return; }            // stale ⇒ can't advance a monotonic driver
     if committee.is_empty() { return; }                 // no committee to verify against yet
@@ -61,10 +67,18 @@ fn dispatch_cert_verify(data: Vec<u8>, p2p: &Arc<SimplifiedP2P>, committee: &[St
         Err(_) => { CERT_SHED.fetch_add(1, Ordering::Relaxed); return; }
     };
     let p2p = p2p.clone();
-    let committee = committee.to_vec();
     tokio::task::spawn_blocking(move || {
         let _permit = permit; // held for the verify's duration
-        if verify_msg(&p2p, &committee, &msg) {
+        let ok = match &msg {
+            ConsensusMsg::Qc(qc) => verify_qc(&p2p, &committee, qc),
+            ConsensusMsg::Tc(tc) => tc.verify(
+                &committee, qnet_consensus::checkpoint_bft::quorum_size(committee.len()),
+                |t| timeout_sig_compact_ok(&t.voter, t.index, t.high_qc_index, &t.signature),
+                |qc| match &high_qc { HighQcCheck::Held => true, HighQcCheck::Over(c) => verify_qc(&p2p, c, qc) },
+            ).is_ok(),
+            _ => false,
+        };
+        if ok {
             if let Some(tx) = V2_TX.get() { let _ = tx.send(V2Event::CertVerified(data)); }
         }
     });
@@ -128,6 +142,7 @@ fn process_authenticated(
     window_buf: &std::collections::HashMap<u64, WindowContent>,
     p2p: &Arc<SimplifiedP2P>,
     committee: &mut Vec<String>,
+    committee_window: u64,
     pending: &mut Vec<Vec<u8>>,
     max_pending: usize,
     heard: &mut std::collections::HashMap<String, std::time::Instant>,
@@ -153,7 +168,7 @@ fn process_authenticated(
                 }
             }
             effs.extend(try_propose(driver, window_buf, storage, committee));
-            effs.extend(drain_pending(driver, window_buf, storage, p2p, committee, pending, max_pending, heard));
+            effs.extend(drain_pending(driver, window_buf, storage, p2p, committee, committee_window, pending, max_pending, heard));
             effs
         }
         ContentCheck::TailDiverged(heights) => {
@@ -1030,7 +1045,8 @@ fn check_content(storage: &Storage, buf: &std::collections::HashMap<u64, WindowC
 
 fn drain_pending(
     driver: &mut ConsensusDriver, buf: &std::collections::HashMap<u64, WindowContent>,
-    storage: &Storage, p2p: &Arc<SimplifiedP2P>, committee: &[String], pending: &mut Vec<Vec<u8>>, max: usize, heard: &mut std::collections::HashMap<String, std::time::Instant>,
+    storage: &Storage, p2p: &Arc<SimplifiedP2P>, committee: &[String], committee_window: u64,
+    pending: &mut Vec<Vec<u8>>, max: usize, heard: &mut std::collections::HashMap<String, std::time::Instant>,
 ) -> Vec<Effect> {
     if pending.is_empty() || committee.is_empty() { return Vec::new(); }
     let cur = driver.current_index();
@@ -1058,15 +1074,17 @@ fn drain_pending(
                 // as the live path, audit F7): dispatch to the bounded off-loop worker; on success it
                 // re-enters as CertVerified and applies without re-verify.
                 if matches!(&m, ConsensusMsg::Qc(_) | ConsensusMsg::Tc(_)) {
-                    dispatch_cert_verify(data, p2p, committee, cur);
+                    let (cmt, hq) = cert_plan(&m, driver, committee, committee_window, storage);
+                    dispatch_cert_verify(data, p2p, cmt, hq, cur);
                     continue;
                 }
                 // Buffered replay applies the SAME sig + content gate as the live path — a Proposal whose
                 // window content we cannot independently reproduce is never handed to the driver.
-                if verify_msg(p2p, committee, &m) {
+                if verify_msg(p2p, &member_set(&m, driver, committee, committee_window, storage), &m) {
                     // Same census the live path keeps: a member whose message only ever reaches us
                     // through replay is demonstrably alive, and omitting it under-counts liveness.
-                    if let Some(sender) = msg_sender(&m) {
+                    // Only the loop's own committee: `heard` is that set's liveness census.
+                    if let Some(sender) = msg_sender(&m).filter(|s| committee.iter().any(|c| c == s)) {
                         heard.insert(sender.to_string(), std::time::Instant::now());
                     }
                     match check_content(storage, buf, &m) {
@@ -1175,6 +1193,19 @@ pub fn record_catchup_bundle(index: u64, bytes: Vec<u8>) {
 
 /// 0 until the runtime has driven at least one tick.
 pub fn v2_next_window_head() -> u64 { V2_NEXT_WINDOW_HEAD.load(Ordering::Relaxed) }
+
+/// Per-round entry counts published by the consensus loop each view tick; read by the memory census.
+static LOOP_CENSUS: parking_lot::Mutex<Vec<(&'static str, u64)>> = parking_lot::Mutex::new(Vec::new());
+
+/// Holders this module owns, for the memory census.
+pub fn holder_census() -> Vec<(&'static str, u64)> {
+    let mut out = LOOP_CENSUS.lock().clone();
+    out.push(("v2_catchup_bundles", CATCHUP_BUNDLES.len() as u64));
+    out.push(("v2_catchup_bundles_mb", (CATCHUP_BUNDLES.iter().map(|e| e.value().len()).sum::<usize>() >> 20) as u64));
+    out.push(("v2_inbound_mb", (V2_INBOUND_BYTES.load(Ordering::Relaxed) >> 20) as u64));
+    out.push(("v2_window_committees", WINDOW_COMMITTEES.lock().map.len() as u64));
+    out
+}
 
 static CONTENT_REJECTS: AtomicUsize = AtomicUsize::new(0);
 static CERT_SHED: AtomicUsize = AtomicUsize::new(0);
@@ -1371,6 +1402,114 @@ fn committee_for_window(storage: &Storage, w: u64) -> Option<Vec<String>> {
             .iter().map(|(id, _)| id.to_string()).collect());
     }
     crate::node::BlockchainNode::committee_for_height(storage, h)
+}
+
+/// Committees by window, so a certificate from a neighbouring epoch does not re-derive the N-2
+/// sample (a full eligible-set decode) on the consensus loop. A few epochs around the view; cleared
+/// when a sealed macroblock is deleted, since a re-seal can change the derivation.
+struct WindowCommittees { seq: u64, map: std::collections::BTreeMap<u64, Vec<String>> }
+static WINDOW_COMMITTEES: parking_lot::Mutex<WindowCommittees> =
+    parking_lot::Mutex::new(WindowCommittees { seq: 0, map: std::collections::BTreeMap::new() });
+
+fn committee_for_window_cached(storage: &Storage, w: u64) -> Option<Vec<String>> {
+    const KEEP: usize = 8;
+    let seq = crate::storage::macroblock_delete_seq();
+    {
+        let mut g = WINDOW_COMMITTEES.lock();
+        if g.seq != seq { g.map.clear(); g.seq = seq; }
+        if let Some(c) = g.map.get(&w) { return Some(c.clone()); }
+    }
+    let c = committee_for_window(storage, w)?;
+    let mut g = WINDOW_COMMITTEES.lock();
+    g.map.insert(w, c.clone());
+    while g.map.len() > KEEP {
+        let oldest = match g.map.keys().next() { Some(k) => *k, None => break };
+        g.map.remove(&oldest);
+    }
+    Some(c)
+}
+
+/// Where a message's committee comes from. A certificate names no head of its own: it is placed
+/// by the proposal this node holds at its index, else by the view being driven.
+#[derive(Debug, PartialEq)]
+enum CertWindow { Known(u64), Current, Unplaced }
+
+/// The window a certificate at `index` certifies, as this node can place it.
+fn window_of_index(driver: &ConsensusDriver, index: u64) -> CertWindow {
+    let k = qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL;
+    match driver.head_of(index) {
+        Some(h) => CertWindow::Known(h / k),
+        None if index == driver.current_index() => CertWindow::Current,
+        None => CertWindow::Unplaced,
+    }
+}
+
+/// The window a view-change message at `index` is retrying: the one after its sender's high QC.
+/// A sender with no QC yet (`high_qc_index == 0`) holds no head we could place it by.
+fn window_of_view(driver: &ConsensusDriver, index: u64, high_qc_index: u64) -> CertWindow {
+    let k = qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL;
+    match driver.head_of(high_qc_index) {
+        Some(h) => CertWindow::Known(h / k + 1),
+        None if index == driver.current_index() => CertWindow::Current,
+        None => CertWindow::Unplaced,
+    }
+}
+
+/// The set a message is checked over, given the window it was placed in. `Current` and the loop's
+/// own window reuse the loop committee; a window within one epoch of it resolves through `lookup`;
+/// anything else falls back to the loop committee, so a foreign certificate fails closed and is
+/// re-gossiped once this node can place it. The one-epoch bound keeps a member that names
+/// arbitrary old heads from forcing a committee derivation per message on the consensus loop.
+fn committee_for<'a>(win: CertWindow, committee: &'a [String], committee_window: u64,
+                     lookup: impl Fn(u64) -> Option<Vec<String>>) -> std::borrow::Cow<'a, [String]> {
+    let epoch_windows = qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL
+        / qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL;
+    match win {
+        CertWindow::Known(w) if w != committee_window && w.abs_diff(committee_window) <= epoch_windows => match lookup(w) {
+            Some(c) => std::borrow::Cow::Owned(c),
+            None => std::borrow::Cow::Borrowed(committee),
+        },
+        _ => std::borrow::Cow::Borrowed(committee),
+    }
+}
+
+/// Committee and high-QC plan for a certificate about to be verified off-loop. A TC is checked
+/// over the window its members are retrying; its embedded high QC over the window IT certifies,
+/// or not at all when this node already holds that certificate.
+fn cert_plan_with(msg: &ConsensusMsg, driver: &ConsensusDriver, committee: &[String], committee_window: u64,
+                  lookup: impl Fn(u64) -> Option<Vec<String>>) -> (Vec<String>, HighQcCheck) {
+    match msg {
+        ConsensusMsg::Qc(qc) => (
+            committee_for(window_of_index(driver, qc.index), committee, committee_window, &lookup).into_owned(),
+            HighQcCheck::Held),
+        ConsensusMsg::Tc(tc) => {
+            let hq_idx = tc.high_qc.as_ref().map(|q| q.index).unwrap_or(0);
+            let own = committee_for(window_of_view(driver, tc.index, hq_idx), committee, committee_window, &lookup).into_owned();
+            let hq = match &tc.high_qc {
+                Some(hq) if !driver.holds_qc(hq.index, &hq.checkpoint_hash) => HighQcCheck::Over(
+                    committee_for(window_of_index(driver, hq.index), committee, committee_window, &lookup).into_owned()),
+                _ => HighQcCheck::Held,
+            };
+            (own, hq)
+        }
+        _ => (committee.to_vec(), HighQcCheck::Held),
+    }
+}
+
+fn cert_plan(msg: &ConsensusMsg, driver: &ConsensusDriver, committee: &[String], committee_window: u64,
+             storage: &Storage) -> (Vec<String>, HighQcCheck) {
+    cert_plan_with(msg, driver, committee, committee_window, |w| committee_for_window_cached(storage, w))
+}
+
+/// Membership set for a single-signature message. A view-change message is checked over the
+/// committee of the window its sender is retrying; everything else is at the view being driven.
+fn member_set<'a>(msg: &ConsensusMsg, driver: &ConsensusDriver, committee: &'a [String], committee_window: u64,
+                  storage: &Storage) -> std::borrow::Cow<'a, [String]> {
+    match msg {
+        ConsensusMsg::Timeout(tm) => committee_for(window_of_view(driver, tm.index, tm.high_qc_index),
+            committee, committee_window, |w| committee_for_window_cached(storage, w)),
+        _ => std::borrow::Cow::Borrowed(committee),
+    }
 }
 
 /// Hold `committee` on the driver's next window, resolving once per window rather than per message,
@@ -1870,6 +2009,22 @@ pub async fn run(
                              driver.current_index(), driver.next_window(), last_signaled,
                              driver.committee().len(), driver.is_leader_now(), window_buf.len());
                 }
+                // Holder census for the memory monitor: entry counts of every per-round structure
+                // this task owns. O(entries) sums on a 4 s tick.
+                {
+                    let mut c: Vec<(&'static str, u64)> = vec![
+                        ("v2_pending", pending.len() as u64),
+                        ("v2_pending_mb", (pending.iter().map(|d| d.len()).sum::<usize>() >> 20) as u64),
+                        ("v2_window_buf", window_buf.len() as u64),
+                        ("v2_window_buf_mb", (window_buf.values()
+                            .map(|w| w.eligible.len() + w.committee.len() * 48 + w.mb_hashes.len() * 32)
+                            .sum::<usize>() >> 20) as u64),
+                        ("v2_heard", heard.len() as u64),
+                    ];
+                    c.extend(driver.census());
+                    c.extend(driver.engine_census());
+                    *LOOP_CENSUS.lock() = c;
+                }
                 let rejects = CONTENT_REJECTS.swap(0, Ordering::Relaxed);
                 let vfails = VERIFY_FAILS.swap(0, Ordering::Relaxed);
                 let shed = CERT_SHED.swap(0, Ordering::Relaxed);
@@ -2033,13 +2188,15 @@ pub async fn run(
                                 // would starve timeouts + every other event (finality stall at scale). Dispatch
                                 // the verify to a bounded blocking worker; on success it re-injects
                                 // V2Event::CertVerified so the loop applies it without the expensive re-verify.
-                                dispatch_cert_verify(data, &p2p, &committee, driver.current_index());
+                                let (cmt, hq) = cert_plan(&msg, &driver, &committee, committee_window, &storage);
+                                dispatch_cert_verify(data, &p2p, cmt, hq, driver.current_index());
                                 Vec::new()
-                            } else if verify_msg(&p2p, &committee, &msg) {
+                            } else if verify_msg(&p2p, &member_set(&msg, &driver, &committee, committee_window, &storage), &msg) {
                                 note_view_heard();
                                 // Signature-verified ⇒ this member is demonstrably alive. Recording it
-                                // only AFTER the verify is what makes the halt test unspoofable.
-                                if let Some(sender) = msg_sender(&msg) {
+                                // only AFTER the verify is what makes the halt test unspoofable. Only the
+                                // loop's own committee: `heard` is that set's liveness census.
+                                if let Some(sender) = msg_sender(&msg).filter(|s| committee.iter().any(|c| c == s)) {
                                     heard.insert(sender.to_string(), std::time::Instant::now());
                                 }
                                 // The receive half of the delivery ledger: the proposer reports how many
@@ -2056,7 +2213,7 @@ pub async fn run(
                                     }
                                 }
                                 // Single-sig (Proposal/Vote/Timeout): the verify is cheap ⇒ inline is fine.
-                                process_authenticated(&msg, &mut driver, &storage, &window_buf, &p2p, &mut committee, &mut pending, MAX_PENDING, &mut heard)
+                                process_authenticated(&msg, &mut driver, &storage, &window_buf, &p2p, &mut committee, committee_window, &mut pending, MAX_PENDING, &mut heard)
                             } else {
                                 VERIFY_FAILS.fetch_add(1, Ordering::Relaxed);
                                 Vec::new()
@@ -2098,7 +2255,7 @@ pub async fn run(
                             Ok(msg) => {
                                 note_view_heard();
                                 refresh_committee(&mut committee, &mut committee_window, &mut driver, &storage, &window_buf);
-                                process_authenticated(&msg, &mut driver, &storage, &window_buf, &p2p, &mut committee, &mut pending, MAX_PENDING, &mut heard)
+                                process_authenticated(&msg, &mut driver, &storage, &window_buf, &p2p, &mut committee, committee_window, &mut pending, MAX_PENDING, &mut heard)
                             }
                             Err(_) => Vec::new(),
                         }
@@ -2163,7 +2320,7 @@ pub async fn run(
                             }
                         }
                         effs.extend(try_propose(&mut driver, &window_buf, &storage, &mut committee));
-                        effs.extend(drain_pending(&mut driver, &window_buf, &storage, &p2p, &committee, &mut pending, MAX_PENDING, &mut heard));
+                        effs.extend(drain_pending(&mut driver, &window_buf, &storage, &p2p, &committee, committee_window, &mut pending, MAX_PENDING, &mut heard));
                         effs
                         }
                     }
@@ -2180,7 +2337,7 @@ pub async fn run(
                                 if !effs.is_empty() {
                                     refresh_committee(&mut committee, &mut committee_window, &mut driver, &storage, &window_buf);
                                     effs.extend(try_propose(&mut driver, &window_buf, &storage, &mut committee));
-                                    effs.extend(drain_pending(&mut driver, &window_buf, &storage, &p2p, &committee, &mut pending, MAX_PENDING, &mut heard));
+                                    effs.extend(drain_pending(&mut driver, &window_buf, &storage, &p2p, &committee, committee_window, &mut pending, MAX_PENDING, &mut heard));
                                 }
                                 effs
                             }
@@ -2666,5 +2823,102 @@ mod catchup_store_tests {
         let local = body.find("buf.get(&w)").expect("local lookup");
         let merged = body.find("committed.or(local)").expect("precedence");
         assert!(committed < local && local < merged, "committed first, local as fallback");
+    }
+}
+
+#[cfg(test)]
+mod cert_window_tests {
+    use super::*;
+    use qnet_consensus::checkpoint_bft::{Checkpoint, QuorumCertificate, TimeoutCertificate};
+
+    fn cp(index: u64, head: u64) -> Checkpoint {
+        Checkpoint {
+            index, parent_qc: None, window_head_height: head, window_mb_hashes: vec![[head as u8; 32]],
+            state_root: [0u8; 32], beacon: [0u8; 32], epoch_commitment: [0u8; 32], reward_root: [0u8; 32],
+            registry_root: [0u8; 32], dilithium_pk_root: [0u8; 32], reward_epoch_root: [0u8; 32], logs_root: [0u8; 32],
+            total_supply: 0, timestamp: 0, proposer: "n0".to_string(), proposer_sig: Vec::new(), recovery_anchor: None,
+        }
+    }
+    fn qc_of(c: &Checkpoint) -> QuorumCertificate {
+        QuorumCertificate { checkpoint_hash: c.hash(), index: c.index, signers: Vec::new(), sig_merkle_root: [0u8; 32], sigs: Vec::new() }
+    }
+    // A driver that certified window 90 at index 100, so view 101 drives window 91.
+    fn driver_at_100() -> (ConsensusDriver, QuorumCertificate) {
+        let c: Vec<String> = (0..4).map(|i| format!("n{}", i)).collect();
+        let mut d = ConsensusDriver::new("n0".to_string(), c, [7u8; 32]);
+        let p = cp(100, 90 * 30);
+        let q = qc_of(&p);
+        let _ = d.sync(&p, &q);
+        (d, q)
+    }
+
+    // A certificate is placed by the proposal held at its index; the view being driven certifies
+    // the loop's own window; anything else cannot be placed.
+    #[test]
+    fn a_certificate_is_placed_by_the_proposal_at_its_index() {
+        let (d, _) = driver_at_100();
+        assert_eq!(d.current_index(), 101);
+        assert_eq!(window_of_index(&d, 100), CertWindow::Known(90));
+        assert_eq!(window_of_index(&d, 101), CertWindow::Current);
+        assert_eq!(window_of_index(&d, 105), CertWindow::Unplaced);
+    }
+
+    // A view-change message belongs to the window right after its sender's high QC.
+    #[test]
+    fn a_view_change_is_placed_after_its_senders_high_qc() {
+        let (d, _) = driver_at_100();
+        assert_eq!(window_of_view(&d, 104, 100), CertWindow::Known(91));
+        assert_eq!(window_of_view(&d, 104, 0), CertWindow::Unplaced);
+        assert_eq!(window_of_view(&d, 101, 99), CertWindow::Current);
+        assert_eq!(window_of_view(&d, 104, 102), CertWindow::Unplaced);
+    }
+
+    // A window more than one epoch from the loop's is never derived on demand: the loop committee
+    // stands in and the check fails closed.
+    #[test]
+    fn a_far_window_is_not_derived_on_the_loop() {
+        let loop_c: Vec<String> = vec!["a".into(), "b".into()];
+        let far: Vec<String> = vec!["z".into()];
+        let near = committee_for(CertWindow::Known(89), &loop_c, 91, |_| Some(far.clone()));
+        assert_eq!(near.as_ref(), far.as_slice(), "within one epoch the window's own set is used");
+        let too_far = committee_for(CertWindow::Known(80), &loop_c, 91, |_| Some(far.clone()));
+        assert_eq!(too_far.as_ref(), loop_c.as_slice(), "beyond one epoch the loop committee stands in");
+    }
+
+    // The first view of a new epoch times out with the previous epoch's high QC inside the TC. That
+    // QC is checked over ITS window's committee, never the loop's - and not at all when this node
+    // already holds it. An unplaceable window falls back to the loop committee (fails closed).
+    #[test]
+    fn a_tc_high_qc_is_checked_over_its_own_windows_committee() {
+        let (d, held) = driver_at_100();
+        let loop_c: Vec<String> = vec!["a".into(), "b".into(), "c".into(), "d".into()];
+        let prev_c: Vec<String> = vec!["p".into(), "q".into(), "r".into(), "s".into()];
+        let lookup = |w: u64| if w == 90 { Some(prev_c.clone()) } else { None };
+
+        let foreign = QuorumCertificate { checkpoint_hash: [9u8; 32], index: 100, signers: Vec::new(), sig_merkle_root: [0u8; 32], sigs: Vec::new() };
+        let tc = ConsensusMsg::Tc(TimeoutCertificate { index: 101, timeouts: Vec::new(), high_qc: Some(foreign) });
+        let (own, hq) = cert_plan_with(&tc, &d, &loop_c, 91, &lookup);
+        assert_eq!(own, loop_c, "the TC's own members retry the loop's window");
+        assert_eq!(hq, HighQcCheck::Over(prev_c.clone()), "its high QC belongs to the previous window");
+
+        let tc = ConsensusMsg::Tc(TimeoutCertificate { index: 101, timeouts: Vec::new(), high_qc: Some(held) });
+        let (_, hq) = cert_plan_with(&tc, &d, &loop_c, 91, &lookup);
+        assert_eq!(hq, HighQcCheck::Held, "a certificate this node holds is not checked twice");
+
+        let (own, _) = cert_plan_with(&ConsensusMsg::Qc(QuorumCertificate {
+            checkpoint_hash: [1u8; 32], index: 107, signers: Vec::new(), sig_merkle_root: [0u8; 32], sigs: Vec::new() }),
+            &d, &loop_c, 91, &lookup);
+        assert_eq!(own, loop_c, "unplaceable falls back to the loop committee");
+    }
+
+    // The view timer keys on held content and a stalled index alone - never on who leads - so a
+    // silent leader is timed out by every member.
+    #[test]
+    fn the_view_timer_does_not_wait_for_a_leader() {
+        let src = include_str!("consensus_v2_node.rs");
+        let f = src.find("local_timeout_fired round=").expect("timer arm");
+        let guard = &src[f.saturating_sub(700)..f];
+        assert!(guard.contains("driver.current_index() == last_index && driver.next_window() <= last_signaled"));
+        assert!(!guard.contains("is_leader_now"));
     }
 }

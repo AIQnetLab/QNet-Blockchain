@@ -156,6 +156,21 @@ impl SimpleMempool {
         self.total_bytes.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Entry counts of every index this pool keeps, for the memory census. `size()` counts live
+    /// transactions only; the dedup and per-sender maps outlive them.
+    pub fn holder_census(&self) -> Vec<(&'static str, u64)> {
+        vec![
+            ("mp_txs", self.transactions.len() as u64),
+            ("mp_included", self.included_tx_hashes.len() as u64),
+            ("mp_expired", self.expired_tx_hashes.len() as u64),
+            ("mp_timestamps", self.tx_timestamps.len() as u64),
+            ("mp_senders", self.tx_count_by_sender.len() as u64),
+            ("mp_sender_map", self.tx_sender_map.len() as u64),
+            ("mp_commitments", self.commitment_index.len() as u64),
+            ("mp_gas_levels", self.by_gas_price.read().len() as u64),
+        ]
+    }
+
     fn bytes_full(&self) -> bool {
         self.total_bytes() >= MAX_MEMPOOL_BYTES
     }

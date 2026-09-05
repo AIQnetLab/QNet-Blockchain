@@ -234,6 +234,28 @@ impl ConsensusDriver {
         self.proposals.keys().any(|(i, _)| *i == index)
     }
 
+    /// Window head of the proposal held at `index`. A certificate names no head of its own, so
+    /// this is how the node places one in a window.
+    pub fn head_of(&self, index: u64) -> Option<u64> { self.heads.get(&index).copied() }
+
+    /// Does the engine hold a verified certificate for exactly this checkpoint? A relayed copy
+    /// needs no second O(committee) check: adopting it again is a no-op on what is already held.
+    /// Engine-held only - a copy this side remembers but the engine has pruned would be adopted
+    /// afresh, so it is verified afresh.
+    pub fn holds_qc(&self, index: u64, hash: &Hash) -> bool {
+        self.eng.qc_hash_at(index) == Some(*hash)
+    }
+
+    /// Entry counts of the driver's per-round maps, for the memory census.
+    pub fn census(&self) -> [(&'static str, u64); 6] {
+        [("drv_proposals", self.proposals.len() as u64), ("drv_heads", self.heads.len() as u64),
+         ("drv_seal_data", self.seal_data.len() as u64), ("drv_recent_qcs", self.recent_qcs.len() as u64),
+         ("drv_pending_seals", self.pending_seals.len() as u64), ("drv_sealed", self.sealed.len() as u64)]
+    }
+
+    /// Entry counts of the engine's per-round maps.
+    pub fn engine_census(&self) -> [(&'static str, u64); 7] { self.eng.census() }
+
     /// Is the pin armed? Index-independent, for the same reason as `CheckpointConsensus::is_relaxed`:
     /// the span is a range of windows, and a TimeoutCertificate breaks any index/window lockstep. The
     /// window bound is enforced at the macroblock authority, from the certificate's own bytes.
@@ -2166,6 +2188,44 @@ mod tests {
             for e in effs { seed.extend(exec(&mut nodes[k], e)); }
         }
         deliver_gated(nodes, tails, c, seed, false);
+    }
+
+    // Like propose_window, but member `skip` stays silent even when it leads.
+    fn propose_window_except(nodes: &mut Vec<Node>, tails: &[Vec<Hash>], c: &[NodeId], w: u64, skip: usize) -> Vec<ConsensusMsg> {
+        let mut seed = Vec::new();
+        for k in 0..nodes.len() {
+            if k == skip { continue; }
+            let effs = nodes[k].d.build_proposal(
+                w, tails[k].clone(), [w as u8; 32], [0u8; 32], w * 1000, c.to_vec(),
+                Vec::new(), Vec::new(), [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], 0);
+            for e in effs { seed.extend(exec(&mut nodes[k], e)); }
+        }
+        seed
+    }
+
+    // A LEADER THAT NEVER PROPOSES. Nothing at the index can end the view but the members' own
+    // timers: they fire, the timeouts form a certificate, the rotated leader proposes the same
+    // window and it certifies - with the silent member silent throughout.
+    #[test]
+    fn a_silent_leader_is_rotated_out_by_the_view_change() {
+        let (c, mut nodes, mut tails) = five_node_harness();
+        warm_three_windows(&mut nodes, &mut tails, &c, false);
+        for t in tails.iter_mut() { *t = vec![[4u8; 32]]; }
+        let silent = nodes.iter().position(|n| n.d.is_leader_now()).expect("one member leads window 4");
+        let view0 = nodes[silent].d.current_index();
+        assert!(propose_window_except(&mut nodes, &tails, &c, 4, silent).is_empty(),
+                "a member that does not lead must not propose");
+        let mut rounds = 0;
+        while nodes.iter().any(|n| n.d.next_window() == 4) && rounds < 8 {
+            fire_timeouts(&mut nodes, &mut tails, &c);
+            let seed = propose_window_except(&mut nodes, &tails, &c, 4, silent);
+            deliver_gated(&mut nodes, &mut tails, &c, seed, false);
+            rounds += 1;
+        }
+        assert!(nodes.iter().all(|n| n.d.next_window() > 4),
+                "the window must certify under a rotated leader: {:?}",
+                nodes.iter().map(|n| n.d.next_window()).collect::<Vec<_>>());
+        assert!(nodes.iter().all(|n| n.d.current_index() > view0), "every view rotated past the silent leader");
     }
 
     // RECOVERY FROM A FAILED WINDOW. A window that fell short of quorum cannot be re-proposed at the same

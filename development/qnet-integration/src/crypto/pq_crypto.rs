@@ -342,6 +342,9 @@ const CACHE_EVICTION_PERCENT: usize = 10;
 static CERTIFICATE_CACHE: once_cell::sync::Lazy<DashMap<String, CachedCertificate>> =
     once_cell::sync::Lazy::new(|| DashMap::new());
 
+/// Entry count of the certificate cache, for the memory census.
+pub fn holder_census() -> Vec<(&'static str, u64)> { vec![("pq_certificates", CERTIFICATE_CACHE.len() as u64)] }
+
 /// Evict oldest entries from certificate cache when it exceeds the maximum size.
 /// Removes ~10% of entries sorted by `verified_at` timestamp (oldest first).
 fn evict_certificate_cache_if_needed() {

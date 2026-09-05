@@ -2561,6 +2561,7 @@ impl PersistentStorage {
         }
 
         self.db.write(batch)?;
+        super::MACROBLOCK_DELETE_SEQ.fetch_add(1, Ordering::Relaxed);
 
         if crate::node::is_info() {
             println!("[INFO][STORAGE] delete_mb idx={} h={} +snapshots", macroblock_index, macroblock_index * 90);

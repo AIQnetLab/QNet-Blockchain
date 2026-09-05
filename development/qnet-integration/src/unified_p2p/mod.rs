@@ -691,6 +691,54 @@ pub fn get_pending_macroblock_count() -> usize {
     PENDING_SYNC_MACROBLOCKS.len()
 }
 
+/// Entry counts of every height-, round- or peer-keyed holder this module owns, for the memory
+/// census. A leak is a name that keeps climbing between ticks.
+pub fn holder_census() -> Vec<(&'static str, u64)> {
+    vec![
+        ("p2p_sync_q", PENDING_SYNC_BLOCKS.len() as u64),
+        ("p2p_macro_q", PENDING_SYNC_MACROBLOCKS.len() as u64),
+        ("p2p_head_ts", LAST_HEAD_TS.len() as u64),
+        ("p2p_failovers_seen", PROCESSED_FAILOVERS.len() as u64),
+        ("p2p_failovers_active", EMERGENCY_FAILOVERS_IN_PROGRESS.len() as u64),
+        ("p2p_sync_cooldown", SYNC_PEER_COOLDOWN.len() as u64),
+        ("p2p_apply_strikes", PEER_APPLY_STRIKES.len() as u64),
+        ("p2p_apply_quarantine", PEER_APPLY_QUARANTINE.len() as u64),
+        ("p2p_invalid_blocks", INVALID_BLOCKS_TRACKER.len() as u64),
+        ("p2p_false_emergency", FALSE_EMERGENCY_TRACKER.len() as u64),
+        ("p2p_emergency_confirms", EMERGENCY_CONFIRMATIONS.len() as u64),
+        ("p2p_blacklist", PEER_BLACKLIST.len() as u64),
+        ("p2p_retry_cooldown", PEER_RETRY_COOLDOWN.len() as u64),
+        ("p2p_quic_fallback", QUIC_FALLBACK_RATE_LIMITER.len() as u64),
+        ("p2p_empty_responses", EMPTY_RESPONSE_TRACKER.len() as u64),
+        ("p2p_invalid_certs", INVALID_CERT_TRACKER.len() as u64),
+        ("p2p_timeout_votes", TIMEOUT_VOTES.len() as u64),
+        ("p2p_foreign_anchors", FOREIGN_ANCHOR_WITNESSES.len() as u64),
+        ("p2p_block_attest", BLOCK_ATTESTATIONS.len() as u64),
+        ("p2p_sorted_committees", SORTED_COMMITTEE_CACHE.len() as u64),
+        ("p2p_timeout_certs", TIMEOUT_CERTIFICATES.len() as u64),
+        ("p2p_certified_rounds", HIGHEST_CERTIFIED_ROUND.len() as u64),
+        ("p2p_failover_committees", FAILOVER_COMMITTEE_CACHE.len() as u64),
+        ("p2p_anchor_pulls", ANCHOR_PULL_LAST.len() as u64),
+        ("p2p_tc_pulls", TC_PULL_LAST.len() as u64),
+        ("p2p_repair_times", REPAIR_REQUEST_TIMES.len() as u64),
+        ("p2p_voter_claims", VOTER_SEALED_CLAIM.len() as u64),
+        ("p2p_anchor_cache", LOCAL_ANCHOR_CACHE.len() as u64),
+        ("p2p_resolved_anchors", RESOLVED_ANCHORS.len() as u64),
+        ("p2p_timeout_voted", TIMEOUT_VOTED_HEIGHTS.len() as u64),
+        ("p2p_finalized_rounds", LAST_FINALIZED_ROUND_PER_MB.len() as u64),
+        ("p2p_epoch_committees", EPOCH_COMMITTEE_CACHE.len() as u64),
+        ("p2p_producer_heartbeats", REMOTE_PRODUCER_HEARTBEAT_MS.len() as u64),
+        ("p2p_block_rejections", BLOCK_REJECTION_OBSERVERS.len() as u64),
+        ("p2p_ready_acks", READY_ACKS.len() as u64),
+        ("p2p_validator_misses", VALIDATOR_CONSECUTIVE_MISSES.len() as u64),
+        ("p2p_ejected", EJECTED_VALIDATORS.len() as u64),
+        ("p2p_forwarded_chunks", FORWARDED_SHRED_CHUNKS.len() as u64),
+        ("p2p_leader_claims", LEADER_CLAIMS.len() as u64),
+        ("p2p_own_claims", OWN_CLAIM_BROADCAST.len() as u64),
+        ("p2p_shred_rosters", SHRED_ROSTER_CACHE.len() as u64),
+    ]
+}
+
 /// v3.1: Clear all pending macroblock sync entries (emergency cleanup)
 pub fn clear_all_pending_sync_macroblocks() {
     PENDING_SYNC_MACROBLOCKS.clear();

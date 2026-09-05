@@ -244,6 +244,9 @@ struct Bucket {
 static PARTIALS: Lazy<RwLock<HashMap<[u8; 32], Bucket>>> = Lazy::new(|| RwLock::new(HashMap::new()));
 // Latest complete capsule held for serving a cold joiner + rebroadcast.
 static HELD: Lazy<RwLock<Option<GenesisCheckpoint>>> = Lazy::new(|| RwLock::new(None));
+
+/// Entry count of the partial-signature buckets, for the memory census.
+pub fn holder_census() -> Vec<(&'static str, u64)> { vec![("galc_partials", PARTIALS.read().len() as u64)] }
 // Highest macroblock index this node has already minted a partial for (anti re-mint).
 static LAST_MINTED: AtomicU64 = AtomicU64::new(0);
 

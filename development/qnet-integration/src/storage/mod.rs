@@ -199,6 +199,12 @@ static MACROBLOCK_SAVE_SEQ: AtomicU64 = AtomicU64::new(0);
 /// Monotonic count of macroblock bodies that became present in this process. See `MACROBLOCK_SAVE_SEQ`.
 pub fn macroblock_save_seq() -> u64 { MACROBLOCK_SAVE_SEQ.load(Ordering::Relaxed) }
 
+/// Bumped when a sealed macroblock is deleted (rollback). Committees cached by window are dropped on
+/// change, since the N-2 sample can differ once that index is re-sealed.
+pub(crate) static MACROBLOCK_DELETE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+pub fn macroblock_delete_seq() -> u64 { MACROBLOCK_DELETE_SEQ.load(Ordering::Relaxed) }
+
 /// Timestamp when rollback started (for timeout protection)
 static ROLLBACK_START_TIME: AtomicU64 = AtomicU64::new(0);
 

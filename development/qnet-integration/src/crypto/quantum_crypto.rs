@@ -37,6 +37,13 @@ static SIGNATURE_CACHE: once_cell::sync::Lazy<DashMap<String, CachedSignature>> 
 static KEY_MANAGER_CACHE: once_cell::sync::Lazy<DashMap<String, CachedKeyManager>> = 
     once_cell::sync::Lazy::new(|| DashMap::new());
 
+/// Entry counts of the crypto caches, for the memory census.
+pub fn holder_census() -> Vec<(&'static str, u64)> {
+    vec![("crypto_activations", CRYPTO_CACHE.len() as u64),
+         ("crypto_signatures", SIGNATURE_CACHE.len() as u64),
+         ("crypto_key_managers", KEY_MANAGER_CACHE.len() as u64)]
+}
+
 /// Cached activation data for zero-copy operations
 #[derive(Debug, Clone)]
 #[allow(dead_code)]

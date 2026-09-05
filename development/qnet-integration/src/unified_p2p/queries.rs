@@ -673,6 +673,23 @@ impl SimplifiedP2P {
     pub fn get_rate_limiter_size(&self) -> usize {
         self.rate_limiter.len()
     }
+
+    /// Entry counts of the per-peer and per-height holders on this instance, for the memory census.
+    pub fn holder_census(&self) -> Vec<(&'static str, u64)> {
+        let assembly_bytes: usize = self.shred_protocol_assemblies.iter().map(|a| {
+            a.chunks_received.iter().chain(a.parity_chunks.iter())
+                .map(|c| c.as_ref().map_or(0, |v| v.len())).sum::<usize>()
+        }).sum();
+        vec![
+            ("p2p_peers", self.connected_peers_lockfree.len() as u64),
+            ("p2p_peer_ids", self.peer_id_to_addr.len() as u64),
+            ("p2p_rate_limits", self.rate_limiter.len() as u64),
+            ("p2p_nonces", self.nonce_validator.len() as u64),
+            ("p2p_shred_assemblies", self.shred_protocol_assemblies.len() as u64),
+            ("p2p_shred_assemblies_mb", (assembly_bytes >> 20) as u64),
+            ("p2p_shred_cache", self.shred_chunk_cache.len() as u64),
+        ]
+    }
     
     /// SHARDING INTEGRATION: Get optimal peers for cross-shard communication
     pub fn get_cross_shard_peers(&self, target_shard: u8, limit: usize) -> Vec<PeerInfo> {

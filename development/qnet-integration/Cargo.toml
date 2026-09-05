@@ -153,7 +153,8 @@ name = "qnet-node"
 path = "src/bin/qnet-node.rs" 
 
 # Returns freed pages to the OS (decay) and exposes real allocator stats —
-# glibc arenas retained multi-GB rss after load spikes. Linux targets only.
+# glibc arenas retained multi-GB rss after load spikes. Unprefixed: jemalloc replaces the
+# system malloc, so RocksDB's C++ heap decays and is counted too. Linux targets only.
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
-tikv-jemallocator = "0.6"
+tikv-jemallocator = { version = "0.6", features = ["unprefixed_malloc_on_supported_platforms"] }
 tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }

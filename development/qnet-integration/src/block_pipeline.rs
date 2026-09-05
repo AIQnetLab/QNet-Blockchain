@@ -1014,6 +1014,11 @@ pub struct PipelineMetrics {
     pub apply_current_h: AtomicU64,
     pub apply_op: AtomicU64,
     pub apply_op_started_ms: AtomicU64,
+    /// Live occupancy of the verify stage's hold buffers, for the memory census.
+    pub deferred_n: AtomicU64,
+    pub deferred_bytes: AtomicU64,
+    pub committee_deferred_n: AtomicU64,
+    pub committee_deferred_bytes: AtomicU64,
 }
 
 /// v15.4: Op codes for per-stage progress markers. Read by the watchdog
@@ -1060,6 +1065,22 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Entry counts of the pipeline's height/peer-keyed holders, for the memory census.
+pub fn holder_census() -> Vec<(&'static str, u64)> {
+    let mut out = vec![
+        ("pipe_deferred_heights", DEFERRED_HEIGHTS.len() as u64),
+        ("pipe_missing_requested", MISSING_BLOCK_REQUESTED.len() as u64),
+        ("pipe_forked_peer_cooldown", FORKED_PEER_COOLDOWN.len() as u64),
+    ];
+    if let Some(m) = crate::node::try_get_pipeline_ingest().map(|i| i.metrics()) {
+        out.push(("pipe_deferred", m.deferred_n.load(Ordering::Relaxed)));
+        out.push(("pipe_deferred_mb", m.deferred_bytes.load(Ordering::Relaxed) >> 20));
+        out.push(("pipe_committee_deferred", m.committee_deferred_n.load(Ordering::Relaxed)));
+        out.push(("pipe_committee_deferred_mb", m.committee_deferred_bytes.load(Ordering::Relaxed) >> 20));
+    }
+    out
+}
+
 impl PipelineMetrics {
     pub fn new() -> Self {
         Self {
@@ -1079,6 +1100,10 @@ impl PipelineMetrics {
             apply_current_h: AtomicU64::new(0),
             apply_op: AtomicU64::new(0),
             apply_op_started_ms: AtomicU64::new(0),
+            deferred_n: AtomicU64::new(0),
+            deferred_bytes: AtomicU64::new(0),
+            committee_deferred_n: AtomicU64::new(0),
+            committee_deferred_bytes: AtomicU64::new(0),
         }
     }
 
@@ -1908,6 +1933,8 @@ impl BlockPipeline {
         // is verified, we drain deferred blocks whose parent has now arrived.
         // Bounded to prevent OOM under load (thousands of Super nodes).
         const DEFERRED_MAX: usize = 2000;
+        // Bytes bound RAM; count bounds index churn. Shared by both hold buffers below.
+        const DEFERRED_MAX_BYTES: usize = 512 * 1024 * 1024;
         // Keyed by PARENT HASH, not by height: a height-keyed map holds one entry per slot, so two
         // blocks waiting on the same parent (the normal case during a branch race) silently
         // overwrote each other. Keyed by parent hash, siblings coexist and the drain is a direct
@@ -1930,6 +1957,7 @@ impl BlockPipeline {
         // parent IS present (burn gate runs post parent-check), so the contiguity drain never revisits them
         // — re-driven when their committee becomes available (see redrive below). Bounded by DEFERRED_MAX.
         let mut committee_deferred: HashMap<u64, DecodedBlock> = HashMap::new();
+        let mut committee_deferred_bytes: usize = 0;
         // Watermark of the last deferred re-drive (see the drain below): (applied tip, sealed-macroblock
         // index). BOTH move independently and gate the two defer reasons — pk_unresolved clears when the
         // chain APPLIES the committing block (chain_h moves); the N-2-committee defer clears when the N-2
@@ -2016,7 +2044,10 @@ impl BlockPipeline {
                     .filter(|h| !crate::node::BlockchainNode::n2_committee_absent(&storage, *h))
                     .collect();
                 for h in ready {
-                    if let Some(def) = committee_deferred.remove(&h) { to_process.push(def); }
+                    if let Some(def) = committee_deferred.remove(&h) {
+                        committee_deferred_bytes = committee_deferred_bytes.saturating_sub(def.raw_data.len());
+                        to_process.push(def);
+                    }
                 }
             }
 
@@ -2142,8 +2173,6 @@ impl BlockPipeline {
                         // arrive out of order — a cap below that would drop honest traffic. Two
                         // rotations of headroom still bounds an attacker to 64 instead of 2000.
                         const DEFERRED_MAX_PER_PRODUCER: usize = 2 * crate::node::ROTATION_INTERVAL_BLOCKS as usize;
-                        // Bytes bound RAM; count bounds index churn.
-                        const DEFERRED_MAX_BYTES: usize = 512 * 1024 * 1024;
                         // Within this many blocks of the tip a long single-producer run is the
                         // legitimate lone-survivor case (peers down, one producer carries the
                         // chain) — the per-producer cap must not reject exactly those blocks.
@@ -2872,8 +2901,13 @@ impl BlockPipeline {
                     // advances via the committee_deferred drain. Hard-rejecting here would fork a
                     // snapshot/catch-up node off the canonical chain. Bounded by DEFERRED_MAX.
                     let dh = decoded.height;
-                    if committee_deferred.len() < DEFERRED_MAX {
-                        committee_deferred.insert(dh, decoded);
+                    let sz = decoded.raw_data.len();
+                    if committee_deferred.len() < DEFERRED_MAX
+                        && committee_deferred_bytes.saturating_add(sz) <= DEFERRED_MAX_BYTES {
+                        committee_deferred_bytes += sz;
+                        if let Some(old) = committee_deferred.insert(dh, decoded) {
+                            committee_deferred_bytes = committee_deferred_bytes.saturating_sub(old.raw_data.len());
+                        }
                         if is_debug() { println!("[DBG][PIPELINE] pk_deferred h={} reason=elided_pk_uncommitted", dh); }
                     } else {
                         metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
@@ -3070,11 +3104,16 @@ impl BlockPipeline {
                         if crate::node::BlockchainNode::burn_committee_absent_for(
                             &storage, &decoded.microblock.transactions)
                         {
-                            if committee_deferred.len() < DEFERRED_MAX {
+                            let sz = decoded.raw_data.len();
+                            if committee_deferred.len() < DEFERRED_MAX
+                                && committee_deferred_bytes.saturating_add(sz) <= DEFERRED_MAX_BYTES {
                                 if is_debug() {
                                     println!("[DBG][PIPELINE] committee_deferred h={} reason=n2_absent buf={}", h, committee_deferred.len());
                                 }
-                                committee_deferred.insert(h, decoded);
+                                committee_deferred_bytes += sz;
+                                if let Some(old) = committee_deferred.insert(h, decoded) {
+                                    committee_deferred_bytes = committee_deferred_bytes.saturating_sub(old.raw_data.len());
+                                }
                             } else {
                                 metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
                             }
@@ -3322,6 +3361,11 @@ impl BlockPipeline {
             if committee_deferred.len() > 100 {
                 committee_deferred.retain(|h, _| *h < chain_h + 500);
             }
+            committee_deferred_bytes = committee_deferred.values().map(|d| d.raw_data.len()).sum();
+            metrics.deferred_n.store(deferred_count as u64, Ordering::Relaxed);
+            metrics.deferred_bytes.store(deferred_bytes as u64, Ordering::Relaxed);
+            metrics.committee_deferred_n.store(committee_deferred.len() as u64, Ordering::Relaxed);
+            metrics.committee_deferred_bytes.store(committee_deferred_bytes as u64, Ordering::Relaxed);
         }
     }
 
