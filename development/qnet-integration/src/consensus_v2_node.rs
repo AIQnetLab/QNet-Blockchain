@@ -264,8 +264,6 @@ pub fn verify_msg(p2p: &SimplifiedP2P, committee: &[String], msg: &ConsensusMsg)
         ConsensusMsg::Timeout(tm) => in_committee(&tm.voter)
             && timeout_sig_ingest_ok(&tm.voter, tm.index, tm.high_qc_index, &tm.signature),
         ConsensusMsg::Qc(qc) => verify_qc(p2p, committee, qc),
-        // Never verified inline: routed to the catch-up verifier against its own window's committee.
-        ConsensusMsg::Justify(..) => false,
         // H4: a TC must carry ≥2f+1 DISTINCT committee timeouts (each signed) for its own
         // view — not merely an optional high_qc. The old `unwrap_or(true)` accepted an
         // EMPTY-timeouts TC and let on_timeout_cert advance the view (`current_index = tc.index+1`),
@@ -380,7 +378,7 @@ fn msg_sender(m: &ConsensusMsg) -> Option<&str> {
         ConsensusMsg::Proposal(cp) => Some(&cp.proposer),
         ConsensusMsg::Vote(v) => Some(&v.voter),
         ConsensusMsg::Timeout(tm) => Some(&tm.voter),
-        ConsensusMsg::Qc(_) | ConsensusMsg::Tc(_) | ConsensusMsg::Justify(..) => None,
+        ConsensusMsg::Qc(_) | ConsensusMsg::Tc(_) => None,
     }
 }
 
@@ -393,7 +391,6 @@ fn msg_index(m: &ConsensusMsg) -> u64 {
         ConsensusMsg::Qc(qc) => qc.index,
         ConsensusMsg::Timeout(tm) => tm.index,
         ConsensusMsg::Tc(tc) => tc.index,
-        ConsensusMsg::Justify(_, qc) => qc.index,
     }
 }
 
@@ -439,7 +436,6 @@ async fn broadcast(p2p: &Arc<SimplifiedP2P>, msg: &ConsensusMsg) {
         ConsensusMsg::Timeout(t) => ("timeout", t.index, 0),
         ConsensusMsg::Qc(q) => ("qc", q.index, 0),
         ConsensusMsg::Tc(t) => ("tc", t.index, 0),
-        ConsensusMsg::Justify(cp, q) => ("justify", q.index, cp.window_head_height),
     };
     let data = match bincode::serialize(msg) {
         Ok(d) => d,
@@ -566,6 +562,22 @@ pub async fn execute(effects: Vec<Effect>, node_id: &str, p2p: &Arc<SimplifiedP2
                 // And ask for the certificate itself — the window content alone cannot commit an
                 // index whose certificate the node never receives.
                 p2p.request_consensus_state(qc_index);
+            }
+            Effect::CatchUpTo { peer, checkpoint, qc } => {
+                let idx = qc.index;
+                match (p2p.get_peer_addr_by_id(&peer),
+                       bincode::serialize(&vec![ConsensusMsg::Proposal(checkpoint), ConsensusMsg::Qc(qc)])) {
+                    (Some(addr), Ok(state_data)) => {
+                        if crate::node::is_info() {
+                            println!("[INFO][BFT2] catchup_sent_to peer={} idx={} bytes={}", peer, idx, state_data.len());
+                        }
+                        p2p.send_network_message(&addr, NetworkMessage::ConsensusState {
+                            round: idx, state_data, sender_id: node_id.to_string() });
+                    }
+                    _ => if crate::node::is_warn() {
+                        println!("[WARN][BFT2] catchup_send_failed peer={} idx={} reason=no_address", peer, idx);
+                    },
+                }
             }
             Effect::Propose(mut cp) => {
                 match sign_payload(node_id, "CKPT", &cp.hash()).await {
@@ -1469,11 +1481,21 @@ static CATCHUP_UNSOLICITED: AtomicUsize = AtomicUsize::new(0);
 /// Only a pair this node ASKED for is admitted: verifying one costs an O(committee) certificate
 /// check on the consensus loop, and nothing stops a peer from sending these unasked. Admitted
 /// frames are charged against the same inbound budget as any other consensus frame.
+static CATCHUP_UNSOLICITED_LAST_MS: AtomicU64 = AtomicU64::new(0);
+const CATCHUP_UNSOLICITED_EVERY_MS: u64 = 5_000;
+
 pub fn route_catchup(data: Vec<u8>) {
     let solicited = CATCHUP_EXPECTED
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| if n == 0 { None } else { Some(n - 1) })
         .is_ok();
-    if !solicited {
+    let admitted_unsolicited = !solicited && {
+        let now = now_ms();
+        CATCHUP_UNSOLICITED_LAST_MS
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire,
+                          |last| if now.saturating_sub(last) >= CATCHUP_UNSOLICITED_EVERY_MS { Some(now) } else { None })
+            .is_ok()
+    };
+    if !solicited && !admitted_unsolicited {
         let c = CATCHUP_UNSOLICITED.fetch_add(1, Ordering::Relaxed);
         if (c < 3 || c % 256 == 0) && crate::node::is_warn() {
             println!("[WARN][BFT2] catchup_unsolicited bytes={} dropped={}", data.len(), c + 1);
@@ -1994,15 +2016,7 @@ pub async fn run(
                             // without them (the post-stall view deadlock). Timeouts verify inline
                             // (same cost as at-round ones); TCs go to the async cert worker.
                             let view_sync = matches!(&msg, ConsensusMsg::Timeout(_) | ConsensusMsg::Tc(_));
-                            if let ConsensusMsg::Justify(cp, qc) = &msg {
-                                if qc.index > driver.newest_qc_index().unwrap_or(0) {
-                                    if let Ok(pair) = bincode::serialize(&vec![
-                                        ConsensusMsg::Proposal(cp.clone()), ConsensusMsg::Qc(qc.clone())]) {
-                                        dispatch_catchup_verify(pair, &p2p, &storage);
-                                    }
-                                }
-                                Vec::new()
-                            } else if committee.is_empty()
+                            if committee.is_empty()
                                 || (!view_sync && msg_index(&msg) > driver.current_index()) {
                                 // Future-round / pre-committee inbound: buffer for replay — PRE-authentication
                                 // (a cert sig can't be checked inline), so this is the UNAUTHENTICATED class:
