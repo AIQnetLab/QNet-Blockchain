@@ -564,7 +564,7 @@ impl BlockchainNode {
         // state.
         // Canonical root at target, read BEFORE the lock so the repair below can run inside it.
         // The same per-block root every validator checked at apply, stored in the surviving block.
-        let expected_root: Option<[u8; 32]> = storage.load_microblock_auto_format(target_height)
+        let mut expected_root: Option<[u8; 32]> = storage.load_microblock_auto_format(target_height)
             .ok().flatten().map(|mb| mb.state_root);
         let mut repaired_phantom: Option<String> = None;
         let replayed: u64;
@@ -611,6 +611,8 @@ impl BlockchainNode {
                         "[INFO][STATE] reconcile_snapshot_restored snap_h={} total_supply={} target={}",
                         snap_height, snap_total_supply, target_height,
                     );
+                    // Rows for accounts born after the snapshot must go before the replay reads them.
+                    let _ = Self::trueup_accounts_cf_against(&sg, storage);
                     mode = "incremental";
                 }
                 None => {
@@ -629,19 +631,26 @@ impl BlockchainNode {
             // Replay every loaded block under the same lock — no `await`
             // inside the loop, no opportunity for another task to slip in.
             let mut applied = 0u64;
+            let mut stopped_at: Option<u64> = None;
             for mb in &blocks_to_replay {
-                let r = Self::apply_block_to_state(&sg, mb, storage, None);
-                // Per-block verification: a divergence is located at its first height, and a
-                // replay that cannot reproduce the chain fails in one block, not after all of
-                // them. The one-leaf phantom repair stays available at every step.
+                let mut snap = sg.create_block_snapshot(mb.height);
+                let r = Self::apply_block_to_state(&sg, mb, storage, Some(&mut snap));
+                // Per-block verification: a divergence is located at its first height. The block
+                // that fails is undone from its own journal and the replay stops on the last
+                // verified one — the live pipeline path continues from there. The one-leaf phantom
+                // repair stays available at every step.
                 if mb.state_root != [0u8; 32] {
                     let got = sg.finalize_merkle();
                     if got != mb.state_root {
                         match sg.repair_single_phantom(&mb.state_root) {
                             Some(addr) => { repaired_phantom = Some(addr); }
-                            None => return Err(format!(
-                                "replay_diverged h={} expected={} computed={} replay_from={}",
-                                mb.height, hex::encode(&mb.state_root[..8]), hex::encode(&got[..8]), replay_from)),
+                            None => {
+                                sg.rollback_block(&snap);
+                                println!("[WARN][STATE] replay_diverged h={} expected={} computed={} replay_from={} action=stop_below",
+                                         mb.height, hex::encode(&mb.state_root[..8]), hex::encode(&got[..8]), replay_from);
+                                stopped_at = Some(mb.height - 1);
+                                break;
+                            }
                         }
                     }
                 }
@@ -660,6 +669,27 @@ impl BlockchainNode {
                 applied = applied.saturating_add(1);
             }
             replayed = applied;
+            if let Some(h) = stopped_at {
+                static STOP_H: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                static STOP_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                let streak = if STOP_H.swap(h, std::sync::atomic::Ordering::Relaxed) == h {
+                    STOP_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+                } else { STOP_N.store(1, std::sync::atomic::Ordering::Relaxed); 1 };
+                if streak >= 3 {
+                    return Err(format!("replay_diverged_persistent h={} streak={} action=resync", h + 1, streak));
+                }
+                // The state is verified at h; every marker that says otherwise is retargeted here,
+                // finality included — the apply dedup treats a finalized height as executed.
+                { sg.chain_state.write().height = h; }
+                if let Err(e) = storage.set_chain_height(h) {
+                    return Err(format!("reconcile_stop_set_height_failed h={} err={:?}", h, e));
+                }
+                crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(h, std::sync::atomic::Ordering::SeqCst);
+                crate::node::retract_finality_to(h);
+                expected_root = storage.load_microblock_auto_format(h).ok().flatten().map(|mb| mb.state_root);
+                println!("[WARN][STATE] reconcile_stopped_short h={} target={} streak={} action=live_apply_from_here",
+                         h, target_height, streak);
+            }
             // Root captured under the SAME lock: after release a concurrent apply may advance the
             // state past target and a post-release read would spuriously mismatch.
             computed_root = sg.finalize_merkle();
@@ -794,6 +824,52 @@ impl BlockchainNode {
         }
         storage.clear_trueup_candidates();
         (candidates.len() as u64, removed)
+    }
+
+    /// CF↔leaf true-up against a COMPLETE leaf set the caller already holds — a restored snapshot,
+    /// which is the whole state at its height. Uncapped: every CF row without a leaf was written by a
+    /// later block, and the replay that follows would read it as that account's value at the
+    /// snapshot height. Runs under the caller's write lock, before any block is replayed.
+    /// Returns (scanned, removed).
+    pub(crate) fn trueup_accounts_cf_against(sg: &StateManager, storage: &Storage) -> (u64, u64) {
+        if !sg.merkle_leaves_complete() || sg.merkle_leaf_count() == 0 {
+            println!("[WARN][STATE] restore_trueup_skipped reason=leafset_not_complete");
+            return (0, 0);
+        }
+        let t0 = std::time::Instant::now();
+        let (mut scanned, mut removed) = (0u64, 0u64);
+        let mut sample: Vec<String> = Vec::new();
+        let mut after: Option<Vec<u8>> = None;
+        loop {
+            let (keys, last) = match storage.accounts_cf_keys_page(after.as_deref(), 10_000) {
+                Ok(p) => p,
+                Err(e) => { println!("[WARN][STATE] restore_trueup_scan_failed err={}", e); break; }
+            };
+            if keys.is_empty() { break; }
+            scanned += keys.len() as u64;
+            let errs_before = crate::storage::MERKLE_LEAF_READ_ERRS.load(std::sync::atomic::Ordering::Relaxed);
+            let phantoms = sg.merkle_absent_leaves(&keys);
+            if crate::storage::MERKLE_LEAF_READ_ERRS.load(std::sync::atomic::Ordering::Relaxed) != errs_before {
+                println!("[WARN][STATE] restore_trueup_page_vetoed reason=leaf_store_read_err scanned={}", scanned);
+            } else if !phantoms.is_empty() {
+                match storage.delete_accounts_cf_keys(&phantoms) {
+                    Ok(()) => {
+                        removed += phantoms.len() as u64;
+                        for p in phantoms.into_iter().take(8usize.saturating_sub(sample.len())) { sample.push(p); }
+                    }
+                    Err(e) => println!("[WARN][STATE] restore_trueup_delete_failed n={} err={}", phantoms.len(), e),
+                }
+            }
+            after = last;
+            if after.is_none() { break; }
+        }
+        if removed > 0 {
+            println!("[WARN][STATE] restore_cf_phantoms_removed n={} scanned={} sample={:?} ms={}",
+                     removed, scanned, sample, t0.elapsed().as_millis());
+        } else if is_info() {
+            println!("[INFO][STATE] restore_trueup_clean scanned={} ms={}", scanned, t0.elapsed().as_millis());
+        }
+        (scanned, removed)
     }
 
     /// CF↔merkle true-up: delete `accounts` CF rows with no committed merkle leaf.

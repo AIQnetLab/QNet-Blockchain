@@ -645,11 +645,12 @@ impl BlockchainNode {
                     .map(|m| (m.size(), m.total_bytes() / 1_048_576))
                     .unwrap_or((0, 0));
                 let breakdown = format!(
-                    "mempool_txs={} mempool_mb={} tx_pool={} sync_q={} macro_q={} peers={} rate_limit={} producer_cache={}",
+                    "mempool_txs={} mempool_mb={} tx_pool={} sync_q={} macro_q={} peers={} rate_limit={} producer_cache={} shred_cache_mb={}",
                     mp_txs, mp_mb, tx_pool_stats.0,
                     crate::unified_p2p::get_pending_sync_count(),
                     crate::unified_p2p::get_pending_macroblock_count(),
-                    peers_count, rate_limiter_count, producer_cache_size);
+                    peers_count, rate_limiter_count, producer_cache_size,
+                    crate::unified_p2p::shred_chunk_cache_bytes() / 1_048_576);
 
                 // Log memory stats. The RocksDB trio is what makes the total attributable: without it
                 // the breakdown showed every owned structure flat while RSS quadrupled.

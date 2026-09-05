@@ -2295,18 +2295,23 @@ impl SimplifiedP2P {
         block_hash: Option<[u8; 32]>,
         num_coding: usize,
     ) {
-        // Cleanup old entries if cache is full
-        if self.shred_chunk_cache.len() >= SHRED_CHUNK_CACHE_SIZE {
-            let mut oldest_height = u64::MAX;
-            for entry in self.shred_chunk_cache.iter() {
-                if *entry.key() < oldest_height {
-                    oldest_height = *entry.key();
-                }
-            }
-            if oldest_height != u64::MAX {
-                self.shred_chunk_cache.remove(&oldest_height);
+        let bytes: usize = chunks.iter().chain(parity_chunks.iter())
+            .map(|c| c.as_ref().map_or(0, |v| v.len())).sum();
+        // Evict oldest while over the count OR the byte ceiling.
+        while !self.shred_chunk_cache.is_empty()
+            && (self.shred_chunk_cache.len() >= SHRED_CHUNK_CACHE_SIZE
+                || super::SHRED_CHUNK_CACHE_USED.load(std::sync::atomic::Ordering::Relaxed) + bytes > super::SHRED_CHUNK_CACHE_BYTES)
+        {
+            let oldest = self.shred_chunk_cache.iter().map(|e| *e.key()).min();
+            match oldest {
+                Some(h) => { self.drop_chunk_cache_entry(h); }
+                None => break,
             }
         }
+        if let Some((_, old)) = self.shred_chunk_cache.remove(&height) {
+            super::SHRED_CHUNK_CACHE_USED.fetch_sub(super::chunk_entry_bytes(&old), std::sync::atomic::Ordering::Relaxed);
+        }
+        super::SHRED_CHUNK_CACHE_USED.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
         self.shred_chunk_cache.insert(height, ShredChunkCacheEntry {
             chunks,
             parity_chunks,
@@ -2318,6 +2323,13 @@ impl SimplifiedP2P {
         });
     }
     
+    /// Remove one cached height and release its bytes.
+    pub(super) fn drop_chunk_cache_entry(&self, height: u64) {
+        if let Some((_, e)) = self.shred_chunk_cache.remove(&height) {
+            super::SHRED_CHUNK_CACHE_USED.fetch_sub(super::chunk_entry_bytes(&e), std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     /// Reconstruct block from all data chunks
     pub(super) fn reconstruct_block_from_shred_protocol(&self, height: u64) {
         // Block already marked as processed in handle_shred_protocol_chunk
@@ -2369,7 +2381,7 @@ impl SimplifiedP2P {
             if computed.as_slice() != &expected_hash[..] {
                 eprintln!("[ERR][SHRED] block_hash_mismatch h={} expected={} computed={} action=discard",
                          height, hex::encode(&expected_hash[..8]), hex::encode(&computed[..8]));
-                self.shred_chunk_cache.remove(&height);
+                self.drop_chunk_cache_entry(height);
                 self.processed_shred_blocks.remove(&height);
                 return;
             }
@@ -2558,7 +2570,7 @@ impl SimplifiedP2P {
                 if computed.as_slice() != &expected_hash[..] {
                     eprintln!("[ERR][SHRED] block_hash_mismatch h={} expected={} computed={} action=discard path=parity",
                              height, hex::encode(&expected_hash[..8]), hex::encode(&computed[..8]));
-                    self.shred_chunk_cache.remove(&height);
+                    self.drop_chunk_cache_entry(height);
                     self.processed_shred_blocks.remove(&height);
                     return;
                 }

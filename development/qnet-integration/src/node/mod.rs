@@ -6252,14 +6252,178 @@ mod tests {
         let apply = include_str!("state_apply.rs");
         let replay = apply.find("for mb in &blocks_to_replay").expect("replay loop");
         let per_block = apply.find("replay_diverged").expect("per-block verification");
+        let undo = apply.find("sg.rollback_block(&snap)").expect("the divergent block is undone");
+        let stop = apply.find("reconcile_stopped_short").expect("the stop is retargeted");
         let end = apply.find("reconcile_complete mode=").expect("end-of-replay report");
-        assert!(replay < per_block && per_block < end, "the check must run inside the replay loop");
+        assert!(replay < undo && undo < per_block && per_block < stop && stop < end,
+                "undo, verify-log and retarget must all happen inside the replay, before the report");
         let prod = include_str!("production.rs");
         let noted = prod.find("fn note_reconcile_failure").expect("failure counter");
         let escalate = prod.find(r#"err.starts_with("replay_diverged")"#).expect("immediate escalation");
         let wholesale = prod[escalate..].find("request_wholesale_state_resync").expect("resync request");
         assert!(noted < escalate && wholesale < 2_000,
                 "a divergent replay must reach the wholesale request without a descent");
+    }
+
+    // Reconcile replays stored blocks from a snapshot with the same apply function the pipeline uses,
+    // and under load its roots stopped matching the live ones (node 005: expected 4a6f85b0, computed
+    // 43a0f579, twice). Reproduce the exact shape: full pure-transfer blocks over a wide account set;
+    // live = per-block journal + per-block finalize, replay = snapshot restore + no journal.
+    #[test]
+    fn a_replay_from_a_snapshot_reproduces_the_live_roots_of_heavy_transfer_blocks() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage");
+        const N: usize = 240;
+        let addr = |i: usize| format!("acct_{:04}", i);
+        let baseline: Vec<(String, qnet_state::Account)> = (0..N).map(|i| {
+            let mut a = qnet_state::Account::default();
+            a.address = addr(i);
+            a.balance = 1_000_000_000_000;
+            (addr(i), a)
+        }).collect();
+
+        // Six blocks, twelve senders each, fifty recipients per batch — senders rotate so nonces climb.
+        let mut nonces = vec![0u64; N];
+        let mut blocks = Vec::new();
+        for b in 0..6u64 {
+            let h = 100 + b;
+            let mut txs = Vec::new();
+            for k in 0..12usize {
+                let from = (b as usize * 12 + k) % N;
+                nonces[from] += 1;
+                let transfers: Vec<qnet_state::transaction::BatchTransferData> = (0..50usize).map(|r| {
+                    qnet_state::transaction::BatchTransferData {
+                        to_address: addr((from + 1 + r * 7) % N), amount: 1_000 + r as u64, memo: None }
+                }).collect();
+                txs.push(qnet_state::Transaction::new(
+                    addr(from), None, 0, nonces[from], 80, 5_000_000, 0, None,
+                    qnet_state::TransactionType::BatchTransfers { transfers, batch_id: format!("b{}-{}", b, k) },
+                    None));
+            }
+            let mut mb = p3_micro(h, b as u8);
+            mb.transactions = txs;
+            blocks.push(mb);
+        }
+
+        let live = qnet_state::State::new();
+        live.restore_accounts(baseline.clone()).expect("restore live");
+        let mut live_roots = Vec::new();
+        for mb in blocks.iter_mut() {
+            let mut snap = live.create_block_snapshot(mb.height);
+            let r = BlockchainNode::apply_block_to_state(&live, mb, &storage, Some(&mut snap));
+            assert!(r.reward_epoch_missing.is_none());
+            let root = live.finalize_merkle();
+            mb.state_root = root;
+            live_roots.push(root);
+        }
+        assert!(live_roots.windows(2).all(|w| w[0] != w[1]), "each block must move the root");
+
+        // Replay exactly as reconcile does: restore, apply with no journal, finalize once at the end.
+        let rep = qnet_state::State::new();
+        rep.restore_accounts(baseline.clone()).expect("restore replay");
+        for mb in &blocks {
+            let _ = BlockchainNode::apply_block_to_state(&rep, mb, &storage, None);
+        }
+        assert_eq!(hex::encode(rep.finalize_merkle()), hex::encode(live_roots[live_roots.len() - 1]),
+                   "replay with one finalize at the end must reproduce the live root");
+
+        // And with a finalize per block, to separate apply-path drift from finalize cadence.
+        let rep2 = qnet_state::State::new();
+        rep2.restore_accounts(baseline).expect("restore replay 2");
+        for (i, mb) in blocks.iter().enumerate() {
+            let _ = BlockchainNode::apply_block_to_state(&rep2, mb, &storage, None);
+            assert_eq!(hex::encode(rep2.finalize_merkle()), hex::encode(live_roots[i]),
+                       "replay must reproduce the live root at block {}", mb.height);
+        }
+    }
+
+    // Node 005, 2026-09-05: `replay_diverged h=433499`, the first block that credited a fee to the
+    // producer 006 — a wallet that did not exist at the snapshot height. After the snapshot restore
+    // the wallet is absent from RAM, so the credit path reads its row from the accounts CF, which
+    // still holds the value the LIVE apply persisted (every later fee included), and credits on top.
+    // Reproduce with the real storage as the disk store.
+    #[test]
+    fn a_replay_from_a_snapshot_reproduces_a_fee_credit_to_a_wallet_born_after_the_snapshot() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = std::sync::Arc::new(crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage"));
+        storage.save_node_registration_at_height("prod_node", "super", "wallet_prod", 90.0, 10).unwrap();
+        const N: usize = 120;
+        let addr = |i: usize| format!("acct_{:04}", i);
+        let baseline: Vec<(String, qnet_state::Account)> = (0..N).map(|i| {
+            let mut a = qnet_state::Account::default();
+            a.address = addr(i);
+            a.balance = 1_000_000_000_000;
+            (addr(i), a)
+        }).collect();
+        let mut nonces = vec![0u64; N];
+        let mut blocks = Vec::new();
+        for b in 0..4u64 {
+            let h = 200 + b;
+            let mut txs = Vec::new();
+            for k in 0..6usize {
+                let from = (b as usize * 6 + k) % N;
+                nonces[from] += 1;
+                let transfers: Vec<qnet_state::transaction::BatchTransferData> = (0..20usize).map(|r| {
+                    qnet_state::transaction::BatchTransferData {
+                        to_address: addr((from + 1 + r * 5) % N), amount: 500 + r as u64, memo: None }
+                }).collect();
+                txs.push(qnet_state::Transaction::new(
+                    addr(from), None, 0, nonces[from], 80, 5_000_000, 0, None,
+                    qnet_state::TransactionType::BatchTransfers { transfers, batch_id: format!("f{}-{}", b, k) },
+                    None));
+            }
+            let mut mb = p3_micro(h, b as u8);
+            mb.producer = "prod_node".to_string();
+            mb.transactions = txs;
+            blocks.push(mb);
+        }
+
+        // Live: journal per block, finalize per block, persist every touched account (write-through).
+        let live = qnet_state::State::new();
+        live.set_disk_store(storage.clone() as std::sync::Arc<dyn qnet_state::AccountStore>);
+        live.restore_accounts(baseline.clone()).expect("restore live");
+        let mut live_roots = Vec::new();
+        for mb in blocks.iter_mut() {
+            let mut snap = live.create_block_snapshot(mb.height);
+            let _ = BlockchainNode::apply_block_to_state(&live, mb, &storage, Some(&mut snap));
+            let root = live.finalize_merkle();
+            mb.state_root = root;
+            live_roots.push(root);
+            let rows: Vec<(String, qnet_state::Account)> = live.accounts.iter()
+                .map(|e| (e.key().clone(), e.value().clone())).collect();
+            assert!(qnet_state::AccountStore::persist_accounts(&*storage, &rows), "persist");
+        }
+        assert!(live.accounts.contains_key("wallet_prod"), "the producer wallet must have been credited live");
+
+        // Replay exactly as reconcile does, on a state whose disk store carries the live rows.
+        let rep = qnet_state::State::new();
+        rep.set_disk_store(storage.clone() as std::sync::Arc<dyn qnet_state::AccountStore>);
+        rep.restore_accounts(baseline).expect("restore replay");
+        // Without this step the wallet's CF row (its latest live value) is read as its value at the
+        // snapshot height and credited on top — the divergence node 005 reported at 433499.
+        let (_, removed) = BlockchainNode::trueup_accounts_cf_against(&rep, &storage);
+        assert_eq!(removed, 1, "exactly the wallet born after the snapshot is a phantom");
+        for (i, mb) in blocks.iter().enumerate() {
+            let _ = BlockchainNode::apply_block_to_state(&rep, mb, &storage, None);
+            assert_eq!(hex::encode(rep.finalize_merkle()), hex::encode(live_roots[i]),
+                       "replay must reproduce the live root at block {}", mb.height);
+        }
+    }
+
+    // Both restore paths must purge post-snapshot CF rows BEFORE anything is replayed on the
+    // restored state; otherwise the replay's disk fallback reads them as snapshot-height values.
+    #[test]
+    fn every_snapshot_restore_purges_post_snapshot_cf_rows_before_replaying() {
+        let apply = include_str!("state_apply.rs");
+        let restored = apply.find("reconcile_snapshot_restored snap_h=").expect("restore log");
+        let trueup = apply.find("trueup_accounts_cf_against(&sg, storage)").expect("reconcile true-up");
+        let replay = apply.find("for mb in &blocks_to_replay").expect("replay loop");
+        assert!(restored < trueup && trueup < replay, "reconcile: restore, true-up, then replay");
+        let snaps = include_str!("../storage/snapshots.rs");
+        let restore = snaps.find("restore_accounts_streamed(acct_iter)").expect("rehydrate restore");
+        let trueup2 = snaps.find("trueup_accounts_cf_against(&*sg, self)").expect("rehydrate true-up");
+        let ok = snaps.find("rehydrate_ok h=").expect("rehydrate report");
+        assert!(restore < trueup2 && trueup2 < ok, "rehydrate: restore, true-up, then report");
     }
 
     // The settle-point index gets ONE block per epoch and no retry, so a node catching up across that

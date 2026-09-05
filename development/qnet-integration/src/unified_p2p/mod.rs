@@ -3017,6 +3017,19 @@ const SHRED_CHUNK_TIMEOUT_SECS: u64 = 5;            // Timeout before requesting
 // a 5000-block window covers ~83 minutes of history at 1 block/sec, ample
 // for any honest peer to detect and repair its gaps before eviction.
 const SHRED_CHUNK_CACHE_SIZE: usize = 5_000;
+/// Byte ceiling for the same cache: a count bound alone let 600 full blocks pin gigabytes.
+const SHRED_CHUNK_CACHE_BYTES: usize = 256 * 1024 * 1024;
+static SHRED_CHUNK_CACHE_USED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Bytes currently held by the retransmit chunk cache (for the memory breakdown).
+pub fn shred_chunk_cache_bytes() -> usize {
+    SHRED_CHUNK_CACHE_USED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn chunk_entry_bytes(e: &ShredChunkCacheEntry) -> usize {
+    e.chunks.iter().chain(e.parity_chunks.iter())
+        .map(|c| c.as_ref().map_or(0, |v| v.len())).sum()
+}
 const SHRED_CHUNK_MAX_RETRIES: u8 = 4;              // Max retransmit attempts per block (v2.31: increased from 2 for reliability)
 #[allow(dead_code)]
 const MAX_CONCURRENT_CHUNK_SENDS: usize = 20;       // Max concurrent QUIC streams for chunk sends (v2.21.4)

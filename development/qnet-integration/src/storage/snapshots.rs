@@ -3535,6 +3535,8 @@ impl Storage {
         // AFTER the fail-closed merkle assert so a rejected snapshot never seeds the map. Byte-identical
         // to a from-genesis node for all reg_height<=anchor bindings.
         self.reseed_commitment_dedup(&*sg)?;
+        // Same reason as the reconcile path: the tail that follows must not read post-anchor rows.
+        let _ = crate::node::BlockchainNode::trueup_accounts_cf_against(&*sg, self);
         println!("[INFO][STATE] rehydrate_ok h={} root={} total_supply={} watermark_mb={}",
                  anchor_height, hex::encode(&anchor_state_root[..8]), total_supply, last_minted_emission_mb);
         Ok(())
