@@ -35,9 +35,8 @@ ENV CARGO_NET_RETRY=10
 ENV CARGO_HTTP_TIMEOUT=300
 
 # Build using Cargo.lock for deterministic dependency resolution
-RUN cargo build --profile release-fast --bin qnet-node \
-    && strip target/release-fast/qnet-node \
-    && cp target/release-fast/qnet-node /usr/local/bin/
+# Not stripped: the symbol table is what makes a host-side backtrace of a frozen node readable.
+RUN cargo build --profile release-fast --bin qnet-node \n    && cp target/release-fast/qnet-node /usr/local/bin/
 
 # Production runtime image — same Ubuntu 22.04 for glibc compatibility
 FROM ubuntu:22.04

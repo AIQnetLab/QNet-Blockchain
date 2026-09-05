@@ -28,7 +28,9 @@ rocksdb = "0.21"
 [profile.release]
 opt-level = 3
 debug = false
-strip = true
+# Keep the symbol table: a frozen node is diagnosed from thread backtraces on the host, and a
+# stripped binary turns them into bare addresses. No DWARF is emitted (debug = false).
+strip = "debuginfo"
 lto = "fat"
 codegen-units = 1
 panic = "abort"
@@ -37,7 +39,7 @@ panic = "abort"
 inherits = "release"
 opt-level = 3
 debug = false
-strip = true
+strip = "debuginfo"
 lto = "fat"
 codegen-units = 1
 panic = "abort"

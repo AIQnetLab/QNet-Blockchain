@@ -2289,6 +2289,15 @@ pub async fn run(
                         window_buf.insert(index, WindowContent {
                             mb_hashes, state_root, beacon, head_ts, committee: cmt, eligible: eligible_producers, banned, reward_root, registry_root, dilithium_pk_root, reward_epoch_root, logs_root, total_supply,
                         });
+                        // Content below the frontier can no longer be proposed or checked - the driver
+                        // refuses any head but next_window's - so it leaves as the frontier passes it. At
+                        // scale each entry carries the full producer snapshot; holding 256 of them was
+                        // gigabytes for nothing. The cap below bounds only the future side, which a
+                        // finality wedge legitimately fills.
+                        {
+                            let nw = driver.next_window();
+                            window_buf.retain(|k, _| k.saturating_add(1) >= nw);
+                        }
                         if window_buf.len() > MAX_WINDOW_BUF {
                             // NEVER evict the IN-FLIGHT window (audit F4): during a finality wedge
                             // production keeps signalling new windows; evicting by min-key alone put a
