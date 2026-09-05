@@ -565,134 +565,169 @@ pub struct StorageStats {
     pub latest_height: u64,
 }
 
-/// Transaction pool with TTL cleanup for efficient microblock storage
-/// Stores transactions separately from microblocks to avoid duplication
-/// v3.0: Added MAX_SIZE limit to prevent memory leak
+/// Read-through RAM cache of stored transactions, keyed by hash, in front of the `transactions`
+/// CF. Bounded by BYTES and evicted oldest-first: a count cap sized for ~1 KB transactions let a
+/// run of 1000-transfer batches (~150 KB each) pin hundreds of megabytes for the whole TTL.
+/// RocksDB is the source of truth; a miss is one CF read.
 #[derive(Debug)]
 pub struct TransactionPool {
-    /// Map of transaction hash to transaction
-    transactions: Arc<RwLock<HashMap<[u8; 32], Transaction>>>,
-    /// Map of transaction hash to creation timestamp
-    creation_times: Arc<RwLock<HashMap<[u8; 32], u64>>>,
-    /// TTL in hours after which transactions are eligible for cleanup
+    /// hash → (transaction, encoded size)
+    transactions: Arc<RwLock<HashMap<[u8; 32], (Transaction, usize)>>>,
+    /// Insertion order with the insertion time; the front is always the oldest entry.
+    order: Arc<RwLock<std::collections::VecDeque<([u8; 32], u64)>>>,
+    bytes: std::sync::atomic::AtomicUsize,
     cleanup_after_hours: u32,
-    /// v3.0: Maximum number of transactions to keep in memory (prevents memory leak)
     max_size: usize,
+    max_bytes: usize,
 }
 
-/// v3.0: Maximum transaction pool size to prevent memory leak
-/// ~200K transactions × ~1KB average = ~200MB RAM (v4.1: 2x)
 const MAX_TRANSACTION_POOL_SIZE: usize = 200_000;
+const MAX_TRANSACTION_POOL_BYTES: usize = 128 * 1024 * 1024;
+
 /// Durable anti-double-sign watermark (metadata CF).
 const HIGHEST_SIGNED_HEIGHT_KEY: &[u8] = b"highest_signed_microblock_height";
 
 impl TransactionPool {
-    /// Create new transaction pool with default TTL of 24 hours
     pub fn new() -> Self {
+        Self::with_limits(MAX_TRANSACTION_POOL_SIZE, MAX_TRANSACTION_POOL_BYTES)
+    }
+
+    pub fn with_limits(max_size: usize, max_bytes: usize) -> Self {
         Self {
             transactions: Arc::new(RwLock::new(HashMap::new())),
-            creation_times: Arc::new(RwLock::new(HashMap::new())),
-            cleanup_after_hours: 24, // 24 hours retention for local hot storage
-            max_size: MAX_TRANSACTION_POOL_SIZE,
+            order: Arc::new(RwLock::new(std::collections::VecDeque::new())),
+            bytes: std::sync::atomic::AtomicUsize::new(0),
+            cleanup_after_hours: 24,
+            max_size,
+            max_bytes,
         }
     }
-    
-    /// Store transaction with current timestamp
-    /// v3.0: Enforces max_size limit to prevent memory leak
+
+    /// Cache a stored transaction. A hash already held is left as is. Entries larger than a
+    /// sixteenth of the byte budget are not cached at all — one read each is cheaper than the
+    /// churn they would cause.
     pub fn store_transaction(&self, tx_hash: [u8; 32], transaction: Transaction) -> Result<(), IntegrationError> {
-        let current_time = SystemTime::now()
+        let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|e| IntegrationError::Other(format!("Time error: {}", e)))?
             .as_secs();
-
+        let size = bincode::serialized_size(&transaction).map(|n| n as usize).unwrap_or(1024);
+        if size > self.max_bytes / 16 { return Ok(()); }
+        let mut txs = self.transactions.write();
+        let mut order = self.order.write();
+        if txs.contains_key(&tx_hash) { return Ok(()); }
+        while !order.is_empty()
+            && (txs.len() >= self.max_size
+                || self.bytes.load(Ordering::Relaxed).saturating_add(size) > self.max_bytes)
         {
-            // FIX L-M22: parking_lot RwLock -- no Result, no poisoning
-            let mut transactions = self.transactions.write();
-            let mut creation_times = self.creation_times.write();
-            
-            // v3.0: CRITICAL - Enforce max size to prevent memory leak
-            // If at limit, remove oldest 10% of transactions
-            if transactions.len() >= self.max_size {
-                let cutoff_time = current_time.saturating_sub(self.cleanup_after_hours as u64 * 1800); // 12h instead of 24h when full
-                let old_hashes: Vec<[u8; 32]> = creation_times.iter()
-                    .filter(|(_, &time)| time < cutoff_time)
-                    .map(|(hash, _)| *hash)
-                    .take(self.max_size / 10) // Remove up to 10%
-                    .collect();
-                    
-                for hash in &old_hashes {
-                    transactions.remove(hash);
-                    creation_times.remove(hash);
-                }
-                
-                if !old_hashes.is_empty() {
-                    println!("[WARN][TX_POOL] at_capacity max={} evicted={}", 
-                             self.max_size, old_hashes.len());
-                }
+            if let Some((h, _)) = order.pop_front() {
+                if let Some((_, b)) = txs.remove(&h) { self.bytes.fetch_sub(b, Ordering::Relaxed); }
             }
-                
-            transactions.insert(tx_hash, transaction);
-            creation_times.insert(tx_hash, current_time);
         }
-        
+        txs.insert(tx_hash, (transaction, size));
+        order.push_back((tx_hash, now));
+        self.bytes.fetch_add(size, Ordering::Relaxed);
         Ok(())
     }
-    
-    /// Get transaction by hash
+
     pub fn get_transaction(&self, tx_hash: &[u8; 32]) -> Option<Transaction> {
-        self.transactions.read()
-            .get(tx_hash)
-            .cloned()
+        self.transactions.read().get(tx_hash).map(|(tx, _)| tx.clone())
     }
-    
-    /// Get multiple transactions by hashes
+
     pub fn get_transactions(&self, tx_hashes: &[[u8; 32]]) -> Vec<Option<Transaction>> {
-        let transactions = self.transactions.read();
-        tx_hashes.iter()
-            .map(|hash| transactions.get(hash).cloned())
-            .collect()
+        let txs = self.transactions.read();
+        tx_hashes.iter().map(|h| txs.get(h).map(|(tx, _)| tx.clone())).collect()
     }
-    
-    /// Clean up old transactions (only removes duplicates, not original blockchain data)
+
+    /// Drop every entry inserted before `cutoff_secs` (oldest-first, so the walk stops at the
+    /// first young one). Returns how many went.
+    pub fn evict_older_than(&self, cutoff_secs: u64) -> usize {
+        let mut txs = self.transactions.write();
+        let mut order = self.order.write();
+        let mut removed = 0usize;
+        while let Some(&(h, t)) = order.front() {
+            if t >= cutoff_secs { break; }
+            order.pop_front();
+            if let Some((_, b)) = txs.remove(&h) { self.bytes.fetch_sub(b, Ordering::Relaxed); removed += 1; }
+        }
+        removed
+    }
+
+    /// Drop entries older than the TTL.
     pub fn cleanup_old_duplicates(&self) -> Result<usize, IntegrationError> {
-        let current_time = SystemTime::now()
+        let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|e| IntegrationError::Other(format!("Time error: {}", e)))?
             .as_secs();
-
-        let cutoff_time = current_time.saturating_sub(self.cleanup_after_hours as u64 * 3600);
-        let mut removed_count = 0;
-
-        {
-            let mut transactions = self.transactions.write();
-            let mut creation_times = self.creation_times.write();
-            
-            // Only remove transactions older than TTL 
-            // In production, we should also check if transaction is already in finalized blocks
-            let old_hashes: Vec<[u8; 32]> = creation_times.iter()
-                .filter(|(_, &time)| time < cutoff_time)
-                .map(|(hash, _)| *hash)
-                .collect();
-                
-            for hash in old_hashes {
-                transactions.remove(&hash);
-                creation_times.remove(&hash);
-                removed_count += 1;
-            }
+        let removed = self.evict_older_than(now.saturating_sub(self.cleanup_after_hours as u64 * 3600));
+        if removed > 0 {
+            println!("[INFO][STORAGE] cleanup_old_tx_duplicates count={}", removed);
         }
-        
-        if removed_count > 0 {
-            println!("[INFO][STORAGE] cleanup_old_tx_duplicates count={}", removed_count);
-        }
-        
-        Ok(removed_count)
+        Ok(removed)
     }
-    
-    /// Get pool statistics
+
+    /// Copies of the cached transactions and their insertion times, for the pool compressor.
+    pub fn export(&self) -> (HashMap<[u8; 32], Transaction>, HashMap<[u8; 32], u64>) {
+        let txs = self.transactions.read();
+        let order = self.order.read();
+        (txs.iter().map(|(h, (tx, _))| (*h, tx.clone())).collect(),
+         order.iter().map(|(h, t)| (*h, *t)).collect())
+    }
+
+    /// (cached transactions, order entries) — equal unless a bug desynchronised them.
     pub fn get_stats(&self) -> Result<(usize, usize), IntegrationError> {
-        let tx_count = self.transactions.read().len();
-        let time_count = self.creation_times.read().len();
-        Ok((tx_count, time_count))
+        Ok((self.transactions.read().len(), self.order.read().len()))
+    }
+
+    /// Encoded bytes currently cached.
+    pub fn bytes(&self) -> usize { self.bytes.load(Ordering::Relaxed) }
+}
+
+#[cfg(test)]
+mod transaction_pool_tests {
+    use super::*;
+
+    fn batch_tx(seed: u8, transfers: usize) -> ([u8; 32], Transaction) {
+        let items = (0..transfers).map(|i| qnet_state::transaction::BatchTransferData {
+            to_address: format!("{:0>44}", i), amount: 1, memo: None }).collect();
+        let tx = Transaction::new(
+            format!("{:0>44}", seed), None, 0, seed as u64, 80, 5_000_000, 1_700_000_000,
+            None, qnet_state::TransactionType::BatchTransfers { transfers: items, batch_id: format!("b{}", seed) },
+            None);
+        ([seed; 32], tx)
+    }
+
+    // A count cap sized for small transactions is no bound at all once transactions are large:
+    // the pool holds what its byte budget allows and lets the oldest go first.
+    #[test]
+    fn the_cache_is_bounded_by_bytes_and_evicts_oldest_first() {
+        let (h0, t0) = batch_tx(1, 1000);
+        let one = bincode::serialized_size(&t0).unwrap() as usize;
+        let cap = one * 16 + one / 2;
+        let pool = TransactionPool::with_limits(200_000, cap);
+        pool.store_transaction(h0, t0).unwrap();
+        for seed in 2..=20u8 { let (h, t) = batch_tx(seed, 1000); pool.store_transaction(h, t).unwrap(); }
+        let (n, ord) = pool.get_stats().unwrap();
+        assert_eq!(n, 16, "sixteen entries fit the budget");
+        assert_eq!(n, ord);
+        assert!(pool.bytes() <= cap, "bytes stay under the cap: {}", pool.bytes());
+        for seed in 1..=4u8 { assert!(pool.get_transaction(&[seed; 32]).is_none(), "the oldest went first"); }
+        assert!(pool.get_transaction(&[20u8; 32]).is_some(), "the newest is held");
+        // A re-store of a held hash is a no-op, not a duplicate queue entry.
+        let (h20, t20) = batch_tx(20, 1000);
+        pool.store_transaction(h20, t20).unwrap();
+        assert_eq!(pool.get_stats().unwrap(), (16, 16));
+    }
+
+    // An entry larger than a sixteenth of the budget is read from disk each time, never cached.
+    #[test]
+    fn an_oversized_entry_is_not_cached() {
+        let (h, t) = batch_tx(1, 1000);
+        let one = bincode::serialized_size(&t).unwrap() as usize;
+        let pool = TransactionPool::with_limits(200_000, one * 8);
+        pool.store_transaction(h, t).unwrap();
+        assert_eq!(pool.get_stats().unwrap(), (0, 0));
+        assert_eq!(pool.bytes(), 0);
     }
 }
 

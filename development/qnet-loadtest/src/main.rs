@@ -192,7 +192,10 @@ async fn main() {
         tokio::spawn(async move {
             let c = &clients[0];
             let mut next_h = c.get_height().await.unwrap_or(0) + 1;
-            let mut last_final_macro: u64 = 0;
+            // Hard finality is walked from the macroblock covering the first tracked height, not
+            // from genesis: early macroblocks carry no certificate and stopped the walk at index 1,
+            // so every run reported finalized=0 whatever the chain did.
+            let mut last_final_macro: u64 = net::finalizing_macroblock(next_h).saturating_sub(1);
             loop {
                 let now = Instant::now();
                 if now >= track_deadline { break; }

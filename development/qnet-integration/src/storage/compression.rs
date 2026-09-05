@@ -46,13 +46,10 @@ impl Storage {
         println!("[INFO][STORAGE] tx_pool_compress_start count={}", tx_count);
         
         // Serialize all transactions
-        let transactions = self.transaction_pool.transactions.read();
-        let creation_times = self.transaction_pool.creation_times.read();
-            
-        let pool_data = (&*transactions, &*creation_times);
+        let (transactions, creation_times) = self.transaction_pool.export();
+        let pool_data = (&transactions, &creation_times);
         let serialized = bincode::serialize(&pool_data)
             .map_err(|e| IntegrationError::SerializationError(e.to_string()))?;
-        
         drop(transactions);
         drop(creation_times);
         
@@ -188,20 +185,8 @@ impl Storage {
         
         // Force aggressive cleanup of transaction pool CACHE only
         {
-            let mut transactions = self.transaction_pool.transactions.write();
-            let mut creation_times = self.transaction_pool.creation_times.write();
-
-            let old_hashes: Vec<[u8; 32]> = creation_times.iter()
-                .filter(|(_, &time)| time < aggressive_cutoff)
-                .map(|(hash, _)| *hash)
-                .collect();
-                
-            for hash in old_hashes {
-                transactions.remove(&hash);
-                creation_times.remove(&hash);
-            }
-            
-            println!("[INFO][STORAGE] aggressive_tx_cache_cleaned older_than=6h");
+            let removed = self.transaction_pool.evict_older_than(aggressive_cutoff);
+            println!("[INFO][STORAGE] aggressive_tx_cache_cleaned older_than=6h removed={}", removed);
         }
         
         // 2. CRITICAL CORRECTION: DO NOT delete blockchain history!
@@ -236,20 +221,8 @@ impl Storage {
         let emergency_cutoff = current_time.saturating_sub(3600); // 1 hour only
         
         {
-            let mut transactions = self.transaction_pool.transactions.write();
-            let mut creation_times = self.transaction_pool.creation_times.write();
-
-            let emergency_hashes: Vec<[u8; 32]> = creation_times.iter()
-                .filter(|(_, &time)| time < emergency_cutoff)
-                .map(|(hash, _)| *hash)
-                .collect();
-                
-            for hash in emergency_hashes {
-                transactions.remove(&hash);
-                creation_times.remove(&hash);
-            }
-            
-            println!("[WARN][STORAGE] emergency_tx_pool_cleared kept=1h");
+            let removed = self.transaction_pool.evict_older_than(emergency_cutoff);
+            println!("[WARN][STORAGE] emergency_tx_pool_cleared kept=1h removed={}", removed);
         }
         
         // 2. CRITICAL CORRECTION: DO NOT delete blockchain history even in emergency!
