@@ -1019,6 +1019,12 @@ impl BlockchainNode {
                 // Complete any snapshot promote interrupted by a crash BEFORE reloading the anchor
                 // (idempotent: re-copies from the intact staging, then clears the marker).
                 if let Some(s) = try_get_storage() { s.recover_pending_snapshot_promote(Some(&state)).await; }
+                // The public-node endpoint index is filled in the background; the RPC serves what
+                // is indexed and indexes a bounded number of rows per call meanwhile.
+                if let Some(s) = try_get_storage() {
+                    let s = s.clone();
+                    tokio::spawn(async move { Self::backfill_api_endpoints(s).await; });
+                }
                 reload_snapshot_anchor();
                 // A recovered promote may have advanced chain_height — re-read so the rest of boot
                 // (integrity checks, p2p height) uses the promoted height, not the pre-recovery value.

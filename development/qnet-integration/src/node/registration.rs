@@ -296,7 +296,8 @@ impl BlockchainNode {
     /// - is_synced = true (not more than 5 blocks behind current height)
     /// - Genesis nodes always included (infrastructure backbone)
     pub async fn get_all_public_api_nodes(&self) -> Vec<(String, String, qnet_state::NodeType, f64, u64, bool)> {
-        use qnet_state::TransactionType;
+        /// Block reads one call may spend on endpoints not indexed yet.
+        const API_INDEX_LOADS_PER_CALL: usize = 256;
 
         // Cache API node results for 60s to avoid O(N) chain scan on every call
         static API_NODES_CACHE: once_cell::sync::Lazy<
@@ -331,29 +332,29 @@ impl BlockchainNode {
             std::collections::HashMap::new()
         };
         
-        // Collect all registrations (last one wins for each node_id)
-        let mut registrations: std::collections::HashMap<String, (String, qnet_state::NodeType)> = 
+        // Registrations come from the registry rows; each node's endpoint is read once from the
+        // block that registered it and indexed. The previous full chain scan from genesis - every
+        // block decoded, every transaction decompressed - ran on a runtime worker each time the
+        // cache expired, and with 13k-transfer blocks it starved the node's own reads for tens of
+        // seconds: producer silence, failover, fork, rollback. A call indexes at most
+        // API_INDEX_LOADS_PER_CALL blocks; the boot backfill covers the rest.
+        let mut registrations: std::collections::HashMap<String, (String, qnet_state::NodeType)> =
             std::collections::HashMap::new();
-        
-        for height in 0..=current_height {
-            if let Ok(Some(block)) = self.storage.load_microblock_auto_format(height) {
-                for tx in &block.transactions {
-                    if let TransactionType::NodeRegistration { 
-                        node_id, 
-                        node_type, 
-                        api_endpoint,
-                        .. 
-                    } = &tx.tx_type {
-                        // Only include nodes with public API (non-empty endpoint)
-                        // Light nodes are automatically excluded (their endpoint is always empty)
-                        if !api_endpoint.is_empty() {
-                            registrations.insert(node_id.clone(), (api_endpoint.clone(), node_type.clone()));
-                        }
-                    }
-                }
-            }
+        let mut loads = API_INDEX_LOADS_PER_CALL;
+        for (node_id, _, reg_height) in self.storage.super_roster_rows().unwrap_or_default() {
+            let endpoint = match Self::indexed_api_endpoint(&self.storage, &node_id, reg_height, &mut loads) {
+                Some(e) => e,
+                None => continue,
+            };
+            if endpoint.is_empty() { continue; }
+            registrations.insert(node_id, (endpoint, qnet_state::NodeType::Super));
         }
-        
+        // The genesis set is pinned in the binary; it is the backbone every client starts from and
+        // must be listed whatever the roster index holds.
+        for (ip, id) in crate::genesis_constants::GENESIS_NODE_IPS {
+            registrations.entry(format!("genesis_node_{}", id))
+                .or_insert_with(|| (format!("{}:8001", ip), qnet_state::NodeType::Super)); // on-chain form: host:port
+        }
         // Reputation display value. The RAM telemetry engine was removed; under the
         // deterministic model an active node sits at the floor — tombstones gate consensus
         // eligibility via the chain fold elsewhere, not this peer-list view.
@@ -413,6 +414,40 @@ impl BlockchainNode {
         }
 
         result
+    }
+
+    /// The endpoint a node registered with: from the index, else read once from the block at its
+    /// registration height and indexed (an empty endpoint is indexed too, so it is never re-read).
+    /// `loads` bounds block reads per call; None = not indexed yet and the budget is spent.
+    pub fn indexed_api_endpoint(storage: &crate::storage::Storage, node_id: &str, reg_height: u64, loads: &mut usize) -> Option<String> {
+        if let Some(e) = storage.api_endpoint_get(node_id) { return Some(e); }
+        if *loads == 0 { return None; }
+        *loads -= 1;
+        let block = storage.load_microblock_auto_format(reg_height).ok().flatten()?;
+        let endpoint = block.transactions.iter().find_map(|tx| match &tx.tx_type {
+            qnet_state::TransactionType::NodeRegistration { node_id: id, api_endpoint, .. } if id == node_id =>
+                Some(api_endpoint.clone()),
+            _ => None,
+        }).unwrap_or_default();
+        let _ = storage.api_endpoint_put(node_id, &endpoint);
+        Some(endpoint)
+    }
+
+    /// Boot backfill of the endpoint index: one block read per not-yet-indexed super row, yielding
+    /// between reads so it never sits on the runtime. Needed once per database; later boots find
+    /// the index in place.
+    pub async fn backfill_api_endpoints(storage: std::sync::Arc<crate::storage::Storage>) {
+        let rows = storage.super_roster_rows().unwrap_or_default();
+        let mut indexed = 0usize;
+        for (i, (node_id, _, reg_height)) in rows.iter().enumerate() {
+            if storage.api_endpoint_get(node_id).is_some() { continue; }
+            let mut one = 1usize;
+            if Self::indexed_api_endpoint(&storage, node_id, *reg_height, &mut one).is_some() { indexed += 1; }
+            if i % 16 == 15 { tokio::task::yield_now().await; }
+        }
+        if indexed > 0 && is_info() {
+            println!("[INFO][REGISTRY] api_endpoint_index_backfilled nodes={} rows={}", indexed, rows.len());
+        }
     }
 
     /// Cache node registration for fast lookups
@@ -1536,4 +1571,54 @@ impl BlockchainNode {
         rows.sort_by(|a, b| a.0.cmp(&b.0));
     }
 
+}
+
+#[cfg(test)]
+mod api_endpoint_index_tests {
+    use super::*;
+
+    fn reg_tx(node_id: &str, endpoint: &str) -> qnet_state::Transaction {
+        let mut tx = qnet_state::Transaction {
+            hash: String::new(), from: "w".to_string(), to: None, amount: 0, nonce: 0,
+            gas_price: 0, gas_limit: 0, timestamp: 1000, signature: None, public_key: None,
+            tx_type: qnet_state::TransactionType::NodeRegistration {
+                node_id: node_id.to_string(), node_type: qnet_state::NodeType::Super,
+                wallet_address: "w".to_string(), registration_proof: String::new(),
+                api_endpoint: endpoint.to_string(), burn_tx: String::new(), vrf_pk: Vec::new(),
+                burn_wallet: String::new(), burn_owner_sig: String::new(), burn_amount: 0, burn_cost: 0,
+                burn_attestors: Vec::new(), attest_epoch: 0,
+            },
+            data: None, dilithium_signature: None, dilithium_public_key: None,
+            chain_id: qnet_state::transaction::QNET_CHAIN_ID,
+        };
+        tx.hash = tx.calculate_hash();
+        tx
+    }
+
+    // The endpoint of a registered node is read from the block that registered it exactly once,
+    // then served from the index; a node registered without one is indexed as empty and never
+    // read again; an unindexed row costs nothing once the per-call budget is spent.
+    #[test]
+    fn endpoints_are_indexed_from_the_registration_block_and_read_once() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage");
+        let mb = qnet_state::MicroBlock::new(7, 1007, [0u8; 32],
+            vec![reg_tx("super_a", "http://10.0.0.1:8001"), reg_tx("super_b", "")], "genesis_node_001".to_string());
+        storage.save_microblock(7, &bincode::serialize(&mb).expect("ser")).expect("save");
+        storage.save_node_registration_at_height("super_a", "super", "w", 1.0, 7).expect("row a");
+        storage.save_node_registration_at_height("super_b", "super", "w", 1.0, 7).expect("row b");
+
+        let mut loads = 0usize;
+        assert_eq!(BlockchainNode::indexed_api_endpoint(&storage, "super_a", 7, &mut loads), None, "no budget, not indexed yet");
+        let mut loads = 4usize;
+        assert_eq!(BlockchainNode::indexed_api_endpoint(&storage, "super_a", 7, &mut loads).as_deref(), Some("http://10.0.0.1:8001"));
+        assert_eq!(loads, 3, "one block read");
+        assert_eq!(BlockchainNode::indexed_api_endpoint(&storage, "super_a", 7, &mut loads).as_deref(), Some("http://10.0.0.1:8001"));
+        assert_eq!(loads, 3, "served from the index, no read");
+        assert_eq!(BlockchainNode::indexed_api_endpoint(&storage, "super_b", 7, &mut loads).as_deref(), Some(""));
+        assert_eq!(storage.api_endpoint_get("super_b").as_deref(), Some(""), "an empty endpoint is indexed too");
+        let rows = storage.super_roster_rows().expect("rows");
+        assert_eq!(rows.iter().filter(|(id, _, h)| *h == 7 && id.starts_with("super_")).count(), 2,
+                   "both supers sit in the roster index the list is built from");
+    }
 }

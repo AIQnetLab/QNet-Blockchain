@@ -1158,6 +1158,29 @@ impl Storage {
         Ok(out)
     }
 
+    /// Chain-confirmed super rows as (node_id, wallet, reg_height), from the `srtr_` index - one
+    /// ascending pass over the supers, never over the light rows.
+    pub fn super_roster_rows(&self) -> IntegrationResult<Vec<(String, String, u64)>> {
+        let mut out = Vec::new();
+        self.super_roster_for_each(|node_id, wallet, h, _| out.push((node_id.to_string(), wallet.to_string(), h)))?;
+        Ok(out)
+    }
+
+    /// Public API endpoint indexed for `node_id` ("" = registered without one). None = not indexed
+    /// yet. A side index keyed `api_<node_id>`; not a registry_root input.
+    pub fn api_endpoint_get(&self, node_id: &str) -> Option<String> {
+        let cf = self.persistent.db.cf_handle("node_registry")?;
+        self.persistent.db.get_cf(&cf, format!("api_{}", node_id).as_bytes()).ok().flatten()
+            .and_then(|v| String::from_utf8(v).ok())
+    }
+
+    pub fn api_endpoint_put(&self, node_id: &str, endpoint: &str) -> IntegrationResult<()> {
+        let cf = self.persistent.db.cf_handle("node_registry")
+            .ok_or_else(|| IntegrationError::StorageError("node_registry column family not found".to_string()))?;
+        self.persistent.db.put_cf(&cf, format!("api_{}", node_id).as_bytes(), endpoint.as_bytes())?;
+        Ok(())
+    }
+
     pub fn load_confirmed_node_registrations(&self) -> IntegrationResult<Vec<(String, String)>> {
         let registry_cf = self.persistent.db.cf_handle("node_registry")
             .ok_or_else(|| IntegrationError::StorageError("node_registry column family not found".to_string()))?;
