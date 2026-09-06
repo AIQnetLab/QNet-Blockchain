@@ -193,6 +193,12 @@ static HASH_CHAIN_BREAK_WITNESSES: once_cell::sync::Lazy<
     dashmap::DashMap<u64, DashSet<String>>
 > = once_cell::sync::Lazy::new(dashmap::DashMap::new);
 
+/// Child height → parent hash it named → the distinct peers that delivered such a child. A tail no
+/// peer builds on is not the chain's tail, whatever failover round it carries.
+static CHILD_PARENT_WITNESSES: once_cell::sync::Lazy<
+    dashmap::DashMap<u64, dashmap::DashMap<[u8; 32], DashSet<String>>>
+> = once_cell::sync::Lazy::new(dashmap::DashMap::new);
+
 
 // v32.10: cooldown for macroblock-anchored fork-recovery trigger.
 // Height → wall-clock secs of last trigger. 60s/height prevents thrashing
@@ -590,6 +596,34 @@ pub(crate) fn supersede_stored_from_sync(storage: &Arc<Storage>, height: u64, da
 /// Scalability: per-height witness sets bounded by active validator
 /// count (≤ MAX_VALIDATORS = 1000 in committee). Cleanup sweep evicts
 /// entries below current chain tip.
+/// Record that a child at `height` delivered by `peer_id` names `parent` — whether or not it linked.
+/// Both branches are recorded, so support for OUR tail is visible too and is what protects it.
+pub fn record_child_parent(height: u64, peer_id: &str, parent: [u8; 32]) {
+    if peer_id.is_empty() || peer_id == "self" || height == 0 { return; }
+    let per_height = CHILD_PARENT_WITNESSES.entry(height).or_insert_with(dashmap::DashMap::new);
+    per_height.entry(parent).or_insert_with(DashSet::new).insert(peer_id.to_string());
+}
+
+/// The parent a quorum-relevant set of DISTINCT peers named at `child_height`, when nobody named
+/// `ours`. At most f peers are Byzantine, so f+1 distinct naming the same parent means at least one
+/// honest node built on it; nobody naming ours means our block at child_height-1 is supported by no
+/// one. That, and only that, makes a tail removable without a certificate.
+pub fn unsupported_tail_parent(child_height: u64, ours: [u8; 32]) -> Option<([u8; 32], usize)> {
+    let n = {
+        let r = qnet_consensus::consensus_crypto::consensus_pk_registry_len();
+        if r >= 3 { r } else { 5 }
+    };
+    let need = (n.saturating_sub(1) / 3) + 1;                 // f+1: at least one honest witness
+    let per_height = CHILD_PARENT_WITNESSES.get(&child_height)?;
+    if per_height.get(&ours).map_or(false, |s| !s.is_empty()) { return None; }  // someone builds on ours
+    let mut best: Option<([u8; 32], usize)> = None;
+    for e in per_height.iter() {
+        let c = e.value().len();
+        if c >= need.max(2) && best.map_or(true, |(_, b)| c > b) { best = Some((*e.key(), c)); }
+    }
+    best
+}
+
 pub fn record_hash_chain_break_witness(height: u64, peer_id: &str) {
     if peer_id.is_empty() || peer_id == "self" {
         return;
@@ -711,8 +745,32 @@ pub fn cleanup_forked_peer_cooldown() {
 
 /// Periodic cleanup of stale witness entries below `min_height`.
 /// Called by unified_p2p cleanup tasks.
+#[cfg(test)]
+mod unsupported_tail_tests {
+    use super::*;
+
+    // A tail that f+1 distinct peers build past, and that none of them builds on, is not the chain's;
+    // one witness is not enough, a repeat from the same peer is one witness, and any peer still
+    // extending ours protects it.
+    #[test]
+    fn only_a_tail_nobody_extends_is_unsupported() {
+        let ours = [1u8; 32];
+        let theirs = [2u8; 32];
+        let h = 7_700_001u64;
+        record_child_parent(h, "p1", theirs);
+        record_child_parent(h, "p1", theirs);
+        assert_eq!(unsupported_tail_parent(h, ours), None, "one distinct witness is not f+1");
+        record_child_parent(h, "p2", theirs);
+        assert_eq!(unsupported_tail_parent(h, ours), Some((theirs, 2)));
+        record_child_parent(h, "p3", ours);
+        assert_eq!(unsupported_tail_parent(h, ours), None, "a peer still builds on ours");
+        assert_eq!(unsupported_tail_parent(h + 500, ours), None, "no witnesses at all");
+    }
+}
+
 pub fn cleanup_break_tracker(min_height: u64) {
     HASH_CHAIN_BREAK_WITNESSES.retain(|h, _| *h >= min_height);
+    CHILD_PARENT_WITNESSES.retain(|h, _| *h >= min_height);
     FORK_RECOVERY_TRIGGER_TIMES.retain(|h, _| *h >= min_height);
 }
 
@@ -2217,6 +2275,7 @@ impl BlockPipeline {
                 }
                 let parent_verified_in_flight =
                     verified_recent.get(&mb.previous_hash).copied() == Some(mb.height.saturating_sub(1));
+                let our_parent: Option<[u8; 32]> = match &load_result { Ok(Some(h)) => Some(*h), _ => None };
                 let prev_hash_ok = match load_result {
                     Ok(Some(prev_hash)) => mb.previous_hash == prev_hash,
                     // Parent verified in this loop but its apply-commit hasn't reached storage
@@ -2364,12 +2423,36 @@ impl BlockPipeline {
                     }
                 };
 
+                record_child_parent(mb.height, &decoded.from_peer, mb.previous_hash);
                 if !prev_hash_ok {
                     if is_warn() {
                         println!("[WARN][PIPELINE] hash_chain_break h={} from={} block_round={}",
                                  mb.height, decoded.from_peer, mb.timeout_round);
                     }
                     metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
+
+                    // The chain is the tail the network extends. When f+1 distinct peers deliver a
+                    // child naming another parent and NONE of them builds on ours, our block at that
+                    // height is off the chain — whatever failover round it carries and with no
+                    // checkpoint needed. Above finality only, once per height per cooldown.
+                    if let Some(ours) = our_parent {
+                        let disputed = mb.height.saturating_sub(1);
+                        let finalized = crate::node::LAST_FINALIZED_HEIGHT.load(Ordering::SeqCst);
+                        if disputed > finalized {
+                            if let Some((parent, w)) = unsupported_tail_parent(mb.height, ours) {
+                                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_secs()).unwrap_or(0);
+                                let due = FORK_RECOVERY_TRIGGER_TIMES.get(&disputed)
+                                    .map(|t| now.saturating_sub(*t) >= FORK_RECOVERY_COOLDOWN_SECS).unwrap_or(true);
+                                if due {
+                                    FORK_RECOVERY_TRIGGER_TIMES.insert(disputed, now);
+                                    signal_fork_recovery(disputed.saturating_sub(1).max(finalized));
+                                    println!("[WARN][FORK] unsupported_tail h={} witnesses={} network_parent={:x?} action=reorg_to_supported",
+                                             disputed, w, &parent[..8]);
+                                }
+                            }
+                        }
+                    }
 
                     // Two parallel paths on a locally-detected hash-chain
                     // break: (1) advisory source-witness counting — records

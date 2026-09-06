@@ -103,9 +103,15 @@ impl BlockchainNode {
                     }, |h| {
                         if h == 0 { return None; }
                         let window_k = (h - 1) / 90 + 1;
-                        windows.borrow_mut().entry(window_k)
+                        let certified = windows.borrow_mut().entry(window_k)
                             .or_insert_with(|| crate::block_pipeline::certified_window_hashes(&storage, window_k))
-                            .as_ref().and_then(|v| v.get((h - (window_k - 1) * 90 - 1) as usize).copied())
+                            .as_ref().and_then(|v| v.get((h - (window_k - 1) * 90 - 1) as usize).copied());
+                        if certified.is_some() { return certified; }
+                        // No checkpoint for this height yet: the peers' own children decide. A tail
+                        // that f+1 distinct peers build past, and that none of them builds on, is off
+                        // the chain — its failover round vouches for nothing.
+                        let ours = storage.load_microblock_auto_format(h).ok().flatten().map(|b| b.hash())?;
+                        crate::block_pipeline::unsupported_tail_parent(h + 1, ours).map(|(p, _)| p)
                     });
                     if protected > rollback_to {
                         println!("[WARN][FORK] rollback_floor_raised from={} to={} reason=certified_round_blocks",

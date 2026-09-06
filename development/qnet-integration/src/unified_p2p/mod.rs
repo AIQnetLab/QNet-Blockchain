@@ -1928,15 +1928,18 @@ pub fn superseded_by_certified_round(h: u64, block_round: u64, our_hash: Option<
 /// The highest height in (rollback_to, local_h] holding a block produced under a certified failover
 /// round that no higher certificate has superseded; a heuristic rollback keeps it and everything
 /// under it. Bounded to two windows above `rollback_to`. `load_block(h)` is the stored block's
-/// (absolute round, hash); `certified_hash(h)` the body the n−f-QC'd window names there. A block the
-/// checkpoint names differently is off the chain whatever its round says, and so is everything above
-/// it: the walk stops there (protecting such a block wedged 004 on its own losing tip at 531136).
-pub fn round_protected_floor(rollback_to: u64, local_h: u64, load_block: impl Fn(u64) -> Option<(u64, [u8; 32])>, certified_hash: impl Fn(u64) -> Option<[u8; 32]>) -> u64 {
+/// (absolute round, hash); `network_hash(h)` the block the network names there — the n−f-QC'd
+/// window's body, or the parent f+1 peers build on when no checkpoint covers the height yet. A block
+/// the network names differently is off the chain whatever its round says, and so is everything above
+/// it: the floor stops just below it (protecting such a block wedged 004 on its own tip at 531136).
+pub fn round_protected_floor(rollback_to: u64, local_h: u64, load_block: impl Fn(u64) -> Option<(u64, [u8; 32])>, network_hash: impl Fn(u64) -> Option<[u8; 32]>) -> u64 {
     let mi = qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
     let mut floor = rollback_to;
     for h in (rollback_to + 1)..=local_h.min(rollback_to.saturating_add(2 * mi)) {
         let (r, ours) = match load_block(h) { Some(b) => b, None => continue };
-        if certified_hash(h).map_or(false, |c| c != ours) { break; }
+        // The network names another block here: this height and everything above it descend from a
+        // branch that is not the chain's. Keep what is below, take the rest.
+        if network_hash(h).map_or(false, |c| c != ours) { floor = h.saturating_sub(1).max(rollback_to); break; }
         let certified = certified_round_for_slot(h);
         if certified == 0 || r == 0 || r > certified { continue; }
         if superseded_by_certified_round(h, r, Some(ours)).is_none() { floor = h; }
@@ -6052,11 +6055,11 @@ mod superseded_tail_tests {
         assert_eq!(round_protected_floor(base + 2, base + 20, round1, unsealed), base + 20,
                    "every round-1 block is protected while round 1 is the highest certified");
         assert_eq!(round_protected_floor(base + 2, base + 20, round1, |h| if h == base + 20 { Some(other) } else { None }), base + 19,
-                   "a block the certified checkpoint names differently is not protected by its round");
+                   "a block the network names differently is not protected by its round");
         assert_eq!(round_protected_floor(base + 2, base + 20, round1, |h| if h == base + 10 { Some(other) } else { None }), base + 9,
-                   "everything above a rejected block descends from it: the floor stops below it");
-        assert_eq!(round_protected_floor(base + 2, base + 20, round1, |h| if h >= base + 6 { Some(other) } else { Some(ours) }), base + 2,
-                   "a whole tail the checkpoint rejects leaves nothing to protect");
+                   "everything above a contradicted block descends from it: the floor stops just below it");
+        assert_eq!(round_protected_floor(base + 2, base + 20, round1, |h| if h >= base + 6 { Some(other) } else { Some(ours) }), base + 5,
+                   "a whole tail the network rejects leaves only what is under it");
         certify(w, 2, &[base + 12, base + 12, base + 11]);
         assert_eq!(round_protected_floor(base + 2, base + 20, round1, unsealed), base + 12,
                    "round-1 blocks above the round-2 quorum tip are not vouched for");
