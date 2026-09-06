@@ -452,6 +452,56 @@ impl BlockchainNode {
         r
     }
 
+    /// Shallow reorg: undo (target, tip] from the retained journals under the state lock, prove the
+    /// result against the target block's committed state_root, mirror the pre-images into the accounts
+    /// CF before the lock is released. Err leaves the snapshot restore as the remedy.
+    pub(super) async fn undo_from_journals(
+        state: &Arc<tokio::sync::RwLock<StateManager>>,
+        storage: &Arc<Storage>,
+        target: u64,
+        tip: u64,
+    ) -> Result<u64, String> {
+        let expected = storage.load_microblock_auto_format(target).ok().flatten()
+            .map(|b| b.state_root).filter(|r| *r != [0u8; 32])
+            .ok_or_else(|| "target_root_unavailable".to_string())?;
+        let sg = state.write().await;
+        // Nothing may have been applied since the consumer parked the frontier at `target`: a canonical
+        // successor applied in between would be undone as if it were the orphan.
+        let applied = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::SeqCst);
+        if applied != target {
+            return Err(format!("applied_since_rollback frontier={} target={}", applied, target));
+        }
+        let (undone, mirror) = sg.undo_blocks_above(target, tip).ok_or_else(|| "journals_incomplete".to_string())?;
+        let got = sg.finalize_merkle();
+        if got != expected {
+            crate::block_pipeline::mark_state_suspect();
+            return Err(format!("root_mismatch computed={} expected={}", hex::encode(&got[..8]), hex::encode(&expected[..8])));
+        }
+        sg.chain_state.write().height = target;
+        let mut puts = Vec::new();
+        let mut dels = Vec::new();
+        for (addr, pre) in mirror {
+            match pre { Some(a) => puts.push((addr, a)), None => dels.push(addr) }
+        }
+        let (n_puts, n_dels) = (puts.len(), dels.len());
+        // Still under the lock: no later block's write-through can interleave with the mirror.
+        let mirrored = storage.persist_accounts_batch(puts, dels).await;
+        drop(sg);
+        match mirrored {
+            Ok(_) => {
+                if is_debug() { println!("[DBG][STATE] journal_undo_mirror target={} puts={} dels={}", target, n_puts, n_dels); }
+            }
+            Err(e) => {
+                // The proven state stands; the CF rows are healed by the true-up below and by replay.
+                println!("[WARN][STATE] journal_undo_mirror_failed target={} err={:?}", target, e);
+            }
+        }
+        // Candidates staged by this rollback (and any a vetoed earlier true-up left behind) are checked
+        // against the now-proven leaf set.
+        Self::trueup_staged_candidates(state, storage).await;
+        Ok(undone)
+    }
+
     async fn reconcile_state_after_rollback_inner(
         state: &Arc<tokio::sync::RwLock<StateManager>>,
         storage: &Arc<Storage>,
@@ -572,6 +622,7 @@ impl BlockchainNode {
         let mut computed_root: [u8; 32];
         {
             let sg = state.write().await;
+            sg.drop_block_journals();
 
             match restored_baseline {
                 Some((snap_height, snap_total_supply, accounts)) => {
@@ -666,6 +717,8 @@ impl BlockchainNode {
                 if mb.height % qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL == 0 {
                     let _ = storage.seal_total_supply(mb.height, sg.get_total_supply());
                 }
+                // A replayed block is a committed block: its journal serves a later shallow undo.
+                sg.retain_block_journal(snap);
                 applied = applied.saturating_add(1);
             }
             replayed = applied;

@@ -1124,9 +1124,9 @@ pub(super) async fn handle_ws_connection_with_cleanup(
                                             // SECURITY: Limit to 20 blocks per request via WS
                                             let limit = p["limit"].as_u64().unwrap_or(10).min(20);
                                             let mut blocks = Vec::new();
-                                            for h in start..start + limit {
-                                                if let Ok(Some(block)) = blockchain_for_ws.get_block(h).await {
-                                                    blocks.push(block);
+                                            for h in start..start.saturating_add(limit) {
+                                                if let Ok(Some((block, hash))) = blockchain_for_ws.get_block_with_hash(h).await {
+                                                    blocks.push(block_json(&block, hash));
                                                 }
                                             }
                                             json!({"jsonrpc": "2.0", "id": id, "result": blocks})
@@ -1134,8 +1134,8 @@ pub(super) async fn handle_ws_connection_with_cleanup(
                                         "chain_getBlock" => {
                                             let p = params.unwrap_or(json!({}));
                                             let height = p["height"].as_u64().unwrap_or(0);
-                                            if let Ok(Some(block)) = blockchain_for_ws.get_block(height).await {
-                                                json!({"jsonrpc": "2.0", "id": id, "result": block})
+                                            if let Ok(Some((block, hash))) = blockchain_for_ws.get_block_with_hash(height).await {
+                                                json!({"jsonrpc": "2.0", "id": id, "result": block_json(&block, hash)})
                                             } else {
                                                 json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32000, "message": "Block not found"}})
                                             }

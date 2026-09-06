@@ -4800,6 +4800,19 @@ impl BlockchainNode {
         }
     }
     
+    /// The API block with its consensus hash from the height→hash index (backfilled from the body when
+    /// the index row is missing). None hash = index absent for a present body, which the caller reports.
+    pub async fn get_block_with_hash(&self, height: u64) -> Result<Option<(qnet_state::Block, Option<[u8; 32]>)>, QNetError> {
+        match self.get_block(height).await? {
+            Some(block) => {
+                let hash = self.storage.load_microblock_hash(height)
+                    .map_err(|e| QNetError::StorageError(e.to_string()))?;
+                Ok(Some((block, hash)))
+            }
+            None => Ok(None),
+        }
+    }
+
     pub async fn get_macroblock(&self, index: u64) -> Result<Option<qnet_state::MacroBlock>, QNetError> {
         // Get macroblock by index (not height!)
         // Macroblock #1 = blocks 1-90, #2 = blocks 91-180, etc.

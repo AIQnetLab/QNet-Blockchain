@@ -216,11 +216,23 @@ impl BlockchainNode {
                                 // if reconcile cannot PROVE the rebuilt state canonical do we fall
                                 // to a clean n−f-QC-bound fast-sync (genesis/pin-rooted, fail-closed)
                                 // and let the tail re-sync verify-then-apply.
-                                if let Err(e) = Self::reconcile_state_after_rollback(
-                                    &state,
-                                    &storage,
-                                    rollback_to,
-                                ).await {
+                                // Shallow reorg first: undo the deleted blocks from their retained
+                                // journals, proven against the target's committed state_root; the
+                                // snapshot restore + window replay is the fallback.
+                                let reconciled = match Self::undo_from_journals(&state, &storage, rollback_to, local_h).await {
+                                    Ok(n) => { if is_info() { println!("[INFO][FORK] journal_undo_ok to={} blocks={}", rollback_to, n); } Ok(()) }
+                                    Err(why) => {
+                                        // A contiguous undo that fails its root proof is worth a WARN (a successor
+                                        // applied in the gap also lands here; the fallback settles both).
+                                        if why.starts_with("root_mismatch") {
+                                            if is_warn() { println!("[WARN][FORK] journal_undo_refuted to={} why={}", rollback_to, why); }
+                                        } else if is_info() {
+                                            println!("[INFO][FORK] journal_undo_skipped to={} why={}", rollback_to, why);
+                                        }
+                                        Self::reconcile_state_after_rollback(&state, &storage, rollback_to).await
+                                    }
+                                };
+                                if let Err(e) = reconciled {
                                     // Reconcile couldn't PROVE the rebuilt state canonical. Don't run
                                     // a second inline fetch here — the single sync coordinator owns
                                     // catch-up: post-rollback the local tip drops below finality, so
@@ -691,10 +703,8 @@ impl BlockchainNode {
                     );
                 }
             } else {
-                // Heartbeat stale OR no cache: exponential re-emit pacing per mb —
-                // tau(rel_round) ≈ 5s·1.5^round capped at 128s, reset naturally on
-                // progress (round/mb change). Guarantees growing honest overlap
-                // under unknown post-GST delay without burning MAX_FAILOVER_ROUND.
+                // Heartbeat stale OR no cache: exponential re-emit pacing per mb, tau(rel_round)
+                // ≈ 5s·1.5^round capped at 30 s (a WAN GST is seconds). Resets on progress.
                 const TAU_SECS: [u64; 9] = [5, 7, 11, 16, 25, 38, 56, 85, 128];
                 let tau = TAU_SECS[failover_round.min(8) as usize];
                 let should_emit = {
@@ -5071,9 +5081,9 @@ impl BlockchainNode {
                     // Authority re-check — the LAST point with zero side effects. A failover
                     // certificate can land while this block is being assembled; producing then
                     // means two blocks for one position. Everything below mutates shared state
-                    // (transactions, supply, fees, merkle) and writes durable rows, and the
-                    // producer path has no snapshot to roll back — so yielding must happen here,
-                    // not after. Yielding costs one empty slot; yielding late costs a diverged
+                    // (transactions, supply, fees, merkle) and writes durable rows before anything
+                    // could roll them back — so yielding must happen here, not after. Yielding
+                    // costs one empty slot; yielding late costs a diverged
                     // state_root, a vote outside n−f, and a stalled checkpoint.
                     {
                         let round_now = crate::unified_p2p::certified_round_for_slot(next_block_height);
@@ -5183,11 +5193,13 @@ impl BlockchainNode {
                     let mut block_logs: Vec<(String, String, Vec<u8>)> = Vec::new();
                     let mut block_token_rows: Vec<crate::storage::TokenTransferRow> = Vec::new();
                     let mut side_idx = BlockSideIndices::default();
+                    // This block's journal (mirror of the validator's BlockSnapshot), retained once the
+                    // block is stored so a shallow reorg can undo our own block from it.
+                    let mut inline_journal: Option<qnet_state::BlockSnapshot> = None;
                     {
                         let state_guard = state.write().await;
                         // Re-checked under the lock: the pipeline cannot interleave here, and a peer's
-                        // block for this height applied since the check above would otherwise be built
-                        // over — the producer path records no diff, so that costs a snapshot restore.
+                        // block for this height applied since the check above would otherwise be built over.
                         if crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::SeqCst) >= next_block_height
                             || crate::unified_p2p::highest_verified_height() >= next_block_height
                             || storage.canonical_hash_at(next_block_height).is_some()
@@ -5201,6 +5213,7 @@ impl BlockchainNode {
                         // reader (gossip TX validation included) waits on it, so this section's
                         // duration is bounded by BLOCK_GAS_LIMIT and measured in block_timing.
                         let t_apply = std::time::Instant::now();
+                        let mut inline_snap = state_guard.create_block_snapshot(next_block_height);
 
                         // Per-block WASM event logs, captured the SAME way the validator path does
                         // (apply_block_to_state) so getLogs is complete and the gated window logs_root
@@ -5224,7 +5237,7 @@ impl BlockchainNode {
                                 qnet_state::TransactionType::Transfer { .. }
                                 | qnet_state::TransactionType::BatchTransfers { .. }));
                         if pure_transfers {
-                            let outcomes = state_guard.apply_transfers_parallel(&txs, None);
+                            let outcomes = state_guard.apply_transfers_parallel(&txs, Some(&mut inline_snap));
                             for (tx, outcome) in txs.iter().zip(outcomes) {
                                 let charged = outcome.as_ref().map_or(false, |o| o.charged);
                                 if let Err(e) = outcome {
@@ -5275,6 +5288,13 @@ impl BlockchainNode {
                                         false
                                     }
                                 };
+                                // Counters and the pool live outside the accounts map: journal them as the
+                                // validator does, or an undone block keeps the mint.
+                                {
+                                    let (supply, minted_mb) = state_guard.supply_watermark();
+                                    inline_snap.record_supply(supply, minted_mb);
+                                    state_guard.journal_pre_images(&mut inline_snap, &[crate::node::StateManager::REWARDS_POOL.to_string()]);
+                                }
                                 let emb = Self::emission_mb_index(next_block_height);
                                 match if emission_ok {
                                     state_guard.emit_rewards(tx.amount, emb)
@@ -5282,9 +5302,7 @@ impl BlockchainNode {
                                     Ok(0) // skip the call outright, exactly as the validator does
                                 } {
                                     Ok(m) if m > 0 => {
-                                        // Mirrors the validator: credit the MINTED value, not the
-                                        // requested one. No journal here — the producer-inline path
-                                        // has no BlockSnapshot.
+                                        // Mirrors the validator: credit the MINTED value, not the requested one.
                                         state_guard.credit_rewards_pool(m);
                                         if is_info() {
                                             println!("[INFO][STATE] emission_minted_inline mb={} amount={} minted={} total={} QNC h={}",
@@ -5301,6 +5319,8 @@ impl BlockchainNode {
                             // or a height-dependent contract's storage writes (and event logs) diverge the
                             // producer's state_root from every validator (apply_block_to_state uses _at(h)).
                             // clear→apply→drain brackets THIS tx's WASM logs on one thread (see block_logs).
+                            state_guard.journal_pre_images(&mut inline_snap, &tx.get_all_affected_addresses());
+                            state_guard.record_commitment_pre_image(tx, &mut inline_snap);
                             qnet_state::wasm_exec::clear_wasm_logs();
                             let owns_mark = block_owns.len();
                             // Mirror of the validator path: unconditional, collected not written.
@@ -5320,6 +5340,7 @@ impl BlockchainNode {
                                 }
                             } else {
                                 block_logs.extend(qnet_state::wasm_exec::drain_wasm_logs());
+                                state_guard.journal_pre_images(&mut inline_snap, &[tx.from.clone()]);
                                 if charged {
                                     let _ = state_guard.apply_gas_refund(tx, next_block_height, tx_wasm_fuel);
                                 }
@@ -5387,7 +5408,7 @@ impl BlockchainNode {
                         // Unreachable: claims_resolvable ran at the zero-side-effect point above over
                         // the same TXs and storage. Reaching it means that invariant broke.
                         if let Err(certifying_mb) =
-                            Self::apply_merkle_claims(&state_guard, &*storage, &txs, next_block_height, None) {
+                            Self::apply_merkle_claims(&state_guard, &*storage, &txs, next_block_height, Some(&mut inline_snap)) {
                             println!("[CRIT][REWARDS] claim_unresolvable_after_precheck certifying_mb={} h={}",
                                      certifying_mb, next_block_height);
                         }
@@ -5407,13 +5428,12 @@ impl BlockchainNode {
                         let mut richlist_producer_wallet: Option<String> = None;
                         if producer_credit > 0 && !producer_wallet.is_empty() {
                             richlist_producer_wallet = Some(producer_wallet.clone());
-                            // None: the producer-inline path has no block journal and never rolls
-                            // back, so nothing may release this marker (see rollback_block).
+                            state_guard.journal_pre_images(&mut inline_snap, &[producer_wallet.clone()]);
                             match state_guard.credit_producer_fees_once(
                                 next_block_height,
                                 &producer_wallet,
                                 producer_credit,
-                                None,
+                                Some(&mut inline_snap),
                             ) {
                                 Ok(true) => {
                                     if is_info() && producer_credit > 10_000_000 {
@@ -5455,6 +5475,7 @@ impl BlockchainNode {
                             println!("[DBG][STATE] state_root computed h={} root={}",
                                      next_block_height, hex::encode(&computed_state_root[..8]));
                         }
+                        inline_journal = Some(inline_snap);
                     }
 
                     // Durable registry materialisation (node_/srtr_/lrtr_ + the registry_root /
@@ -5679,6 +5700,9 @@ impl BlockchainNode {
                     // commit branch below, which publishes the serve horizon and the finalized-round
                     // baseline.
                     if let Ok(crate::storage::SaveOutcome::Stored) = save_result {
+                        if let Some(journal) = inline_journal.take() {
+                            state.read().await.retain_block_journal(journal);
+                        }
                         // Block logs (CONSENSUS: feeds the window logs_root, gate height 0) FIRST —
                         // after the save, so a block that lost the slot race can never erase the
                         // canonical block's rows, but BEFORE the height is published below. Publishing
@@ -5875,9 +5899,9 @@ impl BlockchainNode {
                         // round before the closing block's track → phantom 29/30 + 1/30).
                         let _ = &rotation_tracker_clone;
                     } else {
-                        // Fail-closed. This block was applied INLINE and the producer path has no
-                        // snapshot, so the mutations (transactions, mint, fee credit) are already in
-                        // state with nothing to reverse them. Broadcasting on top of that shipped a
+                        // Fail-closed. This block was applied INLINE; its journal is dropped with the
+                        // candidate, so the mutations (transactions, mint, fee credit) stay in RAM until
+                        // the fork consumer's rebuild. Broadcasting on top of that shipped a
                         // block the node itself does not hold; the peers would build on it while this
                         // node re-produced the same height. Two distinct cases:
                         //   DeclinedRollback — a rollback is already driving to a lower target and
@@ -5888,9 +5912,8 @@ impl BlockchainNode {
                         //     and the node must stop producing, not silently re-produce over an
                         //     inline apply nothing reversed.
                         //   error — the store is the suspect; force fork recovery to rebuild state
-                        //     from a durable point, which is the only thing that can undo the inline
-                        //     apply (a hand-rolled reversal here would have to mirror every side
-                        //     effect of the apply path and would diverge the moment that path grows).
+                        //     from a durable point (the durable rows written before the save are not
+                        //     covered by the block journal, so an in-RAM undo would not be enough).
                         match &save_result {
                             Ok(crate::storage::SaveOutcome::DeclinedRollback) => {
                                 let (_in_progress, target) = crate::storage::get_rollback_status();

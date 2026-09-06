@@ -398,6 +398,13 @@ impl ApiRateLimiter {
             window_seconds: 60,
             block_duration: 30,
         });
+
+        // Block-header pages: up to 1000 row reads each, so the bucket is small (indexers hold a key).
+        configs.insert("headers".to_string(), RateLimitConfig {
+            max_requests: 30,
+            window_seconds: 60,
+            block_duration: 60,
+        });
         
         if tx_rate != 100 {
             println!("[INFO][SECURITY] api_rate_limit_configured tx={}/min general={}/min read={}/min", 
@@ -896,6 +903,27 @@ struct TransactionHistoryQuery {
     end_time: Option<u64>,
 }
 
+/// Block JSON as served by every block endpoint: the API block plus its consensus hash (hex), so a
+/// consumer can verify linkage (previous_hash) without recomputing the preimage.
+pub(super) fn block_json(block: &qnet_state::Block, hash: Option<[u8; 32]>) -> Value {
+    let mut v = serde_json::to_value(block).unwrap_or_else(|_| json!({}));
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("hash".to_string(), hash.map(|h| json!(hex::encode(h))).unwrap_or(Value::Null));
+    }
+    v
+}
+
+/// /api/v1/blocks/headers?from=&limit= — limit is clamped to [1, 1000].
+#[derive(Debug, Deserialize)]
+pub(super) struct BlockHeadersQuery {
+    #[serde(default)]
+    pub(super) from: u64,
+    #[serde(default = "default_headers_limit")]
+    pub(super) limit: u64,
+}
+
+fn default_headers_limit() -> u64 { 100 }
+
 /// Query parameters for global recent transactions
 #[derive(Debug, Deserialize)]
 struct RecentTransactionsQuery {
@@ -1214,12 +1242,10 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
                 ));
             }
             
-            // CRITICAL FIX: Use get_block() to return deserialized MicroBlock, not raw bytes!
-            match blockchain.get_block(height).await {
-                Ok(Some(block)) => {
-                    // Return the actual block data as JSON
+            match blockchain.get_block_with_hash(height).await {
+                Ok(Some((block, hash))) => {
                     Ok::<_, Rejection>(warp::reply::with_status(
-                        warp::reply::json(&block),
+                        warp::reply::json(&block_json(&block, hash)),
                         warp::http::StatusCode::OK
                     ))
                 },
@@ -1268,6 +1294,19 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
             Ok::<_, Rejection>(warp::reply::json(&json!({"from": from, "to": to, "items": items})))
         });
     
+    // Compact headers for indexers. The hash comes from the height→hash index and outlives the body;
+    // body fields are present only inside the retention window.
+    let blocks_headers = api_v1
+        .and(warp::path("blocks"))
+        .and(warp::path("headers"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::query::<BlockHeadersQuery>())
+        .and(warp::addr::remote())
+        .and(warp::header::optional::<String>("x-api-key"))
+        .and(blockchain_filter.clone())
+        .and_then(handle_block_headers);
+
     // Account endpoints
     let account_info = api_v1
         .and(warp::path("account"))
@@ -2506,6 +2545,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         
     let blockchain_routes = microblock_one
         .or(microblocks_range)
+        .or(blocks_headers)
         .or(block_latest)
         .or(block_by_height)
         .or(genesis_block)
@@ -3565,8 +3605,8 @@ async fn chain_get_block(
         message: "Missing height parameter".to_string(), data: None,
     })?;
     
-    match blockchain.get_block(height).await {
-        Ok(Some(block)) => Ok(json!(block)),
+    match blockchain.get_block_with_hash(height).await {
+        Ok(Some((block, hash))) => Ok(block_json(&block, hash)),
         Ok(None) => Err(RpcError {
             code: -32000,
             message: format!("Block {} not found", height), data: None,
@@ -3590,12 +3630,12 @@ async fn chain_get_blocks(
     let limit = params["limit"].as_u64().unwrap_or(10).min(100);
     
     let mut blocks = Vec::new();
-    for height in start..start + limit {
-        if let Ok(Some(block)) = blockchain.get_block(height).await {
-            blocks.push(block);
+    for height in start..start.saturating_add(limit) {
+        if let Ok(Some((block, hash))) = blockchain.get_block_with_hash(height).await {
+            blocks.push(block_json(&block, hash));
         }
     }
-    
+
     Ok(json!(blocks))
 }
 
@@ -4551,5 +4591,26 @@ mod light_route_body_cap_tests {
                 "the old 16 KB cap must be provably too small: body={} bytes", body);
         assert!(body < 64 * 1024,
                 "the route cap must admit the body it exists to carry: body={} bytes", body);
+    }
+}
+
+#[cfg(test)]
+mod block_json_tests {
+    use super::*;
+
+    // Every field of the API block survives and the consensus hash rides alongside as hex (null when
+    // the index has no row), so consumers can verify previous_hash linkage without the preimage.
+    #[test]
+    fn block_json_keeps_the_block_and_adds_the_hash() {
+        let block = qnet_state::Block {
+            height: 42, timestamp: 1_700_000_042, previous_hash: [3u8; 32], merkle_root: [4u8; 32],
+            transactions: vec![], producer: "super_x".to_string(), signature: vec![1, 2, 3], block_type: "MICROBLOCK".to_string(),
+        };
+        let v = block_json(&block, Some([0xabu8; 32]));
+        assert_eq!(v["height"], 42);
+        assert_eq!(v["producer"], "super_x");
+        assert_eq!(v["hash"], "ab".repeat(32));
+        assert_eq!(v["previous_hash"].as_array().map(|a| a.len()), Some(32), "wire shape of the block is unchanged");
+        assert!(block_json(&block, None)["hash"].is_null());
     }
 }

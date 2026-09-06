@@ -4367,6 +4367,10 @@ impl BlockPipeline {
                             }
                         }
 
+                        // The journal outlives the apply: a shallow reorg undoes this block from it.
+                        if let Some(snapshot) = block_snapshot.take() {
+                            state_guard.retain_block_journal(snapshot);
+                        }
                         true // success
                     }
                     Err(e) => {

@@ -2,6 +2,17 @@
 
 use super::*;
 
+/// What an indexer needs per block without the transactions: identity, linkage, size.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MicroBlockHeader {
+    pub height: u64,
+    pub timestamp: u64,
+    pub previous_hash: [u8; 32],
+    pub merkle_root: [u8; 32],
+    pub producer: String,
+    pub tx_count: usize,
+}
+
 impl Storage {
     /// Get microblocks range for batch sync  
     /// CRITICAL: Returns full MicroBlock format for network sync (not EfficientMicroBlock)
@@ -498,11 +509,52 @@ impl Storage {
         ))
     }
 
-    /// Addresses a stored block touched (every tx's affected set) plus its producer id, read
-    /// straight from the stored form. Unlike load_microblock_auto_format this never rebuilds a
-    /// MicroBlock and never feeds the tx pool (whose insert is O(pool) once full), so a deep
-    /// rollback's candidate scan stays one point read per tx. Ok(None) ⇒ block absent.
-    /// Txs missing from the tx CF are counted and logged — they are a coverage gap, not an error.
+    /// Header fields of a stored microblock from its row alone: no transaction reconstruction, no tx-pool
+    /// feed. Ok(None) once the body is pruned (the hash index outlives it); Err for a row that is present
+    /// but decodes in neither form.
+    pub fn load_microblock_header(&self, height: u64) -> IntegrationResult<Option<MicroBlockHeader>> {
+        let (rb_in_progress, _) = get_rollback_status();
+        if !rb_in_progress {
+            if let Some(mb) = self.recent_microblocks.get(&height) {
+                let mb = mb.value();
+                return Ok(Some(MicroBlockHeader {
+                    height: mb.height, timestamp: mb.timestamp, previous_hash: mb.previous_hash,
+                    merkle_root: mb.merkle_root, producer: mb.producer.clone(), tx_count: mb.transactions.len(),
+                }));
+            }
+        }
+        let raw = match self.load_microblock(height)? { Some(d) => d, None => return Ok(None) };
+        let data = if raw.len() >= 4 && raw[0..4] == [0x28, 0xb5, 0x2f, 0xfd] {
+            zstd::decode_all(&raw[..]).map_err(|e| IntegrationError::Other(format!("zstd: {}", e)))?
+        } else { raw };
+        // The format key decides when present; a legacy row without one is tried in both forms.
+        let fmt = self.persistent.db.cf_handle("metadata")
+            .and_then(|cf| self.persistent.db.get_cf(&cf, mb_fmt_key(height).as_bytes()).ok())
+            .flatten()
+            .and_then(|v| v.first().copied());
+        if fmt != Some(0x01) {
+            if let Ok(eb) = bincode::deserialize::<qnet_state::EfficientMicroBlock>(&data) {
+                if eb.height == height {
+                    return Ok(Some(MicroBlockHeader {
+                        height, timestamp: eb.timestamp, previous_hash: eb.previous_hash, merkle_root: eb.merkle_root,
+                        producer: eb.producer, tx_count: eb.transaction_hashes.len(),
+                    }));
+                }
+            }
+        }
+        if fmt != Some(0x02) {
+            if let Ok(mb) = bincode::deserialize::<qnet_state::MicroBlock>(&data) {
+                if mb.height == height {
+                    return Ok(Some(MicroBlockHeader {
+                        height, timestamp: mb.timestamp, previous_hash: mb.previous_hash, merkle_root: mb.merkle_root,
+                        producer: mb.producer, tx_count: mb.transactions.len(),
+                    }));
+                }
+            }
+        }
+        Err(IntegrationError::StorageError(format!("undecodable_microblock_row h={} bytes={}", height, data.len())))
+    }
+
     /// Block timestamp from the retained header row alone — no tx rows needed, so it survives body
     /// expiry (genesis timing must never depend on reconstructable transactions).
     pub fn block_timestamp_at(&self, height: u64) -> IntegrationResult<Option<u64>> {
@@ -519,6 +571,11 @@ impl Storage {
         Ok(None)
     }
 
+    /// Addresses a stored block touched (every tx's affected set) plus its producer id, read
+    /// straight from the stored form. Unlike load_microblock_auto_format this never rebuilds a
+    /// MicroBlock and never feeds the tx pool (whose insert is O(pool) once full), so a deep
+    /// rollback's candidate scan stays one point read per tx. Ok(None) ⇒ block absent.
+    /// Txs missing from the tx CF are counted and logged — they are a coverage gap, not an error.
     pub fn touched_addresses_at(&self, height: u64) -> IntegrationResult<Option<(Vec<String>, String)>> {
         let raw = match self.load_microblock(height)? { Some(d) => d, None => return Ok(None) };
         let data = if raw.len() >= 4 && raw[0..4] == [0x28, 0xb5, 0x2f, 0xfd] {
@@ -717,4 +774,40 @@ impl Storage {
         Ok(migrated_count)
     }
     
+}
+
+#[cfg(test)]
+mod header_read_tests {
+    use super::*;
+
+    fn open() -> (Storage, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = Storage::new(dir.path().to_str().unwrap()).expect("storage init");
+        (storage, dir)
+    }
+
+    // Both stored forms yield the same header shape, a compact row reports its hash count as tx_count,
+    // and an absent row is None rather than an error.
+    #[test]
+    fn header_reads_both_stored_forms_and_none_when_absent() {
+        let (s, _d) = open();
+        let full = qnet_state::MicroBlock::new(7, 1_700_000_007, [1u8; 32], vec![], "super_a".to_string());
+        s.put_microblock_row_for_test(7, &bincode::serialize(&full).unwrap()).unwrap();
+        let meta = s.persistent.db.cf_handle("metadata").unwrap();
+        s.persistent.db.put_cf(&meta, mb_fmt_key(7).as_bytes(), &[0x01]).unwrap();
+        let h7 = s.load_microblock_header(7).unwrap().expect("full row");
+        assert_eq!((h7.height, h7.timestamp, h7.tx_count, h7.producer.as_str()), (7, 1_700_000_007, 0, "super_a"));
+        assert_eq!(h7.previous_hash, [1u8; 32]);
+        assert_eq!(h7.merkle_root, full.merkle_root);
+
+        let eff = qnet_state::EfficientMicroBlock::new(8, 1_700_000_008, [2u8; 32], vec![[9u8; 32]; 3], "super_b".to_string());
+        s.put_microblock_row_for_test(8, &bincode::serialize(&eff).unwrap()).unwrap();
+        let h8 = s.load_microblock_header(8).unwrap().expect("compact row");
+        assert_eq!((h8.height, h8.tx_count, h8.producer.as_str()), (8, 3, "super_b"));
+        assert_eq!(h8.merkle_root, eff.merkle_root);
+
+        assert!(s.load_microblock_header(9).unwrap().is_none(), "no row, no header");
+        s.put_microblock_row_for_test(10, b"not a block").unwrap();
+        assert!(s.load_microblock_header(10).is_err(), "a present row that decodes in neither form is an error");
+    }
 }

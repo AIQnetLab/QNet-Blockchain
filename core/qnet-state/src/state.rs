@@ -2337,7 +2337,15 @@ pub struct StateManager {
     /// → O(changed·depth) instead of an O(H) full rebuild, while storage_root stays provably equal to
     /// StateMerkleTree::compute_storage_root(contract_storage) (from-truth determinism test).
     token_trees: Arc<parking_lot::RwLock<HashMap<String, StateMerkleTree>>>,
+    /// Journals of the most recently applied blocks, oldest first. A shallow reorg is undone from
+    /// them in O(touched accounts); anything deeper falls back to a snapshot restore + replay.
+    recent_journals: Arc<parking_lot::Mutex<std::collections::VecDeque<(usize, BlockSnapshot)>>>,
 }
+
+/// Retained journals: depth in blocks and an estimated byte budget (a pre-image carries the account's
+/// 1952-byte signer key and any contract holder map).
+pub const RECENT_JOURNALS: usize = 16;
+pub const RECENT_JOURNAL_BYTES: usize = 96 * 1024 * 1024;
 
 impl StateManager {
     /// Create new state manager
@@ -2367,7 +2375,56 @@ impl StateManager {
             // `set_num_shards` activates the multi-shard routing surface.
             num_shards: Arc::new(std::sync::atomic::AtomicU32::new(1)),
             token_trees: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            recent_journals: Arc::new(parking_lot::Mutex::new(std::collections::VecDeque::new())),
         }
+    }
+
+    /// Keep an applied block's journal for a later shallow undo. A journal at or above this height
+    /// (a re-apply after a failed attempt) is replaced; the ring is bounded by depth and by accounts.
+    pub fn retain_block_journal(&self, snap: BlockSnapshot) {
+        let bytes = Self::journal_bytes(&snap);
+        let mut q = self.recent_journals.lock();
+        while q.back().map(|(_, b)| b.height() >= snap.height()).unwrap_or(false) { q.pop_back(); }
+        q.push_back((bytes, snap));
+        let mut total: usize = q.iter().map(|(b, _)| *b).sum();
+        while q.len() > RECENT_JOURNALS || (total > RECENT_JOURNAL_BYTES && q.len() > 1) {
+            if let Some((b, _)) = q.pop_front() { total -= b; }
+        }
+    }
+
+    // Estimated resident size of one journal: base row + signer key + contract holder map.
+    fn journal_bytes(s: &BlockSnapshot) -> usize {
+        s.created_keys().len() * 64 + s.accounts().iter().map(|(k, a)| {
+            160 + k.len() + a.dilithium_public_key.as_ref().map_or(0, |p| p.len())
+                + a.contract_storage.iter().map(|(ck, cv)| 48 + ck.len() + cv.len()).sum::<usize>()
+        }).sum::<usize>()
+    }
+
+    /// Forget every retained journal: the state was rebuilt from a snapshot, so they no longer
+    /// describe it.
+    pub fn drop_block_journals(&self) {
+        self.recent_journals.lock().clear();
+    }
+
+    /// Undo (target, tip] newest first from the retained journals. Returns the count and the disk mirror
+    /// (per address its OLDEST pre-image; None = did not exist ⇒ delete). None when the journals do not
+    /// cover the range contiguously — nothing is touched then.
+    pub fn undo_blocks_above(&self, target: u64, tip: u64) -> Option<(u64, HashMap<String, Option<Account>>)> {
+        if tip <= target { return Some((0, HashMap::new())); }
+        let mut q = self.recent_journals.lock();
+        let need = (tip - target) as usize;
+        if q.len() < need { return None; }
+        if !q.iter().rev().take(need).enumerate().all(|(i, (_, s))| s.height() == tip - i as u64) { return None; }
+        let mut mirror: HashMap<String, Option<Account>> = HashMap::new();
+        let mut undone = 0u64;
+        while q.back().map(|(_, s)| s.height() > target).unwrap_or(false) {
+            let (_, s) = q.pop_back().expect("checked above");
+            for addr in s.created_keys() { mirror.insert(addr.clone(), None); }
+            for (addr, acct) in s.accounts() { mirror.insert(addr.clone(), Some(acct.clone())); }
+            self.rollback_block(&s);
+            undone += 1;
+        }
+        Some((undone, mirror))
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -3358,7 +3415,7 @@ impl StateManager {
     ///
     /// `snapshot` is the block journal; it takes the marker-ownership flag so rollback releases the
     /// marker exactly when it releases the credit. Passed in rather than set by the caller so a new
-    /// call site cannot silently omit it. `None` = a path with no rollback (producer-inline apply).
+    /// call site cannot silently omit it. `None` = a path that never rolls back.
     pub fn credit_producer_fees_once(
         &self,
         block_height: u64,
@@ -3942,6 +3999,7 @@ impl StateManager {
         // Same invariant as restore_accounts_streamed: the fee-credit markers describe credits that
         // live in the accounts map, so they cannot outlive it.
         clear_credited_fees_cache();
+        self.recent_journals.lock().clear();
         self.accounts.clear();
         self.committed_epochs.clear();
         self.registered_nodes.clear();
@@ -4059,6 +4117,7 @@ impl StateManager {
         // Credits at or below the restored snapshot are re-established by the accounts below, and
         // the replay above it re-takes its own markers.
         clear_credited_fees_cache();
+        self.recent_journals.lock().clear();
         self.accounts.clear();
         self.token_trees.write().clear(); // V2: drop the per-contract storage-tree cache — rebuilds lazily from the restored contract_storage
 
@@ -4438,6 +4497,41 @@ mod parallel_apply_tests {
         sm.rollback_block(&snap);
         assert_eq!(sm.finalize_merkle(), pre_root, "rollback must restore the pre-block root");
         assert!(sm.accounts.get("pa_0009").is_none(), "created recipient must be removed");
+    }
+
+    // Retained journals undo a shallow reorg exactly: the root returns to the target block's, the disk
+    // mirror names the oldest pre-image per address (created ⇒ delete), and a gap is refused untouched.
+    #[test]
+    fn journal_undo_restores_root_and_reports_mirror() {
+        let sm = StateManager::new();
+        seed(&sm, 8, 1_000_000);
+        let root0 = sm.finalize_merkle();
+        let mut s1 = BlockSnapshot::new(&sm.accounts, 1);
+        let _ = sm.apply_transfers_parallel(&[transfer(0, 1, 100, 1)], Some(&mut s1));
+        let root1 = sm.finalize_merkle();
+        sm.retain_block_journal(s1);
+        let mut s2 = BlockSnapshot::new(&sm.accounts, 2);
+        let _ = sm.apply_transfers_parallel(&[batch(2, &[(3, 5), (9, 7)], 1)], Some(&mut s2));
+        sm.retain_block_journal(s2);
+        assert_ne!(sm.finalize_merkle(), root1);
+
+        let (n, mirror) = sm.undo_blocks_above(1, 2).expect("journals cover (1, 2]");
+        assert_eq!(n, 1);
+        assert_eq!(sm.finalize_merkle(), root1, "state is back at block 1");
+        assert!(matches!(mirror.get("pa_0009"), Some(None)), "created in the undone block: deleted from the mirror");
+        assert!(matches!(mirror.get("pa_0002"), Some(Some(_))), "modified: carries its pre-image");
+
+        let (n2, _) = sm.undo_blocks_above(0, 1).expect("journal for block 1 retained");
+        assert_eq!(n2, 1);
+        assert_eq!(sm.finalize_merkle(), root0);
+        assert!(sm.undo_blocks_above(0, 1).is_none(), "no journals left");
+
+        let mut s3 = BlockSnapshot::new(&sm.accounts, 3);
+        let _ = sm.apply_transfers_parallel(&[transfer(0, 1, 1, 2)], Some(&mut s3));
+        sm.retain_block_journal(s3);
+        let root3 = sm.finalize_merkle();
+        assert!(sm.undo_blocks_above(2, 5).is_none(), "a gap between tip and journals is refused");
+        assert_eq!(sm.finalize_merkle(), root3, "and nothing was touched");
     }
 }
 

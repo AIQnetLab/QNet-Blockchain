@@ -667,11 +667,9 @@ impl BlockchainNode {
         None
     }
 
-    /// The producer's inline apply has no journal, so an abandoned block leaves its transactions, mint
-    /// and fee credit in live RAM state. There is no safe in-process repair: rebuilding takes no apply
-    /// barrier, so it can rewind RAM below the storage tip and wedge the node for good. Fail CLOSED —
-    /// stop producing for this process. A restart replays from storage and rebuilds RAM cleanly, which
-    /// is the right remedy anyway: the only realistic trigger is a missing signing key.
+    /// An abandoned inline block leaves its mutations in live RAM (its journal goes with the candidate).
+    /// Fail CLOSED: stop producing for this process; a restart replays from storage. The only
+    /// realistic trigger is a missing signing key.
     pub(super) fn abandon_inline_apply(saved_height: u64, abandoned_height: u64, reason: &str) {
         INLINE_APPLY_UNVOUCHED.store(saved_height.max(1), std::sync::atomic::Ordering::SeqCst);
         println!("[ERR][NODE] inline_apply_abandoned h={} reason={} vouched_to={} action=stop_producing_until_restart",

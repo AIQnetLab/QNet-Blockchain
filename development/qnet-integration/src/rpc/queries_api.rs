@@ -806,8 +806,8 @@ pub(super) async fn handle_block_latest(
     }
     
     let height = blockchain.get_height().await;
-    match blockchain.get_block(height).await {
-        Ok(Some(block)) => Ok(warp::reply::json(&block)),
+    match blockchain.get_block_with_hash(height).await {
+        Ok(Some((block, hash))) => Ok(warp::reply::json(&block_json(&block, hash))),
         Ok(None) => {
             let error_response = json!({
                 "error": "Latest block not found",
@@ -880,12 +880,12 @@ pub(super) async fn handle_block_by_height(
         })));
     }
     
-    match blockchain.get_block(height).await {
-        Ok(Some(block)) => {
+    match blockchain.get_block_with_hash(height).await {
+        Ok(Some((block, hash))) => {
             // Additive, backward-compatible: keep every existing top-level field and ADD the failover
             // round from the microblock. abs_round = timeout_round + carried_baseline; a boundary
             // round-reset (the 40950 fork) is invisible without it.
-            let mut v = serde_json::to_value(&block).unwrap_or_else(|_| json!({}));
+            let mut v = block_json(&block, hash);
             if let (Some(obj), Some(mb)) = (
                 v.as_object_mut(),
                 blockchain.get_storage().load_microblock_auto_format(height).ok().flatten(),
@@ -932,46 +932,29 @@ pub(super) async fn handle_block_by_hash(
         })));
     }
     
-    // PRODUCTION: Search for block by hash using storage
+    // The consensus hash from the height→hash index over the last 1000 heights: O(1) metadata reads,
+    // exact match only.
+    let wanted = match hex::decode(&hash) {
+        Ok(b) if b.len() == 32 => b,
+        _ => {
+            return Ok(warp::reply::json(&json!({ "hash": hash, "found": false, "error": "hash must be 32 bytes hex" })));
+        }
+    };
     let current_height = blockchain.get_height().await;
-    
-    // Search last 1000 blocks for matching hash (production would use hash index)
-    let mut found_block = None;
-    for height in (current_height.saturating_sub(1000))..=current_height {
-        match blockchain.get_block(height).await {
-            Ok(Some(block)) => {
-                // Calculate block hash and compare with requested hash
-                let block_hash = format!("{:x}", sha3::Sha3_256::digest(
-                    serde_json::to_string(&block).unwrap_or_default().as_bytes()
-                ));
-                
-                // Exact match only: prefix matching lets short queries collide with real hashes.
-                if block_hash == hash {
-                    found_block = Some(block);
-                    break;
-                }
-            }
-            _ => continue,
+    let storage = blockchain.get_storage();
+    let mut found_height = None;
+    for height in (current_height.saturating_sub(1000)..=current_height).rev() {
+        if let Ok(Some(h)) = storage.load_microblock_hash(height) {
+            if h[..] == wanted[..] { found_height = Some(height); break; }
         }
     }
-    
-    match found_block {
-        Some(block) => {
-            let response = json!({
-                "hash": hash,
-                "found": true,
-                "block": {
-                    "height": block.height,
-                    "hash": block.hash(),
-                    "previous_hash": block.previous_hash,
-                    "timestamp": block.timestamp,
-                    "transactions": block.transactions,
-                    "merkle_root": block.merkle_root,
-                    "producer": block.producer,
-                    "signature": block.signature
-                }
-            });
-            Ok(warp::reply::json(&response))
+    match found_height {
+        Some(height) => {
+            // The index knows the hash; the body may already be pruned (block: null).
+            let mut h32 = [0u8; 32];
+            h32.copy_from_slice(&wanted);
+            let block = blockchain.get_block(height).await.ok().flatten().map(|b| block_json(&b, Some(h32)));
+            Ok(warp::reply::json(&json!({ "hash": hash, "found": true, "height": height, "block": block })))
         }
         None => {
             let response = json!({
@@ -980,6 +963,61 @@ pub(super) async fn handle_block_by_hash(
                 "error": "Block with matching hash not found in recent 1000 blocks"
             });
             Ok(warp::reply::json(&response))
+        }
+    }
+}
+
+/// Compact headers for indexers: one item per height stored here in [from, from+limit), limit ≤ 1000.
+/// `hash` comes from the height→hash index and survives body pruning; `body` says whether the header
+/// fields are present. `next` = first height not covered, `head` = applied tip.
+pub(super) async fn handle_block_headers(
+    q: BlockHeadersQuery,
+    remote_addr: Option<std::net::SocketAddr>,
+    api_key: Option<String>,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<warp::reply::Response, Rejection> {
+    use warp::Reply;
+    if let Err(rate_limit_response) = check_api_rate_limit_with_key(remote_addr, api_key, "headers") {
+        return Ok(rate_limit_response.into_response());
+    }
+    // At most four scans on the blocking pool at once: consensus-side blocking work shares that pool.
+    static SCANS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    let permit = SCANS.get_or_init(|| tokio::sync::Semaphore::new(4)).acquire().await;
+    let head = blockchain.get_height().await;
+    let from = q.from;
+    let to = from.saturating_add(q.limit.clamp(1, 1000)).min(head.saturating_add(1));
+    let storage = blockchain.get_storage();
+    let scanned = tokio::task::spawn_blocking(move || {
+        let mut items = Vec::with_capacity(to.saturating_sub(from) as usize);
+        for h in from..to {
+            let hash = storage.load_microblock_hash(h).ok().flatten();
+            let header = match storage.load_microblock_header(h) {
+                Ok(hd) => hd,
+                Err(e) => {
+                    println!("[WARN][RPC] headers_row_undecodable h={} err={}", h, e);
+                    items.push(json!({ "height": h, "hash": hash.map(hex::encode), "body": false, "error": "undecodable" }));
+                    continue;
+                }
+            };
+            if hash.is_none() && header.is_none() { continue; }
+            let mut v = json!({ "height": h, "hash": hash.map(hex::encode), "body": header.is_some() });
+            if let (Some(obj), Some(hd)) = (v.as_object_mut(), header) {
+                obj.insert("timestamp".into(), json!(hd.timestamp));
+                obj.insert("producer".into(), json!(hd.producer));
+                obj.insert("tx_count".into(), json!(hd.tx_count));
+                obj.insert("previous_hash".into(), json!(hex::encode(hd.previous_hash)));
+                obj.insert("merkle_root".into(), json!(hex::encode(hd.merkle_root)));
+            }
+            items.push(v);
+        }
+        items
+    }).await;
+    drop(permit);
+    match scanned {
+        Ok(items) => Ok(warp::reply::json(&json!({ "from": from, "next": to, "head": head, "items": items })).into_response()),
+        Err(e) => {
+            println!("[WARN][RPC] api_error endpoint=block_headers from={} err={}", from, e);
+            Ok(warp::reply::with_status(warp::reply::json(&json!({ "error": "internal error" })), warp::http::StatusCode::INTERNAL_SERVER_ERROR).into_response())
         }
     }
 }
