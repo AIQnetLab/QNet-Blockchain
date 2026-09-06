@@ -364,7 +364,6 @@ impl BlockchainNode {
         // Applied tip + 1 — same value the loop derived from its height view.
         let next_height = LAST_BLOCK_PRODUCED_HEIGHT.load(Ordering::Relaxed) + 1;
         if next_height <= 1 { return; } // nothing applied yet — nothing to fail over
-        Self::drop_superseded_tail(storage, next_height - 1);
         // Local liveness timer: wall-seconds since OUR applied height last
         // advanced. Slot-anchored block_ts must NOT drive this — it carries the
         // chain's lifetime production deficit and would trip the pacemaker against
@@ -797,36 +796,6 @@ impl BlockchainNode {
             crate::sync_manager::nudge_sync_check();
         }
 
-    }
-
-    /// A certified failover round supersedes every lower-round block above the tips the quorum
-    /// certified from. A node holding such blocks - it produced or adopted them without the
-    /// certificate - is off the network's chain until it drops them, and nothing else pulls it
-    /// back: peers reject its branch and it rejects theirs. Re-checked only when a certificate
-    /// lands (rounds of the current and previous window) or every 30 s.
-    fn drop_superseded_tail(storage: &std::sync::Arc<crate::storage::Storage>, tip: u64) {
-        static LAST: parking_lot::Mutex<(u64, u64, u64, u64)> = parking_lot::Mutex::new((0, 0, 0, 0));
-        let w = tip / 90;
-        let (r_w, r_prev) = (crate::unified_p2p::highest_certified_round_for(w),
-                             crate::unified_p2p::highest_certified_round_for(w.saturating_sub(1)));
-        if r_w == 0 && r_prev == 0 { return; }
-        let now = get_timestamp_safe();
-        {
-            let mut g = LAST.lock();
-            if g.0 == w && g.1 == r_w && g.2 == r_prev && now.saturating_sub(g.3) < 30 { return; }
-            *g = (w, r_w, r_prev, now);
-        }
-        let s = storage.clone();
-        if let Some((first, block_round, certified, quorum_tip)) =
-            crate::unified_p2p::superseded_tail_first(tip, |h| {
-                s.load_microblock_auto_format(h).ok().flatten()
-                    .map(|b| b.timeout_round.saturating_add(b.carried_baseline))
-            })
-        {
-            println!("[WARN][FORK] superseded_tail first_h={} block_round={} certified={} quorum_tip={} tip={} action=rollback_to={}",
-                     first, block_round, certified, quorum_tip, tip, first - 1);
-            crate::block_pipeline::signal_fork_recovery(first - 1);
-        }
     }
 
     /// Failover liveness pacemaker — a dedicated task, deliberately OUTSIDE the
