@@ -135,6 +135,25 @@ pub(crate) fn block_child_key(parent: &[u8; 32], child: &[u8; 32]) -> Vec<u8> {
 pub(crate) fn mb_body_key(height: u64) -> String { format!("microblock_{:020}", height) }
 #[inline]
 pub(crate) fn mb_hash_key(height: u64) -> String { format!("microblock_hash_{:020}", height) }
+
+#[cfg(test)]
+mod identity_heal_tests {
+    use crate::storage::Storage;
+
+    // Only the certified name replaces a stored identity; an unsealed window or a body that is not
+    // the certified one changes nothing, and a match with the stored hash is an ordinary backfill.
+    #[test]
+    fn only_the_certified_body_replaces_a_stored_identity() {
+        let ours = [1u8; 32];
+        let theirs = [2u8; 32];
+        let third = [3u8; 32];
+        assert!(Storage::heals_stored_identity(theirs, ours, Some(theirs)));
+        assert!(!Storage::heals_stored_identity(theirs, ours, None), "no checkpoint: the stored hash stands");
+        assert!(!Storage::heals_stored_identity(theirs, ours, Some(third)), "a body the checkpoint does not name");
+        assert!(!Storage::heals_stored_identity(theirs, ours, Some(ours)), "the checkpoint agrees with the stored hash");
+        assert!(!Storage::heals_stored_identity(ours, ours, Some(ours)), "an exact match is a backfill, not a heal");
+    }
+}
 #[inline]
 pub(crate) fn mb_fmt_key(height: u64) -> String { format!("microblock_fmt_{:020}", height) }
 

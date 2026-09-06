@@ -540,9 +540,19 @@ impl Storage {
             && crate::node::BlockchainNode::calculate_merkle_root(&mb.transactions) == mb.merkle_root
     }
 
+    /// Whether an offered body may replace the slot's stored identity. Only the n−f-QC'd checkpoint
+    /// can authorise that: it names one body per height, and a node holding a different one there
+    /// cannot fix it by rolling back once finality has passed the slot. Without a certified name,
+    /// the stored hash is final and only an exact match is a backfill.
+    pub(crate) fn heals_stored_identity(offered: [u8; 32], canonical: [u8; 32], certified: Option<[u8; 32]>) -> bool {
+        matches!(certified, Some(c) if c == offered && c != canonical)
+    }
+
     /// Store-only re-persist of an already-final slot whose body/tx rows expired (genesis
     /// included). Executes nothing and never moves chain_height. Accepts only bytes whose hash
-    /// equals the canonical hash already held for the slot, so a peer cannot rewrite history here.
+    /// equals the canonical hash already held for the slot — or, when the QC'd checkpoint names a
+    /// different body than the one stored, the certified body, which replaces it (a node that kept
+    /// its own losing block below finality has no other way back: the rollback is refused there).
     pub fn backfill_finalized_block(&self, height: u64, data: &[u8]) -> IntegrationResult<bool> {
         if !can_save_block(height) || self.get_effective_storage_mode() == StorageMode::Light {
             return Ok(false);
@@ -560,7 +570,9 @@ impl Storage {
                 return Ok(false); // nothing canonical to match against — not a backfill case
             }
         };
-        if mb.hash() != canonical {
+        let heal = Self::heals_stored_identity(mb.hash(), canonical,
+                                               crate::block_pipeline::certified_micro_hash(self, height));
+        if mb.hash() != canonical && !heal {
             if crate::node::is_warn() {
                 println!("[WARN][STORAGE] backfill_rejected h={} reason=hash_mismatch canonical={:x?} offered={:x?}",
                          height, &canonical[..8], &mb.hash()[..8]);
@@ -574,17 +586,25 @@ impl Storage {
             return Ok(false);
         }
         // Bodies below the retention window were removed on purpose and the prune watermark has
-        // passed them; re-materialising them would be permanent. Genesis is never pruned.
+        // passed them; re-materialising them would be permanent. Genesis is never pruned. A heal
+        // installs the identity the checkpoint names, so it runs at any depth.
         let tip = self.persistent.get_chain_height().unwrap_or(0);
-        if height != 0 && height.saturating_add(crate::node::MICROBLOCK_BODY_RETENTION_BLOCKS) <= tip {
+        if !heal && height != 0 && height.saturating_add(crate::node::MICROBLOCK_BODY_RETENTION_BLOCKS) <= tip {
             return Ok(false);
         }
         if self.load_microblock_auto_format(height).ok().flatten().is_some() {
-            return Ok(false); // body still reconstructable — nothing expired
+            if !heal {
+                return Ok(false); // body still reconstructable — nothing expired
+            }
+            // The stored block, its hash index, header and child link go together; the certified
+            // body then writes a clean slot and the child that names it becomes resolvable again.
+            self.delete_microblock(height)?;
+            println!("[WARN][STORAGE] stored_identity_healed h={} stored={:x?} certified={:x?}",
+                     height, &canonical[..8], &mb.hash()[..8]);
         }
         self.write_block_rows(height, &mb, false)?;
         if crate::node::is_info() {
-            println!("[INFO][STORAGE] finalized_body_backfilled h={} txs={}", height, mb.transactions.len());
+            println!("[INFO][STORAGE] finalized_body_backfilled h={} txs={} heal={}", height, mb.transactions.len(), heal);
         }
         Ok(true)
     }
