@@ -1,63 +1,34 @@
 import { NextResponse } from 'next/server';
-import { startSyncService, getSyncServiceStatus } from '../../../../../lib/sync-service';
+import { getSyncStatus, getExplorerStats } from '../../../../../lib/db';
 
 export const dynamic = 'force-dynamic';
-export const revalidate = 0;
 
-export async function POST() {
-  try {
-    let status;
-    try {
-      status = await getSyncServiceStatus();
-    } catch {
-      status = { isRunning: false } as any;
-    }
-    
-    if (status.isRunning) {
-      return NextResponse.json({
-        success: true,
-        message: 'Sync service is already running',
-        status,
-      });
-    }
-    
-    startSyncService();
-    
-    // Wait a bit for it to initialize
-    await new Promise(resolve => setTimeout(resolve, 1000));
-    
-    let newStatus;
-    try {
-      newStatus = await getSyncServiceStatus();
-    } catch {
-      newStatus = { isRunning: true, lastHeight: 0, lastSyncAt: null } as any;
-    }
-    
-    return NextResponse.json({
-      success: true,
-      message: 'Sync service started',
-      status: newStatus,
-    });
-  } catch (err) {
-    return NextResponse.json({
-      success: false,
-      error: 'Sync service error',
-    }, { status: 500 });
-  }
-}
-
+// Indexing runs in the qnet-indexer process; the web tier reports its published state.
 export async function GET() {
   try {
-    const status = await getSyncServiceStatus();
+    const [sync, stats] = await Promise.all([getSyncStatus(), getExplorerStats()]);
+    const lag = sync.node_height - sync.indexed_prefix;
     return NextResponse.json({
       success: true,
-      status,
-    });
-  } catch (err) {
-    return NextResponse.json({
-      success: false,
-      error: 'Failed to get sync status',
-    }, { status: 500 });
+      status: {
+        head: sync.last_height,
+        indexedPrefix: sync.indexed_prefix,
+        nodeHeight: sync.node_height,
+        lag,
+        live: sync.ws_connected,
+        nodeEndpoint: sync.node_endpoint,
+        healPending: sync.heal_pending,
+        lastSyncAt: sync.last_sync_at ? new Date(sync.last_sync_at).toISOString() : null,
+        txTotal: stats.tx_total,
+        blocksTotal: stats.blocks_total,
+        healthy: lag <= 600 && sync.last_sync_at !== null && Date.now() - new Date(sync.last_sync_at).getTime() < 120_000,
+      },
+    }, { headers: { 'Cache-Control': 'no-store' } });
+  } catch {
+    return NextResponse.json({ success: false, error: 'Failed to get sync status' }, { status: 503 });
   }
 }
 
+export async function POST() {
+  return NextResponse.json({ success: false, error: 'Indexing is owned by the qnet-indexer process' }, { status: 410 });
+}

@@ -1,16 +1,12 @@
-import { getTransactions, getContractDeployByAddress } from '../../lib/db';
+import { getContractDeployByAddress, type TransactionRow } from '../../lib/db';
 import { mapTxType, formatAmount } from './tx-mapping';
 import { sanitizeLogo } from './sanitize-logo';
 import { formatTokenAmountWithSymbol } from './token-format';
 
-// ============================================================================
-// Shared activity-row enrichment — single source of truth for BOTH the SSR
-// explorer page and the /api/activity polling feed, so a QRC-20 row keeps its
-// token icon, symbol amount, click-through and "Token Transfer" label across the
-// first paint, every 5s refresh, and pagination (they must produce identical rows).
-// ============================================================================
+// Shared activity-row enrichment for the SSR page, the head snapshot and /api/activity, so a QRC-20
+// row keeps its token icon, symbol amount and click-through identically on every path.
 
-type RawTx = Awaited<ReturnType<typeof getTransactions>>['transactions'][number];
+type RawTx = TransactionRow;
 type TokenMeta = { symbol: string; logo: string; decimals: number };
 
 export interface EnrichedActivityRow {
@@ -20,6 +16,7 @@ export interface EnrichedActivityRow {
   to: string;
   amount: string;
   block: number;
+  txIndex: number;
   timestamp: number;
   time: string;
   tokenContract?: string;
@@ -73,6 +70,7 @@ export async function enrichActivityRows(transactions: RawTx[]): Promise<Enriche
       to: tx.to_address || 'N/A',
       amount: formatAmount(tx.amount),
       block: tx.block,
+      txIndex: tx.tx_index,
       timestamp: tx.timestamp,
       time: '',
     };

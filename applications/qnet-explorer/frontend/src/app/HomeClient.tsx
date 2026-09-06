@@ -1,6 +1,7 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
+import { useChainHead } from '@/hooks/useChainHead';
 import Link from 'next/link';
 
 interface NetworkStats {
@@ -32,8 +33,7 @@ export default function HomeClient({ initialStats }: HomeClientProps) {
     return `~${minutes}m`;
   };
 
-  useEffect(() => {
-    const fetchStats = async () => {
+  const fetchStats = async () => {
       try {
         // Add timestamp to bypass browser cache
         const res = await fetch(`/api/network/stats?t=${Date.now()}`, {
@@ -46,12 +46,19 @@ export default function HomeClient({ initialStats }: HomeClientProps) {
       } catch (err) {
         /* log disabled */
       }
-    };
-    // Don't fetch immediately - we have SSR data!
-    // Update every 5 seconds for smooth UI
-    const interval = setInterval(fetchStats, 5000);
-    return () => clearInterval(interval);
-  }, []);
+  };
+
+  // Stats follow the chain head: refetch on a new block, at most every 10 s, only while visible.
+  const head = useChainHead();
+  const lastStats = useRef(0);
+  useEffect(() => {
+    if (!head.height) return;
+    if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+    const now = Date.now();
+    if (now - lastStats.current < 10_000) return;
+    lastStats.current = now;
+    void fetchStats();
+  }, [head.height]); // eslint-disable-line react-hooks/exhaustive-deps
   
   return (
     <div className="page-home">

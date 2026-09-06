@@ -1,6 +1,5 @@
 import { NextResponse } from 'next/server';
-import { getDbPool } from '../../../../../lib/db';
-import { getSyncServiceStatus } from '../../../../../lib/sync-service';
+import { getDbPool, getSyncStatus } from '../../../../../lib/db';
 import { getMonitoringHealth } from '../../../../../lib/monitoring';
 import { getRateLimitStats } from '../../../../../lib/rate-limit-redis';
 
@@ -24,19 +23,15 @@ export async function GET() {
     status.application = 'degraded';
   }
 
-  // Check Sync Service status
+  // Indexer state as published by the qnet-indexer process.
   try {
-    const syncStatus = await getSyncServiceStatus();
-    status.syncService = syncStatus;
-    if (!syncStatus.isRunning) {
-      status.application = 'degraded';
-    }
-    if (syncStatus.lastError) {
-      status.application = 'degraded';
-    }
+    const sync = await getSyncStatus();
+    const lag = sync.node_height - sync.indexed_prefix;
+    const stale = !sync.last_sync_at || Date.now() - new Date(sync.last_sync_at).getTime() > 120_000;
+    status.indexer = { head: sync.last_height, indexedPrefix: sync.indexed_prefix, nodeHeight: sync.node_height, lag, live: sync.ws_connected, stale };
+    if (stale || lag > 600) status.application = 'degraded';
   } catch {
-    // Do not leak internal error details/stack to clients; log server-side only.
-    status.syncService = { isRunning: false, error: 'unavailable' };
+    status.indexer = { error: 'unavailable' };
     status.application = 'degraded';
   }
 

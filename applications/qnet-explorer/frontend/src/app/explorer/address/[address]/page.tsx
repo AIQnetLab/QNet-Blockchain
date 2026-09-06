@@ -1,8 +1,9 @@
 'use client';
 
-import React, { useState, useCallback, useEffect } from 'react';
+import React, { useState, useCallback, useEffect, useRef } from 'react';
 import Link from 'next/link';
 import { useParams } from 'next/navigation';
+import { useChainHead } from '@/hooks/useChainHead';
 import { getCache, setCache, isCacheStale } from '@/lib/explorer-cache';
 import TokenIcon from '@/components/TokenIcon';
 
@@ -355,13 +356,17 @@ export default function AddressPage() {
     fetchAddress();
   }, [fetchAddress]);
   
-  // v3.52: Auto-refresh every 5 seconds (like main explorer page)
-  // Ensures new transactions appear within 5s of block inclusion
+  // Refresh when the chain head moves (head stream), at most every 3 s and only while visible.
+  const head = useChainHead();
+  const lastRefetch = useRef(0);
   useEffect(() => {
-    if (!address) return;
-    const interval = setInterval(fetchAddress, 5000);
-    return () => clearInterval(interval);
-  }, [address, fetchAddress]);
+    if (!address || !head.height) return;
+    if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+    const now = Date.now();
+    if (now - lastRefetch.current < 3000) return;
+    lastRefetch.current = now;
+    fetchAddress();
+  }, [address, head.height, fetchAddress]);
   
   // Show error ONLY after fetch attempt
   if (hasFetched && (error || !data)) {

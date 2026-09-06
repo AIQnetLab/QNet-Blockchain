@@ -1,6 +1,7 @@
 'use client';
 
 import React, { useEffect, useRef, useState } from 'react';
+import { useChainHead } from '@/hooks/useChainHead';
 
 // Custom hook to manage animations with Intersection Observer
 const useAnimateOnScroll = () => {
@@ -60,8 +61,7 @@ const HomeSection = React.memo(function HomeSection({ setActiveSection }: { setA
   const animatedContainerRef = useAnimateOnScroll();
   const [stats, setStats] = useState<NetworkStats | null>(null);
   
-  useEffect(() => {
-    const fetchStats = async () => {
+  const fetchStats = async () => {
       try {
         const res = await fetch(`/api/network/stats?t=${Date.now()}`, {
           cache: 'no-store'
@@ -75,13 +75,23 @@ const HomeSection = React.memo(function HomeSection({ setActiveSection }: { setA
       } catch (err) {
         /* log disabled */
       }
-    };
+  };
 
+  useEffect(() => {
     fetchStats();
-    // Update every 5 seconds (same as main page)
-    const interval = setInterval(fetchStats, 5000);
-    return () => clearInterval(interval);
   }, []);
+
+  // Stats follow the chain head: refetch on a new block, at most every 10 s, only while visible.
+  const head = useChainHead();
+  const lastStats = useRef(0);
+  useEffect(() => {
+    if (!head.height) return;
+    if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+    const now = Date.now();
+    if (now - lastStats.current < 10_000) return;
+    lastStats.current = now;
+    void fetchStats();
+  }, [head.height]); // eslint-disable-line react-hooks/exhaustive-deps
   
   return (
     <div ref={animatedContainerRef}>

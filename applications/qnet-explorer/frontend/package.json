@@ -11,7 +11,11 @@
     "lint": "bunx biome lint --write && bunx tsc --noEmit",
     "format": "bunx biome format --write",
     "db:migrate": "node -r ts-node/register scripts/run-migrations.ts",
-    "start:local": "bash scripts/start-local.sh"
+    "start:local": "bash scripts/start-local.sh",
+    "build:indexer": "tsc -p tsconfig.indexer.json",
+    "start:indexer": "node dist-indexer/main.js",
+    "test:indexer": "tsc -p tsconfig.indexer.json && node --test \"dist-indexer/__tests__/*.test.js\"",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {
     "@radix-ui/react-dialog": "1.1.13",

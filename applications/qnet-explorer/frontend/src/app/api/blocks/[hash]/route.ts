@@ -72,8 +72,9 @@ function transformDbBlock(dbBlock: BlockRow, transactions: BlockTransaction[]): 
     version: dbBlock.version || 1,
     producer: dbBlock.producer,
     producer_address: dbBlock.producer_address || dbBlock.producer,
-    tx_count: dbBlock.tx_count,
-    total_gas_used: dbBlock.total_gas_used || 0,
+    tx_count: dbBlock.tx_count ?? transactions.length,
+    total_gas_used: Number(dbBlock.total_gas_used) || 0,
+    body_indexed: dbBlock.body_indexed,
     poh_hash: dbBlock.poh_hash || undefined,
     poh_count: dbBlock.poh_count,
     state_root: dbBlock.state_root || undefined,
@@ -178,9 +179,9 @@ async function fetchBlock(identifier: string): Promise<Block | null> {
         from: tx.from_address,
         to: tx.to_address || tx.from_address,
         amount: String(tx.amount || 0),
-        fee: tx.gas_price ? String(tx.gas_price * tx.gas_limit) : undefined,
+        fee: tx.gas_price ? (BigInt(tx.gas_price) * BigInt(tx.gas_limit)).toString() : undefined,
         timestamp: tx.timestamp,
-        nonce: tx.nonce,
+        nonce: Number(tx.nonce),
         status: tx.status || 'confirmed',
       }));
       

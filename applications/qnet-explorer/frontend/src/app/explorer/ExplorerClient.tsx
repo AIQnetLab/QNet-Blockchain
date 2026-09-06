@@ -3,14 +3,11 @@
 import { memo, useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import Link from 'next/link';
 import { batchCache, getListCache, setListCache, noteChainHeight } from '@/lib/explorer-cache';
+import { useChainHead } from '@/hooks/useChainHead';
 import TokenIcon from '@/components/TokenIcon';
 
-// ============================================================================
-// v4.0: SSR-powered Explorer Client
-// - Receives pre-fetched data from Server Component (instant first paint)
-// - Client handles: polling, filters, pagination, search
-// - Debounced filter changes (batch rapid clicks into one request)
-// ============================================================================
+// Transaction list. First paint comes from SSR (the server's head snapshot); afterwards the head stream
+// drives refreshes (no timers), pages move by cursor, numbered jumps stay within the offset cap.
 
 interface ActivityItem {
   hash: string;
@@ -19,9 +16,9 @@ interface ActivityItem {
   to: string;
   amount: string;
   block: number;
+  txIndex?: number;
   time: string;
   timestamp: number;
-  // Set on QRC-20 token-interaction rows so the row shows the token's icon (SSR-resolved).
   tokenContract?: string;
   tokenSymbol?: string;
   tokenLogo?: string;
@@ -33,24 +30,25 @@ export interface ExplorerClientProps {
   initialTotal: number;
 }
 
+interface Pagination {
+  total: number;
+  currentHeight: number;
+  nextCursor: string | null;
+  prevCursor: string | null;
+  maxPage: number;
+  page: number | null;
+}
+
 function getBadgeClass(type: string): string {
-  const normalized = type.toLowerCase().replace(/\s+/g, '-');
-  return `type-${normalized}`;
+  return `type-${type.toLowerCase().replace(/\s+/g, '-')}`;
 }
 
 function formatTimeAgo(timestamp: number, blockHeight?: number): string {
-  // Genesis block or genesis transactions (block 0)
   if (blockHeight === 0) return 'Genesis';
   if (!timestamp || timestamp === 0) return 'Genesis';
-
-  const now = Date.now();
   const ts = timestamp > 1e12 ? timestamp : timestamp * 1000;
-
-  // If timestamp is before year 2024 (chain launch), treat as Genesis
   if (ts < 1704067200000) return 'Genesis';
-
-  const diff = now - ts;
-
+  const diff = Date.now() - ts;
   if (diff < 0) return 'just now';
   if (diff < 60_000) return `${Math.floor(diff / 1000)}s ago`;
   if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m ago`;
@@ -60,7 +58,6 @@ function formatTimeAgo(timestamp: number, blockHeight?: number): string {
 
 const ActivityRow = memo(function ActivityRow({ item }: { item: ActivityItem }) {
   const displayTime = formatTimeAgo(item.timestamp, item.block);
-
   return (
     <tr className="activity-row">
       <td className="col-hash">
@@ -73,9 +70,7 @@ const ActivityRow = memo(function ActivityRow({ item }: { item: ActivityItem }) 
       </td>
       <td className="col-addresses">
         {item.from && item.from.length > 10 && item.from.includes('eon') ? (
-          <Link href={`/explorer/address/${item.from}`} className="addr">
-            {item.from.slice(0, 6)}...{item.from.slice(-4)}
-          </Link>
+          <Link href={`/explorer/address/${item.from}`} className="addr">{item.from.slice(0, 6)}...{item.from.slice(-4)}</Link>
         ) : (
           <span className="addr">{item.from || 'N/A'}</span>
         )}
@@ -83,19 +78,14 @@ const ActivityRow = memo(function ActivityRow({ item }: { item: ActivityItem }) 
         {item.to === 'batch_transfers' ? (
           <span className="addr">batch recipients</span>
         ) : item.to && item.to.length > 10 && item.to.includes('eon') ? (
-          <Link href={`/explorer/address/${item.to}`} className="addr">
-            {item.to.slice(0, 6)}...{item.to.slice(-4)}
-          </Link>
+          <Link href={`/explorer/address/${item.to}`} className="addr">{item.to.slice(0, 6)}...{item.to.slice(-4)}</Link>
         ) : (
           <span className="addr">{item.to || 'N/A'}</span>
         )}
       </td>
       <td className="col-amount">
         {(() => {
-          // Token label click-through: QRC-20 → its contract page, native value → the QNC coin page.
-          const href = item.tokenContract
-            ? `/explorer/token/${item.tokenContract}`
-            : item.amount.includes('QNC') ? '/explorer/qnc' : null;
+          const href = item.tokenContract ? `/explorer/token/${item.tokenContract}` : item.amount.includes('QNC') ? '/explorer/qnc' : null;
           const chip = (
             <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
               {item.tokenContract
@@ -104,14 +94,10 @@ const ActivityRow = memo(function ActivityRow({ item }: { item: ActivityItem }) 
               <span>{item.amount}</span>
             </span>
           );
-          return href
-            ? <Link href={href} className="token-amount-link">{chip}</Link>
-            : chip;
+          return href ? <Link href={href} className="token-amount-link">{chip}</Link> : chip;
         })()}
       </td>
-      <td className="col-block">
-        <Link href={`/explorer/block/${item.block}`}>{item.block}</Link>
-      </td>
+      <td className="col-block"><Link href={`/explorer/block/${item.block}`}>{item.block}</Link></td>
       <td className="col-time" suppressHydrationWarning>{displayTime}</td>
     </tr>
   );
@@ -119,200 +105,130 @@ const ActivityRow = memo(function ActivityRow({ item }: { item: ActivityItem }) 
 
 const ITEMS_PER_PAGE = 50;
 const TX_TYPES = ['Transfer', 'Reward', 'Swap', 'Heartbeat', 'Light Eligibility', 'Registration', 'Activation', 'Contract', 'System'];
+const LIVE_REFRESH_MIN_MS = 1500;
 
 export default function ExplorerClient({ initialData, initialHeight, initialTotal }: ExplorerClientProps) {
-  // ========== STATE: initialized from SSR data — table renders INSTANTLY ==========
-  const [transactionMap, setTransactionMap] = useState<Map<string, ActivityItem>>(() => {
-    const map = new Map<string, ActivityItem>();
-    initialData.forEach(tx => map.set(tx.hash, tx));
-    return map;
+  const [rows, setRows] = useState<ActivityItem[]>(initialData);
+  const [pagination, setPagination] = useState<Pagination>({
+    total: initialTotal, currentHeight: initialHeight, nextCursor: null, prevCursor: null,
+    maxPage: Math.max(1, Math.min(200, Math.ceil(initialTotal / ITEMS_PER_PAGE))), page: 1,
   });
-  const [currentHeight, setCurrentHeight] = useState(initialHeight);
-  const [loading, setLoading] = useState(false); // SSR data ready — no loading spinner
+  const [loading, setLoading] = useState(false);
   const [hasFetched, setHasFetched] = useState(initialData.length > 0);
   const [searchQuery, setSearchQuery] = useState('');
-  // Live search dropdown (top-L1 unified search): debounced suggestions as you type.
   const [suggestions, setSuggestions] = useState<{ type: string; label: string; sublabel?: string; href: string; symbol?: string; address?: string; logo?: string }[]>([]);
   const [showSuggest, setShowSuggest] = useState(false);
   const [activeSuggest, setActiveSuggest] = useState(-1);
   const [suggestLoading, setSuggestLoading] = useState(false);
   const suggestTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const suggestAbort = useRef<AbortController | null>(null);
-  const [page, setPage] = useState(1);
-  const [totalPages, setTotalPages] = useState(Math.ceil(initialTotal / ITEMS_PER_PAGE) || 1);
-  const [totalCount, setTotalCount] = useState(initialTotal);
   const [sortOrder, setSortOrder] = useState<'desc' | 'asc'>('desc');
   const [typeFilters, setTypeFilters] = useState<string[]>([]);
+  // Where the visible page sits: numbered (offset) or cursor-addressed.
+  const [pos, setPos] = useState<{ page: number; cursor: string | null; dir: 'next' | 'prev' }>({ page: 1, cursor: null, dir: 'next' });
   const [mounted, setMounted] = useState(false);
-
-  const fetchDebounceRef = useRef<NodeJS.Timeout | null>(null);
+  const head = useChainHead();
+  const lastLiveRefresh = useRef(0);
+  const fetchSeq = useRef(0);
   const isFirstRender = useRef(true);
 
   useEffect(() => { setMounted(true); }, []);
 
-  // Pre-cache SSR data: instant TX-detail loads + instant list re-display on filter/nav-back
   useEffect(() => {
     if (initialData.length > 0) {
-      const defaultKey = `${sortOrder}|${[...typeFilters].sort().join(',')}|1`;
-      setListCache(defaultKey, initialData, initialTotal, initialHeight);
+      setListCache(`desc||1`, initialData, initialTotal, initialHeight);
       noteChainHeight(initialHeight);
-      batchCache('tx', initialData.map(tx => ({
-        key: tx.hash,
-        data: {
-          hash: tx.hash, type: tx.type, status: 'confirmed' as const,
-          block: tx.block, timestamp: tx.timestamp, from: tx.from, to: tx.to, amount: tx.amount,
-        }
-      })));
+      batchCache('tx', initialData.map(tx => ({ key: tx.hash, data: { hash: tx.hash, type: tx.type, status: 'confirmed' as const, block: tx.block, timestamp: tx.timestamp, from: tx.from, to: tx.to, amount: tx.amount } })));
     }
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const filteredAndSortedActivity = useMemo(() => {
-    return Array.from(transactionMap.values());
-  }, [transactionMap]);
+  const isLiveView = pos.page === 1 && pos.cursor === null && sortOrder === 'desc' && typeFilters.length === 0;
 
-  // ========== FETCH: client-side for filter/pagination/polling ==========
-  const fetchActivity = useCallback(async (pageNum: number) => {
-    const cacheKey = `${sortOrder}|${[...typeFilters].sort().join(',')}|${pageNum}`;
-
-    // Stale-while-revalidate: render cached rows INSTANTLY (no spinner), then refresh.
-    const cached = getListCache(cacheKey);
+  const fetchList = useCallback(async (target: { page: number; cursor: string | null; dir: 'next' | 'prev' }, silent: boolean) => {
+    const seq = ++fetchSeq.current;
+    const filterKey = [...typeFilters].sort().join(',');
+    const cacheKey = `${sortOrder}|${filterKey}|${target.cursor ?? `p${target.page}`}`;
+    const cached = !silent ? getListCache(cacheKey) : null;
     if (cached) {
-      const m = new Map<string, ActivityItem>();
-      for (const tx of cached.data as ActivityItem[]) if (tx.hash) m.set(tx.hash, tx);
-      setTransactionMap(m);
-      setTotalCount(cached.total);
-      setTotalPages(Math.ceil(cached.total / ITEMS_PER_PAGE) || 1);
-      if (cached.height) setCurrentHeight(cached.height);
+      setRows(cached.data as ActivityItem[]);
+      setPagination(p => ({ ...p, total: cached.total, currentHeight: cached.height || p.currentHeight }));
       setHasFetched(true);
-    } else {
+    } else if (!silent) {
       setLoading(true);
     }
-
     try {
-      const typeParam = typeFilters.length > 0 && typeFilters.length < TX_TYPES.length
-        ? `&types=${encodeURIComponent(typeFilters.join(','))}`
-        : '';
-      const res = await fetch(`/api/activity?page=${pageNum}&limit=${ITEMS_PER_PAGE}&sort=${sortOrder}${typeParam}`, {
-        cache: 'no-store'
-      });
+      const params = new URLSearchParams({ limit: String(ITEMS_PER_PAGE), sort: sortOrder });
+      if (typeFilters.length > 0 && typeFilters.length < TX_TYPES.length) params.set('types', typeFilters.join(','));
+      if (target.cursor) { params.set('cursor', target.cursor); params.set('dir', target.dir); }
+      else if (target.page > 1) params.set('page', String(target.page));
+      const res = await fetch(`/api/activity?${params.toString()}`, { cache: 'no-store' });
       const data = await res.json();
-
-      if (data.success && data.data) {
-        const networkHeight = data.pagination?.currentHeight || 0;
-        noteChainHeight(networkHeight); // wipe stale caches if the chain was reset to 0
-        const total = data.pagination?.total || 0;
-        const pages = Math.ceil(total / ITEMS_PER_PAGE) || 1;
-
-        const newMap = new Map<string, ActivityItem>();
-        for (const tx of data.data as ActivityItem[]) {
-          if (tx.hash) newMap.set(tx.hash, tx);
-        }
-
-        setTransactionMap(newMap);
-        setCurrentHeight(networkHeight);
-        setTotalCount(total);
-        setTotalPages(pages);
-
-        // Cache this list page (instant filter/nav re-display) + seed TX-detail cache
-        setListCache(cacheKey, data.data, total, networkHeight);
-        batchCache('tx', Array.from(newMap.values()).map(tx => ({
-          key: tx.hash,
-          data: {
-            hash: tx.hash, type: tx.type, status: 'confirmed' as const,
-            block: tx.block, timestamp: tx.timestamp, from: tx.from, to: tx.to, amount: tx.amount,
-          }
-        })));
+      if (seq !== fetchSeq.current) return;
+      if (data.success && Array.isArray(data.data)) {
+        const pg = data.pagination || {};
+        noteChainHeight(pg.currentHeight || 0);
+        setRows(data.data as ActivityItem[]);
+        setPagination({
+          total: pg.total || 0, currentHeight: pg.currentHeight || 0, nextCursor: pg.nextCursor ?? null, prevCursor: pg.prevCursor ?? null,
+          maxPage: pg.maxPage || 1, page: typeof pg.page === 'number' ? pg.page : null,
+        });
+        setListCache(cacheKey, data.data, pg.total || 0, pg.currentHeight || 0);
+        batchCache('tx', (data.data as ActivityItem[]).map(tx => ({ key: tx.hash, data: { hash: tx.hash, type: tx.type, status: 'confirmed' as const, block: tx.block, timestamp: tx.timestamp, from: tx.from, to: tx.to, amount: tx.amount } })));
       }
     } catch {
-      /* network error — keep current data */
+      /* keep what is shown */
     } finally {
-      setLoading(false);
-      setHasFetched(true);
+      if (seq === fetchSeq.current) { setLoading(false); setHasFetched(true); }
     }
-  }, [typeFilters, sortOrder]);
+  }, [sortOrder, typeFilters]);
 
-  // ========== EFFECTS ==========
-
-  // Debounced fetch on filter/sort/page changes
+  // Position, sort or filter changed: fetch that page.
   useEffect(() => {
     if (!mounted) return;
+    if (isFirstRender.current) { isFirstRender.current = false; return; }
+    const t = setTimeout(() => { void fetchList(pos, false); }, 150);
+    return () => clearTimeout(t);
+  }, [pos, sortOrder, typeFilters, mounted, fetchList]);
 
-    // Skip first render — SSR data is already displayed
-    if (isFirstRender.current) {
-      isFirstRender.current = false;
-      return;
-    }
-
-    // Debounce: batch rapid filter clicks into one API call
-    if (fetchDebounceRef.current) clearTimeout(fetchDebounceRef.current);
-    fetchDebounceRef.current = setTimeout(() => {
-      fetchActivity(page);
-    }, 200);
-
-    return () => {
-      if (fetchDebounceRef.current) clearTimeout(fetchDebounceRef.current);
-    };
-  }, [page, typeFilters, sortOrder, mounted, fetchActivity]);
-
-  // Real-time: refresh transactions every 5 seconds (page 1 only)
+  // A new head: the live view refreshes (throttled); other pages only update the height/total.
   useEffect(() => {
-    if (!mounted || page !== 1) return;
-    const interval = setInterval(() => fetchActivity(1), 5000);
-    return () => clearInterval(interval);
-  }, [mounted, page, fetchActivity]);
+    if (!mounted || !head.height) return;
+    setPagination(p => ({ ...p, currentHeight: head.height, total: typeFilters.length === 0 ? head.txTotal || p.total : p.total }));
+    if (!isLiveView) return;
+    const now = Date.now();
+    if (now - lastLiveRefresh.current < LIVE_REFRESH_MIN_MS) return;
+    lastLiveRefresh.current = now;
+    void fetchList(pos, true);
+  }, [head.v]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Real-time: poll block height every 5 seconds
-  useEffect(() => {
-    if (!mounted) return;
-    const fetchHeight = async () => {
-      try {
-        const res = await fetch(`/api/network/stats?t=${Date.now()}`, { cache: 'no-store' });
-        const data = await res.json();
-        if (data.success && data.data?.height) {
-          noteChainHeight(data.data.height); // detect chain reset → wipe stale caches
-          setCurrentHeight(data.data.height);
-        }
-      } catch {}
-    };
-    const interval = setInterval(fetchHeight, 5000);
-    return () => clearInterval(interval);
-  }, [mounted]);
-
-  // ========== HANDLERS ==========
-
-  const goToPage = (newPage: number) => {
-    if (newPage >= 1 && newPage <= totalPages && newPage !== page) {
-      setPage(newPage);
-      window.scrollTo({ top: 0, behavior: 'smooth' });
-    }
+  const goNext = () => { if (pagination.nextCursor) { setPos(p => ({ page: (p.page || 1) + 1, cursor: pagination.nextCursor, dir: 'next' })); window.scrollTo({ top: 0, behavior: 'smooth' }); } };
+  const goPrev = () => {
+    if (pos.page <= 2) { setPos({ page: 1, cursor: null, dir: 'next' }); window.scrollTo({ top: 0, behavior: 'smooth' }); return; }
+    if (pagination.prevCursor) { setPos(p => ({ page: Math.max(1, (p.page || 2) - 1), cursor: pagination.prevCursor, dir: 'prev' })); window.scrollTo({ top: 0, behavior: 'smooth' }); }
+  };
+  const goToPage = (n: number) => {
+    if (n < 1 || n > pagination.maxPage || (n === pos.page && !pos.cursor)) return;
+    setPos({ page: n, cursor: null, dir: 'next' });
+    window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
-  const getPageNumbers = () => {
-    const pages: (number | string)[] = [];
-    const maxVisible = 7;
-    if (totalPages <= maxVisible) {
-      for (let i = 1; i <= totalPages; i++) pages.push(i);
-    } else {
-      pages.push(1);
-      if (page > 3) pages.push('...');
-      const start = Math.max(2, page - 1);
-      const end = Math.min(totalPages - 1, page + 1);
-      for (let i = start; i <= end; i++) pages.push(i);
-      if (page < totalPages - 2) pages.push('...');
-      pages.push(totalPages);
-    }
-    return pages;
-  };
+  const shownPage = pos.page;
+  const totalPagesAll = Math.max(1, Math.ceil(pagination.total / ITEMS_PER_PAGE));
+  const pageNumbers = useMemo(() => {
+    const maxJump = pagination.maxPage;
+    const out: (number | string)[] = [];
+    if (maxJump <= 7) { for (let i = 1; i <= maxJump; i++) out.push(i); return out; }
+    out.push(1);
+    if (shownPage > 3) out.push('...');
+    for (let i = Math.max(2, shownPage - 1); i <= Math.min(maxJump - 1, shownPage + 1); i++) out.push(i);
+    if (shownPage < maxJump - 2) out.push('...');
+    out.push(maxJump);
+    return out;
+  }, [pagination.maxPage, shownPage]);
 
-  const toggleSort = () => {
-    setSortOrder(prev => prev === 'desc' ? 'asc' : 'desc');
-    setPage(1);
-  };
-
+  const toggleSort = () => { setSortOrder(prev => (prev === 'desc' ? 'asc' : 'desc')); setPos({ page: 1, cursor: null, dir: 'next' }); };
   const goToResult = (href: string) => { window.location.href = href; };
 
-  // Debounced live suggestions: fetch /api/search/suggest as the user types; abort
-  // stale requests so a fast typist never lands on an out-of-order response.
   useEffect(() => {
     const q = searchQuery.trim();
     if (suggestTimer.current) clearTimeout(suggestTimer.current);
@@ -325,11 +241,7 @@ export default function ExplorerClient({ initialData, initialHeight, initialTota
       try {
         const res = await fetch(`/api/search/suggest?q=${encodeURIComponent(q)}`, { signal: ac.signal });
         const data = await res.json();
-        if (!ac.signal.aborted) {
-          setSuggestions(Array.isArray(data?.results) ? data.results : []);
-          setShowSuggest(true);
-          setActiveSuggest(-1);
-        }
+        if (!ac.signal.aborted) { setSuggestions(Array.isArray(data?.results) ? data.results : []); setShowSuggest(true); setActiveSuggest(-1); }
       } catch {
         if (!ac.signal.aborted) { setSuggestions([]); setShowSuggest(true); }
       } finally {
@@ -339,9 +251,6 @@ export default function ExplorerClient({ initialData, initialHeight, initialTota
     return () => { if (suggestTimer.current) clearTimeout(suggestTimer.current); };
   }, [searchQuery]);
 
-  // Enter / search-button: go to the highlighted (or first) suggestion. With no
-  // suggestion yet, resolve ONLY unambiguous shapes directly — free text with no
-  // token match stays on the "Nothing found" dropdown instead of a broken /tx/{q}.
   const handleSearch = () => {
     const pick = activeSuggest >= 0 ? suggestions[activeSuggest] : suggestions[0];
     if (pick) { goToResult(pick.href); return; }
@@ -350,16 +259,20 @@ export default function ExplorerClient({ initialData, initialHeight, initialTota
     if (/^\d+$/.test(q)) goToResult(`/explorer/block/${q}`);
     else if (q.length === 64 && /^[0-9A-Fa-f]+$/.test(q)) goToResult(`/explorer/tx/${q}`);
     else if (q.length >= 38 && q.toLowerCase().includes('eon')) goToResult(`/explorer/address/${q}`);
-    // else: free text, no token match → keep the dropdown ("Nothing found").
   };
 
-  // ========== RENDER ==========
+  const heightLabel = pagination.currentHeight || head.height || 0;
 
   return (
     <div className="explorer-page">
       <div className="explorer-header">
         <h1>Quantum Blockchain Explorer</h1>
-        <p suppressHydrationWarning>All transactions from Genesis to Now • Block Height: {currentHeight || '...'}</p>
+        <p suppressHydrationWarning>
+          All transactions from Genesis to Now • Block Height: {heightLabel || '...'}
+          {mounted && (
+            <span className={`live-dot ${head.connected ? 'on' : 'off'}`} title={head.connected ? 'live' : 'reconnecting'} style={{ marginLeft: 8, display: 'inline-block', width: 8, height: 8, borderRadius: 4, background: head.connected ? '#7CFFB2' : '#7fa8b0', verticalAlign: 'middle' }} />
+          )}
+        </p>
       </div>
 
       <div className="explorer-search" style={{ position: 'relative' }}>
@@ -386,42 +299,19 @@ export default function ExplorerClient({ initialData, initialHeight, initialTota
           </svg>
         </button>
         {showSuggest && searchQuery.trim() && (
-          <div style={{
-            position: 'absolute', top: 'calc(100% + 6px)', left: 0, right: 0, zIndex: 50,
-            background: 'rgba(8, 20, 28, 0.98)', border: '1px solid rgba(0, 229, 240, 0.35)',
-            borderRadius: 10, boxShadow: '0 12px 32px rgba(0,0,0,0.55)',
-            overflow: 'hidden', maxHeight: 360, overflowY: 'auto', textAlign: 'left',
-          }}>
-            {suggestLoading && suggestions.length === 0 && (
-              <div style={{ padding: '12px 16px', color: '#7fa8b0', fontSize: 14 }}>Searching…</div>
-            )}
-            {!suggestLoading && suggestions.length === 0 && (
-              <div style={{ padding: '12px 16px', color: '#7fa8b0', fontSize: 14 }}>Nothing found</div>
-            )}
+          <div style={{ position: 'absolute', top: 'calc(100% + 6px)', left: 0, right: 0, zIndex: 50, background: 'rgba(8, 20, 28, 0.98)', border: '1px solid rgba(0, 229, 240, 0.35)', borderRadius: 10, boxShadow: '0 12px 32px rgba(0,0,0,0.55)', overflow: 'hidden', maxHeight: 360, overflowY: 'auto', textAlign: 'left' }}>
+            {suggestLoading && suggestions.length === 0 && <div style={{ padding: '12px 16px', color: '#7fa8b0', fontSize: 14 }}>Searching…</div>}
+            {!suggestLoading && suggestions.length === 0 && <div style={{ padding: '12px 16px', color: '#7fa8b0', fontSize: 14 }}>Nothing found</div>}
             {suggestions.map((s, i) => (
-              <div
-                key={`${s.type}-${s.href}-${i}`}
-                onMouseDown={(e) => { e.preventDefault(); goToResult(s.href); }}
-                onMouseEnter={() => setActiveSuggest(i)}
-                style={{
-                  display: 'flex', alignItems: 'center', gap: 10, padding: '10px 14px', cursor: 'pointer',
-                  background: i === activeSuggest ? 'rgba(0, 229, 240, 0.12)' : 'transparent',
-                  borderTop: i === 0 ? 'none' : '1px solid rgba(255,255,255,0.05)',
-                }}
-              >
+              <div key={`${s.type}-${s.href}-${i}`} onMouseDown={(e) => { e.preventDefault(); goToResult(s.href); }} onMouseEnter={() => setActiveSuggest(i)}
+                style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 14px', cursor: 'pointer', background: i === activeSuggest ? 'rgba(0, 229, 240, 0.12)' : 'transparent', borderTop: i === 0 ? 'none' : '1px solid rgba(255,255,255,0.05)' }}>
                 {s.type === 'token' ? (
                   <TokenIcon logo={s.logo} symbol={s.symbol} address={s.address} size={24} />
                 ) : (
-                  <span style={{
-                    fontSize: 10, textTransform: 'uppercase', letterSpacing: '0.5px', fontWeight: 700,
-                    padding: '2px 7px', borderRadius: 5, color: '#04141a', flexShrink: 0,
-                    background: s.type === 'tx' ? '#8b9dff' : s.type === 'block' ? '#7CFFB2' : '#ffd166',
-                  }}>{s.type}</span>
+                  <span style={{ fontSize: 10, textTransform: 'uppercase', letterSpacing: '0.5px', fontWeight: 700, padding: '2px 7px', borderRadius: 5, color: '#04141a', flexShrink: 0, background: s.type === 'tx' ? '#8b9dff' : s.type === 'block' ? '#7CFFB2' : '#ffd166' }}>{s.type}</span>
                 )}
                 <span style={{ color: '#e6f7fa', fontWeight: 600, fontSize: 14 }}>{s.label}</span>
-                {s.sublabel && (
-                  <span style={{ color: '#7fa8b0', fontSize: 12, marginLeft: 'auto', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: '55%' }}>{s.sublabel}</span>
-                )}
+                {s.sublabel && <span style={{ color: '#7fa8b0', fontSize: 12, marginLeft: 'auto', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: '55%' }}>{s.sublabel}</span>}
               </div>
             ))}
           </div>
@@ -435,36 +325,24 @@ export default function ExplorerClient({ initialData, initialHeight, initialTota
             <div className="type-filter-multi">
               <div className="filter-chips">
                 {TX_TYPES.map(type => (
-                  <button
-                    key={type}
-                    className={`filter-chip ${typeFilters.includes(type) ? 'active' : ''}`}
-                    onClick={() => {
-                      setTypeFilters(prev =>
-                        prev.includes(type)
-                          ? prev.filter(t => t !== type)
-                          : [...prev, type]
-                      );
-                      setPage(1);
-                    }}
-                  >
+                  <button key={type} className={`filter-chip ${typeFilters.includes(type) ? 'active' : ''}`}
+                    onClick={() => { setTypeFilters(prev => (prev.includes(type) ? prev.filter(t => t !== type) : [...prev, type])); setPos({ page: 1, cursor: null, dir: 'next' }); }}>
                     {type}
                   </button>
                 ))}
               </div>
             </div>
-            <span className="tx-count">
-              {totalCount} transactions
-            </span>
+            <span className="tx-count">{pagination.total.toLocaleString('en-US')} transactions</span>
           </div>
         </div>
 
         <div className="table-wrapper">
-          {filteredAndSortedActivity.length === 0 && hasFetched ? (
+          {rows.length === 0 && hasFetched ? (
             <div className="empty-state">
               <p>No transactions found</p>
               <span>{typeFilters.length > 0 ? `No ${typeFilters.join('/')} transactions yet` : 'Waiting for network activity...'}</span>
             </div>
-          ) : filteredAndSortedActivity.length === 0 ? (
+          ) : rows.length === 0 ? (
             <div className="table-placeholder" />
           ) : (
             <table className="activity-table">
@@ -474,68 +352,33 @@ export default function ExplorerClient({ initialData, initialHeight, initialTota
                   <th>TYPE</th>
                   <th>FROM → TO</th>
                   <th style={{ textAlign: 'right' }}>AMOUNT</th>
-                  <th
-                    className="sortable-header"
-                    onClick={toggleSort}
-                    title="Click to sort by block height"
-                  >
-                    BLOCK {sortOrder === 'desc' ? '↓' : '↑'}
-                  </th>
+                  <th className="sortable-header" onClick={toggleSort} title="Click to sort by block height">BLOCK {sortOrder === 'desc' ? '↓' : '↑'}</th>
                   <th>TIME</th>
                 </tr>
               </thead>
               <tbody>
-                {filteredAndSortedActivity.map((item, idx) => (
-                  <ActivityRow key={`${item.hash}-${idx}`} item={item} />
-                ))}
+                {rows.map((item) => <ActivityRow key={item.hash} item={item} />)}
               </tbody>
             </table>
           )}
 
-          {/* Pagination */}
-          {totalPages > 1 && (
+          {totalPagesAll > 1 && (
             <div className="pagination-controls">
-              <button
-                className="page-btn page-arrow"
-                onClick={() => goToPage(page - 1)}
-                disabled={page === 1 || loading}
-              >
-                ←
-              </button>
-
-              {getPageNumbers().map((p, idx) => (
-                typeof p === 'number' ? (
-                  <button
-                    key={idx}
-                    className={`page-btn ${p === page ? 'active' : ''}`}
-                    onClick={() => goToPage(p)}
-                    disabled={loading}
-                  >
-                    {p}
-                  </button>
-                ) : (
-                  <span key={idx} className="page-ellipsis">...</span>
-                )
+              <button className="page-btn page-arrow" onClick={goPrev} disabled={(shownPage <= 1 && !pos.cursor) || loading}>←</button>
+              {pageNumbers.map((p, idx) => (
+                typeof p === 'number'
+                  ? <button key={idx} className={`page-btn ${p === shownPage && !pos.cursor ? 'active' : ''}`} onClick={() => goToPage(p)} disabled={loading}>{p}</button>
+                  : <span key={idx} className="page-ellipsis">...</span>
               ))}
-
-              <button
-                className="page-btn page-arrow"
-                onClick={() => goToPage(page + 1)}
-                disabled={page === totalPages || loading}
-              >
-                →
-              </button>
-
+              <button className="page-btn page-arrow" onClick={goNext} disabled={!pagination.nextCursor || loading}>→</button>
               <span className="page-info">
-                Page {page} of {totalPages} ({totalCount} total)
+                Page {shownPage} of {totalPagesAll.toLocaleString('en-US')} ({pagination.total.toLocaleString('en-US')} total)
               </span>
             </div>
           )}
 
-          {totalPages <= 1 && filteredAndSortedActivity.length > 0 && (
-            <div className="pagination-info">
-              {totalCount} transactions
-            </div>
+          {totalPagesAll <= 1 && rows.length > 0 && (
+            <div className="pagination-info">{pagination.total.toLocaleString('en-US')} transactions</div>
           )}
         </div>
       </div>

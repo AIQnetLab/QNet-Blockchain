@@ -59,6 +59,8 @@ export interface Block {
   
   // Transaction data
   tx_count: number;
+  // false: the network pruned this body before the explorer indexed it (identity only)
+  body_indexed?: boolean;
   transactions: BlockTransaction[];
   total_gas_used?: number;
   

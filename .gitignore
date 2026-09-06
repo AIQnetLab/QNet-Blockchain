@@ -698,3 +698,6 @@ dev-scratch/
 
 # Session working notes — never commit
 /memory/
+
+# explorer indexer build output
+applications/qnet-explorer/frontend/dist-indexer/

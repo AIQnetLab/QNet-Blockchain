@@ -7,7 +7,7 @@ const nextConfig = {
     staleTimes: { dynamic: 30, static: 180 },
   },
   compiler: {
-    // MUST keep all console methods - sync-service uses console.log for critical initialization
+    // Server logs ([LEVEL][SUBSYSTEM] lines) go through console; keep them in the build.
     removeConsole: false,
   },
   // Server-side packages that should not be bundled

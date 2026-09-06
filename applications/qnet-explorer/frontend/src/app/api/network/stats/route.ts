@@ -1,127 +1,67 @@
 import { NextResponse } from 'next/server';
-import { Pool } from 'pg';
+import { headHub } from '@/server/head-hub';
+import { query } from '../../../../../lib/db';
 
-// ============================================================================
-// PRODUCTION v3.19: ALL DATA FROM DATABASE (no node requests)
-// - Removes load from node
-// - Faster response times
-// - Data consistency with explorer
-// ============================================================================
-
-// PostgreSQL connection
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DB_SSL === 'true' ? { rejectUnauthorized: false } : false,
-});
-
-// Disable ALL caching
 export const dynamic = 'force-dynamic';
-export const revalidate = 0;
-export const fetchCache = 'force-no-store';
+
+// Network stats: head/counters from the process head cache; active-node counts are per sealed epoch
+// (window queries over the (tx_type, block) index) and change once an epoch, so they are cached 60 s.
+
+const EPOCH = 14_400;
+const NODE_COUNT_TTL_MS = 60_000;
+let nodeCounts: { epoch: number; superNodes: number; lightNodes: number; at: number } | null = null;
+
+async function activeNodeCounts(height: number): Promise<{ superNodes: number; lightNodes: number }> {
+  const pe = Math.max(Math.floor(height / EPOCH) - 1, 0);
+  const now = Date.now();
+  if (nodeCounts && nodeCounts.epoch === pe && now - nodeCounts.at < NODE_COUNT_TTL_MS) {
+    return { superNodes: nodeCounts.superNodes, lightNodes: nodeCounts.lightNodes };
+  }
+  const [sup, light] = await Promise.all([
+    query<{ c: string }>(
+      `SELECT count(DISTINCT from_address) AS c FROM transactions WHERE tx_type = 'Heartbeat' AND block >= $1 AND block < $2`,
+      [pe * EPOCH, (pe + 1) * EPOCH]),
+    query<{ c: string }>(
+      `SELECT COALESCE(MAX(epoch_light), 0)::text AS c FROM (
+         SELECT FLOOR(block / ${EPOCH})::bigint AS epoch, SUM((tx_type_data->>'eligible_count')::bigint) AS epoch_light
+         FROM transactions WHERE tx_type = 'LightNodeEligibilityBitmap' AND block >= $1 AND block < $2
+         GROUP BY FLOOR(block / ${EPOCH})) per_epoch`,
+      [Math.max(pe - 2, 0) * EPOCH, (pe + 1) * EPOCH]),
+  ]);
+  nodeCounts = { epoch: pe, superNodes: Number(sup.rows[0]?.c || 0), lightNodes: Number(light.rows[0]?.c || 0), at: now };
+  return { superNodes: nodeCounts.superNodes, lightNodes: nodeCounts.lightNodes };
+}
 
 export async function GET() {
   try {
-    // ALL DATA FROM DATABASE - no node requests!
-    // Active-node counts use the PREVIOUS sealed epoch (the current epoch is partial → flickers).
-    // prevEpoch = floor(height/14400) - 1; window = [pe*14400, pe*14400+14400).
-    const prevEpochCte = `
-      WITH h AS (
-        SELECT COALESCE(
-          (SELECT last_height FROM sync_state WHERE id = 1),
-          (SELECT MAX(height) FROM blocks),
-          0
-        ) AS height
-      ),
-      ep AS (SELECT GREATEST(FLOOR(height / 14400)::bigint - 1, 0) AS pe FROM h)`;
-
-    const [heightResult, supplyResult, superNodesResult, lightNodesResult] = await Promise.all([
-      // Get current height from sync_state or blocks table
-      pool.query(`
-        SELECT COALESCE(
-          (SELECT last_height FROM sync_state WHERE id = 1),
-          (SELECT MAX(height) FROM blocks),
-          0
-        ) as height
-      `),
-      
-      // Get circulating supply from emission transactions
-      pool.query(`
-        SELECT COALESCE(SUM(amount), 0) as total_rewards 
-        FROM transactions 
-        WHERE tx_type = 'RewardDistribution' 
-          AND from_address = 'system_emission'
-      `),
-      
-      // Active SERVER/super nodes = distinct senders of the v35 'Heartbeat' TX in the previous sealed epoch.
-      pool.query(`${prevEpochCte}
-        SELECT COUNT(DISTINCT t.from_address) AS active_super
-        FROM transactions t, ep
-        WHERE t.tx_type = 'Heartbeat'
-          AND t.block >= ep.pe * 14400 AND t.block < ep.pe * 14400 + 14400
-      `),
-
-      // Active LIGHT nodes = MAX over the last 3 sealed epochs of (per-epoch SUM of eligible_count across genesis shards).
-      // Per-epoch SUM across shards = that epoch's light total (each light is in exactly one shard); MAX de-flickers a light
-      // that missed only the most-recent epoch's ping window.
-      pool.query(`${prevEpochCte}
-        SELECT COALESCE(MAX(epoch_light), 0) AS active_light FROM (
-          SELECT FLOOR(t.block / 14400)::bigint AS epoch,
-                 SUM((t.tx_type_data->>'eligible_count')::bigint) AS epoch_light
-          FROM transactions t, ep
-          WHERE t.tx_type = 'LightNodeEligibilityBitmap'
-            AND t.block >= GREATEST(ep.pe - 2, 0) * 14400 AND t.block < (ep.pe + 1) * 14400
-          GROUP BY FLOOR(t.block / 14400)
-        ) per_epoch
-      `)
-    ]);
-    
-    const height = Number(heightResult.rows[0]?.height || 0);
-    
-    // Reward epoch = 0-based (epoch 0 starts at block 0)
-    const rewardEpoch = Math.floor(height / 14400);
-    // Blocks until next reward
-    const blocksUntilReward = 14400 - (height % 14400);
-    // Time until reward in seconds (1 block = 1 second)
-    const secondsUntilReward = blocksUntilReward;
-    
-    // Circulating supply from emissions
-    const totalRewardsNano = BigInt(supplyResult.rows[0]?.total_rewards || 0);
-    const circulatingSupply = Number(totalRewardsNano) / 1_000_000_000;
-    // Deterministic formatting (no locale differences)
-    const circulatingFormatted = circulatingSupply.toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
-    
-    // Server (super/genesis) nodes active in the previous sealed epoch; light nodes counted separately.
-    const activeNodes = Number(superNodesResult.rows[0]?.active_super || 0);
-    const activeLightNodes = Number(lightNodesResult.rows[0]?.active_light || 0);
-    
-    const response = NextResponse.json({
+    const s = await headHub.snapshot();
+    const height = Math.max(s.height, 0);
+    const nodes = await activeNodeCounts(height);
+    const rewardEpoch = Math.floor(height / EPOCH);
+    const blocksUntilReward = EPOCH - (height % EPOCH);
+    const emissionNano = BigInt(s.stats.emission_total || '0');
+    const whole = emissionNano / 1_000_000_000n;
+    const frac = (emissionNano % 1_000_000_000n).toString().padStart(9, '0').slice(0, 2);
+    const circulatingFormatted = `${whole.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',')}.${frac}`;
+    return NextResponse.json({
       success: true,
       source: 'database',
       data: {
-        activeNodes: activeNodes,
-        activeLightNodes: activeLightNodes,
+        activeNodes: nodes.superNodes,
+        activeLightNodes: nodes.lightNodes,
         currentRound: rewardEpoch,
-        height: height,
-        blocksUntilReward: blocksUntilReward,
-        secondsUntilReward: secondsUntilReward,
-        circulatingSupply: Math.floor(circulatingSupply),
-        circulatingFormatted: circulatingFormatted
-      }
-    });
-    
-    // Force no caching in response headers
-    response.headers.set('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
-    response.headers.set('Pragma', 'no-cache');
-    response.headers.set('Expires', '0');
-    
-    return response;
+        height,
+        blocksUntilReward,
+        secondsUntilReward: blocksUntilReward,
+        circulatingSupply: Number(whole),
+        circulatingFormatted,
+        totalTransactions: s.stats.tx_total,
+        totalBlocks: s.stats.blocks_total,
+        sync: { head: s.sync.last_height, prefix: s.sync.indexed_prefix, nodeHeight: s.sync.node_height, live: s.sync.ws_connected },
+      },
+    }, { headers: { 'Cache-Control': 'public, s-maxage=1, stale-while-revalidate=4' } });
   } catch (error) {
-    console.error('[STATS] Database error:', error);
-    const response = NextResponse.json({
-      success: false,
-      data: null
-    });
-    response.headers.set('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
-    return response;
+    console.error(`[ERR][API] stats_failed err=${error instanceof Error ? error.message : String(error)}`);
+    return NextResponse.json({ success: false, data: null }, { status: 503, headers: { 'Cache-Control': 'no-store' } });
   }
 }

@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getTransactionByHash } from '../../../../../lib/db';
+import { getTransactionByHash, getBatchRecipients } from '../../../../../lib/db';
 import { rateLimit, getClientIdentifier } from '../../../../../lib/rate-limit';
 import { mapTxType, formatAmount } from '@/lib/tx-mapping';
 
@@ -267,11 +267,15 @@ export async function GET(
         signatureType = 'Unsigned';
       }
       
-      // Calculate real fee from stored gas_price and gas_limit
-      const gasPrice = dbTx.gas_price || 0;
-      const gasLimit = dbTx.gas_limit || 0;
-      const totalFee = gasPrice * gasLimit;
-      const fee = totalFee > 0 ? formatAmount(totalFee) : '0';
+      // Fee = gas_price × gas_limit, exact (NUMERIC columns arrive as digit strings).
+      const totalFee = BigInt(dbTx.gas_price || '0') * BigInt(dbTx.gas_limit || '0');
+      const fee = totalFee > 0n ? formatAmount(totalFee.toString()) : '0';
+      // Recipients of a batch envelope live in batch_transfers; the page expands them from tx_type_data.
+      let typeData = parseTxTypeData(dbTx.tx_type_data);
+      if (dbTx.tx_type === 'BatchTransfers') {
+        const recipients = await getBatchRecipients(dbTx.hash).catch(() => []);
+        if (recipients.length > 0) typeData = { ...(typeData || {}), recipients: recipients.map(r => ({ to: r.to_address, amount: r.amount })) };
+      }
       
       // Get timestamp - if 0, fetch from block
       // Note: PostgreSQL BIGINT may come as string, so convert first
@@ -332,7 +336,7 @@ export async function GET(
           dilithium_signature: dbTx.dilithium_signature,
           dilithium_public_key: dbTx.dilithium_public_key,
           data: dbTx.data,
-          tx_type_data: parseTxTypeData(dbTx.tx_type_data),
+          tx_type_data: typeData,
         },
       }, {
         headers: {

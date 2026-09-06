@@ -189,7 +189,7 @@ export async function GET(
 
   try {
     // Parallel: node balance + node QRC-20 token holdings + PostgreSQL TX history + token transfers
-    const [accountResponse, tokens, txResult, tokenTransferRows] = await Promise.all([
+    const [accountResponse, tokens, txResult, batchCredits, tokenTransferRows] = await Promise.all([
       fetch(`${NODE_API}/api/v1/account/${encodeURIComponent(address)}`, {
         headers: nodeHeaders,
         signal: AbortSignal.timeout(10000),
@@ -200,7 +200,7 @@ export async function GET(
       getAddressTokenTransfers(address, 50),
     ]);
 
-    const { transactions, total } = txResult;
+    const { transactions, total, totalCapped } = txResult;
 
     // Resolve each unique contract's QRC-20 metadata once (symbol/decimals/logo) from its ContractDeploy.
     const uniqueContracts = Array.from(new Set(tokenTransferRows.map(t => t.contract)));
@@ -310,6 +310,7 @@ export async function GET(
         address,
         balance: formatAmount(balance),
         txCount: total,
+        txCountCapped: totalCapped,
         firstSeen: firstSeen,
         lastActive: lastActive,
         tokens,
