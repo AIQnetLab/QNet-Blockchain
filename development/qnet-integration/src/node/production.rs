@@ -705,7 +705,7 @@ impl BlockchainNode {
             } else {
                 // Heartbeat stale OR no cache: exponential re-emit pacing per mb, tau(rel_round)
                 // ≈ 5s·1.5^round capped at 30 s (a WAN GST is seconds). Resets on progress.
-                const TAU_SECS: [u64; 9] = [5, 7, 11, 16, 25, 38, 56, 85, 128];
+                const TAU_SECS: [u64; 9] = [5, 7, 11, 16, 25, 30, 30, 30, 30];
                 let tau = TAU_SECS[failover_round.min(8) as usize];
                 let should_emit = {
                     let last = LAST_TIMEOUT_EMIT_PER_MB
