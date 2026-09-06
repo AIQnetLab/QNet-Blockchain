@@ -193,13 +193,6 @@ static HASH_CHAIN_BREAK_WITNESSES: once_cell::sync::Lazy<
     dashmap::DashMap<u64, DashSet<String>>
 > = once_cell::sync::Lazy::new(dashmap::DashMap::new);
 
-/// Child height → parent hash it named → the distinct peers that delivered such a child. A tail no
-/// peer builds on is not the chain's tail, whatever failover round it carries.
-static CHILD_PARENT_WITNESSES: once_cell::sync::Lazy<
-    dashmap::DashMap<u64, dashmap::DashMap<[u8; 32], DashSet<String>>>
-> = once_cell::sync::Lazy::new(dashmap::DashMap::new);
-
-
 // v32.10: cooldown for macroblock-anchored fork-recovery trigger.
 // Height → wall-clock secs of last trigger. 60s/height prevents thrashing
 // when the same break repeats during resync.
@@ -531,11 +524,28 @@ fn maybe_supersede_by_certified_round(storage: &Arc<Storage>, block: &IngestBloc
     // apply_breaker (height-1). Deepest pending target wins (min) so a concurrent, deeper
     // signal is never masked. (h > finalized is guaranteed above; .max is a floor clamp.)
     let target = h.saturating_sub(1).max(finalized);
+    clear_contradicted_tail(h);
     signal_fork_recovery(target);
     if is_warn() {
         println!("[WARN][FORK] round_supersede h={} our_round={} new_round={} action=reorg_to_certified",
                  h, our_round, incoming.timeout_round);
     }
+}
+
+/// A child is evidence only if its producer signed it and the rotation authorises that producer for
+/// its slot at its round. Both are the checks the verify stage runs further down; a hash-chain break
+/// exits before them, so a destructive decision has to run them itself. Fail-closed: an underivable
+/// roster is not authority.
+async fn child_is_authentic(storage: &Arc<Storage>, decoded: &DecodedBlock) -> bool {
+    let mb = &decoded.microblock;
+    if !decoded.sig_pre_verified {
+        match crate::node::BlockchainNode::verify_microblock_signature(storage, mb, &mb.producer, None).await {
+            Ok(true) => {}
+            _ => return false,
+        }
+    }
+    let abs = mb.timeout_round.saturating_add(mb.carried_baseline);
+    matches!(crate::node::expected_producer_for_round(mb.height, abs), Some(l) if l == mb.producer)
 }
 
 /// Route a sync/repair-delivered block at an ALREADY-STORED height through the SAME fork-choice
@@ -596,34 +606,6 @@ pub(crate) fn supersede_stored_from_sync(storage: &Arc<Storage>, height: u64, da
 /// Scalability: per-height witness sets bounded by active validator
 /// count (≤ MAX_VALIDATORS = 1000 in committee). Cleanup sweep evicts
 /// entries below current chain tip.
-/// Record that a child at `height` delivered by `peer_id` names `parent` — whether or not it linked.
-/// Both branches are recorded, so support for OUR tail is visible too and is what protects it.
-pub fn record_child_parent(height: u64, peer_id: &str, parent: [u8; 32]) {
-    if peer_id.is_empty() || peer_id == "self" || height == 0 { return; }
-    let per_height = CHILD_PARENT_WITNESSES.entry(height).or_insert_with(dashmap::DashMap::new);
-    per_height.entry(parent).or_insert_with(DashSet::new).insert(peer_id.to_string());
-}
-
-/// The parent a quorum-relevant set of DISTINCT peers named at `child_height`, when nobody named
-/// `ours`. At most f peers are Byzantine, so f+1 distinct naming the same parent means at least one
-/// honest node built on it; nobody naming ours means our block at child_height-1 is supported by no
-/// one. That, and only that, makes a tail removable without a certificate.
-pub fn unsupported_tail_parent(child_height: u64, ours: [u8; 32]) -> Option<([u8; 32], usize)> {
-    let n = {
-        let r = qnet_consensus::consensus_crypto::consensus_pk_registry_len();
-        if r >= 3 { r } else { 5 }
-    };
-    let need = (n.saturating_sub(1) / 3) + 1;                 // f+1: at least one honest witness
-    let per_height = CHILD_PARENT_WITNESSES.get(&child_height)?;
-    if per_height.get(&ours).map_or(false, |s| !s.is_empty()) { return None; }  // someone builds on ours
-    let mut best: Option<([u8; 32], usize)> = None;
-    for e in per_height.iter() {
-        let c = e.value().len();
-        if c >= need.max(2) && best.map_or(true, |(_, b)| c > b) { best = Some((*e.key(), c)); }
-    }
-    best
-}
-
 pub fn record_hash_chain_break_witness(height: u64, peer_id: &str) {
     if peer_id.is_empty() || peer_id == "self" {
         return;
@@ -666,6 +648,38 @@ pub fn record_hash_chain_break_witness(height: u64, peer_id: &str) {
             }
         }
     }
+}
+
+/// Heights where the slot's OWN authorised leader built on a different parent than the block we hold.
+/// Written only from a child whose producer signature and slot authority were verified, so an entry
+/// is evidence rather than a claim; read by the rollback floor and consumed when it acts. Bounded.
+static CONTRADICTED_TAILS: once_cell::sync::Lazy<dashmap::DashMap<u64, [u8; 32]>> =
+    once_cell::sync::Lazy::new(dashmap::DashMap::new);
+const CONTRADICTED_TAILS_MAX: usize = 256;
+
+/// Whether an authenticated child overrules the tail we hold. The child must name a different parent
+/// and carry a round no lower than ours: a straggler on an older round says nothing about the tail
+/// the rotation has since moved to.
+pub fn tail_is_contradicted(our_hash: [u8; 32], our_abs_round: u64, child_parent: [u8; 32], child_abs_round: u64) -> bool {
+    child_parent != our_hash && child_abs_round >= our_abs_round
+}
+
+pub fn note_contradicted_tail(height: u64, network_parent: [u8; 32]) {
+    CONTRADICTED_TAILS.insert(height, network_parent);
+    if CONTRADICTED_TAILS.len() > CONTRADICTED_TAILS_MAX {
+        let cut = height.saturating_sub(CONTRADICTED_TAILS_MAX as u64);
+        CONTRADICTED_TAILS.retain(|h, _| *h > cut);
+    }
+}
+
+pub fn contradicted_tail(height: u64) -> Option<[u8; 32]> {
+    CONTRADICTED_TAILS.get(&height).map(|v| *v)
+}
+
+/// Forget the evidence at `height`: the block there has been replaced, so a stale entry would
+/// otherwise send the replacement after it.
+pub fn clear_contradicted_tail(height: u64) {
+    CONTRADICTED_TAILS.remove(&height);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -746,31 +760,37 @@ pub fn cleanup_forked_peer_cooldown() {
 /// Periodic cleanup of stale witness entries below `min_height`.
 /// Called by unified_p2p cleanup tasks.
 #[cfg(test)]
-mod unsupported_tail_tests {
+mod contradicted_tail_tests {
     use super::*;
 
-    // A tail that f+1 distinct peers build past, and that none of them builds on, is not the chain's;
-    // one witness is not enough, a repeat from the same peer is one witness, and any peer still
-    // extending ours protects it.
+    // The leader of the next slot building elsewhere overrules our tail; the same leader building on
+    // ours, or a straggler on an older round, does not. The record is bounded and forgettable.
     #[test]
-    fn only_a_tail_nobody_extends_is_unsupported() {
+    fn only_a_newer_leader_on_another_parent_overrules_the_tail() {
         let ours = [1u8; 32];
         let theirs = [2u8; 32];
-        let h = 7_700_001u64;
-        record_child_parent(h, "p1", theirs);
-        record_child_parent(h, "p1", theirs);
-        assert_eq!(unsupported_tail_parent(h, ours), None, "one distinct witness is not f+1");
-        record_child_parent(h, "p2", theirs);
-        assert_eq!(unsupported_tail_parent(h, ours), Some((theirs, 2)));
-        record_child_parent(h, "p3", ours);
-        assert_eq!(unsupported_tail_parent(h, ours), None, "a peer still builds on ours");
-        assert_eq!(unsupported_tail_parent(h + 500, ours), None, "no witnesses at all");
+        assert!(tail_is_contradicted(ours, 3, theirs, 3), "same round, another parent");
+        assert!(tail_is_contradicted(ours, 3, theirs, 9), "a later round, another parent");
+        assert!(!tail_is_contradicted(ours, 3, theirs, 2), "an older round says nothing");
+        assert!(!tail_is_contradicted(ours, 3, ours, 9), "the leader built on ours");
+    }
+
+    #[test]
+    fn the_evidence_record_is_bounded_and_can_be_forgotten() {
+        let base = 9_900_000u64;
+        for i in 0..(CONTRADICTED_TAILS_MAX as u64 + 50) { note_contradicted_tail(base + i, [7u8; 32]); }
+        let top = base + CONTRADICTED_TAILS_MAX as u64 + 49;
+        assert_eq!(contradicted_tail(top), Some([7u8; 32]));
+        assert!(CONTRADICTED_TAILS.len() <= CONTRADICTED_TAILS_MAX + 1, "the record does not grow without bound");
+        clear_contradicted_tail(top);
+        assert_eq!(contradicted_tail(top), None, "a replaced block leaves no evidence behind");
+        CONTRADICTED_TAILS.retain(|h, _| *h < base);
     }
 }
 
+/// Evict break witnesses and recovery cooldowns below `min_height`.
 pub fn cleanup_break_tracker(min_height: u64) {
     HASH_CHAIN_BREAK_WITNESSES.retain(|h, _| *h >= min_height);
-    CHILD_PARENT_WITNESSES.retain(|h, _| *h >= min_height);
     FORK_RECOVERY_TRIGGER_TIMES.retain(|h, _| *h >= min_height);
 }
 
@@ -2423,7 +2443,6 @@ impl BlockPipeline {
                     }
                 };
 
-                record_child_parent(mb.height, &decoded.from_peer, mb.previous_hash);
                 if !prev_hash_ok {
                     if is_warn() {
                         println!("[WARN][PIPELINE] hash_chain_break h={} from={} block_round={}",
@@ -2431,24 +2450,38 @@ impl BlockPipeline {
                     }
                     metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
 
-                    // The chain is the tail the network extends. When f+1 distinct peers deliver a
-                    // child naming another parent and NONE of them builds on ours, our block at that
-                    // height is off the chain — whatever failover round it carries and with no
-                    // checkpoint needed. Above finality only, once per height per cooldown.
+                    // The chain is the tail its own leader extends. A child here that carries the
+                    // signature of the producer the rotation authorises for its slot, at a round no
+                    // lower than ours, and names another parent, proves our block below it is off the
+                    // chain — no certificate needed. Nothing is counted: relays are not builders, and
+                    // a peer id is not an identity, so the evidence is the child's own signature.
+                    // Above finality only, and never against a sealed checkpoint that names ours.
                     if let Some(ours) = our_parent {
                         let disputed = mb.height.saturating_sub(1);
                         let finalized = crate::node::LAST_FINALIZED_HEIGHT.load(Ordering::SeqCst);
-                        if disputed > finalized {
-                            if let Some((parent, w)) = unsupported_tail_parent(mb.height, ours) {
-                                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-                                    .map(|d| d.as_secs()).unwrap_or(0);
-                                let due = FORK_RECOVERY_TRIGGER_TIMES.get(&disputed)
-                                    .map(|t| now.saturating_sub(*t) >= FORK_RECOVERY_COOLDOWN_SECS).unwrap_or(true);
-                                if due {
+                        let child_abs = mb.timeout_round.saturating_add(mb.carried_baseline);
+                        let our_abs = storage.load_microblock_auto_format(disputed).ok().flatten()
+                            .map(|b| b.timeout_round.saturating_add(b.carried_baseline)).unwrap_or(0);
+                        let certified_keeps_ours = certified_micro_hash(&storage, disputed) == Some(ours);
+                        if disputed > finalized && !certified_keeps_ours
+                            && tail_is_contradicted(ours, our_abs, mb.previous_hash, child_abs)
+                            && child_is_authentic(&storage, &decoded).await
+                        {
+                            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs()).unwrap_or(0);
+                            let due = FORK_RECOVERY_TRIGGER_TIMES.get(&disputed)
+                                .map(|t| now.saturating_sub(*t) >= FORK_RECOVERY_COOLDOWN_SECS).unwrap_or(true);
+                            if due {
+                                note_contradicted_tail(disputed, mb.previous_hash);
+                                signal_fork_recovery(disputed.saturating_sub(1).max(finalized));
+                                // Stamped only when this detector moved the signal: a deeper pending
+                                // target must not be silenced behind a cooldown it did not set.
+                                if fork_recovery_target() == disputed.saturating_sub(1).max(finalized) {
                                     FORK_RECOVERY_TRIGGER_TIMES.insert(disputed, now);
-                                    signal_fork_recovery(disputed.saturating_sub(1).max(finalized));
-                                    println!("[WARN][FORK] unsupported_tail h={} witnesses={} network_parent={:x?} action=reorg_to_supported",
-                                             disputed, w, &parent[..8]);
+                                }
+                                if is_warn() {
+                                    println!("[WARN][FORK] leader_built_elsewhere h={} child_round={} our_round={} parent={:x?} action=reorg_to_the_leaders_tail",
+                                             disputed, child_abs, our_abs, &mb.previous_hash[..8]);
                                 }
                             }
                         }

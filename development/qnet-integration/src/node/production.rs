@@ -107,11 +107,10 @@ impl BlockchainNode {
                             .or_insert_with(|| crate::block_pipeline::certified_window_hashes(&storage, window_k))
                             .as_ref().and_then(|v| v.get((h - (window_k - 1) * 90 - 1) as usize).copied());
                         if certified.is_some() { return certified; }
-                        // No checkpoint for this height yet: the peers' own children decide. A tail
-                        // that f+1 distinct peers build past, and that none of them builds on, is off
-                        // the chain — its failover round vouches for nothing.
-                        let ours = storage.load_microblock_auto_format(h).ok().flatten().map(|b| b.hash())?;
-                        crate::block_pipeline::unsupported_tail_parent(h + 1, ours).map(|(p, _)| p)
+                        // No checkpoint for this height yet: the authenticated evidence decides. The
+                        // record is written only where the slot's own authorised leader built on a
+                        // different parent, so a round here vouches for nothing.
+                        crate::block_pipeline::contradicted_tail(h)
                     });
                     if protected > rollback_to {
                         println!("[WARN][FORK] rollback_floor_raised from={} to={} reason=certified_round_blocks",
@@ -147,6 +146,9 @@ impl BlockchainNode {
                                 for h in delete_from..=local_h {
                                     // Long loops must tick the watchdog, not just the phases.
                                     if h % 256 == 0 { crate::storage::note_rollback_progress(); }
+                                    // The evidence for this height has been acted on; a leftover entry
+                                    // would send its replacement after it.
+                                    crate::block_pipeline::clear_contradicted_tail(h);
                                     if let Err(e) = storage.delete_microblock(h) {
                                         if is_warn() {
                                             println!("[WARN][FORK] delete_fail h={} err={}", h, e);

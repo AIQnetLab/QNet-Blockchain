@@ -3,7 +3,7 @@ import * as assert from 'node:assert/strict';
 import { quoteBigInts, uintString, transformTransaction, batchRowsOf, shapeBlock, blockRowFromHeader, toMs, merkleRootOf } from '../transform';
 import { insertBatchTransfers, insertTransactions, insertBlocks, deltaOf, negate, mergeDelta } from '../sql';
 import { ranges, dedupeHeaders, flushGroups, FLUSH_BLOCKS, FLUSH_BATCH_ROWS } from '../chain';
-import { pickNetworkHeight, HEIGHT_SLACK } from '../node-client';
+import { pickNetworkHeight, reduceHeaderViews, HEIGHT_SLACK } from '../node-client';
 
 // A u64 amount above 2^53 survives the JSON hop exactly: quoted before parse, kept as a digit string.
 test('wide integers never pass through a double', () => {
@@ -162,4 +162,50 @@ test('block gas total never overflows its column', () => {
   ] });
   assert.equal(block.block.total_gas_used, '9'.repeat(30));
   assert.equal(block.block.total_gas_used.length, 30);
+});
+
+// The archive's trust rule: a height exists only with the hash a quorum names, and a body only when
+// enough endpoints name the same root that one of them must be honest.
+test('header views reduce to what the endpoints agree on', () => {
+  const H = 'a'.repeat(64), OTHER = 'b'.repeat(64), ROOT = 'c'.repeat(64), FAKE = 'd'.repeat(64);
+  const page = (items: any[], head = 100) => ({ from: 10, next: 11, head, items });
+  const view = (endpoint: string, items: any[], head = 100) => ({ endpoint, page: page(items, head) });
+
+  // Three of five name the hash and the body: it is a body.
+  const withBody = (h: string, root: string, tx: number) => ({ height: 10, hash: h, body: true, merkle_root: root, tx_count: tx, timestamp: 1_000, producer: 'p' });
+  let out = reduceHeaderViews([
+    view('e1', [withBody(H, ROOT, 2)]), view('e2', [withBody(H, ROOT, 2)]), view('e3', [withBody(H, ROOT, 2)]),
+    view('e4', [{ height: 10, hash: H, body: false }]), view('e5', [{ height: 10, hash: H, body: false }]),
+  ], 3, 3);
+  assert.equal(out.items.length, 1);
+  assert.equal(out.items[0].body, true);
+  assert.equal(out.items[0].merkle_root, ROOT);
+  assert.deepEqual(out.bodySources.get(10), ['e1', 'e2', 'e3']);
+
+  // One endpoint alone claims a body with its own root: the height is stored as a pruned identity.
+  out = reduceHeaderViews([
+    view('e1', [withBody(H, FAKE, 7)]),
+    view('e2', [{ height: 10, hash: H, body: false }]), view('e3', [{ height: 10, hash: H, body: false }]),
+    view('e4', [{ height: 10, hash: H, body: false }]), view('e5', [{ height: 10, hash: H, body: false }]),
+  ], 3, 3);
+  assert.equal(out.items[0].body, false, 'a minority body is not a body');
+  assert.equal(out.items[0].merkle_root, undefined);
+  assert.equal(out.bodySources.has(10), false, 'and nothing is fetched from that endpoint');
+
+  // No hash reaches the quorum: the height is not in the page at all.
+  out = reduceHeaderViews([
+    view('e1', [{ height: 10, hash: H, body: false }]), view('e2', [{ height: 10, hash: H, body: false }]),
+    view('e3', [{ height: 10, hash: OTHER, body: false }]), view('e4', [{ height: 10, hash: OTHER, body: false }]),
+  ], 3, 2);
+  assert.deepEqual(out.items, []);
+
+  // One endpoint repeating a height counts once, and the head is the quorum-th claim.
+  out = reduceHeaderViews([
+    view('e1', [{ height: 10, hash: H, body: false }, { height: 10, hash: OTHER, body: false }], 9_000_000),
+    view('e2', [{ height: 10, hash: H, body: false }], 100),
+    view('e3', [{ height: 10, hash: H, body: false }], 100),
+  ], 3, 2);
+  assert.equal(out.items.length, 1);
+  assert.equal(out.items[0].hash, H);
+  assert.equal(out.head, 100, 'a lone inflated head decides nothing');
 });

@@ -41,6 +41,7 @@ export interface TransferWindow { start: number; end: number; rows: NodeTransfer
 // Network half: the transfers for [fromHeight, toHeight] in node-sized windows. A window whose fetch
 // failed is left out, so the stored rows for it stay as they were.
 export async function fetchTokenTransfers(node: NodeClient, fromHeight: number, toHeight: number, pin?: string): Promise<TransferWindow[]> {
+  if (!pin) return [];   // no endpoint vouched for the bodies here; a window is not replaced blind
   const out: TransferWindow[] = [];
   if (!Number.isInteger(fromHeight) || !Number.isInteger(toHeight) || fromHeight < 0 || toHeight < fromHeight) return out;
   let total = 0;

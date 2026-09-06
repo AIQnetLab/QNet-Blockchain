@@ -151,7 +151,15 @@ export class Chain {
     if (ev.height <= this.head) {
       const s = (await this.storedLinks([ev.height])).get(ev.height);
       if (s && s.hash === ev.hash) return;                       // duplicate delivery
-      if (s && s.hash && s.hash !== ev.hash) { await this.repairContradictedRun(ev.height, `event hash differs at ${ev.height}`); return; }
+      if (s && s.hash && s.hash !== ev.hash) {
+        // One frame is one endpoint's claim. A single-height vote is five small requests; the repair
+        // walk is thousands, so the cheap evidence comes first.
+        const votes = await this.votesAt(ev.height);
+        const against = votes.filter(v => v.hash !== s.hash).length;
+        if (against >= this.node.quorum) await this.repairContradictedRun(ev.height, `a quorum names another block at ${ev.height}`);
+        else log.warn('INDEXER', 'event_hash_unconfirmed', { h: ev.height, against, votes: votes.length, endpoint: ev.endpoint });
+        return;
+      }
       if (!s) await this.recordGap(ev.height, ev.height);       // a hole announced itself
       return;
     }
@@ -204,8 +212,9 @@ export class Chain {
     // Only heights a quorum of endpoints names identically are here; the rest stay gaps.
     const items = page.items.filter(h => h.height >= a && h.height <= b);
     if (items.length === 0 && b <= page.head && page.endpoints >= this.node.quorum) {
-      // The endpoints answered and agreed on nothing: either they are on different chains, or every
-      // row here is unreadable. Persisting means the archive cannot advance and must say so.
+      // The endpoints answered about a range they say exists and agreed on nothing: they are on
+      // different chains, or every row here is unreadable. Said out loud after a long streak, and
+      // taken back the moment any page reduces again.
       this.emptyQuorumPages += 1;
       if (this.emptyQuorumPages >= 20 && !this.halted) {
         this.halted = `no quorum on any height in ${a}..${b}: endpoints=${page.endpoints} quorum=${this.node.quorum}`;
@@ -215,7 +224,11 @@ export class Chain {
       }
       return all();
     }
-    this.emptyQuorumPages = 0;
+    if (this.emptyQuorumPages > 0 || this.halted) {
+      if (this.halted) log.warn('INDEXER', 'halt_lifted', { was: this.halted, at: a });
+      this.emptyQuorumPages = 0;
+      this.halted = null;
+    }
     // Slot times are exact (genesis + height·1 s). A header that disagrees is a node fault, not a block.
     if (this.genesisTsMs > 0) {
       const off = items.find(i => i.body && toMs(i.timestamp) !== this.genesisTsMs + i.height * 1000);
@@ -284,8 +297,11 @@ export class Chain {
     if (!committed) { log.info('INDEXER', 'commit_dropped_epoch_changed', { a, b, source }); return all(); }
 
     if (full.length > 0) {
+      // From an endpoint that served a body here (its transactions matched the quorum's root), and an
+      // empty window is no information: replacing on it would erase transfers nobody contradicted.
       const hs = full.map(f => f.block.height);
-      const windows = await fetchTokenTransfers(this.node, Math.min(...hs), Math.max(...hs));
+      const src = page.bodySources.get(hs[0])?.find(e => this.node.isHealthy(e));
+      const windows = (await fetchTokenTransfers(this.node, Math.min(...hs), Math.max(...hs), src)).filter(w => w.rows.length > 0);
       if (windows.length > 0) await this.withWrite(async () => { if (this.epoch === epoch0) await replaceTokenTransfers(this.pool, windows); });
     }
     if (items.length > 0) await this.verifyNeighbours(items[0].height, items[items.length - 1].height);
@@ -350,26 +366,11 @@ export class Chain {
     return out.sort((x, y) => x.block.height - y.block.height);
   }
 
-  // A real hash is written only where none is stored, only when a quorum of endpoints names it, and
-  // never over a present real hash. The height→hash index outlives bodies, so every endpoint can vote.
+  // A real hash is written only where none is stored and never over a present one. Callers pass a hash
+  // from the quorum page, so the identity is already agreed and no second round of votes is needed
+  // (this runs under the write lock — network round-trips do not belong here).
   private async fixHash(height: number, hash: string): Promise<void> {
-    if (!await this.identityAgreed(height, hash)) return;
     await this.pool.query(`UPDATE blocks SET hash = $2 WHERE height = $1 AND (hash IS NULL OR hash !~ '^[0-9a-f]{64}$')`, [height, hash]);
-  }
-
-  // Whether a quorum of endpoints names this exact hash at this height.
-  private async identityAgreed(height: number, hash: string | null | undefined): Promise<boolean> {
-    if (!isHex64(hash)) return false;
-    try {
-      const votes = await this.votesAt(height);
-      const agree = votes.filter(v => v.hash === hash).length;
-      if (agree >= this.node.quorum) return true;
-      log.warn('INDEXER', 'identity_unconfirmed', { h: height, agree, votes: votes.length, quorum: this.node.quorum });
-      return false;
-    } catch (e) {
-      log.warn('INDEXER', 'identity_vote_failed', { h: height, err: errText(e) });
-      return false;
-    }
   }
 
   // Delete [lo, hi] and queue it for a refill. The range is owed from before the delete, so a failed

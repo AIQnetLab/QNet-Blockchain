@@ -1938,8 +1938,10 @@ pub fn round_protected_floor(rollback_to: u64, local_h: u64, load_block: impl Fn
     for h in (rollback_to + 1)..=local_h.min(rollback_to.saturating_add(2 * mi)) {
         let (r, ours) = match load_block(h) { Some(b) => b, None => continue };
         // The network names another block here: this height and everything above it descend from a
-        // branch that is not the chain's. Keep what is below, take the rest.
-        if network_hash(h).map_or(false, |c| c != ours) { floor = h.saturating_sub(1).max(rollback_to); break; }
+        // branch that is not the chain's. The walk stops, leaving the floor at the last height the
+        // network positively vouched for — raising it here would protect blocks nothing vouches for
+        // and leave the real divergence point un-rolled.
+        if network_hash(h).map_or(false, |c| c != ours) { break; }
         let certified = certified_round_for_slot(h);
         if certified == 0 || r == 0 || r > certified { continue; }
         if superseded_by_certified_round(h, r, Some(ours)).is_none() { floor = h; }
@@ -6057,9 +6059,9 @@ mod superseded_tail_tests {
         assert_eq!(round_protected_floor(base + 2, base + 20, round1, |h| if h == base + 20 { Some(other) } else { None }), base + 19,
                    "a block the network names differently is not protected by its round");
         assert_eq!(round_protected_floor(base + 2, base + 20, round1, |h| if h == base + 10 { Some(other) } else { None }), base + 9,
-                   "everything above a contradicted block descends from it: the floor stops just below it");
-        assert_eq!(round_protected_floor(base + 2, base + 20, round1, |h| if h >= base + 6 { Some(other) } else { Some(ours) }), base + 5,
-                   "a whole tail the network rejects leaves only what is under it");
+                   "the last height vouched for below the contradicted one is the floor");
+        assert_eq!(round_protected_floor(base + 2, base + 20, round1, |h| if h >= base + 6 { Some(other) } else { Some(ours) }), base + 2,
+                   "a whole tail the network rejects leaves nothing protected above the walk's start");
         certify(w, 2, &[base + 12, base + 12, base + 11]);
         assert_eq!(round_protected_floor(base + 2, base + 20, round1, unsealed), base + 12,
                    "round-1 blocks above the round-2 quorum tip are not vouched for");

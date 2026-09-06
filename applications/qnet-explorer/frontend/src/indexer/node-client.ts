@@ -123,6 +123,9 @@ export class NodeClient {
   get allEndpoints(): string[] { return [...this.endpoints]; }
   get quorum(): number { return Math.floor(this.endpoints.length / 2) + 1; }
   get admittedCount(): number { return this.admitted().length; }
+  // The smallest number of agreeing endpoints that must include an honest one: at most
+  // endpoints − quorum of them can be wrong, so one more than that is enough to believe a value.
+  get honestOne(): number { return Math.max(1, this.endpoints.length - this.quorum + 1); }
   get networkHeight(): number { return this.maxSeen; }
   get agreedHeight(): number { return this.agreed; }
 
@@ -170,6 +173,11 @@ export class NodeClient {
   forgetAgreedHeight(): void { this.agreed = 0; this.maxSeen = 0; }
 
   quarantine(endpoint: string, ms: number, why: string): void {
+    if (this.admitted().length - 1 < this.quorum) {
+      log.warn('NODE', 'quarantine_refused', { endpoint, why, admitted: this.admitted().length, quorum: this.quorum });
+      this.markFailed(endpoint, why);   // a short cooldown instead: the set must stay decidable
+      return;
+    }
     this.quarantinedUntil.set(endpoint, Date.now() + ms);
     log.err('NODE', 'endpoint_quarantined', { endpoint, ms, why });
     if (this.wsEndpoint === endpoint && this.wsSocket) { try { this.wsSocket.terminate(); } catch { /* closing */ } }
@@ -256,62 +264,14 @@ export class NodeClient {
     return out;
   }
 
-  // Headers [from, from+limit) from every admitted endpoint, reduced per height to the hash a quorum
-  // names and, among the endpoints naming it, the block fields they agree on. Nothing else can enter
-  // the archive: one endpoint cannot invent a height, an identity, or a transaction root.
+  // Headers [from, from+limit) from every admitted endpoint, reduced to what a quorum names.
   async getQuorumHeaders(from: number, limit: number): Promise<QuorumHeaders> {
     const views = await this.getHeadersFromAll(from, limit);
-    const byHeight = new Map<number, Map<string, string[]>>();          // height -> hash -> endpoints
-    const detail = new Map<string, NodeHeader[]>();                     // `${height}:${hash}` -> headers
-    const bodySources = new Map<number, string[]>();
-    let head = 0;
-    for (const v of views) {
-      head = Math.max(head, Number(v.page.head) || 0);
-      const seen = new Set<number>();
-      for (const it of v.page.items) {
-        if (it.error || !Number.isSafeInteger(it.height) || seen.has(it.height)) continue;
-        seen.add(it.height);
-        if (!/^[0-9a-f]{64}$/.test(it.hash || '')) continue;
-        const perHash = byHeight.get(it.height) ?? new Map<string, string[]>();
-        (perHash.get(it.hash as string) ?? perHash.set(it.hash as string, []).get(it.hash as string)!).push(v.endpoint);
-        byHeight.set(it.height, perHash);
-        const key = `${it.height}:${it.hash}`;
-        (detail.get(key) ?? detail.set(key, []).get(key)!).push(it);
-        if (it.body) (bodySources.get(it.height) ?? bodySources.set(it.height, []).get(it.height)!).push(v.endpoint);
-      }
-    }
-    const q = this.quorum;
-    const items: NodeHeader[] = [];
-    for (const [height, perHash] of byHeight) {
-      const agreed = [...perHash.entries()].find(([, eps]) => eps.length >= q);
-      if (!agreed) { bodySources.delete(height); continue; }
-      const [hash] = agreed;
-      const headers = detail.get(`${height}:${hash}`) ?? [];
-      // Fields the identity does not carry are taken from the value most of those endpoints report.
-      const pick = <T>(get: (h: NodeHeader) => T | undefined): T | undefined => {
-        const tal = new Map<string, { v: T; n: number }>();
-        for (const h of headers) {
-          const v = get(h);
-          if (v === undefined || v === null) continue;
-          const k = String(v);
-          const e = tal.get(k) ?? { v, n: 0 };
-          e.n += 1; tal.set(k, e);
-        }
-        return [...tal.values()].sort((a, b) => b.n - a.n)[0]?.v;
-      };
-      const withBody = headers.filter(h => h.body);
-      items.push({
-        height, hash, body: withBody.length > 0,
-        merkle_root: pick(h => (h.body ? h.merkle_root : undefined)),
-        tx_count: pick(h => (h.body ? h.tx_count : undefined)),
-        producer: pick(h => (h.body ? h.producer : undefined)),
-        previous_hash: pick(h => h.previous_hash),
-        timestamp: pick(h => (h.body ? h.timestamp : undefined)),
-      });
-    }
-    items.sort((a, b) => a.height - b.height);
-    if (head > 0) this.noteHeight(head);
-    return { items, bodySources, head, endpoints: views.length, quorum: q };
+    const out = reduceHeaderViews(views, this.quorum, this.honestOne);
+    if (out.head > 0) this.noteHeight(out.head);
+    const bodyless = out.items.filter(i => !i.body).length;
+    if (bodyless > 0 && limit > 1) log.info('NODE', 'headers_without_body', { from, count: bodyless, need: this.honestOne });
+    return out;
   }
 
   async getBlock(height: number, pin?: string): Promise<NodeBlock | null> {
@@ -428,6 +388,69 @@ export class NodeClient {
       if (this.wsSocket) { try { this.wsSocket.close(); } catch { /* closing */ } }
     };
   }
+}
+
+// One header page per endpoint, reduced to what the endpoints agree on:
+//  • a height exists with the hash at least `quorum` of them name;
+//  • a field the hash does not carry (merkle root, transaction count, producer, time) is taken only
+//    when at least `honestOne` of those endpoints name the same value — the smallest agreement that
+//    must contain an honest endpoint. A body fewer than that claim is a pruned row: its transactions
+//    would rest on a minority's word.
+//  • the page head is the quorum-th highest claim, so one endpoint cannot invent a range.
+export function reduceHeaderViews(
+  views: Array<{ endpoint: string; page: HeadersPage }>, quorum: number, honestOne: number,
+): QuorumHeaders {
+  const byHeight = new Map<number, Map<string, Set<string>>>();
+  const detail = new Map<string, NodeHeader[]>();
+  const bodySources = new Map<number, string[]>();
+  const head = Math.max(0, pickNetworkHeight(views.map(v => Number(v.page.head)), quorum));
+  for (const v of views) {
+    const seen = new Set<number>();
+    for (const it of v.page.items) {
+      if (it.error || !Number.isSafeInteger(it.height) || seen.has(it.height)) continue;
+      seen.add(it.height);
+      if (!/^[0-9a-f]{64}$/.test(it.hash || '')) continue;
+      const perHash = byHeight.get(it.height) ?? new Map<string, Set<string>>();
+      (perHash.get(it.hash as string) ?? perHash.set(it.hash as string, new Set()).get(it.hash as string)!).add(v.endpoint);
+      byHeight.set(it.height, perHash);
+      const key = `${it.height}:${it.hash}`;
+      (detail.get(key) ?? detail.set(key, []).get(key)!).push(it);
+      if (it.body) (bodySources.get(it.height) ?? bodySources.set(it.height, []).get(it.height)!).push(v.endpoint);
+    }
+  }
+  const items: NodeHeader[] = [];
+  for (const [height, perHash] of byHeight) {
+    const agreed = [...perHash.entries()].find(([, eps]) => eps.size >= quorum);
+    if (!agreed) { bodySources.delete(height); continue; }
+    const [hash] = agreed;
+    const headers = detail.get(`${height}:${hash}`) ?? [];
+    const pick = <T>(get: (h: NodeHeader) => T | undefined): T | undefined => {
+      const tal = new Map<string, { v: T; n: number }>();
+      for (const h of headers) {
+        const v = get(h);
+        if (v === undefined || v === null) continue;
+        const k = String(v);
+        const e = tal.get(k) ?? { v, n: 0 };
+        e.n += 1; tal.set(k, e);
+      }
+      const best = [...tal.values()].sort((a, b) => b.n - a.n)[0];
+      return best && best.n >= honestOne ? best.v : undefined;
+    };
+    const root = pick(h => (h.body ? h.merkle_root : undefined));
+    const count = pick(h => (h.body ? h.tx_count : undefined));
+    const hasBody = headers.filter(h => h.body).length >= honestOne && root !== undefined && count !== undefined;
+    if (!hasBody) bodySources.delete(height);
+    items.push({
+      height, hash, body: hasBody,
+      merkle_root: hasBody ? root : undefined,
+      tx_count: hasBody ? count : undefined,
+      producer: hasBody ? pick(h => (h.body ? h.producer : undefined)) : undefined,
+      previous_hash: pick(h => h.previous_hash),
+      timestamp: hasBody ? pick(h => (h.body ? h.timestamp : undefined)) : undefined,
+    });
+  }
+  items.sort((a, b) => a.height - b.height);
+  return { items, bodySources, head, endpoints: views.length, quorum };
 }
 
 export class NotFoundError extends Error {}

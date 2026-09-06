@@ -2,6 +2,33 @@
 
 use super::*;
 
+/// The height an operator asked the node to trim back to: a real height strictly below the tip, and
+/// never genesis (which would delete the chain). Anything else is ignored and logged.
+pub(crate) fn trim_target(raw: &str, tip: u64) -> Option<u64> {
+    let target = raw.trim().parse::<u64>().ok()?;
+    if target == 0 || target >= tip { return None; }
+    Some(target)
+}
+
+#[cfg(test)]
+mod trim_tests {
+    use super::trim_target;
+
+    // The lever deletes history, so it acts only on an unambiguous height below the tip.
+    #[test]
+    fn the_trim_target_is_a_height_below_the_tip() {
+        assert_eq!(trim_target("540810", 540870), Some(540810));
+        assert_eq!(trim_target(" 540810 ", 540870), Some(540810));
+        assert_eq!(trim_target("540870", 540870), None, "not below the tip");
+        assert_eq!(trim_target("540900", 540870), None, "above the tip");
+        assert_eq!(trim_target("0", 540870), None, "genesis is not a trim target");
+        assert_eq!(trim_target("", 540870), None);
+        assert_eq!(trim_target("latest", 540870), None);
+        assert_eq!(trim_target("-5", 540870), None);
+        assert_eq!(trim_target("540810", 0), None, "nothing stored yet");
+    }
+}
+
 impl BlockchainNode {
     /// Create a new blockchain node with default settings (backward compatibility)
     pub async fn new(data_dir: &str, p2p_port: u16, bootstrap_peers: Vec<String>) -> Result<Self, QNetError> {
@@ -319,6 +346,26 @@ impl BlockchainNode {
                     }
                 }
                 
+                // Operator lever for a fleet that forked with no branch holding a quorum: trim the
+                // chain back to a height every node agrees on and rejoin from there. Consensus cannot
+                // resolve that state by itself — no branch can be certified — and the node's own
+                // recovery paths deliberately never delete history a peer still builds on. Runs before
+                // the state replay below, so the replay rebuilds state at the new tip. One-shot: the
+                // variable must be removed before the next start, or the node trims again.
+                if let Ok(v) = std::env::var("QNET_TRIM_TO_HEIGHT") {
+                    let tip = storage_arc.get_chain_height().unwrap_or(0);
+                    match trim_target(&v, tip) {
+                        Some(target) => match storage_arc.delete_microblocks_range(target + 1, tip) {
+                            Ok(n) => {
+                                let _ = storage_arc.set_chain_height(target);
+                                println!("[WARN][NODE] operator_trim target={} was={} deleted={} — rejoining from the network", target, tip, n);
+                            }
+                            Err(e) => println!("[ERR][NODE] operator_trim_failed target={} err={}", target, e),
+                        },
+                        None => println!("[WARN][NODE] trim_ignored value={} tip={}", v.trim(), tip),
+                    }
+                }
+
                 // v10.2: HASH INDEX MIGRATION — build O(1) prev_hash lookup index.
                 // Enables prev_hash validation without loading full block body.
                 // Migration is idempotent (flag in metadata CF) and runs once.
