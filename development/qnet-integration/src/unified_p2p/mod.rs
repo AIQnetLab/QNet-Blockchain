@@ -1886,12 +1886,26 @@ fn slot_windows(h: u64) -> (u64, u64) {
     (h / mi, tenure_start / mi)
 }
 
+/// The tip a certificate's voters vouch for: the (f+1)-th highest claim, with f taken for the largest
+/// committee the vote count can be a quorum of (n − ⌊(n−1)/3⌋ ≤ votes ⇒ n ≤ (3·votes−1)/2). That f is
+/// never below the real one, so ≤f inflated claims cannot lift it, and it stays below the honest count,
+/// so honest claims cannot be pushed under it.
+pub fn certified_quorum_tip(tips: &mut Vec<u64>) -> Option<u64> {
+    if tips.is_empty() { return None; }
+    tips.sort_unstable_by(|a, b| b.cmp(a));
+    let n_max = (3 * tips.len() - 1) / 2;
+    let f = (n_max - 1) / 3;
+    Some(tips[f.min(tips.len() - 1)])
+}
+
 /// A block at `h` carrying failover round `block_round` is not vouched for by any certificate this
-/// node holds when a higher round of its slot was certified from tips all below `h`. That is NOT proof
-/// it is off the chain - the higher-round leader may have adopted it and built on it - so this only
+/// node holds when a higher round of its slot was certified from tips below `h`. A voter whose signed
+/// tip stands AT `h` under another hash held another block there and counts as below; the quorum tip
+/// is `certified_quorum_tip`, so no ≤f voters can vouch for everything. That is NOT proof the block
+/// is off the chain - the higher-round leader may have adopted it and built on it - so this only
 /// withholds the descent's protection; the chain itself is settled by a competing block at the same
 /// height or a hash-chain break from the certified leader. Returns (certified round, quorum tip).
-pub fn superseded_by_certified_round(h: u64, block_round: u64) -> Option<(u64, u64)> {
+pub fn superseded_by_certified_round(h: u64, block_round: u64, our_hash: Option<[u8; 32]>) -> Option<(u64, u64)> {
     let certified = certified_round_for_slot(h);
     if block_round >= certified { return None; }
     let (w, w0) = slot_windows(h);
@@ -1899,8 +1913,13 @@ pub fn superseded_by_certified_round(h: u64, block_round: u64) -> Option<(u64, u
         let tc = TIMEOUT_CERTIFICATES.get(&(w, r))
             .or_else(|| if w0 != w { TIMEOUT_CERTIFICATES.get(&(w0, r)) } else { None });
         if let Some(tc) = tc {
-            let quorum_tip = tc.votes.iter().map(|v| v.tip_height).max().unwrap_or(0);
-            if h > quorum_tip { return Some((r, quorum_tip)); }
+            let mut tips: Vec<u64> = tc.votes.iter().map(|v| match our_hash {
+                Some(ours) if v.tip_height == h && v.tip_hash != [0u8; 32] && v.tip_hash != ours => h.saturating_sub(1),
+                _ => v.tip_height,
+            }).collect();
+            if let Some(quorum_tip) = certified_quorum_tip(&mut tips) {
+                if h > quorum_tip { return Some((r, quorum_tip)); }
+            }
         }
     }
     None
@@ -1908,15 +1927,19 @@ pub fn superseded_by_certified_round(h: u64, block_round: u64) -> Option<(u64, u
 
 /// The highest height in (rollback_to, local_h] holding a block produced under a certified failover
 /// round that no higher certificate has superseded; a heuristic rollback keeps it and everything
-/// under it. Bounded to two windows above `rollback_to`.
-pub fn round_protected_floor(rollback_to: u64, local_h: u64, load_round: impl Fn(u64) -> Option<u64>) -> u64 {
+/// under it. Bounded to two windows above `rollback_to`. `load_block(h)` is the stored block's
+/// (absolute round, hash); `certified_hash(h)` the body the n−f-QC'd window names there. A block the
+/// checkpoint names differently is off the chain whatever its round says, and so is everything above
+/// it: the walk stops there (protecting such a block wedged 004 on its own losing tip at 531136).
+pub fn round_protected_floor(rollback_to: u64, local_h: u64, load_block: impl Fn(u64) -> Option<(u64, [u8; 32])>, certified_hash: impl Fn(u64) -> Option<[u8; 32]>) -> u64 {
     let mi = qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
     let mut floor = rollback_to;
     for h in (rollback_to + 1)..=local_h.min(rollback_to.saturating_add(2 * mi)) {
+        let (r, ours) = match load_block(h) { Some(b) => b, None => continue };
+        if certified_hash(h).map_or(false, |c| c != ours) { break; }
         let certified = certified_round_for_slot(h);
-        if certified == 0 { continue; }
-        let r = match load_round(h) { Some(r) if r > 0 && r <= certified => r, _ => continue };
-        if superseded_by_certified_round(h, r).is_none() { floor = h; }
+        if certified == 0 || r == 0 || r > certified { continue; }
+        if superseded_by_certified_round(h, r, Some(ours)).is_none() { floor = h; }
     }
     floor
 }
@@ -3845,10 +3868,9 @@ pub enum NetworkMessage {
     ///   2. Receivers verify the observer's ML-DSA-65 signature against
     ///      the consensus PK registry and aggregate distinct observers
     ///      per `(height, source)` tuple.
-    ///   3. When 2f+1 distinct observers report the same `(height, source)`,
-    ///      the receiver raises `FORK_RECOVERY_HEIGHT = height - 1`. The
-    ///      same destructive-rollback path used by macroblock fork recovery
-    ///      then deletes the forked tip and resyncs from canonical peers.
+    ///   3. Receivers only mark the source as a fork source (peer cooldown);
+    ///      no rollback follows from rejections alone — the chain is settled
+    ///      by certified rounds, checkpoint content and hash-chain breaks.
     ///
     /// Safety: rollback fires only on cryptographic supermajority. A
     /// Byzantine source that splits the network cannot trigger rollback
@@ -5949,18 +5971,22 @@ mod tests_failover_slot_key {
 mod superseded_tail_tests {
     use super::*;
 
-    fn tc(w: u64, round: u64, tips: &[u64]) -> TimeoutProof {
+    fn tc_with(w: u64, round: u64, tips: &[(u64, [u8; 32])]) -> TimeoutProof {
         TimeoutProof {
             height: w, timeout_round: round, anchor: [0u8; 32],
-            votes: tips.iter().enumerate().map(|(i, t)| SignedTimeoutVote {
+            votes: tips.iter().enumerate().map(|(i, (t, th))| SignedTimeoutVote {
                 voter_id: format!("v{}", i), signature: Vec::new(), high_qc_idx: 0, high_qc_hash: [0u8; 32],
-                tip_height: *t, tip_hash: [0u8; 32],
+                tip_height: *t, tip_hash: *th,
             }).collect(),
         }
     }
-    fn certify(w: u64, round: u64, tips: &[u64]) {
-        TIMEOUT_CERTIFICATES.insert((w, round), tc(w, round, tips));
+    fn certify_with(w: u64, round: u64, tips: &[(u64, [u8; 32])]) {
+        TIMEOUT_CERTIFICATES.insert((w, round), tc_with(w, round, tips));
         HIGHEST_CERTIFIED_ROUND.entry(w).and_modify(|c| { if round > *c { *c = round; } }).or_insert(round);
+    }
+    fn certify(w: u64, round: u64, tips: &[u64]) {
+        let v: Vec<(u64, [u8; 32])> = tips.iter().map(|t| (*t, [0u8; 32])).collect();
+        certify_with(w, round, &v);
     }
 
     // A round-1 certificate whose voters stood at +10 vouches for nothing round-0 above +10 and for
@@ -5971,9 +5997,44 @@ mod superseded_tail_tests {
         let w = 9_300_010u64;
         let base = w * 90;
         certify(w, 1, &[base + 10, base + 10, base + 9]);
-        assert_eq!(superseded_by_certified_round(base + 11, 0), Some((1, base + 10)), "round 0 above the quorum tip");
-        assert_eq!(superseded_by_certified_round(base + 10, 0), None, "at the quorum tip: the voters had it");
-        assert_eq!(superseded_by_certified_round(base + 11, 1), None, "the round the certificate elected");
+        assert_eq!(superseded_by_certified_round(base + 11, 0, None), Some((1, base + 10)), "round 0 above the quorum tip");
+        assert_eq!(superseded_by_certified_round(base + 10, 0, None), None, "at the quorum tip: the voters had it");
+        assert_eq!(superseded_by_certified_round(base + 11, 1, None), None, "the round the certificate elected");
+    }
+
+    // A voter standing at h under another hash held another block there; one inflated tip among
+    // four votes does not vouch for the heights above the other three.
+    #[test]
+    fn a_tip_under_another_hash_and_a_lone_high_claim_vouch_for_nothing() {
+        let _g = TEST_FAILOVER_STATE_LOCK.lock();
+        let w = 9_300_030u64;
+        let base = w * 90;
+        let theirs = [7u8; 32];
+        let ours = [9u8; 32];
+        certify_with(w, 1, &[(base + 10, theirs), (base + 10, theirs), (base + 9, theirs)]);
+        assert_eq!(superseded_by_certified_round(base + 10, 0, Some(ours)), Some((1, base + 9)),
+                   "the voters stood at h with a different block: ours is not vouched for");
+        assert_eq!(superseded_by_certified_round(base + 10, 0, Some(theirs)), None,
+                   "the voters stood at h with this very block");
+        certify_with(w + 1, 1, &[((w + 1) * 90 + 40, theirs), ((w + 1) * 90 + 10, theirs), ((w + 1) * 90 + 10, theirs), ((w + 1) * 90 + 10, theirs)]);
+        assert_eq!(superseded_by_certified_round((w + 1) * 90 + 11, 0, None), Some((1, (w + 1) * 90 + 10)),
+                   "the quorum tip is the (f+1)-th highest claim, not the single highest");
+    }
+
+    // f follows the largest committee the vote count can be a quorum of: 4 votes ⇒ n=5, f=1;
+    // 667 ⇒ n=1000, f=333; 3 ⇒ n=4, f=1. The claim at index f is honest for any ≤f liars.
+    #[test]
+    fn the_quorum_tip_is_immune_to_f_inflated_claims() {
+        let honest = |n: usize, lie: usize, high: u64, low: u64| -> Option<u64> {
+            let mut tips: Vec<u64> = (0..n).map(|i| if i < lie { high } else { low }).collect();
+            certified_quorum_tip(&mut tips)
+        };
+        assert_eq!(honest(4, 1, 900, 100), Some(100));
+        assert_eq!(honest(667, 333, 900, 100), Some(100));
+        assert_eq!(honest(667, 334, 900, 100), Some(900), "more than f liars is outside the model");
+        assert_eq!(honest(3, 1, 900, 100), Some(100));
+        assert_eq!(honest(5, 0, 900, 100), Some(100), "an honest spread never reads above the honest claims");
+        assert_eq!(certified_quorum_tip(&mut Vec::new()), None);
     }
 
     // The descent keeps certified-round blocks and everything under them, but not the ones a higher
@@ -5984,13 +6045,22 @@ mod superseded_tail_tests {
         let w = 9_300_020u64;
         let base = w * 90;
         certify(w, 1, &[base + 5, base + 5, base + 5]);
-        let round1 = |h: u64| -> Option<u64> { if h > base + 5 { Some(1) } else { Some(0) } };
-        assert_eq!(round_protected_floor(base + 2, base + 20, round1), base + 20,
+        let ours = [9u8; 32];
+        let other = [7u8; 32];
+        let round1 = |h: u64| -> Option<(u64, [u8; 32])> { Some((if h > base + 5 { 1 } else { 0 }, ours)) };
+        let unsealed = |_: u64| -> Option<[u8; 32]> { None };
+        assert_eq!(round_protected_floor(base + 2, base + 20, round1, unsealed), base + 20,
                    "every round-1 block is protected while round 1 is the highest certified");
+        assert_eq!(round_protected_floor(base + 2, base + 20, round1, |h| if h == base + 20 { Some(other) } else { None }), base + 19,
+                   "a block the certified checkpoint names differently is not protected by its round");
+        assert_eq!(round_protected_floor(base + 2, base + 20, round1, |h| if h == base + 10 { Some(other) } else { None }), base + 9,
+                   "everything above a rejected block descends from it: the floor stops below it");
+        assert_eq!(round_protected_floor(base + 2, base + 20, round1, |h| if h >= base + 6 { Some(other) } else { Some(ours) }), base + 2,
+                   "a whole tail the checkpoint rejects leaves nothing to protect");
         certify(w, 2, &[base + 12, base + 12, base + 11]);
-        assert_eq!(round_protected_floor(base + 2, base + 20, round1), base + 12,
+        assert_eq!(round_protected_floor(base + 2, base + 20, round1, unsealed), base + 12,
                    "round-1 blocks above the round-2 quorum tip are not vouched for");
-        assert_eq!(round_protected_floor(base + 2, base + 20, |_| Some(3)), base + 2,
+        assert_eq!(round_protected_floor(base + 2, base + 20, |_| Some((3, ours)), unsealed), base + 2,
                    "a round above what this node certified vouches for nothing");
     }
 }

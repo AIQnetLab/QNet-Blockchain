@@ -89,11 +89,23 @@ impl BlockchainNode {
                         .load(std::sync::atomic::Ordering::Acquire).saturating_mul(90);
                     let rollback_to = fork_h.max(anchor_floor);
                     // Blocks produced under a certified failover round stay: only a higher certified
-                    // round can supersede them, never this heuristic. The round-1 leader once rolled
-                    // its own certified chain back to adopt a round-0 branch it could not verify.
+                    // round, or the QC'd checkpoint naming a different body at that height, can
+                    // supersede them, never this heuristic. The round-1 leader once rolled its own
+                    // certified chain back to adopt a round-0 branch it could not verify.
+                    let windows: std::cell::RefCell<std::collections::HashMap<u64, Option<Vec<[u8; 32]>>>> = Default::default();
+                    // An unreadable body is never the certified one and vouches for nothing: round 0, zero hash.
                     let protected = crate::unified_p2p::round_protected_floor(rollback_to, local_h, |h| {
-                        storage.load_microblock_auto_format(h).ok().flatten()
-                            .map(|b| b.timeout_round.saturating_add(b.carried_baseline))
+                        match storage.load_microblock_auto_format(h) {
+                            Ok(Some(b)) => Some((b.timeout_round.saturating_add(b.carried_baseline), b.hash())),
+                            Ok(None) => None,
+                            Err(_) => Some((0, [0u8; 32])),
+                        }
+                    }, |h| {
+                        if h == 0 { return None; }
+                        let window_k = (h - 1) / 90 + 1;
+                        windows.borrow_mut().entry(window_k)
+                            .or_insert_with(|| crate::block_pipeline::certified_window_hashes(&storage, window_k))
+                            .as_ref().and_then(|v| v.get((h - (window_k - 1) * 90 - 1) as usize).copied())
                     });
                     if protected > rollback_to {
                         println!("[WARN][FORK] rollback_floor_raised from={} to={} reason=certified_round_blocks",

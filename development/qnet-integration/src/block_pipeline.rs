@@ -366,6 +366,22 @@ fn equal_round_selffork_supersedes(storage: &Storage, incoming: &qnet_state::Mic
 /// Byzantine cannot forge a TC); height must be above finality; per-height cooldown
 /// bounds re-triggers; the resync re-verifies every block. One bounded decode, only
 /// for stored heights above finality.
+/// The body hashes the n−f-QC'd macroblock `window_k` names, when it is stored (stored ⇒ verified).
+pub fn certified_window_hashes(storage: &Storage, window_k: u64) -> Option<Vec<[u8; 32]>> {
+    storage.get_macroblock_by_height(window_k).ok().flatten()
+        .and_then(crate::node::BlockchainNode::macroblock_plaintext)
+        .and_then(|b| bincode::deserialize::<qnet_state::MacroBlock>(&b).ok())
+        .map(|mb| mb.micro_blocks)
+}
+
+/// The body hash the certified window names at h.
+pub fn certified_micro_hash(storage: &Storage, h: u64) -> Option<[u8; 32]> {
+    if h == 0 { return None; }
+    let window_k = (h - 1) / 90 + 1;
+    let start = (window_k - 1) * 90 + 1;
+    certified_window_hashes(storage, window_k).and_then(|v| v.get((h - start) as usize).copied())
+}
+
 fn maybe_supersede_by_certified_round(storage: &Arc<Storage>, block: &IngestBlock, p2p: Option<&SimplifiedP2P>) {
     let h = block.height;
     if h == 0 { return; }
@@ -434,12 +450,7 @@ fn maybe_supersede_by_certified_round(storage: &Arc<Storage>, block: &IngestBloc
     //     round heuristic below reorgs us onto the checkpoint-REJECTED higher-round sibling, and an adversary
     //     re-gossiping that sibling holds our finality at h forever.
     //   * the COMPETITOR holds the certified body, we do NOT    => adopt unconditionally (content_wins).
-    let certified_hash = {
-        let window_k = (h - 1) / 90 + 1;
-        storage.get_macroblock_by_height(window_k).ok().flatten()
-            .and_then(|b| bincode::deserialize::<qnet_state::MacroBlock>(&b).ok())
-            .and_then(|mb| { let start = (window_k - 1) * 90 + 1; mb.micro_blocks.get((h - start) as usize).copied() })
-    };
+    let certified_hash = certified_micro_hash(storage, h);
     if let Some(c) = certified_hash {
         if our_hash == c && incoming.hash() != c { return; } // keep the certified body — content dominates round
     }
