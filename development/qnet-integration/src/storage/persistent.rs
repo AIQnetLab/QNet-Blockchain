@@ -1305,14 +1305,34 @@ impl PersistentStorage {
     /// reboots at the CERTIFIED frontier, so a reboot between certification and seal can no longer
     /// split the committee across windows. Async write: a lost pair is re-fetched, never a fault.
     pub fn record_certified_pair(&self, index: u64, bytes: &[u8]) -> IntegrationResult<()> {
+        self.record_certified_pair_at(index, 0, bytes)
+    }
+
+    /// Same, with the checkpoint's window head (0 = unknown). Retention is by index distance, but
+    /// a pair whose head is above the seal frontier survives it: it is what re-seals a boundary
+    /// whose commit lands late, and a run of re-certifications advances the index far faster than
+    /// the seals.
+    pub fn record_certified_pair_at(&self, index: u64, head: u64, bytes: &[u8]) -> IntegrationResult<()> {
         let cf = self.db.cf_handle("metadata")
             .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
         self.db.put_cf(&cf, super::certified_pair_key(index), bytes)?;
+        if head > 0 {
+            self.db.put_cf(&cf, super::certified_pair_head_key(index), head.to_le_bytes())?;
+        }
         let floor = index.saturating_sub(qnet_consensus::checkpoint_bft::CONSENSUS_STATE_RETAIN);
         if floor > 0 {
+            let sealed_head = self.last_sealed_mb_index()
+                .saturating_mul(qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL);
             let mut batch = WriteBatch::default();
             for (k, _) in self.iter_certified_pairs(&cf)? {
-                if k < floor { batch.delete_cf(&cf, super::certified_pair_key(k)); }
+                if k >= floor { continue; }
+                let above_seal = self.db.get_cf(&cf, super::certified_pair_head_key(k)).ok().flatten()
+                    .filter(|v| v.len() == 8)
+                    .map(|v| u64::from_le_bytes(v[..8].try_into().unwrap_or_default()) > sealed_head)
+                    .unwrap_or(false);
+                if above_seal { continue; }
+                batch.delete_cf(&cf, super::certified_pair_key(k));
+                batch.delete_cf(&cf, super::certified_pair_head_key(k));
             }
             if !batch.is_empty() { self.db.write(batch)?; }
         }
@@ -1345,11 +1365,30 @@ impl PersistentStorage {
         Ok(())
     }
 
+    /// Record the window head of an existing pair (boot backfill for pairs written before the key).
+    pub fn set_certified_pair_head(&self, index: u64, head: u64) -> IntegrationResult<()> {
+        if head == 0 { return Ok(()); }
+        let cf = self.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
+        if self.db.get_cf(&cf, super::certified_pair_head_key(index))?.is_none() {
+            self.db.put_cf(&cf, super::certified_pair_head_key(index), head.to_le_bytes())?;
+        }
+        Ok(())
+    }
+
     pub fn delete_certified_pair(&self, index: u64) -> IntegrationResult<()> {
         let cf = self.db.cf_handle("metadata")
             .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
         self.db.delete_cf(&cf, super::certified_pair_key(index))?;
+        self.db.delete_cf(&cf, super::certified_pair_head_key(index))?;
         Ok(())
+    }
+
+    /// One stored certified pair by index (point read).
+    pub fn certified_pair(&self, index: u64) -> IntegrationResult<Option<Vec<u8>>> {
+        let cf = self.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
+        Ok(self.db.get_cf(&cf, super::certified_pair_key(index))?)
     }
 
     /// All stored certified pairs, index-ascending.

@@ -978,7 +978,24 @@ fn try_propose(
             }
             effs
         }
-        None => Vec::new(),
+        None => {
+            // Closed frontier: the next window was refused for an unsealed anchor, so no content
+            // arrives until something commits, and nothing commits without a new certificate.
+            // Re-certify the high checkpoint from our own snapshot of it (same head, same content).
+            if !frontier_deferred(w) || !driver.commit_pending() || driver.high_head_committed() { return Vec::new(); }
+            let c = match buf.get(&w.saturating_sub(1)) { Some(c) => c, None => return Vec::new() };
+            // Every member buffers the round's seal inputs (all-seal) and adopts the high window's
+            // set - the one that certificate was formed over; the driver decides leadership over it.
+            // The content is the held certificate's, never this snapshot's.
+            *committee = c.committee.clone();
+            let effs = driver.build_recertify_proposal(c.committee.clone(), c.eligible.clone(), c.banned.clone());
+            if !effs.is_empty() && crate::node::is_warn() {
+                println!("[WARN][BFT2] recertify_high round={} head={} reason=frontier_deferred",
+                         driver.current_index(),
+                         w.saturating_sub(1).saturating_mul(qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL));
+            }
+            effs
+        }
     }
 }
 
@@ -1024,6 +1041,7 @@ fn check_content(storage: &Storage, buf: &std::collections::HashMap<u64, WindowC
     // state_root agreeing is the safety gate that makes a tail-hash split safe to reconcile below
     // (same applied state, only the failover-round-bound block hashes differ).
     if cp.state_root != c.state_root
+        || cp.timestamp != c.head_ts
         || qnet_consensus::checkpoint_bft::epoch_commitment(&c.eligible, &c.committee, &c.banned) != cp.epoch_commitment
         || cp.reward_root != c.reward_root
         || (qnet_state::feature_gates::is_active("registry_root_required", cp.window_head_height) && cp.registry_root != c.registry_root)
@@ -1171,6 +1189,41 @@ const MAX_RETAINED_GATED: usize = 4;
 /// marker cannot stand in for it: several writers advance that marker in whole macroblocks, so a
 /// marker-derived target overshoots by one checkpoint whenever the macro path wrote it last.
 static V2_NEXT_WINDOW_HEAD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Head of the window the checkpoint builder last refused for an unsealed anchor (0 = none).
+/// While it names the driver's next window, no content is coming: the view timer keeps rotating
+/// leaders and the leader re-certifies the high checkpoint instead of waiting.
+static V2_FRONTIER_DEFERRED_HEAD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Head of the highest certified checkpoint while it awaits its 2-chain commit (0 otherwise). The
+/// finality redrive re-signals that window so every node holds its content - a node that restarted
+/// since certifying it holds nothing, and cannot vote its re-certification without it.
+static V2_HIGH_QC_HEAD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The checkpoint builder refused `head` because its anchor macroblock is unsealed.
+pub(crate) fn note_frontier_deferred(head: u64) {
+    // The intra and the macro builder both report here; the frontier is the LOWEST refused head
+    // the driver has not passed, so a higher one never masks it - and a latched head the driver
+    // HAS passed is stale (the window was resolved without this node signalling it: not a
+    // committee member, cursor re-armed by the redrive, content adopted from a peer) and yields
+    // to the new one. 0 clears.
+    let mut cur = V2_FRONTIER_DEFERRED_HEAD.load(Ordering::Relaxed);
+    loop {
+        let frontier = V2_NEXT_WINDOW_HEAD.load(Ordering::Relaxed);
+        let stale = cur != 0 && frontier != 0 && cur < frontier;
+        if head != 0 && cur != 0 && cur <= head && !stale { return; }
+        match V2_FRONTIER_DEFERRED_HEAD.compare_exchange(cur, head, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(seen) => cur = seen,
+        }
+    }
+}
+/// Head of the uncommitted high certificate, 0 when nothing is pending.
+pub(crate) fn v2_high_qc_head() -> u64 { V2_HIGH_QC_HEAD.load(Ordering::Relaxed) }
+/// True when the driver's next window is the one the builder refused: nothing will be signalled
+/// for it until something commits, so waiting is not an option.
+fn frontier_deferred(next_window: u64) -> bool {
+    let h = V2_FRONTIER_DEFERRED_HEAD.load(Ordering::Relaxed);
+    h != 0 && h == next_window.saturating_mul(qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL)
+}
 /// Newest index already serialized into the serve store; guards the multi-MB re-serialize.
 static CATCHUP_LAST_RECORDED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
 
@@ -1359,21 +1412,66 @@ pub fn execute_recovery_decree(storage: &Storage, seq: u64, target: u64) -> ! {
 }
 
 /// Certified pair for the checkpoint at `head_height`, from the WAL. O(RETAIN) scan of small pairs.
-pub fn certified_pair_by_head(storage: &Storage, head_height: u64)
+/// The WAL pair certifying `head_height` ON THE COMMITTED CHAIN: found by walking parent links
+/// down from the pair at `committed_index`. Recency is not membership - the WAL holds every
+/// certificate this node ever adopted, an abandoned branch's included, and only the parent chain
+/// of a committed checkpoint says which one the chain kept. Any missing link fails closed: the
+/// macroblock then comes from a peer that can seal it.
+pub fn certified_pair_by_head(storage: &Storage, head_height: u64, committed_index: u64)
     -> Option<(qnet_consensus::checkpoint_bft::Checkpoint, QuorumCertificate)>
 {
-    for (_, bytes) in storage.load_certified_pairs().ok()? {
-        if let Ok(pair) = bincode::deserialize::<Vec<ConsensusMsg>>(&bytes) {
-            let cp = pair.iter().find_map(|m| match m { ConsensusMsg::Proposal(p) => Some(p.clone()), _ => None });
-            let qc = pair.iter().find_map(|m| match m { ConsensusMsg::Qc(q) => Some(q.clone()), _ => None });
-            if let (Some(cp), Some(qc)) = (cp, qc) {
-                if cp.window_head_height == head_height && cp.hash() == qc.checkpoint_hash {
-                    return Some((cp, qc));
-                }
-            }
-        }
+    // Point reads, one per link: a certificate is megabytes at committee scale, so decoding the
+    // whole log to find one row is not an option on the consensus task.
+    let load = |idx: u64| -> Option<(qnet_consensus::checkpoint_bft::Checkpoint, QuorumCertificate)> {
+        let bytes = storage.certified_pair(idx).ok().flatten()?;
+        let pair = bincode::deserialize::<Vec<ConsensusMsg>>(&bytes).ok()?;
+        let cp = pair.iter().find_map(|m| match m { ConsensusMsg::Proposal(p) => Some(p.clone()), _ => None })?;
+        let qc = pair.iter().find_map(|m| match m { ConsensusMsg::Qc(q) => Some(q.clone()), _ => None })?;
+        if qc.index == idx && cp.index == idx && cp.hash() == qc.checkpoint_hash { Some((cp, qc)) } else { None }
+    };
+    let mut cur = committed_index;
+    for _ in 0..=qnet_consensus::checkpoint_bft::CONSENSUS_STATE_RETAIN {
+        let (cp, qc) = load(cur)?;
+        if cp.window_head_height < head_height { return None; }
+        if cp.window_head_height == head_height { return Some((cp, qc)); }
+        let p = cp.parent_qc.as_ref()?.clone();
+        if load(p.index)?.1.checkpoint_hash != p.checkpoint_hash { return None; }
+        cur = p.index;
     }
     None
+}
+
+/// The Persist that re-seals a macro boundary this node COMMITTED but never stored (seal inputs
+/// are round-keyed RAM and die with the process), from the WAL pair plus this window's freshly
+/// derived epoch data. Committed only: the WAL keeps every certified pair, and a 1-chain
+/// certificate is not a seal - two contents can each certify at one head, and only the one that
+/// continues commits. `committee`/`eligible` come from the window event, the same derivation the
+/// certifying nodes used; the window buffer is pruned below the frontier and holds nothing for
+/// exactly the boundaries this path serves, and an empty committee taken from it made every
+/// reseal fail as below quorum.
+fn reseal_from_wal(
+    storage: &Storage, head_height: u64, committed_index: u64, committed_head: Option<u64>,
+    committee: &[String], eligible: &[u8], banned: &[String],
+) -> Option<Effect> {
+    let mi = qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
+    if head_height % mi != 0 || head_height / mi <= storage.last_sealed_mb_index() { return None; }
+    // The commit frontier must have PASSED this head; the walk from the committed pair then
+    // names the certificate the chain kept for it.
+    if committed_head.map_or(true, |ch| ch < head_height) { return None; }
+    let (cp, qc) = certified_pair_by_head(storage, head_height, committed_index)?;
+    // The seal inputs are re-derived here, the certificate was signed over the originals: they
+    // must commit to the same epoch data, or this node would store a roster its peers never
+    // certified. Fail closed, like the receive side does.
+    if qnet_consensus::checkpoint_bft::epoch_commitment(eligible, committee, banned) != cp.epoch_commitment {
+        if crate::node::is_warn() {
+            println!("[WARN][BFT2] reseal_refused window={} head={} reason=epoch_commitment_mismatch", head_height / mi, head_height);
+        }
+        return None;
+    }
+    if crate::node::is_warn() {
+        println!("[WARN][BFT2] reseal_from_wal window={} head={} qc_index={}", head_height / mi, head_height, qc.index);
+    }
+    Some(Effect::Persist { checkpoint: cp, qc, eligible_producers: eligible.to_vec(), committee: committee.to_vec() })
 }
 
 /// Serialized [Proposal, Qc] pair for the newest SEALED macroblock in storage, recorded into the
@@ -1538,6 +1636,12 @@ fn refresh_committee(committee: &mut Vec<String>, cached_for: &mut u64,
                      buf: &std::collections::HashMap<u64, WindowContent>) {
     let w = driver.next_window();
     if *cached_for == w { return; }
+    // A closed frontier: the committee for `w` derives from an anchor that is not sealed, so it
+    // stays unresolvable until something commits, and the only traffic is the re-certification
+    // of `w-1`, signed by that window's set. Hold that set, keyed to `w-1`, until the frontier
+    // reopens; the flag test keeps this off the per-message path.
+    let closed = frontier_deferred(w) && driver.commit_pending() && !driver.high_head_committed();
+    if closed && *cached_for == w.saturating_sub(1) && !committee.is_empty() { return; }
     let committed = committee_for_window(storage, w);
     let local = buf.get(&w).map(|c| c.committee.clone());
     if let (Some(a), Some(b)) = (&committed, &local) {
@@ -1547,15 +1651,22 @@ fn refresh_committee(committee: &mut Vec<String>, cached_for: &mut u64,
             println!("[WARN][BFT2] committee_divergence win={} committed={} local={}", w, a.len(), b.len());
         }
     }
-    let resolved = committed.or(local);
+    let (target, resolved) = match committed.or(local) {
+        Some(c) => (w, Some(c)),
+        None if closed => {
+            let hw = w.saturating_sub(1);
+            (hw, committee_for_window(storage, hw).or_else(|| buf.get(&hw).map(|c| c.committee.clone())))
+        }
+        None => (w, None),
+    };
     match resolved {
         Some(c) => {
-            *cached_for = w;
+            *cached_for = target;
             if *committee != c {
                 *committee = c.clone();
                 driver.set_committee(c);
                 if crate::node::is_debug() {
-                    println!("[INFO][BFT2] committee_adopted win={} n={}", w, committee.len());
+                    println!("[INFO][BFT2] committee_adopted win={} n={}", target, committee.len());
                 }
             }
         }
@@ -1720,6 +1831,7 @@ pub fn signal_window_end(a: WindowEndArgs) {
     let WindowEndArgs { index, head_height, mb_hashes, state_root, beacon, committee,
                         eligible_producers, banned, reward_root, registry_root,
                         dilithium_pk_root, reward_epoch_root, logs_root, total_supply } = a;
+    let _ = V2_FRONTIER_DEFERRED_HEAD.compare_exchange(head_height, 0, Ordering::Relaxed, Ordering::Relaxed);
     if let Some(tx) = V2_TX.get() {
         let _ = tx.send(V2Event::WindowEnd { index, head_height, mb_hashes, state_root, beacon, committee, eligible_producers, banned, reward_root, registry_root, dilithium_pk_root, reward_epoch_root, logs_root, total_supply });
     }
@@ -1791,6 +1903,13 @@ pub async fn run(
     // window from here at the current round — decoupling the window from a skippable round.
     let mut window_buf: std::collections::HashMap<u64, WindowContent> = std::collections::HashMap::new();
     const MAX_WINDOW_BUF: usize = 256;
+    // Committee and producer set of each unsealed macro boundary this process has signalled.
+    let mut boundary_seal_inputs: std::collections::BTreeMap<u64, (Vec<String>, Vec<u8>, Vec<String>)> = std::collections::BTreeMap::new();
+    const SEAL_INPUTS_KEEP: u64 = 4;
+    // (window, commit frontier, tick bucket) of the last reseal probe: the WAL walk is paid once per
+    // commit, not once per tick.
+    let mut last_reseal_probe: (u64, u64, u64) = (0, 0, 0);
+    let mut tick_no: u64 = 0;
     // R15 interlock: the buffer must span the frozen horizon in CHECKPOINT windows (macro window =
     // MACROBLOCK_INTERVAL/CHECKPOINT_INTERVAL = 3), with ≥2× headroom. A future horizon bump that
     // outgrows this fails the build here instead of silently dropping in-flight windows during a freeze.
@@ -1830,11 +1949,14 @@ pub async fn run(
     match storage.load_certified_pairs() {
         Ok(pairs) => {
             let n = pairs.len();
-            for (_, bytes) in pairs {
+            for (idx, bytes) in pairs {
                 if let Ok(pair) = bincode::deserialize::<Vec<ConsensusMsg>>(&bytes) {
                     let cp = pair.iter().find_map(|m| match m { ConsensusMsg::Proposal(p) => Some(p.clone()), _ => None });
                     let qc = pair.iter().find_map(|m| match m { ConsensusMsg::Qc(q) => Some(q.clone()), _ => None });
                     if let (Some(cp), Some(qc)) = (cp, qc) {
+                        // Pairs written before the head key existed get one now, or the seal-frontier
+                        // retention cannot protect them.
+                        let _ = storage.set_certified_pair_head(idx, cp.window_head_height);
                         record_catchup_bundle(qc.index, bytes.clone());
                         let effs = driver.sync(&cp, &qc);
                         if !effs.is_empty() {
@@ -2019,6 +2141,50 @@ pub async fn run(
                     driver.next_window()
                         .saturating_mul(qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL),
                     Ordering::Relaxed);
+                // A latched head the frontier has moved past can no longer be refused content: the
+                // window was resolved elsewhere. Clearing it here is the only path that does not
+                // depend on this node signalling that exact head itself.
+                {
+                    let latched = V2_FRONTIER_DEFERRED_HEAD.load(Ordering::Relaxed);
+                    let frontier = driver.next_window().saturating_mul(qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL);
+                    if latched != 0 && latched < frontier {
+                        let _ = V2_FRONTIER_DEFERRED_HEAD.compare_exchange(latched, 0, Ordering::Relaxed, Ordering::Relaxed);
+                    }
+                }
+                V2_HIGH_QC_HEAD.store(
+                    if frontier_deferred(driver.next_window()) && driver.commit_pending() && !driver.high_head_committed() {
+                        driver.high_qc_head().unwrap_or(0)
+                    } else { 0 },
+                    Ordering::Relaxed);
+                // Seal the oldest unsealed boundary whose commit has landed, from the inputs kept at
+                // its window event: no fresh signal and no lock stands between the commit and the seal.
+                {
+                    tick_no = tick_no.wrapping_add(1);
+                    let sealed = storage.last_sealed_mb_index();
+                    boundary_seal_inputs.retain(|w, _| *w > sealed && *w <= sealed + SEAL_INPUTS_KEEP);
+                    let head = (sealed + 1).saturating_mul(qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL);
+                    let committed = driver.committed_index();
+                    let reached = driver.committed_head().map_or(false, |ch| ch >= head);
+                    let probe = (sealed + 1, committed, tick_no / 8);
+                    if reached && probe != last_reseal_probe {
+                        if let Some((c, e, b)) = boundary_seal_inputs.get(&(sealed + 1)).cloned() {
+                            last_reseal_probe = probe;
+                            match reseal_from_wal(&storage, head, committed, driver.committed_head(), &c, &e, &b) {
+                                Some(eff) => { for w in execute(vec![eff], &node_id, &p2p, &storage).await { driver.mark_sealed(w); } }
+                                // Committed, inputs held, no certificate on the committed chain in the
+                                // WAL: nothing local can seal it; the macroblock arrives from a peer.
+                                None => {
+                                    // Nothing local can seal it; the macroblock has to come from a
+                                    // peer, and the next fast sync pass is what fetches it.
+                                    crate::sync_manager::nudge_sync_check();
+                                    if crate::node::is_warn() {
+                                        println!("[WARN][BFT2] reseal_no_wal_pair window={} committed={}", sealed + 1, committed);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 // View liveness at debug: the whole view machine is otherwise silent between seals.
                 view_dbg_ticks = view_dbg_ticks.wrapping_add(1);
                 if view_dbg_ticks % 8 == 0 && crate::node::is_debug() {
@@ -2084,7 +2250,9 @@ pub async fn run(
                     }
                     None => { blind_ticks = 0; blind_pulls = 0; }
                 }
-                if driver.current_index() == last_index && driver.next_window() <= last_signaled {
+                if driver.current_index() == last_index
+                    && (driver.next_window() <= last_signaled || frontier_deferred(driver.next_window()))
+                {
                     ticks_stuck = ticks_stuck.saturating_add(1);
                     let need = (1u32 << consec_timeouts.min(4)).min(15); // base ticks: 4,8,16,32,60s
                     if ticks_stuck >= need {
@@ -2258,6 +2426,17 @@ pub async fn run(
                                 if crate::node::is_info() {
                                     println!("[INFO][BFT2] catchup_adopted idx={} head={}", qc.index, cp.window_head_height);
                                 }
+                                // The WAL's own writer records only the newest certificate; a pair pulled
+                                // for an OLDER index (the one a walk down the committed chain needs) is
+                                // written here, or the reseal never finds the link. The index is checked
+                                // first: signatures cover the checkpoint hash, which binds cp.index, so a
+                                // pair whose qc.index disagrees is a relabelled certificate and would
+                                // overwrite an honest row at the index it names.
+                                if cp.index == qc.index {
+                                if let Err(e) = storage.record_certified_pair_at(qc.index, cp.window_head_height, &data) {
+                                    if crate::node::is_warn() { println!("[WARN][BFT2] certified_wal_write_fail idx={} err={}", qc.index, e); }
+                                }
+                                }
                                 driver.sync(&cp, &qc)
                             }
                             _ => Vec::new(),
@@ -2303,6 +2482,19 @@ pub async fn run(
                         // over the SAME derived committee as a strict one — the pin moves the threshold,
                         // never the signing set, so all three views agree by construction.
                         committee_window = u64::MAX; // re-resolve from the freshly derived window
+                        let reseal = reseal_from_wal(&storage, head_height, driver.committed_index(), driver.committed_head(),
+                                                     &cmt, &eligible_producers, &banned);
+                        // The inputs a later reseal needs, kept apart from the frontier-pruned buffer: a
+                        // boundary is signalled once per process, and the commit that lets it seal can
+                        // land long after. Bounded to the next few unsealed boundaries (seals are
+                        // sequential); the tick reseals the oldest as soon as its commit has landed.
+                        if head_height % qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL == 0 {
+                            let w_mb = head_height / qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
+                            let sealed = storage.last_sealed_mb_index();
+                            if w_mb > sealed && w_mb <= sealed + SEAL_INPUTS_KEEP {
+                                boundary_seal_inputs.insert(w_mb, (cmt.clone(), eligible_producers.clone(), banned.clone()));
+                            }
+                        }
                         window_buf.insert(index, WindowContent {
                             mb_hashes, state_root, beacon, head_ts, committee: cmt, eligible: eligible_producers, banned, reward_root, registry_root, dilithium_pk_root, reward_epoch_root, logs_root, total_supply,
                         });
@@ -2326,25 +2518,7 @@ pub async fn run(
                                 .or_else(|| window_buf.keys().copied().filter(|k| *k != nw).max());
                             if let Some(v) = victim { window_buf.remove(&v); }
                         }
-                        let mut effs = Vec::new();
-                        // Restart-proof seal: a certified macro boundary whose Persist died with a
-                        // previous process (seal inputs are round-keyed RAM) re-seals from the WAL
-                        // pair plus this window's re-signalled epoch data. mark_sealed dedups.
-                        let mi = qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
-                        if head_height % mi == 0 && head_height / mi > storage.last_sealed_mb_index() {
-                            if let Some((cp, qc)) = certified_pair_by_head(&storage, head_height) {
-                                if crate::node::is_warn() {
-                                    println!("[WARN][BFT2] reseal_from_wal window={} head={} qc_index={}",
-                                             head_height / mi, head_height, qc.index);
-                                }
-                                let c = window_buf.get(&index).map(|w| w.committee.clone()).unwrap_or_default();
-                                effs.push(Effect::Persist {
-                                    checkpoint: cp, qc,
-                                    eligible_producers: window_buf.get(&index).map(|w| w.eligible.clone()).unwrap_or_default(),
-                                    committee: c,
-                                });
-                            }
-                        }
+                        let mut effs: Vec<Effect> = reseal.into_iter().collect();
                         effs.extend(try_propose(&mut driver, &window_buf, &storage, &mut committee));
                         effs.extend(drain_pending(&mut driver, &window_buf, &storage, &p2p, &committee, committee_window, &mut pending, MAX_PENDING, &mut heard));
                         effs
@@ -2359,6 +2533,14 @@ pub async fn run(
                         match bincode::deserialize::<(qnet_consensus::checkpoint_bft::Checkpoint, QuorumCertificate)>(&cp_qc) {
                             Ok((cp, qc)) => {
                                 note_view_heard();
+                                // Same reason as the catch-up path, under the same index binding.
+                                if cp.index == qc.index && cp.hash() == qc.checkpoint_hash {
+                                if let Ok(b) = bincode::serialize(&vec![ConsensusMsg::Proposal(cp.clone()), ConsensusMsg::Qc(qc.clone())]) {
+                                    if let Err(e) = storage.record_certified_pair_at(qc.index, cp.window_head_height, &b) {
+                                        if crate::node::is_warn() { println!("[WARN][BFT2] certified_wal_write_fail idx={} err={}", qc.index, e); }
+                                    }
+                                }
+                                }
                                 let mut effs = driver.sync(&cp, &qc);
                                 if !effs.is_empty() {
                                     refresh_committee(&mut committee, &mut committee_window, &mut driver, &storage, &window_buf);
@@ -2378,8 +2560,10 @@ pub async fn run(
                         // Advance the cursor only on a WRITTEN pair: a QC can precede its
                         // proposal, and skipping then would never persist that index at all.
                         if let Some((idx, pair)) = driver.newest_catchup_bundle() {
+                            let head = pair.iter().find_map(|m| match m {
+                                ConsensusMsg::Proposal(p) => Some(p.window_head_height), _ => None }).unwrap_or(0);
                             if let Ok(b) = bincode::serialize(&pair) {
-                                if let Err(e) = storage.record_certified_pair(idx, &b) {
+                                if let Err(e) = storage.record_certified_pair_at(idx, head, &b) {
                                     if crate::node::is_warn() { println!("[WARN][BFT2] certified_wal_write_fail idx={} err={}", idx, e); }
                                 }
                                 record_catchup_bundle(idx, b);
@@ -2665,6 +2849,125 @@ mod content_gate_tests {
         }
     }
 
+    fn wal_pair(storage: &Storage, index: u64, head: u64, tag: u8, signers: &[String],
+                parent: Option<&QuorumCertificate>, eligible: &[u8]) -> QuorumCertificate {
+        let mut c = cp(head, vec![[tag; 32]], [tag; 32], [0u8; 32]);
+        c.index = index;
+        c.parent_qc = parent.map(qnet_consensus::checkpoint_bft::QcRef::from);
+        c.epoch_commitment = qnet_consensus::checkpoint_bft::epoch_commitment(eligible, signers, &[]);
+        let q = qc_over(&c, signers);
+        let bytes = bincode::serialize(&vec![ConsensusMsg::Proposal(c), ConsensusMsg::Qc(q.clone())]).unwrap();
+        storage.record_certified_pair(index, &bytes).unwrap();
+        q
+    }
+
+    /// The reseal seals what the COMMITTED CHAIN certified at the head, with the committee the
+    /// event derived - never an empty one from a pruned buffer, never a certificate the 2-chain has
+    /// not reached, never an abandoned branch's (recency is not membership), and never with seal
+    /// inputs that do not commit to the certificate's epoch data.
+    #[test]
+    fn reseal_from_wal_is_committed_only_and_carries_the_event_committee() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = Storage::new(dir.path().to_str().unwrap()).unwrap();
+        let cs: Vec<String> = (0..6).map(|i| format!("cs_{:04}", i)).collect();
+        let mi = qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
+        let k = qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL;
+        let head = 2 * mi;
+        let el = [7u8];
+        // 40: the head under an abandoned branch (nobody's parent). 43: the chain's certificate for
+        // the head. 47: a re-certification of 43. 50: the next window, child of 47.
+        let _abandoned = wal_pair(&storage, 40, head, 1, &cs, None, &el);
+        let committed = wal_pair(&storage, 43, head, 2, &cs, None, &el);
+        let recert = wal_pair(&storage, 47, head, 2, &cs, Some(&committed), &el);
+        let _next = wal_pair(&storage, 50, head + k, 3, &cs, Some(&recert), &el);
+        assert_eq!(certified_pair_by_head(&storage, head, 43).map(|(_, q)| q.index), Some(43));
+        assert_eq!(certified_pair_by_head(&storage, head, 50).map(|(_, q)| q.index), Some(47),
+                   "walking down from the committed pair meets the chain's newest certificate at the head");
+        assert!(certified_pair_by_head(&storage, head, 45).is_none(), "no pair at the frontier: nothing to walk from");
+        assert!(certified_pair_by_head(&storage, head, 42).is_none(), "a frontier with no pair of its own: nothing to walk from");
+        assert_eq!(certified_pair_by_head(&storage, head, 50).map(|(c, _)| c.window_mb_hashes[0]), Some([2u8; 32]),
+                   "the abandoned certificate's content is never the answer");
+
+        assert!(reseal_from_wal(&storage, head, 43, Some(head - k), &cs, &el, &[]).is_none(), "frontier below the head");
+        assert!(reseal_from_wal(&storage, head, 43, None, &cs, &el, &[]).is_none(), "no committed head known");
+        assert!(reseal_from_wal(&storage, head + 1, 100, Some(head + 1), &cs, &el, &[]).is_none(), "not a boundary");
+        assert!(reseal_from_wal(&storage, head, 43, Some(head), &cs, &[8u8], &[]).is_none(),
+                "seal inputs that do not commit to the certified epoch data are refused");
+        match reseal_from_wal(&storage, head, 43, Some(head), &cs, &el, &[]) {
+            Some(Effect::Persist { checkpoint, qc, committee, eligible_producers }) => {
+                assert_eq!(checkpoint.window_head_height, head);
+                assert_eq!(qc.index, committed.index);
+                assert_eq!(committee, cs, "the committee is the event's, not the pruned buffer's");
+                assert_eq!(eligible_producers, el.to_vec());
+                assert!(rc_seal_ok(&storage, &checkpoint, &qc, &committee).is_ok(), "and it passes the seal gate");
+            }
+            other => panic!("expected a Persist, got {:?}", other.map(|e| std::mem::discriminant(&e))),
+        }
+    }
+
+    /// Serialises the tests that drive the process-wide frontier flag.
+    fn frontier_flag_lock() -> parking_lot::MutexGuard<'static, ()> {
+        static L: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+        L.lock()
+    }
+
+    /// The restart state of the live freeze: an empty committee, a certificate restored from the
+    /// WAL, and a next window whose committee derives from an unsealed anchor. The loop must adopt
+    /// the HIGH window's committee (resolvable, and the set that certificate was formed over) so
+    /// the re-certification can be led, verified and counted; it must not clear the set and buffer
+    /// everything, which is what left the view dead.
+    #[test]
+    fn a_closed_frontier_resolves_the_high_windows_committee() {
+        let _g = frontier_flag_lock();
+        let k = qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL;
+        let mi = qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = Storage::new(dir.path().to_str().unwrap()).unwrap();
+        let mut d = ConsensusDriver::new("me".into(), Vec::new(), [7u8; 32]);
+        d.set_intervals(k, mi);
+        // High window = the last of the genesis era (its committee is the genesis set); the next
+        // window's committee derives from macroblock 1, which this storage does not hold.
+        let hw = 2 * mi / k;
+        let c1 = cp(hw * k, vec![[1u8; 32]], [1u8; 32], [0u8; 32]);
+        let signers: Vec<String> = crate::genesis_constants::GENESIS_CONSENSUS_PKS.iter().map(|(id, _)| id.to_string()).collect();
+        let q1 = qc_over(&c1, &signers);
+        let _ = d.sync(&c1, &q1);
+        assert_eq!(d.next_window(), hw + 1);
+        assert!(committee_for_window(&storage, hw + 1).is_none(), "the next window is unresolvable");
+        let (mut committee, mut cached_for) = (Vec::<String>::new(), 0u64);
+        let buf = std::collections::HashMap::new();
+        note_frontier_deferred((hw + 1) * k);
+        refresh_committee(&mut committee, &mut cached_for, &mut d, &storage, &buf);
+        assert_eq!(committee, signers, "the high window's set is adopted");
+        assert_eq!(cached_for, hw, "and recorded as that window's");
+        assert!(d.is_leader_now() || !d.committee().is_empty(), "the driver holds it too");
+        // Reopened frontier: the set for the next window is looked up again and, still
+        // unresolvable, cleared - the pre-existing fail-closed rule.
+        note_frontier_deferred(0);
+        refresh_committee(&mut committee, &mut cached_for, &mut d, &storage, &buf);
+        assert!(committee.is_empty());
+    }
+
+    /// The closed-frontier signal is exact: only the window the builder refused counts, and a
+    /// signalled window clears it.
+    #[test]
+    fn a_deferred_frontier_is_the_refused_window_and_nothing_else() {
+        let _g = frontier_flag_lock();
+        let k = qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL;
+        note_frontier_deferred(0);
+        assert!(!frontier_deferred(700));
+        note_frontier_deferred(700 * k);
+        assert!(frontier_deferred(700));
+        assert!(!frontier_deferred(701), "a stale head never matches another window");
+        note_frontier_deferred(702 * k);
+        assert!(frontier_deferred(700), "a higher refused boundary never masks the frontier window");
+        note_frontier_deferred(699 * k);
+        assert!(frontier_deferred(699), "a lower one replaces it");
+        let _ = V2_FRONTIER_DEFERRED_HEAD.compare_exchange(699 * k, 700 * k, Ordering::Relaxed, Ordering::Relaxed);
+        let _ = V2_FRONTIER_DEFERRED_HEAD.compare_exchange(700 * k, 0, Ordering::Relaxed, Ordering::Relaxed);
+        assert!(!frontier_deferred(700), "signalling the window lifts it");
+    }
+
     // THE SHIPPED STATE. Behaviour, not text: the content gate must accept a pinned proposal exactly
     // as it accepts an unpinned one (the pin changes the threshold, not the content), and the seal
     // gate must re-prove the threshold for BOTH — relaxed only for a certificate whose pin RESOLVES
@@ -2937,14 +3240,16 @@ mod cert_window_tests {
         assert_eq!(own, loop_c, "unplaceable falls back to the loop committee");
     }
 
-    // The view timer keys on held content and a stalled index alone - never on who leads - so a
-    // silent leader is timed out by every member.
+    // The view timer keys on a stalled index and on held content - or on a frontier the builder
+    // refused, which no content will ever reach - never on who leads, so a silent leader is timed
+    // out by every member.
     #[test]
     fn the_view_timer_does_not_wait_for_a_leader() {
         let src = include_str!("consensus_v2_node.rs");
         let f = src.find("local_timeout_fired round=").expect("timer arm");
-        let guard = &src[f.saturating_sub(700)..f];
-        assert!(guard.contains("driver.current_index() == last_index && driver.next_window() <= last_signaled"));
+        let guard = &src[f.saturating_sub(800)..f];
+        assert!(guard.contains("driver.current_index() == last_index"));
+        assert!(guard.contains("driver.next_window() <= last_signaled || frontier_deferred(driver.next_window())"));
         assert!(!guard.contains("is_leader_now"));
     }
 }

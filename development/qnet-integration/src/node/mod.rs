@@ -843,6 +843,17 @@ pub(crate) fn redrive_boundary(fin: u64, tip: u64, published: u64, last_sealed_m
     if b <= tip { Some(b) } else { None }
 }
 
+/// Which boundary the finality redrive re-signals this turn. `oldest_unsealed` always takes a turn;
+/// `published` (the driver's frontier) and `high` (the uncommitted high certificate's head) join
+/// when they are distinct later boundaries within the tip. Round-robin, so no boundary starves.
+pub(crate) fn pick_redrive_boundary(oldest_unsealed: u64, published: u64, high: u64, tip: u64, turn: u8) -> u64 {
+    let mut turns = vec![oldest_unsealed];
+    for cand in [published, high] {
+        if cand > oldest_unsealed && cand <= tip && !turns.contains(&cand) { turns.push(cand); }
+    }
+    turns[turn as usize % turns.len()]
+}
+
 /// Mempool TTL in seconds. ONE source: the periodic sweep and the boot-rehydration filter must
 /// agree, or a restart re-admits exactly what the sweep is dropping.
 pub(crate) fn mempool_ttl_secs() -> u64 {
@@ -8646,5 +8657,24 @@ mod tests_production_predicate {
             !src.contains(concat!("reason=no_", "corroboration")),
             "production must never block on absent peer corroboration"
         );
+    }
+}
+
+#[cfg(test)]
+mod redrive_pick_tests {
+    use super::pick_redrive_boundary;
+
+    /// Without a pending certificate the rotation is the old two-way alternation; with one, its
+    /// head takes a turn; a boundary past the tip or below the oldest unsealed never does.
+    #[test]
+    fn the_redrive_rotates_over_every_boundary_that_still_needs_a_signal() {
+        let (b0, pub_, tip) = (559_530u64, 559_650u64, 562_320u64);
+        let two: Vec<u64> = (0..4u8).map(|t| pick_redrive_boundary(b0, pub_, 0, tip, t)).collect();
+        assert_eq!(two, vec![b0, pub_, b0, pub_]);
+        let three: Vec<u64> = (0..6u8).map(|t| pick_redrive_boundary(b0, pub_, 559_620, tip, t)).collect();
+        assert_eq!(three, vec![b0, pub_, 559_620, b0, pub_, 559_620]);
+        assert_eq!(pick_redrive_boundary(b0, pub_, 559_620, 559_600, 2), b0, "a head past the tip is not signalled");
+        assert_eq!(pick_redrive_boundary(b0, pub_, b0, tip, 2), b0, "the high head equal to the oldest unsealed is one turn, not two");
+        assert_eq!(pick_redrive_boundary(b0, pub_, pub_, tip, 2), b0, "duplicates collapse");
     }
 }

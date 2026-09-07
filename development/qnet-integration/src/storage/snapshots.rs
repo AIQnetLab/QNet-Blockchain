@@ -134,6 +134,15 @@ impl Storage {
     pub fn record_certified_pair(&self, index: u64, bytes: &[u8]) -> IntegrationResult<()> {
         self.persistent.record_certified_pair(index, bytes)
     }
+    pub fn record_certified_pair_at(&self, index: u64, head: u64, bytes: &[u8]) -> IntegrationResult<()> {
+        self.persistent.record_certified_pair_at(index, head, bytes)
+    }
+    pub fn set_certified_pair_head(&self, index: u64, head: u64) -> IntegrationResult<()> {
+        self.persistent.set_certified_pair_head(index, head)
+    }
+    pub fn certified_pair(&self, index: u64) -> IntegrationResult<Option<Vec<u8>>> {
+        self.persistent.certified_pair(index)
+    }
     pub fn load_certified_pairs(&self) -> IntegrationResult<Vec<(u64, Vec<u8>)>> {
         self.persistent.load_certified_pairs()
     }

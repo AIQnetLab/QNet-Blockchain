@@ -166,6 +166,34 @@ impl ConsensusDriver {
     }
 
     pub fn committed_index(&self) -> u64 { self.eng.committed_index }
+    /// Head height of the highest certified checkpoint, when its checkpoint is held.
+    pub fn high_qc_head(&self) -> Option<u64> {
+        self.eng.high_qc.as_ref().and_then(|q| self.heads.get(&q.index).copied())
+    }
+    /// True while the highest certificate has no 2-chain commit yet.
+    pub fn commit_pending(&self) -> bool {
+        self.eng.high_qc.as_ref().map(|q| q.index > self.eng.committed_index).unwrap_or(false)
+    }
+    /// True once the commit frontier has reached the high certificate's head. Under a 2-chain rule
+    /// the newest certificate is always uncommitted, so `commit_pending` alone never turns false;
+    /// this is what ends a re-certification run: the head is committed, the seal follows from it.
+    pub fn high_head_committed(&self) -> bool {
+        match (self.high_qc_head(), self.committed_head()) { (Some(h), Some(c)) => c >= h, _ => false }
+    }
+    /// Whether `cp` re-proposes our own highest certified checkpoint: the same head, the SAME
+    /// content, its parent that very certificate, and that certificate still uncommitted. The content
+    /// pin is what keeps "re-propose" literal: without it a same-head child with other content would
+    /// commit the parent's content, seal it, and then commit its own - two contents at one head. A
+    /// checkpoint we do not hold cannot be re-certified. See `build_recertify_proposal`.
+    fn recertifies_high(&self, cp: &Checkpoint) -> bool {
+        let ours = self.eng.high_qc.as_ref().map(qnet_consensus::checkpoint_bft::QcRef::from);
+        if ours.is_none() || cp.parent_qc != ours || !self.commit_pending() { return false; }
+        match self.high_qc_pair() {
+            Some((held, _)) => held.window_head_height == cp.window_head_height
+                && checkpoint_content_digest(&held) == checkpoint_content_digest(cp),
+            None => false,
+        }
+    }
     /// Newest certificate this node holds, as a wire message — what a lagging peer pulls.
     #[cfg(test)]
     pub fn high_qc_msg(&self) -> Option<ConsensusMsg> {
@@ -280,6 +308,12 @@ impl ConsensusDriver {
     pub fn rc_grant_propose(&mut self) { self.rc_propose_ok = true; }
 
     /// True if WE lead the CURRENT round (the consensus view; may skip on timeout).
+    /// The member the leader rule elects for `index` under the current parent hash.
+    #[cfg(test)]
+    pub fn leader_of(&self, index: u64) -> Option<&NodeId> {
+        self.eng.leader_for(index, &self.parent_hash())
+    }
+
     pub fn is_leader_now(&self) -> bool {
         if self.committee.is_empty() { return false; }
         let li = leader_index(self.eng.current_index, &self.parent_hash(), self.committee.len());
@@ -321,6 +355,50 @@ impl ConsensusDriver {
         committee: Vec<NodeId>, eligible_producers: Vec<u8>, banned: Vec<NodeId>, reward_root: Hash,
         registry_root: Hash, dilithium_pk_root: Hash, reward_epoch_root: Hash, logs_root: Hash, total_supply: u64,
     ) -> Vec<Effect> {
+        if window != self.next_window() { return Vec::new(); }
+        self.propose_window(window, mb_hashes, state_root, beacon, head_ts, committee, eligible_producers,
+                            banned, reward_root, registry_root, dilithium_pk_root, reward_epoch_root, logs_root, total_supply)
+    }
+
+    /// Re-propose the highest certified checkpoint at the current round: same head, same content,
+    /// parent = that certificate. For when the contiguous next window cannot be proposed (its
+    /// anchor macroblock is unsealed) while the high certificate has no 2-chain commit: certified
+    /// again in the consecutive round it commits (`commits_parent`), which releases the held seal
+    /// and reopens the frontier. Without this a boundary whose three successor windows each
+    /// certified after a timeout could never commit, and finality froze for good.
+    pub fn build_recertify_proposal(
+        &mut self, committee: Vec<NodeId>, eligible_producers: Vec<u8>, banned: Vec<NodeId>,
+    ) -> Vec<Effect> {
+        let window = self.next_window().saturating_sub(1);
+        let held = match self.high_qc_pair() { Some((cp, _)) => cp, None => return Vec::new() };
+        if !self.commit_pending() || self.high_head_committed()
+            || held.window_head_height != window.saturating_mul(self.cp_interval) {
+            return Vec::new();
+        }
+        // The content is the certified checkpoint's, verbatim; the caller supplies only the seal
+        // inputs, and they must commit to the epoch data that checkpoint carries - anything else is a
+        // different checkpoint, not a re-certification.
+        if epoch_commitment(&eligible_producers, &committee, &banned) != held.epoch_commitment {
+            // The rebuilt epoch data no longer matches what was certified, so this node cannot
+            // re-propose it and the frontier stays closed until another member can.
+            if crate::node::is_warn() {
+                println!("[WARN][BFT2] recertify_refused head={} reason=epoch_commitment_mismatch",
+                         held.window_head_height);
+            }
+            return Vec::new();
+        }
+        self.propose_window(window, held.window_mb_hashes.clone(), held.state_root, held.beacon, held.timestamp,
+                            committee, eligible_producers, banned, held.reward_root, held.registry_root,
+                            held.dilithium_pk_root, held.reward_epoch_root, held.logs_root, held.total_supply)
+    }
+
+    /// Shared body of the two entries above; the caller has settled WHICH window is legal.
+    fn propose_window(
+        &mut self, window: u64, mb_hashes: Vec<Hash>,
+        state_root: Hash, beacon: Hash, head_ts: u64,
+        committee: Vec<NodeId>, eligible_producers: Vec<u8>, banned: Vec<NodeId>, reward_root: Hash,
+        registry_root: Hash, dilithium_pk_root: Hash, reward_epoch_root: Hash, logs_root: Hash, total_supply: u64,
+    ) -> Vec<Effect> {
         self.set_committee(committee.clone());
         let round = self.eng.current_index;
         // QC-certified commitment to this window's epoch-transition data (compute before the
@@ -352,7 +430,7 @@ impl ConsensusDriver {
         } else {
             round > self.last_proposed_round && self.is_leader_now()
         };
-        if !may_propose || window != self.next_window() {
+        if !may_propose {
             return Vec::new();
         }
         let head_height = window.saturating_mul(self.cp_interval);
@@ -425,6 +503,8 @@ impl ConsensusDriver {
     /// Handle an ALREADY-VERIFIED wire message (node checked sigs first).
     pub fn handle(&mut self, msg: &ConsensusMsg) -> Vec<Effect> {
         let mut commit: Option<VoteCommitment> = None;
+        // Effects produced beside the engine's own actions (a certificate adopted from a TC).
+        let mut extra: Vec<Effect> = Vec::new();
         let acts = match msg {
             ConsensusMsg::Proposal(cp) => {
                 // Contiguity invariant: a checkpoint's head MUST be the CONTIGUOUS next window (build_proposal
@@ -435,7 +515,12 @@ impl ConsensusDriver {
                 // it into the MONOTONIC high_window forever (a poison-up liveness wedge). Honest lagging nodes
                 // never false-trip: the node loop routes a Proposal to handle() only once msg_index <=
                 // current_index (frontier caught up ⇒ next_window == this proposal's window); stale/forged is refused.
-                if cp.window_head_height != self.next_window().saturating_mul(self.cp_interval) {
+                // One other head is legal: a re-proposal of our own highest certificate (same head,
+                // parent = that certificate, still uncommitted). It cannot inflate high_window and
+                // the parent check below holds for it by construction.
+                if cp.window_head_height != self.next_window().saturating_mul(self.cp_interval)
+                    && !self.recertifies_high(cp)
+                {
                     if crate::node::is_warn() {
                         println!("[WARN][BFT2] proposal_dropped reason=window idx={} head={} want_head={}",
                                  cp.index, cp.window_head_height,
@@ -454,18 +539,6 @@ impl ConsensusDriver {
                     }
                     return Vec::new();
                 }
-                // Same doctrine for the INDEX. The engine refuses any index but its current one
-                // (checkpoint_consensus on_proposal), so recording one here writes maps the engine will
-                // never act on - and heads/state_roots/mb_hashes feed the finality inputs. A proposal
-                // that is merely early is buffered and replayed by the node loop, so nothing is lost.
-                // Same doctrine for the INDEX. The engine refuses any index but its current one
-                // (checkpoint_consensus on_proposal), so recording one here writes maps the engine will
-                // never act on - and heads/state_roots/mb_hashes feed the finality inputs. A proposal
-                // that is merely early is buffered and replayed by the node loop, so nothing is lost.
-                // Same doctrine for the INDEX. The engine refuses any index but its current one
-                // (checkpoint_consensus on_proposal), so recording one here writes maps the engine will
-                // never act on - and heads/state_roots/mb_hashes feed the finality inputs. A proposal
-                // that is merely early is buffered and replayed by the node loop, so nothing is lost.
                 // A pinned proposal must satisfy the POSITIONAL clauses the macroblock authority
                 // re-derives from the certificate's own bytes (`resolve_recovery_pin`): the head on
                 // the span grid, and a strictly-lower parent link. Without this mirror an armed node
@@ -522,6 +595,24 @@ impl ConsensusDriver {
                     }
                     self.parent_hash()
                 };
+                // Only the ELECTED proposal writes the index maps. The engine refuses to vote for
+                // anyone else, so recording their checkpoint writes rows nothing acts on - and those
+                // rows are the finality inputs and the window frontier. With one head per index that
+                // was harmless; a re-certification adds a second legal head, so any member could
+                // regress next_window and finalize the wrong head by re-proposing off-turn.
+                // Mirror of the engine's own rule: a pin frees the proposer, nothing else does.
+                let proposer_ok = if cp.recovery_anchor.is_some() {
+                    self.committee.iter().any(|c| c == &cp.proposer)
+                } else {
+                    self.eng.leader_for(cp.index, &ph).map(|l| l == &cp.proposer).unwrap_or(false)
+                };
+                if !proposer_ok {
+                    if crate::node::is_warn() {
+                        println!("[WARN][BFT2] proposal_dropped reason=not_leader idx={} head={} proposer={}",
+                                 cp.index, cp.window_head_height, qnet_state::char_prefix(&cp.proposer, 20));
+                    }
+                    return Vec::new();
+                }
                 self.heads.insert(cp.index, cp.window_head_height);
                 self.state_roots.insert(cp.index, cp.state_root);
                 self.mb_hashes.insert(cp.index, cp.window_mb_hashes.clone());
@@ -598,9 +689,22 @@ impl ConsensusDriver {
                     None => self.eng.on_timeout_msg(tm),
                 }
             }
-            ConsensusMsg::Tc(tc) => self.eng.on_timeout_cert(tc),
+            ConsensusMsg::Tc(tc) => {
+                // A certificate carried by a timeout certificate is adopted by the engine but was
+                // never "received" as one: without this it reaches neither the serve store nor the
+                // write-ahead log, and a seal that depends on it has no link to walk. Same
+                // treatment as an inbound Qc, and idempotent.
+                if let Some(hq) = &tc.high_qc {
+                    if self.proposals.contains_key(&(hq.index, hq.checkpoint_hash)) {
+                        self.remember_qc(hq);
+                        extra.extend(self.seal_if_ready(hq));
+                    }
+                }
+                self.eng.on_timeout_cert(tc)
+            }
         };
         let mut out = self.translate(acts);
+        out.append(&mut extra);
         if let Some(c) = commit {
             for e in out.iter_mut() {
                 if let Effect::Vote { commit, .. } = e { *commit = c.clone(); }
@@ -735,11 +839,17 @@ impl ConsensusDriver {
         let commit_floor = self.eng.committed_index.saturating_sub(CONSENSUS_STATE_RETAIN);
         self.eng.prune_below(floor, commit_floor);
         if floor == 0 { return; }
-        self.proposals.retain(|(idx, _), _| *idx >= floor);
-        self.heads.retain(|idx, _| *idx >= floor);
-        self.state_roots.retain(|idx, _| *idx >= floor);
-        self.mb_hashes.retain(|idx, _| *idx >= floor);
-        self.seal_data.retain(|idx, _| *idx >= floor);
+        // The high certificate's row and the committed row stay whatever the view does: a closed
+        // frontier can hold the view far past the retention window, and without them the head of
+        // the high certificate is unknown and nothing can be re-certified or finalized.
+        let hq = self.eng.high_qc.as_ref().map(|q| q.index);
+        let ci = self.eng.committed_index;
+        let keep = |idx: u64| idx >= floor || Some(idx) == hq || idx == ci;
+        self.proposals.retain(|(idx, _), _| keep(*idx));
+        self.heads.retain(|idx, _| keep(*idx));
+        self.state_roots.retain(|idx, _| keep(*idx));
+        self.mb_hashes.retain(|idx, _| keep(*idx));
+        self.seal_data.retain(|idx, _| keep(*idx));
         // `sealed` is keyed by macroblock window; map the index floor to a window floor. A pruned
         // window that a late relayed QC re-seals is idempotent (storage.save_macroblock skips an
         // existing macroblock), so dropping the dedup entry costs at most one no-op write.
@@ -843,6 +953,158 @@ mod tests {
             }
             queue = next;
         }
+    }
+
+    /// Drive the current round: whoever leads proposes the CONTIGUOUS window, everyone buffers it.
+    fn strict_round(nodes: &mut Vec<Node>, c: &[NodeId], window: u64) {
+        let mut seed = Vec::new();
+        for k in 0..nodes.len() {
+            let effs = nodes[k].d.build_proposal(
+                window, vec![[window as u8; 32]], [window as u8; 32], [0u8; 32], window * 1000,
+                c.to_vec(), Vec::new(), Vec::new(), [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], 0);
+            for e in effs { seed.extend(exec(&mut nodes[k], e)); }
+        }
+        deliver(nodes, c, seed);
+    }
+
+    /// Every member's view timer fires: timeouts form a TC and the view advances by one.
+    fn view_change(nodes: &mut Vec<Node>, c: &[NodeId]) {
+        let mut seed = Vec::new();
+        for k in 0..nodes.len() {
+            let effs = nodes[k].d.on_timeout();
+            for e in effs { seed.extend(exec(&mut nodes[k], e)); }
+        }
+        deliver(nodes, c, seed);
+    }
+
+    /// One re-certification round: every member buffers the seal inputs, the leader re-proposes.
+    fn recertify_round(nodes: &mut Vec<Node>, c: &[NodeId]) -> usize {
+        let mut seed = Vec::new();
+        for k in 0..nodes.len() {
+            let effs = nodes[k].d.build_recertify_proposal(c.to_vec(), Vec::new(), Vec::new());
+            for e in effs { seed.extend(exec(&mut nodes[k], e)); }
+        }
+        let proposals = seed.iter().filter(|m| matches!(m, ConsensusMsg::Proposal(_))).count();
+        deliver(nodes, c, seed);
+        proposals
+    }
+
+    /// The finality freeze: window 1 certifies, its successor can never be proposed (anchor rule),
+    /// and a certificate with no consecutive child never commits. Re-certifying the same head is
+    /// that child: after one timeout the first re-certification is not consecutive (it only moves
+    /// the high certificate), the next one is, and the 2-chain commit lands, releasing the held
+    /// seal - with the same content, so nothing that was certified changes.
+    #[test]
+    fn recertifying_the_high_checkpoint_commits_it_when_the_frontier_is_closed() {
+        let (c, mut nodes) = byz_net(4);
+        strict_round(&mut nodes, &c, 1);
+        assert!(nodes.iter().all(|n| n.d.commit_pending()), "a 1-chain certificate is not a commit");
+        assert!(nodes.iter().all(|n| n.committed == 0 && n.sealed.is_empty()));
+        assert!(nodes.iter().all(|n| n.d.current_index() == 2 && n.d.next_window() == 2));
+        // Round 2 times out on the unproposable window 2; the view moves on, the frontier does not.
+        view_change(&mut nodes, &c);
+        assert!(nodes.iter().all(|n| n.d.current_index() == 3 && n.d.next_window() == 2));
+        // Index 3 re-certifies window 1 under QC(1): not consecutive, so no commit yet.
+        assert_eq!(recertify_round(&mut nodes, &c), 1, "exactly the leader re-proposes");
+        assert!(nodes.iter().all(|n| n.committed == 0 && n.d.commit_pending() && n.d.current_index() == 4),
+                "a non-consecutive certificate only raises the high certificate");
+        // Index 4 re-certifies under QC(3): consecutive, so index 3 commits and everything below seals.
+        assert_eq!(recertify_round(&mut nodes, &c), 1);
+        assert!(nodes.iter().all(|n| n.committed == 3), "the consecutive certificate commits: {:?}",
+                nodes.iter().map(|n| n.committed).collect::<Vec<_>>());
+        assert!(nodes.iter().all(|n| !n.sealed.is_empty() && n.sealed.iter().all(|&w| w == 1)),
+                "the held seal of the boundary is released, and only that window");
+        assert!(nodes.iter().all(|n| n.d.next_window() == 2), "the frontier does not move on a re-certification");
+        // The newest certificate is itself uncommitted, as always under a 2-chain rule, but the
+        // head is committed: the run ends here and the seal follows from the commit.
+        assert!(nodes.iter().all(|n| n.d.commit_pending() && n.d.high_head_committed()));
+        assert_eq!(recertify_round(&mut nodes, &c), 0, "a committed head is not re-certified again");
+    }
+
+    /// The restart state: a driver built with NO committee, a WAL-restored certificate, no content
+    /// for the next window. Leadership cannot be decided over an empty set; once the node adopts
+    /// the high window's committee (the set that certificate was formed over) the re-certification
+    /// proceeds and commits exactly as in the live run.
+    #[test]
+    fn a_restarted_driver_re_certifies_once_the_high_windows_committee_is_adopted() {
+        let (c, mut seeded) = byz_net(4);
+        strict_round(&mut seeded, &c, 1);
+        let (cp1, qc1) = seeded[0].d.high_qc_pair().expect("certified window 1");
+        // Fresh processes: empty committee, the WAL pair replayed through sync.
+        let mut nodes: Vec<Node> = c.iter().map(|id| {
+            let mut d = ConsensusDriver::new(id.clone(), Vec::new(), [7u8; 32]);
+            d.set_intervals(90, 90);
+            let _ = d.sync(&cp1, &qc1);
+            Node { d, id: id.clone(), committed: 0, sealed: Vec::new() }
+        }).collect();
+        assert!(nodes.iter().all(|n| n.d.commit_pending() && n.d.next_window() == 2 && !n.d.is_leader_now()),
+                "no member leads over an empty committee");
+        // The node hands every member the high window's set with the round's seal inputs; the
+        // driver adopts it and leadership follows (all-seal: non-leaders buffer, one proposes).
+        // No round was lost after the restore, so this re-certification is the consecutive child
+        // and commits the restored certificate at once; the run then ends.
+        assert_eq!(recertify_round(&mut nodes, &c), 1, "the set arrives with the seal inputs");
+        assert!(nodes.iter().all(|n| !n.d.committee().is_empty()));
+        assert!(nodes.iter().all(|n| n.committed >= 1 && n.d.high_head_committed()),
+                "the restarted quorum commits the restored certificate's head");
+        assert_eq!(recertify_round(&mut nodes, &c), 0, "a committed head is not re-certified again");
+        // Nothing to seal here: the boundary's inputs died with the old process. The node reseals it
+        // from the WAL pair once the commit has reached it (reseal_from_wal).
+        assert!(nodes.iter().all(|n| n.sealed.is_empty()));
+    }
+
+    /// Only the elected proposal writes the index maps. A member re-proposing the high checkpoint
+    /// off-turn used to regress the window frontier and put the wrong head into finality, with no
+    /// evidence against it: a non-leader proposal is not an offence, so the gate has to be here.
+    #[test]
+    fn a_proposal_from_the_wrong_member_never_touches_the_index_maps() {
+        let (c, mut nodes) = byz_net(4);
+        strict_round(&mut nodes, &c, 1);   // window 1 certified, high head 90
+        strict_round(&mut nodes, &c, 2);   // leader proposes window 2 at the current round
+        let d = &mut nodes[0].d;
+        let idx = d.current_index();
+        let (head_before, next_before) = (d.head_of(idx), d.next_window());
+        // A member that does not lead this round re-proposes the high checkpoint at it.
+        let (held, hq) = d.high_qc_pair().expect("a certificate");
+        let mut cp = held.clone();
+        cp.index = idx;
+        cp.parent_qc = Some(qnet_consensus::checkpoint_bft::QcRef::from(&hq));
+        cp.proposer = c.iter().find(|m| Some(*m) != d.leader_of(idx)).expect("a non-leader").clone();
+        assert!(d.handle(&ConsensusMsg::Proposal(cp)).is_empty(), "no vote for an unelected proposal");
+        assert_eq!(d.head_of(idx), head_before, "the elected head stands");
+        assert_eq!(d.next_window(), next_before, "and the frontier does not regress");
+    }
+
+    /// The admitted head is exactly the high certificate's: any other non-contiguous head is still
+    /// refused, and so is the high head under a foreign parent.
+    #[test]
+    fn only_a_re_proposal_of_the_high_certificate_passes_the_head_gate() {
+        let (c, mut nodes) = byz_net(4);
+        strict_round(&mut nodes, &c, 1);
+        view_change(&mut nodes, &c);
+        let d = &mut nodes[0].d;
+        let (held, hq) = d.high_qc_pair().expect("certified window 1");
+        // The re-proposal: the held checkpoint at a new index under its own certificate.
+        let mut cp = held.clone();
+        cp.index = 2;
+        cp.parent_qc = Some(qnet_consensus::checkpoint_bft::QcRef::from(&hq));
+        cp.proposer = String::new();
+        cp.proposer_sig = Vec::new();
+        assert!(d.recertifies_high(&cp), "high head, our certificate, the certified content");
+        cp.window_head_height = 270;
+        assert!(!d.recertifies_high(&cp), "a far head is not a re-certification");
+        cp.window_head_height = 90;
+        cp.state_root = [9u8; 32];
+        assert!(!d.recertifies_high(&cp), "the high head with other content is a different checkpoint");
+        cp.state_root = [1u8; 32];
+        cp.timestamp = 1001;
+        assert!(!d.recertifies_high(&cp), "the timestamp is content too");
+        cp.timestamp = 1000;
+        cp.parent_qc = Some(qnet_consensus::checkpoint_bft::QcRef { index: 0, checkpoint_hash: [3u8; 32] });
+        assert!(!d.recertifies_high(&cp), "the high head under another parent is not one either");
+        // Seal inputs that do not commit to the certified epoch data are refused on the emit side.
+        let mut other = c.clone(); other.push("n9".into());
+        assert!(d.build_recertify_proposal(other, Vec::new(), Vec::new()).is_empty());
     }
 
     // ── BYZANTINE ────────────────────────────────────────────────────────────────────────────────

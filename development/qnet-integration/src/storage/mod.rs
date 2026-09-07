@@ -85,6 +85,16 @@ pub(crate) fn certified_pair_key(index: u64) -> Vec<u8> {
     k
 }
 
+/// Window head of the pair at `index` (`cpqh` ++ index BIG-endian; a different prefix, so the
+/// `cpq_` scan never sees it).
+#[inline]
+pub(crate) fn certified_pair_head_key(index: u64) -> Vec<u8> {
+    let mut k = Vec::with_capacity(4 + 8);
+    k.extend_from_slice(b"cpqh");
+    k.extend_from_slice(&index.to_be_bytes());
+    k
+}
+
 /// Header index key: `hdr_` ++ hash. Hash-keyed, so no ordering requirement.
 #[inline]
 pub(crate) fn block_header_key(hash: &[u8; 32]) -> Vec<u8> {
@@ -3146,6 +3156,28 @@ mod tests_certified_pair_wal {
         let after = s.load_certified_pairs().unwrap();
         assert_eq!(after.iter().map(|(i, _)| *i).collect::<Vec<_>>(), vec![far],
                    "stale pairs below the retain floor are pruned");
+    }
+
+    /// A pair above the seal frontier is what re-seals a late-committing boundary; a re-certification
+    /// run moves the index far past the retain window in minutes, so index distance alone must not
+    /// discard it. Pairs at or below the frontier still go.
+    #[test]
+    fn certified_pairs_above_the_seal_frontier_survive_the_index_prune() {
+        let (s, _d) = open_test_storage();
+        let mi = qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
+        let retain = qnet_consensus::checkpoint_bft::CONSENSUS_STATE_RETAIN;
+        // Nothing sealed yet: every head is above the frontier.
+        s.record_certified_pair_at(10, 3 * mi, b"unsealed_boundary").unwrap();
+        s.record_certified_pair_at(11, 3 * mi + 30, b"unsealed_intra").unwrap();
+        s.record_certified_pair(12, b"legacy_no_head").unwrap();
+        s.record_certified_pair(13, b"legacy_backfilled").unwrap();
+        s.set_certified_pair_head(13, 4 * mi).unwrap();
+        s.record_certified_pair_at(12 + retain + 5, 40 * mi, b"far").unwrap();
+        let kept: Vec<u64> = s.load_certified_pairs().unwrap().iter().map(|(i, _)| *i).collect();
+        assert_eq!(kept, vec![10, 11, 13, 12 + retain + 5],
+                   "heads above the seal frontier stay, a backfilled head counts, a headless pair is pruned as before");
+        s.delete_certified_pair(11).unwrap();
+        assert_eq!(s.load_certified_pairs().unwrap().iter().map(|(i, _)| *i).collect::<Vec<_>>(), vec![10, 13, 12 + retain + 5]);
     }
 }
 

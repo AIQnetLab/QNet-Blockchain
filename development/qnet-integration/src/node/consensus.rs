@@ -360,7 +360,7 @@ impl BlockchainNode {
             let mut lag_timer = tokio::time::interval(
                 std::time::Duration::from_millis(qnet_consensus::checkpoint_bft::VIEW_TIMEOUT_MS));
             lag_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            let mut redrive_flip = false;
+            let mut redrive_turn: u8 = 0;
             loop {
                 let current_height = tokio::select! {
                     ev = block_event_rx.recv() => match ev {
@@ -419,12 +419,13 @@ impl BlockchainNode {
                         // outrun the tip and silence this guard forever; see redrive_boundary.
                         if let Some(b0) = crate::node::redrive_boundary(
                             fin, tip, published, storage.last_sealed_mb_index()) {
-                            // Alternate with the driver's frontier: a boundary the driver already
-                            // CERTIFIED (cursor past it) seals only via the 2-chain commit that the
-                            // frontier window delivers, while a body-less boundary still needs its
-                            // own re-signal — alternating serves both without distinguishing.
-                            let b = if published > b0 && published <= tip && redrive_flip { published } else { b0 };
-                            redrive_flip = !redrive_flip;
+                            // Three boundaries take turns: the oldest unsealed (its seal), the driver's
+                            // frontier (its content), and the high certificate's head while it awaits its
+                            // commit - every node must hold that window's content to vote its
+                            // re-certification, and a node that restarted since certifying it holds nothing.
+                            let b = crate::node::pick_redrive_boundary(
+                                b0, published, crate::consensus_v2_node::v2_high_qc_head(), tip, redrive_turn);
+                            redrive_turn = redrive_turn.wrapping_add(1);
                             // Intra frontier: re-arm the cursor so the intra path re-attempts exactly b.
                             if b % macro_i != 0 {
                                 last_intra_signalled.store(b.saturating_sub(k), std::sync::atomic::Ordering::Relaxed);
@@ -507,6 +508,9 @@ impl BlockchainNode {
                                         // buffers frozen-committee content here, and on resume the buffer wins
                                         // the race against the sealed-arm redrive — certifying frozen values.
                                         if !matches!(Self::roster_mode(&storage_cp, macro_window), RosterMode::Sealed) {
+                                            // The driver learns the frontier is closed here: it re-certifies
+                                            // its high checkpoint until the anchor commits and seals.
+                                            crate::consensus_v2_node::note_frontier_deferred(b);
                                             if is_warn() {
                                                 println!("[WARN][CONS] checkpoint_defer cp={} reason=anchor_unsealed_frozen", cp_index);
                                             }
@@ -628,7 +632,11 @@ impl BlockchainNode {
                     let last_finalized_mb = last_finalized_round / 90;
                     
                     // Check if this is a new consensus round
-                    if macroblock_index > last_finalized_mb {
+                    // A boundary above the seal frontier is admitted even when finality has passed it:
+                    // intra checkpoints finalize without sealing, and the redrive re-signals such a
+                    // boundary precisely so its seal inputs are rebuilt and the commit can seal it.
+                    let unsealed_boundary = macroblock_index > storage.last_sealed_mb_index();
+                    if macroblock_index > last_finalized_mb || unsealed_boundary {
                         // Check if node is synchronized before participating
                         let is_synchronized = coordinator_is_synchronized();
 
@@ -797,10 +805,15 @@ impl BlockchainNode {
                                         continue;
                                     }
                                 } else {
-                                    // Case 4: Future MB active (shouldn't happen) - skip
-                                    println!("[WARN][CONS] future_mb_active active={} requested={}", 
-                                             current_active, macroblock_index);
-                                    continue;
+                                    // Case 4: an OLDER boundary, re-signalled by the finality redrive while a
+                                    // newer window holds the lock. Not a duplicate of the live window, so it
+                                    // runs beside it and leaves the lock alone (the guard's release is a no-op
+                                    // for it). Skipping it here starved the reseal of the oldest unsealed
+                                    // boundary for as long as any newer window had signalled.
+                                    if is_info() {
+                                        println!("[INFO][CONS] older_boundary_redrive active={} requested={}",
+                                                 current_active, macroblock_index);
+                                    }
                                 }
                                 
                                 if is_info() { 
@@ -854,6 +867,7 @@ impl BlockchainNode {
                                         // carries frozen-derived content peers Reject on resume. Defer; the
                                         // finality-lag redrive rebuilds via the sealed arm once the anchor seals.
                                         if !matches!(Self::roster_mode(&storage_cons, mb_idx), RosterMode::Sealed) {
+                                            crate::consensus_v2_node::note_frontier_deferred(end_height);
                                             if is_warn() {
                                                 println!("[WARN][CONS] checkpoint_defer mb={} reason=anchor_unsealed_frozen", mb_idx);
                                             }
