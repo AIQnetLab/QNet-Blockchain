@@ -101,9 +101,19 @@ impl BlockchainNode {
             .and_then(|v| v.trim().parse::<u64>().ok());
         let to_sealed = std::env::var("QNET_ROLLBACK_TO_LAST_SEALED")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false);
+        let sealed = Self::last_sealed_height(storage);
         let target = match (explicit, to_sealed) {
-            (Some(h), _) => Some(h),
-            (None, true) => Self::last_sealed_height(storage),
+            (Some(h), _) => {
+                // An explicit target below the last sealed window discards CERTIFIED history. That is
+                // the operator's call and the reason the explicit form exists, but it must never pass
+                // silently, and unlike the self-chosen target it repeats on every restart.
+                if sealed.map_or(false, |s| h < s) {
+                    println!("[WARN][ROLLBACK] target_below_last_sealed target={} last_sealed={} — certified blocks will be discarded",
+                             h, sealed.unwrap_or(0));
+                }
+                Some(h)
+            }
+            (None, true) => sealed,
             _ => return,
         };
         let target = match target {

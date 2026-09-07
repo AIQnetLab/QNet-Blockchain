@@ -755,27 +755,6 @@ pub fn tail_is_contradicted(our_hash: [u8; 32], our_abs_round: u64, child_parent
     child_parent != our_hash && child_abs_round >= our_abs_round
 }
 
-/// Distinct AUTHENTICATED producers that have presented a child naming a parent we do not hold at a
-/// height. Bounded exactly like CONTRADICTED_TAILS; the producer id is signature-checked before it is
-/// counted (child_is_authentic), so a relay cannot manufacture witnesses.
-static CONTRADICTION_WITNESSES: once_cell::sync::Lazy<dashmap::DashMap<u64, std::collections::HashSet<String>>> =
-    once_cell::sync::Lazy::new(dashmap::DashMap::new);
-
-/// Records `producer` as having built past `height` on a parent we do not hold; returns how many
-/// distinct producers have now done so.
-pub fn note_contradiction_witness(height: u64, producer: &str) -> usize {
-    let n = {
-        let mut e = CONTRADICTION_WITNESSES.entry(height).or_default();
-        e.insert(producer.to_string());
-        e.len()
-    };
-    if CONTRADICTION_WITNESSES.len() > CONTRADICTED_TAILS_MAX {
-        let cut = height.saturating_sub(CONTRADICTED_TAILS_MAX as u64);
-        CONTRADICTION_WITNESSES.retain(|h, _| *h > cut);
-    }
-    n
-}
-
 /// Does an authenticated child overrule the tail we hold?
 ///
 /// The round leg alone INVERTED fork choice. A branch's absolute round rises with every failover it
@@ -785,25 +764,52 @@ pub fn note_contradiction_witness(height: u64, producer: &str) -> usize {
 /// round" and never rolled back, while the majority, holding the lower round, kept yielding TO it.
 /// A transient fork became permanent, and the branch that had failed most won.
 ///
-/// So authority comes from a quorum instead: f+1 DISTINCT authenticated producers building past our
-/// tail on another parent contains at least one honest builder, and no minority can raise that number
-/// by failing. The round leg is kept as the fast path — it settles the common case in one block and
-/// still protects us from a lone stale straggler, which is what it was for.
+/// So authority comes from a quorum instead. `rival_attesters` is how many DISTINCT committee members
+/// have attested the block the child builds on - the per-block attestation set the node already keeps,
+/// and the same evidence the "we are the minority side" detector reads. f+1 of them contains at least
+/// one honest member, and no minority can raise that number by failing. The round leg is kept as the
+/// fast path: it settles the common case in one block and still protects us from a lone stale
+/// straggler, which is what it was for.
 pub fn tail_is_overruled(
     our_hash: [u8; 32], our_abs_round: u64,
     child_parent: [u8; 32], child_abs_round: u64,
-    witnesses: usize, f_plus_one: usize,
+    rival_attesters: usize, f_plus_one: usize,
 ) -> bool {
     if child_parent == our_hash { return false; }
-    child_abs_round >= our_abs_round || (f_plus_one > 0 && witnesses >= f_plus_one)
+    child_abs_round >= our_abs_round || (f_plus_one > 0 && rival_attesters >= f_plus_one)
 }
 
 /// f+1 over the committee that governs `height`: the smallest set that must contain an honest member.
+///
+/// Memoised per epoch. The committee is fixed for an epoch, while resolving it deserializes the
+/// N-2 macroblock's eligible-producer roster — at the target super-node count that is a large blob,
+/// and this is asked on every hash-chain-break block, which during a fork means every block.
 pub fn committee_f_plus_one(storage: &crate::storage::Storage, height: u64) -> Option<usize> {
+    const KEEP: usize = 4;
+    // A rollback that deletes the N-2 macroblock can put a different committee under an epoch, so the
+    // memo follows the same delete counter the window-committee cache does.
+    let seq = crate::storage::macroblock_delete_seq();
+    if COMMITTEE_F1_SEQ.swap(seq, std::sync::atomic::Ordering::Relaxed) != seq {
+        COMMITTEE_F1_BY_EPOCH.clear();
+    }
+    let epoch = height.saturating_sub(1) / qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL + 1;
+    if let Some(v) = COMMITTEE_F1_BY_EPOCH.get(&epoch) { return Some(*v); }
     let n = crate::node::BlockchainNode::committee_for_height(storage, height)?.len();
     if n == 0 { return None; }
-    Some((n.saturating_sub(1)) / 3 + 1)
+    let f1 = (n - 1) / 3 + 1;
+    COMMITTEE_F1_BY_EPOCH.insert(epoch, f1);
+    if COMMITTEE_F1_BY_EPOCH.len() > KEEP {
+        let cut = epoch.saturating_sub(KEEP as u64);
+        COMMITTEE_F1_BY_EPOCH.retain(|e, _| *e > cut);
+    }
+    Some(f1)
 }
+
+/// (epoch -> f+1). Tiny and self-pruning; the committee cannot change inside an epoch.
+static COMMITTEE_F1_BY_EPOCH: once_cell::sync::Lazy<dashmap::DashMap<u64, usize>> =
+    once_cell::sync::Lazy::new(dashmap::DashMap::new);
+/// Macroblock-delete counter the memo above was built under.
+static COMMITTEE_F1_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
 
 pub fn note_contradicted_tail(height: u64, network_parent: [u8; 32]) {
     CONTRADICTED_TAILS.insert(height, network_parent);
@@ -821,7 +827,6 @@ pub fn contradicted_tail(height: u64) -> Option<[u8; 32]> {
 /// otherwise send the replacement after it.
 pub fn clear_contradicted_tail(height: u64) {
     CONTRADICTED_TAILS.remove(&height);
-    CONTRADICTION_WITNESSES.remove(&height);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -921,10 +926,10 @@ mod contradicted_tail_tests {
         // The measured shape: our round 3, the majority's 2. One majority producer is not yet proof —
         // that is exactly the lone straggler the round leg protects us from.
         assert!(!tail_is_overruled(ours, 3, theirs, 2, 1, F1),
-                "one producer on a lower round is a straggler, not a quorum");
-        // A second DISTINCT producer building past us on that parent contains an honest builder.
+                "one attester on a lower round is a straggler, not a quorum");
+        // f+1 committee members attesting the rival block contains at least one honest member.
         assert!(tail_is_overruled(ours, 3, theirs, 2, 2, F1),
-                "f+1 distinct builders overrule a round we raised by failing");
+                "f+1 attesters overrule a round we raised by failing");
         assert!(tail_is_overruled(ours, 99, theirs, 0, 2, F1),
                 "no round we can reach outranks a quorum — that is the whole point");
 
@@ -937,19 +942,6 @@ mod contradicted_tail_tests {
         assert!(!tail_is_overruled(ours, 3, theirs, 2, 0, 0), "no committee ⇒ no quorum leg");
     }
 
-    /// Witnesses are counted per PRODUCER, so one node repeating itself never reaches f+1 — the
-    /// quorum leg has to mean distinct builders or it is just the round leg with extra steps.
-    #[test]
-    fn one_producer_repeating_itself_is_still_one_witness() {
-        let h = 55_000_001u64;
-        assert_eq!(note_contradiction_witness(h, "genesis_node_002"), 1);
-        assert_eq!(note_contradiction_witness(h, "genesis_node_002"), 1, "same builder, still one");
-        assert_eq!(note_contradiction_witness(h, "genesis_node_004"), 2, "a distinct builder counts");
-        clear_contradicted_tail(h);
-        assert_eq!(note_contradiction_witness(h, "genesis_node_002"), 1,
-                   "replacing the tail forgets its witnesses");
-        clear_contradicted_tail(h);
-    }
 
     // The leader of the next slot building elsewhere overrules our tail; the same leader building on
     // ours, or a straggler on an older round, does not. The record is bounded and forgettable.
@@ -2684,12 +2676,14 @@ impl BlockPipeline {
                             && mb.previous_hash != ours
                             && child_is_authentic(&storage, &decoded).await;
                         let overruled = authentic && {
-                            let witnesses = note_contradiction_witness(disputed, &mb.producer);
+                            // The rival block is the parent this child names; its attestation set is
+                            // committee evidence the node already holds, so nothing new accumulates.
+                            let rival = crate::unified_p2p::block_attestation_count(disputed, &mb.previous_hash);
                             let f1 = committee_f_plus_one(&storage, mb.height).unwrap_or(0);
-                            let ruled = tail_is_overruled(ours, our_abs, mb.previous_hash, child_abs, witnesses, f1);
+                            let ruled = tail_is_overruled(ours, our_abs, mb.previous_hash, child_abs, rival, f1);
                             if ruled && child_abs < our_abs && is_warn() {
-                                println!("[WARN][FORK] tail_overruled_by_quorum h={} witnesses={} f1={} our_round={} child_round={}",
-                                         disputed, witnesses, f1, our_abs, child_abs);
+                                println!("[WARN][FORK] tail_overruled_by_quorum h={} rival_attesters={} f1={} our_round={} child_round={}",
+                                         disputed, rival, f1, our_abs, child_abs);
                             }
                             ruled
                         };

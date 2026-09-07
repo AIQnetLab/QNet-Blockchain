@@ -1926,13 +1926,15 @@ impl SimplifiedP2P {
         // Judging silence from it would make a freshly started genesis take over all three of its
         // shards - three fifths of a ten-million-node registry - for no reason.
         let liveness_known = !self.active_full_super_nodes.is_empty();
+        let now_ts = self.current_timestamp();
         let owner_alive = |idx: usize| -> bool {
             if idx == our_genesis_idx || !liveness_known { return true; }
+            // Point-read: the map is keyed by node_id. Scanning it instead cost O(active supers) per
+            // owner per slot, which at the target super-node count is a six-figure walk every second
+            // to answer a question about five fixed identities.
             let id = format!("genesis_node_{:03}", idx + 1);
-            let now = self.current_timestamp();
-            self.active_full_super_nodes.iter().any(|e| {
-                e.value().node_id == id && now.saturating_sub(e.value().last_seen) < OWNER_SILENT_SECS
-            })
+            self.active_full_super_nodes.get(&id)
+                .map_or(false, |e| now_ts.saturating_sub(e.value().last_seen) < OWNER_SILENT_SECS)
         };
         let covered = crate::node::light_shards_to_cover(our_genesis_idx, &owner_alive);
         let covered_mask: usize = covered.iter().fold(0, |m, (sh, _)| m | (1 << sh));
@@ -1941,6 +1943,23 @@ impl SimplifiedP2P {
                      our_genesis_idx, covered.iter().map(|(sh, _)| *sh).collect::<Vec<_>>());
         }
 
+        // "Dormant" must mean the DEVICE stopped answering, never that nobody asked. When this shard
+        // has no committed bitmap for the epoch just ended, the silence is ours: the owner was down,
+        // wedged or restarting through the commit window, and every device in the shard looks dormant
+        // through no fault of its own. One recovery sweep wakes the whole shard instead of waiting for
+        // ten million people to open an app.
+        let recovering = {
+            let prev_epoch = current_window.saturating_sub(1);
+            match crate::node::try_get_storage() {
+                Some(st) => prev_epoch > 0 && st.load_light_bitmaps(prev_epoch)
+                    .map(|m| covered.iter().any(|(sh, _)| !m.contains_key(sh))).unwrap_or(false),
+                None => false,
+            }
+        };
+        if recovering && crate::node::is_warn() {
+            println!("[WARN][GENESIS-PING] shard_recovery_sweep shards={:?} epoch={} reason=no_committed_bitmap_last_epoch",
+                     covered.iter().map(|(sh, _)| *sh).collect::<Vec<_>>(), current_window);
+        }
         let registry = self.light_node_registry.read();
         let reg_len = registry.len();
 
@@ -1968,23 +1987,6 @@ impl SimplifiedP2P {
         // registered_at. Liveness authority is on-chain; this is only a derived whom-to-wake hint.
         let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
         const WAKE_GRACE_EPOCHS: u64 = 3;
-        // "Dormant" must mean the DEVICE stopped answering, never that nobody asked. When this shard
-        // has no committed bitmap for the epoch just ended, the silence is ours: the owner was down,
-        // wedged or restarting through the commit window, and every device in the shard looks dormant
-        // through no fault of its own. One recovery sweep wakes the whole shard instead of waiting for
-        // ten million people to open an app.
-        let recovering = {
-            let prev_epoch = current_window.saturating_sub(1);
-            match crate::node::try_get_storage() {
-                Some(st) => prev_epoch > 0 && st.load_light_bitmaps(prev_epoch)
-                    .map(|m| covered.iter().any(|(sh, _)| !m.contains_key(sh))).unwrap_or(false),
-                None => false,
-            }
-        };
-        if recovering && crate::node::is_warn() {
-            println!("[WARN][GENESIS-PING] shard_recovery_sweep shards={:?} epoch={} reason=no_committed_bitmap_last_epoch",
-                     covered.iter().map(|(sh, _)| *sh).collect::<Vec<_>>(), current_window);
-        }
         let elig = self.epoch_light_eligible.read();
         let attested_recent = |id: &str| (0..WAKE_GRACE_EPOCHS)
             .any(|d| elig.get(&current_window.saturating_sub(d)).map(|s| s.contains(id)).unwrap_or(false));
