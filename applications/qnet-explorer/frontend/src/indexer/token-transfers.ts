@@ -1,4 +1,5 @@
 import type { Pool } from 'pg';
+import { createHash } from 'node:crypto';
 import type { NodeClient } from './node-client';
 import { log, errText } from './log';
 
@@ -38,10 +39,42 @@ async function fetchWindow(node: NodeClient, start: number, end: number, pin?: s
 
 export interface TransferWindow { start: number; end: number; rows: NodeTransfer[] }
 
-// Network half: the transfers for [fromHeight, toHeight] in node-sized windows. A window whose fetch
-// failed is left out, so the stored rows for it stay as they were.
+const TEXT_MAX = 128;
+const AMOUNT_MAX = 10n ** 80n - 1n;   // token_transfers.amount is NUMERIC(80,0)
+
+// One row as the archive will store it: every text bounded and NUL-free, every number inside its
+// column, so nothing a node sends can make the window's INSERT fail.
+function bounded(t: NodeTransfer, start: number, end: number): NodeTransfer | null {
+  const text = (v: unknown, max: number): string => (typeof v === 'string' ? v.replace(/\u0000/g, '').slice(0, max) : '');
+  const tx_hash = text(t.tx_hash, 64);
+  if (!/^[0-9a-f]{64}$/.test(tx_hash)) return null;
+  if (!Number.isInteger(t.log_index) || (t.log_index as number) < 0 || (t.log_index as number) > 2_147_483_647) return null;
+  if (!Number.isInteger(t.height) || (t.height as number) < start || (t.height as number) > end) return null;
+  const contract = text(t.contract, TEXT_MAX);
+  if (!contract) return null;
+  const raw = typeof t.amount === 'string' ? t.amount.trim() : (typeof t.amount === 'number' && Number.isFinite(t.amount) ? Math.trunc(t.amount).toString() : '0');
+  let amount = /^\d+$/.test(raw) ? BigInt(raw) : 0n;
+  if (amount > AMOUNT_MAX) amount = AMOUNT_MAX;
+  return {
+    tx_hash, log_index: t.log_index, contract, height: t.height,
+    from: text(t.from, TEXT_MAX), to: text(t.to, TEXT_MAX), amount: amount.toString(),
+    kind: text(t.kind, 32), std: text(t.std, 32), token_id: text(t.token_id, TEXT_MAX),
+    timestamp: Number.isSafeInteger(t.timestamp) && (t.timestamp as number) >= 0 ? t.timestamp : 0,
+  };
+}
+
+function windowDigest(rows: NodeTransfer[]): string {
+  const h = createHash('sha3-256');
+  for (const r of [...rows].sort((a, b) => (a.tx_hash! < b.tx_hash! ? -1 : a.tx_hash! > b.tx_hash! ? 1 : (a.log_index! - b.log_index!)))) {
+    h.update(JSON.stringify([r.tx_hash, r.log_index, r.contract, r.from, r.to, r.amount, r.kind, r.std, r.token_id, r.height, r.timestamp]));
+  }
+  return h.digest('hex');
+}
+
+// Network half, one endpoint: the transfers for [fromHeight, toHeight] in node-sized windows. A
+// window whose fetch failed is left out.
 export async function fetchTokenTransfers(node: NodeClient, fromHeight: number, toHeight: number, pin?: string): Promise<TransferWindow[]> {
-  if (!pin) return [];   // no endpoint vouched for the bodies here; a window is not replaced blind
+  if (!pin) return [];
   const out: TransferWindow[] = [];
   if (!Number.isInteger(fromHeight) || !Number.isInteger(toHeight) || fromHeight < 0 || toHeight < fromHeight) return out;
   let total = 0;
@@ -53,9 +86,8 @@ export async function fetchTokenTransfers(node: NodeClient, fromHeight: number, 
     if (list === null) continue;
     if (list === 'overflow') { const mid = Math.floor((start + end) / 2); pending.unshift([start, mid], [mid + 1, end]); continue; }
     // A row is stored under the height the node reports, so a row outside the window the DELETE covers
-    // would never be replaced again: it does not enter the archive.
-    const rows = list.filter(t => typeof t.tx_hash === 'string' && t.tx_hash && Number.isInteger(t.log_index)
-      && typeof t.contract === 'string' && t.contract && Number.isInteger(t.height) && (t.height as number) >= start && (t.height as number) <= end);
+    // would never be replaced again: it does not enter the archive. Every field is bounded here.
+    const rows = list.map(t => bounded(t, start, end)).filter((t): t is NodeTransfer => t !== null);
     total += rows.length;
     out.push({ start, end, rows });
     if (total > MAX_ROWS) {
@@ -66,12 +98,33 @@ export async function fetchTokenTransfers(node: NodeClient, fromHeight: number, 
   return out;
 }
 
+// The transfers for a range as `need` of the given endpoints agree on them, window by window. A window
+// on which fewer than `need` agree is left out — its stored rows stay as they were — because the
+// transfer index is not bound by any block hash and one endpoint's word cannot delete it.
+export async function fetchTokenTransfersAgreed(node: NodeClient, fromHeight: number, toHeight: number, sources: string[], need: number): Promise<TransferWindow[]> {
+  const perSource = await Promise.all(sources.map(s => fetchTokenTransfers(node, fromHeight, toHeight, s).catch(() => [] as TransferWindow[])));
+  const votes = new Map<string, { w: TransferWindow; n: number }>();
+  for (const windows of perSource) {
+    for (const w of windows) {
+      const k = `${w.start}:${w.end}:${windowDigest(w.rows)}`;
+      const e = votes.get(k) ?? { w, n: 0 };
+      e.n += 1; votes.set(k, e);
+    }
+  }
+  const out: TransferWindow[] = [];
+  const decided = new Set<string>();
+  for (const { w, n } of votes.values()) {
+    const span = `${w.start}:${w.end}`;
+    if (n >= need && !decided.has(span)) { decided.add(span); out.push(w); }
+  }
+  const undecided = new Set([...votes.values()].map(v => `${v.w.start}:${v.w.end}`).filter(s => !decided.has(s)));
+  if (undecided.size > 0) log.warn('TOKENS', 'window_unagreed', { from: fromHeight, to: toHeight, windows: undecided.size, sources: sources.length, need });
+  return out;
+}
+
 // Database half: replace each window in its own transaction. Runs under the follower's write lock.
 export async function replaceTokenTransfers(pool: Pool, windows: TransferWindow[]): Promise<void> {
-  const amount = (t: NodeTransfer): string => {
-    const s = typeof t.amount === 'string' ? t.amount.trim() : (typeof t.amount === 'number' && Number.isFinite(t.amount) ? Math.trunc(t.amount).toString() : '0');
-    return /^\d+$/.test(s) ? s : '0';
-  };
+  const amount = (t: NodeTransfer): string => (typeof t.amount === 'string' ? t.amount : '0');
   for (const { start, end, rows: ok } of windows) {
     const client = await pool.connect();
     try {

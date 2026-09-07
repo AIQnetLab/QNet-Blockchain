@@ -3,7 +3,9 @@ import type { BlockRow, TxRow, BatchRow } from './transform';
 // Bulk statements over unnest'ed arrays: one statement per table per batch with a fixed parameter
 // count, however many rows it carries (the wire protocol caps a statement at 65 535 parameters).
 // A stored real identity (hash, previous_hash, merkle_root) is never replaced by an upsert: a reorg
-// deletes the row first, so a differing identity here is a defect upstream, not new information.
+// deletes the row first, so a differing identity here is a defect upstream, not new information. A
+// stored body is never demoted by an upsert either: a header-only row landing on a body row keeps the
+// body's count, producer and flag (the caller already keeps its transaction rows).
 
 export interface Statement { text: string; values: unknown[] }
 
@@ -23,9 +25,12 @@ export function insertBlocks(rows: BlockRow[]): Statement {
              timestamp = EXCLUDED.timestamp,
              previous_hash = CASE WHEN blocks.previous_hash ~ '^[0-9a-f]{64}$' THEN blocks.previous_hash ELSE EXCLUDED.previous_hash END,
              merkle_root = CASE WHEN blocks.merkle_root ~ '^[0-9a-f]{64}$' THEN blocks.merkle_root ELSE EXCLUDED.merkle_root END,
-             producer = EXCLUDED.producer, tx_count = EXCLUDED.tx_count,
-             tx_skipped = EXCLUDED.tx_skipped, total_gas_used = EXCLUDED.total_gas_used, size_bytes = EXCLUDED.size_bytes,
-             body_indexed = EXCLUDED.body_indexed, updated_at = CURRENT_TIMESTAMP
+             producer = CASE WHEN blocks.body_indexed AND coalesce(blocks.tx_count, 0) > 0 AND NOT EXCLUDED.body_indexed THEN blocks.producer ELSE EXCLUDED.producer END,
+             tx_count = CASE WHEN blocks.body_indexed AND coalesce(blocks.tx_count, 0) > 0 AND NOT EXCLUDED.body_indexed THEN blocks.tx_count ELSE EXCLUDED.tx_count END,
+             tx_skipped = CASE WHEN blocks.body_indexed AND coalesce(blocks.tx_count, 0) > 0 AND NOT EXCLUDED.body_indexed THEN blocks.tx_skipped ELSE EXCLUDED.tx_skipped END,
+             total_gas_used = CASE WHEN blocks.body_indexed AND coalesce(blocks.tx_count, 0) > 0 AND NOT EXCLUDED.body_indexed THEN blocks.total_gas_used ELSE EXCLUDED.total_gas_used END,
+             size_bytes = CASE WHEN blocks.body_indexed AND coalesce(blocks.tx_count, 0) > 0 AND NOT EXCLUDED.body_indexed THEN blocks.size_bytes ELSE EXCLUDED.size_bytes END,
+             body_indexed = blocks.body_indexed OR EXCLUDED.body_indexed, updated_at = CURRENT_TIMESTAMP
            RETURNING (xmax = 0) AS inserted`,
     values: [
       column(rows, 'height'), column(rows, 'hash'), column(rows, 'timestamp'), column(rows, 'previous_hash'),

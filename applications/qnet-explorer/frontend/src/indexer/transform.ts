@@ -144,6 +144,17 @@ function clip(v: unknown, max: number): string | null {
   return s.length > max ? s.substring(0, max) : s;
 }
 
+// Everything a body contributes to the archive, in order, under one digest. Two endpoints serving the
+// same block produce the same digest; one that altered a field the merkle root does not bind (the
+// root covers transaction hashes, not their content) produces another.
+export function shapedDigest(s: { txs: TxRow[]; batch: BatchRow[]; txHashes: string[] }): string {
+  const h = createHash('sha3-256');
+  h.update(JSON.stringify(s.txHashes));
+  for (const t of s.txs) h.update(JSON.stringify([t.hash, t.from_address, t.to_address, t.amount, t.nonce, t.gas_price, t.gas_limit, t.tx_type, t.tx_type_data, t.data, t.signature, t.public_key, t.dilithium_signature, t.dilithium_public_key, t.is_quantum_signed]));
+  for (const r of s.batch) h.update(JSON.stringify([r.tx_hash, r.tx_index, r.from_address, r.to_address, r.amount]));
+  return h.digest('hex');
+}
+
 // The node's transaction merkle root: leaf H(0x00||hash), internal H(0x01||left||right) over SHA3-256,
 // an odd node duplicated, and H("") for an empty block. The root is inside the block hash, so a body
 // that reproduces it is the body that hash names.
@@ -229,9 +240,10 @@ export interface ShapedBlock {
 
 // A full node block → block row + tx rows (in block order) + recipient rows. Gas used is summed with
 // the u64::MAX "no gas" sentinel skipped and clamped to the column (price × limit is up to 2^128).
-export function shapeBlock(b: NodeBlock): ShapedBlock {
+export function shapeBlock(b: NodeBlock, slotTsMs = 0): ShapedBlock {
   const txsRaw = Array.isArray(b.transactions) ? b.transactions : [];
-  const blockTs = toMs(b.timestamp);
+  // The block's time is the slot's, never the body's: every row it produces carries it.
+  const blockTs = slotTsMs > 0 ? slotTsMs : toMs(b.timestamp);
   const txs: TxRow[] = [];
   const batch: BatchRow[] = [];
   const seen = new Set<string>();
@@ -260,7 +272,7 @@ export function shapeBlock(b: NodeBlock): ShapedBlock {
       timestamp: blockTs,
       previous_hash: isHex64(prev) ? prev : null,
       merkle_root: isHex64(merkle) ? merkle : null,
-      producer: typeof b.producer === 'string' && b.producer ? b.producer : 'unknown',
+      producer: clip(b.producer, 128) || 'unknown',
       tx_count: txsRaw.length,
       tx_skipped: txsRaw.length - txs.length,
       total_gas_used: uintString(gas, GAS_COLUMN_MAX),
@@ -280,7 +292,7 @@ export function blockRowFromHeader(h: NodeHeader, genesisTsMs: number): BlockRow
       height: h.height, hash: isHex64(h.hash) ? h.hash : null, timestamp: toMs(h.timestamp),
       previous_hash: isHex64(h.previous_hash) ? h.previous_hash : null,
       merkle_root: isHex64(h.merkle_root) ? h.merkle_root : null,
-      producer: h.producer || 'unknown', tx_count: 0, tx_skipped: 0, total_gas_used: '0', size_bytes: 0, body_indexed: true,
+      producer: clip(h.producer, 128) || 'unknown', tx_count: 0, tx_skipped: 0, total_gas_used: '0', size_bytes: 0, body_indexed: true,
     };
   }
   return {

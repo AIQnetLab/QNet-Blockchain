@@ -57,6 +57,7 @@ const ENDPOINT_COOLDOWN_MS = 15_000;
 const WS_FRESH_MS = 10_000;          // the WS endpoint is preferred only while it delivers TIP blocks
 const WS_EVENT_SILENCE_MS = 45_000;  // no tip block for this long ⇒ the socket is dropped and rotated
 const WS_MAX_EVENTS_PER_SEC = 500;   // a socket streaming faster than any replay is torn down
+const FANOUT_GRACE_MS = 6_000;       // after a quorum answered, how long the rest may take
 export const HEIGHT_SLACK = 600;     // a single source may lead the agreed network height by this much
 
 // The network height from per-endpoint answers: the quorum-th highest, so no minority can inflate it
@@ -162,7 +163,9 @@ export class NodeClient {
     return [...pinned, ...warm, ...cold, ...pinCold];
   }
 
-  private markFailed(endpoint: string, why: string): void {
+  /// A transient fault: the endpoint sits out a short cooldown. Public so the follower can charge one
+  /// for a claim it did not honour — serving nothing is a fault the transport layer never sees.
+  markFailed(endpoint: string, why: string): void {
     this.failedUntil.set(endpoint, Date.now() + ENDPOINT_COOLDOWN_MS);
     log.warn('NODE', 'endpoint_failed', { endpoint, why });
   }
@@ -237,7 +240,10 @@ export class NodeClient {
     });
     const best = pickNetworkHeight(heights, this.quorum);
     if (best < 0) throw new Error('no endpoint answered /height');
-    this.noteHeight(best, true);
+    // Only a quorum of ANSWERS sets the agreed anchor. Fewer than that still schedules work, but a
+    // lone endpoint must not define the height everything else is measured against.
+    this.noteHeight(best, heights.length >= this.quorum);
+    if (heights.length < this.quorum) log.warn('NODE', 'height_below_quorum', { answers: heights.length, quorum: this.quorum, best });
     return best;
   }
 
@@ -253,14 +259,32 @@ export class NodeClient {
   }
 
   // The same header page from every ADMITTED endpoint: chain-identity decisions need agreement.
+  // Every admitted endpoint is asked at once. The read returns when all have answered, or when a
+  // quorum has and the rest have had FANOUT_GRACE_MS: one silent endpoint must not put its whole
+  // timeout under every decision. An endpoint that fails or is left behind takes a cooldown.
   async getHeadersFromAll(from: number, limit: number): Promise<Array<{ endpoint: string; page: HeadersPage }>> {
     const path = `/api/v1/blocks/headers?from=${from}&limit=${Math.min(Math.max(limit, 1), 1000)}`;
     const pool = this.admitted();
-    const results = await Promise.allSettled(pool.map(e => this.fetchOne<HeadersPage>(e, path, { method: 'GET' }, MAX_SMALL_BYTES, 20_000)));
     const out: Array<{ endpoint: string; page: HeadersPage }> = [];
-    results.forEach((r, i) => {
-      if (r.status === 'fulfilled' && Array.isArray(r.value.items)) out.push({ endpoint: pool[i], page: r.value });
+    const done = new Set<string>();
+    let settled = 0;
+    await new Promise<void>(resolve => {
+      let finished = false;
+      const finish = () => { if (!finished) { finished = true; clearTimeout(grace); resolve(); } };
+      const grace = setTimeout(() => { if (out.length >= this.quorum) finish(); }, FANOUT_GRACE_MS);
+      for (const e of pool) {
+        this.fetchOne<HeadersPage>(e, path, { method: 'GET' }, MAX_SMALL_BYTES, 20_000)
+          .then(v => { if (Array.isArray(v.items)) out.push({ endpoint: e, page: v }); })
+          .catch(err => { this.markFailed(e, `headers: ${errText(err)}`); })
+          .finally(() => {
+            done.add(e); settled += 1;
+            if (settled === pool.length) finish();
+            else if (out.length >= this.quorum && settled >= pool.length - 1) finish();
+          });
+      }
+      if (pool.length === 0) finish();
     });
+    for (const e of pool) if (!done.has(e)) this.markFailed(e, 'headers: left behind the quorum');
     return out;
   }
 
@@ -268,7 +292,8 @@ export class NodeClient {
   async getQuorumHeaders(from: number, limit: number): Promise<QuorumHeaders> {
     const views = await this.getHeadersFromAll(from, limit);
     const out = reduceHeaderViews(views, this.quorum, this.honestOne);
-    if (out.head > 0) this.noteHeight(out.head);
+    // A page a quorum answered carries a quorum-th head: as good an anchor as the height poll.
+    if (out.head > 0) this.noteHeight(out.head, views.length >= this.quorum);
     const bodyless = out.items.filter(i => !i.body).length;
     if (bodyless > 0 && limit > 1) log.info('NODE', 'headers_without_body', { from, count: bodyless, need: this.honestOne });
     return out;

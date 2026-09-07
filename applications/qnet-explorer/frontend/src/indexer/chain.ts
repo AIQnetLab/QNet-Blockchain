@@ -1,8 +1,8 @@
 import type { Pool } from 'pg';
 import { NodeClient, HEIGHT_SLACK, type NewBlockEvent, type NodeHeader, type QuorumHeaders } from './node-client';
 import { Writer } from './writer';
-import { shapeBlock, blockRowFromHeader, isHex64, toMs, merkleRootOf, type BlockRow, type ShapedBlock } from './transform';
-import { fetchTokenTransfers, replaceTokenTransfers } from './token-transfers';
+import { shapeBlock, shapedDigest, blockRowFromHeader, isHex64, toMs, merkleRootOf, type BlockRow, type ShapedBlock } from './transform';
+import { fetchTokenTransfersAgreed, replaceTokenTransfers } from './token-transfers';
 import { log, errText } from './log';
 
 // Chain follower. head = highest stored block, prefix = every height ≤ it is stored, every other hole is
@@ -28,10 +28,10 @@ const HEAL_IDLE_MS = 600_000;
 const HEAL_CANDIDATES = 2_000;
 const SHORT_SCAN_WINDOW = 20_000;       // heights per pass for the short-body scan
 const SAMPLE_INTERVAL_MS = 600_000;
+const ANCHOR_RECHECK_MS = 1_800_000;    // the chain under the archive can be replaced without a contradiction
 const SAMPLE_SIZE = 32;
 const QUARANTINE_MS = 1_800_000;
 const LAG_WARN = 3_600;
-const LAG_ERR = RETENTION_BLOCKS / 2;
 const PREFIX_RECHECK = 5_000;
 
 interface StoredLink { height: number; hash: string | null; previous_hash: string | null; merkle_root: string | null; body_indexed: boolean; tx_count: number | null }
@@ -42,6 +42,7 @@ export class Chain {
   private prefix = -1;
   private nodeHeight = 0;
   private genesisTsMs = 0;
+  private genesisTsUnconfirmed = false;
   private genesisKnown = false;
   private wsConnected = false;
   private endpoint: string | null = null;
@@ -79,8 +80,13 @@ export class Chain {
     this.prefix = synced.prefix;
     const g = await this.pool.query<{ genesis_hash: string | null }>('SELECT genesis_hash FROM sync_state WHERE id = 1');
     this.genesisKnown = isHex64(g.rows[0]?.genesis_hash);
-    this.nodeHeight = await this.node.getHeight();
-    this.lastHeightRefresh = Date.now();
+    try {
+      this.nodeHeight = await this.node.getHeight();
+      this.lastHeightRefresh = Date.now();
+    } catch (e) {
+      // A moment with no endpoint answering is not a reason to die: the poll supplies the height.
+      log.warn('INDEXER', 'boot_height_unavailable', { err: errText(e) });
+    }
     await this.confirmGenesisAnchor();
     await this.loadGenesisTs();
     await this.rederiveGaps();
@@ -106,6 +112,9 @@ export class Chain {
     this.timers.push(setInterval(() => void this.healTick(), HEAL_INTERVAL_MS));
     this.timers.push(setInterval(() => void this.publishState(), 5_000));
     this.timers.push(setInterval(() => void this.enqueueHead(() => this.sampleTick()), SAMPLE_INTERVAL_MS));
+    // A relaunch replaces the chain under the archive without contradicting any height it holds, so
+    // the anchor is re-asked periodically, not only when it has never been confirmed.
+    this.timers.push(setInterval(() => void this.enqueueHead(async () => { await this.anchorSaysFreshGenesis(); }), ANCHOR_RECHECK_MS));
     setTimeout(() => void this.healTick(), 10_000);
   }
 
@@ -136,6 +145,14 @@ export class Chain {
     return run;
   }
 
+  // Any page that reduced is proof the endpoints still agree on something: it lifts a halt, and it is
+  // recorded before the halt can gate the caller, so the state is never terminal.
+  private noteQuorumProgress(): void {
+    if (this.halted) log.warn('INDEXER', 'halt_lifted', { was: this.halted });
+    this.emptyQuorumPages = 0;
+    this.halted = null;
+  }
+
   // A single source moves the local view only within HEIGHT_SLACK of the last AGREED height, so no
   // endpoint can walk it upward one answer at a time.
   private bumpHeight(h: number): void {
@@ -157,7 +174,12 @@ export class Chain {
         const votes = await this.votesAt(ev.height);
         const against = votes.filter(v => v.hash !== s.hash).length;
         if (against >= this.node.quorum) await this.repairContradictedRun(ev.height, `a quorum names another block at ${ev.height}`);
-        else log.warn('INDEXER', 'event_hash_unconfirmed', { h: ev.height, against, votes: votes.length, endpoint: ev.endpoint });
+        else {
+          // The announcement did not survive one vote round. It costs the announcer a cooldown, so a
+          // stream of them cannot keep the head queue busy.
+          this.node.markFailed(ev.endpoint, `announced an unconfirmed hash at ${ev.height}`);
+          log.warn('INDEXER', 'event_hash_unconfirmed', { h: ev.height, against, votes: votes.length, endpoint: ev.endpoint });
+        }
         return;
       }
       if (!s) await this.recordGap(ev.height, ev.height);       // a hole announced itself
@@ -169,7 +191,18 @@ export class Chain {
   }
 
   private async pollTick(): Promise<void> {
-    if (this.stopped || this.halted) return;
+    if (this.stopped) return;
+    if (this.halted) {
+      // Halted means the endpoints disagreed about everything. Keep asking: the moment one page
+      // reduces again the halt lifts, and nothing else in the follower can do that.
+      try {
+        const probe = await this.node.getQuorumHeaders(Math.max(0, this.head), 1);
+        if (probe.items.length > 0) this.noteQuorumProgress();
+      } catch (e) {
+        log.warn('INDEXER', 'halt_probe_failed', { err: errText(e) });
+      }
+      return;
+    }
     const now = Date.now();
     const quiet = this.wsConnected && now - this.lastWsEvent < WS_SILENCE_MS;
     const due = quiet ? now - this.lastHeightRefresh >= HEIGHT_REFRESH_MS
@@ -180,7 +213,7 @@ export class Chain {
     try { h = await this.node.getHeight(); } catch (e) { log.warn('INDEXER', 'poll_height_failed', { err: errText(e) }); return; }
     this.lastHeightRefresh = Date.now();
     this.nodeHeight = h;
-    if (this.genesisTsMs === 0) await this.loadGenesisTs();
+    if (this.genesisTsMs === 0 || this.genesisTsUnconfirmed) await this.loadGenesisTs();
     if (quiet) return;
     if (h > this.head) {
       await this.enqueueHead(async () => {
@@ -210,7 +243,8 @@ export class Chain {
     const page = prefetched ?? await this.node.getQuorumHeaders(a, b - a + 1);
     this.bumpHeight(page.head);
     // Only heights a quorum of endpoints names identically are here; the rest stay gaps.
-    const items = page.items.filter(h => h.height >= a && h.height <= b);
+    let items = page.items.filter(h => h.height >= a && h.height <= b);
+    if (items.length > 0) this.noteQuorumProgress();
     if (items.length === 0 && b <= page.head && page.endpoints >= this.node.quorum) {
       // The endpoints answered about a range they say exists and agreed on nothing: they are on
       // different chains, or every row here is unreadable. Said out loud after a long streak, and
@@ -224,18 +258,13 @@ export class Chain {
       }
       return all();
     }
-    if (this.emptyQuorumPages > 0 || this.halted) {
-      if (this.halted) log.warn('INDEXER', 'halt_lifted', { was: this.halted, at: a });
-      this.emptyQuorumPages = 0;
-      this.halted = null;
-    }
-    // Slot times are exact (genesis + height·1 s). A header that disagrees is a node fault, not a block.
+
+    // Slot times are exact (genesis + height·1 s). A header that disagrees loses its own height; the
+    // rest of the page is unaffected, so one bad answer cannot stop the archive.
     if (this.genesisTsMs > 0) {
-      const off = items.find(i => i.body && toMs(i.timestamp) !== this.genesisTsMs + i.height * 1000);
-      if (off) {
-        log.warn('INDEXER', 'header_off_slot', { h: off.height, ts: toMs(off.timestamp), expected: this.genesisTsMs + off.height * 1000 });
-        return all();
-      }
+      const before = items.length;
+      items = items.filter(i => !i.body || toMs(i.timestamp) === this.genesisTsMs + i.height * 1000);
+      if (items.length !== before) log.warn('INDEXER', 'header_off_slot', { dropped: before - items.length, a, b });
     }
     const have = new Set(items.map(i => i.height));
     const missing: number[] = [];
@@ -261,9 +290,10 @@ export class Chain {
       }
     }
     const needFull = items.filter(i => i.body && (i.tx_count || 0) > 0);
-    const full = await this.fetchFull(needFull, page.bodySources);
-    const fetched = new Set(full.map(f => f.block.height));
-    for (const it of needFull) if (!fetched.has(it.height)) missing.push(it.height);
+    const fetched = await this.fetchFull(needFull, page.bodySources);
+    const full = fetched.blocks;
+    const haveBody = new Set(full.map(f => f.block.height));
+    for (const it of needFull) if (!haveBody.has(it.height)) missing.push(it.height);
     const headersOnly: BlockRow[] = [];
     const hashFixes: Array<[number, string]> = [];
     for (const it of items) {
@@ -297,11 +327,13 @@ export class Chain {
     if (!committed) { log.info('INDEXER', 'commit_dropped_epoch_changed', { a, b, source }); return all(); }
 
     if (full.length > 0) {
-      // From an endpoint that served a body here (its transactions matched the quorum's root), and an
-      // empty window is no information: replacing on it would erase transfers nobody contradicted.
+      // The transfer index is bound by nothing a block carries, so a window is replaced only when the
+      // endpoints whose rows were the agreed ones for these blocks agree on it too.
       const hs = full.map(f => f.block.height);
-      const src = page.bodySources.get(hs[0])?.find(e => this.node.isHealthy(e));
-      const windows = (await fetchTokenTransfers(this.node, Math.min(...hs), Math.max(...hs), src)).filter(w => w.rows.length > 0);
+      const agreeing = [...new Set(hs.flatMap(h => fetched.served.get(h) ?? []))];
+      const windows = agreeing.length >= this.node.honestOne
+        ? await fetchTokenTransfersAgreed(this.node, Math.min(...hs), Math.max(...hs), agreeing, this.node.honestOne)
+        : [];
       if (windows.length > 0) await this.withWrite(async () => { if (this.epoch === epoch0) await replaceTokenTransfers(this.pool, windows); });
     }
     if (items.length > 0) await this.verifyNeighbours(items[0].height, items[items.length - 1].height);
@@ -322,48 +354,65 @@ export class Chain {
 
   // Bodies come from an endpoint that reports holding them; identity and the merkle root are the
   // quorum's, so a body only enters when it rebuilds the root the quorum named.
-  private async fetchFull(headers: NodeHeader[], bodySources: Map<number, string[]>): Promise<ShapedBlock[]> {
+  // A body enters the archive only when `honestOne` independent endpoints serve the same rows. The
+  // merkle root binds the transaction HASHES; their content — the fields the explorer stores — is bound
+  // only by agreement, since the node's transaction hash is not reproducible here. Identity, previous
+  // hash, root, producer and time all come from the quorum header; the body supplies rows and nothing
+  // else. Returns the accepted bodies and, per height, the endpoints whose rows were the agreed ones.
+  private async fetchFull(headers: NodeHeader[], bodySources: Map<number, string[]>): Promise<{ blocks: ShapedBlock[]; served: Map<number, string[]> }> {
     const out: ShapedBlock[] = [];
+    const served = new Map<number, string[]>();
+    if (this.genesisTsMs === 0) return { blocks: out, served };   // rows need the slot time; the heights stay gaps
+    const need = this.node.honestOne;
     let i = 0;
-    let pinDown = false;
     const worker = async () => {
-      while (i < headers.length && !pinDown) {
+      while (i < headers.length) {
         const h = headers[i++];
-        const sources = bodySources.get(h.height) ?? [];
-        const pin = sources.find(e => this.node.isHealthy(e)) ?? sources[0];
-        if (!pin) continue;
-        try {
-          const got = await this.node.getBlockFrom(h.height, pin);
-          if (!got) continue;
-          const { block: b, endpoint: src } = got;
-          const shaped = shapeBlock(b);
-          if (!shaped.block.hash && h.hash) shaped.block.hash = h.hash;
-          if (shaped.block.hash && h.hash && shaped.block.hash !== h.hash) {
-            log.warn('INDEXER', 'block_hash_changed_between_reads', { h: h.height, endpoint: src });
+        const root = isHex64(h.merkle_root) ? (h.merkle_root as string) : null;
+        if (!root) { log.warn('INDEXER', 'body_unverifiable_no_root', { h: h.height }); continue; }
+        const sources = (bodySources.get(h.height) ?? []).filter(e => !this.node.isQuarantined(e));
+        const ordered = [...sources.filter(e => this.node.isHealthy(e)), ...sources.filter(e => !this.node.isHealthy(e))];
+        const byDigest = new Map<string, { shaped: ShapedBlock; from: string[] }>();
+        let winner: { shaped: ShapedBlock; from: string[] } | null = null;
+        for (const src of ordered) {
+          let got;
+          try {
+            got = await this.node.getBlockFrom(h.height, src);
+          } catch (e) {
+            log.warn('INDEXER', 'block_fetch_failed', { h: h.height, endpoint: src, err: errText(e) });
             continue;
           }
-          // The transaction set must rebuild the merkle root the HEADER carries — a root from the same
-          // response proves only that the response agrees with itself. Without a header root there is
-          // nothing to bind the body to, so the height stays a gap.
-          const root = isHex64(h.merkle_root) ? (h.merkle_root as string) : null;
-          if (!root) { log.warn('INDEXER', 'body_unverifiable_no_root', { h: h.height, endpoint: src }); continue; }
+          if (!got || got.endpoint !== src) { this.node.markFailed(src, `claimed the body at ${h.height} and did not serve it`); continue; }
+          const shaped = shapeBlock(got.block, this.genesisTsMs + h.height * 1000);
           if (merkleRootOf(shaped.txHashes) !== root) {
-            this.node.quarantine(src, QUARANTINE_MS, `body does not match the header merkle root at ${h.height}`);
-            break;
-          }
-          if (this.genesisTsMs > 0 && shaped.block.timestamp !== this.genesisTsMs + h.height * 1000) {
-            log.warn('INDEXER', 'body_off_slot', { h: h.height, endpoint: src });
+            this.node.quarantine(src, QUARANTINE_MS, `body does not match the quorum merkle root at ${h.height}`);
             continue;
           }
-          out.push(shaped);
-        } catch (e) {
-          log.warn('INDEXER', 'block_fetch_failed', { h: h.height, err: errText(e) });
-          if (!this.node.isHealthy(pin)) pinDown = true;   // the rest stays missing; retried elsewhere
+          shaped.block.hash = h.hash ?? shaped.block.hash;
+          shaped.block.previous_hash = isHex64(h.previous_hash) ? (h.previous_hash as string) : null;
+          shaped.block.merkle_root = root;
+          shaped.block.producer = h.producer || 'unknown';
+          if (h.tx_count !== undefined) shaped.block.tx_skipped = Math.max(0, h.tx_count - shaped.txs.length);
+          const d = shapedDigest(shaped);
+          const e = byDigest.get(d) ?? { shaped, from: [] };
+          e.from.push(src); byDigest.set(d, e);
+          if (e.from.length >= need) { winner = e; break; }
+          // Enough left to reach agreement? Otherwise stop asking.
+          const remaining = ordered.length - ordered.indexOf(src) - 1;
+          if (Math.max(...[...byDigest.values()].map(v => v.from.length)) + remaining < need) break;
         }
+        if (!winner) {
+          log.warn('INDEXER', 'body_unagreed', { h: h.height, sources: sources.length, need, distinct: byDigest.size });
+          continue;
+        }
+        // Whoever served different rows for the same block served rows the block does not have.
+        for (const [d, e] of byDigest) if (e !== winner) for (const src of e.from) this.node.markFailed(src, `served different rows at ${h.height} (${d.slice(0, 8)})`);
+        out.push(winner.shaped);
+        served.set(h.height, winner.from);
       }
     };
     await Promise.all(Array.from({ length: Math.min(FULL_FETCH_CONCURRENCY, headers.length) }, worker));
-    return out.sort((x, y) => x.block.height - y.block.height);
+    return { blocks: out.sort((x, y) => x.block.height - y.block.height), served };
   }
 
   // A real hash is written only where none is stored and never over a present one. Callers pass a hash
@@ -491,6 +540,9 @@ export class Chain {
       this.prefix = -1;
       this.genesisTsMs = 0;
       this.genesisKnown = false;
+      this.pendingGaps.length = 0;
+      this.shortScanFrom = 0;
+      this.node.forgetAgreedHeight();
     });
     try { this.nodeHeight = await this.node.getHeight(); } catch { /* the next poll refreshes it */ }
     await this.confirmGenesisAnchor();
@@ -510,11 +562,28 @@ export class Chain {
     this.catchUpRunning = true;
     try {
       await this.settleOwedGaps();
+      // Two claims a tick: the lowest due range moves the prefix; the highest due range still inside the
+      // retention window saves bodies before the network drops them, instead of waiting behind history.
+      const edge = Math.max(0, this.nodeHeight - RETENTION_BLOCKS);
       const due = await this.pool.query<{ start_h: string; end_h: string; tries: number }>(
-        'SELECT start_h, end_h, tries FROM sync_gaps WHERE next_retry_at <= now() ORDER BY start_h LIMIT 1');
-      const g = due.rows[0];
-      if (!g) { await this.advancePrefix(); return; }
-      const start = Number(g.start_h), end = Number(g.end_h);
+        `(SELECT start_h, end_h, tries FROM sync_gaps WHERE next_retry_at <= now() ORDER BY start_h LIMIT 1)
+         UNION
+         (SELECT start_h, end_h, tries FROM sync_gaps WHERE next_retry_at <= now() AND end_h >= $1 ORDER BY end_h DESC LIMIT 1)`, [edge]);
+      if (due.rows.length === 0) { await this.advancePrefix(); return; }
+      for (const g of due.rows) await this.drainGap(Number(g.start_h), Number(g.end_h), g.tries);
+      await this.advancePrefix();
+    } catch (e) {
+      log.err('INDEXER', 'catchup_failed', { err: errText(e) });
+    } finally {
+      this.catchUpRunning = false;
+    }
+  }
+
+  // One claimed range: its first chunk is ingested, the remainder goes straight back, what is still
+  // missing is re-queued with a backoff, and the claim stays owed until every piece is in the ledger.
+  private async drainGap(start: number, end: number, tries: number): Promise<void> {
+    {
+      const g = { tries };
       const claimed = await this.pool.query('DELETE FROM sync_gaps WHERE start_h = $1 AND end_h = $2', [start, end]);
       if (claimed.rowCount !== 1) return;
       const chunkEnd = Math.min(end, start + CHUNK - 1);
@@ -537,11 +606,6 @@ export class Chain {
       // backoff; the claimed chunk stays owed until every one of them is in the ledger.
       for (const r of ranges(missing.sort((x, y) => x - y))) await this.requeue(r[0], r[1], g.tries + 1);
       this.owe(start, chunkEnd, -1);
-      await this.advancePrefix();
-    } catch (e) {
-      log.err('INDEXER', 'catchup_failed', { err: errText(e) });
-    } finally {
-      this.catchUpRunning = false;
     }
   }
 
@@ -609,6 +673,11 @@ export class Chain {
 
   private async recordGap(start: number, end: number): Promise<void> {
     if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || end < start || start < 0) return;
+    // Never owe a range the network has not claimed: one inflated answer would otherwise write
+    // millions of heights into the ledger and the catch-up would chase them for good.
+    const ceiling = Math.max(this.head, this.node.agreedHeight + HEIGHT_SLACK);
+    if (start > ceiling) return;
+    end = Math.min(end, ceiling);
     await this.pool.query(
       `INSERT INTO sync_gaps (start_h, end_h) VALUES ($1, $2)
        ON CONFLICT (start_h) DO UPDATE SET end_h = GREATEST(sync_gaps.end_h, EXCLUDED.end_h), next_retry_at = now()`,
@@ -649,12 +718,12 @@ export class Chain {
            SELECT height, 'identity' AS reason FROM blocks WHERE hash IS NULL OR hash !~ '^[0-9a-f]{64}$'
            UNION ALL
            SELECT b.height, 'short' FROM blocks b
-            WHERE b.height >= $3 AND b.height >= $1 AND b.body_indexed AND b.tx_count > b.tx_skipped
+            WHERE b.height >= $3 AND b.height < $3 + $4 AND b.height >= $1 AND b.body_indexed AND b.tx_count > b.tx_skipped
               AND (SELECT count(*) FROM transactions t WHERE t.block = b.height) < b.tx_count - b.tx_skipped
            UNION ALL
            SELECT height, 'pruned' FROM blocks WHERE NOT body_indexed AND height >= $1
          ) c ORDER BY height DESC LIMIT $2`,
-        [inRetention, HEAL_CANDIDATES, this.shortScanFrom]);
+        [inRetention, HEAL_CANDIDATES, Math.max(this.shortScanFrom, inRetention), SHORT_SCAN_WINDOW]);
       // The short-body scan counts transaction rows per block, so it walks the retention window in
       // slices instead of costing a full correlated count every pass.
       this.shortScanFrom = this.shortScanFrom + SHORT_SCAN_WINDOW > this.nodeHeight
@@ -683,7 +752,7 @@ export class Chain {
           if (disputed) { await this.repairContradictedRun(disputed.height, `heal: a quorum names another block at ${disputed.height}`); return; }
           for (const group of flushGroups(items)) {
             if (this.halted || this.stopped) break;
-            const full = await this.fetchFull(group.filter(i => i.body && (i.tx_count || 0) > 0), page.bodySources);
+            const full = (await this.fetchFull(group.filter(i => i.body && (i.tx_count || 0) > 0), page.bodySources)).blocks;
             const headersOnly: BlockRow[] = [];
             const hashFixes: Array<[number, string]> = [];
             for (const it of group) {
@@ -791,10 +860,17 @@ export class Chain {
       // would reject every header against the slot rule and stop the archive dead.
       if (stored > 0 && stored !== gts) log.warn('INDEXER', 'genesis_time_row_disagrees', { stored, network: gts, at });
       this.genesisTsMs = gts;
+      this.genesisTsUnconfirmed = false;
       log.info('INDEXER', 'genesis_time_learned', { from_height: at, genesis_ts: gts, agree: n });
       return;
     }
-    if (stored > 0) { this.genesisTsMs = stored; log.warn('INDEXER', 'genesis_time_from_row_unconfirmed', { stored }); return; }
+    if (stored > 0) {
+      // Usable, but not believed: the poll keeps asking until a quorum names a value.
+      this.genesisTsMs = stored;
+      this.genesisTsUnconfirmed = true;
+      log.warn('INDEXER', 'genesis_time_from_row_unconfirmed', { stored });
+      return;
+    }
     log.warn('INDEXER', 'genesis_time_unknown', { node_height: this.nodeHeight, answers: tal.size });
   }
 
@@ -807,7 +883,16 @@ export class Chain {
     const lag = this.nodeHeight - this.prefix;
     if (lag <= LAG_WARN || Date.now() - this.lastLagLog < 60_000) return;
     this.lastLagLog = Date.now();
-    if (lag > LAG_ERR) log.err('INDEXER', 'lag_near_retention', { lag, prefix: this.prefix, node_height: this.nodeHeight, retention: RETENTION_BLOCKS });
+    // What matters is not how far the prefix trails but which bodies are about to be lost: gap heights
+    // in the older half of the retention window are the ones the network will drop next.
+    const lo = Math.max(0, this.nodeHeight - RETENTION_BLOCKS), hi = Math.max(0, this.nodeHeight - RETENTION_BLOCKS / 2);
+    let atRisk = 0;
+    try {
+      const r = await this.pool.query<{ n: string }>(
+        'SELECT coalesce(sum(LEAST(end_h, $2::bigint) - GREATEST(start_h, $1::bigint) + 1), 0)::text AS n FROM sync_gaps WHERE end_h >= $1 AND start_h <= $2', [lo, hi]);
+      atRisk = Number(r.rows[0]?.n || 0);
+    } catch { /* the warning below still says what is known */ }
+    if (atRisk > 0) log.err('INDEXER', 'bodies_at_risk', { at_risk: atRisk, from: lo, to: hi, lag, prefix: this.prefix, node_height: this.nodeHeight });
     else log.warn('INDEXER', 'lag', { lag, prefix: this.prefix, head: this.head, node_height: this.nodeHeight });
   }
 }

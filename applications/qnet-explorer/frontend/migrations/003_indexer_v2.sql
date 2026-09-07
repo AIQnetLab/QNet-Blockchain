@@ -1,15 +1,27 @@
 -- Indexer v2: keyset ordering key, block identity/body flags, incremental stats, two sync cursors.
 -- Applied as ONE transaction by the indexer's migration runner (src/indexer/migrate.ts).
+--
+-- Every ALTER here takes ACCESS EXCLUSIVE and holds it to COMMIT, so the read tier queues behind it.
+-- The timeouts make that a bounded, retryable failure instead of an open-ended freeze: a migration
+-- that cannot take its locks in 5 s gives up and the indexer reports it, rather than blocking the
+-- explorer while every later query piles up behind the lock.
+SET LOCAL lock_timeout = '5s';
+SET LOCAL statement_timeout = '15min';
 
 -- Position of a transaction inside its block: with (block) the total order the list pages over.
-ALTER TABLE transactions ADD COLUMN IF NOT EXISTS tx_index INTEGER;
+-- The type changes ride the same rewrite as the new column, so the table is rewritten once, and the
+-- per-row updated_at trigger is off for the backfill (it would fire once per row and double the work).
+ALTER TABLE transactions
+  ADD COLUMN IF NOT EXISTS tx_index INTEGER,
+  ALTER COLUMN amount TYPE NUMERIC(20,0),
+  ALTER COLUMN gas_limit TYPE NUMERIC(20,0);
+ALTER TABLE transactions DISABLE TRIGGER USER;
 UPDATE transactions t SET tx_index = r.rn - 1
   FROM (SELECT hash, row_number() OVER (PARTITION BY block ORDER BY timestamp, tx_type, hash) AS rn
         FROM transactions WHERE tx_index IS NULL) r
  WHERE t.hash = r.hash;
+ALTER TABLE transactions ENABLE TRIGGER USER;
 ALTER TABLE transactions ALTER COLUMN tx_index SET NOT NULL;
-ALTER TABLE transactions ALTER COLUMN amount TYPE NUMERIC(20,0);
-ALTER TABLE transactions ALTER COLUMN gas_limit TYPE NUMERIC(20,0);
 CREATE INDEX IF NOT EXISTS idx_transactions_block_txindex ON transactions (block DESC, tx_index DESC);
 CREATE INDEX IF NOT EXISTS idx_transactions_type_block_txindex ON transactions (tx_type, block DESC, tx_index DESC);
 DROP INDEX IF EXISTS idx_transactions_block_timestamp;
@@ -19,12 +31,15 @@ DROP INDEX IF EXISTS idx_transactions_tx_type;
 DROP INDEX IF EXISTS idx_transactions_tx_type_block;
 
 -- A block row whose body the network had already pruned carries only its hash and slot time.
-ALTER TABLE blocks ALTER COLUMN tx_count DROP NOT NULL;
-ALTER TABLE blocks ALTER COLUMN hash DROP NOT NULL;
-ALTER TABLE blocks ADD COLUMN IF NOT EXISTS body_indexed BOOLEAN NOT NULL DEFAULT TRUE;
--- Transactions the indexer deliberately leaves out of a block (genesis prefund fan-out, benchmark accounts).
-ALTER TABLE blocks ADD COLUMN IF NOT EXISTS tx_skipped INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE blocks ALTER COLUMN total_gas_used TYPE NUMERIC(30,0);
+-- One statement, one rewrite. body_indexed defaults TRUE because every row that exists today was
+-- written from a body; a row whose transactions the heal cannot account for is corrected there.
+ALTER TABLE blocks
+  ALTER COLUMN tx_count DROP NOT NULL,
+  ALTER COLUMN hash DROP NOT NULL,
+  ADD COLUMN IF NOT EXISTS body_indexed BOOLEAN NOT NULL DEFAULT TRUE,
+  -- Transactions the indexer deliberately leaves out of a block (genesis prefund, benchmark accounts).
+  ADD COLUMN IF NOT EXISTS tx_skipped INTEGER NOT NULL DEFAULT 0,
+  ALTER COLUMN total_gas_used TYPE NUMERIC(30,0);
 CREATE INDEX IF NOT EXISTS idx_blocks_body_pending ON blocks (height) WHERE body_indexed = FALSE;
 CREATE INDEX IF NOT EXISTS idx_blocks_identity_pending ON blocks (height) WHERE hash IS NULL OR hash !~ '^[0-9a-f]{64}$';
 
