@@ -3161,6 +3161,43 @@ mod tests_certified_pair_wal {
     /// A pair above the seal frontier is what re-seals a late-committing boundary; a re-certification
     /// run moves the index far past the retain window in minutes, so index distance alone must not
     /// discard it. Pairs at or below the frontier still go.
+    /// The operator recovery point is the last SEALED window, not the last window that has a row.
+    /// A stalled fleet writes placeholder macroblocks for windows nobody certified; rolling back to
+    /// one of those would land the chain on state no quorum ever agreed. Empty body = not a
+    /// recovery point, whatever its index says.
+    #[tokio::test]
+    async fn the_recovery_point_is_the_last_SEALED_window() {
+        use crate::node::BlockchainNode;
+        let (s, _d) = open_test_storage();
+        let mk = |idx: u64, micro: Vec<[u8; 32]>| qnet_state::MacroBlock::new(
+            idx, 0, [0u8; 32], micro, [0u8; 32], qnet_state::ConsensusData::default());
+
+        // Tip inside window 12; windows 10 and 11 have rows, only 10 carries a body.
+        s.set_chain_height(12 * 90 + 40).expect("height");
+        s.save_macroblock(10, &mk(10, vec![[1u8; 32]])).await.expect("sealed 10");
+        s.save_macroblock(11, &mk(11, Vec::new())).await.expect("placeholder 11");
+        s.save_macroblock(12, &mk(12, Vec::new())).await.expect("placeholder 12");
+
+        // Window 10 covers [900, 989], so its last height is 989 — NOT 11's or 12's range.
+        assert_eq!(BlockchainNode::last_sealed_height_for_test(&s), Some(11 * 90 - 1),
+                   "the placeholders above the seal are skipped");
+
+        // A higher SEALED window wins over lower ones; the placeholder between them is irrelevant.
+        // (A fresh store: a written macroblock is immutable, so 12 cannot be re-sealed in place.)
+        let (s2, _d3) = open_test_storage();
+        s2.set_chain_height(12 * 90 + 40).expect("height");
+        s2.save_macroblock(10, &mk(10, vec![[1u8; 32]])).await.expect("sealed 10");
+        s2.save_macroblock(11, &mk(11, Vec::new())).await.expect("placeholder 11");
+        s2.save_macroblock(12, &mk(12, vec![[2u8; 32]])).await.expect("sealed 12");
+        assert_eq!(BlockchainNode::last_sealed_height_for_test(&s2), Some(13 * 90 - 1),
+                   "the highest sealed window is the recovery point");
+
+        // Nothing sealed anywhere within reach ⇒ no recovery point, and the caller must not invent one.
+        let (empty, _d2) = open_test_storage();
+        empty.set_chain_height(12 * 90 + 40).expect("height");
+        assert_eq!(BlockchainNode::last_sealed_height_for_test(&empty), None);
+    }
+
     /// A shard's eligibility is the union of what its owners committed. A backup covers what the
     /// primary could not without erasing what the primary did: eligibility only grows, so OR is the
     /// only merge that is both order-independent and safe. One row per shard would have let a

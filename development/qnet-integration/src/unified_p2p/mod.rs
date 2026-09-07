@@ -5961,6 +5961,37 @@ mod tests_failover_slot_key {
         LAST_FINALIZED_ROUND_PER_MB.remove(&W0);
     }
 
+    /// OPEN DEFECT, forensic h=627304 — run with `--ignored` to see it fail.
+    ///
+    /// A failover round is keyed `(window, round)` but BELONGS to the tenure that raised it. Window W
+    /// opens on `W*90`, which is the LAST slot of the straddling tenure, so a timeout raised for that
+    /// tenure is keyed under W. The tenure that opens the window then reads the same key and inherits
+    /// a round raised for a tenure that has already ended. Whether a node holds that certificate at
+    /// `W*90+1` is pure propagation timing, and the leader is `(round0_idx + round) % N`, so one unit
+    /// of disagreement elects the ADJACENT candidate: on 07.09 two leaders produced from 627304 and
+    /// the fleet split 2-vs-4 with neither side able to certify the window.
+    ///
+    /// The fix cannot be inferred from the certificate as it stands: when the new tenure's leader
+    /// produces nothing, the quorum tip stays in the PREVIOUS tenure, so a certificate rotating off
+    /// the new leader is indistinguishable from one raised for the old. The vote has to name the
+    /// tenure it is for — a wire change, hence this stays open rather than half-fixed.
+    #[test]
+    #[ignore = "open defect h=627304: the window-opening tenure inherits the previous tenure's round"]
+    fn a_tenure_does_not_inherit_a_round_raised_for_the_one_before_it() {
+        let _guard = TEST_FAILOVER_STATE_LOCK.lock();
+        const W: u64 = 910_000;
+        let straddling_last = W * 90;      // last slot of the tenure that began in W-1
+        let opening_first = W * 90 + 1;    // first slot of the tenure that opens W
+        HIGHEST_CERTIFIED_ROUND.insert(W, 1); // raised while the straddling tenure was ending
+
+        assert_eq!(certified_round_for_slot(straddling_last), 1,
+                   "the tenure that raised the round keeps it to its last slot");
+        assert_eq!(certified_round_for_slot(opening_first), 0,
+                   "the NEXT tenure elects its own leader: inheriting this round is what forked 627304");
+
+        HIGHEST_CERTIFIED_ROUND.remove(&W);
+    }
+
     /// Both operands are certificate-driven, so the carry cannot invent a round: with nothing
     /// certified anywhere the slot stays at 0 and the round-0 leader is elected as usual.
     #[test]

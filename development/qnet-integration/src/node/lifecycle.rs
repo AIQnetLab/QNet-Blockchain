@@ -30,6 +30,93 @@ mod trim_tests {
 }
 
 impl BlockchainNode {
+    /// The last height covered by a macroblock this node actually holds sealed. A window whose
+    /// macroblock carries no microblocks was never certified — the placeholder row exists, the seal
+    /// does not — so it is not a recovery point. Walks down from the tip and stops at the first
+    /// sealed window rather than scanning the chain.
+    fn last_sealed_height(storage: &Storage) -> Option<u64> {
+        const MI: u64 = 90;
+        let tip = storage.get_chain_height().ok()?;
+        let mut idx = tip / MI;
+        // A live fleet cannot have more than a few windows unsealed; deeper than that the node is not
+        // merely forked and an operator rollback is the wrong tool.
+        let floor = idx.saturating_sub(8);
+        while idx > 0 && idx >= floor {
+            let sealed = storage.get_macroblock_by_height(idx).ok().flatten()
+                .and_then(|raw| bincode::deserialize::<qnet_state::MacroBlock>(&raw).ok())
+                .map_or(false, |mb| !mb.micro_blocks.is_empty());
+            if sealed { return Some((idx + 1).saturating_mul(MI).saturating_sub(1)); }
+            idx -= 1;
+        }
+        None
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_sealed_height_for_test(storage: &Storage) -> Option<u64> {
+        Self::last_sealed_height(storage)
+    }
+
+    /// Truncate the stored chain to `target` and bring every DURABLE side-index back to it. RAM state
+    /// is deliberately untouched: this runs before the state-recovery pipeline, which rebuilds accounts
+    /// from the truncated chain and discards any snapshot above it on its own. Same helpers the live
+    /// reorg path calls, in the same order — one rollback mechanism, not two.
+    async fn rollback_storage_to(storage: &Arc<Storage>, target: u64) -> Result<u64, String> {
+        let local_h = storage.get_chain_height().map_err(|e| e.to_string())?;
+        if target >= local_h { return Ok(0); }
+        for h in (target + 1)..=local_h {
+            if h % 256 == 0 { crate::storage::note_rollback_progress(); }
+            crate::block_pipeline::clear_contradicted_tail(h);
+            if let Err(e) = storage.delete_microblock(h) {
+                println!("[WARN][ROLLBACK] delete_fail h={} err={}", h, e);
+            }
+        }
+        storage.set_chain_height(target).map_err(|e| format!("set_chain_height: {}", e))?;
+        crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(target, std::sync::atomic::Ordering::Release);
+        // Validation-critical bindings first, then the roots derived from them.
+        if let Err(e) = storage.rebuild_committed_burn_wallet(target) {
+            println!("[WARN][ROLLBACK] cbw_rebuild_fail to={} err={}", target, e);
+        }
+        if let Err(e) = storage.rebuild_registry_lthash(target) {
+            println!("[WARN][ROLLBACK] registry_lthash_rebuild_fail to={} err={}", target, e);
+        }
+        if let Err(e) = storage.rollback_dpk_binds_above(target) {
+            println!("[WARN][ROLLBACK] dpk_rollback_fail to={} err={}", target, e);
+        }
+        if let Err(e) = storage.reconcile_reward_indices_above_epoch(target) {
+            println!("[WARN][ROLLBACK] reward_indices_reconcile_fail to={} err={}", target, e);
+        }
+        // Non-consensus; the next boot pass rebuilds it, which is cheaper than scanning here.
+        storage.mark_owns_index_dirty();
+        storage.invalidate_recent_microblocks_above(target);
+        Ok(local_h - target)
+    }
+
+    /// One-shot operator recovery, read once at boot. `QNET_ROLLBACK_TO_LAST_SEALED=1` picks the target
+    /// itself, so there is no arithmetic for an operator to get wrong; `QNET_ROLLBACK_TO_HEIGHT=<h>` is
+    /// the explicit form. Set it on every node, start them together, then REMOVE it — like
+    /// QNET_HALT_HEIGHT. A target at or above the local tip is a no-op, so a node already sitting at
+    /// the recovery point needs no special casing.
+    async fn apply_boot_rollback(storage: &Arc<Storage>) {
+        let explicit = std::env::var("QNET_ROLLBACK_TO_HEIGHT").ok()
+            .and_then(|v| v.trim().parse::<u64>().ok());
+        let to_sealed = std::env::var("QNET_ROLLBACK_TO_LAST_SEALED")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false);
+        let target = match (explicit, to_sealed) {
+            (Some(h), _) => Some(h),
+            (None, true) => Self::last_sealed_height(storage),
+            _ => return,
+        };
+        let target = match target {
+            Some(t) => t,
+            None => { println!("[ERR][ROLLBACK] no_sealed_macroblock_found action=start_unchanged"); return; }
+        };
+        match Self::rollback_storage_to(storage, target).await {
+            Ok(0) => println!("[INFO][ROLLBACK] already_at_or_below target={}", target),
+            Ok(n) => println!("[INFO][ROLLBACK] truncated_to={} dropped={} — remove the env var before the next start", target, n),
+            Err(e) => println!("[ERR][ROLLBACK] failed target={} err={} action=start_unchanged", target, e),
+        }
+    }
+
     /// Create a new blockchain node with default settings (backward compatibility)
     pub async fn new(data_dir: &str, p2p_port: u16, bootstrap_peers: Vec<String>) -> Result<Self, QNetError> {
         // Region is a vestigial cosmetic tag (no consensus/topology role) — fixed
@@ -503,6 +590,14 @@ impl BlockchainNode {
         // format or replay coverage. Reset on full replay (TIER 3),
         // re-activated at the correct block by accrue_pending_rewards().
         // ═══════════════════════════════════════════════════════════════════
+
+        // Operator recovery: truncate the chain to a certified point BEFORE state is rebuilt, so the
+        // recovery pipeline below reproduces exactly that point. Nothing else is needed — Tier 1
+        // discards any snapshot above the stored chain height by itself, and the replay refills the
+        // rest. This is how a stalled fleet is brought back onto one branch without discarding the
+        // ledger: everything above the last sealed macroblock was never final, so dropping it takes
+        // away nothing the protocol promised to keep.
+        Self::apply_boot_rollback(&storage).await;
 
         // ═══════════════════════════════════════════════════════════════════
         // v5.1: STATE RECOVERY PIPELINE
