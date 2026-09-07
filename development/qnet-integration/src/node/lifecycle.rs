@@ -3700,6 +3700,13 @@ impl BlockchainNode {
                             .filter_map(|sh| crate::node::light_owner_rank(sh, my_idx).map(|r| (sh, r)))
                             .filter(|(_, rank)| backups_active || *rank == 0)
                             .filter(|(_, rank)| blocks_until_epoch_end <= owner_deadline[*rank])
+                            // A shard with nothing left to try must not hold the slot. Its own
+                            // emission being confirmed - or having run out of retries - is exactly
+                            // when this node should move on and cover the shard it backs up, which is
+                            // the whole point of backing one up.
+                            .filter(|(sh, _)| bitmap_tracker
+                                .get(&(current_epoch * 10 + *sh as u64))
+                                .map_or(true, |s| !s.is_confirmed() && s.retry_count < MAX_RETRIES))
                             .min_by_key(|(_, rank)| *rank)
                             .map(|(sh, _)| sh)
                         {
