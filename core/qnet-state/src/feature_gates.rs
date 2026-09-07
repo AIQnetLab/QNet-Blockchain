@@ -61,10 +61,14 @@ pub const LOGS_ROOT_GATE_HEIGHT: u64 = 0;
 /// attestation path has nothing to check the device's ping delegation against and rejects every
 /// attestation, so no light node can ever be eligible. 0 = ACTIVE FROM GENESIS, correct for a fresh
 /// relaunch; light nodes registered BEFORE the activation carry no commitment and must re-register once.
-/// ROLLING UPGRADE: raise this to a coordinated future height FIRST. The commitment lands in the light
-/// registry row, and `registry_root` hashes that row's `vrf_pk_sha3` for light as well as super — so a
-/// mixed fleet at gate 0 computes two different registry roots and forks on content_ok.
-pub const LIGHT_KEY_COMMITMENT_GATE_HEIGHT: u64 = 0;
+///
+/// NOT 0 on this chain, and the reason is worth keeping: the commitment lands in the light registry
+/// row, and `registry_root` hashes that row's `vrf_pk_sha3` for light as well as super. At 0 a node
+/// that REPLAYS an old registration writes the commitment while a snapshot-restored node does not, so
+/// the two compute different registry roots from the same chain and fork on content_ok. The gate must
+/// therefore sit ABOVE every block already on disk — then replay and snapshot agree, because neither
+/// writes it. A fresh genesis is the only case where 0 is correct.
+pub const LIGHT_KEY_COMMITMENT_GATE_HEIGHT: u64 = 691_200;
 
 /// Every light shard is owned by three genesis nodes instead of one (`light_shard_backup_owners`),
 /// which changes three rules that must flip together, so they share one gate:
@@ -75,10 +79,13 @@ pub const LIGHT_KEY_COMMITMENT_GATE_HEIGHT: u64 = 0;
 ///     its bitmap from is the same one the reward path reads. Left at 50 with a 150-block window, a
 ///     light node registering in the last 100 blocks before the freeze sits past the bitmap's
 ///     index_span and silently earns nothing for that epoch.
-/// 0 = ACTIVE FROM GENESIS, correct for a fresh relaunch. ROLLING UPGRADE: raise to a coordinated
-/// future EPOCH BOUNDARY (a multiple of 14400) first — the tx rule reads block height and the cutoff
-/// reads epoch_start, and only on a boundary do the two cross together.
-pub const LIGHT_SHARD_BACKUP_OWNERS_GATE_HEIGHT: u64 = 0;
+/// Set to an EPOCH BOUNDARY above every block already on disk, for two reasons. The tx rule reads
+/// block height while the cutoff reads epoch_start, and only on a boundary do the two cross together.
+/// And the cutoff decides which light nodes an epoch's reward set contains: at 0 a node replaying an
+/// old epoch would use the new cutoff and compute a different reward_root than a snapshot-restored
+/// peer computed from the same chain. 0 is correct on a fresh genesis and nowhere else.
+/// Shares its height with LIGHT_KEY_COMMITMENT so one coordinated flip covers both.
+pub const LIGHT_SHARD_BACKUP_OWNERS_GATE_HEIGHT: u64 = 691_200;
 
 /// Gas metering (`gas_metering`): at/after the height a TX is charged `gas_used * gas_price` with the
 /// unused gas refunded; below it the legacy `gas_limit * gas_price`. It was already height-gated, but
@@ -217,6 +224,21 @@ mod tests {
     /// Gas metering is the one rule with a real staged activation, and moving it into the registry
     /// must not move the height: below it a sender is charged gas_limit, at and above it gas_used with
     /// the rest refunded, and those are different blocks on a chain that already replayed them.
+    /// Both light gates sit on the SAME epoch boundary, above the chain they are deployed onto.
+    /// A gate at 0 here is not a stricter default, it is a fork: replay writes state that a snapshot
+    /// restore does not, and registry_root / reward_root then differ between peers on one chain.
+    #[test]
+    fn the_light_gates_flip_together_on_an_epoch_boundary() {
+        const EPOCH: u64 = 14_400;
+        let k = super::LIGHT_KEY_COMMITMENT_GATE_HEIGHT;
+        let o = super::LIGHT_SHARD_BACKUP_OWNERS_GATE_HEIGHT;
+        assert_eq!(k, o, "one coordinated flip, or a node can hold one rule and not the other");
+        assert_eq!(o % EPOCH, 0, "the tx rule reads height and the cutoff reads epoch_start: only a                                   boundary crosses both at once");
+        assert!(!super::is_active(super::id::LIGHT_KEY_COMMITMENT, k - 1), "dormant below");
+        assert!(super::is_active(super::id::LIGHT_KEY_COMMITMENT, k), "active at the boundary");
+        assert!(super::is_active(super::id::LIGHT_SHARD_BACKUP_OWNERS, o));
+    }
+
     #[test]
     fn gas_metering_keeps_its_activation_height() {
         let h = super::GAS_METERING_GATE_HEIGHT;
