@@ -868,15 +868,53 @@ mod tests {
         let mut e = voter.as_bytes().to_vec(); e.extend_from_slice(msg); e == sig
     }
 
-    struct Node { d: ConsensusDriver, id: NodeId, committed: u64, sealed: Vec<u64> }
+    struct Node {
+        d: ConsensusDriver, id: NodeId, committed: u64, sealed: Vec<u64>,
+        /// What survives a restart: the vote commitments written before each vote leaves, and the
+        /// certified pairs the node wrote to its log. Everything else dies with the process.
+        commitments: Vec<VoteCommitment>,
+        wal: Vec<(Checkpoint, QuorumCertificate)>,
+    }
+
+    fn node(id: &NodeId, c: &[NodeId]) -> Node {
+        let mut d = ConsensusDriver::new(id.clone(), c.to_vec(), [7u8; 32]);
+        d.set_intervals(90, 90);
+        Node { d, id: id.clone(), committed: 0, sealed: Vec::new(), commitments: Vec::new(), wal: Vec::new() }
+    }
+
+    /// The write-ahead log as production keeps it: the newest certified pair, recorded whenever the
+    /// certificate frontier moves.
+    fn wal_snapshot(n: &mut Node) {
+        if let Some((idx, pair)) = n.d.newest_catchup_bundle() {
+            if n.wal.iter().any(|(_, q)| q.index == idx) { return; }
+            let cp = pair.iter().find_map(|m| match m { ConsensusMsg::Proposal(p) => Some(p.clone()), _ => None });
+            let qc = pair.iter().find_map(|m| match m { ConsensusMsg::Qc(q) => Some(q.clone()), _ => None });
+            if let (Some(cp), Some(qc)) = (cp, qc) { n.wal.push((cp, qc)); }
+        }
+    }
+
+    /// Restart: the process dies, the disk survives. Rebuild the driver, restore the commitments,
+    /// replay the log - exactly the boot sequence in `consensus_v2_node::run`.
+    fn restart(n: &mut Node, c: &[NodeId]) {
+        let mut d = ConsensusDriver::new(n.id.clone(), Vec::new(), [7u8; 32]);
+        d.set_intervals(90, 90);
+        d.restore_vote_commitments(&n.commitments);
+        let wal = n.wal.clone();
+        for (cp, qc) in &wal { let _ = d.sync(cp, qc); }
+        d.set_committee(c.to_vec());
+        n.d = d;
+    }
 
     // Node executes one Effect ⇒ produces outbound wire messages (mock-signed).
     fn exec(n: &mut Node, e: Effect) -> Vec<ConsensusMsg> {
         match e {
             Effect::Propose(mut cp) => { cp.proposer_sig = sign(&n.id, &cp.hash()); vec![ConsensusMsg::Proposal(cp)] }
-            Effect::Vote { index, checkpoint_hash, .. } => vec![ConsensusMsg::Vote(Vote {
-                checkpoint_hash, index, voter: n.id.clone(), signature: sign(&n.id, &checkpoint_hash),
-            })],
+            Effect::Vote { index, checkpoint_hash, commit } => {
+                n.commitments.push(commit);          // durable BEFORE the vote leaves, as production does
+                vec![ConsensusMsg::Vote(Vote {
+                    checkpoint_hash, index, voter: n.id.clone(), signature: sign(&n.id, &checkpoint_hash),
+                })]
+            }
             Effect::Timeout { index, high_qc_index } => vec![ConsensusMsg::Timeout(TimeoutMsg {
                 index, voter: n.id.clone(), high_qc_index,
                 signature: sign(&n.id, &timeout_bytes(index, high_qc_index)),
@@ -1032,10 +1070,9 @@ mod tests {
         let (cp1, qc1) = seeded[0].d.high_qc_pair().expect("certified window 1");
         // Fresh processes: empty committee, the WAL pair replayed through sync.
         let mut nodes: Vec<Node> = c.iter().map(|id| {
-            let mut d = ConsensusDriver::new(id.clone(), Vec::new(), [7u8; 32]);
-            d.set_intervals(90, 90);
-            let _ = d.sync(&cp1, &qc1);
-            Node { d, id: id.clone(), committed: 0, sealed: Vec::new() }
+            let mut n = node(id, &[]);
+            let _ = n.d.sync(&cp1, &qc1);
+            n
         }).collect();
         assert!(nodes.iter().all(|n| n.d.commit_pending() && n.d.next_window() == 2 && !n.d.is_leader_now()),
                 "no member leads over an empty committee");
@@ -1154,6 +1191,7 @@ mod tests {
         let before = nodes[0].d.next_window();
         split_round(nodes, c, before, part);
         if nodes[0].d.next_window() == before { split_view_change(nodes, c, part); }
+        for n in nodes.iter_mut() { wal_snapshot(n); }
     }
 
     /// Every node's view timer fires, under the same split.
@@ -1255,17 +1293,75 @@ mod tests {
         }
     }
 
+    /// A node loses everything but its disk. It must come back on the same chain, and it must not
+    /// vote a second content where it already voted - that pair is convictable evidence, and an
+    /// honest node that forgot its own commitments would produce it against itself.
+    #[test]
+    fn a_node_that_loses_its_memory_returns_on_the_same_chain_and_never_double_votes() {
+        let (c, mut nodes) = byz_net(4);
+        let all = vec![0usize; 4];
+        for _ in 0..4 { drive(&mut nodes, &c, &all); }
+        let (peer_commit, peer_window) = (nodes[0].d.committed_index(), nodes[0].d.next_window());
+        assert!(peer_commit > 0 && !nodes[3].commitments.is_empty(), "the run produced a commit and votes");
+        let voted = nodes[3].commitments.last().cloned().expect("a commitment");
+
+        restart(&mut nodes[3], &c);
+        assert_eq!(nodes[3].d.committed_index(), peer_commit, "the restarted node is at the same commit point");
+        assert_eq!(nodes[3].d.next_window(), peer_window, "and the same frontier");
+        // The commitments are what keep it OUT of voted territory: it reboots above every index it
+        // ever voted at, so no proposal can ask it for a second vote there.
+        assert!(nodes[3].d.current_index() > voted.index,
+                "a restored node never re-enters a view it already voted at: view={} voted={}",
+                nodes[3].d.current_index(), voted.index);
+        // And a re-proposal of that head with OTHER content draws no vote.
+        let mut forged = nodes[0].d.high_qc_pair().expect("a certificate").0;
+        forged.index = voted.index;
+        forged.window_head_height = voted.window_head;
+        forged.state_root = [0xAB; 32];
+        forged.proposer_sig = sign(&forged.proposer.clone(), &forged.hash());
+        let effs = nodes[3].d.handle(&ConsensusMsg::Proposal(forged));
+        assert!(!effs.iter().any(|e| matches!(e, Effect::Vote { .. })),
+                "no second content at a head this node already voted");
+    }
+
+    /// A committee member re-proposes a certified head with different content. The content pin must
+    /// refuse it everywhere: no vote, no second certificate, and the seal stays the one the chain
+    /// certified. Without the pin this committed two different contents at one height.
+    #[test]
+    fn a_second_content_at_a_certified_head_is_refused_by_everyone() {
+        let (c, mut nodes) = byz_net(4);
+        let all = vec![0usize; 4];
+        for _ in 0..3 { drive(&mut nodes, &c, &all); }
+        let (held, hq) = nodes[0].d.high_qc_pair().expect("a certificate");
+        let sealed_before: Vec<Vec<u64>> = nodes.iter().map(|n| n.sealed.clone()).collect();
+        let certified_before: Vec<Option<Hash>> = nodes.iter()
+            .map(|n| n.d.high_qc_pair().map(|(cp, _)| cp.hash())).collect();
+
+        let mut other = held.clone();
+        other.index = nodes[0].d.current_index();
+        other.parent_qc = Some(qnet_consensus::checkpoint_bft::QcRef::from(&hq));
+        other.state_root = [0xCD; 32];                    // same head, different content
+        other.proposer = c[0].clone();
+        other.proposer_sig = sign(&c[0], &other.hash());
+        let seed = vec![(0usize, ConsensusMsg::Proposal(other))];
+        deliver_split(&mut nodes, &c, seed, &all);
+
+        // Nobody's highest certificate moved: the second content gathered no quorum anywhere.
+        let certified_after: Vec<Option<Hash>> = nodes.iter()
+            .map(|n| n.d.high_qc_pair().map(|(cp, _)| cp.hash())).collect();
+        assert_eq!(certified_after, certified_before, "a second content at a certified head certified nothing");
+        assert!(certified_before.iter().any(|h| *h == Some(held.hash())), "the chain's own certificate stands");
+        let sealed_after: Vec<Vec<u64>> = nodes.iter().map(|n| n.sealed.clone()).collect();
+        assert_eq!(sealed_after, sealed_before, "and nothing new is sealed");
+    }
+
     // ── BYZANTINE ────────────────────────────────────────────────────────────────────────────────
     // The simulator above is all-honest. These run n=7 (quorum_size 7 = 5, f = 2) with f nodes
     // actively hostile, which is the bound the safety argument claims and the one nothing tested.
 
     fn byz_net(n: usize) -> (Vec<NodeId>, Vec<Node>) {
         let c: Vec<NodeId> = (0..n).map(|i| format!("n{}", i)).collect();
-        let nodes = c.iter().map(|id| {
-            let mut d = ConsensusDriver::new(id.clone(), c.clone(), [7u8; 32]);
-            d.set_intervals(90, 90);
-            Node { d, id: id.clone(), committed: 0, sealed: Vec::new() }
-        }).collect();
+        let nodes = c.iter().map(|id| node(id, &c)).collect();
         (c, nodes)
     }
 
@@ -1460,7 +1556,7 @@ mod tests {
         let mut nodes: Vec<Node> = c.iter().map(|id| {
             let mut d = ConsensusDriver::new(id.clone(), c.clone(), genesis);
             d.set_intervals(90, 90); // legacy 1:1 macroblock cadence (this test predates intra-window finality)
-            Node { d, id: id.clone(), committed: 0, sealed: Vec::new() }
+            Node { d, id: id.clone(), committed: 0, sealed: Vec::new(), commitments: Vec::new(), wal: Vec::new() }
         }).collect();
         for index in 1..=8u64 {
             let mut seed = Vec::new();
@@ -1487,7 +1583,7 @@ mod tests {
         let mut nodes: Vec<Node> = c.iter().map(|id| {
             let mut d = ConsensusDriver::new(id.clone(), c.clone(), genesis);
             d.set_intervals(30, 90); // K=30 finality, 90 macroblock
-            Node { d, id: id.clone(), committed: 0, sealed: Vec::new() }
+            Node { d, id: id.clone(), committed: 0, sealed: Vec::new(), commitments: Vec::new(), wal: Vec::new() }
         }).collect();
         // 6 checkpoints ⇒ heads 30,60,90,120,150,180.
         // The 7th checkpoint is NOT a boundary (210 % 90 = 30): it only supplies the child
@@ -1523,7 +1619,7 @@ mod tests {
                 index: ceilings[i], window_head: 15390, content_digest: [3u8; 32],
                 pinned: false, parent_index: 568, parent_hash: [4u8; 32],
             }]);
-            Node { d, id: id.clone(), committed: 0, sealed: Vec::new() }
+            Node { d, id: id.clone(), committed: 0, sealed: Vec::new(), commitments: Vec::new(), wal: Vec::new() }
         }).collect();
         for (i, n) in nodes.iter().enumerate() {
             assert!(n.d.current_index() > ceilings[i], "node {} must boot above its ceiling", i);
@@ -1580,7 +1676,7 @@ mod tests {
         let mut nodes: Vec<Node> = c.iter().map(|id| {
             let mut d = ConsensusDriver::new(id.clone(), c.clone(), genesis);
             d.set_intervals(90, 90); // legacy 1:1 macroblock cadence (this test predates intra-window finality)
-            Node { d, id: id.clone(), committed: 0, sealed: Vec::new() }
+            Node { d, id: id.clone(), committed: 0, sealed: Vec::new(), commitments: Vec::new(), wal: Vec::new() }
         }).collect();
         // All members buffer window `w`'s seal inputs; the current leader proposes; settle.
         fn step(nodes: &mut Vec<Node>, c: &[NodeId], w: u64) {
@@ -2064,7 +2160,7 @@ mod tests {
         let nodes: Vec<Node> = c.iter().map(|id| {
             let mut d = ConsensusDriver::new(id.clone(), c.clone(), [7u8; 32]);
             d.set_intervals(30, 90);
-            Node { d, id: id.clone(), committed: 0, sealed: Vec::new() }
+            Node { d, id: id.clone(), committed: 0, sealed: Vec::new(), commitments: Vec::new(), wal: Vec::new() }
         }).collect();
         let tails: Vec<Vec<Hash>> = (0..5).map(|_| vec![[0u8; 32]]).collect();
         (c, nodes, tails)
