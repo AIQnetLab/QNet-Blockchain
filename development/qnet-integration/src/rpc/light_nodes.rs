@@ -64,10 +64,11 @@ pub(super) async fn handle_light_node_token_refresh(
         })));
     }
 
-    // Load the IMMUTABLE on-chain Dilithium key; fail-closed on None/err.
-    let onchain_pk_hex = match blockchain.get_storage().load_vrf_public_key(&req.node_id) {
-        Ok(Some(bytes)) => hex::encode(bytes),
-        _ => {
+    // The identity the delegation must verify under: the committed key when the chain holds one, else
+    // the key the device recorded when it last proved itself against the committed hash. Fail-closed.
+    let onchain_pk_hex = match blockchain.get_storage().resolve_light_identity_pk(&req.node_id, None) {
+        Some(hex) => hex,
+        None => {
             if crate::node::is_warn() {
                 println!("[WARN][LIGHT] token_refresh_no_onchain_key node={}", req.node_id);
             }
@@ -280,9 +281,12 @@ pub(super) async fn handle_light_node_register(
             // quantum_pubkey MUST equal the committed VRF key. Match → reactivate (skip burn re-verify).
             // Mismatch or key-not-yet-committed-here → mutate nothing, return already_registered inertly
             // (a synced genesis — the shard owner always is — performs the real reactivation).
-            let identity_ok = hex::decode(&register_request.quantum_pubkey).ok()
-                .zip(blockchain.get_storage().load_vrf_public_key(&pseudonym).ok().flatten())
-                .map(|(incoming, committed)| incoming == committed)
+            // Resolved, not point-read: the chain holds only a HASH of a light node's key, so a full-key
+            // lookup answers None for every light node and this branch could never say yes - a legitimate
+            // owner re-registering was refused and its ping-key rotation never ran.
+            let identity_ok = blockchain.get_storage()
+                .resolve_light_identity_pk(&pseudonym, Some(&register_request.quantum_pubkey))
+                .map(|committed| committed.eq_ignore_ascii_case(&register_request.quantum_pubkey))
                 .unwrap_or(false);
             if identity_ok {
                 reactivating_existing = true;
@@ -1161,15 +1165,22 @@ pub(super) async fn handle_light_node_ping_response(
     if let (Some(pp), Some(cert)) = (params.get("ping_pubkey"), params.get("ping_delegation_cert")) {
         if !pp.is_empty() && !cert.is_empty() && signature.starts_with("ping_dilithium:") {
             let inner_ping_sig = &signature[15..];
-            if let Ok(Some(vrf)) = blockchain.get_storage().load_vrf_public_key(&node_id) {
-                let onchain_pk_hex = hex::encode(vrf);
+            // A light node's identity key lives on its device; the chain holds its hash. The device may
+            // present the key here, and it is admitted only if it hashes to that commitment - so the
+            // delegation below is still checked under a key the chain vouches for.
+            let presented = params.get("identity_pubkey").map(|s| s.as_str());
+            if let Some(onchain_pk_hex) = blockchain.get_storage().resolve_light_identity_pk(&node_id, presented) {
                 let delegation_msg = format!("delegate_ping:{}:{}", pp, node_id);
                 if verify_mobile_dilithium_signature(&delegation_msg, cert, &onchain_pk_hex)
                     && verify_mobile_dilithium_signature(&challenge, inner_ping_sig, pp) {
-                    let _ = blockchain.get_storage().save_light_ping_keys(&node_id, pp, cert);
+                    // Record the identity the delegation was proven under, so later attestations need
+                    // only the ping signature.
+                    let _ = blockchain.get_storage().save_light_ping_keys_identity(&node_id, pp, cert, &onchain_pk_hex);
                 } else if crate::node::is_warn() {
                     println!("[WARN][LIGHT] presented_ping_delegation_rejected node={}", node_id);
                 }
+            } else if crate::node::is_warn() {
+                println!("[WARN][LIGHT] identity_unresolved node={} presented={}", node_id, presented.is_some());
             }
         }
     }
@@ -1616,13 +1627,11 @@ pub(super) async fn handle_light_node_status(
         }))),
     };
     
-    // On-chain readiness = the EXACT condition the ping handler enforces before accepting an
-    // attestation (load_vrf_public_key present). Node-independent (committed key is uniform across
-    // storage), unlike RAM-registry presence which is gossip-lagged. The client gates self-attest on
-    // this so a ping never fires before the registration TX is applied (no_onchain_key rejection).
-    let onchain_registered = blockchain.get_storage()
-        .load_vrf_public_key(&node_id)
-        .ok().flatten().is_some();
+    // On-chain readiness = the registration row is applied, the same condition the ping handler needs
+    // before it can resolve the node's identity. Node-independent and durable, unlike RAM-registry
+    // presence which is gossip-lagged. The client gates self-attest on this, so answering "no" for
+    // every light node - which the full-key lookup did - silenced the whole class.
+    let onchain_registered = blockchain.get_storage().is_node_registration_onchain(&node_id);
 
     // B: liveness is derived from the committed attestation-eligibility index (node-independent, durable),
     // NOT a per-genesis RAM FSM. needs_reactivation = registered on-chain but not attested in the last two

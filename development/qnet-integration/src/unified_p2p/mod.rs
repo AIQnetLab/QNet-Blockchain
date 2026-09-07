@@ -2978,7 +2978,8 @@ pub struct SimplifiedP2P {
     /// Per-window ping-slot buckets for THIS genesis's shard: (window, registry_len, [slot 0..239]→node_ids).
     /// Rebuilt only on window/size change ⇒ ping selection is O(bucket)/tick, not O(N log N) clone+sort of
     /// the whole registry every tick — scales the 5-genesis pinger to millions of light nodes.
-    light_ping_slot_cache: Arc<RwLock<(u64, usize, Vec<Vec<String>>)>>,
+    /// (window, registry size, per-slot buckets, bitmask of the shards those buckets cover)
+    light_ping_slot_cache: Arc<RwLock<(u64, usize, Vec<Vec<String>>, usize)>>,
 
 
     /// PRODUCTION: Storage reference for persistent heartbeat storage
@@ -3373,7 +3374,7 @@ impl SimplifiedP2P {
             
             // PRODUCTION: Light Node registry for gossip sync
             light_node_registry: Arc::new(RwLock::new(HashMap::new())),
-            light_ping_slot_cache: Arc::new(RwLock::new((u64::MAX, 0, Vec::new()))),
+            light_ping_slot_cache: Arc::new(RwLock::new((u64::MAX, 0, Vec::new(), 0))),
 
             // PRODUCTION: Heartbeat history for reward eligibility
             storage: storage, // v2.76: Storage for persistent heartbeat storage

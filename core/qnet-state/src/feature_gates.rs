@@ -7,7 +7,7 @@
 //!
 //! To ship a rolling-safe consensus change:
 //!   1. add `("feature_id", activation_height)` to `ACTIVATIONS` (a coordinated FUTURE height);
-//!   2. gate the divergent code: `if feature_gates::is_active("feature_id", height) { new } else { old }`;
+//!   2. gate the divergent code: `if feature_gates::is_active(id::FEATURE_ID, height) { new } else { old }`;
 //!   3. deploy the binary to all nodes BEFORE `activation_height`.
 //! Genesis-active rules need no entry — the default is active.
 
@@ -57,14 +57,54 @@ pub const LIGHT_REG_EPOCH_ROSTER_GATE_HEIGHT: u64 = 0;
 /// loudly, never silent). Raise to a coordinated future height ONLY to activate on a LIVE chain.
 pub const LOGS_ROOT_GATE_HEIGHT: u64 = 0;
 
+/// A light node's identity key is committed by its registration, as a 32-byte hash. Without it the
+/// attestation path has nothing to check the device's ping delegation against and rejects every
+/// attestation, so no light node can ever be eligible. 0 = ACTIVE FROM GENESIS, correct for a fresh
+/// relaunch; light nodes registered BEFORE the activation carry no commitment and must re-register once.
+/// ROLLING UPGRADE: raise this to a coordinated future height FIRST. The commitment lands in the light
+/// registry row, and `registry_root` hashes that row's `vrf_pk_sha3` for light as well as super — so a
+/// mixed fleet at gate 0 computes two different registry roots and forks on content_ok.
+pub const LIGHT_KEY_COMMITMENT_GATE_HEIGHT: u64 = 0;
+
+/// Every light shard is owned by three genesis nodes instead of one (`light_shard_backup_owners`),
+/// which changes three rules that must flip together, so they share one gate:
+///   - a shard's eligibility bitmap is accepted from any of its three owners, not only its own genesis;
+///   - the commit window opens 150 blocks before the epoch end, not 50, so the three owners get
+///     staggered deadlines instead of one shared 50-block dash;
+///   - the roster cutoff moves with the window (`light_roster_cutoff`), so the roster an owner builds
+///     its bitmap from is the same one the reward path reads. Left at 50 with a 150-block window, a
+///     light node registering in the last 100 blocks before the freeze sits past the bitmap's
+///     index_span and silently earns nothing for that epoch.
+/// 0 = ACTIVE FROM GENESIS, correct for a fresh relaunch. ROLLING UPGRADE: raise to a coordinated
+/// future EPOCH BOUNDARY (a multiple of 14400) first — the tx rule reads block height and the cutoff
+/// reads epoch_start, and only on a boundary do the two cross together.
+pub const LIGHT_SHARD_BACKUP_OWNERS_GATE_HEIGHT: u64 = 0;
+
+/// Every gate name, spelled ONCE. A gate is asked for by constant, never by a literal, because an
+/// unlisted name is genesis-active by design: a typo at a call site would not fail, it would silently
+/// turn the new rule on everywhere and fork a half-upgraded fleet. A misspelled constant does not
+/// compile.
+pub mod id {
+    pub const BURN_ATTESTATION_REQUIRED: &str = "burn_attestation_required";
+    pub const REGISTRY_ROOT_REQUIRED: &str = "registry_root_required";
+    pub const LIGHT_REG_EPOCH_ROSTER: &str = "light_reg_epoch_roster";
+    pub const LOGS_ROOT_REQUIRED: &str = "logs_root_required";
+    pub const REWARD_EPOCH_ROOT_REQUIRED: &str = "reward_epoch_root_required";
+    pub const LIGHT_KEY_COMMITMENT: &str = "light_key_commitment";
+    pub const LIGHT_SHARD_BACKUP_OWNERS: &str = "light_shard_backup_owners";
+    /// Genesis-active on purpose: it is already the deployed behaviour, so a mixed fleet agrees
+    /// without a coordinated flip. Listed here, and only here, so it is still spelled once.
+    pub const RECENCY_SPAN_EPOCH: &str = "recency_span_epoch";
+}
+
 /// (feature id, activation height). Heights are hardcoded in the binary, so every node agrees
 /// without on-chain governance. Genesis-active rules need no entry (the default is active);
 /// only rules that must stay dormant until a coordinated height are listed.
 const ACTIVATIONS: &[(&str, u64)] = &[
-    ("burn_attestation_required", BURN_ATTESTATION_GATE_HEIGHT),
-    ("registry_root_required", REGISTRY_ROOT_GATE_HEIGHT),
-    ("light_reg_epoch_roster", LIGHT_REG_EPOCH_ROSTER_GATE_HEIGHT),
-    ("logs_root_required", LOGS_ROOT_GATE_HEIGHT),
+    (id::BURN_ATTESTATION_REQUIRED, BURN_ATTESTATION_GATE_HEIGHT),
+    (id::REGISTRY_ROOT_REQUIRED, REGISTRY_ROOT_GATE_HEIGHT),
+    (id::LIGHT_REG_EPOCH_ROSTER, LIGHT_REG_EPOCH_ROSTER_GATE_HEIGHT),
+    (id::LOGS_ROOT_REQUIRED, LOGS_ROOT_GATE_HEIGHT),
     // ACTIVE FROM GENESIS. The commitment is now a pure function of certified chain data: it walks
     // the epoch grid bounded at N-2 (a voting node holds that macroblock by construction), resolves
     // each root from the certifying macroblock, and returns None on a gap — in which case the
@@ -72,7 +112,9 @@ const ACTIVATIONS: &[(&str, u64)] = &[
     // proves against it must activate together: with the comparison off the field is QC-signed but
     // validated by nobody, and with the carry off a cold-joined node can never obtain pre-anchor
     // roots (their macroblocks sit below its weak-subjectivity floor).
-    ("reward_epoch_root_required", 0),
+    (id::REWARD_EPOCH_ROOT_REQUIRED, 0),
+    (id::LIGHT_KEY_COMMITMENT, LIGHT_KEY_COMMITMENT_GATE_HEIGHT),
+    (id::LIGHT_SHARD_BACKUP_OWNERS, LIGHT_SHARD_BACKUP_OWNERS_GATE_HEIGHT),
 ];
 
 /// Core gate: active iff `feature` is unlisted (genesis-active default) or `height` has reached
@@ -120,11 +162,41 @@ mod tests {
         // (is_legacy_genesis_node), not here. (If re-gated to a future height for a rolling
         // upgrade, is_active would be false below it — covered by gate_switches_at_activation_height.)
         assert_eq!(super::BURN_ATTESTATION_GATE_HEIGHT, 0, "active-from-genesis on fresh genesis");
-        assert!(super::is_active("burn_attestation_required", 0), "active from genesis");
-        assert!(super::is_active("burn_attestation_required", 1), "active just after genesis");
+        assert!(super::is_active(super::id::BURN_ATTESTATION_REQUIRED, 0), "active from genesis");
+        assert!(super::is_active(super::id::BURN_ATTESTATION_REQUIRED, 1), "active just after genesis");
         // No upper bound — the rule stays active at every block height (this is a HEIGHT, not any
         // registration cap; the network has no limit on the number of registrations).
-        assert!(super::is_active("burn_attestation_required", u64::MAX), "active at the highest possible height");
+        assert!(super::is_active(super::id::BURN_ATTESTATION_REQUIRED, u64::MAX), "active at the highest possible height");
+    }
+
+    // Every name in `id` is either scheduled in ACTIVATIONS or deliberately genesis-active, and the
+    // two sets do not overlap. Without this, adding a constant and forgetting the registry entry ships
+    // a rule that is born active on every node - the exact failure gates exist to prevent.
+    #[test]
+    fn every_gate_name_is_classified() {
+        use super::id::*;
+        const GENESIS_ACTIVE: &[&str] = &[RECENCY_SPAN_EPOCH];
+        const SCHEDULED: &[&str] = &[
+            BURN_ATTESTATION_REQUIRED, REGISTRY_ROOT_REQUIRED, LIGHT_REG_EPOCH_ROSTER,
+            LOGS_ROOT_REQUIRED, REWARD_EPOCH_ROOT_REQUIRED, LIGHT_KEY_COMMITMENT,
+            LIGHT_SHARD_BACKUP_OWNERS,
+        ];
+        for name in SCHEDULED {
+            assert!(super::ACTIVATIONS.iter().any(|(f, _)| f == name),
+                    "{} has a constant but no registry entry, so it is silently genesis-active", name);
+            assert!(!GENESIS_ACTIVE.contains(name), "{} cannot be both scheduled and genesis-active", name);
+        }
+        for name in GENESIS_ACTIVE {
+            assert!(!super::ACTIVATIONS.iter().any(|(f, _)| f == name),
+                    "{} is documented as genesis-active but carries an activation height", name);
+        }
+        assert_eq!(super::ACTIVATIONS.len(), SCHEDULED.len(),
+                   "a registry entry exists that no `id` constant names - it can only be reached by a literal");
+        let mut names: Vec<&str> = super::ACTIVATIONS.iter().map(|(f, _)| *f).collect();
+        names.sort_unstable();
+        let before = names.len();
+        names.dedup();
+        assert_eq!(names.len(), before, "duplicate gate name in ACTIVATIONS: the first entry wins silently");
     }
 
     #[test]
@@ -133,10 +205,10 @@ mod tests {
         // the commit-window roster cutoff applies from epoch 0, so a light node earns for its registration
         // epoch and epoch 0. (Re-gate to a future epoch boundary ONLY for a rolling upgrade of a live chain.)
         assert_eq!(super::LIGHT_REG_EPOCH_ROSTER_GATE_HEIGHT, 0, "active-from-genesis on fresh genesis");
-        assert!(super::is_active("light_reg_epoch_roster", 0), "active from genesis (epoch 0)");
-        assert!(super::is_active("light_reg_epoch_roster", 8 * 14_400), "active later too");
-        assert!(super::is_active("light_reg_epoch_roster", u64::MAX), "active at the highest height");
+        assert!(super::is_active(super::id::LIGHT_REG_EPOCH_ROSTER, 0), "active from genesis (epoch 0)");
+        assert!(super::is_active(super::id::LIGHT_REG_EPOCH_ROSTER, 8 * 14_400), "active later too");
+        assert!(super::is_active(super::id::LIGHT_REG_EPOCH_ROSTER, u64::MAX), "active at the highest height");
         // recency_span_epoch is NOT gated (genesis rule = deployed behavior) ⇒ unlisted ⇒ always active.
-        assert!(super::is_active("recency_span_epoch", 0), "recency is genesis-active (matches deployed HEAD)");
+        assert!(super::is_active(super::id::RECENCY_SPAN_EPOCH, 0), "recency is genesis-active (matches deployed HEAD)");
     }
 }

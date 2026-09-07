@@ -49,6 +49,15 @@ const BURN_CONTRACT_PROGRAM_ID = 'CCZSessk1TbWie6Ye2JX2cNEWHTEWxCwe5sLz8JaFriw';
 // Prevents hammering the node API: no matter how many components re-render,
 // only one actual network request goes out per minute.
 const _blockHeightCache = { height: 0, fetchedAt: 0, inFlight: false };
+
+// The activation record is tagged with the wallet that owns it. Records written before the burn path
+// was aligned carry the Solana address and newer ones the QNet address, so ownership matches EITHER
+// identity of the same wallet - never a loose "any wallet" check, which is what the tag exists to stop.
+function activationBelongsToWallet(saved, wallet) {
+  if (!saved || !saved.walletAddress || !wallet) return false;
+  return [wallet.qnetAddress, wallet.address, wallet.publicKey, wallet.solanaAddress]
+    .filter(Boolean).includes(saved.walletAddress);
+}
 let _tokenIconCache = null; // built once on first getTokenIconUrl call (multi-KB base64 set)
 
 // Per-tab render isolation. Wraps a tab's JSX in a memo boundary keyed on the reactive values that
@@ -583,10 +592,8 @@ const WalletScreen = () => {
         // User may have burned tokens and received code but not yet activated the node
         AsyncStorage.getItem('qnet_last_activated_node').then(savedStr => {
           const saved = savedStr ? JSON.parse(savedStr) : {};
-          const currentAddr = wallet.qnetAddress || wallet.address;
-          
           // CRITICAL: If saved state has no wallet tag or belongs to a different wallet, clear UI
-          if (!saved.walletAddress || saved.walletAddress !== currentAddr) {
+          if (!activationBelongsToWallet(saved, wallet)) {
             console.log('[NODE TAB] Saved activation has no wallet tag or belongs to different wallet — clearing UI');
             setActivatedNodeType(null);
             setActivationCode(null);
@@ -849,7 +856,10 @@ const WalletScreen = () => {
         // AUTO-LINK: link server nodes found on-chain. Also fires when the type is
         // already set but the pseudonym is unresolved (server-activated super whose
         // name was never cached locally) so the node name resolves from the chain.
-        const serverNodes = realNodes.filter(n => n.node_type !== 'light' && n.status === 'active');
+        // by-wallet answers "online"/"offline" - liveness, not registration. Testing for "active"
+        // matched nothing, so a server node activated elsewhere never linked itself to the wallet.
+        // The list already excludes pending_activation, so presence here IS registration.
+        const serverNodes = realNodes.filter(n => n.node_type !== 'light');
 
         if (serverNodes.length > 0 && (!activatedNodeType || !nodePseudonym)) {
           // Priority 1: Check for Genesis nodes first (bootstrap nodes)
@@ -2043,14 +2053,13 @@ const WalletScreen = () => {
         try {
           // Priority 1: Check qnet_last_activated_node (includes burn evidence)
           // CRITICAL: Must verify the saved state belongs to THIS wallet, not a different one
-          const currentAddr = wallet.qnetAddress || wallet.address;
           const savedState = await AsyncStorage.getItem('qnet_last_activated_node');
           if (savedState) {
             const state = JSON.parse(savedState);
             if (state.nodeType && state.code) {
               // Verify wallet ownership — saved data must belong to current wallet
               // If walletAddress is missing (old data) or doesn't match — don't trust it
-              if (!state.walletAddress || state.walletAddress !== currentAddr) {
+              if (!activationBelongsToWallet(state, wallet)) {
                 console.log('[checkActivationStatus] Saved activation has no wallet tag or belongs to different wallet, ignoring');
                 // Don't load — user can recover via "Recover My Code"
               } else {
@@ -2625,11 +2634,9 @@ const WalletScreen = () => {
         if (savedState) {
           try {
             const state = JSON.parse(savedState);
-            const currentWalletAddr = loadedWallet.qnetAddress || loadedWallet.address;
-            
             // CRITICAL: Verify saved state belongs to THIS wallet
             // If walletAddress is missing (old data) or doesn't match — don't trust it
-            if (!state.walletAddress || state.walletAddress !== currentWalletAddr) {
+            if (!activationBelongsToWallet(state, loadedWallet)) {
               console.log('[UNLOCK] Saved activation has no wallet tag or belongs to different wallet, skipping');
               // Don't load stale data — user can recover via "Recover My Code"
             } else if (state.nodeType && state.code) {
@@ -2707,10 +2714,13 @@ const WalletScreen = () => {
       
       // Sync activation codes in background (non-blocking)
       setTimeout(() => {
+        // `pw` is what actually opened the vault. Reading the password STATE here left the sync with
+        // an empty string after a biometric unlock, so the code was never restored and the activated
+        // node was missing from the screen until the user typed the password by hand.
         walletManager.syncActivationCodes(
-          loadedWallet.publicKey,
+          loadedWallet.qnetAddress || loadedWallet.publicKey,
           loadedWallet.mnemonic,
-          password
+          pw
         ).then(async syncedCodes => {
           if (syncedCodes && Object.keys(syncedCodes).length > 0) {
             const nodeType = Object.keys(syncedCodes)[0];

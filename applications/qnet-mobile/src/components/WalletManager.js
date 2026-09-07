@@ -4749,7 +4749,13 @@ export class WalletManager {
         // Verify on-chain before trusting local cache
         // Prevents stale codes from surviving network restarts
         try {
-          const onChainResult = await this.verifyActivationOnChain(walletAddress);
+          // Nodes are registered under the QNet address; callers pass whichever they hold. Ask about
+          // the QNet identity, and treat a Solana address as the burn-side alias of the same wallet.
+          const a = String(walletAddress || '');
+          const qnetAddr = (a.length === 45 && a.includes('eon'))
+            ? a                                              // already the QNet identity
+            : this.generateQNetAddressFromSolana(a);         // Solana burn address -> its QNet alias
+          const onChainResult = await this.verifyActivationOnChain(qnetAddr);
           if (!onChainResult.verified && !onChainResult.networkError) {
             console.log('[syncActivationCodes] Local codes exist but NOT verified on-chain — ignoring cache');
             // Don't return cached codes — fall through to re-check server/blockchain
@@ -5554,13 +5560,17 @@ export class WalletManager {
     // CRITICAL: Save qnet_last_activated_node immediately after burn
     // Without this, data is lost if user closes the app before clicking "Activate Node"
     const burnPseudonym = this.generateLightNodePseudonym(walletAddress);
+    // Tag the record with the QNet address. The reader compares against the wallet's QNet identity,
+    // so a record tagged with the Solana burn address read as another wallet's and the activated node
+    // vanished from the app on the next unlock. `solanaAddress` stays for the burn/XOR path.
     await AsyncStorage.setItem('qnet_last_activated_node', JSON.stringify({
       nodeType: 'light',
       code: activationCode,
       pseudonym: burnPseudonym,
       timestamp: Date.now(),
       burnTxHash: burnResult.signature,
-      walletAddress: walletAddress
+      walletAddress: this.generateQNetAddressFromSolana(walletAddress),
+      solanaAddress: walletAddress
     }));
     await AsyncStorage.setItem(`node_pseudonym_${activationCode}`, burnPseudonym);
 

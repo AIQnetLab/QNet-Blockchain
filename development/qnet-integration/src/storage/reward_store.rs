@@ -86,9 +86,22 @@ impl Storage {
     /// happened to accept the TX — that map is not durable, so a restarted node would otherwise
     /// resolve a different bitmap for the epoch and fork reward_root.
     pub fn save_light_bitmap(&self, epoch: u64, gidx: usize, incl_height: u64, bitmap: &[u8]) -> IntegrationResult<()> {
+        self.save_light_bitmap_from(epoch, gidx, gidx, incl_height, bitmap)
+    }
+
+    /// A shard's bitmap as committed by ONE of its owners. Each owner's copy is a row of its own, and
+    /// `load_light_bitmaps` bit-ORs them: eligibility only ever grows, OR is order-independent, so
+    /// every node reaches the same set whatever order the blocks arrived in. Keeping one row per shard
+    /// instead would have made a backup's partial cover ERASE the primary's, which is worse than the
+    /// gap it exists to fill.
+    pub fn save_light_bitmap_from(&self, epoch: u64, shard: usize, signer: usize, incl_height: u64, bitmap: &[u8]) -> IntegrationResult<()> {
         let cf = self.persistent.db.cf_handle("pending_rewards")
             .ok_or_else(|| IntegrationError::StorageError("pending_rewards column family not found".to_string()))?;
-        let key = format!("light_bm_{}_{}", epoch, gidx);
+        let key = if signer == shard {
+            format!("light_bm_{}_{}", epoch, shard)      // the primary keeps the historic key
+        } else {
+            format!("light_bm_{}_{}_{}", epoch, shard, signer)
+        };
         // Lowest inclusion height wins. Arrival order is node-local; the height is canonical, so
         // every node holding both inclusions of a duplicated bitmap converges on the same row.
         if let Some(prev) = self.persistent.db.get_cf(&cf, key.as_bytes())? {
@@ -152,11 +165,23 @@ impl Storage {
     pub fn load_light_bitmaps(&self, epoch: u64) -> IntegrationResult<std::collections::BTreeMap<usize, Vec<u8>>> {
         let cf = self.persistent.db.cf_handle("pending_rewards")
             .ok_or_else(|| IntegrationError::StorageError("pending_rewards column family not found".to_string()))?;
-        let mut out = std::collections::BTreeMap::new();
-        for gidx in 0..5usize {
-            let key = format!("light_bm_{}_{}", epoch, gidx);
-            if let Some(d) = self.persistent.db.get_cf(&cf, key.as_bytes())? {
-                if d.len() > 8 { out.insert(gidx, d[8..].to_vec()); } // strip the height stamp
+        let mut out: std::collections::BTreeMap<usize, Vec<u8>> = std::collections::BTreeMap::new();
+        for shard in 0..5usize {
+            // The shard's own row plus every backup owner's row, bit-ORed. A bit set by any owner
+            // means that light node attested, and no owner can clear another's.
+            let mut keys = vec![format!("light_bm_{}_{}", epoch, shard)];
+            for signer in crate::node::light_shard_owners(shard) {
+                if signer != shard { keys.push(format!("light_bm_{}_{}_{}", epoch, shard, signer)); }
+            }
+            for key in keys {
+                if let Some(d) = self.persistent.db.get_cf(&cf, key.as_bytes())? {
+                    if d.len() > 8 {
+                        let bits = &d[8..];                       // strip the height stamp
+                        let slot = out.entry(shard).or_default();
+                        if slot.len() < bits.len() { slot.resize(bits.len(), 0); }
+                        for (i, b) in bits.iter().enumerate() { slot[i] |= *b; }
+                    }
+                }
             }
         }
         Ok(out)

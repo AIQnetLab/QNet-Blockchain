@@ -2613,7 +2613,7 @@ impl Storage {
         // registry digest from the restored registry and compare to the anchor checkpoint's QC-certified
         // registry_root (bounded by the checkpoint's window head). Gated: until the rule activates the
         // root is computed+committed but not enforced here (staging window to prove live agreement).
-        if qnet_state::feature_gates::is_active("registry_root_required", snapshot_height) {
+        if qnet_state::feature_gates::is_active(qnet_state::feature_gates::id::REGISTRY_ROOT_REQUIRED, snapshot_height) {
             let cp_opt = macroblock.consensus_data.checkpoint_qc.as_ref().and_then(|b| {
                 bincode::deserialize::<(qnet_consensus::checkpoint_bft::Checkpoint, qnet_consensus::checkpoint_bft::QuorumCertificate)>(b).ok()
             }).map(|(cp, _)| cp);

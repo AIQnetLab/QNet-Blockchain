@@ -3004,9 +3004,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            // v8.0: QNET_HALT_HEIGHT — coordinated upgrade stop
-            // Halt-height semantics: set the same value on all nodes,
-            // they all stop at that block → update binaries → restart.
+            // QNET_HALT_HEIGHT — coordinated upgrade stop. Set the same value on every node: each stops
+            // at the first height it observes at or above it, updates, and restarts. The observed
+            // heights can differ by a block or two because this is a poll, not a consensus rule - that
+            // is harmless, the restarted nodes resync to one tip. What it buys is a bounded window in
+            // which no node is producing, so a consensus-rule change lands on an idle chain.
             if let Some(stop_at) = halt_height {
                 let current_height = node_clone.get_height().await;
                 if current_height >= stop_at {

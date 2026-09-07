@@ -54,6 +54,9 @@ jobs:
           context: .
           file: development/qnet-integration/Dockerfile.production
           push: true
+          # Stamped into the runtime image so every node reports the commit it runs on /healthz.
+          build-args: |
+            QNET_BUILD_ID=${{ github.sha }}
           # :latest — for Watchtower auto-updates on all community nodes
           # :sha    — pinned version for rollback
           tags: |

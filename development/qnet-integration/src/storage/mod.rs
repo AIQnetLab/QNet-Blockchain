@@ -3161,6 +3161,83 @@ mod tests_certified_pair_wal {
     /// A pair above the seal frontier is what re-seals a late-committing boundary; a re-certification
     /// run moves the index far past the retain window in minutes, so index distance alone must not
     /// discard it. Pairs at or below the frontier still go.
+    /// A shard's eligibility is the union of what its owners committed. A backup covers what the
+    /// primary could not without erasing what the primary did: eligibility only grows, so OR is the
+    /// only merge that is both order-independent and safe. One row per shard would have let a
+    /// backup's partial cover replace a full one.
+    #[test]
+    fn a_shards_owners_bitmaps_are_merged_by_or() {
+        let (s, _d) = open_test_storage();
+        let shard = 0usize;                                   // owners: 0 (primary), 1, 2
+        // The primary commits the first three light nodes, a backup the fourth.
+        s.save_light_bitmap_from(7, shard, 0, 100, &[0b0000_0111]).unwrap();
+        s.save_light_bitmap_from(7, shard, 1, 101, &[0b0000_1000]).unwrap();
+        let merged = s.load_light_bitmaps(7).unwrap();
+        assert_eq!(merged.get(&shard).map(|v| v.as_slice()), Some(&[0b0000_1111u8][..]),
+                   "the shard is covered by the union of its owners");
+
+        // The order the rows arrive in cannot change the answer.
+        let (s2, _d2) = open_test_storage();
+        s2.save_light_bitmap_from(7, shard, 1, 101, &[0b0000_1000]).unwrap();
+        s2.save_light_bitmap_from(7, shard, 0, 100, &[0b0000_0111]).unwrap();
+        assert_eq!(s2.load_light_bitmaps(7).unwrap().get(&shard), merged.get(&shard));
+
+        // A shorter row from one owner never truncates a longer one from another.
+        let (s3, _d3) = open_test_storage();
+        s3.save_light_bitmap_from(7, shard, 0, 100, &[0xFF, 0x0F]).unwrap();
+        s3.save_light_bitmap_from(7, shard, 2, 102, &[0x00]).unwrap();
+        assert_eq!(s3.load_light_bitmaps(7).unwrap().get(&shard).map(|v| v.as_slice()),
+                   Some(&[0xFFu8, 0x0F][..]));
+
+        // A shard nobody covered stays absent, which is what the reward path reads as "no payout".
+        assert!(!merged.contains_key(&3usize));
+    }
+
+    /// A light node's identity is committed as a hash and carried by its device. The resolver admits
+    /// exactly the key that hashes to the commitment and nothing else - this is the gate that decides
+    /// whether ten million light nodes can attest at all, and it used to refuse every one of them
+    /// because the registration committed nothing to check against.
+    #[test]
+    fn a_light_identity_is_admitted_only_against_its_committed_hash() {
+        use sha3::{Digest, Sha3_256};
+        let (s, _d) = open_test_storage();
+        let pk = vec![7u8; 96];
+        let pk_hex = hex::encode(&pk);
+        let other = hex::encode(vec![9u8; 96]);
+
+        // No registration at all: nothing to check against, so nothing is admitted.
+        assert_eq!(s.resolve_light_identity_pk("light_x", Some(&pk_hex)), None);
+
+        // The registration commits the hash (this is what the apply path now does for light rows).
+        s.save_node_registration_at_height_burn_vrf("light_x", "light", "wallet_x", 70.0, 100, "", Some(&pk))
+            .expect("register");
+        assert_eq!(s.node_signer_key_commitment("light_x").unwrap().as_deref(),
+                   Some(hex::encode(Sha3_256::digest(&pk)).as_str()), "the row carries the commitment");
+        assert!(s.load_vrf_public_key("light_x").unwrap().is_none(),
+                "and NOT the raw key: ten million of those would be tens of gigabytes");
+
+        assert_eq!(s.resolve_light_identity_pk("light_x", Some(&pk_hex)), Some(pk_hex.clone()),
+                   "the device's own key is admitted");
+        assert_eq!(s.resolve_light_identity_pk("light_x", Some(&other)), None,
+                   "another key with the same node id is refused");
+        assert_eq!(s.resolve_light_identity_pk("light_x", None), None,
+                   "and nothing is admitted when no key is presented and none was recorded");
+
+        // Once the delegation is proven the identity is recorded, and later attestations resolve
+        // without the device re-presenting it.
+        s.save_light_ping_keys_identity("light_x", "ping_pk", "cert", &pk_hex).expect("record");
+        assert_eq!(s.resolve_light_identity_pk("light_x", None), Some(pk_hex.clone()));
+        // A write that carries no identity never erases a proven one.
+        s.save_light_ping_keys("light_x", "ping_pk2", "cert2").expect("gossip write");
+        assert_eq!(s.light_ping_identity("light_x").as_deref(), Some(pk_hex.as_str()));
+
+        // A super keeps the raw key, and the resolver prefers it.
+        let spk = vec![3u8; 96];
+        s.save_node_registration_at_height_burn_vrf("super_y", "super", "wallet_y", 70.0, 100, "", Some(&spk))
+            .expect("register super");
+        assert_eq!(s.resolve_light_identity_pk("super_y", None), Some(hex::encode(&spk)));
+    }
+
     #[test]
     fn certified_pairs_above_the_seal_frontier_survive_the_index_prune() {
         let (s, _d) = open_test_storage();

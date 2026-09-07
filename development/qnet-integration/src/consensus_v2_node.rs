@@ -1044,11 +1044,11 @@ fn check_content(storage: &Storage, buf: &std::collections::HashMap<u64, WindowC
         || cp.timestamp != c.head_ts
         || qnet_consensus::checkpoint_bft::epoch_commitment(&c.eligible, &c.committee, &c.banned) != cp.epoch_commitment
         || cp.reward_root != c.reward_root
-        || (qnet_state::feature_gates::is_active("registry_root_required", cp.window_head_height) && cp.registry_root != c.registry_root)
-        || (qnet_state::feature_gates::is_active("registry_root_required", cp.window_head_height) && cp.dilithium_pk_root != c.dilithium_pk_root)
-        || (qnet_state::feature_gates::is_active("logs_root_required", cp.window_head_height) && cp.logs_root != c.logs_root)
-        || (qnet_state::feature_gates::is_active("registry_root_required", cp.window_head_height) && cp.total_supply != c.total_supply)
-        || (qnet_state::feature_gates::is_active("reward_epoch_root_required", cp.window_head_height) && cp.reward_epoch_root != c.reward_epoch_root)
+        || (qnet_state::feature_gates::is_active(qnet_state::feature_gates::id::REGISTRY_ROOT_REQUIRED, cp.window_head_height) && cp.registry_root != c.registry_root)
+        || (qnet_state::feature_gates::is_active(qnet_state::feature_gates::id::REGISTRY_ROOT_REQUIRED, cp.window_head_height) && cp.dilithium_pk_root != c.dilithium_pk_root)
+        || (qnet_state::feature_gates::is_active(qnet_state::feature_gates::id::LOGS_ROOT_REQUIRED, cp.window_head_height) && cp.logs_root != c.logs_root)
+        || (qnet_state::feature_gates::is_active(qnet_state::feature_gates::id::REGISTRY_ROOT_REQUIRED, cp.window_head_height) && cp.total_supply != c.total_supply)
+        || (qnet_state::feature_gates::is_active(qnet_state::feature_gates::id::REWARD_EPOCH_ROOT_REQUIRED, cp.window_head_height) && cp.reward_epoch_root != c.reward_epoch_root)
     { return ContentCheck::Reject("state"); }
     // Window SPAN comes from OUR OWN snapshot, not `k`: an intra checkpoint covers CHECKPOINT_INTERVAL
     // blocks, but the macroblock-boundary checkpoint (head = 90·mb_idx) covers the FULL macroblock

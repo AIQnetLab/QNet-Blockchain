@@ -59,6 +59,24 @@ pub(crate) use crate::{
 
 // PROTOCOL VERSION for compatibility checks
 pub const PROTOCOL_VERSION: u32 = 1;  // Increment when breaking changes are made
+
+/// Which build this process is running, for operators. Set by the image at runtime (the CI passes the
+/// commit), so it costs nothing at compile time and does not bust the build cache. Without it an
+/// operator has no way to tell a node running last week's binary from one running today's - every
+/// endpoint reported the same hardcoded string.
+/// The tip this node has applied, lock-free. The admission doors judge feature gates at this height,
+/// and `get_height_sync` cannot serve them: it answers 0 under lock contention, which would silently
+/// evaluate a gated rule on the wrong side of its activation whenever the node happened to be busy.
+pub fn local_height() -> u64 {
+    crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Acquire)
+}
+
+pub fn build_id() -> &'static str {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ID.get_or_init(|| std::env::var("QNET_BUILD_ID")
+        .ok().filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| format!("v{}-unstamped", env!("CARGO_PKG_VERSION"))))
+}
 pub const MIN_COMPATIBLE_VERSION: u32 = 1;  // Minimum version we can work with
 
 // v15.15: BFT scaling — single source of truth for committee size N.
@@ -1260,10 +1278,55 @@ pub(crate) fn light_shard_of(node_id: &str) -> usize {
     (u64::from_le_bytes(h.as_bytes()[..8].try_into().unwrap_or([0u8; 8])) % 5) as usize
 }
 
+/// The genesis nodes that may commit a shard's eligibility: its own owner and the next two around
+/// the ring. A pure function of the shard, so every validator derives the same set.
+///
+/// One owner per shard made the shard's whole epoch depend on one machine being awake for the
+/// commit window - a restart, a resync or a minute of being wedged cost every light node in it a
+/// full epoch of rewards, and no other node was permitted to supply what was missing. Three owners
+/// with staggered deadlines cost nothing when the first is healthy (the others see the committed
+/// bitmap and stand down) and cover it when it is not. Only genesis nodes are ever owners.
+pub(crate) fn light_shard_owners(shard: usize) -> [usize; 3] {
+    [shard % 5, (shard + 1) % 5, (shard + 2) % 5]
+}
+
+/// Which owner slot this genesis holds for `shard`: 0 primary, 1 first backup, 2 second backup.
+pub(crate) fn light_owner_rank(shard: usize, genesis_idx: usize) -> Option<usize> {
+    light_shard_owners(shard).iter().position(|o| *o == genesis_idx)
+}
+
+/// The shards a genesis must cover this slot, each with the rank it holds. Its own shard always; a
+/// shard it backs up only while EVERY owner above it is judged silent, so two owners never ping the
+/// same shard just because one was briefly slow. Pure, so the takeover rule is testable away from the
+/// peer table it reads.
+pub(crate) fn light_shards_to_cover(my_idx: usize, alive: &dyn Fn(usize) -> bool) -> Vec<(usize, usize)> {
+    (0..5usize)
+        .filter_map(|sh| light_owner_rank(sh, my_idx).map(|r| (sh, r)))
+        .filter(|(sh, rank)| *rank == 0 || light_shard_owners(*sh).iter().take(*rank).all(|o| !alive(*o)))
+        .collect()
+}
+
+/// How many blocks before the epoch end the light commit window opens. Three staggered owner
+/// deadlines need room; one 50-block dash gave the shard a single attempt.
+pub(crate) fn light_commit_window(epoch: u64) -> u64 {
+    let epoch_start = epoch.saturating_mul(14400);
+    if qnet_state::feature_gates::is_active(qnet_state::feature_gates::id::LIGHT_SHARD_BACKUP_OWNERS, epoch_start) { 150 } else { 50 }
+}
+
+/// Deadline per owner rank: the shard's own genesis may emit for the whole window, each backup only
+/// once the ranks above it have let their share of it pass without committing.
+pub(crate) fn light_owner_deadlines(epoch: u64) -> [u64; 3] {
+    let w = light_commit_window(epoch);
+    [w, w * 2 / 3, w / 3]
+}
+
+/// The roster is frozen when the window opens, never inside it. Bit positions are permanent reg_index
+/// values, so a late registration shifts nothing - but it lands past the emitted bitmap's index_span
+/// and reads back as "did not attest", losing that node its epoch through no fault of its own.
 pub(crate) fn light_roster_cutoff(epoch: u64) -> u64 {
     let epoch_start = epoch.saturating_mul(14400);
-    if qnet_state::feature_gates::is_active("light_reg_epoch_roster", epoch_start) {
-        epoch_start + (14400 - 50)
+    if qnet_state::feature_gates::is_active(qnet_state::feature_gates::id::LIGHT_REG_EPOCH_ROSTER, epoch_start) {
+        epoch_start + (14400 - light_commit_window(epoch))
     } else {
         epoch_start
     }
@@ -4209,7 +4272,9 @@ pub struct BlockApplyResult {
 #[derive(Default, Debug)]
 pub struct BlockSideIndices {
     /// (epoch, genesis shard index, inclusion height, bitmap)
-    pub light_bitmaps: Vec<(u64, usize, u64, Vec<u8>)>,
+    /// (epoch, shard, signing owner, inclusion height, bitmap). The owner is kept so each one's
+    /// cover is stored apart and merged by OR at read.
+    pub light_bitmaps: Vec<(u64, usize, usize, u64, Vec<u8>)>,
     /// Display-only rich-list deltas. In no root, but still a durable write that must not happen
     /// speculatively.
     pub richlist: Vec<(String, Option<u64>)>,
@@ -6116,13 +6181,13 @@ mod tests {
             dilithium_public_key: Some(vec![2u8; 1952]),
             chain_id: qnet_state::transaction::QNET_CHAIN_ID,
         };
-        assert!(BlockchainNode::verify_system_tx_binds(&mk("super_A", "super_A")).is_ok());
-        let e = BlockchainNode::verify_system_tx_binds(&mk("super_ATK", "super_VICTIM")).unwrap_err();
+        assert!(BlockchainNode::verify_system_tx_binds(&mk("super_A", "super_A"), 1).is_ok());
+        let e = BlockchainNode::verify_system_tx_binds(&mk("super_ATK", "super_VICTIM"), 1).unwrap_err();
         assert!(e.contains("NodeReactivation identity split"), "got {}", e);
         // The signature-presence rule stays: an unsigned reactivation has no authenticator at all.
         let mut unsigned = mk("super_A", "super_A");
         unsigned.dilithium_signature = None;
-        assert!(BlockchainNode::verify_system_tx_binds(&unsigned).is_err());
+        assert!(BlockchainNode::verify_system_tx_binds(&unsigned, 1).is_err());
     }
 
     // B2. The NodeRegistration dedup set must be seeded from rows `registry_root` ACTUALLY covers.
@@ -6840,13 +6905,23 @@ mod tests {
     }
 
     // Light-reward roster cutoff. light_reg_epoch_roster is genesis-active (gate=0) for a fresh genesis,
-    // so EVERY epoch (incl. 0) freezes the roster at the commit-window open (epoch_start + 14350) — a light
-    // node registered mid-epoch earns for that epoch. Creator + reader call it identically (no divergence).
+    // so EVERY epoch (incl. 0) freezes the roster when the commit window opens — a light node registered
+    // mid-epoch earns for that epoch. Creator + reader call it identically (no divergence).
     #[test]
     fn light_roster_cutoff_gate() {
-        assert_eq!(light_roster_cutoff(0), 14_350);              // epoch 0: commit-window from genesis
-        assert_eq!(light_roster_cutoff(7), 7 * 14_400 + 14_350); // 115150
-        assert_eq!(light_roster_cutoff(8), 8 * 14_400 + 14_350); // 129550
+        // The freeze IS the window open, at whatever width the backup-owners gate selects. Held as one
+        // identity rather than two constants: drifting them apart lets a node register into the gap,
+        // past the index_span of a bitmap already emitted, and lose the epoch it was present for.
+        for epoch in [0u64, 7, 8, 4096] {
+            let w = light_commit_window(epoch);
+            assert!(w == 150 || w == 50, "window is one of the two gated widths, got {}", w);
+            assert_eq!(light_roster_cutoff(epoch), epoch * 14_400 + (14_400 - w),
+                       "epoch {} freezes its roster exactly when its window opens", epoch);
+        }
+        // Deadlines fit inside the window, strictly decreasing, and the primary owns all of it.
+        let d = light_owner_deadlines(0);
+        assert_eq!(d[0], light_commit_window(0), "the shard's own genesis may emit for the whole window");
+        assert!(d[0] > d[1] && d[1] > d[2] && d[2] > 0, "each backup waits longer than the rank above it: {:?}", d);
     }
 
     // Verify-before-serve invariant: the gate hasher (epoch_reward_merkle_root) MUST reproduce the exact
@@ -7213,8 +7288,20 @@ mod tests {
         // producer marked. Encode with the real producer fn, decode with the reader's bit logic.
         let index_span = 13u32;
         let eligible: Vec<u32> = vec![0, 3, 7, 12];
-        let tx = BlockchainNode::create_light_node_bitmap_tx("genesis_node_002", 5, &eligible, index_span)
+        // Shard 002, emitted by its own genesis: `from` is the signer, `genesis_id` the shard.
+        let tx = BlockchainNode::create_light_node_bitmap_tx("genesis_node_002", "genesis_node_002", 5, &eligible, index_span)
             .expect("bitmap tx");
+        assert_eq!(tx.from, "genesis_node_002");
+        // A backup covering the same shard names the SHARD and signs as itself, so the two never
+        // collide on (from, nonce) and both rows survive to be merged.
+        let backup = BlockchainNode::create_light_node_bitmap_tx("genesis_node_002", "genesis_node_003", 5, &eligible, index_span)
+            .expect("backup bitmap tx");
+        assert_eq!(backup.from, "genesis_node_003");
+        match &backup.tx_type {
+            qnet_state::TransactionType::LightNodeEligibilityBitmap { genesis_id, .. } =>
+                assert_eq!(genesis_id, "genesis_node_002", "the shard is named by the TX, not by its signer"),
+            _ => panic!("wrong tx type"),
+        }
         let bm = match tx.tx_type {
             qnet_state::TransactionType::LightNodeEligibilityBitmap { bitmap_compressed, index_span: ta, eligible_count, .. } => {
                 assert_eq!(ta, index_span);
@@ -8657,6 +8744,68 @@ mod tests_production_predicate {
             !src.contains(concat!("reason=no_", "corroboration")),
             "production must never block on absent peer corroboration"
         );
+    }
+}
+
+#[cfg(test)]
+mod light_shard_owner_tests {
+    use super::{light_shard_owners, light_owner_rank};
+
+    /// Every shard is owned by three genesis nodes and every genesis owns three shards, so no shard
+    /// depends on one machine being awake and no node carries more than its share. The shard's own
+    /// genesis is always the primary: a healthy fleet behaves exactly as before.
+    #[test]
+    fn every_shard_has_three_owners_and_every_owner_three_shards() {
+        for shard in 0..5usize {
+            let owners = light_shard_owners(shard);
+            assert_eq!(owners[0], shard, "the shard's own genesis leads it");
+            let mut seen = owners.to_vec();
+            seen.sort_unstable();
+            seen.dedup();
+            assert_eq!(seen.len(), 3, "three DISTINCT owners for shard {}: {:?}", shard, owners);
+            for (rank, o) in owners.iter().enumerate() {
+                assert_eq!(light_owner_rank(shard, *o), Some(rank), "rank is the position in the set");
+            }
+        }
+        for genesis in 0..5usize {
+            let mine: Vec<usize> = (0..5usize).filter(|sh| light_owner_rank(*sh, genesis).is_some()).collect();
+            assert_eq!(mine.len(), 3, "genesis {} owns three shards: {:?}", genesis, mine);
+        }
+        assert_eq!(light_owner_rank(0, 3), None, "a node that does not own the shard has no rank");
+    }
+
+    /// A backup takes over only for an owner that is actually silent, and only after every owner above
+    /// it is. A whole fleet up means every genesis pings exactly its own shard — the healthy case must
+    /// cost nothing, or five nodes would ping three fifths of the registry each.
+    #[test]
+    fn a_backup_covers_a_shard_only_while_every_owner_above_it_is_silent() {
+        use super::light_shards_to_cover;
+        let all_up = |_: usize| true;
+        for idx in 0..5usize {
+            assert_eq!(light_shards_to_cover(idx, &all_up), vec![(idx, 0)],
+                       "a healthy fleet leaves genesis {} with its own shard only", idx);
+        }
+        // Owner 0 is silent. Shard 0's ranks are [0,1,2] -> genesis 1 (rank 1) covers it, and genesis 2
+        // (rank 2) does NOT, because the rank above it is up.
+        let only_0_down = |i: usize| i != 0;
+        assert_eq!(light_shards_to_cover(1, &only_0_down), vec![(0, 1), (1, 0)]);
+        assert_eq!(light_shards_to_cover(2, &only_0_down), vec![(2, 0)], "rank 2 waits behind rank 1");
+        // Both owners above rank 2 are gone, so the last backup steps in.
+        let zero_and_one_down = |i: usize| i > 1;
+        assert_eq!(light_shards_to_cover(2, &zero_and_one_down), vec![(0, 2), (1, 1), (2, 0)]);
+        // No shard is ever left uncovered, however many owners are down.
+        for down in 0..(1usize << 5) {
+            let alive = |i: usize| down & (1 << i) == 0;
+            for sh in 0..5usize {
+                let covering: Vec<usize> = (0..5usize)
+                    .filter(|g| alive(*g) && light_shards_to_cover(*g, &alive).iter().any(|(s, _)| *s == sh))
+                    .collect();
+                let owners_up = light_shard_owners(sh).iter().filter(|o| alive(**o)).count();
+                assert_eq!(covering.len(), owners_up.min(1),
+                           "shard {} with down-mask {:05b}: exactly one live owner covers it, got {:?}",
+                           sh, down, covering);
+            }
+        }
     }
 }
 

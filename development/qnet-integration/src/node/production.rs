@@ -4678,7 +4678,7 @@ impl BlockchainNode {
                     // — the EXACT rule validators enforce at verify (block_pipeline). Without it the
                     // producer would emit a block every peer rejects at the activation-burn gate (wasted
                     // slot → liveness loss under an unbacked-activation spam). Same activation-height gate.
-                    if qnet_state::feature_gates::is_active("burn_attestation_required", next_block_height) {
+                    if qnet_state::feature_gates::is_active(qnet_state::feature_gates::id::BURN_ATTESTATION_REQUIRED, next_block_height) {
                         let this_block_burned: std::collections::HashSet<String> = txs.iter().filter_map(|t| match &t.tx_type {
                             qnet_state::TransactionType::NodeRegistration { wallet_address, burn_tx, .. } if !burn_tx.is_empty() => Some(wallet_address.clone()),
                             _ => None,

@@ -125,6 +125,10 @@ export async function registerLightNode(nodeId, walletAddress, quantumPubkey, qu
   // PING DELEGATION v7.0 (optional — graceful degradation if Keychain unavailable)
   if (pingPubkey)        registrationData.ping_pubkey = pingPubkey;
   if (pingDelegationCert) registrationData.ping_delegation_cert = pingDelegationCert;
+  // The chain commits only a hash of this key, so the node cannot look it up: the device carries it
+  // and the node checks it against that commitment. Kept here so every later attestation can present
+  // it without re-deriving the wallet's key material.
+  if (quantumPubkey) { try { await AsyncStorage.setItem(`qnet_identity_pk_${nodeId}`, quantumPubkey); } catch (_) {} }
 
   // Add provider-specific data
   if (pushProvider.type === PushType.FCM) {
@@ -367,6 +371,8 @@ export async function respondToChallenge(nodeId, challenge, responseUrl) {
               // Present the ping delegation so the genesis verifies it against our committed on-chain key and
               // refreshes its ping-key store — overwrites any pre-registration gossip poison. Optional/graceful.
               const pingCert = await AsyncStorage.getItem(`qnet_ping_cert_${pingNodeId}`);
+              // Presented so the node can verify the delegation against the hash the chain committed.
+              const identityPk = await AsyncStorage.getItem(`qnet_identity_pk_${pingNodeId}`);
 
               const apiUrl = responseUrl || await getRandomBootstrapNodeAsync();
               const response = await fetch(
@@ -380,6 +386,7 @@ export async function respondToChallenge(nodeId, challenge, responseUrl) {
                     signature: formattedSignature,
                     ...(pingPkHex ? { ping_pubkey: pingPkHex } : {}),
                     ...(pingCert ? { ping_delegation_cert: pingCert } : {}),
+                    ...(identityPk ? { identity_pubkey: identityPk } : {}),
                   }),
                 }
               );
@@ -925,6 +932,11 @@ export async function getAllNodesByWallet(walletAddress) {
       };
     }
     
+    // The node answered but did not answer with a node list: unknown, not "this wallet owns nothing".
+    // Reported as success it collapsed the node view exactly like the HTTP failure below.
+    if (result && result.success === false) {
+      return { success: false, nodes: [], totalNodes: 0, error: result.error || 'node returned success:false' };
+    }
     return { success: true, nodes: [], totalNodes: 0 };
   } catch (error) {
     // Distinguish a network/HTTP failure from a genuinely empty wallet: a failed

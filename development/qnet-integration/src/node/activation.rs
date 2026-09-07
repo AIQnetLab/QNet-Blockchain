@@ -559,7 +559,7 @@ impl BlockchainNode {
         // registration. Inert below the gate height.
         {
             let cur_h = storage.get_chain_height().unwrap_or(0);
-            if qnet_state::feature_gates::is_active("burn_attestation_required", cur_h) {
+            if qnet_state::feature_gates::is_active(qnet_state::feature_gates::id::BURN_ATTESTATION_REQUIRED, cur_h) {
                 let b_tx = burn_tx_ref.clone();
                 let b_amt: u64 = std::env::var("QNET_BURN_AMOUNT").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
                 let mnemonic = load_wallet_seed("QNET_WALLET_SEED").unwrap_or_default();

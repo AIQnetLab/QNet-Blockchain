@@ -557,7 +557,12 @@ impl BlockchainNode {
 
                     // v4.6: Extract VRF public key from on-chain TX (non-genesis nodes).
                     // FIX-5: the TX carries the pk as RAW 1952 bytes (no hex hop).
-                    if let Some(pk_bytes) = Self::registration_consensus_pk(tx) {
+                    // CONSENSUS PARTICIPANTS ONLY. A light node's registration now carries a key too,
+                    // but it belongs in the registry row as a 32-byte hash and nowhere else: keeping the
+                    // raw 1952-byte key here would put ~19 GB on disk AND the same again in the RAM
+                    // consensus map at ten million nodes, for a key no block ever verifies.
+                    let commits_consensus_key = !matches!(node_type, qnet_state::NodeType::Light);
+                    if let Some(pk_bytes) = Self::registration_consensus_pk(tx).filter(|_| commits_consensus_key) {
                         {
                             let pk_bytes = &pk_bytes;
                             // Log if registering key from unsigned TX (no proof-of-possession)
@@ -659,7 +664,7 @@ impl BlockchainNode {
     /// writer for this index, called from BOTH apply_block_to_state (validator) AND the producer-inline
     /// apply, so the producer of a bitmap-carrying block stamps its own shard IDENTICALLY — else its
     /// light reward roster diverges from validators at the emission boundary → reward_root fork.
-    pub(super) fn collect_light_eligibility_bitmap(out: &mut Vec<(u64, usize, u64, Vec<u8>)>, h: u64, tx: &qnet_state::Transaction) {
+    pub(super) fn collect_light_eligibility_bitmap(out: &mut Vec<(u64, usize, usize, u64, Vec<u8>)>, h: u64, tx: &qnet_state::Transaction) {
         if let qnet_state::TransactionType::LightNodeEligibilityBitmap {
             genesis_id, epoch, index_span, eligible_count, bitmap_compressed,
         } = &tx.tx_type {
@@ -687,7 +692,15 @@ impl BlockchainNode {
                             println!("[WARN][LIGHT-BITMAP] shape_mismatch genesis={} epoch={} len={}/{} popcount={}/{} action=drop",
                                      genesis_id, epoch, bm.len(), want_len, popcount, eligible_count);
                         } else {
-                            out.push((*epoch, gidx, h, bm));
+                            // The signer is an owner of this shard (checked when the TX was admitted);
+                            // its row is kept apart so a backup's cover adds to the primary's.
+                            let signer = tx.dilithium_public_key.as_deref()
+                                .and_then(|b| std::str::from_utf8(b).ok())
+                                .and_then(|s| s.strip_prefix("genesis_node_"))
+                                .and_then(|n| n.parse::<usize>().ok())
+                                .filter(|n| (1..=5).contains(n)).map(|n| n - 1)
+                                .unwrap_or(gidx);
+                            out.push((*epoch, gidx, signer, h, bm));
                         }
                     }
                 }
@@ -936,8 +949,12 @@ impl BlockchainNode {
     /// - Creates bitmap: bit[i] = 1 if Light node #i responded
     /// - Compresses with zstd and sends as single TX
     /// - MacroBlock merges all 5 Genesis bitmaps for rewards
+    /// `shard_id` names the shard the bitmap covers; `signer_id` is the owner emitting it. They differ
+    /// when a backup covers a shard whose own genesis produced nothing - and they must, or two owners
+    /// would emit the same `from`/nonce pair for one epoch.
     pub(super) fn create_light_node_bitmap_tx(
         genesis_id: &str,
+        signer_id: &str,
         epoch: u64,
         eligible_indices: &[u32],  // reg_index of each Light node that responded
         index_span: u32,           // highest reg_index in this shard + 1 — the bitmap's span
@@ -972,8 +989,11 @@ impl BlockchainNode {
             .unwrap_or_default()
             .as_secs();
         
+        let shard_index = genesis_id.strip_prefix("genesis_node_")
+            .and_then(|n| n.parse::<u64>().ok())
+            .filter(|n| (1..=5).contains(n)).map(|n| n - 1).unwrap_or(0);
         let mut tx = qnet_state::Transaction {
-            from: genesis_id.to_string(),
+            from: signer_id.to_string(),
             to: None,
             amount: 0,
             tx_type: qnet_state::TransactionType::LightNodeEligibilityBitmap {
@@ -989,7 +1009,10 @@ impl BlockchainNode {
             public_key: None,
             gas_price: u64::MAX, // System TX priority
             gas_limit: 0,        // FREE operation
-            nonce: epoch + 1,    // PROTOCOL: Epoch-based nonce (deterministic unique per epoch)
+            // Deterministic and unique per (epoch, shard). One owner can now emit for its own shard AND
+            // for a shard it covers in the SAME epoch; the mempool indexes a sender's TXs by nonce, so
+            // a shared nonce would have let the second bitmap evict the first.
+            nonce: epoch * 10 + shard_index + 1,
             data: Some(format!("Light Node Bitmap: {} eligible / {} assigned, epoch {}", 
                               eligible_count, index_span, epoch)),
             dilithium_signature: None,
@@ -1152,8 +1175,8 @@ impl BlockchainNode {
                 if is_warn() { println!("[WARN][RICHLIST] reconcile_failed h={} err={}", h, e); }
             }
         }
-        for (epoch, gidx, inc_h, bm) in &s.light_bitmaps {
-            let _ = storage.save_light_bitmap(*epoch, *gidx, *inc_h, bm);
+        for (epoch, gidx, signer, inc_h, bm) in &s.light_bitmaps {
+            let _ = storage.save_light_bitmap_from(*epoch, *gidx, *signer, *inc_h, bm);
         }
         if let Some((epoch, eligible)) = &s.super_eligible {
             match storage.save_super_eligible_batch(*epoch, eligible) {

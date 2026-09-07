@@ -31,7 +31,10 @@ impl BlockchainNode {
                         0 
                     },
                     reputation: real_reputation, // REAL reputation from blockchain
-                    version: Some("qnet-v1.0".to_string()), // EXISTING: Default version
+                    // The handshake carries no build string, so we do not know a peer's version.
+                    // Reporting a constant made every peer look up to date, which is the opposite of
+                    // what this field is for. Each node publishes its own build on /healthz.
+                    version: None,
                 }
             }).collect()
         } else {

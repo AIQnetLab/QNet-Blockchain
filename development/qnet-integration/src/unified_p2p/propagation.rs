@@ -642,9 +642,12 @@ impl SimplifiedP2P {
             if ping_pk_hex.is_empty() || delegation_cert.is_empty() {
                 return false;
             }
-            let onchain_pk_hex = match storage.load_vrf_public_key(node_id) {
-                Ok(Some(bytes)) => hex::encode(bytes),
-                _ => return false,
+            // Supers commit the key itself; a light node commits its hash and the key was recorded
+            // when the device proved the delegation. Either way the delegation is checked under a key
+            // the CHAIN vouches for - an identity with neither is refused, as before.
+            let onchain_pk_hex = match storage.resolve_light_identity_pk(node_id, None) {
+                Some(hex) => hex,
+                None => return false,
             };
             let delegation_msg = format!("delegate_ping:{}:{}", ping_pk_hex, node_id);
             if !crate::rpc::verify_mobile_dilithium_signature(&delegation_msg, &delegation_cert, &onchain_pk_hex) {
@@ -1911,22 +1914,52 @@ impl SimplifiedP2P {
                      our_node_id, our_genesis_idx, current_slot);
         }
 
+        // How long an owner may be silent before the rank below it starts covering its shard. Ten ping
+        // slots: long enough that a restart or a slow minute never causes a handover, short enough that
+        // a shard is not left unpinged for a meaningful part of its epoch.
+        const OWNER_SILENT_SECS: u64 = 600;
+        // Which shards we ping this slot. Our own always; a shard we back up only while every owner
+        // ranked above us is silent. Pinging is what PRODUCES the attestations the bitmap commits, so
+        // a shard whose genesis is down needs a stand-in here, not only at commit time - otherwise the
+        // backup commits an empty bitmap and the whole shard still loses the epoch.
+        // An empty liveness map means we have not learned anything yet, not that the fleet is down.
+        // Judging silence from it would make a freshly started genesis take over all three of its
+        // shards - three fifths of a ten-million-node registry - for no reason.
+        let liveness_known = !self.active_full_super_nodes.is_empty();
+        let owner_alive = |idx: usize| -> bool {
+            if idx == our_genesis_idx || !liveness_known { return true; }
+            let id = format!("genesis_node_{:03}", idx + 1);
+            let now = self.current_timestamp();
+            self.active_full_super_nodes.iter().any(|e| {
+                e.value().node_id == id && now.saturating_sub(e.value().last_seen) < OWNER_SILENT_SECS
+            })
+        };
+        let covered = crate::node::light_shards_to_cover(our_genesis_idx, &owner_alive);
+        let covered_mask: usize = covered.iter().fold(0, |m, (sh, _)| m | (1 << sh));
+        if covered_mask != 1 << our_genesis_idx && crate::node::is_warn() {
+            println!("[WARN][GENESIS-PING] shard_takeover idx={} covering={:?} reason=owner_silent",
+                     our_genesis_idx, covered.iter().map(|(sh, _)| *sh).collect::<Vec<_>>());
+        }
+
         let registry = self.light_node_registry.read();
         let reg_len = registry.len();
 
-        // Rebuild this genesis's per-slot buckets only when the window rolls or the registry size changes.
-        // Stable hash-shard (light_shard_of == our_genesis_idx) — roster-size-independent, so a node's owner
-        // NEVER changes as the registry grows (no mid-epoch reshard) and it matches the committed bitmap's
-        // shard exactly, so a reply always reaches the genesis that commits it. O(N) once per window.
-        let need_rebuild = { let c = self.light_ping_slot_cache.read(); c.0 != current_window || c.1 != reg_len };
+        // Rebuild the per-slot buckets only when the window rolls, the registry size changes, or the set
+        // of shards we cover changes. Stable hash-shard (light_shard_of) — roster-size-independent, so a
+        // node's owning shard NEVER changes as the registry grows (no mid-epoch reshard) and it matches
+        // the committed bitmap's shard exactly. O(N) once per window.
+        let need_rebuild = {
+            let c = self.light_ping_slot_cache.read();
+            c.0 != current_window || c.1 != reg_len || c.3 != covered_mask
+        };
         if need_rebuild {
             let mut buckets: Vec<Vec<String>> = vec![Vec::new(); 240];
             for id in registry.keys() {
-                if crate::node::light_shard_of(id) != our_genesis_idx { continue; }
+                if covered_mask & (1 << crate::node::light_shard_of(id)) == 0 { continue; }
                 let slot = Self::calculate_randomized_slot(id, current_window) as usize;
                 buckets[slot].push(id.clone());
             }
-            *self.light_ping_slot_cache.write() = (current_window, reg_len, buckets);
+            *self.light_ping_slot_cache.write() = (current_window, reg_len, buckets, covered_mask);
         }
 
         // Read the 3 grace slots {cur, cur-1, cur-2} (mod 240). B: wake only plausibly-live nodes —
@@ -1935,6 +1968,23 @@ impl SimplifiedP2P {
         // registered_at. Liveness authority is on-chain; this is only a derived whom-to-wake hint.
         let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
         const WAKE_GRACE_EPOCHS: u64 = 3;
+        // "Dormant" must mean the DEVICE stopped answering, never that nobody asked. When this shard
+        // has no committed bitmap for the epoch just ended, the silence is ours: the owner was down,
+        // wedged or restarting through the commit window, and every device in the shard looks dormant
+        // through no fault of its own. One recovery sweep wakes the whole shard instead of waiting for
+        // ten million people to open an app.
+        let recovering = {
+            let prev_epoch = current_window.saturating_sub(1);
+            match crate::node::try_get_storage() {
+                Some(st) => prev_epoch > 0 && st.load_light_bitmaps(prev_epoch)
+                    .map(|m| covered.iter().any(|(sh, _)| !m.contains_key(sh))).unwrap_or(false),
+                None => false,
+            }
+        };
+        if recovering && crate::node::is_warn() {
+            println!("[WARN][GENESIS-PING] shard_recovery_sweep shards={:?} epoch={} reason=no_committed_bitmap_last_epoch",
+                     covered.iter().map(|(sh, _)| *sh).collect::<Vec<_>>(), current_window);
+        }
         let elig = self.epoch_light_eligible.read();
         let attested_recent = |id: &str| (0..WAKE_GRACE_EPOCHS)
             .any(|d| elig.get(&current_window.saturating_sub(d)).map(|s| s.contains(id)).unwrap_or(false));
@@ -1946,8 +1996,14 @@ impl SimplifiedP2P {
                 let node = match registry.get(node_id) { Some(n) => n, None => continue };
                 if this_epoch(node_id) { continue; }  // already attested this epoch — nothing to wake
                 let fresh = now_secs.saturating_sub(node.registered_at) < WAKE_GRACE_EPOCHS * 14400;
-                if !fresh && !attested_recent(node_id) { continue; }  // dormant — self-attests on return
-                result.push((node.clone(), PingerRole::Primary));
+                if !recovering && !fresh && !attested_recent(node_id) { continue; }  // dormant — self-attests on return
+                let role = match crate::node::light_owner_rank(crate::node::light_shard_of(node_id), our_genesis_idx) {
+                    Some(0) => PingerRole::Primary,
+                    Some(1) => PingerRole::Backup1,
+                    Some(_) => PingerRole::Backup2,
+                    None => continue,
+                };
+                result.push((node.clone(), role));
             }
         }
 
@@ -2695,7 +2751,10 @@ impl SimplifiedP2P {
             Some(n) => n.saturating_sub(1),
             None => return false,
         };
-        crate::node::light_shard_of(node_id) == idx
+        // Every shard this node OWNS, primary or backup. A backup that recorded nothing could only
+        // ever commit an empty bitmap for the shard it is meant to cover, which is no cover at all.
+        // Memory cost is three fifths of the registry instead of one fifth, and only on genesis nodes.
+        crate::node::light_owner_rank(crate::node::light_shard_of(node_id), idx).is_some()
     }
 
     /// Record an attested light node into the per-epoch eligibility set (uncapped) + prune old epochs.

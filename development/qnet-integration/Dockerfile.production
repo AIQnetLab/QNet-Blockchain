@@ -42,6 +42,11 @@ RUN cargo build --profile release-fast --bin qnet-node \
 # Production runtime image — same Ubuntu 22.04 for glibc compatibility
 FROM ubuntu:22.04
 
+# Which commit this image carries. Declared in the RUNTIME stage on purpose: putting it in the builder
+# would change a layer on every commit and turn each CI run into a full rebuild.
+ARG QNET_BUILD_ID=unstamped
+ENV QNET_BUILD_ID=${QNET_BUILD_ID}
+
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Install minimal runtime dependencies including gosu for user switching

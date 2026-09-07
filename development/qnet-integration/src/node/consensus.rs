@@ -1092,7 +1092,7 @@ impl BlockchainNode {
                                         // WASM emit_log), folded into Checkpoint.hash + QC-certified n−f. CONSENSUS-CRITICAL:
                                         // block_logs must be byte-identical across the validator + producer drain paths, else
                                         // this root diverges and the macroblock QC never reaches n−f.
-                                        let logs_root = if qnet_state::feature_gates::is_active("logs_root_required", end_height) {
+                                        let logs_root = if qnet_state::feature_gates::is_active(qnet_state::feature_gates::id::LOGS_ROOT_REQUIRED, end_height) {
                                             Self::compute_window_logs_root(&storage_cons, start_height, end_height)
                                         } else { [0u8; 32] };
                                         // Gap ⇒ cannot compute; defer rather than seal a placeholder.

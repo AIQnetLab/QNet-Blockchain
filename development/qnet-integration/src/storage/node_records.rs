@@ -664,12 +664,51 @@ impl Storage {
     /// C: light ping delegation keys — operational CF read per-ping so the crypto stays off the RAM
     /// registry. Written at register / gossip-receive AFTER the identity guard passes; No-op on empty.
     pub fn save_light_ping_keys(&self, node_id: &str, ping_pubkey: &str, ping_delegation_cert: &str) -> IntegrationResult<()> {
+        self.save_light_ping_keys_identity(node_id, ping_pubkey, ping_delegation_cert, "")
+    }
+
+    /// Same, plus the identity key the delegation was PROVEN under. Recording it is what lets the
+    /// attestation path verify a light node at all: the chain commits only a 32-byte hash of that key
+    /// (ten million raw keys would be tens of gigabytes), so the device carries the key and the node
+    /// keeps it here once, after checking it against the commitment. With the identity recorded, the
+    /// per-attestation work is one signature under the ping key - the delegation is already proven.
+    pub fn save_light_ping_keys_identity(&self, node_id: &str, ping_pubkey: &str, ping_delegation_cert: &str, identity_pubkey: &str) -> IntegrationResult<()> {
         if ping_pubkey.is_empty() { return Ok(()); }
         let cf = self.persistent.db.cf_handle("light_ping_keys")
             .ok_or_else(|| IntegrationError::StorageError("light_ping_keys column family not found".to_string()))?;
-        let v = json!({ "ping_pubkey": ping_pubkey, "ping_delegation_cert": ping_delegation_cert });
+        // A proven identity is never replaced by a write that carries none: gossip must not undo what
+        // the device itself proved.
+        let identity = if identity_pubkey.is_empty() {
+            self.light_ping_identity(node_id).unwrap_or_default()
+        } else { identity_pubkey.to_string() };
+        let v = json!({ "ping_pubkey": ping_pubkey, "ping_delegation_cert": ping_delegation_cert, "identity_pubkey": identity });
         self.persistent.db.put_cf(&cf, node_id.as_bytes(), v.to_string().as_bytes())?;
         Ok(())
+    }
+
+    /// The identity key a light node's ping delegation was proven under, if one was recorded.
+    pub fn light_ping_identity(&self, node_id: &str) -> Option<String> {
+        let cf = self.persistent.db.cf_handle("light_ping_keys")?;
+        let raw = self.persistent.db.get_cf(&cf, node_id.as_bytes()).ok()??;
+        let v: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+        v["identity_pubkey"].as_str().filter(|s| !s.is_empty()).map(|s| s.to_string())
+    }
+
+    /// The identity key to verify a node's ping delegation under: the committed consensus key when the
+    /// chain holds one (super, genesis), otherwise a key presented by the device, admitted only when it
+    /// hashes to the commitment the registration wrote. Nothing else is ever accepted.
+    pub fn resolve_light_identity_pk(&self, node_id: &str, presented_hex: Option<&str>) -> Option<String> {
+        if let Ok(Some(bytes)) = self.load_vrf_public_key(node_id) {
+            return Some(hex::encode(bytes));
+        }
+        let tag = self.node_signer_key_commitment(node_id).ok().flatten()?;
+        let candidate = match presented_hex.filter(|s| !s.is_empty()) {
+            Some(p) => p.to_string(),
+            None => self.light_ping_identity(node_id)?,
+        };
+        let bytes = hex::decode(&candidate).ok()?;
+        use sha3::{Digest, Sha3_256};
+        if hex::encode(Sha3_256::digest(&bytes)) == tag { Some(candidate) } else { None }
     }
     pub fn get_light_ping_keys(&self, node_id: &str) -> Option<(String, String)> {
         let cf = self.persistent.db.cf_handle("light_ping_keys")?;

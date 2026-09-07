@@ -87,7 +87,7 @@ impl BlockchainNode {
         // Shared system-TX identity binds — the SAME gate gossip admission and block validation run.
         // Without it this path admitted an unsigned system TX into the local mempool and the local
         // node's own block, which every peer then rejected.
-        Self::verify_system_tx_binds(&tx)
+        Self::verify_system_tx_binds(&tx, crate::node::local_height())
             .map_err(|e| QNetError::ValidationError(format!("[REJECT][RPC] {}", e)))?;
 
         // Same committed-key mirror as the gossip door: admission must not accept a reactivation that
@@ -932,7 +932,10 @@ impl BlockchainNode {
     /// authenticator (a Solana owner_signature for imported wallets, whose wallet == eon(solana_addr)
     /// ≠ eon(dpk)) and/or a deferred Dilithium sig, and their Sybil anchor is the deterministic 2f+1
     /// burn-attestation quorum (verify_burn_attestation_quorum), not a signature-presence check.
-    pub(crate) fn verify_system_tx_binds(tx: &qnet_state::Transaction) -> Result<(), String> {
+    /// `height` is the block the verdict is for: the apply path passes the block's own height, the
+    /// two admission doors pass the current tip. Rules that changed by feature gate must be evaluated
+    /// at the height that will judge the TX, not at whatever this node happens to run.
+    pub(crate) fn verify_system_tx_binds(tx: &qnet_state::Transaction, height: u64) -> Result<(), String> {
         use qnet_state::TransactionType as TT;
         // Node-signed system TXs whose sole authenticator is ML-DSA-65 — a signature MUST be present.
         let requires_dilithium = matches!(tx.tx_type,
@@ -947,12 +950,29 @@ impl BlockchainNode {
                 std::mem::discriminant(&tx.tx_type)));
         }
         match &tx.tx_type {
-            // Bitmap: signer MUST be the genesis whose shard it declares (anti cross-shard hijack).
+            // Bitmap: `genesis_id` names the SHARD, and the signer must be one of that shard's
+            // owners - its own genesis or one of the two backups behind it. Binding the signer to the
+            // shard's own genesis alone meant that when that one machine was down, nobody was allowed
+            // to supply the shard's eligibility and every light node in it lost the epoch.
             TT::LightNodeEligibilityBitmap { genesis_id, .. } => {
-                if tx.dilithium_public_key.as_deref() != Some(genesis_id.as_bytes()) {
+                let signer = tx.dilithium_public_key.as_deref()
+                    .and_then(|b| std::str::from_utf8(b).ok()).unwrap_or_default();
+                let shard = genesis_id.strip_prefix("genesis_node_")
+                    .and_then(|n| n.parse::<usize>().ok())
+                    .filter(|n| (1..=5).contains(n)).map(|n| n - 1);
+                let signer_idx = signer.strip_prefix("genesis_node_")
+                    .and_then(|n| n.parse::<usize>().ok())
+                    .filter(|n| (1..=5).contains(n)).map(|n| n - 1);
+                let backups_active = qnet_state::feature_gates::is_active(qnet_state::feature_gates::id::LIGHT_SHARD_BACKUP_OWNERS, height);
+                let allowed = match (shard, signer_idx) {
+                    (Some(sh), Some(si)) if backups_active => crate::node::light_owner_rank(sh, si).is_some(),
+                    (Some(sh), Some(si)) => sh == si,
+                    _ => false,
+                };
+                if !allowed {
                     return Err(format!(
-                        "LightNodeEligibilityBitmap genesis_id={} != signer={:?} (cross-shard forbidden)",
-                        genesis_id, tx.dilithium_public_key));
+                        "LightNodeEligibilityBitmap shard={} signer={} (not an owner of this shard)",
+                        genesis_id, signer));
                 }
             }
             // Ping: signer MUST be the node the commitment is attributed to (apply dedups on `from`).
@@ -1169,7 +1189,7 @@ impl BlockchainNode {
         }
 
         // Inert below the coordinated activation height (Phase-1 era gate).
-        if !qnet_state::feature_gates::is_active("burn_attestation_required", height) {
+        if !qnet_state::feature_gates::is_active(qnet_state::feature_gates::id::BURN_ATTESTATION_REQUIRED, height) {
             return Ok(());
         }
         // Genesis identities are protocol-minted (anchored by GENESIS_CONSENSUS_PKS), not burn-backed —
@@ -1672,7 +1692,7 @@ impl BlockchainNode {
         // enforced on the block-apply path (block_pipeline), so gossip admission and block validation
         // agree on what a valid system TX is. Closes ping-slot squat / cross-shard bitmap / unbound
         // first-registration at the door, not just at block apply.
-        Self::verify_system_tx_binds(&tx)
+        Self::verify_system_tx_binds(&tx, crate::node::local_height())
             .map_err(|e| QNetError::ValidationError(format!("[REJECT][GOSSIP] {}", e)))?;
 
         // Reactivation is self-verified against the WIRE key, but block validation point-reads the

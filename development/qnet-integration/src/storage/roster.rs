@@ -284,7 +284,9 @@ impl Storage {
         // vrf_pk_sha3: consensus-signer-key commitment, IMMUTABLE once stamped (same invariant as
         // wallet/burn/reg_height). sha3-256 of the node's consensus pubkey carried by the chain-apply
         // (NodeRegistration TX); co-resident here so the registry_root row field is byte-identical on
-        // every node. A later RPC-cache write (vrf_pk None) preserves the stamped key. Light rows: "".
+        // every node. A later RPC-cache write (vrf_pk None) preserves the stamped key. Light rows carry
+        // it too once `light_key_commitment` is active - it is the only thing their attestations can be
+        // checked against - which is why that gate moves registry_root and needs a coordinated flip.
         let vrf_sha3_hex: String = match prior.as_ref().and_then(|p| p["vrf_pk_sha3"].as_str()) {
             Some(pv) if !pv.is_empty() => pv.to_string(),
             _ => match vrf_pk {
@@ -409,7 +411,10 @@ impl Storage {
         // and a missing key is a hard block reject, so that node could never catch up again.
         // Same guards the standalone writer applies: never restate a pinned genesis identity, never
         // rebind an existing one.
-        if let Some(pk) = vrf_pk {
+        // Light rows commit the HASH only (the json field above). Keeping ten million raw ML-DSA keys
+        // resident would be tens of gigabytes for a key no block ever verifies: the device presents it
+        // with each attestation and it is checked against the committed hash.
+        if let Some(pk) = vrf_pk.filter(|_| final_node_type != "light") {
             if !pk.is_empty() {
                 let vrf_key = format!("vrf_pk_{}", node_id);
                 let held = self.persistent.db.get_cf(&registry_cf, vrf_key.as_bytes()).ok().flatten();
@@ -1004,7 +1009,7 @@ impl Storage {
         // The proof target is Checkpoint.reward_epoch_root; it only authenticates a snapshot once the
         // committee compares it (feature_gates: reward_epoch_root_required), so the carry follows the
         // same gate. Active from genesis — this branch exists for a staged rollout, not for normal use.
-        if !qnet_state::feature_gates::is_active("reward_epoch_root_required", anchor_height) {
+        if !qnet_state::feature_gates::is_active(qnet_state::feature_gates::id::REWARD_EPOCH_ROOT_REQUIRED, anchor_height) {
             // Unreachable while the gate is active. Leave the live CF ALONE: carrying nothing is one
             // thing, wiping the rows a from-genesis node already holds is another.
             println!("[WARN][SNAPSHOT] epoch_roots_carry_skipped anchor_h={} reason=authenticator_gated_off", anchor_height);

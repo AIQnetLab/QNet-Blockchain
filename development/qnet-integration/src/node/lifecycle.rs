@@ -3533,7 +3533,6 @@ impl BlockchainNode {
         
         tokio::spawn(async move {
             const EMISSION_BLOCK_INTERVAL: u64 = 14400;
-            const COMMITMENT_WINDOW_START: u64 = 50;
             const RETRY_AFTER_BLOCKS: u64 = 10;
             const MAX_RETRIES: u8 = 3;
             
@@ -3545,14 +3544,20 @@ impl BlockchainNode {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 
                 let current_height = *height.read().await;
+                let current_epoch = current_height / EMISSION_BLOCK_INTERVAL;
+                // The window and the roster cutoff are the same number by construction
+                // (light_roster_cutoff), so the roster an owner builds from is exactly the roster the
+                // reward path reads back - no node can register into the gap and fall past the
+                // bitmap's index_span.
+                // A shard's epoch is decided INSIDE this window and nowhere else. The epoch's reward
+                // root is built from the bitmaps on the chain at the boundary block, so a bitmap
+                // arriving in the next epoch would change no payout - which is why the answer to a
+                // missed commit is three staggered owners here, not a late re-send afterwards.
                 let blocks_until_epoch_end = EMISSION_BLOCK_INTERVAL - (current_height % EMISSION_BLOCK_INTERVAL);
-                let should_create_commitments = blocks_until_epoch_end <= COMMITMENT_WINDOW_START && blocks_until_epoch_end > 0;
-                
-                if !should_create_commitments {
+                let owner_deadline = crate::node::light_owner_deadlines(current_epoch);
+                if blocks_until_epoch_end > owner_deadline[0] || blocks_until_epoch_end == 0 {
                     continue;
                 }
-                
-                let current_epoch = current_height / EMISSION_BLOCK_INTERVAL;
                 
                 if is_info() {
                     println!("[INFO][BITMAP-LOOP] Commitment window height={} epoch={} blocks_until_end={}", 
@@ -3570,8 +3575,36 @@ impl BlockchainNode {
                             println!("[DBG][LIGHT-BITMAP] Skipping - not a Genesis node");
                         }
                     } else {
+                        // Which shard this node covers on this tick: its own first, then a shard it
+                        // backs up whose owner has not committed by its deadline. Chosen before the
+                        // tracker is consulted, because the tracker is per (epoch, shard) - marking the
+                        // whole epoch done after the first shard is what would leave a backup silent.
+                        let my_idx = std::env::var("QNET_BOOTSTRAP_ID")
+                            .ok().and_then(|id| id.parse::<usize>().ok())
+                            .map(|id| id.saturating_sub(1)).unwrap_or(0);
+                        // Below the gate a backup's bitmap is rejected by every validator, so it must
+                        // not be built: only the shard's own genesis emits.
+                        let backups_active = qnet_state::feature_gates::is_active(
+                            qnet_state::feature_gates::id::LIGHT_SHARD_BACKUP_OWNERS,
+                            current_epoch * EMISSION_BLOCK_INTERVAL);
+                        let committed_shards = crate::node::try_get_storage()
+                            .and_then(|s| s.load_light_bitmaps(current_epoch).ok())
+                            .unwrap_or_default();
+                        let target_shard = match (0..5usize)
+                            .filter(|sh| !committed_shards.contains_key(sh))
+                            .filter_map(|sh| crate::node::light_owner_rank(sh, my_idx).map(|r| (sh, r)))
+                            .filter(|(_, rank)| backups_active || *rank == 0)
+                            .filter(|(_, rank)| blocks_until_epoch_end <= owner_deadline[*rank])
+                            .min_by_key(|(_, rank)| *rank)
+                            .map(|(sh, _)| sh)
+                        {
+                            Some(sh) => sh,
+                            None => continue,
+                        };
+                        // One tracker slot per (epoch, shard); shards are 0..5 so the epoch stays readable.
+                        let track_key = current_epoch * 10 + target_shard as u64;
                         // v7.0: Full confirmation + retry tracking (same as HeartbeatCommitment)
-                        let should_send = if let Some(status) = bitmap_tracker.get(&current_epoch) {
+                        let should_send = if let Some(status) = bitmap_tracker.get(&track_key) {
                             if status.is_confirmed() {
                                 // Skip-markers carry a sentinel tx_hash (no real TX emitted) — don't log as a confirmed TX.
                                 if status.tx_hash.starts_with("no_") {
@@ -3624,11 +3657,8 @@ impl BlockchainNode {
 
                                 // Get total assigned Light nodes for this Genesis
                                 // Genesis nodes divide Light nodes: each gets 1/5 of registry
-                                let genesis_idx = std::env::var("QNET_BOOTSTRAP_ID")
-                                    .ok()
-                                    .and_then(|id| id.parse::<u32>().ok())
-                                    .map(|id| id.saturating_sub(1))
-                                    .unwrap_or(0);
+                                let genesis_idx = target_shard as u32;
+                                let shard_id = format!("genesis_node_{:03}", genesis_idx + 1);
                                 
                                 // Deterministic pre-epoch roster streamed ONCE (not materialized): one pass
                                 // yields the full roster size and, for THIS genesis's hash-shard, the local
@@ -3660,7 +3690,7 @@ impl BlockchainNode {
                                 if total_light_nodes == 0 {
                                     let mut status = HeartbeatCommitmentStatus::new("no_light_nodes".to_string(), current_height);
                                     status.mark_confirmed(current_height);
-                                    bitmap_tracker.insert(current_epoch, status);
+                                    bitmap_tracker.insert(track_key, status);
                                     if is_debug() {
                                         println!("[DBG][LIGHT-BITMAP] No Light nodes registered - skipping epoch={}", current_epoch);
                                     }
@@ -3669,7 +3699,7 @@ impl BlockchainNode {
                                 if shard_members == 0 {
                                     let mut status = HeartbeatCommitmentStatus::new("no_assigned_nodes".to_string(), current_height);
                                     status.mark_confirmed(current_height);
-                                    bitmap_tracker.insert(current_epoch, status);
+                                    bitmap_tracker.insert(track_key, status);
                                     if is_info() {
                                         println!("[INFO][LIGHT-BITMAP] Genesis {} shard empty (total={}) - skip",
                                                  genesis_idx + 1, total_light_nodes);
@@ -3683,6 +3713,7 @@ impl BlockchainNode {
                                 
                                 // Create bitmap TX
                                 match Self::create_light_node_bitmap_tx(
+                                    &shard_id,
                                     &node_id,
                                     current_epoch,
                                     &eligible_indices,
@@ -3748,7 +3779,7 @@ impl BlockchainNode {
 
                                                 if mempool.add_binary_transaction(tx_bytes, tx.hash.clone(), gas_price) {
                                                     let tx_hash_clone = tx.hash.clone();
-                                                    if let Some(mut existing) = bitmap_tracker.get_mut(&current_epoch) {
+                                                    if let Some(mut existing) = bitmap_tracker.get_mut(&track_key) {
                                                         existing.increment_retry();
                                                         existing.value_mut().sent_at_height = current_height;
                                                         existing.value_mut().tx_hash = tx_hash_clone.clone();
@@ -3757,7 +3788,7 @@ impl BlockchainNode {
                                                                  existing.retry_count, current_epoch, &tx_hash_clone[..16], existing.all_tx_hashes.len());
                                                     } else {
                                                         bitmap_tracker.insert(
-                                                            current_epoch,
+                                                            track_key,
                                                             HeartbeatCommitmentStatus::new(tx_hash_clone.clone(), current_height)
                                                         );
                                                         if is_info() {
@@ -3861,6 +3892,7 @@ impl BlockchainNode {
                     
                     // v7.0: CONFIRMATION CHECK — scan recent blocks for our BitmapTX
                     {
+                        // Keys are (epoch*10 + shard): the sweep only needs them to look a status up.
                         let pending_epochs: Vec<u64> = bitmap_tracker.iter()
                             .filter(|entry| !entry.value().is_confirmed())
                             .map(|entry| *entry.key())

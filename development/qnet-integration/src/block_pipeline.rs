@@ -3280,7 +3280,7 @@ impl BlockPipeline {
             // (TX bytes + committed-state VRF registry), so the verdict is byte-identical per node.
             if mb.height > 0 {
                 if let Some(reason) = decoded.microblock.transactions.iter()
-                    .find_map(|tx| crate::node::BlockchainNode::verify_system_tx_binds(tx).err())
+                    .find_map(|tx| crate::node::BlockchainNode::verify_system_tx_binds(tx, mb.height).err())
                 {
                     if is_warn() {
                         println!(
@@ -3524,7 +3524,7 @@ impl BlockPipeline {
                 // < h are applied on every node before h is verified, so the lookup is deterministic) OR a
                 // NodeRegistration in THIS block. Same activation-height gate as the registration rule;
                 // genesis nodes never emit NodeActivation (genesis = NodeRegistration only).
-                if qnet_state::feature_gates::is_active("burn_attestation_required", mb.height) {
+                if qnet_state::feature_gates::is_active(qnet_state::feature_gates::id::BURN_ATTESTATION_REQUIRED, mb.height) {
                     let this_block_burned: std::collections::HashSet<String> = decoded.microblock.transactions.iter()
                         .filter_map(|t| match &t.tx_type {
                             qnet_state::TransactionType::NodeRegistration { wallet_address, burn_tx, .. }

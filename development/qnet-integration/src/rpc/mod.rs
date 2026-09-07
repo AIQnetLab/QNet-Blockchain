@@ -2763,7 +2763,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
             let h = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT
                 .load(std::sync::atomic::Ordering::Relaxed);
             warp::reply::with_status(
-                format!("ok h={}", h),
+                format!("ok h={} build={}", h, crate::node::build_id()),
                 warp::http::StatusCode::OK,
             )
         });
@@ -3541,6 +3541,7 @@ async fn node_get_info(blockchain: Arc<BlockchainNode>) -> Result<Value, RpcErro
         "peers": peer_count,
         "mempool_size": mempool_size,
         "version": "0.1.0",
+        "build": crate::node::build_id(),
         "node_type": node_type,
         "region": region,
         "status": "active"
