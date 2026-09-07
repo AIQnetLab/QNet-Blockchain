@@ -755,6 +755,56 @@ pub fn tail_is_contradicted(our_hash: [u8; 32], our_abs_round: u64, child_parent
     child_parent != our_hash && child_abs_round >= our_abs_round
 }
 
+/// Distinct AUTHENTICATED producers that have presented a child naming a parent we do not hold at a
+/// height. Bounded exactly like CONTRADICTED_TAILS; the producer id is signature-checked before it is
+/// counted (child_is_authentic), so a relay cannot manufacture witnesses.
+static CONTRADICTION_WITNESSES: once_cell::sync::Lazy<dashmap::DashMap<u64, std::collections::HashSet<String>>> =
+    once_cell::sync::Lazy::new(dashmap::DashMap::new);
+
+/// Records `producer` as having built past `height` on a parent we do not hold; returns how many
+/// distinct producers have now done so.
+pub fn note_contradiction_witness(height: u64, producer: &str) -> usize {
+    let n = {
+        let mut e = CONTRADICTION_WITNESSES.entry(height).or_default();
+        e.insert(producer.to_string());
+        e.len()
+    };
+    if CONTRADICTION_WITNESSES.len() > CONTRADICTED_TAILS_MAX {
+        let cut = height.saturating_sub(CONTRADICTED_TAILS_MAX as u64);
+        CONTRADICTION_WITNESSES.retain(|h, _| *h > cut);
+    }
+    n
+}
+
+/// Does an authenticated child overrule the tail we hold?
+///
+/// The round leg alone INVERTED fork choice. A branch's absolute round rises with every failover it
+/// suffers, so the branch that is alone — the one nobody builds on, timing out again and again —
+/// carries the HIGHEST round. Live at 627304: the 2-of-6 minority stood at round 3 and the 4-of-6
+/// majority at round 2, so the minority dismissed every majority block as "a straggler on an older
+/// round" and never rolled back, while the majority, holding the lower round, kept yielding TO it.
+/// A transient fork became permanent, and the branch that had failed most won.
+///
+/// So authority comes from a quorum instead: f+1 DISTINCT authenticated producers building past our
+/// tail on another parent contains at least one honest builder, and no minority can raise that number
+/// by failing. The round leg is kept as the fast path — it settles the common case in one block and
+/// still protects us from a lone stale straggler, which is what it was for.
+pub fn tail_is_overruled(
+    our_hash: [u8; 32], our_abs_round: u64,
+    child_parent: [u8; 32], child_abs_round: u64,
+    witnesses: usize, f_plus_one: usize,
+) -> bool {
+    if child_parent == our_hash { return false; }
+    child_abs_round >= our_abs_round || (f_plus_one > 0 && witnesses >= f_plus_one)
+}
+
+/// f+1 over the committee that governs `height`: the smallest set that must contain an honest member.
+pub fn committee_f_plus_one(storage: &crate::storage::Storage, height: u64) -> Option<usize> {
+    let n = crate::node::BlockchainNode::committee_for_height(storage, height)?.len();
+    if n == 0 { return None; }
+    Some((n.saturating_sub(1)) / 3 + 1)
+}
+
 pub fn note_contradicted_tail(height: u64, network_parent: [u8; 32]) {
     CONTRADICTED_TAILS.insert(height, network_parent);
     if CONTRADICTED_TAILS.len() > CONTRADICTED_TAILS_MAX {
@@ -771,6 +821,7 @@ pub fn contradicted_tail(height: u64) -> Option<[u8; 32]> {
 /// otherwise send the replacement after it.
 pub fn clear_contradicted_tail(height: u64) {
     CONTRADICTED_TAILS.remove(&height);
+    CONTRADICTION_WITNESSES.remove(&height);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -853,6 +904,52 @@ pub fn cleanup_forked_peer_cooldown() {
 #[cfg(test)]
 mod contradicted_tail_tests {
     use super::*;
+
+    /// Forensic h=627304 — the inversion this rule exists to close.
+    ///
+    /// A branch's absolute round rises with every failover it suffers, so the branch NOBODY builds on
+    /// carries the highest one. Live: the 2-of-6 minority stood at round 3, the 4-of-6 majority at
+    /// round 2. Under the round leg alone the minority dismissed every majority block as a straggler
+    /// and never rolled back, while the majority, holding the lower round, kept yielding to it — the
+    /// branch that failed most won, and the fork became permanent.
+    #[test]
+    fn a_quorum_on_another_parent_overrules_a_higher_round_the_lone_branch_gave_itself() {
+        let ours = [1u8; 32];
+        let theirs = [2u8; 32];
+        const F1: usize = 2; // n=6 ⇒ f=1 ⇒ f+1=2
+
+        // The measured shape: our round 3, the majority's 2. One majority producer is not yet proof —
+        // that is exactly the lone straggler the round leg protects us from.
+        assert!(!tail_is_overruled(ours, 3, theirs, 2, 1, F1),
+                "one producer on a lower round is a straggler, not a quorum");
+        // A second DISTINCT producer building past us on that parent contains an honest builder.
+        assert!(tail_is_overruled(ours, 3, theirs, 2, 2, F1),
+                "f+1 distinct builders overrule a round we raised by failing");
+        assert!(tail_is_overruled(ours, 99, theirs, 0, 2, F1),
+                "no round we can reach outranks a quorum — that is the whole point");
+
+        // The fast path is untouched: an equal-or-higher round still settles it in one block.
+        assert!(tail_is_overruled(ours, 3, theirs, 3, 0, F1), "same round, another parent");
+        assert!(tail_is_overruled(ours, 3, theirs, 9, 0, F1), "a later round, another parent");
+        // And the leader building on OUR tail is never a contradiction, whatever the counts say.
+        assert!(!tail_is_overruled(ours, 3, ours, 9, 9, F1), "built on ours");
+        // An unknown committee (f+1 = 0) must not let an empty witness set overrule anything.
+        assert!(!tail_is_overruled(ours, 3, theirs, 2, 0, 0), "no committee ⇒ no quorum leg");
+    }
+
+    /// Witnesses are counted per PRODUCER, so one node repeating itself never reaches f+1 — the
+    /// quorum leg has to mean distinct builders or it is just the round leg with extra steps.
+    #[test]
+    fn one_producer_repeating_itself_is_still_one_witness() {
+        let h = 55_000_001u64;
+        assert_eq!(note_contradiction_witness(h, "genesis_node_002"), 1);
+        assert_eq!(note_contradiction_witness(h, "genesis_node_002"), 1, "same builder, still one");
+        assert_eq!(note_contradiction_witness(h, "genesis_node_004"), 2, "a distinct builder counts");
+        clear_contradicted_tail(h);
+        assert_eq!(note_contradiction_witness(h, "genesis_node_002"), 1,
+                   "replacing the tail forgets its witnesses");
+        clear_contradicted_tail(h);
+    }
 
     // The leader of the next slot building elsewhere overrules our tail; the same leader building on
     // ours, or a straggler on an older round, does not. The record is bounded and forgettable.
@@ -2581,10 +2678,22 @@ impl BlockPipeline {
                         let our_abs = storage.load_microblock_auto_format(disputed).ok().flatten()
                             .map(|b| b.timeout_round.saturating_add(b.carried_baseline)).unwrap_or(0);
                         let certified_keeps_ours = certified_micro_hash(&storage, disputed) == Some(ours);
-                        if disputed > finalized && !certified_keeps_ours
-                            && tail_is_contradicted(ours, our_abs, mb.previous_hash, child_abs)
-                            && child_is_authentic(&storage, &decoded).await
-                        {
+                        // Authenticate FIRST: a producer only counts as a witness once its own
+                        // signature is checked, or a relay could manufacture a quorum.
+                        let authentic = disputed > finalized && !certified_keeps_ours
+                            && mb.previous_hash != ours
+                            && child_is_authentic(&storage, &decoded).await;
+                        let overruled = authentic && {
+                            let witnesses = note_contradiction_witness(disputed, &mb.producer);
+                            let f1 = committee_f_plus_one(&storage, mb.height).unwrap_or(0);
+                            let ruled = tail_is_overruled(ours, our_abs, mb.previous_hash, child_abs, witnesses, f1);
+                            if ruled && child_abs < our_abs && is_warn() {
+                                println!("[WARN][FORK] tail_overruled_by_quorum h={} witnesses={} f1={} our_round={} child_round={}",
+                                         disputed, witnesses, f1, our_abs, child_abs);
+                            }
+                            ruled
+                        };
+                        if overruled {
                             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
                                 .map(|d| d.as_secs()).unwrap_or(0);
                             let due = FORK_RECOVERY_TRIGGER_TIMES.get(&disputed)

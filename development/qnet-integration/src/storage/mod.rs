@@ -3166,7 +3166,7 @@ mod tests_certified_pair_wal {
     /// one of those would land the chain on state no quorum ever agreed. Empty body = not a
     /// recovery point, whatever its index says.
     #[tokio::test]
-    async fn the_recovery_point_is_the_last_SEALED_window() {
+    async fn the_recovery_point_is_the_last_sealed_window() {
         use crate::node::BlockchainNode;
         let (s, _d) = open_test_storage();
         let mk = |idx: u64, micro: Vec<[u8; 32]>| qnet_state::MacroBlock::new(
