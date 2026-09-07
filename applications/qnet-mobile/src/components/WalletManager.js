@@ -4648,8 +4648,12 @@ export class WalletManager {
       );
 
       if (!response.ok) {
+        // A node that could not answer has told us NOTHING about the chain. The endpoint reports a
+        // genuine "no activation" as 200 with verified:false, so any other status - 429 from the
+        // rate limiter, 5xx from a busy node, a proxy error - is an unknown, not an absence. It is
+        // flagged as such because callers delete the local activation on an unflagged negative.
         console.warn('[verifyOnChain] Server returned', response.status);
-        return { verified: false, error: `HTTP ${response.status}` };
+        return { verified: false, error: `HTTP ${response.status}`, networkError: true };
       }
 
       const result = await response.json();

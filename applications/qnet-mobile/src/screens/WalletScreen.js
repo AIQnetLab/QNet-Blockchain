@@ -379,6 +379,7 @@ const WalletScreen = () => {
   const [showActivationInput, setShowActivationInput] = useState(false); // Show activation code input modal
   const [activationInputCode, setActivationInputCode] = useState(''); // Input activation code
   const [lightNodeStatus, setLightNodeStatus] = useState(null); // Light node network status
+  const lastHistoryAddrRef = useRef(null); // wallet the loaded history belongs to (a switch clears it, an unlock does not)
   const [serverNodeStatus, setServerNodeStatus] = useState(null); // Super node network status
   const [allUserNodes, setAllUserNodes] = useState([]); // All nodes owned by this wallet (unified view)
   const [loadingAllNodes, setLoadingAllNodes] = useState(false); // Loading state for all nodes
@@ -615,15 +616,15 @@ const WalletScreen = () => {
                     console.log('[NODE TAB] Solana check failed — keeping state');
                     return;
                   }
-                  console.log('[NODE TAB] No activation on-chain AND no burn — clearing stale state');
-                  setActivatedNodeType(null);
-                  setActivationCode(null);
-                  setNodePseudonym('');
+                  // A negative answer is ONE node's view of the chain, and the app keeps no copy of
+                  // the chain to check it against. It is enough to stop claiming the node is active;
+                  // it is not enough to destroy the activation the user paid for. The record stays,
+                  // marked unconfirmed, and re-confirms itself as soon as any node answers yes —
+                  // deleting it here is what made an activated node vanish after a lock/unlock.
+                  console.log('[NODE TAB] No activation on-chain AND no burn — marking unconfirmed, record kept');
                   setLightNodeStatus(null);
                   setServerNodeStatus(null);
-                  await AsyncStorage.removeItem('qnet_last_activated_node');
-                  await AsyncStorage.removeItem('qnet_cached_server_status');
-                  await AsyncStorage.removeItem('qnet_activation_codes');
+                  await AsyncStorage.setItem('qnet_activation_unconfirmed_at', String(Date.now()));
                 }
               }
             }).catch(() => { /* Network error — keep current state */ });
@@ -709,12 +710,24 @@ const WalletScreen = () => {
     
     try {
       const status = await checkNodeStatus();
+      // Any confirmed answer clears the unconfirmed mark: the doubt was about reachability, and it
+      // is now resolved.
+      if (status?.registered === true) { AsyncStorage.removeItem('qnet_activation_unconfirmed_at').catch(() => {}); }
       // needsReactivation is authoritative ONLY from the server, and ONLY for a genuinely
       // registered node (checkNodeStatus returns needs_reactivation on its registered:true branch).
       // A never-activated node (got code, not yet registered) and a reinstall both return
       // {registered:false} with no local ping identity; that is NOT a drop and must surface as
       // NOT ACTIVATED downstream, not as needs-reactivation. So we no longer synthesize the flag here.
-      setLightNodeStatus(status);
+      // An answer that carries an error is "we could not ask", not "you have no node": the fetcher
+      // sets it precisely so the UI can tell the two apart. Keep the last CONFIRMED status on screen
+      // instead of replacing it with the failure - overwriting it is what made an activated node
+      // disappear from the tab whenever a node was busy or rate-limiting.
+      setLightNodeStatus(prev => {
+        if (status && status.error && prev && prev.registered === true) {
+          return { ...prev, stale: true, error: status.error };
+        }
+        return status;
+      });
       // Update cached block height if checkNodeStatus returned a fresh value
       if (status?.currentBlockHeight > 0) {
         setCurrentBlockHeight(status.currentBlockHeight);
@@ -2151,9 +2164,15 @@ const WalletScreen = () => {
   // v3.31: Initialize node discovery + WebSocket + TX history when wallet ready
   useEffect(() => {
     if (wallet?.qnetAddress) {
-      // Wallet switch: drop the previous wallet's history (incl. its pending TXs) immediately.
-      setTxHistory([]);
-      pendingTxRef.current = null;
+      // Drop the previous wallet's history ONLY on a real switch. The effect also runs when the same
+      // wallet is loaded again after an unlock, and clearing there emptied the list every time the
+      // screen came back - the user saw their history disappear on each unlock while the chain still
+      // held every transaction.
+      if (lastHistoryAddrRef.current && lastHistoryAddrRef.current !== wallet.qnetAddress) {
+        setTxHistory([]);
+        pendingTxRef.current = null;
+      }
+      lastHistoryAddrRef.current = wallet.qnetAddress;
 
       // Load cached nodes and trigger discovery for load balancing
       walletManager.loadNodesFromCache().then(() => {
@@ -2663,16 +2682,11 @@ const WalletScreen = () => {
                         console.log('[VERIFY] Solana check failed — keeping cached state');
                         return;
                       }
-                      console.log('[VERIFY] No activation on-chain AND no Solana burn — clearing stale cache');
-                      setActivatedNodeType(null);
-                      setActivationCode(null);
-                      setNodePseudonym('');
+                      // Same rule as the node tab: one node's "no" is not proof, and the activation
+                      // record is the user's, not the network's. Mark it unconfirmed and keep it.
+                      console.log('[VERIFY] No activation on-chain AND no Solana burn — marking unconfirmed, record kept');
                       setServerNodeStatus(null);
-                      await AsyncStorage.removeItem('qnet_last_activated_node');
-                      await AsyncStorage.removeItem('qnet_cached_server_status');
-                      await AsyncStorage.removeItem('qnet_activation_codes');
-                      await AsyncStorage.removeItem('qnet_activation_meta_light');
-                      await AsyncStorage.removeItem('qnet_activation_meta_super');
+                      await AsyncStorage.setItem('qnet_activation_unconfirmed_at', String(Date.now()));
                     }
                   }
                 }).catch(() => {
@@ -3225,8 +3239,11 @@ const WalletScreen = () => {
       // Native rows: keep every native type; drop only a ContractCall a token event already represents
       // (avoids a duplicate "0 QNC" row). A non-transfer contract call (approve / WASM) stays visible.
       let nativeTxs = [];
+      // Whether the node actually answered. An unanswered request is not an empty history.
+      let nativeOk = false;
       const response = await nativePromise;
       if (response.ok) {
+        nativeOk = true;
         const data = await response.json();
         const transactions = data.transactions || data || [];
         nativeTxs = transactions
@@ -3276,7 +3293,13 @@ const WalletScreen = () => {
           (t.from || '').toLowerCase() === myAddress &&
           !confirmedHashes.has(t.hash)
         );
-        return [...stillPending, ...formattedTxs];
+        // When the node did not answer, the rows already on screen are the best record there is:
+        // keep them instead of replacing the list with the token/lifecycle rows alone. A rate-limited
+        // or erroring node blanked the history every time this ran.
+        const keptConfirmed = nativeOk ? [] : prev.filter(t =>
+          t.status === 'confirmed' && !t.nodeEvent && !confirmedHashes.has(t.hash));
+        return [...stillPending, ...formattedTxs, ...keptConfirmed]
+          .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
       });
 
       // P4: verify each token transfer's inclusion against a committee-QC-anchored logs_root. 'verified'
