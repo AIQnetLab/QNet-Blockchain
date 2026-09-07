@@ -107,6 +107,11 @@ fn record_apply_mismatch() -> bool {
 
 /// Heights currently parked in the deferred buffer (refcounted: siblings can share a
 /// height). The sync missing-scan consults this so RAM-held blocks are not re-downloaded.
+///
+/// That answer is only honest under one invariant: a parked block's PARENT SLOT IS EMPTY. Once
+/// the slot fills, the block is either drained by the hash-keyed release (its parent) or dead
+/// (a sibling of its parent won) - and a dead block left here masks its height from repair, so
+/// the canonical block for that height is never fetched again. `sweep_parked` enforces it.
 static DEFERRED_HEIGHTS: once_cell::sync::Lazy<dashmap::DashMap<u64, u32>> =
     once_cell::sync::Lazy::new(dashmap::DashMap::new);
 
@@ -121,6 +126,92 @@ fn deferred_track(h: u64) {
 fn deferred_untrack(h: u64) {
     if let Some(mut e) = DEFERRED_HEIGHTS.get_mut(&h) {
         if *e > 1 { *e -= 1; } else { drop(e); DEFERRED_HEIGHTS.remove(&h); }
+    }
+}
+
+/// A parked block waits at most this long for its parent; past it the block is re-requested.
+const DEFERRED_MAX_AGE_SECS: u64 = 120;
+/// How often the buffer is swept, whether or not blocks are flowing. The sweep used to run only
+/// on an inbound block: when the network halted, nothing arrived, nothing was swept, and a dead
+/// entry kept its height masked from repair for as long as the halt lasted.
+const DEFERRED_SWEEP_SECS: u64 = 1;
+
+/// Removed by one sweep of the deferred buffer.
+#[derive(Default, Debug, PartialEq)]
+struct SweepOutcome { expired: usize, dead: usize, stale: usize }
+
+/// Drop what can no longer apply: entries older than the TTL, entries far below the tip, and
+/// entries whose parent slot is already occupied (`parent_slot(h-1)` is Some). The last rule is
+/// the invariant behind `deferred_holds`: a live child is released by the hash-keyed drain the
+/// moment its parent verifies, so a child still parked once the slot is filled is a child of the
+/// losing sibling. Dropping it untracks the height, and the next repair scan fetches the
+/// canonical block instead of waiting on the one that will never verify.
+fn sweep_parked(
+    deferred: &mut HashMap<[u8; 32], Vec<(u64, DecodedBlock)>>,
+    by_producer: &mut HashMap<String, usize>,
+    count: &mut usize,
+    bytes: &mut usize,
+    now_secs: u64,
+    chain_h: u64,
+    parent_slot: impl Fn(u64) -> Option<[u8; 32]>,
+) -> SweepOutcome {
+    let cutoff = chain_h.saturating_sub(500);
+    let mut out = SweepOutcome::default();
+    for waiters in deferred.values_mut() {
+        waiters.retain(|(parked_at, d)| {
+            let h = d.microblock.height;
+            // A slot can only be occupied at or below the applied tip, so entries parked far
+            // ahead (the whole catch-up buffer) cost no storage read; two heights of slack cover
+            // a tip read a moment before the apply stage moved it.
+            let reason = if now_secs.saturating_sub(*parked_at) > DEFERRED_MAX_AGE_SECS { Some(0) }
+                else if h <= cutoff { Some(1) }
+                else if h <= chain_h.saturating_add(2) && parent_slot(h.saturating_sub(1)).is_some() { Some(2) }
+                else { None };
+            match reason {
+                None => true,
+                Some(r) => {
+                    match r { 0 => out.expired += 1, 1 => out.stale += 1, _ => out.dead += 1 }
+                    deferred_untrack(h);
+                    false
+                }
+            }
+        });
+    }
+    if out != SweepOutcome::default() {
+        deferred.retain(|_, w| !w.is_empty());
+        *count = deferred.values().map(|v| v.len()).sum();
+        *bytes = deferred.values().flat_map(|v| v.iter()).map(|(_, d)| d.raw_data.len()).sum();
+        by_producer.clear();
+        for (_, d) in deferred.values().flat_map(|v| v.iter()) {
+            *by_producer.entry(d.microblock.producer.clone()).or_insert(0) += 1;
+        }
+    }
+    out
+}
+
+/// One sweep against live storage; logs and counts what it removed.
+fn sweep_deferred_now(
+    storage: &Arc<Storage>,
+    metrics: &PipelineMetrics,
+    deferred: &mut HashMap<[u8; 32], Vec<(u64, DecodedBlock)>>,
+    by_producer: &mut HashMap<String, usize>,
+    count: &mut usize,
+    bytes: &mut usize,
+) {
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let chain_h = storage.get_chain_height().unwrap_or(0);
+    let out = sweep_parked(deferred, by_producer, count, bytes, now_secs, chain_h,
+                           |h| storage.canonical_hash_at(h));
+    let removed = out.expired + out.dead + out.stale;
+    if removed > 0 {
+        // Evictions leave the in-flight estimate, or they count as "ingested, never finished"
+        // and throttle sync dispatch forever.
+        metrics.deferred_evicted.fetch_add(removed as u64, Ordering::Relaxed);
+        if is_info() {
+            println!("[INFO][PIPELINE] deferred_sweep expired={} dead={} stale={} remaining={}",
+                     out.expired, out.dead, out.stale, *count);
+        }
     }
 }
 
@@ -2161,7 +2252,34 @@ impl BlockPipeline {
         // grow the buffer. Refreshed alongside horizon_cache_h.
         let mut horizon_cache_syncing = false;
 
-        'outer: while let Some(decoded) = rx.recv().await {
+        let mut last_sweep = std::time::Instant::now();
+        let mut last_rollback_target = crate::storage::get_rollback_status().1;
+        'outer: loop {
+            // A rollback deletes blocks this stage already vouched for as "verified, commit
+            // pending"; a re-served child of the deleted branch would otherwise pass the parent
+            // gate on that stale word and re-arm fork recovery right after the node converged.
+            {
+                let (rolling, target) = crate::storage::get_rollback_status();
+                if rolling || target != last_rollback_target {
+                    verified_recent.retain(|_, h| *h <= target);
+                    last_rollback_target = target;
+                }
+            }
+            // The buffer is swept on a clock, not only per block: during a halt nothing arrives.
+            let decoded = match tokio::time::timeout(
+                std::time::Duration::from_secs(DEFERRED_SWEEP_SECS), rx.recv()).await
+            {
+                Ok(Some(d)) => d,
+                Ok(None) => break 'outer,
+                Err(_) => {
+                    if deferred_count > 0 {
+                        sweep_deferred_now(&storage, &metrics, &mut deferred, &mut deferred_by_producer,
+                                           &mut deferred_count, &mut deferred_bytes);
+                        last_sweep = std::time::Instant::now();
+                    }
+                    continue 'outer;
+                }
+            };
             // v15.4 DIAG: a fresh block has just arrived — between recv()
             // calls the stage was idle on the channel, so reset the op
             // marker to a clean idle baseline. The earlier mark_verify_op
@@ -3515,55 +3633,12 @@ impl BlockPipeline {
                 verified_recent.retain(|_, h| h.saturating_add(500) > tip);
             }
 
-            // Unconditional: the TTL is an invariant, not a large-buffer-only rule. A single
-            // orphan parked below the old >100 gate lived forever — and with the deferred set
-            // masking its height from sync, that single entry wedged the whole node.
-            if deferred_count > 0 {
-                let chain_h = storage.get_chain_height().unwrap_or(0);
-                {
-                    const DEFERRED_MAX_AGE_SECS: u64 = 120;
-                    let now_secs = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs()).unwrap_or(0);
-                    let cutoff = if chain_h > 500 { chain_h - 500 } else { 0 };
-                    let before = deferred_count;
-                    for waiters in deferred.values_mut() {
-                        waiters.retain(|(parked_at, d)| {
-                            let too_old = now_secs.saturating_sub(*parked_at) > DEFERRED_MAX_AGE_SECS;
-                            let keep = d.microblock.height > cutoff && !too_old;
-                            if !keep { deferred_untrack(d.height); }
-                            keep
-                        });
-                    }
-                    deferred.retain(|_, waiters| !waiters.is_empty());
-                    deferred_count = deferred.values().map(|v| v.len()).sum();
-                    deferred_bytes = deferred.values().flat_map(|v| v.iter())
-                        .map(|(_, d)| d.raw_data.len()).sum();
-                    let evicted = before - deferred_count;
-                    // Rebuild the index ONLY when something was actually evicted. The enclosing
-                    // condition is a buffer-size threshold, not an eviction event, so it holds on
-                    // every loop iteration while the buffer stays large — and with parent-hash keying
-                    // siblings coexist, so that is the common case during catch-up, not a rare one.
-                    // Rebuilding regardless meant a producer-String clone per buffered block (up to
-                    // DEFERRED_MAX) on every pass.
-                    if evicted > 0 {
-                        deferred_by_producer.clear();
-                        for (_, d) in deferred.values().flat_map(|v| v.iter()) {
-                            *deferred_by_producer.entry(d.microblock.producer.clone()).or_insert(0) += 1;
-                        }
-                        // v15.3: register eviction in dedicated counter so the
-                        // backpressure formula can subtract these from the
-                        // in-flight estimate. Without this, evicted blocks
-                        // remained "ingested but never finished" forever and
-                        // contributed to the false-overload signal that
-                        // throttled sync request dispatch.
-                        metrics.deferred_evicted.fetch_add(evicted as u64, Ordering::Relaxed);
-                        if is_info() {
-                            println!("[INFO][PIPELINE] deferred_evict count={} cutoff={} remaining={}",
-                                     evicted, cutoff, deferred.len());
-                        }
-                    }
-                }
+            // Time-gated: the sweep is O(parked) with a storage read per entry, and during catch-up
+            // this loop runs thousands of times a second.
+            if deferred_count > 0 && last_sweep.elapsed() >= std::time::Duration::from_secs(DEFERRED_SWEEP_SECS) {
+                sweep_deferred_now(&storage, &metrics, &mut deferred, &mut deferred_by_producer,
+                                   &mut deferred_count, &mut deferred_bytes);
+                last_sweep = std::time::Instant::now();
             }
 
             // Bound committee-deferred the same way (its re-drive is committee-arrival, not tip contiguity).
@@ -5321,6 +5396,90 @@ mod tests_deferred_by_parent {
 }
 
 #[cfg(test)]
+mod deferred_test_support {
+    use super::DecodedBlock;
+
+    /// A 32-byte key derived from a number: hashes and parent links the deferred-buffer tests can
+    /// tell apart by eye.
+    pub(super) fn key(n: u64) -> [u8; 32] {
+        let mut k = [0u8; 32];
+        k[..8].copy_from_slice(&n.to_le_bytes());
+        k
+    }
+
+    /// A decoded block as the verify stage holds it, with the parent it claims.
+    pub(super) fn decoded(h: u64, producer: &str, parent: [u8; 32], raw_len: usize) -> DecodedBlock {
+        let mb = qnet_state::MicroBlock {
+            height: h, timestamp: 0, transactions: vec![], producer: producer.to_string(),
+            signature: vec![0u8; 64], merkle_root: key(h), previous_hash: parent,
+            vrf_output: None, vrf_proof: None, fees_collected: 0,
+            state_root: [0u8; 32], timeout_round: 0, carried_baseline: 0, timeout_proof: None,
+        };
+        DecodedBlock {
+            height: h, raw_data: vec![0u8; raw_len], decompressed: Vec::new(),
+            microblock: mb, from_peer: "sim".into(), sig_pre_verified: true,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests_deferred_sweep {
+    use super::*;
+    use super::deferred_test_support::{key, decoded};
+
+    fn parked(h: u64, parent: [u8; 32], at: u64) -> (u64, DecodedBlock) { (at, decoded(h, "p", parent, 10)) }
+    fn park(deferred: &mut HashMap<[u8; 32], Vec<(u64, DecodedBlock)>>, by_producer: &mut HashMap<String, usize>,
+            count: &mut usize, bytes: &mut usize, h: u64, parent: [u8; 32], at: u64) {
+        deferred.entry(parent).or_default().push(parked(h, parent, at));
+        *by_producer.entry("p".into()).or_insert(0) += 1;
+        deferred_track(h);
+        *count += 1;
+        *bytes += 10;
+    }
+
+    /// The live wedge: a losing sibling's child parked while its parent slot was empty, the slot
+    /// then filled by the winner. The hash-keyed drain never fires (that parent never verifies),
+    /// and the tracked height tells sync the block is already here. The sweep drops it, the
+    /// height is visible again, and a child of a still-empty slot keeps waiting.
+    #[test]
+    fn a_child_of_the_losing_sibling_is_dropped_once_the_slot_fills() {
+        let (lose, win) = (key(9_100_001), key(9_200_001));
+        let mut deferred = HashMap::new();
+        let mut by_producer = HashMap::new();
+        let (mut count, mut bytes) = (0usize, 0usize);
+        park(&mut deferred, &mut by_producer, &mut count, &mut bytes, 9_100_101, lose, 1_000);
+        park(&mut deferred, &mut by_producer, &mut count, &mut bytes, 9_100_120, key(50), 1_000);
+        let out = sweep_parked(&mut deferred, &mut by_producer, &mut count, &mut bytes, 1_010, 9_100_100,
+                               |h| if h == 9_100_100 { Some(win) } else { None });
+        assert_eq!(out, SweepOutcome { expired: 0, dead: 1, stale: 0 });
+        assert!(!deferred_holds(9_100_101), "the height must be visible to repair again");
+        assert!(deferred_holds(9_100_120), "a child of an empty slot keeps waiting");
+        assert_eq!((count, bytes, by_producer["p"]), (1, 10, 1));
+        deferred_untrack(9_100_120);
+    }
+
+    /// Age and depth still reclaim; nothing is swept while every parked block still has an empty
+    /// slot and time on the clock.
+    #[test]
+    fn age_and_depth_still_evict_and_nothing_else_does() {
+        let mut deferred = HashMap::new();
+        let mut by_producer = HashMap::new();
+        let (mut count, mut bytes) = (0usize, 0usize);
+        park(&mut deferred, &mut by_producer, &mut count, &mut bytes, 9_300_010, key(1), 1_010);   // newer
+        park(&mut deferred, &mut by_producer, &mut count, &mut bytes, 9_300_020, key(2), 1_000);   // older
+        park(&mut deferred, &mut by_producer, &mut count, &mut bytes, 9_299_000, key(3), 1_000);   // far below tip
+        let quiet = sweep_parked(&mut deferred, &mut by_producer, &mut count, &mut bytes, 1_010, 9_300_000, |_| None);
+        assert_eq!(quiet, SweepOutcome { expired: 0, dead: 0, stale: 1 });
+        let aged = sweep_parked(&mut deferred, &mut by_producer, &mut count, &mut bytes, 1_000 + DEFERRED_MAX_AGE_SECS + 1,
+                                9_300_000, |_| None);
+        assert_eq!(aged, SweepOutcome { expired: 1, dead: 0, stale: 0 }, "the older entry expires, the newer one stays");
+        assert!(deferred_holds(9_300_010) && !deferred_holds(9_300_020) && !deferred_holds(9_299_000));
+        assert_eq!(count, 1);
+        deferred_untrack(9_300_010);
+    }
+}
+
+#[cfg(test)]
 mod tests_deferred_capacity_rules {
     use super::*;
 
@@ -5360,19 +5519,9 @@ mod tests_deferred_capacity_rules {
 #[cfg(test)]
 mod deferred_eviction_tests {
     use super::*;
+    use super::deferred_test_support::decoded;
 
-    fn parked(h: u64, producer: &str) -> (u64, DecodedBlock) {
-        let mb = qnet_state::MicroBlock {
-            height: h, timestamp: 0, transactions: vec![], producer: producer.to_string(),
-            signature: vec![0u8; 64], merkle_root: [0u8; 32], previous_hash: [0u8; 32],
-            vrf_output: None, vrf_proof: None, fees_collected: 0,
-            state_root: [0u8; 32], timeout_round: 0, carried_baseline: 0, timeout_proof: None,
-        };
-        (0u64, DecodedBlock {
-            height: h, raw_data: Vec::new(), decompressed: Vec::new(),
-            microblock: mb, from_peer: "p".into(), sig_pre_verified: true,
-        })
-    }
+    fn parked(h: u64, producer: &str) -> (u64, DecodedBlock) { (0u64, decoded(h, producer, [0u8; 32], 0)) }
 
     /// A node two blocks behind used to discard the block it was waiting for and keep sixty it would
     /// not need for another minute. The bound stays the same; what changes is which block is kept.
@@ -5448,24 +5597,9 @@ mod multi_node_tests {
         Applied,
     }
 
-    fn key(h: u64) -> [u8; 32] {
-        let mut k = [0u8; 32];
-        k[..8].copy_from_slice(&h.to_le_bytes());
-        k
-    }
+    use super::deferred_test_support::{key, decoded};
 
-    fn block(h: u64, producer: &str) -> DecodedBlock {
-        let mb = qnet_state::MicroBlock {
-            height: h, timestamp: 0, transactions: vec![], producer: producer.to_string(),
-            signature: vec![0u8; 64], merkle_root: key(h), previous_hash: key(h.saturating_sub(1)),
-            vrf_output: None, vrf_proof: None, fees_collected: 0,
-            state_root: [0u8; 32], timeout_round: 0, carried_baseline: 0, timeout_proof: None,
-        };
-        DecodedBlock {
-            height: h, raw_data: Vec::new(), decompressed: Vec::new(),
-            microblock: mb, from_peer: "sim".into(), sig_pre_verified: true,
-        }
-    }
+    fn block(h: u64, producer: &str) -> DecodedBlock { decoded(h, producer, key(h.saturating_sub(1)), 0) }
 
     struct SimNode {
         applied: u64,
