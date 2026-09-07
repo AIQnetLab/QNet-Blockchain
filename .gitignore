@@ -571,7 +571,8 @@ activation_storage/
 **/CURRENT
 **/IDENTITY
 **/LOCK
-**/LOG*
+**/LOG
+**/LOG.old*
 **/MANIFEST-*
 **/OPTIONS-*
 *.rocksdb/
