@@ -10,8 +10,10 @@ name: Build & Deploy QNet Production
 #
 # Update flow:
 #   1. Build Docker image ONCE in CI → push to PUBLIC ghcr.io
-#   2. Genesis nodes — auto SSH rolling deploy (this workflow)
-#   3. Super nodes   — self-update via Watchtower (polls :latest)
+#   2. Genesis nodes — DELIBERATE rolling deploy: run scripts/deploy-genesis.sh. They do NOT
+#      auto-update: install-genesis.sh installs no Watchtower, on purpose. Five consensus nodes
+#      pulling a bad build at once is not a risk worth taking for convenience.
+#   3. Super nodes   — self-update via Watchtower (polls :latest, installed by install-super-node.sh)
 #   4. Light nodes   — mobile APK (separate release process)
 # ─────────────────────────────────────────────────────────────
 on:
@@ -77,7 +79,8 @@ jobs:
 
   # ───────────────────────────────────────────────────────────
   # Stage 2: Publish summary
-  # Genesis nodes update automatically via Watchtower (no seeds in CI)
+  # No deploy stage here on purpose: the genesis roll is operator-driven (scripts/deploy-genesis.sh),
+  # and the wallet seeds it would need are not in CI.
   # For immediate genesis deploy: run scripts/deploy-genesis.sh locally
   # ───────────────────────────────────────────────────────────
   notify:
@@ -94,6 +97,6 @@ jobs:
           echo "| latest | \`${{ env.IMAGE }}:latest\` |" >> $GITHUB_STEP_SUMMARY
           echo "| commit | \`${{ env.IMAGE }}:${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Genesis nodes** — auto-update via Watchtower (within 5 min)" >> $GITHUB_STEP_SUMMARY
+          echo "**Genesis nodes** — NOT automatic. Roll them with \`scripts/deploy-genesis.sh\`" >> $GITHUB_STEP_SUMMARY
           echo "**Super nodes**   — auto-update via Watchtower (within 5 min)" >> $GITHUB_STEP_SUMMARY
           echo "**Immediate genesis deploy** — run \`scripts/deploy-genesis.sh\` locally" >> $GITHUB_STEP_SUMMARY

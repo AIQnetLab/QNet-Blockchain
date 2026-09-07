@@ -755,6 +755,32 @@ pub fn tail_is_contradicted(our_hash: [u8; 32], our_abs_round: u64, child_parent
     child_parent != our_hash && child_abs_round >= our_abs_round
 }
 
+/// Distinct AUTHENTICATED producers that built past a height on one PARTICULAR parent. Keyed by
+/// (height, that parent) so two competing branches never add up. The producer id is signature-checked
+/// before it is counted (child_is_authentic), so a relay cannot invent one.
+///
+/// This is the leg that is always available. Committee attestations are the stronger claim but they
+/// are gossip: at the live 627304 split the stuck node held only 29 attestation entries in total,
+/// while blocks from four distinct branch-B producers arrived continuously and were logged every
+/// second as hash_chain_break. Evidence the failure reliably produces is worth more than evidence
+/// that is merely better when it happens to be there.
+static VOUCHED_PARENTS: once_cell::sync::Lazy<dashmap::DashMap<(u64, [u8; 32]), std::collections::HashSet<String>>> =
+    once_cell::sync::Lazy::new(dashmap::DashMap::new);
+
+/// Records `producer` as having built past `height` on `parent`; returns the distinct count so far.
+pub fn note_parent_vouched(height: u64, parent: [u8; 32], producer: &str) -> usize {
+    let n = {
+        let mut e = VOUCHED_PARENTS.entry((height, parent)).or_default();
+        e.insert(producer.to_string());
+        e.len()
+    };
+    if VOUCHED_PARENTS.len() > CONTRADICTED_TAILS_MAX {
+        let cut = height.saturating_sub(CONTRADICTED_TAILS_MAX as u64);
+        VOUCHED_PARENTS.retain(|(h, _), _| *h > cut);
+    }
+    n
+}
+
 /// Does an authenticated child overrule the tail we hold?
 ///
 /// The round leg alone INVERTED fork choice. A branch's absolute round rises with every failover it
@@ -764,19 +790,19 @@ pub fn tail_is_contradicted(our_hash: [u8; 32], our_abs_round: u64, child_parent
 /// round" and never rolled back, while the majority, holding the lower round, kept yielding TO it.
 /// A transient fork became permanent, and the branch that had failed most won.
 ///
-/// So authority comes from a quorum instead. `rival_attesters` is how many DISTINCT committee members
-/// have attested the block the child builds on - the per-block attestation set the node already keeps,
-/// and the same evidence the "we are the minority side" detector reads. f+1 of them contains at least
-/// one honest member, and no minority can raise that number by failing. The round leg is kept as the
-/// fast path: it settles the common case in one block and still protects us from a lone stale
-/// straggler, which is what it was for.
+/// So authority comes from a quorum instead. `rival_vouchers` is how many DISTINCT authenticated
+/// parties vouch for the parent the child builds on - committee members that attested that block, or
+/// producers that built past it, whichever set is larger. f+1 of them contains at least one honest
+/// party, and no minority can raise that number by failing. The round leg is kept as the fast path:
+/// it settles the common case in one block and still protects us from a lone stale straggler, which
+/// is what it was for.
 pub fn tail_is_overruled(
     our_hash: [u8; 32], our_abs_round: u64,
     child_parent: [u8; 32], child_abs_round: u64,
-    rival_attesters: usize, f_plus_one: usize,
+    rival_vouchers: usize, f_plus_one: usize,
 ) -> bool {
     if child_parent == our_hash { return false; }
-    child_abs_round >= our_abs_round || (f_plus_one > 0 && rival_attesters >= f_plus_one)
+    child_abs_round >= our_abs_round || (f_plus_one > 0 && rival_vouchers >= f_plus_one)
 }
 
 /// f+1 over the committee that governs `height`: the smallest set that must contain an honest member.
@@ -827,6 +853,7 @@ pub fn contradicted_tail(height: u64) -> Option<[u8; 32]> {
 /// otherwise send the replacement after it.
 pub fn clear_contradicted_tail(height: u64) {
     CONTRADICTED_TAILS.remove(&height);
+    VOUCHED_PARENTS.retain(|(h, _), _| *h != height);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -926,10 +953,10 @@ mod contradicted_tail_tests {
         // The measured shape: our round 3, the majority's 2. One majority producer is not yet proof —
         // that is exactly the lone straggler the round leg protects us from.
         assert!(!tail_is_overruled(ours, 3, theirs, 2, 1, F1),
-                "one attester on a lower round is a straggler, not a quorum");
-        // f+1 committee members attesting the rival block contains at least one honest member.
+                "one voucher on a lower round is a straggler, not a quorum");
+        // f+1 distinct parties vouching for the rival parent contains at least one honest party.
         assert!(tail_is_overruled(ours, 3, theirs, 2, 2, F1),
-                "f+1 attesters overrule a round we raised by failing");
+                "f+1 vouchers overrule a round we raised by failing");
         assert!(tail_is_overruled(ours, 99, theirs, 0, 2, F1),
                 "no round we can reach outranks a quorum — that is the whole point");
 
@@ -938,8 +965,29 @@ mod contradicted_tail_tests {
         assert!(tail_is_overruled(ours, 3, theirs, 9, 0, F1), "a later round, another parent");
         // And the leader building on OUR tail is never a contradiction, whatever the counts say.
         assert!(!tail_is_overruled(ours, 3, ours, 9, 9, F1), "built on ours");
-        // An unknown committee (f+1 = 0) must not let an empty witness set overrule anything.
+        // An unknown committee (f+1 = 0) must not let an empty voucher set overrule anything.
         assert!(!tail_is_overruled(ours, 3, theirs, 2, 0, 0), "no committee ⇒ no quorum leg");
+    }
+
+    /// Builders are counted per PRODUCER and per PARENT: one node repeating itself never reaches f+1,
+    /// and two competing branches never pool their evidence into a quorum for either. This is the leg
+    /// that carried the live 627304 split, where four distinct branch-B producers were arriving every
+    /// second while the node held only a handful of attestations.
+    #[test]
+    fn builders_are_counted_once_each_and_never_across_branches() {
+        let h = 55_000_001u64;
+        let branch_b = [9u8; 32];
+        let branch_c = [8u8; 32];
+        assert_eq!(note_parent_vouched(h, branch_b, "genesis_node_002"), 1);
+        assert_eq!(note_parent_vouched(h, branch_b, "genesis_node_002"), 1, "same builder, still one");
+        assert_eq!(note_parent_vouched(h, branch_b, "genesis_node_004"), 2, "a distinct builder counts");
+        assert_eq!(note_parent_vouched(h, branch_c, "genesis_node_005"), 1,
+                   "another branch keeps its own count");
+        assert_eq!(note_parent_vouched(h, branch_b, "genesis_node_004"), 2, "and does not inflate this one");
+        clear_contradicted_tail(h);
+        assert_eq!(note_parent_vouched(h, branch_b, "genesis_node_002"), 1,
+                   "replacing the tail forgets what vouched for it");
+        clear_contradicted_tail(h);
     }
 
 
@@ -2676,14 +2724,18 @@ impl BlockPipeline {
                             && mb.previous_hash != ours
                             && child_is_authentic(&storage, &decoded).await;
                         let overruled = authentic && {
-                            // The rival block is the parent this child names; its attestation set is
-                            // committee evidence the node already holds, so nothing new accumulates.
-                            let rival = crate::unified_p2p::block_attestation_count(disputed, &mb.previous_hash);
+                            // Two independent ways to vouch for the rival parent: a committee member
+                            // that attested the block, or an authenticated producer that built past it.
+                            // Whichever is larger decides — attestations are the stronger claim, the
+                            // builders are the one the failure reliably produces.
+                            let attested = crate::unified_p2p::block_attestation_count(disputed, &mb.previous_hash);
+                            let built = note_parent_vouched(disputed, mb.previous_hash, &mb.producer);
+                            let rival = attested.max(built);
                             let f1 = committee_f_plus_one(&storage, mb.height).unwrap_or(0);
                             let ruled = tail_is_overruled(ours, our_abs, mb.previous_hash, child_abs, rival, f1);
                             if ruled && child_abs < our_abs && is_warn() {
-                                println!("[WARN][FORK] tail_overruled_by_quorum h={} rival_attesters={} f1={} our_round={} child_round={}",
-                                         disputed, rival, f1, our_abs, child_abs);
+                                println!("[WARN][FORK] tail_overruled_by_quorum h={} attested={} built={} f1={} our_round={} child_round={}",
+                                         disputed, attested, built, f1, our_abs, child_abs);
                             }
                             ruled
                         };
