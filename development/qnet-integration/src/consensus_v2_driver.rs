@@ -1107,6 +1107,154 @@ mod tests {
         assert!(d.build_recertify_proposal(other, Vec::new(), Vec::new()).is_empty());
     }
 
+    // ── FAULTS ───────────────────────────────────────────────────────────────────────────────────
+    // The network's answer to a node that stops answering. Every scenario below is a shape that has
+    // actually halted the live chain, replayed here against the real driver and engine so the
+    // recovery is proven before a release rather than after an outage.
+
+    /// Deliver a round while the network is SPLIT: a message reaches only the nodes in the partition
+    /// of the node that produced it. `part[k]` is node k's partition; equal values can talk. An
+    /// isolated node is simply alone in its own partition, which is what silence looks like from the
+    /// outside - it neither hears nor is heard.
+    fn deliver_split(nodes: &mut Vec<Node>, committee: &[NodeId], seed: Vec<(usize, ConsensusMsg)>, part: &[usize]) {
+        let mut queue = seed;
+        let mut gen = 0;
+        while !queue.is_empty() && gen < 2000 {
+            gen += 1;
+            let mut next = Vec::new();
+            for (g, m) in queue.drain(..) {
+                for k in 0..nodes.len() {
+                    if part[k] != g { continue; }
+                    if !verify_msg(committee, &m) { continue; }
+                    let effects = nodes[k].d.handle(&m);
+                    for e in effects { for out in exec(&mut nodes[k], e) { next.push((g, out)); } }
+                }
+            }
+            queue = next;
+        }
+    }
+
+    /// One proposing round under a split: every node still buffers the window (all-seal), and each
+    /// node's outbound messages carry its own partition.
+    fn split_round(nodes: &mut Vec<Node>, c: &[NodeId], window: u64, part: &[usize]) {
+        let mut seed: Vec<(usize, ConsensusMsg)> = Vec::new();
+        for k in 0..nodes.len() {
+            let effs = nodes[k].d.build_proposal(
+                window, vec![[window as u8; 32]], [window as u8; 32], [0u8; 32], window * 1000,
+                c.to_vec(), Vec::new(), Vec::new(), [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], 0);
+            for e in effs { for out in exec(&mut nodes[k], e) { seed.push((part[k], out)); } }
+        }
+        deliver_split(nodes, c, seed, part);
+    }
+
+    /// One round, and the view timer ONLY if the round made no progress - the production rule. Firing
+    /// it after a good round would break the 2-chain: a commit needs two CONSECUTIVE certified
+    /// indices, and an idle timeout puts a gap between them.
+    fn drive(nodes: &mut Vec<Node>, c: &[NodeId], part: &[usize]) {
+        let before = nodes[0].d.next_window();
+        split_round(nodes, c, before, part);
+        if nodes[0].d.next_window() == before { split_view_change(nodes, c, part); }
+    }
+
+    /// Every node's view timer fires, under the same split.
+    fn split_view_change(nodes: &mut Vec<Node>, c: &[NodeId], part: &[usize]) {
+        let mut seed: Vec<(usize, ConsensusMsg)> = Vec::new();
+        for k in 0..nodes.len() {
+            let effs = nodes[k].d.on_timeout();
+            for e in effs { for out in exec(&mut nodes[k], e) { seed.push((part[k], out)); } }
+        }
+        deliver_split(nodes, c, seed, part);
+    }
+
+    /// The §4.5 catch-up: a node adopts a committed pair from a peer that has it.
+    fn catch_up(nodes: &mut Vec<Node>, from: usize, to: usize) {
+        let pair = nodes[from].d.high_qc_pair();
+        if let Some((cp, qc)) = pair {
+            let effs = nodes[to].d.sync(&cp, &qc);
+            for e in effs { exec(&mut nodes[to], e); }
+        }
+    }
+
+    /// A node that goes silent for several windows must cost the network nothing while it is away,
+    /// and must return to the SAME chain - never a second one. This is the live shape: one node held
+    /// by its host for tens of seconds while the others keep producing.
+    #[test]
+    fn a_silent_node_costs_the_network_nothing_and_returns_to_the_same_chain() {
+        let (c, mut nodes) = byz_net(4);          // quorum 3 of 4: one may be away
+        let alone = vec![0, 0, 0, 1];             // node 3 hears nobody and is heard by nobody
+        // A round whose leader is the silent node produces nothing; the view timer rotates past it,
+        // which is exactly what the network does and what makes the absence cost-free.
+        for _ in 0..8 { drive(&mut nodes, &c, &alone); }
+        assert!(nodes[..3].iter().all(|n| n.committed >= 2), "the quorum keeps committing without it: {:?}",
+                nodes.iter().map(|n| n.committed).collect::<Vec<_>>());
+        assert_eq!(nodes[3].committed, 0, "an isolated node commits nothing on its own");
+        assert!(nodes[3].sealed.is_empty(), "and seals nothing");
+        // It returns: one catch-up pair puts it back on the chain the others built.
+        catch_up(&mut nodes, 0, 3);
+        // Its commit point and frontier are the others'. The finality MARKER follows separately, from
+        // the macroblock the chain already holds - the driver deliberately emits no Finalize for a
+        // checkpoint it never saw, rather than finalizing a head it cannot name.
+        assert_eq!(nodes[3].d.committed_index(), nodes[0].d.committed_index(),
+                   "the returning node adopts the same commit point");
+        assert_eq!(nodes[3].d.next_window(), nodes[0].d.next_window(), "and the same frontier");
+        let heal = vec![0, 0, 0, 0];
+        let next = nodes[0].d.next_window();
+        split_round(&mut nodes, &c, next, &heal);
+        // Whatever each node sealed, the shorter list is a prefix of the longer: one history.
+        let seals: Vec<Vec<u64>> = nodes.iter().map(|n| n.sealed.clone()).collect();
+        for s in &seals[1..] {
+            let n = s.len().min(seals[0].len());
+            assert_eq!(s[..n], seals[0][..n], "two nodes sealed different windows: {:?}", seals);
+        }
+    }
+
+    /// The window's own leader goes silent exactly at its turn. The round must time out, the next
+    /// leader must re-propose the SAME window, and it must commit - the boundary is not lost. This is
+    /// the shape that ended in a thirteen-hour finality freeze on the live chain.
+    #[test]
+    fn a_leader_that_dies_at_its_own_window_does_not_cost_the_window() {
+        let (c, mut nodes) = byz_net(4);
+        strict_round(&mut nodes, &c, 1);
+        let want = nodes[0].d.next_window();
+        // Whoever leads the next round is held for that round; everyone else runs normally.
+        let leader = (0..nodes.len()).find(|k| nodes[*k].d.is_leader_now()).expect("a leader");
+        let mut part = vec![0usize; nodes.len()];
+        part[leader] = 1;
+        split_round(&mut nodes, &c, want, &part);
+        assert!(nodes.iter().all(|n| n.d.next_window() == want), "a silent leader certifies nothing");
+        // The view moves on and the next leader proposes the same window.
+        split_view_change(&mut nodes, &c, &part);
+        split_round(&mut nodes, &c, want, &part);
+        split_round(&mut nodes, &c, want + 1, &part);
+        let live: Vec<u64> = (0..nodes.len()).filter(|k| *k != leader).map(|k| nodes[k].committed).collect();
+        assert!(live.iter().all(|v| *v > 0), "the window commits without its own leader: {:?}", live);
+        assert!(nodes.iter().filter(|n| !n.sealed.is_empty()).count() >= 3,
+                "and the boundary seals on the quorum that stayed");
+    }
+
+    /// A split with no quorum on either side must commit NOTHING - a stalled chain is correct, two
+    /// chains are not - and must converge on one history when the split heals.
+    #[test]
+    fn an_even_split_stalls_and_then_converges_on_one_history() {
+        let (c, mut nodes) = byz_net(4);          // quorum 3: neither half of a 2/2 split can certify
+        strict_round(&mut nodes, &c, 1);
+        let before: Vec<u64> = nodes.iter().map(|n| n.committed).collect();
+        let split = vec![0, 0, 1, 1];
+        for _ in 0..8 { drive(&mut nodes, &c, &split); }
+        let during: Vec<u64> = nodes.iter().map(|n| n.committed).collect();
+        assert_eq!(during, before, "no half of an even split may commit: {:?} -> {:?}", before, during);
+        // Healed: the network commits again, and every node's seals agree with every other's.
+        let heal = vec![0, 0, 0, 0];
+        for _ in 0..8 { drive(&mut nodes, &c, &heal); }
+        assert!(nodes.iter().any(|n| n.committed > before[0]), "the healed network commits again");
+        let first = nodes[0].sealed.clone();
+        for n in &nodes[1..] {
+            let n_len = n.sealed.len().min(first.len());
+            assert_eq!(n.sealed[..n_len], first[..n_len], "two nodes sealed different windows: {:?}",
+                       nodes.iter().map(|x| x.sealed.clone()).collect::<Vec<_>>());
+        }
+    }
+
     // ── BYZANTINE ────────────────────────────────────────────────────────────────────────────────
     // The simulator above is all-honest. These run n=7 (quorum_size 7 = 5, f = 2) with f nodes
     // actively hostile, which is the bound the safety argument claims and the one nothing tested.
