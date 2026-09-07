@@ -58,7 +58,9 @@ for id in "${TARGETS[@]}"; do
     set -e
     N=$name
     docker inspect \$N >/dev/null 2>&1 || { echo 'no such container'; exit 1; }
-    ENVS=\$(docker inspect --format '{{range .Config.Env}}-e {{printf \"%q\" .}} {{end}}' \$N)
+    # Carry the container's env, MINUS any recovery flag a previous roll injected. Those are one-shot
+    # by nature; carried forward they would silently re-truncate on every future restart.
+    ENVS=\$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' \$N             | grep -v '^QNET_ROLLBACK_'             | while read -r e; do [ -n \"\$e\" ] && printf ' -e %q' \"\$e\"; done)
     BINDS=\$(docker inspect --format '{{range .HostConfig.Binds}}-v {{printf \"%q\" .}} {{end}}' \$N)
     PORTS=\$(docker inspect --format '{{range \$p, \$c := .HostConfig.PortBindings}}{{range \$c}}-p {{.HostPort}}:{{\$p}} {{end}}{{end}}' \$N)
     REST=\$(docker inspect --format '{{.HostConfig.RestartPolicy.Name}}' \$N)
