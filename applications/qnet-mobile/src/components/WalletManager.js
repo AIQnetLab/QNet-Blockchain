@@ -4658,6 +4658,12 @@ export class WalletManager {
 
       const result = await response.json();
       console.log('[verifyOnChain] Result:', JSON.stringify(result));
+      // A node that is behind the network has not applied the block a registration lives in, so its
+      // "no" is an absence it cannot vouch for. It says so with authoritative:false; treat that
+      // exactly like a transport failure, because for the caller it means the same thing - unknown.
+      if (result && result.verified === false && result.authoritative === false) {
+        return { ...result, networkError: true, error: result.error || 'node is behind the network' };
+      }
       return result;
     } catch (error) {
       console.warn('[verifyOnChain] Verification request failed:', error.message);

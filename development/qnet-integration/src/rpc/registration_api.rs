@@ -1575,13 +1575,27 @@ pub(super) async fn handle_verify_activation_onchain(
     }
 
 
-    // Not found — wallet has no activation or registration on current blockchain
+    // Not found HERE — which is only the same thing as "not registered" when this node is at the
+    // network's height. A node that is behind, isolated or forked has simply not applied the block
+    // the registration is in, and answering a flat "no" to that is how a client ends up deleting a
+    // perfectly good activation. `authoritative` is the third state: absence this node can vouch for.
     let current_height = blockchain.get_height().await;
+    let network_height = blockchain.get_unified_p2p()
+        .and_then(|p2p| p2p.get_cached_network_height())
+        .map(|nh| nh.max(current_height))
+        .unwrap_or(current_height);
+    let authoritative = current_height >= network_height;
     Ok(warp::reply::json(&json!({
         "verified": false,
+        "authoritative": authoritative,
         "wallet_address": wallet_address,
         "current_height": current_height,
-        "message": "No activation or registration found for this wallet"
+        "network_height": network_height,
+        "message": if authoritative {
+            "No activation or registration found for this wallet"
+        } else {
+            "This node is behind the network and cannot answer for this wallet yet"
+        }
     })))
 }
 

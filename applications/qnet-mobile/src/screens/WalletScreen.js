@@ -50,6 +50,10 @@ const BURN_CONTRACT_PROGRAM_ID = 'CCZSessk1TbWie6Ye2JX2cNEWHTEWxCwe5sLz8JaFriw';
 // only one actual network request goes out per minute.
 const _blockHeightCache = { height: 0, fetchedAt: 0, inFlight: false };
 
+// How many confirmed rows survive a restart. Enough to fill several screens; a wallet with more
+// history refills the rest from the node on the first successful fetch.
+const HISTORY_CACHE_MAX = 100;
+
 // The activation record is tagged with the wallet that owns it. Records written before the burn path
 // was aligned carry the Solana address and newer ones the QNet address, so ownership matches EITHER
 // identity of the same wallet - never a loose "any wallet" check, which is what the tag exists to stop.
@@ -2177,7 +2181,21 @@ const WalletScreen = () => {
       // wallet is loaded again after an unlock, and clearing there emptied the list every time the
       // screen came back - the user saw their history disappear on each unlock while the chain still
       // held every transaction.
+      // Nothing shown yet for this wallet: put the cached rows up while the fetch is in flight.
+      if (lastHistoryAddrRef.current !== wallet.qnetAddress && wallet.qnetAddress) {
+        AsyncStorage.getItem(`qnet_tx_history_${wallet.qnetAddress.toLowerCase()}`).then(raw => {
+          if (!raw) return;
+          try {
+            const cached = JSON.parse(raw);
+            if (Array.isArray(cached) && cached.length) {
+              setTxHistory(prev => (prev.length ? prev : cached));
+            }
+          } catch (_) {}
+        }).catch(() => {});
+      }
       if (lastHistoryAddrRef.current && lastHistoryAddrRef.current !== wallet.qnetAddress) {
+        // Only the screen is cleared. Each wallet's cache is keyed by its own address, so switching
+        // back shows that wallet's rows again instead of a blank list.
         setTxHistory([]);
         pendingTxRef.current = null;
       }
@@ -3308,8 +3326,17 @@ const WalletScreen = () => {
         // or erroring node blanked the history every time this ran.
         const keptConfirmed = nativeOk ? [] : prev.filter(t =>
           t.status === 'confirmed' && !t.nodeEvent && !confirmedHashes.has(t.hash));
-        return [...stillPending, ...formattedTxs, ...keptConfirmed]
+        const merged = [...stillPending, ...formattedTxs, ...keptConfirmed]
           .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+        // Keep the confirmed rows on disk under THIS wallet. History is a read model of the chain,
+        // so caching it costs nothing in correctness and stops a cold start from showing an empty
+        // wallet until the first fetch lands. Pending rows are deliberately not cached: they are
+        // local intent, and a stale one would reappear as a ghost after a restart.
+        if (nativeOk && myAddress) {
+          const keep = merged.filter(t => t.status === 'confirmed').slice(0, HISTORY_CACHE_MAX);
+          AsyncStorage.setItem(`qnet_tx_history_${myAddress}`, JSON.stringify(keep)).catch(() => {});
+        }
+        return merged;
       });
 
       // P4: verify each token transfer's inclusion against a committee-QC-anchored logs_root. 'verified'
