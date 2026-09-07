@@ -310,9 +310,14 @@ export class NodeClient {
   // fallen through to another, and a fault in the body belongs to whoever sent it.
   async getBlockFrom(height: number, pin?: string): Promise<{ block: NodeBlock; endpoint: string } | null> {
     try {
-      const r = await this.fetchJson<NodeBlock & { block?: NodeBlock; error?: string }>(
-        `/api/v1/microblock/${height}`, { method: 'GET' }, MAX_BLOCK_BYTES, 30_000, pin,
-      );
+      const path = `/api/v1/microblock/${height}`;
+      // A PINNED read asks that endpoint and no other. The caller is collecting one independent
+      // answer per source, so falling through to a neighbour would return a body the caller then
+      // discards as "not from the source I asked" - and it would blame the pin for a request it
+      // never received, quarantining a healthy node. The caller moves to its next source itself.
+      const r = pin
+        ? { value: await this.fetchOne<NodeBlock & { block?: NodeBlock; error?: string }>(pin, path, { method: 'GET' }, MAX_BLOCK_BYTES, 30_000), endpoint: pin }
+        : await this.fetchJson<NodeBlock & { block?: NodeBlock; error?: string }>(path, { method: 'GET' }, MAX_BLOCK_BYTES, 30_000);
       const b = (r.value.block ?? r.value) as NodeBlock;
       if (r.value.error || typeof b.height !== 'number') return null;
       if (b.height !== height) throw new Error(`block height mismatch want=${height} got=${b.height}`);
