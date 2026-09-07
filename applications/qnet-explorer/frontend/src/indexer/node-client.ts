@@ -284,7 +284,10 @@ export class NodeClient {
       }
       if (pool.length === 0) finish();
     });
-    for (const e of pool) if (!done.has(e)) this.markFailed(e, 'headers: left behind the quorum');
+    // A source that has not answered inside the grace is SLOW, not broken: the page is served from
+    // the quorum that did answer, and the straggler is asked again next round. Quarantining it here
+    // shrank the pool below the quorum exactly when every node is slow at once (a chain catching up
+    // after a halt), and the tip then had no quorum at all - the head stopped moving.
     return out;
   }
 
