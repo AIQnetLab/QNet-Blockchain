@@ -3473,7 +3473,7 @@ impl BlockPipeline {
                     if tx.from.starts_with("system_") || tx.gas_limit == 0 {
                         continue;
                     }
-                    let charged_gas = if mb.height >= qnet_state::GAS_METERING_ACTIVATION_HEIGHT {
+                    let charged_gas = if qnet_state::feature_gates::is_active(qnet_state::feature_gates::id::GAS_METERING, mb.height) {
                         tx.compute_gas_used()
                     } else {
                         tx.gas_limit

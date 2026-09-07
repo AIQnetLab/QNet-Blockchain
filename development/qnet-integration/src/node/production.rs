@@ -5009,7 +5009,7 @@ impl BlockchainNode {
                         // RESOURCE set: wider than the fee set — gas_price == 0 pays nothing but
                         // still consumes compute. The receive-side gate uses this exact predicate.
                         if !tx.from.starts_with("system_") && tx.gas_limit > 0 {
-                            let charged_gas = if next_block_height >= qnet_state::GAS_METERING_ACTIVATION_HEIGHT {
+                            let charged_gas = if qnet_state::feature_gates::is_active(qnet_state::feature_gates::id::GAS_METERING, next_block_height) {
                                 tx.compute_gas_used()
                             } else {
                                 tx.gas_limit
@@ -5270,7 +5270,7 @@ impl BlockchainNode {
                                     let _ = state_guard.apply_gas_refund(tx, next_block_height, 0);
                                 }
                                 if charged && !tx.from.starts_with("system_") && tx.gas_price > 0 && tx.gas_limit > 0 {
-                                    let charged_gas = if next_block_height >= qnet_state::GAS_METERING_ACTIVATION_HEIGHT {
+                                    let charged_gas = if qnet_state::feature_gates::is_active(qnet_state::feature_gates::id::GAS_METERING, next_block_height) {
                                         tx.compute_gas_used()
                                     } else {
                                         tx.gas_limit
@@ -5367,14 +5367,14 @@ impl BlockchainNode {
                                 // Accrue this tx's NET fee (flat + metered WASM compute above activation),
                                 // mirroring the validator so both credit the identical producer total.
                                 if charged && !tx.from.starts_with("system_") && tx.gas_price > 0 && tx.gas_limit > 0 {
-                                    let charged_gas = if next_block_height >= qnet_state::GAS_METERING_ACTIVATION_HEIGHT {
+                                    let charged_gas = if qnet_state::feature_gates::is_active(qnet_state::feature_gates::id::GAS_METERING, next_block_height) {
                                         tx.compute_gas_used()
                                     } else {
                                         tx.gas_limit
                                     };
                                     block_flat_fees = block_flat_fees
                                         .saturating_add(tx.effective_gas_price().saturating_mul(charged_gas));
-                                    if next_block_height >= qnet_state::GAS_METERING_ACTIVATION_HEIGHT {
+                                    if qnet_state::feature_gates::is_active(qnet_state::feature_gates::id::GAS_METERING, next_block_height) {
                                         block_wasm_fuel_fees = block_wasm_fuel_fees.saturating_add(tx.wasm_fuel_fee(tx_wasm_fuel));
                                     }
                                 }

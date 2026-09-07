@@ -3801,7 +3801,7 @@ impl StateManager {
     /// Deterministic: compute_gas_used() is pure function of TX type → identical on all nodes.
     /// Must be called AFTER apply_transaction_lazy() for each TX.
     pub fn apply_gas_refund(&self, tx: &Transaction, block_height: u64, wasm_fuel: u64) -> StateResult<()> {
-        if block_height < GAS_METERING_ACTIVATION_HEIGHT {
+        if !crate::feature_gates::is_active(crate::feature_gates::id::GAS_METERING, block_height) {
             return Ok(());
         }
         // Metered fee = (compute_gas_used + wasm_fuel) * price. The sender prepaid gas_limit*price, so

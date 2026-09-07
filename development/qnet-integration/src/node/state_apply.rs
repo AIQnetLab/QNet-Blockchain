@@ -99,7 +99,7 @@ impl BlockchainNode {
                     let _ = state_guard.apply_gas_refund(tx, h, 0);
                 }
                 if charged && !tx.from.starts_with("system_") && tx.gas_price > 0 && tx.gas_limit > 0 {
-                    let charged_gas = if h >= qnet_state::GAS_METERING_ACTIVATION_HEIGHT {
+                    let charged_gas = if qnet_state::feature_gates::is_active(qnet_state::feature_gates::id::GAS_METERING, h) {
                         tx.compute_gas_used()
                     } else {
                         tx.gas_limit
@@ -168,14 +168,14 @@ impl BlockchainNode {
                 // Accrue this tx's NET fee — flat charged_gas, plus the metered WASM compute above the
                 // activation height. Same filter and same charged_gas the producer's fill loop uses.
                 if charged && !tx.from.starts_with("system_") && tx.gas_price > 0 && tx.gas_limit > 0 {
-                    let charged_gas = if h >= qnet_state::GAS_METERING_ACTIVATION_HEIGHT {
+                    let charged_gas = if qnet_state::feature_gates::is_active(qnet_state::feature_gates::id::GAS_METERING, h) {
                         tx.compute_gas_used()
                     } else {
                         tx.gas_limit
                     };
                     block_flat_fees = block_flat_fees
                         .saturating_add(tx.effective_gas_price().saturating_mul(charged_gas));
-                    if h >= qnet_state::GAS_METERING_ACTIVATION_HEIGHT {
+                    if qnet_state::feature_gates::is_active(qnet_state::feature_gates::id::GAS_METERING, h) {
                         block_wasm_fuel_fees = block_wasm_fuel_fees.saturating_add(tx.wasm_fuel_fee(tx_wasm_fuel));
                     }
                 }
@@ -295,7 +295,7 @@ impl BlockchainNode {
                 let list_upper_bound: u64 = microblock.transactions.iter()
                     .filter(|tx| !tx.from.starts_with("system_") && tx.gas_price > 0 && tx.gas_limit > 0)
                     .map(|tx| {
-                        let charged_gas = if h >= qnet_state::GAS_METERING_ACTIVATION_HEIGHT {
+                        let charged_gas = if qnet_state::feature_gates::is_active(qnet_state::feature_gates::id::GAS_METERING, h) {
                             tx.compute_gas_used()
                         } else {
                             tx.gas_limit

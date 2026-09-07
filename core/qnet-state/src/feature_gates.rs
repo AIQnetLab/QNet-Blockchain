@@ -80,6 +80,19 @@ pub const LIGHT_KEY_COMMITMENT_GATE_HEIGHT: u64 = 0;
 /// reads epoch_start, and only on a boundary do the two cross together.
 pub const LIGHT_SHARD_BACKUP_OWNERS_GATE_HEIGHT: u64 = 0;
 
+/// Gas metering (`gas_metering`): at/after the height a TX is charged `gas_used * gas_price` with the
+/// unused gas refunded; below it the legacy `gas_limit * gas_price`. It was already height-gated, but
+/// outside this registry — so the one rule with a real staged activation was the one rule the gate
+/// tests, the name constants and the classification check did not cover. Height and semantics are
+/// unchanged by listing it here; only the bookkeeping moves. On a FRESH genesis the correct value is
+/// 0 (blocks 0..99_999 otherwise overcharge every sender); it cannot be lowered on the live chain
+/// without changing how those blocks replay.
+pub const GAS_METERING_GATE_HEIGHT: u64 = qnet_state_gas_metering_height();
+
+/// Kept as a const fn so the single source of the number stays in `transaction.rs`, where the charging
+/// code documents it, while the registry entry above stays a plain literal expression.
+const fn qnet_state_gas_metering_height() -> u64 { crate::transaction::GAS_METERING_ACTIVATION_HEIGHT }
+
 /// Every gate name, spelled ONCE. A gate is asked for by constant, never by a literal, because an
 /// unlisted name is genesis-active by design: a typo at a call site would not fail, it would silently
 /// turn the new rule on everywhere and fork a half-upgraded fleet. A misspelled constant does not
@@ -95,6 +108,7 @@ pub mod id {
     /// Genesis-active on purpose: it is already the deployed behaviour, so a mixed fleet agrees
     /// without a coordinated flip. Listed here, and only here, so it is still spelled once.
     pub const RECENCY_SPAN_EPOCH: &str = "recency_span_epoch";
+    pub const GAS_METERING: &str = "gas_metering";
 }
 
 /// (feature id, activation height). Heights are hardcoded in the binary, so every node agrees
@@ -115,6 +129,7 @@ const ACTIVATIONS: &[(&str, u64)] = &[
     (id::REWARD_EPOCH_ROOT_REQUIRED, 0),
     (id::LIGHT_KEY_COMMITMENT, LIGHT_KEY_COMMITMENT_GATE_HEIGHT),
     (id::LIGHT_SHARD_BACKUP_OWNERS, LIGHT_SHARD_BACKUP_OWNERS_GATE_HEIGHT),
+    (id::GAS_METERING, GAS_METERING_GATE_HEIGHT),
 ];
 
 /// Core gate: active iff `feature` is unlisted (genesis-active default) or `height` has reached
@@ -179,7 +194,7 @@ mod tests {
         const SCHEDULED: &[&str] = &[
             BURN_ATTESTATION_REQUIRED, REGISTRY_ROOT_REQUIRED, LIGHT_REG_EPOCH_ROSTER,
             LOGS_ROOT_REQUIRED, REWARD_EPOCH_ROOT_REQUIRED, LIGHT_KEY_COMMITMENT,
-            LIGHT_SHARD_BACKUP_OWNERS,
+            LIGHT_SHARD_BACKUP_OWNERS, GAS_METERING,
         ];
         for name in SCHEDULED {
             assert!(super::ACTIVATIONS.iter().any(|(f, _)| f == name),
@@ -197,6 +212,19 @@ mod tests {
         let before = names.len();
         names.dedup();
         assert_eq!(names.len(), before, "duplicate gate name in ACTIVATIONS: the first entry wins silently");
+    }
+
+    /// Gas metering is the one rule with a real staged activation, and moving it into the registry
+    /// must not move the height: below it a sender is charged gas_limit, at and above it gas_used with
+    /// the rest refunded, and those are different blocks on a chain that already replayed them.
+    #[test]
+    fn gas_metering_keeps_its_activation_height() {
+        let h = super::GAS_METERING_GATE_HEIGHT;
+        assert_eq!(h, crate::transaction::GAS_METERING_ACTIVATION_HEIGHT,
+                   "the registry entry and the charging code must name the same height");
+        assert!(!super::is_active(super::id::GAS_METERING, h.saturating_sub(1)), "legacy charge below");
+        assert!(super::is_active(super::id::GAS_METERING, h), "refunds from the activation height");
+        assert!(super::is_active(super::id::GAS_METERING, u64::MAX));
     }
 
     #[test]
