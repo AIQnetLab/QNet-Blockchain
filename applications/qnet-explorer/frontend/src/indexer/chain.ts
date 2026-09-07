@@ -293,9 +293,28 @@ export class Chain {
     const fetched = await this.fetchFull(needFull, page.bodySources);
     const full = fetched.blocks;
     const haveBody = new Set(full.map(f => f.block.height));
-    for (const it of needFull) if (!haveBody.has(it.height)) missing.push(it.height);
+    // A body the nodes still keep is worth asking for again. Below the retention floor there is
+    // nothing left to ask: the header page was answered a moment before the floor swept past the
+    // height, which is the normal case while a chain catches up (bodies age out at the catch-up
+    // rate, not at one a second). Such a height is recorded by its agreed identity with no body,
+    // exactly like a height the page already called pruned - otherwise the heal asks the network
+    // for a body that no longer exists anywhere, for good, and the gap ledger never drains.
+    const bodyFloor = Math.max(0, this.nodeHeight - RETENTION_BLOCKS);
+    const pruned: NodeHeader[] = [];
+    for (const it of needFull) {
+      if (haveBody.has(it.height)) continue;
+      if (it.height < bodyFloor) pruned.push(it); else missing.push(it.height);
+    }
     const headersOnly: BlockRow[] = [];
     const hashFixes: Array<[number, string]> = [];
+    for (const it of pruned) {
+      const s2 = stored.get(it.height);
+      if (s2?.body_indexed && (s2.tx_count ?? 0) > 0) continue;   // never demote a stored body
+      if (s2) { if (!s2.hash && isHex64(it.hash)) hashFixes.push([it.height, it.hash as string]); continue; }
+      if (this.genesisTsMs === 0) { missing.push(it.height); continue; }
+      headersOnly.push({ ...blockRowFromHeader({ ...it, body: false }, this.genesisTsMs), tx_count: it.tx_count ?? null });
+    }
+    if (pruned.length > 0) log.warn('INDEXER', 'bodies_expired', { from: pruned[0].height, to: pruned[pruned.length - 1].height, floor: bodyFloor });
     for (const it of items) {
       if (it.body && (it.tx_count || 0) > 0) continue;
       const s = stored.get(it.height);
