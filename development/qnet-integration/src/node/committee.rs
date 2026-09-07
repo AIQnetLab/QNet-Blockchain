@@ -436,22 +436,13 @@ impl BlockchainNode {
         hdr: &qnet_state::EquivocationHeader,
         pk_bytes: &[u8],
     ) -> bool {
-        let mut hasher = Sha3_256::new();
-        hasher.update(b"Block_Sig_v23.1");
-        hasher.update(&height.to_be_bytes());
-        hasher.update(&hdr.timestamp.to_be_bytes());
-        hasher.update(&hdr.merkle_root);
-        hasher.update(&hdr.previous_hash);
-        hasher.update(&hdr.state_root);
-        hasher.update(producer.as_bytes());
-        if let Some(ref vrf) = hdr.vrf_output { hasher.update(vrf); }
-        hasher.update(&hdr.timeout_round.to_be_bytes());
-        // v23.2: bind carried_baseline (matches sign_microblock_with_dilithium).
-        hasher.update(&hdr.carried_baseline.to_be_bytes());
-        // Blocker-3: bind pk_digest (captured from the block's txs at header extraction) so this
-        // equivocation-proof re-verify reconstructs the SAME signed digest as the producer.
-        hasher.update(&hdr.pk_digest);
-        let digest = hasher.finalize();
+        // The header carries the fields the producer signed, including the pk_digest captured from
+        // its txs at extraction, so the shared builder reconstructs the producer's digest exactly.
+        let digest = crate::node::block_signing_digest(
+            height, hdr.timestamp, &hdr.merkle_root, &hdr.previous_hash, &hdr.state_root,
+            producer, hdr.vrf_output.as_ref().map(|v| &v[..]), hdr.timeout_round, hdr.carried_baseline,
+            &hdr.pk_digest,
+        );
         // Wire format: "dilithium3_v4:" + hex(detached_sig).
         let sig_str = match std::str::from_utf8(&hdr.signature) { Ok(s) => s, Err(_) => return false };
         let sig_hex = match sig_str.strip_prefix("dilithium3_v4:") { Some(x) => x, None => return false };

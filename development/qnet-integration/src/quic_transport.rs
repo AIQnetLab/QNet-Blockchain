@@ -175,12 +175,9 @@ fn max_size_for_message_type(msg_type: u8) -> usize {
     }
 }
 
-/// Protocol version
-pub const PROTOCOL_VERSION: u8 = 1;
-
-/// Oldest wire version still accepted. Accepting [MIN, CURRENT] lets a coordinated version bump
-/// roll out node-by-node without partitioning. MIN==CURRENT ⇒ behaviour unchanged today.
-pub const MIN_SUPPORTED_PROTOCOL_VERSION: u8 = 1;
+/// The wire protocol version pair, owned by `p2p_transport`. Re-exported rather than restated: two
+/// copies of a version number are two chances to bump only one.
+pub use crate::p2p_transport::{PROTOCOL_VERSION, MIN_SUPPORTED_PROTOCOL_VERSION};
 
 /// Maximum concurrent incoming handshakes (v6.3: DoS protection).
 /// Each TLS 1.3 + Kyber handshake costs ~2-5ms CPU. Capping at 64

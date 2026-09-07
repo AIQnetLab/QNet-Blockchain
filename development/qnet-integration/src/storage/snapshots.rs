@@ -268,7 +268,7 @@ impl Storage {
 
                 // Type discriminator first (0x02 = SNAP_TYPE_FULL), then the header fields.
                 feed!(encoder, uncompressed_len, &[0x02u8]); // SNAP_TYPE_FULL
-                feed!(encoder, uncompressed_len, &crate::node::PROTOCOL_VERSION.to_le_bytes());
+                feed!(encoder, uncompressed_len, &crate::node::SNAPSHOT_FORMAT_VERSION.to_le_bytes());
                 feed!(encoder, uncompressed_len, &height.to_le_bytes());
                 feed!(encoder, uncompressed_len, &timestamp.to_le_bytes());
 
@@ -928,9 +928,9 @@ impl Storage {
         let version = probe; // already read as u32
         cursor += 4;
 
-        if version != crate::node::PROTOCOL_VERSION {
+        if version != crate::node::SNAPSHOT_FORMAT_VERSION {
             println!("[WARN][STORAGE] snapshot_version_mismatch snapshot_v={} current_v={}",
-                     version, crate::node::PROTOCOL_VERSION);
+                     version, crate::node::SNAPSHOT_FORMAT_VERSION);
         }
 
         // Skip height and timestamp
@@ -1164,7 +1164,7 @@ impl Storage {
         
         // PRODUCTION: Create IPFS-compatible metadata
         let _metadata = json!({
-            "version": crate::node::PROTOCOL_VERSION,
+            "version": crate::node::SNAPSHOT_FORMAT_VERSION,
             "height": height,
             "timestamp": chrono::Utc::now().timestamp(),
             "type": "qnet_snapshot",

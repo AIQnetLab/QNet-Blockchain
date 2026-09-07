@@ -1534,29 +1534,11 @@ impl BlockchainNode {
         // upgrade path for this consensus-rule change.
         // ═══════════════════════════════════════════════════════════════════
 
-        // Create deterministic message hash (same on all nodes for verification)
-        let mut hasher = Sha3_256::new();
-        hasher.update(b"Block_Sig_v23.1");
-        hasher.update(&microblock.height.to_be_bytes());
-        hasher.update(&microblock.timestamp.to_be_bytes());
-        hasher.update(&microblock.merkle_root);
-        hasher.update(&microblock.previous_hash);
-        hasher.update(&microblock.state_root);
-        hasher.update(microblock.producer.as_bytes());
-        if let Some(ref vrf_out) = microblock.vrf_output {
-            hasher.update(vrf_out);
-        }
-        // v23.1: bind timeout_round to the signed digest.
-        hasher.update(&microblock.timeout_round.to_be_bytes());
-        // v23.2: bind carried_baseline too. abs_round = timeout_round + carried_baseline, so the
-        // baseline half is equally consensus-relevant — leaving it unsigned would let a peer-relay
-        // mutate it in transit (signature still verifies against the unsigned remainder) and poison
-        // record_finalized_round / fork-choice, re-opening the exact malleability v23.1 closed.
-        hasher.update(&microblock.carried_baseline.to_be_bytes());
-        // Blocker-3: bind the WIRE pk-presence of this block's txs so a relay cannot strip/add a first-use
-        // pk (block hash unchanged, pk elided from the tx preimage) without breaking this signature.
-        hasher.update(&microblock_pk_digest(&microblock.transactions));
-        let message_hash = hasher.finalize();
+        // The one builder every signer and verifier shares (crate::node::block_signing_digest): it
+        // binds timeout_round and carried_baseline (abs_round is their sum, so an unsigned half is
+        // relay-malleable) and the WIRE pk-presence of the txs (a stripped first-use pk leaves the
+        // block hash unchanged).
+        let message_hash = crate::node::microblock_signing_digest(&microblock);
 
         // Sign with VRF instance (ML-DSA-65 detached signature)
         // VRF instance holds the persistent keypair loaded from DilithiumKeyManager at startup
@@ -1660,25 +1642,7 @@ impl BlockchainNode {
             // Recreate message hash (MUST match sign_microblock_with_dilithium).
             // v23.1: payload version tag is "Block_Sig_v23.1" and includes
             // `timeout_round` to bind consensus rotation state to the signature.
-            let mut hasher2 = Sha3_256::new();
-            hasher2.update(b"Block_Sig_v23.1");
-            hasher2.update(&microblock.height.to_be_bytes());
-            hasher2.update(&microblock.timestamp.to_be_bytes());
-            hasher2.update(&microblock.merkle_root);
-            hasher2.update(&microblock.previous_hash);
-            hasher2.update(&microblock.state_root);
-            hasher2.update(microblock.producer.as_bytes());
-            if let Some(ref vrf_out) = microblock.vrf_output {
-                hasher2.update(vrf_out);
-            }
-            // v23.1: bind timeout_round to the signed digest (matches signer).
-            hasher2.update(&microblock.timeout_round.to_be_bytes());
-            // v23.2: bind carried_baseline (matches signer) — see sign_microblock_with_dilithium.
-            hasher2.update(&microblock.carried_baseline.to_be_bytes());
-            // Blocker-3: bind the received block's WIRE pk-presence (matches signer). A tampered copy
-            // (first-use pk stripped/added) recomputes a different digest ⇒ sig fails ⇒ rejected + re-fetched.
-            hasher2.update(&microblock_pk_digest(&microblock.transactions));
-            let msg_hash = hasher2.finalize();
+            let msg_hash = crate::node::microblock_signing_digest(&microblock);
 
             // Verify ML-DSA-65 detached signature
             use pqcrypto_mldsa::mldsa65 as dilithium3;

@@ -57,8 +57,10 @@ pub(crate) use crate::{
     unified_p2p::{SimplifiedP2P, NodeType as UnifiedNodeType, Region as UnifiedRegion, NetworkMessage, BlockExistenceResult},
 };
 
-// PROTOCOL VERSION for compatibility checks
-pub const PROTOCOL_VERSION: u32 = 1;  // Increment when breaking changes are made
+/// Snapshot FORMAT version — what a transported state snapshot is stamped with and checked against.
+/// Not the wire protocol (that pair lives in `p2p_transport`): sharing the name with it invited a
+/// bump in the wrong place, which would have made every node reject every peer's snapshot.
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 1;
 
 /// Which build this process is running, for operators. Set by the image at runtime (the CI passes the
 /// commit), so it costs nothing at compile time and does not bust the build cache. Without it an
@@ -930,6 +932,56 @@ pub(crate) fn producer_verify_pk(storage: &Storage, node_id: &str) -> Option<Vec
 /// wasteful reorg. This rejects any block not validly signed by its producer — a grinded random sig
 /// fails the Dilithium verify, so only a GENUINE same-round self-fork (re-signed by the real producer,
 /// who has the key) can win the tie-break. Mirrors the v4 path of the async verify_microblock_signature:
+/// THE producer-signature digest. Every signer and every verifier goes through here.
+///
+/// It was written out four times - the signer, the tie-break verifier, the equivocation-proof
+/// re-verify and the header check - each rebuilding the same bytes by hand. They agree today, but a
+/// field added to three of four is a signature the network splits over, and `carried_baseline` and
+/// `pk_digest` were each added that way. One builder makes that impossible, and leaves exactly one
+/// place to put a height-gated domain tag when the payload next changes.
+///
+/// `vrf_output` is folded in only when present, `producer` as raw bytes, everything else big-endian:
+/// byte-for-byte what the four copies produced.
+pub(crate) fn block_signing_digest(
+    height: u64,
+    timestamp: u64,
+    merkle_root: &[u8],
+    previous_hash: &[u8],
+    state_root: &[u8],
+    producer: &str,
+    vrf_output: Option<&[u8]>,
+    timeout_round: u64,
+    carried_baseline: u64,
+    pk_digest: &[u8],
+) -> [u8; 32] {
+    use sha3::Digest;
+    let mut h = sha3::Sha3_256::new();
+    h.update(b"Block_Sig_v23.1");
+    h.update(&height.to_be_bytes());
+    h.update(&timestamp.to_be_bytes());
+    h.update(merkle_root);
+    h.update(previous_hash);
+    h.update(state_root);
+    h.update(producer.as_bytes());
+    if let Some(v) = vrf_output { h.update(v); }
+    h.update(&timeout_round.to_be_bytes());
+    h.update(&carried_baseline.to_be_bytes());
+    h.update(pk_digest);
+    let out = h.finalize();
+    let mut d = [0u8; 32];
+    d.copy_from_slice(&out);
+    d
+}
+
+/// Same digest, taken straight from a microblock.
+pub(crate) fn microblock_signing_digest(mb: &qnet_state::MicroBlock) -> [u8; 32] {
+    block_signing_digest(
+        mb.height, mb.timestamp, &mb.merkle_root, &mb.previous_hash, &mb.state_root,
+        &mb.producer, mb.vrf_output.as_ref().map(|v| &v[..]), mb.timeout_round, mb.carried_baseline,
+        &microblock_pk_digest(&mb.transactions),
+    )
+}
+
 /// Block_Sig_v23.1 digest + detached ML-DSA-65 against the producer's registered VRF PK. h==0/genesis
 /// never reaches here (maybe_supersede early-returns h==0); relaunch-from-scratch has no legacy sigs.
 pub(crate) fn verify_microblock_producer_sig_sync(storage: &Storage, mb: &qnet_state::MicroBlock) -> bool {
@@ -937,22 +989,7 @@ pub(crate) fn verify_microblock_producer_sig_sync(storage: &Storage, mb: &qnet_s
     let sig_hex = match sig_str.strip_prefix("dilithium3_v4:") { Some(x) => x, None => return false };
     let sig_bytes = match hex::decode(sig_hex) { Ok(b) => b, Err(_) => return false };
     let pk = match producer_verify_pk(storage, &mb.producer) { Some(p) => p, None => return false };
-    use sha3::Digest;
-    let mut hasher = sha3::Sha3_256::new();
-    hasher.update(b"Block_Sig_v23.1");
-    hasher.update(&mb.height.to_be_bytes());
-    hasher.update(&mb.timestamp.to_be_bytes());
-    hasher.update(&mb.merkle_root);
-    hasher.update(&mb.previous_hash);
-    hasher.update(&mb.state_root);
-    hasher.update(mb.producer.as_bytes());
-    if let Some(ref vrf_out) = mb.vrf_output { hasher.update(vrf_out); }
-    hasher.update(&mb.timeout_round.to_be_bytes());
-    hasher.update(&mb.carried_baseline.to_be_bytes());
-    // Blocker-3: bind the WIRE pk-presence (matches signer) so a pk-stripped fork copy fails this
-    // tie-break verify instead of being accepted as a validly-signed sibling.
-    hasher.update(&microblock_pk_digest(&mb.transactions));
-    let msg_hash = hasher.finalize();
+    let msg_hash = microblock_signing_digest(mb);
     use pqcrypto_mldsa::mldsa65 as dilithium3;
     use pqcrypto_traits::sign::{PublicKey as PkTrait, DetachedSignature as SigTrait};
     let d3_pk = match <dilithium3::PublicKey as PkTrait>::from_bytes(&pk) { Ok(p) => p, Err(_) => return false };
@@ -7610,7 +7647,9 @@ mod tests {
         h: &qnet_state::EquivocationHeader,
     ) -> Vec<u8> {
         use pqcrypto_traits::sign::DetachedSignature as _;
-        // Reconstruct the EXACT Block_Sig_v23.1 digest verify_block_header_sig checks.
+        // Reconstructed BY HAND on purpose, not via block_signing_digest: an independent copy is what
+        // makes this an oracle. Routing it through the builder the code under test uses would pass
+        // even if that builder changed its bytes, which is the failure this test exists to catch.
         let mut hasher = Sha3_256::new();
         hasher.update(b"Block_Sig_v23.1");
         hasher.update(&height.to_be_bytes());

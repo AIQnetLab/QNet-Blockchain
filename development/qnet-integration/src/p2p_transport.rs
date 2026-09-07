@@ -53,12 +53,15 @@ use crate::crypto::pq_crypto::PqCertificate;
 // CONSTANTS - ALIGNED WITH HTTP AND QUIC TRANSPORT
 // ============================================================================
 
-/// Protocol version for binary messages
+/// Wire protocol version, for BOTH transports. Declared once: the two transports speak the same
+/// protocol, so a bump applied to one and not the other would split the fleet along transport lines —
+/// the exact partition the accepted range below exists to prevent.
 pub const PROTOCOL_VERSION: u8 = 1;
 
 /// Oldest wire version this binary still accepts. Accepting the range [MIN, CURRENT] (instead of an
 /// exact match) lets a future version bump roll out node-by-node without partitioning the network —
 /// upgraded nodes keep talking to not-yet-upgraded peers. MIN==CURRENT ⇒ behaviour unchanged today.
+/// To bump: raise PROTOCOL_VERSION and leave MIN where it is until every node runs the new binary.
 pub const MIN_SUPPORTED_PROTOCOL_VERSION: u8 = 1;
 
 /// Maximum message size (10 MB - enough for macroblocks)
