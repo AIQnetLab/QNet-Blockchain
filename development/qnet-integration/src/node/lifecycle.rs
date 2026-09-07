@@ -85,29 +85,35 @@ impl BlockchainNode {
         if let Err(e) = storage.reconcile_reward_indices_above_epoch(target) {
             println!("[WARN][ROLLBACK] reward_indices_reconcile_fail to={} err={}", target, e);
         }
-        // The anti-double-sign mark comes down with the chain on an OPERATOR rollback, and ONLY here.
-        // Surviving a crash is exactly right for it: a node that rolled back on its own must not
-        // re-sign a height it already signed. But an operator rollback declares those blocks abandoned
-        // across the whole fleet, and a mark left above the tip forbids this node from producing at
-        // heights nobody else will produce either. Live at 627483: every genesis yielded with
-        // "already_signed_this_round" (hwm_h=627570 while the chain sat at 627483, its window one
-        // ahead of the chain's), the elected producer could not sign in the window the chain was in,
-        // and the chain stopped for good.
-        if let Ok(Some((hwm, w, _r, _lh))) = storage.load_highest_signed_mark() {
-            if hwm > target {
-                let tw = crate::node::window_of_height(target);
-                match storage.save_highest_signed_mark(target, tw, 0, target) {
-                    Ok(()) => println!("[WARN][ROLLBACK] signed_mark_lowered from_h={} from_w={} to_h={} to_w={} reason=blocks_abandoned",
-                                       hwm, w, target, tw),
-                    Err(e) => println!("[ERR][ROLLBACK] signed_mark_lower_failed to={} err={} — this node will refuse to produce",
-                                       target, e),
-                }
-            }
-        }
         // Non-consensus; the next boot pass rebuilds it, which is cheaper than scanning here.
         storage.mark_owns_index_dirty();
         storage.invalidate_recent_microblocks_above(target);
         Ok(local_h - target)
+    }
+
+    /// Bring the anti-double-sign mark down to `target`. Called ONLY from the operator rollback.
+    ///
+    /// Surviving a crash is exactly right for this mark: a node that rolled back on its own must not
+    /// re-sign a height it already signed. An operator rollback is different - it declares those
+    /// blocks abandoned across the whole fleet - and a mark left above the tip forbids this node from
+    /// producing at heights nobody else will produce either. Live at 627483: every genesis yielded
+    /// with `already_signed_this_round` (hwm_h=627570, its window one ahead of the chain's), so the
+    /// elected producer could not sign in the window the chain was in and the chain stopped for good.
+    ///
+    /// Separate from the truncation because it is needed even when nothing is truncated: a fleet that
+    /// has already converged on one height needs its marks lowered, not its agreed blocks discarded.
+    fn lower_signing_mark_to(storage: &Arc<Storage>, target: u64) {
+        let (hwm, w) = match storage.load_highest_signed_mark() {
+            Ok(Some((h, w, _, _))) if h > target => (h, w),
+            _ => return,
+        };
+        let tw = crate::node::window_of_height(target);
+        match storage.save_highest_signed_mark(target, tw, 0, target) {
+            Ok(()) => println!("[WARN][ROLLBACK] signed_mark_lowered from_h={} from_w={} to_h={} to_w={} reason=blocks_abandoned",
+                               hwm, w, target, tw),
+            Err(e) => println!("[ERR][ROLLBACK] signed_mark_lower_failed to={} err={} — this node will refuse to produce",
+                               target, e),
+        }
     }
 
     /// One-shot operator recovery, read once at boot. `QNET_ROLLBACK_TO_LAST_SEALED=1` picks the target
@@ -142,8 +148,15 @@ impl BlockchainNode {
         match Self::rollback_storage_to(storage, target).await {
             Ok(0) => println!("[INFO][ROLLBACK] already_at_or_below target={}", target),
             Ok(n) => println!("[INFO][ROLLBACK] truncated_to={} dropped={} — remove the env var before the next start", target, n),
-            Err(e) => println!("[ERR][ROLLBACK] failed target={} err={} action=start_unchanged", target, e),
+            Err(e) => {
+                println!("[ERR][ROLLBACK] failed target={} err={} action=start_unchanged", target, e);
+                return; // the chain did not move: lowering the mark under it would be unfounded
+            }
         }
+        // Against the height the node actually ends up at: the target may sit above a tip this node
+        // never reached, and the mark must never be lowered below what the chain still holds.
+        let effective = storage.get_chain_height().unwrap_or(target).min(target);
+        Self::lower_signing_mark_to(storage, effective);
     }
 
     /// Create a new blockchain node with default settings (backward compatibility)
