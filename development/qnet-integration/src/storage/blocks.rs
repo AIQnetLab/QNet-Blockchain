@@ -249,6 +249,10 @@ impl Storage {
             bincode::deserialize::<qnet_state::MicroBlock>(data).ok();
         let incoming_hash: Option<[u8; 32]> = incoming_block.as_ref().map(|mb| mb.hash());
 
+        // chain_height is written in the same WriteBatch as the body, so a row above it was never
+        // committed. L4 protects COMMITTED history: the evidence below is always taken, but an
+        // uncommitted row must not refuse its own replacement — that leaves the height unfillable.
+        let durable_tip = self.persistent.get_chain_height().unwrap_or(0);
         if let Ok(Some(existing_hash)) = self.persistent.load_microblock_hash(height) {
             match incoming_hash {
                 Some(new_hash) if new_hash == existing_hash => {
@@ -258,7 +262,11 @@ impl Storage {
                         println!("[INFO][STORAGE] dedup_blocked h={} (idempotent re-save, hash={:x?})",
                                  height, &new_hash[..8]);
                     }
-                    return Ok(SaveOutcome::Stored); // already durable at this height
+                    // Above the tip the same bytes are an uncommitted row: fall through so the write
+                    // below commits the height with them, instead of leaving the slot unfillable.
+                    if durable_tip >= height {
+                        return Ok(SaveOutcome::Stored); // already durable at this height
+                    }
                 }
                 Some(new_hash) => {
                     // EQUIVOCATION — different block at the same height. Capture unforgeable
@@ -322,13 +330,22 @@ impl Storage {
                     if let Some(ref inc) = incoming_block {
                         self.retain_branch_block(inc, data);
                     }
-                    return Err(IntegrationError::StorageError(format!(
-                        "fork_conflict h={} existing_hash={:x?} new_hash={:x?} producer={}",
-                        height,
-                        &existing_hash[..8],
-                        &new_hash[..8],
-                        new_producer,
-                    )));
+                    if durable_tip >= height {
+                        return Err(IntegrationError::StorageError(format!(
+                            "fork_conflict h={} existing_hash={:x?} new_hash={:x?} producer={}",
+                            height,
+                            &existing_hash[..8],
+                            &new_hash[..8],
+                            new_producer,
+                        )));
+                    }
+                    // Uncommitted row: the proof is recorded and the branch copy kept, so nothing is
+                    // lost by letting the canonical block take the slot.
+                    if crate::node::is_warn() {
+                        println!("[WARN][STORAGE] orphan_row_replaced h={} tip={} reason=above_durable_tip",
+                                 height, durable_tip);
+                    }
+                    self.delete_microblock(height)?;
                 }
                 None => {
                     // Could not deserialize incoming bytes (rare legacy path).

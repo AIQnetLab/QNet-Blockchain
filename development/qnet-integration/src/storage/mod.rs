@@ -3338,6 +3338,54 @@ mod tests_parent_linkage_invariant {
         assert!(storage.load_microblock(3).unwrap().is_some(), "correctly linked child must persist");
     }
 
+    /// Genesis 001, 08.09: a rollback left rows at 684495 while chain_height stayed at 684494 and the
+    /// node never moved again — readers took "row present" for "height done" and L4 refused the
+    /// canonical block as a fork conflict. A row above the tip was provably never committed.
+    #[test]
+    fn an_orphan_row_above_the_durable_tip_yields_to_the_canonical_block() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = Storage::new(dir.path().to_str().unwrap()).unwrap();
+
+        let base = mb(1, [0u8; 32], 1);
+        storage.save_microblock(1, &bincode::serialize(&base).unwrap()).unwrap();
+        assert_eq!(storage.get_chain_height().unwrap(), 1);
+
+        // Stage the wedge exactly: rows at 2, tip still 1.
+        let orphan = mb(2, base.hash(), 0xAA);
+        storage.put_microblock_row_for_test(2, &bincode::serialize(&orphan).unwrap()).unwrap();
+        storage.save_microblock_hash(2, &orphan.hash()).unwrap();
+        assert!(storage.load_microblock(2).unwrap().is_some(), "the row is what masks the height");
+        assert_eq!(storage.get_chain_height().unwrap(), 1, "and the tip never moved past it");
+
+        // The canonical block for that height must still land, and take the height with it.
+        let canonical = mb(2, base.hash(), 0xBB);
+        storage.save_microblock(2, &bincode::serialize(&canonical).unwrap())
+            .expect("an uncommitted orphan must yield to the canonical block");
+        assert_eq!(storage.load_microblock_hash(2).unwrap(), Some(canonical.hash()),
+                   "the canonical block owns the slot");
+        assert_eq!(storage.get_chain_height().unwrap(), 2, "and the chain advances");
+    }
+
+    /// The same block re-offered above the tip is the ordinary case after a reorg — a node re-fetches
+    /// its own uncommitted suffix. It must commit, not be deleted and rewritten.
+    #[test]
+    fn an_identical_row_above_the_tip_commits_instead_of_being_replaced() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = Storage::new(dir.path().to_str().unwrap()).unwrap();
+
+        let base = mb(1, [0u8; 32], 1);
+        storage.save_microblock(1, &bincode::serialize(&base).unwrap()).unwrap();
+        let ahead = mb(2, base.hash(), 0xCC);
+        storage.put_microblock_row_for_test(2, &bincode::serialize(&ahead).unwrap()).unwrap();
+        storage.save_microblock_hash(2, &ahead.hash()).unwrap();
+        assert_eq!(storage.get_chain_height().unwrap(), 1);
+
+        storage.save_microblock(2, &bincode::serialize(&ahead).unwrap())
+            .expect("the same block commits");
+        assert_eq!(storage.load_microblock_hash(2).unwrap(), Some(ahead.hash()));
+        assert_eq!(storage.get_chain_height().unwrap(), 2, "the height follows the block that was already there");
+    }
+
     /// An ABSENT parent is not a linkage violation: pruned history, snapshot cold-join and
     /// out-of-order backfill all legitimately write a block whose parent is not held locally.
     #[test]

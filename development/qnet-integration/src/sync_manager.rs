@@ -512,6 +512,16 @@ impl SyncManager {
         }
     }
 
+    /// A row proves the height is done only at or below the applied tip; above it it is an orphan
+    /// (rollback resurrection, aborted apply) and counting it as present makes the gap permanent —
+    /// never re-requested, while apply waits for exactly that block. Apply already has this rule.
+    fn row_counts_as_present(&self, h: u64, apply_tip: u64) -> bool {
+        if h > apply_tip.max(crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Acquire)) {
+            return false;
+        }
+        self.storage.load_microblock(h).map(|o| o.is_some()).unwrap_or(false)
+    }
+
     /// v14.10: Event-driven pipelined sync with CREDIT-BASED BACKPRESSURE.
     ///
     /// Architecture (scales to 10K+ Super nodes at 1-sec block time):
@@ -833,7 +843,7 @@ impl SyncManager {
                 let mut lowest_missing = None;
                 let mut h = apply_tip + 1;
                 while h <= scan_hi {
-                    if self.storage.load_microblock(h).map(|o| o.is_none()).unwrap_or(true) {
+                    if !self.row_counts_as_present(h, apply_tip) {
                         lowest_missing = Some(h);
                         break;
                     }
@@ -904,9 +914,7 @@ impl SyncManager {
             let mut range_start: Option<u64> = None;
             let mut range_end: u64 = 0;
             for h in scan_start..=window_end {
-                let present = self.storage.load_microblock(h)
-                    .map(|opt| opt.is_some())
-                    .unwrap_or(false);
+                let present = self.row_counts_as_present(h, apply_tip);
                 if !present {
                     match range_start {
                         None => { range_start = Some(h); range_end = h; }

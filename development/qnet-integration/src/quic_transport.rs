@@ -2446,9 +2446,35 @@ impl QuicTransport {
         self.broadcast_wire_to(peer_addr, &wire_data).await
     }
 
-    /// broadcast_to with the frame already on the wire format. A fan-out that serializes per peer
-    /// holds one copy per in-flight send, and a certificate at a 1000-member committee carries that
-    /// many un-aggregated ML-DSA-65 signatures - so the caller serializes once and shares the bytes.
+    /// Peers reachable right now without dialling, over BOTH pools — the same question `connect()`
+    /// answers, and what `dial_blocked_for` already encodes. Outbound alone reads 0 in a mesh where
+    /// peers dial in: on the genesis fleet `alive=0` on 69 of 69 samples while sends kept succeeding.
+    pub fn reachable_without_dial(&self, failed: &std::collections::HashSet<String>) -> usize {
+        let ident = |addr: &SocketAddr, c: &Arc<QuicConnection>| -> String {
+            c.remote_node_id.clone().unwrap_or_else(|| addr.to_string())
+        };
+        Self::count_reachable(
+            self.connections.iter().map(|e| (ident(e.key(), e.value()), is_connection_alive(e.value()))),
+            INBOUND_CONN_BY_LISTEN_ADDR.iter().map(|e| (ident(e.key(), e.value()), is_connection_alive(e.value()))),
+            failed,
+        )
+    }
+
+    /// The count itself, over both pools, deduped by peer address — both maps are keyed in the same
+    /// address space, which is why `connect()` can look a peer up in either. Pure so the invariant is
+    /// testable without a live QUIC endpoint.
+    pub(crate) fn count_reachable(
+        outbound: impl Iterator<Item = (String, bool)>,
+        inbound: impl Iterator<Item = (String, bool)>,
+        failed: &std::collections::HashSet<String>,
+    ) -> usize {
+        let mut peers: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (id, alive) in outbound.chain(inbound) {
+            if alive && !failed.contains(&id) { peers.insert(id); }
+        }
+        peers.len()
+    }
+
     /// Time left on the reconnect cooldown when a fresh dial is the ONLY way to reach this peer.
     /// None whenever a channel can still appear on its own: a live cached connection, a live
     /// NAT-reuse connection the peer opened to us, or a dial another task already has in flight.
@@ -2466,6 +2492,9 @@ impl QuicTransport {
         })
     }
 
+    /// broadcast_to with the frame already on the wire format. A fan-out that serializes per peer
+    /// holds one copy per in-flight send, and a certificate at a 1000-member committee carries that
+    /// many un-aggregated ML-DSA-65 signatures - so the caller serializes once and shares the bytes.
     pub async fn broadcast_wire_to(&self, peer_addr: SocketAddr, wire_data: &[u8]) -> Result<(), String> {
         // Retry loop for broadcast attempts
         let mut last_error = String::new();
@@ -3314,6 +3343,48 @@ mod tests_handshake {
         HANDSHAKE_FAIL_TRACKER.clear();
     }
 
+}
+
+#[cfg(test)]
+mod tests_reachability {
+    use super::QuicTransport;
+
+    fn p(n: u8) -> String { format!("genesis_node_{:03}", n) }
+
+    /// The reconnect trigger must count what `connect()` can resolve: BOTH pools, by PEER. Outbound
+    /// alone is permanently zero in a mesh where peers dial in, so the node re-dials forever — on the
+    /// genesis fleet, `alive=0` on 69 of 69 samples and 1378 reconnect cycles while sends succeeded.
+    #[test]
+    fn a_peer_that_dialled_us_counts_as_reachable() {
+        let none: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        // Nothing outbound, three live inbound: connect() reaches all three without dialling.
+        assert_eq!(QuicTransport::count_reachable(
+            std::iter::empty(),
+            vec![(p(1), true), (p(2), true), (p(3), true)].into_iter(), &none), 3,
+            "inbound-only peers are reachable; counting them as 0 is what caused the storm");
+
+        // One peer in both pools is one peer — the two maps key on different addresses for a NAT'd
+        // peer, so the count is by identity, not by address.
+        assert_eq!(QuicTransport::count_reachable(
+            vec![(p(1), true)].into_iter(),
+            vec![(p(1), true), (p(2), true)].into_iter(), &none), 2, "deduped by peer");
+
+        // Dead connections in either pool count for nothing.
+        assert_eq!(QuicTransport::count_reachable(
+            vec![(p(1), false)].into_iter(),
+            vec![(p(2), false)].into_iter(), &none), 0, "a dead connection is not reachability");
+
+        // A peer whose HealthPing just failed is not reachable, however alive its connection looks —
+        // otherwise the zombie evidence is discarded and the node never re-dials.
+        let failed: std::collections::HashSet<String> = vec![p(1), p(2)].into_iter().collect();
+        assert_eq!(QuicTransport::count_reachable(
+            vec![(p(1), true)].into_iter(),
+            vec![(p(2), true), (p(3), true)].into_iter(), &failed), 1, "zombies do not count");
+
+        // And a genuinely isolated node still reads zero, so the trigger keeps working.
+        assert_eq!(QuicTransport::count_reachable(std::iter::empty(), std::iter::empty(), &none), 0);
+    }
 }
 
 #[cfg(test)]

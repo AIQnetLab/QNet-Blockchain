@@ -1180,6 +1180,10 @@ impl SimplifiedP2P {
                     // Step 2: ACTIVE health check - send HealthPing to all connected peers
                     let connected_peers = transport.get_connected_peers();
                     let mut zombie_count = 0;
+                    // The addresses behind that count: a failed send is live evidence the channel is
+                    // useless, and the reachability count must not hand it back.
+                    let mut zombie_ids: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
                     
                     let current_height = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
                     let ts = std::time::SystemTime::now()
@@ -1222,6 +1226,7 @@ impl SimplifiedP2P {
                             Err(_e) => {
                                 // Connection is zombie - will be removed by retry logic
                                 zombie_count += 1;
+                                zombie_ids.insert(peer_id.clone());
                                 if crate::node::is_warn() { println!("[WARN][QUIC] Zombie connection detected to {} via HealthPing",
                                          get_privacy_id_for_addr(&peer_id)); }
                             }
@@ -1234,10 +1239,15 @@ impl SimplifiedP2P {
                                  alive, removed, zombie_count);
                     }
                     
+                    // What connect() can resolve is both pools, minus the peers whose HealthPing just
+                    // failed: outbound alone is empty in a mesh where peers dial in and reads as "no
+                    // connections" forever, while a zombie reads as alive at the QUIC layer.
+                    let reachable = transport.reachable_without_dial(&zombie_ids);
+
                     drop(transport); // Release read lock before reconnection
-                    
+
                     // Step 3: Proactive reconnection if we have very few connections
-                    let effective_alive = alive.saturating_sub(zombie_count);
+                    let effective_alive = reachable;
                     let min_connections = 3; // Minimum for Byzantine tolerance
                     
                     if effective_alive < min_connections {

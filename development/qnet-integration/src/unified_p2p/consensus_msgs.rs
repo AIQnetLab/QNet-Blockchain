@@ -552,24 +552,37 @@ impl SimplifiedP2P {
     /// an ordinary honest outage or a rolling upgrade. Two answers to "who is the committee" is a fork
     /// surface that needs no adversary at all; there is now exactly one.
     pub(super) fn deterministic_eligible_ids(&self) -> Option<std::collections::HashSet<String>> {
-        let local_h = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Acquire);
-        if local_h <= 180 {
+        Self::committee_at(LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Acquire))
+            .map(|c| c.as_ref().clone())
+    }
+
+    /// The same answer without the clone, for callers that only read it. Fork choice asks this per
+    /// hash-chain-break block, which during a fork means every block.
+    pub(crate) fn committee_at(height: u64) -> Option<Arc<std::collections::HashSet<String>>> {
+        if height <= 180 {
             return None; // genesis bootstrap -> fallback (signature-only) doctrine
         }
-        let current_epoch = (local_h - 1) / 90 + 1;
-        if let Some(c) = EPOCH_COMMITTEE_CACHE.get(&current_epoch) {
-            return Some(c.value().as_ref().clone());
+        // A rollback that deletes the N-2 macroblock can put a different committee under the same
+        // epoch, so the memo follows the delete counter the window-committee cache does. Without it a
+        // reorg leaves fork choice deciding against the committee of a chain that no longer exists.
+        let seq = crate::storage::macroblock_delete_seq();
+        if EPOCH_COMMITTEE_SEQ.swap(seq, std::sync::atomic::Ordering::Relaxed) != seq {
+            EPOCH_COMMITTEE_CACHE.clear();
+        }
+        let epoch = (height - 1) / 90 + 1;
+        if let Some(c) = EPOCH_COMMITTEE_CACHE.get(&epoch) {
+            return Some(c.value().clone());
         }
         let storage = crate::node::try_get_storage()?;
         let set: std::collections::HashSet<String> =
-            crate::node::BlockchainNode::committee_for_height(&storage, local_h)?
+            crate::node::BlockchainNode::committee_for_height(&storage, height)?
                 .into_iter().collect();
         // Cache per epoch. The resolver is a pure function of committed macroblocks, so a hit is the
         // same value every node computes; the 4-epoch retain bounds it.
         let arc = Arc::new(set);
-        EPOCH_COMMITTEE_CACHE.insert(current_epoch, arc.clone());
-        EPOCH_COMMITTEE_CACHE.retain(|e, _| *e + 4 >= current_epoch);
-        Some(arc.as_ref().clone())
+        EPOCH_COMMITTEE_CACHE.insert(epoch, arc.clone());
+        EPOCH_COMMITTEE_CACHE.retain(|e, _| *e + 4 >= epoch);
+        Some(arc)
     }
 
     /// Count unique alive peers by node_id, excluding self and stale entries.

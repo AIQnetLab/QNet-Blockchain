@@ -15,8 +15,14 @@ pub type Hash = [u8; 32];
 /// no two conflicting QCs. (n−f == 2f+1 exactly when n=3f+1.) E.g. n=5⇒4, n=100⇒67.
 pub fn quorum_size(committee_len: usize) -> usize {
     if committee_len == 0 { return 0; }
-    let f = (committee_len - 1) / 3;
-    committee_len - f
+    committee_len - byzantine_f(committee_len)
+}
+
+/// f = floor((n-1)/3) — the tolerated Byzantine count. Single definition: fork choice asks for f+1
+/// (the smallest set that must contain an honest member) and must never drift from the quorum here.
+pub fn byzantine_f(committee_len: usize) -> usize {
+    if committee_len == 0 { return 0; }
+    (committee_len - 1) / 3
 }
 
 /// Smallest committee for which the relaxation exists. Below it `relaxed_quorum` returns

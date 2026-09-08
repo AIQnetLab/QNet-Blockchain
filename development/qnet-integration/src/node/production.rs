@@ -94,7 +94,9 @@ impl BlockchainNode {
                     // certified chain back to adopt a round-0 branch it could not verify.
                     let windows: std::cell::RefCell<std::collections::HashMap<u64, Option<Vec<[u8; 32]>>>> = Default::default();
                     // An unreadable body is never the certified one and vouches for nothing: round 0, zero hash.
-                    let protected = crate::unified_p2p::round_protected_floor(rollback_to, local_h, |h| {
+                    let protected = crate::unified_p2p::round_protected_floor(
+                        rollback_to, local_h,
+                        LAST_FINALIZED_HEIGHT.load(std::sync::atomic::Ordering::SeqCst), |h| {
                         match storage.load_microblock_auto_format(h) {
                             Ok(Some(b)) => Some((b.timeout_round.saturating_add(b.carried_baseline), b.hash())),
                             Ok(None) => None,
@@ -3147,17 +3149,24 @@ impl BlockchainNode {
                 {
                     let storage_for_precheck = storage.clone();
                     let precheck_height = next_block_height;
+                    // The label is resolved on the SAME blocking task, and only when it will be
+                    // printed: rows are zstd-compressed or EfficientMicroBlock, so bincode on the raw
+                    // bytes named every real block "unknown", and a second read here would sit on the
+                    // reactor the outer spawn_blocking exists to protect.
+                    let want_label = is_info();
                     match tokio::task::spawn_blocking(move || {
-                        storage_for_precheck.load_microblock(precheck_height)
+                        storage_for_precheck.load_microblock(precheck_height).map(|row| row.map(|_| {
+                            if !want_label { return String::new(); }
+                            storage_for_precheck.load_microblock_auto_format(precheck_height)
+                                .ok().flatten().map(|mb| mb.producer)
+                                .unwrap_or_else(|| "unknown".to_string())
+                        }))
                     }).await {
-                        Ok(Ok(Some(existing_data))) => {
+                        Ok(Ok(Some(existing_producer))) => {
                             // Block already exists at our target height — apply pipeline
                             // already finalized it (received from peer broadcast). Yield
                             // and let the next iteration pick up the advanced height.
-                            let existing_producer = bincode::deserialize::<qnet_state::MicroBlock>(&existing_data)
-                                .map(|mb| mb.producer)
-                                .unwrap_or_else(|_| "unknown".to_string());
-                            if is_info() {
+                            if want_label {
                                 println!(
                                     "[INFO][PROD] preempted_h={} existing_producer={} action=yield_to_pipeline",
                                     precheck_height, existing_producer

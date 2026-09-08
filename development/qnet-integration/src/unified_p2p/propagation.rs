@@ -2,6 +2,60 @@
 
 use super::*;
 
+/// Memo + log latch for the light-shard recovery sweep: `epoch * 128 + covered_mask * 4 + state`,
+/// state 0 quiet / 1 recovering / 2 stood down. Keyed by the covered set too, so a shard takeover
+/// re-evaluates instead of inheriting the previous owner's verdict.
+static SHARD_SWEEP_STATE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Single admission point for the resident light registry: role cap with inactive-first eviction plus
+/// the trimmed entry (heavy crypto lives in the VRF/ping-key CFs). Gossip and bulk sync both pass here.
+/// Caller holds the write lock, so a bulk merge takes it once.
+pub(super) fn admit_light_registration(
+    registry: &mut std::collections::HashMap<String, LightNodeRegistrationData>,
+    reg: LightNodeRegistrationData,
+) {
+    make_room_for(registry, 1);
+    registry.insert(reg.node_id.clone(), LightNodeRegistrationData {
+        quantum_pubkey: String::new(), signature: String::new(),
+        ping_pubkey: String::new(), ping_delegation_cert: String::new(),
+        device_token_hash: String::new(),
+        ..reg
+    });
+}
+
+/// Free space for `incoming` new entries if the role cap needs it. Separate from admission because a
+/// bulk merge must pay the scan ONCE, not once per entry.
+pub(super) fn make_room_for(
+    registry: &mut std::collections::HashMap<String, LightNodeRegistrationData>,
+    incoming: usize,
+) {
+    let cap = light_registry_cap();
+    if registry.len() + incoming > cap {
+        // Inactive-first, then oldest, so live nodes are never dropped while dead entries remain.
+        // Selection is a bounded heap, not a clone-and-sort of the whole map: at the genesis cap that
+        // was 10M key clones and an O(N log N) sort under the write lock.
+        // The batch is a slice of the cap, not a constant — the one pass is the expensive part and
+        // must be amortised over many admissions at 10M as well as at 100k.
+        let evict_batch = (cap / 100).clamp(1, 10_000).max(incoming);
+        let mut worst: std::collections::BinaryHeap<(bool, u64, String)> = std::collections::BinaryHeap::new();
+        for (k, v) in registry.iter() {
+            let key = (v.is_active, v.registered_at);
+            if worst.len() >= evict_batch {
+                match worst.peek() {
+                    Some(w) if key < (w.0, w.1) => { worst.pop(); }
+                    _ => continue,
+                }
+            }
+            worst.push((key.0, key.1, k.clone()));
+        }
+        let evicted = worst.len();
+        for (_, _, key) in worst { registry.remove(&key); }
+        if crate::node::is_info() {
+            println!("[INFO][P2P] registry_evicted count={} cap={}", evicted, cap);
+        }
+    }
+}
+
 impl SimplifiedP2P {
     /// Track blocks without ping commitment for monitoring
     /// Uses thread-local static for simplicity (no struct modification needed)
@@ -1549,12 +1603,7 @@ impl SimplifiedP2P {
         }
         {
             let mut registry = self.light_node_registry.write();
-            registry.insert(registration.node_id.clone(), LightNodeRegistrationData {
-                quantum_pubkey: String::new(), signature: String::new(),
-                ping_pubkey: String::new(), ping_delegation_cert: String::new(),
-                device_token_hash: String::new(),
-                ..registration.clone()
-            });
+            admit_light_registration(&mut registry, registration.clone());
         }
 
         // Gossip to network — the FULL `registration` values (below), NOT the trimmed resident entry.
@@ -1628,7 +1677,16 @@ impl SimplifiedP2P {
         let mut added = 0;
         let mut registry = self.light_node_registry.write();
 
+        // The cap is enforced by stopping, not by evicting: at boot the map is empty, so there is
+        // nothing to evict and a chain holding more than the cap would otherwise blow straight past it.
+        let cap = light_registry_cap();
         for (node_id, wallet_address, _node_type, registered_at) in nodes {
+            if registry.len() >= cap {
+                if crate::node::is_warn() {
+                    println!("[WARN][P2P] restore_capped restored={} cap={} reason=registry_full", added, cap);
+                }
+                break;
+            }
             if !registry.contains_key(&node_id) {
                 // B: liveness is derived from on-chain attestation recency, not a persisted flag — seed
                 // active; the ping-wakeup scheduler re-derives whom to wake from committed eligibility.
@@ -1946,20 +2004,49 @@ impl SimplifiedP2P {
         // "Dormant" must mean the DEVICE stopped answering, never that nobody asked. When this shard
         // has no committed bitmap for the epoch just ended, the silence is ours: the owner was down,
         // wedged or restarting through the commit window, and every device in the shard looks dormant
-        // through no fault of its own. One recovery sweep wakes the whole shard instead of waiting for
-        // ten million people to open an app.
-        let recovering = {
-            let prev_epoch = current_window.saturating_sub(1);
-            match crate::node::try_get_storage() {
-                Some(st) => prev_epoch > 0 && st.load_light_bitmaps(prev_epoch)
-                    .map(|m| covered.iter().any(|(sh, _)| !m.contains_key(sh))).unwrap_or(false),
-                None => false,
+        // through no fault of its own. Sweeping wakes the whole shard instead of waiting for ten
+        // million people to open an app.
+        //
+        // BOUNDED, because recovery is for a TRANSIENT gap. Unbounded it fired every slot for hours
+        // (07.09): no bitmap can be committed behind a closed gate, so "none last epoch" stays true
+        // forever — a full-registry sweep every epoch at 10M nodes. Past RECOVERY_EPOCHS it stands down.
+        const RECOVERY_EPOCHS: u64 = 3;
+        // Decided ONCE per (epoch, covered shards) and reused for the whole epoch. The probe reads a
+        // whole epoch of bitmaps — megabytes at 10M light nodes — and the answer cannot usefully
+        // change inside an epoch, so running it per ping slot was the cost the stand-down exists to
+        // avoid. State: 0 quiet, 1 recovering, 2 stood down.
+        let latch_base = current_window * 128 + (covered_mask as u64) * 4;
+        let cached = SHARD_SWEEP_STATE.load(std::sync::atomic::Ordering::Relaxed);
+        let state = if cached >= latch_base && cached <= latch_base + 2 {
+            cached - latch_base
+        } else {
+            let missing_epochs = match crate::node::try_get_storage() {
+                // take_while short-circuits: a healthy epoch costs exactly one read.
+                Some(st) => (1..=RECOVERY_EPOCHS + 1)
+                    .take_while(|back| {
+                        let e = current_window.saturating_sub(*back);
+                        e > 0 && st.load_light_bitmaps(e)
+                            .map(|m| covered.iter().any(|(sh, _)| !m.contains_key(sh)))
+                            .unwrap_or(false)
+                    })
+                    .count() as u64,
+                None => 0,
+            };
+            let s = if missing_epochs == 0 { 0 } else if missing_epochs <= RECOVERY_EPOCHS { 1 } else { 2 };
+            SHARD_SWEEP_STATE.store(latch_base + s, std::sync::atomic::Ordering::Relaxed);
+            if s != 0 && crate::node::is_warn() {
+                let shards: Vec<usize> = covered.iter().map(|(sh, _)| *sh).collect();
+                if s == 1 {
+                    println!("[WARN][GENESIS-PING] shard_recovery_sweep shards={:?} epoch={} missing_epochs={} reason=no_committed_bitmap",
+                             shards, current_window, missing_epochs);
+                } else {
+                    println!("[CRIT][GENESIS-PING] shard_bitmap_absent shards={:?} epoch={} missing_epochs>{} action=sweep_stood_down reason=pinging_cannot_fix_this",
+                             shards, current_window, RECOVERY_EPOCHS);
+                }
             }
+            s
         };
-        if recovering && crate::node::is_warn() {
-            println!("[WARN][GENESIS-PING] shard_recovery_sweep shards={:?} epoch={} reason=no_committed_bitmap_last_epoch",
-                     covered.iter().map(|(sh, _)| *sh).collect::<Vec<_>>(), current_window);
-        }
+        let recovering = state == 1;
         let registry = self.light_node_registry.read();
         let reg_len = registry.len();
 

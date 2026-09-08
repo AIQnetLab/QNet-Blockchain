@@ -805,37 +805,41 @@ pub fn tail_is_overruled(
     child_abs_round >= our_abs_round || (f_plus_one > 0 && rival_vouchers >= f_plus_one)
 }
 
-/// f+1 over the committee that governs `height`: the smallest set that must contain an honest member.
+/// Distinct committee members that built on the branch descending from `child`, counting `child`.
 ///
-/// Memoised per epoch. The committee is fixed for an epoch, while resolving it deserializes the
-/// N-2 macroblock's eligible-producer roster — at the target super-node count that is a large blob,
-/// and this is asked on every hash-chain-break block, which during a fork means every block.
-pub fn committee_f_plus_one(storage: &crate::storage::Storage, height: u64) -> Option<usize> {
-    const KEEP: usize = 4;
-    // A rollback that deletes the N-2 macroblock can put a different committee under an epoch, so the
-    // memo follows the same delete counter the window-committee cache does.
-    let seq = crate::storage::macroblock_delete_seq();
-    if COMMITTEE_F1_SEQ.swap(seq, std::sync::atomic::Ordering::Relaxed) != seq {
-        COMMITTEE_F1_BY_EPOCH.clear();
+/// Vouchers keyed at ONE height can never reach f+1 while the chain is halted: a slot has one
+/// authorised leader, so the rival branch offers exactly one builder there however long it is. The
+/// blocks above it are already here — parked in the deferred buffer, ML-DSA-verified before parking
+/// and keyed by parent hash, so the buffer IS the branch. Committee-only, so f+1 keeps meaning what
+/// it means; bounded walk, so a deep buffer cannot make this expensive.
+fn branch_builders(
+    deferred: &HashMap<[u8; 32], Vec<(u64, DecodedBlock)>>,
+    child: &qnet_state::MicroBlock,
+    committee: &std::collections::HashSet<String>,
+    enough: usize,
+) -> usize {
+    // Stops at `enough` (f+1) — more proves nothing — and at a hard visit bound so a deep buffer
+    // cannot make this expensive. One tenure is 30 blocks, so a large committee needs far more of the
+    // branch than the bound allows: there the attestation leg is the one that reaches f+1, and this
+    // leg is what a small committee has instead.
+    const MAX_VISITED: usize = 4 * crate::node::ROTATION_INTERVAL_BLOCKS as usize;
+    let mut builders: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    if committee.contains(&child.producer) { builders.insert(child.producer.as_str()); }
+    let mut frontier = vec![child.hash()];
+    let mut visited = 0usize;
+    while let Some(h) = frontier.pop() {
+        let waiters = match deferred.get(&h) { Some(w) => w, None => continue };
+        for (_, d) in waiters {
+            if builders.len() >= enough || visited >= MAX_VISITED { return builders.len(); }
+            visited += 1;
+            if committee.contains(&d.microblock.producer) {
+                builders.insert(d.microblock.producer.as_str());
+            }
+            frontier.push(d.microblock.hash());
+        }
     }
-    let epoch = height.saturating_sub(1) / qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL + 1;
-    if let Some(v) = COMMITTEE_F1_BY_EPOCH.get(&epoch) { return Some(*v); }
-    let n = crate::node::BlockchainNode::committee_for_height(storage, height)?.len();
-    if n == 0 { return None; }
-    let f1 = (n - 1) / 3 + 1;
-    COMMITTEE_F1_BY_EPOCH.insert(epoch, f1);
-    if COMMITTEE_F1_BY_EPOCH.len() > KEEP {
-        let cut = epoch.saturating_sub(KEEP as u64);
-        COMMITTEE_F1_BY_EPOCH.retain(|e, _| *e > cut);
-    }
-    Some(f1)
+    builders.len()
 }
-
-/// (epoch -> f+1). Tiny and self-pruning; the committee cannot change inside an epoch.
-static COMMITTEE_F1_BY_EPOCH: once_cell::sync::Lazy<dashmap::DashMap<u64, usize>> =
-    once_cell::sync::Lazy::new(dashmap::DashMap::new);
-/// Macroblock-delete counter the memo above was built under.
-static COMMITTEE_F1_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
 
 pub fn note_contradicted_tail(height: u64, network_parent: [u8; 32]) {
     CONTRADICTED_TAILS.insert(height, network_parent);
@@ -2212,12 +2216,16 @@ impl BlockPipeline {
                 continue;
             }
 
-            // Dedup: skip if already in storage. Exception — a same-height block from
-            // a higher n−f-certified rotation round (failover race) supersedes ours;
-            // route it to the finality-guarded reorg instead of silently dropping.
-            if storage.load_microblock(block.height)
-                .map(|opt| opt.is_some())
-                .unwrap_or(false)
+            // Dedup: skip if already in storage AND at or below the applied frontier. Exception —
+            // a same-height block from a higher n−f-certified rotation round (failover race)
+            // supersedes ours; route it to the finality-guarded reorg instead of silently dropping.
+            // The frontier clause: apply already guards itself with `height > applied_tip` because the
+            // store can hold bodies above the tip after a rollback. This reader did not, so one orphan
+            // row made its height undeliverable forever — verify dropped every copy as a duplicate.
+            if block.height <= crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Acquire)
+                && storage.load_microblock(block.height)
+                    .map(|opt| opt.is_some())
+                    .unwrap_or(false)
             {
                 maybe_supersede_by_certified_round(&storage, &block, unified_p2p.as_deref());
                 // A height we asked for may be held with expired tx rows: the apply stage decides
@@ -2730,12 +2738,18 @@ impl BlockPipeline {
                             // builders are the one the failure reliably produces.
                             let attested = crate::unified_p2p::block_attestation_count(disputed, &mb.previous_hash);
                             let built = note_parent_vouched(disputed, mb.previous_hash, &mb.producer);
-                            let rival = attested.max(built);
-                            let f1 = committee_f_plus_one(&storage, mb.height).unwrap_or(0);
+                            let committee = crate::unified_p2p::SimplifiedP2P::committee_at(mb.height);
+                            let f1 = committee.as_ref()
+                                .map(|c| qnet_consensus::checkpoint_bft::byzantine_f(c.len()) + 1).unwrap_or(0);
+                            // Third leg: the rival BRANCH, not just its first block. A halted chain
+                            // re-broadcasts one block per height, so the two legs above stay at 1 forever.
+                            let branch = committee.as_ref()
+                                .map(|c| branch_builders(&deferred, &decoded.microblock, c, f1)).unwrap_or(0);
+                            let rival = attested.max(built).max(branch);
                             let ruled = tail_is_overruled(ours, our_abs, mb.previous_hash, child_abs, rival, f1);
                             if ruled && child_abs < our_abs && is_warn() {
-                                println!("[WARN][FORK] tail_overruled_by_quorum h={} attested={} built={} f1={} our_round={} child_round={}",
-                                         disputed, attested, built, f1, our_abs, child_abs);
+                                println!("[WARN][FORK] tail_overruled_by_quorum h={} attested={} built={} branch={} f1={} our_round={} child_round={}",
+                                         disputed, attested, built, branch, f1, our_abs, child_abs);
                             }
                             ruled
                         };
@@ -4583,7 +4597,14 @@ impl BlockPipeline {
                             // S2: publish the apply frontier the instant the block is durable + height-set,
                             // BEFORE deferred side effects — a peer reading it never sees a stale frontier and
                             // wrongly cools a syncing node. fetch_max keeps it monotone (never below the anchor).
-                            Ok(_) => { crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.fetch_max(height, std::sync::atomic::Ordering::AcqRel); }
+                            // Both mirrors of the tip move here. ctx.height used to be raised at the END of
+                            // deferred-fx, so a task that stopped short left disk at h and the node at h-1 with
+                            // nothing to reconcile them (genesis 001, 08.09: 20 min wedged one block short).
+                            Ok(_) => {
+                                crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.fetch_max(height, std::sync::atomic::Ordering::AcqRel);
+                                let mut h = ctx.height.write().await;
+                                if height > *h { *h = height; }
+                            }
                             Err(e) => { if is_warn() { println!("[WARN][PIPELINE] set_height_failed h={} err={}", height, e); } }
                         }
                         // v15.4 DIAG: deferred-side-effects phase. Mostly
@@ -4906,14 +4927,6 @@ impl BlockPipeline {
             crate::node::LAST_SYNC_PROGRESS_TIME.store(
                 crate::node::get_timestamp_safe(), Ordering::Relaxed,
             );
-
-            // Update RAM height
-            {
-                let mut h = ctx.height.write().await;
-                if height > *h {
-                    *h = height;
-                }
-            }
 
             // Apply frontier already published right after set_chain_height (above) so peers never read a
             // stale value during the deferred-fx window.
@@ -5435,6 +5448,21 @@ mod tests_rollback_cache_invalidation {
                 "height-keyed hash cache reintroduced — parent resolution must stay content-addressed");
     }
 
+    /// Both mirrors of the applied tip publish at the durable point. Raised at the end of deferred-fx,
+    /// two awaits later, a task that stopped short left disk at h and the operating height at h-1.
+    #[test]
+    fn both_mirrors_of_the_applied_tip_publish_at_the_durable_point() {
+        // Needles built at runtime so this assertion cannot match itself.
+        let frontier = format!("LOCAL_BLOCKCHAIN_HEIGHT.{}(height", "fetch_max");
+        let operating = format!("let mut h = ctx.{}.write().await;", "height");
+        let src = include_str!("block_pipeline.rs");
+        let publish = src.find(&frontier).expect("apply publishes the frontier");
+        let ram = src.find(&operating).expect("apply publishes the operating height");
+        assert!(ram > publish && ram - publish < 400,
+                "the operating height must be published with the frontier, not at the end of deferred-fx");
+        assert_eq!(src.matches(operating.as_str()).count(), 1, "one publication point, not two");
+    }
+
     /// A node whose verify stage re-enters one height forever is FORKED, not behind: the block
     /// below it is off the network chain, so every incoming block fails the parent link and forward
     /// sync re-downloads blocks that keep failing the same check. Node 001 sat at h=272 for 21
@@ -5574,6 +5602,76 @@ mod deferred_test_support {
             height: h, raw_data: vec![0u8; raw_len], decompressed: Vec::new(),
             microblock: mb, from_peer: "sim".into(), sig_pre_verified: true,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests_branch_weight {
+    use super::*;
+    use super::deferred_test_support::decoded;
+
+    fn committee() -> std::collections::HashSet<String> {
+        (1..=6).map(|i| format!("genesis_node_{:03}", i)).collect()
+    }
+
+    /// Park a block under the parent it names; returns its own hash so a chain can be built.
+    fn park(buf: &mut HashMap<[u8; 32], Vec<(u64, DecodedBlock)>>, d: DecodedBlock) -> [u8; 32] {
+        let h = d.microblock.hash();
+        buf.entry(d.microblock.previous_hash).or_default().push((0, d));
+        h
+    }
+
+    /// Halt 684631: our tail carried a higher round (rounds rise with every failover a lone branch
+    /// suffers), the rival child carried a lower one, and vouchers counted at ONE height stayed at 1
+    /// forever — a slot has one authorised leader. 1641 reconcile attempts, every one overruled by the
+    /// protected floor. The branch above that child is the evidence a halted chain does produce.
+    #[test]
+    fn a_branch_is_weighed_by_its_distinct_committee_builders() {
+        let c = committee();
+        let rival_parent = [7u8; 32];
+        let child = decoded(101, "genesis_node_002", rival_parent, 10).microblock;
+        let ours = [9u8; 32];
+        let mut buf: HashMap<[u8; 32], Vec<(u64, DecodedBlock)>> = HashMap::new();
+
+        // Nothing above it yet: one builder, and one builder is not a quorum.
+        assert_eq!(branch_builders(&buf, &child, &c, 9), 1);
+        assert!(!tail_is_overruled(ours, 5, rival_parent, 0, 1, 2),
+                "a lower-round child alone must not move us off our tail");
+
+        // The rotation moves on and the branch grows under distinct members.
+        let mut cur = child.hash();
+        for (h, p) in [(102u64, "genesis_node_002"), (103, "genesis_node_004"), (104, "genesis_node_005")] {
+            cur = park(&mut buf, decoded(h, p, cur, 10));
+        }
+        assert_eq!(branch_builders(&buf, &child, &c, 9), 3, "002 (twice, counted once), 004, 005");
+        assert!(tail_is_overruled(ours, 5, rival_parent, 0, 3, 2),
+                "f+1 distinct committee builders overrule a higher-round tail nobody extends");
+    }
+
+    /// The rule must not be cheaper to satisfy than f+1 honest parties.
+    #[test]
+    fn one_identity_never_becomes_a_quorum() {
+        let c = committee();
+        let rival_parent = [7u8; 32];
+        let mut buf: HashMap<[u8; 32], Vec<(u64, DecodedBlock)>> = HashMap::new();
+
+        // A long branch signed by ONE producer is worth exactly one voucher.
+        let child = decoded(101, "genesis_node_002", rival_parent, 10).microblock;
+        let mut cur = child.hash();
+        for h in 102..=140u64 {
+            cur = park(&mut buf, decoded(h, "genesis_node_002", cur, 10));
+        }
+        assert_eq!(branch_builders(&buf, &child, &c, 9), 1, "one identity, however long the branch");
+        assert!(!tail_is_overruled([9u8; 32], 5, rival_parent, 0, 1, 2));
+
+        // Producers outside the committee are worth none, so f+1 keeps meaning what it means.
+        let mut outside: HashMap<[u8; 32], Vec<(u64, DecodedBlock)>> = HashMap::new();
+        let stranger = decoded(101, "super_node_ffff", rival_parent, 10).microblock;
+        let mut cur = stranger.hash();
+        for (h, p) in [(102u64, "super_node_eeee"), (103, "super_node_dddd")] {
+            cur = park(&mut outside, decoded(h, p, cur, 10));
+        }
+        assert_eq!(branch_builders(&outside, &stranger, &c, 9), 0, "non-members do not vouch");
     }
 }
 

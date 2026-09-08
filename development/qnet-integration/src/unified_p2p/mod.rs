@@ -1805,6 +1805,10 @@ static LAST_FINALIZED_ROUND_PER_MB: Lazy<Arc<DashMap<u64, u64>>> =
 /// Epoch-keyed committee cache. deterministic_eligible_ids resolves the N-2 VRF committee via a
 /// macroblock deserialize+sort+sample (O(E log E)); without caching a timeout-vote/TC flood pays
 /// that per message. Cached only for the canonical N-2 source; pruned to a few recent epochs.
+/// Macroblock-delete counter the committee memo below was built under.
+pub(super) static EPOCH_COMMITTEE_SEQ: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(u64::MAX);
+
 static EPOCH_COMMITTEE_CACHE: Lazy<Arc<DashMap<u64, Arc<std::collections::HashSet<String>>>>> =
     Lazy::new(|| Arc::new(DashMap::new()));
 
@@ -1932,7 +1936,13 @@ pub fn superseded_by_certified_round(h: u64, block_round: u64, our_hash: Option<
 /// window's body, or the parent f+1 peers build on when no checkpoint covers the height yet. A block
 /// the network names differently is off the chain whatever its round says, and so is everything above
 /// it: the floor stops just below it (protecting such a block wedged 004 on its own tip at 531136).
-pub fn round_protected_floor(rollback_to: u64, local_h: u64, load_block: impl Fn(u64) -> Option<(u64, [u8; 32])>, network_hash: impl Fn(u64) -> Option<[u8; 32]>) -> u64 {
+pub fn round_protected_floor(rollback_to: u64, local_h: u64, finalized: u64, load_block: impl Fn(u64) -> Option<(u64, [u8; 32])>, network_hash: impl Fn(u64) -> Option<[u8; 32]>) -> u64 {
+    // The floor guards an uncertified tail against a SHALLOW heuristic target. A target at the
+    // certified base is not that: everything above it is uncertified by definition, and the node is
+    // returning to certified history rather than adopting an unverified branch — sync re-verifies
+    // whatever it pulls back. Live 08.09: the deepen bottomed out at the finality floor and all 1641
+    // of its rollbacks were cancelled here, so the node replayed its own losing branch forever.
+    if rollback_to <= finalized { return rollback_to; }
     let mi = qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
     let mut floor = rollback_to;
     for h in (rollback_to + 1)..=local_h.min(rollback_to.saturating_add(2 * mi)) {
@@ -3187,6 +3197,18 @@ fn chunk_entry_bytes(e: &ShredChunkCacheEntry) -> usize {
     e.chunks.iter().chain(e.parity_chunks.iter())
         .map(|c| c.as_ref().map_or(0, |v| v.len())).sum()
 }
+
+/// Re-account an entry after its chunks changed: apply the delta, remember the new size. The only
+/// writer of the counter besides removal, so the two can never diverge.
+fn reaccount_chunk_entry(e: &mut ShredChunkCacheEntry) {
+    let now = chunk_entry_bytes(e);
+    if now >= e.accounted_bytes {
+        SHRED_CHUNK_CACHE_USED.fetch_add(now - e.accounted_bytes, std::sync::atomic::Ordering::Relaxed);
+    } else {
+        SHRED_CHUNK_CACHE_USED.fetch_sub(e.accounted_bytes - now, std::sync::atomic::Ordering::Relaxed);
+    }
+    e.accounted_bytes = now;
+}
 const SHRED_CHUNK_MAX_RETRIES: u8 = 4;              // Max retransmit attempts per block (v2.31: increased from 2 for reliability)
 #[allow(dead_code)]
 const MAX_CONCURRENT_CHUNK_SENDS: usize = 20;       // Max concurrent QUIC streams for chunk sends (v2.21.4)
@@ -3293,6 +3315,10 @@ struct ShredChunkCacheEntry {
     // spread the mix — every rebuild of it hashed wrong and was discarded, forever.
     block_hash: Option<[u8; 32]>,
     num_coding: usize,
+    /// Bytes this entry currently contributes to SHRED_CHUNK_CACHE_USED. Chunks arrive after the
+    /// entry exists, so add and remove must agree on ONE number — subtracting a recomputed, larger
+    /// size wrapped the counter (observed 17592186044262), which then kept the cache at one entry.
+    accounted_bytes: usize,
 }
 
 #[allow(dead_code)]
@@ -5121,6 +5147,37 @@ mod tests {
     // ═══════════════════════════════════════════════════════════════════════════
     
     /// Test ShredChunkCacheEntry creation and storage
+    /// The counter must come back to where it started. Chunks arrive AFTER the entry exists, so a
+    /// removal that recomputed the size subtracted more than was ever added and wrapped the atomic
+    /// (17592186044262 on genesis 001) — after which the byte ceiling was permanently exceeded and
+    /// the cache held one entry, so every block re-requested its chunks.
+    #[test]
+    fn chunk_cache_accounting_returns_to_its_starting_value() {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = LOCK.lock().unwrap();
+        let start = SHRED_CHUNK_CACHE_USED.load(std::sync::atomic::Ordering::Relaxed);
+        let mut e = ShredChunkCacheEntry {
+            chunks: vec![None; 3], parity_chunks: vec![None; 2], original_block_size: 4096,
+            is_macroblock: false, cached_at: std::time::Instant::now(),
+            block_hash: None, num_coding: 0, accounted_bytes: 0,
+        };
+        reaccount_chunk_entry(&mut e);
+        assert_eq!(SHRED_CHUNK_CACHE_USED.load(std::sync::atomic::Ordering::Relaxed), start,
+                   "an empty entry accounts for nothing");
+
+        e.chunks[0] = Some(vec![7u8; 1000]);
+        reaccount_chunk_entry(&mut e);
+        e.parity_chunks[1] = Some(vec![7u8; 500]);
+        reaccount_chunk_entry(&mut e);
+        assert_eq!(SHRED_CHUNK_CACHE_USED.load(std::sync::atomic::Ordering::Relaxed), start + 1500,
+                   "arriving chunks are accounted as they land");
+        assert_eq!(e.accounted_bytes, 1500, "and the entry remembers exactly that");
+
+        SHRED_CHUNK_CACHE_USED.fetch_sub(e.accounted_bytes, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(SHRED_CHUNK_CACHE_USED.load(std::sync::atomic::Ordering::Relaxed), start,
+                   "removal releases what was accounted, never a recomputed larger size");
+    }
+
     #[test]
     fn test_shred_chunk_cache_entry() {
         let chunks = vec![
@@ -5142,6 +5199,7 @@ mod tests {
             cached_at: std::time::Instant::now(),
             block_hash: Some([9u8; 32]),
             num_coding: 2,
+            accounted_bytes: 0,
         };
 
         assert_eq!(entry.chunks.len(), 4);
@@ -6086,18 +6144,26 @@ mod superseded_tail_tests {
         let other = [7u8; 32];
         let round1 = |h: u64| -> Option<(u64, [u8; 32])> { Some((if h > base + 5 { 1 } else { 0 }, ours)) };
         let unsealed = |_: u64| -> Option<[u8; 32]> { None };
-        assert_eq!(round_protected_floor(base + 2, base + 20, round1, unsealed), base + 20,
+        assert_eq!(round_protected_floor(base + 2, base + 20, 0, round1, unsealed), base + 20,
                    "every round-1 block is protected while round 1 is the highest certified");
-        assert_eq!(round_protected_floor(base + 2, base + 20, round1, |h| if h == base + 20 { Some(other) } else { None }), base + 19,
+        assert_eq!(round_protected_floor(base + 2, base + 20, 0, round1, |h| if h == base + 20 { Some(other) } else { None }), base + 19,
                    "a block the network names differently is not protected by its round");
-        assert_eq!(round_protected_floor(base + 2, base + 20, round1, |h| if h == base + 10 { Some(other) } else { None }), base + 9,
+        assert_eq!(round_protected_floor(base + 2, base + 20, 0, round1, |h| if h == base + 10 { Some(other) } else { None }), base + 9,
                    "the last height vouched for below the contradicted one is the floor");
-        assert_eq!(round_protected_floor(base + 2, base + 20, round1, |h| if h >= base + 6 { Some(other) } else { Some(ours) }), base + 2,
+        assert_eq!(round_protected_floor(base + 2, base + 20, 0, round1, |h| if h >= base + 6 { Some(other) } else { Some(ours) }), base + 2,
                    "a whole tail the network rejects leaves nothing protected above the walk's start");
+        // A target at or below the certified base is not a heuristic guess: nothing above finality is
+        // certified, so there is nothing here to protect. Without this the deepen bottoms out at the
+        // floor and is cancelled forever (1641 times on genesis 003, 08.09).
+        assert_eq!(round_protected_floor(base + 2, base + 20, base + 2, round1, unsealed), base + 2,
+                   "the floor yields to a rollback that returns to certified history");
+        assert_eq!(round_protected_floor(base + 2, base + 20, base + 1, round1, unsealed), base + 20,
+                   "above the certified base it still protects");
+
         certify(w, 2, &[base + 12, base + 12, base + 11]);
-        assert_eq!(round_protected_floor(base + 2, base + 20, round1, unsealed), base + 12,
+        assert_eq!(round_protected_floor(base + 2, base + 20, 0, round1, unsealed), base + 12,
                    "round-1 blocks above the round-2 quorum tip are not vouched for");
-        assert_eq!(round_protected_floor(base + 2, base + 20, |_| Some((3, ours)), unsealed), base + 2,
+        assert_eq!(round_protected_floor(base + 2, base + 20, 0, |_| Some((3, ours)), unsealed), base + 2,
                    "a round above what this node certified vouches for nothing");
     }
 }

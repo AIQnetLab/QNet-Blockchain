@@ -1343,7 +1343,7 @@ impl BlockchainNode {
             if matches!(Self::roster_mode(s, mb_index), RosterMode::Frozen) {
                 let own_seal = s.last_sealed_mb_index();
                 let peer_seal = crate::unified_p2p::sealed_frontier_with_support(
-                    committee.len().saturating_sub(1) / 3 + 1);
+                    qnet_consensus::checkpoint_bft::byzantine_f(committee.len()) + 1);
                 if peer_seal > own_seal {
                     p2p.request_window_anchor(mb_index);
                     crate::sync_manager::nudge_sync_check();

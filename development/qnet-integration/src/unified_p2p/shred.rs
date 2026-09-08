@@ -1045,6 +1045,7 @@ impl SimplifiedP2P {
                         cached_at: Instant::now(),
                         block_hash: chunk.block_hash,
                         num_coding: chunk.num_coding_shreds,
+                        accounted_bytes: 0,
                     }
                 });
 
@@ -1079,6 +1080,9 @@ impl SimplifiedP2P {
                     cache_entry.chunks[chunk.chunk_index] = Some(chunk.data.clone());
                 }
             }
+            // Chunks arrive AFTER the entry exists; without this the byte ceiling never saw the
+            // receive path and removal subtracted bytes that were never added.
+            super::reaccount_chunk_entry(&mut cache_entry);
         }
         
         // v26 D4b: CERT-PRESENCE gate (decoupled from raw chunk #0).
@@ -2308,11 +2312,11 @@ impl SimplifiedP2P {
                 None => break,
             }
         }
-        if let Some((_, old)) = self.shred_chunk_cache.remove(&height) {
-            super::SHRED_CHUNK_CACHE_USED.fetch_sub(super::chunk_entry_bytes(&old), std::sync::atomic::Ordering::Relaxed);
-        }
+        self.drop_chunk_cache_entry(height);
         super::SHRED_CHUNK_CACHE_USED.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
-        self.shred_chunk_cache.insert(height, ShredChunkCacheEntry {
+        // insert() returns whatever a concurrent receive put back between the drop and here; its
+        // bytes are still on the counter.
+        let displaced = self.shred_chunk_cache.insert(height, ShredChunkCacheEntry {
             chunks,
             parity_chunks,
             original_block_size,
@@ -2320,13 +2324,17 @@ impl SimplifiedP2P {
             cached_at: Instant::now(),
             block_hash,
             num_coding,
+            accounted_bytes: bytes,
         });
+        if let Some(old) = displaced {
+            super::SHRED_CHUNK_CACHE_USED.fetch_sub(old.accounted_bytes, std::sync::atomic::Ordering::Relaxed);
+        }
     }
-    
-    /// Remove one cached height and release its bytes.
+
+    /// Remove one cached height and release exactly the bytes it was accounted for.
     pub(super) fn drop_chunk_cache_entry(&self, height: u64) {
         if let Some((_, e)) = self.shred_chunk_cache.remove(&height) {
-            super::SHRED_CHUNK_CACHE_USED.fetch_sub(super::chunk_entry_bytes(&e), std::sync::atomic::Ordering::Relaxed);
+            super::SHRED_CHUNK_CACHE_USED.fetch_sub(e.accounted_bytes, std::sync::atomic::Ordering::Relaxed);
         }
     }
 

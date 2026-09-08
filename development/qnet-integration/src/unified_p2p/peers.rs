@@ -1306,11 +1306,12 @@ impl SimplifiedP2P {
                 // the minority side — the one thing a diverged node cannot learn from its own state.
                 // Action is a pull, never a rollback: fork choice stays the sole canonical authority.
                 if let Ok(Some(ours)) = storage.load_microblock_hash(block_height) {
-                    if ours != hash && backing >= roster.len() / 3 + 1
+                    let need = qnet_consensus::checkpoint_bft::byzantine_f(roster.len()) + 1;
+                    if ours != hash && backing >= need
                         && block_attestation_count(block_height, &ours) == 0 {
                         if crate::node::is_warn() {
                             println!("[WARN][ATTEST] branch_unattested h={} rival_backing={} need={} action=reconcile",
-                                     block_height, backing, roster.len() / 3 + 1);
+                                     block_height, backing, need);
                         }
                         self.request_window_anchor(window);
                     }
@@ -2387,30 +2388,10 @@ impl SimplifiedP2P {
                     let _ = s.save_light_ping_keys(&node_id, &ping_pubkey, &ping_delegation_cert);
                 }
 
-                // Store in local registry with LRU eviction
+                // Store in local registry (cap, eviction and trimming live in the shared admission).
                 {
                     let mut registry = self.light_node_registry.write();
-
-                    // Role-based cap; evict inactive-first (then oldest) so live nodes are never
-                    // dropped while dead entries remain.
-                    let cap = light_registry_cap();
-                    if registry.len() >= cap {
-                        let evict_count = cap / 10;
-                        let mut entries: Vec<_> = registry.iter()
-                            .map(|(k, v)| (k.clone(), v.is_active, v.registered_at))
-                            .collect();
-                        entries.sort_by_key(|(_, active, ts)| (*active, *ts));
-
-                        for (key, _, _) in entries.into_iter().take(evict_count) {
-                            registry.remove(&key);
-                        }
-                        if crate::node::is_info() {
-                            println!("[INFO][P2P] registry_evicted count={} cap={}", evict_count, cap);
-                        }
-                    }
-                    
-                    // Trimmed resident entry — heavy crypto lives in the VRF/ping-key CFs (read on demand).
-                    registry.insert(node_id.clone(), LightNodeRegistrationData {
+                    super::propagation::admit_light_registration(&mut registry, LightNodeRegistrationData {
                         node_id: node_id.clone(),
                         wallet_address: wallet_address.clone(),
                         device_token_hash: String::new(),
@@ -2426,7 +2407,7 @@ impl SimplifiedP2P {
                         ping_delegation_cert: String::new(),
                     });
                 }
-                
+
                 if crate::node::is_info() {
                     println!("[INFO][GOSSIP] light_node_accepted node={} hop={} dilithium=ok", node_id, gossip_hop);
                 }
@@ -2458,21 +2439,58 @@ impl SimplifiedP2P {
                     println!("[INFO][SYNC] Light node registry request from {} (since {})", requester_id, last_sync_timestamp);
                 }
                 
-                // Collect registrations newer than or equal to last_sync_timestamp
-                // FIX: Use >= to include nodes registered at exactly last_sync_timestamp
-                let registrations: Vec<LightNodeRegistrationData> = {
-                    let registry = self.light_node_registry.read();
-                    registry.values()
-                        .filter(|r| r.registered_at >= last_sync_timestamp)
-                        .cloned()
-                        .collect()
+                // The serve is a full pass over the registry, so it is gated the way the response
+                // side is — consensus-tier peers only — and rate-limited on the PEER, not on the id
+                // the requester puts in the message, which it can rotate for free. The client asks
+                // every 10 slots; one serve a minute is above what it needs and bounds the walk.
+                if !requester_id.starts_with("genesis_node_")
+                    && !self.active_full_super_nodes.contains_key(&requester_id) {
+                    if crate::node::is_warn() {
+                        println!("[WARN][SYNC] light_registry_request_unauthenticated requester={} action=drop", requester_id);
+                    }
+                    return;
+                }
+                if self.is_consensus_rate_limited(from_peer, "light_registry", 3) {
+                    return;
+                }
+                let reply_to = match self.get_peer_address_for_heartbeat(&requester_id) {
+                    Some(a) => a,
+                    None => return, // unroutable requester: the walk below would be pure waste
                 };
-                
-                let total_count = {
+
+                // BOUNDED serve: the requester controls `last_sync_timestamp` and 0 means "everything",
+                // which cloned the whole registry under the read lock — multi-GB at 10M light nodes, and
+                // any authenticated peer could ask three at a time. Completeness comes from the committed
+                // node_registry on boot, so a page is the right answer here. Oldest-first, so the
+                // requester's watermark advances; `total_count` says what remains.
+                const LIGHT_REGISTRY_SYNC_PAGE: usize = 1000;
+                let (registrations, total_count, matched) = {
                     let registry = self.light_node_registry.read();
-                    registry.len() as u64
+                    // One pass, O(page) memory: a max-heap of the oldest LIGHT_REGISTRY_SYNC_PAGE keys.
+                    // `peek` rejects a candidate without allocating, so the walk clones ~page*ln(N/page)
+                    // ids, not N of them.
+                    let mut heap: std::collections::BinaryHeap<(u64, String)> = std::collections::BinaryHeap::new();
+                    let mut matched = 0u64;
+                    for r in registry.values().filter(|r| r.registered_at >= last_sync_timestamp) {
+                        matched += 1;
+                        if heap.len() >= LIGHT_REGISTRY_SYNC_PAGE {
+                            match heap.peek() {
+                                Some(w) if (r.registered_at, r.node_id.as_str()) < (w.0, w.1.as_str()) => { heap.pop(); }
+                                _ => continue,
+                            }
+                        }
+                        heap.push((r.registered_at, r.node_id.clone()));
+                    }
+                    let out: Vec<LightNodeRegistrationData> = heap.into_iter()
+                        .filter_map(|(_, id)| registry.get(&id).cloned())
+                        .collect();
+                    (out, registry.len() as u64, matched)
                 };
-                
+                if matched > LIGHT_REGISTRY_SYNC_PAGE as u64 && crate::node::is_info() {
+                    println!("[INFO][SYNC] light_registry_page sent={} matched={} requester={} reason=page_cap",
+                             registrations.len(), matched, requester_id);
+                }
+
                 // Send response
                 let response = NetworkMessage::LightNodeRegistryResponse {
                     sender_id: self.node_id.clone(),
@@ -2480,9 +2498,7 @@ impl SimplifiedP2P {
                     total_count,
                 };
                 
-                if let Some(peer_addr) = self.get_peer_address_for_heartbeat(&requester_id) {
-                    self.send_network_message(&peer_addr, response);
-                }
+                self.send_network_message(&reply_to, response);
             }
             
             // PRODUCTION: Light Node registry sync response
@@ -2534,16 +2550,18 @@ impl SimplifiedP2P {
                              sender_id, registrations.len(), total_count);
                 }
 
-                // Merge into local registry. The pre-existing dedup-by-
-                // `node_id` plus the upstream `MAX_LIGHT_NODE_REGISTRY` cap
-                // jointly bound memory and prevent overwrite of an entry
-                // already known to this node.
+                // Shared admission: dedup by node_id, role cap, trimmed entry. The raw insert this
+                // replaces honoured none of them — a synced entry kept the sender's full crypto payload
+                // and could push the map past the cap without evicting.
                 let mut added = 0;
                 {
                     let mut registry = self.light_node_registry.write();
+                    // Once for the whole page: the eviction scan is the expensive part.
+                    super::propagation::make_room_for(&mut registry, registrations.len());
                     for reg in registrations {
+                        // An entry already known here is never overwritten by a peer.
                         if !registry.contains_key(&reg.node_id) {
-                            registry.insert(reg.node_id.clone(), reg);
+                            super::propagation::admit_light_registration(&mut registry, reg);
                             added += 1;
                         }
                     }
