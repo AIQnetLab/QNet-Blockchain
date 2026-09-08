@@ -4352,6 +4352,15 @@ impl BlockPipeline {
                     if !burn_tx.is_empty() {
                         let _ = ctx.storage.committed_burn_wallet_put(burn_tx, node_id);
                     }
+                    // The resident light registry follows the same apply-Ok set. registered_at is the
+                    // slot-anchored block time, so every node stores the same value.
+                    if type_str == "light" {
+                        if let Some(ref p2p) = ctx.unified_p2p {
+                            let ts = crate::node::expected_block_timestamp(
+                                crate::node::genesis_timestamp(&ctx.storage), height);
+                            p2p.admit_light_from_chain(node_id, wallet, ts);
+                        }
+                    }
                 }
                 // Registration-origin markers, the dedup reseed source. The producer stamps these inline;
                 // without the mirror here a validator rebuilds an incomplete dedup map after any restart
@@ -5602,6 +5611,30 @@ mod deferred_test_support {
             height: h, raw_data: vec![0u8; raw_len], decompressed: Vec::new(),
             microblock: mb, from_peer: "sim".into(), sig_pre_verified: true,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests_chain_fed_light_registry {
+    /// The resident light registry follows the chain: the apply path that writes the durable registry
+    /// row also admits the entry in RAM, from the same apply-Ok set. Before this the map was fed only
+    /// by gossip, by this node's own RPC and by a boot restore - so a node that missed the gossip did
+    /// not learn about a light node until it restarted, and a bulk peer-to-peer reconciliation existed
+    /// to paper over that, at a full pass over the registry per request.
+    #[test]
+    fn apply_admits_light_registrations_and_no_peer_is_asked_for_them() {
+        let src = include_str!("block_pipeline.rs");
+        let durable = src.find("deferred_registrations").expect("apply writes the durable registry row");
+        let resident = src.find("admit_light_from_chain").expect("apply admits into the resident registry");
+        assert!(resident > durable && resident - durable < 3000,
+                "the RAM admit belongs to the same apply-Ok set as the durable row");
+
+        // Built at runtime so this assertion cannot match itself.
+        let retired = format!("request_light_node_registry{}", "_sync");
+        let prop = include_str!("unified_p2p/propagation.rs");
+        assert!(!prop.contains(&retired), "nothing asks a peer for the registry any more");
+        let peers = include_str!("unified_p2p/peers.rs");
+        assert!(!peers.contains("LIGHT_REGISTRY_SYNC_PAGE"), "and nothing serves it");
     }
 }
 

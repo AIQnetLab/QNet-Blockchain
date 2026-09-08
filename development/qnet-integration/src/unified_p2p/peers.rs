@@ -2391,7 +2391,7 @@ impl SimplifiedP2P {
                 // Store in local registry (cap, eviction and trimming live in the shared admission).
                 {
                     let mut registry = self.light_node_registry.write();
-                    super::propagation::admit_light_registration(&mut registry, LightNodeRegistrationData {
+                    self.admit_light(&mut registry, LightNodeRegistrationData {
                         node_id: node_id.clone(),
                         wallet_address: wallet_address.clone(),
                         device_token_hash: String::new(),
@@ -2433,74 +2433,19 @@ impl SimplifiedP2P {
             }
             
             // PRODUCTION: Light Node registry sync request
+            // Retired. Serving this meant a full pass over the registry per request - ten million
+            // entries under the read lock to hand back a page - and it existed only because the resident
+            // registry was not fed by block apply. It is now (admit_light_from_chain), so a peer can
+            // derive everything here from the chain. Accepted and ignored so a peer still on the
+            // previous binary is not left retrying; the message itself goes at the next fresh genesis.
             NetworkMessage::LightNodeRegistryRequest { requester_id, last_sync_timestamp } => {
                 self.update_peer_last_seen(from_peer);
-                if crate::node::is_info() {
-                    println!("[INFO][SYNC] Light node registry request from {} (since {})", requester_id, last_sync_timestamp);
+                if crate::node::is_debug() {
+                    println!("[DBG][SYNC] light_registry_request_retired from={} since={}",
+                             requester_id, last_sync_timestamp);
                 }
-                
-                // The serve is a full pass over the registry, so it is gated the way the response
-                // side is — consensus-tier peers only — and rate-limited on the PEER, not on the id
-                // the requester puts in the message, which it can rotate for free. The client asks
-                // every 10 slots; one serve a minute is above what it needs and bounds the walk.
-                if !requester_id.starts_with("genesis_node_")
-                    && !self.active_full_super_nodes.contains_key(&requester_id) {
-                    if crate::node::is_warn() {
-                        println!("[WARN][SYNC] light_registry_request_unauthenticated requester={} action=drop", requester_id);
-                    }
-                    return;
-                }
-                if self.is_consensus_rate_limited(from_peer, "light_registry", 3) {
-                    return;
-                }
-                let reply_to = match self.get_peer_address_for_heartbeat(&requester_id) {
-                    Some(a) => a,
-                    None => return, // unroutable requester: the walk below would be pure waste
-                };
-
-                // BOUNDED serve: the requester controls `last_sync_timestamp` and 0 means "everything",
-                // which cloned the whole registry under the read lock — multi-GB at 10M light nodes, and
-                // any authenticated peer could ask three at a time. Completeness comes from the committed
-                // node_registry on boot, so a page is the right answer here. Oldest-first, so the
-                // requester's watermark advances; `total_count` says what remains.
-                const LIGHT_REGISTRY_SYNC_PAGE: usize = 1000;
-                let (registrations, total_count, matched) = {
-                    let registry = self.light_node_registry.read();
-                    // One pass, O(page) memory: a max-heap of the oldest LIGHT_REGISTRY_SYNC_PAGE keys.
-                    // `peek` rejects a candidate without allocating, so the walk clones ~page*ln(N/page)
-                    // ids, not N of them.
-                    let mut heap: std::collections::BinaryHeap<(u64, String)> = std::collections::BinaryHeap::new();
-                    let mut matched = 0u64;
-                    for r in registry.values().filter(|r| r.registered_at >= last_sync_timestamp) {
-                        matched += 1;
-                        if heap.len() >= LIGHT_REGISTRY_SYNC_PAGE {
-                            match heap.peek() {
-                                Some(w) if (r.registered_at, r.node_id.as_str()) < (w.0, w.1.as_str()) => { heap.pop(); }
-                                _ => continue,
-                            }
-                        }
-                        heap.push((r.registered_at, r.node_id.clone()));
-                    }
-                    let out: Vec<LightNodeRegistrationData> = heap.into_iter()
-                        .filter_map(|(_, id)| registry.get(&id).cloned())
-                        .collect();
-                    (out, registry.len() as u64, matched)
-                };
-                if matched > LIGHT_REGISTRY_SYNC_PAGE as u64 && crate::node::is_info() {
-                    println!("[INFO][SYNC] light_registry_page sent={} matched={} requester={} reason=page_cap",
-                             registrations.len(), matched, requester_id);
-                }
-
-                // Send response
-                let response = NetworkMessage::LightNodeRegistryResponse {
-                    sender_id: self.node_id.clone(),
-                    registrations,
-                    total_count,
-                };
-                
-                self.send_network_message(&reply_to, response);
             }
-            
+
             // PRODUCTION: Light Node registry sync response
             NetworkMessage::LightNodeRegistryResponse { sender_id, registrations, total_count } => {
                 self.update_peer_last_seen(from_peer);
@@ -2561,7 +2506,7 @@ impl SimplifiedP2P {
                     for reg in registrations {
                         // An entry already known here is never overwritten by a peer.
                         if !registry.contains_key(&reg.node_id) {
-                            super::propagation::admit_light_registration(&mut registry, reg);
+                            self.admit_light(&mut registry, reg);
                             added += 1;
                         }
                     }

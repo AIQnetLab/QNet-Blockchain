@@ -5667,6 +5667,12 @@ impl BlockchainNode {
                         let _ = storage.save_node_registration_at_height_burn_vrf(
                             rid, rtype, rwallet, 1.0, next_block_height, rburn, rpk.as_deref());
                         if !rburn.is_empty() { let _ = storage.committed_burn_wallet_put(rburn, rid); }
+                        // Mirror of the validator: the resident light registry follows the same set.
+                        if rtype == "light" {
+                            if let Some(ref p2p) = unified_p2p {
+                                p2p.admit_light_from_chain(rid, rwallet, deterministic_timestamp);
+                            }
+                        }
                     }
                     // Keyed maps, so their order is free — kept out of the ordered stamp above rather
                     // than re-derived inside it.

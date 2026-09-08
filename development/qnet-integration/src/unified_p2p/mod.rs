@@ -44,12 +44,19 @@ pub(crate) use futures::future;
 const MAX_LIGHT_NODE_REGISTRY_SIZE: usize = 100_000;
 const MAX_LIGHT_NODE_REGISTRY_SIZE_GENESIS: usize = 10_000_000;
 
+/// Whether this node owns light-shard ping duty. One definition, read once: the registry cap, the
+/// ping loop and the ping index all key on it, and a node that answers false here never maintains a
+/// ping bucket, so it must not accumulate work for one.
+pub(super) fn is_genesis_pinger() -> bool {
+    static IS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *IS.get_or_init(|| std::env::var("QNET_BOOTSTRAP_ID")
+        .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
+        .unwrap_or(false))
+}
+
 /// Registry capacity for THIS node's role.
 fn light_registry_cap() -> usize {
-    let is_genesis = std::env::var("QNET_BOOTSTRAP_ID")
-        .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
-        .unwrap_or(false);
-    if is_genesis { MAX_LIGHT_NODE_REGISTRY_SIZE_GENESIS } else { MAX_LIGHT_NODE_REGISTRY_SIZE }
+    if is_genesis_pinger() { MAX_LIGHT_NODE_REGISTRY_SIZE_GENESIS } else { MAX_LIGHT_NODE_REGISTRY_SIZE }
 }
 
 /// Max attestations in RAM (24h window, auto-cleanup).
@@ -2989,7 +2996,13 @@ pub struct SimplifiedP2P {
     /// Rebuilt only on window/size change ⇒ ping selection is O(bucket)/tick, not O(N log N) clone+sort of
     /// the whole registry every tick — scales the 5-genesis pinger to millions of light nodes.
     /// (window, registry size, per-slot buckets, bitmask of the shards those buckets cover)
-    light_ping_slot_cache: Arc<RwLock<(u64, usize, Vec<Vec<String>>, usize)>>,
+    /// Per-slot ping buckets: (window, 240 buckets, covered shard mask). An INDEX over the light
+    /// registry, so it is maintained, not rebuilt: only a change in what the slot is DERIVED from — the
+    /// window (the slot is re-randomised per window) or the covered shards — costs a full pass.
+    light_ping_slot_cache: Arc<RwLock<(u64, Vec<Vec<String>>, usize)>>,
+    /// Light nodes admitted since the last ping slot, waiting to be placed in their bucket. Keyed on
+    /// nothing: the ping loop is the only reader and it knows the window and the mask.
+    light_ping_pending: Arc<RwLock<Vec<String>>>,
 
 
     /// PRODUCTION: Storage reference for persistent heartbeat storage
@@ -3400,7 +3413,8 @@ impl SimplifiedP2P {
             
             // PRODUCTION: Light Node registry for gossip sync
             light_node_registry: Arc::new(RwLock::new(HashMap::new())),
-            light_ping_slot_cache: Arc::new(RwLock::new((u64::MAX, 0, Vec::new(), 0))),
+            light_ping_slot_cache: Arc::new(RwLock::new((u64::MAX, Vec::new(), 0))),
+            light_ping_pending: Arc::new(RwLock::new(Vec::new())),
 
             // PRODUCTION: Heartbeat history for reward eligibility
             storage: storage, // v2.76: Storage for persistent heartbeat storage

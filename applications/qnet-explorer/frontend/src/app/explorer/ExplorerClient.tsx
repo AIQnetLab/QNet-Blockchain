@@ -269,9 +269,6 @@ export default function ExplorerClient({ initialData, initialHeight, initialTota
         <h1>Quantum Blockchain Explorer</h1>
         <p suppressHydrationWarning>
           All transactions from Genesis to Now • Block Height: {heightLabel || '...'}
-          {mounted && (
-            <span className={`live-dot ${head.connected ? 'on' : 'off'}`} title={head.connected ? 'live' : 'reconnecting'} style={{ marginLeft: 8, display: 'inline-block', width: 8, height: 8, borderRadius: 4, background: head.connected ? '#7CFFB2' : '#7fa8b0', verticalAlign: 'middle' }} />
-          )}
         </p>
       </div>
 

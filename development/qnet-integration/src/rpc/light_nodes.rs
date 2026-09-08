@@ -2749,11 +2749,10 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
             // ================================================================
             // SYNC: Request registry updates periodically
             // ================================================================
-            if current_slot % 10 == 0 {  // Every 10 minutes
-                if let Some(p2p) = blockchain_for_pings.get_unified_p2p() {
-                    p2p.request_light_node_registry_sync();
-                }
-            }
+            // The periodic bulk registry sync is gone: the resident registry is fed by block apply
+            // (admit_light_from_chain), so it is a function of the chain rather than of a peer-to-peer
+            // reconciliation that cost a full registry pass per request.
+            let _ = current_slot;
         }
     });
     

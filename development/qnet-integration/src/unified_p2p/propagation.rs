@@ -7,20 +7,38 @@ use super::*;
 /// re-evaluates instead of inheriting the previous owner's verdict.
 static SHARD_SWEEP_STATE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
 
+/// Place newly admitted light nodes into their ping-slot buckets. Returns how many were placed —
+/// a node outside the shards we cover belongs to no bucket of ours. Pure, so the invariant "a node
+/// admitted between rebuilds is pingable in its slot" is testable without a live node.
+pub(super) fn index_new_light_nodes(
+    buckets: &mut [Vec<String>],
+    ids: Vec<String>,
+    window: u64,
+    covered_mask: usize,
+) -> usize {
+    let mut placed = 0usize;
+    for id in ids {
+        if covered_mask & (1 << crate::node::light_shard_of(&id)) == 0 { continue; }
+        let slot = SimplifiedP2P::calculate_randomized_slot(&id, window) as usize;
+        if let Some(b) = buckets.get_mut(slot) { b.push(id); placed += 1; }
+    }
+    placed
+}
+
 /// Single admission point for the resident light registry: role cap with inactive-first eviction plus
 /// the trimmed entry (heavy crypto lives in the VRF/ping-key CFs). Gossip and bulk sync both pass here.
 /// Caller holds the write lock, so a bulk merge takes it once.
 pub(super) fn admit_light_registration(
     registry: &mut std::collections::HashMap<String, LightNodeRegistrationData>,
     reg: LightNodeRegistrationData,
-) {
+) -> bool {
     make_room_for(registry, 1);
     registry.insert(reg.node_id.clone(), LightNodeRegistrationData {
         quantum_pubkey: String::new(), signature: String::new(),
         ping_pubkey: String::new(), ping_delegation_cert: String::new(),
         device_token_hash: String::new(),
         ..reg
-    });
+    }).is_none()
 }
 
 /// Free space for `incoming` new entries if the role cap needs it. Separate from admission because a
@@ -57,6 +75,75 @@ pub(super) fn make_room_for(
 }
 
 impl SimplifiedP2P {
+    /// Admit into the registry and keep the ping index in step. Every writer of the resident registry
+    /// goes through here, so a node is pingable from the slot after the one that admitted it without
+    /// anything being rebuilt. Caller holds the registry write lock; this takes the pending queue
+    /// after it, the same order the ping loop uses (registry, then index).
+    pub(super) fn admit_light(
+        &self,
+        registry: &mut std::collections::HashMap<String, LightNodeRegistrationData>,
+        reg: LightNodeRegistrationData,
+    ) -> bool {
+        let id = reg.node_id.clone();
+        let is_new = admit_light_registration(registry, reg);
+        if is_new { self.queue_for_ping_index(id); }
+        is_new
+    }
+
+    /// Queue a newly admitted id for placement in the ping index, bounded. Only a node with ping duty
+    /// drains this; on any other node it would grow with every registration and never shrink. Past the
+    /// cap the queue is dropped and the index marked stale, so the next slot that DOES run rebuilds
+    /// from the registry - correct either way, and the memory is bounded on every node type.
+    fn queue_for_ping_index(&self, id: String) {
+        const PENDING_MAX: usize = 50_000;
+        // Only the ping loop drains this, and only a shard owner runs it. Anywhere else the queue has
+        // no reader, so queuing would retain an id per registration for the life of the process - at
+        // ten million light nodes, a gigabyte of heap that is written and never read.
+        if !is_genesis_pinger() { return; }
+        let mut q = self.light_ping_pending.write();
+        if q.len() >= PENDING_MAX {
+            q.clear();
+            drop(q);
+            self.light_ping_slot_cache.write().0 = u64::MAX; // force a full pass on the next slot
+            return;
+        }
+        q.push(id);
+    }
+
+    /// Admit a light node the chain just registered. The resident registry is otherwise fed only by
+    /// this node's own RPC, by gossip and by a boot restore — so a node that missed the gossip did not
+    /// learn about it until it restarted, and a bulk P2P reconciliation existed to paper over that.
+    /// Derived from the applied block instead, the registry is a function of the chain continuously,
+    /// and gossip is only a latency optimisation.
+    pub fn admit_light_from_chain(&self, node_id: &str, wallet: &str, registered_at: u64) {
+        let mut registry = self.light_node_registry.write();
+        // The chain wins over gossip for the fields the chain decides. A gossiped entry carries the
+        // sender's own wallet and timestamp; leaving it in place would let a peer's claim outlive the
+        // committed one. Local fields (push type, last_seen) are not the chain's to set, and an entry
+        // whose registration is later rolled back is left behind - the boot restore reconciles it, so
+        // this map is a superset of the chain, never a subset.
+        if let Some(e) = registry.get_mut(node_id) {
+            e.wallet_address = wallet.to_string();
+            e.registered_at = registered_at;
+            return;
+        }
+        self.admit_light(&mut registry, LightNodeRegistrationData {
+            node_id: node_id.to_string(),
+            wallet_address: wallet.to_string(),
+            device_token_hash: String::new(),
+            quantum_pubkey: String::new(),
+            registered_at,
+            signature: String::new(),
+            push_type: PushType::Polling,
+            unified_push_endpoint: None,
+            last_seen: registered_at,
+            consecutive_failures: 0,
+            is_active: true,
+            ping_pubkey: String::new(),
+            ping_delegation_cert: String::new(),
+        });
+    }
+
     /// Track blocks without ping commitment for monitoring
     /// Uses thread-local static for simplicity (no struct modification needed)
     pub fn increment_missing_commitment_count(&self) -> u64 {
@@ -1603,7 +1690,7 @@ impl SimplifiedP2P {
         }
         {
             let mut registry = self.light_node_registry.write();
-            admit_light_registration(&mut registry, registration.clone());
+            self.admit_light(&mut registry, registration.clone());
         }
 
         // Gossip to network — the FULL `registration` values (below), NOT the trimmed resident entry.
@@ -1688,10 +1775,12 @@ impl SimplifiedP2P {
                 break;
             }
             if !registry.contains_key(&node_id) {
+                // Through the shared admission like every other writer, so the trimming, the cap and
+                // the ping index cannot diverge between the paths that fill this map.
                 // B: liveness is derived from on-chain attestation recency, not a persisted flag — seed
                 // active; the ping-wakeup scheduler re-derives whom to wake from committed eligibility.
-                registry.insert(node_id.clone(), LightNodeRegistrationData {
-                    node_id,
+                self.admit_light(&mut registry, LightNodeRegistrationData {
+                    node_id: node_id.clone(),
                     wallet_address,
                     device_token_hash: String::new(),
                     quantum_pubkey: String::new(),
@@ -1753,34 +1842,6 @@ impl SimplifiedP2P {
         }
     }
 
-    /// Request Light Node registry sync from peers
-    pub fn request_light_node_registry_sync(&self) {
-        let _now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        
-        // Get oldest registration timestamp we have
-        let last_sync = {
-            let registry = self.light_node_registry.read();
-            registry.values()
-                .map(|r| r.registered_at)
-                .max()
-                .unwrap_or(0)
-        };
-        
-        let request = NetworkMessage::LightNodeRegistryRequest {
-            requester_id: self.node_id.clone(),
-            last_sync_timestamp: last_sync,
-        };
-        
-        // Request from 3 random peers
-        self.gossip_to_random_peers(request, 3);
-        if crate::node::is_info() {
-            println!("[INFO][SYNC] Requested Light node registry sync (since {})", last_sync);
-        }
-    }
-    
     // ========================================================================
     // PRODUCTION: Sharded Light Node Ping System
     // ========================================================================
@@ -1959,10 +2020,7 @@ impl SimplifiedP2P {
         let mut result = Vec::new();
 
         // v2.89: ONLY Genesis nodes ping Light nodes (5 fixed shard owners, always online).
-        let is_genesis_node = std::env::var("QNET_BOOTSTRAP_ID")
-            .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
-            .unwrap_or(false);
-        if !is_genesis_node { return result; }
+        if !is_genesis_pinger() { return result; }
         let our_genesis_idx = std::env::var("QNET_BOOTSTRAP_ID")
             .ok().and_then(|id| id.parse::<usize>().ok())
             .map(|id| id.saturating_sub(1)).unwrap_or(0);
@@ -2047,25 +2105,45 @@ impl SimplifiedP2P {
             s
         };
         let recovering = state == 1;
-        let registry = self.light_node_registry.read();
+        let mut registry = self.light_node_registry.read();
         let reg_len = registry.len();
 
-        // Rebuild the per-slot buckets only when the window rolls, the registry size changes, or the set
-        // of shards we cover changes. Stable hash-shard (light_shard_of) — roster-size-independent, so a
-        // node's owning shard NEVER changes as the registry grows (no mid-epoch reshard) and it matches
-        // the committed bitmap's shard exactly. O(N) once per window.
+        // A full pass ONLY when what the slot is derived from changes: the window (the slot is
+        // re-randomised per window, deliberately) or the set of shards we cover. Keying it on the
+        // registry SIZE as well meant one registration rebuilt everything — at ten million light nodes
+        // that is ten million id clones under this read lock, on a slot that fires every minute.
+        // Stable hash-shard (light_shard_of): a node's shard never moves as the registry grows.
         let need_rebuild = {
             let c = self.light_ping_slot_cache.read();
-            c.0 != current_window || c.1 != reg_len || c.3 != covered_mask
+            c.0 != current_window || c.2 != covered_mask
         };
         if need_rebuild {
+            // The id snapshot AND the pending queue are taken together, under the read lock that
+            // excludes every writer. That is what makes them consistent: the queue is only ever filled
+            // by a writer holding the WRITE lock, so nothing can be admitted between the two, and the
+            // snapshot therefore already contains every queued id. Clearing after releasing the lock
+            // would drop whatever was admitted in the gap - present in neither the buckets nor the
+            // queue. Hashing and bucketing run outside the lock, so block apply, which admits under
+            // the write lock, is not held behind the part that does not need the map.
+            let ours: Vec<String> = registry.keys()
+                .filter(|id| covered_mask & (1 << crate::node::light_shard_of(id)) != 0)
+                .cloned().collect();
+            drop(std::mem::take(&mut *self.light_ping_pending.write()));
+            drop(registry);
             let mut buckets: Vec<Vec<String>> = vec![Vec::new(); 240];
-            for id in registry.keys() {
-                if covered_mask & (1 << crate::node::light_shard_of(id)) == 0 { continue; }
-                let slot = Self::calculate_randomized_slot(id, current_window) as usize;
-                buckets[slot].push(id.clone());
+            index_new_light_nodes(&mut buckets, ours, current_window, covered_mask);
+            *self.light_ping_slot_cache.write() = (current_window, buckets, covered_mask);
+            registry = self.light_node_registry.read();
+        } else {
+            // Everything admitted since the last slot, placed in O(new).
+            let newly = std::mem::take(&mut *self.light_ping_pending.write());
+            if !newly.is_empty() {
+                let mut c = self.light_ping_slot_cache.write();
+                let placed = index_new_light_nodes(&mut c.1, newly, current_window, covered_mask);
+                if placed > 0 && crate::node::is_debug() {
+                    println!("[DBG][GENESIS-PING] slot_index_extended placed={} epoch={}", placed, current_window);
+                }
             }
-            *self.light_ping_slot_cache.write() = (current_window, reg_len, buckets, covered_mask);
         }
 
         // Read the 3 grace slots {cur, cur-1, cur-2} (mod 240). B: wake only plausibly-live nodes —
@@ -2081,7 +2159,7 @@ impl SimplifiedP2P {
         let cache = self.light_ping_slot_cache.read();
         for g in 0..=2u64 {
             let s = ((current_slot + 240 - g) % 240) as usize;
-            for node_id in cache.2.get(s).into_iter().flatten() {
+            for node_id in cache.1.get(s).into_iter().flatten() {
                 let node = match registry.get(node_id) { Some(n) => n, None => continue };
                 if this_epoch(node_id) { continue; }  // already attested this epoch — nothing to wake
                 let fresh = now_secs.saturating_sub(node.registered_at) < WAKE_GRACE_EPOCHS * 14400;
@@ -2944,5 +3022,53 @@ impl SimplifiedP2P {
     pub fn get_light_node_wallet(&self, node_id: &str) -> Option<String> {
         let registry = self.light_node_registry.read();
         registry.get(node_id).map(|r| r.wallet_address.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests_ping_slot_index {
+    use super::*;
+
+    /// A node admitted between rebuilds must be pingable in its slot without a rebuild. The index was
+    /// keyed on the registry SIZE, so one registration rebuilt all 240 buckets - at ten million light
+    /// nodes, ten million id clones under the read lock, on a loop that runs every slot.
+    #[test]
+    fn a_node_admitted_between_rebuilds_lands_in_its_slot() {
+        let ids: Vec<String> = (0..40).map(|i| format!("light_{:04}", i)).collect();
+        let window = 47u64;
+
+        // Every shard covered: every id is placed, each in the slot the ping loop will read.
+        let mut buckets: Vec<Vec<String>> = vec![Vec::new(); 240];
+        assert_eq!(index_new_light_nodes(&mut buckets, ids.clone(), window, 0b11111), ids.len());
+        for id in &ids {
+            let s = SimplifiedP2P::calculate_randomized_slot(id, window) as usize;
+            assert!(buckets[s].contains(id), "{} missing from slot {}", id, s);
+        }
+
+        // One shard covered: exactly that shard's ids belong to our buckets, and nothing else.
+        let expect = ids.iter().filter(|id| crate::node::light_shard_of(id) == 0).count();
+        assert!(expect > 0 && expect < ids.len(), "the fixture must exercise both sides");
+        let mut only_shard0: Vec<Vec<String>> = vec![Vec::new(); 240];
+        assert_eq!(index_new_light_nodes(&mut only_shard0, ids.clone(), window, 0b00001), expect);
+
+        // The slot is re-randomised per window on purpose, which is why a window roll is the one
+        // thing that still costs a full pass.
+        let moved = ids.iter().filter(|id|
+            SimplifiedP2P::calculate_randomized_slot(id, window)
+                != SimplifiedP2P::calculate_randomized_slot(id, window + 1)).count();
+        assert!(moved > 0, "a new window must move slots, or rebuilding on one would be pointless");
+    }
+
+    /// Guard against reintroduction: the rebuild keys on what the slot is DERIVED from, never on how
+    /// many entries the registry happens to hold.
+    #[test]
+    fn the_slot_index_is_not_rebuilt_on_a_size_change() {
+        let src = include_str!("propagation.rs");
+        let cond = src.split("let need_rebuild = {").nth(1).expect("the rebuild condition")
+            .split('}').next().expect("its body");
+        assert!(cond.contains("current_window"), "a window roll re-randomises every slot");
+        assert!(cond.contains("covered_mask"), "a shard takeover changes which ids are ours");
+        let size_term = format!("reg{}", "_len");
+        assert!(!cond.contains(&size_term), "keying on the registry size rebuilds 240 buckets per registration");
     }
 }
