@@ -1,6 +1,6 @@
 //! Blockchain node implementation
 mod lifecycle;
-mod production;
+pub(crate) mod production;
 mod monitoring;
 mod activation;
 mod sync;

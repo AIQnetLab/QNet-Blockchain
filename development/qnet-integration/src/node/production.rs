@@ -2,6 +2,14 @@
 
 use super::*;
 
+/// Rollback target for the Nth failed tip reconcile: an exponential descent clamped to the finality
+/// floor. The exponent must run until the descent REACHES the floor — capped at 6 the step stopped at
+/// 64 blocks, so a tip further than that above finality never got there and the same target repeated
+/// forever (genesis 004 sat 144 above it and asked for the same 64 blocks 44 times, 08.09).
+pub(crate) fn tip_reconcile_target(local_h: u64, attempts: u32, fin_floor: u64) -> u64 {
+    local_h.saturating_sub(1u64 << attempts.min(40)).max(fin_floor).max(1)
+}
+
 impl BlockchainNode {
     /// Fork-recovery consumer — its own task, for the same reason as the pacemaker:
     /// it used to live in the production loop, and during the h=601 wedge an armed
@@ -347,7 +355,7 @@ impl BlockchainNode {
                                 // Clamped to the finality floor: certified history never rolls back,
                                 // and an unclamped target below it is refused forever (deepen livelock).
                                 let fin_floor = LAST_FINALIZED_HEIGHT.load(std::sync::atomic::Ordering::SeqCst);
-                                let target = local_h.saturating_sub(1u64 << attempts.min(6)).max(fin_floor).max(1);
+                                let target = tip_reconcile_target(local_h, attempts, fin_floor);
                                 // No rollback room below the snapshot anchor: the only remedy left
                                 // is a wholesale state restore, not an endless deepen loop.
                                 if target >= local_h {

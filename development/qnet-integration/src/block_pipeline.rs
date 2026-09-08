@@ -5606,6 +5606,25 @@ mod deferred_test_support {
 }
 
 #[cfg(test)]
+mod tests_reconcile_descent {
+    use crate::node::production::tip_reconcile_target as target;
+
+    /// The descent must REACH the finality floor. Capped at a 64-block step it stalled a fixed
+    /// distance above it and asked for the same target forever — genesis 004, 144 blocks above
+    /// finality, repeated one 64-block rollback 44 times while the chain stood still.
+    #[test]
+    fn the_descent_reaches_the_finality_floor() {
+        let (tip, fin) = (684_594u64, 684_450u64);
+        assert_eq!(target(tip, 1, fin), tip - 2, "first retry steps one block pair");
+        assert_eq!(target(tip, 6, fin), tip - 64, "still exponential in the shallow range");
+        assert_eq!(target(tip, 8, fin), fin, "and it gets there instead of stalling at 64");
+        assert_eq!(target(tip, 40, fin), fin, "never below certified history");
+        // A tip at the floor has nowhere to go; the caller treats target >= local_h as bottomed out.
+        assert_eq!(target(fin, 9, fin), fin);
+    }
+}
+
+#[cfg(test)]
 mod tests_branch_weight {
     use super::*;
     use super::deferred_test_support::decoded;
