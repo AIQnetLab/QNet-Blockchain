@@ -2897,13 +2897,6 @@ impl QuicTransport {
         }
     }
     
-    /// v2.24: Get alive connection count (excludes dead connections)
-    pub fn alive_connection_count(&self) -> usize {
-        self.connections.iter()
-            .filter(|entry| crate::quic_transport::is_connection_alive(entry.value()))
-            .count()
-    }
-
     pub fn is_connection_alive(&self, peer_addr: &SocketAddr) -> bool {
         self.connections.get(peer_addr)
             .map(|conn| crate::quic_transport::is_connection_alive(&conn))

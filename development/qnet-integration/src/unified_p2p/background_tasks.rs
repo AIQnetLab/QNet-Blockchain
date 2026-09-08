@@ -647,9 +647,14 @@ impl SimplifiedP2P {
                     // Cleanup idle connections
                     transport.cleanup_idle();
                     
-                    if removed > 0 || alive < 4 {
-                        if crate::node::is_info() { println!("[INFO][QUIC] health_check alive={} removed={} action=reconnect", 
-                                 alive, removed); }
+                    // Observation only — this loop reconnects nothing, and `alive` is the outbound
+                    // pool alone, which is legitimately empty in a mesh where peers dial in. The
+                    // reconnect decision belongs to the loop that counts both pools.
+                    if removed > 0 {
+                        if crate::node::is_info() {
+                            println!("[INFO][QUIC] health_check outbound_alive={} removed={} action=observe",
+                                     alive, removed);
+                        }
                     }
                 }
             }
