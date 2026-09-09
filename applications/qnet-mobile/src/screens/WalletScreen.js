@@ -1051,34 +1051,15 @@ const WalletScreen = () => {
 
     setReactivatingNode(true);
     try {
-      // If the local ping identity is gone (e.g. after a seed restore), a plain reactivate has no ping
-      // key to sign with. Re-establish it first via registerNodeWithCode (restore-safe: re-finds the
-      // burn on Solana, regenerates the ping delegation key signed by the restored wallet key, NO
-      // re-burn), then refresh status.
-      const localInfo = await AsyncStorage.getItem('qnet_light_node_info');
-      if (!localInfo && activationCode && wallet) {
-        // registerNodeWithCode returns {success:false,error} on failure (it does NOT throw), so we
-        // MUST inspect the result — else a failed re-establish would falsely report Success and loop.
-        // wallet_address MUST be the QNet EON (qnetAddress), never the Solana publicKey (server rejects).
-        const res = await walletManager.registerNodeWithCode(activationCode, wallet.qnetAddress || wallet.address, password);
-        if (res && res.success) {
-          showAlert('Success', 'Node re-established on this device. Attestation will resume shortly.');
-          // Seed-restore edge: state/ref pseudonym may still be empty here (identity was just
-          // re-established) — pass the fresh one so the status load can't no-op on the guard.
-          await loadLightNodeStatus(res.pseudonym || undefined, res.nodeType || 'light');
-        } else {
-          showAlert('Error', (res && res.error) || 'Could not re-establish node. Please try again.');
-        }
-        return;
-      }
-      // B: reactivation = self-attest. A forced self-attest records this-epoch eligibility on-chain, which
-      // IS the return — no separate reactivate endpoint. Also refresh the FCM token (may have changed offline).
+      // Reactivation = self-attest: a forced self-attest records this-epoch eligibility on chain, which
+      // IS the return. No separate reactivate endpoint.
       //
       // Resolve the node id through every source before attesting. `nodePseudonym` is state loaded from
       // `node_pseudonym_<code>`, which the Recover-Code and seed-restore paths never write, and
       // selfAttestIfNeeded's own fallback is `qnet_ping_node_id`, written inside the best-effort ping
-      // delegation block. With both missing the button reported "could not attest" while the authoritative
-      // id sat in `qnet_light_node_info` — the very record read two lines above.
+      // delegation block. With both missing the button failed while the authoritative id sat in
+      // `qnet_light_node_info`.
+      const localInfo = await AsyncStorage.getItem('qnet_light_node_info');
       let attestId = nodePseudonymRef.current || nodePseudonym;
       if (!attestId) {
         try {
@@ -1086,7 +1067,51 @@ const WalletScreen = () => {
           attestId = ni.nodeId || (await AsyncStorage.getItem('qnet_ping_node_id')) || '';
         } catch (_) { /* fall through to the empty id — selfAttestIfNeeded fails closed */ }
       }
-      const attested = await selfAttestIfNeeded(attestId, true);
+      // The node verifies a ping delegation against the identity key the chain committed, and the app
+      // sends that key only from `qnet_identity_pk_<id>` — a cache written once at registration and
+      // wiped by a reinstall. Without it the request goes out with `identity_pubkey` absent and the
+      // node answers `identity_unresolved presented=false`, which is exactly what the logs showed.
+      // The key is not lost: a light node's identity IS the wallet's ML-DSA-65 key, so it comes back
+      // with the seed. Restore the cache from the wallet before attesting — no activation code, no
+      // re-registration, and background pings can present it afterwards too.
+      // Read from the UNLOCKED wallet object, never from the password state: after a biometric unlock
+      // that state is an empty string, which is the same trap that once left the activation-code sync
+      // reading "" and losing the node from the screen. Only the PUBLIC half is needed here, so no
+      // password and no private key are involved.
+      if (attestId && wallet?.qnetKeypair?.publicKey) {
+        try {
+          const cached = await AsyncStorage.getItem(`qnet_identity_pk_${attestId}`);
+          if (!cached) {
+            const hex = Array.from(wallet.qnetKeypair.publicKey)
+              .map(b => (b & 0xff).toString(16).padStart(2, '0')).join('');
+            if (hex.length > 64) await AsyncStorage.setItem(`qnet_identity_pk_${attestId}`, hex);
+          }
+        } catch (_) { /* best effort: the attest below still reports the real outcome */ }
+      }
+
+      let attested = await selfAttestIfNeeded(attestId, true);
+
+      // A failed attest is not a network problem, and it must not be reported as one. The device
+      // cannot PROVE itself: after a reinstall the Keychain ping key and the identity key are gone,
+      // so it either has nothing to sign with or presents a fresh ping key the node cannot bind to an
+      // identity (`identity_unresolved`). The previous guard tried to predict this from the presence
+      // of `qnet_light_node_info` — an unrelated record that a restore rebuilds, so the re-establish
+      // never ran. Act on the OUTCOME instead: re-establish the delegation from the restored wallet
+      // (re-finds the burn, regenerates the ping key, NO re-burn) and attest once more.
+      if (!attested && activationCode && wallet) {
+        // wallet_address MUST be the QNet EON (qnetAddress), never the Solana publicKey.
+        // registerNodeWithCode returns {success:false,error} on failure — it does NOT throw.
+        const res = await walletManager.registerNodeWithCode(
+          activationCode, wallet.qnetAddress || wallet.address, password);
+        if (res && res.success) {
+          attested = await selfAttestIfNeeded(res.pseudonym || attestId, true);
+        } else if (!attested) {
+          showAlert('Error', (res && res.error) || 'Could not re-establish this node on this device.');
+          await loadLightNodeStatus();
+          return;
+        }
+      }
+
       if (attested) {
         try {
           const nodeInfoStr = await AsyncStorage.getItem('qnet_light_node_info');
@@ -1097,8 +1122,11 @@ const WalletScreen = () => {
         } catch (_) { /* non-critical */ }
         showAlert('Success', 'Welcome back! Your node attested this epoch — it will show active shortly.');
         await loadLightNodeStatus();
+      } else if (!activationCode) {
+        // Nothing to re-establish from: the code is what proves this wallet owns the node.
+        showAlert('Error', 'This device cannot prove your node yet. Open the Activate tab and enter your activation code, then press I\'m Back again.');
       } else {
-        showAlert('Error', 'Could not attest — check your connection and try again.');
+        showAlert('Error', 'Could not attest. Your node was re-established on this device — try I\'m Back again in a minute.');
       }
     } catch (error) {
       showAlert('Error', 'Network error. Please try again.');

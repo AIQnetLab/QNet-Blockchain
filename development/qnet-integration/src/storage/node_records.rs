@@ -695,20 +695,35 @@ impl Storage {
     }
 
     /// The identity key to verify a node's ping delegation under: the committed consensus key when the
-    /// chain holds one (super, genesis), otherwise a key presented by the device, admitted only when it
-    /// hashes to the commitment the registration wrote. Nothing else is ever accepted.
+    /// chain holds one (super, genesis), otherwise a key presented by the device, admitted only when the
+    /// chain vouches for it. Nothing else is ever accepted.
     pub fn resolve_light_identity_pk(&self, node_id: &str, presented_hex: Option<&str>) -> Option<String> {
         if let Ok(Some(bytes)) = self.load_vrf_public_key(node_id) {
             return Some(hex::encode(bytes));
         }
-        let tag = self.node_signer_key_commitment(node_id).ok().flatten()?;
         let candidate = match presented_hex.filter(|s| !s.is_empty()) {
             Some(p) => p.to_string(),
             None => self.light_ping_identity(node_id)?,
         };
         let bytes = hex::decode(&candidate).ok()?;
         use sha3::{Digest, Sha3_256};
-        if hex::encode(Sha3_256::digest(&bytes)) == tag { Some(candidate) } else { None }
+        match self.node_signer_key_commitment(node_id).ok().flatten() {
+            // The registration committed a hash of the identity key: that is the check.
+            Some(tag) => if hex::encode(Sha3_256::digest(&bytes)) == tag { Some(candidate) } else { None },
+            // Registered before light_key_commitment activated, so the row carries no hash - the state a
+            // device can never recover from once it loses its keys, because every path back needs the
+            // very thing that was never written. The row DOES carry the wallet, and a light node's
+            // wallet address IS SHA-512 of this key, so the chain vouches for the key after all: admit
+            // it only when it derives the committed address. That is the same binding the registration
+            // was made under, it needs no operator step, and a wallet whose address came from somewhere
+            // else (a Solana-bridged EON) simply fails closed as before.
+            None => {
+                let wallet = self.load_node_registration(node_id).ok().flatten().map(|(_, w, _)| w)?;
+                if wallet.is_empty() { return None; }
+                let derived = crate::crypto::solana_derivation::eon_from_qnet_dilithium_pubkey_bytes(&bytes)?;
+                if derived.eq_ignore_ascii_case(&wallet) { Some(candidate) } else { None }
+            }
+        }
     }
     pub fn get_light_ping_keys(&self, node_id: &str) -> Option<(String, String)> {
         let cf = self.persistent.db.cf_handle("light_ping_keys")?;
@@ -1200,6 +1215,53 @@ impl Storage {
         Ok(())
     }
     
+}
+
+#[cfg(test)]
+mod light_identity_without_commitment_tests {
+    /// A light node registered before light_key_commitment carries an EMPTY vrf_pk_sha3, so there is no
+    /// hash to check a presented key against — and every way back needs exactly that. Live on 09.09:
+    /// node light_mobile_83afab763b9058fd, reg_height 65764 against a gate at 691200, answered
+    /// `identity_unresolved presented=true` even when handed the correct key derived from its own seed.
+    /// The row does carry the WALLET, and the wallet address IS SHA-512 of that key, so the chain
+    /// vouches for it after all.
+    #[test]
+    fn the_committed_wallet_stands_in_for_a_commitment_that_was_never_written() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let s = crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage");
+
+        // A real ML-DSA-65 key and the address it derives — the same pair a device holds.
+        let xi = [3u8; 32];
+        let (pk, _sk) = crate::crypto::genesis_key::derive_mldsa65_from_xi(&xi);
+        let wallet = crate::crypto::solana_derivation::eon_from_qnet_dilithium_pubkey_bytes(&pk)
+            .expect("eon from pk");
+        let pk_hex = hex::encode(&pk);
+
+        // The pre-gate row: a wallet, and no key commitment at all.
+        let row = format!(r#"{{"reg_height":65764,"wallet":"{}","node_type":"light","vrf_pk_sha3":""}}"#, wallet);
+        s.put_registry_row_for_test("node_registry", b"node_light_pre_gate", row.as_bytes());
+        assert_eq!(s.node_signer_key_commitment("light_pre_gate").expect("read"), None,
+                   "the fixture must reproduce the empty commitment");
+
+        assert_eq!(s.resolve_light_identity_pk("light_pre_gate", Some(&pk_hex)).as_deref(), Some(pk_hex.as_str()),
+                   "the key that derives the committed wallet is the identity the chain vouches for");
+
+        // Any other key derives a different address and is refused — the binding is not weakened.
+        let (other_pk, _) = crate::crypto::genesis_key::derive_mldsa65_from_xi(&[4u8; 32]);
+        assert_eq!(s.resolve_light_identity_pk("light_pre_gate", Some(&hex::encode(&other_pk))), None,
+                   "a foreign key must not pass");
+        assert_eq!(s.resolve_light_identity_pk("light_pre_gate", None), None,
+                   "and nothing is admitted when no key is presented and none was ever stored");
+
+        // A row that DID commit a hash keeps using it, presented key or not.
+        let tag = hex::encode(<sha3::Sha3_256 as sha3::Digest>::digest(&pk));
+        let gated = format!(r#"{{"reg_height":700000,"wallet":"{}","node_type":"light","vrf_pk_sha3":"{}"}}"#, wallet, tag);
+        s.put_registry_row_for_test("node_registry", b"node_light_post_gate", gated.as_bytes());
+        assert_eq!(s.resolve_light_identity_pk("light_post_gate", Some(&pk_hex)).as_deref(), Some(pk_hex.as_str()),
+                   "the commitment path is untouched");
+        assert_eq!(s.resolve_light_identity_pk("light_post_gate", Some(&hex::encode(&other_pk))), None,
+                   "and it still refuses a key that does not hash to the commitment");
+    }
 }
 
 #[cfg(test)]
