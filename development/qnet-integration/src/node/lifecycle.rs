@@ -162,6 +162,16 @@ impl BlockchainNode {
         // the signing mark below, and only for an anchor the operator has just put out of reach.
         Self::drop_snapshot_anchor_above(storage, target);
 
+        // Same declaration, same class of artifact. A snapshot above the target is a complete picture
+        // of the chain this rollback abandoned, and the runtime adopt path takes it: it raises
+        // chain_height to the snapshot height and re-persists the anchor that was just dropped. The
+        // node then holds no block above the truncation yet reports the snapshot's tip.
+        match storage.prune_snapshots_above(target) {
+            Ok(0) => {}
+            Ok(n) => println!("[INFO][ROLLBACK] snapshots_pruned above={} dropped={}", target, n),
+            Err(e) => println!("[WARN][ROLLBACK] snapshot_prune_failed target={} err={}", target, e),
+        }
+
         // Against the height the node actually ends up at: the target may sit above a tip this node
         // never reached, and the mark must never be lowered below what the chain still holds.
         let effective = storage.get_chain_height().unwrap_or(target).min(target);

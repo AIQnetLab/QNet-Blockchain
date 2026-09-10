@@ -1803,6 +1803,42 @@ impl Storage {
         Ok(if best > 0 { Some(best) } else { None })
     }
 
+    /// Delete every snapshot describing chain ABOVE `target`, and re-point `latest_full_snap` at the
+    /// highest survivor. Called by the boot rollback: a snapshot above the truncation is a complete,
+    /// self-consistent picture of the chain the operator has just abandoned, and the runtime adopt
+    /// path will take it - raising chain_height to a height whose blocks were deleted, and
+    /// re-persisting the snapshot anchor along with it. Truncating blocks while leaving these behind
+    /// is what let a rolled-back node report a tip it does not hold and sync forever.
+    pub fn prune_snapshots_above(&self, target: u64) -> IntegrationResult<u64> {
+        let cf = self.persistent.db.cf_handle("snapshots")
+            .ok_or_else(|| IntegrationError::StorageError("snapshots column family not found".to_string()))?;
+        let mut batch = rocksdb::WriteBatch::default();
+        let mut dropped = 0u64;
+        let mut best_kept = 0u64;
+        for item in self.persistent.db.iterator_cf(&cf, rocksdb::IteratorMode::Start) {
+            let (key, _) = match item { Ok(kv) => kv, Err(_) => continue };
+            let k = String::from_utf8_lossy(&key).to_string();
+            let h = match k.strip_prefix("full_snap_").or_else(|| k.strip_prefix("state_snap_")) {
+                Some(h_str) => match h_str.parse::<u64>() { Ok(h) => h, Err(_) => continue },
+                None => continue,
+            };
+            if h > target {
+                batch.delete_cf(&cf, key.as_ref());
+                dropped += 1;
+            } else if k.starts_with("full_snap_") && h > best_kept {
+                best_kept = h;
+            }
+        }
+        // The pointer must never outlive what it names.
+        if best_kept > 0 {
+            batch.put_cf(&cf, b"latest_full_snap", &best_kept.to_le_bytes());
+        } else {
+            batch.delete_cf(&cf, b"latest_full_snap");
+        }
+        self.persistent.db.write(batch)?;
+        Ok(dropped)
+    }
+
     pub fn get_latest_snapshot_height(&self) -> IntegrationResult<Option<u64>> {
         let snapshots_cf = self.persistent.db.cf_handle("snapshots")
             .ok_or_else(|| IntegrationError::StorageError("snapshots column family not found".to_string()))?;
@@ -3564,4 +3600,47 @@ impl Storage {
     // SMART CONTRACT STORAGE METHODS
     // =========================================================================
     
+}
+
+#[cfg(test)]
+mod tests_rollback_snapshot_prune {
+    use super::*;
+
+    fn temp_storage() -> (Storage, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let st = Storage::new(dir.path().to_str().unwrap()).expect("storage");
+        (st, dir)
+    }
+
+    fn seed(st: &Storage, h: u64) {
+        let cf = st.persistent.db.cf_handle("snapshots").expect("snapshots cf");
+        st.persistent.db
+            .put_cf(&cf, format!("full_snap_{}", h).as_bytes(), &[1u8, 2, 3])
+            .expect("seed");
+    }
+
+    /// A rollback must take the snapshots with it. One above the target is a complete, self-consistent
+    /// picture of the chain the operator has just abandoned, and the runtime adopt path takes it: it
+    /// raises chain_height to the snapshot height AND re-persists the snapshot anchor the rollback
+    /// dropped a moment earlier. That is why dropping the anchor alone did not hold - six nodes booted
+    /// correctly at 863550, replayed and verified, and then climbed back to 867600 with block 863551
+    /// present nowhere.
+    #[test]
+    fn a_rollback_prunes_snapshots_describing_the_chain_it_abandoned() {
+        let (st, _d) = temp_storage();
+        let target = 863_550u64;
+        for h in [860_400u64, 864_000, 867_600] { seed(&st, h); }
+
+        let dropped = st.prune_snapshots_above(target).expect("prune");
+        assert_eq!(dropped, 2, "both snapshots above the target go");
+        assert!(st.get_snapshot_data(867_600).expect("get").is_none(), "above the target: gone");
+        assert!(st.get_snapshot_data(864_000).expect("get").is_none(), "above the target: gone");
+        assert!(st.get_snapshot_data(860_400).expect("get").is_some(), "below the target: kept");
+        assert_eq!(st.get_latest_snapshot_height().expect("latest"), Some(860_400),
+                   "the pointer must never outlive what it names");
+
+        // Nothing above the target left ⇒ a second run is a no-op, and the survivor stays.
+        assert_eq!(st.prune_snapshots_above(target).expect("prune"), 0, "idempotent");
+        assert!(st.get_snapshot_data(860_400).expect("get").is_some());
+    }
 }
