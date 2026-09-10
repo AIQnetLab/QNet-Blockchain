@@ -172,10 +172,39 @@ impl BlockchainNode {
             Err(e) => println!("[WARN][ROLLBACK] snapshot_prune_failed target={} err={}", target, e),
         }
 
+        // And the macroblock objects. qc_verified_frontier_height() scans for the highest STORED
+        // macroblock above local progress and raises QC_VERIFIED_FRONTIER to it - a monotonic floor
+        // under get_max_peer_height. Left behind, one object above the target makes the node read the
+        // network as thousands of blocks ahead of a tip nobody holds, so it syncs forever instead of
+        // producing the next block. Bounded window, comfortably wider than that scan's own 128.
+        Self::prune_macroblocks_above(storage, target);
+
         // Against the height the node actually ends up at: the target may sit above a tip this node
         // never reached, and the mark must never be lowered below what the chain still holds.
         let effective = storage.get_chain_height().unwrap_or(target).min(target);
         Self::lower_signing_mark_to(storage, effective);
+    }
+
+    /// Delete macroblock objects describing chain above `target`. Existence of one is what
+    /// qc_verified_frontier_height() reads as "QC-verified up to here", and that frontier floors the
+    /// network-height oracle, so an object the rollback left behind keeps the node permanently behind
+    /// a tip it just discarded. Bounded scan: the frontier probe itself never looks further than
+    /// local_mb + 128, so this window cannot miss what it would find.
+    fn prune_macroblocks_above(storage: &Arc<Storage>, target: u64) {
+        const SCAN_WINDOW_MB: u64 = 1024;
+        let mi = qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
+        let target_mb = target / mi;
+        let mut dropped = 0u64;
+        for idx in (target_mb + 1)..=(target_mb + SCAN_WINDOW_MB) {
+            if storage.get_macroblock_by_height(idx).ok().flatten().is_none() { continue; }
+            match storage.delete_macroblock(idx) {
+                Ok(_) => dropped += 1,
+                Err(e) => println!("[WARN][ROLLBACK] macroblock_delete_failed idx={} err={}", idx, e),
+            }
+        }
+        if dropped > 0 {
+            println!("[INFO][ROLLBACK] macroblocks_pruned above_mb={} dropped={}", target_mb, dropped);
+        }
     }
 
     /// Invalidate a persisted snapshot anchor that sits above `target`. mb == 0 is the sentinel
