@@ -153,10 +153,41 @@ impl BlockchainNode {
                 return; // the chain did not move: lowering the mark under it would be unfounded
             }
         }
+        // The persisted snapshot anchor is a trusted-floor claim about the chain this rollback has
+        // just discarded. Left in place it outlives the truncation: reload_snapshot_anchor runs a few
+        // seconds later in the same boot and raises chain_height back to anchor_mb * 90 - a height
+        // whose blocks were deleted a moment earlier. The node then reports a tip it does not hold,
+        // reads itself as behind, and syncs forever against a block no peer has either, because every
+        // peer rolled back too. Clearing it is the same declaration the rollback already makes about
+        // the signing mark below, and only for an anchor the operator has just put out of reach.
+        Self::drop_snapshot_anchor_above(storage, target);
+
         // Against the height the node actually ends up at: the target may sit above a tip this node
         // never reached, and the mark must never be lowered below what the chain still holds.
         let effective = storage.get_chain_height().unwrap_or(target).min(target);
         Self::lower_signing_mark_to(storage, effective);
+    }
+
+    /// Invalidate a persisted snapshot anchor that sits above `target`. mb == 0 is the sentinel
+    /// `reload_snapshot_anchor` already treats as "no anchor", so this needs no new format and no new
+    /// read path. An anchor at or below the target still describes chain the node keeps, and stays.
+    fn drop_snapshot_anchor_above(storage: &Arc<Storage>, target: u64) {
+        let bytes = match storage.get_snapshot_anchor() {
+            Ok(Some(b)) if b.len() == 40 => b,
+            _ => return,
+        };
+        let mut mb = [0u8; 8];
+        mb.copy_from_slice(&bytes[0..8]);
+        let anchor_mb = u64::from_le_bytes(mb);
+        let anchor_h = anchor_mb.saturating_mul(qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL);
+        if anchor_mb == 0 || anchor_h <= target {
+            return;
+        }
+        match storage.put_snapshot_anchor(&[0u8; 40]) {
+            Ok(_) => println!("[INFO][ROLLBACK] snapshot_anchor_dropped mb={} anchor_h={} target={}",
+                              anchor_mb, anchor_h, target),
+            Err(e) => println!("[WARN][ROLLBACK] snapshot_anchor_drop_failed mb={} err={}", anchor_mb, e),
+        }
     }
 
     /// Create a new blockchain node with default settings (backward compatibility)
@@ -4082,4 +4113,49 @@ impl BlockchainNode {
         }
     }
     
+}
+
+#[cfg(test)]
+mod tests_rollback_snapshot_anchor {
+    use super::*;
+    use crate::storage::Storage;
+    use std::sync::Arc;
+
+    fn temp_storage() -> (Arc<Storage>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let st = Storage::new(dir.path().to_str().unwrap()).expect("storage");
+        (Arc::new(st), dir)
+    }
+
+    fn anchor_bytes(mb: u64) -> Vec<u8> {
+        let mut b = mb.to_le_bytes().to_vec();
+        b.extend_from_slice(&[7u8; 32]);
+        b
+    }
+
+    /// An operator rollback declares the chain above its target abandoned. The snapshot anchor is a
+    /// trusted-floor claim about exactly that chain, and reload_snapshot_anchor raises chain_height
+    /// back to it later in the SAME boot - to a height whose blocks the truncation deleted seconds
+    /// earlier. The node then reports a tip it does not hold, reads itself as behind, and syncs
+    /// forever against a block no peer kept either, because every peer rolled back too. Six nodes sat
+    /// like that at h=863550 with block 863551 present nowhere.
+    #[test]
+    fn a_rollback_drops_a_snapshot_anchor_it_put_out_of_reach() {
+        let (st, _d) = temp_storage();
+        let mi = qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
+
+        // Above the target: invalidated, so the boot reload finds the mb == 0 sentinel and no-ops.
+        st.put_snapshot_anchor(&anchor_bytes(9640)).expect("put");
+        BlockchainNode::drop_snapshot_anchor_above(&st, 863_550);
+        let after = st.get_snapshot_anchor().expect("get").expect("present");
+        assert_eq!(&after[0..8], &0u64.to_le_bytes(),
+                   "an anchor the rollback put out of reach must not survive it");
+
+        // At or below the target it still describes chain the node keeps, so it stays.
+        let keep = 9000u64;
+        st.put_snapshot_anchor(&anchor_bytes(keep)).expect("put");
+        BlockchainNode::drop_snapshot_anchor_above(&st, keep * mi);
+        let after = st.get_snapshot_anchor().expect("get").expect("present");
+        assert_eq!(&after[0..8], &keep.to_le_bytes(), "an anchor within reach is kept");
+    }
 }
