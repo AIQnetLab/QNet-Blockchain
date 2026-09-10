@@ -211,18 +211,7 @@ impl BlockchainNode {
                         node_id, node_type, wallet_address, burn_tx, ..
                     } => {
                         let type_str = Self::registration_type_str(node_type);
-                        // The key is bound for BOTH kinds, for different reasons. A super's key verifies
-                        // its blocks and votes. A light node's key verifies the delegation that lets its
-                        // device sign attestations: with nothing committed, every attestation is refused
-                        // and the node can never be eligible for a reward. Only the 32-byte hash reaches
-                        // the registry row for a light node (the storage layer keeps the full key for
-                        // consensus participants only), so ten million of them cost 32 bytes each and the
-                        // device carries the key itself on the wire.
-                        let reg_vrf = if matches!(node_type, qnet_state::NodeType::Super)
-                            || qnet_state::feature_gates::is_active(qnet_state::feature_gates::id::LIGHT_KEY_COMMITMENT, h)
-                        {
-                            Self::registration_consensus_pk(tx).map(hex::encode).unwrap_or_default()
-                        } else { String::new() };
+                        let reg_vrf = Self::registration_vrf_hex(tx, node_type, h);
                         result.deferred_registrations.push((node_id.clone(), type_str.to_string(), wallet_address.clone(), burn_tx.clone(), reg_vrf));
                         result.deferred_registration_origins.push((node_id.clone(), wallet_address.clone()));
                     }

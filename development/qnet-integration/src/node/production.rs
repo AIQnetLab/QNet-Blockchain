@@ -877,6 +877,7 @@ impl BlockchainNode {
             std::sync::atomic::Ordering::SeqCst,
         ).is_ok() {
             Self::start_producer_watchdog();
+            Self::start_runtime_stall_watchdog();
         }
 
         // Liveness pacemaker task (see run_failover_pacemaker). Once per process.
@@ -5232,7 +5233,7 @@ impl BlockchainNode {
                     let mut side_idx = BlockSideIndices::default();
                     // This block's journal (mirror of the validator's BlockSnapshot), retained once the
                     // block is stored so a shallow reorg can undo our own block from it.
-                    let mut inline_journal: Option<qnet_state::BlockSnapshot> = None;
+                    let inline_journal: Option<qnet_state::BlockSnapshot>;
                     {
                         let state_guard = state.write().await;
                         // Re-checked under the lock: the pipeline cannot interleave here, and a peer's
@@ -5635,10 +5636,8 @@ impl BlockchainNode {
                             } => {
                                 // Collected, not written: the write order decides reg_index and must be
                                 // canonical, not transaction order. Same tuple shape the validator defers,
-                                // and the vrf super-only rule is the validator's, so the rows are identical.
-                                let reg_vrf = if matches!(rtype, qnet_state::NodeType::Super) {
-                                    Self::registration_consensus_pk(tx).map(hex::encode).unwrap_or_default()
-                                } else { String::new() };
+                                // and the same single definition of the vrf rule, so the rows are identical.
+                                let reg_vrf = Self::registration_vrf_hex(tx, rtype, next_block_height);
                                 inline_regs.push((
                                     rid.clone(), Self::registration_type_str(rtype).to_string(),
                                     rwallet.clone(), rburn.clone(), reg_vrf,
@@ -5743,7 +5742,7 @@ impl BlockchainNode {
                     // commit branch below, which publishes the serve horizon and the finalized-round
                     // baseline.
                     if let Ok(crate::storage::SaveOutcome::Stored) = save_result {
-                        if let Some(journal) = inline_journal.take() {
+                        if let Some(journal) = inline_journal {
                             state.read().await.retain_block_journal(journal);
                         }
                         // Block logs (CONSENSUS: feeds the window logs_root, gate height 0) FIRST —

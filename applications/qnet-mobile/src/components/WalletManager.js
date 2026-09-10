@@ -2793,6 +2793,8 @@ export class WalletManager {
   // Encrypt and store wallet with PBKDF2 + AES (like extension)
   async storeWallet(walletData, password) {
     try {
+      // The first session after an import never decrypts again, so seed the identity cache here too.
+      await this.cacheLightIdentityPk(walletData);
       // Only clear activation codes when it's a DIFFERENT wallet
       // (import/create already clears them explicitly in WalletScreen)
       // Previously this line deleted codes on EVERY save, causing data loss
@@ -3108,6 +3110,33 @@ export class WalletManager {
   // proofs are ALL signed by the ML-DSA-65 WALLET key (the key whose SHA512 IS wallet_address). Returns it
   // as hex {secretKey, publicKey} for signWithDilithium — replaces the legacy per-node identity key so the
   // RAM quantum_pubkey == the on-chain root (load_vrf_public_key) and background/foreground pings verify.
+  /// Re-derive the light node's identity-key cache from a decrypted wallet.
+  ///
+  /// The node verifies a ping delegation against the identity key the chain committed, and the app
+  /// presents that key ONLY from `qnet_identity_pk_<id>` — a cache written once at registration and
+  /// wiped by a reinstall. Without it every ping goes out with `identity_pubkey` absent and the node
+  /// answers `identity_unresolved presented=false`, which is what the genesis logs showed. Nothing is
+  /// actually lost: a light node's identity IS this wallet's ML-DSA-65 key and its id derives from the
+  /// wallet address, so both come back with the seed.
+  ///
+  /// It lives HERE, not in a screen: the failing pings come from the background task, which reaches no
+  /// screen and holds no password. Every decrypt and every store passes through this class, so this is
+  /// the one place that cannot be routed around. Public half only, idempotent, no network.
+  async cacheLightIdentityPk(wallet) {
+    try {
+      const pk = wallet && wallet.qnetKeypair && wallet.qnetKeypair.publicKey;
+      const addr = wallet && wallet.qnetAddress;
+      if (!pk || !addr) return;
+      const key = `qnet_identity_pk_${this.generateLightNodePseudonym(addr)}`;
+      if (await AsyncStorage.getItem(key)) return;
+      const hex = Buffer.from(new Uint8Array(pk)).toString('hex');
+      if (hex.length > 64) {
+        await AsyncStorage.setItem(key, hex);
+        console.log('[Identity] ping identity key restored from wallet');
+      }
+    } catch (_) { /* best effort: a ping that cannot present still reports honestly */ }
+  }
+
   async _walletDilithiumKeys(password, walletData = null) {
     const wd = walletData || await this.loadWallet(password);
     const qk = wd && wd.qnetKeypair;
@@ -3380,6 +3409,7 @@ export class WalletManager {
       // Attach migration info for caller to show notification
       wallet._migrated = migrated;
       wallet._migratedFromVersion = migrated ? fromVersion : null;
+      await this.cacheLightIdentityPk(wallet);
       return wallet;
     } catch (error) {
       throw error;

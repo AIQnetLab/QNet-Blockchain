@@ -2783,10 +2783,12 @@ impl SimplifiedP2P {
                     .unwrap_or(true);
                     
                 if should_update {
-                    // v9.3: Get peer's block height from connected_peers for sync tracking
+                    // v9.3: Get peer's block height from connected_peers for sync tracking.
+                    // Floored by evidence: this registry is what liveness and eligibility read, so a
+                    // record frozen by a stalled ping channel would report a producing peer as dead.
                     let peer_height = self.connected_peers_lockfree.iter()
                         .find(|e| e.value().id == node_id)
-                        .map(|e| e.value().last_block_height)
+                        .map(|e| crate::unified_p2p::peer_height_with_evidence(&node_id, e.value().last_block_height))
                         .unwrap_or(0);
                     self.active_full_super_nodes.insert(node_id.clone(), ActiveNodeInfo {
                         node_id: node_id.clone(),

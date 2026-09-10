@@ -2078,6 +2078,22 @@ pub fn frontier_order_statistic(mut hs: Vec<u64>) -> u64 {
     hs[f]
 }
 
+/// Fold our OWN applied tip into a corroborated ceiling. 0 is preserved verbatim — it means "no
+/// corroborator, trust raw", and a cold joiner at tip 100 must never clamp a real frontier to 100.
+/// Above that, the chain we verified and persisted is itself a corroborator: a ceiling below it is
+/// self-contradictory and turns every honest peer into an over-claimer.
+pub(crate) fn ceiling_with_own_tip(corroborated: u64, local_tip: u64) -> u64 {
+    if corroborated == 0 { 0 } else { corroborated.max(local_tip) }
+}
+
+/// A peer's height floored by what its own APPLIED block proves. The gossip channel that carries the
+/// claim can stall — rate-limit, loss, a runtime pause — and freeze a record for hours while that peer
+/// keeps producing. A block of theirs we verified and persisted cannot be above their real height, so
+/// this floor never inflates; it only refuses to believe a peer is behind a block it authored.
+pub(crate) fn peer_height_with_evidence(peer_id: &str, gossiped: u64) -> u64 {
+    gossiped.max(last_remote_producer_heartbeat_height(peer_id).unwrap_or(0))
+}
+
 
 
 // Remote-producer heartbeat tracking (two wait-free DashMaps).
@@ -6212,5 +6228,19 @@ mod signed_head_tests {
         assert_eq!(best_of_attested(vec![(900, now - 1_000)].into_iter(), now), 900, "nothing fresh: any entry");
         assert_eq!(best_of_attested(vec![(u64::MAX, now)].into_iter(), now), 0, "corrupt values are ignored");
         assert_eq!(best_of_attested(std::iter::empty(), now), 0);
+    }
+
+    #[test]
+    fn ceiling_never_sits_below_our_own_applied_tip() {
+        // The live failure: the ping channel stalled, the corroborated ceiling froze at 800544 while the
+        // node itself had verified and applied up to 851163 — every honest peer then read as an
+        // over-claimer and the demotion fed a wrong rollback target.
+        assert_eq!(ceiling_with_own_tip(800_544, 851_163), 851_163);
+        // 0 is the "no corroborator, trust raw" sentinel and must survive: a cold joiner at tip 100
+        // clamping a real frontier down to 100 would never sync.
+        assert_eq!(ceiling_with_own_tip(0, 851_163), 0);
+        // A genuinely behind node keeps the peers' higher ceiling.
+        assert_eq!(ceiling_with_own_tip(900_000, 100), 900_000);
+        assert_eq!(ceiling_with_own_tip(851_163, 851_163), 851_163);
     }
 }

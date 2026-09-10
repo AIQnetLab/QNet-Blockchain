@@ -38,6 +38,36 @@ const _forceHttps = (() => {
 
 export const GENESIS_NODES = _forceHttps ? GENESIS_NODES_HTTPS : GENESIS_NODES_HTTP;
 
+/**
+ * The genesis nodes that own a light node's shard, in the order the chain ranks them.
+ *
+ * A light node's shard is blake3(node_id) mod 5, and a shard is owned by three genesis nodes — its
+ * own and the next two around the ring — so a shard survives one of them being down. Both rules are
+ * pure functions of the node id, so the device derives the same answer the chain does, with no
+ * network call. MUST stay byte-identical to node/mod.rs light_shard_of + light_shard_owners.
+ *
+ * This matters because the shard owner is the node that records eligibility and commits the epoch
+ * bitmap. An answer sent anywhere else has to be relayed to it, and a relay carries the signature
+ * without the key it was signed with — which is exactly how a device that rotated its ping key
+ * (a reinstall does) ends up attesting into a void.
+ */
+export function lightShardOwnerUrls(nodeId) {
+  if (!nodeId) return GENESIS_NODES.slice();
+  let shard;
+  try {
+    const { blake3 } = require('@noble/hashes/blake3.js');
+    const h = blake3(Buffer.from(nodeId, 'utf8'));
+    // First 8 bytes as a little-endian u64, exactly as the node reads them.
+    let v = 0n;
+    for (let i = 7; i >= 0; i--) v = (v << 8n) | BigInt(h[i]);
+    shard = Number(v % 5n);
+  } catch (_) {
+    return GENESIS_NODES.slice(); // hashing unavailable: every genesis, rather than nothing
+  }
+  const owners = [shard % 5, (shard + 1) % 5, (shard + 2) % 5];
+  return owners.map(i => GENESIS_NODES[i]).filter(Boolean);
+}
+
 // Node discovery settings
 export const NODE_DISCOVERY = {
   CACHE_TTL_MS: 5 * 60 * 1000,      // 5 minutes cache TTL

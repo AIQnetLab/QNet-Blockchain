@@ -7,7 +7,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import messaging from '@react-native-firebase/messaging';
 import BackgroundFetch from 'react-native-background-fetch';
 // v3.35: Centralized node configuration (no duplication!)
-import { GENESIS_NODES, getRandomGenesisNode } from '../config/nodes';
+import { GENESIS_NODES, getRandomGenesisNode, lightShardOwnerUrls } from '../config/nodes';
 
 // Push types
 export const PushType = {
@@ -454,7 +454,18 @@ export async function selfAttestIfNeeded(nodeId, force = false) {
     const phBytes = block.previous_hash;
     if (!phBytes.every(b => Number.isInteger(b) && b >= 0 && b <= 255)) return false;
     const hash = phBytes.map(b => b.toString(16).padStart(2, '0')).join('');
-    const ok = await respondToChallenge(pingNodeId, `selfattest:${anchor}:${hash}`, apiUrl);
+    // Send it to the nodes that OWN this shard, not to whichever node answered the height query.
+    // The owner is what records eligibility and commits the epoch bitmap; anywhere else the answer
+    // has to be relayed to it, and the relay carries the signature without the ping key it was signed
+    // with — so a device that rotated its key (every reinstall does) attests into a void. All three
+    // owners are tried, which is also what makes one owner being down survivable.
+    const challenge = `selfattest:${anchor}:${hash}`;
+    let ok = false;
+    for (const ownerUrl of lightShardOwnerUrls(pingNodeId)) {
+      if (await respondToChallenge(pingNodeId, challenge, ownerUrl)) { ok = true; break; }
+    }
+    // Last resort: the node we already know answers. Better a relayed attestation than none.
+    if (!ok) ok = await respondToChallenge(pingNodeId, challenge, apiUrl);
     if (ok) {
       await AsyncStorage.setItem('qnet_last_self_attest_epoch', String(epoch));
       console.log('[SelfAttest] ✅ Attested for epoch', epoch);

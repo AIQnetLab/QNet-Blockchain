@@ -1615,6 +1615,34 @@ impl BlockchainNode {
         }
     }
 
+    /// The registry row's `vrf_pk_sha3`, for BOTH apply paths.
+    ///
+    /// The key is bound for both node kinds, for different reasons. A super's key verifies its blocks
+    /// and votes. A light node's key verifies the delegation that lets its device sign attestations:
+    /// with nothing committed, every attestation is refused and the node can never earn a reward. Only
+    /// the 32-byte hash reaches the row for a light node, so ten million of them cost 32 bytes each.
+    ///
+    /// Height-gated for light, because rows written before the gate committed nothing and a rewrite
+    /// would fork the root. registry_root hashes this field, so — exactly like `registration_type_str`
+    /// above — it has ONE definition: the producer-inline path and the validator-deferred path both
+    /// call this. They previously each spelled the rule out, the producer's copy was missing the gate
+    /// clause, and once the chain passed the gate height the first light registration made the
+    /// producing node's row differ from every other node's, diverging registry_root permanently.
+    pub(crate) fn registration_vrf_hex(
+        tx: &qnet_state::Transaction,
+        node_type: &qnet_state::NodeType,
+        height: u64,
+    ) -> String {
+        let committed = matches!(node_type, qnet_state::NodeType::Super)
+            || qnet_state::feature_gates::is_active(
+                qnet_state::feature_gates::id::LIGHT_KEY_COMMITMENT, height);
+        if committed {
+            Self::registration_consensus_pk(tx).map(hex::encode).unwrap_or_default()
+        } else {
+            String::new()
+        }
+    }
+
     /// Canonical stamping order for one block's registry rows.
     ///
     /// `reg_index` is handed out by a monotone counter as rows are written, while the rebuild ranks
@@ -1727,5 +1755,26 @@ mod signer_key_backfill_tests {
         assert_eq!(storage.committed_signer_pk("super_bk").as_deref(), Some(raw.as_slice()));
         assert_eq!(storage.load_vrf_public_key("super_bk_bad").expect("read"), None,
                    "a block key that does not match the commitment is not stamped");
+    }
+}
+
+#[cfg(test)]
+mod tests_registration_vrf_single_definition {
+    /// registry_root hashes vrf_pk_sha3, so the rule deciding it must have exactly one definition.
+    /// It had two. The producer-inline copy was missing the LIGHT_KEY_COMMITMENT clause, so once the
+    /// chain passed the gate height the first light registration made the PRODUCING node write an
+    /// empty hash where every other node wrote the real one — that node's registry_root diverged
+    /// permanently, and after two such registrations too few nodes agreed to seal a macroblock.
+    #[test]
+    fn neither_apply_path_re_derives_the_vrf_rule() {
+        for (name, src) in [
+            ("production.rs", include_str!("production.rs")),
+            ("state_apply.rs", include_str!("state_apply.rs")),
+        ] {
+            assert!(src.contains("registration_vrf_hex"),
+                    "{} must take the vrf rule from its single definition", name);
+            assert!(!src.contains("LIGHT_KEY_COMMITMENT"),
+                    "{} must not spell the gate clause out again — that is how the paths drifted", name);
+        }
     }
 }

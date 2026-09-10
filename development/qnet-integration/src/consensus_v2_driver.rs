@@ -952,30 +952,6 @@ mod tests {
         }
     }
 
-    // deliver + per-generation wire census (diagnostic twin of deliver).
-    fn deliver_probed(nodes: &mut Vec<Node>, committee: &[NodeId], seed: Vec<ConsensusMsg>, tick: usize, props: usize) {
-        let mut queue = seed;
-        let mut gen = 0;
-        while !queue.is_empty() && gen < 2000 {
-            gen += 1;
-            let votes = queue.iter().filter(|m| matches!(m, ConsensusMsg::Vote(_))).count();
-            let qcs = queue.iter().filter(|m| matches!(m, ConsensusMsg::Qc(_))).count();
-            if tick < 3 && (props > 0 || votes > 0 || qcs > 0) {
-                println!("tick={} gen={} wire: props={} votes={} qcs={}", tick, gen,
-                         queue.iter().filter(|m| matches!(m, ConsensusMsg::Proposal(_))).count(), votes, qcs);
-            }
-            let mut next = Vec::new();
-            for m in queue.drain(..) {
-                for k in 0..nodes.len() {
-                    if !verify_msg(committee, &m) { continue; }
-                    let effects = nodes[k].d.handle(&m);
-                    for e in effects { next.extend(exec(&mut nodes[k], e)); }
-                }
-            }
-            queue = next;
-        }
-    }
-
     fn deliver(nodes: &mut Vec<Node>, committee: &[NodeId], seed: Vec<ConsensusMsg>) {
         let mut queue = seed;
         let mut rounds = 0;

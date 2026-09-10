@@ -2652,7 +2652,11 @@ impl SimplifiedP2P {
     /// arm gate (both liveness hints; the on-chain attest_epoch verifier is the safety backstop) —
     /// never a consensus/failover input.
     pub fn corroborated_head_ceiling(&self) -> u64 {
-        frontier_order_statistic(self.fresh_in_set_peer_heights())
+        let corroborated = frontier_order_statistic(self.fresh_in_set_peer_heights());
+        ceiling_with_own_tip(
+            corroborated,
+            LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed),
+        )
     }
 
     // failover_frontier_ceiling REMOVED: the failover vote key is a pure function of the voter's
@@ -2673,7 +2677,7 @@ impl SimplifiedP2P {
                 in_set && p.last_block_height > 0
                     && now.saturating_sub(p.last_height_attested_at) < PEER_HEIGHT_ATTEST_TTL_SECS
             })
-            .map(|e| e.value().last_block_height)
+            .map(|e| peer_height_with_evidence(&e.value().id, e.value().last_block_height))
             .collect()
     }
 
@@ -2780,7 +2784,9 @@ impl SimplifiedP2P {
                 .map(|e| (e.value().last_block_height, e.value().last_height_attested_at)),
             now,
         );
-        let raw = table.max(signed_head_fresh_max(now));
+        // Never below our own applied tip: the frontier is provably at least the chain we hold.
+        let raw = table.max(signed_head_fresh_max(now))
+            .max(LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed));
         BEST_PEER_HEIGHT.store(raw, std::sync::atomic::Ordering::Relaxed);
         self.clamp_overclaim(raw)
     }

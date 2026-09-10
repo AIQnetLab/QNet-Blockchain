@@ -1074,21 +1074,6 @@ const WalletScreen = () => {
       // The key is not lost: a light node's identity IS the wallet's ML-DSA-65 key, so it comes back
       // with the seed. Restore the cache from the wallet before attesting — no activation code, no
       // re-registration, and background pings can present it afterwards too.
-      // Read from the UNLOCKED wallet object, never from the password state: after a biometric unlock
-      // that state is an empty string, which is the same trap that once left the activation-code sync
-      // reading "" and losing the node from the screen. Only the PUBLIC half is needed here, so no
-      // password and no private key are involved.
-      if (attestId && wallet?.qnetKeypair?.publicKey) {
-        try {
-          const cached = await AsyncStorage.getItem(`qnet_identity_pk_${attestId}`);
-          if (!cached) {
-            const hex = Array.from(wallet.qnetKeypair.publicKey)
-              .map(b => (b & 0xff).toString(16).padStart(2, '0')).join('');
-            if (hex.length > 64) await AsyncStorage.setItem(`qnet_identity_pk_${attestId}`, hex);
-          }
-        } catch (_) { /* best effort: the attest below still reports the real outcome */ }
-      }
-
       let attested = await selfAttestIfNeeded(attestId, true);
 
       // A failed attest is not a network problem, and it must not be reported as one. The device

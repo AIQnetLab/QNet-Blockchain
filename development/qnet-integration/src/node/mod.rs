@@ -1575,6 +1575,10 @@ pub static ROUND_ENTRY_WALL: AtomicU64 = AtomicU64::new(0);
 // on the BFT timeout-vote path). O(1).
 pub static PRODUCER_HEARTBEAT_MS: AtomicU64 = AtomicU64::new(0);
 pub static PRODUCER_WATCHDOG_STARTED: AtomicU64 = AtomicU64::new(0);
+// Async-runtime liveness beat, stamped by the producer-watchdog TICK (not by production, so it is
+// role-independent) and read by the OUT-OF-RUNTIME stall watchdog. A starved runtime stops advancing
+// it — the one condition every in-runtime watchdog is blind to, because it starves with them.
+pub static RUNTIME_BEAT_MS: AtomicU64 = AtomicU64::new(0);
 // Once-guard for the failover pacemaker task (run_failover_pacemaker).
 pub static PACEMAKER_STARTED: AtomicU64 = AtomicU64::new(0);
 // Gossip-lane consumer heartbeat (ms since epoch), stamped each drained message.

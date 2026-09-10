@@ -947,6 +947,14 @@ impl BlockchainNode {
             loop {
                 interval.tick().await;
 
+                // Runtime beat: stamped before any `continue` below, so it measures the RUNTIME's
+                // ability to run this task at all — which is what the stall watchdog reads.
+                RUNTIME_BEAT_MS.store(
+                    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64).unwrap_or(0),
+                    Ordering::Relaxed,
+                );
+
                 let heartbeat = PRODUCER_HEARTBEAT_MS.load(Ordering::Relaxed);
                 if heartbeat == 0 {
                     // Producer hasn't published its first heartbeat yet — still
@@ -988,6 +996,55 @@ impl BlockchainNode {
                 }
             }
         });
+    }
+
+    /// Runtime-stall watchdog: a plain OS thread, deliberately NOT a tokio task. Every existing
+    /// watchdog runs ON the runtime, so it starves with it and can only report a stall once the stall
+    /// is already over — which is why `deadlock_suspected` never named a cause. This one keeps ticking
+    /// and, at the moment of the stall, probes the lock the runtime is suspected to be waiting on.
+    /// Observability only: it never mutates state, so a false positive cannot affect consensus.
+    pub(super) fn start_runtime_stall_watchdog() {
+        let spawned = std::thread::Builder::new()
+            .name("qnet-stall-watchdog".to_string())
+            .spawn(|| {
+                use std::sync::atomic::Ordering;
+                const TICK_MS: u64 = 250;
+                const STALL_MS: u64 = 2_000;
+                let mut episode_beat: u64 = 0;
+                let mut episode_max: u64 = 0;
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(TICK_MS));
+                    let beat = RUNTIME_BEAT_MS.load(Ordering::Relaxed);
+                    if beat == 0 { continue; }
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64).unwrap_or(0);
+                    let stall_ms = now_ms.saturating_sub(beat);
+                    if stall_ms < STALL_MS {
+                        if episode_beat != 0 {
+                            println!("[INFO][WATCHDOG] runtime_recovered stalled_ms={}", episode_max);
+                            episode_beat = 0;
+                            episode_max = 0;
+                        }
+                        continue;
+                    }
+                    episode_max = episode_max.max(stall_ms);
+                    if episode_beat == beat { continue; } // one report per episode
+                    episode_beat = beat;
+                    // Non-blocking probe: names the suspect instead of just recording the symptom.
+                    let committee_lock = match crate::unified_p2p::CURRENT_COMMITTEE.try_read() {
+                        Some(_) => "free",
+                        None => "held",
+                    };
+                    println!("[CRIT][WATCHDOG] runtime_stalled stall_ms={} committee_lock={} beat_ms={}",
+                             stall_ms, committee_lock, beat);
+                }
+            });
+        if spawned.is_ok() {
+            if is_info() { println!("[INFO][WATCHDOG] stall_watchdog_started tick_ms=250 stall_ms=2000"); }
+        } else if is_warn() {
+            println!("[WARN][WATCHDOG] stall_watchdog_spawn_failed");
+        }
     }
 
     /// Start health monitor for sync flags (prevents permanent deadlock)
