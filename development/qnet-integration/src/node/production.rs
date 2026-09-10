@@ -925,13 +925,12 @@ impl BlockchainNode {
         // ═══════════════════════════════════════════════════════════════════════
         {
             let tc_bytes = self.storage.load_timeout_certificates().unwrap_or(None).unwrap_or_default();
-            let hc_bytes = self.storage.load_highest_certified_rounds().unwrap_or(None).unwrap_or_default();
             // No P2P handle ⇒ install NOTHING: the certified-round tracker is only admissible when
             // the co-persisted TCs behind it were signature-verified, and that verifier lives on P2P.
             match self.unified_p2p.as_ref() {
                 Some(p2p) => {
                     let (tc_n, tc_rej) = p2p.rehydrate_timeout_certificates_verified(&tc_bytes);
-                    let hc_n = crate::unified_p2p::rehydrate_highest_certified_rounds(&hc_bytes);
+                    let hc_n = crate::unified_p2p::rehydrate_highest_certified_rounds();
                     if is_info() {
                         println!("[INFO][CONS] timeout_state_rehydrated certs={} rejected={} hi_cert={}",
                                  tc_n, tc_rej, hc_n);
@@ -956,13 +955,19 @@ impl BlockchainNode {
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
                     ticker.tick().await;
+                    // ONE persisted fact. The certified-round tracker is derived from these on
+                    // restore, so writing it separately is not merely redundant: two writes are two
+                    // moments, and a certificate formed between them came back without its round.
                     let tc = crate::unified_p2p::snapshot_timeout_certificates();
-                    let hc = crate::unified_p2p::snapshot_highest_certified_rounds();
-                    if let Err(e) = storage_flush.save_timeout_certificates(&tc) {
-                        if is_warn() { println!("[WARN][CONS] tcerts_flush_fail err={}", e); }
-                    }
-                    if let Err(e) = storage_flush.save_highest_certified_rounds(&hc) {
-                        if is_warn() { println!("[WARN][CONS] hi_cert_flush_fail err={}", e); }
+                    // RocksDB write, so OFF the runtime: a compaction holding the write path stalls
+                    // whichever worker thread runs it, and with it every other task scheduled there -
+                    // the whole-runtime stall this node logs as runtime_stalled. The blocking pool
+                    // absorbs the wait; only this 2s tick is delayed.
+                    let sf = storage_flush.clone();
+                    match tokio::task::spawn_blocking(move || sf.save_timeout_certificates(&tc)).await {
+                        Ok(Err(e)) => { if is_warn() { println!("[WARN][CONS] tcerts_flush_fail err={}", e); } }
+                        Err(e) => { if is_warn() { println!("[WARN][CONS] cert_flush_join_fail err={}", e); } }
+                        Ok(Ok(())) => {}
                     }
                 }
             });
@@ -6400,8 +6405,14 @@ impl BlockchainNode {
                                 
                                 // CRITICAL: Double-check if block was received during timeout period
                                 // This prevents race condition where block arrives just as timeout triggers
-                                let block_exists = match storage_check.load_microblock(expected_height_timeout) {
-                                    Ok(Some(_)) => {
+                                // Off the runtime: this read fires on every late block, i.e. exactly
+                                // when the node is already under load, and a stall here would starve
+                                // the very tasks that resolve the lateness.
+                                let sc = storage_check.clone();
+                                let block_exists = match tokio::task::spawn_blocking(move || {
+                                    matches!(sc.load_microblock(expected_height_timeout), Ok(Some(_)))
+                                }).await {
+                                    Ok(true) => {
                                         if is_debug() { println!("[DBG][FAIL] block_arrived h={}", expected_height_timeout); }
                                         true
                                     },
@@ -6706,9 +6717,12 @@ impl BlockchainNode {
                         // Give consensus 5 more seconds to complete (total 35s from block 61)
                         tokio::time::sleep(Duration::from_secs(5)).await;
 
-                        let macroblock_exists = storage_check.get_macroblock_by_height(expected_macroblock)
-                            .map(|mb| mb.is_some())
-                            .unwrap_or(false);
+                        let sc = storage_check.clone();
+                        let macroblock_exists = tokio::task::spawn_blocking(move || {
+                            sc.get_macroblock_by_height(expected_macroblock)
+                                .map(|mb| mb.is_some())
+                                .unwrap_or(false)
+                        }).await.unwrap_or(false);
 
                         if macroblock_exists {
                             if is_info() { println!("[INFO][MB] created h={}", expected_macroblock); }

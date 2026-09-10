@@ -15,6 +15,7 @@
 #   ./deploy-genesis.sh 001 003                          # only these
 #   QNET_ROLLBACK_TO_LAST_SEALED=1 ./deploy-genesis.sh   # recover to the last sealed macroblock
 #   QNET_ROLLBACK_TO_HEIGHT=627483 ./deploy-genesis.sh   # or to an exact height
+#   QNET_RECOVERY_HALTED=1 ./deploy-genesis.sh           # chain stopped: M3/M4 not measurable
 set -uo pipefail
 
 IMAGE="ghcr.io/aiqnetlab/qnet-production:latest"
@@ -98,7 +99,7 @@ docker inspect "$N" >/dev/null 2>&1 || { echo "no such container: $N"; exit 1; }
 #                    exactly where it is needed, and a roll cannot be told from a no-op.
 ENVS=""
 while IFS= read -r e; do
-  case "$e" in ''|QNET_ROLLBACK_*|QNET_BUILD_ID=*) continue;; esac
+  case "$e" in ''|QNET_ROLLBACK_*|QNET_RECOVERY_HALTED*|QNET_BUILD_ID=*) continue;; esac
   ENVS="$ENVS -e $(printf '%q' "$e")"
 done < <(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$N")
 
@@ -158,6 +159,18 @@ INNER
   done
   if [ -z "$conv" ]; then echo "  [ERR] $id did not converge within ${REENTRY_TIMEOUT}s — roll stopped"; exit 1; fi
   echo "  M2 converged: gap<10 ($conv)"
+
+  # A HALTED chain cannot satisfy M3/M4: nothing seals and no block advances until the roll that fixes
+  # the halt has finished, so those milestones would gate the roll on the outcome of the roll itself.
+  # M1 and M2 stay enforced — they are meaningful and passable while stopped (the tip is the same
+  # everywhere, so the gap is real). Explicit flag ONLY, never a fallback on timeout: a genuine
+  # liveness fault must never be able to read as "recovery". The gate for such a roll is fleet-level
+  # and is the operator's to check — sealing must resume once the fleet is rolled.
+  if [ -n "${QNET_RECOVERY_HALTED:-}" ]; then
+    echo "  M3/M4 SKIPPED: QNET_RECOVERY_HALTED set — chain is not sealing, per-node re-entry is not"
+    echo "        measurable. Verify fleet-level that sealing resumed before calling this done."
+    continue
+  fi
 
   # M3 — finality re-entry. TWO signals, because a seal alone does not name its signers: the node
   # must have re-entered a checkpoint as a participating validator, and a window at or above that one

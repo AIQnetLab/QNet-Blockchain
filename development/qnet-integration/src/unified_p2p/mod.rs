@@ -4838,13 +4838,6 @@ pub fn snapshot_timeout_certificates() -> Vec<u8> {
     bincode::serialize(&entries).unwrap_or_default()
 }
 
-pub fn snapshot_highest_certified_rounds() -> Vec<u8> {
-    let entries: Vec<(u64, u64)> = HIGHEST_CERTIFIED_ROUND
-        .iter()
-        .map(|e| (*e.key(), *e.value()))
-        .collect();
-    bincode::serialize(&entries).unwrap_or_default()
-}
 
 // v14.8.7: `snapshot_highest_adopted_rounds` / `rehydrate_highest_adopted_rounds`
 // REMOVED together with HIGHEST_ADOPTED_ROUND. The persisted blob for the
@@ -4869,24 +4862,29 @@ pub fn tc_blob_structural(bytes: &[u8]) -> Vec<((u64, u64), TimeoutCertificate)>
     }
 }
 
-/// Rehydrate the certified-round tracker — a pair is installed ONLY when the co-persisted TC blob
-/// (rehydrated first) actually holds that (mb, round) proof. Raw pairs from disk are otherwise a
-/// forgeable production input.
-pub fn rehydrate_highest_certified_rounds(bytes: &[u8]) -> usize {
-    if bytes.is_empty() { return 0; }
-    match bincode::deserialize::<Vec<(u64, u64)>>(bytes) {
-        Ok(entries) => {
-            let mut count = 0usize;
-            for (k, v) in entries {
-                if TIMEOUT_CERTIFICATES.contains_key(&(k, v)) {
-                    HIGHEST_CERTIFIED_ROUND.insert(k, v);
-                    count += 1;
-                }
-            }
-            count
+/// Rehydrate the certified-round tracker by DERIVING it from the certificates rehydrated just
+/// before: it is the highest round this node holds a verified proof for, and nothing else.
+///
+/// It used to be restored from a blob of its own, installed only where the co-persisted TC confirmed
+/// the exact (mb, round). That guard already made the certificates the authority - the blob could
+/// only ever agree with them or be ignored - while adding the one thing that wedges the chain: a way
+/// for the two to DISAGREE. The flusher snapshots and writes them separately, so a certificate formed
+/// between the two snapshots is persisted while its round is not. The node then comes back holding
+/// the proof - which makes broadcast_timeout_vote suppress its vote, correctly, since the round is
+/// already certified - while electing on round 0, waiting for the very leader that certificate
+/// rotated away from. No vote is re-sent, so no peer can complete the round either: every restart
+/// reproduces it. Deriving deletes the second copy, and with it the possibility.
+pub fn rehydrate_highest_certified_rounds() -> usize {
+    let mut count = 0usize;
+    for e in TIMEOUT_CERTIFICATES.iter() {
+        let (mb, round) = *e.key();
+        let raises = HIGHEST_CERTIFIED_ROUND.get(&mb).map(|c| round > *c).unwrap_or(true);
+        if raises {
+            HIGHEST_CERTIFIED_ROUND.insert(mb, round);
+            count += 1;
         }
-        Err(_) => 0,
     }
+    count
 }
 
 // v14.7.2: per-microblock block-commit helpers, leader-lock helpers,
@@ -4960,8 +4958,9 @@ mod tests {
         assert_eq!(observed_tc_window_floor(), 0, "rehydrate never raises the floor");
         // Nothing was signature-verified, so TIMEOUT_CERTIFICATES stays empty and the certified-round
         // tracker cannot be seeded from disk alone — raw pairs are not a production input.
-        let pairs = bincode::serialize(&vec![(7u64, 3u64), (9u64, 5u64)]).unwrap();
-        assert_eq!(rehydrate_highest_certified_rounds(&pairs), 0, "unverified pairs NOT installed");
+        // Nothing verified, so nothing to derive from. The tracker has no on-disk source of its own
+        // any more: a raw pair cannot be a production input by construction, not by a guard.
+        assert_eq!(rehydrate_highest_certified_rounds(), 0, "no certificates means no certified round");
         assert_eq!(highest_certified_round_for(7), 0);
         assert_eq!(highest_certified_round_for(9), 0);
 
@@ -4993,6 +4992,42 @@ mod tests {
         assert!(round_one_short_of_quorum(sw, "g_e"), "quorum-1 others ⇒ self-yield fires");
         assert!(!round_one_short_of_quorum(sw, "g_a"), "already voted this round ⇒ not withholding");
 
+        test_clear_timeout_state();
+    }
+
+    /// A held certificate ALWAYS implies its certified round after a restart.
+    ///
+    /// This is the invariant whose absence stopped the chain at h=869221. The two were persisted by
+    /// separate writes, so a certificate formed between them came back without its round: the node
+    /// held the proof for round 1 - which correctly suppresses re-broadcasting its own vote, the
+    /// round being certified already - while electing on round 0, waiting forever for the leader that
+    /// certificate had rotated away from. Nothing re-sent a vote, so no peer could finish the round
+    /// either, and every restart reproduced it identically.
+    #[test]
+    fn a_held_certificate_implies_its_certified_round_after_restart() {
+        test_clear_timeout_state();
+        let (mb, round) = (9658u64, 1u64);
+        assert_eq!(highest_certified_round_for(mb), 0, "clean state");
+
+        // Exactly what rehydrate_timeout_certificates_verified installs: a verified proof, and
+        // nothing else. There is no second blob to carry the round any more.
+        TIMEOUT_CERTIFICATES.insert((mb, round), TimeoutProof {
+            height: mb,
+            timeout_round: round,
+            anchor: [0u8; 32],
+            votes: vec![SignedTimeoutVote {
+                voter_id: "voter_a".into(), signature: vec![1],
+                high_qc_idx: 0, high_qc_hash: [0u8; 32], tip_height: 0, tip_hash: [0u8; 32],
+            }],
+        });
+
+        assert_eq!(rehydrate_highest_certified_rounds(), 1, "the certificate seeds the round");
+        assert_eq!(highest_certified_round_for(mb), round,
+                   "a node holding a proof must elect on the round that proof certified");
+
+        // Idempotent, and never lowers: re-running finds nothing to raise.
+        assert_eq!(rehydrate_highest_certified_rounds(), 0, "already derived");
+        assert_eq!(highest_certified_round_for(mb), round);
         test_clear_timeout_state();
     }
 
