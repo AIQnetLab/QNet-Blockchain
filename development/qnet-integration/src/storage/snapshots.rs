@@ -1952,8 +1952,18 @@ impl Storage {
             return;
         }
 
-        // The seal watermark is monotonic-up on the normal path; the reader derives it from the
-        // macroblocks that remain, so after the deletions above min(derived, target) is exact.
+        // The seal watermark is re-derived, never trusted. The hint is monotonic-up and the reader
+        // scans forward FROM it, so a node that lost objects below it keeps reporting a frontier it
+        // does not hold and its sync asks for the wrong range forever (003 held only every other
+        // macroblock from 9585 and asked for 9596 up). From the prune floor - the anchor is added by
+        // the reader itself - the scan covers only objects that exist and repairs the hint to them.
+        let floor_mb = self.persistent.db.get_cf(&meta, b"oldest_block").ok().flatten()
+            .filter(|v| v.len() == 8)
+            .map(|v| u64::from_le_bytes(v[..8].try_into().unwrap_or([0u8; 8])) / mi)
+            .unwrap_or(0);
+        if let Err(e) = self.force_last_sealed_mb(floor_mb) {
+            println!("[WARN][ROLLBACK] sealed_watermark_reset_failed to_mb={} err={}", floor_mb, e);
+        }
         let sealed_mb = self.last_sealed_mb_index().min(target_mb);
         if let Err(e) = self.force_last_sealed_mb(sealed_mb) {
             println!("[WARN][ROLLBACK] sealed_watermark_lower_failed to_mb={} err={}", sealed_mb, e);
@@ -3839,7 +3849,8 @@ mod tests_rollback_retraction {
         meta_put(&st, b"last_sealed_mb", &9648u64.to_le_bytes());
         meta_put(&st, b"latest_macroblock_hash", &[0xEEu8; 32]);
         meta_put(&st, b"qc_sig_strip_cursor", &9640u64.to_be_bytes());
-        let mut anchor = 9640u64.to_le_bytes().to_vec();
+        // A cold-join anchor at 9594 (kept: below the target); the watermark scan starts from it.
+        let mut anchor = 9594u64.to_le_bytes().to_vec();
         anchor.extend_from_slice(&[7u8; 32]);
         st.put_snapshot_anchor(&anchor).expect("anchor");
         let mut promote = 867_600u64.to_le_bytes().to_vec();
@@ -3867,7 +3878,7 @@ mod tests_rollback_retraction {
         assert_eq!(st.last_sealed_mb_index(), 9595, "watermark derived from what remains");
         assert_eq!(st.get_latest_macroblock_hash().expect("hash"), kept.hash(), "names the macroblock that remains");
         assert_eq!(meta_get(&st, b"qc_sig_strip_cursor").expect("cursor"), 9595u64.to_be_bytes().to_vec());
-        assert_eq!(&st.get_snapshot_anchor().expect("get").expect("present")[0..8], &0u64.to_le_bytes(), "anchor sentinel");
+        assert_eq!(&st.get_snapshot_anchor().expect("get").expect("present")[0..8], &9594u64.to_le_bytes(), "an anchor within reach stays");
         assert!(meta_get(&st, b"promote_pending").is_none(), "a promote toward the abandoned chain is dropped");
         let pairs: Vec<u64> = st.load_certified_pairs().expect("pairs").into_iter().map(|(i, _)| i).collect();
         assert_eq!(pairs, vec![1000], "pairs by the window they certify; an unreadable one goes too");
@@ -3880,6 +3891,34 @@ mod tests_rollback_retraction {
         assert!(st.get_macroblock_by_height(9595).expect("get").is_some());
         assert_eq!(st.last_sealed_mb_index(), 9595);
         assert_eq!(st.load_certified_pairs().expect("pairs").len(), 1);
+    }
+
+    /// An anchor above the target is a trusted-floor claim about the abandoned chain: reload would
+    /// raise chain_height straight back to it. mb == 0 is the sentinel the reload treats as none.
+    #[test]
+    fn a_rollback_drops_an_anchor_it_put_out_of_reach() {
+        let (st, _d) = temp_storage();
+        let mut anchor = 9640u64.to_le_bytes().to_vec();
+        anchor.extend_from_slice(&[7u8; 32]);
+        st.put_snapshot_anchor(&anchor).expect("anchor");
+        st.retract_chain_position_above(863_550);
+        assert_eq!(&st.get_snapshot_anchor().expect("get").expect("present")[0..8], &0u64.to_le_bytes(), "anchor sentinel");
+    }
+
+    /// The watermark hint can lie upward: the reader scans forward FROM it and never checks the
+    /// objects below. Node 003 held only every other macroblock from 9585, reported 9595, asked its
+    /// peers for 9596 and up, and never healed. The retraction derives the watermark from what
+    /// exists above the anchor, so the sync asks for exactly the hole.
+    #[test]
+    fn a_rollback_derives_the_seal_watermark_from_the_objects_not_the_hint() {
+        let (st, _d) = temp_storage();
+        let mut anchor = 9590u64.to_le_bytes().to_vec();
+        anchor.extend_from_slice(&[7u8; 32]);
+        st.put_snapshot_anchor(&anchor).expect("anchor");
+        for idx in [9591u64, 9592, 9593, 9594, 9596] { seed_macroblock(&st, idx); } // 9595 missing
+        meta_put(&st, b"last_sealed_mb", &9648u64.to_le_bytes());
+        st.retract_chain_position_above(863_550);
+        assert_eq!(st.last_sealed_mb_index(), 9594, "the frontier stops at the first hole, whatever the hint said");
     }
 
     /// The operator's declaration on top: the votes this node cast above the target and the genesis

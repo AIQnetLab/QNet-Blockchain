@@ -2218,7 +2218,9 @@ pub async fn run(
                 // non-member and the repair could never land. The certificate at this index was
                 // signed by the committee this node still holds. Sustained, because a QC legitimately
                 // arrives before its proposal now and then.
-                match driver.frontier_blind() {
+                // The other shape of the same hole: nothing local names the certificate, only
+                // the peers' timeouts do (certificate_gap). Same ask, same backoff.
+                match driver.frontier_blind().or_else(|| driver.certificate_gap()) {
                     Some(idx) => {
                         blind_ticks = blind_ticks.saturating_add(1);
                         // Back off 16s, 32s, 64s, 128s. A blind spot is usually cleared by the first
@@ -2229,8 +2231,9 @@ pub async fn run(
                             blind_ticks = 0;
                             blind_pulls = blind_pulls.saturating_add(1);
                             if crate::node::is_warn() {
-                                println!("[WARN][BFT2] frontier_blind qc_index={} next_window={} — pulling that checkpoint",
-                                         idx, driver.next_window());
+                                println!("[WARN][BFT2] certificate_pull idx={} next_window={} reason={}",
+                                         idx, driver.next_window(),
+                                         if driver.frontier_blind().is_some() { "checkpoint_missing" } else { "peers_hold_it" });
                             }
                             p2p.request_consensus_state(idx);
                         }

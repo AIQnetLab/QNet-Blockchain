@@ -489,6 +489,16 @@ impl ConsensusDriver {
         if idx < floor { None } else { Some(idx) }
     }
 
+    /// A certificate at least f+1 members hold and this node does not. frontier_blind sees a
+    /// certificate whose checkpoint is missing; this is the case with nothing at all - the node
+    /// was down for the proposal and the votes alike, and its peers' timeouts are the only thing
+    /// that names it. Live at 863640: one node at the old frontier, five at the new, quorum five.
+    pub fn certificate_gap(&self) -> Option<u64> {
+        let claimed = self.eng.quorum_high_qc_index();
+        let ours = self.eng.high_qc.as_ref().map(|q| q.index).unwrap_or(0);
+        if claimed > ours { Some(claimed) } else { None }
+    }
+
     /// Catch-up: ingest a VERIFIED committed checkpoint + QC.
     pub fn sync(&mut self, cp: &Checkpoint, qc: &QuorumCertificate) -> Vec<Effect> {
         if cp.index != qc.index || cp.hash() != qc.checkpoint_hash { return Vec::new(); }

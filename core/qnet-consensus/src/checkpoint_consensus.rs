@@ -30,6 +30,9 @@ pub struct CheckpointConsensus {
     /// Newest timeout index seen per member — the view-sync input for the f+1 jump across
     /// DISTINCT indices (views scattered by restarts never meet on one index otherwise).
     peer_views: HashMap<NodeId, u64>,
+    /// Newest certificate index each member claimed in a timeout. A node that missed a
+    /// certificate's proposal AND its votes holds nothing that names it; only these claims do.
+    peer_high_qc: HashMap<NodeId, u64>,
     qcs: HashMap<u64, QuorumCertificate>,
     /// The recovery anchor this node armed for, or None. PARTICIPATION only — it gates what this node
     /// proposes/votes/counts, never what is VALID. `on_vote` recomputes the threshold from the live
@@ -68,7 +71,8 @@ impl CheckpointConsensus {
             node_id, committee, current_index: 1, last_voted_index: 0,
             high_qc: None, locked_index: 0, committed_index: 0,
             proposals: HashMap::new(), votes: HashMap::new(),
-            timeouts: HashMap::new(), peer_views: HashMap::new(), qcs: HashMap::new(),
+            timeouts: HashMap::new(), peer_views: HashMap::new(), peer_high_qc: HashMap::new(),
+            qcs: HashMap::new(),
             relaxed: None, head_votes: HashMap::new(), index_votes: HashMap::new(),
         }
     }
@@ -152,6 +156,16 @@ impl CheckpointConsensus {
     fn quorum(&self) -> usize { quorum_size(self.committee.len()) }
     fn f(&self) -> usize { self.committee.len().saturating_sub(1) / 3 }
 
+    /// The highest certificate index at least f+1 members claim to hold - the (f+1)-th highest
+    /// claim, so no f liars can name one that does not exist; 0 below f+1 claims.
+    pub fn quorum_high_qc_index(&self) -> u64 {
+        let f = self.f();
+        let mut v: Vec<u64> = self.peer_high_qc.values().copied().collect();
+        if v.len() < f + 1 { return 0; }
+        v.sort_unstable_by(|a, b| b.cmp(a));
+        v[f]
+    }
+
     fn is_leader(&self, index: u64, proposer: &str, parent_hash: &Hash) -> bool {
         if self.committee.is_empty() { return false; }
         let li = leader_index(index, parent_hash, self.committee.len());
@@ -164,6 +178,7 @@ impl CheckpointConsensus {
     pub fn set_committee(&mut self, mut committee: Vec<NodeId>) {
         committee.sort();
         self.peer_views.retain(|id, _| committee.binary_search(id).is_ok());
+        self.peer_high_qc.retain(|id, _| committee.binary_search(id).is_ok());
         self.committee = committee;
     }
 
@@ -319,6 +334,9 @@ impl CheckpointConsensus {
     pub fn on_timeout_msg(&mut self, tm: &TimeoutMsg) -> Vec<Action> {
         let q = self.quorum();
         let f = self.f();
+        // Recorded at ANY distance, like peer_views: the claim is what lets a node that holds no
+        // trace of a certificate ask for it.
+        self.peer_high_qc.insert(tm.voter.clone(), tm.high_qc_index);
         // Tally only near the current view: one member spraying far-future indices must not grow
         // the per-index map unboundedly. peer_views (one slot per member) still records it, so the
         // f+1-distinct jump below works at ANY distance and the tally resumes once we arrive.
@@ -1064,5 +1082,25 @@ mod tests {
         assert!(eng2.on_proposal(&strict_same_head, &hh(0)).is_empty(),
                 "an unpinned conflicting vote at a pinned head must be refused");
         assert!(pinned_double_vote(&first, &strict_same_head));
+    }
+    /// A member that missed a certificate's proposal and its votes learns of it only from the
+    /// certificate index its peers claim in their timeouts. One claim proves nothing; f+1 do.
+    #[test]
+    fn peers_timeouts_name_the_certificate_this_node_missed() {
+        let c: Vec<NodeId> = (0..6).map(|i| format!("n{}", i)).collect(); // f = 1
+        let mut eng = CheckpointConsensus::new("n0".into(), c.clone());
+        let tm = |voter: &str, idx: u64, hq: u64| TimeoutMsg {
+            index: idx, voter: voter.into(), high_qc_index: hq, signature: Vec::new() };
+        assert_eq!(eng.quorum_high_qc_index(), 0, "no claims");
+        eng.on_timeout_msg(&tm("n1", 40, 32094));
+        assert_eq!(eng.quorum_high_qc_index(), 0, "one claim is one liar's word");
+        eng.on_timeout_msg(&tm("n2", 40, 32094));
+        assert_eq!(eng.quorum_high_qc_index(), 32094, "f+1 distinct members claim it");
+        eng.on_timeout_msg(&tm("n3", 41, 32036));
+        assert_eq!(eng.quorum_high_qc_index(), 32094, "a lower claim does not pull it down");
+        // A claim from outside the committee is dropped with the member.
+        eng.on_timeout_msg(&tm("stranger", 40, 99_999));
+        eng.set_committee(c.clone());
+        assert_eq!(eng.quorum_high_qc_index(), 32094);
     }
 }
