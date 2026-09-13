@@ -770,13 +770,34 @@ impl Storage {
         // Same span as the prune floor, or a boot/reorg re-canonicalise would re-narrow the index the
         // deep readers depend on.
         let start_sw = (up_to_height / 1440).saturating_sub(LHB_RETAINED_SUBWINDOWS);
+        // The lowest subwindow the bodies covered end to end. A body missing at h leaves its subwindow
+        // and everything below uncertain, so the prune watermark may not claim them.
+        let mut complete_from_sw = start_sw;
         for h in start_sw.saturating_mul(1440)..=up_to_height {
-            if let Ok(Some(block)) = self.load_microblock_auto_format(h) {
-                for tx in &block.transactions {
-                    if let qnet_state::TransactionType::Heartbeat { node_id, anchor_height, .. } = &tx.tx_type {
-                        let _ = self.index_heartbeat_inclusion(node_id, *anchor_height, h);
+            match self.load_microblock_auto_format(h) {
+                Ok(Some(block)) => {
+                    for tx in &block.transactions {
+                        if let qnet_state::TransactionType::Heartbeat { node_id, anchor_height, .. } = &tx.tx_type {
+                            let _ = self.index_heartbeat_inclusion(node_id, *anchor_height, h);
+                        }
                     }
                 }
+                _ => complete_from_sw = h / 1440 + 1,
+            }
+        }
+        // The watermark says "rows below this subwindow are gone". A tip that later moved DOWN (an
+        // operator rollback past the derivation horizon) leaves it above what the readers at the new
+        // tip need, and they fail closed on every node at once: the whole fleet abstained at the first
+        // window end after 868320 -> 863550 (watermark 599, needed 598). The re-index above rebuilt
+        // the rows from `complete_from_sw` up, so the watermark comes back to it; one already lower
+        // stays - those rows were carried, not pruned.
+        if let Some(meta_cf) = self.persistent.db.cf_handle("metadata") {
+            let have = self.persistent.db.get_cf(&meta_cf, b"lhb_pb")?
+                .and_then(|v| v[..8.min(v.len())].try_into().ok().map(u64::from_be_bytes)).unwrap_or(0);
+            if have > complete_from_sw {
+                self.persistent.db.put_cf(&meta_cf, b"lhb_pb", &complete_from_sw.to_be_bytes())?;
+                println!("[INFO][ROSTER] heartbeat_prune_watermark_lowered from_sw={} to_sw={} up_to={}",
+                         have, complete_from_sw, up_to_height);
             }
         }
         Ok(())

@@ -7115,53 +7115,60 @@ mod tests {
 
     // lhb_ liveness index == body scan, byte-identical (Phase-2A eligibility feeds epoch_commitment;
     // any index/scan divergence is a fork). Covers min-inclusion, reorg canonicalize, re-apply recovery.
+    fn hb_tx(node_id: &str, anchor_height: u64) -> qnet_state::Transaction {
+        // Storage stores txs separately keyed by 64-hex hash — must be valid hex, unique per tx.
+        let uniq = node_id.bytes().fold(anchor_height, |a, b| a.wrapping_mul(131).wrapping_add(b as u64));
+        qnet_state::Transaction {
+            from: node_id.to_string(),
+            to: None,
+            amount: 0,
+            tx_type: qnet_state::TransactionType::Heartbeat {
+                node_id: node_id.to_string(),
+                anchor_height,
+                anchor_hash: String::new(),
+            },
+            timestamp: 0,
+            hash: format!("{:064x}", uniq),
+            signature: None,
+            public_key: None,
+            gas_price: u64::MAX,
+            gas_limit: 0,
+            nonce: 1,
+            data: None,
+            dilithium_signature: None,
+            dilithium_public_key: Some(node_id.to_string().into_bytes()),
+            chain_id: qnet_state::transaction::QNET_CHAIN_ID,
+        }
+    }
+    fn put_block(storage: &crate::storage::Storage, height: u64, txs: Vec<qnet_state::Transaction>) {
+        put_linked_block(storage, height, txs, [0u8; 32]);
+    }
+    /// Same, linked to `previous_hash` (the store refuses a block whose stored parent does not match);
+    /// returns this block's hash for the next one.
+    fn put_linked_block(storage: &crate::storage::Storage, height: u64, txs: Vec<qnet_state::Transaction>, previous_hash: [u8; 32]) -> [u8; 32] {
+        let mb = qnet_state::MicroBlock {
+            height,
+            timestamp: 0,
+            transactions: txs,
+            producer: "genesis_node_001".to_string(),
+            signature: vec![0u8; 64],
+            merkle_root: [0u8; 32],
+            previous_hash,
+            vrf_output: None,
+            vrf_proof: None,
+            fees_collected: 0,
+            state_root: [0u8; 32],
+            timeout_round: 0,
+            carried_baseline: 0,
+            timeout_proof: None,
+        };
+        let data = bincode::serialize(&mb).expect("serialize");
+        storage.save_microblock(height, &data).expect("save");
+        mb.hash()
+    }
+
     #[test]
     fn heartbeat_index_matches_body_scan() {
-        fn hb_tx(node_id: &str, anchor_height: u64) -> qnet_state::Transaction {
-            // Storage stores txs separately keyed by 64-hex hash — must be valid hex, unique per tx.
-            let uniq = node_id.bytes().fold(anchor_height, |a, b| a.wrapping_mul(131).wrapping_add(b as u64));
-            qnet_state::Transaction {
-                from: node_id.to_string(),
-                to: None,
-                amount: 0,
-                tx_type: qnet_state::TransactionType::Heartbeat {
-                    node_id: node_id.to_string(),
-                    anchor_height,
-                    anchor_hash: String::new(),
-                },
-                timestamp: 0,
-                hash: format!("{:064x}", uniq),
-                signature: None,
-                public_key: None,
-                gas_price: u64::MAX,
-                gas_limit: 0,
-                nonce: 1,
-                data: None,
-                dilithium_signature: None,
-                dilithium_public_key: Some(node_id.to_string().into_bytes()),
-                chain_id: qnet_state::transaction::QNET_CHAIN_ID,
-            }
-        }
-        fn put_block(storage: &crate::storage::Storage, height: u64, txs: Vec<qnet_state::Transaction>) {
-            let mb = qnet_state::MicroBlock {
-                height,
-                timestamp: 0,
-                transactions: txs,
-                producer: "genesis_node_001".to_string(),
-                signature: vec![0u8; 64],
-                merkle_root: [0u8; 32],
-                previous_hash: [0u8; 32],
-                vrf_output: None,
-                vrf_proof: None,
-                fees_collected: 0,
-                state_root: [0u8; 32],
-                timeout_round: 0,
-                carried_baseline: 0,
-                timeout_proof: None,
-            };
-            let data = bincode::serialize(&mb).expect("serialize");
-            storage.save_microblock(height, &data).expect("save");
-        }
         let _dir = tempfile::TempDir::new().expect("tempdir");
         let storage = crate::storage::Storage::new(_dir.path().to_str().unwrap()).expect("storage");
 
@@ -7200,6 +7207,44 @@ mod tests {
                        recent_heartbeat_senders_scan(&storage, scan_end),
                        "post-reapply index != scan at scan_end={}", scan_end);
         }
+    }
+
+    /// A rollback deeper than the heartbeat index retention leaves the prune watermark above the
+    /// subwindows the roster derivation needs at the new tip, and the reader then fails closed on
+    /// EVERY node: the fleet abstained at the first window end after rolling 868320 -> 863550
+    /// (watermark 599, needed 598), and the chain would have parked at the derivation horizon again.
+    /// Canonicalizing from the retained bodies re-creates those rows, so the watermark must come
+    /// back down to the first subwindow the bodies cover end to end - and no further.
+    #[test]
+    fn canonicalizing_from_bodies_lowers_the_prune_watermark_to_what_they_cover() {
+        let _dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = crate::storage::Storage::new(_dir.path().to_str().unwrap()).expect("storage");
+        let tip = 2 * 1440 + 10;                                  // subwindows 0, 1, 2 - all bodies present
+        let mut prev = [0u8; 32];
+        for h in 0..=tip {
+            let txs = match h {
+                700 => vec![hb_tx("super_a", 650)],
+                1500 => vec![hb_tx("super_b", 1450)],
+                2885 => vec![hb_tx("super_c", 2881)],
+                _ => Vec::new(),
+            };
+            prev = put_linked_block(&storage, h, txs, prev);
+        }
+        // The abandoned tip pruned below subwindow 2: a reader that needs subwindows 0/1 refuses.
+        storage.put_registry_row_for_test("metadata", b"lhb_pb", &2u64.to_be_bytes());
+        assert!(recent_heartbeat_senders(&storage, 1500).is_none(), "fails closed while the watermark is high");
+
+        storage.canonicalize_heartbeat_index(tip).expect("canonicalize");
+        let set = recent_heartbeat_senders(&storage, 1500).expect("bodies covered subwindows 0 and 1");
+        assert_eq!(set, recent_heartbeat_senders_scan(&storage, 1500), "index == body scan");
+        assert!(set.contains("super_a") && set.contains("super_b"));
+
+        // A body missing in subwindow 0 leaves that subwindow uncertain: the watermark stops at 1.
+        storage.delete_microblock(700).expect("drop body");
+        storage.put_registry_row_for_test("metadata", b"lhb_pb", &2u64.to_be_bytes());
+        storage.canonicalize_heartbeat_index(tip).expect("canonicalize");
+        assert!(recent_heartbeat_senders(&storage, 1500).is_none(), "subwindow 0 is not provably complete");
+        assert!(recent_heartbeat_senders(&storage, 2885).is_some(), "subwindows 1 and 2 are");
     }
 
     // committee_for_height determinism: genesis era ⇒ None (caller uses the genesis committee), and
