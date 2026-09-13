@@ -2614,6 +2614,17 @@ impl PersistentStorage {
             batch.delete_cf(&snapshots_cf, format!("ipfs_{}", height).as_bytes());
         }
 
+        // The epoch root save_macroblock wrote atomically with this macroblock goes with it - a root
+        // without its macroblock breaks the invariant stated there, and a survivor from an abandoned
+        // window makes the re-sealed window an "equivocation" at the same epoch, which the save
+        // refuses. The fold memo covered that epoch; it is a pure cache and rebuilds itself.
+        if let Some(epoch) = crate::reward_epoch::epoch_of_emission_mb(macroblock_index) {
+            if let Some(rewards_cf) = self.db.cf_handle("pending_rewards") {
+                batch.delete_cf(&rewards_cf, super::Storage::epoch_root_key(epoch).as_bytes());
+                batch.delete_cf(&rewards_cf, b"epoch_fold_head");
+            }
+        }
+
         self.db.write(batch)?;
         super::MACROBLOCK_DELETE_SEQ.fetch_add(1, Ordering::Relaxed);
 

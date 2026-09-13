@@ -1073,11 +1073,6 @@ impl Storage {
         self.persistent.get_macroblock_by_height(macroblock_index)
     }
     
-    /// PRODUCTION v2.45: Delete macroblock by index (for fork recovery)
-    pub fn delete_macroblock(&self, macroblock_index: u64) -> IntegrationResult<()> {
-        self.persistent.delete_macroblock(macroblock_index)
-    }
-    
     /// Save checkpoint block for Progressive Finalization
     pub async fn save_checkpoint(&self, height: u64, block: &qnet_state::MacroBlock) -> Result<(), String> {
         // Serialize and save as checkpoint

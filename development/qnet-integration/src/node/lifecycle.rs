@@ -63,6 +63,13 @@ impl BlockchainNode {
     async fn rollback_storage_to(storage: &Arc<Storage>, target: u64) -> Result<u64, String> {
         let local_h = storage.get_chain_height().map_err(|e| e.to_string())?;
         if target >= local_h { return Ok(0); }
+        // The rows these blocks wrote through to the accounts CF outlive their deletion; the boot
+        // true-up removes exactly the addresses they touched, so journal them before the bodies go -
+        // the same journal the fork rollback and the recovery decree stage.
+        let (staged, dropped) = storage.stage_trueup_for_range(target + 1, local_h);
+        if dropped > 0 {
+            println!("[CRIT][ROLLBACK] trueup_candidates_truncated staged={} dropped={}", staged, dropped);
+        }
         for h in (target + 1)..=local_h {
             if h % 256 == 0 { crate::storage::note_rollback_progress(); }
             crate::block_pipeline::clear_contradicted_tail(h);
@@ -153,80 +160,24 @@ impl BlockchainNode {
                 return; // the chain did not move: lowering the mark under it would be unfounded
             }
         }
-        // The persisted snapshot anchor is a trusted-floor claim about the chain this rollback has
-        // just discarded. Left in place it outlives the truncation: reload_snapshot_anchor runs a few
-        // seconds later in the same boot and raises chain_height back to anchor_mb * 90 - a height
-        // whose blocks were deleted a moment earlier. The node then reports a tip it does not hold,
-        // reads itself as behind, and syncs forever against a block no peer has either, because every
-        // peer rolled back too. Clearing it is the same declaration the rollback already makes about
-        // the signing mark below, and only for an anchor the operator has just put out of reach.
-        Self::drop_snapshot_anchor_above(storage, target);
+        // Every durable marker that still names chain above the target. Each outlives the truncation
+        // on its own and each was seen putting the fleet back on the abandoned tip: the snapshot
+        // anchor and the snapshots re-raise chain_height in the same boot, a macroblock object floors
+        // the network-height oracle, certified pairs reboot the driver at the abandoned frontier, and
+        // the seal watermark keeps reporting it. One retraction, shared with the recovery decree.
+        storage.retract_chain_position_above(target);
 
-        // Same declaration, same class of artifact. A snapshot above the target is a complete picture
-        // of the chain this rollback abandoned, and the runtime adopt path takes it: it raises
-        // chain_height to the snapshot height and re-persists the anchor that was just dropped. The
-        // node then holds no block above the truncation yet reports the snapshot's tip.
-        match storage.prune_snapshots_above(target) {
-            Ok(0) => {}
-            Ok(n) => println!("[INFO][ROLLBACK] snapshots_pruned above={} dropped={}", target, n),
-            Err(e) => println!("[WARN][ROLLBACK] snapshot_prune_failed target={} err={}", target, e),
-        }
-
-        // And the macroblock objects. qc_verified_frontier_height() scans for the highest STORED
-        // macroblock above local progress and raises QC_VERIFIED_FRONTIER to it - a monotonic floor
-        // under get_max_peer_height. Left behind, one object above the target makes the node read the
-        // network as thousands of blocks ahead of a tip nobody holds, so it syncs forever instead of
-        // producing the next block. Bounded window, comfortably wider than that scan's own 128.
-        Self::prune_macroblocks_above(storage, target);
+        // The operator's declaration: the whole fleet abandons that chain, so this node's own vote
+        // commitments above the target and the genesis capsule for it go too. Restored, the
+        // commitments put the engine at the abandoned chain's last voted index, where it ignores
+        // every proposal of the re-produced windows - nothing certifies, nothing seals, and
+        // production parks 2880 blocks up, exactly where the fleet stopped at 866430.
+        storage.abandon_chain_claims_above(target);
 
         // Against the height the node actually ends up at: the target may sit above a tip this node
         // never reached, and the mark must never be lowered below what the chain still holds.
         let effective = storage.get_chain_height().unwrap_or(target).min(target);
         Self::lower_signing_mark_to(storage, effective);
-    }
-
-    /// Delete macroblock objects describing chain above `target`. Existence of one is what
-    /// qc_verified_frontier_height() reads as "QC-verified up to here", and that frontier floors the
-    /// network-height oracle, so an object the rollback left behind keeps the node permanently behind
-    /// a tip it just discarded. Bounded scan: the frontier probe itself never looks further than
-    /// local_mb + 128, so this window cannot miss what it would find.
-    fn prune_macroblocks_above(storage: &Arc<Storage>, target: u64) {
-        const SCAN_WINDOW_MB: u64 = 1024;
-        let mi = qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
-        let target_mb = target / mi;
-        let mut dropped = 0u64;
-        for idx in (target_mb + 1)..=(target_mb + SCAN_WINDOW_MB) {
-            if storage.get_macroblock_by_height(idx).ok().flatten().is_none() { continue; }
-            match storage.delete_macroblock(idx) {
-                Ok(_) => dropped += 1,
-                Err(e) => println!("[WARN][ROLLBACK] macroblock_delete_failed idx={} err={}", idx, e),
-            }
-        }
-        if dropped > 0 {
-            println!("[INFO][ROLLBACK] macroblocks_pruned above_mb={} dropped={}", target_mb, dropped);
-        }
-    }
-
-    /// Invalidate a persisted snapshot anchor that sits above `target`. mb == 0 is the sentinel
-    /// `reload_snapshot_anchor` already treats as "no anchor", so this needs no new format and no new
-    /// read path. An anchor at or below the target still describes chain the node keeps, and stays.
-    fn drop_snapshot_anchor_above(storage: &Arc<Storage>, target: u64) {
-        let bytes = match storage.get_snapshot_anchor() {
-            Ok(Some(b)) if b.len() == 40 => b,
-            _ => return,
-        };
-        let mut mb = [0u8; 8];
-        mb.copy_from_slice(&bytes[0..8]);
-        let anchor_mb = u64::from_le_bytes(mb);
-        let anchor_h = anchor_mb.saturating_mul(qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL);
-        if anchor_mb == 0 || anchor_h <= target {
-            return;
-        }
-        match storage.put_snapshot_anchor(&[0u8; 40]) {
-            Ok(_) => println!("[INFO][ROLLBACK] snapshot_anchor_dropped mb={} anchor_h={} target={}",
-                              anchor_mb, anchor_h, target),
-            Err(e) => println!("[WARN][ROLLBACK] snapshot_anchor_drop_failed mb={} err={}", anchor_mb, e),
-        }
     }
 
     /// Create a new blockchain node with default settings (backward compatibility)
@@ -4152,49 +4103,4 @@ impl BlockchainNode {
         }
     }
     
-}
-
-#[cfg(test)]
-mod tests_rollback_snapshot_anchor {
-    use super::*;
-    use crate::storage::Storage;
-    use std::sync::Arc;
-
-    fn temp_storage() -> (Arc<Storage>, tempfile::TempDir) {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let st = Storage::new(dir.path().to_str().unwrap()).expect("storage");
-        (Arc::new(st), dir)
-    }
-
-    fn anchor_bytes(mb: u64) -> Vec<u8> {
-        let mut b = mb.to_le_bytes().to_vec();
-        b.extend_from_slice(&[7u8; 32]);
-        b
-    }
-
-    /// An operator rollback declares the chain above its target abandoned. The snapshot anchor is a
-    /// trusted-floor claim about exactly that chain, and reload_snapshot_anchor raises chain_height
-    /// back to it later in the SAME boot - to a height whose blocks the truncation deleted seconds
-    /// earlier. The node then reports a tip it does not hold, reads itself as behind, and syncs
-    /// forever against a block no peer kept either, because every peer rolled back too. Six nodes sat
-    /// like that at h=863550 with block 863551 present nowhere.
-    #[test]
-    fn a_rollback_drops_a_snapshot_anchor_it_put_out_of_reach() {
-        let (st, _d) = temp_storage();
-        let mi = qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
-
-        // Above the target: invalidated, so the boot reload finds the mb == 0 sentinel and no-ops.
-        st.put_snapshot_anchor(&anchor_bytes(9640)).expect("put");
-        BlockchainNode::drop_snapshot_anchor_above(&st, 863_550);
-        let after = st.get_snapshot_anchor().expect("get").expect("present");
-        assert_eq!(&after[0..8], &0u64.to_le_bytes(),
-                   "an anchor the rollback put out of reach must not survive it");
-
-        // At or below the target it still describes chain the node keeps, so it stays.
-        let keep = 9000u64;
-        st.put_snapshot_anchor(&anchor_bytes(keep)).expect("put");
-        BlockchainNode::drop_snapshot_anchor_above(&st, keep * mi);
-        let after = st.get_snapshot_anchor().expect("get").expect("present");
-        assert_eq!(&after[0..8], &keep.to_le_bytes(), "an anchor within reach is kept");
-    }
 }

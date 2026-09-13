@@ -865,6 +865,19 @@ impl Storage {
                 if h > up_to_height { batch.delete_cf(&meta_cf, &k); }
             }
         }
+        // Its sibling seal at the same heads: a stale one reads as "this head is applied and sealed".
+        for item in self.persistent.db.iterator_cf(&meta_cf, IteratorMode::From(b"ts_seal_", Direction::Forward)) {
+            let (k, _) = match item {
+                Ok(kv) => kv,
+                Err(e) => return Err(IntegrationError::StorageError(
+                    format!("total_supply_seal iterator failed: {}", e))),
+            };
+            if !k.starts_with(b"ts_seal_") { break; }
+            if k.len() == 8 + 8 {
+                let h = u64::from_be_bytes(k[8..16].try_into().unwrap_or([0u8; 8]));
+                if h > up_to_height { batch.delete_cf(&meta_cf, &k); }
+            }
+        }
         let mut key = b"rr_seal_".to_vec();
         key.extend_from_slice(&up_to_height.to_be_bytes());
         batch.put_cf(&meta_cf, &key, &root);

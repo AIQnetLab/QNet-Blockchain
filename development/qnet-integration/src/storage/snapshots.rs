@@ -153,9 +153,6 @@ impl Storage {
     pub fn set_applied_decree_seq(&self, seq: u64) -> IntegrationResult<()> {
         self.persistent.set_applied_decree_seq(seq)
     }
-    pub fn delete_macroblock_pub(&self, idx: u64) -> IntegrationResult<()> {
-        self.persistent.delete_macroblock(idx)
-    }
     pub fn force_last_sealed_mb(&self, idx: u64) -> IntegrationResult<()> {
         self.persistent.force_last_sealed_mb(idx)
     }
@@ -1839,6 +1836,176 @@ impl Storage {
         Ok(dropped)
     }
 
+    /// Bring every durable marker that names chain ABOVE `target` back to it. The blocks themselves
+    /// are the caller's job (boot rollback, recovery decree, snapshot regress); this is everything
+    /// else a later boot or the running node reads as "the chain reaches here": macroblock objects
+    /// and the epoch roots sealed with them, snapshots and their pointer, the cold-join anchor, a
+    /// pending promote, certified pairs by the window they certify, the seal watermark and the
+    /// latest-macroblock hash, the QC-strip cursor, the consensus round, timeout certificates and
+    /// the sync resume point, and the epoch roots certified above it. Idempotent: a crash between
+    /// steps re-runs on the next boot.
+    pub fn retract_chain_position_above(&self, target: u64) {
+        const MACROBLOCK_SCAN_WINDOW: u64 = 1024;
+        let mi = qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
+        let target_mb = target / mi;
+
+        // Macroblocks first: the watermark below is derived from what remains. The bound covers a
+        // current watermark, a stale one far above the tip, and a tip not yet lowered (live regress).
+        let upper = self.last_sealed_mb_index()
+            .max(self.get_chain_height().unwrap_or(0) / mi + 1)
+            .max(target_mb + MACROBLOCK_SCAN_WINDOW);
+        let mut macroblocks = 0u64;
+        for idx in (target_mb + 1)..=upper {
+            if self.get_macroblock_by_height(idx).ok().flatten().is_none() { continue; }
+            match self.persistent.delete_macroblock(idx) {
+                Ok(()) => macroblocks += 1,
+                Err(e) => println!("[WARN][ROLLBACK] macroblock_delete_failed idx={} err={}", idx, e),
+            }
+        }
+        let snapshots = match self.prune_snapshots_above(target) {
+            Ok(n) => n,
+            Err(e) => { println!("[WARN][ROLLBACK] snapshot_prune_failed target={} err={}", target, e); 0 }
+        };
+
+        let meta = match self.persistent.db.cf_handle("metadata") {
+            Some(cf) => cf,
+            None => { println!("[WARN][ROLLBACK] retract_failed reason=no_metadata_cf"); return; }
+        };
+        let mut batch = rocksdb::WriteBatch::default();
+
+        // A promote still pending above the target would put the node back on the chain it left.
+        let mut promote_dropped = false;
+        if let Ok(Some(m)) = self.persistent.db.get_cf(&meta, b"promote_pending") {
+            if m.len() >= 8 {
+                let h = u64::from_le_bytes(m[..8].try_into().unwrap_or([0u8; 8]));
+                if h > target {
+                    batch.delete_cf(&meta, b"promote_pending");
+                    let _ = self.discard_snapshot_state(h);
+                    promote_dropped = true;
+                }
+            }
+        }
+        // The cold-join anchor: mb == 0 is the sentinel reload_snapshot_anchor treats as "none".
+        let mut anchor_dropped = false;
+        if let Ok(Some(a)) = self.persistent.db.get_cf(&meta, b"snapshot_anchor") {
+            if a.len() >= 8 {
+                let mb = u64::from_le_bytes(a[..8].try_into().unwrap_or([0u8; 8]));
+                if mb > 0 && mb.saturating_mul(mi) > target {
+                    batch.put_cf(&meta, b"snapshot_anchor", &[0u8; 40]);
+                    anchor_dropped = true;
+                }
+            }
+        }
+        // Certified pairs by the WINDOW they certify - the pair index is the view counter, not a
+        // macroblock index. Head from its key when it has one, else from the pair itself; a pair
+        // whose head cannot be read goes too.
+        let mut pairs = 0u64;
+        for (idx, bytes) in self.load_certified_pairs().unwrap_or_default() {
+            let head = self.persistent.db.get_cf(&meta, super::certified_pair_head_key(idx)).ok().flatten()
+                .filter(|v| v.len() == 8)
+                .map(|v| u64::from_le_bytes(v[..8].try_into().unwrap_or([0u8; 8])))
+                .or_else(|| bincode::deserialize::<Vec<crate::consensus_v2_driver::ConsensusMsg>>(&bytes).ok()
+                    .and_then(|p| p.iter().find_map(|m| match m {
+                        crate::consensus_v2_driver::ConsensusMsg::Proposal(cp) => Some(cp.window_head_height),
+                        _ => None,
+                    })));
+            if head.map_or(true, |h| h > target) {
+                batch.delete_cf(&meta, super::certified_pair_key(idx));
+                batch.delete_cf(&meta, super::certified_pair_head_key(idx));
+                pairs += 1;
+            }
+        }
+        // Epoch roots whose certifying macroblock is above the target, whether or not that object still
+        // exists: an earlier prune that took the object without its root leaves exactly this orphan,
+        // and save_macroblock refuses the re-sealed window as an equivocation against it. The fold
+        // memo covered those epochs; it is a pure cache.
+        let mut roots = 0u64;
+        if let Some(rewards) = self.persistent.db.cf_handle("pending_rewards") {
+            for e in self.reward_epochs_from(0).unwrap_or_default() {
+                if crate::reward_epoch::certifying_mb_index(e).map_or(true, |mb| mb > target_mb) {
+                    batch.delete_cf(&rewards, Storage::epoch_root_key(e).as_bytes());
+                    roots += 1;
+                }
+            }
+            if roots > 0 { batch.delete_cf(&rewards, b"epoch_fold_head"); }
+        }
+        // The QC-signature strip cursor: a re-sealed window below it would keep its signatures forever.
+        if let Ok(Some(c)) = self.persistent.db.get_cf(&meta, b"qc_sig_strip_cursor") {
+            if c.len() == 8 && u64::from_be_bytes(c[..8].try_into().unwrap_or([0u8; 8])) > target_mb {
+                batch.put_cf(&meta, b"qc_sig_strip_cursor", &target_mb.to_be_bytes());
+            }
+        }
+        // The round a boot would ask peers to resume, the certificates that would rotate the producer
+        // of a window nobody produced, and the sync resume point; live traffic rewrites what it needs.
+        if let Some(cons) = self.persistent.db.cf_handle("consensus") {
+            batch.delete_cf(&cons, b"latest_round");
+            batch.delete_cf(&cons, b"tcerts_v1");
+        }
+        if let Some(sync) = self.persistent.db.cf_handle("sync_state") {
+            batch.delete_cf(&sync, b"sync_progress");
+        }
+        // Nothing below runs on a failed batch: with the anchor still in place the watermark reader
+        // would repair the hint straight back up to it, so a partial retraction must stay visible
+        // and re-run on the next boot rather than look complete.
+        if let Err(e) = self.persistent.db.write(batch) {
+            println!("[WARN][ROLLBACK] retract_batch_failed target={} err={}", target, e);
+            return;
+        }
+
+        // The seal watermark is monotonic-up on the normal path; the reader derives it from the
+        // macroblocks that remain, so after the deletions above min(derived, target) is exact.
+        let sealed_mb = self.last_sealed_mb_index().min(target_mb);
+        if let Err(e) = self.force_last_sealed_mb(sealed_mb) {
+            println!("[WARN][ROLLBACK] sealed_watermark_lower_failed to_mb={} err={}", sealed_mb, e);
+        }
+        match self.macroblock_hash_at(sealed_mb) {
+            Some(h) => { let _ = self.persistent.db.put_cf(&meta, b"latest_macroblock_hash", &h); }
+            None => { let _ = self.persistent.db.delete_cf(&meta, b"latest_macroblock_hash"); }
+        }
+        println!("[INFO][ROLLBACK] position_retracted target={} macroblocks={} epoch_roots={} snapshots={} pairs={} anchor_dropped={} promote_dropped={} sealed_mb={}",
+                 target, macroblocks, roots, snapshots, pairs, anchor_dropped, promote_dropped, sealed_mb);
+    }
+
+    /// Hash of the stored macroblock at `idx`, whichever framing it was stored in.
+    fn macroblock_hash_at(&self, idx: u64) -> Option<[u8; 32]> {
+        if idx == 0 { return None; }
+        let raw = self.get_macroblock_by_height(idx).ok().flatten()?;
+        let plain = if raw.len() >= 4 && raw[0..4] == [0x28, 0xb5, 0x2f, 0xfd] {
+            zstd::decode_all(&raw[..]).ok()?
+        } else { raw };
+        bincode::deserialize::<qnet_state::MacroBlock>(&plain).ok().map(|mb| mb.hash())
+    }
+
+    /// The operator rollback's own declaration, beside the signing mark: the whole fleet abandons
+    /// the chain above `target`, so this node's vote commitments there refuse nothing that can
+    /// recur, and the genesis capsule it holds describes a chain nobody keeps. NOT for a single
+    /// node's regress - there the rest of the network kept that chain, and a forgotten commitment
+    /// is a second vote at a head this node already voted at.
+    pub fn abandon_chain_claims_above(&self, target: u64) {
+        let meta = match self.persistent.db.cf_handle("metadata") { Some(cf) => cf, None => return };
+        let mut batch = rocksdb::WriteBatch::default();
+        let mut votes = 0u64;
+        for (index, (head, ..)) in self.persistent.iter_checkpoint_votes(&meta).unwrap_or_default() {
+            if head > target {
+                batch.delete_cf(&meta, super::checkpoint_vote_key(index));
+                votes += 1;
+            }
+        }
+        let mi = qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
+        let capsule_dropped = match self.get_galc_held() {
+            Ok(Some(b)) => bincode::deserialize::<crate::galc::GenesisCheckpoint>(&b).ok()
+                .map_or(false, |c| c.mb_index.saturating_mul(mi) > target),
+            _ => false,
+        };
+        if capsule_dropped { batch.delete_cf(&meta, b"galc_held"); }
+        if let Err(e) = self.persistent.db.write(batch) {
+            println!("[WARN][ROLLBACK] abandon_batch_failed target={} err={}", target, e);
+            return;
+        }
+        println!("[INFO][ROLLBACK] claims_abandoned target={} votes={} capsule_dropped={}",
+                 target, votes, capsule_dropped);
+    }
+
     pub fn get_latest_snapshot_height(&self) -> IntegrationResult<Option<u64>> {
         let snapshots_cf = self.persistent.db.cf_handle("snapshots")
             .ok_or_else(|| IntegrationError::StorageError("snapshots column family not found".to_string()))?;
@@ -2921,19 +3088,6 @@ impl Storage {
             let cur = self.get_chain_height().unwrap_or(live_h);
             if cur > height {
                 let anchor_mb = height / 90;
-                // WAL pairs by the WINDOW they certify — the pair index is the view counter, not
-                // a macroblock index — same rule as the recovery decree.
-                for (idx, bytes) in self.load_certified_pairs().unwrap_or_default() {
-                    let head = bincode::deserialize::<Vec<crate::consensus_v2_driver::ConsensusMsg>>(&bytes).ok()
-                        .and_then(|p| p.iter().find_map(|m| match m {
-                            crate::consensus_v2_driver::ConsensusMsg::Proposal(cp) => Some(cp.window_head_height),
-                            _ => None,
-                        }));
-                    if head.map(|h| h > height).unwrap_or(true) { let _ = self.delete_certified_pair(idx); }
-                }
-                for idx in (anchor_mb + 1)..=(cur / 90 + 1) {
-                    let _ = self.delete_macroblock_pub(idx);
-                }
                 // Reward side-indices are add-only / first-write-wins: the canonical re-apply of
                 // the tail can never remove an orphan row, so clear them like every other prune.
                 match self.reconcile_reward_indices_above_epoch(height) {
@@ -2942,7 +3096,10 @@ impl Storage {
                     _ => {}
                 }
                 let _ = self.delete_microblocks_range_pub(height + 1, cur);
-                let _ = self.force_last_sealed_mb(anchor_mb);
+                // Every durable marker naming chain above the restored tip - certified pairs by the
+                // window they certify, macroblocks, the seal watermark - through the one retraction
+                // the boot rollback and the recovery decree also run.
+                self.retract_chain_position_above(height);
                 // The mandatory post-destruction cleanup every other prune path runs: drop the
                 // read-through body cache (it would keep answering presence checks for deleted
                 // heights) and lower the stored-height marker (monotone-up otherwise).
@@ -3603,7 +3760,7 @@ impl Storage {
 }
 
 #[cfg(test)]
-mod tests_rollback_snapshot_prune {
+mod tests_rollback_retraction {
     use super::*;
 
     fn temp_storage() -> (Storage, tempfile::TempDir) {
@@ -3642,5 +3799,129 @@ mod tests_rollback_snapshot_prune {
         // Nothing above the target left ⇒ a second run is a no-op, and the survivor stays.
         assert_eq!(st.prune_snapshots_above(target).expect("prune"), 0, "idempotent");
         assert!(st.get_snapshot_data(860_400).expect("get").is_some());
+    }
+
+    fn seed_macroblock(st: &Storage, index: u64) -> qnet_state::MacroBlock {
+        let mb = qnet_state::MacroBlock::new(index * 90, 0, [0u8; 32], vec![[7u8; 32]], [1u8; 32],
+                                             qnet_state::ConsensusData::default());
+        let cf = st.persistent.db.cf_handle("microblocks").expect("microblocks cf");
+        st.persistent.db.put_cf(&cf, format!("macroblock_{}", index).as_bytes(),
+                                bincode::serialize(&mb).expect("ser")).expect("seed");
+        mb
+    }
+
+    fn meta_get(st: &Storage, key: &[u8]) -> Option<Vec<u8>> {
+        let cf = st.persistent.db.cf_handle("metadata").expect("metadata cf");
+        st.persistent.db.get_cf(&cf, key).expect("get")
+    }
+
+    fn meta_put(st: &Storage, key: &[u8], val: &[u8]) {
+        let cf = st.persistent.db.cf_handle("metadata").expect("metadata cf");
+        st.persistent.db.put_cf(&cf, key, val).expect("put");
+    }
+
+    /// One retraction for every durable marker that names chain above the target. Each was found
+    /// the same way: a fleet rolled back to 863550 held no block above it, yet reported the
+    /// abandoned tip through one of them and never produced the next block.
+    #[test]
+    fn a_rollback_retracts_every_durable_position_marker_above_the_target() {
+        let (st, _d) = temp_storage();
+        let target = 863_550u64;                      // 9595 * 90: a window boundary
+        let kept = seed_macroblock(&st, 9595);
+        seed_macroblock(&st, 9596);
+        seed_macroblock(&st, 9600);                   // closes reward epoch 9440
+        let rewards = st.persistent.db.cf_handle("pending_rewards").expect("pending_rewards cf");
+        st.persistent.db.put_cf(&rewards, Storage::epoch_root_key(9440).as_bytes(), &[9u8; 32]).expect("root");
+        st.persistent.db.put_cf(&rewards, Storage::epoch_root_key(9600).as_bytes(), &[8u8; 32]).expect("orphan root"); // mb 9760, object gone
+        st.persistent.db.put_cf(&rewards, Storage::epoch_root_key(9280).as_bytes(), &[6u8; 32]).expect("kept root");   // mb 9440
+        st.persistent.db.put_cf(&rewards, b"epoch_fold_head", &[1u8; 8]).expect("fold");
+        for h in [860_400u64, 867_600] { seed(&st, h); }
+        meta_put(&st, b"last_sealed_mb", &9648u64.to_le_bytes());
+        meta_put(&st, b"latest_macroblock_hash", &[0xEEu8; 32]);
+        meta_put(&st, b"qc_sig_strip_cursor", &9640u64.to_be_bytes());
+        let mut anchor = 9640u64.to_le_bytes().to_vec();
+        anchor.extend_from_slice(&[7u8; 32]);
+        st.put_snapshot_anchor(&anchor).expect("anchor");
+        let mut promote = 867_600u64.to_le_bytes().to_vec();
+        promote.extend_from_slice(&[3u8; 32]);
+        meta_put(&st, b"promote_pending", &promote);
+        st.record_certified_pair_at(1000, 863_550, b"kept").expect("pair");
+        st.record_certified_pair_at(1001, 863_640, b"above").expect("pair");
+        st.record_certified_pair(1002, b"legacy-unreadable").expect("pair"); // no head key, undecodable
+        st.save_consensus_state(28_944, b"state").expect("round");
+        st.save_timeout_certificates(b"certs").expect("tcerts");
+        st.save_sync_progress(863_550, 868_320, 863_550).expect("sync");
+
+        st.retract_chain_position_above(target);
+
+        assert!(st.get_macroblock_by_height(9595).expect("get").is_some(), "the window sealed at the target stays");
+        assert!(st.get_macroblock_by_height(9596).expect("get").is_none());
+        assert!(st.get_macroblock_by_height(9600).expect("get").is_none());
+        assert_eq!(st.load_epoch_root(9440).expect("root"), None,
+                   "the root sealed with macroblock 9600 goes with it, or the re-sealed window is refused as equivocation");
+        assert_eq!(st.load_epoch_root(9600).expect("root"), None, "an orphan root above the target goes too");
+        assert!(st.load_epoch_root(9280).expect("root").is_some(), "a root certified at or below the target stays");
+        assert!(st.persistent.db.get_cf(&rewards, b"epoch_fold_head").expect("get").is_none(), "fold memo covered that epoch");
+        assert!(st.get_snapshot_data(867_600).expect("get").is_none());
+        assert!(st.get_snapshot_data(860_400).expect("get").is_some());
+        assert_eq!(st.last_sealed_mb_index(), 9595, "watermark derived from what remains");
+        assert_eq!(st.get_latest_macroblock_hash().expect("hash"), kept.hash(), "names the macroblock that remains");
+        assert_eq!(meta_get(&st, b"qc_sig_strip_cursor").expect("cursor"), 9595u64.to_be_bytes().to_vec());
+        assert_eq!(&st.get_snapshot_anchor().expect("get").expect("present")[0..8], &0u64.to_le_bytes(), "anchor sentinel");
+        assert!(meta_get(&st, b"promote_pending").is_none(), "a promote toward the abandoned chain is dropped");
+        let pairs: Vec<u64> = st.load_certified_pairs().expect("pairs").into_iter().map(|(i, _)| i).collect();
+        assert_eq!(pairs, vec![1000], "pairs by the window they certify; an unreadable one goes too");
+        assert_eq!(st.get_latest_consensus_round().expect("round"), 0);
+        assert!(st.load_timeout_certificates().expect("tcerts").is_none());
+        assert!(st.load_sync_progress().expect("sync").is_none());
+
+        // Idempotent: a second run finds nothing above the target and changes nothing below it.
+        st.retract_chain_position_above(target);
+        assert!(st.get_macroblock_by_height(9595).expect("get").is_some());
+        assert_eq!(st.last_sealed_mb_index(), 9595);
+        assert_eq!(st.load_certified_pairs().expect("pairs").len(), 1);
+    }
+
+    /// The operator's declaration on top: the votes this node cast above the target and the genesis
+    /// capsule it holds for that chain. Left in place, the engine reboots at the abandoned chain's
+    /// last voted index and ignores every proposal of the re-produced windows: no checkpoint
+    /// certifies, nothing seals, and production parks at the derivation horizon - 2880 blocks above
+    /// the target, which is exactly where the fleet stopped (866430 = 863550 + 2880).
+    #[test]
+    fn an_operator_rollback_abandons_the_votes_and_the_capsule_above_the_target() {
+        let (st, _d) = temp_storage();
+        let target = 863_550u64;
+        st.record_checkpoint_vote(28_785, 863_550, &[1u8; 32], false, 28_784, &[2u8; 32]).expect("vote");
+        st.record_checkpoint_vote(28_786, 863_580, &[3u8; 32], false, 28_785, &[4u8; 32]).expect("vote");
+        st.record_checkpoint_vote(28_790, 863_700, &[5u8; 32], false, 28_789, &[6u8; 32]).expect("vote");
+        let capsule = |mb_index: u64| bincode::serialize(&crate::galc::GenesisCheckpoint {
+            version: 1, network_id: [0u8; 32], mb_index, mb_hash: [0u8; 32],
+            committee_digest_anchor: [0u8; 32], committee_digest_pred: [0u8; 32],
+            minted_at_height: 0, sigs: Vec::new(),
+        }).expect("ser");
+        st.put_galc_held(&capsule(9640)).expect("galc");
+
+        st.abandon_chain_claims_above(target);
+        let kept: Vec<u64> = st.load_checkpoint_votes().expect("votes").into_iter().map(|v| v.0).collect();
+        assert_eq!(kept, vec![28_785], "only the vote at the target's own head remains");
+        assert!(st.get_galc_held().expect("get").is_none(), "a capsule above the target describes nothing");
+
+        // A capsule at or below the target is a trust root this node keeps.
+        st.put_galc_held(&capsule(9000)).expect("galc");
+        st.abandon_chain_claims_above(target);
+        assert!(st.get_galc_held().expect("get").is_some());
+    }
+
+    /// The total-supply seal is the registry-root seal's sibling: same head, same "Some means this
+    /// head is applied and sealed" reading. The registry rebuild already took rr_seal_ above the new
+    /// tip; ts_seal_ has to go with it.
+    #[test]
+    fn a_registry_rebuild_takes_the_total_supply_seals_above_the_tip_with_it() {
+        let (st, _d) = temp_storage();
+        st.seal_total_supply(863_550, 1_000).expect("seal");
+        st.seal_total_supply(863_640, 1_001).expect("seal");
+        st.rebuild_registry_lthash(863_550).expect("rebuild");
+        assert_eq!(st.get_total_supply_at(863_550), Some(1_000), "the seal at the tip stays");
+        assert_eq!(st.get_total_supply_at(863_640), None, "a seal above the tip names an abandoned head");
     }
 }

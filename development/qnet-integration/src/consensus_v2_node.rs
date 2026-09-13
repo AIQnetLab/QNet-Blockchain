@@ -1338,16 +1338,6 @@ pub fn verify_recovery_decree(genesis_hash: &[u8; 32], seq: u64, target: u64,
 /// Prune all consensus/chain artifacts above `target`, then persist the seq (idempotent deletes:
 /// a crash mid-prune re-executes on redelivery), then exit for a clean boot.
 pub fn execute_recovery_decree(storage: &Storage, seq: u64, target: u64) -> ! {
-    if let Ok(pairs) = storage.load_certified_pairs() {
-        for (idx, bytes) in pairs {
-            let head = bincode::deserialize::<Vec<ConsensusMsg>>(&bytes).ok()
-                .and_then(|p| p.iter().find_map(|m| match m {
-                    ConsensusMsg::Proposal(cp) => Some(cp.window_head_height), _ => None }));
-            if head.map(|h| h > target).unwrap_or(true) {
-                let _ = storage.delete_certified_pair(idx);
-            }
-        }
-    }
     // The node is live and the candidate scan below is O(tail): bar saves above the target for
     // the whole prune, or a block saved meanwhile survives above the lowered height —
     // stored-but-unapplied forever. Never proceed without the slot: a busy one belongs to a
@@ -1372,10 +1362,6 @@ pub fn execute_recovery_decree(storage: &Storage, seq: u64, target: u64) -> ! {
         _ => wait_for_slot(),
     };
     let mi = qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
-    let last_mb = storage.last_sealed_mb_index();
-    for mb in (target / mi + 1)..=last_mb.max(target / mi + 1) {
-        let _ = storage.delete_macroblock_pub(mb);
-    }
     let tip = storage.get_chain_height().unwrap_or(target);
     // A node at/below the target has nothing to prune — never RAISE the height marker.
     if tip > target {
@@ -1402,9 +1388,10 @@ pub fn execute_recovery_decree(storage: &Storage, seq: u64, target: u64) -> ! {
         let _ = storage.delete_microblocks_range_pub(target + 1, tip);
         let _ = storage.set_chain_height(target);
     }
-    // Retract the sealed-macroblock watermark to the target boundary: it is monotonic-up on the
-    // normal path, so without this the pruned frontier is still reported and the node chases it.
-    let _ = storage.force_last_sealed_mb(target / mi);
+    // Every durable marker naming chain above the target - certified pairs by the window they
+    // certify, macroblocks, the seal watermark, snapshots - through the one retraction the boot
+    // rollback and the snapshot regress also run.
+    storage.retract_chain_position_above(target);
     let _ = storage.set_applied_decree_seq(seq);
     println!("[WARN][DECREE] executed seq={} target={} pruned_to_mb={} action=process_restart",
              seq, target, target / mi);
