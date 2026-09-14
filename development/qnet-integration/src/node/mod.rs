@@ -6559,8 +6559,10 @@ mod tests {
         }
     }
 
-    // Both restore paths must purge post-snapshot CF rows BEFORE anything is replayed on the
+    // Every restore path must purge post-snapshot CF rows BEFORE anything is replayed on the
     // restored state; otherwise the replay's disk fallback reads them as snapshot-height values.
+    // The boot restore lacked it: on 14.09 all six nodes replayed a light registration over a
+    // rolled-back wallet's row, drifted from the header root and regressed at the same minute.
     #[test]
     fn every_snapshot_restore_purges_post_snapshot_cf_rows_before_replaying() {
         let apply = include_str!("state_apply.rs");
@@ -6573,6 +6575,11 @@ mod tests {
         let trueup2 = snaps.find("trueup_accounts_cf_against(&*sg, self)").expect("rehydrate true-up");
         let ok = snaps.find("rehydrate_ok h=").expect("rehydrate report");
         assert!(restore < trueup2 && trueup2 < ok, "rehydrate: restore, true-up, then report");
+        let boot = include_str!("lifecycle.rs");
+        let verified = boot.find("snapshot_verified h=").expect("boot restore log");
+        let trueup3 = boot.find("trueup_accounts_cf_against(&*state_guard, &storage)").expect("boot true-up");
+        let replay3 = boot.find("_replay start=").expect("boot replay loop");
+        assert!(verified < trueup3 && trueup3 < replay3, "boot: restore, true-up, then replay");
     }
 
     // The settle-point index gets ONE block per epoch and no retry, so a node catching up across that

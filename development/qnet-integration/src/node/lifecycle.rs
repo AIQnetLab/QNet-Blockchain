@@ -755,6 +755,13 @@ impl BlockchainNode {
                                         }
                                         restored_snapshot_height = 0;
                                     }
+                                    // Rows for accounts born after the snapshot must go before the tail
+                                    // replay reads them - the same purge the reconcile and rehydrate
+                                    // restores make. Without it the replay materialised a rolled-back
+                                    // wallet's row as a leaf and drifted from every header root.
+                                    if restored_snapshot_height > 0 {
+                                        let _ = Self::trueup_accounts_cf_against(&*state_guard, &storage);
+                                    }
                                 }
                                 Err(e) => {
                                     // The restore wipes the map and then inserts row by row, so a
