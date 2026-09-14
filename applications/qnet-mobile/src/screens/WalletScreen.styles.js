@@ -1384,11 +1384,17 @@ const styles = StyleSheet.create({
   rewardLabel: {
     fontSize: 14,
     color: '#888888',
+    flexShrink: 0,
   },
+  // The value is the flexible half of the row: on narrow screens a long value
+  // ("14,257 blocks (~3h 57m)") wraps inside the card instead of running past it.
   rewardValue: {
     fontSize: 16,
     fontWeight: '600',
     color: '#00d4ff',
+    flexShrink: 1,
+    textAlign: 'right',
+    marginLeft: 12,
   },
   validatorNote: {
     fontSize: 12,
