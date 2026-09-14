@@ -1158,36 +1158,40 @@ impl RocksMerkleNodeStore {
 /// "absent" from "unreadable": the CF true-up snapshots this counter around each page
 /// and vetoes deletions when it moved — an IO error must never read as certain absence.
 pub static MERKLE_LEAF_READ_ERRS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Accounts-CF reads that failed (a RocksDB or decode error, not a miss). Observability only: each
+/// read reports its own outcome.
+pub static ACCOUNT_READ_ERRS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl qnet_state::MerkleNodeStore for RocksMerkleNodeStore {
-    fn get_leaf(&self, key: &[u8; 32]) -> Option<[u8; 32]> {
-        // EVERY unreadable outcome — missing CF, IO error, malformed value — bumps the
-        // counter: a probe that cannot read a leaf must never be taken as proof of absence
-        // (see MERKLE_LEAF_READ_ERRS). Only a clean miss returns an un-flagged None.
+    fn get_leaf(&self, key: &[u8; 32]) -> Option<[u8; 32]> { self.try_get_leaf(key).ok().flatten() }
+    fn try_get_leaf(&self, key: &[u8; 32]) -> Result<Option<[u8; 32]>, ()> {
+        // EVERY unreadable outcome — missing CF, IO error, malformed value — is an Err and bumps
+        // the counter: a probe that cannot read a leaf must never be taken as proof of absence.
         let cf = match self.db.cf_handle(self.leaf_cf) {
             Some(cf) => cf,
             None => {
                 MERKLE_LEAF_READ_ERRS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return None;
+                return Err(());
             }
         };
         // Keys-only probes must not evict the hot working set from the block cache.
         let mut ro = rocksdb::ReadOptions::default();
         ro.fill_cache(false);
         let v = match self.db.get_cf_opt(&cf, &key[..], &ro) {
-            Ok(v) => v?,
+            Ok(Some(v)) => v,
+            Ok(None) => return Ok(None),
             Err(_) => {
                 MERKLE_LEAF_READ_ERRS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return None;
+                return Err(());
             }
         };
         if v.len() == 32 {
             let mut out = [0u8; 32];
             out.copy_from_slice(&v);
-            Some(out)
+            Ok(Some(out))
         } else {
             MERKLE_LEAF_READ_ERRS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            None
+            Err(())
         }
     }
 
@@ -1925,9 +1929,14 @@ impl Storage {
 // OUTSIDE the state-write lock (see block_pipeline.rs pre-warm site).
 impl qnet_state::AccountStore for Storage {
     fn load_account(&self, address: &str) -> Option<qnet_state::Account> {
+        qnet_state::AccountStore::try_load_account(self, address).ok().flatten()
+    }
+
+    fn try_load_account(&self, address: &str) -> Result<Option<qnet_state::Account>, ()> {
         match self.persistent.load_account(address) {
-            Ok(opt) => opt,
+            Ok(opt) => Ok(opt),
             Err(e) => {
+                ACCOUNT_READ_ERRS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if crate::node::is_info() {
                     let preview = if address.len() >= 16 { &address[..16] } else { address };
                     println!(
@@ -1935,7 +1944,7 @@ impl qnet_state::AccountStore for Storage {
                         preview, e,
                     );
                 }
-                None
+                Err(())
             }
         }
     }
@@ -1943,6 +1952,10 @@ impl qnet_state::AccountStore for Storage {
     fn load_accounts_batch(&self, addresses: &[String]) -> Vec<Option<qnet_state::Account>> {
         // One RocksDB multi_get over the accounts CF (reward_store.rs).
         Storage::load_accounts_batch(self, addresses)
+    }
+
+    fn try_load_accounts_batch(&self, addresses: &[String]) -> Vec<Result<Option<qnet_state::Account>, ()>> {
+        Storage::try_load_accounts_batch(self, addresses)
     }
 
     fn persist_accounts(&self, accounts: &[(String, qnet_state::Account)]) -> bool {

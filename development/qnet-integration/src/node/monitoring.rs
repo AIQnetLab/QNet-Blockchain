@@ -96,7 +96,7 @@ impl BlockchainNode {
                 let block_height = self.storage.get_transaction_block_height(tx_hash).await.ok();
                 
                 // Calculate Fast Finality Indicators
-                let current_height = *self.height.read().await;
+                let current_height = crate::node::local_height();
                 let confirmations = if let Some(tx_height) = block_height {
                     (current_height.saturating_sub(tx_height) + 1) as u32
                 } else {

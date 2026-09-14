@@ -55,7 +55,7 @@ The curve has four branches, evaluated in this order:
 
 The sharp drop is a one-time additional ÷10 applied at cycle 5 (approximately year 20 of chain time); normal halving resumes from that lower base afterwards.
 
-Deriving the cycle from height rather than from the wall clock is deliberate: block timestamps are slot-anchored (`block_ts = genesis_ts + height * SLOT`), so height is an exact node-independent measure of elapsed chain time. Reading the local clock would make the minted amount depend on each node's clock and split the network across a halving boundary. Producer and validator both call the same function, so the emission amount is verified rather than asserted.
+Deriving the cycle from height rather than from the wall clock is deliberate: height is node-independent, and the schedule counts produced slots, so a halt of the chain delays the halvings in wall time rather than shortening the emission. Reading the local clock would make the minted amount depend on each node's clock and split the network across a halving boundary. Producer and validator both call the same function, so the emission amount is verified rather than asserted.
 
 ## Emission events
 

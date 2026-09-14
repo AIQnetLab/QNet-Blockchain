@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import * as assert from 'node:assert/strict';
-import { quoteBigInts, uintString, transformTransaction, batchRowsOf, shapeBlock, blockRowFromHeader, toMs, merkleRootOf } from '../transform';
+import { quoteBigInts, uintString, transformTransaction, batchRowsOf, shapeBlock, blockRowFromHeader, toMs, merkleRootOf, SLOT_GAP_REANCHOR_GATE_HEIGHT } from '../transform';
 import { insertBatchTransfers, insertTransactions, insertBlocks, deltaOf, negate, mergeDelta } from '../sql';
 import { ranges, dedupeHeaders, flushGroups, FLUSH_BLOCKS, FLUSH_BATCH_ROWS } from '../chain';
 import { pickNetworkHeight, reduceHeaderViews, HEIGHT_SLACK } from '../node-client';
@@ -85,6 +85,12 @@ test('header rows distinguish empty blocks from pruned bodies', () => {
   assert.equal(pruned.tx_count, null);
   assert.equal(pruned.timestamp, genesis + 5000);
   assert.equal(pruned.producer, 'unknown');
+  // A pruned header that still carries its time keeps it; at/after the slot-gap gate a pruned header
+  // without one is unknown here (0, bounded by the caller), never stamped genesis + height.
+  const timed = blockRowFromHeader({ height: 5, hash: 'c'.repeat(64), body: false, timestamp: 1_788_150_299 }, genesis);
+  assert.equal(timed.timestamp, toMs(1_788_150_299));
+  const late = blockRowFromHeader({ height: SLOT_GAP_REANCHOR_GATE_HEIGHT, hash: 'c'.repeat(64), body: false }, genesis);
+  assert.equal(late.timestamp, 0);
 });
 
 // Sorted heights collapse into inclusive ranges; duplicates and singletons are handled.

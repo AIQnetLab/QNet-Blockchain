@@ -95,6 +95,15 @@ pub const LIGHT_SHARD_BACKUP_OWNERS_GATE_HEIGHT: u64 = 691_200;
 /// 0 (blocks 0..99_999 otherwise overcharge every sender); it cannot be lowered on the live chain
 /// without changing how those blocks replay.
 pub const GAS_METERING_GATE_HEIGHT: u64 = qnet_state_gas_metering_height();
+/// The slot-gap rule (`slot_gap_reanchor`): at/after this height a microblock's timestamp is
+/// `parent + 1 s` (the same grid as `genesis + h` until the first gap) OR a declared gap of at
+/// least SLOT_GAP_MIN_SECS that does not run ahead of the verifier's clock. Below it the grid is
+/// `genesis + h` exactly, so after a halt every missed second had to be produced as a block and the
+/// chain ran at the 200 ms floor until it caught up, with every height-keyed schedule up to 5x fast.
+/// Epoch 93, above the height where the 14.09 catch-up reaches the grid (~1.285M): there both rules
+/// stamp the same bytes, so activation declares no gap. A consensus rule: every node must run the
+/// binary before this height, or a mixed fleet diverges at the first halt of a window or more.
+pub const SLOT_GAP_REANCHOR_GATE_HEIGHT: u64 = 1_339_200;
 
 /// Kept as a const fn so the single source of the number stays in `transaction.rs`, where the charging
 /// code documents it, while the registry entry above stays a plain literal expression.
@@ -116,6 +125,7 @@ pub mod id {
     /// without a coordinated flip. Listed here, and only here, so it is still spelled once.
     pub const RECENCY_SPAN_EPOCH: &str = "recency_span_epoch";
     pub const GAS_METERING: &str = "gas_metering";
+    pub const SLOT_GAP_REANCHOR: &str = "slot_gap_reanchor";
 }
 
 /// (feature id, activation height). Heights are hardcoded in the binary, so every node agrees
@@ -137,6 +147,7 @@ const ACTIVATIONS: &[(&str, u64)] = &[
     (id::LIGHT_KEY_COMMITMENT, LIGHT_KEY_COMMITMENT_GATE_HEIGHT),
     (id::LIGHT_SHARD_BACKUP_OWNERS, LIGHT_SHARD_BACKUP_OWNERS_GATE_HEIGHT),
     (id::GAS_METERING, GAS_METERING_GATE_HEIGHT),
+    (id::SLOT_GAP_REANCHOR, SLOT_GAP_REANCHOR_GATE_HEIGHT),
 ];
 
 /// Core gate: active iff `feature` is unlisted (genesis-active default) or `height` has reached
@@ -201,7 +212,7 @@ mod tests {
         const SCHEDULED: &[&str] = &[
             BURN_ATTESTATION_REQUIRED, REGISTRY_ROOT_REQUIRED, LIGHT_REG_EPOCH_ROSTER,
             LOGS_ROOT_REQUIRED, REWARD_EPOCH_ROOT_REQUIRED, LIGHT_KEY_COMMITMENT,
-            LIGHT_SHARD_BACKUP_OWNERS, GAS_METERING,
+            LIGHT_SHARD_BACKUP_OWNERS, GAS_METERING, SLOT_GAP_REANCHOR,
         ];
         for name in SCHEDULED {
             assert!(super::ACTIVATIONS.iter().any(|(f, _)| f == name),

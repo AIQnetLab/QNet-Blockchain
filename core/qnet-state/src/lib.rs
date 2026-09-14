@@ -38,6 +38,7 @@ pub use state::BlockSnapshot;
 pub use state::AccountStore;
 // Read-through disk-backed node store for the merkle tree (default-off seam).
 pub use state::MerkleNodeStore;
+pub use state::CF_ROWS_WITHOUT_LEAF;
 
 #[cfg(feature = "python")]
 pub use python_bindings::*;

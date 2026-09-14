@@ -29,6 +29,9 @@ mod trim_tests {
     }
 }
 
+/// Window whose heartbeat this node last withheld (log once per window).
+static HB_WITHHELD_WINDOW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 impl BlockchainNode {
     /// The last height covered by a macroblock this node actually holds sealed. A window whose
     /// macroblock carries no microblocks was never certified — the placeholder row exists, the seal
@@ -826,22 +829,39 @@ impl BlockchainNode {
                 boot_state_proven = true; // snapshot root already anchor-verified, no tail
             }
 
-            if replay_start == 0 {
-                // A full replay executes block 0. Its body is loaded from disk, so the genesis
-                // restore (file/HTTP) has to happen HERE — the boot's own load_genesis runs long
-                // after this loop, and a replay without genesis builds an unprovable state.
-                let have_genesis = matches!(storage.load_microblock_auto_format(0), Ok(Some(_)));
-                if !have_genesis {
-                    let cfg = crate::genesis_config::GenesisConfig::from_env();
-                    match crate::genesis_config::load_genesis(&storage, &cfg).await {
-                        crate::genesis_config::GenesisResult::Loaded { block, source } => {
-                            println!("[INFO][GENESIS] pre_replay_restored source={} txs={}", source, block.transactions.len());
-                        }
-                        _ => println!("[ERR][GENESIS] pre_replay_unavailable — replay will start above genesis"),
+            // Bodies below the prune watermark or a snapshot-join anchor are gone by design, and a
+            // block 0 that cannot be restored leaves nothing to start from: a replay from block 0 cannot
+            // reach the tip, so the state is not wiped and is latched suspect at the stored tip instead.
+            let join_mb = storage.snapshot_join_anchor_mb();
+            let pruned_below = storage.log_prune_floor().max(if join_mb > 0 {
+                join_mb.saturating_mul(qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL) + 1
+            } else { 0 });
+            let mut have_genesis = replay_start > 0 || matches!(storage.load_microblock_auto_format(0), Ok(Some(_)));
+            if !have_genesis && pruned_below <= 1 {
+                // A full replay executes block 0 from disk, so the genesis restore (file/HTTP) happens
+                // here, before anything is wiped; the boot's own load_genesis runs long after this.
+                let cfg = crate::genesis_config::GenesisConfig::from_env();
+                match crate::genesis_config::load_genesis(&storage, &cfg).await {
+                    crate::genesis_config::GenesisResult::Loaded { block, source } => {
+                        have_genesis = true;
+                        println!("[INFO][GENESIS] pre_replay_restored source={} txs={}", source, block.transactions.len());
                     }
+                    _ => println!("[ERR][GENESIS] pre_replay_unavailable"),
                 }
             }
-            if replay_start <= pre_snapshot_chain_height {
+            let genesis_replay_blocked = replay_start == 0 && (pruned_below > 1 || !have_genesis);
+            if genesis_replay_blocked {
+                println!("[WARN][STATE] replay_unprovable tip={} pruned_below={} genesis={} action=suspect_resync",
+                         pre_snapshot_chain_height, pruned_below, have_genesis);
+                crate::block_pipeline::mark_state_suspect();
+                crate::sync_manager::nudge_sync_check();
+            }
+            if replay_start == 0 && !genesis_replay_blocked {
+                // A replay from block 0 starts from an empty leaf set: the store still holds the last
+                // run's leaves, and the genesis apply would read them as this chain's pre-genesis state.
+                state.write().await.clear();
+            }
+            if replay_start <= pre_snapshot_chain_height && !genesis_replay_blocked {
                 let replay_end = pre_snapshot_chain_height;
                 let replay_count = replay_end.saturating_sub(replay_start).saturating_add(1);
                 let replay_mode = if restored_snapshot_height > 0 { "incremental" } else { "full" };
@@ -851,75 +871,84 @@ impl BlockchainNode {
                 let replay_time = std::time::Instant::now();
                 let mut replayed = 0u64;
                 let mut replay_errors = 0u64;
+                let mut replay_stopped_at: Option<u64> = None;
+                // Set when block 0 itself cannot be replayed: there is no verified height below it.
+                let mut replay_unprovable = false;
                 let mut last_replayed_block_timestamp: u64 = 0;
                 let log_interval = std::cmp::max(replay_count / 20, 1000); // Log progress ~20 times or every 1000 blocks
 
                 for h in replay_start..=replay_end {
-                    match storage.load_microblock_auto_format(h) {
-                        Ok(Some(microblock)) => {
-                            last_replayed_block_timestamp = microblock.timestamp;
-                            let state_guard = state.write().await;
-
-                            // v10.0: Use shared apply_block_to_state (replay mode: no snapshot, no emission check)
-                            let apply_result = Self::apply_block_to_state(
-                                &state_guard, &microblock, &storage, None);
-                            // Same as the reconcile replay: the block is canonical, so flush now.
-                            Self::flush_block_side_indices(&storage, microblock.height, &apply_result.side_indices);
-                            // A replay that credits fewer claims than the network produces a state
-                            // this node can never reconcile. Stop the replay rather than build on it.
-                            if let Some(certifying_mb) = apply_result.reward_epoch_missing {
-                                println!("[CRIT][STATE] replay_reward_epoch_missing h={} certifying_mb={} action=stop_replay",
-                                         microblock.height, certifying_mb);
-                                break;
-                            }
-
-
-                            // Re-seal total_supply at checkpoint heads: a post-restart finality redrive reads
-                            // get_total_supply_at(head), which (unlike registry_root) does NOT recompute on miss
-                            // → without this re-seal that checkpoint would defer forever. Mirrors the live pipeline.
-                            if h % qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL == 0 {
-                                let _ = storage.seal_total_supply(h, state_guard.get_total_supply());
-                            }
-
-                            replayed += 1;
-
-                            // Progress logging for long replays
-                            if replayed % log_interval == 0 {
-                                let pct = (replayed as f64 / replay_count as f64 * 100.0) as u32;
-                                let elapsed = replay_time.elapsed();
-                                println!("[INFO][REPLAY] progress={}/{}  {}%  elapsed={:.1}s",
-                                         replayed, replay_count, pct, elapsed.as_secs_f64());
-                            }
-                        }
-                        Ok(None) => {
-                            // Block missing in storage — skip but count error
-                            if replay_errors < 5 {
-                                println!("[WARN][REPLAY] block_missing h={}", h);
+                    let microblock = match storage.load_microblock_auto_format(h) {
+                        Ok(Some(mb)) => mb,
+                        other => {
+                            // A block is replayed on the state its parent left: the tail ends at the
+                            // first body that cannot be loaded, and the state stands below it.
+                            match &other {
+                                Err(e) => eprintln!("[WARN][REPLAY] load_fail h={} err={} action=stop_below", h, e),
+                                _ => println!("[WARN][REPLAY] block_missing h={} action=stop_below", h),
                             }
                             replay_errors += 1;
-                            if h == 0 {
-                                // A state built without genesis is unprovable; ask for the rebuild here,
-                                // not only at the post-replay root check (which this may never reach).
-                                crate::block_pipeline::mark_state_suspect();
-                                crate::sync_manager::request_wholesale_state_resync();
+                            // Below the prune watermark the body is gone by design: nothing to stand on.
+                            if h < pruned_below { replay_unprovable = true } else {
+                                match h.checked_sub(1) { Some(v) => replay_stopped_at = Some(v), None => replay_unprovable = true }
                             }
+                            break;
                         }
-                        Err(e) => {
-                            if replay_errors < 5 {
-                                eprintln!("[WARN][REPLAY] load_fail h={} err={}", h, e);
-                            }
-                            replay_errors += 1;
-                            if h == 0 {
-                                crate::block_pipeline::mark_state_suspect();
-                                crate::sync_manager::request_wholesale_state_resync();
-                            }
+                    };
+                    last_replayed_block_timestamp = microblock.timestamp;
+                    let state_guard = state.write().await;
+
+                    // Verified per block, the same step reconcile uses: apply, compare with the
+                    // committed root, repair a one-leaf phantom, undo and stop on anything else.
+                    let repaired = match Self::replay_block_verified(&state_guard, &storage, &microblock) {
+                        Ok(repaired) => repaired,
+                        Err(stop) => {
+                            // The state verified up to h-1 stands and the chain is set there below;
+                            // the rows above stay stored for the live path, which decides fork
+                            // body vs wrong state with the certificates. Block 0 has nothing below it.
+                            eprintln!("[ERR][STATE] replay_diverged h={} {} action=stop_below", h, stop.describe());
+                            match h.checked_sub(1) { Some(v) => replay_stopped_at = Some(v), None => replay_unprovable = true }
+                            break;
                         }
+                    };
+                    if let Some(addr) = repaired {
+                        storage.purge_phantom_account(&addr);
+                        println!("[WARN][STATE] replay_phantom_repaired h={} addr={}", h, addr);
+                    }
+
+                    replayed += 1;
+
+                    // Progress logging for long replays
+                    if replayed % log_interval == 0 {
+                        let pct = (replayed as f64 / replay_count as f64 * 100.0) as u32;
+                        let elapsed = replay_time.elapsed();
+                        println!("[INFO][REPLAY] progress={}/{}  {}%  elapsed={:.1}s",
+                                 replayed, replay_count, pct, elapsed.as_secs_f64());
                     }
                 }
 
                 let elapsed = replay_time.elapsed();
                 println!("[INFO][STATE] {}_replay_done replayed={}/{} errors={} elapsed={:.2}s",
                          replay_mode, replayed, replay_count, replay_errors, elapsed.as_secs_f64());
+                if replay_unprovable {
+                    // Nothing below block 0 to stand on: the state is suspect at the stored tip until a
+                    // peer snapshot replaces it.
+                    println!("[WARN][STATE] replay_unprovable tip={} action=suspect_resync", replay_end);
+                    crate::block_pipeline::mark_state_suspect();
+                    crate::sync_manager::nudge_sync_check();
+                }
+                if let Some(h) = replay_stopped_at {
+                    // The chain head is the last verified block. The state is suspect until a peer
+                    // snapshot or a certified fork-body replacement proves otherwise; the latch
+                    // schedules that on the jittered cadence, never at once fleet-wide.
+                    { state.write().await.chain_state.write().height = h; }
+                    if let Err(e) = storage.set_chain_height(h) {
+                        eprintln!("[ERR][STATE] replay_stop_set_height_failed h={} err={}", h, e);
+                    }
+                    println!("[WARN][STATE] replay_stopped_short h={} tip_was={} action=suspect_resync", h, replay_end);
+                    crate::block_pipeline::mark_state_suspect();
+                    crate::sync_manager::nudge_sync_check();
+                }
 
                 // v5.2: Set LAST_BLOCK_PRODUCED_TIME to timestamp of last replayed block
                 // This ensures correct timeout_round calculation after restart.
@@ -938,7 +967,7 @@ impl BlockchainNode {
                 // Verify final merkle root matches the last block's state_root
                 // NOTE: block.state_root stores finalize_merkle() output (merkle root),
                 // NOT calculate_state_root() which includes height+total_supply.
-                if replayed > 0 {
+                if replayed > 0 && replay_stopped_at.is_none() && !replay_unprovable {
                     // Owns-index (NON-consensus): NOT force-dirtied here. Replay rebuilds in-memory state up
                     // to the persisted tip, which wallet_token already covers; the durable owns-watermark
                     // (below) lets the boot gate rebuild ONLY when it actually lags the tip (unclean shutdown
@@ -961,7 +990,7 @@ impl BlockchainNode {
                                           hex::encode(&final_merkle[..8]),
                                           pre_snapshot_chain_height);
                                 crate::block_pipeline::mark_state_suspect(); // abstain from certifying until resynced
-                                crate::sync_manager::request_wholesale_state_resync(); // self-heal, no operator restart
+                                crate::sync_manager::nudge_sync_check(); // the latch schedules the wholesale, jittered
                             }
                         }
                     }
@@ -1004,7 +1033,10 @@ impl BlockchainNode {
             // a node that applied a losing fork (chain_height reflects it) but hasn't been repaired to
             // canonical must NOT pin finality on the fork across the restart (else the finality-guarded
             // rollback can never heal it). Ceiling = highest content-matching sealed window <= chain_height.
-            let finalized_round = Self::boot_content_finality_ceiling(&storage, pre_snapshot_chain_height);
+            // From the applied tip, not the pre-replay one: a replay that stopped short set the chain
+            // lower, and the apply dedup treats a finalized height as executed.
+            let applied_tip = storage.get_chain_height().unwrap_or(0).min(pre_snapshot_chain_height);
+            let finalized_round = Self::boot_content_finality_ceiling(&storage, applied_tip);
             LAST_FINALIZED_CONSENSUS_ROUND.store(finalized_round, std::sync::atomic::Ordering::SeqCst);
             LAST_FINALIZED_HEIGHT.store(finalized_round, std::sync::atomic::Ordering::SeqCst);
 
@@ -1215,7 +1247,7 @@ impl BlockchainNode {
         
         // Get current height from storage
         if is_debug() { println!("[DBG][NODE] loading_chain_height"); }
-        let mut height = match storage.get_chain_height() {
+        let height = match storage.get_chain_height() {
             Ok(height) => {
                 if is_debug() { println!("[DBG][NODE] chain_height={}", height); }
                 
@@ -1304,7 +1336,7 @@ impl BlockchainNode {
                 if let Err(e) = storage.reset_chain_height() {
                     eprintln!("[ERR][NODE] reset_fail err={}", e);
                 } else {
-                    height = 0;
+                    crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(0, std::sync::atomic::Ordering::Release);
                     if is_info() { println!("[INFO][NODE] reset_h=0"); }
                 }
             } else {
@@ -1709,7 +1741,6 @@ impl BlockchainNode {
             bootstrap_peers,
             perf_config,
             security_config,
-            height: Arc::new(RwLock::new(height)),
             is_running: Arc::new(RwLock::new(false)),
             current_microblocks: Arc::new(RwLock::new(Vec::new())),
             last_microblock_time: Arc::new(RwLock::new(Instant::now())),
@@ -2147,7 +2178,6 @@ impl BlockchainNode {
             storage: blockchain.storage.clone(),
             state: blockchain.state.clone(),
             coordinator: coordinator_handle.clone(),
-            height: blockchain.height.clone(),
             unified_p2p: blockchain.unified_p2p.clone(),
             block_event_tx: blockchain.block_event_tx.clone(),
             node_id: blockchain.node_id.clone(),
@@ -2730,7 +2760,7 @@ impl BlockchainNode {
             loop {
                 tokio::time::sleep(Duration::from_secs(60)).await;
                 
-                let current_height = *blockchain_for_macrocheck.height.read().await;
+                let current_height = crate::node::local_height();
                 if current_height < 90 {
                     continue; // No macroblocks expected yet
                 }
@@ -3539,7 +3569,7 @@ impl BlockchainNode {
             if let Some(unified_p2p) = &self.unified_p2p {
             // Check if we have cached height (no blocking)
             if let Some(network_height) = unified_p2p.get_cached_network_height() {
-                        let current_height = *self.height.read().await;
+                let current_height = crate::node::local_height();
                 if is_debug() { println!("[DBG][SYNC] h={} net_h={}", current_height, network_height); }
                 
                 if network_height > current_height && network_height > 0 {
@@ -3612,7 +3642,6 @@ impl BlockchainNode {
         // ═══════════════════════════════════════════════════════════════════════════
         {
         let storage = self.storage.clone();
-        let height = self.height.clone();
         let unified_p2p = self.unified_p2p.clone();
         let mempool = self.mempool.clone();
         let node_id = self.node_id.clone();
@@ -3641,7 +3670,7 @@ impl BlockchainNode {
             while *is_running.read().await {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
-                let current_height = *height.read().await;
+                let current_height = crate::node::local_height();
 
                 // v34: emit ONE unforgeable Heartbeat TX per ~1440-block subwindow (10/epoch) for
                 // super/genesis nodes. Anchored to a recent block hash so it cannot be pre-signed or
@@ -3653,6 +3682,21 @@ impl BlockchainNode {
                     // Derive epoch/subwindow from the ANCHOR (current_height-2) the heartbeat commits and
                     // the apply tallies, so the inclusion check tests exactly the bit the emit will set.
                     let anchor_h = current_height - 2;
+                    // A heartbeat is this node's claim to a seat in the committee. A node current on
+                    // microblocks but behind on seals (Defer: a certified anchor exists that it does not
+                    // hold) would be counted in the quorum and unable to vote in it, raising the threshold
+                    // for everyone else. Withhold in that case only: in a fleet-wide finality stall (Frozen)
+                    // nobody can vote and presence must still be recorded. The eligible set stays a pure
+                    // function of committed heartbeats.
+                    // The window the anchor falls in, (h-1)/90+1: the epoch every roster_mode caller passes.
+                    let anchor_mb_window = anchor_h.saturating_sub(1) / qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL + 1;
+                    if matches!(Self::roster_mode(&storage, anchor_mb_window), crate::node::RosterMode::Defer) {
+                        if HB_WITHHELD_WINDOW.swap(anchor_mb_window, std::sync::atomic::Ordering::Relaxed) != anchor_mb_window && is_info() {
+                            println!("[INFO][HEARTBEAT] heartbeat_withheld reason=behind_on_seals window={} anchor_h={}",
+                                     anchor_mb_window, anchor_h);
+                        }
+                        continue;
+                    }
                     let hb_epoch = anchor_h / EMISSION_BLOCK_INTERVAL;
                     let pos = anchor_h % EMISSION_BLOCK_INTERVAL;
                     let hb_subwindow = pos / 1440;
@@ -3697,7 +3741,6 @@ impl BlockchainNode {
         // ═══════════════════════════════════════════════════════════════════════════
         {
         let storage = self.storage.clone();
-        let height = self.height.clone();
         let unified_p2p = self.unified_p2p.clone();
         let mempool = self.mempool.clone();
         let node_id = self.node_id.clone();
@@ -3717,7 +3760,7 @@ impl BlockchainNode {
             while *is_running.read().await {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 
-                let current_height = *height.read().await;
+                let current_height = crate::node::local_height();
                 let current_epoch = current_height / EMISSION_BLOCK_INTERVAL;
                 // The window and the roster cutoff are the same number by construction
                 // (light_roster_cutoff), so the roster an owner builds from is exactly the roster the
@@ -3980,7 +4023,7 @@ impl BlockchainNode {
                                                     
                                                     // v8.0: Fresh height re-read + 3-block Gulf Stream forwarding
                                                     // Re-read height AFTER heavy TX creation to target correct producer
-                                                    let fresh_height = *height.read().await;
+                                                    let fresh_height = crate::node::local_height();
                                                     let mut forwarded_to_producer = false;
                                                     let mut sent_to: Vec<String> = Vec::new();
 

@@ -567,7 +567,11 @@ impl BlockchainNode {
         // through the same resolver the certificate verifier on the consensus loop uses. The
         // roster-mode derivation this used before answered from the verifier's OWN seal frontier
         // (Frozen/Defer), so a node behind on seals rejected certificates formed under the sealed set.
-        let committee: Vec<String> = match Self::committee_for_height(storage, cp.window_head_height) {
+        // Through the per-window cache the consensus loop uses, so a burst of received macroblocks does
+        // not decode the N-2 eligible set once per object.
+        let committee: Vec<String> = match crate::consensus_v2_node::committee_for_window_cached(
+            storage, cp.window_head_height / qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL)
+        {
             Some(c) if !c.is_empty() => c,
             _ if index < 3 => crate::genesis_constants::GENESIS_CONSENSUS_PKS
                 .iter().map(|(id, _)| id.to_string()).collect(),
@@ -677,11 +681,14 @@ impl BlockchainNode {
     /// Returns (missing, mismatched) local heights. Finality must NOT advance while either is non-empty:
     /// a mismatch is a local losing-fork body repair/supersede must replace first (else finality would
     /// pin a fork — the node-001 h=30780 safety violation). Same hash comparator as check_content.
-    pub(crate) fn window_content_verdict(storage: &crate::storage::Storage, certified: &[[u8; 32]], start: u64, end: u64) -> (Vec<u64>, Vec<u64>) {
+    pub(crate) fn window_content_verdict(storage: &crate::storage::Storage, certified: &[[u8; 32]], start: u64, end: u64, applied_tip: u64) -> (Vec<u64>, Vec<u64>) {
         let mut missing = Vec::new();
         let mut mismatched = Vec::new();
         for h in start..=end {
             let i = (h - start) as usize;
+            // A row above the applied tip is not chain state (a replay that stopped short keeps it):
+            // it counts as missing, so finality never passes it and no fork signal names it.
+            if h > applied_tip { missing.push(h); continue; }
             match storage.load_microblock_auto_format(h) {
                 Ok(Some(mb)) => if certified.get(i).map_or(true, |c| mb.hash() != *c) { mismatched.push(h); },
                 // Absent is benign - bodies are pruned on a retention schedule.
@@ -722,7 +729,7 @@ impl BlockchainNode {
                 .and_then(|b| bincode::deserialize::<qnet_state::MacroBlock>(&b).ok()) {
                 Some(m) => m, None => break,
             };
-            let (missing, mismatched) = Self::window_content_verdict(storage, &mb.micro_blocks, (idx - 1) * 90 + 1, idx * 90);
+            let (missing, mismatched) = Self::window_content_verdict(storage, &mb.micro_blocks, (idx - 1) * 90 + 1, idx * 90, crate::node::local_height());
             if missing.is_empty() && mismatched.is_empty() { fr = idx * 90; } else { break; }
         }
         CONTENT_VERIFIED_FRONTIER.fetch_max(fr, std::sync::atomic::Ordering::Relaxed);
@@ -750,7 +757,7 @@ impl BlockchainNode {
             match storage.get_macroblock_by_height(idx).ok().flatten()
                 .and_then(|b| bincode::deserialize::<qnet_state::MacroBlock>(&b).ok()) {
                 Some(mb) => {
-                    let (_, mismatched) = Self::window_content_verdict(storage, &mb.micro_blocks, (idx - 1) * 90 + 1, idx * 90);
+                    let (_, mismatched) = Self::window_content_verdict(storage, &mb.micro_blocks, (idx - 1) * 90 + 1, idx * 90, chain_height);
                     if mismatched.is_empty() { break; } // canonical window ⇒ ceiling here
                 }
                 None => {} // no QC-sealed macroblock for this window ⇒ not final ⇒ step down
@@ -869,7 +876,15 @@ impl BlockchainNode {
                 let anchor_trusted = SNAPSHOT_ANCHOR_MB.load(std::sync::atomic::Ordering::SeqCst) >= index;
                 // Content-verify against the already-saved macroblock's QC-certified hash list — same guard
                 // as the new-save branch, so a divergent local tail body cannot finalize via this path either.
-                let (missing, mismatched) = Self::window_content_verdict(&self.storage, &macroblock.micro_blocks, expected_start, index * 90);
+                let (missing, mismatched) = {
+                    let st = self.storage.clone();
+                    let hashes = macroblock.micro_blocks.clone();
+                    let tip = crate::node::local_height();
+                    // A verdict that did not run is not a clean one: nothing advances on it.
+                    tokio::task::spawn_blocking(move || Self::window_content_verdict(&st, &hashes, expected_start, index * 90, tip))
+                        .await.map_err(|e| crate::errors::IntegrationError::Other(format!("verdict_join mb={} err={}", index, e)))?
+                };
+                Self::signal_certified_fork_point(&mismatched, index * 90);
                 if (missing.is_empty() && mismatched.is_empty()) || anchor_trusted {
                     if try_advance_finality(round, "MB-SYNC-DEDUP") {
                         println!("[INFO][MB-SYNC] finality_catchup mb={} round={} prev_round={}", index, round, prev_round);
@@ -894,8 +909,13 @@ impl BlockchainNode {
             let expected_end = index * 90;
             
             // Content-verify (not just presence) against the QC-certified hash list.
-            let (missing_microblocks, mismatched_microblocks) =
-                Self::window_content_verdict(&self.storage, &macroblock.micro_blocks, expected_start, expected_end);
+            let (missing_microblocks, mismatched_microblocks) = {
+                let st = self.storage.clone();
+                let hashes = macroblock.micro_blocks.clone();
+                let tip = crate::node::local_height();
+                tokio::task::spawn_blocking(move || Self::window_content_verdict(&st, &hashes, expected_start, expected_end, tip))
+                    .await.map_err(|e| crate::errors::IntegrationError::Other(format!("verdict_join mb={} err={}", index, e)))?
+            };
 
             if (!missing_microblocks.is_empty() || !mismatched_microblocks.is_empty()) && is_debug() {
                 // Missing = bulk pipeline still backfilling (benign during sync). Mismatched = a local
@@ -906,6 +926,9 @@ impl BlockchainNode {
             
             // Save macroblock to storage
             self.storage.save_macroblock(index, &macroblock).await?;
+            // Signalled once the certificate is stored: the rollback's floor resolves certified
+            // content from it, and before the save it would see none and protect the losing block.
+            Self::signal_certified_fork_point(&mismatched_microblocks, expected_end);
 
             // Advance the QC-verified frontier immediately on a QC-bearing commit (keeps the cached
             // gate fresh between probes; this is the sole commit-time writer the cache relies on).
@@ -1034,6 +1057,19 @@ impl BlockchainNode {
                 }
             }
         });
+    }
+
+    /// A QC-certified hash list is total authority over its window: every local body it contradicts
+    /// is a losing fork, and the rollback goes to the height below the FIRST one at once. The
+    /// hash_chain_break walk that used to do this converged one height per repair round.
+    pub(crate) fn signal_certified_fork_point(mismatched: &[u64], head_height: u64) {
+        if let Some(first) = mismatched.iter().min().copied() {
+            crate::block_pipeline::signal_fork_recovery(first.saturating_sub(1).max(1));
+            if is_warn() {
+                println!("[WARN][FORK] fork_point_certified first_mismatch={} head_h={} mismatched={} action=rollback_once",
+                         first, head_height, mismatched.len());
+            }
+        }
     }
 
     /// Runtime-stall watchdog: a plain OS thread, deliberately NOT a tokio task. Every existing

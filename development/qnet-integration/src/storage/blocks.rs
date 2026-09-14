@@ -250,8 +250,8 @@ impl Storage {
         let incoming_hash: Option<[u8; 32]> = incoming_block.as_ref().map(|mb| mb.hash());
 
         // chain_height is written in the same WriteBatch as the body, so a row above it was never
-        // committed. L4 protects COMMITTED history: the evidence below is always taken, but an
-        // uncommitted row must not refuse its own replacement — that leaves the height unfillable.
+        // committed. L4 protects COMMITTED history: only a committed row refuses a save and is taken as
+        // evidence; an uncommitted one is replaced, or the height stays unfillable.
         let durable_tip = self.persistent.get_chain_height().unwrap_or(0);
         if let Ok(Some(existing_hash)) = self.persistent.load_microblock_hash(height) {
             match incoming_hash {
@@ -276,7 +276,7 @@ impl Storage {
                         .map(|mb| mb.producer.clone())
                         .unwrap_or_else(|| "unknown".to_string());
 
-                    if crate::node::is_warn() {
+                    if durable_tip >= height && crate::node::is_warn() {
                         println!(
                             "[ERR][FORK] equivocation_attempt h={} existing_hash={:x?} new_hash={:x?} new_producer={} action=reject_save_record_evidence",
                             height,
@@ -294,7 +294,10 @@ impl Storage {
                     // (format byte 0x02) — decoding those as a MicroBlock fails on EVERY block, so
                     // this was always None and the whole block-equivocation slashing path was dead:
                     // the guard rejected the variant and then silently dropped the evidence.
-                    let existing_mb = self.load_microblock_auto_format(height).ok().flatten();
+                    // Only against committed history: a row above the durable tip is a block the chain
+                    // abandoned (an operator rollback licenses its producer to sign the height again), so
+                    // it is replaced below, never taken as evidence.
+                    let existing_mb = if durable_tip >= height { self.load_microblock_auto_format(height).ok().flatten() } else { None };
                     if let (Some(inc), Some(exist)) = (incoming_block.as_ref(), existing_mb.as_ref()) {
                         // Slashable equivocation requires the SAME producer to have signed BOTH
                         // blocks. Two DIFFERENT producers at one height is a failover/rotation

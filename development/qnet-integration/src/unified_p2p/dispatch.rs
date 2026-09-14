@@ -311,7 +311,9 @@ impl SimplifiedP2P {
                 // Previous dup_pending skip caused deadlock: block marked pending on first
                 // request, then every re-delivery skipped → block never reached sync_order_buffer.
                 // Now: always accept delivered blocks, let sync_order_buffer handle ordering.
-                if storage.load_microblock(height).unwrap_or(None).is_some() {
+                // Held means at or below the applied tip: a row above it is not chain state, so a
+                // delivery of that height goes on to the pipeline, whose save replaces the row.
+                if crate::block_pipeline::held_at_or_below_tip(&storage, height) {
                     clear_block_pending_sync(height);
                     skipped_exists += 1;
                     // A sync/repair-delivered block at a height we ALREADY hold may be a higher-2f+1-
@@ -1411,9 +1413,8 @@ impl SimplifiedP2P {
                 // Deferred-held blocks are already in RAM awaiting their parent —
                 // re-downloading them doubled sync traffic. Their tracker entries
                 // expire with the deferred TTL, so a dropped block is re-requested.
-                let present = storage.load_microblock(h)
-                    .map(|opt| opt.is_some())
-                    .unwrap_or(false)
+                // A row above the applied tip is not chain state: its height is requested.
+                let present = crate::block_pipeline::held_at_or_below_tip(&storage, h)
                     || crate::block_pipeline::deferred_holds(h);
                 if present {
                     if let Some(s) = run_start.take() {

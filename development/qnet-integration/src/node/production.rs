@@ -10,6 +10,11 @@ pub(crate) fn tip_reconcile_target(local_h: u64, attempts: u32, fin_floor: u64) 
     local_h.saturating_sub(1u64 << attempts.min(40)).max(fin_floor).max(1)
 }
 
+/// Height whose orphan row (a body above the applied tip) the producer already reported once.
+static ORPHAN_ROW_NOTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Height whose certified slot the producer already reported yielding.
+static CERTIFIED_SLOT_NOTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 impl BlockchainNode {
     /// Fork-recovery consumer — its own task, for the same reason as the pacemaker:
     /// it used to live in the production loop, and during the h=601 wedge an armed
@@ -18,7 +23,6 @@ impl BlockchainNode {
     /// rollback barrier already make it safe against concurrent apply.
     pub(super) async fn run_fork_recovery_consumer(
         state: std::sync::Arc<tokio::sync::RwLock<qnet_state::State>>,
-        height: std::sync::Arc<tokio::sync::RwLock<u64>>,
         storage: std::sync::Arc<crate::storage::Storage>,
         unified_p2p: Option<std::sync::Arc<crate::unified_p2p::SimplifiedP2P>>,
     ) {
@@ -38,45 +42,7 @@ impl BlockchainNode {
                     // fault, not the state — tracked to drive the progressive deepening below.
                     static TIP_RECONCILED_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                     static TIP_RECONCILE_ATTEMPTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-                    // Escalation tracker: N consecutive reconcile failures with the SAME computed
-                    // root prove the local base (snapshots + stored replay) cannot self-heal —
-                    // hand recovery to the QC-verified peer-snapshot path instead of looping.
-                    static RECONCILE_FAIL_SIG: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-                    static RECONCILE_FAIL_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-                    static LAST_WHOLESALE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                    fn note_reconcile_failure(err: &str) {
-                        let sig = err.split("computed=").nth(1)
-                            .and_then(|s| s.split_whitespace().next())
-                            .unwrap_or(err).to_string();
-                        let count = {
-                            let mut prev = RECONCILE_FAIL_SIG.lock().unwrap();
-                            if prev.as_deref() == Some(sig.as_str()) {
-                                RECONCILE_FAIL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
-                            } else {
-                                *prev = Some(sig);
-                                RECONCILE_FAIL_COUNT.store(1, std::sync::atomic::Ordering::Relaxed);
-                                1
-                            }
-                        };
-                        if count >= 3 || err.starts_with("replay_diverged") {
-                            let now_ms = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
-                            let last = LAST_WHOLESALE_MS.load(std::sync::atomic::Ordering::Relaxed);
-                            // 10-min cooldown + per-node jitter (0..~5min) so a fleet poisoned by one
-                            // shared fork does not stampede the snapshot holders in lockstep.
-                            let jitter_ms = std::env::var("QNET_BOOTSTRAP_ID").ok()
-                                .or_else(|| std::env::var("QNET_NODE_ID").ok())
-                                .map(|s| (blake3::hash(s.as_bytes()).as_bytes()[0] as u64) * 1200)
-                                .unwrap_or(0);
-                            if now_ms.saturating_sub(last) >= 600_000 + jitter_ms {
-                                LAST_WHOLESALE_MS.store(now_ms, std::sync::atomic::Ordering::Relaxed);
-                                RECONCILE_FAIL_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
-                                println!("[WARN][FORK] reconcile_escalate fails={} action=wholesale_state_resync", count);
-                                crate::sync_manager::request_wholesale_state_resync();
-                            }
-                        }
-                    }
-                    let local_h = *height.read().await;
+                    let local_h = crate::node::local_height();
                     // v33: FORK_RECOVERY_HEIGHT is the deterministic highest-good height —
                     // disputed_height-1 (n−f minority-fork observer) or finalized_h+1 (anchor
                     // recovery), both agreed across nodes. Roll back TO it: keep ≤ fork_h,
@@ -117,6 +83,9 @@ impl BlockchainNode {
                             .or_insert_with(|| crate::block_pipeline::certified_window_hashes(&storage, window_k))
                             .as_ref().and_then(|v| v.get((h - (window_k - 1) * 90 - 1) as usize).copied());
                         if certified.is_some() { return certified; }
+                        // No seal yet: the committed checkpoint covering h names its body at the
+                        // checkpoint cadence, the same authority that signalled this rollback.
+                        if let Some(c) = crate::block_pipeline::certified_pair_hash(&storage, h) { return Some(c); }
                         // No checkpoint for this height yet: the authenticated evidence decides. The
                         // record is written only where the slot's own authorised leader built on a
                         // different parent, so a round here vouches for nothing.
@@ -170,7 +139,6 @@ impl BlockchainNode {
                                 if let Err(e) = storage.set_chain_height(rollback_to) {
                                     eprintln!("[ERR][FORK] set_chain_height_fail h={} err={}", rollback_to, e);
                                 }
-                                *height.write().await = rollback_to;
                                 LAST_BLOCK_PRODUCED_HEIGHT.store(rollback_to, Ordering::Relaxed);
                                 crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(
                                     rollback_to, std::sync::atomic::Ordering::Release
@@ -269,7 +237,6 @@ impl BlockchainNode {
                                     // its snapshot fast-path restores wholesale state (and owns) on the
                                     // nudge below. Mark owns dirty so a crash before that re-derives it.
                                     storage.mark_owns_index_dirty();
-                                    note_reconcile_failure(&e);
                                     println!(
                                         "[WARN][STATE] reconcile_unproven target={} err={} action=coordinator_state_sync",
                                         rollback_to, e,
@@ -345,7 +312,6 @@ impl BlockchainNode {
                                     Ok(_) => { crate::block_pipeline::clear_state_suspect(); println!("[INFO][FORK] state_reconciled_at_tip h={}", local_h); }
                                     Err(e) => {
                                         storage.mark_owns_index_dirty();
-                                        note_reconcile_failure(&e);
                                         println!("[WARN][FORK] tip_reconcile_unproven h={} err={} action=coordinator_state_sync",
                                                  local_h, e);
                                     }
@@ -365,7 +331,6 @@ impl BlockchainNode {
                                         Ok(_) => { crate::block_pipeline::clear_state_suspect(); println!("[INFO][FORK] state_reconciled_at_floor h={}", local_h); }
                                         Err(e) => {
                                             storage.mark_owns_index_dirty();
-                                            note_reconcile_failure(&e);
                                             println!("[WARN][FORK] floor_reconcile_unproven h={} err={} action=coordinator_state_sync",
                                                      local_h, e);
                                         }
@@ -902,11 +867,10 @@ impl BlockchainNode {
             std::sync::atomic::Ordering::SeqCst,
         ).is_ok() {
             let fc_state = self.state.clone();
-            let fc_height = self.height.clone();
             let fc_storage = self.storage.clone();
             let fc_p2p = self.unified_p2p.clone();
             tokio::spawn(async move {
-                Self::run_fork_recovery_consumer(fc_state, fc_height, fc_storage, fc_p2p).await;
+                Self::run_fork_recovery_consumer(fc_state, fc_storage, fc_p2p).await;
             });
         }
 
@@ -1022,7 +986,6 @@ impl BlockchainNode {
         let mempool = self.mempool.clone();
         let mev_mempool = self.mev_mempool.clone();
         let storage = self.storage.clone();
-        let height = self.height.clone();
         let unified_p2p = self.unified_p2p.clone();
         let _wallet_identity_for_reactivation = self.wallet_identity.clone();
         let microblock_interval = self.microblock_interval;
@@ -1067,7 +1030,7 @@ impl BlockchainNode {
         
         let production_handle = tokio::spawn(async move {
             // CRITICAL FIX: Start from current global height, not 0
-            let mut microblock_height = *height.read().await;
+            let mut microblock_height = crate::node::local_height();
             // CRITICAL FIX: Calculate last_macroblock_trigger from current height
             // This ensures consensus works even when node starts after block 61
             let mut last_macroblock_trigger = (microblock_height / 90) * 90;
@@ -1274,7 +1237,6 @@ impl BlockchainNode {
 
                                 if let Ok(stored_height) = storage.get_chain_height() {
                                     microblock_height = stored_height;
-                                    *height.write().await = stored_height;
                                 }
                                 crate::GLOBAL_GENESIS_TIMESTAMP.store(
                                     existing_genesis.timestamp,
@@ -1630,7 +1592,6 @@ impl BlockchainNode {
                                                 // CRITICAL FIX: Set height to 0 after Genesis creation
                                                 // This ensures next block will be #1
                                                 microblock_height = 0;
-                                                *height.write().await = 0;
                                                 
                                                 // Update storage height to 0 to fix any inconsistencies
                                                 if let Err(e) = storage.set_chain_height(0) {
@@ -1789,7 +1750,6 @@ impl BlockchainNode {
                                 // Update height from storage
                                 if let Ok(stored_height) = storage.get_chain_height() {
                                     microblock_height = stored_height;
-                                    *height.write().await = stored_height;
                                     if is_info() {
                                         println!("[INFO][GEN] height_synced h={}", stored_height);
                                     }
@@ -1933,7 +1893,6 @@ impl BlockchainNode {
                         if stored_height > 0 {
                             println!("[INFO][GEN] Blockchain already synced (height: {})", stored_height);
                             microblock_height = stored_height;
-                            *height.write().await = stored_height;
                         }
                     }
                     
@@ -2153,14 +2112,17 @@ impl BlockchainNode {
                             .load(std::sync::atomic::Ordering::Relaxed);
                         
                         if genesis_ts > 0 {
-                            // Calculate expected Unix timestamp for next block
-                            let current_height = *height.read().await;
-                            let expected_unix_time = genesis_ts + current_height + 1;
-                            
+                            // The next block's slot: the grid, or `now` once the grid has fallen a
+                            // window behind (the gap rule - the chain re-anchors instead of catching up).
+                            let current_height = crate::node::local_height();
                             let current_unix_time = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
                                 .as_secs();
+                            let parent_ts = storage.block_timestamp_at(current_height).ok().flatten();
+                            // Unknown parent at/after the gate: no slot to wait for; the stamp skips it.
+                            let expected_unix_time = producer_slot_timestamp(genesis_ts, parent_ts, current_height + 1, current_unix_time)
+                                .unwrap_or(current_unix_time);
                             
                             if expected_unix_time > current_unix_time {
                                 let wait_secs = expected_unix_time - current_unix_time;
@@ -2563,64 +2525,12 @@ impl BlockchainNode {
                 }
                 }
                 
-                // CRITICAL FIX v2.50: Unify height sources within THIS NODE
-                // 
-                // ARCHITECTURE: Two LOCAL height sources exist on each node:
-                // 1. Arc<RwLock<u64>> height - RAM variable, updated by received_block handler
-                // 2. storage.get_chain_height() - RocksDB on disk, updated by save_microblock()
-                // 
-                // PROBLEM: sync_blocks() downloads from network and saves to RocksDB
-                //          but does NOT update the RAM variable (Arc<RwLock>)!
-                // RESULT: State machine uses stale RAM height, causing rotation desync
-                // 
-                // SOLUTION: Use RocksDB as single source of truth (it's always updated)
-                //           Then sync RAM variable for consistency with other components
-                // 
-                // NOTE: This is INTERNAL synchronization within one node, NOT network sync!
-                //       Network sync happens via sync_blocks() -> save_microblock() -> RocksDB
                 {
-                    // v15.11: storage.get_chain_height() is a sync RocksDB read on a column
-                    // family that can stall for hundreds of milliseconds during compaction.
-                    // The producer loop runs every second, so an 800ms compaction stall
-                    // here freezes the entire async runtime — the exact fault profile
-                    // observed on the production node 002 silent-for-85s incident.
-                    // spawn_blocking moves the read off the runtime's worker threads.
-                    let storage_for_height = storage.clone();
-                    let local_chain_height = match tokio::task::spawn_blocking(move || {
-                        storage_for_height.get_chain_height().unwrap_or(0)
-                    }).await {
-                        Ok(h) => h,
-                        Err(join_err) => {
-                            println!("[WARN][SYNC] get_chain_height_join_err err={}", join_err);
-                            0
-                        }
-                    };
-
-                    // Also get RAM height variable for comparison
-                    let ram_height = *height.read().await;
-
-                    // CRITICAL: Use MAX of both to handle all sync paths
-                    // SAFETY: Guard against u64::MAX (can appear if cache/state is corrupted).
-                    // Without this, the scan loop below iterates 18 quintillion entries → deadlock.
-                    let canonical_height = {
-                        let raw = std::cmp::max(local_chain_height, ram_height);
-                        if raw == u64::MAX || raw > 2_000_000_000 {
-                            println!("[ERR][SYNC] canonical_height_invalid={} local={} ram={} — clamping to local",
-                                     raw, local_chain_height, ram_height);
-                            local_chain_height
-                        } else {
-                            raw
-                        }
-                    };
-
-                    // INTERNAL SYNC: Update RAM if RocksDB is ahead (fixes API/other components)
-                    if local_chain_height > ram_height {
-                        *height.write().await = local_chain_height;
-                        if is_debug() {
-                            println!("[DBG][SYNC] RAM height updated: {} -> {} (from RocksDB)",
-                                     ram_height, local_chain_height);
-                        }
-                    }
+                    // The applied tip, and nothing else. This used to take max(storage, RwLock mirror):
+                    // the mirror never followed a lowering, so after a regress the scan below started
+                    // from the deleted tip and asked peers for bodies that were gone (004, 14.09 00:42).
+                    // One atomic read, no storage round-trip on the runtime.
+                    let canonical_height = crate::node::local_height();
 
                     if canonical_height > microblock_height {
                         // v15.11: scan window bounded + spawn_blocking. Verify blocks
@@ -3151,64 +3061,46 @@ impl BlockchainNode {
                 // Nodes at different heights naturally select different producers (by design)
                 let next_block_height = microblock_height + 1;
 
-                // Producer own-height pre-check (anti-fork at production
-                // entry). Forensic h=174582: two nodes produced the same
-                // height because the pipeline hadn't caught up to the in-
-                // memory counter and the pre-save guard fired only after the
-                // heavy sign work. Read storage at cycle entry — if a
-                // block at next_block_height already exists, abort and yield
-                // (shrinks the race ~50ms → ~1-2ms). Idempotent (same
-                // producer no-op); different producer → yield; a fork attempt
-                // is still caught by the L4 save-time guard. O(1) read.
+                // Producer own-slot pre-check. The slot is filled iff the APPLIED tip covers it: a body and
+                // chain_height are written in one WriteBatch and nothing stores a body ahead of apply, so
+                // `tip >= h` is exactly "the pipeline committed h". A row above the tip is an orphan a
+                // rollback or an aborted apply left behind - not chain state, never going to apply - and
+                // yielding to it wedged production for good (684631; 937457 and 937531 on 14.09). It is
+                // ignored here and replaced by L4 on the canonical save; the producer no longer waits for it.
                 {
+                    let tip = crate::node::local_height();
+                    if tip >= next_block_height {
+                        if is_info() {
+                            println!("[INFO][PROD] preempted_h={} tip={} action=yield_to_pipeline", next_block_height, tip);
+                        }
+                        // The state-machine scan at the top of the loop fast-forwards with its trigger
+                        // bookkeeping; assigning the height here skipped a macroblock boundary.
+                        continue;
+                    }
                     let storage_for_precheck = storage.clone();
-                    let precheck_height = next_block_height;
-                    // The label is resolved on the SAME blocking task, and only when it will be
-                    // printed: rows are zstd-compressed or EfficientMicroBlock, so bincode on the raw
-                    // bytes named every real block "unknown", and a second read here would sit on the
-                    // reactor the outer spawn_blocking exists to protect.
-                    let want_label = is_info();
-                    match tokio::task::spawn_blocking(move || {
-                        storage_for_precheck.load_microblock(precheck_height).map(|row| row.map(|_| {
-                            if !want_label { return String::new(); }
-                            storage_for_precheck.load_microblock_auto_format(precheck_height)
-                                .ok().flatten().map(|mb| mb.producer)
-                                .unwrap_or_else(|| "unknown".to_string())
-                        }))
-                    }).await {
-                        Ok(Ok(Some(existing_producer))) => {
-                            // Block already exists at our target height — apply pipeline
-                            // already finalized it (received from peer broadcast). Yield
-                            // and let the next iteration pick up the advanced height.
-                            if want_label {
-                                println!(
-                                    "[INFO][PROD] preempted_h={} existing_producer={} action=yield_to_pipeline",
-                                    precheck_height, existing_producer
-                                );
-                            }
-                            continue;
+                    let (row, durable, certified) = tokio::task::spawn_blocking(move || (
+                        storage_for_precheck.load_microblock(next_block_height).ok().flatten().is_some(),
+                        storage_for_precheck.get_chain_height().unwrap_or(0),
+                        crate::block_pipeline::certified_micro_hash(&storage_for_precheck, next_block_height),
+                    )).await.unwrap_or((false, 0, None));
+                    // The pipeline committed this height (body and durable height in one batch) and
+                    // publishes the tip under the lock it still holds: yield, the row is no orphan.
+                    if durable >= next_block_height {
+                        if is_info() {
+                            println!("[INFO][PROD] preempted_h={} tip={} durable={} action=yield_to_pipeline", next_block_height, tip, durable);
                         }
-                        Ok(Ok(None)) => {
-                            // No block yet — proceed with normal production path.
+                        continue;
+                    }
+                    // A certificate already names this height's body: another block here would compete
+                    // with a settled one. The pipeline installs the certified body, from disk or peers.
+                    if let Some(c) = certified {
+                        if CERTIFIED_SLOT_NOTED.swap(next_block_height, Ordering::Relaxed) != next_block_height && is_info() {
+                            println!("[INFO][PROD] certified_slot_yield h={} body={} action=await_certified", next_block_height, hex::encode(&c[..8]));
                         }
-                        Ok(Err(e)) => {
-                            // Storage read error — treat as "no block" but log. Production
-                            // continues; L4 storage guard will catch any later conflict.
-                            if is_warn() {
-                                println!(
-                                    "[WARN][PROD] precheck_storage_err h={} err={} action=proceed_with_l4_guard",
-                                    precheck_height, e
-                                );
-                            }
-                        }
-                        Err(join_err) => {
-                            if is_warn() {
-                                println!(
-                                    "[WARN][PROD] precheck_join_err h={} err={} action=proceed",
-                                    precheck_height, join_err
-                                );
-                            }
-                        }
+                        continue;
+                    }
+                    if row && ORPHAN_ROW_NOTED.swap(next_block_height, Ordering::Relaxed) != next_block_height && is_warn() {
+                        println!("[WARN][PROD] orphan_row_ignored h={} tip={} action=produce", next_block_height, tip);
                     }
                 }
 
@@ -4787,31 +4679,6 @@ impl BlockchainNode {
                     // Other nodes validate and accept/reject - this is the blockchain way!
                     // NO SYNC CHECKS, NO NETWORK QUERIES, NO WAITING!
                     
-                    // Median-aware wall-clock timestamp = max of four sources:
-                    // (1) wall_clock; (2) network_median + blocks_ahead (last-32
-                    // ring — pulls a behind-clock producer into the accepted
-                    // range); (3) parent_ts+1 (strict monotonicity, clock-
-                    // independent); (4) median_past+1 (Median-Past lower bound;
-                    // undefined for the first ~11 blocks → falls back to (3)).
-                    // The max is the smallest legal timestamp satisfying every
-                    // rule, so a node within 2h drift is accepted on first
-                    // validation with zero NTP dependency. block.timestamp is
-                    // ML-DSA-65-signed, so the producer can't show different
-                    // peers different values. Four O(1) reads.
-                    // Slot-anchored deterministic timestamp: block_ts = genesis_ts +
-                    // height*SLOT. Identical on every node ⇒ clock-independent, no drift,
-                    // no median ring, no NTP. ML-DSA-65-signed.
-                    let deterministic_timestamp = {
-                        let g = genesis_timestamp(&storage);
-                        let ts = expected_block_timestamp(g, next_block_height);
-                        if is_debug() && next_block_height > 0 {
-                            println!("[DBG][TIMESTAMP] gen h={} genesis_ts={} → ts={}",
-                                     next_block_height, g, ts);
-                        }
-                        ts
-                    };
-
-
                     // Get previous block hash
                     let prev_hash = Self::get_previous_microblock_hash(&storage, next_block_height).await;
                     
@@ -4910,6 +4777,32 @@ impl BlockchainNode {
                         // Note: PREV_HASH_RETRY_COUNTER already defined above
                         PREV_HASH_RETRY_COUNTER.store(0, Ordering::SeqCst);
                     }
+
+                    // The slot timestamp (slot_timestamp_valid is the rule), from the parent this block
+                    // names: its header row, else its body. Unknown at/after the gate: the slot is skipped.
+                    let deterministic_timestamp = {
+                        let g = genesis_timestamp(&storage);
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                        let parent_ts = storage.header_by_hash(&prev_hash).map(|hd| hd.timestamp)
+                            .or_else(|| storage.block_timestamp_at(next_block_height.saturating_sub(1)).ok().flatten());
+                        match producer_slot_timestamp(g, parent_ts, next_block_height, now) {
+                            Some(ts) => {
+                                if let Some(p) = parent_ts {
+                                    if ts > p + 1 && is_warn() {
+                                        println!("[WARN][SLOT] gap_declared h={} parent_ts={} ts={} gap_s={}", next_block_height, p, ts, ts - p - 1);
+                                    }
+                                }
+                                ts
+                            }
+                            None => {
+                                println!("[WARN][SLOT] parent_ts_unknown h={} action=skip_slot", next_block_height);
+                                crate::unified_p2p::BLOCK_BROADCAST_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
+                                tokio::time::sleep(microblock_interval).await;
+                                continue;
+                            }
+                        }
+                    };
                     
                     
                     // ═══════════════════════════════════════════════════════════════════════════
@@ -5141,9 +5034,10 @@ impl BlockchainNode {
                         // below this point leaves state mutated with nothing to roll it back: the
                         // producer would then sign a state_root no validator can reproduce.
                         if next_block_height > 0 {
-                            // Blocks are saved at apply, so a lagging node holds the network's block
-                            // for this height in its verify->apply queue long before storage sees it.
-                            let stored = matches!(storage.load_microblock(next_block_height), Ok(Some(_)));
+                            // Filled iff the applied tip covers it (same rule as the cycle-entry
+                            // precheck); a lagging node also holds the network's block for this height
+                            // in its verify->apply queue long before the tip moves.
+                            let stored = crate::node::local_height() >= next_block_height;
                             let verified = crate::unified_p2p::highest_verified_height() >= next_block_height;
                             if stored || verified {
                                 println!("[WARN][PROD] production_yielded h={} reason={}", next_block_height,
@@ -5245,7 +5139,6 @@ impl BlockchainNode {
                         // block for this height applied since the check above would otherwise be built over.
                         if crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::SeqCst) >= next_block_height
                             || crate::unified_p2p::highest_verified_height() >= next_block_height
-                            || storage.canonical_hash_at(next_block_height).is_some()
                         {
                             println!("[WARN][PROD] production_yielded h={} reason=slot_occupied_under_lock", next_block_height);
                             drop(state_guard);
@@ -5256,6 +5149,9 @@ impl BlockchainNode {
                         // reader (gossip TX validation included) waits on it, so this section's
                         // duration is bounded by BLOCK_GAS_LIMIT and measured in block_timing.
                         let t_apply = std::time::Instant::now();
+                        // A stale-mirror verdict from a warm before this block (the pipeline's pre-warm)
+                        // is not this block's.
+                        let _ = state_guard.take_mirror_stale();
                         let mut inline_snap = state_guard.create_block_snapshot(next_block_height);
 
                         // Per-block WASM event logs, captured the SAME way the validator path does
@@ -5495,6 +5391,22 @@ impl BlockchainNode {
                             }
                         }
                         
+                        // A tx in this block read an account from a CF row that does not hash to its
+                        // committed leaf: this node does not hold that account's value and must not sign
+                        // a state root built without it. Undo the inline apply; the latch schedules the
+                        // resync. Validators refuse such a block the same way.
+                        let stale = state_guard.take_mirror_stale();
+                        if !stale.is_empty() {
+                            inline_snap.note_stale_leaves(stale);
+                            state_guard.rollback_block(&inline_snap);
+                            drop(state_guard);
+                            println!("[ERR][PROD] mirror_stale h={} action=abort_block_suspect", next_block_height);
+                            crate::block_pipeline::mark_state_suspect();
+                            crate::sync_manager::nudge_sync_check();
+                            crate::unified_p2p::BLOCK_BROADCAST_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
+                            continue;
+                        }
+
                         // 4. Finalize Merkle and get state_root. CPU-bound: run via block_in_place
                         // so this worker thread is handed back to the runtime's scheduler.
                         let apply_ms = t_apply.elapsed().as_millis();
@@ -6117,18 +6029,12 @@ impl BlockchainNode {
                     // We only advance after successfully creating and storing the block
                     microblock_height = microblock.height;  // Set to the block we just created
                     
-                    // Update global height for API sync
-                    {
-                        let mut global_height = height.write().await;
-                        *global_height = microblock_height;
-                        
-                        // Update P2P local height for message filtering
-                        // v9.0: Release ordering pairs with Acquire in consensus paths
-                        crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(
-                            microblock_height,
-                            std::sync::atomic::Ordering::Release
-                        );
-                    }
+                    // The applied tip moves here for the producer's own block.
+                    // v9.0: Release ordering pairs with Acquire in consensus paths
+                    crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(
+                        microblock_height,
+                        std::sync::atomic::Ordering::Release
+                    );
                     
                     if is_info() { println!("[INFO][PROD] block_created h={}", microblock_height); }
                     
@@ -6325,10 +6231,6 @@ impl BlockchainNode {
                         if let Ok(Some(_)) = storage.load_microblock(expected_height) {
                             // Block already exists locally - advance to this height
                             microblock_height = expected_height;
-                            {
-                                let mut global_height = height.write().await;
-                                *global_height = microblock_height;
-                            }
                             if is_info() { println!("[INFO][SYNC] local_block h={} advance={}", expected_height, microblock_height); }
                             
                             // Rotation boundary check for logging

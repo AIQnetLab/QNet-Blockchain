@@ -2,6 +2,27 @@
 
 use super::*;
 
+/// Why a replayed block was not taken; the block has already been undone from its own journal.
+#[derive(Debug)]
+pub(crate) enum ReplayStop {
+    /// The root its producer committed cannot be reproduced here: (expected, computed).
+    Diverged([u8; 32], [u8; 32]),
+    /// A row the block read does not hold the account's committed value.
+    MirrorStale,
+    /// A claim names an epoch whose certifying macroblock is not held here, and the root disagrees.
+    RewardEpochMissing(u64),
+}
+
+impl ReplayStop {
+    pub(crate) fn describe(&self) -> String {
+        match self {
+            ReplayStop::Diverged(e, c) => format!("reason=diverged expected={} computed={}", hex::encode(&e[..8]), hex::encode(&c[..8])),
+            ReplayStop::MirrorStale => "reason=mirror_stale".to_string(),
+            ReplayStop::RewardEpochMissing(mb) => format!("reason=reward_epoch_missing certifying_mb={}", mb),
+        }
+    }
+}
+
 impl BlockchainNode {
     /// Apply a block's transactions to state. This is the SINGLE source of truth
     /// for state mutation ordering. The phases execute in deterministic order:
@@ -31,9 +52,12 @@ impl BlockchainNode {
         // into this block's persisted receipts. Filled during Phase 2's SEQUENTIAL tx apply.
         qnet_state::wasm_exec::clear_wasm_logs();
 
+        // Cleared per block: a stale-mirror hit anywhere in this block's reads is this block's verdict.
+        let _ = state_guard.take_mirror_stale();
         let mut result = BlockApplyResult {
             side_indices: BlockSideIndices::default(),
             merkle_root: [0u8; 32],
+            mirror_stale: false,
 
             deferred_pool3: 0,
             deferred_registrations: Vec::new(),
@@ -341,6 +365,9 @@ impl BlockchainNode {
 
         // ── Phase 5: Finalize merkle tree ──
         result.merkle_root = state_guard.finalize_merkle();
+        let stale = state_guard.take_mirror_stale();
+        result.mirror_stale = !stale.is_empty();
+        if let Some(snap) = block_snapshot.as_deref_mut() { snap.note_stale_leaves(stale); }
 
         // Rich-list index (display-only, best-effort): reconcile this block's touched holders. Same
         // touched-set as the producer-inline path (tx affected-addrs ∪ credited producer wallet).
@@ -426,6 +453,57 @@ impl BlockchainNode {
     //   from partitions). Liveness handled instead by the heartbeat-eligibility gate
     //   (non-heartbeating node drops out) + slot-timeout failover with no penalty.
     
+    /// One replayed block, verified. Applied under the caller's write lock; the root the apply
+    /// produced is compared with the root the block's producer committed. A single-leaf difference
+    /// is the accounts-CF phantom and is repaired (the address comes back so the caller can purge
+    /// its row); anything else undoes the block from its own journal and says why, so a divergence
+    /// is named at its first height. Reconcile and the boot replay share it.
+    pub(crate) fn replay_block_verified(
+        sg: &StateManager,
+        storage: &Storage,
+        mb: &MicroBlock,
+    ) -> Result<Option<String>, ReplayStop> {
+        let mut snap = sg.create_block_snapshot(mb.height);
+        let r = Self::apply_block_to_state(sg, mb, storage, Some(&mut snap));
+        // A matching root proves the block whatever the apply could not decide or read; without a
+        // root to check, only a complete apply stands. A stale read explains a root that differs.
+        let mut repaired = None;
+        let proven = if mb.state_root == [0u8; 32] {
+            r.reward_epoch_missing.is_none() && !r.mirror_stale
+        } else if r.merkle_root == mb.state_root {
+            true
+        } else if r.mirror_stale {
+            false
+        } else if let Some(addr) = sg.repair_single_phantom(&mb.state_root) {
+            repaired = Some(addr);
+            true
+        } else {
+            false
+        };
+        if !proven {
+            sg.rollback_block(&snap);
+            return Err(if r.mirror_stale {
+                ReplayStop::MirrorStale
+            } else {
+                match r.reward_epoch_missing {
+                    Some(certifying_mb) => ReplayStop::RewardEpochMissing(certifying_mb),
+                    None => ReplayStop::Diverged(mb.state_root, r.merkle_root),
+                }
+            });
+        }
+        // A replayed block already owns its slot: side indices are written straight away
+        // (idempotent — lowest-height-wins and add-only).
+        Self::flush_block_side_indices(storage, mb.height, &r.side_indices);
+        // Re-seal total_supply at checkpoint heads: a later finality redrive reads
+        // get_total_supply_at(head), which does NOT recompute on a miss.
+        if mb.height % qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL == 0 {
+            let _ = storage.seal_total_supply(mb.height, sg.get_total_supply());
+        }
+        // A replayed block is a committed block: its journal serves a later shallow undo.
+        sg.retain_block_journal(snap);
+        Ok(repaired)
+    }
+
     // Rebuild in-memory state to match the chain tip at target_height after a
     // rollback. Rollback deletes microblocks from storage but leaves the
     // in-memory accounts DashMap mutated, so post-rollback blocks validate
@@ -437,7 +515,7 @@ impl BlockchainNode {
     /// Rebuild state at `target_height` and PROVE it against the canonical block's state_root.
     /// Any Err leaves a non-authoritative leaf set resident, so the suspect latch is set HERE,
     /// on the single exit — no future early-return inside can forget it.
-    pub(super) async fn reconcile_state_after_rollback(
+    pub(crate) async fn reconcile_state_after_rollback(
         state: &Arc<tokio::sync::RwLock<StateManager>>,
         storage: &Arc<Storage>,
         target_height: u64,
@@ -575,13 +653,16 @@ impl BlockchainNode {
             .map(|(h, _, _)| h.saturating_add(1))
             .unwrap_or(0);
         let replay_to = target_height;
+        // Contiguous only: a block is replayed on the state its parent left, so the tail ends at the
+        // first body that cannot be loaded.
         let mut blocks_to_replay: Vec<MicroBlock> = Vec::new();
         let mut load_errs = 0u64;
+        let mut first_hole: Option<u64> = None;
         if replay_from <= replay_to {
             for h in replay_from..=replay_to {
                 match storage.load_microblock_auto_format(h) {
                     Ok(Some(mb)) => blocks_to_replay.push(mb),
-                    _ => load_errs = load_errs.saturating_add(1),
+                    _ => { load_errs = load_errs.saturating_add(1); first_hole = Some(h); break; }
                 }
             }
         }
@@ -679,42 +760,23 @@ impl BlockchainNode {
             let mut applied = 0u64;
             let mut stopped_at: Option<u64> = None;
             for mb in &blocks_to_replay {
-                let mut snap = sg.create_block_snapshot(mb.height);
-                let r = Self::apply_block_to_state(&sg, mb, storage, Some(&mut snap));
-                // Per-block verification: a divergence is located at its first height. The block
-                // that fails is undone from its own journal and the replay stops on the last
-                // verified one — the live pipeline path continues from there. The one-leaf phantom
-                // repair stays available at every step.
-                if mb.state_root != [0u8; 32] {
-                    let got = sg.finalize_merkle();
-                    if got != mb.state_root {
-                        match sg.repair_single_phantom(&mb.state_root) {
-                            Some(addr) => { repaired_phantom = Some(addr); }
-                            None => {
-                                sg.rollback_block(&snap);
-                                println!("[WARN][STATE] replay_diverged h={} expected={} computed={} replay_from={} action=stop_below",
-                                         mb.height, hex::encode(&mb.state_root[..8]), hex::encode(&got[..8]), replay_from);
-                                stopped_at = Some(mb.height - 1);
-                                break;
-                            }
+                match Self::replay_block_verified(&sg, storage, mb) {
+                    Ok(repaired) => { if let Some(addr) = repaired { repaired_phantom = Some(addr); } }
+                    Err(stop) => {
+                        println!("[WARN][STATE] replay_diverged h={} {} replay_from={} action=stop_below",
+                                 mb.height, stop.describe(), replay_from);
+                        // Block 0 has no verified state below it: nothing local can stand.
+                        match mb.height.checked_sub(1) {
+                            Some(h) => { stopped_at = Some(h); break; }
+                            None => return Err(format!("replay_diverged_at_genesis {} action=resync", stop.describe())),
                         }
                     }
                 }
-                // Replaying a stored block: it already owns its slot, so its side indices are written
-                // straight away (idempotent — lowest-height-wins and add-only).
-                Self::flush_block_side_indices(storage, mb.height, &r.side_indices);
-                if let Some(certifying_mb) = r.reward_epoch_missing {
-                    return Err(format!("reconcile_reward_epoch_missing h={} certifying_mb={}",
-                                       mb.height, certifying_mb));
-                }
-                // Re-seal total_supply at checkpoint heads (see startup replay): a post-reconcile finality
-                // redrive reads get_total_supply_at(head), which does NOT recompute on miss → defer forever.
-                if mb.height % qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL == 0 {
-                    let _ = storage.seal_total_supply(mb.height, sg.get_total_supply());
-                }
-                // A replayed block is a committed block: its journal serves a later shallow undo.
-                sg.retain_block_journal(snap);
                 applied = applied.saturating_add(1);
+            }
+            // The tail ended at a body that could not be loaded: the state stands below it.
+            if stopped_at.is_none() && applied > 0 {
+                if let Some(hole) = first_hole { stopped_at = Some(hole - 1); }
             }
             replayed = applied;
             if let Some(h) = stopped_at {

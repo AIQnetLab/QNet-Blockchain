@@ -4,8 +4,8 @@
 //! consensus emission amount. Everything else was a second reward accounting that ran beside
 //! the certified one and disagreed with it.
 
-/// Seconds of chain time per microblock slot. Block timestamps are slot-anchored
-/// (block_ts = genesis_ts + height*SLOT), so height alone is the chain's clock.
+/// Seconds of chain time per microblock slot. The schedule counts produced slots: height is its
+/// clock, and a halt the chain re-anchors over (SLOT_GAP_REANCHOR) delays it in wall time.
 pub const EMISSION_SLOT_SECS: u64 = 1;
 /// Seconds per emission year (365d), the halving schedule's unit.
 pub const EMISSION_SECS_PER_YEAR: u64 = 365 * 24 * 60 * 60;
@@ -45,11 +45,11 @@ pub fn pool1_base_emission_for_cycles(halving_cycles: u64) -> u64 {
 
 /// CONSENSUS emission schedule: Pool-1 base emission at a block height.
 ///
-/// The halving cycle is derived from HEIGHT, not from the wall clock. Block timestamps are
-/// slot-anchored, so height is an exact, node-independent measure of elapsed chain time; reading
-/// SystemTime::now() here would make the amount depend on each node's clock and split the network
-/// for the whole cycle in which their clocks straddle a halving boundary. Producer and validator
-/// both call this, so the emission TX's amount is verifiable rather than asserted.
+/// The halving cycle is derived from HEIGHT, not from the wall clock: height is node-independent,
+/// and reading SystemTime::now() here would make the amount depend on each node's clock and split
+/// the network for the whole cycle in which their clocks straddle a halving boundary. Slots nobody
+/// produced mint nothing and do not count. Producer and validator both call this, so the emission
+/// TX's amount is verifiable rather than asserted.
 pub fn pool1_base_emission_at_height(height: u64) -> u64 {
     let years = height.saturating_mul(EMISSION_SLOT_SECS) / EMISSION_SECS_PER_YEAR;
     pool1_base_emission_for_cycles(years / 4)

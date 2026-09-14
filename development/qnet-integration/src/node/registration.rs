@@ -1018,7 +1018,7 @@ impl BlockchainNode {
         let mut eligible: Vec<String> = Vec::new();
         // Resident supers: read the committed tally from RAM (authoritative). Evicted (inactive) ones:
         // collect for ONE batched disk read below — avoids N sequential cold reads stalling the
-        // boundary block at scale. Same set + same values as a per-super warm_account loop.
+        // boundary block at scale. That read is the raw mirror: the leaf gate of warm_* does not cover it.
         let mut evicted: Vec<String> = Vec::new();
         for (node_id, _wallet) in &supers {
             match state_guard.accounts.get(node_id) {

@@ -1395,16 +1395,19 @@ fn recent_heartbeat_senders(storage: &crate::storage::Storage, scan_end: u64) ->
 /// the authority. Reading it from there made the seed unavailable the moment finality stopped, which
 /// is what turns a finality stall into a height stall.
 ///
-/// None ⇒ some body in the window is missing ⇒ the caller abstains. Window w spans
-/// (w-1)*90+1 ..= w*90, i.e. at most 180 blocks behind the production point — always inside the
-/// 6-epoch body retention.
+/// Folded from the height->hash index: the index is written in the same batch as every body,
+/// deleted with it and kept across body prune, and `EfficientMicroBlock::hash` equals
+/// `MicroBlock::hash`, so it IS the body's identity. Ninety 32-byte point reads instead of ninety
+/// body loads, each of which deserialised the block and, on a cache miss, every transaction in it.
+///
+/// None ⇒ a height in the window has neither index nor body ⇒ the caller abstains. Window w spans
+/// (w-1)*90+1 ..= w*90.
 pub(crate) fn derive_window_beacon(storage: &Storage, w: u64) -> Option<[u8; 32]> {
     if w == 0 { return None; }
     let (start, end) = ((w - 1) * 90 + 1, w * 90);
     let mut v: Vec<[u8; 32]> = Vec::with_capacity(90);
     for h in start..=end {
-        let mb = storage.load_microblock_auto_format(h).ok().flatten()?;
-        v.push(mb.hash());
+        v.push(storage.load_microblock_hash(h).ok().flatten()?);
     }
     Some(qnet_consensus::checkpoint_bft::accumulate_beacon(&v))
 }
@@ -2541,9 +2544,9 @@ pub fn attestation_layer_warmed_up() -> bool {
     node_uptime_secs() >= ATTESTATION_WARMUP_SECS
 }
 
-/// Microblock slot duration. block_ts is a pure function of height anchored to
-/// genesis (block_ts = genesis_ts + height*SLOT) ⇒ clock-independent: no drift,
-/// no median ring, no NTP dependency, deterministic on every node.
+/// Microblock slot duration. The timestamp rule is slot_timestamp_valid: the genesis grid
+/// (genesis_ts + height*SLOT) below SLOT_GAP_REANCHOR, the parent's timestamp + SLOT or a
+/// declared gap at/after it.
 pub const MICROBLOCK_INTERVAL_SECS: u64 = 1;
 
 /// Genesis anchor for slot timestamps: block 0's signed timestamp, cached on
@@ -2563,10 +2566,44 @@ pub fn genesis_timestamp(storage: &crate::storage::Storage) -> u64 {
     ts
 }
 
-/// Deterministic clock-independent timestamp for a microblock at `height`.
+/// Deterministic clock-independent timestamp for a microblock at `height` on the genesis grid.
 #[inline]
 pub fn expected_block_timestamp(genesis_ts: u64, height: u64) -> u64 {
     genesis_ts.saturating_add(height.saturating_mul(MICROBLOCK_INTERVAL_SECS))
+}
+
+/// Smallest gap a producer may declare, and the most a declared gap may run ahead of a verifier's
+/// clock. A gap is only ever declared after a halt of at least one window, so ordinary clock spread
+/// between hosts never reaches the rule; and a gap block that outruns honest clocks by more than
+/// the tolerance is refused by them and the slot fails over.
+pub const SLOT_GAP_MIN_SECS: u64 = 90;
+pub const SLOT_GAP_FUTURE_TOLERANCE_SECS: u64 = 30;
+
+/// The timestamp rule for block `h`. Below the gate: the genesis grid, exactly. At/after: the
+/// parent grid `parent + 1 s` (the same value until the first gap), or a declared gap of at least
+/// SLOT_GAP_MIN_SECS that is not ahead of `now` by more than the tolerance. `now` is None on sync
+/// and replay, where the block's certificate is the check; the same block accepted live is accepted
+/// on replay. An unknown parent timestamp is refused live (a gap bounded by nothing would park every
+/// producer until wall time reached it) and left to the certificate on sync and replay.
+pub fn slot_timestamp_valid(genesis_ts: u64, parent_ts: Option<u64>, h: u64, ts: u64, now: Option<u64>) -> bool {
+    if !qnet_state::feature_gates::is_active(qnet_state::feature_gates::id::SLOT_GAP_REANCHOR, h) {
+        return ts == expected_block_timestamp(genesis_ts, h);
+    }
+    let grid = match parent_ts { Some(p) => p.saturating_add(MICROBLOCK_INTERVAL_SECS), None => return now.is_none() };
+    if ts == grid { return true; }
+    if ts < grid || ts - grid < SLOT_GAP_MIN_SECS { return false; }
+    match now { Some(n) => ts <= n.saturating_add(SLOT_GAP_FUTURE_TOLERANCE_SECS), None => true }
+}
+
+/// What the producer stamps on block `h`: the grid, or `now` when the grid has fallen at least
+/// SLOT_GAP_MIN_SECS behind it - the chain re-anchors once instead of producing every missed second.
+/// None at/after the gate when the parent's timestamp is unknown: there is no slot to stamp.
+pub fn producer_slot_timestamp(genesis_ts: u64, parent_ts: Option<u64>, h: u64, now: u64) -> Option<u64> {
+    if !qnet_state::feature_gates::is_active(qnet_state::feature_gates::id::SLOT_GAP_REANCHOR, h) {
+        return Some(expected_block_timestamp(genesis_ts, h));
+    }
+    let grid = parent_ts?.saturating_add(MICROBLOCK_INTERVAL_SECS);
+    Some(if now >= grid.saturating_add(SLOT_GAP_MIN_SECS) { now } else { grid })
 }
 
 /// Get current failover metrics (for Prometheus/Grafana integration)
@@ -4186,7 +4223,6 @@ pub struct BlockchainNode {
     security_config: qnet_core::security::SecurityConfig,
     
     // State
-    height: Arc<RwLock<u64>>,
     is_running: Arc<RwLock<bool>>,
     
     // Micro/macro block tracking
@@ -4284,6 +4320,10 @@ pub struct BlockApplyResult {
     /// Set when a claim referenced an epoch whose certifying macroblock is absent. The block MUST
     /// NOT be committed: fetch that macroblock and re-apply.
     pub reward_epoch_missing: Option<u64>,
+    /// Set when an account this block touched was read from a CF row that does not hash to its
+    /// committed leaf: this node does not hold the account's value. The block MUST NOT be committed
+    /// and the state is suspect until a proven restore.
+    pub mirror_stale: bool,
 
     pub deferred_pool3: u64,
     // (node_id, type_str, wallet, burn_tx). burn_tx empty for non-NodeRegistration (activations).
@@ -4674,23 +4714,16 @@ impl BlockchainNode {
     // This ensures wallet→node binding is cryptographically verified and immutable
     // ═══════════════════════════════════════════════════════════════════════════
     
+    /// The applied tip. One source for every reader: the pipeline commit raises it, every rollback
+    /// lowers it. The RwLock mirror this used to answer from followed raises only - a regress left
+    /// it at the deleted tip and the sync scan hunted bodies that no longer existed (004, 14.09).
     pub async fn get_height(&self) -> u64 {
-        *self.height.read().await
+        crate::node::local_height()
     }
-    
-    /// v2.42.2: Synchronous height access for heartbeat service
-    /// Uses try_read to avoid blocking - returns last known height or 0
-    /// SAFE: Can be called from any context (sync or async)
+
+    /// Same value, callable from sync contexts (heartbeat service, admission doors).
     pub fn get_height_sync(&self) -> u64 {
-        // Try non-blocking read first
-        match self.height.try_read() {
-            Ok(guard) => *guard,
-            Err(_) => {
-                // Lock contention - return 0 (heartbeat will use current height next time)
-                // This is safe because heartbeats are not height-critical
-                0
-            }
-        }
+        crate::node::local_height()
     }
     
     pub async fn get_peer_count(&self) -> Result<usize, QNetError> {
@@ -5086,7 +5119,6 @@ impl Clone for BlockchainNode {
             security_config: self.security_config.clone(),
             heartbeat_commitment_tracker: self.heartbeat_commitment_tracker.clone(),
             bitmap_commitment_tracker: self.bitmap_commitment_tracker.clone(),
-            height: self.height.clone(),
             is_running: self.is_running.clone(),
             node_registration_cache: self.node_registration_cache.clone(),
             wallet_identity: self.wallet_identity.clone(),
@@ -5184,25 +5216,30 @@ mod tests {
         let certified: Vec<[u8; 32]> = p3_seed_chain(&storage, 1, 4, |h| h as u8);
 
         // Honest window: stored == certified ⇒ nothing deferred (the happy path is never blocked).
-        let (miss, mism) = BlockchainNode::window_content_verdict(&storage, &certified, 1, 4);
+        let (miss, mism) = BlockchainNode::window_content_verdict(&storage, &certified, 1, 4, u64::MAX);
         assert!(miss.is_empty() && mism.is_empty(), "honest window must not defer");
 
         // QC certified a DIFFERENT body at height 3 than the one we locally hold (the 001 fork).
         let mut forked = certified.clone();
         forked[2] = [0xEE; 32];
-        let (miss, mism) = BlockchainNode::window_content_verdict(&storage, &forked, 1, 4);
+        let (miss, mism) = BlockchainNode::window_content_verdict(&storage, &forked, 1, 4, u64::MAX);
         assert_eq!(mism, vec![3], "fork body flagged mismatched ⇒ finality must not advance");
         assert!(miss.is_empty());
 
         // Absent (pruned-old) bodies at 5,6: the None arm fires ⇒ `missing`, never `mismatched`.
-        let (miss, mism) = BlockchainNode::window_content_verdict(&storage, &certified, 1, 6);
+        let (miss, mism) = BlockchainNode::window_content_verdict(&storage, &certified, 1, 6, u64::MAX);
         assert_eq!(miss, vec![5, 6]);
         assert!(mism.is_empty());
 
         // Fail-closed: a certified list shorter than the range counts uncovered heights as mismatched.
-        let (miss, mism) = BlockchainNode::window_content_verdict(&storage, &certified[..2], 1, 4);
+        let (miss, mism) = BlockchainNode::window_content_verdict(&storage, &certified[..2], 1, 4, u64::MAX);
         assert!(miss.is_empty());
         assert_eq!(mism, vec![3, 4], "heights beyond the certified list are fail-closed");
+
+        // A row above the applied tip is not chain state: missing, never a verdict or a fork signal.
+        let (miss, mism) = BlockchainNode::window_content_verdict(&storage, &forked, 1, 4, 2);
+        assert_eq!(miss, vec![3, 4], "rows above the tip count as missing");
+        assert!(mism.is_empty(), "no fork signal names a row above the tip");
     }
 
     // P3 SAFETY (restart-during-fork): a node that durably APPLIED a losing fork must NOT boot-finalize
@@ -6394,24 +6431,35 @@ mod tests {
 
     // Reconcile replayed 2000 heavy blocks under the state lock and compared ONE root at the end;
     // a replay that could not reproduce the chain then descended and re-replayed them 36 times.
-    // Pin that every replayed block is checked against the root it carries, and that a divergent
-    // replay escalates to the peer-sourced resync instead of deepening.
+    // Pin that every replayed block is checked against the root it carries in ONE shared step
+    // (reconcile and boot), that the divergent block is undone before it is named, and that a
+    // divergent replay reaches the suspect latch - whose jittered arm asks for the wholesale -
+    // instead of deepening.
     #[test]
     fn a_replayed_block_is_verified_against_its_own_root_and_a_divergence_escalates() {
         let apply = include_str!("state_apply.rs");
+        let step = apply.find("fn replay_block_verified").expect("the shared verified step");
+        let undo = apply[step..].find("sg.rollback_block(&snap)").expect("the divergent block is undone") + step;
+        let named = apply[step..].find("ReplayStop::Diverged(mb.state_root, r.merkle_root)").expect("named by (expected, computed)") + step;
+        assert!(undo < named, "undone before it is named");
         let replay = apply.find("for mb in &blocks_to_replay").expect("replay loop");
-        let per_block = apply.find("replay_diverged").expect("per-block verification");
-        let undo = apply.find("sg.rollback_block(&snap)").expect("the divergent block is undone");
+        let call = apply[replay..].find("replay_block_verified(&sg, storage, mb)").expect("reconcile uses the step") + replay;
+        let per_block = apply[call..].find("replay_diverged").expect("per-block verification") + call;
         let stop = apply.find("reconcile_stopped_short").expect("the stop is retargeted");
         let end = apply.find("reconcile_complete mode=").expect("end-of-replay report");
-        assert!(replay < undo && undo < per_block && per_block < stop && stop < end,
-                "undo, verify-log and retarget must all happen inside the replay, before the report");
+        assert!(replay < call && call < per_block && per_block < stop && stop < end,
+                "verify-log and retarget must happen inside the replay, before the report");
+        // Every unproven reconcile latches suspect on the wrapper's single exit and the jittered arm
+        // asks for the wholesale; no second counter decides it.
+        let wrap = apply.find("pub(crate) async fn reconcile_state_after_rollback(").expect("wrapper");
+        let exit = apply[wrap..].find("if r.is_err() { crate::block_pipeline::mark_state_suspect(); }").expect("the single exit latches");
+        assert!(exit < 600, "on the wrapper's exit");
         let prod = include_str!("production.rs");
-        let noted = prod.find("fn note_reconcile_failure").expect("failure counter");
-        let escalate = prod.find(r#"err.starts_with("replay_diverged")"#).expect("immediate escalation");
-        let wholesale = prod[escalate..].find("request_wholesale_state_resync").expect("resync request");
-        assert!(noted < escalate && wholesale < 2_000,
-                "a divergent replay must reach the wholesale request without a descent");
+        assert!(!prod.contains(&format!("fn {}", "note_reconcile_failure")), "no second escalation counter");
+        assert!(!prod.contains("WHOLESALE_STATE_RESYNC"), "production keeps no private wholesale path beside the shared jittered arm");
+        assert!(include_str!("../sync_manager.rs").contains(
+                    "WHOLESALE_STATE_RESYNC.swap(false, Ordering::SeqCst) && crate::block_pipeline::state_suspect()"),
+                "a wholesale request is taken only while the latch holds");
     }
 
     // Reconcile replays stored blocks from a snapshot with the same apply function the pipeline uses,
@@ -6557,6 +6605,326 @@ mod tests {
             assert_eq!(hex::encode(rep.finalize_merkle()), hex::encode(live_roots[i]),
                        "replay must reproduce the live root at block {}", mb.height);
         }
+    }
+
+    // A replayed block is verified against the root its producer committed, at ITS height: a
+    // divergence is undone from the block's own journal and named, and the state stands at the last
+    // verified block. Reconcile had this; the boot replay checked only the tip root and needed an hour
+    // of bisecting (14.09) to name block 936249.
+    #[test]
+    fn a_verified_replay_stops_at_the_first_block_whose_root_it_cannot_reproduce() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = std::sync::Arc::new(crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage"));
+        storage.save_node_registration_at_height("prod_node", "super", "wallet_prod", 90.0, 10).unwrap();
+        let mut acct = qnet_state::Account::default();
+        acct.address = "acct_a".to_string();
+        acct.balance = 1_000;
+        let baseline = vec![("acct_a".to_string(), acct)];
+
+        // Live: three empty blocks, each stamped with the root the apply produced.
+        let live = qnet_state::State::new();
+        live.set_disk_store(storage.clone() as std::sync::Arc<dyn qnet_state::AccountStore>);
+        live.restore_accounts(baseline.clone()).expect("restore live");
+        let mut blocks: Vec<qnet_state::MicroBlock> = (0..3u64).map(|i| {
+            let mut mb = p3_micro(300 + i, i as u8);
+            mb.producer = "prod_node".to_string();
+            mb
+        }).collect();
+        let mut live_roots = Vec::new();
+        for mb in blocks.iter_mut() {
+            let mut snap = live.create_block_snapshot(mb.height);
+            let r = BlockchainNode::apply_block_to_state(&live, mb, &storage, Some(&mut snap));
+            mb.state_root = r.merkle_root;
+            live_roots.push(r.merkle_root);
+        }
+
+        // Replay verified: every block reproduces its root.
+        let rep = qnet_state::State::new();
+        rep.set_disk_store(storage.clone() as std::sync::Arc<dyn qnet_state::AccountStore>);
+        rep.restore_accounts(baseline.clone()).expect("restore replay");
+        for (i, mb) in blocks.iter().enumerate() {
+            let repaired = match BlockchainNode::replay_block_verified(&rep, &storage, mb) {
+                Ok(r) => r,
+                Err(e) => panic!("verified: {:?}", e),
+            };
+            assert_eq!(rep.finalize_merkle(), live_roots[i]);
+            assert!(repaired.is_none());
+        }
+
+        // A block whose committed root this state cannot reproduce is undone and named; the state
+        // stays at the previous block's root.
+        let rep2 = qnet_state::State::new();
+        rep2.set_disk_store(storage.clone() as std::sync::Arc<dyn qnet_state::AccountStore>);
+        rep2.restore_accounts(baseline).expect("restore replay 2");
+        assert!(BlockchainNode::replay_block_verified(&rep2, &storage, &blocks[0]).is_ok(), "block 0 verifies");
+        let mut forged = blocks[1].clone();
+        forged.state_root = [0xAB; 32];
+        match BlockchainNode::replay_block_verified(&rep2, &storage, &forged) {
+            Err(super::state_apply::ReplayStop::Diverged(expected, computed)) => {
+                assert_eq!(expected, [0xAB; 32], "expected = the block's committed root");
+                assert_eq!(computed, live_roots[1], "computed = what the apply produced");
+            }
+            Err(other) => panic!("a divergence, not {:?}", other),
+            Ok(_) => panic!("a block whose root cannot be reproduced must diverge"),
+        }
+        assert_eq!(rep2.finalize_merkle(), live_roots[0], "undone from its own journal");
+    }
+
+    // The window beacon is a fold of block hashes; the height->hash index IS the body's identity
+    // (written with it), so folding the index gives the sealed value without loading 90 bodies.
+    #[test]
+    fn the_window_beacon_folded_from_the_hash_index_is_the_sealed_value() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage");
+        let hashes = p3_seed_chain(&storage, 1, 90, |h| (h % 7) as u8);
+        assert_eq!(hashes.len(), 90);
+        let want = qnet_consensus::checkpoint_bft::accumulate_beacon(&hashes);
+        assert_eq!(derive_window_beacon(&storage, 1), Some(want));
+        // A height with neither body nor index leaves the window underivable: the caller abstains.
+        storage.delete_microblocks_range_pub(50, 50).expect("delete");
+        assert_eq!(derive_window_beacon(&storage, 1), None);
+    }
+
+    // A wholesale regress keeps every tail body the certificates vouch for and drops the tail from
+    // the first body a certificate contradicts. Six nodes deleting their whole tails at the same
+    // minute erased 937473..937530 from the fleet on 14.09.
+    #[tokio::test]
+    async fn a_regress_keeps_certified_tail_bodies_and_drops_from_the_first_contradiction() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage");
+        let hashes = p3_seed_chain(&storage, 1, 180, |h| (h % 5) as u8);
+        // Window 1 sealed and certified with the bodies as stored; window 2 has no seal yet.
+        let honest = qnet_state::MacroBlock::new(90, 0, [0u8; 32], hashes[..90].to_vec(), [0u8; 32],
+                                                 qnet_state::ConsensusData::default());
+        storage.save_macroblock(1, &honest).await.expect("seal 1");
+        assert_eq!(storage.first_certified_mismatch_above(0, 180), None, "all certified bodies match, unsealed window kept");
+        // The certificate names another body at 45: 45 and everything above it are a losing fork.
+        // (A seal is first-write-wins, so the contradicting certificate gets a store of its own.)
+        let dir2 = tempfile::TempDir::new().expect("tempdir 2");
+        let storage2 = crate::storage::Storage::new(dir2.path().to_str().unwrap()).expect("storage 2");
+        let hashes2 = p3_seed_chain(&storage2, 1, 180, |h| (h % 5) as u8);
+        assert_eq!(hashes2, hashes, "the seeded chain is deterministic");
+        let mut forked = hashes[..90].to_vec();
+        forked[44] = [0xEE; 32];
+        let contradicting = qnet_state::MacroBlock::new(90, 0, [0u8; 32], forked, [0u8; 32],
+                                                        qnet_state::ConsensusData::default());
+        storage2.save_macroblock(1, &contradicting).await.expect("seal 1 on the second store");
+        assert_eq!(storage2.first_certified_mismatch_above(0, 180), Some(45));
+        assert_eq!(storage2.first_certified_mismatch_above(60, 180), None, "the contradiction is below the range");
+        // A placeholder seal (an empty list) is not a certificate: the window keeps its bodies.
+        let dir3 = tempfile::TempDir::new().expect("tempdir 3");
+        let storage3 = crate::storage::Storage::new(dir3.path().to_str().unwrap()).expect("storage 3");
+        p3_seed_chain(&storage3, 1, 180, |h| (h % 5) as u8);
+        let placeholder = qnet_state::MacroBlock::new(90, 0, [0u8; 32], Vec::new(), [0u8; 32],
+                                                      qnet_state::ConsensusData::default());
+        storage3.save_macroblock(1, &placeholder).await.expect("placeholder");
+        assert_eq!(storage3.first_certified_mismatch_above(0, 180), None, "a placeholder carries no verdict");
+    }
+
+    // A row of the accounts CF enters consensus state only when it hashes to its committed leaf. No
+    // leaf ⇒ the account is absent (a rolled-back block's row must not become a leaf). A leaf the
+    // row does not hash to ⇒ this node does not hold the account's value: nothing is admitted and
+    // the block apply refuses the block through the latch.
+    #[test]
+    fn a_cf_row_enters_consensus_state_only_when_it_hashes_to_its_leaf() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = std::sync::Arc::new(crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage"));
+        let st = qnet_state::State::new();
+        st.set_disk_store(storage.clone() as std::sync::Arc<dyn qnet_state::AccountStore>);
+        let mut committed = qnet_state::Account::default();
+        committed.address = "w_leaf".to_string();
+        committed.balance = 5;
+        st.restore_accounts(vec![("w_leaf".to_string(), committed.clone())]).expect("restore");
+        let _ = st.take_mirror_stale();
+
+        // A row nobody committed: absent, counted, not inserted.
+        let mut phantom = qnet_state::Account::default();
+        phantom.address = "w_phantom".to_string();
+        phantom.balance = 10_000_000_000;
+        assert!(qnet_state::AccountStore::persist_accounts(&*storage, &[("w_phantom".to_string(), phantom)]));
+        let before = qnet_state::CF_ROWS_WITHOUT_LEAF.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(!st.warm_account("w_phantom"), "a row without a leaf is absent");
+        assert!(!st.accounts.contains_key("w_phantom"));
+        assert!(qnet_state::CF_ROWS_WITHOUT_LEAF.load(std::sync::atomic::Ordering::Relaxed) > before);
+        assert!(st.take_mirror_stale().is_empty(), "absent is not stale");
+
+        // The committed value, evicted and read back from the row: admitted.
+        st.accounts.remove("w_leaf");
+        assert!(qnet_state::AccountStore::persist_accounts(&*storage, &[("w_leaf".to_string(), committed.clone())]));
+        assert!(st.warm_account("w_leaf"));
+        assert_eq!(st.accounts.get("w_leaf").map(|a| a.balance), Some(5));
+
+        // A row that does not hash to the leaf: not admitted, and the block latch is set.
+        st.accounts.remove("w_leaf");
+        let mut stale = committed.clone();
+        stale.balance = 999;
+        assert!(qnet_state::AccountStore::persist_accounts(&*storage, &[("w_leaf".to_string(), stale)]));
+        assert!(!st.warm_account("w_leaf"), "a stale row is refused");
+        assert!(!st.accounts.contains_key("w_leaf"));
+        let stale = st.take_mirror_stale();
+        assert_eq!(stale.len(), 1, "the block apply must refuse this block");
+        assert_eq!(stale[0].0, "w_leaf", "named with the leaf it could not read");
+        assert!(st.take_mirror_stale().is_empty(), "the verdict is taken once");
+    }
+
+    // Committed account w_x, evicted, its row stale; a block at 7 journaled it after the refused warm.
+    // Returns the root the leaf set commits to.
+    fn stale_row_journal() -> (tempfile::TempDir, std::sync::Arc<crate::storage::Storage>, qnet_state::State,
+                               qnet_state::BlockSnapshot, [u8; 32]) {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = std::sync::Arc::new(crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage"));
+        let st = qnet_state::State::new();
+        st.set_disk_store(storage.clone() as std::sync::Arc<dyn qnet_state::AccountStore>);
+        let mut committed = qnet_state::Account::default();
+        committed.address = "w_x".to_string();
+        committed.balance = 5;
+        st.restore_accounts(vec![("w_x".to_string(), committed.clone())]).expect("restore");
+        let root_before = st.finalize_merkle();
+        st.accounts.remove("w_x");
+        let mut stale = committed.clone();
+        stale.balance = 999;
+        assert!(qnet_state::AccountStore::persist_accounts(&*storage, &[("w_x".to_string(), stale)]));
+        let mut snap = st.create_block_snapshot(7);
+        st.journal_pre_images(&mut snap, &["w_x".to_string()]);
+        assert!(snap.created_keys().contains("w_x"), "not resident after the refused warm");
+        snap.note_stale_leaves(st.take_mirror_stale());
+        (dir, storage, st, snap, root_before)
+    }
+
+    // A block that could not read a committed account (its row stale) is refused, and its undo puts
+    // that account's leaf back. A tombstone there would leave the tree without an account the chain
+    // holds; the row the mirror keeps is what the next warm refuses again.
+    #[tokio::test]
+    async fn a_refused_blocks_rollback_restores_the_leaf_it_could_not_read() {
+        let (_dir, storage, st, snap, root_before) = stale_row_journal();
+        st.rollback_block(&snap);
+        assert_eq!(st.finalize_merkle(), root_before, "the committed leaf is back, not a tombstone");
+        assert!(storage.load_account("w_x").expect("read").is_some(), "the row stays for the next warm to refuse");
+    }
+
+    // A committed block that read a stale row (its root matched) and is later undone from the journals
+    // keeps that row: deleting it would leave a committed leaf with no row, read as a new account.
+    #[tokio::test]
+    async fn a_journal_undo_keeps_the_row_a_block_could_not_read() {
+        let (_dir, _storage, st, mut snap, root_before) = stale_row_journal();
+        // A created account whose leaf could not be read either: no leaf goes back, so no row stays.
+        st.journal_pre_images(&mut snap, &["w_new".to_string()]);
+        snap.note_stale_leaves(vec![("w_new".to_string(), None)]);
+        st.retain_block_journal(snap);
+        let (undone, mirror) = st.undo_blocks_above(6, 7).expect("the journal covers 7");
+        assert_eq!(undone, 1);
+        assert!(!mirror.contains_key("w_x"), "no mirror delete for the row the block could not read");
+        assert!(matches!(mirror.get("w_new"), Some(None)), "an unread leaf goes, and its row with it");
+        assert_eq!(st.finalize_merkle(), root_before, "the committed leaf is back");
+    }
+
+    // A row above the durable tip is not chain state: it holds no slot for the apply checks, is no
+    // parent for the verify stage or the deferred sweep, and the range sync still requests its height.
+    #[tokio::test]
+    async fn a_row_above_the_durable_tip_holds_no_slot() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage");
+        let hashes = p3_seed_chain(&storage, 1, 100, |h| (h % 5) as u8);
+        storage.set_chain_height(5).expect("tip");
+        assert_eq!(storage.canonical_hash_at(7), Some(hashes[6]), "the row is stored");
+        assert_eq!(storage.committed_hash_at(7), None, "above the durable tip it is not committed");
+        assert_eq!(storage.committed_hash_at(5), Some(hashes[4]));
+        // A row above the tip that a certificate names still holds its slot against a sibling; any other
+        // row above the tip holds none.
+        let seal = qnet_state::MacroBlock::new(90, 0, [0u8; 32], hashes[..90].to_vec(), [0u8; 32],
+                                               qnet_state::ConsensusData::default());
+        storage.save_macroblock(1, &seal).await.expect("seal 1");
+        let sibling = [0xEEu8; 32];
+        assert_eq!(crate::block_pipeline::slot_holder(&storage, 7, &sibling), Some(hashes[6]), "certified: kept");
+        assert_eq!(crate::block_pipeline::slot_holder(&storage, 7, &hashes[6]), None, "the same body is not refused");
+        assert_eq!(crate::block_pipeline::slot_holder(&storage, 95, &sibling), None, "uncertified: replaced");
+        let bp = include_str!("../block_pipeline.rs");
+        assert!(!bp.contains(&format!(".{}(height).map(|h| h != block.microblock.hash())", "canonical_hash_at")),
+                "the apply slot checks read the slot holder");
+        assert!(bp.contains(&format!("storage_for_load.{}(parent_h)", "committed_hash_at")), "the verify parent is a committed row");
+        assert!(bp.contains(&format!("|h| storage.{}(h)", "committed_hash_at")), "a child waiting for the canonical parent is not swept");
+        assert!(include_str!("../unified_p2p/dispatch.rs")
+                    .contains(&format!("let present = crate::block_pipeline::{}(&storage, h)", "held_at_or_below_tip")),
+                "the range sync requests a height whose row is above the tip");
+        assert!(bp.contains(&format!("if !{} {{", "from_self")), "a block fed from disk asks no peer for its fed parent");
+        assert!(include_str!("../storage/blocks.rs").contains(&format!("let existing_mb = if {} >= height", "durable_tip")),
+                "equivocation evidence only against committed history");
+    }
+
+    // Rows above the applied tip that a certificate names are fed to the pipeline from disk, the one
+    // path that applies and materialises a block; an uncertified or contradicted row is left to peers.
+    #[tokio::test]
+    async fn only_certified_local_rows_are_fed_and_the_feed_stops_at_the_first_other() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage");
+        let hashes = p3_seed_chain(&storage, 1, 180, |h| (h % 5) as u8);
+        assert!(crate::sync_manager::collect_certified_local(&storage, 1, 180).is_empty(), "nothing certified yet");
+        let seal = qnet_state::MacroBlock::new(90, 0, [0u8; 32], hashes[..90].to_vec(), [0u8; 32],
+                                               qnet_state::ConsensusData::default());
+        storage.save_macroblock(1, &seal).await.expect("seal 1");
+        let fed = crate::sync_manager::collect_certified_local(&storage, 5, 180);
+        assert_eq!(fed.first().map(|(h, _)| *h), Some(5));
+        assert_eq!(fed.last().map(|(h, _)| *h), Some(90), "window 2 has no certificate: left to peers");
+        let mb: qnet_state::MicroBlock = bincode::deserialize(&fed[0].1).expect("wire bytes the pipeline decodes");
+        assert_eq!(mb.hash(), hashes[4]);
+        let src = include_str!("../sync_manager.rs");
+        let frontier = src.find("sync_blocks_frontier(fetch_from, end)").expect("peers are asked past the local feed");
+        let feed = src[..frontier].rfind("feed_certified_local(l, end)").expect("the frontier feeds first");
+        assert!(feed < frontier);
+        assert!(!include_str!("state_apply.rs").contains(&format!("fn {}", "replay_kept_tail")), "no second apply path");
+    }
+
+    // A wholesale regress keeps certified chain content: the macroblocks (and the epoch roots sealed
+    // with them) stay, only the state this node built above the restored height goes. The full
+    // retraction - boot rollback, recovery decree - still removes both.
+    #[tokio::test]
+    async fn the_state_retraction_keeps_certified_content_and_the_full_one_does_not() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage");
+        let hashes = p3_seed_chain(&storage, 1, 180, |h| (h % 5) as u8);
+        let mb1 = qnet_state::MacroBlock::new(90, 0, [0u8; 32], hashes[..90].to_vec(), [0u8; 32],
+                                              qnet_state::ConsensusData::default());
+        storage.save_macroblock(1, &mb1).await.expect("seal 1");
+        let mb2 = qnet_state::MacroBlock::new(180, 0, mb1.hash(), hashes[90..180].to_vec(), [0u8; 32],
+                                              qnet_state::ConsensusData::default());
+        storage.save_macroblock(2, &mb2).await.expect("seal 2");
+        storage.retract_state_position_above(90);
+        assert!(storage.get_macroblock_by_height(2).expect("read").is_some(), "the regress keeps the certificate above the restored height");
+        storage.retract_chain_position_above(90);
+        assert!(storage.get_macroblock_by_height(2).expect("read").is_none(), "the full retraction removes it");
+    }
+
+    // The producer's three presence gates read the applied tip, never a stored row: a row above the
+    // tip is an orphan that never applies, and yielding to it wedged production (684631, 937457).
+    #[test]
+    fn the_producer_gates_read_the_applied_tip_not_stored_rows() {
+        let src = include_str!("production.rs");
+        assert!(!src.contains("storage.load_microblock(next_block_height), Ok(Some(_))"), "pre-sign gate must not read a row");
+        assert!(!src.contains("canonical_hash_at(next_block_height)"), "under-lock gate must not read the hash index");
+        assert!(src.contains("orphan_row_ignored"), "an orphan row is reported once and ignored");
+        assert!(src.contains("preempted_h={} tip={}"), "the yield names the tip that covers the slot");
+        let sm = src.find("let canonical_height = crate::node::local_height();").expect("state machine reads the applied tip");
+        assert!(sm > 0);
+    }
+
+    // A node behind on seals (Defer) does not advertise liveness: it would be counted in the quorum
+    // and unable to vote in it. In a fleet-wide stall (Frozen) presence is still recorded.
+    #[test]
+    fn a_heartbeat_is_withheld_when_the_node_is_behind_on_seals() {
+        let src = include_str!("lifecycle.rs");
+        let gate = src.find("Self::roster_mode(&storage, anchor_mb_window), crate::node::RosterMode::Defer").expect("self-gate");
+        let emit = src.find("create_heartbeat_tx_static(&storage, &node_id, current_height").expect("emit");
+        assert!(gate < emit, "the gate stands before the emission");
+        let boot = src.find("replay_block_verified(&state_guard, &storage, &microblock)").expect("boot replay verifies per block");
+        let done = src.find("_replay_done replayed=").expect("replay done log");
+        assert!(boot < done);
+        let snaps = include_str!("../storage/snapshots.rs");
+        let classify = snaps.find("first_certified_mismatch_above(height, top)").expect("tail classified to the highest stored body");
+        let retract = snaps[classify..].find("retract_state_position_above(height)").expect("state retraction");
+        assert!(retract > 0, "classified before the retraction");
+        assert!(src.contains("anchor_h.saturating_sub(1) / qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL + 1"),
+                "the window the anchor falls in");
+        assert!(src.contains("replay_unprovable") && !src.contains("Some(h - 1)"), "no replay stop computes below block 0");
     }
 
     // Every restore path must purge post-snapshot CF rows BEFORE anything is replayed on the
@@ -8933,5 +9301,69 @@ mod redrive_pick_tests {
         assert_eq!(pick_redrive_boundary(b0, pub_, 559_620, 559_600, 2), b0, "a head past the tip is not signalled");
         assert_eq!(pick_redrive_boundary(b0, pub_, b0, tip, 2), b0, "the high head equal to the oldest unsealed is one turn, not two");
         assert_eq!(pick_redrive_boundary(b0, pub_, pub_, tip, 2), b0, "duplicates collapse");
+    }
+}
+
+#[cfg(test)]
+mod slot_gap_rule_tests {
+    use super::{expected_block_timestamp, producer_slot_timestamp, slot_timestamp_valid,
+                SLOT_GAP_FUTURE_TOLERANCE_SECS, SLOT_GAP_MIN_SECS};
+    use qnet_state::feature_gates::SLOT_GAP_REANCHOR_GATE_HEIGHT as GATE;
+    const G: u64 = 1_700_000_000;
+
+    #[test]
+    fn below_the_gate_the_genesis_grid_is_the_only_valid_timestamp() {
+        let h = GATE - 1;
+        assert!(slot_timestamp_valid(G, Some(G + h - 1), h, G + h, Some(G + h + 500)));
+        assert!(!slot_timestamp_valid(G, Some(G + h - 1), h, G + h + 500, Some(G + h + 500)), "no gap below the gate");
+        assert_eq!(producer_slot_timestamp(G, Some(G + h - 1), h, G + h + 500), Some(expected_block_timestamp(G, h)));
+    }
+
+    #[test]
+    fn at_the_gate_the_parent_grid_equals_the_genesis_grid_until_a_gap() {
+        let h = GATE + 10;
+        assert_eq!(producer_slot_timestamp(G, Some(G + h - 1), h, G + h), Some(G + h));
+        assert!(slot_timestamp_valid(G, Some(G + h - 1), h, G + h, Some(G + h)));
+        // one second late is still the grid, not a gap: the producer catches up as before
+        assert_eq!(producer_slot_timestamp(G, Some(G + h - 1), h, G + h + SLOT_GAP_MIN_SECS - 1), Some(G + h));
+    }
+
+    #[test]
+    fn a_gap_of_at_least_one_window_reanchors_and_is_accepted_within_clock_tolerance() {
+        let h = GATE + 10;
+        let parent = G + h - 1;
+        let now = parent + 1 + 3 * 86_400; // three days of halt
+        let ts = producer_slot_timestamp(G, Some(parent), h, now).expect("known parent");
+        assert_eq!(ts, now, "the producer stamps its clock");
+        assert!(slot_timestamp_valid(G, Some(parent), h, ts, Some(now)));
+        assert!(slot_timestamp_valid(G, Some(parent), h, ts, Some(now - SLOT_GAP_FUTURE_TOLERANCE_SECS)), "a verifier whose clock is behind by the tolerance accepts");
+        assert!(!slot_timestamp_valid(G, Some(parent), h, ts, Some(now - SLOT_GAP_FUTURE_TOLERANCE_SECS - 1)), "further ahead of the verifier is refused live");
+        assert!(slot_timestamp_valid(G, Some(parent), h, ts, None), "on sync and replay the certificate is the check");
+        // the block after the gap continues from the new anchor
+        assert!(slot_timestamp_valid(G, Some(ts), h + 1, ts + 1, Some(ts + 1)));
+        assert!(!slot_timestamp_valid(G, Some(ts), h + 1, G + h + 1, Some(ts + 1)), "the old grid is gone");
+    }
+
+    #[test]
+    fn an_unknown_parent_timestamp_is_refused_live_and_left_to_the_certificate_on_sync() {
+        let h = GATE + 10;
+        assert!(!slot_timestamp_valid(G, None, h, G + h + 1_000_000, Some(G + h)), "a far-future stamp over an unknown parent parks no producer");
+        assert!(!slot_timestamp_valid(G, None, h, G + h, Some(G + h)), "live, the parent timestamp must be known");
+        assert!(slot_timestamp_valid(G, None, h, G + h, None), "on sync and replay the certificate is the check");
+        assert!(slot_timestamp_valid(G, None, GATE - 1, G + GATE - 1, Some(G)), "below the gate the grid needs no parent");
+        assert_eq!(producer_slot_timestamp(G, None, h, G + h), None, "no stamp without the parent's time");
+        assert_eq!(producer_slot_timestamp(G, None, GATE - 1, G), Some(G + GATE - 1), "below the gate the grid needs no parent");
+        let bp = include_str!("../block_pipeline.rs");
+        assert!(bp.contains(&format!("(!snap.is_syncing() || {}) && mb.height > 0", "sync_checked")),
+                "a syncing node checks every post-gate block whose parent time it knows");
+    }
+
+    #[test]
+    fn a_gap_smaller_than_a_window_and_a_backwards_stamp_are_refused() {
+        let h = GATE + 10;
+        let parent = G + h - 1;
+        assert!(!slot_timestamp_valid(G, Some(parent), h, parent + 1 + SLOT_GAP_MIN_SECS - 1, Some(parent + 10_000)));
+        assert!(!slot_timestamp_valid(G, Some(parent), h, parent, Some(parent + 10_000)));
+        assert!(!slot_timestamp_valid(G, Some(parent), h, parent - 5, Some(parent + 10_000)));
     }
 }

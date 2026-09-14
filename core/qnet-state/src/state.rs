@@ -133,9 +133,17 @@ const REBUILD_SUBTREE_MAX_LEAVES: usize = 4_096;
 /// plugs in via `set_node_store`. The root is a pure function of the leaf set
 /// (BTreeMap → order-independent), so read-through caching / eviction cannot
 /// change the produced root: a DB-backed root is byte-identical to the in-mem one.
+/// Rows of the accounts CF that had no leaf when a consensus read reached for them (phantoms
+/// ignored). Observability; the count says how much the mirror disagrees with the committed state.
+pub static CF_ROWS_WITHOUT_LEAF: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PHANTOM_ROW_NOTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub trait MerkleNodeStore: Send + Sync {
     /// Point read of a leaf (addr_hash → account_hash). None = absent.
     fn get_leaf(&self, key: &[u8; 32]) -> Option<[u8; 32]>;
+    /// The committed leaf at `key` with its read outcome: Ok(None) = a clean miss, Err = the store
+    /// could not answer (I/O, missing CF, malformed value). Default: a store that cannot fail.
+    fn try_get_leaf(&self, key: &[u8; 32]) -> Result<Option<[u8; 32]>, ()> { Ok(self.get_leaf(key)) }
     /// Point read of a non-default internal node at (depth, key). None = default subtree.
     fn get_node(&self, depth: u32, key: &[u8; 32]) -> Option<[u8; 32]>;
     /// Leaves in the inclusive key range `[lo, hi]`, stopping after `limit`. A subtree
@@ -571,6 +579,16 @@ impl StateMerkleTree {
         self.dirty_paths.insert(addr_hash); // v32.14: incremental path tracking
     }
 
+    /// Put a committed account leaf back verbatim. The undo of a block that could not read the
+    /// account: its value is not held here, only its leaf, so the rollback must not tombstone it.
+    pub fn restore_leaf_lazy(&mut self, address: &str, leaf: [u8; HASH_SIZE]) {
+        let addr_hash = Self::hash_address(address);
+        self.leaf_put(addr_hash, leaf);
+        self.dirty = true;
+        self.pending_updates += 1;
+        self.dirty_paths.insert(addr_hash);
+    }
+
     /// V2: insert a RAW leaf (key hashed via hash_storage_key, value taken verbatim), no root recompute.
     /// Builds a per-contract StorageMerkleTree over contract_storage entries; its root is storage_root.
     /// Bypasses hash_account (that is for account leaves; this leaf commits one storage key→value).
@@ -977,6 +995,16 @@ impl StateMerkleTree {
             Some(s) => s.get_leaf(key).is_some(),
             None => true,
         }
+    }
+
+    /// The committed leaf value for `key`: RAM, then (trimmed cache only) the pending-delete
+    /// tombstones, then the store; every unflushed put is in RAM. `Err(())` = the store could not
+    /// answer; `Ok(None)` = a clean miss.
+    pub(crate) fn leaf_value_full(&self, key: &[u8; HASH_SIZE]) -> Result<Option<[u8; HASH_SIZE]>, ()> {
+        if let Some(v) = self.leaves.get(key) { return Ok(Some(*v)); }
+        if self.leaves_complete || self.node_store.is_none() { return Ok(None); }
+        if self.pending_leaf_dels.contains(key) { return Ok(None); }
+        match &self.node_store { Some(s) => s.try_get_leaf(key), None => Ok(None) }
     }
 
     pub fn hash_address(address: &str) -> [u8; HASH_SIZE] {
@@ -2067,6 +2095,10 @@ pub struct BlockSnapshot {
     pre_images: HashMap<String, Account>,
     /// Addresses of accounts created during this block (didn't exist before)
     created_keys: HashSet<String>,
+    /// Addresses the block could not read although a committed leaf exists (a stale or unreadable
+    /// row), with that leaf (None: the leaf store could not answer either). Journaled as created; a
+    /// rollback puts a known leaf back instead of a tombstone, and the mirror keeps those rows.
+    stale_leaves: HashMap<String, Option<[u8; 32]>>,
     /// Block height for logging
     height: u64,
     /// QRC-20 wallet↔token ownership transitions applied this block (NON-consensus reverse-index
@@ -2098,6 +2130,7 @@ impl BlockSnapshot {
         Self {
             pre_images: HashMap::new(),
             created_keys: HashSet::new(),
+            stale_leaves: HashMap::new(),
             height,
             owns: Vec::new(),
             supply_before: None,
@@ -2182,6 +2215,19 @@ impl BlockSnapshot {
         &self.created_keys
     }
 
+    /// Record the accounts this block could not read, with their committed leaves. One block can read
+    /// an account twice; a known leaf is never replaced by a later unread one.
+    pub fn note_stale_leaves(&mut self, stale: Vec<(String, Option<[u8; 32]>)>) {
+        for (addr, leaf) in stale {
+            let e = self.stale_leaves.entry(addr).or_insert(None);
+            if e.is_none() { *e = leaf; }
+        }
+    }
+
+    pub fn stale_leaves(&self) -> &HashMap<String, Option<[u8; 32]>> {
+        &self.stale_leaves
+    }
+
     pub fn height(&self) -> u64 {
         self.height
     }
@@ -2264,6 +2310,15 @@ pub trait AccountStore: Send + Sync {
         addresses.iter().map(|a| self.load_account(a)).collect()
     }
 
+    /// One read with its outcome: Ok(None) = absent, Err = the row could not be read. Default: a
+    /// store whose load_account cannot fail.
+    fn try_load_account(&self, address: &str) -> Result<Option<Account>, ()> { Ok(self.load_account(address)) }
+
+    /// Batched try_load_account; order matches `addresses`.
+    fn try_load_accounts_batch(&self, addresses: &[String]) -> Vec<Result<Option<Account>, ()>> {
+        self.load_accounts_batch(addresses).into_iter().map(Ok).collect()
+    }
+
     /// Durable batch write of accounts. Called by the eviction sweep BEFORE dropping entries from the
     /// cache; returns true IFF the write durably succeeded. The evictor removes ONLY a successfully-
     /// persisted batch, so a failed persist (I/O error, or no store) keeps the accounts resident —
@@ -2330,6 +2385,10 @@ pub struct StateManager {
     disk_load_hits: Arc<std::sync::atomic::AtomicU64>,
     disk_load_misses: Arc<std::sync::atomic::AtomicU64>,
     evictions_total: Arc<std::sync::atomic::AtomicU64>,
+    /// Accounts a block read from a stale or unreadable row while a committed leaf exists, with that
+    /// leaf. The block apply takes them per block and refuses the block; the rollback puts the leaves
+    /// back. Per state, so two states in one process never see each other's verdicts.
+    stale_leaves: Arc<parking_lot::Mutex<Vec<(String, Option<[u8; 32]>)>>>,
     /// V2 (incremental): in-memory per-contract StorageMerkleTree cache, keyed by contract address.
     /// NON-persisted (no RocksDB namespace → no wipe-bound fork edge): each tree is a pure cache
     /// rebuilt from the authoritative Account.contract_storage on first touch after boot, and dropped
@@ -2370,6 +2429,7 @@ impl StateManager {
             disk_load_hits: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             disk_load_misses: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             evictions_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            stale_leaves: Arc::new(parking_lot::Mutex::new(Vec::new())),
             // v15.10 STAGE-2A: single shard by default — Stage-2A is wire
             // compatible with the pre-2A behaviour. Bumping this via
             // `set_num_shards` activates the multi-shard routing surface.
@@ -2407,8 +2467,9 @@ impl StateManager {
     }
 
     /// Undo (target, tip] newest first from the retained journals. Returns the count and the disk mirror
-    /// (per address its OLDEST pre-image; None = did not exist ⇒ delete). None when the journals do not
-    /// cover the range contiguously — nothing is touched then.
+    /// (per address its OLDEST pre-image; None = did not exist ⇒ delete; no entry for a key whose
+    /// committed leaf the undo puts back, whose row stays). None when the journals do not cover the
+    /// range contiguously — nothing is touched then.
     pub fn undo_blocks_above(&self, target: u64, tip: u64) -> Option<(u64, HashMap<String, Option<Account>>)> {
         if tip <= target { return Some((0, HashMap::new())); }
         let mut q = self.recent_journals.lock();
@@ -2419,7 +2480,11 @@ impl StateManager {
         let mut undone = 0u64;
         while q.back().map(|(_, s)| s.height() > target).unwrap_or(false) {
             let (_, s) = q.pop_back().expect("checked above");
-            for addr in s.created_keys() { mirror.insert(addr.clone(), None); }
+            for addr in s.created_keys() {
+                // A committed leaf that goes back keeps its row, which the next warm refuses again (newest
+                // first, the oldest entry wins); an unread leaf is removed, and its row with it.
+                if matches!(s.stale_leaves().get(addr), Some(Some(_))) { mirror.remove(addr); } else { mirror.insert(addr.clone(), None); }
+            }
             for (addr, acct) in s.accounts() { mirror.insert(addr.clone(), Some(acct.clone())); }
             self.rollback_block(&s);
             undone += 1;
@@ -2511,6 +2576,56 @@ impl StateManager {
         }
     }
 
+    /// Whether a row loaded from the accounts CF may enter consensus state. The CF is a flat mirror
+    /// written by spawned persists and the evictor; the leaf set is the committed state. A row with
+    /// NO leaf is a phantom (a rolled-back block's row, a stray writer) and is absent for consensus
+    /// reads - loading it materialised a leaf the network never had and forked every boot replay
+    /// on 14.09. A row whose value does not hash to its leaf is stale: this node does not hold that
+    /// account's committed value, so the block touching it cannot be applied here (`take_mirror_stale`
+    /// is read by the block apply, which refuses the block and latches the state suspect). An
+    /// unreadable leaf store proves nothing: admit, as before.
+    fn admit_loaded(&self, address: &str, account: &Account) -> bool {
+        let key = StateMerkleTree::hash_address(address);
+        let verdict = { self.merkle_tree.read().leaf_value_full(&key) };
+        match verdict {
+            Err(()) => true,
+            Ok(None) => {
+                CF_ROWS_WITHOUT_LEAF.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if !PHANTOM_ROW_NOTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    println!("[WARN][STATE] cf_row_without_leaf addr={} action=absent", crate::char_prefix(address, 16));
+                }
+                false
+            }
+            Ok(Some(leaf)) => {
+                if StateMerkleTree::hash_account(account) == leaf { return true; }
+                self.stale_leaves.lock().push((address.to_string(), Some(leaf)));
+                println!("[ERR][STATE] cf_row_stale addr={} action=block_refused", crate::char_prefix(address, 16));
+                false
+            }
+        }
+    }
+
+    /// The accounts this block could not read, drained, each with its committed leaf (None: the leaf
+    /// store could not answer either). Non-empty = refuse the block.
+    pub fn take_mirror_stale(&self) -> Vec<(String, Option<[u8; 32]>)> {
+        std::mem::take(&mut *self.stale_leaves.lock())
+    }
+
+    /// A row that could not be read may belong to an account with a committed leaf. With one, this
+    /// node does not hold the account's value: the same refusal as a stale row. A leaf store that
+    /// cannot answer either proves no absence: refused too, with no leaf to put back.
+    fn refuse_unreadable(&self, address: &str) {
+        let key = StateMerkleTree::hash_address(address);
+        let leaf = match self.merkle_tree.read().leaf_value_full(&key) {
+            Ok(Some(l)) => Some(l),
+            Err(()) => None,
+            Ok(None) => return,
+        };
+        self.stale_leaves.lock().push((address.to_string(), leaf));
+        println!("[ERR][STATE] cf_row_unreadable addr={} leaf={} action=block_refused",
+                 crate::char_prefix(address, 16), if leaf.is_some() { "committed" } else { "unreadable" });
+    }
+
     pub fn warm_account(&self, address: &str) -> bool {
         if self.accounts.contains_key(address) {
             self.cache_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2522,7 +2637,13 @@ impl StateManager {
         self.cache_misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let store_guard = self.disk_store.read();
         if let Some(ref store) = *store_guard {
-            if let Some(account) = store.load_account(address) {
+            let loaded = store.try_load_account(address);
+            let unreadable = loaded.is_err();
+            if let Ok(Some(account)) = loaded {
+                if !self.admit_loaded(address, &account) {
+                    self.disk_load_misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return false;
+                }
                 self.disk_load_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 // Race-tolerant insert: if another thread inserted between
                 // the contains_key check above and this point, keep the
@@ -2533,6 +2654,7 @@ impl StateManager {
                 self.touch_access(address);
                 return true;
             }
+            if unreadable { self.refuse_unreadable(address); }
             self.disk_load_misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         false
@@ -2559,8 +2681,13 @@ impl StateManager {
         if misses.is_empty() { return hit; }
         let store_guard = self.disk_store.read();
         if let Some(ref store) = *store_guard {
-            for (addr, loaded) in misses.iter().zip(store.load_accounts_batch(&misses)) {
-                match loaded {
+            let rows = store.try_load_accounts_batch(&misses);
+            for (addr, loaded) in misses.iter().zip(rows) {
+                let unreadable = loaded.is_err();
+                match loaded.ok().flatten() {
+                    Some(account) if !self.admit_loaded(addr, &account) => {
+                        self.disk_load_misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                     Some(account) => {
                         self.disk_load_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         // Race-tolerant: keep an entry inserted concurrently — identical
@@ -2570,6 +2697,7 @@ impl StateManager {
                         hit = hit.saturating_add(1);
                     }
                     None => {
+                        if unreadable { self.refuse_unreadable(addr); }
                         self.disk_load_misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
@@ -3973,7 +4101,11 @@ impl StateManager {
         let mut tree = self.merkle_tree.write();
 
         for addr in snapshot.created_keys() {
-            tree.remove_lazy(addr);
+            match snapshot.stale_leaves().get(addr) {
+                Some(Some(leaf)) => tree.restore_leaf_lazy(addr, *leaf),
+                // Nothing to put back (created, or its leaf unread): the latch's resync rebuilds the latter.
+                _ => tree.remove_lazy(addr),
+            }
         }
         for (address, account) in snapshot.accounts() {
             tree.insert_lazy(address, account);
@@ -5285,6 +5417,79 @@ mod cache_tests {
         a
     }
 
+    /// The read-through cache admits a stored row only when it hashes to a committed leaf (the
+    /// accounts CF is a mirror of the leaf set, never a source): every row the mock store holds
+    /// gets its leaf here, as a block apply would have given it.
+    fn commit_leaves(sm: &StateManager, store: &MockStore) {
+        let rows: Vec<(String, Account)> = store.data.read().iter()
+            .map(|(a, acc)| (a.clone(), acc.clone())).collect();
+        let mut tree = sm.merkle_tree.write();
+        for (a, acc) in &rows { tree.insert_lazy(a, acc); }
+        tree.finalize();
+    }
+
+    // An unreadable row of an account with a committed leaf refuses the block: the verdict comes
+    // from that read's own outcome, never from another thread's error.
+    #[test]
+    fn an_unreadable_row_of_a_committed_account_refuses_the_block() {
+        struct Unreadable;
+        impl AccountStore for Unreadable {
+            fn load_account(&self, _a: &str) -> Option<Account> { None }
+            fn try_load_account(&self, _a: &str) -> Result<Option<Account>, ()> { Err(()) }
+            fn try_load_accounts_batch(&self, a: &[String]) -> Vec<Result<Option<Account>, ()>> { vec![Err(()); a.len()] }
+        }
+        let sm = StateManager::new();
+        { let mut t = sm.merkle_tree.write(); t.insert_lazy("w_err", &make_account(7)); t.finalize(); }
+        sm.set_disk_store(Arc::new(Unreadable) as Arc<dyn AccountStore>);
+        assert!(!sm.warm_account("w_err"));
+        assert_eq!(sm.take_mirror_stale().len(), 1, "a committed account that cannot be read refuses the block");
+        assert!(!sm.warm_account("w_absent"));
+        assert!(sm.take_mirror_stale().is_empty(), "no leaf: absent, nothing refused");
+        assert_eq!(sm.warm_accounts(&["w_err".to_string(), "w_absent".to_string()]), 0);
+        assert_eq!(sm.take_mirror_stale().len(), 1, "per row: only the account with a leaf is refused");
+    }
+
+    // A row that cannot be read, and a leaf store that cannot answer either: nothing proves the
+    // account absent, so the block is refused, with no leaf to put back.
+    #[test]
+    fn an_unreadable_row_with_an_unreadable_leaf_refuses_the_block() {
+        struct Unreadable;
+        impl AccountStore for Unreadable {
+            fn load_account(&self, _a: &str) -> Option<Account> { None }
+            fn try_load_account(&self, _a: &str) -> Result<Option<Account>, ()> { Err(()) }
+            fn try_load_accounts_batch(&self, a: &[String]) -> Vec<Result<Option<Account>, ()>> { vec![Err(()); a.len()] }
+        }
+        struct LeafErr;
+        impl MerkleNodeStore for LeafErr {
+            fn get_leaf(&self, _k: &[u8; 32]) -> Option<[u8; 32]> { None }
+            fn try_get_leaf(&self, _k: &[u8; 32]) -> Result<Option<[u8; 32]>, ()> { Err(()) }
+            fn get_node(&self, _d: u32, _k: &[u8; 32]) -> Option<[u8; 32]> { None }
+            fn leaves_under(&self, _lo: &[u8; 32], _hi: &[u8; 32], _n: usize) -> Vec<([u8; 32], [u8; 32])> { Vec::new() }
+            fn all_leaves(&self) -> Vec<([u8; 32], [u8; 32])> { Vec::new() }
+            fn wipe_leaves(&self) -> Result<(), String> { Ok(()) }
+            fn put_batch(&self, _lp: &[([u8; 32], [u8; 32])], _ld: &[[u8; 32]], _np: &[((u32, [u8; 32]), [u8; 32])],
+                         _nd: &[(u32, [u8; 32])], _w: bool) -> Result<(), String> { Ok(()) }
+        }
+        let sm = StateManager::new();
+        sm.merkle_tree.write().set_node_store(Arc::new(LeafErr));
+        sm.set_disk_store(Arc::new(Unreadable) as Arc<dyn AccountStore>);
+        assert!(!sm.warm_account("w_err"));
+        let stale = sm.take_mirror_stale();
+        assert_eq!(stale.len(), 1, "an unreadable leaf proves no absence");
+        assert_eq!(stale[0].1, None, "no leaf to put back");
+    }
+
+    // One block can read an account twice: a later unread leaf never replaces a known one.
+    #[test]
+    fn a_known_stale_leaf_is_not_replaced_by_a_later_unread_one() {
+        let sm = StateManager::new();
+        let mut snap = sm.create_block_snapshot(3);
+        snap.note_stale_leaves(vec![("w_x".to_string(), Some([7u8; 32])), ("w_x".to_string(), None)]);
+        snap.note_stale_leaves(vec![("w_y".to_string(), None)]);
+        assert_eq!(snap.stale_leaves().get("w_x"), Some(&Some([7u8; 32])));
+        assert_eq!(snap.stale_leaves().get("w_y"), Some(&None));
+    }
+
     /// B cutover anti-replay: claim_reward credits once per epoch and is monotonic.
     /// last_claimed_epoch is consensus-bound (SMT leaf) so this property holds network-wide.
 
@@ -5309,6 +5514,7 @@ mod cache_tests {
         let store = MockStore::new();
         store.put("bob", make_account(42));
         sm.set_disk_store(store.clone() as Arc<dyn AccountStore>);
+        commit_leaves(&sm, &store);
 
         assert!(!sm.accounts.contains_key("bob"));
         assert!(sm.warm_account("bob"));
@@ -5485,6 +5691,7 @@ mod cache_tests {
         store.put("on_disk_1", make_account(1));
         store.put("on_disk_2", make_account(2));
         sm.set_disk_store(store.clone() as Arc<dyn AccountStore>);
+        commit_leaves(&sm, &store);
         // Already resident
         sm.accounts.insert("in_cache".to_string(), make_account(3));
 
@@ -5543,6 +5750,7 @@ mod cache_tests {
         let store = MockStore::new();
         store.put("disk_a", make_account(1));
         sm.set_disk_store(store.clone() as Arc<dyn AccountStore>);
+        commit_leaves(&sm, &store);
         sm.accounts.insert("ram_a".to_string(), make_account(2));
 
         // Cache hit
@@ -5615,6 +5823,7 @@ mod cache_tests {
             store.put(&format!("acc_{:06}", i), make_account(i as u64));
         }
         sm.set_disk_store(store.clone() as Arc<dyn AccountStore>);
+        commit_leaves(&sm, &store);
         sm.set_cache_capacity(CACHE_CAP);
 
         // Walk the entire address space; each warm causes a cold load
@@ -5659,6 +5868,7 @@ mod cache_tests {
             store.put(&format!("cold_{:06}", i), make_account(1_000_000 + i as u64));
         }
         sm.set_disk_store(store.clone() as Arc<dyn AccountStore>);
+        commit_leaves(&sm, &store);
         sm.set_cache_capacity(CACHE_CAP);
 
         // Warm hot set first — these get the OLDEST timestamps (we'll
@@ -5824,6 +6034,7 @@ mod cache_tests {
             store.put(&format!("a_{:06}", i), make_account(i as u64));
         }
         sm.set_disk_store(store.clone() as Arc<dyn AccountStore>);
+        commit_leaves(&sm, &store);
         sm.set_cache_capacity(CACHE_CAP);
 
         // Spawn workers that each walk a disjoint slice of the address

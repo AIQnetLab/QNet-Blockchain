@@ -809,6 +809,7 @@ pub async fn execute(effects: Vec<Effect>, node_id: &str, p2p: &Arc<SimplifiedP2
                 }
             }
             Effect::Finalize { index, head_height, state_root, mb_hashes } => {
+                publish_committed_lists(storage, index).await;
                 // Finalize a checkpoint on ITS OWN QC'd head + state_root + per-height body hashes — NOT via
                 // a macroblock body (intra-window checkpoints on the /cp_interval cadence have none). Advance
                 // the monotonic marker ONLY if: tip reached the head AND local head state == QC'd state_root
@@ -825,7 +826,7 @@ pub async fn execute(effects: Vec<Effect>, node_id: &str, p2p: &Arc<SimplifiedP2
                 let verdict = if !anchor_ok && win > 0 && win <= head_height {
                     let start = head_height - (win - 1);
                     Some(crate::node::BlockchainNode::window_content_verdict(
-                        &storage, &mb_hashes, start, head_height))
+                        &storage, &mb_hashes, start, head_height, chain_h))
                 } else { None };
                 let content_ok = anchor_ok
                     || verdict.as_ref().map_or(false, |(miss, mism)| miss.is_empty() && mism.is_empty());
@@ -845,6 +846,7 @@ pub async fn execute(effects: Vec<Effect>, node_id: &str, p2p: &Arc<SimplifiedP2
                     // timer runs on, and each is fire-and-forget anyway - completeness is judged
                     // by re-reading storage on the next tick.
                     if let Some((missing, mismatched)) = verdict.as_ref() {
+                        crate::node::BlockchainNode::signal_certified_fork_point(mismatched, head_height);
                         let heights: Vec<u64> = missing.iter().chain(mismatched.iter())
                             .copied().take(32).collect();
                         if !heights.is_empty() {
@@ -1415,34 +1417,88 @@ pub fn execute_recovery_decree(storage: &Storage, seq: u64, target: u64) -> ! {
     std::process::exit(0);
 }
 
-/// Certified pair for the checkpoint at `head_height`, from the WAL. O(RETAIN) scan of small pairs.
-/// The WAL pair certifying `head_height` ON THE COMMITTED CHAIN: found by walking parent links
-/// down from the pair at `committed_index`. Recency is not membership - the WAL holds every
-/// certificate this node ever adopted, an abandoned branch's included, and only the parent chain
-/// of a committed checkpoint says which one the chain kept. Any missing link fails closed: the
+/// One WAL pair by index, checked to be the pair it claims (index and hash agree). A certificate is
+/// megabytes at committee scale: one point read and one decode per link.
+fn load_certified_pair(storage: &Storage, idx: u64)
+    -> Option<(qnet_consensus::checkpoint_bft::Checkpoint, QuorumCertificate)>
+{
+    let bytes = storage.certified_pair(idx).ok().flatten()?;
+    let (mut cp, mut qc) = (None, None);
+    for m in bincode::deserialize::<Vec<ConsensusMsg>>(&bytes).ok()? {
+        match m { ConsensusMsg::Proposal(p) if cp.is_none() => cp = Some(p), ConsensusMsg::Qc(q) if qc.is_none() => qc = Some(q), _ => {} }
+    }
+    let (cp, qc) = (cp?, qc?);
+    if qc.index == idx && cp.index == idx && cp.hash() == qc.checkpoint_hash { Some((cp, qc)) } else { None }
+}
+
+/// The parent pair of `cp` on the committed chain, when its link verifies.
+fn committed_parent(storage: &Storage, cp: &qnet_consensus::checkpoint_bft::Checkpoint)
+    -> Option<(qnet_consensus::checkpoint_bft::Checkpoint, QuorumCertificate)>
+{
+    let p = cp.parent_qc.as_ref()?;
+    load_certified_pair(storage, p.index).filter(|(_, qc)| qc.checkpoint_hash == p.checkpoint_hash)
+}
+
+/// Certified pair for the checkpoint at `head_height` ON THE COMMITTED CHAIN: found by walking parent
+/// links down from the pair at `committed_index`. Recency is not membership - the WAL holds every
+/// certificate this node ever adopted, an abandoned branch's included, and only the parent chain of
+/// a committed checkpoint says which one the chain kept. Any missing link fails closed: the
 /// macroblock then comes from a peer that can seal it.
 pub fn certified_pair_by_head(storage: &Storage, head_height: u64, committed_index: u64)
     -> Option<(qnet_consensus::checkpoint_bft::Checkpoint, QuorumCertificate)>
 {
-    // Point reads, one per link: a certificate is megabytes at committee scale, so decoding the
-    // whole log to find one row is not an option on the consensus task.
-    let load = |idx: u64| -> Option<(qnet_consensus::checkpoint_bft::Checkpoint, QuorumCertificate)> {
-        let bytes = storage.certified_pair(idx).ok().flatten()?;
-        let pair = bincode::deserialize::<Vec<ConsensusMsg>>(&bytes).ok()?;
-        let cp = pair.iter().find_map(|m| match m { ConsensusMsg::Proposal(p) => Some(p.clone()), _ => None })?;
-        let qc = pair.iter().find_map(|m| match m { ConsensusMsg::Qc(q) => Some(q.clone()), _ => None })?;
-        if qc.index == idx && cp.index == idx && cp.hash() == qc.checkpoint_hash { Some((cp, qc)) } else { None }
-    };
-    let mut cur = committed_index;
+    let mut cur = load_certified_pair(storage, committed_index)?;
     for _ in 0..=qnet_consensus::checkpoint_bft::CONSENSUS_STATE_RETAIN {
-        let (cp, qc) = load(cur)?;
-        if cp.window_head_height < head_height { return None; }
-        if cp.window_head_height == head_height { return Some((cp, qc)); }
-        let p = cp.parent_qc.as_ref()?.clone();
-        if load(p.index)?.1.checkpoint_hash != p.checkpoint_hash { return None; }
-        cur = p.index;
+        if cur.0.window_head_height < head_height { return None; }
+        if cur.0.window_head_height == head_height { return Some(cur); }
+        cur = committed_parent(storage, &cur.0)?;
     }
     None
+}
+
+/// (committed checkpoint hash, (head, window body hashes) of the committed chain's checkpoints above
+/// `floor`, newest first, at most 32); heads at or below the floor answer from their macroblocks. The
+/// walk stops at the checkpoint the previous publish began at and takes its lists from there, so a
+/// commit costs one load; a floor that dropped since (a seal undone) walks the disk again for the heads
+/// the old floor filtered out. None when the committed pair itself does not load.
+pub fn committed_window_lists(storage: &Storage, committed_index: u64, floor: u64,
+                              prev: Option<(u64, [u8; 32], u64, crate::block_pipeline::WindowLists)>)
+    -> Option<([u8; 32], crate::block_pipeline::WindowLists)>
+{
+    const COMMITTED_WALK_MAX: usize = 32;
+    let (top, top_qc) = load_certified_pair(storage, committed_index)?;
+    let mut out = Vec::new();
+    let mut next = Some(top);
+    while let Some(cp) = next {
+        if cp.window_head_height <= floor || out.len() >= COMMITTED_WALK_MAX { break; }
+        let splice = match (&cp.parent_qc, &prev) {
+            (Some(p), Some((pi, ph, pf, _))) => p.index == *pi && p.checkpoint_hash == *ph && floor >= *pf,
+            _ => false,
+        };
+        next = if splice { None } else { committed_parent(storage, &cp).map(|(c, _)| c) };
+        out.push((cp.window_head_height, cp.window_mb_hashes));
+        if let (true, Some((_, _, _, lists))) = (splice, prev.as_ref()) {
+            out.extend(lists.iter().filter(|(h, _)| *h > floor).cloned());
+            out.truncate(COMMITTED_WALK_MAX);
+        }
+    }
+    Some((top_qc.checkpoint_hash, out))
+}
+
+/// Walk and publish the committed chain's body lists when `committed` is newer than what is
+/// published: at each commit, before the verdict that may signal a fork point from them. The walk
+/// decodes certificates, so it runs on the blocking pool; a committed pair that does not load
+/// publishes nothing and the next tick retries.
+async fn publish_committed_lists(storage: &Arc<Storage>, committed: u64) {
+    if committed == 0 || committed <= crate::block_pipeline::committed_lists_index(storage) { return; }
+    let st = storage.clone();
+    let floor = storage.last_sealed_mb_index().saturating_mul(qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL);
+    let prev = crate::block_pipeline::committed_lists_snapshot(storage);
+    let walked = tokio::task::spawn_blocking(move || committed_window_lists(&st, committed, floor, prev))
+        .await.ok().flatten();
+    if let Some((hash, lists)) = walked {
+        crate::block_pipeline::publish_committed_window_lists(storage, committed, hash, floor, lists);
+    }
 }
 
 /// The Persist that re-seals a macro boundary this node COMMITTED but never stored (seal inputs
@@ -1530,7 +1586,7 @@ struct WindowCommittees { seq: u64, map: std::collections::BTreeMap<u64, Vec<Str
 static WINDOW_COMMITTEES: parking_lot::Mutex<WindowCommittees> =
     parking_lot::Mutex::new(WindowCommittees { seq: 0, map: std::collections::BTreeMap::new() });
 
-fn committee_for_window_cached(storage: &Storage, w: u64) -> Option<Vec<String>> {
+pub(crate) fn committee_for_window_cached(storage: &Storage, w: u64) -> Option<Vec<String>> {
     const KEEP: usize = 8;
     let seq = crate::storage::macroblock_delete_seq();
     {
@@ -1898,6 +1954,7 @@ pub async fn run(
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_index = driver.current_index();
     let mut last_committed = driver.committed_index(); // progress signal resetting the adaptive backoff
+    publish_committed_lists(&storage, last_committed).await;
     let mut consec_timeouts: u32 = 0; // views timed out without a commit → grows the effective view timeout
     let mut ticks_stuck: u32 = 0;     // base ticks accumulated toward the next backed-off on_timeout
     let mut last_signaled: u64 = 0; // highest window index we hold data for (gates idle timeouts)
@@ -2027,6 +2084,7 @@ pub async fn run(
                 // lost its window content is restored by the pull below: the bodies land, WindowEnd fires,
                 // last_signaled rises and this guard opens on its own.
                 let committed = driver.committed_index();
+                publish_committed_lists(&storage, committed).await;
                 if committed > last_committed {
                     last_committed = committed; consec_timeouts = 0; ticks_stuck = 0;
                     last_certified_at = std::time::Instant::now();
@@ -3186,6 +3244,55 @@ mod cert_window_tests {
         let q = qc_of(&p);
         let _ = d.sync(&p, &q);
         (d, q)
+    }
+
+    // Fork-choice reads the committed checkpoints' body lists at checkpoint cadence: the walk follows
+    // verified parent links down from the committed index and stops at the seal floor.
+    #[test]
+    fn the_committed_window_lists_follow_parent_links_down_to_the_seal() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = Storage::new(dir.path().to_str().unwrap()).expect("storage");
+        let k = qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL;
+        let mut parent: Option<QuorumCertificate> = None;
+        for (idx, head) in [(10u64, 3 * k), (11, 4 * k), (12, 5 * k)] {
+            let mut c = cp(idx, head);
+            c.window_mb_hashes = (0..k).map(|i| [(head - k + 1 + i) as u8; 32]).collect();
+            c.parent_qc = parent.as_ref().map(qnet_consensus::checkpoint_bft::QcRef::from);
+            let q = qc_of(&c);
+            let bytes = bincode::serialize(&vec![ConsensusMsg::Proposal(c.clone()), ConsensusMsg::Qc(q.clone())]).expect("ser");
+            storage.record_certified_pair_at(idx, head, &bytes).expect("record");
+            parent = Some(q);
+        }
+        let heads = |floor| committed_window_lists(&storage, 12, floor, None).expect("pair 12").1
+            .iter().map(|(h, _)| *h).collect::<Vec<_>>();
+        assert_eq!(heads(0), vec![5 * k, 4 * k, 3 * k]);
+        assert_eq!(heads(4 * k), vec![5 * k], "heads at or below the seal answer from macroblocks");
+        assert_eq!(certified_pair_by_head(&storage, 4 * k, 12).map(|(c, _)| c.index), Some(11));
+        // The next commit's walk stops at the checkpoint the previous publish began at, unless the seal
+        // floor dropped since: then it walks the disk again for the heads the old floor filtered out.
+        let (h11s, l11s) = committed_window_lists(&storage, 11, 4 * k - 1, None).expect("pair 11");
+        let rewalk = committed_window_lists(&storage, 12, 0, Some((11, h11s, 4 * k - 1, l11s))).expect("pair 12").1;
+        assert_eq!(rewalk.iter().map(|(h, _)| *h).collect::<Vec<_>>(), vec![5 * k, 4 * k, 3 * k], "a dropped floor walks again");
+        // With the floor held it splices: with the older pairs gone from disk it answers the same lists.
+        let (h11, l11) = committed_window_lists(&storage, 11, 0, None).expect("pair 11");
+        storage.delete_certified_pair(11).expect("drop 11");
+        storage.delete_certified_pair(10).expect("drop 10");
+        let (h12, l12) = committed_window_lists(&storage, 12, 0, Some((11, h11, 0, l11))).expect("pair 12");
+        assert_eq!(l12.iter().map(|(h, _)| *h).collect::<Vec<_>>(), vec![5 * k, 4 * k, 3 * k], "spliced, not re-walked");
+        assert!(committed_window_lists(&storage, 11, 0, None).is_none(), "a pair that does not load publishes nothing");
+        // The lookup fork-choice uses, from the lists the consensus loop publishes at each commit.
+        crate::block_pipeline::publish_committed_window_lists(&storage, 12, h12, 0, l12);
+        assert_eq!(crate::block_pipeline::committed_lists_top(&storage), 5 * k, "the sync target reaches the newest committed head");
+        let other_dir = tempfile::TempDir::new().expect("tempdir");
+        let other = Storage::new(other_dir.path().to_str().unwrap()).expect("storage");
+        crate::block_pipeline::invalidate_committed_window_lists(&other);
+        assert_eq!(crate::block_pipeline::committed_lists_top(&storage), 5 * k, "another store's retraction leaves them");
+        let h = 4 * k - 5;
+        assert_eq!(crate::block_pipeline::certified_pair_hash(&storage, h), Some([h as u8; 32]));
+        assert_eq!(crate::block_pipeline::certified_micro_hash(&storage, h), Some([h as u8; 32]), "no seal: the committed pair names it");
+        crate::block_pipeline::publish_committed_window_lists(&storage, 11, [0u8; 32], 0, Vec::new());
+        assert!(crate::block_pipeline::certified_pair_hash(&storage, h).is_some(), "an older index never replaces a newer");
+        crate::block_pipeline::invalidate_committed_window_lists(&storage);
     }
 
     // A certificate is placed by the proposal held at its index; the view being driven certifies

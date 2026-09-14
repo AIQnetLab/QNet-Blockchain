@@ -1997,8 +1997,8 @@ impl BlockchainNode {
             return Err(format!("Too many transactions: {} (max: 200000)", microblock.transactions.len()));
         }
         
-        // block_ts is slot-deterministic (genesis_ts + height*SLOT), enforced on
-        // ingest; no producer-side future check needed.
+        // The slot timestamp rule (slot_timestamp_valid) is enforced on ingest; a producer never
+        // stamps past its own clock, so no producer-side future check is needed.
         Ok(())
     }
     

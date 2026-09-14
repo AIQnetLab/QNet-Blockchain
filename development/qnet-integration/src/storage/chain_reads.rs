@@ -208,6 +208,14 @@ impl Storage {
         self.persistent.load_microblock_hash(height).ok().flatten()
     }
 
+    /// The body hash at `height` when it is committed chain: at or below the durable tip, which is
+    /// written in the body's own batch. A row above it (a rollback's or a stopped replay's leftover)
+    /// is not chain state; its slot stays open to the canonical block, whose save replaces it.
+    pub fn committed_hash_at(&self, height: u64) -> Option<[u8; 32]> {
+        if height > self.persistent.get_chain_height().unwrap_or(0) { return None; }
+        self.canonical_hash_at(height)
+    }
+
     /// What occupies a slot. `Burned` is a legal, permanent answer once slots are exclusive: a
     /// silent leader's slot is never filled by anyone. Callers must treat it as "move on", not as
     /// a gap to repair — conflating the two is what turns a skipped slot into a stall.
@@ -558,6 +566,11 @@ impl Storage {
     /// Block timestamp from the retained header row alone — no tx rows needed, so it survives body
     /// expiry (genesis timing must never depend on reconstructable transactions).
     pub fn block_timestamp_at(&self, height: u64) -> IntegrationResult<Option<u64>> {
+        // The header row, written in the body's batch and deleted with it: metadata point reads, no
+        // body decode. The body is read only for a row saved before the header index existed.
+        if let Some(hash) = self.persistent.load_microblock_hash(height)? {
+            if let Some(hd) = self.persistent.header_index(&hash) { return Ok(Some(hd.timestamp)); }
+        }
         let raw = match self.load_microblock(height)? { Some(d) => d, None => return Ok(None) };
         let data = if raw.len() >= 4 && raw[0..4] == [0x28, 0xb5, 0x2f, 0xfd] {
             zstd::decode_all(&raw[..]).map_err(|e| IntegrationError::Other(format!("zstd: {}", e)))?

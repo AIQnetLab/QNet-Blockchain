@@ -66,34 +66,104 @@ fn take_sync_nudge() -> bool {
     SYNC_EVENT_NUDGE.swap(false, Ordering::Relaxed)
 }
 
-/// Wholesale state-resync request: set by fork recovery once repeated reconciles keep
-/// producing the SAME non-canonical root — the local base (snapshots + replay) provably
-/// cannot self-heal, so the next sync pass must take the QC-verified peer-snapshot path
-/// regardless of gap size. One-shot: consumed by a single execute_sync attempt; the
-/// requester re-arms (with its own cooldown) if that attempt fails.
-/// Last time a latched suspect state re-armed the wholesale request (unix secs).
+/// When the current suspect episode began, or when its last wholesale was asked (unix secs); 0 = no
+/// episode. A reconcile clearing the latch does not end the episode, only a proven restore does: a
+/// breaker that re-trips after every proven reconcile must still reach the wholesale.
 static SUSPECT_REARM_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// A latch this long after the last one opens a new episode.
+const SUSPECT_EPISODE_SECS: u64 = 600;
+
+/// The moment the suspect latch closed. The FIRST wholesale request of an episode fires one jitter
+/// after it, not at once: all six nodes latched at boot within a minute on 14.09 and each asked for
+/// a wholesale immediately, pruned its tail and fetched it from peers doing the same. A latch inside
+/// a running episode keeps its clock.
+pub fn note_suspect_latched() {
+    let now = unix_secs();
+    if suspect_opens_episode(now, SUSPECT_REARM_SECS.load(Ordering::Acquire)) { stamp_suspect_episode(now); }
+}
+
+/// Whether a latch at `now` starts a new episode.
+pub(crate) fn suspect_opens_episode(now: u64, prev: u64) -> bool {
+    prev == 0 || now.saturating_sub(prev) >= SUSPECT_EPISODE_SECS
+}
+
+/// Start the episode clock and say when the wholesale is due. Until the P2P layer names the node
+/// ("unknown") there is no jitter to announce: the manager re-stamps a boot latch when it starts.
+fn stamp_suspect_episode(now: u64) {
+    SUSPECT_REARM_SECS.store(now, Ordering::Release);
+    if is_warn() {
+        let id = crate::unified_p2p::GLOBAL_NODE_ID.read().clone();
+        if id.is_empty() || id == "unknown" {
+            println!("[WARN][SYNC] suspect_latched action=schedule_at_sync_start");
+        } else {
+            println!("[WARN][SYNC] suspect_resync_scheduled in={}s", suspect_jitter_secs(&id));
+        }
+    }
+}
+
+fn unix_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// 2-4 min, spread by the node's own identity, so a fleet latched by one shared fault does not ask
+/// in lockstep. GLOBAL_NODE_ID is set on every node; the env vars are genesis-only.
+pub(crate) fn suspect_jitter_secs(node_id: &str) -> u64 {
+    120 + if node_id.is_empty() { 0 } else { blake3::hash(node_id.as_bytes()).as_bytes()[0] as u64 % 120 }
+}
+
+/// Whether a latched node asks for its wholesale now: one jitter after the latch closed, then one
+/// jitter between asks. Pure, so the cadence is testable without a clock.
+pub(crate) fn suspect_arm_due(now: u64, latched_or_last: u64, jitter: u64) -> bool {
+    latched_or_last != 0 && now.saturating_sub(latched_or_last) >= jitter
+}
+
+/// Rows above the applied tip that a certificate names (the sealed macroblock of their window, else
+/// the committed checkpoint): this node's own copy of canonical blocks, which a regress keeps and a
+/// stopped replay leaves. Contiguous from `from`, as the wire bytes the pipeline decodes.
+pub(crate) fn collect_certified_local(storage: &Storage, from: u64, to: u64) -> Vec<(u64, Vec<u8>)> {
+    let mi = qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
+    let mut out = Vec::new();
+    if from == 0 { return out; }
+    let mut window: Option<(u64, Option<Vec<[u8; 32]>>)> = None;
+    let mut h = from;
+    while h <= to {
+        // The cheap fact first: without a row there is nothing to feed, and ordinary catch-up (no
+        // rows above the tip) never decodes a window certificate.
+        let stored = match storage.load_microblock_hash(h).ok().flatten() { Some(s) => s, None => break };
+        let w = (h - 1) / mi + 1;
+        if window.as_ref().map(|(k, _)| *k) != Some(w) {
+            window = Some((w, crate::block_pipeline::certified_window_hashes(storage, w)));
+        }
+        let certified = match window.as_ref().and_then(|(_, v)| v.as_ref()) {
+            Some(v) => v.get((h - ((w - 1) * mi + 1)) as usize).copied(),
+            None => crate::block_pipeline::certified_pair_hash(storage, h),
+        };
+        if certified != Some(stored) { break; }
+        let bytes = match storage.load_microblock_auto_format(h) {
+            Ok(Some(mb)) if certified == Some(mb.hash()) => bincode::serialize(&mb).ok(),
+            _ => None,
+        };
+        match bytes { Some(b) => out.push((h, b)), None => break }
+        h += 1;
+    }
+    out
+}
 
 /// A latched suspect state cannot be proven locally, so it keeps asking for a wholesale resync
-/// until one succeeds (or a proven reconcile lifts it). Rate-limited with per-node jitter: a fleet
-/// latched by one shared fault must not stampede the snapshot holders in lockstep.
+/// until one succeeds (or a proven reconcile lifts it), on the jittered cadence above.
 fn arm_suspect_resync() {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs()).unwrap_or(0);
-    // 2-4 min, spread by the node's own identity: a fleet latched by one shared fault must not
-    // re-ask in lockstep. GLOBAL_NODE_ID is set on every node; the env vars are genesis-only.
-    let id = crate::unified_p2p::GLOBAL_NODE_ID.read().clone();
-    let jitter = 120 + if id.is_empty() { 0 } else { blake3::hash(id.as_bytes()).as_bytes()[0] as u64 % 120 };
-    if now.saturating_sub(SUSPECT_REARM_SECS.load(Ordering::Relaxed)) < jitter { return; }
+    let jitter = suspect_jitter_secs(&crate::unified_p2p::GLOBAL_NODE_ID.read());
+    let last = SUSPECT_REARM_SECS.load(Ordering::Acquire);
+    if last == 0 { note_suspect_latched(); return; } // latched before the hook existed: schedule now
+    if !suspect_arm_due(now, last, jitter) { return; }
     SUSPECT_REARM_SECS.store(now, Ordering::Relaxed);
     WHOLESALE_STATE_RESYNC.store(true, Ordering::SeqCst);
 }
+/// Wholesale state-resync request: set only by the suspect arm; consumed by one execute_sync attempt
+/// while the latch holds.
 static WHOLESALE_STATE_RESYNC: AtomicBool = AtomicBool::new(false);
-
-pub fn request_wholesale_state_resync() {
-    WHOLESALE_STATE_RESYNC.store(true, Ordering::SeqCst);
-    SYNC_EVENT_NUDGE.store(true, Ordering::Relaxed);
-}
 
 /// RAII marker for the bulk catch-up window: storage disables the WAL while set (~10× apply throughput,
 /// the difference between a far-behind node converging and falling further behind). Cleared on EVERY
@@ -257,6 +327,9 @@ impl SyncManager {
         if is_info() {
             println!("[INFO][SYNC] manager_started");
         }
+        // A latch closed during boot (a replay that stopped short) was stamped before this manager
+        // could act on it: the first ask waits one jitter from here, not from the latch.
+        if crate::block_pipeline::state_suspect() { stamp_suspect_episode(unix_secs()); }
 
         // ═══════════════════════════════════════════════════════════════════════
         // v14.2: EVENT-DRIVEN + PERIODIC CHECK
@@ -305,8 +378,11 @@ impl SyncManager {
     /// Cold-start sync target = QC-verified finality frontier; the peer/bootstrap-HTTP hint may only
     /// add the ≤2-macroblock unsealed tail above it (no unverified scalar drives the bulk target).
     /// frontier==0 (h<90 / fresh genesis) ⇒ the hint alone, so the 5-genesis bootstrap is never blocked.
+    /// The newest committed checkpoint raises it too: the producer yields to a height a committed
+    /// certificate names, and with every tip below it (a fleet-wide regress) nothing else targets it.
     async fn detect_network_height(&self) -> u64 {
-        let hint = self.detect_network_height_hint().await;
+        let hint = self.detect_network_height_hint().await
+            .max(crate::block_pipeline::committed_lists_top(&self.storage));
         let frontier = crate::node::qc_verified_frontier_height();
         if frontier == 0 { hint }
         // Floor at the QC frontier (never sync below finality); reach the hint. Fetched blocks are
@@ -512,6 +588,39 @@ impl SyncManager {
         }
     }
 
+    /// Certified rows above the applied tip go to the pipeline from disk, the one path that applies
+    /// and materialises a block, before peers are asked for them. Returns the last height fed once it
+    /// has landed or a bounded wait passed: paced like the peer frontier fetch, a pass never re-queues
+    /// a range still in flight.
+    async fn feed_certified_local(&self, from: u64, to: u64) -> Option<u64> {
+        let st = self.storage.clone();
+        let blocks = tokio::task::spawn_blocking(move || collect_certified_local(&st, from, to))
+            .await.unwrap_or_default();
+        let last = blocks.last().map(|(h, _)| *h)?;
+        let n = blocks.len();
+        let now = unix_secs();
+        for (height, data) in blocks {
+            let ingest = crate::block_pipeline::IngestBlock {
+                // "self": the local source, exempt from peer strikes, quarantine and attribution.
+                height, data, block_type: "micro".to_string(), from_peer: "self".to_string(), received_at: now,
+            };
+            if !self.pipeline.submit_async(ingest).await { return None; }
+        }
+        if is_info() {
+            println!("[INFO][SYNC] local_certified_fed from={} to={} n={}", from, last, n);
+        }
+        let notify = self.pipeline.apply_notify();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        // notify_waiters keeps no permit: the 1 s tick covers a wake between the read and the wait.
+        while self.storage.get_chain_height().unwrap_or(0) < last && Instant::now() < deadline {
+            tokio::select! {
+                _ = notify.notified() => {}
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+            }
+        }
+        Some(last)
+    }
+
     /// A row proves the height is done only at or below the applied tip; above it it is an orphan
     /// (rollback resurrection, aborted apply) and counting it as present makes the gap permanent —
     /// never re-requested, while apply waits for exactly that block. Apply already has this rule.
@@ -587,7 +696,10 @@ impl SyncManager {
         // (the coordinator's observed height can be stale while the state is wedged) and the
         // gap threshold below — the peer-snapshot negotiation finds the real tip itself.
         if crate::block_pipeline::state_suspect() { arm_suspect_resync(); }
-        let wholesale = WHOLESALE_STATE_RESYNC.swap(false, Ordering::SeqCst);
+        // Taken only while latched: a request whose latch cleared before it was taken (the insufficient-
+        // peers re-arm) is dropped. A wholesale under way completes: only the verified restore ends the
+        // episode, not a reconcile proof.
+        let wholesale = WHOLESALE_STATE_RESYNC.swap(false, Ordering::SeqCst) && crate::block_pipeline::state_suspect();
 
         if !wholesale && local_h >= target {
             if is_debug() {
@@ -668,8 +780,10 @@ impl SyncManager {
                     if restored > local_h || (wholesale && restored > 0) {
                         // fast_sync Ok ⇒ the restore was verify-gated inside (rehydrate rejects any
                         // root that does not reproduce the QC-bound anchor) — a PROVEN rebuild, so
-                        // the wholesale path may lift the suspect latch.
-                        if wholesale { crate::block_pipeline::clear_state_suspect(); }
+                        // the latch lifts however it was asked for: a boot-stopped node far behind
+                        // takes this path before its jittered wholesale is due. The proof ends the episode.
+                        crate::block_pipeline::clear_state_suspect();
+                        SUSPECT_REARM_SECS.store(0, Ordering::Release);
                         local_h = restored;
                         self.progress_height.store(restored, Ordering::Relaxed);
                         crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(restored, Ordering::Release);
@@ -677,8 +791,10 @@ impl SyncManager {
                             println!("[INFO][SYNC] snapshot_restored h={} target={} tail={} wholesale={}",
                                      restored, target, target.saturating_sub(restored), wholesale);
                         }
+                        // The regress kept every tail body a certificate vouches for. The range sync below
+                        // feeds them to the pipeline from disk (feed_certified_local) before it asks peers
+                        // that may be regressing too (14.09: 937473..937530 vanished from all six that way).
                     } else {
-                        if wholesale && !crate::block_pipeline::state_suspect() { request_wholesale_state_resync(); } // nothing restored — keep asking
                         if is_info() {
                             println!("[INFO][SYNC] snapshot_no_advance local={} — fallback block_sync", local_h);
                         }
@@ -689,7 +805,6 @@ impl SyncManager {
                     // one. Bail to the desync tick (gated !active), which re-drives cold-join once the
                     // co-sent capsule arrives — never fall to O(height) block-replay from the h=90 anchor.
                     if matches!(e, crate::errors::IntegrationError::AnchorPending) {
-                        if wholesale && !crate::block_pipeline::state_suspect() { request_wholesale_state_resync(); }
                         if is_info() { println!("[INFO][SYNC] coldjoin_await_anchor — bail to tick"); }
                         self.active.store(false, Ordering::SeqCst);
                         return;
@@ -697,9 +812,8 @@ impl SyncManager {
                     if is_info() {
                         println!("[INFO][SYNC] snapshot_unavailable reason={:?} fallback=block_sync", e);
                     }
-                    // A wholesale request is the only self-heal for an unprovable state: it must
-                    // outlive a failed attempt (no peer snapshot yet) instead of being consumed once.
-                    if wholesale && !crate::block_pipeline::state_suspect() { request_wholesale_state_resync(); }
+                    // A failed wholesale is asked again by the suspect arm, one jitter later, while the
+                    // latch holds.
                 }
             }
         }
@@ -837,6 +951,7 @@ impl SyncManager {
             // the sole guarantee of convergence from ANY gap. Runs BEFORE the bulk credit gate and
             // bypasses the bulk overlap-dedup; the bulk dispatch below is optimistic prefetch only.
             // ─────────────────────────────────────────────────────────────────
+            let mut fed_through: u64 = 0;
             {
                 const FRONTIER_SCAN: u64 = 512; // bounded lowest-missing probe (breaks at first hole)
                 let scan_hi = std::cmp::min(apply_tip.saturating_add(FRONTIER_SCAN), target);
@@ -860,7 +975,14 @@ impl SyncManager {
                         println!("[INFO][SYNC] frontier_fetch l={} end={} apply_tip={} target={} reserved",
                                  l, end, apply_tip, target);
                     }
-                    let _ = self.p2p.sync_blocks_frontier(l, end).await;
+                    // Certified rows this node already holds go from disk; peers are asked for the rest.
+                    let fetch_from = match self.feed_certified_local(l, end).await {
+                        Some(fed) => { fed_through = fed; fed + 1 }
+                        None => l,
+                    };
+                    if fetch_from <= end {
+                        let _ = self.p2p.sync_blocks_frontier(fetch_from, end).await;
+                    }
                 } else {
                     frontier_misses = 0;
                 }
@@ -929,7 +1051,9 @@ impl SyncManager {
             }
 
             if missing.is_empty() {
-                // Window complete in storage — wait for apply_tip to advance.
+                // Window complete in storage — wait for apply_tip to advance, unless this pass already
+                // raised it (a local feed waits for its own applies, and their wake is spent).
+                if self.storage.get_chain_height().unwrap_or(0) > apply_tip { continue; }
                 tokio::select! {
                     _ = apply_notify.notified() => {}
                     _ = tokio::time::sleep(NOTIFY_TIMEOUT) => {
@@ -966,6 +1090,13 @@ impl SyncManager {
             let dispatch_start = Instant::now();
             let mut any_sent = false;
             for (from, to) in requests {
+                let from = from.max(fed_through.saturating_add(1));
+                if from > to { continue; }
+                let from = match self.feed_certified_local(from, to).await {
+                    Some(fed) => { any_sent = true; fed + 1 }
+                    None => from,
+                };
+                if from > to { continue; }
                 match tokio::time::timeout(
                     self.config.request_timeout,
                     self.p2p.sync_blocks(from, to),
@@ -997,7 +1128,9 @@ impl SyncManager {
                 continue;
             }
 
-            // Wait for pipeline to apply AT LEAST ONE new block, or safety timeout.
+            // Wait for pipeline to apply AT LEAST ONE new block, or safety timeout; a pass whose local
+            // feeds already raised the tip has seen it.
+            if self.storage.get_chain_height().unwrap_or(0) > apply_tip { continue; }
             tokio::select! {
                 _ = apply_notify.notified() => {}
                 _ = tokio::time::sleep(NOTIFY_TIMEOUT) => {
@@ -1061,3 +1194,54 @@ impl SyncManager {
     // sizing was tuned for polling-loop architecture that no longer exists.
 }
 
+#[cfg(test)]
+mod suspect_arm_tests {
+    use super::{suspect_arm_due, suspect_jitter_secs};
+
+    // 14.09: six nodes latched suspect within a minute of each other and each asked for a wholesale at
+    // once; the resync pruned every tail and refetched it from peers that were pruning theirs. The first
+    // ask of an episode waits one jitter from the latch, and every later ask waits one jitter more.
+    #[test]
+    fn the_first_wholesale_ask_waits_one_jitter_from_the_latch() {
+        let j = suspect_jitter_secs("genesis_node_001");
+        assert!((120..240).contains(&j), "2-4 min: {}", j);
+        assert!(!suspect_arm_due(1_000, 0, j), "nothing latched, nothing due");
+        assert!(!suspect_arm_due(1_000 + j - 1, 1_000, j), "before the jitter: wait");
+        assert!(suspect_arm_due(1_000 + j, 1_000, j), "at the jitter: ask");
+        assert!(suspect_arm_due(1_000 + 10 * j, 1_000, j), "long latched: ask");
+    }
+
+    // The episode's time is stored before the latch that names it (an arm that sees the latch sees
+    // its time), and a latch closed during boot is re-stamped when the manager starts.
+    #[test]
+    fn the_latch_time_precedes_the_latch_and_a_boot_latch_is_restamped_at_start() {
+        let bp = include_str!("block_pipeline.rs");
+        let f = bp.find("pub fn mark_state_suspect()").expect("latch");
+        let stamp = bp[f..].find("note_suspect_latched()").expect("stamp") + f;
+        let set = bp[f..].find(&format!("STATE_SUSPECT.{}(true", "store")).expect("publish") + f;
+        assert!(stamp < set, "stamped before published");
+        let sm = include_str!("sync_manager.rs");
+        let run = sm.find("pub async fn run(mut self)").expect("run");
+        let restamp = sm[run..].find(&format!("state_suspect() {{ {}(unix_secs()); }}", "stamp_suspect_episode")).expect("boot latch re-stamped");
+        assert!(restamp < 800, "at the start of the manager");
+    }
+
+    // A breaker that re-trips after every proven reconcile keeps one episode: a latch inside the
+    // window does not restart the clock, so the wholesale is still asked one jitter after the first.
+    #[test]
+    fn a_relatch_inside_an_episode_keeps_its_clock() {
+        use super::{suspect_opens_episode, SUSPECT_EPISODE_SECS};
+        assert!(suspect_opens_episode(1_000, 0), "no episode: the latch opens one");
+        assert!(!suspect_opens_episode(1_000 + 30, 1_000), "re-latched 30 s later: the same episode");
+        assert!(suspect_opens_episode(1_000 + SUSPECT_EPISODE_SECS, 1_000), "after a quiet spell: a new one");
+    }
+
+    #[test]
+    fn the_jitter_spreads_nodes_and_is_stable_per_node() {
+        let a = suspect_jitter_secs("genesis_node_001");
+        let b = suspect_jitter_secs("genesis_node_002");
+        assert_eq!(a, suspect_jitter_secs("genesis_node_001"), "deterministic per id");
+        assert!((120..240).contains(&a) && (120..240).contains(&b));
+        assert_eq!(suspect_jitter_secs(""), 120, "no identity yet: the floor");
+    }
+}

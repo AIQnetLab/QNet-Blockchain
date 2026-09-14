@@ -264,14 +264,24 @@ impl Storage {
     /// single batched I/O instead of sequential cold reads that would stall the boundary block at scale.
     /// Order matches `addresses`; missing/undecodable → None.
     pub fn load_accounts_batch(&self, addresses: &[String]) -> Vec<Option<qnet_state::Account>> {
+        self.try_load_accounts_batch(addresses).into_iter().map(|r| r.ok().flatten()).collect()
+    }
+
+    /// The same read with each row's outcome: Err = unreadable (no CF, a RocksDB or decode error).
+    pub fn try_load_accounts_batch(&self, addresses: &[String]) -> Vec<Result<Option<qnet_state::Account>, ()>> {
         let cf = match self.persistent.db.cf_handle("accounts") {
             Some(c) => c,
-            None => return vec![None; addresses.len()],
+            None => return vec![Err(()); addresses.len()],
         };
+        let unreadable = || { crate::storage::ACCOUNT_READ_ERRS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); };
         self.persistent.db
             .multi_get_cf(addresses.iter().map(|a| (&cf, a.as_bytes())))
             .into_iter()
-            .map(|r| match r { Ok(Some(b)) => bincode::deserialize(&b).ok(), _ => None })
+            .map(|r| match r {
+                Ok(None) => Ok(None),
+                Ok(Some(b)) => bincode::deserialize::<qnet_state::Account>(&b).map(Some).map_err(|_| unreadable()),
+                Err(_) => { unreadable(); Err(()) }
+            })
             .collect()
     }
 

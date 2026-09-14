@@ -1,7 +1,7 @@
 import type { Pool } from 'pg';
 import { NodeClient, HEIGHT_SLACK, type NewBlockEvent, type NodeHeader, type QuorumHeaders } from './node-client';
 import { Writer } from './writer';
-import { shapeBlock, shapedDigest, blockRowFromHeader, isHex64, toMs, merkleRootOf, type BlockRow, type ShapedBlock } from './transform';
+import { shapeBlock, shapedDigest, blockRowFromHeader, isHex64, toMs, merkleRootOf, SLOT_MS, SLOT_GAP_REANCHOR_GATE_HEIGHT, type BlockRow, type ShapedBlock } from './transform';
 import { fetchTokenTransfersAgreed, replaceTokenTransfers } from './token-transfers';
 import { log, errText } from './log';
 
@@ -259,13 +259,6 @@ export class Chain {
       return all();
     }
 
-    // Slot times are exact (genesis + height·1 s). A header that disagrees loses its own height; the
-    // rest of the page is unaffected, so one bad answer cannot stop the archive.
-    if (this.genesisTsMs > 0) {
-      const before = items.length;
-      items = items.filter(i => !i.body || toMs(i.timestamp) === this.genesisTsMs + i.height * 1000);
-      if (items.length !== before) log.warn('INDEXER', 'header_off_slot', { dropped: before - items.length, a, b });
-    }
     const have = new Set(items.map(i => i.height));
     const missing: number[] = [];
     for (let h = a; h <= b; h++) if (!have.has(h)) missing.push(h);
@@ -311,7 +304,7 @@ export class Chain {
       const s2 = stored.get(it.height);
       if (s2?.body_indexed && (s2.tx_count ?? 0) > 0) continue;   // never demote a stored body
       if (s2) { if (!s2.hash && isHex64(it.hash)) hashFixes.push([it.height, it.hash as string]); continue; }
-      if (this.genesisTsMs === 0) { missing.push(it.height); continue; }
+      if (!it.timestamp && this.genesisTsMs === 0) { missing.push(it.height); continue; }
       headersOnly.push({ ...blockRowFromHeader({ ...it, body: false }, this.genesisTsMs), tx_count: it.tx_count ?? null });
     }
     if (pruned.length > 0) log.warn('INDEXER', 'bodies_expired', { from: pruned[0].height, to: pruned[pruned.length - 1].height, floor: bodyFloor });
@@ -328,10 +321,11 @@ export class Chain {
         // A stored row keeps what it has and can only gain a missing hash; a new pruned row needs the
         // genesis time for its slot timestamp and an identity a quorum names.
         if (s) { if (!s.hash && isHex64(it.hash)) hashFixes.push([it.height, it.hash as string]); continue; }
-        if (this.genesisTsMs === 0) { missing.push(it.height); continue; }
+        if (it.height < SLOT_GAP_REANCHOR_GATE_HEIGHT && this.genesisTsMs === 0) { missing.push(it.height); continue; }
       }
       headersOnly.push(blockRowFromHeader(it, this.genesisTsMs));
     }
+    for (const h of await this.fillUnknownTimes(headersOnly, full)) missing.push(h);
     if (full.length === 0 && headersOnly.length === 0 && hashFixes.length === 0) return missing.sort((x, y) => x - y);
 
     const committed = await this.withWrite(async () => {
@@ -381,7 +375,6 @@ export class Chain {
   private async fetchFull(headers: NodeHeader[], bodySources: Map<number, string[]>): Promise<{ blocks: ShapedBlock[]; served: Map<number, string[]> }> {
     const out: ShapedBlock[] = [];
     const served = new Map<number, string[]>();
-    if (this.genesisTsMs === 0) return { blocks: out, served };   // rows need the slot time; the heights stay gaps
     const need = this.node.honestOne;
     let i = 0;
     const worker = async () => {
@@ -402,7 +395,7 @@ export class Chain {
             continue;
           }
           if (!got || got.endpoint !== src) { this.node.markFailed(src, `claimed the body at ${h.height} and did not serve it`); continue; }
-          const shaped = shapeBlock(got.block, this.genesisTsMs + h.height * 1000);
+          const shaped = shapeBlock(got.block, toMs(h.timestamp));
           if (merkleRootOf(shaped.txHashes) !== root) {
             this.node.quarantine(src, QUARANTINE_MS, `body does not match the quorum merkle root at ${h.height}`);
             continue;
@@ -761,11 +754,6 @@ export class Chain {
           // for an identity the archive will then keep forever.
           const page = await this.node.getQuorumHeaders(lo, hi - lo + 1);
           let items = page.items.filter(i => i.height >= lo && i.height <= hi);
-          if (this.genesisTsMs > 0) {
-            const before = items.length;
-            items = items.filter(i => !i.body || toMs(i.timestamp) === this.genesisTsMs + i.height * 1000);
-            if (items.length !== before) log.warn('INDEXER', 'heal_header_off_slot', { dropped: before - items.length });
-          }
           const stored = await this.storedLinks(items.map(i => i.height));
           const disputed = items.find(it => { const s = stored.get(it.height); return s?.hash && it.hash && s.hash !== it.hash; });
           if (disputed) { await this.repairContradictedRun(disputed.height, `heal: a quorum names another block at ${disputed.height}`); return; }
@@ -785,12 +773,13 @@ export class Chain {
                 // No body on the network: a stored row keeps what it has and gains a missing hash; a row
                 // that never existed is recorded as pruned. An identical pruned row is left alone.
                 if (s) { if (!s.hash && it.hash) hashFixes.push([it.height, it.hash]); }
-                else if (this.genesisTsMs > 0) { headersOnly.push(blockRowFromHeader(it, this.genesisTsMs)); }
+                else if (this.genesisTsMs > 0 || it.height >= SLOT_GAP_REANCHOR_GATE_HEIGHT) { headersOnly.push(blockRowFromHeader(it, this.genesisTsMs)); }
                 if (s && (s.tx_count ?? 0) > 0 && !s.body_indexed) unrecoverable++;
                 continue;
               }
               headersOnly.push(blockRowFromHeader(it, this.genesisTsMs));
             }
+            await this.fillUnknownTimes(headersOnly, full);
             const ok = await this.withWrite(async () => {
               if (this.epoch !== epoch0) return false;
               for (const [h, hash] of hashFixes) await this.fixHash(h, hash);
@@ -857,30 +846,28 @@ export class Chain {
     return m;
   }
 
-  // Slot times are exact, so one height every endpoint holds fixes the archive's clock — but only a
-  // value a quorum derives identically is taken, or one endpoint would set every pruned row's time.
+  // Genesis time is block 0's own timestamp: every node keeps block 0, and below the slot-gap gate a
+  // pruned height's time is genesis + height·1 s. Only a value a quorum names identically is taken.
   private async loadGenesisTs(): Promise<void> {
     const g = await this.pool.query<{ timestamp: string }>('SELECT timestamp FROM blocks WHERE height = 0');
     const stored = toMs(g.rows[0]?.timestamp);
-    const at = Math.max(1, this.nodeHeight - 10);
     const tal = new Map<number, number>();
     try {
-      for (const v of await this.node.getHeadersFromAll(at, 1)) {
-        const it = v.page.items.find(i => i.height === at);
-        const ts = it?.body ? toMs(it.timestamp) : 0;
-        if (ts > 0) { const gts = ts - at * 1000; tal.set(gts, (tal.get(gts) || 0) + 1); }
+      for (const v of await this.node.getHeadersFromAll(0, 1)) {
+        const it = v.page.items.find(i => i.height === 0);
+        const gts = it?.body ? toMs(it.timestamp) : 0;
+        if (gts > 0) tal.set(gts, (tal.get(gts) || 0) + 1);
       }
     } catch (e) {
       log.warn('INDEXER', 'genesis_time_lookup_failed', { err: errText(e) });
     }
     for (const [gts, n] of tal) {
       if (n < this.node.quorum) continue;
-      // The stored block-0 row is only believed when the network agrees with it: a wrong value there
-      // would reject every header against the slot rule and stop the archive dead.
-      if (stored > 0 && stored !== gts) log.warn('INDEXER', 'genesis_time_row_disagrees', { stored, network: gts, at });
+      // The stored block-0 row is only believed when the network agrees with it.
+      if (stored > 0 && stored !== gts) log.warn('INDEXER', 'genesis_time_row_disagrees', { stored, network: gts });
       this.genesisTsMs = gts;
       this.genesisTsUnconfirmed = false;
-      log.info('INDEXER', 'genesis_time_learned', { from_height: at, genesis_ts: gts, agree: n });
+      log.info('INDEXER', 'genesis_time_learned', { from_height: 0, genesis_ts: gts, agree: n });
       return;
     }
     if (stored > 0) {
@@ -891,6 +878,42 @@ export class Chain {
       return;
     }
     log.warn('INDEXER', 'genesis_time_unknown', { node_height: this.nodeHeight, answers: tal.size });
+  }
+
+  // At/after the slot-gap gate a pruned height has no time left anywhere on the network. The row before
+  // it bounds it from below (every step is at least one second), exact unless the chain halted in
+  // between. A row with nothing known below it is taken out and returned: that height stays a gap.
+  private async fillUnknownTimes(rows: BlockRow[], full: ShapedBlock[]): Promise<number[]> {
+    const unknown = rows.filter(r => r.timestamp === 0).map(r => r.height);
+    if (unknown.length === 0) return [];
+    const lo = Math.min(...unknown), hi = Math.max(...unknown);
+    // The archive's own rows bound as much as the batch's: the nearest known time below each unknown
+    // row is its bound, wherever that row lives.
+    const below = await this.pool.query<{ height: string; timestamp: string }>(
+      'SELECT height, timestamp FROM blocks WHERE height < $1 AND timestamp > 0 ORDER BY height DESC LIMIT 1', [lo]);
+    const inside = await this.pool.query<{ height: string; timestamp: string }>(
+      'SELECT height, timestamp FROM blocks WHERE height > $1 AND height < $2 AND timestamp > 0', [lo, hi]);
+    const seq = [
+      ...rows.map(r => ({ h: r.height, row: r as BlockRow | null, ts: r.timestamp })),
+      ...full.map(f => ({ h: f.block.height, row: null as BlockRow | null, ts: f.block.timestamp })),
+      ...[...below.rows, ...inside.rows].map(r => ({ h: Number(r.height), row: null as BlockRow | null, ts: toMs(r.timestamp) })),
+    ].sort((x, y) => x.h - y.h);
+    let last: [number, number] | null = null;
+    const dropped: number[] = [];
+    let bounded = 0;
+    for (const e of seq) {
+      if (e.ts > 0) { last = [e.h, e.ts]; continue; }
+      if (!last || !e.row) { dropped.push(e.h); continue; }
+      e.row.timestamp = last[1] + (e.h - last[0]) * SLOT_MS;
+      last = [e.h, e.row.timestamp];
+      bounded++;
+    }
+    if (bounded > 0) log.warn('INDEXER', 'time_lower_bound', { rows: bounded, from: seq.find(e => e.ts === 0)?.h });
+    if (dropped.length > 0) {
+      const d = new Set(dropped);
+      for (let k = rows.length - 1; k >= 0; k--) if (d.has(rows[k].height)) rows.splice(k, 1);
+    }
+    return dropped;
   }
 
   private async publishState(): Promise<void> {

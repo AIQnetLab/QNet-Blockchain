@@ -3,6 +3,10 @@ import type { NodeBlock, NodeHeader } from './node-client';
 // Pure node-JSON → row shaping. No I/O, unit-tested.
 
 export const SLOT_MS = 1000;
+// The node's SLOT_GAP_REANCHOR gate (core/qnet-state feature_gates.rs). Below it a block's time is
+// genesis + height·1 s exactly; at/after it the chain re-anchors after a halt, so a block's time is
+// its own, carried by the quorum header.
+export const SLOT_GAP_REANCHOR_GATE_HEIGHT = 1_339_200;
 export const ZERO_HASH = '0'.repeat(64);
 
 export interface BlockRow {
@@ -242,7 +246,8 @@ export interface ShapedBlock {
 // the u64::MAX "no gas" sentinel skipped and clamped to the column (price × limit is up to 2^128).
 export function shapeBlock(b: NodeBlock, slotTsMs = 0): ShapedBlock {
   const txsRaw = Array.isArray(b.transactions) ? b.transactions : [];
-  // The block's time is the slot's, never the body's: every row it produces carries it.
+  // The block's time is the quorum header's when given, never one endpoint's body: every row it
+  // produces carries it.
   const blockTs = slotTsMs > 0 ? slotTsMs : toMs(b.timestamp);
   const txs: TxRow[] = [];
   const batch: BatchRow[] = [];
@@ -285,7 +290,8 @@ export function shapeBlock(b: NodeBlock, slotTsMs = 0): ShapedBlock {
 }
 
 // A header with a body → an empty-block row (tx_count must be 0: a header with transactions needs the
-// full block). A header without a body → identity-only row with the slot-derived time.
+// full block). A header without a body → identity-only row: its own time when the node still has it,
+// the slot time below the gate, else 0 = unknown here (the caller bounds it or leaves the gap).
 export function blockRowFromHeader(h: NodeHeader, genesisTsMs: number): BlockRow {
   if (h.body && (h.tx_count || 0) === 0) {
     return {
@@ -296,7 +302,8 @@ export function blockRowFromHeader(h: NodeHeader, genesisTsMs: number): BlockRow
     };
   }
   return {
-    height: h.height, hash: isHex64(h.hash) ? h.hash : null, timestamp: slotTimestampMs(genesisTsMs, h.height),
+    height: h.height, hash: isHex64(h.hash) ? h.hash : null,
+    timestamp: h.timestamp ? toMs(h.timestamp) : h.height < SLOT_GAP_REANCHOR_GATE_HEIGHT ? slotTimestampMs(genesisTsMs, h.height) : 0,
     previous_hash: null, merkle_root: null, producer: 'unknown', tx_count: null, tx_skipped: 0, total_gas_used: '0', size_bytes: 0, body_indexed: false,
   };
 }

@@ -159,6 +159,34 @@ impl Storage {
     pub fn delete_microblocks_range_pub(&self, from: u64, to: u64) -> IntegrationResult<u64> {
         self.persistent.delete_microblocks_range(from, to)
     }
+
+    /// First height in (from, to] whose stored body a certificate contradicts: the sealed macroblock
+    /// of its window, or without one the committed checkpoint the WAL holds for it. None when every
+    /// certified body matches; heights nothing certifies carry no verdict and are kept. The
+    /// height->hash index is the body's identity (written with it, deleted with it).
+    pub fn first_certified_mismatch_above(&self, from: u64, to: u64) -> Option<u64> {
+        let mi = qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
+        let mut h = from + 1;
+        while h <= to {
+            let window_k = (h - 1) / mi + 1;
+            let start = (window_k - 1) * mi + 1;
+            let end = window_k * mi;
+            let sealed = crate::block_pipeline::certified_window_hashes(self, window_k);
+            let mut hh = h;
+            while hh <= end.min(to) {
+                let certified = match &sealed {
+                    Some(v) => v.get((hh - start) as usize).copied(),
+                    None => crate::block_pipeline::certified_pair_hash(self, hh),
+                };
+                if let Some(c) = certified {
+                    if self.load_microblock_hash(hh).ok().flatten().map_or(false, |l| l != c) { return Some(hh); }
+                }
+                hh += 1;
+            }
+            h = end + 1;
+        }
+        None
+    }
     pub fn put_galc_held(&self, bytes: &[u8]) -> IntegrationResult<()> { self.persistent.put_galc_held(bytes) }
     pub fn get_galc_held(&self) -> IntegrationResult<Option<Vec<u8>>> { self.persistent.get_galc_held() }
     /// The macroblock index this node cold-joined at, or 0 for a from-genesis node.
@@ -1873,29 +1901,7 @@ impl Storage {
         };
         let mut batch = rocksdb::WriteBatch::default();
 
-        // A promote still pending above the target would put the node back on the chain it left.
-        let mut promote_dropped = false;
-        if let Ok(Some(m)) = self.persistent.db.get_cf(&meta, b"promote_pending") {
-            if m.len() >= 8 {
-                let h = u64::from_le_bytes(m[..8].try_into().unwrap_or([0u8; 8]));
-                if h > target {
-                    batch.delete_cf(&meta, b"promote_pending");
-                    let _ = self.discard_snapshot_state(h);
-                    promote_dropped = true;
-                }
-            }
-        }
-        // The cold-join anchor: mb == 0 is the sentinel reload_snapshot_anchor treats as "none".
-        let mut anchor_dropped = false;
-        if let Ok(Some(a)) = self.persistent.db.get_cf(&meta, b"snapshot_anchor") {
-            if a.len() >= 8 {
-                let mb = u64::from_le_bytes(a[..8].try_into().unwrap_or([0u8; 8]));
-                if mb > 0 && mb.saturating_mul(mi) > target {
-                    batch.put_cf(&meta, b"snapshot_anchor", &[0u8; 40]);
-                    anchor_dropped = true;
-                }
-            }
-        }
+        let (promote_dropped, anchor_dropped) = self.stage_state_markers_above(&mut batch, target);
         // Certified pairs by the WINDOW they certify - the pair index is the view counter, not a
         // macroblock index. Head from its key when it has one, else from the pair itself; a pair
         // whose head cannot be read goes too.
@@ -1951,6 +1957,7 @@ impl Storage {
             println!("[WARN][ROLLBACK] retract_batch_failed target={} err={}", target, e);
             return;
         }
+        crate::block_pipeline::invalidate_committed_window_lists(self);
 
         // The seal watermark is re-derived, never trusted. The hint is monotonic-up and the reader
         // scans forward FROM it, so a node that lost objects below it keeps reporting a frontier it
@@ -1974,6 +1981,56 @@ impl Storage {
         }
         println!("[INFO][ROLLBACK] position_retracted target={} macroblocks={} epoch_roots={} snapshots={} pairs={} anchor_dropped={} promote_dropped={} sealed_mb={}",
                  target, macroblocks, roots, snapshots, pairs, anchor_dropped, promote_dropped, sealed_mb);
+    }
+
+    /// Stage the state markers above `target` a retraction drops: a pending promote (it would put the
+    /// node back on the state it left) and the cold-join anchor (mb 0 is the "none" sentinel).
+    fn stage_state_markers_above(&self, batch: &mut rocksdb::WriteBatch, target: u64) -> (bool, bool) {
+        let mi = qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
+        let meta = match self.persistent.db.cf_handle("metadata") { Some(cf) => cf, None => return (false, false) };
+        let mut promote_dropped = false;
+        if let Ok(Some(m)) = self.persistent.db.get_cf(&meta, b"promote_pending") {
+            if m.len() >= 8 {
+                let h = u64::from_le_bytes(m[..8].try_into().unwrap_or([0u8; 8]));
+                if h > target {
+                    batch.delete_cf(&meta, b"promote_pending");
+                    let _ = self.discard_snapshot_state(h);
+                    promote_dropped = true;
+                }
+            }
+        }
+        let mut anchor_dropped = false;
+        if let Ok(Some(a)) = self.persistent.db.get_cf(&meta, b"snapshot_anchor") {
+            if a.len() >= 8 {
+                let mb = u64::from_le_bytes(a[..8].try_into().unwrap_or([0u8; 8]));
+                if mb > 0 && mb.saturating_mul(mi) > target {
+                    batch.put_cf(&meta, b"snapshot_anchor", &[0u8; 40]);
+                    anchor_dropped = true;
+                }
+            }
+        }
+        (promote_dropped, anchor_dropped)
+    }
+
+    /// The state half of the retraction, for a wholesale regress: the snapshots this node built above
+    /// `target` from the state that was the fault, the state markers above it and the sync resume
+    /// point. Certified chain content - macroblocks, their epoch roots, the WAL pairs - stays.
+    pub fn retract_state_position_above(&self, target: u64) {
+        let snapshots = match self.prune_snapshots_above(target) {
+            Ok(n) => n,
+            Err(e) => { println!("[WARN][ROLLBACK] snapshot_prune_failed target={} err={}", target, e); 0 }
+        };
+        let mut batch = rocksdb::WriteBatch::default();
+        let (promote_dropped, anchor_dropped) = self.stage_state_markers_above(&mut batch, target);
+        if let Some(sync) = self.persistent.db.cf_handle("sync_state") {
+            batch.delete_cf(&sync, b"sync_progress");
+        }
+        if let Err(e) = self.persistent.db.write(batch) {
+            println!("[WARN][ROLLBACK] state_retract_failed target={} err={}", target, e);
+            return;
+        }
+        println!("[INFO][ROLLBACK] state_position_retracted target={} snapshots={} anchor_dropped={} promote_dropped={}",
+                 target, snapshots, anchor_dropped, promote_dropped);
     }
 
     /// Hash of the stored macroblock at `idx`, whichever framing it was stored in.
@@ -3088,15 +3145,18 @@ impl Storage {
         self.mark_owns_index_dirty();
         let _ = self.clear_cf("wallet_token");
         if self.backfill_owns_indices().is_ok() { let _ = self.set_owns_index_built(height); }
-        // Wholesale regress: drop the stored tail above the restored anchor, or it stays
-        // present-but-unapplied forever — sync's missing-range scan keys on storage presence
-        // and the pipeline dedups re-delivered stored blocks, so nothing would ever re-apply
-        // it. Same sequence as the recovery decree, monotonic seal watermark included; the
-        // deleted range is re-fetched, verified and applied by the normal tail sync.
+        // Wholesale regress: the STATE was the fault, the tail bodies were not. Every body a certificate
+        // on disk vouches for is kept (the certificates are read here, before the retraction below
+        // removes the objects) and replayed by the caller under verification; only the bodies a
+        // certificate contradicts go, from the first contradiction up. Deleting them all is what let
+        // six simultaneous regresses erase 937473..937530 from the whole fleet on 14.09.
         if regress {
             // Saves above `height` are barred by the slot, so this read is the final tip.
             let cur = self.get_chain_height().unwrap_or(live_h);
-            if cur > height {
+            // Rows above the applied tip are a designed state (a replay that stopped short keeps them),
+            // so the tail classified runs to the highest stored body, not to the tip.
+            let top = self.highest_stored_microblock().ok().flatten().unwrap_or(cur).max(cur);
+            if top > height {
                 let anchor_mb = height / 90;
                 // Reward side-indices are add-only / first-write-wins: the canonical re-apply of
                 // the tail can never remove an orphan row, so clear them like every other prune.
@@ -3105,11 +3165,15 @@ impl Storage {
                     Err(e) => println!("[WARN][SYNC] regress_reward_indices_fail to={} err={}", height, e),
                     _ => {}
                 }
-                let _ = self.delete_microblocks_range_pub(height + 1, cur);
-                // Every durable marker naming chain above the restored tip - certified pairs by the
-                // window they certify, macroblocks, the seal watermark - through the one retraction
-                // the boot rollback and the recovery decree also run.
-                self.retract_chain_position_above(height);
+                let dropped_from = self.first_certified_mismatch_above(height, top);
+                if let Some(d) = dropped_from {
+                    let _ = self.delete_microblocks_range_pub(d, top);
+                }
+                // Certified chain content stays: every macroblock here carries an n-f QC and the
+                // network kept that chain, so the kept tail's claims resolve against its epoch roots
+                // with no peer (six regressing nodes each deleting them would leave none to ask). What
+                // goes is what this node's state produced above the restored height.
+                self.retract_state_position_above(height);
                 // The mandatory post-destruction cleanup every other prune path runs: drop the
                 // read-through body cache (it would keep answering presence checks for deleted
                 // heights) and lower the stored-height marker (monotone-up otherwise).
@@ -3119,10 +3183,11 @@ impl Storage {
                 // raise-only everywhere else — left high, the node advertises the range it just
                 // deleted and answers empty batches for it.
                 crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(height, std::sync::atomic::Ordering::SeqCst);
-                // Markers above the restored tip would deafen this node in exactly the windows
-                // it must re-drive — retract them with the tail they were certifying.
+                // Finality above the restored tip would make the apply dedup skip the tail it
+                // must re-apply.
                 crate::node::retract_finality_to(height);
-                println!("[WARN][SYNC] regress_tail_pruned from={} to={} anchor_mb={}", cur, height, anchor_mb);
+                println!("[WARN][SYNC] regress_tail_kept from={} top={} to={} anchor_mb={} dropped_from={}",
+                         cur, top, height, anchor_mb, dropped_from.map(|d| d.to_string()).unwrap_or_else(|| "none".to_string()));
             }
         }
         // Commit height + finality/WS floors + durable anchor (adopt_snapshot_finality persists it).

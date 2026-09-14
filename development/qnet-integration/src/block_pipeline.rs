@@ -95,7 +95,12 @@ const APPLY_MISMATCH_BREAKER: u64 = 3;
 /// certify, and a member that cannot trust its own derivation must not count toward n−f.
 static STATE_SUSPECT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 pub fn state_suspect() -> bool { STATE_SUSPECT.load(Ordering::Acquire) }
-pub fn mark_state_suspect() { STATE_SUSPECT.store(true, Ordering::Release); }
+pub fn mark_state_suspect() {
+    if STATE_SUSPECT.load(Ordering::Acquire) { return; }
+    // The episode's time before the latch that names it: an arm that sees the latch sees its time.
+    crate::sync_manager::note_suspect_latched();
+    STATE_SUSPECT.store(true, Ordering::Release);
+}
 pub fn clear_state_suspect() { STATE_SUSPECT.store(false, Ordering::Release); }
 
 /// Record an apply failure; returns true once it trips the breaker.
@@ -202,7 +207,7 @@ fn sweep_deferred_now(
         .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let chain_h = storage.get_chain_height().unwrap_or(0);
     let out = sweep_parked(deferred, by_producer, count, bytes, now_secs, chain_h,
-                           |h| storage.canonical_hash_at(h));
+                           |h| storage.committed_hash_at(h));
     let removed = out.expired + out.dead + out.stale;
     if removed > 0 {
         // Evictions leave the in-flight estimate, or they count as "ingested, never finished"
@@ -457,19 +462,101 @@ fn equal_round_selffork_supersedes(storage: &Storage, incoming: &qnet_state::Mic
 /// bounds re-triggers; the resync re-verifies every block. One bounded decode, only
 /// for stored heights above finality.
 /// The body hashes the n−f-QC'd macroblock `window_k` names, when it is stored (stored ⇒ verified).
+/// A row whose list does not cover the window (the empty placeholder a stalled fleet once wrote)
+/// is not a certificate.
 pub fn certified_window_hashes(storage: &Storage, window_k: u64) -> Option<Vec<[u8; 32]>> {
     storage.get_macroblock_by_height(window_k).ok().flatten()
         .and_then(crate::node::BlockchainNode::macroblock_plaintext)
         .and_then(|b| bincode::deserialize::<qnet_state::MacroBlock>(&b).ok())
         .map(|mb| mb.micro_blocks)
+        .filter(|v| v.len() as u64 == qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL)
 }
 
-/// The body hash the certified window names at h.
+/// The body hash the certified window names at h: the sealed macroblock when there is one, else the
+/// WAL certified pair of the 30-block checkpoint covering h (the same QC-signed `window_mb_hashes`
+/// two windows earlier than a seal), so fork-choice has certified content at the checkpoint cadence
+/// and not only at the macro boundary.
 pub fn certified_micro_hash(storage: &Storage, h: u64) -> Option<[u8; 32]> {
     if h == 0 { return None; }
     let window_k = (h - 1) / 90 + 1;
     let start = (window_k - 1) * 90 + 1;
-    certified_window_hashes(storage, window_k).and_then(|v| v.get((h - start) as usize).copied())
+    if let Some(v) = certified_window_hashes(storage, window_k) {
+        return v.get((h - start) as usize).copied();
+    }
+    certified_pair_hash(storage, h)
+}
+
+/// The body holding slot `h` against `incoming`: the committed row, or a row above the durable tip
+/// that a certificate names (a kept certified tail). Any other row above the tip is replaced by the
+/// save. The certificate is read only when a different row sits above the tip.
+pub(crate) fn slot_holder(storage: &Storage, h: u64, incoming: &[u8; 32]) -> Option<[u8; 32]> {
+    storage.committed_hash_at(h).or_else(|| storage.canonical_hash_at(h)
+        .filter(|r| r != incoming && certified_micro_hash(storage, h) == Some(*r)))
+}
+
+/// (head, window body hashes) per committed checkpoint, newest first.
+pub type WindowLists = Vec<(u64, Vec<[u8; 32]>)>;
+
+/// Body lists of the committed checkpoints above the last seal, walked and published by the consensus
+/// loop at each commit (on the blocking pool): fork-choice only looks them up. Keyed by the store,
+/// so two stores in one process never share an answer. The committed checkpoint's hash and the seal
+/// floor the walk honoured let the next walk stop where this one began, while the floor holds.
+static COMMITTED_WINDOW_LISTS: once_cell::sync::Lazy<parking_lot::RwLock<(usize, u64, [u8; 32], u64, WindowLists)>> =
+    once_cell::sync::Lazy::new(|| parking_lot::RwLock::new((0, 0, [0u8; 32], 0, Vec::new())));
+
+/// The committed index the published lists were walked from, for this store; 0 = none.
+pub fn committed_lists_index(storage: &Storage) -> u64 {
+    let l = COMMITTED_WINDOW_LISTS.read();
+    if l.0 == storage as *const Storage as usize { l.1 } else { 0 }
+}
+
+/// (committed index, its checkpoint hash, the floor it was walked with, lists) as published here.
+pub fn committed_lists_snapshot(storage: &Storage) -> Option<(u64, [u8; 32], u64, WindowLists)> {
+    let l = COMMITTED_WINDOW_LISTS.read();
+    if l.0 == storage as *const Storage as usize && l.1 > 0 { Some((l.1, l.2, l.3, l.4.clone())) } else { None }
+}
+
+/// The highest head the published lists name for this store; 0 = none.
+pub fn committed_lists_top(storage: &Storage) -> u64 {
+    let l = COMMITTED_WINDOW_LISTS.read();
+    if l.0 != storage as *const Storage as usize { return 0; }
+    l.4.iter().map(|(hd, _)| *hd).max().unwrap_or(0)
+}
+
+/// Publish the lists walked from committed index `committed` (checkpoint `hash`, seal floor `floor`);
+/// an older index never replaces a newer.
+pub fn publish_committed_window_lists(storage: &Storage, committed: u64, hash: [u8; 32], floor: u64, lists: WindowLists) {
+    let sid = storage as *const Storage as usize;
+    let mut l = COMMITTED_WINDOW_LISTS.write();
+    if l.0 == sid && l.1 >= committed { return; }
+    *l = (sid, committed, hash, floor, lists);
+}
+
+/// The body hash the committed checkpoint covering `h` names, from the published lists. None when
+/// nothing committed covers it here.
+pub fn certified_pair_hash(storage: &Storage, h: u64) -> Option<[u8; 32]> {
+    if h == 0 { return None; }
+    let k = qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL;
+    let head = ((h - 1) / k + 1) * k;
+    let l = COMMITTED_WINDOW_LISTS.read();
+    if l.0 != storage as *const Storage as usize { return None; }
+    let (hd, v) = l.4.iter().find(|(hd, _)| *hd == head)?;
+    let start = hd.saturating_sub(v.len() as u64) + 1;
+    if h < start { return None; }
+    v.get((h - start) as usize).copied()
+}
+
+/// Dropped with the WAL pairs a retraction of this store removes; the consensus loop publishes afresh.
+pub fn invalidate_committed_window_lists(storage: &Storage) {
+    let mut l = COMMITTED_WINDOW_LISTS.write();
+    if l.0 == storage as *const Storage as usize { *l = (0, 0, [0u8; 32], 0, Vec::new()); }
+}
+
+/// A stored row counts as held only at or below the applied tip. Above it a row is not chain state
+/// (a rollback or a stopped replay left it): its height stays deliverable and names no fork point.
+pub(crate) fn held_at_or_below_tip(storage: &Storage, h: u64) -> bool {
+    h <= crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(Ordering::Acquire)
+        && storage.load_microblock(h).map(|o| o.is_some()).unwrap_or(false)
 }
 
 fn maybe_supersede_by_certified_round(storage: &Arc<Storage>, block: &IngestBlock, p2p: Option<&SimplifiedP2P>) {
@@ -477,6 +564,8 @@ fn maybe_supersede_by_certified_round(storage: &Arc<Storage>, block: &IngestBloc
     if h == 0 { return; }
     let finalized = crate::node::LAST_FINALIZED_HEIGHT.load(Ordering::SeqCst);
     if h <= finalized { return; } // never reorg finalized history
+    // A row above the applied tip is not chain state: the apply stage installs this height.
+    if h > crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(Ordering::Acquire) { return; }
 
     // Ok(None) is genuinely absent - the ordinary ingest path installs it. Err is different: we
     // HOLD bytes we cannot read, so every presence check says "have it" and nothing ever replaces
@@ -1290,6 +1379,9 @@ pub struct PipelineMetrics {
     pub applied: AtomicU64,
     pub apply_failed: AtomicU64,
     pub duplicates_skipped: AtomicU64,
+    /// A second copy of a block already waiting in the apply stage's held window: finished for the
+    /// in-flight estimate, but not apply progress for the watchdog.
+    pub held_duplicates: AtomicU64,
     /// v15.3: Blocks ARRIVED via gossip but their height is far beyond the
     /// node's current chain tip (`apply_tip + GOSSIP_HORIZON`). They are
     /// NOT failures — sync will fetch the corresponding range when the
@@ -1399,14 +1491,19 @@ const APPLY_HELD_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(2
 
 type Held<T> = std::collections::BTreeMap<u64, (T, std::time::Instant)>;
 
-/// Park `block` (height `h`, `size` bytes) until the frontier reaches its parent. False when the
-/// window is full, in which case the caller drops it exactly as before.
-fn hold_ahead<T>(held: &mut Held<T>, bytes: &mut usize, h: u64, size: usize, block: T, now: std::time::Instant) -> bool {
-    if held.contains_key(&h) { return true; } // the same height is already waiting
-    if held.len() >= APPLY_HELD_MAX || bytes.saturating_add(size) > APPLY_HELD_MAX_BYTES { return false; }
+/// What `hold_ahead` did with a block.
+#[derive(Debug, PartialEq)]
+enum Hold { Parked, Duplicate, Full }
+
+/// Park `block` (height `h`, `size` bytes) until the frontier reaches its parent. A second copy of
+/// a waiting height is a duplicate; past a bound the window is full and the caller drops the block
+/// exactly as before.
+fn hold_ahead<T>(held: &mut Held<T>, bytes: &mut usize, h: u64, size: usize, block: T, now: std::time::Instant) -> Hold {
+    if held.contains_key(&h) { return Hold::Duplicate; }
+    if held.len() >= APPLY_HELD_MAX || bytes.saturating_add(size) > APPLY_HELD_MAX_BYTES { return Hold::Full; }
     held.insert(h, (block, now));
     *bytes = bytes.saturating_add(size);
-    true
+    Hold::Parked
 }
 
 /// The lowest held block the frontier at `tip` can now execute (height <= tip + 1), if any.
@@ -1439,8 +1536,9 @@ mod apply_reorder_tests {
         let now = Instant::now();
         let mut held: Held<u64> = Held::new();
         let mut bytes = 0usize;
-        assert!(hold_ahead(&mut held, &mut bytes, 102, 10, 102, now));
-        assert!(hold_ahead(&mut held, &mut bytes, 101, 10, 101, now));
+        assert_eq!(hold_ahead(&mut held, &mut bytes, 102, 10, 102, now), Hold::Parked);
+        assert_eq!(hold_ahead(&mut held, &mut bytes, 101, 10, 101, now), Hold::Parked);
+        assert_eq!(hold_ahead(&mut held, &mut bytes, 101, 10, 101, now), Hold::Duplicate, "a second copy is counted, not parked");
         assert_eq!(bytes, 20);
         assert_eq!(take_ready_held(&mut held, &mut bytes, 99, now, |_| 10).0, None, "frontier at 99 runs nothing");
         assert_eq!(take_ready_held(&mut held, &mut bytes, 100, now, |_| 10).0, Some(101));
@@ -1455,14 +1553,14 @@ mod apply_reorder_tests {
         let now = Instant::now();
         let mut held: Held<u64> = Held::new();
         let mut bytes = 0usize;
-        for h in 0..APPLY_HELD_MAX as u64 { assert!(hold_ahead(&mut held, &mut bytes, 1000 + h, 1, h, now)); }
-        assert!(!hold_ahead(&mut held, &mut bytes, 5000, 1, 5000, now), "count bound");
+        for h in 0..APPLY_HELD_MAX as u64 { assert_eq!(hold_ahead(&mut held, &mut bytes, 1000 + h, 1, h, now), Hold::Parked); }
+        assert_eq!(hold_ahead(&mut held, &mut bytes, 5000, 1, 5000, now), Hold::Full, "count bound");
         let mut big: Held<u64> = Held::new();
         let mut big_bytes = 0usize;
-        assert!(!hold_ahead(&mut big, &mut big_bytes, 10, APPLY_HELD_MAX_BYTES + 1, 10, now), "byte bound");
+        assert_eq!(hold_ahead(&mut big, &mut big_bytes, 10, APPLY_HELD_MAX_BYTES + 1, 10, now), Hold::Full, "byte bound");
         let mut old: Held<u64> = Held::new();
         let mut old_bytes = 0usize;
-        assert!(hold_ahead(&mut old, &mut old_bytes, 7, 5, 7, now));
+        assert_eq!(hold_ahead(&mut old, &mut old_bytes, 7, 5, 7, now), Hold::Parked);
         let later = now + APPLY_HELD_MAX_AGE + Duration::from_secs(1);
         let (got, expired) = take_ready_held(&mut old, &mut old_bytes, 6, later, |_| 5);
         assert_eq!((got, expired), (None, 1), "an aged entry is dropped, never executed");
@@ -1499,6 +1597,7 @@ impl PipelineMetrics {
             applied: AtomicU64::new(0),
             apply_failed: AtomicU64::new(0),
             duplicates_skipped: AtomicU64::new(0),
+            held_duplicates: AtomicU64::new(0),
             future_dropped: AtomicU64::new(0),
             deferred_evicted: AtomicU64::new(0),
             verify_current_h: AtomicU64::new(0),
@@ -1628,7 +1727,6 @@ pub struct ApplyContext {
     pub storage: Arc<Storage>,
     pub state: Arc<RwLock<crate::StateManager>>,
     pub coordinator: CoordinatorHandle,
-    pub height: Arc<RwLock<u64>>,
     pub unified_p2p: Option<Arc<SimplifiedP2P>>,
     pub block_event_tx: tokio::sync::broadcast::Sender<u64>,
     pub node_id: String,
@@ -1715,6 +1813,7 @@ impl PipelineIngest {
             .saturating_add(self.metrics.verify_failed.load(Ordering::Relaxed))
             .saturating_add(self.metrics.apply_failed.load(Ordering::Relaxed))
             .saturating_add(self.metrics.duplicates_skipped.load(Ordering::Relaxed))
+            .saturating_add(self.metrics.held_duplicates.load(Ordering::Relaxed))
             .saturating_add(self.metrics.future_dropped.load(Ordering::Relaxed))
             .saturating_add(self.metrics.deferred_evicted.load(Ordering::Relaxed));
 
@@ -2222,11 +2321,7 @@ impl BlockPipeline {
             // The frontier clause: apply already guards itself with `height > applied_tip` because the
             // store can hold bodies above the tip after a rollback. This reader did not, so one orphan
             // row made its height undeliverable forever — verify dropped every copy as a duplicate.
-            if block.height <= crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Acquire)
-                && storage.load_microblock(block.height)
-                    .map(|opt| opt.is_some())
-                    .unwrap_or(false)
-            {
+            if held_at_or_below_tip(&storage, block.height) {
                 maybe_supersede_by_certified_round(&storage, &block, unified_p2p.as_deref());
                 // A height we asked for may be held with expired tx rows: the apply stage decides
                 // (store-only backfill against the canonical hash), never a re-execution.
@@ -2360,7 +2455,7 @@ impl BlockPipeline {
         // (600+ ms later under load) while children release at VERIFY — a child arriving in
         // that window found neither and parked forever. Same task as the release, so reads
         // here are exact, with no lock and no timing.
-        let mut verified_recent: HashMap<[u8; 32], u64> = HashMap::new();
+        let mut verified_recent: HashMap<[u8; 32], (u64, u64)> = HashMap::new(); // hash -> (height, timestamp)
         // A restarted pipeline dropped its buffer; stale holds would mask sync forever.
         DEFERRED_HEIGHTS.clear();
         // Per-producer occupancy, maintained incrementally: counting by scanning the whole buffer
@@ -2406,7 +2501,7 @@ impl BlockPipeline {
             {
                 let (rolling, target) = crate::storage::get_rollback_status();
                 if rolling || target != last_rollback_target {
-                    verified_recent.retain(|_, h| *h <= target);
+                    verified_recent.retain(|_, (h, _)| *h <= target);
                     last_rollback_target = target;
                 }
             }
@@ -2519,7 +2614,21 @@ impl BlockPipeline {
                     continue;
                 }
             }
+            // The parent's timestamp comes with the parent: its header row (written in the body's
+            // batch), the verified-in-flight record, or the adopted anchor's certificate.
+            let mut parent_ts: Option<u64> = None;
             let anchor_h = crate::node::SNAPSHOT_ANCHOR_MB.load(Ordering::Acquire).saturating_mul(90);
+            if anchor_h > 0 && mb.height == anchor_h + 1 {
+                // The anchor body is absent by design; its macroblock carries the head's timestamp.
+                let st = storage.clone();
+                let anchor_mb = anchor_h / 90;
+                parent_ts = tokio::task::spawn_blocking(move || {
+                    st.get_macroblock_by_height(anchor_mb).ok().flatten()
+                        .and_then(crate::node::BlockchainNode::macroblock_plaintext)
+                        .and_then(|b| bincode::deserialize::<qnet_state::MacroBlock>(&b).ok())
+                        .map(|m| m.timestamp)
+                }).await.ok().flatten();
+            }
             if mb.height > 0 && !(anchor_h > 0 && mb.height == anchor_h + 1) {
                 metrics.mark_verify_op(mb.height, PIPELINE_OP_VERIFY_LOAD_PREV);
                 let parent_h = mb.height - 1;
@@ -2527,14 +2636,20 @@ impl BlockPipeline {
                 // The parent must be the block CANONICALLY occupying the preceding slot, read
                 // straight from storage (no cache in front of it, so no stale oracle). Asking only
                 // "do we hold a block with this hash?" would be a tautology — the claimed hash
-                // would answer for itself — and would admit a child of any retained branch.
-                // Ok(Some) = canonical parent hash, Ok(None) = slot empty (defer), Err = disk failure.
+                // would answer for itself — and would admit a child of any retained branch. Only a
+                // committed row is a parent: one above the durable tip is not chain state, and the
+                // child of the canonical block waits for that block instead of reading as a break.
+                // Ok(Some) = committed parent hash, Ok(None) = none yet (defer), Err = disk failure.
                 let load_start = std::time::Instant::now();
                 let storage_for_load = storage.clone();
                 let load_result: Result<Option<[u8; 32]>, ()> = match tokio::task::spawn_blocking(move || {
-                    storage_for_load.canonical_hash_at(parent_h)
+                    storage_for_load.committed_hash_at(parent_h).map(|c| {
+                        let ts = storage_for_load.header_by_hash(&c).map(|hd| hd.timestamp)
+                            .or_else(|| storage_for_load.block_timestamp_at(parent_h).ok().flatten());
+                        (c, ts)
+                    })
                 }).await {
-                    Ok(Some(canonical)) => Ok(Some(canonical)),
+                    Ok(Some((canonical, ts))) => { parent_ts = ts; Ok(Some(canonical)) }
                     Ok(None) => Ok(None),
                     Err(join_err) => {
                         if is_warn() {
@@ -2556,8 +2671,10 @@ impl BlockPipeline {
                         );
                     }
                 }
-                let parent_verified_in_flight =
-                    verified_recent.get(&mb.previous_hash).copied() == Some(mb.height.saturating_sub(1));
+                let in_flight = verified_recent.get(&mb.previous_hash).copied()
+                    .filter(|(h, _)| *h == mb.height.saturating_sub(1));
+                let parent_verified_in_flight = in_flight.is_some();
+                if parent_ts.is_none() { parent_ts = in_flight.map(|(_, ts)| ts); }
                 let our_parent: Option<[u8; 32]> = match &load_result { Ok(Some(h)) => Some(*h), _ => None };
                 let prev_hash_ok = match load_result {
                     Ok(Some(prev_hash)) => mb.previous_hash == prev_hash,
@@ -2570,9 +2687,10 @@ impl BlockPipeline {
                         // and would be invalidated by the move otherwise.
                         let child_h = mb.height;
                         let parent_h = mb.height - 1;
-                        // We are here because the parent SLOT is empty (the read above returned
-                        // None), so this is an ordinary gap: defer and let the drain or repair fill
-                        // it. A child built on a COMPETING parent takes the mismatch path instead
+                        let from_self = decoded.from_peer == "self";
+                        // We are here because no committed parent holds the slot (the read above
+                        // returned None), so this is an ordinary gap: defer and let the drain or repair
+                        // fill it. A child built on a COMPETING parent takes the mismatch path instead
                         // (prev_hash_ok == false below), which is where the fork witness belongs —
                         // re-testing the same empty slot here would be both unreachable and a
                         // blocking storage read on the async reactor, once per deferred block.
@@ -2683,11 +2801,15 @@ impl BlockPipeline {
                         // large gap → batched range request via sync_blocks.
                         let local_tip = tip_now;
                         let gap = child_h.saturating_sub(local_tip);
-                        if gap > RANGE_SYNC_GAP_THRESHOLD {
-                            let from = local_tip.saturating_add(1);
-                            let _ = request_missing_range(from, child_h);
-                        } else {
-                            let _ = request_missing_parent(parent_h);
+                        // A block fed from disk waits for its fed parent (the feed is contiguous) and the
+                        // drain releases it when that parent verifies: no peer is asked for rows on disk.
+                        if !from_self {
+                            if gap > RANGE_SYNC_GAP_THRESHOLD {
+                                let from = local_tip.saturating_add(1);
+                                let _ = request_missing_range(from, child_h);
+                            } else {
+                                let _ = request_missing_parent(parent_h);
+                            }
                         }
 
                         // v18: mark verify stage as IDLE on the deferral path
@@ -2976,19 +3098,24 @@ impl BlockPipeline {
                 }
             }
 
-            // 2. Slot-anchored timestamp validation (LIVE only; SYNC skips — block_ts is
-            // already bound by the block hash + producer Dilithium sig + hash-chain).
-            // block_ts must equal genesis_ts + height*SLOT exactly: deterministic,
-            // clock-independent, non-gameable. The single source of truth on the live path.
+            // 2. Slot timestamp validation. The rule lives in slot_timestamp_valid: the genesis grid
+            // below the gate, the parent grid or a declared gap at/after it, against the parent
+            // timestamp resolved with the parent above. Live, every block. While syncing, below the
+            // gate the grid was enforced live already; at/after it every block whose parent time is
+            // known is checked too, or a far-future stamp accepted while syncing would move every
+            // later slot with it. A certified gap block lies in the past and passes.
             let snap = coordinator.snapshot();
-            if !snap.is_syncing() && mb.height > 0 {
+            let sync_checked = parent_ts.is_some()
+                && qnet_state::feature_gates::is_active(qnet_state::feature_gates::id::SLOT_GAP_REANCHOR, mb.height);
+            if (!snap.is_syncing() || sync_checked) && mb.height > 0 {
                 let g = crate::GLOBAL_GENESIS_TIMESTAMP.load(Ordering::Relaxed);
                 if g != 0 {
-                    let expected = crate::node::expected_block_timestamp(g, mb.height);
-                    if mb.timestamp != expected {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                    if !crate::node::slot_timestamp_valid(g, parent_ts, mb.height, mb.timestamp, Some(now)) {
                         if is_warn() {
-                            println!("[WARN][PIPELINE] slot_mismatch h={} ts={} expected={} from={}",
-                                     mb.height, mb.timestamp, expected, decoded.from_peer);
+                            println!("[WARN][PIPELINE] slot_mismatch h={} ts={} parent_ts={:?} now={} from={}",
+                                     mb.height, mb.timestamp, parent_ts, now, decoded.from_peer);
                         }
                         metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
                         continue;
@@ -3726,7 +3853,7 @@ impl BlockPipeline {
             // Identity of the block just verified — the key its waiting children were parked under.
             let verified_hash = decoded.microblock.hash();
             // Answers "parent verified, apply-commit pending" for the parking guard above.
-            verified_recent.insert(verified_hash, block_height);
+            verified_recent.insert(verified_hash, (block_height, decoded.microblock.timestamp));
 
             // Liveness is NOT recorded here. A signature-verified block only proves the producer
             // signed something — a block that fails apply (bad state_root, unresolvable pk, breaker)
@@ -3799,7 +3926,7 @@ impl BlockPipeline {
             // anything 500 below the tip is long-committed (or long-dead).
             if verified_recent.len() > 1024 {
                 let tip = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(Ordering::Relaxed);
-                verified_recent.retain(|_, h| h.saturating_add(500) > tip);
+                verified_recent.retain(|_, (h, _)| h.saturating_add(500) > tip);
             }
 
             // Time-gated: the sweep is O(parked) with a storage read per entry, and during catch-up
@@ -3960,11 +4087,16 @@ impl BlockPipeline {
                 if height > tip + 1 {
                     metrics.mark_apply_idle();
                     let size = block.decompressed.len();
-                    if hold_ahead(&mut held, &mut held_bytes, height, size, block, std::time::Instant::now()) {
-                        if is_debug() {
-                            println!("[DBG][PIPELINE] apply_held h={} applied_tip={} held={}", height, tip, held.len());
+                    match hold_ahead(&mut held, &mut held_bytes, height, size, block, std::time::Instant::now()) {
+                        Hold::Parked => {
+                            if is_debug() {
+                                println!("[DBG][PIPELINE] apply_held h={} applied_tip={} held={}", height, tip, held.len());
+                            }
+                            continue;
                         }
-                        continue;
+                        // Finished for the in-flight estimate (or it drifts up for good), not apply progress.
+                        Hold::Duplicate => { metrics.held_duplicates.fetch_add(1, Ordering::Relaxed); continue; }
+                        Hold::Full => {}
                     }
                     static OOO_LAST_TIP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
                     metrics.future_dropped.fetch_add(1, Ordering::Relaxed);
@@ -4153,8 +4285,10 @@ impl BlockPipeline {
 
                 // Slot check BEFORE apply: a sibling that cannot win the slot should not pay for a
                 // full apply. It can no longer corrupt anything either — apply is side-effect-free
-                // w.r.t. durable indices — so this is a cost guard, not a correctness one.
-                if ctx.storage.canonical_hash_at(height).map(|h| h != block.microblock.hash()).unwrap_or(false) {
+                // w.r.t. durable indices — so this is a cost guard, not a correctness one. A committed
+                // row holds the slot, and so does a certified row above the durable tip; any other row
+                // there is replaced by this save.
+                if slot_holder(&ctx.storage, height, &block.microblock.hash()).map_or(false, |h| h != block.microblock.hash()) {
                     if is_warn() {
                         println!("[WARN][PIPELINE] slot_taken_before_apply h={} from={} action=skip",
                                  height, block.from_peer);
@@ -4192,6 +4326,22 @@ impl BlockPipeline {
                 // A claim referenced an epoch whose certifying macroblock is absent here. This node
                 // cannot decide the credit, so it must not commit the block — crediting or skipping
                 // would diverge state_root from nodes that hold it. Roll back and fetch.
+                // A stale read explains a root the block does not reproduce; a matching root proves the
+                // block whatever the apply could not read.
+                if apply_result.mirror_stale && !(has_state_root && apply_result.merkle_root == block.microblock.state_root) {
+                    if let Some(ref snapshot) = block_snapshot {
+                        state_guard.rollback_block(snapshot);
+                    }
+                    drop(state_guard);
+                    println!("[ERR][PIPELINE] mirror_stale h={} action=refuse_block_suspect", height);
+                    crate::block_pipeline::mark_state_suspect();
+                    crate::sync_manager::nudge_sync_check();
+                    metrics.apply_failed.fetch_add(1, Ordering::Relaxed);
+                    crate::unified_p2p::clear_block_pending_sync(height);
+                    metrics.mark_apply_idle();
+                    continue;
+                }
+
                 if let Some(certifying_mb) = apply_result.reward_epoch_missing {
                     if let Some(ref snapshot) = block_snapshot {
                         state_guard.rollback_block(snapshot);
@@ -4223,7 +4373,7 @@ impl BlockPipeline {
                              hex::encode(&block.microblock.state_root[..8]),
                              hex::encode(&computed_state_root[..8]));
 
-                    // Rollback to pre-block state
+                    // Rollback to pre-block state. A refused block wrote nothing durable: RAM and the tree are all it undoes.
                     if let Some(ref snapshot) = block_snapshot {
                         state_guard.rollback_block(snapshot);
                         if is_info() { println!("[INFO][PIPELINE] block_rollback h={}", height); }
@@ -4264,8 +4414,8 @@ impl BlockPipeline {
                 // canonical-tip argument and quiesced applies, so they cannot run here. Preventing
                 // the write is the only sound option. The dedup above compares against the APPLIED
                 // tip, which this node's own producer path advances only after its save; this reads
-                // the canonical slot itself and so also covers that window.
-                if ctx.storage.canonical_hash_at(height).map(|h| h != block.microblock.hash()).unwrap_or(false) {
+                // the slot holder (body and durable height share a batch) and so covers that window.
+                if slot_holder(&ctx.storage, height, &block.microblock.hash()).map_or(false, |h| h != block.microblock.hash()) {
                     if is_warn() {
                         // Nothing to clean: this block collected its indices but never flushed them.
                         println!("[WARN][PIPELINE] slot_taken_before_materialise h={} from={} action=skip",
@@ -4353,12 +4503,10 @@ impl BlockPipeline {
                         let _ = ctx.storage.committed_burn_wallet_put(burn_tx, node_id);
                     }
                     // The resident light registry follows the same apply-Ok set. registered_at is the
-                    // slot-anchored block time, so every node stores the same value.
+                    // block's own timestamp, so every node stores the same value across a slot gap.
                     if type_str == "light" {
                         if let Some(ref p2p) = ctx.unified_p2p {
-                            let ts = crate::node::expected_block_timestamp(
-                                crate::node::genesis_timestamp(&ctx.storage), height);
-                            p2p.admit_light_from_chain(node_id, wallet, ts);
+                            p2p.admit_light_from_chain(node_id, wallet, block.microblock.timestamp);
                         }
                     }
                 }
@@ -4612,8 +4760,6 @@ impl BlockPipeline {
                             // nothing to reconcile them (genesis 001, 08.09: 20 min wedged one block short).
                             Ok(_) => {
                                 crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.fetch_max(height, std::sync::atomic::Ordering::AcqRel);
-                                let mut h = ctx.height.write().await;
-                                if height > *h { *h = height; }
                             }
                             Err(e) => { if is_warn() { println!("[WARN][PIPELINE] set_height_failed h={} err={}", height, e); } }
                         }
@@ -5458,19 +5604,18 @@ mod tests_rollback_cache_invalidation {
                 "height-keyed hash cache reintroduced — parent resolution must stay content-addressed");
     }
 
-    /// Both mirrors of the applied tip publish at the durable point. Raised at the end of deferred-fx,
-    /// two awaits later, a task that stopped short left disk at h and the operating height at h-1.
+    /// The applied tip is ONE value, published at the durable point. There used to be a second
+    /// mirror (a RwLock the producer loop and get_height read) raised here as well; it followed
+    /// raises only, and after a regress the state-machine scan took max(storage, mirror) and hunted
+    /// deleted bodies (004, 14.09). The mirror is gone: nothing in the pipeline writes a height lock.
     #[test]
-    fn both_mirrors_of_the_applied_tip_publish_at_the_durable_point() {
+    fn the_applied_tip_publishes_once_at_the_durable_point() {
         // Needles built at runtime so this assertion cannot match itself.
         let frontier = format!("LOCAL_BLOCKCHAIN_HEIGHT.{}(height", "fetch_max");
-        let operating = format!("let mut h = ctx.{}.write().await;", "height");
+        let mirror = format!(".{}.write().await", "height");
         let src = include_str!("block_pipeline.rs");
-        let publish = src.find(&frontier).expect("apply publishes the frontier");
-        let ram = src.find(&operating).expect("apply publishes the operating height");
-        assert!(ram > publish && ram - publish < 400,
-                "the operating height must be published with the frontier, not at the end of deferred-fx");
-        assert_eq!(src.matches(operating.as_str()).count(), 1, "one publication point, not two");
+        assert!(src.contains(&frontier), "apply publishes the applied tip");
+        assert!(!src.contains(&mirror), "no second height mirror is written in the pipeline");
     }
 
     /// A node whose verify stage re-enters one height forever is FORKED, not behind: the block
