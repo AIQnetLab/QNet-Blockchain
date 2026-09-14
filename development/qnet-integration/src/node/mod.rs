@@ -6582,6 +6582,19 @@ mod tests {
         assert!(verified < trueup3 && trueup3 < replay3, "boot: restore, true-up, then replay");
     }
 
+    // The node->wallet lookup answers from the registry row and nothing else. A chain walk behind a
+    // miss ran from the tip to genesis on a runtime worker per status poll of an unregistered id and
+    // froze whole genesis nodes for 6-25 s at a time (14.09, gdb-proven).
+    #[test]
+    fn the_registration_lookup_never_walks_the_chain() {
+        let src = include_str!("registration.rs");
+        let start = src.find("pub async fn find_node_registration_full").expect("lookup fn");
+        let end = src[start..].find("\n    pub async fn ").map(|i| start + i).unwrap_or(src.len());
+        let body = &src[start..end];
+        assert!(!body.contains("load_microblock"), "the lookup must not load blocks");
+        assert!(!body.contains(".rev()"), "the lookup must not iterate heights");
+    }
+
     // The settle-point index gets ONE block per epoch and no retry, so a node catching up across that
     // block never obtains it — and then cannot rebuild the epoch's shards, which truncates the claimable
     // figure it reports for every wallet. Pin that the miss is recovered while the epoch is still

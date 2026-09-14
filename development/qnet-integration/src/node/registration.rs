@@ -219,13 +219,10 @@ impl BlockchainNode {
     
     /// Find full node registration including api_endpoint
     /// Returns (node_type, wallet_address, api_endpoint) if found
-    /// v3.35: 3-LEVEL LOOKUP for O(1) performance:
-    ///   Level 1: DashMap in-memory cache (fastest, ~1ns)
-    ///   Level 2: RocksDB persistent cache (~10μs)
-    ///   Level 3: Blockchain scan (slow, O(N) — only on cold start/miss)
+    /// Two levels: the in-memory map, then the durable registry row. A miss IS "not registered":
+    /// the row is written by every apply (validator and producer alike) and rebuilt at boot, so
+    /// there is nothing a chain walk could find that the row does not say.
     pub async fn find_node_registration_full(&self, node_id: &str) -> Option<(qnet_state::NodeType, String, String)> {
-        use qnet_state::TransactionType;
-        
         // LEVEL 1: In-memory DashMap — O(1), ~1ns
         if let Some(entry) = self.node_registration_cache.get(node_id) {
             let (nt, wallet, endpoint) = entry.value().clone();
@@ -251,39 +248,10 @@ impl BlockchainNode {
             return Some((node_type, wallet, String::new()));
         }
         
-        // LEVEL 3: Full blockchain scan — O(N), SLOW (only on cache miss after restart)
-        let current_height = self.get_height().await;
-        
-        for height in (0..=current_height).rev() {
-            if let Ok(Some(block)) = self.storage.load_microblock_auto_format(height) {
-                for tx in &block.transactions {
-                    if let TransactionType::NodeRegistration { 
-                        node_id: reg_node_id, 
-                        node_type, 
-                        wallet_address,
-                        api_endpoint,
-                        .. 
-                    } = &tx.tx_type {
-                        if reg_node_id == node_id {
-                            // Populate BOTH caches for future O(1) lookups
-                            self.node_registration_cache.insert(
-                                node_id.to_string(),
-                                (node_type.clone(), wallet_address.clone(), api_endpoint.clone())
-                            );
-                            self.cache_node_registration(node_id, node_type.clone(), wallet_address.clone()).await;
-                            if is_debug() { 
-                                println!("[DBG][REG] found_onchain node={} wallet={}... endpoint={} h={}", 
-                                         node_id, qnet_state::char_prefix(&wallet_address, 16),
-                                         if api_endpoint.is_empty() { "hidden" } else { api_endpoint },
-                                         height); 
-                            }
-                            return Some((node_type.clone(), wallet_address.clone(), api_endpoint.clone()));
-                        }
-                    }
-                }
-            }
-        }
-        
+        // No third level. The chain walk that used to stand here went from the tip to genesis on a
+        // runtime worker for every status poll of an unregistered node id - the fleet-wide runtime
+        // freezes of 09.09 and 14.09 (gdb: the block loader under get_node_wallet on three tokio
+        // workers at once).
         None
     }
     
@@ -484,17 +452,6 @@ impl BlockchainNode {
         }
     }
 
-    /// Cache node registration for fast lookups
-    pub(super) async fn cache_node_registration(&self, node_id: &str, node_type: qnet_state::NodeType, wallet: String) {
-        // Use storage for persistence
-        // v3.18: Super node type removed
-        let type_str = match node_type {
-            qnet_state::NodeType::Light => "light",
-            qnet_state::NodeType::Super => "super",
-        };
-        let _ = self.storage.save_node_registration(node_id, type_str, &wallet, 1.0);
-    }
-    
     #[allow(dead_code)]
     pub(super) async fn get_cached_node_registration(&self, node_id: &str) -> Option<(qnet_state::NodeType, String)> {
         match self.storage.load_node_registration(node_id) {
