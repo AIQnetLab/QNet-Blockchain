@@ -2,6 +2,10 @@
 
 use super::*;
 
+/// Anchors this process already dropped as poisoned (see verify_v2_macroblock): one attempt each.
+static POISONED_ANCHORS_DROPPED: once_cell::sync::Lazy<dashmap::DashMap<u64, ()>> =
+    once_cell::sync::Lazy::new(dashmap::DashMap::new);
+
 impl BlockchainNode {
     /// Start sync process after node restart or new node join
     pub async fn start_sync_if_needed(&self) -> Result<(), QNetError> {
@@ -567,7 +571,17 @@ impl BlockchainNode {
             Some(c) if !c.is_empty() => c,
             _ if index < 3 => crate::genesis_constants::GENESIS_CONSENSUS_PKS
                 .iter().map(|(id, _)| id.to_string()).collect(),
-            _ => return Err(format!("v2_qc_no_committee mb={}", index)),
+            _ => {
+                // The anchor is held (the defer above passed) yet yields no committee: it is this
+                // node's own bad seal, not the certified object. Dropping it makes the sync re-fetch
+                // the certified copy; keeping it rejects every later macroblock and desyncs the node
+                // for good. Once per anchor per process: a copy that comes back unusable is a fault
+                // to report, not to re-fetch forever.
+                if let Some(n2) = Self::drop_poisoned_anchor_once(storage, index) {
+                    return Err(format!("v2_qc_defer_anchor mb={} need_mb_n2={} why=anchor_poisoned", index, n2));
+                }
+                return Err(format!("v2_qc_no_committee mb={}", index));
+            }
         };
         let _ = (p2p, node_id, node_type);
         let quorum = match cp.recovery_anchor {
@@ -635,10 +649,27 @@ impl BlockchainNode {
                 else if !check(v, &qc.checkpoint_hash, s) { Some(format!("{}:bad_sig", v)) }
                 else { None }
             }).unwrap_or_default();
+            // A certificate the derived committee refuses may be refused against a committee this
+            // node derived from its own bad anchor; only a provably poisoned anchor is dropped.
+            if let Some(n2) = Self::drop_poisoned_anchor_once(storage, index) {
+                return Err(format!("v2_qc_defer_anchor mb={} need_mb_n2={} why=anchor_poisoned", index, n2));
+            }
             return Err(format!("v2_qc_invalid mb={} why={} signers={} committee={} quorum={} first_bad={}",
                                index, why, qc.signers.len(), committee.len(), quorum, bad));
         }
         Ok(())
+    }
+
+    /// Drop the N-2 anchor of `index` if it is this node's own bad seal, once per anchor per
+    /// process. Some(n2) = dropped, the caller defers and the range sync re-fetches the certified
+    /// copy; a copy that comes back poisoned is a fault to report, not to re-fetch forever.
+    fn drop_poisoned_anchor_once(storage: &Storage, index: u64) -> Option<u64> {
+        let n2 = Self::v2_committee_anchor_index(index)?;
+        if POISONED_ANCHORS_DROPPED.contains_key(&n2) { return None; }
+        if !storage.drop_poisoned_macroblock(n2) { return None; }
+        POISONED_ANCHORS_DROPPED.insert(n2, ());
+        println!("[WARN][MB] anchor_dropped_poisoned mb={} for_mb={} action=refetch", n2, index);
+        Some(n2)
     }
 
     /// Content-verify heights [start..=end] against the QC-certified per-height hash list
@@ -803,10 +834,17 @@ impl BlockchainNode {
         // v3.00: Check if macroblock already saved (e.g., by BFT participant during consensus)
         // CRITICAL: Do NOT return early — emission rewards still need processing!
         // process_macroblock_heartbeats_deterministic has built-in dedup via processed_set
-        let already_saved = self.storage.get_macroblock_by_height(index)
+        let mut already_saved = self.storage.get_macroblock_by_height(index)
             .map(|mb| mb.is_some())
             .unwrap_or(false);
-        
+        // A stored copy that disagrees with its own certificate is this node's bad seal, and the
+        // verified object arriving now is what replaces it. First-write-wins kept the bad one: 001
+        // sealed 10184 without a producer set and skipped the fleet's copy 10 ms later.
+        if already_saved && self.storage.drop_poisoned_macroblock(index) {
+            println!("[WARN][MB-SYNC] poisoned_local_copy_replaced mb={}", index);
+            already_saved = false;
+        }
+
         if already_saved {
             // BFT participants save macroblock during consensus, broadcast arrives later
             // Skip save + validation, but continue to emission reward processing below

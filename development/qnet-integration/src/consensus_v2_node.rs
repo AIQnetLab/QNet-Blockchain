@@ -713,7 +713,7 @@ pub async fn execute(effects: Vec<Effect>, node_id: &str, p2p: &Arc<SimplifiedP2
                 // bincode. Lets the next epoch's reputation fold derive bans in O(window)
                 // instead of re-scanning from genesis (pruning-safe, scales to 100k). Pure
                 // function of the committed chain ⇒ every sealer produces the same bytes.
-                let banned_validators = {
+                let banned_ids: Vec<String> = {
                     // Underivable ⇒ abort the persist. Every sealer assembles this macroblock body
                     // locally, so a guessed set here means two nodes store DIFFERENT bytes under the
                     // same macroblock key — and that object is the roster/beacon source for the next
@@ -730,8 +730,25 @@ pub async fn execute(effects: Vec<Effect>, node_id: &str, p2p: &Arc<SimplifiedP2
                     };
                     let mut v: Vec<String> = set.into_iter().collect();
                     v.sort();
-                    Some(bincode::serialize(&v).unwrap_or_default())
+                    v
                 };
+                // The seal inputs were kept by ROUND, and this certificate may have come by catch-up:
+                // a node behind on windows holds, under that round, the inputs of an OLDER window - an
+                // intra one carries no producer set at all. The certificate signed the proposer's
+                // inputs; sealing anything else stores a roster no peer certified, and a snapshot-less
+                // object is the anchor no committee derives from two windows on (001 at 10184, 004 at
+                // 10403: v2_qc_no_committee for good). Same check the receive side and the WAL reseal
+                // apply; refused, the window arrives from a peer through sync.
+                if qnet_consensus::checkpoint_bft::epoch_commitment(&eligible_producers, &committee, &banned_ids)
+                    != checkpoint.epoch_commitment
+                {
+                    if crate::node::is_warn() {
+                        println!("[WARN][BFT2] persist_refused reason=epoch_commitment_mismatch window={} round={} eligible_bytes={}",
+                                 window, qc.index, eligible_producers.len());
+                    }
+                    continue;
+                }
+                let banned_validators = Some(bincode::serialize(&banned_ids).unwrap_or_default());
                 let mb = qnet_state::MacroBlock {
                     height: window,
                     timestamp: checkpoint.timestamp,

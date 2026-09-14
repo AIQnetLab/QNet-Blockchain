@@ -1997,6 +1997,15 @@ impl BlockchainNode {
                     std::process::exit(1);
                 }
             }
+            // A stored macroblock that disagrees with its own certificate is this node's bad seal
+            // (sealed from local inputs the certificate never signed). It is the committee anchor
+            // two windows on, so left in place it makes this node reject the certified chain and
+            // split the committee's view of itself. Dropped copies come back from peers, verified.
+            let poisoned = blockchain.storage.drop_poisoned_macroblocks_recent(256);
+            if poisoned > 0 {
+                println!("[WARN][NODE] poisoned_macroblocks_dropped_at_boot n={} sealed_mb={}",
+                         poisoned, blockchain.storage.last_sealed_mb_index());
+            }
             // The commitment-dedup maps are derived from block history, and a snapshot restore
             // rebuilds the chain view without them: a restarted node would hold dedup entries only
             // for the blocks it replayed, so a duplicate NodeRegistration naming an already-known

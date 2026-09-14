@@ -82,7 +82,11 @@ pub struct ConsensusDriver {
     heads: HashMap<u64, u64>, // round → window_head_height (Finalize + next_window mapping)
     state_roots: HashMap<u64, Hash>, // round → checkpoint state_root (Finalize carries it; verified locally, no macroblock body needed)
     mb_hashes: HashMap<u64, Vec<Hash>>, // round → QC'd per-height body hashes (Finalize content-verifies local bodies against these before advancing — intra checkpoints have no stored macroblock)
-    seal_data: HashMap<u64, (Vec<u8>, Vec<NodeId>)>, // round → (eligible_producers, committee)
+    /// Seal inputs keyed by the epoch_commitment they produce: (round seen, eligible_producers,
+    /// committee). A certificate names its commitment, so a lookup by it can only return inputs
+    /// that ARE the certified ones. Keyed by round, a node a window behind sealed a boundary from
+    /// the inputs of another window and stored a body no peer certified.
+    seal_data: HashMap<Hash, (u64, Vec<u8>, Vec<NodeId>)>,
     sealed: std::collections::HashSet<u64>, // windows the node CONFIRMED durably stored (dedup)
     seal_skipped: Option<u64>,              // last window skipped for want of seal inputs (observability)
     pending_seals: Vec<(u64, Effect)>,      // Persists built on a QC, released by the 2-chain commit
@@ -406,9 +410,10 @@ impl ConsensusDriver {
         // set. `banned` is the deterministic cumulative ban set the macroblock body also stores;
         // binding it here means a corrupted stored banned_validators can never match the QC.
         let epoch_c = epoch_commitment(&eligible_producers, &committee, &banned);
-        // Seal inputs keyed by ROUND (seal_if_ready looks up by qc.index) and buffered on
-        // every member so any can seal the macroblock locally on QC (all-seal).
-        self.seal_data.insert(round, (eligible_producers, committee));
+        // Buffered on every member so any can seal the macroblock locally on QC (all-seal), and
+        // keyed by the commitment: seal_if_ready looks the certificate's commitment up, so a member
+        // whose inputs are not the certified ones finds nothing and fetches the object instead.
+        self.seal_data.insert(epoch_c, (round, eligible_producers, committee));
         // SPAN SELF-TERMINATION, at the position we are about to SIGN — not at the position we armed
         // for. The arm gate ran once, windows earlier; without re-deriving here a span walks past its
         // last legal step and seals a macroblock whose pin no peer can resolve (`v2_rc_unpinned`),
@@ -751,11 +756,12 @@ impl ConsensusDriver {
         if cp.window_head_height % self.macro_interval != 0 { return Vec::new(); }
         let window = cp.window_head_height / self.macro_interval; // dedup by macroblock window
         if self.sealed.contains(&window) { return Vec::new(); } // confirmed durable by the node
-        // Seal inputs absent (round pruned): a default-empty producer set builds a body
-        // byte-different from every other sealer's, and an empty committee makes quorum_size 0.
-        // Fail closed; the node reports it.
-        let (eligible_producers, committee) = match self.seal_data.get(&qc.index) {
-            Some(d) => d.clone(),
+        // Seal inputs are found by the certificate's own commitment: present only when this node
+        // holds exactly what was certified. Absent - pruned, never derived, or derived differently
+        // by a node that was behind when it did - the node does not build a body of its own; it
+        // reports the window and fetches the certified object.
+        let (eligible_producers, committee) = match self.seal_data.get(&cp.epoch_commitment) {
+            Some((_, e, c)) => (e.clone(), c.clone()),
             None => { self.seal_skipped = Some(window); return Vec::new(); }
         };
         // HELD, not emitted: a 1-chain QC is not final. Action::Commit releases it below. A SET,
@@ -859,7 +865,7 @@ impl ConsensusDriver {
         self.heads.retain(|idx, _| keep(*idx));
         self.state_roots.retain(|idx, _| keep(*idx));
         self.mb_hashes.retain(|idx, _| keep(*idx));
-        self.seal_data.retain(|idx, _| keep(*idx));
+        self.seal_data.retain(|_, (round, _, _)| keep(*round));
         // `sealed` is keyed by macroblock window; map the index floor to a window floor. A pruned
         // window that a late relayed QC re-seals is idempotent (storage.save_macroblock skips an
         // existing macroblock), so dropping the dedup entry costs at most one no-op write.
@@ -1160,8 +1166,15 @@ mod tests {
     /// One proposing round under a split: every node still buffers the window (all-seal), and each
     /// node's outbound messages carry its own partition.
     fn split_round(nodes: &mut Vec<Node>, c: &[NodeId], window: u64, part: &[usize]) {
+        split_round_skip(nodes, c, window, part, None)
+    }
+
+    /// Same, with one node that derives NOTHING for the window - a node behind on windows never
+    /// signals the window end and holds no inputs for it.
+    fn split_round_skip(nodes: &mut Vec<Node>, c: &[NodeId], window: u64, part: &[usize], skip: Option<usize>) {
         let mut seed: Vec<(usize, ConsensusMsg)> = Vec::new();
         for k in 0..nodes.len() {
+            if skip == Some(k) { continue; }
             let effs = nodes[k].d.build_proposal(
                 window, vec![[window as u8; 32]], [window as u8; 32], [0u8; 32], window * 1000,
                 c.to_vec(), Vec::new(), Vec::new(), [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], 0);
@@ -1174,8 +1187,13 @@ mod tests {
     /// it after a good round would break the 2-chain: a commit needs two CONSECUTIVE certified
     /// indices, and an idle timeout puts a gap between them.
     fn drive(nodes: &mut Vec<Node>, c: &[NodeId], part: &[usize]) {
+        drive_skip(nodes, c, part, None)
+    }
+
+    /// `drive` with one node that derives nothing for the round's window.
+    fn drive_skip(nodes: &mut Vec<Node>, c: &[NodeId], part: &[usize], skip: Option<usize>) {
         let before = nodes[0].d.next_window();
-        split_round(nodes, c, before, part);
+        split_round_skip(nodes, c, before, part, skip);
         if nodes[0].d.next_window() == before { split_view_change(nodes, c, part); }
         for n in nodes.iter_mut() { wal_snapshot(n); }
     }
@@ -1197,6 +1215,47 @@ mod tests {
             let effs = nodes[to].d.sync(&cp, &qc);
             for e in effs { exec(&mut nodes[to], e); }
         }
+    }
+
+    /// The live shape of 13.09: a node a window behind missed the boundary proposal, adopted the
+    /// certificate by catch-up, and sealed the macroblock from inputs of ANOTHER window - a body
+    /// no peer certified, and the anchor its own committee derivation failed on two windows later.
+    /// A node whose inputs for the window are not the certified ones must seal nothing and fetch;
+    /// a node that holds the certified inputs seals exactly them.
+    #[test]
+    fn a_node_that_missed_the_proposal_seals_nothing_from_inputs_of_its_own() {
+        let (c, mut nodes) = byz_net(4);
+        let alone = vec![0, 0, 0, 1];             // node 3 hears nobody
+        // The quorum certifies boundary windows while node 3 is away. Node 3 meanwhile derives a
+        // window of its own with DIFFERENT epoch data (an intra window carries no producer set at
+        // all) - the inputs it would have sealed from under a round-keyed store.
+        let window = nodes[0].d.next_window();
+        let effs = nodes[3].d.build_proposal(
+            window, vec![[window as u8; 32]], [window as u8; 32], [0u8; 32], window * 1000,
+            c.to_vec(), vec![9u8, 9, 9], Vec::new(), [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], 0);
+        for e in effs { exec(&mut nodes[3], e); }
+        // Behind, node 3 derives none of the windows the quorum certifies.
+        for _ in 0..6 { drive_skip(&mut nodes, &c, &alone, Some(3)); }
+        assert!(nodes[..3].iter().all(|n| !n.sealed.is_empty()), "the quorum seals: {:?}",
+                nodes.iter().map(|n| n.sealed.clone()).collect::<Vec<_>>());
+        assert!(nodes[3].sealed.is_empty());
+        // Catch-up hands node 3 the certificates. It holds inputs for those windows, but not the
+        // certified ones: it must not build a body, and it must say which window it could not seal.
+        for _ in 0..4 { catch_up(&mut nodes, 0, 3); }
+        // The certificate itself reaches it too, as a relayed Qc did on 001 - that is the message
+        // seal_if_ready acts on.
+        if let Some((_, qc)) = nodes[0].d.high_qc_pair() {
+            let effs = nodes[3].d.handle(&ConsensusMsg::Qc(qc));
+            for e in effs { exec(&mut nodes[3], e); }
+        }
+        assert_eq!(nodes[3].d.committed_index(), nodes[0].d.committed_index(), "same commit point");
+        assert!(nodes[3].sealed.is_empty(), "no body from inputs the certificate never signed: {:?}", nodes[3].sealed);
+        assert!(nodes[3].d.take_seal_skipped().is_some(), "and the skipped window is reported for the fetch");
+        // Back in the quorum with the SAME inputs as everyone, it seals again like everyone.
+        let heal = vec![0, 0, 0, 0];
+        for _ in 0..3 { drive(&mut nodes, &c, &heal); }
+        let last = *nodes[0].sealed.last().expect("quorum sealed");
+        assert!(nodes[3].sealed.contains(&last), "with certified inputs it seals the same window: {:?}", nodes[3].sealed);
     }
 
     /// A node that goes silent for several windows must cost the network nothing while it is away,
@@ -1910,7 +1969,7 @@ mod tests {
             d.proposals.insert((i, cp.hash()), cp);
             d.heads.insert(i, i * 90);
             d.state_roots.insert(i, [i as u8; 32]);
-            d.seal_data.insert(i, (Vec::new(), Vec::new()));
+            d.seal_data.insert([i as u8; 32], (i, Vec::new(), Vec::new()));
             d.sealed.insert(i);
         }
         d.eng.committed_index = total;
@@ -1920,7 +1979,7 @@ mod tests {
         assert!(d.heads.keys().all(|k| *k >= floor), "heads pruned below floor");
         assert!(d.proposals.keys().all(|(idx, _)| *idx >= floor), "proposals pruned below floor");
         assert!(d.state_roots.keys().all(|k| *k >= floor), "state_roots pruned below floor");
-        assert!(d.seal_data.keys().all(|k| *k >= floor), "seal_data pruned below floor");
+        assert!(d.seal_data.values().all(|(r, _, _)| *r >= floor), "seal_data pruned below floor");
         assert!(d.sealed.iter().all(|w| *w >= floor), "sealed windows pruned below floor");
         assert!(d.heads.len() <= CONSENSUS_STATE_RETAIN as usize + 1, "bounded, not O(chain length)");
         assert_eq!(d.eng.committed_index, total, "prune never regresses committed_index");
@@ -1940,7 +1999,7 @@ mod tests {
             d.heads.insert(i, 90);
             d.state_roots.insert(i, [1u8; 32]);
             d.mb_hashes.insert(i, vec![[1u8; 32]]);
-            d.seal_data.insert(i, (Vec::new(), Vec::new()));
+            d.seal_data.insert([(i % 251) as u8; 32].map(|b| b ^ ((i >> 8) as u8)), (i, Vec::new(), Vec::new()));
             d.eng.current_index = i + 1;
             d.prune();
         }

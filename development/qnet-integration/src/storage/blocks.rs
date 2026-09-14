@@ -1072,6 +1072,65 @@ impl Storage {
     pub fn get_macroblock_by_height(&self, macroblock_index: u64) -> IntegrationResult<Option<Vec<u8>>> {
         self.persistent.get_macroblock_by_height(macroblock_index)
     }
+
+    /// Whether stored macroblock `idx` is this node's own bad seal: a body that carries no usable
+    /// producer snapshot, or one whose (eligible, committee, banned) does not commit to the
+    /// epoch_commitment inside its OWN certificate. A canonical object can be neither - the proposer
+    /// never publishes an empty set and the receive side checks the commitment - and this object is
+    /// the anchor every committee two windows on is derived from. None = not stored or unreadable.
+    pub fn macroblock_is_poisoned(&self, idx: u64) -> Option<bool> {
+        if idx < 3 { return Some(false); } // genesis era: committee is the genesis list, no snapshot
+        let raw = self.get_macroblock_by_height(idx).ok()??;
+        let mb = crate::node::BlockchainNode::macroblock_plaintext(raw)
+            .and_then(|b| bincode::deserialize::<qnet_state::MacroBlock>(&b).ok())?;
+        let elig = mb.consensus_data.eligible_producers.as_deref().unwrap_or(&[]);
+        let usable = bincode::deserialize::<Vec<qnet_state::EligibleProducer>>(elig).ok()
+            .map_or(false, |e| e.iter().any(|p| !p.node_id.is_empty()));
+        if !usable { return Some(true); }
+        let cmt = mb.consensus_data.consensus_committee.clone().unwrap_or_default();
+        let banned: Vec<String> = mb.consensus_data.banned_validators.as_deref()
+            .and_then(|b| bincode::deserialize::<Vec<String>>(b).ok()).unwrap_or_default();
+        let cp = mb.consensus_data.checkpoint_qc.as_deref()
+            .and_then(|b| bincode::deserialize::<(qnet_consensus::checkpoint_bft::Checkpoint,
+                                                   qnet_consensus::checkpoint_bft::QuorumCertificate)>(b).ok())
+            .map(|(cp, _)| cp);
+        match cp {
+            Some(cp) => Some(qnet_consensus::checkpoint_bft::epoch_commitment(elig, &cmt, &banned) != cp.epoch_commitment),
+            None => Some(false), // no certificate to check against: not provably bad
+        }
+    }
+
+    /// Drop stored macroblock `idx` if it is poisoned (see macroblock_is_poisoned) and bring the seal
+    /// watermark under it, so the range sync asks for the certified copy. Returns whether it dropped.
+    pub fn drop_poisoned_macroblock(&self, idx: u64) -> bool {
+        // At or below the cold-join anchor nothing can be re-fetched: the watermark reader floors
+        // at the anchor and the range sync asks above it. The anchor itself was QC-verified at join.
+        if idx <= self.snapshot_join_anchor_mb() { return false; }
+        if self.macroblock_is_poisoned(idx) != Some(true) { return false; }
+        if let Err(e) = self.persistent.delete_macroblock(idx) {
+            println!("[WARN][STORAGE] poisoned_macroblock_drop_failed idx={} err={}", idx, e);
+            return false;
+        }
+        let below = idx.saturating_sub(1);
+        if self.last_sealed_mb_index() > below {
+            let _ = self.force_last_sealed_mb(below);
+        }
+        true
+    }
+
+    /// Boot pass over the recent tail: every poisoned macroblock among the last `span` below the
+    /// seal watermark is dropped. Returns how many. One decode plus one hash per object.
+    pub fn drop_poisoned_macroblocks_recent(&self, span: u64) -> u64 {
+        let top = self.last_sealed_mb_index();
+        let mut dropped = 0u64;
+        for idx in top.saturating_sub(span)..=top {
+            if self.drop_poisoned_macroblock(idx) {
+                println!("[WARN][STORAGE] poisoned_macroblock_dropped idx={}", idx);
+                dropped += 1;
+            }
+        }
+        dropped
+    }
     
     /// Save checkpoint block for Progressive Finalization
     pub async fn save_checkpoint(&self, height: u64, block: &qnet_state::MacroBlock) -> Result<(), String> {

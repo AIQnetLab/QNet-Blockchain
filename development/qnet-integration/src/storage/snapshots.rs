@@ -3921,6 +3921,63 @@ mod tests_rollback_retraction {
         assert_eq!(st.last_sealed_mb_index(), 9594, "the frontier stops at the first hole, whatever the hint said");
     }
 
+    /// A stored boundary macroblock is this node's own bad seal when it has no producer snapshot or
+    /// when its body does not commit to the epoch_commitment in its own certificate. Nodes 001 and
+    /// 004 sealed one each from round-keyed inputs of an older window; healthy nodes sealed some from
+    /// their own liveness view; every committee derived two windows on then differed or failed.
+    /// Dropping the object and bringing the watermark under it lets the range sync fetch the
+    /// certified copy; a canonical object is never touched.
+    #[test]
+    fn a_macroblock_that_disagrees_with_its_own_certificate_is_dropped_and_the_watermark_follows() {
+        use qnet_consensus::checkpoint_bft::{Checkpoint, QuorumCertificate, epoch_commitment};
+        let (st, _d) = temp_storage();
+        let mut anchor = 10_180u64.to_le_bytes().to_vec();
+        anchor.extend_from_slice(&[7u8; 32]);
+        st.put_snapshot_anchor(&anchor).expect("anchor");
+        let committee: Vec<String> = (1..=5).map(|i| format!("genesis_node_00{}", i)).collect();
+        let eligible = bincode::serialize(&committee.iter().map(|id| qnet_state::EligibleProducer {
+            node_id: id.clone(), reputation: 7000 }).collect::<Vec<_>>()).unwrap();
+        let banned: Vec<String> = Vec::new();
+        let put = |idx: u64, elig: Option<Vec<u8>>, commitment: [u8; 32]| {
+            let cp = Checkpoint {
+                index: idx, parent_qc: None, window_head_height: idx * 90, window_mb_hashes: vec![[7u8; 32]],
+                state_root: [0xab; 32], beacon: [3u8; 32], epoch_commitment: commitment, reward_root: [0u8; 32],
+                registry_root: [0u8; 32], logs_root: [0u8; 32], dilithium_pk_root: [0u8; 32],
+                reward_epoch_root: [0u8; 32], total_supply: 0, timestamp: 0,
+                proposer: "genesis_node_001".to_string(), proposer_sig: Vec::new(), recovery_anchor: None,
+            };
+            let qc = QuorumCertificate { checkpoint_hash: cp.hash(), index: idx, signers: Vec::new(),
+                                         sig_merkle_root: [0u8; 32], sigs: Vec::new() };
+            let mut cd = qnet_state::ConsensusData::default();
+            cd.checkpoint_qc = Some(bincode::serialize(&(cp, qc)).unwrap());
+            cd.eligible_producers = elig;
+            cd.consensus_committee = Some(committee.clone());
+            cd.banned_validators = Some(bincode::serialize(&banned).unwrap());
+            let mb = qnet_state::MacroBlock::new(idx * 90, 0, [0u8; 32], vec![[7u8; 32]], [1u8; 32], cd);
+            let cf = st.persistent.db.cf_handle("microblocks").expect("microblocks cf");
+            st.persistent.db.put_cf(&cf, format!("macroblock_{}", idx).as_bytes(), bincode::serialize(&mb).unwrap()).expect("seed");
+        };
+        let good = epoch_commitment(&eligible, &committee, &banned);
+        for idx in [10_181u64, 10_182, 10_183] { put(idx, Some(eligible.clone()), good); }
+        put(10_184, None, good);                          // no snapshot at all (001's seal of 10184)
+        put(10_185, Some(eligible.clone()), good);        // canonical
+        put(10_186, Some(eligible.clone()), [9u8; 32]);   // a set its own certificate never signed
+        assert_eq!(st.last_sealed_mb_index(), 10_186);
+
+        assert_eq!(st.macroblock_is_poisoned(10_185), Some(false));
+        assert_eq!(st.macroblock_is_poisoned(10_184), Some(true), "no snapshot");
+        assert_eq!(st.macroblock_is_poisoned(10_186), Some(true), "commitment mismatch");
+        assert_eq!(st.macroblock_is_poisoned(10_190), None, "not stored");
+
+        assert!(!st.drop_poisoned_macroblock(10_185), "a canonical object is never dropped");
+        assert_eq!(st.drop_poisoned_macroblocks_recent(16), 2, "both bad seals go in one boot pass");
+        assert!(st.get_macroblock_by_height(10_184).expect("get").is_none());
+        assert!(st.get_macroblock_by_height(10_186).expect("get").is_none());
+        assert!(st.get_macroblock_by_height(10_185).expect("get").is_some());
+        assert_eq!(st.last_sealed_mb_index(), 10_183, "the watermark sits under the lowest hole, so sync asks for it");
+        assert_eq!(st.drop_poisoned_macroblocks_recent(16), 0, "nothing to drop twice");
+    }
+
     /// The operator's declaration on top: the votes this node cast above the target and the genesis
     /// capsule it holds for that chain. Left in place, the engine reboots at the abandoned chain's
     /// last voted index and ignores every proposal of the re-produced windows: no checkpoint
