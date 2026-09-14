@@ -858,6 +858,11 @@ impl Storage {
         self.persistent.rocksdb_memory_mb()
     }
 
+    /// RocksDB back-pressure and background work right now, as k=v (see PersistentStorage).
+    pub fn rocksdb_stall_facts(&self) -> String {
+        self.persistent.rocksdb_stall_facts()
+    }
+
     /// Highest microblock height on disk (index seek, no scan, no ceiling).
     pub fn highest_stored_microblock(&self) -> IntegrationResult<Option<u64>> {
         self.persistent.highest_stored_microblock()

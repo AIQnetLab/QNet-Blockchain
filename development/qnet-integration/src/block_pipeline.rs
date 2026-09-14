@@ -4438,8 +4438,9 @@ impl BlockPipeline {
                 if save_elapsed > std::time::Duration::from_millis(500) {
                     if is_warn() {
                         println!(
-                            "[WARN][PIPELINE] slow_storage_write op=save_microblock h={} elapsed_ms={} bytes={}",
-                            height, save_elapsed.as_millis(), block.decompressed.len()
+                            "[WARN][PIPELINE] slow_storage_write op=save_microblock h={} elapsed_ms={} bytes={} {}",
+                            height, save_elapsed.as_millis(), block.decompressed.len(),
+                            ctx.storage.rocksdb_stall_facts()
                         );
                     }
                 }
@@ -4597,8 +4598,8 @@ impl BlockPipeline {
                         if height_elapsed > std::time::Duration::from_millis(500) {
                             if is_warn() {
                                 println!(
-                                    "[WARN][PIPELINE] slow_storage_write op=set_height h={} elapsed_ms={}",
-                                    height, height_elapsed.as_millis()
+                                    "[WARN][PIPELINE] slow_storage_write op=set_height h={} elapsed_ms={} {}",
+                                    height, height_elapsed.as_millis(), ctx.storage.rocksdb_stall_facts()
                                 );
                             }
                         }

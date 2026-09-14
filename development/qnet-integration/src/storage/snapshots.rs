@@ -3773,6 +3773,20 @@ impl Storage {
 mod tests_rollback_retraction {
     use super::*;
 
+    /// The stall report reads RocksDB properties only; on a fresh store every figure is zero and
+    /// every key is present, so a report with a missing key or a non-numeric value is a broken reader.
+    #[test]
+    fn stall_facts_name_every_engine_figure() {
+        let (st, _dir) = temp_storage();
+        let facts = st.rocksdb_stall_facts();
+        for key in ["write_stopped=", "delayed_rate=", "running_compactions=", "running_flushes=",
+                    "compaction_pending=", "flush_pending=", "imm_memtables=", "memtables_mb=",
+                    "l0_max=", "bg_errors="] {
+            assert!(facts.contains(key), "missing {} in {}", key, facts);
+        }
+        assert!(facts.contains("write_stopped=0") && facts.contains("bg_errors=0"), "{}", facts);
+    }
+
     fn temp_storage() -> (Storage, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
         let st = Storage::new(dir.path().to_str().unwrap()).expect("storage");

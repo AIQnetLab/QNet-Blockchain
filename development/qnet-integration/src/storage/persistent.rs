@@ -2231,6 +2231,43 @@ impl PersistentStorage {
         (cache / MB, memtables / MB, readers / MB)
     }
 
+    /// What RocksDB is doing right now, as k=v for a stall report: write stop / delayed-write
+    /// rate (the engine's own back-pressure), running and pending compactions and flushes,
+    /// immutable memtables waiting to flush, the largest L0 pile and which CF owns it, background
+    /// errors. Property reads only - no I/O, safe from a watchdog thread mid-stall.
+    pub fn rocksdb_stall_facts(&self) -> String {
+        const MB: u64 = 1024 * 1024;
+        let get = |cf: &rocksdb::ColumnFamily, name: &str| -> u64 {
+            self.db.property_int_value_cf(cf, name).ok().flatten().unwrap_or(0)
+        };
+        let (mut imm, mut memtables, mut l0_max, mut l0_cf) = (0u64, 0u64, 0u64, "-");
+        let mut db_wide: Option<(u64, u64, u64, u64, u64, u64, u64)> = None;
+        for name in ALL_COLUMN_FAMILIES {
+            let cf = match self.db.cf_handle(name) { Some(c) => c, None => continue };
+            if db_wide.is_none() {
+                db_wide = Some((
+                    get(&cf, "rocksdb.is-write-stopped"),
+                    get(&cf, "rocksdb.actual-delayed-write-rate"),
+                    get(&cf, "rocksdb.num-running-compactions"),
+                    get(&cf, "rocksdb.num-running-flushes"),
+                    get(&cf, "rocksdb.compaction-pending"),
+                    get(&cf, "rocksdb.mem-table-flush-pending"),
+                    get(&cf, "rocksdb.background-errors"),
+                ));
+            }
+            imm += get(&cf, "rocksdb.num-immutable-mem-table");
+            memtables += get(&cf, "rocksdb.cur-size-all-mem-tables");
+            let l0 = get(&cf, "rocksdb.num-files-at-level0");
+            if l0 > l0_max { l0_max = l0; l0_cf = name; }
+        }
+        let (stopped, delayed, comp, flush, comp_pending, flush_pending, bg_err) =
+            db_wide.unwrap_or((0, 0, 0, 0, 0, 0, 0));
+        format!("write_stopped={} delayed_rate={} running_compactions={} running_flushes={} \
+                 compaction_pending={} flush_pending={} imm_memtables={} memtables_mb={} l0_max={}/{} bg_errors={}",
+                stopped, delayed, comp, flush, comp_pending, flush_pending, imm, memtables / MB,
+                l0_max, l0_cf, bg_err)
+    }
+
     pub fn load_microblock(&self, height: u64) -> IntegrationResult<Option<Vec<u8>>> {
         let microblocks_cf = self.db.cf_handle("microblocks")
             .ok_or_else(|| IntegrationError::StorageError("microblocks column family not found".to_string()))?;

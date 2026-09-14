@@ -877,7 +877,7 @@ impl BlockchainNode {
             std::sync::atomic::Ordering::SeqCst,
         ).is_ok() {
             Self::start_producer_watchdog();
-            Self::start_runtime_stall_watchdog();
+            Self::start_runtime_stall_watchdog(self.storage.clone());
         }
 
         // Liveness pacemaker task (see run_failover_pacemaker). Once per process.

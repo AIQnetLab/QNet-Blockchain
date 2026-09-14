@@ -1041,10 +1041,15 @@ impl BlockchainNode {
     /// is already over — which is why `deadlock_suspected` never named a cause. This one keeps ticking
     /// and, at the moment of the stall, probes the lock the runtime is suspected to be waiting on.
     /// Observability only: it never mutates state, so a false positive cannot affect consensus.
-    pub(super) fn start_runtime_stall_watchdog() {
+    /// The report carries what the runtime and the store were doing AT the stall: tokio's worker,
+    /// alive-task and injection-queue counts (the handle is taken here, on the runtime, because the
+    /// thread has none) and RocksDB's own back-pressure facts - the two suspects every freeze so far
+    /// left unnamed.
+    pub(super) fn start_runtime_stall_watchdog(storage: Arc<Storage>) {
+        let handle = tokio::runtime::Handle::try_current().ok();
         let spawned = std::thread::Builder::new()
             .name("qnet-stall-watchdog".to_string())
-            .spawn(|| {
+            .spawn(move || {
                 use std::sync::atomic::Ordering;
                 const TICK_MS: u64 = 250;
                 const STALL_MS: u64 = 2_000;
@@ -1074,8 +1079,16 @@ impl BlockchainNode {
                         Some(_) => "free",
                         None => "held",
                     };
-                    println!("[CRIT][WATCHDOG] runtime_stalled stall_ms={} committee_lock={} beat_ms={}",
-                             stall_ms, committee_lock, beat);
+                    let tokio_facts = match handle.as_ref() {
+                        Some(h) => {
+                            let m = h.metrics();
+                            format!("workers={} alive_tasks={} global_queue={}",
+                                    m.num_workers(), m.num_alive_tasks(), m.global_queue_depth())
+                        }
+                        None => "workers=? alive_tasks=? global_queue=?".to_string(),
+                    };
+                    println!("[CRIT][WATCHDOG] runtime_stalled stall_ms={} committee_lock={} beat_ms={} {} {}",
+                             stall_ms, committee_lock, beat, tokio_facts, storage.rocksdb_stall_facts());
                 }
             });
         if spawned.is_ok() {
