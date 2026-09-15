@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getTransactionByHash, getBatchRecipients } from '../../../../../lib/db';
 import { rateLimit, getClientIdentifier } from '../../../../../lib/rate-limit';
 import { mapTxType, formatAmount } from '@/lib/tx-mapping';
+import { chainFeeNano, chainFeeNanoBig } from '@/lib/fee';
 
 // Rate limiting: 200 requests per minute per IP
 const RATE_LIMIT_MAX = 200;
@@ -267,8 +268,12 @@ export async function GET(
         signatureType = 'Unsigned';
       }
       
-      // Fee = gas_price × gas_limit, exact (NUMERIC columns arrive as digit strings).
-      const totalFee = BigInt(dbTx.gas_price || '0') * BigInt(dbTx.gas_limit || '0');
+      // The fee the chain debits, exact (NUMERIC columns arrive as digit strings): every non-system TX on
+      // chain is ML-DSA signed and pays 1.5x the gas price; genesis/system TXs pay nothing.
+      const sender = String(from || '');
+      const totalFee = sender.startsWith('system_') || sender === 'genesis'
+        ? BigInt(0)
+        : chainFeeNanoBig(BigInt(dbTx.gas_price || '0'), BigInt(dbTx.gas_limit || '0'), true);
       const fee = totalFee > 0n ? formatAmount(totalFee.toString()) : '0';
       // Recipients of a batch envelope live in batch_transfers; the page expands them from tx_type_data.
       let typeData = parseTxTypeData(dbTx.tx_type_data);
@@ -410,14 +415,14 @@ export async function GET(
       signatureType = 'Unsigned';
     }
     
-    // Calculate fee: gas_price * gas_limit, or 0 for genesis/system transactions
+    // The fee the chain debits: ML-DSA-signed TXs pay 1.5x the gas price; genesis/system TXs pay nothing.
     let fee: string;
     if (isSystemTx) {
       fee = '0';
     } else {
       const gasPrice = (tx.gas_price as number) || 0;
       const gasLimit = (tx.gas_limit as number) || 0;
-      const totalFee = gasPrice * gasLimit;
+      const totalFee = chainFeeNano(gasPrice, gasLimit, isQuantumSigned);
       fee = totalFee > 0 ? formatAmount(totalFee) : '0';
     }
     

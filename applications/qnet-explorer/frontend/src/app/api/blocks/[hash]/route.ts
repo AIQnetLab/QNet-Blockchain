@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getBlockByHeight, getBlockByHash, getTransactionsByBlock, BlockRow } from '../../../../../lib/db';
 import type { Block, BlockTransaction } from '@/lib/types';
+import { chainFeeNano, chainFeeNanoBig } from '@/lib/fee';
 
 // ============================================================================
 // PRODUCTION v2.97: PostgreSQL-first with Node RPC fallback
@@ -145,7 +146,9 @@ function transformRpcBlock(raw: Record<string, unknown>): Block | null {
         from: (t.from as string) || '',
         to: (t.to as string) || (t.from as string) || '',
         amount: String(t.amount || 0),
-        fee: (t.gas_price && Number(t.gas_price) < U64_MAX - 1000) ? String((t.gas_price as number) * (t.gas_limit as number)) : undefined,
+        // Every non-system TX on chain is ML-DSA signed (unsigned value TXs are refused); system TXs pay nothing.
+        fee: (t.gas_price && Number(t.gas_price) < U64_MAX - 1000 && !String(t.from || '').startsWith('system_'))
+          ? String(chainFeeNano(Number(t.gas_price), Number(t.gas_limit), true)) : undefined,
         timestamp: (t.timestamp as number) || timestamp,
         nonce: t.nonce as number | undefined,
         status: (t.status as string) || 'confirmed',
@@ -179,7 +182,8 @@ async function fetchBlock(identifier: string): Promise<Block | null> {
         from: tx.from_address,
         to: tx.to_address || tx.from_address,
         amount: String(tx.amount || 0),
-        fee: tx.gas_price ? (BigInt(tx.gas_price) * BigInt(tx.gas_limit)).toString() : undefined,
+        fee: tx.gas_price && !String(tx.from_address || '').startsWith('system_')
+          ? chainFeeNanoBig(BigInt(tx.gas_price), BigInt(tx.gas_limit), true).toString() : undefined,
         timestamp: tx.timestamp,
         nonce: Number(tx.nonce),
         status: tx.status || 'confirmed',
