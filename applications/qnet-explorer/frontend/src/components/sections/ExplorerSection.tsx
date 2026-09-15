@@ -5,7 +5,16 @@ import Link from 'next/link';
 
 // Helper function to format time ago
 const formatTimeAgo = (timestamp: number): string => {
-  const seconds = Math.floor((Date.now() - timestamp) / 1000);
+  if (!timestamp || timestamp === 0) return 'Genesis';
+  
+  // Handle both seconds and milliseconds timestamps
+  const ts = timestamp > 1e12 ? timestamp : timestamp * 1000;
+  
+  // If timestamp is before year 2024 (chain launch), treat as Genesis
+  if (ts < 1704067200000) return 'Genesis';
+  
+  const seconds = Math.floor((Date.now() - ts) / 1000);
+  if (seconds < 0) return 'just now';
   if (seconds < 60) return `${seconds} seconds ago`;
   const minutes = Math.floor(seconds / 60);
   if (minutes < 60) return `${minutes} minutes ago`;
@@ -22,25 +31,25 @@ const truncateAddress = (address: string, start: number = 6, end: number = 4): s
 };
 
 // Mock data for transactions/activity
-// QNET EON Address format: 19 chars + "eon" + 15 chars + 4 char checksum = 41 total
+// QNET EON Address format: 19 chars + "eon" + 15 chars + 8 char checksum = 45 total
 // Tokens: QNC (native), custom tokens via smart contracts
-// SWAP: gas fee goes to Pool 2 (70% Super nodes, 30% Full nodes)
+// v3.18+: Transaction fees go directly to block producer (Super node)
 const mockActivity = [
   {
     id: '1',
     blockHash: '62FE142CE64F8A22BB43D18057AF770BD304E3774CBB9C2E43719B0B1617AA91',
     timestamp: Date.now() - 23 * 60 * 1000,
     type: 'SWAP',
-    from: 'a1b2c3d4e5f6g7h8i9aeonklmnopqrstuvwx0a1b', // 41 chars
-    to: 'dex0pool01qncwqnc00eonabcdef123456781234',   // 41 chars - DEX pool
+    from: 'a1b2c3d4e5f6a7b8c9aeon0abcde1234567f0a1b2c3d', // 45 chars
+    to: 'dex0pool01aacbddc00eonabcdef12345671234abcd',     // 45 chars - DEX pool
     amount: '100 QNC',
     swapDetails: {
       tokenIn: 'QNC',
       tokenOut: 'WQNC',
       amountIn: '100',
       amountOut: '99.5',
-      poolAddress: 'dex0pool01qncwqnc00eonabcdef123456781234',
-      gasFee: '0.001 QNC → Pool 2',
+      poolAddress: 'dex0pool01aacbddc00eonabcdef12345671234abcd',
+      gasFee: '0.001 QNC → Producer',
     },
   },
   {
@@ -48,8 +57,8 @@ const mockActivity = [
     blockHash: '7D804D56FF7268D7967D51F9EBAB2C22D77E1E5CFEEF4A0D93DCBECC0CF49E5A',
     timestamp: Date.now() - 22 * 60 * 1000,
     type: 'SEND',
-    from: 'b2c3d4e5f6g7h8i9j0aeonlmnopqrstuvwxy1c2d', // 41 chars
-    to: 'c3d4e5f6g7h8i9j0k1aeonmnopqrstuvwxyz2d3e',  // 41 chars
+    from: 'b2c3d4e5f6a7b8c9d0aeon0abcde1234567f1c2d3e4f', // 45 chars
+    to: 'c3d4e5f6a7b8c9d0e1aeon0abcde1234567f2d3e4f5a',   // 45 chars
     amount: '0.05 QNC',
   },
   {
@@ -57,8 +66,8 @@ const mockActivity = [
     blockHash: '7D804D56FF7268D7967D51F9EBAB2C22D77E1E5CFEEF4A0D93DCBECC0CF49E5A',
     timestamp: Date.now() - 22 * 60 * 1000,
     type: 'SEND',
-    from: 'b2c3d4e5f6g7h8i9j0aeonlmnopqrstuvwxy1c2d', // 41 chars
-    to: 'c3d4e5f6g7h8i9j0k1aeonmnopqrstuvwxyz2d3e',  // 41 chars
+    from: 'b2c3d4e5f6a7b8c9d0aeon0abcde1234567f1c2d3e4f', // 45 chars
+    to: 'c3d4e5f6a7b8c9d0e1aeon0abcde1234567f2d3e4f5a',   // 45 chars
     amount: '50.00 QNC',
   },
   {
@@ -66,8 +75,8 @@ const mockActivity = [
     blockHash: '6138F66C1442F08C3AC329396962D442323E66E9A9FB00B95FCB9989EB08010',
     timestamp: Date.now() - 23 * 60 * 1000,
     type: 'SEND',
-    from: 'a1b2c3d4e5f6g7h8i9aeonklmnopqrstuvwx0a1b', // 41 chars
-    to: 'b2c3d4e5f6g7h8i9j0aeonlmnopqrstuvwxy1c2d',  // 41 chars
+    from: 'a1b2c3d4e5f6a7b8c9aeon0abcde1234567f0a1b2c3d', // 45 chars
+    to: 'b2c3d4e5f6a7b8c9d0aeon0abcde1234567f1c2d3e4f',   // 45 chars
     amount: '1,000.00 QNC',
   },
   {
@@ -75,25 +84,25 @@ const mockActivity = [
     blockHash: '16C0ABE55E0E030E13E57B25B6D77A227FE3836B0941F9CD6A44995BB3BE3AC1',
     timestamp: Date.now() - 25 * 60 * 1000,
     type: 'NODE_ACTIVATION',
-    from: 'd4e5f6g7h8i9j0k1l2aeonopqrstuvwxyz01e4f5', // 41 chars
-    to: 'pool3activation0000eon000000000000001234',   // 41 chars - Pool 3
-    amount: '7,500 QNC → Pool #3',
+    from: 'd4e5f6a7b8c9d0e1f2aeon0abcde1234567fe4f5a6b7', // 45 chars
+    to: 'pool3activation0000eon00000000000000012345678',    // 45 chars - Pool 3
+    amount: '10,000 QNC → Pool #3',
   },
   {
     id: '6',
     blockHash: 'A8B9C0D1E2F3A4B5C6D7E8F9A0B1C2D3E4F5A6B7C8D9E0F1A2B3C4D5E6F7A8B9',
     timestamp: Date.now() - 26 * 60 * 1000,
     type: 'SWAP',
-    from: 'e5f6g7h8i9j0k1l2m3aeonpqrstuvwxyz0123h7i8', // 41 chars
-    to: 'dex0pool02stblqnc00eonbcdefg234567891234',   // 41 chars
+    from: 'e5f6a7b8c9d0e1f2a3aeon0abcde1234567fa7b8c9d0', // 45 chars
+    to: 'dex0pool02aabbccdd00eonbcdef01234567891234abcd',  // 45 chars
     amount: '500 STABLE',
     swapDetails: {
       tokenIn: 'STABLE',
       tokenOut: 'QNC',
       amountIn: '500',
       amountOut: '125.5',
-      poolAddress: 'dex0pool02stblqnc00eonbcdefg234567891234',
-      gasFee: '0.002 QNC → Pool 2',
+      poolAddress: 'dex0pool02aabbccdd00eonbcdef01234567891234abcd',
+      gasFee: '0.002 QNC → Producer',
     },
   },
   {
@@ -101,8 +110,8 @@ const mockActivity = [
     blockHash: 'B9C0D1E2F3A4B5C6D7E8F9A0B1C2D3E4F5A6B7C8D9E0F1A2B3C4D5E6F7A8B9C0',
     timestamp: Date.now() - 35 * 60 * 1000,
     type: 'REWARD',
-    from: 'pool1emission000000eon0000000000000001234',  // 41 chars - Pool 1
-    to: 'a1b2c3d4e5f6g7h8i9aeonklmnopqrstuvwx0a1b',    // 41 chars
+    from: 'pool1emission000000aeon00000000000000012345678',  // 45 chars - Pool 1
+    to: 'a1b2c3d4e5f6a7b8c9aeon0abcde1234567f0a1b2c3d',    // 45 chars
     amount: '251.43 QNC',
   },
 ];
@@ -119,7 +128,7 @@ const CopyButton = ({ text }: { text: string }) => {
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     } catch (err) {
-      console.error('Failed to copy:', err);
+      /* log disabled */
     }
   }, [text]);
 

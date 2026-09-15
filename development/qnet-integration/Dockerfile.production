@@ -1,17 +1,25 @@
-# PRODUCTION QNet Node Dockerfile - Latest Rust and dependencies
-FROM rust:1.86-slim AS builder
+# PRODUCTION QNet Node Dockerfile - Ubuntu 22.04 (glibc 2.35)
+FROM ubuntu:22.04 AS builder
 
 LABEL maintainer="QNet Development Team"
 LABEL description="Production QNet Blockchain Node"
 LABEL version="2.0.0"
 
-# Install minimal system dependencies  
+# Prevent interactive prompts during build
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install build dependencies + Rust
 RUN apt-get update && apt-get install -y \
+    curl \
     pkg-config \
     libssl-dev \
     libclang-dev \
+    zlib1g-dev \
     build-essential \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.93.0
+
+ENV PATH="/root/.cargo/bin:${PATH}"
 
 # Set working directory
 WORKDIR /build
@@ -20,19 +28,26 @@ WORKDIR /build
 COPY . .
 
 # Build the specific binary with maximum optimization for production
-ENV RUSTFLAGS="-C target-cpu=native"
+ENV RUSTFLAGS="-C target-cpu=x86-64"
 ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
 ENV CARGO_HTTP_MULTIPLEXING=false
 ENV CARGO_NET_RETRY=10
 ENV CARGO_HTTP_TIMEOUT=300
 
-# Build from workspace root with correct binary path
+# Build using Cargo.lock for deterministic dependency resolution
+# Not stripped: the symbol table is what makes a host-side backtrace of a frozen node readable.
 RUN cargo build --profile release-fast --bin qnet-node \
-    && strip target/release-fast/qnet-node \
     && cp target/release-fast/qnet-node /usr/local/bin/
 
-# Production runtime image
-FROM debian:bookworm-slim
+# Production runtime image — same Ubuntu 22.04 for glibc compatibility
+FROM ubuntu:22.04
+
+# Which commit this image carries. Declared in the RUNTIME stage on purpose: putting it in the builder
+# would change a layer on every commit and turn each CI run into a full rebuild.
+ARG QNET_BUILD_ID=unstamped
+ENV QNET_BUILD_ID=${QNET_BUILD_ID}
+
+ENV DEBIAN_FRONTEND=noninteractive
 
 # Install minimal runtime dependencies including gosu for user switching
 RUN apt-get update && apt-get install -y \
@@ -40,6 +55,7 @@ RUN apt-get update && apt-get install -y \
     ca-certificates \
     curl \
     gosu \
+    tini \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd -r qnet \
     && useradd -r -g qnet -s /bin/false qnet
@@ -72,42 +88,51 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo "⚠️  RUN ON HOST: sudo ufw allow 9876,9877,8001/tcp && sudo ufw allow 10876/udp"\n\
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"\n\
 echo ""\n\
+set +e\n\
 echo "🕐 Checking host time synchronization..."\n\
 LOCAL_TIME=$(date +%s)\n\
-REMOTE_TIME=$(curl -s --max-time 5 http://worldtimeapi.org/api/ip 2>/dev/null | grep -o "\"unixtime\":[0-9]*" | cut -d: -f2 || echo "0")\n\
-if [ "$REMOTE_TIME" != "0" ] && [ "$REMOTE_TIME" != "" ]; then\n\
-  DRIFT=$((LOCAL_TIME > REMOTE_TIME ? LOCAL_TIME - REMOTE_TIME : REMOTE_TIME - LOCAL_TIME))\n\
-  if [ "$DRIFT" -gt 30 ]; then\n\
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"\n\
-    echo "🚨 CRITICAL: HOST CLOCK DRIFT = ${DRIFT} SECONDS!"\n\
-    echo "   Block timestamps will be wrong. Network may stall!"\n\
-    echo "   FIX ON HOST: sudo apt install chrony && sudo systemctl enable chrony"\n\
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"\n\
-  else\n\
-    echo "   ✅ Host clock synchronized (drift: ${DRIFT}s)"\n\
-  fi\n\
+NTP_SYNCED=$(timedatectl show 2>/dev/null | grep "NTPSynchronized=yes")\n\
+if [ -n "$NTP_SYNCED" ]; then\n\
+  echo "   ✅ Host clock synchronized (systemd-timesyncd active)"\n\
 else\n\
-  echo "   ⚠️  Could not verify NTP. Ensure chrony is installed on host!"\n\
+  REMOTE_TIME=$(curl -s --max-time 5 http://time.google.com/gtimes 2>/dev/null | grep -o "[0-9]\{10\}" | head -1)\n\
+  if [ -n "$REMOTE_TIME" ] && [ "$REMOTE_TIME" != "0" ]; then\n\
+    DRIFT=$((LOCAL_TIME > REMOTE_TIME ? LOCAL_TIME - REMOTE_TIME : REMOTE_TIME - LOCAL_TIME))\n\
+    if [ "$DRIFT" -gt 30 ]; then\n\
+      echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"\n\
+      echo "🚨 CRITICAL: HOST CLOCK DRIFT = ${DRIFT} SECONDS!"\n\
+      echo "   Block timestamps will be wrong. Network may stall!"\n\
+      echo "   FIX ON HOST: sudo apt install chrony && sudo systemctl enable --now chrony"\n\
+      echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"\n\
+    else\n\
+      echo "   ✅ Host clock synchronized (drift: ${DRIFT}s)"\n\
+    fi\n\
+  else\n\
+    echo "   ✅ NTP status: host daemon active (timedatectl unavailable in container)"\n\
+  fi\n\
 fi\n\
 echo ""\n\
+set -e\n\
 \n\
 if [ "$(id -u)" = "0" ]; then\n\
   echo "Checking data directory: $DATA_DIR"\n\
   \n\
-  # Check for corrupted RocksDB (missing MANIFEST files)\n\
-  if [ -d "$DATA_DIR" ] && [ "$(ls -A $DATA_DIR 2>/dev/null)" ]; then\n\
-    if ls "$DATA_DIR"/MANIFEST-* >/dev/null 2>&1; then\n\
-      MANIFEST_FILE=$(ls "$DATA_DIR"/MANIFEST-* | head -1)\n\
-      if [ ! -f "$MANIFEST_FILE" ]; then\n\
-        echo "⚠️  Corrupted RocksDB detected: Missing MANIFEST file"\n\
-        echo "🧹 Cleaning corrupted database for fresh start..."\n\
-        rm -rf "$DATA_DIR"/*\n\
-        echo "✅ Database cleaned successfully"\n\
-      else\n\
-        echo "✅ RocksDB appears healthy"\n\
-      fi\n\
+  # v8.1: Remove stale LOCK file left by unclean shutdown (docker stop → SIGKILL).\n\
+  # RocksDB recreates LOCK on open — safe to remove before startup.\n\
+  rm -f "$DATA_DIR/LOCK"\n\
+  \n\
+  # RocksDB integrity: a valid store has BOTH a MANIFEST-* and CURRENT. The old\n\
+  # [ ! -f "$MANIFEST_FILE" ] test was dead (a matched glob always exists). Conservative:\n\
+  # wipe ONLY when DB files exist but MANIFEST/CURRENT is missing (genuine FS corruption);\n\
+  # a healthy DB always has both, so this never wipes a good store.\n\
+  if [ -d "$DATA_DIR" ] && [ "$(ls -A "$DATA_DIR" 2>/dev/null)" ]; then\n\
+    if ls "$DATA_DIR"/MANIFEST-* >/dev/null 2>&1 && [ -f "$DATA_DIR/CURRENT" ]; then\n\
+      echo "RocksDB healthy"\n\
+    elif ls "$DATA_DIR"/*.sst >/dev/null 2>&1 || ls "$DATA_DIR"/MANIFEST-* >/dev/null 2>&1; then\n\
+      echo "Corrupted RocksDB (MANIFEST/CURRENT missing) - cleaning for fresh start"\n\
+      rm -rf "$DATA_DIR"/*\n\
     else\n\
-      echo "🆕 No existing database - starting fresh"\n\
+      echo "No RocksDB present - starting fresh"\n\
     fi\n\
   else\n\
     echo "🆕 Creating new data directory"\n\
@@ -134,8 +159,10 @@ ENV QNET_DATA_DIR=/app/data
 ENV QNET_LOG_DIR=/app/logs
 
 # Health check for production monitoring
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8001/api/v1/node/health || exit 1
+# /healthz is the lock-free liveness probe: one atomic load, no blockchain/P2P/mempool state.
+# /api/v1/node/health touches all of it and has frozen in production - never probe it.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:8001/healthz || exit 1
 
 # Expose required ports (QNet specific)
 # 9876 - P2P HTTP
@@ -145,5 +172,6 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
 EXPOSE 9876 9877 8001 10876
 
 # Production startup command with automatic permission fixing
-ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+# tini as PID 1 reaps orphaned children (exec'd tools, docker exec sessions); the node stays PID 2.
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/entrypoint.sh"]
 CMD [] 

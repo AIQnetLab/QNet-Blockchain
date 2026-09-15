@@ -145,7 +145,8 @@ class Node:
         self.api_port = self.app_config.getint('Network', 'api_port', fallback=5000)
         
         # Node type configuration
-        self.node_type = self.app_config.get('Node', 'node_type', fallback='full')  # light, full, super
+        # v3.18: Full nodes removed - default to super
+        self.node_type = self.app_config.get('Node', 'node_type', fallback='super')  # light, super
         
         # --- Regional Configuration ---
         self._init_regional_support()

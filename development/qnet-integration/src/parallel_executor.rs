@@ -2,16 +2,11 @@
 // Integrates with existing ParallelValidator and ShardCoordinator
 
 use std::sync::Arc;
-use std::collections::{HashMap, HashSet, VecDeque};
-use tokio::sync::{RwLock, Mutex};
+use std::collections::{HashMap, HashSet, BTreeSet, VecDeque};
+use tokio::sync::RwLock;
 use qnet_state::{Transaction, TransactionType};
 use qnet_sharding::{ShardCoordinator, ParallelValidator, CrossShardTx};
-use sha3::{Sha3_256, Digest};
-use rayon::prelude::*;
 use hex;
-
-/// Maximum transactions to process in parallel
-const MAX_PARALLEL_TX: usize = 10000;
 
 /// Number of pipeline stages (including Dilithium signature stage)
 const PIPELINE_STAGES: usize = 5;
@@ -19,8 +14,6 @@ const PIPELINE_STAGES: usize = 5;
 /// Dependency graph for transaction ordering
 #[derive(Debug, Clone)]
 pub struct DependencyGraph {
-    /// Map from account to transactions that read/write it
-    account_dependencies: HashMap<String, Vec<usize>>,
     /// Transaction execution order
     execution_order: Vec<Vec<usize>>,
 }
@@ -148,10 +141,9 @@ impl ParallelExecutor {
                         from_shard: self.shard_coordinator.get_shard(&tx.from),
                         to_shard: self.shard_coordinator.get_shard(to),
                         amount: tx.amount,
-                        timestamp: std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs(),
+                        // Deterministic: ordering comes from the dependency graph, not this field.
+                        // No wall-clock in a would-be state-transition path.
+                        timestamp: 0,
                     };
                     self.shard_coordinator.process_cross_shard_tx(cross_tx).await
                         .map_err(|e| e.to_string())?;
@@ -234,7 +226,6 @@ impl ParallelExecutor {
         let execution_order = self.compute_execution_order(&contexts)?;
         
         Ok(DependencyGraph {
-            account_dependencies,
             execution_order,
         })
     }
@@ -243,22 +234,33 @@ impl ParallelExecutor {
     fn compute_execution_order(&self, contexts: &[ExecutionContext]) -> Result<Vec<Vec<usize>>, String> {
         let mut execution_order = Vec::new();
         let mut processed = HashSet::new();
-        let mut remaining: HashSet<usize> = (0..contexts.len()).collect();
+        // BTreeSet (not HashSet): ascending, deterministic batch selection — two producers with
+        // the same mempool emit byte-identical block ordering (no SipHash-seeded reorder).
+        let mut remaining: BTreeSet<usize> = (0..contexts.len()).collect();
         
         while !remaining.is_empty() {
             let mut batch = Vec::new();
             let mut batch_writes = HashSet::new();
-            
+            let mut batch_reads = HashSet::new();
+
             for &idx in remaining.iter() {
                 let ctx = &contexts[idx];
-                
+
                 // Check if this transaction conflicts with current batch
-                let has_conflict = ctx.reads.intersection(&batch_writes).count() > 0 ||
-                                  ctx.writes.intersection(&batch_writes).count() > 0;
-                
+                let has_raw = ctx.reads.intersection(&batch_writes).count() > 0;  // RAW
+                let has_waw = ctx.writes.intersection(&batch_writes).count() > 0; // WAW
+                let has_war = ctx.writes.intersection(&batch_reads).count() > 0;  // WAR
+                let has_conflict = has_raw || has_waw || has_war;
+
+                if has_war && !has_raw && !has_waw {
+                    let conflicting: Vec<_> = ctx.writes.intersection(&batch_reads).cloned().collect();
+                    log::debug!("[DEBUG][PARALLEL] war_conflict tx={} conflicting_keys={}", idx, conflicting.join(","));
+                }
+
                 if !has_conflict {
                     batch.push(idx);
                     batch_writes.extend(ctx.writes.clone());
+                    batch_reads.extend(ctx.reads.clone());
                 }
             }
             
@@ -338,7 +340,7 @@ impl ParallelExecutor {
         
         for stage_idx in 0..PIPELINE_STAGES {
             // Drain current stage
-            while let Some(mut ctx) = stages[stage_idx].transactions.pop_front() {
+            while let Some(ctx) = stages[stage_idx].transactions.pop_front() {
                 // Process based on stage
                 match stage_idx {
                     0 | 1 | 2 => {

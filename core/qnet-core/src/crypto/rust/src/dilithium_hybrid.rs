@@ -1,7 +1,7 @@
-﻿//! Hybrid Dilithium + Ed25519 wrapper (production-ready)
+//! Hybrid Dilithium + Ed25519 wrapper (production-ready)
 //! June 2025 implementation
 
-use pqcrypto_dilithium::dilithium2::*;
+use pqcrypto_mldsa::mldsa44::*;
 use ed25519_dalek::{SigningKey as EdSigningKey, VerifyingKey as EdPublicKey, Signature as EdSig, Signer, Verifier};
 use rand_core::OsRng;
 
@@ -18,10 +18,10 @@ pub struct HybridSecretKey {
     ed_sk: EdSigningKey,
 }
 
-/// Signature = Dilithium sig \|\| Ed25519 sig
+/// Signature = Dilithium SignedMessage (sig || msg) + Ed25519 sig
 #[derive(Clone)]
 pub struct HybridSignature {
-    pub pq_sig: Signature,
+    pub pq_sig: SignedMessage,
     pub ed_sig: EdSig,
 }
 
@@ -49,10 +49,20 @@ impl HybridSecretKey {
 impl HybridPublicKey {
     /// Verify hybrid signature (both parts must be valid)
     pub fn verify(&self, msg: &[u8], sig: &HybridSignature) -> bool {
-        if verify(msg, &sig.pq_sig, &self.pq_pk).is_err() {
-            return false;
+        // open() decrypts SignedMessage and returns the original message if valid
+        match open(&sig.pq_sig, &self.pq_pk) {
+            Ok(recovered) if ct_eq_pq(recovered.as_slice(), msg) => {}
+            _ => return false,
         }
         self.ed_pk.verify(msg, &sig.ed_sig).is_ok()
     }
+}
+
+#[inline(never)]
+fn ct_eq_pq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() { return false; }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) { diff |= x ^ y; }
+    std::hint::black_box(diff) == 0
 }
 

@@ -20,11 +20,11 @@ const FooterComponent = () => {
             <a href="https://t.me/AiQnetLab" target="_blank" rel="noopener noreferrer" className="social-link">
               <div className="social-icon" style={{ backgroundColor: '#00ffff', maskImage: `url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M21.192 2.012a2.033 2.033 0 0 0-1.806-.415L2.14 8.71c-1.25.485-1.234 1.748.022 2.086l4.69 1.407 10.95-6.57-8.312 7.493-.588 4.542a1.49 1.49 0 0 0 1.42 1.482 1.49 1.49 0 0 0 .61-.13l2.364-1.182 4.418 3.26a1.488 1.488 0 0 0 2.21-.76l3.582-16.73A2.033 2.033 0 0 0 21.192 2.012z"></path></svg>')` }}></div>
             </a>
-            <a href="#" target="_blank" rel="noopener noreferrer" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '44px' }}>
-              <img src="https://developer.apple.com/assets/elements/badges/download-on-the-app-store.svg" alt="App Store" style={{ height: '44px', width: 'auto' }} />
+            <a href="https://apps.apple.com/app/qnet-wallet" target="_blank" rel="noopener noreferrer" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '44px' }}>
+              <img src="/badges/app-store.svg" alt="App Store" style={{ height: '44px', width: 'auto' }} />
             </a>
-            <a href="#" target="_blank" rel="noopener noreferrer" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-              <img src="https://play.google.com/intl/en_us/badges/static/images/badges/en_badge_web_generic.png" alt="Google Play" style={{ height: '60px' }} />
+            <a href="https://play.google.com/store/apps/details?id=com.qnetmobile" target="_blank" rel="noopener noreferrer" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+              <img src="/badges/google-play.png" alt="Google Play" style={{ height: '80px', marginTop: '-18px', marginBottom: '-18px' }} />
             </a>
           </div>
         </div>

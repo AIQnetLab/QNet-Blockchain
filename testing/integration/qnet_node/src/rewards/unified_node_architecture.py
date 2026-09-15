@@ -1,8 +1,9 @@
 """
 Unified Node Architecture for QNet
 ARCHITECTURAL SEPARATION:
+v3.18: Only Light and Super nodes (Full removed)
 - Light Nodes: Mobile devices, network-initiated pings
-- Full/Super Nodes: Server infrastructure, direct server pings
+- Super Nodes: Server infrastructure, direct server pings
 - Browser Extensions: Monitoring only, no pings
 """
 
@@ -19,8 +20,8 @@ logger = logging.getLogger(__name__)
 
 class NodeCategory(Enum):
     """Node categories for architectural separation"""
+    # v3.18: Only Light and Super nodes (Full removed)
     MOBILE_LIGHT = "mobile_light"       # Mobile Light nodes
-    SERVER_FULL = "server_full"         # Server Full nodes
     SERVER_SUPER = "server_super"       # Server Super nodes
 
 @dataclass
@@ -41,14 +42,13 @@ class UnifiedNodeArchitecture:
         # Mobile Light nodes manager
         self.device_registry = DeviceRegistry()
         
-        # Server Full/Super nodes manager
+        # Server Super nodes manager (v3.18: Full removed)
         self.server_monitor = ServerNodeMonitor()
         
-        # Success rate requirements
+        # v3.18: Only Light and Super nodes (Full removed)
         self.success_rate_requirements = {
             NodeCategory.MOBILE_LIGHT: 0.90,   # 90% for mobile Light nodes
-            NodeCategory.SERVER_FULL: 0.95,    # 95% for server Full nodes
-            NodeCategory.SERVER_SUPER: 0.98,   # 98% for server Super nodes
+            NodeCategory.SERVER_SUPER: 0.90,   # 90% for server Super nodes
         }
         
         logger.info("Unified Node Architecture initialized")
@@ -87,17 +87,7 @@ class UnifiedNodeArchitecture:
         """Record response to network-initiated ping from mobile device"""
         return self.device_registry.record_ping_response(device_id, success)
     
-    # ============ SERVER FULL/SUPER NODES ============
-    
-    def register_server_full_node(self, node_id: str, server_address: str, 
-                                server_port: int) -> bool:
-        """Register a server Full node (NO mobile device involvement)"""
-        return self.server_monitor.register_server_node(
-            node_id=node_id,
-            node_type=ServerNodeType.FULL,
-            server_address=server_address,
-            server_port=server_port
-        )
+    # ============ SERVER SUPER NODES (v3.18: Full removed) ============
     
     def register_server_super_node(self, node_id: str, server_address: str, 
                                  server_port: int) -> bool:
@@ -142,14 +132,14 @@ class UnifiedNodeArchitecture:
                 ping_mechanism="mobile_ping"
             )
         
-        # Check if it's a server Full node
+        # v3.18: Check if it's a server Super node (Full removed)
         server_status = self.server_monitor.get_server_node_status(node_id)
         if server_status:
-            if server_status['node_type'] == 'full':
-                required_rate = self.success_rate_requirements[NodeCategory.SERVER_FULL]
+            if server_status['node_type'] == 'super':
+                required_rate = self.success_rate_requirements[NodeCategory.SERVER_SUPER]
                 return UnifiedNodeStatus(
                     node_id=node_id,
-                    category=NodeCategory.SERVER_FULL,
+                    category=NodeCategory.SERVER_SUPER,
                     success_rate=server_status['success_rate'],
                     meets_requirements=server_status['meets_requirements'],
                     last_ping_time=server_status.get('last_ping_ago'),
@@ -192,10 +182,11 @@ class UnifiedNodeArchitecture:
                 "success_rate_requirement": "90%",
                 "ping_mechanism": "Network-initiated mobile pings"
             },
-            "server_full_nodes": {
-                "total": server_stats['full_nodes'],
-                "compliant": server_stats['success_rate_compliance']['full_nodes_compliant'],
-                "success_rate_requirement": "95%",
+            # v3.18: Full nodes removed - only showing Super stats
+            "server_super_nodes": {
+                "total": server_stats['super_nodes'],
+                "compliant": server_stats['success_rate_compliance']['super_nodes_compliant'],
+                "success_rate_requirement": "90%",
                 "ping_mechanism": "Direct server pings"
             },
             "server_super_nodes": {
@@ -210,9 +201,9 @@ class UnifiedNodeArchitecture:
             },
             "architecture_compliance": {
                 "mobile_light_separation": "✅ Mobile devices handle Light node pings",
-                "server_separation": "✅ Servers handle Full/Super node pings",
+                "server_separation": "✅ Servers handle Super node pings",
                 "browser_separation": "✅ Browser extensions monitoring only",
-                "no_cross_contamination": "✅ No Full/Super pings through mobile"
+                "no_cross_contamination": "✅ No Super pings through mobile"
             }
         }
     
@@ -225,7 +216,8 @@ class UnifiedNodeArchitecture:
         all_mobile_devices = []
         for node_id, devices in self.device_registry.node_devices.items():
             for device in devices:
-                if device.device_type in [DeviceType.SERVER_FULL, DeviceType.SERVER_SUPER]:
+                # v3.18: Only SERVER_SUPER (Full removed)
+                if device.device_type == DeviceType.SERVER_SUPER:
                     issues.append(f"CRITICAL: Server node {node_id} registered as mobile device!")
         
         # Check 2: No mobile devices trying to handle server pings

@@ -1,20 +1,18 @@
-#![allow(unused_imports)]
-#![allow(unused_variables)]
-#![allow(dead_code)]
-#![allow(unused_mut)]
+// Blanket suppression directives removed.
+// Remaining targeted #[allow(dead_code)] annotations are placed on specific
+// items intentionally kept for future use or backwards-compatibility.
 #![recursion_limit = "256"]
 
 //! QNet Integration - Full blockchain system
 //! This module integrates all QNet components into a cohesive blockchain system.
 
 pub mod errors;
+pub mod boot_contract;     // Required-subsystem registry: a task that never spawns fails the node
 pub mod storage;
-pub mod validator;
 pub mod unified_p2p;
 pub mod node;
 pub mod rpc;
 pub mod genesis;
-pub mod blockchain;
 pub mod activation_validation;
 pub mod parallel_executor;
 pub mod adaptive_bft;
@@ -22,39 +20,41 @@ pub mod pre_execution;
 pub mod network_config;
 pub mod archive_manager;
 pub mod genesis_constants;
+pub mod galc;              // Genesis-Anchored Live Checkpoint — live genesis-signed WS pin for cold-join
 pub mod reward_sharding;
-pub mod p2p_extensions;
-pub mod contract_vm;
+pub mod reward_epoch;      // Reward epochs: one owner for an epoch root, its total, and its serveability
+pub mod registry_lthash;   // Homomorphic (incremental, O(1)) multiset hash for registry_root at scale
+pub mod consensus_state;   // L1 consensus state machine (single coordinator)
+pub mod consensus_v2_driver; // Consensus v2 — Checkpoint-BFT driver (engine ↔ node bridge)
+pub mod consensus_v2_node;   // Consensus v2 — node runtime (verify + async effect executor + task)
+pub mod block_pipeline;    // Staged block processing pipeline (ingest → decode → verify → apply)
+pub mod genesis_config;    // File-based genesis loader (not p2p)
+pub mod sync_manager;      // Block download coordinator (sequential waves, ordered buffer)
 pub mod quic_transport;    // PRODUCTION v2.19.21: QUIC transport layer
 pub mod p2p_transport;     // PRODUCTION v2.19.21: P2P transport abstraction + binary protocol
 pub mod preflight_checks;  // PRODUCTION v2.19.22: Pre-flight port/connectivity validation
 pub mod benchmark;         // PRODUCTION v2.19.25: Real transaction benchmark system
-pub mod tests;             // PRODUCTION v2.19.25: Complete test suite (API, Stress, Network, Chaos)
+#[cfg(test)]
+mod tests;                 // PRODUCTION v2.19.25: Complete test suite (API, Stress, Network, Chaos)
 
 // ============================================================================
 // CRYPTOGRAPHY MODULE (isolated for external audit)
 // ============================================================================
-/// All cryptographic operations: Dilithium, Ed25519, VRF, PoH, Key Management
+/// All cryptographic operations: Dilithium, VRF, Key Management
 /// See: src/crypto/mod.rs for full documentation
 pub mod crypto;
 
 // Backwards compatibility re-exports (so existing imports still work)
-pub use crypto::hybrid_crypto;
+pub use crypto::pq_crypto;
 pub use crypto::quantum_crypto;
-pub use crypto::quantum_poh;
 pub use crypto::vrf;
-pub use crypto::vrf_hybrid;
 pub use crypto::key_manager;
 
-use std::sync::Arc;
-use tokio::sync::RwLock;
-use tracing::{info, error};
-use sha3::{Sha3_256, Digest};
-
-// Core imports with correct paths  
-pub use qnet_state::{StateManager, Account, Transaction, Block, StateDB, StateError, StateResult};
+// Core imports with correct paths
+// v3.22: Use State (not StateManager) - State has optimized Merkle methods
+pub use qnet_state::{State as StateManager, Account, Transaction, Block, StateDB, StateError, StateResult};
 pub use qnet_mempool::{SimpleMempool, SimpleMempoolConfig};
-pub use qnet_consensus::{ConsensusEngine, ConsensusConfig, NodeId};
+pub use qnet_consensus::NodeId;
 pub use qnet_sharding::{ShardCoordinator, ParallelValidator};
 
 // Import NetworkMessage for compilation
@@ -63,290 +63,51 @@ pub use unified_p2p::NetworkMessage;
 // Re-export for external use
 pub use errors::{IntegrationError, IntegrationResult};
 pub use storage::PersistentStorage;
-pub use validator::BlockValidator;
 pub use node::{BlockchainNode, NodeType, Region};
 pub use unified_p2p::SimplifiedP2P;
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+// v3.12: Re-export failover metrics for monitoring (NTP functions removed - using proper timestamp validation)
+pub use node::{
+    get_failover_metrics,
+    get_extended_failover_metrics,
+    FailoverMetrics,
+};
+
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // ============================================================================
 // GLOBAL STATE FOR DYNAMIC PRICING (updated by node sync process)
 // ============================================================================
 
-/// Global 1DEV burn percentage (multiplied by 100 for precision, e.g., 4500 = 45.00%)
-pub static GLOBAL_BURN_PERCENTAGE: AtomicU64 = AtomicU64::new(0);
+// 1DEV burn progress is NOT mirrored here: it lives on Solana and survives a fresh QNet genesis,
+// so every phase and price is derived from a live supply read via rpc::live_activation_pricing().
 
-/// Global total active nodes count (from P2P network)
-pub static GLOBAL_ACTIVE_NODES: AtomicU64 = AtomicU64::new(0);
+/// CHAIN-CONFIRMED registered-node count — the Phase-2 QNC price multiplier input. It must be a
+/// committed quantity: the local peer table stays in the tens at any network size, so quoting off it
+/// pins the multiplier to its cheapest tier forever and makes two honest nodes quote different
+/// prices. Refreshed from storage by the node maintenance loop.
+pub static GLOBAL_REGISTERED_NODES: AtomicU64 = AtomicU64::new(0);
 
 /// Global Genesis block timestamp (set once from block #0)
 pub static GLOBAL_GENESIS_TIMESTAMP: AtomicU64 = AtomicU64::new(0);
 
-/// Update global pricing state (called by node sync process)
-pub fn update_global_pricing_state(burn_pct: f64, active_nodes: u64, genesis_ts: u64) {
-    GLOBAL_BURN_PERCENTAGE.store((burn_pct * 100.0) as u64, Ordering::Relaxed);
-    GLOBAL_ACTIVE_NODES.store(active_nodes, Ordering::Relaxed);
+/// Refresh the registered-node count from the chain-confirmed registry (node maintenance loop).
+pub fn update_registered_node_count(registered_nodes: u64) {
+    GLOBAL_REGISTERED_NODES.store(registered_nodes, Ordering::Relaxed);
+}
+
+/// Latch the genesis timestamp on first sight of block #0. Separate from the count above: the
+/// block-ingest sites know the timestamp and nothing about the registry, and folding the two
+/// together made every genesis sighting clobber the price multiplier's input.
+pub fn set_genesis_timestamp(genesis_ts: u64) {
     if genesis_ts > 0 && GLOBAL_GENESIS_TIMESTAMP.load(Ordering::Relaxed) == 0 {
         GLOBAL_GENESIS_TIMESTAMP.store(genesis_ts, Ordering::Relaxed);
     }
 }
 
-/// Main QNet blockchain instance
-pub struct QNetBlockchain {
-    /// Storage layer
-    storage: Arc<storage::PersistentStorage>,
-    
-    /// State manager
-    state_manager: Arc<RwLock<StateManager>>,
-    
-    /// Transaction mempool
-    mempool: Arc<qnet_mempool::SimpleMempool>,
-    
-    /// Consensus mechanism
-    consensus: Arc<qnet_consensus::ConsensusEngine>,
-    
-    /// Validator
-    validator: Arc<validator::BlockValidator>,
-    
-    /// Node running flag
-    running: Arc<AtomicBool>,
-    
-    /// Shard coordinator
-    shard_coordinator: Option<Arc<ShardCoordinator>>,
-    
-    /// Parallel validator
-    parallel_validator: Option<Arc<ParallelValidator>>,
-}
-
-impl QNetBlockchain {
-    /// Create new QNet blockchain instance
-    pub async fn new(data_dir: &str) -> IntegrationResult<Self> {
-        info!("Initializing QNet blockchain at {}", data_dir);
-        
-        // Initialize storage
-        let storage = Arc::new(storage::PersistentStorage::new(data_dir)?);
-        
-        // Initialize state manager
-        let state_manager = Arc::new(RwLock::new(StateManager::new()));
-        
-        // Initialize mempool with production settings
-        let mempool_config = qnet_mempool::SimpleMempoolConfig {
-            max_size: std::env::var("QNET_MEMPOOL_SIZE")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(500_000), // Production default: 500k
-            min_gas_price: 1,
-        };
-        
-        let mempool = Arc::new(qnet_mempool::SimpleMempool::new(mempool_config));
-        
-        // Initialize consensus with proper config
-        let consensus_config = qnet_consensus::ConsensusConfig::default();
-        let consensus = Arc::new(qnet_consensus::ConsensusEngine::new("node1".to_string(), consensus_config));
-        
-        // Initialize validator
-        let validator = Arc::new(validator::BlockValidator::new());
-        
-        // Initialize sharding
-        let shard_coordinator = Some(Arc::new(ShardCoordinator::new()));
-        let parallel_validator = Some(Arc::new(ParallelValidator::new(4)));
-        
-        Ok(QNetBlockchain {
-            storage,
-            state_manager,
-            mempool,
-            consensus,
-            validator,
-            running: Arc::new(AtomicBool::new(false)),
-            shard_coordinator,
-            parallel_validator,
-        })
-    }
-    
-    /// Initialize genesis block
-    pub async fn initialize_genesis(&self) -> IntegrationResult<()> {
-        info!("Initializing genesis block...");
-        
-        let genesis_config = genesis::GenesisConfig::default();
-        let genesis_block = genesis::create_genesis_block(genesis_config)?;
-        
-        self.storage.save_block(&genesis_block).await?;
-        
-        info!("Genesis block created successfully");
-        Ok(())
-    }
-    
-    /// Start the blockchain
-    pub async fn start(&self) -> IntegrationResult<()> {
-        self.running.store(true, Ordering::SeqCst);
-        
-        info!("Starting QNet blockchain...");
-        
-        // CRITICAL: Consensus rounds DISABLED - QNet uses microblock/macroblock architecture
-        // Consensus is handled by macroblock triggers every 90 blocks, NOT continuous rounds
-        // self.start_consensus_rounds().await?;
-        
-        // Start network message handling
-        self.start_network_handler().await?;
-        
-        Ok(())
-    }
-    
-    /// Stop the blockchain
-    pub async fn stop(&self) -> IntegrationResult<()> {
-        self.running.store(false, Ordering::SeqCst);
-        
-        info!("QNet blockchain stopped");
-        Ok(())
-    }
-    
-    /// Add transaction to mempool
-    pub async fn add_transaction(&self, tx: Transaction) -> IntegrationResult<()> {
-        // PRODUCTION v2.26: Use bincode for consistency with block production
-        let tx_bytes = bincode::serialize(&tx).map_err(|e| IntegrationError::SerializationError(e.to_string()))?;
-        let tx_hash = format!("{:x}", sha3::Sha3_256::digest(&tx_bytes));
-        
-        // PRODUCTION v2.26: Add binary transaction for consistency
-        self.mempool.add_binary_transaction(tx_bytes, tx_hash, tx.gas_price);
-        Ok(())
-    }
-    
-    /// Get pending transactions
-    pub async fn get_pending_transactions(&self) -> IntegrationResult<Vec<Transaction>> {
-        // SimpleMempool returns raw JSON, we need to convert back
-        // For now, return empty vec - this would be implemented properly
-        Ok(vec![])
-    }
-    
-    /// Start consensus rounds
-    async fn start_consensus_rounds(&self) -> IntegrationResult<()> {
-        let consensus = self.consensus.clone();
-        let mempool = self.mempool.clone();
-        let running = self.running.clone();
-        
-        tokio::spawn(async move {
-            let mut round = 0;
-            
-            while running.load(Ordering::SeqCst) {
-                round += 1;
-                
-                // Run consensus round
-                if let Err(e) = Self::run_consensus_round(&*consensus, &*mempool, round).await {
-                    error!("Consensus round {} failed: {}", round, e);
-                }
-                
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            }
-        });
-        
-        Ok(())
-    }
-    
-    /// Run single consensus round
-    async fn run_consensus_round(
-        consensus: &ConsensusEngine,
-        mempool: &SimpleMempool,
-        round: u64
-    ) -> IntegrationResult<()> {
-        info!("Starting consensus round {}", round);
-        
-        // For now, just simulate consensus
-        // In production, this would run full consensus protocol
-        
-        Ok(())
-    }
-    
-    /// Process new block
-    pub async fn process_block(&self, block: Block) -> IntegrationResult<()> {
-        // Validate block
-        self.validator.validate_block(&block)?;
-        
-        // Store block
-        self.storage.save_block(&block).await?;
-        
-        // Update state
-        let mut state = self.state_manager.write().await;
-        for tx in &block.transactions {
-            state.apply_transaction(tx)?;
-        }
-        
-        info!("Processing block at height {}", block.height);
-        
-        Ok(())
-    }
-    
-    /// Produce new block
-    pub async fn produce_block(&self) -> IntegrationResult<Block> {
-        // Get transactions from mempool
-        // For now, create empty block
-        let block = Block {
-            height: 1,
-            previous_hash: [0u8; 32],
-            transactions: vec![],
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-            merkle_root: [0u8; 32],
-            producer: "node1".to_string(),
-            signature: vec![],
-        };
-        
-        info!("Produced block {} at height {}",
-            hex::encode(block.hash()), block.height);
-        
-        Ok(block)
-    }
-    
-    /// Start network event handler
-    async fn start_network_handler(&self) -> IntegrationResult<()> {
-        let running = self.running.clone();
-        
-        tokio::spawn(async move {
-            while running.load(Ordering::SeqCst) {
-                // Simulate network events
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
-        });
-        
-        Ok(())
-    }
-    
-    /// Handle network message
-    async fn handle_network_message(&self, peer_id: String, message: NetworkMessage) -> IntegrationResult<()> {
-        info!("Received message from {}: {:?}", peer_id, message);
-        
-        match message {
-            NetworkMessage::Block { height, data, block_type } => {
-                // Process new block
-                info!("Received block at height {}: {:?}", height, block_type);
-                // For now, just log
-            }
-            NetworkMessage::Transaction { data, .. } => {
-                // Add transaction to mempool
-                info!("Received transaction: {:?}", data);
-                // For now, just log
-            }
-            _ => {
-                // Handle other message types
-            }
-        }
-        
-        Ok(())
-    }
-    
-    /// Broadcast message to network
-    pub async fn broadcast_message(&self, message: NetworkMessage) -> IntegrationResult<()> {
-        // For now, just log
-        info!("Broadcasting message: {:?}", message);
-        Ok(())
-    }
-}
 
 /// Feature flags for testing
 pub mod feature_flags {
-    use crate::node::{NodeType, Region};
-    
     /// Performance configuration
     pub struct PerformanceConfig {
         pub enable_sharding: bool,
@@ -362,16 +123,12 @@ pub mod feature_flags {
                 enable_sharding: true,
                 enable_parallel_validation: true,
                 shard_count: 100,
-                batch_size: 1000,
+                batch_size: 200000, // v4.1: 200K TX/block
                 microblock_interval: std::time::Duration::from_secs(1),
             }
         }
     }
 }
-
-// Add serde_json dependency for serialization
-use serde_json;
-use hex;
 
 // Re-export commonly used types
 pub type BlockHash = [u8; 32];

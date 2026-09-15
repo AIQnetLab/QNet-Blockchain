@@ -23,7 +23,7 @@ def get_status():
             return jsonify({
                 "status": "active",
                 "node_id": status.get("node_id", "unknown"),
-                "node_type": status.get("node_type", "full"),
+                "node_type": status.get("node_type", "super"),  # v3.18: Default to super (full removed)
                 "address": status.get("address", "unknown"),
                 "blockchain_height": status.get("height", 0),
                 "peers_count": len(status.get("peers", [])),
@@ -50,7 +50,7 @@ def get_status():
             "status": "initializing", 
             "message": "Node starting up",
             "node_id": "temp_node_001",
-            "node_type": "full",
+            "node_type": "super",  # v3.18: Changed from 'full' to 'super'
             "blockchain_height": 0,
             "peers_count": 0,
             "is_mining": False

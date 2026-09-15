@@ -34,7 +34,7 @@ pub fn handler(ctx: Context<GetBurnStats>) -> Result<BurnStatistics> {
         phase_transitioned: burn_tracker.phase_transitioned,
         should_transition: burn_tracker.should_transition(),
         qnc_light_cost: QNC_LIGHT_ACTIVATION,
-        qnc_full_cost: QNC_FULL_ACTIVATION,
+        qnc_full_cost: 0,  // v3.18: Full node removed
         qnc_super_cost: QNC_SUPER_ACTIVATION,
         is_paused: burn_tracker.paused,
         last_update: burn_tracker.last_update,

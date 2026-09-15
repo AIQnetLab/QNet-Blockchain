@@ -1,0 +1,3944 @@
+//! Snapshot creation, chunked transfer, consensus binding, staging promotion and fast sync.
+
+use super::*;
+
+/// Wholesale-resync escalation window: lifts the two forward-only regress guards
+/// (download negotiation + promote) for the single fast_sync call that set it. The
+/// sync coordinator serializes fast_sync calls, so a plain flag is race-free; the
+/// promote/rehydrate root verification still gates every restore.
+static ALLOW_SNAPSHOT_REGRESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// RAII window for ALLOW_SNAPSHOT_REGRESS — clears on drop so a panic or task abort
+/// inside the download/promote chain can never leave the permission latched.
+struct RegressWindow;
+impl Drop for RegressWindow {
+    fn drop(&mut self) { ALLOW_SNAPSHOT_REGRESS.store(false, std::sync::atomic::Ordering::SeqCst); }
+}
+
+impl Storage {
+    pub fn accounts_cf_keys_page(&self, after: Option<&[u8]>, limit: usize)
+        -> IntegrationResult<(Vec<String>, Option<Vec<u8>>)> {
+        self.persistent.accounts_cf_keys_page(after, limit)
+    }
+    pub fn stage_trueup_candidates(&self, addrs: &[String]) -> IntegrationResult<usize> {
+        self.persistent.stage_trueup_candidates(addrs)
+    }
+
+    /// Stage every address the blocks in `from..=to` touched, for the post-reconcile CF true-up.
+    /// Their write-through rows in the accounts CF outlive a prune, so this journal is the
+    /// candidate set. Mirrors what apply can create: the tx sets plus the two protocol-level
+    /// credits that appear in no transaction (producer fee wallet, rewards pool). Flushed in
+    /// batches so peak RAM is bounded by the batch, not by the depth of the rollback; stops
+    /// collecting once the durable journal is full. Ticks the rollback watchdog.
+    /// Returns (staged, dropped_at_cap).
+    pub fn stage_trueup_for_range(&self, from: u64, to: u64) -> (usize, usize) {
+        const FLUSH_EVERY: usize = 20_000;
+        let mut batch: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        batch.insert(crate::StateManager::REWARDS_POOL.to_string());
+        let (mut staged, mut dropped) = (0usize, 0usize);
+        for h in from..=to {
+            // Every height, not every N: the scan runs inside the rollback barrier and each
+            // block is real I/O — a coarse tick lets the watchdog reap the barrier mid-scan.
+            crate::storage::note_rollback_progress();
+            if let Ok(Some((addrs, producer))) = self.touched_addresses_at(h) {
+                batch.extend(addrs);
+                if let Ok(Some((_, wallet, _))) = self.load_node_registration(&producer) {
+                    if !wallet.is_empty() { batch.insert(wallet); }
+                }
+            }
+            if batch.len() >= FLUSH_EVERY {
+                let (s, d) = self.flush_trueup_batch(&mut batch);
+                staged += s; dropped += d;
+                crate::storage::note_rollback_progress();
+                if dropped > 0 { break; } // journal full — further collecting cannot help
+            }
+        }
+        let (s, d) = self.flush_trueup_batch(&mut batch);
+        staged += s; dropped += d;
+        crate::storage::note_rollback_progress();
+        (staged, dropped)
+    }
+
+    /// Persist one true-up batch, emptying it. Returns (staged, dropped) — a failed write counts
+    /// the whole batch as dropped so the caller's coverage alarm fires; silence here would let
+    /// the later clear_trueup_candidates make the uncovered phantoms permanent.
+    fn flush_trueup_batch(&self, batch: &mut std::collections::BTreeSet<String>) -> (usize, usize) {
+        if batch.is_empty() { return (0, 0); }
+        let v: Vec<String> = std::mem::take(batch).into_iter().collect();
+        match self.stage_trueup_candidates(&v) {
+            Ok(d) => (v.len().saturating_sub(d), d),
+            Err(e) => {
+                println!("[WARN][STATE] trueup_stage_failed n={} err={}", v.len(), e);
+                (0, v.len())
+            }
+        }
+    }
+    pub fn load_trueup_candidates(&self) -> Vec<String> { self.persistent.load_trueup_candidates() }
+    pub fn clear_trueup_candidates(&self) { self.persistent.clear_trueup_candidates() }
+
+    /// Drop a phantom account everywhere it was mirrored: its accounts-CF row and, for a
+    /// contract, its contract_storage rows (RPC-visible garbage otherwise). Callers hold the state
+    /// lock that found it, so no later block's row for the address can land before the delete.
+    pub fn purge_phantom_account(&self, addr: &str) {
+        if let Err(e) = self.mirror_write_durable(Vec::new(), vec![addr.to_string()]) {
+            println!("[WARN][STATE] phantom_purge_failed addr={} err={}", addr, e);
+        }
+        let _ = self.persistent.delete_contract_storage(addr);
+    }
+
+    /// O(1) RocksDB estimate of total persisted accounts — the TOTAL on-disk
+    /// account count (every hot ∪ cold row in the "accounts" CF), NOT the bounded
+    /// LRU cache size. Best-effort: unwraps to 0 on missing CF / None / Err so it
+    /// never panics. node.rs uses it for the merkle-store auto-heuristic.
+    pub fn estimate_account_count(&self) -> u64 {
+        self.persistent.db.cf_handle("accounts")
+            .and_then(|cf| self.persistent.db
+                .property_int_value_cf(&cf, "rocksdb.estimate-num-keys")
+                .ok()
+                .flatten())
+            .unwrap_or(0)
+    }
+
+    pub fn record_checkpoint_vote(&self, index: u64, window_head: u64, content_digest: &[u8; 32],
+                                  pinned: bool, parent_index: u64, parent_hash: &[u8; 32])
+        -> IntegrationResult<()> {
+        self.persistent.record_checkpoint_vote(index, window_head, content_digest, pinned,
+                                               parent_index, parent_hash)
+    }
+    pub fn load_checkpoint_votes(&self)
+        -> IntegrationResult<Vec<(u64, u64, [u8; 32], bool, u64, [u8; 32])>> {
+        self.persistent.load_checkpoint_votes()
+    }
+    pub fn record_certified_pair(&self, index: u64, bytes: &[u8]) -> IntegrationResult<()> {
+        self.persistent.record_certified_pair(index, bytes)
+    }
+    pub fn record_certified_pair_at(&self, index: u64, head: u64, bytes: &[u8]) -> IntegrationResult<()> {
+        self.persistent.record_certified_pair_at(index, head, bytes)
+    }
+    pub fn set_certified_pair_head(&self, index: u64, head: u64) -> IntegrationResult<()> {
+        self.persistent.set_certified_pair_head(index, head)
+    }
+    pub fn certified_pair(&self, index: u64) -> IntegrationResult<Option<Vec<u8>>> {
+        self.persistent.certified_pair(index)
+    }
+    pub fn load_certified_pairs(&self) -> IntegrationResult<Vec<(u64, Vec<u8>)>> {
+        self.persistent.load_certified_pairs()
+    }
+    pub fn delete_certified_pair(&self, index: u64) -> IntegrationResult<()> {
+        self.persistent.delete_certified_pair(index)
+    }
+    pub fn applied_decree_seq(&self) -> u64 { self.persistent.applied_decree_seq() }
+    pub fn set_applied_decree_seq(&self, seq: u64) -> IntegrationResult<()> {
+        self.persistent.set_applied_decree_seq(seq)
+    }
+    pub fn force_last_sealed_mb(&self, idx: u64) -> IntegrationResult<()> {
+        self.persistent.force_last_sealed_mb(idx)
+    }
+    pub fn delete_microblocks_range_pub(&self, from: u64, to: u64) -> IntegrationResult<u64> {
+        self.persistent.delete_microblocks_range(from, to)
+    }
+
+    /// First height in (from, to] whose stored body a certificate contradicts: the sealed macroblock
+    /// of its window, or without one the committed checkpoint the WAL holds for it. None when every
+    /// certified body matches; heights nothing certifies carry no verdict and are kept. The
+    /// height->hash index is the body's identity (written with it, deleted with it).
+    pub fn first_certified_mismatch_above(&self, from: u64, to: u64) -> Option<u64> {
+        let mi = qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
+        let mut h = from + 1;
+        while h <= to {
+            let window_k = (h - 1) / mi + 1;
+            let start = (window_k - 1) * mi + 1;
+            let end = window_k * mi;
+            let sealed = crate::block_pipeline::certified_window_hashes(self, window_k);
+            let mut hh = h;
+            while hh <= end.min(to) {
+                let certified = match &sealed {
+                    Some(v) => v.get((hh - start) as usize).copied(),
+                    None => crate::block_pipeline::certified_pair_hash(self, hh),
+                };
+                if let Some(c) = certified {
+                    if self.load_microblock_hash(hh).ok().flatten().map_or(false, |l| l != c) { return Some(hh); }
+                }
+                hh += 1;
+            }
+            h = end + 1;
+        }
+        None
+    }
+    pub fn put_galc_held(&self, bytes: &[u8]) -> IntegrationResult<()> { self.persistent.put_galc_held(bytes) }
+    pub fn get_galc_held(&self) -> IntegrationResult<Option<Vec<u8>>> { self.persistent.get_galc_held() }
+    /// The macroblock index this node cold-joined at, or 0 for a from-genesis node.
+    ///
+    /// This is the ONE honest test for "the data is missing because *I* joined late" versus "the data is
+    /// missing on every node". Absence below the anchor is local blindness and the node must abstain;
+    /// absence at or above it is a fact the whole network shares, and abstaining on a shared fact is how
+    /// a recoverable state becomes a permanent halt — nobody signals, ever.
+    pub fn snapshot_join_anchor_mb(&self) -> u64 {
+        self.persistent.get_snapshot_anchor().ok().flatten()
+            .filter(|v| v.len() >= 8)
+            .map(|v| { let mut b = [0u8; 8]; b.copy_from_slice(&v[..8]); u64::from_le_bytes(b) })
+            .unwrap_or(0)
+    }
+
+    pub fn put_snapshot_anchor(&self, bytes: &[u8]) -> IntegrationResult<()> { self.persistent.put_snapshot_anchor(bytes) }
+    pub fn get_snapshot_anchor(&self) -> IntegrationResult<Option<Vec<u8>>> { self.persistent.get_snapshot_anchor() }
+
+    /// Write the boundary snapshot at `height` from a pinned view on the calling thread: encode, then store.
+    /// `fence` is what the capture saw, the snapshot generation and the block hash at `height`.
+    pub fn write_boundary_frame(&self, height: u64, views: super::boundary_snapshot::FrameViews, expected_leaves: Option<u64>,
+                                fence: Option<(u64, [u8; 32])>) -> IntegrationResult<()> {
+        if height == 0 {
+            return Ok(());
+        }
+        let _claim = self.claim_snapshot_height(height)?;
+        if self.snapshot_exists(height)? {
+            if crate::node::is_debug() { println!("[DBG][SNAPSHOT] snapshot_already_stored h={}", height); }
+            return Ok(());
+        }
+        println!("[INFO][STORAGE] state_snapshot_start height={}", height);
+        let start_time = std::time::Instant::now();
+        let timestamp = self.boundary_timestamp(height);
+        // Rows are written as the encoder fills them; an error drops them with `rows`.
+        let mut rows = self.begin_frame(height, true)?;
+        let counts = Self::encode_state_frame(&views, height, timestamp, expected_leaves, &mut rows)?;
+        drop(views); // the pins go before the final write
+        self.store_boundary_frame(height, rows, &counts, start_time, fence)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn frame_views(&self) -> IntegrationResult<super::boundary_snapshot::FrameViews> {
+        Ok(super::boundary_snapshot::FrameViews { accounts: self.pin_view()?, side: self.pin_view()? })
+    }
+
+    /// The carry's filter, applied when the frame is written: a canonical epoch_root_ key on the reward grid with
+    /// a 32-byte root, inside the band the certificate at this height proves.
+    fn frame_carries_epoch_root(key: &[u8], value: &[u8], height: u64) -> bool {
+        let digits = match key.strip_prefix(b"epoch_root_".as_ref()).and_then(|d| std::str::from_utf8(d).ok()) {
+            Some(d) => d,
+            None => return false,
+        };
+        let epoch = match digits.parse::<u64>() { Ok(e) => e, Err(_) => return false };
+        let n2 = (height / qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL).saturating_sub(2);
+        value.len() == 32 && digits.len() == 10 && Self::epoch_root_key(epoch).as_bytes() == key
+            && crate::reward_epoch::is_reward_epoch(epoch)
+            && n2 >= crate::reward_epoch::MB_PER_EPOCH && epoch <= n2 - crate::reward_epoch::MB_PER_EPOCH
+    }
+
+    /// A registry row as the frame carries it: chain-stamped rows only, the node-local write time replaced by
+    /// the frame's own timestamp and the RPC-written reputation by the value the chain apply writes.
+    fn frame_node_row(value: &[u8], timestamp: u64) -> Option<Vec<u8>> {
+        let mut row: serde_json::Value = serde_json::from_slice(value).ok()?;
+        row.get("reg_height")?.as_u64()?;
+        row["timestamp"] = serde_json::json!(timestamp);
+        row["reputation"] = serde_json::json!(1.0);
+        Some(row.to_string().into_bytes())
+    }
+
+    /// A frame row length as the format writes it; a row the u32 field cannot hold refuses the frame.
+    fn frame_len(len: usize) -> IntegrationResult<[u8; 4]> {
+        u32::try_from(len).map(u32::to_le_bytes)
+            .map_err(|_| IntegrationError::StorageError(format!("snapshot_row_too_long len={}", len)))
+    }
+
+    /// Canonical frame timestamp: the boundary block's own, not the wall clock, so every holder of the
+    /// height writes the same bytes.
+    fn boundary_timestamp(&self, height: u64) -> u64 {
+        match self.load_microblock_auto_format(height) {
+            Ok(Some(boundary_block)) => boundary_block.timestamp,
+            _ => 0,
+        }
+    }
+
+    /// Stream a pinned view into `sink` as one frame, [sha3(32) | uncompressed_len(8) | zstd]: a pure function
+    /// of the view, the height and the timestamp. Fails closed when the pinned accounts differ from the
+    /// committed leaf count.
+    fn encode_state_frame(views: &super::boundary_snapshot::FrameViews, height: u64, timestamp: u64,
+                          expected_leaves: Option<u64>, sink: &mut super::snapshot_index::FrameRows)
+                          -> IntegrationResult<FrameCounts> {
+        use std::io::Write;
+        let db = &views.accounts.db;
+        let snap = &views.accounts.snap;
+        // Reward and registry rows come from the pin taken under the lock that applied the block.
+        let side = &views.side.snap;
+
+        // Stream the logical payload through a zstd encoder into the chunk rows: neither the uncompressed
+        // blob nor the compressed frame (multi-GB at 10M accounts) is ever held whole. `uncompressed_len`
+        // tracks the running byte count fed to the encoder for the header. Content and order are fixed, so
+        // every holder streams the same bytes ⇒ the frame stays deterministic.
+        let mut encoder = zstd::Encoder::new(sink, 3)
+            .map_err(|e| IntegrationError::Other(format!("Full snapshot encoder init error: {}", e)))?;
+        let mut uncompressed_len: u64 = 0;
+        // Feed a chunk into the encoder while accumulating its length into
+        // `uncompressed_len` (checked-add: a >u64 payload is unrepresentable,
+        // never a silent wrap on the consensus-critical header).
+        macro_rules! feed {
+            ($enc:expr, $len:expr, $chunk:expr) => {{
+                let c = $chunk;
+                $enc.write_all(c)
+                    .map_err(|e| IntegrationError::Other(format!("Full snapshot write error: {}", e)))?;
+                $len = $len.checked_add(c.len() as u64)
+                    .ok_or_else(|| IntegrationError::Other("snapshot length overflow".to_string()))?;
+            }};
+        }
+
+        // Type discriminator first (0x02 = SNAP_TYPE_FULL), then the header fields.
+        feed!(encoder, uncompressed_len, &[0x02u8]); // SNAP_TYPE_FULL
+        feed!(encoder, uncompressed_len, &crate::node::SNAPSHOT_FORMAT_VERSION.to_le_bytes());
+        feed!(encoder, uncompressed_len, &height.to_le_bytes());
+        feed!(encoder, uncompressed_len, &timestamp.to_le_bytes());
+
+        // 4. Account state — the COMPLETE committed tree leaf set. The mirror queues every applied
+        //    block's rows ahead of the pin behind them, and an account leaves RAM only once its row
+        //    is written, so recompute reproduces the QC-bound state_root at any cache size.
+        //    Key-ordered iteration ⇒ byte-identical snapshots across nodes.
+        let accounts_cf = db.cf_handle("accounts")
+            .ok_or_else(|| IntegrationError::StorageError("accounts column family not found".to_string()))?;
+        let mut account_count = 0u64;
+        for item in snap.iterator_cf(&accounts_cf, rocksdb::IteratorMode::Start) {
+            let (key, value) = item?;
+            feed!(encoder, uncompressed_len, &Self::frame_len(key.len())?);
+            feed!(encoder, uncompressed_len, &key);
+            feed!(encoder, uncompressed_len, &Self::frame_len(value.len())?);
+            feed!(encoder, uncompressed_len, &value);
+            account_count += 1;
+        }
+        // Fail-closed: a pinned account set that diverges from the committed leaf set can
+        // never restore to a provable root — abort rather than persist a poison snapshot.
+        // Walk-back keeps older candidates; the next cycle retries after true-up.
+        if let Some(exp) = expected_leaves {
+            if exp != account_count {
+                eprintln!("[CRIT][SNAPSHOT] snapshot_aborted_cf_divergent h={} cf_accounts={} merkle_leaves={}",
+                          height, account_count, exp);
+                return Err(IntegrationError::StorageError(format!(
+                    "snapshot_cf_divergent h={} cf={} leaves={}", height, account_count, exp)));
+            }
+        }
+
+        // 5. v2.75: Include pending_rewards for fast sync (lazy rewards survive restart)
+        let mut rewards_count = 0u64;
+        if let Some(rewards_cf) = db.cf_handle("pending_rewards") {
+            // Write marker for rewards section
+            feed!(encoder, uncompressed_len, b"REWARDS_V1");
+
+            let rewards_iter = side.iterator_cf(&rewards_cf, rocksdb::IteratorMode::Start);
+            for item in rewards_iter {
+                let (key, value) = item?;
+                // Only what a joiner takes: the epoch roots of the band its certificate proves, by the carry's
+                // own filter. Every other row is re-derived or node-local, and differs between holders.
+                if !Self::frame_carries_epoch_root(&key, &value, height) { continue; }
+                feed!(encoder, uncompressed_len, &Self::frame_len(key.len())?);
+                feed!(encoder, uncompressed_len, &key);
+                feed!(encoder, uncompressed_len, &Self::frame_len(value.len())?);
+                feed!(encoder, uncompressed_len, &value);
+                rewards_count += 1;
+            }
+
+            // Write end marker
+            feed!(encoder, uncompressed_len, b"REWARDS_END");
+        }
+
+        // 6. v5.0: Include contract_storage for full state recovery
+        let mut contract_entries = 0u64;
+        if let Some(cs_cf) = db.cf_handle("contract_storage") {
+            feed!(encoder, uncompressed_len, b"CONTRACT_STORAGE_V1");
+            let cs_iter = snap.iterator_cf(&cs_cf, rocksdb::IteratorMode::Start);
+            for item in cs_iter {
+                let (key, value) = item?;
+                feed!(encoder, uncompressed_len, &Self::frame_len(key.len())?);
+                feed!(encoder, uncompressed_len, &key);
+                feed!(encoder, uncompressed_len, &Self::frame_len(value.len())?);
+                feed!(encoder, uncompressed_len, &value);
+                contract_entries += 1;
+            }
+            feed!(encoder, uncompressed_len, b"CONTRACT_STORAGE_END");
+        }
+
+        // 7. v5.0: Include node_registry for producer wallet lookups after snapshot restore
+        let mut registry_count = 0u64;
+        if let Some(nr_cf) = db.cf_handle("node_registry") {
+            feed!(encoder, uncompressed_len, b"NODE_REGISTRY_V1");
+            let nr_iter = side.iterator_cf(&nr_cf, rocksdb::IteratorMode::Start);
+            for item in nr_iter {
+                let (key, value) = item?;
+                // Only what a joiner takes, in one form on every holder: the roster keys the binder enumerates
+                // (srtr_/lrtr_, pure functions of the rows), chain-stamped node_ rows with their node-local write
+                // time and reputation replaced, and signer keys matching their row's commitment. The rest (rich
+                // list, endpoints, caches, origin markers, un-stamped rows) is node-local or re-derived.
+                let value: Vec<u8> = if key.starts_with(b"srtr_") || key.starts_with(b"lrtr_") {
+                    value.to_vec()
+                } else if key.starts_with(b"node_") {
+                    match Self::frame_node_row(&value, timestamp) { Some(v) => v, None => continue }
+                } else if let Some(id) = key.strip_prefix(b"vrf_pk_".as_ref()).and_then(|id| std::str::from_utf8(id).ok()) {
+                    // The commitment is immutable once stamped, so the live row answers as the pinned one would.
+                    if !Self::staged_vrf_pk_matches_commitment(db, nr_cf, id, &value) { continue; }
+                    value.to_vec()
+                } else {
+                    continue;
+                };
+                feed!(encoder, uncompressed_len, &Self::frame_len(key.len())?);
+                feed!(encoder, uncompressed_len, &key);
+                feed!(encoder, uncompressed_len, &Self::frame_len(value.len())?);
+                feed!(encoder, uncompressed_len, &value);
+                registry_count += 1;
+            }
+            feed!(encoder, uncompressed_len, b"NODE_REGISTRY_END");
+        }
+
+        // finish() flushes the final zstd frame into the rows; the header is filled in at seal.
+        encoder.finish()
+            .map_err(|e| IntegrationError::Other(format!("Full snapshot compression error: {}", e)))?;
+        Ok(FrameCounts {
+            accounts: account_count,
+            rewards: rewards_count,
+            contracts: contract_entries,
+            registry: registry_count,
+            uncompressed_len,
+        })
+    }
+
+    /// Complete an encoded frame. Under the snapshot fence: check that nothing since the capture abandoned its
+    /// chain (a snapshot prune, or another block at `height`), land the frame's last rows, manifest and index
+    /// row with the newest-frame pointer, then apply retention. A dropped frame takes its rows with it.
+    fn store_boundary_frame(&self, height: u64, rows: super::snapshot_index::FrameRows, counts: &FrameCounts,
+                            start: std::time::Instant, fence: Option<(u64, [u8; 32])>) -> IntegrationResult<()> {
+        let encode_ms = start.elapsed().as_millis();
+        let cf = self.persistent.db.cf_handle("snapshots")
+            .ok_or_else(|| IntegrationError::StorageError("snapshots column family not found".to_string()))?;
+        let _fence = self.snapshot_fence();
+        if let Some((generation, block_hash)) = fence {
+            let now_gen = self.snapshot_generation();
+            let now_hash = self.load_microblock_hash(height).ok().flatten();
+            if now_gen != generation || now_hash != Some(block_hash) {
+                println!("[WARN][SNAPSHOT] snapshot_dropped_abandoned_chain h={} generation={}->{} block_match={}",
+                         height, generation, now_gen, now_hash == Some(block_hash));
+                return Ok(());
+            }
+        }
+        let pointer = self.persistent.db.get_cf(cf, b"latest_full_snap")?
+            .filter(|v| v.len() >= 8)
+            .map(|v| { let mut b = [0u8; 8]; b.copy_from_slice(&v[..8]); u64::from_le_bytes(b) });
+        let mut batch = WriteBatch::default();
+        let manifest = rows.seal(counts.uncompressed_len, &mut batch)?;
+        if pointer.map_or(true, |p| height > p) {
+            batch.put_cf(cf, b"latest_full_snap", &height.to_le_bytes());
+        }
+        self.persistent.db.write(batch)?;
+        let retired = self.retain_snapshots_locked(crate::node::SNAPSHOT_KEEP_COUNT)?;
+        println!("[INFO][SNAPSHOT] full_snap_created h={} accounts={} rewards={} contracts={} registry={} compressed={}KB chunks={} uncompressed={}KB encode_ms={} total_ms={} retired={}",
+                 height, counts.accounts, counts.rewards, counts.contracts, counts.registry, manifest.total_size / 1024,
+                 manifest.chunk_count, counts.uncompressed_len / 1024, encode_ms, start.elapsed().as_millis(), retired);
+        Ok(())
+    }
+    
+    /// Apply-bound state_root + QC-certified total_supply at macroblock `mb_idx`, read from the
+    /// macroblock's embedded (Checkpoint, QC). total_supply is in Checkpoint::hash ⇒ 2f+1-certified — the
+    /// SAME source cold-join rehydrate uses, never a drifting live read. A pre-emission anchor (epoch<2)
+    /// may carry no checkpoint_qc ⇒ total_supply falls back to the balance sum (exact while minted==sum).
+    /// None ⇒ macroblock absent / corrupt QC (caller fails closed to full replay — never a wrong supply).
+    pub fn anchor_root_and_supply(&self, mb_idx: u64, accounts: &[(String, qnet_state::Account)]) -> Option<([u8; 32], u64)> {
+        let bytes = self.get_macroblock_by_height(mb_idx).ok()??;
+        let mb: qnet_state::MacroBlock = bincode::deserialize(&bytes).ok()?;
+        let ts = match &mb.consensus_data.checkpoint_qc {
+            // Present-but-corrupt QC ⇒ fail closed to full replay (NEVER fall through to the balance sum,
+            // which is wrong post-emission); log distinctly since a locally-sealed QC should never corrupt.
+            Some(b) => match bincode::deserialize::<(qnet_consensus::checkpoint_bft::Checkpoint, qnet_consensus::checkpoint_bft::QuorumCertificate)>(b) {
+                Ok((cp, _)) => cp.total_supply,
+                Err(e) => {
+                    if crate::node::is_warn() { println!("[WARN][SNAPSHOT] anchor_qc_corrupt mb={} err={} action=full_replay", mb_idx, e); }
+                    return None;
+                }
+            },
+            None => accounts.iter().map(|(_, a)| a.balance).fold(0u64, |acc, b| acc.saturating_add(b)),
+        };
+        Some((mb.state_root, ts))
+    }
+
+    pub async fn load_latest_state_snapshot(&self, exclude: &[u64]) -> IntegrationResult<Option<(u64, [u8; 32], Vec<u8>, u64)>> {
+        let snapshots_cf = self.persistent.db.cf_handle("snapshots")
+            .ok_or_else(|| IntegrationError::StorageError("snapshots column family not found".to_string()))?;
+
+        // Local restart restores from the apply-bound full_snap_ (the SAME complete snapshot P2P serves),
+        // NOT the retired live-captured state_snap_ (whose content drifted past its label height). accounts
+        // come from the snapshot; state_root + total_supply come from the anchor macroblock's QC-bound
+        // checkpoint (the cold-join source), never a drifting live read.
+        // Candidates newest→oldest, NOT only the pointer: a snapshot taken past a finality stall has no
+        // sealed anchor macroblock, and giving up there turned every restart during the stall into a
+        // from-genesis replay while perfectly anchored older snapshots sat one key away.
+        let mut candidates = super::snapshot_index::indexed_heights(&self.persistent.db, snapshots_cf)?;
+        candidates.sort_unstable_by(|a, b| b.cmp(a));
+        if candidates.is_empty() { return Ok(None); }
+
+        for height in candidates {
+            // Caller-rejected candidates (e.g. restored root failed the anchor verify) — walk older.
+            if exclude.contains(&height) { continue; }
+            // Reads the frame, checks its stream hash and keeps the accounts. Re-serialized as the bincode Vec
+            // the TIER-1 consumer expects, so the restore path below is unchanged.
+            let accounts = match self.decode_snapshot_accounts(height) {
+                Ok(a) => a,
+                Err(e) => {
+                    eprintln!("[WARN][SNAPSHOT] full_snap_ h={} decode_fail err={} — trying older", height, e);
+                    continue;
+                }
+            };
+
+            // full_snap_ heights are macroblock boundaries (h=90 + multiples of SNAPSHOT_INCREMENTAL_INTERVAL),
+            // so the anchor macroblock at height/90 carries the apply-bound state_root + QC total_supply.
+            let mb_idx = height / 90;
+            let (state_root, total_supply) = match self.anchor_root_and_supply(mb_idx, &accounts) {
+                Some(rs) => rs,
+                None => {
+                    eprintln!("[WARN][SNAPSHOT] full_snap_ h={} anchor mb={} unavailable — trying older", height, mb_idx);
+                    continue;
+                }
+            };
+
+            let accounts_data = bincode::serialize(&accounts)
+                .map_err(|e| IntegrationError::SerializationError(format!("reserialize_full_snap_accounts: {}", e)))?;
+
+            if crate::node::is_info() {
+                println!("[INFO][SNAPSHOT] full_snap_loaded h={} total_supply={} accounts={}",
+                         height, total_supply, accounts.len());
+            }
+
+            return Ok(Some((height, state_root, accounts_data, total_supply)));
+        }
+
+        eprintln!("[WARN][SNAPSHOT] no anchored full_snap_ — full replay");
+        Ok(None)
+    }
+    
+    /// v2.99: Load state snapshot by height and restore into StateManager
+    /// Load a state snapshot by height and return (state_root, accounts_bincode) for StateManager restoration.
+    /// Payload: [type=0x01 | state_root(32) | accounts_bincode]
+    // Persistent mempool API: pending TXs are mirrored to the `mempool` CF
+    // on admission and removed on inclusion / TTL / drop, so a producer that
+    // dies between accepting and including a TX doesn't silently drop it —
+    // the next process reloads the queue under the same gas-price ordering.
+    // Per entry, keyed by tx hash: [admission_ts u64 LE | tx_payload] (ts
+    // rebuilds TTL/by_gas_price on reload with no extra round-trip). One
+    // put_cf per TX; boot scan runs in spawn_blocking to free the reactor.
+
+    /// Persist a single pending mempool entry.
+    /// Called from the integration layer immediately after a TX is admitted
+    /// to the in-RAM `SimpleMempool`, so a crash between admission and
+    /// block inclusion does not lose the TX.
+    pub fn save_pending_tx(&self, tx_hash: &str, payload: &[u8], admission_ts: u64) -> IntegrationResult<()> {
+        let cf = self.persistent.db.cf_handle("mempool")
+            .ok_or_else(|| IntegrationError::StorageError("mempool column family not found".to_string()))?;
+        let mut value = Vec::with_capacity(8 + payload.len());
+        value.extend_from_slice(&admission_ts.to_le_bytes());
+        value.extend_from_slice(payload);
+        self.persistent.db.put_cf(&cf, tx_hash.as_bytes(), &value)?;
+        Ok(())
+    }
+
+    /// Remove a pending mempool entry (called on block inclusion,
+    /// TTL expiration, replacement, or explicit drop).
+    pub fn delete_pending_tx(&self, tx_hash: &str) -> IntegrationResult<()> {
+        let cf = self.persistent.db.cf_handle("mempool")
+            .ok_or_else(|| IntegrationError::StorageError("mempool column family not found".to_string()))?;
+        self.persistent.db.delete_cf(&cf, tx_hash.as_bytes())?;
+        Ok(())
+    }
+
+    /// Scan the entire `mempool` CF and return every persisted entry.
+    /// Used at node startup to repopulate the in-RAM mempool. Each tuple
+    /// is `(tx_hash, payload_bytes, admission_ts)`.
+    /// Runs on the async caller; in node.rs we wrap the entire restore
+    /// pass in `tokio::task::spawn_blocking` to keep the reactor free
+    /// while large mempools (≥100K entries) are streamed back in.
+    pub fn load_all_pending_txs(&self) -> IntegrationResult<Vec<(String, Vec<u8>, u64)>> {
+        let cf = self.persistent.db.cf_handle("mempool")
+            .ok_or_else(|| IntegrationError::StorageError("mempool column family not found".to_string()))?;
+        let mut out: Vec<(String, Vec<u8>, u64)> = Vec::new();
+        let iter = self.persistent.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
+        for item in iter {
+            let (key, value) = item?;
+            if value.len() < 8 { continue; }
+            let admission_ts = u64::from_le_bytes(
+                value[..8].try_into()
+                    .map_err(|_| IntegrationError::StorageError("Invalid mempool entry header".to_string()))?
+            );
+            let payload = value[8..].to_vec();
+            let tx_hash = String::from_utf8_lossy(&key).into_owned();
+            out.push((tx_hash, payload, admission_ts));
+        }
+        Ok(out)
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // v15.10 STAGE-2C: CROSS-SHARD 2PC PERSISTENCE API
+    // ───────────────────────────────────────────────────────────────────────
+    // Two surfaces:
+    //   * `cross_shard_pending` — in-flight 2PC envelopes keyed by
+    //     `tx_id` (32-byte). Survives coordinator restarts; the failover
+    //     path on a successor node reads this CF to reconstitute state.
+    //   * `cross_shard_receipts` — terminal receipts keyed by `tx_id`.
+    //     Append-only; queried by wallets through the
+    //     `/api/v1/cross-shard/receipt/{tx_id}` RPC endpoint.
+    //
+    // PRIVACY-FIRST LOGGING
+    // ───────────────────────────────────────────────────────────────────────
+    // Logged tx_id previews are truncated to the first 16 hex chars,
+    // matching the rest of the codebase's privacy posture.
+
+    /// Persist a `CrossShardEnvelope` (or any wire-format bytes) for the
+    /// given `tx_id`. Idempotent: re-saving overwrites the previous
+    /// value, which is the correct behaviour when the coordinator
+    /// re-broadcasts a phase advancement (for example after a restart).
+    pub fn save_cross_shard_pending(&self, tx_id: &[u8; 32], payload: &[u8]) -> IntegrationResult<()> {
+        let cf = self.persistent.db.cf_handle("cross_shard_pending")
+            .ok_or_else(|| IntegrationError::StorageError("cross_shard_pending column family not found".to_string()))?;
+        self.persistent.db.put_cf(&cf, tx_id, payload)?;
+        Ok(())
+    }
+
+    /// Read the persisted envelope (if any) for `tx_id`. Returns None
+    /// when the 2PC has already been finalised — finalisation moves the
+    /// record from `pending` to `receipts`.
+    pub fn load_cross_shard_pending(&self, tx_id: &[u8; 32]) -> IntegrationResult<Option<Vec<u8>>> {
+        let cf = self.persistent.db.cf_handle("cross_shard_pending")
+            .ok_or_else(|| IntegrationError::StorageError("cross_shard_pending column family not found".to_string()))?;
+        Ok(self.persistent.db.get_cf(&cf, tx_id)?)
+    }
+
+    /// Drop the pending entry for `tx_id`. Called when the protocol
+    /// reaches a terminal state (after `save_cross_shard_receipt`).
+    pub fn delete_cross_shard_pending(&self, tx_id: &[u8; 32]) -> IntegrationResult<()> {
+        let cf = self.persistent.db.cf_handle("cross_shard_pending")
+            .ok_or_else(|| IntegrationError::StorageError("cross_shard_pending column family not found".to_string()))?;
+        self.persistent.db.delete_cf(&cf, tx_id)?;
+        Ok(())
+    }
+
+    /// Persist a terminal-state `CrossShardReceipt`. Append-only — the
+    /// receipt MUST NOT be overwritten once written, because wallets
+    /// rely on its immutability for trust-less verification.
+    pub fn save_cross_shard_receipt(&self, tx_id: &[u8; 32], payload: &[u8]) -> IntegrationResult<()> {
+        let cf = self.persistent.db.cf_handle("cross_shard_receipts")
+            .ok_or_else(|| IntegrationError::StorageError("cross_shard_receipts column family not found".to_string()))?;
+        // Idempotent re-save with byte-identical payload is allowed
+        // (replay of the same finalisation event); divergent payloads
+        // are detected at the integration layer through the receipt's
+        // BFT proofs and rejected before reaching this method.
+        self.persistent.db.put_cf(&cf, tx_id, payload)?;
+        Ok(())
+    }
+
+    /// Read the receipt (if any) for `tx_id`. The wallet RPC endpoint
+    /// uses this to surface the trust-less outcome of a cross-shard
+    /// transaction. Returns None for tx_ids that are still in flight or
+    /// have never been seen.
+    pub fn load_cross_shard_receipt(&self, tx_id: &[u8; 32]) -> IntegrationResult<Option<Vec<u8>>> {
+        let cf = self.persistent.db.cf_handle("cross_shard_receipts")
+            .ok_or_else(|| IntegrationError::StorageError("cross_shard_receipts column family not found".to_string()))?;
+        Ok(self.persistent.db.get_cf(&cf, tx_id)?)
+    }
+
+    /// Iterate every persisted pending 2PC and return `(tx_id, payload)`
+    /// pairs. Used at coordinator startup to rehydrate the in-RAM
+    /// `CrossShardCoordinator.pending` map; subsequent failover-driven
+    /// takeovers can advance the protocol from the recorded state
+    /// without losing any in-flight commitments.
+    pub fn load_all_cross_shard_pending(&self) -> IntegrationResult<Vec<([u8; 32], Vec<u8>)>> {
+        let cf = self.persistent.db.cf_handle("cross_shard_pending")
+            .ok_or_else(|| IntegrationError::StorageError("cross_shard_pending column family not found".to_string()))?;
+        let mut out = Vec::new();
+        let iter = self.persistent.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
+        for item in iter {
+            let (key, value) = item?;
+            if key.len() == 32 {
+                let mut tx_id = [0u8; 32];
+                tx_id.copy_from_slice(&key);
+                out.push((tx_id, value.to_vec()));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Drop every entry in the `mempool` CF. Reserved for explicit
+    /// admin-level resets; not part of the normal lifecycle.
+    pub fn clear_pending_txs(&self) -> IntegrationResult<()> {
+        let cf = self.persistent.db.cf_handle("mempool")
+            .ok_or_else(|| IntegrationError::StorageError("mempool column family not found".to_string()))?;
+        let mut batch = WriteBatch::default();
+        let iter = self.persistent.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
+        for item in iter {
+            let (key, _) = item?;
+            batch.delete_cf(&cf, &key);
+        }
+        self.persistent.db.write(batch)?;
+        Ok(())
+    }
+
+    /// The freshest retained snapshot height at or below `target_height`, from the index. A reconcile restores
+    /// it and replays at most one SNAPSHOT_INCREMENTAL_INTERVAL of blocks instead of the whole chain.
+    pub fn find_snapshot_at_or_before(&self, target_height: u64) -> IntegrationResult<Option<u64>> {
+        if target_height == 0 {
+            return Ok(None);
+        }
+        let snapshots_cf = self.persistent.db.cf_handle("snapshots")
+            .ok_or_else(|| IntegrationError::StorageError("snapshots column family not found".to_string()))?;
+        super::snapshot_index::highest_le(&self.persistent.db, snapshots_cf, target_height)
+    }
+
+    /// The accounts of the frame stored at `height`, for an in-memory state rebuild. The whole frame is read so
+    /// its stream hash is checked; the other sections are skipped.
+    pub fn decode_snapshot_accounts(&self, height: u64) -> IntegrationResult<Vec<(String, qnet_state::Account)>> {
+        let mut frame = self.open_frame(height)?
+            .ok_or_else(|| IntegrationError::StorageError(format!("snapshot h={} not stored", height)))?;
+        let mut out = Vec::new();
+        let frame_height = Self::walk_frame(&mut frame, |section, key, value| {
+            if section == FrameSection::Accounts {
+                let addr = String::from_utf8(key.to_vec())
+                    .map_err(|e| IntegrationError::StorageError(format!("addr utf8: {}", e)))?;
+                let account = bincode::deserialize::<qnet_state::Account>(value)
+                    .map_err(|e| IntegrationError::SerializationError(format!("account decode: {}", e)))?;
+                out.push((addr, account));
+            }
+            Ok(())
+        })?;
+        if frame_height != height {
+            return Err(IntegrationError::StorageError(format!(
+                "snapshot_height_mismatch stored_at={} frame_says={}", height, frame_height)));
+        }
+        Ok(out)
+    }
+
+    /// Walk a frame's rows in stream order, [0x02 | version(4) | height(8) | timestamp(8) | accounts |
+    /// REWARDS_V1 .. REWARDS_END | CONTRACT_STORAGE_V1 .. END | NODE_REGISTRY_V1 .. END], then check the
+    /// stream against its header: the sha3 of the compressed bytes and the uncompressed length. Rows reach
+    /// `f` before that check, so callers put them where a failed check leaves nothing live. Returns the
+    /// height the frame carries.
+    pub(crate) fn walk_frame<R: std::io::Read>(
+        reader: &mut R,
+        mut f: impl FnMut(FrameSection, &[u8], &[u8]) -> IntegrationResult<()>,
+    ) -> IntegrationResult<u64> {
+        use sha3::Digest;
+        let bad = |what: String| IntegrationError::StorageError(format!("snapshot_frame_invalid {}", what));
+        let mut header = [0u8; 40];
+        reader.read_exact(&mut header).map_err(|e| bad(format!("header: {}", e)))?;
+        let mut hashed = HashingReader { inner: reader, hasher: sha3::Sha3_256::new() };
+        let (height, consumed) = {
+            let decoder = zstd::stream::read::Decoder::new(&mut hashed).map_err(|e| bad(format!("zstd: {}", e)))?;
+            let declared = u64::from_le_bytes(header[32..40].try_into().expect("8 bytes"));
+            let mut s = FrameStream { inner: decoder, buf: Vec::new(), pos: 0, consumed: 0, seen: 0, limit: declared };
+            let io = |e: std::io::Error| bad(e.to_string());
+            if s.take(1).map_err(io)?[0] != 0x02 {
+                return Err(bad("type".to_string()));
+            }
+            let version = s.u32().map_err(io)?;
+            // A value this large is the first bytes of a state root: the retired accounts-only format.
+            if version >= 10_000 {
+                return Err(bad("format_B_incomplete_for_consensus".to_string()));
+            }
+            if version == 0 || version > crate::node::SNAPSHOT_FORMAT_VERSION {
+                println!("[WARN][STORAGE] snapshot_version_unknown v={} current={}",
+                         version, crate::node::SNAPSHOT_FORMAT_VERSION);
+            }
+            let height = u64::from_le_bytes(s.take(8).map_err(io)?.try_into().expect("8 bytes"));
+            s.take(8).map_err(io)?; // timestamp
+            while !s.at_end().map_err(io)? && !s.at(b"REWARDS_V1").map_err(io)? {
+                s.row(FrameSection::Accounts, &mut f)?;
+            }
+            for (section, open, close) in [
+                (FrameSection::Rewards, &b"REWARDS_V1"[..], &b"REWARDS_END"[..]),
+                (FrameSection::Contracts, &b"CONTRACT_STORAGE_V1"[..], &b"CONTRACT_STORAGE_END"[..]),
+                (FrameSection::Registry, &b"NODE_REGISTRY_V1"[..], &b"NODE_REGISTRY_END"[..]),
+            ] {
+                if !s.at(open).map_err(io)? {
+                    continue;
+                }
+                s.take(open.len()).map_err(io)?;
+                loop {
+                    if s.at(close).map_err(io)? {
+                        s.take(close.len()).map_err(io)?;
+                        break;
+                    }
+                    if s.at_end().map_err(io)? {
+                        return Err(bad(format!("{:?} unterminated", section)));
+                    }
+                    s.row(section, &mut f)?;
+                }
+            }
+            if !s.at_end().map_err(io)? {
+                return Err(bad("trailing bytes".to_string()));
+            }
+            (height, s.consumed)
+        };
+        std::io::copy(&mut hashed, &mut std::io::sink()).map_err(|e| bad(e.to_string()))?;
+        if hashed.hasher.finalize()[..] != header[..32] {
+            return Err(bad("integrity check failed".to_string()));
+        }
+        if consumed != u64::from_le_bytes(header[32..40].try_into().expect("8 bytes")) {
+            return Err(bad("uncompressed length mismatch".to_string()));
+        }
+        Ok(height)
+    }
+
+    /// Load the stored frame at `height` and restore its sections into RocksDB, streamed from the chunk rows:
+    /// rows land in batches as they are parsed, and the stream hash is checked at the end.
+    /// stage=true restores into the *_stage CFs (verify-then-promote cold-join: live state stays
+    /// untouched until the binding passes); stage=false restores directly into live CFs.
+    pub async fn load_state_snapshot(&self, height: u64, stage: bool) -> IntegrationResult<()> {
+        if crate::node::is_info() {
+            println!("[INFO][SNAPSHOT] full_snap_loading h={} stage={}", height, stage);
+        }
+        let accounts_cf_name = if stage { "accounts_stage" } else { "accounts" };
+        let rewards_cf_name = if stage { "pending_rewards_stage" } else { "pending_rewards" };
+        let contract_cf_name = if stage { "contract_storage_stage" } else { "contract_storage" };
+        let registry_cf_name = if stage { "node_registry_stage" } else { "node_registry" };
+
+        // Clear the staging CFs BEFORE a fresh staged load. A crash in a prior attempt's narrow
+        // promote window (marker deleted but stage-clear not yet finished) can leave stale rows;
+        // loading a new snapshot on top would then let those poison this snapshot's Pattern-C
+        // merkle recompute → a fail-closed reject of an otherwise-honest snapshot (a liveness
+        // hole, forcing a needless full replay). The *_stage CFs are throwaway verify-space, so
+        // truncating them here is always safe and makes each staged load self-contained.
+        if stage {
+            for cf in &[accounts_cf_name, rewards_cf_name, contract_cf_name, registry_cf_name] {
+                let _ = self.clear_cf(cf);
+            }
+        }
+
+        let open = || -> IntegrationResult<super::snapshot_index::FrameReader> {
+            self.open_frame(height)?
+                .ok_or_else(|| IntegrationError::StorageError(format!("Snapshot at h={} not found", height)))
+        };
+        // Live rows are replaced only by a frame that checked out end to end, once the mirror has drained.
+        if !stage {
+            Self::walk_frame(&mut open()?, |_, _, _| Ok(()))?;
+            self.mirror_barrier();
+        }
+        let mut frame = open()?;
+        let cf_name = |section: FrameSection| match section {
+            FrameSection::Accounts => accounts_cf_name,
+            FrameSection::Rewards => rewards_cf_name,
+            FrameSection::Contracts => contract_cf_name,
+            FrameSection::Registry => registry_cf_name,
+        };
+        let db = &self.persistent.db;
+        let mut counts = [0u64; 4];
+        let mut batch = WriteBatch::default();
+        let frame_height = Self::walk_frame(&mut frame, |section, key, value| {
+            let cf = db.cf_handle(cf_name(section)).ok_or_else(|| IntegrationError::StorageError(
+                format!("{} column family not found", cf_name(section))))?;
+            batch.put_cf(cf, key, value);
+            counts[section as usize] += 1;
+            if batch.len() >= 10_000 {
+                db.write(std::mem::take(&mut batch))?;
+            }
+            Ok(())
+        })?;
+        db.write(batch)?;
+        if frame_height != height {
+            return Err(IntegrationError::StorageError(format!(
+                "snapshot_height_mismatch stored_at={} frame_says={}", height, frame_height)));
+        }
+        let [account_count, rewards_count, contract_count, registry_count] = counts;
+        // Derived indices (roster srtr_/lrtr_, cbw burn→wallet, registry_lthash) live in metadata, NOT in the
+        // snapshot blob. Rebuild them deterministically from the restored node_registry, bounded by the
+        // snapshot height. In stage mode this runs at promote (against live), never on the staging copy.
+        if !stage {
+            let _ = self.backfill_roster_indices();
+            match self.rebuild_committed_burn_wallet(height) {
+                Ok(n) if crate::node::is_info() => println!("[INFO][SNAPSHOT] cbw_rebuilt bindings={}", n),
+                Err(e) => println!("[WARN][SNAPSHOT] cbw_rebuild_failed err={}", e),
+                _ => {}
+            }
+            if let Err(e) = self.rebuild_registry_lthash(height) {
+                println!("[WARN][SNAPSHOT] registry_lthash_rebuild_failed err={}", e);
+            }
+            // FIX-5: derive dilithium_pk_root LtHash from the restored accounts (metadata CF is
+            // not snapshot-carried) so elided-pk verify + the next checkpoint match the network.
+            if let Err(e) = self.rebuild_dilithium_pk_lthash() {
+                println!("[WARN][SNAPSHOT] dilithium_pk_lthash_rebuild_failed err={}", e);
+            }
+            // Never inherit peer-supplied rich-list rows (display-only, snapshot-unverified) —
+            // the boot rebuild re-derives from the restored accounts.
+            let _ = self.richlist_clear();
+        }
+
+        if crate::node::is_info() {
+            println!("[INFO][SNAPSHOT] full_snap_restored h={} accounts={} rewards={} contracts={} registry={}",
+                     height, account_count, rewards_count, contract_count, registry_count);
+        }
+
+        // v32.10: trust Pattern C. SHA3 byte integrity + Zstd parse + format
+        // probe already reject malformed bytes upstream. Cryptographic
+        // snapshot_root verification (verify_snapshot_consensus_binding)
+        // matches macroblock 2f+1 commitment — that is the security gate,
+        // not entry counts. Empty-state anchors (h=90 fresh net: registry>0,
+        // accounts=0) are legitimate.
+        if account_count == 0 && crate::node::is_info() {
+            println!(
+                "[INFO][SNAPSHOT] empty_state_anchor h={} registry={} mode=pre_first_transfer",
+                height, registry_count,
+            );
+        }
+
+        // Live restore advances chain_height to the snapshot height so catch-up fetches only
+        // blocks AFTER it. Stage mode leaves chain_height untouched — it is advanced by promote
+        // once the binding passes.
+        if !stage {
+            self.set_chain_height(height)?;
+            println!("[INFO][SNAPSHOT] format_A_chain_height_set h={}", height);
+        }
+
+        Ok(())
+    }
+    
+    // v3.41: cleanup_old_snapshots unified into the ephemeral cleanup section above
+    
+    // PRODUCTION: IPFS integration for decentralized snapshot distribution
+    
+    /// Upload snapshot to IPFS and return CID (Content Identifier)
+    /// A frame's chunks as a stream, each read off the reactor; it ends at the first error.
+    pub(crate) fn frame_chunk_stream(frame: super::snapshot_index::FrameReader)
+        -> impl futures::Stream<Item = std::io::Result<Vec<u8>>> + Send + 'static {
+        futures::stream::unfold(Some(frame), |state| async move {
+            let mut frame = state?;
+            let (frame, chunk) = tokio::task::spawn_blocking(move || { let c = frame.next_chunk(); (frame, c) })
+                .await.ok()?;
+            match chunk? {
+                Ok(c) => Some((Ok(c), Some(frame))),
+                Err(e) => Some((Err(e), None)),
+            }
+        })
+    }
+
+    pub async fn upload_snapshot_to_ipfs(&self, height: u64) -> IntegrationResult<String> {
+        // PRODUCTION: Check if IPFS is available (OPTIONAL feature)
+        let ipfs_api = match std::env::var("IPFS_API_URL") {
+            Ok(url) => url,
+            Err(_) => {
+                // IPFS is OPTIONAL - skip if not configured
+                return Err(IntegrationError::Other("IPFS not configured (set IPFS_API_URL to enable)".to_string()));
+            }
+        };
+        
+        println!("[INFO][STORAGE] ipfs_snapshot_upload_start height={}", height);
+        
+        // Streamed from the chunk rows as the body is sent: the frame is never held whole.
+        let frame = self.open_frame(height)?
+            .ok_or_else(|| IntegrationError::StorageError(format!("Snapshot at height {} not found", height)))?;
+        let total = frame.total_size() as u64;
+        let body = reqwest::Body::from(warp::hyper::Body::wrap_stream(Self::frame_chunk_stream(frame)));
+
+        // No whole-request timeout: a multi-GB frame takes as long as the link needs.
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| IntegrationError::Other(format!("HTTP client error: {}", e)))?;
+
+        // Create multipart form for IPFS add endpoint
+        let form = reqwest::multipart::Form::new()
+            .part("file", reqwest::multipart::Part::stream_with_length(body, total)
+                .file_name(format!("qnet_snapshot_{}.dat", height)));
+        
+        // Upload to IPFS
+        let response = client.post(&format!("{}/api/v0/add", ipfs_api))
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e| IntegrationError::Other(format!("IPFS upload failed: {}", e)))?;
+        
+        if response.status().is_success() {
+            let result: serde_json::Value = response.json().await
+                .map_err(|e| IntegrationError::Other(format!("IPFS response parse error: {}", e)))?;
+            
+            if let Some(cid) = result.get("Hash").and_then(|v| v.as_str()) {
+                // Store IPFS CID reference (in a scope to drop cf_handle)
+                {
+                    let ipfs_key = format!("ipfs_{}", height);
+                    let snapshots_cf = self.persistent.db.cf_handle("snapshots")
+                        .ok_or_else(|| IntegrationError::StorageError("snapshots column family not found".to_string()))?;
+                    self.persistent.db.put_cf(&snapshots_cf, ipfs_key.as_bytes(), cid.as_bytes())?;
+                } // cf_handle is dropped here
+                
+                println!("[INFO][STORAGE] ipfs_snapshot_uploaded cid={}", cid);
+                
+                // PRODUCTION: Pin the content to ensure persistence (now safe after cf_handle is dropped)
+                self.pin_ipfs_content(&ipfs_api, cid).await?;
+                
+                return Ok(cid.to_string());
+            }
+        }
+        
+        Err(IntegrationError::StorageError("Failed to upload snapshot to IPFS".to_string()))
+    }
+    
+    /// Pin IPFS content to ensure it stays available
+    pub(super) async fn pin_ipfs_content(&self, ipfs_api: &str, cid: &str) -> IntegrationResult<()> {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| IntegrationError::Other(format!("HTTP client error: {}", e)))?;
+        
+        let response = client.post(&format!("{}/api/v0/pin/add", ipfs_api))
+            .query(&[("arg", cid)])
+            .send()
+            .await
+            .map_err(|e| IntegrationError::Other(format!("IPFS pin failed: {}", e)))?;
+        
+        if response.status().is_success() {
+            println!("[INFO][STORAGE] ipfs_content_pinned cid={}", cid);
+            Ok(())
+        } else {
+            Err(IntegrationError::StorageError(format!("Failed to pin IPFS content: {}", cid)))
+        }
+    }
+    
+    /// Fetch the frame at `height` from IPFS by CID, under the caller's claim.
+    async fn fetch_frame_ipfs(&self, claim: &super::snapshot_index::HeightClaim<'_>, cid: &str, height: u64)
+        -> IntegrationResult<()> {
+        let ipfs_gateway = match std::env::var("IPFS_GATEWAY_URL") {
+            Ok(url) => url,
+            Err(_) => {
+                // DECENTRALIZED: No default to centralized services!
+                // User must configure their own IPFS gateway or local node
+                return Err(IntegrationError::Other(
+                    "IPFS gateway not configured (set IPFS_GATEWAY_URL or run local IPFS node)".to_string()
+                ));
+            }
+        };
+        
+        println!("[INFO][STORAGE] ipfs_snapshot_download_start cid={}", cid);
+        
+        // PRODUCTION: Try gateways from environment or peers
+        let mut gateways = vec![ipfs_gateway.clone()];
+        
+        // Add additional gateways from environment (comma-separated)
+        if let Ok(extra_gateways) = std::env::var("IPFS_EXTRA_GATEWAYS") {
+            for gateway in extra_gateways.split(',') {
+                gateways.push(gateway.trim().to_string());
+            }
+        }
+        
+        // DECENTRALIZED: Prefer local IPFS nodes from peers
+        // In production, would discover IPFS gateways from P2P network
+        // Not hardcoding any centralized services!
+        
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(300)) // 5 minutes for large downloads
+            .build()
+            .map_err(|e| IntegrationError::Other(format!("HTTP client error: {}", e)))?;
+        
+        // Each gateway's body streams into chunk rows; its header must match the stream it came with.
+        self.abort_frame(claim, height);
+        let mut stored = None;
+        for gateway in &gateways {
+            let url = format!("{}/ipfs/{}", gateway, cid);
+            println!("[INFO][STORAGE] ipfs_trying_gateway url={}", gateway);
+            let mut response = match client.get(&url).send().await {
+                Ok(r) if r.status().is_success() => r,
+                Ok(r) => {
+                    println!("[WARN][STORAGE] ipfs_gateway_error gateway={} status={}", gateway, r.status());
+                    continue;
+                }
+                Err(e) => {
+                    println!("[WARN][STORAGE] ipfs_connect_failed gateway={} err={}", gateway, e);
+                    continue;
+                }
+            };
+            let mut rows = self.begin_frame(height, false)?;
+            match Self::stream_body_into(&mut response, &mut rows).await {
+                Ok(()) if rows.body_matches_header() => {
+                    println!("[INFO][STORAGE] ipfs_downloaded bytes={} gateway={}", rows.len(), gateway);
+                    stored = Some(rows);
+                    break;
+                }
+                Ok(()) => println!("[WARN][STORAGE] ipfs_integrity_failed gateway={}", gateway),
+                Err(e) => println!("[WARN][STORAGE] ipfs_read_failed gateway={} err={}", gateway, e),
+            }
+        }
+        let rows = stored
+            .ok_or_else(|| IntegrationError::StorageError("Failed to download from any IPFS gateway".to_string()))?;
+        {
+            let _fence = self.snapshot_fence();
+            let mut batch = WriteBatch::default();
+            rows.seal(0, &mut batch)?;
+            self.persistent.db.write(batch)?;
+        }
+        let snapshots_cf = self.persistent.db.cf_handle("snapshots")
+            .ok_or_else(|| IntegrationError::StorageError("snapshots column family not found".to_string()))?;
+
+        // Save IPFS reference
+        let ipfs_key = format!("ipfs_{}", height);
+        self.persistent.db.put_cf(&snapshots_cf, ipfs_key.as_bytes(), cid.as_bytes())?;
+        
+        println!("[INFO][STORAGE] ipfs_snapshot_saved height={}", height);
+        
+        Ok(())
+    }
+    
+    /// Get IPFS CID for a snapshot at given height
+    pub fn get_snapshot_ipfs_cid(&self, height: u64) -> IntegrationResult<Option<String>> {
+        let snapshots_cf = self.persistent.db.cf_handle("snapshots")
+            .ok_or_else(|| IntegrationError::StorageError("snapshots column family not found".to_string()))?;
+        
+        let ipfs_key = format!("ipfs_{}", height);
+        match self.persistent.db.get_cf(&snapshots_cf, ipfs_key.as_bytes())? {
+            Some(cid_bytes) => Ok(Some(String::from_utf8_lossy(&cid_bytes).to_string())),
+            None => Ok(None)
+        }
+    }
+    
+    // NOTE: a former `announce_snapshot_to_peers` broadcast a StateSnapshot IPFS-CID hint to
+    // every peer, but the receiver only logged it (never fetched) — dead traffic. State sync
+    // is fully handled by GALC + the QC-anchored snapshot/full-sync path, so the announcement
+    // was removed.
+
+    /// EIP-4444-style body expiry for the archival (Super) tier. Microblock BODIES
+    /// (the bulk: heartbeats + TXs) older than `retention_blocks` are dropped, while
+    /// the hash index (metadata), macroblocks, snapshots and account state are kept —
+    /// so chain-continuity (previous_hash) stays an O(1) hash-index lookup and reward
+    /// eligibility (read from state + macroblock summaries) is unaffected. Block 0
+    /// (genesis) is never pruned. A watermark in `metadata` bounds each run to the
+    /// newly-aged-out range (O(retention/run), not O(height)). Safe by construction:
+    /// every body reader uses `if let Ok(Some(..))`, so a pruned body is skipped, and
+    /// cold-start replays from a <=1h snapshot, never across the retention window.
+    /// Returns the number of bodies pruned this run.
+    /// Height below which per-block bodies AND blocklogs have been pruned on this node (0 if never
+    /// pruned) — the `body_prune_watermark` written by prune_old_microblock_bodies. getLogs reads
+    /// this to report `pruned_below`, so an empty result for an aged-out height is distinguishable
+    /// from a block that genuinely emitted no events (both otherwise return count:0).
+    pub fn log_prune_floor(&self) -> u64 {
+        self.persistent.db.cf_handle("metadata")
+            .and_then(|cf| self.persistent.db.get_cf(&cf, b"body_prune_watermark").ok().flatten())
+            .filter(|v| v.len() == 8)
+            .map(|v| { let mut b = [0u8; 8]; b.copy_from_slice(&v[..8]); u64::from_le_bytes(b) })
+            .unwrap_or(0)
+    }
+
+    pub fn prune_old_microblock_bodies(&self, current_height: u64, retention_blocks: u64) -> IntegrationResult<u64> {
+        // Super (incl. genesis) is the only tier that stores block data: Light nodes
+        // are stateless mobile clients and Full nodes are removed. Off-tier or before
+        // the first full retention window → nothing to prune.
+        if self.storage_mode != StorageMode::Super || current_height <= retention_blocks {
+            return Ok(0);
+        }
+        // Body-only prune: deletes ONLY microblock_{h} bodies, KEEPING macroblock objects +
+        // microblock_hash_{h} (the cold-join lineage walk reads macroblock OBJECTS, never bodies), so it
+        // can never cross anything that walk needs — no WS-floor clamp required. (An earlier clamp tied to
+        // the FROZEN snapshot join-anchor wrongly froze pruning forever above the anchor → unbounded
+        // growth on snapshot-joined nodes; removed.)
+        let prune_before = current_height - retention_blocks;
+
+        let microblocks_cf = self.persistent.db.cf_handle("microblocks")
+            .ok_or_else(|| IntegrationError::StorageError("microblocks column family not found".to_string()))?;
+        let metadata_cf = self.persistent.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
+
+        const WATERMARK_KEY: &[u8] = b"body_prune_watermark";
+        let watermark = self.persistent.db.get_cf(&metadata_cf, WATERMARK_KEY)?
+            .filter(|v| v.len() == 8)
+            .map(|v| {
+                let mut b = [0u8; 8];
+                b.copy_from_slice(&v[..8]);
+                u64::from_le_bytes(b)
+            })
+            .unwrap_or(0);
+
+        // Never touch genesis (h=0); resume from the watermark.
+        let from = watermark.max(1);
+        if prune_before <= from {
+            return Ok(0);
+        }
+
+        let mut batch = WriteBatch::default();
+        for h in from..prune_before {
+            // Body only — KEEP metadata/microblock_hash_{h} (continuity) + macroblocks.
+            batch.delete_cf(&microblocks_cf, mb_body_key(h).as_bytes());
+            // The ancestry rows describe a body that is going away and nothing will ever walk
+            // ancestry through an expired range. Left in place they grow ~220 B/block forever
+            // (~7 GB/year/node) on the very tier whose purpose is bounding disk. The height→hash
+            // alias is deliberately kept: continuity checks still need it.
+            if let Ok(Some(existing)) = self.persistent.load_microblock_hash(h) {
+                if let Some(prev) = self.persistent.header_index(&existing).map(|hd| hd.previous_hash) {
+                    batch.delete_cf(&metadata_cf, &block_child_key(&prev, &existing));
+                }
+                batch.delete_cf(&metadata_cf, &block_header_key(&existing));
+            }
+            // Co-prune the OFF-consensus WASM log receipts on the same window: getLogs serves only a
+            // bounded recent range (<< retention_blocks), so aged-out blocklogs are unreachable and
+            // safe to drop. Default CF (save_raw); zero-padded key ⇒ lexicographically contiguous.
+            batch.delete(format!("blocklogs_{:010}", h).as_bytes());
+            batch.delete(format!("blocklogsroot_{:010}", h).as_bytes()); // co-prune the per-block sub-root
+        }
+        batch.put_cf(&metadata_cf, WATERMARK_KEY, &prune_before.to_le_bytes());
+        self.persistent.db.write(batch)?;
+        // Physically reclaim the aged-out body range (tombstones otherwise persist until natural
+        // compaction). Range-scoped ⇒ cost proportional to the pruned span, not the whole CF.
+        self.persistent.db.compact_range_cf(
+            &microblocks_cf,
+            Some(mb_body_key(from).as_bytes()),
+            Some(mb_body_key(prune_before).as_bytes()),
+        );
+        // Same reclaim for the co-pruned blocklogs range (default CF).
+        self.persistent.db.compact_range(
+            Some(format!("blocklogs_{:010}", from).as_bytes()),
+            Some(format!("blocklogs_{:010}", prune_before).as_bytes()),
+        );
+        // Co-prune the token-transfer index below the same floor (bounded per run; drains a backlog
+        // over cycles). Mirrors the tx_by_address retention so this index cannot grow unbounded.
+        let pruned_xfers = self.prune_token_transfers_below(prune_before);
+        if crate::node::is_info() {
+            println!("[INFO][STORAGE] body_prune_compacted from={} to={} xfer_index_pruned={}", from, prune_before, pruned_xfers);
+        }
+
+        Ok(prune_before - from)
+    }
+
+    /// SLIDING WINDOW: Prune old blocks outside of retention window
+    pub fn prune_old_blocks(&self) -> IntegrationResult<()> {
+        // Super nodes keep everything (archival role)
+        if self.storage_mode == StorageMode::Super {
+            return Ok(()); // Super nodes are our "archive" nodes - keep everything
+        }
+        
+        // Light nodes don't store full blocks at all
+        if self.storage_mode == StorageMode::Light {
+            return self.prune_for_light_node();
+        }
+        
+        let current_height = self.get_chain_height()?;
+        if current_height <= self.sliding_window_size {
+            return Ok(()); // Not enough blocks yet
+        }
+        
+        let prune_before = current_height - self.sliding_window_size;
+        
+        // Find last snapshot before pruning point
+        let last_snapshot = (prune_before / 10_000) * 10_000; // Round down to snapshot
+        if last_snapshot == 0 {
+            return Ok(()); // Don't prune before first snapshot
+        }
+        
+        println!("[INFO][STORAGE] block_pruning_start keeping_from={}", prune_before);
+        
+        let microblocks_cf = self.persistent.db.cf_handle("microblocks")
+            .ok_or_else(|| IntegrationError::StorageError("microblocks column family not found".to_string()))?;
+        
+        let mut batch = WriteBatch::default();
+        let mut pruned_count = 0;
+        
+        // Prune blocks before the window, but after last snapshot
+        for height in (last_snapshot + 1)..prune_before {
+            // Prune microblocks
+            let micro_key = mb_body_key(height);
+            if self.persistent.db.get_cf(&microblocks_cf, micro_key.as_bytes())?.is_some() {
+                batch.delete_cf(&microblocks_cf, micro_key.as_bytes());
+                pruned_count += 1;
+            }
+            
+            // CRITICAL FIX: Also prune macroblocks (they were NEVER deleted!)
+            // Macroblocks have their own numbering: macro #1 = after micro 90, macro #2 = after micro 180
+            // Check if this microblock height corresponds to a macroblock
+            if height % 90 == 0 && height > 0 {
+                // This microblock height has a corresponding macroblock
+                let macro_number = height / 90;
+                let macro_key = format!("macroblock_{}", macro_number);
+                if self.persistent.db.get_cf(&microblocks_cf, macro_key.as_bytes())?.is_some() {
+                    batch.delete_cf(&microblocks_cf, macro_key.as_bytes());
+                    pruned_count += 1;
+                    println!("[INFO][STORAGE] macroblock_pruned macro_num={} micro_height={}", 
+                            macro_number, height);
+                }
+            }
+                
+                // Apply batch every 1000 blocks to avoid memory issues
+                if pruned_count % 1000 == 0 {
+                    self.persistent.db.write(batch)?;
+                    batch = WriteBatch::default();
+                    println!("[INFO][STORAGE] pruning_progress count={}", pruned_count);
+            }
+        }
+        
+        // Apply remaining batch
+        if !batch.is_empty() {
+            self.persistent.db.write(batch)?;
+        }
+        
+        // Force compaction to reclaim space
+        self.persistent.db.compact_range_cf(&microblocks_cf, 
+            Some(mb_body_key(last_snapshot).as_bytes()),
+            Some(mb_body_key(prune_before).as_bytes()));
+        
+        println!("[INFO][STORAGE] blocks_pruned count={} before_height={} snapshot_at={}", 
+                pruned_count, prune_before, last_snapshot);
+        
+        // CRITICAL: Also prune transactions from pruned blocks
+        // Transactions are stored separately and must be cleaned up
+        let tx_pruned = self.prune_old_transactions(prune_before)?;
+        if tx_pruned > 0 {
+            println!("[INFO][STORAGE] txs_pruned count={}", tx_pruned);
+        }
+        
+        // Update metadata
+        let metadata_cf = self.persistent.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
+        self.persistent.db.put_cf(&metadata_cf, b"oldest_block", &prune_before.to_le_bytes())?;
+        
+        Ok(())
+    }
+    
+    /// v9.0: Prune old transactions + tx_index + tx_by_address below retention height.
+    /// Uses HashSet for O(1) lookups (was O(n) Vec::contains — quadratic on large datasets).
+    /// Called from prune_old_blocks() for non-Super nodes, and from run_ephemeral_cleanup()
+    /// for ALL node types (Super nodes keep blocks but prune tx indices beyond retention).
+    /// Bounded per-call prune of `transactions` / `tx_index` / `tx_by_address`.
+    ///
+    /// The two index families are pruned on INDEPENDENT criteria: `tx_index` by the block height
+    /// it stores, `tx_by_address` by the timestamp embedded in its own key
+    /// (`addr_{address}_{ts:016x}_{tx_hash}`). Deriving the address rows from the set of hashes
+    /// collected in this call would orphan every matching row outside the window — the two column
+    /// families sort on unrelated orders, and once the `tx_index` row is gone the hash can never
+    /// be rediscovered.
+    ///
+    /// Both scans resume from a persisted cursor and stop at a row cap, so one call costs O(cap)
+    /// regardless of index size. Returns the number of transactions pruned; the hourly cadence
+    /// catches up.
+    pub fn prune_old_transactions(&self, prune_before_height: u64) -> IntegrationResult<u64> {
+        // A fixed row cap is a throughput bet: set it below the production rate and retention stops
+        // holding, silently, exactly when the chain gets busy. Budget instead from the work that must
+        // be done — one full sweep of each index inside the retention window — measured from RocksDB's
+        // own key estimate, with a floor so a young chain still makes progress and a ceiling so one
+        // call cannot stall the maintenance thread.
+        let runs_in_window = (TX_INDEX_RETENTION_BLOCKS / 3_600).max(1) * PRUNE_RUNS_PER_HOUR;
+        let tx_scan_cap = self.sweep_budget("tx_index", runs_in_window);
+        let addr_scan_cap = self.sweep_budget("tx_by_address", runs_in_window);
+
+        let tx_cf = self.persistent.db.cf_handle("transactions")
+            .ok_or_else(|| IntegrationError::StorageError("transactions column family not found".to_string()))?;
+        let tx_index_cf = self.persistent.db.cf_handle("tx_index")
+            .ok_or_else(|| IntegrationError::StorageError("tx_index column family not found".to_string()))?;
+        let tx_by_addr_cf = self.persistent.db.cf_handle("tx_by_address")
+            .ok_or_else(|| IntegrationError::StorageError("tx_by_address column family not found".to_string()))?;
+        let meta_cf = self.persistent.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
+
+        let read_cursor = |k: &[u8]| -> Vec<u8> {
+            self.persistent.db.get_cf(&meta_cf, k).ok().flatten().unwrap_or_default()
+        };
+
+        let mut batch = WriteBatch::default();
+        let mut pruned_count: u64 = 0;
+
+        // ── transactions + tx_index, by stored block height ──
+        let tx_cursor = read_cursor(b"prune_tx_index_cursor");
+        let tx_mode = if tx_cursor.is_empty() {
+            rocksdb::IteratorMode::Start
+        } else {
+            rocksdb::IteratorMode::From(&tx_cursor, rocksdb::Direction::Forward)
+        };
+        let mut examined = 0usize;
+        let mut last_tx_key: Option<Vec<u8>> = None;
+        for item in self.persistent.db.iterator_cf(&tx_index_cf, tx_mode) {
+            let (key, value) = item?;
+            examined += 1;
+            last_tx_key = Some(key.to_vec());
+            if value.len() >= 8 {
+                let block_height = u64::from_be_bytes(value[..8].try_into().unwrap_or([0u8; 8]));
+                if block_height < prune_before_height && block_height > 0 { // genesis txs are never expired
+                    batch.delete_cf(&tx_cf, &key);
+                    batch.delete_cf(&tx_index_cf, &key);
+                    pruned_count += 1;
+                    if pruned_count % 5000 == 0 {
+                        self.persistent.db.write(batch)?;
+                        batch = WriteBatch::default();
+                    }
+                }
+            }
+            if examined >= tx_scan_cap {
+                break;
+            }
+        }
+        // Cap reached → resume here next call; scan finished → wrap to the start.
+        let next_tx_cursor: Vec<u8> = if examined >= tx_scan_cap {
+            last_tx_key.unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        batch.put_cf(&meta_cf, b"prune_tx_index_cursor", &next_tx_cursor);
+
+        // ── tx_by_address, by the inclusion HEIGHT in its own key ──
+        // Scanned independently of tx_index (the two families sort on unrelated orders, so deriving
+        // one from the other orphans rows), but cut on the SAME height rule. The key used to carry
+        // `tx.timestamp`, which the sender picks: one row stamped in the future was unreachable by
+        // any prune, forever.
+
+        let addr_cursor = read_cursor(b"prune_addr_cursor");
+        let addr_mode = if addr_cursor.is_empty() {
+            rocksdb::IteratorMode::Start
+        } else {
+            rocksdb::IteratorMode::From(&addr_cursor, rocksdb::Direction::Forward)
+        };
+        let mut addr_examined = 0usize;
+        let mut addr_pruned: u64 = 0;
+        let mut addr_unparsed: u64 = 0;
+        let mut last_addr_key: Option<Vec<u8>> = None;
+        for item in self.persistent.db.iterator_cf(&tx_by_addr_cf, addr_mode) {
+            let (key, _value) = item?;
+            addr_examined += 1;
+            last_addr_key = Some(key.to_vec());
+            match Self::addr_index_height(&key) {
+                Some(h) if h < prune_before_height && h > 0 => {
+                    batch.delete_cf(&tx_by_addr_cf, &key);
+                    addr_pruned += 1;
+                    if addr_pruned % 5000 == 0 {
+                        self.persistent.db.write(batch)?;
+                        batch = WriteBatch::default();
+                    }
+                }
+                Some(_) => {}
+                // Not a key this writer produces. Never deleted on a guess (a parse miss is not
+                // evidence of age), but counted so corruption is visible instead of silent.
+                None => addr_unparsed += 1,
+            }
+            if addr_examined >= addr_scan_cap {
+                break;
+            }
+        }
+        let next_addr_cursor: Vec<u8> = if addr_examined >= addr_scan_cap {
+            last_addr_key.unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        batch.put_cf(&meta_cf, b"prune_addr_cursor", &next_addr_cursor);
+
+        if !batch.is_empty() {
+            self.persistent.db.write(batch)?;
+        }
+
+        if addr_unparsed > 0 {
+            println!("[WARN][PRUNE] addr_index_unparsed rows={} action=retained", addr_unparsed);
+        }
+        if (pruned_count > 0 || addr_pruned > 0) && crate::node::is_info() {
+            println!("[INFO][PRUNE] tx_done txs={} addr_entries={} before_h={} tx_scanned={}/{} addr_scanned={}/{}",
+                     pruned_count, addr_pruned, prune_before_height,
+                     examined, tx_scan_cap, addr_examined, addr_scan_cap);
+        }
+
+        Ok(pruned_count)
+    }
+
+    /// Inclusion height embedded in a `tx_by_address` key: `addr_{address}_{height:016x}_{tx_hash}`.
+    /// The address itself may contain `_`, so the field is located from the RIGHT.
+    pub(super) fn addr_index_height(key: &[u8]) -> Option<u64> {
+        let s = std::str::from_utf8(key).ok()?;
+        let mut parts = s.rsplitn(3, '_');
+        let _tx_hash = parts.next()?;
+        let h_hex = parts.next()?;
+        u64::from_str_radix(h_hex, 16).ok()
+    }
+
+    /// Rows one maintenance pass may examine in a column family so that `runs_in_window` passes
+    /// sweep all of it. Uses RocksDB's own key estimate, so the budget tracks real load instead of
+    /// a number someone picked once. Floor: a young index still drains. Ceiling: one pass stays short
+    /// enough that the hourly maintenance thread never becomes the bottleneck.
+    pub(super) fn sweep_budget(&self, cf_name: &str, runs_in_window: u64) -> usize {
+        const MIN_SWEEP: usize = 50_000;
+        const MAX_SWEEP: usize = 5_000_000;
+        let est = self.persistent.db.cf_handle(cf_name)
+            .and_then(|cf| self.persistent.db.property_int_value_cf(&cf, "rocksdb.estimate-num-keys").ok().flatten())
+            .unwrap_or(0);
+        let needed = (est / runs_in_window.max(1)) as usize;
+        needed.clamp(MIN_SWEEP, MAX_SWEEP)
+    }
+
+    /// DEPRECATED — legacy "headers-only" Light pruning pass.
+    ///
+    /// Current Light tier (v3.18+) is a pure mobile API client with
+    /// zero on-device chain storage; the `save_microblock` path is a
+    /// no-op for `StorageMode::Light`, so this pruning function should
+    /// never observe any rows to convert. Retained for backward
+    /// compatibility with the historical header-rotation tier and to
+    /// keep call sites compiling. Will be removed in a future cleanup.
+    pub(super) fn prune_for_light_node(&self) -> IntegrationResult<()> {
+        println!("[INFO][STORAGE] light_node_prune_start mode=legacy_no_op");
+        
+        let microblocks_cf = self.persistent.db.cf_handle("microblocks")
+            .ok_or_else(|| IntegrationError::StorageError("microblocks column family not found".to_string()))?;
+        
+        let mut batch = WriteBatch::default();
+        let mut converted = 0;
+        
+        // Convert full blocks to headers only
+        let iter = self.persistent.db.iterator_cf(&microblocks_cf, rocksdb::IteratorMode::Start);
+        for item in iter {
+            let (key, value) = item?;
+            
+            // Skip if already a header
+            if value.len() < 1000 { // Headers are much smaller than full blocks
+                continue;
+            }
+            
+            // Extract header from full block (simplified - in production would deserialize properly)
+            let header = &value[..200.min(value.len())]; // bytes, not str
+            batch.put_cf(&microblocks_cf, &key, header);
+            converted += 1;
+            
+            if converted % 100 == 0 {
+                self.persistent.db.write(batch)?;
+                batch = WriteBatch::default();
+            }
+        }
+        
+        if !batch.is_empty() {
+            self.persistent.db.write(batch)?;
+        }
+        
+        println!("[INFO][STORAGE] blocks_to_headers converted={}", converted);
+        
+        Ok(())
+    }
+    
+    /// Get current storage mode
+    pub fn get_storage_mode(&self) -> StorageMode {
+        self.storage_mode
+    }
+    
+    /// Check if block is within retention window
+    pub fn is_block_retained(&self, _height: u64) -> bool {
+        match self.storage_mode {
+            StorageMode::Super => true,  // Super nodes keep everything (archival)
+            StorageMode::Light => false, // Light nodes don't store blocks (API client)
+        }
+    }
+    
+    /// Estimate storage requirements for current configuration
+    pub fn estimate_storage_requirements(&self) -> String {
+        // v3.19: Light nodes = NO storage (pure API client), Super = archival
+        match self.storage_mode {
+            StorageMode::Light => "0 MB (API client only, no local storage)".to_string(),
+            StorageMode::Super => "500 GB - 1 TB (complete blockchain history with compression)".to_string(),
+        }
+    }
+    
+    /// Get the latest snapshot height available for fast sync.
+    /// Prefers full snapshots (latest_full_snap) over state snapshots (latest_state_snap),
+    /// falls back to numerical scan over all snapshot_* keys.
+    /// Highest RETAINED snapshot height ≤ ceiling — cold-join verifiable-anchor negotiation. A joiner
+    /// clamps to its exogenously-verifiable anchor (GALC pin / h=90); a peer whose latest snapshot is
+    /// ABOVE that pin must still offer the highest one ≤ it. None ⇒ peer retains no snapshot ≤ ceiling.
+    pub fn get_highest_snapshot_height_le(&self, ceiling: u64) -> IntegrationResult<Option<u64>> {
+        let snapshots_cf = self.persistent.db.cf_handle("snapshots")
+            .ok_or_else(|| IntegrationError::StorageError("snapshots column family not found".to_string()))?;
+        Ok(super::snapshot_index::highest_le(&self.persistent.db, snapshots_cf, ceiling)?.filter(|h| *h > 0))
+    }
+
+    /// Delete every snapshot describing chain ABOVE `target`, and re-point `latest_full_snap` at the
+    /// highest survivor. Called by the boot rollback: a snapshot above the truncation is a complete,
+    /// self-consistent picture of the chain the operator has just abandoned, and the runtime adopt
+    /// path will take it - raising chain_height to a height whose blocks were deleted, and
+    /// re-persisting the snapshot anchor along with it. Truncating blocks while leaving these behind
+    /// is what let a rolled-back node report a tip it does not hold and sync forever.
+    pub fn prune_snapshots_above(&self, target: u64) -> IntegrationResult<u64> {
+        let cf = self.persistent.db.cf_handle("snapshots")
+            .ok_or_else(|| IntegrationError::StorageError("snapshots column family not found".to_string()))?;
+        // Under the fence, the generation bumped first: a serializer that captured below this prune finds
+        // the bump and writes nothing, so no frame of the abandoned chain comes back.
+        let _fence = self.snapshot_fence();
+        self.persistent.snapshot_gen.fetch_add(1, Ordering::AcqRel);
+        let mut batch = rocksdb::WriteBatch::default();
+        let mut dropped = 0u64;
+        let mut best_kept = 0u64;
+        for h in super::snapshot_index::indexed_heights(&self.persistent.db, cf)? {
+            if h > target {
+                super::snapshot_index::stage_delete(&mut batch, cf, h);
+                dropped += 1;
+            } else if h > best_kept {
+                best_kept = h;
+            }
+        }
+        // The pointer must never outlive what it names.
+        if best_kept > 0 {
+            batch.put_cf(cf, b"latest_full_snap", &best_kept.to_le_bytes());
+        } else {
+            batch.delete_cf(cf, b"latest_full_snap");
+        }
+        self.persistent.db.write(batch)?;
+        Ok(dropped)
+    }
+
+    /// Bring every durable marker that names chain ABOVE `target` back to it. The blocks themselves
+    /// are the caller's job (boot rollback, recovery decree, snapshot regress); this is everything
+    /// else a later boot or the running node reads as "the chain reaches here": macroblock objects
+    /// and the epoch roots sealed with them, snapshots and their pointer, the cold-join anchor, a
+    /// pending promote, certified pairs by the window they certify, the seal watermark and the
+    /// latest-macroblock hash, the QC-strip cursor, the consensus round, timeout certificates and
+    /// the sync resume point, and the epoch roots certified above it. Idempotent: a crash between
+    /// steps re-runs on the next boot.
+    pub fn retract_chain_position_above(&self, target: u64) {
+        const MACROBLOCK_SCAN_WINDOW: u64 = 1024;
+        let mi = qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
+        let target_mb = target / mi;
+
+        // Macroblocks first: the watermark below is derived from what remains. The bound covers a
+        // current watermark, a stale one far above the tip, and a tip not yet lowered (live regress).
+        let upper = self.last_sealed_mb_index()
+            .max(self.get_chain_height().unwrap_or(0) / mi + 1)
+            .max(target_mb + MACROBLOCK_SCAN_WINDOW);
+        let mut macroblocks = 0u64;
+        for idx in (target_mb + 1)..=upper {
+            if self.get_macroblock_by_height(idx).ok().flatten().is_none() { continue; }
+            match self.persistent.delete_macroblock(idx) {
+                Ok(()) => macroblocks += 1,
+                Err(e) => println!("[WARN][ROLLBACK] macroblock_delete_failed idx={} err={}", idx, e),
+            }
+        }
+        let snapshots = match self.prune_snapshots_above(target) {
+            Ok(n) => n,
+            Err(e) => { println!("[WARN][ROLLBACK] snapshot_prune_failed target={} err={}", target, e); 0 }
+        };
+
+        let meta = match self.persistent.db.cf_handle("metadata") {
+            Some(cf) => cf,
+            None => { println!("[WARN][ROLLBACK] retract_failed reason=no_metadata_cf"); return; }
+        };
+        let mut batch = rocksdb::WriteBatch::default();
+
+        let (promote_dropped, anchor_dropped) = self.stage_state_markers_above(&mut batch, target);
+        // Certified pairs by the WINDOW they certify - the pair index is the view counter, not a
+        // macroblock index. Head from its key when it has one, else from the pair itself; a pair
+        // whose head cannot be read goes too.
+        let mut pairs = 0u64;
+        for (idx, bytes) in self.load_certified_pairs().unwrap_or_default() {
+            let head = self.persistent.db.get_cf(&meta, super::certified_pair_head_key(idx)).ok().flatten()
+                .filter(|v| v.len() == 8)
+                .map(|v| u64::from_le_bytes(v[..8].try_into().unwrap_or([0u8; 8])))
+                .or_else(|| bincode::deserialize::<Vec<crate::consensus_v2_driver::ConsensusMsg>>(&bytes).ok()
+                    .and_then(|p| p.iter().find_map(|m| match m {
+                        crate::consensus_v2_driver::ConsensusMsg::Proposal(cp) => Some(cp.window_head_height),
+                        _ => None,
+                    })));
+            if head.map_or(true, |h| h > target) {
+                batch.delete_cf(&meta, super::certified_pair_key(idx));
+                batch.delete_cf(&meta, super::certified_pair_head_key(idx));
+                pairs += 1;
+            }
+        }
+        // Epoch roots whose certifying macroblock is above the target, whether or not that object still
+        // exists: an earlier prune that took the object without its root leaves exactly this orphan,
+        // and save_macroblock refuses the re-sealed window as an equivocation against it. The fold
+        // memo covered those epochs; it is a pure cache.
+        let mut roots = 0u64;
+        if let Some(rewards) = self.persistent.db.cf_handle("pending_rewards") {
+            for e in self.reward_epochs_from(0).unwrap_or_default() {
+                if crate::reward_epoch::certifying_mb_index(e).map_or(true, |mb| mb > target_mb) {
+                    batch.delete_cf(&rewards, Storage::epoch_root_key(e).as_bytes());
+                    roots += 1;
+                }
+            }
+            if roots > 0 { batch.delete_cf(&rewards, b"epoch_fold_head"); }
+        }
+        // The QC-signature strip cursor: a re-sealed window below it would keep its signatures forever.
+        if let Ok(Some(c)) = self.persistent.db.get_cf(&meta, b"qc_sig_strip_cursor") {
+            if c.len() == 8 && u64::from_be_bytes(c[..8].try_into().unwrap_or([0u8; 8])) > target_mb {
+                batch.put_cf(&meta, b"qc_sig_strip_cursor", &target_mb.to_be_bytes());
+            }
+        }
+        // The round a boot would ask peers to resume, the certificates that would rotate the producer
+        // of a window nobody produced, and the sync resume point; live traffic rewrites what it needs.
+        if let Some(cons) = self.persistent.db.cf_handle("consensus") {
+            batch.delete_cf(&cons, b"latest_round");
+            batch.delete_cf(&cons, b"tcerts_v1");
+        }
+        if let Some(sync) = self.persistent.db.cf_handle("sync_state") {
+            batch.delete_cf(&sync, b"sync_progress");
+        }
+        // Nothing below runs on a failed batch: with the anchor still in place the watermark reader
+        // would repair the hint straight back up to it, so a partial retraction must stay visible
+        // and re-run on the next boot rather than look complete.
+        if let Err(e) = self.persistent.db.write(batch) {
+            println!("[WARN][ROLLBACK] retract_batch_failed target={} err={}", target, e);
+            return;
+        }
+        crate::block_pipeline::invalidate_committed_window_lists(self);
+
+        // The seal watermark is re-derived, never trusted. The hint is monotonic-up and the reader
+        // scans forward FROM it, so a node that lost objects below it keeps reporting a frontier it
+        // does not hold and its sync asks for the wrong range forever (003 held only every other
+        // macroblock from 9585 and asked for 9596 up). From the prune floor - the anchor is added by
+        // the reader itself - the scan covers only objects that exist and repairs the hint to them.
+        let floor_mb = self.persistent.db.get_cf(&meta, b"oldest_block").ok().flatten()
+            .filter(|v| v.len() == 8)
+            .map(|v| u64::from_le_bytes(v[..8].try_into().unwrap_or([0u8; 8])) / mi)
+            .unwrap_or(0);
+        if let Err(e) = self.force_last_sealed_mb(floor_mb) {
+            println!("[WARN][ROLLBACK] sealed_watermark_reset_failed to_mb={} err={}", floor_mb, e);
+        }
+        let sealed_mb = self.last_sealed_mb_index().min(target_mb);
+        if let Err(e) = self.force_last_sealed_mb(sealed_mb) {
+            println!("[WARN][ROLLBACK] sealed_watermark_lower_failed to_mb={} err={}", sealed_mb, e);
+        }
+        match self.macroblock_hash_at(sealed_mb) {
+            Some(h) => { let _ = self.persistent.db.put_cf(&meta, b"latest_macroblock_hash", &h); }
+            None => { let _ = self.persistent.db.delete_cf(&meta, b"latest_macroblock_hash"); }
+        }
+        println!("[INFO][ROLLBACK] position_retracted target={} macroblocks={} epoch_roots={} snapshots={} pairs={} anchor_dropped={} promote_dropped={} sealed_mb={}",
+                 target, macroblocks, roots, snapshots, pairs, anchor_dropped, promote_dropped, sealed_mb);
+    }
+
+    /// Stage the state markers above `target` a retraction drops: a pending promote (it would put the
+    /// node back on the state it left) and the cold-join anchor (mb 0 is the "none" sentinel).
+    fn stage_state_markers_above(&self, batch: &mut rocksdb::WriteBatch, target: u64) -> (bool, bool) {
+        let mi = qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
+        let meta = match self.persistent.db.cf_handle("metadata") { Some(cf) => cf, None => return (false, false) };
+        let mut promote_dropped = false;
+        if let Ok(Some(m)) = self.persistent.db.get_cf(&meta, b"promote_pending") {
+            if m.len() >= 8 {
+                let h = u64::from_le_bytes(m[..8].try_into().unwrap_or([0u8; 8]));
+                if h > target {
+                    batch.delete_cf(&meta, b"promote_pending");
+                    let _ = self.discard_snapshot_state(h);
+                    promote_dropped = true;
+                }
+            }
+        }
+        let mut anchor_dropped = false;
+        if let Ok(Some(a)) = self.persistent.db.get_cf(&meta, b"snapshot_anchor") {
+            if a.len() >= 8 {
+                let mb = u64::from_le_bytes(a[..8].try_into().unwrap_or([0u8; 8]));
+                if mb > 0 && mb.saturating_mul(mi) > target {
+                    batch.put_cf(&meta, b"snapshot_anchor", &[0u8; 40]);
+                    anchor_dropped = true;
+                }
+            }
+        }
+        (promote_dropped, anchor_dropped)
+    }
+
+    /// The state half of the retraction, for a wholesale regress: the snapshots this node built above
+    /// `target` from the state that was the fault, the state markers above it and the sync resume
+    /// point. Certified chain content - macroblocks, their epoch roots, the WAL pairs - stays.
+    pub fn retract_state_position_above(&self, target: u64) {
+        let snapshots = match self.prune_snapshots_above(target) {
+            Ok(n) => n,
+            Err(e) => { println!("[WARN][ROLLBACK] snapshot_prune_failed target={} err={}", target, e); 0 }
+        };
+        let mut batch = rocksdb::WriteBatch::default();
+        let (promote_dropped, anchor_dropped) = self.stage_state_markers_above(&mut batch, target);
+        if let Some(sync) = self.persistent.db.cf_handle("sync_state") {
+            batch.delete_cf(&sync, b"sync_progress");
+        }
+        if let Err(e) = self.persistent.db.write(batch) {
+            println!("[WARN][ROLLBACK] state_retract_failed target={} err={}", target, e);
+            return;
+        }
+        println!("[INFO][ROLLBACK] state_position_retracted target={} snapshots={} anchor_dropped={} promote_dropped={}",
+                 target, snapshots, anchor_dropped, promote_dropped);
+    }
+
+    /// Hash of the stored macroblock at `idx`, whichever framing it was stored in.
+    fn macroblock_hash_at(&self, idx: u64) -> Option<[u8; 32]> {
+        if idx == 0 { return None; }
+        let raw = self.get_macroblock_by_height(idx).ok().flatten()?;
+        let plain = if raw.len() >= 4 && raw[0..4] == [0x28, 0xb5, 0x2f, 0xfd] {
+            zstd::decode_all(&raw[..]).ok()?
+        } else { raw };
+        bincode::deserialize::<qnet_state::MacroBlock>(&plain).ok().map(|mb| mb.hash())
+    }
+
+    /// The operator rollback's own declaration, beside the signing mark: the whole fleet abandons
+    /// the chain above `target`, so this node's vote commitments there refuse nothing that can
+    /// recur, and the genesis capsule it holds describes a chain nobody keeps. NOT for a single
+    /// node's regress - there the rest of the network kept that chain, and a forgotten commitment
+    /// is a second vote at a head this node already voted at.
+    pub fn abandon_chain_claims_above(&self, target: u64) {
+        let meta = match self.persistent.db.cf_handle("metadata") { Some(cf) => cf, None => return };
+        let mut batch = rocksdb::WriteBatch::default();
+        let mut votes = 0u64;
+        for (index, (head, ..)) in self.persistent.iter_checkpoint_votes(&meta).unwrap_or_default() {
+            if head > target {
+                batch.delete_cf(&meta, super::checkpoint_vote_key(index));
+                votes += 1;
+            }
+        }
+        let mi = qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
+        let capsule_dropped = match self.get_galc_held() {
+            Ok(Some(b)) => bincode::deserialize::<crate::galc::GenesisCheckpoint>(&b).ok()
+                .map_or(false, |c| c.mb_index.saturating_mul(mi) > target),
+            _ => false,
+        };
+        if capsule_dropped { batch.delete_cf(&meta, b"galc_held"); }
+        if let Err(e) = self.persistent.db.write(batch) {
+            println!("[WARN][ROLLBACK] abandon_batch_failed target={} err={}", target, e);
+            return;
+        }
+        println!("[INFO][ROLLBACK] claims_abandoned target={} votes={} capsule_dropped={}",
+                 target, votes, capsule_dropped);
+    }
+
+    pub fn get_latest_snapshot_height(&self) -> IntegrationResult<Option<u64>> {
+        let snapshots_cf = self.persistent.db.cf_handle("snapshots")
+            .ok_or_else(|| IntegrationError::StorageError("snapshots column family not found".to_string()))?;
+
+        // Advertised to P2P joiners ⇒ full_snap_ ONLY (complete snapshots); state_snap_ is local-only.
+        // 1. Prefer the full-snapshot pointer.
+        if let Ok(Some(data)) = self.persistent.db.get_cf(&snapshots_cf, b"latest_full_snap") {
+            if data.len() >= 8 {
+                if let Ok(bytes) = data[..8].try_into() {
+                    let height = u64::from_le_bytes(bytes);
+                    if height > 0 { return Ok(Some(height)); }
+                }
+            }
+        }
+
+        // 2. Fall back to the newest indexed frame (nodes without the pointer).
+        Ok(super::snapshot_index::indexed_heights(&self.persistent.db, snapshots_cf)?.into_iter().max().filter(|h| *h > 0))
+    }
+    
+    /// v32.9: Canonical state root computed from accounts CF in RocksDB.
+    /// Deterministic across nodes — every honest node hashes the same
+    /// sorted (key, value) list domain-separated by height. Used for
+    /// snapshot consensus binding via Pattern C (state_root commitment
+    /// instead of opaque SHA3-of-bytes). Independent of in-memory
+    /// StateManager so verifier can compute after applying a downloaded
+    /// snapshot without re-initialising state.
+    pub fn compute_canonical_state_root(&self, height: u64) -> IntegrationResult<[u8; 32]> {
+        let accounts_cf = self.persistent.db.cf_handle("accounts")
+            .ok_or_else(|| IntegrationError::StorageError("accounts column family not found".to_string()))?;
+
+        let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let iter = self.persistent.db.iterator_cf(&accounts_cf, rocksdb::IteratorMode::Start);
+        for item in iter {
+            match item {
+                Ok((k, v)) => entries.push((k.to_vec(), v.to_vec())),
+                Err(e) => return Err(IntegrationError::StorageError(format!("canonical_root_iter_err: {}", e))),
+            }
+        }
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+        use sha3::{Sha3_256, Digest};
+        let mut hasher = Sha3_256::new();
+        hasher.update(b"QNET_CANONICAL_STATE_ROOT_V1:");
+        hasher.update(&height.to_le_bytes());
+        hasher.update(&(entries.len() as u64).to_le_bytes());
+        for (k, v) in &entries {
+            hasher.update(&(k.len() as u32).to_le_bytes());
+            hasher.update(k);
+            hasher.update(&(v.len() as u32).to_le_bytes());
+            hasher.update(v);
+        }
+        let mut root = [0u8; 32];
+        root.copy_from_slice(&hasher.finalize());
+        Ok(root)
+    }
+
+    /// Rebuild the canonical account-state merkle root (the consensus
+    /// finalize_merkle output) from the accounts CF. Binds a restored snapshot
+    /// to the QC-certified mb.state_root: a forged snapshot yields a different
+    /// root. Deterministic — a fresh StateMerkleTree full-recomputes (no
+    /// incremental cache), matching every node's finalize().
+    pub fn recompute_account_merkle_root(&self) -> IntegrationResult<[u8; 32]> {
+        self.recompute_account_merkle_root_cf("accounts")
+    }
+
+    /// Repair a STAGED snapshot that exceeds the QC-bound root by exactly one leaf: rebuild the
+    /// scratch tree from accounts_stage, find the extra leaf (find_single_extra_leaf — verified
+    /// against the certified root, not guessed), delete that staged row and return its address.
+    /// None ⇒ no single removal reaches the root; the caller keeps its fail-closed discard.
+    pub(super) fn repair_staged_phantom(&self, expected_root: &[u8; 32]) -> Option<String> {
+        let cf = self.persistent.db.cf_handle("accounts_stage")?;
+        let mut tree = qnet_state::StateMerkleTree::new();
+        let mut addrs: Vec<String> = Vec::new();
+        for item in self.persistent.db.iterator_cf(&cf, rocksdb::IteratorMode::Start) {
+            let (k, v) = item.ok()?;
+            let addr = String::from_utf8(k.to_vec()).ok()?;
+            let account: qnet_state::Account = bincode::deserialize(&v).ok()?;
+            tree.insert_lazy(&addr, &account);
+            addrs.push(addr);
+        }
+        let _ = tree.finalize();
+        let key = tree.find_single_extra_leaf(expected_root)?;
+        let addr = addrs.into_iter().find(|a| qnet_state::StateMerkleTree::hash_address(a) == key)?;
+        self.persistent.db.delete_cf(&cf, addr.as_bytes()).ok()?;
+        Some(addr)
+    }
+
+    /// Account merkle over an explicit CF: "accounts" (live) or "accounts_stage" (cold-join verify).
+    /// Streams the CF row-by-row into a throwaway tree (no full Vec) — the finalized root is identical
+    /// (the tree is leaf-set-keyed, so insertion streaming vs batch yields the same root).
+    pub fn recompute_account_merkle_root_cf(&self, cf_name: &str) -> IntegrationResult<[u8; 32]> {
+        let accounts_cf = self.persistent.db.cf_handle(cf_name)
+            .ok_or_else(|| IntegrationError::StorageError("accounts column family not found".to_string()))?;
+        let mut tree = qnet_state::StateMerkleTree::new();
+        for item in self.persistent.db.iterator_cf(&accounts_cf, rocksdb::IteratorMode::Start) {
+            let (k, v) = item.map_err(|e| IntegrationError::StorageError(format!("merkle_iter_err: {}", e)))?;
+            let addr = String::from_utf8(k.to_vec())
+                .map_err(|e| IntegrationError::StorageError(format!("merkle_addr_utf8_err: {}", e)))?;
+            let account: qnet_state::Account = bincode::deserialize(&v)
+                .map_err(|e| IntegrationError::SerializationError(format!("merkle_account_decode_err: {}", e)))?;
+            // V2 SNAPSHOT BINDING: under the SROOT schema the contract account leaf commits only
+            // storage_root, NOT the raw contract_storage map (the old full-map fold is gone). So a
+            // restored/untrusted contract_storage that does NOT hash to the committed storage_root would
+            // still reproduce state_root and pass the Pattern-C bind — yet serve forged balances and fork
+            // on the next write. Re-derive and reject the mismatch here (O(entries)) to restore the
+            // transitive binding the fold gave for free, so a tampered snapshot fails the bind check.
+            if !qnet_state::StateMerkleTree::contract_storage_root_matches(&account) {
+                return Err(IntegrationError::StorageError(format!(
+                    "[REJECT][SNAPSHOT] storage_root_mismatch addr={} cf={}", addr, cf_name)));
+            }
+            tree.insert_lazy(&addr, &account);
+        }
+        Ok(tree.finalize())
+    }
+
+    /// Binder lineage-walk budget (macroblocks): the max genesis/pin-rooted N-2 QC walk a cold joiner will
+    /// re-verify. SINGLE SOURCE for both the snapshot SELECTION ceiling (download_and_load_snapshot) and the
+    /// binder (verify_snapshot_consensus_binding) so the two can never drift. ~2 weeks at 1 blk/s ⇒ realistic
+    /// binary-WS-pin rotation cadence; a fresh GALC capsule normally keeps the real walk ≈ 0.
+    pub(super) const SNAPSHOT_MAX_WS_WALK_MB: u64 = 13_440;
+
+    /// Committee signatures are the bulk of a macroblock — 2f+1 ML-DSA-65 envelopes, ~3 MB at the
+    /// 1000-member target committee, against a few KB for everything else. They are read ONLY by
+    /// `verify_v2_macroblock`, which runs at INGEST; every reader of a STORED macroblock takes the
+    /// checkpoint half (reward roots, total_supply, registry_root, recovery anchor). So the sigs are
+    /// needed exactly as long as a cold joiner may still walk to this index — the binder budget below
+    /// — plus margin for tip skew between joiner and server and the walk's one-below descent.
+    ///
+    /// Without this, macroblock storage on a Super (which prunes nothing) grows ~1 TB/year at target
+    /// scale and has no horizon at all. Stripping is fork-free by construction: `MacroBlock::hash()`
+    /// excludes consensus_data, and `sig_merkle_root` stays, so the removed set is still committed.
+    pub(super) const QC_SIG_RETENTION_MB: u64 = Self::SNAPSHOT_MAX_WS_WALK_MB + 1_440;
+
+    /// Strip committee signatures from macroblocks whose index is below the retention horizon, keeping
+    /// the checkpoint, the signer list and `sig_merkle_root`. Bounded and resumable: the cursor is the
+    /// highest index already swept, so runs form one monotone forward sweep and never re-read the tail.
+    /// Absent indices (a snapshot-joined node holds none below its anchor) advance the cursor for free.
+    /// Returns how many macroblocks were rewritten.
+    pub fn strip_macroblock_qc_sigs(&self) -> IntegrationResult<u64> {
+        /// Indices looked at per call. A miss is one bloom-filter probe, so this may be large — it is
+        /// what lets a snapshot-joined node sweep past its empty pre-anchor range in a few runs.
+        const EXAMINE_CAP: u64 = 50_000;
+        /// Macroblocks rewritten per call: the real work bound (decode + re-serialize + write).
+        const REWRITE_CAP: u64 = 512;
+
+        let tip_mb = self.get_chain_height()?.saturating_div(90);
+        let floor = match tip_mb.checked_sub(Self::QC_SIG_RETENTION_MB) {
+            Some(f) if f > 0 => f,
+            _ => return Ok(0), // young chain: nothing is outside the walk budget yet
+        };
+
+        let micro_cf = self.persistent.db.cf_handle("microblocks")
+            .ok_or_else(|| IntegrationError::StorageError("microblocks column family not found".to_string()))?;
+        let meta_cf = self.persistent.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
+
+        let mut swept = self.persistent.db.get_cf(&meta_cf, b"qc_sig_strip_cursor")?
+            .filter(|v| v.len() == 8)
+            .map(|v| u64::from_be_bytes(v[..8].try_into().unwrap_or([0u8; 8])))
+            .unwrap_or(0);
+
+        let mut batch = WriteBatch::default();
+        let mut rewritten: u64 = 0;
+        let mut examined: u64 = 0;
+        while swept < floor && examined < EXAMINE_CAP && rewritten < REWRITE_CAP {
+            let index = swept + 1;
+            examined += 1;
+            swept = index;
+            let key = format!("macroblock_{}", index);
+            let raw = match self.persistent.db.get_cf(&micro_cf, key.as_bytes())? {
+                Some(r) if !r.is_empty() => r,
+                _ => continue,
+            };
+            // Stored macroblocks may be zstd-framed; re-store in the SAME framing so no reader has to
+            // learn a new one.
+            let compressed = raw.len() >= 4 && raw[0..4] == [0x28, 0xb5, 0x2f, 0xfd];
+            let plain = if compressed {
+                match zstd::decode_all(&raw[..]) { Ok(d) => d, Err(_) => continue }
+            } else {
+                raw
+            };
+            let mut mb: qnet_state::MacroBlock = match bincode::deserialize(&plain) {
+                Ok(m) => m,
+                Err(_) => continue, // unreadable row: leave it exactly as found, never destroy
+            };
+            let qc_bytes = match mb.consensus_data.checkpoint_qc.as_ref() { Some(b) => b, None => continue };
+            let (cp, mut qc): (qnet_consensus::checkpoint_bft::Checkpoint,
+                               qnet_consensus::checkpoint_bft::QuorumCertificate) =
+                match bincode::deserialize(qc_bytes) { Ok(v) => v, Err(_) => continue };
+            if qc.sigs.is_empty() { continue; }
+            qc.sigs = Vec::new();
+            let restripped = match bincode::serialize(&(cp, qc)) { Ok(b) => b, Err(_) => continue };
+            mb.consensus_data.checkpoint_qc = Some(restripped);
+            let reserialized = match bincode::serialize(&mb) { Ok(b) => b, Err(_) => continue };
+            let out = if compressed {
+                match zstd::encode_all(&reserialized[..], 3) { Ok(c) => c, Err(_) => continue }
+            } else {
+                reserialized
+            };
+            batch.put_cf(&micro_cf, key.as_bytes(), &out);
+            rewritten += 1;
+        }
+
+        batch.put_cf(&meta_cf, b"qc_sig_strip_cursor", &swept.to_be_bytes());
+        self.persistent.db.write(batch)?;
+        if rewritten > 0 && crate::node::is_info() {
+            println!("[INFO][STORAGE] qc_sigs_stripped count={} up_to={} floor={}", rewritten, swept, floor);
+        }
+        Ok(rewritten)
+    }
+
+    /// True iff this stored macroblock still carries its committee signatures. A stripped one is
+    /// useless to a syncing peer: `verify_v2_macroblock` would read the empty set as an invalid QC and
+    /// score the honest server as byzantine, so the sync path serves it as ABSENT instead.
+    pub fn macroblock_carries_qc_sigs(mb: &qnet_state::MacroBlock) -> bool {
+        mb.consensus_data.checkpoint_qc.as_ref().map_or(false, |b| {
+            bincode::deserialize::<(qnet_consensus::checkpoint_bft::Checkpoint,
+                                    qnet_consensus::checkpoint_bft::QuorumCertificate)>(b)
+                .map_or(false, |(_, qc)| !qc.sigs.is_empty())
+        })
+    }
+
+    /// Highest macroblock index contiguously present at/above the apply frontier (chain_height/90). Present
+    /// ⟹ inductively QC-verified (stored only after verify_v2). SINGLE SOURCE for the selection ceiling AND
+    /// the binder walk budget so the two extents can never drift. Bounded: chain_height/90 is a tight lower
+    /// bound and any fill-ahead is capped at SNAPSHOT_MAX_WS_WALK_MB, so this never scans O(chain).
+    pub(super) fn own_contiguous_frontier_mb(&self) -> u64 {
+        let mut f = self.get_chain_height().unwrap_or(0) / 90;
+        while self.get_macroblock_by_height(f.saturating_add(1)).ok().flatten().is_some() {
+            f = f.saturating_add(1);
+        }
+        f
+    }
+
+    /// v5.0: Download snapshot from network — chunked parallel download with fallback
+    pub async fn download_and_load_snapshot(&self, p2p: &crate::unified_p2p::SimplifiedP2P) -> IntegrationResult<u64> {
+        let peers = p2p.get_validated_active_peers();
+        if peers.is_empty() {
+            return Err(IntegrationError::Other("No peers available for snapshot download".to_string()));
+        }
+
+        // Two-phase snapshot negotiation. Phase 1: query each peer's
+        // advertised snapshot height (differ per-node — creation is per-node).
+        // Phase 2: pick best_height and download ONLY from peers that
+        // reported exactly it — including lower/no-height peers would return
+        // None on get_snapshot_chunk and break the manifest chain, forcing
+        // fallback even when a capable peer exists. >1 such peer → parallel
+        // fan-out; exactly 1 → serial (still faster than block-by-block).
+        // IPFS fast path preserved: ipfs_cid + IPFS_ENABLED short-circuits
+        // to the gateway, bypassing peer fan-out. O(active_peers) discovery.
+
+        // v31.5: Phase 1 discovery — parallel fan-out via join_all.
+        // Cost = max(rtt) regardless of peer count.
+        let mut best_height = 0u64;
+        let mut peer_heights: Vec<(String, u64)> = Vec::new();
+
+        // A1: settle the genesis-rooted GALC pin BEFORE reading the ceiling — the capsule arrives +
+        // Dilithium-verifies asynchronously, so a joiner without a near-tip pin acquires it first to keep the
+        // binder walk ≈ 0. Re-sample the (f+1)-corroborated tip EACH pass: at t=0 the cache can read 0 (peers
+        // up, head not yet reported), so should_have_capsule latches ONLY once a mature tip (mb >=
+        // GALC_MINT_INTERVAL) is corroborated. A corroborated young chain fail-opens; an unproven tip keeps
+        // polling. On mature-tip-but-pin-absent it returns retryable AnchorPending (bounded eclipse floor).
+        static COLDJOIN_ANCHOR_PENDING_ROUNDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        const COLDJOIN_ANCHOR_PENDING_MAX: u64 = 10; // ~2 min of retries, then fail-open (eclipse liveness floor)
+        // Engage the pin-wait keyed on pin-staleness vs the (f+1)-corroborated mature tip — NOT own_frontier
+        // (concurrent linear sync advancing it, or a prior low-anchor adoption, must never disarm the wait).
+        // Skip it when a near-tip pin is already held OR our own contiguous verified frontier can already bind
+        // a snapshot within the walk budget (no capsule needed). All callers gate this on far-behind.
+        let corr_tip_mb = p2p.corroborated_head_ceiling() / 90;
+        // FRESH (near-tip) pin. Keyed on STALENESS, not mere existence — a stale nonzero pin (old capsule
+        // from a lagging peer) must NOT count as reached. Takes the tip explicitly so the loop re-checks
+        // against the LIVE corroborated tip each pass. Margin = 2 mint intervals, not 1: the capsule roots at
+        // the latest FINALIZED 40-boundary K while corr_tip_mb is the (unfinalized) microblock tip that leads
+        // it by up to ~1 interval (boundary floor + finality lag), so a 1-interval margin would misflag the
+        // freshest mintable capsule as stale for part of each cycle → spurious AnchorPending. 2 intervals
+        // absorbs the gap; a genuinely old capsule (≥2 intervals below tip) is still stale and the resulting
+        // binder walk stays ≤2 intervals (cheap).
+        let pin_fresh = |mb: u64, tip_mb: u64| mb > 0 && tip_mb > 0
+            && mb.saturating_add(2 * crate::galc::GALC_MINT_INTERVAL) > tip_mb;
+        // A node whose own contiguous frontier is within the walk budget of the tip binds cheaply from its
+        // own lineage and needs no capsule — do not stall it in the wait (it would AnchorPending pointlessly).
+        let frontier_can_bind = corr_tip_mb > 0
+            && corr_tip_mb.saturating_sub(self.own_contiguous_frontier_mb()) <= Self::SNAPSHOT_MAX_WS_WALK_MB;
+        if !pin_fresh(crate::galc::effective_pin_checkpoint().0, corr_tip_mb) && !frontier_can_bind {
+            const GALC_PIN_WAIT_ATTEMPTS: u32 = 20;       // ≤ ~10s per cold-join call
+            const GALC_PIN_WAIT_INTERVAL_MS: u64 = 500;
+            let mut should_have_capsule = false;          // set true ONLY on a (f+1)-corroborated mature tip
+            let mut tip_live = corr_tip_mb;
+            for i in 0..GALC_PIN_WAIT_ATTEMPTS {
+                // Re-read the LIVE (f+1)-corroborated tip each pass: corroborated_head_ceiling() is the
+                // (f+1)-th highest fresh in-set peer height, or 0 when < f+1 corroborators — a lone lying peer
+                // cannot raise it. 0 = uncorroborated → keep polling.
+                tip_live = p2p.corroborated_head_ceiling() / 90;
+                // Break on a FRESH pin (near the live tip), not mere existence: a stale nonzero pin keeps
+                // polling for the near-tip capsule via the re-request below, else the ceiling would collapse.
+                if pin_fresh(crate::galc::effective_pin_checkpoint().0, tip_live) { break; }
+                if tip_live >= crate::galc::GALC_MINT_INTERVAL { should_have_capsule = true; }
+                else if tip_live > 0 { break; }            // CORROBORATED young chain (< first capsule) → fail-open to h=90
+                // tip_live == 0: no f+1 corroboration yet → keep polling (never latch from an unproven tip)
+                if i % 4 == 0 {                            // re-request every ~2s (a reply may be lost)
+                    let _ = p2p.broadcast_quic(&crate::unified_p2p::NetworkMessage::RequestGenesisCheckpoint {
+                        requester_id: "snapshot_ceiling".to_string(),
+                    }).await;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(GALC_PIN_WAIT_INTERVAL_MS)).await;
+            }
+            // Mature tip but still no FRESH pin (stale-nonzero OR absent): return retryable AnchorPending so
+            // the caller bails to the desync tick rather than rooting the ceiling at a stale/genesis extent.
+            // Bounded escape after COLDJOIN_ANCHOR_PENDING_MAX rounds → fail-open to block-replay (eclipse floor).
+            // The counter is process-global (shared across cold-join drivers); in a true eclipse every driver
+            // takes the increment (none the reset), so it climbs monotonically to MAX — no livelock.
+            if should_have_capsule && !pin_fresh(crate::galc::effective_pin_checkpoint().0, tip_live) {
+                let rounds = COLDJOIN_ANCHOR_PENDING_ROUNDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if rounds <= COLDJOIN_ANCHOR_PENDING_MAX {
+                    if crate::node::is_info() {
+                        println!("[INFO][SYNC] coldjoin_anchor_pending round={}/{} — retry next tick", rounds, COLDJOIN_ANCHOR_PENDING_MAX);
+                    }
+                    return Err(IntegrationError::AnchorPending);
+                }
+                if crate::node::is_warn() {
+                    println!("[WARN][SYNC] coldjoin_anchor_pending_exhausted rounds={} — fail-open to block-replay (degraded/eclipse)", rounds);
+                }
+            }
+            COLDJOIN_ANCHOR_PENDING_ROUNDS.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        // Exogenously-verifiable negotiation ceiling — genesis/pin/frontier-rooted, NEVER a raw peer tip. A
+        // cold joiner may adopt any snapshot whose anchor the binder re-verifies from a trusted root within its
+        // REAL walk budget (SNAPSHOT_MAX_WS_WALK_MB, the same CONSTANT verify_snapshot_consensus_binding
+        // enforces). Roots: the GALC pin, the rotated WS floor, or its OWN highest contiguous-present macro-
+        // block (present ⟹ inductively QC-verified from genesis). Prior code capped this at base+15mb, below
+        // the latest snapshot whenever the verified extent lags it by ≥1 interval (40mb) → the joiner was
+        // forced onto a stale anchor + O(chain) tail. NOTE: the binder credits the pin as a walk root ONLY
+        // when usable (ws_floor < pin ≤ anchor); a capsule minted one interval ABOVE the negotiated anchor
+        // roots the binder at ws_floor instead, so at a boundary crossing an admitted snapshot may be re-
+        // verified from ws_floor/frontier (transiently rejected + retried next tick, never mis-bound). Bytes
+        // stay bound to the anchor's 2f+1 snapshot_root on promote and a forged anchor fails the QC walk →
+        // block replay, so the wide ceiling never weakens weak-subjectivity. base==0 + no mature tip ⇒ h=90.
+        let verifiable_ceiling = {
+            let pin_mb = crate::galc::effective_pin_checkpoint().0;
+            let ws_floor_mb = crate::node::effective_ws_checkpoint().0;
+            let base_mb = pin_mb.max(ws_floor_mb).max(self.own_contiguous_frontier_mb());
+            if base_mb == 0 && corr_tip_mb < crate::galc::GALC_MINT_INTERVAL {
+                crate::node::SNAPSHOT_EARLY_ANCHOR_HEIGHT
+            } else {
+                base_mb.saturating_add(Self::SNAPSHOT_MAX_WS_WALK_MB).saturating_mul(90)
+            }
+        };
+
+        let queries: Vec<_> = peers.iter().map(|peer| {
+            let addr = peer.addr.clone();
+            let storage_ref = self;
+            async move {
+                let result = storage_ref.query_peer_snapshot(&addr, verifiable_ceiling).await;
+                (addr, result)
+            }
+        }).collect();
+
+        let results = futures::future::join_all(queries).await;
+        let mut cids: Vec<(u64, String)> = Vec::new();
+
+        for (addr, result) in results {
+            if let Ok(Some((height, cid))) = result {
+                if height > verifiable_ceiling { continue; } // defense: peer ignored the ceiling param
+                if height > best_height {
+                    best_height = height;
+                }
+                // A CID is a fetch source for the target height, tried first where IPFS is enabled.
+                if !cid.is_empty() { cids.push((height, cid)); }
+                peer_heights.push((addr, height));
+            }
+        }
+
+        if best_height == 0 || peer_heights.is_empty() {
+            return Err(IntegrationError::Other("No snapshots available from network".to_string()));
+        }
+
+        // ── Phase 2: pick the HIGHEST height advertised by a quorum (>=2) of peers so the
+        // download has redundant sources for parallel fan-out + retry. The single max is
+        // often one peer mid-boundary → serial download. Fall back to max if none shared.
+        let target_height = {
+            let mut counts: std::collections::BTreeMap<u64, usize> = std::collections::BTreeMap::new();
+            for (_, h) in &peer_heights { *counts.entry(*h).or_insert(0) += 1; }
+            let quorum = 2usize.min(peer_heights.len());
+            counts.iter().rev().find(|(_, c)| **c >= quorum).map(|(h, _)| *h).unwrap_or(best_height)
+        };
+        let peer_addrs: Vec<String> = peer_heights
+            .iter()
+            .filter(|(_, h)| *h == target_height)
+            .map(|(addr, _)| addr.clone())
+            .collect();
+
+        if peer_addrs.is_empty() {
+            return Err(IntegrationError::Other(format!(
+                "snapshot_peer_filter_empty target_height={} candidates={}",
+                target_height, peer_heights.len(),
+            )));
+        }
+
+        // Forward-only: never adopt a snapshot at/below our own chain height (promote sets chain_height,
+        // so a ≤-local snapshot would REGRESS the node). The verifiable-ceiling clamp can yield a
+        // below-local anchor for a node already past it (e.g. capsule-less + advanced via replay) — fall
+        // to block replay instead, which continues forward.
+        let local_h = self.get_chain_height().unwrap_or(0);
+        if target_height <= local_h && !ALLOW_SNAPSHOT_REGRESS.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(IntegrationError::Other(format!(
+                "snapshot_not_forward target={} local={} action=block_replay", target_height, local_h
+            )));
+        }
+
+        // Snapshot is the preferred cold-join path: a transient binding/download failure is retried each
+        // desync tick (~15s backoff), never permanently latched. Forward-only guard above is the only
+        // suppression; convergence relies on the frontier-reserved dispatcher, not on disabling the jump.
+        println!(
+            "[INFO][SYNC] snapshot_download h={} capable_peers={}/{} discovery=two_phase",
+            target_height, peer_addrs.len(), peer_heights.len(),
+        );
+
+        // Stage the frame (IPFS where enabled, then chunked, then one body), then verify-then-promote: the
+        // staged snapshot is bound to the 2f+1 macroblock root and only on success copied into live state;
+        // ANY failure drops staging and the frame, and falls to block replay.
+        let ipfs = std::env::var("IPFS_ENABLED").unwrap_or_default() == "1";
+        let cid = cids.iter().find(|(h, _)| ipfs && *h == target_height).map(|(_, c)| c.clone());
+        self.stage_frame(&peer_addrs, target_height, cid.as_deref()).await?;
+        self.verify_and_promote_staged(p2p, target_height).await
+    }
+
+    /// Stage the frame at `height`: the one held here if it loads, else one fetched now. A frame that does
+    /// not load is dropped, so the next attempt fetches afresh instead of loading it again.
+    async fn stage_frame(&self, peers: &[String], height: u64, cid: Option<&str>) -> IntegrationResult<()> {
+        if self.snapshot_exists(height)? {
+            match self.load_staged_or_drop(height).await {
+                Ok(()) => return Ok(()),
+                Err(e) => println!("[WARN][SYNC] held_frame_unloadable h={} err={} action=refetch", height, e),
+            }
+        }
+        self.fetch_frame(peers, height, cid).await?;
+        self.load_staged_or_drop(height).await
+    }
+
+    async fn load_staged_or_drop(&self, height: u64) -> IntegrationResult<()> {
+        let res = self.load_state_snapshot(height, true).await;
+        if res.is_err() {
+            let _ = self.discard_snapshot_state(height);
+        }
+        res
+    }
+
+    /// Fetch the frame at `height` under one claim: IPFS where a CID is given, then chunked, then one body.
+    async fn fetch_frame(&self, peers: &[String], height: u64, cid: Option<&str>) -> IntegrationResult<()> {
+        if peers.is_empty() {
+            return Err(IntegrationError::Other("No peers for snapshot download".to_string()));
+        }
+        let claim = self.claim_snapshot_height(height)?;
+        if self.snapshot_exists(height)? {
+            return Ok(()); // written meanwhile; the caller loads it
+        }
+        if let Some(cid) = cid {
+            match self.fetch_frame_ipfs(&claim, cid, height).await {
+                Ok(()) => return Ok(()),
+                Err(e) => println!("[WARN][SYNC] ipfs_fetch_failed h={} err={} fallback=chunked", height, e),
+            }
+        }
+        match self.fetch_frame_chunked(&claim, peers, height).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                println!("[WARN][SYNC] chunked_download_failed err={} fallback=legacy", e);
+                self.fetch_frame_legacy(&claim, &peers[0], height).await
+            }
+        }
+    }
+
+    /// Verify a STAGED snapshot against its 2f+1 anchor and, on success, promote it into live state.
+    /// On any failure drop staging and return Err so the caller falls to block replay. Pre-anchor
+    /// (mb_idx==0) cold-join is handled by replay, never a snapshot.
+    pub(super) async fn verify_and_promote_staged(
+        &self,
+        p2p: &crate::unified_p2p::SimplifiedP2P,
+        height: u64,
+    ) -> IntegrationResult<u64> {
+        if height / 90 == 0 {
+            let _ = self.discard_snapshot_state(height);
+            return Err(IntegrationError::Other(format!(
+                "snapshot_below_anchor h={} action=block_replay", height
+            )));
+        }
+        match self.verify_snapshot_consensus_binding(p2p, height).await {
+            Ok(anchor) => {
+                // A failure here may have already replaced live accounts, so the marker and staging
+                // MUST survive for boot recovery. Pre-destructive failures clean up inside promote.
+                if let Err(e) = self.promote_snapshot_staging(height, anchor).await {
+                    // Failed after the live CFs began to change: the mirror stays closed and applies stay paused
+                    // until a restore completes; the latch makes the coordinator run one.
+                    if SNAPSHOT_REHYDRATE_IN_PROGRESS.load(Ordering::SeqCst) {
+                        crate::block_pipeline::mark_state_suspect();
+                    }
+                    return Err(e);
+                }
+                Ok(height)
+            }
+            Err(e) => {
+                // Drop staging; snapshot path stays available for retry (no permanent latch).
+                let _ = self.discard_snapshot_state(height);
+                Err(e)
+            }
+        }
+    }
+
+    // Trustless-bootstrap binding. A byzantine peer can serve a self-
+    // consistent forged snapshot (per-chunk hashes only prove "download
+    // matches the peer's metadata", not chain-canonicity). Binding: the
+    // snapshot-boundary macroblock embeds consensus_data.snapshot_root =
+    // SHA3-256 of the canonical snapshot bytes (byte-stable across the
+    // committee, finalised by a 2f+1 Checkpoint-BFT QC → forging needs 2f+1 keys).
+    // Verifier: SHA3 the saved snapshot → fetch macroblock at height/90
+    // (local then P2P) → compare → accept or ROLL BACK (delete
+    // full_snap_/state_snap_ keys). Every fetch/binding failure returns Err
+    // (no graceful-degradation accept) so the caller falls to byzantine-safe
+    // block-by-block sync — costs 1 RTT, no attacker state contamination.
+    // O(1)/bootstrap.
+    /// Verifies a STAGED snapshot (in the *_stage CFs) against the 2f+1-bound macroblock lineage.
+    /// Returns the anchor macroblock hash on success (caller promotes); on ANY failure drops the
+    /// staging CFs and returns Err so live state is never touched and the caller falls to block-sync.
+    pub(super) async fn verify_snapshot_consensus_binding(
+        &self,
+        p2p: &crate::unified_p2p::SimplifiedP2P,
+        snapshot_height: u64,
+    ) -> IntegrationResult<[u8; 32]> {
+        // Genesis-window snapshots (mb_idx < 1) cannot be bound to a consensus-finalised macroblock —
+        // nothing earlier to anchor against. The caller routes pre-anchor cold-join to block replay.
+        let mb_idx = snapshot_height / 90;
+        if mb_idx == 0 {
+            return Ok([0u8; 32]);
+        }
+
+        // ── Genesis/pin-rooted inductive lineage walk (weak-subjectivity trust root) ───────────────
+        // A snapshot peer controls the bytes it serves, so the anchor's 2f+1 QC must NOT be trusted
+        // against a committee derived from peer-served data alone (that is circular — a byzantine server
+        // forges a self-consistent anchor + predecessors + QC). Instead we re-verify the macroblock
+        // lineage from an EXOGENOUS root up to the anchor: verify_v2_macroblock checks each macroblock's
+        // QC against the committee sampled from its already-verified N-2 predecessor, and a macroblock
+        // only stores after that verify passes (process_received_macroblock), so "contiguously present
+        // in storage" ⟺ "inductively verified". Roots: fresh/young chain ⇒ genesis (the first two
+        // macroblocks use the embedded genesis committee); mature chain ⇒ the binary WS pin (its
+        // macroblock by hash + predecessor by the previous_hash chain, handled in verify_v2_macroblock).
+        struct AnchorReset(u64);
+        impl Drop for AnchorReset {
+            fn drop(&mut self) {
+                // Restore the prior runtime floor on ANY early return; only a fully-verified anchor
+                // commits a new floor (adopt_snapshot_finality + mem::forget at the end). No provisional
+                // floor is set during the walk (the old mb_idx-3 shortcut was the circularity hole).
+                // CAP by the live chain_height: discard_snapshot_state zeroes chain_height on a full
+                // state wipe (a snapshot rejected after a prior one was adopted), so a blind restore of
+                // the higher prior anchor would strand the dedup floor above an empty chain (the cross-
+                // attempt invariant break). A non-wiping early return leaves chain_height == prior, so the
+                // prior anchor is restored unchanged.
+                let chain_mb = crate::node::try_get_storage()
+                    .and_then(|s| s.get_chain_height().ok())
+                    .map(|h| h / 90)
+                    .unwrap_or(self.0);
+                crate::node::SNAPSHOT_ANCHOR_MB.store(self.0.min(chain_mb), std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let anchor_guard = AnchorReset(crate::node::SNAPSHOT_ANCHOR_MB.load(std::sync::atomic::Ordering::SeqCst));
+
+        // Security floor = ws_floor ONLY (binary pin / adopted snapshot anchor): a snapshot below the
+        // exogenous finality floor has no trusted root beneath it to re-verify from — reject. The GALC
+        // capsule is a walk SHORTENER, never a floor: a capsule ABOVE the anchor can't root the forward
+        // N-2 lineage walk DOWN to it, so it roots the walk ONLY when at-or-below the anchor; else ws_floor.
+        let ws_floor = crate::node::effective_ws_checkpoint();
+        if mb_idx < ws_floor.0 {
+            let _ = self.discard_snapshot_state(snapshot_height);
+            return Err(IntegrationError::Other(format!(
+                "snapshot_below_ws mb={} ws={} action=reject_snapshot", mb_idx, ws_floor.0
+            )));
+        }
+        // Root the walk at the genesis-signed GALC capsule when one is co-located at/below the
+        // snapshot anchor (walk ≈ 0). The capsule arrives + Dilithium-verifies asynchronously, so a
+        // binding that ran right after the cold-join orchestrator's best-effort request would race it
+        // and fall back to ws_floor → a full genesis-to-anchor re-verify (the slow-rejoin bug).
+        // Deterministically request + bounded-wait for a usable capsule before rooting; on timeout
+        // fall through to ws_floor (correct, only slower — never worse, no new launch requirement).
+        let usable = |k: u64| k > ws_floor.0 && k <= mb_idx;
+        let mut pin = crate::galc::effective_pin_checkpoint();
+        // Skip the wait on a young network: the first capsule only mints at mb == GALC_MINT_INTERVAL,
+        // so a snapshot anchored below it can never have a usable capsule — waiting is pure dead-time.
+        // Tip proxy = the anchor itself (mb_idx). Fall straight through to ws_floor (fail-open path
+        // below is unchanged); behaves exactly as before once mb_idx>=GALC_MINT_INTERVAL.
+        if !usable(pin.0) && mb_idx >= crate::galc::GALC_MINT_INTERVAL {
+            const GALC_WAIT_ATTEMPTS: u32 = 20;        // ≤ ~10s total
+            const GALC_WAIT_INTERVAL_MS: u64 = 500;
+            for i in 0..GALC_WAIT_ATTEMPTS {
+                // A capsule already adopted ABOVE the anchor (cadence put the freshest mint a step ahead
+                // of the negotiated snapshot) can never become usable by waiting — adoption is monotonic-up
+                // — so root at ws_floor now instead of burning the timeout; the next snapshot boundary
+                // re-aligns capsule and anchor.
+                if pin.0 > mb_idx { break; }
+                if i % 4 == 0 {                        // re-request every ~2s (a reply may be lost)
+                    let _ = p2p.broadcast_quic(&crate::unified_p2p::NetworkMessage::RequestGenesisCheckpoint {
+                        requester_id: "snapshot_binder".to_string(),
+                    }).await;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(GALC_WAIT_INTERVAL_MS)).await;
+                pin = crate::galc::effective_pin_checkpoint();
+                if usable(pin.0) { break; }
+            }
+            if crate::node::is_info() {
+                println!("[INFO][SYNC] galc_anchor_wait mb={} pin={} rooted={}",
+                         mb_idx, pin.0, if usable(pin.0) { "capsule" } else { "ws_floor" });
+            }
+        }
+        let walk_root: (u64, [u8; 32]) =
+            if usable(pin.0) { (pin.0, pin.1) } else { ws_floor };
+        // Bound the walk so a stale root can't degrade into an unbounded genesis-to-tip re-verify
+        // (DoS-on-self CPU + a wider trust window). The GALC capsule normally keeps the root within a few
+        // macroblocks of the anchor (walk ≈ 0); this is the FALLBACK ceiling when no capsule is held, sized
+        // to ~2 weeks so the binary-pin rotation cadence is realistic. Measured from the EFFECTIVE walk start
+        // = max(walk_root, own contiguous-present frontier): the fill loop below slides past present ⟹
+        // inductively-verified macroblocks, so the real fetch/verify work is mb_idx - frontier, not
+        // mb_idx - walk_root. Trust still roots at walk_root (pin/ws_floor); the frontier is self-verified,
+        // never peer-claimed, so crediting it adds no attack surface and keeps this budget consistent with
+        // the selection ceiling (which also folds in frontier). INERT for a young chain (span small).
+        const MAX_WS_WALK_MB: u64 = Storage::SNAPSHOT_MAX_WS_WALK_MB; // single-sourced with the selection ceiling
+        let walk_span_root = walk_root.0.max(self.own_contiguous_frontier_mb());
+        if mb_idx.saturating_sub(walk_span_root) > MAX_WS_WALK_MB {
+            let _ = self.discard_snapshot_state(snapshot_height);
+            return Err(IntegrationError::Other(format!(
+                "snapshot_ws_walk_too_long mb={} start={} root={} max={} action=upgrade_binary_pin",
+                mb_idx, walk_span_root, walk_root.0, MAX_WS_WALK_MB
+            )));
+        }
+        // Where to begin filling: from genesis (1) on a fresh chain; just above the walk_root when its
+        // macroblock is already present (a prior adoption — fill only the new gap); else from the pinned
+        // pair (walk_root.0-1) so the root macroblock + its predecessor bootstrap forward verification.
+        let walk_from = if walk_root.0 == 0 {
+            1
+        } else if walk_root.0 == mb_idx && walk_root.0 > ws_floor.0 {
+            // Capsule/pin co-located AT the snapshot anchor (strictly above the WS floor — so anchor-1
+            // is at/above the floor and re-verifiable, never below it). The forward committee derivation
+            // for the
+            // first two tail macroblocks (anchor+1, anchor+2) reads N-2 = {anchor-1, anchor}. The capsule
+            // binds BOTH digests (pin.2 anchor, pin.3 predecessor) and verify_v2_macroblock trusts the
+            // predecessor by the anchor's previous_hash chain (pin.0-1 branch), so descend to anchor-1 to
+            // fetch+verify it EVEN IF the anchor macroblock is already stored. Without this the predecessor
+            // is skipped (walk_root+1 ⇒ empty range) → anchor+1 hits v2_qc_no_committee, anchor+3 then
+            // defers on the resulting hole → post-snapshot finality wedges 2 mb past the anchor on a mature
+            // chain. The cursor skips already-present macroblocks, so this is a no-op extra storage read
+            // when the predecessor is already held; it costs one fetch only in the wedge case.
+            walk_root.0.saturating_sub(1).max(1)
+        } else if self.get_macroblock_by_height(walk_root.0).ok().flatten().is_some() {
+            walk_root.0.saturating_add(1)
+        } else {
+            walk_root.0.saturating_sub(1).max(1)
+        };
+
+        // Fill the contiguous lineage [walk_from ..= mb_idx] bottom-up. The cursor slides past
+        // already-stored (⇒ verified) macroblocks; each attempt re-requests from the lowest-missing so
+        // the repair window slides forward. Back off only when an attempt made NO progress.
+        const MB_FETCH_MAX_ATTEMPTS: u32 = 1500; // server caps ~10 macroblocks/response ⇒ ≥ MAX_WS_WALK_MB/10 (+margin)
+        const MB_FETCH_BASE_DELAY_MS: u64 = 1_000;
+        // Wall-clock budget: a mature-chain walk with no usable GALC capsule can run ~30min and starve
+        // block replay (same task). Cap it; on timeout the incomplete-lineage path below drops staging,
+        // latches the boundary (no re-arm), and the caller falls through to block replay. Kept under
+        // STALL_ABORT(120s); a young chain (capsule co-located) finishes in ~0 well before it.
+        const WALK_BUDGET_SECS: u64 = 90;
+        let walk_deadline = std::time::Instant::now() + std::time::Duration::from_secs(WALK_BUDGET_SECS);
+        let mut lineage_from = walk_from;
+        let mut attempt = 0u32;
+        loop {
+            while lineage_from <= mb_idx
+                && self.get_macroblock_by_height(lineage_from).ok().flatten().is_some()
+            {
+                lineage_from = lineage_from.saturating_add(1);
+            }
+            if lineage_from > mb_idx { break; } // full contiguous lineage present ⇒ inductively verified
+            attempt += 1;
+            if attempt > MB_FETCH_MAX_ATTEMPTS { break; }
+            if std::time::Instant::now() >= walk_deadline {
+                if crate::node::is_warn() {
+                    println!("[WARN][SYNC] verifier_walk_budget_exceeded reached={} mb={} action=block_replay",
+                        lineage_from.saturating_sub(1), mb_idx);
+                }
+                break;
+            }
+            let before = lineage_from;
+            if crate::node::is_info() {
+                println!(
+                    "[INFO][SYNC] verifier_lineage_walk from={} to={} attempt={}/{} for_snapshot_h={}",
+                    lineage_from, mb_idx, attempt, MB_FETCH_MAX_ATTEMPTS, snapshot_height,
+                );
+            }
+            if let Err(e) = p2p.sync_macroblocks_repair(lineage_from, mb_idx).await {
+                if crate::node::is_warn() {
+                    println!(
+                        "[WARN][SYNC] verifier_lineage_fetch_retry from={} to={} attempt={}/{} err={}",
+                        lineage_from, mb_idx, attempt, MB_FETCH_MAX_ATTEMPTS, e,
+                    );
+                }
+            }
+            // Re-slide to measure progress before deciding to back off.
+            while lineage_from <= mb_idx
+                && self.get_macroblock_by_height(lineage_from).ok().flatten().is_some()
+            {
+                lineage_from = lineage_from.saturating_add(1);
+            }
+            if lineage_from == before {
+                let backoff_ms = MB_FETCH_BASE_DELAY_MS.saturating_mul(1u64 << (attempt - 1).min(3));
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+            }
+        }
+
+        let macroblock_bytes = match self.get_macroblock_by_height(mb_idx)
+            .map_err(|e| IntegrationError::Other(format!("mb_reload_err mb={} err={:?}", mb_idx, e)))?
+        {
+            Some(b) if lineage_from > mb_idx => b, // anchor present AND lineage [walk_from..=mb_idx] contiguous
+            _ => {
+                if crate::node::is_warn() {
+                    println!(
+                        "[WARN][SYNC] verifier_lineage_incomplete mb={} reached={} attempts={} action=reject_snapshot",
+                        mb_idx, lineage_from.saturating_sub(1), MB_FETCH_MAX_ATTEMPTS,
+                    );
+                }
+                let _ = self.discard_snapshot_state(snapshot_height);
+                return Err(IntegrationError::Other(format!(
+                    "snapshot_binding_unavailable mb={} reason=lineage_incomplete reached={}",
+                    mb_idx, lineage_from.saturating_sub(1)
+                )));
+            }
+        };
+
+        let macroblock: qnet_state::MacroBlock = match bincode::deserialize(&macroblock_bytes) {
+            Ok(mb) => mb,
+            Err(e) => {
+                if crate::node::is_warn() {
+                    println!(
+                        "[WARN][SYNC] verifier_macroblock_decode_failed mb={} err={} action=reject_snapshot",
+                        mb_idx, e,
+                    );
+                }
+                let _ = self.discard_snapshot_state(snapshot_height);
+                return Err(IntegrationError::Other(format!(
+                    "snapshot_binding_unavailable mb={} reason=mb_decode_failed err={}",
+                    mb_idx, e
+                )));
+            }
+        };
+
+        // Anchor-QC gate (P2/P1): trust the macroblock's state_root ONLY after its own 2f+1
+        // checkpoint QC verifies against the committee anchored to the embedded genesis keys.
+        // Without this a Byzantine peer forges a self-consistent (macroblock, snapshot) pair the
+        // merkle recompute below would accept (a None-QC macroblock passes verify_v2_macroblock's
+        // early return). On ANY failure, discard the applied state → fall back to verified block-sync.
+        if let Err(e) = crate::node::verify_snapshot_anchor_qc(&macroblock, mb_idx, self).await {
+            if crate::node::is_warn() {
+                println!(
+                    "[WARN][SYNC] verifier_anchor_qc_failed mb={} snapshot_h={} err={} action=reject_snapshot",
+                    mb_idx, snapshot_height, e,
+                );
+            }
+            let _ = self.discard_snapshot_state(snapshot_height);
+            return Err(IntegrationError::Other(format!(
+                "snapshot_binding_unverified mb={} reason=anchor_qc_invalid err={}", mb_idx, e
+            )));
+        }
+
+        // Step 2: the 2f+1-bound account-state root. The macroblock's top-level
+        // state_root IS checkpoint.state_root (finalize_merkle), certified by the
+        // checkpoint QC — the trustless anchor. (consensus_data.snapshot_root is unused.)
+        let expected_root = macroblock.state_root;
+        if expected_root == [0u8; 32] {
+            if crate::node::is_warn() {
+                println!(
+                    "[WARN][SYNC] verifier_no_binding mb={} snapshot_h={} action=reject_snapshot",
+                    mb_idx, snapshot_height,
+                );
+            }
+            let _ = self.discard_snapshot_state(snapshot_height);
+            return Err(IntegrationError::Other(format!(
+                "snapshot_binding_missing mb={} reason=zero_state_root", mb_idx
+            )));
+        }
+
+        // Pattern C: snapshot bytes are staged in accounts_stage. Recompute the SAME account merkle the
+        // consensus committed (finalize_merkle) from the STAGED accounts and compare to the QC-bound
+        // mb.state_root; a forged snapshot yields a different root.
+        let mut computed = self.recompute_account_merkle_root_cf("accounts_stage")
+            .map_err(|e| IntegrationError::Other(format!("merkle_recompute_err h={} err={:?}", snapshot_height, e)))?;
+
+        if computed != expected_root {
+            // A peer snapshot ONE leaf over the QC-bound root is the accounts-CF phantom a
+            // rolled-back block left in every node's mirror. Repair it against the certified
+            // root here, BEFORE the discard — this binder is the only gate a cold-joiner or a
+            // wholesale resync ever passes; the post-promote rehydrate check is just the belt.
+            if let Some(addr) = self.repair_staged_phantom(&expected_root) {
+                println!("[WARN][SNAPSHOT] staged_repaired_phantom h={} addr={}", snapshot_height, addr);
+                computed = self.recompute_account_merkle_root_cf("accounts_stage")
+                    .map_err(|e| IntegrationError::Other(format!("merkle_recompute_err h={} err={:?}", snapshot_height, e)))?;
+            }
+        }
+
+        if computed != expected_root {
+            // Real rollback: a peer served state that doesn't match the 2f+1-bound root.
+            // Wipe it entirely (not just the key) so it can't pollute the fallback block-sync.
+            self.discard_snapshot_state(snapshot_height)?;
+            return Err(IntegrationError::Other(format!(
+                "snapshot_root_mismatch h={} mb={} expected={} computed={}",
+                snapshot_height, mb_idx,
+                hex::encode(&expected_root[..8]),
+                hex::encode(&computed[..8]),
+            )));
+        }
+
+        // #8 registry binding: the account-merkle check above covers ONLY the accounts CF, NOT the
+        // node_registry CF — from which cbw AND the attestor VRF keys are derived. Without this an
+        // untrusted snapshot server could serve correct accounts but a FORGED node_registry (rebinding
+        // a burn to its own wallet, or swapping a VRF key) → the joiner accepts reused-burn blocks
+        // honest nodes reject, or verifies attestations against forged keys. Recompute the deterministic
+        // registry digest from the restored registry and compare to the anchor checkpoint's QC-certified
+        // registry_root (bounded by the checkpoint's window head). Gated: until the rule activates the
+        // root is computed+committed but not enforced here (staging window to prove live agreement).
+        if qnet_state::feature_gates::is_active(qnet_state::feature_gates::id::REGISTRY_ROOT_REQUIRED, snapshot_height) {
+            let cp_opt = macroblock.consensus_data.checkpoint_qc.as_ref().and_then(|b| {
+                bincode::deserialize::<(qnet_consensus::checkpoint_bft::Checkpoint, qnet_consensus::checkpoint_bft::QuorumCertificate)>(b).ok()
+            }).map(|(cp, _)| cp);
+            match cp_opt {
+                Some(cp) => {
+                    let computed_rr = match self.compute_registry_root_staged("node_registry_stage", cp.window_head_height) {
+                        Some(r) => r,
+                        // Unreadable staged registry: treat as a failed verify, not as a pass.
+                        None => {
+                            self.discard_snapshot_state(snapshot_height)?;
+                            return Err(IntegrationError::Other(format!(
+                                "snapshot_registry_root_unreadable h={} mb={}", snapshot_height, mb_idx)));
+                        }
+                    };
+                    if computed_rr != cp.registry_root {
+                        self.discard_snapshot_state(snapshot_height)?;
+                        return Err(IntegrationError::Other(format!(
+                            "snapshot_registry_root_mismatch h={} mb={} committed={} computed={}",
+                            snapshot_height, mb_idx,
+                            hex::encode(&cp.registry_root[..8]), hex::encode(&computed_rr[..8]),
+                        )));
+                    }
+                    // FIX-5: same anti-forge boundary for the per-account ML-DSA-65 pk set. The account
+                    // merkle (state_root) does NOT cover pk (excluded from hash_account by design), so an
+                    // untrusted snapshot server could serve correct balances but omit/alter an account's
+                    // pk → a joiner would stall that account's ELIDED TXs forever (unresolvable signer)
+                    // or admit a rebound key. Recompute dilithium_pk_root over the STAGED accounts and
+                    // compare to the QC-certified cp.dilithium_pk_root. Same gate as registry_root.
+                    let computed_dpk = match self.compute_dilithium_pk_root_staged() {
+                        Some(r) => r,
+                        // Unreadable staged accounts: a failed verify, never a pass.
+                        None => {
+                            self.discard_snapshot_state(snapshot_height)?;
+                            return Err(IntegrationError::Other(format!(
+                                "snapshot_dilithium_pk_root_unreadable h={} mb={}", snapshot_height, mb_idx)));
+                        }
+                    };
+                    if computed_dpk != cp.dilithium_pk_root {
+                        self.discard_snapshot_state(snapshot_height)?;
+                        return Err(IntegrationError::Other(format!(
+                            "snapshot_dilithium_pk_root_mismatch h={} mb={} committed={} computed={}",
+                            snapshot_height, mb_idx,
+                            hex::encode(&cp.dilithium_pk_root[..8]), hex::encode(&computed_dpk[..8]),
+                        )));
+                    }
+                }
+                None => {
+                    self.discard_snapshot_state(snapshot_height)?;
+                    return Err(IntegrationError::Other(format!(
+                        "snapshot_registry_root_unavailable mb={} reason=no_checkpoint_qc", mb_idx
+                    )));
+                }
+            }
+        }
+
+        // No vrf_pk completeness gate: registry authenticity is bound by registry_root above; vrf_pk is in
+        // no consensus root and self-heals via on-chain apply + VrfKeyAnnounce gossip. A super missing its
+        // key is excluded only from QC verification (n−f quorum unaffected), never from the committee
+        // sample — so a missing key must NOT reject otherwise-authentic state (would brick every joiner).
+
+        // Staging verified (2f+1 QC + Pattern-C state + registry binding). Return the anchor hash;
+        // promote commits the floors and copies staging→live atomically.
+        std::mem::forget(anchor_guard);
+        if crate::node::is_info() {
+            println!(
+                "[INFO][SYNC] verifier_pass mb={} snapshot_h={} root={} pattern=C",
+                mb_idx, snapshot_height, hex::encode(&computed[..8]),
+            );
+        }
+        Ok(macroblock.hash())
+    }
+
+    /// Wipe every key of a CF (cold-start rollback helper).
+    pub(super) fn clear_cf(&self, cf_name: &str) -> IntegrationResult<()> {
+        if let Some(cf) = self.persistent.db.cf_handle(cf_name) {
+            let mut batch = WriteBatch::default();
+            for item in self.persistent.db.iterator_cf(&cf, rocksdb::IteratorMode::Start) {
+                let (k, _) = item?;
+                batch.delete_cf(&cf, k);
+            }
+            self.persistent.db.write(batch)?;
+        }
+        Ok(())
+    }
+
+    /// Rebuild the per-key contract_storage CF from the (verified) accounts CF. contract_storage
+    /// mirrors Account.contract_storage, which is bound by state_root, so deriving it here binds it
+    /// transitively — the untrusted staged contract_storage is never promoted.
+    pub(super) fn rebuild_contract_storage_from_accounts(&self) -> IntegrationResult<()> {
+        let accounts_cf = self.persistent.db.cf_handle("accounts")
+            .ok_or_else(|| IntegrationError::StorageError("accounts column family not found".to_string()))?;
+        let mut n = 0u64;
+        for item in self.persistent.db.iterator_cf(&accounts_cf, rocksdb::IteratorMode::Start) {
+            let (_k, v) = item?;
+            let acct: qnet_state::Account = match bincode::deserialize(&v) { Ok(a) => a, Err(_) => continue };
+            if acct.is_contract && !acct.contract_storage.is_empty() {
+                self.persistent.save_contract_storage(&acct.address, &acct.contract_storage)?;
+                n += 1;
+            }
+        }
+        if n > 0 && crate::node::is_info() {
+            println!("[INFO][SNAPSHOT] contract_storage_rebuilt contracts={}", n);
+        }
+        Ok(())
+    }
+
+    /// Drop a rejected staged snapshot: truncate the *_stage CFs + the staged blob ONLY. Live state,
+    /// chain_height and the finality floors are NEVER touched, so a reject degrades cleanly to block
+    /// replay from the current committed height (no orphaned state, no wipe of replay progress).
+    pub(super) fn discard_snapshot_state(&self, height: u64) -> IntegrationResult<()> {
+        for cf in &["accounts_stage", "node_registry_stage", "pending_rewards_stage", "contract_storage_stage"] {
+            let _ = self.clear_cf(cf);
+        }
+        if let Some(snapshots_cf) = self.persistent.db.cf_handle("snapshots") {
+            let _fence = self.snapshot_fence();
+            let mut batch = WriteBatch::default();
+            super::snapshot_index::stage_delete(&mut batch, snapshots_cf, height);
+            let _ = self.persistent.db.write(batch);
+        }
+        println!("[WARN][SYNC] snapshot_staging_dropped h={} action=degrade_to_replay", height);
+        Ok(())
+    }
+
+    /// Promote a VERIFIED staged snapshot into live state, crash-atomically. Marker
+    /// `promote_pending = [height(8)|anchor(32)]` is written first and cleared only after the copy +
+    /// floor commit complete; a crash mid-copy re-runs idempotently from the intact staging on boot
+    /// (recover_pending_snapshot_promote). The ONLY place a snapshot mutates live state.
+    pub async fn promote_snapshot_staging(&self, height: u64, anchor_hash: [u8; 32]) -> IntegrationResult<()> {
+        let meta = self.persistent.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata CF not found".to_string()))?;
+        // A retried promote (boot recovery) must not overwrite live state on a node that has since
+        // replayed past the snapshot height — set_chain_height below is not forward-only.
+        let live_h = self.get_chain_height().map_err(|e| IntegrationError::StorageError(
+            format!("promote_height_read_failed h={} err={:?}", height, e)))?;
+        if live_h > height && !ALLOW_SNAPSHOT_REGRESS.load(std::sync::atomic::Ordering::SeqCst) {
+            let _ = self.persistent.db.delete_cf(&meta, b"promote_pending");
+            let _ = self.discard_snapshot_state(height);
+            return Err(IntegrationError::StorageError(format!(
+                "promote_refused_regress snapshot_h={} live_h={}", height, live_h)));
+        }
+        // Honest producers snapshot only on macroblock boundaries and adopt_snapshot_finality
+        // refuses anything else — refuse HERE, before anything destructive, or a peer-advertised
+        // off-boundary height leaves the tail half-pruned with finality retracted and no anchor.
+        if height % qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL != 0 {
+            let _ = self.discard_snapshot_state(height);
+            return Err(IntegrationError::StorageError(format!("promote_refused_off_boundary h={}", height)));
+        }
+        let regress = live_h > height;
+        let mut marker = height.to_le_bytes().to_vec();
+        marker.extend_from_slice(&anchor_hash);
+        // Regress authorization must survive a crash: boot recovery re-enters this promote
+        // with the volatile flag off, and refusing then would discard the only state that
+        // can finish the job (live accounts may already be partially replaced).
+        marker.push(regress as u8);
+        self.persistent.db.put_cf(&meta, b"promote_pending", &marker)?;
+        // A regress runs on a LIVE node: bar saves and materialisation above the restored tip for
+        // the whole destructive window (CF swap, rebuilds, tail prune), or a concurrent apply lands
+        // rows behind the very scans that exist to remove them. Guard drops on every exit path.
+        // Nothing destructive has run yet, so a busy slot just hands the retry token back.
+        let _slot = if regress {
+            match crate::storage::claim_rollback_slot(height) {
+                Ok(g) => Some(g),
+                Err(e) => {
+                    let _ = self.persistent.db.delete_cf(&meta, b"promote_pending");
+                    let _ = self.discard_snapshot_state(height);
+                    return Err(IntegrationError::StorageError(format!("promote_regress_slot_busy h={} err={}", height, e)));
+                }
+            }
+        } else { None };
+
+        // Epoch reward roots: PROVE before anything destructive runs. Their macroblocks sit below
+        // this node's weak-subjectivity floor and can never be re-fetched, so they must be carried —
+        // but a forged set must fail while live state is still intact and the retry can start clean.
+        if let Err(e) = self.carry_and_verify_epoch_roots(height) {
+            // Nothing destructive has run yet, so drop the retry token and let the snapshot path
+            // start clean. Every failure AFTER this point keeps the marker on purpose.
+            let _ = self.persistent.db.delete_cf(&meta, b"promote_pending");
+            let _ = self.discard_snapshot_state(height);
+            return Err(e);
+        }
+
+        // Rows already queued land before the copy; every row queued from here until the rehydrate replaces RAM
+        // is refused (it was read from the RAM this discards), and applies pause.
+        self.begin_state_replacement();
+        // Swap staging→live for the CONSENSUS-BOUND CFs only: accounts (state_root) + node_registry
+        // (registry_root). The binder verified exactly these against the 2f+1 anchor.
+        for (stage, live) in [("accounts_stage", "accounts"), ("node_registry_stage", "node_registry")] {
+            self.clear_cf(live)?;
+            let (s, l) = match (self.persistent.db.cf_handle(stage), self.persistent.db.cf_handle(live)) {
+                (Some(s), Some(l)) => (s, l),
+                _ => continue,
+            };
+            let mut batch = WriteBatch::default();
+            let mut n = 0u64;
+            let mut dropped = 0u64;
+            let mut dropped_keys = 0u64;
+            for item in self.persistent.db.iterator_cf(&s, rocksdb::IteratorMode::Start) {
+                let (k, v) = item?;
+                // WHITELIST. registry_root folds only srtr_/lrtr_ -> node_<id>, so every OTHER prefix in
+                // this section is unbound peer data. `vrf_pk_` is the worst: it is the key verify_qc and
+                // vote_sig_compact_ok resolve against, and the immutable-once-stamped rule makes a
+                // poisoned row permanent.
+                //
+                // vrf_pk_ is admitted only when it matches the COVERED commitment node_<id>.vrf_pk_sha3
+                // — the hash cannot yield the key, so the key must be carried, but it can be bound.
+                // Everything else is dropped and re-derived locally after promote.
+                if live == "node_registry" && !Self::registry_key_is_root_covered(&k) {
+                    let bound = k.strip_prefix(b"vrf_pk_".as_ref())
+                        .and_then(|id| std::str::from_utf8(id).ok())
+                        .map(|id| Self::staged_vrf_pk_matches_commitment(&self.persistent.db, &s, id, &v))
+                        .unwrap_or(false);
+                    if !bound {
+                        dropped += 1;
+                        if k.starts_with(b"vrf_pk_") { dropped_keys += 1; }
+                        continue;
+                    }
+                }
+                batch.put_cf(&l, &k, &v);
+                n += 1;
+                if n % 10_000 == 0 {
+                    self.persistent.db.write(std::mem::take(&mut batch))?;
+                    crate::storage::note_rollback_progress(); // no-op unless a regress slot is held
+                }
+            }
+            self.persistent.db.write(batch)?;
+            if dropped_keys > 0 {
+                // A signer key the certificate verifiers resolve against is gone from this node.
+                println!("[ERR][SNAPSHOT] registry_rows_dropped={} signer_keys_dropped={} reason=not_covered_by_registry_root",
+                         dropped, dropped_keys);
+            } else if dropped > 0 {
+                println!("[WARN][SNAPSHOT] registry_rows_dropped={} reason=not_covered_by_registry_root", dropped);
+            }
+        }
+        self.clear_cf("contract_storage")?;
+        self.rebuild_contract_storage_from_accounts()?;
+        // Derived indices over the now-live registry (byte-identical to a from-genesis node at this
+        // height). Propagate errors BEFORE committing height/floors/marker-delete: a failed rebuild must
+        // NOT finalize the anchor with a stale cbw/registry_lthash (silent fork). On Err the marker +
+        // staging survive, so recover_pending_snapshot_promote retries on next boot.
+        crate::storage::note_rollback_progress();
+        self.backfill_roster_indices()?;
+        crate::storage::note_rollback_progress();
+        self.rebuild_committed_burn_wallet(height)?;
+        crate::storage::note_rollback_progress();
+        self.rebuild_registry_lthash(height)?;
+        crate::storage::note_rollback_progress();
+        // FIX-5: dilithium_pk_root LtHash from the promoted live accounts — same fail-closed discipline
+        // as cbw/registry (Err leaves staging + marker so the promote retries, never finalizes stale).
+        self.rebuild_dilithium_pk_lthash()?;
+        // Prove the carried epoch roots against the anchor's 2f+1-certified commitment. Fail-closed
+        // like the rebuilds above: on mismatch the marker + staging survive and the promote retries,
+        // so a snapshot server cannot hand this node roots the committee never signed.
+        // Rich-list index is display-only and NOT snapshot-verified: clear any promoted/inherited rows
+        // + the build marker so the joiner never serves a peer-supplied (possibly forged) rich list.
+        // The boot rebuild then re-derives it locally from the verified accounts.
+        let _ = self.richlist_clear();
+        // Wallet→token reverse index (NON-consensus): rebuild from the freshly promoted accounts so a
+        // cold-joined node serves per-wallet token lists in O(held). Best-effort — a failure must never
+        // wedge the consensus-critical promote. Mark dirty FIRST (drops OWNS_INDEX_READY + clears the
+        // build marker) so that if the rebuild Errs — or we crash mid-rebuild — the emptied CF is NEVER
+        // left authoritative: the reader falls back to the O(N) scan and the NEXT boot re-runs the
+        // backfill. backfill_owns_indices re-asserts READY on success; the marker is set ONLY then.
+        self.mark_owns_index_dirty();
+        let _ = self.clear_cf("wallet_token");
+        if self.backfill_owns_indices().is_ok() { let _ = self.set_owns_index_built(height); }
+        // Wholesale regress: the STATE was the fault, the tail bodies were not. Every body a certificate
+        // on disk vouches for is kept (the certificates are read here, before the retraction below
+        // removes the objects) and replayed by the caller under verification; only the bodies a
+        // certificate contradicts go, from the first contradiction up. Deleting them all is what let
+        // six simultaneous regresses erase 937473..937530 from the whole fleet on 14.09.
+        if regress {
+            // Saves above `height` are barred by the slot, so this read is the final tip.
+            let cur = self.get_chain_height().unwrap_or(live_h);
+            // Rows above the applied tip are a designed state (a replay that stopped short keeps them),
+            // so the tail classified runs to the highest stored body, not to the tip.
+            let top = self.highest_stored_microblock().ok().flatten().unwrap_or(cur).max(cur);
+            if top > height {
+                let anchor_mb = height / 90;
+                // Reward side-indices are add-only / first-write-wins: the canonical re-apply of
+                // the tail can never remove an orphan row, so clear them like every other prune.
+                match self.reconcile_reward_indices_above_epoch(height) {
+                    Ok(c) if c > 0 => println!("[INFO][SYNC] regress_reward_indices_cleared n={} to={}", c, height),
+                    Err(e) => println!("[WARN][SYNC] regress_reward_indices_fail to={} err={}", height, e),
+                    _ => {}
+                }
+                let dropped_from = self.first_certified_mismatch_above(height, top);
+                if let Some(d) = dropped_from {
+                    let _ = self.delete_microblocks_range_pub(d, top);
+                }
+                // Certified chain content stays: every macroblock here carries an n-f QC and the
+                // network kept that chain, so the kept tail's claims resolve against its epoch roots
+                // with no peer (six regressing nodes each deleting them would leave none to ask). What
+                // goes is what this node's state produced above the restored height.
+                self.retract_state_position_above(height);
+                // The mandatory post-destruction cleanup every other prune path runs: drop the
+                // read-through body cache (it would keep answering presence checks for deleted
+                // heights) and lower the stored-height marker (monotone-up otherwise).
+                self.invalidate_recent_microblocks_above(height);
+                crate::node::complete_rollback_cleanup(height);
+                // Plain store: the serve horizon is max(this, stored-height) and this half is
+                // raise-only everywhere else — left high, the node advertises the range it just
+                // deleted and answers empty batches for it.
+                crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(height, std::sync::atomic::Ordering::SeqCst);
+                // Finality above the restored tip would make the apply dedup skip the tail it
+                // must re-apply.
+                crate::node::retract_finality_to(height);
+                println!("[WARN][SYNC] regress_tail_kept from={} top={} to={} anchor_mb={} dropped_from={}",
+                         cur, top, height, anchor_mb, dropped_from.map(|d| d.to_string()).unwrap_or_else(|| "none".to_string()));
+            }
+        }
+        // Commit height + finality/WS floors + durable anchor (adopt_snapshot_finality persists it).
+        self.set_chain_height(height)?;
+        crate::node::adopt_snapshot_finality(height, anchor_hash);
+        // Advertise the verified blob so this node can serve the snapshot it joined from.
+        if let Some(snaps) = self.persistent.db.cf_handle("snapshots") {
+            let _fence = self.snapshot_fence();
+            let _ = self.persistent.db.put_cf(&snaps, b"latest_full_snap", &height.to_le_bytes());
+        }
+        // The accounts CF was replaced wholesale by the verified snapshot — any staged
+        // phantom candidates died with it, so the journal must not outlive them.
+        self.clear_trueup_candidates();
+        self.persistent.db.delete_cf(&meta, b"promote_pending")?;
+        // Clear staging CFs ONLY (keep the blob for serving).
+        for cf in &["accounts_stage", "node_registry_stage", "pending_rewards_stage", "contract_storage_stage"] {
+            let _ = self.clear_cf(cf);
+        }
+        println!("[INFO][SYNC] snapshot_promoted h={} anchor_mb={}", height, height / 90);
+        Ok(())
+    }
+
+    /// Boot recovery: if a promote was interrupted, the marker is still present and staging is intact —
+    /// re-run the promote idempotently. On failure clear staging + marker and fall to block replay.
+    /// `state`: when present (main boot path) the in-mem StateManager is rehydrated from the promoted
+    /// CFs after a successful promote — same fail-closed semantics as the live cold-join. The boot
+    /// TIER-1 restore runs BEFORE this recovery (no promoted state yet), so it would NOT rehydrate the
+    /// recovered snapshot; doing it here closes that gap.
+    pub async fn recover_pending_snapshot_promote(
+        &self,
+        state: Option<&std::sync::Arc<tokio::sync::RwLock<crate::StateManager>>>,
+    ) {
+        let meta = match self.persistent.db.cf_handle("metadata") { Some(c) => c, None => return };
+        let bytes = match self.persistent.db.get_cf(&meta, b"promote_pending") {
+            Ok(Some(b)) if b.len() == 40 || b.len() == 41 => b,
+            _ => return,
+        };
+        let height = u64::from_le_bytes(bytes[..8].try_into().unwrap_or([0u8; 8]));
+        let mut anchor = [0u8; 32];
+        anchor.copy_from_slice(&bytes[8..40]);
+        // Re-arm a crash-interrupted regress promote: the marker byte is the durable
+        // authorization the volatile flag cannot carry across a restart.
+        let regress_authorized = bytes.len() == 41 && bytes[40] == 1;
+        let regress_window = if regress_authorized {
+            ALLOW_SNAPSHOT_REGRESS.store(true, std::sync::atomic::Ordering::SeqCst);
+            Some(RegressWindow)
+        } else { None };
+        println!("[WARN][SYNC] promote_recovery h={} replay=staged regress={}", height, regress_authorized);
+        let promote_res = self.promote_snapshot_staging(height, anchor).await;
+        drop(regress_window);
+        if let Err(e) = promote_res {
+            // Keep the marker AND staging: this failure may have landed after live accounts were
+            // already replaced, and they are the only state that can finish the job. A
+            // pre-destructive failure has already cleared both inside promote, so nothing latches
+            // that should not.
+            println!("[ERR][SYNC] promote_recovery_failed h={} err={} action=retry_next_boot", height, e);
+            if SNAPSHOT_REHYDRATE_IN_PROGRESS.load(Ordering::SeqCst) {
+                crate::block_pipeline::mark_state_suspect();
+            }
+            return;
+        }
+        // Rehydrate the in-mem state from the recovered CFs (fail-closed). On failure the helper wipes the
+        // in-mem state; the latch makes the sync coordinator restore wholesale.
+        if let Some(state) = state {
+            if let Err(e) = self.rehydrate_inmem_state_from_promoted_cf(state, height).await {
+                crate::block_pipeline::mark_state_suspect();
+                println!("[WARN][SYNC] promote_recovery_rehydrate_failed h={} err={} action=suspect_resync", height, e);
+            }
+        }
+    }
+
+    /// Query peer for available snapshots
+    pub(super) async fn query_peer_snapshot(&self, peer_addr: &str, max_height: u64) -> IntegrationResult<Option<(u64, String)>> {
+        // Ask for the highest snapshot ≤ our exogenously-verifiable ceiling (not just the peer's latest,
+        // which may be above our pin and therefore unverifiable cold).
+        let url = format!("http://{}/api/v1/snapshot/latest?max_height={}", peer_addr, max_height);
+        
+        match reqwest::get(&url).await {
+            Ok(response) => {
+                if response.status().is_success() {
+                    let data: serde_json::Value = response.json().await
+                        .map_err(|e| IntegrationError::Other(format!("JSON error: {}", e)))?;
+                    
+                    if let (Some(height), Some(cid)) = (
+                        data["height"].as_u64(),
+                        data["ipfs_cid"].as_str()
+                    ) {
+                        // A peer with no snapshot answers height=0/available:false — it is NOT a target.
+                        // Treating it as Some((0,…)) let the quorum picker resolve target=0 → a phantom
+                        // h=0 download. Exclude it from negotiation entirely.
+                        if height == 0 { return Ok(None); }
+                        return Ok(Some((height, cid.to_string())));
+                    }
+                }
+            },
+            Err(e) => println!("[WARN][STORAGE] snapshot_peer_query_failed peer={} err={}", peer_addr, e),
+        }
+        
+        Ok(None)
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // v5.0: CHUNKED SNAP SYNC — parallel download from multiple peers
+    // Snapshot is split into 4MB chunks, each verified independently.
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    pub(super) const SNAPSHOT_CHUNK_SIZE: usize = 4 * 1024 * 1024; // 4MB per chunk
+
+    // v32.10: hard bounds on untrusted manifest fields. Prevents OOM DoS via
+    // forged total_size / chunk_count from byzantine peer.
+    pub(super) const MAX_SNAPSHOT_SIZE: u64 = 100 * 1024 * 1024 * 1024; // 100 GB
+    pub(super) const MAX_CHUNK_COUNT: u64 = 100_000; // 100k × 4MB = 400GB max
+
+    /// v32.10: deterministic SHA3-256 over canonical manifest bytes.
+    /// Used by producer to commit into MacroBlock.snapshot_manifest_hash, and
+    /// by joiner to verify fetched manifest matches the 2f+1-bound value.
+    pub fn compute_manifest_hash(manifest: &SnapshotManifest) -> [u8; 32] {
+        use sha3::{Sha3_256, Digest};
+        let mut hasher = Sha3_256::new();
+        hasher.update(b"QNET_SNAPSHOT_MANIFEST_V1:");
+        hasher.update(&manifest.height.to_le_bytes());
+        hasher.update(&manifest.total_size.to_le_bytes());
+        hasher.update(&manifest.chunk_size.to_le_bytes());
+        hasher.update(&manifest.chunk_count.to_le_bytes());
+        hasher.update(&(manifest.chunk_hashes.len() as u64).to_le_bytes());
+        for h in &manifest.chunk_hashes {
+            hasher.update(&(h.len() as u32).to_le_bytes());
+            hasher.update(h.as_bytes());
+        }
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&hasher.finalize());
+        out
+    }
+
+    /// Fetch the frame at `height` by the chunked parallel protocol from several peers, under the caller's claim.
+    async fn fetch_frame_chunked(
+        &self,
+        claim: &super::snapshot_index::HeightClaim<'_>,
+        peer_addrs: &[String],
+        height: u64,
+    ) -> IntegrationResult<()> {
+        let start_time = std::time::Instant::now();
+
+        // The manifest is NOT consensus-bound and cannot be: whether a node holds a snapshot at a
+        // boundary is node-local, so committing its digest would split the macroblock body. The binder
+        // is Pattern C — the staged accounts merkle recomputed against the QC-certified mb.state_root,
+        // plus the registry-CF check — which runs after assembly. Everything read from the manifest
+        // before that point is therefore treated as hostile and bounds-checked below.
+
+        // Step 1: Fetch manifest from first responsive peer
+        let mut manifest: Option<SnapshotManifest> = None;
+        for addr in peer_addrs {
+            let url = format!("http://{}/api/v1/snapshot/{}/manifest", addr, height);
+            match reqwest::Client::new().get(&url).timeout(std::time::Duration::from_secs(10)).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    if let Ok(m) = resp.json::<SnapshotManifest>().await {
+                        manifest = Some(m);
+                        break;
+                    }
+                }
+                _ => continue,
+            }
+        }
+
+        let manifest = match manifest {
+            Some(m) => m,
+            None => return Err(IntegrationError::Other(format!("chunked_manifest_unavailable h={}", height))),
+        };
+
+        // v32.10: untrusted-input bounds. Reject before allocation.
+        if manifest.total_size > Self::MAX_SNAPSHOT_SIZE {
+            if crate::node::is_warn() {
+                println!("[WARN][SYNC] manifest_rejected reason=total_size_overflow h={} got={} max={}",
+                         height, manifest.total_size, Self::MAX_SNAPSHOT_SIZE);
+            }
+            return Err(IntegrationError::Other(format!(
+                "manifest_total_size_exceeds_max h={} got={} max={}",
+                height, manifest.total_size, Self::MAX_SNAPSHOT_SIZE
+            )));
+        }
+        if manifest.chunk_count == 0 || manifest.chunk_count > Self::MAX_CHUNK_COUNT {
+            if crate::node::is_warn() {
+                println!("[WARN][SYNC] manifest_rejected reason=chunk_count_invalid h={} got={} max={}",
+                         height, manifest.chunk_count, Self::MAX_CHUNK_COUNT);
+            }
+            return Err(IntegrationError::Other(format!(
+                "manifest_chunk_count_invalid h={} got={}", height, manifest.chunk_count
+            )));
+        }
+        if manifest.chunk_size != Self::SNAPSHOT_CHUNK_SIZE as u64 {
+            if crate::node::is_warn() {
+                println!("[WARN][SYNC] manifest_rejected reason=chunk_size_mismatch h={} got={} expected={}",
+                         height, manifest.chunk_size, Self::SNAPSHOT_CHUNK_SIZE);
+            }
+            return Err(IntegrationError::Other(format!(
+                "manifest_chunk_size_mismatch h={} got={} expected={}",
+                height, manifest.chunk_size, Self::SNAPSHOT_CHUNK_SIZE
+            )));
+        }
+        // Shape, not just count: these strings are peer-supplied and are byte-sliced when a chunk
+        // mismatches, so a short one would panic the process (`panic = "abort"`).
+        if let Some(bad) = manifest.chunk_hashes.iter()
+            .position(|h| h.len() != 64 || !h.bytes().all(|b| b.is_ascii_hexdigit())) {
+            if crate::node::is_warn() {
+                println!("[WARN][SYNC] manifest_rejected reason=chunk_hash_malformed h={} idx={}", height, bad);
+            }
+            return Err(IntegrationError::Other(format!(
+                "manifest_chunk_hash_malformed h={} idx={}", height, bad
+            )));
+        }
+        if manifest.chunk_hashes.len() as u64 != manifest.chunk_count {
+            if crate::node::is_warn() {
+                println!("[WARN][SYNC] manifest_rejected reason=hashes_len_mismatch h={} hashes={} count={}",
+                         height, manifest.chunk_hashes.len(), manifest.chunk_count);
+            }
+            return Err(IntegrationError::Other(format!(
+                "manifest_hashes_count_mismatch h={} hashes={} count={}",
+                height, manifest.chunk_hashes.len(), manifest.chunk_count
+            )));
+        }
+        // Consistency: total_size must fit exactly in chunk_count × chunk_size.
+        let expected_chunks = (manifest.total_size + manifest.chunk_size - 1) / manifest.chunk_size;
+        if expected_chunks != manifest.chunk_count {
+            if crate::node::is_warn() {
+                println!("[WARN][SYNC] manifest_rejected reason=size_count_inconsistent h={} expected_chunks={} got={}",
+                         height, expected_chunks, manifest.chunk_count);
+            }
+            return Err(IntegrationError::Other(format!(
+                "manifest_size_count_inconsistent h={} expected_chunks={} got={}",
+                height, expected_chunks, manifest.chunk_count
+            )));
+        }
+
+        if manifest.height != height {
+            return Err(IntegrationError::Other(format!(
+                "manifest_height_mismatch h={} got={}", height, manifest.height)));
+        }
+
+        println!("[INFO][SYNC] chunked_download_start h={} chunks={} total={}MB",
+                 height, manifest.chunk_count, manifest.total_size / (1024 * 1024));
+
+        // Step 2: chunks in parallel (round-robin across peers, 4 at a time). Each is checked against the
+        // manifest and written as its own row, so memory holds four chunks, never the frame.
+        let chunk_count = manifest.chunk_count as usize;
+        let chunk_size = manifest.chunk_size as usize;
+        let total_size = manifest.total_size as usize;
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| IntegrationError::Other(format!("HTTP client error: {}", e)))?;
+        self.abort_frame(claim, height);
+        self.mark_frame_in_progress(height)?;
+        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(4));
+        // A cancelled download stops its writers with it.
+        let mut handles = AbortOnDrop(Vec::with_capacity(chunk_count));
+        for i in 0..chunk_count {
+            let peer = peer_addrs[i % peer_addrs.len()].clone();
+            let client = client.clone();
+            let expected_hash = manifest.chunk_hashes[i].clone();
+            // The manifest fixes every chunk's length; a blob of any other size is refused as data.
+            let expected_len = total_size.saturating_sub(i * chunk_size).min(chunk_size);
+            let sem = semaphore.clone();
+            let db = self.persistent.db.clone();
+            handles.0.push(tokio::spawn(async move {
+                let _permit = sem.acquire().await
+                    .map_err(|_| IntegrationError::Other("Snapshot semaphore closed".into()))?;
+                let url = format!("http://{}/api/v1/snapshot/{}/chunk/{}", peer, height, i);
+                let resp = client.get(&url).send().await
+                    .map_err(|e| IntegrationError::Other(format!("Chunk {} download: {}", i, e)))?;
+                if !resp.status().is_success() {
+                    return Err(IntegrationError::Other(format!("Chunk {} HTTP {}", i, resp.status())));
+                }
+                let bytes = resp.bytes().await
+                    .map_err(|e| IntegrationError::Other(format!("Chunk {} read: {}", i, e)))?;
+                if bytes.len() != expected_len {
+                    return Err(IntegrationError::Other(format!(
+                        "snapshot_chunk_bad_len h={} idx={} got={} want={}", height, i, bytes.len(), expected_len)));
+                }
+                let actual_hash = hex::encode(sha3::Sha3_256::digest(&bytes));
+                if actual_hash != expected_hash {
+                    return Err(IntegrationError::Other(
+                        format!("Chunk {} hash mismatch expected={} got={}", i, &expected_hash[..16], &actual_hash[..16])
+                    ));
+                }
+                Storage::put_frame_chunk(&db, height, i as u64, &bytes)
+            }));
+        }
+        let mut failed: Option<IntegrationError> = None;
+        for (i, h) in handles.0.iter_mut().enumerate() {
+            let r = h.await.map_err(|e| IntegrationError::Other(format!("Chunk {} join: {}", i, e))).and_then(|r| r);
+            if let Err(e) = r {
+                if failed.is_none() { failed = Some(e); }
+            }
+        }
+        if let Some(e) = failed {
+            self.abort_frame(claim, height);
+            return Err(e);
+        }
+
+        // Step 3: the frame exists once its manifest and index row land; the caller stages it.
+        self.seal_downloaded_frame(&manifest)?;
+
+        let elapsed = start_time.elapsed();
+        println!("[INFO][SYNC] chunked_download_done h={} chunks={} total={}MB elapsed={:.1}s",
+                 height, chunk_count, manifest.total_size / (1024 * 1024), elapsed.as_secs_f64());
+        Ok(())
+    }
+
+    /// Fetch the frame at `height` as one body from one peer, under the caller's claim.
+    async fn fetch_frame_legacy(
+        &self,
+        claim: &super::snapshot_index::HeightClaim<'_>,
+        peer_addr: &str,
+        height: u64,
+    ) -> IntegrationResult<()> {
+        // The frame arrives as one body and streams into chunk rows, capped at MAX_SNAPSHOT_SIZE; its header
+        // must match the stream it came with. Pattern C at the caller still decides whether it is canonical.
+        let url = format!("http://{}/api/v1/snapshot/{}", peer_addr, height);
+        let mut response = reqwest::get(&url).await
+            .map_err(|e| IntegrationError::Other(format!("Download error: {}", e)))?;
+        if !response.status().is_success() {
+            return Err(IntegrationError::Other("Snapshot download failed".to_string()));
+        }
+        self.abort_frame(claim, height);
+        let mut rows = self.begin_frame(height, false)?;
+        Self::stream_body_into(&mut response, &mut rows).await?;
+        // A peer with no snapshot may answer 200 with a JSON error body: that is no frame.
+        if !rows.body_matches_header() {
+            return Err(IntegrationError::Other(format!(
+                "legacy_snapshot_not_a_frame h={} len={}", height, rows.len())));
+        }
+        {
+            let _fence = self.snapshot_fence();
+            let mut batch = WriteBatch::default();
+            rows.seal(0, &mut batch)?;
+            self.persistent.db.write(batch)?;
+        }
+        if crate::node::is_info() {
+            println!("[INFO][SYNC] legacy_snapshot_stored h={}", height);
+        }
+        Ok(())
+    }
+
+    /// Copy an HTTP body into frame rows as it arrives, within MAX_SNAPSHOT_SIZE.
+    async fn stream_body_into(response: &mut reqwest::Response, rows: &mut super::snapshot_index::FrameRows)
+        -> IntegrationResult<()> {
+        use std::io::Write;
+        while let Some(bytes) = response.chunk().await
+            .map_err(|e| IntegrationError::Other(format!("snapshot body read: {}", e)))? {
+            rows.write_all(&bytes)?;
+            if rows.len() > Self::MAX_SNAPSHOT_SIZE {
+                return Err(IntegrationError::Other(format!("snapshot body over {} bytes", Self::MAX_SNAPSHOT_SIZE)));
+            }
+        }
+        Ok(())
+    }
+
+    /// Fast sync with snapshot for new nodes. `allow_regress` (wholesale escalation from a
+    /// wedged-at-tip state) lifts the two forward-only guards for THIS call — the promote /
+    /// rehydrate verification still gates safety; the sync coordinator serializes calls.
+    pub async fn fast_sync_with_snapshot(
+        &self,
+        p2p: &crate::unified_p2p::SimplifiedP2P,
+        target_height: u64,
+        state: &std::sync::Arc<tokio::sync::RwLock<crate::StateManager>>,
+        allow_regress: bool,
+    ) -> IntegrationResult<()> {
+        println!("[INFO][STORAGE] fast_sync_start target_height={} allow_regress={}", target_height, allow_regress);
+
+        // Light nodes do not perform fast-sync at all — they are pure
+        // mobile API clients with zero on-device chain storage. All
+        // chain reads happen via the Super-node REST API at request
+        // time, so there is nothing to download here.
+        if self.storage_mode == StorageMode::Light {
+            println!("[INFO][STORAGE] fast_sync_skipped role=light_api_client");
+            return Ok(());
+        }
+
+        let regress_window = if allow_regress {
+            ALLOW_SNAPSHOT_REGRESS.store(true, std::sync::atomic::Ordering::SeqCst);
+            Some(RegressWindow)
+        } else { None };
+        let res = self.download_and_load_snapshot(p2p).await;
+        drop(regress_window);
+
+        // Try to find and load a snapshot
+        match res {
+            Ok(snapshot_height) => {
+                println!("[INFO][STORAGE] snapshot_loaded height={}", snapshot_height);
+
+                // Derived consensus/reward indices (registry_root LtHash, cbw, roster) and the vrf_pk
+                // completeness contract were materialized + checked inside verify_snapshot_consensus_binding
+                // BEFORE the WS floor was adopted (fail-closed there, atomic with floor adoption), so by
+                // here the snapshot is fully consistent and forward-ready.
+                println!("[INFO][STORAGE] snapshot_indices_rebuilt h={}", snapshot_height);
+
+                // CRITICAL: promote only swapped the on-disk CFs. The in-mem StateManager (merkle +
+                // accounts DashMap) the apply pipeline reads is still empty — without rehydrating it the
+                // first tail block (anchor+1) computes a near-empty state_root → state_root_mismatch →
+                // rollback → apply circuit-breaker wedge. Fail-closed: on any rehydrate failure return
+                // Err so the caller falls back to block-sync from a clean base.
+                if let Err(e) = self.rehydrate_inmem_state_from_promoted_cf(state, snapshot_height).await {
+                    // The promoted CFs stand verified at the anchor; the in-mem view is wiped. The latch stops
+                    // production and voting and makes the retry a wholesale restore at the same height.
+                    crate::block_pipeline::mark_state_suspect();
+                    return Err(e);
+                }
+
+                if target_height > snapshot_height {
+                    println!("[INFO][STORAGE] sync_remaining_start count={}",
+                            target_height - snapshot_height);
+                }
+                Ok(())
+            },
+            Err(e) => {
+                // AnchorPending is retryable (caller bails to the desync tick until the GALC pin arrives) —
+                // not a failure, so don't emit the fallback warning for it.
+                if !matches!(e, IntegrationError::AnchorPending) && crate::node::is_warn() {
+                    println!("[WARN][STORAGE] snapshot_sync_failed err={:?} fallback=full_sync", e);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Cold-join: rehydrate the IN-MEM StateManager (merkle + accounts DashMap) from the just-promoted
+    /// `accounts` CF, mirroring the boot TIER-1 restore (node.rs). promote_snapshot_staging only swaps
+    /// the on-disk CFs; the apply pipeline reads this in-mem state, so without this the first tail block
+    /// computes a near-empty state_root → mismatch → wedge. FAIL-CLOSED: if the rehydrated merkle does
+    /// not match the anchor's 2f+1-bound state_root we clear the in-mem state and return Err so the
+    /// caller falls back to block-replay from a clean base — never proceed with a mismatched state.
+    pub async fn rehydrate_inmem_state_from_promoted_cf(
+        &self,
+        state: &std::sync::Arc<tokio::sync::RwLock<crate::StateManager>>,
+        anchor_height: u64,
+    ) -> IntegrationResult<()> {
+        let res = self.rehydrate_inner(state, anchor_height).await;
+        if res.is_err() {
+            // RAM must not keep the state the promote replaced: a later write of it would land on the promoted CF.
+            state.write().await.reset_to_empty();
+            self.end_state_replacement();
+        }
+        res
+    }
+
+    async fn rehydrate_inner(
+        &self,
+        state: &std::sync::Arc<tokio::sync::RwLock<crate::StateManager>>,
+        anchor_height: u64,
+    ) -> IntegrationResult<()> {
+        // OB1: block the apply pipeline from writing a tail block over the un-rehydrated (empty) in-mem
+        // state for the whole rehydrate — including the synchronous macroblock read below, which can
+        // stall under a compaction/flush storm and widen the adopt→rehydrate race. end_state_replacement clears
+        // it once RAM holds the promoted accounts, or on any failure.
+        SNAPSHOT_REHYDRATE_IN_PROGRESS.store(true, Ordering::SeqCst);
+        // Accounts are streamed row-by-row from the promoted CF into the merkle+DashMap below (no full
+        // Vec materialization) — see the streaming restore after the anchor root/total_supply are read.
+        // Emission watermark: highest emission macroblock already minted at/below the anchor. Derived
+        // with the SAME formula the apply path uses (node.rs apply_block_to_state) so the rehydrated
+        // node never re-mints an epoch the bound state already includes (>=2 epochs ⇒ double-mint).
+        const EMISSION_BLOCK_INTERVAL: u64 = 14400;
+        const MICROBLOCKS_PER_MB: u64 = 90;
+        let current_epoch = anchor_height / EMISSION_BLOCK_INTERVAL;
+        let last_minted_emission_mb = if current_epoch >= 2 {
+            let rewarding_epoch = current_epoch.saturating_sub(2);
+            rewarding_epoch.saturating_add(1).saturating_mul(EMISSION_BLOCK_INTERVAL) / MICROBLOCKS_PER_MB
+        } else {
+            0
+        };
+
+        // Anchor's committed state_root + QC-bound total_supply: the macroblock at anchor_height/90
+        // carries BOTH — state_root directly (the SAME value verify_snapshot_consensus_binding checked
+        // the staged accounts against) and total_supply via the embedded (Checkpoint, QC) in
+        // consensus_data.checkpoint_qc. total_supply is in Checkpoint::hash() ⇒ qc.checkpoint_hash binds
+        // it ⇒ 2f+1 certify it. We read this QC-bound value instead of summing balances: a balance sum
+        // is correct ONLY pre-emission (epoch<2); at epoch>=2 emission mints supply credited later via
+        // claim TXs, so minted>sum. total_supply is consensus-critical (emission cap) but NOT in
+        // state_root (account-only), so it is bound separately here through the checkpoint.
+        let mb_idx = anchor_height / MICROBLOCKS_PER_MB;
+        let (anchor_state_root, total_supply): ([u8; 32], u64) = match self.get_macroblock_by_height(mb_idx)? {
+            Some(bytes) => {
+                let mb: qnet_state::MacroBlock = bincode::deserialize(&bytes)
+                    .map_err(|e| IntegrationError::StorageError(format!("rehydrate_anchor_decode_fail {}", e)))?;
+                // Extract the QC-bound total_supply from the embedded checkpoint. Pre-emission anchors
+                // (epoch<2) MAY lack a checkpoint_qc (legacy/genesis) — fall back to the balance sum,
+                // which is exact while minted==sum-of-balances.
+                let ts = match &mb.consensus_data.checkpoint_qc {
+                    // A PRESENT checkpoint_qc MUST decode — a corrupt QC is fail-closed (Err →
+                    // block-replay), never a silent fall-back to a balance sum that is wrong post-emission.
+                    Some(b) => {
+                        let (cp, _) = bincode::deserialize::<(qnet_consensus::checkpoint_bft::Checkpoint, qnet_consensus::checkpoint_bft::QuorumCertificate)>(b)
+                            .map_err(|e| IntegrationError::StorageError(format!("rehydrate_checkpoint_decode_fail mb={} {}", mb_idx, e)))?;
+                        cp.total_supply
+                    }
+                    // No checkpoint_qc ⇒ only legacy/genesis pre-emission anchors (epoch<2), where the
+                    // balance sum is exact (minted==sum-of-balances). Streamed (O(1) RAM), not a Vec fold.
+                    None => self.sum_all_account_balances()?,
+                };
+                (mb.state_root, ts)
+            }
+            None => {
+                return Err(IntegrationError::StorageError(format!(
+                    "rehydrate_anchor_missing mb={} h={}", mb_idx, anchor_height
+                )));
+            }
+        };
+
+        let sg = state.write().await;
+        // STREAMING restore: feed the accounts CF row-by-row into the merkle + DashMap (no full Vec,
+        // no double-hold — peak RAM drops from ~2x accounts to ~1x). A row that fails to decode is
+        // skipped+logged; the resulting incompleteness trips the fail-closed merkle assert below
+        // (clear + block-replay), so a corrupt row can never admit partial state.
+        let cf = self.persistent.db.cf_handle("accounts")
+            .ok_or_else(|| IntegrationError::StorageError("accounts column family not found".to_string()))?;
+        let acct_iter = self.persistent.db.iterator_cf(&cf, rocksdb::IteratorMode::Start).filter_map(|item| {
+            let (k, v) = item.ok()?;
+            let addr = String::from_utf8(k.to_vec()).ok()?;
+            match bincode::deserialize::<qnet_state::Account>(&v) {
+                Ok(a) => Some((addr, a)),
+                Err(e) => { println!("[WARN][STATE] rehydrate_skip_corrupt_account err={}", e); None }
+            }
+        });
+        // FAIL-CLOSED merkle assert BEFORE seeding chain_state — a mismatch then leaves no partial
+        // chain_state to roll back (clear() resets accounts+merkle; chain_state was never mutated).
+        // A mid-iteration failure leaves an arbitrary PREFIX of the snapshot in the accounts map, so
+        // the Err path must wipe before returning — exactly as the mismatch branch below does.
+        // Without it the caller falls back to a block replay on top of that prefix and applies every
+        // credit in it a second time.
+        let computed = match sg.restore_accounts_streamed(acct_iter) {
+            // RAM holds the promoted accounts: rows are taken again (the root check, purge and true-up follow).
+            Ok(root) => { self.end_state_replacement(); root }
+            Err(e) => {
+                sg.reset_to_empty();
+                return Err(IntegrationError::StorageError(format!("rehydrate_restore_fail {}", e)));
+            }
+        };
+        if computed != anchor_state_root {
+            // A peer snapshot carrying one phantom row (rollback write-through never reversed)
+            // is repaired against the QC-bound root rather than rejected — same verified-not-
+            // guessed rule as the boot and reconcile sites; the promoted CF row goes too.
+            match sg.repair_single_phantom(&anchor_state_root) {
+                Some(addr) => {
+                    self.purge_phantom_account(&addr);
+                    println!("[WARN][STATE] rehydrate_repaired_phantom h={} addr={}", anchor_height, addr);
+                }
+                None => {
+                    println!("[ERR][STATE] rehydrate_merkle_mismatch expected={} computed={} action=clear_block_replay",
+                             hex::encode(&anchor_state_root[..8]), hex::encode(&computed[..8]));
+                    sg.reset_to_empty();
+                    return Err(IntegrationError::StorageError(format!(
+                        "rehydrate_merkle_mismatch h={} expected={} computed={}",
+                        anchor_height, hex::encode(&anchor_state_root[..8]), hex::encode(&computed[..8])
+                    )));
+                }
+            }
+        }
+        // Verified — seed chain_state now that the bound merkle is confirmed.
+        {
+            let mut cs = sg.chain_state.write();
+            cs.height = anchor_height;
+            cs.total_supply = total_supply;
+            cs.last_minted_emission_mb = last_minted_emission_mb;
+        }
+        // Seal the anchor's total_supply so a cold-joiner can serve/verify the checkpoint at its anchor
+        // head via get_total_supply_at (mirror of the registry_root seal carried through the binding).
+        let _ = self.seal_total_supply(anchor_height, total_supply);
+        // Rebuild the in-mem NodeRegistration-dedup map from the snapshot-bound node_registry CF (the CF
+        // is bound by registry_root in the QC Checkpoint). restore_accounts seeds account leaves but NOT
+        // this off-merkle map; without it a cold-joiner has an EMPTY registered_nodes for all reg_height<=
+        // anchor entries, so a tail block with a duplicate NodeRegistration is admitted here (empty map ⇒
+        // not "already registered") while from-genesis nodes reject it → registry_root divergence. Done
+        // AFTER the fail-closed merkle assert so a rejected snapshot never seeds the map. Byte-identical
+        // to a from-genesis node for all reg_height<=anchor bindings.
+        self.reseed_commitment_dedup(&*sg)?;
+        // The mempool's marks follow the restored state.
+        crate::node::sync_restored_marks(&*sg);
+        // Same reason as the reconcile path: the tail that follows must not read post-anchor rows.
+        let _ = crate::node::BlockchainNode::trueup_accounts_cf_against(&*sg, self);
+        println!("[INFO][STATE] rehydrate_ok h={} root={} total_supply={} watermark_mb={}",
+                 anchor_height, hex::encode(&anchor_state_root[..8]), total_supply, last_minted_emission_mb);
+        Ok(())
+    }
+
+    // =========================================================================
+    // SMART CONTRACT STORAGE METHODS
+    // =========================================================================
+    
+}
+
+#[cfg(test)]
+mod tests_rollback_retraction {
+    use super::*;
+
+    /// The stall report reads RocksDB properties only; on a fresh store every figure is zero and
+    /// every key is present, so a report with a missing key or a non-numeric value is a broken reader.
+    #[test]
+    fn stall_facts_name_every_engine_figure() {
+        let (st, _dir) = temp_storage();
+        let facts = st.rocksdb_stall_facts();
+        for key in ["write_stopped=", "delayed_rate=", "running_compactions=", "running_flushes=",
+                    "compaction_pending=", "flush_pending=", "imm_memtables=", "memtables_mb=",
+                    "l0_max=", "bg_errors="] {
+            assert!(facts.contains(key), "missing {} in {}", key, facts);
+        }
+        assert!(facts.contains("write_stopped=0") && facts.contains("bg_errors=0"), "{}", facts);
+    }
+
+    /// Two holders of one height write the same frame bytes: node-local registry and reward rows, a row's write
+    /// time and its reputation do not reach the frame.
+    #[test]
+    fn frames_of_one_height_are_byte_identical_across_holders() {
+        let frame_with = |local: bool| {
+            let (st, _dir) = temp_storage();
+            let cf = st.registry_cf_for_test();
+            st.put_registry_row_for_test(&cf, b"srtr_super_a", b"x");
+            let (ts, rep) = if local { (111, 0.5) } else { (999, 1.0) };
+            st.put_registry_row_for_test(&cf, b"node_super_a", format!(
+                r#"{{"node_type":"super","wallet":"w","reg_height":5,"reputation":{},"timestamp":{}}}"#, rep, ts).as_bytes());
+            if local {
+                st.put_registry_row_for_test(&cf, b"nep_super_a", b"1.2.3.4:8001");
+                st.put_registry_row_for_test(&cf, b"node_cache_only", br#"{"node_type":"light","wallet":"x"}"#);
+                let rewards = st.persistent.db.cf_handle("pending_rewards").expect("rewards cf");
+                st.persistent.db.put_cf(rewards, b"light_bm_1", b"x").expect("reward row");
+            }
+            st.write_boundary_frame(90, st.frame_views().expect("views"), None, None).expect("frame");
+            st.get_snapshot_data(90).expect("read").expect("frame")
+        };
+        assert_eq!(frame_with(true), frame_with(false));
+    }
+
+    /// A held frame that does not load is dropped, so the next attempt fetches afresh instead of loading it again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_frame_that_does_not_load_is_dropped() {
+        let (st, _dir) = temp_storage();
+        st.store_frame_bytes(90, &[7u8; 64]).expect("store");
+        assert!(st.snapshot_exists(90).expect("exists"));
+        assert!(st.stage_frame(&[], 90, None).await.is_err(), "no peers to fetch from");
+        assert!(!st.snapshot_exists(90).expect("exists"), "the unloadable frame is gone");
+    }
+
+    fn temp_storage() -> (Storage, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let st = Storage::new(dir.path().to_str().unwrap()).expect("storage");
+        (st, dir)
+    }
+
+    fn seed(st: &Storage, h: u64) {
+        st.store_frame_bytes(h, &[1u8, 2, 3]).expect("seed");
+    }
+
+    /// A rollback must take the snapshots with it. One above the target is a complete, self-consistent
+    /// picture of the chain the operator has just abandoned, and the runtime adopt path takes it: it
+    /// raises chain_height to the snapshot height AND re-persists the snapshot anchor the rollback
+    /// dropped a moment earlier. That is why dropping the anchor alone did not hold - six nodes booted
+    /// correctly at 863550, replayed and verified, and then climbed back to 867600 with block 863551
+    /// present nowhere.
+    #[test]
+    fn a_rollback_prunes_snapshots_describing_the_chain_it_abandoned() {
+        let (st, _d) = temp_storage();
+        let target = 863_550u64;
+        for h in [860_400u64, 864_000, 867_600] { seed(&st, h); }
+
+        let dropped = st.prune_snapshots_above(target).expect("prune");
+        assert_eq!(dropped, 2, "both snapshots above the target go");
+        assert!(st.get_snapshot_data(867_600).expect("get").is_none(), "above the target: gone");
+        assert!(st.get_snapshot_data(864_000).expect("get").is_none(), "above the target: gone");
+        assert!(st.get_snapshot_data(860_400).expect("get").is_some(), "below the target: kept");
+        assert_eq!(st.get_latest_snapshot_height().expect("latest"), Some(860_400),
+                   "the pointer must never outlive what it names");
+
+        // Nothing above the target left ⇒ a second run is a no-op, and the survivor stays.
+        assert_eq!(st.prune_snapshots_above(target).expect("prune"), 0, "idempotent");
+        assert!(st.get_snapshot_data(860_400).expect("get").is_some());
+    }
+
+    // Retention and every height lookup read the index, never a frame: a frame with no index row is not
+    // seen until the boot pass adopts it, which it does when the newest-frame pointer names it.
+    #[test]
+    fn retention_and_lookups_read_only_the_snapshot_index() {
+        let (st, _d) = temp_storage();
+        for h in [90u64, 3_600, 7_200, 10_800, 14_400] { seed(&st, h); }
+        assert_eq!(st.cleanup_old_snapshots(3).expect("cleanup"), 1, "3,600 goes; the early anchor stays");
+        assert!(st.get_snapshot_data(3_600).expect("get").is_none());
+        assert!(st.get_snapshot_data(90).expect("get").is_some());
+        assert_eq!(st.get_latest_snapshot_height().expect("latest"), Some(14_400));
+        assert_eq!(st.get_highest_snapshot_height_le(10_000).expect("le"), Some(7_200));
+        assert_eq!(st.find_snapshot_at_or_before(8_000).expect("find"), Some(7_200));
+
+        // The single-value layout of an earlier binary: a raw frame and the pointer.
+        let cf = st.persistent.db.cf_handle("snapshots").expect("snapshots cf");
+        st.persistent.db.put_cf(&cf, b"full_snap_18000", &[4u8, 5, 6]).expect("raw frame");
+        st.persistent.db.put_cf(&cf, b"latest_full_snap", &18_000u64.to_le_bytes()).expect("pointer");
+        assert_eq!(st.get_highest_snapshot_height_le(u64::MAX).expect("le"), Some(14_400), "not indexed yet");
+        st.ensure_snapshot_index().expect("adopt");
+        assert_eq!(st.get_highest_snapshot_height_le(u64::MAX).expect("le"), Some(18_000));
+        st.ensure_snapshot_index().expect("second pass is a no-op");
+    }
+
+    // A frame whose capture predates a snapshot prune, or whose height now holds another block, describes a
+    // chain this node abandoned: nothing is written for it.
+    #[test]
+    fn a_frame_captured_before_a_rollback_is_not_written() {
+        let (st, _d) = temp_storage();
+        let before = st.snapshot_generation();
+        st.prune_snapshots_above(0).expect("prune");
+        assert_eq!(st.snapshot_generation(), before + 1, "a prune bumps the generation");
+        let view = st.frame_views().expect("view");
+        st.write_boundary_frame(90, view, None, Some((before, [0u8; 32]))).expect("write");
+        assert!(st.get_snapshot_data(90).expect("get").is_none(), "captured before the prune: dropped");
+        let view = st.frame_views().expect("view");
+        st.write_boundary_frame(90, view, None, Some((st.snapshot_generation(), [7u8; 32]))).expect("write");
+        assert!(st.get_snapshot_data(90).expect("get").is_none(), "another block at the height: dropped");
+        let view = st.frame_views().expect("view");
+        st.write_boundary_frame(90, view, None, None).expect("write");
+        assert!(st.get_snapshot_data(90).expect("get").is_some());
+        assert_eq!(st.get_latest_snapshot_height().expect("latest"), Some(90));
+    }
+
+    fn seed_macroblock(st: &Storage, index: u64) -> qnet_state::MacroBlock {
+        let mb = qnet_state::MacroBlock::new(index * 90, 0, [0u8; 32], vec![[7u8; 32]], [1u8; 32],
+                                             qnet_state::ConsensusData::default());
+        let cf = st.persistent.db.cf_handle("microblocks").expect("microblocks cf");
+        st.persistent.db.put_cf(&cf, format!("macroblock_{}", index).as_bytes(),
+                                bincode::serialize(&mb).expect("ser")).expect("seed");
+        mb
+    }
+
+    fn meta_get(st: &Storage, key: &[u8]) -> Option<Vec<u8>> {
+        let cf = st.persistent.db.cf_handle("metadata").expect("metadata cf");
+        st.persistent.db.get_cf(&cf, key).expect("get")
+    }
+
+    fn meta_put(st: &Storage, key: &[u8], val: &[u8]) {
+        let cf = st.persistent.db.cf_handle("metadata").expect("metadata cf");
+        st.persistent.db.put_cf(&cf, key, val).expect("put");
+    }
+
+    /// One retraction for every durable marker that names chain above the target. Each was found
+    /// the same way: a fleet rolled back to 863550 held no block above it, yet reported the
+    /// abandoned tip through one of them and never produced the next block.
+    #[test]
+    fn a_rollback_retracts_every_durable_position_marker_above_the_target() {
+        let (st, _d) = temp_storage();
+        let target = 863_550u64;                      // 9595 * 90: a window boundary
+        let kept = seed_macroblock(&st, 9595);
+        seed_macroblock(&st, 9596);
+        seed_macroblock(&st, 9600);                   // closes reward epoch 9440
+        let rewards = st.persistent.db.cf_handle("pending_rewards").expect("pending_rewards cf");
+        st.persistent.db.put_cf(&rewards, Storage::epoch_root_key(9440).as_bytes(), &[9u8; 32]).expect("root");
+        st.persistent.db.put_cf(&rewards, Storage::epoch_root_key(9600).as_bytes(), &[8u8; 32]).expect("orphan root"); // mb 9760, object gone
+        st.persistent.db.put_cf(&rewards, Storage::epoch_root_key(9280).as_bytes(), &[6u8; 32]).expect("kept root");   // mb 9440
+        st.persistent.db.put_cf(&rewards, b"epoch_fold_head", &[1u8; 8]).expect("fold");
+        for h in [860_400u64, 867_600] { seed(&st, h); }
+        meta_put(&st, b"last_sealed_mb", &9648u64.to_le_bytes());
+        meta_put(&st, b"latest_macroblock_hash", &[0xEEu8; 32]);
+        meta_put(&st, b"qc_sig_strip_cursor", &9640u64.to_be_bytes());
+        // A cold-join anchor at 9594 (kept: below the target); the watermark scan starts from it.
+        let mut anchor = 9594u64.to_le_bytes().to_vec();
+        anchor.extend_from_slice(&[7u8; 32]);
+        st.put_snapshot_anchor(&anchor).expect("anchor");
+        let mut promote = 867_600u64.to_le_bytes().to_vec();
+        promote.extend_from_slice(&[3u8; 32]);
+        meta_put(&st, b"promote_pending", &promote);
+        st.record_certified_pair_at(1000, 863_550, b"kept").expect("pair");
+        st.record_certified_pair_at(1001, 863_640, b"above").expect("pair");
+        st.record_certified_pair(1002, b"legacy-unreadable").expect("pair"); // no head key, undecodable
+        st.save_consensus_state(28_944, b"state").expect("round");
+        st.save_timeout_certificates(b"certs").expect("tcerts");
+        st.save_sync_progress(863_550, 868_320, 863_550).expect("sync");
+
+        st.retract_chain_position_above(target);
+
+        assert!(st.get_macroblock_by_height(9595).expect("get").is_some(), "the window sealed at the target stays");
+        assert!(st.get_macroblock_by_height(9596).expect("get").is_none());
+        assert!(st.get_macroblock_by_height(9600).expect("get").is_none());
+        assert_eq!(st.load_epoch_root(9440).expect("root"), None,
+                   "the root sealed with macroblock 9600 goes with it, or the re-sealed window is refused as equivocation");
+        assert_eq!(st.load_epoch_root(9600).expect("root"), None, "an orphan root above the target goes too");
+        assert!(st.load_epoch_root(9280).expect("root").is_some(), "a root certified at or below the target stays");
+        assert!(st.persistent.db.get_cf(&rewards, b"epoch_fold_head").expect("get").is_none(), "fold memo covered that epoch");
+        assert!(st.get_snapshot_data(867_600).expect("get").is_none());
+        assert!(st.get_snapshot_data(860_400).expect("get").is_some());
+        assert_eq!(st.last_sealed_mb_index(), 9595, "watermark derived from what remains");
+        assert_eq!(st.get_latest_macroblock_hash().expect("hash"), kept.hash(), "names the macroblock that remains");
+        assert_eq!(meta_get(&st, b"qc_sig_strip_cursor").expect("cursor"), 9595u64.to_be_bytes().to_vec());
+        assert_eq!(&st.get_snapshot_anchor().expect("get").expect("present")[0..8], &9594u64.to_le_bytes(), "an anchor within reach stays");
+        assert!(meta_get(&st, b"promote_pending").is_none(), "a promote toward the abandoned chain is dropped");
+        let pairs: Vec<u64> = st.load_certified_pairs().expect("pairs").into_iter().map(|(i, _)| i).collect();
+        assert_eq!(pairs, vec![1000], "pairs by the window they certify; an unreadable one goes too");
+        assert_eq!(st.get_latest_consensus_round().expect("round"), 0);
+        assert!(st.load_timeout_certificates().expect("tcerts").is_none());
+        assert!(st.load_sync_progress().expect("sync").is_none());
+
+        // Idempotent: a second run finds nothing above the target and changes nothing below it.
+        st.retract_chain_position_above(target);
+        assert!(st.get_macroblock_by_height(9595).expect("get").is_some());
+        assert_eq!(st.last_sealed_mb_index(), 9595);
+        assert_eq!(st.load_certified_pairs().expect("pairs").len(), 1);
+    }
+
+    /// An anchor above the target is a trusted-floor claim about the abandoned chain: reload would
+    /// raise chain_height straight back to it. mb == 0 is the sentinel the reload treats as none.
+    #[test]
+    fn a_rollback_drops_an_anchor_it_put_out_of_reach() {
+        let (st, _d) = temp_storage();
+        let mut anchor = 9640u64.to_le_bytes().to_vec();
+        anchor.extend_from_slice(&[7u8; 32]);
+        st.put_snapshot_anchor(&anchor).expect("anchor");
+        st.retract_chain_position_above(863_550);
+        assert_eq!(&st.get_snapshot_anchor().expect("get").expect("present")[0..8], &0u64.to_le_bytes(), "anchor sentinel");
+    }
+
+    /// The watermark hint can lie upward: the reader scans forward FROM it and never checks the
+    /// objects below. Node 003 held only every other macroblock from 9585, reported 9595, asked its
+    /// peers for 9596 and up, and never healed. The retraction derives the watermark from what
+    /// exists above the anchor, so the sync asks for exactly the hole.
+    #[test]
+    fn a_rollback_derives_the_seal_watermark_from_the_objects_not_the_hint() {
+        let (st, _d) = temp_storage();
+        let mut anchor = 9590u64.to_le_bytes().to_vec();
+        anchor.extend_from_slice(&[7u8; 32]);
+        st.put_snapshot_anchor(&anchor).expect("anchor");
+        for idx in [9591u64, 9592, 9593, 9594, 9596] { seed_macroblock(&st, idx); } // 9595 missing
+        meta_put(&st, b"last_sealed_mb", &9648u64.to_le_bytes());
+        st.retract_chain_position_above(863_550);
+        assert_eq!(st.last_sealed_mb_index(), 9594, "the frontier stops at the first hole, whatever the hint said");
+    }
+
+    /// A stored boundary macroblock is this node's own bad seal when it has no producer snapshot or
+    /// when its body does not commit to the epoch_commitment in its own certificate. Nodes 001 and
+    /// 004 sealed one each from round-keyed inputs of an older window; healthy nodes sealed some from
+    /// their own liveness view; every committee derived two windows on then differed or failed.
+    /// Dropping the object and bringing the watermark under it lets the range sync fetch the
+    /// certified copy; a canonical object is never touched.
+    #[test]
+    fn a_macroblock_that_disagrees_with_its_own_certificate_is_dropped_and_the_watermark_follows() {
+        use qnet_consensus::checkpoint_bft::{Checkpoint, QuorumCertificate, epoch_commitment};
+        let (st, _d) = temp_storage();
+        let mut anchor = 10_180u64.to_le_bytes().to_vec();
+        anchor.extend_from_slice(&[7u8; 32]);
+        st.put_snapshot_anchor(&anchor).expect("anchor");
+        let committee: Vec<String> = (1..=5).map(|i| format!("genesis_node_00{}", i)).collect();
+        let eligible = bincode::serialize(&committee.iter().map(|id| qnet_state::EligibleProducer {
+            node_id: id.clone(), reputation: 7000 }).collect::<Vec<_>>()).unwrap();
+        let banned: Vec<String> = Vec::new();
+        let put = |idx: u64, elig: Option<Vec<u8>>, commitment: [u8; 32]| {
+            let cp = Checkpoint {
+                index: idx, parent_qc: None, window_head_height: idx * 90, window_mb_hashes: vec![[7u8; 32]],
+                state_root: [0xab; 32], beacon: [3u8; 32], epoch_commitment: commitment, reward_root: [0u8; 32],
+                registry_root: [0u8; 32], logs_root: [0u8; 32], dilithium_pk_root: [0u8; 32],
+                reward_epoch_root: [0u8; 32], total_supply: 0, timestamp: 0,
+                proposer: "genesis_node_001".to_string(), proposer_sig: Vec::new(), recovery_anchor: None,
+            };
+            let qc = QuorumCertificate { checkpoint_hash: cp.hash(), index: idx, signers: Vec::new(),
+                                         sig_merkle_root: [0u8; 32], sigs: Vec::new() };
+            let mut cd = qnet_state::ConsensusData::default();
+            cd.checkpoint_qc = Some(bincode::serialize(&(cp, qc)).unwrap());
+            cd.eligible_producers = elig;
+            cd.consensus_committee = Some(committee.clone());
+            cd.banned_validators = Some(bincode::serialize(&banned).unwrap());
+            let mb = qnet_state::MacroBlock::new(idx * 90, 0, [0u8; 32], vec![[7u8; 32]], [1u8; 32], cd);
+            let cf = st.persistent.db.cf_handle("microblocks").expect("microblocks cf");
+            st.persistent.db.put_cf(&cf, format!("macroblock_{}", idx).as_bytes(), bincode::serialize(&mb).unwrap()).expect("seed");
+        };
+        let good = epoch_commitment(&eligible, &committee, &banned);
+        for idx in [10_181u64, 10_182, 10_183] { put(idx, Some(eligible.clone()), good); }
+        put(10_184, None, good);                          // no snapshot at all (001's seal of 10184)
+        put(10_185, Some(eligible.clone()), good);        // canonical
+        put(10_186, Some(eligible.clone()), [9u8; 32]);   // a set its own certificate never signed
+        assert_eq!(st.last_sealed_mb_index(), 10_186);
+
+        assert_eq!(st.macroblock_is_poisoned(10_185), Some(false));
+        assert_eq!(st.macroblock_is_poisoned(10_184), Some(true), "no snapshot");
+        assert_eq!(st.macroblock_is_poisoned(10_186), Some(true), "commitment mismatch");
+        assert_eq!(st.macroblock_is_poisoned(10_190), None, "not stored");
+
+        assert!(!st.drop_poisoned_macroblock(10_185), "a canonical object is never dropped");
+        assert_eq!(st.drop_poisoned_macroblocks_recent(16), 2, "both bad seals go in one boot pass");
+        assert!(st.get_macroblock_by_height(10_184).expect("get").is_none());
+        assert!(st.get_macroblock_by_height(10_186).expect("get").is_none());
+        assert!(st.get_macroblock_by_height(10_185).expect("get").is_some());
+        assert_eq!(st.last_sealed_mb_index(), 10_183, "the watermark sits under the lowest hole, so sync asks for it");
+        assert_eq!(st.drop_poisoned_macroblocks_recent(16), 0, "nothing to drop twice");
+    }
+
+    /// The operator's declaration on top: the votes this node cast above the target and the genesis
+    /// capsule it holds for that chain. Left in place, the engine reboots at the abandoned chain's
+    /// last voted index and ignores every proposal of the re-produced windows: no checkpoint
+    /// certifies, nothing seals, and production parks at the derivation horizon - 2880 blocks above
+    /// the target, which is exactly where the fleet stopped (866430 = 863550 + 2880).
+    #[test]
+    fn an_operator_rollback_abandons_the_votes_and_the_capsule_above_the_target() {
+        let (st, _d) = temp_storage();
+        let target = 863_550u64;
+        st.record_checkpoint_vote(28_785, 863_550, &[1u8; 32], false, 28_784, &[2u8; 32]).expect("vote");
+        st.record_checkpoint_vote(28_786, 863_580, &[3u8; 32], false, 28_785, &[4u8; 32]).expect("vote");
+        st.record_checkpoint_vote(28_790, 863_700, &[5u8; 32], false, 28_789, &[6u8; 32]).expect("vote");
+        let capsule = |mb_index: u64| bincode::serialize(&crate::galc::GenesisCheckpoint {
+            version: 1, network_id: [0u8; 32], mb_index, mb_hash: [0u8; 32],
+            committee_digest_anchor: [0u8; 32], committee_digest_pred: [0u8; 32],
+            minted_at_height: 0, sigs: Vec::new(),
+        }).expect("ser");
+        st.put_galc_held(&capsule(9640)).expect("galc");
+
+        st.abandon_chain_claims_above(target);
+        let kept: Vec<u64> = st.load_checkpoint_votes().expect("votes").into_iter().map(|v| v.0).collect();
+        assert_eq!(kept, vec![28_785], "only the vote at the target's own head remains");
+        assert!(st.get_galc_held().expect("get").is_none(), "a capsule above the target describes nothing");
+
+        // A capsule at or below the target is a trust root this node keeps.
+        st.put_galc_held(&capsule(9000)).expect("galc");
+        st.abandon_chain_claims_above(target);
+        assert!(st.get_galc_held().expect("get").is_some());
+    }
+
+    /// The total-supply seal is the registry-root seal's sibling: same head, same "Some means this
+    /// head is applied and sealed" reading. The registry rebuild already took rr_seal_ above the new
+    /// tip; ts_seal_ has to go with it.
+    #[test]
+    fn a_registry_rebuild_takes_the_total_supply_seals_above_the_tip_with_it() {
+        let (st, _d) = temp_storage();
+        st.seal_total_supply(863_550, 1_000).expect("seal");
+        st.seal_total_supply(863_640, 1_001).expect("seal");
+        st.rebuild_registry_lthash(863_550).expect("rebuild");
+        assert_eq!(st.get_total_supply_at(863_550), Some(1_000), "the seal at the tip stays");
+        assert_eq!(st.get_total_supply_at(863_640), None, "a seal above the tip names an abandoned head");
+    }
+}
+
+/// What one encoded frame holds, for the creation log.
+struct FrameCounts {
+    accounts: u64,
+    rewards: u64,
+    contracts: u64,
+    registry: u64,
+    uncompressed_len: u64,
+}
+
+/// Frame sections, in stream order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FrameSection { Accounts = 0, Rewards = 1, Contracts = 2, Registry = 3 }
+
+/// Peekable reader over a decoded frame: the section markers are raw bytes, so the parser looks ahead. It
+/// never reads past the length the frame's header declares.
+struct FrameStream<R: std::io::Read> {
+    inner: R,
+    buf: Vec<u8>,
+    pos: usize,
+    consumed: u64,
+    /// Decoded bytes read so far.
+    seen: u64,
+    limit: u64,
+}
+
+impl<R: std::io::Read> FrameStream<R> {
+    /// Make `n` unread bytes available; false at the end of the stream.
+    fn fill(&mut self, n: usize) -> std::io::Result<bool> {
+        while self.buf.len() - self.pos < n {
+            if self.pos > 0 {
+                self.buf.drain(..self.pos);
+                self.pos = 0;
+            }
+            let mut tmp = [0u8; 64 * 1024];
+            let k = self.inner.read(&mut tmp)?;
+            if k == 0 {
+                return Ok(false);
+            }
+            self.seen += k as u64;
+            if self.seen > self.limit {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "frame longer than its header says"));
+            }
+            self.buf.extend_from_slice(&tmp[..k]);
+        }
+        Ok(true)
+    }
+
+    fn at(&mut self, marker: &[u8]) -> std::io::Result<bool> {
+        Ok(self.fill(marker.len())? && &self.buf[self.pos..self.pos + marker.len()] == marker)
+    }
+
+    fn at_end(&mut self) -> std::io::Result<bool> {
+        Ok(!self.fill(1)?)
+    }
+
+    fn take(&mut self, n: usize) -> std::io::Result<&[u8]> {
+        if !self.fill(n)? {
+            return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "frame truncated"));
+        }
+        let start = self.pos;
+        self.pos += n;
+        self.consumed += n as u64;
+        Ok(&self.buf[start..start + n])
+    }
+
+    fn u32(&mut self) -> std::io::Result<u32> {
+        Ok(u32::from_le_bytes(self.take(4)?.try_into().expect("4 bytes")))
+    }
+
+    fn row_len(&mut self) -> std::io::Result<usize> {
+        let n = self.u32()? as usize;
+        if n as u64 > self.limit.saturating_sub(self.consumed) {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("row length {}", n)));
+        }
+        Ok(n)
+    }
+
+    fn row(&mut self, section: FrameSection,
+           f: &mut impl FnMut(FrameSection, &[u8], &[u8]) -> IntegrationResult<()>) -> IntegrationResult<()> {
+        let io = |e: std::io::Error| IntegrationError::StorageError(format!("snapshot_frame_invalid {}", e));
+        let klen = self.row_len().map_err(io)?;
+        let key = self.take(klen).map_err(io)?.to_vec();
+        let vlen = self.row_len().map_err(io)?;
+        let value = self.take(vlen).map_err(io)?;
+        f(section, &key, value)
+    }
+}
+
+/// Hashes every byte read through it.
+struct HashingReader<'a, R: std::io::Read> {
+    inner: &'a mut R,
+    hasher: sha3::Sha3_256,
+}
+
+impl<R: std::io::Read> std::io::Read for HashingReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        use sha3::Digest;
+        let n = self.inner.read(buf)?;
+        self.hasher.update(&buf[..n]);
+        Ok(n)
+    }
+}
+
+/// Aborts the tasks it holds when dropped: a cancelled download stops writing rows.
+struct AbortOnDrop(Vec<tokio::task::JoinHandle<IntegrationResult<()>>>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        for h in &self.0 {
+            h.abort();
+        }
+    }
+}

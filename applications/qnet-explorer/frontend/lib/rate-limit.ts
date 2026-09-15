@@ -93,30 +93,105 @@ export function rateLimit(
   };
 }
 
-// Get client IP from request with validation
+// ---------------------------------------------------------------------------
+// Shared client-IP derivation
+// ---------------------------------------------------------------------------
+// Next.js 15 App Router route handlers do NOT expose the socket address on the
+// request object (`request.ip` was removed upstream), so the client IP can only
+// be recovered from proxy-supplied headers (x-forwarded-for / x-real-ip).
+//
+// Those headers are forgeable, so they are trusted ONLY when the deployment
+// opts in via a trusted-proxy flag (RATE_LIMIT_TRUSTED_PROXY=1, or the legacy
+// FAUCET_TRUSTED_PROXY=1) — set by the edge operator who controls and
+// normalises the header chain. An attacker who could rotate x-forwarded-for
+// would otherwise defeat every per-IP limit.
+//
+// When no trusted proxy is configured there is no reliable per-request IP:
+//   - On mainnet/production we FAIL CLOSED: `resolveClientIp` returns null so
+//     the caller can refuse to serve rather than silently collapsing every
+//     caller into one shared 'unknown' bucket (which both disables per-IP abuse
+//     protection AND self-DoSes the whole network once any N requests land).
+//   - On testnet/dev we degrade gracefully to a fixed dev value so local
+//     testing keeps working.
+// ---------------------------------------------------------------------------
+
+const isValidIp = (ip: string): boolean =>
+  /^[0-9a-fA-F:.]+$/.test(ip) && ip.length > 0 && ip.length <= 45;
+
+// True when the deployment operator has asserted a trusted reverse proxy is in
+// front of this handler (so x-forwarded-for / x-real-ip can be believed).
+export function isTrustedProxy(): boolean {
+  return (
+    process.env.RATE_LIMIT_TRUSTED_PROXY === '1' ||
+    process.env.FAUCET_TRUSTED_PROXY === '1'
+  );
+}
+
+// True when this deployment must apply strict (production) rules. Mainnet is
+// derived from the same server-side env the rest of the frontend uses; it is
+// fixed at build/deploy time and cannot be influenced per request.
+export function isMainnet(): boolean {
+  const net = (process.env.FAUCET_ENV || process.env.NEXT_PUBLIC_NETWORK || '').toLowerCase();
+  if (net === 'testnet' || net === 'dev' || net === 'development') return false;
+  if (net === 'mainnet') return true;
+  // Unset network → treat a production build as mainnet (safer default),
+  // otherwise as dev.
+  return process.env.NODE_ENV === 'production';
+}
+
+// Derive the real client IP from trusted proxy headers.
+// Returns the first hop of x-forwarded-for (the original client) or x-real-ip
+// when a trusted proxy is configured; returns null otherwise (no reliable IP).
+export function resolveClientIp(request: Request): string | null {
+  if (isTrustedProxy()) {
+    const forwarded = request.headers.get('x-forwarded-for');
+    if (forwarded) {
+      const firstIp = forwarded.split(',')[0].trim();
+      if (isValidIp(firstIp)) return firstIp;
+    }
+    const realIp = request.headers.get('x-real-ip');
+    if (realIp && isValidIp(realIp.trim())) return realIp.trim();
+  }
+  return null;
+}
+
+// Result of client-IP derivation for a rate-limited endpoint.
+//   - ok:    a usable per-IP key (real IP, or a dev fallback on testnet)
+//   - fail:  mainnet is misconfigured (no trusted proxy / IP source) and the
+//            endpoint MUST refuse to serve rather than key everyone under one
+//            shared bucket.
+export type ClientIpResolution =
+  | { ok: true; ip: string }
+  | { ok: false; reason: string };
+
+// Resolve a per-IP rate-limit key, failing closed on mainnet when no IP source
+// is configured. On testnet/dev, falls back to a fixed dev key so local runs
+// still exercise the limiter deterministically.
+export function getRateLimitKey(request: Request): ClientIpResolution {
+  const ip = resolveClientIp(request);
+  if (ip) return { ok: true, ip };
+
+  if (isMainnet()) {
+    return {
+      ok: false,
+      reason:
+        'Per-IP rate limiting is misconfigured: no trusted proxy is set. ' +
+        'Set RATE_LIMIT_TRUSTED_PROXY=1 (behind a reverse proxy that provides ' +
+        'x-forwarded-for) so the client IP can be derived on mainnet.',
+    };
+  }
+
+  // testnet / dev — degrade gracefully so local testing keeps working.
+  return { ok: true, ip: 'dev-local' };
+}
+
+// Back-compat wrapper used by endpoints that key rate limiting off a plain
+// string. Delegates to getRateLimitKey; on a fail-closed mainnet result it
+// returns 'unmetered' rather than the old always-shared 'unknown' bucket. New
+// callers should prefer getRateLimitKey and honour its { ok: false } result by
+// returning a 503, so misconfiguration is surfaced instead of silently pooled.
 export function getClientIdentifier(request: Request): string {
-  // Try to get real IP from headers (if behind proxy)
-  // Note: x-forwarded-for can be spoofed, but in production should be validated by reverse proxy
-  const forwarded = request.headers.get('x-forwarded-for');
-  if (forwarded) {
-    // Take first IP and validate format
-    const firstIp = forwarded.split(',')[0].trim();
-    // Basic IP validation (IPv4 or IPv6)
-    if (/^[0-9a-fA-F:.]+$/.test(firstIp) && firstIp.length <= 45) {
-      return firstIp;
-    }
-  }
-  
-  const realIp = request.headers.get('x-real-ip');
-  if (realIp) {
-    // Validate IP format
-    if (/^[0-9a-fA-F:.]+$/.test(realIp) && realIp.length <= 45) {
-      return realIp;
-    }
-  }
-  
-  // Fallback: use a session-based identifier if available
-  // In production, this should be handled by reverse proxy with proper IP extraction
-  return 'unknown';
+  const resolution = getRateLimitKey(request);
+  return resolution.ok ? resolution.ip : 'unmetered';
 }
 

@@ -1,79 +1,110 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getTransactionByHash } from '../../../../../lib/db';
+import { getTransactionByHash, getBatchRecipients } from '../../../../../lib/db';
 import { rateLimit, getClientIdentifier } from '../../../../../lib/rate-limit';
-
-// NODE_RPC_URL is now defined in getNodeRpcUrl() function below
+import { mapTxType, formatAmount } from '@/lib/tx-mapping';
 
 // Rate limiting: 200 requests per minute per IP
 const RATE_LIMIT_MAX = 200;
 const RATE_LIMIT_WINDOW = 60 * 1000; // 1 minute
 
-// Map transaction type to display string
-function mapTxType(type: string | object | undefined): string {
-  if (!type) return 'Transfer';
-  const typeStr = typeof type === 'object' ? Object.keys(type)[0] : String(type);
-  
-  const map: Record<string, string> = {
-    'Transfer': 'Transfer',
-    'NodeActivation': 'Node Activation',
-    'NodeRegistration': 'Registration',
-    'Swap': 'Swap',
-    'RewardDistribution': 'Reward',
-    'ContractDeploy': 'Smart Contract',
-    'ContractCall': 'Smart Contract',
-    'CreateAccount': 'System',
-    'BatchRewardClaims': 'Reward',
-    'BatchNodeActivations': 'Node Activation',
-    'BatchTransfers': 'Transfer',
-    'PingAttestation': 'System',
-    'PingCommitmentWithSampling': 'System',
-  };
-  return map[typeStr] || 'Transfer';
-}
+const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 
-// Format amount from nanoQNC to QNC
-function formatAmount(amount: number | string | undefined): string {
-  if (!amount) return '0 QNC';
-  const num = typeof amount === 'string' ? parseFloat(amount) : amount;
-  if (num >= 1e9) {
-    return (num / 1e9).toLocaleString('en-US', { maximumFractionDigits: 6 }) + ' QNC';
+// Dev/testnet only: no production host is ever baked into source, so in a
+// production build QNET_API_URL is REQUIRED (see resolveNodeRpc).
+const NODE_RPC_DEV_FALLBACK = 'http://127.0.0.1:8001';
+
+// True if hostname is a private, loopback, link-local, or CGNAT address (SSRF guard).
+function isBlockedHost(hostname: string): boolean {
+  const h = hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  if (h === 'localhost' || h.endsWith('.localhost')) return true;
+  // IPv6 loopback / unspecified / unique-local / link-local
+  if (h === '::1' || h === '::' || h.startsWith('fc') || h.startsWith('fd') || h.startsWith('fe80')) return true;
+  const m = h.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (m) {
+    const [a, b] = [Number(m[1]), Number(m[2])];
+    if (a === 127 || a === 0 || a === 10) return true;               // loopback, "this network", private
+    if (a === 192 && b === 168) return true;                          // private
+    if (a === 169 && b === 254) return true;                          // link-local (incl. cloud metadata)
+    if (a === 172 && b >= 16 && b <= 31) return true;                 // private
+    if (a === 100 && b >= 64 && b <= 127) return true;                // CGNAT
   }
-  return num.toLocaleString('en-US', { maximumFractionDigits: 6 }) + ' QNC';
+  return false;
 }
 
-// Validate and sanitize NODE_RPC_URL to prevent SSRF
-function getNodeRpcUrl(): string {
-  const url = process.env.QNET_API_URL || 'http://161.97.86.81:8001';
+// Resolve the node RPC base URL once at module load.
+//   - Production REQUIRES a valid, publicly-routable QNET_API_URL. If it is
+//     unset, malformed, or points at a private/loopback host, we resolve to an
+//     error rather than '' — an empty base would turn every RPC fetch into a
+//     relative URL that throws "Failed to parse URL" and silently 404s any tx
+//     not in the local DB. The handler surfaces this as a 503 naming the
+//     misconfiguration instead of failing silently.
+//   - Dev/testnet falls back to loopback (http://127.0.0.1:8001) so local runs
+//     work without any env; a blocked/loopback QNET_API_URL is likewise allowed
+//     in dev (that is the intended local target).
+function resolveNodeRpc(): { url: string | null; error: string | null } {
+  const configured = process.env.QNET_API_URL;
+
+  if (!configured) {
+    if (IS_PRODUCTION) {
+      return {
+        url: null,
+        error:
+          'QNET_API_URL is not set. A production build requires an explicit, ' +
+          'publicly-routable node RPC endpoint (no host is baked into source).',
+      };
+    }
+    return { url: NODE_RPC_DEV_FALLBACK, error: null };
+  }
+
+  let parsed: URL;
   try {
-    const parsed = new URL(url);
-    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-      throw new Error('Invalid protocol');
-    }
-    const hostname = parsed.hostname;
-    if (hostname === 'localhost' || hostname === '127.0.0.1' || 
-        hostname.startsWith('192.168.') || hostname.startsWith('10.') ||
-        hostname.startsWith('172.16.') || hostname.startsWith('172.17.') ||
-        hostname.startsWith('172.18.') || hostname.startsWith('172.19.') ||
-        hostname.startsWith('172.20.') || hostname.startsWith('172.21.') ||
-        hostname.startsWith('172.22.') || hostname.startsWith('172.23.') ||
-        hostname.startsWith('172.24.') || hostname.startsWith('172.25.') ||
-        hostname.startsWith('172.26.') || hostname.startsWith('172.27.') ||
-        hostname.startsWith('172.28.') || hostname.startsWith('172.29.') ||
-        hostname.startsWith('172.30.') || hostname.startsWith('172.31.')) {
-      return 'http://161.97.86.81:8001';
-    }
-    return url;
+    parsed = new URL(configured);
   } catch {
-    return 'http://161.97.86.81:8001';
+    return IS_PRODUCTION
+      ? { url: null, error: `QNET_API_URL is not a valid URL: "${configured}".` }
+      : { url: NODE_RPC_DEV_FALLBACK, error: null };
   }
+
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    return IS_PRODUCTION
+      ? { url: null, error: `QNET_API_URL has an unsupported protocol: "${parsed.protocol}".` }
+      : { url: NODE_RPC_DEV_FALLBACK, error: null };
+  }
+
+  if (isBlockedHost(parsed.hostname)) {
+    // Private/loopback host: fine in dev (intended local target), but in
+    // production it is either an SSRF target or a now-blocked internal host —
+    // refuse rather than silently degrade to an unreachable/empty base.
+    return IS_PRODUCTION
+      ? {
+          url: null,
+          error:
+            `QNET_API_URL points at a private/loopback host ("${parsed.hostname}") ` +
+            'which is not reachable in production. Configure a public node RPC endpoint.',
+        }
+      : { url: configured, error: null };
+  }
+
+  return { url: configured, error: null };
 }
 
-const NODE_RPC_URL = getNodeRpcUrl();
+const { url: NODE_RPC_URL, error: NODE_RPC_ERROR } = resolveNodeRpc();
+
+// Normalize type-specific public data (JSONB object or JSON string) → object|null; null if empty.
+function parseTxTypeData(raw: unknown): Record<string, unknown> | null {
+  if (!raw) return null;
+  let obj: unknown = raw;
+  if (typeof raw === 'string') {
+    try { obj = JSON.parse(raw); } catch { return null; }
+  }
+  if (typeof obj !== 'object' || obj === null || Array.isArray(obj)) return null;
+  return Object.keys(obj).length > 0 ? (obj as Record<string, unknown>) : null;
+}
 
 // Fetch TX from Node RPC (fallback if not in DB)
 async function fetchTransaction(hash: string): Promise<Record<string, unknown> | null> {
   try {
-    const res = await fetch(`${NODE_RPC_URL}/api/v1/transaction/${hash}`, {
+    const res = await fetch(`${NODE_RPC_URL}/api/v1/transaction/${encodeURIComponent(hash)}`, {
       cache: 'no-store',
       signal: AbortSignal.timeout(3000),
     });
@@ -83,7 +114,7 @@ async function fetchTransaction(hash: string): Promise<Record<string, unknown> |
     // Validate response size before parsing
     const text = await res.text();
     if (text.length > 10 * 1024 * 1024) { // 10MB max
-      console.warn('[TX] Transaction response too large:', text.length);
+      // console.warn('[TX] Transaction response too large:', text.length);
       return null;
     }
     
@@ -91,7 +122,7 @@ async function fetchTransaction(hash: string): Promise<Record<string, unknown> |
     try {
       data = JSON.parse(text) as { status?: string; transaction?: Record<string, unknown> };
     } catch (parseErr) {
-      console.warn('[TX] Failed to parse transaction JSON:', parseErr);
+      // console.warn('[TX] Failed to parse transaction JSON:', parseErr);
       return null;
     }
     
@@ -105,9 +136,15 @@ async function fetchTransaction(hash: string): Promise<Record<string, unknown> |
 }
 
 // Fallback: Search in genesis and emission blocks
+// Dynamically builds list up to current network height (every 14400 blocks)
 async function searchInEmissionBlocks(hash: string): Promise<Record<string, unknown> | null> {
-  const emissionBlocks = [0, 14400, 28800, 43200, 57600, 72000];
-  
+  const EPOCH_SIZE = 14400;
+  // Build dynamic list: block 0 + all epoch boundaries up to epoch 20 (covers ~280K blocks)
+  const emissionBlocks: number[] = [0];
+  for (let epoch = 1; epoch <= 20; epoch++) {
+    emissionBlocks.push(epoch * EPOCH_SIZE);
+  }
+
   for (const height of emissionBlocks) {
     try {
       const res = await fetch(`${NODE_RPC_URL}/api/v1/block/${height}`, {
@@ -120,7 +157,6 @@ async function searchInEmissionBlocks(hash: string): Promise<Record<string, unkn
       // Validate response size
       const blockText = await res.text();
       if (blockText.length > 50 * 1024 * 1024) { // 50MB max
-        console.warn(`[TX] Block ${height} response too large`);
         continue;
       }
       
@@ -136,8 +172,8 @@ async function searchInEmissionBlocks(hash: string): Promise<Record<string, unkn
       for (const tx of transactions) {
         const txObj = tx as Record<string, unknown>;
         if (txObj.hash === hash) {
-          const txTimestamp = height === 0 ? block.timestamp : ((txObj.timestamp as number) || block.timestamp);
-          return { ...txObj, block_height: height, timestamp: txTimestamp };
+          // Always use block.timestamp (authoritative chain time, not tx signing time)
+          return { ...txObj, block_height: height, timestamp: block.timestamp };
         }
       }
     } catch {
@@ -172,8 +208,18 @@ export async function GET(
     });
   }
   
+  // Fail loudly on RPC misconfiguration instead of silently 404ing every tx
+  // that is not already in the local DB (an empty base URL would make each
+  // fallback fetch a relative URL that throws "Failed to parse URL").
+  if (NODE_RPC_ERROR || !NODE_RPC_URL) {
+    return NextResponse.json({
+      success: false,
+      error: `Node RPC misconfigured: ${NODE_RPC_ERROR ?? 'QNET_API_URL is not configured'}`,
+    }, { status: 503 });
+  }
+
   const { hash } = await params;
-  
+
   // Validate hash
   if (!hash || typeof hash !== 'string') {
     return NextResponse.json({
@@ -210,27 +256,30 @@ export async function GET(
       const isSystemTx = from.startsWith('system_') || from === 'genesis' || dbTx.block === 0;
       const isQuantumSigned = dbTx.is_quantum_signed;
       
-      // 3 signature types:
-      // 1. System TX - for system transactions
-      // 2. Ed25519 + Dilithium3 - hybrid quantum-resistant  
-      // 3. Ed25519 - classical only
+      // Signature types (Ed25519 removed from consensus; user/consensus TXs are pure ML-DSA-65):
+      // 1. System TX  2. ML-DSA-65 (quantum-signed)  3. Unsigned (legacy / no PQ sig)
       let signatureType: string;
       if (isSystemTx) {
         signatureType = 'System TX';
       } else if (isQuantumSigned) {
-        signatureType = 'Ed25519 + Dilithium3';
+        signatureType = 'ML-DSA-65';
       } else {
-        signatureType = 'Ed25519';
+        signatureType = 'Unsigned';
       }
       
-      // Calculate real fee from stored gas_price and gas_limit
-      const gasPrice = dbTx.gas_price || 0;
-      const gasLimit = dbTx.gas_limit || 0;
-      const totalFee = gasPrice * gasLimit;
-      const fee = totalFee > 0 ? formatAmount(totalFee) : '0 QNC';
+      // Fee = gas_price × gas_limit, exact (NUMERIC columns arrive as digit strings).
+      const totalFee = BigInt(dbTx.gas_price || '0') * BigInt(dbTx.gas_limit || '0');
+      const fee = totalFee > 0n ? formatAmount(totalFee.toString()) : '0';
+      // Recipients of a batch envelope live in batch_transfers; the page expands them from tx_type_data.
+      let typeData = parseTxTypeData(dbTx.tx_type_data);
+      if (dbTx.tx_type === 'BatchTransfers') {
+        const recipients = await getBatchRecipients(dbTx.hash).catch(() => []);
+        if (recipients.length > 0) typeData = { ...(typeData || {}), recipients: recipients.map(r => ({ to: r.to_address, amount: r.amount })) };
+      }
       
       // Get timestamp - if 0, fetch from block
-      let finalTimestamp = dbTx.timestamp > 0 ? dbTx.timestamp : 0;
+      // Note: PostgreSQL BIGINT may come as string, so convert first
+      let finalTimestamp = Number(dbTx.timestamp) > 0 ? Number(dbTx.timestamp) : 0;
       
       // If timestamp is 0 and block is 0, fetch block timestamp
       if (finalTimestamp === 0 && dbTx.block === 0) {
@@ -266,7 +315,7 @@ export async function GET(
         source: 'postgresql',
         data: {
           hash: dbTx.hash,
-          type: mapTxType(dbTx.tx_type),
+          type: mapTxType(dbTx.tx_type, dbTx.from_address, dbTx.data),
           tx_type: dbTx.tx_type,
           status: dbTx.status || 'confirmed',
           block: dbTx.block,
@@ -287,6 +336,7 @@ export async function GET(
           dilithium_signature: dbTx.dilithium_signature,
           dilithium_public_key: dbTx.dilithium_public_key,
           data: dbTx.data,
+          tx_type_data: typeData,
         },
       }, {
         headers: {
@@ -312,62 +362,63 @@ export async function GET(
       }, { status: 404 });
     }
     
-    // Normalize timestamp to ms
-    let rawTs = (tx.timestamp as number) || 0;
+    // Always use block.timestamp (authoritative chain time), not tx.timestamp (signing time)
+    let rawTs = 0;
     const blockHeight = (tx.block_height || tx.block || 0) as number;
-    
-    // Genesis TX: use block timestamp
-    if (rawTs === 0 && blockHeight === 0) {
-      try {
-        const blockRes = await fetch(`${NODE_RPC_URL}/api/v1/block/0`, {
-          cache: 'no-store',
-          signal: AbortSignal.timeout(2000),
-        });
+
+    // Fetch block timestamp from node API
+    try {
+      const blockRes = await fetch(`${NODE_RPC_URL}/api/v1/block/${blockHeight}`, {
+        cache: 'no-store',
+        signal: AbortSignal.timeout(2000),
+      });
       if (blockRes.ok) {
         const blockText = await blockRes.text();
-        if (blockText.length > 10 * 1024 * 1024) {
-          console.warn('[TX] Block response too large');
-        } else {
+        if (blockText.length < 10 * 1024 * 1024) {
           try {
             const block = JSON.parse(blockText) as { timestamp?: number };
             rawTs = block.timestamp || 0;
           } catch {
-            // fallback to 0
+            // fallback to tx.timestamp
           }
         }
       }
-      } catch {
-        // fallback to 0
-      }
+    } catch {
+      // fallback to tx.timestamp
     }
-    
+
+    // Fallback to tx.timestamp if block fetch failed
+    if (rawTs === 0) {
+      rawTs = (tx.timestamp as number) || 0;
+    }
+
     const ts = rawTs > 1e12 ? rawTs : rawTs * 1000;
     
     // Determine transaction signature type
     const from = (tx.from_address || tx.from || 'unknown') as string;
     const isSystemTx = from.startsWith('system_') || from === 'genesis' || blockHeight === 0;
-    const isQuantumSigned = !!(tx.is_quantum_signed || 
-      (tx.dilithium_signature && tx.dilithium_public_key));
+    // FIX-5: sig-only (pk elided after first use → requiring it would mislabel signed txs Unsigned)
+    const isQuantumSigned = !!(tx.is_quantum_signed || tx.dilithium_signature);
     
     // 3 signature types
     let signatureType: string;
     if (isSystemTx) {
       signatureType = 'System TX';
     } else if (isQuantumSigned) {
-      signatureType = 'Ed25519 + Dilithium3';
+      signatureType = 'ML-DSA-65';
     } else {
-      signatureType = 'Ed25519';
+      signatureType = 'Unsigned';
     }
     
     // Calculate fee: gas_price * gas_limit, or 0 for genesis/system transactions
     let fee: string;
     if (isSystemTx) {
-      fee = '0 QNC';
+      fee = '0';
     } else {
       const gasPrice = (tx.gas_price as number) || 0;
       const gasLimit = (tx.gas_limit as number) || 0;
       const totalFee = gasPrice * gasLimit;
-      fee = totalFee > 0 ? formatAmount(totalFee) : '0 QNC';
+      fee = totalFee > 0 ? formatAmount(totalFee) : '0';
     }
     
     // Return ALL fields from transaction
@@ -376,7 +427,7 @@ export async function GET(
       source: 'rocksdb',
       data: {
         hash: tx.hash as string,
-        type: mapTxType((tx.tx_type || tx.type) as string),
+        type: mapTxType((tx.tx_type || tx.type) as string, (tx.from_address || tx.from) as string, tx.data),
         tx_type: tx.tx_type || tx.type,
         status: (tx.status as string) || 'confirmed',
         block: blockHeight,
@@ -397,6 +448,7 @@ export async function GET(
         dilithium_signature: tx.dilithium_signature as string | undefined,
         dilithium_public_key: tx.dilithium_public_key as string | undefined,
         data: tx.data as string | undefined,
+        tx_type_data: parseTxTypeData(tx.tx_type_data),
       },
     }, {
       headers: {
@@ -406,8 +458,7 @@ export async function GET(
       }
     });
     
-  } catch (err) {
-    console.error('[TX] Error:', err);
+  } catch {
     return NextResponse.json({
       success: false,
       error: 'Backend unavailable',

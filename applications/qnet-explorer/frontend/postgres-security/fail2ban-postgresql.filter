@@ -1,0 +1,37 @@
+# ============================================================================
+# Fail2ban Filter for PostgreSQL
+# Place this file in /etc/fail2ban/filter.d/postgresql.conf
+# ============================================================================
+
+[Definition]
+
+# Detect failed authentication attempts
+failregex = ^.*FATAL:.*authentication failed for user ".*" from host "<HOST>"
+            ^.*FATAL:.*password authentication failed for user ".*" from host "<HOST>"
+            ^.*FATAL:.*no pg_hba\.conf entry for host "<HOST>", user ".*", database ".*"
+            ^.*FATAL:.*no pg_hba\.conf entry for host "<HOST>"
+            ^.*LOG:.*connection authorized: user=.* database=.* SSL enabled \(protocol=.*, cipher=.*, bits=.*\) from <HOST>.*authentication failure
+            ^.*FATAL:.*role ".*" does not exist from host "<HOST>"
+            ^.*FATAL:.*database ".*" does not exist from host "<HOST>"
+            ^.*FATAL:.*pg_hba\.conf rejects connection for host "<HOST>"
+
+# Ignore localhost and internal connections
+ignoreregex = from host "127\.0\.0\.1"
+              from host "::1"
+              from host "localhost"
+
+# ============================================================================
+# Testing this filter:
+# ============================================================================
+#
+# 1. Test against log file:
+#    sudo fail2ban-regex /var/log/postgresql/postgresql-*.log /etc/fail2ban/filter.d/postgresql.conf
+#
+# 2. Test specific log line:
+#    sudo fail2ban-regex "FATAL: password authentication failed for user \"qnet_user\" from host \"192.168.1.100\"" /etc/fail2ban/filter.d/postgresql.conf
+#
+# 3. View real-time matches:
+#    sudo tail -f /var/log/postgresql/postgresql-*.log | fail2ban-regex - /etc/fail2ban/filter.d/postgresql.conf
+#
+# ============================================================================
+

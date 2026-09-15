@@ -1,0 +1,20 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "lib": ["ES2022"],
+    "types": ["node"],
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "outDir": "dist-indexer",
+    "rootDir": "src/indexer",
+    "sourceMap": false,
+    "noEmit": false,
+    "incremental": false
+  },
+  "include": ["src/indexer/**/*.ts"],
+  "exclude": ["node_modules", ".next", "dist-indexer"]
+}

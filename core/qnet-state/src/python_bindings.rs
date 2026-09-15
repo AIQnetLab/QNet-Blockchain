@@ -202,20 +202,24 @@ impl PyTransaction {
                 amount,
             },
             data: None,
+            public_key: None,
+            dilithium_signature: None,
+            dilithium_public_key: None,
+            chain_id: crate::transaction::QNET_CHAIN_ID,
         };
         tx.hash = tx.calculate_hash();
         Self { inner: tx }
     }
-    
+
     /// Create node activation transaction
     #[staticmethod]
     fn node_activation(from: String, node_type: String, amount: u64, nonce: u64, gas_price: u64, gas_limit: u64) -> Self {
         // Parse node_type string to enum
+        // v3.18: Full nodes removed
         let node_type_enum = match node_type.to_lowercase().as_str() {
             "light" => NodeType::Light,
-            "full" => NodeType::Full,
             "super" => NodeType::Super,
-            _ => NodeType::Light, // Default to Light
+            _ => NodeType::Light, // Default to Light (ignore "full")
         };
         
         // Determine phase: Phase1 if amount == 0 (1DEV burn), Phase2 if amount > 0 (QNC transfer)
@@ -241,6 +245,10 @@ impl PyTransaction {
                 phase,
             },
             data: Some(serde_json::json!({ "node_type": node_type }).to_string()),
+            public_key: None,
+            dilithium_signature: None,
+            dilithium_public_key: None,
+            chain_id: crate::transaction::QNET_CHAIN_ID,
         };
         tx.hash = tx.calculate_hash();
         Self { inner: tx }
@@ -289,6 +297,9 @@ impl PyTransaction {
             TransactionType::ContractDeploy => "contract_deploy".to_string(),
             TransactionType::ContractCall => "contract_call".to_string(),
             TransactionType::RewardDistribution => "reward_distribution".to_string(),
+            TransactionType::NodeRegistration { .. } => "node_registration".to_string(),
+            TransactionType::NodeReactivation { .. } => "node_reactivation".to_string(),
+            _ => "other".to_string(),
         }
     }
     

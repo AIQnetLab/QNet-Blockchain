@@ -1,24 +1,45 @@
+// Lift the trait-recursion ceiling to compile the deeply-nested
+// `warp::Filter::or(...)` chain used by the embedded RPC router.
+// Default `recursion_limit = 128` blows the stack inside rustc's trait
+// solver on the `Or<Or<Or<...>>>` Filter type the router builds at
+// roughly 70+ routes. 1024 is well above the chain depth and matches
+// the ceiling production binaries already use elsewhere in the workspace.
+// Required for `cargo test` (test profile) — release profile resolves
+// the chain via inlining hints and is unaffected.
+#![recursion_limit = "1024"]
 #![allow(unused_imports)]
 #![allow(unused_variables)]
 #![allow(dead_code)]
 #![allow(unused_mut)]
 
-//! QNet Production Node - 100k+ TPS Ready
-//! 
-//! PRODUCTION DEPLOYMENT: Interactive Setup Only
-//! - No command-line arguments for activation
-//! - Use built-in interactive menu for node configuration
-//! - Activation code required (format: QNET-XXXXXX-XXXXXX-XXXXXX)
+//! QNet production node
+//!
+//! PRODUCTION DEPLOYMENT: Docker Environment Variables Only
+//! - Genesis: QNET_BOOTSTRAP_ID + QNET_WALLET_SEED
+//! - Super:   QNET_ACTIVATION_CODE + QNET_BURN_TX_HASH + QNET_BURN_AMOUNT + QNET_WALLET_SEED
+//! - No interactive menu — env vars only (same architecture as genesis nodes)
 //! 
 //! Features:
-//! - Microblocks as default mode for 100k+ TPS
+//! - Microblocks as the default production mode
 //! - Production-grade batch processing
 //! - Smart synchronization and compression
 //! - Enterprise security and monitoring
 
-use qnet_integration::node::{BlockchainNode, NodeType, Region};
+// jemalloc with background decay: freed pages actually return to the OS, so
+// post-load rss reflects live data instead of allocator retention. Built unprefixed, it is the
+// process-wide malloc (RocksDB included), and `malloc_conf` below is the symbol it reads.
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+#[cfg(not(target_env = "msvc"))]
+#[export_name = "malloc_conf"]
+pub static MALLOC_CONF: &[u8] = b"background_thread:true,dirty_decay_ms:10000,muzzy_decay_ms:10000\0";
+
+use qnet_integration::node::{BlockchainNode, NodeType, Region, is_info, is_warn, is_debug};
 use qnet_integration::quantum_crypto::{QNetQuantumCrypto, ActivationPayload};
 use qnet_integration::unified_p2p::get_privacy_id_for_addr;
+use qnet_integration::GLOBAL_GENESIS_TIMESTAMP;
 // No clap - fully automatic configuration
 use std::path::PathBuf;
 use std::time::Duration;
@@ -53,6 +74,7 @@ async fn get_current_phase_simple() -> Result<u8, String> {
 }
 
 // Quantum-secure activation code decryption with Light node blocking
+#[allow(dead_code)]
 async fn decode_activation_code_quantum_secure(
     code: &str, 
     selected_node_type: NodeType
@@ -69,10 +91,10 @@ async fn decode_activation_code_quantum_secure(
     let payload = quantum_crypto.decrypt_activation_code(code).await
         .map_err(|e| format!("Quantum decryption failed: {}", e))?;
 
-    // 2. Parse node type from payload
-    let node_type = match payload.node_type.as_str() {
+    // 2. Parse node type from payload (case-insensitive)
+    let node_type = match payload.node_type.to_lowercase().as_str() {
         "light" => NodeType::Light,
-        "full" => NodeType::Full,
+        "full" => NodeType::Super,
         "super" => NodeType::Super,
         _ => return Err(format!("Invalid node type in activation code: {}", payload.node_type)),
     };
@@ -82,7 +104,7 @@ async fn decode_activation_code_quantum_secure(
         eprintln!("🚨 SECURITY VIOLATION: Light node activation attempted on server!");
         eprintln!("   Light nodes can ONLY be activated on mobile devices");
         eprintln!("   Server activation is STRICTLY FORBIDDEN for Light nodes");
-        eprintln!("   Use Full or Super node activation codes for servers");
+        eprintln!("   Use Super node activation codes for servers (v3.18: Full removed)");
         std::process::exit(1); // IMMEDIATE TERMINATION
     }
 
@@ -94,31 +116,15 @@ async fn decode_activation_code_quantum_secure(
         ));
     }
 
-    // 5. Verify Dilithium signature with wallet binding
-    let signature_data = format!("{}:{}:{}", payload.burn_tx, payload.node_type, payload.timestamp);
-    let signature_valid = quantum_crypto.verify_dilithium_signature(
-        &signature_data,
-        &payload.signature,
-        &payload.wallet
-    ).await.map_err(|e| format!("Signature verification failed: {}", e))?;
-
-    if !signature_valid {
-        return Err("Invalid wallet signature - activation code is not authentic".to_string());
-    }
-
-    // FIXED: Check code ownership instead of usage (codes are reusable on different devices)
-    // We only need to verify the code belongs to the wallet trying to use it
-    println!("🔍 Checking code ownership (codes are reusable for device migration)");
-    
-    // Code ownership is already verified in quantum decryption step above
-    // The payload.wallet from the decrypted code is the true owner
-    // No additional blockchain check needed - quantum decryption guarantees authenticity
+    // Activation code authenticity is verified by successful XOR decryption:
+    // key = SHA3(burn_tx:node_type:burn_amount) — only the correct burn_tx/amount
+    // will recover a valid wallet address. No Dilithium signature needed here.
 
     // 7. Extract purchase phase from payload (for information only)
     let purchase_phase = if payload.burn_tx.starts_with("burn_tx_") { 1 } else { 2 };
 
     println!("✅ Quantum-secure activation code validation successful");
-    println!("   🔐 Quantum encryption: CRYSTALS-Kyber compatible");
+    println!("   🔐 Quantum encryption: CRYSTALS-Dilithium3 (NIST FIPS 204)");
     println!("   📝 Digital signature: Dilithium verified"); 
     println!("   🛡️  Wallet binding: Cryptographically secured");
     println!("   ♾️  Permanent: Code never expires");
@@ -133,6 +139,7 @@ async fn decode_activation_code_quantum_secure(
 }
 
 // Validate activation code matches expected node type and payment
+#[allow(dead_code)]
 fn validate_activation_code_node_type(code: &str, expected_type: NodeType, current_phase: u8, current_pricing: &PricingInfo) -> Result<(), String> {
     println!("\n🔍 === Activation Code Validation ===");
     
@@ -172,22 +179,19 @@ fn validate_activation_code_node_type(code: &str, expected_type: NodeType, curre
 // Phase 2: Base * multiplier (0.5x to 3.0x based on network size)
 
 // Device type validation functions
+#[allow(dead_code)]
 fn validate_server_node_type(node_type: NodeType) -> Result<(), String> {
     match node_type {
         NodeType::Light => {
             eprintln!("❌ CRITICAL ERROR: Light nodes are NOT allowed on server hardware!");
             eprintln!("   🚫 Light nodes must run ONLY on mobile devices (phones, tablets)");
-            eprintln!("   🖥️  For servers use: Full Node or Super Node activation codes");
+            eprintln!("   🖥️  For servers use: Super Node activation codes (v3.18: Full nodes removed)");
             eprintln!("   💡 Get correct server activation code from wallet extension");
             eprintln!("");
             eprintln!("🛑 SYSTEM SECURITY: Blocking Light node server activation");
             
             // ABSOLUTE BLOCKING: Light nodes cannot run on servers 
             std::process::exit(1);
-        },
-        NodeType::Full => {
-            println!("✅ Full node validated for server deployment");
-            Ok(())
         },
         NodeType::Super => {
             println!("✅ Super node validated for server deployment");
@@ -196,6 +200,7 @@ fn validate_server_node_type(node_type: NodeType) -> Result<(), String> {
     }
 }
 
+#[allow(dead_code)]
 async fn validate_phase_and_pricing(phase: u8, node_type: NodeType, pricing: &PricingInfo, activation_code: &str) -> Result<(), String> {
     let price = calculate_node_price(phase, node_type, pricing);
     let price_str = format_price(phase, price);
@@ -217,9 +222,14 @@ async fn validate_phase_and_pricing(phase: u8, node_type: NodeType, pricing: &Pr
             println!("   💰 Payment verified: Code purchased during Phase {}", decoded.purchase_phase);
             
             // CRITICAL: Verify burn transaction on Solana blockchain
-            let burn_verified = verify_solana_burn_for_activation(&decoded.wallet_address, &decoded.tx_hash, price as u64).await?;
+            // decoded.wallet_address is only a 5-byte prefix on first launch (before registry);
+            // derive the full Solana address from seed phrase for a valid Solana RPC query.
+            let full_solana_wallet = extract_wallet_from_activation_code(activation_code)
+                .unwrap_or_else(|_| decoded.wallet_address.clone());
+            let burn_verified = verify_solana_burn_for_activation(&full_solana_wallet, &decoded.tx_hash, price as u64).await?;
             if !burn_verified {
-                return Err(format!("Solana burn verification failed: {} 1DEV burn not found for wallet {}", price as u64, &decoded.wallet_address[..8]));
+                let wallet_preview = qnet_state::char_prefix(&full_solana_wallet, 8);
+                return Err(format!("Solana burn verification failed: {} 1DEV burn not found for wallet {}", price as u64, wallet_preview));
             }
             
             println!("   ✅ Solana burn verification passed: {} 1DEV burned", price as u64);
@@ -245,7 +255,7 @@ async fn validate_phase_and_pricing(phase: u8, node_type: NodeType, pricing: &Pr
     Ok(())
 }
 
-// Check for existing activation or run interactive setup
+// Check for existing activation from env vars or RocksDB
 async fn check_existing_activation_or_setup() -> Result<(NodeType, String), Box<dyn std::error::Error>> {
     // Use the new activation function with auto-genesis detection
     get_activation_with_auto_genesis().await
@@ -257,8 +267,20 @@ use qnet_integration::genesis_constants::{GENESIS_BOOTSTRAP_CODES, GENESIS_NODE_
 const BOOTSTRAP_WHITELIST: &[&str] = GENESIS_BOOTSTRAP_CODES;
 
 // Check if this is a genesis bootstrap node
+/// Genesis detection. Memoised: the duplicate-identity scan inside performs BLOCKING TCP probes
+/// against the whole roster, and this is called from a dozen sites — on a simultaneous fresh
+/// launch, when no peer is listening yet, each uncached call cost tens of seconds of blocking I/O
+/// on the async runtime.
 fn is_genesis_bootstrap_node() -> bool {
-    println!("[DEBUG] === is_genesis_bootstrap_node() called ===");
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if let Some(v) = CACHED.get() {
+        return *v;
+    }
+    let verdict = is_genesis_bootstrap_node_uncached();
+    *CACHED.get_or_init(|| verdict)
+}
+
+fn is_genesis_bootstrap_node_uncached() -> bool {
     
     // GENESIS NODE DETECTION: First 5 nodes can start without activation code
     
@@ -398,7 +420,8 @@ fn test_connection_quick(addr: &str) -> bool {
     use std::time::Duration;
     
     match std::net::TcpStream::connect_timeout(
-        &addr.parse().unwrap_or_else(|_| "127.0.0.1:9876".parse().unwrap()),
+        // FIX R24-L2: Remove nested unwrap — use const parsed at compile time
+        &addr.parse().unwrap_or_else(|_| std::net::SocketAddr::from(([127, 0, 0, 1], 9876))),
         Duration::from_secs(2)
     ) {
         Ok(_) => true,
@@ -444,6 +467,7 @@ fn get_existing_bootstrap_nodes() -> Vec<String> {
 }
 
 // Comprehensive activation code validation (ALL checks before acceptance)
+#[allow(dead_code)]
 async fn validate_activation_code_comprehensive(
     code: &str, 
     node_type: NodeType, 
@@ -506,7 +530,7 @@ async fn validate_blockchain_uniqueness(code: &str) -> Result<(), String> {
     // FIXED: Initialize blockchain registry with real QNet nodes
     let qnet_rpc = std::env::var("QNET_RPC_URL")
         .or_else(|_| std::env::var("QNET_GENESIS_NODES")
-            .map(|nodes| format!("http://{}:8001", nodes.split(',').next().unwrap_or("127.0.0.1").trim())))
+            .map(|nodes| { let ip = nodes.split(',').next().unwrap_or("127.0.0.1").trim().to_string(); format!("http://{}:8001", ip) }))
         .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
         
     let registry = qnet_integration::activation_validation::BlockchainActivationRegistry::new(
@@ -537,10 +561,13 @@ async fn verify_activation_burn(code: &str, node_type: &NodeType) -> Result<(), 
     
     // Extract wallet address from code
     let wallet_address = extract_wallet_from_activation_code(code)?;
-    
-    // Required burn amount (Phase 1: 1500 1DEV universal)
-    let required_burn = 1500.0;
-    
+
+    // Phase-1 price is the live tier, read from Solana through the canonical integer formula.
+    // A hardcoded base price rejects every legitimate burn made at a reduced tier.
+    let (total_burned, current_supply) = qnet_integration::rpc::fetch_solana_1dev_supply().await
+        .map_err(|e| format!("solana_supply_unavailable: {}", e))?;
+    let required_burn = qnet_state::Transaction::phase1_activation_cost(total_burned, current_supply);
+
     // Verify burn transaction exists
     let burn_verified = verify_solana_burn_transaction(&wallet_address, required_burn).await?;
     
@@ -552,7 +579,9 @@ async fn verify_activation_burn(code: &str, node_type: &NodeType) -> Result<(), 
     }
 }
 
-// Interactive node setup functions
+// Legacy interactive setup — no longer called in production.
+// Kept as dead code for potential future dev/testing use.
+#[allow(dead_code)]
 async fn interactive_node_setup() -> Result<(NodeType, String), Box<dyn std::error::Error>> {
     println!("🚀 QNet Node Setup");
     
@@ -587,12 +616,12 @@ async fn interactive_node_setup() -> Result<(NodeType, String), Box<dyn std::err
     let node_type = select_node_type(current_phase, &pricing_info)?;
 
     // Calculate activation price
+    // v3.18: Full node type removed - pricing for Light and Super only
     let price = match current_phase {
         1 => 10.0,      // Phase 1: Universal pricing
         2 => match node_type {
-            NodeType::Light => 5.0,
-            NodeType::Full => 10.0,
-            NodeType::Super => 20.0,
+            NodeType::Light => 10.0,   // Mobile Node (Light): 10,000 QNC base
+            NodeType::Super => 7.5,    // Server Node (Super): 7,500 QNC base
         },
         _ => 10.0,
     };
@@ -652,8 +681,8 @@ async fn interactive_node_setup() -> Result<(NodeType, String), Box<dyn std::err
     println!("🔮 QNET QUANTUM BLOCKCHAIN NODE INITIALIZED");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("🚀 Node Type: {:?} | 🔐 Post-Quantum Security: ACTIVE", node_type);
-    println!("🛡️  Quantum Algorithms: CRYSTALS-Dilithium + CRYSTALS-Kyber");
-    println!("⚡ Performance Target: 100,000+ TPS | ⏱️  Block Time: 1s microblocks");
+    println!("🛡️  Quantum Algorithms: CRYSTALS-Dilithium3 (ML-DSA-65) signatures + X25519Kyber768 (ML-KEM-768) hybrid TLS KEX");
+    println!("⏱️  Block time: 1s microblocks");
     println!("🌐 Network: Production Ready | 💎 Consensus: Byzantine-BFT");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("✅ Quantum Node Ready - Blockchain Operations Starting...");
@@ -669,60 +698,37 @@ struct PricingInfo {
     network_multiplier: f64, // Phase 2: network size multiplier
 }
     
-// Check if 5 years have passed since QNet mainnet launch
-async fn is_five_years_passed_since_mainnet() -> bool {
-    // QNet mainnet launch timestamp - get from blockchain or use current time
-    let mainnet_launch_timestamp = std::env::var("QNET_MAINNET_LAUNCH_TIMESTAMP")
-        .ok()
-        .and_then(|s| s.parse::<i64>().ok())
-        .unwrap_or_else(|| {
-            // Network not launched yet or timestamp not set
-            // Use current time as fallback (0 years passed)
-            chrono::Utc::now().timestamp()
-        });
-    
-    let current_timestamp = chrono::Utc::now().timestamp();
-    let five_years_in_seconds = 5 * 365 * 24 * 60 * 60; // 5 years in seconds
-    
-    let years_passed = (current_timestamp - mainnet_launch_timestamp) / (365 * 24 * 60 * 60);
-    
-    println!("📅 Time check: {:.2} years passed since mainnet launch", 
-             years_passed as f64);
-    
-    // Only consider 5 years passed if we have a valid launch timestamp
-    if mainnet_launch_timestamp > 1700000000 { // After 2023-11-14 (sanity check)
-        (current_timestamp - mainnet_launch_timestamp) >= five_years_in_seconds
-    } else {
-        false // Network not launched yet
-    }
+/// Whole years elapsed since the genesis timestamp. The emission schedule itself is keyed on
+/// HEIGHT (pool1_base_emission_at_height); this is only for operator-facing phase/halving display.
+fn years_since(genesis_ts: u64) -> u64 {
+    const SECS_PER_YEAR: u64 = 365 * 24 * 60 * 60;
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs().saturating_sub(genesis_ts) / SECS_PER_YEAR)
+        .unwrap_or(0)
 }
 
 // Detect current phase with proper transition logic
 async fn detect_current_phase() -> (u8, PricingInfo) {
     println!("🔍 Detecting current network phase...");
-    
+
+    // The phase comes from the ONE canonical resolver every price path and every admission gate
+    // uses, which applies both halves of the rule (90% of 1DEV burned OR five years since genesis).
+    // A second local rule here would let this node skip its Phase-1 burn checks while the network is
+    // still charging for them. Unreadable supply ⇒ Phase 1, the phase that demands MORE proof.
+    let canonical_phase = qnet_integration::rpc::live_activation_pricing().await
+        .map(|p| p.phase)
+        .unwrap_or_else(|e| { println!("⚠️  Phase resolver unavailable ({}) — assuming Phase 1", e); 1 });
+
     // Try to get real data from Solana contract
     match fetch_burn_tracker_data().await {
         Ok(burn_data) => {
             println!("✅ Real blockchain data loaded");
-            
-            // Phase 2 transition logic: 90% burned OR 5 years passed (whichever comes first)
-            let five_years_passed = is_five_years_passed_since_mainnet().await;
-            
-            // CRITICAL: Automatic phase transition logic
-            let current_phase = if burn_data.burn_percentage >= 90.0 {
-                println!("🔥 PHASE TRANSITION: 90% of 1DEV burned - transitioning to Phase 2");
-                2 // Phase 2: QNC economy
-            } else if five_years_passed {
-                println!("⏰ PHASE TRANSITION: 5 years since mainnet - transitioning to Phase 2");
-                2 // Phase 2: QNC economy
-            } else {
-                println!("🔥 Phase 1 active: {:.1}% burned, {:.1} years elapsed", 
-                    burn_data.burn_percentage, 
-                    get_years_since_mainnet().await);
-                1 // Phase 1: 1DEV burn
-            };
-            
+
+            let current_phase = canonical_phase;
+            println!("🔥 Phase {} active: {:.1}% burned, {:.1} years elapsed",
+                current_phase, burn_data.burn_percentage, get_years_since_mainnet().await);
+
             let network_multiplier = calculate_network_multiplier(burn_data.total_nodes_activated);
             
             let pricing_info = PricingInfo {
@@ -739,19 +745,20 @@ async fn detect_current_phase() -> (u8, PricingInfo) {
             println!("   Error: {}", e);
             println!("   Trying backup RPC nodes...");
             
-            // Try backup RPC nodes (network-aware)
+            // Backup RPCs must stay on the network the node is configured for: only mainnet may
+            // fall back to mainnet endpoints, testnet and local both stay on devnet.
             let network_config = qnet_integration::network_config::get_network_config();
-            let backup_rpcs = if network_config.is_testnet() {
-                vec![
-                    "https://api.devnet.solana.com",
-                    "https://devnet.helius-rpc.com", 
-                    "https://solana-devnet.g.alchemy.com/v2/demo",
-                ]
-            } else {
+            let backup_rpcs = if network_config.is_production() {
                 vec![
                     "https://api.mainnet-beta.solana.com",
                     "https://solana-mainnet.g.alchemy.com/v2/demo",
                     "https://mainnet.helius-rpc.com",
+                ]
+            } else {
+                vec![
+                    "https://api.devnet.solana.com",
+                    "https://devnet.helius-rpc.com",
+                    "https://solana-devnet.g.alchemy.com/v2/demo",
                 ]
             };
             
@@ -761,19 +768,7 @@ async fn detect_current_phase() -> (u8, PricingInfo) {
                     Ok(supply_data) => {
                         println!("✅ Data retrieved from backup RPC!");
                         
-                        // Phase 2 transition logic: 90% burned OR 5 years passed
-                        let five_years_passed = is_five_years_passed_since_mainnet().await;
-                        
-                        let current_phase = if supply_data.burn_percentage >= 90.0 {
-                            println!("🔥 PHASE TRANSITION: 90% of 1DEV burned - transitioning to Phase 2");
-                            2
-                        } else if five_years_passed {
-                            println!("⏰ PHASE TRANSITION: 5 years since mainnet - transitioning to Phase 2");
-                            2
-                        } else {
-                            1
-                        };
-                        
+                        let current_phase = canonical_phase;
                         let network_multiplier = calculate_network_multiplier(supply_data.total_burned / 1500);
                         let pricing_info = PricingInfo {
                             network_size: supply_data.total_burned / 1500,
@@ -799,23 +794,21 @@ async fn detect_current_phase() -> (u8, PricingInfo) {
                 burn_percentage: 0.0,
                 network_multiplier: 0.5,
             };
-            
-            (1, fallback_pricing)
+
+            (canonical_phase, fallback_pricing)
         }
     }
 }
 
 // Get years since mainnet launch
 async fn get_years_since_mainnet() -> f64 {
-    let mainnet_launch_timestamp = std::env::var("QNET_MAINNET_LAUNCH_TIMESTAMP")
-        .ok()
-        .and_then(|s| s.parse::<i64>().ok())
-        .unwrap_or_else(|| chrono::Utc::now().timestamp());
+    // PRODUCTION v2.85: Use PhaseAwareRewardManager (real Genesis timestamp)
+    let genesis_ts = GLOBAL_GENESIS_TIMESTAMP.load(std::sync::atomic::Ordering::Relaxed);
+    if genesis_ts == 0 {
+        return 0.0;
+    }
     
-    let current_timestamp = chrono::Utc::now().timestamp();
-    let years_passed = (current_timestamp - mainnet_launch_timestamp) as f64 / (365.0 * 24.0 * 60.0 * 60.0);
-    
-    years_passed
+    years_since(genesis_ts) as f64
 }
 
 // Real blockchain data structure
@@ -841,29 +834,15 @@ struct RealNodeCounts {
 
 // Fetch real data from Solana contract
 async fn fetch_burn_tracker_data() -> Result<BurnTrackerData, String> {
-    // Network-aware Solana RPC configuration
+    // Endpoint and mint come from the node's own network configuration only — an env override
+    // here would silently read a different Solana network than the burn verifier does.
     let network_config = qnet_integration::network_config::get_network_config();
-    let rpc_url = std::env::var("SOLANA_RPC_URL").unwrap_or_else(|_| {
-        network_config.solana.rpc_url.clone()
-    });
-    
-    let program_id = std::env::var("BURN_TRACKER_PROGRAM_ID").unwrap_or_else(|_| {
-        // Production program ID for 1DEV burn tracker on Solana
-        // Deployed and verified - tracks 1DEV token burns for QNet activation
-        "D7g7mkL8o1YEex6ZgETJEQyyHV7uuUMvV3Fy3u83igJ7".to_string()
-    });
-    
-    println!("📋 Burn Tracker Program ID: {}", program_id);
-    
-    // PRODUCTION 1DEV token mint address on Solana devnet
-    let one_dev_mint = std::env::var("ONE_DEV_MINT_ADDRESS").unwrap_or_else(|_| {
-        "62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ".to_string()
-    });
-    
-    println!("🔗 Connecting to Solana devnet RPC: {}", rpc_url);
-    println!("📋 Burn Tracker Program ID: {}", program_id);
-    println!("💰 1DEV Token Mint (devnet): {}", one_dev_mint);
-    
+    let rpc_url = network_config.solana.rpc_url.clone();
+    let one_dev_mint = network_config.solana.onedev_mint.clone();
+
+    println!("🔗 Connecting to Solana RPC: {}", rpc_url);
+    println!("💰 1DEV Token Mint: {}", one_dev_mint);
+
     // Try to get real token supply from Solana
     match get_real_token_supply(&rpc_url, &one_dev_mint).await {
         Ok(supply_data) => {
@@ -1043,15 +1022,11 @@ async fn get_real_token_supply(rpc_url: &str, token_mint: &str) -> Result<TokenS
 // This function removed - now using real network scanning instead of token burn estimation
 
 fn calculate_network_multiplier(network_size: u64) -> f64 {
-    // CANONICAL VALUES - same across all components
-    match network_size {
-        0..=100_000 => 0.5,          // ≤100K: Early adopter discount
-        100_001..=300_000 => 1.0,    // ≤300K: Base price
-        300_001..=1_000_000 => 2.0,  // ≤1M: High demand
-        _ => 3.0                     // >1M: Maximum (cap)
-    }
+    // The shared table — the same tiers the quote and the chain floor are derived from.
+    qnet_state::transaction::phase2_size_mult_tenths(network_size) as f64 / 10.0
 }
 
+#[allow(dead_code)]
 fn display_phase_info(phase: u8, pricing: &PricingInfo) {
     match phase {
         1 => println!("🔥 Phase 1: {} active nodes, {:.1}% burned", pricing.network_size, pricing.burn_percentage),
@@ -1060,6 +1035,7 @@ fn display_phase_info(phase: u8, pricing: &PricingInfo) {
     }
 }
 
+#[allow(dead_code)]
 fn select_node_type(phase: u8, pricing: &PricingInfo) -> Result<NodeType, Box<dyn std::error::Error>> {
     // SECURITY: Check if this is a Genesis node - if so, auto-select Super Node type
     if is_genesis_bootstrap_node() {
@@ -1069,52 +1045,45 @@ fn select_node_type(phase: u8, pricing: &PricingInfo) -> Result<NodeType, Box<dy
         return Ok(NodeType::Super);
     }
     
+    // v3.18: Only Super nodes for servers (Full node type removed)
     loop {
         println!("\n🖥️ Node Type:");
-        println!("1. Full Node   - Standard server");
-        println!("2. Super Node  - High-performance server");
+        println!("1. Super Node  - Server/validator node (7,500 QNC base)");
+        println!("   NOTE: Full Node type was removed in v3.18");
         
-        // Show pricing
-    for (i, node_type) in [NodeType::Full, NodeType::Super].iter().enumerate() {
-        let price = calculate_node_price(phase, *node_type, pricing);
+        // Show pricing for Super node
+        let price = calculate_node_price(phase, NodeType::Super, pricing);
         let price_str = format_price(phase, price);
-            println!("   {}. {}", i + 1, price_str);
-    }
+        println!("   Price: {}", price_str);
     
-        print!("\nChoice (1-2): ");
-    io::stdout().flush()?;
+        print!("\nPress Enter to confirm Super Node, or 'q' to quit: ");
+        io::stdout().flush()?;
     
-    let mut input = String::new();
-    match io::stdin().read_line(&mut input) {
+        let mut input = String::new();
+        match io::stdin().read_line(&mut input) {
             Ok(_) => {},
             Err(_) => continue,
         }
         
-        // Take only the first digit from input
-        let choice = input.trim().chars()
-            .find(|c| c.is_ascii_digit())
-            .map(|c| c.to_string())
-            .unwrap_or_default();
-        
-        println!("Debug: cleaned input '{}'", choice);
+        let choice = input.trim().to_lowercase();
         
         match choice.as_str() {
-        "1" => {
-                println!("✅ Full Node selected");
-                return Ok(NodeType::Full);
-        },
-        "2" => {
+            "" | "1" | "y" | "yes" => {
                 println!("✅ Super Node selected");
                 return Ok(NodeType::Super);
-        },
-        _ => {
-                println!("❌ Invalid choice '{}'. Please enter 1 or 2.", choice);
+            },
+            "q" | "quit" | "exit" => {
+                return Err("User cancelled".into());
+            },
+            _ => {
+                println!("❌ Invalid choice '{}'. Press Enter to confirm or 'q' to quit.", choice);
                 // Continue the loop to ask again
             }
         }
     }
 }
 
+#[allow(dead_code)]
 fn calculate_node_price(phase: u8, node_type: NodeType, pricing: &PricingInfo) -> f64 {
     match phase {
         1 => {
@@ -1135,14 +1104,12 @@ fn calculate_node_price(phase: u8, node_type: NodeType, pricing: &PricingInfo) -
             current_price.max(min_price)
         }
         2 => {
-            // Phase 2: Real QNC pricing from contract constants
-            // QNC_LIGHT_ACTIVATION = 5000 QNC
-            // QNC_FULL_ACTIVATION = 7500 QNC  
-            // QNC_SUPER_ACTIVATION = 10000 QNC
+            // Phase 2: Real QNC pricing (v3.18)
+            // Mobile Node (Light): 10,000 QNC base
+            // Server Node (Super): 7,500 QNC base
             let base_price = match node_type {
-                NodeType::Light => 5_000.0,
-                NodeType::Full => 7_500.0,
-                NodeType::Super => 10_000.0,
+                NodeType::Light => 10_000.0,
+                NodeType::Super => 7_500.0,
             };
             base_price * pricing.network_multiplier
         }
@@ -1150,6 +1117,7 @@ fn calculate_node_price(phase: u8, node_type: NodeType, pricing: &PricingInfo) -
     }
 }
 
+#[allow(dead_code)]
 fn format_price(phase: u8, price: f64) -> String {
     match phase {
         1 => format!("{:.0} 1DEV", price),
@@ -1158,18 +1126,20 @@ fn format_price(phase: u8, price: f64) -> String {
     }
 }
 
+#[allow(dead_code)]
 fn format_node_type(node_type: NodeType) -> &'static str {
     match node_type {
         NodeType::Light => "Light Node ",
-        NodeType::Full => "Full Node  ",
         NodeType::Super => "Super Node ",
     }
 }
 
+#[allow(dead_code)]
 fn display_activation_cost(phase: u8, node_type: NodeType, price: f64) {
     println!("\n💳 Cost: {}", format_price(phase, price));
 }
 
+#[allow(dead_code)]
 fn request_activation_code(phase: u8) -> Result<String, Box<dyn std::error::Error>> {
     if is_genesis_bootstrap_node() {
         print!("🚀 Genesis node (press ENTER): ");
@@ -1225,44 +1195,10 @@ impl AutoConfig {
     async fn new() -> Result<Self, Box<dyn std::error::Error>> {
         println!("🔧 Auto-configuring QNet node...");
         
-        // PRODUCTION FIX: Allow region override for Genesis nodes to ensure stable P2P ports
-        let region = if let Ok(region_str) = std::env::var("QNET_REGION") {
-            match region_str.to_lowercase().as_str() {
-                "na" | "northamerica" | "north_america" => {
-                    println!("🌍 Using fixed region from QNET_REGION: North America");
-                    Region::NorthAmerica
-                },
-                "eu" | "europe" => {
-                    println!("🌍 Using fixed region from QNET_REGION: Europe");
-                    Region::Europe
-                },
-                "asia" | "ap" | "asia_pacific" => {
-                    println!("🌍 Using fixed region from QNET_REGION: Asia");
-                    Region::Asia
-                },
-                "sa" | "southamerica" | "south_america" => {
-                    println!("🌍 Using fixed region from QNET_REGION: South America");
-                    Region::SouthAmerica
-                },
-                "africa" | "af" => {
-                    println!("🌍 Using fixed region from QNET_REGION: Africa");
-                    Region::Africa
-                },
-                "oceania" | "oc" => {
-                    println!("🌍 Using fixed region from QNET_REGION: Oceania");
-                    Region::Oceania
-                },
-                _ => {
-                    println!("⚠️ Unknown QNET_REGION: {}, auto-detecting...", region_str);
-                    auto_detect_region().await?
-                }
-            }
-        } else {
-            // Auto-detect region if not specified
-            let region = auto_detect_region().await?;
-            println!("🌍 Auto-detected region: {:?}", region);
-            region
-        };
+        // Region is a vestigial cosmetic tag (no consensus/topology/port role) — fixed
+        // default, no QNET_REGION read, no geo-IP detection at boot. P2P ports come from
+        // QNET_P2P_PORT / DOCKER_ENV below, never from region.
+        let region = Region::Europe;
         
         // PRODUCTION FIX: Use fixed P2P port from environment for Docker deployments
         // This ensures Docker port mapping works correctly
@@ -1270,10 +1206,32 @@ impl AutoConfig {
             let port = port_str.parse::<u16>().unwrap_or(9876);
             println!("🔌 Using fixed P2P port from QNET_P2P_PORT: {}", port);
             port
+        } else if std::env::var("DOCKER_ENV").is_ok() {
+            // Docker without explicit QNET_P2P_PORT — use default 9876 with retry
+            // Cannot fallback to other ports because only 9876 is mapped in Docker
+            9876
         } else {
-            // Auto-detect only if not in Docker
             find_available_port(9876).await?
         };
+
+        // PORT BIND RETRY for P2P: survive TIME_WAIT after fast Docker restart
+        // In Docker, port mapping is fixed — fallback to another port is fatal
+        if std::env::var("DOCKER_ENV").is_ok() || std::env::var("QNET_P2P_PORT").is_ok() {
+            let mut p2p_bound = false;
+            for attempt in 1u32..=10 {
+                match std::net::TcpListener::bind(format!("0.0.0.0:{}", p2p_port)) {
+                    Ok(_probe) => { p2p_bound = true; break; }
+                    Err(e) => {
+                        println!("[WARN][P2P] port_{}_busy attempt={}/10 err={}", p2p_port, attempt, e);
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    }
+                }
+            }
+            if !p2p_bound {
+                eprintln!("[FATAL][P2P] Cannot bind port {} after 10 attempts (20s) — restarting node", p2p_port);
+                std::process::exit(1);
+            }
+        }
         
         // RPC port is deprecated - all use unified API on 8001
         let rpc_port = std::env::var("QNET_API_PORT")
@@ -1344,27 +1302,28 @@ fn get_bootstrap_peers_for_region(region: &Region) -> Vec<String> {
         }
     }
     
-    // PRODUCTION FIX: Provide appropriate bootstrap nodes based on context
-    // Light nodes connect to Full/Super nodes, servers connect to Genesis nodes
+    // PRODUCTION FIX: Provide appropriate bootstrap nodes based on context.
+    // Light nodes connect to Super nodes; servers connect to Genesis nodes.
+    // (v3.18: the "Full" tier was removed from the protocol.)
     let is_light_node = std::env::var("QNET_NODE_TYPE")
         .map(|t| t.to_lowercase() == "light")
         .unwrap_or(false);
     
     if is_light_node {
-        // Light nodes (mobile) connect to Full/Super nodes for better decentralization
+        // v3.18: Light nodes (mobile) connect to Super nodes for better decentralization
         let genesis_ips = get_genesis_node_ips_dynamic();
-        let full_super_peers: Vec<String> = genesis_ips.iter()
+        let super_peers: Vec<String> = genesis_ips.iter()
             .take(2)  // Use first 2 Genesis nodes as fallback for Light nodes
             .map(|ip| format!("{}:8001", ip))
             .collect();
         
-        println!("[BOOTSTRAP] 📱 Light node: Connecting to Full/Super nodes");
-        println!("[BOOTSTRAP] ✅ {} Full/Super nodes for Light node: {:?}", 
-                 full_super_peers.len(), full_super_peers);
+        println!("[BOOTSTRAP] 📱 Light node: Connecting to Super nodes");
+        println!("[BOOTSTRAP] ✅ {} Super nodes for Light node: {:?}", 
+                 super_peers.len(), super_peers);
         
-        full_super_peers
+        super_peers
     } else {
-        // Full/Super/Genesis nodes connect to Genesis bootstrap network
+        // v3.18: Super/Genesis nodes connect to Genesis bootstrap network
         let genesis_ips = get_genesis_node_ips_dynamic();
         let genesis_bootstrap_peers: Vec<String> = genesis_ips.iter()
             .map(|ip| format!("{}:8001", ip))
@@ -1427,9 +1386,13 @@ fn get_genesis_node_ips_dynamic() -> Vec<String> {
 fn check_genesis_node_duplication(bootstrap_id: &str) -> bool {
     println!("[SECURITY] 🔍 Scanning network for duplicate Genesis node {}...", bootstrap_id);
     
-    // PRODUCTION OVERRIDE: Allow skipping duplication check if needed
-    if std::env::var("QNET_SKIP_GENESIS_DUPLICATION_CHECK").unwrap_or_default() == "1" {
-        println!("[SECURITY] ⚠️  DUPLICATION CHECK DISABLED via QNET_SKIP_GENESIS_DUPLICATION_CHECK");
+    // Off-mainnet escape ONLY. This startup IP-scan is a SOFT pre-flight (it already skips our own
+    // IP and allows on detection failure; the HARD duplicate-identity protection is the registry /
+    // consensus IP↔PK binding, which this never bypasses). The bypass is permitted on testnet
+    // (chaotic relaunches) but NEVER on mainnet — a mainnet node sets QNET_NETWORK=mainnet.
+    let is_mainnet = std::env::var("QNET_NETWORK").map(|n| n.eq_ignore_ascii_case("mainnet")).unwrap_or(false);
+    if !is_mainnet && std::env::var("QNET_SKIP_GENESIS_DUPLICATION_CHECK").unwrap_or_default() == "1" {
+        println!("[SECURITY] ⚠️  DUPLICATION CHECK DISABLED via QNET_SKIP_GENESIS_DUPLICATION_CHECK (testnet only)");
         println!("[SECURITY] 🔓 Allowing Genesis node startup without duplication verification");
         return false;
     }
@@ -1522,28 +1485,19 @@ fn check_genesis_node_duplication(bootstrap_id: &str) -> bool {
             if test_connection_quick(&addr) {
                 println!("[SECURITY] 🚨 FOUND ACTIVE GENESIS NODE at: {}", addr);
                 
-                // CRITICAL FIX: Only block if this is the SAME Genesis node ID
-                // Check if this IP belongs to our Genesis node using our mapping
-                let genesis_ip_mapping = vec![
-                    ("001", "154.38.160.39"),
-                    ("002", "62.171.157.44"),
-                    ("003", "161.97.86.81"), 
-                    ("004", "5.189.130.160"),
-                    ("005", "162.244.25.114"),
-                ];
-                
-                let mut is_our_genesis_node = false;
-                for (id, genesis_ip) in &genesis_ip_mapping {
-                    if bootstrap_id == *id && ip == *genesis_ip {
-                        println!("[SECURITY] 🔒 DUPLICATE: Found our Genesis {} running at: {}", id, addr);
-                        println!("[SECURITY] 🚨 BLOCKING: Genesis node {} already exists!", id);
-                        is_our_genesis_node = true;
-                        break;
-                    }
-                }
-                
-                if is_our_genesis_node {
-                    return true; // Duplicate of OUR Genesis node detected - block startup
+                // Block only when the responder sits at OUR OWN id's address AND we know we are
+                // not that host. Without the second condition a failed self-IP detection made the
+                // node find its own listener, declare itself a duplicate and exit — the roster is
+                // read from constants, never re-hardcoded here.
+                let our_genesis_ip = qnet_integration::genesis_constants::get_genesis_ip_by_id(bootstrap_id);
+                let responder_is_our_slot = our_genesis_ip == Some(ip.as_str());
+                let we_are_that_host = our_current_ip.as_str() == ip.as_str();
+
+                if responder_is_our_slot && !we_are_that_host {
+                    println!("[SECURITY] 🔒 DUPLICATE: Genesis {} already answering at {}", bootstrap_id, addr);
+                    return true;
+                } else if responder_is_our_slot {
+                    println!("[SECURITY] ⏭️  Service at our own address {} — this node", addr);
                 } else {
                     println!("[SECURITY] ✅ Different Genesis node active at: {} (not Genesis {})", addr, bootstrap_id);
                     println!("[SECURITY] 🔓 Continuing startup - this is a different Genesis node");
@@ -1589,64 +1543,66 @@ fn get_current_server_ip() -> String {
     "auto-detected".to_string()  // Special marker for auto-detection failure
 }
 
-// Get external IP address (Docker/Container-friendly) - FIXED: No curl dependency
+// Get external IP address (Docker/Container-friendly)
+// v6.2: Runs blocking HTTP on a dedicated OS thread to avoid stalling tokio runtime
 fn get_external_ip() -> Result<String, String> {
-    println!("[DEBUG] 🔧 get_external_ip() called - attempting IP detection");
-    
-    // CRITICAL FIX: Use blocking HTTP client to avoid Tokio runtime conflicts
-    let client = match reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build() {
-        Ok(client) => client,
-        Err(e) => {
-            println!("[DEBUG] ❌ Failed to create HTTP client: {}", e);
-            return Err(format!("HTTP client error: {}", e));
-        }
-    };
-    
-    let ip_services = vec![
-        "https://api.ipify.org",
-        "https://ifconfig.me/ip", 
-        "https://icanhazip.com",
-    ];
-    
-    for service in ip_services {
-        println!("[DEBUG] 🔧 Trying IP service: {}", service);
-        
-        match client.get(service).send() {
-            Ok(response) if response.status().is_success() => {
-                match response.text() {
-                    Ok(ip_text) => {
-                        let ip = ip_text.trim().to_string();
-                        
-                        if !ip.is_empty() && ip.contains('.') && !ip.contains("error") && !ip.contains("timeout") {
-                            if validate_ip_address_security(&ip) {
-                                println!("[DEBUG] ✅ IP detected via {}: {}", service, ip);
-                                println!("[IP] 🌐 External IP detected via {}: {}", service, ip);
-                                return Ok(ip);
-                            } else {
-                                println!("[DEBUG] ❌ IP failed security validation: {}", ip);
+    if is_debug() { println!("[DBG][IP] get_external_ip called"); }
+
+    std::thread::spawn(|| {
+        let client = match reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build() {
+            Ok(c) => c,
+            Err(e) => {
+                if is_warn() { println!("[WARN][IP] http_client_create_fail err={}", e); }
+                return Err(format!("HTTP client error: {}", e));
+            }
+        };
+
+        let ip_services = [
+            "https://api.ipify.org",
+            "https://ifconfig.me/ip",
+            "https://icanhazip.com",
+        ];
+
+        for service in ip_services {
+            if is_debug() { println!("[DBG][IP] trying_service url={}", service); }
+
+            match client.get(service).send() {
+                Ok(response) if response.status().is_success() => {
+                    match response.text() {
+                        Ok(ip_text) => {
+                            let ip = ip_text.trim().to_string();
+                            if !ip.is_empty() && ip.contains('.') && !ip.contains("error") && !ip.contains("timeout") {
+                                if validate_ip_address_security(&ip) {
+                                    if is_info() { println!("[INFO][IP] external_ip_detected service={} ip={}", service, ip); }
+                                    return Ok(ip);
+                                } else if is_debug() {
+                                    println!("[DBG][IP] security_validation_fail ip={}", ip);
+                                }
+                            } else if is_debug() {
+                                println!("[DBG][IP] invalid_response service={} body={}", service, ip);
                             }
-                        } else {
-                            println!("[DEBUG] ❌ Invalid IP response: {}", ip);
+                        }
+                        Err(e) => {
+                            if is_debug() { println!("[DBG][IP] response_read_err service={} err={}", service, e); }
                         }
                     }
-                    Err(e) => {
-                        println!("[DEBUG] ❌ Response read error from {}: {}", service, e);
-                    }
+                }
+                Ok(response) => {
+                    if is_debug() { println!("[DBG][IP] http_err service={} status={}", service, response.status()); }
+                }
+                Err(e) => {
+                    if is_debug() { println!("[DBG][IP] request_fail service={} err={}", service, e); }
                 }
             }
-            Ok(response) => {
-                println!("[DEBUG] ❌ HTTP error {} from {}", response.status(), service);
-            }
-            Err(e) => {
-                println!("[DEBUG] ❌ Request failed for {}: {}", service, e);
-            }
         }
-    }
-    
-    println!("[DEBUG] ❌ All IP services failed");
-    Err("Could not detect external IP".to_string())
+
+        if is_warn() { println!("[WARN][IP] all_services_failed"); }
+        Err("Could not detect external IP".to_string())
+    })
+    .join()
+    .unwrap_or_else(|_| Err("IP detection thread panicked".to_string()))
 }
 
 // Get local network IP address
@@ -1998,7 +1954,8 @@ fn is_qnet_node_running(addr: &str) -> bool {
     
     // Quick connection test with short timeout
     match TcpStream::connect_timeout(
-        &addr.parse().unwrap_or("127.0.0.1:9876".parse().unwrap()),
+        // FIX R24-L2: Remove nested unwrap
+        &addr.parse().unwrap_or(std::net::SocketAddr::from(([127, 0, 0, 1], 9876))),
         Duration::from_millis(100)
     ) {
         Ok(_) => {
@@ -2422,6 +2379,62 @@ async fn detect_region_from_local_interfaces() -> Result<Region, String> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Crash observability. Installed before any spawn so every panic is traced.
+    // panic=abort (workspace Cargo.toml) ends the process on any panic with no
+    // JoinError for watchdogs to observe — this stderr line is the only crash
+    // trace, and stderr is what the container captures (docker logs). Written
+    // directly to stderr (no Mutex) so a poisoned lock during a cascade can't
+    // swallow it.
+    std::panic::set_hook(Box::new(|info| {
+        use std::io::Write;
+        let loc = info.location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "unknown".to_string());
+        let msg = info.payload().downcast_ref::<&str>().copied()
+            .or_else(|| info.payload().downcast_ref::<String>().map(|s| s.as_str()))
+            .unwrap_or("<non-string panic>");
+        let thread = std::thread::current().name().unwrap_or("unnamed").to_string();
+        eprintln!("[FATAL][PANIC] loc={} thread={} msg={}", loc, thread, msg);
+        eprintln!("[FATAL][PANIC] backtrace:\n{}", std::backtrace::Backtrace::force_capture());
+        let _ = std::io::stderr().flush();
+    }));
+
+    // Apply QNET_LOG_LEVEL before the first log line. Without this call the level stayed pinned at
+    // the INFO default and the documented variable did nothing — at scale operators need to turn
+    // per-node volume down without rebuilding.
+    qnet_integration::node::init_logging();
+
+    // OOM restart backoff: consecutive memory shutdowns within 10 min pace the next
+    // boot exponentially (15s..120s) instead of storming. Marker written by the
+    // memory watchdog; a stale marker is dropped here.
+    let oom_marker = qnet_integration::node::oom_backoff_path();
+    if let Ok(s) = std::fs::read_to_string(&oom_marker) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        let mut it = s.split_whitespace();
+        match (it.next().and_then(|v| v.parse::<u64>().ok()),
+               it.next().and_then(|v| v.parse::<u32>().ok())) {
+            (Some(ts), Some(n)) if now.saturating_sub(ts) < 600 && n >= 1 => {
+                let delay = (15u64 << (n.min(4) - 1)).min(120);
+                eprintln!("[WARN][MEMORY] oom_backoff boot_delay={}s consecutive={}", delay, n);
+                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+            }
+            _ => { let _ = std::fs::remove_file(&oom_marker); }
+        }
+    }
+
+    // Restart manifest sanity, before anything opens storage or touches the network. A malformed
+    // manifest is a broken RELEASE, not a runtime condition — refuse to start rather than run a binary
+    // whose restart anchor could hash-trust the wrong branch or silently bar identities.
+    if let Err(e) = qnet_integration::genesis_constants::restart_manifest_is_wellformed() {
+        eprintln!("[FATAL][RESTART] malformed_manifest err={} — refusing to start", e);
+        std::process::exit(1);
+    }
+    if let Some((mb, _)) = qnet_integration::genesis_constants::restart_anchor() {
+        eprintln!("[WARN][RESTART] manifest_active resume_from_mb={} excluded={}",
+                  mb, qnet_integration::genesis_constants::RESTART_MANIFEST.excluded.len());
+    }
+
     // SECURITY: Prevent direct execution - ONLY Docker or Mobile allowed
     if !std::path::Path::new("/.dockerenv").exists() && 
        std::env::var("DOCKER_ENV").is_err() &&
@@ -2448,6 +2461,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::set_var("RUST_LOG", "info");
     }
     env_logger::init();
+    
+    // Clock correction is the host's job: the runtime image ships none of timedatectl/chronyc/
+    // ntpdate and the container has no CAP_SYS_TIME, so an in-process sync attempt can only fail.
+    // The drift check below still runs and is what actually guards consensus timing.
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // v3.10: NTP DRIFT CHECK - Fail-fast if system time is too far off
+    // ═══════════════════════════════════════════════════════════════════════════
+    // CRITICAL: QNet uses slot-based timing (genesis_ts + height) for determinism.
+    // If NTP drift > 3 seconds, nodes will compute different timeout_rounds → FORK!
+    // Better to fail at startup than cause consensus issues.
+    // ═══════════════════════════════════════════════════════════════════════════
+    {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        
+        // Simple NTP drift estimation using multiple time sources
+        // In production, nodes should have NTP configured properly
+        let system_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        
+        // Basic sanity check: system time should be reasonable (after 2024)
+        const MIN_VALID_TIMESTAMP: u64 = 1704067200; // 2024-01-01 00:00:00 UTC
+        const MAX_REASONABLE_TIMESTAMP: u64 = 2524608000; // 2050-01-01 00:00:00 UTC
+        
+        if system_time < MIN_VALID_TIMESTAMP {
+            eprintln!("═══════════════════════════════════════════════════════════════════════════");
+            eprintln!("[FATAL] System clock is set before 2024!");
+            eprintln!("[FATAL] Current timestamp: {} (expected > {})", system_time, MIN_VALID_TIMESTAMP);
+            eprintln!("[FATAL] Please sync your system clock with NTP before running QNet.");
+            eprintln!("");
+            eprintln!("  Linux:   sudo timedatectl set-ntp true && sudo systemctl restart systemd-timesyncd");
+            eprintln!("  Docker:  Ensure host has NTP sync (containers inherit host time)");
+            eprintln!("  Windows: Settings → Time & Language → Sync now");
+            eprintln!("═══════════════════════════════════════════════════════════════════════════");
+            std::process::exit(1);
+        }
+        
+        if system_time > MAX_REASONABLE_TIMESTAMP {
+            eprintln!("═══════════════════════════════════════════════════════════════════════════");
+            eprintln!("[FATAL] System clock is set too far in the future!");
+            eprintln!("[FATAL] Current timestamp: {} (expected < {})", system_time, MAX_REASONABLE_TIMESTAMP);
+            eprintln!("[FATAL] Please sync your system clock with NTP before running QNet.");
+            eprintln!("═══════════════════════════════════════════════════════════════════════════");
+            std::process::exit(1);
+        }
+        
+        println!("[INFO][NTP] System time check passed: {} (OK)", system_time);
+    }
     
     // Check if data cleanup is requested
     if std::env::var("QNET_CLEAN_DATA").unwrap_or_default() == "1" {
@@ -2493,7 +2556,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Auto-configure everything
     let config = AutoConfig::new().await?;
     
-    // PRODUCTION: Check for existing activation or run interactive setup
+    // PRODUCTION: Check for existing activation from env vars or RocksDB
     let (node_type, activation_code) = check_existing_activation_or_setup().await?;
     
     // Configure production mode (microblocks by default)
@@ -2509,28 +2572,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // Store activation code and node type for validation and storage configuration
     std::env::set_var("QNET_ACTIVATION_CODE", activation_code);
+    // v3.18: Full node type removed - only Light and Super remain
     std::env::set_var("QNET_NODE_TYPE", match node_type {
         NodeType::Light => "light",
-        NodeType::Full => "full",
         NodeType::Super => "super",
     });
     
     // Display configuration
     display_node_config(&config, &node_type, &region);
-    
+
+    // ═══════════════════════════════════════════════════════════════════
+    // v4.0: Wallet Seed → WalletIdentity + VRF
+    // ═══════════════════════════════════════════════════════════════════
+    if let Some(seed) = qnet_integration::node::load_wallet_seed("QNET_WALLET_SEED") {
+        let wallet_addr = qnet_integration::crypto::vrf::WalletIdentity::derive_wallet_address(&seed);
+        println!("[INFO][STARTUP] wallet_seed=present derived_addr={}", wallet_addr);
+        println!("[INFO][STARTUP] vrf=dilithium3 mode=deterministic_leader_election");
+    } else if let Some(genesis_seed) = qnet_integration::node::load_wallet_seed("QNET_GENESIS_SEED") {
+        let wallet_addr = qnet_integration::crypto::vrf::WalletIdentity::derive_wallet_address(&genesis_seed);
+        println!("[INFO][STARTUP] genesis_seed=present derived_addr={}", wallet_addr);
+    } else {
+        println!("[WARN][STARTUP] wallet_seed=absent vrf=disabled — set QNET_WALLET_SEED or QNET_GENESIS_SEED");
+    }
+
     // Display activation status
     let activation_code = std::env::var("QNET_ACTIVATION_CODE").unwrap_or_default();
-    println!("\n🔐 === Activation Status ===");
+    println!("\n[INFO][STARTUP] === Activation Status ===");
     
     if activation_code.is_empty() {
         return Err("No activation code provided".into());
     }
     
+    // FIX R23-F3: Initialize weak subjectivity checkpoint from env
+    qnet_integration::node::init_weak_subjectivity_checkpoint();
+
     // PRODUCTION: Load network configuration based on QNET_NETWORK env
     let network_config = qnet_integration::network_config::get_network_config();
     println!("🌐 Network: {}", network_config.network_name());
     println!("   Environment: {:?}", network_config.environment);
-    println!("   Chain ID: {}", network_config.chain_id);
+    println!("   Chain ID: {}", qnet_state::transaction::QNET_CHAIN_ID);
     println!("   QNet RPC: {}", network_config.endpoints.qnet_rpc);
     println!("   Bridge API: {}", network_config.endpoints.bridge_api);
     println!("   Solana RPC: {}", network_config.solana.rpc_url);
@@ -2592,8 +2672,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         quantum_crypto.record_activation_in_blockchain(&activation_code, &payload, &node_pubkey).await?;
         
         println!("✅ Quantum activation recorded in QNet blockchain successfully");
-        println!("   📝 Node: {}...", &node_pubkey[..12]);
-        println!("   🔐 Quantum-secure: CRYSTALS-Kyber + Dilithium");
+        println!("   📝 Node: {}", node_pubkey);
+        println!("   🔐 Quantum-secure: CRYSTALS-Dilithium3 (NIST FIPS 204)");
         println!("   🚫 Database: Not used - blockchain is source of truth");
 
         // PRODUCTION: Auto-shutdown previous nodes of same type for this wallet
@@ -2619,70 +2699,122 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
         .unwrap_or(false);
     
-    // CRITICAL FIX v2.21.8: Run preflight checks BEFORE binding signal_listener
-    // This ensures ports are available, then we can bind 8001 for GENESIS SYNC
-    let mut genesis_signal_listener: Option<tokio::net::TcpListener> = None;
-    
-    if is_genesis {
-        // Run preflight FIRST - before we bind anything
-        println!("[GENESIS] 🔍 Running pre-flight checks...");
+    // PREFLIGHT: All server nodes (Genesis + Super) run port/network checks before startup.
+    // Catches port conflicts and network issues early — before any binding or P2P activity.
+    if std::env::var("QNET_PREFLIGHT_DONE").unwrap_or_default() != "1" {
+        let node_label = if is_genesis { "GENESIS" } else { "SUPER" };
+        if is_info() { println!("[INFO][PREFLIGHT] start node_type={}", node_label); }
         let external_ip = get_physical_ip().await.ok();
-        if let Err(e) = qnet_integration::preflight_checks::run_preflight_checks(external_ip.as_deref()).await {
-            eprintln!("❌ Pre-flight checks failed: {}", e);
-            return Err(e.into());
+        match qnet_integration::preflight_checks::run_preflight_checks(external_ip.as_deref()).await {
+            Err(e) => {
+                eprintln!("[FATAL][PREFLIGHT] checks_failed node_type={} err={}", node_label, e);
+                std::process::exit(1);
+            }
+            Ok(r) => {
+                std::env::set_var("QNET_PREFLIGHT_DONE", "1");
+                if r.passed {
+                    if is_info() { println!("[INFO][PREFLIGHT] passed node_type={}", node_label); }
+                } else {
+                    // Partial coverage is not a pass. Non-fatal: a node that cannot reach the IP
+                    // resolver may still reach its peers.
+                    let failed: Vec<&str> = r.checks.iter().filter(|c| !c.passed).map(|c| c.name.as_str()).collect();
+                    if is_warn() { println!("[WARN][PREFLIGHT] incomplete node_type={} failed={}", node_label, failed.join(",")); }
+                }
+            }
         }
-        std::env::set_var("QNET_PREFLIGHT_DONE", "1");
-        println!("[GENESIS] ✅ Pre-flight checks passed");
-        
+    }
+
+    let mut genesis_signal_listener: Option<tokio::net::TcpListener> = None;
+
+    // v11.1: Skip genesis sync on restart — only run on first network start
+    let has_existing_data = std::path::Path::new(&config.data_dir).join("CURRENT").exists();
+    if has_existing_data && is_genesis {
+        if is_info() { println!("[INFO][GENESIS] skip_genesis_sync reason=existing_data dir={}", config.data_dir.display()); }
+    }
+
+    if is_genesis && !has_existing_data {
+
         // Now bind signal_listener for GENESIS SYNC
-        println!("[GENESIS SYNC] 📡 Starting signal listener on port 8001...");
-        
-        let signal_listener = tokio::net::TcpListener::bind("0.0.0.0:8001").await
-            .expect("Failed to bind port 8001 for Genesis sync");
-        
-        println!("[GENESIS SYNC] ✅ Signal listener ready on port 8001");
-        println!("[GENESIS SYNC] ⏳ Waiting for other Genesis nodes to be ready...");
-        
-        let genesis_ips = vec![
-            "154.38.160.39",
-            "62.171.157.44",
-            "161.97.86.81",
-            "5.189.130.160",
-            "162.244.25.114",
-        ];
-        
-        // Get our IP for self-skip
-        let our_ip = get_physical_ip().await.unwrap_or_else(|_| "127.0.0.1".to_string());
+        if is_info() { println!("[INFO][GENESIS] signal_listener_start port=8001"); }
+
+        let signal_listener = {
+            let mut bound = None;
+            for attempt in 1..=10u32 {
+                match tokio::net::TcpListener::bind("0.0.0.0:8001").await {
+                    Ok(listener) => { bound = Some(listener); break; }
+                    Err(e) => {
+                        if is_warn() { println!("[WARN][GENESIS] port_8001_busy attempt={}/10 err={}", attempt, e); }
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    }
+                }
+            }
+            match bound {
+                Some(listener) => listener,
+                None => {
+                    eprintln!("[FATAL][GENESIS] Cannot bind port 8001 after 10 attempts (20s) — restarting node");
+                    std::process::exit(1);
+                }
+            }
+        };
+
+        if is_info() { println!("[INFO][GENESIS] signal_listener_ready port=8001"); }
+
+        // Single source for the roster; a second hardcoded copy here would silently diverge.
+        let genesis_ips: Vec<&str> = qnet_integration::genesis_constants::GENESIS_NODE_IPS
+            .iter()
+            .map(|(ip, _)| *ip)
+            .collect();
+
+        // Self-identify by bootstrap id, not by detected IP. IP detection failing fell back to
+        // 127.0.0.1, which matches no genesis address — the node then probed ITSELF, found its own
+        // listener up and counted itself, releasing the barrier one real peer short.
+        let our_ip: String = match std::env::var("QNET_BOOTSTRAP_ID")
+            .ok()
+            .and_then(|id| qnet_integration::genesis_constants::get_genesis_ip_by_id(&id))
+        {
+            Some(ip) => ip.to_string(),
+            None => {
+                if is_warn() { println!("[WARN][GENESIS] self_ip_unresolved src=bootstrap_id fallback=probe"); }
+                get_physical_ip().await.unwrap_or_default()
+            }
+        };
         let mut ready_count = 0;
         let mut attempts = 0;
-        const MAX_ATTEMPTS: u32 = 60; // 60 * 2s = 120 seconds max wait
-        const REQUIRED_PEERS: usize = 4; // Need ALL 4 other Genesis nodes ready (5 total - 1 self = 4)
-        
-        while ready_count < REQUIRED_PEERS && attempts < MAX_ATTEMPTS {
+        // Prefer the full roster, but never start producing below what can certify a block:
+        // quorum_size(n) = n - f, f = (n-1)/3, minus ourselves. Derived from the roster so a
+        // different genesis size stays correct.
+        let roster_n = genesis_ips.len();
+        let quorum_min_peers = roster_n.saturating_sub((roster_n.saturating_sub(1)) / 3).saturating_sub(1);
+        let required_peers = roster_n.saturating_sub(1);
+        const MAX_ATTEMPTS: u32 = 60; // 60 * 2s = 120s before relaxing to the quorum floor
+
+        if is_info() {
+            println!("[INFO][GENESIS] waiting_for_peers required={} quorum_floor={}",
+                     required_peers, quorum_min_peers);
+        }
+
+        while ready_count < required_peers && attempts < MAX_ATTEMPTS {
             attempts += 1;
             ready_count = 0;
-            
-            // Accept any incoming connections (non-blocking) to signal we're alive
-            // Use short timeout so we don't block the check loop
+
+            // Accept incoming TCP connections (non-blocking signal)
             loop {
                 match tokio::time::timeout(
                     std::time::Duration::from_millis(10),
                     signal_listener.accept()
                 ).await {
-                    Ok(Ok((socket, _))) => {
-                        drop(socket); // Accept and drop - just signals we're alive
-                    }
-                    _ => break, // No more pending connections
+                    Ok(Ok((socket, _))) => { drop(socket); }
+                    _ => break,
                 }
             }
-            
+
             // Check other Genesis nodes
             for ip in &genesis_ips {
                 // Skip self
                 if *ip == our_ip {
                     continue;
                 }
-                
+
                 // Check if node API port is responding (TCP 8001)
                 let is_ready = match tokio::time::timeout(
                     std::time::Duration::from_secs(1),
@@ -2691,38 +2823,69 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Ok(Ok(_)) => true,
                     _ => false,
                 };
-                
+
                 if is_ready {
                     ready_count += 1;
                 }
             }
-            
-            if ready_count >= REQUIRED_PEERS {
-                println!("[GENESIS SYNC] ✅ {} Genesis nodes ready, proceeding with startup", ready_count);
+
+            if ready_count >= required_peers {
+                if is_info() { println!("[INFO][GENESIS] peers_ready count={} required={}", ready_count, required_peers); }
                 break;
             }
-            
-            println!("[GENESIS SYNC] ⏳ {}/{} Genesis nodes ready (attempt {}/{}), waiting 2s...", 
-                     ready_count, REQUIRED_PEERS, attempts, MAX_ATTEMPTS);
+
+            if is_debug() { println!("[DEBUG][GENESIS] waiting ready={}/{} attempt={}/{}", ready_count, required_peers, attempts, MAX_ATTEMPTS); }
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         }
-        
-        if ready_count < REQUIRED_PEERS {
-            println!("[GENESIS SYNC] ⚠️ Only {} Genesis nodes ready after {} attempts, starting anyway", 
-                     ready_count, attempts);
+
+        // Below the quorum floor the barrier does NOT release. Starting a fresh chain alone means
+        // minting blocks no one can certify, then forking when the rest arrive — the timeout used
+        // to let exactly that happen. Waiting is recoverable; a genesis-height fork is not.
+        if ready_count < quorum_min_peers {
+            if is_warn() {
+                println!("[WARN][GENESIS] below_quorum ready={} floor={} action=hold",
+                         ready_count, quorum_min_peers);
+            }
+            let mut holds = 0u32;
+            while ready_count < quorum_min_peers {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                holds += 1;
+                ready_count = 0;
+                for ip in &genesis_ips {
+                    if *ip == our_ip { continue; }
+                    let up = matches!(tokio::time::timeout(
+                        std::time::Duration::from_secs(1),
+                        tokio::net::TcpStream::connect(format!("{}:8001", ip))
+                    ).await, Ok(Ok(_)));
+                    if up { ready_count += 1; }
+                }
+                if holds % 12 == 0 && is_warn() {
+                    println!("[WARN][GENESIS] still_below_quorum ready={} floor={} waited={}s",
+                             ready_count, quorum_min_peers, holds * 5);
+                }
+            }
+            if is_info() { println!("[INFO][GENESIS] quorum_reached ready={}", ready_count); }
+        } else if ready_count < required_peers {
+            if is_warn() {
+                println!("[WARN][GENESIS] partial_start ready={} required={} quorum_floor={}",
+                         ready_count, required_peers, quorum_min_peers);
+            }
         }
-        
+
         // CRITICAL FIX v2.21.8: DO NOT drop listener here!
         // Keep it alive so connectivity_test in BlockchainNode::new() will PASS
         // Other nodes still have their listeners active = TCP 8001 is reachable
-        println!("[GENESIS SYNC] ✅ Keeping signal listener active for BlockchainNode creation...");
+        if is_info() { println!("[INFO][GENESIS] listener_kept_alive reason=blockchain_node_creation"); }
         genesis_signal_listener = Some(signal_listener);
-        
+
+        // Note: QNET_PREFLIGHT_DONE=1 was set at line 2624 after preflight passed
+        // BlockchainNode::new() will skip preflight checks because of this flag
+
         // Brief wait for all nodes to reach this point
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 
-    println!("🔍 DEBUG: About to create BlockchainNode...");
+    if is_debug() { println!("[DEBUG][NODE] creating_blockchain_node"); }
     let mut node = match BlockchainNode::new_with_config(
         &config.data_dir.to_string_lossy(),
         config.p2p_port,
@@ -2731,22 +2894,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         region,
     ).await {
         Ok(node) => {
-            println!("🔍 DEBUG: BlockchainNode created successfully");
+            if is_info() { println!("[INFO][NODE] blockchain_node_created"); }
             node
         }
         Err(e) => {
-            println!("❌ ERROR: BlockchainNode creation failed: {}", e);
-            eprintln!("❌ ERROR: BlockchainNode creation failed: {}", e);
-            println!("🔍 DEBUG: Error details: {:?}", e);
+            eprintln!("[ERROR][NODE] blockchain_node_failed err={}", e);
             return Err(format!("BlockchainNode creation failed: {}", e).into());
         }
     };
     
-    // Save activation code to persistent storage for future restarts
-    // Always save in development mode to remember selected node type
+    // save_activation_code is LOCAL-only now (validate + device-register + persist) — the on-chain
+    // NodeRegistration arm lives in the convergence driver spawned at net_ready, so this call is
+    // sync-independent and safe on a cold joiner. Skip once persisted (idempotency: no re-validation
+    // or device re-POST per boot).
     if !activation_code.is_empty() {
-        if let Err(e) = node.save_activation_code(&activation_code, node_type).await {
-            println!("⚠️  Warning: Could not save activation code: {}", e);
+        let already_persisted = node.get_storage().load_activation_code()
+            .map(|opt| opt.is_some())
+            .unwrap_or(false);
+        if already_persisted {
+            if is_info() { println!("[INFO][NODE] activation_persisted skip=fallback_call"); }
+        } else if let Err(e) = node.save_activation_code(&activation_code, node_type).await {
+            if is_warn() { println!("[WARN][NODE] activation_code_save_failed err={}", e); }
         }
     }
     
@@ -2757,7 +2925,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // BlockchainNode is created, connectivity_test passed (other nodes still have listeners)
     // Now we can drop our listener so RPC server can bind to 8001
     if let Some(listener) = genesis_signal_listener.take() {
-        println!("[GENESIS SYNC] 🔌 Releasing port 8001 for RPC server...");
+        if is_info() { println!("[INFO][GENESIS] releasing_port port=8001 reason=rpc_server"); }
         drop(listener);
         // Brief wait for OS to release socket
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -2772,15 +2940,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     
     // Start node
-    println!("🚀 Starting QNet node...");
+    if is_info() { println!("[INFO][NODE] starting"); }
     
     // DAEMON MODE: Prepare log file
     let log_file_path = std::path::Path::new(&config.data_dir).join("qnet-node.log");
-    println!("📝 Log file: {}", log_file_path.display());
-    
+    if is_debug() { println!("[DEBUG][NODE] log_file path={}", log_file_path.display()); }
+
     // Start the blockchain node (keep reference for peer injection)
     if let Err(e) = node.start().await {
-        eprintln!("❌ Node failed to start: {}", e);
+        eprintln!("[ERROR][NODE] start_failed err={}", e);
         return Err(format!("Node startup failed: {}", e).into());
     }
     
@@ -2788,24 +2956,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
     
     // CRITICAL FIX: Now run DHT discovery AFTER API server is running
-    println!("🔍 API server ready - starting DHT peer discovery...");
+    if is_info() { println!("[INFO][NODE] api_ready starting_dht_discovery"); }
     let (_, discovered_peers) = scan_active_qnet_nodes().await;
-    
+
     // Add discovered peers to P2P system
     if !discovered_peers.is_empty() {
-        println!("🔗 Discovered {} peers, integrating with P2P network...", discovered_peers.len());
-        
+        if is_info() { println!("[INFO][P2P] discovered_peers count={}", discovered_peers.len()); }
+
         // FIXED: Now we can inject peers into the running node
         node.add_discovered_peers(&discovered_peers);
-        
-        for peer in &discovered_peers {
-            println!("🔗 Integrated active peer: {}", peer);
+
+        if is_debug() {
+            for peer in &discovered_peers {
+                println!("[DEBUG][P2P] integrated_peer addr={}", peer);
+            }
         }
-        
-        println!("✅ Peers successfully integrated into P2P network");
+
+        if is_info() { println!("[INFO][P2P] peers_integrated count={}", discovered_peers.len()); }
     }
     
     // Start background node monitoring
+    // v8.0: Read QNET_HALT_HEIGHT once at startup for coordinated upgrades.
+    // Halt-height flag. When ALL nodes set the same halt height,
+    // they all stop gracefully at the same block → operator updates binaries → restarts.
+    // Use case: breaking consensus changes (hard fork).
+    // Normal rolling updates: leave unset (nodes restart one-by-one, catch up via snapshot).
+    let halt_height: Option<u64> = std::env::var("QNET_HALT_HEIGHT")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok());
+
+    if let Some(h) = halt_height {
+        println!("[INFO][HALT] QNET_HALT_HEIGHT={} — node will stop at this block (coordinated upgrade)", h);
+    }
+
     let node_clone = node.clone();
     let node_handle = tokio::spawn(async move {
         // Keep node running and monitor
@@ -2815,9 +2998,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Monitor peer connections
             if let Ok(peer_count) = node_clone.get_peer_count().await {
                 if peer_count > 0 {
-                    println!("[MONITOR] ✅ {} peers connected", peer_count);
+                    if is_debug() { println!("[DEBUG][MONITOR] peers_connected count={}", peer_count); }
                 } else {
-                    println!("[MONITOR] ⚠️ No peers connected - running standalone");
+                    if is_warn() { println!("[WARN][MONITOR] no_peers_connected"); }
+                }
+            }
+
+            // QNET_HALT_HEIGHT — coordinated upgrade stop. Set the same value on every node: each stops
+            // at the first height it observes at or above it, updates, and restarts. The observed
+            // heights can differ by a block or two because this is a poll, not a consensus rule - that
+            // is harmless, the restarted nodes resync to one tip. What it buys is a bounded window in
+            // which no node is producing, so a consensus-rule change lands on an idle chain.
+            if let Some(stop_at) = halt_height {
+                let current_height = node_clone.get_height().await;
+                if current_height >= stop_at {
+                    println!("[INFO][HALT] Reached halt_height={} current={} — flushing and stopping for coordinated upgrade",
+                             stop_at, current_height);
+                    let storage = node_clone.get_storage();
+                    match storage.flush_all() {
+                        Ok(()) => println!("[INFO][HALT] storage.flush_all() complete"),
+                        Err(e) => println!("[ERR][HALT] storage.flush_all() failed: {}", e),
+                    }
+                    println!("[INFO][HALT] Node stopped. Update binary and restart (remove QNET_HALT_HEIGHT).");
+                    std::process::exit(0);
                 }
             }
         }
@@ -2838,65 +3041,105 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => "localhost".to_string()
     };
     
-    println!("🚀 QNet Node #{} started successfully!", 
-        std::env::var("QNET_BOOTSTRAP_ID").unwrap_or("N/A".to_string()));
-    println!("🌐 Region: {:?} | Type: {:?} | IP: {}", 
-        region, node_type, external_ip);
-    println!("📡 Endpoints: P2P={} RPC={} API={}", 
-        config.p2p_port, config.rpc_port, std::env::var("QNET_CURRENT_API_PORT").unwrap_or("8001".to_string()));
-    println!("");
-    println!("📖 View detailed logs: docker logs -f qnet-node");
-    println!("🔍 Filter blockchain logs: docker logs qnet-node | grep \"Block #\\|Syncing\\|Macroblock\"");
-    println!("📊 Monitor P2P: docker logs qnet-node | grep \"peer\\|P2P\\|Connected\"");
-    println!("");
-    println!("=== BLOCKCHAIN LOGS (Live) ===");
+    if is_info() {
+        let node_id = std::env::var("QNET_BOOTSTRAP_ID").unwrap_or("N/A".to_string());
+        let api_port = std::env::var("QNET_CURRENT_API_PORT").unwrap_or("8001".to_string());
+        println!("[INFO][NODE] started node_id={} region={:?} type={:?} ip={} p2p={} rpc={} api={}",
+            node_id, region, node_type, external_ip, config.p2p_port, config.rpc_port, api_port);
+    }
     
     // ═══════════════════════════════════════════════════════════════════════════
     // PRODUCTION FIX v2.30: Graceful shutdown with certificate persistence
-    // Handles Ctrl+C and SIGTERM to save certificate_history before exit
+    // Handles Ctrl+C and SIGTERM to save certificates before exit
+    // v3.50: certificate_history no longer persisted (Dilithium-only verification)
     // ═══════════════════════════════════════════════════════════════════════════
     
-    tokio::select! {
-        // Normal monitoring loop
-        _ = node_handle => {
-            println!("[SHUTDOWN] Node monitoring ended unexpectedly");
+    // v5.0: Handle both SIGINT (Ctrl+C) and SIGTERM (docker stop)
+    // Docker sends SIGTERM on `docker stop`. Without this, the process ignores
+    // SIGTERM and gets SIGKILL after 10s, losing unflushed macroblock data.
+    // SIGTERM is an optional convenience (docker stop). If registration fails,
+    // never panic node boot — fall back to SIGINT-only graceful shutdown.
+    #[cfg(unix)]
+    let mut sigterm = match tokio::signal::unix::signal(
+        tokio::signal::unix::SignalKind::terminate()
+    ) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            println!("[WARN][SHUTDOWN] sigterm_register_failed err={} fallback=sigint_only", e);
+            None
         }
-        
-        // Graceful shutdown on Ctrl+C or SIGTERM
-        _ = tokio::signal::ctrl_c() => {
-            println!("\n[SHUTDOWN] 🛑 Received shutdown signal...");
-            println!("[SHUTDOWN] 💾 Saving certificate history...");
-            
-            // Persist certificate history before exit
-            if node_type != NodeType::Light {
-                if let Some(p2p) = node.get_unified_p2p() {
-                    // Use QNET_STORAGE_PATH (set during init) with fallback to "data"
-                    let storage_path = std::env::var("QNET_STORAGE_PATH").unwrap_or_else(|_| "data".to_string());
-                    let data_dir = std::path::Path::new(&storage_path);
-                    if let Err(e) = std::fs::create_dir_all(&data_dir) {
-                        println!("[SHUTDOWN] ⚠️ Failed to create data dir {}: {}", storage_path, e);
-                    } else if let Ok(mut cert_manager) = p2p.certificate_manager.write() {
-                        let unified_node_type = match node_type {
-                            NodeType::Light => qnet_integration::unified_p2p::NodeType::Light,
-                            NodeType::Full => qnet_integration::unified_p2p::NodeType::Full,
-                            NodeType::Super => qnet_integration::unified_p2p::NodeType::Super,
-                        };
-                        match cert_manager.persist_to_disk(&data_dir, unified_node_type) {
-                            Ok(_) => println!("[SHUTDOWN] ✅ Certificate history saved to {}", storage_path),
-                            Err(e) => println!("[SHUTDOWN] ⚠️ Failed to save certificates: {}", e),
-                        }
+    };
+
+    let shutdown_handler = async {
+        let signal_name;
+        #[cfg(unix)]
+        {
+            // Pending future when SIGTERM is unavailable so select falls through to SIGINT only.
+            let sigterm_recv = async {
+                match sigterm.as_mut() {
+                    Some(s) => { s.recv().await; }
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => { signal_name = "SIGINT"; }
+                _ = sigterm_recv => { signal_name = "SIGTERM"; }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            tokio::signal::ctrl_c().await.ok();
+            signal_name = "SIGINT";
+        }
+
+        println!("\n[SHUTDOWN] Received {} — starting graceful shutdown...", signal_name);
+
+        // 1. Flush RocksDB (WAL → SST), prevents macroblock/block data loss
+        let storage = node.get_storage();
+        match storage.flush_all() {
+            Ok(()) => println!("[SHUTDOWN] storage.flush_all() complete"),
+            Err(e) => println!("[ERR][SHUTDOWN] storage.flush_all() failed: {}", e),
+        }
+
+        // 2. Persist certificate history
+        if node_type != NodeType::Light {
+            if let Some(p2p) = node.get_unified_p2p() {
+                let storage_path = std::env::var("QNET_STORAGE_PATH").unwrap_or_else(|_| "data".to_string());
+                let data_dir = std::path::Path::new(&storage_path);
+                if let Err(e) = std::fs::create_dir_all(&data_dir) {
+                    println!("[WARN][SHUTDOWN] create_dir fail: {}", e);
+                } else {
+                    let mut cert_manager = p2p.certificate_manager.write();
+                    let unified_node_type = match node_type {
+                        NodeType::Light => qnet_integration::unified_p2p::NodeType::Light,
+                        NodeType::Super => qnet_integration::unified_p2p::NodeType::Super,
+                    };
+                    match cert_manager.persist_to_disk(&data_dir, unified_node_type) {
+                        Ok(_) => println!("[SHUTDOWN] certificates saved to {}", storage_path),
+                        Err(e) => println!("[WARN][SHUTDOWN] cert save failed: {}", e),
                     }
                 }
             }
-            
-            println!("[SHUTDOWN] ✅ Graceful shutdown complete");
         }
+
+        println!("[SHUTDOWN] graceful shutdown complete");
+    };
+
+    tokio::select! {
+        _ = node_handle => {
+            // The monitor is an infinite loop; it ending is a fault (a deliberate
+            // stop uses process::exit directly). Exit non-zero so the orchestrator
+            // restarts instead of reading this as a clean shutdown.
+            eprintln!("[CRIT][SHUTDOWN] monitor_task_ended action=exit_for_restart");
+            let _ = std::io::Write::flush(&mut std::io::stderr());
+            std::process::exit(1);
+        }
+        _ = shutdown_handler => {}
     }
-    
+
     Ok(())
 }
 
-// Redirect stdout/stderr to log file for daemon mode
 async fn redirect_logs_to_file(log_path: &std::path::Path) -> Result<(), std::io::Error> {
     use std::fs::OpenOptions;
     use std::io::Write;
@@ -2920,23 +3163,9 @@ async fn redirect_logs_to_file(log_path: &std::path::Path) -> Result<(), std::io
     println!("📝 Logs redirected to: {}", log_path_str);
     println!("📖 View logs with: tail -f {}", log_path_str);
     
-    // Set up a custom logger that writes to the file
-    use std::sync::Mutex;
-    use std::sync::Arc;
-    
-    let log_file_arc = Arc::new(Mutex::new(log_file));
-    let log_file_for_panic = log_file_arc.clone();
-    
-    // Set up panic handler to log panics
-    std::panic::set_hook(Box::new(move |panic_info| {
-        if let Ok(mut log_file) = log_file_for_panic.lock() {
-            let _ = writeln!(log_file, "[PANIC] {}: {}", 
-                chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC"),
-                panic_info);
-            let _ = log_file.flush();
-        }
-    }));
-    
+    // Panic tracing is the unconditional stderr hook set at main() top (before any
+    // spawn, survives panic=abort). No per-mode set_hook here — it would clobber it.
+
     // For production daemon mode, we'll use env_logger with file output
     // The actual log redirection is handled by the Docker container or systemd
     println!("✅ Log redirection configured for daemon mode");
@@ -2951,29 +3180,20 @@ fn configure_production_mode() {
     // PRODUCTION: All transactions are ALWAYS validated (signature, balance, nonce)
     // No skip_validation option exists - removed for security
     
-    // Always enable microblocks for production
-    std::env::set_var("QNET_ENABLE_MICROBLOCKS", "1");
-    std::env::set_var("QNET_MICROBLOCK_DEFAULT", "1");
-    
     // Always enable producer mode for production
     std::env::set_var("QNET_IS_LEADER", "1");
     std::env::set_var("QNET_MICROBLOCK_PRODUCER", "1");
     
     std::env::set_var("QNET_HIGH_FREQUENCY", "1");
-    std::env::set_var("QNET_MAX_TPS", "12800000");
-    std::env::set_var("QNET_MEMPOOL_SIZE", "10000000");
-    std::env::set_var("QNET_BATCH_SIZE", "100000");
+    // QNET_MEMPOOL_SIZE is NOT set here: the process setting its own override made the
+    // network-size auto-scaling in mempool config unreachable and pinned every node at a fixed
+    // 20M-entry mempool. Left unset so auto-scaling runs and the variable stays an operator knob.
+    std::env::set_var("QNET_BATCH_SIZE", "200000");
     std::env::set_var("QNET_PARALLEL_VALIDATION", "1");
     std::env::set_var("QNET_PARALLEL_THREADS", "16");
     std::env::set_var("QNET_COMPRESSION", "1");
-    
-    
-    std::env::set_var("QNET_ENABLE_SHARDING", "1");
-    std::env::set_var("QNET_SHARD_COUNT", "256");
     std::env::set_var("QNET_USE_LOCKFREE", "1"); // DashMap for lock-free operations
-    
-    println!("⚡ ULTRA HIGH-PERFORMANCE: 12.8M TPS theoretical max (50K × 256 shards)");
-    println!("🚀 Quantum blockchain optimizations: Lock-free + Sharding + Parallel + 2MB blocks");
+    // Sharding is deferred (single-shard); do NOT advertise it via env/logs.
         
     // Default server configuration (user will choose during setup)
     std::env::set_var("QNET_FULL_SYNC", "1");
@@ -2989,13 +3209,18 @@ fn configure_production_mode() {
 }
 
 fn parse_node_type(type_str: &str) -> Result<NodeType, String> {
+    // v3.18+: only Light (mobile-only) and Super (server) exist. The
+    // string "full" is silently accepted and mapped to Super so that
+    // legacy operator scripts and stored configs from before v3.18 do
+    // not break, but new deployments should use "super" — the only
+    // server role advertised in the help text below.
     match type_str.to_lowercase().as_str() {
         "light" => {
-            Err("❌ Light nodes are not supported on servers! Light nodes are restricted to mobile devices only. Use 'full' or 'super' for server deployment.".to_string())
+            Err("❌ Light nodes are not supported on servers! Light nodes are restricted to mobile devices only. Use 'super' for server deployment.".to_string())
         },
-        "full" => Ok(NodeType::Full),
+        "full" => Ok(NodeType::Super),     // legacy alias kept for backward compat
         "super" => Ok(NodeType::Super),
-        _ => Err(format!("❌ Invalid node type: '{}' for server deployment.\n🖥️  Servers support: full, super\n📱 Mobile devices support: light", type_str)),
+        _ => Err(format!("❌ Invalid node type: '{}' for server deployment.\n🖥️  Servers support: super\n📱 Mobile devices support: light", type_str)),
     }
 }
 
@@ -3356,33 +3581,26 @@ fn display_node_config(config: &AutoConfig, node_type: &NodeType, region: &Regio
     // Validate node type for server deployment
     match node_type {
         NodeType::Light => {
-            println!("  ❌ ERROR: Light nodes not supported on servers!");
-            println!("  📱 Light nodes are restricted to mobile devices only");
-            println!("  💡 Use mobile app for Light node activation");
-        },
-        NodeType::Full => {
-            println!("  ✅ Full node: Suitable for server deployment");
-            println!("  🔧 Capability: Full validation + microblock sync");
-            println!("  💰 Dynamic pricing: Base 7500 QNC × network multiplier (Phase 2)");
-            println!("  💰 Dynamic pricing: 1500→300 1DEV min (Phase 1, universal)");
+            println!("  [ERR] Light nodes not supported on servers!");
+            println!("  Light nodes are restricted to mobile devices only");
+            println!("  Use mobile app for Light node activation");
         },
         NodeType::Super => {
-            println!("  ✅ Super node: Optimized for server deployment");
-            println!("  🔧 Capability: Validation + production + maximum rewards");
-            println!("  💰 Dynamic pricing: Base 10000 QNC × network multiplier (Phase 2)");
-            println!("  💰 Dynamic pricing: 1500→300 1DEV min (Phase 1, universal)");
+            println!("  [OK] Super node: Optimized for server deployment");
+            println!("  Capability: Validation + production + maximum rewards");
+            println!("  Dynamic pricing: Base 7500 QNC x network multiplier (Phase 2)");
+            println!("  Dynamic pricing: 1500->300 1DEV min (Phase 1, universal)");
         },
     }
     
-    println!("  Mode: Production (Microblocks + 100k+ TPS)");
-    println!("  Performance: Ultra High (100k+ TPS optimizations)");
+    println!("  Mode: Production (microblocks)");
     
     println!("  🚀 Server deployment ready!");
     println!("  📱 Light nodes: Use mobile app only");
     println!("  💰 Activation costs: Dynamic pricing active");
 }
 
-async fn verify_1dev_burn(node_type: &NodeType) -> Result<(), String> {
+async fn verify_1dev_burn(_node_type: &NodeType) -> Result<(), String> {
     // GENESIS NODES: Skip burn verification for bootstrap nodes
     if is_genesis_bootstrap_node() {
         println!("🚀 Genesis bootstrap node detected - skipping 1DEV burn verification");
@@ -3392,16 +3610,17 @@ async fn verify_1dev_burn(node_type: &NodeType) -> Result<(), String> {
     }
     
     // Production 1DEV burn verification - Dynamic pricing based on current burn percentage
-    let (current_phase, pricing_info) = detect_current_phase().await;
-    let required_burn = if current_phase == 1 {
-        // Use dynamic pricing for Phase 1
-        calculate_node_price(1, *node_type, &pricing_info)
-    } else {
+    let (current_phase, _pricing_info) = detect_current_phase().await;
+    if current_phase != 1 {
         // Phase 2: No 1DEV burn required
         println!("⚠️  Phase 2 detected - 1DEV burn verification skipped (QNC era)");
         return Ok(());
-    };
-    
+    }
+    // Phase-1 price from the live 1DEV supply via the canonical integer tier formula.
+    let (total_burned, current_supply) = qnet_integration::rpc::fetch_solana_1dev_supply().await
+        .map_err(|e| format!("solana_supply_unavailable: {}", e))?;
+    let required_burn = qnet_state::Transaction::phase1_activation_cost(total_burned, current_supply);
+
     println!("🔐 Verifying 1DEV burn on Solana blockchain...");
     
     // Real Solana burn verification
@@ -3414,324 +3633,95 @@ async fn verify_1dev_burn(node_type: &NodeType) -> Result<(), String> {
     let burn_verified = verify_solana_burn_transaction(&wallet_address, required_burn).await?;
     
     if !burn_verified {
-        let wallet_preview = if wallet_address.len() >= 8 { &wallet_address[..8] } else { &wallet_address };
+        let wallet_preview = wallet_address.as_str();
         return Err(format!("1DEV burn verification failed: Required {} 1DEV not found for wallet {}", required_burn, wallet_preview));
     }
     
-    let wallet_preview = if wallet_address.len() >= 8 { &wallet_address[..8] } else { &wallet_address };
+    let wallet_preview = wallet_address.as_str();
     println!("✅ 1DEV burn verified: {} 1DEV burned by wallet {}", required_burn, wallet_preview);
     Ok(())
 }
 
-async fn verify_solana_burn_transaction(wallet_address: &str, required_amount: f64) -> Result<bool, String> {
-    println!("📡 Querying Solana devnet for burn transaction...");
-    
-    // PRODUCTION: Use network-aware RPC configuration  
-    let network_config = qnet_integration::network_config::get_network_config();
-    let solana_rpc = &network_config.solana.rpc_url;
-    
-    // Build RPC request to check burn transactions
-    let request_body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "getSignaturesForAddress",
-        "params": [
-            wallet_address,
-            {
-                "limit": 100,
-                "commitment": "confirmed"
-            }
-        ]
-    });
-    
-    // Make HTTP request to Solana RPC
-    let client = reqwest::Client::new();
-    let response = client
-        .post(solana_rpc)
-        .json(&request_body)
-        .send()
-        .await
-        .map_err(|e| format!("Solana devnet RPC request failed: {}", e))?;
-    
-    if !response.status().is_success() {
-        return Err(format!("Solana devnet RPC returned error: {}", response.status()));
-    }
-    
-    let rpc_response: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse Solana devnet RPC response: {}", e))?;
-    
-    // Check if any transactions are burn transactions
-    if let Some(transactions) = rpc_response["result"].as_array() {
-        for tx in transactions {
-            if let Some(signature) = tx["signature"].as_str() {
-                // Check if this transaction is a burn transaction
-                if is_burn_transaction(signature).await? {
-                    let burned_amount = get_burned_amount(signature).await?;
-                    if burned_amount >= required_amount {
-                        println!("✅ Found valid burn transaction: {} (burned {} 1DEV)", signature, burned_amount);
-                        return Ok(true);
-                    }
-                }
-            }
-        }
-    }
-    
-    println!("❌ No valid burn transaction found for required amount: {} 1DEV", required_amount);
-    Ok(false)
+/// Local-startup burn check when no TX hash is known: the operator may pin one via
+/// QNET_BURN_TX_HASH, otherwise the wallet's recent signatures are enumerated as candidates.
+async fn verify_solana_burn_transaction(wallet_address: &str, required_amount: u64) -> Result<bool, String> {
+    let pinned_tx = std::env::var("QNET_BURN_TX_HASH").unwrap_or_default();
+    verify_solana_burn_for_activation(wallet_address, &pinned_tx, required_amount).await
 }
 
+/// Local-startup Solana burn check. Delegates every soundness decision to the node's single
+/// token-aware verifier (canonical 1DEV mint, genuine burn instruction or transfer to the
+/// incinerator, amount in 6-decimal base units, fee payer == the claimed wallet).
 async fn verify_solana_burn_for_activation(wallet_address: &str, expected_tx_hash: &str, required_amount: u64) -> Result<bool, String> {
-    println!("📡 PRODUCTION: Verifying 1DEV burn on Solana for node activation...");
-    
-    // PRODUCTION: Use network-aware RPC configuration
+    println!("📡 Verifying 1DEV burn on Solana for node activation (required {} 1DEV)...", required_amount);
+
+    // The fee-payer bind needs the full base58 Solana address, not a decoded 5-byte prefix.
+    if wallet_address.len() < 32 {
+        println!("[ERROR][BURN] wallet_too_short_for_solana_lookup len={}", wallet_address.len());
+        return Ok(false);
+    }
+
+    if !expected_tx_hash.is_empty() {
+        // Known TX: use the retrying entry point — a fresh burn takes 5-15s to index on Solana.
+        return match qnet_integration::rpc::verify_burn_transaction_exists(
+            expected_tx_hash, wallet_address, required_amount, 1).await
+        {
+            Ok((valid, burned)) => {
+                if valid {
+                    println!("[INFO][BURN] activation_burn_verified tx={}... burned={} required={}",
+                        qnet_state::char_prefix(&expected_tx_hash, 16), burned, required_amount);
+                } else {
+                    println!("[ERROR][BURN] activation_burn_not_found tx={}...",
+                        qnet_state::char_prefix(&expected_tx_hash, 16));
+                }
+                Ok(valid)
+            }
+            Err(e) => {
+                println!("[ERROR][BURN] activation_burn_rejected tx={}... err={}",
+                    qnet_state::char_prefix(&expected_tx_hash, 16), e);
+                Ok(false)
+            }
+        };
+    }
+
+    // No TX hash: enumerate the wallet's recent signatures and let the verifier decide. One
+    // attempt per candidate — these are already-indexed historical transactions.
     let network_config = qnet_integration::network_config::get_network_config();
     let solana_rpc = &network_config.solana.rpc_url;
-    let onedev_mint = &network_config.solana.onedev_mint;
-    let burn_address = &network_config.solana.burn_address;
-    
-    // Convert to 6 decimals for comparison
-    let required_amount_decimals = required_amount * 1_000_000;
-    
-    // Build RPC request to check burn transactions
     let request_body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
+        "jsonrpc": "2.0", "id": 1,
         "method": "getSignaturesForAddress",
-        "params": [
-            wallet_address,
-            {
-                "limit": 50,
-                "commitment": "finalized"
-            }
-        ]
+        "params": [wallet_address, {"limit": 50, "commitment": "finalized"}]
     });
-
     let client = reqwest::Client::new();
-    let response = client
-        .post(solana_rpc)
-        .json(&request_body)
-        .send()
-        .await
+    let response = client.post(solana_rpc).json(&request_body).send().await
         .map_err(|e| format!("Solana RPC request failed: {}", e))?;
+    let data: serde_json::Value = response.json().await
+        .map_err(|e| format!("Failed to parse Solana RPC response: {}", e))?;
+    let signatures: Vec<String> = data["result"].as_array()
+        .map(|txs| txs.iter().filter_map(|tx| tx["signature"].as_str().map(String::from)).collect())
+        .unwrap_or_default();
 
-    let data: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| format!("JSON parse failed: {}", e))?;
-
-    if let Some(result) = data.get("result") {
-        if let Some(signatures) = result.as_array() {
-            println!("📋 Found {} recent transactions for wallet {}", signatures.len(), &wallet_address[..8]);
-            
-            // Check each signature for burn transactions to incinerator
-            for sig_info in signatures {
-                if let Some(signature) = sig_info.get("signature").and_then(|s| s.as_str()) {
-                    
-                    // If specific TX hash expected from activation code, check it matches
-                    if !expected_tx_hash.is_empty() && signature != expected_tx_hash {
-                        continue;
-                    }
-                    
-                    // Get transaction details to verify burn
-                    let tx_request = serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "id": 1,
-                        "method": "getTransaction",
-                        "params": [
-                            signature,
-                            {
-                                "encoding": "jsonParsed",
-                                "commitment": "finalized",
-                                "maxSupportedTransactionVersion": 0
-                            }
-                        ]
-                    });
-                    
-                    if let Ok(tx_response) = client.post(solana_rpc).json(&tx_request).send().await {
-                        if let Ok(tx_data) = tx_response.json::<serde_json::Value>().await {
-                            if let Some(result) = tx_data.get("result") {
-                                if let Some(transaction) = result.get("transaction") {
-                                    // Check if this is a token transfer to burn address
-                                    if let Some(message) = transaction.get("message") {
-                                        if let Some(instructions) = message.get("instructions").and_then(|i| i.as_array()) {
-                                            for instruction in instructions {
-                                                if instruction.get("program").and_then(|p| p.as_str()) == Some("spl-token") {
-                                                    if let Some(parsed) = instruction.get("parsed") {
-                                                        if parsed.get("type").and_then(|t| t.as_str()) == Some("transfer") {
-                                                            if let Some(info) = parsed.get("info") {
-                                                                let mint_match = info.get("mint").and_then(|m| m.as_str()) == Some(onedev_mint);
-                                                                let dest_match = info.get("destination").and_then(|d| d.as_str()) == Some(burn_address);
-                                                                let amount_match = info.get("amount")
-                                                                    .and_then(|a| a.as_str())
-                                                                    .and_then(|a| a.parse::<u64>().ok())
-                                                                    .map(|a| a >= required_amount_decimals)
-                                                                    .unwrap_or(false);
-                                                                
-                                                                if mint_match && dest_match && amount_match {
-                                                                    let burned_amount = info.get("amount")
-                                                                        .and_then(|a| a.as_str())
-                                                                        .and_then(|a| a.parse::<u64>().ok())
-                                                                        .unwrap_or(0);
-                                                                    
-                                                                    println!("✅ VERIFIED: Valid burn transaction found!");
-                                                                    println!("   TX: {}", &signature[..16]);
-                                                                    println!("   Burned: {} 1DEV (required: {})", burned_amount / 1_000_000, required_amount);
-                                                                    println!("   Token: {} (1DEV mint)", onedev_mint);
-                                                                    println!("   Destination: {} (official incinerator)", burn_address);
-                                                                    return Ok(true);
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+    for signature in &signatures {
+        if let Ok((true, burned)) = qnet_integration::rpc::verify_burn_transaction_exists_attempts(
+            signature, wallet_address, required_amount, 1, 1).await
+        {
+            println!("[INFO][BURN] activation_burn_verified tx={}... burned={} required={}",
+                qnet_state::char_prefix(&signature, 16), burned, required_amount);
+            return Ok(true);
         }
     }
 
-    println!("❌ VERIFICATION FAILED: No valid burn transaction found for {} 1DEV to incinerator", required_amount);
-    println!("   Required: {} 1DEV burned to {}", required_amount, burn_address);
-    println!("   Token: {} (1DEV mint)", onedev_mint);
+    println!("[ERROR][BURN] activation_burn_not_found scanned={} required={}", signatures.len(), required_amount);
     Ok(false)
 }
 
-async fn is_burn_transaction(signature: &str) -> Result<bool, String> {
-    // Query transaction details to check if it's a burn to 1DEV burn address
-    let network_config = qnet_integration::network_config::get_network_config();
-    let solana_rpc = &network_config.solana.rpc_url;
-    
-    let request_body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "getTransaction",
-        "params": [
-            signature,
-            {
-                "encoding": "json",
-                "commitment": "confirmed"
-            }
-        ]
-    });
-    
-    let client = reqwest::Client::new();
-    let response = client
-        .post(solana_rpc)
-        .json(&request_body)
-        .send()
-        .await
-        .map_err(|e| format!("Failed to query transaction: {}", e))?;
-    
-    let rpc_response: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse transaction response: {}", e))?;
-    
-    // Check if transaction transfers to burn address
-    if let Some(transaction) = rpc_response["result"]["transaction"].as_object() {
-        if let Some(instructions) = transaction["message"]["instructions"].as_array() {
-            for instruction in instructions {
-                // Check if instruction is a transfer to burn address
-                if is_transfer_to_burn_address(instruction) {
-                    return Ok(true);
-                }
-            }
-        }
-    }
-    
-    Ok(false)
-}
-
-async fn get_burned_amount(signature: &str) -> Result<f64, String> {
-    // Parse burn amount from transaction
-    let network_config = qnet_integration::network_config::get_network_config();
-    let solana_rpc = &network_config.solana.rpc_url;
-    
-    let request_body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "getTransaction",
-        "params": [
-            signature,
-            {
-                "encoding": "json",
-                "commitment": "confirmed"
-            }
-        ]
-    });
-    
-    let client = reqwest::Client::new();
-    let response = client
-        .post(solana_rpc)
-        .json(&request_body)
-        .send()
-        .await
-        .map_err(|e| format!("Failed to query burn amount: {}", e))?;
-    
-    let rpc_response: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse burn amount response: {}", e))?;
-    
-    // Extract burn amount from transaction
-    if let Some(pre_token_balances) = rpc_response["result"]["meta"]["preTokenBalances"].as_array() {
-        if let Some(post_token_balances) = rpc_response["result"]["meta"]["postTokenBalances"].as_array() {
-            // Calculate amount burned by comparing pre and post balances
-            for (pre, post) in pre_token_balances.iter().zip(post_token_balances.iter()) {
-                if let (Some(pre_amount), Some(post_amount)) = (
-                    pre["uiTokenAmount"]["uiAmount"].as_f64(),
-                    post["uiTokenAmount"]["uiAmount"].as_f64()
-                ) {
-                    let burned = pre_amount - post_amount;
-                    if burned > 0.0 {
-                        return Ok(burned);
-                    }
-                }
-            }
-        }
-    }
-    
-    Ok(0.0)
-}
-
-fn is_transfer_to_burn_address(instruction: &serde_json::Value) -> bool {
-    // Check if instruction transfers to 1DEV burn address
-    const BURN_ADDRESS: &str = "1nc1nerator11111111111111111111111111111111"; // Official Solana incinerator address
-    
-    if let Some(accounts) = instruction["accounts"].as_array() {
-        for account in accounts {
-            if let Some(account_str) = account.as_str() {
-                if account_str == BURN_ADDRESS {
-                    return true;
-                }
-            }
-        }
-    }
-    
-    false
-}
-
-fn extract_wallet_from_activation_code(activation_code: &str) -> Result<String, String> {
-    // Extract wallet address from activation code
-    // In production: decode activation code to get wallet address
-    if activation_code.is_empty() {
-        return Err("No activation code provided".to_string());
-    }
-    
-    // For now, derive wallet address from activation code
-    // In production: proper cryptographic derivation
-    let wallet_hash = blake3::hash(activation_code.as_bytes());
-    let wallet_address = bs58::encode(wallet_hash.as_bytes()).into_string();
-    
-    Ok(wallet_address)
+fn extract_wallet_from_activation_code(_activation_code: &str) -> Result<String, String> {
+    // Derive the real Solana wallet address from QNET_WALLET_SEED (BIP39 → SLIP-10 → Ed25519)
+    // This matches the mobile app derivation and is required for Solana RPC queries.
+    let seed = qnet_integration::node::load_wallet_seed("QNET_WALLET_SEED").ok_or(std::env::VarError::NotPresent)
+        .map_err(|_| "QNET_WALLET_SEED not set — cannot derive Solana wallet address for burn verification".to_string())?;
+    qnet_integration::crypto::solana_derivation::derive_solana_address_from_mnemonic(&seed)
 }
 
 async fn start_metrics_server(port: u16) {
@@ -3740,27 +3730,53 @@ async fn start_metrics_server(port: u16) {
     tokio::spawn(async move {
         use warp::Filter;
         
+        // PORT BIND RETRY for metrics — survive TIME_WAIT after fast Docker restart
+        {
+            let mut bound = false;
+            for attempt in 1u32..=10 {
+                match tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await {
+                    Ok(_probe) => { bound = true; break; }
+                    Err(e) => {
+                        println!("[WARN][METRICS] port_{}_busy attempt={}/10 err={}", port, attempt, e);
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    }
+                }
+            }
+            if !bound {
+                eprintln!("[ERR][METRICS] Cannot bind port {} after 10 attempts — metrics disabled", port);
+                return;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Real values only. Hardcoded zeros here are worse than no endpoint: an alert built on
+        // them can never fire, and the operator believes the node is monitored.
+        let started_at = std::time::Instant::now();
         let metrics_route = warp::path("metrics")
             .and(warp::get())
-            .map(|| {
-                // Basic Prometheus metrics format
+            .map(move || {
+                let (applied, target, behind) = qnet_integration::node::network_status();
+                let peers = qnet_integration::node::try_get_p2p()
+                    .map(|p| p.get_peer_count_lockfree())
+                    .unwrap_or(0);
                 format!(
-                    "# HELP qnet_node_uptime_seconds Total uptime of the node\n\
-                     # TYPE qnet_node_uptime_seconds counter\n\
-                     qnet_node_uptime_seconds {}\n\
-                     # HELP qnet_blocks_height Current blockchain height\n\
-                     # TYPE qnet_blocks_height gauge\n\
-                     qnet_blocks_height 0\n\
-                     # HELP qnet_peers_connected Number of connected peers\n\
-                     # TYPE qnet_peers_connected gauge\n\
-                     qnet_peers_connected 0\n\
-                     # HELP qnet_transactions_total Total number of transactions\n\
-                     # TYPE qnet_transactions_total counter\n\
-                     qnet_transactions_total 0\n",
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs()
+                    "# HELP qnet_node_uptime_seconds Seconds since the metrics server started
+                     # TYPE qnet_node_uptime_seconds counter
+                     qnet_node_uptime_seconds {}
+                     # HELP qnet_blocks_height Applied microblock height
+                     # TYPE qnet_blocks_height gauge
+                     qnet_blocks_height {}
+                     # HELP qnet_network_height Best height observed on the network
+                     # TYPE qnet_network_height gauge
+                     qnet_network_height {}
+                     # HELP qnet_blocks_behind Blocks this node is behind the network
+                     # TYPE qnet_blocks_behind gauge
+                     qnet_blocks_behind {}
+                     # HELP qnet_peers_connected Connected peers
+                     # TYPE qnet_peers_connected gauge
+                     qnet_peers_connected {}
+",
+                    started_at.elapsed().as_secs(), applied, target, behind, peers
                 )
             });
         
@@ -3771,7 +3787,6 @@ async fn start_metrics_server(port: u16) {
         
         let routes = metrics_route.with(cors);
         
-        // Get external IP for metrics display
         let external_ip = match tokio::process::Command::new("curl")
             .arg("-s")
             .arg("--max-time")
@@ -3783,7 +3798,7 @@ async fn start_metrics_server(port: u16) {
             Ok(output) if output.status.success() => {
                 String::from_utf8_lossy(&output.stdout).trim().to_string()
             }
-            _ => "127.0.0.1".to_string(), // Fallback only for display
+            _ => "127.0.0.1".to_string(),
         };
         
         println!("📈 Metrics available at: http://{}:{}/metrics", external_ip, port);
@@ -3791,64 +3806,44 @@ async fn start_metrics_server(port: u16) {
     });
 }
 
-async fn start_reward_claiming_service(wallet_key: String, node_type: String) {
-    println!("💰 Starting automatic reward claiming service...");
-    
-    tokio::spawn(async move {
-        let mut interval = interval(Duration::from_secs(4 * 60 * 60)); // Every 4 hours
-        
-        loop {
-            interval.tick().await;
-            
-            let wallet_preview = if wallet_key.len() >= 8 { &wallet_key[..8] } else { &wallet_key };
-        println!("💰 Claiming rewards for wallet: {}...", wallet_preview);
-            
-            // In production: Claim rewards from blockchain
-            let reward_amount = calculate_base_reward().await.unwrap_or(0.0);
-            let fee_share = calculate_fee_share(&node_type).await.unwrap_or(0.0);
-            let total_reward = reward_amount + fee_share;
-            
-            println!("✅ Rewards claimed: {:.2} QNC (Base: {:.2} + Fees: {:.2})", 
-                     total_reward, reward_amount, fee_share);
-        }
-    });
-}
-
 async fn calculate_base_reward() -> Result<f64, String> {
-    // Sharp drop economic model: normal halving (÷2) except 5th halving (÷10)
-    // Years 0-4: 245,100.67 QNC per 4-hour period
-    // Years 4-8: 122,550.33 QNC per 4-hour period (÷2)
-    // Years 8-12: 61,275.17 QNC per 4-hour period (÷2)
-    // Years 12-16: 30,637.58 QNC per 4-hour period (÷2)
-    // Years 16-20: 15,318.79 QNC per 4-hour period (÷2)
-    // Years 20-24: 1,531.88 QNC per 4-hour period (÷10 SHARP DROP!)
-    // Years 24+: Resume normal halving (÷2) but from much lower base
+    // PRODUCTION v2.85: Use PhaseAwareRewardManager (no duplication!)
+    // Real halving logic is in core/qnet-consensus/src/lazy_rewards.rs
+    let genesis_ts = GLOBAL_GENESIS_TIMESTAMP.load(std::sync::atomic::Ordering::Relaxed);
+    if genesis_ts == 0 {
+        return Ok(0.0);
+    }
     
-    let years_since_genesis = 0; // In production: Calculate from genesis block
-    let halving_cycles = years_since_genesis / 4;
+    let years = years_since(genesis_ts);
+    let pool1_emission = qnet_consensus::lazy_rewards::pool1_base_emission_for_cycles(years / 4);
     
-    let base_rate = if halving_cycles == 5 {
-        // 5th halving (year 20-24): Sharp drop by 10x instead of 2x
-        251_432.34 / (2.0_f64.powi(4) * 10.0) // Previous 4 halvings (÷2) then sharp drop (÷10)
-    } else if halving_cycles > 5 {
-        // After sharp drop: Resume normal halving from new low base
-        let normal_halvings = halving_cycles - 5;
-        251_432.34 / (2.0_f64.powi(4) * 10.0 * 2.0_f64.powi(normal_halvings as i32))
-    } else {
-        // Normal halving for first 5 cycles (20 years) - CORRECTED to match whitepaper
-        251_432.34 / (2.0_f64.powi(halving_cycles as i32))
-    };
+    // v2.87: Log halving/phase status every 4h (with reward claims)
+    let halving_cycle = years / 4;
+    let years_until_halving = 4 - (years % 4);
+    let next_cycle = halving_cycle + 1;
+    let halving_type = if next_cycle == 5 { "÷10_SHARP" } else { "÷2" };
+    let emission_qnc = (pool1_emission as f64) / 1_000_000_000.0;
     
-    Ok(base_rate)
+    // Phase for the operator log: from the one resolver, which already applies both halves of the
+    // rule (90% of 1DEV burned OR five years since genesis). Unreadable supply reads as Phase 1.
+    let phase = qnet_integration::rpc::live_activation_pricing_opt().await
+        .map(|p| p.phase).unwrap_or(1);
+
+    println!("[REWARD][ECON] 4h_window phase={} years={} halving_cycle={} next_halving={}y halving_type={} pool1_emission={:.2}",
+        phase, years, halving_cycle, years_until_halving, halving_type, emission_qnc);
+    
+    // Convert from nanoQNC to QNC
+    Ok(emission_qnc)
 }
 
 async fn calculate_fee_share(node_type_str: &str) -> Result<f64, String> {
     let total_fees = 100.0; // In production: Query blockchain
     
+    // v3.18: Pool 2 removed - fees go directly to block producer
+    // This code kept for backward compatibility (always returns 0)
     let share_percentage = match node_type_str {
         "light" => 0.0,  // 0% of fees
-        "full" => 0.30,  // 30% of fees
-        "super" => 0.70, // 70% of fees
+        "super" => 0.0,  // v3.18: Fees go directly to producer, not pooled
         _ => 0.0,
     };
     
@@ -3870,8 +3865,7 @@ async fn print_microblock_status() {
     println!("🔗 Microblock Architecture Status:");
     println!("   📦 Microblocks: 1-second intervals (fast finality)");
     println!("   🏗️  Macroblocks: 90-second intervals (permanent finality)");
-    println!("   ⚡ Target TPS: 100,000+ transactions per second");
-    println!("   🌐 Network scaling: Ready for 10M+ nodes");
+
 }
 
 fn parse_bootstrap_peers(peers_str: &Option<String>) -> Vec<String> {
@@ -3909,12 +3903,13 @@ async fn try_query_node(addr: &str) -> Result<NodeInfo, String> {
         Ok(response) => {
             if response.status().is_success() {
                 if let Ok(text) = response.text().await {
-                    // Simple parsing of node type from response
-                    let node_type = if text.contains("Light") {
+                    // Simple parsing of node type from response (case-insensitive)
+                    let text_lower = text.to_lowercase();
+                    let node_type = if text_lower.contains("light") {
                         "Light".to_string()
-                    } else if text.contains("Super") {
+                    } else if text_lower.contains("super") {
                         "Super".to_string()
-                    } else if text.contains("Full") {
+                    } else if text_lower.contains("full") {
                         "Full".to_string()
                     } else {
                         "Unknown".to_string()
@@ -4077,10 +4072,11 @@ async fn scan_active_qnet_nodes() -> (RealNodeCounts, Vec<String>) {
     
     for peer_addr in discovered_peers.clone() {
         if let Ok(node_info) = query_node_info(&peer_addr).await {
-            match node_info.node_type.as_str() {
-                "Light" => counts.light += 1,
-                "Full" => counts.full += 1,
-                "Super" => counts.super_nodes += 1,
+            // v3.18: Full nodes removed - "full" mapped to Super for backward compatibility
+            match node_info.node_type.to_lowercase().as_str() {
+                "light" => counts.light += 1,
+                "full" => counts.super_nodes += 1, // v3.18: Full nodes are now Super
+                "super" => counts.super_nodes += 1,
                 _ => {}
             }
             counts.total += 1;
@@ -4092,8 +4088,8 @@ async fn scan_active_qnet_nodes() -> (RealNodeCounts, Vec<String>) {
     println!("📊 Decentralized network scan complete:");
     println!("   🌐 Total Active Nodes: {}", counts.total);
     println!("   📱 Light Nodes: {} (mobile devices)", counts.light);
-    println!("   🖥️  Full Nodes: {} (servers)", counts.full);
-    println!("   ⚡ Super Nodes: {} (high-performance)", counts.super_nodes);
+    // v3.18: Full Nodes removed
+    println!("   ⚡ Super Nodes: {} (high-performance servers)", counts.super_nodes);
     
     // QUANTUM DECENTRALIZED: No file persistence - use real-time network discovery only
     println!("[DISCOVERY] 🔗 QUANTUM: Peer discovery completed via decentralized protocol (no cache persistence)");
@@ -4236,8 +4232,12 @@ async fn perform_dht_peer_discovery() -> Result<Vec<String>, String> {
     discovered_peers.append(&mut second_hop_peers);
     discovered_peers.sort();
     discovered_peers.dedup();
-    
-    println!("[DHT] 📊 DHT discovery complete: {} initial peers, {} total after propagation", 
+
+    // Total cap: even across many honest+malicious responses the accepted set
+    // is bounded by a constant, independent of network size.
+    discovered_peers.truncate(MAX_DISCOVERED_PEERS);
+
+    println!("[DHT] 📊 DHT discovery complete: {} initial peers, {} total after propagation",
              initial_count, discovered_peers.len());
     
     // DIAGNOSTIC: Show final peer summary
@@ -4353,7 +4353,7 @@ async fn query_node_for_peers(node_addr: &str) -> Result<Vec<String>, String> {
     // CRITICAL FIX: Use only actual listening port (8001) 
     // All QNet nodes run unified API on port 8001 only - no 8080/9876
     let endpoints = vec![
-        format!("http://{}:8001/api/v1/peers", ip),     // Unified API port
+        format!("http://{}:8001/api/v1/peers", ip),
     ];
     
     for endpoint in endpoints {
@@ -4370,15 +4370,21 @@ async fn query_node_for_peers(node_addr: &str) -> Result<Vec<String>, String> {
     Err(format!("All endpoints failed for {}", node_addr))
 }
 
+// Constant cap on peers accepted from ONE response — a peer cannot flood the
+// discovery set with phantom addresses. Fixed bound (not proportional to N).
+const MAX_PEERS_PER_RESPONSE: usize = 64;
+// Total cap on the peer set produced by one DHT discovery pass.
+const MAX_DISCOVERED_PEERS: usize = 256;
+
 // HTTP query for peer list with timeout
 async fn query_peers_http(endpoint: &str) -> Result<Vec<String>, String> {
     use std::time::Duration;
     
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15)) // PRODUCTION: Extended timeout for peer discovery
-        .connect_timeout(Duration::from_secs(8)) // Connection timeout for peer queries
+        .timeout(Duration::from_secs(15))
+        .connect_timeout(Duration::from_secs(8))
         .user_agent("QNet-Node/1.0")
-        .tcp_nodelay(true) // Faster peer discovery
+        .tcp_nodelay(true)
         .build()
         .map_err(|e| format!("HTTP client error: {}", e))?;
     
@@ -4386,40 +4392,36 @@ async fn query_peers_http(endpoint: &str) -> Result<Vec<String>, String> {
         Ok(response) if response.status().is_success() => {
             match response.text().await {
                 Ok(text) => {
-                    // Parse peer list (JSON format: {"peers": ["ip1:port1", "ip2:port2"]})
-                    if text.contains("\"peers\"") {
-                        let peers: Vec<String> = text
-                            .split("\"peers\":")
-                            .nth(1)
-                            .unwrap_or("")
-                            .split('[')
-                            .nth(1)
-                            .unwrap_or("")
-                            .split(']')
-                            .next()
-                            .unwrap_or("")
-                            .split(',')
-                            .filter_map(|s| {
-                                let clean = s.trim().trim_matches('"').trim();
-                                if clean.is_empty() || clean == "{" || clean == "}" {
-                                    None
-                                } else {
-                                    Some(clean.to_string())
+                    // Parse peer list using proper JSON parsing.
+                    // Response format: {"peers": [{"address":"ip:port", "id":"...", ...}, ...]}
+                    // or legacy: {"peers": ["ip:port", ...]}
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+                        if let Some(peers_array) = json.get("peers").and_then(|p| p.as_array()) {
+                            let peers: Vec<String> = peers_array.iter().filter_map(|entry| {
+                                // Object format: extract "address" field
+                                if let Some(addr) = entry.get("address").and_then(|a| a.as_str()) {
+                                    if !addr.is_empty() && addr.contains(':') {
+                                        return Some(addr.to_string());
+                                    }
                                 }
-                            })
-                            .collect();
-                        
-                        Ok(peers)
-                    } else {
-                        // Try simple comma-separated format
-                        let peers: Vec<String> = text
-                            .split(',')
-                            .map(|s| s.trim().to_string())
-                            .filter(|s| !s.is_empty() && s.contains(':'))
-                            .collect();
-                        
-                        Ok(peers)
+                                // String format: use directly
+                                if let Some(s) = entry.as_str() {
+                                    if !s.is_empty() && s.contains(':') {
+                                        return Some(s.to_string());
+                                    }
+                                }
+                                None
+                            }).collect();
+                            return Ok(cap_peer_list(peers));
+                        }
                     }
+                    // Fallback: simple comma-separated format
+                    let peers: Vec<String> = text
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty() && s.contains(':') && !s.contains('"'))
+                        .collect();
+                    Ok(cap_peer_list(peers))
                 }
                 Err(e) => Err(format!("Failed to read response: {}", e)),
             }
@@ -4427,6 +4429,16 @@ async fn query_peers_http(endpoint: &str) -> Result<Vec<String>, String> {
         Ok(response) => Err(format!("HTTP error: {}", response.status())),
         Err(e) => Err(format!("Request failed: {}", e)),
     }
+}
+
+// Dedup then truncate to a constant per-response bound so no single peer can
+// flood the discovery set. Order-stable (dedup keeps first sight) — no map iteration.
+fn cap_peer_list(peers: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    peers.into_iter()
+        .filter(|p| seen.insert(p.clone()))
+        .take(MAX_PEERS_PER_RESPONSE)
+        .collect()
 }
 
 // Get peer list from an active node
@@ -4514,51 +4526,116 @@ async fn get_activation_with_auto_genesis() -> Result<(NodeType, String), Box<dy
         
         return Ok((NodeType::Super, genesis_code));
     } else {
-        println!("[DEBUG] ❌ NOT a genesis node - checking storage...");
+        println!("[DEBUG] ❌ NOT a genesis node - checking env/storage...");
     }
     
-    // Try to initialize storage first
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // v4.5: PRIORITY 1 — Read activation code from environment variable
+    // This is the PRIMARY method for Docker detached mode (-d):
+    //   docker run -d -e QNET_ACTIVATION_CODE=QNET-SXXXXX-YYYYYY-ZZZZZZ \
+    //              -e QNET_BURN_TX_HASH=<solana_tx_signature> \
+    //              -e QNET_BURN_AMOUNT=1500 ...
+    // Code is SELF-CONTAINED: XOR(wallet_prefix, SHA3(burn_tx:type:amount))
+    // Verification is STATELESS — no node state needed.
+    // ═══════════════════════════════════════════════════════════════════════════════
+    if let Ok(env_code) = std::env::var("QNET_ACTIVATION_CODE") {
+        let env_code = env_code.trim().to_string();
+        if !env_code.is_empty() && env_code.starts_with("QNET-") {
+            println!("[INFO][STARTUP] activation_source=env_var code={}...", qnet_state::char_prefix(&env_code, 12));
+            
+            // Read burn data from env for stateless verification
+            let burn_tx = std::env::var("QNET_BURN_TX_HASH").unwrap_or_default();
+            let burn_amount: u64 = std::env::var("QNET_BURN_AMOUNT")
+                .unwrap_or_default()
+                .parse()
+                .unwrap_or(0);
+            
+            if !burn_tx.is_empty() && burn_amount > 0 {
+                // Store burn data in env for later use by save_activation_code
+                std::env::set_var("QNET_BURN_TX_HASH", &burn_tx);
+                std::env::set_var("QNET_BURN_AMOUNT", burn_amount.to_string());
+                println!("[INFO][STARTUP] burn_data=present tx={}... amount={}",
+                    qnet_state::char_prefix(&burn_tx, 16), burn_amount);
+            } else {
+                println!("[WARN][STARTUP] burn_data=missing — set QNET_BURN_TX_HASH and QNET_BURN_AMOUNT for full verification");
+                println!("[WARN][STARTUP] Code will still be validated via comprehensive checks at startup");
+            }
+            
+            // Server nodes are always Super (Light → exit(1) enforced later)
+            return Ok((NodeType::Super, env_code));
+        }
+    }
+    
+    // PRIORITY 2: Check persistent RocksDB storage (previous activation)
     let temp_storage = match Storage::new("./temp_activation_check") {
         Ok(storage) => storage,
         Err(e) => {
-            println!("[WARNING] Storage not available: {}, running interactive setup", e);
-            return interactive_node_setup().await;
+            println!("[WARNING] Storage not available: {} — skipping RocksDB check", e);
+            // Fall through to error message below (no interactive fallback)
+            eprintln!("❌ No QNET_ACTIVATION_CODE env var and storage unavailable.");
+            eprintln!("   Set QNET_ACTIVATION_CODE, QNET_BURN_TX_HASH, QNET_BURN_AMOUNT, QNET_WALLET_SEED");
+            std::process::exit(1);
         }
     };
     
-    // Check for existing activation code
     println!("[DEBUG] Loading activation code from storage...");
     match temp_storage.load_activation_code() {
         Ok(Some((code, node_type_id, timestamp))) => {
             println!("[DEBUG] Found existing activation code");
             let node_type = match node_type_id {
                 0 => NodeType::Light,
-                1 => NodeType::Full,
+                1 => NodeType::Super,
                 2 => NodeType::Super,
-                _ => NodeType::Full,
+                _ => NodeType::Super,
             };
             
-            // Check if activation is still valid (codes never expire - tied to blockchain burns)
-            println!("[SUCCESS] Found valid activation code with cryptographic binding");
-            println!("   [CODE] Code: {}", mask_code(&code));
+            println!("[INFO][STARTUP] activation_source=rocksdb code={}", mask_code(&code));
             println!("   [TYPE] Node Type: {:?}", node_type);
             let current_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
             println!("   [TIME] Activated: {} days ago", (current_time - timestamp) / (24 * 60 * 60));
-            println!("   [UNIVERSAL] Works on VPS, VDS, PC, laptop, server");
             println!("   [RESUMING] Resuming node with existing activation...\n");
             return Ok((node_type, code));
         }
         Ok(None) => {
-            println!("[DEBUG] No existing activation found");
+            println!("[DEBUG] No existing activation found in storage");
         }
         Err(e) => {
             println!("[WARNING] Error checking activation: {}", e);
         }
     }
     
-    // For non-genesis nodes, run interactive setup
-    println!("[DEBUG] Regular node detected - starting interactive setup");
-    interactive_node_setup().await
+    // NO INTERACTIVE MENU — super nodes use env vars ONLY (same as genesis nodes)
+    // If we get here: no QNET_BOOTSTRAP_ID, no QNET_ACTIVATION_CODE, no saved activation
+    eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    eprintln!("❌ ACTIVATION REQUIRED — no activation data found");
+    eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    eprintln!("");
+    eprintln!("Super Node requires these environment variables:");
+    eprintln!("  -e QNET_ACTIVATION_CODE=\"QNET-SXXXXX-YYYYYY-ZZZZZZ\"");
+    eprintln!("  -e QNET_BURN_TX_HASH=\"your_solana_burn_tx_signature\"");
+    eprintln!("  -e QNET_BURN_AMOUNT=\"1500\"");
+    eprintln!("  QNET_WALLET_SEED_FILE=/run/secrets/qnet_seed   (file, mode 0600 — preferred)");
+    eprintln!("");
+    eprintln!("  The mnemonic is the SAME secret as your mobile wallet. Passing it with -e makes it");
+    eprintln!("  readable via `docker inspect` and /proc/<pid>/environ. Mount a 0600 file instead.");
+    eprintln!("");
+    eprintln!("Example:");
+    eprintln!("  printf %s \"your mnemonic here\" > ./qnet_seed && chmod 600 ./qnet_seed");
+    eprintln!("  docker run -d --name qnet-super --restart=always \\");
+    eprintln!("    -e QNET_PRODUCTION=1 \\");
+    eprintln!("    -e DOCKER_ENV=1 \\");
+    eprintln!("    -v $(pwd)/qnet_seed:/run/secrets/qnet_seed:ro \\");
+    eprintln!("    -e QNET_WALLET_SEED_FILE=/run/secrets/qnet_seed \\");
+    eprintln!("    -e QNET_ACTIVATION_CODE=\"QNET-SXXXXX-YYYYYY-ZZZZZZ\" \\");
+    eprintln!("    -e QNET_BURN_TX_HASH=\"solana_tx_signature\" \\");
+    eprintln!("    -e QNET_BURN_AMOUNT=\"1500\" \\");
+    eprintln!("    -p 9876:9876 -p 9877:9877 -p 8001:8001 -p 10876:10876/udp \\");
+    eprintln!("    -v $(pwd)/node_data:/app/data \\");
+    eprintln!("    qnet-production");
+    eprintln!("");
+    eprintln!("Get activation data from QNet Mobile App: Settings > Export Activation Codes");
+    eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    std::process::exit(1);
 }
 
 

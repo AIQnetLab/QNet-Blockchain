@@ -9,7 +9,7 @@ import CryptoJS from 'crypto-js';
 class WalletSecurity {
     constructor() {
         this.algorithm = 'AES-256-GCM';
-        this.keyDerivationRounds = 100000; // PBKDF2 iterations
+        this.keyDerivationRounds = 600_000; // PBKDF2 iterations (OWASP 2024)
         this.saltLength = 32; // bytes
         this.ivLength = 16; // bytes for AES-GCM
         this.tagLength = 16; // bytes for authentication tag

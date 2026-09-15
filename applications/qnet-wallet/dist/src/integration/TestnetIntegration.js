@@ -132,7 +132,7 @@ export class TestnetIntegration {
             activationHistory: [
                 {
                     id: 'test_activation_1',
-                    type: 'full',
+                    type: 'super',  // v3.18: Changed from 'full' to 'super'
                     status: 'completed',
                     timestamp: Date.now() - 86400000,
                     txHash: 'test_tx_hash_1',
@@ -149,7 +149,7 @@ export class TestnetIntegration {
             ],
             nodeStatus: {
                 nodeId: 'test_node_12345',
-                type: 'full',
+                type: 'super',  // v3.18: Changed from 'full' to 'super'
                 status: 'active',
                 uptime: 99.5,
                 lastReward: Date.now() - 7200000,

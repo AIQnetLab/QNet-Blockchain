@@ -1,7 +1,7 @@
 """
-Server Node Monitor for Full and Super Nodes
+Server Node Monitor for Super Nodes (v3.18: Full removed)
 These nodes run on servers and are pinged directly on server infrastructure
-NO mobile device pinging for Full/Super nodes!
+NO mobile device pinging for Super nodes!
 """
 
 import time
@@ -16,9 +16,8 @@ from enum import Enum
 logger = logging.getLogger(__name__)
 
 class ServerNodeType(Enum):
-    """Server node types"""
-    FULL = "full"       # Full node - 95% success rate required
-    SUPER = "super"     # Super node - 98% success rate required
+    """Server node types - v3.18: Only Super nodes (Full removed)"""
+    SUPER = "super"     # Super node - 90% success rate required
 
 class ServerNodeStatus(Enum):
     """Server node status"""
@@ -45,7 +44,7 @@ class ServerNodeInfo:
     consecutive_failures: int # Consecutive ping failures
 
 class ServerNodeMonitor:
-    """Monitor for server-based Full and Super nodes"""
+    """Monitor for server-based Super nodes (v3.18: Full removed)"""
     
     def __init__(self):
         # node_id -> ServerNodeInfo
@@ -57,9 +56,9 @@ class ServerNodeMonitor:
         self.max_consecutive_failures = 3
         
         # Success rate requirements (FOR CURRENT 4-HOUR REWARD WINDOW ONLY!)
+        # v3.18: Only Super nodes (Full removed)
         self.success_rate_requirements = {
-            ServerNodeType.FULL: 0.95,   # 95% over current 4-hour window (60 pings)
-            ServerNodeType.SUPER: 0.98,  # 98% over current 4-hour window (60 pings)
+            ServerNodeType.SUPER: 0.90,  # 90% over current 4-hour window
         }
         
         # Current reward window size (4 hours)
@@ -246,11 +245,10 @@ class ServerNodeMonitor:
         ]
     
     def get_server_nodes_summary(self) -> Dict:
-        """Get summary statistics for server nodes"""
+        """Get summary statistics for server nodes - v3.18: Only Super nodes"""
         if not self.server_nodes:
             return {
                 "total_nodes": 0,
-                "full_nodes": 0,
                 "super_nodes": 0,
                 "active_nodes": 0,
                 "offline_nodes": 0,
@@ -258,7 +256,7 @@ class ServerNodeMonitor:
                 "average_success_rate": 0.0
             }
         
-        full_nodes = [n for n in self.server_nodes.values() if n.node_type == ServerNodeType.FULL]
+        # v3.18: Only Super nodes (Full removed)
         super_nodes = [n for n in self.server_nodes.values() if n.node_type == ServerNodeType.SUPER]
         active_nodes = [n for n in self.server_nodes.values() if n.status == ServerNodeStatus.ACTIVE]
         offline_nodes = [n for n in self.server_nodes.values() if n.status == ServerNodeStatus.OFFLINE]
@@ -268,14 +266,12 @@ class ServerNodeMonitor:
         
         return {
             "total_nodes": len(self.server_nodes),
-            "full_nodes": len(full_nodes),
             "super_nodes": len(super_nodes),
             "active_nodes": len(active_nodes),
             "offline_nodes": len(offline_nodes),
             "degraded_nodes": len(degraded_nodes),
             "average_success_rate": avg_success_rate,
             "success_rate_compliance": {
-                "full_nodes_compliant": sum(1 for n in full_nodes if n.success_rate >= self.success_rate_requirements[ServerNodeType.FULL]),
                 "super_nodes_compliant": sum(1 for n in super_nodes if n.success_rate >= self.success_rate_requirements[ServerNodeType.SUPER])
             }
         }

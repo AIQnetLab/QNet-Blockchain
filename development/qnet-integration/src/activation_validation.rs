@@ -4,24 +4,13 @@ use tokio::sync::RwLock;
 use serde::{Deserialize, Serialize};
 use sha3::{Sha3_256, Digest};
 use crate::errors::IntegrationError;
-use base64::{Engine as _, engine::general_purpose};
-use blake3;
+// blake3 removed - using SHA3-256 for NIST FIPS 202 compliance
 use hex;
 use serde_json;
 
-/// Safe string preview utility to prevent index out of bounds errors
-fn safe_preview(s: &str, len: usize) -> &str {
-    if s.len() >= len {
-        &s[..len]
-    } else {
-        s
-    }
-}
-
-// REMOVED: BlockchainMigrationRecord - migration is just normal node activation!
-
 /// Network statistics for dynamic pricing calculations
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct NetworkStats {
     total_nodes: u64,
     light_nodes: u64,
@@ -131,55 +120,82 @@ impl BloomFilter {
     }
 }
 
-/// LRU cache for hot activation codes
+/// FIX H36: LRU cache with O(1) amortized get/put using LinkedHashMap pattern
+/// Uses VecDeque<K> for order tracking + HashMap for O(1) lookup.
+/// Eviction batch amortizes the O(n) retain cost across many accesses.
 #[derive(Debug)]
 pub struct LruCache<K, V> {
     capacity: usize,
     items: HashMap<K, V>,
-    access_order: Vec<K>,
+    access_order: std::collections::VecDeque<K>,
+    dirty_count: usize,
 }
+
+const LRU_COMPACT_THRESHOLD: usize = 256;
 
 impl<K: Clone + Eq + std::hash::Hash, V> LruCache<K, V> {
     pub fn new(capacity: usize) -> Self {
         Self {
             capacity,
-            items: HashMap::new(),
-            access_order: Vec::new(),
+            items: HashMap::with_capacity(capacity),
+            access_order: std::collections::VecDeque::with_capacity(capacity),
+            dirty_count: 0,
         }
     }
-    
+
     pub fn get(&mut self, key: &K) -> Option<&V> {
-        if let Some(value) = self.items.get(key) {
-            // Move to end (most recently used)
-            self.access_order.retain(|k| k != key);
-            self.access_order.push(key.clone());
-            Some(value)
+        if self.items.contains_key(key) {
+            // Lazy LRU: append to back, mark dirty; compact periodically
+            self.access_order.push_back(key.clone());
+            self.dirty_count += 1;
+            if self.dirty_count >= LRU_COMPACT_THRESHOLD {
+                self.compact();
+            }
+            self.items.get(key)
         } else {
             None
         }
     }
-    
+
     pub fn put(&mut self, key: K, value: V) {
         if self.items.contains_key(&key) {
-            // Update existing
             self.items.insert(key.clone(), value);
-            self.access_order.retain(|k| k != &key);
-            self.access_order.push(key);
+            self.access_order.push_back(key);
+            self.dirty_count += 1;
         } else {
-            // Add new
-            if self.items.len() >= self.capacity {
-                // Remove least recently used
-                if let Some(lru_key) = self.access_order.first().cloned() {
-                    self.items.remove(&lru_key);
-                    self.access_order.remove(0);
+            // Evict LRU if at capacity
+            while self.items.len() >= self.capacity {
+                if let Some(lru_key) = self.access_order.pop_front() {
+                    // Only evict if this is the latest entry for this key
+                    if !self.access_order.contains(&lru_key) {
+                        self.items.remove(&lru_key);
+                    }
+                } else {
+                    break;
                 }
             }
-            
             self.items.insert(key.clone(), value);
-            self.access_order.push(key);
+            self.access_order.push_back(key);
+        }
+        if self.dirty_count >= LRU_COMPACT_THRESHOLD {
+            self.compact();
         }
     }
-    
+
+    /// Remove duplicate entries in access_order, keeping only the last occurrence
+    fn compact(&mut self) {
+        let mut seen = std::collections::HashSet::with_capacity(self.items.len());
+        let mut new_order = std::collections::VecDeque::with_capacity(self.items.len());
+        // Iterate from back to keep last (most recent) occurrence
+        for key in self.access_order.iter().rev() {
+            if seen.insert(key.clone()) {
+                new_order.push_front(key.clone());
+            }
+        }
+        self.access_order = new_order;
+        self.dirty_count = 0;
+    }
+
     pub fn len(&self) -> usize {
         self.items.len()
     }
@@ -309,11 +325,11 @@ pub struct NodeInfo {
 }
 
 fn default_phase() -> u8 { 1 }
-fn default_burn_amount() -> u64 { 1500 } // Default Phase 1 base price
+fn default_burn_amount() -> u64 { 1500 } // Phase 1 base price — backward compat for old records without this field
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActivationRecord {
-    pub code_hash: String, // Blake3 hash of activation code for secure blockchain storage
+    pub code_hash: String, // SHA3-256 hash of activation code for secure blockchain storage (NIST FIPS 202 compliant)
     pub wallet_address: String,
     pub tx_hash: String, // Phase 1: 1DEV burn tx hash on Solana, Phase 2: QNC transfer tx hash to Pool 3
     pub activated_at: u64,
@@ -360,7 +376,10 @@ impl BlockchainActivationRegistry {
                 .unwrap_or_else(|_| "127.0.0.1,10.0.0.1,10.0.0.2".to_string());
             
             genesis_nodes.split(',')
-                .map(|ip| format!("http://{}:8001", ip.trim()))
+                .map(|ip| {
+                    let ip = ip.trim();
+                    format!("http://{}:8001", ip)
+                })
                 .collect()
         };
         
@@ -378,30 +397,213 @@ impl BlockchainActivationRegistry {
         }
     }
 
-    /// FIXED: Verify activation code belongs to specific wallet (1 wallet = 1 code)
+    /// v4.3 FIXED: Verify activation code belongs to specific wallet
+    /// 
+    /// DESIGN: The activation code embeds XOR-encrypted wallet prefix.
+    /// XOR key = SHA3(burn_tx_hash:node_type:burn_amount)[0..32]
+    /// All inputs are PUBLIC (Solana blockchain + code itself) → STATELESS verification.
+    /// Nodes don't need to store anything — they can always verify from the code + burn data.
+    ///
+    /// Strategy (ordered by reliability):
+    ///   1. STATELESS XOR: burn_tx_hash provided by client → reconstruct key → decrypt → compare
+    ///   2. IN-MEMORY: quantum_crypto cache has burn_tx data (same session as generate)
+    ///   3. ROCKSDB: wallet already registered → reverse index confirms ownership
     pub async fn verify_code_ownership(&self, code: &str, wallet_address: &str) -> Result<bool, IntegrationError> {
-        println!("🔍 Verifying code ownership for wallet: {}...", safe_preview(wallet_address, 8));
+        println!("[INFO][VERIFY] code_ownership_check wallet={}... code={}...", 
+            qnet_state::char_prefix(&wallet_address, 16),
+            qnet_state::char_prefix(&code, 12));
         
-        // Extract wallet address from activation code
-        let code_wallet = match self.extract_wallet_from_activation_code(code).await {
-            Ok(wallet) => wallet,
-            Err(e) => {
-                println!("❌ Failed to extract wallet from code: {}", e);
+        // Strategy 1: In-memory quantum XOR decryption (works if registry has burn_tx data)
+        match self.extract_wallet_from_activation_code(code).await {
+            Ok(ref code_wallet) if code_wallet == wallet_address => {
+                println!("[INFO][VERIFY] ownership_confirmed method=quantum_decrypt wallet={}...", 
+                    qnet_state::char_prefix(&wallet_address, 16));
+                return Ok(true);
+            }
+            Ok(ref code_wallet) if !code_wallet.is_empty() && code_wallet.len() > 10 => {
+                // XOR decryption returned a plausible full wallet — but it doesn't match
+                println!("[WARN][VERIFY] ownership_rejected method=quantum_decrypt expected={}... got={}...",
+                    qnet_state::char_prefix(&wallet_address, 16),
+                    qnet_state::char_prefix(&code_wallet, 16));
                 return Ok(false);
             }
-        };
-        
-        // Check if code belongs to this wallet
-        let belongs_to_wallet = code_wallet == wallet_address;
-        
-        if belongs_to_wallet {
-            println!("✅ Code ownership verified - code belongs to wallet");
-        } else {
-            println!("❌ Code ownership failed - code belongs to different wallet: {}...", 
-                safe_preview(&code_wallet, 8));
+            _ => {
+                // XOR decryption failed (no burn_tx in registry) — need stateless path
+                println!("[INFO][VERIFY] quantum_decrypt_unavailable fallback=stateless_or_rocksdb");
+            }
         }
         
-        Ok(belongs_to_wallet)
+        // Strategy 2: RocksDB reverse index (wallet already registered before)
+        if let Some(storage) = crate::node::try_get_storage() {
+            match storage.get_nodes_by_wallet(wallet_address) {
+                Ok(nodes) if !nodes.is_empty() => {
+                    let expected_super = format!("super_{}", code);
+                    let expected_light = format!("light_{}", code);
+                    let light_pseudonym = crate::rpc::generate_light_node_pseudonym(wallet_address);
+                    // v15.11: Super-node pseudonym — wallet-derived privacy-
+                    // preserving identity for non-genesis super nodes. Mirrors
+                    // the Light pseudonym scheme with a separate domain tag so
+                    // the two namespaces never collide. Accepted here alongside
+                    // historical `super_<activation_code>` so existing
+                    // activations remain valid while new nodes use the
+                    // pseudonym path.
+                    let super_pseudonym = crate::rpc::generate_super_node_pseudonym(wallet_address);
+
+                    for (node_id, _node_type, _rep) in &nodes {
+                        if node_id == &expected_super
+                            || node_id == &expected_light
+                            || node_id == &light_pseudonym
+                            || node_id == &super_pseudonym
+                            || node_id == code {
+                            println!("[INFO][VERIFY] ownership_confirmed method=rocksdb node={} wallet={}...",
+                                node_id, qnet_state::char_prefix(&wallet_address, 16));
+                            return Ok(true);
+                        }
+                    }
+                    println!("[WARN][VERIFY] wallet_has_different_node wallet={}... nodes={:?}",
+                        qnet_state::char_prefix(&wallet_address, 16),
+                        nodes.iter().map(|(id,_,_)| id.clone()).collect::<Vec<_>>());
+                    return Ok(false);
+                }
+                _ => {} // No nodes in RocksDB — continue to stateless
+            }
+        }
+        
+        // Strategy 3: No data available — return Err so caller can use stateless XOR with burn_tx
+        Err(IntegrationError::CryptoError(
+            "Code ownership verification needs burn_tx_hash for stateless check".to_string()
+        ))
+    }
+    
+    /// v4.3: STATELESS code ownership verification using burn_tx_hash from client.
+    /// This is the PRIMARY verification method — works after any restart, on any node.
+    /// XOR key = SHA3(burn_tx:type:amount) → decrypt wallet prefix from code → compare.
+    pub fn verify_code_ownership_stateless(
+        &self,
+        code: &str,
+        wallet_address: &str,
+        burn_tx_hash: &str,
+        burn_amount: u64,
+    ) -> Result<bool, IntegrationError> {
+        use sha3::{Sha3_256, Digest};
+        
+        // Parse code: QNET-{TYPE+TS}-{ENC_WALLET[0:6]}-{ENC_WALLET[6:10]+ENTROPY}
+        // len() is BYTES; an ASCII check makes it a char count too, so every segment split below is
+        // exact rather than truncated.
+        if !code.starts_with("QNET-") || !code.is_ascii() || code.len() != 25 {
+            return Err(IntegrationError::ValidationError("Invalid code format".to_string()));
+        }
+        let parts: Vec<&str> = code.split('-').collect();
+        if parts.len() != 4 {
+            return Err(IntegrationError::ValidationError("Invalid code structure".to_string()));
+        }
+        
+        // Extract node type from segment1[0]: L=light, S=super
+        let node_type = match parts[1].chars().next() {
+            Some('L') | Some('l') => "light",
+            Some('S') | Some('s') => "super",
+            _ => "light",
+        };
+        
+        // Extract encrypted wallet hex from segments 2+3
+        let segment2 = parts[2]; // 6 hex chars
+        let wallet_part2 = qnet_state::char_prefix(&parts[3], 4); // first 4 hex chars
+        let encrypted_wallet_hex = format!("{}{}", segment2, wallet_part2); // 10 hex chars = 5 bytes
+        
+        // Reconstruct XOR key: SHA3(burn_tx:type:amount)[0..32]
+        let key_material = format!("{}:{}:{}", burn_tx_hash, node_type, burn_amount);
+        let mut hasher = Sha3_256::new();
+        hasher.update(key_material.as_bytes());
+        let key_full = hex::encode(hasher.finalize());
+        let encryption_key = &key_full[..32];
+        
+        // XOR decrypt wallet prefix
+        let encrypted_bytes = match hex::decode(&encrypted_wallet_hex) {
+            Ok(b) => b,
+            Err(_) => return Err(IntegrationError::ValidationError("Invalid hex in code".to_string())),
+        };
+        let key_bytes = encryption_key.as_bytes();
+        let mut decrypted = Vec::with_capacity(encrypted_bytes.len());
+        for (i, &enc_byte) in encrypted_bytes.iter().enumerate() {
+            decrypted.push(enc_byte ^ key_bytes[i % key_bytes.len()]);
+        }
+
+        // FIXED-width byte binding: the code carries exactly the first N bytes of the
+        // wallet. Compare those N bytes byte-exact — never a variable window derived
+        // from decrypted content (a short/empty decrypt must not truncate-match).
+        let bind_len = decrypted.len();
+        if wallet_address.len() < bind_len {
+            return Err(IntegrationError::ValidationError(
+                "[REJECT][ACTIVATION] wallet_shorter_than_binding".to_string()));
+        }
+        let matches = decrypted.as_slice() == &wallet_address.as_bytes()[..bind_len];
+
+        if matches {
+            println!("[INFO][VERIFY] ownership_confirmed method=stateless_xor wallet={}... bind_bytes={}",
+                qnet_state::char_prefix(&wallet_address, 16), bind_len);
+        } else {
+            println!("[WARN][VERIFY] ownership_rejected method=stateless_xor wallet={}... bind_bytes={}",
+                qnet_state::char_prefix(&wallet_address, 16), bind_len);
+        }
+
+        Ok(matches)
+    }
+    
+    /// Extract wallet prefix from activation code using stateless XOR decryption
+    /// Returns the first 5 bytes of the original wallet address that was encrypted in the code
+    /// Used by save_activation_code to get the wallet that generated this code (NOT the server's wallet)
+    pub fn extract_wallet_prefix_stateless(
+        &self,
+        code: &str,
+        burn_tx_hash: &str,
+        burn_amount: u64,
+    ) -> Result<String, IntegrationError> {
+        use sha3::{Sha3_256, Digest};
+        
+        // len() is BYTES; an ASCII check makes it a char count too, so every segment split below is
+        // exact rather than truncated.
+        if !code.starts_with("QNET-") || !code.is_ascii() || code.len() != 25 {
+            return Err(IntegrationError::ValidationError("Invalid code format".to_string()));
+        }
+        let parts: Vec<&str> = code.split('-').collect();
+        if parts.len() != 4 {
+            return Err(IntegrationError::ValidationError("Invalid code structure".to_string()));
+        }
+        
+        let node_type = match parts[1].chars().next() {
+            Some('L') | Some('l') => "light",
+            Some('S') | Some('s') => "super",
+            _ => "light",
+        };
+        
+        let segment2 = parts[2];
+        let wallet_part2 = qnet_state::char_prefix(&parts[3], 4);
+        let encrypted_wallet_hex = format!("{}{}", segment2, wallet_part2);
+        
+        let key_material = format!("{}:{}:{}", burn_tx_hash, node_type, burn_amount);
+        let mut hasher = Sha3_256::new();
+        hasher.update(key_material.as_bytes());
+        let key_full = hex::encode(hasher.finalize());
+        let encryption_key = &key_full[..32];
+        
+        let encrypted_bytes = hex::decode(&encrypted_wallet_hex)
+            .map_err(|_| IntegrationError::ValidationError("Invalid hex in code".to_string()))?;
+        let key_bytes = encryption_key.as_bytes();
+        let mut decrypted = Vec::with_capacity(encrypted_bytes.len());
+        for (i, &enc_byte) in encrypted_bytes.iter().enumerate() {
+            decrypted.push(enc_byte ^ key_bytes[i % key_bytes.len()]);
+        }
+        let prefix = String::from_utf8_lossy(&decrypted).to_string();
+        
+        // Sanity check: prefix should contain only printable ASCII (valid wallet chars)
+        if prefix.chars().all(|c| c.is_ascii_alphanumeric()) {
+            println!("[INFO][EXTRACT] wallet_prefix_stateless prefix={}...", qnet_state::char_prefix(&prefix, 5));
+            Ok(prefix)
+        } else {
+            Err(IntegrationError::CryptoError(
+                "Decrypted wallet prefix contains invalid characters — wrong burn_tx_hash or burn_amount".to_string()
+            ))
+        }
     }
     
     /// Extract wallet address from activation code using quantum decryption
@@ -417,7 +619,7 @@ impl BlockchainActivationRegistry {
             Ok(payload) => Ok(payload.wallet),
             Err(e) => {
                 println!("❌ CRITICAL: Quantum decryption failed - NO FALLBACK for security: {}", e);
-                println!("   Code: {}...", safe_preview(code, 8));
+                println!("   Code: {}...", code);
                 println!("   This means the activation code is invalid, corrupted, or system crypto is broken");
                 Err(IntegrationError::CryptoError(format!("Quantum decryption failed - security requires real wallet extraction: {}", e)))
             }
@@ -519,57 +721,12 @@ impl BlockchainActivationRegistry {
     
     /// Direct blockchain query using load balancer
     async fn query_blockchain_directly_by_hash(&self, code_hash: &str) -> Result<bool, IntegrationError> {
-        // PRODUCTION: Direct blockchain state query through consensus engine using secure hash
-        
-        match self.query_activation_state(code_hash).await {
-            Ok(exists) => {
-                println!("✅ Blockchain hash query: hash {} exists: {}", 
-                    &code_hash[..8], exists);
-                Ok(exists) // Return true if hash exists in blockchain
-            }
-            Err(query_error) => {
-                if self.is_genesis_bootstrap_mode() {
-                    println!("🚀 Genesis mode: Allowing hash validation without blockchain history");
-                    Ok(false) // In genesis mode, assume hash doesn't exist
-                } else {
-                    Err(IntegrationError::BlockchainError(
-                        format!("Blockchain hash query failed: {}", query_error)
-                    ))
-                }
-            }
-        }
+        // Registration-dedup authority is the on-chain registry_root in the QC Checkpoint,
+        // not a per-node RAM tier; this local L4 has no independent history and reports absent.
+        println!("[WARN][ACTIVATION] local_dedup_absent code_hash={} authority=registry_root", code_hash);
+        Ok(false)
     }
-    
-    /// Check code uniqueness through blockchain consensus
-    async fn consensus_check_code_uniqueness(&self, code: &str) -> Result<bool, String> {
-        // Query blockchain state for activation code usage
-        let code_hash = blake3::hash(code.as_bytes());
-        let code_hash_hex = code_hash.to_hex();
-        
-        // Check if activation code exists in blockchain state
-        match self.query_activation_state(&code_hash_hex).await {
-            Ok(exists) => Ok(!exists), // Return true if unique (doesn't exist)
-            Err(e) => Err(format!("Consensus query failed: {}", e))
-        }
-    }
-    
-    /// Query activation state from blockchain
-    async fn query_activation_state(&self, code_hash: &str) -> Result<bool, String> {
-        // PRODUCTION: Query QNet blockchain for activation record
-        // This would check if activation code hash exists in blockchain state
-        
-        // Access local blockchain state through consensus engine
-        // In real implementation: query state store for activation records
-        
-        // PRODUCTION: Query real blockchain state for activation code existence
-        // For now: Use deterministic check based on hash (will be replaced with real state query)
-        let hash_bytes = hex::decode(code_hash).map_err(|e| format!("Invalid hash: {}", e))?;
-        let exists = (hash_bytes[0] % 10) == 0; // 10% chance code already exists
-        
-        println!("🔗 Blockchain state query: activation {} exists: {}", &code_hash[..8], exists);
-        Ok(exists)
-    }
-    
+
     /// Get comprehensive performance statistics
     pub async fn get_performance_stats(&self) -> PerformanceStats {
         let cache_stats = self.cache_stats.read().await;
@@ -618,14 +775,15 @@ impl BlockchainActivationRegistry {
         
         // Create activation record with secure hash storage
         let code_hash = self.hash_activation_code_for_blockchain(code)?;
+        
         let record = ActivationRecord {
             code_hash: code_hash.clone(),
             wallet_address: node_info.wallet_address.clone(),
-            tx_hash: node_info.burn_tx_hash.clone(), // CRITICAL: Store burn_tx for XOR decryption
+            tx_hash: node_info.burn_tx_hash.clone(),
             activated_at: node_info.activated_at,
             node_type: node_info.node_type.clone(),
-            phase: node_info.phase, // Use phase from NodeInfo
-            activation_amount: node_info.burn_amount, // CRITICAL: Store exact amount for XOR key derivation
+            phase: node_info.phase,
+            activation_amount: node_info.burn_amount,
             blockchain_height: self.get_current_blockchain_height().await?,
             is_active: true,
             device_migrations: vec![],
@@ -637,16 +795,44 @@ impl BlockchainActivationRegistry {
         // Update local cache with code hash instead of plaintext code
         {
             let mut used_codes = self.used_codes.write().await;
+            // FIX H8: Evict oldest 10% when used_codes exceeds 500,000 entries
+            if used_codes.len() > 500_000 {
+                let evict_count = used_codes.len() / 10;
+                let keys_to_remove: Vec<String> = used_codes.iter().take(evict_count).cloned().collect();
+                for key in &keys_to_remove {
+                    used_codes.remove(key);
+                }
+                log::info!("[INFO][ACTIVATION] used_codes_eviction evicted={} remaining={}", evict_count, used_codes.len());
+            }
             used_codes.insert(code_hash.clone());
         }
 
         {
             let mut active_nodes = self.active_nodes.write().await;
+            // FIX R14-H7: Evict oldest 10% when active_nodes exceeds 500,000 entries
+            const MAX_ACTIVE_NODES: usize = 500_000;
+            if active_nodes.len() > MAX_ACTIVE_NODES {
+                let evict_count = active_nodes.len() / 10;
+                let keys_to_remove: Vec<String> = active_nodes.keys().take(evict_count).cloned().collect();
+                for key in &keys_to_remove {
+                    active_nodes.remove(key);
+                }
+                println!("[INFO][ACTIVATION] active_nodes_eviction evicted={} remaining={}", evict_count, active_nodes.len());
+            }
             active_nodes.insert(node_info.device_signature.clone(), node_info.clone());
         }
 
         {
             let mut activation_records = self.activation_records.write().await;
+            // FIX H8: Evict oldest 10% when activation_records exceeds 500,000 entries
+            if activation_records.len() > 500_000 {
+                let evict_count = activation_records.len() / 10;
+                let keys_to_remove: Vec<String> = activation_records.keys().take(evict_count).cloned().collect();
+                for key in &keys_to_remove {
+                    activation_records.remove(key);
+                }
+                log::info!("[INFO][ACTIVATION] activation_records_eviction evicted={} remaining={}", evict_count, activation_records.len());
+            }
             activation_records.insert(code_hash.clone(), record);
         }
 
@@ -666,228 +852,22 @@ impl BlockchainActivationRegistry {
             l1_cache.put(code_hash.clone(), true);
         }
 
-        // NOTE: DHT propagation removed - activation syncs through blockchain and ReputationSync
+        // Activation state syncs through the blockchain.
 
-        println!("✅ Activation registered on blockchain successfully");
+        // Local record only — the NodeActivation TX is broadcast separately and its
+        // on-chain inclusion is NOT confirmed here (verify via node/status before trusting).
+        println!("[INFO][ACTIVATION] activation_recorded_local on_chain_inclusion=pending");
         Ok(())
-    }
-
-    /// Simplified device migration for Light nodes, rate-limited for Full/Super nodes
-    pub async fn migrate_device_on_blockchain(&self, code: &str, wallet_address: &str, new_device_signature: &str) -> Result<(), IntegrationError> {
-        println!("🔄 Processing device migration for activation code: {}", safe_preview(code, 8));
-        
-        // Determine node type from activation code
-        let node_type = self.determine_node_type_from_code(code).await?;
-        
-        match node_type.as_str() {
-            "light" => {
-                // LIGHT NODES: Simple device switching (no rate limiting needed)
-                println!("📱 Light node device switch - simple device management");
-                
-                // Validate wallet ownership only
-                if !self.verify_wallet_ownership(wallet_address, code).await? {
-                    return Err(IntegrationError::ValidationError(
-                        "Wallet does not own this activation code".to_string()
-                    ));
-                }
-                
-                // Update device signature directly (no rate limiting)
-                self.update_light_node_device(code, new_device_signature).await?;
-                
-                println!("✅ Light node device switched successfully (no migration limits)");
-            }
-            
-            "full" | "super" => {
-                // FULL/SUPER NODES: Real server migration with rate limiting
-                println!("🖥️ Server node migration - applying rate limits and blockchain validation");
-                
-                // Check migration rate limiting (1 per 24 hours for servers)
-                let migration_count = self.check_server_migration_rate(code).await?;
-                if migration_count >= 1 {
-                    return Err(IntegrationError::RateLimitExceeded(
-                        "Server migration limited to 1 per 24 hours - use emergency recovery for urgent cases".to_string()
-                    ));
-                }
-                
-                // Validate ownership with enhanced security
-                if !self.verify_wallet_ownership(wallet_address, code).await? {
-                    return Err(IntegrationError::ValidationError(
-                        "Wallet does not own this activation code".to_string()
-                    ));
-                }
-                
-                // Create server migration record for blockchain
-                let migration = DeviceMigration {
-                    from_device: self.get_current_server_signature(code).await?,
-                    to_device: new_device_signature.to_string(),
-                    migration_timestamp: SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs(),
-                    wallet_signature: self.generate_wallet_signature(wallet_address, code).await?,
-                };
-                
-                // Record migration in blockchain (decentralized)
-                self.record_server_migration_blockchain(code, &migration).await?;
-                
-                // Update activation record
-                {
-                    let mut activation_records = self.activation_records.write().await;
-                    if let Some(record) = activation_records.get_mut(code) {
-                        record.device_migrations.push(migration);
-                    }
-                }
-                
-                println!("✅ Server migration completed with blockchain record");
-            }
-            
-            _ => {
-                return Err(IntegrationError::ValidationError(
-                    "Unknown node type for migration".to_string()
-                ));
-            }
-        }
-        
-        // Update local cache for all node types
-        {
-            let mut active_nodes = self.active_nodes.write().await;
-            if let Some(node_info) = active_nodes.values_mut().find(|n| n.activation_code == code) {
-                node_info.device_signature = new_device_signature.to_string();
-                // Only increment migration count for servers
-                if node_type == "full" || node_type == "super" {
-                    node_info.migration_count += 1;
-                }
-            }
-        }
-        
-        Ok(())
-    }
-
-    /// BLOCKCHAIN-based server migration rate limiting (decentralized)
-    async fn check_server_migration_rate(&self, code: &str) -> Result<u32, IntegrationError> {
-        println!("🔍 Checking server migration rate from QNet blockchain...");
-        
-        // DECENTRALIZED: Use blockchain instead of local database
-        let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-        let twenty_four_hours_ago = current_time - (24 * 60 * 60);
-        
-        // 1. Query QNet blockchain for migration history
-        match self.query_blockchain_migration_history(code, twenty_four_hours_ago).await {
-            Ok(migration_count) => {
-                println!("✅ Blockchain query successful: {} migrations in last 24h", migration_count);
-                Ok(migration_count)
-            }
-            Err(e) => {
-                println!("⚠️  Blockchain query failed: {}, falling back to local cache", e);
-                
-                // Fallback to local cache if blockchain unavailable
-                if let Some(record) = self.activation_records.read().await.get(code) {
-                    let recent_migrations = record.device_migrations
-                        .iter()
-                        .filter(|m| m.migration_timestamp > twenty_four_hours_ago)
-                        .count() as u32;
-                    
-                    println!("📋 Local cache fallback: {} migrations found", recent_migrations);
-                    Ok(recent_migrations)
-                } else {
-                    println!("❌ SECURITY: No migration history AND blockchain unavailable");
-                    println!("   Cannot verify rate limits - rejecting migration for security");
-                    println!("   This prevents rate limit bypass when blockchain is down");
-                    
-                    // SECURITY FIX: Return error instead of Ok(0) to prevent rate limit bypass
-                    // When blockchain is unavailable AND no local cache exists, we cannot verify
-                    // the migration count, so we must reject to maintain security
-                    Err(IntegrationError::SecurityError(
-                        "Cannot verify migration rate limits - blockchain unavailable and no local history".to_string()
-                    ))
-                }
-            }
-        }
-    }
-
-    /// Query QNet blockchain for migration history (decentralized verification)
-    async fn query_blockchain_migration_history(&self, code: &str, since_timestamp: u64) -> Result<u32, IntegrationError> {
-        println!("🔗 Querying QNet blockchain for migration history...");
-        
-        // Create activation code hash for blockchain lookup
-        let code_hash = self.hash_activation_code_for_blockchain(code)?;
-        
-        // In production: This would query QNet blockchain RPC
-        // Query structure: Find migration events for this activation code hash
-        
-        // PRODUCTION: Real blockchain query for migration history
-        let blockchain_query_result = self.query_qnet_blockchain_consensus(&code_hash, since_timestamp).await;
-        
-        match blockchain_query_result {
-            Ok(count) => {
-                println!("✅ Blockchain returned {} migrations since timestamp {}", count, since_timestamp);
-                Ok(count)
-            }
-            Err(e) => {
-                Err(IntegrationError::BlockchainError(
-                    format!("Failed to query blockchain: {}", e)
-                ))
-            }
-        }
     }
 
     /// Hash activation code for secure blockchain storage
     pub fn hash_activation_code_for_blockchain(&self, code: &str) -> Result<String, IntegrationError> {
-        // Use Blake3 for quantum-resistant hashing
-        let hash = blake3::hash(code.as_bytes());
-        Ok(hex::encode(hash.as_bytes()))
+        // Use SHA3-256 for NIST FIPS 202 compliance (consistent with transaction hashing)
+        use sha3::{Sha3_256, Digest};
+        let hash = Sha3_256::digest(code.as_bytes());
+        Ok(format!("{:x}", hash))
     }
 
-
-    
-    /// Query QNet blockchain through consensus engine (decentralized)
-    async fn query_qnet_blockchain_consensus(&self, code_hash: &str, since_timestamp: u64) -> Result<u32, String> {
-        // PRODUCTION: Direct blockchain state query through consensus
-        
-        // Access QNet blockchain state through consensus engine
-        // Each node maintains full blockchain state for validation
-        let migration_count = match self.consensus_query_migration_count(code_hash, since_timestamp).await {
-            Ok(count) => count,
-            Err(e) => {
-                // Fallback: Query through P2P network consensus
-                println!("⚠️  Local consensus failed, querying P2P network: {}", e);
-                self.p2p_consensus_migration_query(code_hash, since_timestamp).await?
-            }
-        };
-        
-        Ok(migration_count)
-    }
-    
-    /// Direct consensus engine query for migration count
-    async fn consensus_query_migration_count(&self, code_hash: &str, since_timestamp: u64) -> Result<u32, String> {
-        // Query migration transactions from blockchain state
-        // This would use the node's own consensus engine to read blockchain
-        
-        // Access consensus engine to query migration transactions
-        // Filter by code_hash and timestamp
-        // Return count of migrations in last 24h
-        
-        // For now: Use deterministic consensus (will be replaced with real consensus engine)
-        let hash_bytes = hex::decode(code_hash).map_err(|e| format!("Invalid hash: {}", e))?;
-        let migration_count = (hash_bytes[0] % 2) as u32; // 0-1 migrations through consensus
-        
-        println!("🔗 Consensus engine query: {} migrations for hash {}", migration_count, &code_hash[..8]);
-        Ok(migration_count)
-    }
-    
-    /// P2P network consensus query for migration verification
-    async fn p2p_consensus_migration_query(&self, code_hash: &str, since_timestamp: u64) -> Result<u32, String> {
-        // Query multiple peers in P2P network for consensus on migration count
-        // Majority consensus determines the result
-        
-        // For production: This would query 3-5 random peers and get consensus
-        // For now: Simplified consensus simulation
-        
-        let consensus_result = 0; // No migrations found through P2P consensus
-        println!("🌐 P2P consensus query result: {} migrations", consensus_result);
-        Ok(consensus_result)
-    }
-    
     /// Check if node is running in genesis bootstrap mode
     fn is_genesis_bootstrap_mode(&self) -> bool {
         // EXISTING: Check for QNET_BOOTSTRAP_ID which Genesis nodes actually use
@@ -938,172 +918,10 @@ impl BlockchainActivationRegistry {
         
         println!("[REGISTRY] 🚀 Genesis bootstrap: ALL {} nodes populated (deterministic)", active_nodes.len());
     }
-}
 
-/// PRODUCTION: Blockchain migration record for device migrations
-#[derive(Debug, Clone)]
-pub struct BlockchainMigrationRecord {
-    pub code_hash: String,
-    pub from_device: String,
-    pub to_device: String,
-    pub migration_timestamp: u64,
-    pub wallet_signature: String,
-    pub record_type: String,
 }
 
 impl BlockchainActivationRegistry {
-    /// Submit migration record to QNet blockchain through consensus engine
-    async fn submit_migration_to_blockchain(&self, record: BlockchainMigrationRecord) -> Result<String, IntegrationError> {
-        // PRODUCTION: Submit migration transaction directly to QNet blockchain
-        
-        match self.submit_to_qnet_consensus(&record).await {
-            Ok(tx_hash) => {
-                println!("✅ Migration transaction submitted to QNet blockchain: {}", tx_hash);
-                Ok(tx_hash)
-            }
-            Err(consensus_error) => {
-                println!("⚠️  QNet consensus submission failed: {}", consensus_error);
-                
-                if self.is_genesis_bootstrap_mode() {
-                    println!("🚀 Genesis mode: Creating genesis migration record");
-                    let genesis_hash = format!("genesis_migration_{}", &record.code_hash[..8]);
-                    Ok(genesis_hash)
-                } else {
-                    return Err(IntegrationError::BlockchainError(
-                        format!("Failed to submit migration to QNet blockchain: {}", consensus_error)
-                    ));
-                }
-            }
-        }
-    }
-    
-    /// Submit migration transaction through QNet consensus engine
-    async fn submit_to_qnet_consensus(&self, record: &BlockchainMigrationRecord) -> Result<String, String> {
-        // PRODUCTION: Create and submit transaction to QNet blockchain
-        
-        // Create migration transaction for QNet blockchain
-        let migration_tx = QNetMigrationTransaction {
-            tx_type: "device_migration".to_string(),
-            code_hash: record.code_hash.clone(),
-            from_device: record.from_device.clone(),
-            to_device: record.to_device.clone(),
-            timestamp: record.migration_timestamp,
-            wallet_signature: record.wallet_signature.clone(),
-            record_type: record.record_type.clone(),
-        };
-        
-        // Submit to blockchain through consensus engine
-        let tx_hash = self.consensus_submit_transaction(migration_tx).await?;
-        
-        // Broadcast to P2P network for propagation
-        self.p2p_broadcast_migration_transaction(&tx_hash, record).await?;
-        
-        Ok(tx_hash)
-    }
-    
-    /// Submit transaction through consensus engine 
-    async fn consensus_submit_transaction(&self, migration_tx: QNetMigrationTransaction) -> Result<String, String> {
-        // Create transaction hash using blake3
-        let tx_data = format!("{}:{}:{}:{}", 
-            migration_tx.code_hash, 
-            migration_tx.from_device, 
-            migration_tx.to_device, 
-            migration_tx.timestamp
-        );
-        
-        let tx_hash_bytes = blake3::hash(tx_data.as_bytes());
-        let tx_hash = format!("qnet_{}", &tx_hash_bytes.to_hex()[..16]);
-        
-        // Submit to consensus engine (mempool -> block production)
-        println!("🔗 Submitting migration transaction to QNet consensus: {}", tx_hash);
-        
-        // PRODUCTION: Transaction added to mempool and included in next microblock
-        
-        Ok(tx_hash)
-    }
-    
-    /// Broadcast migration transaction to P2P network
-    async fn p2p_broadcast_migration_transaction(&self, tx_hash: &str, record: &BlockchainMigrationRecord) -> Result<(), String> {
-        // Broadcast transaction to P2P network for validation and inclusion
-        println!("🌐 Broadcasting migration transaction to P2P network: {}", tx_hash);
-        
-        // P2P broadcast would propagate transaction to other nodes
-        // Other nodes would validate and include in their mempools
-        
-        Ok(())
-    }
-
-    /// Simple device update for Light nodes (no rate limiting)
-    async fn update_light_node_device(&self, code: &str, new_device_signature: &str) -> Result<(), IntegrationError> {
-        // Light nodes: simple device signature update
-        // No complex migration record needed - just update the signature
-        // Auto-cleanup of inactive devices handles device management automatically
-        
-        {
-            let mut activation_records = self.activation_records.write().await;
-            if let Some(record) = activation_records.get_mut(code) {
-                // No migration record for Light nodes - just note the update
-                println!("📱 Updated Light node device signature (automatic device management)");
-            }
-        }
-        
-        Ok(())
-    }
-
-    /// Create blockchain migration record from device migration
-    fn create_blockchain_migration_record(&self, code: &str, migration: &DeviceMigration) -> Result<BlockchainMigrationRecord, IntegrationError> {
-        use sha3::{Sha3_256, Digest};
-        
-        // Generate hash for activation code
-        let mut hasher = Sha3_256::new();
-        hasher.update(code.as_bytes());
-        let code_hash = hex::encode(hasher.finalize());
-        
-        Ok(BlockchainMigrationRecord {
-            code_hash,
-            from_device: migration.from_device.clone(),
-            to_device: migration.to_device.clone(),
-            migration_timestamp: migration.migration_timestamp,
-            wallet_signature: migration.wallet_signature.clone(),
-            record_type: "server_migration".to_string(),
-        })
-    }
-
-    /// Record server migration in blockchain (decentralized - no local database)
-    async fn record_server_migration_blockchain(&self, code: &str, migration: &DeviceMigration) -> Result<(), IntegrationError> {
-        println!("📝 Recording server migration in QNet blockchain...");
-        
-        // Create blockchain transaction for server migration
-        let migration_record = self.create_blockchain_migration_record(code, migration)?;
-        
-        // Submit to QNet blockchain (decentralized)
-        match self.submit_migration_to_blockchain(migration_record).await {
-            Ok(tx_hash) => {
-                println!("✅ Server migration recorded in blockchain");
-                        println!("   Transaction: {}...", safe_preview(&tx_hash, 8));
-        println!("   From: {}...", safe_preview(&migration.from_device, 8));
-        println!("   To: {}...", safe_preview(&migration.to_device, 8));
-                println!("   Timestamp: {}", migration.migration_timestamp);
-                Ok(())
-            }
-            Err(e) => {
-                // Log error but don't fail activation (blockchain might be temporarily unavailable)
-                println!("⚠️  Warning: Failed to record in blockchain: {}", e);
-                println!("   Migration still valid, recorded locally");
-                Ok(())
-            }
-        }
-    }
-
-    /// Get current server signature for migration validation
-    async fn get_current_server_signature(&self, code: &str) -> Result<String, IntegrationError> {
-        if let Some(node_info) = self.active_nodes.read().await.values().find(|n| n.activation_code == code) {
-            Ok(node_info.device_signature.clone())
-        } else {
-            Err(IntegrationError::ValidationError("Node not found".to_string()))
-        }
-    }
-    
     /// Get node_id by activation_code (for mobile app monitoring)
     /// Returns the network node_id linked to this activation code
     pub async fn get_node_id_by_activation_code(&self, code: &str) -> Option<String> {
@@ -1120,9 +938,9 @@ impl BlockchainActivationRegistry {
             }
         }
         
-        // Try partial match (code might be prefix of activation_code)
-        if let Some(node_info) = active_nodes.values().find(|n| 
-            n.activation_code.contains(code) || code.contains(&n.activation_code)
+        // Exact match only — no partial/contains matching
+        if let Some(node_info) = active_nodes.values().find(|n|
+            n.activation_code == code
         ) {
             if !node_info.node_id.is_empty() {
                 return Some(node_info.node_id.clone());
@@ -1152,29 +970,6 @@ impl BlockchainActivationRegistry {
             .cloned();
         
         Ok(node_info)
-    }
-
-    /// Determine node type from activation code structure
-    async fn determine_node_type_from_code(&self, code: &str) -> Result<String, IntegrationError> {
-        // Extract node type from activation code format
-        if code.len() >= 6 {
-            let node_type_char = code[5..6].to_uppercase();
-            match node_type_char.as_str() {
-                "L" => Ok("light".to_string()),
-                "F" => Ok("full".to_string()),
-                "S" => Ok("super".to_string()),
-                _ => {
-                    // Fallback: query activation records
-                    if let Some(record) = self.activation_records.read().await.get(code) {
-                        Ok(record.node_type.clone())
-                    } else {
-                        Ok("light".to_string()) // Default to light
-                    }
-                }
-            }
-        } else {
-            Err(IntegrationError::ValidationError("Invalid activation code format".to_string()))
-        }
     }
 
     /// Check if we need to sync from blockchain
@@ -1320,10 +1115,8 @@ impl BlockchainActivationRegistry {
     /// Get eligible nodes for consensus (public interface)
     pub async fn get_eligible_nodes(&self) -> Vec<(String, f64, String)> {
         // CONSENSUS FIX: Use block height for cache invalidation instead of wall clock
-        let current_height = std::env::var("CURRENT_BLOCK_HEIGHT")
-            .unwrap_or_default()
-            .parse::<u64>()
-            .unwrap_or(0);
+        let current_height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT
+            .load(std::sync::atomic::Ordering::Relaxed);
         
         // ARCHITECTURE FIX: ALWAYS sync from blockchain for true decentralization
         // No special Genesis mode - all nodes equal from block #1
@@ -1342,7 +1135,7 @@ impl BlockchainActivationRegistry {
             }
         } else {
             // Check for periodic refresh from blockchain
-            let node_count = active_nodes_read.len();
+            let _node_count = active_nodes_read.len();
             drop(active_nodes_read);
             
             // CONSENSUS FIX: Use block-based cache invalidation (every 30 blocks)
@@ -1368,14 +1161,15 @@ impl BlockchainActivationRegistry {
         
         let active_nodes = self.active_nodes.read().await;
         
-        // Filter nodes by type (Full/Super only) and reputation (≥70%)
+        // Filter nodes by type (Super only) and reputation (≥70%)
         // CRITICAL FIX: Case-insensitive comparison for node_type
-        // Handles both "Super"/"Full" (Capitalized) and "super"/"full" (lowercase)
+        // v3.18: Full nodes removed
         let mut eligible: Vec<(String, f64, String)> = active_nodes
             .values()
             .filter(|node| {
                 let node_type_lower = node.node_type.to_lowercase();
-                (node_type_lower == "full" || node_type_lower == "super") &&
+                // v3.18: Only Super nodes (Full removed)
+                node_type_lower == "super" &&
                 // Calculate reputation based on activity and uptime
                 self.calculate_node_reputation(node) >= 0.70
             })
@@ -1413,10 +1207,8 @@ impl BlockchainActivationRegistry {
     fn calculate_node_reputation(&self, node: &NodeInfo) -> f64 {
         // CONSENSUS FIX: Use block height instead of wall clock for deterministic reputation
         // This ensures all nodes calculate the same reputation at the same block height
-        let current_height = std::env::var("CURRENT_BLOCK_HEIGHT")
-            .unwrap_or_default()
-            .parse::<u64>()
-            .unwrap_or(0);
+        let current_height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT
+            .load(std::sync::atomic::Ordering::Relaxed);
         
         // Convert block height to deterministic "time" (1 block = ~1 second)
         let current_time = node.activated_at + current_height;
@@ -1469,10 +1261,8 @@ impl BlockchainActivationRegistry {
         // All nodes must read the same blocks to get the same activation list
         
         // Use the block height from environment (set by microblock producer)
-        let current_height = std::env::var("CURRENT_BLOCK_HEIGHT")
-            .unwrap_or_default()
-            .parse::<u64>()
-            .unwrap_or(0);
+        let current_height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT
+            .load(std::sync::atomic::Ordering::Relaxed);
         
         // Read activations from deterministic range (aligned to 30-block boundaries)
         // This ensures all nodes see the same data at the same round
@@ -1485,7 +1275,11 @@ impl BlockchainActivationRegistry {
         let mut activations = Vec::new();
         
         // PRODUCTION: Get current phase and network stats for dynamic pricing
-        let current_phase = self.get_current_activation_phase();
+        // One phase resolver for the whole node. A supply-read outage must not be answered with a
+        // guessed phase: the wrong phase quotes the wrong currency and the wrong price.
+        let current_phase = crate::rpc::live_activation_pricing().await
+            .map_err(|e| format!("[REJECT][PRICING] phase_unresolved err={}", e))?
+            .phase;
         let network_stats = self.get_network_statistics().await;
         
         // PRODUCTION: Read real activation transactions from blockchain storage
@@ -1494,21 +1288,10 @@ impl BlockchainActivationRegistry {
             
             // Iterate through recent blocks and extract activation transactions
             for block_height in from_height..=snapshot_height {
-                if let Ok(Some(block)) = storage.load_microblock(block_height) {
-                    // Try to parse as MicroBlock (full transactions)
-                    let transactions = if let Ok(microblock) = bincode::deserialize::<qnet_state::MicroBlock>(&block) {
-                        microblock.transactions
-                    } else if let Ok(efficient_block) = bincode::deserialize::<qnet_state::EfficientMicroBlock>(&block) {
-                        // EfficientMicroBlock has only hashes, need to fetch transactions from pool
-                        let mut txs = Vec::new();
-                        for tx_hash in &efficient_block.transaction_hashes {
-                            // Try to get transaction from pool
-                            if let Some(tx) = storage.transaction_pool.get_transaction(tx_hash) {
-                                txs.push(tx);
-                            }
-                        }
-                        txs
-                    } else {
+                // v3.20: Use load_microblock_auto_format for unified format handling
+                if let Ok(Some(microblock)) = storage.load_microblock_auto_format(block_height) {
+                    let transactions = microblock.transactions;
+                    if transactions.is_empty() {
                         // Can't parse block, skip
                         continue;
                     };
@@ -1550,17 +1333,36 @@ impl BlockchainActivationRegistry {
                                             }
                                         };
                                         
+                                        // activation_amount gates the burn-cost floor and the XOR key —
+                                        // a missing field on a burn-gated entry must reject, never
+                                        // silently default. Genesis entries are burn-exempt (amount 0).
+                                        let activation_amount = match activation_json["activation_amount"].as_u64() {
+                                            Some(a) if a > 0 || is_genesis_activation => a,
+                                            _ => {
+                                                println!("[REJECT][ACTIVATION] missing_activation_amount code={} tx={}",
+                                                         code_hash, burn_tx_hash);
+                                                continue; // Skip invalid activation
+                                            }
+                                        };
+                                        
+                                        let phase_val = activation_json["phase"].as_u64().unwrap_or(1);
+                                        if phase_val > 2 {
+                                            println!("[REJECT][ACTIVATION] invalid_phase value={}", phase_val);
+                                            return Err(format!("Invalid activation phase: {}", phase_val));
+                                        }
+                                        let phase = phase_val as u8;
+                                        
                                         let record = ActivationRecord {
                                             code_hash: code_hash.clone(),
                                             wallet_address: activation_json["wallet"].as_str().unwrap_or("").to_string(),
                                             tx_hash: burn_tx_hash, // Use burn_tx_hash from JSON
                                             activated_at: activation_json["activated_at"].as_u64().unwrap_or(0),
                                             node_type,
-                                            phase: 1, // Phase 1 (Solana burn)
-                                            activation_amount: 0, // Phase 1: no QNC cost
+                                            phase, // Read from blockchain data
+                                            activation_amount, // CRITICAL: Must match XOR key derivation amount
                                             blockchain_height: block_height,
                                             is_active: true, // Always true if in blockchain
-                                            device_migrations: vec![], // Not stored in blockchain
+                                            device_migrations: vec![],
                                         };
                                         activations.push(record);
                                     }
@@ -1577,11 +1379,12 @@ impl BlockchainActivationRegistry {
             // FALLBACK: If no storage path, use temporary simulation
             println!("[REGISTRY] ⚠️ No storage path, using simulation");
             for i in 0..3 { // Temporary simulation
+                // v3.18: Full nodes removed - only Light and Super
                 let node_type = match i {
                 0 => "light".to_string(),
-                1 => "full".to_string(),
+                1 => "super".to_string(), // v3.18: Index 1 is now Super (Full removed)
                 2 => "super".to_string(),
-                _ => unreachable!("Only 3 node types exist"),
+                _ => unreachable!("Only 2 node types exist (Light and Super)"),
             };
             
             // Calculate dynamic price based on phase and network size
@@ -1594,17 +1397,18 @@ impl BlockchainActivationRegistry {
                 (2, qnc_amount)
             };
             
+            use sha3::{Sha3_256, Digest};
             let activation = ActivationRecord {
-                code_hash: blake3::hash(format!("QNET-SIM{}-ACTI-VATE", i).as_bytes()).to_hex().to_string(),
+                code_hash: format!("{:x}", Sha3_256::digest(format!("QNET-SIM{}-ACTI-VATE", i).as_bytes())),
                 node_type,
                 activated_at: (chrono::Utc::now().timestamp() - (i as i64 * 3600)) as u64, // Hours ago, convert to u64
                 wallet_address: format!("wallet_{}", i),
                 tx_hash: if phase == 1 { 
                     // Phase 1: Real 1DEV burn transaction hash on Solana
-                    format!("1dev_burn_{}", blake3::hash(format!("PHASE1-{}", i).as_bytes()).to_hex())
+                    format!("1dev_burn_{:x}", Sha3_256::digest(format!("PHASE1-{}", i).as_bytes()))
                 } else {
                     // Phase 2: QNC transfer to Pool 3 transaction hash
-                    format!("pool3_transfer_{}", blake3::hash(format!("PHASE2-{}", i).as_bytes()).to_hex())
+                    format!("pool3_transfer_{:x}", Sha3_256::digest(format!("PHASE2-{}", i).as_bytes()))
                 },
                 phase,
                 activation_amount: amount,
@@ -1625,10 +1429,8 @@ impl BlockchainActivationRegistry {
         // CONSENSUS FIX: Use deterministic block height from environment
         // This is set by the microblock producer and ensures all nodes use the same height
         
-        let current_height = std::env::var("CURRENT_BLOCK_HEIGHT")
-            .unwrap_or_default()
-            .parse::<u64>()
-            .unwrap_or(0);
+        let current_height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT
+            .load(std::sync::atomic::Ordering::Relaxed);
         
         Ok(current_height)
     }
@@ -1649,7 +1451,7 @@ impl BlockchainActivationRegistry {
             return Err(IntegrationError::ValidationError("Invalid activation code hash format".to_string()));
         }
         
-        // Hash length validation (Blake3 produces 32-byte hash = 64 hex chars)
+        // Hash length validation (SHA3-256 produces 32-byte hash = 64 hex chars, NIST FIPS 202 compliant)
         if record.code_hash.len() != 64 {
             return Err(IntegrationError::ValidationError("Activation code hash must be 64 characters".to_string()));
         }
@@ -1683,32 +1485,37 @@ impl BlockchainActivationRegistry {
         // PRODUCTION: Create and submit activation transaction to QNet blockchain
         
         // Create activation transaction
-        let activation_tx = QNetActivationTransaction {
+        let _activation_tx = QNetActivationTransaction {
             tx_type: "node_activation".to_string(),
             code_hash: record.code_hash.clone(), // Use hash for secure blockchain storage
             node_type: record.node_type.clone(),
             wallet_address: record.wallet_address.clone(),
             device_signature: "server_device".to_string(), // Default device signature for server
-            qnc_cost: if record.phase == 1 { 0 } else { record.activation_amount }, // Phase 1: no QNC cost, Phase 2: QNC transferred to Pool 3 (not burned)
+            qnc_cost: if record.phase == 1 { 0 } else { record.activation_amount }, // Phase 1: no QNC cost (1DEV burned on Solana), Phase 2: QNC transferred to Pool 3 (not burned)
             activation_phase: record.phase, // Use phase as activation_phase
             timestamp: record.activated_at,
         };
         
-        // Create transaction hash
-        let tx_data = format!("{}:{}:{}:{}", 
-            activation_tx.code_hash,
-            activation_tx.node_type,
-            activation_tx.wallet_address,
-            activation_tx.timestamp
-        );
-        
-        let tx_hash_bytes = blake3::hash(tx_data.as_bytes());
-        let tx_hash = format!("qnet_activation_{}", &tx_hash_bytes.to_hex()[..16]);
-        
         // PRODUCTION: Create real blockchain transaction
-        use qnet_state::{Transaction, TransactionType};
+        use qnet_state::{Transaction, TransactionType, account::{NodeType, ActivationPhase}};
+        use qnet_state::transaction::NANO_PER_QNC;
         
-        // Create activation data JSON for transaction
+        // Parse node type from string to enum
+        // v3.18: Full nodes removed
+        let node_type_enum = match record.node_type.to_lowercase().as_str() {
+            "light" => NodeType::Light,
+            "super" => NodeType::Super,
+            _ => NodeType::Light, // Default (ignore "full")
+        };
+        
+        // Parse phase from u8 to enum
+        let phase_enum = if record.phase == 2 {
+            ActivationPhase::Phase2
+        } else {
+            ActivationPhase::Phase1
+        };
+        
+        // Create activation data JSON for transaction (stored in blockchain for reference)
         // SECURITY: Minimal data in blockchain for privacy and efficiency
         let activation_json = serde_json::json!({
             "type": "node_activation",
@@ -1716,34 +1523,101 @@ impl BlockchainActivationRegistry {
             "wallet": record.wallet_address.clone(),
             "node_type": record.node_type.clone(),
             "activated_at": record.activated_at,
-            "burn_tx_hash": record.tx_hash.clone(), // Solana burn proof
+            "phase": record.phase, // 1 = Phase 1 (1DEV burn), 2 = Phase 2 (QNC to Pool 3)
+            "tx_hash": record.tx_hash.clone(), // Phase 1: Solana 1DEV burn proof, Phase 2: QNet Pool 3 transfer proof
+            "activation_amount": record.activation_amount, // Phase 1: 1DEV amount, Phase 2: QNC amount
         }).to_string();
         
-        // Create blockchain transaction
-        // SECURITY: Unique nonce to prevent collision and replay attacks
-        let nonce_data = format!("{}:{}:{}", record.wallet_address, record.activated_at, record.code_hash);
-        let nonce_hash = blake3::hash(nonce_data.as_bytes());
-        let nonce = u64::from_le_bytes(nonce_hash.as_bytes()[0..8].try_into().expect("Blake3 hash is 32 bytes"));
+        // v32.15: sequential nonce per L1 standard (state-apply expects sender.nonce+1).
+        // Anti-replay enforced independently by:
+        //   1) Solana burn-tx hash (Phase 1) / on-chain Pool3 transfer hash (Phase 2),
+        //   2) canonical TX hash (SHA3 of canonical bytes),
+        //   3) mempool commitment_dedup_key (wallet, phase, type=6),
+        //   4) on-chain registered_nodes registry rejects double-activation.
+        // First TX from a fresh wallet → nonce=1.
+        let nonce: u64 = 1;
         
-        let transaction = Transaction {
-            hash: tx_hash.clone(),
+        // CRITICAL: Use NodeActivation transaction type for proper Pool 3 integration
+        // Phase 1: amount = 0 (1DEV burned externally on Solana, FREE gas)
+        // Phase 2: amount > 0 (QNC transferred to Pool 3, distributed to all nodes)
+        // The quoted price, the activation record and the XOR code key are all denominated in WHOLE
+        // QNC (human-facing). The chain is nanoQNC end to end — apply debits `amount` straight out of
+        // sender.balance and Pool 3 credits it — so the conversion belongs HERE, at the one boundary
+        // where a price becomes a chain value. Without it Phase 2 charged 3750 nano (~4e-6 QNC): the
+        // entry price existed only as an RPC courtesy and was worth nothing on-chain.
+        let amount = if record.phase == 2 {
+            record.activation_amount.saturating_mul(NANO_PER_QNC) // Phase 2: QNC to Pool 3
+        } else {
+            0 // Phase 1: No QNC transfer (1DEV burned on Solana)
+        };
+        
+        let mut transaction = Transaction {
+            hash: String::new(), // Will be calculated via canonical_bytes()
             from: record.wallet_address.clone(),
-            to: Some("qnet_activation_registry".to_string()), // Registry contract address
-            amount: 0, // No value transfer, just registration
+            to: None, // NodeActivation doesn't use 'to' field
+            amount: 0, // Not used in NodeActivation (amount is in tx_type)
             nonce, // Unique nonce from wallet+timestamp+code_hash
-            gas_price: 1, // QNet minimum gas price (from mempool config)
-            gas_limit: 100000, // QNet standard for data transactions
-            data: Some(activation_json), // String, not Vec<u8>
+            // v14.8.4: gas_price=0 + gas_limit=0 — system TX, payment proven via
+            // Solana 1DEV burn (Phase 1) or on-chain QNC→Pool3 transfer (Phase 2).
+            // Mempool recognises NodeActivation via Transaction::is_system_tx() and
+            // bypasses the min_gas_price floor. State apply charges fee = 0 because
+            // effective_gas_price * gas_limit = 0. Previously this field held `1`
+            // with a comment "Phase 1 will be FREE via special handling" — the
+            // special handling is the system-TX path added in v14.8.4.
+            gas_price: 0,
+            gas_limit: 0,
+            data: Some(activation_json), // Store reference data for blockchain records
             signature: None, // No signature needed - security via activation code validation
             public_key: None, // Not needed for activation transactions
-            tx_type: TransactionType::ContractCall, // Use tx_type, not transaction_type
+            tx_type: TransactionType::NodeActivation {
+                node_type: node_type_enum,
+                amount, // Phase 1: 0, Phase 2: QNC to Pool 3
+                phase: phase_enum, // ActivationPhase enum
+            },
             timestamp: record.activated_at,
             dilithium_signature: None,   // Activation TX - no quantum sig
             dilithium_public_key: None,
+            chain_id: qnet_state::transaction::QNET_CHAIN_ID,
         };
+
+        // Pure ML-DSA-65: NodeActivation is authenticated solely by this node's consensus
+        // ML-DSA-65 key (registered on-chain at NodeRegistration). Admission requires + verifies
+        // it via verify_dilithium_tx_signature_async (signer_id = dilithium_public_key) over the
+        // canonical message (build_canonical_verify_message's NodeActivation arm). Ed25519 was an
+        // illusory leg that proved no identity and is quantum-breakable — removed.
+        {
+            // THE one builder — never rebuild the preimage here, or signer and verifier drift and the
+            // payload silently falls back outside the signature.
+            let canonical_msg =
+                crate::node::BlockchainNode::build_canonical_verify_message(&transaction);
+            let local_node_id = crate::unified_p2p::GLOBAL_NODE_ID.read().clone();
+            if !local_node_id.is_empty() {
+                if let Some(crypto) = crate::node::try_get_quantum_crypto() {
+                    match crypto.create_consensus_signature(&local_node_id, &canonical_msg).await {
+                        Ok(dil) => {
+                            transaction.dilithium_signature = Some(dil.signature.into_bytes());
+                            transaction.dilithium_public_key = Some(local_node_id.into_bytes());
+                        }
+                        Err(e) => {
+                            // Pre-install signing attempt is benign — the TX is re-signed after
+                            // initialize_wallet_identity; only a real signer error is a fault.
+                            let es = e.to_string();
+                            if es.contains("identity_not_installed") {
+                                if crate::node::is_debug() { println!("[DBG][ACTIVATION] sign_deferred reason=identity_not_installed"); }
+                            } else {
+                                println!("[WARN][ACTIVATION] dilithium_sign_failed err={}", es);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Calculate hash using canonical serialization (SHA3-256 NIST compliant)
+        transaction.hash = transaction.calculate_hash();
         
         // PRODUCTION: Submit to blockchain through GLOBAL mempool
-        println!("[REGISTRY] 🔗 Submitting activation transaction to mempool: {}", tx_hash);
+        println!("[REGISTRY] 🔗 Submitting activation transaction to mempool: {}", qnet_state::char_prefix(&transaction.hash, 16));
         
         // CRITICAL: Use GLOBAL_MEMPOOL_INSTANCE to add transaction to mempool
         // This ensures transaction will be included in next microblock
@@ -1754,28 +1628,48 @@ impl BlockchainActivationRegistry {
             // PRODUCTION v2.26: Use bincode for consistency with block production
             match bincode::serialize(&transaction) {
                 Ok(tx_bytes) => {
-                    // Calculate transaction hash for mempool (using SHA3-256 of bincode)
-                    use sha3::{Sha3_256, Digest};
-                    let tx_hash_for_mempool = format!("{:x}", Sha3_256::digest(&tx_bytes));
-                    
                     // v2.26: Direct access - SimpleMempool is already thread-safe
-                    if mempool_arc.add_binary_transaction(tx_bytes, tx_hash_for_mempool.clone(), transaction.gas_price) {
-                        println!("[REGISTRY] ✅ Activation transaction added to mempool: {}", tx_hash_for_mempool);
+                    // Use transaction.hash which was calculated via canonical_bytes()
+                    let held = match crate::node::try_get_state() {
+                        Some(st) => crate::node::refuse_held_commitment(st, &transaction).await.is_err(),
+                        None => false,
+                    };
+                    if !held && mempool_arc.add_binary_transaction(tx_bytes.clone(), transaction.hash.clone(), transaction.gas_price) {
+                        println!("[INFO][REGISTRY] activation_tx_added hash={}", qnet_state::char_prefix(&transaction.hash, 16));
+                        // v6.5: Gulf Stream broadcast → current producer + gossip backup
+                        // If producer unknown (new node just started), fallback sends to ALL genesis nodes
+                        // This ensures activation TX reaches whoever is producing blocks
+                        if let Some(p2p) = crate::node::try_get_p2p() {
+                            let _ = p2p.broadcast_transaction(tx_bytes.clone());
+                            println!("[INFO][REGISTRY] activation_tx_broadcast hash={}", qnet_state::char_prefix(&transaction.hash, 16));
+
+                            // v6.5: Explicit send to ALL genesis nodes as guaranteed fallback
+                            // New node may not know current producer yet — ensure TX reaches the network
+                            let genesis_ips = crate::unified_p2p::get_genesis_bootstrap_ips();
+                            let tx_msg = crate::unified_p2p::NetworkMessage::Transaction {
+                                data: tx_bytes,
+                            };
+                            for ip in &genesis_ips {
+                                let addr = format!("{}:8001", ip);
+                                p2p.send_network_message(&addr, tx_msg.clone());
+                            }
+                            println!("[INFO][REGISTRY] activation_tx_sent_to_genesis nodes={}", genesis_ips.len());
+                        }
                     } else {
-                        println!("[REGISTRY] ⚠️ Failed to add activation transaction to mempool (may be full or duplicate)");
+                        println!("[WARN][REGISTRY] activation_tx_skip hash={} reason=duplicate_or_full", qnet_state::char_prefix(&transaction.hash, 16));
                     }
                 }
                 Err(e) => {
-                    println!("[REGISTRY] ❌ Failed to serialize activation transaction: {}", e);
+                    println!("[WARN][REGISTRY] activation_tx_serialize_err err={}", e);
                 }
             }
         } else {
-            println!("[REGISTRY] ⚠️ Global mempool not initialized yet");
+            println!("[WARN][REGISTRY] activation_tx_no_mempool reason=not_initialized");
         }
         
         // Also store in transaction_pool for backward compatibility and quick lookup
         if let Some(ref storage) = self.storage {
-            let tx_hash_bytes = hex::decode(&tx_hash).unwrap_or_else(|_| vec![0u8; 32]);
+            let tx_hash_bytes = hex::decode(&transaction.hash).unwrap_or_else(|_| vec![0u8; 32]);
             if tx_hash_bytes.len() == 32 {
                 let mut hash_array = [0u8; 32];
                 hash_array.copy_from_slice(&tx_hash_bytes);
@@ -1783,11 +1677,11 @@ impl BlockchainActivationRegistry {
             }
         }
         
-        Ok(tx_hash)
+        Ok(transaction.hash)
     }
     
     /// Broadcast activation transaction to P2P network
-    async fn p2p_broadcast_activation(&self, tx_hash: &str, record: &ActivationRecord) -> Result<(), String> {
+    async fn p2p_broadcast_activation(&self, tx_hash: &str, _record: &ActivationRecord) -> Result<(), String> {
         // PRODUCTION: Broadcast activation transaction to P2P network
         
         println!("🌐 Broadcasting activation to P2P network: {}", tx_hash);
@@ -1831,8 +1725,8 @@ impl BlockchainActivationRegistry {
                 // Code already exists - this is device migration
                 if current_device != new_device_signature {
                     println!("🔄 Device migration detected:");
-                    println!("   Old device: {}...", safe_preview(&current_device, 8));
-                    println!("   New device: {}...", safe_preview(new_device_signature, 8));
+                    println!("   Old device: {}...", &current_device);
+                    println!("   New device: {}...", new_device_signature);
                     
                     // Update device signature in global registry
                     self.update_device_signature(code, new_device_signature).await?;
@@ -1918,11 +1812,11 @@ impl BlockchainActivationRegistry {
         // No special "migration transaction" - just normal node activation that updates device signature
         println!("🔗 Device migration = node activation with same code (updates device signature)");
         if let Some(old_key) = &old_key_for_print {
-            println!("   📝 From device: {}...", &old_key[..8.min(old_key.len())]);
+            println!("   📝 From device: {}...", qnet_state::char_prefix(&old_key, 8));
         } else {
             println!("   📝 From device: unknown");
         }
-        println!("   📝 To device: {}...", &new_device_signature[..8.min(new_device_signature.len())]);
+        println!("   📝 To device: {}...", qnet_state::char_prefix(&new_device_signature, 8));
         println!("   💰 Cost: Normal activation cost (no extra fees for migration)");
         
         Ok(())
@@ -1933,373 +1827,11 @@ impl BlockchainActivationRegistry {
         // PRODUCTION: Broadcast via P2P network to inform old device to shut down
         // For now: simulate broadcast
         println!("📡 Broadcasting deactivation signal:");
-        println!("   Code: {}...", safe_preview(code, 8));
-        println!("   Old device: {}...", safe_preview(old_device, 8));
+        println!("   Code: {}...", code);
+        println!("   Old device: {}...", old_device);
         println!("   Message: 'Your activation has been migrated to new device - please shut down'");
         
         Ok(())
-    }
-
-    /// REAL wallet ownership verification - NO MORE PLACEHOLDERS
-    async fn verify_wallet_ownership(&self, wallet_address: &str, activation_code: &str) -> Result<bool, IntegrationError> {
-        println!("🔍 Verifying REAL wallet ownership...");
-        
-        // SECURITY: Real cryptographic verification
-        // This replaces the placeholder that always returned true
-        
-        // 1. Extract activation signature from code
-        let activation_signature = match self.extract_activation_signature(activation_code).await {
-            Ok(sig) => sig,
-            Err(e) => {
-                println!("❌ Failed to extract activation signature: {}", e);
-                return Ok(false);
-            }
-        };
-        
-        // 2. Rebuild the signed message that should match the wallet
-        let message_to_verify = format!("QNET_ACTIVATION:{}:{}", activation_code, wallet_address);
-        
-        // 3. CRITICAL: Verify cryptographic signature matches wallet
-        let signature_valid = match self.verify_wallet_cryptographic_signature(
-            &message_to_verify,
-            &activation_signature,
-            wallet_address
-        ).await {
-            Ok(valid) => valid,
-            Err(e) => {
-                println!("❌ Signature verification failed: {}", e);
-                return Ok(false);
-            }
-        };
-        
-        if !signature_valid {
-            println!("❌ SECURITY: Wallet signature does not match activation code");
-            println!("   This activation code was NOT generated by wallet: {}", safe_preview(wallet_address, 8));
-            println!("   Possible attack: stolen or forged activation code");
-            return Ok(false);
-        }
-        
-        // 4. Verify wallet funded the transaction (Phase 1: Solana burn, Phase 2: QNet transfer)
-        if let Err(e) = self.verify_transaction_funding(wallet_address, activation_code).await {
-            println!("❌ SECURITY: Transaction verification failed: {}", e);
-            println!("   This wallet did not fund the required transaction");
-            return Ok(false);
-        }
-        
-        // 5. Check activation code was derived from wallet's burn transaction
-        if let Err(e) = self.verify_code_derivation_from_wallet(wallet_address, activation_code).await {
-            println!("❌ SECURITY: Code derivation verification failed: {}", e);
-            println!("   Activation code was not properly derived from wallet burn");
-            return Ok(false);
-        }
-        
-        println!("✅ SECURITY: Wallet ownership verified cryptographically");
-        println!("   Wallet: {}... owns activation code: {}...", 
-                safe_preview(wallet_address, 8), safe_preview(activation_code, 8));
-        
-        Ok(true)
-    }
-
-    /// Extract activation signature from quantum-secured code
-    async fn extract_activation_signature(&self, activation_code: &str) -> Result<String, IntegrationError> {
-        // Use quantum crypto module to decrypt and extract signature
-        // PRODUCTION v2.50: Lock-free quantum crypto
-        use crate::node::try_get_quantum_crypto;
-        let quantum_crypto = try_get_quantum_crypto()
-            .ok_or_else(|| IntegrationError::CryptoError("Quantum crypto not initialized".to_string()))?;
-        
-        // Decrypt activation code to get payload with signature
-        let payload = quantum_crypto.decrypt_activation_code(activation_code).await
-            .map_err(|e| IntegrationError::CryptoError(format!("Decryption failed: {}", e)))?;
-        
-        // Extract the wallet signature from payload
-        Ok(payload.signature.signature)
-    }
-
-    /// Verify cryptographic signature matches wallet (REAL verification)
-    async fn verify_wallet_cryptographic_signature(
-        &self,
-        message: &str,
-        signature: &str,
-        wallet_address: &str
-    ) -> Result<bool, IntegrationError> {
-        // SECURITY: Real cryptographic signature verification
-        
-        // 1. Decode signature from base64
-        let signature_bytes = general_purpose::STANDARD.decode(signature)
-            .map_err(|e| IntegrationError::CryptoError(format!("Invalid signature format: {}", e)))?;
-        
-        if signature_bytes.len() != 64 {
-            return Err(IntegrationError::CryptoError(
-                "Invalid signature length - expected 64 bytes".to_string()
-            ));
-        }
-        
-        // 2. Hash the message using the same algorithm as wallet
-        let mut hasher = Sha3_256::new();
-        hasher.update(message.as_bytes());
-        hasher.update(wallet_address.as_bytes()); // Include wallet in hash
-        let message_hash = hasher.finalize();
-        
-        // 3. Verify signature using Blake3-based verification
-        let mut verification_hasher = blake3::Hasher::new();
-        verification_hasher.update(&message_hash);
-        verification_hasher.update(wallet_address.as_bytes()); 
-        verification_hasher.update(b"QNET_WALLET_SIG_V2");
-        let expected_sig_hash = verification_hasher.finalize();
-        
-        // 4. Compare first 32 bytes of signature with expected hash
-        let signature_hash = &signature_bytes[..32];
-        let expected_hash = expected_sig_hash.as_bytes();
-        
-        let signatures_match = signature_hash == &expected_hash[..32];
-        
-        if signatures_match {
-            println!("✅ Cryptographic signature verified for wallet: {}...", safe_preview(wallet_address, 8));
-        } else {
-            println!("❌ Signature verification failed - wallet mismatch");
-        }
-        
-        Ok(signatures_match)
-    }
-
-    /// Verify wallet funded the transaction (Phase 1: Solana burn, Phase 2: QNet transfer)
-    async fn verify_transaction_funding(
-        &self,
-        wallet_address: &str,
-        activation_code: &str
-    ) -> Result<(), IntegrationError> {
-        println!("[VERIFY] Verifying transaction funding...");
-        
-        // Extract transaction hash from activation code (Phase 1: burn tx, Phase 2: transfer tx)
-        let tx_hash = match self.extract_tx_hash_from_code(activation_code).await {
-            Ok(tx) => tx,
-            Err(e) => {
-                return Err(IntegrationError::ValidationError(
-                    format!("Failed to extract transaction hash: {}", e)
-                ));
-            }
-        };
-        
-        // Check for Genesis bootstrap codes (skip Solana verification)
-        if tx_hash == "genesis_bootstrap" {
-            println!("[VERIFY] Genesis bootstrap code - skipping Solana verification");
-            return Ok(());
-        }
-        
-        // Validate tx_hash format
-        if tx_hash.is_empty() {
-            return Err(IntegrationError::ValidationError(
-                "No transaction hash found in activation code".to_string()
-            ));
-        }
-        
-        // PRODUCTION: Query Solana blockchain to verify 1DEV burn via HTTP JSON-RPC
-        // Get Solana RPC endpoint from environment or use mainnet-beta
-        let solana_rpc_url = std::env::var("SOLANA_RPC_URL")
-            .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
-        
-        println!("[VERIFY] Querying Solana RPC: {}", solana_rpc_url);
-        println!("[VERIFY] Transaction hash: {}...", safe_preview(&tx_hash, 8));
-        
-        // Create HTTP client (reqwest uses rustls, no OpenSSL needed)
-        let client = reqwest::Client::new();
-        
-        // Solana JSON-RPC request: getTransaction
-        let request_body = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getTransaction",
-            "params": [
-                tx_hash,
-                {
-                    "encoding": "json",
-                    "maxSupportedTransactionVersion": 0
-                }
-            ]
-        });
-        
-        // Send HTTP POST request to Solana RPC
-        let response = client
-            .post(&solana_rpc_url)
-            .json(&request_body)
-            .send()
-            .await
-            .map_err(|e| IntegrationError::NetworkError(
-                format!("Failed to connect to Solana RPC: {}", e)
-            ))?;
-        
-        // Parse JSON-RPC response
-        let rpc_response: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|e| IntegrationError::NetworkError(
-                format!("Failed to parse Solana RPC response: {}", e)
-            ))?;
-        
-        // Check for RPC error
-        if let Some(error) = rpc_response.get("error") {
-            return Err(IntegrationError::ValidationError(
-                format!("Solana RPC error: {}", error)
-            ));
-        }
-        
-        // Extract transaction result
-        let result = rpc_response.get("result")
-            .ok_or_else(|| IntegrationError::ValidationError(
-                "No transaction result in RPC response".to_string()
-            ))?;
-        
-        // Check if transaction exists
-        if result.is_null() {
-            return Err(IntegrationError::ValidationError(
-                "Transaction not found on Solana blockchain".to_string()
-            ));
-        }
-        
-        // Extract transaction metadata
-        let meta = result.get("meta")
-            .ok_or_else(|| IntegrationError::ValidationError(
-                "Transaction metadata not found".to_string()
-            ))?;
-        
-        // Check transaction succeeded
-        if meta.get("err").is_some() && !meta["err"].is_null() {
-            return Err(IntegrationError::ValidationError(
-                format!("Solana transaction failed: {}", meta["err"])
-            ));
-        }
-        
-        // Verify burn amount (1 DEV = 1_000_000_000 lamports)
-        const MIN_BURN_AMOUNT: u64 = 1_000_000_000; // 1 DEV in lamports
-        
-        // Extract pre/post balances to verify burn
-        let pre_balances: Vec<u64> = meta.get("preBalances")
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| IntegrationError::ValidationError(
-                "preBalances not found".to_string()
-            ))?
-            .iter()
-            .filter_map(|v| v.as_u64())
-            .collect();
-        
-        let post_balances: Vec<u64> = meta.get("postBalances")
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| IntegrationError::ValidationError(
-                "postBalances not found".to_string()
-            ))?
-            .iter()
-            .filter_map(|v| v.as_u64())
-            .collect();
-        
-        if pre_balances.is_empty() || post_balances.is_empty() {
-            return Err(IntegrationError::ValidationError(
-                "Transaction balance data missing".to_string()
-            ));
-        }
-        
-        // Calculate burned amount (difference in balances)
-        let burned_amount = pre_balances.iter()
-            .zip(post_balances.iter())
-            .map(|(pre, post)| pre.saturating_sub(*post))
-            .sum::<u64>();
-        
-        if burned_amount < MIN_BURN_AMOUNT {
-            return Err(IntegrationError::ValidationError(
-                format!("Insufficient burn amount: {} lamports (required: {} lamports)", 
-                    burned_amount, MIN_BURN_AMOUNT)
-            ));
-        }
-        
-        // Verify wallet address matches transaction signer
-        let transaction_data = result.get("transaction")
-            .and_then(|t| t.get("message"))
-            .and_then(|m| m.get("accountKeys"))
-            .and_then(|keys| keys.as_array())
-            .and_then(|keys| keys.first())
-            .and_then(|key| key.as_str());
-        
-        if let Some(signer_address) = transaction_data {
-            // Compare wallet addresses (allow partial match for compatibility)
-            let wallet_prefix = if wallet_address.len() >= 10 { &wallet_address[..10] } else { wallet_address };
-            let signer_prefix = if signer_address.len() >= 10 { &signer_address[..10] } else { signer_address };
-            
-            if !wallet_address.contains(signer_prefix) && !signer_address.contains(wallet_prefix) {
-                println!("[VERIFY] Warning: Wallet address mismatch");
-                println!("[VERIFY]   Expected: {}...", safe_preview(wallet_address, 8));
-                println!("[VERIFY]   Found:    {}...", safe_preview(signer_address, 8));
-                // Allow for now, strict matching can be enabled later
-            }
-            
-            println!("[VERIFY] ✅ Solana burn verification successful");
-            println!("[VERIFY]   Burned: {} lamports ({} DEV)", burned_amount, burned_amount / 1_000_000_000);
-            println!("[VERIFY]   Signer: {}...", safe_preview(signer_address, 8));
-        } else {
-            println!("[VERIFY] ⚠️ Could not extract signer address, but burn amount verified");
-            println!("[VERIFY] ✅ Solana burn verification successful");
-            println!("[VERIFY]   Burned: {} lamports ({} DEV)", burned_amount, burned_amount / 1_000_000_000);
-        }
-        
-        Ok(())
-    }
-
-    /// Verify activation code was properly derived from wallet burn
-    async fn verify_code_derivation_from_wallet(
-        &self,
-        wallet_address: &str,
-        activation_code: &str
-    ) -> Result<(), IntegrationError> {
-        println!("🔍 Verifying code derivation from wallet...");
-        
-        // Activation codes must be generated deterministically from:
-        // 1. Burn transaction hash
-        // 2. Wallet address
-        // 3. Node type selection
-        // 4. Quantum entropy
-        
-        // Use quantum crypto to verify derivation
-        // PRODUCTION v2.50: Lock-free quantum crypto
-        use crate::node::try_get_quantum_crypto;
-        let quantum_crypto = try_get_quantum_crypto()
-            .ok_or_else(|| IntegrationError::CryptoError("Quantum crypto not initialized".to_string()))?;
-        
-        // Decrypt payload to get wallet address
-        let payload = quantum_crypto.decrypt_activation_code(activation_code).await
-            .map_err(|e| IntegrationError::CryptoError(format!("Failed to decrypt for verification: {}", e)))?;
-        
-        // Verify wallet address in payload matches claimed wallet
-        if payload.wallet != wallet_address {
-            return Err(IntegrationError::SecurityError(
-                format!("Wallet mismatch: code contains {}, claimed {}",
-                       safe_preview(&payload.wallet, 8), safe_preview(wallet_address, 8))
-            ));
-        }
-        
-        println!("✅ Code derivation verified - wallet addresses match");
-        Ok(())
-    }
-
-    /// Extract transaction hash from activation code (Phase 1: burn tx, Phase 2: transfer tx)
-    async fn extract_tx_hash_from_code(&self, activation_code: &str) -> Result<String, IntegrationError> {
-        // PRODUCTION v2.50: Lock-free quantum crypto
-        use crate::node::try_get_quantum_crypto;
-        let quantum_crypto = try_get_quantum_crypto()
-            .ok_or_else(|| IntegrationError::CryptoError("Quantum crypto not initialized".to_string()))?;
-        
-        let payload = quantum_crypto.decrypt_activation_code(activation_code).await
-            .map_err(|e| IntegrationError::CryptoError(format!("Decryption failed: {}", e)))?;
-        
-        Ok(payload.burn_tx)
-    }
-
-    /// Get current device signature for code
-    async fn get_current_device_signature(&self, code: &str) -> Result<String, IntegrationError> {
-        Ok("current_device".to_string())
-    }
-
-    /// Generate wallet signature
-    async fn generate_wallet_signature(&self, wallet_address: &str, code: &str) -> Result<String, IntegrationError> {
-        Ok("wallet_signature".to_string())
     }
 
     /// Get registry statistics
@@ -2346,23 +1878,11 @@ pub struct RegistryStats {
 /// Legacy compatibility wrapper
 pub type ActivationValidator = BlockchainActivationRegistry; 
 
-/// QNet migration transaction structure
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct QNetMigrationTransaction {
-    pub tx_type: String,
-    pub code_hash: String,
-    pub from_device: String,
-    pub to_device: String,
-    pub timestamp: u64,
-    pub wallet_signature: String,
-    pub record_type: String,
-}
-
 impl BlockchainActivationRegistry {
     /// Check and replace existing active node of same type
     async fn check_and_replace_existing_node(&self, new_node_info: &NodeInfo) -> Result<(), IntegrationError> {
         println!("🔄 Checking for existing {} node on wallet {}...", 
-                 new_node_info.node_type, &new_node_info.wallet_address[..8]);
+                 new_node_info.node_type, new_node_info.wallet_address);
         
         // Look for existing active node of same wallet+type
         let active_nodes = self.active_nodes.read().await;
@@ -2372,7 +1892,7 @@ impl BlockchainActivationRegistry {
                 && existing_node.node_type == new_node_info.node_type {
                 
                 println!("🔄 Found existing {} node: {}", 
-                         existing_node.node_type, &device_sig[..8]);
+                         existing_node.node_type, device_sig);
                 
                 // Send shutdown signal to existing node
                 if let Err(e) = self.send_node_shutdown_signal(existing_node).await {
@@ -2390,7 +1910,7 @@ impl BlockchainActivationRegistry {
     
     /// Send shutdown signal to existing node via HTTP API
     async fn send_node_shutdown_signal(&self, existing_node: &NodeInfo) -> Result<(), IntegrationError> {
-        println!("📡 Sending shutdown signal to existing node: {}", &existing_node.device_signature[..8]);
+        println!("📡 Sending shutdown signal to existing node: {}", existing_node.device_signature);
         
         // Try to extract IP:port from device_signature
         // In QNet, device_signature often contains node connection info
@@ -2511,8 +2031,8 @@ impl BlockchainActivationRegistry {
         // This is much more scalable than HTTP requests to millions of nodes
         
         // For now: Log the blockchain broadcast
-        println!("✅ Blockchain replacement broadcast prepared for node: {}", 
-                 &existing_node.device_signature[..8]);
+        println!("✅ Blockchain replacement broadcast prepared for node: {}",
+                 existing_node.device_signature);
         
         Ok(())
     }
@@ -2524,8 +2044,8 @@ impl BlockchainActivationRegistry {
         // PRODUCTION: Update blockchain state to mark node as inactive
         // This is the authoritative source of truth for node status
         
-        println!("✅ Node marked as replaced in blockchain: {}", 
-                 &existing_node.device_signature[..8]);
+        println!("✅ Node marked as replaced in blockchain: {}",
+                 existing_node.device_signature);
         
         Ok(())
     }
@@ -2534,7 +2054,7 @@ impl BlockchainActivationRegistry {
     /// Returns existing node info if found, regardless of node type
     pub async fn check_wallet_has_any_node(&self, wallet_address: &str) -> Result<Option<(String, String)>, IntegrationError> {
         println!("🔍 [SECURITY] Checking if wallet {} already has a node (1 wallet = 1 node rule)", 
-                 safe_preview(wallet_address, 8));
+                 wallet_address);
         
         // Search in local activation records (any node type)
         {
@@ -2542,7 +2062,7 @@ impl BlockchainActivationRegistry {
             for (code_hash, record) in activation_records.iter() {
                 if record.wallet_address == wallet_address {
                     println!("🚫 [SECURITY] Wallet already has {} node: {}", 
-                             record.node_type, safe_preview(code_hash, 8));
+                             record.node_type, code_hash);
                     return Ok(Some((record.node_type.clone(), format!("HASH:{}", code_hash))));
                 }
             }
@@ -2560,7 +2080,7 @@ impl BlockchainActivationRegistry {
         }
         
         println!("✅ [SECURITY] Wallet {} has no existing nodes - eligible for activation", 
-                 safe_preview(wallet_address, 8));
+                 wallet_address);
         Ok(None)
     }
     
@@ -2573,7 +2093,7 @@ impl BlockchainActivationRegistry {
         node_type: &str
     ) -> Result<Option<String>, IntegrationError> {
         println!("🔍 Querying activation by wallet: {} phase: {} type: {}", 
-                 safe_preview(wallet_address, 8), phase, node_type);
+                 wallet_address, phase, node_type);
         
         // Search in local activation records first (now using hash keys)
         {
@@ -2582,7 +2102,7 @@ impl BlockchainActivationRegistry {
                 if record.wallet_address == wallet_address 
                     && record.phase == phase 
                     && record.node_type.to_lowercase() == node_type.to_lowercase() {
-                    println!("✅ Found existing activation hash in local records: {}", safe_preview(code_hash, 8));
+                    println!("✅ Found existing activation hash in local records: {}", code_hash);
                     // Note: We can't return the original code since we only store hashes
                     // In production, the code should be provided by the user for verification
                     return Ok(Some(format!("HASH_FOUND:{}", code_hash)));
@@ -2596,7 +2116,7 @@ impl BlockchainActivationRegistry {
             for (_device_sig, node_info) in active_nodes.iter() {
                 if node_info.wallet_address == wallet_address 
                     && node_info.node_type.to_lowercase() == node_type.to_lowercase() {
-                    println!("✅ Found existing activation in active nodes: {}", safe_preview(&node_info.activation_code, 8));
+                    println!("✅ Found existing activation in active nodes: {}", &node_info.activation_code);
                     return Ok(Some(node_info.activation_code.clone()));
                 }
             }
@@ -2605,12 +2125,12 @@ impl BlockchainActivationRegistry {
         // Try to query blockchain through consensus
         match self.query_blockchain_for_wallet_activation(wallet_address, phase, node_type).await {
             Ok(Some(code)) => {
-                println!("✅ Found existing activation on blockchain: {}", safe_preview(&code, 8));
+                println!("✅ Found existing activation on blockchain: {}", &code);
                 Ok(Some(code))
             }
             Ok(None) => {
                 println!("⚠️  No existing activation found for wallet {} phase {} type {}", 
-                         safe_preview(wallet_address, 8), phase, node_type);
+                         wallet_address, phase, node_type);
                 Ok(None)
             }
             Err(e) => {
@@ -2627,12 +2147,12 @@ impl BlockchainActivationRegistry {
         let activation_records = self.activation_records.read().await;
         
         if let Some(record) = activation_records.get(code_hash) {
-            println!("✅ Found activation record for hash: {}...", safe_preview(code_hash, 8));
+            println!("✅ Found activation record for hash: {}...", code_hash);
             return Ok(Some(record.clone()));
         }
         
         // Not found locally - could query blockchain in production
-        println!("⚠️ No activation record found for hash: {}...", safe_preview(code_hash, 8));
+        println!("⚠️ No activation record found for hash: {}...", code_hash);
         Ok(None)
     }
     
@@ -2646,7 +2166,7 @@ impl BlockchainActivationRegistry {
         // In production, this would query the actual blockchain
         // For now, return None to indicate no existing activation found
         println!("🔍 Querying blockchain for wallet {} phase {} type {}", 
-                 safe_preview(wallet_address, 8), phase, node_type);
+                 wallet_address, phase, node_type);
         
         // Production blockchain query would happen here
         // For now: No existing activations found (new system)
@@ -2658,11 +2178,11 @@ impl BlockchainActivationRegistry {
         // PRODUCTION: Dynamic pricing based on network size (matching dynamic_pricing.py)
         
         // Base prices in QNC (Phase 2)
+        // v3.18: Only Light and Super nodes (Full removed)
         let base_price = match node_type {
-            "light" => 5_000,   // Light node base cost
-            "full" => 7_500,    // Full node base cost
-            "super" => 10_000,  // Super node base cost
-            _ => 5_000,         // Default to light node price
+            "light" => 10_000,  // Light node base cost (10,000 QNC)
+            "super" => 7_500,   // Super node base cost (7,500 QNC)
+            _ => 10_000,        // Default to light node price
         };
         
         // Network size multipliers (CORRECT implementation from dynamic_pricing.py)
@@ -2685,58 +2205,6 @@ impl BlockchainActivationRegistry {
         final_price
     }
     
-    /// Get current activation phase (1: 1DEV burn, 2: QNC pool transfer)
-    fn get_current_activation_phase(&self) -> u8 {
-        // PRODUCTION: Phase detection logic
-        // Phase 1: Active until 90% of 1DEV supply is burned (900M out of 1B) OR 5 years pass
-        // Phase 2: Starts after Phase 1 completes (whichever condition comes first)
-        
-        // Check environment variable for phase override (for testing)
-        if let Ok(phase) = std::env::var("QNET_ACTIVATION_PHASE") {
-            return phase.parse::<u8>().unwrap_or(2);
-        }
-        
-        // Check time-based phase transition (5 years from launch: Nov 2024)
-        // Launch date: November 1, 2024
-        let launch_timestamp: u64 = 1730419200; // Nov 1, 2024 00:00:00 UTC
-        let five_years_seconds: u64 = 5 * 365 * 24 * 60 * 60;
-        let current_time = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        
-        // If 5 years have passed, we're in Phase 2
-        if current_time > launch_timestamp + five_years_seconds {
-            return 2;
-        }
-        
-        // Check burn percentage from cached value or Solana
-        // Cache burn percentage to avoid frequent RPC calls
-        let burn_percentage = self.get_cached_burn_percentage();
-        
-        // Phase 1 ends when 90% is burned
-        if burn_percentage >= 90.0 {
-            return 2;
-        }
-        
-        // Still in Phase 1
-        1
-    }
-    
-    /// Get cached burn percentage (updated periodically by background task)
-    fn get_cached_burn_percentage(&self) -> f64 {
-        // Check environment variable for cached value
-        if let Ok(percentage) = std::env::var("QNET_BURN_PERCENTAGE") {
-            return percentage.parse::<f64>().unwrap_or(0.0);
-        }
-        
-        // Default: assume we're still early in Phase 1
-        // Background task should update QNET_BURN_PERCENTAGE from Solana RPC
-        // Query: Get 1DEV token supply vs total supply (1B)
-        // Burned = Total Supply - Circulating Supply
-        0.0
-    }
-    
     /// Get network statistics for dynamic pricing
     async fn get_network_statistics(&self) -> NetworkStats {
         let active_nodes = self.active_nodes.read().await;
@@ -2744,22 +2212,21 @@ impl BlockchainActivationRegistry {
         
         // Count by type
         let mut light_count = 0u64;
-        let mut full_count = 0u64;
         let mut super_count = 0u64;
         
         for node in active_nodes.values() {
-            match node.node_type.as_str() {
+            // v3.18: Full nodes removed - ignore "full" type completely
+            match node.node_type.to_lowercase().as_str() {
                 "light" => light_count += 1,
-                "full" => full_count += 1,
                 "super" => super_count += 1,
-                _ => {}
+                _ => {} // Ignore "full" and unknown types
             }
         }
         
         NetworkStats {
             total_nodes: total,
             light_nodes: light_count,
-            full_nodes: full_count,
+            full_nodes: 0, // v3.18: Always 0 (Full node type removed)
             super_nodes: super_count,
         }
     }

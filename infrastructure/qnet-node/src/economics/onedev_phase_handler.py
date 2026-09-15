@@ -33,26 +33,25 @@ class OneDEVPhaseHandler:
         self.activated_nodes: Dict[str, OneDEVNodeActivation] = {}
         self.used_burn_txs = set()  # Prevent reuse of burn transactions
         
-        # Genesis whitelist - Bootstrap nodes (format: 19+3+15+4=41 chars)
-        # v2.66: Updated to Ed25519-based addresses
+        # Genesis whitelist - Bootstrap nodes (format: 19+3+15+8=45 chars)
+        # Pure-Dilithium: eon = SHA512(WALLET ML-DSA-65 pk). SOURCE OF TRUTH: genesis_constants.rs.
         self.genesis_whitelist = {
-            "f36ff465a0944fd06cdeonfca0ad004ff9db46743",  # Bootstrap Node 1
-            "0bac6225a082de1f659eond0c96f1706cf19c35eb",  # Bootstrap Node 2
-            "d216bb23fbe7f853636eon3f16b378b91922701a6",  # Bootstrap Node 3
-            "e5bffcbe8d8cc90afa1eond9c4c2a4e75101ead2e",  # Bootstrap Node 4
-            "02af45d56bd1f5d9002eon0eb1c522f96a2f440b8"   # Bootstrap Node 5
+            "4c83bc6f4c20906b81beon31e92ebc6ffccd7b973e10d",  # Bootstrap Node 1
+            "c81f26da185fd05dcaeeona499b3d9e58d7ec75304f1b",  # Bootstrap Node 2
+            "006a5c220ca2fa77021eon2b5c6703999066d5411e2ff",  # Bootstrap Node 3
+            "a60999a5a40637c1dd6eon975ca9618927edd7c19f38e",  # Bootstrap Node 4
+            "9dd783e0c65cf68467ceondfeaed5e1e47f0242f6aed9"   # Bootstrap Node 5
         }
         self.genesis_claimed = set()
         
         # Pricing model - ALL NODE TYPES SAME PRICE
+        # v3.18: Only Light and Super nodes (Full removed)
         self.base_prices = {
             "light": 1500,
-            "full": 1500,
-            "super": 1500
+            "super": 1500  # Universal pricing for all node types in Phase 1
         }
         self.min_prices = {
             "light": 300,
-            "full": 300,
             "super": 300
         }
         
@@ -70,7 +69,7 @@ class OneDEVPhaseHandler:
         
         Args:
             owner_address: QNet address of node owner
-            node_type: Type of node (light/full/super)
+            node_type: Type of node (light/super) - v3.18: Full removed
             node_id: Unique node identifier
             solana_burn_tx: Solana burn transaction hash
             burned_amount: Amount burned in this transaction
@@ -181,7 +180,8 @@ class OneDEVPhaseHandler:
     
     def get_stats(self) -> Dict:
         """Get activation statistics"""
-        node_counts = {"light": 0, "full": 0, "super": 0}
+        # v3.18: Only Light and Super nodes (Full removed)
+        node_counts = {"light": 0, "super": 0}
         total_burned = 0
         
         for node in self.activated_nodes.values():

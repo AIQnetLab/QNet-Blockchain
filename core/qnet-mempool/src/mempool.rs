@@ -545,8 +545,9 @@ impl Mempool {
             data: None,
             dilithium_signature: None,   // QUANTUM v2.25: Optional
             dilithium_public_key: None,  // QUANTUM v2.25: Optional
+            chain_id: qnet_state::transaction::QNET_CHAIN_ID,
         };
-        
+
         let priority = self.priority_calc.calculate_priority(&tx);
         let entry = TxEntry {
             tx,

@@ -1,6 +1,6 @@
 /**
  * EON Address Generator for QNet Dual-Network Wallet
- * PRODUCTION FORMAT: 19 chars + "eon" + 15 chars + 4 char checksum = 41 total
+ * PRODUCTION FORMAT: 19 chars + "eon" + 15 chars + 8 char SHA3-256 checksum = 45 total
  * Compatible with mobile app and backend validation
  */
 
@@ -12,22 +12,22 @@ export class EONAddressGenerator {
 
     /**
      * Generate new EON address
-     * PRODUCTION FORMAT: 19 + 3 + 15 + 4 = 41 characters
-     * @returns {string} EON address in format: xxxxxxxxxxxxxxxxxxx eon xxxxxxxxxxxxxxx xxxx
+     * PRODUCTION FORMAT: 19 + 3 + 15 + 8 = 45 characters
+     * @returns {string} EON address in format: {19hex}eon{15hex}{8hex checksum}
      */
     async generateEONAddress() {
         // Generate 64 random bytes for entropy
         const randomBytes = new Uint8Array(64);
         crypto.getRandomValues(randomBytes);
-        
+
         // Convert to hex
         const hex = Array.from(randomBytes).map(b => b.toString(16).padStart(2, '0')).join('');
-        
-        // PRODUCTION FORMAT: 19 + 3 + 15 + 4 = 41
+
+        // PRODUCTION FORMAT: 19 + 3 + 15 + 8 = 45
         const part1 = hex.substring(0, 19).toLowerCase();
         const part2 = hex.substring(19, 34).toLowerCase();
         const checksum = await this.calculateChecksum(part1 + 'eon' + part2);
-        
+
         return `${part1}eon${part2}${checksum}`;
     }
 
@@ -48,21 +48,21 @@ export class EONAddressGenerator {
     /**
      * Calculate SHA-256 checksum for address validation
      * @param {string} data - Data to calculate checksum for (part1 + "eon" + part2)
-     * @returns {string} 4-character hex checksum
+     * @returns {string} 8-character hex checksum (4 bytes)
      */
     async calculateChecksum(data) {
         const encoder = new TextEncoder();
         const dataBytes = encoder.encode(data);
-        
+
         const hashBuffer = await crypto.subtle.digest('SHA-256', dataBytes);
         const hashArray = new Uint8Array(hashBuffer);
-        
-        // Use first 2 bytes = 4 hex chars for checksum
-        const checksum = Array.from(hashArray.slice(0, 2))
+
+        // Use first 4 bytes = 8 hex chars for checksum
+        const checksum = Array.from(hashArray.slice(0, 4))
             .map(b => b.toString(16).padStart(2, '0'))
             .join('')
             .toLowerCase();
-        
+
         return checksum;
     }
 
@@ -76,20 +76,20 @@ export class EONAddressGenerator {
             return false;
         }
 
-        // Check new format: 19 chars + "eon" + 15 chars + 4 chars = 41 total
-        if (address.length !== 41) {
+        // Check format: 19 chars + "eon" + 15 chars + 8 chars = 45 total
+        if (address.length !== 45) {
             return false;
         }
 
-        // Check for "eon" in the middle
+        // Check for "eon" marker
         if (address.substring(19, 22) !== 'eon') {
             return false;
         }
 
-        // Extract parts for new format
+        // Extract parts
         const part1 = address.substring(0, 19);
         const part2 = address.substring(22, 37);
-        const providedChecksum = address.substring(37, 41);
+        const providedChecksum = address.substring(37, 45);
 
         // Validate character set
         const fullContent = part1 + part2 + providedChecksum;

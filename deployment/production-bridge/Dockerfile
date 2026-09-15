@@ -42,5 +42,8 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
 # Expose port
 EXPOSE 8080
 
-# Start application
-CMD ["python", "-m", "uvicorn", "bridge-server:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "4"] 
+# Worker count is env-tunable so operators can scale to the host without rebuilding.
+ENV UVICORN_WORKERS=4
+
+# Start application (shell form so $UVICORN_WORKERS expands at runtime)
+CMD python -m uvicorn bridge-server:app --host 0.0.0.0 --port 8080 --workers "$UVICORN_WORKERS" 

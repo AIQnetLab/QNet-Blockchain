@@ -1,22 +1,70 @@
 Business Source License 1.1
 
+
+SUMMARY (not a substitute for the terms below, but it is what they mean)
+
+  YOU MAY, freely and commercially, with no agreement to sign and no fee:
+    - run QNet nodes of any type and earn network rewards;
+    - serve RPC/API/WebSocket endpoints from your nodes, publicly, free or paid;
+    - run explorers, faucets, dashboards, indexers, bridges and bots;
+    - write, deploy and operate smart contracts, tokens and applications;
+    - use it inside your company, and study or security-test it.
+
+  YOU MAY NOT:
+    - use this code to launch a blockchain network other than QNet;
+    - sell "we host your node" as a product built on this code
+      (running your own nodes and serving them publicly is fine);
+    - ship modified copies of this software as a replacement for it;
+    - strip the notices.
+
+  If you are running nodes or building on QNet, everything you need is already
+  granted. The restrictions exist to stop the network being cloned, not to stop
+  it being used.
+
+
 Parameters
 
 Licensor:             AIQnetLab
 Licensed Work:        QNet Blockchain Node Software
                       The Licensed Work is (c) 2025 AIQnetLab
-Additional Use Grant: You may use the Licensed Work for non-production purposes
-                      only (testing, development, evaluation). Any production
-                      use, commercial deployment, or hosting services require
-                      a separate commercial license from AIQnetLab.
+Additional Use Grant: You may use the Licensed Work in production, including
+                      commercially, for all of the following:
+
+                      (a) Running one or more QNet nodes of any type (super,
+                          full, light) that participate in the QNet network,
+                          including earning network rewards for doing so.
+                      (b) Operating public endpoints from such a node — RPC,
+                          API, WebSocket, explorers, faucets, dashboards and
+                          similar services — for your own use or for the public,
+                          free or paid.
+                      (c) Developing, deploying and operating smart contracts,
+                          tokens, wallets, SDKs, bots, indexers, bridges and
+                          any other applications that interact with the QNet
+                          network.
+                      (d) Internal business use, evaluation, testing, research,
+                          education, and security research.
+
+                      No separate agreement, registration or fee is required for
+                      any of the above.
+
 Change Date:          None (License remains BSL 1.1 indefinitely)
-Change License:       N/A (Perpetual proprietary license)
+Change License:       N/A
 
 Additional Restrictions:
-                      1. You may not create a competing blockchain network or service
-                      2. You may not offer the Licensed Work as a hosted service
-                      3. You may not remove or modify proprietary notices
-                      4. Forks must maintain clear attribution to QNet/AIQnetLab
+                      1. You may not use the Licensed Work, or any derivative of
+                         it, to operate a blockchain network other than QNet.
+                         This is the core restriction: the grant above is for
+                         participating in QNet, not for launching a copy of it.
+                      2. You may not offer the Licensed Work itself to third
+                         parties as a managed or hosted product (for example,
+                         "node hosting as a service" where the customer's node
+                         is the deliverable). Running your own nodes and serving
+                         their endpoints publicly is expressly permitted by
+                         grant (b) and is not restricted by this clause.
+                      3. You may not redistribute modified versions of the
+                         Licensed Work as a substitute for it.
+                      4. You may not remove or alter copyright, license or
+                         attribution notices.
 
 ---
 
@@ -39,7 +87,10 @@ Licensor may make an Additional Use Grant, above, permitting limited production
 use.
 
 This license is perpetual and remains in effect indefinitely. Production use
-of the Licensed Work requires a separate commercial license from the Licensor.
+BEYOND the Additional Use Grant stated above requires a separate commercial
+license from the Licensor. Production use that falls WITHIN the Additional Use
+Grant -- including running nodes of any type, earning protocol rewards, and
+operating public endpoints -- requires no agreement, fee, or notice.
 The Licensor reserves all rights not explicitly granted herein.
 
 If your use of the Licensed Work does not comply with the requirements currently
@@ -78,6 +129,7 @@ This license applies to the following components of the QNet project:
 COVERED BY BSL 1.1 (Blockchain Infrastructure):
 - core/                       (Blockchain core modules: consensus, mempool, state, sharding)
 - development/               (Node implementation, integration, contracts, VM)
+                              EXCEPT development/qnet-sdk/ -- see NOT COVERED below
 - audit/                     (Security audit tools and compliance tests)
 - governance/                (DAO and governance mechanisms)
 - deployment/                (Node deployment and orchestration)
@@ -90,20 +142,20 @@ NOT COVERED (Apache-2.0):
 - applications/qnet-wallet/     (Browser extension wallet - Apache-2.0)
 - applications/qnet-explorer/   (Blockchain explorer - Apache-2.0)
 - applications/qnet-cli/        (CLI tools - Apache-2.0)
+- development/qnet-sdk/         (Client SDK - Apache-2.0)
 
-NOTE: All applications connect to blockchain nodes via HTTP API only and contain
+NOTE: All of the above connect to blockchain nodes via HTTP API only and contain
 no proprietary blockchain code. They are independently licensed under Apache-2.0.
 
 ---
 
-Transfer of Rights:
+Assignment:
 
-In the event of acquisition or sale of the Licensed Work, all intellectual
-property rights, including but not limited to the right to modify this license,
-transfer ownership, or change licensing terms for future versions, shall transfer
-to the acquiring party. The new owner shall have full authority to relicense the
-work under any terms they choose, including making it open-source or maintaining
-proprietary status.
+The Licensor may assign this License and all rights under it. Your rights under
+the Additional Use Grant survive any such assignment: an assignee is bound by the
+grant as it stood when you obtained your copy, for that version. You may not
+assign or sublicense your rights under this License without the Licensor's
+written consent.
 
 ---
 

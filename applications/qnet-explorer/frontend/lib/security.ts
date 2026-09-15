@@ -29,11 +29,6 @@ export function verifyTransactionHash(tx: {
 
   // Compare with provided hash
   if (calculatedHash !== tx.hash && tx.hash.length > 0) {
-    console.error('[SECURITY] Hash mismatch detected!', {
-      provided: tx.hash,
-      calculated: calculatedHash,
-      tx: tx.hash.substring(0, 16) + '...'
-    });
     return false;
   }
 
@@ -88,12 +83,12 @@ export function logSecurityEvent(
   details: Record<string, unknown>
 ): void {
   const timestamp = new Date().toISOString();
-  console.error(`[SECURITY][${timestamp}] ${event}:`, details);
+  // console.error(`[SECURITY][${timestamp}] ${event}:`, details);
   
   // Process event for monitoring and alerting (async, don't await)
   import('./monitoring').then(({ processSecurityEvent }) => {
     processSecurityEvent(event, details).catch(err => {
-      console.error('[SECURITY] Failed to process security event:', err);
+      // console.error('[SECURITY] Failed to process security event:', err);
     });
   }).catch(() => {
     // Monitoring module not available, skip
@@ -107,7 +102,7 @@ export function logSecurityEvent(
       webhookUrl = new URL(process.env.SECURITY_WEBHOOK_URL);
       // Only allow https/http protocols
       if (webhookUrl.protocol !== 'https:' && webhookUrl.protocol !== 'http:') {
-        console.error('[SECURITY] Invalid webhook protocol:', webhookUrl.protocol);
+        // console.error('[SECURITY] Invalid webhook protocol:', webhookUrl.protocol);
         return;
       }
       // Block private/internal IPs (SSRF protection)
@@ -122,11 +117,11 @@ export function logSecurityEvent(
           hostname.startsWith('172.26.') || hostname.startsWith('172.27.') ||
           hostname.startsWith('172.28.') || hostname.startsWith('172.29.') ||
           hostname.startsWith('172.30.') || hostname.startsWith('172.31.')) {
-        console.error('[SECURITY] Webhook URL points to private IP, blocked:', hostname);
+        // console.error('[SECURITY] Webhook URL points to private IP, blocked:', hostname);
         return;
       }
     } catch {
-      console.error('[SECURITY] Invalid webhook URL format');
+      // console.error('[SECURITY] Invalid webhook URL format');
       return;
     }
     
@@ -136,7 +131,7 @@ export function logSecurityEvent(
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ event, timestamp, details }),
       signal: AbortSignal.timeout(5000), // 5 second timeout
-    }).catch(err => console.error('[SECURITY] Failed to send alert:', err));
+    }).catch(() => {});
   }
 }
 

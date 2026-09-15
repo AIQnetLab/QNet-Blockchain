@@ -2,7 +2,10 @@
 target/
 */target/
 **/target/
-Cargo.lock
+# IMPORTANT: Cargo.lock MUST be included for deterministic builds!
+# Without it, each Docker build resolves dependencies from scratch,
+# which caused random build failures when upstream crates released
+# incompatible versions between builds.
 node_modules/
 */node_modules/
 **/node_modules/

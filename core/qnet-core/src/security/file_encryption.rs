@@ -1,4 +1,4 @@
-﻿//! File encryption for LSM storage protection
+//! File encryption for LSM storage protection
 //! 
 //! This module provides AES-256-GCM encryption for protecting files on disk
 //! while maintaining blockchain transparency. Data content remains publicly
@@ -12,19 +12,33 @@ use rand::RngCore;
 /// File encryption system for protecting data at rest
 /// NOTE: This encrypts only the file storage, not the data content
 /// All blockchain data remains publicly queryable via APIs
-#[derive(Clone)]
+/// Master key is generated via OsRng — not derived from any public identifier
+/// FIX H16: Removed Clone to prevent key material duplication; added Drop for zeroization
 pub struct FileEncryption {
-    /// Master encryption key for file protection (256-bit)
+    /// Master encryption key for file protection (256-bit, OsRng-generated)
     master_key: Vec<u8>,
-    
+
     /// Encryption enabled flag
     enabled: bool,
-    
-    /// Key derivation salt (256-bit)
+
+    /// Random salt stored for reference (not used in key derivation)
     salt: [u8; 32],
-    
-    /// Node identifier for key derivation
+
+    /// Node identifier (stored for record-keeping, not used in key derivation)
     node_id: String,
+
+    /// Flag set after key rotation — indicates existing files need re-encryption
+    needs_reencryption: bool,
+}
+
+impl Drop for FileEncryption {
+    fn drop(&mut self) {
+        // FIX H16: Volatile zeroize master key on drop
+        for byte in self.master_key.iter_mut() {
+            unsafe { core::ptr::write_volatile(byte, 0u8); }
+        }
+        core::hint::black_box(&self.master_key);
+    }
 }
 
 /// Encrypted file header for integrity verification
@@ -100,32 +114,26 @@ impl From<std::io::Error> for EncryptionError {
 }
 
 impl FileEncryption {
-    /// Create new file encryption system
+    /// Create new file encryption system.
+    /// Master key is fully random (OsRng), independent of node_id.
     pub fn new(enabled: bool, node_id: String) -> Result<Self, EncryptionError> {
+        use rand::RngCore;
+        use rand::rngs::OsRng;
+
         let mut salt = [0u8; 32];
-        if enabled {
-            // Generate cryptographically secure random salt
-            use rand::RngCore;
-            rand::thread_rng().fill_bytes(&mut salt);
-        }
-        
-        // Generate 256-bit master key for AES-256-GCM
         let mut master_key = vec![0u8; 32];
+
         if enabled {
-            // Derive key from node ID and random salt for uniqueness
-            let mut hasher = Sha3_256::new();
-            hasher.update(node_id.as_bytes());
-            hasher.update(&salt);
-            hasher.update(b"qnet_lsm_encryption_key");
-            let key_hash = hasher.finalize();
-            master_key.copy_from_slice(&key_hash);
+            OsRng.fill_bytes(&mut salt);
+            OsRng.fill_bytes(&mut master_key);
         }
-        
+
         Ok(Self {
             master_key,
             enabled,
             salt,
             node_id,
+            needs_reencryption: false,
         })
     }
     
@@ -136,6 +144,7 @@ impl FileEncryption {
             enabled: true,
             salt,
             node_id,
+            needs_reencryption: false,
         }
     }
     
@@ -156,8 +165,9 @@ impl FileEncryption {
         }
         
         // Generate unique nonce for this encryption
+        use rand::rngs::OsRng;
         let mut nonce = [0u8; 12];
-        rand::thread_rng().fill_bytes(&mut nonce);
+        OsRng.fill_bytes(&mut nonce);
         
         // Create file header
         let header = EncryptedFileHeader {
@@ -210,7 +220,7 @@ impl FileEncryption {
         }
         
         // Parse header
-        if encrypted_data.len() < 54 { // Magic + version + nonce + checksum + timestamp + file_type
+        if encrypted_data.len() < 55 { // Magic(1) + version(1) + nonce(12) + checksum(32) + timestamp(8) + file_type(1) = 55
             return Err(EncryptionError::CorruptedFile("Invalid encrypted file header".to_string()));
         }
         
@@ -241,7 +251,20 @@ impl FileEncryption {
         hasher.update(&self.salt);
         let expected_checksum = hasher.finalize();
         
-        if stored_checksum != expected_checksum.as_slice() {
+        // FIX L2: Constant-time comparison for integrity checksum
+        let checksum_match = {
+            let expected = expected_checksum.as_slice();
+            if stored_checksum.len() != expected.len() {
+                false
+            } else {
+                let mut diff = 0u8;
+                for (a, b) in stored_checksum.iter().zip(expected.iter()) {
+                    diff |= a ^ b;
+                }
+                core::hint::black_box(diff) == 0
+            }
+        };
+        if !checksum_match {
             return Err(EncryptionError::CorruptedFile("File integrity check failed".to_string()));
         }
         
@@ -311,29 +334,47 @@ impl FileEncryption {
     }
     
     /// Rotate encryption key (for periodic security updates)
+    ///
+    /// WARNING: After rotation, all files encrypted with the old key become inaccessible
+    /// unless re-encrypted. Call `re_encrypt_all_files()` after rotation to migrate data.
     pub fn rotate_key(&mut self) -> Result<(), EncryptionError> {
         if !self.enabled {
             return Ok(());
         }
-        
+
+        println!("[WARN][CRYPTO] key_rotation — existing files encrypted with old key will become inaccessible");
+        println!("[WARN][CRYPTO] call re_encrypt_all_files() after rotation to migrate encrypted data");
+
         // Generate new salt
-        rand::thread_rng().fill_bytes(&mut self.salt);
-        
-        // Derive new key
-        let mut hasher = Sha3_256::new();
-        hasher.update(self.node_id.as_bytes());
-        hasher.update(&self.salt);
-        hasher.update(b"qnet_lsm_encryption_key_rotated");
-        hasher.update(&std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
-            .to_le_bytes());
-        
-        let key_hash = hasher.finalize();
-        self.master_key.copy_from_slice(&key_hash);
-        
+        {
+            use rand::RngCore;
+            use rand::rngs::OsRng;
+            OsRng.fill_bytes(&mut self.salt);
+        }
+
+        // Generate a fresh random master key (independent of node_id)
+        {
+            use rand::RngCore;
+            use rand::rngs::OsRng;
+            OsRng.fill_bytes(&mut self.master_key);
+        }
+
+        // Flag that existing files need re-encryption with the new key
+        self.needs_reencryption = true;
+        println!("[INFO][CRYPTO] key_rotated needs_reencryption=true");
+
         Ok(())
+    }
+
+    /// Check if files need re-encryption after a key rotation
+    pub fn needs_reencryption(&self) -> bool {
+        self.needs_reencryption
+    }
+
+    /// Clear the re-encryption flag after all files have been migrated
+    pub fn mark_reencryption_complete(&mut self) {
+        self.needs_reencryption = false;
+        println!("[INFO][CRYPTO] reencryption_complete needs_reencryption=false");
     }
     
     /// Get encryption statistics

@@ -13,8 +13,8 @@ logger = logging.getLogger(__name__)
 
 class NodeType(Enum):
     """Node types for ping routing"""
+    # v3.18: Only Light and Super nodes (Full removed)
     LIGHT = "light"     # Mobile Light node - ping mobile device
-    FULL = "full"       # Server Full node - ping server directly  
     SUPER = "super"     # Server Super node - ping server directly
 
 class PingTarget(Enum):
@@ -92,39 +92,31 @@ class NodeTypeDetector:
                          mobile_devices: list, declared_type: Optional[str]) -> NodeType:
         """Detect node type based on registration data"""
         
-        # Rule 1: Server endpoint provided = Full or Super node
+        # v3.18: Only Light and Super nodes (Full removed)
+        # Rule 1: Server endpoint provided = Super node
         if server_endpoint:
-            # Check activation amount to distinguish Full vs Super
-            if activation_amount >= 10000:  # 10k+ QNC = Super node
+            # v3.18: All server nodes are Super nodes (7500+ QNC base)
+            if activation_amount >= 7500:
                 logger.info(f"Detected Super node: server endpoint + {activation_amount} QNC")
                 return NodeType.SUPER
-            elif activation_amount >= 7500:  # 7.5k+ QNC = Full node
-                logger.info(f"Detected Full node: server endpoint + {activation_amount} QNC")
-                return NodeType.FULL
             else:
                 logger.warning(f"Server endpoint provided but low activation amount: {activation_amount}")
-                return NodeType.FULL  # Default to Full if server provided
+                return NodeType.SUPER  # Default to Super if server provided
         
         # Rule 2: Only mobile devices = Light node
         if mobile_devices and not server_endpoint:
             logger.info(f"Detected Light node: {len(mobile_devices)} mobile devices, no server")
             return NodeType.LIGHT
         
-        # Rule 3: Declared type validation
+        # Rule 3: Declared type validation (v3.18: only light/super)
         if declared_type:
-            if declared_type.lower() == 'super' and activation_amount >= 10000:
+            if declared_type.lower() == 'super' and activation_amount >= 7500:
                 logger.warning("Declared Super node but no server endpoint - requiring server")
                 return NodeType.SUPER
-            elif declared_type.lower() == 'full' and activation_amount >= 7500:
-                logger.warning("Declared Full node but no server endpoint - requiring server")  
-                return NodeType.FULL
         
         # Rule 4: Default based on activation amount
-        if activation_amount >= 10000:
-            logger.warning(f"High activation amount ({activation_amount}) but no server - defaulting to Light")
-            return NodeType.LIGHT
-        elif activation_amount >= 7500:
-            logger.warning(f"Medium activation amount ({activation_amount}) but no server - defaulting to Light")
+        if activation_amount >= 7500:
+            logger.warning(f"Server activation amount ({activation_amount}) but no server - defaulting to Light")
             return NodeType.LIGHT
         
         # Default: Light node
@@ -135,7 +127,8 @@ class NodeTypeDetector:
                               mobile_devices: list) -> Tuple[PingTarget, str, list]:
         """Determine what to ping for this node"""
         
-        if node_type in [NodeType.FULL, NodeType.SUPER]:
+        # v3.18: Only Super nodes for servers (Full removed)
+        if node_type == NodeType.SUPER:
             # Server nodes: ping server endpoint
             if server_endpoint:
                 return PingTarget.SERVER_ENDPOINT, server_endpoint, []
@@ -235,9 +228,8 @@ class NodeTypeDetector:
             # Reasoning: Mobile devices can be offline due to travel, battery, airplane mode, no service
             return node_info.consecutive_failures >= 24
         
-        elif node_info.node_type == NodeType.FULL:
-            # Full nodes: Ban after 180 consecutive ping failures (12 hours offline)  
-            # Reasoning: Servers can have maintenance windows, updates, network issues, hardware failures
+        # v3.18: Full removed - Super handles all server nodes
+        elif node_info.node_type == NodeType.SUPER:
             return node_info.consecutive_failures >= 180
         
         elif node_info.node_type == NodeType.SUPER:
@@ -316,8 +308,8 @@ class NodeTypeDetector:
     def _get_ban_threshold(self, node_type: NodeType) -> int:
         """Get ban threshold for node type (PRODUCTION-REALISTIC)"""
         thresholds = {
+            # v3.18: Only Light and Super nodes (Full removed)
             NodeType.LIGHT: 24,   # 24 missed reward windows (4 days)
-            NodeType.FULL: 180,   # 180 consecutive ping failures (12 hours)
             NodeType.SUPER: 90    # 90 consecutive ping failures (6 hours)
         }
         return thresholds.get(node_type, 24)

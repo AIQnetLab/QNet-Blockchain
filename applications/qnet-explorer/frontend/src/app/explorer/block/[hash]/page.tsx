@@ -4,6 +4,7 @@ import React, { useState, useCallback, useEffect } from 'react';
 import Link from 'next/link';
 import { useParams } from 'next/navigation';
 import type { Block, BlockTransaction, HeartbeatEntry } from '@/lib/types';
+import { getCache, setCache, isCacheStale } from '@/lib/explorer-cache';
 
 // Helper to truncate
 const truncate = (str: string, start = 8, end = 6): string => {
@@ -12,15 +13,35 @@ const truncate = (str: string, start = 8, end = 6): string => {
 };
 
 // Format amount from nanoQNC to QNC
+// v3.52: Full precision, no zero-padding
 const formatAmount = (nanoQNC: string): string => {
   const num = BigInt(nanoQNC);
   const qnc = Number(num) / 1e9;
-  return qnc.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 6 }) + ' QNC';
+  
+  const fixed = qnc.toFixed(9);
+  const trimmed = fixed.replace(/\.?0+$/, '');
+  
+  const [intPart, decPart] = trimmed.split('.');
+  const intFormatted = Number(intPart).toLocaleString('en-US');
+  return decPart ? intFormatted + '.' + decPart + ' QNC' : intFormatted + ' QNC';
 };
 
-// Format timestamp
-const formatTime = (ts: number): string => {
-  return new Date(ts).toUTCString();
+// Format timestamp → dd.mm.yyyy, HH:MM:SS
+const formatTime = (ts: number | string | undefined): string => {
+  const timestamp = Number(ts);
+  if (!timestamp || !Number.isFinite(timestamp) || timestamp <= 0) {
+    return 'Genesis Block';
+  }
+  const ms = timestamp > 1e12 ? timestamp : timestamp * 1000;
+  const date = new Date(ms);
+  if (isNaN(date.getTime())) return 'Invalid Date';
+  const dd = String(date.getDate()).padStart(2, '0');
+  const mm = String(date.getMonth() + 1).padStart(2, '0');
+  const yyyy = date.getFullYear();
+  const hh = String(date.getHours()).padStart(2, '0');
+  const min = String(date.getMinutes()).padStart(2, '0');
+  const ss = String(date.getSeconds()).padStart(2, '0');
+  return `${dd}.${mm}.${yyyy}, ${hh}:${min}:${ss}`;
 };
 
 // Copy button (Keeta style)
@@ -53,50 +74,58 @@ export default function BlockPage() {
   const params = useParams();
   const hash = params.hash as string;
   
-  const [block, setBlock] = useState<Block | null>(null);
-  const [loading, setLoading] = useState(true);
+  // v2.102: Sync cache read for instant display
+  const cachedBlock = hash ? getCache<Block>('block', hash) : null;
+  
+  const [block, setBlock] = useState<Block | null>(cachedBlock);
   const [error, setError] = useState<string | null>(null);
+  const [hasFetched, setHasFetched] = useState(!!cachedBlock); // true if we have cache
   const [showValidators, setShowValidators] = useState(false);
   const [showRelated, setShowRelated] = useState(false);
   
   useEffect(() => {
     if (!hash) return;
     
+    // If we have fresh cache, skip fetch
+    if (cachedBlock && !isCacheStale('block', hash)) {
+      setHasFetched(true);
+      return;
+    }
+    
     const fetchBlock = async () => {
       try {
-        setLoading(true);
         const res = await fetch(`/api/blocks/${hash}`);
         const data = await res.json();
         
         if (data.success && data.data) {
           setBlock(data.data);
+          setCache('block', hash, data.data);
+          setError(null);
         } else {
           setError(data.error || 'Block not found');
         }
-      } catch (err) {
+      } catch {
         setError('Failed to load block');
       } finally {
-        setLoading(false);
+        setHasFetched(true);
       }
     };
     
     fetchBlock();
-  }, [hash]);
+  }, [hash, cachedBlock]);
   
-  if (loading) {
-    return (
-      <div className="block-page">
-        <div className="loading-state">Loading block...</div>
-      </div>
-    );
-  }
-  
-  if (error || !block) {
+  // Show error ONLY after fetch attempt
+  if (hasFetched && (error || !block)) {
     return (
       <div className="block-page">
         <div className="error-state">{error || 'Block not found'}</div>
       </div>
     );
+  }
+  
+  // Still loading - show empty shell (no flicker)
+  if (!block) {
+    return <div className="block-page" />;
   }
   
   const isMacro = block.block_type === 'MACROBLOCK';
@@ -129,43 +158,86 @@ export default function BlockPage() {
             <span className="detail-value">{block.block_type}</span>
           </div>
           <div className="detail-row">
-            <span className="detail-label">Producer</span>
-            <span className="detail-value">{block.producer}</span>
+            <span className="detail-label">Version</span>
+            <span className="detail-value">{block.version || 1}</span>
           </div>
           <div className="detail-row">
-            <span className="detail-label">Producer Address</span>
-            <span className="detail-value">
-              <Link href={`/explorer/address/${block.producer_address}`} className="address-link">
-                {truncate(block.producer_address, 12, 8)}
-              </Link>
-              <CopyBtn text={block.producer_address} />
-            </span>
+            <span className="detail-label">Producer</span>
+            <span className="detail-value">{block.producer}</span>
           </div>
           <div className="detail-row">
             <span className="detail-label">Transactions</span>
             <span className="detail-value">{block.tx_count}</span>
           </div>
+          {block.total_gas_used !== undefined && block.total_gas_used > 0 && (
+            <div className="detail-row">
+              <span className="detail-label">Gas Used</span>
+              <span className="detail-value">{block.total_gas_used.toLocaleString()}</span>
+            </div>
+          )}
+          {block.size_bytes !== undefined && block.size_bytes > 0 && (
+            <div className="detail-row">
+              <span className="detail-label">Block Size</span>
+              <span className="detail-value">{(block.size_bytes / 1024).toFixed(2)} KB</span>
+            </div>
+          )}
           <div className="detail-row">
             <span className="detail-label">Previous Hash</span>
             <span className="detail-value">
-              <Link href={`/explorer/block/${block.previous_hash}`} className="address-link">
-                {truncate(block.previous_hash)}
-              </Link>
-              <CopyBtn text={block.previous_hash} />
+              {block.height > 0 ? (
+                <>
+                  <Link href={`/explorer/block/${block.height - 1}`} className="address-link">
+                    {truncate(block.previous_hash)}
+                  </Link>
+                  <CopyBtn text={block.previous_hash} />
+                </>
+              ) : (
+                <span className="mono">Genesis Block</span>
+              )}
             </span>
           </div>
           <div className="detail-row">
             <span className="detail-label">Merkle Root</span>
-            <span className="detail-value mono">{truncate(block.merkle_root, 12, 12)}</span>
+            <span className="detail-value mono">
+              {truncate(block.merkle_root, 12, 12)}
+              <CopyBtn text={block.merkle_root} />
+            </span>
           </div>
+          {block.state_root && (
+            <div className="detail-row">
+              <span className="detail-label">State Root</span>
+              <span className="detail-value mono">
+                {truncate(block.state_root, 12, 12)}
+                <CopyBtn text={block.state_root} />
+              </span>
+            </div>
+          )}
+          {block.poh_hash && (
+            <div className="detail-row">
+              <span className="detail-label">VTS Hash</span>
+              <span className="detail-value mono">
+                {truncate(block.poh_hash, 12, 12)}
+                <CopyBtn text={block.poh_hash} />
+              </span>
+            </div>
+          )}
           <div className="detail-row">
             <span className="detail-label">VTS Counter</span>
             <span className="detail-value">{block.poh_count.toLocaleString()}</span>
           </div>
           <div className="detail-row">
-            <span className="detail-label">Signature</span>
+            <span className="detail-label">Signature Type</span>
             <span className="detail-value">{block.signature_type}</span>
           </div>
+          {block.signature && (
+            <div className="detail-row">
+              <span className="detail-label">Signature</span>
+              <span className="detail-value mono">
+                {truncate(block.signature, 16, 16)}
+                <CopyBtn text={block.signature} />
+              </span>
+            </div>
+          )}
           {block.cert_serial && (
             <div className="detail-row">
               <span className="detail-label">Certificate</span>
@@ -175,7 +247,10 @@ export default function BlockPage() {
           {block.qrb_output && (
             <div className="detail-row">
               <span className="detail-label">QRB Output</span>
-              <span className="detail-value mono">{truncate(block.qrb_output, 16, 16)}</span>
+              <span className="detail-value mono">
+                {truncate(block.qrb_output, 16, 16)}
+                <CopyBtn text={block.qrb_output} />
+              </span>
             </div>
           )}
         </div>
@@ -202,10 +277,10 @@ export default function BlockPage() {
               <span className="detail-label">Eligible Nodes</span>
               <span className="detail-value">{block.consensus_data.eligible_nodes_count}</span>
             </div>
-            {block.consensus_data.pool2_total_fees !== undefined && (
+            {block.consensus_data.fees_collected !== undefined && (
               <div className="detail-row highlight">
-                <span className="detail-label">Pool 2 Fees</span>
-                <span className="detail-value">{formatAmount(block.consensus_data.pool2_total_fees.toString())}</span>
+                <span className="detail-label">Fees Collected</span>
+                <span className="detail-value">{formatAmount(block.consensus_data.fees_collected.toString())}</span>
               </div>
             )}
             {block.consensus_data.pool3_total_activations !== undefined && (
@@ -246,13 +321,21 @@ export default function BlockPage() {
                   <span className={`type-badge type-${tx.type.toLowerCase()}`}>{tx.type}</span>
                 </td>
                 <td>
-                  <Link href={`/explorer/address/${tx.from}`} className="address-link">
-                    {truncate(tx.from, 6, 4)}
-                  </Link>
+                  {tx.from && tx.from.length > 10 && tx.from.includes('eon') ? (
+                    <Link href={`/explorer/address/${tx.from}`} className="address-link">
+                      {truncate(tx.from, 6, 4)}
+                    </Link>
+                  ) : (
+                    <span className="address-link">{tx.from || 'N/A'}</span>
+                  )}
                   <span className="tx-arrow">→</span>
-                  <Link href={`/explorer/address/${tx.to}`} className="address-link">
-                    {truncate(tx.to, 6, 4)}
-                  </Link>
+                  {tx.to && tx.to.length > 10 && tx.to.includes('eon') ? (
+                    <Link href={`/explorer/address/${tx.to}`} className="address-link">
+                      {truncate(tx.to, 6, 4)}
+                    </Link>
+                  ) : (
+                    <span className="address-link">{tx.to || 'N/A'}</span>
+                  )}
                 </td>
                 <td>{formatAmount(tx.amount)}</td>
               </tr>
@@ -328,3 +411,4 @@ export default function BlockPage() {
     </div>
   );
 }
+

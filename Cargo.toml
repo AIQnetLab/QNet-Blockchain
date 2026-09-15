@@ -5,7 +5,9 @@ members = [
     "core/qnet-mempool",
     "core/qnet-state",
     "core/qnet-sharding",
+    "core/qnet-vm",
     "development/qnet-integration",
+    "development/qnet-loadtest",
     "audit"
 ]
 resolver = "2"
@@ -26,7 +28,9 @@ rocksdb = "0.21"
 [profile.release]
 opt-level = 3
 debug = false
-strip = true
+# Keep the symbol table: a frozen node is diagnosed from thread backtraces on the host, and a
+# stripped binary turns them into bare addresses. No DWARF is emitted (debug = false).
+strip = "debuginfo"
 lto = "fat"
 codegen-units = 1
 panic = "abort"
@@ -35,11 +39,17 @@ panic = "abort"
 inherits = "release"
 opt-level = 3
 debug = false
-strip = true
+strip = "debuginfo"
 lto = "fat"
 codegen-units = 1
 panic = "abort"
 overflow-checks = false
+
+[profile.dev]
+# Line tables only. Full debug info grew the crate rlib past 4 GB, which link.exe cannot read as an
+# archive — it silently skips the library and the build dies on thousands of unresolved symbols.
+# Panics still carry file:line.
+debug = 1
 
 [profile.test]
 opt-level = 2  # Optimize tests for better performance

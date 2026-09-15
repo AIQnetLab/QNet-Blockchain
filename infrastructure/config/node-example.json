@@ -1,6 +1,6 @@
 {
   "data_dir": "./data",
-  "node_type": "Full",
+  "node_type": "super",  // v3.18: Full removed, use "super" for servers
   "network": {
     "listen_addresses": [
       "/ip4/0.0.0.0/tcp/9000",

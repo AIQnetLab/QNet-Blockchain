@@ -1,32 +1,23 @@
 //! QNet Quantum-Resistant Cryptography Module for Server
-//! Production implementation using CRYSTALS-Kyber and Dilithium algorithms
+//! Production implementation using CRYSTALS-ML-DSA-65 and XOR-based activation code encryption
 //! Server-side activation code decryption and validation
 
 use sha3::{Sha3_256, Digest};
-// Crystals-Dilithium will be used through key_manager
-use aes_gcm::{Aes256Gcm, Key, Nonce, KeyInit};
-use aes_gcm::aead::{Aead, AeadCore, OsRng};
 use serde::{Serialize, Deserialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 use base64::{Engine as _, engine::general_purpose};
 use anyhow::{Result, anyhow};
-use crate::node::NodeType;
-use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::RwLock as StdRwLock;  // For performance_stats (non-async)
-use blake3;
-use chacha20poly1305::{ChaCha20Poly1305, Key as ChaChaKey, Nonce as ChachaNonce, KeyInit as ChachaKeyInit};
-use tokio::time::Duration;
+use parking_lot::RwLock as StdRwLock;  // For performance_stats (non-async, non-poisoning)
 use dashmap::DashMap;
 
-/// Safe string preview utility to prevent index out of bounds errors
-fn safe_preview(s: &str, len: usize) -> &str {
-    if s.len() >= len {
-        &s[..len]
-    } else {
-        s
-    }
-}
+
+
+// `ct_eq` was used by the old STEP-4 fallback in `verify_dilithium_signature`
+// that was removed as part of the v17 identity-binding hardening. The
+// canonical-message comparison now lives entirely inside
+// `qnet_consensus::consensus_crypto::verify_with_real_dilithium`, which has
+// its own constant-time helper. This module no longer needs a local copy.
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // PRODUCTION v2.51: Lock-free caches with DashMap
@@ -46,44 +37,16 @@ static SIGNATURE_CACHE: once_cell::sync::Lazy<DashMap<String, CachedSignature>> 
 static KEY_MANAGER_CACHE: once_cell::sync::Lazy<DashMap<String, CachedKeyManager>> = 
     once_cell::sync::Lazy::new(|| DashMap::new());
 
-/// Blockchain phase state for dynamic pricing calculations
-#[derive(Debug, Clone)]
-pub struct BlockchainPhaseState {
-    pub is_phase_1: bool,
-    pub burn_percentage: f64,      // % of 1DEV burned (Phase 1)
-    pub total_active_nodes: u64,   // Total active nodes (Phase 2)
-    pub genesis_timestamp: u64,    // Genesis block timestamp
-    pub current_timestamp: u64,    // Current timestamp
-}
-
-impl BlockchainPhaseState {
-    /// Check if currently in Phase 1 (1DEV burning phase)
-    pub fn is_phase1(&self) -> bool {
-        self.is_phase_1
-    }
-
-    /// Get 1DEV burn percentage for Phase 1 pricing
-    pub fn get_1dev_burn_percentage(&self) -> f64 {
-        self.burn_percentage
-    }
-
-    /// Get total active nodes for Phase 2 network multipliers
-    pub fn get_total_active_nodes(&self) -> u64 {
-        self.total_active_nodes
-    }
-
-    /// Check if phase transition conditions are met
-    pub fn should_transition_to_phase2(&self) -> bool {
-        // Transition if 90% burned OR 5 years since genesis
-        let five_years_seconds = 5 * 365 * 24 * 60 * 60; // 5 years in seconds
-        let years_passed = self.current_timestamp >= self.genesis_timestamp + five_years_seconds;
-        
-        self.burn_percentage >= 90.0 || years_passed
-    }
+/// Entry counts of the crypto caches, for the memory census.
+pub fn holder_census() -> Vec<(&'static str, u64)> {
+    vec![("crypto_activations", CRYPTO_CACHE.len() as u64),
+         ("crypto_signatures", SIGNATURE_CACHE.len() as u64),
+         ("crypto_key_managers", KEY_MANAGER_CACHE.len() as u64)]
 }
 
 /// Cached activation data for zero-copy operations
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct CachedActivationData {
     payload: ActivationPayload,
     created_at: u64,
@@ -92,6 +55,7 @@ struct CachedActivationData {
 
 /// Cached signature for fast validation
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct CachedSignature {
     is_valid: bool,
     cached_at: u64,
@@ -126,7 +90,8 @@ pub struct ActivationPayload {
     /// QNet EON address for rewards (ALWAYS EON format: {19}eon{15}{4checksum})
     pub wallet: String,
     pub node_type: String,
-    pub signature: DilithiumSignature,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<DilithiumSignature>,
     pub entropy: String,
     pub timestamp: u64,
     pub version: String,
@@ -168,16 +133,6 @@ pub struct QuantumAlgorithms {
     pub hash: String,
 }
 
-/// Compatible activation data structure for integration with existing economic logic
-#[derive(Debug, Clone)]
-struct CompatibleActivationData {
-    pub node_type: NodeType,
-    pub qnc_amount: u64,
-    pub tx_hash: String,
-    pub wallet_address: String,
-    pub phase: u8,
-}
-
 /// Quantum-secure crypto system for QNet activation codes
 pub struct QNetQuantumCrypto {
     initialized: bool,
@@ -188,6 +143,7 @@ pub struct QNetQuantumCrypto {
 }
 
 #[derive(Debug, Default)]
+#[allow(dead_code)]
 struct PerformanceStats {
     total_operations: u64,
     cache_hits: u64,
@@ -198,7 +154,7 @@ struct PerformanceStats {
 
 impl QNetQuantumCrypto {
     pub fn new() -> Self {
-        println!("✅ Server quantum crypto modules initialized");
+        println!("[INFO][QUANTUM_CRYPTO] server_modules_initialized");
         Self {
             initialized: false,
             cache_ttl_seconds: 3600, // 1 hour cache TTL for aggressive caching
@@ -214,13 +170,13 @@ impl QNetQuantumCrypto {
         }
 
         // Initialize quantum crypto algorithms (placeholder for CRYSTALS integration)
-        println!("🔐 Initializing quantum-resistant crypto systems...");
+        println!("[INFO][QUANTUM_CRYPTO] initializing_quantum_resistant_crypto");
         
         // Pre-warm cache for better performance
         self.prewarm_cache().await?;
         
         self.initialized = true;
-        println!("✅ Quantum crypto system ready with aggressive caching");
+        println!("[INFO][QUANTUM_CRYPTO] system_ready caching=enabled");
         Ok(())
     }
 
@@ -236,7 +192,7 @@ impl QNetQuantumCrypto {
         if let Some(cached) = self.get_from_cache(activation_code).await {
             self.increment_zero_copy_ops();
             self.record_cache_hit();
-            println!("🚀 Cache hit - zero-copy activation code decrypt");
+            println!("[INFO][QUANTUM_CRYPTO] activation_cache_hit");
             return Ok(cached.payload);
         }
 
@@ -250,7 +206,7 @@ impl QNetQuantumCrypto {
         ];
         
         if BOOTSTRAP_WHITELIST.contains(&activation_code) {
-            println!("✅ Genesis bootstrap code detected in quantum_crypto.rs: {}", activation_code);
+            println!("[INFO][QUANTUM_CRYPTO] genesis_bootstrap_detected code={}", activation_code);
             
             // Extract bootstrap ID from code: QNET-BOOT-0001-STRAP → "001"
             // Note: split gives "0001" (4 chars), but genesis_constants uses "001" (3 chars)
@@ -277,13 +233,8 @@ impl QNetQuantumCrypto {
                 burn_tx: "genesis_bootstrap".to_string(),
                 node_type: "super".to_string(),
                 timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
-                wallet,  // Now matches get_wallet_address() format!
-                signature: DilithiumSignature {
-                    signature: "genesis_bootstrap_signature".to_string(),
-                    algorithm: "CRYSTALS-Dilithium3".to_string(),  // NIST FIPS 204
-                    timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
-                    strength: "quantum-resistant".to_string(),
-                },
+                wallet,
+                signature: None,
                 entropy: "genesis_entropy".to_string(),
                 version: "2.0.0".to_string(),
                 permanent: true,
@@ -316,7 +267,7 @@ impl QNetQuantumCrypto {
         // segment3 = encrypted_wallet[6:10] + entropy[0:2] OR encrypted_wallet[6:10] + entropy[0:4]
         // We need to extract wallet parts, ignoring entropy
         let wallet_part1 = segment2; // 6 chars
-        let wallet_part2 = &segment3[..4.min(segment3.len())]; // First 4 chars (rest is entropy)
+        let wallet_part2 = qnet_state::char_prefix(&segment3, 4); // First 4 chars (rest is entropy)
         let encrypted_wallet_hex = format!("{}{}", wallet_part1, wallet_part2); // 10 chars total
 
         // 5. Query blockchain for burn transaction AND amount (we need both for decryption key)
@@ -328,10 +279,10 @@ impl QNetQuantumCrypto {
         let key_material = format!("{}:{}:{}", burn_tx, node_type, burn_amount);
         let encryption_key = self.sha3_hash(&key_material)[..32].to_string();
         
-        println!("🔑 Decryption key derived from:");
-        println!("   burn_tx: {}...", safe_preview(&burn_tx, 8));
-        println!("   node_type: {}", node_type);
-        println!("   burn_amount: {}", burn_amount);
+        if crate::node::is_debug() {
+            println!("[DEBUG][QUANTUM_CRYPTO] xor_key_derived burn_tx={}... node_type={} burn_amount={}",
+                     &burn_tx, node_type, burn_amount);
+        }
 
         // 7. XOR decrypt wallet PREFIX (only first 5 bytes are in the code)
         let encrypted_wallet = hex::decode(&encrypted_wallet_hex)
@@ -355,21 +306,19 @@ impl QNetQuantumCrypto {
                 };
                 
                 if stored_prefix != decrypted_wallet_prefix {
-                    println!("⚠️ Wallet prefix mismatch - code may be corrupted or forged");
-                    println!("   Decrypted: {}...", safe_preview(&decrypted_wallet_prefix, 8));
-                    println!("   Stored: {}...", safe_preview(stored_prefix, 8));
-                    // Continue with stored wallet - it's authoritative
+                    eprintln!("[WARN][QUANTUM_CRYPTO] wallet_prefix_mismatch decrypted={}... stored={}... using_stored=true",
+                              &decrypted_wallet_prefix, stored_prefix);
+                    // Continue with stored wallet — it's authoritative
                 }
                 
                 record.wallet_address.clone()
             }
             Ok(None) => {
-                // No record found - use decrypted prefix as fallback (Genesis nodes)
-                println!("⚠️ No activation record found, using decrypted prefix as wallet");
+                eprintln!("[WARN][QUANTUM_CRYPTO] no_activation_record using_prefix_as_wallet=true");
                 decrypted_wallet_prefix.clone()
             }
             Err(e) => {
-                println!("⚠️ Registry query failed: {}, using decrypted prefix", e);
+                eprintln!("[WARN][QUANTUM_CRYPTO] registry_query_failed err={} using_prefix_as_wallet=true", e);
                 decrypted_wallet_prefix.clone()
             }
         };
@@ -380,13 +329,8 @@ impl QNetQuantumCrypto {
             wallet: full_wallet,
             node_type,
             timestamp,
-            signature: DilithiumSignature {
-                signature: "activation_payload_signature".to_string(),
-                algorithm: "CRYSTALS-Dilithium3".to_string(),  // NIST FIPS 204
-                timestamp,
-                strength: "quantum-resistant".to_string(),
-            },
-            entropy: segment3[4..].to_string(), // Extract entropy from segment3
+            signature: None,
+            entropy: segment3[4..].to_string(),
             version: "2.0.0".to_string(),
             permanent: true,
         };
@@ -398,11 +342,11 @@ impl QNetQuantumCrypto {
         let decrypt_time_ms = start_time.elapsed().as_millis() as u64;
         self.record_decrypt_time(decrypt_time_ms);
 
-        println!("🔓 Route.ts compatible activation code decrypted successfully");
-        println!("   Wallet: {}...", safe_preview(&payload.wallet, 8));
-        println!("   Node type: {}", payload.node_type);
-        println!("   Burn tx: {}...", safe_preview(&payload.burn_tx, 8));
-        println!("   Decrypt time: {}ms", decrypt_time_ms);
+        if crate::node::is_debug() {
+            println!("[DEBUG][QUANTUM_CRYPTO] activation_decoded wallet={}... node_type={} burn_tx={}... elapsed_ms={}",
+                     &payload.wallet, payload.node_type,
+                     &payload.burn_tx, decrypt_time_ms);
+        }
 
         Ok(payload)
     }
@@ -470,7 +414,7 @@ impl QNetQuantumCrypto {
     /// Pre-warm cache for better performance
     async fn prewarm_cache(&self) -> Result<()> {
         // Pre-generate common crypto components for zero-copy operations
-        println!("🔥 Pre-warming crypto cache for optimal performance...");
+        println!("[INFO][QUANTUM_CRYPTO] prewarm_cache_start");
         
         // This would pre-compute common cryptographic operations
         // For now, just initialize the cache structures
@@ -484,28 +428,25 @@ impl QNetQuantumCrypto {
     }
 
     fn record_cache_hit(&self) {
-        if let Ok(mut stats) = self.performance_stats.write() {
-            stats.cache_hits += 1;
-            stats.total_operations += 1;
-        }
+        let mut stats = self.performance_stats.write();
+        stats.cache_hits += 1;
+        stats.total_operations += 1;
     }
 
     fn record_cache_miss(&self) {
-        if let Ok(mut stats) = self.performance_stats.write() {
-            stats.cache_misses += 1;
-            stats.total_operations += 1;
-        }
+        let mut stats = self.performance_stats.write();
+        stats.cache_misses += 1;
+        stats.total_operations += 1;
     }
 
     fn record_decrypt_time(&self, time_ms: u64) {
-        if let Ok(mut stats) = self.performance_stats.write() {
-            stats.total_decrypt_time_ms += time_ms;
-        }
+        let mut stats = self.performance_stats.write();
+        stats.total_decrypt_time_ms += time_ms;
     }
 
     /// Get performance status (removed code verification - system always generates correct codes)
     pub fn get_status(&self) -> QuantumCryptoStatus {
-        let stats = match self.performance_stats.read() { Ok(g) => g, Err(p) => p.into_inner() };
+        let stats = self.performance_stats.read();
         let zero_copy_ops = self.zero_copy_counter.load(std::sync::atomic::Ordering::Relaxed);
         
         let cache_hit_rate = if stats.total_operations > 0 {
@@ -524,7 +465,7 @@ impl QNetQuantumCrypto {
             initialized: self.initialized,
             algorithms: QuantumAlgorithms {
                 signature: "CRYSTALS-Dilithium3".to_string(),  // NIST FIPS 204
-                encryption: "AES-256-GCM".to_string(),         // NIST FIPS 197 (Kyber removed)
+                encryption: "AES-256-GCM + ML-KEM-768".to_string(), // NIST FIPS 197 + FIPS 203 (Kyber via QUIC TLS 1.3)
                 hash: "SHA3-256".to_string(),                  // NIST FIPS 202
             },
             performance: PerformanceMetrics {
@@ -547,6 +488,7 @@ impl QNetQuantumCrypto {
     }
 
     /// Constant-time comparison to prevent timing attacks
+    #[allow(dead_code)]
     fn constant_time_compare(a: &[u8], b: &[u8]) -> bool {
         if a.len() != b.len() {
             return false;
@@ -565,7 +507,7 @@ impl QNetQuantumCrypto {
             return Err(anyhow!("Quantum crypto not initialized"));
         }
 
-        println!("🔐 Verifying Dilithium quantum-resistant signature...");
+        println!("[INFO][QUANTUM_CRYPTO] dilithium_verify_start");
 
         // SECURITY: Real quantum-resistant signature verification
         // This replaces the placeholder that used simple hashing
@@ -608,268 +550,70 @@ impl QNetQuantumCrypto {
             return Err(anyhow!("Invalid signature length: {}", signature_bytes.len()));
         }
 
-        // 3. CRITICAL FIX: Try BOTH message formats for compatibility
-        // Some systems expect "node_id:hash", others just "hash"
-        
-        // First try with just the data (new format)
-        let is_valid_new = qnet_consensus::consensus_crypto::verify_consensus_signature(
+        // 3. Verify through the consensus-layer canonical path.
+        //
+        //    `verify_consensus_signature` is the ONE function authorised to
+        //    accept or reject a ML-DSA-65 signature for an identity-bearing
+        //    wire message. It performs the FULL chain of checks:
+        //      a) Decodes the on-the-wire format ("dilithium_sig_<id>_<b64>",
+        //         "compact_bin:<b64>", "pq_bin:<b64>", etc.);
+        //      b) Parses the combined `[sig_len][SignedMessage][pk_len][pk]`
+        //         payload and validates structural invariants;
+        //      c) ENFORCES THE (node_id → public_key) BINDING via the
+        //         `CONSENSUS_PK_REGISTRY` — a registered identity whose
+        //         extracted PK does not match yields a hard `pk_mismatch`
+        //         rejection, and an unbound genesis identity yields a hard
+        //         `genesis_pk_first_seen_rejected` (see consensus_crypto.rs);
+        //      d) Verifies the ML-DSA-65 signature math via `dilithium3::open`.
+        //
+        //    HISTORICAL INCIDENT (v15.x / v16.x identity-squat class):
+        //    A previous version of this function carried a "fallback" branch
+        //    that — when the consensus-layer call returned `false` — re-parsed
+        //    the same combined format locally and ran ONLY the math check,
+        //    skipping the registry binding from step (c). That branch let any
+        //    peer with their own valid ML-DSA-65 keypair forge messages
+        //    claiming any node identity (most damagingly genesis identities
+        //    operated from non-genesis IPs). The math passed because the
+        //    signature WAS valid for the embedded PK; the spoof succeeded
+        //    because the registry binding was never consulted on the second
+        //    pass. We saw the fallout as `pk_mismatch` log spam from the
+        //    consensus-layer detector, paired with `mldsa65_verified` from the
+        //    bypass — the system was correctly detecting the attack, then
+        //    correctly accepting it.
+        //
+        //    DO NOT REINTRODUCE A FALLBACK HERE.
+        //
+        //    A `false` return from `verify_consensus_signature` is FINAL.
+        //    It already covers every legitimate branch including the
+        //    bootstrap (None / TOFV) case for non-genesis identities.
+        let is_valid = qnet_consensus::consensus_crypto::verify_consensus_signature(
             wallet_address,
-            data,  // Just the hash, no prefix
+            data,
             &signature.signature
         ).await;
-        
-        if is_valid_new {
-            println!("✅ Dilithium signature verified successfully");
-            return Ok(true);
-        }
-        
-        // Then try with node_id:hash format (old format)
-        let expected_message = format!("{}:{}", wallet_address, data);
-        let is_valid_old = qnet_consensus::consensus_crypto::verify_consensus_signature(
-            wallet_address,
-            &expected_message,
-            &signature.signature
-        ).await;
-        
-        if is_valid_old {
-            println!("✅ Dilithium signature verified successfully");
-            return Ok(true);
-        }
-        
-        // PRODUCTION: Parse our combined format and verify with REAL Dilithium3
-        // Format: [sig_len(4)] + [signature(2420) + message] + [pk_len(4)] + [public_key(1952)]
-        if signature_bytes.len() < 8 {
-            return Err(anyhow!("Signature too short: {} bytes", signature_bytes.len()));
-        }
-        
-        let mut cursor = 0;
-        
-        // Read signed message length (signature + message combined)
-        let signed_len = u32::from_le_bytes([
-            signature_bytes[cursor],
-            signature_bytes[cursor + 1],
-            signature_bytes[cursor + 2],
-            signature_bytes[cursor + 3],
-        ]) as usize;
-        cursor += 4;
-        
-        if cursor + signed_len > signature_bytes.len() {
-            return Err(anyhow!("Invalid signature format: signed message truncated"));
-        }
-        
-        // Extract signed message bytes (signature + message)
-        let signed_bytes = &signature_bytes[cursor..cursor + signed_len];
-        cursor += signed_len;
-        
-        // Read public key length
-        if cursor + 4 > signature_bytes.len() {
-            return Err(anyhow!("Invalid signature format: missing public key length"));
-        }
-        
-        let pk_len = u32::from_le_bytes([
-            signature_bytes[cursor],
-            signature_bytes[cursor + 1],
-            signature_bytes[cursor + 2],
-            signature_bytes[cursor + 3],
-        ]) as usize;
-        cursor += 4;
-        
-        // NIST FIPS 204: Dilithium3 public key MUST be exactly 1952 bytes
-        if pk_len != 1952 {
-            return Err(anyhow!("Invalid public key size: {} (expected 1952)", pk_len));
-        }
-        
-        if cursor + pk_len != signature_bytes.len() {
-            return Err(anyhow!("Invalid signature format: public key size mismatch"));
-        }
-        
-        // Extract public key bytes
-        let pk_bytes = &signature_bytes[cursor..cursor + pk_len];
-        
-        println!("🔐 REAL Dilithium3 verification (NIST FIPS 204):");
-        println!("   Signed message: {} bytes", signed_len);
-        println!("   Public key: {} bytes", pk_len);
-        
-        // PRODUCTION: Use REAL Dilithium3 verification from pqcrypto
-        use pqcrypto_dilithium::dilithium3;
-        use pqcrypto_traits::sign::{PublicKey as PQPublicKey, SignedMessage as PQSignedMessage};
-        
-        // Parse Dilithium3 public key
-        let public_key = match dilithium3::PublicKey::from_bytes(pk_bytes) {
-            Ok(pk) => pk,
-            Err(_) => {
-                println!("❌ Invalid Dilithium3 public key format");
-                return Err(anyhow!("Invalid Dilithium3 public key"));
-            }
-        };
-        
-        // Parse signed message (signature + message concatenated)
-        let signed_message = match dilithium3::SignedMessage::from_bytes(signed_bytes) {
-            Ok(sm) => sm,
-            Err(_) => {
-                println!("❌ Invalid Dilithium3 signed message format");
-                return Err(anyhow!("Invalid Dilithium3 signed message"));
-            }
-        };
-        
-        // REAL cryptographic verification using dilithium3::open()
-        match dilithium3::open(&signed_message, &public_key) {
-            Ok(recovered_message) => {
-                // Verify recovered message matches expected data
-                let expected_bytes = data.as_bytes();
-                
-                if recovered_message == expected_bytes {
-                    println!("✅ Dilithium3 signature VERIFIED (NIST FIPS 204)");
-                    println!("   Algorithm: CRYSTALS-Dilithium3");
-                    println!("   Strength: Quantum-resistant (NIST Level 3)");
-                    println!("   Message integrity: CONFIRMED");
-                    Ok(true)
+
+        if is_valid {
+            println!("[INFO][QUANTUM_CRYPTO] dilithium_verified");
+            Ok(true)
+        } else {
+            // Consensus-layer rejection is final — registry mismatch, malformed
+            // payload, or math failure. Caller decides how to react (drop the
+            // message, score the peer, etc.); we just propagate the verdict.
+            if crate::node::is_warn() {
+                let display = if wallet_address.len() > 16 {
+                    &wallet_address[..16]
                 } else {
-                    println!("❌ Message mismatch after verification");
-                    println!("   Expected: {} bytes", expected_bytes.len());
-                    println!("   Recovered: {} bytes", recovered_message.len());
-                    Ok(false)
-                }
+                    wallet_address
+                };
+                println!("[WARN][QUANTUM_CRYPTO] consensus_verify_rejected id={}", display);
             }
-            Err(_) => {
-                println!("❌ Dilithium3 signature verification FAILED");
-                println!("   Possible reasons: forged signature, wrong key, tampered data");
-                Ok(false)
-            }
+            Ok(false)
         }
     }
 
     // REMOVED: Old Kyber/ChaCha20 decryption functions - replaced with route.ts compatible XOR decryption
 
 
-
-    /// Decode activation code using existing economic logic (quantum-enhanced)
-    fn decode_activation_code_compatible(&self, code: &str) -> Result<CompatibleActivationData> {
-        // Use existing logic from the original decode_activation_code function
-        
-        // Check for genesis bootstrap codes first
-        const BOOTSTRAP_WHITELIST: &[&str] = &[
-            "QNET-BOOT-0001-STRAP", "QNET-BOOT-0002-STRAP", "QNET-BOOT-0003-STRAP", 
-            "QNET-BOOT-0004-STRAP", "QNET-BOOT-0005-STRAP"
-        ];
-        
-        if BOOTSTRAP_WHITELIST.contains(&code) {
-            // Extract bootstrap ID and create consistent wallet format
-            let bootstrap_id = code
-                .split('-')
-                .nth(2)
-                .unwrap_or("000")
-                .trim_start_matches('0');
-            
-            let genesis_node_id = format!("genesis_node_{:03}", bootstrap_id.parse::<u32>().unwrap_or(1));
-            
-            // GENESIS: Use predefined wallet from genesis_constants.rs
-            // These are the REAL wallets created via mobile app
-            let bootstrap_id_str = format!("{:03}", bootstrap_id.parse::<u32>().unwrap_or(1));
-            let wallet_address = crate::genesis_constants::get_genesis_wallet_by_id(&bootstrap_id_str)
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| {
-                    // Fallback: Generate proper EON address format: {19}eon{15}{4 checksum} = 41 chars
-                    use sha2::{Sha256, Digest as Sha2Digest};
-                    let hash = blake3::hash(genesis_node_id.as_bytes()).to_hex();
-                    let part1 = &hash[..19];
-                    let part2 = &hash[19..34];
-                    let checksum_input = format!("{}eon{}", part1, part2);
-                    let mut hasher = Sha256::new();
-                    hasher.update(checksum_input.as_bytes());
-                    let checksum = hex::encode(&hasher.finalize()[..2]);
-                    format!("{}eon{}{}", part1, part2, checksum)
-                });
-            
-            // Return dummy data for genesis codes
-            return Ok(CompatibleActivationData {
-                node_type: NodeType::Super,
-                qnc_amount: 0,
-                tx_hash: "genesis_bootstrap".to_string(),
-                wallet_address,  // Now consistent!
-                phase: 1,
-            });
-        }
-        
-        // Validate format: QNET-XXXXXX-XXXXXX-XXXXXX (25 chars) for regular codes (genesis codes 20 chars)
-        if !code.starts_with("QNET-") || (code.len() != 25 && code.len() != 20) {
-            return Err(anyhow!("Invalid activation code format"));
-        }
-
-        let parts: Vec<&str> = code.split('-').collect();
-        if parts.len() != 4 || parts[0] != "QNET" {
-            return Err(anyhow!("Invalid activation code structure"));
-        }
-
-        // Extract data using existing algorithm
-        let encoded_data = format!("{}{}{}", parts[1], parts[2], parts[3]);
-        
-        // Decode node type from first segment (existing logic)
-        let node_type = match &encoded_data[0..1] {
-            "L" | "l" | "1" | "2" | "3" | "A" | "B" | "C" => NodeType::Light,
-            "F" | "f" | "4" | "5" | "6" | "D" | "E" => NodeType::Full, 
-            "S" | "s" | "7" | "8" | "9" => NodeType::Super,
-            _ => {
-                // Fallback logic (SHA3-256 for consistency)
-                let mut hasher = Sha3_256::new();
-                hasher.update(encoded_data.as_bytes());
-                let hash = hasher.finalize();
-                match hash[0] % 3 {
-                    0 => NodeType::Light,
-                    1 => NodeType::Full,
-                    2 => NodeType::Super,
-                    _ => NodeType::Full,
-                }
-            }
-        };
-
-        // Decode phase from second segment (existing logic)
-        let phase = match &encoded_data[1..2] {
-            "1" | "A" | "B" | "C" => 1,
-            "2" | "D" | "E" | "F" => 2,
-            _ => 1, // Default to Phase 1
-        };
-
-        // Generate transaction hash from remaining segments (existing logic)
-        let tx_hash = format!("0x{}", &encoded_data[2..]);
-        
-        // Generate wallet address from activation code
-        // PRODUCTION FORMAT: 19 + 3 + 15 + 4 = 41 characters
-        let wallet_hash = {
-            let mut hasher = Sha3_256::new();
-            hasher.update(code.as_bytes());
-            hasher.finalize()
-        };
-        let full_hex = hex::encode(&wallet_hash);
-        let part1 = &full_hex[..19];
-        let part2 = &full_hex[19..34];
-        // Generate SHA-256 checksum for wallet compatibility
-        let checksum_input = format!("{}eon{}", part1, part2);
-        use sha2::{Sha256, Digest as Sha2Digest};
-        let mut checksum_hasher = Sha256::new();
-        checksum_hasher.update(checksum_input.as_bytes());
-        let checksum = hex::encode(&checksum_hasher.finalize()[..2]); // 4 hex chars
-        let wallet_address = format!("{}eon{}{}", part1, part2, checksum);
-
-        // Calculate amount based on phase and node type (EXISTING ECONOMIC LOGIC)
-        let qnc_amount = match phase {
-            1 => 1500, // Phase 1: 1500 1DEV (universal pricing from economic model)
-            2 => match node_type {
-                NodeType::Light => 5000,  // Phase 2: 5000 QNC
-                NodeType::Full => 7500,   // Phase 2: 7500 QNC  
-                NodeType::Super => 10000, // Phase 2: 10000 QNC
-            },
-            _ => return Err(anyhow!("Invalid phase in activation code")),
-        };
-
-        Ok(CompatibleActivationData {
-            node_type,
-            qnc_amount,
-            tx_hash,
-            wallet_address,
-            phase,
-        })
-    }
 
     /// PRODUCTION: Create REAL Dilithium signature for consensus/blockchain operations  
     pub async fn create_consensus_signature(&self, node_id: &str, data: &str) -> Result<DilithiumSignature> {
@@ -953,7 +697,7 @@ impl QNetQuantumCrypto {
         let public_key_bytes = key_manager.get_public_key()?;
         
         // PRODUCTION: Use sign_full() to get proper SignedMessage format
-        // This creates [signature(2420)] + [message] which dilithium3::open() can verify
+        // This creates [signature(3309 bytes, ML-DSA-65)] + [message] which dilithium3::open() can verify
         let signed_msg_bytes = key_manager.sign_full(signature_data.as_bytes())?;
         
         // Build combined format for transport
@@ -988,6 +732,7 @@ impl QNetQuantumCrypto {
     // All Dilithium signing now goes through create_consensus_signature() which uses sign_full()
 
     /// Extract node type from activation code segments
+    #[allow(dead_code)]
     fn extract_node_type_from_code(&self, code_segments: &str) -> Result<String> {
         if code_segments.is_empty() {
             return Err(anyhow!("Empty code segments"));
@@ -1016,6 +761,7 @@ impl QNetQuantumCrypto {
     }
 
     /// Validate activation payload structure (route.ts compatible - simplified)
+    #[allow(dead_code)]
     fn validate_payload_structure(&self, payload: &ActivationPayload) -> Result<()> {
         if payload.burn_tx.is_empty() {
             return Err(anyhow!("Invalid burn transaction"));
@@ -1025,7 +771,7 @@ impl QNetQuantumCrypto {
             return Err(anyhow!("Invalid wallet address"));
         }
 
-        if !["light", "full", "super"].contains(&payload.node_type.as_str()) {
+        if !["light", "full", "super"].contains(&payload.node_type.to_lowercase().as_str()) {
             return Err(anyhow!("Invalid node type: {}", payload.node_type));
         }
 
@@ -1057,14 +803,14 @@ impl QNetQuantumCrypto {
 
     /// Check if activation code has already been used in QNet blockchain
     pub async fn check_blockchain_usage(&self, activation_code: &str) -> Result<bool> {
-        println!("🔍 Checking QNet blockchain for activation code usage...");
-        println!("   Code: {}...", safe_preview(activation_code, 8));
+        println!("[INFO][QUANTUM_CRYPTO] activation_code_usage_check");
+        println!("[DEBUG][QUANTUM_CRYPTO] code={}...", activation_code);
         
         // Use existing activation validation infrastructure
         let registry = crate::activation_validation::BlockchainActivationRegistry::new(
             Some(std::env::var("QNET_RPC_URL")
                 .or_else(|_| std::env::var("QNET_GENESIS_NODES")
-                    .map(|nodes| format!("http://{}:8001", nodes.split(',').next().unwrap_or("127.0.0.1").trim())))
+                    .map(|nodes| { let ip = nodes.split(',').next().unwrap_or("127.0.0.1").trim().to_string(); format!("http://{}:8001", ip) }))
                 .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string()))
         );
         
@@ -1072,14 +818,14 @@ impl QNetQuantumCrypto {
         match registry.is_code_used_globally(activation_code).await {
             Ok(used) => {
                 if used {
-                    println!("❌ Activation code already used in QNet blockchain");
+                    println!("[ERR][QUANTUM_CRYPTO] activation_code_already_used");
                 } else {
-                    println!("✅ Activation code available for use");
+                    println!("[INFO][QUANTUM_CRYPTO] activation_code_available");
                 }
                 Ok(used)
             }
             Err(e) => {
-                println!("⚠️  Warning: Blockchain check failed: {}", e);
+                eprintln!("[WARN][QUANTUM_CRYPTO] blockchain_check_failed err={}", e);
                 // In production mode, we want to be strict about this
                 if std::env::var("QNET_PRODUCTION").unwrap_or_default() == "1" {
                     Err(anyhow!("Blockchain verification required in production: {}", e))
@@ -1097,44 +843,72 @@ impl QNetQuantumCrypto {
         payload: &ActivationPayload,
         node_pubkey: &str
     ) -> Result<()> {
-        println!("📝 Recording activation in QNet blockchain...");
+        // v2.95: Genesis nodes are ALREADY registered in block 0 via NodeRegistration TX
+        // Skip duplicate activation TX for genesis bootstrap codes
+        if activation_code.starts_with("QNET-BOOT-") {
+            println!("[INFO][QUANTUM_CRYPTO] genesis_node_skip_duplicate_activation_tx");
+            println!("[DEBUG][QUANTUM_CRYPTO] node={}...", node_pubkey);
+            println!("[DEBUG][QUANTUM_CRYPTO] wallet={}...", &payload.wallet);
+            println!("[DEBUG][QUANTUM_CRYPTO] node_type={}", payload.node_type);
+            return Ok(());
+        }
+        
+        println!("[INFO][QUANTUM_CRYPTO] activation_recording");
         
         // Use existing activation validation infrastructure
         let registry = crate::activation_validation::BlockchainActivationRegistry::new(
             Some(std::env::var("QNET_RPC_URL")
                 .or_else(|_| std::env::var("QNET_GENESIS_NODES")
-                    .map(|nodes| format!("http://{}:8001", nodes.split(',').next().unwrap_or("127.0.0.1").trim())))
+                    .map(|nodes| { let ip = nodes.split(',').next().unwrap_or("127.0.0.1").trim().to_string(); format!("http://{}:8001", ip) }))
                 .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string()))
         );
         
+        // Phase AND price come from the SAME verified source — the live 1DEV supply, through the one
+        // helper every price path uses. The phase is never inferred from the shape of `payload`,
+        // which is attacker-authored: a caller must not get to choose which phase's rules price
+        // their own activation. A supply outage fails the activation closed.
+        let pricing = crate::rpc::live_activation_pricing().await
+            .map_err(|e| anyhow!("Activation price unavailable: {}", e))?;
+        let phase = pricing.phase;
+
+        // CRITICAL: burn_amount is the EXACT amount burned on Solana to generate the activation code.
+        // Required for XOR key: key_material = f"{burn_tx}:{node_type}:{burn_amount}"
+        // Source 1: QNET_BURN_AMOUNT env var (Docker -e QNET_BURN_AMOUNT=...)
+        // Source 2: the live activation quote for this node type.
+        let burn_amount = match std::env::var("QNET_BURN_AMOUNT").ok().and_then(|s| s.parse::<u64>().ok()) {
+            Some(amount) => amount,
+            None => pricing.cost_for(&payload.node_type),
+        };
+
         // Create node info for blockchain registry
         let node_info = crate::activation_validation::NodeInfo {
             activation_code: activation_code.to_string(),
             wallet_address: payload.wallet.clone(),
-            device_signature: node_pubkey.to_string(), // Use node pubkey as device signature
+            device_signature: node_pubkey.to_string(),
             node_type: payload.node_type.clone(),
             activated_at: payload.timestamp,
             last_seen: payload.timestamp,
             migration_count: 0,
             node_id: String::new(), // Will be set when node starts
-            burn_tx_hash: payload.burn_tx.clone(), // CRITICAL: Store burn_tx for XOR decryption
-            phase: 1, // Default to Phase 1 (will be determined from activation code)
-            burn_amount: 1500, // Default Phase 1 base price - will be overwritten from registry
+            burn_tx_hash: payload.burn_tx.clone(), // CRITICAL: burn_tx for XOR key
+            phase,
+            burn_amount, // CRITICAL: exact burned amount for XOR key derivation
         };
         
         // Register activation on blockchain using existing infrastructure
         registry.register_activation_on_blockchain(activation_code, node_info).await
             .map_err(|e| anyhow!("Failed to register activation: {}", e))?;
         
-        println!("✅ Activation recorded in QNet blockchain successfully");
-        println!("   Node: {}...", safe_preview(node_pubkey, 8));
-        println!("   Wallet: {}...", safe_preview(&payload.wallet, 8));
-        println!("   Type: {}", payload.node_type);
+        println!("[INFO][QUANTUM_CRYPTO] activation_recorded_on_chain");
+        println!("[DEBUG][QUANTUM_CRYPTO] node={}...", node_pubkey);
+        println!("[DEBUG][QUANTUM_CRYPTO] wallet={}...", &payload.wallet);
+        println!("[DEBUG][QUANTUM_CRYPTO] node_type={}", payload.node_type);
         
         Ok(())
     }
 
     /// Hash activation code for blockchain storage
+    #[allow(dead_code)]
     fn hash_activation_code(&self, code: &str) -> Result<String> {
         let mut hasher = Sha3_256::new();
         hasher.update(code.as_bytes());
@@ -1144,20 +918,21 @@ impl QNetQuantumCrypto {
     /// Store node connection info in device signature for replacement system
     pub async fn store_node_connection_info(
         &self,
-        activation_code: &str,
+        _activation_code: &str,
         external_ip: &str,
         api_port: u16,
     ) -> Result<()> {
-        println!("📝 Storing node connection info for replacement system");
-        println!("   External IP: {}", external_ip);
-        println!("   API Port: {}", api_port);
+        println!("[INFO][QUANTUM_CRYPTO] node_connection_info_storing");
+        println!("[DEBUG][QUANTUM_CRYPTO] external_ip={} api_port={}", external_ip, api_port);
         
         // In production: Update the device_signature in blockchain records
         // to include IP:port for future replacement operations
         
         // For now: Just log the connection info
         let connection_info = format!("{}:{}", external_ip, api_port);
-        println!("✅ Connection info ready for blockchain update: {}", connection_info);
+        if crate::node::is_debug() {
+            println!("[DEBUG][QUANTUM_CRYPTO] connection_info_ready info={}", connection_info);
+        }
         
         Ok(())
     }
@@ -1201,180 +976,59 @@ impl QNetQuantumCrypto {
         Ok(timestamp / 1000) // Convert from milliseconds to seconds
     }
 
-    /// Get burn transaction hash from blockchain records
-    /// Get burn_tx AND burn_amount from blockchain registry
-    /// CRITICAL: Both values must match what was used during code generation for XOR decryption!
-    async fn get_burn_tx_and_amount_from_blockchain(&self, activation_code: &str, node_type: &str) -> Result<(String, u64)> {
-        // PRODUCTION: Query QNet blockchain activation registry
+    /// Get burn_tx AND burn_amount required for XOR decryption key.
+    /// Priority: (1) QNET_BURN_TX_HASH / QNET_BURN_AMOUNT env vars,
+    ///           (2) blockchain activation registry,
+    ///           (3) genesis bootstrap codes — hardcoded sentinel values.
+    /// Non-genesis codes with no env vars and no registry entry → hard error (no silent fallback).
+    async fn get_burn_tx_and_amount_from_blockchain(&self, activation_code: &str, _node_type: &str) -> Result<(String, u64)> {
+        // Genesis bootstrap codes don't use XOR encryption — skip all checks.
+        if activation_code.starts_with("QNET-BOOT") {
+            return Ok(("genesis_bootstrap".to_string(), 0));
+        }
+
+        // Priority 1: env vars set by Docker (-e QNET_BURN_TX_HASH=... -e QNET_BURN_AMOUNT=...)
+        let env_burn_tx = std::env::var("QNET_BURN_TX_HASH").unwrap_or_default();
+        let env_burn_amount = std::env::var("QNET_BURN_AMOUNT")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+
+        if !env_burn_tx.is_empty() && env_burn_amount > 0 {
+            println!("[INFO][QUANTUM_CRYPTO] xor_key_from_env tx={}... amount={}", &env_burn_tx, env_burn_amount);
+            return Ok((env_burn_tx, env_burn_amount));
+        }
+
+        // Priority 2: activation registry in blockchain (node already registered once before)
         let registry = crate::activation_validation::BlockchainActivationRegistry::new(None);
-        
-        // Hash the activation code (registry stores hashes, not plaintext codes)
         let code_hash = registry.hash_activation_code_for_blockchain(activation_code)
             .map_err(|e| anyhow!("Failed to hash activation code: {}", e))?;
-        
-        // Query registry for activation record
+
         match registry.get_activation_record_by_hash(&code_hash).await {
-            Ok(Some(record)) => {
-                if !record.tx_hash.is_empty() {
-                    println!("🔗 Retrieved from blockchain registry:");
-                    println!("   burn_tx: {}...", safe_preview(&record.tx_hash, 8));
-                    println!("   burn_amount: {}", record.activation_amount);
-                    return Ok((record.tx_hash, record.activation_amount));
-                }
+            Ok(Some(record)) if !record.tx_hash.is_empty() => {
+                println!("[INFO][QUANTUM_CRYPTO] xor_key_from_registry tx={}... amount={}",
+                    &record.tx_hash, record.activation_amount);
+                return Ok((record.tx_hash, record.activation_amount));
             }
-            Ok(None) => {
-                println!("⚠️ No activation record found for code hash: {}...", safe_preview(&code_hash, 8));
-            }
+            Ok(_) => {}
             Err(e) => {
-                println!("⚠️ Registry query failed: {}", e);
+                eprintln!("[WARN][QUANTUM_CRYPTO] registry_query_failed err={}", e);
             }
         }
-        
-        // FALLBACK: For Genesis nodes or codes without registry entry
-        // Genesis nodes use predefined values
-        if activation_code.starts_with("QNET-BOOT") {
-            let fallback_tx = format!("genesis_burn_{}", &blake3::hash(activation_code.as_bytes()).to_hex()[..16]);
-            println!("⚠️ Using Genesis fallback: tx={}, amount=0", safe_preview(&fallback_tx, 8));
-            return Ok((fallback_tx, 0)); // Genesis nodes don't use XOR encryption
-        }
-        
-        // For non-Genesis codes without registry entry, use default Phase 1 base price
-        // This is a fallback and may cause decryption failure if actual price was different
-        let fallback_tx = format!("unknown_burn_{}", &blake3::hash(activation_code.as_bytes()).to_hex()[..16]);
-        let fallback_amount = 1500u64; // Phase 1 base price
-        println!("⚠️ Using fallback (may fail): tx={}, amount={}", safe_preview(&fallback_tx, 8), fallback_amount);
-        Ok((fallback_tx, fallback_amount))
+
+        // No source found — hard error. Silent fallback would silently corrupt XOR decryption.
+        eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        eprintln!("❌ ACTIVATION FAILED: QNET_BURN_TX_HASH or QNET_BURN_AMOUNT not provided");
+        eprintln!("   XOR decryption requires the exact Solana burn transaction and amount");
+        eprintln!("   used when the activation code was generated.");
+        eprintln!("");
+        eprintln!("   Required Docker env vars:");
+        eprintln!("     -e QNET_BURN_TX_HASH=\"<your_solana_burn_tx_signature>\"");
+        eprintln!("     -e QNET_BURN_AMOUNT=\"1500\"");
+        eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        std::process::exit(1);
     }
     
-    /// DEPRECATED: Use get_burn_tx_and_amount_from_blockchain instead
-    #[allow(dead_code)]
-    async fn get_burn_tx_from_blockchain(&self, activation_code: &str, node_type: &str) -> Result<String> {
-        let (burn_tx, _) = self.get_burn_tx_and_amount_from_blockchain(activation_code, node_type).await?;
-        Ok(burn_tx)
-    }
-
-    /// Get DYNAMIC burn amount based on current blockchain state (PHASE 1 or PHASE 2)
-    /// 
-    /// ARCHITECTURE: This is the SINGLE SOURCE OF TRUTH for pricing logic.
-    /// Python config (core/qnet-core/src/config.py) contains only BASE CONSTANTS
-    /// and documentation. All actual pricing calculations happen HERE.
-    /// 
-    /// Phase 1 Formula: price = max(300, 1500 - (burn_percentage / 10) * 150)
-    /// Phase 2 Formula: price = base_price[node_type] * network_multiplier(total_nodes)
-    async fn get_dynamic_burn_amount(&self, _activation_code: &str, node_type: &str) -> Result<u64> {
-        // PRODUCTION: Query real blockchain state
-        let blockchain_state = self.get_blockchain_phase_state().await?;
-        
-        if blockchain_state.is_phase1() {
-            // ============== PHASE 1: Dynamic 1DEV pricing ==============
-            // Price DECREASES as more 1DEV is burned (incentivizes early adoption)
-            // Synced with: config.py TokenConfig.one_dev_* parameters
-            let burn_percentage = blockchain_state.get_1dev_burn_percentage();
-            
-            const BASE_PRICE: u64 = 1_500;           // TokenConfig.one_dev_base_price
-            const REDUCTION_PER_10_PCT: u64 = 150;   // TokenConfig.one_dev_reduction_per_10_percent
-            const MIN_PRICE: u64 = 300;              // TokenConfig.one_dev_min_price
-            
-            // Formula: 1500 - (burn_percentage / 10) * 150, floor at 300
-            let reduction_steps = (burn_percentage as u64) / 10;
-            let dynamic_price = BASE_PRICE.saturating_sub(reduction_steps * REDUCTION_PER_10_PCT);
-            let final_price = dynamic_price.max(MIN_PRICE);
-            
-            println!("💰 Phase 1 Dynamic Pricing: {}% burned = {} 1DEV", burn_percentage, final_price);
-            Ok(final_price)
-            
-        } else {
-            // ============== PHASE 2: Dynamic QNC pricing ==============
-            // Price INCREASES with network size (prevents node inflation)
-            // Synced with: config.py TokenConfig.qnc_base_prices
-            let network_size = blockchain_state.get_total_active_nodes();
-            let network_multiplier = self.calculate_network_multiplier(network_size);
-            
-            // Base prices per node type (TokenConfig.qnc_base_prices)
-            let base_price = match node_type {
-                "light" => 5_000u64,   // 5,000 QNC base
-                "full" => 7_500u64,    // 7,500 QNC base
-                "super" => 10_000u64,  // 10,000 QNC base
-                _ => 5_000u64,         // Default to light
-            };
-            
-            // Apply network multiplier (0.5x to 3.0x)
-            let final_price = ((base_price as f64) * network_multiplier) as u64;
-            
-            println!("💰 Phase 2 Dynamic Pricing: {} nodes = {}x multiplier = {} QNC", 
-                    network_size, network_multiplier, final_price);
-            Ok(final_price)
-        }
-    }
-
-    /// Get current blockchain phase state (CRITICAL for dynamic pricing)
-    /// 
-    /// PRODUCTION: This queries REAL blockchain state from storage.
-    /// NO FALLBACKS - if data unavailable, return error.
-    async fn get_blockchain_phase_state(&self) -> Result<BlockchainPhaseState> {
-        let current_timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        
-        // PRODUCTION: Get REAL data from global state (set by node sync process)
-        // These are populated by the running node from actual blockchain data
-        
-        // 1. Get burn percentage from Solana bridge monitor
-        let burn_percentage = crate::GLOBAL_BURN_PERCENTAGE
-            .load(std::sync::atomic::Ordering::Relaxed) as f64 / 100.0;
-        
-        // 2. Get total active nodes from P2P network state
-        let total_active_nodes = crate::GLOBAL_ACTIVE_NODES
-            .load(std::sync::atomic::Ordering::Relaxed);
-        
-        // 3. Get genesis timestamp from Genesis block (block #0)
-        let genesis_timestamp = crate::GLOBAL_GENESIS_TIMESTAMP
-            .load(std::sync::atomic::Ordering::Relaxed);
-        
-        // STRICT VALIDATION: All values must be set by the running node
-        if genesis_timestamp == 0 {
-            return Err(anyhow!("Genesis timestamp not available - node not fully synced"));
-        }
-        
-        if total_active_nodes == 0 {
-            return Err(anyhow!("Active nodes count not available - P2P not initialized"));
-        }
-        
-        // Phase 1 if <90% burned AND <5 years since genesis
-        let years_since_genesis = (current_timestamp - genesis_timestamp) / (365 * 24 * 60 * 60);
-        let is_phase_1 = burn_percentage < 90.0 && years_since_genesis < 5;
-        
-        println!("[PRICING] 📊 LIVE blockchain state: Phase {}, {:.2}% burned, {} active nodes, genesis: {}",
-                 if is_phase_1 { "1" } else { "2" }, burn_percentage, total_active_nodes, genesis_timestamp);
-        
-        Ok(BlockchainPhaseState {
-            is_phase_1,
-            burn_percentage,
-            total_active_nodes,
-            genesis_timestamp,
-            current_timestamp,
-        })
-    }
-
-    /// Calculate network multiplier for Phase 2 (0.5x to 3.0x based on network size)
-    /// 
-    /// CANONICAL VALUES - same across all components (JS, Python, Rust)
-    /// 
-    /// | Network Size | Multiplier | Super Node Price |
-    /// |--------------|------------|------------------|
-    /// | ≤100K nodes  | 0.5x       | 5,000 QNC        |
-    /// | ≤300K nodes  | 1.0x       | 10,000 QNC       |
-    /// | ≤1M nodes    | 2.0x       | 20,000 QNC       |
-    /// | >1M nodes    | 3.0x       | 30,000 QNC (max) |
-    fn calculate_network_multiplier(&self, total_nodes: u64) -> f64 {
-        match total_nodes {
-            0..=100_000 => 0.5,          // ≤100K: Early adopter discount
-            100_001..=300_000 => 1.0,    // ≤300K: Base price
-            300_001..=1_000_000 => 2.0,  // ≤1M: High demand
-            _ => 3.0,                    // >1M: Maximum (cap)
-        }
-    }
 
     /// SHA3-256 hash function (NIST SP 800-186 compliant)
     fn sha3_hash(&self, data: &str) -> String {
@@ -1414,55 +1068,76 @@ mod tests {
     /// This test verifies the ENTIRE chain from sign to verify
     #[tokio::test]
     async fn test_dilithium_sign_and_verify() {
-        println!("\n🧪 TEST: Dilithium Sign and Verify Chain\n");
-        
+        println!("[TEST][QUANTUM_CRYPTO] test_dilithium_sign_and_verify start");
+
+        // Serialize against the key_manager identity tests: all share the process-wide
+        // keypair cache + CACHED_KEY_DIR OnceLock + canonicalize() over transient temp
+        // dirs. Without this, a parallel identity test cleans a dir mid-run and our
+        // install/sign resolve to different canonical keys → spurious identity_not_installed.
+        let _identity_guard = crate::crypto::key_manager::IDENTITY_TEST_LOCK
+            .lock().unwrap_or_else(|e| e.into_inner());
+
         // 1. Initialize crypto
         let mut crypto = QNetQuantumCrypto::new();
         let init_result = crypto.initialize().await;
         assert!(init_result.is_ok(), "Crypto initialization failed: {:?}", init_result.err());
-        println!("✅ Step 1: Crypto initialized");
-        
+        println!("[TEST][QUANTUM_CRYPTO] step=1 crypto_initialized");
+
         // 2. Create a test signature
         let node_id = "test_node_001";
         let message = "heartbeat:test_node_001:1234567890:100:0";
-        
+
+        // v29 IDENTITY HARDENING: install canonical mnemonic-derived identity
+        // before signing. Mirrors the production path create_consensus_signature
+        // uses (QNET_STORAGE_PATH/keys, default /app/data/keys via the same
+        // ensure_writable_directory chain → same canonical cache key).
+        {
+            use crate::key_manager::DilithiumKeyManager;
+            let storage_path = std::env::var("QNET_STORAGE_PATH")
+                .unwrap_or_else(|_| "/app/data".to_string());
+            let key_dir = std::path::Path::new(&storage_path).join("keys");
+            let installer = DilithiumKeyManager::new(node_id.to_string(), &key_dir)
+                .expect("v29 installer DKM");
+            let _ = installer.get_keypair_from_mnemonic(
+                "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+            ).expect("v29 identity install");
+        }
+
         let sign_result = crypto.create_consensus_signature(node_id, message).await;
         assert!(sign_result.is_ok(), "Signature creation failed: {:?}", sign_result.err());
-        
+
         let signature = sign_result.unwrap();
-        println!("✅ Step 2: Signature created");
-        println!("   Algorithm: {}", signature.algorithm);
-        println!("   Signature length: {} chars", signature.signature.len());
-        println!("   Signature prefix: {}...", &signature.signature[..50.min(signature.signature.len())]);
-        
+        println!("[TEST][QUANTUM_CRYPTO] step=2 signature_created algorithm={} sig_len={}",
+                 signature.algorithm, signature.signature.len());
+
         // 3. Verify signature format
-        assert!(signature.signature.starts_with("dilithium_sig_"), 
+        assert!(signature.signature.starts_with("dilithium_sig_"),
                 "Signature must start with 'dilithium_sig_'");
-        assert!(signature.signature.len() > 100, 
+        assert!(signature.signature.len() > 100,
                 "Signature too short: {} chars", signature.signature.len());
-        println!("✅ Step 3: Signature format valid");
-        
+        println!("[TEST][QUANTUM_CRYPTO] step=3 signature_format_valid");
+
         // 4. Verify signature content
         let verify_result = crypto.verify_dilithium_signature(message, &signature, node_id).await;
         assert!(verify_result.is_ok(), "Verification call failed: {:?}", verify_result.err());
-        
+
         let is_valid = verify_result.unwrap();
         assert!(is_valid, "Signature verification returned false!");
-        println!("✅ Step 4: Signature verified successfully");
-        
+        println!("[TEST][QUANTUM_CRYPTO] step=4 signature_verified");
+
         // 5. Test that wrong message fails verification (CRITICAL SECURITY TEST)
         let wrong_message = "wrong_message_that_was_not_signed";
         let wrong_verify = crypto.verify_dilithium_signature(wrong_message, &signature, node_id).await;
         match wrong_verify {
             Ok(valid) => {
-                assert!(!valid, "Wrong message should NOT verify! This is a CRITICAL security issue!");
-                println!("✅ Step 5: Wrong message correctly rejected (cryptographic verification works!)");
+                assert!(!valid, "Wrong message should NOT verify! CRITICAL security issue!");
+                println!("[TEST][QUANTUM_CRYPTO] step=5 wrong_message_rejected ok=true");
             }
             Err(_) => {
-                println!("✅ Step 5: Wrong message correctly caused error");
+                println!("[TEST][QUANTUM_CRYPTO] step=5 wrong_message_caused_error ok=true");
             }
         }
-        
+
         // 6. Test that empty signature fails
         let empty_sig = DilithiumSignature {
             signature: "".to_string(),
@@ -1472,37 +1147,37 @@ mod tests {
         };
         let empty_verify = crypto.verify_dilithium_signature(message, &empty_sig, node_id).await;
         assert!(empty_verify.is_err() || !empty_verify.unwrap(), "Empty signature should fail!");
-        println!("✅ Step 6: Empty signature correctly rejected");
-        
-        println!("\n🎉 ALL DILITHIUM TESTS PASSED!\n");
+        println!("[TEST][QUANTUM_CRYPTO] step=6 empty_signature_rejected ok=true");
+
+        println!("[TEST][QUANTUM_CRYPTO] test_dilithium_sign_and_verify passed");
     }
-    
+
     /// Test signature format validation
     #[test]
     fn test_signature_format_validation() {
-        println!("\n🧪 TEST: Signature Format Validation\n");
-        
+        println!("[TEST][QUANTUM_CRYPTO] test_signature_format_validation start");
+
         // Valid format
         let valid_sig = "dilithium_sig_node_001_SGVsbG9Xb3JsZA==";
         assert!(valid_sig.starts_with("dilithium_sig_"), "Valid sig should have prefix");
         assert!(valid_sig.len() > 30, "Valid sig should be longer than 30 chars");
-        println!("✅ Valid signature format accepted");
-        
+        println!("[TEST][QUANTUM_CRYPTO] case=valid_format ok=true");
+
         // Invalid: too short
         let short_sig = "abc";
         assert!(short_sig.len() < 100, "Short sig should fail length check");
-        println!("✅ Short signature correctly identified");
-        
+        println!("[TEST][QUANTUM_CRYPTO] case=short_sig ok=true");
+
         // Invalid: wrong prefix
         let wrong_prefix = "ed25519_sig_node_001_SGVsbG8=";
         assert!(!wrong_prefix.starts_with("dilithium_sig_"), "Wrong prefix should be rejected");
-        println!("✅ Wrong prefix correctly rejected");
-        
+        println!("[TEST][QUANTUM_CRYPTO] case=wrong_prefix ok=true");
+
         // Invalid: empty
         let empty_sig = "";
         assert!(empty_sig.is_empty(), "Empty sig should be rejected");
-        println!("✅ Empty signature correctly rejected");
-        
-        println!("\n🎉 ALL FORMAT TESTS PASSED!\n");
+        println!("[TEST][QUANTUM_CRYPTO] case=empty_sig ok=true");
+
+        println!("[TEST][QUANTUM_CRYPTO] test_signature_format_validation passed");
     }
 } 

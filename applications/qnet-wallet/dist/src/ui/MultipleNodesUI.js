@@ -179,10 +179,10 @@ export class MultipleNodesUI {
                     
                     <div class="form-group">
                         <label for="node-type-select">Node Type:</label>
+                        <!-- v3.18: Only Light and Super nodes -->
                         <select id="node-type-select" class="form-control">
-                            <option value="light">Light Node (2.5k-15k QNC)</option>
-                            <option value="full">Full Node (3.75k-22.5k QNC)</option>
-                            <option value="super">Super Node (5k-30k QNC)</option>
+                            <option value="light">Light Node (10k-30k QNC)</option>
+                            <option value="super">Super Node (7.5k-22.5k QNC)</option>
                         </select>
                     </div>
                     
@@ -254,8 +254,9 @@ export class MultipleNodesUI {
 
     // Activate node for specific account
     async activateNodeForAccount(accountIndex) {
-        const nodeType = prompt('Select node type (light/full/super):', 'light');
-        if (!nodeType || !['light', 'full', 'super'].includes(nodeType)) {
+        // v3.18: Only Light and Super nodes
+        const nodeType = prompt('Select node type (light/super):', 'light');
+        if (!nodeType || !['light', 'super'].includes(nodeType)) {
             alert('Invalid node type');
             return;
         }

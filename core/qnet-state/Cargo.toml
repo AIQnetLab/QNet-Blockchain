@@ -4,13 +4,15 @@ version = "0.1.0"
 edition = "2021"
 authors = ["QNet Team"]
 description = "State management for QNet blockchain"
-license = "MIT"
+license = "BUSL-1.1"
 
 [lib]
 name = "qnet_state"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+# Smart-contract VM — executes WASM contracts on the apply path.
+qnet-vm = { path = "../qnet-vm" }
 # Storage
 rocksdb = "0.21"
 
@@ -57,6 +59,7 @@ pyo3 = { version = "0.20", features = ["extension-module"], optional = true }
 [dev-dependencies]
 tempfile = "3.8.1"
 criterion = "0.5"
+wat = "1"  # compile readable WAT test contracts for the WASM apply tests
 
 [features]
 default = []

@@ -9,18 +9,18 @@ import hashlib
 import secrets
 from enum import Enum
 
+# v3.18: Full nodes removed - only Light and Super
 class NodeType(Enum):
     LIGHT = "Light"
-    FULL = "Full"
     SUPER = "Super"
 
 class QNCActivationCosts:
     """QNC activation costs with network size multipliers"""
     
+    # v3.18: Only Light and Super nodes (Full removed)
     base_costs = {
-        NodeType.LIGHT: 5000,
-        NodeType.FULL: 7500, 
-        NodeType.SUPER: 10000
+        NodeType.LIGHT: 10000,  # Light: 10,000 QNC base
+        NodeType.SUPER: 7500     # Super: 7,500 QNC base
     }
     
     network_multipliers = {

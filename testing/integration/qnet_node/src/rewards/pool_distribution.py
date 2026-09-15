@@ -1,7 +1,7 @@
 """
 QNet Three-Pool Reward Distribution System
+v3.18: Pool 2 removed - fees go directly to block producer
 Pool #1: Base Emission (equal to all active nodes)
-Pool #2: Transaction Fees (70% Super, 30% Full, 0% Light)
 Pool #3: ActivationPool (equal to all active nodes from Phase 2 activation fees)
 """
 
@@ -16,8 +16,8 @@ from enum import Enum
 logger = logging.getLogger(__name__)
 
 class NodeType(Enum):
+    # v3.18: Only Light and Super nodes
     LIGHT = "light"
-    FULL = "full"
     SUPER = "super"
 
 @dataclass
@@ -32,8 +32,8 @@ class ActiveNode:
 @dataclass
 class PoolState:
     """State of reward pools"""
+    # v3.18: Pool 2 removed - fees go directly to block producer
     pool1_base_emission: float = 0.0
-    pool2_transaction_fees: float = 0.0
     pool3_activation_pool: float = 0.0
     last_distribution: int = 0
     distribution_round: int = 0
@@ -59,7 +59,7 @@ class PoolDistributor:
         
         # Minimum reputation for NEW rewards by node type:
         self.min_reputation_light = 70.0
-        self.min_reputation_full_super = 70.0
+        self.min_reputation_super = 70.0  # v3.18: renamed from full_super
         
         # CORRECT LOGIC: Network pings nodes in randomized slots 
         self.reward_window = 4 * 60 * 60  # 4 hours: reward distribution window
@@ -101,7 +101,7 @@ class PoolDistributor:
             # Super nodes get priority slots (first 24 slots only = 10x more frequent)
             assigned_slot = hash_int % 24
         else:
-            # Full and Light nodes use all 240 slots
+            # Light nodes use all 240 slots (v3.18: Full removed)
             assigned_slot = hash_int % self.ping_slots
         
         return assigned_slot
@@ -128,8 +128,8 @@ class PoolDistributor:
     
     def add_active_node(self, node_id: str, node_type: NodeType, reputation: float) -> bool:
         """Add active node to reward distribution"""
-        # Check minimum reputation based on node type
-        min_rep = self.min_reputation_light if node_type == NodeType.LIGHT else self.min_reputation_full_super
+        # Check minimum reputation based on node type (v3.18: only Light/Super)
+        min_rep = self.min_reputation_light if node_type == NodeType.LIGHT else self.min_reputation_super
         if reputation < min_rep:
             logger.warning(f"Node {node_id} ({node_type.value}) reputation {reputation} below minimum {min_rep}")
             return False
@@ -158,8 +158,8 @@ class PoolDistributor:
         eligible = []
         
         for node in self.active_nodes.values():
-            # Check reputation requirement based on node type
-            min_rep = self.min_reputation_light if node.node_type == NodeType.LIGHT else self.min_reputation_full_super
+            # Check reputation requirement based on node type (v3.18: only Light/Super)
+            min_rep = self.min_reputation_light if node.node_type == NodeType.LIGHT else self.min_reputation_super
             if node.reputation < min_rep:
                 continue
             
@@ -352,7 +352,7 @@ class PoolDistributor:
                 "active": True,
                 "reputation": node.reputation,
                 "eligible_for_rewards": (
-                    node.reputation >= (self.min_reputation_light if node.node_type == NodeType.LIGHT else self.min_reputation_full_super)
+                    node.reputation >= (self.min_reputation_light if node.node_type == NodeType.LIGHT else self.min_reputation_super)
                     and (quarantine_until is None or current_time >= quarantine_until)
                 ),
                 "last_ping": node.last_ping,

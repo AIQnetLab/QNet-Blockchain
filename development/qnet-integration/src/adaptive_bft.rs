@@ -1,5 +1,5 @@
-// QNet Adaptive BFT - Adaptive timeout management for Byzantine consensus
-// Integrates with existing consensus mechanisms
+// Adaptive per-height timeout used by the block-production failover path.
+// Scales the base timeout by observed peer RTT and packet loss.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -48,8 +48,12 @@ pub struct AdaptiveBft {
 /// Network state for adaptive adjustments
 #[derive(Debug, Clone)]
 pub struct NetworkState {
-    /// Average network latency
+    /// Average network latency (sliding window across all peers)
     pub avg_latency_ms: u64,
+    /// v14.9: MAX observed per-peer RTT. BFT timeout uses this (not avg) because
+    /// a safe rotation window must accommodate the SLOWEST honest peer, not the
+    /// median. At globally-distributed super-node scale this adapts cleanly.
+    pub max_peer_rtt_ms: u64,
     /// Packet loss rate (0.0 to 1.0)
     pub packet_loss_rate: f64,
     /// Number of active peers
@@ -62,6 +66,7 @@ impl Default for NetworkState {
     fn default() -> Self {
         Self {
             avg_latency_ms: 100,
+            max_peer_rtt_ms: 100,
             packet_loss_rate: 0.0,
             active_peers: 0,
             last_update: Instant::now(),
@@ -127,18 +132,22 @@ impl AdaptiveBft {
             base_timeout
         };
         
-        // Adjust based on network conditions
+        // RTT-aware timeout scaling. The old >500ms-only adjustment treated a
+        // 110ms transatlantic peer like a 1ms intra-DC peer → BFT failover
+        // storms (timeouts LAN-sized, not for geo-distributed nodes). Now add
+        // max_peer_rtt×3 (propagate → sign → propagate → margin) on the base.
+        // Floor = base (never shrinks); cap = 30s (RTT-spike peers can't
+        // freeze rotation); packet-loss bonus stacks on top.
         let network_state = self.network_state.read().await;
-        let network_adjusted = if network_state.packet_loss_rate > 0.1 {
-            // High packet loss - increase timeout
-            (timeout_ms as f64 * (1.0 + network_state.packet_loss_rate)) as u64
-        } else if network_state.avg_latency_ms > 500 {
-            // High latency - increase proportionally
-            timeout_ms + (network_state.avg_latency_ms / 10)
+        let rtt_budget_ms = network_state.max_peer_rtt_ms.saturating_mul(3).max(100);
+        let rtt_adjusted = timeout_ms.saturating_add(rtt_budget_ms);
+        let packet_loss_bonus = if network_state.packet_loss_rate > 0.01 {
+            ((rtt_adjusted as f64) * network_state.packet_loss_rate) as u64
         } else {
-            timeout_ms
+            0
         };
-        
+        let network_adjusted = rtt_adjusted.saturating_add(packet_loss_bonus).min(30_000);
+
         let final_timeout = Duration::from_millis(network_adjusted);
         
         // Cache the timeout
@@ -149,23 +158,33 @@ impl AdaptiveBft {
     
     /// Update network latency measurement
     pub async fn record_latency(&self, latency: Duration) {
+        let latency_ms = latency.as_millis() as u64;
         let mut measurements = self.latency_measurements.write().await;
         measurements.push(latency);
-        
+
         // Keep only recent measurements
         if measurements.len() > self.config.latency_window_size {
             measurements.remove(0);
         }
-        
+
         // Update network state
         if !measurements.is_empty() {
             let avg_latency_ms = measurements.iter()
                 .map(|d| d.as_millis() as u64)
                 .sum::<u64>() / measurements.len() as u64;
-            
+            let max_latency_ms = measurements.iter()
+                .map(|d| d.as_millis() as u64)
+                .max()
+                .unwrap_or(avg_latency_ms);
+
             let mut network_state = self.network_state.write().await;
             network_state.avg_latency_ms = avg_latency_ms;
+            // v14.9: track MAX peer RTT across the sliding window. BFT timeout
+            // scales on max, not avg, because the consensus window must fit the
+            // slowest honest peer — failing that, we exclude them as faulty.
+            network_state.max_peer_rtt_ms = max_latency_ms;
             network_state.last_update = Instant::now();
+            let _ = latency_ms; // touched for clarity above
         }
     }
     
@@ -184,54 +203,8 @@ impl AdaptiveBft {
         network_state.active_peers = count;
     }
     
-    /// Get timeout for Byzantine consensus phases
-    pub fn get_consensus_timeout(&self, phase: ConsensusPhase) -> Duration {
-        match phase {
-            ConsensusPhase::Commit => Duration::from_secs(15),
-            ConsensusPhase::Reveal => Duration::from_secs(15),
-            ConsensusPhase::Finalize => Duration::from_secs(5),
-        }
-    }
     
-    /// Calculate validator stake-weighted timeout
-    pub async fn get_stake_weighted_timeout(
-        &self,
-        height: u64,
-        validator_stakes: &HashMap<String, u64>,
-    ) -> Duration {
-        let base_timeout = self.get_timeout(height, 0).await;
-        
-        if validator_stakes.is_empty() {
-            return base_timeout;
-        }
-        
-        // Calculate total stake
-        let total_stake: u64 = validator_stakes.values().sum();
-        if total_stake == 0 {
-            return base_timeout;
-        }
-        
-        // Weight timeout based on stake distribution
-        let stake_variance = self.calculate_stake_variance(validator_stakes, total_stake);
-        
-        // High variance means uneven distribution - need more time
-        let multiplier = 1.0 + (stake_variance * 0.5).min(0.5);
-        
-        Duration::from_millis((base_timeout.as_millis() as f64 * multiplier) as u64)
-    }
     
-    /// Calculate stake variance for timeout adjustment
-    fn calculate_stake_variance(&self, stakes: &HashMap<String, u64>, total: u64) -> f64 {
-        let mean = total as f64 / stakes.len() as f64;
-        let variance: f64 = stakes.values()
-            .map(|&stake| {
-                let diff = stake as f64 - mean;
-                diff * diff
-            })
-            .sum::<f64>() / stakes.len() as f64;
-        
-        (variance / (mean * mean)).sqrt()
-    }
     
     /// Clear old cached timeouts
     pub async fn clear_old_timeouts(&self, current_height: u64) {
@@ -239,47 +212,3 @@ impl AdaptiveBft {
         timeouts.retain(|&height, _| height >= current_height.saturating_sub(100));
     }
 }
-
-/// Consensus phase for timeout calculation
-#[derive(Debug, Clone, Copy)]
-pub enum ConsensusPhase {
-    Commit,
-    Reveal,
-    Finalize,
-}
-
-/// Vote state for Adaptive BFT
-#[derive(Debug, Clone)]
-pub struct VoteState {
-    pub height: u64,
-    pub slot: u64,
-    pub confirmations: u32,
-    pub last_vote_time: Instant,
-}
-
-impl VoteState {
-    pub fn new(height: u64, slot: u64) -> Self {
-        Self {
-            height,
-            slot,
-            confirmations: 0,
-            last_vote_time: Instant::now(),
-        }
-    }
-    
-    /// Check if vote has expired based on timeout
-    pub fn is_expired(&self, timeout: Duration) -> bool {
-        self.last_vote_time.elapsed() > timeout
-    }
-    
-    /// Increment confirmation count
-    pub fn confirm(&mut self) {
-        self.confirmations += 1;
-        self.last_vote_time = Instant::now();
-    }
-}
-
-// Backward compatibility aliases
-pub type TowerBftConfig = AdaptiveBftConfig;
-pub type TowerBft = AdaptiveBft;
-

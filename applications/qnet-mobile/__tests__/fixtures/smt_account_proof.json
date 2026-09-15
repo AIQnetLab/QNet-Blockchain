@@ -1,0 +1,168 @@
+{
+  "address": "vec_addr_3",
+  "balance": "1003",
+  "nonce": "3",
+  "state_root": "a47ca2f297d81d7627b8000645afd26470b2ab5edba78e8744327c8f1b86058c",
+  "proof": [
+    {
+      "sibling": "abe65c3614faae9ed7a3d19a4734b51e92619554be3aa8a11256b999372c9d73",
+      "is_right": true
+    },
+    {
+      "sibling": "f9ec475f76e96025e5965005b453d8ff64d6c54c0adb27b2eed8b0031edd5f65",
+      "is_right": true
+    },
+    {
+      "sibling": "bdd0659fa3b43b79e1d7f2c4734a43c3849c5a4cb843e20bdbd4fefdc2fe684f",
+      "is_right": true
+    },
+    {
+      "sibling": "fdfafc12231339952ffa04b06fea5030248656acc5ff5bea8f42fe14ff525f4b",
+      "is_right": false
+    },
+    {
+      "sibling": "bfb7d248650e65962cbd3d3f41304f53226f4f12bdcb3ffdff0004894e6e8ea6",
+      "is_right": false
+    },
+    {
+      "sibling": "2a1d2766cfc41d12f6a4fb719b49e0e0765ec96ce4ea25fb92e19fdb9a63aefd",
+      "is_right": false
+    },
+    {
+      "sibling": "6ccb5edacf8d71d4e39d2dc16f3865658cf06cda19eecc8b6b96c1b21e715f97",
+      "is_right": true
+    },
+    {
+      "sibling": "04aee1ce083f6289397bfce0c89df04ab60e342fc21cd7bce1565f6601f7339a",
+      "is_right": false
+    },
+    {
+      "sibling": "a398c7d4fec9db3636cc50b2dc411e8b78401205a4d27c6a9c0606662c2e4f9d",
+      "is_right": true
+    },
+    {
+      "sibling": "ac60193250b70b82b7fc09f7cd89a44099dc5720475e6cd1b777213c06f04668",
+      "is_right": true
+    },
+    {
+      "sibling": "8303719cfd95b9ac4ce39f8abd236df6f8adee5c4e3ec5b25f5526685679b6c6",
+      "is_right": false
+    },
+    {
+      "sibling": "c2e3d8fb8eb81535536b3e0775aff1641ba9d2ccb49c80ec6e56ac1b71a7504a",
+      "is_right": false
+    },
+    {
+      "sibling": "ff05b0521c4eac67230b90455232e102a3979eea1c3009562c7423689307ae01",
+      "is_right": true
+    },
+    {
+      "sibling": "7d9bcf56afeaaeb93af4185714ae1467ccd807930947075ba8a3941e1b63918d",
+      "is_right": true
+    },
+    {
+      "sibling": "de2dc3b8a57efd78fdc9683d65013545236fdf9477c0db4f50edf2452183dc99",
+      "is_right": false
+    },
+    {
+      "sibling": "d00ef99bc1cf43d63d8b1f72e223fcaf938e1ae2fb171f422907e04e0446a02e",
+      "is_right": true
+    },
+    {
+      "sibling": "434ea2d0997e9d2832e09c352ca5382242822d241d1cb19d47647f1424855561",
+      "is_right": true
+    },
+    {
+      "sibling": "2bf455170c1868eb0ac252d5ecdc9f3dfac42648a7bd799332f3e5fe9dbe2c74",
+      "is_right": true
+    },
+    {
+      "sibling": "12966d5704f97f42d19eaf3ecb82f9a50bacb009fc5ae4817bbae50401276138",
+      "is_right": false
+    },
+    {
+      "sibling": "bf3d2e248dd89b68f50cbc0e20e1f07cf15d5215d87437d9f195c5e7b9fa7edb",
+      "is_right": true
+    },
+    {
+      "sibling": "503204e4fe669a1ab099b40019f34d006c5acbd7810caf46332f52108d84d0be",
+      "is_right": true
+    },
+    {
+      "sibling": "2d15577124a205a35bdc916c604a4b25b170a44823a216dafd9825c63e832f6a",
+      "is_right": false
+    },
+    {
+      "sibling": "d49b5ba42cc0b68063034c0393fdf09ccfc76508bf1b99bc8a8782eb08411f53",
+      "is_right": false
+    },
+    {
+      "sibling": "9266862a4d09bd851a652a490705f2936ada534ff73b1d1a402da82dbc2043a6",
+      "is_right": false
+    },
+    {
+      "sibling": "1c2f125efc3769c7c1b9a4ac3b80e8b461c53c30ef904eab479692a799cfcb99",
+      "is_right": false
+    },
+    {
+      "sibling": "5dea38fdd44eca0e809c40fa2fdd5ac0dfbf74f25d0b65d31b39196a16aa9362",
+      "is_right": false
+    },
+    {
+      "sibling": "a5166049991d15c30700bb899ae3ff1a3419b0cb8e0c93cd08f32cffad71b50b",
+      "is_right": false
+    },
+    {
+      "sibling": "2c85a5dbb5612a42b8503a83025ec3d43d64e12f6aeb0b68e2aa8d59c2ab4a52",
+      "is_right": false
+    },
+    {
+      "sibling": "968babaeeef99614646efde7e6f1ea38211b766f5e2efc647f4e0f55168aaf70",
+      "is_right": true
+    },
+    {
+      "sibling": "3c7e43eab7c8666a7d9b667058a878b9a02a38bd319011360e44f70bfc75c7f8",
+      "is_right": false
+    },
+    {
+      "sibling": "ec73207cee0b4520321c3922574a7af88770bc6cdc3b2448611ba4b7f5767369",
+      "is_right": false
+    },
+    {
+      "sibling": "11e02fc709d5cbbf6adb222f2aa388fbae6f17d954a26903f430ec36e8512625",
+      "is_right": false
+    },
+    {
+      "sibling": "2bac034bab13bf27db89b6dcccfb06354cf43ba7d1cfb932554ba41ec38a2559",
+      "is_right": true
+    },
+    {
+      "sibling": "35831deab182ffaa444780a85a11f9f38682325a0b7a57a3621ccdfb8a9c5b5a",
+      "is_right": true
+    },
+    {
+      "sibling": "9ac1f85edfe2b62deae5fab94ac714140c093e3600aebc067f3601da4b9792b7",
+      "is_right": false
+    },
+    {
+      "sibling": "86bce515b218d06f62bdb3fa63c03a385a8cd8da8837f5ad1c199bef39506cb4",
+      "is_right": false
+    },
+    {
+      "sibling": "619637c02b08e533620064eed6dcdcfc1e4f901c826834b57f2d0dd3db690e68",
+      "is_right": false
+    },
+    {
+      "sibling": "ef00939d0b0f8d1b7a96bd1493b6e93809d61aef1b70c177348285167a78f404",
+      "is_right": false
+    },
+    {
+      "sibling": "a20f5d53c7526c67483ff5575166dd2ac414ed1c9dd888945ddb18be2e4942eb",
+      "is_right": true
+    },
+    {
+      "sibling": "c037339c1a1813b44fc6d6987171780ed9cc171a34990b9a0e1f617ad3ba1a9a",
+      "is_right": true
+    }
+  ]
+}

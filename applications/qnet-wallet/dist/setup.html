@@ -304,6 +304,10 @@
     <!-- Production crypto libraries -->
     <script src="lib/tweetnacl.min.js"></script>
     <script src="lib/crypto-js.min.js"></script>
+    <!-- noble-pq-ml-dsa.js sets window.QNetDilithiumLib (canonical ML-DSA-65 wallet derivation);
+         MUST load before setup.js so the displayed EON address matches the wallet the background
+         service worker actually creates. -->
+    <script src="lib/noble-pq-ml-dsa.js"></script>
     <script src="src/crypto/ProductionBIP39.js"></script>
     <script src="lib/solana-correct.js"></script>
     <script src="lib/crypto-secure.js"></script>

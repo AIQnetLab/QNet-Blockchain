@@ -1,4 +1,31 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { createHash, randomBytes } from 'crypto';
+
+// ---------------------------------------------------------------------------
+// v14.5: CORS ALLOWLIST (was: Access-Control-Allow-Origin: *)
+// ---------------------------------------------------------------------------
+// Wildcard CORS lets any origin read the build-verification payload and, if
+// paired with credentials, exfiltrate response data from authenticated users.
+// The endpoint is still publicly readable — we just stop advertising cross-
+// origin permission. Explicitly known front-ends can be added via env
+// (VERIFY_BUILD_ALLOWED_ORIGINS, comma-separated).
+// ---------------------------------------------------------------------------
+const DEFAULT_ALLOWED_ORIGINS = [
+  'https://aiqnet.io',
+  'https://www.aiqnet.io',
+  'https://explorer.aiqnet.io',
+];
+
+function resolveAllowedOrigin(request: NextRequest): string | null {
+  const extra = (process.env.VERIFY_BUILD_ALLOWED_ORIGINS || '')
+    .split(',')
+    .map((o) => o.trim())
+    .filter(Boolean);
+  const allowed = [...DEFAULT_ALLOWED_ORIGINS, ...extra];
+  const origin = request.headers.get('origin');
+  if (origin && allowed.includes(origin)) return origin;
+  return null;
+}
 
 export async function GET(request: NextRequest) {
   const buildInfo = {
@@ -42,28 +69,46 @@ export async function GET(request: NextRequest) {
     }
   };
 
-  return NextResponse.json(buildInfo, {
-    headers: {
-      'Content-Type': 'application/json',
-      'Cache-Control': 'no-cache, no-store, must-revalidate',
-      'Access-Control-Allow-Origin': '*',
-    },
-  });
-}
-
-// Simple function to get file hash (placeholder)
-async function getFileHash(filename: string): Promise<string> {
-  // In real version this will be SHA-256 hash of file
-  // For demo using fixed values
-  const hashes: Record<string, string> = {
-    'package.json': 'sha256:a1b2c3d4e5f6...',
-    'next.config.js': 'sha256:f6e5d4c3b2a1...',
+  const allowedOrigin = resolveAllowedOrigin(request);
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    'Cache-Control': 'no-cache, no-store, must-revalidate',
   };
-  return hashes[filename] || 'sha256:' + Math.random().toString(36).substring(2, 15);
+  if (allowedOrigin) {
+    headers['Access-Control-Allow-Origin'] = allowedOrigin;
+    headers['Vary'] = 'Origin';
+  }
+  return NextResponse.json(buildInfo, { headers });
 }
 
-// Simple function to get directory hash (placeholder)  
+async function getFileHash(filename: string): Promise<string> {
+  try {
+    const fs = await import('fs/promises');
+    const path = await import('path');
+    const filePath = path.join(process.cwd(), filename);
+    const content = await fs.readFile(filePath);
+    return 'sha256:' + createHash('sha256').update(content).digest('hex');
+  } catch {
+    return 'sha256:unavailable';
+  }
+}
+
 async function getDirectoryHash(dirname: string): Promise<string> {
-  // In real version this will be aggregated hash of all files in directory
-  return 'sha256:' + Math.random().toString(36).substring(2, 15);
-} 
+  try {
+    const fs = await import('fs/promises');
+    const path = await import('path');
+    const dirPath = path.join(process.cwd(), dirname);
+    const hash = createHash('sha256');
+    const entries = await fs.readdir(dirPath, { recursive: true, withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.isFile()) {
+        const fp = path.join(entry.parentPath ?? entry.path, entry.name);
+        const content = await fs.readFile(fp);
+        hash.update(content);
+      }
+    }
+    return 'sha256:' + hash.digest('hex');
+  } catch {
+    return 'sha256:unavailable';
+  }
+}

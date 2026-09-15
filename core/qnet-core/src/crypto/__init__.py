@@ -59,7 +59,10 @@ class ProductionCrypto:
             return self._create_minimal_simulator()
     
     def _create_dilithium_simulator(self):
-        """Create Dilithium simulator for testing"""
+        """DEVELOPMENT ONLY: SHA256-based Dilithium simulation.
+        NOT cryptographically secure — signatures can be forged.
+        Production Rust node uses pqcrypto-mldsa (real ML-DSA-65).
+        This fallback exists because the Rust cdylib does not compile."""
         class DilithiumSimulator:
             def __init__(self, algorithm):
                 self.algorithm = algorithm
@@ -89,7 +92,8 @@ class ProductionCrypto:
         return DilithiumSimulator(self.algorithm)
     
     def _create_minimal_simulator(self):
-        """Minimal simulator when no crypto libraries available"""
+        """DEVELOPMENT ONLY: Mock simulator — always returns valid.
+        NEVER use in production. See _create_dilithium_simulator docstring."""
         class MinimalSimulator:
             def generate_keypair(self):
                 return b"mock_public_key", b"mock_secret_key"

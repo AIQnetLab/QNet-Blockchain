@@ -117,8 +117,12 @@ class EnhancedSecurityChecker:
             return False
         
         # Check 4: Node type validation
-        if node_type not in ["light", "full", "super"]:
-            print(f"❌ SECURITY: Invalid node type: {node_type}")
+        # v3.18: Full nodes removed
+        if node_type not in ["light", "super"]:
+            if node_type == "full":
+                print(f"❌ SECURITY: Full node type removed in v3.18. Use Super node instead.")
+            else:
+                print(f"❌ SECURITY: Invalid node type: {node_type}")
             return False
         
         print(f"✅ SECURITY: Node activation validation passed for {node_type} node")

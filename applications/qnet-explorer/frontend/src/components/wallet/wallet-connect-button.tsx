@@ -91,10 +91,10 @@ const WalletConnectButton = () => {
       if (accounts && accounts.length > 0) {
         setAccount(accounts[0]);
         setIsConnected(true);
-        console.log('✅ Wallet connected:', accounts[0]);
+        /* log disabled */
       }
     } catch (error) {
-      console.error('❌ Failed to connect wallet:', error);
+      /* log disabled */
       alert('Failed to connect wallet. Please try again.');
     } finally {
       setIsConnecting(false);
@@ -108,7 +108,7 @@ const WalletConnectButton = () => {
         setAccount(null);
         setIsConnected(false);
       } catch (error) {
-        console.error('Failed to disconnect wallet:', error);
+        /* log disabled */
       }
     }
   };

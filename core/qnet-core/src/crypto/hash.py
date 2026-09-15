@@ -161,7 +161,7 @@ class QNetHasher:
         except Exception:
             return False
             
-    def pbkdf2_hash(self, password: Union[str, bytes], salt: bytes, iterations: int = 100000) -> bytes:
+    def pbkdf2_hash(self, password: Union[str, bytes], salt: bytes, iterations: int = 600_000) -> bytes:
         """
         PBKDF2 key derivation for secure password hashing
         

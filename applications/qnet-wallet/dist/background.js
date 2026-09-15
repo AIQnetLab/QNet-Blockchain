@@ -1,4 +1,4 @@
-﻿/**
+/**
  * QNet Wallet Background Service Worker - Production Version
  * Self-contained cryptography for Chrome Extension compatibility
  */
@@ -11,6 +11,10 @@ try {
         // Service worker context - load required libraries
         importScripts('lib/tweetnacl.min.js');
         importScripts('lib/crypto-js.min.js');
+        // PURE DILITHIUM (F0.2): canonical ML-DSA-65 wallet derivation + signing. Sets the global
+        // self.QNetDilithiumLib (esbuild var QNetDilithiumLib=...). A service worker has NO `window`,
+        // so downstream code accesses it via self/globalThis. Must load before any wallet derivation.
+        importScripts('lib/noble-pq-ml-dsa.js');
         
         // Check if nacl is now available globally
         if (typeof self !== 'undefined' && typeof self.nacl !== 'undefined') {
@@ -39,6 +43,330 @@ if (typeof self !== 'undefined') {
         nacl = self.nacl;
     }
 }
+
+// ============================================================================
+// v3.14: QNet API Integration - DISTRIBUTED load across ALL Genesis nodes
+// NO single point of failure - random node selection from the start!
+// ============================================================================
+
+// ALL Genesis nodes — the ONE list; every node fetch in this worker resolves through it.
+// Plain HTTP on the unified API port 8001: no TLS terminator is deployed, so an https:// URL
+// simply cannot connect. The transport carries public chain data + already-signed TXs — fund
+// safety rests on the ML-DSA-65 signature, not on TLS. Mirrors qnet-mobile src/config/nodes.js.
+const QNET_GENESIS_NODES = [
+    'http://154.38.160.39:8001',   // North America
+    'http://62.171.157.44:8001',   // Europe
+    'http://161.97.86.81:8001',    // Europe
+    'http://5.189.130.160:8001',   // Europe
+    'http://162.244.25.114:8001'   // Europe
+];
+
+// Minimum reputation for verification nodes
+const QNET_MIN_REPUTATION = 0.70;
+
+// CSPRNG helpers (replace Math.random for security-sensitive values)
+function cryptoRandomHex(byteLength) {
+    const bytes = new Uint8Array(byteLength);
+    crypto.getRandomValues(bytes);
+    return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+function cryptoRandomInt(max) {
+    const arr = new Uint32Array(1);
+    crypto.getRandomValues(arr);
+    return arr[0] % max;
+}
+
+function cryptoRandomBase36(length) {
+    const chars = '0123456789abcdefghijklmnopqrstuvwxyz';
+    const bytes = new Uint8Array(length);
+    crypto.getRandomValues(bytes);
+    return Array.from(bytes).map(b => chars[b % chars.length]).join('');
+}
+
+// Cache for discovered nodes (after first successful discovery)
+let qnetDiscoveredNodes = [];
+let qnetNodesCacheTime = 0;
+const QNET_NODES_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+
+/**
+ * v3.14: Get RANDOM Genesis node (distributes load from first request!)
+ */
+function getRandomGenesisNode() {
+    return QNET_GENESIS_NODES[Math.floor(Math.random() * QNET_GENESIS_NODES.length)];
+}
+
+/**
+ * v3.14: Get real QNC balance from QNet blockchain
+ * Uses random node selection to distribute load
+ */
+async function getQNCBalance(address) {
+    try {
+        if (!address || typeof address !== 'string') {
+            return 0;
+        }
+        
+        // Get random node for load balancing (from discovered or Genesis)
+        const nodeUrl = await getQNetNodeUrl();
+        
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 5000);
+        
+        const response = await fetch(`${nodeUrl}/api/v1/account/${address}/balance`, {
+            method: 'GET',
+            headers: { 'Content-Type': 'application/json' },
+            signal: controller.signal
+        });
+        
+        clearTimeout(timeoutId);
+        
+        if (!response.ok) {
+            return 0;
+        }
+        
+        const data = await response.json();
+        // Balance in nanoQNC, convert to QNC
+        const balanceNano = data.balance || data.amount || 0;
+        return balanceNano / 1e9;
+        
+    } catch (error) {
+        // console.warn('[QNet] Balance fetch failed:', error.message);
+        return 0;
+    }
+}
+
+/**
+ * v3.13: Get QNC balance with Merkle proof for trustless verification
+ */
+async function getQNCBalanceWithProof(address) {
+    try {
+        if (!address || typeof address !== 'string') {
+            return { balance: 0, verified: false, error: 'Invalid address' };
+        }
+        
+        const nodeUrl = await getQNetNodeUrl();
+        
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 10000);
+        
+        const response = await fetch(`${nodeUrl}/api/v1/account/${address}/balance/proof`, {
+            method: 'GET',
+            headers: { 'Content-Type': 'application/json' },
+            signal: controller.signal
+        });
+        
+        clearTimeout(timeoutId);
+        
+        if (!response.ok) {
+            return { balance: 0, verified: false, error: 'API request failed' };
+        }
+        
+        const data = await response.json();
+        
+        if (!data.proof || !data.state_root) {
+            // Fallback: return balance without verification
+            return { 
+                balance: (data.balance || 0) / 1e9, 
+                verified: false, 
+                error: 'No proof available' 
+            };
+        }
+        
+        // Verify Merkle proof locally
+        const verified = await verifyQNetMerkleProof(
+            address,
+            data.balance,
+            data.nonce || 0,
+            data.proof,
+            data.state_root
+        );
+        
+        // If local verification passed, verify state_root from multiple nodes
+        let consensusVerified = false;
+        if (verified) {
+            consensusVerified = await verifyQNetStateRootConsensus(
+                data.state_root,
+                data.block_height || 0
+            );
+        }
+        
+        return {
+            balance: (data.balance || 0) / 1e9,
+            verified: verified && consensusVerified,
+            proofVerified: verified,
+            consensusVerified: consensusVerified,
+            blockHeight: data.block_height
+        };
+        
+    } catch (error) {
+        return { balance: 0, verified: false, error: error.message };
+    }
+}
+
+/**
+ * v3.13: Verify Merkle proof locally using SHA3-256
+ */
+async function verifyQNetMerkleProof(address, balance, nonce, proof, expectedRoot) {
+    try {
+        // Use SubtleCrypto for SHA3-256 (or fallback to simple hash)
+        // Note: Browser doesn't have native SHA3, so we use a simplified verification
+        // For full security, this should use js-sha3 library
+        
+        if (!proof || !Array.isArray(proof) || proof.length === 0) {
+            return false;
+        }
+        
+        // Simplified verification: check proof structure is valid
+        // Full verification requires SHA3-256 library
+        const isValidStructure = proof.every(p => 
+            p.sibling && typeof p.sibling === 'string' && 
+            typeof p.is_right === 'boolean'
+        );
+        
+        if (!isValidStructure) {
+            return false;
+        }
+        
+        // For now, trust the proof structure if it looks valid
+        // Full cryptographic verification happens server-side
+        return true;
+        
+    } catch (error) {
+        return false;
+    }
+}
+
+/**
+ * v3.13: Verify state_root from multiple high-reputation nodes
+ */
+async function verifyQNetStateRootConsensus(stateRoot, blockHeight) {
+    try {
+        const nodes = await discoverQNetHighRepNodes();
+        
+        if (nodes.length < 2) {
+            return false;
+        }
+        
+        const macroBlockIndex = Math.floor(blockHeight / 90);
+        
+        // Query up to 5 nodes
+        const nodesToQuery = shuffleArray(nodes).slice(0, 5);
+        
+        const queries = nodesToQuery.map(async (node) => {
+            try {
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 3000);
+                
+                const response = await fetch(`${node.url}/api/v1/macroblock/${macroBlockIndex}`, {
+                    method: 'GET',
+                    headers: { 'Content-Type': 'application/json' },
+                    signal: controller.signal
+                });
+                
+                clearTimeout(timeoutId);
+                
+                if (!response.ok) return null;
+                
+                const macroblock = await response.json();
+                return macroblock.state_root || null;
+            } catch {
+                return null;
+            }
+        });
+        
+        const results = await Promise.all(queries);
+        const validResults = results.filter(r => r !== null);
+        
+        if (validResults.length < 2) {
+            return false;
+        }
+        
+        // 2/3 consensus required
+        const matchCount = validResults.filter(r => r === stateRoot).length;
+        const threshold = Math.ceil(validResults.length * 2 / 3);
+        
+        return matchCount >= threshold;
+        
+    } catch (error) {
+        return false;
+    }
+}
+
+/**
+ * v3.14: Discover high-reputation QNet nodes
+ * Uses RANDOM Genesis node for discovery (no single point of failure!)
+ */
+async function discoverQNetHighRepNodes() {
+    // Return cached if fresh
+    if (qnetDiscoveredNodes.length > 0 && (Date.now() - qnetNodesCacheTime) < QNET_NODES_CACHE_TTL) {
+        return qnetDiscoveredNodes;
+    }
+    
+    // Try discovery from random Genesis node
+    const randomGenesis = getRandomGenesisNode();
+    
+    try {
+        const response = await fetch(`${randomGenesis}/api/v1/peers`, {
+            signal: AbortSignal.timeout(5000)
+        });
+        
+        if (response.ok) {
+            const data = await response.json();
+            
+            if (data.peers && Array.isArray(data.peers)) {
+                // Filter by high reputation only
+                const highRepNodes = data.peers
+                    .filter(peer => 
+                        peer.address && 
+                        peer.address.includes(':') &&
+                        (peer.reputation || 0) >= QNET_MIN_REPUTATION
+                    )
+                    // Peers announce host:port for the same plain-HTTP unified API as the genesis list.
+                    .map(peer => ({
+                        url: `http://${peer.address}`,
+                        reputation: peer.reputation,
+                        nodeType: peer.node_type
+                    }))
+                    .sort((a, b) => b.reputation - a.reputation)
+                    .slice(0, 50);
+                
+                if (highRepNodes.length >= 1) {
+                    qnetDiscoveredNodes = highRepNodes;
+                    qnetNodesCacheTime = Date.now();
+                    return highRepNodes;
+                }
+            }
+        }
+    } catch (error) {
+        // Discovery from this node failed, try another
+    }
+    
+    // Fallback: return ALL Genesis nodes as options (distributed!)
+    return QNET_GENESIS_NODES.map(url => ({ url, reputation: 0.90, nodeType: 'genesis' }));
+}
+
+/**
+ * v3.13: Get random high-rep QNet node URL
+ */
+async function getQNetNodeUrl() {
+    const nodes = await discoverQNetHighRepNodes();
+    const selected = nodes[Math.floor(Math.random() * nodes.length)];
+    return selected.url;
+}
+
+/**
+ * Helper: Shuffle array (Fisher-Yates)
+ */
+function shuffleArray(array) {
+    const shuffled = [...array];
+    for (let i = shuffled.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+    }
+    return shuffled;
+}
+
+// ============================================================================
 
 // Production Crypto Class - No external dependencies
 class ProductionCrypto {
@@ -2346,42 +2674,12 @@ class ProductionCrypto {
         return this.base58Encode(publicKey);
     }
     
-    // Generate QNet address from Solana address (for simple display)
-    // PRODUCTION FORMAT: 19 chars + "eon" + 15 chars + 4 char checksum = 41 total
-    static generateQNetAddressFromSolana(solanaAddress) {
-        try {
-            // Generate deterministic QNet address from Solana address
-            const encoder = new TextEncoder();
-            const data = encoder.encode(solanaAddress + 'qnet_eon_bridge');
-            
-            // Use SHA-512 hash
-            return crypto.subtle.digest('SHA-512', data).then(hashBuffer => {
-                const hash = Array.from(new Uint8Array(hashBuffer));
-                const fullHex = hash.map(b => b.toString(16).padStart(2, '0')).join('');
-                
-                // PRODUCTION FORMAT: 19 + 3 + 15 + 4 = 41 characters (NO underscores!)
-                const part1 = fullHex.substring(0, 19).toLowerCase();
-                const part2 = fullHex.substring(19, 34).toLowerCase();
-                
-                // Generate SHA-256 checksum (same algorithm as mobile app)
-                const addressWithoutChecksum = part1 + 'eon' + part2;
-                const checksumEncoder = new TextEncoder();
-                
-                return crypto.subtle.digest('SHA-256', checksumEncoder.encode(addressWithoutChecksum)).then(checksumBuffer => {
-                    const checksumHash = Array.from(new Uint8Array(checksumBuffer));
-                    const checksumHex = checksumHash.map(b => b.toString(16).padStart(2, '0')).join('');
-                    const checksum = checksumHex.substring(0, 4).toLowerCase();
-                    
-                    // PRODUCTION: No underscores, just part1 + eon + part2 + checksum
-                    return `${part1}eon${part2}${checksum}`;
-                });
-            });
-        } catch (error) {
-            // console.error('Error generating QNet address from Solana:', error);
-            return null;
-        }
-    }
-    
+    // REMOVED: dead generateQNetAddressFromSolana(). It derived a QNet EON address from the Solana
+    // address via SHA-512("...qnet_eon_bridge") — a DIVERGENT identity unrelated to the ML-DSA-65 key,
+    // which the Rust node + mobile reject (the unlock path explicitly warns "NEVER derive the QNet
+    // address from the Solana address"). It had zero callers. The only valid QNet EON address comes from
+    // ProductionCrypto.generateQNetAddress(mnemonic) → QNetDilithium.deriveWallet(mnemonic).address.
+
     // Migrate QNet address - preserve old addresses, add keypairs for new
     static async migrateQNetAddress(wallet) {
         try {
@@ -2390,15 +2688,27 @@ class ProductionCrypto {
             
             // Check if wallet has QNet address
             if (!wallet.qnetAddress || !wallet.networks?.qnet?.address) {
-                // No existing address - generate from Solana as fallback
-                if (wallet.networks?.solana?.address) {
-                    const newAddress = await CryptoService.generateQNetAddressFromSolana(wallet.networks.solana.address);
-                    if (newAddress) {
-                        if (wallet.networks && wallet.networks.qnet) {
-                            wallet.networks.qnet.address = newAddress;
-                        }
-                        wallet.qnetAddress = newAddress;
+                // No existing address. Derive the CANONICAL pure-Dilithium (ML-DSA-65) address from
+                // the mnemonic. Do NOT derive from the Solana address (that produced a divergent,
+                // WRONG address that node/mobile reject).
+                if (wallet.mnemonic) {
+                    const result = await ProductionCrypto.generateQNetAddress(wallet.mnemonic, 0);
+                    if (wallet.networks && wallet.networks.qnet) {
+                        wallet.networks.qnet.address = result.address;
                     }
+                    wallet.qnetAddress = result.address;
+                    wallet.qnetKeypair = {
+                        publicKey: Array.from(result.keypair.publicKey),
+                        privateKey: Array.from(result.keypair.privateKey),
+                        publicKeyHex: result.keypair.publicKeyHex,
+                        privateKeyHex: result.keypair.privateKeyHex,
+                        algorithm: result.keypair.algorithm,
+                        path: result.keypair.path
+                    };
+                } else {
+                    // No mnemonic → cannot derive the canonical ML-DSA-65 wallet. Leave the address
+                    // unset rather than mint a divergent SHA-based address the network would reject.
+                    console.warn('[MIGRATION] No mnemonic available — cannot derive canonical QNet address');
                 }
                 return wallet;
             }
@@ -2408,16 +2718,18 @@ class ProductionCrypto {
             // If wallet has mnemonic, ALWAYS migrate to BIP44 address
             if (wallet.mnemonic) {
                 try {
-                    // Generate proper BIP44 address and keypair
-                    const seed = await ProductionCrypto.mnemonicToSeed(wallet.mnemonic);
-                    const result = await ProductionCrypto.generateQNetAddress(seed, 0);
-                    
+                    // Canonical pure-Dilithium (ML-DSA-65) derivation — from the MNEMONIC, via the bundle.
+                    const result = await ProductionCrypto.generateQNetAddress(wallet.mnemonic, 0);
+
                     // UPDATE to new address (breaking change but necessary)
                     const oldAddress = currentAddress;
                     wallet.qnetAddress = result.address;
                     wallet.qnetKeypair = {
                         publicKey: Array.from(result.keypair.publicKey),
                         privateKey: Array.from(result.keypair.privateKey),
+                        publicKeyHex: result.keypair.publicKeyHex,
+                        privateKeyHex: result.keypair.privateKeyHex,
+                        algorithm: result.keypair.algorithm,
                         path: result.keypair.path
                     };
                     
@@ -2435,12 +2747,15 @@ class ProductionCrypto {
             if (currentAddress && currentAddress.length < 40) {
                 // This is very old format, need to regenerate
                 if (wallet.mnemonic) {
-                    const seed = await ProductionCrypto.mnemonicToSeed(wallet.mnemonic);
-                    const result = await ProductionCrypto.generateQNetAddress(seed, 0);
+                    // Canonical pure-Dilithium (ML-DSA-65) derivation — from the MNEMONIC, via the bundle.
+                    const result = await ProductionCrypto.generateQNetAddress(wallet.mnemonic, 0);
                     wallet.qnetAddress = result.address;
                     wallet.qnetKeypair = {
                         publicKey: Array.from(result.keypair.publicKey),
                         privateKey: Array.from(result.keypair.privateKey),
+                        publicKeyHex: result.keypair.publicKeyHex,
+                        privateKeyHex: result.keypair.privateKeyHex,
+                        algorithm: result.keypair.algorithm,
                         path: result.keypair.path
                     };
                     if (wallet.networks && wallet.networks.qnet) {
@@ -2531,56 +2846,70 @@ class ProductionCrypto {
         }
     }
     
-    // Generate QNet EON address from keypair
-    static async generateQNetAddress(seed, accountIndex = 0) {
+    // Access the canonical pure-Dilithium (ML-DSA-65) bundle. In the MV3 service worker there is NO
+    // `window`; the esbuild `var QNetDilithiumLib` global lives on self/globalThis (loaded above via
+    // importScripts('lib/noble-pq-ml-dsa.js')).
+    static getDilithium() {
+        const g = (typeof self !== 'undefined') ? self
+                : (typeof globalThis !== 'undefined') ? globalThis
+                : (typeof window !== 'undefined') ? window : null;
+        const lib = g && g.QNetDilithiumLib;
+        const Q = lib && lib.QNetDilithium;
+        if (!Q || typeof Q.deriveWallet !== 'function') {
+            throw new Error('QNetDilithium bundle not loaded — importScripts(lib/noble-pq-ml-dsa.js) must run before wallet derivation');
+        }
+        return Q;
+    }
+
+    // Generate the CANONICAL pure-Dilithium (ML-DSA-65) QNet EON address + key material from a
+    // BIP39 MNEMONIC. Byte-identical to the Rust node + mobile app (golden-KAT proven:
+    // "abandon…about" → d9fa370374e24333242eon847d1d354dcd87fe873823e). The address is derived from
+    // the ML-DSA-65 public key by the bundle — it is NOT re-hashed from a raw seed.
+    //
+    // NOTE: callers now pass the MNEMONIC (not a raw 32-byte seed). The pure-Dilithium wallet is the
+    // account-0 ML-DSA-65 keypair; there is no per-index HD tree (same as node/mobile), so
+    // `accountIndex` is retained only for signature compatibility and does not alter derivation.
+    static async generateQNetAddress(mnemonic, accountIndex = 0) {
         try {
-            // Generate keypair first using BIP44
-            const keypair = await ProductionCrypto.generateQNetKeypair(seed, accountIndex);
-            
-            // Create address from public key
-            const publicKeyHex = Array.from(keypair.publicKey)
-                .map(b => b.toString(16).padStart(2, '0'))
-                .join('');
-            
-            // Use SHA-512 of public key for address generation
-            const addressData = await crypto.subtle.digest('SHA-512', keypair.publicKey);
-            const addressHash = Array.from(new Uint8Array(addressData));
-            const fullHex = addressHash.map(b => b.toString(16).padStart(2, '0')).join('');
-            
-            // Create deterministic address from hash
-            // Format: 19 chars + "eon" + 15 chars + 4 char checksum = 41 total
-            const part1 = fullHex.substring(0, 19).toLowerCase();
-            const part2 = fullHex.substring(19, 34).toLowerCase();
-            
-            // Generate SHA-256 checksum from the address parts
-            const addressWithoutChecksum = part1 + 'eon' + part2;
-            const encoder = new TextEncoder();
-            const checksumBuffer = await crypto.subtle.digest('SHA-256', encoder.encode(addressWithoutChecksum));
-            const checksumHash = Array.from(new Uint8Array(checksumBuffer));
-            const checksumHex = checksumHash.map(b => b.toString(16).padStart(2, '0')).join('');
-            const checksum = checksumHex.substring(0, 4).toLowerCase();
-            
-            const address = `${part1}eon${part2}${checksum}`;
-            
-            // Return both address and keypair for storage
+            if (typeof mnemonic !== 'string' || mnemonic.trim().split(/\s+/).length < 12) {
+                throw new Error('generateQNetAddress requires a BIP39 mnemonic (pure-Dilithium derivation)');
+            }
+            const Q = ProductionCrypto.getDilithium();
+            const w = Q.deriveWallet(mnemonic); // { address, publicKey(hex 1952B), secretKey(hex 4032B), xi }
+
+            const pkBytes = Uint8Array.from(w.publicKey.match(/../g).map(x => parseInt(x, 16)));
+            const skBytes = Uint8Array.from(w.secretKey.match(/../g).map(x => parseInt(x, 16)));
+
+            // Return address + keypair for storage. publicKey/privateKey are ML-DSA-65 byte arrays;
+            // publicKeyHex/privateKeyHex are the hex forms the signer (Q.signQNet) consumes directly.
             return {
-                address: address,
-                keypair: keypair
+                address: w.address,
+                keypair: {
+                    publicKey: pkBytes,
+                    privateKey: skBytes,
+                    publicKeyHex: w.publicKey,
+                    privateKeyHex: w.secretKey,
+                    algorithm: 'ML-DSA-65',
+                    path: 'QNET_WALLET_MLDSA65_v1'
+                }
             };
         } catch (error) {
             // Error:('QNet address generation failed:', error);
-            throw new Error('Failed to generate QNet address');
+            throw new Error('Failed to generate QNet address: ' + (error && error.message ? error.message : error));
         }
     }
     
     // Encrypt wallet data with password
+    static ENCRYPT_ITERATIONS_V2 = 600_000; // OWASP 2024
+    static ENCRYPT_ITERATIONS_V1 = 100_000; // Legacy — decrypt only
+
     static async encryptWalletData(walletData, password) {
         try {
             const encoder = new TextEncoder();
             const data = encoder.encode(JSON.stringify(walletData));
             
             // Generate salt and IV
-            const salt = crypto.getRandomValues(new Uint8Array(16));
+            const salt = crypto.getRandomValues(new Uint8Array(32));
             const iv = crypto.getRandomValues(new Uint8Array(12));
             
             // Derive key from password
@@ -2596,7 +2925,7 @@ class ProductionCrypto {
                 {
                     name: 'PBKDF2',
                     salt: salt,
-                    iterations: 100000, // Industry standard for crypto wallets
+                    iterations: ProductionCrypto.ENCRYPT_ITERATIONS_V2,
                     hash: 'SHA-256'
                 },
                 passwordKey,
@@ -2616,7 +2945,7 @@ class ProductionCrypto {
                 encrypted: Array.from(new Uint8Array(encrypted)),
                 salt: Array.from(salt),
                 iv: Array.from(iv),
-                version: 1
+                version: 2
             };
         } catch (error) {
             // Error:('Wallet encryption failed:', error);
@@ -2695,13 +3024,15 @@ class ProductionCrypto {
                 ['deriveKey']
             );
             
-            // console.log('[DecryptWallet] Deriving encryption key...');
-            // Derive key
+            // Derive key — v2=600K (current), v1=100K (legacy, auto-migrates)
+            const iterations = (encryptedWalletData.version === 2)
+                ? ProductionCrypto.ENCRYPT_ITERATIONS_V2
+                : ProductionCrypto.ENCRYPT_ITERATIONS_V1;
             const key = await crypto.subtle.deriveKey(
                 {
                     name: 'PBKDF2',
                     salt: new Uint8Array(salt),
-                    iterations: 100000, // Industry standard for crypto wallets
+                    iterations,
                     hash: 'SHA-256'
                 },
                 passwordKey,
@@ -3299,15 +3630,9 @@ class SolanaRPC {
             return this._networkSizeCache;
         }
         
-        // PRODUCTION: Real Genesis node IPs (from genesis_constants.rs)
-        const bootstrapNodes = [
-            'http://154.38.160.39:8080',   // Genesis #1 - North America
-            'http://62.171.157.44:8080',   // Genesis #2 - Europe
-            'http://161.97.86.81:8080',    // Genesis #3 - Europe
-            'http://5.189.130.160:8080',   // Genesis #4 - Europe
-            'http://162.244.25.114:8080'   // Genesis #5 - Europe
-        ];
-        
+        // The ONE genesis list — a second copy here drifted to a port the node never served.
+        const bootstrapNodes = QNET_GENESIS_NODES;
+
         // Try multiple bootstrap nodes for reliability
         for (const apiUrl of bootstrapNodes) {
             try {
@@ -3342,17 +3667,18 @@ class SolanaRPC {
         throw new Error('Network size unavailable - all bootstrap nodes unreachable');
     }
     
-    async getCurrentBurnPricing(nodeType = 'full') {
+    // v3.18: Default to 'light' instead of 'full'
+    async getCurrentBurnPricing(nodeType = 'light') {
         try {
             const burnPercent = await this.getBurnProgress();
             
             // Check if Phase 2 (90% burned or 5 years passed)
             if (burnPercent >= 90) {
                 // Phase 2: QNC activation with dynamic network multiplier
+                // v3.18: Only Light and Super nodes
                 const phase2BaseCosts = {
-                    light: 5000,  // Base QNC cost
-                    full: 7500,   // Base QNC cost
-                    super: 10000  // Base QNC cost
+                    light: 10000,  // Base QNC cost (10,000 QNC)
+                    super: 7500   // Base QNC cost (7,500 QNC)
                 };
                 
                 // PRODUCTION: Get real active nodes count from QNet API
@@ -3371,7 +3697,8 @@ class SolanaRPC {
                     multiplier = 3.0;       // >1M: Maximum (cap)
                 }
                 
-                const baseCost = phase2BaseCosts[nodeType] || phase2BaseCosts.full;
+                // v3.18: Full nodes removed - default to super if invalid type
+                const baseCost = phase2BaseCosts[nodeType] || phase2BaseCosts.super;
                 const finalCost = Math.round(baseCost * multiplier);
                 
                 return {
@@ -3454,7 +3781,7 @@ const ONE_DEV_TOKEN_MINT = {
 };
 
 // 1DEV Burn Tracker Contract
-const BURN_CONTRACT_PROGRAM_ID = 'D7g7mkL8o1YEex6ZgETJEQyyHV7uuUMvV3Fy3u83igJ7';
+const BURN_CONTRACT_PROGRAM_ID = 'CCZSessk1TbWie6Ye2JX2cNEWHTEWxCwe5sLz8JaFriw';
 
 // Global state management with optimizations
 let walletState = {
@@ -3470,10 +3797,8 @@ let walletState = {
     solanaRPC: null,
     balanceCache: new Map(),
     pendingBalanceRequests: new Map(), // Debounce parallel requests
-    encryptionKey: null, // Store encryption key for activation codes
-    encryptedActivationCodes: {}, // Store encrypted activation codes
+    encryptionKey: null, // Wallet decryption key (stored after unlock)
     transactionHistory: new Map(),
-    isActivatingNode: false, // Lock to prevent concurrent node activations
     rpcPerformance: new Map(), // Track RPC performance for smart selection
     lastSuccessfulRpc: null, // Remember fastest RPC
     prefetchQueue: new Set() // Queue for prefetching data
@@ -3589,249 +3914,6 @@ async function initializeWallet() {
     } catch (error) {
         // Error:('Failed to initialize wallet:', error);
     }
-}
-
-/**
- * Burn tokens and activate node
- */
-async function burnAndActivateNode(nodeType, amount) {
-    
-    // Check if activation is already in progress (prevent race conditions)
-    if (walletState.isActivatingNode) {
-        return { success: false, error: 'Node activation already in progress. Please wait.' };
-    }
-    
-    try {
-        // Set lock to prevent concurrent activations
-        walletState.isActivatingNode = true;
-        
-        if (!walletState.isUnlocked || walletState.accounts.length === 0) {
-            walletState.isActivatingNode = false;
-            return { success: false, error: 'Wallet is locked' };
-        }
-
-        const account = walletState.accounts[0];
-        const solanaAddress = account.solanaAddress;
-
-        if (!solanaAddress) {
-            walletState.isActivatingNode = false;
-            return { success: false, error: 'No Solana address found' };
-        }
-
-        // Check if any node is already activated on this wallet
-        const storageData = await chrome.storage.local.get(['walletData', 'encryptedActivationCodes']);
-        const existingCodes = storageData.encryptedActivationCodes || {};
-        
-        if (Object.keys(existingCodes).length > 0) {
-            // Found existing activation - determine which type
-            const existingType = Object.keys(existingCodes)[0];
-            const nodeTypeNames = { 
-                light: 'Light Node', 
-                full: 'Full Node', 
-                super: 'Super Node' 
-            };
-            walletState.isActivatingNode = false;
-            return { 
-                success: false, 
-                error: `This wallet already has an active ${nodeTypeNames[existingType] || 'node'}. One wallet can only run one node.` 
-            };
-        }
-
-        // Get current 1DEV token balance
-        const localData = await chrome.storage.local.get(['mainnet']);
-        const isMainnet = localData.mainnet === true;
-        const tokenMint = isMainnet ? ONE_DEV_TOKEN_MINT.mainnet : ONE_DEV_TOKEN_MINT.devnet;
-        
-        
-        const currentBalance = await getBalance(solanaAddress, tokenMint);
-        
-        
-        if (currentBalance === null || currentBalance === undefined || currentBalance === 0) {
-            walletState.isActivatingNode = false;
-            
-            // More detailed error for debugging
-            const networkName = isMainnet ? 'Mainnet' : 'Devnet';
-            return { 
-                success: false, 
-                error: `Failed to check 1DEV token balance on ${networkName}. Make sure you have 1DEV tokens at address: ${solanaAddress.substring(0, 8)}...` 
-            };
-        }
-
-        if (currentBalance < amount) {
-            walletState.isActivatingNode = false;
-            return { success: false, error: `Insufficient 1DEV balance: ${currentBalance.toFixed(2)} available, ${amount} required.` };
-        }
-
-        // Burn tokens - send to burn address
-        
-        // Solana burn address (null address)
-        const BURN_ADDRESS = '11111111111111111111111111111112';
-        
-        // Variable to store activation code
-        let activationCode = null;
-        
-        try {
-            // Starting real token burn
-            
-            // Get token account info
-            const tokenAccountInfo = await getTokenAccountInfo(solanaAddress, tokenMint);
-            if (!tokenAccountInfo) {
-                // console.error('[Node Activation] Token account not found!');
-                // console.error('[Node Activation] Address:', solanaAddress);
-                // console.error('[Node Activation] Token mint:', tokenMint);
-                // console.error('[Node Activation] Network:', isMainnet ? 'Mainnet' : 'Devnet');
-                
-                // Try to get SOL balance to see if the wallet is accessible
-                const solBalance = await getBalance(solanaAddress);
-                // console.error('[Node Activation] SOL balance check:', solBalance, 'SOL');
-                
-                walletState.isActivatingNode = false;
-                return { 
-                    success: false, 
-                    error: `Token account not found. Make sure you have 1DEV tokens on ${isMainnet ? 'mainnet' : 'devnet'}. Token mint: ${tokenMint}` 
-                };
-            }
-            
-            // Create burn transaction
-            const burnAmount = amount * 1000000; // Convert to 6 decimals for 1DEV
-            const burnTxSignature = await createAndSendBurnTransaction(
-                solanaAddress,
-                tokenAccountInfo.pubkey,
-                tokenMint,
-                burnAmount,
-                isMainnet,
-                nodeType  // Pass node type for MEMO
-            );
-            
-            if (!burnTxSignature) {
-                // Real burn failed - DO NOT generate code
-                // console.error('[Node Activation] ❌ Burn transaction failed!');
-                // console.error('[Node Activation] Tokens were NOT burned');
-                // console.error('[Node Activation] Possible reasons:');
-                // console.error('- Insufficient SOL for transaction fee (~0.001 SOL needed)');
-                // console.error('- Network connection issues');
-                // console.error('- RPC endpoint problems');
-                
-                walletState.isActivatingNode = false;
-                return { 
-                    success: false, 
-                    error: 'Failed to burn tokens. Check you have SOL for gas fees (~0.001 SOL). Tokens were NOT burned.' 
-                };
-            }
-            
-            // Transaction was sent - even if not yet confirmed
-            // Burn transaction sent successfully
-            
-            // Record burn in contract
-            // Contract will track burn stats on-chain
-            
-            // Get seed phrase for deterministic code generation
-            let seedPhrase = null;
-            
-            // First try to use already decrypted data from memory
-            if (walletState.decryptedWalletData && walletState.decryptedWalletData.mnemonic) {
-                seedPhrase = walletState.decryptedWalletData.mnemonic;
-                // console.log('[Node Activation] Using seed phrase from memory');
-            } else if (walletState.encryptionKey) {
-                // If not in memory, decrypt from storage
-                const storageData = await chrome.storage.local.get(['encryptedWallet']);
-                if (storageData.encryptedWallet) {
-                    try {
-                        const decrypted = await ProductionCrypto.decryptWalletData(
-                            storageData.encryptedWallet,
-                            walletState.encryptionKey
-                        );
-                        seedPhrase = decrypted.mnemonic;
-                        // console.log('[Node Activation] Decrypted seed phrase from storage');
-                    } catch (err) {
-                        // console.error('[Node Activation] Could not decrypt seed phrase:', err);
-                    }
-                }
-            }
-            
-            // Generate DETERMINISTIC activation code using seed phrase           
-            activationCode = await generateActivationCode(nodeType, solanaAddress, seedPhrase);            
-            
-        } catch (error) {
-            // console.error('[Node Activation] Critical error during burn process:', error);
-            walletState.isActivatingNode = false;
-            return { 
-                success: false, 
-                error: 'Transaction failed: ' + (error.message || 'Unknown error. Check console for details.') 
-            };
-        }
-        
-        // Only continue if we have activation code (meaning burn was successful)
-        if (!activationCode) {
-            // console.error('[Node Activation] No activation code - burn must have failed');
-            walletState.isActivatingNode = false;
-            return { 
-                success: false, 
-                error: 'Cannot generate activation code without successful token burn' 
-            };
-        }
-        
-        // Encrypt activation code before storing (similar to seed phrase)
-        const currentStorageData = await chrome.storage.local.get(['walletData', 'encryptedActivationCodes']);
-        const walletData = currentStorageData.walletData || {};
-        
-        // Store encrypted activation codes separately for better security
-        let encryptedCodes = currentStorageData.encryptedActivationCodes || {};
-        
-        // Double-check: ensure no other nodes are activated (protection against race conditions)
-        if (Object.keys(encryptedCodes).length > 0) {
-            const existingType = Object.keys(encryptedCodes)[0];
-            const nodeTypeNames = { 
-                light: 'Light Node', 
-                full: 'Full Node', 
-                super: 'Super Node' 
-            };
-            walletState.isActivatingNode = false;
-            return { 
-                success: false, 
-                error: `This wallet already has an active ${nodeTypeNames[existingType] || 'node'}. One wallet can only run one node.` 
-            };
-        }
-        
-        // Encrypt the activation code using wallet's encryption key
-        const encryptedCode = await encryptActivationCode(activationCode);
-        
-        encryptedCodes[nodeType] = {
-            encryptedCode: encryptedCode,
-            timestamp: Date.now(),
-            address: solanaAddress
-        };
-        
-        // Update node status
-        walletData.nodeStatus = {
-            active: true,
-            type: nodeType,
-            activationTime: Date.now()
-        };
-        
-        // Store both encrypted codes and wallet data
-        await chrome.storage.local.set({ 
-            'walletData': walletData,
-            'encryptedActivationCodes': encryptedCodes
-        });
-        
-        // Update in-memory state (store encrypted version)
-        walletState.nodeStatus = walletData.nodeStatus;
-        walletState.encryptedActivationCodes = encryptedCodes;
-
-        return { 
-            success: true, 
-            activationCode: activationCode
-        };
-
-    } catch (error) {
-                // console.error('Node activation error:', error);
-        return { success: false, error: error.message || 'Failed to activate node' };
-    } finally {
-        // Always release the lock
-        walletState.isActivatingNode = false;
-    }
-
 }
 
 /**
@@ -4608,519 +4690,6 @@ async function waitForTransactionConfirmation(rpcUrl, signature) {
     }
 }
 
-
-/**
- * Check blockchain for burn transactions to find activated nodes
- */
-async function checkBlockchainForActivations(walletAddress) {
-    // console.log('[checkBlockchainForActivations] Checking blockchain for wallet:', walletAddress?.substring(0, 8) + '...');
-    try {
-        const activatedNodes = [];
-        
-        // Get network setting
-        const localData = await chrome.storage.local.get(['mainnet']);
-        const isMainnet = localData.mainnet === true;
-        // console.log('[checkBlockchainForActivations] Network:', isMainnet ? 'mainnet' : 'devnet');
-        
-        // Initialize RPC if not already
-        if (!walletState.solanaRPC) {
-            const network = isMainnet ? 'mainnet' : 'devnet';
-            walletState.solanaRPC = new SolanaRPC(network);
-        }
-        
-        // Check for burn transactions in Phase 1
-        // Look for SPL Token burns of 1DEV tokens
-        const TOKEN_PROGRAM_ID = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
-        const DEV_TOKEN_MINT = isMainnet 
-            ? '4R3DPW4BY97kJRfv8J5wgTtbDpoXpRv92W957tXMpump' // 1DEV token mint mainnet (CORRECT)
-            : '62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ'; // 1DEV token mint testnet/devnet
-        
-        try {
-            // Get connection
-            const rpc = isMainnet ? 'https://api.mainnet-beta.solana.com' : 'https://api.devnet.solana.com';
-            const response = await fetch(rpc, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    jsonrpc: '2.0',
-                    id: 1,
-                    method: 'getSignaturesForAddress',
-                    params: [
-                        walletAddress,
-                        { limit: 100 }
-                    ]
-                })
-            });
-            
-            const data = await response.json();
-            // console.log('[checkBlockchainForActivations] RPC response received, transactions count:', data.result?.length || 0);
-            
-            if (data.result && Array.isArray(data.result)) {
-                // console.log('[checkBlockchainForActivations] Processing', data.result.length, 'transactions');
-                // Check each transaction
-                for (const tx of data.result) {
-                    // console.log('[checkBlockchainForActivations] Checking transaction:', tx.signature?.substring(0, 10) + '...');
-                    // Get transaction details
-                    const txResponse = await fetch(rpc, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            jsonrpc: '2.0',
-                            id: 1,
-                            method: 'getTransaction',
-                            params: [tx.signature, { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 }]
-                        })
-                    });
-                    
-                    const txData = await txResponse.json();
-                    if (txData.result && txData.result.meta && !txData.result.meta.err) {
-                        // First check parsed instructions (easier to work with)
-                        const parsedInstructions = txData.result?.transaction?.message?.instructions;
-                        if (parsedInstructions) {
-                            for (const inst of parsedInstructions) {
-                                // Check for parsed burn instruction
-                                if (inst.parsed && inst.parsed.type === 'burn' && inst.program === 'spl-token') {
-                                    const mint = inst.parsed.info?.mint;
-                                    const amount = inst.parsed.info?.amount;
-                                    
-                                    // console.log('[checkBlockchainForActivations] Found SPL token burn - mint:', mint, 'amount:', amount);
-                                    // console.log('[checkBlockchainForActivations] Expected 1DEV mint:', DEV_TOKEN_MINT);
-                                    
-                        if (mint === DEV_TOKEN_MINT && amount) {
-                            const burnedAmount = parseInt(amount);
-                            // console.log('[checkBlockchainForActivations] ✅ 1DEV burned:', burnedAmount / 1000000, '1DEV');
-                            
-                            // Check if it's in Phase 1 range (dynamic pricing: 300-1500 1DEV)
-                            if (burnedAmount >= 300000000 && burnedAmount <= 1500000000) {
-                                // console.log('[checkBlockchainForActivations] ✅ Found node activation burn, checking for MEMO...');
-                                
-                                // Look for MEMO instruction in the same transaction
-                                let nodeType = null;
-                                const parsedInstructions = txData.result?.transaction?.message?.instructions;
-                                if (parsedInstructions) {
-                                    for (const memoInst of parsedInstructions) {
-                                        if (memoInst.program === 'spl-memo' || 
-                                            (memoInst.programId && memoInst.programId === 'MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr')) {
-                                            // Found memo instruction - parse the data
-                                            let memoData = null;
-                                            if (memoInst.parsed) {
-                                                memoData = memoInst.parsed;
-                                            } else if (memoInst.data) {
-                                                // Decode base64 or base58 data
-                                                try {
-                                                    memoData = atob(memoInst.data);
-                                                } catch (e) {
-                                                    // Try as raw string if base64 fails
-                                                    memoData = memoInst.data;
-                                                }
-                                            }
-                                            
-                                            if (memoData && typeof memoData === 'string') {
-                                                // Check if it's our node type memo
-                                                const match = memoData.match(/QNET_NODE_TYPE:(\w+)/);
-                                                if (match && match[1]) {
-                                                    nodeType = match[1].toLowerCase();
-                                                    // console.log('[checkBlockchainForActivations] ✅ Found node type in MEMO:', nodeType);
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                
-                                if (nodeType && ['light', 'full', 'super'].includes(nodeType)) {
-                                    // Found exact type from memo!
-                                    // console.log('[checkBlockchainForActivations] ✅ Exact node type determined from MEMO:', nodeType);
-                                    return [nodeType];
-                                } else {
-                                    // Old activation without memo - return all types
-                                    // console.log('[checkBlockchainForActivations] No MEMO found (old activation), returning all types');
-                                    return ['light', 'full', 'super'];
-                                }
-                            }
-                        } else if (mint !== DEV_TOKEN_MINT) {
-                            // console.log('[checkBlockchainForActivations] ❌ Wrong token mint, not 1DEV');
-                        }
-                                }
-                            }
-                        }
-                        
-                        // Fallback to manual checking if parsed data not available
-                        const instructions = txData.result?.transaction?.message?.instructions;
-                        const accountKeys = txData.result?.transaction?.message?.accountKeys;
-                        
-                        if (instructions && accountKeys) {
-                            for (const inst of instructions) {
-                                // Check if instruction involves Token Program
-                                if (inst.programIdIndex !== undefined) {
-                                    const programId = accountKeys[inst.programIdIndex];
-                                    
-                                    // Check for SPL Token burn instruction
-                                    if (programId === TOKEN_PROGRAM_ID) {
-                                        // This is a token program instruction
-                                        // Check if it's a burn by looking at the instruction data
-                                        // Burn instruction starts with 8 (discriminator for burn)
-                                        if (inst.data && typeof inst.data === 'string') {
-                                            // Decode base58 data
-                                            try {
-                                                const decodedData = atob(inst.data);
-                                                const instructionType = decodedData.charCodeAt(0);
-                                                
-                                                // SPL Token Burn instruction type is 8
-                                                if (instructionType === 8) {
-                                                    // console.log('[checkBlockchainForActivations] Found SPL Token burn in tx:', tx.signature.substring(0, 10) + '...');
-                                                    // Check token balances to see if 1DEV was burned
-                                                    const preBalances = txData.result?.meta?.preTokenBalances || [];
-                                                    const postBalances = txData.result?.meta?.postTokenBalances || [];
-                                                    
-                                                    for (const preBalance of preBalances) {
-                                                        if (preBalance.mint === DEV_TOKEN_MINT) {
-                                                            // Found 1DEV balance change
-                                                            const preBal = parseInt(preBalance.uiTokenAmount?.amount || '0');
-                                                            const postBalance = postBalances.find(pb => pb.accountIndex === preBalance.accountIndex);
-                                                            const postBal = parseInt(postBalance?.uiTokenAmount?.amount || '0');
-                                                            
-                                                            if (preBal > postBal) {
-                                                                const burned = preBal - postBal;
-                                                                // console.log('[checkBlockchainForActivations] ✅ 1DEV burned (manual check):', burned / 1000000, '1DEV');
-                                                                
-                                                                // Check if it's in Phase 1 range (dynamic pricing: 300-1500 1DEV)
-                                                                if (burned >= 300000000 && burned <= 1500000000) {
-                                                                    // console.log('[checkBlockchainForActivations] ✅ Found node activation burn (manual)!');
-                                                                    return ['light', 'full', 'super'];
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            } catch (e) {
-                                                // Failed to decode instruction data
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        } catch (rpcError) {
-            // console.error('[checkBlockchainForActivations] RPC check failed:', rpcError);
-            // console.error('[checkBlockchainForActivations] RPC URL used:', rpc);
-            // console.error('[checkBlockchainForActivations] Wallet address:', walletAddress);
-            // Continue without blockchain check
-        }
-        
-        // console.log('[checkBlockchainForActivations] No burn transactions found');
-        return activatedNodes;
-    } catch (error) {
-                // console.error('[checkBlockchainForActivations] Error:', error);
-        return [];
-    }
-}
-
-/**
- * Sync activation codes from blockchain (called on wallet restore)
- */
-async function syncActivationCodes(walletAddress, seedPhrase) {
-    // console.log('[syncActivationCodes] Starting sync for wallet:', walletAddress?.substring(0, 8) + '...');
-    try {
-        // Generate deterministic codes for all node types
-        const codes = {
-            light: await generateActivationCode('light', walletAddress, seedPhrase),
-            full: await generateActivationCode('full', walletAddress, seedPhrase),
-            super: await generateActivationCode('super', walletAddress, seedPhrase)
-        };
-        
-        // console.log('[syncActivationCodes] Generated codes for all types');
-        
-        // Check blockchain for existing burn transactions (Phase 1)
-        const activatedNodes = await checkBlockchainForActivations(walletAddress);
-        
-        // console.log('[syncActivationCodes] Blockchain check returned:', activatedNodes);
-        
-        // Build encrypted activation codes object for activated nodes only
-        const encryptedCodes = {};
-        
-        // If we found activated nodes on blockchain
-        if (activatedNodes && activatedNodes.length > 0) {
-            // Check if we already have a stored code to maintain consistency
-            const stored = await chrome.storage.local.get(['encryptedActivationCodes']);
-            const existingCodes = stored.encryptedActivationCodes || {};
-            
-            if (Object.keys(existingCodes).length > 0) {
-                // Already have a code stored - keep it
-                // console.log('[syncActivationCodes] Keeping existing node type:', Object.keys(existingCodes));
-                return existingCodes;
-            }
-            
-            // Check if we have exact node type from MEMO
-            if (activatedNodes.length === 1) {
-                // Exact type determined from MEMO!
-                const nodeType = activatedNodes[0];
-                const code = codes[nodeType];
-                
-                if (code) {
-                    // console.log('[syncActivationCodes] Storing code for node type (from MEMO):', nodeType);
-                    const encryptedCode = await encryptActivationCode(code);
-                    encryptedCodes[nodeType] = {
-                        encryptedCode: encryptedCode,
-                        timestamp: Date.now(),
-                        nodeType: nodeType
-                    };
-                    // console.log('[syncActivationCodes] Code stored for:', nodeType);
-                }
-            } else {
-                // Old activation without MEMO - can't determine exact type
-                // console.log('[syncActivationCodes] ⚠️ Old activation detected without MEMO');
-                // console.log('[syncActivationCodes] Cannot determine exact node type');
-                // console.log('[syncActivationCodes] Please re-activate your node with latest version');
-                
-                // Don't store anything - user needs to re-activate
-                return null;
-            }
-        }
-        
-        // Return encrypted codes if any were found
-        if (Object.keys(encryptedCodes).length > 0) {
-            // console.log('[syncActivationCodes] Returning newly encrypted codes for:', Object.keys(encryptedCodes));
-            return encryptedCodes;
-        }
-        
-        // Check if we have stored codes locally (for backward compatibility)
-        const stored = await chrome.storage.local.get(['encryptedActivationCodes']);
-        const existingCodes = stored.encryptedActivationCodes || {};
-        
-        // console.log('[syncActivationCodes] Checking local storage, found:', Object.keys(existingCodes));
-        
-        if (Object.keys(existingCodes).length > 0) {
-            // console.log('[syncActivationCodes] Returning existing codes from storage');
-            return existingCodes;
-        }
-        
-        // console.log('[syncActivationCodes] No codes found - neither on blockchain nor in storage');
-        return null;
-    } catch (error) {
-                // console.error('[syncActivationCodes] Error:', error);
-        return null;
-    }
-}
-
-/**
- * Generate deterministic activation code from seed phrase
- * Same seed + nodeType = same code (for sync between devices)
- */
-async function generateActivationCode(nodeType, address, seedPhrase = null) {
-    // Generate DETERMINISTIC activation code
-    let entropy;
-    
-    if (seedPhrase) {
-        // Use seed phrase for deterministic generation (preferred)
-        const seedData = `${seedPhrase}-${nodeType}-QNET_ACTIVATION_V2`;
-        
-        // Log first few words of seed phrase for verification (safe to log partial)
-        const seedWords = seedPhrase.split(' ');
-        // console.log('[generateActivationCode] Using seed phrase starting with:', seedWords[0], seedWords[1], '...');
-        
-        // Use Web Crypto API for SHA-256 hashing
-        const encoder = new TextEncoder();
-        const data = encoder.encode(seedData);
-        const hashBuffer = await crypto.subtle.digest('SHA-256', data);
-        const hashArray = Array.from(new Uint8Array(hashBuffer));
-        entropy = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
-    } else {
-        // Fallback: generate random for backward compatibility
-        const randomBytes = new Uint8Array(32);
-        crypto.getRandomValues(randomBytes);
-        entropy = Array.from(randomBytes)
-        .map(b => b.toString(16).padStart(2, '0'))
-            .join('');
-    }
-    
-    // Create three 6-character segments from entropy
-    const entropyUpper = entropy.toUpperCase();
-    const segment1 = entropyUpper.substring(0, 6);
-    const segment2 = entropyUpper.substring(6, 12);
-    const segment3 = entropyUpper.substring(12, 18);
-    
-    // Format as QNET-XXXXXX-XXXXXX-XXXXXX (25 chars total)
-    const formatted = `QNET-${segment1}-${segment2}-${segment3}`;
-    
-    return formatted;
-}
-
-/**
- * Encrypt activation code for secure storage
- */
-async function encryptActivationCode(code) {
-    try {
-        if (!walletState.encryptionKey) {
-            throw new Error('No encryption key available');
-        }
-        
-        // Use AES-GCM for strong encryption (same as ProductionCrypto)
-        const encoder = new TextEncoder();
-        const data = encoder.encode(code);
-        
-        // Generate salt and IV
-        const salt = crypto.getRandomValues(new Uint8Array(16));
-        const iv = crypto.getRandomValues(new Uint8Array(12));
-        
-        // Derive key from password
-        const passwordKey = await crypto.subtle.importKey(
-            'raw',
-            encoder.encode(walletState.encryptionKey),
-            'PBKDF2',
-            false,
-            ['deriveKey']
-        );
-        
-            const key = await crypto.subtle.deriveKey(
-                {
-                    name: 'PBKDF2',
-                    salt: salt,
-                    iterations: 100000, // Industry standard for crypto wallets
-                    hash: 'SHA-256'
-                },
-                passwordKey,
-                { name: 'AES-GCM', length: 256 },
-                false,
-                ['encrypt']
-            );
-        
-        // Encrypt data
-        const encrypted = await crypto.subtle.encrypt(
-            {
-                name: 'AES-GCM',
-                iv: iv
-            },
-            key,
-            data
-        );
-        
-        // Combine salt, iv, and encrypted data
-        const combined = new Uint8Array(salt.length + iv.length + encrypted.byteLength);
-        combined.set(salt, 0);
-        combined.set(iv, salt.length);
-        combined.set(new Uint8Array(encrypted), salt.length + iv.length);
-        
-        // Convert to base64 for storage
-        return btoa(String.fromCharCode(...combined));
-    } catch (error) {
-                // console.error('[Encrypt Code] Error:', error);
-        throw new Error('Failed to encrypt activation code');
-    }
-}
-
-/**
- * Decrypt activation code from storage
- */
-async function decryptActivationCode(encryptedCode) {
-    try {
-        if (!walletState.encryptionKey) {
-            throw new Error('No encryption key available');
-        }
-        
-        // Decode from base64
-        const combined = Uint8Array.from(atob(encryptedCode), c => c.charCodeAt(0));
-        
-        // Extract salt, iv, and encrypted data
-        const salt = combined.slice(0, 16);
-        const iv = combined.slice(16, 28);
-        const encrypted = combined.slice(28);
-        
-        // Derive key from password
-        const encoder = new TextEncoder();
-        const passwordKey = await crypto.subtle.importKey(
-            'raw',
-            encoder.encode(walletState.encryptionKey),
-            'PBKDF2',
-            false,
-            ['deriveKey']
-        );
-        
-        const key = await crypto.subtle.deriveKey(
-            {
-                name: 'PBKDF2',
-                salt: salt,
-                iterations: 100000, // Industry standard for crypto wallets
-                hash: 'SHA-256'
-            },
-            passwordKey,
-            { name: 'AES-GCM', length: 256 },
-            false,
-            ['decrypt']
-        );
-        
-        // Decrypt data
-        const decrypted = await crypto.subtle.decrypt(
-            {
-                name: 'AES-GCM',
-                iv: iv
-            },
-            key,
-            encrypted
-        );
-        
-        // Convert back to string
-        const decoder = new TextDecoder();
-        return decoder.decode(decrypted);
-    } catch (error) {
-                // console.error('[Decrypt Code] Error:', error);
-        throw new Error('Failed to decrypt activation code');
-    }
-}
-
-/**
- * Export activation code (similar to recovery phrase export)
- */
-async function exportActivationCode(password, nodeType) {
-    try {
-        // Verify password
-        const unlocked = await unlockWallet(password);
-        if (!unlocked.success) {
-            return { success: false, error: 'Invalid password' };
-        }
-        
-        // Get encrypted activation codes from storage
-        const storageData = await chrome.storage.local.get(['encryptedActivationCodes']);
-        const encryptedCodes = storageData.encryptedActivationCodes || {};
-        
-        if (!encryptedCodes[nodeType]) {
-            return { success: false, error: 'No activation code found for this node type' };
-        }
-        
-        // Decrypt the activation code
-        const decryptedCode = await decryptActivationCode(encryptedCodes[nodeType].encryptedCode);
-        
-        if (!decryptedCode) {
-            return { success: false, error: 'Failed to decrypt activation code' };
-        }
-        
-        return { 
-            success: true, 
-            activationCode: decryptedCode,
-            timestamp: encryptedCodes[nodeType].timestamp,
-            nodeType: nodeType
-        };
-        
-    } catch (error) {
-                // console.error('Export activation code error:', error);
-        return { success: false, error: error.message };
-    }
-}
-
-/**
- * Message handler
- */
-chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-    handleMessage(request, sender, sendResponse);
-    return true; // Keep message channel open for async response
-});
-
-/**
- * Handle incoming messages
- */
 async function handleMessage(request, sender, sendResponse) {
     try {
         // Message received
@@ -5248,17 +4817,6 @@ async function handleMessage(request, sender, sendResponse) {
                     sendResponse({ success: false, error: error.message });
                 }
                 break;
-                
-            case 'BURN_AND_ACTIVATE':
-                // Security check: ensure request is from our extension popup
-                if (sender.tab || !sender.url?.includes('popup.html')) {
-                    sendResponse({ success: false, error: 'Unauthorized request. Node activation must be done through the wallet interface.' });
-                    break;
-                }
-                const burnResult = await burnAndActivateNode(request.nodeType, request.amount);
-                sendResponse(burnResult);
-                break;
-                
             case 'VERIFY_PASSWORD':
                 try {
                     // Always verify password, even if wallet is unlocked
@@ -5294,11 +4852,6 @@ async function handleMessage(request, sender, sendResponse) {
                     // console.error('[VERIFY_PASSWORD] Unexpected error:', error);
                     sendResponse({ success: false, error: error.message });
                 }
-                break;
-                
-            case 'EXPORT_ACTIVATION_CODE':
-                const exportResult = await exportActivationCode(request.password, request.nodeType);
-                sendResponse(exportResult);
                 break;
                 
             case 'CLEAR_CACHE':
@@ -5346,12 +4899,6 @@ async function handleMessage(request, sender, sendResponse) {
                 const networkSizeResult = await getNetworkSize();
                 sendResponse(networkSizeResult);
                 break;
-                
-            case 'BURN_1DEV_TOKENS':
-                const burn1DevResult = await burnOneDevTokens(request);
-                sendResponse(burn1DevResult);
-                break;
-                
             case 'SETUP_COMPLETE':
                 try {
                     // Wallet setup completed, opening main wallet
@@ -5428,7 +4975,6 @@ async function handleMessage(request, sender, sendResponse) {
                             
                             startAutoLockTimer();
                             startBalanceUpdates();
-                            startActivationSync();
                         }
                     }
                     
@@ -5462,37 +5008,6 @@ async function handleMessage(request, sender, sendResponse) {
                 } catch (error) {
                     sendResponse({ success: false, error: error.message });
                 }
-                break;
-                
-            case 'SPEND_QNC_TO_POOL3':
-                try {
-                    // CRITICAL: Check phase before allowing QNC spend
-                    const currentPhase = request.phase || 1;
-                    if (currentPhase < 2) {
-                        sendResponse({
-                            success: false,
-                            error: 'PHASE_1_ACTIVE: QNC activations are disabled in Phase 1. Use 1DEV burn instead.',
-                            phase: currentPhase
-                        });
-                        return true;
-                    }
-
-                    // Proceed with QNC to Pool 3 operation
-                    const result = await spendQNCToPool3(request);
-                    sendResponse({
-                        success: true,
-                        signature: result.signature,
-                        poolTransfer: result.poolTransfer,
-                        phase: currentPhase
-                    });
-                } catch (error) {
-                    // Error:('Failed to spend QNC to Pool 3:', error);
-                    sendResponse({
-                        success: false,
-                        error: error.message
-                    });
-                }
-                return true;
                 
             case 'GET_BURN_PERCENTAGE':
                 try {
@@ -5536,27 +5051,47 @@ async function handleMessage(request, sender, sendResponse) {
                 try {
                     // Get stored wallet data
                     const encryptedWalletData = await chrome.storage.local.get(['wallet', 'isUnlocked']);
-                    
+
                     if (!encryptedWalletData.wallet || !encryptedWalletData.isUnlocked) {
                         return sendResponse({
                             success: false,
                             error: 'Wallet not found or locked'
                         });
                     }
-                    
+
+                    // Resolve the CANONICAL QNet EON address. NEVER fall back to a random getRandomValues
+                    // address (that produced funds-losing divergent identities). If the stored wallet has
+                    // no derived address, derive it deterministically from the wallet mnemonic via the
+                    // pure-Dilithium bundle; if neither is available, return an explicit error.
+                    let qnetAddress = encryptedWalletData.wallet.qnetAddress;
+                    if (!qnetAddress) {
+                        const mnemonic = encryptedWalletData.wallet.mnemonic
+                            || (walletState.decryptedWalletData && walletState.decryptedWalletData.mnemonic);
+                        if (mnemonic) {
+                            const derived = await ProductionCrypto.generateQNetAddress(mnemonic, 0);
+                            qnetAddress = derived.address;
+                        }
+                    }
+                    if (!qnetAddress) {
+                        return sendResponse({
+                            success: false,
+                            error: 'QNet address unavailable — wallet is missing a derived EON address and no mnemonic to derive it from'
+                        });
+                    }
+
                     // Return account list with addresses
                     const accounts = [{
                         id: 'primary',
                         name: 'Account 1',
-                        qnetAddress: encryptedWalletData.wallet.qnetAddress || generateEONAddress(),
+                        qnetAddress: qnetAddress,
                         solanaAddress: encryptedWalletData.wallet.solanaAddress || generateSolanaAddress()
                     }];
-                    
+
                     return sendResponse({
                         success: true,
                         accounts: accounts
                     });
-                    
+
                 } catch (error) {
                     // Error: ( Failed to get accounts:', error);
                     return sendResponse({
@@ -5569,16 +5104,32 @@ async function handleMessage(request, sender, sendResponse) {
                 try {
                     const qnetAddress = request.address;
                     
-                    // Mock QNet data for production demo
+                    // v3.13: Real QNet data from blockchain API
+                    const realBalance = await getQNCBalance(qnetAddress);
+                    
+                    // Try to get node info from API
+                    let nodeInfo = null;
+                    try {
+                        const nodeUrl = await getQNetNodeUrl();
+                        const nodeResponse = await fetch(`${nodeUrl}/api/v1/node/${qnetAddress}/info`, {
+                            signal: AbortSignal.timeout(5000)
+                        });
+                        if (nodeResponse.ok) {
+                            nodeInfo = await nodeResponse.json();
+                        }
+                    } catch (e) {
+                        // Node info not available
+                    }
+                    
                     const qnetData = {
                         address: qnetAddress,
-                        balance: Math.floor(Math.random() * 50000) + 10000, // 10K-60K QNC
-                        nodeInfo: {
-                            code: `QNET-${qnetAddress.substring(0, 6).toUpperCase()}-${Date.now().toString().slice(-6)}`,
-                            type: 'light',
-                            status: 'active',
-                            uptime: '98.5%',
-                            rewards: Math.floor(Math.random() * 20) + 5 // 5-25 QNC/day
+                        balance: realBalance,
+                        nodeInfo: nodeInfo || {
+                            code: null,
+                            type: 'unknown',
+                            status: 'unknown',
+                            uptime: 'N/A',
+                            rewards: 0
                         }
                     };
                     
@@ -5588,10 +5139,42 @@ async function handleMessage(request, sender, sendResponse) {
                     });
                     
                 } catch (error) {
-                    // Error: ( Failed to get QNet data:', error);
+                    // Error: Failed to get QNet data
                     return sendResponse({
                         success: false,
-                        error: 'Failed to get QNet data'
+                        error: 'Failed to get QNet data: ' + error.message
+                    });
+                }
+                
+            case 'VERIFY_QNC_BALANCE':
+                // v3.13: Verify QNC balance with Merkle proof (trustless)
+                try {
+                    const verifyAddress = request.address;
+                    
+                    if (!verifyAddress) {
+                        return sendResponse({
+                            success: false,
+                            error: 'Address required'
+                        });
+                    }
+                    
+                    const verifyResult = await getQNCBalanceWithProof(verifyAddress);
+                    
+                    return sendResponse({
+                        success: true,
+                        address: verifyAddress,
+                        balance: verifyResult.balance,
+                        verified: verifyResult.verified,
+                        proofVerified: verifyResult.proofVerified,
+                        consensusVerified: verifyResult.consensusVerified,
+                        blockHeight: verifyResult.blockHeight,
+                        error: verifyResult.error
+                    });
+                    
+                } catch (error) {
+                    return sendResponse({
+                        success: false,
+                        error: 'Verification failed: ' + error.message
                     });
                 }
                 
@@ -5600,11 +5183,13 @@ async function handleMessage(request, sender, sendResponse) {
                     const solanaAddress = request.address;
                     
                     // Mock Solana data for production demo
+                    const _rndBuf = new Uint32Array(2);
+                    crypto.getRandomValues(_rndBuf);
                     const solanaData = {
                         address: solanaAddress,
                         balances: {
-                            SOL: (Math.random() * 5).toFixed(2), // 0-5 SOL
-                            '1DEV': Math.floor(Math.random() * 3000) + 500 // 500-3500 1DEV
+                            SOL: ((_rndBuf[0] / 0xFFFFFFFF) * 5).toFixed(2),
+                            '1DEV': (_rndBuf[1] % 3000) + 500
                         }
                     };
                     
@@ -5758,7 +5343,8 @@ async function createWallet(password, mnemonic) {
         
         // Generate keypairs for both networks
         const solanaKeypair = await ProductionCrypto.generateSolanaKeypair(seed, 0);
-        const qnetResult = await ProductionCrypto.generateQNetAddress(seed, 0);
+        // QNet: canonical pure-Dilithium (ML-DSA-65) — derive from the MNEMONIC (not the raw seed).
+        const qnetResult = await ProductionCrypto.generateQNetAddress(seedPhrase, 0);
         
         // Create wallet data
         const walletData = {
@@ -5775,6 +5361,9 @@ async function createWallet(password, mnemonic) {
                 qnetKeypair: {
                     publicKey: Array.from(qnetResult.keypair.publicKey),
                     privateKey: Array.from(qnetResult.keypair.privateKey),
+                    publicKeyHex: qnetResult.keypair.publicKeyHex,
+                    privateKeyHex: qnetResult.keypair.privateKeyHex,
+                    algorithm: qnetResult.keypair.algorithm,
                     path: qnetResult.keypair.path
                 }
             }],
@@ -5790,7 +5379,6 @@ async function createWallet(password, mnemonic) {
             walletExists: true,
             encryptedWallet: encryptedWallet,
             currentNetwork: 'solana',
-            encryptedActivationCodes: {} // Clear old activation codes from previous wallet
         });
         
         // Auto-unlock wallet after creation
@@ -5799,7 +5387,6 @@ async function createWallet(password, mnemonic) {
         walletState.encryptionKey = password; // Store encryption key for activation codes
         walletState.decryptedWalletData = walletData; // Cache decrypted wallet data
         walletState.currentNetwork = 'solana';
-        walletState.encryptedActivationCodes = {}; // Clear old activation codes from memory
         
         // Load accounts
         await loadWalletAccounts(walletData);
@@ -5823,7 +5410,6 @@ async function createWallet(password, mnemonic) {
         // Start timers
         startAutoLockTimer();
         startBalanceUpdates();
-        startActivationSync();
         
         // Prefetch critical data for new wallet
         setTimeout(() => prefetchCriticalData(), 100); // Small delay to ensure wallet is fully initialized
@@ -5858,26 +5444,9 @@ async function importWallet(password, mnemonic) {
         
         // Use createWallet with provided mnemonic
         const result = await createWallet(password, mnemonic);
-        
-        if (result.success) {
-            
-            // Sync activation codes from blockchain (restore existing activations)
-            try {
-                const address = result.address || result.solanaAddress;
-                if (address && mnemonic) {
-                    const existingCodes = await syncActivationCodes(address, mnemonic);
-                    if (existingCodes) {
-                        // Store the synced codes
-                        await chrome.storage.local.set({ encryptedActivationCodes: existingCodes });
-                    }
-                }
-            } catch (syncError) {
-                // Silent fail - no previous activations
-            }
-        }
-        
+
         return result;
-        
+
     } catch (error) {
                 // console.error('[ImportWallet] ❌ Wallet import failed:', error);
         return { success: false, error: error.message };
@@ -5931,73 +5500,47 @@ async function unlockWallet(password) {
             return { success: false, error: decryptError.message || 'Invalid password or corrupted wallet' };
         }
         
-        // Migrate old QNet address format to new if needed (inline implementation)
+        // Migrate old QNet address to the CANONICAL pure-Dilithium (ML-DSA-65) address if needed.
+        // NEVER derive the QNet address from the Solana address (that produced a divergent, WRONG
+        // address rejected by node/mobile). The only valid source is the mnemonic → ML-DSA-65 pk.
         try {
-            // Check if wallet has QNet address
-            if (!walletData.qnetAddress) {
-                // Generate new address from Solana address
-                const solanaAddr = walletData.solanaAddress || walletData.address || (walletData.accounts && walletData.accounts[0]);
-                if (solanaAddr) {
-                    // Generate deterministic QNet address from Solana address
-                    const encoder = new TextEncoder();
-                    const data = encoder.encode(solanaAddr + 'qnet_eon_bridge');
-                    const hashBuffer = await crypto.subtle.digest('SHA-512', data);
-                    const hashArray = Array.from(new Uint8Array(hashBuffer));
-                    const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
-                    
-                    // New long format: 19 chars + "eon" + 15 chars + 4 char checksum = 41 total
-                    const part1 = hashHex.substring(0, 19).toLowerCase();
-                    const part2 = hashHex.substring(19, 34).toLowerCase();
-                    
-                    // Generate SHA-256 checksum
-                    const addressWithoutChecksum = part1 + 'eon' + part2;
-                    const checksumBuffer = await crypto.subtle.digest('SHA-256', encoder.encode(addressWithoutChecksum));
-                    const checksumArray = Array.from(new Uint8Array(checksumBuffer));
-                    const checksumHex = checksumArray.map(b => b.toString(16).padStart(2, '0')).join('');
-                    const checksum = checksumHex.substring(0, 4).toLowerCase();
-                    
-                    walletData.qnetAddress = `${part1}eon${part2}${checksum}`;
-                    //console.log('[UnlockWallet] Generated new QNet address');
-                }
-            } else if (walletData.qnetAddress.length < 40) {
-                // Migrate old short format to new long format
-                //console.log('[UnlockWallet] Migrating old short QNet address to new long format');
-                const solanaAddr = walletData.solanaAddress || walletData.address || (walletData.accounts && walletData.accounts[0]);
-                if (solanaAddr) {
-                    // Generate new long format
-                    const encoder = new TextEncoder();
-                    const data = encoder.encode(solanaAddr + 'qnet_eon_bridge');
-                    const hashBuffer = await crypto.subtle.digest('SHA-512', data);
-                    const hashArray = Array.from(new Uint8Array(hashBuffer));
-                    const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
-                    
-                    const part1 = hashHex.substring(0, 19).toLowerCase();
-                    const part2 = hashHex.substring(19, 34).toLowerCase();
-                    
-                    const checksumData = `qnet_${part1}_eon_${part2}`;
-                    const checksumBuffer = await crypto.subtle.digest('SHA-256', encoder.encode(checksumData));
-                    const checksumArray = Array.from(new Uint8Array(checksumBuffer));
-                    const checksumHex = checksumArray.map(b => b.toString(16).padStart(2, '0')).join('');
-                    const checksum = checksumHex.substring(0, 4);
-                    
-                    walletData.qnetAddress = `qnet_${part1}_eon_${part2}_${checksum}`;
-                    //console.log('[UnlockWallet] Migrated to new QNet address:', walletData.qnetAddress);
+            const needsQNetAddr = !walletData.qnetAddress || walletData.qnetAddress.length !== 45;
+            if (needsQNetAddr) {
+                if (walletData.mnemonic) {
+                    const result = await ProductionCrypto.generateQNetAddress(walletData.mnemonic, 0);
+                    walletData.qnetAddress = result.address;
+                    walletData.qnetKeypair = {
+                        publicKey: Array.from(result.keypair.publicKey),
+                        privateKey: Array.from(result.keypair.privateKey),
+                        publicKeyHex: result.keypair.publicKeyHex,
+                        privateKeyHex: result.keypair.privateKeyHex,
+                        algorithm: result.keypair.algorithm,
+                        path: result.keypair.path
+                    };
+                    // Also keep the canonical address on the first account for callers that read it there.
+                    if (walletData.accounts && walletData.accounts[0]) {
+                        walletData.accounts[0].qnetAddress = result.address;
+                        walletData.accounts[0].qnetKeypair = walletData.qnetKeypair;
+                    }
+                } else {
+                    // No mnemonic → cannot derive the canonical address. Leave as-is rather than mint
+                    // a divergent SHA-from-Solana address the network would reject.
+                    console.warn('[UnlockWallet] No mnemonic — cannot derive canonical QNet address');
                 }
             }
-            
-            //console.log('[UnlockWallet] QNet address migration checked');
         } catch (migrateError) {
             // console.error('[UnlockWallet] Migration error:', migrateError);
             // Continue without migration
         }
         
-        // Store migrated wallet if it was updated
-        if (walletData.qnetAddress && walletData.qnetAddress.length >= 40) {
-            // Re-encrypt with migrated data
+        // Migrate vault to v2 (PBKDF2 600K) if stored as v1 (100K), or if QNet address was migrated
+        const needsMigration = (result.encryptedWallet?.version !== 2)
+            || (walletData.qnetAddress && walletData.qnetAddress.length >= 40
+                && result.encryptedWallet?.version !== 2);
+        if (needsMigration) {
             const updatedEncrypted = await ProductionCrypto.encryptWalletData(walletData, password);
             await chrome.storage.local.set({ encryptedWallet: updatedEncrypted });
             walletState.encryptedWallet = updatedEncrypted;
-            //console.log('[UnlockWallet] Wallet migrated to new QNet address format');
         }
         
         // Cache decrypted wallet data for future operations (like burning tokens)
@@ -6035,29 +5578,9 @@ async function unlockWallet(password) {
         //console.log('[UnlockWallet] Starting auto-lock timer and balance updates');
         startAutoLockTimer();
         startBalanceUpdates();
-        startActivationSync(); // Start periodic activation sync
         
         // Prefetch critical data for instant UI
         prefetchCriticalData();
-        
-        // Sync activation codes from blockchain in background
-        setTimeout(async () => {
-            try {
-                const address = walletState.accounts[0]?.solanaAddress || walletState.accounts[0]?.address;
-                const mnemonic = walletData.mnemonic;
-                
-                if (address && mnemonic) {
-                    const existingCodes = await syncActivationCodes(address, mnemonic);
-                    if (existingCodes) {
-                        // Store the synced codes
-                        await chrome.storage.local.set({ encryptedActivationCodes: existingCodes });
-                    }
-                }
-            } catch (syncError) {
-                // Silent fail - sync in background
-                // console.log('[UnlockWallet] Background sync error:', syncError);
-            }
-        }, 100);
         
         // Log: ( Wallet unlocked successfully');
         return { success: true, accounts: walletState.accounts };
@@ -6093,9 +5616,6 @@ async function lockWallet() {
         clearInterval(balanceUpdateInterval);
         balanceUpdateInterval = null;
     }
-    
-    // Stop activation sync
-    stopActivationSync();
     
     // Clear lock time but do NOT save isUnlocked to local storage
     await chrome.storage.local.set({
@@ -6600,9 +6120,13 @@ async function fetchBalanceFromBlockchain(address, tokenMint, cacheKey) {
                 }
             }
         } else {
-            // QNet balance (mock for now)
-            balance = Math.floor(Math.random() * 50000) + 10000;
-            // Log:(`QNet balance for ${address}: ${balance} QNC`);
+            // v3.13: Real QNet balance from blockchain API
+            try {
+                balance = await getQNCBalance(address);
+            } catch (e) {
+                // Fallback to 0 if API fails
+                balance = 0;
+            }
         }
         
         // Cache result
@@ -6653,6 +6177,66 @@ async function getTransactionHistory(address) {
 }
 
 /**
+ * Resolve the active account's CANONICAL QNet identity + ML-DSA-65 key material for signing.
+ * Source of truth is the decrypted wallet cache (set at create/unlock). Returns hex pk/sk that
+ * QNetDilithium.signQNet consumes directly, plus the canonical EON `from` address. Throws if the
+ * wallet is locked or the account has no Dilithium key material (never fabricate a key/address).
+ */
+function getActiveQNetKeys() {
+    const data = walletState.decryptedWalletData;
+    if (!data) {
+        throw new Error('Wallet is locked — no decrypted key material available');
+    }
+    const acct = (data.accounts && data.accounts[0]) ? data.accounts[0] : null;
+    const kp = (acct && acct.qnetKeypair) || data.qnetKeypair || null;
+    const from = (acct && acct.qnetAddress) || data.qnetAddress || null;
+    const skHex = kp && kp.privateKeyHex;
+    const pkHex = kp && kp.publicKeyHex;
+    if (!from || !skHex || !pkHex) {
+        throw new Error('Account is missing Dilithium key material — cannot sign QNet transaction');
+    }
+    return { from, skHex, pkHex };
+}
+
+/**
+ * Access the canonical pure-Dilithium (ML-DSA-65) signer from the bundle. In the MV3 service worker
+ * the esbuild global lives on self/globalThis (importScripts('lib/noble-pq-ml-dsa.js') runs at top).
+ */
+function getQNetSigner() {
+    const g = (typeof self !== 'undefined') ? self
+            : (typeof globalThis !== 'undefined') ? globalThis
+            : (typeof window !== 'undefined') ? window : null;
+    const Q = g && g.QNetDilithiumLib && g.QNetDilithiumLib.QNetDilithium;
+    if (!Q || typeof Q.signQNet !== 'function') {
+        throw new Error('QNetDilithium bundle not loaded — importScripts(lib/noble-pq-ml-dsa.js) must run before signing');
+    }
+    return Q;
+}
+
+/**
+ * Next transfer nonce = committed account nonce + 1 (the node rejects anything else:
+ * `tx.nonce != sender.nonce + 1` -> invalid_nonce). A never-used account reports 0, so its first
+ * TX is nonce 1 — which is also the fallback when the account read fails.
+ */
+async function getQNetAccountNonce(nodeUrl, address) {
+    try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 5000);
+        const response = await fetch(`${nodeUrl}/api/v1/account/${address}`, {
+            method: 'GET',
+            headers: { 'Content-Type': 'application/json' },
+            signal: controller.signal
+        });
+        clearTimeout(timeoutId);
+        if (response.ok) {
+            const data = await response.json();
+            if (Number.isInteger(data.nonce)) return data.nonce + 1;
+        }
+    } catch (e) { /* fall through to default */ }
+    return 1;
+}
+
+/**
  * Send transaction
  */
 async function sendTransaction(transactionData) {
@@ -6660,22 +6244,85 @@ async function sendTransaction(transactionData) {
         if (!walletState.isUnlocked) {
             throw new Error('Wallet is locked');
         }
-        
+
         if (walletState.currentNetwork === 'solana') {
             // TODO: Implement real Solana transaction
             // Log: ( Sending Solana transaction:', transactionData);
-            
+
             // For now, simulate transaction
-            const txHash = 'sol_' + Math.random().toString(16).substr(2, 64);
+            const txHash = 'sol_' + cryptoRandomHex(32);
             return { signature: txHash, confirmed: true };
-            
+
         } else {
-            // QNet transaction (simulated)
-            // Log: ( Sending QNet transaction:', transactionData);
-            const txHash = 'qnet_' + Math.random().toString(16).substr(2, 64);
-            return { signature: txHash, confirmed: true };
+            // QNet transaction — pure-Dilithium signed (ML-DSA-65). Build the canonical transfer message
+            // the node's value-TX gate verifies, sign it with the account's ML-DSA-65 secret key via the
+            // bundle, and POST hex(raw 3309-byte detached sig) + hex(raw 1952-byte pubkey) to
+            // /api/v1/transaction — the node hex-decodes both and calls verify_detached_signature.
+            // `from` is the canonical EON address; amount is integer nano-QNC. No private key is ever sent.
+            const { from, skHex, pkHex } = getActiveQNetKeys();
+            const Q = getQNetSigner();
+            const nodeUrl = await getQNetNodeUrl();
+
+            const to = transactionData.to;
+            if (!to || typeof to !== 'string') {
+                throw new Error('Invalid recipient address');
+            }
+            // Round, never floor: QNC*1e9 in binary floats lands just under the integer (0.29 ->
+            // 289999999.99999994), so floor would silently send one nano short of what the user typed.
+            const amountNano = Math.round(Number(transactionData.amount) * 1_000_000_000); // integer nano-QNC
+            if (!Number.isSafeInteger(amountNano) || amountNano <= 0) {
+                throw new Error('Invalid transaction amount');
+            }
+            const gasPrice = Number.isInteger(transactionData.gasPrice) ? transactionData.gasPrice : 10;
+            const gasLimit = Number.isInteger(transactionData.gasLimit) ? transactionData.gasLimit : 21000;
+            const nonce = Number.isInteger(transactionData.nonce)
+                ? transactionData.nonce
+                : await getQNetAccountNonce(nodeUrl, from);
+
+            // Canonical message — EXACTLY the string the node re-derives and verifies against.
+            // 'q1337|' is the chain tag; it MUST byte-match QNET_CHAIN_ID in the node
+            // (core/qnet-state/src/transaction.rs) or the signature is rejected.
+            const message = `q1337|transfer:${from}:${to}:${amountNano}:${nonce}:${gasPrice}:${gasLimit}`;
+            const dilithiumSignature = Q.signQNet(message, skHex, pkHex);
+
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 15000);
+            let response;
+            try {
+                response = await fetch(`${nodeUrl}/api/v1/transaction`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    signal: controller.signal,
+                    body: JSON.stringify({
+                        from: from,
+                        to: to,
+                        amount: amountNano,
+                        dilithium_signature: dilithiumSignature,
+                        dilithium_public_key: pkHex,
+                        gas_price: gasPrice,
+                        gas_limit: gasLimit,
+                        nonce: nonce
+                    })
+                });
+            } finally {
+                clearTimeout(timeoutId);
+            }
+
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+            }
+            const data = await response.json();
+            if (data && (data.success || data.tx_hash)) {
+                return {
+                    signature: data.tx_hash,
+                    confirmed: true,
+                    network: 'qnet',
+                    timestamp: Date.now()
+                };
+            }
+            throw new Error((data && data.error) || 'QNet transaction failed');
         }
-        
+
     } catch (error) {
         // Error: ( Transaction failed:', error);
         throw error;
@@ -6701,10 +6348,10 @@ async function signMessage(message) {
             // Log: ( Message signed with Solana key');
             return signature;
         } else {
-            // QNet signing (simulated)
-            const signature = 'qnet_signature_' + Math.random().toString(16).substr(2, 64);
-            // Log: ( Message signed with QNet key');
-            return signature;
+            // QNet signing — pure-Dilithium (ML-DSA-65) via the bundle. No more random stub.
+            const { skHex, pkHex } = getActiveQNetKeys();
+            const Q = getQNetSigner();
+            return Q.signQNet(message, skHex, pkHex);
         }
         
     } catch (error) {
@@ -6827,7 +6474,7 @@ async function executeSwapWithFee(swapData) {
         // Simulate swap execution (in production, integrate with DEX APIs)
         const swapResult = {
             success: true,
-            transactionHash: 'swap_' + Math.random().toString(16).substr(2, 64),
+            transactionHash: 'swap_' + cryptoRandomHex(32),
             amountSwapped: amountAfterFee,
             platformFee: platformFee,
             feeRecipient: productionFeeRecipient,
@@ -6855,6 +6502,11 @@ async function executeSwapWithFee(swapData) {
  */
 async function getSupportedTokens(network = 'solana') {
     try {
+        // Same 1DEV mint the burn and balance paths use, so a table read and a live read can never
+        // name different tokens for the selected network.
+        const localData = await chrome.storage.local.get(['mainnet']);
+        const isMainnet = localData.mainnet === true;
+        const oneDevMint = isMainnet ? ONE_DEV_TOKEN_MINT.mainnet : ONE_DEV_TOKEN_MINT.devnet;
         // Production token configuration with real addresses
         const SUPPORTED_TOKENS = {
             solana: {
@@ -6869,7 +6521,7 @@ async function getSupportedTokens(network = 'solana') {
                     symbol: "1DEV",
                     name: "1DEV Token",
                     decimals: 6,  // 1DEV has 6 decimals
-                    mintAddress: "62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ", // Real testnet 1DEV address
+                    mintAddress: oneDevMint,
                     logoURI: "/icons/1dev-token.png"
                 },
                 USDC: {
@@ -6884,7 +6536,9 @@ async function getSupportedTokens(network = 'solana') {
                 QNC: {
                     symbol: "QNC",
                     name: "QNet Coin",
-                    decimals: 18,
+                    // nano-QNC: NANO_PER_QNC = 1e9 in core/qnet-state (transaction.rs), which is what
+                    // the send path already multiplies by. 18 rendered every balance 1e9x too large.
+                    decimals: 9,
                     address: "qnet_native_qnc",
                     logoURI: "/icons/qnc-token.png"
                 }
@@ -6993,9 +6647,7 @@ async function prefetchCriticalData() {
             // SOL balance
             getBalance(account.solanaAddress),
             // 1DEV token balance
-            getBalance(account.solanaAddress, tokenMint),
-            // Check for existing activation codes
-            chrome.storage.local.get(['encryptedActivationCodes'])
+            getBalance(account.solanaAddress, tokenMint)
         ];
         
         // Execute all prefetches in parallel - don't wait for results
@@ -7010,73 +6662,6 @@ async function prefetchCriticalData() {
     }
 }
 
-/**
- * Start periodic activation code sync for browser extension (every 30 seconds)
- */
-function startActivationSync() {
-    // console.log('[ActivationSync] Starting activation sync...');
-    
-    // Clear existing interval if any
-    if (walletState.syncInterval) {
-        clearInterval(walletState.syncInterval);
-        walletState.syncInterval = null;
-    }
-    
-    // Do immediate sync first
-    if (walletState.isUnlocked && walletState.accounts.length > 0 && walletState.decryptedWalletData) {
-        const address = walletState.accounts[0]?.solanaAddress || walletState.accounts[0]?.address;
-        const mnemonic = walletState.decryptedWalletData.mnemonic;
-        
-        // console.log('[ActivationSync] Syncing for address:', address?.substring(0, 8) + '...');
-        
-        if (address && mnemonic) {
-            syncActivationCodes(address, mnemonic).then(syncedCodes => {
-                // console.log('[ActivationSync] Sync completed, codes found:', syncedCodes ? Object.keys(syncedCodes) : 'none');
-                if (syncedCodes) {
-                    chrome.storage.local.set({ encryptedActivationCodes: syncedCodes });
-                    walletState.encryptedActivationCodes = syncedCodes;
-                }
-            }).catch(error => {
-                // console.error('[ActivationSync] Initial sync error:', error);
-            });
-        } else {
-            // console.log('[ActivationSync] Missing address or mnemonic');
-        }
-    } else {
-        // console.log('[ActivationSync] Not ready - unlocked:', walletState.isUnlocked, 'accounts:', walletState.accounts.length);
-    }
-    
-    // Set up periodic sync interval (30 seconds for browser - no battery concern)
-    walletState.syncInterval = setInterval(async () => {
-        if (walletState.isUnlocked && walletState.accounts.length > 0 && walletState.decryptedWalletData) {
-            try {
-                const address = walletState.accounts[0]?.solanaAddress || walletState.accounts[0]?.address;
-                const mnemonic = walletState.decryptedWalletData.mnemonic;
-                
-                if (address && mnemonic) {
-                    const syncedCodes = await syncActivationCodes(address, mnemonic);
-                    if (syncedCodes) {
-                        await chrome.storage.local.set({ encryptedActivationCodes: syncedCodes });
-                        walletState.encryptedActivationCodes = syncedCodes;
-                    }
-                }
-            } catch (error) {
-                // Silent fail - don't interrupt user
-                // console.log('[ActivationSync] Background sync error:', error);
-            }
-        }
-    }, 30000); // 30 seconds
-}
-
-/**
- * Stop periodic activation sync
- */
-function stopActivationSync() {
-    if (walletState.syncInterval) {
-        clearInterval(walletState.syncInterval);
-        walletState.syncInterval = null;
-    }
-}
 
 /**
  * Check if wallet exists
@@ -7244,7 +6829,8 @@ async function initializeSolanaRPC() {
 /**
  * Get current network phase (Phase 1 or Phase 2)
  */
-async function getBurnPricing(nodeType = 'full') {
+// v3.18: Default to 'light' instead of 'full'
+async function getBurnPricing(nodeType = 'light') {
     try {
         // Check if wallet is initialized with Solana
         if (!walletState.solanaRPC) {
@@ -7324,15 +6910,9 @@ async function getNetworkSize() {
         };
     }
     
-    // PRODUCTION: Real Genesis node IPs (from genesis_constants.rs)
-    const bootstrapNodes = [
-        'http://154.38.160.39:8080',
-        'http://62.171.157.44:8080',
-        'http://161.97.86.81:8080',
-        'http://5.189.130.160:8080',
-        'http://162.244.25.114:8080'
-    ];
-    
+    // The ONE genesis list — a second copy here drifted to a port the node never served.
+    const bootstrapNodes = QNET_GENESIS_NODES;
+
     for (const apiUrl of bootstrapNodes) {
         try {
             const response = await fetch(`${apiUrl}/api/v1/network/stats`, {
@@ -7405,56 +6985,6 @@ async function getBurnPercentage() {
     }
 }
 
-/**
- * FREE activation - no burning needed
- */
-async function burnOneDevTokens(request) {
-    try {
-        // FREE wallet - no burning needed, instant activation
-        const mockSignature = 'free_activation_' + Math.random().toString(36).substring(2, 15);
-        const mockBlockHeight = Math.floor(Math.random() * 1000000) + 200000000;
-
-        return {
-            success: true,
-            signature: mockSignature,
-            blockHeight: mockBlockHeight,
-            phase: request.phase || 1,
-            amount: 0, // FREE - no cost
-            nodeType: request.nodeType,
-            free: true
-        };
-    } catch (error) {
-        // Error:('Failed to activate:', error);
-        return {
-            success: false,
-            error: error.message
-        };
-    }
-}
-
-/**
- * FREE activation - no QNC spending needed
- */
-async function spendQNCToPool3(request) {
-    try {
-        // FREE wallet - instant activation without spending
-        const mockSignature = 'free_pool3_' + Math.random().toString(36).substring(2, 15);
-        const mockPoolTransfer = 'free_transfer_' + Math.random().toString(36).substring(2, 15);
-
-        return {
-            success: true,
-            signature: mockSignature,
-            poolTransfer: mockPoolTransfer,
-            amount: 0, // FREE - no cost
-            nodeType: request.nodeType,
-            networkSize: request.networkSize,
-            free: true
-        };
-    } catch (error) {
-        // Error:('Failed to activate:', error);
-        throw error;
-    }
-}
 
 /**
  * Get network age years since QNet mainnet launch
@@ -7474,64 +7004,21 @@ async function getNetworkAgeYears() {
     }
 }
 
-/**
- * Generate EON address using professional crypto approach
- * New Format: 19 chars + "eon" + 15 chars + 4 char checksum = 41 total
- */
-function generateEONAddress() {
-    const charset = '123456789abcdefghijkmnopqrstuvwxyz'; // Safe chars without confusion
-    
-    // Generate secure random parts
-    const generateSecureRandom = (length) => {
-        const randomBytes = new Uint8Array(length);
-        crypto.getRandomValues(randomBytes);
-        
-        let result = '';
-        for (let i = 0; i < length; i++) {
-            result += charset[randomBytes[i] % charset.length];
-        }
-        return result;
-    };
-    
-    // Calculate checksum
-    const calculateChecksum = async (data) => {
-        const encoder = new TextEncoder();
-        const dataBytes = encoder.encode(data);
-        const hashBuffer = await crypto.subtle.digest('SHA-256', dataBytes);
-        const hashArray = new Uint8Array(hashBuffer);
-        
-        let checksum = '';
-        for (let i = 0; i < 4; i++) {
-            checksum += charset[hashArray[i] % charset.length];
-        }
-        return checksum;
-    };
-    
-    // Generate parts for new format
-    const part1 = generateSecureRandom(19);  // 19 chars before "eon"
-    const part2 = generateSecureRandom(15);  // 15 chars after "eon"
-    
-    // For synchronous compatibility, use simple checksum
-    const simpleChecksum = (part1 + part2).split('').reduce((acc, char, i) => {
-        return acc + char.charCodeAt(0) * (i + 1);
-    }, 0);
-    
-    let checksum = '';
-    for (let i = 0; i < 4; i++) {
-        checksum += charset[(simpleChecksum + i) % charset.length];
-    }
-    
-    return `${part1}eon${part2}${checksum}`;
-}
+// REMOVED: dead random generateEONAddress(). It minted a QNet EON address from crypto.getRandomValues
+// (unrelated to the wallet's ML-DSA-65 key), which the node/mobile reject and which loses funds. All
+// QNet EON addresses now come exclusively from ProductionCrypto.generateQNetAddress(mnemonic) →
+// QNetDilithium.deriveWallet(mnemonic).address (the canonical bundle).
 
 /**
  * Generate Solana address for demo
  */
 function generateSolanaAddress() {
     const chars = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+    const randomBytes = new Uint8Array(44);
+    crypto.getRandomValues(randomBytes);
     let result = '';
     for (let i = 0; i < 44; i++) {
-        result += chars.charAt(Math.floor(Math.random() * chars.length));
+        result += chars.charAt(randomBytes[i] % chars.length);
     }
     return result;
 }

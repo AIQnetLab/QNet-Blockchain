@@ -1,9 +1,17 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   reactStrictMode: false,
-  compiler: {
-    removeConsole: process.env.NODE_ENV === 'production',
+  // Client-side Router Cache: reuse a visited route's payload on back-navigation
+  // (instant tab-switch). Live data is refreshed by each page's own client polling.
+  experimental: {
+    staleTimes: { dynamic: 30, static: 180 },
   },
+  compiler: {
+    // Server logs ([LEVEL][SUBSYSTEM] lines) go through console; keep them in the build.
+    removeConsole: false,
+  },
+  // Server-side packages that should not be bundled
+  serverExternalPackages: ['ws', 'pg'],
   images: {
     unoptimized: true,
     domains: [
@@ -43,6 +51,35 @@ const nextConfig = {
   },
   poweredByHeader: false,
   compress: true,
+  async headers() {
+    return [
+      {
+        source: '/(.*)',
+        headers: [
+          { key: 'X-Frame-Options', value: 'DENY' },
+          { key: 'X-Content-Type-Options', value: 'nosniff' },
+          { key: 'Referrer-Policy', value: 'strict-origin-when-cross-origin' },
+          { key: 'Permissions-Policy', value: 'camera=(), microphone=(), geolocation=()' },
+          {
+            key: 'Content-Security-Policy',
+            value: [
+              "default-src 'self'",
+              "script-src 'self' 'unsafe-inline' 'unsafe-eval'",
+              "style-src 'self' 'unsafe-inline'",
+              "img-src 'self' data: blob: https:",
+              "font-src 'self' data:",
+              "connect-src 'self' ws: wss: http: https:",
+              "frame-ancestors 'none'",
+            ].join('; '),
+          },
+          {
+            key: 'Strict-Transport-Security',
+            value: 'max-age=31536000; includeSubDomains',
+          },
+        ],
+      },
+    ];
+  },
 };
 
 module.exports = nextConfig;

@@ -872,8 +872,8 @@ def request_activation_token():
         logger.error(f"Failed to calculate dynamic burn requirement: {e}")
         # Fallback to config value based on node type
         fallback_map = {
+            # v3.18: Only Light and Super nodes
             "light": app_config.getint("Token", "onedev_initial_burn_light", fallback=1500000000),
-            "full": app_config.getint("Token", "onedev_initial_burn_full", fallback=1500000000),
             "super": app_config.getint("Token", "onedev_initial_burn_super", fallback=1500000000)
         }
         onedev_required_units = fallback_map.get(node_type, 1500000000)

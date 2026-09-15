@@ -116,7 +116,6 @@
     "activateNode": "Activate Node",
     "nodeStatus": "Node Status: Inactive",
     "nodeType": "Select Node Type",
-    "fullNode": "Full Node",
     "lightNode": "Light Node",
     "validatorNode": "Super Node",
     "burnTokens": "Burn 1DEV Tokens",

@@ -275,19 +275,12 @@ class SimpleCLI:
             node_config = self._get_node_config()
             node_id = node_config.get('node_id', 'unknown')
             
-            print(f"Claiming rewards for node {node_id}...")
-            
-            # Make claim request
-            data = self._api_request(f"/api/rewards/claim", method="POST", 
-                                   data={"node_id": node_id})
-            
-            if data and 'error' not in data:
-                print(f"✅ Rewards claimed successfully!")
-                print(f"  Amount: {data.get('claimed_amount', 0)} QNC")
-                print(f"  Transaction ID: {data.get('tx_id', 'pending')}")
-                print(f"  New Balance: {data.get('new_balance', 0)} QNC")
-            else:
-                print(f"❌ Reward claim failed: {data.get('error', 'Unknown error')}")
+            # A claim is authorised by TWO ML-DSA-65 signatures from the wallet key: one over
+            # "claim_rewards:{node_id}:{wallet}", and one over the payload the node quotes back. This
+            # CLI holds no key and has no post-quantum signer, so it cannot produce either.
+            print("❌ Claiming requires your wallet's ML-DSA-65 key, which this CLI does not hold.")
+            print("   Claim from the QNet wallet app, or via @qnet/sdk claimRewards() with a signer.")
+            print(f"   node_id: {node_id}")
         except Exception as e:
             print(f"Error claiming rewards: {e}")
             

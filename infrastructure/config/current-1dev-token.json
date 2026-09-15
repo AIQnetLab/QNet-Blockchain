@@ -21,9 +21,8 @@
       "reductionPer10Percent": 150
     },
     "phase2": {
-      "lightNode": 5000,
-      "fullNode": 7500,
-      "superNode": 10000,
+      "lightNode": 10000,
+      "superNode": 7500,
       "networkMultiplier": 1
     }
   },

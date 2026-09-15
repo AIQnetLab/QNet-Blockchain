@@ -1,6 +1,5 @@
 import { NextResponse } from 'next/server';
-import { getDbPool } from '../../../../../lib/db';
-import { getSyncServiceStatus } from '../../../../../lib/sync-service';
+import { getDbPool, getSyncStatus } from '../../../../../lib/db';
 import { getMonitoringHealth } from '../../../../../lib/monitoring';
 import { getRateLimitStats } from '../../../../../lib/rate-limit-redis';
 
@@ -18,30 +17,21 @@ export async function GET() {
     const dbPool = getDbPool();
     await dbPool.query('SELECT 1');
     status.database = 'ok';
-  } catch (dbErr: any) {
-    console.error('[Health] Database check failed:', dbErr);
+  } catch {
+    // Do not leak internal error details to clients; log server-side only.
     status.database = 'error';
-    status.databaseError = dbErr?.message || 'Unknown error';
     status.application = 'degraded';
   }
 
-  // Check Sync Service status
+  // Indexer state as published by the qnet-indexer process.
   try {
-    const syncStatus = await getSyncServiceStatus();
-    status.syncService = syncStatus;
-    if (!syncStatus.isRunning) {
-      status.application = 'degraded';
-    }
-    if (syncStatus.lastError) {
-      status.application = 'degraded';
-    }
-  } catch (syncErr: any) {
-    console.error('[Health] Sync service check failed:', syncErr);
-    status.syncService = { 
-      isRunning: false,
-      error: syncErr?.message || 'Unknown error',
-      stack: syncErr?.stack 
-    };
+    const sync = await getSyncStatus();
+    const lag = sync.node_height - sync.indexed_prefix;
+    const stale = !sync.last_sync_at || Date.now() - new Date(sync.last_sync_at).getTime() > 120_000;
+    status.indexer = { head: sync.last_height, indexedPrefix: sync.indexed_prefix, nodeHeight: sync.node_height, lag, live: sync.ws_connected, stale };
+    if (stale || lag > 600) status.application = 'degraded';
+  } catch {
+    status.indexer = { error: 'unavailable' };
     status.application = 'degraded';
   }
 
@@ -49,18 +39,16 @@ export async function GET() {
   try {
     const health = getMonitoringHealth();
     status.monitoring = health;
-  } catch (monErr: any) {
-    console.error('[Health] Monitoring check failed:', monErr);
-    status.monitoring = { error: monErr?.message || 'Unknown error' };
+  } catch {
+    status.monitoring = { error: 'unavailable' };
   }
 
   // Get rate limit stats
   try {
     const rateLimitStats = await getRateLimitStats();
     status.rateLimit = rateLimitStats;
-  } catch (rateErr: any) {
-    console.error('[Health] Rate limit check failed:', rateErr);
-    status.rateLimit = { error: rateErr?.message || 'Unknown error' };
+  } catch {
+    status.rateLimit = { error: 'unavailable' };
   }
 
   // Always return 200, even if degraded, so we can see the status

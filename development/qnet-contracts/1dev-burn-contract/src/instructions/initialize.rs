@@ -25,19 +25,20 @@ pub fn handler(
     burn_address: Pubkey,
     one_dev_mint: Pubkey,
     network_genesis_timestamp: i64,
+    verification_authority: Pubkey, // v14.5: Required — attests off-chain burn verification.
 ) -> Result<()> {
     let burn_tracker = &mut ctx.accounts.burn_tracker;
     let clock = Clock::get()?;
-    
+
     burn_tracker.authority = authority;
     burn_tracker.admin = admin;
     burn_tracker.burn_address = burn_address;
     burn_tracker.one_dev_mint = one_dev_mint;
-    
+
     // Set genesis_timestamp as QNet network genesis block time (passed as parameter)
     // This is the REAL genesis block timestamp for 5-year Phase 2 limit calculation
     burn_tracker.genesis_timestamp = network_genesis_timestamp;
-    
+
     burn_tracker.total_1dev_burned = 0;
     burn_tracker.total_burn_transactions = 0;
     burn_tracker.total_nodes_activated = 0;
@@ -49,11 +50,15 @@ pub fn handler(
     burn_tracker.paused = false;
     burn_tracker.last_update = clock.unix_timestamp;
     burn_tracker.bump = ctx.bumps.burn_tracker;
-    
+    // v14.5: Pin the authority that may attest off-chain burn verification
+    // (required signer for record_burn and execute_phase_transition).
+    burn_tracker.verification_authority = verification_authority;
+
     msg!("Burn tracker initialized");
     msg!("Authority: {}", burn_tracker.authority);
     msg!("Burn address: {}", burn_tracker.burn_address);
     msg!("Genesis timestamp: {}", burn_tracker.genesis_timestamp);
-    
+    msg!("Verification authority: {}", burn_tracker.verification_authority);
+
     Ok(())
-} 
+}

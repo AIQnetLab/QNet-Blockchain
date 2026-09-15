@@ -268,18 +268,14 @@
                                     <div style="display: flex; align-items: center; gap: 0.3rem; margin: 0.5rem 0; font-size: 0.65rem; color: #666;">
                                         <div style="width: 5px; height: 5px; background: #00d4ff; border-radius: 50%; animation: pulse 2s ease-in-out infinite;"></div>
                                         <span style="color: #888;">Burn Contract:</span>
-                                        <span style="font-family: 'Courier New', monospace; color: #00d4ff; font-size: 0.6rem;">D7g7mkL8o1YEex6ZgETJEQyyHV7uuUMvV3Fy3u83igJ7</span>
+                                        <span style="font-family: 'Courier New', monospace; color: #00d4ff; font-size: 0.6rem;">CCZSessk1TbWie6Ye2JX2cNEWHTEWxCwe5sLz8JaFriw</span>
                                     </div>
                                     
+                                    <!-- v3.18: Only Light and Super nodes -->
                                     <div class="node-options" id="node-options" style="flex: 1; display: flex; flex-direction: column; justify-content: center; gap: 0.6rem;">
                                         <div class="node-option" data-type="light" style="display: flex; justify-content: space-between; align-items: center; cursor: pointer;">
                                             <span class="node-name">Light Node</span>
                                             <span class="node-price" data-node-type="light" style="flex-grow: 1; text-align: center;">Loading...</span>
-                                            <span class="node-action">Activate</span>
-                                        </div>
-                                        <div class="node-option" data-type="full" style="display: flex; justify-content: space-between; align-items: center; cursor: pointer;">
-                                            <span class="node-name">Full Node</span>
-                                            <span class="node-price" data-node-type="full" style="flex-grow: 1; text-align: center;">Loading...</span>
                                             <span class="node-action">Activate</span>
                                         </div>
                                         <div class="node-option" data-type="super" style="display: flex; justify-content: space-between; align-items: center; cursor: pointer;">
@@ -476,9 +472,10 @@
                                             <span>Pool 1 (Base):</span>
                                             <span id="pool1-rewards">0.000 QNC</span>
                                         </div>
+                                        <!-- v3.18: Pool 2 removed - fees go to block producer -->
                                         <div class="detail-row">
-                                            <span>Pool 2 (Fees):</span>
-                                            <span id="pool2-rewards">0.000 QNC</span>
+                                            <span>Block Fees:</span>
+                                            <span id="pool2-rewards">Direct to Producer</span>
                                         </div>
                                         <div class="detail-row">
                                             <span>Next Claim:</span>
@@ -869,7 +866,11 @@
 
     <!-- Load production version with working interface -->
     <script src="lib/crypto-js.min.js"></script>
+    <!-- Post-quantum cryptography: ML-DSA-65 (NIST FIPS 204 / Dilithium3) -->
+    <!-- noble-pq-ml-dsa.js sets window.QNetDilithiumLib; must load before DilithiumManager -->
+    <script src="lib/noble-pq-ml-dsa.js"></script>
     <script src="src/crypto/Ed25519.js"></script>
+    <script src="src/crypto/DilithiumManager.js"></script>
     <script src="src/security/SecureKeyManager.js"></script>
     <script src="popup.js"></script>
 </body>

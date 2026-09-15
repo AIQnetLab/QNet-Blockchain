@@ -86,7 +86,7 @@ async function deriveKey(password, salt) {
         {
             name: 'PBKDF2',
             salt: salt,
-            iterations: 100000, // Industry standard
+            iterations: 600_000, // OWASP 2024 recommendation
             hash: 'SHA-256'
         },
         passwordKey,
@@ -120,7 +120,7 @@ async function hashPassword(password) {
         {
             name: 'PBKDF2',
             salt: salt,
-            iterations: 100000,
+            iterations: 600_000,
             hash: 'SHA-256'
         },
         passwordKey,
@@ -159,7 +159,7 @@ async function verifyPassword(password, hash, salt) {
         {
             name: 'PBKDF2',
             salt: saltBuffer,
-            iterations: 100000,
+            iterations: 600_000,
             hash: 'SHA-256'
         },
         passwordKey,

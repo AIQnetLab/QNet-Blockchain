@@ -66,7 +66,7 @@ export default function RootLayout({
               function checkQNetWallet() {
                 if (window.qnet && window.qnet.isQNet) {
                   window.qnetWalletReady = true;
-                  console.log('✅ QNet Wallet detected and ready');
+                  /* log disabled */
                   
                   // Emit custom event for components
                   window.dispatchEvent(new CustomEvent('qnet:walletReady', {

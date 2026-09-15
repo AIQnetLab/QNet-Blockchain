@@ -25,6 +25,7 @@ impl PyMempoolConfig {
             inner: SimpleMempoolConfig {
                 max_size,
                 min_gas_price,
+                max_per_sender: 10_000,
             },
         }
     }
@@ -59,8 +60,9 @@ impl PyMempool {
         let tx: serde_json::Value = serde_json::from_str(tx_json)
             .map_err(|e| PyValueError::new_err(format!("Invalid transaction JSON: {}", e)))?;
         
-        // Extract gas_price from transaction (default to 1 if missing)
-        let gas_price = tx["gas_price"].as_u64().unwrap_or(1);
+        // FIX R14-M2: Reject missing/invalid gas_price instead of silent fallback
+        let gas_price = tx["gas_price"].as_u64()
+            .ok_or_else(|| PyValueError::new_err("[REJECT][MEMPOOL] gas_price must be a valid u64"))?;
         
         // Generate a simple hash (SHA3-256 for NIST compliance)
         use sha3::{Sha3_256, Digest};

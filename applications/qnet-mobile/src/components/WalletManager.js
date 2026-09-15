@@ -1,18 +1,42 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import CryptoJS from 'crypto-js';
-// Import native crypto for production - falls back to CryptoJS
-import 'react-native-get-random-values'; // Must be imported first
+import { AppState } from 'react-native'; // Clear in-memory derived key when app backgrounds
+import CryptoJS from 'crypto-js'; // Required for generateQNetAddress, generateMnemonic
+import 'react-native-get-random-values'; // Must be imported first — polyfills crypto.getRandomValues
+import { smtFold } from '../crypto/SmtFold'; // pure; shared with the jest proof pin
 import { Connection, Keypair, PublicKey } from '@solana/web3.js';
 import { derivePath } from 'ed25519-hd-key';
 import * as bip39 from 'bip39';
 import nacl from 'tweetnacl'; // Ed25519 signing for node operations
+import * as Keychain from 'react-native-keychain';
+// v3.35: Centralized node configuration (no duplication!)
+// v4.10: Added getSolanaRpcUrl for centralized Solana RPC management
+import { GENESIS_NODES, NODE_DISCOVERY, getRandomGenesisNode, getSolanaRpcUrl, rotateSolanaRpc } from '../config/nodes';
+// Post-quantum BFT light-client: trustless committee-QC state-root verification
+// (replaces the MITM-bypassable 2/3 peer-poll). MITM-proof at any network size.
+import { verifyMacroblockStateRoot, verifyLogInclusion, verifyLogWindowInclusion, verifyMacroblockLogsRoot, transferLogLeaf } from '../crypto/QcLightClient';
+
+// Canonical identity + signed-preimage construction, pinned cross-language against the node and the
+// extension by __tests__/fix5_kat.test.js.
+import { QNET_CHAIN_TAG, walletSeedString, eonFromPublicKeyBytes, transferPreimage } from '../crypto/WalletIdentity';
+import { GAS_PRICE, STORAGE_DEPOSIT_NANO, DEPLOY_GAS_PRICE, DEPLOY_GAS_LIMIT, feeNano, contractCallGasLimit } from '../config/fees';
+
+// A TX admitted to a mempool keeps its inclusion window (attest_epoch + 2 epochs, <= 270 blocks) before any
+// resubmit may replace it.
+const ONCHAIN_ADMIT_HOLD_MS = 10 * 60_000;
+
+// Wait before the next automatic try of a registration that did not land: 2^attempts minutes, capped at 6h.
+const onchainBackoffMs = (attempts) => Math.min(Math.pow(2, attempts || 0) * 60_000, 6 * 3600_000);
 
 export class WalletManager {
   constructor() {
-    this.connection = new Connection('https://api.devnet.solana.com', 'confirmed');
-    this.keyCache = null; // Cache derived key for faster unlock
-    this.keyCachePassword = null; // Track which password the key is for
-    
+    this.keyCache = null;       // Uint8Array (32-byte AES key), NOT the password
+    this._keyCacheSalt = null;  // Hex salt that was used to derive keyCache
+    this._keyCacheIter = 0;     // Iteration count used to derive keyCache
+    this._failedAttempts = 0;
+    this._lockoutUntil = 0;
+    this._rateLimitLoaded = false;
+    this._appStateSub = null;   // AppState subscription (clears keyCache on background)
+
     // BIP39 wordlist (2048 words)
     this.BIP39_WORDLIST = [
       "abandon",
@@ -2064,6 +2088,21 @@ export class WalletManager {
       "zone",
       "zoo"
     ];
+
+    // Drop the derived AES key from heap the moment the app leaves the foreground,
+    // so a backgrounded/locked process never holds the vault key in memory.
+    this._appStateSub = AppState.addEventListener('change', (state) => {
+      if (state !== 'active') this._clearCachedKey();
+    });
+  }
+
+  // Detach the AppState listener (call when tearing down this manager instance).
+  dispose() {
+    if (this._appStateSub) {
+      this._appStateSub.remove();
+      this._appStateSub = null;
+    }
+    this._clearCachedKey();
   }
 
   // Generate QNet address from mnemonic (extension-compatible)
@@ -2090,15 +2129,16 @@ export class WalletManager {
       const hash = CryptoJS.SHA512(solanaAddress + 'qnet-eon-bridge'); // Use hyphen for consistency
       const fullHash = hash.toString(CryptoJS.enc.Hex);
       
-      // New long format: 19 chars + "eon" + 15 chars + 4 char checksum = 41 total
+      // Format: 19 chars + "eon" + 15 chars + 8 char SHA3-256 checksum = 45 total
       const part1 = fullHash.substring(0, 19).toLowerCase();
       const part2 = fullHash.substring(19, 34).toLowerCase();
-      
-      // Generate SHA-256 checksum (MUST match server!)
+
+      // Generate SHA3-256 checksum (MUST match server! 4 bytes = 8 hex chars)
+      const { sha3_256 } = require('js-sha3');
       const addressWithoutChecksum = part1 + 'eon' + part2;
-      const checksumHash = CryptoJS.SHA256(addressWithoutChecksum);
-      const checksum = checksumHash.toString(CryptoJS.enc.Hex).substring(0, 4).toLowerCase();
-      
+      const checksumHex = sha3_256(addressWithoutChecksum);
+      const checksum = checksumHex.substring(0, 8).toLowerCase();
+
       return `${part1}eon${part2}${checksum}`;
     } catch (error) {
       // console.error('Error generating QNet address from Solana:', error);
@@ -2106,36 +2146,27 @@ export class WalletManager {
     }
   }
   
-  // Migrate old QNet address to new BIP44-based format
+  // Re-derive the QNet address to the canonical pure-Dilithium identity.
   async migrateQNetAddress(wallet) {
     try {
-      // Skip if wallet already has BIP44 keypair (already migrated or newly imported)
-      if (wallet.qnetKeypair && wallet.qnetKeypair.path) {
+      // Already on the current FIPS-204 identity — nothing to do. (A wallet from the old
+      // round-3 build carries the previous 'QNET_WALLET_MLDSA65_v1' marker, so it does NOT
+      // match here and falls through to be re-derived below.)
+      if (wallet.qnetKeypair && wallet.qnetKeypair.path === 'QNET_WALLET_MLDSA65_fips204') {
         return wallet;
       }
-      
-      // MIGRATE only old wallets without BIP44 keypair
-      if (wallet.mnemonic && !wallet.qnetKeypair) {
+
+      // Any wallet holding a mnemonic (including a stale Ed25519/BIP44 one) re-derives
+      // to the pure-Dilithium address so app and node agree on one identity per seed.
+      if (wallet.mnemonic) {
         const seed = bip39.mnemonicToSeedSync(wallet.mnemonic);
         const result = await this.generateQNetAddress(seed, 0);
-        
-        // Store old address for logging
-        const oldAddress = wallet.qnetAddress;
-        
-        // UPDATE to new BIP44 address (breaking change but necessary)
         wallet.qnetAddress = result.address;
         wallet.qnetKeypair = {
           publicKey: Array.from(result.keypair.publicKey),
           privateKey: Array.from(result.keypair.privateKey),
           path: result.keypair.path
         };
-        
-        //if (oldAddress && oldAddress !== result.address) {
-          //console.log('[MIGRATION] QNet address updated:', oldAddress, '->', result.address);
-       // } else {
-         // console.log('[Migration] Generated BIP44 QNet address:', result.address);
-       // }
-        
         return wallet;
       }
       
@@ -2156,135 +2187,35 @@ export class WalletManager {
     }
   }
 
-  // Generate QNet keypair using BIP44 standard with proper SLIP-0010
-  // SECURITY: This follows the same standard as hardware wallets (Ledger, Trezor)
-  // OPTIMIZED: Minimized conversions between formats for speed
-  generateQNetKeypair(seed, accountIndex = 0) {
-    try {
-      // BIP44 path for QNet: m/44'/9999'/accountIndex'/0'/0'
-      
-      // Step 1: Generate master key from seed (SLIP-0010)
-      // HMAC-SHA512(Key = "ed25519 seed", Data = seed)
-      // CRITICAL: Must match browser extension exactly!
-      const seedWordArray = CryptoJS.lib.WordArray.create(seed);
-      const ed25519SeedKey = CryptoJS.enc.Utf8.parse("ed25519 seed");
-      const masterHmac = CryptoJS.HmacSHA512(seedWordArray, ed25519SeedKey);
-      
-      // Split into key and chain code (64 bytes total = 16 words)
-      let currentKeyBytes = new Uint8Array(32);
-      let currentChainCodeBytes = new Uint8Array(32);
-      
-      // Convert masterHmac (WordArray) to Uint8Array
-      for (let i = 0; i < 8; i++) {
-        const word = masterHmac.words[i];
-        currentKeyBytes[i * 4] = (word >>> 24) & 0xff;
-        currentKeyBytes[i * 4 + 1] = (word >>> 16) & 0xff;
-        currentKeyBytes[i * 4 + 2] = (word >>> 8) & 0xff;
-        currentKeyBytes[i * 4 + 3] = word & 0xff;
-      }
-      for (let i = 0; i < 8; i++) {
-        const word = masterHmac.words[i + 8];
-        currentChainCodeBytes[i * 4] = (word >>> 24) & 0xff;
-        currentChainCodeBytes[i * 4 + 1] = (word >>> 16) & 0xff;
-        currentChainCodeBytes[i * 4 + 2] = (word >>> 8) & 0xff;
-        currentChainCodeBytes[i * 4 + 3] = word & 0xff;
-      }
-      
-      // Step 2: Derive path m/44'/9999'/accountIndex'/0'/0'
-      const levels = [
-        0x8000002C, // 44' (hardened)
-        0x8000270F, // 9999' (hardened) - 0x270F = 9999
-        0x80000000 + accountIndex, // accountIndex' (hardened)
-        0x80000000, // 0' (hardened change)
-        0x80000000  // 0' (hardened address index)
-      ];
-      
-      // Step 3: Derive each level (FIXED: match browser extension format exactly)
-      for (const index of levels) {
-        // HMAC-SHA512(Key = chainCode, Data = 0x00 || privateKey || index)
-        // Build data: 0x00 || key (32 bytes) || index (4 bytes) = 37 bytes total
-        const dataBytes = new Uint8Array(37);
-        dataBytes[0] = 0x00; // Prefix byte
-        dataBytes.set(currentKeyBytes, 1); // Copy 32 bytes of key
-        dataBytes[33] = (index >>> 24) & 0xff;
-        dataBytes[34] = (index >>> 16) & 0xff;
-        dataBytes[35] = (index >>> 8) & 0xff;
-        dataBytes[36] = index & 0xff;
-        
-        // HMAC-SHA512 with chainCode as key
-        const dataWordArray = CryptoJS.lib.WordArray.create(dataBytes);
-        const chainCodeWordArray = CryptoJS.lib.WordArray.create(currentChainCodeBytes);
-        const derivedHmac = CryptoJS.HmacSHA512(dataWordArray, chainCodeWordArray);
-        
-        // Extract new key and chain code (64 bytes = 16 words)
-        const derivedBytes = new Uint8Array(64);
-        for (let i = 0; i < 16; i++) {
-          const word = derivedHmac.words[i];
-          derivedBytes[i * 4] = (word >>> 24) & 0xff;
-          derivedBytes[i * 4 + 1] = (word >>> 16) & 0xff;
-          derivedBytes[i * 4 + 2] = (word >>> 8) & 0xff;
-          derivedBytes[i * 4 + 3] = word & 0xff;
-        }
-        
-        currentKeyBytes = derivedBytes.slice(0, 32);
-        currentChainCodeBytes = derivedBytes.slice(32, 64);
-      }
-      
-      // Step 4: Generate Ed25519 keypair from seed (private key)
-      // CRITICAL FIX v2.66: Use nacl.sign.keyPair.fromSeed() for proper Ed25519!
-      // Old code used SHA256(privateKey) which is cryptographically WRONG!
-      // Ed25519 public key = privateKey * G (elliptic curve multiplication)
-      const privateKey = new Uint8Array(32);
-      privateKey.set(currentKeyBytes);
-      
-      // Generate proper Ed25519 keypair
-      const ed25519Keypair = nacl.sign.keyPair.fromSeed(privateKey);
-      
-      // ed25519Keypair.publicKey = 32 bytes (the actual Ed25519 public key)
-      // ed25519Keypair.secretKey = 64 bytes (privateKey + publicKey concatenated)
-      
-      return {
-        privateKey: privateKey,  // 32-byte seed
-        publicKey: ed25519Keypair.publicKey,  // 32-byte Ed25519 public key
-        path: `m/44'/9999'/${accountIndex}'/0'/0'`,
-        chainCode: new Uint8Array(32) // Not needed for address generation
-      };
-    } catch (error) {
-      // console.error('Error generating QNet keypair:', error);
-      throw new Error('Failed to generate QNet keypair');
-    }
-  }
-  
-  // Generate QNet EON address (compatible with extension wallet)
+  // Generate QNet EON address — PURE DILITHIUM (ML-DSA-65, F0.1). The QNet identity is the
+  // post-quantum key derived from the mnemonic; the address commits to it. Byte-identical to the
+  // node (genesis_key.rs): the native module SHAKE-256s the canonical seed string into the 32-byte
+  // ML-DSA-65 KeyGen seed, then EON = SHA512(pk) formatted. Ed25519/Solana keys are derived
+  // separately (m/44'/501') and are UNTOUCHED — Ed25519 is a Solana-only credential.
   async generateQNetAddress(seed, accountIndex = 0) {
     try {
-      // Generate keypair first using BIP44 (now synchronous for speed)
-      const keypair = this.generateQNetKeypair(seed, accountIndex);
-      
-      // Generate address from public key
-      const publicKeyWordArray = CryptoJS.lib.WordArray.create(keypair.publicKey);
-      const addressHash = CryptoJS.SHA512(publicKeyWordArray);
-      const fullHash = addressHash.toString(CryptoJS.enc.Hex);
-      
-      // Create address format: 19 chars + "eon" + 15 chars + 4 char checksum
-      const part1 = fullHash.substring(0, 19).toLowerCase();
-      const part2 = fullHash.substring(19, 34).toLowerCase();
-      
-      // Generate SHA-256 checksum (MUST match server!)
-      const addressWithoutChecksum = part1 + 'eon' + part2;
-      const checksumData = CryptoJS.SHA256(addressWithoutChecksum);
-      const checksum = checksumData.toString(CryptoJS.enc.Hex).substring(0, 4).toLowerCase();
-      
-      const address = `${part1}eon${part2}${checksum}`;
-      
-      // Return both address and keypair for storage
+      // Canonical wallet seed string — MUST byte-match the node's WALLET_SEED_PREFIX + hex(bip39_seed64).
+      const seedString = walletSeedString(seed);
+
+      // Native ML-DSA-65 keygen: shake256(seedString) -> 32-byte xi -> keypair (hex pk 1952B / sk 4032B).
+      const { generateRawDilithiumKeypair } = require('../crypto/DilithiumCrypto');
+      const kp = await generateRawDilithiumKeypair(seedString);
+      const pkBytes = Uint8Array.from(kp.publicKey.match(/.{1,2}/g).map(h => parseInt(h, 16)));
+      const skBytes = Uint8Array.from(kp.secretKey.match(/.{1,2}/g).map(h => parseInt(h, 16)));
+
+      const address = eonFromPublicKeyBytes(pkBytes);
+
+      // keypair keeps a byte-array shape (publicKey/privateKey Uint8Array) so existing storage sites
+      // (Array.from(...)) keep working; the bytes are now the ML-DSA-65 wallet key, not Ed25519.
       return {
-        address: address,
-        keypair: keypair
+        address,
+        // path marker bumped to '_fips204' so a wallet created by the OLD round-3 native
+        // build (same seed prefix, same '_v1' marker, but a different key) is NOT mistaken
+        // for already-migrated — migrateQNetAddress re-derives it to this FIPS-204 identity.
+        keypair: { publicKey: pkBytes, privateKey: skBytes, path: 'QNET_WALLET_MLDSA65_fips204' },
       };
     } catch (error) {
-      // console.error('Error generating QNet address:', error);
-      throw new Error('Failed to generate QNet address');
+      throw new Error('Failed to generate QNet address (pure Dilithium): ' + ((error && error.message) || error));
     }
   }
 
@@ -2327,6 +2258,34 @@ export class WalletManager {
   }
 
   // Generate new wallet with BIP39 mnemonic
+  // EVM (secp256k1) derivation from the SAME BIP39 seed — standard Ethereum path m/44'/60'/0'/0/0.
+  // Additive + independent: the same mnemonic also yields an EVM address (byte-identical to
+  // MetaMask/ethers). QNet (ML-DSA-65) + Solana (Ed25519) derivations are UNTOUCHED. KAT: mnemonic
+  // "abandon…about" → 0x9858EfFD232B4033E47d90003D41EC34EcaEda94.
+  async deriveEvmWallet(seed) {
+    // EVM is an ADDITIVE sub-feature. @noble/curves is now a direct dependency, but if it is ever
+    // unresolvable (nested/strict install layout, or a future @scure/bip32 that vendors curves),
+    // degrade gracefully (return null) instead of throwing out of core wallet creation. QNet +
+    // Solana identity must still be created even if the EVM address cannot be derived.
+    try {
+      const { HDKey } = require('@scure/bip32');
+      const { secp256k1 } = require('@noble/curves/secp256k1');
+      const { keccak256 } = require('js-sha3');
+      const seedBytes = seed instanceof Uint8Array ? seed : new Uint8Array(seed);
+      const hd = HDKey.fromMasterSeed(seedBytes).derive("m/44'/60'/0'/0/0");
+      const priv = hd.privateKey;
+      const pub = secp256k1.getPublicKey(priv, false); // 65B uncompressed 0x04||X||Y
+      const addrHex = keccak256(pub.slice(1)).slice(-40); // keccak256(pubkey[1:])[-20 bytes]
+      const hashHex = keccak256(addrHex); // EIP-55 checksum over the lowercase hex
+      let address = '0x';
+      for (let i = 0; i < 40; i++) address += (parseInt(hashHex[i], 16) >= 8 ? addrHex[i].toUpperCase() : addrHex[i]);
+      return { address, privateKey: Buffer.from(priv).toString('hex'), publicKey: Buffer.from(pub).toString('hex'), path: "m/44'/60'/0'/0/0" };
+    } catch (error) {
+      // console.warn('EVM derivation unavailable, omitting evm field:', error);
+      return null;
+    }
+  }
+
   async generateWallet() {
     try {
       // Generate BIP39 mnemonic with checksum using bip39 library
@@ -2343,7 +2302,10 @@ export class WalletManager {
       
       // Generate QNet address and keypair using BIP44 derivation (reuse seed!)
       const qnetResult = await this.generateQNetAddress(seed, 0);
-      
+
+      // EVM address from the SAME seed (m/44'/60') — mnemonic portability to Ethereum/EVM networks.
+      const evmResult = await this.deriveEvmWallet(seed);
+
       // Store mnemonic temporarily for wallet creation flow
       const wallet = {
         publicKey: keypair.publicKey.toString(),
@@ -2356,9 +2318,13 @@ export class WalletManager {
           publicKey: Array.from(qnetResult.keypair.publicKey),
           privateKey: Array.from(qnetResult.keypair.privateKey),
           path: qnetResult.keypair.path
-        }
+        },
+        // EVM is additive: if deriveEvmWallet returned null (curves unresolvable), omit it —
+        // core QNet + Solana wallet creation still succeeds.
+        evmAddress: evmResult ? evmResult.address : null,
+        evmKeypair: evmResult ? { publicKey: evmResult.publicKey, privateKey: evmResult.privateKey, path: evmResult.path } : null
       };
-      
+
       // Temporarily attach mnemonic for storage only
       wallet._tempMnemonic = mnemonic;
       return wallet;
@@ -2530,7 +2496,10 @@ export class WalletManager {
       
       // Generate QNet address and keypair using BIP44 derivation
       const qnetResult = await this.generateQNetAddress(seed, 0);
-      
+
+      // EVM address from the SAME seed (m/44'/60') — mnemonic portability to Ethereum/EVM networks.
+      const evmResult = await this.deriveEvmWallet(seed);
+
       // Store mnemonic temporarily for import flow
       const wallet = {
         publicKey: keypair.publicKey.toString(),
@@ -2544,6 +2513,10 @@ export class WalletManager {
           privateKey: Array.from(qnetResult.keypair.privateKey),
           path: qnetResult.keypair.path
         },
+        // EVM is additive: if deriveEvmWallet returned null (curves unresolvable), omit it —
+        // core QNet + Solana wallet import still succeeds.
+        evmAddress: evmResult ? evmResult.address : null,
+        evmKeypair: evmResult ? { publicKey: evmResult.publicKey, privateKey: evmResult.privateKey, path: evmResult.path } : null,
         imported: true
       };
       
@@ -2565,107 +2538,279 @@ export class WalletManager {
       const vaultData = JSON.parse(storedWallet);
       
       // Decrypt to get mnemonic
-      const salt = CryptoJS.enc.Hex.parse(vaultData.salt);
-      const iv = CryptoJS.enc.Hex.parse(vaultData.iv);
-      
-      const key = await this.deriveKeyAsync(password, salt, 10000);
-      
-      const decrypted = CryptoJS.AES.decrypt(
-        vaultData.encrypted,
-        key,
-        {
-          iv: iv,
-          mode: CryptoJS.mode.CBC,
-          padding: CryptoJS.pad.Pkcs7
-        }
-      );
-      
-      const walletData = JSON.parse(decrypted.toString(CryptoJS.enc.Utf8));
+      let plaintext;
+      if (vaultData.version === 3 || vaultData.version === 2) {
+        plaintext = await this._decryptGCM(vaultData, password);
+      } else {
+        plaintext = await this._decryptCBC(vaultData, password);
+      }
+      const walletData = JSON.parse(plaintext);
       return walletData.mnemonic || null;
     } catch (error) {
       return null;
     }
   }
-  
-  // Quick password verification without loading full wallet
-  async verifyPassword(password) {
+
+  // ── Rate limiting (exponential backoff on failed password attempts) ──
+
+  static KEYCHAIN_SERVICE = 'com.qnet.wallet.biometric';
+
+  async _loadRateLimitState() {
+    if (this._rateLimitLoaded) return;
     try {
-      const storedWallet = await AsyncStorage.getItem('qnet_wallet');
-      if (!storedWallet) return false;
-      
-      const vaultData = JSON.parse(storedWallet);
-      
-      // Handle old format 
-      if (typeof vaultData === 'string' || !vaultData.salt) {
-        // Legacy format - try direct decryption
-        const encrypted = typeof vaultData === 'string' ? vaultData : vaultData.encrypted;
-        try {
-          const decrypted = CryptoJS.AES.decrypt(encrypted, password).toString(CryptoJS.enc.Utf8);
-          if (!decrypted) return false;
-          const wallet = JSON.parse(decrypted);
-          return wallet && wallet.publicKey ? true : false;
-        } catch (error) {
-          return false;
-        }
+      const raw = await AsyncStorage.getItem('qnet_rate_limit');
+      if (raw) {
+        const { attempts, lockoutUntil } = JSON.parse(raw);
+        this._failedAttempts = attempts || 0;
+        this._lockoutUntil = lockoutUntil || 0;
       }
-      
-      // New format with salt and IV
-      const salt = CryptoJS.enc.Hex.parse(vaultData.salt);
-      const iv = CryptoJS.enc.Hex.parse(vaultData.iv);
-      
-      // Use cached key if available
-      let key;
-      if (this.keyCachePassword === password && this.keyCache) {
-        key = this.keyCache;
-      } else {
-        // Derive key ASYNCHRONOUSLY using same parameters as storage
-        key = await this.deriveKeyAsync(password, salt, 10000);
-        this.keyCache = key;
-        this.keyCachePassword = password;
-      }
-      
-      // Decrypt
-      const decrypted = CryptoJS.AES.decrypt(
-        vaultData.encrypted,
-        key,
-        {
-          iv: iv,
-          mode: CryptoJS.mode.CBC,
-          padding: CryptoJS.pad.Pkcs7
-        }
-      );
-      
-      try {
-        const walletData = JSON.parse(decrypted.toString(CryptoJS.enc.Utf8));
-        return walletData && walletData.publicKey ? true : false;
-      } catch (error) {
-        return false; // Wrong password
-      }
-    } catch (error) {
-      return false;
-    }
+    } catch { /* ignore */ }
+    this._rateLimitLoaded = true;
   }
 
-  // Async PBKDF2 wrapper to avoid blocking UI
-  async deriveKeyAsync(password, salt, iterations = 10000) {
-    return new Promise((resolve) => {
-      // Use setTimeout to avoid blocking the main thread
-      setTimeout(() => {
-      const key = CryptoJS.PBKDF2(password, salt, {
-        keySize: 256/32,
-          iterations: iterations,
-        hasher: CryptoJS.algo.SHA256
+  async _saveRateLimitState() {
+    try {
+      await AsyncStorage.setItem('qnet_rate_limit', JSON.stringify({
+        attempts: this._failedAttempts,
+        lockoutUntil: this._lockoutUntil,
+      }));
+    } catch { /* ignore */ }
+  }
+
+  _lockoutMs(n) {
+    if (n < 3) return 0;
+    return Math.min(1000 * Math.pow(2, n - 3), 300_000);
+  }
+
+  async _recordFailedAttempt() {
+    this._failedAttempts++;
+    const delay = this._lockoutMs(this._failedAttempts);
+    if (delay > 0) this._lockoutUntil = Date.now() + delay;
+    await this._saveRateLimitState();
+  }
+
+  async _resetRateLimit() {
+    this._failedAttempts = 0;
+    this._lockoutUntil = 0;
+    await this._saveRateLimitState();
+  }
+
+  async getPasswordLockStatus() {
+    await this._loadRateLimitState();
+    const now = Date.now();
+    if (this._lockoutUntil > now) {
+      return { locked: true, remainingMs: this._lockoutUntil - now, attempts: this._failedAttempts };
+    }
+    return { locked: false, remainingMs: 0, attempts: this._failedAttempts };
+  }
+
+  // ── Keychain / biometric unlock ──────────────────────────────────────
+
+  async isBiometricSupported() {
+    try {
+      const type = await Keychain.getSupportedBiometryType();
+      return !!type;
+    } catch { return false; }
+  }
+
+  async getBiometryType() {
+    try {
+      return await Keychain.getSupportedBiometryType();
+    } catch { return null; }
+  }
+
+  async isBiometricEnabled() {
+    try {
+      const creds = await Keychain.getGenericPassword({
+        service: WalletManager.KEYCHAIN_SERVICE,
       });
-        resolve(key);
+      return !!creds;
+    } catch { return false; }
+  }
+
+  async enableBiometricUnlock(password) {
+    try {
+      const type = await Keychain.getSupportedBiometryType();
+      if (!type) return false;
+      await Keychain.setGenericPassword('qnet_wallet', password, {
+        service: WalletManager.KEYCHAIN_SERVICE,
+        accessControl: Keychain.ACCESS_CONTROL.BIOMETRY_CURRENT_SET,
+        accessible: Keychain.ACCESSIBLE.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
+      });
+      return true;
+    } catch { return false; }
+  }
+
+  async disableBiometricUnlock() {
+    try {
+      await Keychain.resetGenericPassword({ service: WalletManager.KEYCHAIN_SERVICE });
+      return true;
+    } catch { return false; }
+  }
+
+  async tryBiometricUnlock() {
+    try {
+      const creds = await Keychain.getGenericPassword({
+        service: WalletManager.KEYCHAIN_SERVICE,
+        authenticationPrompt: { title: 'Unlock QNet Wallet' },
+      });
+      if (!creds || !creds.password) return null;
+      return creds.password;
+    } catch { return null; }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Secure crypto helpers (Web Crypto API — AES-256-GCM + PBKDF2)
+  // Vault format v3: { version:3, salt, iv, encrypted } — PBKDF2 600K (current)
+  // Vault format v2: { version:2, salt, iv, encrypted } — PBKDF2 100K (legacy, auto-migrates)
+  // ---------------------------------------------------------------------------
+
+  static VAULT_ITERATIONS_V3 = 600_000; // OWASP 2024 recommendation
+  static VAULT_ITERATIONS_V2 = 100_000; // Legacy — kept for backward compat decrypt
+
+  // Derive 32-byte AES key from password + hex salt via PBKDF2-SHA256.
+  // Uses @noble/hashes pbkdf2Async — truly non-blocking: yields to JS event loop
+  // every ~10 ms so the UI stays responsive during 600K iterations on mobile.
+  // Lazy require() avoids top-level ESM import issues with Hermes at module init.
+  // Returns Uint8Array(32) — the raw AES-256 key bytes.
+  async _deriveKeyNative(password, saltHex, iterations = WalletManager.VAULT_ITERATIONS_V3) {
+    // react-native-quick-crypto provides crypto.subtle backed by OpenSSL on a C++ JSI thread.
+    // PBKDF2 runs natively — never blocks the JS thread — completes in < 1 second.
+    // Use Buffer.from() instead of TextEncoder — Buffer is always available via QuickCrypto.install().
+    const passwordBytes = Buffer.from(password == null ? '' : String(password), 'utf8');
+    const salt = this._hexToBytes(saltHex);
+    const keyMaterial = await crypto.subtle.importKey(
+      'raw', passwordBytes, 'PBKDF2', false, ['deriveKey']
+    );
+    return crypto.subtle.deriveKey(
+      { name: 'PBKDF2', salt, iterations, hash: 'SHA-256' },
+      keyMaterial,
+      { name: 'AES-GCM', length: 256 },
+      false,
+      ['encrypt', 'decrypt']
+    );
+  }
+
+  // Set keyCache and remember which salt/iterations produced it.
+  _setCachedKey(key, saltHex, iterations) {
+    this.keyCache      = key;
+    this._keyCacheSalt = saltHex;
+    this._keyCacheIter = iterations;
+  }
+
+  // Clear keyCache on failed attempts or vault change.
+  _clearCachedKey() {
+    this.keyCache      = null;
+    this._keyCacheSalt = null;
+    this._keyCacheIter = 0;
+  }
+
+  // Encrypt plaintext string → { version:3, salt, iv, encrypted } (all hex).
+  // Returns { vault, derivedKey } — derivedKey (Uint8Array) can be cached to avoid a 2nd PBKDF2 call.
+  // AES-256-GCM via crypto-browserify; output layout matches crypto.subtle (ciphertext || 16-byte tag).
+  async _encryptGCM(plaintext, password) {
+    const salt = crypto.getRandomValues(new Uint8Array(32));
+    const iv   = crypto.getRandomValues(new Uint8Array(12));
+    const key  = await this._deriveKeyNative(password, this._bytesToHex(salt), WalletManager.VAULT_ITERATIONS_V3);
+    const plaintextBytes = Buffer.from(plaintext == null ? '' : String(plaintext), 'utf8');
+    const cipherBuf = await crypto.subtle.encrypt(
+      { name: 'AES-GCM', iv },
+      key,
+      plaintextBytes
+    );
+    const vault = {
+      version:   3,
+      salt:      this._bytesToHex(salt),
+      iv:        this._bytesToHex(iv),
+      encrypted: this._bytesToHex(new Uint8Array(cipherBuf)),
+      timestamp: Date.now(),
+    };
+    return { vault, derivedKey: key };
+  }
+
+  // Decrypt vault v2 or v3 → plaintext string. Throws on wrong password.
+  // AES-256-GCM via crypto-browserify; compatible with vaults encrypted by
+  // crypto.subtle (ciphertext || 16-byte tag) and by _encryptGCM above.
+  async _decryptGCM(vaultData, password) {
+    const iterations = vaultData.version === 3
+      ? WalletManager.VAULT_ITERATIONS_V3
+      : WalletManager.VAULT_ITERATIONS_V2;
+    // Reuse cached key if it was derived from the same salt+iterations.
+    // This eliminates duplicate PBKDF2 calls when verifyPassword → loadWallet
+    // are called back-to-back (every unlock).
+    const canReuseCache =
+      this.keyCache &&
+      this._keyCacheSalt === vaultData.salt &&
+      this._keyCacheIter === iterations;
+    let key;
+    if (canReuseCache) {
+      key = this.keyCache;
+    } else {
+      key = await this._deriveKeyNative(password, vaultData.salt, iterations);
+      this._setCachedKey(key, vaultData.salt, iterations);
+    }
+    const plainBuf = await crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv: this._hexToBytes(vaultData.iv) },
+      key,
+      this._hexToBytes(vaultData.encrypted)
+    );
+    return Buffer.from(plainBuf).toString('utf8');
+  }
+
+  _bytesToHex(bytes) {
+    return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+  }
+
+  _hexToBytes(hex) {
+    // Reject malformed hex up front — a bad char/odd length would otherwise
+    // make parseInt return NaN, which coerces to 0 and silently corrupts crypto input.
+    if (typeof hex !== 'string' || hex.length % 2 !== 0 || !/^[0-9a-fA-F]*$/.test(hex)) {
+      throw new Error('Invalid hex input');
+    }
+    const bytes = new Uint8Array(hex.length / 2);
+    for (let i = 0; i < bytes.length; i++) {
+      bytes[i] = parseInt(hex.substr(i * 2, 2), 16);
+    }
+    return bytes;
+  }
+
+  // Legacy PBKDF2 (CryptoJS, kept ONLY to migrate old CBC vaults on first unlock).
+  async _deriveKeyLegacy(password, saltHex) {
+    const salt = CryptoJS.enc.Hex.parse(saltHex);
+    return new Promise((resolve) => {
+      setTimeout(() => {
+        resolve(CryptoJS.PBKDF2(password, salt, {
+          keySize: 256 / 32, iterations: 10000, hasher: CryptoJS.algo.SHA256
+        }));
       }, 0);
     });
+  }
+
+  // Legacy AES-CBC decrypt (CryptoJS, for migrating old vaults only).
+  async _decryptCBC(vaultData, password) {
+    const salt = CryptoJS.enc.Hex.parse(vaultData.salt);
+    const iv   = CryptoJS.enc.Hex.parse(vaultData.iv);
+    const key  = await this._deriveKeyLegacy(password, vaultData.salt);
+    const dec  = CryptoJS.AES.decrypt(vaultData.encrypted, key,
+      { iv, mode: CryptoJS.mode.CBC, padding: CryptoJS.pad.Pkcs7 });
+    const str  = dec.toString(CryptoJS.enc.Utf8);
+    if (!str) throw new Error('Wrong password or corrupted wallet');
+    return str;
   }
 
   // Encrypt and store wallet with PBKDF2 + AES (like extension)
   async storeWallet(walletData, password) {
     try {
-      // Clear old activation codes when storing new wallet
-      await AsyncStorage.removeItem('qnet_activation_codes');
+      // The first session after an import never decrypts again, so seed the identity cache here too.
+      await this.cacheLightIdentityPk(walletData);
+      // Only clear activation codes when it's a DIFFERENT wallet
+      // (import/create already clears them explicitly in WalletScreen)
+      // Previously this line deleted codes on EVERY save, causing data loss
+      const existingAddress = await AsyncStorage.getItem('qnet_wallet_address');
+      if (existingAddress && walletData.address && existingAddress !== walletData.address) {
+        // Different wallet — clear old activation codes
+        await AsyncStorage.removeItem('qnet_activation_codes');
+      }
       
       // Extract and use temporary mnemonic if present
       const mnemonic = walletData._tempMnemonic || walletData.mnemonic;
@@ -2682,39 +2827,11 @@ export class WalletManager {
         mnemonic: mnemonic // Will be encrypted below
       };
       
-      // Generate random salt (32 bytes)
-      const salt = CryptoJS.lib.WordArray.random(32);
-      
-      // Derive key using PBKDF2 ASYNCHRONOUSLY (10,000 iterations for security)
-      const key = await this.deriveKeyAsync(password, salt, 10000);
-      
-      // Cache the key for faster subsequent operations
-      this.keyCache = key;
-      this.keyCachePassword = password;
-      
-      // Generate random IV (16 bytes for AES)
-      const iv = CryptoJS.lib.WordArray.random(16);
-      
-      // Encrypt wallet data with mnemonic included
-      const encrypted = CryptoJS.AES.encrypt(
-        JSON.stringify(storageData), 
-        key,
-        { 
-          iv: iv,
-          mode: CryptoJS.mode.CBC,
-          padding: CryptoJS.pad.Pkcs7
-        }
-      );
-      
-      // Store encrypted data with salt and IV
-      const vaultData = {
-        encrypted: encrypted.toString(),
-        salt: salt.toString(),
-        iv: iv.toString(),
-        version: 1,
-        timestamp: Date.now()
-      };
-      
+      // Encrypt wallet data — AES-256-GCM + PBKDF2 600K (v3)
+      // derivedKey is reused for keyCache — no 2nd PBKDF2 call
+      const { vault: vaultData, derivedKey: vaultKey } = await this._encryptGCM(JSON.stringify(storageData), password);
+      this._setCachedKey(vaultKey, vaultData.salt, WalletManager.VAULT_ITERATIONS_V3);
+
       await AsyncStorage.setItem('qnet_wallet', JSON.stringify(vaultData));
       await AsyncStorage.setItem('qnet_wallet_address', walletData.address);
       
@@ -2747,16 +2864,9 @@ export class WalletManager {
       // Ignore cache errors
     }
     
-    // Fallback to Genesis bootstrap nodes if no discovered nodes
-    // These are the official Genesis nodes from genesis_constants.rs
-    const genesisNodes = [
-      { url: 'http://154.38.160.39:8001', region: 'North America' },
-      { url: 'http://62.171.157.44:8001', region: 'Europe' },
-      { url: 'http://161.97.86.81:8001', region: 'Europe' },
-      { url: 'http://5.189.130.160:8001', region: 'Europe' },
-      { url: 'http://162.244.25.114:8001', region: 'Europe' }
-    ];
-    
+    // Fallback to the canonical Genesis list (single source: config/nodes.js).
+    const genesisNodes = GENESIS_NODES.map(url => ({ url }));
+
     // Try to discover new nodes from Genesis nodes
     this.discoverNodes(genesisNodes);
     
@@ -2766,25 +2876,31 @@ export class WalletManager {
   }
   
   // Discover active nodes from network
+  // v3.13: Discover active nodes from network (stores reputation!)
   async discoverNodes(seedNodes) {
     try {
       // Query each seed node for their peer list
       for (const seed of seedNodes) {
         try {
+          const controller = new AbortController();
+          const t = setTimeout(() => controller.abort(), 5000);
           const response = await fetch(`${seed.url}/api/v1/peers`, {
             method: 'GET',
-            timeout: 5000
-          });
-          
+            signal: controller.signal, // `timeout:` is ignored by fetch — use AbortController
+          }).finally(() => clearTimeout(t));
+
           if (response.ok) {
             const data = await response.json();
             if (data.peers && Array.isArray(data.peers)) {
-              // Store discovered nodes
-              const discoveredNodes = data.peers.map(peer => ({
-                url: `http://${peer.address}`,
-                nodeType: peer.node_type,
-                lastSeen: Date.now()
-              }));
+              // v3.13: Store discovered nodes WITH reputation for filtering
+              const discoveredNodes = data.peers
+                .filter(peer => peer.address && peer.address.includes(':'))
+                .map(peer => ({
+                  url: peer.address.startsWith('http') ? peer.address : `http://${peer.address}`,
+                  nodeType: peer.node_type,
+                  reputation: peer.reputation || 0, // v3.13: Store reputation!
+                  lastSeen: Date.now()
+                }));
               
               // Merge with existing cache
               const cachedNodes = await AsyncStorage.getItem('qnet_discovered_nodes');
@@ -2793,7 +2909,7 @@ export class WalletManager {
                 const existing = JSON.parse(cachedNodes);
                 allNodes = [...existing, ...discoveredNodes];
                 
-                // Remove duplicates
+                // Remove duplicates (prefer newer data)
                 const unique = {};
                 allNodes.forEach(node => {
                   unique[node.url] = node;
@@ -2812,22 +2928,417 @@ export class WalletManager {
         }
       }
     } catch (e) {
-      // Discovery failed, will use Genesis nodes
+      // Discovery failed silently
     }
   }
   
-  // Helper for backward compatibility
+  // v3.31: PRODUCTION-READY node selection with discovery + caching
+  // v3.35: Genesis nodes ARE in the discovered list (from /api/v1/validators/proof)
+  // ONLY used directly for FIRST LAUNCH bootstrap when cache is empty
+  
+  // In-memory cache for fast access (synced with AsyncStorage)
+  // v3.35: Cache contains ALL validators including Genesis (verified via Merkle)
+  static discoveredNodesCache = null;
+  static lastDiscoveryTime = 0;
+  static nodeHealth = {};   // baseUrl -> { ewmaMs, fails, lastFailAt } — client-side latency/failure
+  static nonceCache = {};   // address -> { next, at } — local nonce, re-anchored on staleness/error
+  
+  // v3.36: Synchronous node getter - uses cache with weighted random
+  // Genesis nodes ARE in the cache - NO SEPARATE FALLBACK!
+  // 
+  // SCALABILITY: Load distributed across ALL eligible nodes (100K+)
+  // Each node gets proportional traffic based on reputation
   getRandomBootstrapNode() {
-    // Synchronous wrapper for compatibility
-    // Returns Genesis node immediately, discovery happens in background
-    const genesisNodes = [
-      'http://154.38.160.39:8001',
-      'http://62.171.157.44:8001',
-      'http://161.97.86.81:8001',
-      'http://5.189.130.160:8001',
-      'http://162.244.25.114:8001'
-    ];
-    return genesisNodes[Math.floor(Math.random() * genesisNodes.length)];
+    // Cache contains ALL validators (Genesis + Super) from verified Merkle proof
+    if (WalletManager.discoveredNodesCache && WalletManager.discoveredNodesCache.length > 0) {
+      const currentTime = Math.floor(Date.now() / 1000);
+      const eligibleNodes = WalletManager.discoveredNodesCache.filter(n => {
+        const age = currentTime - (n.lastSeen || 0);
+        return age < NODE_DISCOVERY.MAX_STALE_SECS && 
+               n.reputation >= NODE_DISCOVERY.MIN_REPUTATION && 
+               n.isSynced !== false;
+      });
+      
+      if (eligibleNodes.length > 0) {
+        // Weighted random by BLOCKCHAIN reputation
+        // Higher reputation = higher chance (but ALL eligible nodes participate!)
+        // Genesis and Super nodes compete equally - no special treatment
+        const totalRep = eligibleNodes.reduce((sum, n) => sum + (n.reputation || 0.7), 0);
+        let random = Math.random() * totalRep;
+        for (const node of eligibleNodes) {
+          random -= (node.reputation || 0.7);
+          if (random <= 0) {
+            return node.url;
+          }
+        }
+        return eligibleNodes[0].url;
+      }
+    }
+    
+    // FIRST LAUNCH ONLY - cache is empty
+    // Genesis used ONCE to bootstrap, then cache takes over
+    this.refreshNodeDiscovery();
+    return getRandomGenesisNode();
+  }
+  
+  // --- Scalable node client: health-ranked selection + hedged, timeout-bounded requests ---------
+  // Every remote call is capped by a timeout and hedged across two nodes, so one slow/unreachable
+  // node can never stall a send; load stays spread across the whole validator set.
+
+  _recordNode(base, ok, ms) {
+    const h = WalletManager.nodeHealth[base] || { ewmaMs: 300, fails: 0, lastFailAt: 0 };
+    if (ok) { h.ewmaMs = h.ewmaMs * 0.7 + ms * 0.3; h.fails = 0; }
+    else { h.fails = Math.min(h.fails + 1, 10); h.lastFailAt = Date.now(); }
+    WalletManager.nodeHealth[base] = h;
+  }
+
+  _recentlyFailed(base) {
+    const h = WalletManager.nodeHealth[base];
+    return !!h && h.fails >= 3 && (Date.now() - h.lastFailAt) < 30000;
+  }
+
+  // Up to `count` distinct eligible nodes, weighted-random by reputation (spreads load), skipping
+  // recently-failing ones. Falls back to a genesis node only when the discovery cache is cold.
+  getRankedNodes(count = 2) {
+    const cache = WalletManager.discoveredNodesCache;
+    let pool = [];
+    if (cache && cache.length > 0) {
+      const now = Math.floor(Date.now() / 1000);
+      const eligible = (n) => (now - (n.lastSeen || 0)) < NODE_DISCOVERY.MAX_STALE_SECS
+        && n.reputation >= NODE_DISCOVERY.MIN_REPUTATION && n.isSynced !== false;
+      pool = cache.filter(n => eligible(n) && !this._recentlyFailed(n.url));
+      if (pool.length === 0) pool = cache.filter(eligible);   // relax if all transiently marked bad
+    }
+    const urls = [];
+    const picks = pool.slice();
+    while (urls.length < count && picks.length > 0) {
+      const total = picks.reduce((s, n) => s + (n.reputation || 0.7), 0);
+      let r = Math.random() * total, idx = 0;
+      for (let i = 0; i < picks.length; i++) { r -= (picks[i].reputation || 0.7); if (r <= 0) { idx = i; break; } }
+      urls.push(picks[idx].url); picks.splice(idx, 1);
+    }
+    if (urls.length === 0) { this.refreshNodeDiscovery(); urls.push(getRandomGenesisNode()); }
+    return urls;
+  }
+
+  // Hedged request: fire the primary; if silent for hedgeMs, race a second node in parallel; first
+  // success wins and aborts the rest; a failing node hands off to the next at once. Each attempt is
+  // capped by timeoutMs. A CLIENT-signed, content-addressed POST is safe to hedge (the mempool dedups
+  // the double-submit). A server-BUILDS-the-TX POST is NOT (two nodes mint two distinct hashes for one
+  // logical op) — pass nodes:getRankedNodes(1) for those (e.g. /api/v1/node-registration/submit).
+  async _hedged(path, { method = 'GET', body = null, timeoutMs = 4000, hedgeMs = 700, nodes = null, raw = false } = {}) {
+    const bases = nodes || this.getRankedNodes(2);
+    const ctrls = [];
+    let settled = false, launched = 0, pending = 0, lastErr = null;
+    const run = (base) => new Promise((resolve, reject) => {
+      const c = new AbortController(); ctrls.push(c);
+      const t0 = Date.now();
+      const guard = setTimeout(() => c.abort(), timeoutMs);
+      fetch(`${base}${path}`, {
+        method, headers: { 'Content-Type': 'application/json' },
+        body: body ? JSON.stringify(body) : undefined, signal: c.signal,
+      }).then(async (r) => {
+        clearTimeout(guard);
+        const data = raw ? (await r.text().catch(() => '')) : (await r.json().catch(() => ({})));
+        this._recordNode(base, true, Date.now() - t0);
+        resolve({ ok: r.ok, status: r.status, data, base });
+      }).catch((e) => {
+        clearTimeout(guard); this._recordNode(base, false, Date.now() - t0); reject(e);
+      });
+    });
+    return new Promise((resolve, reject) => {
+      const launch = (i) => {
+        if (settled || i >= bases.length) return;
+        launched++; pending++;
+        run(bases[i]).then((res) => {
+          if (settled) return;
+          settled = true; ctrls.forEach(c => { try { c.abort(); } catch (_) {} }); resolve(res);
+        }).catch((e) => {
+          pending--; lastErr = e;
+          if (settled) return;
+          if (launched < bases.length) launch(launched);            // failed → next immediately
+          else if (pending === 0) reject(lastErr || new Error('all nodes failed'));
+        });
+      };
+      launch(0);
+      if (bases.length > 1) setTimeout(() => { if (!settled && launched < 2) launch(1); }, hedgeMs);
+    });
+  }
+
+  // Submit a signed TX (hedged POST). Gossip routes it to the current producer within ~1 microblock,
+  // so no producer-lookup round-trip is needed.
+  async submitSignedTx(txPayload) {
+    const res = await this._hedged('/api/v1/transaction', { method: 'POST', body: txPayload, timeoutMs: 5000, hedgeMs: 900 });
+    return res.data || {};
+  }
+
+  // Nonce for the next TX from `address`, tracked locally so back-to-back sends skip the round-trip;
+  // re-anchored from chain when stale (TTL) or forced after a nonce-rejected submit.
+  async resolveNonce(address, forceFresh = false) {
+    const cached = WalletManager.nonceCache[address];
+    if (!forceFresh && cached && (Date.now() - cached.at) < 15000) return cached.next;
+    let accountNonce = 0;
+    let pkBound = false;
+    try {
+      const res = await this._hedged(`/api/v1/account/${address}`, { timeoutMs: 4000, hedgeMs: 700 });
+      if (res.ok && res.data) {
+        accountNonce = res.data.nonce || 0;
+        pkBound = res.data.has_dilithium_pk === true;
+      } else if (cached) return cached.next;
+    } catch (e) {
+      if (cached) return cached.next;
+      console.warn('[SEND] nonce fetch failed, assuming 0:', e.message);
+    }
+    const next = accountNonce + 1;
+    // FIX-5 pk-elision gate: the node's OWN answer for "is this wallet's ML-DSA-65 key committed on-chain",
+    // never an inference. nonce>=1 does NOT imply it — a node-constructed NodeActivation raises the wallet's
+    // nonce while carrying a node_id in the pubkey field, so it never binds the wallet key. Only a fresh
+    // chain read may raise this (the optimistic _bumpNonce must not), else we could elide while the binding
+    // TX is still unconfirmed and the node would reject it (it resolves from COMMITTED state, not mempool).
+    // Absent field (older node) ⇒ false ⇒ we keep sending the pk: degrades bandwidth, never correctness.
+    WalletManager.nonceCache[address] = { next, at: Date.now(), pkBound };
+    return next;
+  }
+
+  _bumpNonce(address, usedNonce) {
+    const prev = WalletManager.nonceCache[address];
+    // Carry pkBound forward UNCHANGED — only a confirmed chain read may raise it (see resolveNonce).
+    WalletManager.nonceCache[address] = { next: usedNonce + 1, at: Date.now(), pkBound: !!(prev && prev.pkBound) };
+  }
+
+  /// True once a confirmed chain read proved this wallet's ML-DSA-65 pubkey is committed on-chain,
+  /// i.e. the 1952-byte key may be omitted from the wire (the node rehydrates it). Conservative: any
+  /// doubt (no cache / never fetched / nonce 0) ⇒ false ⇒ we carry the pk and bind it.
+  static _pkElidable(address) {
+    const c = WalletManager.nonceCache[address];
+    return !!(c && c.pkBound);
+  }
+
+  // PURE DILITHIUM (F0.1): the light node's on-chain attestation root, ping delegation, and reward-claim
+  // proofs are ALL signed by the ML-DSA-65 WALLET key (the key whose SHA512 IS wallet_address). Returns it
+  // as hex {secretKey, publicKey} for signWithDilithium — replaces the legacy per-node identity key so the
+  // RAM quantum_pubkey == the on-chain root (load_vrf_public_key) and background/foreground pings verify.
+  /// Re-derive the light node's identity-key cache from a decrypted wallet.
+  ///
+  /// The node verifies a ping delegation against the identity key the chain committed, and the app
+  /// presents that key ONLY from `qnet_identity_pk_<id>` — a cache written once at registration and
+  /// wiped by a reinstall. Without it every ping goes out with `identity_pubkey` absent and the node
+  /// answers `identity_unresolved presented=false`, which is what the genesis logs showed. Nothing is
+  /// actually lost: a light node's identity IS this wallet's ML-DSA-65 key and its id derives from the
+  /// wallet address, so both come back with the seed.
+  ///
+  /// It lives HERE, not in a screen: the failing pings come from the background task, which reaches no
+  /// screen and holds no password. Every decrypt and every store passes through this class, so this is
+  /// the one place that cannot be routed around. Public half only, idempotent, no network.
+  async cacheLightIdentityPk(wallet) {
+    try {
+      const pk = wallet && wallet.qnetKeypair && wallet.qnetKeypair.publicKey;
+      const addr = wallet && wallet.qnetAddress;
+      if (!pk || !addr) return;
+      const key = `qnet_identity_pk_${this.generateLightNodePseudonym(addr)}`;
+      if (await AsyncStorage.getItem(key)) return;
+      const hex = Buffer.from(new Uint8Array(pk)).toString('hex');
+      if (hex.length > 64) {
+        await AsyncStorage.setItem(key, hex);
+        console.log('[Identity] ping identity key restored from wallet');
+      }
+    } catch (_) { /* best effort: a ping that cannot present still reports honestly */ }
+  }
+
+  async _walletDilithiumKeys(password, walletData = null) {
+    const wd = walletData || await this.loadWallet(password);
+    const qk = wd && wd.qnetKeypair;
+    if (!qk || !qk.privateKey || !qk.publicKey) {
+      throw new Error('No ML-DSA-65 QNet key in wallet (pure-Dilithium identity unavailable)');
+    }
+    return {
+      secretKey: Buffer.from(new Uint8Array(qk.privateKey)).toString('hex'),
+      publicKey: Buffer.from(new Uint8Array(qk.publicKey)).toString('hex'),
+    };
+  }
+
+  // Async node getter with guaranteed fresh data
+  async getNodeWithDiscovery() {
+    // Load cache from storage if not loaded
+    if (!WalletManager.discoveredNodesCache) {
+      await this.loadNodesFromCache();
+    }
+    
+    // Refresh if stale (use config)
+    if (Date.now() - WalletManager.lastDiscoveryTime > NODE_DISCOVERY.DISCOVERY_INTERVAL_MS) {
+      await this.refreshNodeDiscovery();
+    }
+    
+    return this.getRandomBootstrapNode();
+  }
+  
+  // Load cached nodes from AsyncStorage
+  async loadNodesFromCache() {
+    try {
+      const cached = await AsyncStorage.getItem('qnet_discovered_nodes');
+      if (cached) {
+        WalletManager.discoveredNodesCache = JSON.parse(cached);
+      }
+    } catch (e) {
+      WalletManager.discoveredNodesCache = [];
+    }
+  }
+  
+  // v3.36: Get random node for discovery requests
+  // Uses cache if available, Genesis ONLY for first launch
+  // NO SEPARATE FALLBACK - Genesis is in the cache!
+  getRandomNodeForDiscovery() {
+    // If cache exists and has nodes, use weighted random from cache
+    if (WalletManager.discoveredNodesCache && WalletManager.discoveredNodesCache.length > 0) {
+      const currentTime = Math.floor(Date.now() / 1000);
+      
+      // Filter eligible nodes (same criteria as everywhere)
+      const eligibleNodes = WalletManager.discoveredNodesCache.filter(n => {
+        const age = currentTime - (n.lastSeen || 0);
+        return age < NODE_DISCOVERY.MAX_STALE_SECS && 
+               n.reputation >= NODE_DISCOVERY.MIN_REPUTATION && 
+               n.isSynced !== false;
+      });
+      
+      if (eligibleNodes.length > 0) {
+        // Weighted random selection (higher reputation = higher chance)
+        const totalRep = eligibleNodes.reduce((sum, n) => sum + (n.reputation || 0.7), 0);
+        let random = Math.random() * totalRep;
+        for (const node of eligibleNodes) {
+          random -= (node.reputation || 0.7);
+          if (random <= 0) {
+            return node.url;
+          }
+        }
+        return eligibleNodes[0].url;
+      }
+    }
+    
+    // FIRST LAUNCH ONLY - cache is empty
+    // Genesis nodes will be added to cache after first successful discovery
+    return getRandomGenesisNode();
+  }
+  
+  // v3.36: Refresh node discovery with TRUSTLESS verification
+  // Uses /api/v1/validators/proof - data verified via Merkle proof
+  // 
+  // SCALABILITY FIX: Discovery goes to RANDOM node from cache (not just Genesis!)
+  // Genesis nodes ARE in the cache - they are regular validators
+  // Genesis used ONLY for FIRST LAUNCH when cache is empty
+  async refreshNodeDiscovery(maxRetries = 3) {
+    // Don't refresh too often
+    if (Date.now() - WalletManager.lastDiscoveryTime < 30000) return;
+    WalletManager.lastDiscoveryTime = Date.now();
+    
+    const triedNodes = new Set();
+    let lastError = null;
+    
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+      try {
+        // v3.36: Use node from CACHE if available (includes Genesis + Super)
+        // Genesis only for FIRST LAUNCH when cache is empty
+        // This distributes discovery load across ALL nodes!
+        let seedUrl = this.getRandomNodeForDiscovery();
+        let retryCount = 0;
+        while (triedNodes.has(seedUrl) && retryCount < 10) {
+          seedUrl = this.getRandomNodeForDiscovery();
+          retryCount++;
+        }
+        triedNodes.add(seedUrl);
+        
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 5000);
+        
+        // v3.32: Use new TRUSTLESS endpoint with Merkle proof
+        const response = await fetch(`${seedUrl}/api/v1/validators/proof`, {
+          method: 'GET',
+          signal: controller.signal
+        });
+        
+        clearTimeout(timeoutId);
+        
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        
+        const data = await response.json();
+        
+        // v3.32: Verify Merkle proof locally before trusting data!
+        if (data.validators && data.merkle_root) {
+          const proofValid = await this.verifyValidatorSetProof(data);
+          
+          if (!proofValid) {
+            console.warn('[DISCOVERY] Validator set proof INVALID - node may be malicious!');
+            throw new Error('Invalid Merkle proof'); // Retry on different node
+          }
+        }
+        
+        if (data.validators && Array.isArray(data.validators)) {
+          // Filter active nodes - all data comes from BLOCKCHAIN (verified by proof!)
+          // v3.35: Genesis nodes ARE in this list - no separate fallback needed!
+          // Only Super/Genesis nodes (Light nodes are NOT real nodes)
+          const nodes = data.validators
+            .filter(v => v.address && v.is_active && v.reputation >= NODE_DISCOVERY.MIN_REPUTATION && v.is_synced !== false)
+            .map(v => ({
+              url: v.address.startsWith('http') ? v.address : `http://${v.address}`,
+              reputation: v.reputation, // BLOCKCHAIN reputation - verified by proof!
+              nodeType: v.node_type,
+              nodeId: v.node_id,
+              lastSeen: v.last_seen || Math.floor(Date.now() / 1000), // v3.35: REAL last_seen from P2P heartbeat (seconds)
+              isSynced: v.is_synced !== false // v3.35: Sync status from node
+            }));
+          
+          if (nodes.length > 0) {
+            // Replace cache entirely (don't merge - we have fresh verified data)
+            WalletManager.discoveredNodesCache = nodes;
+            await AsyncStorage.setItem('qnet_discovered_nodes', 
+              JSON.stringify(WalletManager.discoveredNodesCache)
+            );
+            return; // Success!
+          }
+        }
+        
+        throw new Error('Empty validators list');
+      } catch (e) {
+        lastError = e;
+        // v3.35: Wait before retry (exponential backoff)
+        if (attempt < maxRetries - 1) {
+          await new Promise(r => setTimeout(r, (attempt + 1) * 500));
+        }
+      }
+    }
+    
+    // All retries failed
+    console.warn(`[DISCOVERY] Failed after ${maxRetries} retries:`, lastError?.message);
+    // Keep using existing cache if available
+  }
+  
+  // Get ALL available nodes for redundant operations (sorted by blockchain reputation)
+  // v3.35: NO FALLBACK - Genesis nodes ARE in discoveredNodesCache!
+  // They come from /api/v1/validators/proof - verified via Merkle proof
+  getAvailableNodes() {
+    const currentTime = Math.floor(Date.now() / 1000);
+    
+    // v3.35: Genesis nodes ARE in this list (from validators/proof endpoint)
+    // No separate fallback needed - they're first-class validators
+    if (WalletManager.discoveredNodesCache && WalletManager.discoveredNodesCache.length > 0) {
+      const filtered = WalletManager.discoveredNodesCache
+        .filter(n => {
+          const age = currentTime - (n.lastSeen || 0);
+          return age < NODE_DISCOVERY.MAX_STALE_SECS && n.reputation >= NODE_DISCOVERY.MIN_REPUTATION && n.isSynced !== false;
+        })
+        .sort((a, b) => b.reputation - a.reputation) // Sorted by blockchain reputation
+        .slice(0, 20)
+        .map(n => n.url);
+      
+      // If all cached nodes were filtered out (stale/low reputation), fall back to Genesis
+      if (filtered.length > 0) return filtered;
+    }
+    
+    // ONLY if cache is completely empty (first app launch) or all filtered out
+    // This triggers discovery which will populate cache with verified list
+    this.refreshNodeDiscovery();
+    return [...GENESIS_NODES];
   }
 
   // Load and decrypt wallet with PBKDF2 + AES
@@ -2849,222 +3360,888 @@ export class WalletManager {
         throw new Error('Wallet data is corrupted. Please create a new wallet or import existing one.');
       }
       
-      // Handle old format (direct encryption without salt/IV)
-      if (typeof vaultData === 'string' || !vaultData.salt) {
-        // Legacy format - try direct decryption
-        const encrypted = typeof vaultData === 'string' ? vaultData : vaultData.encrypted;
-        const decrypted = CryptoJS.AES.decrypt(encrypted, password).toString(CryptoJS.enc.Utf8);
-        if (!decrypted) {
-          throw new Error('Invalid password');
-        }
-        let wallet = JSON.parse(decrypted);
-        
-        // Migrate old QNet address format to new if needed
-        wallet = await this.migrateQNetAddress(wallet);
-        
-        // Store migrated wallet in new format
-        if (wallet.qnetAddress && wallet.qnetAddress.length >= 40) {
-          // Generate salt and IV for new format
-          const salt = CryptoJS.lib.WordArray.random(256/8);
-          const iv = CryptoJS.lib.WordArray.random(128/8);
-          
-          // Derive key ASYNCHRONOUSLY
-          const key = await this.deriveKeyAsync(password, salt, 10000);
-          
-          // Encrypt with new format
-          const updatedEncrypted = CryptoJS.AES.encrypt(
-            JSON.stringify(wallet),
-            key,
-            {
-              iv: iv,
-              mode: CryptoJS.mode.CBC,
-              padding: CryptoJS.pad.Pkcs7
-            }
-          ).toString();
-          
-          const updatedVaultData = {
-            encrypted: updatedEncrypted,
-            salt: salt.toString(CryptoJS.enc.Hex),
-            iv: iv.toString(CryptoJS.enc.Hex)
-          };
-          await AsyncStorage.setItem('qnet_wallet', JSON.stringify(updatedVaultData));
-          
-          // Also update the stored QNet address
-          await AsyncStorage.setItem('qnet_address', wallet.qnetAddress);
-        }
-        
-        // Remove mnemonic from memory for security
-        if (wallet.mnemonic) {
-          delete wallet.mnemonic;
-        }
-        return wallet;
-      }
-      
-      // New format with salt and IV
-      const salt = CryptoJS.enc.Hex.parse(vaultData.salt);
-      const iv = CryptoJS.enc.Hex.parse(vaultData.iv);
-      
-      // Use cached key if available
-      let key;
-      if (this.keyCachePassword === password && this.keyCache) {
-        key = this.keyCache;
+      // Decrypt — support vault v1/v2/v3 with auto-migration to v3 (GCM 600K).
+      // v0 (no salt, direct CryptoJS) was removed — those wallets are too old to exist in production.
+      let plaintext;
+      if (vaultData.version === 3 || vaultData.version === 2) {
+        // v3: AES-256-GCM + PBKDF2 600K (current)
+        // v2: AES-256-GCM + PBKDF2 100K (legacy, auto-migrates to v3)
+        plaintext = await this._decryptGCM(vaultData, password);
+      } else if (vaultData.salt) {
+        // v1: AES-256-CBC + PBKDF2 10K (legacy) — migrate on first unlock
+        plaintext = await this._decryptCBC(vaultData, password);
       } else {
-        // Derive key ASYNCHRONOUSLY using same parameters as storage
-        key = await this.deriveKeyAsync(password, salt, 10000);
-        this.keyCache = key;
-        this.keyCachePassword = password;
+        throw new Error('Unsupported wallet format. Please re-import using your recovery phrase.');
       }
-      
-      // Decrypt
-      const decrypted = CryptoJS.AES.decrypt(
-        vaultData.encrypted,
-        key,
-        {
-          iv: iv,
-          mode: CryptoJS.mode.CBC,
-          padding: CryptoJS.pad.Pkcs7
+
+      let wallet = JSON.parse(plaintext);
+
+      // Migrate old QNet address format if needed
+      wallet = await this.migrateQNetAddress(wallet);
+
+      // Migrate to v3 (PBKDF2 600K) if vault is not already v3
+      let migrated = false;
+      const fromVersion = vaultData.version || 1;
+      if (vaultData.version !== 3) {
+        try {
+          // derivedKey is reused for keyCache — no 2nd PBKDF2 call needed
+          const { vault: newVault, derivedKey: newKey } = await this._encryptGCM(JSON.stringify(wallet), password);
+          await AsyncStorage.setItem('qnet_wallet', JSON.stringify(newVault));
+          this._setCachedKey(newKey, newVault.salt, WalletManager.VAULT_ITERATIONS_V3);
+          migrated = true;
+          console.log(`[INFO][WALLET] vault_migrated from_version=${fromVersion} to_version=3 iterations=${WalletManager.VAULT_ITERATIONS_V3}`);
+        } catch (migrationError) {
+          // Migration failed — wallet is still readable (old format), but log the failure
+          console.error(`[ERR][WALLET] vault_migration_failed from_version=${fromVersion} err=${migrationError.message}`);
+          // Re-throw so caller can show an error to user
+          throw new Error(`Wallet migration failed: ${migrationError.message}. Your wallet data is safe — please try again.`);
         }
-      );
-      
-      let decryptedStr;
-      try {
-        decryptedStr = decrypted.toString(CryptoJS.enc.Utf8);
-      } catch (utf8Error) {
-        // console.error('UTF-8 decode error, likely wrong password');
-        throw new Error('Wrong password or corrupted wallet');
-      }
-      
-      if (!decryptedStr) {
-        throw new Error('Wrong password or corrupted wallet');
-      }
-      
-      try {
-        let wallet = JSON.parse(decryptedStr);
-        
-        // Migrate old QNet address format to new if needed
-        wallet = await this.migrateQNetAddress(wallet);
-        
-        // Store migrated wallet if it was updated
-        if (wallet.qnetAddress && wallet.qnetAddress.length >= 40) {
-          // Re-encrypt with migrated data
-          const updatedEncrypted = CryptoJS.AES.encrypt(
-            JSON.stringify(wallet),
-            key,
-            {
-              iv: iv,
-              mode: CryptoJS.mode.CBC,
-              padding: CryptoJS.pad.Pkcs7
-            }
-          ).toString();
-          
-          const updatedVaultData = {
-            encrypted: updatedEncrypted,
-            salt: vaultData.salt,
-            iv: vaultData.iv
-          };
-          await AsyncStorage.setItem('qnet_wallet', JSON.stringify(updatedVaultData));
-          
-          // Also update the stored QNet address
-          await AsyncStorage.setItem('qnet_address', wallet.qnetAddress);
+      } else {
+        // Cache CryptoKey for faster subsequent unlocks (skip if already cached by verifyPassword)
+        if (!this.keyCache) {
+          const k = await this._deriveKeyNative(password, vaultData.salt, WalletManager.VAULT_ITERATIONS_V3);
+          this._setCachedKey(k, vaultData.salt, WalletManager.VAULT_ITERATIONS_V3);
         }
-        
-        // Remove mnemonic from memory for security
-        if (wallet.mnemonic) {
-          delete wallet.mnemonic;
-        }
-        return wallet;
-      } catch (parseError) {
-        // console.error('Failed to parse decrypted data');
-        throw new Error('Wrong password or corrupted wallet');
       }
+
+      if (wallet.qnetAddress) {
+        await AsyncStorage.setItem('qnet_address', wallet.qnetAddress);
+        // Stamp the crypto scheme so getCurrentWallet (no-password path) never trusts an
+        // address cached by the old round-3 build; a missing/old stamp = re-derive on unlock.
+        await AsyncStorage.setItem('qnet_address_scheme', 'fips204');
+      }
+
+      // Remove mnemonic from returned object — caller uses getEncryptedMnemonic() explicitly
+      if (wallet.mnemonic) delete wallet.mnemonic;
+
+      // Attach migration info for caller to show notification
+      wallet._migrated = migrated;
+      wallet._migratedFromVersion = migrated ? fromVersion : null;
+      await this.cacheLightIdentityPk(wallet);
+      return wallet;
     } catch (error) {
-      // console.error('Error loading wallet:', error);
       throw error;
     }
   }
 
   // Get wallet balance from Solana network
   async getBalance(publicKey, isTestnet = true) {
-    try {
-      // Use correct RPC based on network (don't use cached connection)
-      // FIXED: Previously inverted - now isTestnet=true means devnet
-      const rpcUrl = isTestnet 
-        ? 'https://api.devnet.solana.com'  // Testnet
-        : 'https://api.mainnet-beta.solana.com';  // Mainnet
-        
-      const response = await fetch(rpcUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          jsonrpc: '2.0',
-          id: 1,
-          method: 'getBalance',
-          params: [publicKey]
-        })
-      });
-      
-      if (response.ok) {
-        const data = await response.json();
-        // Convert lamports to SOL (1 SOL = 1e9 lamports)
-        return (data.result?.value || 0) / 1e9;
-      }
-      
-      return 0;
-    } catch (error) {
-      // console.error('Error getting balance:', error);
-      return 0;
+    // 2 attempts, rotating the Solana RPC endpoint on 429/failure; null (not 0) ⇒ keep last-known.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const rpcUrl = attempt === 0 ? getSolanaRpcUrl(isTestnet) : rotateSolanaRpc(isTestnet);
+        const controller = new AbortController();
+        const t = setTimeout(() => controller.abort(), 5000);
+        const response = await fetch(rpcUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'getBalance', params: [publicKey] }),
+          signal: controller.signal,
+        }).finally(() => clearTimeout(t));
+        if (response.ok) {
+          const data = await response.json();
+          return (data.result?.value || 0) / 1e9; // lamports → SOL
+        }
+      } catch (error) { /* rotate + retry */ }
     }
+    return null;
   }
   
   // Get SPL token balance (for 1DEV and other tokens)
   async getTokenBalance(walletAddress, mintAddress, isTestnet = true) {
+    // 2 attempts, rotating the Solana RPC on 429/failure; null (not 0) on failure ⇒ keep last-known.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const rpcUrl = attempt === 0 ? getSolanaRpcUrl(isTestnet) : rotateSolanaRpc(isTestnet);
+        const controller = new AbortController();
+        const t = setTimeout(() => controller.abort(), 5000);
+        const response = await fetch(rpcUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'getTokenAccountsByOwner',
+            params: [walletAddress, { mint: mintAddress }, { encoding: 'jsonParsed' }] }),
+          signal: controller.signal,
+        }).finally(() => clearTimeout(t));
+        if (response.ok) {
+          const data = await response.json();
+          const accounts = data.result?.value || [];
+          if (accounts.length > 0) {
+            return parseFloat(accounts[0].account.data.parsed.info.tokenAmount.uiAmount) || 0;
+          }
+          return 0; // no token account = genuine zero
+        }
+      } catch (error) { /* rotate + retry */ }
+    }
+    return null;
+  }
+
+  // v3.36: DEPRECATED - Use getQNCBalanceWithProof() for ALL balance queries!
+  // This method is kept only for backwards compatibility with internal code
+  // For UI/display: ALWAYS use getQNCBalanceWithProof() - it's TRUSTLESS!
+  // 
+  // WHY: getQNCBalance() trusts the node response without Merkle verification
+  // A malicious node could return fake balance. getQNCBalanceWithProof() prevents this.
+  async getQNCBalance(address, maxRetries = 3) {
+    const result = await this.getQNCBalanceWithProof(address, true, maxRetries);
+    return result.ok ? result.balance : null;   // null on failure ⇒ caller keeps last-known
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // v3.11: TRUSTLESS BALANCE VERIFICATION with Merkle Proofs
+  // Light clients can verify balance without trusting the API
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Get QNC balance with Merkle proof for trustless verification
+   * v3.35: Added retry logic with different nodes
+   * @param {string} address - Wallet address
+   * @param {boolean} verify - Whether to verify the proof
+   * @returns {Promise<{balance: number, verified: boolean, proof: object}>}
+   */
+  // Returns { ok, balance, verified, ... }. ok=false ⇒ fetch failed / no data: the caller MUST keep
+  // the last-known balance, NEVER display a fabricated 0. Hedged + health-ranked (send-path bar).
+  async getQNCBalanceWithProof(address, verify = true, _maxRetries = 3) {
+    if (!address || typeof address !== 'string') {
+      return { ok: false, balance: null, verified: false, error: 'Invalid address' };
+    }
+    let res;
     try {
-      // Use correct RPC based on network - TESTNET when isTestnet=true
-      const rpcUrl = isTestnet 
-        ? 'https://api.devnet.solana.com'  // TESTNET when isTestnet=true
-        : 'https://api.mainnet-beta.solana.com';  // MAINNET when isTestnet=false
+      // raw text: balance/nonce are uint64 — JSON.parse would lose precision past 2^53 nano (>9.007M QNC).
+      res = await this._hedged(`/api/v1/account/${address}/balance/proof`, { timeoutMs: 5000, hedgeMs: 800, raw: true });
+    } catch (e) {
+      console.warn('[BALANCE] proof fetch failed:', e.message);
+      return { ok: false, balance: null, verified: false, error: e.message };
+    }
+    if (!res.ok || !res.data) {
+      return { ok: false, balance: null, verified: false, error: `HTTP ${res.status}` };
+    }
+    let data;
+    try { data = JSON.parse(res.data); } catch (_) {
+      return { ok: false, balance: null, verified: false, error: 'bad json' };
+    }
+    // Exact base-units extracted as strings from the raw text (BigInt-safe for the proof); Number only
+    // for the display value, where precision loss above ~9M QNC is acceptable.
+    const balMatch = /"balance"\s*:\s*"?(\d+)"?/.exec(res.data);
+    const balanceNanoStr = balMatch ? balMatch[1] : String(data.balance || 0);
+    const nonceMatch = /"nonce"\s*:\s*"?(\d+)"?/.exec(res.data);
+    const nonceStr = nonceMatch ? nonceMatch[1] : String(data.nonce || 0);
+    // last_claimed_epoch is in the account leaf, so the proof needs it (0 for a wallet that
+    // never claimed). pending_rewards was dropped from the leaf and is not threaded at all.
+    const lceMatch = /"last_claimed_epoch"\s*:\s*"?(\d+)"?/.exec(res.data);
+    const lceStr = lceMatch ? lceMatch[1] : '0';
+    // is_node is in the leaf too: a wallet that activated a node hashes 1 here, and hardcoding 0
+    // would fail every operator's balance proof.
+    const isNode = /"is_node"\s*:\s*true/.test(res.data);
+    const balanceQNC = Number(balanceNanoStr) / 1e9;
+    // QC-anchored proof verification (MITM-proof); advisory flag surfaced to the caller.
+    let verified = false;
+    if (verify && data.merkle_proof && data.merkle_proof.length > 0) {
+      const proofValid = await this.verifyMerkleProof(address, balanceNanoStr, nonceStr, data.merkle_proof, data.state_root, lceStr, isNode);
+      if (proofValid) {
+        verified = await verifyMacroblockStateRoot(data.state_root, data.block_height, () => this.getRankedNodes(1)[0]);
+      }
+    }
+    return {
+      ok: true, balance: balanceQNC, balanceNano: balanceNanoStr, nonce: nonceStr,
+      verified, blockHeight: data.block_height, stateRoot: data.state_root, proof: data.merkle_proof,
+    };
+  }
+
+  // V2: TRUSTLESS QRC-20 balance — exactly the getQNCBalanceWithProof trust model, one level deeper.
+  //   GET /api/v1/token/{contract}/{holder}/balance/proof -> two-level TokenBalanceProof.
+  // verifyTokenBalanceProof re-derives the chain balance -> storage_root -> contract account leaf ->
+  // state_root; then verifyMacroblockStateRoot independently anchors state_root to the committee QC
+  // (MITM-proof). `verified` is true only if BOTH hold. Balance is exact u64-string (BigInt-safe).
+  async getTokenBalanceWithProof(contract, holder, decimals = null, verify = true) {
+    if (!contract || !holder) return { ok: false, balance: null, verified: false, error: 'bad args' };
+    let res;
+    try {
+      res = await this._hedged(`/api/v1/token/${contract}/${holder}/balance/proof`, { timeoutMs: 5000, hedgeMs: 800, raw: true });
+    } catch (e) {
+      return { ok: false, balance: null, verified: false, error: e.message };
+    }
+    if (!res.ok || !res.data) return { ok: false, balance: null, verified: false, error: `HTTP ${res.status}` };
+    let data;
+    try { data = JSON.parse(res.data); } catch (_) { return { ok: false, balance: null, verified: false, error: 'bad json' }; }
+    // token_balance is a u64 base-unit string — re-extract from raw text so it stays exact past 2^53.
+    const balMatch = /"token_balance"\s*:\s*"?(\d+)"?/.exec(res.data);
+    const baseUnitsStr = balMatch ? balMatch[1] : String(data.token_balance || '0');
+    let verified = false;
+    if (verify && Array.isArray(data.storage_proof) && Array.isArray(data.account_proof)) {
+      // SECURITY: bind to the REQUESTED (contract, holder) — else a valid proof for a DIFFERENT
+      // token/holder verifies internally and falsely earns the checkmark.
+      const proofValid = await this.verifyTokenBalanceProof(data, contract, holder);
+      if (proofValid) {
+        verified = await verifyMacroblockStateRoot(data.state_root, data.block_height, () => this.getRankedNodes(1)[0]);
+      }
+    }
+    const human = decimals != null ? this._formatBaseUnits(baseUnitsStr, decimals) : baseUnitsStr;
+    return {
+      ok: true, balance: human, balanceBase: baseUnitsStr, verified,
+      blockHeight: data.block_height, stateRoot: data.state_root,
+    };
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // QRC-20 token READ path — hedged/health-ranked GETs (mirror getQNCBalanceWithProof)
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  // Scale a raw u64 base-unit string to a human decimal string using ITS OWN decimals.
+  // Pure BigInt/string math — NEVER float, so full u64 precision survives (a token can hold
+  // far more than 2^53 base units). Trailing fractional zeros are trimmed; integer-only tokens
+  // (decimals=0) return the integer as-is. Matches the on-chain u64 semantics exactly.
+  _formatBaseUnits(baseUnitsStr, decimals) {
+    const d = Number(decimals) || 0;
+    let s = String(baseUnitsStr == null ? '0' : baseUnitsStr).trim();
+    if (!/^\d+$/.test(s)) s = '0';
+    if (d <= 0) return s;
+    s = s.replace(/^0+(?=\d)/, ''); // strip leading zeros but keep a single 0
+    const padded = s.padStart(d + 1, '0');
+    const intPart = padded.slice(0, padded.length - d);
+    const fracPart = padded.slice(padded.length - d).replace(/0+$/, '');
+    return fracPart ? `${intPart}.${fracPart}` : intPart;
+  }
+
+  // Held QRC-20 tokens for a QNet account.
+  //   GET /api/v1/account/{addr}/tokens -> [{contract_address, balance, name, symbol, decimals}]
+  // Returns [{contract, name, symbol, decimals, balance}] with `balance` a HUMAN decimal string
+  // scaled by 10**decimals (BigInt-safe). Raw text parse keeps u64 balances exact past 2^53.
+  async getTokenHoldings(qnetAddress) {
+    if (!qnetAddress || typeof qnetAddress !== 'string') return [];
+    let res;
+    try {
+      res = await this._hedged(`/api/v1/account/${qnetAddress}/tokens`, { timeoutMs: 5000, hedgeMs: 800, raw: true });
+    } catch (e) {
+      console.warn('[QRC20] holdings fetch failed:', e.message);
+      return [];
+    }
+    if (!res.ok || !res.data) return [];
+    let list;
+    try {
+      const parsed = JSON.parse(res.data);
+      list = Array.isArray(parsed) ? parsed : (Array.isArray(parsed.tokens) ? parsed.tokens : []);
+    } catch (_) {
+      return [];
+    }
+    // Balances are u64 base units — pull them as exact strings from the raw text so a JSON number
+    // never truncates above 2^53. Contract addresses are hex (no regex-special chars), so match each
+    // holding's balance to its own contract directly in the untouched text.
+    return list.map((t) => {
+      const contract = t.contract_address || t.contract || '';
+      const decimals = Number(t.decimals) || 0;
+      // Prefer the string-exact balance the node emits; JSON.parse of a large number loses precision.
+      let balanceStr = t.balance != null ? String(t.balance) : '0';
+      if (contract && /^[0-9a-fA-F]+$/.test(contract)) {
+        // Re-extract this contract's balance as a raw string (BigInt-safe) from the untouched text.
+        const re = new RegExp(`"contract_address"\\s*:\\s*"${contract}"[^}]*?"balance"\\s*:\\s*"?(\\d+)"?`);
+        const alt = new RegExp(`"balance"\\s*:\\s*"?(\\d+)"?[^}]*?"contract_address"\\s*:\\s*"${contract}"`);
+        const m = re.exec(res.data) || alt.exec(res.data);
+        if (m) balanceStr = m[1];
+      }
+      return {
+        contract,
+        name: t.name || t.symbol || 'Token',
+        symbol: t.symbol || '',
+        decimals,
+        logo: typeof t.logo === 'string' ? t.logo : '',
+        balance: this._formatBaseUnits(balanceStr, decimals),
+      };
+    }).filter((t) => t.contract);
+  }
+
+  // Token metadata for a contract.
+  //   GET /api/v1/token/{addr} -> {name, symbol, decimals, total_supply, deployer}
+  // Returns {contract, name, symbol, decimals, totalSupply, deployer} or null when the contract
+  // is not a token / not found (so the Add-Token flow can reject an invalid address honestly).
+  async getTokenInfo(contractAddress) {
+    if (!contractAddress || typeof contractAddress !== 'string') return null;
+    let res;
+    try {
+      res = await this._hedged(`/api/v1/token/${contractAddress}`, { timeoutMs: 5000, hedgeMs: 800 });
+    } catch (e) {
+      console.warn('[QRC20] token info fetch failed:', e.message);
+      return null;
+    }
+    if (!res.ok || !res.data || typeof res.data !== 'object') return null;
+    const d = res.data;
+    // A miss returns an error body or an empty object — require the token identity fields.
+    if (d.error || (d.symbol == null && d.name == null)) return null;
+    return {
+      contract: contractAddress,
+      name: d.name || d.symbol || 'Token',
+      symbol: d.symbol || '',
+      // Defensive across a flat or {token:{...}}-nested body; '' ⇒ client renders a generated avatar.
+      logo: String((d.logo != null ? d.logo : (d.token && d.token.logo)) || ''),
+      decimals: Number(d.decimals) || 0,
+      totalSupply: d.total_supply != null ? String(d.total_supply) : null,
+      deployer: d.deployer || null,
+    };
+  }
+
+  // Decoded QRC-20/721 token-transfer events for an account (effect-sourced, success-gated).
+  //   GET /api/v1/account/{addr}/token-transfers?limit=N
+  // Each row embeds its token metadata (symbol/decimals/logo) — no extra fetch. `amount` is a u64
+  // base-unit DECIMAL STRING (quoted in JSON, so JSON.parse keeps it exact). Returns the transfers
+  // array, or [] on any error/miss. Never throws.
+  async getAccountTokenTransfers(address, limit = 50) {
+    if (!address || typeof address !== 'string') return [];
+    let res;
+    try {
+      res = await this._hedged(`/api/v1/account/${address}/token-transfers?limit=${limit}`, { timeoutMs: 5000, hedgeMs: 800 });
+    } catch (e) {
+      console.warn('[QRC20] token transfers fetch failed:', e.message);
+      return [];
+    }
+    if (!res.ok || !res.data || typeof res.data !== 'object') return [];
+    return Array.isArray(res.data.transfers) ? res.data.transfers : [];
+  }
+
+  // P4 trustless check for ONE token transfer: fetch its /logs/proof, BIND the proven leaf to this
+  // row's own fields, verify the merkle inclusion, then anchor the window logs_root to a committee-QC-
+  // certified Checkpoint.logs_root. `row` = the decoded transfer row (contract/from/to/amount/kind/std/
+  // token_id/tx_hash/log_index). True ONLY on a full cryptographic proof of THIS row; false for
+  // pending-finality / unreachable / forged (caller keeps those unverified, never dropping a legit row).
+  // Returns: 'verified' (leaf-bound + merkle + committee-QC anchored), 'consistent' (leaf folds to the
+  // node-claimed root but the window is below the trust floor / not QC-anchorable now — real but unproven),
+  // 'rejected' (leaf ≠ this row's fields, or the proof doesn't fold → forged), or 'pending' (transient
+  // fetch/finality miss → retry). Caller shows only 'verified' with the trust badge.
+  async verifyTokenTransferInclusion(row) {
+    if (!row || typeof row !== 'object' || !row.tx_hash || typeof row.tx_hash !== 'string') return 'rejected';
+    let res;
+    try {
+      res = await this._hedged(`/api/v1/logs/proof?tx_hash=${row.tx_hash}&log_index=${row.log_index || 0}`, { timeoutMs: 5000, hedgeMs: 800 });
+    } catch (_) { return 'pending'; }
+    const d = res && res.data;
+    if (!res || !res.ok || !d || d.error || !d.leaf || !Array.isArray(d.proof) ||
+        !d.block_root || !Array.isArray(d.window_proof) || !d.logs_root) return 'pending';
+    // BIND: the proven leaf MUST equal the leaf recomputed from THIS row's own fields — else a node
+    // replayed a real transfer's proof under a forged row. This check is what makes P4 reject forgeries.
+    const expected = transferLogLeaf(row);
+    if (!expected || expected !== String(d.leaf).toLowerCase()) return 'rejected';
+    // SHARDED 2-level proof: level 1 folds the leaf → this block's sub-root; level 2 folds that sub-root →
+    // the window logs_root. BOTH must hold — the node cannot substitute a block sub-root it did not commit.
+    if (!verifyLogInclusion(d.leaf, d.proof, d.block_root)) return 'rejected';
+    if (!verifyLogWindowInclusion(d.block_root, d.window_proof, d.logs_root)) return 'rejected';
+    // Leaf folds to the node-CLAIMED root (self-consistent, a malicious node can fabricate this), so
+    // QC-anchor the root to the committee signature for real trust. 'mismatch' = the committee-signed
+    // root differs from the node's claim → a proven forgery, must be rejected (never confirmed).
+    const anchored = await verifyMacroblockLogsRoot(d.logs_root, d.window_end, () => this.getRandomBootstrapNode());
+    if (anchored === true) return 'verified';
+    if (anchored === 'mismatch') return 'rejected';
+    return 'consistent'; // below trust floor / macroblock unreachable — real but unprovable now
+  }
+
+  // Raw + scaled QRC-20 balance for a single holder of a single contract.
+  //   GET /api/v1/token/{contract}/balance/{holder}
+  // `decimals` is optional; when supplied the returned `balance` is the human decimal string.
+  // Returns { ok, balanceBaseUnits (string), balance (string|null) }.
+  async getTokenBalanceOf(contractAddress, holder, decimals = null) {
+    if (!contractAddress || !holder) return { ok: false, balanceBaseUnits: '0', balance: null };
+    let res;
+    try {
+      res = await this._hedged(`/api/v1/token/${contractAddress}/balance/${holder}`, { timeoutMs: 5000, hedgeMs: 800, raw: true });
+    } catch (e) {
+      console.warn('[QRC20] token balance fetch failed:', e.message);
+      return { ok: false, balanceBaseUnits: '0', balance: null };
+    }
+    if (!res.ok || !res.data) return { ok: false, balanceBaseUnits: '0', balance: null };
+    // u64 base units as an exact string — never JSON.parse the number.
+    const m = /"balance"\s*:\s*"?(\d+)"?/.exec(res.data);
+    const baseUnits = m ? m[1] : '0';
+    return {
+      ok: true,
+      balanceBaseUnits: baseUnits,
+      balance: decimals != null ? this._formatBaseUnits(baseUnits, decimals) : null,
+    };
+  }
+
+  // Scale a human decimal amount string to a u64 base-unit STRING using the token's decimals.
+  // Pure string math (no float) so full u64 precision survives — feeds qrc20Transfer's _amt().
+  // Throws on a malformed amount or more fractional digits than the token supports.
+  toBaseUnits(amountStr, decimals) {
+    const d = Number(decimals) || 0;
+    let s = String(amountStr == null ? '' : amountStr).trim().replace(',', '.');
+    if (!/^\d+(\.\d+)?$/.test(s)) throw new Error('Invalid token amount');
+    let [intPart, fracPart = ''] = s.split('.');
+    if (fracPart.length > d) throw new Error(`Amount has more than ${d} decimal places`);
+    fracPart = fracPart.padEnd(d, '0');
+    const combined = (intPart + fracPart).replace(/^0+(?=\d)/, '');
+    return combined === '' ? '0' : combined;
+  }
+
+  /**
+   * Verify Merkle proof locally using SHA3-256
+   * This is the core trustless verification - no network calls needed
+   * 
+   * CRITICAL: Must match Rust implementation exactly!
+   * Rust uses raw bytes, not hex strings for hashing
+   */
+  /**
+   * Shared SMT sibling-fold used by BOTH the account balance proof and the two-level token proof —
+   * ONE primitive so a fix to the walk can never drift between the two proof types. Folds `leafHashHex`
+   * up `proof` ([{sibling, is_right}, ...]) using `keyHashHex` bits for the expected direction at each
+   * level; returns true iff the fold reproduces `root`. MUST stay byte-exact to the Rust
+   * verify_proof / verify_raw_proof (SHA3-256 over sibling||current ordered by is_right).
+   */
+  _smtFold(leafHashHex, keyHashHex, proof, root, sha3_256) {
+    // One implementation, in src/crypto/SmtFold.js, so the jest pin guards the shipped code.
+    return smtFold(leafHashHex, keyHashHex, proof, root, sha3_256);
+  }
+
+  async verifyMerkleProof(address, balance, nonce, proof, expectedRoot, lastClaimedEpoch = 0, isNode = false) {
+    try {
+      // Import js-sha3 for SHA3-256 (same as Rust implementation)
+      const { sha3_256 } = await import('js-sha3');
+
+      // Hash address (same as Rust: b"QNET_ADDR:" + address.as_bytes())
+      const addrHashHex = sha3_256(this.concatBytes(
+        Buffer.from('QNET_ADDR:', 'utf8'),
+        Buffer.from(address, 'utf8')
+      ));
+
+      // Account leaf — MUST match Rust hash_account (QNET_ACCOUNT_V2) EXACTLY, else the leaf
+      // never matches the QC-committed root and the proof always fails. A plain wallet has
+      // is_contract=false, no code/storage, and heartbeat=0 (a Heartbeat is keyed on node_id, so a
+      // wallet never carries a tally). last_claimed_epoch is threaded from the account —
+      // hardcoding it broke every wallet that had ever claimed. Byte-exact order.
+      const accountDataBytes = this.concatBytes(
+        Buffer.from('QNET_ACCOUNT_V2:', 'utf8'),
+        this.uint64ToBytes(balance),           // balance u64 LE
+        this.uint64ToBytes(nonce),             // nonce u64 LE
+        Buffer.from(address, 'utf8'),          // address string bytes
+        Buffer.from([0]),                      // is_contract = false
+        Buffer.from('HB:', 'utf8'),
+        this.uint64ToBytes(0),                 // heartbeat_epoch u64 LE
+        Buffer.from([0, 0]),                   // heartbeat_slots u16 LE
+        this.uint64ToBytes(0),                 // heartbeat_final_epoch u64 LE
+        Buffer.from([0, 0]),                   // heartbeat_final_slots u16 LE
+        Buffer.from('LCE:', 'utf8'),
+        this.uint64ToBytes(lastClaimedEpoch),  // last_claimed_epoch u64 LE
+        Buffer.from('BAN:', 'utf8'),
+        this.uint64ToBytes(0),                 // banned_at_height u64 LE (native wallets are never banned)
+        Buffer.from('NODE:', 'utf8'),
+        Buffer.from([isNode ? 1 : 0])          // is_node u8
+      );
+      const leafHash = sha3_256(accountDataBytes);
+      // Fold the account leaf up to the expected root via the shared SMT primitive.
+      return this._smtFold(leafHash, addrHashHex, proof, expectedRoot, sha3_256);
+    } catch (error) {
+      console.warn('[MERKLE] Proof verification failed:', error.message);
+      return false;
+    }
+  }
+
+  /**
+   * V2: verify a two-level trustless QRC-20 balance proof against a QC-committed state_root.
+   * Level-2 proves balance:{holder} in storage_root; Level-1 proves the contract account leaf
+   * (which commits storage_root) in state_root. Byte-exact to Rust hash_account (SROOT schema) +
+   * StorageMerkleTree. Returns true only if BOTH levels verify (and, when supplied, the proof's
+   * state_root equals the independently QC-verified expectedStateRoot).
+   */
+  async verifyTokenBalanceProof(proofData, expectedContract, expectedHolder, expectedStateRoot) {
+    try {
+      const { sha3_256 } = await import('js-sha3');
+      const {
+        contract_address, holder, token_balance, storage_root,
+        storage_proof, account_proof,
+        account_balance, account_nonce,
+        contract_code_hash, heartbeat_epoch, heartbeat_slots,
+        heartbeat_final_epoch, heartbeat_final_slots, last_claimed_epoch,
+        banned_at_height, is_node,
+        state_root,
+      } = proofData;
+
+      // Identity binding: the folds below verify against the identifiers IN the proof, so reject unless
+      // they match what we requested (else a valid proof for another token/holder passes).
+      if (expectedContract != null && contract_address !== expectedContract) return false;
+      if (expectedHolder != null && holder !== expectedHolder) return false;
+
+      // The proof's own state_root MUST equal the root we independently trust (QC-verified).
+      if (expectedStateRoot && state_root !== expectedStateRoot) return false;
+
+      // Bucketed SMT proofs: 40 tree steps + optional in-bucket steps; smtFold
+      // enforces the exact bounds and flag rules.
+      if (!Array.isArray(storage_proof) || storage_proof.length < 40) return false;
+      if (!Array.isArray(account_proof) || account_proof.length < 40) return false;
+
+      // ── Level-2: balance:{holder} ∈ storage_root ──
+      const storageKey = 'balance:' + holder;
+      const storageKeyHashHex = sha3_256(this.concatBytes(
+        Buffer.from('QNET_STORAGE_KEY:', 'utf8'), Buffer.from(storageKey, 'utf8')));
+      // QRC-20 removes drained keys, so token_balance "0" ⇒ ABSENT ⇒ empty-leaf default (32 zero bytes).
+      const storageLeafHex = String(token_balance) === '0'
+        ? '00'.repeat(32)
+        : sha3_256(this.concatBytes(Buffer.from('QNET_STORAGE_VAL:', 'utf8'), Buffer.from(String(token_balance), 'utf8')));
+      if (!this._smtFold(storageLeafHex, storageKeyHashHex, storage_proof, storage_root, sha3_256)) return false;
+
+      // ── Level-1: contract account leaf (committing storage_root) ∈ state_root ──
+      const contractAddrHashHex = sha3_256(this.concatBytes(
+        Buffer.from('QNET_ADDR:', 'utf8'), Buffer.from(contract_address, 'utf8')));
+      const parts = [
+        Buffer.from('QNET_ACCOUNT_V2:', 'utf8'),
+        this.uint64ToBytes(account_balance),   // u64 LE (BigInt-safe)
+        this.uint64ToBytes(account_nonce),
+        Buffer.from(contract_address, 'utf8'),
+        Buffer.from([1]),                       // is_contract = true
+      ];
+      if (contract_code_hash) {
+        parts.push(Buffer.from('CODE:', 'utf8'));
+        parts.push(Buffer.from(String(contract_code_hash), 'utf8'));
+      }
+      parts.push(Buffer.from('SROOT:', 'utf8'));
+      parts.push(this.hexToBytes(storage_root)); // 32 RAW bytes (not hex text)
+      parts.push(Buffer.from('HB:', 'utf8'));
+      parts.push(this.uint64ToBytes(heartbeat_epoch || 0));
+      const slots = heartbeat_slots || 0;
+      parts.push(Buffer.from([slots & 0xff, (slots >> 8) & 0xff])); // u16 LE
+      parts.push(this.uint64ToBytes(heartbeat_final_epoch || 0));
+      const finalSlots = heartbeat_final_slots || 0;
+      parts.push(Buffer.from([finalSlots & 0xff, (finalSlots >> 8) & 0xff])); // u16 LE
+      parts.push(Buffer.from('LCE:', 'utf8'));
+      parts.push(this.uint64ToBytes(last_claimed_epoch || 0));
+      parts.push(Buffer.from('BAN:', 'utf8'));
+      parts.push(this.uint64ToBytes(banned_at_height || 0));
+      parts.push(Buffer.from('NODE:', 'utf8'));
+      parts.push(Buffer.from([is_node ? 1 : 0]));
+      const contractLeafHex = sha3_256(this.concatBytes(...parts));
+      if (!this._smtFold(contractLeafHex, contractAddrHashHex, account_proof, state_root, sha3_256)) return false;
+
+      return true;
+    } catch (error) {
+      console.warn('[MERKLE] Token proof verification failed:', error.message);
+      return false;
+    }
+  }
+
+  /**
+   * v3.32: Verify validator set proof locally
+   * TRUSTLESS verification - matches Rust implementation exactly
+   */
+  async verifyValidatorSetProof(proofData) {
+    try {
+      const { sha3_256 } = await import('js-sha3');
       
-      // Get token accounts for the wallet
-      const response = await fetch(rpcUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          jsonrpc: '2.0',
-          id: 1,
-          method: 'getTokenAccountsByOwner',
-          params: [
-            walletAddress,
-            {
-              mint: mintAddress
-            },
-            {
-              encoding: 'jsonParsed'
-            }
-          ]
-        })
+      const validators = proofData.validators || [];
+      const epoch = proofData.epoch || 0;
+      const expectedRoot = proofData.merkle_root;
+      
+      if (!expectedRoot) return false;
+      
+      // Sort validators by node_id for deterministic ordering (same as Rust)
+      const sorted = [...validators].sort((a, b) => 
+        (a.node_id || '').localeCompare(b.node_id || '')
+      );
+      
+      // Build hash (same as Rust: b"QNET_VALIDATOR_SET:" + epoch + validators)
+      let dataToHash = this.concatBytes(
+        Buffer.from('QNET_VALIDATOR_SET:', 'utf8'),
+        this.uint64ToBytes(epoch)
+      );
+      
+      for (const v of sorted) {
+        dataToHash = this.concatBytes(
+          dataToHash,
+          Buffer.from(v.node_id || '', 'utf8'),
+          Buffer.from(v.address || '', 'utf8'),
+          Buffer.from(v.node_type || '', 'utf8'),
+          this.float64ToBytes(v.reputation || 0),
+          this.uint64ToBytes(v.last_seen || 0),
+          new Uint8Array([v.is_active ? 1 : 0])
+        );
+      }
+      
+      const computedRoot = sha3_256(dataToHash);
+      return computedRoot === expectedRoot;
+    } catch (error) {
+      console.warn('[DISCOVERY] Validator set proof verification failed:', error.message);
+      return false;
+    }
+  }
+
+  // Helper: Convert float64 to bytes (little-endian, for reputation)
+  float64ToBytes(value) {
+    const buffer = new ArrayBuffer(8);
+    const view = new DataView(buffer);
+    view.setFloat64(0, value, true); // little-endian
+    return new Uint8Array(buffer);
+  }
+
+  // Helper: Concatenate byte arrays
+  concatBytes(...arrays) {
+    const totalLength = arrays.reduce((sum, arr) => sum + arr.length, 0);
+    const result = new Uint8Array(totalLength);
+    let offset = 0;
+    for (const arr of arrays) {
+      result.set(arr, offset);
+      offset += arr.length;
+    }
+    return result;
+  }
+
+  /**
+   * DEPRECATED + UNUSED (kept for reference). Superseded by the trustless
+   * committee-QC light client: QcLightClient.verifyMacroblockStateRoot().
+   *
+   * SECURITY: this 2/3 multi-node poll is MITM-bypassable — an attacker on the
+   * path (or controlling the polled subset) can return matching FAKE state_roots
+   * and pass the vote. It verifies agreement, not authenticity. The replacement
+   * verifies a ≥quorum post-quantum committee QC inductively from a pinned anchor,
+   * so a forged root cannot be certified without breaking ML-DSA-65 / SHA3.
+   *
+   * No remaining callers. Safe to delete in a later cleanup.
+   */
+  async verifyStateRootFromMultipleNodes(stateRoot, blockHeight) {
+    try {
+      // v3.12: Get nodes from discovery system (NOT hardcoded!)
+      // This distributes load across ALL active nodes in the network
+      const nodes = await this.getNodesForVerification();
+      
+      if (nodes.length < 2) {
+        // Not enough nodes for consensus verification
+        console.warn('[MERKLE] Not enough nodes for verification:', nodes.length);
+        return false;
+      }
+      
+      // v3.11: state_root is in MacroBlock
+      // MacroBlock index = floor(blockHeight / 90)
+      const macroBlockIndex = Math.floor(blockHeight / 90);
+      
+      // Query state_root from multiple nodes in parallel (max 5 to limit load)
+      const nodesToQuery = nodes.slice(0, 5);
+      const queries = nodesToQuery.map(async (nodeUrl) => {
+        try {
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), 3000);
+          
+          // v3.11: Use macroblock endpoint for state_root
+          const response = await fetch(`${nodeUrl}/api/v1/macroblock/${macroBlockIndex}`, {
+            method: 'GET',
+            headers: { 'Content-Type': 'application/json' },
+            signal: controller.signal
+          });
+          
+          clearTimeout(timeoutId);
+          
+          if (!response.ok) return null;
+          
+          const macroblock = await response.json();
+          return macroblock.state_root || null;
+        } catch {
+          return null;
+        }
+      });
+      
+      const results = await Promise.all(queries);
+      const validResults = results.filter(r => r !== null);
+      
+      if (validResults.length < 2) {
+        return false; // Not enough responses
+      }
+      
+      // Count how many nodes agree on the state_root
+      const matchCount = validResults.filter(r => r === stateRoot).length;
+      const threshold = Math.ceil(validResults.length * 2 / 3); // 2/3 consensus
+      
+      return matchCount >= threshold;
+    } catch (error) {
+      console.warn('[MERKLE] State root verification failed:', error.message);
+      return false;
+    }
+  }
+
+  /**
+   * v3.36: Get nodes for verification using WEIGHTED RANDOM sampling
+   * 
+   * CRITICAL: NOT TOP 20! Uses ALL eligible nodes with weighted random selection
+   * This distributes load across ALL nodes in the network (100K+ scalability)
+   * 
+   * TOP L1 pattern:
+   * - Solana: random sampling from active validators
+   * - Common light clients: random peer selection
+   * - Stake-weighted networks: weighted random by stake
+   * 
+   * Our algorithm:
+   * 1. Filter: rep >= 70%, lastSeen < 5 min, isSynced
+   * 2. Weighted random selection (5 nodes) - higher rep = higher chance
+   * 3. Load distributed across ALL eligible nodes
+   */
+  async getNodesForVerification() {
+    try {
+      // v3.35: Cache contains ALL validators (Genesis + Super) from Merkle-verified list
+      const cachedNodes = await AsyncStorage.getItem('qnet_discovered_nodes');
+      if (cachedNodes) {
+        const nodes = JSON.parse(cachedNodes);
+        const currentTime = Math.floor(Date.now() / 1000);
+        
+        // v3.35: STRICT filters - same as discovery
+        // - last_seen < 5 minutes (300 sec) from P2P heartbeat
+        // - reputation >= 70% from blockchain
+        // - is_synced = true (not more than 5 blocks behind)
+        const eligibleNodes = nodes.filter(node => {
+          const age = currentTime - (node.lastSeen || 0);
+          return age < NODE_DISCOVERY.MAX_STALE_SECS && 
+                 (node.reputation || 0) >= NODE_DISCOVERY.MIN_REPUTATION &&
+                 node.isSynced !== false;
+        });
+        
+        if (eligibleNodes.length >= 2) {
+          // v3.36: WEIGHTED RANDOM from ALL eligible nodes (not TOP 20!)
+          // This distributes load across 100K+ nodes proportionally
+          const selectedNodes = this.weightedRandomSample(eligibleNodes, 5);
+          return selectedNodes.map(n => n.url);
+        }
+      }
+    } catch (e) {
+      // Cache error
+    }
+    
+    // FIRST LAUNCH ONLY - cache is empty
+    // Triggers discovery which will populate cache (includes Genesis)
+    this.refreshNodeDiscovery();
+    
+    // Bootstrap: use Genesis nodes for first verification
+    // After discovery completes, cache will have all validators
+    return GENESIS_NODES.map(url => url);
+  }
+  
+  /**
+   * v3.36: Weighted random sampling WITHOUT replacement
+   * Higher reputation = higher probability of being selected
+   * Used for multi-node verification (Byzantine fault tolerance)
+   * 
+   * Algorithm: Reservoir sampling with weights
+   * - Each node has weight = reputation
+   * - Select N nodes with probability proportional to weight
+   * - No duplicates (without replacement)
+   * 
+   * @param {Array} nodes - Array of nodes with reputation field
+   * @param {number} count - Number of nodes to select
+   * @returns {Array} Selected nodes (up to count)
+   */
+  weightedRandomSample(nodes, count) {
+    if (nodes.length <= count) {
+      return this.shuffleArray([...nodes]);
+    }
+    
+    const selected = [];
+    const available = [...nodes]; // Copy to avoid mutation
+    
+    for (let i = 0; i < count && available.length > 0; i++) {
+      // Calculate total weight of remaining nodes
+      const totalWeight = available.reduce((sum, n) => sum + (n.reputation || 0.7), 0);
+      
+      // Random value in [0, totalWeight)
+      let random = Math.random() * totalWeight;
+      
+      // Select node based on weight
+      let selectedIdx = 0;
+      for (let j = 0; j < available.length; j++) {
+        random -= (available[j].reputation || 0.7);
+        if (random <= 0) {
+          selectedIdx = j;
+          break;
+        }
+      }
+      
+      // Move selected node to result
+      selected.push(available[selectedIdx]);
+      available.splice(selectedIdx, 1); // Remove from pool (no replacement)
+    }
+    
+    return selected;
+  }
+
+  /**
+   * v3.13: Discover high-reputation nodes from network
+   * Queries /api/v1/peers and saves nodes with reputation >= 70%
+   */
+  async discoverHighRepNodes(seedNodeUrl) {
+    const MIN_REPUTATION = 0.70;
+    
+    try {
+      const response = await fetch(`${seedNodeUrl}/api/v1/peers`, {
+        method: 'GET',
+        timeout: 5000
       });
       
       if (response.ok) {
         const data = await response.json();
-        const accounts = data.result?.value || [];
-        
-        if (accounts.length > 0) {
-          // Get the token amount from the first account
-          const tokenAmount = accounts[0].account.data.parsed.info.tokenAmount;
-          return parseFloat(tokenAmount.uiAmount) || 0;
+        if (data.peers && Array.isArray(data.peers)) {
+          // Filter by high reputation
+          const highRepNodes = data.peers
+            .filter(peer => 
+              peer.address && 
+              (peer.reputation || 0) >= MIN_REPUTATION
+            )
+            .map(peer => ({
+              url: peer.address.startsWith('http') ? peer.address : `http://${peer.address}`,
+              reputation: peer.reputation,
+              nodeType: peer.node_type,
+              lastSeen: Date.now()
+            }));
+          
+          if (highRepNodes.length > 0) {
+            // Merge with existing cache
+            let allNodes = highRepNodes;
+            try {
+              const cached = await AsyncStorage.getItem('qnet_discovered_nodes');
+              if (cached) {
+                const existing = JSON.parse(cached);
+                // Merge, preferring new data
+                const urlMap = {};
+                existing.forEach(n => urlMap[n.url] = n);
+                highRepNodes.forEach(n => urlMap[n.url] = n);
+                allNodes = Object.values(urlMap);
+              }
+            } catch (e) {}
+            
+            await AsyncStorage.setItem('qnet_discovered_nodes', JSON.stringify(allNodes));
+            console.log(`[MERKLE] Discovered ${highRepNodes.length} high-rep nodes`);
+          }
         }
       }
-      
-      return 0;
-    } catch (error) {
-      // console.error('Error getting token balance:', error);
-      return 0;
+    } catch (e) {
+      // Discovery failed silently
     }
   }
+
+  // Helper: Shuffle array (Fisher-Yates)
+  shuffleArray(array) {
+    const shuffled = [...array];
+    for (let i = shuffled.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+    }
+    return shuffled;
+  }
+
+  // Helper: Convert uint64 to bytes (little-endian)
+  uint64ToBytes(value) {
+    const buffer = new ArrayBuffer(8);
+    const view = new DataView(buffer);
+    view.setBigUint64(0, BigInt(value), true); // little-endian
+    return new Uint8Array(buffer);
+  }
+
+  // Helper: Bytes to hex string
+  bytesToHex(bytes) {
+    return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+  }
+
+  // Helper: Hex string to bytes
+  hexToBytes(hex) {
+    // Reject malformed hex up front — a bad char/odd length would otherwise
+    // make parseInt return NaN, which coerces to 0 and silently corrupts crypto input.
+    if (typeof hex !== 'string' || hex.length % 2 !== 0 || !/^[0-9a-fA-F]*$/.test(hex)) {
+      throw new Error('Invalid hex input');
+    }
+    const bytes = new Uint8Array(hex.length / 2);
+    for (let i = 0; i < hex.length; i += 2) {
+      bytes[i / 2] = parseInt(hex.substring(i, i + 2), 16);
+    }
+    return bytes;
+  }
+
 
   // CACHE: Network size (avoid spamming bootstrap nodes)
   _networkSizeCache = null;
@@ -3082,15 +4259,9 @@ export class WalletManager {
       return this._networkSizeCache;
     }
     
-    // PRODUCTION: Real Genesis node IPs (from genesis_constants.rs)
-    const bootstrapNodes = [
-      'http://154.38.160.39:8080',   // Genesis #1 - North America
-      'http://62.171.157.44:8080',   // Genesis #2 - Europe
-      'http://161.97.86.81:8080',    // Genesis #3 - Europe
-      'http://5.189.130.160:8080',   // Genesis #4 - Europe
-      'http://162.244.25.114:8080'   // Genesis #5 - Europe
-    ];
-    
+    // Canonical Genesis list (single source: config/nodes.js).
+    const bootstrapNodes = GENESIS_NODES;
+
     // Try multiple bootstrap nodes for reliability
     for (const apiUrl of bootstrapNodes) {
       try {
@@ -3107,9 +4278,8 @@ export class WalletManager {
         
         if (response.ok) {
           const stats = await response.json();
-          // Return total active nodes (Light + Full + Super)
+          // Return total active nodes (Light + Super)
           const totalNodes = (stats.light_nodes || 0) + 
-                            (stats.full_nodes || 0) + 
                             (stats.super_nodes || 0);
           if (totalNodes > 0) {
             // UPDATE CACHE
@@ -3126,17 +4296,15 @@ export class WalletManager {
     }
     
     // All nodes failed - throw error, NOT fake data
-    console.error('[PRICING] ❌ Could not reach any bootstrap nodes');
+    console.warn('[PRICING] Could not reach any bootstrap nodes');
     throw new Error('Network size unavailable - all bootstrap nodes unreachable');
   }
 
   // Get real burn progress from blockchain
   async getBurnProgress(isTestnet = true) {
     try {
-      // Ensure correct RPC endpoint usage
-      const rpcUrl = isTestnet 
-        ? 'https://api.devnet.solana.com'  // TESTNET when isTestnet=true
-        : 'https://api.mainnet-beta.solana.com';  // MAINNET when isTestnet=false
+      // v4.10: Centralized RPC URL
+      const rpcUrl = getSolanaRpcUrl(isTestnet);
       
       // 1DEV token mint addresses - ensure correct assignment
       const oneDevMint = isTestnet 
@@ -3146,18 +4314,24 @@ export class WalletManager {
       const TOTAL_SUPPLY = 1000000000; // 1 billion total supply
       
       // Try to get current supply and calculate burned amount
-      const response = await fetch(rpcUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          jsonrpc: '2.0',
-          id: 1,
-          method: 'getTokenSupply',
-          params: [oneDevMint]
-        })
-      });
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 8000);
+      let response;
+      try {
+        response = await fetch(rpcUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          signal: controller.signal,
+          body: JSON.stringify({
+            jsonrpc: '2.0',
+            id: 1,
+            method: 'getTokenSupply',
+            params: [oneDevMint]
+          })
+        });
+      } finally {
+        clearTimeout(timeoutId);
+      }
       
       if (response.ok) {
         const data = await response.json();
@@ -3186,12 +4360,9 @@ export class WalletManager {
         // console.error('[getBurnProgress] Failed to fetch:', response.status, response.statusText);
       }
       
-      // Fallback values
-      return '0.0';
+      return null; // failure ⇒ caller keeps last-known (don't fabricate 0.0%)
     } catch (error) {
-      // console.error('[getBurnProgress] Error:', error);
-      // Return zero if can't fetch real data
-      return '0.0';
+      return null;
     }
   }
 
@@ -3211,10 +4382,7 @@ export class WalletManager {
         amount = pricing.cost;
       }
       
-      const connection = new Connection(
-        isTestnet ? 'https://api.devnet.solana.com' : 'https://api.mainnet-beta.solana.com',
-        'confirmed'
-      );
+      const connection = new Connection(getSolanaRpcUrl(isTestnet), 'confirmed');
       
       // Load and decrypt wallet properly
       if (!password) {
@@ -3291,18 +4459,42 @@ export class WalletManager {
       // Sign transaction
       transaction.sign(keypair);
       
-      // Send transaction
+      // Send transaction (skip preflight for speed - balance already checked)
       const signature = await connection.sendRawTransaction(transaction.serialize(), {
-        skipPreflight: false,
+        skipPreflight: true,
         preflightCommitment: 'processed'
       });
       
-      // Wait for confirmation
-      const confirmation = await connection.confirmTransaction({
+      // Wait for confirmation with timeout (30 seconds max)
+      const confirmPromise = connection.confirmTransaction({
         signature,
         blockhash,
         lastValidBlockHeight
       }, 'confirmed');
+      
+      const timeoutPromise = new Promise((_, reject) => 
+        setTimeout(() => reject(new Error('TIMEOUT')), 30000)
+      );
+      
+      let confirmation;
+      try {
+        confirmation = await Promise.race([confirmPromise, timeoutPromise]);
+      } catch (timeoutErr) {
+        if (timeoutErr.message === 'TIMEOUT') {
+          // Transaction was sent but confirmation timed out
+          // Return signature anyway - tx is likely already on chain
+          console.log('Confirmation timed out, but transaction was sent:', signature);
+          return {
+            nodeType,
+            amount,
+            timestamp: Date.now(),
+            signature: signature,
+            txHash: signature,
+            explorer: `https://explorer.solana.com/tx/${signature}?cluster=${isTestnet ? 'devnet' : 'mainnet-beta'}`
+          };
+        }
+        throw timeoutErr;
+      }
       
       if (!confirmation.value.err) {
         // Transaction successful
@@ -3332,7 +4524,8 @@ export class WalletManager {
   //
   // This method is DEPRECATED - use requestActivationCodeFromServer() instead
   // Kept for backward compatibility with stored codes only
-  generateActivationCode(nodeType = 'full', walletAddress = '', seedPhrase = null) {
+  // Default to 'super' for backward compatibility
+  generateActivationCode(nodeType = 'super', walletAddress = '', seedPhrase = null) {
     console.warn('[DEPRECATED] generateActivationCode() should not be used for new activations');
     console.warn('   Use requestActivationCodeFromServer() after burn transaction');
     
@@ -3359,31 +4552,101 @@ export class WalletManager {
   }
   
   // Request activation code from server after burn verification
-  // Phase 1: burnTxHash = Solana 1DEV burn transaction
+  // Phase 1: burnTxHash = Solana 1DEV burn transaction, qnetRewardWallet = EON address for rewards
   // Phase 2: burnTxHash = QNet QNC transfer to Pool 3 transaction
-  async requestActivationCodeFromServer(nodeType, walletAddress, burnTxHash, phase = 1) {
+  // ============================================================================
+  // LOCAL activation code generation — NO server dependency.
+  // Identical algorithm to server-side generate_quantum_activation_code (rpc.rs).
+  // Inputs are all derivable from Solana blockchain → always reproducible.
+  //
+  // Algorithm:
+  //   key      = SHA3_256("burn_tx:type:amount")[0:32]
+  //   seg1     = type_marker + SHA3_256("ts:burn_tx:type")[0:5]    (6 chars)
+  //   seg2     = hex(XOR(wallet_bytes, key))[0:6]                   (6 chars)
+  //   seg3     = (hex(XOR(wallet_bytes, key))[6:10]
+  //              + SHA3_256("entropy:wallet:burn_tx:type")[0:4])[0:6] (6 chars)
+  //   code     = QNET-{seg1}-{seg2}-{seg3}
+  // ============================================================================
+  generateActivationCodeLocally(nodeType, walletAddress, burnTxHash, burnAmount) {
+    const sha3_256 = require('js-sha3').sha3_256;
+    const type = nodeType.toLowerCase();
+
+    // Step 1: XOR encryption key = SHA3("burn_tx:type:amount")[0:32]
+    const keyFull = sha3_256(`${burnTxHash}:${type}:${burnAmount}`); // 64 hex chars
+    const encKey = keyFull.substring(0, 32); // 32 hex chars → used as byte key
+
+    // Step 2: XOR encrypt wallet address bytes (cycling over key)
+    const walletBytes = Array.from(walletAddress).map(c => c.charCodeAt(0));
+    const keyBytes   = Array.from(encKey).map(c => c.charCodeAt(0));
+    const encBytes   = walletBytes.map((b, i) => b ^ keyBytes[i % keyBytes.length]);
+    const encHex     = encBytes.map(b => b.toString(16).padStart(2, '0')).join('').toUpperCase();
+
+    // Step 3: segment1 — type marker + SHA3("ts:burn_tx:type")[0:5]
+    const marker     = type === 'super' ? 'S' : 'L';
+    const tsHash     = sha3_256(`ts:${burnTxHash}:${type}`);
+    const tsPart     = tsHash.substring(0, 5).toUpperCase();
+    const segment1   = `${marker}${tsPart}`;                // 6 chars
+
+    // Step 4: segment2 — first 6 hex chars of encrypted wallet
+    const segment2   = (encHex + '000000').substring(0, 6); // 6 chars
+
+    // Step 5: segment3 — next 4 hex chars + entropy[0:4], take first 6
+    const walletPart2 = (encHex.substring(6, 10) + '0000').substring(0, 4);
+    const entropy     = sha3_256(`entropy:${walletAddress}:${burnTxHash}:${type}`);
+    const entShort    = entropy.substring(0, 4).toUpperCase();
+    const segment3    = (walletPart2 + entShort).substring(0, 6); // 6 chars
+
+    const code = `QNET-${segment1}-${segment2}-${segment3}`;
+    console.log(`[LOCAL_CODE] Generated: ${code.substring(0, 12)}... type=${type} tx=${burnTxHash.substring(0, 8)}...`);
+    return code;
+  }
+
+  // CRITICAL: actualBurnAmount MUST be the exact amount burned on Solana — NOT the current price!
+  //   XOR key = SHA3(burn_tx:type:amount) — if amount is wrong, code can NEVER be verified.
+  //   Caller must pass the same amount used in burnTokensForNode / burnTokens.
+  async requestActivationCodeFromServer(nodeType, walletAddress, burnTxHash, phase = 1, qnetRewardWallet = null, actualBurnAmount = null) {
     try {
       const apiUrl = this.getRandomBootstrapNode();
       
-      // Get dynamic pricing info for Phase 2
-      let burnAmount = 0;
-      if (phase === 2) {
-        const pricingResponse = await fetch(`${apiUrl}/api/v1/pricing/${nodeType}`);
-        const pricing = await pricingResponse.json();
-        burnAmount = pricing.current_price || 0;
+      // Use ACTUAL burned amount (from caller) — NOT current price!
+      // XOR key = SHA3(burn_tx:type:amount) — amount MUST match exactly what was burned
+      // Dynamic pricing: amount varies based on network burn percentage — NO hardcoded defaults
+      let burnAmount = actualBurnAmount;
+      if (!burnAmount || burnAmount <= 0) {
+        // Fallback: fetch DYNAMIC price from server (correct endpoint: /api/v1/activation/price)
+        // This uses GLOBAL_BURN_PERCENTAGE on server — the actual current network price
+        console.warn('[WalletManager] actualBurnAmount not provided — fetching dynamic price from server');
+        try {
+          const pricingResponse = await fetch(`${apiUrl}/api/v1/activation/price?type=${nodeType}`);
+          const pricing = await pricingResponse.json();
+          burnAmount = pricing.cost || 0; // Server returns "cost" field, NOT "current_price"
+        } catch (pricingErr) {
+          console.warn('[WalletManager] Pricing fetch failed:', pricingErr.message);
+        }
+        if (!burnAmount || burnAmount <= 0) {
+          throw new Error('Cannot determine burn amount — dynamic pricing requires server or caller to provide actual amount');
+        }
+      }
+      
+      // Build request body
+      const requestBody = {
+        wallet_address: walletAddress,
+        burn_tx_hash: burnTxHash,
+        node_type: nodeType,
+        burn_amount: burnAmount,
+        phase: phase
+      };
+      
+      // Phase 1 requires QNet EON address for rewards (separate from Solana burn address)
+      if (phase === 1 && qnetRewardWallet) {
+        requestBody.qnet_reward_wallet = qnetRewardWallet;
       }
       
       // Request code generation from server
       const response = await fetch(`${apiUrl}/api/v1/generate-activation-code`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          wallet_address: walletAddress,
-          burn_tx_hash: burnTxHash,
-          node_type: nodeType,
-          burn_amount: burnAmount,
-          phase: phase
-        })
+        body: JSON.stringify(requestBody)
       });
       
       const result = await response.json();
@@ -3401,11 +4664,52 @@ export class WalletManager {
         burnTxHash: burnTxHash
       };
     } catch (error) {
-      console.error('Error requesting activation code:', error);
+      console.warn('[WalletManager] Activation code request failed:', error.message || error);
       throw error;
     }
   }
   
+  /**
+   * Verify that a node activation exists on the CURRENT QNet blockchain.
+   * Prevents stale local cache from showing phantom activations after network restart.
+   * Checks: RocksDB storage, genesis constants, reward manager, and blockchain scan.
+   * @param {string} walletAddress - QNet EON or Solana wallet address
+   * @returns {{ verified: boolean, node_type?: string, node_id?: string, source?: string }}
+   */
+  async verifyActivationOnChain(walletAddress) {
+    try {
+      const apiUrl = this.getRandomBootstrapNode();
+      // Wallet via header, not the URL (privacy).
+      const response = await fetch(
+        `${apiUrl}/api/v1/verify-activation`,
+        { method: 'GET', headers: { 'Content-Type': 'application/json', 'X-QNet-Wallet': walletAddress } }
+      );
+
+      if (!response.ok) {
+        // A node that could not answer has told us NOTHING about the chain. The endpoint reports a
+        // genuine "no activation" as 200 with verified:false, so any other status - 429 from the
+        // rate limiter, 5xx from a busy node, a proxy error - is an unknown, not an absence. It is
+        // flagged as such because callers delete the local activation on an unflagged negative.
+        console.warn('[verifyOnChain] Server returned', response.status);
+        return { verified: false, error: `HTTP ${response.status}`, networkError: true };
+      }
+
+      const result = await response.json();
+      console.log('[verifyOnChain] Result:', JSON.stringify(result));
+      // A node that is behind the network has not applied the block a registration lives in, so its
+      // "no" is an absence it cannot vouch for. It says so with authoritative:false; treat that
+      // exactly like a transport failure, because for the caller it means the same thing - unknown.
+      if (result && result.verified === false && result.authoritative === false) {
+        return { ...result, networkError: true, error: result.error || 'node is behind the network' };
+      }
+      return result;
+    } catch (error) {
+      console.warn('[verifyOnChain] Verification request failed:', error.message);
+      // Network error — do NOT invalidate cache (could be temporary connectivity issue)
+      return { verified: false, error: error.message, networkError: true };
+    }
+  }
+
   // Encrypt and store activation code securely
   async storeActivationCode(code, nodeType, password, metadata = {}) {
     try {
@@ -3413,38 +4717,26 @@ export class WalletManager {
       const existingCodesStr = await AsyncStorage.getItem('qnet_activation_codes');
       let encryptedCodes = existingCodesStr ? JSON.parse(existingCodesStr) : {};
       
-      // Store activation metadata (timestamp, tx signature, phase, wallet address)
+      // Store activation metadata (timestamp, tx signature, phase, wallet address, burn amount)
       // CRITICAL: phase determines which wallet address to use for claims
       // Phase 1: Solana address, Phase 2: QNet address
+      // burnAmount is REQUIRED for stateless XOR verification on server nodes
       await AsyncStorage.setItem(`qnet_activation_meta_${nodeType}`, JSON.stringify({
         timestamp: metadata.timestamp || Date.now(),
         signature: metadata.signature || null,
         burnTxHash: metadata.burnTxHash || null,
+        burnAmount: metadata.burnAmount || null,
         nodeType: nodeType,
         phase: metadata.phase || 1,  // Default to Phase 1
         walletAddress: metadata.walletAddress || null  // The address used for activation
       }));
       
-      // Generate random salt and IV for this specific code
-      const salt = CryptoJS.lib.WordArray.random(16);
-      const iv = CryptoJS.lib.WordArray.random(16);
-      
-      // Derive key from password ASYNCHRONOUSLY
-      const key = await this.deriveKeyAsync(password, salt, 10000);
-      
-      // Encrypt the activation code
-      const encrypted = CryptoJS.AES.encrypt(code, key, {
-        iv: iv,
-        mode: CryptoJS.mode.CBC,
-        padding: CryptoJS.pad.Pkcs7
-      });
-      
+      // Encrypt the activation code — AES-256-GCM + PBKDF2 600K (v3)
+      const { vault: codeVault } = await this._encryptGCM(code, password);
+
       // Store encrypted code with metadata
       encryptedCodes[nodeType] = {
-        encrypted: encrypted.toString(),
-        salt: salt.toString(),
-        iv: iv.toString(),
-        timestamp: Date.now(),
+        ...codeVault,
         nodeType: nodeType
       };
       
@@ -3472,21 +4764,13 @@ export class WalletManager {
         return null;
       }
       
-      // Parse encryption parameters
-      const salt = CryptoJS.enc.Hex.parse(codeData.salt);
-      const iv = CryptoJS.enc.Hex.parse(codeData.iv);
-      
-      // Derive key from password ASYNCHRONOUSLY
-      const key = await this.deriveKeyAsync(password, salt, 10000);
-      
-      // Decrypt the activation code
-      const decrypted = CryptoJS.AES.decrypt(codeData.encrypted, key, {
-        iv: iv,
-        mode: CryptoJS.mode.CBC,
-        padding: CryptoJS.pad.Pkcs7
-      });
-      
-      const decryptedStr = decrypted.toString(CryptoJS.enc.Utf8);
+      // Decrypt the activation code (v3/v2=GCM, v1=CBC legacy)
+      let decryptedStr;
+      if (codeData.version === 3 || codeData.version === 2) {
+        decryptedStr = await this._decryptGCM(codeData, password);
+      } else {
+        decryptedStr = await this._decryptCBC(codeData, password);
+      }
       if (!decryptedStr) {
         throw new Error('Invalid password');
       }
@@ -3506,59 +4790,111 @@ export class WalletManager {
       const existingCodes = await this.getStoredActivationCodes(password);
       
       if (existingCodes && Object.keys(existingCodes).length > 0) {
-        // Already have codes locally - no need to check blockchain
-        // This saves battery and RPC calls
-        return existingCodes;
+        // Verify on-chain before trusting local cache
+        // Prevents stale codes from surviving network restarts
+        try {
+          // Nodes are registered under the QNet address; callers pass whichever they hold. Ask about
+          // the QNet identity, and treat a Solana address as the burn-side alias of the same wallet.
+          const a = String(walletAddress || '');
+          const qnetAddr = (a.length === 45 && a.includes('eon'))
+            ? a                                              // already the QNet identity
+            : this.generateQNetAddressFromSolana(a);         // Solana burn address -> its QNet alias
+          const onChainResult = await this.verifyActivationOnChain(qnetAddr);
+          if (!onChainResult.verified && !onChainResult.networkError) {
+            console.log('[syncActivationCodes] Local codes exist but NOT verified on-chain — ignoring cache');
+            // Don't return cached codes — fall through to re-check server/blockchain
+          } else {
+            return existingCodes;
+          }
+        } catch (e) {
+          // Network error — trust local cache as fallback
+          return existingCodes;
+        }
       }
       
       // First check if we have stored activation metadata
       // This is the most reliable way to know if node was activated
-      const metaKeys = ['light', 'full', 'super'];
+      const metaKeys = ['light', 'super']; // v4.10: Removed 'full' — Full Node type was removed in v3.18
       for (const nodeType of metaKeys) {
         const metaData = await AsyncStorage.getItem(`qnet_activation_meta_${nodeType}`);
         if (metaData) {
           const meta = JSON.parse(metaData);
           console.log(`Found activation metadata for ${nodeType} node`);
           
-          // PRODUCTION: Retrieve code from server using burn_tx_hash
-          if (meta.burnTxHash && password) {
+          // Regenerate code LOCALLY from stored burn metadata
+          if (meta.burnTxHash && meta.burnAmount && password) {
             try {
-              const result = await this.requestActivationCodeFromServer(
-                nodeType, 
-                walletAddress, 
-                meta.burnTxHash,
-                meta.phase || 1
+              const code = this.generateActivationCodeLocally(
+                nodeType, walletAddress, meta.burnTxHash, meta.burnAmount
               );
-              if (result.success && result.activationCode) {
-                await this.storeActivationCode(result.activationCode, nodeType, password);
-                return { [nodeType]: result.activationCode };
-              }
+              await this.storeActivationCode(code, nodeType, password, {
+                burnTxHash: meta.burnTxHash,
+                burnAmount: meta.burnAmount,
+                walletAddress: meta.walletAddress,
+                phase: meta.phase || 1
+              });
+              return { [nodeType]: code };
             } catch (e) {
-              console.warn('Failed to retrieve code from server:', e.message);
+              console.warn('Failed to regenerate code locally:', e.message);
             }
           }
         }
       }
       
       // Query QNet blockchain for activations by wallet
+      // FIX: backend expects "wallet_address" param (not "wallet")
+      // FIX: backend returns "nodes" array (not "activations")
       const apiUrl = this.getRandomBootstrapNode();
       try {
+        // Wallet via header, not the URL (privacy).
         const response = await fetch(
-          `${apiUrl}/api/v1/activations/by-wallet?wallet=${encodeURIComponent(walletAddress)}`,
-          { method: 'GET', timeout: 10000 }
+          `${apiUrl}/api/v1/activations/by-wallet`,
+          { method: 'GET', timeout: 10000, headers: { 'X-QNet-Wallet': walletAddress } }
         );
         
         if (response.ok) {
           const result = await response.json();
-          if (result.success && result.activations && result.activations.length > 0) {
-            // Found activations on blockchain
-            const activation = result.activations[0]; // Use first activation
-            const code = activation.activation_code;
-            const nodeType = activation.node_type;
+          // Backend returns { success, nodes: [...] } — each node has node_id, node_type, status
+          const allNodes = result.nodes || result.activations || [];
+          // CRITICAL: Filter out pending_activation and HASH-only entries
+          // These are NOT real activated nodes — just code generation records
+          const nodes = allNodes.filter(n => 
+            n.status !== 'pending_activation' && 
+            !(n.activation_code && typeof n.activation_code === 'string' && n.activation_code.startsWith('HASH:'))
+          );
+          if (result.success && nodes.length > 0) {
+            const node = nodes[0]; // Use first node (1 wallet = 1 node rule)
+            const nodeType = node.node_type;
+            const nodeId = node.node_id;
+            
+            // Backend may return activation_code directly (registry query) or we need to re-request
+            let code = node.activation_code;
+            
+            if (!code && nodeId) {
+              // Node exists in blockchain but activation_code not in this response
+              // Regenerate code LOCALLY from stored burn metadata
+              console.log('[syncActivationCodes] Node found on blockchain, regenerating activation code locally...');
+              try {
+                const metaStr = await AsyncStorage.getItem(`qnet_activation_meta_${nodeType}`);
+                const meta = metaStr ? JSON.parse(metaStr) : null;
+                if (meta && meta.burnTxHash && meta.burnAmount) {
+                  code = this.generateActivationCodeLocally(
+                    nodeType, walletAddress, meta.burnTxHash, meta.burnAmount
+                  );
+                }
+              } catch (recoverError) {
+                console.warn('[syncActivationCodes] Code regeneration failed:', recoverError.message);
+              }
+            }
             
             if (code && nodeType && password) {
               await this.storeActivationCode(code, nodeType, password, { fromBlockchain: true });
               return { [nodeType]: code };
+            }
+            
+            // Even without code, return node info so UI knows a node exists
+            if (nodeType) {
+              return { [nodeType]: { nodeId, nodeType, status: node.status, needsCodeRecovery: !code } };
             }
           }
         }
@@ -3569,26 +4905,48 @@ export class WalletManager {
       // Fallback: Check Solana for burn transactions
       const activatedNodes = await this.checkBlockchainForActivations(walletAddress);
       
-      // If burn found but no code in QNet registry, user needs to re-activate
+      // checkBlockchainForActivations returns array of node type strings: ['light'] or ['light','full','super']
+      // If burn found, try to recover code from server using stored burn TX metadata
       if (activatedNodes && activatedNodes.length > 0) {
-        console.log('[syncActivationCodes] ⚠️ Burn found but no activation code in registry');
-        console.log('   User may need to complete activation on QNet network');
+        console.log('[syncActivationCodes] 🔥 Burn found on Solana, attempting code recovery...');
         
-        // Check if we already have a stored code
-        const existingCodes = await this.getStoredActivationCodes(password);
-        if (existingCodes && Object.keys(existingCodes).length > 0) {
-          return existingCodes;
+        // Determine the best node type (single = exact, multiple = old activation without MEMO)
+        const burnNodeType = activatedNodes.length === 1 ? activatedNodes[0] : 'light';
+        
+        // Look for burn TX hash in stored activation metadata
+        const metaStr = await AsyncStorage.getItem(`qnet_activation_meta_${burnNodeType}`);
+        const meta = metaStr ? JSON.parse(metaStr) : null;
+        const burnTxHash = meta?.signature || meta?.burnTxHash;
+        
+        if (burnTxHash && meta?.burnAmount) {
+          try {
+            // Regenerate code LOCALLY — no server needed
+            const code = this.generateActivationCodeLocally(
+              burnNodeType, walletAddress, burnTxHash, meta.burnAmount
+            );
+            console.log('[syncActivationCodes] ✅ Code regenerated locally from burn TX');
+            await this.storeActivationCode(code, burnNodeType, password, {
+              burnTxHash,
+              burnAmount: meta.burnAmount,
+              walletAddress: meta.walletAddress || walletAddress,
+              phase: meta?.phase || 1
+            });
+            return { [burnNodeType]: code };
+          } catch (recoverError) {
+            console.warn('[syncActivationCodes] Local code regeneration failed:', recoverError.message);
+          }
+        } else {
+          console.log('[syncActivationCodes] ⚠️ Burn found but no TX hash in metadata for recovery');
         }
         
-        // Cannot generate code locally - must be done by server
-        // Return null to indicate activation is incomplete
+        // Burn exists but code cannot be recovered (no stored burn TX hash)
         return null;
       }
       
       // No activations found
       return null;
     } catch (error) {
-      console.error('Error syncing activation codes:', error);
+      console.warn('[syncActivationCodes] Error:', error.message || error);
       return null;
     }
   }
@@ -3680,9 +5038,106 @@ export class WalletManager {
     }
   }
   
+  /**
+   * v4.10: Find burn transaction directly on Solana blockchain
+   * Returns { burnTxHash, nodeType, burnAmount } or null
+   * Used when local metadata was cleared (pm clear / reinstall)
+   */
+  async findBurnTransactionOnSolana(walletAddress) {
+    try {
+      const testnetSetting = await AsyncStorage.getItem('qnet_testnet');
+      const isTestnet = testnetSetting === null ? true : testnetSetting === 'true';
+      const rpcUrl = getSolanaRpcUrl(isTestnet);
+      
+      // Step 1: Get signatures — fetch enough to find the FIRST (oldest) burn TX
+      const sigResponse = await fetch(rpcUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          jsonrpc: '2.0', id: 1,
+          method: 'getSignaturesForAddress',
+          params: [walletAddress, { limit: 50 }]
+        })
+      });
+      
+      if (!sigResponse.ok) return null;
+      const sigData = await sigResponse.json();
+      if (!sigData.result || sigData.result.length === 0) return null;
+      
+      // Step 2: Find ALL burn TXs with QNET_NODE_TYPE memo, then pick the OLDEST one.
+      // Solana returns signatures newest-first, so we reverse to get oldest-first.
+      // There should only ever be ONE valid burn TX per wallet (1 wallet = 1 node),
+      // but if multiple exist for any reason, we always use the FIRST (original) burn.
+      const burnSigs = sigData.result
+        .filter(sig => sig.memo && sig.memo.includes('QNET_NODE_TYPE:') && !sig.err);
+      if (burnSigs.length === 0) return null;
+      // Oldest = last in the newest-first array
+      const sig = burnSigs[burnSigs.length - 1];
+      const match = sig.memo.match(/QNET_NODE_TYPE:(\w+)/);
+      if (match) {
+          const nodeType = match[1].toLowerCase();
+          console.log(`[findBurnTx] Found burn TX (oldest): ${sig.signature.substring(0, 16)}... type=${nodeType} (${burnSigs.length} burn TX total)`);
+            
+          // Step 3: Get parsed transaction to extract burn amount
+          await new Promise(r => setTimeout(r, 500)); // Rate limit protection
+          try {
+            const txResponse = await fetch(rpcUrl, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                jsonrpc: '2.0', id: 1,
+                method: 'getTransaction',
+                params: [sig.signature, { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 }]
+              })
+            });
+            
+            if (txResponse.ok) {
+              const txData = await txResponse.json();
+              if (txData.result) {
+                // Extract burn amount from instructions — MUST be integer (no floats for XOR key)
+                let burnAmount = 0;
+                const instructions = txData.result?.transaction?.message?.instructions || [];
+                for (const inst of instructions) {
+                  if (inst.parsed && inst.parsed.type === 'burn' && inst.parsed.info) {
+                    const rawAmount = parseInt(inst.parsed.info.amount || '0');
+                    const decimals = inst.parsed.info.decimals || 6;
+                    // Math.round CRITICAL: avoids floating-point drift (e.g. 1499.9999 vs 1500)
+                    burnAmount = Math.round(rawAmount / Math.pow(10, decimals));
+                    break;
+                  }
+                }
+                
+                return {
+                  burnTxHash: sig.signature,
+                  nodeType: nodeType,
+                  burnAmount: burnAmount > 0 ? burnAmount : null, // Must be real — no defaults
+                  blockTime: sig.blockTime
+                };
+              }
+            }
+            } catch (txErr) {
+              // Can't get amount — return TX hash but no amount (caller must handle)
+              return {
+                burnTxHash: sig.signature,
+                nodeType: nodeType,
+                burnAmount: null,
+                blockTime: sig.blockTime
+              };
+            }
+          }
+      
+      return null;
+    } catch (error) {
+      console.warn('[findBurnTx] Error:', error.message);
+      return null;
+    }
+  }
+
   // Check blockchain for burn transactions to find activated nodes
+  // v4.10: Added rate-limit protection — initial delay + retry with backoff
   async checkBlockchainForActivations(walletAddress) {
     try {
+      console.warn('[QNET_DEBUG] checkBlockchainForActivations called for:', walletAddress);
       const activatedNodes = [];
       
       // Get network setting
@@ -3690,33 +5145,60 @@ export class WalletManager {
       const isTestnet = testnetSetting === null ? true : testnetSetting === 'true';
       
       // Burn contract for checking
-      const BURN_CONTRACT_ID = 'D7g7mkL8o1YEex6ZgETJEQyyHV7uuUMvV3Fy3u83igJ7';
+      const BURN_CONTRACT_ID = 'CCZSessk1TbWie6Ye2JX2cNEWHTEWxCwe5sLz8JaFriw';
       
       try {
         // Import Solana web3
         const { Connection, PublicKey } = require('@solana/web3.js');
         
-        // Create connection with timeout
-        const connection = new Connection(
-          isTestnet ? 'https://api.devnet.solana.com' : 'https://api.mainnet-beta.solana.com',
-          {
-            commitment: 'confirmed',
-            confirmTransactionInitialTimeout: 10000 // 10 second timeout
-          }
-        );
+        // v4.10: Centralized RPC URL with timeout + fetch middleware for 429 retry
+        const connection = new Connection(getSolanaRpcUrl(isTestnet), {
+          commitment: 'confirmed',
+          confirmTransactionInitialTimeout: 15000,
+        });
+        
+        // v4.10: Initial delay to stagger with other parallel Solana RPC calls
+        // (loadBalance, getBurnProgress run first — we wait to avoid 429)
+        await new Promise(r => setTimeout(r, 2000));
         
         // Smart transaction fetching strategy
         // 1. First check recent transactions (fast)
         let signatures = await connection.getSignaturesForAddress(
           new PublicKey(walletAddress),
-          { limit: 10 } // Quick check of recent transactions
+          { limit: 5 } // v4.10: Reduced from 10→5 to reduce RPC calls
         );
         
+        // v4.10: Helper to avoid Solana 429 rate limits
+        const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+        
+        // v4.10: FAST PATH — check memo field from signatures (no extra RPC calls needed)
+        // Solana returns memo in getSignaturesForAddress response, e.g. "[20] QNET_NODE_TYPE:LIGHT"
+        const detectedTypes = new Set();
+        for (const sig of signatures) {
+          if (sig.memo && sig.memo.includes('QNET_NODE_TYPE:') && !sig.err) {
+            const memoText = sig.memo;
+            const nodeTypeMatch = memoText.match(/QNET_NODE_TYPE:(\w+)/);
+            if (nodeTypeMatch) {
+              const detectedType = nodeTypeMatch[1].toLowerCase();
+              console.log(`[checkBlockchainForActivations] Fast-path: found ${detectedType} burn via memo`);
+              detectedTypes.add(detectedType);
+            }
+          }
+        }
+        if (detectedTypes.size > 0) {
+          // Return exact detected types (light, super, or both if multiple burns)
+          return Array.from(detectedTypes);
+        }
+        
+        console.log('[checkBlockchainForActivations] No memo fast-path hit, checking transaction details...');
+        
         // Function to check transactions in batches
+        // v4.10: Reduced batch size from 5→2 and added 500ms delay between batches
+        // to avoid Solana public RPC 429 rate limiting
         const checkTransactionBatch = async (sigs) => {
           const txPromises = [];
           const txSignatures = []; // Store signatures for later use
-          const maxBatchSize = 5;
+          const maxBatchSize = 2; // v4.10: Reduced from 5 to avoid 429
           
           for (let i = 0; i < sigs.length; i++) {
             const sigInfo = sigs[i];
@@ -3732,6 +5214,8 @@ export class WalletManager {
             // Process in batches
             if (txPromises.length === maxBatchSize || i === sigs.length - 1) {
               const txBatch = await Promise.all(txPromises);
+              // v4.10: Delay between batches to respect Solana RPC rate limits
+              if (i < sigs.length - 1) await sleep(500);
               
               for (const result of txBatch) {
                 if (!result) continue;
@@ -3747,8 +5231,7 @@ export class WalletManager {
                   // Found burn transaction but can't determine type in Phase 1
                   // All nodes have DYNAMIC pricing (1500-300 1DEV based on burn %)
                   // Return all types and let sync logic determine which one
-                  // console.log('[checkBlockchainForActivations] Found burn transaction');
-                  return ['light', 'full', 'super'];
+                  return ['light', 'super']; // v4.10: Removed 'full'
                 }
                 
                 // Also check for SPL token burns
@@ -3798,20 +5281,28 @@ export class WalletManager {
                       }
                     }
                     
-                    if (nodeType && ['light', 'full', 'super'].includes(nodeType)) {
+                    if (nodeType && ['light', 'super'].includes(nodeType)) {
                       // Found exact type from memo!
                       // console.log('[checkBlockchainForActivations] ✅ Exact node type determined:', nodeType);
-                      // Store activation metadata for future quick lookups
+                      // Store activation metadata for future quick lookups and code recovery
                       await AsyncStorage.setItem(`qnet_activation_meta_${nodeType}`, JSON.stringify({
                         timestamp: tx.blockTime ? tx.blockTime * 1000 : Date.now(),
                         signature: sigInfo.signature,
-                        nodeType: nodeType
+                        burnTxHash: sigInfo.signature, // CRITICAL: burn TX hash = Solana signature
+                        nodeType: nodeType,
+                        phase: 1
                       }));
                       return [nodeType];
                     } else {
-                      // Old activation without memo - return all types
-                      // console.log('[checkBlockchainForActivations] No memo found (old activation), returning all types');
-                      return ['light', 'full', 'super'];
+                      // Old activation without memo - store metadata and return all types
+                      await AsyncStorage.setItem('qnet_activation_meta_light', JSON.stringify({
+                        timestamp: tx.blockTime ? tx.blockTime * 1000 : Date.now(),
+                        signature: sigInfo.signature,
+                        burnTxHash: sigInfo.signature,
+                        nodeType: 'light',
+                        phase: 1
+                      }));
+                      return ['light', 'super']; // v4.10: Removed 'full'
                     }
                   }
                 }
@@ -3920,38 +5411,15 @@ export class WalletManager {
             continue;
           }
           
-          // Check if it's the new format with salt and iv
           if (codeData.salt && codeData.iv && codeData.encrypted) {
             try {
-              // Validate hex strings before parsing
-              if (typeof codeData.salt !== 'string' || typeof codeData.iv !== 'string') {
-                continue;
+              let code;
+              if (codeData.version === 3 || codeData.version === 2) {
+                code = await this._decryptGCM(codeData, password);
+              } else {
+                code = await this._decryptCBC(codeData, password);
               }
-              
-              // Parse encryption parameters
-              const salt = CryptoJS.enc.Hex.parse(codeData.salt);
-              const iv = CryptoJS.enc.Hex.parse(codeData.iv);
-              
-              // Check if parsing was successful
-              if (!salt || !iv || !salt.sigBytes || !iv.sigBytes) {
-                continue;
-              }
-              
-              // Derive key from password ASYNCHRONOUSLY
-              const key = await this.deriveKeyAsync(password, salt, 10000);
-              
-              // Decrypt the activation code
-              const decrypted = CryptoJS.AES.decrypt(codeData.encrypted, key, {
-                iv: iv,
-                mode: CryptoJS.mode.CBC,
-                padding: CryptoJS.pad.Pkcs7
-              });
-              
-              const code = decrypted.toString(CryptoJS.enc.Utf8);
               if (code && code.length > 0) {
-                // Validate code format
-                // Mobile can have any node type code - light, full, or super
-                
                 decryptedCodes[nodeType] = {
                   code,
                   timestamp: codeData.timestamp || Date.now()
@@ -3960,8 +5428,6 @@ export class WalletManager {
             } catch (decryptError) {
               // Decryption failed - skip this code
             }
-          } else {
-            // Old format - skip
           }
         } catch (err) {
           // Error processing this code - skip
@@ -3976,22 +5442,23 @@ export class WalletManager {
   }
   
   // Calculate dynamic activation cost based on burn percentage
-  async calculateActivationCost(nodeType = 'full') {
+  // Calculate activation cost (Light and Super nodes only)
+  // Dynamic pricing: 1500 base at 0% burned → 300 minimum at 80%+ burned
+  async calculateActivationCost(nodeType = 'super') {
+    // Phase 1 Economic Model — declared outside try for catch access
+    const PHASE_1_BASE_PRICE = 1500; // Base cost in 1DEV at 0% burned
+    const PRICE_REDUCTION_PER_10_PERCENT = 150; // 150 1DEV reduction per 10% burned
     try {
-      const burnPercent = parseFloat(await this.getBurnProgress(false));
-      
-      // Phase 1 Economic Model
-      const PHASE_1_BASE_PRICE = 1500; // Base cost in 1DEV
-      const PRICE_REDUCTION_PER_10_PERCENT = 150; // 150 1DEV reduction per 10% burned
+      const burnPercent = parseFloat((await this.getBurnProgress(false)) ?? '0'); // null ⇒ treat as 0% (same as old fallback)
       const MINIMUM_PRICE = 300; // Minimum price at 80-90% burned
       
       // Check if Phase 2 (90% burned or 5 years passed)
       if (burnPercent >= 90) {
         // Phase 2: QNC activation with dynamic network multiplier
+        // v3.18: Only Light and Super nodes (Full removed)
         const phase2BaseCosts = {
-          light: 5000,  // Base QNC cost
-          full: 7500,   // Base QNC cost
-          super: 10000  // Base QNC cost
+          light: 10000,  // Light: 10,000 QNC base
+          super: 7500    // Super: 7,500 QNC base
         };
         
         // Get real active nodes count from blockchain
@@ -4009,7 +5476,8 @@ export class WalletManager {
           multiplier = 3.0; // Mature network (1M+)
         }
         
-        const baseCost = phase2BaseCosts[nodeType] || phase2BaseCosts.full;
+        // Default to super if invalid type
+        const baseCost = phase2BaseCosts[nodeType] || phase2BaseCosts.super;
         const finalCost = Math.round(baseCost * multiplier);
         
         return {
@@ -4041,14 +5509,37 @@ export class WalletManager {
         description: `Burn ${currentPrice} 1DEV for activation (${burnPercent.toFixed(1)}% already burned)`
       };
     } catch (error) {
-      // console.error('Error calculating activation cost:', error);
-      // Fallback to base price
+      console.warn('[PRICING] Error calculating activation cost:', error.message);
+      // Fallback: fetch dynamic price from server pricing endpoint
+      try {
+        const apiUrl = this.getRandomBootstrapNode();
+        const pricingResponse = await fetch(`${apiUrl}/api/v1/activation/price?type=${nodeType}`);
+        const serverPricing = await pricingResponse.json();
+        if (serverPricing.cost > 0) {
+          return {
+            cost: serverPricing.cost,
+            currency: serverPricing.currency || '1DEV',
+            phase: serverPricing.phase || 1,
+            mechanism: serverPricing.mechanism || 'burn',
+            burnPercent: serverPricing.burn_percentage || 0,
+            baseCost: serverPricing.base_cost || serverPricing.cost,
+            description: `Burn ${serverPricing.cost} ${serverPricing.currency || '1DEV'} for activation`,
+            isEstimate: false
+          };
+        }
+      } catch (fallbackErr) {
+        console.warn('[PRICING] Server pricing fallback failed:', fallbackErr.message);
+      }
+      // Last resort: use base price (max cost) — user never underpays
       return {
-        cost: 1500,
+        cost: PHASE_1_BASE_PRICE,
         currency: '1DEV',
         phase: 1,
         mechanism: 'burn',
-        description: 'Burn 1500 1DEV for activation'
+        burnPercent: 0,
+        baseCost: PHASE_1_BASE_PRICE,
+        description: 'Burn 1DEV for activation (price may be lower — check network status)',
+        isEstimate: true
       };
     }
   }
@@ -4056,13 +5547,7 @@ export class WalletManager {
   // Activate Light Node - REQUIRES REAL 1DEV BURN
   async activateLightNode(walletAddress, password) {
     try {
-      // Check if node already activated on blockchain (prevent duplicates)
-      const existingActivations = await this.checkBlockchainForActivations(walletAddress);
-      if (existingActivations && existingActivations.length > 0) {
-        throw new Error('This wallet already has an activated node on the blockchain. One wallet can only activate one node.');
-      }
-      
-      // Also check local storage for existing codes
+      // Quick local check only (blockchain check is too slow - 30+ RPC calls)
       const existingCodes = await this.getStoredActivationCodes(password);
       if (existingCodes && Object.keys(existingCodes).length > 0) {
         throw new Error('This wallet already has an activated node. One wallet can only activate one node.');
@@ -4090,23 +5575,6 @@ export class WalletManager {
         throw new Error('Failed to calculate activation cost');
       }
       
-      // Check balances BEFORE attempting burn (use the same address for both checks)
-      const solBalance = await this.getBalance(walletAddress, isTestnet);
-      // Fix floating point precision issue (0.01 might be 0.009999999)
-      const minSolRequired = 0.009; // Slightly less than 0.01 to account for precision
-      if (solBalance < minSolRequired) {
-        throw new Error(`Insufficient SOL for transaction fees. Need at least 0.01 SOL, have: ${solBalance.toFixed(4)}`);
-      }
-      
-      const oneDevMint = isTestnet 
-        ? '62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ'
-        : '4R3DPW4BY97kJRfv8J5wgTtbDpoXpRv92W957tXMpump';
-      
-      const oneDevBalance = await this.getTokenBalance(walletAddress, oneDevMint, isTestnet);
-      if (oneDevBalance < pricing.cost) {
-        throw new Error(`Insufficient 1DEV balance. Need: ${pricing.cost}, have: ${oneDevBalance}`);
-      }
-      
       // BURN REAL TOKENS for activation
       const burnResult = await this.burnTokensForNode('light', pricing.cost, isTestnet, password);
       
@@ -4114,89 +5582,42 @@ export class WalletManager {
         throw new Error('Failed to burn tokens for activation');
       }
       
-    // PRODUCTION: Request activation code from server AFTER successful burn
-    // Server verifies burn transaction and generates code with embedded wallet
-    const apiUrl = this.getRandomBootstrapNode();
+    // Generate activation code LOCALLY — deterministic XOR, no server dependency.
+    // Inputs are all from Solana blockchain → always reproducible for recovery.
+    // Validation (burn TX exists, amount OK, 1-wallet-1-node) happens at registration.
+    const activationCode = this.generateActivationCodeLocally(
+      'light',
+      walletAddress,        // Solana address (burn wallet, used for XOR)
+      burnResult.signature, // burn TX hash
+      pricing.cost          // exact burned amount
+    );
     
-    let activationCode;
-    try {
-      const codeResult = await this.requestActivationCodeFromServer(
-        'light',
-        walletAddress,
-        burnResult.signature,
-        1 // Phase 1: 1DEV burn
-      );
-      
-      if (!codeResult.success || !codeResult.activationCode) {
-        throw new Error('Server failed to generate activation code');
-      }
-      
-      activationCode = codeResult.activationCode;
-    } catch (codeError) {
-      console.error('Failed to get activation code from server:', codeError);
-      throw new Error('Burn successful but failed to get activation code. Please contact support.');
-    }
-    
-    // Store the activation code with transaction signature
+    // Store the activation code with ALL metadata (burnAmount included for stateless XOR)
+    // storeActivationCode now saves burnAmount in qnet_activation_meta_light — no duplicate write needed
     await this.storeActivationCode(activationCode, 'light', password, {
       burnTxHash: burnResult.signature,
+      burnAmount: pricing.cost,
       phase: 1,
       walletAddress: walletAddress
     });
     
-    // Store activation metadata for wallet restore
-    await AsyncStorage.setItem(`qnet_activation_meta_light`, JSON.stringify({
+    // CRITICAL: Save qnet_last_activated_node immediately after burn
+    // Without this, data is lost if user closes the app before clicking "Activate Node"
+    const burnPseudonym = this.generateLightNodePseudonym(walletAddress);
+    // Tag the record with the QNet address. The reader compares against the wallet's QNet identity,
+    // so a record tagged with the Solana burn address read as another wallet's and the activated node
+    // vanished from the app on the next unlock. `solanaAddress` stays for the burn/XOR path.
+    await AsyncStorage.setItem('qnet_last_activated_node', JSON.stringify({
+      nodeType: 'light',
+      code: activationCode,
+      pseudonym: burnPseudonym,
+      timestamp: Date.now(),
       burnTxHash: burnResult.signature,
-      phase: 1,
-      timestamp: Date.now()
+      walletAddress: this.generateQNetAddressFromSolana(walletAddress),
+      solanaAddress: walletAddress
     }));
-    
-    try {
-      // Create registration message for P2P network
-      const registrationMessage = {
-        node_id: activationCode,
-        public_key: walletData.publicKey,
-        host: '0.0.0.0', // Mobile nodes don't have fixed IP
-        port: 0, // Mobile nodes don't listen on ports
-        node_type: 'light',
-        activation_tx: burnResult.signature,
-        wallet_address: walletAddress,
-        timestamp: Date.now()
-      };
-      
-      // Sign the registration
-      const messageStr = JSON.stringify(registrationMessage, Object.keys(registrationMessage).sort());
-      const messageHash = CryptoJS.SHA256(messageStr).toString();
-      const signature = nacl.sign.detached(
-        Buffer.from(messageHash, 'hex'),
-        new Uint8Array(walletData.secretKey)
-      );
-      
-      // Register node with P2P network
-      const response = await fetch(`${apiUrl}/api/v1/nodes`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          ...registrationMessage,
-          signature: bs58.encode(signature)
-        })
-      });
-      
-      if (!response.ok) {
-        console.warn('P2P registration failed:', response.status);
-        // Don't fail - node is activated, just not registered for pings yet
-      }
-      
-      // Store initial ping time
-      await AsyncStorage.setItem(`node_last_ping_${walletAddress}`, Date.now().toString());
-      
-    } catch (apiError) {
-      // P2P registration failed but node is activated on-chain
-      console.warn('P2P registration error:', apiError.message);
-    }
-    
+    await AsyncStorage.setItem(`node_pseudonym_${activationCode}`, burnPseudonym);
+
     return {
       success: true,
       signature: burnResult.signature,
@@ -4211,266 +5632,623 @@ export class WalletManager {
     }
   }
   
-  // Get validator node metrics from blockchain
-  async getNodeRewards(nodeType, activationCode, walletAddress) {
+  // Query any node to verify that walletAddress has an active registration on-chain.
+  // Returns { verified: true, node_id, node_type } or { verified: false }.
+  async checkOnChainActivation(walletAddress) {
     try {
-      // Get backend URL
-      // Direct connection to bootstrap node - fully decentralized
       const apiUrl = this.getRandomBootstrapNode();
-      
-      // Get rewards periods from blockchain
-      const periodsResponse = await fetch(`${apiUrl}/api/rewards/periods`, {
-        method: 'GET',
-        headers: {
-          'Content-Type': 'application/json',
-        }
-      });
-      
-      const periods = await periodsResponse.json();
-      const currentPeriod = periods?.periods?.[0];
-      
-      // Get reward proof for current period
-      const proofResponse = await fetch(`${apiUrl}/api/rewards/proof?address=${walletAddress}&period_id=${currentPeriod?.id || 'current'}`, {
-        method: 'GET',
-        headers: {
-          'Content-Type': 'application/json',
-        }
-      });
-      
-      let rewardData = {};
-      if (proofResponse.ok) {
-        rewardData = await proofResponse.json();
-      }
-      
-      // Get node ping status from storage
-      const lastPingTime = await AsyncStorage.getItem(`node_last_ping_${walletAddress}`);
-      const lastPing = lastPingTime ? parseInt(lastPingTime) : null;
-      const fourHoursAgo = Date.now() - (4 * 60 * 60 * 1000);
-      const isActive = lastPing && lastPing > fourHoursAgo;
-      
-      // Daily rates by node type
-      const dailyRates = {
-        light: 10,
-        full: 100,
-        super: 500
-      };
-      
-      // Get stored rewards data
-      const storedRewardsStr = await AsyncStorage.getItem('qnet_node_rewards');
-      let storedRewards = {};
-      if (storedRewardsStr) {
-        try {
-          storedRewards = JSON.parse(storedRewardsStr);
-        } catch (e) {
-          // console.error('Error parsing stored rewards:', e);
-        }
-      }
-      
-      // Calculate validator activity metrics
-      const dailyRate = dailyRates[nodeType] || 10;
-      const totalEarned = rewardData?.total_earned || storedRewards.totalEarned || 0;
-      const totalClaimed = rewardData?.total_claimed || storedRewards.totalClaimed || 0;
-      const unclaimed = rewardData?.unclaimed || (totalEarned - totalClaimed);
-      
-      // Return validator metrics (rewards are managed automatically by blockchain protocol)
-      return {
-        dailyRate,
-        totalEarned,  // Total on-chain validations
-        totalClaimed, // Confirmed validations
-        unclaimed,    // Pending validations
-        lastPing,
-        isActive,
-        nextClaim: storedRewards.lastClaim 
-          ? storedRewards.lastClaim + (24 * 60 * 60 * 1000)
-          : null,
-        merkleProof: rewardData?.merkle_proof || [],
-        periodId: currentPeriod?.id || null
-      };
-    } catch (error) {
-      // console.error('Error getting validator metrics:', error);
-      // Return default metrics
-      return {
-        dailyRate: 10,
-        totalEarned: 0,
-        totalClaimed: 0,
-        unclaimed: 0,
-        lastPing: null,
-        isActive: false,
-        nextClaim: null,
-        merkleProof: [],
-        periodId: null
-      };
+      // Wallet via header, not the URL (privacy).
+      const url = `${apiUrl}/api/v1/verify-activation`;
+      const resp = await fetch(url, { method: 'GET', headers: { 'Content-Type': 'application/json', 'X-QNet-Wallet': walletAddress } });
+      if (!resp.ok) return { verified: false };
+      const data = await resp.json();
+      return data;
+    } catch (_) {
+      return { verified: false };
     }
   }
-  
+
   // Generate Light Node pseudonym (matching backend logic)
   generateLightNodePseudonym(walletAddress) {
-    // Generate blake3-style hash (using SHA256 as substitute)
-    const hash = CryptoJS.SHA256(`LIGHT_NODE_PRIVACY_${walletAddress}`).toString();
-    
-    // Format: light_mobile_[8_hex_chars]
-    const region = 'mobile'; // Mobile nodes always use 'mobile' region
-    return `light_${region}_${hash.substring(0, 8)}`;
+    // MUST match server: rpc.rs generate_light_node_pseudonym() uses blake3
+    // blake3::hash("LIGHT_NODE_PRIVACY_{wallet}") → first 16 hex chars (64-bit)
+    const { blake3 } = require('@noble/hashes/blake3.js');
+    const input = `LIGHT_NODE_PRIVACY_${walletAddress}`;
+    const hashBytes = blake3(Buffer.from(input, 'utf8'));
+    // First 8 bytes → 16 hex chars (matches Rust: &pseudonym_hash.to_hex()[..16])
+    const hexHash = Array.from(hashBytes.slice(0, 8))
+      .map(b => b.toString(16).padStart(2, '0'))
+      .join('');
+    // Region-independent: server pins the "mobile" segment (no QNET_REGION in id derivation)
+    return `light_mobile_${hexHash}`;
   }
   
-  // Register node with activation code
-  async registerNodeWithCode(activationCode, walletAddress, password) {
+  // One rule for every NodeRegistration submit outcome, keyed per wallet. Mempool admission is not
+  // inclusion, so the marker survives it (with txHash + admittedAt) until status reports the node on
+  // chain; "already registered" is the only submit answer that proves the registration landed.
+  async _recordOnchainSubmitOutcome(walletAddress, info, txResult) {
+    const rejectMsg = String((txResult && (txResult.error || txResult.details)) || '');
+    const outcome = /already[\s_]*registered/i.test(rejectMsg) ? 'on_chain'
+      : (txResult && txResult.success && txResult.tx_hash) ? 'admitted' : 'failed';
     try {
-      // Get backend URL
-      // Direct connection to bootstrap node - fully decentralized
-      const apiUrl = this.getRandomBootstrapNode();
-      
-      // Load wallet to sign the request
-      const walletData = await this.loadWallet(password);
-      if (!walletData || !walletData.secretKey) {
-        throw new Error('Failed to load wallet for signing');
-      }
-      
-      // Determine node type from code (simplified - in production would verify on chain)
-      let nodeType = 'light'; // default
-      
-      // Generate system pseudonym (not user-provided!)
-      const systemPseudonym = this.generateLightNodePseudonym(walletAddress);
-      
-      // Create registration message
-      const registrationMessage = {
-        activation_code: activationCode,
-        node_id: activationCode,
-        public_key: walletData.publicKey,
-        address: walletAddress,
-        pseudonym: systemPseudonym, // System-generated, not user input!
-        node_type: nodeType,
-        timestamp: Date.now(),
-        version: '1.0.0'
-      };
-      
-      // Sign the registration
-      const messageStr = JSON.stringify(registrationMessage, Object.keys(registrationMessage).sort());
-      const messageHash = CryptoJS.SHA256(messageStr).toString();
-      const signature = nacl.sign.detached(
-        Buffer.from(messageHash, 'hex'),
-        new Uint8Array(walletData.secretKey)
-      );
-      
-      // Send registration to backend
-      const response = await fetch(`${apiUrl}/api/nodes/activate`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          ...registrationMessage,
-          signature: bs58.encode(signature)
-        })
-      });
-      
-      let result = {};
-      if (response.ok) {
-        result = await response.json();
-        
-        // Store activation locally
-        await this.storeActivationCode(activationCode, nodeType, password);
-        
-        // Store initial ping time
-        await AsyncStorage.setItem(`node_last_ping_${walletAddress}`, Date.now().toString());
-        
-      // Store system pseudonym
-      await AsyncStorage.setItem(`node_pseudonym_${activationCode}`, systemPseudonym);
-      
-      return {
-        success: true,
-        nodeType,
-        pseudonym: systemPseudonym,
-        message: 'Node successfully activated and registered'
-      };
+      const key = `qnet_onchain_reg_pending_${walletAddress}`;
+      if (outcome === 'on_chain') {
+        await AsyncStorage.removeItem(key);
       } else {
-        // For development/testing - simulate successful registration
-        // In production, this would be a real error
-        await this.storeActivationCode(activationCode, nodeType, password);
-        await AsyncStorage.setItem(`node_last_ping_${walletAddress}`, Date.now().toString());
-        
-        await AsyncStorage.setItem(`node_pseudonym_${activationCode}`, systemPseudonym);
-        
-        return {
-          success: true,
-          nodeType,
-          pseudonym: systemPseudonym,
-          message: 'Node registered (development mode)',
-          dev: true
-        };
+        const prev = await AsyncStorage.getItem(key);
+        const attempts = prev ? ((JSON.parse(prev).attempts || 0)) : 0;
+        const now = Date.now();
+        const next = { ...info, walletAddress, attempts: attempts + 1, savedAt: now };
+        // Admission records the TX for the inclusion hold and still counts toward the backoff, so a TX
+        // admitted but never included is not resent every few minutes.
+        await AsyncStorage.setItem(key, JSON.stringify(outcome === 'admitted'
+          ? { ...next, txHash: txResult.tx_hash, admittedAt: now } : next));
       }
-      
-    } catch (error) {
-      // console.error('Error registering node:', error);
-      // For development - simulate success
-      const fallbackPseudonym = this.generateLightNodePseudonym(walletAddress);
+    } catch (_) { /* best effort */ }
+    return outcome;
+  }
+
+  async _clearPendingOnchainRegistration(walletAddress) {
+    try { await AsyncStorage.removeItem(`qnet_onchain_reg_pending_${walletAddress}`); } catch (_) {}
+  }
+
+  // Every NodeRegistration submit runs here, one at a time. A submit started while another is in flight
+  // waits for it, and one that finds a TX admitted inside the inclusion hold yields to it ('held') rather
+  // than replacing it in the mempool. An automatic retry also re-reads the backoff after the wait: the
+  // submit ahead of it may have failed a moment ago, or landed and cleared the marker.
+  async _submitRegistration(walletAddress, info, submit, { automatic = false } = {}) {
+    const prev = this._onchainSubmitTail || Promise.resolve();
+    let release;
+    this._onchainSubmitTail = new Promise(resolve => { release = resolve; });
+    try {
+      await prev;
+      const raw = await AsyncStorage.getItem(`qnet_onchain_reg_pending_${walletAddress}`);
+      const p = raw ? JSON.parse(raw) : null;
+      if (p && p.admittedAt && (Date.now() - p.admittedAt) < ONCHAIN_ADMIT_HOLD_MS) {
+        return { outcome: 'held', txHash: p.txHash };
+      }
+      if (automatic && (!p || (p.savedAt && (Date.now() - p.savedAt) < onchainBackoffMs(p.attempts)))) {
+        return { outcome: 'skipped' };
+      }
+      let txResult;
+      try {
+        txResult = await submit();
+      } catch (e) {
+        // Network down / no keypair: a throw, not a returned reject; recorded as a failed try.
+        txResult = { success: false, error: (e && e.message) || String(e) };
+      }
+      const outcome = await this._recordOnchainSubmitOutcome(walletAddress, info, txResult);
+      return { outcome, txResult, txHash: txResult && txResult.tx_hash };
+    } finally {
+      release();
+    }
+  }
+
+  // Re-drives a pending on-chain registration. Needs the password (the TX is signed by the wallet ML-DSA
+  // key), so it runs on unlock, foreground and the light status poll. The chain decides: on chain clears
+  // the marker; not on chain keeps retrying on the backoff, past the attempt cap.
+  async retryPendingOnchainRegistration(password, knownStatus = null) {
+    if (this._onchainRetryBusy) return; // unlock, foreground and the status poll can overlap
+    this._onchainRetryBusy = true;
+    try {
+      const walletAddress = await AsyncStorage.getItem('qnet_address');
+      if (!walletAddress) return;
+      const raw = await AsyncStorage.getItem(`qnet_onchain_reg_pending_${walletAddress}`);
+      if (!raw) return;
+      const p = JSON.parse(raw);
+      const { checkNodeStatus } = require('../services/PushService');
+      const status = knownStatus || await checkNodeStatus();
+      const onChain = status ? status.onChainRegistered : null;
+      if (onChain === true) {
+        await this._clearPendingOnchainRegistration(walletAddress);
+        console.log('[Registration] pending on-chain registration is on chain — marker cleared');
+        return;
+      }
+      if ((p.attempts || 0) >= 12 && onChain !== false) return; // past the cap only while the chain says "absent"
+      // The backoff is read inside the submit queue, after any submit ahead of this one.
+      const { outcome, txResult } = await this._submitRegistration(walletAddress, {
+        nodeId: p.nodeId, registrationProof: p.registrationProof,
+        burnTxHash: p.burnTxHash, burnAmount: p.burnAmount, burnWallet: p.burnWallet,
+      }, () => this.createAndSubmitNodeRegistrationTx(
+        p.nodeId, walletAddress, p.registrationProof, password, null,
+        p.burnTxHash, p.burnAmount, p.burnWallet
+      ), { automatic: true });
+      if (outcome === 'failed') {
+        console.warn('[Registration] pending on-chain retry still rejected:', (txResult && txResult.error) || 'unknown');
+      } else if (outcome !== 'skipped' && outcome !== 'held') {
+        console.log('[Registration] pending on-chain retry:', outcome, (txResult && txResult.tx_hash) || '');
+      }
+    } catch (e) {
+      console.warn('[Registration] pending on-chain retry error:', e.message || e);
+    } finally {
+      this._onchainRetryBusy = false;
+    }
+  }
+
+  // v6.0: Create a NodeRegistration TX client-side and submit it to the current producer.
+  // Called after /api/v1/light-node/register returns registration_proof.
+  // Signing message: "q{chain}|client_node_reg:{node_id}:{wallet_address}:{registration_proof}:{timestamp}"
+  async createAndSubmitNodeRegistrationTx(nodeId, walletAddress, registrationProof, password, dilithiumKeys, burnTxHash, burnAmount, burnWallet) {
+    const walletData = await this.loadWallet(password);
+    if (!walletData || !walletData.secretKey) {
+      throw new Error('Cannot sign NodeRegistration TX: wallet not loaded');
+    }
+
+    // PURE DILITHIUM (F0.1): wallet control is proven by the ML-DSA-65 WALLET key (which derives to
+    // wallet_address — the node checks eon_from_qnet_dilithium_pubkey(dilithium_public_key)==wallet_address).
+    // Ed25519 is a Solana-only credential and is NOT sent for a QNet registration.
+    const qk = walletData.qnetKeypair;
+    if (!qk || !qk.privateKey || !qk.publicKey) {
+      throw new Error('No ML-DSA-65 QNet key in wallet — required for pure-Dilithium registration');
+    }
+    const walletDilPkHex = Buffer.from(new Uint8Array(qk.publicKey)).toString('hex');
+    const walletDilSkHex = Buffer.from(new Uint8Array(qk.privateKey)).toString('hex');
+
+    const timestamp = Math.floor(Date.now() / 1000);
+    const message = `${QNET_CHAIN_TAG}client_node_reg:${nodeId}:${walletAddress}:${registrationProof}:${timestamp}`;
+
+    const payload = {
+      from: walletAddress,
+      node_id: nodeId,
+      node_type: 'light',
+      wallet_address: walletAddress,
+      registration_proof: registrationProof,
+      timestamp,
+    };
+
+    // Option A: carry the Solana 1DEV burn so the server can build a burn-attested ON-CHAIN Light
+    // registration (without it the TX has an empty burn and is hard-rejected at the gate). The burn is
+    // already cryptographically committed by registration_proof = blake3(burn:node_id:wallet)[..32],
+    // so the server binds it by recomputing the proof — no extra signed field is needed.
+    if (burnTxHash) payload.burn_tx_hash = burnTxHash;
+    if (burnAmount) payload.burn_amount = burnAmount;
+    if (burnWallet) payload.burn_wallet = burnWallet;
+
+    // MANDATORY: the WALLET Dilithium public key is this node's IMMUTABLE on-chain attestation root and
+    // ALSO its wallet-control proof — the node checks eon_from_qnet_dilithium_pubkey(dilithium_public_key)
+    // == wallet_address and verifies every liveness attestation against it. Fail hard if the key is absent.
+    {
+      // Sign client_node_reg with the WALLET Dilithium key; signer_id = the raw pubkey hex so the node
+      // verifies via the same "dilithium_sig_{pk}_{b64}" wire format. Proves control of the wallet whose
+      // address == wallet_address, and pins that key as the node's attestation root.
+      const { signDetached } = require('../crypto/DilithiumCrypto');
+      const dilSig = await signDetached(message, walletDilSkHex); // FIX-5: raw detached hex (lifecycle verify)
+      if (!dilSig) throw new Error('Dilithium registration signature failed');
+      payload.dilithium_signature = dilSig;
+      payload.dilithium_public_key = walletDilPkHex;
+    }
+
+    // Proof-of-ownership of the burning Solana wallet: sign with the Solana key, node verifies against
+    // burn_wallet. Binds THIS on-chain registration to the wallet owner — stops an attacker front-running
+    // our first registration with our public burn_tx. The trailing field is sha3-256 of the wallet
+    // Dilithium key, i.e. the attestation root this registration commits: for a Solana-derived QNet
+    // address nothing else ties that key to us, so the burner has to name it explicitly.
+    {
+      const solSecret = walletData.secretKey instanceof Uint8Array
+        ? walletData.secretKey : new Uint8Array(walletData.secretKey);
+      const { sha3_256 } = require('js-sha3');
+      const attestRoot = sha3_256(Buffer.from(walletDilPkHex, 'hex'));
+      const ownerMsg = `qnet_onchain_reg:${nodeId}:${walletAddress}:${registrationProof}:${timestamp}:${attestRoot}:${burnTxHash || ''}`;
+      const ownerSig = nacl.sign.detached(Buffer.from(ownerMsg, 'utf8'), solSecret);
+      payload.owner_signature = Buffer.from(ownerSig).toString('hex');
+    }
+
+    // Single-node submit (NOT hedged): the server BUILDS + hashes the on-chain TX, so a hedged
+    // double-submit yields two DIFFERENT tx hashes for one logical registration — content-addressed
+    // mempool dedup can't collapse them, doubling the committee burn-attestation fan-out per registration.
+    // Gossip routes the one TX to the current producer within ~1 microblock.
+    let result;
+    try {
+      const res = await this._hedged('/api/v1/node-registration/submit', { method: 'POST', body: payload, timeoutMs: 8000, nodes: this.getRankedNodes(1) });
+      result = res.data || {};
+    } catch (netErr) {
+      throw new Error('Failed to submit NodeRegistration TX: all nodes unreachable');
+    }
+    if (result.success) console.log('[NodeReg] submitted hash:', result.tx_hash);
+    else console.warn('[NodeReg] rejected:', result.error);
+    return result;
+  }
+
+  // Register node with activation code
+  // PRODUCTION: Uses real ML-DSA-65 (ML-DSA-65) signatures + PushService for correct API
+  // FALLBACK: If Dilithium not available, stores locally and registers without quantum sig
+  async registerNodeWithCode(activationCode, walletAddress, password) {
+    // Hoisted so catch block can reference them for storeActivationCode + on-chain recovery
+    let burnTxHash = null;
+    let burnAmount = null;
+    let burnWallet = null;
+
+    try {
+      const nodeType = 'light';
+      const systemPseudonym = this.generateLightNodePseudonym(walletAddress);
+
+      // Try ML-DSA-65 registration first (full quantum-secure)
+      let registrationResult = null;
+      let quantumSecured = false;
+
+      try {
+        const { signWithDilithium, isDilithiumAvailable } = require('../crypto/DilithiumCrypto');
+        const { registerLightNode } = require('../services/PushService');
+
+        if (isDilithiumAvailable()) {
+          // Generate or load ML-DSA-65 keypair
+          const dilithiumKeys = await this._walletDilithiumKeys(password);
+
+          // Part 1 (ML-DSA-65): Sign wallet_address — quantum-resistant identity proof
+          // Server verifies: verify_mobile_dilithium_signature(wallet_address, sig, pubkey)
+          const registrationMessage = walletAddress;
+          const quantumSignature = await signWithDilithium(
+            registrationMessage,
+            dilithiumKeys.secretKey,
+            dilithiumKeys.publicKey,
+            systemPseudonym
+          );
+
+          // Pure ML-DSA-65: the ML-DSA-65 Part-1 signature above is the sole gossip authenticator.
+          // The former Part-2 Ed25519 (light_node_gossip:...) proof is removed.
+
+          // ── PING DELEGATION v7.1: ML-DSA-65 (full quantum safety) ──────
+          // Dedicated ML-DSA-65 ping keypair stored in Keychain (hardware-encrypted).
+          // The wallet Dilithium key signs a delegation cert authorizing the ping key.
+          // Background FCM handler signs with ping key — wallet key stays encrypted.
+          let pingPubkeyHex = null;
+          let pingDelegationCert = null;
+          try {
+            const Keychain = require('react-native-keychain');
+            const { generateRawDilithiumKeypair } = require('../crypto/DilithiumCrypto');
+
+            const existingPingSk = await Keychain.getGenericPassword({
+              service: `qnet_ping_sk_${systemPseudonym}`,
+            });
+            const existingPingPk = await AsyncStorage.getItem(`qnet_ping_dilithium_pk_${systemPseudonym}`);
+
+            if (existingPingSk && existingPingSk.password
+                && existingPingPk && existingPingPk.length === 3904) {
+              pingPubkeyHex = existingPingPk;
+              console.log('[Registration] Reusing existing Dilithium3 ping keypair');
+            } else {
+              const randomBytes = crypto.getRandomValues(new Uint8Array(32));
+              const pingSeed = `QNET_PING_${Buffer.from(randomBytes).toString('hex')}`;
+              const pingKp = await generateRawDilithiumKeypair(pingSeed);
+              pingPubkeyHex = pingKp.publicKey;
+
+              await Keychain.setGenericPassword(
+                `ping_key_${systemPseudonym}`,
+                pingKp.secretKey,
+                {
+                  service: `qnet_ping_sk_${systemPseudonym}`,
+                  accessible: Keychain.ACCESSIBLE.AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY,
+                }
+              );
+              await AsyncStorage.setItem(`qnet_ping_dilithium_pk_${systemPseudonym}`, pingPubkeyHex);
+              console.log('[Registration] Dilithium3 ping keypair generated and stored');
+            }
+
+            const delegationMsg = `delegate_ping:${pingPubkeyHex}:${systemPseudonym}`;
+            pingDelegationCert = await signWithDilithium(
+              delegationMsg,
+              dilithiumKeys.secretKey,
+              dilithiumKeys.publicKey,
+              systemPseudonym,
+            );
+            // Persist the cert so ping-response / self-attest can present it to a genesis for on-chain-key
+            // verification (anti-poison: the node's own authenticated ping key overwrites any gossip poison).
+            await AsyncStorage.setItem(`qnet_ping_cert_${systemPseudonym}`, pingDelegationCert);
+            await AsyncStorage.setItem('qnet_ping_node_id', systemPseudonym);
+            console.log('[Registration] Ping delegation cert created (quantum-safe)');
+          } catch (pingErr) {
+            console.warn('[Registration] Ping delegation setup failed (non-fatal):', pingErr.message);
+            pingPubkeyHex = null;
+            pingDelegationCert = null;
+          }
+          // ── END PING DELEGATION ─────────────────────────────────────────
+
+          // v4.3: Get burn TX data for STATELESS code ownership verification
+          // Node needs burn_tx_hash + burn_amount to reconstruct XOR key and verify
+          // that the activation code truly belongs to this wallet — no server state needed
+          // Note: burnTxHash / burnAmount / burnWallet are hoisted to method scope for catch access
+          try {
+            const metaStr = await AsyncStorage.getItem('qnet_activation_meta_light');
+            if (metaStr) {
+              const meta = JSON.parse(metaStr);
+              burnTxHash = meta.burnTxHash || null;
+              burnAmount = meta.burnAmount || null;
+              burnWallet = meta.walletAddress || null; // Solana address used during code gen
+            }
+            if (!burnTxHash) {
+              const lastNode = await AsyncStorage.getItem('qnet_last_activated_node');
+              if (lastNode) {
+                const ln = JSON.parse(lastNode);
+                burnTxHash = ln.burnTxHash || null;
+              }
+            }
+            // Fallback: try to get Solana address from wallet address storage
+            if (!burnWallet) {
+              // qnet_wallet_address stores the Solana publicKey directly (unencrypted)
+              const storedAddr = await AsyncStorage.getItem('qnet_wallet_address');
+              if (storedAddr) {
+                burnWallet = storedAddr;
+              }
+            }
+          } catch (_) { /* best effort */ }
+          
+          // v4.8: If burnAmount or burnTxHash is missing from local storage,
+          // fall back to finding the burn transaction directly on Solana blockchain.
+          // This handles: fresh install, seed restore, or metadata saved without burnAmount.
+          if ((!burnTxHash || !burnAmount) && burnWallet) {
+            try {
+              console.log('[Registration] Burn metadata incomplete, searching Solana for burn TX...');
+              const burnInfo = await this.findBurnTransactionOnSolana(burnWallet);
+              if (burnInfo) {
+                burnTxHash = burnTxHash || burnInfo.burnTxHash;
+                burnAmount = burnAmount || burnInfo.burnAmount;
+                console.log('[Registration] Found burn TX on Solana:', burnTxHash, 'amount:', burnAmount);
+                // Update local metadata with found data
+                await AsyncStorage.setItem('qnet_activation_meta_light', JSON.stringify({
+                  burnTxHash,
+                  burnAmount,
+                  walletAddress: burnWallet,
+                  nodeType: 'light',
+                  phase: 1,
+                  timestamp: Date.now()
+                }));
+              }
+            } catch (solanaErr) {
+              console.warn('[Registration] Solana burn TX lookup failed:', solanaErr.message);
+            }
+          }
+
+          // v4.7: Sign with Solana Ed25519 key to prove wallet ownership
+          // Prevents stolen code reuse — attacker cannot sign without private key
+          // FIX: qnet_wallet stores ENCRYPTED vault — must use loadWallet(password) to decrypt
+          let ed25519Signature = null;
+          let signatureTimestamp = null;
+          try {
+            const wd = await this.loadWallet(password);
+            if (wd && wd.secretKey) {
+              signatureTimestamp = Math.floor(Date.now() / 1000);
+              const message = `qnet_register:${activationCode}:${signatureTimestamp}`;
+              const messageBytes = Buffer.from(message, 'utf8');
+              const secretKeyBytes = new Uint8Array(wd.secretKey);
+              const sig = nacl.sign.detached(messageBytes, secretKeyBytes);
+              ed25519Signature = Array.from(sig).map(b => b.toString(16).padStart(2, '0')).join('');
+              console.log('[Registration] Ed25519 wallet ownership signature created');
+            }
+          } catch (sigErr) {
+            console.warn('[Registration] Ed25519 signature failed:', sigErr.message);
+            throw new Error(`Wallet ownership proof (Ed25519 signature) required: ${sigErr.message}`);
+          }
+          
+          if (!ed25519Signature) {
+            throw new Error('Ed25519 wallet ownership signature is required. Ensure wallet has Solana private key.');
+          }
+
+          // Step 1: Verify burn + register node locally on server
+          // Server returns node_id + registration_proof (no longer creates on-chain TX)
+          registrationResult = await registerLightNode(
+            activationCode,
+            walletAddress,
+            dilithiumKeys.publicKey,
+            quantumSignature,
+            burnTxHash,
+            burnAmount,
+            burnWallet,
+            ed25519Signature,
+            signatureTimestamp,
+            pingPubkeyHex,            // PING DELEGATION v7.0: ping hot key pubkey
+            pingDelegationCert,       // PING DELEGATION v7.0: Dilithium cert
+          );
+          quantumSecured = true;
+
+          // Step 2: Create and submit NodeRegistration TX client-side (v6.0)
+          // TX is signed by wallet key and routed directly to the current producer.
+          // This replaces the old server-side TX creation and eliminates up-to-30-sec latency.
+          if (registrationResult && registrationResult.success && registrationResult.tx_required) {
+            // HONEST status: an admitted TX is only in a mempool, so the marker stays until the chain has it;
+            // a reject (most are transient: burn quorum, committee syncing) is retried automatically. A TX
+            // still inside its inclusion hold is not replaced.
+            const { outcome, txResult, txHash } = await this._submitRegistration(walletAddress, {
+              nodeId: registrationResult.node_id,
+              registrationProof: registrationResult.registration_proof,
+              burnTxHash, burnAmount, burnWallet,
+            }, () => this.createAndSubmitNodeRegistrationTx(
+              registrationResult.node_id,
+              walletAddress,
+              registrationResult.registration_proof,
+              password,
+              dilithiumKeys,
+              burnTxHash,   // Option A: server embeds the burn + committee attestation into the on-chain TX
+              burnAmount,
+              burnWallet
+            ));
+            if (outcome === 'admitted' || outcome === 'held') {
+              console.log('[Registration] NodeRegistration TX', outcome, txHash);
+              registrationResult.onchain_tx_hash = txHash;
+            } else if (outcome === 'failed') {
+              const reason = (txResult && txResult.error) || 'unknown';
+              console.warn('[Registration] on-chain stage rejected (retryable):', reason);
+              registrationResult.tx_pending = true;
+              registrationResult.onchain_error = reason;
+            }
+          }
+        }
+      } catch (dilithiumError) {
+        // Re-throw server/network errors as-is so WalletScreen shows proper error messages.
+        // Only wrap actual Dilithium/Ed25519 crypto errors.
+        const msg = dilithiumError.message || '';
+        console.error('[Registration] Error in quantum registration block:', msg);
+        const isCryptoError = msg.includes('DilithiumModule') ||
+          msg.includes('Dilithium3') ||
+          msg.includes('dilithium') ||
+          msg.includes('Ed25519 wallet ownership') ||
+          msg.includes('Wallet ownership proof') ||
+          msg.includes('generateKeypair') ||
+          msg.includes('Failed to sign');
+        if (isCryptoError) {
+          console.warn('[Registration] Dilithium3 signature failed:', msg);
+          throw new Error(`Quantum signature failed: ${msg}`);
+        }
+        // Server / network error — pass through directly
+        console.warn('[Registration] Registration rejected by server:', msg);
+        throw dilithiumError;
+      }
+
+      // No fallback — ML-DSA-65 is mandatory for node registration
+      if (!registrationResult) {
+        throw new Error('Dilithium3 module not available. Quantum signature is required for node registration.');
+      }
+
+      // ALWAYS store activation code locally, even if network registration fails
+      // This prevents data loss — code was already paid for via 1DEV burn
+      // CRITICAL: pass burnTxHash + burnAmount so metadata is NOT overwritten with null
+      await this.storeActivationCode(activationCode, nodeType, password, {
+        burnTxHash: burnTxHash || null,
+        burnAmount: burnAmount || null,
+        walletAddress: burnWallet || null,
+        phase: 1
+      });
+      await AsyncStorage.setItem(`node_last_ping_${walletAddress}`, Date.now().toString());
+      await AsyncStorage.setItem(`node_pseudonym_${activationCode}`, systemPseudonym);
+
+      // Store next ping time from backend (if available)
+      if (registrationResult && registrationResult.next_ping_time) {
+        await AsyncStorage.setItem(`node_next_ping_${activationCode}`, registrationResult.next_ping_time.toString());
+      }
+
+      const alreadyRegistered = !!(registrationResult && registrationResult.already_registered);
+      // Pending until a block includes the registration: rejected and retrying, or only admitted.
+      const onChainPending = !!(registrationResult && (registrationResult.tx_pending || registrationResult.onchain_tx_hash));
+
       return {
         success: true,
-        nodeType: 'light',
-        pseudonym: fallbackPseudonym,
-        message: 'Node registered (offline mode)',
-        offline: true
+        alreadyRegistered,
+        nodeType,
+        pseudonym: (registrationResult && registrationResult.node_id) || systemPseudonym,
+        burnTxHash: burnTxHash || null,
+        message: alreadyRegistered
+          ? (registrationResult.message || 'Node already registered. Your existing node has been restored.')
+          : onChainPending
+            ? (registrationResult.onchain_tx_hash
+              ? 'Node activated. Its on-chain registration was submitted and confirms once a block includes it.'
+              : 'Node activated locally. On-chain registration is pending and will retry automatically.')
+            : registrationResult
+              ? 'Node successfully activated and registered in blockchain'
+              : 'Node activation saved locally. Network registration will retry automatically.',
+        nextPingTime: registrationResult ? registrationResult.next_ping_time : null,
+        nextPingWindow: registrationResult ? registrationResult.next_ping_window : null,
+        quantumSecured,
+        onChainPending,
+        onChainError: (registrationResult && registrationResult.onchain_error) || null,
+        pendingRegistration: !registrationResult
+      };
+
+    } catch (error) {
+      console.warn('[Registration] Node activation failed:', error.message);
+
+      // Store activation code locally even on failure (paid via 1DEV burn)
+      // CRITICAL: preserve burnTxHash + burnAmount so future retries can send them to server
+      try {
+        await this.storeActivationCode(activationCode, 'light', password, {
+          burnTxHash: burnTxHash || null,
+          burnAmount: burnAmount || null,
+          walletAddress: burnWallet || null,
+          phase: 1
+        });
+      } catch (storeError) {
+        // Silent — at least we tried to save the code
+      }
+
+      // Race condition guard: even if the client got an error (network timeout,
+      // Solana indexing lag, partial response), the server might have already
+      // written the NodeRegistration TX to the chain. Verify before surfacing failure.
+      try {
+        const onChain = await this.checkOnChainActivation(walletAddress);
+        if (onChain && onChain.verified) {
+          console.log('[Registration] On-chain check confirms node is registered despite client error:', onChain.node_id);
+          const systemPseudonym = this.generateLightNodePseudonym(walletAddress);
+          await AsyncStorage.setItem(`node_pseudonym_${activationCode}`, onChain.node_id || systemPseudonym);
+          await AsyncStorage.setItem(`node_last_ping_${walletAddress}`, Date.now().toString());
+          return {
+            success: true,
+            nodeType: onChain.node_type || 'light',
+            pseudonym: onChain.node_id || systemPseudonym,
+            burnTxHash: burnTxHash || null,
+            message: 'Node is already registered and active on blockchain.',
+            quantumSecured: true,
+            pendingRegistration: false,
+            recoveredFromOnChain: true
+          };
+        }
+      } catch (_) {
+        // On-chain check itself failed — fall through to error response
+      }
+
+      return {
+        success: false,
+        error: error.message || 'Dilithium3 registration failed. Quantum signature is required.'
       };
     }
   }
   
   // Send node ping/heartbeat
+  // PRODUCTION: Uses /api/v1/light-node/ping-response with HYBRID signature
   async pingNode(activationCode, walletAddress, nodeType, password) {
     try {
-      // Get backend URL
-      // Direct connection to bootstrap node - fully decentralized
+      const { signWithDilithium, isDilithiumAvailable } = require('../crypto/DilithiumCrypto');
+
+      // Get pseudonym (stored during registration)
+      const storedPseudonym = await AsyncStorage.getItem(`node_pseudonym_${activationCode}`);
+      const nodeId = storedPseudonym || this.generateLightNodePseudonym(walletAddress);
+
+      // Get backend URL — any synced node (scalable via discovery)
       const apiUrl = this.getRandomBootstrapNode();
-      
-      // Load wallet to sign the ping
-      const walletData = await this.loadWallet(password);
-      if (!walletData || !walletData.secretKey) {
-        throw new Error('Failed to load wallet for signing');
+
+      // Create challenge from timestamp (for signature)
+      const challenge = `ping:${nodeId}:${Date.now()}`;
+
+      // Build ML-DSA-65 signature (pure post-quantum, no Ed25519)
+      let formattedSignature;
+
+      if (!isDilithiumAvailable()) {
+        throw new Error('Dilithium3 module required for node ping. Rebuild app with native module.');
       }
-      
-      // Create ping message
-      const pingMessage = {
-        node_id: activationCode,
-        node_type: nodeType,
-        address: walletAddress,
-        timestamp: Date.now(),
-        version: '1.0.0'
-      };
-      
-      // Sign the ping message
-      const messageStr = JSON.stringify(pingMessage, Object.keys(pingMessage).sort());
-      const messageHash = CryptoJS.SHA256(messageStr).toString();
-      const signature = nacl.sign.detached(
-        Buffer.from(messageHash, 'hex'),
-        new Uint8Array(walletData.secretKey)
+
+      // Load ML-DSA-65 keys (mandatory — no Ed25519 fallback)
+      const dilithiumKeys = await this._walletDilithiumKeys(password);
+
+      // Sign challenge with ML-DSA-65
+      const dilithiumSig = await signWithDilithium(
+        challenge,
+        dilithiumKeys.secretKey,
+        dilithiumKeys.publicKey,
+        nodeId
       );
-      
-      // Send ping to backend
-      const response = await fetch(`${apiUrl}/api/nodes/heartbeat`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          ...pingMessage,
-          signature: bs58.encode(signature),
-          public_key: walletData.publicKey
-        })
-      });
-      
-      if (!response.ok) {
-        throw new Error(`Ping failed: ${response.status}`);
+      formattedSignature = dilithiumSig;
+
+      // Send ping via correct endpoint: GET /api/v1/light-node/ping-response
+      const response = await fetch(
+        `${apiUrl}/api/v1/light-node/ping-response?node_id=${encodeURIComponent(nodeId)}&challenge=${encodeURIComponent(challenge)}&signature=${encodeURIComponent(formattedSignature)}`,
+        { method: 'GET' }
+      );
+
+      const result = await response.json();
+
+      if (!result.success) {
+        throw new Error(result.error || `Ping failed: ${response.status}`);
       }
-      
+
       // Store last ping time
       await AsyncStorage.setItem(`node_last_ping_${walletAddress}`, Date.now().toString());
-      
+
       return {
         success: true,
-        timestamp: Date.now()
+        timestamp: Date.now(),
+        nextPingTime: result.next_ping_time,
+        nextPingWindow: result.next_ping_window
       };
-      
+
     } catch (error) {
-      // console.error('Error pinging node:', error);
+      console.warn('[Ping] Heartbeat failed:', error.message);
       return {
         success: false,
         error: error.message
@@ -4481,78 +6259,27 @@ export class WalletManager {
   // Claim accumulated rewards with blockchain integration
   // Works for ALL node types: Light, Full, Super, Genesis
   // Server validates pending rewards - client just sends claim request
-  async claimRewards(nodeType, activationCode, walletAddress, password, serverPendingRewards = null) {
+  async claimRewards(nodeType, activationCode, walletAddress, password, serverPendingRewards = null, actualNodeId = null) {
     try {
-      // For LIGHT nodes: Check local rewards tracking
-      // For SERVER nodes (Full/Super/Genesis): Skip local check, server knows pending rewards
-      if (nodeType === 'light') {
-        const rewards = await this.getNodeRewards(nodeType, activationCode, walletAddress);
-        if (!rewards) {
-          return {
-            success: false,
-            message: 'Unable to fetch rewards data'
-          };
-        }
-        
-        if (!rewards.unclaimed || rewards.unclaimed <= 0) {
-          return {
-            success: false,
-            message: 'No unclaimed rewards'
-          };
-        }
-        
-        // Check if can claim (1h cooldown for lazy rewards)
-        if (rewards.nextClaim && Date.now() < rewards.nextClaim) {
-          const minutesLeft = Math.ceil((rewards.nextClaim - Date.now()) / (60 * 1000));
-          if (minutesLeft > 60) {
-            const hoursLeft = Math.ceil(minutesLeft / 60);
-            return {
-              success: false,
-              message: `Next claim in ${hoursLeft} hours`
-            };
-          } else {
-            return {
-              success: false,
-              message: `Next claim in ${minutesLeft} minutes`
-            };
-          }
-        }
-        
-        // Check minimum claim amount (1 QNC)
-        const MIN_CLAIM_QNC = 1.0;
-        if (rewards.unclaimed < MIN_CLAIM_QNC) {
-          return {
-            success: false,
-            message: `Minimum claim amount is ${MIN_CLAIM_QNC} QNC`
-          };
-        }
-      } else {
-        // SERVER NODES: Just verify there are pending rewards from server status
-        // The actual validation happens on the server
-        if (serverPendingRewards !== null && serverPendingRewards <= 0) {
-          return {
-            success: false,
-            message: 'No pending rewards on server'
-          };
-        }
+      // Unified check for all node types via on-chain pending rewards (nanoQNC)
+      if (serverPendingRewards !== null && serverPendingRewards <= 0) {
+        return { success: false, message: 'No pending rewards' };
+      }
+      if (serverPendingRewards !== null && serverPendingRewards < 1_000_000_000) {
+        return { success: false, message: 'Minimum claim amount is 1 QNC' };
       }
       
-      // Get backend URL - use official API endpoints
-      // Direct connection to bootstrap node - fully decentralized
-      const apiUrl = this.getRandomBootstrapNode();
-      
-      // Generate node ID from activation code
-      // GENESIS NODE SUPPORT: Genesis codes map to genesis_node_XXX format
-      // v2.66: Support both 3-digit (001) and 4-digit (0001) formats
       let nodeId;
-      const genesisMatch = activationCode.match(/^QNET-BOOT-0*([1-5])-STRAP$/);
-      if (genesisMatch) {
-        // Genesis node: use predefined node ID format
-        const bootstrapId = genesisMatch[1].padStart(3, '0');
-        nodeId = `genesis_node_${bootstrapId}`;
+      if (actualNodeId) {
+        nodeId = actualNodeId;
       } else {
-        // Regular node: use standard format
-        nodeId = `${nodeType}_${activationCode}`;
+        const genesisMatch = activationCode.match(/^QNET-BOOT-0*([1-5])-STRAP$/);
+        if (genesisMatch) {
+          const bootstrapId = genesisMatch[1].padStart(3, '0');
+          nodeId = `genesis_node_${bootstrapId}`;
+        } else {
+          nodeId = `${nodeType}_${activationCode}`;
+        }
       }
       
       // Load wallet for signing
@@ -4561,69 +6288,157 @@ export class WalletManager {
         throw new Error('Failed to load wallet for signing');
       }
       
-      // Get keypair for signing (prefer qnetKeypair, fallback to secretKey)
-      const qnetKeypair = walletData.qnetKeypair;
-      const privateKeyBytes = qnetKeypair?.privateKey 
-        ? new Uint8Array(qnetKeypair.privateKey) 
-        : (walletData.secretKey ? new Uint8Array(walletData.secretKey.slice(0, 32)) : null);
-      
-      if (!privateKeyBytes || privateKeyBytes.length !== 32) {
-        throw new Error('No valid 32-byte private key available in wallet');
+      // PURE DILITHIUM (F0.2): the reward claim is authorised ONLY by the ML-DSA-65 signature below over
+      // "{chain_tag}claim_rewards:{node_id}:{wallet_address}" (the node also matches the on-chain wallet +
+      // re-verifies the merkle proof). Ed25519 is Solana-only and no longer sent on this QNet path.
+      // Chain-bound like every other preimage: mirror of rpc.rs handle_claim_rewards.
+      const message = `${QNET_CHAIN_TAG}claim_rewards:${nodeId}:${walletAddress}`;
+
+      // ML-DSA-65 signature — quantum-safe proof of node ownership (NIST FIPS 204)
+      // Activation code is used as seed so the same keypair is deterministically recovered
+      let dilithiumSignature = null;
+      let dilithiumPublicKey = null;
+      try {
+        const { signWithDilithium, isDilithiumAvailable } = require('../crypto/DilithiumCrypto');
+        if (isDilithiumAvailable()) {
+          const dilithiumKeys = await this._walletDilithiumKeys(password);
+          dilithiumSignature = await signWithDilithium(message, dilithiumKeys.secretKey, dilithiumKeys.publicKey, nodeId);
+          dilithiumPublicKey = dilithiumKeys.publicKey;
+        }
+      } catch (dilithiumErr) {
+        // Dilithium signing failed — server v5.0+ will reject the claim without it.
+        // The error from the server will surface to the user via the normal error path.
+        console.warn('[claimRewards] Dilithium signing failed (server will reject):', dilithiumErr.message);
       }
       
-      // CRITICAL FIX v2.66: ALWAYS regenerate publicKey from privateKey!
-      // Old wallets have WRONG publicKey (SHA256 instead of Ed25519 curve)
-      // nacl.sign.keyPair.fromSeed() generates the CORRECT Ed25519 public key
-      const regeneratedKeypair = nacl.sign.keyPair.fromSeed(privateKeyBytes);
-      const publicKeyBytes = regeneratedKeypair.publicKey;
-      
-      // PRODUCTION: Create Ed25519 signature (clients use ONLY Ed25519)
-      // Post-quantum Dilithium is ONLY for node consensus, NOT for client transactions
-      // Format matches validator's create_client_signing_message: "claim_rewards:from:to"
-      const message = `claim_rewards:${nodeId}:${walletAddress}`;
-      const messageBytes = new TextEncoder().encode(message);
-      
-      // Ed25519 signature (nacl needs 64-byte secret key = privateKey + publicKey)
-      const fullSecretKey = privateKeyBytes.length === 64 
-        ? privateKeyBytes 
-        : new Uint8Array([...privateKeyBytes, ...publicKeyBytes]);
-      
-      const ed25519Sig = nacl.sign.detached(messageBytes, fullSecretKey);
-      const quantumSignature = Buffer.from(ed25519Sig).toString('hex');
-      
-      // Get public key for verification (32 bytes hex)
-      const publicKeyHex = Buffer.from(publicKeyBytes).toString('hex');
-      
-      // Submit claim request to official API
-      const claimResponse = await fetch(`${apiUrl}/api/v1/rewards/claim`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
+      // Submit claim (hedged POST — timeout-bounded across two nodes).
+      const claimRes = await this._hedged('/api/v1/rewards/claim', {
+        method: 'POST', timeoutMs: 8000, hedgeMs: 1200,
+        body: {
           node_id: nodeId,
           wallet_address: walletAddress,
-          quantum_signature: quantumSignature,  // Ed25519 signature (hex)
-          public_key: publicKeyHex  // PRODUCTION: Required for Ed25519 verification
-        })
+          ...(dilithiumSignature && { dilithium_signature: dilithiumSignature }),
+          ...(dilithiumPublicKey && { dilithium_public_key: dilithiumPublicKey }),
+        },
       });
-      
-      if (!claimResponse.ok) {
-        const errorData = await claimResponse.json().catch(() => ({}));
-        throw new Error(errorData.error || errorData.message || 'Failed to claim rewards');
+      let claimResult = claimRes.data || {};
+      if (!claimRes.ok) {
+        throw new Error(claimResult.error || claimResult.message || 'Failed to claim rewards');
       }
-      
-      const claimResult = await claimResponse.json().catch(() => {
-        throw new Error('Invalid JSON response from server');
-      });
-      
-      // Check if claim was successful
+
+      // Two-step claim: step 1 QUOTES the batch, we sign those exact bytes, step 2 submits them.
+      // On-chain apply credits only what this wallet's key authorized, so no relayer can aim a claim
+      // at us. The node still picks the batch, so refuse to sign a quote that does not cover the
+      // independently-polled pending total — a truncated batch would strand the epochs it omits.
+      if (claimResult.needs_signature) {
+        if (!claimResult.claims_data || !claimResult.sign_message) {
+          throw new Error('Node returned an incomplete claim quote');
+        }
+        // Check the batch SHAPE, not its total. Epochs a node cannot serve make an honest quote
+        // legitimately short, so comparing sums rejects honest nodes; what actually strands rewards is
+        // a batch that SKIPS epochs, because the on-chain watermark is monotonic. Requiring strictly
+        // ascending epochs starting just above the wallet's watermark makes a skip unsignable.
+        let claimsParsed;
+        try {
+          claimsParsed = JSON.parse(claimResult.claims_data).claims;
+        } catch (e) {
+          throw new Error('Node returned a malformed claim quote');
+        }
+        if (!Array.isArray(claimsParsed) || claimsParsed.length === 0) {
+          throw new Error('Node returned an empty claim quote');
+        }
+        const watermark = Number(claimResult.last_claimed_epoch ?? -1);
+        if (!Number.isInteger(watermark) || watermark < 0) {
+          throw new Error('Node did not report the claim watermark');
+        }
+        let prevEpoch = watermark;
+        for (const entry of claimsParsed) {
+          if (!Number.isInteger(entry.epoch) || entry.epoch <= prevEpoch) {
+            throw new Error('Node quoted a non-ascending claim batch — retry on another node');
+          }
+          prevEpoch = entry.epoch;
+        }
+        // The head is what a malicious quote would drop, so verify it against a DIFFERENT node —
+        // excluding the quoting one, which would otherwise be the top-ranked responder here too and
+        // simply confirm its own answer. Skipping the first earned epoch would burn it behind the
+        // monotonic watermark once this batch lands.
+        const others = this.getRankedNodes(3).filter((b) => b !== claimRes.base);
+        const headRes = others.length
+          ? await this._hedged(`/api/v1/rewards/pending/${encodeURIComponent(nodeId)}`,
+                               { timeoutMs: 6000, hedgeMs: 1200, nodes: others })
+          : { ok: false };
+        const expectedHead = headRes.ok ? headRes.data?.first_unclaimed_epoch : null;
+        if (!Number.isInteger(expectedHead)) {
+          // Fail CLOSED: unverified head means the quote's starting epoch is unchecked, and signing it
+          // is irreversible (the on-chain watermark only moves forward).
+          throw new Error('Could not verify the claim head against a second node — retry');
+        }
+        if (claimsParsed[0].epoch !== expectedHead) {
+          throw new Error(`Node quoted a batch starting at epoch ${claimsParsed[0].epoch}, expected ${expectedHead} — retry on another node`);
+        }
+        // nanoQNC exceeds 2^53, so the total is carried as a decimal string and compared as BigInt.
+        const quotedNano = BigInt(claimResult.amount_nano ?? '0');
+        if (quotedNano <= 0n) {
+          throw new Error('Node quoted a zero-value claim');
+        }
+        // NEVER sign a server-supplied string with the wallet key. This used to sign
+        // `claimResult.sign_message` verbatim with the SAME ML-DSA-65 key that signs
+        // `q{chain}|transfer:{from}:{to}:{amount}:{nonce}:{gas_price}:{gas_limit}`, and nothing anywhere
+        // rebuilt or checked the `qnet_claim_v1` prefix — so the prefix separated nothing and any
+        // node in the hedged pool could return a transfer-shaped string and drain the wallet, while
+        // the user saw only "Failed to submit signed claim".
+        //
+        // The preimage is fully derivable here: both inputs are values this client already holds and
+        // already sends back in the same POST, so the node's copy is pure convenience and is now
+        // treated as untrusted. Mirror of BlockchainNode::claim_sign_message.
+        const { sha3_256 } = require('js-sha3');
+        const claimTs = claimResult.claim_timestamp;
+        if (!Number.isInteger(claimTs) || claimTs <= 0) {
+          throw new Error('Node returned no claim timestamp — refusing to sign');
+        }
+        const signMessage =
+          `${QNET_CHAIN_TAG}qnet_claim_v1:${walletAddress}:${claimTs}:${sha3_256(claimResult.claims_data)}`;
+        if (claimResult.sign_message && claimResult.sign_message !== signMessage) {
+          // Not fatal by itself — the locally built message is what gets signed either way — but a
+          // mismatch means the node asked for something else, and that is worth refusing loudly.
+          throw new Error('Node asked the wallet to sign a different message — refusing');
+        }
+        const { signWithDilithium } = require('../crypto/DilithiumCrypto');
+        const dilithiumKeys = await this._walletDilithiumKeys(password);
+        const claimsSignature = await signWithDilithium(
+          signMessage, dilithiumKeys.secretKey, dilithiumKeys.publicKey, nodeId);
+        const submitRes = await this._hedged('/api/v1/rewards/claim', {
+          method: 'POST', timeoutMs: 8000, hedgeMs: 1200,
+          body: {
+            node_id: nodeId,
+            wallet_address: walletAddress,
+            dilithium_signature: dilithiumSignature,
+            dilithium_public_key: dilithiumKeys.publicKey,
+            claims_data: claimResult.claims_data,
+            claims_signature: claimsSignature,
+            // Inside the signed message and reused as the TX timestamp, so the payload cannot be
+            // re-stamped into a fresh hash and replayed.
+            claim_timestamp: claimResult.claim_timestamp,
+          },
+        });
+        const submitted = submitRes.data || {};
+        if (!submitRes.ok || !submitted.success) {
+          throw new Error(submitted.error || submitted.message || 'Failed to submit signed claim');
+        }
+        // The quote's stop point survives the submit, so the UI can name the epoch the batch stopped at.
+        claimResult = { ...submitted, epochs_claimed: claimResult.epochs_claimed,
+                        stopped_at_epoch: claimResult.stopped_at_epoch, stopped_reason: claimResult.stopped_reason };
+      }
+
       if (!claimResult.success) {
         throw new Error(claimResult.error || 'Claim failed on server');
       }
-      
-      // Extract amount from server response (server returns reward.total_qnc in QNC, not nanoQNC)
-      const claimedAmount = claimResult.reward?.total_qnc || claimResult.amount || 0;
+
+      // Server returns amount_qnc (QNC) + epochs_claimed. The claim is SUBMITTED here and credited on
+      // inclusion (the per-proof merkle claim finalizes within ~1 block); balance reconciles on the next
+      // status poll. Previously read reward.total_qnc/amount which the handler never returns → always 0.
+      const claimedAmount = claimResult.amount_qnc ?? claimResult.amount ?? 0;
+      const epochsClaimed = claimResult.epochs_claimed ?? 0;
       
       // Update local storage with claim time
       const storedRewardsStr = await AsyncStorage.getItem('qnet_node_rewards');
@@ -4643,6 +6458,10 @@ export class WalletManager {
       return {
         success: true,
         amount: claimedAmount,
+        epochsClaimed,
+        stoppedAtEpoch: claimResult.stopped_at_epoch ?? null, // the epoch the quote stopped at, if it did
+        stoppedReason: claimResult.stopped_reason ?? null,
+        pending: true, // submitted; credited on inclusion — balance updates on the next status poll
         timestamp: Date.now(),
         nextClaim: claimResult.next_claim_time || (Date.now() + 24 * 60 * 60 * 1000),
         txHash: claimResult.tx_hash
@@ -4653,7 +6472,10 @@ export class WalletManager {
     }
   }
 
-  // Universal send transaction function (routes to appropriate network)
+  // Universal send transaction function (routes to appropriate network).
+  // Native QNC → sendQNC. QRC-20 tokens are sent via qrc20Transfer directly from the UI
+  // (contract address + per-token decimals are threaded through the send modal), so this
+  // function only handles the native asset; any other symbol here is a caller bug.
   async sendTransaction(fromAddress, toAddress, amount, tokenSymbol, password) {
     try {
       // Route to appropriate network handler
@@ -4663,7 +6485,8 @@ export class WalletManager {
         // Solana transactions not supported in this app
         throw new Error('Solana transactions are not supported. Use a Solana wallet.');
       } else {
-        throw new Error(`Unknown token: ${tokenSymbol}`);
+        // QRC-20 tokens do not reach here — the UI calls qrc20Transfer(contract, ...) directly.
+        throw new Error(`sendTransaction is for native QNC only; use qrc20Transfer for token ${tokenSymbol}`);
       }
     } catch (error) {
       return {
@@ -4676,21 +6499,27 @@ export class WalletManager {
   // Send QNC tokens to another address
   async sendQNC(toAddress, amount, password) {
     try {
-      // Validate inputs - EON address: {19 chars}eon{15 chars}{4 checksum} = 41 chars
+      // Validate inputs - EON address: {19 chars}eon{15 chars}{8 checksum} = 45 chars
       if (!toAddress) {
         throw new Error('Recipient address is required');
       }
-      
-      // Accept EON format (41 chars with 'eon') or hex format (64 chars)
-      const isEonFormat = toAddress.includes('eon') && toAddress.length === 41;
+
+      // EON (45 chars, "eon" marker at offset 19, 8-char SHA3 checksum) or hex (64 chars).
+      const isEonFormat = toAddress.length === 45 && toAddress.slice(19, 22) === 'eon';
       const isHexFormat = /^[0-9a-fA-F]{64}$/.test(toAddress);
-      
       if (!isEonFormat && !isHexFormat) {
-        throw new Error('Invalid address. EON (41 chars) or Hex (64 chars) required.');
+        throw new Error('Invalid address. EON (45 chars) or Hex (64 chars) required.');
       }
-      
-      if (!amount || amount <= 0) {
-        throw new Error('Amount must be greater than 0');
+      if (isEonFormat) {
+        // Reject a mistyped EON address BEFORE signing — checksum over the first 37 chars.
+        const { sha3_256 } = require('js-sha3');
+        const expectedCk = sha3_256(toAddress.slice(0, 37)).substring(0, 8).toLowerCase();
+        if (toAddress.slice(37).toLowerCase() !== expectedCk) {
+          throw new Error('Invalid recipient address (checksum mismatch)');
+        }
+      }
+      if (!Number.isFinite(amount) || amount <= 0) {
+        throw new Error('Amount must be a valid positive number');
       }
       
       // Load wallet for signing
@@ -4714,78 +6543,384 @@ export class WalletManager {
         }
       }
       
-      // Get private key bytes (either from qnetKeypair or legacy secretKey, always 32 bytes)
-      const privateKeyBytes = qnetKeypair?.privateKey 
-        ? new Uint8Array(qnetKeypair.privateKey) 
-        : new Uint8Array(walletData.secretKey.slice(0, 32));
-      
-      if (privateKeyBytes.length !== 32) {
-        throw new Error('Invalid private key length');
+      // PURE DILITHIUM (F0.1): the QNet wallet key is ML-DSA-65 (pk 1952B / sk 4032B). Ed25519 is a
+      // Solana-only credential and is NOT used to sign QNet TX. Load the Dilithium wallet key.
+      const qk = walletData.qnetKeypair;
+      if (!qk || !qk.privateKey || !qk.publicKey) {
+        throw new Error('No ML-DSA-65 QNet key in wallet — re-create/import to derive the pure-Dilithium key');
       }
-      
-      // CRITICAL FIX v2.66: ALWAYS regenerate publicKey from privateKey!
-      // Old wallets have WRONG publicKey (SHA256 instead of Ed25519 curve)
-      const regeneratedKeypair = nacl.sign.keyPair.fromSeed(privateKeyBytes);
-      const publicKeyBytes = regeneratedKeypair.publicKey;
-      
-      // PRODUCTION: Create Ed25519 signature for transaction
-      // Format matches validator's create_client_signing_message: "transfer:from:to:amount:gas_price:gas_limit"
-      const amountSmallest = Math.floor(amount * 1_000_000_000); // Convert QNC to smallest unit (9 decimals)
-      const gasPrice = 1;
+      const dilPkHex = Buffer.from(new Uint8Array(qk.publicKey)).toString('hex');
+      const dilSkHex = Buffer.from(new Uint8Array(qk.privateKey)).toString('hex');
+
+      // v2.101: Math.round() to avoid float precision loss (QNC → nano, 9 decimals).
+      const amountSmallest = Math.round(amount * 1_000_000_000);
+      if (!Number.isSafeInteger(amountSmallest)) {
+        throw new Error('Amount too large or imprecise'); // beyond 2^53 nano — would lose precision
+      }
+      const gasPrice = GAS_PRICE; // fee = (10 + 10/2) * 10_000 = 150_000 nanoQNC: ML-DSA costs +50%
       const gasLimit = 10_000;
-      const message = `transfer:${fromAddress}:${toAddress}:${amountSmallest}:${gasPrice}:${gasLimit}`;
-      const messageBytes = new TextEncoder().encode(message);
-      
-      // Sign with Ed25519 (nacl needs 64-byte secret key = privateKey + publicKey)
-      const fullSecretKey = privateKeyBytes.length === 64 
-        ? privateKeyBytes 
-        : new Uint8Array([...privateKeyBytes, ...publicKeyBytes]);
-      
-      const ed25519Sig = nacl.sign.detached(messageBytes, fullSecretKey);
-      const signature = Buffer.from(ed25519Sig).toString('hex');
-      
-      // Get public key for verification (32 bytes hex)
-      const publicKeyHex = Buffer.from(publicKeyBytes).toString('hex');
-      
-      // Get random bootstrap node
-      const apiUrl = this.getRandomBootstrapNode();
-      
-      // Submit transaction to REST API (uses handle_transaction_submit endpoint)
-      const response = await fetch(`${apiUrl}/api/v1/transaction`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          from: fromAddress,
-          to: toAddress,
-          amount: amountSmallest,
-          signature: signature,
-          public_key: publicKeyHex,
-          gas_price: gasPrice,
-          gas_limit: gasLimit,
-          nonce: 0 // Server will assign correct nonce from account state
-        })
-      });
-      
-      const result = await response.json();
-      
-      if (!response.ok || !result.success) {
-        throw new Error(result.error || result.details || 'Failed to send transaction');
+
+      const { signDetached } = require('../crypto/DilithiumCrypto');
+
+      // Sign + submit for a nonce. The canonical message MUST byte-match the node's
+      // build_canonical_verify_message Transfer arm: "q{chain}|transfer:from:to:amount:nonce:gas_price:gas_limit".
+      // FIX-5: send the RAW detached ML-DSA-65 signature as hex (3309 B → 6618 hex chars) and the RAW
+      // pubkey as hex (1952 B → 3904 hex chars) — no "dilithium_sig_" envelope, no 3× pubkey. The node
+      // hex-decodes both to raw bytes and verifies via verify_user_tx_dilithium (verify_detached).
+      // pk-ELISION (FIX-5, node-side resolution shipped): drop the 1952-byte pubkey (3904 hex chars) from
+      // the wire once the account's pk is committed on-chain, and the node rehydrates it from state before
+      // verify (rehydrate_elided_pk). SAFETY: the pk binds write-once on the FIRST tx that carries it, and
+      // resolveNonce returns (on-chain confirmed nonce)+1, so txNonce===1 is the first-ever tx (MUST carry
+      // the pk to bind it) and txNonce>=2 means a lower-nonce tx already bound it. Nonce ordering guarantees
+      // that binding tx APPLIES before any elided tx, so rehydrate always resolves — no defer-livelock. On a
+      // nonce error the retry re-resolves fresh (→ txNonce 1 if the account is truly empty) and re-includes pk.
+      const buildAndSubmit = async (txNonce, legacy = false) => {
+        const message = transferPreimage(fromAddress, toAddress, amountSmallest, txNonce, gasPrice, gasLimit);
+        const dilSig = await signDetached(message, dilSkHex);
+        const payload = {
+          from: fromAddress, to: toAddress, amount: amountSmallest,
+          dilithium_signature: dilSig,
+          gas_price: gasPrice, gas_limit: gasLimit, nonce: txNonce,
+        };
+        // Carry the pk until a CONFIRMED chain read proves it is committed; then omit it (the win).
+        if (!WalletManager._pkElidable(fromAddress)) { payload.dilithium_public_key = dilPkHex; }
+        return this.submitSignedTx(payload);
+      };
+
+      // Local nonce → hedged submit; one retry with a chain-fresh nonce if the node rejects on drift.
+      let txNonce = await this.resolveNonce(fromAddress);
+      let result = await buildAndSubmit(txNonce);
+      if (result && result.success === false && !result.tx_hash &&
+          // `pk_unresolved` = we elided the pubkey but the node has no committed key for us. The forced
+        // fresh resolveNonce below re-reads has_dilithium_pk (false), so the retry re-attaches the pk.
+        /nonce|pk_unresolved/i.test(`${result.error || ''} ${result.details || ''}`)) {
+        txNonce = await this.resolveNonce(fromAddress, true);
+        result = await buildAndSubmit(txNonce);
       }
-      
+      // Affirmative accept: require a real tx_hash (or explicit success). An ambiguous/empty 200 is
+      // NOT a successful send — never show "sent" + deduct balance for a TX the node may have dropped.
+      const accepted = !!(result && (result.tx_hash || result.success === true));
+      if (!accepted) {
+        const errorMsg = result && result.details
+          ? `${result.error}: ${result.details}`
+          : (result && result.error) || 'Node did not acknowledge the transaction';
+        console.warn('[SEND] tx not accepted:', errorMsg);
+        throw new Error(errorMsg);
+      }
+      this._bumpNonce(fromAddress, txNonce);
       return {
-        success: true,
-        txHash: result.tx_hash,
-        from: fromAddress,
-        to: toAddress,
-        amount: amount,
-        timestamp: Date.now()
+        success: true, txHash: result.tx_hash,
+        from: fromAddress, to: toAddress, amount, timestamp: Date.now(),
       };
     } catch (error) {
-      console.error('[WalletManager] Send QNC error:', error);
+      console.warn('[WalletManager] Send QNC error:', error.message || error);
       throw error;
     }
+  }
+
+  // ===========================================================================
+  // QRC-20 SDK — client-side ContractCall/ContractDeploy convenience wrappers
+  // ===========================================================================
+  // Same wallet-load, ML-DSA-65 signer, local-nonce and hedged-submit path as
+  // sendQNC. The node builds tx.data server-side from the request fields, so the
+  // signature MUST bind the EXACT byte string it will reproduce:
+  //   ContractCall   canonical: q{chain}|contract_call:{from}:{sha3_256_hex(dataStr)}:{nonce}:{gas_price}:{gas_limit}
+  //                  dataStr = serde_json::to_string(json!({"contract","method","args"})).
+  //                  serde_json here has preserve_order OFF (Map = BTreeMap), so the node
+  //                  emits keys ALPHABETICALLY: `{"args":..,"contract":..,"method":..}`.
+  //                  The client MUST hash that exact ordering (not JS insertion order).
+  //                  Args are strings (addresses, decimal amounts, NFT token_ids) + the
+  //                  occasional small integer; JSON.stringify then matches serde's compact
+  //                  form byte-for-byte. QRC-20 amounts + QRC-721 token_ids are passed as
+  //                  STRINGS (node reads string-or-number) so full u64 values survive exactly
+  //                  — a JSON number would truncate above 2^53 and bake the loss into the
+  //                  signed digest (see qrc20*/_amt and the nft* wrappers).
+
+  // Load the ML-DSA-65 wallet key as {from, dilPkHex, dilSkHex} — mirrors sendQNC.
+  async _loadContractSigner(password) {
+    const walletData = await this.loadWallet(password);
+    if (!walletData) throw new Error('Failed to load wallet for signing');
+    const from = walletData.qnetAddress || walletData.address;
+    if (!from) throw new Error('Wallet has no QNet address');
+    const qk = walletData.qnetKeypair;
+    if (!qk || !qk.privateKey || !qk.publicKey) {
+      throw new Error('No ML-DSA-65 QNet key in wallet — re-create/import to derive the pure-Dilithium key');
+    }
+    return {
+      from,
+      dilPkHex: Buffer.from(new Uint8Array(qk.publicKey)).toString('hex'),
+      dilSkHex: Buffer.from(new Uint8Array(qk.privateKey)).toString('hex'),
+    };
+  }
+
+  // Build + sign + submit a ContractCall. `args` is the method's positional argument
+  // array (see the qrc20* wrappers for each method's shape). Returns the node's
+  // { success, tx_hash, ... } JSON; throws only on an unaffirmed submit.
+  async buildContractCall(contractAddress, method, args, password, opts = {}) {
+    if (!contractAddress || !method) throw new Error('contractAddress and method are required');
+    const argList = Array.isArray(args) ? args : [];
+    const { from, dilPkHex, dilSkHex } = await this._loadContractSigner(password);
+
+    // Byte-exact match to the node's json! serialization: serde_json (preserve_order OFF)
+    // sorts object keys, so the keys MUST be alphabetical — args, contract, method.
+    const dataStr = WalletManager._callData(contractAddress, method, argList);
+    const gasPrice = opts.gasPrice != null ? opts.gasPrice : GAS_PRICE;
+    // Apply refuses a call whose intrinsic gas exceeds its limit; the intrinsic gas is the exact default.
+    const gasLimit = opts.gasLimit != null ? opts.gasLimit : contractCallGasLimit(Buffer.byteLength(dataStr, 'utf8'));
+
+    const { signDetached } = require('../crypto/DilithiumCrypto');
+    const { sha3_256 } = require('js-sha3');
+
+    const buildAndSubmit = async (txNonce, legacy = false) => {
+      const dataHash = sha3_256(dataStr); // hex; matches Rust Sha3_256::digest(tx.data)
+      // The signature covers the gas, so no relay can raise it; `legacy` is the form a node before that rule takes.
+      const message = `${QNET_CHAIN_TAG}contract_call:${from}:${dataHash}:${txNonce}${legacy ? '' : `:${gasPrice}:${gasLimit}`}`;
+      const dilSig = await signDetached(message, dilSkHex); // FIX-5: raw detached hex; pk sent as hex(dilPkHex)
+      // pk-ELISION (same rule as sendQNC): omit the pubkey once bound on-chain (txNonce>=2); include it on
+      // the first-ever tx (txNonce===1) so the node can bind it. Nonce ordering ⇒ rehydrate always resolves.
+      const body = {
+        from, contract_address: contractAddress, method, args: argList,
+        gas_price: gasPrice, gas_limit: gasLimit, nonce: txNonce,
+        dilithium_signature: dilSig,
+      };
+      if (!WalletManager._pkElidable(from)) { body.dilithium_public_key = dilPkHex; }
+      const res = await this._hedged('/api/v1/contract/call', {
+        method: 'POST', timeoutMs: 5000, hedgeMs: 900,
+        body,
+      });
+      return res.data || {};
+    };
+
+    // Local nonce → hedged submit; one retry with a chain-fresh nonce on drift (mirrors sendQNC).
+    let txNonce = await this.resolveNonce(from);
+    let result = await buildAndSubmit(txNonce);
+    // A node from before gas-bound contract signatures refuses the new form; it takes the old one.
+    if (result && result.success === false && !result.tx_hash &&
+        /signature|dilithium/i.test(`${result.error || ''} ${result.details || ''}`)) {
+      result = await buildAndSubmit(txNonce, true);
+    }
+    if (result && result.success === false && !result.tx_hash &&
+        // `pk_unresolved` = we elided the pubkey but the node has no committed key for us. The forced
+        // fresh resolveNonce below re-reads has_dilithium_pk (false), so the retry re-attaches the pk.
+        /nonce|pk_unresolved/i.test(`${result.error || ''} ${result.details || ''}`)) {
+      txNonce = await this.resolveNonce(from, true);
+      result = await buildAndSubmit(txNonce);
+    }
+    const accepted = !!(result && (result.tx_hash || result.success === true));
+    if (!accepted) {
+      const errorMsg = result && result.details
+        ? `${result.error}: ${result.details}`
+        : (result && result.error) || 'Node did not acknowledge the contract call';
+      console.warn('[QRC20] call not accepted:', errorMsg);
+      throw new Error(errorMsg);
+    }
+    this._bumpNonce(from, txNonce);
+    return result;
+  }
+
+  // QRC-20 convenience wrappers — amounts are raw token base-units (u64), NOT decimal
+  // token amounts; scale by 10**decimals in the UI before calling. Args mirror the
+  // node's apply arms: transfer[to,amt] approve[spender,amt] transferFrom[from,to,amt]
+  // mint[to,amt] burn[amt].
+  //
+  // Amounts are passed as DECIMAL STRINGS (not JSON numbers): the node's amount reader
+  // now accepts string-or-number, and a string carries the full u64 range exactly. A JSON
+  // number would silently lose precision above 2^53 (JS doubles) — and the loss would be
+  // baked into the AC-1 signature digest (sha3 of the calldata), so the node would apply a
+  // truncated amount. _amt() normalizes any caller input (Number/BigInt/string) to the
+  // canonical base-10 integer string that serde serializes byte-identically here and node-side.
+  _amt(amount) {
+    if (typeof amount === 'string') {
+      if (!/^\d+$/.test(amount)) throw new Error('amount must be a non-negative integer string');
+      return amount;
+    }
+    if (typeof amount === 'bigint') {
+      if (amount < 0n) throw new Error('amount must be non-negative');
+      return amount.toString();
+    }
+    if (typeof amount === 'number') {
+      if (!Number.isInteger(amount) || amount < 0) throw new Error('amount must be a non-negative integer');
+      if (!Number.isSafeInteger(amount)) throw new Error('amount exceeds 2^53 — pass a string for full u64 exactness');
+      return String(amount);
+    }
+    throw new Error('amount must be a string, number, or bigint');
+  }
+  async qrc20Transfer(contract, to, amount, password, opts) {
+    return this.buildContractCall(contract, 'transfer', [to, this._amt(amount)], password, opts);
+  }
+  static _callData(contract, method, args) { return JSON.stringify({ args, contract, method }); }
+  // QNC fee (gas_debit) the chain prepays for qrc20Transfer(contract, to, amount) at the default gas.
+  qrc20TransferFeeNano(contract, to, amount) {
+    const dataStr = WalletManager._callData(contract, 'transfer', [to, this._amt(amount)]);
+    return feeNano(GAS_PRICE, contractCallGasLimit(Buffer.byteLength(dataStr, 'utf8')));
+  }
+  // QNC the sender must hold: the fee, plus a refundable deposit when the recipient holds none of the token.
+  // An unreadable recipient balance counts as none, so the check stays on the safe side.
+  async qrc20TransferQncNeedNano(contract, to, amount) {
+    const fee = this.qrc20TransferFeeNano(contract, to, amount);
+    const r = await this.getTokenBalanceOf(contract, to);
+    const depositNano = r.ok && r.balanceBaseUnits !== '0' ? 0 : STORAGE_DEPOSIT_NANO;
+    return { feeNano: fee, depositNano, needNano: fee + depositNano };
+  }
+  async qrc20Approve(contract, spender, amount, password, opts) {
+    return this.buildContractCall(contract, 'approve', [spender, this._amt(amount)], password, opts);
+  }
+  async qrc20TransferFrom(contract, from, to, amount, password, opts) {
+    return this.buildContractCall(contract, 'transferFrom', [from, to, this._amt(amount)], password, opts);
+  }
+  async qrc20Mint(contract, to, amount, password, opts) {
+    return this.buildContractCall(contract, 'mint', [to, this._amt(amount)], password, opts);
+  }
+  async qrc20Burn(contract, amount, password, opts) {
+    return this.buildContractCall(contract, 'burn', [this._amt(amount)], password, opts);
+  }
+
+  // QRC-721 (NFT) convenience wrappers — same ContractCall path/signature as QRC-20, so the
+  // AC-1 digest (sha3 of the alphabetical {"args","contract","method"} calldata) is produced
+  // identically. token_id is ALWAYS a decimal STRING (node reads it from a contract_storage
+  // string key and via string-or-number amount parsing) — a JSON number would truncate above
+  // 2^53 and bake the loss into the signed digest. Args mirror the node apply arms exactly:
+  //   mint[to,token_id] transfer[to,token_id] approve[spender,token_id]
+  //   transferFrom[from,to,token_id]
+  // _tokenId() normalizes Number/BigInt/string to the canonical base-10 integer string.
+  _tokenId(tokenId) {
+    // Reuses the amount normalizer: a token_id is a non-negative integer with the same
+    // full-u64 string-exactness requirement.
+    return this._amt(tokenId);
+  }
+  async nftMint(contract, to, tokenId, password, opts) {
+    return this.buildContractCall(contract, 'mint', [to, this._tokenId(tokenId)], password, opts);
+  }
+  async nftTransfer(contract, to, tokenId, password, opts) {
+    return this.buildContractCall(contract, 'transfer', [to, this._tokenId(tokenId)], password, opts);
+  }
+  async nftApprove(contract, spender, tokenId, password, opts) {
+    return this.buildContractCall(contract, 'approve', [spender, this._tokenId(tokenId)], password, opts);
+  }
+  async nftTransferFrom(contract, from, to, tokenId, password, opts) {
+    return this.buildContractCall(contract, 'transferFrom', [from, to, this._tokenId(tokenId)], password, opts);
+  }
+
+  // One length-prefixed field of a canonical deploy digest: "{utf8_byte_len}:{value}". Mirrors
+  // deploy_digest_field in qnet-state; the length prefix is what stops a relayer re-splitting
+  // ':'-joined fields (name "A:B" vs symbol "B:C") under an unchanged signature.
+  _deployField(value) {
+    const s = typeof value === 'boolean' ? (value ? 'true' : 'false') : String(value);
+    return `${new TextEncoder().encode(s).length}:${s}`;
+  }
+
+  // Deploy a QRC-20 token via the node's /api/v1/token/deploy endpoint. The node
+  // derives the on-chain contract address (derive_contract_address(from, nonce)) and
+  // builds tx.data itself, so the signature binds the canonical deploy message it
+  // reproduces: q{chain}|contract_deploy:{from}:{code_hash}:{nonce}:{gas_price}:{gas_limit}, where code_hash is
+  // the canonical deploy digest below — it commits to EVERY field the chain applies, so
+  // no relayer can alter the token under this signature.
+  async deployToken({ name, symbol, decimals = 9, initialSupply, mintable = false, burnable = false, logo = '' }, password, opts = {}) {
+    if (!name || !symbol) throw new Error('name and symbol are required');
+    if (!(initialSupply > 0)) throw new Error('initialSupply must be greater than 0');
+    const { from, dilPkHex, dilSkHex } = await this._loadContractSigner(password);
+
+    const { signDetached } = require('../crypto/DilithiumCrypto');
+    const { sha3_256 } = require('js-sha3');
+
+    const buildAndSubmit = async (txNonce, legacy = false) => {
+      // Mirrors qnet-state deploy_code_hash(DeployKind::Qrc20, ..) — NIST FIPS 202.
+      const codeHash = sha3_256(
+        'QRC20|' + this._deployField(name) + this._deployField(symbol) +
+        this._deployField(decimals) + this._deployField(initialSupply) +
+        this._deployField(!!mintable) + this._deployField(!!burnable) +
+        this._deployField(logo));
+      const message = `${QNET_CHAIN_TAG}contract_deploy:${from}:${codeHash}:${txNonce}${legacy ? '' : `:${DEPLOY_GAS_PRICE}:${DEPLOY_GAS_LIMIT}`}`;
+      const dilSig = await signDetached(message, dilSkHex); // FIX-5: raw detached hex; pk sent as hex(dilPkHex)
+      const res = await this._hedged('/api/v1/token/deploy', {
+        method: 'POST', timeoutMs: 5000, hedgeMs: 900,
+        body: {
+          from, name, symbol, decimals, initial_supply: initialSupply, nonce: txNonce,
+          mintable, burnable, logo,
+          dilithium_signature: dilSig, dilithium_public_key: dilPkHex,
+        },
+      });
+      return res.data || {};
+    };
+
+    let txNonce = await this.resolveNonce(from);
+    let result = await buildAndSubmit(txNonce);
+    // A node from before gas-bound contract signatures refuses the new form; it takes the old one.
+    if (result && result.success === false && !result.tx_hash &&
+        /signature|dilithium/i.test(`${result.error || ''} ${result.details || ''}`)) {
+      result = await buildAndSubmit(txNonce, true);
+    }
+    if (result && result.success === false && !result.tx_hash &&
+        // `pk_unresolved` = we elided the pubkey but the node has no committed key for us. The forced
+        // fresh resolveNonce below re-reads has_dilithium_pk (false), so the retry re-attaches the pk.
+        /nonce|pk_unresolved/i.test(`${result.error || ''} ${result.details || ''}`)) {
+      txNonce = await this.resolveNonce(from, true);
+      result = await buildAndSubmit(txNonce);
+    }
+    const accepted = !!(result && (result.tx_hash || result.success === true));
+    if (!accepted) {
+      const errorMsg = result && result.details
+        ? `${result.error}: ${result.details}`
+        : (result && result.error) || 'Node did not acknowledge the token deploy';
+      console.warn('[QRC20] deploy not accepted:', errorMsg);
+      throw new Error(errorMsg);
+    }
+    this._bumpNonce(from, txNonce);
+    return result;
+  }
+
+  // Deploy a QRC-721 (NFT) collection. Mirrors deployToken's ContractDeploy path exactly:
+  // the node derives the on-chain contract address (derive_contract_address(from, nonce)),
+  // builds tx.data server-side as {"qrc721":true,"name":..,"symbol":..}, and the value-TX gate
+  // rebuilds the SAME canonical deploy message this signs — q{chain}|contract_deploy:{from}:{code_hash}:{nonce}:{gas_price}:{gas_limit}
+  // — then binds the ML-DSA-65 key to `from`. The digest mirrors qnet-state
+  // deploy_code_hash(DeployKind::Qrc721, ..) byte for byte.
+  async deployNftCollection({ name, symbol }, password, opts = {}) {
+    if (!name || !symbol) throw new Error('name and symbol are required');
+    const { from, dilPkHex, dilSkHex } = await this._loadContractSigner(password);
+
+    const { signDetached } = require('../crypto/DilithiumCrypto');
+    const { sha3_256 } = require('js-sha3');
+
+    const buildAndSubmit = async (txNonce, legacy = false) => {
+      // Mirrors qnet-state deploy_code_hash(DeployKind::Qrc721, ..) — NIST FIPS 202.
+      const codeHash = sha3_256('QRC721|' + this._deployField(name) + this._deployField(symbol));
+      const message = `${QNET_CHAIN_TAG}contract_deploy:${from}:${codeHash}:${txNonce}${legacy ? '' : `:${DEPLOY_GAS_PRICE}:${DEPLOY_GAS_LIMIT}`}`;
+      const dilSig = await signDetached(message, dilSkHex); // FIX-5: raw detached hex; pk sent as hex(dilPkHex)
+      const res = await this._hedged('/api/v1/nft/deploy', {
+        method: 'POST', timeoutMs: 5000, hedgeMs: 900,
+        body: {
+          from, name, symbol, nonce: txNonce,
+          dilithium_signature: dilSig, dilithium_public_key: dilPkHex,
+        },
+      });
+      return res.data || {};
+    };
+
+    let txNonce = await this.resolveNonce(from);
+    let result = await buildAndSubmit(txNonce);
+    // A node from before gas-bound contract signatures refuses the new form; it takes the old one.
+    if (result && result.success === false && !result.tx_hash &&
+        /signature|dilithium/i.test(`${result.error || ''} ${result.details || ''}`)) {
+      result = await buildAndSubmit(txNonce, true);
+    }
+    if (result && result.success === false && !result.tx_hash &&
+        // `pk_unresolved` = we elided the pubkey but the node has no committed key for us. The forced
+        // fresh resolveNonce below re-reads has_dilithium_pk (false), so the retry re-attaches the pk.
+        /nonce|pk_unresolved/i.test(`${result.error || ''} ${result.details || ''}`)) {
+      txNonce = await this.resolveNonce(from, true);
+      result = await buildAndSubmit(txNonce);
+    }
+    const accepted = !!(result && (result.tx_hash || result.success === true));
+    if (!accepted) {
+      const errorMsg = result && result.details
+        ? `${result.error}: ${result.details}`
+        : (result && result.error) || 'Node did not acknowledge the NFT collection deploy';
+      console.warn('[NFT] deploy not accepted:', errorMsg);
+      throw new Error(errorMsg);
+    }
+    this._bumpNonce(from, txNonce);
+    return result;
   }
 
   // Check if wallet exists and is valid
@@ -4815,40 +6950,32 @@ export class WalletManager {
   
   // Quick password verification (faster than full decryption)
   async verifyPassword(password) {
+    await this._loadRateLimitState();
+    if (this._lockoutUntil > Date.now()) return false;
+
     try {
       const vaultDataStr = await AsyncStorage.getItem('qnet_wallet');
       if (!vaultDataStr) return false;
-      
+
       const vaultData = JSON.parse(vaultDataStr);
-      if (!vaultData.encrypted) return false;
-      
-      // Use cached key if password matches
-      let key;
-      if (this.keyCachePassword === password && this.keyCache) {
-        key = this.keyCache;
-      } else {
-        // Derive key ASYNCHRONOUSLY and cache it
-        key = await this.deriveKeyAsync(password, CryptoJS.enc.Hex.parse(vaultData.salt), 10000);
-        this.keyCache = key;
-        this.keyCachePassword = password;
-      }
-      
       try {
-        // Try to decrypt - if it fails, password is wrong
-        const decrypted = CryptoJS.AES.decrypt(vaultData.encrypted, key, {
-          iv: CryptoJS.enc.Hex.parse(vaultData.iv),
-          mode: CryptoJS.mode.CBC,
-          padding: CryptoJS.pad.Pkcs7
-        });
-        
-        const decryptedStr = decrypted.toString(CryptoJS.enc.Utf8);
-        // Check if decryption produced valid JSON
-        JSON.parse(decryptedStr);
+        let plaintext;
+        if (vaultData.version === 3 || vaultData.version === 2) {
+          plaintext = await this._decryptGCM(vaultData, password);
+        } else if (vaultData.salt) {
+          plaintext = await this._decryptCBC(vaultData, password);
+        } else {
+          throw new Error('Unsupported vault format');
+        }
+        JSON.parse(plaintext);
+        // For v2/v3 vaults: key was already cached inside _decryptGCM above.
+        // For v1 CBC vaults: skip caching — loadWallet will use _decryptCBC (CryptoJS)
+        // and migration creates a new salt, so a pre-cached key is never reused.
+        await this._resetRateLimit();
         return true;
       } catch {
-        // Clear cache on wrong password
-        this.keyCache = null;
-        this.keyCachePassword = null;
+        this._clearCachedKey();
+        await this._recordFailedAttempt();
         return false;
       }
     } catch (error) {
@@ -4869,18 +6996,18 @@ export class WalletManager {
       // Return a minimal wallet structure with what we know
       const solanaAddress = await AsyncStorage.getItem('qnet_wallet_address');
       if (solanaAddress) {
-        // Check for stored QNet address first
+        // Trust the cached QNet address ONLY if a prior unlock stamped it under the current
+        // FIPS-204 scheme. A cache from the old round-3 build (still a valid 45-char eon with a
+        // valid checksum) would otherwise be returned verbatim and diverge from the node. We
+        // cannot re-derive here (no password) — leave it null so the UI waits for the next
+        // unlock, which re-derives via generateQNetAddress and stamps the scheme. Never fall
+        // back to the Solana-bridge address (non-Dilithium — it can never match the node).
         let qnetAddress = await AsyncStorage.getItem('qnet_address');
-        
-        // If no QNet address or it's old format, generate/migrate
-        if (!qnetAddress || qnetAddress.length < 40) {
-          qnetAddress = this.generateQNetAddressFromSolana(solanaAddress);
-          // Store the new address for future use
-          if (qnetAddress) {
-            await AsyncStorage.setItem('qnet_address', qnetAddress);
-          }
+        const scheme = await AsyncStorage.getItem('qnet_address_scheme');
+        if (scheme !== 'fips204' || !qnetAddress || qnetAddress.length !== 45) {
+          qnetAddress = null;
         }
-        
+
         return {
           address: solanaAddress,
           solanaAddress: solanaAddress,

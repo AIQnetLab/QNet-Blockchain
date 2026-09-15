@@ -35,22 +35,57 @@ class SecureKeyManager {
         this.autoLockTimer = null;
     }
     
+    // Access the canonical pure-Dilithium (ML-DSA-65) bundle. Loaded in setup.html + popup.html via
+    // <script src="lib/noble-pq-ml-dsa.js"> BEFORE this file. In a page it lives on window; fall back
+    // to self/globalThis for safety. This is the ONLY valid source of a QNet EON address.
+    getQNetDilithium() {
+        const g = (typeof window !== 'undefined') ? window
+                : (typeof self !== 'undefined') ? self
+                : (typeof globalThis !== 'undefined') ? globalThis : null;
+        const lib = g && g.QNetDilithiumLib;
+        const Q = lib && lib.QNetDilithium;
+        if (!Q || typeof Q.deriveWallet !== 'function') {
+            throw new Error('QNetDilithium bundle not loaded — lib/noble-pq-ml-dsa.js must load before SecureKeyManager.js');
+        }
+        return Q;
+    }
+
     // Initialize wallet with OPTIONAL encrypted seed storage
     async initializeWallet(password, seedPhrase, storeSeedPhrase = true) {
         try {
             // 1. Derive keys from seed
             const seed = await this.mnemonicToSeed(seedPhrase);
-            
+
             // 2. Generate private keys
+            //    QNet/EON is pure-Dilithium (ML-DSA-65) — its key material comes from the canonical
+            //    bundle (deriveWallet), NOT from a BIP44 m/44'/195' HMAC seed. Deriving a raw eon "key"
+            //    here and hashing it produced a divergent 34-char address the node/mobile reject. Solana
+            //    stays on its Ed25519 SLIP-0010 path.
+            const Q = this.getQNetDilithium();
+            const qnetWallet = Q.deriveWallet(seedPhrase.trim()); // { address(45), publicKey(hex), secretKey(hex), xi }
+
             const keys = {
-                eon: await this.deriveKey(seed, "m/44'/195'/0'/0/0"),
+                // Store the ML-DSA-65 secret key bytes for the eon slot (used by pure-Dilithium signing),
+                // not a BIP44-derived stub. Hex → Uint8Array.
+                eon: Uint8Array.from(qnetWallet.secretKey.match(/../g).map(b => parseInt(b, 16))),
                 solana: await this.deriveKey(seed, "m/44'/501'/0'/0'")
             };
-            
+
             // 3. Generate addresses
+            //    EON address MUST be the canonical ML-DSA-65 address from the bundle (byte-identical to
+            //    Rust node + mobile: golden KAT "abandon…about" → d9fa37…823e). Solana unchanged.
             const addresses = {
-                eon: await this.getAddress(keys.eon, 'eon'),
+                eon: qnetWallet.address,
                 solana: await this.getAddress(keys.solana, 'solana')
+            };
+
+            // Public ML-DSA-65 key material kept alongside the vault so signers (Q.signQNet) can read the
+            // pk/sk hex without re-deriving. Never transmitted; encrypted at rest with the private keys.
+            const qnetKeypair = {
+                address: qnetWallet.address,
+                publicKeyHex: qnetWallet.publicKey,
+                privateKeyHex: qnetWallet.secretKey,
+                algorithm: 'ML-DSA-65'
             };
             
             // 4. Create encryption key from password
@@ -75,13 +110,21 @@ class SecureKeyManager {
             
             // 7. Store encrypted vault
             const vault = {
-                version: '4.0.0', // Updated version
-                addresses: addresses, // Public - OK to store
-                encryptedKeys: encryptedKeys, // Encrypted private keys
-                encryptedSeedPhrase: encryptedSeedPhrase, // OPTIONAL: Encrypted seed (secure!)
+                version: '4.1.0',
+                addresses: addresses,
+                // Canonical ML-DSA-65 public key material (hex). Non-secret pk + the address let signers
+                // and unlock resurface the correct QNet identity without re-deriving. (privateKeyHex is
+                // ALSO carried inside encryptedKeys.eon; this copy is convenience for pk/address.)
+                qnetKeypair: {
+                    address: qnetKeypair.address,
+                    publicKeyHex: qnetKeypair.publicKeyHex,
+                    algorithm: qnetKeypair.algorithm
+                },
+                encryptedKeys: encryptedKeys,
+                encryptedSeedPhrase: encryptedSeedPhrase,
                 salt: safeBase64Encode(String.fromCharCode(...salt)),
-                iterations: 100000,
-                algorithm: 'AES-GCM-256' // Specify encryption algorithm
+                iterations: 600_000, // OWASP 2024
+                algorithm: 'AES-GCM-256'
             };
             
             // 8. Store in IndexedDB (more secure than localStorage)
@@ -109,37 +152,59 @@ class SecureKeyManager {
             // 1. Load encrypted vault
             const vault = await this.loadVault();
             if (!vault) {
-                // Try legacy format for backward compatibility
+                // Auto-migrate legacy localStorage wallet to secure IndexedDB vault
                 const storedHash = localStorage.getItem('qnet_wallet_password_hash');
                 const encryptedWallet = localStorage.getItem('qnet_wallet_encrypted');
                 if (storedHash && encryptedWallet) {
+                    // LEGACY MIGRATION: old wallets stored base64(password+salt) — NOT secure.
+                    // We must keep base64 verification here; stored hash format cannot change.
+                    // After migration to IndexedDB vault (v4.1.0), this path is never used again.
                     const inputHash = safeBase64Encode(password + 'qnet_salt_2025');
-                    if (inputHash === storedHash) {
-                        // Legacy wallet detected - get mnemonic from old format
-                        let mnemonic = null;
-                        try {
-                            const walletData = JSON.parse(safeBase64Decode(encryptedWallet));
-                            mnemonic = walletData.mnemonic;
-                        } catch (e) {
-                            console.error('Failed to extract mnemonic from legacy wallet');
-                        }
-                        
-                        console.warn('⚠️ Legacy wallet format detected. Please migrate to secure format.');
-                        return { 
-                            success: true, 
-                            legacy: true,
-                            mnemonic: mnemonic, // Return legacy mnemonic
-                            warning: 'Legacy wallet format. Please re-create wallet for better security.'
-                        };
-                    }
+                    if (inputHash !== storedHash) throw new Error('Invalid password');
+
+                    // Extract mnemonic from legacy plaintext Base64
+                    let mnemonic = null;
+                    try {
+                        const walletData = JSON.parse(safeBase64Decode(encryptedWallet));
+                        mnemonic = walletData.mnemonic;
+                    } catch (e) { /* corrupted legacy data */ }
+
+                    if (!mnemonic) throw new Error('Legacy wallet corrupted. Please re-import using recovery phrase.');
+
+                    // Re-initialize with secure format (PBKDF2 600K + AES-GCM + IndexedDB)
+                    const migrated = await this.initializeWallet(password, mnemonic, true);
+                    if (!migrated.success) throw new Error('Migration failed: ' + migrated.error);
+
+                    // Remove insecure legacy localStorage entries (base64 "hash", plaintext mnemonic)
+                    localStorage.removeItem('qnet_wallet_password_hash');
+                    localStorage.removeItem('qnet_wallet_encrypted');
+                    ['qnet_wallet_secure', 'qnet_wallet_initialized', 'qnet_wallet_unlocked']
+                        .forEach(k => localStorage.removeItem(k));
+
+                    // Load the freshly-created vault and continue unlock normally
+                    const newVault = await this.loadVault();
+                    if (!newVault) throw new Error('Vault not found after migration');
+
+                    const salt = Uint8Array.from(safeBase64Decode(newVault.salt), c => c.charCodeAt(0));
+                    const passwordKey = await this.derivePasswordKey(password, salt, 600_000);
+                    this.sessionKeys = await this.decryptKeys(newVault.encryptedKeys, passwordKey);
+                    this.addresses = newVault.addresses;
+                    this.setAutoLock(15 * 60 * 1000);
+                    return {
+                        success: true,
+                        addresses: newVault.addresses,
+                        mnemonic: returnSeedPhrase ? mnemonic : null,
+                        migrated: true,
+                    };
                 }
                 throw new Error('No wallet found');
             }
             
-            // 2. Derive decryption key from password
+            // 2. Derive decryption key from password — use stored iterations for backward compat
             const salt = Uint8Array.from(safeBase64Decode(vault.salt), c => c.charCodeAt(0));
-            const passwordKey = await this.derivePasswordKey(password, salt);
-            
+            const vaultIterations = vault.iterations || 600_000;
+            const passwordKey = await this.derivePasswordKey(password, salt, vaultIterations);
+
             // 3. Decrypt private keys
             const keys = await this.decryptKeys(vault.encryptedKeys, passwordKey);
             
@@ -219,7 +284,7 @@ class SecureKeyManager {
             // Re-verify password
             const vault = await this.loadVault();
             const salt = Uint8Array.from(safeBase64Decode(vault.salt), c => c.charCodeAt(0));
-            const passwordKey = await this.derivePasswordKey(password, salt);
+            const passwordKey = await this.derivePasswordKey(password, salt, vault.iterations || 600_000);
             
             // Decrypt keys
             const keys = await this.decryptKeys(vault.encryptedKeys, passwordKey);
@@ -246,7 +311,8 @@ class SecureKeyManager {
     }
     
     // Derive password key using PBKDF2
-    async derivePasswordKey(password, salt) {
+    // iterations defaults to 600K (OWASP 2024); pass 100000 only for legacy vault decryption
+    async derivePasswordKey(password, salt, iterations = 600_000) {
         const encoder = new TextEncoder();
         const passwordBuffer = encoder.encode(password);
         
@@ -262,7 +328,7 @@ class SecureKeyManager {
             {
                 name: 'PBKDF2',
                 salt: salt,
-                iterations: 100000,
+                iterations,
                 hash: 'SHA-256'
             },
             passwordKey,
@@ -363,22 +429,10 @@ class SecureKeyManager {
     
     // Store vault with fallback to localStorage
     async storeVault(vault) {
-        try {
-            // Try IndexedDB first
-            if (typeof indexedDB !== 'undefined') {
-                return await this.storeVaultIndexedDB(vault);
-            }
-        } catch (e) {
-            // Fallback to localStorage
+        if (typeof indexedDB === 'undefined') {
+            throw new Error('IndexedDB not available. Vault storage requires IndexedDB.');
         }
-        
-        // Fallback to localStorage
-        try {
-            localStorage.setItem('qnet_wallet_vault', JSON.stringify(vault));
-            return Promise.resolve();
-        } catch (e) {
-            return Promise.reject(new Error('Failed to store vault'));
-        }
+        return this.storeVaultIndexedDB(vault);
     }
     
     // Store vault in IndexedDB
@@ -407,29 +461,14 @@ class SecureKeyManager {
         });
     }
     
-    // Load vault with fallback to localStorage
+    // Load vault from IndexedDB only — localStorage is not used for vault storage
     async loadVault() {
+        if (typeof indexedDB === 'undefined') return null;
         try {
-            // Try IndexedDB first
-            if (typeof indexedDB !== 'undefined') {
-                const result = await this.loadVaultIndexedDB();
-                if (result) return result;
-            }
+            return await this.loadVaultIndexedDB();
         } catch (e) {
-            // Fallback to localStorage
+            return null;
         }
-        
-        // Fallback to localStorage
-        try {
-            const stored = localStorage.getItem('qnet_wallet_vault');
-            if (stored) {
-                return JSON.parse(stored);
-            }
-        } catch (e) {
-            // Ignore
-        }
-        
-        return null;
     }
     
     // Load vault from IndexedDB
@@ -460,9 +499,9 @@ class SecureKeyManager {
                 return { success: false, error: 'No wallet found' };
             }
             
-            // 2. Verify old password by trying to decrypt
+            // 2. Verify old password by trying to decrypt (use stored iterations)
             const oldSalt = Uint8Array.from(safeBase64Decode(vault.salt), c => c.charCodeAt(0));
-            const oldPasswordKey = await this.derivePasswordKey(oldPassword, oldSalt);
+            const oldPasswordKey = await this.derivePasswordKey(oldPassword, oldSalt, vault.iterations || 600_000);
             
             // Try to decrypt keys with old password
             let keys;
@@ -501,24 +540,22 @@ class SecureKeyManager {
                 newEncryptedSeedPhrase = await this.encryptSeedPhrase(seedPhrase, newPasswordKey);
             }
             
-            // 7. Create updated vault
+            // 7. Create updated vault — upgrade iterations to 600K on password change
             const updatedVault = {
                 ...vault,
                 encryptedKeys: newEncryptedKeys,
                 encryptedSeedPhrase: newEncryptedSeedPhrase,
                 salt: safeBase64Encode(String.fromCharCode(...newSalt)),
+                iterations: 600_000,
+                version: '4.1.0',
                 updatedAt: Date.now()
             };
             
             // 8. Store updated vault
             await this.storeVault(updatedVault);
             
-            // 9. Also update legacy password hash if it exists
-            const legacyHash = localStorage.getItem('qnet_wallet_password_hash');
-            if (legacyHash) {
-                const newLegacyHash = safeBase64Encode(newPassword + 'qnet_salt_2025');
-                localStorage.setItem('qnet_wallet_password_hash', newLegacyHash);
-            }
+            // 9. Remove legacy plaintext password "hash" (Base64-reversible, insecure)
+            localStorage.removeItem('qnet_wallet_password_hash');
             
             // 10. Clear sensitive data from memory
             if (seedPhrase) {
@@ -647,24 +684,14 @@ class SecureKeyManager {
             
             // Encode public key as base58 address
             return this.simpleBase58(publicKey);
-        } else if (network === 'eon') {
-            // CRITICAL v2.66: Generate proper Ed25519 public key (NOT SHA-256!)
-            // Use nacl if available, otherwise delegate to ProductionCrypto
-            let publicKey;
-            if (typeof nacl !== 'undefined' && nacl.sign && nacl.sign.keyPair) {
-                const keypair = nacl.sign.keyPair.fromSeed(privateKey.slice(0, 32));
-                publicKey = keypair.publicKey;
-            } else {
-                // Fallback to SHA-512 for address generation only (not for signing)
-                const hash = await crypto.subtle.digest('SHA-512', privateKey);
-                publicKey = new Uint8Array(hash).slice(0, 32);
-            }
-            // Generate EON address from public key
-            const addrHash = await crypto.subtle.digest('SHA-512', publicKey);
-            const fullHex = Array.from(new Uint8Array(addrHash)).map(b => b.toString(16).padStart(2, '0')).join('');
-            const part1 = fullHex.substring(0, 19).toLowerCase();
-            const part2 = fullHex.substring(19, 34).toLowerCase();
-            return part1 + 'eon' + part2; // Without checksum for simplicity
+        } else if (network === 'eon' || network === 'qnet') {
+            // DIVERGENT PATH REMOVED. The old code hashed a BIP44-derived key with SHA-512 into a
+            // checksum-less 34-char "eon" address that the Rust node + mobile app reject. A QNet EON
+            // address is ONLY valid when derived from the ML-DSA-65 public key via the canonical bundle.
+            // getAddress() only has a private key here, not the mnemonic, so it cannot derive the
+            // canonical address — callers must use QNetDilithium.deriveWallet(mnemonic).address instead
+            // (initializeWallet already does). Fail loudly rather than mint a wrong address.
+            throw new Error('SecureKeyManager.getAddress: EON/QNet addresses must come from QNetDilithium.deriveWallet(mnemonic).address (bundle), not from a derived key.');
         }
         return 'ADDRESS_PLACEHOLDER';
     }

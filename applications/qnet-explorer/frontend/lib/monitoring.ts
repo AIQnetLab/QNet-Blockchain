@@ -102,33 +102,14 @@ async function sendAlert(alert: SecurityAlert): Promise<void> {
         }),
         signal: AbortSignal.timeout(5000),
       }).catch(err => {
-        console.error('[Monitoring] Failed to send alert to webhook:', err);
+        // console.error('[Monitoring] Failed to send alert to webhook:', err);
       });
     } catch {
       // Invalid webhook URL, skip
     }
   }
   
-  // Send to email if configured (via SMTP or service)
-  if (process.env.ALERT_EMAIL && alert.severity === 'critical') {
-    // In production, integrate with email service (SendGrid, AWS SES, etc.)
-    console.error('[Monitoring] CRITICAL ALERT - Email notification required:', {
-      to: process.env.ALERT_EMAIL,
-      subject: `[CRITICAL] ${alert.event}`,
-      body: JSON.stringify(alert, null, 2),
-    });
-  }
-  
-  // Log to console with severity-based formatting
-  const logLevel = alert.severity === 'critical' ? 'error' : 
-                   alert.severity === 'high' ? 'error' : 
-                   alert.severity === 'medium' ? 'warn' : 'info';
-  
-  console[logLevel](`[Monitoring][${alert.severity.toUpperCase()}] ${alert.event}:`, {
-    count: alert.count,
-    timestamp: alert.timestamp,
-    details: alert.details,
-  });
+  // Email alerts disabled
 }
 
 // Process security event and generate alerts

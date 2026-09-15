@@ -1,21 +1,20 @@
 //! Archive Replication Manager - Production system for distributed blockchain archival
-//! 
-//! This module implements a distributed archival system where:
-//! - Full nodes archive 3 chunks as network obligation
+//!
+//! This module implements a distributed archival system where (v3.18+ — only
+//! Light and Super exist; the legacy "Full" tier was removed from the protocol):
 //! - Super nodes archive 8 chunks as network obligation
 //! - Genesis nodes archive 20+ chunks for critical network infrastructure
 //! - Automatic replication ensures 3+ copies of each chunk exist
 //! - Compliance enforcement maintains network fault tolerance
 //! - Background monitoring ensures archival obligations are met
+//! - Light nodes have no archival obligation (mobile API clients, no chain storage)
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::errors::{IntegrationError, IntegrationResult};
 use crate::node::NodeType;
-use sha3::{Sha3_256, Digest};
-use bincode;
 use serde::{Serialize, Deserialize};
 
 /// Archive chunk containing compressed blockchain data
@@ -74,8 +73,6 @@ pub struct ArchiveReplicationManager {
     min_replicas: u8,
     /// Maximum replicas per chunk (adaptive based on network size)
     max_replicas: u8,
-    /// Health check interval
-    health_check_interval: Duration,
     /// Grace period for new nodes (24 hours)
     grace_period_hours: u32,
     /// Network size adaptive scaling
@@ -91,7 +88,6 @@ impl ArchiveReplicationManager {
             chunk_assignments: Arc::new(RwLock::new(HashMap::new())),
             min_replicas: 3,        // Adaptive minimum based on network size
             max_replicas: 7,        // Adaptive maximum based on network size
-            health_check_interval: Duration::from_secs(4 * 3600), // 4 hours
             grace_period_hours: 24, // 24 hours for new nodes to comply
             adaptive_scaling: true, // Enable adaptive scaling for small networks
         }
@@ -111,7 +107,6 @@ impl ArchiveReplicationManager {
             // Static quotas for large networks
             match node_type {
                 NodeType::Light => 0,    // Light nodes exempt from archival
-                NodeType::Full => 3,     // Static: Full nodes archive 3 chunks
                 NodeType::Super => 8,    // Static: Super nodes archive 8 chunks
             }
         };
@@ -244,12 +239,11 @@ impl ArchiveReplicationManager {
                 }
                 
                 let required_chunks = match node_info.node_type {
-                    NodeType::Full => 3,
+                    NodeType::Light => continue,
                     NodeType::Super => 8,
-                    _ => continue,
                 };
                 
-                let actual_chunks = node_info.assigned_chunks.len() as u8;
+                let actual_chunks = node_info.assigned_chunks.len().min(255) as u8;
                 
                 match &node_info.compliance_status {
                     ComplianceStatus::GracePeriod { expires_at } => {
@@ -372,9 +366,9 @@ impl ArchiveReplicationManager {
         let total_nodes = archive_nodes.len();
         
         // Count nodes by type
-        let genesis_count = archive_nodes.values().filter(|n| matches!(n.node_type, NodeType::Super)).count(); // Genesis treated as Super for now
+        let _genesis_count = archive_nodes.values().filter(|n| matches!(n.node_type, NodeType::Super)).count(); // Genesis treated as Super for now
         let super_count = archive_nodes.values().filter(|n| matches!(n.node_type, NodeType::Super)).count();
-        let full_count = archive_nodes.values().filter(|n| matches!(n.node_type, NodeType::Full)).count();
+        let full_count = 0; // v3.18: Always 0 (Full node type removed)
         let light_count = archive_nodes.values().filter(|n| matches!(n.node_type, NodeType::Light)).count();
         
         drop(archive_nodes);
@@ -391,7 +385,6 @@ impl ArchiveReplicationManager {
                 
                 match node_type {
                     NodeType::Light => 0,
-                    NodeType::Full => 8,  // Increase Full node quota significantly
                     NodeType::Super => 15, // Increase Super node quota significantly
                 }
             },
@@ -403,7 +396,6 @@ impl ArchiveReplicationManager {
                 
                 match node_type {
                     NodeType::Light => 0,
-                    NodeType::Full => 6,  // Higher quota for Full nodes
                     NodeType::Super => 12, // Higher quota for Super nodes
                 }
             },
@@ -415,7 +407,6 @@ impl ArchiveReplicationManager {
                 
                 match node_type {
                     NodeType::Light => 0,
-                    NodeType::Full => 4,  // Slightly higher than standard
                     NodeType::Super => 10, // Slightly higher than standard
                 }
             },
@@ -427,7 +418,6 @@ impl ArchiveReplicationManager {
                 
                 match node_type {
                     NodeType::Light => 0,
-                    NodeType::Full => 3,  // Standard quota
                     NodeType::Super => 8,  // Standard quota
                 }
             }
@@ -435,12 +425,6 @@ impl ArchiveReplicationManager {
         
         let quota = match node_type {
             NodeType::Light => 0,
-            NodeType::Full => match total_nodes {
-                0..=15 => 8,
-                16..=50 => 6,
-                51..=200 => 4,
-                _ => 3,
-            },
             NodeType::Super => match total_nodes {
                 0..=15 => 15,
                 16..=50 => 12,
@@ -523,7 +507,7 @@ impl ArchiveReplicationManager {
             }
             
             let new_quota = self.calculate_emergency_quota(&node_info.node_type, total_nodes);
-            let current_chunks = node_info.assigned_chunks.len() as u8;
+            let current_chunks = node_info.assigned_chunks.len().min(255) as u8;
             
             if current_chunks < new_quota {
                 println!("[Archive] 📈 Increasing quota for {} from {} to {} chunks (emergency scaling)", 
@@ -538,20 +522,17 @@ impl ArchiveReplicationManager {
     /// Calculate emergency quota for very small networks
     fn calculate_emergency_quota(&self, node_type: &NodeType, total_nodes: usize) -> u8 {
         match (node_type, total_nodes) {
+            // v3.18: Full nodes removed, only Super and Light remain
             // EMERGENCY: 5-15 nodes total
-            (NodeType::Full, 5..=15) => 12,   // Emergency: Full nodes take 12 chunks each
             (NodeType::Super, 5..=15) => 20,  // Emergency: Super nodes take 20 chunks each
             
             // SMALL: 16-30 nodes total  
-            (NodeType::Full, 16..=30) => 8,   // Small network: Full nodes take 8 chunks
             (NodeType::Super, 16..=30) => 15, // Small network: Super nodes take 15 chunks
             
             // MEDIUM: 31-50 nodes total
-            (NodeType::Full, 31..=50) => 5,   // Medium network: Full nodes take 5 chunks
             (NodeType::Super, 31..=50) => 10, // Medium network: Super nodes take 10 chunks
             
             // STANDARD: 50+ nodes
-            (NodeType::Full, _) => 3,          // Standard quota
             (NodeType::Super, _) => 8,         // Standard quota
             
             (NodeType::Light, _) => 0,         // Light nodes never archive
@@ -739,7 +720,6 @@ impl BackgroundReplicationService {
     fn get_max_chunks_for_node_type(node_type: &crate::node::NodeType) -> usize {
         match node_type {
             crate::node::NodeType::Light => 0,
-            crate::node::NodeType::Full => 5,     // Allow up to 5 chunks (3 required + 2 buffer)
             crate::node::NodeType::Super => 12,   // Allow up to 12 chunks (8 required + 4 buffer)
         }
     }

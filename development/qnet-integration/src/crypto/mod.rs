@@ -5,8 +5,9 @@
 //! All post-quantum and classical cryptography implementations.
 //!
 //! ## NIST Compliance
-//! - CRYSTALS-Dilithium (NIST Level 3) - Post-quantum signatures
-//! - Ed25519 - Classical signatures (hybrid fallback)
+//! - CRYSTALS-ML-DSA-65 / ML-DSA-65 (NIST FIPS 204, Level 3) - the ONLY signature scheme
+//! - X25519Kyber768 / ML-KEM-768 (NIST FIPS 203) - post-quantum TLS key exchange
+//! - Ed25519 - Solana-side only (1DEV burn wallet ownership); NOT a QNet signature
 //! - SHA3-256 - Hash functions
 //!
 //! ## Module Structure
@@ -14,13 +15,10 @@
 //! ```text
 //! crypto/
 //! ├── mod.rs              - This file (public exports)
-//! ├── hybrid_crypto.rs    - Dilithium + Ed25519 hybrid signatures
+//! ├── pq_crypto.rs        - Pure ML-DSA-65 (ML-DSA-65) signatures
 //! ├── quantum_crypto.rs   - Quantum-resistant cryptography core
-//! ├── quantum_poh.rs      - Verifiable Time Sequence (VTS)
 //! ├── vrf.rs              - Legacy VRF (deprecated)
-//! ├── vrf_hybrid.rs       - Hybrid VRF for QRB (NOT producer selection)
-//! ├── key_manager.rs      - Key generation and management
-//! └── crypto_integration.rs - Service integration layer
+//! └── key_manager.rs      - Key generation and management
 //! ```
 //!
 //! ## Security Audit Scope
@@ -33,58 +31,56 @@
 //!
 //! ## Version History
 //! - v2.19.0: Initial isolation for audit
-//! - NIST PQC Round 3 compliant (Dilithium3)
+//! - NIST PQC Round 3 compliant (ML-DSA-65)
 
 // ============================================================================
 // SUBMODULES
 // ============================================================================
 
-/// Hybrid cryptography: CRYSTALS-Dilithium + Ed25519
-/// Implements dual-signature system for post-quantum security with classical fallback
-pub mod hybrid_crypto;
+/// Post-quantum cryptography: pure CRYSTALS-ML-DSA-65 (ML-DSA-65) signatures.
+/// Ed25519 is fully removed from QNet signing. Attached-signature wire tags use the `pq_*`
+/// namespace: `pq_p2p_bin:` is the live P2P format; `pq_bin:` / `pq:` / `pq_p2p:` are
+/// legacy parse-only stubs with no current producer. Parsers use `strip_prefix` (no hardcoded
+/// byte offsets). The crypto itself is a single pure ML-DSA-65 signature per message.
+pub mod pq_crypto;
 
 /// Quantum-resistant cryptography core
 /// Node activation, phase management, pricing calculations
 pub mod quantum_crypto;
 
-/// Verifiable Time Sequence (VTS)
-/// Time-based consensus with quantum-resistant hashing
-pub mod quantum_poh;
-
-/// Legacy VRF (DEPRECATED for producer selection)
-/// Keep for reference only - production uses SHA3-512 deterministic selection
+/// ML-DSA-65-VRF: deterministic leader election and the per-block beacon contribution.
+/// The doc that stood here described Proof-of-History, which was removed — it never described `vrf`.
 pub mod vrf;
-
-/// Hybrid VRF for QRB (Quantum Randomness Beacon)
-/// Used for: microblock VRF outputs → RANDAO accumulation → dApp randomness
-/// NOT used for: Producer selection (uses deterministic SHA3-512 in node.rs)
-pub mod vrf_hybrid;
 
 /// Key management
 /// Dilithium key generation, storage, rotation
 pub mod key_manager;
 
-// NOTE: crypto_integration.rs is deprecated (uses non-existent qnet_core::crypto)
-// The hybrid_crypto and quantum_crypto modules handle all production crypto needs
-// pub mod crypto_integration;
+/// v27 HOLE1: deterministic ML-DSA-65 keypair derivation from a mnemonic.
+/// Identity becomes a pure function of the wallet seed (wipe-safe, no
+/// random keygen, no runtime TOFU). Carries a mandatory fail-closed KAT.
+pub mod genesis_key;
+
+/// Solana address derivation from mnemonic (BIP39 + SLIP-10)
+/// Used to verify mnemonic ownership during server node activation
+pub mod solana_derivation;
 
 // ============================================================================
 // RE-EXPORTS FOR CONVENIENCE
 // ============================================================================
 
-// Hybrid crypto types
-pub use hybrid_crypto::{
-    HybridCrypto,
-    HybridCertificate,
-    HybridSignature,
-    CompactHybridSignature,
-    GLOBAL_HYBRID_INSTANCES,
+// Post-quantum crypto types (pure ML-DSA-65 / ML-DSA-65)
+pub use pq_crypto::{
+    PqCrypto,
+    PqCertificate,
+    PqSignature,
+    CompactPqSignature,
+    GLOBAL_PQ_INSTANCES,
 };
 
 // Quantum crypto types
 pub use quantum_crypto::{
     QNetQuantumCrypto,
-    BlockchainPhaseState,
     DilithiumSignature,
     QuantumCryptoStatus,
     QuantumAlgorithms,
@@ -93,21 +89,13 @@ pub use quantum_crypto::{
 };
 
 // Quantum VTS types
-pub use quantum_poh::{
-    QuantumPoH,
-    PoHEntry,
-};
 
-// VRF types
+// VRF types (ML-DSA-65-VRF)
 pub use vrf::{
+    DilithiumVrf,
     QNetVrf,
     VrfOutput,
-};
-
-// Hybrid VRF types
-pub use vrf_hybrid::{
-    QNetHybridVrf,
-    HybridVrfOutput,
+    WalletIdentity,
 };
 
 // Key manager types

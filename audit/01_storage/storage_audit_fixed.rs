@@ -49,6 +49,10 @@ fn create_test_transaction(id: u64, size: usize) -> Transaction {
             amount: 1000 + id,
         },
         data,
+        public_key: None,
+        dilithium_signature: None,
+        dilithium_public_key: None,
+        chain_id: qnet_state::transaction::QNET_CHAIN_ID,
     }
 }
 
@@ -57,15 +61,22 @@ fn create_test_microblock(height: u64, tx_count: usize) -> MicroBlock {
     let transactions: Vec<Transaction> = (0..tx_count)
         .map(|i| create_test_transaction(height * 1000 + i as u64, 500))
         .collect();
-    
+
     MicroBlock {
         height,
         timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
         transactions,
-        producer: format!("genesis_node_{:03}", (height % 5) + 1), // Real QNet producer format
-        signature: vec![0u8; 64],  // Dilithium signature size
-        previous_hash: [0u8; 32],  // SHA3-256 hash
-        merkle_root: [0u8; 32],    // Merkle root of transactions
+        producer: format!("genesis_node_{:03}", (height % 5) + 1),
+        signature: vec![0u8; 64],
+        previous_hash: [0u8; 32],
+        merkle_root: [0u8; 32],
+        poh_hash: vec![0u8; 64],
+        poh_count: 0,
+        vrf_output: None,
+        vrf_proof: None,
+        fees_collected: 0,
+        state_root: [0u8; 32],
+        timeout_round: 0,
     }
 }
 

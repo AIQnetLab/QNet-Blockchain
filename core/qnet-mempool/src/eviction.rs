@@ -61,8 +61,9 @@ impl EvictionPolicy for DefaultEvictionPolicy {
                 tx1.gas_price.cmp(&tx2.gas_price)
             }
             EvictionStrategy::LargestFirst => {
-                let size1 = bincode::serialize(tx1).expect("Transaction must be serializable").len();
-                let size2 = bincode::serialize(tx2).expect("Transaction must be serializable").len();
+                // FIX C10: Replace expect() with safe fallback — prevent node crash during eviction
+                let size1 = bincode::serialize(tx1).map(|b| b.len()).unwrap_or(0);
+                let size2 = bincode::serialize(tx2).map(|b| b.len()).unwrap_or(0);
                 size2.cmp(&size1) // Reverse order
             }
             EvictionStrategy::Combined => {

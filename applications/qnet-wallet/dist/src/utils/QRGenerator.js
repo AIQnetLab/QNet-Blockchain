@@ -308,8 +308,8 @@ export class QRGenerator {
                 return /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(address);
                 
             case 'qnet':
-                // New QNet EON addresses: 19 chars + "eon" + 15 chars + 4 char checksum = 41 total
-                return /^[a-z0-9]{19}eon[a-z0-9]{15}[a-z0-9]{4}$/.test(address);
+                // QNet EON addresses: 19 chars + "eon" + 15 chars + 8 char checksum = 45 total
+                return /^[a-z0-9]{19}eon[a-z0-9]{15}[a-z0-9]{8}$/.test(address);
                 
             default:
                 return address.length > 10; // Basic length check

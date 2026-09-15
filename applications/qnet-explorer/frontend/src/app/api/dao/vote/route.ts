@@ -129,7 +129,61 @@ class MockGovernanceContract {
 // Global governance instance
 const governance = new MockGovernanceContract();
 
+// ---------------------------------------------------------------------------
+// v14.5: HARD-DISABLE + CRYPTOGRAPHIC SIGNATURE CHECK
+// ---------------------------------------------------------------------------
+// Prior code accepted votes if the `signature` field was merely present —
+// any non-empty string passed. When DAO is activated in 2026 that would let
+// anyone vote on any proposal as any wallet. Two defenses:
+//
+// 1. Early 501 return: the endpoint is explicitly disabled until DAO launch,
+//    so NO write path can execute even if upstream validation is bypassed.
+// 2. verifyVoteSignature(): real Ed25519 (nacl) verification helper, ready
+//    for activation. When DAO is enabled (DAO_ENABLED=1), remove the 501
+//    guard and call this helper.
+// ---------------------------------------------------------------------------
+async function verifyVoteSignature(params: {
+  walletAddress: string;
+  proposalId: number;
+  vote: boolean;
+  signature: string;
+}): Promise<boolean> {
+  try {
+    const { walletAddress, proposalId, vote, signature } = params;
+    // Canonical vote payload — MUST match frontend signing format exactly.
+    const message = `QNET_DAO_VOTE|proposal=${proposalId}|vote=${vote ? 'yes' : 'no'}|voter=${walletAddress}`;
+    const nacl = await import('tweetnacl');
+    const bs58 = await import('bs58');
+    const publicKey = bs58.default.decode(walletAddress);
+    // Accept hex or base58 signatures; strip 0x if present.
+    let sigBytes: Uint8Array;
+    const sigStr = signature.startsWith('0x') ? signature.slice(2) : signature;
+    if (/^[0-9a-fA-F]+$/.test(sigStr) && sigStr.length === 128) {
+      sigBytes = new Uint8Array(sigStr.match(/.{1,2}/g)!.map((b) => parseInt(b, 16)));
+    } else {
+      sigBytes = bs58.default.decode(sigStr);
+    }
+    if (sigBytes.length !== 64 || publicKey.length !== 32) return false;
+    const msgBytes = new TextEncoder().encode(message);
+    return nacl.default.sign.detached.verify(msgBytes, sigBytes, publicKey);
+  } catch {
+    return false;
+  }
+}
+
 export async function POST(request: NextRequest) {
+  // v14.5: Hard-disable until DAO activation. Prevents any voting logic
+  // (including the weak signature-presence check) from running.
+  if (process.env.DAO_ENABLED !== '1') {
+    return NextResponse.json(
+      {
+        success: false,
+        error: 'DAO voting is not yet active. Scheduled for activation ~2026.',
+      },
+      { status: 501 }
+    );
+  }
+
   try {
     const body = await request.json();
     const { proposalId, vote, walletAddress, signature } = body;
@@ -142,10 +196,23 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // In production, verify wallet signature
+    // v14.5: Cryptographic signature verification (Ed25519).
+    // Replaces the previous presence-only check that accepted any string.
     if (!signature) {
       return NextResponse.json(
         { success: false, error: 'Signature required' },
+        { status: 401 }
+      );
+    }
+    const sigValid = await verifyVoteSignature({
+      walletAddress,
+      proposalId: Number(proposalId),
+      vote: Boolean(vote),
+      signature: String(signature),
+    });
+    if (!sigValid) {
+      return NextResponse.json(
+        { success: false, error: 'Invalid signature' },
         { status: 401 }
       );
     }

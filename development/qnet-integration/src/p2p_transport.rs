@@ -4,7 +4,7 @@
 //!
 //! ## Architecture
 //!
-//! ```
+//! ```text
 //! ┌─────────────────────────────────────────────────────────────────┐
 //! │                     P2PTransport Trait                          │
 //! │  - send_message(peer, msg) -> Response                         │
@@ -26,39 +26,43 @@
 //! ## Security Model
 //!
 //! 1. **Transport Encryption**: QUIC with TLS 1.3
-//! 2. **Peer Authentication**: HybridCertificate (Ed25519 + Dilithium)
+//! 2. **Peer Authentication**: PqCertificate (ML-DSA-65 / ML-DSA-65)
 //! 3. **Message Integrity**: Dilithium signatures on all messages
 //! 4. **Post-Quantum**: NIST FIPS 204 compliant (ML-DSA/Dilithium)
 //!
 //! ## Protocol
 //!
 //! Binary message format (bincode serialization):
-//! ```
+//! ```text
 //! ┌──────────┬──────────┬────────────┬─────────────────┐
 //! │ Version  │ MsgType  │  Length    │    Payload      │
 //! │ (1 byte) │ (1 byte) │ (4 bytes)  │  (N bytes)      │
 //! └──────────┴──────────┴────────────┴─────────────────┘
 //! ```
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use dashmap::DashMap;
 use serde::{Serialize, Deserialize};
-use tokio::sync::RwLock;
 
 use crate::unified_p2p::{PeerInfo, NetworkMessage};
-use crate::crypto::hybrid_crypto::HybridCertificate;
+use crate::crypto::pq_crypto::PqCertificate;
 
 // ============================================================================
 // CONSTANTS - ALIGNED WITH HTTP AND QUIC TRANSPORT
 // ============================================================================
 
-/// Protocol version for binary messages
+/// Wire protocol version, for BOTH transports. Declared once: the two transports speak the same
+/// protocol, so a bump applied to one and not the other would split the fleet along transport lines —
+/// the exact partition the accepted range below exists to prevent.
 pub const PROTOCOL_VERSION: u8 = 1;
+
+/// Oldest wire version this binary still accepts. Accepting the range [MIN, CURRENT] (instead of an
+/// exact match) lets a future version bump roll out node-by-node without partitioning the network —
+/// upgraded nodes keep talking to not-yet-upgraded peers. MIN==CURRENT ⇒ behaviour unchanged today.
+/// To bump: raise PROTOCOL_VERSION and leave MIN where it is until every node runs the new binary.
+pub const MIN_SUPPORTED_PROTOCOL_VERSION: u8 = 1;
 
 /// Maximum message size (10 MB - enough for macroblocks)
 pub const MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024;
@@ -76,7 +80,8 @@ pub const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Maximum concurrent streams per connection
-pub const MAX_STREAMS_PER_CONN: u32 = 100;
+/// Must match quic_transport::MAX_STREAMS_PER_CONN
+pub const MAX_STREAMS_PER_CONN: u32 = 500;
 
 /// QUIC port offset from API port (8001 -> 10876)
 /// NOTE: peer.addr contains API port (8001), so offset = 10876 - 8001 = 2875
@@ -175,7 +180,9 @@ impl MessageHeader {
         }
         
         let version = bytes[0];
-        if version != PROTOCOL_VERSION {
+        // Accept the supported range, not an exact match → a coordinated version bump rolls out
+        // without partitioning. Out-of-range (too old / unknown-newer) is still rejected.
+        if version < MIN_SUPPORTED_PROTOCOL_VERSION || version > PROTOCOL_VERSION {
             return Err(TransportError::ProtocolMismatch(PROTOCOL_VERSION, version));
         }
         
@@ -200,16 +207,10 @@ pub enum MessageType {
     PeerDiscovery = 3,
     /// Health ping
     HealthPing = 4,
-    /// Consensus commit
-    ConsensusCommit = 5,
-    /// Consensus reveal
-    ConsensusReveal = 6,
     /// Emergency producer change
     EmergencyChange = 7,
     /// ShredProtocol chunk
     ShredProtocolChunk = 8,
-    /// Reputation sync
-    ReputationSync = 9,
     /// Block request (sync)
     BlockRequest = 10,
     /// Block batch response
@@ -237,11 +238,8 @@ impl MessageType {
             2 => Some(Self::Transaction),
             3 => Some(Self::PeerDiscovery),
             4 => Some(Self::HealthPing),
-            5 => Some(Self::ConsensusCommit),
-            6 => Some(Self::ConsensusReveal),
             7 => Some(Self::EmergencyChange),
             8 => Some(Self::ShredProtocolChunk),
-            9 => Some(Self::ReputationSync),
             10 => Some(Self::BlockRequest),
             11 => Some(Self::BlockBatch),
             12 => Some(Self::CertificateAnnounce),
@@ -262,12 +260,9 @@ impl MessageType {
             NetworkMessage::Transaction { .. } => Self::Transaction,
             NetworkMessage::PeerDiscovery { .. } => Self::PeerDiscovery,
             NetworkMessage::HealthPing { .. } => Self::HealthPing,
-            NetworkMessage::ConsensusCommit { .. } => Self::ConsensusCommit,
-            NetworkMessage::ConsensusReveal { .. } => Self::ConsensusReveal,
+            #[allow(deprecated)]
             NetworkMessage::EmergencyProducerChange { .. } => Self::EmergencyChange,
             NetworkMessage::ShredProtocolChunk { .. } => Self::ShredProtocolChunk,
-            #[allow(deprecated)]
-            NetworkMessage::ReputationSyncDeprecated { .. } => Self::ReputationSync,
             NetworkMessage::RequestBlocks { .. } => Self::BlockRequest,
             NetworkMessage::BlocksBatch { .. } => Self::BlockBatch,
             NetworkMessage::CertificateAnnounce { .. } => Self::CertificateAnnounce,
@@ -349,8 +344,8 @@ impl WireMessage {
 pub struct HandshakeMessage {
     /// Node ID
     pub node_id: String,
-    /// HybridCertificate for verification
-    pub certificate: HybridCertificate,
+    /// PqCertificate for verification
+    pub certificate: PqCertificate,
     /// Protocol version supported
     pub protocol_version: u8,
     /// Timestamp (Unix epoch)
@@ -371,7 +366,7 @@ pub struct ConnectionInfo {
     /// Peer node ID
     pub peer_node_id: String,
     /// Peer certificate (verified)
-    pub peer_certificate: HybridCertificate,
+    pub peer_certificate: PqCertificate,
     /// Connection established time
     pub connected_at: Instant,
     /// Last activity time
@@ -397,7 +392,7 @@ pub struct BroadcastResult {
 #[async_trait]
 pub trait P2PTransport: Send + Sync {
     /// Initialize the transport
-    async fn init(&mut self, bind_addr: SocketAddr, node_id: &str, certificate: &HybridCertificate) -> TransportResult<()>;
+    async fn init(&mut self, bind_addr: SocketAddr, node_id: &str, certificate: &PqCertificate) -> TransportResult<()>;
     
     /// Connect to a peer
     async fn connect(&self, peer_addr: SocketAddr) -> TransportResult<ConnectionInfo>;
@@ -474,7 +469,7 @@ mod tests {
     #[test]
     fn test_message_type_conversion() {
         assert_eq!(MessageType::from_u8(1), Some(MessageType::Block));
-        assert_eq!(MessageType::from_u8(5), Some(MessageType::ConsensusCommit));
+        assert_eq!(MessageType::from_u8(8), Some(MessageType::ShredProtocolChunk));
         assert_eq!(MessageType::from_u8(255), Some(MessageType::Handshake));
         assert_eq!(MessageType::from_u8(200), None);
     }

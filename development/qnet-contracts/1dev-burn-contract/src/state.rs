@@ -1,10 +1,11 @@
 use anchor_lang::prelude::*;
 
 /// Node types for activation (Phase 1: using 1DEV, Phase 2: using QNC)
+/// v3.18: Only Light and Super nodes active
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, PartialEq, Eq)]
 pub enum NodeType {
     Light,
-    Full,
+    #[deprecated(note = "Full node type removed in v3.18")]
     Super,
 }
 
@@ -23,11 +24,11 @@ impl NodeType {
     }
 
     /// Get QNC amount for Phase 2 activation (after 90% 1DEV burned or 5 years)
+    /// v3.18: Only Light and Super nodes (Full node type removed)
     pub fn get_qnc_activation_amount(&self) -> u64 {
         match self {
-            NodeType::Light => 5_000_000_000,   // 5000 QNC
-            NodeType::Full => 7_500_000_000,    // 7500 QNC
-            NodeType::Super => 10_000_000_000,  // 10000 QNC
+            NodeType::Light => 10_000_000_000_000,  // 10,000 QNC (in nanoQNC)
+            NodeType::Super => 7_500_000_000_000,   // 7,500 QNC (in nanoQNC)
         }
     }
 }
@@ -53,7 +54,7 @@ pub struct BurnTracker {
     pub total_nodes_activated: u64,
     /// Light nodes activated
     pub light_nodes: u64,
-    /// Full nodes activated
+    /// Full nodes activated (v3.18: DEPRECATED - always 0, kept for backward compatibility)
     pub full_nodes: u64,
     /// Super nodes activated
     pub super_nodes: u64,
@@ -67,6 +68,11 @@ pub struct BurnTracker {
     pub last_update: i64,
     /// Bump seed
     pub bump: u8,
+    /// v14.5: Authority that attests off-chain RPC verification of burn txs.
+    /// Required signer on `record_burn` and `execute_phase_transition` to
+    /// close the anyone-can-call hole. Pinned at tracker initialization and
+    /// immutable thereafter — no rotate instruction exists in this program.
+    pub verification_authority: Pubkey,
 }
 
 impl BurnTracker {
@@ -86,7 +92,8 @@ impl BurnTracker {
         1 +  // phase_transitioned
         1 +  // paused
         8 +  // last_update
-        1;   // bump
+        1 +  // bump
+        32;  // verification_authority (v14.5)
 
     pub fn should_transition(&self) -> bool {
         let current_time = Clock::get().expect("Clock sysvar should be available").unix_timestamp;
@@ -229,9 +236,9 @@ pub const MIN_1DEV_PRICE: u64 = 300_000_000;      // 300 1DEV minimum at 80-90%
 pub const PRICE_REDUCTION_PER_TIER: u64 = 150_000_000; // 150 1DEV reduction per 10% tier
 
 // QNC activation costs (Phase 2) - 9 decimals
-pub const QNC_LIGHT_ACTIVATION: u64 = 5_000_000_000_000;   // 5000 QNC (in nanoQNC)
-pub const QNC_FULL_ACTIVATION: u64 = 7_500_000_000_000;    // 7500 QNC (in nanoQNC)
-pub const QNC_SUPER_ACTIVATION: u64 = 10_000_000_000_000;  // 10000 QNC (in nanoQNC)
+// v3.18: Light=10,000 QNC, Super=7,500 QNC (Full removed)
+pub const QNC_LIGHT_ACTIVATION: u64 = 10_000_000_000_000;  // 10,000 QNC (in nanoQNC)
+pub const QNC_SUPER_ACTIVATION: u64 = 7_500_000_000_000;   // 7,500 QNC (in nanoQNC)
 
 /// Seeds for PDA derivation
 pub const BURN_TRACKER_SEED: &[u8] = b"burn_tracker";

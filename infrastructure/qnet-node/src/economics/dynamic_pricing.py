@@ -9,17 +9,17 @@ from dataclasses import dataclass
 from enum import Enum
 
 class NodeType(Enum):
+    # v3.18: Only Light and Super nodes (Full removed)
     LIGHT = "light"
-    FULL = "full"
     SUPER = "super"
 
 @dataclass
 class PricingConfig:
     """Configuration for Phase 2 QNC node activation pricing"""
     # CORRECT Phase 2 Base prices (QNC)
-    light_base_price: float = 5_000   # Light node base cost
-    full_base_price: float = 7_500    # Full node base cost  
-    super_base_price: float = 10_000  # Super node base cost
+    # v3.18: Only Light and Super nodes (Full removed)
+    light_base_price: float = 10_000  # Light node base cost (10,000 QNC)
+    super_base_price: float = 7_500   # Super node base cost (7,500 QNC)
     
     # Network size multipliers (CORRECT implementation)
     multiplier_0_100k: float = 0.5     # 0-100k nodes: 0.5x
@@ -29,9 +29,9 @@ class PricingConfig:
     
     # Target equilibrium points
     target_total_nodes: int = 100_000
-    target_light_ratio: float = 0.7  # 70% light nodes
-    target_full_ratio: float = 0.25  # 25% full nodes
-    target_super_ratio: float = 0.05  # 5% super nodes
+    # v3.18: Only Light and Super nodes
+    target_light_ratio: float = 0.90  # 90% light nodes (mobile)
+    target_super_ratio: float = 0.10  # 10% super nodes (servers)
     
     # Price curve parameters
     curve_steepness: float = 2.0  # Quadratic curve
@@ -93,29 +93,31 @@ class DynamicPricingCalculator:
             return min_price + price_range * curve_value
     
     def _get_base_price(self, node_type: NodeType) -> float:
-        """Get base price for node type (Phase 2 QNC)"""
+        """Get base price for node type (Phase 2 QNC)
+        v3.18: Only Light (10,000 QNC) and Super (7,500 QNC) - Full removed
+        """
         return {
-            NodeType.LIGHT: self.config.light_base_price,    # 5000 QNC
-            NodeType.FULL: self.config.full_base_price,      # 7500 QNC
-            NodeType.SUPER: self.config.super_base_price     # 10000 QNC
-        }[node_type]
+            NodeType.LIGHT: self.config.light_base_price,    # 10,000 QNC
+            NodeType.SUPER: self.config.super_base_price     # 7,500 QNC
+        }.get(node_type, self.config.light_base_price)
     
     def _get_network_multiplier(self, total_nodes: int) -> float:
-        """Get network size multiplier for CORRECT Phase 2 pricing"""
-        if total_nodes < 100_000:
-            return self.config.multiplier_0_100k       # 0.5x
-        elif total_nodes < 300_000:
-            return self.config.multiplier_100k_300k    # 1.0x
-        elif total_nodes < 1_000_000:
-            return self.config.multiplier_300k_1m      # 2.0x
+        """Get network size multiplier for CORRECT Phase 2 pricing
+        CANONICAL VALUES - same across all components (Rust, Python, JS)
+        """
+        if total_nodes <= 100_000:
+            return self.config.multiplier_0_100k       # ≤100K: 0.5x
+        elif total_nodes <= 300_000:
+            return self.config.multiplier_100k_300k    # ≤300K: 1.0x
+        elif total_nodes <= 1_000_000:
+            return self.config.multiplier_300k_1m      # ≤1M: 2.0x
         else:
-            return self.config.multiplier_1m_plus      # 3.0x
+            return self.config.multiplier_1m_plus      # >1M: 3.0x
     
     def _get_target_count(self, node_type: NodeType, total_target: int) -> int:
-        """Get target count for node type"""
+        """Get target count for node type - v3.18: Only Light and Super"""
         ratios = {
             NodeType.LIGHT: self.config.target_light_ratio,
-            NodeType.FULL: self.config.target_full_ratio,
             NodeType.SUPER: self.config.target_super_ratio
         }
         return int(total_target * ratios[node_type])
@@ -193,18 +195,18 @@ if __name__ == "__main__":
     calculator = DynamicPricingCalculator()
     
     # Test different network sizes
+    # v3.18: Only Light and Super nodes (Full removed)
     test_scenarios = [
-        {"light": 70, "full": 25, "super": 5},      # 100 nodes
-        {"light": 700, "full": 250, "super": 50},   # 1K nodes
-        {"light": 7000, "full": 2500, "super": 500}, # 10K nodes
-        {"light": 70000, "full": 25000, "super": 5000}, # 100K nodes
-        {"light": 700000, "full": 250000, "super": 50000}, # 1M nodes
+        {"light": 90, "super": 10},      # 100 nodes
+        {"light": 900, "super": 100},   # 1K nodes
+        {"light": 9000, "super": 1000}, # 10K nodes
+        {"light": 90000, "super": 10000}, # 100K nodes
+        {"light": 900000, "super": 100000}, # 1M nodes
     ]
     
     for scenario in test_scenarios:
         active_nodes = {
             NodeType.LIGHT: scenario["light"],
-            NodeType.FULL: scenario["full"],
             NodeType.SUPER: scenario["super"]
         }
         total = sum(scenario.values())

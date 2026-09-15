@@ -10,6 +10,25 @@ use hex;
 /// Block hash type
 pub type BlockHash = [u8; 32];
 
+/// Fixed-width fold of an optional VRF output: 1 tag byte + 32 bytes, ALWAYS. A bare `if let Some`
+/// would leave the preimage ambiguous — absent and present-as-zeros would collide.
+///
+/// Sole caller is the EQUIVOCATION identity key. `MicroBlock::hash` deliberately excludes vrf_output
+/// (it is consensus-inert), so equivocation evidence still distinguishes two bodies that differ only
+/// in that field, while block identity does not.
+pub fn fold_vrf_output(hasher: &mut Sha3_256, vrf_output: &Option<[u8; 32]>) {
+    match vrf_output {
+        Some(v) => {
+            hasher.update([1u8]);
+            hasher.update(v);
+        }
+        None => {
+            hasher.update([0u8]);
+            hasher.update([0u8; 32]);
+        }
+    }
+}
+
 /// Block type enum for micro/macro architecture
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum BlockType {
@@ -40,30 +59,88 @@ pub struct MicroBlock {
     pub previous_hash: [u8; 32],
     /// Merkle root of transactions
     pub merkle_root: [u8; 32],
-    /// Verifiable Time Sequence hash at block creation
-    pub poh_hash: Vec<u8>,  // SHA3-512 produces 64 bytes
-    /// Verifiable Time Sequence counter at block creation
-    pub poh_count: u64,
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // QUANTUM RANDOMNESS BEACON (QRB) v3.0
-    // Each producer contributes signed randomness for epoch accumulation
-    // Provides "true randomness" for gambling, NFT mints, fair auctions
+    // v4.0: DILITHIUM3-VRF OUTPUT + PROOF (dual purpose)
+    // 1. Leader election proof: the schedule itself is a PUBLIC deterministic hash of
+    //    on-chain inputs; this VRF output only proves the named leader signed its slot.
+    // 2. Quantum Randomness Beacon (QRB): accumulated for epoch randomness
     // ═══════════════════════════════════════════════════════════════════════════
     
-    /// QRB randomness output from producer (32 bytes)
-    /// Generated using Hybrid signature (Dilithium3 + Ed25519)
-    /// Input: SHA3(prev_block_hash || height || producer_id)
-    /// Note: Field named vrf_output for serialization compatibility
+    /// VRF output: SHA3-256(Dilithium3_detached_sign(sk, slot_seed)) = 32 bytes
+    /// Used for: leader-slot proof verification + QRB randomness accumulation
     #[serde(default)]
     pub vrf_output: Option<[u8; 32]>,
     
-    /// Serialized QRB proof for verification
-    /// Contains: HybridSignature (Dilithium certificate + Ed25519 ephemeral signature)
-    /// Any node can verify the randomness contribution is authentic
-    /// Note: Field named vrf_proof for serialization compatibility
+    /// VRF proof: ML-DSA-65 detached signature (~3309 bytes)
+    /// Verifiable by any node with producer's registered public key
     #[serde(default)]
     pub vrf_proof: Option<Vec<u8>>,
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // v3.18: DIRECT FEE COLLECTION - Pool 2 removed
+    // Fees go directly to block producer, recorded here for transparency
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /// Total transaction fees collected in this block (nanoQNC)
+    /// v3.18: Credited directly to producer's wallet, not pooled
+    #[serde(default)]
+    pub fees_collected: u64,
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // v3.27: STATE ROOT - TOP L1 PATTERN
+    // Root hash of the state Merkle tree AFTER applying all transactions + fees
+    // Enables state verification: all nodes must compute identical state_root
+    // If computed root != block.state_root → REJECT block as invalid!
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /// State Merkle root after applying this block
+    /// Computed as: apply_transactions() → credit_fees() → finalize_merkle()
+    /// Validators MUST verify: computed_root == block.state_root
+    #[serde(default)]
+    pub state_root: [u8; 32],
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // v14.0: TIMEOUT ROUND — Producer Authority Proof
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Records which timeout_round was used for leader selection when this block
+    // was produced. Enables any node to independently verify producer authority:
+    //   expected = candidates[ hash(seed, height, round, timeout_round) % N ]
+    //   assert(expected == block.producer)
+    //
+    // Without this field, nodes must rely on local timeout_round cache which
+    // diverges during network stalls — causing false-positive block rejections.
+    // With this field, verification is fully deterministic from on-chain state.
+    //
+    // Backward compatible: old blocks deserialize as timeout_round=0 (primary leader).
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// Timeout round used for leader selection (0 = primary leader, >0 = failover). RELATIVE to
+    /// `carried_baseline`: the ABSOLUTE window failover round is `timeout_round + carried_baseline`.
+    #[serde(default)]
+    pub timeout_round: u64,
+
+    /// The per-mb rotation baseline the producer read when it stamped this block, carried IN the
+    /// block bytes (hashed) so the ABSOLUTE round = `timeout_round + carried_baseline` is a pure
+    /// function of the committed identity — every honest node reconstructs the SAME absolute round
+    /// regardless of apply-order / reorg / cold-join (no local LAST_FINALIZED_ROUND_PER_MB term).
+    /// 0 at a window start / happy path. Fixes the loser-apply baseline double-count (permanent
+    /// boundary-failover divergence). Producer derives it and timeout_round from ONE baseline
+    /// snapshot, so `timeout_round + carried_baseline == certified_abs` holds by construction.
+    #[serde(default)]
+    pub carried_baseline: u64,
+
+    /// #80: bincode 2f+1 TimeoutProof certifying this block's failover round (round>0 only; None on
+    /// the happy path). Excluded from `hash()` — self-authenticating via its own committee
+    /// signatures, so a strip only degrades to the pull path and a forge fails 2f+1 verify. Lets a
+    /// lagging node adopt the certified round in-band. Opaque here; verified in the consensus layer.
+    #[serde(default)]
+    pub timeout_proof: Option<Vec<u8>>,
+
+    // v14.7.2: `prev_block_qc` field REMOVED. Microblock BFT safety is
+    // delivered by the canonical macroblock commit/reveal path rather
+    // than a per-block pipelined QC, so the header no longer needs to
+    // carry a 2f+1 certificate for its predecessor.
 }
 
 /// Macroblock structure - consensus blocks that finalize microblocks
@@ -77,18 +154,14 @@ pub struct MacroBlock {
     pub micro_blocks: Vec<[u8; 32]>,
     /// State root after applying all microblocks
     pub state_root: [u8; 32],
-    /// Consensus data (commit-reveal)
+    /// Consensus data for this macroblock
     pub consensus_data: ConsensusData,
     /// Previous macroblock hash
     pub previous_hash: [u8; 32],
-    /// Verifiable Time Sequence hash at macroblock finalization
-    pub poh_hash: Vec<u8>,  // SHA3-512 produces 64 bytes
-    /// Verifiable Time Sequence counter at macroblock finalization
-    pub poh_count: u64,
 }
 
 /// Consensus data for macroblocks
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ConsensusData {
     /// Commit phase data
     pub commits: HashMap<String, Vec<u8>>,
@@ -96,34 +169,30 @@ pub struct ConsensusData {
     pub reveals: HashMap<String, Vec<u8>>,
     /// Selected leader for next round
     pub next_leader: String,
-    
+
+    /// Consensus v2: bincode of the checkpoint QuorumCertificate (2f+1 sigs over
+    /// the checkpoint). Present ⇒ v2 finality; absent ⇒ legacy commit/reveal.
+    #[serde(default)]
+    pub checkpoint_qc: Option<Vec<u8>>,
+
     // ═══════════════════════════════════════════════════════════════════
     // DETERMINISTIC REPUTATION DATA (v2.21.5)
     // Stored in blockchain for all nodes to compute identical reputation
     // ═══════════════════════════════════════════════════════════════════
     
-    /// Serialized slashing events with cryptographic proof
-    /// Format: bincode serialized Vec<SlashingEventData>
+    /// v2 SCALE ANCHOR: cumulative equivocation ban-set as of THIS macroblock.
+    /// Format: bincode serialized Vec<String> (sorted node_ids).
+    ///
+    /// Lets the next epoch's reputation fold derive the ban-set in O(window) — prev
+    /// macroblock's set ∪ this window's verified proofs — instead of re-scanning every
+    /// microblock from genesis (pruning-safe; scales to 100k+ nodes). NOT included in
+    /// MacroBlock::hash(): each node self-computes it deterministically, and the ban
+    /// EFFECT is independently re-verified every epoch via epoch_commitment (eligible
+    /// excludes banned), so a stale/forged copy self-heals through content_ok fail-stop
+    /// instead of forking the chain.
     #[serde(default)]
-    pub slashing_events_data: Option<Vec<u8>>,
-    
-    /// Serialized automatic jails (computed deterministically)
-    /// Format: bincode serialized Vec<AutomaticJailData>
-    #[serde(default)]
-    pub automatic_jails_data: Option<Vec<u8>>,
-    
-    // ═══════════════════════════════════════════════════════════════════
-    // REPUTATION SNAPSHOT (v2.24.0)
-    // Snapshot stored in macroblock for consistency across all nodes
-    // All nodes MUST have identical reputation after applying macroblock
-    // ═══════════════════════════════════════════════════════════════════
-    
-    /// Reputation snapshot at macroblock finalization
-    /// Format: bincode serialized HashMap<String, f64>
-    /// This ensures ALL nodes have IDENTICAL reputation (no drift!)
-    #[serde(default)]
-    pub reputation_snapshot: Option<Vec<u8>>,
-    
+    pub banned_validators: Option<Vec<u8>>,
+
     // ═══════════════════════════════════════════════════════════════════
     // ELIGIBLE PRODUCERS SNAPSHOT (v2.27.0)
     // Epoch-based validator set for deterministic producer selection
@@ -146,7 +215,7 @@ pub struct ConsensusData {
     /// Quantum Randomness Beacon - accumulated from epoch's randomness outputs
     /// Formula: QRB = XOR(output_1, output_2, ..., output_90)
     /// Use cases: gambling, NFT mints, fair auctions, leader election
-    /// Quantum-safe: All signatures use Dilithium3 (NIST FIPS 204)
+    /// Quantum-safe: All signatures use ML-DSA-65 (NIST FIPS 204)
     #[serde(default)]
     pub randomness_beacon: Option<[u8; 32]>,
     
@@ -158,21 +227,29 @@ pub struct ConsensusData {
     
     // ═══════════════════════════════════════════════════════════════════════════
     // REWARD HEARTBEATS (v2.41.0)
-    // Deterministic heartbeat recording for Full/Super node rewards
-    // Replaces gossip-based heartbeats which were non-deterministic and lossy
+    // Deterministic heartbeat recording for Super node rewards.
+    // Replaces gossip-based heartbeats which were non-deterministic and lossy.
+    // (v3.18: the "Full" tier was removed from the protocol; only Super
+    // nodes self-attest via heartbeats. Light nodes use the separate
+    // ping-response attestation path.)
     // ═══════════════════════════════════════════════════════════════════════════
     
-    /// Aggregated heartbeat summaries for all nodes in this epoch
-    /// Format: bincode serialized Vec<HeartbeatSummary>
-    /// Deterministic: all nodes see same heartbeat data from blockchain
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // v2.78: LIGHT NODE ATTESTATIONS - Collected from PingCommitment TXs.
+    // Each Super node submits a PingCommitment TX listing the Light nodes
+    // it pinged. The MacroBlock aggregates all of them to count unique
+    // Light nodes for Pool 3 rewards.
+    // (v3.18: only Super nodes ping Light nodes — the "Full" tier was
+    // removed.)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// Aggregated Light node attestations from all Super-node PingCommitment TXs
+    /// Format: bincode serialized HashMap<light_node_id: String, ping_count: u32>
+    /// Deterministic: all nodes see same Light node data from blockchain
     /// Used for reward calculation at emission blocks (every 4 hours)
     #[serde(default)]
-    pub reward_heartbeats: Option<Vec<u8>>,
-    
-    /// Merkle root of all individual heartbeats for verification
-    /// Allows light clients to verify heartbeat inclusion without full data
-    #[serde(default)]
-    pub heartbeats_merkle_root: Option<[u8; 32]>,
+    pub reward_light_nodes: Option<Vec<u8>>,
     
     // ═══════════════════════════════════════════════════════════════════════════
     // POOL 2 & POOL 3 TOTALS (v2.50.0)
@@ -182,18 +259,96 @@ pub struct ConsensusData {
     
     /// Pool 2: Total transaction fees collected in this emission window (4 hours)
     /// Recorded ONLY in EMISSION MacroBlocks (every 160th = 4 hours)
-    /// Distribution: 70% Super nodes, 30% Full nodes, 0% Light nodes
+    /// v3.18: Pool 2 removed - fees go directly to block producer (always 0)
     /// All nodes use this SAME value for deterministic reward calculation
+    /// CONSENSUS DEPENDENCY: the emission-amount gate (node.rs expected_emission_amount) assumes
+    /// this is never written, so the expected amount is pure height arithmetic that every node
+    /// can check without loading this macroblock. If it is ever populated, that gate must read
+    /// the macroblock again AND handle its absence explicitly — a node that has pruned or never
+    /// synced it would otherwise compute a wrong expectation and reject an HONEST block.
     #[serde(default)]
     pub pool2_total_fees: Option<u64>,
     
+    // ═══════════════════════════════════════════════════════════════════════════
+    // COMMITTEE-BASED BFT (v3.36)
+    // VRF-subsampled committee for scalable MacroBlock consensus (up to 1000+ validators)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// Committee members selected for this MacroBlock's BFT consensus
+    /// When total validators > COMMITTEE_THRESHOLD, a VRF-subsampled committee
+    /// of COMMITTEE_SIZE nodes certifies the checkpoint. Other nodes accept the result.
+    /// Format: sorted Vec<String> of node_ids
+    #[serde(default)]
+    pub consensus_committee: Option<Vec<String>>,
+
     /// Pool 3: Total activation QNC collected in this emission window (Phase 2 only)
     /// Recorded ONLY in EMISSION MacroBlocks when Phase 2 is active
     /// Distribution: Equal share to ALL eligible nodes (Light + Full + Super)
     /// Phase 1: Always None (Pool 3 disabled, 1DEV burn instead)
     /// Phase 2: Sum of all node activation QNC payments
+    /// CONSENSUS DEPENDENCY: the emission-amount gate (node.rs expected_emission_amount) assumes
+    /// this is never written, so the expected amount is pure height arithmetic that every node
+    /// can check without loading this macroblock. If it is ever populated, that gate must read
+    /// the macroblock again AND handle its absence explicitly — a node that has pruned or never
+    /// synced it would otherwise compute a wrong expectation and reject an HONEST block.
     #[serde(default)]
     pub pool3_total_activations: Option<u64>,
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // EXCLUDED PRODUCERS FOR NEXT EPOCH (v3.10)
+    // Deterministic failover exclusion - stored in blockchain for consistency
+    // All nodes read SAME list from MacroBlock N-2 → NO FORK!
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /// Producers excluded from next epoch due to failover events
+    /// Format: bincode serialized Vec<ExcludedProducerEntry>
+    /// Populated from failover history during MacroBlock creation
+    /// Used by calculate_qualified_candidates to exclude unreliable producers
+    /// CRITICAL: All nodes use SAME list from blockchain → deterministic selection!
+    #[serde(default)]
+    pub excluded_producers_for_next_epoch: Option<Vec<u8>>,
+
+    // Skip-marker macroblock: when both the primary and deterministic-
+    // fallback paths exhaust retries for this index, an explicit on-chain
+    // placeholder must occupy it — else mb=N+1's previous_hash dangles and
+    // every honest node halts permanently. When a 2f+1 TimeoutCertificate
+    // exists at certified_round ≥ MAX_VIEW_CHANGE_ROUNDS, every honest node
+    // deterministically builds a skip marker: occupies the index, carries
+    // the AggregatedTimeoutCertificate as evidence, is_skip_marker=true,
+    // no rewards / no state mutations (only preserves previous_hash linkage).
+    // Validation requires: flag set; skip_certificate decodes; cert verifies
+    // 2f+1 ML-DSA-65 votes at round ≥ MAX_VIEW_CHANGE_ROUNDS. Never
+    // speculative — the 2f+1 view-change votes ARE the proof of failure.
+
+    /// True iff this macroblock is a skip-marker placeholder produced after
+    /// every fallback path failed to drive consensus to 2f+1 reveals.
+    #[serde(default)]
+    pub is_skip_marker: bool,
+
+    /// Bincode-serialised AggregatedTimeoutCertificate proving 2f+1 view-change
+    /// votes for this macroblock index at certified_round ≥ MAX_VIEW_CHANGE_ROUNDS.
+    /// Required iff `is_skip_marker == true`. None for regular macroblocks.
+    #[serde(default)]
+    pub skip_certificate: Option<Vec<u8>>,
+
+    // Snapshot binding for trustless bootstrap: SHA3-256 of the canonical
+    // snapshot bytes at a snapshot-boundary macroblock. Identical across the
+    // committee (deterministic apply-stage materialisation + canonical key
+    // ordering) and implicitly endorsed by the n−f checkpoint QC that
+    // finalises the macroblock. A bootstrapping node computes the digest
+    // locally and accepts the downloaded snapshot only when it matches.
+    /// SHA3-256 digest of the canonical snapshot artefact at this macroblock's
+    /// end_height. Present only when this macroblock terminates a snapshot
+    /// interval boundary AND the local snapshot was successfully created.
+    #[serde(default)]
+    pub snapshot_root: Option<[u8; 32]>,
+
+    /// v32.10: SHA3-256 of the canonical SnapshotManifest bytes at the same
+    /// boundary. Bound by the same checkpoint QC as snapshot_root.
+    /// Joiner verifies downloaded manifest matches this BEFORE chunk fetch —
+    /// rejects byzantine manifest early, saves bandwidth.
+    #[serde(default)]
+    pub snapshot_manifest_hash: Option<[u8; 32]>,
 }
 
 /// Eligible producer entry for epoch-based validator set
@@ -202,51 +357,44 @@ pub struct ConsensusData {
 pub struct EligibleProducer {
     /// Node identifier (e.g., "genesis_node_001" or "node_abc123")
     pub node_id: String,
-    /// Reputation score at snapshot time (0.0 - 1.0)
-    pub reputation: f64,
+    /// Reputation at snapshot time as fixed-point centipercent (u32): 70.00% = 7000, max = 10000.
+    /// Integer (not f64) so this consensus-committed value is bit-identical on every node.
+    pub reputation: u32,
 }
 
-/// Slashing event data for blockchain storage (simplified for serialization)
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct SlashingEventData {
-    /// Node being slashed
-    pub offender: String,
-    /// Penalty amount (reputation points)
-    pub penalty: f64,
-    /// Block height when detected
-    pub detected_at_height: u64,
-    /// Reporter node
-    pub reporter: String,
-    /// Offense type code (0=DoubleSign, 1=InvalidBlock, 2=ChainFork, 3=MissedBlocks)
-    pub offense_type: u8,
-    /// SHA3 hash of evidence
-    pub evidence_hash: [u8; 32],
-    /// Is permanent ban
-    pub is_permanent_ban: bool,
-}
+// ═══════════════════════════════════════════════════════════════════════════════
+// EXCLUDED PRODUCER ENTRY (v3.10)
+// Deterministic failover exclusion data stored in MacroBlock
+// ═══════════════════════════════════════════════════════════════════════════════
 
-/// Automatic jail data for blockchain storage
+/// Excluded producer entry for deterministic failover handling
+/// Stored in MacroBlock.consensus_data.excluded_producers_for_next_epoch
+/// Used to exclude unreliable producers from next epoch selection
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct AutomaticJailData {
-    /// Node being jailed
+pub struct ExcludedProducerEntry {
+    /// Node identifier being excluded
     pub node_id: String,
-    /// Jail duration in seconds
-    pub jail_duration: u64,
-    /// Offense count (for progressive jail)
-    pub offense_count: u32,
-    /// Reason code
+    /// Number of failover events in the epoch
+    pub failover_count: u32,
+    /// Block heights where failovers occurred
+    pub failover_heights: Vec<u64>,
+    /// Exclusion duration in blocks (typically 90 = 1 epoch)
+    pub exclusion_blocks: u64,
+    /// Reason for exclusion
     pub reason: String,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // REWARD HEARTBEAT DATA (v2.41.0)
-// Deterministic heartbeat recording for Full/Super node rewards
-// Stored in MacroBlock for verifiable, deterministic reward calculation
+// Deterministic heartbeat recording for Super-node rewards.
+// Stored in MacroBlock for verifiable, deterministic reward calculation.
+// (v3.18: the "Full" tier was removed from the protocol.)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Reward heartbeat entry for blockchain storage
-/// Each Full/Super node must send 10 heartbeats per 4-hour window
-/// Super nodes need 9/10 (90%), Full nodes need 8/10 (80%) for rewards
+/// Each Super node must send 10 heartbeats per 4-hour window
+/// Super nodes need 9/10 (90%) for rewards.
+/// (v3.18: legacy "Full" tier removed.)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RewardHeartbeat {
     /// Node identifier (pseudonym, not IP)
@@ -267,9 +415,12 @@ pub struct RewardHeartbeat {
 pub struct HeartbeatSummary {
     /// Node identifier
     pub node_id: String,
-    /// Node type: 0=Light, 1=Full, 2=Super
+    /// Node type tag: 0=Light, 2=Super. The value 1 ("Full") is a
+    /// historical reserved code from before v3.18 and is no longer
+    /// produced by any current node; readers map any legacy 1 to
+    /// Super for backward compatibility.
     pub node_type: u8,
-    /// Number of successful heartbeats in this epoch (0-10 for Full/Super)
+    /// Number of successful heartbeats in this epoch (0-10 for Super)
     pub heartbeat_count: u8,
     /// First heartbeat timestamp in epoch
     pub first_heartbeat: u64,
@@ -297,11 +448,6 @@ pub struct EfficientMicroBlock {
     pub previous_hash: [u8; 32],
     /// Merkle root of transaction hashes
     pub merkle_root: [u8; 32],
-    /// Verifiable Time Sequence hash at block creation (SHA3-512 produces 64 bytes)
-    pub poh_hash: Vec<u8>,
-    /// Verifiable Time Sequence counter at block creation
-    pub poh_count: u64,
-    
     // ═══════════════════════════════════════════════════════════════════════════
     // QUANTUM RANDOMNESS BEACON (QRB) v3.0
     // ═══════════════════════════════════════════════════════════════════════════
@@ -315,6 +461,34 @@ pub struct EfficientMicroBlock {
     /// Note: Field named vrf_proof for serialization compatibility
     #[serde(default)]
     pub vrf_proof: Option<Vec<u8>>,
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // v3.18: DIRECT FEE COLLECTION
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /// Total transaction fees collected in this block (nanoQNC)
+    #[serde(default)]
+    pub fees_collected: u64,
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // v3.27: STATE ROOT
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// State Merkle root after applying all transactions and fees
+    #[serde(default)]
+    pub state_root: [u8; 32],
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // v14.0: TIMEOUT ROUND — Producer Authority Proof
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// Timeout round used for leader selection (0 = primary, >0 = failover). RELATIVE to carried_baseline.
+    #[serde(default)]
+    pub timeout_round: u64,
+
+    /// Rotation baseline carried in-block; absolute round = timeout_round + carried_baseline (see MicroBlock).
+    #[serde(default)]
+    pub carried_baseline: u64,
 }
 
 /// Light microblock header for mobile nodes
@@ -337,7 +511,6 @@ pub struct LightMicroBlock {
 // Architecture principles:
 // 1. First byte indicates version/format
 // 2. All formats can be converted to full MicroBlock when needed
-// 3. PoH state is stored separately for fast validation
 // ============================================================================
 
 /// Storage format version markers
@@ -347,7 +520,12 @@ pub mod storage_version {
     pub const V1_FULL_MICROBLOCK: u8 = 0x01;
     /// EfficientMicroBlock with transaction hashes only (v2.19.8+)
     pub const V2_EFFICIENT_MICROBLOCK: u8 = 0x02;
-    /// LightMicroBlock headers only for Light nodes (v2.19.8+)
+    /// DEPRECATED — `LightMicroBlock` (headers-only) wire/storage form.
+    /// Designed for the historical Light tier that persisted block
+    /// headers locally. In v3.18+, the Light tier is a pure mobile API
+    /// client with zero on-device chain storage, so this format is no
+    /// longer produced or stored by Light nodes. Tag retained for
+    /// backward compatibility with any legacy records or peers.
     pub const V3_LIGHT_MICROBLOCK: u8 = 0x03;
     /// Future: Compressed format with dictionary
     pub const V4_COMPRESSED: u8 = 0x04;
@@ -361,7 +539,11 @@ pub enum StoredMicroBlock {
     V1Full(MicroBlock),
     /// Version 2: Efficient format - transaction hashes only, TX stored separately
     V2Efficient(EfficientMicroBlock),
-    /// Version 3: Light format - headers only, no transactions or signatures
+    /// Version 3: DEPRECATED — `LightMicroBlock` headers-only format from the
+    /// historical Light tier that persisted block headers on-device. The
+    /// current Light tier (v3.18+) is a pure mobile API client with zero
+    /// on-device chain storage and never emits or consumes this variant.
+    /// Kept for backward compatibility with any legacy stored records.
     V3Light(LightMicroBlock),
 }
 
@@ -390,25 +572,6 @@ impl StoredMicroBlock {
             StoredMicroBlock::V1Full(b) => &b.producer,
             StoredMicroBlock::V2Efficient(b) => &b.producer,
             StoredMicroBlock::V3Light(b) => &b.producer,
-        }
-    }
-    
-    /// Get PoH state if available (not available for Light format)
-    pub fn poh_state(&self) -> Option<PoHState> {
-        match self {
-            StoredMicroBlock::V1Full(b) => Some(PoHState {
-                height: b.height,
-                poh_hash: b.poh_hash.clone(),
-                poh_count: b.poh_count,
-                previous_hash: b.previous_hash,
-            }),
-            StoredMicroBlock::V2Efficient(b) => Some(PoHState {
-                height: b.height,
-                poh_hash: b.poh_hash.clone(),
-                poh_count: b.poh_count,
-                previous_hash: b.previous_hash,
-            }),
-            StoredMicroBlock::V3Light(_) => None, // Light nodes don't store PoH
         }
     }
     
@@ -459,87 +622,6 @@ impl StoredMicroBlock {
     }
 }
 
-/// VTS (Verifiable Time Sequence) state for a block
-/// Stored separately for fast validation without loading full block
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct PoHState {
-    /// Block height this PoH state belongs to
-    pub height: u64,
-    /// PoH hash at block creation (SHA3-512, 64 bytes)
-    pub poh_hash: Vec<u8>,
-    /// PoH counter at block creation
-    pub poh_count: u64,
-    /// Previous block hash (for chain verification)
-    pub previous_hash: [u8; 32],
-}
-
-impl PoHState {
-    /// Create new PoH state
-    pub fn new(height: u64, poh_hash: Vec<u8>, poh_count: u64, previous_hash: [u8; 32]) -> Self {
-        Self {
-            height,
-            poh_hash,
-            poh_count,
-            previous_hash,
-        }
-    }
-    
-    /// Create from MicroBlock
-    pub fn from_microblock(block: &MicroBlock) -> Self {
-        Self {
-            height: block.height,
-            poh_hash: block.poh_hash.clone(),
-            poh_count: block.poh_count,
-            previous_hash: block.previous_hash,
-        }
-    }
-    
-    /// Create from EfficientMicroBlock
-    pub fn from_efficient(block: &EfficientMicroBlock) -> Self {
-        Self {
-            height: block.height,
-            poh_hash: block.poh_hash.clone(),
-            poh_count: block.poh_count,
-            previous_hash: block.previous_hash,
-        }
-    }
-    
-    /// Validate PoH progression from previous state
-    /// Returns Ok(()) if valid, Err with reason if invalid
-    pub fn validate_progression(&self, prev: &PoHState) -> Result<(), String> {
-        // Height must be exactly one more than previous
-        if self.height != prev.height + 1 {
-            return Err(format!(
-                "Invalid height progression: expected {}, got {}",
-                prev.height + 1, self.height
-            ));
-        }
-        
-        // PoH count must be greater than previous (monotonic increase)
-        // Allow some tolerance for network delays (30 seconds max)
-        // 15M hashes at 500K/sec = 30 seconds < 90 sec macroblock interval
-        const MAX_ACCEPTABLE_REGRESSION: u64 = 15_000_000; // ~30 seconds at 500K/sec
-        
-        if self.poh_count <= prev.poh_count {
-            let regression = prev.poh_count - self.poh_count;
-            if regression > MAX_ACCEPTABLE_REGRESSION {
-                return Err(format!(
-                    "Severe PoH regression: {} <= {} (diff: {})",
-                    self.poh_count, prev.poh_count, regression
-                ));
-            }
-            // Minor regression is acceptable due to network delays
-        }
-        
-        Ok(())
-    }
-    
-    /// Check if PoH data is valid (non-empty)
-    pub fn is_valid(&self) -> bool {
-        !self.poh_hash.is_empty() && self.poh_count > 0
-    }
-}
-
 /// Block in the blockchain
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Block {
@@ -557,6 +639,9 @@ pub struct Block {
     pub producer: String,
     /// Producer's signature
     pub signature: Vec<u8>,
+    /// Block type indicator
+    #[serde(default)]
+    pub block_type: String,
 }
 
 /// Block header (simplified)
@@ -604,6 +689,7 @@ impl Block {
             transactions,
             producer,
             signature: vec![],
+            block_type: String::new(),
         }
     }
     
@@ -620,7 +706,7 @@ impl Block {
                 let hash_str = tx.calculate_hash();
                 let hash_bytes = hex::decode(&hash_str).unwrap_or_else(|_| vec![0u8; 32]);
                 let mut hash_array = [0u8; 32];
-                hash_array.copy_from_slice(&hash_bytes[..32.min(hash_bytes.len())]);
+                hash_array.copy_from_slice(&hash_bytes[..32.min(hash_bytes.len())]); // bytes, not str
                 hash_array
             })
             .collect();
@@ -704,16 +790,30 @@ impl MicroBlock {
             signature: vec![],
             previous_hash,
             merkle_root,
-            // Default PoH values for backward compatibility
-            poh_hash: vec![0u8; 64], // SHA3-512 produces 64 bytes
-            poh_count: 0,
-            // QRB v3.0: VRF fields (None for legacy/compatibility)
+            // VRF fields are consensus-inert (outside MicroBlock::hash and the beacon).
             vrf_output: None,
             vrf_proof: None,
+            // v3.18: Direct fee collection (default 0)
+            fees_collected: 0,
+            // v3.27: State root (computed after applying TX + fees)
+            state_root: [0u8; 32],
+            // v14.0: Timeout round (default 0 = primary leader)
+            timeout_round: 0,
+            // rotation baseline carried in-block (0 at window start / happy path)
+            carried_baseline: 0,
+            // #80: no failover proof on the happy path
+            timeout_proof: None,
         }
     }
-    
-    /// Calculate microblock hash
+
+    /// Calculate microblock hash.
+    ///
+    /// `timeout_round` IS bound into the hash: it is consensus-relevant
+    /// (selects the elected producer and drives certified rotation for the
+    /// macroblock window). Once v23 used real values, omitting it let a
+    /// MITM mutate it without changing the hash → storage L4 anti-fork
+    /// guard treats it as an idempotent re-save → leader divergence.
+    /// Binding it turns any mutation into an L4 equivocation (reject + slash).
     pub fn hash(&self) -> [u8; 32] {
         let mut hasher = Sha3_256::new();
         hasher.update(&self.height.to_le_bytes());
@@ -721,13 +821,30 @@ impl MicroBlock {
         hasher.update(&self.previous_hash);
         hasher.update(&self.merkle_root);
         hasher.update(self.producer.as_bytes());
-        
+        // v23.1: bind timeout_round to block identity (see header above).
+        hasher.update(&self.timeout_round.to_le_bytes());
+        // Bind the carried rotation baseline: absolute round = timeout_round + carried_baseline, so
+        // the reconstructed round is a property of the committed bytes (node-independent).
+        hasher.update(&self.carried_baseline.to_le_bytes());
+        // Bind the post-apply state commitment. Without it two bodies at one height with
+        // DIFFERENT state roots are hash-identical, so storage L4 treats the second as an
+        // idempotent re-save and record_block_equivocation is never reached — a state-root
+        // fork would be neither hash-detectable nor slashable. Safe to bind because the
+        // signing digest (Block_Sig_v23.1) already covers state_root, so a mutation breaks
+        // the signature before it can change block identity. fees_collected is deliberately
+        // NOT bound: it is outside the signed digest, so binding it would let a mutation
+        // change the hash of a validly-signed block and frame an honest producer.
+        hasher.update(&self.state_root);
+        // vrf_output is NOT folded. It was, to stop two bodies with one hash carrying different beacon
+        // contributions — but the window beacon no longer reads it (it folds block hashes, which are
+        // QC-signed in window_mb_hashes), so the field is consensus-inert and binding it would only let
+        // a producer grind block identity for free.
         let result = hasher.finalize();
         let mut hash = [0u8; 32];
         hash.copy_from_slice(&result);
         hash
     }
-    
+
     /// Convert to light header for mobile nodes
     pub fn to_light_header(&self) -> LightMicroBlock {
         LightMicroBlock {
@@ -794,14 +911,19 @@ impl EfficientMicroBlock {
             signature: vec![],
             previous_hash,
             merkle_root,
-            poh_hash: vec![],
-            poh_count: 0,
             // QRB v3.0: VRF fields (None for legacy/compatibility)
             vrf_output: None,
             vrf_proof: None,
+            // v3.18: fees_collected for producer rewards
+            fees_collected: 0,
+            // v3.27: state_root (computed after applying TX + fees)
+            state_root: [0u8; 32],
+            // v14.0: Timeout round (default 0 = primary leader)
+            timeout_round: 0,
+            carried_baseline: 0,
         }
     }
-    
+
     /// Create efficient microblock from full microblock (conversion for migration)
     pub fn from_microblock(microblock: &MicroBlock) -> Self {
         let transaction_hashes: Vec<[u8; 32]> = microblock.transactions
@@ -842,14 +964,19 @@ impl EfficientMicroBlock {
             signature: microblock.signature.clone(),
             previous_hash: microblock.previous_hash,
             merkle_root: microblock.merkle_root,
-            poh_hash: microblock.poh_hash.clone(),
-            poh_count: microblock.poh_count,
             // QRB v3.0: Copy VRF fields from source microblock
             vrf_output: microblock.vrf_output,
             vrf_proof: microblock.vrf_proof.clone(),
+            // v3.18: Copy fees_collected from source microblock
+            fees_collected: microblock.fees_collected,
+            // v3.27: Copy state_root from source microblock
+            state_root: microblock.state_root,
+            // v14.0: Copy timeout_round from source microblock
+            timeout_round: microblock.timeout_round,
+            carried_baseline: microblock.carried_baseline,
         }
     }
-    
+
     /// Calculate merkle root from transaction hashes
     fn calculate_merkle_root_from_hashes(transaction_hashes: &[[u8; 32]]) -> [u8; 32] {
         if transaction_hashes.is_empty() {
@@ -868,6 +995,15 @@ impl EfficientMicroBlock {
     }
     
     /// Calculate efficient microblock hash
+    ///
+    /// v23.1: Mirror of `MicroBlock::hash` — includes `timeout_round` in the
+    /// digest so that storage-layer hash identity matches between the full
+    /// `MicroBlock` and its `EfficientMicroBlock` representation. Without
+    /// this mirror, a block loaded as `MicroBlock` and a block loaded as
+    /// `EfficientMicroBlock` would produce different hashes for the same
+    /// on-disk bytes — breaking the storage-L4 anti-fork guard's identity
+    /// comparison across read paths. See `MicroBlock::hash` header for the
+    /// full consensus-binding rationale.
     pub fn hash(&self) -> [u8; 32] {
         let mut hasher = Sha3_256::new();
         hasher.update(&self.height.to_le_bytes());
@@ -875,7 +1011,15 @@ impl EfficientMicroBlock {
         hasher.update(&self.previous_hash);
         hasher.update(&self.merkle_root);
         hasher.update(self.producer.as_bytes());
-        
+        // v23.1: bind timeout_round to block identity (see MicroBlock::hash header).
+        hasher.update(&self.timeout_round.to_le_bytes());
+        // MUST stay byte-identical to MicroBlock::hash: bind carried_baseline (see MicroBlock::hash).
+        hasher.update(&self.carried_baseline.to_le_bytes());
+        // MUST stay byte-identical to MicroBlock::hash: bind the post-apply state commitment.
+        hasher.update(&self.state_root);
+        // MUST stay byte-identical to MicroBlock::hash: bind the beacon contribution.
+        // vrf_output is consensus-inert; see MicroBlock::hash.
+
         let result = hasher.finalize();
         let mut hash = [0u8; 32];
         hash.copy_from_slice(&result);
@@ -950,9 +1094,6 @@ impl MacroBlock {
             state_root,
             consensus_data,
             previous_hash,
-            // Default PoH values for backward compatibility
-            poh_hash: vec![0u8; 64], // SHA3-512 produces 64 bytes
-            poh_count: 0,
         }
     }
     
@@ -975,24 +1116,94 @@ impl MacroBlock {
         hash
     }
     
-    /// Validate macroblock
-    pub fn validate(&self) -> Result<(), StateError> {
-        // Check timestamp
-        if self.timestamp == 0 {
-            return Err(StateError::InvalidBlock("Invalid timestamp".to_string()));
-        }
-        
-        // Check microblock count (should be ~90 for 90 seconds)
-        if self.micro_blocks.is_empty() || self.micro_blocks.len() > 100 {
-            return Err(StateError::InvalidBlock("Invalid microblock count".to_string()));
-        }
-        
-        // Verify consensus data has enough participants
-        if self.consensus_data.reveals.len() < 3 {
-            return Err(StateError::InvalidBlock("Insufficient consensus participants".to_string()));
-        }
-        
-        Ok(())
-    }
 }
 
+#[cfg(test)]
+mod block_identity_tests {
+    use super::*;
+
+    fn mb(vrf: Option<[u8; 32]>) -> MicroBlock {
+        let mut b = MicroBlock::new(7, 1_700_000_000, [9u8; 32], vec![], "producer_1".into());
+        b.timeout_round = 2;
+        b.carried_baseline = 3;
+        b.vrf_output = vrf;
+        b
+    }
+
+    fn efficient_from(b: &MicroBlock) -> EfficientMicroBlock {
+        EfficientMicroBlock {
+            height: b.height,
+            timestamp: b.timestamp,
+            transaction_hashes: vec![],
+            producer: b.producer.clone(),
+            signature: b.signature.clone(),
+            previous_hash: b.previous_hash,
+            merkle_root: b.merkle_root,
+            vrf_output: b.vrf_output,
+            vrf_proof: b.vrf_proof.clone(),
+            fees_collected: b.fees_collected,
+            state_root: b.state_root,
+            timeout_round: b.timeout_round,
+            carried_baseline: b.carried_baseline,
+        }
+    }
+
+    /// vrf_output is OUTSIDE block identity, and must stay outside. It was folded in when the window
+    /// beacon read it; the beacon now folds block hashes, so folding it back would only hand a
+    /// producer a free knob to grind block identity — and through it the beacon.
+    #[test]
+    fn vrf_output_is_outside_block_identity() {
+        let base = mb(None).hash();
+        for v in [Some([0u8; 32]), Some([1u8; 32]), Some([2u8; 32]), Some([0xFFu8; 32])] {
+            assert_eq!(mb(v).hash(), base, "vrf_output={:?} changed block identity", v);
+        }
+    }
+
+    /// EfficientMicroBlock is the same block read through a different type. If the two digests drift,
+    /// the storage anti-fork guard compares hashes across read paths and sees a phantom fork.
+    #[test]
+    fn efficient_hash_mirrors_microblock_hash() {
+        for v in [None, Some([0u8; 32]), Some([7u8; 32])] {
+            let b = mb(v);
+            assert_eq!(b.hash(), efficient_from(&b).hash(), "digests drifted for vrf_output={:?}", v);
+        }
+    }
+
+    /// state_root IS block identity. Two bodies at one height committing DIFFERENT state must be
+    /// two different blocks, or the storage anti-fork guard treats the second as an idempotent
+    /// re-save and a state-root fork is never recorded as equivocation.
+    #[test]
+    fn state_root_is_inside_block_identity() {
+        let mut a = mb(None);
+        let mut b = mb(None);
+        a.state_root = [1u8; 32];
+        b.state_root = [2u8; 32];
+        assert_ne!(a.hash(), b.hash(), "differing state_root must yield different block identity");
+        assert_ne!(efficient_from(&a).hash(), efficient_from(&b).hash());
+        assert_eq!(a.hash(), efficient_from(&a).hash());
+    }
+
+    /// fees_collected is OUTSIDE block identity: it is not covered by the Block_Sig_v23.1 signing
+    /// digest, so binding it would let a mutation change the hash of a validly-signed block and
+    /// frame an honest producer with a phantom equivocation.
+    #[test]
+    fn fees_collected_is_outside_block_identity() {
+        let mut a = mb(None);
+        let mut b = mb(None);
+        a.fees_collected = 0;
+        b.fees_collected = 12_345;
+        assert_eq!(a.hash(), b.hash(), "fees_collected must not change block identity");
+    }
+
+    /// The signature is OUTSIDE block identity — the property the fork-choice tie-break relies on.
+    /// It ranks equal-round siblings by block.hash(); ML-DSA signatures are randomized, so if the hash
+    /// covered the signature a producer could re-sign the same block to shift the tie at will.
+    #[test]
+    fn signature_is_outside_block_identity() {
+        let mut a = mb(None);
+        let mut b = mb(None);
+        a.signature = vec![1, 2, 3];
+        b.signature = vec![9, 9, 9, 9, 9];
+        assert_eq!(a.hash(), b.hash(), "re-signing the same block must not change its identity");
+    }
+}

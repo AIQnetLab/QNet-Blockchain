@@ -10,8 +10,8 @@ from enum import Enum
 logger = logging.getLogger(__name__)
 
 class NodeType(Enum):
+    # v3.18: Only Light and Super nodes (Full removed)
     LIGHT = "light"     # Ping mobile device
-    FULL = "full"       # Ping server 
     SUPER = "super"     # Ping server
 
 class NetworkPingRouter:
@@ -30,13 +30,13 @@ class NetworkPingRouter:
         
         # NETWORK DECISION LOGIC:
         if server_endpoint:
-            # Has server endpoint = ping server directly
-            node_type = NodeType.SUPER if activation_amount >= 10000 else NodeType.FULL
+            # v3.18: All server nodes are Super (Full removed)
+            node_type = NodeType.SUPER
             return {
                 "ping_target": "server",
                 "node_type": node_type.value,
                 "endpoint": f"http://{server_endpoint}/ping",
-                "success_rate_required": 0.98 if node_type == NodeType.SUPER else 0.95,
+                "success_rate_required": 0.90,  # v3.18: 90% for Super nodes
                 "pings_per_4h_window": 60,
                 "ping_interval_seconds": 240
             }

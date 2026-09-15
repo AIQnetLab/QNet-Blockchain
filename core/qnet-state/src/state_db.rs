@@ -77,29 +77,55 @@ impl StateDB {
                     reputation: 0.0,
                     created_at: timestamp,
                     updated_at: timestamp,
+                    is_contract: false,
+                    contract_code_hash: None,
+                    contract_storage: std::collections::HashMap::new(),
+                    heartbeat_epoch: 0,
+                    heartbeat_slots: 0,
+                    heartbeat_final_epoch: 0,
+                    heartbeat_final_slots: 0,
+                    last_claimed_epoch: 0,
+            banned_at_height: 0,
+                    storage_root: [0u8; 32], // inert: legacy is_contract=false apply path
+                    dilithium_public_key: None, // FIX-5: bound at apply via the pk-persist hook, not this legacy ctor
                 }
             });
-            
+
+            // IDEMPOTENT APPLY — silent skip for already-applied transactions.
+            // Mirrors the policy in `transaction.rs::apply_to_state` (Transfer arm)
+            // so that re-delivery of the same TX during sync / replay does not
+            // fail the operation. Replay protection is preserved: a TX with stale
+            // nonce has no incremental effect (sender's balance already reflects
+            // the original deduction).
+            if tx.nonce <= sender.nonce {
+                return Ok(tx_hash);
+            }
             // Check nonce for transaction ordering
             if tx.nonce != sender.nonce + 1 {
                 return Err(StateError::InvalidTransaction(format!(
-                    "Invalid nonce: expected {}, got {}", 
+                    "Invalid nonce: expected {}, got {}",
                     sender.nonce + 1, tx.nonce
                 )));
             }
             
-            // Calculate total cost including gas
-            let gas_cost = tx.gas_price * tx.gas_limit;
-            let total_cost = tx.amount + gas_cost;
-            
+            // SECURITY: checked arithmetic to prevent overflow bypass
+            let gas_cost = tx.gas_price.checked_mul(tx.gas_limit)
+                .ok_or_else(|| StateError::InvalidTransaction(
+                    format!("Gas calculation overflow: {} * {}", tx.gas_price, tx.gas_limit)
+                ))?;
+            let total_cost = tx.amount.checked_add(gas_cost)
+                .ok_or_else(|| StateError::InvalidTransaction(
+                    format!("Total cost overflow: {} + {}", tx.amount, gas_cost)
+                ))?;
+
             if sender.balance < total_cost {
                 return Err(StateError::InsufficientBalance {
                     have: sender.balance,
                     need: total_cost,
                 });
             }
-            
-            // Execute transaction
+
+            // Execute transaction (safe: balance >= total_cost verified above)
             sender.balance -= total_cost;
             sender.nonce += 1;
             
@@ -120,10 +146,21 @@ impl StateDB {
                     reputation: 0.0,
                     created_at: timestamp,
                     updated_at: timestamp,
+                    is_contract: false,
+                    contract_code_hash: None,
+                    contract_storage: std::collections::HashMap::new(),
+                    heartbeat_epoch: 0,
+                    heartbeat_slots: 0,
+                    heartbeat_final_epoch: 0,
+                    heartbeat_final_slots: 0,
+                    last_claimed_epoch: 0,
+            banned_at_height: 0,
+                    storage_root: [0u8; 32], // inert: legacy is_contract=false apply path
+                    dilithium_public_key: None, // FIX-5: bound at apply via the pk-persist hook, not this legacy ctor
                 }
             });
-            
-            recipient.balance += tx.amount;
+
+            recipient.balance = recipient.balance.saturating_add(tx.amount);
             // Update recipient activity
             recipient.touch(timestamp);
             

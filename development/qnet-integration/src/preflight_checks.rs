@@ -30,9 +30,11 @@ pub struct CheckResult {
 }
 
 /// Required ports for QNet node
-/// NOTE: 9876/9877 removed - not actually used, P2P works via QUIC (10876) and HTTP API (8001)
+/// All ports must be open for full node operation
 pub const REQUIRED_PORTS: &[(u16, &str, &str)] = &[
     (8001, "TCP", "REST API"),
+    (9876, "TCP", "P2P Network"),
+    (9877, "TCP", "P2P Regional"),
     (10876, "UDP", "QUIC Transport"),
 ];
 
@@ -98,18 +100,19 @@ pub async fn run_preflight_checks(external_ip: Option<&str>) -> Result<Preflight
                 ip
             }
             Err(e) => {
-                println!("   ⚠️ Could not detect external IP: {}", e);
-                println!("   ℹ️ Skipping external connectivity checks");
-                
+                // Returning passed:true here printed "[INFO][PREFLIGHT] passed" while phases 3-6
+                // never ran — a false all-clear. Report the real coverage instead; the caller
+                // decides, and the operator sees which phases were skipped.
+                println!("[WARN][PREFLIGHT] external_ip_undetected err={} skipped=phases_3_6", e);
+
                 checks.push(CheckResult {
                     name: "External IP Detection".to_string(),
                     passed: false,
                     message: e.clone(),
                 });
-                
-                // Not critical - continue without external checks
+
                 return Ok(PreflightResult {
-                    passed: true,
+                    passed: false,
                     checks,
                     critical_failures: vec![],
                 });
@@ -368,10 +371,19 @@ async fn check_udp_external_connectivity(external_ip: &str, port: u16) -> CheckR
     // External check requires external service or peer
     match UdpSocket::bind("0.0.0.0:0") {
         Ok(socket) => {
-            let addr: SocketAddr = format!("{}:{}", external_ip, port)
-                .parse()
-                .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
-            
+            // Never substitute a bogus fallback address that masks a bad external_ip.
+            let addr: SocketAddr = match format!("{}:{}", external_ip, port).parse() {
+                Ok(a) => a,
+                Err(e) => {
+                    println!("[WARN][PREFLIGHT] invalid external address, skipping UDP check ip={} port={} err={}", external_ip, port, e);
+                    return CheckResult {
+                        name,
+                        passed: false,
+                        message: format!("Invalid external address {}:{} ({})", external_ip, port, e),
+                    };
+                }
+            };
+
             // Try to send a probe packet
             match socket.send_to(b"QNET_PREFLIGHT_CHECK", addr) {
                 Ok(_) => {
@@ -494,7 +506,7 @@ async fn check_time_sync() -> CheckResult {
     
     // Method 1: Check against public NTP-synced time services
     let time_services = [
-        "http://worldtimeapi.org/api/ip",
+        "https://worldtimeapi.org/api/ip",
     ];
     
     let local_time = std::time::SystemTime::now()
@@ -562,14 +574,14 @@ mod tests {
     #[test]
     fn test_check_port_available_tcp() {
         // Should be able to bind to a random high port
-        let result = check_port_available(0, "TCP");
+        let _result = check_port_available(0, "TCP");
         // Port 0 will fail because we need a real port
         // This is just a sanity check that the function works
     }
     
     #[test]
     fn test_check_port_available_udp() {
-        let result = check_port_available(0, "UDP");
+        let _result = check_port_available(0, "UDP");
         // Same as above
     }
     

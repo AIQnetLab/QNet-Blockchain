@@ -1,6 +1,7 @@
 'use client';
 
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
+import { useChainHead } from '@/hooks/useChainHead';
 
 // Custom hook to manage animations with Intersection Observer
 const useAnimateOnScroll = () => {
@@ -34,9 +35,63 @@ const useAnimateOnScroll = () => {
   return containerRef;
 };
 
+interface NetworkStats {
+  activeNodes: number;
+  activeLightNodes?: number;
+  currentRound: number;
+  height: number;
+  blocksUntilReward: number;
+  secondsUntilReward: number;
+  circulatingSupply?: number;
+  circulatingFormatted?: string;
+}
+
+// Helper to format time remaining
+const formatTimeRemaining = (seconds: number): string => {
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  if (hours > 0) {
+    return `~${hours}h ${minutes}m`;
+  }
+  return `~${minutes}m`;
+};
+
 // Memoized functional component for the Home section
 const HomeSection = React.memo(function HomeSection({ setActiveSection }: { setActiveSection: (section: string) => void }) {
   const animatedContainerRef = useAnimateOnScroll();
+  const [stats, setStats] = useState<NetworkStats | null>(null);
+  
+  const fetchStats = async () => {
+      try {
+        const res = await fetch(`/api/network/stats?t=${Date.now()}`, {
+          cache: 'no-store'
+        });
+        if (res.ok) {
+          const data = await res.json();
+          if (data.success && data.data) {
+            setStats(data.data);
+          }
+        }
+      } catch (err) {
+        /* log disabled */
+      }
+  };
+
+  useEffect(() => {
+    fetchStats();
+  }, []);
+
+  // Stats follow the chain head: refetch on a new block, at most every 10 s, only while visible.
+  const head = useChainHead();
+  const lastStats = useRef(0);
+  useEffect(() => {
+    if (!head.height) return;
+    if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+    const now = Date.now();
+    if (now - lastStats.current < 10_000) return;
+    lastStats.current = now;
+    void fetchStats();
+  }, [head.height]); // eslint-disable-line react-hooks/exhaustive-deps
   
   return (
     <div ref={animatedContainerRef}>
@@ -74,24 +129,26 @@ const HomeSection = React.memo(function HomeSection({ setActiveSection }: { setA
           {/* Network Statistics */}
           <div className="hero-stats">
             <div className="stat-card">
-              <div className="stat-number">156</div>
+              <div className="stat-number">{stats?.activeNodes || '—'}</div>
               <div className="stat-label">ACTIVE NODES</div>
-              <div className="stat-trend">+12 this hour</div>
+              <div className="stat-trend">{stats ? `+${(stats.activeLightNodes ?? 0).toLocaleString()} light (prev epoch)` : 'Live data'}</div>
             </div>
             <div className="stat-card">
-              <div className="stat-number">424,411</div>
-              <div className="stat-label">TPS ACHIEVED</div>
-              <div className="stat-trend">Peak performance</div>
+              <div className="stat-number">13k</div>
+              <div className="stat-label">TRANSFERS/SEC</div>
+              <div className="stat-trend">measured E2E · 40-80k on validator hardware</div>
             </div>
             <div className="stat-card">
-              <div className="stat-number">99.9%</div>
-              <div className="stat-label">NETWORK UPTIME</div>
-              <div className="stat-trend">24h average</div>
+              <div className="stat-number">{stats?.currentRound !== undefined ? stats.currentRound : '—'}</div>
+              <div className="stat-label">REWARD EPOCH</div>
+              <div className="stat-trend">
+                {stats ? `Next: ${stats.blocksUntilReward.toLocaleString()} blocks (${formatTimeRemaining(stats.secondsUntilReward)})` : 'Loading...'}
+              </div>
             </div>
             <div className="stat-card">
-              <div className="stat-number">4.29B</div>
+              <div className="stat-number">{stats?.circulatingFormatted || '—'}</div>
               <div className="stat-label">QNC SUPPLY</div>
-              <div className="stat-trend">Max Supply</div>
+              <div className="stat-trend">Circulating / Max: 4.29B</div>
             </div>
             {/* GitHub Code Verification Section */}
             <div className="code-verification-banner">
@@ -133,7 +190,7 @@ const HomeSection = React.memo(function HomeSection({ setActiveSection }: { setA
             </div>
             <h3>Post-Quantum Cryptography</h3>
             <p>
-              Kyber-1024 KEM & Dilithium-5 signatures. 31/31 crypto tests passed (100% perfect). 
+              ML-DSA-65 (NIST FIPS 204) quantum signatures. 31/31 crypto tests passed (100% perfect). 
               NIST-approved algorithms protecting against quantum computing threats.
             </p>
           </div>
@@ -142,10 +199,11 @@ const HomeSection = React.memo(function HomeSection({ setActiveSection }: { setA
               <div className="feature-icon-wrapper">
                   <div className="lightning-icon"></div>
               </div>
-              <h3>Verified 424,411 TPS</h3>
+              <h3>13,000 Transfers/sec Measured</h3>
               <p>
-                  Real performance test June 11, 2025: Single Thread 282,337 | Multi-Process 334,218 | 
-                  Maximum Burst 424,411 TPS. Microblock architecture with pBFT consensus.
+                  13,000 finalized transfers per second measured end-to-end on a 5-node testnet
+                  with 1-second blocks and post-quantum signatures. Validator-grade hardware
+                  projects to 40-80k.
               </p>
           </div>
           
@@ -155,7 +213,7 @@ const HomeSection = React.memo(function HomeSection({ setActiveSection }: { setA
               </div>
               <h3>Pool #3 Innovation</h3>
               <p>
-                  Revolutionary reward system: When users pay QNC to activate Phase 2 nodes, their QNC goes to Pool #3 
+                  When users pay QNC to activate Phase 2 nodes, their QNC goes to Pool #3 
                   which redistributes rewards to ALL active nodes. Everyone benefits from network growth!
               </p>
           </div>
@@ -221,7 +279,7 @@ const HomeSection = React.memo(function HomeSection({ setActiveSection }: { setA
           </div>
           <div className="tech-item">
             <h4>Ping-Based Participation</h4>
-            <p>Every 4 hours network ping with cryptographic proof. Rewards from all three pools including Pool #3 activation benefits.</p>
+            <p>Every 4 hours network ping with cryptographic proof. Rewards from two pools: Base Emission and Pool #3 activation benefits.</p>
           </div>
           <div className="tech-item">
             <h4>11 Languages Supported</h4>
@@ -245,7 +303,7 @@ const HomeSection = React.memo(function HomeSection({ setActiveSection }: { setA
           </div>
           <div className="tech-item">
             <h4>Phase 2: QNC to Pool #3 (Future)</h4>
-            <p>QNC tokens are SENT TO POOL #3 for node activation. DYNAMIC PRICING: Light(2.5k-15k), Full(3.75k-22.5k), Super(5k-30k) QNC based on network size → Pool #3 → redistributed to ALL active nodes!</p>
+            <p>QNC tokens are SENT TO POOL #3 for node activation. DYNAMIC PRICING v3.18: Light(10k-30k), Super(7.5k-22.5k) QNC based on network size → Pool #3 → redistributed to ALL active nodes!</p>
           </div>
           <div className="tech-item">
             <h4>Sharp Drop Halving Innovation</h4>
@@ -256,8 +314,8 @@ const HomeSection = React.memo(function HomeSection({ setActiveSection }: { setA
             <p>Network size multipliers: 0-100K nodes (0.5x discount), 100K-300K (1.0x standard), 300K-1M (2.0x), 1M+ (3.0x premium). ALL fees → Pool #3!</p>
           </div>
           <div className="tech-item">
-            <h4>Three Reward Pools</h4>
-            <p>1. Base Emission (halving schedule) | 2. Transaction Fees (70% Super, 30% Full, 0% Light) | 3. Activation Pool #3 (ALL nodes benefit)</p>
+            <h4>Two Reward Pools</h4>
+            <p>1. Base Emission (halving schedule) | 2. Activation Pool #3 (ALL nodes benefit)</p>
           </div>
           <div className="tech-item">
             <h4>Hybrid Post-Quantum Cryptography</h4>
@@ -265,7 +323,7 @@ const HomeSection = React.memo(function HomeSection({ setActiveSection }: { setA
           </div>
           <div className="tech-item">
             <h4>Reputation-Based Consensus</h4>
-            <p>Score range 0-100. No token locking. Reputation 40+ for rewards. Double-sign detection with automatic penalties. Mobile-friendly security.</p>
+            <p>Score range 0-100. No token locking. Double-sign detection with automatic penalties. Mobile-friendly security.</p>
           </div>
           <div className="tech-item">
             <h4>Rate Limiting & DDoS Protection</h4>

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["QNet Team"]
 description = "Transaction mempool for QNet blockchain"
-license = "MIT"
+license = "BUSL-1.1"
 
 [lib]
 name = "qnet_mempool"
@@ -60,6 +60,8 @@ pyo3 = { version = "0.20", features = ["extension-module"], optional = true }
 [dev-dependencies]
 criterion = "0.5"
 tempfile = "3.8.1"
+qnet-state = { path = "../qnet-state" }
+serde_json = "1.0.111"
 
 [features]
 default = []

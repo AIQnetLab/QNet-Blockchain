@@ -2,6 +2,28 @@ use anchor_lang::prelude::*;
 use crate::state::*;
 use crate::errors::BurnError;
 
+// ═══════════════════════════════════════════════════════════════════════════
+// v14.5: PHASE TRANSITION NOW REQUIRES AUTHORITY SIGNER
+// ═══════════════════════════════════════════════════════════════════════════
+// Previous code allowed ANY signer to execute the transition once
+// `should_transition()` returned true. Combined with the old `record_burn`
+// (which accepted fake burns with `verified = true` unconditionally), an
+// attacker could:
+//   1. Call `record_burn` many times with synthetic tx signatures → inflate
+//      `total_1dev_burned` past the 90% threshold.
+//   2. Call `execute_phase_transition` themselves → flip `phase_transitioned`
+//      to true PERMANENTLY (constraint `!phase_transitioned` prevents revert).
+//   3. Phase 1 1DEV-burn activation is killed forever.
+//
+// v14.5 closes both holes in this file + `record_burn.rs` + `state.rs`:
+//   - `record_burn` now requires the verification_authority signer, so fake
+//     burns cannot inflate the counter anymore.
+//   - `execute_phase_transition` now requires the same authority signer AND
+//     keeps the organic trigger path (`should_transition()` still validated),
+//     so the transition can fire when genuinely warranted but cannot be
+//     weaponised by an unrelated caller.
+// ═══════════════════════════════════════════════════════════════════════════
+
 #[derive(Accounts)]
 pub struct ExecutePhaseTransition<'info> {
     #[account(
@@ -11,8 +33,13 @@ pub struct ExecutePhaseTransition<'info> {
         constraint = !burn_tracker.phase_transitioned @ BurnError::PhaseTransitioned
     )]
     pub burn_tracker: Account<'info, BurnTracker>,
-    
-    /// Anyone can call this function when transition conditions are met
+
+    // v14.5: Authority signer (pinned via burn_tracker.verification_authority).
+    // Only this account can finalise the phase transition.
+    #[account(
+        constraint = caller.key() == burn_tracker.verification_authority
+            @ BurnError::UnauthorizedCaller
+    )]
     pub caller: Signer<'info>,
 }
 

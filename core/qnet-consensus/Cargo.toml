@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["QNet Team"]
 description = "High-performance consensus mechanism for QNet blockchain"
-license = "MIT"
+license = "BUSL-1.1"
 
 [lib]
 name = "qnet_consensus"
@@ -35,8 +35,8 @@ sha3 = "0.10.8"
 hex = "0.4.3"
 base64 = "0.22"
 
-# CRYSTALS-Dilithium for quantum-resistant signatures (MANDATORY)
-pqcrypto-dilithium = "0.5"
+# ML-DSA-65 (FIPS 204) for quantum-resistant signatures (MANDATORY)
+pqcrypto-mldsa = "0.1"
 pqcrypto-traits = "0.3"
 
 # Ed25519 for hybrid signatures
@@ -59,6 +59,9 @@ dashmap = "5.5"
 parking_lot = "0.12"
 crossbeam = "0.8"
 
+# Parallel signature verification (QC committee can be ≤1000 post-quantum sigs)
+rayon = "1.10"
+
 # Metrics
 prometheus = "0.13"
 lazy_static = "1.4"
@@ -66,18 +69,9 @@ lazy_static = "1.4"
 # Network
 bytes = "1.5"
 
-# Python bindings
-pyo3 = { version = "0.20", features = ["extension-module"], optional = true }
-pyo3-asyncio = { version = "0.20", optional = true }
-
 [dev-dependencies]
-criterion = "0.5"
 proptest = "1.4"
 
 [features]
 default = []  # MANDATORY: Dilithium is now a required dependency, not optional
-python = ["pyo3", "pyo3-asyncio"]
-
-[[bench]]
-name = "consensus_bench"
-harness = false 
+ 

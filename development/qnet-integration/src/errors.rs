@@ -40,7 +40,13 @@ pub enum IntegrationError {
     
     #[error("Network error: {0}")]
     NetworkError(String),
-    
+
+    // Cold-join: genesis-rooted GALC pin not yet adopted while the network is past the first-capsule
+    // height. Retryable — the caller bails to the desync tick (pin arrives via peer co-send) instead of
+    // collapsing the verifiable ceiling to the h=90 anchor and replaying the whole chain.
+    #[error("Cold-join anchor pending")]
+    AnchorPending,
+
     #[error("Security error: {0}")]
     SecurityError(String),
     
@@ -115,12 +121,6 @@ impl From<qnet_mempool::MempoolError> for QNetError {
 impl From<qnet_mempool::MempoolError> for IntegrationError {
     fn from(err: qnet_mempool::MempoolError) -> Self {
         IntegrationError::MempoolError(err.to_string())
-    }
-}
-
-impl From<crate::validator::ValidationError> for IntegrationError {
-    fn from(err: crate::validator::ValidationError) -> Self {
-        IntegrationError::ValidationError(err.to_string())
     }
 }
 

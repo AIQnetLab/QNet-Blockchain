@@ -88,7 +88,7 @@ clean:
 # Docker commands
 docker-build:
 	@echo "Building Docker image..."
-	docker build -t qnet-node:latest .
+	docker build -f qnet-integration/Dockerfile.production -t qnet-production:latest ..
 
 docker-run:
 	@echo "Starting QNet with Docker Compose..."

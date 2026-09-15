@@ -54,11 +54,8 @@ function App(): React.JSX.Element {
             await handlePushMessage(remoteMessage.data);
           });
 
-          // Handle background/quit messages
-          messaging().setBackgroundMessageHandler(async remoteMessage => {
-            console.log('[FCM] Background message:', remoteMessage);
-            await handlePushMessage(remoteMessage.data);
-          });
+          // Background/quit handler is registered in index.js (top-level, headless-safe).
+          // Only foreground handler and listeners belong here.
 
           // Handle notification opened app
           messaging().onNotificationOpenedApp(remoteMessage => {
@@ -74,19 +71,16 @@ function App(): React.JSX.Element {
               }
             });
 
-          // Token refresh listener
+          // Token refresh listener — immediately push to genesis nodes if possible
           const unsubscribeTokenRefresh = messaging().onTokenRefresh(async (newToken) => {
-            console.log('[FCM] Token refreshed:', newToken);
+            console.log('[FCM] Token refreshed');
             const AsyncStorage = require('@react-native-async-storage/async-storage').default;
             await AsyncStorage.setItem('qnet_fcm_token', newToken);
-            
-            // Mark for re-registration
-            const nodeInfoStr = await AsyncStorage.getItem('qnet_light_node_info');
-            if (nodeInfoStr) {
-              const nodeInfo = JSON.parse(nodeInfoStr);
-              nodeInfo.needsReregistration = true;
-              await AsyncStorage.setItem('qnet_light_node_info', JSON.stringify(nodeInfo));
-            }
+            await AsyncStorage.setItem('qnet_needs_token_refresh', 'true');
+            try {
+              const { backgroundRefreshFcmToken } = require('./src/services/PushService');
+              await backgroundRefreshFcmToken();
+            } catch (_) {}
           });
 
           return () => {

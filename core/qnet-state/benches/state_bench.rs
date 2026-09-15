@@ -1,239 +1,136 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
-use qnet_state::prelude::*;
-use qnet_state::account::{NodeType, ActivationPhase};
-use qnet_state::transaction::TransactionType;
-use qnet_state::block::{BlockHeader, ConsensusProof};
-use tempfile::TempDir;
-use tokio::runtime::Runtime;
-use std::sync::Arc;
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use qnet_state::account::Account;
+use qnet_state::state::StateMerkleTree;
+use qnet_state::transaction::{Transaction, TransactionType};
 
-fn bench_account_operations(c: &mut Criterion) {
-    let rt = Runtime::new().unwrap();
-    let temp_dir = TempDir::new().unwrap();
-    let state_db = rt.block_on(async {
-        StateDB::with_rocksdb(temp_dir.path()).unwrap()
-    });
-    
-    let mut group = c.benchmark_group("account_operations");
-    
-    // Benchmark account creation
-    group.bench_function("create_account", |b| {
-        b.iter(|| {
-            rt.block_on(async {
-                let address = format!("account_{}", rand::random::<u32>());
-                let state = AccountState::new(1000);
-                state_db.set_account(&address, &state).await.unwrap();
+fn accounts(count: usize) -> Vec<(String, Account)> {
+    (0..count)
+        .map(|i| {
+            let address = format!("eon_account_{:016x}", i);
+            let mut account = Account::with_balance(address.clone(), 1_000_000 + i as u64);
+            account.nonce = i as u64;
+            (address, account)
+        })
+        .collect()
+}
+
+fn tree_of(count: usize) -> StateMerkleTree {
+    let mut tree = StateMerkleTree::new();
+    tree.insert_batch(&accounts(count));
+    tree.finalize();
+    tree
+}
+
+/// State root over a fresh account set: the per-block cost of committing state.
+fn bench_state_root(c: &mut Criterion) {
+    let mut group = c.benchmark_group("state_root");
+
+    for size in [100usize, 1_000, 10_000] {
+        let set = accounts(size);
+        group.bench_with_input(BenchmarkId::new("insert_batch_finalize", size), &set, |b, set| {
+            b.iter(|| {
+                let mut tree = StateMerkleTree::new();
+                tree.insert_batch(black_box(set));
+                black_box(tree.finalize())
             });
         });
-    });
-    
-    // Benchmark account retrieval
-    let test_address = "test_account";
-    rt.block_on(async {
-        let state = AccountState::new(1000);
-        state_db.set_account(test_address, &state).await.unwrap();
-    });
-    
-    group.bench_function("get_account", |b| {
-        b.iter(|| {
-            rt.block_on(async {
-                let _ = state_db.get_account(black_box(test_address)).await.unwrap();
-            });
-        });
-    });
-    
-    // Benchmark batch operations
-    group.bench_function("batch_update_100_accounts", |b| {
-        b.iter(|| {
-            rt.block_on(async {
-                state_db.backend.begin_batch().await.unwrap();
-                
-                for i in 0..100 {
-                    let address = format!("batch_account_{}", i);
-                    let state = AccountState::new(1000 + i as u64);
-                    state_db.set_account(&address, &state).await.unwrap();
-                }
-                
-                state_db.backend.commit_batch().await.unwrap();
-            });
-        });
-    });
-    
+    }
+
     group.finish();
 }
 
-fn bench_transaction_execution(c: &mut Criterion) {
-    let rt = Runtime::new().unwrap();
-    let temp_dir = TempDir::new().unwrap();
-    let state_db = rt.block_on(async {
-        StateDB::with_rocksdb(temp_dir.path()).unwrap()
-    });
-    
-    let mut group = c.benchmark_group("transaction_execution");
-    
-    // Setup accounts
-    rt.block_on(async {
-        for i in 0..1000 {
-            let address = format!("tx_account_{}", i);
-            let state = AccountState::new(1_000_000);
-            state_db.set_account(&address, &state).await.unwrap();
-        }
-    });
-    
-    // Benchmark simple transfer
-    group.bench_function("simple_transfer", |b| {
-        let mut nonce = 0u64;
-        b.iter(|| {
-            rt.block_on(async {
-                let from = "tx_account_0";
-                let to = format!("tx_account_{}", (nonce % 999) + 1);
-                
-                let tx = Transaction::new(
-                    from.to_string(),
-                    TransactionType::Transfer {
-                        to: to.clone(),
-                        amount: 100,
-                    },
-                    nonce,
-                    10,
-                    10_000, // QNet TRANSFER gas limit
-                    1234567890,
-                );
-                
-                let _ = state_db.execute_transaction(&tx, 1, 0).await.unwrap();
-                nonce += 1;
+/// Incremental re-root: one account changes in a populated tree, which is what a
+/// microblock does, as opposed to the full recompute above.
+fn bench_incremental_root(c: &mut Criterion) {
+    let mut group = c.benchmark_group("incremental_root");
+
+    for size in [1_000usize, 10_000] {
+        group.bench_with_input(BenchmarkId::new("single_update_finalize", size), &size, |b, &size| {
+            let mut tree = tree_of(size);
+            let address = format!("eon_account_{:016x}", 0);
+            let mut balance = 1_000_000u64;
+            b.iter(|| {
+                balance += 1;
+                let account = Account::with_balance(address.clone(), balance);
+                tree.insert_lazy(black_box(&address), black_box(&account));
+                black_box(tree.finalize())
             });
         });
-    });
-    
-    // Benchmark node activation
-    group.bench_function("node_activation", |b| {
-        let mut account_idx = 100u32;
-        b.iter(|| {
-            rt.block_on(async {
-                let address = format!("tx_account_{}", account_idx);
-                
-                let tx = Transaction::new(
-                    address.clone(),
-                    TransactionType::NodeActivation {
-                        node_type: NodeType::Light,
-                        amount: 1000,
-                        phase: ActivationPhase::Phase2,
-                    },
-                    0,
-                    10,
-                    50000,
-                    1234567890,
-                );
-                
-                let _ = state_db.execute_transaction(&tx, 1, 0).await.unwrap();
-                account_idx += 1;
-            });
-        });
-    });
-    
+    }
+
     group.finish();
 }
 
-fn bench_block_operations(c: &mut Criterion) {
-    let rt = Runtime::new().unwrap();
-    let temp_dir = TempDir::new().unwrap();
-    let state_db = rt.block_on(async {
-        StateDB::with_rocksdb(temp_dir.path()).unwrap()
+/// Balance-proof generation and verification — the light-client read path.
+fn bench_balance_proof(c: &mut Criterion) {
+    let mut tree = tree_of(10_000);
+    let root = tree.finalize();
+    let address = format!("eon_account_{:016x}", 0);
+    let account = Account::with_balance(address.clone(), 1_000_000);
+    let proof = tree.generate_proof(&address);
+    assert!(
+        StateMerkleTree::verify_proof(&address, &account, &proof, &root),
+        "benchmark fixture must produce a verifying proof"
+    );
+
+    let mut group = c.benchmark_group("balance_proof");
+
+    group.bench_function("generate_10k", |b| {
+        b.iter(|| black_box(tree.generate_proof(black_box(&address))));
     });
-    
-    let mut group = c.benchmark_group("block_operations");
-    
-    // Create test blocks
-    let blocks: Vec<Block> = (0..100).map(|i| {
-        let header = BlockHeader::new(
-            i,
-            format!("prev_hash_{}", i),
-            format!("tx_root_{}", i),
-            format!("state_root_{}", i),
-            1234567890 + i * 10,
-            format!("producer_{}", i),
-            i,
-        );
-        
-        let consensus_proof = ConsensusProof {
-            commits: vec![],
-            reveals: vec![],
-            random_beacon: format!("beacon_{}", i),
-            leader_proof: format!("proof_{}", i),
-        };
-        
-        Block::new(header, vec![], consensus_proof)
-    }).collect();
-    
-    // Store blocks
-    rt.block_on(async {
-        for block in &blocks {
-            state_db.store_block(block).await.unwrap();
-        }
-    });
-    
-    // Benchmark block retrieval
-    group.bench_function("get_block_by_height", |b| {
+
+    group.bench_function("verify_10k", |b| {
         b.iter(|| {
-            rt.block_on(async {
-                let height = rand::random::<u64>() % 100;
-                let _ = state_db.get_block(black_box(height)).await.unwrap();
-            });
+            black_box(StateMerkleTree::verify_proof(
+                black_box(&address),
+                black_box(&account),
+                black_box(&proof),
+                black_box(&root),
+            ))
         });
     });
-    
-    // Benchmark latest block retrieval
-    group.bench_function("get_latest_block", |b| {
-        b.iter(|| {
-            rt.block_on(async {
-                let _ = state_db.get_latest_block().await.unwrap();
-            });
-        });
-    });
-    
+
     group.finish();
 }
 
-fn bench_concurrent_access(c: &mut Criterion) {
-    let rt = Runtime::new().unwrap();
-    let temp_dir = TempDir::new().unwrap();
-    let state_db = Arc::new(rt.block_on(async {
-        StateDB::with_rocksdb(temp_dir.path()).unwrap()
-    }));
-    
-    let mut group = c.benchmark_group("concurrent_access");
-    
-    // Benchmark concurrent reads
-    group.bench_function("concurrent_reads_10_threads", |b| {
-        b.iter(|| {
-            let handles: Vec<_> = (0..10).map(|i| {
-                let state_db = Arc::clone(&state_db);
-                let rt_handle = rt.handle().clone();
-                std::thread::spawn(move || {
-                    rt_handle.block_on(async {
-                        for j in 0..100 {
-                            let address = format!("account_{}_{}", i, j);
-                            let _ = state_db.get_account(&address).await;
-                        }
-                    });
-                })
-            }).collect();
-            
-            for handle in handles {
-                handle.join().unwrap();
-            }
-        });
+/// Canonical encoding and hashing of a transaction — run once per transaction on
+/// every ingress, produce and validate path.
+fn bench_transaction_hash(c: &mut Criterion) {
+    let tx = Transaction::new(
+        "eon_sender".to_string(),
+        Some("eon_recipient".to_string()),
+        100,
+        7,
+        100_000,
+        10_000,
+        1_234_567_890,
+        None,
+        TransactionType::Transfer {
+            from: "eon_sender".to_string(),
+            to: "eon_recipient".to_string(),
+            amount: 100,
+        },
+        None,
+    );
+
+    let mut group = c.benchmark_group("transaction");
+
+    group.bench_function("canonical_bytes", |b| {
+        b.iter(|| black_box(black_box(&tx).canonical_bytes()));
     });
-    
+
+    group.bench_function("calculate_hash", |b| {
+        b.iter(|| black_box(black_box(&tx).calculate_hash()));
+    });
+
     group.finish();
 }
 
 criterion_group!(
     benches,
-    bench_account_operations,
-    bench_transaction_execution,
-    bench_block_operations,
-    bench_concurrent_access
+    bench_state_root,
+    bench_incremental_root,
+    bench_balance_proof,
+    bench_transaction_hash
 );
-criterion_main!(benches); 
+criterion_main!(benches);

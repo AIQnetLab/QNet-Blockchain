@@ -140,7 +140,8 @@ def monitor_network():
         for region in regions:
             print(f"\n{get_region_symbol(region)} {region.upper()}:")
             
-            for node_type in ['super', 'full', 'light']:
+            # v3.18: Full nodes removed
+            for node_type in ['super', 'light']:
                 nodes = network_map[region].get(node_type, [])
                 if nodes:
                     color = get_node_color(node_type)
