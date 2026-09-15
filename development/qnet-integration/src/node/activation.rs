@@ -676,6 +676,12 @@ impl BlockchainNode {
                 registration_tx.dilithium_signature.is_some(), node_id);
         }
 
+        // A registration the state already holds is done; nothing to arm.
+        if let Some(st) = crate::node::try_get_state() {
+            if crate::node::refuse_held_commitment(st, &registration_tx).await.is_err() {
+                return Ok(());
+            }
+        }
         // Submit + arm + deliver.
         let tx_bytes = bincode::serialize(&registration_tx).unwrap_or_default();
         let tx_hash = registration_tx.hash.clone();

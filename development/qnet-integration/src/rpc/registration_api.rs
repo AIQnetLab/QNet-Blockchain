@@ -2775,6 +2775,23 @@ pub(super) async fn handle_node_registration_client_submit(
                 "error": "burn_tx_hash does not match the signed registration_proof"
             })));
         }
+        // attest_epoch is pinned from THIS node's tip: behind the chain, the tx it would arm has its
+        // verifier window already closing, so refuse (retryable) with the server arm gate's own test.
+        if let Some(p2p) = blockchain.get_unified_p2p() {
+            let local = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Acquire);
+            let ceiling = p2p.corroborated_head_ceiling();
+            if crate::node::arm_deficit_exceeded(local, ceiling) {
+                if crate::node::is_warn() {
+                    println!("[WARN][NODE-REG-CLIENT] reject node={} reason=node_behind local={} ceiling={} (retryable)", req.node_id, local, ceiling);
+                }
+                return Ok(warp::reply::json(&json!({
+                    "success": false,
+                    "error": "node is behind the chain; retry shortly",
+                    "height": local,
+                    "head": ceiling
+                })));
+            }
+        }
         // Local Phase-1 cost hint (advisory only); each attestor recomputes + signs its own value.
         // Through the single-flight cache: an uncached read here is one Solana round-trip per
         // registration attempt, i.e. an attacker-paced fan-out to one external endpoint.
@@ -2975,6 +2992,10 @@ pub(super) async fn handle_node_reactivation_submit(
     let tx_bytes = bincode::serialize(&react_tx).unwrap_or_default();
     let mempool = blockchain.get_mempool();
 
+    let state = blockchain.get_state_manager();
+    if let Err(e) = crate::node::refuse_held_commitment(&state, &react_tx).await {
+        return Ok(warp::reply::json(&json!({ "success": false, "error": e })));
+    }
     if mempool.add_binary_transaction(tx_bytes.clone(), tx_hash.clone(), react_tx.gas_price) {
         println!("[INFO][NODE-REACTIVATION] tx_added node={} h={} mb={} hash={}",
                  req.node_id, req.current_height, req.last_macroblock_index,

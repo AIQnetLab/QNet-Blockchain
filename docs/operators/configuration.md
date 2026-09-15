@@ -78,7 +78,7 @@ The QUIC listener binds IPv4. Pre-flight treats UDP 10876 as critical: if it is 
 | `QNET_WALLET_SEED_FILE` | Path to a file holding the BIP39 mnemonic. Preferred over the inline form. | none | `/run/secrets/qnet_seed` |
 | `QNET_WALLET_SEED` | The mnemonic inline. The ML-DSA-65 consensus keypair is derived deterministically from it. | none | — |
 | `QNET_GENESIS_SEED_FILE` / `QNET_GENESIS_SEED` | Same mechanism, consulted only when no wallet seed is present. | none | — |
-| `QNET_BOOTSTRAP_ID` | Genesis bootstrap identity, `001`–`005`. Reserved for the five pinned genesis nodes; any other value is rejected. Also selects the light-node shard this node owns — `00N` pings and commits the eligibility bitmap for shard `N-1`, so the five values must be distinct across the genesis set. See [economics](../economics/overview.md). | none | `001` |
+| `QNET_BOOTSTRAP_ID` | Genesis bootstrap identity, `001`–`005`. Reserved for the five pinned genesis nodes; any other value is rejected. Also selects the light-node shard this node owns — `00N` pings and commits the eligibility bitmap for shard `N-1` — and the two shards it backs up: first backup for `N-2`, second for `N-3` (mod 5). It pings a backed-up shard while every owner ranked above it has been silent for 600 s, and commits that shard's bitmap if no owner's bitmap has landed by its deadline: the owner may commit in the epoch's last 150 blocks, the first backup in the last 100, the second in the last 50. The five values must be distinct across the genesis set. See [economics](../economics/overview.md). | none | `001` |
 | `QNET_PRODUCTION` | `1` enables on-chain uniqueness checking of the activation code, Solana burn verification, and activation recording at startup. | unset | `1` |
 | `QNET_NETWORK` | Selects the network profile: `mainnet`, `testnet` or `local`. An unrecognised value resolves to testnet. | `testnet` | `testnet` |
 | `QNET_KEY_ENCRYPTION_SECRET` | 64 hex characters (32 bytes) used to encrypt the on-disk key material instead of the auto-generated file secret. Other lengths are rejected with a log line. | auto-generated | — |
@@ -130,12 +130,12 @@ Container-level log rotation is the operator's responsibility; the node is verbo
 | Variable | Purpose | Default | Example |
 |----------|---------|---------|---------|
 | `QNET_ADMIN_SECRET` | Required for `POST /api/v1/shutdown`, which refuses every request without it, and enforced on `GET /api/v1/node/secure-info` whenever it holds a value. Set it: `secure-info` is authenticated only when this variable is set. | unset | 32 random bytes, hex |
-| `QNET_API_KEY_EXPLORER` | API key that bypasses rate limiting, matched against the `X-API-Key` header. Minimum 16 characters; shorter values are logged and ignored. Applies to the two JSON-RPC routes. | unset | — |
+| `QNET_API_KEY_EXPLORER` | API key that bypasses rate limiting, matched against the `X-API-Key` header. Minimum 16 characters; shorter values are logged and ignored. Applies to the two JSON-RPC routes and to `GET /api/v1/blocks/headers`. | unset | — |
 | `QNET_API_KEY_ADMIN` | As above, for monitoring and administration tooling. | unset | — |
 | `QNET_WHITELIST_IPS` | Comma-separated IPs that bypass rate limiting and satisfy the internal-caller check on privileged endpoints. Loopback is always included. | loopback only | `10.0.0.5` |
 | `QNET_API_RATE_LIMIT` | Requests per 60-second window for the `transaction` bucket, clamped to 1–10000. | `100` | `100` |
 
-Two behaviours matter when you build tooling against these. Rate-limit rejections are returned as HTTP 200 with an error body, so check the body rather than the status code; the WebSocket upgrade returns 429. The peer IP used for rate limiting and the internal-caller check is taken from the raw socket, so a reverse proxy attributes every request to itself, and a proxy terminating on loopback places everything behind it inside the whitelist.
+Two behaviours matter when you build tooling against these. Rate-limit rejections are returned as HTTP 200 with an error body, so check the body rather than the status code; the WebSocket upgrade returns 429. The peer IP used for rate limiting and the internal-caller check is taken from the raw socket, so a reverse proxy attributes every request to itself, and a proxy terminating on loopback places everything behind it inside the whitelist. The internal-caller check admits the whitelist plus any loopback, RFC 1918, link-local or IPv6 unique-local source address. Among the routes it gates are `POST /api/v1/shutdown`, `POST /api/v1/p2p/message` and the operator JSON-RPC methods `node_armRecovery`, `node_disarmRecovery`, `node_recoveryStatus`, `node_decreeEndorse` and `node_decreeSubmit`, which answer error `-32004` to any other caller.
 
 ## External services
 
@@ -147,7 +147,7 @@ configuration to verify burns.
 |----------|---------|---------|
 | `QNET_MAINNET_1DEV_MINT` | Replaces the pinned mainnet 1DEV mint. The value must be base58 of pubkey length; anything else logs `[CRIT][CONFIG] solana_address_invalid` and exits. An accepted override logs `[WARN][CONFIG] solana_address_overridden`. | pinned mainnet mint |
 | `QNET_MAINNET_BURN_CONTRACT` | Replaces the pinned burn-contract program id, under the same check. | pinned program id |
-| `IPFS_ENABLED`, `IPFS_API_URL`, `IPFS_GATEWAY_URL`, `IPFS_EXTRA_GATEWAYS` | Optional IPFS integration. | disabled |
+| `IPFS_ENABLED`, `IPFS_API_URL`, `IPFS_GATEWAY_URL`, `IPFS_EXTRA_GATEWAYS` | Optional IPFS integration. With `IPFS_ENABLED=1` and `IPFS_API_URL` set, a node uploads each snapshot frame it writes at a 43,200-block boundary, streamed from its chunk rows and never held whole; `IPFS_GATEWAY_URL` and the comma-separated `IPFS_EXTRA_GATEWAYS` are where a download by CID looks, tried first for the target height before the chunked and single-body downloads. | disabled |
 | `FCM_PROJECT_ID`, `FCM_SERVER_KEY`, `GOOGLE_APPLICATION_CREDENTIALS` | Push-notification delivery for mobile Light nodes; meaningful only on nodes that serve that role. | unset |
 
 ## Resource sizing
@@ -156,11 +156,10 @@ These affect local CPU and memory allocation. Most defaults adapt to the detecte
 
 | Variable | Purpose | Default |
 |----------|---------|---------|
-| `QNET_CPU_LIMIT_PERCENT` | Percentage of detected cores the node may use (1–100). | `100` |
-| `QNET_MAX_THREADS` | Absolute cap on worker threads; takes priority over the percentage. | unset |
-| `QNET_SIGVERIFY_THREADS`, `QNET_BANKING_THREADS`, `QNET_REPLAY_THREADS`, `QNET_BROADCAST_THREADS` | Per-runtime worker-thread counts. `QNET_SIGVERIFY_THREADS` is clamped to 1..cores. | 1 on ≤4 cores, otherwise `cores/4` (minimum 2) |
+| `QNET_SIGVERIFY_THREADS` | Worker threads of the signature-verification runtime, clamped to 1..cores. | 1 on ≤4 cores, otherwise `cores/4` (minimum 2) |
+| `QNET_BROADCAST_THREADS` | Worker threads of the broadcast runtime (shred fan-out, chunk forwarding, background repair), clamped to 1..cores. | 1 on ≤2 cores, 2 on ≤4 cores, otherwise `cores/2` (minimum 2) |
 | `QNET_VALUE_VERIFY_PERMITS` | Concurrency for value-transaction signature verification, per lane, minimum 4. | detected parallelism |
-| `QNET_MEMPOOL_TTL` | Seconds before a never-confirmed transaction is evicted from the mempool. | `1800` |
+| `QNET_MEMPOOL_TTL` | Seconds before a never-confirmed transaction is evicted from the mempool by the 60-second sweep. The same value filters the persisted mempool at boot, so a restart does not re-admit an expired transaction. | `1800` |
 | `QNET_MAX_PER_SENDER` | Mempool cap on pending transactions per sender. | `10000` |
 | `QNET_PK_REGISTRY_CAP` | Consensus public-key registry capacity; clamped to a compile-time hard maximum of 1,000,000. | `1000000` |
 | `QNET_PK_REGISTRY_IDLE_DAYS` | Idle threshold, in days, before a registry entry is evicted. | `30` |
@@ -170,7 +169,8 @@ These affect local CPU and memory allocation. Most defaults adapt to the detecte
 | Variable | Purpose | Notes |
 |----------|---------|-------|
 | `QNET_HALT_HEIGHT` | The node stops at this block height. | For coordinated upgrades. Meaningful only if the whole network agrees on the height; halting one node alone takes it offline. |
-| `QNET_WEAK_SUBJECTIVITY_CHECKPOINT` | A syncing node refuses a chain whose tip is below this height, mitigating long-range attacks. | `0` by default. A value above the real tip makes the node unable to sync at all. Use only a height you have independently verified. |
+| `QNET_ROLLBACK_TO_LAST_SEALED` | `1` (or `true`) rolls the stored chain back at boot, before state recovery, to the last height of the newest window this node holds sealed (a stored macroblock with a non-empty microblock list), searching the tip's window and the 8 below it. Blocks above that height are deleted, the macroblocks and certified pairs above it are retracted, this node's own vote commitments above it are dropped, and its anti-double-sign mark is lowered to the height it ends at. A target at or above the tip deletes no blocks but still retracts those markers and lowers the mark. With no sealed window in range the node logs `no_sealed_macroblock_found` and starts unchanged. | Fleet-wide recovery: set it on every node, start them together, then remove it — it acts again on every start it is present for. |
+| `QNET_ROLLBACK_TO_HEIGHT` | The same rollback to an explicit height, taking precedence over `QNET_ROLLBACK_TO_LAST_SEALED`. A target below the last sealed window logs `target_below_last_sealed` and discards certified blocks. | Same one-shot discipline. |
 | `QNET_CLEAN_DATA` | `1` deletes the known data directories and peer cache at startup. | Destructive and unconfirmed. It runs before storage is opened, after the startup guards (restart manifest, container check, logger, clock plausibility). |
 | `QNET_FORCE_RESET` + `QNET_CONFIRM_RESET` | Resets stored chain height. Requires `QNET_FORCE_RESET=1` **and** `QNET_CONFIRM_RESET=YES`; either alone is refused. | Destructive; recovery procedure only. |
 
@@ -192,6 +192,7 @@ These affect local CPU and memory allocation. Most defaults adapt to the detecte
 | `QNET_GENESIS_FILE`, `QNET_GENESIS_MODE`, `QNET_BOOTSTRAP_NODE` | Genesis-file path and genesis-mode flags used when creating a network. |
 | `QNET_MAINNET_LAUNCH_TIMESTAMP` | Sets the genesis block timestamp when a genesis node creates block 0, fixing chain identity and every slot-anchored timestamp thereafter. Genesis creation only. |
 | `QNET_MICROBLOCK_INTERVAL` | Local block production interval in seconds (minimum 1). The protocol's slot cadence is one second; any other value desynchronises this node from the slot schedule. |
+| `QNET_BLOCK_FILL_GAS` | Overrides the gas this node packs into each block it produces (`BLOCK_FILL_SOFT_GAS` = 130,000,000 by default), clamped to 10,000,000–`BLOCK_GAS_LIMIT` (200,000,000); an override logs `fill_gas_target_override`. |
 | `QNET_SKIP_GENESIS_DUPLICATION_CHECK` | Skips the startup scan for a duplicate genesis identity. Refused when `QNET_NETWORK=mainnet`. |
 | `QNET_NODE_SECRET`, `QNET_AUDIT_SECRET` | Salts for local reputation and audit-chain hashes; both fall back to a node-id-derived value. |
 

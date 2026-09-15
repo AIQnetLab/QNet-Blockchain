@@ -272,8 +272,9 @@ pub(super) async fn handle_light_node_register(
             let state = state_mgr.read().await;
             state.is_node_registered(&pseudonym)
         };
-        let registered_in_gossip = LIGHT_NODE_REGISTRY.lock().contains_key(&pseudonym);
-        if registered_on_chain || registered_in_gossip {
+        // Chain only: this process's RAM registry also holds nodes whose registration tx never landed,
+        // and those must take the full path below to get tx_required and their registration_proof.
+        if registered_on_chain {
             // SECURITY: reactivation/ping-key rotation may run ONLY if the caller proves the node's
             // established identity. The quantum keypair is activation-derived (immutable), so the legit
             // owner presents the pubkey already committed as the node's VRF key. The mobile Dilithium sig
@@ -627,6 +628,8 @@ pub(super) async fn handle_light_node_register(
         let mut registry = LIGHT_NODE_REGISTRY.lock();
         
         if let Some(existing_node) = registry.get_mut(&light_node_pseudonym) {
+            // One phone holds one slot: its re-registration replaces its own entry, refreshing last_active.
+            existing_node.devices.retain(|d| d.device_id != new_device.device_id);
             // Check device limit (max 3 devices per Light node)
             if existing_node.devices.len() >= 3 {
                 // Remove oldest inactive device if needed
@@ -2280,71 +2283,6 @@ impl FCMPushService {
             }
         }
     }
-}
-
-// Calculate deterministic ping slot for Light node (0-239)
-#[allow(dead_code)]
-pub(super) fn calculate_ping_slot(node_id: &str) -> u32 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    
-    let mut hasher = DefaultHasher::new();
-    node_id.hash(&mut hasher);
-    let hash = hasher.finish();
-    
-    // 240 slots in 4-hour window (1 minute each)
-    (hash % 240) as u32
-}
-
-// Calculate next ping time for any node type (PRODUCTION: Unified for all node types)
-#[allow(dead_code)]
-pub(super) fn calculate_next_ping_time(node_id: &str) -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-    let current_4h_window = now - (now % (4 * 60 * 60)); // Start of current 4h window
-    let slot = calculate_ping_slot(node_id);
-    let slot_offset = (node_id.len() % 60) as u64; // 0-59 seconds within slot
-    
-    let ping_time = current_4h_window + (slot as u64 * 60) + slot_offset;
-    
-    // If ping time already passed, schedule for next 4h window
-    if ping_time <= now {
-        ping_time + (4 * 60 * 60)
-    } else {
-        ping_time
-    }
-}
-
-// Calculate all ping times for Super nodes (10 pings per 4h window)
-#[allow(dead_code)]
-pub(super) fn calculate_full_super_ping_times(node_id: &str) -> Vec<u64> {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-    let current_4h_window = now - (now % (4 * 60 * 60)); // Start of current 4h window
-    let base_slot = calculate_ping_slot(node_id); // Base randomization from node_id
-    let slot_offset = (node_id.len() % 60) as u64; // 0-59 seconds within slot
-    
-    let mut ping_times = Vec::new();
-    
-    // CRITICAL: Distribute 10 pings evenly across 4-hour window with randomization
-    // 4 hours = 240 minutes, 10 pings = every 24 minutes average
-    for i in 0..10 {
-        // Spread pings with base randomization + incremental offset
-        let spread_slot = (base_slot + (i * 24)) % 240; // Every 24 minutes with randomized start
-        let ping_time = current_4h_window + (spread_slot as u64 * 60) + slot_offset;
-        
-        // If ping time already passed, schedule for next 4h window  
-        if ping_time <= now {
-            ping_times.push(ping_time + (4 * 60 * 60));
-        } else {
-            ping_times.push(ping_time);
-        }
-    }
-    
-    ping_times.sort(); // Chronological order
-    ping_times
 }
 
 // ============================================================================

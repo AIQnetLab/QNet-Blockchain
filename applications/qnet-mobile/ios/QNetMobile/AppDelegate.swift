@@ -4,6 +4,7 @@ import React_RCTAppDelegate
 import ReactAppDependencyProvider
 import FirebaseCore
 import FirebaseMessaging
+import TSBackgroundFetch
 
 @main
 class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterDelegate, MessagingDelegate {
@@ -51,6 +52,10 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
       rootView.backgroundColor = UIColor(red: 17.0/255.0, green: 19.0/255.0, blue: 31.0/255.0, alpha: 1.0)
     }
 
+    // Registers the periodic wake with BGTaskScheduler, which accepts a launch handler only while the app
+    // finishes launching; Info.plist permits exactly this task (com.transistorsoft.fetch). Called once.
+    TSBackgroundFetch.sharedInstance().didFinishLaunching()
+
     return true
   }
   
@@ -65,19 +70,8 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
     Messaging.messaging().apnsToken = deviceToken
   }
 
-  // Background/silent push handler — CRITICAL for ping responses when app is killed.
-  // iOS requires this native method to exist AND call completionHandler(.newData)
-  // to grant ~30 seconds of background execution time.
-  // Messaging.appDidReceiveMessage lets Firebase decode the APNs→FCM mapping and
-  // then invoke the JS setBackgroundMessageHandler registered in index.js.
-  func application(
-    _ application: UIApplication,
-    didReceiveRemoteNotification userInfo: [AnyHashable: Any],
-    fetchCompletionHandler completionHandler: @escaping (UIBackgroundFetchResult) -> Void
-  ) {
-    Messaging.messaging().appDidReceiveMessage(userInfo)
-    completionHandler(.newData)
-  }
+  // No background-push method here: React Native Firebase runs the JS handler and completes the push itself;
+  // one here would complete it at once, and with the delegate proxy off it would take the push from RNFB.
 
   // Handle foreground notifications (show banner while app is open)
   func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification, withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {

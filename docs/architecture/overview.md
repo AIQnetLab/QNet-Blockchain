@@ -41,45 +41,35 @@ Consequences of the arithmetic:
   quorum is 4.
 - Because `COMMITTEE_THRESHOLD` equals `COMMITTEE_SIZE`, committee sampling only subsamples above 1000
   eligible nodes; below that the committee *is* the whole eligible set.
-- Block timestamps are a pure function of height (`genesis_ts + height × MICROBLOCK_INTERVAL_SECS`) and
-  are validated by exact match, so the wall clock is never a consensus input.
+- Below `SLOT_GAP_REANCHOR_GATE_HEIGHT = 1_339_200` a block's timestamp is exactly
+  `genesis_ts + height × MICROBLOCK_INTERVAL_SECS`. From that height it is the parent's timestamp plus
+  `MICROBLOCK_INTERVAL_SECS`, or, after a halt, a declared gap of at least `SLOT_GAP_MIN_SECS = 90`
+  seconds, so the chain re-anchors once instead of producing every missed second. Verifiers check it
+  against the parent's timestamp and refuse a gap block more than `SLOT_GAP_FUTURE_TOLERANCE_SECS = 30`
+  seconds ahead of their own clock.
 
 Block production runs independently of finality. If finality stalls, each node keeps producing on a
 roster derived purely from the last sealed macroblock's bytes, bounded to 2880 blocks past that seal,
-then parks and syncs. Rollback below the finalized height is refused. Those two rules together bound
-reorg depth.
+then parks and syncs. Fork recovery never rolls back below the finalized height. Those two rules
+together bound reorg depth. A recovery decree signed by a quorum of the genesis keys, and a one-shot
+operator rollback read at boot (`QNET_ROLLBACK_TO_LAST_SEALED=1` or `QNET_ROLLBACK_TO_HEIGHT`), go
+below it.
 
 Full treatment: [consensus](./consensus.md).
 
-## Measured performance
+## Block work budget
 
-Every figure below is an end-to-end measurement over public RPC on a live 5-node network of
-budget VPS hosts (8 vCPU class), taken by a load harness that counts a transfer only after the
-block containing it is certified by a checkpoint: submitted → included → finalized. Nothing here
-is a single-process benchmark.
+Block work is bounded by gas, not by transaction count. Every validator refuses a block whose
+transactions are charged more than `BLOCK_GAS_LIMIT = 200_000_000` gas in total, or whose contract
+calls reserve more than `BLOCK_FUEL_LIMIT = 50_000_000` WASM fuel; system and zero-gas transactions
+are not counted. The producer fills to a lower target, `BLOCK_FILL_SOFT_GAS = 130_000_000`, and to at
+most `BLOCK_FILL_SOFT_BYTES = 4_000_000` bytes of transactions. The fill target is producer-local
+policy, never a validity rule: `QNET_BLOCK_FILL_GAS` overrides it per node, clamped to between
+`10_000_000` and `BLOCK_GAS_LIMIT`.
 
-- **Sustained throughput: 13,000 transfers/s** — the highest load rung that held ≥99% inclusion
-  and finalization over a continuous 10-minute run (99.79%, 12,975 finalized transfers/s).
-  12,000/s ran at 99.97% with exactly one block per second end to end (932 blocks in 932 s).
-- **Peak throughput: 16,000 transfers/s** over 5-minute windows (99.79%). Sustained rungs above
-  13k degrade gracefully: the pool queues and self-drains with no forks and no network halt
-  (14k settles at ~9.2k/s effective, 20k at ~11k/s).
-- **Single-signature transactions: ~450/s** on this hardware. Each carries its own 3,309-byte
-  ML-DSA-65 signature and there is no standardized batch verification for ML-DSA, so the
-  per-signer rate is bound by signature-adjacent work and scales with cores.
-- **Batch transfers** put up to 1,000 payments under one ML-DSA-65 signature (3.3 signature
-  bytes per transfer). The batch is signed and verified as one plain FIPS 204 message — no
-  custom cryptography — which is what moves the throughput bound from signatures to state
-  application.
-- **Finality latency**: inclusion is seconds (p50 2–5 s at moderate load); hard BFT finality is
-  the checkpoint certificate — p50 ~109 s measured at maximum sustained load (including ~30 s of
-  inclusion queueing), bounded by the checkpoint cadence when idle.
-
-The block work budget is calibrated from these runs (Ethereum-style target/limit split):
-`BLOCK_GAS_LIMIT` = 200M (20 batches — the measured burst boundary: a backlog of limit-sized
-blocks drains without a cadence avalanche but cannot be sustained on floor hardware) and the
-producer fill target `BLOCK_FILL_SOFT_GAS` = 130M (13 batches — the highest 10-minute-sustained
-rung, with the slot-schedule catch-up supplying the drain margin).
+A `BatchTransfers` transaction carries 1 to 1,000 payments under one ML-DSA-65 signature, each with a
+non-zero amount and a memo of at most 128 bytes. The signed message binds every recipient, amount and
+memo together with the sender, nonce and gas fields.
 
 ## Lifecycle of a transaction
 
@@ -88,12 +78,18 @@ rung, with the slot-schedule catch-up supplying the drain margin).
    a lookup. See [cryptography](./cryptography.md).
 2. **Submission.** `POST /api/v1/transaction` on any Super node. The handler validates both EON
    addresses, then verifies the ML-DSA-65 signature on a blocking worker behind a bounded semaphore, so
-   a burst of signature work cannot starve the async runtime.
+   a burst of signature work cannot starve the async runtime. A value transaction (transfer, batch
+   transfer, contract deploy or call) may omit a public key that is already committed on chain; the node
+   then reads that key from committed state before verifying, and refuses the transaction when none is
+   committed.
 3. **Admission.** `Transaction::validate()` runs, plus a gas-limit ceiling check, a chain-id check that
    rejects cross-chain replay, and a type whitelist that admits only the externally submittable
-   transaction types. The RPC ingress and the gossip ingress apply the same whitelist.
+   transaction types. The RPC ingress and the gossip ingress apply the same whitelist, and both run the system-transaction
+   identity binds that block validation runs; both also refuse a commitment the state already records.
 4. **Mempool and gossip.** The transaction is stored in the mempool in its binary form keyed by hash
-   and gas price, broadcast to peers, and surfaced as a pending-transaction WebSocket event.
+   and gas price, broadcast to peers, and surfaced as a pending-transaction WebSocket event. A commitment
+   included in a block leaves a mark that keeps its copies out of the mempool for its class's lifetime
+   (three reward epochs; 1,620 blocks for a heartbeat), pruned by age every 1,440 blocks.
 5. **Inclusion.** The producer elected for the slot drains the mempool up to the per-block limit (bundle
    allocation first when MEV protection is enabled, public transactions after), prepends the emission
    transaction on emission blocks, computes the merkle root and the new state root, and signs the block
@@ -101,10 +97,14 @@ rung, with the slot-schedule catch-up supplying the drain margin).
 6. **Ingestion on every other node.** Blocks enter the staged pipeline `Ingest → Decode → Verify →
    Apply → Notify`. Each stage has a bounded channel, so a bad or oversized block is dropped at its own
    stage instead of stalling the pipeline. Verify is parallelizable; Apply is a single sequential
-   RocksDB writer by design and performs all side effects.
+   stage by design and performs all side effects. Account rows reach the `accounts` family through one
+   ordered writer thread, queued under the lock that applied the block, with a snapshot boundary pinned
+   right behind them. A verified block whose parent is not yet
+   applied waits in a bounded reorder window (`APPLY_HELD_MAX = 512` blocks, `APPLY_HELD_MAX_BYTES` =
+   256 MiB, `APPLY_HELD_MAX_AGE` = 20 seconds) until the applied tip reaches its parent.
 7. **Certification.** At each checkpoint boundary the committee agrees on one `Checkpoint` object
-   binding the window's microblock hashes, the state root, the randomness beacon, the epoch commitment
-   and the reward, registry, logs and public-key roots. A quorum certificate is an explicit signer list
+   binding the window's microblock hashes, the state root, the randomness beacon, the epoch commitment,
+   the reward, reward-epoch, registry, logs and public-key roots, and the total minted supply. A quorum certificate is an explicit signer list
    carrying one ML-DSA-65 signature per signer.
 8. **Finality.** The commit rule is 2-chain: a QC at index *i* on a checkpoint whose parent QC is at
    index *i−1* finalizes index *i−1*. Before the local finality marker advances, the node independently
@@ -133,7 +133,7 @@ checkpoint quorum certificate.
 | --- | --- | --- |
 | Storage mode | `StorageMode::Light` — zero chain data on device | `StorageMode::Super` — full history |
 | Consensus | Excluded by type, before any reputation check | Producer, checkpoint voter, failover voter |
-| Consensus key | None (`vrf_pk` empty in the registry row) | Mandatory 1952-byte ML-DSA-65 `vrf_pk` |
+| Consensus key | None; the registry row holds at most the SHA3-256 digest (`vrf_pk_sha3`) of the key its device's ping delegation is verified under | Mandatory 1952-byte ML-DSA-65 `vrf_pk` |
 | Archival | Never | Yes |
 | Registration | Client-side from the mobile wallet | Server-side by the node itself |
 | Devices | At most 3 bound devices | Server or VPS |
@@ -162,14 +162,16 @@ A Super node runs these concurrently; each owns a distinct module.
 
 - **Production loop** (`node/production.rs`) — slot timer, producer election for the current rotation
   round, mempool drain, block signing and broadcast. It re-checks authority immediately before
-  mutating state and yields the slot if the certified round advanced or storage already holds the
-  height.
+  mutating state and yields the slot if the certified round advanced, the applied tip already covers
+  the height, or a block for that height has already passed verify. It also skips a slot whose body a
+  certificate already names.
 - **Block pipeline** (`block_pipeline.rs`) — the staged ingest path, fork choice at contested heights,
   the apply-stage circuit breaker, and fork-recovery signalling.
 - **Consensus coordinator** (`consensus_state.rs`) — one async task owning the node's consensus phase
-  (`LoadingGenesis`, `Syncing`, `Synchronized`, `Producing`, `Validating`). Every other task sends it
-  events — the node reports genesis loaded, blocks applied and sync complete, and the block pipeline and
-  sync manager feed it too — over a bounded channel, and reads the phase from an `RwLock` snapshot. One
+  (`LoadingGenesis`, `Syncing`, `Synchronized`, `Producing`, `Validating`, `ResolvingFork`, `Halted`).
+  Every other task sends it events — the node reports genesis loaded, blocks applied and sync complete,
+  and the block pipeline and sync manager feed it too — over a bounded channel, and reads the phase from
+  an `RwLock` snapshot. One
   writer and many readers means the phase is a single source of truth: the sync target lives in
   `Syncing.target_height`, and whether production and voting are permitted follows from the phase itself
   rather than from a set of independently settable flags.
@@ -177,11 +179,16 @@ A Super node runs these concurrently; each owns a distinct module.
   consensus select loop, the view timer, proposal and vote handling, macroblock sealing. Certificate
   verification runs off the loop on blocking workers behind a two-permit semaphore so an
   O(committee) signature verify cannot starve the view-change timer.
+- **Failover pacemaker** (`node/production.rs`) — a dedicated task outside the production loop that
+  ticks every second to sign and broadcast timeout votes and to nudge sync on a stall. A tick that runs
+  past 2 seconds is cancelled and the next tick retries, so a parked production loop cannot silence
+  failover.
 - **P2P layer** (`unified_p2p/`, `quic_transport.rs`, `p2p_transport.rs`) — peer registry and
   discovery, block and transaction gossip, timeout-vote collection and re-gossip, and the QUIC
   transport. See [networking](./networking.md).
 - **Sync manager** (`sync_manager.rs`) — initial catch-up, desync recovery and post-rollback resync,
-  in sequential waves bounded by pipeline backpressure.
+  in sequential waves bounded by pipeline backpressure. Certified bodies it already holds above the
+  applied tip go to the pipeline from disk before peers are asked for them.
 - **Storage** (`storage/`) — RocksDB with 30 declared column families, plus an hourly cleanup pass
   that applies the per-artifact retention rules. See [state and storage](./state.md).
 - **RPC and WebSocket server** (`rpc/`) — the HTTP API, rate limiting, and event subscriptions. See
@@ -189,7 +196,9 @@ A Super node runs these concurrently; each owns a distinct module.
 - **Liveness loops** (`node/lifecycle.rs`) — periodic anchored Heartbeat transactions for Super nodes
   and the light-node eligibility bitmap, both of which feed reward eligibility.
 - **Reward machinery** (`reward_epoch.rs`, `reward_sharding.rs`) — epoch roots, shard maintenance and
-  the claim path. See [economics](../economics/overview.md).
+  the claim path. An epoch this node cannot serve is rebuilt from a peer's leaf set, accepted only when
+  it hashes to the reward root in this node's own certified macroblock. See
+  [economics](../economics/overview.md).
 
 ## Crate map
 
@@ -202,7 +211,7 @@ The Cargo workspace has nine members.
 | `qnet-mempool` | `core/qnet-mempool` | `SimpleMempool` (the one the node uses), priority, validation, eviction, MEV bundle protection, metrics |
 | `qnet-vm` | `core/qnet-vm` | Deterministic contract VM on the `wasmi` interpreter, fuel as gas, deploy-time module validation |
 | `qnet-core` | `core/qnet-core` | Merkle helpers used by the reward shard tree, security configuration, file encryption |
-| `qnet-sharding` | `core/qnet-sharding` | Shard coordinator and parallel validator. Single-shard operation is the shipped configuration: the coordinator is not constructed, so cross-shard routing and the parallel executor are inactive |
+| `qnet-sharding` | `core/qnet-sharding` | Shard coordinator and parallel validator types; the node runs as a single shard |
 | `qnet-integration` | `development/qnet-integration` | The node itself: the `node/`, `unified_p2p/`, `rpc/` and `storage/` modules, `block_pipeline.rs`, the consensus v2 driver and runtime, `sync_manager.rs`, `registry_lthash.rs`, `reward_epoch.rs`, `activation_validation.rs`, `genesis_constants.rs`, and the `qnet-node` binary |
 | `qnet-loadtest` | `development/qnet-loadtest` | External harness that drives the production transaction path from outside the validators |
 | `qnet-audit` | `audit` | Security and correctness test suite over the core crates |
@@ -228,34 +237,40 @@ Outside the Rust workspace: `applications/qnet-mobile` (the [mobile wallet](../a
 ## Data flow
 
 **Production path.** Slot timer fires → node derives the leadership round from the height and the
-absolute certified failover round → derives the candidate roster and election entropy from macroblock
-N−2 (or from the frozen anchor when finality has stalled) → if it is the leader, checks that it holds
+absolute certified failover round → derives the candidate roster from macroblock N−2 (or from the
+frozen anchor when finality has stalled) and the election entropy from the hash of the chain block at
+height (N−2) × 90 (the genesis block in the first two windows) → if it is the leader, checks that it holds
 the previous block, drains the mempool, applies transactions to a working set, computes merkle and
 state roots, re-checks authority, writes the block, and broadcasts it.
 
 **Ingestion path.** Gossip or sync delivers bytes → `Ingest` enqueues → `Decode` parses the block in
-whichever stored form it arrives in → `Verify` checks the slot-anchored timestamp, the producer's
+whichever stored form it arrives in → `Verify` checks the slot timestamp rule, the producer's
 authority for the claimed round, the producer signature and the hash chain → `Apply` snapshots state,
-applies the block, compares the resulting state root, and either commits or rolls back and signals
-fork recovery → `Notify` updates heights and publishes events.
+applies the block, compares the resulting state root, and either commits, keeping the block's undo
+journal for a shallow reorg, or rolls back and signals fork recovery → `Notify` updates heights and publishes events.
 
 **Finality path.** At a checkpoint boundary the driver proposes or awaits a `Checkpoint` for the
 window → a proposal is refused unless its parent quorum certificate is exactly the receiving node's
-own `high_qc` → committee members reproduce the window content locally and sign only what they
+own `high_qc`; up to three members holding a higher certificate send it to the proposer, and a member
+holding a lower one fetches the certificate the proposal names → committee members reproduce the
+window content locally and sign only what they
 reproduce → votes accumulate into a quorum certificate → the 2-chain rule finalizes the parent → the
 `Finalize` effect re-verifies tip, state root and every body hash → the finality marker ratchets
 forward. At a 90-block boundary the quorum certificate builds a macroblock seal that is held until
 the 2-chain commit reaches its index; on release every committee member writes the macroblock
-locally, and only the proposer broadcasts it.
+locally from the seal inputs that match the certificate's epoch commitment, and only the proposer
+broadcasts it. A member without matching inputs writes nothing and pulls the sealed macroblock through
+sync. When a certified hash list contradicts local bodies, the node signals fork recovery to the height
+below the first contradicted body.
 
 **Failover path.** When a slot goes unfilled past the grace conditions, validated committee members
 broadcast signed timeout votes over a `(window, round, sealed anchor)` tuple. A quorum of same-round
 votes forms a timeout certificate, which is the sole input that advances the highest certified round.
 Leadership then shifts by that round within the same roster.
 
-**Join path.** A cold or lagging node negotiates a snapshot, restores it into staging column families,
-verifies it against the committed roots, promotes it, and then replays the tail through the same block
-pipeline that live gossip uses. See [maintenance](../operators/maintenance.md).
+**Join path.** A cold or lagging node negotiates a snapshot, downloads it chunk by chunk against its
+manifest, restores it into staging column families, verifies it against the committed roots, promotes it,
+and then replays the tail through the same block pipeline that live gossip uses. See [maintenance](../operators/maintenance.md).
 
 ## Where to read next
 

@@ -25,6 +25,7 @@ impl BlockchainNode {
             return Err(QNetError::ValidationError(format!(
                 "gas_limit {} exceeds MAX_GAS_LIMIT {}", tx.gas_limit, qnet_state::gas_limits::MAX_GAS_LIMIT)));
         }
+        crate::node::refuse_held_commitment(&self.state, &tx).await.map_err(QNetError::ValidationError)?;
 
         // ═══════════════════════════════════════════════════════════════════════
         // RPC-PATH TRANSACTION TYPE WHITELIST
@@ -422,13 +423,23 @@ impl BlockchainNode {
     }
 
 
+    /// A contract TX's message without its gas: accepted below the contract-gas gate only.
+    pub(crate) fn legacy_contract_message(tx: &qnet_state::Transaction) -> Option<String> {
+        if !matches!(tx.tx_type, qnet_state::TransactionType::ContractDeploy | qnet_state::TransactionType::ContractCall) {
+            return None;
+        }
+        let msg = Self::build_canonical_verify_message(tx);
+        msg.strip_suffix(&format!(":{}:{}", tx.gas_price, tx.gas_limit)).map(str::to_string)
+    }
+
     /// Build the canonical verify message — MUST byte-match how the
     /// client/RPC signed, or ML-DSA-65/Ed25519 verification fails. Formats
     /// (source of truth; per-arm comments below point at each signer):
     ///   Transfer        transfer:{from}:{to}:{amount}:{nonce}:{gas_price}:{gas}
     ///   BatchTransfers  batch_transfer:{from}:{total}:{count}:{batch_id}
-    ///   ContractDeploy  contract_deploy:{from}:{code_hash}:{nonce}
-    ///   ContractCall    contract_call:{from}:{sha3(raw tx.data calldata)}:{nonce}
+    ///   ContractDeploy  contract_deploy:{from}:{code_hash}:{nonce}:{gas_price}:{gas}
+    ///   ContractCall    contract_call:{from}:{sha3(raw tx.data calldata)}:{nonce}:{gas_price}:{gas}
+    ///   (below the contract-gas gate a contract TX may be signed over the form without its gas)
     ///   Heartbeat/Ping  {from}|{to}|{amount}|{nonce}|{gas_price}|{gas}|{ts}
     ///   RewardClaim     claim_rewards:{node_id}:{wallet}
     /// System/unsigned TXs (emission RewardDistribution, NodeRegistration,
@@ -483,7 +494,7 @@ impl BlockchainNode {
                 } else {
                     String::new()
                 };
-                format!("contract_deploy:{}:{}:{}", tx.from, code_hash, tx.nonce)
+                format!("contract_deploy:{}:{}:{}:{}:{}", tx.from, code_hash, tx.nonce, tx.gas_price, tx.gas_limit)
             }
             
             // ContractCall: contract/method/args ALL live inside tx.data (JSON
@@ -496,7 +507,7 @@ impl BlockchainNode {
             qnet_state::TransactionType::ContractCall => {
                 let data_bytes = tx.data.as_deref().unwrap_or("").as_bytes();
                 let data_hash = format!("{:x}", Sha3_256::digest(data_bytes));
-                format!("contract_call:{}:{}:{}", tx.from, data_hash, tx.nonce)
+                format!("contract_call:{}:{}:{}:{}:{}", tx.from, data_hash, tx.nonce, tx.gas_price, tx.gas_limit)
             }
             
             // system_rewards_pool merkle claims are sig-exempt (authorized by per-proof re-verify
@@ -614,13 +625,13 @@ impl BlockchainNode {
             // sheds under load (client resubmits); block-validation AWAITS its reserved pool so a
             // valid block is never rejected for local busy — the verdict stays pure over TX bytes.
             let tx_owned = tx.clone();
-            let _permit = match lane {
-                VerifyLane::Admission => VALUE_TX_VERIFY_SEM.try_acquire()
-                    .map_err(|_| QNetError::ValidationError("verify_overloaded".to_string()))?,
-                VerifyLane::Block => BLOCK_VERIFY_SEM.acquire().await
-                    .map_err(|_| QNetError::ValidationError("verify_sem_closed".to_string()))?,
+            let (_permit, height) = match lane {
+                VerifyLane::Admission => (VALUE_TX_VERIFY_SEM.try_acquire()
+                    .map_err(|_| QNetError::ValidationError("verify_overloaded".to_string()))?, Self::admission_height()),
+                VerifyLane::Block(h) => (BLOCK_VERIFY_SEM.acquire().await
+                    .map_err(|_| QNetError::ValidationError("verify_sem_closed".to_string()))?, h),
             };
-            return tokio::task::spawn_blocking(move || Self::verify_user_tx_dilithium(&tx_owned))
+            return tokio::task::spawn_blocking(move || Self::verify_user_tx_dilithium_at(&tx_owned, height))
                 .await
                 .map_err(|e| QNetError::ValidationError(format!("verify_join_error: {}", e)));
         }
@@ -742,6 +753,17 @@ impl BlockchainNode {
     /// Wire format (produced by the mobile/ext wallet, signer_id = raw pubkey hex):
     ///   `dilithium_sig_{pk_hex}_{base64([sig_len:4LE][SignedMessage][pk_len:4LE][pk])}`
     pub(crate) fn verify_user_tx_dilithium(tx: &qnet_state::Transaction) -> bool {
+        Self::verify_user_tx_dilithium_at(tx, Self::admission_height())
+    }
+
+    /// The height a TX entering the pool is judged at: the next block.
+    fn admission_height() -> u64 {
+        crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Acquire).saturating_add(1)
+    }
+
+    /// `verify_user_tx_dilithium` for a TX in the block at `height`: below the contract-gas gate a contract TX
+    /// may also carry a signature over the form without its gas.
+    pub(crate) fn verify_user_tx_dilithium_at(tx: &qnet_state::Transaction, height: u64) -> bool {
         // FIX-5: RAW detached ML-DSA-65 verify. The pk is present on the TX because ingest REHYDRATES
         // an elided pk from committed account state BEFORE verify (rehydrate_elided_pk); a value TX
         // whose account has no committed pk and carries none stays pk-less → rejected here.
@@ -749,9 +771,16 @@ impl BlockchainNode {
             (Some(s), Some(p)) if s.len() == 3309 && p.len() == 1952 => (s, p),
             _ => return false,
         };
+        if Self::verify_user_tx_dilithium_msg(tx, sig, pk, &Self::build_canonical_verify_message(tx)) {
+            return true;
+        }
+        !qnet_state::feature_gates::is_active(qnet_state::feature_gates::id::CONTRACT_GAS_SIGNED, height)
+            && Self::legacy_contract_message(tx).map_or(false, |m| Self::verify_user_tx_dilithium_msg(tx, sig, pk, &m))
+    }
+
+    fn verify_user_tx_dilithium_msg(tx: &qnet_state::Transaction, sig: &[u8], pk: &[u8], msg: &str) -> bool {
         // Verify-result memo (positive-only): key binds sig+pk+preimage+from — folding `from` keeps an
         // elided-then-rehydrated memo sender-bound; never tx.hash (sig-unbound → forgeable).
-        let msg = Self::build_canonical_verify_message(tx);
         let key: [u8; 32] = {
             use sha3::{Digest, Sha3_256};
             let mut h = Sha3_256::new();
@@ -762,7 +791,7 @@ impl BlockchainNode {
             h.finalize().into()
         };
         if VALUE_VERIFY_CACHE.contains_key(&key) { return true; }
-        let ok = Self::verify_user_tx_dilithium_inner(tx, sig, pk, &msg);
+        let ok = Self::verify_user_tx_dilithium_inner(tx, sig, pk, msg);
         if ok { value_verify_cache_put(key); }
         ok
     }
@@ -917,7 +946,7 @@ impl BlockchainNode {
     /// verify_dilithium_tx_signature_async on both paths; THIS fn enforces (a) the PRESENCE of that
     /// signature for node-signed system TXs that carry no alternate authenticator, and (b) the
     /// signer↔credited-identity binds that keep apply's per-account keying honest:
-    ///   - LightNodeEligibilityBitmap: signer == genesis_id       (no cross-shard bitmap hijack)
+    ///   - LightNodeEligibilityBitmap: signer owns the shard genesis_id names (no cross-shard hijack)
     ///   - PingCommitmentWithSampling:  signer == from            (apply dedups on `from`)
     ///   - Heartbeat:                   from == node_id == signer  (apply keys liveness on `from`
     ///                                  while the sig binds node_id — decoupling forges a dead node's
@@ -1466,11 +1495,10 @@ impl BlockchainNode {
         let mut by_pair: std::collections::BTreeMap<(u64, u64), Vec<(String, String)>> = std::collections::BTreeMap::new();
         let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
-        // Resolve endpoints first (pure local lookups), then query in BOUNDED-CONCURRENCY batches.
-        // The loop used to be strictly serial with a 30 s per-request timeout: at the 1000-member target
-        // committee a single slow member could push the whole collection past the 2-epoch attestation
-        // validity window, so onboarding could never complete at scale. Order-independent — the quorum is
-        // a set — so batching changes nothing except wall-clock.
+        // Resolve endpoints first (pure local lookups), then query through a BOUNDED-CONCURRENCY window.
+        // With a 1000-member committee and a 30 s per-request timeout, serial or batch-at-a-time
+        // collection lets slow members push it past the 2-epoch attestation validity window. Order-
+        // independent — the quorum is a set — so the window changes nothing except wall-clock.
         let targets: Vec<(String, String)> = committee.iter().filter_map(|member_id| {
             let ip = crate::genesis_constants::get_node_endpoint_ip(member_id)
                 .or_else(|| storage.load_node_endpoint(member_id).ok().flatten()
@@ -1485,19 +1513,21 @@ impl BlockchainNode {
         let unresolved = committee.len().saturating_sub(targets.len());
 
         const ATTEST_FANOUT: usize = 32;
-        'outer: for chunk in targets.chunks(ATTEST_FANOUT) {
-            let calls = chunk.iter().map(|(member_id, url)| {
+        use futures::stream::StreamExt;
+        // One sliding window of ATTEST_FANOUT requests, each slot refilled as its reply lands: a slow
+        // member holds one slot instead of stalling every later member, and the quorum break returns at
+        // the need-th agreeing signature, dropping the requests still in flight.
+        'outer: {
+            let mut calls = futures::stream::iter(targets.iter().cloned()).map(|(member_id, url)| {
                 let client = client.clone();
                 let body = body.clone();
-                let member_id = member_id.clone();
-                let url = url.clone();
                 async move {
                     let resp = client.post(&url).json(&body).send().await.ok()?;
                     let json: serde_json::Value = resp.json().await.ok()?;
                     Some((member_id, json))
                 }
-            });
-            for out in futures::future::join_all(calls).await {
+            }).buffer_unordered(ATTEST_FANOUT);
+            while let Some(out) = calls.next().await {
                 let (member_id, json) = match out { Some(x) => x, None => continue };
                 let result = match json.get("result") {
                     Some(r) => r,
@@ -1564,6 +1594,8 @@ impl BlockchainNode {
             return Err(QNetError::ValidationError(format!(
                 "gas_limit {} exceeds MAX_GAS_LIMIT {}", tx.gas_limit, qnet_state::gas_limits::MAX_GAS_LIMIT)));
         }
+        // Before the rate limiter and every verify: a commitment the state holds costs nothing further.
+        crate::node::refuse_held_commitment(&self.state, &tx).await.map_err(QNetError::ValidationError)?;
 
         // v32.12: gossip-side activation admission rate limit. NodeRegistration
         // and NodeActivation TXs trigger heavy block-include + state-apply paths.
@@ -1807,20 +1839,6 @@ impl BlockchainNode {
                     return Err(QNetError::ValidationError("Invalid Dilithium signature on commitment TX".to_string()));
                 }
 
-                // P2: bind the bitmap's self-declared genesis_id to the AUTHENTICATED signer. The
-                // Dilithium verify above already proved the signer is a genesis PK (anti-squat); this
-                // also forbids one genesis emitting a bitmap for ANOTHER's shard (genesis_id != signer
-                // → cross-shard reward hijack / denial-of-commit). Genuine bitmaps set
-                // dilithium_public_key = node_id = genesis_id, so they pass.
-                if let qnet_state::TransactionType::LightNodeEligibilityBitmap { genesis_id, .. } = &tx.tx_type {
-                    if tx.dilithium_public_key.as_deref() != Some(genesis_id.as_bytes()) {
-                        return Err(QNetError::ValidationError(format!(
-                            "LightNodeEligibilityBitmap genesis_id={} != signer={:?} (cross-shard forbidden)",
-                            genesis_id, tx.dilithium_public_key
-                        )));
-                    }
-                }
-
                 if is_info() {
                     println!("[INFO][VERIFY] commitment_tx_pq_verified type={:?}",
                              std::mem::discriminant(&tx.tx_type));
@@ -1933,32 +1951,6 @@ impl BlockchainNode {
             qnet_state::TransactionType::EquivocationProof { .. } |
             qnet_state::TransactionType::VoteEquivocationProof { .. }
         );
-        
-        // PROTOCOL: State-level dedup check for commitment TXs (prevents duplicate per node per epoch)
-        if skip_nonce_check {
-            let state = self.state.read().await;
-            let epoch_interval: u64 = 14400;
-            let is_duplicate = match &tx.tx_type {
-                qnet_state::TransactionType::HeartbeatCommitment { node_id, window_start_height, .. } => {
-                    state.is_epoch_committed("heartbeat", node_id, window_start_height / epoch_interval)
-                }
-                qnet_state::TransactionType::PingCommitmentWithSampling { window_start_height, .. } => {
-                    state.is_epoch_committed("ping", &tx.from, window_start_height / epoch_interval)
-                }
-                qnet_state::TransactionType::LightNodeEligibilityBitmap { genesis_id, epoch, .. } => {
-                    state.is_epoch_committed("bitmap", genesis_id, *epoch)
-                }
-                qnet_state::TransactionType::NodeRegistration { node_id, .. } => {
-                    state.is_node_registered(node_id)
-                }
-                _ => false, // RewardDistribution / NodeActivation — no epoch dedup
-            };
-            if is_duplicate {
-                return Err(QNetError::ValidationError(
-                    format!("duplicate commitment TX: already committed for this epoch hash={}", qnet_state::char_prefix(&tx.hash, 16))
-                ));
-            }
-        }
         
         if !skip_nonce_check {
             let state = self.state.read().await;

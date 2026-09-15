@@ -6,6 +6,7 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import messaging from '@react-native-firebase/messaging';
 import BackgroundFetch from 'react-native-background-fetch';
+import { AppState, Platform } from 'react-native';
 // v3.35: Centralized node configuration (no duplication!)
 import { GENESIS_NODES, getRandomGenesisNode, lightShardOwnerUrls } from '../config/nodes';
 
@@ -59,6 +60,41 @@ function getRandomBootstrapNode() {
   }
   getRandomBootstrapNodeAsync().catch(() => {}); // warm snapshot for subsequent calls
   return getRandomGenesisNode();
+}
+
+// RN fetch has no timeout of its own: an unreachable node would hold a call for the OS TCP timeout, past
+// the ~30 s iOS gives a background wake. Every network call in this module goes through this cap.
+function fetchWithTimeout(url, opts = {}, ms = 8000) {
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), Math.max(0, ms));
+  return fetch(url, { ...opts, signal: ctl.signal }).finally(() => clearTimeout(t));
+}
+
+// The promise's value, or `onTimeout` once `deadline` passes first; the promise itself runs on.
+function untilDeadline(promise, deadline, onTimeout) {
+  let timer;
+  const expiry = new Promise((resolve) => { timer = setTimeout(() => resolve(onTimeout), Math.max(0, deadline - Date.now())); });
+  return Promise.race([promise, expiry]).finally(() => clearTimeout(timer));
+}
+
+const _selfAttestRounds = new Map(); // node id -> { force, promise } of the round in flight
+const _pingLanes = new Map();        // node id -> settles when the last queued answer for it is done
+
+// One ping-response POST at a time per node, whichever path sends it. A queued answer gives up (false) once its
+// own deadline leaves less than SELF_ATTEST_MIN_POST_MS; one that gives up keeps its place in the queue.
+async function inPingLane(nodeId, deadline, answer) {
+  const before = _pingLanes.get(nodeId);
+  let release;
+  const mine = new Promise((resolve) => { release = resolve; });
+  const tail = before ? before.then(() => mine) : mine;
+  _pingLanes.set(nodeId, tail);
+  try {
+    if (before && !(await untilDeadline(before.then(() => true), deadline - SELF_ATTEST_MIN_POST_MS, false))) return false;
+    return await answer();
+  } finally {
+    release();
+    if (_pingLanes.get(nodeId) === tail) _pingLanes.delete(nodeId);
+  }
 }
 
 /**
@@ -139,11 +175,11 @@ export async function registerLightNode(nodeId, walletAddress, quantumPubkey, qu
 
   try {
     console.log('[Push] registering light node wallet=...' + (registrationData.wallet_address || '').slice(-8));
-    const response = await fetch(`${targetUrl}/api/v1/light-node/register`, {
+    const response = await fetchWithTimeout(`${targetUrl}/api/v1/light-node/register`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(registrationData),
-    });
+    }, 15000);
 
     const result = await response.json();
 
@@ -165,9 +201,11 @@ export async function registerLightNode(nodeId, walletAddress, quantumPubkey, qu
         ]);
       }
 
-      // Setup polling if needed
+      // Every push type gets the periodic self-attest; polling phones also get the precise ping wake.
       if (pushProvider.type === PushType.POLLING) {
         await setupPollingService(result.node_id, result.next_ping_time);
+      } else {
+        await configureBackgroundFetch();
       }
 
       console.log('[Push] ✅ Light node registered:', result.node_id, 'push:', pushProvider.type);
@@ -196,8 +234,69 @@ async function getDeviceId() {
 }
 
 /**
- * Setup polling service for F-Droid users without UnifiedPush
- * ENERGY EFFICIENT: Only wakes up ~2 minutes before scheduled ping (once per 4h window)
+ * The one background-wake handler, live and headless (index.js): any wake self-attests (deduped per
+ * epoch); a polling phone near its ping slot also pulls the pending challenge. Always finishes the task.
+ */
+export async function onBackgroundFetch(taskId) {
+  // Everything this wake sends shares one deadline inside the ~30 s iOS gives a background fetch.
+  const deadline = Date.now() + WAKE_FETCH_MS;
+  try {
+    console.log('[BackgroundFetch] Task triggered:', taskId);
+    await selfAttestIfNeeded(undefined, false, deadline);
+
+    const nodeInfoStr = await AsyncStorage.getItem('qnet_light_node_info');
+    const nodeInfo = nodeInfoStr ? JSON.parse(nodeInfoStr) : null;
+    if (nodeInfo && nodeInfo.pushType === PushType.POLLING) {
+      // Only within [-180, +300] s of the ping time, so periodic wakes cost no challenge call.
+      const timeToPing = (nodeInfo.nextPingTime || 0) - Math.floor(Date.now() / 1000);
+      if (timeToPing <= 300 && timeToPing >= -180) {
+        await checkPendingChallenge(deadline);
+      }
+    }
+  } catch (error) {
+    console.warn('[BackgroundFetch] Task failed:', error.message || error);
+  } finally {
+    BackgroundFetch.finish(taskId);
+  }
+}
+
+/**
+ * Periodic wake for every push type: 30 min leaves several tries per 14,400-block epoch when the OS defers
+ * some. From block 1,339,200 a wake sends no self-attestation for up to 2 hours after one (see
+ * holdSelfAttest); a later wake in the same epoch costs one /height read, which re-arms the hold. A polling
+ * phone within [-180, +300] s of its ping time still pulls the pending challenge.
+ */
+async function configureBackgroundFetch() {
+  try {
+    // stopOnTerminate, startOnBoot and enableHeadless are Android options. On iOS the wake is a
+    // BGAppRefreshTask: the OS picks the time (at least 15 minutes apart) and never wakes a force-quit app.
+    const status = await BackgroundFetch.configure({
+      minimumFetchInterval: 30,
+      stopOnTerminate: false,
+      startOnBoot: true,
+      enableHeadless: true,
+    }, onBackgroundFetch, (taskId) => {
+      console.log('[BackgroundFetch] Task timeout:', taskId);
+      BackgroundFetch.finish(taskId);
+    });
+    await recordBackgroundRefreshStatus(status);
+  } catch (error) {
+    // iOS rejects with the Background App Refresh status itself: 0 restricted, 1 turned off.
+    if (typeof error === 'number') await recordBackgroundRefreshStatus(error);
+    console.warn('[BackgroundFetch] Configure failed:', (error && error.message) || error);
+  }
+}
+
+// The last Background App Refresh status configure reported (2 = available), read by the node tab.
+export const BG_REFRESH_STATUS_KEY = 'qnet_bg_refresh_status';
+async function recordBackgroundRefreshStatus(status) {
+  if (typeof status !== 'number') return;
+  try { await AsyncStorage.setItem(BG_REFRESH_STATUS_KEY, String(status)); } catch (_) { /* best effort */ }
+}
+
+/**
+ * Polling phones (no FCM, no UnifiedPush): the periodic wake, and on Android a precise one-shot wake ~2
+ * minutes before the ping slot.
  */
 async function setupPollingService(nodeId, nextPingTime) {
   // Calculate when to check (2 minutes before expected ping)
@@ -209,58 +308,21 @@ async function setupPollingService(nodeId, nextPingTime) {
   console.log('[Polling] Scheduling wake-up in', Math.round(delaySeconds / 60), 'minutes');
 
   try {
-    // IMPORTANT: We use scheduleTask for PRECISE timing, not periodic fetch
-    // This ensures app wakes up ONLY when needed (~once per 4 hours)
-    
-    // First, configure BackgroundFetch handler (required for scheduleTask to work)
-    // NOTE: minimumFetchInterval is set high to prevent unnecessary periodic wakes
-    await BackgroundFetch.configure({
-      minimumFetchInterval: 240, // 4 hours - matches ping window, prevents extra wakes
-      stopOnTerminate: false,
-      startOnBoot: true,
-      enableHeadless: true,
-    }, async (taskId) => {
-      // This handler is called for BOTH periodic and scheduled tasks
-      console.log('[Polling] Background task triggered:', taskId);
+    // Configured first: the one-shot wake is delivered to the same handler as the periodic fetch.
+    await configureBackgroundFetch();
 
-      // PULL: any background wake proves this-epoch liveness (deduped per epoch, so ~1 real call/4h).
-      await selfAttestIfNeeded();
-
-      // Check if we're near our ping time (within 5 minutes)
-      const nodeInfoStr = await AsyncStorage.getItem('qnet_light_node_info');
-      if (nodeInfoStr) {
-        const nodeInfo = JSON.parse(nodeInfoStr);
-        const currentTime = Math.floor(Date.now() / 1000);
-        const pingTime = nodeInfo.nextPingTime || 0;
-        const timeToPing = pingTime - currentTime;
-
-        // Only check challenge if we're within 5 minutes of ping time
-        // This prevents wasted API calls from periodic background fetches
-        if (timeToPing <= 300 && timeToPing >= -180) {
-          console.log('[Polling] Within ping window, checking challenge...');
-          await checkPendingChallenge();
-        } else {
-          console.log('[Polling] Not in ping window (', timeToPing, 'sec to ping), skipping');
-        }
-      }
-
-      BackgroundFetch.finish(taskId);
-    }, (taskId) => {
-      console.log('[Polling] Task timeout:', taskId);
-      BackgroundFetch.finish(taskId);
-    });
-
-    // Schedule PRECISE wake-up for this ping
-    // This is the PRIMARY mechanism - wakes app exactly when needed
-    await BackgroundFetch.scheduleTask({
-      taskId: 'qnet-ping-check',
-      delay: delaySeconds * 1000,
-      periodic: false, // One-time task - will reschedule after ping
-      forceAlarmManager: true, // Use AlarmManager for precise timing
-      enableHeadless: true,
-    });
-
-    console.log('[Polling] ✅ Scheduled precise wake-up for ping');
+    // Android: a precise one-shot wake for this ping (AlarmManager). iOS has no precise wake: a polling
+    // iPhone relies on the periodic wake and on opening the app.
+    if (Platform.OS === 'android') {
+      await BackgroundFetch.scheduleTask({
+        taskId: 'qnet-ping-check',
+        delay: delaySeconds * 1000,
+        periodic: false, // One-time task - will reschedule after ping
+        forceAlarmManager: true, // Use AlarmManager for precise timing
+        enableHeadless: true,
+      });
+      console.log('[Polling] ✅ Scheduled precise wake-up for ping');
+    }
   } catch (error) {
     console.warn('[Polling] Failed to setup background fetch:', error.message || error);
   }
@@ -269,8 +331,9 @@ async function setupPollingService(nodeId, nextPingTime) {
 /**
  * Check for pending challenge (polling mode)
  */
-export async function checkPendingChallenge() {
+export async function checkPendingChallenge(deadline = Date.now() + WAKE_FETCH_MS) {
   try {
+    if (deadline - Date.now() < SELF_ATTEST_MIN_POST_MS) return null;
     const nodeInfoStr = await AsyncStorage.getItem('qnet_light_node_info');
     if (!nodeInfoStr) {
       console.log('[Polling] No node registered');
@@ -280,9 +343,9 @@ export async function checkPendingChallenge() {
     const nodeInfo = JSON.parse(nodeInfoStr);
     const apiUrl = getRandomBootstrapNode();
 
-    const response = await fetch(
+    const response = await fetchWithTimeout(
       `${apiUrl}/api/v1/light-node/pending-challenge?node_id=${encodeURIComponent(nodeInfo.nodeId)}`,
-      { method: 'GET' }
+      { method: 'GET' }, Math.min(6000, deadline - Date.now())
     );
 
     const result = await response.json();
@@ -294,7 +357,7 @@ export async function checkPendingChallenge() {
       // own seed, so any other node rejects it as unrecognized — and with 5 bootstrap nodes an
       // independent second draw matched only 1 time in 5. The push and self-attest paths already
       // pass their URL through; this one dropped it.
-      await respondToChallenge(nodeInfo.nodeId, result.challenge, apiUrl);
+      await respondToChallenge(nodeInfo.nodeId, result.challenge, apiUrl, deadline);
       
       return result;
     } else if (result.next_ping_time) {
@@ -320,9 +383,9 @@ export async function getNextPingTime() {
     const nodeInfo = JSON.parse(nodeInfoStr);
     const apiUrl = getRandomBootstrapNode();
 
-    const response = await fetch(
+    const response = await fetchWithTimeout(
       `${apiUrl}/api/v1/light-node/next-ping?node_id=${encodeURIComponent(nodeInfo.nodeId)}`,
-      { method: 'GET' }
+      { method: 'GET' }, 5000
     );
 
     const result = await response.json();
@@ -347,15 +410,29 @@ export async function getNextPingTime() {
  * Respond to ping challenge (sign and send)
  * MANDATORY: Dilithium3 (ML-DSA-65) quantum signature — no Ed25519 fallback
  */
-export async function respondToChallenge(nodeId, challenge, responseUrl) {
+export async function respondToChallenge(nodeId, challenge, responseUrl, deadline = Date.now() + RESPONSE_MS) {
   try {
-      const Keychain = require('react-native-keychain');
+    const pingNodeId = nodeId || await AsyncStorage.getItem('qnet_ping_node_id');
+    if (!pingNodeId) {
+      console.warn('[Push] Dilithium3 ping key unavailable — ping missed (will retry next window)');
+      return false;
+    }
+    // One answer at a time per node, whichever path sends it; the wait comes out of this caller's deadline.
+    return await inPingLane(pingNodeId, deadline, () => answerChallenge(pingNodeId, challenge, responseUrl, deadline));
+  } catch (error) {
+    console.warn('[Push] Error responding to challenge:', error.message || error);
+    return false;
+  }
+}
+
+async function answerChallenge(pingNodeId, challenge, responseUrl, deadline) {
+  try {
+    const Keychain = require('react-native-keychain');
 
     // ── PATH A: ML-DSA-65 ping delegation key (v7.1) — background-safe ──────
     // Loads ML-DSA-65 ping secret key from Keychain (AFTER_FIRST_UNLOCK).
     // No password needed. Full quantum safety for ping responses.
-    const pingNodeId = nodeId || await AsyncStorage.getItem('qnet_ping_node_id');
-    if (pingNodeId) {
+    {
       try {
         const keychainEntry = await Keychain.getGenericPassword({
           service: `qnet_ping_sk_${pingNodeId}`,
@@ -375,7 +452,10 @@ export async function respondToChallenge(nodeId, challenge, responseUrl) {
               const identityPk = await AsyncStorage.getItem(`qnet_identity_pk_${pingNodeId}`);
 
               const apiUrl = responseUrl || await getRandomBootstrapNodeAsync();
-              const response = await fetch(
+              // Capped after the Keychain read and the signing, which take their own share of the wake.
+              const timeoutMs = Math.min(RESPONSE_MS, deadline - Date.now());
+              if (timeoutMs < SELF_ATTEST_MIN_POST_MS) return false;
+              const response = await fetchWithTimeout(
                 `${apiUrl}/api/v1/light-node/ping-response`,
                 {
                   method: 'POST',
@@ -388,12 +468,14 @@ export async function respondToChallenge(nodeId, challenge, responseUrl) {
                     ...(pingCert ? { ping_delegation_cert: pingCert } : {}),
                     ...(identityPk ? { identity_pubkey: identityPk } : {}),
                   }),
-                }
+                },
+                timeoutMs
               );
               const result = await response.json();
               if (result.success) {
                 console.log('[Push] ✅ Ping response sent (Dilithium3 delegation, quantum-safe)');
-                await getNextPingTime();
+                // Not awaited: a background wake spends its time on the proof, not on the display refresh.
+                getNextPingTime().catch(() => {});
                 return true;
               }
               console.warn('[Push] Dilithium3 delegation ping rejected:', result.error);
@@ -418,35 +500,97 @@ export async function respondToChallenge(nodeId, challenge, responseUrl) {
   }
 }
 
+const SELF_ATTEST_HOLD_KEY = 'qnet_self_attest_hold';
+// From this height a block is never stamped ahead of the wall clock, so an epoch cannot end sooner than
+// one second per block still left in it.
+const WALL_CLOCK_BOUND_HEIGHT = 1339200;
+
+// No hold outlasts this: the node that answered the height may lag the chain, and a device clock can move.
+const SELF_ATTEST_MAX_HOLD_MS = 2 * 3600000;
+
+// After an attestation: hold until the epoch can have ended, counted from when the height was read and
+// only where that bound holds. After a failure: back off 30 minutes, doubling, so a refused device does
+// not re-sign on every wake. Either way at most SELF_ATTEST_MAX_HOLD_MS.
+async function holdSelfAttest(nodeId, height, ok, readAt) {
+  try {
+    const prev = JSON.parse((await AsyncStorage.getItem(SELF_ATTEST_HOLD_KEY)) || 'null');
+    const failures = ok ? 0 : ((prev && prev.nodeId === nodeId && prev.failures) || 0) + 1;
+    const until = ok
+      ? (height >= WALL_CLOCK_BOUND_HEIGHT ? readAt + Math.min((14400 - (height % 14400)) * 1000, SELF_ATTEST_MAX_HOLD_MS) : 0)
+      : Date.now() + Math.min(30 * 60000 * Math.pow(2, failures - 1), SELF_ATTEST_MAX_HOLD_MS);
+    await AsyncStorage.setItem(SELF_ATTEST_HOLD_KEY, JSON.stringify({ nodeId, at: Date.now(), until, failures }));
+  } catch (_) { /* best effort */ }
+}
+
+// A background wake gets about 30 s on iOS (25 s for a push handled by React Native Firebase). Each wake sets
+// one deadline inside that for everything it sends; a self-attest round also stays within its own budget,
+// each request capped inside it.
+const WAKE_FETCH_MS = 25000;
+const WAKE_PUSH_MS = 22000;
+const RESPONSE_MS = 8000;
+const SELF_ATTEST_BUDGET_MS = 20000;
+const SELF_ATTEST_CALL_MS = 6000;
+const SELF_ATTEST_MIN_POST_MS = 2000; // no answer is started with less time than this left
+
 /**
  * PULL self-attestation: sign a fresh same-epoch block hash and submit through the standard
  * ping-response endpoint (challenge = "selfattest:{height}:{hash}"). Proves this-epoch liveness
- * on ANY wakeup (push, background fetch, app open) — no dependency on FCM delivery.
- * Deduped per epoch locally; the node dedupes per epoch too.
+ * on ANY wakeup (push, background fetch, app open or return) — no dependency on FCM delivery.
+ * Deduped per epoch locally; the node dedupes per epoch too. Rounds are per node: concurrent callers (a push
+ * launch also mounts the app) share one, each within its own deadline; "I'm Back" (force) reruns only behind
+ * a round that did not attest.
  */
-export async function selfAttestIfNeeded(nodeId, force = false) {
+export async function selfAttestIfNeeded(nodeId, force = false, wakeDeadline = undefined) {
+  const deadline = Math.min(Date.now() + SELF_ATTEST_BUDGET_MS, wakeDeadline || Infinity);
+  const id = nodeId || await AsyncStorage.getItem('qnet_ping_node_id');
+  if (!id) return false;
+  for (let running = _selfAttestRounds.get(id); running; running = _selfAttestRounds.get(id)) {
+    const r = await untilDeadline(running.promise, deadline, null);
+    if (r === null) return false;               // this caller's deadline came first; the round runs on
+    if (r || !force || running.force) return r; // only a forced caller behind a round that did not attest goes on
+  }
+  const round = { force, promise: null };
+  round.promise = runSelfAttest(id, force, deadline)
+    .finally(() => { if (_selfAttestRounds.get(id) === round) _selfAttestRounds.delete(id); });
+  _selfAttestRounds.set(id, round);
+  return round.promise;
+}
+
+async function runSelfAttest(nodeId, force, deadline) {
+  const cap = () => Math.min(SELF_ATTEST_CALL_MS, deadline - Date.now());
+  const callDeadline = () => Math.min(deadline, Date.now() + SELF_ATTEST_CALL_MS);
   try {
     const pingNodeId = nodeId || await AsyncStorage.getItem('qnet_ping_node_id');
     if (!pingNodeId) return false;
+    // No request while the attested epoch cannot have ended, or while a failed attempt backs off. A hold
+    // written before the clock moved back, or longer than any hold is written for, is void.
+    const hold = force ? null : JSON.parse((await AsyncStorage.getItem(SELF_ATTEST_HOLD_KEY)) || 'null');
+    const now = Date.now();
+    if (hold && hold.nodeId === pingNodeId && now < hold.until && now >= (hold.at || 0)
+        && hold.until - now <= SELF_ATTEST_MAX_HOLD_MS) return false;
     const apiUrl = await getRandomBootstrapNodeAsync();
-    const hr = await fetch(`${apiUrl}/api/v1/height`);
+    const hr = await fetchWithTimeout(`${apiUrl}/api/v1/height`, {}, cap());
     const { height } = await hr.json();
+    const readAt = Date.now();
     if (!height || height < 3) return false;
     const epoch = Math.floor(height / 14400);
     const last = await AsyncStorage.getItem('qnet_last_self_attest_epoch');
     // force = user pressed "I'm Back" — re-attest even if already done this epoch (B: attestation IS reactivation).
-    if (!force && last !== null && parseInt(last, 10) === epoch) return false;
+    if (!force && last !== null && parseInt(last, 10) === epoch) {
+      await holdSelfAttest(pingNodeId, height, true, readAt);
+      return false;
+    }
     // Registration gate: don't attest before the node's on-chain key is committed — a ping is only
     // accepted once load_vrf_public_key(node_id) is present (else rejected no_onchain_key /
     // ping_dilithium_node_not_found). onChainRegistered mirrors that exact server condition and is
     // node-independent (a committed key is uniform across storage), unlike RAM-registry presence.
     // Skip ONLY on a DEFINITIVE on-chain false; proceed when true, when the field is absent (older
     // node — preserve prior behavior) or on a transient error, so a live node never misses its window.
-    const reg = await checkNodeStatus();
+    const reg = await checkNodeStatus({ timeoutMs: cap(), withHeight: false });
     if (reg && reg.onChainRegistered === false) return false;
     // Canonical hash of block `anchor` = previous_hash of block anchor+1 (the chain link).
     const anchor = height - 2;
-    const br = await fetch(`${apiUrl}/api/v1/microblock/${anchor + 1}`);
+    const br = await fetchWithTimeout(`${apiUrl}/api/v1/microblock/${anchor + 1}`, {}, cap());
     const block = await br.json();
     if (!Array.isArray(block?.previous_hash)) return false;
     // Server-supplied bytes: reject any non-integer / out-of-[0,255] element so a
@@ -462,14 +606,16 @@ export async function selfAttestIfNeeded(nodeId, force = false) {
     const challenge = `selfattest:${anchor}:${hash}`;
     let ok = false;
     for (const ownerUrl of lightShardOwnerUrls(pingNodeId)) {
-      if (await respondToChallenge(pingNodeId, challenge, ownerUrl)) { ok = true; break; }
+      if (cap() < SELF_ATTEST_MIN_POST_MS) break;
+      if (await respondToChallenge(pingNodeId, challenge, ownerUrl, callDeadline())) { ok = true; break; }
     }
     // Last resort: the node we already know answers. Better a relayed attestation than none.
-    if (!ok) ok = await respondToChallenge(pingNodeId, challenge, apiUrl);
+    if (!ok && cap() >= SELF_ATTEST_MIN_POST_MS) ok = await respondToChallenge(pingNodeId, challenge, apiUrl, callDeadline());
     if (ok) {
       await AsyncStorage.setItem('qnet_last_self_attest_epoch', String(epoch));
       console.log('[SelfAttest] ✅ Attested for epoch', epoch);
     }
+    await holdSelfAttest(pingNodeId, height, ok, readAt);
     return ok;
   } catch (error) {
     console.warn('[SelfAttest] failed:', error.message || error);
@@ -502,6 +648,7 @@ export async function teardownLightNode() {
       'qnet_light_node_info',
       'qnet_ping_node_id',
       'qnet_last_self_attest_epoch',
+      SELF_ATTEST_HOLD_KEY,
     ]);
     console.log('[LightNode] teardown complete: attestation stopped, ping key wiped');
   } catch (error) {
@@ -513,12 +660,17 @@ export async function teardownLightNode() {
  * Handle incoming push message (FCM or UnifiedPush)
  */
 export async function handlePushMessage(data) {
+  // The answer and a fallback self-attest share one deadline inside the 25 s a background push gets.
+  const deadline = Date.now() + WAKE_PUSH_MS;
   if (data?.action === 'ping_response' && data?.challenge && data?.node_id) {
     console.log('[Push] 📥 Ping received:', data.node_id, 'from:', data.response_url || 'random');
-    return await respondToChallenge(data.node_id, data.challenge, data.response_url);
+    const ok = await respondToChallenge(data.node_id, data.challenge, data.response_url,
+                                        Math.min(deadline, Date.now() + RESPONSE_MS));
+    // A late (expired stamp) or refused ping still leaves this epoch provable by a self-attest.
+    return ok || await selfAttestIfNeeded(data.node_id, false, deadline);
   }
   // Any other wakeup still proves liveness for this epoch.
-  return await selfAttestIfNeeded(data?.node_id);
+  return await selfAttestIfNeeded(data?.node_id, false, deadline);
 }
 
 /**
@@ -542,7 +694,10 @@ export async function setUnifiedPushEndpoint(endpoint) {
  * Check Light node status. B: needs_reactivation is derived on-chain (committed attestation recency),
  * node-independent — a single fetch to ANY node is authoritative (no fan-out / optimistic window).
  */
-export async function checkNodeStatus() {
+export async function checkNodeStatus({ timeoutMs = 6000, withHeight = true } = {}) {
+  // The server's verdict only when the reply carries one: a rate-limit or error reply has no field, and
+  // reading it as false would claim the chain has no such node.
+  const onChainOf = (r) => ((r && typeof r.onchain_registered === 'boolean') ? r.onchain_registered : null);
   try {
     const nodeInfoStr = await AsyncStorage.getItem('qnet_light_node_info');
     if (!nodeInfoStr) {
@@ -557,38 +712,34 @@ export async function checkNodeStatus() {
     // relaunch before nodes are up) would hang this call for the OS TCP timeout, sticking the UI on
     // "Checking…"/"Connecting…" indefinitely. Abort each request on a short budget so the status
     // resolves fast (and falls to the error branch → the Activate button stays actionable).
-    const fetchT = (url, ms) => {
-      const ctl = new AbortController();
-      const t = setTimeout(() => ctl.abort(), ms);
-      return fetch(url, { method: 'GET', signal: ctl.signal }).finally(() => clearTimeout(t));
-    };
-
     let result = null;
     let fetchErr = null;
     try {
-      const r = await fetchT(`${apiUrl}/api/v1/light-node/status?node_id=${encodeURIComponent(nodeId)}`, 6000);
+      const r = await fetchWithTimeout(`${apiUrl}/api/v1/light-node/status?node_id=${encodeURIComponent(nodeId)}`, { method: 'GET' }, timeoutMs);
       result = await r.json();
     } catch (e) { fetchErr = e; }
 
-    // Block height for the "Next Rewards" display (secondary — shorter budget).
+    // Block height for the "Next Rewards" display (secondary — shorter budget; the attest path skips it).
     let currentBlockHeight = 0;
-    try {
-      const heightResp = await fetchT(`${apiUrl}/api/v1/status`, 4000);
-      if (heightResp.ok) {
-        const heightData = await heightResp.json();
-        currentBlockHeight = heightData.height || heightData.current_height || 0;
-      }
-    } catch (_) {}
+    if (withHeight) {
+      try {
+        const heightResp = await fetchWithTimeout(`${apiUrl}/api/v1/status`, { method: 'GET' }, 4000);
+        if (heightResp.ok) {
+          const heightData = await heightResp.json();
+          currentBlockHeight = heightData.height || heightData.current_height || 0;
+        }
+      } catch (_) {}
+    }
 
     if (!result || !result.success) {
       // Distinguish a transport failure (result null) from a real success:false verdict: on a network hiccup
       // return a TRUTHY error so the UI shows the neutral 'Checking…' state, never a false 'Not Activated'.
       // onChainRegistered must stay UNKNOWN (null) on a transient failure — a definitive `false` here makes
       // selfAttestIfNeeded's `onChainRegistered === false` gate SKIP the epoch attestation on a mere network
-      // hiccup (a live node would miss its window). Emit a real boolean ONLY when the server actually replied.
+      // hiccup (a live node would miss its window). Emit a real boolean ONLY when the reply carries the field.
       return { registered: false,
                error: result ? result.error : ((fetchErr && (fetchErr.message || 'unreachable')) || 'unreachable'),
-               onChainRegistered: result ? !!result.onchain_registered : null, currentBlockHeight };
+               onChainRegistered: onChainOf(result), currentBlockHeight };
     }
 
     const needsReactivation = result.needs_reactivation === true;
@@ -606,7 +757,7 @@ export async function checkNodeStatus() {
       nextPingWindow: result.next_ping_window,
       needsReactivation,
       currentBlockHeight,
-      onChainRegistered: !!result.onchain_registered,
+      onChainRegistered: onChainOf(result),
     };
   } catch (error) {
     console.warn('[Push] Status check failed:', error.message || error);
@@ -680,26 +831,34 @@ export async function refreshFcmTokenOnServer(nodeId) {
     const dilithiumSig = await signWithDilithium(message, pingSkHex, pingPkHex, nodeId);
     const signatureStr = `ping_dilithium:${dilithiumSig}`;
 
-    const apiUrl = await getRandomBootstrapNodeAsync();
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 10000);
-
-    const response = await fetch(`${apiUrl}/api/v1/light-node/token-refresh`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      signal: controller.signal,
-      body: JSON.stringify({
-        node_id: nodeId,
-        device_token: currentToken,
-        push_type: pushProvider.type,
-        endpoint: pushProvider.endpoint || undefined,
-        signature: signatureStr,
-        timestamp,
-      }),
+    const body = JSON.stringify({
+      node_id: nodeId,
+      device_token: currentToken,
+      push_type: pushProvider.type,
+      endpoint: pushProvider.endpoint || undefined,
+      signature: signatureStr,
+      timestamp,
     });
-    clearTimeout(timeoutId);
-
-    const result = await response.json();
+    const postRefresh = async (apiUrl) => {
+      try {
+        const response = await fetchWithTimeout(`${apiUrl}/api/v1/light-node/token-refresh`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body,
+        }, 10000);
+        return await response.json();
+      } catch (e) {
+        return { success: false, error: e.message };
+      }
+    };
+    // Only a node that took this device's ping replies holds its identity: the shard owners. Try them in
+    // rank order, and a random node only when every owner fails.
+    let result = { success: false };
+    for (const ownerUrl of lightShardOwnerUrls(nodeId)) {
+      result = await postRefresh(ownerUrl);
+      if (result.success) break;
+    }
+    if (!result.success) result = await postRefresh(await getRandomBootstrapNodeAsync());
     if (result.success) {
       await AsyncStorage.multiSet([
         ['qnet_last_sent_fcm_token', currentToken],
@@ -757,6 +916,8 @@ export async function isTokenRefreshNeeded() {
 }
 
 
+let _resumeAttest = null; // the AppState subscription, registered once per process
+
 /**
  * Initialize push service
  */
@@ -769,13 +930,28 @@ export async function initializePushService() {
   if (nodeInfoStr) {
     const nodeInfo = JSON.parse(nodeInfoStr);
 
-    // Setup polling if needed
+    // Every push type gets the periodic self-attest; polling phones also get the precise ping wake.
     if (nodeInfo.pushType === PushType.POLLING) {
       await setupPollingService(nodeInfo.nodeId, nodeInfo.nextPingTime);
+    } else {
+      await configureBackgroundFetch();
     }
 
     // PULL: app open is a wakeup — attest for this epoch if not yet done (deduped inside).
     selfAttestIfNeeded(nodeInfo.nodeId).catch(() => {});
+  }
+
+  // Returning to the app is a wake too, a locked wallet included (the ping key needs no password). The
+  // self-attest hold keeps repeated returns from sending anything.
+  if (!_resumeAttest) {
+    _resumeAttest = AppState.addEventListener('change', (next) => {
+      if (next !== 'active') return;
+      // The user may have changed Background App Refresh in Settings meanwhile.
+      BackgroundFetch.status().then(recordBackgroundRefreshStatus).catch(() => {});
+      AsyncStorage.getItem('qnet_light_node_info')
+        .then((s) => { const info = s ? JSON.parse(s) : null; return info && info.nodeId ? selfAttestIfNeeded(info.nodeId) : false; })
+        .catch(() => {});
+    });
   }
 
   return pushProvider;
@@ -833,16 +1009,10 @@ export async function checkServerNodeStatus(activationCode, nodeId = null, walle
         : `${apiUrl}/api/v1/node/status`;
       console.log(`[Push] Checking server node status (attempt ${attempt + 1}): ${url}`);
 
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 8000);
-
-      const response = await fetch(url, {
+      const response = await fetchWithTimeout(url, {
         method: 'GET',
         headers: walletHeader ? { 'X-QNet-Wallet': walletHeader } : undefined,
-        signal: controller.signal
-      });
-      
-      clearTimeout(timeoutId);
+      }, 8000);
       
       if (!response.ok) {
         throw new Error(`HTTP ${response.status}`);
@@ -917,7 +1087,7 @@ export async function getAllNodesByWallet(walletAddress) {
     const apiUrl = getRandomBootstrapNode();
     
     // NEW: Call without node_type to get ALL nodes. Wallet via header, not the URL (privacy).
-    const response = await fetch(
+    const response = await fetchWithTimeout(
       `${apiUrl}/api/v1/activations/by-wallet`,
       { method: 'GET', headers: { 'X-QNet-Wallet': walletAddress } }
     );
@@ -966,7 +1136,7 @@ export async function getAllNodesByWallet(walletAddress) {
 export async function getPendingRewards(nodeId) {
   try {
     const apiUrl = getRandomBootstrapNode();
-    const response = await fetch(`${apiUrl}/api/v1/rewards/pending/${encodeURIComponent(nodeId)}`, { method: 'GET' });
+    const response = await fetchWithTimeout(`${apiUrl}/api/v1/rewards/pending/${encodeURIComponent(nodeId)}`, { method: 'GET' });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const r = await response.json();
     return {

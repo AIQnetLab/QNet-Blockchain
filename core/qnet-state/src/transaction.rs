@@ -1641,8 +1641,8 @@ impl Transaction {
             TransactionType::PingCommitmentWithSampling { window_start_height, .. } => {
                 Some((self.from.clone(), window_start_height / EPOCH_INTERVAL, 2))
             }
-            TransactionType::LightNodeEligibilityBitmap { genesis_id, epoch, .. } => {
-                Some((genesis_id.clone(), *epoch, 3))
+            TransactionType::LightNodeEligibilityBitmap { epoch, .. } => {
+                self.light_bitmap_commitment_id().map(|id| (id, *epoch, 3))
             }
             TransactionType::NodeRegistration { node_id, .. } => {
                 // One-shot for the chain's lifetime. Constant `0` epoch
@@ -1661,6 +1661,36 @@ impl Transaction {
                     crate::account::ActivationPhase::Phase2 => 2,
                 };
                 Some((self.from.clone(), phase_id, 6))
+            }
+            _ => None,
+        }
+    }
+
+    /// Blocks after its inclusion that the mempool keeps a finalized mark of commitment class
+    /// `type_id`. Past it the class can no longer be included again, or the state refuses it at the
+    /// door: a heartbeat for one subwindow plus the anchor lag plus rollback slack, every other class
+    /// three epochs, as long as the state keeps its own epoch records. It ages a mark by inclusion
+    /// height, never by the key's second field, whose unit differs per class.
+    pub fn commitment_mark_retention_blocks(type_id: u8) -> u64 {
+        const EPOCH_INTERVAL: u64 = 14400; // matches commitment_dedup_key
+        match type_id {
+            7 => 1440 + HB_ANCHOR_MAX_LAG_BLOCKS + 90,
+            1..=6 => 3 * EPOCH_INTERVAL,
+            _ => 0,
+        }
+    }
+
+    /// A light eligibility bitmap's commitment identity, "{shard}:{signer}". Each owner of a shard
+    /// commits its own row and the rows are bit-ORed at read, so keyed by the shard alone the first
+    /// owner to land would shut the others out. Signer is the signing genesis id, else the shard.
+    pub fn light_bitmap_commitment_id(&self) -> Option<String> {
+        match &self.tx_type {
+            TransactionType::LightNodeEligibilityBitmap { genesis_id, .. } => {
+                let signer = self.dilithium_public_key.as_deref()
+                    .and_then(|b| std::str::from_utf8(b).ok())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(genesis_id.as_str());
+                Some(format!("{}:{}", genesis_id, signer))
             }
             _ => None,
         }
@@ -6299,5 +6329,33 @@ mod tests_activation_pricing_and_chain_binding {
         // Unknown genesis and a clock behind genesis keep the age trigger shut.
         assert!(!Transaction::is_phase2(0, 1000, 0, five_years), "genesis_ts=0 never triggers");
         assert!(!Transaction::is_phase2(0, 1000, G, G - 1), "clock behind genesis never triggers");
+    }
+}
+
+#[cfg(test)]
+mod commitment_mark_retention_tests {
+    use super::*;
+
+    // Every class commitment_dedup_key produces is kept for a while, and a heartbeat mark outlives the
+    // heartbeat's whole admission window (its subwindow plus the anchor lag).
+    #[test]
+    fn every_commitment_class_has_a_retention() {
+        let src = include_str!("transaction.rs");
+        let start = src.find("pub fn commitment_dedup_key(").expect("key fn");
+        let end = start + src[start..].find("pub fn commitment_mark_retention_blocks(").expect("retention fn");
+        let body = src[start..end].as_bytes();
+        let mut classes = Vec::new();
+        for i in 0..body.len().saturating_sub(5) {
+            if &body[i..i + 2] == b", " && body[i + 2].is_ascii_digit() && &body[i + 3..i + 5] == b"))" {
+                classes.push(body[i + 2] - b'0');
+            }
+        }
+        assert_eq!(classes.len(), 7, "one class per commitment arm: {:?}", classes);
+        for t in classes {
+            assert!(Transaction::commitment_mark_retention_blocks(t) > 0, "class {} has no retention", t);
+        }
+        assert!(Transaction::commitment_mark_retention_blocks(7) >= 1_440 + HB_ANCHOR_MAX_LAG_BLOCKS,
+                "a heartbeat mark outlives the heartbeat's admission window");
+        assert_eq!(Transaction::commitment_mark_retention_blocks(0), 0);
     }
 }

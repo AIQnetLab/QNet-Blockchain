@@ -51,7 +51,7 @@ git pull origin testnet
 
 ## Building the image
 
-The production Dockerfile is a two-stage build: it installs a pinned Rust toolchain (1.93.0), builds the `qnet-node` binary with the `release-fast` profile, then copies the stripped binary into a minimal Ubuntu 22.04 runtime image. Build from the repository root — the Dockerfile expects the whole workspace as its context.
+The production Dockerfile is a two-stage build: it installs a pinned Rust toolchain (1.93.0), builds the `qnet-node` binary with the `release-fast` profile, then copies the binary into a minimal Ubuntu 22.04 runtime image. The profile strips debug info and keeps the symbol table, so a thread backtrace taken on the host names its functions. Build from the repository root — the Dockerfile expects the whole workspace as its context. The runtime stage takes a `QNET_BUILD_ID` build argument (default `unstamped`) and exports it into the image; the node reports it as `build=` on `/healthz` and as `build` in the `node_getInfo` JSON-RPC answer, so building with `--build-arg QNET_BUILD_ID=$(git rev-parse --short HEAD)` makes every image name its commit.
 
 ```bash
 docker build -f development/qnet-integration/Dockerfile.production -t qnet-production .
@@ -64,7 +64,7 @@ docker system prune -f
 docker build --no-cache -f development/qnet-integration/Dockerfile.production -t qnet-production .
 ```
 
-The image entrypoint runs as root only long enough to fix data-directory ownership, remove a stale RocksDB `LOCK` file left by an unclean shutdown, and check RocksDB integrity; it then drops to the unprivileged `qnet` user via `gosu`. The integrity check wipes the data directory only when database files exist but `MANIFEST-*` / `CURRENT` are missing — a healthy store is never touched.
+`tini` runs as PID 1 and reaps orphaned child processes. Under it the entrypoint script runs as root only long enough to remove a stale RocksDB `LOCK` file left by an unclean shutdown, check RocksDB integrity and fix data-directory ownership; it then drops to the unprivileged `qnet` user via `gosu`. The integrity check wipes the data directory only when database files exist but `MANIFEST-*` / `CURRENT` are missing — a healthy store is never touched.
 
 ## Firewall and ports (do this before the first start)
 
@@ -196,7 +196,7 @@ All of these are served on the API port.
 
 ```bash
 # Liveness (lock-free, one atomic read — this is what a container health check should use)
-curl -s http://localhost:8001/healthz            # -> "ok h=<height>"
+curl -s http://localhost:8001/healthz            # -> "ok h=<height> build=<id>"
 curl -s http://localhost:8001/health             # -> "OK"
 
 # Rich health: height vs network height, sync status, peer counts, clock drift, failover state
@@ -220,7 +220,7 @@ curl -s "http://localhost:8001/api/v1/node/status?node_id=<your_node_id>"
 
 What to look for:
 
-- `/healthz` returns a height that increases.
+- `/healthz` returns a height that increases, and its `build=` is the `QNET_BUILD_ID` the running image was built with.
 - In `/api/v1/node/health`: `sync_status` reaches a synced state, `height` tracks `network_height`, `peers` and `validated_peers` are non-zero, `clock_drift_ema_secs` stays near zero, and `current_timeout_round` is 0 in steady state (a persistently non-zero value means the network is in failover).
 - `/api/v1/peers` shows peers other than the bootstrap set.
 
@@ -277,7 +277,7 @@ docker restart qnet-super
 docker rm qnet-super
 ```
 
-Upgrading is a rebuild plus a container replacement with the same volume and the same environment; see [maintenance](maintenance.md) for the coordinated-stop variable `QNET_HALT_HEIGHT` and the rest of the upgrade procedure.
+Upgrading is a rebuild plus a container replacement with the same volume and the same environment, less any one-shot recovery variable (`QNET_ROLLBACK_TO_LAST_SEALED`, `QNET_ROLLBACK_TO_HEIGHT`), which acts again on every start it is present for; see [maintenance](maintenance.md) for the coordinated-stop variable `QNET_HALT_HEIGHT` and the rest of the upgrade procedure.
 
 ### Bundled multi-node stack
 

@@ -97,11 +97,7 @@ impl Storage {
     pub fn save_light_bitmap_from(&self, epoch: u64, shard: usize, signer: usize, incl_height: u64, bitmap: &[u8]) -> IntegrationResult<()> {
         let cf = self.persistent.db.cf_handle("pending_rewards")
             .ok_or_else(|| IntegrationError::StorageError("pending_rewards column family not found".to_string()))?;
-        let key = if signer == shard {
-            format!("light_bm_{}_{}", epoch, shard)      // the primary keeps the historic key
-        } else {
-            format!("light_bm_{}_{}_{}", epoch, shard, signer)
-        };
+        let key = Self::light_bm_key(epoch, shard, signer);
         // Lowest inclusion height wins. Arrival order is node-local; the height is canonical, so
         // every node holding both inclusions of a duplicated bitmap converges on the same row.
         if let Some(prev) = self.persistent.db.get_cf(&cf, key.as_bytes())? {
@@ -118,6 +114,18 @@ impl Storage {
         v.extend_from_slice(bitmap);
         self.persistent.db.put_cf(&cf, key.as_bytes(), &v)?;
         Ok(())
+    }
+
+    /// The row one owner's bitmap for a shard lives under; the primary keeps the historic key.
+    fn light_bm_key(epoch: u64, shard: usize, signer: usize) -> String {
+        if signer == shard { format!("light_bm_{}_{}", epoch, shard) } else { format!("light_bm_{}_{}_{}", epoch, shard, signer) }
+    }
+
+    /// Whether `signer` already has its own committed bitmap row for this shard's epoch.
+    pub fn has_light_bitmap_from(&self, epoch: u64, shard: usize, signer: usize) -> bool {
+        self.persistent.db.cf_handle("pending_rewards")
+            .and_then(|cf| self.persistent.db.get_cf(&cf, Self::light_bm_key(epoch, shard, signer).as_bytes()).ok().flatten())
+            .is_some()
     }
 
     /// Persist a light node's per-epoch attestation (genesis restart resilience): the boundary bitmap TX
@@ -169,11 +177,8 @@ impl Storage {
         for shard in 0..5usize {
             // The shard's own row plus every backup owner's row, bit-ORed. A bit set by any owner
             // means that light node attested, and no owner can clear another's.
-            let mut keys = vec![format!("light_bm_{}_{}", epoch, shard)];
             for signer in crate::node::light_shard_owners(shard) {
-                if signer != shard { keys.push(format!("light_bm_{}_{}_{}", epoch, shard, signer)); }
-            }
-            for key in keys {
+                let key = Self::light_bm_key(epoch, shard, signer);
                 if let Some(d) = self.persistent.db.get_cf(&cf, key.as_bytes())? {
                     if d.len() > 8 {
                         let bits = &d[8..];                       // strip the height stamp

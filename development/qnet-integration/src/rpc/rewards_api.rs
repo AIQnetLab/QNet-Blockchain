@@ -168,7 +168,7 @@ pub(super) async fn handle_claim_rewards(
     }
 
     // ── Step 1: quote the batch of ALL of this wallet's unclaimed epochs ──
-    // Enumerate epochs via the reward-epochs index (no scan cap), generate each merkle proof from the
+    // Walk the epoch grid above the watermark, generate each merkle proof from the
     // locally-stored leaf set, and return the payload for the wallet to sign (oldest-first → no
     // forfeiture). Apply re-verifies every proof and the wallet signature, so this RPC can neither
     // forge a credit nor submit on the wallet's behalf.
@@ -183,7 +183,6 @@ pub(super) async fn handle_claim_rewards(
             let g = state.read().await;
             (*g).get_last_claimed_epoch(&wallet_address)
         };
-        let epochs = storage.reward_epochs_from(0).unwrap_or_default();
         let mut claim_entries: Vec<serde_json::Value> = Vec::new();
         let mut total_amount: u64 = 0;
         // Reported so a wallet knows WHY the batch ended and can retry elsewhere.
@@ -196,7 +195,7 @@ pub(super) async fn handle_claim_rewards(
         // limit. Oldest-first + stop-not-skip means a partial batch forfeits nothing.
         const CLAIM_QUOTE_BYTE_BUDGET: usize = 128 * 1024;
         let mut quote_bytes: usize = 0;
-        for epoch in epochs.into_iter().filter(|e| *e > last_claimed) {
+        for epoch in crate::reward_epoch::grid_epochs_after(&storage, last_claimed) {
             if claim_entries.len() >= MAX_BATCH {
                 stopped_at = Some((epoch, "batch_full"));
                 break;
@@ -207,10 +206,10 @@ pub(super) async fn handle_claim_rewards(
             }
             // The certified root is the sole authority. Claims stop (never skip) at the first
             // epoch this node cannot serve: the watermark is monotonic, so skipping forfeits it.
-            let (committed_root, ctotal) = match storage.load_epoch_root(epoch) {
-                Ok(Some(r)) if r != [0u8; 32] => (hex::encode(r), crate::reward_epoch::canonical_total(epoch)),
-                Ok(Some(_)) => continue, // epoch distributed nothing
-                _ => { stopped_at = Some((epoch, "root_not_here")); break; }
+            let (committed_root, ctotal) = match crate::reward_epoch::epoch_root_or_derive(&storage, epoch) {
+                Some(r) if r != [0u8; 32] => (hex::encode(r), crate::reward_epoch::canonical_total(epoch)),
+                Some(_) => continue, // epoch distributed nothing
+                None => { stopped_at = Some((epoch, "root_not_here")); break; }
             };
             // Resolve from the shard cache (one shard + meta, never the whole leaf set); the shard
             // roots are re-verified against the certified root before proving. Absent = cache miss,
@@ -326,11 +325,11 @@ pub(super) async fn wallet_first_unclaimed_epoch(blockchain: &BlockchainNode, wa
         let g = state.read().await;
         g.get_last_claimed_epoch(wallet)
     };
-    for epoch in storage.reward_epochs_from(0).unwrap_or_default().into_iter().filter(|e| *e > last_claimed) {
-        let root = match storage.load_epoch_root(epoch) {
-            Ok(Some(r)) if r != [0u8; 32] => hex::encode(r),
-            Ok(Some(_)) => continue, // epoch distributed nothing
-            _ => return None,        // cannot resolve here; reporting a later epoch would be a lie
+    for epoch in crate::reward_epoch::grid_epochs_after(&storage, last_claimed) {
+        let root = match crate::reward_epoch::epoch_root_or_derive(&storage, epoch) {
+            Some(r) if r != [0u8; 32] => hex::encode(r),
+            Some(_) => continue, // epoch distributed nothing
+            None => return None, // cannot resolve here; reporting a later epoch would be a lie
         };
         match crate::node::BlockchainNode::reward_proof_from_shard(&storage, epoch, &root, wallet, false) {
             crate::node::ShardClaim::Proof(_, _) => return Some(epoch),
@@ -355,13 +354,13 @@ pub(super) async fn wallet_claimable_qnc(blockchain: &BlockchainNode, wallet: &s
     // under-report relative to the claim path, never over-report.
     const MAX_BATCH: usize = 512;
     let mut counted = 0usize;
-    for epoch in storage.reward_epochs_from(0).unwrap_or_default().into_iter().filter(|e| *e > last_claimed) {
+    for epoch in crate::reward_epoch::grid_epochs_after(&storage, last_claimed) {
         if counted >= MAX_BATCH { break; }
         // 2f+1-committed root = authority for this epoch.
-        let committed_root = match storage.load_epoch_root(epoch) {
-            Ok(Some(r)) if r != [0u8; 32] => hex::encode(r),
-            Ok(Some(_)) => continue,  // epoch distributed nothing — the claim path skips it too
-            _ => break,               // root not here: the claim path stops, so must the figure
+        let committed_root = match crate::reward_epoch::epoch_root_or_derive(&storage, epoch) {
+            Some(r) if r != [0u8; 32] => hex::encode(r),
+            Some(_) => continue,  // epoch distributed nothing — the claim path skips it too
+            None => break,        // root not here: the claim path stops, so must the figure
         };
         // Amount-only resolution from the SHARDED structure (loads one shard, skips proof gen), verified
         // against the committed root. This endpoint is UNAUTHENTICATED, so it must NEVER trigger the
@@ -547,6 +546,15 @@ pub(super) struct LeafsetQuery {
     pub(super) shard: Option<usize>,
 }
 
+/// History status of one epoch. Zero is tested before the watermark, so "claimed" only names an
+/// epoch in which the wallet held a leaf.
+fn reward_history_status(servable: bool, amount: u64, epoch: u64, last_claimed: u64) -> &'static str {
+    if !servable { "unavailable" }
+    else if amount == 0 { "not_eligible" }
+    else if epoch <= last_claimed { "claimed" }
+    else { "claimable" }
+}
+
 pub(super) async fn handle_get_reward_history(
     node_id: String,
     query: RewardHistoryQuery,
@@ -585,8 +593,8 @@ pub(super) async fn handle_get_reward_history(
 
     let mut epochs_history = Vec::new();
     for &epoch in epochs.iter().skip(offset).take(limit) {
-        let end_h = crate::reward_epoch::emission_height_of(epoch).unwrap_or(0);
-        let start_h = end_h.saturating_sub(14_400);
+        // The window this epoch paid for, from the helper the reward gather itself uses.
+        let (start_h, end_h) = crate::reward_epoch::work_window_of(epoch);
         // Amount + servability in one resolution, verified against the 2f+1-committed root.
         let (amount, servable) = match storage.load_epoch_root(epoch) {
             Ok(Some(r)) if r != [0u8; 32] && !wallet.is_empty() => {
@@ -602,10 +610,7 @@ pub(super) async fn handle_get_reward_history(
             Ok(Some(_)) => (0, true), // certified as distributing nothing
             _ => (0, false),
         };
-        let status = if !servable { "unavailable" }
-            else if epoch <= last_claimed { "claimed" }
-            else if amount > 0 { "claimable" }
-            else { "not_eligible" };
+        let status = reward_history_status(servable, amount, epoch, last_claimed);
         epochs_history.push(json!({
             "epoch": epoch,
             "block_range": format!("{}-{}", start_h, end_h),
@@ -1176,4 +1181,19 @@ pub(super) async fn handle_get_reward_summary(
     REWARD_SUMMARY_CACHE.insert(node_id, (summary.clone(), std::time::Instant::now()));
     
     Ok(warp::reply::json(&summary))
+}
+
+#[cfg(test)]
+mod tests_reward_history {
+    use super::reward_history_status;
+
+    /// An epoch below the watermark in which the wallet had no leaf was never claimed by it.
+    #[test]
+    fn zero_amount_epochs_are_not_eligible_even_below_the_watermark() {
+        assert_eq!(reward_history_status(true, 0, 160, 13_600), "not_eligible");
+        assert_eq!(reward_history_status(true, 5, 160, 13_600), "claimed");
+        assert_eq!(reward_history_status(true, 5, 13_760, 13_600), "claimable");
+        assert_eq!(reward_history_status(true, 0, 13_760, 13_600), "not_eligible");
+        assert_eq!(reward_history_status(false, 5, 160, 13_600), "unavailable", "an unservable epoch says so first");
+    }
 }

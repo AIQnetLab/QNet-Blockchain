@@ -213,8 +213,9 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: '#0f0f1a',
   },
+  // Fills the screen so short content centres, but can outgrow it and scroll.
   content: {
-    flex: 1,
+    flexGrow: 1,
     justifyContent: 'center',
     alignItems: 'center',
     padding: 20,
@@ -257,6 +258,9 @@ const styles = StyleSheet.create({
   },
   buttonContainer: {
     flexDirection: 'row',
+    flexWrap: 'wrap',
+    justifyContent: 'center',
+    alignSelf: 'stretch',
     gap: 10,
     marginTop: 20,
   },

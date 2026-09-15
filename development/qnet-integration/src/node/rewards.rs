@@ -435,7 +435,7 @@ impl BlockchainNode {
         macroblock_index: u64,
     ) -> Option<(Vec<(String, String)>, LightRewardSource)> {
         if macroblock_index < 160 { return Some((Vec::new(), LightRewardSource::default())); }
-        let ws = (macroblock_index / 160 - 1) * 14400;
+        let (ws, _) = crate::reward_epoch::work_window_of(macroblock_index);
         let epoch_num = ws / 14400;
 
         let mut super_eligible: Vec<(String, String)> = Vec::new();

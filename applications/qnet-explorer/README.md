@@ -1,7 +1,7 @@
 # QNet explorer
 
-Block explorer for QNet: a Next.js frontend plus a sync service that ingests blocks and
-transactions from a node's RPC into PostgreSQL.
+Block explorer for QNet: a Next.js frontend plus an indexer process that ingests blocks and
+transactions from the nodes' RPC into PostgreSQL.
 
 Full documentation: [docs/applications/explorer.md](../../docs/applications/explorer.md)
 
@@ -10,7 +10,8 @@ Full documentation: [docs/applications/explorer.md](../../docs/applications/expl
 ```bash
 cd frontend
 npm install
-npm run dev
+npm run dev                                     # web tier
+npm run build:indexer && npm run start:indexer  # indexer, the only database writer
 ```
 
 Configuration is supplied through environment variables (node RPC URL, database connection,

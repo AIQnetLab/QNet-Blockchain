@@ -2,7 +2,8 @@
 
 External load-test harness that measures QNet capacity over the **production
 transaction path** — every transaction is a real ML-DSA-65-signed `Transfer`
-submitted via `POST /api/v1/transaction` between real key-derived accounts.
+submitted via `POST /api/v1/transaction` (with `--batch-size` N > 1, a `BatchTransfers` of N
+transfers under one signature via `POST /api/v1/batch/transfer`) between real key-derived accounts.
 No benchmark bypass, no unsigned throughput.
 
 ## What it measures
@@ -16,9 +17,13 @@ No benchmark bypass, no unsigned throughput.
 
 ## Why it is credible (methodology)
 - Real path: identical to what a wallet uses; the node enforces `from ==
-  eon(dilithium_public_key)` + a valid ML-DSA-65 signature. No special mode.
-- Real n-f Checkpoint-BFT finality: hard finality is read from the macroblock
-  `qc.signers >= 2f+1` over its committee — not a heuristic.
+  eon(dilithium_public_key)` + a valid ML-DSA-65 signature. Each submit carries the hex of the raw
+  detached signature; the public key rides only while the account's committed nonce is 0, and the
+  node rehydrates it from state after that.
+- Real n-f Checkpoint-BFT finality: hard finality is read from `/api/v1/macroblock/{index}/proof`
+  as `qc.signers >= floor(2n/3) + 1` over the committee the node reports (`--committee` when the
+  response does not list it; with neither, nothing counts as final), walking forward from the
+  macroblock that covers the first tracked height.
 - Load is generated **off the validators**.
 - Accounts are pre-funded at genesis (standard for a benchmark), deterministically
   derived; the harness holds each signing key.
@@ -27,7 +32,9 @@ No benchmark bypass, no unsigned throughput.
 - **Nonce is checked against committed state → 1 in-flight tx per account per
   committed block.** So included/finalized TPS ≈ `funded_accounts × blocks_per_second`.
   To target X TPS, pre-fund ≳ X accounts.
-- Gas floor `gas_price >= 10`; Dilithium transactions pay a ×1.5 fee.
+- Gas floor `gas_price >= 10` (`MIN_GAS_PRICE`); the submit endpoint raises it with the node's mempool
+  backlog: ×2 from 5,000 pending transactions, ×4 from 20,000 and ×8 from 100,000. Dilithium
+  transactions pay a ×1.5 fee.
 - `/transaction` per-IP rate limit is 100/60s, **but `127.0.0.1` bypasses it** —
   run the client ON a node (localhost), or whitelist its IP via
   `QNET_WHITELIST_IPS`, or raise `QNET_API_RATE_LIMIT`.

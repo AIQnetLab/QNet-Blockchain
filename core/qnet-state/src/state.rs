@@ -2113,6 +2113,9 @@ pub struct BlockSnapshot {
     commit_epoch_before: HashMap<String, Option<u64>>,
     /// Pre-images of `registered_nodes` entries this block writes. Same contract.
     registered_before: HashMap<String, Option<String>>,
+    /// The commitment keys (`commitment_dedup_key`) of this block's TXs, so a rollback names exactly
+    /// the mempool marks it may free instead of scanning all of them.
+    commit_keys: Vec<(String, u64, u8)>,
     /// True when THIS apply took the process-global fee-credit marker for `height`. The marker also
     /// lives outside the accounts map: rollback restores the producer's pre-image but the marker
     /// would survive, so a re-apply of the same height silently skips the credit and can never
@@ -2136,6 +2139,7 @@ impl BlockSnapshot {
             supply_before: None,
             commit_epoch_before: HashMap::new(),
             registered_before: HashMap::new(),
+            commit_keys: Vec::new(),
             fee_credit_marked: false,
             chain_height_before: None,
         }
@@ -2322,10 +2326,10 @@ pub trait AccountStore: Send + Sync {
     /// Durable batch write of accounts. Called by the eviction sweep BEFORE dropping entries from the
     /// cache; returns true IFF the write durably succeeded. The evictor removes ONLY a successfully-
     /// persisted batch, so a failed persist (I/O error, or no store) keeps the accounts resident —
-    /// never silently dropping a cold mutation not yet write-through-persisted (genesis /
-    /// producer-inline), which would diverge the persistent mirror from the committed tree. Default
-    /// false (a read-only store never persists ⇒ its accounts are never evicted).
-    fn persist_accounts(&self, _accounts: &[(String, Account)]) -> bool { false }
+    /// never dropping a value whose row has not been written yet, which would diverge the persistent
+    /// mirror from the committed tree. Default false (a read-only store never persists ⇒ its accounts
+    /// are never evicted).
+    fn persist_accounts(&self, _accounts: Vec<(String, Account)>) -> bool { false }
 }
 
 pub struct StateManager {
@@ -2466,18 +2470,19 @@ impl StateManager {
         self.recent_journals.lock().clear();
     }
 
-    /// Undo (target, tip] newest first from the retained journals. Returns the count and the disk mirror
+    /// Undo (target, tip] newest first from the retained journals. Returns the count, the disk mirror
     /// (per address its OLDEST pre-image; None = did not exist ⇒ delete; no entry for a key whose
-    /// committed leaf the undo puts back, whose row stays). None when the journals do not cover the
-    /// range contiguously — nothing is touched then.
-    pub fn undo_blocks_above(&self, target: u64, tip: u64) -> Option<(u64, HashMap<String, Option<Account>>)> {
-        if tip <= target { return Some((0, HashMap::new())); }
+    /// committed leaf the undo puts back, whose row stays) and the commitment keys the undone blocks
+    /// carried. None when the journals do not cover the range contiguously — nothing is touched then.
+    pub fn undo_blocks_above(&self, target: u64, tip: u64) -> Option<(u64, HashMap<String, Option<Account>>, Vec<(String, u64, u8)>)> {
+        if tip <= target { return Some((0, HashMap::new(), Vec::new())); }
         let mut q = self.recent_journals.lock();
         let need = (tip - target) as usize;
         if q.len() < need { return None; }
         if !q.iter().rev().take(need).enumerate().all(|(i, (_, s))| s.height() == tip - i as u64) { return None; }
         let mut mirror: HashMap<String, Option<Account>> = HashMap::new();
         let mut undone = 0u64;
+        let mut commit_keys = Vec::new();
         while q.back().map(|(_, s)| s.height() > target).unwrap_or(false) {
             let (_, s) = q.pop_back().expect("checked above");
             for addr in s.created_keys() {
@@ -2486,10 +2491,11 @@ impl StateManager {
                 if matches!(s.stale_leaves().get(addr), Some(Some(_))) { mirror.remove(addr); } else { mirror.insert(addr.clone(), None); }
             }
             for (addr, acct) in s.accounts() { mirror.insert(addr.clone(), Some(acct.clone())); }
+            commit_keys.extend_from_slice(&s.commit_keys);
             self.rollback_block(&s);
             undone += 1;
         }
-        Some((undone, mirror))
+        Some((undone, mirror, commit_keys))
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -2784,15 +2790,15 @@ impl StateManager {
             .collect();
         sorted.sort_by_key(|(_, ts)| *ts);
 
-        // Persist-before-evict: snapshot the victims' current values and flush
-        // them to the durable store BEFORE dropping from the cache, so a cold
-        // mutation not yet write-through-persisted (genesis / producer-inline)
-        // is never lost — the persistent store stays a complete mirror of the
-        // committed tree. Persist-then-remove (not the reverse) leaves no window
-        // where a concurrent read sees the address as absent.
+        // Persist-before-evict: snapshot the victims' current values and write
+        // them to the durable store BEFORE dropping from the cache, so a value
+        // whose row is still queued is never lost — the persistent store stays a
+        // complete mirror of the committed tree. Persist-then-remove (not the
+        // reverse) leaves no window where a concurrent read sees the address as absent.
         let victims: Vec<(String, Account)> = sorted.iter().take(target_evict)
             .filter_map(|(addr, _)| self.accounts.get(addr).map(|e| (addr.clone(), e.value().clone())))
             .collect();
+        let victim_addrs: Vec<String> = victims.iter().map(|(addr, _)| addr.clone()).collect();
         // Evict a batch ONLY when it is safe to drop from RAM: if a durable store is wired, evict iff the
         // persist succeeded (a failed write keeps the victims resident so a cold mutation is never lost
         // and the persistent mirror never diverges from the committed tree — the next sweep retries). If
@@ -2802,13 +2808,13 @@ impl StateManager {
             true
         } else {
             match *self.disk_store.read() {
-                Some(ref store) => store.persist_accounts(&victims),
+                Some(ref store) => store.persist_accounts(victims),
                 None => true,
             }
         };
         let mut evicted = 0usize;
         if persisted {
-            for (addr, _) in &victims {
+            for addr in &victim_addrs {
                 self.accounts.remove(addr);
                 self.last_access.remove(addr);
                 // V2: drop any per-contract storage-tree cache for an evicted address too, so the cache
@@ -2964,10 +2970,11 @@ impl StateManager {
                     )));
                 }
             }
-            TransactionType::LightNodeEligibilityBitmap { genesis_id, epoch, .. } => {
-                if self.is_epoch_committed("bitmap", genesis_id, *epoch) {
+            TransactionType::LightNodeEligibilityBitmap { epoch, .. } => {
+                let id = tx.light_bitmap_commitment_id().unwrap_or_default();
+                if self.is_epoch_committed("bitmap", &id, *epoch) {
                     return Err(StateError::InvalidTransaction(format!(
-                        "duplicate LightNodeBitmap: genesis={} epoch={} already committed", genesis_id, epoch
+                        "duplicate LightNodeBitmap: owner={} epoch={} already committed", id, epoch
                     )));
                 }
             }
@@ -3027,9 +3034,9 @@ impl StateManager {
                     epoch: window_start_height / epoch_interval,
                 })
             }
-            TransactionType::LightNodeEligibilityBitmap { genesis_id, epoch, .. } => {
+            TransactionType::LightNodeEligibilityBitmap { epoch, .. } => {
                 Some(CommitmentKey::Epoch {
-                    kind: "bitmap".into(), sender: genesis_id.clone(), epoch: *epoch,
+                    kind: "bitmap".into(), sender: tx.light_bitmap_commitment_id().unwrap_or_default(), epoch: *epoch,
                 })
             }
             TransactionType::NodeRegistration { node_id, wallet_address, .. } => {
@@ -3054,6 +3061,7 @@ impl StateManager {
     /// nothing alarms and it drops out of every later quorum.
     /// Call BEFORE applying the TX, once per TX. First write wins per key.
     pub fn record_commitment_pre_image(&self, tx: &Transaction, snapshot: &mut BlockSnapshot) {
+        if let Some(k) = tx.commitment_dedup_key() { snapshot.commit_keys.push(k); }
         match Self::commitment_key_for_tx(tx) {
             Some(CommitmentKey::Epoch { kind, sender, .. }) => {
                 let key = format!("{}:{}", kind, sender);
@@ -4140,6 +4148,16 @@ impl StateManager {
         *self.state_root.write() = [0u8; 32];
         self.token_trees.write().clear(); // V2: drop the per-contract storage-tree cache on full reset
     }
+
+    /// clear() plus the chain_state counters: nothing of a rebuilt view survives a restore or reseed that
+    /// could not complete.
+    pub fn reset_to_empty(&self) {
+        self.clear();
+        let mut cs = self.chain_state.write();
+        cs.height = 0;
+        cs.total_supply = 0;
+        cs.last_minted_emission_mb = 0;
+    }
     
     /// v3.38: Get number of accounts in state
     pub fn account_count(&self) -> usize {
@@ -4647,13 +4665,13 @@ mod parallel_apply_tests {
         sm.retain_block_journal(s2);
         assert_ne!(sm.finalize_merkle(), root1);
 
-        let (n, mirror) = sm.undo_blocks_above(1, 2).expect("journals cover (1, 2]");
+        let (n, mirror, _) = sm.undo_blocks_above(1, 2).expect("journals cover (1, 2]");
         assert_eq!(n, 1);
         assert_eq!(sm.finalize_merkle(), root1, "state is back at block 1");
         assert!(matches!(mirror.get("pa_0009"), Some(None)), "created in the undone block: deleted from the mirror");
         assert!(matches!(mirror.get("pa_0002"), Some(Some(_))), "modified: carries its pre-image");
 
-        let (n2, _) = sm.undo_blocks_above(0, 1).expect("journal for block 1 retained");
+        let (n2, _, _) = sm.undo_blocks_above(0, 1).expect("journal for block 1 retained");
         assert_eq!(n2, 1);
         assert_eq!(sm.finalize_merkle(), root0);
         assert!(sm.undo_blocks_above(0, 1).is_none(), "no journals left");
@@ -5402,10 +5420,10 @@ mod cache_tests {
             self.load_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.data.read().get(address).cloned()
         }
-        fn persist_accounts(&self, accounts: &[(String, Account)]) -> bool {
+        fn persist_accounts(&self, accounts: Vec<(String, Account)>) -> bool {
             let mut g = self.data.write();
             for (addr, acct) in accounts {
-                g.insert(addr.clone(), acct.clone());
+                g.insert(addr, acct);
             }
             true
         }
@@ -5568,7 +5586,7 @@ mod cache_tests {
     struct FailingStore;
     impl AccountStore for FailingStore {
         fn load_account(&self, _address: &str) -> Option<Account> { None }
-        fn persist_accounts(&self, _accounts: &[(String, Account)]) -> bool { false } // always fails
+        fn persist_accounts(&self, _accounts: Vec<(String, Account)>) -> bool { false } // always fails
     }
 
     #[test]
@@ -7011,23 +7029,25 @@ mod tests_snapshot_supply_rollback {
 
         // A key with NO prior value must be REMOVED on rollback.
         let fresh = bitmap_tx("genesis_node_001", 7);
+        let fresh_id = fresh.light_bitmap_commitment_id().expect("bitmap id");
         let mut snap = BlockSnapshot::new(&DashMap::new(), 500);
         state.record_commitment_pre_image(&fresh, &mut snap);
-        state.mark_epoch_committed("bitmap", "genesis_node_001", 7);
-        assert!(state.is_epoch_committed("bitmap", "genesis_node_001", 7));
+        state.mark_epoch_committed("bitmap", &fresh_id, 7);
+        assert!(state.is_epoch_committed("bitmap", &fresh_id, 7));
         state.rollback_block(&snap);
-        assert!(!state.is_epoch_committed("bitmap", "genesis_node_001", 7),
+        assert!(!state.is_epoch_committed("bitmap", &fresh_id, 7),
                 "a discarded block must not leave its commitment marked");
 
         // A key with a PRIOR value must be restored to that value, not removed.
-        state.mark_epoch_committed("bitmap", "genesis_node_002", 3);
         let bump = bitmap_tx("genesis_node_002", 9);
+        let bump_id = bump.light_bitmap_commitment_id().expect("bitmap id");
+        state.mark_epoch_committed("bitmap", &bump_id, 3);
         let mut snap2 = BlockSnapshot::new(&DashMap::new(), 501);
         state.record_commitment_pre_image(&bump, &mut snap2);
-        state.mark_epoch_committed("bitmap", "genesis_node_002", 9);
+        state.mark_epoch_committed("bitmap", &bump_id, 9);
         state.rollback_block(&snap2);
-        assert!(state.is_epoch_committed("bitmap", "genesis_node_002", 3), "prior epoch restored");
-        assert!(!state.is_epoch_committed("bitmap", "genesis_node_002", 9), "block's epoch undone");
+        assert!(state.is_epoch_committed("bitmap", &bump_id, 3), "prior epoch restored");
+        assert!(!state.is_epoch_committed("bitmap", &bump_id, 9), "block's epoch undone");
     }
 
     /// Node registration is the case with a consensus consequence: dropped silently, it costs the
@@ -7047,6 +7067,43 @@ mod tests_snapshot_supply_rollback {
         state.rollback_block(&snap);
         assert!(!state.is_node_registered("node_X"),
                 "a discarded registration must be re-appliable, not silently deduped away");
+    }
+
+    /// Each owner of a shard commits its own bitmap: one owner landing first must not shut the others
+    /// out, while the same owner still commits once per epoch. Mempool, producer and apply share the key.
+    #[test]
+    fn bitmap_commitment_is_per_shard_and_signer() {
+        let state = StateManager::new();
+        let signed = |signer: &str| {
+            let mut tx = bitmap_tx("genesis_node_002", 7);
+            tx.dilithium_public_key = Some(signer.as_bytes().to_vec());
+            tx
+        };
+        let (primary, backup) = (signed("genesis_node_002"), signed("genesis_node_003"));
+        assert_ne!(primary.commitment_dedup_key(), backup.commitment_dedup_key(),
+                   "two owners must not collapse into one mempool entry");
+        state.mark_commitment_from_tx(&backup);
+        assert!(state.check_duplicate_commitment(&primary).is_ok(), "a backup's bitmap must not shut out the primary's");
+        assert!(state.check_duplicate_commitment(&backup).is_err(), "the same owner commits once per epoch");
+        let (id, epoch, _) = backup.commitment_dedup_key().expect("a bitmap is a commitment");
+        assert!(state.is_epoch_committed("bitmap", &id, epoch), "the producer's on-chain check reads the apply key");
+    }
+
+    /// A journal undo names the commitment keys its blocks carried, so the mempool frees exactly those
+    /// marks, and the state's own dedup record goes back with them.
+    #[test]
+    fn journal_undo_names_the_commitments_it_undid() {
+        let state = StateManager::new();
+        let tx = bitmap_tx("genesis_node_003", 9);
+        let mut snap = BlockSnapshot::new(&DashMap::new(), 1);
+        state.record_commitment_pre_image(&tx, &mut snap);
+        state.mark_commitment_from_tx(&tx);
+        state.retain_block_journal(snap);
+        let (n, _, keys) = state.undo_blocks_above(0, 1).expect("the journal covers block 1");
+        assert_eq!(n, 1);
+        assert_eq!(keys, vec![tx.commitment_dedup_key().expect("a bitmap is a commitment")]);
+        let (id, epoch, _) = &keys[0];
+        assert!(!state.is_epoch_committed("bitmap", id, *epoch), "the undo took the dedup record back");
     }
 
 }

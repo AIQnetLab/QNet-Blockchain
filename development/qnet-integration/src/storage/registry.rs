@@ -829,6 +829,22 @@ impl Storage {
         // Canonical order, then contiguous ranks from 0. Rewriting the row is required: reg_index is
         // hashed, so a stale value on disk would fold into a root nobody else computes.
         survivors.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        // A registration above the height is undone where its row survives (a row first stamped by an
+        // activation): its marker says so until the canonical chain registers the node again.
+        {
+            let kept: std::collections::HashSet<&str> = survivors.iter().map(|s| s.1.as_str()).collect();
+            for item in self.persistent.db.prefix_iterator_cf(&registry_cf, b"nreg_") {
+                let (k, v) = match item { Ok(kv) => kv, Err(_) => continue };
+                if !k.starts_with(b"nreg_") { break; }
+                let kept_row = std::str::from_utf8(&k[5..]).map_or(false, |id| kept.contains(id));
+                if let Some(h) = Self::registration_marker_height(&v) {
+                    if kept_row && h > up_to_height && h != u64::MAX {
+                        batch.put_cf(&registry_cf, &k,
+                            Self::registration_marker(u64::MAX, Self::registration_marker_wallet(&v)));
+                    }
+                }
+            }
+        }
         for (h, node_id, mut parsed) in survivors.into_iter() {
             let ntype_for_space = parsed["node_type"].as_str().unwrap_or("").to_string();
             let sp = match Self::index_space_of(&node_id, &ntype_for_space) { Some(v) => v, None => continue };

@@ -1630,7 +1630,11 @@ impl BlockchainActivationRegistry {
                 Ok(tx_bytes) => {
                     // v2.26: Direct access - SimpleMempool is already thread-safe
                     // Use transaction.hash which was calculated via canonical_bytes()
-                    if mempool_arc.add_binary_transaction(tx_bytes.clone(), transaction.hash.clone(), transaction.gas_price) {
+                    let held = match crate::node::try_get_state() {
+                        Some(st) => crate::node::refuse_held_commitment(st, &transaction).await.is_err(),
+                        None => false,
+                    };
+                    if !held && mempool_arc.add_binary_transaction(tx_bytes.clone(), transaction.hash.clone(), transaction.gas_price) {
                         println!("[INFO][REGISTRY] activation_tx_added hash={}", qnet_state::char_prefix(&transaction.hash, 16));
                         // v6.5: Gulf Stream broadcast → current producer + gossip backup
                         // If producer unknown (new node just started), fallback sends to ALL genesis nodes

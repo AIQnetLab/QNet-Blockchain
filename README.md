@@ -28,7 +28,7 @@ contracts at your own risk. See [SECURITY.md](SECURITY.md) for how to report a v
 | Signature scheme | ML-DSA-65 / CRYSTALS-Dilithium3 (FIPS 204) — 1952-byte public key, 3309-byte signature |
 | Hash function | SHA3-256 (domain-separated per structure) |
 | Address format | 45 ASCII chars: 19 lowercase hex, the literal `eon`, 15 hex, 8-hex checksum |
-| Microblock slot | `MICROBLOCK_INTERVAL_SECS = 1`; `block_ts = genesis_ts + height x 1s`, so the wall clock is never a consensus input |
+| Microblock slot | `MICROBLOCK_INTERVAL_SECS = 1`; a block's timestamp is its parent's plus 1 s, or after a halt a declared gap of at least `SLOT_GAP_MIN_SECS = 90` s that verifiers refuse if it runs more than `SLOT_GAP_FUTURE_TOLERANCE_SECS = 30` s ahead of their own clock; below height `SLOT_GAP_REANCHOR_GATE_HEIGHT = 1_339_200` it is exactly `genesis_ts + height x 1s` |
 | Producer rotation | `ROTATION_INTERVAL_BLOCKS = 30`; leader is a public, deterministic SHA3-256 selection over the roster of macroblock N-2 |
 | Macroblock / epoch | `MACROBLOCK_INTERVAL = 90` microblocks (3 producer rotations per window) |
 | Finality | Checkpoint-BFT quorum certificates at `CHECKPOINT_INTERVAL = 30` microblocks, 2-chain commit rule |
@@ -69,7 +69,7 @@ on-chain rather than burned, with base costs of 10,000 QNC for a Light node and 
 Super node before a network-size multiplier. The transition happens when 90% of the 1DEV supply
 has been burned or five years have passed since the genesis block, whichever comes first; Phase 1
 is the active path today. Every burn is cryptographically bound to one node identity and
-re-verified at block apply. See
+re-verified by every node that validates a block carrying it. See
 [docs/economics/node-activation.md](docs/economics/node-activation.md).
 
 ## Repository layout

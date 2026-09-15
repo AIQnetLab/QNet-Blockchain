@@ -18,7 +18,7 @@ export interface DeployContractParams {
   nonce: number;
   /**
    * Hex-encoded ML-DSA-65 signature over
-   * `q{chainId}|contract_deploy:{from}:{sha3_256(module bytes)}:{nonce}`
+   * `q{chainId}|contract_deploy:{from}:{sha3_256(module bytes)}:{nonce}:{gasPrice}:{gasLimit}`
    */
   dilithiumSignature: string;
   /** Hex-encoded ML-DSA-65 public key; its EON address must equal `from` */
@@ -42,7 +42,7 @@ export interface CallContractParams {
   gasPrice?: number;
   /**
    * Hex-encoded ML-DSA-65 signature over
-   * `q{chainId}|contract_call:{from}:{sha3_256(calldata bytes)}:{nonce}`.
+   * `q{chainId}|contract_call:{from}:{sha3_256(calldata bytes)}:{nonce}:{gasPrice}:{gasLimit}`, the gas as sent.
    * Required for a state-changing call, unused by a view.
    */
   dilithiumSignature?: string;

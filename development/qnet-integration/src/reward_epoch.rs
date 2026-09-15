@@ -51,6 +51,31 @@ pub fn is_reward_epoch(epoch: u64) -> bool {
     epoch % MB_PER_EPOCH == 0
 }
 
+/// Blocks `[start, end)` that reward key `epoch` pays for: the window that closed one full epoch
+/// before its emission. Empty below MB_PER_EPOCH, which pays nothing.
+#[inline]
+pub fn work_window_of(epoch: u64) -> (u64, u64) {
+    let end = epoch / MB_PER_EPOCH;
+    (end.saturating_sub(1).saturating_mul(EMISSION_BLOCK_INTERVAL), end.saturating_mul(EMISSION_BLOCK_INTERVAL))
+}
+
+/// Grid epochs above the claim watermark, ascending, up to the highest root stored here. An epoch
+/// whose root is missing is still yielded: the watermark is monotonic, so callers stop there.
+pub fn grid_epochs_after(storage: &crate::storage::Storage, last_claimed: u64) -> impl Iterator<Item = u64> {
+    let first = (last_claimed / MB_PER_EPOCH).saturating_add(1).saturating_mul(MB_PER_EPOCH);
+    let highest = storage.reward_epochs_from(first).ok().and_then(|v| v.last().copied()).unwrap_or(0);
+    (first..=highest).step_by(MB_PER_EPOCH as usize)
+}
+
+/// Epoch `epoch`'s certified root: the stored row, else derived (and cached) from the certifying
+/// macroblock this node holds, the same resolution root_for_apply makes. None when neither is here.
+pub fn epoch_root_or_derive(storage: &crate::storage::Storage, epoch: u64) -> Option<[u8; 32]> {
+    match storage.load_epoch_root(epoch) {
+        Ok(Some(r)) => Some(r),
+        _ => storage.derive_epoch_root_from_macroblock(epoch).ok().flatten(),
+    }
+}
+
 /// Amount epoch `E` distributes. A formula over height, NEVER read from a TX — which is what
 /// bounds the money rather than only the supply counter. A producer cannot mint the scheduled
 /// figure while funding the epoch with one nano, because it does not get to state the figure:
@@ -361,6 +386,20 @@ mod tests {
             assert!(is_reward_epoch(e), "epoch {} is not on the epoch grid", e);
         }
     }
+
+    /// The reward gather and the history label read one window: the emission at
+    /// k*EMISSION_BLOCK_INTERVAL pays eligibility epoch k-2.
+    #[test]
+    fn work_window_is_the_epoch_two_before_its_emission() {
+        for k in 2..10_000u64 {
+            let e = crate::node::BlockchainNode::emission_mb_index(EMISSION_BLOCK_INTERVAL * k);
+            assert_eq!(work_window_of(e),
+                       ((k - 2) * EMISSION_BLOCK_INTERVAL, (k - 1) * EMISSION_BLOCK_INTERVAL),
+                       "work window drifted at k={}", k);
+        }
+        assert_eq!(work_window_of(13_760), (1_224_000, 1_238_400));
+        assert_eq!(work_window_of(0), (0, 0), "keys below MB_PER_EPOCH pay no window");
+    }
 }
 
 #[cfg(test)]
@@ -429,6 +468,33 @@ mod tests_apply_authority {
             assert!(st.load_epoch_root(e).unwrap().is_some(), "listed epoch {} has no root", e);
         }
     }
+
+    /// The claim walk follows the grid, not the stored rows: a missing row inside the range is
+    /// yielded, so callers stop there instead of advancing the watermark past it.
+    #[test]
+    fn grid_walk_yields_a_missing_epoch_instead_of_skipping_it() {
+        let (st, _d) = temp_storage();
+        for e in [MB_PER_EPOCH, MB_PER_EPOCH * 3] {
+            st.seed_epoch_root_for_test(e, [1u8; 32]);
+        }
+        let walked: Vec<u64> = grid_epochs_after(&st, 0).collect();
+        assert_eq!(walked, vec![MB_PER_EPOCH, MB_PER_EPOCH * 2, MB_PER_EPOCH * 3]);
+        assert!(st.load_epoch_root(MB_PER_EPOCH * 2).unwrap().is_none(), "the gap is walked, not listed");
+    }
+
+    /// Starts strictly above the watermark and ends at the highest stored root.
+    #[test]
+    fn grid_walk_is_bounded_by_the_watermark_and_the_highest_root() {
+        let (st, _d) = temp_storage();
+        assert_eq!(grid_epochs_after(&st, 0).count(), 0, "no roots, nothing to walk");
+        for i in 0..5u64 {
+            st.seed_epoch_root_for_test(i * MB_PER_EPOCH, [2u8; 32]);
+        }
+        assert_eq!(grid_epochs_after(&st, 0).next(), Some(MB_PER_EPOCH), "watermark 0 never yields epoch 0");
+        assert_eq!(grid_epochs_after(&st, MB_PER_EPOCH * 2).collect::<Vec<_>>(),
+                   vec![MB_PER_EPOCH * 3, MB_PER_EPOCH * 4]);
+        assert_eq!(grid_epochs_after(&st, MB_PER_EPOCH * 4).count(), 0, "nothing above the highest root");
+    }
 }
 
 #[cfg(test)]
@@ -471,7 +537,7 @@ mod tests_registration_dedup {
         st.save_node_registration_at_height_burn("act_node", "super", "wallet_a", 1.0, 10, "").unwrap();
         // A real registration.
         st.save_node_registration_at_height_burn("reg_node", "super", "wallet_r", 1.0, 20, "burn").unwrap();
-        st.mark_node_registration_origin("reg_node", "wallet_r").unwrap();
+        st.mark_node_registration_origin("reg_node", "wallet_r", 20).unwrap();
 
         let origins = st.load_registration_origins().expect("origins");
         assert_eq!(origins, vec![("reg_node".to_string(), "wallet_r".to_string())],

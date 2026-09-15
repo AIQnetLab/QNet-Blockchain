@@ -60,7 +60,8 @@ pub(crate) use crate::{
 /// Snapshot FORMAT version — what a transported state snapshot is stamped with and checked against.
 /// Not the wire protocol (that pair lives in `p2p_transport`): sharing the name with it invited a
 /// bump in the wrong place, which would have made every node reject every peer's snapshot.
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 1;
+/// 2: the frame leaves out the node-local reward shard cache. Readers take 1 and 2 alike.
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 2;
 
 /// Which build this process is running, for operators. Set by the image at runtime (the CI passes the
 /// commit), so it costs nothing at compile time and does not bust the build cache. Without it an
@@ -105,7 +106,7 @@ pub const MAX_VALIDATORS: usize = 1000;
 pub const ROTATION_INTERVAL_BLOCKS: u64 = 30; // Producer rotation every 30 blocks
 #[allow(dead_code)]
 const MIN_BYZANTINE_NODES: usize = 4; // 3f+1 where f=1
-const SNAPSHOT_FULL_INTERVAL: u64 = 43200; // Full snapshot every 12 hours (43,200 microblocks = 480 macroblocks)
+pub(crate) const SNAPSHOT_FULL_INTERVAL: u64 = 43200; // Full snapshot every 12 hours (43,200 microblocks = 480 macroblocks)
 pub const SNAPSHOT_INCREMENTAL_INTERVAL: u64 = 3600; // Incremental snapshot every 1 hour (3,600 microblocks = 40 macroblocks)
 pub const SNAPSHOT_EARLY_ANCHOR_HEIGHT: u64 = 90; // First consensus-bindable boundary (mb_idx=1): a young chain has a servable snapshot well before the 3600 interval
 /// Newest snapshots retained per type by cleanup_old_snapshots (single source of truth).
@@ -343,6 +344,12 @@ pub(crate) struct ArmLadderState {
     last_dial: Option<std::time::Instant>,
 }
 
+/// T3 of the arm gate, shared with the client-submit endpoint: the strict corroborated head is known
+/// (0 = unknown, no verdict here) and more than DEFICIT_BOUND above the local tip.
+pub(crate) fn arm_deficit_exceeded(local: u64, ceiling: u64) -> bool {
+    ceiling > 0 && ceiling > local.saturating_add(DEFICIT_BOUND)
+}
+
 /// Fail-closed registration arm gate + anti-livelock ladder.
 /// T1 coordinator_is_production_ready — necessary but fails open alone (Synchronized{0}); T2+T3
 /// carry the fix. T2 strict corroborated ceiling (unified_p2p::corroborated_head_ceiling — the
@@ -361,7 +368,7 @@ fn registration_arm_gate(ladder: &mut ArmLadderState) -> bool {
     if ceiling > 0 {
         ladder.strict_zero_since = None;
         ladder.wc_defers = 0;
-        if ceiling > local.saturating_add(DEFICIT_BOUND) {
+        if arm_deficit_exceeded(local, ceiling) {
             if is_info() { println!("[INFO][REG] arm_defer reason=behind local={} ceiling={}", local, ceiling); }
             return false;
         }
@@ -1089,6 +1096,32 @@ mod fix5_kat_tests {
         assert!(d3::verify_detached_signature(&d3_sig, msg.as_bytes(), &d3_pk).is_ok());
     }
 
+    // A contract call's signature covers its gas from the gate on; below it the form without the gas verifies
+    // too, so blocks under the gate replay unchanged. A relay that raises the gas never passes the new form.
+    #[test]
+    fn a_contract_call_signature_covers_its_gas_from_the_gate() {
+        let (pk, sk) = d3::keypair();
+        let pk_bytes = pk.as_bytes().to_vec();
+        let from = crate::crypto::solana_derivation::eon_from_qnet_dilithium_pubkey_bytes(&pk_bytes).expect("eon");
+        let tx = qnet_state::Transaction::new(
+            from.clone(), None, 0, 1, 10, 100_000, 1_700_000_000,
+            Some(r#"{"args":[],"contract":"c","method":"m"}"#.to_string()),
+            qnet_state::TransactionType::ContractCall, None,
+        );
+        let sign = |msg: &str| tx.clone().with_quantum_signature(
+            Some(d3::detached_sign(msg.as_bytes(), &sk).as_bytes().to_vec()), Some(pk_bytes.clone()));
+        let gate = qnet_state::feature_gates::CONTRACT_GAS_SIGNED_GATE_HEIGHT;
+        let new_form = sign(&super::BlockchainNode::build_canonical_verify_message(&tx));
+        assert!(super::BlockchainNode::verify_user_tx_dilithium_at(&new_form, gate - 1));
+        assert!(super::BlockchainNode::verify_user_tx_dilithium_at(&new_form, gate));
+        let old_form = sign(&super::BlockchainNode::legacy_contract_message(&tx).expect("contract form"));
+        assert!(super::BlockchainNode::verify_user_tx_dilithium_at(&old_form, gate - 1), "below the gate");
+        assert!(!super::BlockchainNode::verify_user_tx_dilithium_at(&old_form, gate), "not from the gate on");
+        let mut raised = new_form.clone();
+        raised.gas_price = 1_000;
+        assert!(!super::BlockchainNode::verify_user_tx_dilithium_at(&raised, gate - 1), "raised gas");
+    }
+
     // Regression guard: the NODE-BINARY lifecycle signer must emit the RAW detached wire form
     // (3309 B sig + 1952 B pk) that verify_node_lifecycle_dilithium requires. The envelope form
     // (sign_consensus) is length-gated out and silently killed super registration + reactivation.
@@ -1357,6 +1390,13 @@ pub(crate) fn light_owner_deadlines(epoch: u64) -> [u64; 3] {
     [w, w * 2 / 3, w / 3]
 }
 
+/// Whether an owner stands down for a shard's epoch. The primary waits only for its own row, so a
+/// backup's partial cover landing first never keeps the primary's bits out of the OR-merge; a backup
+/// stands down on any row, so a healthy primary costs the backups nothing.
+pub(crate) fn light_owner_stands_down(rank: usize, own_row: bool, any_row: bool) -> bool {
+    if rank == 0 { own_row } else { any_row }
+}
+
 /// The roster is frozen when the window opens, never inside it. Bit positions are permanent reg_index
 /// values, so a late registration shifts nothing - but it lands past the emitted bitmap's index_span
 /// and reads back as "did not attest", losing that node its epoch through no fault of its own.
@@ -1415,11 +1455,11 @@ pub(crate) fn derive_window_beacon(storage: &Storage, w: u64) -> Option<[u8; 32]
 /// True iff `node_id` was equivocation-banned at or below `window_head`, read the way the reward roster
 /// already reads it: the LIVE applied state first, disk only for an evicted account.
 ///
-/// The accounts column family is NOT the source of truth here. It is written asynchronously and
-/// best-effort after apply, and the producer-inline apply never writes it at all — so a node that just
-/// produced the block carrying an equivocation proof would disagree with every validator about its own
-/// block. The StateManager map IS what state_root is computed from, and `banned_at_height` is
-/// write-once monotone, so reading it at a later tip still answers the as-of-window question exactly.
+/// The accounts column family is NOT the source of truth here: its writer runs behind the apply, so a
+/// row can trail the block that just changed it, and a node reading it would disagree with every
+/// validator about that block. The StateManager map IS what state_root is computed from, and
+/// `banned_at_height` is write-once monotone, so reading it at a later tip still answers the
+/// as-of-window question exactly.
 fn banned_at_or_below(
     state_guard: &StateManager,
     storage: &crate::storage::Storage,
@@ -1942,7 +1982,7 @@ pub(crate) static BLOCK_VERIFY_SEM: once_cell::sync::Lazy<tokio::sync::Semaphore
 
 /// Which verify lane a caller runs on — selects the semaphore + acquire policy above.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum VerifyLane { Admission, Block }
+pub(crate) enum VerifyLane { Admission, Block(u64) }
 
 /// Whether a NodeReactivation's wire key matches the vrf_pk committed for its sender
 /// (see BlockchainNode::reactivation_key_state).
@@ -3799,6 +3839,86 @@ pub fn try_get_mempool() -> Option<&'static Arc<qnet_mempool::SimpleMempool>> {
     GLOBAL_MEMPOOL_INSTANCE.get()
 }
 
+/// Whether the chain view holds the commitment a `commitment_dedup_key` names: the one map from a
+/// commitment class to the state's own dedup record, read by admission and the producer. Activations and
+/// heartbeats keep no dedup record (their effect lives in the account) and are never on chain here.
+pub(crate) fn commitment_on_chain(sg: &StateManager, key: &(String, u64, u8)) -> bool {
+    let (identity, epoch, type_id) = key;
+    match type_id {
+        // One-shot, kept in the node registry rather than committed_epochs.
+        4 => sg.is_node_registered(identity),
+        1 => sg.is_epoch_committed("heartbeat", identity, *epoch),
+        2 => sg.is_epoch_committed("ping", identity, *epoch),
+        3 => sg.is_epoch_committed("bitmap", identity, *epoch),
+        5 => sg.is_epoch_committed("reactivation", identity, *epoch),
+        _ => false,
+    }
+}
+
+/// After a journal undo: free the marks of exactly the commitments the undone blocks carried that the
+/// state no longer holds, so they can be admitted again. O(undone commitments); returns the number freed.
+pub(crate) fn release_finalized_marks(sg: &StateManager, keys: &[(String, u64, u8)]) -> usize {
+    let Some(mp) = try_get_mempool() else { return 0; };
+    keys.iter().filter(|k| !finalized_mark_backed(sg, k) && mp.unmark_finalized(k)).count()
+}
+
+/// After a replay from genesis, which rebuilds every record exactly: drop every mark the state no longer
+/// backs. O(mark cache), so only for that path, which a young chain alone takes.
+pub(crate) fn sync_finalized_marks(sg: &StateManager) -> usize {
+    try_get_mempool().map_or(0, |mp| mp.retain_finalized_marks(|k| finalized_mark_backed(sg, k)))
+}
+
+/// After a snapshot restore: drop the marks the restored state no longer backs for the classes it rebuilds
+/// exactly (registrations from the reseeded map, activations and heartbeats from the accounts) and keep the
+/// epoch-class marks, whose records the reseed does not refill. Returns the number dropped.
+pub(crate) fn sync_restored_marks(sg: &StateManager) -> usize {
+    try_get_mempool().map_or(0, |mp| mp.retain_finalized_marks(|k| restored_mark_backed(sg, k)))
+}
+
+fn restored_mark_backed(sg: &StateManager, k: &(String, u64, u8)) -> bool {
+    match k.2 {
+        4 => sg.is_node_registered(&k.0),
+        6 | 7 => commitment_backed_by_state(sg, k),
+        _ => true,
+    }
+}
+
+/// Whether the state backs the commitment a `commitment_dedup_key` names, for every class: the mempool
+/// doors (gossip and RPC) and the rewind helpers share it. Activations and heartbeats keep no dedup
+/// record, but the account carries what they wrote: the node flag (apply ignores an activation from a
+/// node wallet), and the heartbeat's subwindow bit. Read from memory only: after a rewind the disk row
+/// can still be the discarded block's, while memory holds the rewound state (an evicted account reads as
+/// unbacked, which only admits an idempotent activation or heartbeat).
+pub(crate) fn commitment_backed_by_state(sg: &StateManager, k: &(String, u64, u8)) -> bool {
+    match k.2 {
+        1..=5 => commitment_on_chain(sg, k),
+        6 => sg.accounts.get(&k.0).map_or(false, |a| a.is_node),
+        7 => {
+            let (epoch, bit) = (k.1 / 10, 1u16 << ((k.1 % 10).min(9) as u32));
+            sg.accounts.get(&k.0).map_or(false, |a| (a.heartbeat_epoch == epoch && a.heartbeat_slots & bit != 0)
+                || (a.heartbeat_final_epoch == epoch && a.heartbeat_final_slots & bit != 0))
+        }
+        _ => false,
+    }
+}
+
+/// The one admission rule for commitment TXs, run by every mempool door and local emitter whatever the TX's
+/// nonce or system class: refuse a commitment the state already holds. Other TXs pass without the lock.
+pub(crate) async fn refuse_held_commitment(state: &RwLock<StateManager>, tx: &qnet_state::Transaction) -> Result<(), String> {
+    let Some(key) = tx.commitment_dedup_key() else { return Ok(()) };
+    let held = commitment_backed_by_state(&*state.read().await, &key);
+    if held {
+        return Err(format!("duplicate commitment id={} epoch={} type={} already held by the state",
+            qnet_state::char_prefix(&key.0, 16), key.1, key.2));
+    }
+    Ok(())
+}
+
+/// Whether the state still backs a mark; a class the state keeps no record of keeps its mark.
+fn finalized_mark_backed(sg: &StateManager, k: &(String, u64, u8)) -> bool {
+    !(1..=7).contains(&k.2) || commitment_backed_by_state(sg, k)
+}
+
 /// v4.3: Global P2P instance — for broadcasting TX from activation_validation.rs
 /// Without this, NodeActivation TX stays in local mempool and is only included
 /// when this specific node becomes block producer.
@@ -4920,12 +5040,6 @@ impl BlockchainNode {
             .map_err(|e| QNetError::StorageError(e.to_string()))
     }
     
-    /// Get raw snapshot data for P2P download
-    pub fn get_snapshot_data(&self, height: u64) -> Result<Option<Vec<u8>>, QNetError> {
-        self.storage.get_snapshot_data(height)
-            .map_err(|e| QNetError::StorageError(e.to_string()))
-    }
-    
     pub async fn get_block(&self, height: u64) -> Result<Option<qnet_state::Block>, QNetError> {
         // v2.70: Use auto-format loader that handles both EfficientMicroBlock and legacy MicroBlock
         // EfficientMicroBlock stores only TX hashes - full TXs are in separate "transactions" CF
@@ -5170,6 +5284,202 @@ mod tests {
         assert!(checkpoint_participation_allowed(false, 250, mb_end));     // syncing, ahead of end → yes
         assert!(!checkpoint_participation_allowed(false, 179, mb_end));    // syncing, missing last block → defer
         assert!(!checkpoint_participation_allowed(false, 0, mb_end));      // syncing, no window → defer
+    }
+
+    // The arm deficit test the server gate and the client submit share: an unknown head gives no
+    // verdict, the bound itself still arms, one block past it is behind.
+    #[test]
+    fn arm_deficit_bound() {
+        assert!(!arm_deficit_exceeded(1_000, 0));
+        assert!(!arm_deficit_exceeded(1_000, 900));
+        assert!(!arm_deficit_exceeded(1_000, 1_000 + DEFICIT_BOUND));
+        assert!(arm_deficit_exceeded(1_000, 1_001 + DEFICIT_BOUND));
+        assert!(!arm_deficit_exceeded(u64::MAX, u64::MAX));
+    }
+
+    // Finalized marks follow every rewind of the chain view (snapshot reseed, journal undo, replay from
+    // genesis), the dedup seed stands at the state's own height before any replay, and the client submit
+    // runs the arm deficit test before it fans out to the attestors.
+    // After a restore the marks follow the classes the state rebuilds exactly and keep the others.
+    #[test]
+    fn restored_marks_follow_registrations_activations_and_heartbeats() {
+        let sg = StateManager::new();
+        let mut node = qnet_state::Account::new("w_node".to_string());
+        node.is_node = true;
+        node.heartbeat_epoch = 3;
+        node.heartbeat_slots = 1 << 2;
+        sg.accounts.insert("w_node".to_string(), node);
+        assert!(restored_mark_backed(&sg, &("w_node".to_string(), 1, 6)), "an activation the account records");
+        assert!(!restored_mark_backed(&sg, &("w_other".to_string(), 1, 6)), "an activation the state does not hold");
+        assert!(restored_mark_backed(&sg, &("w_node".to_string(), 32, 7)), "heartbeat epoch 3, subwindow 2");
+        assert!(!restored_mark_backed(&sg, &("w_node".to_string(), 33, 7)), "subwindow 3 was never set");
+        assert!(!restored_mark_backed(&sg, &("n_unknown".to_string(), 0, 4)), "a registration the reseed did not restore");
+        assert!(restored_mark_backed(&sg, &("anyone".to_string(), 7, 1)), "epoch-class marks stay");
+    }
+
+    #[test]
+    fn finalized_marks_and_the_client_arm_gate_are_wired() {
+        let roster = include_str!("../storage/roster.rs");
+        let reseed = roster.find("pub fn reseed_commitment_dedup").expect("reseed");
+        let bound = roster[reseed..].find("let up_to = sg.chain_state.read().height;").expect("the seed reads the state height") + reseed;
+        let seeded = roster[reseed..].find("self.registry_root_covered_origins(up_to)").expect("the seed is bounded by it") + reseed;
+        assert!(bound < seeded);
+        let apply = include_str!("state_apply.rs");
+        let restored = apply.find("cs.height = snap_height;").expect("reconcile sets the state height");
+        let reseeded = apply.find("storage.reseed_commitment_dedup(&*sg)").expect("reconcile reseeds");
+        let replay = apply[reseeded..].find("Self::replay_block_verified(&sg, storage, mb)").expect("reconcile replay") + reseeded;
+        let marks = apply[replay..].find("crate::node::sync_restored_marks(&sg)").expect("the restored marks follow the replay") + replay;
+        assert!(restored < reseeded && reseeded < replay && replay < marks);
+        let boot = include_str!("lifecycle.rs");
+        let pre = boot.find("storage.reseed_commitment_dedup(&*sg)").expect("boot seeds");
+        assert!(pre < boot.find("Self::replay_block_verified(").expect("boot replay"), "the boot seed precedes the tail replay");
+        let snaps = include_str!("../storage/snapshots.rs");
+        let rehydrate = snaps.find("self.reseed_commitment_dedup(&*sg)?;").expect("cold-join reseeds");
+        assert!(snaps[rehydrate..].find("crate::node::sync_restored_marks(&*sg);").map_or(false, |o| o < 160),
+                "the cold-join marks follow its reseed");
+        let undo = apply.find("pub(super) async fn undo_from_journals").expect("journal undo");
+        let rewound = apply[undo..].find("sg.undo_blocks_above(target, tip)").expect("undo") + undo;
+        let freed = apply[undo..].find("crate::node::release_finalized_marks(&sg, &commit_keys)").expect("journal undo frees the marks") + undo;
+        assert!(rewound < freed, "the marks follow the undone set");
+        let full = apply.find("mode = \"full\";").expect("replay from genesis");
+        let replayed = apply[full..].find("crate::node::sync_finalized_marks(&sg)").expect("a replay from genesis syncs the marks");
+        assert!(replayed > 0);
+        let submit = include_str!("../rpc/registration_api.rs");
+        let gate = submit.find("crate::node::arm_deficit_exceeded(local, ceiling)").expect("client-submit lag gate");
+        let collect = submit.find("BlockchainNode::collect_burn_attestations(").expect("attestor fan-out");
+        assert!(gate < collect, "the lag gate stands before the attestor fan-out");
+    }
+
+    // A reconcile or boot reseed holds exactly the registrations a from-genesis node holds at the
+    // restored height; the replay above it re-applies the rest. Seeded ahead, the replay refused a
+    // registration and journaled it as present, so an undo below it kept the node after the rollback
+    // had pruned its row: the canonical re-apply was refused and registry_root went one row short.
+    #[tokio::test]
+    async fn the_dedup_seed_stops_at_the_state_height_so_an_undo_frees_a_replayed_registration() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage");
+        let cf = storage.registry_cf_for_test();
+        let later = burn_node_id();
+        for (id, h) in [("node_early".to_string(), 10u64), (later.clone(), 20)] {
+            storage.put_registry_row_for_test(&cf, format!("srtr_{}", id).as_bytes(), b"x");
+            storage.put_registry_row_for_test(&cf, format!("node_{}", id).as_bytes(),
+                format!(r#"{{"reg_height":{},"wallet":"w_{}","burn":"b","vrf_pk_sha3":""}}"#, h, id).as_bytes());
+        }
+        let sg = StateManager::new();
+        sg.chain_state.write().height = 15;
+        storage.reseed_commitment_dedup(&sg).expect("reseed");
+        assert!(sg.is_node_registered("node_early"));
+        assert!(!sg.is_node_registered(&later), "a registration above the restored height is replayed, not seeded");
+
+        // The replay applies the registration at 20 and journals it; an undo below 20 must free it.
+        let reg = burn_reg_tx_id(&later, "burn", "burn_tx_later", 1_000, vec![]);
+        let mut snap = qnet_state::BlockSnapshot::new(&dashmap::DashMap::new(), 20);
+        sg.record_commitment_pre_image(&reg, &mut snap);
+        sg.mark_node_registered(&later, "w_later");
+        sg.retain_block_journal(snap);
+        assert!(sg.undo_blocks_above(19, 20).is_some(), "the journal covers the undone block");
+        assert!(!sg.is_node_registered(&later), "the canonical re-apply must find the node unregistered");
+
+        // Once the state stands at the registration's height, the seed holds it.
+        sg.chain_state.write().height = 20;
+        storage.reseed_commitment_dedup(&sg).expect("reseed");
+        assert!(sg.is_node_registered(&later));
+    }
+
+    // A row first stamped by an activation keeps that height when the node's registration lands later. The
+    // seed follows the registration's own height, and a rolled-back registration stays out until re-applied.
+    #[tokio::test]
+    async fn the_dedup_seed_follows_the_registration_height_not_the_first_stamp() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage");
+        let cf = storage.registry_cf_for_test();
+        storage.put_registry_row_for_test(&cf, b"srtr_super_act", b"x");
+        storage.put_registry_row_for_test(&cf, b"node_super_act",
+            br#"{"reg_height":10,"wallet":"w_act","burn":"b","vrf_pk_sha3":""}"#);
+        storage.mark_node_registration_origin("super_act", "w_act", 20).expect("marker");
+        let sg = StateManager::new();
+        sg.chain_state.write().height = 15;
+        storage.reseed_commitment_dedup(&sg).expect("reseed");
+        assert!(!sg.is_node_registered("super_act"), "registered at 20, not at the activation's 10");
+        sg.chain_state.write().height = 20;
+        storage.reseed_commitment_dedup(&sg).expect("reseed");
+        assert!(sg.is_node_registered("super_act"));
+        storage.rebuild_registry_lthash(15).expect("rollback to 15");
+        storage.reseed_commitment_dedup(&sg).expect("reseed");
+        assert!(!sg.is_node_registered("super_act"), "a rolled-back registration stays out until re-applied");
+        storage.mark_node_registration_origin("super_act", "w_act", 18).expect("canonical re-registration");
+        storage.reseed_commitment_dedup(&sg).expect("reseed");
+        assert!(sg.is_node_registered("super_act"));
+    }
+
+    // One class-to-record map serves admission, the producer and the mark sync: a rewind frees exactly
+    // what the state no longer holds, and a class with no state record keeps its mark.
+    #[test]
+    fn finalized_marks_follow_the_state_record() {
+        let sg = StateManager::new();
+        sg.mark_node_registered("light_a", "wallet_a");
+        sg.mark_epoch_committed("bitmap", "genesis_node_002:genesis_node_003", 7);
+        assert!(commitment_on_chain(&sg, &("light_a".to_string(), 0, 4)));
+        assert!(!commitment_on_chain(&sg, &("light_b".to_string(), 0, 4)));
+        assert!(commitment_on_chain(&sg, &("genesis_node_002:genesis_node_003".to_string(), 7, 3)));
+        assert!(!commitment_on_chain(&sg, &("genesis_node_002:genesis_node_002".to_string(), 7, 3)),
+                "another owner's row is its own commitment");
+        assert!(!finalized_mark_backed(&sg, &("light_b".to_string(), 0, 4)), "a rolled-back registration is freed");
+        // Activations and heartbeats follow what they wrote into the account.
+        let mut hb = qnet_state::Account::new("super_x".to_string());
+        hb.heartbeat_epoch = 7;
+        hb.heartbeat_slots = 1 << 3;
+        let mut act = qnet_state::Account::new("wallet_act".to_string());
+        act.is_node = true;
+        sg.restore_accounts(vec![("super_x".to_string(), hb), ("wallet_act".to_string(), act)]).unwrap();
+        assert!(finalized_mark_backed(&sg, &("super_x".to_string(), 73, 7)), "the heartbeat's bit is set: kept");
+        assert!(!finalized_mark_backed(&sg, &("super_x".to_string(), 74, 7)), "an undone heartbeat's bit is clear: freed");
+        assert!(finalized_mark_backed(&sg, &("wallet_act".to_string(), 1, 6)), "an applied activation: kept");
+        assert!(!finalized_mark_backed(&sg, &("wallet_other".to_string(), 1, 6)), "an undone activation: freed");
+        // The doors refuse what the state backs, for every class: a node wallet's activation in either
+        // phase and a set heartbeat bit too, both of which apply ignores.
+        assert!(commitment_backed_by_state(&sg, &("wallet_act".to_string(), 2, 6)));
+        assert!(commitment_backed_by_state(&sg, &("super_x".to_string(), 73, 7)));
+        assert!(!commitment_backed_by_state(&sg, &("super_x".to_string(), 74, 7)));
+        assert!(commitment_backed_by_state(&sg, &("light_a".to_string(), 0, 4)));
+        assert!(!commitment_backed_by_state(&sg, &("x".to_string(), 0, 9)), "an unknown class is never backed at a door");
+        assert!(finalized_mark_backed(&sg, &("x".to_string(), 0, 9)), "but keeps its mark");
+    }
+
+    // Both apply paths age their marks by the block's height, and both mempool doors ask the state,
+    // whose records outlive the marks.
+    #[test]
+    fn finalized_marks_age_on_the_chain_clock_and_the_doors_ask_the_state() {
+        assert!(include_str!("../block_pipeline.rs").contains("mempool_arc.mark_commitment_finalized(key, height);"));
+        assert!(include_str!("production.rs").contains("mempool.mark_commitment_finalized(key, height_for_storage);"));
+        assert_eq!(include_str!("transactions.rs").matches("crate::node::refuse_held_commitment(&self.state, &tx)").count(), 2,
+                   "the gossip door and the RPC submit both refuse what the state holds");
+        for (name, src) in [("registration_api.rs", include_str!("../rpc/registration_api.rs")),
+                            ("activation_validation.rs", include_str!("../activation_validation.rs")),
+                            ("activation.rs", include_str!("activation.rs")), ("lifecycle.rs", include_str!("lifecycle.rs"))] {
+            assert!(src.contains("refuse_held_commitment(") || src.contains("commitment_backed_by_state("),
+                    "{} inserts without asking the state", name);
+        }
+        assert!(include_str!("production.rs").contains("crate::node::commitment_backed_by_state(&state_snapshot, &key)"),
+                "the producer drops every class the state holds");
+    }
+
+    // After a rewind the disk row of an account an undone block created is still that block's; a mark is
+    // judged by memory alone, so the row cannot keep an undone activation or heartbeat marked.
+    #[test]
+    fn a_discarded_blocks_disk_row_does_not_back_a_mark() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = std::sync::Arc::new(crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage"));
+        let sg = StateManager::new();
+        sg.set_disk_store(storage.clone() as std::sync::Arc<dyn qnet_state::AccountStore>);
+        let mut orphan = qnet_state::Account::new("w_orphan".to_string());
+        orphan.is_node = true;
+        orphan.heartbeat_epoch = 7;
+        orphan.heartbeat_slots = 1 << 3;
+        assert!(qnet_state::AccountStore::persist_accounts(&*storage, vec![("w_orphan".to_string(), orphan)]));
+        assert!(sg.get_account("w_orphan").is_some(), "the read-through still finds the discarded row");
+        assert!(!finalized_mark_backed(&sg, &("w_orphan".to_string(), 1, 6)), "the undone activation is freed");
+        assert!(!finalized_mark_backed(&sg, &("w_orphan".to_string(), 73, 7)), "the undone heartbeat is freed");
     }
 
     // P3 test microblock: distinct body per (height,tag) so hash() differs; all other fields inert.
@@ -6291,7 +6601,7 @@ mod tests {
         storage.put_registry_row_for_test(&cf, b"node_node_victim",
             br#"{"reg_height":11,"wallet":"w_victim","burn":"b","vrf_pk_sha3":""}"#);
 
-        let covered = storage.registry_root_covered_origins().expect("covered");
+        let covered = storage.registry_root_covered_origins(u64::MAX).expect("covered");
         assert_eq!(covered, vec![("node_real".to_string(), "w_real".to_string())],
                    "the dedup seed must contain exactly the root-covered bindings");
         assert!(!covered.iter().any(|(id, _)| id == "node_victim"),
@@ -6301,8 +6611,18 @@ mod tests {
         // is excluded by the root's own fold, so it must be excluded here too.
         storage.put_registry_row_for_test(&cf, b"srtr_node_unconf", b"x");
         storage.put_registry_row_for_test(&cf, b"node_node_unconf", br#"{"wallet":"w_u"}"#);
-        assert_eq!(storage.registry_root_covered_origins().expect("covered").len(), 1,
+        assert_eq!(storage.registry_root_covered_origins(u64::MAX).expect("covered").len(), 1,
                    "unconfirmed rows are outside the root and must stay outside the seed");
+
+        // The bound is inclusive: a row stamped at the height is held there, one stamped above is not.
+        storage.put_registry_row_for_test(&cf, b"srtr_node_later", b"x");
+        storage.put_registry_row_for_test(&cf, b"node_node_later",
+            br#"{"reg_height":30,"wallet":"w_later","burn":"b","vrf_pk_sha3":""}"#);
+        let ids = |up_to: u64| storage.registry_root_covered_origins(up_to).expect("covered")
+            .into_iter().map(|(id, _)| id).collect::<Vec<_>>();
+        assert_eq!(ids(9), Vec::<String>::new());
+        assert_eq!(ids(10), vec!["node_real".to_string()]);
+        assert_eq!(ids(30), vec!["node_later".to_string(), "node_real".to_string()]);
     }
 
     // B3. Reaching fork_conflict means the slot was taken during the save's own await — the slot-taken
@@ -6588,7 +6908,7 @@ mod tests {
             live_roots.push(root);
             let rows: Vec<(String, qnet_state::Account)> = live.accounts.iter()
                 .map(|e| (e.key().clone(), e.value().clone())).collect();
-            assert!(qnet_state::AccountStore::persist_accounts(&*storage, &rows), "persist");
+            assert!(qnet_state::AccountStore::persist_accounts(&*storage, rows), "persist");
         }
         assert!(live.accounts.contains_key("wallet_prod"), "the producer wallet must have been credited live");
 
@@ -6741,7 +7061,7 @@ mod tests {
         let mut phantom = qnet_state::Account::default();
         phantom.address = "w_phantom".to_string();
         phantom.balance = 10_000_000_000;
-        assert!(qnet_state::AccountStore::persist_accounts(&*storage, &[("w_phantom".to_string(), phantom)]));
+        assert!(qnet_state::AccountStore::persist_accounts(&*storage, vec![("w_phantom".to_string(), phantom)]));
         let before = qnet_state::CF_ROWS_WITHOUT_LEAF.load(std::sync::atomic::Ordering::Relaxed);
         assert!(!st.warm_account("w_phantom"), "a row without a leaf is absent");
         assert!(!st.accounts.contains_key("w_phantom"));
@@ -6750,7 +7070,7 @@ mod tests {
 
         // The committed value, evicted and read back from the row: admitted.
         st.accounts.remove("w_leaf");
-        assert!(qnet_state::AccountStore::persist_accounts(&*storage, &[("w_leaf".to_string(), committed.clone())]));
+        assert!(qnet_state::AccountStore::persist_accounts(&*storage, vec![("w_leaf".to_string(), committed.clone())]));
         assert!(st.warm_account("w_leaf"));
         assert_eq!(st.accounts.get("w_leaf").map(|a| a.balance), Some(5));
 
@@ -6758,7 +7078,7 @@ mod tests {
         st.accounts.remove("w_leaf");
         let mut stale = committed.clone();
         stale.balance = 999;
-        assert!(qnet_state::AccountStore::persist_accounts(&*storage, &[("w_leaf".to_string(), stale)]));
+        assert!(qnet_state::AccountStore::persist_accounts(&*storage, vec![("w_leaf".to_string(), stale)]));
         assert!(!st.warm_account("w_leaf"), "a stale row is refused");
         assert!(!st.accounts.contains_key("w_leaf"));
         let stale = st.take_mirror_stale();
@@ -6783,7 +7103,7 @@ mod tests {
         st.accounts.remove("w_x");
         let mut stale = committed.clone();
         stale.balance = 999;
-        assert!(qnet_state::AccountStore::persist_accounts(&*storage, &[("w_x".to_string(), stale)]));
+        assert!(qnet_state::AccountStore::persist_accounts(&*storage, vec![("w_x".to_string(), stale)]));
         let mut snap = st.create_block_snapshot(7);
         st.journal_pre_images(&mut snap, &["w_x".to_string()]);
         assert!(snap.created_keys().contains("w_x"), "not resident after the refused warm");
@@ -6811,7 +7131,7 @@ mod tests {
         st.journal_pre_images(&mut snap, &["w_new".to_string()]);
         snap.note_stale_leaves(vec![("w_new".to_string(), None)]);
         st.retain_block_journal(snap);
-        let (undone, mirror) = st.undo_blocks_above(6, 7).expect("the journal covers 7");
+        let (undone, mirror, _) = st.undo_blocks_above(6, 7).expect("the journal covers 7");
         assert_eq!(undone, 1);
         assert!(!mirror.contains_key("w_x"), "no mirror delete for the row the block could not read");
         assert!(matches!(mirror.get("w_new"), Some(None)), "an unread leaf goes, and its row with it");
@@ -6948,6 +7268,50 @@ mod tests {
         let trueup3 = boot.find("trueup_accounts_cf_against(&*state_guard, &storage)").expect("boot true-up");
         let replay3 = boot.find("_replay start=").expect("boot replay loop");
         assert!(verified < trueup3 && trueup3 < replay3, "boot: restore, true-up, then replay");
+    }
+
+    // The accounts CF has one writer, fed in apply order: the pipeline queues a block's rows under the lock
+    // that applied it, before the frontier moves, with the boundary pin right behind; the producer does the
+    // same next to its journal; a replayed block queues its own. The direct writers and the flush-then-pin
+    // at the boundary (the hourly ~10 s producer stall) are gone.
+    #[test]
+    fn the_accounts_cf_is_written_in_apply_order_by_one_writer() {
+        let pipe = include_str!("../block_pipeline.rs");
+        let save = pipe.find("storage_for_save.save_microblock(height, &block_bytes_for_save)").expect("pipeline save");
+        let delta = pipe.find("ctx.storage.mirror_block_delta(height, puts, dels)").expect("pipeline rows");
+        let pin = pipe.find("ctx.storage.request_boundary_pin(&state_guard, height)").expect("pipeline pin");
+        assert!(save < delta && delta < pin, "pipeline: save, rows, then the pin");
+        assert!(!pipe[save..pin].contains("LOCAL_BLOCKCHAIN_HEIGHT.fetch_max("), "the frontier moves after the rows");
+        assert!(pipe[pin..].contains("LOCAL_BLOCKCHAIN_HEIGHT.fetch_max(height"), "and it does move");
+        let prod = include_str!("production.rs");
+        let psave = prod.find("storage_clone.save_block_with_delta(height_for_storage").expect("producer save");
+        let pd = prod.find("storage.mirror_block_delta(height_for_storage, puts, dels)").expect("producer rows");
+        let pp = prod.find("storage.request_boundary_pin(&sg, height_for_storage)").expect("producer pin");
+        let pj = prod.find("sg.retain_block_journal(journal)").expect("producer journal");
+        assert!(psave < pd && pd < pp && pp < pj, "producer: save, rows, pin, journal");
+        assert!(!prod[psave..pj].contains("LOCAL_BLOCKCHAIN_HEIGHT.store("), "the frontier moves after the rows");
+        // A live fork rollback drops the frames above its target once the bodies are gone.
+        let del = prod.find("storage.delete_microblock(h)").expect("rollback deletes");
+        let pruned = prod[del..].find("storage.prune_snapshots_above(rollback_to)").expect("rollback prunes frames") + del;
+        let ended = prod[del..].find("crate::storage::end_rollback_protection();").expect("barrier ends") + del;
+        assert!(pruned < ended, "frames go inside the rollback barrier");
+        let apply = include_str!("state_apply.rs");
+        let step = apply.find("fn replay_block_verified").expect("replay step");
+        let rows = apply[step..].find("storage.mirror_block_delta(mb.height, puts, dels)").expect("replayed rows");
+        let kept = apply[step..].find("sg.retain_block_journal(snap)").expect("replayed journal");
+        assert!(rows < kept, "a replayed block's rows are queued with it");
+        for (name, src) in [
+            ("block_pipeline.rs", pipe), ("production.rs", prod), ("state_apply.rs", apply),
+            ("lifecycle.rs", include_str!("lifecycle.rs")),
+            ("storage/mod.rs", include_str!("../storage/mod.rs")),
+            ("storage/persistent.rs", include_str!("../storage/persistent.rs")),
+            ("storage/snapshots.rs", include_str!("../storage/snapshots.rs")),
+        ] {
+            for gone in ["persist_accounts_batch", "persist_accounts_sync", "prepare_snapshot_view",
+                         "create_state_snapshot", "delete_accounts_cf_keys", "fn save_account("] {
+                assert!(!src.contains(gone), "{} still has {}", name, gone);
+            }
+        }
     }
 
     // The node->wallet lookup answers from the registry row and nothing else. A chain walk behind a
@@ -7351,6 +7715,17 @@ mod tests {
         let d = light_owner_deadlines(0);
         assert_eq!(d[0], light_commit_window(0), "the shard's own genesis may emit for the whole window");
         assert!(d[0] > d[1] && d[1] > d[2] && d[2] > 0, "each backup waits longer than the rank above it: {:?}", d);
+    }
+
+    // The primary is silenced only by its own row, a backup by any row.
+    #[test]
+    fn light_owner_stand_down_depends_on_rank() {
+        assert!(!light_owner_stands_down(0, false, true), "a backup's row must not silence the primary");
+        assert!(light_owner_stands_down(0, true, true), "the primary stops once its own row landed");
+        for rank in [1usize, 2] {
+            assert!(light_owner_stands_down(rank, false, true), "backup {} stands down on any row", rank);
+            assert!(!light_owner_stands_down(rank, false, false), "backup {} covers a shard with no row", rank);
+        }
     }
 
     // Verify-before-serve invariant: the gate hasher (epoch_reward_merkle_root) MUST reproduce the exact
@@ -8695,11 +9070,11 @@ mod tests {
         let mut banned_late = qnet_state::Account::new("super_banned_late".to_string());
         banned_late.banned_at_height = 5_000;         // long after window 2
         let clean = qnet_state::Account::new("super_clean".to_string());
-        storage.persist_accounts_batch(
+        storage.mirror_write_durable(
             vec![(banned_early.address.clone(), banned_early.clone()),
                  (banned_late.address.clone(), banned_late.clone()),
                  (clean.address.clone(), clean.clone())],
-            Vec::new()).await.expect("persist accounts");
+            Vec::new()).expect("persist accounts");
         let ids: Vec<String> = vec!["super_banned_early".into(), "super_banned_late".into(), "super_clean".into()];
 
         let st = qnet_state::State::new();

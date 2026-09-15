@@ -32,6 +32,10 @@ const styles = StyleSheet.create({
     paddingTop: 80,
     backgroundColor: '#0f0f1a',
   },
+  // Wraps a form's ScrollView so an open keyboard shrinks the form instead of covering it.
+  keyboardAvoid: {
+    flex: 1,
+  },
   content: {
     flex: 1,
     padding: 20,
@@ -52,9 +56,11 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     marginBottom: 30,
   },
+  // At least 50 high, growing with a large system font instead of clipping; the vertical padding overrides Android's theme padding.
   input: {
     width: '100%',
-    height: 50,
+    minHeight: 50,
+    paddingVertical: 12,
     backgroundColor: 'rgba(22, 33, 62, 0.8)',
     borderRadius: 10,
     paddingHorizontal: 15,
@@ -64,9 +70,12 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: 'rgba(0, 212, 255, 0.5)',
   },
+  // At least 50 high, and taller when a large system font wraps the label, instead of clipping it.
   button: {
     width: '100%',
-    height: 50,
+    minHeight: 50,
+    paddingVertical: 10,
+    paddingHorizontal: 16,
     backgroundColor: '#00d4ff',
     borderRadius: 10,
     justifyContent: 'center',
@@ -82,12 +91,13 @@ const styles = StyleSheet.create({
     color: '#1a1a2e',
     fontSize: 18,
     fontWeight: 'bold',
+    textAlign: 'center',
   },
   secondaryButtonText: {
     color: '#00d4ff',
   },
   textArea: {
-    height: 100,
+    minHeight: 100,
     textAlignVertical: 'top',
     paddingTop: 15,
   },
@@ -143,11 +153,6 @@ const styles = StyleSheet.create({
     color: '#b0b0b0',
     fontSize: 16,
     marginBottom: 5,
-  },
-  addressText: {
-    color: '#ffffff',
-    fontSize: 14,
-    fontFamily: 'monospace',
   },
   actionButton: {
     backgroundColor: '#16213e',
@@ -274,11 +279,6 @@ const styles = StyleSheet.create({
     marginVertical: 15,
     borderWidth: 1,
     borderColor: '#00d4ff20',
-  },
-  addressText: {
-    color: '#ffffff',
-    fontSize: 13,
-    fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
   },
   receiveButtons: {
     flexDirection: 'row',
@@ -471,6 +471,20 @@ const styles = StyleSheet.create({
     paddingHorizontal: 4,
     paddingVertical: 10,
   },
+  // Modal body that shrinks and scrolls under modalBox's 80% cap, so the title and buttons stay visible.
+  modalScroll: {
+    flexGrow: 0,
+    flexShrink: 1,
+  },
+  // Inner padding for modals whose content sits directly in modalBox (padding 0).
+  modalBody: {
+    paddingHorizontal: 20,
+    paddingTop: 20,
+  },
+  // KeyboardAvoidingView sets paddingBottom (0 while the keyboard is closed); a zero top keeps the box centred.
+  modalOverlayKeyboard: {
+    paddingTop: 0,
+  },
   modalActions: {
     flexDirection: 'row',
     gap: 10,
@@ -555,11 +569,6 @@ const styles = StyleSheet.create({
     color: '#1a1a2e',
     fontWeight: 'bold',
   },
-  checkmark: {
-    color: '#1a1a2e',
-    fontSize: 18,
-    fontWeight: 'bold',
-  },
   seedGrid: {
     flexDirection: 'row',
     flexWrap: 'wrap',
@@ -591,10 +600,8 @@ const styles = StyleSheet.create({
     color: '#ffffff',
     flex: 1,
   },
-  warningText: {
+  seedWarningText: {
     color: '#ffaa00',
-    fontSize: 14,
-    marginBottom: 20,
     textAlign: 'center',
     fontWeight: '600',
   },
@@ -680,8 +687,11 @@ const styles = StyleSheet.create({
   tokenList: {
     marginBottom: 20,
   },
+  // Token rows (and tokenItemClickable) wrap like rewardItem: a balance that does not fit beside the name
+  // takes its own right-aligned line instead of running past the card.
   tokenItem: {
     flexDirection: 'row',
+    flexWrap: 'wrap',
     justifyContent: 'space-between',
     alignItems: 'center',
     backgroundColor: '#16213e',
@@ -692,6 +702,9 @@ const styles = StyleSheet.create({
   tokenInfo: {
     flexDirection: 'row',
     alignItems: 'center',
+    flexShrink: 1,
+    maxWidth: '100%',
+    marginRight: 12,
   },
   tokenIcon: {
     width: 40,
@@ -735,6 +748,7 @@ const styles = StyleSheet.create({
   },
   tokenDetails: {
     justifyContent: 'center',
+    flexShrink: 1,
   },
   tokenName: {
     color: '#ffffff',
@@ -747,18 +761,24 @@ const styles = StyleSheet.create({
   },
   tokenBalance: {
     alignItems: 'flex-end',
+    flexShrink: 1,
+    maxWidth: '100%',
+    marginLeft: 'auto',
   },
   tokenAmount: {
     color: '#ffffff',
     fontSize: 16,
     fontWeight: '600',
+    textAlign: 'right',
   },
   tokenValue: {
     color: '#888',
     fontSize: 12,
+    textAlign: 'right',
   },
   tokenItemClickable: {
     flexDirection: 'row',
+    flexWrap: 'wrap',
     justifyContent: 'space-between',
     alignItems: 'center',
     backgroundColor: '#16213e',
@@ -850,13 +870,19 @@ const styles = StyleSheet.create({
     borderBottomColor: 'rgba(0, 212, 255, 0.2)',
     backgroundColor: 'rgba(0, 212, 255, 0.08)',
   },
+  // Wraps beside the close X instead of pushing it out of the header.
+  mgrTitle: {
+    flexShrink: 1,
+    marginRight: 12,
+  },
   mgrClose: {
     color: '#8aa0b3',
     fontSize: 20,
     fontWeight: '700',
   },
   mgrSearch: {
-    height: 44,
+    minHeight: 44,
+    paddingVertical: 10,
     marginHorizontal: 14,
     marginTop: 14,
     marginBottom: 8,
@@ -987,6 +1013,7 @@ const styles = StyleSheet.create({
   },
   sendTotalContainer: {
     flexDirection: 'row',
+    flexWrap: 'wrap',
     justifyContent: 'space-between',
     alignItems: 'center',
     paddingVertical: 12,
@@ -999,11 +1026,16 @@ const styles = StyleSheet.create({
     color: '#fff',
     fontSize: 16,
     fontWeight: '600',
+    marginRight: 12,
   },
   sendTotalValue: {
     color: '#00d4ff',
     fontSize: 16,
     fontWeight: '700',
+    flexShrink: 1,
+    maxWidth: '100%',
+    textAlign: 'right',
+    marginLeft: 'auto',
   },
   // Send Screen Styles (inline, not modal)
   sendScreenContainer: {
@@ -1023,6 +1055,9 @@ const styles = StyleSheet.create({
     color: '#00d4ff',
     fontSize: 18,
     fontWeight: '600',
+    flexShrink: 1,
+    textAlign: 'center',
+    marginHorizontal: 8,
   },
   backButton: {
     paddingVertical: 8,
@@ -1071,6 +1106,7 @@ const styles = StyleSheet.create({
     fontSize: 24,
     fontWeight: '700',
     marginBottom: 16,
+    textAlign: 'center',
   },
   txResultAmount: {
     color: '#00d4ff',
@@ -1289,6 +1325,7 @@ const styles = StyleSheet.create({
     borderRadius: 8,
     padding: 10,
     marginTop: 10,
+    marginHorizontal: 16,
     color: '#ffffff',
     backgroundColor: '#1a1a2a',
   },
@@ -1372,8 +1409,11 @@ const styles = StyleSheet.create({
     color: '#ffffff',
     marginBottom: 20,
   },
+  // A label and its value share a line when both fit; otherwise the row wraps and the value takes a line
+  // of its own, right-aligned, so a narrow screen or a large system font never pushes it past the card.
   rewardItem: {
     flexDirection: 'row',
+    flexWrap: 'wrap',
     justifyContent: 'space-between',
     alignItems: 'center',
     marginBottom: 12,
@@ -1384,17 +1424,24 @@ const styles = StyleSheet.create({
   rewardLabel: {
     fontSize: 14,
     color: '#888888',
-    flexShrink: 0,
+    maxWidth: '100%',
+    marginRight: 12,
   },
-  // The value is the flexible half of the row: on narrow screens a long value
-  // ("14,257 blocks (~3h 57m)") wraps inside the card instead of running past it.
   rewardValue: {
     fontSize: 16,
     fontWeight: '600',
     color: '#00d4ff',
     flexShrink: 1,
+    maxWidth: '100%',
     textAlign: 'right',
-    marginLeft: 12,
+    marginLeft: 'auto',
+  },
+  // Plain note under a reward row (pending rewards stay out of the balance until claimed).
+  rewardHint: {
+    fontSize: 12,
+    color: '#888888',
+    marginTop: -4,
+    marginBottom: 12,
   },
   validatorNote: {
     fontSize: 12,
@@ -1488,9 +1535,6 @@ const styles = StyleSheet.create({
     color: '#00d4ff',
     textDecorationLine: 'underline',
   },
-  buttonDisabled: {
-    opacity: 0.5,
-  },
   termsModal: {
     flex: 1,
     backgroundColor: 'rgba(0, 0, 0, 0.9)',
@@ -1508,10 +1552,13 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     marginBottom: 20,
   },
+  // Wraps beside the close X instead of pushing it out of the card.
   termsModalTitle: {
     fontSize: 18,
     fontWeight: 'bold',
     color: '#ffffff',
+    flexShrink: 1,
+    marginRight: 12,
   },
   termsModalClose: {
     padding: 5,
@@ -1554,28 +1601,6 @@ const styles = StyleSheet.create({
   },
   termsModalDeclineText: {
     color: '#ffffff',
-  },
-  errorToast: {
-    position: 'absolute',
-    bottom: 40,
-    left: 20,
-    right: 20,
-    backgroundColor: '#ff4444',
-    paddingVertical: 16,
-    paddingHorizontal: 20,
-    borderRadius: 12,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.3,
-    shadowRadius: 8,
-    elevation: 8,
-    zIndex: 1000,
-  },
-  errorToastText: {
-    color: '#ffffff',
-    fontSize: 16,
-    fontWeight: '600',
-    textAlign: 'center',
   },
   lockoutBanner: {
     backgroundColor: '#2a1a1a',

@@ -110,14 +110,15 @@ pub struct SimpleMempool {
     persist_admit: Arc<RwLock<Option<Arc<dyn Fn(&str, &[u8], u64) + Send + Sync>>>>,
     persist_remove: Arc<RwLock<Option<Arc<dyn Fn(&str) + Send + Sync>>>>,
 
-    // On-chain commitment-epoch cache (third dedup tier behind
-    // commitment_index and the producer filter). Mirrors the state crate's
-    // authoritative `committed_epochs` set (filled by mark_commitment_
-    // finalized on producer+peer apply) into a lock-free DashMap so the
-    // admission path can reject finalized-epoch commitments without a
-    // cross-crate state guard. Key = commitment_dedup_key() tuple. Bounded
-    // (~1000×5×~6 ≈ 30k entries) and pruned by prune_committed_epochs_below.
-    committed_epochs_cache: Arc<DashMap<(String, u64, u8), ()>>,
+    // Finalized commitment marks: one per commitment TX applied on chain, keyed by
+    // commitment_dedup_key() and valued by the height it was applied at, so a re-admission is
+    // rejected at the door without a state guard. Each mark ages out after its class's retention
+    // (Transaction::commitment_mark_retention_blocks), pruned on the chain clock by the mark path;
+    // past it the class cannot be included again or the state refuses it. A rewind frees marks
+    // (retain_finalized_marks / unmark_finalized).
+    committed_epochs_cache: Arc<DashMap<(String, u64, u8), u64>>,
+    // Step (height / MARK_PRUNE_STEP_BLOCKS) of the last mark prune.
+    marks_pruned_step: Arc<std::sync::atomic::AtomicU64>,
 
     // Live count of distinct NodeRegistrations (commitment type_id 4) resident in the pool.
     // Live set of NodeRegistration (commitment type_id 4) hashes resident in the pool. SINGLE source
@@ -126,6 +127,10 @@ pub struct SimpleMempool {
     // set directly, O(pending regs) not O(system bucket)). Maintained in lockstep with commitment_index.
     pending_registration_hashes: Arc<DashSet<String>>,
 }
+
+/// Finalized marks are pruned when the first mark crosses a boundary of this many blocks (one
+/// heartbeat subwindow), so the cache stays bounded by the chain clock however fast blocks arrive.
+const MARK_PRUNE_STEP_BLOCKS: u64 = 1_440;
 
 impl SimpleMempool {
     /// Create new optimized mempool with priority queue
@@ -167,6 +172,7 @@ impl SimpleMempool {
             ("mp_senders", self.tx_count_by_sender.len() as u64),
             ("mp_sender_map", self.tx_sender_map.len() as u64),
             ("mp_commitments", self.commitment_index.len() as u64),
+            ("mp_finalized_marks", self.committed_epochs_cache.len() as u64),
             ("mp_gas_levels", self.by_gas_price.read().len() as u64),
         ]
     }
@@ -199,42 +205,55 @@ impl SimpleMempool {
             persist_remove: Arc::new(RwLock::new(None)),
             // v15.12: on-chain commitment-epoch cache (see struct doc)
             committed_epochs_cache: Arc::new(DashMap::new()),
+            marks_pruned_step: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             pending_registration_hashes: Arc::new(DashSet::new()),
         }
     }
 
-    /// v15.12: Notify the mempool that a commitment-class TX with
-    /// `(identity, epoch_or_index, type_id)` has been finalized on chain.
-    ///
-    /// Called by the integration layer's apply path on EVERY block apply
-    /// (producer + peer pipeline) for every commitment-class TX in the block.
-    /// Subsequent admission attempts for the same key are rejected at the
-    /// door — see `is_commitment_already_on_chain`.
-    ///
-    /// Idempotent: re-marking an already-known key is a no-op DashMap insert.
-    pub fn mark_commitment_finalized(&self, key: (String, u64, u8)) {
-        self.committed_epochs_cache.insert(key, ());
+    /// Record that a commitment TX with this `commitment_dedup_key` was applied at `height`, so a
+    /// re-admission is rejected at the door (`is_commitment_already_on_chain`). Called by both apply
+    /// paths (producer and peer pipeline) for every commitment TX of every block. The first mark past a
+    /// step boundary ages the cache on the chain clock, so it stays bounded through a fast catch-up
+    /// too; a mark at a lower height (a rewind) never prunes.
+    pub fn mark_commitment_finalized(&self, key: (String, u64, u8), height: u64) {
+        self.committed_epochs_cache.insert(key, height);
+        let step = height / MARK_PRUNE_STEP_BLOCKS;
+        if step > self.marks_pruned_step.fetch_max(step, std::sync::atomic::Ordering::Relaxed) {
+            self.prune_finalized_marks(height);
+        }
     }
 
-    /// v15.12: Returns true if the mempool has previously been notified that
-    /// `(identity, epoch_or_index, type_id)` is finalized on chain.
-    /// O(1) DashMap lookup; safe in the lock-free admission hot path.
+    /// Whether a mark for this key is held. O(1), lock-free: safe in the admission hot path.
     pub fn is_commitment_already_on_chain(&self, key: &(String, u64, u8)) -> bool {
         self.committed_epochs_cache.contains_key(key)
     }
 
-    /// v15.12: Bulk-prune finalized-epoch entries with `epoch_or_index < min_epoch`.
-    ///
-    /// Intended for the periodic TTL sweep so the cache footprint stays flat
-    /// at thousands-of-validators scale. NodeRegistration uses epoch=0 as a
-    /// one-shot marker and is intentionally excluded from pruning so a
-    /// long-lived registration never gets re-admissible after eviction.
-    pub fn prune_committed_epochs_below(&self, min_epoch: u64) {
-        self.committed_epochs_cache.retain(|key, _| {
-            // type_id 4 = NodeRegistration, one-shot keepsake at epoch=0.
-            let (_, epoch, type_id) = key;
-            *type_id == 4 || *epoch >= min_epoch
+    /// Drop every mark past its class's retention at `tip`. Returns the number dropped.
+    fn prune_finalized_marks(&self, tip: u64) -> usize {
+        let mut dropped = 0usize;
+        self.committed_epochs_cache.retain(|(_, _, type_id), included| {
+            let kept = included.saturating_add(qnet_state::Transaction::commitment_mark_retention_blocks(*type_id)) > tip;
+            if !kept { dropped += 1; }
+            kept
         });
+        dropped
+    }
+
+    /// Drop the finalized marks `keep` rejects, so a commitment whose block was discarded can be
+    /// admitted again. Returns the number dropped.
+    pub fn retain_finalized_marks(&self, keep: impl Fn(&(String, u64, u8)) -> bool) -> usize {
+        let mut dropped = 0usize;
+        self.committed_epochs_cache.retain(|key, _| {
+            let kept = keep(key);
+            if !kept { dropped += 1; }
+            kept
+        });
+        dropped
+    }
+
+    /// Drop one finalized mark; true if it was there.
+    pub fn unmark_finalized(&self, key: &(String, u64, u8)) -> bool {
+        self.committed_epochs_cache.remove(key).is_some()
     }
 
     /// v15.9: Install persistence callbacks. Called once by the integration
@@ -1668,6 +1687,78 @@ mod hygiene_tests {
         assert_eq!(pool.get_pending_for_fill(1, usize::MAX).len(), 1);
         // A budget smaller than one payload still yields one entry (progress guarantee).
         assert_eq!(pool.get_pending_for_fill(10, 1).len(), 1);
+    }
+
+    #[test]
+    fn finalized_marks_follow_the_keep_set() {
+        let pool = test_pool();
+        let reg = |id: &str| (id.to_string(), 0u64, 4u8);
+        let bitmap = ("genesis_node_002:genesis_node_003".to_string(), 7u64, 3u8);
+        pool.mark_commitment_finalized(reg("light_kept"), 1);
+        pool.mark_commitment_finalized(reg("light_rolled_back"), 1);
+        pool.mark_commitment_finalized(bitmap.clone(), 1);
+
+        // The chain view kept one registration and lost the other with the bitmap's block.
+        assert_eq!(pool.retain_finalized_marks(|k| *k == reg("light_kept")), 2);
+        assert!(pool.is_commitment_already_on_chain(&reg("light_kept")));
+        assert!(!pool.is_commitment_already_on_chain(&reg("light_rolled_back")),
+                "a registration whose block was discarded must be admissible again");
+        assert!(!pool.is_commitment_already_on_chain(&bitmap), "and so must a bitmap");
+        pool.mark_commitment_finalized(bitmap.clone(), 1);
+        assert!(pool.unmark_finalized(&bitmap) && !pool.unmark_finalized(&bitmap), "one mark, dropped once");
+        assert_eq!(pool.retain_finalized_marks(|_| true), 0);
+    }
+
+    // A mark is aged by the height it was applied at and its class's retention, never by the key's
+    // second field (an epoch, a macroblock index, an activation phase, epoch*10+subwindow).
+    #[test]
+    fn finalized_marks_age_by_inclusion_height_per_class() {
+        for t in 1u8..=7 {
+            let pool = test_pool();
+            let key = (format!("id{}", t), 2u64, t);
+            pool.mark_commitment_finalized(key.clone(), 1_000);
+            let r = qnet_state::Transaction::commitment_mark_retention_blocks(t);
+            assert_eq!(pool.prune_finalized_marks(1_000 + r - 1), 0, "class {} is kept through its retention", t);
+            assert_eq!(pool.prune_finalized_marks(1_000 + r), 1, "class {} ages out right after it", t);
+            assert!(!pool.is_commitment_already_on_chain(&key) && !pool.unmark_finalized(&key));
+        }
+    }
+
+    // The mark path prunes once per step, when the first mark crosses its boundary; a rewind's lower
+    // height never prunes.
+    #[test]
+    fn the_mark_prune_runs_on_the_chain_clock_and_never_on_a_rewind() {
+        let pool = test_pool();
+        let old = ("old".to_string(), 1u64, 7u8);
+        pool.mark_commitment_finalized(old.clone(), 10);
+        pool.mark_commitment_finalized(("a".to_string(), 1, 7), 1_439);
+        assert!(pool.is_commitment_already_on_chain(&old), "no boundary crossed yet");
+        pool.mark_commitment_finalized(("b".to_string(), 1, 7), 2 * 1_440);
+        assert!(!pool.is_commitment_already_on_chain(&old), "past its retention at the crossing");
+        assert!(pool.is_commitment_already_on_chain(&("a".to_string(), 1, 7)));
+        let rewound = ("rewound".to_string(), 1u64, 7u8);
+        pool.mark_commitment_finalized(rewound.clone(), 5);
+        assert!(pool.is_commitment_already_on_chain(&rewound), "a lower height does not prune");
+        assert!(pool.holder_census().iter().any(|(n, v)| *n == "mp_finalized_marks" && *v == 3));
+    }
+
+    // Steady heartbeats from many nodes: the cache holds at most the marks of the last retention plus
+    // one step, whatever the uptime.
+    #[test]
+    fn heartbeat_marks_stay_bounded_on_the_chain_clock() {
+        let pool = test_pool();
+        let (nodes, per_block) = (2_000u64, 2u64);
+        let mut peak = 0usize;
+        for h in 1..=20_000u64 {
+            for i in 0..per_block {
+                let n = (h * per_block + i) % nodes;
+                let key = (format!("super_{}", n), (h / 14_400) * 10 + (h % 14_400) / 1_440, 7u8);
+                pool.mark_commitment_finalized(key, h);
+            }
+            peak = peak.max(pool.committed_epochs_cache.len());
+        }
+        let bound = (per_block * (qnet_state::Transaction::commitment_mark_retention_blocks(7) + MARK_PRUNE_STEP_BLOCKS)) as usize;
+        assert!(peak <= bound, "peak {} above {}", peak, bound);
     }
 }
 

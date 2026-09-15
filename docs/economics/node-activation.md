@@ -22,7 +22,7 @@ The difference is structural capability, not an economic tier:
 | On-device chain data | A pure API client storing zero blockchain data (`max_storage_bytes = 0`), querying balances and history over REST from Super nodes | Full local chain |
 | Consensus certificates | Cache size 0, persist limit 0 | Cache 5000, persist 2000 |
 | Archival duty | The archive requirement returns 0 for Light | Per-node archival role |
-| Consensus key in registry row | `vrf_pk` is empty | Required: raw ML-DSA-65 public key, exactly `D3_PK_BYTES` = 1952 bytes |
+| Consensus key in registry row | `vrf_pk` is empty. For a registration at or above height 691,200 (`LIGHT_KEY_COMMITMENT_GATE_HEIGHT`) the row's `vrf_pk_sha3` is the SHA3-256 of the wallet's ML-DSA-65 key from the transaction envelope, the key the device's ping delegation is verified against | Required: raw ML-DSA-65 public key, exactly `D3_PK_BYTES` = 1952 bytes |
 | Where the registration TX is built | Client-side, by the mobile wallet | Server-side, by the node itself at boot |
 | Public API endpoint in the registry | Always empty (privacy) | Public by default; set to an empty string to hide |
 
@@ -201,7 +201,7 @@ pricing is type-differentiated.
 
 A network-size multiplier is applied to the base cost when a price is quoted:
 
-| Active nodes | Multiplier |
+| Registered nodes | Multiplier |
 | --- | --- |
 | ≤ 100,000 | 0.5 |
 | ≤ 300,000 | 1.0 |
@@ -210,8 +210,10 @@ A network-size multiplier is applied to the base cost when a price is quoted:
 
 The chain floors are `base × 0.5`, the minimum over that table, because the discount tier covers the
 whole early-network era; a floor set at the base would reject honestly-priced activations. The
-multiplier itself is a quoting rule rather than a chain rule — it reads a process-local node counter,
-and a consensus rule requires a committed count. Amounts are converted from whole QNC to nanoQNC at
+multiplier itself is a quoting rule rather than a chain rule — it reads the chain-confirmed
+registered-node count (`registered_node_count`, the sum of the registry's per-index-space counters),
+which each node refreshes periodically into `GLOBAL_REGISTERED_NODES`, so its value depends on when
+that node last refreshed, and a consensus rule cannot read such a value. Amounts are converted from whole QNC to nanoQNC at
 transaction construction (`NANO_PER_QNC = 1_000_000_000`, `QNC_DECIMALS = 9`); Phase 1 sets
 `amount = 0`.
 
@@ -245,8 +247,9 @@ key over a canonical message; Ed25519 appears only for the external Solana burne
 fields are `node_id`, `node_type`, `wallet_address`, `registration_proof`, `api_endpoint`, `burn_tx`,
 `burn_wallet`, `burn_owner_sig`, `vrf_pk`, `burn_amount`, `burn_cost`, `burn_attestors` and
 `attest_epoch`. Both are system transactions: `is_system_tx()` covers `NodeRegistration`,
-`NodeActivation`, `NodeReactivation`, `Heartbeat`, `LightNodeEligibilityBitmap`, `RewardDistribution`,
-`KeyRotation` and both equivocation proofs, and `gas_debit()` returns 0 for all of them.
+`NodeActivation`, `NodeReactivation`, `PingAttestation`, `PingCommitmentWithSampling`,
+`HeartbeatCommitment`, `Heartbeat`, `LightNodeEligibilityBitmap`, `RewardDistribution`, `KeyRotation`
+and both equivocation proofs, and `gas_debit()` returns 0 for all of them.
 
 Mempool dedup keys enforce one-shot semantics:
 
@@ -256,8 +259,12 @@ Mempool dedup keys enforce one-shot semantics:
 | `NodeActivation` | `(from, phase_id, 6)` | one-shot per (wallet, phase), `phase_id` ∈ {1, 2} |
 | `NodeReactivation` | `(node_id, last_macroblock_index, 5)` | one per macroblock epoch (90 blocks) |
 
-State apply additionally rejects a duplicate `NodeRegistration` when `is_node_registered(node_id)` is
-already true.
+A key included in a block stays marked in the mempool for three reward epochs (43,200 blocks) from its
+inclusion height; marks are pruned by that age once per 1,440 blocks. The RPC and gossip doors also ask the
+state: a commitment it already records is refused, an activation from a wallet that is already a node
+included. State apply additionally rejects a duplicate `NodeRegistration` when
+`is_node_registered(node_id)` is already true; after a snapshot restore that record is rebuilt from the
+registrations stamped at or below the restored height.
 
 **`TransactionType::NodeReactivation { node_id, current_height, last_macroblock_hash, last_macroblock_index, api_endpoint }`**
 is a separate fee-less system transaction letting a returning node re-enter the eligible-producer
@@ -297,15 +304,19 @@ Super and genesis registration transactions are created server-side by a boot-sp
 driver. Light registration transactions are created client-side by the mobile wallet after
 `POST /api/v1/light-node/register` returns a registration proof, and submitted through
 `POST /api/v1/node-registration/submit`, which rejects any node type other than `light` and requires
-`from == wallet_address`. Light registration requires a non-empty `burn_tx_hash`, a non-zero
+`from == wallet_address`. The submit endpoint gathers the committee's burn attestations itself and
+refuses retryably, arming nothing, while its tip trails the corroborated head by more than
+`DEFICIT_BOUND` (45 blocks), while it cannot read the attest epoch's committee, or while fewer than a
+quorum have attested. Light registration requires a non-empty `burn_tx_hash`, a non-zero
 `burn_amount`, a successful stateless XOR code-ownership match, and an Ed25519 signature proving
 control of the burning Solana wallet. See [mobile wallet](../applications/mobile-wallet.md) and the
 [RPC reference](../developers/rpc-api.md). Light-node reward eligibility is separately committed
-on-chain through a `LightNodeEligibilityBitmap` transaction, one per genesis shard per epoch, indexed
+on-chain through a `LightNodeEligibilityBitmap` transaction, at most one per shard and owner per epoch, with a shard's owner rows bit-ORed, indexed
 by each node's permanent registration index; Light nodes are pinged on a randomized per-window slot
-with a 2-slot grace and retry window out of 240 slots. A registration stamped at or below
-`epoch_start + 14_350` joins that epoch's reward roster, including the node's own registration epoch;
-one stamped in the closing 50 blocks joins from the next epoch. See
+with a 2-slot grace and retry window out of 240 slots; from window 95 the draw uses the first 232, so the
+last push and its challenge end before the commit window opens. A registration stamped below
+`epoch_start + 14_250`, when the commit window opens, joins that epoch's reward roster, including the
+node's own registration epoch; one stamped in the closing 150 blocks joins from the next epoch. See
 [economics overview](./overview.md).
 
 ## One node per payment, and device rules
@@ -324,10 +335,12 @@ one stamped in the closing 50 blocks joins from the next epoch. See
   cannot be reached still loses the record. Treat re-activating an existing wallet-and-type pair as a
   move of that node, not as a way to run a second one: bring the old host down first, so the two are
   never both trying to serve the identity.
-- **Light devices.** At most 3 devices per Light node. A fourth registration first prunes devices that
-  are inactive or unseen for 24 hours, and if 3 remain it is refused with
-  `Maximum 3 devices per Light node.` Light nodes switch devices freely with no rate limit, subject to
-  wallet ownership verification.
+- **Light devices.** At most 3 devices per Light node. A device that registers again replaces its own
+  entry, matched by `device_id`, instead of taking a new slot. A fourth device first prunes devices
+  that are inactive or unseen for 24 hours, and if 3 remain it is refused with
+  `Maximum 3 devices per Light node. Remove inactive devices first.` A device registers through `POST /api/v1/light-node/register`, subject to wallet
+  ownership verification; the endpoint admits 3 requests per IP per 3600 s and then refuses that IP
+  for 3600 s.
 - **Super migration.** 1 migration per 24 hours, enforced in `handle_register_node`: a same-wallet,
   same-`node_id` re-registration is treated as a server migration and refused while fewer than
   86,400 s have elapsed since the last one. The timestamp map is process-local, so the limit is a

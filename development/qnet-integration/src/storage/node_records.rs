@@ -951,57 +951,33 @@ impl Storage {
     }
     
     /// Cleanup old snapshots, keeping only the latest `keep_count` per type.
-    /// Keys: "full_snap_{height}" and "state_snap_{height}". Updates pointers atomically.
+    /// Reads the snapshot index only; the early anchor (h=90) stays besides the newest `keep_count`.
     pub fn cleanup_old_snapshots(&self, keep_count: usize) -> IntegrationResult<u32> {
+        let _fence = self.snapshot_fence();
+        self.retain_snapshots_locked(keep_count)
+    }
+
+    /// cleanup_old_snapshots for a caller that already holds the snapshot fence.
+    pub(super) fn retain_snapshots_locked(&self, keep_count: usize) -> IntegrationResult<u32> {
         let snapshots_cf = self.persistent.db.cf_handle("snapshots")
             .ok_or_else(|| IntegrationError::StorageError("snapshots column family not found".to_string()))?;
-
-        let mut removed = 0u32;
-
-        // Clean up both full_snap_ and state_snap_ independently
-        for prefix in &["full_snap_", "state_snap_"] {
-            let pointer_key: &[u8] = if *prefix == "full_snap_" {
-                b"latest_full_snap"
-            } else {
-                b"latest_state_snap"
-            };
-
-            let mut heights: Vec<u64> = Vec::new();
-            let iter = self.persistent.db.iterator_cf(&snapshots_cf, rocksdb::IteratorMode::Start);
-            for item in iter {
-                if let Ok((key, _)) = item {
-                    let key_str = String::from_utf8_lossy(&key);
-                    if let Some(h_str) = key_str.strip_prefix(prefix) {
-                        if let Ok(h) = h_str.parse::<u64>() {
-                            heights.push(h);
-                        }
-                    }
-                }
-            }
-
-            if heights.len() <= keep_count {
-                continue;
-            }
-
-            heights.sort_unstable_by(|a, b| b.cmp(a));
-            let surviving_max = heights[0];
-            let to_delete = &heights[keep_count..];
-
-            let mut batch = WriteBatch::default();
-            for h in to_delete {
-                // Keep the genesis early anchor (h=90) as a universal cold-join floor: it is always
-                // committee-verifiable (genesis committee), so a capsule-less joiner can always fast-sync to it.
-                if *h == crate::node::SNAPSHOT_EARLY_ANCHOR_HEIGHT { continue; }
-                let key = format!("{}{}", prefix, h);
-                batch.delete_cf(&snapshots_cf, key.as_bytes());
-                removed += 1;
-            }
-
-            // Update pointer to the newest surviving snapshot
-            batch.put_cf(&snapshots_cf, pointer_key, &surviving_max.to_le_bytes());
-            self.persistent.db.write(batch)?;
+        let mut heights = super::snapshot_index::indexed_heights(&self.persistent.db, snapshots_cf)?;
+        if heights.len() <= keep_count {
+            return Ok(0);
         }
-
+        heights.sort_unstable_by(|a, b| b.cmp(a));
+        let mut batch = WriteBatch::default();
+        let mut removed = 0u32;
+        for h in &heights[keep_count..] {
+            // Keep the genesis early anchor (h=90) as a universal cold-join floor: it is always
+            // committee-verifiable (genesis committee), so a capsule-less joiner can always fast-sync to it.
+            if *h == crate::node::SNAPSHOT_EARLY_ANCHOR_HEIGHT { continue; }
+            super::snapshot_index::stage_delete(&mut batch, snapshots_cf, *h);
+            removed += 1;
+        }
+        // The pointer names the newest surviving snapshot.
+        batch.put_cf(snapshots_cf, b"latest_full_snap", &heights[0].to_le_bytes());
+        self.persistent.db.write(batch)?;
         Ok(removed)
     }
     

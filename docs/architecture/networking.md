@@ -21,8 +21,8 @@ dials out, trust comes from the SAN check plus a trust-on-first-use fingerprint 
 rejected as possible interception for every identity except `genesis_node_*`, whose address is pinned at compile time
 and which may always re-pin; after the grace period a new fingerprint replaces the pin for any identity, so a rolling
 restart with a regenerated certificate reconnects. Both directions then run the application handshake described below:
-a connection completes only when the peer presents a valid post-quantum identity proof, and a peer that cannot present
-one is refused.
+a connection completes only when the peer presents a post-quantum identity proof, and one that fails under the claimed
+identity's registered key refuses the connection.
 
 | Transport parameter | Value |
 | --- | --- |
@@ -39,7 +39,10 @@ one is refused.
 Ordinary messages travel on unidirectional streams, fire-and-forget. Bidirectional streams with a one-byte
 acknowledgement are reserved for `send_with_ack`, whose deadline adapts to the measured peer RTT; initial RTT is seeded
 per peer from a bounded cache refreshed from live connection statistics. A connection idle for more than 60 seconds is
-treated as a zombie even when QUIC reports no close reason, because a silent partition never sets one.
+treated as a zombie even when QUIC reports no close reason, because a silent partition never sets one. The periodic
+idle sweep also closes any non-genesis connection older than `UNPROMOTED_MAX_AGE_SECS` (300 s) whose address has no
+peer-table entry, so that peer re-dials and passes admission again. A broadcast retry that the peer's reconnect cooldown
+would still refuse after the backoff delay returns at once instead of sleeping.
 
 ## Connection identity and handshake
 
@@ -57,16 +60,19 @@ the attacker-chosen deserialization surface is a single form.
 `dilithium_proof` is a mandatory ML-DSA-65 signature over
 `qnet-quic-handshake-v2:{node_id}:{timestamp}:{block_height}:{channel_binding}`. The channel binding is a TLS
 keying-material export over that specific connection, label `qnet-quic-channel-binding-v1`, hex-encoded, so a proof
-captured from one session cannot be replayed on another. If the exporter is unavailable the connection is refused. Each
-side verifies the peer's proof before sending its own, and a node whose local crypto cannot sign its own proof refuses
-the connection rather than putting an unprovable identity on the wire.
+captured from one session cannot be replayed on another. If the exporter is unavailable the connection is refused. The
+accepting side verifies the dialler's proof before sending its own, and a node whose local crypto cannot sign its own
+proof refuses the connection rather than putting an unprovable identity on the wire.
 
 Verification is one registry lookup plus at most one ML-DSA-65 verify, and retains no per-peer state. An empty proof, a
 proof whose bytes are not valid UTF-8, and a proof that fails under the claimed identity's registered key each close the
 connection. Two outcomes admit the peer as unauthenticated transport instead: the claimed `node_id` has no entry in the
-consensus public-key registry, and the local verifier is not yet published. The first is the fresh-joiner path — the
-connection carries the peer's signed `VrfKeyAnnounce`, which installs its identity. An unauthenticated peer attests
-nothing, and its claimed `block_height` is discarded; a verified handshake binds `(node_id, block_height)` as one signed
+consensus public-key registry, and the local verifier is not yet published. The first is the fresh-joiner path: the
+joiner's key enters the registry when block apply reaches its committed registration, or from its signed
+`VrfKeyAnnounce` once that key's SHA3-256 matches the chain-committed `vrf_pk_sha3` for the id and no key is
+stored. An unauthenticated peer attests
+nothing: its claimed `block_height` carries no attestation stamp and never raises `SIGNED_HEAD_MAX`, though on a
+connection this node dialled it still raises `BEST_PEER_HEIGHT`; a verified handshake binds `(node_id, block_height)` as one signed
 tuple, so a non-zero height attests the peer's tip immediately without waiting for a `HealthPing`. Authority is asserted
 per message rather than per connection: every consensus-bearing message carries its own signature, verified against the
 registry.
@@ -82,7 +88,8 @@ column family alongside the in-RAM entry, and `restore_node_endpoints` rehydrate
 persisted `nep_genesis_node_*` and `nep_super_*` rows, so the gate is armed from the first inbound connection after a
 restart or a snapshot cold join instead of falling through to first-contact for every peer. Genesis identities resolve
 from the pinned binary table, so a persisted row never restates one. The map is bounded at 1,000,000 entries and
-evicts one entry when a new registration arrives at capacity; a miss is re-resolved from the committed rows.
+evicts one entry when a new registration arrives at capacity; lookups read only this map, so an evicted identity passes the gate as first-contact until block apply writes its
+endpoint again or a boot restore reloads its row.
 
 ## Wire encoding
 
@@ -109,9 +116,10 @@ alone.
 | 2 | `Transaction` | 1 MB |
 | 3 | `PeerDiscovery` | 256 KB |
 | 4 | `HealthPing` | 16 KB |
-| 8 | `ShredProtocolChunk` | 512 KB + 256 |
-| 10 | `ConsensusV2`, `MacroblocksBatch`, `TimeoutCertificateBroadcast`, `TimeoutCertificatesResponse` | 10 MB |
-| 0 | every other variant, and any unrecognised byte (catch-all) | 2 MB |
+| 7 | — (a frame with this type byte is refused) | 0 |
+| 8 | `ShredProtocolChunk` | 512 KB + 16 KB |
+| 10 | `ConsensusV2`, `MacroblocksBatch`, `TimeoutCertificateBroadcast`, `TimeoutCertificatesResponse`, `ConsensusState` | 10 MB |
+| 0 | every other variant, and any other type byte (catch-all) | 2 MB |
 
 `MAX_MESSAGE_SIZE` bounds every frame at 10 MB.
 
@@ -132,7 +140,7 @@ Related request/response pairs share one row below.
 | `RequestMacroblocks` / `MacroblocksBatch` | 0 / 10 | Ask for, and serve, macroblocks by index (server truncates a response to 10 macroblocks) |
 | `RequestMacroblockAnchor` | 0 | Control-lane request for one QC-bound macroblock by index, answered with `MacroblocksBatch` |
 | `ShredProtocolChunk` | 8 | One Reed-Solomon data or parity shred of a block body |
-| `RequestMissingChunks` / `MissingChunksResponse` | 0 | Ask for, and serve, specific missing shred indices |
+| `RequestMissingChunks` / `MissingChunksResponse` | 0 | Ask for, and serve, specific missing shred indices; a response names the block hash and parity count of the set it was cut from |
 | `ConsensusV2` | 10 | Opaque Checkpoint-BFT frame routed to the consensus v2 runtime. A completed quorum or timeout certificate is relayed to `RELAY_FANOUT` (8) peers, not to every peer: committee members rebuild the same certificate from the votes they already collected, so the relay is redundancy rather than the delivery path |
 | `TimeoutVote` | 0 | Signed failover vote for a window and round, carrying the voter's own high-QC and tip |
 | `TimeoutCertificateBroadcast` | 10 | Aggregated per-voter timeout proofs forming a round certificate |
@@ -140,10 +148,10 @@ Related request/response pairs share one row below.
 | `TimeoutCertificatesResponse` | 10 | Serve those certificates with full per-voter payloads |
 | `ProducerReady` / `ReadyAck` | 0 | Round-change handshake; fires only at failover round above 0, both signed |
 | `ProducerHeartbeat` | 0 | Signed producer liveness beacon over the wire-supplied anchor hash |
-| `BlockRejection` | 0 | Signed observer report of a rejected block, aggregated per (height, source) |
-| `BlockAttestation` | 0 | Signed confirmation of an accepted block, emitted only by that height's committee slice |
-| `VrfLeaderClaim` / `VrfKeyAnnounce` | 0 | Self-verifiable VRF leadership claim with gossip TTL; self-signed VRF public-key announcement |
-| `RequestConsensusState` | 0 | Ask a peer for consensus state at a round |
+| `BlockRejection` | 0 | Signed observer report of a rejected block, aggregated per (height, source); once distinct observers reach a quorum of that window's failover committee (at least 3), sync peer selection deprioritises the source for `FORKED_PEER_COOLDOWN_MS` (5 min), unless it is the producer elected for that height |
+| `BlockAttestationMsg` | 0 | Signed confirmation of an accepted block, emitted only by that height's committee slice; a receiver admits it only from that slice, and a rival hash backed by f+1 attesters while its own block has none makes it pull the window's anchor |
+| `VrfLeaderClaim` / `VrfKeyAnnounce` | 0 | Self-verifiable VRF leadership claim with gossip TTL; self-signed VRF public-key announcement, installed only when its key matches the chain-committed `vrf_pk_sha3` for that id and no key is stored |
+| `RequestConsensusState` / `ConsensusState` | 0 / 10 | Checkpoint catch-up. A node asks 3 random peers for the `[Proposal, Qc]` pair of one index when a refused proposal names a parent certificate it does not hold and, with a doubling backoff, while it holds a certificate whose checkpoint never arrived or its peers' timeouts name a certificate it lacks. The answer is the pair at that index, else the newest held below it, else the newest held, else the sealed frontier read from storage. The three members after a proposer in the sorted committee also send it their pair unasked, once per index, when its proposal extends an older certificate than theirs. A receiver admits only as many answers as it asked for plus one unsolicited answer per 5 s, and verifies each off the consensus loop against the committee of the served checkpoint's window |
 | `GenesisCheckpointSig` / `GenesisCheckpoint` / `RequestGenesisCheckpoint` | 0 | A genesis node's partial signature, the quorum-signed capsule, and the cold-join pull for it |
 | `Transaction` / `TransactionBatch` | 2 / 0 | One serialized transaction; or many in one frame with a batch timestamp |
 | `PeerDiscovery` | 3 | Introduce the requesting node's `PeerInfo` |
@@ -154,9 +162,9 @@ Related request/response pairs share one row below.
 | `ActiveNodesRequest` / `ActiveNodesResponse` | 0 | Ask for, and serve, the active-node list |
 | `SystemEvent` | 0 | Broadcast of a system-level event with JSON payload |
 | `LightNodeRegistration` | 0 | Gossip a Light node's registration record into the registry |
-| `LightNodeRegistryRequest` / `LightNodeRegistryResponse` | 0 | Ask for, and serve, registrations newer than a timestamp |
-| `LightNodeAttestation` | 0 | Doubly-signed proof that a Light node answered a ping challenge |
+| `LightNodeAttestation` | 0 | Doubly-signed proof that a Light node answered a ping challenge; the node that took the device's reply sends it directly to each connected owner genesis of the node's shard other than itself, and to 5 random peers |
 | `CertificateAnnounce` / `CertificateRequest` / `CertificateResponse` | 0 | Announce a post-quantum certificate by serial; ask for and serve one by owner and serial |
+| `RecoveryDecree` | 0 | Coordinated-recovery order naming a target height, valid only under a quorum of the genesis consensus keys over `RDCR:{genesis hash}:{seq}:{target}` and ignored at or below the last applied sequence; an accepting node re-gossips it to 8 peers, then executes it |
 
 ## Inbound quality-of-service lanes
 
@@ -164,13 +172,17 @@ Every inbound message is dispatched into one of three channels before handling, 
 finality:
 
 - **Finality lane** (reserved): `ConsensusV2`, `TimeoutVote`, `TimeoutCertificateBroadcast`, `ProducerReady`,
-  `ReadyAck` — non-redundant quorum frames with no repair path. Overflow increments `FINALITY_LANE_DROPPED`, meaning
-  unrepairable consensus loss; a non-zero value warrants investigation.
+  `ReadyAck` — non-redundant quorum frames with no repair path — and the checkpoint catch-up pair
+  `RequestConsensusState` / `ConsensusState`, which has to land while a finality stall saturates gossip. Overflow
+  increments `FINALITY_LANE_DROPPED`, meaning unrepairable consensus loss; a non-zero value warrants investigation.
 - **Bulk lane** (bounded, drop-on-full): `RequestBlocks`, `RequestMacroblocks`, `BlocksBatch`, `MacroblocksBatch`,
-  `StateSnapshot`. Overflow increments `BULK_LANE_DROPPED` and is benign shedding.
-- **Default lane**: everything else, including all gossip. A control-lane set — `RequestMacroblockAnchor`,
-  `RequestGenesisCheckpoint`, `GenesisCheckpointSig`, `GenesisCheckpoint` — is kept out of the bulk classification so
-  the anchor fetch every cold joiner must complete keeps a reserved serve quota on this lane.
+  `StateSnapshot`, and the shred traffic `ShredProtocolChunk`, `RequestMissingChunks` and `MissingChunksResponse`, whose
+  handlers move megabytes. At most 8 bulk messages are handled at once; overflow increments `BULK_LANE_DROPPED` and is
+  benign shedding.
+- **Default lane**: everything else, including all gossip. Its drain hands each message to a pool of 8 workers and sheds
+  one that waits more than 5 s for a worker, counting it in `GOSSIP_POOL_SHED`. A control-lane set —
+  `RequestMacroblockAnchor`, `RequestGenesisCheckpoint`, `GenesisCheckpointSig`, `GenesisCheckpoint` — is kept out of the
+  bulk classification so the anchor fetch every cold joiner must complete keeps a reserved serve quota on this lane.
 
 ## Peer discovery
 
@@ -233,7 +245,7 @@ binds to the claimed id only when the chain-committed endpoint IP in `NODE_ENDPO
 gossiped address. A `genesis_node_*` id claimed from a non-pinned address, and any other id with no matching committed
 endpoint, is dropped as `unbound_identity`. An entry whose bound identity is already connected refreshes that peer's
 last-seen stamp only — the gossiped height is unauthenticated and never sets `last_block_height`, which moves on signed
-`HealthPing`s and applied blocks. A new peer is entered as inbound, consuming an inbound slot and facing every gate
+`HealthPing`s and verified handshakes. A new peer is entered as inbound, consuming an inbound slot and facing every gate
 above, and at most `MAX_GOSSIP_ADMITS_PER_RESPONSE` (16) new peers are taken from any one response, so discovery
 converges over repeated exchange cycles rather than letting one relay shape the peer set. A node running a genesis
 identity admits only pinned genesis addresses from gossip. `PeerInfo::combined_reputation()` returns the
@@ -258,8 +270,8 @@ Block bodies are split into `SHRED_PROTOCOL_CHUNK_SIZE` 512 KB chunks with Reed-
 adaptive: 2.0x at every size tier when the live peer count is 50 or fewer, and 1.5x / 1.75x / 1.5x for larger sets at
 the under-100 KB, under-500 KB and 500 KB-and-above tiers. Every shred carries `num_coding_shreds` so the decoder
 reconstructs with the producer's exact dimensions, plus a SHA3-256 hash of the original block so the reconstruction is
-checked before full validation. The producer certificate is replicated onto chunk 0 and the first
-`CERT_REDUNDANT_PARITY` (4) parity chunks, so chunk arrival order is irrelevant.
+checked before full validation. The producer certificate rides every data chunk and the first
+`CERT_REDUNDANT_PARITY` (4) parity chunks, so any delivered data chunk carries it and chunk arrival order is irrelevant.
 
 Relay follows a rotated F-ary heap over the canonical committee roster from `committee_for_height`, with the tier-0
 root chosen as `chunk_index % roster_len` so every member builds a byte-identical tree. `shred_tree_fanout` is a pure
@@ -272,8 +284,19 @@ peer list shuffled by a SplitMix64-seeded Fisher-Yates keyed on block height, us
 Sends are paced: batch size between `PACING_BATCH_SIZE_MIN` 50 and `PACING_BATCH_SIZE_DEFAULT` 100, inter-batch delay
 between `PACING_DELAY_MS_DEFAULT` 2 ms and `PACING_DELAY_MS_MAX` 20 ms, selected from the recent send-failure rate
 against `PACING_FAILURE_THRESHOLD` 0.15 and `PACING_FAILURE_CRITICAL` 0.35, with a semaphore bounding concurrent sends.
-Missing chunks are re-requested after `SHRED_CHUNK_TIMEOUT_SECS` 5 with up to `SHRED_CHUNK_MAX_RETRIES` 4 attempts,
-served from a `SHRED_CHUNK_CACHE_SIZE` of 5000 blocks of cached chunks. Chunks at or below the local height are dropped
+Missing chunks are re-requested on two paths that share an assembly's `SHRED_CHUNK_MAX_RETRIES` 4 attempts. A forwarding
+node whose assembly is still incomplete `SHRED_CHUNK_TIMEOUT_SECS` 5 after it opened sends the whole missing list to
+between 3 and 10 validated peers, scaled with the peer count. A background sweep polls open assemblies every 100 ms and
+re-requests at most every 250 ms from up to 3 consensus-qualified peers, splitting the missing indices among them — each
+takes every n-th index, rotated per attempt, at most 16 per request to match the serve side's 8 MB `MAX_REPAIR_BYTES`;
+a block that can already be reconstructed but lacks its certificate asks for one missing data chunk. Repairs are served
+from a retransmit cache bounded at `SHRED_CHUNK_CACHE_SIZE` 5000 blocks and `SHRED_CHUNK_CACHE_BYTES` 256 MB, which holds
+the producer's own set from broadcast time and, on a receiver, a reconstruction only once its SHA3-256 matches the block
+hash; a reconstruction that does not match is discarded and its height purged from the cache. Cache entries and repair
+responses carry the block hash and parity count of their set, and a receiver drops a live chunk or repair response whose
+block hash differs from its assembly's, a live chunk whose data layout differs, and any parity chunk cut with a
+different parity count. Blocks served to a syncing peer as shreds are paced to `SERVE_TARGET_BITS_PER_SEC` (50 Mbit/s),
+and repair responses go out two chunks per batch at the same rate. Chunks at or below the local height are dropped
 unless this node explicitly solicited the repair within a 30-second window, so a peer cannot force below-tip
 reassembly.
 
@@ -285,12 +308,13 @@ reader that short-circuits on the first byte past `MAX_MACROBLOCK_DECOMPRESSED`,
 ## Transaction propagation
 
 Transaction routing is producer-directed. A transaction is sent straight to the cached current producer and then
-gossiped to 2 backup peers, or 3 when no producer is cached. `broadcast_transaction_batch` skips the network entirely
+gossiped to 2 backup peers, or to 3 when it went to no producer because none is cached or this node is the producer. `broadcast_transaction_batch` skips the network entirely
 when this node is the current producer, since the transactions are already in its own mempool. On receipt, transactions
 are deduplicated by SHA3-256 of the raw bytes in a `seen_tx_hashes` set that is cleared at 1000000 entries; only unseen
-transactions are queued and re-gossiped, to 2 random peers. A `TransactionBatch` carrying more than `MAX_TX_BATCH_SIZE`
-10000 transactions is dropped as an out-of-memory guard. Random-peer gossip picks targets with `OsRng` over the whole
-connected-peer map; a variant excludes the sender by IP prefix to break echo loops.
+transactions are queued and re-gossiped, to 2 random peers other than the sender, and the originating node enters its
+own transactions in the set before sending them, so their echo stops at its own dedup. A `TransactionBatch` carrying
+more than `MAX_TX_BATCH_SIZE` 10000 transactions is dropped as an out-of-memory guard. Random-peer gossip picks targets
+with `OsRng` over the whole connected-peer map; the relay variant excludes the sender by IP prefix to break echo loops.
 
 ## Rate limiting and denial-of-service defences
 
@@ -306,8 +330,9 @@ Inbound work is filtered in a fixed order, cheapest first:
    accept/refuse speed. A handshake exceeding `INCOMING_HANDSHAKE_TIMEOUT_SECS` 5 releases its permit immediately.
 4. `ip_identity_gate`, then ML-DSA-65 proof verification.
 5. Per-type payload ceiling, applied before deserialization.
-6. Per-request serve rate limits, keyed jointly on `(source IP, requester node-id prefix)` so that neither a shared
-   address nor a rotating identity defeats them.
+6. Per-request serve rate limits. Block and macroblock serves are keyed jointly on `(source IP, requester node-id
+   prefix)` so that neither a shared address nor a rotating identity defeats them; the `HealthPing` and consensus
+   catch-up limits are keyed on the sending peer.
 
 | Serve limit | Value |
 | --- | --- |
@@ -317,12 +342,13 @@ Inbound work is filtered in a fixed order, cheapest first:
 | Blocks per `BlocksBatch` | 100 |
 | Macroblock serve, normal / requester behind | 5/min, 120 s block / 30/min, 60 s block |
 | `HealthPing` | 60/min per peer, 300 s block |
+| Consensus catch-up serve (`RequestConsensusState`) | 5/min per peer, 120 s block |
 | Bulk serve-send permits (`BULK_SEND_CONCURRENCY`) | 256, 2 s acquisition timeout |
 
 Genesis peers bypass sync rate limiting, and the bypass is decided from the transport-verified source IP rather than a
 self-declared node id. A node refuses to serve a range whose `from_height` is above its own servable height, avoiding
 empty-batch spam; serve decisions read `HIGHEST_STORED_HEIGHT` (durably stored) rather than the applied height, and
-that watermark is lowered after a rollback so the node stops advertising a range it no longer holds. Bulk serve
+that watermark is lowered after a rollback so the node stops advertising a range it does not hold. Bulk serve
 responses acquire a permit before sending while requests and consensus messages bypass it, reserving connection
 headroom for consensus.
 
@@ -331,27 +357,44 @@ vote per validator per round, distinct-observer sets — are the emission cap. `
 unsigned health pings and announcement telemetry. Individual paths add their own guards. `HealthPing` is deduplicated
 by `(timestamp, height)` per claimed origin *before* the signature verify and before the rate-limit spend, and the
 dedup marker only advances after a successful verify, so a spoofed future timestamp cannot poison a real origin's
-floor. Its signature is checked against the public key resolved from the consensus registry, and a signed head is
-relayed onward only when its height exceeds the known signed-head maximum by at least `HEAD_REPLY_MIN_GAP` 8, then only
-to k peers sorted by Kademlia bucket, excluding the origin and the immediate sender. `ProducerHeartbeat` bounds replay
+floor. Its signature is checked against the public key resolved from the consensus registry. A verified head that is
+its origin's newest by the origin's own timestamp replaces that origin's attested height even when it is lower, so a
+peer that rolled back lowers its own claim, and the signed-head maximum is the highest of the origins' newest heads
+received within `SIGNED_HEAD_FRESH_SECS` 300. A head is relayed onward only when its height exceeds the maximum held
+before it arrived by more than `HEAD_REPLY_MIN_GAP` 8, then only to 6 peers sorted by Kademlia bucket, excluding the
+origin, the immediate sender and the genesis nodes. `ProducerHeartbeat` bounds replay
 with a per-producer monotonic timestamp guard.
 
 ## HTTP node-to-node calls
 
-Alongside QUIC, a node calls its peers' TCP API port. These are ordinary requests to the same public REST surface
-documented in [rpc-api.md](../developers/rpc-api.md), so peers reach each other on port 8001 as well as on the QUIC
-port.
+Alongside QUIC, a node calls its peers' TCP API port, so peers reach each other on port 8001 as well as on the QUIC port.
+Public calls use the REST surface documented in [rpc-api.md](../developers/rpc-api.md); the `/api/v1/internal/`
+endpoints answer only genesis IPs and loopback.
 
 | Call | Made by | Purpose |
 | --- | --- | --- |
 | `POST /api/v1/auth/challenge` | `verify_peer_authenticity` | Authenticates a bootstrap candidate before it enters the peer table |
 | `GET /api/v1/microblock/{height}` | `check_block_exists_on_network` | Corroborates a height against several peers at once |
+| `GET /api/v1/light-node/status?node_id={id}&fwd=1` | `shard_owner_says_active` | Takes a light node's activity verdict from the genesis that owns its shard |
+| `GET /api/v1/internal/fcm-token-get?node_id={id}` | `maybe_pull_push_channel` | Refills a genesis's missing or polling push-channel record for a node of its shard from the genesis that attested it |
+| `GET /api/v1/internal/light-ping-keys-get?node_id={id}` | `maybe_pull_light_identity` | Fetches a light node's ping key and delegation when a relayed attestation fails to verify locally |
+| `POST /api/v1/internal/fcm-token-sync` | `sync_fcm_token_to_genesis_peers` | Copies a push-channel record a genesis just stored to every other genesis, which accepts it only from a genesis address and keeps the newer record by timestamp |
+| `GET /api/v1/rewards/epoch/{epoch}/leafset?shard={n}` | `repair_unservable_reward_epochs` | Fetches, shard by shard, the reward leaf set of a committed epoch this node cannot serve, trying each other genesis in turn, and keeps a set only when its merkle root equals the committed root |
 
 `check_block_exists_on_network` answers first from the signed heights already held in the peer table and falls back to
 the HTTP probe when that is inconclusive. The sample size scales with the peer count — 3 peers on networks of 5 or
 fewer, 5 up to 100, 7 above that — chosen at random and queried in parallel with a 3 s per-peer timeout under a 5 s
 global budget. Each response body is parsed and checked before it counts, so a peer that answers 200 with empty or
 malformed content does not register as holding the block.
+
+A node other than the genesis that owns a light node's shard consults that owner before it reports the node as needing
+reactivation; the verdict is cached for 60 s per node, an owner that failed is skipped for 15 s, at most 16 requests are
+in flight under a 2 s timeout, and `fwd=1` marks a proxied request, which the owner answers from its own view. The two
+internal pulls run on a genesis for nodes of its own shards, once per node and epoch: the push-channel record is merged
+through the node's own loopback `POST /api/v1/internal/fcm-token-sync`, and a pulled ping key is stored only when the
+chain vouches for the identity key — the committed consensus key, the registration's key hash, or, for a row without
+one, the registered wallet address the key derives — the delegation verifies under that key and the ping key signs the
+challenge the relay carried, with at most 32 identity pulls in flight.
 
 ## Ports
 

@@ -43,8 +43,9 @@ npm run build
 
 ## Constructing a client
 
-The endpoint is operator-supplied — the base URL of a node's HTTP API. An API key, if the node
-requires one, is sent as the `X-API-Key` header.
+The endpoint is operator-supplied — the base URL of a node's HTTP API. An optional API key is sent as
+the `X-API-Key` header on every request; the node reads that header on the routes listed under
+[Authentication](rpc-api.md#authentication).
 
 ```typescript
 import { QNetClient, formatQNC } from '@qnet/sdk';
@@ -69,8 +70,9 @@ const block = await client.getLatestBlock();
 | `callContract`, `viewContract` | `POST /api/v1/contract/call` |
 | `getContractLogs` | `GET /api/v1/logs` |
 
-`getLatestBlock` and `getBlock` back the pollers and subscriptions. For every other route, use the
-paths in the [RPC API reference](rpc-api.md) directly.
+`getLatestBlock` is the tip read behind the pollers and subscriptions, and `waitForHeight` reads its
+target block with `getBlock`. For every other route, use the paths in the [RPC API reference](rpc-api.md)
+directly.
 
 ## Reward claims
 
@@ -78,20 +80,21 @@ The claim helper matches the node's handler. It is a two-step handshake against
 `POST /api/v1/rewards/claim`:
 
 1. `quoteRewardClaim` sends `node_id`, `wallet_address` and an ML-DSA-65 signature over
-   `claim_rewards:{nodeId}:{wallet}` — the string `buildRewardClaimPayload` returns. The node replies
-   with the claims payload, the message to sign, a timestamp, and the amount in nanoQNC as a decimal
-   string.
+   `q{chain_id}|claim_rewards:{nodeId}:{wallet}` — the string `buildRewardClaimPayload` returns. The
+   node replies with the claims payload, the message to sign, a timestamp, and the amount in nanoQNC as
+   a decimal string.
 2. `submitRewardClaim` echoes `claims_data` and `claim_timestamp` back unchanged, together with a
    second signature over the quoted message. Apply re-verifies the signature and every Merkle proof.
 
 `claimRewards` performs both steps and returns `null` when there is nothing to claim. Before the
 second signature it calls `assertClaimMessageShape`, which hands the node's string to the signing key
-only when it has the exact form `qnet_claim_v1:{wallet}:{timestamp}:{64 hex chars}` — the node builds
-precisely that message as `qnet_claim_v1:{to}:{timestamp}:{hex(sha3_256(claims_data))}`. Because the
-same key signs transfers, this shape check is what keeps a claim response from steering the key into
-signing anything else. The check pins the domain tag, the wallet, the timestamp and the digest shape;
-a caller can additionally hash `quote.claimsData` with SHA3-256 and compare it against the digest
-before signing.
+only when it has the exact form `q{chain_id}|qnet_claim_v1:{wallet}:{timestamp}:{64 hex chars}` — the
+node builds precisely that message as
+`q{chain_id}|qnet_claim_v1:{to}:{timestamp}:{hex(sha3_256(claims_data))}`. Because the same key signs
+transfers, this shape check is what keeps a claim response from steering the key into signing anything
+else. The check pins the chain tag, the domain tag, the wallet, the timestamp and the digest shape; a
+caller can additionally hash `quote.claimsData` with SHA3-256 and compare it against the digest before
+signing.
 
 ## Amounts and addresses
 
@@ -105,9 +108,13 @@ addresses with the node's own endpoints, or against the format documented in
 A transfer signature is taken over the node's canonical message
 `q{chain_id}|transfer:{from}:{to}:{amount}:{nonce}:{gas_price}:{gas_limit}` (`q1337|` on testnet, the
 node's compile-time `QNET_CHAIN_ID`). A contract call is signed over
-`q{chain_id}|contract_call:{from}:{sha3_256(calldata bytes)}:{nonce}`, where the calldata is the JSON
+`q{chain_id}|contract_call:{from}:{sha3_256(calldata bytes)}:{nonce}:{gas_price}:{gas_limit}`, where the calldata is the JSON
 object described in [smart contracts](smart-contracts.md); a WASM deploy is signed over
-`q{chain_id}|contract_deploy:{from}:{sha3_256(module bytes)}:{nonce}`.
+`q{chain_id}|contract_deploy:{from}:{sha3_256(module bytes)}:{nonce}:{gas_price}:{gas_limit}`. A batch transfer
+(`POST /api/v1/batch/transfer`) is signed over
+`q{chain_id}|batch_transfer:{from}:{total}:{count}:{batch_id}:{digest}:{nonce}:{gas_price}:{gas_limit}`,
+where `digest` is the hex SHA3-256 over each transfer in order: the `to_address` bytes, the amount as
+8 little-endian bytes, a `0x00` byte, the memo bytes when present, and a `0xff` byte.
 
 ## Errors
 

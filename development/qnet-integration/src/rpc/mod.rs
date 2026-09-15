@@ -2646,6 +2646,17 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(blockchain_filter.clone())
         .and_then(handle_internal_fcm_token_get);
 
+    // Internal genesis-to-genesis light ping-key read (IP-restricted) — shard-owner identity pull
+    let internal_light_keys_get = api_v1
+        .and(warp::path("internal"))
+        .and(warp::path("light-ping-keys-get"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::addr::remote())
+        .and(warp::query::<std::collections::HashMap<String, String>>())
+        .and(blockchain_filter.clone())
+        .and_then(handle_internal_light_ping_keys_get);
+
     // Public: lightweight FCM token refresh (Ed25519-signed)
     let light_node_token_refresh = api_v1
         .and(warp::path("light-node"))
@@ -2670,6 +2681,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .or(light_node_pending_challenge)
         .or(internal_fcm_sync)
         .or(internal_fcm_get)
+        .or(internal_light_keys_get)
         .or(claim_rewards)
         .or(pending_rewards)
         .or(reward_history)
@@ -4483,7 +4495,7 @@ pub fn generate_quantum_challenge() -> String {
 // Now the genesis stamps a challenge = hex(nonce[16] | expiry_be[8] | mac[16]); the device echoes it
 // and the same genesis re-verifies the mac. No per-node store (survives FCM-woken devices that never
 // poll). Off-consensus path. Secret = SHA3(domain | node seed) — stable across restarts, never logged.
-const LIGHT_CHALLENGE_TTL_SECS: u64 = 180;
+pub(crate) const LIGHT_CHALLENGE_TTL_SECS: u64 = 180;
 
 fn light_challenge_mac(node_id: &str, nonce: &[u8; 16], expiry: u64) -> [u8; 16] {
     use sha3::{Digest, Sha3_256};

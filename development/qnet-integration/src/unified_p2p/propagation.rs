@@ -25,6 +25,31 @@ pub(super) fn index_new_light_nodes(
     placed
 }
 
+/// Widest gap (in slots) one ping tick reads back over. A live chain moves a few slots per 60 s tick; a
+/// wider gap means the loop fell behind (a stalled loop or a fast resync) and reads only the grace
+/// slots. A node a whole epoch behind the chain reads only the grace slots too (get_light_nodes_to_ping).
+const MAX_PING_CATCHUP_SLOTS: u64 = 15;
+
+/// First window drawn from the bounded slot range. Every genesis switches at this window roll rather than
+/// at its own restart: a restart mid-window would re-draw the live window, and a device whose old slot had
+/// not come while its new one had passed would get no ping that epoch. Node-local, not a consensus rule;
+/// the upgrade must reach every genesis before this window's first block (104 * 14,400 = 1,497,600).
+const BOUNDED_SLOT_DRAW_FROM_WINDOW: u64 = 104;
+
+/// Buckets one ping tick reads, newest first: the grace read {slot, slot-1, slot-2} (mod 240) of every
+/// slot passed since `last_read` (absolute slots, window * 240 + slot), a new window from its slot 0. A
+/// first tick, a rollback or a gap past MAX_PING_CATCHUP_SLOTS reads only the grace slots, with the gap.
+pub(super) fn ping_buckets_to_read(last_read: Option<u64>, now: u64) -> (Vec<usize>, u64) {
+    let slot = now % 240;
+    let (first, gap) = match last_read {
+        Some(l) if l < now && now - l <= MAX_PING_CATCHUP_SLOTS => ((l + 1).max(now - slot), 0),
+        Some(l) if l < now => (now, now - l),
+        _ => (now, 0),
+    };
+    let span = now - first;
+    ((0..=span + 2).map(|g| ((slot + 240 - g) % 240) as usize).collect(), gap)
+}
+
 /// Single admission point for the resident light registry: role cap with inactive-first eviction plus
 /// the trimmed entry (heavy crypto lives in the VRF/ping-key CFs). Gossip and bulk sync both pass here.
 /// Caller holds the write lock, so a bulk merge takes it once.
@@ -1873,8 +1898,10 @@ impl SimplifiedP2P {
         LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed) / 14400
     }
     
-    /// Calculate ping slot for Light node with per-window randomization
-    /// SECURITY: Slot changes each 4h window, preventing prediction attacks
+    /// Ping slot of a light node in `window_number`, re-randomised per window. From
+    /// BOUNDED_SLOT_DRAW_FROM_WINDOW the draw leaves out the last slots: on the regular one-slot tick a
+    /// node's primary and two grace pushes, and the lifetime of the last challenge, end before the light
+    /// commit window opens. A catch-up push after a stalled tick can still be answered too late for it.
     pub fn calculate_randomized_slot(light_node_id: &str, window_number: u64) -> u64 {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
@@ -1883,7 +1910,13 @@ impl SimplifiedP2P {
         light_node_id.hash(&mut hasher);
         window_number.hash(&mut hasher);  // Randomize per window!
         let hash = hasher.finish();
-        hash % 240  // 0-239 slots
+        let slots = if window_number >= BOUNDED_SLOT_DRAW_FROM_WINDOW {
+            240 - crate::node::light_commit_window(window_number).div_ceil(60) - 2
+                - crate::rpc::LIGHT_CHALLENGE_TTL_SECS.div_ceil(60)
+        } else {
+            240
+        };
+        hash % slots
     }
     
     /// Get next ping time for a Light node (for polling fallback)
@@ -2146,19 +2179,28 @@ impl SimplifiedP2P {
             }
         }
 
-        // Read the 3 grace slots {cur, cur-1, cur-2} (mod 240). B: wake only plausibly-live nodes —
-        // attested (own-shard recency, epoch map held once) or registered within the grace window. Dormant
-        // nodes stop being woken (they self-attest on return); a fresh node gets its first ping via
-        // registered_at. Liveness authority is on-chain; this is only a derived whom-to-wake hint.
+        // Read the grace slots {cur, cur-1, cur-2} (mod 240) of every slot passed since the last tick. B:
+        // wake only plausibly-live nodes — attested (own-shard recency, epoch map held once) or registered
+        // within the grace window. Dormant nodes stop being woken (they self-attest on return); a fresh node
+        // gets its first ping via registered_at. Liveness authority is on-chain; this is a whom-to-wake hint.
+        // A whole epoch behind the chain (resync): the slots passed belong to epochs already committed,
+        // so the tick reads only the grace slots.
+        let behind = self.corroborated_head_ceiling() / 14400 > current_window;
         let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
         const WAKE_GRACE_EPOCHS: u64 = 3;
         let elig = self.epoch_light_eligible.read();
         let attested_recent = |id: &str| (0..WAKE_GRACE_EPOCHS)
             .any(|d| elig.get(&current_window.saturating_sub(d)).map(|s| s.contains(id)).unwrap_or(false));
         let this_epoch = |id: &str| elig.get(&current_window).map(|s| s.contains(id)).unwrap_or(false);
+        let now_slot = current_window * 240 + current_slot;
+        let last_read = self.light_ping_last_read.swap(now_slot, std::sync::atomic::Ordering::Relaxed);
+        let (buckets, gap) = ping_buckets_to_read((last_read != u64::MAX && !behind).then_some(last_read), now_slot);
+        if gap > 0 && crate::node::is_info() {
+            println!("[INFO][GENESIS-PING] ping_read_gap gap_slots={} max={} slot={} action=grace_slots_only",
+                     gap, MAX_PING_CATCHUP_SLOTS, current_slot);
+        }
         let cache = self.light_ping_slot_cache.read();
-        for g in 0..=2u64 {
-            let s = ((current_slot + 240 - g) % 240) as usize;
+        for s in buckets {
             for node_id in cache.1.get(s).into_iter().flatten() {
                 let node = match registry.get(node_id) { Some(n) => n, None => continue };
                 if this_epoch(node_id) { continue; }  // already attested this epoch — nothing to wake
@@ -2198,12 +2240,7 @@ impl SimplifiedP2P {
             None => return,
         };
         if !degraded { return; }
-        // Pad so the legacy unpadded id form ("genesis_node_1") still resolves.
-        let digits: String = attestor_id.chars().filter(|c| c.is_ascii_digit()).collect();
-        let digits = format!("{:0>3}", digits);
-        if std::env::var("QNET_BOOTSTRAP_ID").ok().as_deref() == Some(digits.as_str()) { return; }
-        let Some((ip, _)) = crate::genesis_constants::GENESIS_NODE_IPS.iter()
-            .find(|(_, id)| *id == digits) else { return; };
+        let Some(ip) = Self::genesis_peer_ip(attestor_id) else { return; };
         if pull_dedup().len() > 65_536 { pull_dedup().clear(); }
         if pull_dedup().insert(node_id.to_string(), epoch) == Some(epoch) { return; }
         let node = node_id.to_string();
@@ -2240,6 +2277,96 @@ impl SimplifiedP2P {
         });
     }
 
+    /// IP of the genesis peer `attestor_id` names; None for a non-genesis id or for this node itself.
+    fn genesis_peer_ip(attestor_id: &str) -> Option<&'static str> {
+        // Pad so the legacy unpadded id form ("genesis_node_1") still resolves.
+        let digits = format!("{:0>3}", attestor_id.strip_prefix("genesis_node_")?);
+        if std::env::var("QNET_BOOTSTRAP_ID").ok().as_deref() == Some(digits.as_str()) { return None; }
+        crate::genesis_constants::GENESIS_NODE_IPS.iter().find(|(_, id)| *id == digits).map(|(ip, _)| *ip)
+    }
+
+    /// Admit a relayed attestation whose device signature verified. Eligibility is recorded only for a
+    /// node in one of our shards and only for the CURRENT local epoch: block_height is not signed, and a
+    /// forged future height would drive the prune in record_light_epoch_eligible and wipe the live set.
+    pub(super) fn admit_relayed_attestation(&self, a: LightNodeAttestation) {
+        let (node, pinger, block_height) = (a.light_node_id.clone(), a.pinger_id.clone(), a.block_height);
+        self.store_attestation(a);
+        let local_epoch = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed) / 14400;
+        if block_height / 14400 == local_epoch && self.node_in_my_shard_for_epoch(local_epoch, &node) {
+            self.record_light_epoch_eligible(block_height, &node);
+            // The attestor just served this node, so its push channel is live: heal ours if degraded.
+            Self::maybe_pull_push_channel(&node, &pinger, local_epoch);
+        }
+    }
+
+    /// Heal a relay that failed here although a genesis pinger verified it: this node holds no identity row
+    /// for the device, or a stale one (the ping key rotates on every reinstall). Pull the pinger's row once
+    /// per (node, epoch), admit it only under the chain commitment and only if its ping key signs the held
+    /// challenge (so a stale or forged row never lands), then admit the relay.
+    pub(super) fn maybe_pull_light_identity(&self, a: LightNodeAttestation) {
+        fn pull_dedup() -> &'static dashmap::DashMap<String, u64> {
+            static M: std::sync::OnceLock<dashmap::DashMap<String, u64>> = std::sync::OnceLock::new();
+            M.get_or_init(dashmap::DashMap::new)
+        }
+        // Every established node of a shard pulls once after a rollout; in-flight pulls stay bounded.
+        fn pull_permits() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
+            static S: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+            S.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(32)))
+        }
+        let local_epoch = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed) / 14400;
+        if !a.light_node_signature.starts_with("ping_dilithium:")
+            || !self.node_in_my_shard_for_epoch(local_epoch, &a.light_node_id) { return; }
+        // Already recorded here this epoch: this node's row is current, so a copy that fails was tampered
+        // with, and a pull could not help.
+        if self.epoch_light_eligible.read().get(&local_epoch).map_or(false, |s| s.contains(&a.light_node_id)) { return; }
+        let Some(storage) = crate::node::try_get_storage() else { return; };
+        let Some(ip) = Self::genesis_peer_ip(&a.pinger_id) else { return; };
+        if pull_dedup().len() > 65_536 { pull_dedup().clear(); }
+        if pull_dedup().insert(a.light_node_id.clone(), local_epoch) == Some(local_epoch) { return; }
+        let Ok(permit) = pull_permits().clone().try_acquire_owned() else {
+            pull_dedup().remove(&a.light_node_id);
+            return;
+        };
+        tokio::spawn(async move {
+            let _permit = permit;
+            let node = a.light_node_id.clone();
+            let url = format!("http://{}:8001/api/v1/internal/light-ping-keys-get?node_id={}", ip, node);
+            let v: serde_json::Value = match HTTP_CLIENT.get(&url).send().await.ok()
+                .filter(|r| r.status().is_success())
+            {
+                Some(r) => match r.json().await { Ok(v) => v, Err(_) => return },
+                None => {
+                    if crate::node::is_debug() {
+                        println!("[DBG][LIGHT] light_identity_pull_failed node={} from={}", node, ip);
+                    }
+                    return;
+                }
+            };
+            let field = |k: &str| v[k].as_str().unwrap_or("").to_string();
+            let (pp, cert, presented) = (field("ping_pubkey"), field("ping_delegation_cert"), field("identity_pubkey"));
+            if v["success"].as_bool() != Some(true) || pp.is_empty() || cert.is_empty() { return; }
+            // The three checks the HTTP ingress runs before it records an identity (light_nodes.rs).
+            let inner_sig = a.light_node_signature.strip_prefix("ping_dilithium:").unwrap_or("");
+            let admitted = storage.resolve_light_identity_pk(&node, Some(presented.as_str())).filter(|id| {
+                crate::rpc::verify_mobile_dilithium_signature(&format!("delegate_ping:{}:{}", pp, node), &cert, id)
+                    && crate::rpc::verify_mobile_dilithium_signature(&a.challenge, inner_sig, &pp)
+            });
+            let Some(identity) = admitted else {
+                if crate::node::is_warn() {
+                    println!("[WARN][LIGHT] light_identity_pull_rejected node={} from={}", node, ip);
+                }
+                return;
+            };
+            if storage.save_light_ping_keys_identity(&node, &pp, &cert, &identity).is_err() { return; }
+            if crate::node::is_info() {
+                println!("[INFO][LIGHT] light_identity_pulled node={} from={}", node, ip);
+            }
+            if let Some(p2p) = crate::node::try_get_p2p() {
+                p2p.admit_relayed_attestation(a);
+            }
+        });
+    }
+
     /// Update push_type + last_seen for a light node (called on token-refresh).
     pub fn update_light_node_push_type(&self, node_id: &str, push_type_str: &str, timestamp: u64) {
         let mut registry = self.light_node_registry.write();
@@ -2257,26 +2384,40 @@ impl SimplifiedP2P {
     /// took the device's reply directly) and the gossip relay - go through here, so the key shape and
     /// the capacity bound cannot drift apart again.
     ///
-    /// The key carries the EPOCH because that is the unit the credit it guards lives in: `slot` is
-    /// hash(node_id) % 240 and so constant for a device, and the map is retained for
-    /// RETENTION_PERIOD_SECS, so a slot-only key suppressed that device for every epoch in the window.
+    /// The key carries the EPOCH because that is the unit the credit it guards lives in: slot numbers
+    /// repeat every epoch and the map is retained for RETENTION_PERIOD_SECS, so a slot-only key
+    /// suppressed a device in every later epoch whose reply fell in the same slot.
     pub(super) fn attestation_key(light_node_id: &str, slot: u64) -> String {
         let epoch = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed) / 14400;
         format!("{}:{}:{}", light_node_id, slot, epoch)
     }
 
-    pub(super) fn store_attestation(&self, a: LightNodeAttestation) {
+    pub(super) fn store_attestation(&self, mut a: LightNodeAttestation) {
+        // Readers take the key and the header only; the ~12 KB of signatures were verified on arrival.
+        a.light_node_signature = String::new();
+        a.pinger_signature = String::new();
+        a.challenge = String::new();
         let key = Self::attestation_key(&a.light_node_id, a.slot);
-        let now = a.timestamp;
+        // Local time: the attestation's own stamp is the pinger's, anywhere within the relay's +-300 s.
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
         let mut attestations = self.light_node_attestations.write();
         if attestations.len() >= MAX_ATTESTATIONS_SIZE {
-            let cutoff = now.saturating_sub(RETENTION_PERIOD_SECS);
-            let before = attestations.len();
-            attestations.retain(|_, v| v.timestamp > cutoff);
-            let removed = before - attestations.len();
-            if removed > 0 && crate::node::is_info() {
-                println!("[INFO][P2P] attestations_pruned removed={} kept={}", removed, attestations.len());
+            // One sweep a minute at most: a sweep that frees nothing must not run on every insert. A key
+            // of an earlier epoch can no longer dedupe an echo, so it goes with the expired ones.
+            static LAST_SWEEP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            if now.saturating_sub(LAST_SWEEP.load(std::sync::atomic::Ordering::Relaxed)) >= 60 {
+                LAST_SWEEP.store(now, std::sync::atomic::Ordering::Relaxed);
+                let cutoff = now.saturating_sub(RETENTION_PERIOD_SECS);
+                let live = format!(":{}", LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed) / 14400);
+                let before = attestations.len();
+                attestations.retain(|k, v| v.timestamp > cutoff && k.ends_with(&live));
+                let removed = before - attestations.len();
+                if removed > 0 && crate::node::is_info() {
+                    println!("[INFO][P2P] attestations_pruned removed={} kept={}", removed, attestations.len());
+                }
             }
+            // Still full: the map only dedupes echoes, and eligibility is recorded apart from it.
+            if attestations.len() >= MAX_ATTESTATIONS_SIZE { return; }
         }
         attestations.insert(key, a);
     }
@@ -2297,10 +2438,19 @@ impl SimplifiedP2P {
         
         // Store locally first + record into the per-epoch eligibility set (the live origination
         // path: this genesis received the light node's ping reply directly).
+        let owners = crate::node::light_shard_owners(crate::node::light_shard_of(&attestation.light_node_id));
         self.record_light_epoch_eligible(attestation.block_height, &attestation.light_node_id);
         self.store_attestation(attestation);
 
-        // Gossip to peers
+        // Every owner of the shard commits its own bitmap, and random gossip reaches a given genesis
+        // only by chance on a large network: the other owners get the attestation directly.
+        for owner in owners {
+            let id = format!("genesis_node_{:03}", owner + 1);
+            if id == self.node_id { continue; }
+            if let Some(addr) = self.get_peer_addr_by_id(&id) {
+                self.send_network_message(&addr, msg.clone());
+            }
+        }
         self.gossip_to_random_peers(msg, 5);
     }
     
@@ -2648,9 +2798,9 @@ impl SimplifiedP2P {
     /// in-set peers (round committee ∪ genesis). >=f+1 members attesting a height ⇒ >=1 honest ⇒ a real
     /// lower bound on the true tip, so stragglers cannot demote a tip the honest majority attests (a median
     /// would). 0 if <f+1 fresh corroborators ⇒ the clamp trusts raw (bootstrap/isolated). Self EXCLUDED
-    /// (peer-only). SYNC-HINT oracle ONLY — sanctioned consumers: clamp_overclaim and the registration
-    /// arm gate (both liveness hints; the on-chain attest_epoch verifier is the safety backstop) —
-    /// never a consensus/failover input.
+    /// (peer-only). SYNC-HINT oracle ONLY — sanctioned consumers: clamp_overclaim, the registration arm
+    /// test (arm_deficit_exceeded: server arm gate and client submit), snapshot discovery's tip and the
+    /// light ping loop's behind check — liveness hints only, never consensus/failover.
     pub fn corroborated_head_ceiling(&self) -> u64 {
         let corroborated = frontier_order_statistic(self.fresh_in_set_peer_heights());
         ceiling_with_own_tip(
@@ -3076,5 +3226,77 @@ mod tests_ping_slot_index {
         assert!(cond.contains("covered_mask"), "a shard takeover changes which ids are ours");
         let size_term = format!("reg{}", "_len");
         assert!(!cond.contains(&size_term), "keying on the registry size rebuilds 240 buckets per registration");
+    }
+
+    /// At one slot per tick a tick reads exactly the grace slots, as before; at any faster pace up to the
+    /// bound it still reads every slot it passed, and a window entered from the previous one from slot 0.
+    #[test]
+    fn a_ping_tick_reads_every_slot_it_passed() {
+        let w = 240 * 6;
+        assert_eq!(ping_buckets_to_read(Some(w + 99), w + 100), (vec![100, 99, 98], 0));
+        for step in [1u64, 2, 3, 5, 9, MAX_PING_CATCHUP_SLOTS] {
+            let (mut read, mut last, mut now) = (vec![false; 240], None, w - 100);
+            while now < w + 240 {
+                let (buckets, gap) = ping_buckets_to_read(last, now);
+                assert_eq!(gap, 0, "step {} is within the bound", step);
+                if now >= w { for s in buckets { read[s] = true; } }
+                last = Some(now);
+                now += step;
+            }
+            let top = (last.unwrap() - w) as usize;
+            assert!(read[..=top].iter().all(|r| *r), "step {}: a slot of the window went unread", step);
+        }
+    }
+
+    /// A first tick or a rollback has nothing to catch up, and a gap past the bound is a loop behind the
+    /// tip: each reads only the grace slots. Slot 0 still wraps onto the window's last two buckets.
+    #[test]
+    fn a_ping_tick_without_continuity_reads_only_the_grace_slots() {
+        let now = 240 * 9 + 50;
+        assert_eq!(ping_buckets_to_read(None, now), (vec![50, 49, 48], 0), "first tick");
+        assert_eq!(ping_buckets_to_read(Some(now + 4), now), (vec![50, 49, 48], 0), "rollback");
+        assert_eq!(ping_buckets_to_read(Some(now), now), (vec![50, 49, 48], 0), "no slot passed");
+        let far = MAX_PING_CATCHUP_SLOTS + 1;
+        assert_eq!(ping_buckets_to_read(Some(now - far), now), (vec![50, 49, 48], far), "gap past the bound");
+        assert_eq!(ping_buckets_to_read(None, 240 * 9), (vec![0, 239, 238], 0), "slot 0 wraps");
+    }
+
+    /// From the switch window a reply to the last push of the last slot a node can draw, sent while its
+    /// challenge still lives, lands before the owner builds the epoch bitmap; before it the full range
+    /// stays, so a restart re-draws nothing.
+    #[test]
+    fn every_ping_slot_and_its_grace_end_before_the_commit_window() {
+        let before = BOUNDED_SLOT_DRAW_FROM_WINDOW - 1;
+        let top_before = (0..5_000)
+            .map(|i| SimplifiedP2P::calculate_randomized_slot(&format!("light_{:05}", i), before))
+            .max().unwrap();
+        assert!((235..240).contains(&top_before), "window {} still draws all 240 slots", before);
+        for window in [BOUNDED_SLOT_DRAW_FROM_WINDOW, BOUNDED_SLOT_DRAW_FROM_WINDOW + 1, 4096] {
+            let opens_at = 14_400 - crate::node::light_commit_window(window);
+            let top = (0..5_000)
+                .map(|i| SimplifiedP2P::calculate_randomized_slot(&format!("light_{:05}", i), window))
+                .max().unwrap();
+            let ttl = crate::rpc::LIGHT_CHALLENGE_TTL_SECS;
+            assert!((top + 3) * 60 + ttl <= opens_at, "window {}: a reply to slot {}'s last push can land after the bitmap is built", window, top);
+            assert_eq!(top + 3 + ttl.div_ceil(60), opens_at / 60, "window {}: the draw uses every slot that fits", window);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests_genesis_peer_ip {
+    use super::*;
+
+    /// Padded and legacy unpadded genesis ids name one peer; any other id is not a genesis peer.
+    #[test]
+    fn genesis_ids_resolve_and_others_do_not() {
+        // The helper skips the node itself, so ask for a genesis that is not this process.
+        let n = if std::env::var("QNET_BOOTSTRAP_ID").ok().as_deref() == Some("001") { "002" } else { "001" };
+        let padded = SimplifiedP2P::genesis_peer_ip(&format!("genesis_node_{}", n));
+        assert!(padded.is_some(), "genesis_node_{} is a genesis peer", n);
+        assert_eq!(SimplifiedP2P::genesis_peer_ip(&format!("genesis_node_{}", n.trim_start_matches('0'))), padded);
+        assert_eq!(SimplifiedP2P::genesis_peer_ip("super_node_12"), None);
+        assert_eq!(SimplifiedP2P::genesis_peer_ip("genesis_node_0001"), None);
+        assert_eq!(SimplifiedP2P::genesis_peer_ip("genesis_node_"), None);
     }
 }

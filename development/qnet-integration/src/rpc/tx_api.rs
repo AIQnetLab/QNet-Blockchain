@@ -957,22 +957,23 @@ pub(super) async fn handle_gas_recommendations(
             "eco": {
                 "gas_price": eco_price,
                 "estimated_time": eco_time,
-                "cost_qnc": (eco_price as f64 * qnet_state::transaction::gas_limits::TRANSFER as f64) / 1_000_000_000.0 // nanoQNC → QNC
+                // ML-DSA signed, as every wallet TX is: the chain charges gas_price + gas_price/2.
+                "cost_qnc": ((eco_price + eco_price / 2) as f64 * qnet_state::transaction::gas_limits::TRANSFER as f64) / 1_000_000_000.0
             },
             "standard": {
                 "gas_price": standard_price,
                 "estimated_time": standard_time,
-                "cost_qnc": (standard_price as f64 * qnet_state::transaction::gas_limits::TRANSFER as f64) / 1_000_000_000.0
+                "cost_qnc": ((standard_price + standard_price / 2) as f64 * qnet_state::transaction::gas_limits::TRANSFER as f64) / 1_000_000_000.0
             },
             "fast": {
                 "gas_price": fast_price,
                 "estimated_time": fast_time,
-                "cost_qnc": (fast_price as f64 * qnet_state::transaction::gas_limits::TRANSFER as f64) / 1_000_000_000.0
+                "cost_qnc": ((fast_price + fast_price / 2) as f64 * qnet_state::transaction::gas_limits::TRANSFER as f64) / 1_000_000_000.0
             },
             "priority": {
                 "gas_price": priority_price,
                 "estimated_time": priority_time,
-                "cost_qnc": (priority_price as f64 * qnet_state::transaction::gas_limits::TRANSFER as f64) / 1_000_000_000.0
+                "cost_qnc": ((priority_price + priority_price / 2) as f64 * qnet_state::transaction::gas_limits::TRANSFER as f64) / 1_000_000_000.0
             }
         },
         "network_load": network_load,

@@ -18,6 +18,14 @@ import { verifyMacroblockStateRoot, verifyLogInclusion, verifyLogWindowInclusion
 // Canonical identity + signed-preimage construction, pinned cross-language against the node and the
 // extension by __tests__/fix5_kat.test.js.
 import { QNET_CHAIN_TAG, walletSeedString, eonFromPublicKeyBytes, transferPreimage } from '../crypto/WalletIdentity';
+import { GAS_PRICE, STORAGE_DEPOSIT_NANO, DEPLOY_GAS_PRICE, DEPLOY_GAS_LIMIT, feeNano, contractCallGasLimit } from '../config/fees';
+
+// A TX admitted to a mempool keeps its inclusion window (attest_epoch + 2 epochs, <= 270 blocks) before any
+// resubmit may replace it.
+const ONCHAIN_ADMIT_HOLD_MS = 10 * 60_000;
+
+// Wait before the next automatic try of a registration that did not land: 2^attempts minutes, capped at 6h.
+const onchainBackoffMs = (attempts) => Math.min(Math.pow(2, attempts || 0) * 60_000, 6 * 3600_000);
 
 export class WalletManager {
   constructor() {
@@ -5655,70 +5663,105 @@ export class WalletManager {
     return `light_mobile_${hexHash}`;
   }
   
-  // Persist a pending on-chain registration so the next unlock re-drives it. Keyed per wallet.
-  // `attempts` bounds retries; `nextRetryTs` backs off. Written only when the on-chain stage did NOT land.
-  async _savePendingOnchainRegistration(walletAddress, info) {
+  // One rule for every NodeRegistration submit outcome, keyed per wallet. Mempool admission is not
+  // inclusion, so the marker survives it (with txHash + admittedAt) until status reports the node on
+  // chain; "already registered" is the only submit answer that proves the registration landed.
+  async _recordOnchainSubmitOutcome(walletAddress, info, txResult) {
+    const rejectMsg = String((txResult && (txResult.error || txResult.details)) || '');
+    const outcome = /already[\s_]*registered/i.test(rejectMsg) ? 'on_chain'
+      : (txResult && txResult.success && txResult.tx_hash) ? 'admitted' : 'failed';
     try {
       const key = `qnet_onchain_reg_pending_${walletAddress}`;
-      const prev = await AsyncStorage.getItem(key);
-      const attempts = prev ? ((JSON.parse(prev).attempts || 0)) : 0;
-      await AsyncStorage.setItem(key, JSON.stringify({ ...info, walletAddress, attempts, savedAt: Date.now() }));
+      if (outcome === 'on_chain') {
+        await AsyncStorage.removeItem(key);
+      } else {
+        const prev = await AsyncStorage.getItem(key);
+        const attempts = prev ? ((JSON.parse(prev).attempts || 0)) : 0;
+        const now = Date.now();
+        const next = { ...info, walletAddress, attempts: attempts + 1, savedAt: now };
+        // Admission records the TX for the inclusion hold and still counts toward the backoff, so a TX
+        // admitted but never included is not resent every few minutes.
+        await AsyncStorage.setItem(key, JSON.stringify(outcome === 'admitted'
+          ? { ...next, txHash: txResult.tx_hash, admittedAt: now } : next));
+      }
     } catch (_) { /* best effort */ }
+    return outcome;
   }
 
   async _clearPendingOnchainRegistration(walletAddress) {
     try { await AsyncStorage.removeItem(`qnet_onchain_reg_pending_${walletAddress}`); } catch (_) {}
   }
 
-  // Foreground retry of a pending on-chain registration. Called on wallet unlock (password available —
-  // the on-chain TX must be signed by the wallet ML-DSA key, which a background push wake can't decrypt).
-  // Bounded by an attempt counter with exponential backoff; clears the marker once the node is on-chain.
-  async retryPendingOnchainRegistration(password) {
+  // Every NodeRegistration submit runs here, one at a time. A submit started while another is in flight
+  // waits for it, and one that finds a TX admitted inside the inclusion hold yields to it ('held') rather
+  // than replacing it in the mempool. An automatic retry also re-reads the backoff after the wait: the
+  // submit ahead of it may have failed a moment ago, or landed and cleared the marker.
+  async _submitRegistration(walletAddress, info, submit, { automatic = false } = {}) {
+    const prev = this._onchainSubmitTail || Promise.resolve();
+    let release;
+    this._onchainSubmitTail = new Promise(resolve => { release = resolve; });
+    try {
+      await prev;
+      const raw = await AsyncStorage.getItem(`qnet_onchain_reg_pending_${walletAddress}`);
+      const p = raw ? JSON.parse(raw) : null;
+      if (p && p.admittedAt && (Date.now() - p.admittedAt) < ONCHAIN_ADMIT_HOLD_MS) {
+        return { outcome: 'held', txHash: p.txHash };
+      }
+      if (automatic && (!p || (p.savedAt && (Date.now() - p.savedAt) < onchainBackoffMs(p.attempts)))) {
+        return { outcome: 'skipped' };
+      }
+      let txResult;
+      try {
+        txResult = await submit();
+      } catch (e) {
+        // Network down / no keypair: a throw, not a returned reject; recorded as a failed try.
+        txResult = { success: false, error: (e && e.message) || String(e) };
+      }
+      const outcome = await this._recordOnchainSubmitOutcome(walletAddress, info, txResult);
+      return { outcome, txResult, txHash: txResult && txResult.tx_hash };
+    } finally {
+      release();
+    }
+  }
+
+  // Re-drives a pending on-chain registration. Needs the password (the TX is signed by the wallet ML-DSA
+  // key), so it runs on unlock, foreground and the light status poll. The chain decides: on chain clears
+  // the marker; not on chain keeps retrying on the backoff, past the attempt cap.
+  async retryPendingOnchainRegistration(password, knownStatus = null) {
+    if (this._onchainRetryBusy) return; // unlock, foreground and the status poll can overlap
+    this._onchainRetryBusy = true;
     try {
       const walletAddress = await AsyncStorage.getItem('qnet_address');
       if (!walletAddress) return;
-      const key = `qnet_onchain_reg_pending_${walletAddress}`;
-      const raw = await AsyncStorage.getItem(key);
+      const raw = await AsyncStorage.getItem(`qnet_onchain_reg_pending_${walletAddress}`);
       if (!raw) return;
       const p = JSON.parse(raw);
-      const attempts = p.attempts || 0;
-      if (attempts >= 12) return; // give up after ~12 unlocks; user can re-activate manually
-      // Exponential backoff between unlocks: 2^attempts minutes, capped at 6h.
-      const backoffMs = Math.min(Math.pow(2, attempts) * 60_000, 6 * 3600_000);
-      if (p.savedAt && (Date.now() - p.savedAt) < backoffMs) return;
-      let landed = false;
-      try {
-        const txResult = await this.createAndSubmitNodeRegistrationTx(
-          p.nodeId, walletAddress, p.registrationProof, password, null,
-          p.burnTxHash, p.burnAmount, p.burnWallet
-        );
-        const rejectMsg = String((txResult && (txResult.error || txResult.details)) || '');
-        // "already registered" IS the success case for a retry: the ORIGINAL submit landed on-chain and only
-        // its response was lost (exactly why the pending marker was saved). Treating it as a failure kept
-        // re-signing and re-submitting an on-chain registration up to the give-up cap.
-        const alreadyOnChain = /already[\s_]*registered/i.test(rejectMsg);
-        if (txResult && txResult.success && txResult.tx_hash) {
-          landed = true;
-          await this._clearPendingOnchainRegistration(walletAddress);
-          console.log('[Registration] pending on-chain registration landed on retry:', txResult.tx_hash);
-        } else if (alreadyOnChain) {
-          landed = true;
-          await this._clearPendingOnchainRegistration(walletAddress);
-          console.log('[Registration] pending on-chain registration already on-chain — marker cleared');
-        } else {
-          console.warn('[Registration] pending on-chain retry still rejected:', rejectMsg || 'unknown');
-        }
-      } catch (submitErr) {
-        // Network down / no keypair — a THROW, not a returned reject. Fall through to the attempts bump.
-        console.warn('[Registration] pending on-chain retry submit error:', submitErr.message || submitErr);
+      const { checkNodeStatus } = require('../services/PushService');
+      const status = knownStatus || await checkNodeStatus();
+      const onChain = status ? status.onChainRegistered : null;
+      if (onChain === true) {
+        await this._clearPendingOnchainRegistration(walletAddress);
+        console.log('[Registration] pending on-chain registration is on chain — marker cleared');
+        return;
       }
-      // Advance attempts + backoff clock on ANY non-landed outcome (returned reject OR thrown), so a
-      // persistent failure converges to the give-up cap instead of retrying every unlock forever.
-      if (!landed) {
-        await AsyncStorage.setItem(key, JSON.stringify({ ...p, attempts: attempts + 1, savedAt: Date.now() }));
+      if ((p.attempts || 0) >= 12 && onChain !== false) return; // past the cap only while the chain says "absent"
+      // The backoff is read inside the submit queue, after any submit ahead of this one.
+      const { outcome, txResult } = await this._submitRegistration(walletAddress, {
+        nodeId: p.nodeId, registrationProof: p.registrationProof,
+        burnTxHash: p.burnTxHash, burnAmount: p.burnAmount, burnWallet: p.burnWallet,
+      }, () => this.createAndSubmitNodeRegistrationTx(
+        p.nodeId, walletAddress, p.registrationProof, password, null,
+        p.burnTxHash, p.burnAmount, p.burnWallet
+      ), { automatic: true });
+      if (outcome === 'failed') {
+        console.warn('[Registration] pending on-chain retry still rejected:', (txResult && txResult.error) || 'unknown');
+      } else if (outcome !== 'skipped' && outcome !== 'held') {
+        console.log('[Registration] pending on-chain retry:', outcome, (txResult && txResult.tx_hash) || '');
       }
     } catch (e) {
       console.warn('[Registration] pending on-chain retry error:', e.message || e);
+    } finally {
+      this._onchainRetryBusy = false;
     }
   }
 
@@ -6001,47 +6044,31 @@ export class WalletManager {
           // TX is signed by wallet key and routed directly to the current producer.
           // This replaces the old server-side TX creation and eliminates up-to-30-sec latency.
           if (registrationResult && registrationResult.success && registrationResult.tx_required) {
-            try {
-              const txResult = await this.createAndSubmitNodeRegistrationTx(
-                registrationResult.node_id,
-                walletAddress,
-                registrationResult.registration_proof,
-                password,
-                dilithiumKeys,
-                burnTxHash,   // Option A: server embeds the burn + committee attestation into the on-chain TX
-                burnAmount,
-                burnWallet
-              );
-              // HONEST status: the on-chain stage counts as done ONLY when the server ACCEPTED the TX
-              // (txResult.success). A tx_hash with success:false is NOT a landed registration — treat it
-              // as pending and persist so the next unlock retries (14 of the server's reject reasons are
-              // transient: burn-quorum not yet reached, committee syncing, etc.).
-              if (txResult && txResult.success && txResult.tx_hash) {
-                console.log('[Registration] NodeRegistration TX accepted:', txResult.tx_hash);
-                registrationResult.onchain_tx_hash = txResult.tx_hash;
-                await this._clearPendingOnchainRegistration(walletAddress);
-              } else {
-                const reason = (txResult && txResult.error) || 'unknown';
-                console.warn('[Registration] on-chain stage rejected (retryable):', reason);
-                registrationResult.tx_pending = true;
-                registrationResult.onchain_error = reason;
-                await this._savePendingOnchainRegistration(walletAddress, {
-                  nodeId: registrationResult.node_id,
-                  registrationProof: registrationResult.registration_proof,
-                  burnTxHash, burnAmount, burnWallet,
-                });
-              }
-            } catch (txErr) {
-              // Network failure (all nodes unreachable): the node is registered locally (ping works) but
-              // the ON-CHAIN registration did NOT land. Persist so the next unlock retries it.
-              console.warn('[Registration] NodeRegistration TX submission failed (retryable):', txErr.message);
+            // HONEST status: an admitted TX is only in a mempool, so the marker stays until the chain has it;
+            // a reject (most are transient: burn quorum, committee syncing) is retried automatically. A TX
+            // still inside its inclusion hold is not replaced.
+            const { outcome, txResult, txHash } = await this._submitRegistration(walletAddress, {
+              nodeId: registrationResult.node_id,
+              registrationProof: registrationResult.registration_proof,
+              burnTxHash, burnAmount, burnWallet,
+            }, () => this.createAndSubmitNodeRegistrationTx(
+              registrationResult.node_id,
+              walletAddress,
+              registrationResult.registration_proof,
+              password,
+              dilithiumKeys,
+              burnTxHash,   // Option A: server embeds the burn + committee attestation into the on-chain TX
+              burnAmount,
+              burnWallet
+            ));
+            if (outcome === 'admitted' || outcome === 'held') {
+              console.log('[Registration] NodeRegistration TX', outcome, txHash);
+              registrationResult.onchain_tx_hash = txHash;
+            } else if (outcome === 'failed') {
+              const reason = (txResult && txResult.error) || 'unknown';
+              console.warn('[Registration] on-chain stage rejected (retryable):', reason);
               registrationResult.tx_pending = true;
-              registrationResult.onchain_error = txErr.message;
-              await this._savePendingOnchainRegistration(walletAddress, {
-                nodeId: registrationResult.node_id,
-                registrationProof: registrationResult.registration_proof,
-                burnTxHash, burnAmount, burnWallet,
-              });
+              registrationResult.onchain_error = reason;
             }
           }
         }
@@ -6089,7 +6116,8 @@ export class WalletManager {
       }
 
       const alreadyRegistered = !!(registrationResult && registrationResult.already_registered);
-      const onChainPending = !!(registrationResult && registrationResult.tx_pending);
+      // Pending until a block includes the registration: rejected and retrying, or only admitted.
+      const onChainPending = !!(registrationResult && (registrationResult.tx_pending || registrationResult.onchain_tx_hash));
 
       return {
         success: true,
@@ -6100,7 +6128,9 @@ export class WalletManager {
         message: alreadyRegistered
           ? (registrationResult.message || 'Node already registered. Your existing node has been restored.')
           : onChainPending
-            ? 'Node activated locally. On-chain registration is pending and will retry automatically.'
+            ? (registrationResult.onchain_tx_hash
+              ? 'Node activated. Its on-chain registration was submitted and confirms once a block includes it.'
+              : 'Node activated locally. On-chain registration is pending and will retry automatically.')
             : registrationResult
               ? 'Node successfully activated and registered in blockchain'
               : 'Node activation saved locally. Network registration will retry automatically.',
@@ -6395,7 +6425,9 @@ export class WalletManager {
         if (!submitRes.ok || !submitted.success) {
           throw new Error(submitted.error || submitted.message || 'Failed to submit signed claim');
         }
-        claimResult = { ...submitted, epochs_claimed: claimResult.epochs_claimed };
+        // The quote's stop point survives the submit, so the UI can name the epoch the batch stopped at.
+        claimResult = { ...submitted, epochs_claimed: claimResult.epochs_claimed,
+                        stopped_at_epoch: claimResult.stopped_at_epoch, stopped_reason: claimResult.stopped_reason };
       }
 
       if (!claimResult.success) {
@@ -6427,6 +6459,8 @@ export class WalletManager {
         success: true,
         amount: claimedAmount,
         epochsClaimed,
+        stoppedAtEpoch: claimResult.stopped_at_epoch ?? null, // the epoch the quote stopped at, if it did
+        stoppedReason: claimResult.stopped_reason ?? null,
         pending: true, // submitted; credited on inclusion — balance updates on the next status poll
         timestamp: Date.now(),
         nextClaim: claimResult.next_claim_time || (Date.now() + 24 * 60 * 60 * 1000),
@@ -6523,7 +6557,7 @@ export class WalletManager {
       if (!Number.isSafeInteger(amountSmallest)) {
         throw new Error('Amount too large or imprecise'); // beyond 2^53 nano — would lose precision
       }
-      const gasPrice = 10;   // nanoQNC/gas — matches node MIN_GAS_PRICE (fee = 10 * 10000 = 0.0001 QNC)
+      const gasPrice = GAS_PRICE; // fee = (10 + 10/2) * 10_000 = 150_000 nanoQNC: ML-DSA costs +50%
       const gasLimit = 10_000;
 
       const { signDetached } = require('../crypto/DilithiumCrypto');
@@ -6540,7 +6574,7 @@ export class WalletManager {
       // the pk to bind it) and txNonce>=2 means a lower-nonce tx already bound it. Nonce ordering guarantees
       // that binding tx APPLIES before any elided tx, so rehydrate always resolves — no defer-livelock. On a
       // nonce error the retry re-resolves fresh (→ txNonce 1 if the account is truly empty) and re-includes pk.
-      const buildAndSubmit = async (txNonce) => {
+      const buildAndSubmit = async (txNonce, legacy = false) => {
         const message = transferPreimage(fromAddress, toAddress, amountSmallest, txNonce, gasPrice, gasLimit);
         const dilSig = await signDetached(message, dilSkHex);
         const payload = {
@@ -6590,7 +6624,7 @@ export class WalletManager {
   // Same wallet-load, ML-DSA-65 signer, local-nonce and hedged-submit path as
   // sendQNC. The node builds tx.data server-side from the request fields, so the
   // signature MUST bind the EXACT byte string it will reproduce:
-  //   ContractCall   canonical: q{chain}|contract_call:{from}:{sha3_256_hex(dataStr)}:{nonce}
+  //   ContractCall   canonical: q{chain}|contract_call:{from}:{sha3_256_hex(dataStr)}:{nonce}:{gas_price}:{gas_limit}
   //                  dataStr = serde_json::to_string(json!({"contract","method","args"})).
   //                  serde_json here has preserve_order OFF (Map = BTreeMap), so the node
   //                  emits keys ALPHABETICALLY: `{"args":..,"contract":..,"method":..}`.
@@ -6627,18 +6661,20 @@ export class WalletManager {
     const argList = Array.isArray(args) ? args : [];
     const { from, dilPkHex, dilSkHex } = await this._loadContractSigner(password);
 
-    const gasPrice = opts.gasPrice != null ? opts.gasPrice : 10;   // nanoQNC/gas — node MIN_GAS_PRICE
-    const gasLimit = opts.gasLimit != null ? opts.gasLimit : 10_000; // node call min gas_limit
+    // Byte-exact match to the node's json! serialization: serde_json (preserve_order OFF)
+    // sorts object keys, so the keys MUST be alphabetical — args, contract, method.
+    const dataStr = WalletManager._callData(contractAddress, method, argList);
+    const gasPrice = opts.gasPrice != null ? opts.gasPrice : GAS_PRICE;
+    // Apply refuses a call whose intrinsic gas exceeds its limit; the intrinsic gas is the exact default.
+    const gasLimit = opts.gasLimit != null ? opts.gasLimit : contractCallGasLimit(Buffer.byteLength(dataStr, 'utf8'));
 
     const { signDetached } = require('../crypto/DilithiumCrypto');
     const { sha3_256 } = require('js-sha3');
 
-    const buildAndSubmit = async (txNonce) => {
-      // Byte-exact match to the node's json! serialization: serde_json (preserve_order OFF)
-      // sorts object keys, so the keys MUST be alphabetical — args, contract, method.
-      const dataStr = JSON.stringify({ args: argList, contract: contractAddress, method });
+    const buildAndSubmit = async (txNonce, legacy = false) => {
       const dataHash = sha3_256(dataStr); // hex; matches Rust Sha3_256::digest(tx.data)
-      const message = `${QNET_CHAIN_TAG}contract_call:${from}:${dataHash}:${txNonce}`;
+      // The signature covers the gas, so no relay can raise it; `legacy` is the form a node before that rule takes.
+      const message = `${QNET_CHAIN_TAG}contract_call:${from}:${dataHash}:${txNonce}${legacy ? '' : `:${gasPrice}:${gasLimit}`}`;
       const dilSig = await signDetached(message, dilSkHex); // FIX-5: raw detached hex; pk sent as hex(dilPkHex)
       // pk-ELISION (same rule as sendQNC): omit the pubkey once bound on-chain (txNonce>=2); include it on
       // the first-ever tx (txNonce===1) so the node can bind it. Nonce ordering ⇒ rehydrate always resolves.
@@ -6658,6 +6694,11 @@ export class WalletManager {
     // Local nonce → hedged submit; one retry with a chain-fresh nonce on drift (mirrors sendQNC).
     let txNonce = await this.resolveNonce(from);
     let result = await buildAndSubmit(txNonce);
+    // A node from before gas-bound contract signatures refuses the new form; it takes the old one.
+    if (result && result.success === false && !result.tx_hash &&
+        /signature|dilithium/i.test(`${result.error || ''} ${result.details || ''}`)) {
+      result = await buildAndSubmit(txNonce, true);
+    }
     if (result && result.success === false && !result.tx_hash &&
         // `pk_unresolved` = we elided the pubkey but the node has no committed key for us. The forced
         // fresh resolveNonce below re-reads has_dilithium_pk (false), so the retry re-attaches the pk.
@@ -6706,6 +6747,20 @@ export class WalletManager {
   }
   async qrc20Transfer(contract, to, amount, password, opts) {
     return this.buildContractCall(contract, 'transfer', [to, this._amt(amount)], password, opts);
+  }
+  static _callData(contract, method, args) { return JSON.stringify({ args, contract, method }); }
+  // QNC fee (gas_debit) the chain prepays for qrc20Transfer(contract, to, amount) at the default gas.
+  qrc20TransferFeeNano(contract, to, amount) {
+    const dataStr = WalletManager._callData(contract, 'transfer', [to, this._amt(amount)]);
+    return feeNano(GAS_PRICE, contractCallGasLimit(Buffer.byteLength(dataStr, 'utf8')));
+  }
+  // QNC the sender must hold: the fee, plus a refundable deposit when the recipient holds none of the token.
+  // An unreadable recipient balance counts as none, so the check stays on the safe side.
+  async qrc20TransferQncNeedNano(contract, to, amount) {
+    const fee = this.qrc20TransferFeeNano(contract, to, amount);
+    const r = await this.getTokenBalanceOf(contract, to);
+    const depositNano = r.ok && r.balanceBaseUnits !== '0' ? 0 : STORAGE_DEPOSIT_NANO;
+    return { feeNano: fee, depositNano, needNano: fee + depositNano };
   }
   async qrc20Approve(contract, spender, amount, password, opts) {
     return this.buildContractCall(contract, 'approve', [spender, this._amt(amount)], password, opts);
@@ -6757,7 +6812,7 @@ export class WalletManager {
   // Deploy a QRC-20 token via the node's /api/v1/token/deploy endpoint. The node
   // derives the on-chain contract address (derive_contract_address(from, nonce)) and
   // builds tx.data itself, so the signature binds the canonical deploy message it
-  // reproduces: q{chain}|contract_deploy:{from}:{code_hash}:{nonce}, where code_hash is
+  // reproduces: q{chain}|contract_deploy:{from}:{code_hash}:{nonce}:{gas_price}:{gas_limit}, where code_hash is
   // the canonical deploy digest below — it commits to EVERY field the chain applies, so
   // no relayer can alter the token under this signature.
   async deployToken({ name, symbol, decimals = 9, initialSupply, mintable = false, burnable = false, logo = '' }, password, opts = {}) {
@@ -6768,14 +6823,14 @@ export class WalletManager {
     const { signDetached } = require('../crypto/DilithiumCrypto');
     const { sha3_256 } = require('js-sha3');
 
-    const buildAndSubmit = async (txNonce) => {
+    const buildAndSubmit = async (txNonce, legacy = false) => {
       // Mirrors qnet-state deploy_code_hash(DeployKind::Qrc20, ..) — NIST FIPS 202.
       const codeHash = sha3_256(
         'QRC20|' + this._deployField(name) + this._deployField(symbol) +
         this._deployField(decimals) + this._deployField(initialSupply) +
         this._deployField(!!mintable) + this._deployField(!!burnable) +
         this._deployField(logo));
-      const message = `${QNET_CHAIN_TAG}contract_deploy:${from}:${codeHash}:${txNonce}`;
+      const message = `${QNET_CHAIN_TAG}contract_deploy:${from}:${codeHash}:${txNonce}${legacy ? '' : `:${DEPLOY_GAS_PRICE}:${DEPLOY_GAS_LIMIT}`}`;
       const dilSig = await signDetached(message, dilSkHex); // FIX-5: raw detached hex; pk sent as hex(dilPkHex)
       const res = await this._hedged('/api/v1/token/deploy', {
         method: 'POST', timeoutMs: 5000, hedgeMs: 900,
@@ -6790,6 +6845,11 @@ export class WalletManager {
 
     let txNonce = await this.resolveNonce(from);
     let result = await buildAndSubmit(txNonce);
+    // A node from before gas-bound contract signatures refuses the new form; it takes the old one.
+    if (result && result.success === false && !result.tx_hash &&
+        /signature|dilithium/i.test(`${result.error || ''} ${result.details || ''}`)) {
+      result = await buildAndSubmit(txNonce, true);
+    }
     if (result && result.success === false && !result.tx_hash &&
         // `pk_unresolved` = we elided the pubkey but the node has no committed key for us. The forced
         // fresh resolveNonce below re-reads has_dilithium_pk (false), so the retry re-attaches the pk.
@@ -6812,7 +6872,7 @@ export class WalletManager {
   // Deploy a QRC-721 (NFT) collection. Mirrors deployToken's ContractDeploy path exactly:
   // the node derives the on-chain contract address (derive_contract_address(from, nonce)),
   // builds tx.data server-side as {"qrc721":true,"name":..,"symbol":..}, and the value-TX gate
-  // rebuilds the SAME canonical deploy message this signs — q{chain}|contract_deploy:{from}:{code_hash}:{nonce}
+  // rebuilds the SAME canonical deploy message this signs — q{chain}|contract_deploy:{from}:{code_hash}:{nonce}:{gas_price}:{gas_limit}
   // — then binds the ML-DSA-65 key to `from`. The digest mirrors qnet-state
   // deploy_code_hash(DeployKind::Qrc721, ..) byte for byte.
   async deployNftCollection({ name, symbol }, password, opts = {}) {
@@ -6822,10 +6882,10 @@ export class WalletManager {
     const { signDetached } = require('../crypto/DilithiumCrypto');
     const { sha3_256 } = require('js-sha3');
 
-    const buildAndSubmit = async (txNonce) => {
+    const buildAndSubmit = async (txNonce, legacy = false) => {
       // Mirrors qnet-state deploy_code_hash(DeployKind::Qrc721, ..) — NIST FIPS 202.
       const codeHash = sha3_256('QRC721|' + this._deployField(name) + this._deployField(symbol));
-      const message = `${QNET_CHAIN_TAG}contract_deploy:${from}:${codeHash}:${txNonce}`;
+      const message = `${QNET_CHAIN_TAG}contract_deploy:${from}:${codeHash}:${txNonce}${legacy ? '' : `:${DEPLOY_GAS_PRICE}:${DEPLOY_GAS_LIMIT}`}`;
       const dilSig = await signDetached(message, dilSkHex); // FIX-5: raw detached hex; pk sent as hex(dilPkHex)
       const res = await this._hedged('/api/v1/nft/deploy', {
         method: 'POST', timeoutMs: 5000, hedgeMs: 900,
@@ -6839,6 +6899,11 @@ export class WalletManager {
 
     let txNonce = await this.resolveNonce(from);
     let result = await buildAndSubmit(txNonce);
+    // A node from before gas-bound contract signatures refuses the new form; it takes the old one.
+    if (result && result.success === false && !result.tx_hash &&
+        /signature|dilithium/i.test(`${result.error || ''} ${result.details || ''}`)) {
+      result = await buildAndSubmit(txNonce, true);
+    }
     if (result && result.success === false && !result.tx_hash &&
         // `pk_unresolved` = we elided the pubkey but the node has no committed key for us. The forced
         // fresh resolveNonce below re-reads has_dilithium_pk (false), so the retry re-attaches the pk.

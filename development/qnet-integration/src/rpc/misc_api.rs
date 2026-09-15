@@ -233,17 +233,12 @@ pub(super) async fn handle_internal_fcm_token_sync(
     req:         FcmTokenSyncRequest,
     blockchain:  Arc<BlockchainNode>,
 ) -> Result<impl warp::Reply, warp::Rejection> {
-    use crate::genesis_constants::GENESIS_NODE_IPS;
-
     // IP allowlist — only genesis peers may call this
     let caller_ip = remote_addr
         .map(|a| a.ip().to_string())
         .unwrap_or_default();
-    let allowed = GENESIS_NODE_IPS.iter().any(|(ip, _)| *ip == caller_ip)
-        || caller_ip == "127.0.0.1"
-        || caller_ip == "::1";
 
-    if !allowed {
+    if !is_genesis_peer_ip(&caller_ip) {
         if crate::node::is_warn() {
             println!("[WARN][LIGHT] fcm_sync_rejected_unauthorized caller={}", caller_ip);
         }
@@ -320,11 +315,8 @@ pub(super) async fn handle_internal_fcm_token_get(
     params:      std::collections::HashMap<String, String>,
     blockchain:  Arc<BlockchainNode>,
 ) -> Result<impl warp::Reply, warp::Rejection> {
-    use crate::genesis_constants::GENESIS_NODE_IPS;
     let caller_ip = remote_addr.map(|a| a.ip().to_string()).unwrap_or_default();
-    let allowed = GENESIS_NODE_IPS.iter().any(|(ip, _)| *ip == caller_ip)
-        || caller_ip == "127.0.0.1" || caller_ip == "::1";
-    if !allowed {
+    if !is_genesis_peer_ip(&caller_ip) {
         return Ok(warp::reply::with_status(
             warp::reply::json(&serde_json::json!({"success": false, "error": "Unauthorized"})),
             warp::http::StatusCode::FORBIDDEN,
@@ -350,6 +342,47 @@ pub(super) async fn handle_internal_fcm_token_get(
             warp::http::StatusCode::OK,
         )),
     }
+}
+
+/// The internal genesis-to-genesis endpoints answer only the other genesis nodes and this host.
+fn is_genesis_peer_ip(caller_ip: &str) -> bool {
+    crate::genesis_constants::GENESIS_NODE_IPS.iter().any(|(ip, _)| *ip == caller_ip)
+        || caller_ip == "127.0.0.1" || caller_ip == "::1"
+}
+
+/// Handler: GET /api/v1/internal/light-ping-keys-get?node_id=X
+/// Genesis-only: a light node's ping delegation with the identity key it was proven under, so a shard
+/// owner that only saw a relay can verify the device. The caller re-checks all of it against the chain.
+pub(super) async fn handle_internal_light_ping_keys_get(
+    remote_addr: Option<std::net::SocketAddr>,
+    params:      std::collections::HashMap<String, String>,
+    blockchain:  Arc<BlockchainNode>,
+) -> Result<impl warp::Reply, warp::Rejection> {
+    let caller_ip = remote_addr.map(|a| a.ip().to_string()).unwrap_or_default();
+    if !is_genesis_peer_ip(&caller_ip) {
+        return Ok(warp::reply::with_status(
+            warp::reply::json(&serde_json::json!({"success": false, "error": "Unauthorized"})),
+            warp::http::StatusCode::FORBIDDEN,
+        ));
+    }
+    let node_id = params.get("node_id").map(|s| s.as_str()).unwrap_or("");
+    let storage = blockchain.get_storage();
+    let row = storage.get_light_ping_keys(node_id)
+        .filter(|(_, cert)| !cert.is_empty())
+        .zip(storage.light_ping_identity(node_id));
+    Ok(match row {
+        Some(((ping_pubkey, cert), identity)) => warp::reply::with_status(
+            warp::reply::json(&serde_json::json!({
+                "success": true, "ping_pubkey": ping_pubkey,
+                "ping_delegation_cert": cert, "identity_pubkey": identity,
+            })),
+            warp::http::StatusCode::OK,
+        ),
+        None => warp::reply::with_status(
+            warp::reply::json(&serde_json::json!({"success": false, "error": "not_found"})),
+            warp::http::StatusCode::OK,
+        ),
+    })
 }
 
 /// Public endpoint: POST /api/v1/light-node/token-refresh

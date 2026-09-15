@@ -59,10 +59,9 @@ fn light_registry_cap() -> usize {
     if is_genesis_pinger() { MAX_LIGHT_NODE_REGISTRY_SIZE_GENESIS } else { MAX_LIGHT_NODE_REGISTRY_SIZE }
 }
 
-/// Max attestations in RAM (24h window, auto-cleanup).
-/// An entry holds TWO enveloped ML-DSA-65 signatures plus the challenge — see the field annotations
-/// on LightNodeAttestation — so it is kilobytes, not the ~300 bytes an earlier note assumed. Budget
-/// hundreds of MB at this count, and size it against the real struct rather than a per-entry guess.
+/// Max echo-dedupe entries in RAM. An entry is header-only (~200 B): store_attestation drops the
+/// signatures once they are verified. Past the cap the map keeps the current epoch only and stops
+/// inserting; a node then drops echoes of attestations it recorded through the per-epoch eligibility set.
 const MAX_ATTESTATIONS_SIZE: usize = 100_000;
 
 /// Max heartbeat records in RAM (24h window, auto-cleanup)
@@ -3016,6 +3015,9 @@ pub struct SimplifiedP2P {
     /// registry, so it is maintained, not rebuilt: only a change in what the slot is DERIVED from — the
     /// window (the slot is re-randomised per window) or the covered shards — costs a full pass.
     light_ping_slot_cache: Arc<RwLock<(u64, Vec<Vec<String>>, usize)>>,
+    /// Absolute ping slot (window * 240 + slot) the ping loop last read, u64::MAX before its first
+    /// tick; lets a tick that advanced several slots read every bucket it passed.
+    light_ping_last_read: Arc<AtomicU64>,
     /// Light nodes admitted since the last ping slot, waiting to be placed in their bucket. Keyed on
     /// nothing: the ping loop is the only reader and it knows the window and the mask.
     light_ping_pending: Arc<RwLock<Vec<String>>>,
@@ -3430,6 +3432,7 @@ impl SimplifiedP2P {
             // PRODUCTION: Light Node registry for gossip sync
             light_node_registry: Arc::new(RwLock::new(HashMap::new())),
             light_ping_slot_cache: Arc::new(RwLock::new((u64::MAX, Vec::new(), 0))),
+            light_ping_last_read: Arc::new(AtomicU64::new(u64::MAX)),
             light_ping_pending: Arc::new(RwLock::new(Vec::new())),
 
             // PRODUCTION: Heartbeat history for reward eligibility

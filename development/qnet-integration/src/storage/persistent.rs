@@ -332,7 +332,12 @@ impl PersistentStorage {
             }
         };
         
-        let store = Self { db: Arc::new(db) };
+        let store = Self {
+            db: Arc::new(db),
+            snapshot_write_lock: parking_lot::Mutex::new(()),
+            snapshot_gen: AtomicU64::new(0),
+            snapshot_writing: parking_lot::Mutex::new(std::collections::HashSet::new()),
+        };
         store.enforce_storage_format()?;
         Ok(store)
     }
@@ -904,114 +909,6 @@ impl PersistentStorage {
         }
     }
     
-    pub async fn save_account(&self, account: &qnet_state::Account) -> IntegrationResult<()> {
-        let accounts_cf = self.db.cf_handle("accounts")
-            .ok_or_else(|| IntegrationError::StorageError("accounts column family not found".to_string()))?;
-
-        let account_data = bincode::serialize(account)
-            .map_err(|e| IntegrationError::SerializationError(e.to_string()))?;
-
-        self.db.put_cf(&accounts_cf, account.address.as_bytes(), &account_data)?;
-
-        // v5.0: Persist contract_storage to dedicated CF for per-key access
-        if account.is_contract {
-            if !account.contract_storage.is_empty() {
-                self.save_contract_storage(&account.address, &account.contract_storage)?;
-            } else {
-                // Storage cleared — remove stale keys from CF
-                let _ = self.delete_contract_storage(&account.address);
-            }
-        }
-
-        Ok(())
-    }
-
-    // v15.9 Stage-1: write-through account persistence. After a block is
-    // verified/saved/height-advanced, mirror every account it mutated (set
-    // from the BlockSnapshot journal; post-image re-read from the in-memory
-    // accounts DashMap) into the accounts CF. Stage 1 = durability without a
-    // RAM bound (Stage 2 = LRU+CF): the CF becomes the canonical durable
-    // state so a crash rebuilds from CF + surviving microblocks, not a
-    // genesis replay. One WriteBatch/block → block-atomic (all-or-none).
-    // Runs on spawn_blocking so the reactor never stalls on compaction
-    // (~15 KB/block). Contract storage → its own CF (small account rows).
-    pub async fn persist_accounts_batch(
-        &self,
-        modified_accounts: Vec<(String, qnet_state::Account)>,
-        deleted_addresses: Vec<String>,
-    ) -> IntegrationResult<(usize, usize)> {
-        if modified_accounts.is_empty() && deleted_addresses.is_empty() {
-            return Ok((0, 0));
-        }
-
-        let db = self.db.clone();
-        tokio::task::spawn_blocking(move || -> IntegrationResult<(usize, usize)> {
-            let accounts_cf = db.cf_handle("accounts")
-                .ok_or_else(|| IntegrationError::StorageError("accounts column family not found".to_string()))?;
-            let contract_storage_cf = db.cf_handle("contract_storage");
-
-            let mut batch = WriteBatch::default();
-            let mut put_count = 0usize;
-            let mut del_count = 0usize;
-
-            for (addr, account) in &modified_accounts {
-                let bytes = bincode::serialize(account)
-                    .map_err(|e| IntegrationError::SerializationError(e.to_string()))?;
-                batch.put_cf(&accounts_cf, addr.as_bytes(), &bytes);
-                put_count = put_count.saturating_add(1);
-
-                // Mirror contract storage into the dedicated CF when the
-                // account is a contract. We use the same in-batch staging
-                // so the contract row and its storage land atomically.
-                if account.is_contract {
-                    if let Some(ref cs_cf) = contract_storage_cf {
-                        if account.contract_storage.is_empty() {
-                            // Storage cleared — best-effort prune of any
-                            // residual keys for this contract. The
-                            // existing helper performs a prefix scan;
-                            // we re-use it outside the batch since
-                            // delete_range_cf semantics would require a
-                            // separate pass.
-                        } else {
-                            for (k, v) in &account.contract_storage {
-                                let composite_key = format!("{}\x00{}", addr, k);
-                                batch.put_cf(cs_cf, composite_key.as_bytes(), v.as_bytes());
-                            }
-                        }
-                    }
-                }
-            }
-
-            for addr in &deleted_addresses {
-                batch.delete_cf(&accounts_cf, addr.as_bytes());
-                del_count = del_count.saturating_add(1);
-            }
-
-            db.write(batch)?;
-            Ok((put_count, del_count))
-        })
-        .await
-        .map_err(|e| IntegrationError::Other(format!("persist_accounts_join_err: {}", e)))?
-    }
-
-    // Sync best-effort batch write to the accounts CF. Called by the cache
-    // eviction sweep (persist-before-evict) so an unpersisted cold mutation
-    // is never lost. Same key/value layout as persist_accounts_batch; one
-    // atomic WriteBatch.
-    pub fn persist_accounts_sync(&self, accounts: &[(String, qnet_state::Account)]) -> IntegrationResult<usize> {
-        if accounts.is_empty() { return Ok(0); }
-        let accounts_cf = self.db.cf_handle("accounts")
-            .ok_or_else(|| IntegrationError::StorageError("accounts column family not found".to_string()))?;
-        let mut batch = WriteBatch::default();
-        for (addr, account) in accounts {
-            let bytes = bincode::serialize(account)
-                .map_err(|e| IntegrationError::SerializationError(e.to_string()))?;
-            batch.put_cf(&accounts_cf, addr.as_bytes(), &bytes);
-        }
-        self.db.write(batch)?;
-        Ok(accounts.len())
-    }
-
     /// One page of raw `accounts` CF keys, ascending, starting strictly after `after`.
     /// Returns (keys, last_key) — pass last_key back to continue; None page-end = CF exhausted.
     pub fn accounts_cf_keys_page(&self, after: Option<&[u8]>, limit: usize)
@@ -1074,18 +971,6 @@ impl PersistentStorage {
         if let Some(cf) = self.db.cf_handle("metadata") {
             let _ = self.db.delete_cf(&cf, b"trueup_pending");
         }
-    }
-
-    /// Batch-delete `accounts` CF rows. Used by the CF↔merkle true-up to drop phantom
-    /// rows (persisted by a block whose rollback never reached the CF mirror).
-    pub fn delete_accounts_cf_keys(&self, keys: &[String]) -> IntegrationResult<()> {
-        if keys.is_empty() { return Ok(()); }
-        let accounts_cf = self.db.cf_handle("accounts")
-            .ok_or_else(|| IntegrationError::StorageError("accounts column family not found".to_string()))?;
-        let mut batch = WriteBatch::default();
-        for k in keys { batch.delete_cf(&accounts_cf, k.as_bytes()); }
-        self.db.write(batch)?;
-        Ok(())
     }
 
     // ── Wallet→token reverse index (wallet_token CF, NON-consensus) ──
@@ -1441,26 +1326,6 @@ impl PersistentStorage {
                       (u64::from_be_bytes(head), digest, v[40] != 0, u64::from_be_bytes(pi), ph)));
         }
         Ok(out)
-    }
-
-    // (sync, called at a macroblock boundary under the apply context) Flush the
-    // hot in-memory account set to the accounts CF, then pin a consistent
-    // point-in-time DB view. With persist-before-evict keeping cold accounts in
-    // the CF, the pinned view holds the COMPLETE committed tree leaf set at this
-    // height; freezing it lets the off-reactor serializer reproduce state_root@H
-    // even as H+1.. mutate the live DB.
-    pub fn prepare_snapshot_view(
-        &self,
-        hot_accounts: &[(String, qnet_state::Account)],
-    ) -> IntegrationResult<PinnedDbSnapshot> {
-        self.persist_accounts_sync(hot_accounts)?;
-        let snap = self.db.snapshot();
-        // SAFETY: lifetime-extend the snapshot borrow to 'static. PinnedDbSnapshot
-        // stores the same Arc<DB>, which outlives `snap`, so the underlying handle
-        // is always valid; only the (runtime-erased) lifetime changes — layout-identical.
-        let snap: rocksdb::SnapshotWithThreadMode<'static, DB> =
-            unsafe { std::mem::transmute(snap) };
-        Ok(PinnedDbSnapshot { db: self.db.clone(), snap })
     }
 
     /// Load a single account from the persistent `accounts` CF. Used by
@@ -2629,11 +2494,12 @@ impl PersistentStorage {
     /// PRODUCTION v2.45: Delete macroblock by index (for fork recovery)
     /// v9.0: Cleans ALL associated data: macroblock record + state/full/delta snapshots + IPFS ref.
     /// Key schema: macroblocks created at height = macroblock_index * 90.
-    /// Snapshots use height-based keys: state_snap_{h}, full_snap_{h}, delta_{h}, ipfs_{h}.
+    /// The snapshot at that height goes with it (chunk rows, manifest, index row), and its ipfs_{h} reference.
     pub fn delete_macroblock(&self, macroblock_index: u64) -> IntegrationResult<()> {
         let microblocks_cf = self.db.cf_handle("microblocks")
             .ok_or_else(|| IntegrationError::StorageError("microblocks column family not found".to_string()))?;
 
+        let _snapshot_fence = self.snapshot_write_lock.lock();
         let mut batch = rocksdb::WriteBatch::default();
 
         // Delete macroblock record
@@ -2644,9 +2510,11 @@ impl PersistentStorage {
         // Macroblock at index N corresponds to microblock height N * 90.
         if let Some(snapshots_cf) = self.db.cf_handle("snapshots") {
             let height = macroblock_index * 90;
-            // Delete all known snapshot key formats for this height
-            batch.delete_cf(&snapshots_cf, format!("state_snap_{}", height).as_bytes());
-            batch.delete_cf(&snapshots_cf, format!("full_snap_{}", height).as_bytes());
+            // Everything stored for the snapshot at this height, unless a writer is producing it right now:
+            // that frame is its writer's to finish or drop, and its seal re-checks the block at the height.
+            if !self.snapshot_writing.lock().contains(&height) {
+                super::snapshot_index::stage_delete(&mut batch, snapshots_cf, height);
+            }
             batch.delete_cf(&snapshots_cf, format!("delta_{}", height).as_bytes());
             batch.delete_cf(&snapshots_cf, format!("ipfs_{}", height).as_bytes());
         }

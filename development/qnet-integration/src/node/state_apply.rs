@@ -432,9 +432,9 @@ impl BlockchainNode {
     /// scan silently dropped evicted cold holders past the cache cap). Returns the storage result so the
     /// boot caller gates its one-time marker on success (a transient failure then retries next boot).
     pub(super) async fn rebuild_richlist_index() -> crate::errors::IntegrationResult<u64> {
-        // Offload the unbounded accounts-CF scan to the blocking pool so it never stalls a reactor worker
-        // (mirrors persist_accounts_batch). At scale the scan is many seconds of pure CPU/IO with no yield;
-        // the callers (boot / snapshot-restore / reorg) await this on the shared runtime.
+        // Offload the unbounded accounts-CF scan to the blocking pool so it never stalls a reactor worker.
+        // At scale the scan is many seconds of pure CPU/IO with no yield; the callers (boot /
+        // snapshot-restore / reorg) await this on the shared runtime.
         let storage = match try_get_storage() {
             Some(s) => std::sync::Arc::clone(s),
             None => return Err(crate::errors::IntegrationError::Other("richlist_rebuild_no_storage".to_string())),
@@ -499,6 +499,9 @@ impl BlockchainNode {
         if mb.height % qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL == 0 {
             let _ = storage.seal_total_supply(mb.height, sg.get_total_supply());
         }
+        // Its rows follow in apply order, like any applied block's.
+        let (puts, dels) = crate::storage::account_delta(sg, &snap);
+        storage.mirror_block_delta(mb.height, puts, dels);
         // A replayed block is a committed block: its journal serves a later shallow undo.
         sg.retain_block_journal(snap);
         Ok(repaired)
@@ -526,7 +529,7 @@ impl BlockchainNode {
     }
 
     /// Shallow reorg: undo (target, tip] from the retained journals under the state lock, prove the
-    /// result against the target block's committed state_root, mirror the pre-images into the accounts
+    /// result against the target block's committed state_root, queue the pre-images for the accounts
     /// CF before the lock is released. Err leaves the snapshot restore as the remedy.
     pub(super) async fn undo_from_journals(
         state: &Arc<tokio::sync::RwLock<StateManager>>,
@@ -544,7 +547,13 @@ impl BlockchainNode {
         if applied != target {
             return Err(format!("applied_since_rollback frontier={} target={}", applied, target));
         }
-        let (undone, mirror) = sg.undo_blocks_above(target, tip).ok_or_else(|| "journals_incomplete".to_string())?;
+        let (undone, mirror, commit_keys) = sg.undo_blocks_above(target, tip).ok_or_else(|| "journals_incomplete".to_string())?;
+        // The undone blocks' commitments left the state's dedup records; their mempool marks follow,
+        // whether or not the root proof below holds - the blocks are discarded either way.
+        let marks_freed = crate::node::release_finalized_marks(&sg, &commit_keys);
+        if marks_freed > 0 && is_info() {
+            println!("[INFO][STATE] journal_undo_marks_freed target={} n={}", target, marks_freed);
+        }
         let got = sg.finalize_merkle();
         if got != expected {
             crate::block_pipeline::mark_state_suspect();
@@ -557,17 +566,14 @@ impl BlockchainNode {
             match pre { Some(a) => puts.push((addr, a)), None => dels.push(addr) }
         }
         let (n_puts, n_dels) = (puts.len(), dels.len());
-        // Still under the lock: no later block's write-through can interleave with the mirror.
-        let mirrored = storage.persist_accounts_batch(puts, dels).await;
+        // Queued under the lock: every later block's rows land after these.
+        let mirrored = storage.mirror_enqueue(puts, dels);
         drop(sg);
-        match mirrored {
-            Ok(_) => {
-                if is_debug() { println!("[DBG][STATE] journal_undo_mirror target={} puts={} dels={}", target, n_puts, n_dels); }
-            }
-            Err(e) => {
-                // The proven state stands; the CF rows are healed by the true-up below and by replay.
-                println!("[WARN][STATE] journal_undo_mirror_failed target={} err={:?}", target, e);
-            }
+        if mirrored.landed().await {
+            if is_debug() { println!("[DBG][STATE] journal_undo_mirror target={} puts={} dels={}", target, n_puts, n_dels); }
+        } else {
+            // The proven state stands; a stale mirror is rewritten by the periodic heal.
+            println!("[WARN][STATE] journal_undo_mirror_failed target={} puts={} dels={}", target, n_puts, n_dels);
         }
         // Candidates staged by this rollback (and any a vetoed earlier true-up left behind) are checked
         // against the now-proven leaf set.
@@ -593,20 +599,16 @@ impl BlockchainNode {
             }
         };
 
-        // Step 2: pre-decode the snapshot payload off the state lock.
-        // Decoding is purely a CPU transformation of bytes the caller
-        // already owns; doing it BEFORE we acquire the write lock keeps
-        // the apply pipeline blocked for the minimum possible window.
-        // Decode the snapshot bytes already fetched by find_snapshot_at_or_before (canonical
-        // full_snap_ or legacy state_snap_). Restoring from the freshest snapshot ≤ target
-        // bounds replay to ≤ SNAPSHOT_INCREMENTAL_INTERVAL instead of a full genesis replay.
+        // Step 2: read and decode the snapshot off the state lock, so the apply pipeline is blocked
+        // for the minimum possible window. Restoring from the freshest snapshot ≤ target bounds
+        // replay to ≤ SNAPSHOT_INCREMENTAL_INTERVAL instead of a full genesis replay.
         let restored_baseline: Option<(u64, u64, Vec<(String, qnet_state::Account)>)> =
             match snap_choice {
-                Some((snap_height, snap_data)) => {
+                Some(snap_height) => {
                     // total_supply is a counter, not derivable from accounts. Take it from the anchor
                     // macroblock's QC-bound checkpoint (apply-bound, same source as cold-join), NOT from
                     // the snapshot blob. None ⇒ anchor/QC unavailable ⇒ from-0 full replay (watermark from 0).
-                    match storage.decode_snapshot_accounts(&snap_data) {
+                    match storage.decode_snapshot_accounts(snap_height) {
                         Ok(accounts) => match storage.anchor_root_and_supply(snap_height / 90, &accounts) {
                             Some((_, ts)) => Some((snap_height, ts, accounts)),
                             None => {
@@ -723,8 +725,8 @@ impl BlockchainNode {
                     // DELETED blocks: a re-applied NodeRegistration is then skipped as a duplicate,
                     // its registry row and registry_root delta are never written, and — because a
                     // registration has no account effect — the state_root still matches, so nothing
-                    // alarms. Reseeded from the durable registry, which the caller has already
-                    // pruned via rebuild_registry_lthash(target).
+                    // alarms. Reseeded at snap_height (set above), whatever the caller pruned: the
+                    // replay below then refuses and journals exactly what a from-genesis node did.
                     if let Err(e) = storage.reseed_commitment_dedup(&*sg) {
                         return Err(format!("reseed_commitment_dedup_failed err={:?}", e));
                     }
@@ -761,7 +763,10 @@ impl BlockchainNode {
             let mut stopped_at: Option<u64> = None;
             for mb in &blocks_to_replay {
                 match Self::replay_block_verified(&sg, storage, mb) {
-                    Ok(repaired) => { if let Some(addr) = repaired { repaired_phantom = Some(addr); } }
+                    Ok(repaired) => {
+                        // Purged under the lock, ahead of any later block's row for the address.
+                        if let Some(addr) = repaired { storage.purge_phantom_account(&addr); repaired_phantom = Some(addr); }
+                    }
                     Err(stop) => {
                         println!("[WARN][STATE] replay_diverged h={} {} replay_from={} action=stop_below",
                                  mb.height, stop.describe(), replay_from);
@@ -779,6 +784,9 @@ impl BlockchainNode {
                 if let Some(hole) = first_hole { stopped_at = Some(hole - 1); }
             }
             replayed = applied;
+            // The marks follow the rebuilt records: every class after a replay from genesis, the
+            // registrations after a snapshot restore.
+            if mode == "full" { crate::node::sync_finalized_marks(&sg); } else { crate::node::sync_restored_marks(&sg); }
             if let Some(h) = stopped_at {
                 static STOP_H: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 static STOP_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -793,6 +801,10 @@ impl BlockchainNode {
                 { sg.chain_state.write().height = h; }
                 if let Err(e) = storage.set_chain_height(h) {
                     return Err(format!("reconcile_stop_set_height_failed h={} err={:?}", h, e));
+                }
+                // No frame outlives the tip it describes.
+                if let Err(e) = storage.prune_snapshots_above(h) {
+                    println!("[WARN][STATE] snapshot_prune_fail to={} err={}", h, e);
                 }
                 crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(h, std::sync::atomic::Ordering::SeqCst);
                 crate::node::retract_finality_to(h);
@@ -810,6 +822,7 @@ impl BlockchainNode {
             if let Some(exp) = expected_root {
                 if computed_root != exp {
                     if let Some(addr) = sg.repair_single_phantom(&exp) {
+                        storage.purge_phantom_account(&addr);
                         repaired_phantom = Some(addr);
                         computed_root = exp;
                     }
@@ -817,7 +830,6 @@ impl BlockchainNode {
             }
         } // <-- single lock release after full reconcile
         if let Some(addr) = &repaired_phantom {
-            storage.purge_phantom_account(addr);
             println!("[WARN][STATE] reconcile_repaired_phantom target={} addr={}", target_height, addr);
         }
 
@@ -855,24 +867,17 @@ impl BlockchainNode {
         println!("[INFO][STATE] reconcile_verified target={} root={}",
                  target_height, hex::encode(&computed_root[..8]));
 
-        // Push the reconciled accounts back to disk. The accounts CF is written by a fire-and-forget
-        // task after apply and is NOT rolled back, so an orphaned block's values survive there. RAM is
-        // now proven canonical (the root check above), and the consensus reads go RAM-first — but an
-        // EVICTED account falls through to this CF, and a stale banned_at_height there would zero a
-        // node's reputation on this host and nowhere else, splitting epoch_commitment. Writing the
-        // proven state through closes the window instead of waiting for persist-before-evict.
+        // Push the reconciled accounts back to disk. The rolled-back branch's rows are still in the
+        // accounts CF, and RAM is now proven canonical (the root check above). Consensus reads go
+        // RAM-first, but an EVICTED account falls through to this CF, and a stale banned_at_height there
+        // would zero a node's reputation on this host and nowhere else, splitting epoch_commitment.
+        // Only the reconciled RAM set is written: a wholesale delete of non-resident rows would drop live
+        // balances to correct a narrow staleness; the staged candidates below cover the branch's rows.
         {
-            let sg = state.read().await;
-            let restored: Vec<(String, qnet_state::Account)> = sg.accounts.iter()
-                .map(|e| (e.key().clone(), e.value().clone())).collect();
-            drop(sg);
-            let n = restored.len();
-            // Only the reconciled RAM set is written. A wholesale delete of non-resident rows was
-            // considered and REJECTED: eviction is normal, so that would drop live balances to correct a
-            // narrow staleness. The residual — an account banned on an orphaned branch AND evicted before
-            // the reorg — stays, self-healing on the next persist-before-evict.
-            if let Err(e) = storage.persist_accounts_batch(restored, Vec::new()).await {
-                println!("[WARN][STATE] reconcile_account_persist_failed target={} err={}", target_height, e);
+            let written = { let sg = state.read().await; storage.mirror_full_write(&sg) };
+            let n = written.rows();
+            if !written.landed().await {
+                println!("[WARN][STATE] reconcile_account_persist_failed target={} n={}", target_height, n);
             } else if is_info() {
                 println!("[INFO][STATE] reconcile_accounts_persisted target={} n={}", target_height, n);
             }
@@ -884,11 +889,11 @@ impl BlockchainNode {
     }
 
     /// Targeted CF true-up: check ONLY the addresses the rolled-back blocks touched (staged by
-    /// the rollback barrier) instead of sweeping the whole accounts CF. Phantoms are born at
-    /// exactly one place — a block whose write-through mirror was never reversed — so the
-    /// rollback's own journal is the complete candidate set. O(rolled-back addresses), no hot-path
-    /// scan, and correct at any account count. Runs only on a PROVEN state (its single caller is
-    /// the reconcile tail, past the root verify). Returns (checked, removed).
+    /// the rollback barrier) instead of sweeping the whole accounts CF. The rollback's journal is
+    /// the complete set of rows the abandoned branch wrote: a leafless one is a phantom and goes, a
+    /// leaf-backed one is rewritten with its proven value. O(rolled-back addresses), no hot-path
+    /// scan, and correct at any account count. Runs only on a PROVEN state (after a journal undo,
+    /// a verified reconcile, or a proven boot). Returns (checked, removed).
     pub async fn trueup_staged_candidates(
         state: &Arc<tokio::sync::RwLock<StateManager>>,
         storage: &Arc<Storage>,
@@ -903,34 +908,38 @@ impl BlockchainNode {
             return (candidates.len() as u64, 0);
         }
         let errs_before = crate::storage::MERKLE_LEAF_READ_ERRS.load(std::sync::atomic::Ordering::Relaxed);
-        let phantoms: Vec<String> = {
+        let (phantoms, rewritten, written) = {
             let sg = state.read().await;
             if sg.merkle_leaf_count() == 0 { return (candidates.len() as u64, 0); }
-            sg.merkle_absent_leaves(&candidates)
-        };
-        // This is the one true-up path that actually reaches the leaf store (a trimmed cache
-        // falls through to get_leaf), so the veto must bracket the probe — a fault DURING it
-        // is exactly the case where "absent" is a guess. Journal kept for a later run.
-        if crate::storage::MERKLE_LEAF_READ_ERRS.load(std::sync::atomic::Ordering::Relaxed) != errs_before {
-            println!("[WARN][STATE] cf_trueup_deferred reason=leaf_store_read_err_during_probe candidates={}",
-                     candidates.len());
-            return (candidates.len() as u64, 0);
-        }
-        let mut removed = 0u64;
-        if !phantoms.is_empty() {
-            match storage.delete_accounts_cf_keys(&phantoms) {
-                Ok(()) => {
-                    removed = phantoms.len() as u64;
-                    println!("[WARN][STATE] cf_phantoms_removed n={} checked={} sample={:?}",
-                             removed, candidates.len(), &phantoms[..phantoms.len().min(8)]);
-                }
-                Err(e) => {
-                    println!("[WARN][STATE] cf_trueup_delete_failed n={} err={}", phantoms.len(), e);
-                    return (candidates.len() as u64, 0); // keep the journal for the next attempt
-                }
+            let phantoms = sg.merkle_absent_leaves(&candidates);
+            // This is the one true-up path that actually reaches the leaf store (a trimmed cache
+            // falls through to get_leaf), so the veto must bracket the probe — a fault DURING it
+            // is exactly the case where "absent" is a guess. Journal kept for a later run.
+            if crate::storage::MERKLE_LEAF_READ_ERRS.load(std::sync::atomic::Ordering::Relaxed) != errs_before {
+                println!("[WARN][STATE] cf_trueup_deferred reason=leaf_store_read_err_during_probe candidates={}",
+                         candidates.len());
+                return (candidates.len() as u64, 0);
             }
+            // A candidate with a leaf takes its proven value: the abandoned branch may have left its own
+            // in the row. Queued under this lock, so a later block's row for any of them lands after.
+            let gone: std::collections::HashSet<&String> = phantoms.iter().collect();
+            let puts: Vec<(String, qnet_state::Account)> = candidates.iter()
+                .filter(|a| !gone.contains(a))
+                .filter_map(|a| sg.accounts.get(a).map(|e| (a.clone(), e.value().clone())))
+                .collect();
+            let rewritten = puts.len();
+            (phantoms.clone(), rewritten, storage.mirror_enqueue(puts, phantoms))
+        };
+        if !written.landed().await {
+            println!("[WARN][STATE] cf_trueup_write_failed deleted={} rewritten={}", phantoms.len(), rewritten);
+            return (candidates.len() as u64, 0); // keep the journal for the next attempt
+        }
+        let removed = phantoms.len() as u64;
+        if removed > 0 {
+            println!("[WARN][STATE] cf_phantoms_removed n={} checked={} rewritten={} sample={:?}",
+                     removed, candidates.len(), rewritten, &phantoms[..phantoms.len().min(8)]);
         } else if is_info() {
-            println!("[INFO][STATE] cf_trueup_clean checked={}", candidates.len());
+            println!("[INFO][STATE] cf_trueup_clean checked={} rewritten={}", candidates.len(), rewritten);
         }
         storage.clear_trueup_candidates();
         (candidates.len() as u64, removed)
@@ -946,6 +955,8 @@ impl BlockchainNode {
             println!("[WARN][STATE] restore_trueup_skipped reason=leafset_not_complete");
             return (0, 0);
         }
+        // Rows still queued are part of what the scan must see.
+        storage.mirror_barrier();
         let t0 = std::time::Instant::now();
         let (mut scanned, mut removed) = (0u64, 0u64);
         let mut sample: Vec<String> = Vec::new();
@@ -962,12 +973,13 @@ impl BlockchainNode {
             if crate::storage::MERKLE_LEAF_READ_ERRS.load(std::sync::atomic::Ordering::Relaxed) != errs_before {
                 println!("[WARN][STATE] restore_trueup_page_vetoed reason=leaf_store_read_err scanned={}", scanned);
             } else if !phantoms.is_empty() {
-                match storage.delete_accounts_cf_keys(&phantoms) {
+                let n = phantoms.len();
+                match storage.mirror_write_durable(Vec::new(), phantoms.clone()) {
                     Ok(()) => {
-                        removed += phantoms.len() as u64;
+                        removed += n as u64;
                         for p in phantoms.into_iter().take(8usize.saturating_sub(sample.len())) { sample.push(p); }
                     }
-                    Err(e) => println!("[WARN][STATE] restore_trueup_delete_failed n={} err={}", phantoms.len(), e),
+                    Err(e) => println!("[WARN][STATE] restore_trueup_delete_failed n={} err={}", n, e),
                 }
             }
             after = last;
@@ -1038,35 +1050,33 @@ impl BlockchainNode {
             // clear the tree mid-scan, and a store read error must veto the page (an
             // unreadable leaf is not an absent leaf).
             let errs_before = crate::storage::MERKLE_LEAF_READ_ERRS.load(std::sync::atomic::Ordering::Relaxed);
-            let phantoms: Vec<String> = {
+            // Decided and queued under one read lock, so a block that recreates one of these rows lands after.
+            let queued = {
                 let sg = state.read().await;
                 if crate::block_pipeline::state_suspect() || sg.merkle_leaf_count() == 0 {
                     println!("[WARN][STATE] cf_trueup_aborted reason=authority_lost scanned={}", scanned);
                     break;
                 }
-                sg.merkle_absent_leaves(&keys)
+                let phantoms = sg.merkle_absent_leaves(&keys);
+                if crate::storage::MERKLE_LEAF_READ_ERRS.load(std::sync::atomic::Ordering::Relaxed) != errs_before {
+                    println!("[WARN][STATE] cf_trueup_page_vetoed reason=leaf_store_read_err scanned={}", scanned);
+                    None
+                } else {
+                    let cap = std::cmp::max(1000, scanned / 20);
+                    let room = cap.saturating_sub(removed) as usize;
+                    deferred += phantoms.len().saturating_sub(room) as u64;
+                    let batch: Vec<String> = phantoms.into_iter().take(room).collect();
+                    (!batch.is_empty()).then(|| (batch.clone(), storage.mirror_enqueue(Vec::new(), batch)))
+                }
             };
-            if crate::storage::MERKLE_LEAF_READ_ERRS.load(std::sync::atomic::Ordering::Relaxed) != errs_before {
-                println!("[WARN][STATE] cf_trueup_page_vetoed reason=leaf_store_read_err scanned={}", scanned);
-                after = last;
-                if after.is_none() { break; }
-                continue;
-            }
-            if !phantoms.is_empty() {
-                let cap = std::cmp::max(1000, scanned / 20);
-                let room = cap.saturating_sub(removed) as usize;
-                deferred += phantoms.len().saturating_sub(room) as u64;
-                let batch: Vec<String> = phantoms.into_iter().take(room).collect();
-                if !batch.is_empty() {
-                    match storage.delete_accounts_cf_keys(&batch) {
-                        Ok(()) => {
-                            removed += batch.len() as u64;
-                            for p in batch.into_iter().take(8usize.saturating_sub(sample.len())) {
-                                sample.push(p);
-                            }
-                        }
-                        Err(e) => println!("[WARN][STATE] cf_trueup_delete_failed n={} err={}", batch.len(), e),
+            if let Some((batch, ticket)) = queued {
+                if ticket.landed().await {
+                    removed += batch.len() as u64;
+                    for p in batch.into_iter().take(8usize.saturating_sub(sample.len())) {
+                        sample.push(p);
                     }
+                } else {
+                    println!("[WARN][STATE] cf_trueup_delete_failed n={}", batch.len());
                 }
             }
             after = last;

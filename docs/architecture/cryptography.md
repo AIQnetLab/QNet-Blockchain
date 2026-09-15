@@ -184,6 +184,7 @@ in one context can never be replayed as a valid preimage in another. The main in
 | `QNET_HEARTBEAT:` | heartbeat transaction preimage (after the chain tag) |
 | `QNET_HEALTH_PING_V1:` | signed health-ping preimage |
 | `QNET_BLOCK_REJECTION_V1:`, `QNET_PRODUCER_READY_V1:`, `QNET_READY_ACK_V1:`, `QNET_PRODUCER_HEARTBEAT_V3:` | signed consensus-adjacent P2P messages |
+| `RDCR:` | coordinated-recovery decree over the genesis hash, sequence and target height, verified against the genesis consensus keys |
 | `QNet_Seed_FP_v1` | wallet seed fingerprint |
 | `qnet_onchain_reg:`, `burn_attest:` | burn-owner binding and burn-attestation quorum messages |
 | `QNET_SECRET_INTEGRITY_V1`, `QNET_DB_ENCRYPTION_V1`, `qnet-light-challenge-secret-v1` | key-file integrity tag, database key derivation, light-client RPC challenge MAC |
@@ -198,8 +199,8 @@ extension — reconstruct the same bytes. The bodies, each carrying the tag in f
 | --- | --- |
 | `Transfer` | `transfer:{from}:{to}:{amount}:{nonce}:{gas_price}:{gas_limit}` |
 | `BatchTransfers` | `batch_transfer:{from}:{total_amount}:{count}:{batch_id}` |
-| `ContractDeploy` | `contract_deploy:{from}:{code_hash}:{nonce}`, `code_hash` read from the `tx.data` JSON |
-| `ContractCall` | `contract_call:{from}:{hex(SHA3-256(raw tx.data))}:{nonce}` |
+| `ContractDeploy` | `contract_deploy:{from}:{code_hash}:{nonce}:{gas_price}:{gas_limit}`, `code_hash` read from the `tx.data` JSON |
+| `ContractCall` | `contract_call:{from}:{hex(SHA3-256(raw tx.data))}:{nonce}:{gas_price}:{gas_limit}`; below height 1,497,600 both contract rows also verify over the form without the gas |
 | `NodeRegistration`, client-signed | `client_node_reg:{node_id}:{wallet}:{registration_proof}:{timestamp}`, with `:{hex(SHA3-256(vrf_pk))}:{api_endpoint}` appended for a Super |
 | `NodeRegistration`, node-signed | `node_reg_v2:{from}\|{to}\|{amount}\|{nonce}\|{gas_price}\|{gas_limit}\|{timestamp}\|{node_id}\|{wallet_address}\|{node_type}` |
 | `NodeActivation` | `node_act_v2:{from}\|{to}\|{amount}\|{nonce}\|{gas_price}\|{gas_limit}\|{timestamp}\|{node_type}\|{payload_amount}\|{phase}` |
@@ -275,13 +276,21 @@ byte-identical roots and proofs. The quorum-certificate signature tree and the e
 same shape with their own byte tags.
 
 **Sparse merkle tree** (`core/qnet-state/src/state.rs`) — account and contract state. Fixed
-`TREE_DEPTH` = 256 with 32-byte nodes, so every leaf converges to a root at a fixed depth. Leaf
+`TREE_DEPTH` = 256 with 32-byte nodes, so every leaf converges to a root at a fixed depth. Depths
+below `BUCKET_DEPTH` = 216 collapse into buckets, so only the top `PROOF_DEPTH` = 40 levels are hashed as
+tree levels. Leaf
 *positions* are `SHA3-256("QNET_ADDR:" || address)` for accounts and
 `SHA3-256("QNET_STORAGE_KEY:" || key)` for contract storage; storage leaf *values* are
 `SHA3-256("QNET_STORAGE_VAL:" || raw value string)`. Path direction at depth `i` uses key bit
-`255 - i`, which is what makes any subtree a contiguous key range. Internal nodes are plain
-`SHA3-256(left || right)`; domain separation lives entirely in the leaves. Default (empty) hashes are
-built by iterating `SHA3-256(h || h)` from a 32-byte zero seed. The account leaf is a fixed-schema
+`255 - i`, which is what makes any subtree a contiguous key range. A bucket holds every leaf
+sharing the key's leading 40 bits; its hash is a mini-merkle over the bucket's key-sorted tagged leaves
+`SHA3-256(0xB5 || key || value)`, pairing `SHA3-256(l || r)` and promoting an odd element, and an empty
+bucket takes the default hash of depth 216. Internal nodes are plain `SHA3-256(left || right)`; domain
+separation lives in the leaves, whose 65-byte tagged preimage never equals a 64-byte node preimage.
+Default (empty) hashes are built by iterating `SHA3-256(h || h)` from a 32-byte zero seed. A proof is
+the in-bucket path, whose side flags are positional, followed by exactly 40 tree steps whose flags must
+equal the key's bits; the verifier accepts 40 to 104 steps, and an all-zero leaf value proves absence
+against an empty bucket with no in-bucket steps. The account leaf is a fixed-schema
 `SHA3-256("QNET_ACCOUNT_V2:" || ...)` digest whose fields exclude reputation and the account public
 key, which the address already commits to. See [state](state.md).
 
@@ -312,9 +321,9 @@ provider. ALPN is `qnet-p2p-v1`.
   `qnet-quic-handshake-v2:{node_id}:{timestamp}:{block_height}:{channel_binding}`. The channel binding
   is a 32-byte TLS keying-material export with label `qnet-quic-channel-binding-v1`; if the exporter is
   unavailable the code refuses the connection rather than substituting a default, so a proof can never
-  be verified against an empty binding. Each side verifies the peer's proof before sending its own, and
-  a node whose local crypto cannot sign its own proof refuses the connection.
-- **A peer that cannot present a valid proof is refused.** An empty proof, a proof whose bytes are not
+  be verified against an empty binding. The accepting side verifies the dialler's proof before sending
+  its own, and a node whose local crypto cannot sign its own proof refuses the connection.
+- **A peer whose proof fails is refused.** An empty proof, a proof whose bytes are not
   valid UTF-8, and a proof that fails under the claimed identity's registered key each close the
   connection. Where the proof is not checkable at all — the claimed `node_id` has no key in the
   consensus registry, or the local verifier is not yet published — the peer is admitted as
@@ -333,9 +342,11 @@ See [networking](networking.md).
 
 Mobile ML-DSA-65 operations run through a native module (`DilithiumModule`); the mobile light client
 independently recomputes the checkpoint hash, the registry root and the committee selection score, and
-verifies each committee vote as `QNET_BFT2_VOTE:<checkpoint_hash>` — its SMT proof verifier mirrors the
-Rust fold rule at every level of the served path, checking each entry's side against key bit `255 - i`
-before hashing, and the two-level QRC-20 proof additionally requires exactly 256 entries at each level.
+verifies each committee vote as `QNET_BFT2_VOTE:<checkpoint_hash>` — its SMT proof verifier
+(`applications/qnet-mobile/src/crypto/SmtFold.js`) mirrors the Rust fold rule: it seeds from the tagged
+bucket leaf, walks the in-bucket steps, checks the side of each of the last 40 steps against key bit
+`255 - depth` before hashing and accepts 40 to 104 steps, and the two-level QRC-20 proof requires at
+least 40 entries at each level.
 See [mobile wallet](../applications/mobile-wallet.md).
 
 ## Where each signature scheme is used

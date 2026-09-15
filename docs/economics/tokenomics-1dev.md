@@ -84,9 +84,9 @@ In Phase 2, activation is paid in native QNC on the QNet chain rather than by bu
 | Light | 10,000 QNC | `PHASE2_LIGHT_MIN_NANO` = 5,000 QNC |
 | Super | 7,500 QNC | `PHASE2_SUPER_MIN_NANO` = 3,750 QNC |
 
-A network-size multiplier of 0.5x / 1.0x / 2.0x / 3.0x applies to the quoted base cost at 100,000 / 300,000 / 1,000,000 registered nodes. Full details are in [node-activation.md](node-activation.md).
+A network-size multiplier applies to the quoted base cost by chain-confirmed registered-node count: 0.5x up to 100,000, 1.0x up to 300,000, 2.0x up to 1,000,000 and 3.0x above. Full details are in [node-activation.md](node-activation.md).
 
-An existing operator is not re-charged at the transition: `NodeActivation` apply is a no-op when the account's `is_node` flag is already set. Activation is one-shot per wallet at the state level — that `is_node` guard is phase-agnostic, so a wallet that activated in Phase 1 does not activate again in Phase 2. The mempool additionally dedups activations on `(wallet, phase)`.
+An existing operator is not re-charged at the transition: `NodeActivation` apply is a no-op when the account's `is_node` flag is already set. Activation is one-shot per wallet at the state level — that `is_node` guard is phase-agnostic, so a wallet that activated in Phase 1 does not activate again in Phase 2. The mempool additionally dedups activations on `(wallet, phase)`, and the RPC and gossip doors refuse an activation from a wallet that is already a node.
 
 ## Burn mechanics
 

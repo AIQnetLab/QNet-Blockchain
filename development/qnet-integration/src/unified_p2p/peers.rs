@@ -2530,9 +2530,9 @@ impl SimplifiedP2P {
                 }
                 
                 // DEDUPE the gossip echo, and ONLY the echo. The key must live in the same unit as
-                // the credit it guards: eligibility is per EPOCH, slot is hash(node_id) % 240 and so
-                // is CONSTANT for a device, and the map is retained 24 h = 6 epochs. Keyed on
-                // {id}:{slot} alone, the first attestation suppressed that device for the next six
+                // the credit it guards: eligibility is per EPOCH, slot numbers repeat every epoch,
+                // and the map is retained 24 h = 6 epochs. Keyed on {id}:{slot} alone, an
+                // attestation suppressed that device's replies in the same slot for six
                 // epochs — the shard owner dropped the relayed reply before recording eligibility,
                 // and the device lost those rewards. The LOCAL epoch is used, not the message
                 // block_height, which is relay-tamperable. Built by the SAME helper the writer uses,
@@ -2544,6 +2544,12 @@ impl SimplifiedP2P {
                         // Already have attestation for this Light node in this slot
                         return;
                     }
+                }
+                // An echo of an attestation already recorded here this epoch. The map above stops deduping
+                // past its bound; this set is the eligibility record itself.
+                let local_epoch = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed) / 14400;
+                if self.epoch_light_eligible.read().get(&local_epoch).map_or(false, |s| s.contains(&light_node_id)) {
+                    return;
                 }
                 
                 // TIMESTAMP VALIDATION: Must be within ±5 minutes
@@ -2603,16 +2609,7 @@ impl SimplifiedP2P {
                 // The DEVICE's own signature over the challenge is the only thing proving the phone
                 // actually answered; it was carried here and verified by nobody. Same verifier the HTTP
                 // ingress uses, so relay and ingress accept an identical set.
-                if !self.verify_light_ping_signature(&light_node_id, &challenge, &light_node_signature) {
-                    if crate::node::is_warn() {
-                        println!("[WARN][P2P] light_sig_invalid node={} pinger={}", light_node_id, pinger_id);
-                    }
-                    return;
-                }
-                
-                // Store through THE single writer: shared key shape and shared capacity bound, so
-                // this path and the origination path cannot drift apart again.
-                self.store_attestation(LightNodeAttestation {
+                let attestation = LightNodeAttestation {
                     light_node_id: light_node_id.clone(),
                     pinger_id: pinger_id.clone(),
                     slot,
@@ -2621,26 +2618,20 @@ impl SimplifiedP2P {
                     pinger_signature: pinger_signature.clone(),
                     challenge: challenge.clone(),
                     block_height,
-                });
-                
-                // Record into the per-epoch eligibility set IF this node is in OUR shard — so a reply
-                // (push or self-attest) that landed on a DIFFERENT genesis still reaches this shard-owner's
-                // committed bitmap. Shard-filtered (bitmap-identical committed-roster split) ⇒ memory stays
-                // at this genesis's 1/5, and each node is counted by exactly one shard owner. The pinger
-                // signature was verified above. block_height is NOT signature-covered (relay-tamperable), so
-                // record ONLY for the CURRENT local epoch — a forged future block_height would otherwise drive
-                // the prune in record_light_epoch_eligible and wipe the live epoch's eligibility set.
-                let local_epoch = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed) / 14400;
-                if block_height / 14400 == local_epoch
-                    && self.node_in_my_shard_for_epoch(local_epoch, &light_node_id) {
-                    self.record_light_epoch_eligible(block_height, &light_node_id);
-                    // Shard-owner self-heal: the attestor's copy of this node's push channel is
-                    // provably live (it just served the attestation). If ours looks degraded
-                    // (missing/polling), pull it and LWW-merge — automatic push pings resume
-                    // without waiting for an app-side token refresh. Once per node per epoch.
-                    Self::maybe_pull_push_channel(&light_node_id, &pinger_id, local_epoch);
+                };
+                if !self.verify_light_ping_signature(&light_node_id, &challenge, &light_node_signature) {
+                    if crate::node::is_warn() {
+                        println!("[WARN][P2P] light_sig_invalid node={} pinger={}", light_node_id, pinger_id);
+                    }
+                    // An owner the device never replied to directly holds no identity row for it, or a stale one.
+                    self.maybe_pull_light_identity(attestation);
+                    return;
                 }
-
+                
+                // Store through the single writer, and record eligibility for a my-shard node: the same
+                // admission the identity pull finishes with.
+                self.admit_relayed_attestation(attestation);
+                
                 // WHITEPAPER: Light nodes have FIXED reputation of 70
                 // NO reputation changes for Light nodes - they are always eligible if attested
                 

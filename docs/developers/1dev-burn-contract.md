@@ -67,8 +67,8 @@ anchors the five-year Phase 2 deadline; it is not the deployment time.
 **burn_1dev_for_node_activation** takes `node_type`, `one_dev_amount`, `solana_burn_tx` and a node
 public key. Accounts: the tracker (must be neither paused nor phase-transitioned), a new
 `NodeActivationRecord`, a new `BurnRecord`, the paying `user` signer, the node public key as an
-unchecked account, the 1DEV mint (constrained to equal `burn_tracker.one_dev_mint`), and the system,
-token and rent programs. The token program and mint accounts are required by the account struct but no
+unchecked account, the 1DEV mint (constrained to equal `burn_tracker.one_dev_mint`), and the system and token
+programs and the rent sysvar. The token program and mint accounts are required by the account struct but no
 token instruction is invoked. The handler checks that the signature string is 64 to 88 characters and
 base58-decodes to exactly 64 bytes; that `one_dev_amount` is at least the current required amount from
 the pricing curve; that the burn address on the tracker equals the Solana incinerator constant
@@ -119,8 +119,8 @@ Verification lives in `verify_burn_transaction_exists` in
 
 1. Issues a `getTransaction` JSON-RPC call for the burn signature against the Solana endpoint of the
    active network profile, with `encoding` `jsonParsed`, `commitment` `finalized` and
-   `maxSupportedTransactionVersion` 0. A signature Solana has not indexed yet is retried up to three
-   times, six seconds apart; the attestation path passes a budget of one so an unauthenticated caller
+   `maxSupportedTransactionVersion` 0. The lookup makes up to three attempts, six seconds apart, while
+   the request fails or Solana has not indexed the signature yet, each with a ten-second timeout; the attestation path passes a budget of one so an unauthenticated caller
    cannot multiply one request into several upstream round trips.
 2. Rejects the burn when `meta.err` is non-null.
 3. Requires `accountKeys[0]`, the fee payer that signed the Solana transaction, to equal the
@@ -134,7 +134,8 @@ Verification lives in `verify_burn_transaction_exists` in
    mint across the union of both sides. Decreases accumulate into a destroyed total; increases
    accumulate into a retained total that is subtracted from it, so a movement between two accounts of
    one owner nets to zero rather than reading as a burn. An increase on an account owned by the
-   Solana incinerator is destruction, not a retained balance, and is not subtracted. A balance entry
+   Solana incinerator, or on the incinerator address itself, is destruction, not a retained balance,
+   and is not subtracted. A balance entry
    for any other mint contributes nothing; an account present only in `pre` counts its whole balance
    as destroyed, which is the closed-account case, and an account present only in `post` is an
    increase from zero.

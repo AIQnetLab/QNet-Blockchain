@@ -1318,72 +1318,62 @@ pub(super) async fn handle_snapshot_latest(
 }
 
 /// GET /api/v1/snapshot/{height} - Download snapshot data
-/// Returns compressed binary snapshot for the specified height
+/// Streams the compressed frame chunk by chunk from a pinned view; the serve slot is held while the client reads.
 pub(super) async fn handle_snapshot_download(
     height: u64,
     remote_addr: Option<std::net::SocketAddr>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
-    if let Err(_) = check_api_rate_limit(remote_addr, "read_only") {
-        let body = serde_json::to_vec(&json!({"error": "Rate limit exceeded"})).unwrap_or_default();
-        return Ok(warp::reply::with_header(
-            warp::reply::with_header(body, "Content-Type", "application/json"),
-            "Content-Disposition", ""
-        ));
-    }
-    let _serve_permit = match SNAPSHOT_SERVE_SEM.try_acquire() {
-        Ok(p) => p,
-        Err(_) => {
-            let body = serde_json::to_vec(&json!({"error": "snapshot serve busy"})).unwrap_or_default();
-            return Ok(warp::reply::with_header(
-                warp::reply::with_header(body, "Content-Type", "application/json"),
-                "Content-Disposition", ""));
-        }
+    let json_reply = |body: serde_json::Value| {
+        let mut r = warp::http::Response::new(warp::hyper::Body::from(serde_json::to_vec(&body).unwrap_or_default()));
+        r.headers_mut().insert("Content-Type", warp::http::HeaderValue::from_static("application/json"));
+        r
     };
-    match blockchain.get_snapshot_data(height) {
-        Ok(Some(data)) => {
-            // Return binary data with appropriate headers
-            Ok(warp::reply::with_header(
-                warp::reply::with_header(
-                    data,
-                    "Content-Type",
-                    "application/octet-stream"
-                ),
-                "Content-Disposition",
-                format!("attachment; filename=\"snapshot_{}.bin\"", height)
-            ))
-        }
-        Ok(None) => {
-            // Return 404 as JSON
-            let error_response = json!({
-                "error": "Snapshot not found",
-                "height": height
+    if check_api_rate_limit(remote_addr, "read_only").is_err() {
+        return Ok(json_reply(json!({"error": "Rate limit exceeded"})));
+    }
+    let permit = match SNAPSHOT_SERVE_SEM.try_acquire() {
+        Ok(p) => p,
+        Err(_) => return Ok(json_reply(json!({"error": "snapshot serve busy"}))),
+    };
+    match blockchain.get_storage().open_frame(height) {
+        Ok(Some(frame)) => {
+            // Chunks are read off the reactor and handed over one at a time. A client that stops reading for
+            // 60 s ends the transfer, which releases the serve slot and the pinned view.
+            let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<Vec<u8>>>(1);
+            tokio::spawn(async move {
+                let _permit = permit;
+                let mut frame = frame;
+                loop {
+                    let (back, chunk) = match tokio::task::spawn_blocking(move || {
+                        let chunk = frame.next_chunk();
+                        (frame, chunk)
+                    }).await {
+                        Ok(v) => v,
+                        Err(_) => break,
+                    };
+                    frame = back;
+                    let chunk = match chunk { Some(c) => c, None => break };
+                    let failed = chunk.is_err();
+                    match tokio::time::timeout(std::time::Duration::from_secs(60), tx.send(chunk)).await {
+                        Ok(Ok(())) if !failed => {}
+                        _ => break,
+                    }
+                }
             });
-            Ok(warp::reply::with_header(
-                warp::reply::with_header(
-                    serde_json::to_vec(&error_response).unwrap_or_default(),
-                    "Content-Type",
-                    "application/json"
-                ),
-                "Content-Disposition",
-                ""
-            ))
+            let body = futures::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|item| (item, rx)) });
+            let mut r = warp::http::Response::new(warp::hyper::Body::wrap_stream(body));
+            let headers = r.headers_mut();
+            headers.insert("Content-Type", warp::http::HeaderValue::from_static("application/octet-stream"));
+            if let Ok(v) = warp::http::HeaderValue::from_str(&format!("attachment; filename=\"snapshot_{}.bin\"", height)) {
+                headers.insert("Content-Disposition", v);
+            }
+            Ok(r)
         }
+        Ok(None) => Ok(json_reply(json!({"error": "Snapshot not found", "height": height}))),
         Err(e) => {
             println!("[WARN][RPC] api_error endpoint=snapshot_download err={}", e);
-            let error_response = json!({
-                "error": "Failed to get snapshot",
-                "details": "internal error"
-            });
-            Ok(warp::reply::with_header(
-                warp::reply::with_header(
-                    serde_json::to_vec(&error_response).unwrap_or_default(),
-                    "Content-Type",
-                    "application/json"
-                ),
-                "Content-Disposition",
-                ""
-            ))
+            Ok(json_reply(json!({"error": "Failed to get snapshot", "details": "internal error"})))
         }
     }
 }

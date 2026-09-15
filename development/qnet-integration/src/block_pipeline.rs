@@ -3510,7 +3510,7 @@ impl BlockPipeline {
                     } // read-lock dropped here
                     if !pk_unresolved && !rehydrated.is_empty() {
                         let verify_futures: Vec<_> = rehydrated.iter()
-                            .map(|tx| crate::node::BlockchainNode::verify_dilithium_tx_signature_async(tx, crate::node::VerifyLane::Block))
+                            .map(|tx| crate::node::BlockchainNode::verify_dilithium_tx_signature_async(tx, crate::node::VerifyLane::Block(decoded.microblock.height)))
                             .collect();
                         let results = join_all(verify_futures).await;
                         for r in results {
@@ -4515,7 +4515,7 @@ impl BlockPipeline {
                 // or snapshot join and then admits a second registration for a node everyone else rejects
                 // — a silent registry_root split.
                 for (node_id, wallet) in &apply_result.deferred_registration_origins {
-                    let _ = ctx.storage.mark_node_registration_origin(node_id, wallet);
+                    let _ = ctx.storage.mark_node_registration_origin(node_id, wallet, height);
                 }
                 // FIX-5: bind this block's value-TX pubkeys into the dilithium_pk_root LtHash
                 // (marker-guarded ⇒ once/account, deterministic) BEFORE the seal below.
@@ -4701,7 +4701,7 @@ impl BlockPipeline {
                                 let mut commitment_marks = 0usize;
                                 for tx in &block.microblock.transactions {
                                     if let Some(key) = tx.commitment_dedup_key() {
-                                        mempool_arc.mark_commitment_finalized(key);
+                                        mempool_arc.mark_commitment_finalized(key, height);
                                         commitment_marks += 1;
                                     }
                                 }
@@ -4722,6 +4722,23 @@ impl BlockPipeline {
                             }
                         }
 
+                        // Rows in apply order, under the lock that applied them and before the frontier
+                        // moves: this block's rows, then the boundary pin right behind them.
+                        match block_snapshot {
+                            Some(ref snapshot) => {
+                                let (puts, dels) = crate::storage::account_delta(&state_guard, snapshot);
+                                ctx.storage.mirror_block_delta(height, puts, dels);
+                                // QRC-20 wallet→token owns-index deltas (NON-consensus), persisted off-lock below.
+                                owns_to_persist = snapshot.owns().to_vec();
+                            }
+                            // Block 0 carries no journal: the genesis set goes whole.
+                            None => { let _ = ctx.storage.mirror_full_write(&state_guard); }
+                        }
+                        if crate::storage::is_snapshot_boundary(height)
+                            && crate::node::should_materialize_snapshot(&ctx.node_id, height)
+                        {
+                            ctx.storage.request_boundary_pin(&state_guard, height);
+                        }
                         // v15.6: chain-height bump on the blocking pool too —
                         // it is an atomic CF write but pays the same compaction
                         // queue penalty as the block save above.
@@ -4808,98 +4825,6 @@ impl BlockPipeline {
                         // now; sharding primitives stay dormant and CrossShard*
                         // TransactionType variants are removed to block accidental
                         // activation (see qnet-sharding/lib.rs header).
-
-                        // Write-through account persistence: mirror every account
-                        // this block mutated (addresses from the BlockSnapshot
-                        // journal) into the persistent `accounts` CF via one
-                        // atomic WriteBatch on the blocking pool, so a crash
-                        // restart has durable per-block state (no lost mutations
-                        // between snapshots). Skipped when block_snapshot is None
-                        // (genesis window, no mutation set). O(touched accounts).
-                        if let Some(ref snapshot) = block_snapshot {
-                            let mut modified: Vec<(String, qnet_state::Account)> =
-                                Vec::with_capacity(snapshot.accounts().len() + snapshot.created_keys().len());
-                            let mut deleted: Vec<String> = Vec::new();
-                            // QRC-20 wallet→token owns-index deltas this block (NON-consensus reverse index).
-                            let owns_deltas: Vec<qnet_state::OwnsDelta> = snapshot.owns().to_vec();
-
-                            // Modified addresses: pre-image existed; check if
-                            // the post-image still exists (it might have been
-                            // removed entirely if the apply path deletes
-                            // accounts in some flow).
-                            for addr in snapshot.accounts().keys() {
-                                match state_guard.accounts.get(addr) {
-                                    Some(entry) => {
-                                        modified.push((addr.clone(), entry.value().clone()));
-                                    }
-                                    None => {
-                                        deleted.push(addr.clone());
-                                    }
-                                }
-                            }
-                            // Created addresses: pre-image did NOT exist; just
-                            // capture the post-image. (If the apply created
-                            // and then immediately removed an account in the
-                            // same block, it is already absent from the map
-                            // and we skip the put.)
-                            for addr in snapshot.created_keys() {
-                                if let Some(entry) = state_guard.accounts.get(addr) {
-                                    modified.push((addr.clone(), entry.value().clone()));
-                                }
-                            }
-
-                            // Owns-index (NON-consensus): capture under the lock, persist OFF-lock below.
-                            // A large airdrop block's batch must not serialise apply behind the state lock.
-                            owns_to_persist = owns_deltas;
-                            if !modified.is_empty() || !deleted.is_empty() {
-                                // ───────────────────────────────────────────────
-                                // Accounts CF (best-effort mirror, can be large):
-                                // persist in the BACKGROUND so we never await on
-                                // RocksDB while still holding `state_guard`.
-                                // Holding the state write lock across an async
-                                // I/O would serialise the entire apply pipeline
-                                // behind disk latency — exactly the failure mode
-                                // Fix #2 was introduced to avoid. The spawned
-                                // task takes ownership of the modified/deleted
-                                // buffers and an Arc<Storage> clone; it cannot
-                                // outlive the runtime, and a logged failure is
-                                // recoverable via microblock replay (the
-                                // canonical Stage-1 invariant: account CF is
-                                // best-effort, microblocks are authoritative).
-                                // ───────────────────────────────────────────────
-                                let storage_for_persist = ctx.storage.clone();
-                                let height_for_persist = height;
-                                let modified_count = modified.len();
-                                let deleted_count = deleted.len();
-                                tokio::spawn(async move {
-                                    let persist_start = std::time::Instant::now();
-                                    match storage_for_persist
-                                        .persist_accounts_batch(modified, deleted)
-                                        .await
-                                    {
-                                        Ok((puts, dels)) => {
-                                            let elapsed = persist_start.elapsed();
-                                            if elapsed > std::time::Duration::from_millis(200) {
-                                                if is_warn() {
-                                                    println!(
-                                                        "[WARN][PIPELINE] slow_persist_accounts h={} puts={} dels={} elapsed_ms={}",
-                                                        height_for_persist, puts, dels, elapsed.as_millis(),
-                                                    );
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            if is_warn() {
-                                                println!(
-                                                    "[WARN][PIPELINE] persist_accounts_failed h={} puts={} dels={} err={:?}",
-                                                    height_for_persist, modified_count, deleted_count, e,
-                                                );
-                                            }
-                                        }
-                                    }
-                                });
-                            }
-                        }
 
                         // The journal outlives the apply: a shallow reorg undoes this block from it.
                         if let Some(snapshot) = block_snapshot.take() {
@@ -5130,80 +5055,8 @@ impl BlockPipeline {
                 }
             }
 
-            // Canonical boundary snapshot on EVERY node's apply path (deterministic, role-independent)
-            // so a cold joiner can fast-sync from any peer — at the early anchor (h=90, first bindable
-            // boundary) AND every SNAPSHOT_INCREMENTAL_INTERVAL thereafter. Pin a frozen DB view at
-            // `height` SYNCHRONOUSLY here — the serial apply loop has not started H+1, so the snapshot
-            // captures exactly state_root@H. With persist-before-evict the pinned accounts CF is the
-            // COMPLETE committed leaf set, so a cold joiner's recompute reproduces the bound root. The
-            // heavy serialization runs off-reactor on the frozen view.
-            if height > 0
-                && (height == crate::node::SNAPSHOT_EARLY_ANCHOR_HEIGHT
-                    || height % crate::node::SNAPSHOT_INCREMENTAL_INTERVAL == 0)
-                && crate::node::should_materialize_snapshot(&ctx.node_id, height)
-            {
-                // No CF sweep here: phantoms are removed at their source (the rollback's staged
-                // candidates, applied by the reconcile tail), so the pin stays off the apply path.
-                // The count gate below is the residual fail-closed check.
-                let (snapshot_accounts, expected_leaves) = {
-                    let sg = ctx.state.read().await;
-                    // Strict count gate only while the RAM leaf set is the complete authority.
-                    let exp = if sg.merkle_leaves_complete() { Some(sg.merkle_leaf_count() as u64) } else { None };
-                    (sg.get_all_accounts(), exp)
-                };
-                match ctx.storage.prepare_snapshot_view(&snapshot_accounts) {
-                    Ok(view) => {
-                        let storage_for_snapshot = ctx.storage.clone();
-                        let snapshot_height = height;
-                        tokio::spawn(async move {
-                            if let Err(e) = storage_for_snapshot
-                                .create_state_snapshot(snapshot_height, view, expected_leaves).await
-                            {
-                                if is_warn() {
-                                    println!("[WARN][PIPELINE] snapshot_create_failed h={} err={:?}", snapshot_height, e);
-                                }
-                            }
-                        });
-                    }
-                    Err(e) => {
-                        if is_warn() {
-                            println!("[WARN][PIPELINE] snapshot_prepare_failed h={} err={:?}", height, e);
-                        }
-                    }
-                }
-            }
-
-            // STORAGE HYGIENE (epoch boundary) on EVERY node's apply path — the body-prune's twin
-            // to the producer path in node.rs:17800. apply_stage is the single universal per-block
-            // apply path for received blocks (gossip broadcast AND batch sync both funnel through
-            // block_tx → pipeline), so this prunes on EVERY Super node that APPLIES a 14400-boundary
-            // block. It intentionally does NOT use should_materialize_snapshot's ~1-in-5 holder gate,
-            // so its per-node coverage is strictly BROADER than the co-located snapshot materialization
-            // (each node must bound its OWN storage regardless of snapshot-holder duty). The prior
-            // producer-only trigger left every non-boundary-producer growing unbounded (observed live:
-            // one genesis at full ~2.8GB history vs a pruned one at ~1.1GB). prune_old_microblock_bodies
-            // self-gates to Super and is watermark-based/idempotent (catch-up: drops everything below
-            // height − 6 epochs), so any single applied boundary reclaims the whole window. Body-only
-            // prune keeps hashes + macroblocks + snapshots + state → non-consensus, cannot affect
-            // state_root or cold-join. (14400 is a multiple of the 3600 snapshot interval, so every
-            // prune boundary is also a snapshot boundary — compatible cadences.)
-            //
-            // NOTE: recompress_old_blocks() is deliberately NOT run here. It is O(chain) — it re-scans
-            // and re-decompresses the WHOLE history plus an unconditional full-CF compaction every
-            // call, with near-zero steady-state benefit (blocks already at their age-bucket level are
-            // not rewritten). Multiplying that across every node every epoch would burn CPU and contend
-            // the apply write path at the boundary, so recompression stays producer-only (node.rs).
-            if height % 14_400 == 0 && height > 0 {
-                let storage_for_body_prune = ctx.storage.clone();
-                let prune_h = height;
-                tokio::spawn(async move {
-                    match storage_for_body_prune.prune_old_microblock_bodies(prune_h, crate::node::MICROBLOCK_BODY_RETENTION_BLOCKS) {
-                        Ok(0) => {}
-                        Ok(n) => println!("[INFO][PIPELINE] microblock_bodies_pruned count={} window=6epochs h={}", n, prune_h),
-                        Err(e) => { if is_warn() { println!("[WARN][PIPELINE] body_prune_failed err={:?}", e); } }
-                    }
-                });
-            }
+            // Body expiry at the epoch boundary, on every node that applies it (self-gated to Super).
+            ctx.storage.prune_bodies_at_epoch(height);
 
             // ────────────────────────────────────────────────────────────────
             // v14.10: GENESIS GLOBAL STATE (was missing in pipeline apply path!)

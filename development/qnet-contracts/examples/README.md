@@ -114,7 +114,7 @@ Submit them to `POST /api/v1/wasm/deploy` (1 MiB body limit):
 }
 ```
 
-The signature is ML-DSA-65 over `q{chain_id}|contract_deploy:{from}:{code_hash}:{nonce}`, where
+The signature is ML-DSA-65 over `q{chain_id}|contract_deploy:{from}:{code_hash}:{nonce}:{gas_price}:{gas_limit}`, where
 `chain_id` is the node's compile-time `QNET_CHAIN_ID` (`q1337` on testnet) and `code_hash` is the hex
 SHA3-256 of the module bytes. The contract address is derived on-chain from
 the deployer address and the nonce and is returned as `contract.contract_address`; a caller-supplied
@@ -141,7 +141,7 @@ Submit `POST /api/v1/contract/call`:
 
 The node builds the transaction calldata as the JSON object `{"args":…,"contract":…,"method":…}` —
 keys in that order, no whitespace — and the ML-DSA-65 signature covers
-`q{chain_id}|contract_call:{from}:{sha3_256(calldata bytes)}:{nonce}`. The signature binds the literal
+`q{chain_id}|contract_call:{from}:{sha3_256(calldata bytes)}:{nonce}:{gas_price}:{gas_limit}`. The signature binds the literal
 calldata bytes, so a client must sign that exact serialisation. `method: "reset"` selects the
 other entry point. The interpreter's fuel budget is `gas_limit` minus the intrinsic gas of the
 transaction; fuel is consumed, and billed, whether or not the call succeeds. The gas settlement rules

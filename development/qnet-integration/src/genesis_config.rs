@@ -234,6 +234,10 @@ pub async fn apply_genesis_state(
                 }
             }
         }
+        // A fresh chain's genesis accounts reach the CF here; every later block carries its own rows.
+        if storage.get_chain_height().unwrap_or(0) == 0 {
+            let _ = storage.mirror_full_write(&state_guard);
+        }
     }
 
     // Cache node registrations (VRF keys, Dilithium PKs)

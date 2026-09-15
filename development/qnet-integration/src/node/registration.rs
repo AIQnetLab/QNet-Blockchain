@@ -708,7 +708,7 @@ impl BlockchainNode {
         let _ = storage.save_node_registration_at_height_burn_vrf(node_id, type_str, wallet, 1.0, height, burn_tx, vrf.as_deref());
         // Registration-origin marker: the dedup reseed source. Activations write registry rows too,
         // so reseeding from those would reject honest registrations.
-        let _ = storage.mark_node_registration_origin(node_id, wallet);
+        let _ = storage.mark_node_registration_origin(node_id, wallet, height);
         if !burn_tx.is_empty() {
             let _ = storage.committed_burn_wallet_put(burn_tx, node_id);
         }
@@ -1157,8 +1157,9 @@ impl BlockchainNode {
         }
     }
 
-    /// Epochs holding a certified reward_root that this node cannot serve — exactly where
-    /// `wallet_claimable_qnc` stops and starts under-reporting every wallet. Newest first, bounded.
+    /// Epochs holding a certified reward_root whose shards this node cannot serve, oldest first,
+    /// bounded. `wallet_claimable_qnc` stops at the first of these; a grid epoch with no root row is
+    /// derived from its stored macroblock, and only an absent macroblock stops it there.
     pub(crate) fn unservable_reward_epochs(storage: &crate::storage::Storage, max: usize) -> Vec<(u64, String)> {
         // ASCENDING, deliberately: `wallet_claimable_qnc` walks epochs in order and STOPS at the first
         // one it cannot serve, so the oldest gap is the one truncating the total. Repairing the newest

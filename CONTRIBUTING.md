@@ -15,7 +15,7 @@ Security vulnerabilities must not be filed as public issues or pull requests. Fo
 | Rust | A recent stable toolchain. The workspace pins no `rust-toolchain.toml`, but dependencies set the floor: `wasmi` 0.47 declares `rust-version = "1.86"`, so anything older will not build. Add the `rustfmt` and `clippy` components. |
 | Build tools (Linux) | `build-essential`, `pkg-config`, `libssl-dev`. These are what CI installs, and RocksDB needs a C/C++ toolchain. |
 | Node.js | The mobile app declares `engines.node >= 20`. The explorer front end is built on Node 18 in CI. |
-| Python | Required by `applications/qnet-cli`, which declares `python_requires >= 3.8`, and by any Cargo command that enables the `python` feature — including `--all-features`, which pulls in `pyo3` (and `pyo3-asyncio` in `qnet-consensus`) and needs a discoverable Python 3 interpreter at build time. |
+| Python | Required by `applications/qnet-cli`, which declares `python_requires >= 3.8`, and by any Cargo command that enables the `python` feature — including `--all-features`, which pulls in `pyo3` through `qnet-state`, `qnet-mempool` and `qnet-sharding` and needs a discoverable Python 3 interpreter at build time. |
 
 ```bash
 rustup default stable
@@ -32,7 +32,7 @@ The root `Cargo.toml` declares these members:
 | `qnet-consensus` | `core/qnet-consensus` | Checkpoint-BFT, committees, rewards |
 | `qnet-mempool` | `core/qnet-mempool` | Transaction pool |
 | `qnet-state` | `core/qnet-state` | Accounts, transactions, state commitment, RocksDB |
-| `qnet-sharding` | `core/qnet-sharding` | Shard coordinator and parallel validator. The shard coordinator is pinned off in the node behind an `if false` guard (`development/qnet-integration/src/node.rs`), so only `ParallelValidator` is live |
+| `qnet-sharding` | `core/qnet-sharding` | Shard coordinator and parallel transaction validator |
 | `qnet-vm` | `core/qnet-vm` | Deterministic WASM contract VM (`wasmi`) and deploy-time validator |
 | `qnet-integration` | `development/qnet-integration` | The node binary `qnet-node`, P2P, RPC |
 | `qnet-loadtest` | `development/qnet-loadtest` | External load-test harness |
@@ -117,9 +117,9 @@ safety parameters at runtime.
 
 - Branch from the branch you intend to target; `master` is the default branch, `testnet` carries
   pre-release work.
-- Commit subjects in this repository are predominantly `subsystem: short imperative summary`, for
-  example `consensus: bound seal-frontier outrun`. Conventional-commit prefixes (`feat:`, `fix:`)
-  appear occasionally. No format is enforced — match the surrounding history and keep the subject
+- Commit subjects in this repository use `subsystem: short imperative summary` (for example
+  `consensus: bound seal-frontier outrun`), conventional-commit prefixes (`feat:`, `fix:`) or a
+  plain sentence. No format is enforced — match the surrounding history and keep the subject
   under roughly 72 characters.
 - One logical change per pull request. Describe what changed, why, and how you verified it. Link
   the issue if there is one.

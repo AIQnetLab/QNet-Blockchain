@@ -144,6 +144,16 @@ impl BlockchainNode {
                                     rollback_to, std::sync::atomic::Ordering::Release
                                 );
 
+                                // Frames above the target describe the branch just deleted. After the bodies and
+                                // under the snapshot fence: a frame sealed before the delete goes here, a capture
+                                // taken before it finds the generation bumped.
+                                crate::storage::note_rollback_progress();
+                                match storage.prune_snapshots_above(rollback_to) {
+                                    Ok(n) if n > 0 => println!("[INFO][FORK] snapshots_pruned n={} to={}", n, rollback_to),
+                                    Err(e) => println!("[WARN][FORK] snapshot_prune_fail to={} err={}", rollback_to, e),
+                                    _ => {}
+                                }
+
                                 // cbw is validation-critical: rebuild it from node_registry bounded by the
                                 // rollback target so orphaned-block bindings (reg_height > rollback_to) drop
                                 // out, BEFORE the rollback barrier is released. No per-block delete ⇒ no
@@ -1418,6 +1428,8 @@ impl BlockchainNode {
                                         match storage.save_microblock(0, &data) {
                                             Ok(crate::storage::SaveOutcome::Stored) => {
                                                 println!("[INFO][GEN] Genesis Block created and saved at height 0");
+                                                // Its accounts reach the CF with the block that holds them.
+                                                let _ = storage.mirror_full_write(&*state.read().await);
 
                                                 // v12.0: Export genesis.bin for file-based distribution
                                                 // Other nodes (002-005) can load from this file instead of p2p sync
@@ -4440,26 +4452,10 @@ impl BlockchainNode {
                             // bloated block storage + explorer (h=14351→14461). Fix: before the dedup
                             // tiers, is_epoch_committed(type,identity,epoch) against the held read-
                             // guard; if on chain → drop the TX from the block AND local mempool.
-                            // Same 5 types as commitment_dedup_key; NodeRegistration epoch=0
-                            // (one-shot) → rejects 2nd registration. Read-only, O(1) ~50ns.
-                            let is_already_on_chain = if let Some((identity, epoch, type_id)) =
-                                tx.commitment_dedup_key()
-                            {
-                                match type_id {
-                                    // NodeRegistration is one-shot, recorded in the node registry
-                                    // (mark_node_registered), NOT committed_epochs — dedup against the
-                                    // registry, else an already-registered node_id is never dropped and the
-                                    // producer re-selects the same reg every tick (the ~9/s hot loop).
-                                    4 => state_snapshot.is_node_registered(&identity),
-                                    1 => state_snapshot.is_epoch_committed("heartbeat", &identity, epoch),
-                                    2 => state_snapshot.is_epoch_committed("ping", &identity, epoch),
-                                    3 => state_snapshot.is_epoch_committed("bitmap", &identity, epoch),
-                                    5 => state_snapshot.is_epoch_committed("reactivation", &identity, epoch),
-                                    _ => false,
-                                }
-                            } else {
-                                false
-                            };
+                            // NodeRegistration is checked against the node registry, else an
+                            // already-registered node_id is re-selected every tick. Read-only, O(1).
+                            let is_already_on_chain = tx.commitment_dedup_key()
+                                .map_or(false, |key| crate::node::commitment_backed_by_state(&state_snapshot, &key));
 
                             if is_already_on_chain {
                                 if is_info() {
@@ -5133,6 +5129,8 @@ impl BlockchainNode {
                     // This block's journal (mirror of the validator's BlockSnapshot), retained once the
                     // block is stored so a shallow reorg can undo our own block from it.
                     let inline_journal: Option<qnet_state::BlockSnapshot>;
+                    // Its rows, read under the same lock, queued once the block is stored.
+                    let inline_delta: (Vec<(String, qnet_state::Account)>, Vec<String>);
                     {
                         let state_guard = state.write().await;
                         // Re-checked under the lock: the pipeline cannot interleave here, and a peer's
@@ -5430,6 +5428,7 @@ impl BlockchainNode {
                             println!("[DBG][STATE] state_root computed h={} root={}",
                                      next_block_height, hex::encode(&computed_state_root[..8]));
                         }
+                        inline_delta = crate::storage::account_delta(&state_guard, &inline_snap);
                         inline_journal = Some(inline_snap);
                     }
 
@@ -5593,7 +5592,7 @@ impl BlockchainNode {
                     // Keyed maps, so their order is free — kept out of the ordered stamp above rather
                     // than re-derived inside it.
                     for (rid, rwallet) in inline_reg_origins.iter() {
-                        let _ = storage.mark_node_registration_origin(rid, rwallet);
+                        let _ = storage.mark_node_registration_origin(rid, rwallet, next_block_height);
                     }
                     // FIX-5: drain this block's value-TX pk bindings into the dilithium_pk_root LtHash
                     // (marker-guarded ⇒ once/account) BEFORE the seal — outside the loop above, whose
@@ -5659,9 +5658,6 @@ impl BlockchainNode {
                     // commit branch below, which publishes the serve horizon and the finalized-round
                     // baseline.
                     if let Ok(crate::storage::SaveOutcome::Stored) = save_result {
-                        if let Some(journal) = inline_journal {
-                            state.read().await.retain_block_journal(journal);
-                        }
                         // Block logs (CONSENSUS: feeds the window logs_root, gate height 0) FIRST —
                         // after the save, so a block that lost the slot race can never erase the
                         // canonical block's rows, but BEFORE the height is published below. Publishing
@@ -5674,6 +5670,20 @@ impl BlockchainNode {
                         side_idx.block_logs = std::mem::take(&mut block_logs);
                         side_idx.token_rows = std::mem::take(&mut block_token_rows);
                         Self::flush_block_side_indices(&storage, height_for_storage, &side_idx);
+                        // This block's reward rows now exist for the boundary pin.
+                        if let Some(journal) = inline_journal {
+                            // Rows, then the boundary pin, then the journal, before the frontier is published
+                            // below: nothing above this height applies before its journal is kept.
+                            let sg = state.read().await;
+                            let (puts, dels) = inline_delta;
+                            storage.mirror_block_delta(height_for_storage, puts, dels);
+                            if crate::storage::is_snapshot_boundary(height_for_storage)
+                                && should_materialize_snapshot(&node_id, height_for_storage)
+                            {
+                                storage.request_boundary_pin(&sg, height_for_storage);
+                            }
+                            sg.retain_block_journal(journal);
+                        }
 
                         // Publish the applied frontier now that the block AND its consensus-visible
                         // side data are durable, so the invariant "block H in storage ⟺
@@ -5774,7 +5784,7 @@ impl BlockchainNode {
                             let mut commitment_marks = 0usize;
                             for tx in &txs {
                                 if let Some(key) = tx.commitment_dedup_key() {
-                                    mempool.mark_commitment_finalized(key);
+                                    mempool.mark_commitment_finalized(key, height_for_storage);
                                     commitment_marks += 1;
                                 }
                             }
@@ -6066,77 +6076,9 @@ impl BlockchainNode {
                         println!("[INFO][EPOCH] complete epoch={} h={}", microblock_height / 90, microblock_height);
                     }
                     
-                    // v32.6: early anchor at h=90 so cold-start joiners can use
-                    // state-sync immediately; subsequent snapshots on baseline interval.
-                    let early_anchor = microblock_height == 90;
-                    let baseline_due = microblock_height % SNAPSHOT_INCREMENTAL_INTERVAL == 0
-                        && microblock_height > 0;
-                    if (early_anchor || baseline_due) && should_materialize_snapshot(&node_id, microblock_height) {
-                        // Capture the hot in-memory account set at this exact height, then pin a frozen
-                        // DB view (sync flush + snapshot) HERE — before the next block mutates the CF.
-                        // With persist-before-evict the pinned accounts CF is the COMPLETE committed tree
-                        // leaf set, so a cold joiner's recompute reproduces the bound state_root past the
-                        // LRU cap; the heavy serialization runs off-reactor on the frozen view.
-                        // No CF sweep here: phantoms are removed at their source (the rollback's staged
-                        // candidates, applied by the reconcile tail), so production never stalls on it.
-                        let (snapshot_accounts, expected_leaves) = {
-                            let sg = state.read().await;
-                            // Strict count gate only while the RAM leaf set is the complete authority.
-                            let exp = if sg.merkle_leaves_complete() { Some(sg.merkle_leaf_count() as u64) } else { None };
-                            (sg.get_all_accounts(), exp)
-                        };
-                        let snap_res = match storage.prepare_snapshot_view(&snapshot_accounts) {
-                            Ok(view) => storage.create_incremental_snapshot(microblock_height, view, expected_leaves).await,
-                            Err(e) => Err(e),
-                        };
-                        match snap_res {
-                            Ok(_) => {
-                                println!("[INFO][NODE] snapshot_created h={} type=incremental", microblock_height);
-                                
-                                // STORAGE OPTIMIZATION: Trigger pruning after snapshot for non-archive nodes
-                                // This ensures we have a valid snapshot before removing old blocks
-                                // INTERVAL: 14400 blocks = 4 hours (aligned with reward window)
-                                if microblock_height % 14_400 == 0 {
-                                    // v36: EIP-4444 body expiry. Super (incl. genesis) is the only tier
-                                    // that stores block data — drop microblock bodies (heartbeats + TXs)
-                                    // older than 6 epochs while keeping hashes, macroblocks, snapshots and
-                                    // state. Bounds storage to a ~6-epoch window instead of growing forever.
-                                    let storage_for_body_prune = Arc::clone(&storage);
-                                    tokio::spawn(async move {
-                                        match storage_for_body_prune
-                                            .prune_old_microblock_bodies(microblock_height, MICROBLOCK_BODY_RETENTION_BLOCKS)
-                                        {
-                                            Ok(0) => {}
-                                            Ok(n) => println!("[INFO][NODE] microblock_bodies_pruned count={} window=6epochs", n),
-                                            Err(e) => println!("[WARN][NODE] body_prune_failed err={:?}", e),
-                                        }
-                                    });
-                                }
-                                
-                                // For full snapshots, upload to IPFS if enabled
-                                if microblock_height % SNAPSHOT_FULL_INTERVAL == 0 {
-                                    if std::env::var("IPFS_ENABLED").unwrap_or_default() == "1" {
-                                        // Upload to IPFS synchronously (avoids Send issues)
-                                        match storage.upload_snapshot_to_ipfs(microblock_height).await {
-                                            Ok(cid) => {
-                                                // IPFS snapshot upload retained; the dead peer-announce
-                                                // (receiver only logged it) was removed — GALC + the
-                                                // QC-anchored snapshot path handle state sync.
-                                                println!("[INFO][NODE] ipfs_upload cid={}", cid);
-                                            },
-                                            Err(e) => {
-                                                println!("[WARN][NODE] ipfs_upload_failed err={}", e);
-                                            }
-                                        }
-                                    }
-                                }
-                            },
-                            Err(e) => {
-                                println!("[WARN][NODE] snapshot_failed err={}", e);
-                            }
-                        }
-                    }
-                    
+                    // Body expiry at the epoch boundary; the boundary snapshot was queued behind the block's rows.
+                    storage.prune_bodies_at_epoch(microblock_height);
+
                     // CRITICAL FIX: Do NOT reset timing here - breaks precision timing
                     // Timing update happens ONLY at end of loop for drift prevention
                     

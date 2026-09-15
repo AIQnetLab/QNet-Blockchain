@@ -19,7 +19,8 @@ Light node.
 The UI is a single wallet screen with six tabs: assets, receive, activate, history, node, settings.
 It includes QR receive, clipboard copy, hideable balances, spam-token hiding and a QNet/Solana
 network switch. Interface strings are localised into 11 languages in `src/i18n/translations.js`, with
-the language selected in settings.
+the language selected in settings. The layout adapts to the screen: tab labels shrink to fit, and dialogs
+scroll and stay above the keyboard.
 
 ## Identity and key derivation
 
@@ -49,6 +50,9 @@ is signed. Key sizes are 1952-byte public key, 4032-byte secret key, 3309-byte d
   with `AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY`, so a background push handler can answer a challenge
   without the wallet password. It is bound to the wallet by a delegation certificate: the wallet
   ML-DSA-65 signature over `delegate_ping:{ping_pubkey}:{node_id}`.
+- The wallet public key that a ping presents as the node's identity key is kept in app storage as
+  `qnet_identity_pk_{node_id}`: written at registration, and written from the wallet whenever it is
+  decrypted or stored and the entry is missing, so a reinstall restores it with the seed.
 - Deleting the wallet tears the node down: the scheduled wake is stopped and the keychain ping secret
   and cached certificate are wiped, so a removed wallet cannot keep attesting.
 
@@ -92,8 +96,8 @@ from a node over HTTP and checked on device against a committee quorum certifica
    and equivocation bans are written to the offender node account, so neither lands on a wallet
    account. A balance counts as verified only if the proof folds to the served `state_root` *and*
    that `state_root` is independently certified by a committee QC.
-7. **QRC-20 balance.** A two-level proof: a storage proof and an account proof, each required to be
-   exactly 256 entries, bound to the requested (contract, holder) pair, with a zero balance treated
+7. **QRC-20 balance.** A two-level proof: a storage proof and an account proof, each folded by the
+   bucketed SMT fold below, bound to the requested (contract, holder) pair, with a zero balance treated
    as the 32-zero-byte empty leaf and the contract leaf folded with `SROOT:` plus the raw 32-byte
    storage root.
 8. **Token transfers.** Each row's leaf is recomputed from the row's own fields (tx hash, log index,
@@ -102,9 +106,13 @@ from a node over HTTP and checked on device against a committee quorum certifica
    committee QC.
 
 The SMT fold lives in its own module (`src/crypto/SmtFold.js`) so the cross-language jest pins
-exercise the shipped code: depth `i` splits on key bit `255-i`, an entry whose `is_right` disagrees
-with that bit is rejected, and the pair is hashed `SHA3-256(sibling || current)` ordered by
-`is_right`.
+exercise the shipped code. It mirrors the node's bucketed tree, which groups leaves sharing their
+leading 40 key bits into buckets and hashes only the 40 levels above them (`BUCKET_DEPTH` = 216,
+`PROOF_DEPTH` = 40). The fold seeds from `SHA3-256(0xB5 || key || leaf)` and accepts 40 to 104
+entries: the first `len - 40` are in-bucket steps with positional flags, and in the last 40 depth `d`
+splits on key bit `255-d`, so an entry whose `is_right` disagrees with that bit is rejected. Each pair
+is hashed `SHA3-256(sibling || current)` ordered by `is_right`. An all-zero leaf is a proof of
+absence: exactly 40 steps, seeded from the empty-bucket hash.
 
 ### What the verified badge covers
 
@@ -164,8 +172,10 @@ verified badge is earned only by the checks above.
   SHA3-256 over `QNET_VALIDATOR_SET:`, the epoch as u64 LE, then — for each validator, sorted by
   `node_id` — the node id, address and node-type strings, the reputation as an IEEE-754 f64 LE, the
   last-seen timestamp as u64 LE and the active flag as one byte; the device mirrors that byte layout.
-- **Native QNC transaction history.** Rows from `/api/v1/account/{addr}/transactions` are rendered as
-  served; QRC-20/721 transfer rows carry logs-root inclusion proofs.
+- **Native QNC transaction history.** Rows from `/api/v1/account/{addr}/transactions`, and node
+  lifecycle rows from `/api/v1/account/{addr}/node-events`, are rendered as
+  served; QRC-20/721 transfer rows carry logs-root inclusion proofs. Up to 100 confirmed rows are
+  cached per wallet address and shown while a session's first fetch is in flight.
 - **WebSocket balance pushes.** A `BalanceUpdate` event addressed to this wallet is applied directly
   to the displayed balance. On the polled path the UI holds the last known balance and refuses to
   lower it from an unverified source.
@@ -200,16 +210,16 @@ Two signature wire formats come from the same native module:
 - The envelope `dilithium_sig_{node_id}_{base64}` for lifecycle, ping and claim messages, where the
   base64 payload is `[u32LE len(sig||msg)][sig||msg]` optionally followed by `[u32LE pk_len][pk]`.
 
-Canonical signed messages. Every transaction preimage carries the chain tag `q{chain_id}|`
-(`q1337|` on testnet); the reward-claim and ping-delegation messages are RPC authorisation
-messages, not transactions, and carry no tag:
+Canonical signed messages. Every transaction preimage and both reward-claim messages carry the
+chain tag `q{chain_id}|` (`q1337|` on testnet), since the same wallet key signs transfers; the ping
+delegation and the node-registration identity proof carry no tag:
 
 | Operation | Message |
 | --- | --- |
 | Native transfer | `q{chain_id}\|transfer:{from}:{to}:{amount}:{nonce}:{gas_price}:{gas_limit}` |
-| Contract call | `q{chain_id}\|contract_call:{from}:{sha3_256_hex(dataStr)}:{nonce}`, `dataStr` being JSON with keys ordered `args, contract, method` |
-| Reward claim, step 1 (node ownership) | `claim_rewards:{node_id}:{wallet}` |
-| Reward claim, step 2 (batch) | `qnet_claim_v1:{wallet}:{claim_timestamp}:{sha3_256(claims_data)}` |
+| Contract call | `q{chain_id}\|contract_call:{from}:{sha3_256_hex(dataStr)}:{nonce}:{gas_price}:{gas_limit}`, `dataStr` being JSON with keys ordered `args, contract, method` |
+| Reward claim, step 1 (node ownership) | `q{chain_id}\|claim_rewards:{node_id}:{wallet}` |
+| Reward claim, step 2 (batch) | `q{chain_id}\|qnet_claim_v1:{wallet}:{claim_timestamp}:{sha3_256(claims_data)}` |
 | Node registration | `q{chain_id}\|client_node_reg:{node_id}:{wallet}:{registration_proof}:{timestamp}` |
 | Node-registration identity proof | `{wallet}` |
 | Ping delegation | `delegate_ping:{ping_pubkey}:{node_id}` |
@@ -221,7 +231,10 @@ it is the sole gossip authenticator, mirroring the check every peer node applies
 `client_node_reg` message above then authorises the on-chain registration transaction built from that
 response.
 
-Transfers default to `gas_price = 10` nanoQNC per gas and `gas_limit = 10000`. Amounts and token ids
+Transfers default to `gas_price = 10` nanoQNC per gas and `gas_limit = 10000`; every wallet TX is ML-DSA-65
+signed, so the chain charges 1.5 × the gas price and a native transfer costs 150 000 nanoQNC (0.00015 QNC).
+A QRC-20 call sets `gas_limit` to its intrinsic gas (100 000 plus 5 per calldata byte, about 0.0015 QNC) and
+the sender's QNC must also cover a refundable 0.01 QNC deposit when the recipient holds none of the token. Amounts and token ids
 are normalised to decimal strings so full u64 values survive the signed digest, and balances are
 re-extracted as exact decimal strings from the raw response text because `JSON.parse` loses precision
 above 2^53. A send is reported successful only on an affirmative `tx_hash` or `success === true`; an
@@ -238,7 +251,7 @@ QRC-721 mint, transfer, approve, transferFrom; plus `deployToken` and `deployNft
 ## Reward claims
 
 Claiming is two-step, and each step carries its own wallet-key ML-DSA-65 signature: step 1 proves
-node ownership over `claim_rewards:{node_id}:{wallet}`, step 2 signs the quoted batch. The node quotes
+node ownership over `q{chain_id}|claim_rewards:{node_id}:{wallet}`, step 2 signs the quoted batch. The node quotes
 a batch; the client then:
 
 - rejects a quote whose epochs are not strictly ascending above the reported watermark;
@@ -249,6 +262,10 @@ a batch; the client then:
   server-supplied string would let any node in the hedged pool obtain a transfer signature.
 
 The minimum claim is 1,000,000,000 nanoQNC (1 QNC). See [economics](../economics/overview.md).
+Pending rewards stay out of the balance until a claim lands, and the node tab says so under the
+Pending Rewards row once they reach that minimum. The success dialog shows the amount of the batch
+actually submitted and, when the quote stopped early, the epoch it stopped at, to claim again after
+the batch is credited.
 
 ## Node activation from the app
 
@@ -267,29 +284,63 @@ Operating parameters:
   [running a node](../operators/running-a-node.md).
 - The Light node pseudonym is `light_mobile_{first 16 hex of blake3("LIGHT_NODE_PRIVACY_{wallet}")}`
   and carries no region.
+- An HTTP error or no answer from `/api/v1/verify-activation`, or `verified: false` with
+  `authoritative: false` — which a node sends while its height is below the network height it sees —
+  counts as unknown and leaves the stored activation as it is. A negative the answering node can vouch
+  for marks an activation saved without a Solana burn as unconfirmed and keeps the record.
 - On-chain registration is submitted to a single node, because the server builds and hashes the
-  transaction. A failure is persisted per wallet and retried on later unlocks with exponential
-  backoff, giving up after 12 attempts; an "already registered" rejection is treated as success.
+  transaction. The attempt stays persisted per wallet until `/light-node/status` reports
+  `onchain_registered`: mempool admission only records the TX hash and holds a resubmit back for
+  10 minutes while still counting toward the backoff, and an "already registered" rejection also clears it. A rejected or timed-out submit is
+  retried on unlock, on return to the foreground and from the light status poll, with exponential
+  backoff; the 12-attempt limit applies only while status cannot confirm the node is absent. Until the
+  registration lands, the node tab shows it as pending on chain and not earning, with a Retry
+  registration button that re-runs activation from the stored activation code. Submits run one at
+  a time, and one inside the 10-minute hold yields to the admitted TX instead of replacing it.
 
 ## Liveness: pings and self-attestation
 
-Push provider selection degrades in order: UnifiedPush, then FCM, then a BackgroundFetch polling
-fallback configured with a 240-minute minimum interval, `stopOnTerminate = false`, `startOnBoot = true`
-and headless mode enabled. The FCM background handler is registered at top level in `index.js` so
-pushes to a killed app are not lost.
+Push provider selection degrades in order: UnifiedPush, then FCM, then polling. Every provider also
+gets a periodic BackgroundFetch wake with a 30-minute minimum interval. On Android it survives the app
+being closed and the phone restarting (`stopOnTerminate = false`, `startOnBoot = true`, headless mode),
+and polling adds a precise one-shot wake about 2 minutes before the ping slot. On iOS the wake is a
+`BGAppRefreshTask` (`com.transistorsoft.fetch`, declared in `Info.plist` and handed to the library in
+`AppDelegate`): the system picks the time, never sooner than that minimum, never wakes an app the user
+force-quit, and offers no precise one-shot wake. When Background App Refresh is off for the app, the node
+tab says the node is proven only while the app is open; the setting is read again whenever the app returns. The FCM background handler and the
+BackgroundFetch headless task (Android) are registered at top level in `index.js`, so pushes and wakes
+that reach a killed app are not lost. Opening the app and returning to it are wakes too. A refreshed FCM
+token is sent to the node's shard owners in rank order, and to a random node only if every owner fails.
 
 Two paths prove liveness:
 
 - **Push challenge.** The node pushes a challenge; the app signs it with the keychain-held delegation
-  key and POSTs `node_id`, the challenge, the `ping_dilithium:`-prefixed signature, the ping public
-  key and the delegation certificate as a JSON body to `/api/v1/light-node/ping-response`. The route
+  key and POSTs a JSON body to `/api/v1/light-node/ping-response` carrying `node_id`, the challenge,
+  the `ping_dilithium:`-prefixed signature, the ping public key, the delegation certificate and the
+  wallet public key as `identity_pubkey`. The chain holds only a hash of a light node's identity key,
+  so the node admits the presented key only when it hashes to that commitment (or, on a registration
+  row without one, derives the registered wallet address) and verifies the delegation under it. The route
   takes POST with a 64 KB body limit because each enveloped ML-DSA-65 signature embeds its own
   message, so the response is far larger than a query string will carry. If the keychain is
-  unavailable the ping window is missed and retried in the next window.
+  unavailable the ping window is missed and retried in the next window. The answer is capped at 8
+  seconds, counted after the key read and the signing. A refused or late answer, such as one to an
+  expired challenge, falls back to a pull self-attestation.
 - **Pull self-attestation.** On any wakeup the app builds the challenge `selfattest:{height-2}:{hash}`
   from the `previous_hash` of block `height-1`, deduplicated per 14,400-block epoch, and submits it
-  through the same ping-response endpoint. This proves same-epoch liveness without depending on push
-  delivery. It is skipped only on a definitive `onChainRegistered === false`.
+  through the same ping-response endpoint to the node's three shard owners in rank order (the genesis
+  node at index `u64_le(blake3(node_id)[0..8]) mod 5` and the next two around the ring, derived on the
+  device as the chain derives them), then to the node that answered the height read if none of them
+  accepts it. This proves same-epoch liveness without depending on push
+  delivery. Apart from the hold below, it is skipped only on a definitive `onChainRegistered === false`.
+  After a self-attestation, or a wake that finds the epoch already attested, the app sends nothing until
+  the epoch can have ended (from block 1,339,200, where blocks are never stamped ahead of the clock), for
+  at most 2 hours; a failed attempt backs off from 30 minutes, doubling, to 2 hours. A pushed ping that
+  was answered sets no hold, so the next wake still runs one self-attestation round for the epoch.
+  Each wake sets one deadline for everything it sends, 25 seconds for a background fetch and 22 for a
+  push, inside the roughly 30 and 25 seconds iOS gives them; a self-attestation round also stays within
+  20 seconds, each request capped at 6, and wakes that arrive together share one round per node. Every ping answer (a self-attest round, a
+  pushed or a polled challenge) goes out one at a time per node, each within its caller's own deadline, and a
+  forced round runs again only behind a round that did not attest.
 
 Either path counts the same: **one** recorded attestation makes the node eligible for that epoch's
 reward bitmap. The two paths also carry different guarantees over a long absence. The node that owns
@@ -297,8 +348,9 @@ the device's shard wakes it while it has attested within the last 3 epochs, or w
 same span from registration. Past that span the shard owner stops waking it, and pull self-attestation
 is what brings it back: the first wakeup after a long offline stretch attests for the current epoch and
 restores the device to the wake roster. A device that fails 5 consecutive pings, or whose registration
-is marked inactive, likewise returns through self-attestation. Keeping the BackgroundFetch fallback
-enabled is therefore what makes a device that misses pushes still earn. See
+is marked inactive, likewise returns through self-attestation. The periodic wake is therefore what
+makes a device that misses pushes still earn; an iPhone the user force-quit, or one with Background App
+Refresh off for the app, is proven only when it is opened. See
 [economics](../economics/overview.md).
 
 ## Platforms and build
@@ -318,7 +370,8 @@ enabled is therefore what makes a device that misses pushes still earn. See
   properties are never committed. An F-Droid reproducible-build metadata file points at the `android`
   subdirectory.
 - Cross-language jest pins assert that the JavaScript registry-root fold and the SMT account-proof
-  fold reproduce roots emitted by the Rust node, importing the shipped modules rather than copies.
+  fold reproduce roots emitted by the Rust node, and that the shard-owner derivation matches shards
+  the node's `light_shard_of` produced, importing the shipped modules rather than copies.
 
 ## Related documents
 

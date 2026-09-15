@@ -2,33 +2,6 @@
 
 use super::*;
 
-/// The height an operator asked the node to trim back to: a real height strictly below the tip, and
-/// never genesis (which would delete the chain). Anything else is ignored and logged.
-pub(crate) fn trim_target(raw: &str, tip: u64) -> Option<u64> {
-    let target = raw.trim().parse::<u64>().ok()?;
-    if target == 0 || target >= tip { return None; }
-    Some(target)
-}
-
-#[cfg(test)]
-mod trim_tests {
-    use super::trim_target;
-
-    // The lever deletes history, so it acts only on an unambiguous height below the tip.
-    #[test]
-    fn the_trim_target_is_a_height_below_the_tip() {
-        assert_eq!(trim_target("540810", 540870), Some(540810));
-        assert_eq!(trim_target(" 540810 ", 540870), Some(540810));
-        assert_eq!(trim_target("540870", 540870), None, "not below the tip");
-        assert_eq!(trim_target("540900", 540870), None, "above the tip");
-        assert_eq!(trim_target("0", 540870), None, "genesis is not a trim target");
-        assert_eq!(trim_target("", 540870), None);
-        assert_eq!(trim_target("latest", 540870), None);
-        assert_eq!(trim_target("-5", 540870), None);
-        assert_eq!(trim_target("540810", 0), None, "nothing stored yet");
-    }
-}
-
 /// Window whose heartbeat this node last withheld (log once per window).
 static HB_WITHHELD_WINDOW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -499,26 +472,6 @@ impl BlockchainNode {
                     }
                 }
                 
-                // Operator lever for a fleet that forked with no branch holding a quorum: trim the
-                // chain back to a height every node agrees on and rejoin from there. Consensus cannot
-                // resolve that state by itself — no branch can be certified — and the node's own
-                // recovery paths deliberately never delete history a peer still builds on. Runs before
-                // the state replay below, so the replay rebuilds state at the new tip. One-shot: the
-                // variable must be removed before the next start, or the node trims again.
-                if let Ok(v) = std::env::var("QNET_TRIM_TO_HEIGHT") {
-                    let tip = storage_arc.get_chain_height().unwrap_or(0);
-                    match trim_target(&v, tip) {
-                        Some(target) => match storage_arc.delete_microblocks_range(target + 1, tip) {
-                            Ok(n) => {
-                                let _ = storage_arc.set_chain_height(target);
-                                println!("[WARN][NODE] operator_trim target={} was={} deleted={} — rejoining from the network", target, tip, n);
-                            }
-                            Err(e) => println!("[ERR][NODE] operator_trim_failed target={} err={}", target, e),
-                        },
-                        None => println!("[WARN][NODE] trim_ignored value={} tip={}", v.trim(), tip),
-                    }
-                }
-
                 // v10.2: HASH INDEX MIGRATION — build O(1) prev_hash lookup index.
                 // Enables prev_hash validation without loading full block body.
                 // Migration is idempotent (flag in metadata CF) and runs once.
@@ -634,6 +587,16 @@ impl BlockchainNode {
                 tick.tick().await; // skip immediate first tick
                 loop {
                     tick.tick().await;
+                    // A wholesale replacement is under way: its rows would be refused anyway.
+                    if crate::storage::SNAPSHOT_REHYDRATE_IN_PROGRESS.load(std::sync::atomic::Ordering::Acquire) {
+                        continue;
+                    }
+                    // Rows a failed mirror write left behind are rewritten here, off the apply path.
+                    if let Some(s) = crate::node::try_get_storage() {
+                        if s.mirror_stale() && !s.heal_mirror(&state_evict).await {
+                            println!("[WARN][STORAGE] account_mirror_still_stale action=retry_next_sweep");
+                        }
+                    }
                     let sg = state_evict.read().await;
                     let before = sg.cache_size();
                     let cap = sg.cache_capacity_value();
@@ -663,6 +626,10 @@ impl BlockchainNode {
         // rest. This is how a stalled fleet is brought back onto one branch without discarding the
         // ledger: everything above the last sealed macroblock was never final, so dropping it takes
         // away nothing the protocol promised to keep.
+        // Every snapshot lookup and prune below reads the snapshot index, so it exists before the first one.
+        if let Err(e) = storage.ensure_snapshot_index() {
+            println!("[WARN][SNAPSHOT] snapshot_index_build_failed err={}", e);
+        }
         Self::apply_boot_rollback(&storage).await;
 
         // ═══════════════════════════════════════════════════════════════════
@@ -806,6 +773,17 @@ impl BlockchainNode {
         }
         }
 
+        // The dedup maps start where the restored state stands, as a from-genesis node holds them there, so
+        // the tail replay refuses and journals exactly what peers did. Empty, a replayed duplicate
+        // registration journaled "absent", and an undo through it later dropped a node whose row survives.
+        if restored_snapshot_height > 0 {
+            // A failed reseed wipes the state: rebuild from block 0, or latch suspect where bodies are pruned.
+            let reseeded = { let sg = state.write().await; storage.reseed_commitment_dedup(&*sg) };
+            if reseeded.is_err() {
+                restored_snapshot_height = 0;
+            }
+        }
+
         // ═══════════════════════════════════════════════════════════════════
         // v5.1: GUARANTEED STATE REPLAY
         // TIER 2: If snapshot loaded partially → replay from snapshot to tip
@@ -944,6 +922,10 @@ impl BlockchainNode {
                     { state.write().await.chain_state.write().height = h; }
                     if let Err(e) = storage.set_chain_height(h) {
                         eprintln!("[ERR][STATE] replay_stop_set_height_failed h={} err={}", h, e);
+                    }
+                    // No frame outlives the tip it describes.
+                    if let Err(e) = storage.prune_snapshots_above(h) {
+                        println!("[WARN][STATE] snapshot_prune_fail to={} err={}", h, e);
                     }
                     println!("[WARN][STATE] replay_stopped_short h={} tip_was={} action=suspect_resync", h, replay_end);
                     crate::block_pipeline::mark_state_suspect();
@@ -1183,9 +1165,18 @@ impl BlockchainNode {
                     // we use its `gas_price`; otherwise we admit at 0 (system
                     // priority will be re-derived inside add_binary_transaction
                     // via `is_system_tx()` parsing).
-                    let gas_price = bincode::deserialize::<qnet_state::Transaction>(&payload)
-                        .map(|tx| tx.gas_price)
-                        .unwrap_or(0);
+                    let decoded = bincode::deserialize::<qnet_state::Transaction>(&payload).ok();
+                    // A commitment the state already holds is not brought back.
+                    if let (Some(tx), Some(st)) = (decoded.as_ref(), crate::node::try_get_state()) {
+                        if let Some(k) = tx.commitment_dedup_key() {
+                            if crate::node::commitment_backed_by_state(&*st.blocking_read(), &k) {
+                                let _ = storage_load.delete_pending_tx(&tx_hash);
+                                expired += 1;
+                                continue;
+                            }
+                        }
+                    }
+                    let gas_price = decoded.map(|tx| tx.gas_price).unwrap_or(0);
                     // Rehydrated admit keeps the ORIGINAL admission age (RAM clock
                     // back-dated, disk ts restored) — the plain path re-stamped both
                     // with `now`, granting survivors a fresh TTL on every restart.
@@ -2043,19 +2034,6 @@ impl BlockchainNode {
             if poisoned > 0 {
                 println!("[WARN][NODE] poisoned_macroblocks_dropped_at_boot n={} sealed_mb={}",
                          poisoned, blockchain.storage.last_sealed_mb_index());
-            }
-            // The commitment-dedup maps are derived from block history, and a snapshot restore
-            // rebuilds the chain view without them: a restarted node would hold dedup entries only
-            // for the blocks it replayed, so a duplicate NodeRegistration naming an already-known
-            // node_id is admitted here and rejected by from-genesis peers — the block still applies
-            // everywhere (a registration has no account effect, so state_root matches) while only
-            // this node rewrites the registry row and its registry_root delta. Reseeded from the
-            // durable registry AFTER the prune above, which drops rows above the tip.
-            {
-                let sg = blockchain.state.read().await;
-                if let Err(e) = blockchain.storage.reseed_commitment_dedup(&*sg) {
-                    println!("[WARN][NODE] commitment_dedup_reseed_boot err={:?}", e);
-                }
             }
             // FIX-5: dilithium_pk_root LtHash (metadata CF, not snapshot-carried) — recompute the pk
             // accumulator + count-markers so a restarted / crash-recovered node is byte-identical to a
@@ -3709,6 +3687,12 @@ impl BlockchainNode {
                             .map(|a| a.heartbeat_epoch == hb_epoch
                                   && (a.heartbeat_slots & (1u16 << hb_subwindow.min(9))) != 0)
                             .unwrap_or(false);
+                        // The in-memory state is the authority after a rewind; the stored row may lag it.
+                        let included = included || match crate::node::try_get_state() {
+                            Some(st) => crate::node::commitment_backed_by_state(&*st.read().await,
+                                &(node_id.clone(), hb_epoch * 10 + hb_subwindow as u64, 7)),
+                            None => false,
+                        };
                         let first = !matches!(last_hb_emit, Some((e, s, _)) if e == hb_epoch && s == hb_subwindow);
                         let reanchor = matches!(last_hb_emit, Some((_, _, h)) if current_height.saturating_sub(h) >= HB_REEMIT_INTERVAL);
                         if !included && (first || reanchor) {
@@ -3807,9 +3791,13 @@ impl BlockchainNode {
                         let committed_shards = crate::node::try_get_storage()
                             .and_then(|s| s.load_light_bitmaps(current_epoch).ok())
                             .unwrap_or_default();
+                        // Rank 0 holds one shard, its own, so this is the only row it waits for.
+                        let own_row = crate::node::try_get_storage()
+                            .map_or(false, |s| s.has_light_bitmap_from(current_epoch, my_idx, my_idx));
                         let target_shard = match (0..5usize)
-                            .filter(|sh| !committed_shards.contains_key(sh))
                             .filter_map(|sh| crate::node::light_owner_rank(sh, my_idx).map(|r| (sh, r)))
+                            .filter(|(sh, rank)| !crate::node::light_owner_stands_down(
+                                *rank, own_row, committed_shards.contains_key(sh)))
                             .filter(|(_, rank)| backups_active || *rank == 0)
                             .filter(|(_, rank)| blocks_until_epoch_end <= owner_deadline[*rank])
                             // A shard with nothing left to try must not hold the slot. Its own
@@ -4001,7 +3989,11 @@ impl BlockchainNode {
                                                     }
                                                 }
 
-                                                if mempool.add_binary_transaction(tx_bytes, tx.hash.clone(), gas_price) {
+                                                let held = match crate::node::try_get_state() {
+                                                    Some(st) => crate::node::refuse_held_commitment(st, &tx).await.is_err(),
+                                                    None => false,
+                                                };
+                                                if !held && mempool.add_binary_transaction(tx_bytes, tx.hash.clone(), gas_price) {
                                                     let tx_hash_clone = tx.hash.clone();
                                                     if let Some(mut existing) = bitmap_tracker.get_mut(&track_key) {
                                                         existing.increment_retry();

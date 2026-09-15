@@ -76,7 +76,8 @@ cent for an ML-DSA-65-signed transaction (`effective_gas_price`).
 `MAX_LOG_DATA_BYTES`, the frame traps. Fuel exhaustion is a deterministic trap.
 
 **Settlement.** The sender prepays `gas_limit * effective_gas_price`. At heights at or above
-`GAS_METERING_ACTIVATION_HEIGHT` (100000), `apply_gas_refund` credits back
+`GAS_METERING_ACTIVATION_HEIGHT` (100000), the activation height of the `gas_metering` feature gate,
+`apply_gas_refund` credits back
 `compute_gas_refund() - wasm_fuel_fee(fuel)`, i.e. the unused intrinsic gas minus the metered compute
 fee `fuel * effective_gas_price`. The producer's fee credit adds exactly the same compute fee, so the
 charge is a symmetric account move and total supply is unchanged. Fuel is billed even when the call
@@ -84,8 +85,15 @@ tree traps, because the work was performed. `reserved_fuel()` is non-zero only f
 
 **Block ceilings.** Every validator independently sums, from signed fields alone and without
 executing anything, the charged gas and the reserved fuel of a proposed block, and rejects the block
-if either exceeds `BLOCK_GAS_LIMIT` (10000000000) or `BLOCK_FUEL_LIMIT` (50000000). This check runs
-from genesis in `development/qnet-integration/src/block_pipeline.rs`.
+if either exceeds `BLOCK_GAS_LIMIT` (200000000) or `BLOCK_FUEL_LIMIT` (50000000). Charged gas is
+`compute_gas_used()` at heights at or above `GAS_METERING_ACTIVATION_HEIGHT` and `gas_limit` below it;
+transactions from `system_` senders or with `gas_limit` 0 are not counted. This check runs from genesis
+in `development/qnet-integration/src/block_pipeline.rs`. The producer counts the same way while filling
+and ends the block before the first transaction that would take its charged gas past
+`BLOCK_FILL_SOFT_GAS` (130000000) or its reserved fuel past `BLOCK_FUEL_LIMIT`, leaving that transaction
+and the ones after it in the mempool. `BLOCK_FILL_SOFT_GAS` is a producer-local target;
+`QNET_BLOCK_FILL_GAS` overrides it, clamped to the range 10000000 to `BLOCK_GAS_LIMIT`. Validators accept
+blocks up to the consensus limits.
 
 ## Host ABI
 
@@ -101,8 +109,8 @@ Available in every execution context:
 | `storage_write` | `(key_ptr, key_len, val_ptr, val_len)` | writes into this contract's overlay; traps past `MAX_WRITES_PER_FRAME` |
 | `storage_read` | `(key_ptr, key_len, out_ptr, out_cap) -> i32` | returns `-1` when absent, otherwise the full value length; the value is truncated into `out_cap` bytes |
 | `get_caller` | `(out_ptr, out_cap) -> i32` | caller address bytes, returns the full length |
-| `get_block_height` | `() -> i64` | slot-anchored block height |
-| `get_value` | `() -> i64` | native QNC attached to the call, as context |
+| `get_block_height` | `() -> i64` | height of the block being applied; in a view, the serving node's current height |
+| `get_value` | `() -> i64` | the call's `value` context: 0 in the entry frame and in a view, since a `ContractCall` carries no native QNC; inside a callee, the `value` its caller passed to `call_contract` |
 | `emit_log` | `(data_ptr, data_len)` | appends an opaque event payload; charges fuel |
 | `revert` | `(msg_ptr, msg_len)` | always traps, carrying the message |
 
@@ -169,7 +177,7 @@ address, and the address the RPC returns equals the address apply derives. Deplo
 account at the derived address is already a smart contract, the deploy is rejected.
 
 Authorization is an ML-DSA-65 (Dilithium3) signature over the canonical message
-`q{chain_id}|contract_deploy:{from}:{code_hash}:{nonce}`, where `code_hash` is read from the
+`q{chain_id}|contract_deploy:{from}:{code_hash}:{nonce}:{gas_price}:{gas_limit}`, where `code_hash` is read from the
 transaction data and `q{chain_id}` is the chain tag (`q1337` on testnet).
 The signature and public key are carried as hex-encoded raw bytes. See
 [cryptography](../architecture/cryptography.md) for the signature scheme.
@@ -182,13 +190,22 @@ contract's own methods after deployment.
 | Form | Data JSON | Result at apply |
 | --- | --- | --- |
 | Executable WASM | `{"wasm": true, "code": "<hex>", "code_hash": "<hex>"}` | module validated, `type="wasm"`, `code=<hex>` stored |
-| QRC-20 | `{"qrc20": true, "name", "symbol", "decimals", "logo", "initial_supply", "code_hash"}` | native token contract materialised |
+| QRC-20 | `{"qrc20": true, "name", "symbol", "decimals", "logo", "initial_supply", "mintable", "burnable", "code_hash"}` | native token contract materialised |
 | QRC-721 | `{"qrc721": true, "name", "symbol", "code_hash"}` | native NFT collection materialised |
+
+Exactly one of `wasm`, `qrc20` and `qrc721` must be `true`, and `code_hash` must equal the canonical
+deploy digest that `deploy_code_hash` recomputes from the payload. For WASM it is `sha3_256` of the
+module bytes. For a token it is `sha3_256` over the tag `QRC20|` or `QRC721|` followed by each field
+fed as `{byte_len}:{value}` of its string form, in the order `name`, `symbol`, `decimals`,
+`initial_supply`, `mintable`, `burnable`, `logo` for QRC-20 and `name`, `symbol` for QRC-721; an absent
+field is fed as the default the apply arm reads (`decimals` 9, `initial_supply` 0, flags `false`,
+strings empty). `classify_contract_deploy` enforces both rules at admission and again at apply, so
+neither the code nor a token field can be swapped under a signature that still verifies.
 
 ## Calling a contract
 
 A `ContractCall` transaction's `data` is the exact calldata bound by the signature: authorization is
-an ML-DSA-65 signature over `q{chain_id}|contract_call:{from}:{sha3(raw tx.data)}:{nonce}`, so the literal
+an ML-DSA-65 signature over `q{chain_id}|contract_call:{from}:{sha3(raw tx.data)}:{nonce}:{gas_price}:{gas_limit}`, so the literal
 calldata bytes are committed and no re-serialisation can diverge. The public key may be omitted once
 it is committed on-chain; the submit path rehydrates it.
 
@@ -197,13 +214,19 @@ Dispatch depends on the target account's `contract_storage["type"]`:
 - `qrc20` and `qrc721` run the native apply arms described below.
 - `wasm` runs the VM. The entry point name comes from `data.method`, defaulting to `"run"`. Arguments
   are supplied as `args`, a JSON string of hex, and are hex-decoded into the bytes the contract reads
-  through `get_call_args`. `accessList`, if present, declares the reachable contract set.
+  through `get_call_args`. `accessList`, if present, declares the reachable contract set. Each field
+  decodes fail-closed: a non-string `method`, an `args` value that is not a hex string, or an
+  `accessList` that is not an array of strings or holds more than `MAX_WASM_ACCESS_LIST` entries
+  rejects the transaction.
 
 Commit rules for a WASM call: the per-contract storage deltas are written into
 `Account.contract_storage` only when the call tree did not trap and no touched contract would exceed
 `MAX_CONTRACT_STORAGE_ENTRIES`. On a trap or a cap breach nothing is committed, the fee is consumed
-and the nonce advances, and any `msg.value` credited to the target before execution is returned to the
-sender.
+and the nonce advances.
+
+A `ContractCall`'s `amount` must be 0: `check_contract_call_value` rejects a non-zero `amount` at
+admission and again at apply, before any state change. The host ABI moves contract storage, return
+bytes and events only, so native QNC credited to a contract address would stay there.
 
 ### Endpoints
 
@@ -212,6 +235,7 @@ Full request and response shapes are in the [RPC API reference](rpc-api.md).
 | Method and path | Purpose |
 | --- | --- |
 | `POST /api/v1/wasm/deploy` | deploy executable WASM (`from`, hex `code`, `nonce`, signature, public key); 1 MiB body limit; validates the module before submitting |
+| `POST /api/v1/contract/deploy` | deploy executable WASM from base64 `code` (`from`, `gas_limit` 50000 to 1000000, `gas_price`, `nonce`, empty `constructor_args`, signature, public key); 2 MiB body limit; validates the module and submits the executable-WASM deploy data above |
 | `POST /api/v1/token/deploy` | deploy a QRC-20 token |
 | `POST /api/v1/nft/deploy` | deploy a QRC-721 collection |
 | `POST /api/v1/contract/call` | state-changing call (signature required) or, with `is_view: true`, a read-only query |
@@ -273,11 +297,14 @@ map.
 
 ## Event logs
 
-Both `emit_log` from WASM and the native token arms feed one thread-local per-block log sink. The sink
-is drained per block, which is sound because block application is sequential; the producer's inline
-apply path and the validator apply path bracket it identically (`clear_wasm_logs` /
-`drain_wasm_logs`), and a rejected transaction's partial emissions are truncated back to a pre-apply
-mark so only successful transactions contribute.
+Both `emit_log` from WASM and the native token arms feed one thread-local log sink. A thread-local sink
+is sound because a block that carries any contract transaction applies its transactions one at a time;
+only a block of 32 or more transactions that are all transfers takes the parallel apply path, and
+transfers emit no events. The validator apply path clears the sink at block start (`clear_wasm_logs`),
+truncates a rejected transaction's partial emissions back to a pre-apply mark, and drains it at block
+end (`drain_wasm_logs`); the producer's inline apply path clears it before each transaction and drains
+it after each successful one. Both paths therefore commit the events of successful transactions only,
+in apply order.
 
 The commitment is two levels of Merkle tree with distinct domain separators, so a block sub-root can
 never be reinterpreted as a leaf:
@@ -303,7 +330,8 @@ Per-block logs are persisted under `blocklogs_{height}` and the per-block sub-ro
 `GET /api/v1/logs/proof` report that floor rather than return a partial, non-matching leaf set, and
 the proof endpoint serves windows that are already finalized.
 
-Log payloads are opaque bytes; the log query endpoint filters by contract address and height range.
+Log payloads are opaque bytes; the log query endpoint filters by contract address and height range,
+clamping `to` to the chain tip and to `from` + `MAX_LOG_RANGE` (500).
 The native token arms emit a structured, sorted-key JSON payload tagged `t:"xfer"`, which is what the
 decoded transfer feeds index.
 
@@ -319,8 +347,9 @@ sanitised `logo`, `mintable`, `burnable`, `total_supply`, and the lifetime count
 (seeded at the initial supply) and `total_burned` (seeded at 0), which keep the invariant
 `total_supply == total_minted - total_burned`. A non-zero initial supply also materialises
 `balance:{deployer}` and charges its storage deposit. `mintable` and `burnable` both default to
-`false`, so tokens deployed through `POST /api/v1/token/deploy` are fixed-supply. The signed
-`code_hash` for that endpoint is `sha3_256("QRC20:" + name + ":" + symbol)`.
+`false`, and `mint` and `burn` are rejected unless the deploy set the matching flag to `true`;
+`POST /api/v1/token/deploy` accepts both as optional booleans. The signed `code_hash` is the canonical
+deploy digest over `name`, `symbol`, `decimals`, `initial_supply`, `mintable`, `burnable` and `logo`.
 
 Methods: `transfer`, `approve`, `transferFrom` (also `transfer_from`), `mint`, `burn`. An unknown
 method is rejected, so a typo cannot silently succeed after the fee was charged.
@@ -339,7 +368,7 @@ Two behaviours worth knowing:
 ### QRC-721
 
 Deploy stores the base `deployer` and `deployed_at` metadata plus `type`, `name` and `symbol`; the
-signed `code_hash` for `POST /api/v1/nft/deploy` is `sha3_256("QRC721:" + name + ":" + symbol)`.
+signed `code_hash` is the canonical deploy digest over `name` and `symbol`.
 Methods: `mint`, `transfer`, `approve`, `transferFrom` (also `transfer_from`); an unknown method is
 rejected. Minting is gated to the recorded deployer, and an absent deployer entry rejects rather than
 mints.

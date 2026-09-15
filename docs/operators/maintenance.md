@@ -13,7 +13,7 @@ All monitoring endpoints are served by the node's single HTTP server on `QNET_AP
 
 | Endpoint | Use it for | Notes |
 |---|---|---|
-| `GET /healthz` | container liveness probe | Returns `ok h={height}` from a single atomic load and takes no lock. This is the probe to wire into the container runtime; `GET /health` returns a bare `OK`. |
+| `GET /healthz` | container liveness probe | Returns `ok h={height} build={build}` from a single atomic load and takes no lock; `build` is the image's `QNET_BUILD_ID`. This is the probe to wire into the container runtime; `GET /health` returns a bare `OK`. |
 | `GET /api/v1/node/health` | the main dashboard record | Rich, but touches blockchain, P2P and mempool state; do not use it as a liveness probe. |
 | `GET /api/v1/sync/status` | catch-up progress | `local_height`, `network_height`, `is_syncing`, `is_ahead`, `blocks_behind`, `blocks_ahead`, `sync_progress`, `estimated_sync_time`. |
 | `GET /api/v1/debug/consensus-position` | finality health | See below — the most useful endpoint during an incident. |
@@ -26,8 +26,8 @@ All monitoring endpoints are served by the node's single HTTP server on `QNET_AP
 | `GET /api/v1/reputation/history?node_id=` | reputation | `current_reputation` is read from the latest macroblock snapshot, so every node reports the same value. |
 
 `GET /api/v1/node/health` reports `status` as one of `healthy`, `isolated` (zero peers), `syncing`, `degraded` (fewer
-than four validated peers on a non-genesis node), `checking` (peers present but network height undeterminable) or
-`bootstrap`. Alongside the obvious counters it carries the runtime consensus and clock observability fields:
+than four validated peers on a non-genesis node), `checking` (peers present but network height undeterminable).
+A genesis node with no network-height reading reports `sync_status` `bootstrap` and `status` `healthy`. Alongside the obvious counters it carries the runtime consensus and clock observability fields:
 `clock_drift_ema_secs`, `clock_drift_peak_secs`, `current_timeout_round` (0 in steady state, above 0 during BFT
 failover), `max_slot_delay_secs`, `max_timeout_round_seen`, `failover_count` and `timestamp_rejections`.
 
@@ -81,7 +81,7 @@ Lines worth alerting on directly:
 | `[FATAL][RESTART] malformed_manifest` | the release's restart manifest failed its well-formedness check; the node refuses to start |
 | `[CRIT][NODE] identity_anchor_mismatch` | the derived identity key does not match this node's chain anchor; startup is aborted |
 | `[FATAL][GEN] WS restart pin active … refusing to mint` | a restart pin is set but the local chain is empty; the node halts rather than minting a fresh genesis |
-| `[CRIT][MEMORY] … OOM_IMMINENT graceful_shutdown` | memory ceiling hit; the node flushes and exits 137 for the supervisor to restart |
+| `[CRIT][MEMORY] … OOM_IMMINENT graceful_shutdown` | memory stayed above the fatal threshold 30 s after an emergency cleanup; the node flushes and exits 137 for the supervisor to restart |
 | `[CRIT][STORAGE] … state=critically_full action=admin_required` | the internal storage budget is at or above 95 % |
 | `[WARN][MONITOR] no_peers_connected` | emitted by the 30-second monitor loop |
 | `[INFO][HALT] Reached halt_height=…` | coordinated-upgrade stop reached |
@@ -89,6 +89,8 @@ Lines worth alerting on directly:
 | `[CRIT][FAILOVER] … action=self_restart` | the stuck-height watchdog is spending one of its three restart attempts |
 | `[CRIT][FAILOVER] … action=stay_up_degraded reason=restart_budget_exhausted` | the restart budget is spent; the node stays up and keeps syncing, and the cause is structural |
 | `[CRIT][WATCHDOG] chain_stuck …` | the chain-stuck watchdog fired; alert only, the process keeps running |
+| `[CRIT][WATCHDOG] chain_halted …` | the best height known to this node, its own or the network's, has not moved for 300 s — the whole network is stopped; alert only |
+| `[CRIT][WATCHDOG] runtime_stalled …` | the async runtime missed its heartbeat for 2 s or more; logged once per stall from a separate OS thread with tokio's worker, task and queue counts and RocksDB's write-stop, compaction, flush, memtable and L0 state, which `[WARN][PIPELINE] slow_storage_write` also carries; `runtime_recovered` closes the episode |
 | `[INFO][ARCHIVE] compliance_check_start` / `compliance_stats` | the four-hourly archive-replication report; informational, actual retention is governed by the pruning rules below |
 
 Three of these describe how a node handles its own failure. The **error ladder** counts consecutive
@@ -108,16 +110,20 @@ alert per stuck window. An operator decision, not a restart, is the intended res
 
 A Super node is archival by design: it keeps macroblocks, block hashes, snapshots and full account state for the whole
 chain, while Light nodes store no chain data at all. Storage is RocksDB across 30 column families with `use_fsync`
-enabled, WAL capped at 64 MB, RocksDB's own LOG files bounded to 64 MB × 10, one shared 512 MB LRU block cache, and
-Lz4 compression at most levels with Zstd at the bottommost level and for cold families. The node prunes on two
+enabled, WAL capped at 512 MB, memtables capped at 1 GB in total with up to four per family, RocksDB's own LOG files
+bounded to 64 MB × 10, one shared 512 MB LRU block cache, and Lz4 compression with Zstd for the cold `blocks` and
+`snapshots` families. The node prunes on two
 independent schedules and never deletes chain history to free space:
 
 - **Hourly maintenance pass** (`PRUNE_RUNS_PER_HOUR = 1`): ping history and attestations by timestamp; consensus
   rounds down to the last 1000; failover events on a 24-hour cutoff; snapshots down to the newest
-  `SNAPSHOT_KEEP_COUNT = 3`; and transactions, `tx_index` and `tx_by_address` below
+  `SNAPSHOT_KEEP_COUNT = 3` plus the height-90 anchor (the same rule also runs after every frame is written); and transactions, `tx_index` and `tx_by_address` below
   `current_height − TX_INDEX_RETENTION_BLOCKS (100,000)`. Each index sweep resumes from a persisted cursor under a
   per-run row budget, so retention catches up across runs rather than in one pass. Compaction afterwards is selective:
-  only column families that shed at least `COMPACT_MIN_ROWS = 1000` rows are compacted. Independently of this pass,
+  only column families that shed at least `COMPACT_MIN_ROWS = 1000` rows are compacted. The pass also strips the
+  committee signatures from every macroblock at least `QC_SIG_RETENTION_MB = 14,880` windows below the tip's window,
+  keeping its checkpoint, signer list and `sig_merkle_root`; it resumes from a persisted cursor and rewrites at most
+  512 macroblocks per run. Independently of this pass,
   every failover-event write trims the family to the newest 10,000 rows.
 - **Microblock-body prune** at every 14,400-block boundary, on the apply path of *every* Super node, not only the
   producer. Bodies older than `MICROBLOCK_BODY_RETENTION_BLOCKS = 6 × 14,400 = 86,400` blocks are deleted along with
@@ -140,12 +146,16 @@ default 2000 GB for a Super node. That is a configured budget, not the filesyste
 compaction; chain data is kept. So: set `QNET_DATA_DIR` explicitly, set `QNET_MAX_STORAGE_GB` near the real volume
 size, and monitor actual free space externally with `df` regardless.
 
-Memory is sampled every 300 seconds, logging RSS, virtual size, the delta since the last sample and the sizes of the
-major in-process structures. The limit is derived automatically — the cgroup memory limit at 85 % if visible,
-otherwise 70 % of `MemAvailable` with a 2000 MB floor and a ceiling of 80 % of total RAM — and the thresholds are fixed
-fractions of it: 60 % warn, 75 % emergency (clears both sync queues and the producer cache, forces a transaction-pool
-cleanup, flushes RocksDB), 90 % fatal (final flush, then `exit(137)`). A Super node below 4 GB of RAM logs
-`[CRIT][MEMORY] INSUFFICIENT_RAM` at startup.
+Memory is sampled every 300 seconds, logging RSS, virtual size, the delta since the last sample, the allocator's
+`heap_alloc_mb`, `heap_resident_mb` and `heap_retained_mb`, RocksDB's `db_cache_mb`, `db_memtable_mb` and
+`db_readers_mb`, and the sizes of the major in-process structures; a second `[INFO][MEMORY] census` line lists each
+in-RAM holder's entry count (its size, for `_mb` names). The limit is derived automatically — the cgroup memory limit
+at 85 % if visible, otherwise 70 % of total RAM with a 2000 MB floor — and the thresholds are fixed fractions of it:
+60 % warn, 75 % emergency (clears both sync queues and the producer cache, forces a transaction-pool cleanup, flushes
+RocksDB), 90 % fatal. A fatal reading is re-measured 30 s later, and only if it still holds does the node flush and
+`exit(137)`; a boot within 10 minutes of such an exit waits 15 s, doubling with each further memory exit within 10
+minutes of the previous one, up to 120 s. A Super node below 4 GB of RAM (`MIN_RAM_SERVER_MB = 4000`) refuses to
+start unless `QNET_SKIP_RAM_CHECK` is set, and then logs `[CRIT][MEMORY] INSUFFICIENT_RAM`.
 
 ## Backup and restore
 
@@ -183,10 +193,18 @@ and a matching `admin_secret` in the body; it flushes and exits 0.
 ## Upgrading a node
 
 **Rolling upgrade (no consensus-visible change).** Stop the node, replace the image or binary, start it again with
-`QNET_HALT_HEIGHT` unset. It catches up on its own, snapshot-jumping if it fell far enough behind. Do one node at a
+`QNET_HALT_HEIGHT` and the one-shot recovery variables (`QNET_ROLLBACK_TO_LAST_SEALED`, `QNET_ROLLBACK_TO_HEIGHT`)
+unset. It catches up on its own, snapshot-jumping if it fell far enough behind. Do one node at a
 time and wait until it reports `healthy` on `/api/v1/node/health` with `blocks_behind` at zero on
 `/api/v1/sync/status` before touching the next. Track `validated_peers` while you work: taking down more of the
-committee than the fault bound tolerates turns a maintenance window into a liveness incident.
+committee than the fault bound tolerates turns a maintenance window into a liveness incident. `/healthz` answers
+with the new image's `build=` once the replacement has taken. `scripts/deploy-genesis.sh` runs this pass for the
+genesis fleet: it recreates each container from its own `docker inspect` output, leaving `QNET_ROLLBACK_*`,
+`QNET_RECOVERY_HALTED` and `QNET_BUILD_ID` out of the carried environment, and touches the next node only after the
+previous one answers `/healthz`, is fewer than 10 blocks below the network height with at least one validated peer,
+has taken part in a checkpoint as a validator and seen a full-quorum seal at or above that window above its restart
+height, and has run 30 blocks past its restart with a failover-free metrics window. `QNET_RECOVERY_HALTED=1` skips the
+last two gates for a roll that repairs a halted chain.
 
 **Gated rule change (rolling).** A consensus rule that ships behind a feature gate rolls like an ordinary upgrade.
 The release carries the rule dormant with an activation height compiled into the binary, every node flips it at that
@@ -219,7 +237,8 @@ Restart only when **both** of these hold. Anything less is a bug to fix, not an 
 
 1. Finality has not advanced for more than two hours. Production stops on its own once the
    `roster_derivation_horizon` (2880 blocks past the last seal) is reached.
-2. There is no software fix that restores liveness without abandoning chain data.
+2. There is no software fix that restores liveness without abandoning chain data, and rolling the fleet back to its
+   last sealed macroblock (see *Fleet stalled or forked above its last seal* below) does not restore it either.
 
 For a **forged finality** incident — a committee majority certified a bad `state_root` — the trigger is different:
 restart as soon as it is confirmed, and pick `K` strictly below the first bad macroblock.
@@ -301,10 +320,24 @@ appear, look at `current_timeout_round` and `failover_count` on `/api/v1/node/he
 from it — and at `clock_drift_ema_secs` and `timestamp_rejections`. If `sealed_lag_windows` is climbing past the
 horizon the node has parked on `roster_derivation_horizon`, and the problem is network-wide finality, not this node.
 
+**Fleet stalled or forked above its last seal.** When every branch agrees up to the last sealed macroblock and only the
+unsealed tail differs or stops, roll the fleet back to that point instead of cutting a restart release. Set
+`QNET_ROLLBACK_TO_LAST_SEALED=1` (or `QNET_ROLLBACK_TO_HEIGHT=<h>`) on every node, start them together, and remove the
+variable before the next start. At boot, before state recovery, each node truncates to that height, retracts the
+macroblocks and certified pairs above it, drops its own vote commitments above it and lowers its anti-double-sign mark
+to the height it ends at, so it can sign the re-produced windows. Run with either variable, `scripts/deploy-genesis.sh`
+sets it on the containers it recreates and strips it on its next roll; until then a restart of such a container
+repeats the rollback. A recovery decree prunes from one host: on each genesis node `node_decreeEndorse` (params `seq`,
+`target_height`) returns that node's consensus signature over the decree, and `node_decreeSubmit` (the same params plus
+`sigs`) with signatures from a quorum of the genesis consensus keys and a `seq` above the last applied one gossips it;
+every node that verifies it deletes the blocks above `target_height`, retracts the macroblocks and certified pairs
+above it, records the `seq` and exits for a clean boot. Both methods answer internal callers only. For a fork in which no branch holds a quorum, `QNET_ROLLBACK_TO_HEIGHT`
+brings every stored marker back to one height at boot and the node rejoins from the network.
+
 **Storage full.** Distinguish the two meanings. If the *filesystem* is full the node cannot flush and should be stopped
 before it is starved; free space outside the data directory, then restart. If the node logs `storage_warn_85pct_full`
 or `critically_full`, that is the internal budget against `QNET_MAX_STORAGE_GB`, whose cleanups touch caches only. The
-real levers: confirm the body prune is running (`[INFO][PIPELINE] microblock_bodies_pruned` appears at 14,400-block
+real levers: confirm the body prune is running (`[INFO][STORAGE] microblock_bodies_pruned` appears at 14,400-block
 boundaries — a node that has not crossed one since starting has not pruned yet), confirm `QNET_DATA_DIR` points at the
 directory the node really uses, then provision more disk. Never hand-delete files from the RocksDB directory.
 
@@ -314,7 +347,7 @@ set. Two log lines name what it is waiting on. `[WARN][REWARDS] epoch_root_gap �
 means the macroblock is simply absent and the node has already fired a targeted repair fetch — it
 resolves itself; watch that the named `missing_mb` stops recurring. `[ERR][REWARDS]
 epoch_root_mb_no_usable_qc … action=operator_resync` means the macroblock is on this node's disk but
-unreadable, and it needs you: the object is QC-certified and sits below the weak-subjectivity floor,
+unreadable, and it needs you: the object is QC-certified and sits at or below that N-2 macroblock,
 so the node keeps it rather than deleting it, and forward sync never revisits that height. Resync this
 node from a snapshot; do not hand-delete anything from the RocksDB directory. A third line,
 `epoch_root_target_unknown … action=defer_no_repair`, means a storage read itself failed — treat it as

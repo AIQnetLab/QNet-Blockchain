@@ -8,7 +8,13 @@ mod roster;
 mod registry;
 mod node_records;
 mod snapshots;
+mod snapshot_index;
+mod account_mirror;
+mod boundary_snapshot;
 mod persistent;
+
+pub use account_mirror::{account_delta, MirrorTicket};
+pub use boundary_snapshot::is_snapshot_boundary;
 
 pub(crate) use rocksdb::{DB, Options, ColumnFamily, ColumnFamilyDescriptor, WriteBatch};
 pub(crate) use qnet_state::Transaction;
@@ -558,6 +564,13 @@ pub struct PersistentStorage {
     /// batches, snapshot zstd compression) to run off the async reactor
     /// without changing the public storage API surface.
     db: Arc<DB>,
+    /// Held by every write of snapshot frames, their index rows and the newest-frame pointer, so a
+    /// rollback's prune and a finishing serializer never interleave.
+    snapshot_write_lock: parking_lot::Mutex<()>,
+    /// Bumped by every snapshot prune under that lock: a frame captured under an older value is dropped.
+    snapshot_gen: AtomicU64,
+    /// Heights whose frame rows are being written in this process: one writer per height.
+    snapshot_writing: parking_lot::Mutex<std::collections::HashSet<u64>>,
 }
 
 /// Owned, thread-movable RocksDB consistent snapshot. The held `Arc<DB>` keeps
@@ -1368,6 +1381,8 @@ pub(crate) const LHB_RETAINED_SUBWINDOWS: u64 =
 
 pub struct Storage {
     persistent: PersistentStorage,
+    /// The one writer of the accounts CF: rows land in apply order (see account_mirror).
+    mirror: account_mirror::AccountMirror,
     /// Transaction pool for efficient storage without duplication
     pub transaction_pool: TransactionPool,
     /// Maximum storage size per node in bytes (300 GB default)
@@ -1462,25 +1477,6 @@ impl Storage {
     // Smart-contract VM: WASM code blobs are stored via the existing
     // `save_contract_code` / `get_contract_code` (content-addressed by code_hash,
     // `contract:code:{hash}` in the raw store). No new CF needed.
-
-    // ========================================================================
-    // v15.9: WRITE-THROUGH ACCOUNT PERSISTENCE (Stage 1) — public surface
-    // ========================================================================
-    /// Atomic batch persistence of every account mutated by a single block.
-    /// Called from the apply pipeline after `set_chain_height` succeeds, so
-    /// the on-disk `accounts` column family stays in lockstep with the
-    /// committed chain tip. Implementation lives in `PersistentStorage` —
-    /// see the doc on `PersistentStorage::persist_accounts_batch` for full
-    /// rationale, batch semantics, and scalability bounds.
-    pub async fn persist_accounts_batch(
-        &self,
-        modified_accounts: Vec<(String, qnet_state::Account)>,
-        deleted_addresses: Vec<String>,
-    ) -> IntegrationResult<(usize, usize)> {
-        self.persistent
-            .persist_accounts_batch(modified_accounts, deleted_addresses)
-            .await
-    }
 
     /// Wallet→token reverse-index maintenance (NON-consensus). One atomic batch: this block's owns-deltas
     /// + the durable watermark at `height`; see `PersistentStorage::persist_owns_deltas`.
@@ -1958,12 +1954,13 @@ impl qnet_state::AccountStore for Storage {
         Storage::try_load_accounts_batch(self, addresses)
     }
 
-    fn persist_accounts(&self, accounts: &[(String, qnet_state::Account)]) -> bool {
-        match self.persistent.persist_accounts_sync(accounts) {
-            Ok(_) => true,
+    fn persist_accounts(&self, accounts: Vec<(String, qnet_state::Account)>) -> bool {
+        let count = accounts.len();
+        match self.mirror_write_durable(accounts, Vec::new()) {
+            Ok(()) => true,
             Err(e) => {
                 if crate::node::is_warn() {
-                    println!("[WARN][CACHE] evict_persist_failed count={} err={:?}", accounts.len(), e);
+                    println!("[WARN][CACHE] evict_persist_failed count={} err={:?}", count, e);
                 }
                 false
             }
@@ -2569,11 +2566,11 @@ mod v32_9_pattern_c_tests {
         let mut acct_b = qnet_state::Account::new("addrB".to_string());
         acct_b.dilithium_public_key = Some(pk_b.clone());
         let acct_c = qnet_state::Account::new("addrC".to_string()); // no pk (elided / not-yet-bound)
-        storage.persistent.persist_accounts_sync(&[
+        storage.mirror_write_durable(vec![
             ("addrA".to_string(), acct_a),
             ("addrB".to_string(), acct_b),
             ("addrC".to_string(), acct_c),
-        ]).unwrap();
+        ], Vec::new()).unwrap();
         // Incremental binds in an ARBITRARY order + a duplicate (the marker must absorb it).
         storage.dpk_lt_bind("addrB", &pk_b, 10).unwrap();
         storage.dpk_lt_bind("addrA", &pk_a, 11).unwrap();
@@ -3040,26 +3037,23 @@ mod v32_9_pattern_c_tests {
         let (p2, cont2) = src.accounts_cf_keys_page(Some(&cont), 2).expect("page2");
         assert_eq!(p2, vec!["acct_c".to_string()]);
         assert!(cont2.is_none(), "exhausted scan ends the continuation");
-        src.delete_accounts_cf_keys(&["acct_b".to_string()]).expect("delete");
+        src.mirror_write_durable(Vec::new(), vec!["acct_b".to_string()]).expect("delete");
         let (all, _) = src.accounts_cf_keys_page(None, 10).expect("rescan");
         assert_eq!(all, vec!["acct_a".to_string(), "acct_c".to_string()]);
     }
 
     #[test]
     fn snapshot_aborts_on_cf_leaf_divergence() {
-        let rt = tokio::runtime::Runtime::new().expect("rt");
         let (src, _sd) = open_test_storage();
         put_account(&src, b"acct_a", b"1");
         put_account(&src, b"acct_b", b"2");
-        let view = src.prepare_snapshot_view(&[]).expect("view");
-        assert!(rt.block_on(src.create_state_snapshot(90, view, Some(1))).is_err(),
+        let view = src.frame_views().expect("view");
+        assert!(src.write_boundary_frame(90, view, Some(1), None).is_err(),
                 "CF/leaf divergence must abort the snapshot");
-        let cf = src.persistent.db.cf_handle("snapshots").unwrap();
-        assert!(src.persistent.db.get_cf(&cf, b"full_snap_90").unwrap().is_none(),
-                "aborted snapshot must not persist a frame");
-        let view = src.prepare_snapshot_view(&[]).expect("view2");
-        rt.block_on(src.create_state_snapshot(90, view, Some(2))).expect("clean snapshot");
-        assert!(src.persistent.db.get_cf(&cf, b"full_snap_90").unwrap().is_some());
+        assert!(src.get_snapshot_data(90).unwrap().is_none(), "aborted snapshot must not persist a frame");
+        let view = src.frame_views().expect("view2");
+        src.write_boundary_frame(90, view, Some(2), None).expect("clean snapshot");
+        assert!(src.get_snapshot_data(90).unwrap().is_some());
     }
 
     // Read every (key, value) row of a CF into a sorted map for set-equality checks.
@@ -3088,7 +3082,7 @@ mod v32_9_pattern_c_tests {
         put_account(&src, b"acct_ccc", b"balance-3");
         {
             let cf = src.persistent.db.cf_handle("pending_rewards").expect("rewards cf");
-            src.persistent.db.put_cf(&cf, b"rew_key", b"rew_val").expect("put reward");
+            src.persistent.db.put_cf(&cf, b"epoch_root_0000000160", [7u8; 32]).expect("put reward");
         }
         {
             let cf = src.persistent.db.cf_handle("contract_storage").expect("cs cf");
@@ -3096,20 +3090,19 @@ mod v32_9_pattern_c_tests {
         }
         {
             let cf = src.persistent.db.cf_handle("node_registry").expect("nr cf");
-            src.persistent.db.put_cf(&cf, b"node_super_x", b"nr_val").expect("put registry");
+            src.persistent.db.put_cf(&cf, b"srtr_super_x", b"x").expect("put roster key");
+            src.persistent.db.put_cf(&cf, b"node_super_x",
+                br#"{"node_type":"super","wallet":"w","reg_height":5}"#).expect("put registry");
         }
 
-        // Stream the dump: prepare a pinned view (accounts already flushed to the CF, so pass none)
-        // and materialize the compressed frame under full_snap_<h>.
-        let height = 90u64;
-        let view = src.prepare_snapshot_view(&[]).expect("view");
-        rt.block_on(src.create_state_snapshot(height, view, None)).expect("create snapshot");
+        // Stream the dump from a pinned view into the chunk rows of the frame at <h>: a height whose certificate
+        // proves the epoch root at 160, so the frame carries it.
+        let height = 28_980u64;
+        let view = src.frame_views().expect("view");
+        src.write_boundary_frame(height, view, None, None).expect("create snapshot");
 
         // The frame must be a valid single zstd stream with the unchanged [hash(32)|len(8)|zstd] header.
-        let src_snaps = src.persistent.db.cf_handle("snapshots").expect("snapshots cf");
-        let frame = src.persistent.db
-            .get_cf(&src_snaps, format!("full_snap_{}", height).as_bytes())
-            .expect("get frame").expect("frame present");
+        let frame = src.get_snapshot_data(height).expect("get frame").expect("frame present");
         assert!(frame.len() > 40, "frame carries the 40-byte header + compressed body");
         let stored_hash = &frame[..32];
         let claimed_len = u64::from_le_bytes(frame[32..40].try_into().unwrap());
@@ -3122,12 +3115,9 @@ mod v32_9_pattern_c_tests {
         assert_eq!(decoded.len() as u64, claimed_len, "uncompressed_len header matches streamed byte count");
         assert_eq!(decoded.first().copied(), Some(0x02u8), "SNAP_TYPE_FULL discriminator preserved");
 
-        // Load the frame into a FRESH storage via the untouched loader and compare the account set.
+        // Load the frame into a FRESH storage and compare the account set.
         let (dst, _dd) = open_test_storage();
-        let dst_snaps = dst.persistent.db.cf_handle("snapshots").expect("snapshots cf");
-        dst.persistent.db
-            .put_cf(&dst_snaps, format!("full_snap_{}", height).as_bytes(), &frame)
-            .expect("stage frame");
+        dst.store_frame_bytes(height, &frame).expect("stage frame");
         rt.block_on(dst.load_state_snapshot(height, false)).expect("load snapshot");
 
         assert_eq!(dump_cf(&src, "accounts"), dump_cf(&dst, "accounts"),
@@ -3139,7 +3129,53 @@ mod v32_9_pattern_c_tests {
         // Other streamed sections also survive the round-trip.
         assert_eq!(dump_cf(&src, "pending_rewards"), dump_cf(&dst, "pending_rewards"));
         assert_eq!(dump_cf(&src, "contract_storage"), dump_cf(&dst, "contract_storage"));
-        assert_eq!(dump_cf(&src, "node_registry"), dump_cf(&dst, "node_registry"));
+        // The registry as a joiner takes it: the roster key, and the row with its chain-stamped fields.
+        let nr = dump_cf(&dst, "node_registry");
+        assert!(nr.contains_key(&b"srtr_super_x".to_vec()));
+        let row: serde_json::Value = serde_json::from_slice(&nr[&b"node_super_x".to_vec()]).expect("row");
+        assert_eq!((row["reg_height"].as_u64(), row["wallet"].as_str()), (Some(5), Some("w")));
+    }
+
+    // The frame leaves out node-local rows the joiner never takes (the reward shard cache, the light
+    // eligibility index) and carries the epoch roots its certificate proves, so two holders of one height
+    // write the same bytes; it carries the current format.
+    #[test]
+    fn a_frame_carries_no_node_local_reward_cache() {
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let (src, _sd) = open_test_storage();
+        put_account(&src, b"acct_a", b"1");
+        let cf = src.persistent.db.cf_handle("pending_rewards").expect("rewards cf");
+        src.persistent.db.put_cf(&cf, b"epoch_root_0000000160", [7u8; 32]).expect("put root");
+        for key in [&b"epoch_wshard_0000000160_000000"[..], b"epoch_shardmeta_0000000160", b"light_elig_x"] {
+            src.persistent.db.put_cf(&cf, key, b"v").expect("put");
+        }
+        let h = 28_980u64; // mb 322: the band reaches the epoch at 160
+        let view = src.frame_views().expect("view");
+        src.write_boundary_frame(h, view, None, None).expect("frame");
+        let frame = src.get_snapshot_data(h).expect("get").expect("present");
+        let body = zstd::decode_all(&frame[40..]).expect("zstd");
+        assert_eq!(u32::from_le_bytes(body[1..5].try_into().unwrap()), crate::node::SNAPSHOT_FORMAT_VERSION);
+        let (dst, _dd) = open_test_storage();
+        dst.store_frame_bytes(h, &frame).expect("stage");
+        rt.block_on(dst.load_state_snapshot(h, false)).expect("load");
+        let rows: Vec<Vec<u8>> = dump_cf(&dst, "pending_rewards").into_keys().collect();
+        assert_eq!(rows, vec![b"epoch_root_0000000160".to_vec()]);
+    }
+
+    // A frame whose bytes changed on disk is refused: the stream hash is checked when it is read.
+    #[test]
+    fn a_changed_frame_byte_is_refused() {
+        let (src, _sd) = open_test_storage();
+        src.mirror_write_durable(vec![("acct_a".to_string(), qnet_state::Account::new("acct_a".to_string()))], Vec::new())
+            .expect("account");
+        let view = src.frame_views().expect("view");
+        src.write_boundary_frame(90, view, None, None).expect("frame");
+        assert_eq!(src.decode_snapshot_accounts(90).expect("intact").len(), 1);
+        let mut frame = src.get_snapshot_data(90).expect("get").expect("present");
+        let last = frame.len() - 1;
+        frame[last] ^= 0xFF;
+        src.store_frame_bytes(90, &frame).expect("store changed");
+        assert!(src.decode_snapshot_accounts(90).is_err());
     }
 }
 #[cfg(test)]
@@ -3241,6 +3277,19 @@ mod tests_certified_pair_wal {
 
         // A shard nobody covered stays absent, which is what the reward path reads as "no payout".
         assert!(!merged.contains_key(&3usize));
+    }
+
+    /// The primary stands down on its OWN row only: a backup's row for the same shard is not it,
+    /// although the shard already reads as covered.
+    #[test]
+    fn an_owners_own_row_is_told_apart_from_the_shards() {
+        let (s, _d) = open_test_storage();
+        s.save_light_bitmap_from(7, 0, 1, 101, &[0b0000_0001]).unwrap();   // backup 1 covers shard 0
+        assert!(!s.has_light_bitmap_from(7, 0, 0), "a backup's row is not the primary's");
+        assert!(s.has_light_bitmap_from(7, 0, 1));
+        assert!(s.load_light_bitmaps(7).unwrap().contains_key(&0usize), "while the shard reads as covered");
+        s.save_light_bitmap_from(7, 0, 0, 100, &[0b0000_0010]).unwrap();
+        assert!(s.has_light_bitmap_from(7, 0, 0), "the primary's own row");
     }
 
     /// A light node's identity is committed as a hash and carried by its device. The resolver admits

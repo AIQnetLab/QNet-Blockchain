@@ -859,14 +859,48 @@ impl Storage {
         Ok(())
     }
 
-    /// Durable NodeRegistration-origin marker. Written ONLY by write_registration_row, so the set
-    /// is exactly what the in-memory dedup map holds — activations write registry rows too, and
-    /// reseeding from those would reject honest re-registrations.
-    pub fn mark_node_registration_origin(&self, node_id: &str, wallet: &str) -> IntegrationResult<()> {
+    /// Durable NodeRegistration-origin marker: the height the registration applied at, then the wallet.
+    /// Written by every NodeRegistration apply (the last wins, so a canonical re-registration after a rollback
+    /// replaces an orphan's) and never by an activation, which stamps registry rows too.
+    pub fn mark_node_registration_origin(&self, node_id: &str, wallet: &str, height: u64) -> IntegrationResult<()> {
         let cf = self.persistent.db.cf_handle("node_registry")
             .ok_or_else(|| IntegrationError::StorageError("node_registry CF not found".to_string()))?;
-        self.persistent.db.put_cf(&cf, format!("nreg_{}", node_id).as_bytes(), wallet.as_bytes())?;
+        self.persistent.db.put_cf(&cf, format!("nreg_{}", node_id).as_bytes(),
+                                  Self::registration_marker(height, wallet.as_bytes()))?;
         Ok(())
+    }
+
+    /// A registration marker: 0xFF, the height (big-endian), the wallet. An older marker is the wallet alone.
+    pub(crate) fn registration_marker(height: u64, wallet: &[u8]) -> Vec<u8> {
+        let mut v = Vec::with_capacity(9 + wallet.len());
+        v.push(0xFF);
+        v.extend_from_slice(&height.to_be_bytes());
+        v.extend_from_slice(wallet);
+        v
+    }
+
+    pub(crate) fn registration_marker_height(v: &[u8]) -> Option<u64> {
+        if v.len() >= 9 && v[0] == 0xFF { v[1..9].try_into().ok().map(u64::from_be_bytes) } else { None }
+    }
+
+    pub(crate) fn registration_marker_wallet(v: &[u8]) -> &[u8] {
+        if Self::registration_marker_height(v).is_some() { &v[9..] } else { v }
+    }
+
+    /// node_id -> the height its NodeRegistration applied at, for markers that record it; u64::MAX means the
+    /// registration was rolled back.
+    pub fn registration_heights(&self) -> IntegrationResult<std::collections::HashMap<String, u64>> {
+        let cf = self.persistent.db.cf_handle("node_registry")
+            .ok_or_else(|| IntegrationError::StorageError("node_registry CF not found".to_string()))?;
+        let mut out = std::collections::HashMap::new();
+        for item in self.persistent.db.prefix_iterator_cf(&cf, b"nreg_") {
+            let (k, v) = item.map_err(|e| IntegrationError::StorageError(format!("registration_marker_read err={}", e)))?;
+            if !k.starts_with(b"nreg_") { break; }
+            if let (Ok(id), Some(h)) = (std::str::from_utf8(&k[5..]), Self::registration_marker_height(&v)) {
+                out.insert(id.to_string(), h);
+            }
+        }
+        Ok(out)
     }
 
     /// The registration-origin set: node_id -> wallet for every applied NodeRegistration.
@@ -878,33 +912,44 @@ impl Storage {
             let (k, v) = match item { Ok(kv) => kv, Err(_) => continue };
             if !k.starts_with(b"nreg_") { break; }
             let id = match std::str::from_utf8(&k[5..]) { Ok(s) => s.to_string(), Err(_) => continue };
-            let w = match std::str::from_utf8(&v) { Ok(s) => s.to_string(), Err(_) => continue };
+            let w = match std::str::from_utf8(Self::registration_marker_wallet(&v)) { Ok(s) => s.to_string(), Err(_) => continue };
             out.push((id, w));
         }
         Ok(out)
     }
 
-    /// Every CHAIN-CONFIRMED node_id->wallet binding in the node_registry CF (super/genesis AND light,
-    /// all types). Used to rebuild the in-mem `registered_nodes` NodeRegistration-dedup map on cold-join:
-    /// the CF is snapshot-bound (registry_root in the QC Checkpoint), so deriving the dedup set from it is
-    /// sound. Mirrors the `node_` decode used by backfill_roster_indices / rebuild_committed_burn_wallet
-    /// (key `node_<id>`, JSON value, `wallet` field). Skips entries WITHOUT `reg_height` (non-deterministic
-    /// RPC/discovery cache writes) so the set is identical to a from-genesis node — distinct from
-    /// load_all_node_registrations, which is the startup P2P-registry restore and includes unconfirmed rows.
-    /// Reset the derived commitment-dedup maps and reseed `registered_nodes` from the durable
-    /// node_registry CF (bound by registry_root in the QC Checkpoint). THE single entry point for
-    /// every path that rebuilds the chain view from a snapshot — cold-join rehydrate, boot restore
-    /// and post-rollback reconcile — so the three cannot drift apart. Must run AFTER
-    /// `rebuild_registry_lthash`, which prunes rows above the tip; reseeding first would re-import
-    /// the very orphans that prune exists to drop.
+    /// Reset the derived commitment-dedup maps and reseed `registered_nodes` with what a from-genesis
+    /// node holds at the state's own height (`chain_state.height`, set by every caller first): the
+    /// root-covered bindings stamped at or below it. The single entry point for every path that rebuilds
+    /// the chain view from a snapshot (cold-join, boot restore, reconcile). A row above the height is
+    /// either replayed next or an orphan; seeded ahead, the replay refused its registration and
+    /// journaled it as present, so a later undo kept a node whose row the rollback had pruned.
+    /// Callers sync the mempool's registration marks once their map is final, and hold the write lock: an
+    /// Err wipes the state, since every caller restored accounts and a height first and a live view with an
+    /// unknown dedup map passes every root check while it splits registry_root.
     pub fn reseed_commitment_dedup(&self, sg: &qnet_state::State) -> IntegrationResult<usize> {
+        let up_to = sg.chain_state.read().height;
+        let read = self.registry_root_covered_origins(up_to)
+            .and_then(|regs| self.registration_heights().map(|heights| (regs, heights)));
+        let (regs, heights) = match read {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[ERR][STATE] commitment_dedup_reseed_failed up_to={} err={:?} action=state_wiped", up_to, e);
+                sg.reset_to_empty();
+                return Err(e);
+            }
+        };
+        // A row first stamped by an activation keeps that height when its registration lands later; the marker
+        // holds the registration's own height, and a node registered above the state height is not yet here.
+        let regs: Vec<(String, String)> = regs.into_iter()
+            .filter(|(id, _)| heights.get(id).map_or(true, |h| *h <= up_to))
+            .collect();
         sg.reset_commitment_dedup();
-        let regs = self.registry_root_covered_origins()?;
         let n = regs.len();
         for (node_id, wallet) in regs {
             sg.seed_registered_node(&node_id, &wallet);
         }
-        println!("[INFO][STATE] commitment_dedup_reseeded registered={}", n);
+        println!("[INFO][STATE] commitment_dedup_reseeded registered={} up_to={}", n, up_to);
         Ok(n)
     }
 
@@ -947,13 +992,13 @@ impl Storage {
         }
     }
 
-    /// Every `(node_id, wallet)` binding `registry_root` actually covers: the same `srtr_`/`lrtr_` ->
-    /// `node_<id>` traversal `compute_lt_state_cf` folds, chain-confirmed only.
+    /// Every `(node_id, wallet)` binding `registry_root` actually covers, stamped at or below `up_to`:
+    /// the same `srtr_`/`lrtr_` -> `node_<id>` traversal `compute_lt_state_cf` folds, chain-confirmed only.
     ///
     /// The dedup seed used to read the `nreg_` prefix, which the root does NOT cover, while a snapshot
     /// is imported unfiltered — so one injected `nreg_<victim>` row made a joiner skip that node's real
     /// registration as a duplicate and left its `registry_root` permanently one row short.
-    pub fn registry_root_covered_origins(&self) -> IntegrationResult<Vec<(String, String)>> {
+    pub fn registry_root_covered_origins(&self, up_to: u64) -> IntegrationResult<Vec<(String, String)>> {
         use rocksdb::{IteratorMode, Direction};
         let cf = self.persistent.db.cf_handle("node_registry")
             .ok_or_else(|| IntegrationError::StorageError("node_registry CF not found".to_string()))?;
@@ -973,8 +1018,10 @@ impl Storage {
                 let val = match self.persistent.db.get_cf(&cf, nk.as_bytes()) { Ok(Some(v)) => v, _ => continue };
                 let parsed: serde_json::Value = match serde_json::from_slice(&val) { Ok(p) => p, Err(_) => continue };
                 // reg_height present == chain-confirmed. Its ABSENCE is what excludes the
-                // non-deterministic RPC/discovery cache writes, exactly as the root's fold does.
-                if parsed["reg_height"].as_u64().is_none() { continue; }
+                // non-deterministic RPC/discovery cache writes, exactly as the root's fold does. A row
+                // stamped above `up_to` is not held at that height yet: reg_height is the first stamp,
+                // and no activation stamps a row ahead of its burn registration.
+                match parsed["reg_height"].as_u64() { Some(h) if h <= up_to => {}, _ => continue }
                 // `registered_nodes` is written ONLY by NodeRegistration, but an activation also writes
                 // a roster row. Seeding from every roster row makes a restarted node reject a genuine
                 // later registration that every running node accepts — and a registration has no

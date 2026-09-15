@@ -20,7 +20,8 @@ if (typeof global.EventEmitter === 'undefined') {
 
 import { AppRegistry } from 'react-native';
 import messaging from '@react-native-firebase/messaging';
-import { handlePushMessage } from './src/services/PushService';
+import BackgroundFetch from 'react-native-background-fetch';
+import { handlePushMessage, onBackgroundFetch } from './src/services/PushService';
 import App from './App';
 
 // Background/killed FCM handler — MUST be at top level (not in useEffect).
@@ -31,6 +32,13 @@ messaging().setBackgroundMessageHandler(async remoteMessage => {
   if (remoteMessage?.data) {
     await handlePushMessage(remoteMessage.data);
   }
+});
+
+// Android: background-fetch events after the app is terminated (stopOnTerminate:false) land here, in the
+// same handler the live app configures. A timeout event only finishes the task.
+BackgroundFetch.registerHeadlessTask(async ({ taskId, timeout }) => {
+  if (timeout) { BackgroundFetch.finish(taskId); return; }
+  await onBackgroundFetch(taskId);
 });
 
 AppRegistry.registerComponent('QNetMobile', () => App);

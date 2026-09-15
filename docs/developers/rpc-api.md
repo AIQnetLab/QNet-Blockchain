@@ -26,16 +26,18 @@ by a fast container restart. If all 10 attempts fail, or if the warp server ever
 calls `std::process::exit(1)` so the supervisor restarts the node.
 
 A separate warp server, defined in `development/qnet-integration/src/bin/qnet-node.rs`, binds
-`rpc_port + 100` and answers `GET /metrics` in Prometheus text-exposition format, carrying the node
-uptime series. Live node, chain and peer telemetry comes from the `/api/v1/*` paths with "metrics" in
-their name, which return JSON.
+`rpc_port + 100` and answers `GET /metrics` in Prometheus text-exposition format with five series:
+`qnet_node_uptime_seconds` (counter) and the gauges `qnet_blocks_height` (applied height),
+`qnet_network_height`, `qnet_blocks_behind` and `qnet_peers_connected`. Its bind is probed the same way;
+if every attempt fails, the node runs without the metrics listener. Further node telemetry comes as JSON
+from the `/api/v1/*` paths with "metrics" in their name.
 
 ## Liveness probes
 
 | Method | Path | Purpose |
 | --- | --- | --- |
 | GET | `/health` | Returns the literal string `OK` with HTTP 200. Touches no state. |
-| GET | `/healthz` | Returns `ok h={height}` read from the `LOCAL_BLOCKCHAIN_HEIGHT` atomic. One atomic load, no locks. |
+| GET | `/healthz` | Returns `ok h={height} build={build}`: the height from the `LOCAL_BLOCKCHAIN_HEIGHT` atomic and the build id (`QNET_BUILD_ID` as the image sets it, else `v{crate version}-unstamped`). One atomic load, no locks. |
 
 Container health checks should target `/healthz`. It reads no blockchain, P2P or mempool state, so it
 stays accurate even when the heavier API surfaces are blocked. `/api/v1/node/health` reads all of that
@@ -47,21 +49,23 @@ Authentication is per-endpoint and applies where an action is privileged or dest
 
 | Gate | Where it applies | Behaviour |
 | --- | --- | --- |
-| `X-API-Key` header | `POST /rpc` and `POST /` | Matched against `QNET_API_KEY_EXPLORER` / `QNET_API_KEY_ADMIN`. Minimum 16 characters, enforced both at load and at check. A valid key bypasses rate limiting; it grants no extra methods. |
-| `QNET_DEV_API_KEY` | same two routes | Additional key, compiled in under `#[cfg(debug_assertions)]` for debug builds. |
-| Internal-IP check | `POST /api/v1/p2p/message`, `POST /api/v1/shutdown` | `is_internal_ip()` accepts loopback, RFC1918, IPv4 link-local, IPv6 loopback, `fc00::/7`, `fe80::/10`, and anything in `QNET_WHITELIST_IPS`. Unparseable strings are rejected. |
+| `X-API-Key` header | `POST /rpc`, `POST /` and `GET /api/v1/blocks/headers` | Matched against `QNET_API_KEY_EXPLORER` / `QNET_API_KEY_ADMIN`. Minimum 16 characters, enforced both at load and at check. A valid key bypasses rate limiting; it grants no extra methods. |
+| `QNET_DEV_API_KEY` | same three routes | Additional key, compiled in under `#[cfg(debug_assertions)]` for debug builds. |
+| Internal-IP check | `POST /api/v1/p2p/message`, `POST /api/v1/shutdown`, the JSON-RPC operator methods | `is_internal_ip()` accepts loopback, RFC1918, IPv4 link-local, IPv6 loopback, `fc00::/7`, `fe80::/10`, and anything in `QNET_WHITELIST_IPS`. Unparseable strings are rejected. |
 | `QNET_ADMIN_SECRET` | `POST /api/v1/shutdown` | Mandatory. If the variable is unset or empty the request is denied. Also requires an internal caller IP and a matching `admin_secret` field in the body. |
 | `QNET_ADMIN_SECRET` | `GET /api/v1/node/secure-info` | Read from `Authorization: Bearer <secret>`, or from an `admin_secret` query parameter. Enforced whenever the variable is configured, so set it on any node whose API port is reachable. |
-| Genesis-IP allowlist | `POST /api/v1/internal/fcm-token-sync` | Genesis IPs plus loopback; everyone else receives HTTP 403. |
+| Genesis-IP allowlist | `POST /api/v1/internal/fcm-token-sync`, `GET /api/v1/internal/fcm-token-get`, `GET /api/v1/internal/light-ping-keys-get` | Genesis IPs plus loopback; everyone else receives HTTP 403. |
 | `QNET_BENCHMARK_SECRET` | `POST /api/v1/benchmark/start`, `POST /api/v1/benchmark/stop` | Start requires `QNET_BOOTSTRAP_ID` (genesis node) or a configured `QNET_BENCHMARK_SECRET`; whenever the secret is configured, the request body's `secret` must match it — genesis status does not bypass a configured secret. Stop additionally requires a genesis node or an internal IP whenever the secret is configured. |
 | Submitter-IP match | `DELETE /api/v1/bundle/{bundle_id}` | Caller IP must equal the recorded submitter IP, or pass `is_internal_ip()`. |
 
-The API key applies to the two JSON-RPC routes and is read from the `x-api-key` header.
+The API key applies to the two JSON-RPC routes and to `GET /api/v1/blocks/headers`, and is read from
+the `x-api-key` header.
 
 Signature-based authorisation is separate from transport authentication. Every value transfer, reward
-claim and contract deployment carries a mandatory ML-DSA-65 (FIPS 204) signature. Verification runs in
-the handler whenever the public key is on the wire, and in `submit_transaction` for a transfer that
-elides an already-committed key. See [cryptography](../architecture/cryptography.md).
+claim and contract deployment carries a mandatory ML-DSA-65 (FIPS 204) signature. The transfer and
+claim handlers verify it whenever the public key is on the wire, and `submit_transaction` verifies every
+value transaction (transfer, batch transfer, contract deployment and call) before mempool admission,
+rehydrating an elided key from committed state. See [cryptography](../architecture/cryptography.md).
 
 ## Rate limiting
 
@@ -81,6 +85,7 @@ address (`warp::addr::remote()`).
 | `consensus` | 60 | 60 s | 60 s | `POST /api/v1/p2p/message` |
 | `mev_bundle` | 30 | 60 s | 120 s | bundle submit/status/cancel |
 | `benchmark` | 5 | 60 s | 300 s | all `/api/v1/benchmark/*`, `POST /api/v1/shutdown` |
+| `headers` | 30 | 60 s | 60 s | `GET /api/v1/blocks/headers`; a valid API key bypasses it |
 
 `tx_rate` is `QNET_API_RATE_LIMIT`, parsed as requests per minute and clamped to `1..=10_000`,
 default `100`.
@@ -120,15 +125,17 @@ deployment.
 ## Request and response conventions
 
 - **REST handlers return HTTP 200** and carry the outcome in the JSON body (typically
-  `{"success": false, "error": "..."}` or `{"error": "...", "details": "..."}`). Three REST paths set
-  a non-200 status: `/api/v1/microblock/{height}` (404/500), `/api/v1/genesis/block` (404) and
-  `/api/v1/internal/fcm-token-sync` (403/400/500).
+  `{"success": false, "error": "..."}` or `{"error": "...", "details": "..."}`). Six REST paths set
+  a non-200 status: `/api/v1/microblock/{height}` (404/500), `/api/v1/genesis/block` (404),
+  `/api/v1/blocks/headers` (500), `/api/v1/internal/fcm-token-sync` (403/400/500),
+  `/api/v1/internal/fcm-token-get` (403/400) and `/api/v1/internal/light-ping-keys-get` (403).
 - **Body size caps** are per-route, enforced by `warp::body::content_length_limit`:
 
   | Route | Cap |
   | --- | --- |
   | `POST /rpc`, `POST /` | 1 MiB |
   | `POST /api/v1/transaction` | 64 KiB |
+  | `POST /api/v1/batch/transfer` | 256 KiB |
   | `POST /api/v1/node-registration/submit` | 128 KiB (large ML-DSA-65 signature) |
   | `POST /api/v1/light-node/ping-response` | 64 KiB (enveloped ML-DSA-65 signatures) |
   | `POST /api/v1/rewards/claim` | 256 KiB |
@@ -191,11 +198,11 @@ Response envelope — `result` and `error` are mutually exclusive and the absent
 
 | Method | Params | Notes |
 | --- | --- | --- |
-| `node_getInfo` | none | `node_id` (`node_{port}`), height, peers, mempool size, version, node type, region, status. |
+| `node_getInfo` | none | `node_id` (`node_{port}`), height, peers, mempool size, version, `build` (as in `/healthz`), node type, region, status. |
 | `node_getPeers` | none | `{count, peers[], max_peers: 50, connection_status}`; each peer has id, address, node_type, region, last_seen, connection_time, reputation, version. |
 | `chain_getHeight` | none | `{height}` |
-| `chain_getBlock` | `{height}` | The block, or error `-32000`. |
-| `chain_getBlocks` | `{start, limit}` | `limit` defaults to 10, capped at 100. Returns an array. |
+| `chain_getBlock` | `{height}` | The block JSON with its `hash`, or error `-32000`. |
+| `chain_getBlocks` | `{start, limit}` | `limit` defaults to 10, capped at 100. Returns an array of block JSON with `hash`. |
 | `tx_submit` | transaction object | |
 | `tx_sendTransaction` | transaction object | Alias of `tx_submit`. |
 | `tx_get` | `{hash}` | |
@@ -210,6 +217,14 @@ Response envelope — `result` and `error` are mutually exclusive and the absent
 | `device_migration` | `{activation_code, new_device_signature, dilithium_signature, dilithium_public_key}` | Verifies ML-DSA-65 over `migrate:{activation_code}:{new_device_signature}`. |
 | `node_getTransferStatus` | `{activation_code}` | `{has_activation, node_type, activated_at, supports_transfer, device_support}` |
 | `node_attestBurn` | burn attestation | Genesis-side verification of an external Phase 1 burn. |
+| `node_armRecovery` | none | Operator. Dry-runs the recovery arm conditions; when they hold, hands the arm to the consensus loop and returns `{armed: true, anchor_mb, anchor_cp_index, anchor_digest, span_windows, committee, quorum_size, relaxed_quorum}`, otherwise `{armed: false, reason}`. |
+| `node_disarmRecovery` | none | Operator. Hands a disarm to the consensus loop; `{disarm_requested, armed}`. |
+| `node_recoveryStatus` | none | Operator. `{armed: true, anchor_mb, anchor_cp_index, anchor_digest, span_windows, heard_from, committee, quorum_size, relaxed_quorum}` while armed, otherwise `{armed: false, enabled, heard_from}`. |
+| `node_decreeEndorse` | `{seq, target_height}` | Operator. Signs the recovery decree `RDCR:{genesis_hash}:{seq}:{target_height}` with this node's consensus key; `{node_id, sig}`. Only genesis signatures count toward a decree. |
+| `node_decreeSubmit` | `{seq, target_height, sigs: [{node_id, sig}]}` | Operator. Accepts a `seq` above the applied decree floor whose valid genesis signatures reach `quorum_size` of the genesis set, gossips the decree to 16 random peers, and 3 s later prunes this node's chain above `target_height` and exits for a clean restart; `{accepted, seq, target_height}`. |
+
+The last five methods are operator methods: a caller whose address fails `is_internal_ip()` receives
+`-32004`.
 
 ### Error codes
 
@@ -218,6 +233,7 @@ Response envelope — `result` and `error` are mutually exclusive and the absent
 | `-32000` | Internal error, or requested object not found |
 | `-32001` | Epoch not yet finalized (randomness beacon) |
 | `-32003` | ML-DSA-65 signature verification failed on device migration |
+| `-32004` | Operator method called from an address that fails `is_internal_ip()` |
 | `-32050` | `attest_pending` — the caller is not yet promoted by the attestation admission throttle; `error.data.retry_after_secs` carries the backoff hint |
 | `-32601` | Method not found; also returned by `node_attestBurn` when this node is not an attestor for the requested `attest_epoch`, so treat it as method-specific before concluding a method is unsupported |
 | `-32602` | Invalid or missing params |
@@ -267,12 +283,19 @@ rate limit returns `-32029`.
 | GET | `/api/v1/height` | `{height, network_height, is_syncing, blocks_behind}` using `max(local, cached P2P height)` |
 | GET | `/api/v1/block/latest` | Block at the current tip |
 | GET | `/api/v1/block/{height}` | Block JSON plus `timeout_round`, `carried_baseline` and `abs_round` (= sum of the two) injected from the stored microblock |
-| GET | `/api/v1/block/hash/{hash}` | `{hash, found, block{...}}`; searches the last 1000 blocks, recomputing each hash |
+| GET | `/api/v1/block/hash/{hash}` | `{hash, found, height, block}`; looks the 32-byte hex hash up in the height→hash index from `tip − 1000` through the tip; `block` is `null` once the body is pruned |
 | GET | `/api/v1/genesis/block` | Full block 0 with its transactions, bincode + zstd, as `application/octet-stream` (computed once per process; identical bytes on every node, so a joining node's multi-source hash vote agrees); HTTP 404 `{error:"genesis_block_unavailable"}` when the node cannot reconstruct block 0 |
-| GET | `/api/v1/microblock/{height}` | Deserialized microblock; HTTP 404 `Block not yet produced` for a future height, `Block not found` for a missing one; HTTP 500 `Failed to load block` on a storage error |
+| GET | `/api/v1/microblock/{height}` | Block JSON; HTTP 404 `Block not yet produced` for a future height, `Block not found` for a missing one; HTTP 500 `Failed to load block` on a storage error |
 | GET | `/api/v1/microblocks?from=&to=` | `{from, to, items[{height, data}]}` with `data` as base64 raw bytes; `to` is clamped to `from + 100` |
+| GET | `/api/v1/blocks/headers?from=&limit=` | `{from, next, head, items[{height, hash, body, timestamp, producer, tx_count, previous_hash, merkle_root}]}` for the heights this node holds in `[from, min(from + limit, head + 1))`, hashes hex; `from` defaults to 0 and `limit` to 100, clamped `1..=1000`. `hash` comes from the height→hash index and outlives the body; the header fields appear only when `body` is true, and a row that fails to decode comes back as `{height, hash, body: false, error: "undecodable"}`. `next` is the first height not covered, `head` the applied tip. `headers` rate bucket; at most 4 scans run at once |
 | GET | `/api/v1/macroblock/{index}` | `{index, height, timestamp, micro_blocks_count, micro_blocks[], state_root, consensus_data{...}, previous_hash}` |
 | GET | `/api/v1/blocks/stats` | Height, block-time and macroblock-boundary counters |
+
+`/api/v1/block/latest`, `/api/v1/block/{height}`, `/api/v1/block/hash/{hash}` and
+`/api/v1/microblock/{height}`, and `chain_getBlock` / `chain_getBlocks` over JSON-RPC and WebSocket,
+return the block JSON plus a `hash` field: the block's consensus hash as hex from the height→hash index,
+`null` when the index holds no row for the height and none can be rebuilt from the stored body.
+`previous_hash` keeps its 32-element byte-array form.
 
 ## REST: light-client proofs
 
@@ -302,12 +325,14 @@ The `checkpoint.total_supply` field is a string.
 | Method | Path | Purpose |
 | --- | --- | --- |
 | GET | `/api/v1/snapshot/latest?max_height=` | `{height, ipfs_cid, available, node_id, timestamp}` or `{available:false}` |
-| GET | `/api/v1/snapshot/{height}` | Compressed snapshot as `application/octet-stream` with a `Content-Disposition: attachment` header |
+| GET | `/api/v1/snapshot/{height}` | The whole compressed frame as `application/octet-stream` with a `Content-Disposition: attachment` header, streamed chunk by chunk |
 | GET | `/api/v1/snapshot/{height}/manifest` | Stored chunk manifest for parallel download |
 | GET | `/api/v1/snapshot/{height}/chunk/{index}` | One chunk as `application/octet-stream` |
 
 Full-file and chunk serving both acquire `SNAPSHOT_SERVE_SEM`, a node-global semaphore with 16
-permits. When it is exhausted the response is `{error: "snapshot serve busy"}`.
+permits. When it is exhausted the response is `{error: "snapshot serve busy"}`. A full-file transfer holds
+its permit while the client keeps reading and ends when it stalls for 60 seconds; the manifest and each chunk
+are one stored row.
 
 ## REST: accounts
 
@@ -316,6 +341,7 @@ permits. When it is exhausted the response is `{error: "snapshot serve busy"}`.
 | GET | `/api/v1/account/{address}` | Serialized account. The 1952-byte `dilithium_public_key` is replaced on the wire by a boolean `has_dilithium_pk`. An unknown account yields a zeroed default object. |
 | GET | `/api/v1/account/{address}/balance` | `{address, balance}` in nanoQNC; addresses longer than 64 characters are rejected |
 | GET | `/api/v1/account/{address}/transactions` | First page of up to 50 transactions plus a total count |
+| GET | `/api/v1/account/{address}/node-events` | `{address, count, events[{type: "node_activation", node_id, node_type, height, timestamp, burn_tx}]}` for the wallet's genesis, super and light node ids, read from the node registry rows rather than the transaction index; `timestamp` is 0 once the registering block's body is pruned |
 | GET | `/api/v1/account/{address}/token-transfers?limit=&before=` | `{address, count, transfers[], oldest_available}`, each transfer enriched with symbol, decimals, logo and a `{height:016x}_{log_index:08x}` cursor |
 | GET | `/api/v1/account/{address}/tokens` | QRC-20 holdings. Uses the reverse owns-index when `OWNS_INDEX_READY` is set (`source: "reverse_index"`), otherwise a full account scan (`source: "blockchain_state"`) |
 | GET | `/api/v1/richlist?limit=` | `{success, total_supply_raw, circulating_raw, burned_raw, holder_count, holders[{address, balance_raw, percent}], source}`; `circulating = total_supply − burn-sink balance`. Limit defaults to 100, clamped `1..=500`. |
@@ -328,12 +354,13 @@ be at most 40 characters of hex or underscore.
 | Method | Path | Purpose |
 | --- | --- | --- |
 | POST | `/api/v1/transaction` | Submit a signed transfer |
+| POST | `/api/v1/batch/transfer` | Up to 1000 transfers from one sender as one signed transaction: `{transfers[{from, to_address, amount, memo}], batch_id, nonce, gas_price, gas_limit, dilithium_signature, dilithium_public_key}` → `{success, batch_id, transaction_hash, transfer_count, total_amount, from_address, message, processed_by}`. Every `from` is the same address, each `amount` is above 0, each `memo` at most 128 bytes, and `gas_limit` at least 10 000 (`gas_limits::TRANSFER`) per transfer; the signature covers the batch message in [SDK](sdk.md#amounts-and-addresses), and `dilithium_public_key` may be elided as for a transfer |
 | GET | `/api/v1/transaction/{hash}` | `{tx_hash, transaction{...}, status}` |
 | GET | `/api/v1/transactions/recent?page=&per_page=` | `{success, transactions[], pagination{...}, current_height}` |
 | GET | `/api/v1/transactions/history?address=&page=&per_page=&tx_type=&direction=` | Filtered, paginated address history |
 | GET | `/api/v1/mempool/status` | `{size, max_size, status, node_id, timestamp}` |
 | GET | `/api/v1/mempool/transactions?limit=&offset=` | `{transactions, count, total_count, offset, limit, node_id}` |
-| GET | `/api/v1/gas/recommendations` | Four tiers (`eco`, `standard`, `fast`, `priority`), each with `gas_price`, `estimated_time` and `cost_qnc`, plus `network_load`, `mempool_size`, `current_height`, `base_fee`, `node_id`. `base_fee` scales off `qnet_state::transaction::MIN_GAS_PRICE` by mempool depth. |
+| GET | `/api/v1/gas/recommendations` | Four tiers (`eco`, `standard`, `fast`, `priority`), each with `gas_price`, `estimated_time` and `cost_qnc` (a transfer at that price, the ML-DSA premium of 1.5 × the gas price included), plus `network_load`, `mempool_size`, `current_height`, `base_fee`, `node_id`. `base_fee` scales off `qnet_state::transaction::MIN_GAS_PRICE` by mempool depth. |
 
 `per_page` on both history endpoints is clamped `1..=100`. Mempool paging defaults to a limit of 100
 and is capped at 1000. `/api/v1/token-transfers?from=&to=&limit=&after=` (explorer ingestion) accepts
@@ -405,32 +432,42 @@ makes it refetch.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| GET | `/api/v1/node/status` | Accepts `node_id`, `wallet` or `activation_code`; the wallet may also arrive in `X-QNet-Wallet`. Resolves through the on-chain wallet reverse index before falling back to activation-code mapping. |
-| POST | `/api/v1/light-node/register` | Light-node registration with per-wallet failed-attempt limiting (max 5 failures per 600 s, independent of IP), EON validation, and `already_registered` / reactivation results |
-| POST | `/api/v1/light-node/token-refresh` | Requires a signature prefixed `ping_dilithium:` over `token_refresh:{node_id}:{timestamp}`, a timestamp within 300 s, and a delegation certificate `delegate_ping:{ping_pubkey}:{node_id}` verified against the on-chain VRF key |
+| GET | `/api/v1/node/status` | Accepts `node_id`, `wallet` or `activation_code`; the wallet may also arrive in `X-QNet-Wallet`. The first given of `node_id`, `wallet` and `activation_code` is used; a wallet resolves to the first of its genesis, super and light node ids that has a registry row. A light node in this node's light registry reports `heartbeat_count` 1 once it holds an on-chain attestation from either of the two previous epochs (`required_heartbeats` 1), and `is_online` is also true when the genesis node owning its light shard reports it active on `/api/v1/light-node/status`. |
+| POST | `/api/v1/light-node/register` | Light-node registration with per-wallet failed-attempt limiting (max 5 failures per 600 s, independent of IP) and EON validation. For a node already registered on chain, a `quantum_pubkey` that resolves to the node's identity key (below) reactivates it; any other key returns `already_registered` and changes nothing. A light node holds at most 3 devices, and a device that registers again replaces its own entry |
+| POST | `/api/v1/light-node/token-refresh` | Requires a signature prefixed `ping_dilithium:` over `token_refresh:{node_id}:{timestamp}`, a timestamp within 300 s, and the ping delegation certificate `delegate_ping:{ping_pubkey}:{node_id}` this node holds for the node, verified under the node's identity key (below); `updated` is false when the token, push type and endpoint are unchanged |
 | GET, POST | `/api/v1/light-node/ping-response` | Registered twice — GET with query parameters, POST with a JSON map body under a 64 KiB cap — both routed to the same handler. A signed response carries enveloped ML-DSA-65 signatures, so POST is the form that fits. |
-| GET | `/api/v1/light-node/status?node_id=` | `{success, node_id, is_active, registered_at, push_type, has_attestation_current_slot, next_ping_time, next_ping_window, needs_reactivation, onchain_registered}` |
+| GET | `/api/v1/light-node/status?node_id=` | `{success, node_id, is_active, registered_at, push_type, has_attestation_current_slot, next_ping_time, next_ping_window, needs_reactivation, onchain_registered}`, with `registered_at` and `push_type` present when the node is in this node's light registry; `onchain_registered` is true once the registration row is applied. Before reporting a node inactive, any node other than the genesis node that owns its light shard asks that owner and reports it active when the owner does (the owner's answer is cached 60 s). `read_only` bucket |
 | GET | `/api/v1/light-node/next-ping?node_id=` | `{success, node_id, next_ping_time, next_ping_window, current_slot, current_window, slots_per_window: 240, window_duration_seconds: 14400}` |
 | GET | `/api/v1/light-node/pending-challenge?node_id=` | Serves nodes whose `push_type` is `Polling`; `{success, node_id, has_challenge, challenge, created_at, expires_at}` with a 180-second expiry |
 | GET | `/api/v1/node-device?node_id=` | `{success, node_id, device_id}`, `device_id` null when unset |
 | POST | `/api/v1/register-device` | Requires the node to already be registered as type `super`; node ids starting with `genesis_node_` are rejected. Strict `activation` bucket (5/hour). |
-| POST | `/api/v1/internal/fcm-token-sync` | `{pseudonym, token, push_type, endpoint, origin_ip}` from genesis IPs or loopback only; 403 otherwise, 400 on missing fields, 500 on save failure |
+| POST | `/api/v1/internal/fcm-token-sync` | `{pseudonym, token, push_type, endpoint, origin_ip, ts}` from genesis IPs or loopback only. `ts` is the time the serving genesis stamped the record (arrival time when absent); a record older than the stored one is ignored with `{success: true, applied: false, reason: "stale"}`. 403 otherwise, 400 on missing fields, 500 on save failure |
+| GET | `/api/v1/internal/fcm-token-get?node_id=` | Genesis IPs or loopback only: the node's push-channel record `{success, token, push_type, endpoint, ts}`, or `{success: false, error: "not_found"}`; 403 otherwise, 400 without `node_id` |
+| GET | `/api/v1/internal/light-ping-keys-get?node_id=` | Genesis IPs or loopback only: `{success, ping_pubkey, ping_delegation_cert, identity_pubkey}`, the node's ping delegation and the identity key it was proven under, or `{success: false, error: "not_found"}`; 403 otherwise. A shard owner that cannot verify a relayed attestation pulls this once per node and epoch and records it only when the identity resolves against the chain, the delegation verifies under it, and the relayed challenge signature verifies under the ping key |
 
 The ping-response handler accepts two challenge forms: a server-issued stamp verified by
 `verify_challenge_stamp`, or `selfattest:{height}:{block_hash}` checked against the canonical
 microblock hash within the same 14 400-block epoch. See
 [node activation](../economics/node-activation.md).
 
+A ping response signed `ping_dilithium:` may also carry `ping_pubkey`, `ping_delegation_cert` and
+`identity_pubkey`; the node records that delegation only when the certificate verifies under the node's
+identity key and the ping signature verifies under the presented ping key. The identity key is resolved
+from the chain: the on-chain VRF key when the registry holds one; otherwise a presented key, or the one
+the device last proved, accepted only when its SHA3-256 equals the registration's key commitment
+(`vrf_pk_sha3`) or, for a registration that carries no commitment, when it derives the registered wallet
+address. Token refresh, re-registration and relayed attestations resolve it the same way.
+
 ## REST: activation and registration
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| POST | `/api/v1/node-registration/submit` | Accepts `node_type: "light"`; super-node registration is server-initiated |
+| POST | `/api/v1/node-registration/submit` | Accepts `node_type: "light"`; super-node registration is server-initiated. A registration that embeds a burn is refused, retryably, with `{success: false, error, height, head}` while this node's applied height trails the corroborated network head by more than `DEFICIT_BOUND` (45) blocks |
 | POST | `/api/v1/node-reactivation/submit` | Reactivation. Takes `node_id`, `current_height`, `last_macroblock_hash`, `last_macroblock_index` and an optional `api_endpoint` that republishes the node's committed address; omitting it announces the node's own configured endpoint. Accepted for the node itself or from an internal caller address, and the endpoint is validated (`http(s)`, no loopback, RFC 1918 or link-local host) before it is signed. |
 | POST | `/api/v1/nodes` | Super-node registration. Light nodes use `/api/v1/light-node/register`, which issues a post-quantum gossip signature. |
 | POST | `/api/v1/generate-activation-code` | Validates the EON reward wallet. Strict `activation` bucket (5/hour). |
-| GET | `/api/v1/verify-activation` | Resolves a wallet through the O(1) storage reverse index, then genesis wallet constants; `{verified, source, node_id, node_type, wallet_address}` or `{verified:false, current_height}` |
-| GET | `/api/v1/activations/by-wallet` | All nodes for a wallet when `node_type` is omitted; accepts `X-QNet-Wallet` |
+| GET | `/api/v1/verify-activation` | Resolves a wallet to the first of its genesis, super and light node ids that has a registry row (`source: "storage_index"`), then genesis wallet constants (`source: "genesis_constants"`); `{verified, source, node_id, node_type, wallet_address}` or `{verified: false, authoritative, wallet_address, current_height, network_height, message}`; `authoritative` is false while this node is below the network height it has cached, so its negative answer does not settle the wallet |
+| GET | `/api/v1/activations/by-wallet` | With `node_type` omitted, the wallet's node (the first of its genesis, super and light node ids that has a registry row) and, for a genesis wallet, its genesis node; accepts `X-QNet-Wallet` |
 | GET | `/api/v1/activation/price?type=` | Phase 1: `{phase:1, cost, currency:"1DEV", base_cost:1500, min_cost:300, burn_percentage, savings, savings_percent, mechanism:"burn", universal_price:true}`. Phase 2 returns QNC pricing with a network-size multiplier. |
 
 ## REST: rewards
@@ -440,19 +477,20 @@ microblock hash within the same 14 400-block epoch. See
 | POST | `/api/v1/rewards/claim` | Claim accrued rewards |
 | GET | `/api/v1/rewards/pending/{node_id}` | node_type, phase, `pending_rewards` (QNC), `pending_rewards_nano`, `first_unclaimed_epoch`, pools breakdown, epoch range, `last_claim`, `heartbeats{current, required, remaining}`, `is_active`, `is_eligible`, `is_claimable` |
 | POST | `/api/v1/rewards/pending/batch` | `{node_ids: [...]}`, at most 100 → `{success, current_epoch, total_pending_qnc, count, nodes[]}` |
-| GET | `/api/v1/rewards/history/{node_id}?offset=&limit=` | Per-epoch claim records; limit defaults to 10, capped at 100 |
+| GET | `/api/v1/rewards/history/{node_id}?offset=&limit=` | Per-epoch records, newest first. `block_range` is the work window the epoch paid for; `status` is `unavailable`, `not_eligible` (no reward that epoch), `claimed` or `claimable`. limit defaults to 10, capped at 100 |
 | GET | `/api/v1/rewards/pools/{node_id}` | `current_phase`, `phase_description`, pending-rewards pool breakdown, `epoch_accumulated` |
-| GET | `/api/v1/rewards/by-wallet/{wallet_address}` | `{wallet_address, total_nodes, total_pending_qnc, current_epoch, nodes[]}` from the storage wallet→nodes index |
+| GET | `/api/v1/rewards/by-wallet/{wallet_address}` | `{wallet_address, total_nodes, total_pending_qnc, current_epoch, nodes[]}` for the wallet's node, resolved to the first of its genesis, super and light node ids that has a registry row |
 | GET | `/api/v1/rewards/network/stats` | `current_epoch`, `current_height`, `blocks_until_next_epoch`, `epoch_accumulated`, `network_totals`, `emission_rate`. Served from a 30-second cache. |
 | GET | `/api/v1/rewards/summary/{node_id}` | `lifetime_totals`, `epochs{total_epochs, epochs_claimed, epochs_missed, claim_rate_percent}`, `first_claim`, `last_claim`, `averages`, `current_pending_qnc`. Cached per node id, evicted above 5000 entries. |
+| GET | `/api/v1/rewards/epoch/{epoch}/leafset?shard=` | One shard of an epoch's reward leaf set: `{epoch, shard, shards, wallets[[address, amount]]}`; `shard` defaults to 0, and `{epoch, shards: 0, wallets: []}` means this node holds no shards for the epoch. A node that cannot serve an epoch assembles the set from genesis peers and keeps it only if it hashes to the `reward_root` in its own certified macroblock |
 
-The heartbeat requirement reported by `/api/v1/rewards/pending/{node_id}` is 9 for Super, 8 for Full
-and 1 for Light. See [economics](../economics/overview.md).
+The heartbeat requirement reported by `/api/v1/rewards/pending/{node_id}` is 9 for Super (`super_` and
+`genesis_` ids) and 1 for Light (`light_` ids). See [economics](../economics/overview.md).
 
 ### Claiming
 
-A claim requires a mandatory ML-DSA-65 signature over `claim_rewards:{node_id}:{wallet_address}`
-plus the matching public key. A missing signature is rejected before any state is read.
+A claim requires a mandatory ML-DSA-65 signature over
+`q{chain_id}|claim_rewards:{node_id}:{wallet_address}` plus the matching public key. A missing signature is rejected before any state is read.
 
 ```bash
 curl -s -X POST http://127.0.0.1:8001/api/v1/rewards/claim \
@@ -474,7 +512,7 @@ The call above returns a **quote**: `claims_data`, `sign_message`, `claim_timest
 `claims_signature` and the echoed `claim_timestamp` submits the claim and returns
 `{success, tx_hash, amount_qnc, message}`.
 
-A quote covers epochs strictly above `last_claimed_epoch`, ascending, and stops rather than skips at
+A quote walks the epoch grid strictly above `last_claimed_epoch`, ascending, and stops rather than skips at
 the first epoch it cannot serve. When it stops it carries `stopped_at_epoch` and `stopped_reason`:
 
 | `stopped_reason` | Meaning | Client action |
@@ -515,13 +553,13 @@ All four deploy endpoints (`wasm`, `token`, `nft`, `contract`) require a mandato
 | Method | Path | Purpose |
 | --- | --- | --- |
 | GET | `/api/v1/stats` | Nested `network` / `node` / `mempool` / `blockchain` objects plus a timestamp; includes `microblock_interval: 1`, `macroblock_interval: 90` and `current_round = height/30` |
-| GET | `/api/v1/public/stats` | `active_nodes`, `light_nodes`, `full_nodes`, `super_nodes`, `height`, `phase`, `burn_percentage`, `burn_address`, `qnc_burned`, `cached_at`, `cache_ttl_seconds`. Served from a 600-second cache. |
+| GET | `/api/v1/public/stats` | `active_nodes`, `light_nodes`, `full_nodes`, `super_nodes`, `height`, `phase`, `burn_percentage`, `supply_age_seconds` (the age of the 1DEV supply read behind `phase` and `burn_percentage`; all three are `null` when no read is available), `burn_address`, `qnc_burned`, `cached_at`, `cache_ttl_seconds`. Served from a 600-second cache. |
 | GET | `/api/v1/producer/status` | `current_height`, `is_producer`, `current_producer`, `producer_endpoint`, `node_id`, `leadership_round`, `next_rotation_height`, `blocks_until_rotation`, `producer_selection_method`, `consensus_threshold` — computed for the next block |
 | GET | `/api/v1/failovers?limit=&from_height=` | `{failovers[], total_count, from_height, limit, status, statistics, message}` |
 | GET | `/api/v1/network/failovers` | Alias registered against the identical handler |
 | GET | `/api/v1/reputation/history?node_id=&limit=` | `{node_id, current_reputation, history[], total_changes, limit, status}`; `current_reputation` comes from the latest macroblock snapshot |
 | GET | `/api/v1/debug/consensus-position` | `{height, tip_hash, own_window, last_sealed_mb_index, sealed_lag_windows, finalized_height, tc_window_floor, floor_above_window, certified_round_current_window}` |
-| GET | `/api/v1/metrics/performance` | Mempool size and capacity, current height, peers connected, and fields derived from them |
+| GET | `/api/v1/metrics/performance` | `mempool_size`, `current_height` and `peers_connected` read live, plus fields fixed in the handler or computed from those three |
 | GET | `/api/v1/adaptive-bft/timeouts` | `current_height`, timeouts for block 1 / block 10 / the current block, and a config block: `base_timeout_ms 7000`, `timeout_multiplier 1.5`, `max_timeout_ms 20000`, `min_timeout_ms 1000` |
 | GET | `/api/v1/shred-protocol/metrics` | Chunking parameters and status fields for block propagation |
 | GET | `/api/v1/parallel-executor/metrics` | `enabled`, `pipeline_stages` and the five stage names (Validation, DependencyAnalysis, Execution, DilithiumSignature, Commitment), `max_parallel_tx`, `status` |

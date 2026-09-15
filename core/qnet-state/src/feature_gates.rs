@@ -105,6 +105,12 @@ pub const GAS_METERING_GATE_HEIGHT: u64 = qnet_state_gas_metering_height();
 /// binary before this height, or a mixed fleet diverges at the first halt of a window or more.
 pub const SLOT_GAP_REANCHOR_GATE_HEIGHT: u64 = 1_339_200;
 
+/// From this height a contract call's signature must cover its gas price and gas limit, as a transfer's
+/// does; below it the form without them is accepted too, so blocks under the gate replay unchanged. The
+/// form with gas is valid at any height, so an upgraded wallet uses it before the gate. A consensus rule:
+/// every node must run the binary before this height. Window 104.
+pub const CONTRACT_GAS_SIGNED_GATE_HEIGHT: u64 = 1_497_600;
+
 /// Kept as a const fn so the single source of the number stays in `transaction.rs`, where the charging
 /// code documents it, while the registry entry above stays a plain literal expression.
 const fn qnet_state_gas_metering_height() -> u64 { crate::transaction::GAS_METERING_ACTIVATION_HEIGHT }
@@ -126,6 +132,7 @@ pub mod id {
     pub const RECENCY_SPAN_EPOCH: &str = "recency_span_epoch";
     pub const GAS_METERING: &str = "gas_metering";
     pub const SLOT_GAP_REANCHOR: &str = "slot_gap_reanchor";
+    pub const CONTRACT_GAS_SIGNED: &str = "contract_gas_signed";
 }
 
 /// (feature id, activation height). Heights are hardcoded in the binary, so every node agrees
@@ -148,6 +155,7 @@ const ACTIVATIONS: &[(&str, u64)] = &[
     (id::LIGHT_SHARD_BACKUP_OWNERS, LIGHT_SHARD_BACKUP_OWNERS_GATE_HEIGHT),
     (id::GAS_METERING, GAS_METERING_GATE_HEIGHT),
     (id::SLOT_GAP_REANCHOR, SLOT_GAP_REANCHOR_GATE_HEIGHT),
+    (id::CONTRACT_GAS_SIGNED, CONTRACT_GAS_SIGNED_GATE_HEIGHT),
 ];
 
 /// Core gate: active iff `feature` is unlisted (genesis-active default) or `height` has reached
@@ -212,7 +220,7 @@ mod tests {
         const SCHEDULED: &[&str] = &[
             BURN_ATTESTATION_REQUIRED, REGISTRY_ROOT_REQUIRED, LIGHT_REG_EPOCH_ROSTER,
             LOGS_ROOT_REQUIRED, REWARD_EPOCH_ROOT_REQUIRED, LIGHT_KEY_COMMITMENT,
-            LIGHT_SHARD_BACKUP_OWNERS, GAS_METERING, SLOT_GAP_REANCHOR,
+            LIGHT_SHARD_BACKUP_OWNERS, GAS_METERING, SLOT_GAP_REANCHOR, CONTRACT_GAS_SIGNED,
         ];
         for name in SCHEDULED {
             assert!(super::ACTIVATIONS.iter().any(|(f, _)| f == name),

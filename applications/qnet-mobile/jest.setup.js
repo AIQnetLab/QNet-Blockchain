@@ -20,10 +20,11 @@ jest.mock('@react-native-firebase/messaging', () => {
 jest.mock('react-native-background-fetch', () => ({
   __esModule: true,
   default: {
-    configure: jest.fn().mockResolvedValue(0),
+    configure: jest.fn().mockResolvedValue(2), // STATUS_AVAILABLE; iOS rejects with 0 or 1 instead
     finish: jest.fn(),
     stop: jest.fn(),
     scheduleTask: jest.fn().mockResolvedValue(undefined),
+    status: jest.fn().mockResolvedValue(2),
     STATUS_AVAILABLE: 2,
     NETWORK_TYPE_ANY: 0,
   },

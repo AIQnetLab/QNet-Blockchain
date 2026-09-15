@@ -5,6 +5,7 @@ use super::*;
 impl Storage {
     pub fn new(data_dir: &str) -> IntegrationResult<Self> {
         let persistent = PersistentStorage::new(data_dir)?;
+        let mirror = account_mirror::AccountMirror::start(persistent.db.clone())?;
         let transaction_pool = TransactionPool::new();
         
         // Detect node type from environment or config
@@ -162,6 +163,7 @@ impl Storage {
 
         Ok(Self { 
             persistent,
+            mirror,
             transaction_pool,
             max_storage_size,
             current_storage_usage: Arc::new(RwLock::new(0)),

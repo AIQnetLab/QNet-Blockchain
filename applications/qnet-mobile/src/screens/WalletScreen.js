@@ -28,6 +28,7 @@ import Clipboard from '@react-native-clipboard/clipboard';
 import WalletManager from '../components/WalletManager';
 import QRCode from 'react-native-qrcode-svg';
 import {
+  BG_REFRESH_STATUS_KEY,
   checkNodeStatus,
   selfAttestIfNeeded,
   checkServerNodeStatus,
@@ -38,6 +39,7 @@ import {
   teardownLightNode,
 } from '../services/PushService';
 import { getRandomGenesisNode } from '../config/nodes';
+import { TRANSFER_FEE_NANO, TRANSFER_FEE_QNC } from '../config/fees';
 import translations from '../i18n/translations';
 import styles from './WalletScreen.styles';
 
@@ -125,6 +127,12 @@ const PillToggle = React.memo(function PillToggle({ value, onValueChange }) {
   );
 });
 
+// A logo is drawn as-is only when it is a short emoji; text (letters, digits, a URL) gets the one-letter
+// avatar instead, which fits the fixed disc it sits in.
+function isGlyphLogo(logo) {
+  return logo.length > 0 && logo.length <= 8 && !/[A-Za-z0-9]/.test(logo);
+}
+
 function TxCoinMark({ token }) {
   if (!token) {
     // Native QNC → the app's own brand icon.
@@ -134,7 +142,7 @@ function TxCoinMark({ token }) {
     );
   }
   const logo = typeof token.logo === 'string' ? token.logo.trim() : '';
-  const isEmoji = logo.length > 0 && logo.length <= 8 && !logo.startsWith('http');
+  const isEmoji = isGlyphLogo(logo);
   let h = 0;
   const seed = String(token.contract || token.symbol || '?');
   for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) >>> 0;
@@ -212,21 +220,21 @@ const TxRow = React.memo(function TxRow({ tx, onCopy, hideAmounts }) {
       style={{ backgroundColor: '#16213e', borderRadius: 12, padding: 16, marginBottom: 12, borderWidth: 1, borderColor: tx.status === 'pending' ? '#ffaa00' : '#1a1a2e' }}
       onPress={() => onCopy(tx.hash)}
     >
-      <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
-        <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+      <View style={{ flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+        <View style={{ flexDirection: 'row', alignItems: 'center', flexShrink: 1 }}>
           <View style={{ width: 32, height: 32, borderRadius: 16, backgroundColor: isSend ? '#ff444420' : '#00ff8820', alignItems: 'center', justifyContent: 'center', marginRight: 12 }}>
             <Text style={{ color: isSend ? '#ff4444' : '#00ff88', fontSize: 18 }}>{isBurn ? '🔥' : (isSend ? '↑' : '↓')}</Text>
           </View>
-          <View>
+          <View style={{ flexShrink: 1 }}>
             <Text style={{ color: '#fff', fontSize: 16, fontWeight: '600' }}>{isBurn ? '🔥 Burn' : (isSend ? 'Sent' : 'Received')}</Text>
             <Text style={{ color: '#666', fontSize: 12 }}>{dateLabel}</Text>
           </View>
         </View>
-        <View style={{ alignItems: 'flex-end', flexShrink: 1, marginLeft: 8 }}>
+        <View style={{ alignItems: 'flex-end', flexShrink: 1, maxWidth: '100%', marginLeft: 'auto', paddingLeft: 8 }}>
           <View style={{ flexDirection: 'row', alignItems: 'center' }}>
             {/* QNC brand mark for native rows; the token's own icon for a QRC-20 transfer. */}
             <TxCoinMark token={isToken ? { contract: tx.tokenContract, symbol: tx.tokenSymbol, logo: tx.tokenLogo } : null} />
-            <Text style={{ color: isSend ? '#ff4444' : '#00ff88', fontSize: 16, fontWeight: '600' }} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.5}>
+            <Text style={{ color: isSend ? '#ff4444' : '#00ff88', fontSize: 16, fontWeight: '600', flexShrink: 1 }} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.5}>
               {hideAmounts ? '••••' : amountLabel}
             </Text>
             {/* Trust badge: a ✓ marks a token transfer proven against a committee-QC-anchored logs_root
@@ -326,6 +334,7 @@ const WalletScreen = () => {
   const [hiddenTokens, setHiddenTokens] = useState(new Set()); // user-hidden token contracts (spam control)
   const [balancesHidden, setBalancesHidden] = useState(false); // privacy: mask all amounts (persisted)
   const [showHeaderMenu, setShowHeaderMenu] = useState(false); // header ⋮ dropdown
+  const [headerBottom, setHeaderBottom] = useState(0); // header's measured bottom edge; the ⋮ menu card opens 12 dp above it
   const [showTokenManager, setShowTokenManager] = useState(false); // token visibility/search manager
   const [tokenMgrQuery, setTokenMgrQuery] = useState(''); // manager search filter
   // Add-Custom-Token modal
@@ -360,7 +369,6 @@ const WalletScreen = () => {
   const [importStep, setImportStep] = useState(1); // 1 = password, 2 = seed phrase
   const [showSeedConfirm, setShowSeedConfirm] = useState(false);
   const [seedConfirmWords, setSeedConfirmWords] = useState({});
-  const [showSplash, setShowSplash] = useState(true); // Show splash initially
   const [tempWallet, setTempWallet] = useState(null);
   const [wordChoices, setWordChoices] = useState({});
   const [termsAccepted, setTermsAccepted] = useState(false);
@@ -392,6 +400,7 @@ const WalletScreen = () => {
   const [showActivationInput, setShowActivationInput] = useState(false); // Show activation code input modal
   const [activationInputCode, setActivationInputCode] = useState(''); // Input activation code
   const [lightNodeStatus, setLightNodeStatus] = useState(null); // Light node network status
+  const [bgRefreshDenied, setBgRefreshDenied] = useState(false); // iOS Background App Refresh is off for the app
   const lastHistoryAddrRef = useRef(null); // wallet the loaded history belongs to (a switch clears it, an unlock does not)
   const [serverNodeStatus, setServerNodeStatus] = useState(null); // Super node network status
   const [allUserNodes, setAllUserNodes] = useState([]); // All nodes owned by this wallet (unified view)
@@ -582,6 +591,7 @@ const WalletScreen = () => {
       // load status here, else the gate below never fires and the badge sticks on CHECKING forever.
       if (activatedNodeType === 'light' && nodePseudonym && !activationCode) {
         loadLightNodeStatus();
+        promises.push(loadServerNodeStatus()); // the Pending Rewards / Claim block renders from it
       }
 
       // Also load specific node data if activated (runs in PARALLEL with loadAllUserNodes)
@@ -724,6 +734,10 @@ const WalletScreen = () => {
       // Any confirmed answer clears the unconfirmed mark: the doubt was about reachability, and it
       // is now resolved.
       if (status?.registered === true) { AsyncStorage.removeItem('qnet_activation_unconfirmed_at').catch(() => {}); }
+      // Not on chain yet: re-drive the pending registration while a password is held (it signs the TX).
+      if (status?.onChainRegistered === false && password) {
+        walletManager.retryPendingOnchainRegistration(password, status).catch(() => {});
+      }
       // needsReactivation is authoritative ONLY from the server, and ONLY for a genuinely
       // registered node (checkNodeStatus returns needs_reactivation on its registered:true branch).
       // A never-activated node (got code, not yet registered) and a reinstall both return
@@ -739,6 +753,8 @@ const WalletScreen = () => {
         }
         return status;
       });
+      // Only "turned off" (1) gets a hint: a restricted device (0) is not the user's to change.
+      AsyncStorage.getItem(BG_REFRESH_STATUS_KEY).then(v => setBgRefreshDenied(v === '1')).catch(() => {});
       // Update cached block height if checkNodeStatus returned a fresh value
       if (status?.currentBlockHeight > 0) {
         setCurrentBlockHeight(status.currentBlockHeight);
@@ -1120,6 +1136,27 @@ const WalletScreen = () => {
     }
   };
   
+  // Off chain: re-run activation from the stored code. Covers a pending marker and the case with none left
+  // (an admitted TX that never landed); the server hands back a fresh proof for a node not on chain.
+  const handleRetryRegistration = async () => {
+    if (reactivatingNode) return;
+    if (!activationCode || !wallet) {
+      showAlert('Activation code needed', 'Open the Activate tab and enter your activation code to retry the registration.');
+      return;
+    }
+    setReactivatingNode(true);
+    try {
+      const res = await walletManager.registerNodeWithCode(activationCode, wallet.qnetAddress || wallet.address, password);
+      showAlert(res && res.success ? 'Registration' : 'Error',
+        (res && (res.success ? res.message : res.error)) || 'Could not submit the registration. Try again in a minute.');
+    } catch (_) {
+      showAlert('Error', 'Network error. Please try again.');
+    } finally {
+      setReactivatingNode(false);
+      await loadLightNodeStatus();
+    }
+  };
+
   // Load system-generated node pseudonym (read-only)
   const loadNodePseudonym = async (activationCode) => {
     if (!activationCode) return;
@@ -1303,9 +1340,13 @@ const WalletScreen = () => {
           try { await selfAttestIfNeeded(result.pseudonym, true); } catch (_) {}
           // Auto-show the status window (see the restore branch above for why the explicit arg).
           try { await loadLightNodeStatus(result.pseudonym, nodeType); } catch (_) {}
+          // The on-chain stage can still be pending (it retries automatically); say so instead.
+          const activatedText = result.onChainPending
+            ? result.message
+            : `Your ${nodeType} node has been successfully activated and registered in the network.`;
           showAlert(
             'Node Activated!',
-            `Your ${nodeType} node has been successfully activated and registered in the network.\n\nNode ID: ${activationInputCode.trim()}\nSystem ID: ${result.pseudonym}`,
+            `${activatedText}\n\nNode ID: ${activationInputCode.trim()}\nSystem ID: ${result.pseudonym}`,
             [{ text: 'OK', onPress: () => {
               setShowActivationInput(false);
               setActivationInputCode('');
@@ -1576,16 +1617,14 @@ const WalletScreen = () => {
   };
   
   // Set amount as percentage of balance
+  // A native send leaves the fee. Floored: toFixed would round up past what the balance check allows.
   const setAmountPercentage = (percentage) => {
     if (!sendingToken) return;
-    const amount = (sendingToken.balance * percentage / 100).toFixed(sendingToken.symbol === 'QNC' ? 5 : 6);
-    setSendAmount(amount);
+    const dp = sendingToken.symbol === 'QNC' ? 5 : 6;
+    const fee = sendingToken.contract ? 0 : TRANSFER_FEE_QNC;
+    const spendable = Math.max(0, sendingToken.balance - fee) * percentage / 100;
+    setSendAmount((Math.floor(spendable * 10 ** dp) / 10 ** dp).toFixed(dp));
   };
-  
-  // QNet transaction fee constants (matching blockchain MIN_GAS_PRICE = BASE_FEE / TRANSFER_gas)
-  const QNET_GAS_PRICE = 10; // nanoQNC/gas
-  const QNET_GAS_LIMIT = 10000; // for transfers
-  const QNET_TX_FEE = (QNET_GAS_PRICE * QNET_GAS_LIMIT) / 1_000_000_000; // 0.0001 QNC
   
   // v3.34: Poll TX status until confirmed
   // ARCHITECTURE: Polling only updates UI status (confirming → confirmed)
@@ -1706,8 +1745,8 @@ const WalletScreen = () => {
       return;
     }
 
-    // QRC-20 gas is paid in QNC (separate balance), NOT in the token itself — so a token send only
-    // needs `amount` of the token, while native QNC needs amount + fee. Guard each accordingly.
+    // QRC-20 gas is paid in QNC (separate balance), NOT in the token itself: a token send needs `amount` of
+    // the token here and its fee in QNC (checked below, once the call is sized); native QNC needs amount + fee.
     const isTokenSend = sendingToken.network === 'qnet' && !!sendingToken.contract;
     if (isTokenSend) {
       if (amount > sendingToken.balance) {
@@ -1718,12 +1757,12 @@ const WalletScreen = () => {
         return;
       }
     } else {
-      // Calculate total cost (amount + fee) for the native asset
-      const totalCost = amount + QNET_TX_FEE;
-      if (totalCost > sendingToken.balance) {
+      // amount + fee in whole nanoQNC, as the chain debits it
+      const needNano = Math.round(amount * 1e9) + TRANSFER_FEE_NANO;
+      if (needNano > Math.round(sendingToken.balance * 1e9)) {
         setTxResult({
           success: false,
-          error: `Insufficient balance. Need ${totalCost.toFixed(6)} ${sendingToken.symbol} (including fee).\nYour balance: ${sendingToken.balance.toFixed(6)} ${sendingToken.symbol}`,
+          error: `Insufficient balance. Need ${(needNano / 1e9).toFixed(6)} ${sendingToken.symbol} (including the ${TRANSFER_FEE_QNC} QNC fee).\nYour balance: ${sendingToken.balance.toFixed(6)} ${sendingToken.symbol}`,
         });
         return;
       }
@@ -1752,6 +1791,15 @@ const WalletScreen = () => {
         // paid in QNC by the node; the token balance only drops by `amount`.
         const decimals = sendingToken.decimals || 0;
         const amountBaseUnits = walletManager.toBaseUnits(sendAmount, decimals); // string
+        // The call's fee, and a refundable deposit when the recipient holds none of the token yet, are paid in QNC.
+        const need = await walletManager.qrc20TransferQncNeedNano(sendingToken.contract, sendAddress, amountBaseUnits);
+        if (need.needNano > Math.round((tokenBalances.qnc || 0) * 1e9)) {
+          setTxResult({
+            success: false,
+            error: `Not enough QNC for the network fee. Need ${(need.needNano / 1e9).toFixed(6)} QNC${need.depositNano ? ' (fee + refundable 0.01 QNC deposit for a new recipient)' : ''}.\nYour QNC balance: ${fmtAmount(tokenBalances.qnc || 0, 6)} QNC`,
+          });
+          return;
+        }
         const result = await walletManager.qrc20Transfer(
           sendingToken.contract,
           sendAddress,
@@ -1770,7 +1818,7 @@ const WalletScreen = () => {
         });
         // Show the transfer in history immediately as a pending TOKEN row (icon + amount + symbol).
         if (txHash) {
-          addPendingTxToHistory(txHash, sendAddress, amount, 0, {
+          addPendingTxToHistory(txHash, sendAddress, amount, need.feeNano / 1e9, {
             contract: sendingToken.contract,
             symbol: sendingToken.symbol,
             logo: sendingToken.logo,
@@ -1811,7 +1859,7 @@ const WalletScreen = () => {
       if (result.success) {
         const previousBalance = sendingToken.balance;
         const expectedBalance = sendingToken.symbol === 'QNC'
-          ? Math.max(0, previousBalance - amount - QNET_TX_FEE)
+          ? Math.max(0, Math.round(previousBalance * 1e9) - Math.round(amount * 1e9) - TRANSFER_FEE_NANO) / 1e9
           : previousBalance;
 
         // Show success with "confirming" status
@@ -1841,7 +1889,7 @@ const WalletScreen = () => {
           }));
 
           // v3.30: Add to TX history with pending status
-          addPendingTxToHistory(result.txHash, sendAddress, amount, QNET_TX_FEE);
+          addPendingTxToHistory(result.txHash, sendAddress, amount, TRANSFER_FEE_QNC);
 
           // Start polling for TX confirmation
           startTxConfirmationPolling(result.txHash, expectedBalance, previousBalance);
@@ -1878,13 +1926,15 @@ const WalletScreen = () => {
       );
       
       if (result.success) {
-        const claimedAmount = (pendingRewards / 1e9).toFixed(4);
+        // The batch actually submitted (result.amount is QNC), not the displayed pending figure.
+        const claimedAmount = Number(result.amount || 0).toFixed(4);
         
         // v2.80: Rich content with clickable transaction hash
         const richContent = (
           <View style={{ paddingHorizontal: 16, paddingVertical: 12 }}>
             <Text style={[styles.modalContent, { textAlign: 'center', marginBottom: 16 }]}>
-              Successfully claimed {claimedAmount} QNC rewards from your {activatedNodeType} node.
+              Claim for {claimedAmount} QNC from your {activatedNodeType} node submitted - credited when included.
+              {result.stoppedAtEpoch != null ? `\n\nThis claim stopped at epoch ${result.stoppedAtEpoch} - claim again once it is credited to collect anything later.` : ''}
             </Text>
             <Text style={[styles.modalContent, { textAlign: 'center', marginBottom: 8, fontSize: 12, color: '#888' }]}>
               Transaction:
@@ -1910,7 +1960,7 @@ const WalletScreen = () => {
         );
         
         showAlert(
-          'Rewards Claimed!',
+          'Claim Submitted',
           '', // Empty - using richContent
           [
             { text: 'Copy Hash', style: 'default', onPress: () => {
@@ -2148,6 +2198,9 @@ const WalletScreen = () => {
         }
       } catch (_) { /* silent */ }
 
+      // Re-drive a pending on-chain registration: a no-op without a marker; it checks status itself.
+      walletManager.retryPendingOnchainRegistration(password).catch(() => {});
+
       // ── 2. Refresh what is ON SCREEN. Coming back from background (screen unlock included) left the
       //       UI on pre-background state: node status polls every 30 s and the history poll only runs
       //       while the History tab is already open, so an activated node and its transactions both
@@ -2242,13 +2295,8 @@ const WalletScreen = () => {
       const exists = await walletManager.walletExists();
       setHasWallet(exists);
       setLoading(false);
-      // Hide splash if no wallet exists
-      if (!exists) {
-        setShowSplash(false);
-      }
     } catch (error) {
       setLoading(false);
-      setShowSplash(false);
     }
   };
 
@@ -2624,8 +2672,6 @@ const WalletScreen = () => {
       return;
     }
 
-    // Password verified — hide splash, keep loading spinner visible
-    setShowSplash(false);
 
     // Load wallet asynchronously (may trigger vault migration)
     walletManager.loadWallet(pw).then(loadedWallet => {
@@ -2798,8 +2844,6 @@ const WalletScreen = () => {
           `${error.message}\n\nYour wallet is still accessible. Please close the app and try again. If the problem persists, contact support.`,
           [{ text: 'OK', style: 'default' }]
         );
-        // Show the splash again so user can retry
-        setShowSplash(true);
         return;
       }
       // Check if it's a corrupted wallet issue
@@ -3798,7 +3842,7 @@ const WalletScreen = () => {
         transparent={true}
         onRequestClose={() => setShowTermsModal(false)}
       >
-        <View style={styles.termsModal}>
+        <SafeAreaView style={styles.termsModal}>
           <View style={styles.termsModalContent}>
             <View style={styles.termsModalHeader}>
               <Text style={styles.termsModalTitle}>{t('terms_title')}</Text>
@@ -3845,8 +3889,69 @@ const WalletScreen = () => {
               </TouchableOpacity>
             </View>
           </View>
-        </View>
+        </SafeAreaView>
       </Modal>
+    );
+  };
+
+  // Custom alert (styled like extension). Every screen renders it, so an alert raised before the wallet opens is shown too.
+  const renderCustomAlert = () => {
+    if (!customAlert) return null;
+
+    return (
+      <KeyboardAvoidingView style={[styles.modalOverlay, styles.modalOverlayKeyboard]} behavior="padding">
+        <View style={[styles.modalBox, { maxWidth: 350 }]}>
+          {/* Modal Header with icon */}
+          <View style={styles.modalHeader}>
+            <Text style={styles.modalTitle}>
+              {customAlert.title}
+            </Text>
+          </View>
+
+          {/* Modal Content: scrolls inside the box, so a long body never pushes the actions out */}
+          <ScrollView style={styles.modalScroll} keyboardShouldPersistTaps="handled">
+            {customAlert.richContent ? (
+              <View style={styles.modalContentContainer}>
+                {customAlert.richContent}
+              </View>
+            ) : (
+              <Text style={styles.modalContent}>
+                {customAlert.message}
+              </Text>
+            )}
+          </ScrollView>
+
+          {/* Modal Actions */}
+          <View style={styles.modalActions}>
+            {customAlert.buttons.map((button, index) => (
+              <TouchableOpacity
+                key={index}
+                style={[
+                  styles.modalButton,
+                  button.style === 'destructive' ?
+                    styles.modalButtonDanger :
+                    button.style === 'cancel' ?
+                      styles.modalButtonSecondary :
+                      styles.modalButtonPrimary,
+                  { flex: 1 }
+                ]}
+                onPress={() => {
+                  setCustomAlert(null);
+                  if (button.onPress) button.onPress();
+                }}
+              >
+                <Text style={[
+                  styles.modalButtonText,
+                  button.style === 'destructive' && styles.modalButtonTextDanger,
+                  button.style === 'cancel' && styles.modalButtonTextSecondary
+                ]}>
+                  {button.text}
+                </Text>
+              </TouchableOpacity>
+            ))}
+          </View>
+        </View>
+      </KeyboardAvoidingView>
     );
   };
 
@@ -3858,6 +3963,7 @@ const WalletScreen = () => {
           <Text style={styles.subtitle}>Loading...</Text>
         </View>
         {renderTermsModal()}
+        {renderCustomAlert()}
       </SafeAreaView>
     );
   }
@@ -3903,7 +4009,7 @@ const WalletScreen = () => {
                     <Text style={[
                       styles.wordChoiceText,
                       seedConfirmWords[pos] === word && styles.wordChoiceTextSelected
-                    ]}>
+                    ]} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.7}>
                       {word}
                     </Text>
                   </TouchableOpacity>
@@ -3942,6 +4048,7 @@ const WalletScreen = () => {
             <Text style={[styles.buttonText, styles.secondaryButtonText]}>Back</Text>
           </TouchableOpacity>
         </ScrollView>
+        {renderCustomAlert()}
       </SafeAreaView>
     );
   }
@@ -3987,6 +4094,7 @@ const WalletScreen = () => {
               <Text style={[styles.buttonText, styles.secondaryButtonText]}>Import Existing Wallet</Text>
             </TouchableOpacity>
           </View>
+          {renderCustomAlert()}
         </SafeAreaView>
       );
     }
@@ -3997,6 +4105,7 @@ const WalletScreen = () => {
           style={[styles.container, Platform.OS === 'ios' && {paddingTop: 44}]} 
           edges={Platform.OS === 'ios' ? ['left', 'right'] : ['top', 'left', 'right']}
         >
+          <KeyboardAvoidingView style={styles.keyboardAvoid} behavior="padding">
           <ScrollView
             contentContainerStyle={styles.formContent}
             showsVerticalScrollIndicator={true}
@@ -4100,7 +4209,9 @@ const WalletScreen = () => {
               <Text style={[styles.buttonText, styles.secondaryButtonText]}>Back</Text>
             </TouchableOpacity>
           </ScrollView>
+          </KeyboardAvoidingView>
           {renderTermsModal()}
+          {renderCustomAlert()}
         </SafeAreaView>
       );
     }
@@ -4126,13 +4237,13 @@ const WalletScreen = () => {
               {words.map((word, index) => (
                 <View key={index} style={[styles.seedWordContainer, {padding: 8, marginBottom: 6}]}>
                   <Text style={[styles.seedWordNumber, {fontSize: 11}]}>{index + 1}</Text>
-                  <Text style={[styles.seedWordText, {fontSize: 13}]}>{word}</Text>
+                  <Text style={[styles.seedWordText, {fontSize: 13}]} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.5}>{word}</Text>
                 </View>
               ))}
             </View>
             
             <TouchableOpacity 
-              style={[styles.button, styles.secondaryButton, {marginVertical: 10, minHeight: 44}]}
+              style={[styles.button, styles.secondaryButton, {marginVertical: 10}]}
               onPress={() => {
                 try {
                   // Copy seed phrase to clipboard
@@ -4152,12 +4263,12 @@ const WalletScreen = () => {
               <Text style={[styles.buttonText, styles.secondaryButtonText]}>Copy Recovery Phrase</Text>
             </TouchableOpacity>
             
-            <Text style={[styles.warningText, {marginTop: 10, marginBottom: 15, fontSize: 13}]}>
+            <Text style={[styles.seedWarningText, {marginTop: 10, marginBottom: 15, fontSize: 13}]}>
               ⚠️ Never share this with anyone!
             </Text>
             
             <TouchableOpacity 
-              style={[styles.button, {marginBottom: 20, minHeight: 44}]}
+              style={[styles.button, {marginBottom: 20}]}
               onPress={() => {
                 setShowSeedConfirm(true);
                 setShowCreateOptions(false);
@@ -4166,6 +4277,7 @@ const WalletScreen = () => {
               <Text style={styles.buttonText}>I Wrote It Down</Text>
             </TouchableOpacity>
           </ScrollView>
+          {renderCustomAlert()}
         </SafeAreaView>
       );
     }
@@ -4178,6 +4290,7 @@ const WalletScreen = () => {
             style={[styles.container, Platform.OS === 'ios' && {paddingTop: 44}]} 
             edges={Platform.OS === 'ios' ? ['left', 'right'] : ['top', 'left', 'right']}
           >
+            <KeyboardAvoidingView style={styles.keyboardAvoid} behavior="padding">
             <ScrollView
               contentContainerStyle={styles.formContent}
               showsVerticalScrollIndicator={true}
@@ -4186,11 +4299,11 @@ const WalletScreen = () => {
               keyboardShouldPersistTaps="handled"
             >
               <Text style={styles.title}>Import Wallet</Text>
-              <Text style={styles.subtitle}>Step 1: Create password</Text>
+              <Text style={styles.subtitle}>Step 1: Create a password (min 8 characters)</Text>
               
               <TextInput
                 style={[styles.input, passwordError && password.length > 0 && password.length < 8 ? styles.inputError : null]}
-                placeholder="Enter password (min 8 characters)"
+                placeholder="Enter password"
                 placeholderTextColor="#888"
                 secureTextEntry
                 value={password}
@@ -4269,7 +4382,9 @@ const WalletScreen = () => {
                 <Text style={[styles.buttonText, styles.secondaryButtonText]}>Back</Text>
               </TouchableOpacity>
             </ScrollView>
+            </KeyboardAvoidingView>
             {renderTermsModal()}
+            {renderCustomAlert()}
           </SafeAreaView>
         );
       }
@@ -4281,6 +4396,7 @@ const WalletScreen = () => {
             style={[styles.container, Platform.OS === 'ios' && {paddingTop: 44}]} 
             edges={Platform.OS === 'ios' ? ['left', 'right'] : ['top', 'left', 'right']}
           >
+            <KeyboardAvoidingView style={styles.keyboardAvoid} behavior="padding">
             <ScrollView
               contentContainerStyle={styles.formContent}
               showsVerticalScrollIndicator={true}
@@ -4358,7 +4474,9 @@ const WalletScreen = () => {
                 <Text style={[styles.buttonText, styles.secondaryButtonText]}>Back</Text>
               </TouchableOpacity>
             </ScrollView>
+            </KeyboardAvoidingView>
             {renderTermsModal()}
+            {renderCustomAlert()}
           </SafeAreaView>
         );
       }
@@ -4400,6 +4518,10 @@ const WalletScreen = () => {
                 returnKeyType="done"
               />
 
+              {unlockError ? (
+                <Text style={styles.errorText}>{unlockError}</Text>
+              ) : null}
+
               <TouchableOpacity 
                 style={styles.button}
                 onPress={unlockWallet}
@@ -4412,22 +4534,16 @@ const WalletScreen = () => {
 
               {biometricEnabled && (
                 <TouchableOpacity
-                  style={[styles.button, { backgroundColor: '#1a1a2e', marginTop: 12 }]}
+                  style={[styles.button, styles.secondaryButton]}
                   onPress={handleBiometricUnlock}
                 >
-                  <Text style={styles.buttonText}>{t('biometric_unlock')}</Text>
+                  <Text style={[styles.buttonText, styles.secondaryButtonText]}>{t('biometric_unlock')}</Text>
                 </TouchableOpacity>
               )}
             </>
           )}
         </View>
-
-        {/* Error Toast */}
-        {unlockError ? (
-          <View style={styles.errorToast}>
-            <Text style={styles.errorToastText}>{unlockError}</Text>
-          </View>
-        ) : null}
+        {renderCustomAlert()}
       </SafeAreaView>
     );
   }
@@ -4454,7 +4570,7 @@ const WalletScreen = () => {
                         <Text style={styles.txSuccessIconText}>✓</Text>
                       </View>
                       <Text style={styles.txResultTitle}>Transaction Sent!</Text>
-                      <Text style={styles.txResultAmount}>
+                      <Text style={styles.txResultAmount} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.5}>
                         {txResult.amount} {txResult.symbol}
                       </Text>
                       <Text style={styles.txResultTo}>
@@ -4496,13 +4612,18 @@ const WalletScreen = () => {
             );
           }
 
+          // The fee the chain prepays for this send: a transfer's is fixed, a token call's follows its size.
+          const feePreviewNano = !sendingToken?.contract ? TRANSFER_FEE_NANO : (() => {
+            try {
+              return walletManager.qrc20TransferFeeNano(sendingToken.contract, sendAddress || '',
+                walletManager.toBaseUnits(sendAmount || '0', sendingToken.decimals || 0));
+            } catch (_) { return null; }
+          })();
+
           // Send Form Screen
           return (
             <TabBox key="assets-send" deps={[showSendScreen, sendingToken, sendAddress, sendAmount, sendingTransaction, balancesHidden]} render={() => (
-            <KeyboardAvoidingView
-              style={{ flex: 1 }}
-              behavior={Platform.OS === 'ios' ? 'padding' : undefined}
-            >
+            <KeyboardAvoidingView style={styles.keyboardAvoid} behavior="padding">
             <ScrollView
               style={styles.content}
               contentContainerStyle={[styles.scrollContentContainer, styles.sendScreenContainer]}
@@ -4582,16 +4703,18 @@ const WalletScreen = () => {
               <View style={styles.sendFeeContainer}>
                 <Text style={styles.sendFeeLabel}>Network Fee</Text>
                 <Text style={styles.sendFeeValue}>
-                  {sendingToken.network === 'qnet' ? '0.00001 QNC' : '~0.00025 SOL'}
+                  {feePreviewNano == null ? '—' : `${fmtAmount(feePreviewNano / 1e9, 6)} QNC`}
                 </Text>
               </View>
               
-              {/* Total Cost */}
+              {/* Total Cost: the sum the balance check charges (amount + fee for QNC; a QRC-20 send pays its fee in QNC). */}
               {sendAmount && parseFloat(sendAmount) > 0 && (
                 <View style={styles.sendTotalContainer}>
                   <Text style={styles.sendTotalLabel}>Total</Text>
                   <Text style={styles.sendTotalValue}>
-                    {(parseFloat(sendAmount) + (sendingToken.network === 'qnet' ? 0.00001 : 0.00025)).toFixed(6)} {sendingToken.symbol}
+                    {sendingToken.contract
+                      ? `${sendAmount} ${sendingToken.symbol} + ${feePreviewNano == null ? '—' : fmtAmount(feePreviewNano / 1e9, 6)} QNC`
+                      : `${((Math.round(parseFloat(sendAmount) * 1e9) + TRANSFER_FEE_NANO) / 1e9).toFixed(6)} ${sendingToken.symbol}`}
                   </Text>
                 </View>
               )}
@@ -4759,7 +4882,7 @@ const WalletScreen = () => {
                         // is never loaded as <Image> here — it would leak the device IP/timing to an
                         // attacker-controlled host — so a URL logo falls through to the letter avatar.
                         const logo = typeof tk.logo === 'string' ? tk.logo.trim() : '';
-                        const isEmoji = logo.length > 0 && logo.length <= 8 && !logo.startsWith('http');
+                        const isEmoji = isGlyphLogo(logo);
                         let h = 0;
                         const seed = String(tk.contract || tk.symbol || '?');
                         for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) >>> 0;
@@ -4888,11 +5011,7 @@ const WalletScreen = () => {
                   {selectedNetwork === 'qnet' ? 'Your QNet Address' : 'Your Solana Address'}
                 </Text>
                 
-                <TouchableOpacity 
-                  style={[
-                    styles.addressItem,
-                    copiedAddress.includes('receive') && styles.addressItemCopied
-                  ]}
+                <TouchableOpacity
                   onPress={() => {
                     const addressType = selectedNetwork === 'qnet' ? 'qnet-receive' : 'solana-receive';
                     copyToClipboard(currentReceiveAddress, addressType);
@@ -5093,12 +5212,7 @@ const WalletScreen = () => {
                 
                 // Create rich content for confirmation modal (compact version)
                 const confirmRichContent = (
-                  <ScrollView 
-                    style={{ maxHeight: 350 }} 
-                    showsVerticalScrollIndicator={true}
-                    bounces={true}
-                    scrollEnabled={true}
-                  >
+                  <View>
                     <View style={{ paddingHorizontal: 15, paddingVertical: 10 }}>
                       <Text style={[styles.modalContent, { fontSize: 15, fontWeight: 'bold', marginBottom: 10 }]}>
                         {nodeTypeName} Activation
@@ -5155,7 +5269,7 @@ const WalletScreen = () => {
                       )}
                     </View>
                     </View>
-                  </ScrollView>
+                  </View>
                 );
                 
                 showAlert(
@@ -5304,12 +5418,7 @@ const WalletScreen = () => {
                             
                             // Create rich content for the modal
                             const richContent = (
-                              <ScrollView 
-                                style={{ maxHeight: 400 }} 
-                                showsVerticalScrollIndicator={true}
-                                bounces={true}
-                                scrollEnabled={true}
-                              >
+                              <View>
                                 <View style={{ paddingHorizontal: 16, paddingVertical: 12 }}>
                                   <Text style={[styles.modalContent, { textAlign: 'left', marginBottom: 8, fontSize: 13 }]}>
                                     <Text style={{ fontWeight: 'bold' }}>Activation Code:</Text>
@@ -5350,7 +5459,7 @@ const WalletScreen = () => {
                                     </Text>
                                   </TouchableOpacity>
                                 </View>
-                              </ScrollView>
+                              </View>
                             );
                             
                             showAlert(
@@ -5749,6 +5858,8 @@ const WalletScreen = () => {
                 const nodeConfirmed = activatedNodeType === 'light'
                   ? lightNodeStatus?.registered === true
                   : (serverNodeStatus?.success === true && serverNodeStatus?.registered !== false);
+                // Gossiped but not on chain: it earns nothing yet, so it must not read as ONLINE / Active.
+                const lightOnChainPending = activatedNodeType === 'light' && lightNodeStatus?.onChainRegistered === false;
                 if (!nodeConfirmed) {
                   return (
                     <View style={styles.nodeMonitoringCard}>
@@ -5757,7 +5868,7 @@ const WalletScreen = () => {
                       </Text>
                       {activatedNodeType === 'light' ? (
                         <TouchableOpacity
-                          style={[styles.button, styles.primaryButton, {marginTop: 16}]}
+                          style={[styles.button,{marginTop: 16}]}
                           onPress={() => {
                             setShowActivationInput(true);
                             setActivationInputCode('');
@@ -5788,35 +5899,37 @@ const WalletScreen = () => {
                         <>
                           <Text style={styles.nodeMonitoringLabel}>Node name:</Text>
                           <Text style={styles.nodeMonitoringValue}>
-                          {nodePseudonym}
-                        </Text>
+                            {nodePseudonym}
+                          </Text>
                           <View style={{marginTop: 12}}>
                             <Text style={styles.nodeMonitoringLabel}>Type of node:</Text>
-                    <Text style={styles.nodeMonitoringValue}>
+                            <Text style={styles.nodeMonitoringValue}>
                               {activatedNodeType.charAt(0).toUpperCase() + activatedNodeType.slice(1)} Node
-                    </Text>
-                  </View>
+                            </Text>
+                          </View>
                         </>
                       ) : (
                         <Text style={styles.nodeMonitoringTitle}>
                           {activatedNodeType.charAt(0).toUpperCase() + activatedNodeType.slice(1)} Node
-                    </Text>
+                        </Text>
                       )}
                     </View>
                     <View style={[
                       styles.statusBadge,
                       // Confirmed node only: Light keys off reactivation state, Super off liveness.
                       activatedNodeType === 'light'
-                        ? (lightNodeStatus.needsReactivation ? styles.statusBadgeInactive : styles.statusBadgeActivated)
+                        ? (lightOnChainPending ? styles.statusBadgeActive
+                          : lightNodeStatus.needsReactivation ? styles.statusBadgeInactive : styles.statusBadgeActivated)
                         : (serverNodeStatus.isOnline ? styles.statusBadgeActivated : styles.statusBadgeInactive)
                     ]}>
                       <Text style={[
                         styles.statusBadgeText,
+                        lightOnChainPending && styles.statusBadgeTextActive,
                         ((activatedNodeType === 'light' && lightNodeStatus.needsReactivation) ||
                          (activatedNodeType !== 'light' && !serverNodeStatus.isOnline)) && {color: '#ff3b30'}
                       ]}>
                         {activatedNodeType === 'light'
-                          ? (lightNodeStatus.needsReactivation ? 'OFFLINE' : 'ONLINE')
+                          ? (lightOnChainPending ? 'PENDING' : lightNodeStatus.needsReactivation ? 'OFFLINE' : 'ONLINE')
                           : (serverNodeStatus.isOnline ? 'ONLINE' : 'OFFLINE')}
                       </Text>
                     </View>
@@ -5835,7 +5948,7 @@ const WalletScreen = () => {
                         </Text>
                       </View>
                       <TouchableOpacity
-                        style={[styles.button, styles.primaryButton, {marginTop: 12}, reactivatingNode && styles.buttonDisabled]}
+                        style={[styles.button,{marginTop: 12}, reactivatingNode && styles.buttonDisabled]}
                         onPress={handleReactivateNode}
                         disabled={reactivatingNode}
                       >
@@ -5856,14 +5969,29 @@ const WalletScreen = () => {
                     <Text style={[styles.rewardValue, {
                       // Confirmed node only: Light keys off reactivation state, Super off liveness.
                       color: activatedNodeType === 'light'
-                        ? (lightNodeStatus.needsReactivation ? '#ff9500' : '#34c759')
+                        ? (lightOnChainPending || lightNodeStatus.needsReactivation ? '#ff9500' : '#34c759')
                         : (serverNodeStatus.isOnline ? '#34c759' : '#ff3b30')
                     }]}>
                       {activatedNodeType === 'light'
-                        ? (lightNodeStatus.needsReactivation ? 'Needs Reactivation' : 'Active')
+                        ? (lightOnChainPending ? 'Registration pending on chain - not earning yet'
+                          : lightNodeStatus.needsReactivation ? 'Needs Reactivation' : 'Active')
                         : (serverNodeStatus.isOnline ? 'Active' : 'Server Offline')}
                     </Text>
                   </View>
+                  {lightOnChainPending && (
+                    <TouchableOpacity
+                      style={[styles.button,{marginTop: 4, marginBottom: 12}, reactivatingNode && styles.buttonDisabled]}
+                      onPress={handleRetryRegistration}
+                      disabled={reactivatingNode}
+                    >
+                      <Text style={styles.buttonText}>{reactivatingNode ? 'Retrying...' : 'Retry registration'}</Text>
+                    </TouchableOpacity>
+                  )}
+                  {activatedNodeType === 'light' && bgRefreshDenied && (
+                    <Text style={styles.rewardHint}>
+                      Background App Refresh is off for QNet Wallet, so the node is proven only while the app is open. Turn it on in Settings.
+                    </Text>
+                  )}
                   
                   {/* ALL NODES: Unified reward display (light/super/genesis) */}
                   {serverNodeStatus?.success && (
@@ -5912,6 +6040,10 @@ const WalletScreen = () => {
                           })()}
                         </Text>
                       </View>
+                      {/* Rewards are pull-only: nothing reaches the balance until a claim lands. */}
+                      {(serverNodeStatus.pendingRewards || 0) >= 1e9 && (
+                        <Text style={styles.rewardHint}>Not in your balance until you claim it</Text>
+                      )}
                     </>
                   )}
 
@@ -5949,7 +6081,7 @@ const WalletScreen = () => {
                 </Text>
 
                 <TouchableOpacity
-                  style={[styles.button, styles.primaryButton, { marginTop: 20 }]}
+                  style={[styles.button,{ marginTop: 20 }]}
                   onPress={() => {
                     setActiveTab('activate');
                   }}
@@ -6145,34 +6277,12 @@ const WalletScreen = () => {
     }
   };
 
-  // Show splash screen after unlock while loading wallet
-  if (hasWallet && !wallet && showSplash) {
-    return (
-      <SafeAreaView 
-        style={[styles.container, Platform.OS === 'ios' && {paddingTop: 44}]} 
-        edges={Platform.OS === 'ios' ? ['left', 'right'] : ['top', 'left', 'right']}
-      >
-        <View style={styles.centerContent}>
-          <View style={styles.logoContainer}>
-            <View style={styles.logoOuter}>
-              <View style={styles.logoMiddle}>
-                <View style={styles.logoInner}>
-                  <Text style={styles.logoText}>Q</Text>
-                </View>
-              </View>
-            </View>
-          </View>
-        </View>
-      </SafeAreaView>
-    );
-  }
-
   return (
     <SafeAreaView 
       style={[styles.container, Platform.OS === 'ios' && {paddingTop: 44}]} 
       edges={Platform.OS === 'ios' ? ['left', 'right'] : ['top', 'left', 'right']}
     >
-      <View style={styles.header}>
+      <View style={styles.header} onLayout={(e) => setHeaderBottom(e.nativeEvent.layout.y + e.nativeEvent.layout.height)}>
         <Text style={styles.title}>QNet Wallet</Text>
         {/* Overflow menu: token manager / hide balances / wallet settings */}
         <TouchableOpacity
@@ -6199,7 +6309,7 @@ const WalletScreen = () => {
             }
           }}
         >
-          <Text style={[styles.tabText, activeTab === 'assets' && styles.activeTabText]}>Assets</Text>
+          <Text style={[styles.tabText, activeTab === 'assets' && styles.activeTabText]} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.7}>Assets</Text>
         </TouchableOpacity>
         
         {/* Send tab hidden - use Assets to send tokens */}
@@ -6211,7 +6321,7 @@ const WalletScreen = () => {
             setNodeStatus(null); // Reset node selection when leaving activate tab
           }}
         >
-          <Text style={[styles.tabText, activeTab === 'receive' && styles.activeTabText]}>Receive</Text>
+          <Text style={[styles.tabText, activeTab === 'receive' && styles.activeTabText]} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.7}>Receive</Text>
         </TouchableOpacity>
         
         <TouchableOpacity 
@@ -6221,7 +6331,7 @@ const WalletScreen = () => {
             setNodeStatus(null); // Reset node selection when switching tabs
           }}
         >
-          <Text style={[styles.tabText, activeTab === 'activate' && styles.activeTabText]}>Activate</Text>
+          <Text style={[styles.tabText, activeTab === 'activate' && styles.activeTabText]} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.7}>Activate</Text>
         </TouchableOpacity>
         
         <TouchableOpacity 
@@ -6231,7 +6341,7 @@ const WalletScreen = () => {
             loadTxHistory(); // Refresh history when tab opened
           }}
         >
-          <Text style={[styles.tabText, activeTab === 'history' && styles.activeTabText]}>History</Text>
+          <Text style={[styles.tabText, activeTab === 'history' && styles.activeTabText]} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.7}>History</Text>
         </TouchableOpacity>
         
         <TouchableOpacity 
@@ -6241,7 +6351,7 @@ const WalletScreen = () => {
             setNodeStatus(null); // Reset node selection when leaving activate tab
           }}
         >
-          <Text style={[styles.tabText, activeTab === 'node' && styles.activeTabText]}>Node</Text>
+          <Text style={[styles.tabText, activeTab === 'node' && styles.activeTabText]} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.7}>Node</Text>
         </TouchableOpacity>
       </View>
 
@@ -6252,36 +6362,38 @@ const WalletScreen = () => {
 
       {/* Change Password Modal */}
       {showChangePassword && (
-        <View style={styles.modalOverlay}>
+        <KeyboardAvoidingView style={[styles.modalOverlay, styles.modalOverlayKeyboard]} behavior="padding">
           <View style={styles.modalBox}>
-            <Text style={styles.modalTitle}>{t('change_password')}</Text>
-            
-            <TextInput
-              style={styles.input}
-              placeholder={t('enter_current_password')}
-              placeholderTextColor="#888"
-              secureTextEntry
-              value={currentPassword}
-              onChangeText={setCurrentPassword}
-            />
+            <ScrollView style={styles.modalScroll} contentContainerStyle={styles.modalBody} keyboardShouldPersistTaps="handled">
+              <Text style={styles.modalTitle}>{t('change_password')}</Text>
 
-            <TextInput
-              style={styles.input}
-              placeholder={t('enter_new_password')}
-              placeholderTextColor="#888"
-              secureTextEntry
-              value={newPassword}
-              onChangeText={setNewPassword}
-            />
+              <TextInput
+                style={styles.input}
+                placeholder={t('enter_current_password')}
+                placeholderTextColor="#888"
+                secureTextEntry
+                value={currentPassword}
+                onChangeText={setCurrentPassword}
+              />
 
-            <TextInput
-              style={styles.input}
-              placeholder={t('confirm_new_password')}
-              placeholderTextColor="#888"
-              secureTextEntry
-              value={confirmNewPassword}
-              onChangeText={setConfirmNewPassword}
-            />
+              <TextInput
+                style={styles.input}
+                placeholder={t('enter_new_password')}
+                placeholderTextColor="#888"
+                secureTextEntry
+                value={newPassword}
+                onChangeText={setNewPassword}
+              />
+
+              <TextInput
+                style={styles.input}
+                placeholder={t('confirm_new_password')}
+                placeholderTextColor="#888"
+                secureTextEntry
+                value={confirmNewPassword}
+                onChangeText={setConfirmNewPassword}
+              />
+            </ScrollView>
 
             <View style={styles.modalActions}>
               <TouchableOpacity 
@@ -6305,14 +6417,14 @@ const WalletScreen = () => {
               </TouchableOpacity>
             </View>
           </View>
-        </View>
+        </KeyboardAvoidingView>
       )}
 
       {/* Header ⋮ overflow menu */}
       {showHeaderMenu && (
         <>
           <TouchableOpacity style={styles.menuBackdrop} activeOpacity={1} onPress={() => setShowHeaderMenu(false)} />
-          <View style={[styles.menuCard, { top: Platform.OS === 'ios' ? 104 : 62 }]}>
+          <View style={[styles.menuCard, { top: headerBottom - 12 }]}>
             <TouchableOpacity
               style={styles.menuItem}
               onPress={() => { setShowHeaderMenu(false); setTokenMgrQuery(''); setShowTokenManager(true); }}
@@ -6341,10 +6453,10 @@ const WalletScreen = () => {
 
       {/* Token manager: search + per-token visibility + add-by-address; local view only, never touches balances. */}
       {showTokenManager && (
-        <View style={styles.modalOverlay}>
+        <KeyboardAvoidingView style={[styles.modalOverlay, styles.modalOverlayKeyboard]} behavior="padding">
           <View style={[styles.modalBox, styles.mgrBox]}>
             <View style={styles.mgrHeader}>
-              <Text style={styles.modalTitle}>Manage tokens</Text>
+              <Text style={[styles.modalTitle, styles.mgrTitle]}>Manage tokens</Text>
               <TouchableOpacity onPress={() => { setShowTokenManager(false); setAddTokenError(''); }} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
                 <Text style={styles.mgrClose}>✕</Text>
               </TouchableOpacity>
@@ -6373,7 +6485,7 @@ const WalletScreen = () => {
                 const visible = !addable && !hiddenTokens.has(tk.contract);
                 // Inert letter/emoji avatar (never load a node-supplied URL logo); QNC = app icon.
                 const logo = typeof tk.logo === 'string' ? tk.logo.trim() : '';
-                const isEmoji = logo.length > 0 && logo.length <= 8 && !logo.startsWith('http');
+                const isEmoji = isGlyphLogo(logo);
                 let h = 0; const seed = String(tk.contract || tk.symbol || '?');
                 for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) >>> 0;
                 const bg = isEmoji ? '#0b1a22' : `hsl(${h % 360}, 60%, 42%)`;
@@ -6402,29 +6514,31 @@ const WalletScreen = () => {
               }}
             />
           </View>
-        </View>
+        </KeyboardAvoidingView>
       )}
 
       {/* Add Custom QRC-20 Token Modal */}
       {showAddTokenModal && (
-        <View style={styles.modalOverlay}>
+        <KeyboardAvoidingView style={[styles.modalOverlay, styles.modalOverlayKeyboard]} behavior="padding">
           <View style={styles.modalBox}>
-            <Text style={styles.modalTitle}>Add token</Text>
-            <Text style={styles.modalContent}>
-              Enter the QRC-20 contract address (64 hex characters).
-            </Text>
-            <TextInput
-              style={styles.input}
-              placeholder="Contract address"
-              placeholderTextColor="#888"
-              value={addTokenAddress}
-              onChangeText={(txt) => { setAddTokenAddress(txt.trim()); setAddTokenError(''); }}
-              autoCapitalize="none"
-              autoCorrect={false}
-            />
-            {!!addTokenError && (
-              <Text style={[styles.modalContent, { color: '#ff5555' }]}>{addTokenError}</Text>
-            )}
+            <ScrollView style={styles.modalScroll} contentContainerStyle={styles.modalBody} keyboardShouldPersistTaps="handled">
+              <Text style={styles.modalTitle}>Add token</Text>
+              <Text style={styles.modalContent}>
+                Enter the QRC-20 contract address (64 hex characters).
+              </Text>
+              <TextInput
+                style={styles.input}
+                placeholder="Contract address"
+                placeholderTextColor="#888"
+                value={addTokenAddress}
+                onChangeText={(txt) => { setAddTokenAddress(txt.trim()); setAddTokenError(''); }}
+                autoCapitalize="none"
+                autoCorrect={false}
+              />
+              {!!addTokenError && (
+                <Text style={[styles.modalContent, { color: '#ff5555' }]}>{addTokenError}</Text>
+              )}
+            </ScrollView>
             <View style={styles.modalActions}>
               <TouchableOpacity
                 style={[styles.modalButton, styles.modalButtonSecondary, { flex: 1 }]}
@@ -6442,24 +6556,26 @@ const WalletScreen = () => {
               </TouchableOpacity>
             </View>
           </View>
-        </View>
+        </KeyboardAvoidingView>
       )}
 
       {/* Biometric Enable Password Prompt */}
       {showBiometricPasswordPrompt && (
-        <View style={styles.modalOverlay}>
+        <KeyboardAvoidingView style={[styles.modalOverlay, styles.modalOverlayKeyboard]} behavior="padding">
           <View style={styles.modalBox}>
-            <Text style={styles.modalTitle}>{t('enable_biometric')}</Text>
-            <TextInput
-              style={styles.input}
-              placeholder={t('enter_current_password')}
-              placeholderTextColor="#888"
-              secureTextEntry
-              value={biometricPassword}
-              onChangeText={setBiometricPassword}
-              onSubmitEditing={handleConfirmBiometricEnable}
-              returnKeyType="done"
-            />
+            <ScrollView style={styles.modalScroll} contentContainerStyle={styles.modalBody} keyboardShouldPersistTaps="handled">
+              <Text style={styles.modalTitle}>{t('enable_biometric')}</Text>
+              <TextInput
+                style={styles.input}
+                placeholder={t('enter_current_password')}
+                placeholderTextColor="#888"
+                secureTextEntry
+                value={biometricPassword}
+                onChangeText={setBiometricPassword}
+                onSubmitEditing={handleConfirmBiometricEnable}
+                returnKeyType="done"
+              />
+            </ScrollView>
             <View style={styles.modalActions}>
               <TouchableOpacity
                 style={[styles.modalButton, styles.modalButtonSecondary, {flex: 1}]}
@@ -6475,26 +6591,28 @@ const WalletScreen = () => {
               </TouchableOpacity>
             </View>
           </View>
-        </View>
+        </KeyboardAvoidingView>
       )}
 
       {/* Export Seed Phrase Modal */}
       {showExportSeed && (
-        <View style={styles.modalOverlay}>
+        <KeyboardAvoidingView style={[styles.modalOverlay, styles.modalOverlayKeyboard]} behavior="padding">
           <View style={styles.modalBox}>
-            <Text style={styles.modalTitle}>{t('export_recovery_phrase')}</Text>
-            <Text style={styles.modalWarning}>
-              {t('recovery_phrase_warning')}
-            </Text>
-            
-            <TextInput
-              style={styles.input}
-              placeholder={t('enter_password_to_reveal')}
-              placeholderTextColor="#888"
-              secureTextEntry
-              value={exportPassword}
-              onChangeText={setExportPassword}
-            />
+            <ScrollView style={styles.modalScroll} contentContainerStyle={styles.modalBody} keyboardShouldPersistTaps="handled">
+              <Text style={styles.modalTitle}>{t('export_recovery_phrase')}</Text>
+              <Text style={styles.modalWarning}>
+                {t('recovery_phrase_warning')}
+              </Text>
+
+              <TextInput
+                style={styles.input}
+                placeholder={t('enter_password_to_reveal')}
+                placeholderTextColor="#888"
+                secureTextEntry
+                value={exportPassword}
+                onChangeText={setExportPassword}
+              />
+            </ScrollView>
 
             <View style={styles.modalActions}>
               <TouchableOpacity 
@@ -6516,26 +6634,28 @@ const WalletScreen = () => {
               </TouchableOpacity>
             </View>
           </View>
-        </View>
+        </KeyboardAvoidingView>
       )}
 
       {/* Export Activation Code Modal */}
       {showExportActivation && (
-        <View style={styles.modalOverlay}>
+        <KeyboardAvoidingView style={[styles.modalOverlay, styles.modalOverlayKeyboard]} behavior="padding">
           <View style={styles.modalBox}>
-            <Text style={styles.modalTitle}>{t('export_activation_code')}</Text>
-            <Text style={styles.modalWarning}>
-              {t('activation_code_warning')}
-            </Text>
-            
-            <TextInput
-              style={styles.input}
-              placeholder={t('enter_password_to_generate')}
-              placeholderTextColor="#888"
-              secureTextEntry
-              value={exportPassword}
-              onChangeText={setExportPassword}
-            />
+            <ScrollView style={styles.modalScroll} contentContainerStyle={styles.modalBody} keyboardShouldPersistTaps="handled">
+              <Text style={styles.modalTitle}>{t('export_activation_code')}</Text>
+              <Text style={styles.modalWarning}>
+                {t('activation_code_warning')}
+              </Text>
+
+              <TextInput
+                style={styles.input}
+                placeholder={t('enter_password_to_generate')}
+                placeholderTextColor="#888"
+                secureTextEntry
+                value={exportPassword}
+                onChangeText={setExportPassword}
+              />
+            </ScrollView>
 
             <View style={styles.modalActions}>
               <TouchableOpacity 
@@ -6557,34 +6677,36 @@ const WalletScreen = () => {
               </TouchableOpacity>
             </View>
           </View>
-        </View>
+        </KeyboardAvoidingView>
       )}
 
       {/* Auto-Lock Time Picker Modal */}
       {showAutoLockPicker && (
         <View style={styles.modalOverlay}>
-          <View style={styles.modalBox}>
+          <View style={[styles.modalBox, styles.modalBody]}>
             <Text style={styles.modalTitle}>{t('auto_lock_timer')}</Text>
             <Text style={styles.modalSubtitle}>{t('select_inactivity_time')}</Text>
             
-            {['1', '5', '15', '30', '60', 'never'].map((time) => (
-              <TouchableOpacity
-                key={time}
-                style={[
-                  styles.timeOption,
-                  autoLockTime === time && styles.timeOptionActive
-                ]}
-                onPress={() => saveAutoLockTime(time)}
-              >
-                <Text style={[
-                  styles.timeOptionText,
-                  autoLockTime === time && styles.timeOptionTextActive
-                ]}>
-                  {time === 'never' ? t('never') : `${time} ${t(time === '1' ? 'minute' : 'minutes')}`}
-                </Text>
-                {autoLockTime === time && <Text style={styles.checkmark}>✓</Text>}
-              </TouchableOpacity>
-            ))}
+            <ScrollView style={styles.modalScroll}>
+              {['1', '5', '15', '30', '60', 'never'].map((time) => (
+                <TouchableOpacity
+                  key={time}
+                  style={[
+                    styles.timeOption,
+                    autoLockTime === time && styles.timeOptionActive
+                  ]}
+                  onPress={() => saveAutoLockTime(time)}
+                >
+                  <Text style={[
+                    styles.timeOptionText,
+                    autoLockTime === time && styles.timeOptionTextActive
+                  ]}>
+                    {time === 'never' ? t('never') : `${time} ${t(time === '1' ? 'minute' : 'minutes')}`}
+                  </Text>
+                  {autoLockTime === time && <Text style={styles.checkmark}>✓</Text>}
+                </TouchableOpacity>
+              ))}
+            </ScrollView>
 
             <TouchableOpacity 
               style={[styles.button, styles.secondaryButton, {marginTop: 10}]}
@@ -6599,12 +6721,12 @@ const WalletScreen = () => {
       {/* Language Picker Modal */}
       {showLanguagePicker && (
         <View style={styles.modalOverlay}>
-          <View style={styles.modalBox}>
+          <View style={[styles.modalBox, styles.modalBody]}>
             <Text style={styles.modalTitle}>{t('language')}</Text>
             <Text style={styles.modalSubtitle}>{t('language_subtitle')}</Text>
             
             <ScrollView 
-              style={{maxHeight: 400}} 
+              style={styles.modalScroll}
               onScroll={handleUserActivity} 
               scrollEventThrottle={1000}
               showsVerticalScrollIndicator={true}
@@ -6656,129 +6778,53 @@ const WalletScreen = () => {
         </View>
       )}
 
-      {/* Node Activation Input Modal */}
+      {/* Node Activation Input Modal. It pads by the keyboard overlap on both platforms (0 once the window has resized). */}
       {showActivationInput && (
-        <Animated.View style={[styles.modalOverlay, {
-          opacity: showActivationInput ? 1 : 0
-        }]}>
-          <Animated.View style={[
-            styles.modalBox, 
-            { 
-              maxWidth: 350,
-              transform: [{
-                scale: showActivationInput ? 1 : 0.9
-              }]
-            }
-          ]}>
-            <View style={styles.modalHeader}>
-              <Text style={styles.modalTitle}>
-                Node Activation
+        <KeyboardAvoidingView style={[styles.modalOverlay, styles.modalOverlayKeyboard]} behavior="padding">
+          <View style={styles.modalBox}>
+            <ScrollView style={styles.modalScroll} contentContainerStyle={styles.modalBody} keyboardShouldPersistTaps="handled">
+              <Text style={styles.modalTitle}>Node Activation</Text>
+              <Text style={styles.modalContent}>
+                Enter your activation code to register the node in the network
               </Text>
-            </View>
-            
-            <Text style={styles.modalContent}>
-              Enter your activation code to register the node in the network
-            </Text>
-            
-            <TextInput
-              style={[styles.alertInput, {marginTop: 15}]}
-              placeholder="QNET-XXXXXX-XXXXXX-XXXXXX"
-              placeholderTextColor="#666"
-              value={activationInputCode}
-              onChangeText={(text) => setActivationInputCode(text.toUpperCase())}
-              autoCapitalize="characters"
-              maxLength={25}
-            />
-            
-            <View style={{flexDirection: 'row', justifyContent: 'space-between', marginTop: 25, marginHorizontal: 20, gap: 12}}>
-              <TouchableOpacity 
-                style={[styles.button, styles.secondaryButton, {flex: 1, minHeight: 38, paddingVertical: 10, elevation: 1}]}
+              <TextInput
+                style={styles.input}
+                placeholder="QNET-XXXXXX-XXXXXX-XXXXXX"
+                placeholderTextColor="#888"
+                value={activationInputCode}
+                onChangeText={(text) => setActivationInputCode(text.toUpperCase())}
+                autoCapitalize="characters"
+                maxLength={25}
+                multiline
+                submitBehavior="blurAndSubmit"
+              />
+            </ScrollView>
+
+            <View style={styles.modalActions}>
+              <TouchableOpacity
+                style={[styles.modalButton, styles.modalButtonSecondary, {flex: 1}]}
                 onPress={() => {
                   setShowActivationInput(false);
                   setActivationInputCode('');
                 }}
               >
-                <Text style={[styles.buttonText, styles.secondaryButtonText, {fontSize: 14}]}>Cancel</Text>
+                <Text style={[styles.modalButtonText, styles.modalButtonTextSecondary]}>Cancel</Text>
               </TouchableOpacity>
-              
-              <TouchableOpacity 
-                style={[styles.button, styles.primaryButton, nodeActivating && styles.buttonDisabled, {flex: 1, minHeight: 38, paddingVertical: 10, elevation: 1}]}
+
+              <TouchableOpacity
+                style={[styles.modalButton, styles.modalButtonPrimary, {flex: 1}, (nodeActivating || !activationInputCode.trim()) && styles.buttonDisabled]}
                 onPress={handleNodeActivation}
                 disabled={Boolean(nodeActivating || !activationInputCode.trim())}
               >
-                <Text style={[styles.buttonText, {fontSize: 14}]}>
-                  {nodeActivating ? 'Activating...' : 'Activate'}
-                </Text>
+                <Text style={styles.modalButtonText}>{nodeActivating ? 'Activating...' : 'Activate'}</Text>
               </TouchableOpacity>
             </View>
-          </Animated.View>
-        </Animated.View>
+          </View>
+        </KeyboardAvoidingView>
       )}
 
       {/* Custom Alert Modal (styled like extension) */}
-      {customAlert && (
-        <Animated.View style={[styles.modalOverlay, {
-          opacity: customAlert ? 1 : 0
-        }]}>
-          <Animated.View style={[
-            styles.modalBox, 
-            { 
-              maxWidth: 350,
-              transform: [{
-                scale: customAlert ? 1 : 0.9
-              }]
-            }
-          ]}>
-            {/* Modal Header with icon */}
-            <View style={styles.modalHeader}>
-              <Text style={styles.modalTitle}>
-                {customAlert.title}
-              </Text>
-            </View>
-            
-            {/* Modal Content */}
-            {customAlert.richContent ? (
-              <View style={styles.modalContentContainer}>
-                {customAlert.richContent}
-              </View>
-            ) : (
-            <Text style={styles.modalContent}>
-              {customAlert.message}
-            </Text>
-            )}
-            
-            {/* Modal Actions */}
-            <View style={styles.modalActions}>
-              {customAlert.buttons.map((button, index) => (
-                <TouchableOpacity
-                  key={index}
-                  style={[
-                    styles.modalButton,
-                    button.style === 'destructive' ? 
-                      styles.modalButtonDanger : 
-                      button.style === 'cancel' ? 
-                        styles.modalButtonSecondary : 
-                        styles.modalButtonPrimary,
-                    { flex: 1 }
-                  ]}
-                  onPress={() => {
-                    setCustomAlert(null);
-                    if (button.onPress) button.onPress();
-                  }}
-                >
-                  <Text style={[
-                    styles.modalButtonText,
-                    button.style === 'destructive' && styles.modalButtonTextDanger,
-                    button.style === 'cancel' && styles.modalButtonTextSecondary
-                  ]}>
-                    {button.text}
-                  </Text>
-                </TouchableOpacity>
-              ))}
-            </View>
-          </Animated.View>
-        </Animated.View>
-      )}
+      {renderCustomAlert()}
     </SafeAreaView>
   );
 };

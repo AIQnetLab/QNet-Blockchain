@@ -145,7 +145,7 @@ pub(super) async fn handle_contract_deploy(
         Some(serde_json::to_string(&deploy_data).unwrap_or_default()), // data
     );
     // Carry the caller's ML-DSA-65 signature so the value-TX gate verifies it (over the canonical
-    // "q{chain}|contract_deploy:{from}:{code_hash}:{nonce}" message) and binds the key to `from`.
+    // "q{chain}|contract_deploy:{from}:{code_hash}:{nonce}:{gas_price}:{gas_limit}" message) and binds the key to `from`.
     // FIX-5: hex(raw detached) -> bytes; value gate verifies
     tx.dilithium_signature = hex::decode(&request.dilithium_signature).ok();
     tx.dilithium_public_key = hex::decode(&request.dilithium_public_key).ok();
@@ -553,7 +553,7 @@ pub(super) async fn handle_contract_call(
         })).unwrap_or_default()),
     );
     // Carry the caller's ML-DSA-65 signature so the value-TX gate verifies it (over the canonical
-    // "q{chain}|contract_call:{from}:{sha3(tx.data calldata)}:{nonce}" message) and binds the key to `from`.
+    // "q{chain}|contract_call:{from}:{sha3(tx.data calldata)}:{nonce}:{gas_price}:{gas_limit}" message) and binds the key to `from`.
     // FIX-5: hex(raw detached) -> bytes; value gate verifies
     tx.dilithium_signature = hex::decode(&dilithium_sig).ok();
     // Elided pk stays None all the way into the mempool — never re-added to the wire (FIX-5 TPS win).
@@ -1216,7 +1216,7 @@ pub(super) struct WasmDeployRequest {
     pub(super) from: String,
     /// WASM module bytes, hex-encoded
     pub(super) code: String,
-    /// Replay-protection nonce (signed into "q{chain}|contract_deploy:{from}:{code_hash}:{nonce}").
+    /// Replay-protection nonce (signed into "q{chain}|contract_deploy:{from}:{code_hash}:{nonce}:{gas_price}:{gas_limit}").
     pub(super) nonce: u64,
     /// ML-DSA-65 signature + public key (MANDATORY; pure ML-DSA-65)
     pub(super) dilithium_signature: String,
@@ -1336,7 +1336,7 @@ pub(super) struct NftDeployRequest {
     /// Collection symbol
     pub(super) symbol: String,
     /// Replay-protection nonce (client signs it into the canonical
-    /// "q{chain}|contract_deploy:{from}:{code_hash}:{nonce}" message the value-TX gate verifies).
+    /// "q{chain}|contract_deploy:{from}:{code_hash}:{nonce}:{gas_price}:{gas_limit}" message the value-TX gate verifies).
     pub(super) nonce: u64,
     /// ML-DSA-65 signature (MANDATORY; pure ML-DSA-65)
     pub(super) dilithium_signature: String,
@@ -1347,7 +1347,7 @@ pub(super) struct NftDeployRequest {
 /// Handle QRC-721 (NFT) collection deployment. Mirrors handle_token_deploy: builds a
 /// ContractDeploy value-TX with data {"qrc721":true,...} that apply_to_state materializes
 /// on every node; authorisation is the value-TX gate (verify_user_tx_dilithium) over the
-/// canonical "q{chain}|contract_deploy:{from}:{code_hash}:{nonce}" where code_hash is the canonical
+/// canonical "q{chain}|contract_deploy:{from}:{code_hash}:{nonce}:{gas_price}:{gas_limit}" where code_hash is the canonical
 /// deploy digest (qnet_state::transaction::deploy_code_hash) over the payload built below — the
 /// client MUST sign THAT message with a wallet ML-DSA-65 key whose eon address == from. Individual
 /// NFTs are minted afterwards via ContractCall.
@@ -1472,7 +1472,7 @@ pub(super) struct TokenDeployRequest {
     #[serde(default)]
     pub(super) burnable: bool,
     /// Replay-protection nonce (client-provided; the caller signs it into the canonical
-    /// "q{chain}|contract_deploy:{from}:{code_hash}:{nonce}" message the value-TX gate verifies).
+    /// "q{chain}|contract_deploy:{from}:{code_hash}:{nonce}:{gas_price}:{gas_limit}" message the value-TX gate verifies).
     pub(super) nonce: u64,
     /// ML-DSA-65 signature (MANDATORY v6.1)
     pub(super) dilithium_signature: String,
@@ -1533,7 +1533,7 @@ pub(super) async fn handle_token_deploy(
     // PURE DILITHIUM (F0.2): structural presence check only. A QRC-20 token deploy IS a ContractDeploy
     // value-TX, so the AUTHORITATIVE verify is the value-TX gate in submit_transaction
     // (verify_user_tx_dilithium): it opens the ML-DSA-65 sig over the canonical message
-    // build_canonical_verify_message() rebuilds — "q{chain}|contract_deploy:{from}:{code_hash}:{nonce}" where
+    // build_canonical_verify_message() rebuilds — "q{chain}|contract_deploy:{from}:{code_hash}:{nonce}:{gas_price}:{gas_limit}" where
     // code_hash is the canonical deploy digest over the payload built below (it commits to every
     // applied field) — AND binds eon_from_qnet_dilithium_pubkey(dpk)==from.
     // The client MUST sign THAT message (NOT "token_deploy:..") in the "dilithium_sig_{pk}_{b64}" wire
@@ -1546,7 +1546,7 @@ pub(super) async fn handle_token_deploy(
     }
 
     // Client-provided nonce (replay protection is enforced at apply). It MUST match the nonce the caller
-    // signed into the canonical "q{chain}|contract_deploy:{from}:{code_hash}:{nonce}" message, else the value-TX
+    // signed into the canonical "q{chain}|contract_deploy:{from}:{code_hash}:{nonce}:{gas_price}:{gas_limit}" message, else the value-TX
     // gate rejects the derived ContractDeploy at ingest.
     let nonce = request.nonce;
     
