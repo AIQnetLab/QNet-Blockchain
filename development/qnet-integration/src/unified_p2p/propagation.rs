@@ -2019,9 +2019,12 @@ impl SimplifiedP2P {
         }
     }
     
-    /// Check if attestation already exists for Light node in current slot
+    /// True iff an attestation for this light node in this slot of the CURRENT epoch is already held.
+    /// Built by attestation_key, the one builder every writer goes through: the key rolled by hand here
+    /// carried no epoch, matched nothing an insert had produced, and so answered false for a node that
+    /// had already replied - re-pinging it and re-issuing it a challenge for the rest of the slot. O(1).
     pub fn has_attestation(&self, light_node_id: &str, slot: u64) -> bool {
-        let key = format!("{}:{}", light_node_id, slot);
+        let key = Self::attestation_key(light_node_id, slot);
         let attestations = self.light_node_attestations.read();
         attestations.contains_key(&key)
     }
@@ -3178,6 +3181,60 @@ impl SimplifiedP2P {
     pub fn get_light_node_wallet(&self, node_id: &str) -> Option<String> {
         let registry = self.light_node_registry.read();
         registry.get(node_id).map(|r| r.wallet_address.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests_attestation_dedup {
+    use super::*;
+
+    fn epoch_now() -> u64 { SimplifiedP2P::get_current_window_number() }
+
+    fn attestation(id: &str, slot: u64) -> LightNodeAttestation {
+        LightNodeAttestation {
+            light_node_id: id.to_string(),
+            pinger_id: "genesis_node_001".to_string(),
+            slot,
+            timestamp: 1_700_000_000,
+            light_node_signature: "device_sig".to_string(),
+            pinger_signature: "pinger_sig".to_string(),
+            challenge: "challenge".to_string(),
+            block_height: LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+
+    /// The dedupe read has to find what the write put there. It did not: the write keyed
+    /// {id}:{slot}:{epoch} through attestation_key while this read rolled {id}:{slot} by hand, so a
+    /// device that had already answered read back as unattested - a backup owner pinged it a second
+    /// time and the challenge endpoint handed it another challenge for the rest of the slot. Asserted
+    /// through the public reader, so writer and reader can only agree by sharing the one builder.
+    #[test]
+    fn an_answered_node_reads_back_as_attested_in_that_slot() {
+        let p2p = SimplifiedP2P::new("test_attest_node".into(), NodeType::Super, Region::Europe, 8101);
+        let (id, slot) = ("light_attest_0001", 137u64);
+
+        assert!(!p2p.has_attestation(id, slot), "nothing stored yet");
+
+        // The key stamps the epoch of LOCAL_BLOCKCHAIN_HEIGHT, a process global other tests in this
+        // binary move under us (serve_horizon_follows_stored_height parks it three epochs away behind
+        // a lock private to its own module). A write and a read that saw different epochs prove
+        // nothing either way, so assert only across a window in which that reading held still.
+        let mut proven = false;
+        for _ in 0..64 {
+            let before = epoch_now();
+            p2p.store_attestation(attestation(id, slot));
+            let found = p2p.has_attestation(id, slot);
+            if epoch_now() == before {
+                assert!(found, "the reader must find the key the writer produced");
+                proven = true;
+                break;
+            }
+        }
+        assert!(proven, "the height global never held still long enough to assert");
+
+        // Scoped to the one slot and the one device: every other ping opportunity stays open.
+        assert!(!p2p.has_attestation(id, slot + 1), "the next slot is a fresh ping, not a suppressed one");
+        assert!(!p2p.has_attestation("light_attest_0002", slot), "another device is not covered by it");
     }
 }
 

@@ -4373,9 +4373,11 @@ pub struct BlockchainNode {
     // Replaces simple HashSet for retry mechanism support
     heartbeat_commitment_tracker: Arc<DashMap<u64, HeartbeatCommitmentStatus>>,
     
-    // PRODUCTION v2.78: Track BitmapCommitment TXs by epoch with confirmation + retry
-    // Same pattern as heartbeat_commitment_tracker for consistency
-    bitmap_commitment_tracker: Arc<DashMap<u64, HeartbeatCommitmentStatus>>,
+    // PRODUCTION v2.78: Track BitmapCommitment TXs with confirmation + retry.
+    // Keyed by (epoch, shard), not by epoch: an owner commits one bitmap per shard it covers, and a
+    // backup covers a second shard in the same epoch. The pair is typed rather than packed into one
+    // number so that a read cannot compare it against a bare epoch and silently match nothing.
+    bitmap_commitment_tracker: Arc<DashMap<(u64, usize), HeartbeatCommitmentStatus>>,
     
     // Parallel Executor for parallel transaction execution
     parallel_executor: Option<Arc<crate::parallel_executor::ParallelExecutor>>,

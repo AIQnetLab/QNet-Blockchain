@@ -3805,7 +3805,7 @@ impl BlockchainNode {
                             // when this node should move on and cover the shard it backs up, which is
                             // the whole point of backing one up.
                             .filter(|(sh, _)| bitmap_tracker
-                                .get(&(current_epoch * 10 + *sh as u64))
+                                .get(&(current_epoch, *sh))
                                 .map_or(true, |s| !s.is_confirmed() && s.retry_count < MAX_RETRIES))
                             .min_by_key(|(_, rank)| *rank)
                             .map(|(sh, _)| sh)
@@ -3813,8 +3813,8 @@ impl BlockchainNode {
                             Some(sh) => sh,
                             None => continue,
                         };
-                        // One tracker slot per (epoch, shard); shards are 0..5 so the epoch stays readable.
-                        let track_key = current_epoch * 10 + target_shard as u64;
+                        // One tracker slot per (epoch, shard).
+                        let track_key = (current_epoch, target_shard);
                         // v7.0: Full confirmation + retry tracking (same as HeartbeatCommitment)
                         let should_send = if let Some(status) = bitmap_tracker.get(&track_key) {
                             if status.is_confirmed() {
@@ -3978,7 +3978,7 @@ impl BlockchainNode {
                                                 // multiple versions of the same logical commitment into one
                                                 // block.
                                                 let stale_hashes: Vec<String> = bitmap_tracker
-                                                    .get(&current_epoch)
+                                                    .get(&track_key)
                                                     .map(|e| e.all_tx_hashes.clone())
                                                     .unwrap_or_default();
                                                 if !stale_hashes.is_empty() {
@@ -4108,25 +4108,28 @@ impl BlockchainNode {
                     
                     // v7.0: CONFIRMATION CHECK — scan recent blocks for our BitmapTX
                     {
-                        // Keys are (epoch*10 + shard): the sweep only needs them to look a status up.
-                        let pending_epochs: Vec<u64> = bitmap_tracker.iter()
+                        // Keys are (epoch, shard): the sweep only needs them to look a status up.
+                        let pending: Vec<(u64, usize)> = bitmap_tracker.iter()
                             .filter(|entry| !entry.value().is_confirmed())
                             .map(|entry| *entry.key())
                             .collect();
 
-                        for epoch in pending_epochs {
-                            if let Some(mut status) = bitmap_tracker.get_mut(&epoch) {
+                        for key in pending {
+                            if let Some(mut status) = bitmap_tracker.get_mut(&key) {
                                 let scan_start = status.sent_at_height;
                                 let scan_end = current_height.min(scan_start + 20);
 
                                 for check_height in scan_start..=scan_end {
                                     if let Ok(Some(block_data)) = storage.load_microblock_auto_format(check_height) {
                                         for tx in &block_data.transactions {
-                                            if let qnet_state::TransactionType::LightNodeEligibilityBitmap { genesis_id, .. } = &tx.tx_type {
-                                                if genesis_id == &node_id && status.all_tx_hashes.contains(&tx.hash) {
+                                            // Ours by HASH, not by genesis_id: that field names the shard's owner,
+                                            // so a bitmap emitted while covering someone else's shard never matched and
+                                            // retried to its cap every epoch. all_tx_hashes holds only what this row sent.
+                                            if let qnet_state::TransactionType::LightNodeEligibilityBitmap { .. } = &tx.tx_type {
+                                                if status.all_tx_hashes.contains(&tx.hash) {
                                                     status.mark_confirmed(check_height);
-                                                    println!("[INFO][LIGHT-BITMAP] TX CONFIRMED epoch={} block={} hash={}",
-                                                             epoch, check_height, &tx.hash[..16]);
+                                                    println!("[INFO][LIGHT-BITMAP] TX CONFIRMED epoch={} shard={} block={} hash={}",
+                                                             key.0, key.1, check_height, &tx.hash[..16]);
                                                     break;
                                                 }
                                             }
@@ -4137,14 +4140,17 @@ impl BlockchainNode {
                             }
                         }
 
-                        // Cleanup old epochs (keep last 10)
-                        if current_epoch > 10 {
-                            let min_epoch = current_epoch.saturating_sub(10);
+                        // Keep the last 10 epochs, compared against the key's epoch half. Against the
+                        // packed key this comparison held for every row, so nothing was ever dropped and
+                        // the confirmation scan above re-read blocks for dead rows for the life of the
+                        // process. Bounded now at 10 epochs x the shards this node covers.
+                        {
                             let before_len = bitmap_tracker.len();
-                            bitmap_tracker.retain(|epoch, _| *epoch >= min_epoch);
+                            bitmap_tracker.retain(|(epoch, _), _| *epoch + 10 >= current_epoch);
                             let removed = before_len.saturating_sub(bitmap_tracker.len());
                             if removed > 0 && is_info() {
-                                println!("[INFO][LIGHT-BITMAP] cleanup removed={} epochs min_epoch={}", removed, min_epoch);
+                                println!("[INFO][LIGHT-BITMAP] cleanup removed={} kept={} min_epoch={}",
+                                         removed, bitmap_tracker.len(), current_epoch.saturating_sub(10));
                             }
                         }
                     }
