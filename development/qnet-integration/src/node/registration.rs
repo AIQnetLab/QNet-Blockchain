@@ -1561,6 +1561,36 @@ impl BlockchainNode {
                 return false;
             }
         }
+        // Last, because it costs shard reads: refuse a batch that LEAVES OUT an epoch this wallet was
+        // paid in - at the head of the batch or anywhere inside it. last_claimed_epoch is monotonic,
+        // so an epoch left out of the payload can never be claimed again: it is burned the moment a
+        // later one credits. The quote path walks oldest-first
+        // and stops rather than skips, but the payload is signed by the wallet and can reach this door
+        // from anywhere, so the door checks what it was actually handed rather than trusting how it was
+        // built. Node-local admission only: a block carrying such a TX stays valid, so refusing here can
+        // never fork the fleet. Fail-OPEN on anything this node cannot decide - a claim must not be
+        // blocked by local sync lag.
+        let claimed: std::collections::BTreeSet<u64> =
+            entries.iter().filter_map(|e| e.get("epoch").and_then(|v| v.as_u64())).collect();
+        let last = match claimed.iter().next_back() { Some(l) => *l, None => return false };
+        // An offline wallet must not buy an unbounded walk at the door.
+        const MAX_GAP_PROBE: usize = 64;
+        for epoch in crate::reward_epoch::grid_epochs_after(storage, last_claimed).take(MAX_GAP_PROBE) {
+            if epoch > last { break; }
+            if claimed.contains(&epoch) { continue; }
+            let root_hex = match crate::reward_epoch::root_for_apply(storage, epoch, u64::MAX) {
+                crate::reward_epoch::ApplyRoot::Root(r) if r != [0u8; 32] => hex::encode(r),
+                _ => continue, // distributed nothing, or undecidable here: not this node's call
+            };
+            if let crate::node::ShardClaim::Proof(amount, _) =
+                Self::reward_proof_from_shard(storage, epoch, &root_hex, to, false) {
+                if amount > 0 {
+                    println!("[WARN][REWARDS] claim_skips_paid_epoch wallet={}.. skipped={} batch_ends={} action=refuse",
+                             qnet_state::char_prefix(to, 16), epoch, last);
+                    return false;
+                }
+            }
+        }
         true
     }
 

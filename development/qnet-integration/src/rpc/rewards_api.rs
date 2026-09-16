@@ -548,8 +548,14 @@ pub(super) struct LeafsetQuery {
 
 /// History status of one epoch. Zero is tested before the watermark, so "claimed" only names an
 /// epoch in which the wallet held a leaf.
-fn reward_history_status(servable: bool, amount: u64, epoch: u64, last_claimed: u64) -> &'static str {
+/// `shard_certified` is Some(false) only for a LIGHT node whose shard published no bitmap for the
+/// epoch. Then a zero is not the node's doing: the epoch's reward root was sealed without that shard,
+/// and no later block can add it (the owners were all silent through the commit window). Reporting it
+/// as "not_eligible" told the owner they had missed their pings when they had not.
+fn reward_history_status(servable: bool, amount: u64, epoch: u64, last_claimed: u64,
+                         shard_certified: Option<bool>) -> &'static str {
     if !servable { "unavailable" }
+    else if amount == 0 && shard_certified == Some(false) { "shard_not_certified" }
     else if amount == 0 { "not_eligible" }
     else if epoch <= last_claimed { "claimed" }
     else { "claimable" }
@@ -591,6 +597,10 @@ pub(super) async fn handle_get_reward_history(
     epochs.reverse();
     let total_epochs = epochs.len();
 
+    // A super node has no light shard, so the shard verdict below must not be applied to it.
+    let is_light = blockchain.get_unified_p2p()
+        .map_or(false, |p| p.get_light_node(&node_id).is_some());
+
     let mut epochs_history = Vec::new();
     for &epoch in epochs.iter().skip(offset).take(limit) {
         // The window this epoch paid for, from the helper the reward gather itself uses.
@@ -610,12 +620,18 @@ pub(super) async fn handle_get_reward_history(
             Ok(Some(_)) => (0, true), // certified as distributing nothing
             _ => (0, false),
         };
-        let status = reward_history_status(servable, amount, epoch, last_claimed);
+        // Only resolved when it can change the answer: a zero this node CAN serve.
+        let shard_certified = if servable && amount == 0 && is_light {
+            let shard = crate::node::light_shard_of(&node_id);
+            Some(storage.load_light_bitmaps(epoch).map(|m| m.contains_key(&shard)).unwrap_or(false))
+        } else { None };
+        let status = reward_history_status(servable, amount, epoch, last_claimed, shard_certified);
         epochs_history.push(json!({
             "epoch": epoch,
             "block_range": format!("{}-{}", start_h, end_h),
             "amount_qnc": amount as f64 / 1_000_000_000.0,
             "status": status,
+            "shard_certified": shard_certified,
         }));
     }
 
@@ -1190,10 +1206,24 @@ mod tests_reward_history {
     /// An epoch below the watermark in which the wallet had no leaf was never claimed by it.
     #[test]
     fn zero_amount_epochs_are_not_eligible_even_below_the_watermark() {
-        assert_eq!(reward_history_status(true, 0, 160, 13_600), "not_eligible");
-        assert_eq!(reward_history_status(true, 5, 160, 13_600), "claimed");
-        assert_eq!(reward_history_status(true, 5, 13_760, 13_600), "claimable");
-        assert_eq!(reward_history_status(true, 0, 13_760, 13_600), "not_eligible");
-        assert_eq!(reward_history_status(false, 5, 160, 13_600), "unavailable", "an unservable epoch says so first");
+        assert_eq!(reward_history_status(true, 0, 160, 13_600, None), "not_eligible");
+        assert_eq!(reward_history_status(true, 5, 160, 13_600, None), "claimed");
+        assert_eq!(reward_history_status(true, 5, 13_760, 13_600, None), "claimable");
+        assert_eq!(reward_history_status(true, 0, 13_760, 13_600, None), "not_eligible");
+        assert_eq!(reward_history_status(false, 5, 160, 13_600, None), "unavailable", "an unservable epoch says so first");
+    }
+
+    /// A light whose shard published no bitmap earned nothing THROUGH NO FAULT OF ITS OWN. Calling
+    /// that "not_eligible" told the owner they had missed their pings; the epoch's root was simply
+    /// sealed without their shard, and no later block can add it.
+    #[test]
+    fn a_shard_with_no_bitmap_is_not_the_nodes_fault() {
+        assert_eq!(reward_history_status(true, 0, 13_760, 13_600, Some(false)), "shard_not_certified");
+        assert_eq!(reward_history_status(true, 0, 13_760, 13_600, Some(true)), "not_eligible",
+                   "the shard committed and this node still earned nothing - that one IS on the node");
+        assert_eq!(reward_history_status(false, 0, 13_760, 13_600, Some(false)), "unavailable",
+                   "an epoch this node cannot serve says so first, whatever the shard did");
+        assert_eq!(reward_history_status(true, 5, 13_760, 13_600, Some(false)), "claimable",
+                   "a paid epoch is paid; the shard verdict only explains a zero");
     }
 }

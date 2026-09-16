@@ -5843,21 +5843,6 @@ impl BlockchainNode {
                             }
                         }
                         
-                        // v3.36: Dynamic gas pricing — update after each block produced
-                        // EIP-1559 style: adjust base_fee based on mempool congestion + block utilization
-                        {
-                            let current_mempool_size = mempool.size();
-                            let max_tx = 10_000u64; // max_tx_per_microblock target
-                            let block_utilization = txs.len() as f64 / max_tx as f64;
-                            let mut pricing = qnet_state::DynamicGasPricing::new();
-                            pricing.update_network_load(current_mempool_size, block_utilization);
-                            qnet_state::update_dynamic_gas_pricing(pricing);
-                            if is_debug() {
-                                println!("[DBG][GAS] dynamic_update h={} mempool={} util={:.2}%",
-                                    height_for_storage, current_mempool_size, block_utilization * 100.0);
-                            }
-                        }
-                        
                         // EVENT-BASED OPTIMIZATION: Notify consensus listener immediately
                         // Don't wait for P2P round-trip - local block is ready for consensus check
                         let _ = block_event_tx_for_spawn.send(height_for_storage);
