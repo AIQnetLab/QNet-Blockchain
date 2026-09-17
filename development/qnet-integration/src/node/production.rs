@@ -6063,6 +6063,7 @@ impl BlockchainNode {
                     
                     // Body expiry at the epoch boundary; the boundary snapshot was queued behind the block's rows.
                     storage.prune_bodies_at_epoch(microblock_height);
+                    storage.archive_history_at(microblock_height);
 
                     // CRITICAL FIX: Do NOT reset timing here - breaks precision timing
                     // Timing update happens ONLY at end of loop for drift prevention

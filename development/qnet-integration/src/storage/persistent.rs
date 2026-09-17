@@ -2075,6 +2075,21 @@ impl PersistentStorage {
         Ok(None)
     }
 
+    /// Lowest microblock height at or above `from` held on disk; one forward seek, same key order.
+    pub fn lowest_stored_microblock_from(&self, from: u64) -> IntegrationResult<Option<u64>> {
+        let cf = self.db.cf_handle("microblocks")
+            .ok_or_else(|| IntegrationError::StorageError("microblocks column family not found".to_string()))?;
+        let start = mb_body_key(from);
+        let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::From(start.as_bytes(), rocksdb::Direction::Forward));
+        for item in iter {
+            let (k, _) = item?;
+            let key = match std::str::from_utf8(&k) { Ok(s) => s, Err(_) => continue };
+            let digits = match key.strip_prefix("microblock_") { Some(d) => d, None => break };
+            if let Ok(h) = digits.parse::<u64>() { return Ok(Some(h)); }
+        }
+        Ok(None)
+    }
+
     /// RocksDB's own memory, in MB: (shared block cache, live memtables, open table readers).
     /// The cache is one shared LRU so it is read once; the other two are per-CF and summed.
     pub fn rocksdb_memory_mb(&self) -> (u64, u64, u64) {

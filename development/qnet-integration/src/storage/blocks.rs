@@ -161,7 +161,7 @@ impl Storage {
             let _ = persistent.db.write(b);
         }
 
-        Ok(Self { 
+        let storage = Self {
             persistent,
             mirror,
             transaction_pool,
@@ -175,7 +175,14 @@ impl Storage {
             graceful_degradation: Arc::new(RwLock::new(graceful_degradation)),
             light_rotation: Arc::new(RwLock::new(light_rotation)),
             recent_microblocks: Arc::new(dashmap::DashMap::new()),
-        })
+            history_archive: once_cell::sync::OnceCell::new(),
+        };
+        if storage.storage_mode == StorageMode::Super && std::env::var("QNET_ARCHIVE").as_deref() == Ok("1") {
+            if let Err(e) = storage.open_history_archive(Path::new(data_dir).join("archive")) {
+                println!("[ERR][HISTORY] open_failed err={} action=run_without_archive", e);
+            }
+        }
+        Ok(storage)
     }
     
     pub fn get_chain_height(&self) -> IntegrationResult<u64> {
@@ -557,7 +564,7 @@ impl Storage {
     /// Content binding for bodies that bypass the pipeline's verify stage: every tx hash string is
     /// recomputed from its content and the tx merkle root from those strings, so the header hash
     /// (already matched against the chain) vouches for the exact transactions being written.
-    fn block_content_bound(mb: &qnet_state::MicroBlock) -> bool {
+    pub(super) fn block_content_bound(mb: &qnet_state::MicroBlock) -> bool {
         mb.transactions.iter().all(|tx| tx.calculate_hash() == tx.hash)
             && crate::node::BlockchainNode::calculate_merkle_root(&mb.transactions) == mb.merkle_root
     }

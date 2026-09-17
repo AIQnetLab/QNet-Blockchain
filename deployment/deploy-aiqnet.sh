@@ -294,8 +294,8 @@ echo \"IP: 195.246.231.53\"
 echo \"SSL: \$(curl -s -o /dev/null -w \"%{http_code}\" https://aiqnet.io)\"
 echo ''
 echo '📈 Performance:'
-echo \"Blockchain TPS: 424,411\"
-echo \"Mobile TPS: 8,859\"
+echo \"Batched transfers/sec: 13,000\"
+echo \"Single transfers/sec: 450\"
 echo \"Project Size: 11MB\"
 EOF
     
@@ -322,8 +322,8 @@ echo -e "• Status: ${YELLOW}ssh root@$SERVER_IP '/root/status-aiqnet.sh'${NC}"
 echo -e "• Restart: ${YELLOW}ssh root@$SERVER_IP 'pm2 restart aiqnet-explorer'${NC}"
 echo ""
 echo -e "${BLUE}📈 Performance Metrics:${NC}"
-echo -e "• Blockchain TPS: ${GREEN}424,411${NC}"
-echo -e "• Mobile TPS: ${GREEN}8,859${NC}"
+echo -e "• Batched transfers/sec: ${GREEN}13,000${NC}"
+echo -e "• Single transfers/sec: ${GREEN}450${NC}"
 echo -e "• Project Size: ${GREEN}11MB${NC}"
 echo -e "• Memory Usage: ${GREEN}~1GB${NC}"
 echo -e "• Server RAM: ${GREEN}2GB${NC}"

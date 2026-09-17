@@ -1,25 +1,22 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { fetchNode } from '@/lib/node-api';
 
 // ============================================================================
 // SWAP Execute API - DEX Module
 // Status: Planned for Phase 3
 // ============================================================================
 
-const QNET_API_URL = process.env.QNET_API_URL || 'http://localhost:8001';
-
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
     
     // Try to execute swap via backend DEX
-    const res = await fetch(`${QNET_API_URL}/api/v1/dex/swap`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(30000), // 30s for tx execution
+    // A swap is a write: one node only, never retried on another.
+    const res = await fetchNode('/api/v1/dex/swap', {
+      method: 'POST', body: JSON.stringify(body), timeoutMs: 30000, failover: false,
     });
-    
-    if (res.ok) {
+
+    if (res && res.ok) {
       const data = await res.json();
       return NextResponse.json({
         success: true,

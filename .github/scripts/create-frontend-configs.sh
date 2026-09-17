@@ -121,8 +121,7 @@ export default function Home() {
           Post-Quantum Decentralized Network
         </p>
         <div className="text-center mt-8">
-          <p>Performance: 424,411 TPS</p>
-          <p>Mobile: 8,859 TPS</p>
+          <p>13,000 transfers/sec measured end-to-end</p>
           <p>Post-Quantum Cryptography</p>
         </div>
       </div>

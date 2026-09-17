@@ -405,6 +405,13 @@ impl ApiRateLimiter {
             window_seconds: 60,
             block_duration: 60,
         });
+
+        // History archive: index pages and segment downloads (a segment is one epoch of blocks).
+        configs.insert("archive".to_string(), RateLimitConfig {
+            max_requests: 30,
+            window_seconds: 60,
+            block_duration: 60,
+        });
         
         if tx_rate != 100 {
             println!("[INFO][SECURITY] api_rate_limit_configured tx={}/min general={}/min read={}/min", 
@@ -924,6 +931,15 @@ pub(super) struct BlockHeadersQuery {
 
 fn default_headers_limit() -> u64 { 100 }
 
+/// /api/v1/archive?from_epoch=&limit= — limit is clamped to [1, 1000].
+#[derive(Debug, Deserialize)]
+pub(super) struct ArchiveListQuery {
+    #[serde(default)]
+    pub(super) from_epoch: u64,
+    #[serde(default = "default_headers_limit")]
+    pub(super) limit: u64,
+}
+
 /// Query parameters for global recent transactions
 #[derive(Debug, Deserialize)]
 struct RecentTransactionsQuery {
@@ -1295,7 +1311,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         });
     
     // Compact headers for indexers. The hash comes from the height→hash index and outlives the body;
-    // body fields are present only inside the retention window.
+    // body fields are present inside the retention window, and past it where this node's archive holds the block.
     let blocks_headers = api_v1
         .and(warp::path("blocks"))
         .and(warp::path("headers"))
@@ -1306,6 +1322,27 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::header::optional::<String>("x-api-key"))
         .and(blockchain_filter.clone())
         .and_then(handle_block_headers);
+
+    // History archive (nodes started with QNET_ARCHIVE=1): the segment index and one segment file.
+    let archive_list = api_v1
+        .and(warp::path("archive"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::query::<ArchiveListQuery>())
+        .and(warp::addr::remote())
+        .and(warp::header::optional::<String>("x-api-key"))
+        .and(blockchain_filter.clone())
+        .and_then(handle_archive_list);
+    let archive_segment = api_v1
+        .and(warp::path("archive"))
+        .and(warp::path("segment"))
+        .and(warp::path::param::<u64>())
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::addr::remote())
+        .and(warp::header::optional::<String>("x-api-key"))
+        .and(blockchain_filter.clone())
+        .and_then(handle_archive_segment);
 
     // Account endpoints
     let account_info = api_v1
@@ -2546,6 +2583,8 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
     let blockchain_routes = microblock_one
         .or(microblocks_range)
         .or(blocks_headers)
+        .or(archive_list)
+        .or(archive_segment)
         .or(block_latest)
         .or(block_by_height)
         .or(genesis_block)

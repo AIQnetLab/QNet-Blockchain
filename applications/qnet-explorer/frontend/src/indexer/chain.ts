@@ -1,5 +1,5 @@
 import type { Pool } from 'pg';
-import { NodeClient, HEIGHT_SLACK, type NewBlockEvent, type NodeHeader, type QuorumHeaders } from './node-client';
+import { NodeClient, HEIGHT_SLACK, archiveFloor, type NewBlockEvent, type NodeHeader, type QuorumHeaders } from './node-client';
 import { Writer } from './writer';
 import { shapeBlock, shapedDigest, blockRowFromHeader, isHex64, toMs, merkleRootOf, SLOT_MS, SLOT_GAP_REANCHOR_GATE_HEIGHT, type BlockRow, type ShapedBlock } from './transform';
 import { fetchTokenTransfersAgreed, replaceTokenTransfers } from './token-transfers';
@@ -67,6 +67,7 @@ export class Chain {
   private lastBehindLog = 0;
   private lastLagLog = 0;
   private lastQueueLog = 0;
+  private archiveReach = Number.POSITIVE_INFINITY;   // bodies below retention are reachable from here up
 
   constructor(private readonly node: NodeClient, private readonly writer: Writer, private readonly pool: Pool) {}
 
@@ -89,6 +90,7 @@ export class Chain {
     }
     await this.confirmGenesisAnchor();
     await this.loadGenesisTs();
+    await this.refreshArchiveReach();
     await this.rederiveGaps();
     log.info('INDEXER', 'start', { head: this.head, prefix: this.prefix, node_height: this.nodeHeight, endpoints: this.node.endpointCount, genesis_ts: this.genesisTsMs });
     if (this.nodeHeight > this.head) await this.recordGap(this.head + 1, this.nodeHeight);
@@ -292,7 +294,8 @@ export class Chain {
     // rate, not at one a second). Such a height is recorded by its agreed identity with no body,
     // exactly like a height the page already called pruned - otherwise the heal asks the network
     // for a body that no longer exists anywhere, for good, and the gap ledger never drains.
-    const bodyFloor = Math.max(0, this.nodeHeight - RETENTION_BLOCKS);
+    // Node history archives move the floor down: a height they cover is retried, not written off.
+    const bodyFloor = Math.min(Math.max(0, this.nodeHeight - RETENTION_BLOCKS), this.archiveReach);
     const pruned: NodeHeader[] = [];
     for (const it of needFull) {
       if (haveBody.has(it.height)) continue;
@@ -724,7 +727,10 @@ export class Chain {
     this.healRunning = true;
     const t0 = Date.now();
     try {
+      await this.refreshArchiveReach();
       const inRetention = Math.max(0, this.nodeHeight - RETENTION_BLOCKS + 100);
+      // A pruned row is worth asking for again inside the retention window, or where the archives reach.
+      const prunedFrom = Math.min(inRetention, this.archiveReach);
       const cand = await this.pool.query<{ height: string; reason: string }>(
         `SELECT height::text, reason FROM (
            SELECT height, 'identity' AS reason FROM blocks WHERE hash IS NULL OR hash !~ '^[0-9a-f]{64}$'
@@ -733,9 +739,9 @@ export class Chain {
             WHERE b.height >= $3 AND b.height < $3 + $4 AND b.height >= $1 AND b.body_indexed AND b.tx_count > b.tx_skipped
               AND (SELECT count(*) FROM transactions t WHERE t.block = b.height) < b.tx_count - b.tx_skipped
            UNION ALL
-           SELECT height, 'pruned' FROM blocks WHERE NOT body_indexed AND height >= $1
+           SELECT height, 'pruned' FROM blocks WHERE NOT body_indexed AND height >= $5
          ) c ORDER BY height DESC LIMIT $2`,
-        [inRetention, HEAL_CANDIDATES, Math.max(this.shortScanFrom, inRetention), SHORT_SCAN_WINDOW]);
+        [inRetention, HEAL_CANDIDATES, Math.max(this.shortScanFrom, inRetention), SHORT_SCAN_WINDOW, prunedFrom]);
       // The short-body scan counts transaction rows per block, so it walks the retention window in
       // slices instead of costing a full correlated count every pass.
       this.shortScanFrom = this.shortScanFrom + SHORT_SCAN_WINDOW > this.nodeHeight
@@ -831,6 +837,16 @@ export class Chain {
   }
 
   // ── helpers ─────────────────────────────────────────────────────────────────────────────────────
+
+  private async refreshArchiveReach(): Promise<void> {
+    try {
+      const reach = archiveFloor(await this.node.getArchiveStarts(), this.node.honestOne);
+      if (reach !== this.archiveReach) log.info('INDEXER', 'archive_reach', { from: Number.isFinite(reach) ? reach : null, need: this.node.honestOne });
+      this.archiveReach = reach;
+    } catch (e) {
+      log.warn('INDEXER', 'archive_reach_unavailable', { err: errText(e) });
+    }
+  }
 
   private async storedLinks(heights: number[]): Promise<Map<number, StoredLink>> {
     const m = new Map<number, StoredLink>();

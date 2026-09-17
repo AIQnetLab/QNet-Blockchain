@@ -59,9 +59,9 @@ class RealisticPerformanceTester:
         
         if not components['rpc_server']:
             estimates['current_tps'] = 0
-            estimates['mobile_crypto_tps'] = 8859  # Mobile crypto performance
-            estimates['blockchain_tps'] = 424411  # Full blockchain with microblocks (when nodes running)
-            estimates['reason'] = "RPC server needed for full blockchain testing - mobile crypto: 8,859 TPS, full blockchain: 424,411 TPS"
+            estimates['blockchain_tps'] = 13000  # Measured 30.08.2026 boundary ladder, batched transfers
+            estimates['single_transfer_tps'] = 450  # Measured the same day, single transfers
+            estimates['reason'] = "RPC server needed for full blockchain testing - measured: 13,000 batched / 450 single transfers per second"
             
         elif not components['consensus']:
             estimates['current_tps'] = 0  

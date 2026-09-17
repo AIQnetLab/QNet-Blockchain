@@ -1,7 +1,6 @@
 import { NextResponse } from 'next/server';
 import { getDbPool, getSyncStatus } from '../../../../../lib/db';
 import { getMonitoringHealth } from '../../../../../lib/monitoring';
-import { getRateLimitStats } from '../../../../../lib/rate-limit-redis';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
@@ -41,14 +40,6 @@ export async function GET() {
     status.monitoring = health;
   } catch {
     status.monitoring = { error: 'unavailable' };
-  }
-
-  // Get rate limit stats
-  try {
-    const rateLimitStats = await getRateLimitStats();
-    status.rateLimit = rateLimitStats;
-  } catch {
-    status.rateLimit = { error: 'unavailable' };
   }
 
   // Always return 200, even if degraded, so we can see the status

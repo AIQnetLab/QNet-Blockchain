@@ -1563,15 +1563,11 @@ impl BlockchainNode {
         let sig = dilithium3::detached_sign(message_hash.as_ref(), &sk);
         let sig_bytes = SigTrait::as_bytes(&sig).to_vec();
         
-        // Prefix: "dilithium3_v4:" + hex(signature)
-        let sig_hex = hex::encode(&sig_bytes);
-        let prefixed = format!("dilithium3_v4:{}", sig_hex);
-        
-        if microblock.height % ROTATION_INTERVAL_BLOCKS == 1 {
-            println!("[INFO][SIGN] h={} dilithium3=fips204 size={}", microblock.height, prefixed.len());
+        let wire = crate::node::encode_microblock_signature(microblock.height, &sig_bytes);
+        if microblock.height % ROTATION_INTERVAL_BLOCKS == 1 && crate::node::is_info() {
+            println!("[INFO][SIGN] h={} dilithium3=fips204 size={}", microblock.height, wire.len());
         }
-        
-        Ok(prefixed.as_bytes().to_vec())
+        Ok(wire)
     }
     
     /// PRODUCTION: Verify PQ (ML-DSA-65) signature for received microblock (supports compact)
@@ -1604,30 +1600,17 @@ impl BlockchainNode {
             return Ok(is_valid);
         }
         
-        // Convert signature bytes to string to check format
-        let sig_str = match String::from_utf8(microblock.signature.clone()) {
-            Ok(s) => s,
-            Err(_) => {
-                println!("[ERR][CRYPTO] Invalid signature format (not UTF-8)");
-                return Ok(false);
-            }
-        };
-        
-        // ═══════════════════════════════════════════════════════════════════
-        // v4.0: DILITHIUM3 DIRECT SIGNATURE (production format)
-        // Format: "dilithium3_v4:{hex_signature}"
-        // Verified against producer's registered VRF public key
-        // ═══════════════════════════════════════════════════════════════════
-        if sig_str.starts_with("dilithium3_v4:") {
-            let sig_hex = &sig_str[14..]; // Skip "dilithium3_v4:" prefix
-            let sig_bytes = match hex::decode(sig_hex) {
-                Ok(b) => b,
-                Err(e) => {
-                    println!("[ERR][SIGN] hex_decode err={}", e);
-                    return Ok(false);
-                }
-            };
-
+        // The detached ML-DSA-65 signature in the form this height must carry. From the MICROBLOCK_SIG_RAW
+        // gate that is the only form that verifies; below it a block may still carry a pre-v4 compact form.
+        let raw_form = qnet_state::feature_gates::is_active(
+            qnet_state::feature_gates::id::MICROBLOCK_SIG_RAW, microblock.height);
+        let detached = crate::node::decode_microblock_signature(microblock.height, &microblock.signature);
+        if raw_form && detached.is_none() {
+            println!("[ERR][SIGN] sig_form_invalid h={} producer={} len={}",
+                     microblock.height, microblock.producer, microblock.signature.len());
+            return Ok(false);
+        }
+        if let Some(sig_bytes) = detached {
             // Lookup producer's ML-DSA-65 public key (committed source, see producer_verify_pk)
             let pk = match crate::node::producer_verify_pk(storage, &microblock.producer) {
                 Some(pk) => pk,
@@ -1681,7 +1664,14 @@ impl BlockchainNode {
             return Ok(true);
         }
 
-        // Legacy: compact_bin / compact signature formats (for pre-v4 blocks)
+        // Legacy: compact_bin / compact signature formats (pre-v4 blocks), reachable only below the gate.
+        let sig_str = match String::from_utf8(microblock.signature.clone()) {
+            Ok(s) => s,
+            Err(_) => {
+                println!("[ERR][CRYPTO] Invalid signature format (not UTF-8)");
+                return Ok(false);
+            }
+        };
         use base64::{Engine as _, engine::general_purpose};
         let compact_sig: crate::pq_crypto::CompactPqSignature = if sig_str.starts_with("compact_bin:") {
             // v2.24: Parse binary compact signature (bincode+zstd+base64)

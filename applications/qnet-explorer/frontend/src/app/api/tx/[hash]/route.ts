@@ -3,93 +3,11 @@ import { getTransactionByHash, getBatchRecipients } from '../../../../../lib/db'
 import { rateLimit, getClientIdentifier } from '../../../../../lib/rate-limit';
 import { mapTxType, formatAmount } from '@/lib/tx-mapping';
 import { chainFeeNano, chainFeeNanoBig } from '@/lib/fee';
+import { fetchNode, nodeConfigError } from '@/lib/node-api';
 
 // Rate limiting: 200 requests per minute per IP
 const RATE_LIMIT_MAX = 200;
 const RATE_LIMIT_WINDOW = 60 * 1000; // 1 minute
-
-const IS_PRODUCTION = process.env.NODE_ENV === 'production';
-
-// Dev/testnet only: no production host is ever baked into source, so in a
-// production build QNET_API_URL is REQUIRED (see resolveNodeRpc).
-const NODE_RPC_DEV_FALLBACK = 'http://127.0.0.1:8001';
-
-// True if hostname is a private, loopback, link-local, or CGNAT address (SSRF guard).
-function isBlockedHost(hostname: string): boolean {
-  const h = hostname.toLowerCase().replace(/^\[|\]$/g, '');
-  if (h === 'localhost' || h.endsWith('.localhost')) return true;
-  // IPv6 loopback / unspecified / unique-local / link-local
-  if (h === '::1' || h === '::' || h.startsWith('fc') || h.startsWith('fd') || h.startsWith('fe80')) return true;
-  const m = h.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
-  if (m) {
-    const [a, b] = [Number(m[1]), Number(m[2])];
-    if (a === 127 || a === 0 || a === 10) return true;               // loopback, "this network", private
-    if (a === 192 && b === 168) return true;                          // private
-    if (a === 169 && b === 254) return true;                          // link-local (incl. cloud metadata)
-    if (a === 172 && b >= 16 && b <= 31) return true;                 // private
-    if (a === 100 && b >= 64 && b <= 127) return true;                // CGNAT
-  }
-  return false;
-}
-
-// Resolve the node RPC base URL once at module load.
-//   - Production REQUIRES a valid, publicly-routable QNET_API_URL. If it is
-//     unset, malformed, or points at a private/loopback host, we resolve to an
-//     error rather than '' — an empty base would turn every RPC fetch into a
-//     relative URL that throws "Failed to parse URL" and silently 404s any tx
-//     not in the local DB. The handler surfaces this as a 503 naming the
-//     misconfiguration instead of failing silently.
-//   - Dev/testnet falls back to loopback (http://127.0.0.1:8001) so local runs
-//     work without any env; a blocked/loopback QNET_API_URL is likewise allowed
-//     in dev (that is the intended local target).
-function resolveNodeRpc(): { url: string | null; error: string | null } {
-  const configured = process.env.QNET_API_URL;
-
-  if (!configured) {
-    if (IS_PRODUCTION) {
-      return {
-        url: null,
-        error:
-          'QNET_API_URL is not set. A production build requires an explicit, ' +
-          'publicly-routable node RPC endpoint (no host is baked into source).',
-      };
-    }
-    return { url: NODE_RPC_DEV_FALLBACK, error: null };
-  }
-
-  let parsed: URL;
-  try {
-    parsed = new URL(configured);
-  } catch {
-    return IS_PRODUCTION
-      ? { url: null, error: `QNET_API_URL is not a valid URL: "${configured}".` }
-      : { url: NODE_RPC_DEV_FALLBACK, error: null };
-  }
-
-  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-    return IS_PRODUCTION
-      ? { url: null, error: `QNET_API_URL has an unsupported protocol: "${parsed.protocol}".` }
-      : { url: NODE_RPC_DEV_FALLBACK, error: null };
-  }
-
-  if (isBlockedHost(parsed.hostname)) {
-    // Private/loopback host: fine in dev (intended local target), but in
-    // production it is either an SSRF target or a now-blocked internal host —
-    // refuse rather than silently degrade to an unreachable/empty base.
-    return IS_PRODUCTION
-      ? {
-          url: null,
-          error:
-            `QNET_API_URL points at a private/loopback host ("${parsed.hostname}") ` +
-            'which is not reachable in production. Configure a public node RPC endpoint.',
-        }
-      : { url: configured, error: null };
-  }
-
-  return { url: configured, error: null };
-}
-
-const { url: NODE_RPC_URL, error: NODE_RPC_ERROR } = resolveNodeRpc();
 
 // Normalize type-specific public data (JSONB object or JSON string) → object|null; null if empty.
 function parseTxTypeData(raw: unknown): Record<string, unknown> | null {
@@ -105,12 +23,8 @@ function parseTxTypeData(raw: unknown): Record<string, unknown> | null {
 // Fetch TX from Node RPC (fallback if not in DB)
 async function fetchTransaction(hash: string): Promise<Record<string, unknown> | null> {
   try {
-    const res = await fetch(`${NODE_RPC_URL}/api/v1/transaction/${encodeURIComponent(hash)}`, {
-      cache: 'no-store',
-      signal: AbortSignal.timeout(3000),
-    });
-    
-    if (!res.ok) return null;
+    const res = await fetchNode(`/api/v1/transaction/${encodeURIComponent(hash)}`, { cache: 'no-store', timeoutMs: 3000 });
+    if (!res || !res.ok) return null;
     
     // Validate response size before parsing
     const text = await res.text();
@@ -148,12 +62,8 @@ async function searchInEmissionBlocks(hash: string): Promise<Record<string, unkn
 
   for (const height of emissionBlocks) {
     try {
-      const res = await fetch(`${NODE_RPC_URL}/api/v1/block/${height}`, {
-        cache: 'no-store',
-        signal: AbortSignal.timeout(3000),
-      });
-      
-      if (!res.ok) continue;
+      const res = await fetchNode(`/api/v1/block/${height}`, { cache: 'no-store', timeoutMs: 3000 });
+      if (!res || !res.ok) continue;
       
       // Validate response size
       const blockText = await res.text();
@@ -209,14 +119,11 @@ export async function GET(
     });
   }
   
-  // Fail loudly on RPC misconfiguration instead of silently 404ing every tx
-  // that is not already in the local DB (an empty base URL would make each
-  // fallback fetch a relative URL that throws "Failed to parse URL").
-  if (NODE_RPC_ERROR || !NODE_RPC_URL) {
-    return NextResponse.json({
-      success: false,
-      error: `Node RPC misconfigured: ${NODE_RPC_ERROR ?? 'QNET_API_URL is not configured'}`,
-    }, { status: 503 });
+  // Fail loudly on node misconfiguration instead of silently 404ing every tx
+  // that is not already in the local DB.
+  const nodeError = nodeConfigError();
+  if (nodeError) {
+    return NextResponse.json({ success: false, error: `Node RPC misconfigured: ${nodeError}` }, { status: 503 });
   }
 
   const { hash } = await params;
@@ -289,11 +196,8 @@ export async function GET(
       // If timestamp is 0 and block is 0, fetch block timestamp
       if (finalTimestamp === 0 && dbTx.block === 0) {
         try {
-          const blockRes = await fetch(`${NODE_RPC_URL}/api/v1/block/0`, {
-            cache: 'no-store',
-            signal: AbortSignal.timeout(5000),
-          });
-          if (blockRes.ok) {
+          const blockRes = await fetchNode('/api/v1/block/0', { cache: 'no-store', timeoutMs: 5000 });
+          if (blockRes && blockRes.ok) {
             const blockText = await blockRes.text();
             if (blockText.length < 10 * 1024 * 1024) {
               try {
@@ -373,11 +277,8 @@ export async function GET(
 
     // Fetch block timestamp from node API
     try {
-      const blockRes = await fetch(`${NODE_RPC_URL}/api/v1/block/${blockHeight}`, {
-        cache: 'no-store',
-        signal: AbortSignal.timeout(2000),
-      });
-      if (blockRes.ok) {
+      const blockRes = await fetchNode(`/api/v1/block/${blockHeight}`, { cache: 'no-store', timeoutMs: 2000 });
+      if (blockRes && blockRes.ok) {
         const blockText = await blockRes.text();
         if (blockText.length < 10 * 1024 * 1024) {
           try {

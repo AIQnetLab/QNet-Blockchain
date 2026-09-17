@@ -46,8 +46,8 @@ export default function HomePage() {
               <div className="stat-trend">+12 this hour</div>
             </div>
             <div className="stat-card">
-              <div className="stat-number">424,411</div>
-              <div className="stat-label">TPS ACHIEVED</div>
+              <div className="stat-number">13,000</div>
+              <div className="stat-label">TRANSFERS/SEC</div>
               <div className="stat-trend">Peak performance</div>
             </div>
             <div className="stat-card">
@@ -144,10 +144,10 @@ export default function HomePage() {
                 animation: 'lightningFlash 1.5s ease-in-out infinite'
               }}></div>
             </div>
-            <h3>Verified 424,411 TPS</h3>
+            <h3>13,000 Transfers/sec Measured</h3>
             <p>
               Real performance test June 11, 2025: Single Thread 282,337 | Multi-Process 334,218 | 
-              Maximum Burst 424,411 TPS. Microblock architecture with pBFT consensus.
+              Burst ceiling 20,000 transfers/sec. Microblock architecture with pBFT consensus.
             </p>
           </div>
           

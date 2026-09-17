@@ -1,4 +1,5 @@
 import { NextResponse } from 'next/server';
+import { fetchNode } from '@/lib/node-api';
 
 // ============================================================================
 // SWAP Pools API - DEX Module
@@ -6,17 +7,12 @@ import { NextResponse } from 'next/server';
 // Status: Planned for Phase 3
 // ============================================================================
 
-const QNET_API_URL = process.env.QNET_API_URL || 'http://localhost:8001';
-
 export async function GET() {
   try {
     // Try to fetch from backend DEX module
-    const res = await fetch(`${QNET_API_URL}/api/v1/dex/pools`, {
-      cache: 'no-store',
-      signal: AbortSignal.timeout(5000),
-    });
-    
-    if (res.ok) {
+    const res = await fetchNode('/api/v1/dex/pools', { cache: 'no-store', timeoutMs: 5000 });
+
+    if (res && res.ok) {
       const data = await res.json();
       return NextResponse.json({
         success: true,

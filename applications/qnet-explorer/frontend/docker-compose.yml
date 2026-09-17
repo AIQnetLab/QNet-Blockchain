@@ -15,7 +15,6 @@ services:
       - NEXT_PUBLIC_NETWORK=mainnet
       - DATABASE_URL=postgresql://qnet_user:${POSTGRES_PASSWORD}@host.docker.internal:5432/qnet_explorer
       - QNET_API_URL=${QNET_API_URL:-https://162.244.25.114:8001}
-      - REDIS_URL=${REDIS_URL:-}
       - SECURITY_WEBHOOK_URL=${SECURITY_WEBHOOK_URL:-}
       - ALERT_EMAIL=${ALERT_EMAIL:-}
       - DB_SSL=${DB_SSL:-true}
@@ -34,19 +33,6 @@ services:
     networks:
       - qnet-network
 
-  # Optional: Redis for distributed rate limiting
-  redis:
-    image: redis:7-alpine
-    container_name: qnet-redis
-    ports:
-      - "${REDIS_PORT:-6379}:6379"
-    volumes:
-      - redis-data:/data
-    command: redis-server --appendonly yes
-    restart: unless-stopped
-    networks:
-      - qnet-network
-
   # Optional: Add nginx reverse proxy
   nginx:
     image: nginx:alpine
@@ -62,9 +48,6 @@ services:
     restart: unless-stopped
     networks:
       - qnet-network
-
-volumes:
-  redis-data:
 
 networks:
   qnet-network:

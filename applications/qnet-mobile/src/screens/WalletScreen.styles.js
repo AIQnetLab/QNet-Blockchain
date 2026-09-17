@@ -687,7 +687,7 @@ const styles = StyleSheet.create({
   tokenList: {
     marginBottom: 20,
   },
-  // Token rows (and tokenItemClickable) wrap like rewardItem: a balance that does not fit beside the name
+  // Token rows (and tokenItemClickable) wrap: a balance that does not fit beside the name
   // takes its own right-aligned line instead of running past the card.
   tokenItem: {
     flexDirection: 'row',
@@ -1409,11 +1409,11 @@ const styles = StyleSheet.create({
     color: '#ffffff',
     marginBottom: 20,
   },
-  // A label and its value share a line when both fit; otherwise the row wraps and the value takes a line
-  // of its own, right-aligned, so a narrow screen or a large system font never pushes it past the card.
+  // A label and its value always share one line: the label keeps its width and the value takes the rest,
+  // rendered with numberOfLines={1} + adjustsFontSizeToFit so a narrow screen or a large system font
+  // shrinks the value instead of dropping it to a line of its own.
   rewardItem: {
     flexDirection: 'row',
-    flexWrap: 'wrap',
     justifyContent: 'space-between',
     alignItems: 'center',
     marginBottom: 12,
@@ -1424,7 +1424,7 @@ const styles = StyleSheet.create({
   rewardLabel: {
     fontSize: 14,
     color: '#888888',
-    maxWidth: '100%',
+    flexShrink: 0,
     marginRight: 12,
   },
   rewardValue: {

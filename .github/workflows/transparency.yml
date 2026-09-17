@@ -72,8 +72,8 @@ jobs:
         echo "" >> transparency-report.md
         
         echo "## 📈 Performance Metrics" >> transparency-report.md
-        echo "- **Blockchain TPS**: 424,411" >> transparency-report.md
-        echo "- **Mobile SDK TPS**: 8,859" >> transparency-report.md
+        echo "- **Batched transfers/sec**: 13,000" >> transparency-report.md
+        echo "- **Single transfers/sec**: 450" >> transparency-report.md
         echo "- **Project Size**: 11MB (optimized from 30GB)" >> transparency-report.md
         echo "- **Size Reduction**: 99.96%" >> transparency-report.md
         echo "" >> transparency-report.md
@@ -182,7 +182,7 @@ jobs:
           echo "" >> mobile-transparency.md
           
           echo "## 🔋 Performance Optimizations" >> mobile-transparency.md
-          echo "- **TPS Performance**: 8,859 transactions per second" >> mobile-transparency.md
+          echo "- **Role**: light nodes answer one liveness ping per epoch; they do not process transactions" >> mobile-transparency.md
           echo "- **Battery Optimization**: Advanced power management" >> mobile-transparency.md
           echo "- **Memory Usage**: Optimized for mobile devices" >> mobile-transparency.md
           echo "- **Network Efficiency**: Minimal data usage" >> mobile-transparency.md
@@ -292,8 +292,8 @@ jobs:
         echo "- ✅ Multi-signature support validated"
         echo ""
         echo "## 📈 Performance Transparency"
-        echo "- **Blockchain Performance**: 424,411 TPS"
-        echo "- **Mobile Performance**: 8,859 TPS"
+        echo "- **Batched throughput**: 13,000 transfers/sec"
+        echo "- **Single-transfer throughput**: 450 transfers/sec"
         echo "- **Project Optimization**: 99.96% size reduction"
         echo "- **Final Size**: 11MB (from 30GB)"
         echo "- **Memory Usage**: <1GB RAM required"

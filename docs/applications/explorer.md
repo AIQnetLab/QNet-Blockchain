@@ -70,7 +70,7 @@ most every 10 s and the address page its data at most every 3 s.
 The migration runner (`src/indexer/migrate.ts`) applies every `migrations/NNN_*.sql` file not yet
 recorded in `schema_migrations`, in name order, each file as one transaction. A database whose tables
 predate that ledger is baselined by recording `001_init.sql` and `002_batch_transfers.sql` without
-running them. `003_indexer_v2.sql` sets `lock_timeout = 5s` and `statement_timeout = 15min`, so a
+running them. `003_indexer_v2.sql` and `004_address_history.sql` set `lock_timeout = 5s` and `statement_timeout = 15min`, so a
 migration that cannot take its locks fails rather than holding the read tier behind them. The
 optional `pg_trgm` GIN index that makes token free-text search index-served is applied by hand.
 
@@ -112,7 +112,10 @@ honest endpoint.
   (`body_indexed = FALSE`). Its time is the agreed header's; where the header carries none, below
   `SLOT_GAP_REANCHOR_GATE_HEIGHT` = 1,339,200 it is the slot time, the quorum-agreed time of block 0
   plus one second per height, and from that height on a lower bound from the nearest stored row below
-  it. A stored body stays when a header calls its height empty.
+  it. A stored body stays when a header calls its height empty. Nodes started with `QNET_ARCHIVE=1` keep
+  archived bodies past that window and report them as `body: true`; the indexer asks `GET /api/v1/archive`
+  where each endpoint's archive starts and treats heights at or above the `n - quorum + 1`-th lowest start as still
+  obtainable: a missing body there is retried, not recorded as pruned.
 - **Token transfers.** After blocks with transactions are stored, the node's `/api/v1/token-transfers`
   rows for that height range are fetched from the endpoints that served the agreed bodies, and each
   window of up to 10,000 heights is replaced when `n - quorum + 1` of them return identical rows.
@@ -126,8 +129,8 @@ honest endpoint.
   on which the endpoints agree on nothing halt ingestion; the next page they agree on lifts the halt.
 - **Heal.** Every minute, or 10 minutes after a pass that finds or changes nothing, rows without a real
   hash, bodies inside the retention window whose transaction rows fall short of
-  `tx_count - tx_skipped`, and identity-only rows back inside the window are re-read through the same
-  quorum path.
+  `tx_count - tx_skipped`, and identity-only rows back inside the window or at or above the archive reach are
+  re-read through the same quorum path.
 
 ## Database schema
 
@@ -167,6 +170,7 @@ identifier; `/api/activity`, for example, allows 600 requests per minute per cli
 | --- | --- |
 | `GET /api/activity` | Transaction list from the index, enriched for display: keyset pages by `cursor` and `dir`, numbered `page` jumps up to 200, a `types` filter; the default first page comes from the head snapshot |
 | `GET /api/address/[address]` | Address summary and history, with incoming `BatchTransfers` credits merged in |
+| `GET /api/address/[address]/history?cursor=&limit=` | The wallet's history feed: transactions sent or received, batch credits and token transfers as one newest-first list, `limit` 1–100 (default 50), ordered by block, source, position and hash, paged by the returned `next_cursor`. Amounts are raw (nano QNC or token base units, with the token's deploy-time symbol, decimals and logo); `fee` is the nano QNC the chain debited a sender |
 | `GET /api/address/[address]/balance-proof` | Multi-node balance agreement check |
 | `GET /api/blocks/[hash]` | Block by hash |
 | `GET /api/tx/[hash]` | Transaction by hash; a `BatchTransfers` envelope carries its recipients |
@@ -179,7 +183,7 @@ identifier; `/api/activity`, for example, allows 600 requests per minute per cli
 | `GET /api/head` | The head snapshot as JSON, the poll fallback for `/api/stream` |
 | `GET /api/stream` | Server-sent `head` event on each new head snapshot; at most 6 streams per client, 15 s heartbeat |
 | `GET /api/sync/start` | The indexer's published state: head, prefix, node height, lag, subscription, heal backlog, and `healthy` when the lag is at most 600 blocks and the last commit is under 120 s old; `POST` answers 410 |
-| `GET /api/monitoring/health`, `GET /api/monitoring/alerts` | Health (database, indexer lag and freshness, rate limiter) and alerting; health reports `degraded` when the last commit is over 120 s old or the lag exceeds 600 blocks |
+| `GET /api/monitoring/health`, `GET /api/monitoring/alerts` | Health (database, indexer lag and freshness, monitoring) and alerting; health reports `degraded` when the last commit is over 120 s old or the lag exceeds 600 blocks |
 | `GET /api/verify-build` | Build provenance (commit and source-tree links) |
 
 ### Balance agreement check
@@ -210,13 +214,12 @@ Values are operator-supplied. Never commit them; never place them in a document.
 | `DATABASE_URL` | PostgreSQL connection string |
 | `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, `PGPASSWORD` | Connection fields for `scripts/backfill-timestamps.ts` |
 | `DB_SSL`, `DB_SSL_REJECT_UNAUTHORIZED` | TLS for the database connection |
-| `QNET_API_URL` | Base URL of the QNet node the proxy routes read from; the indexer's endpoint when `QNET_API_URLS` is unset |
-| `QNET_API_URLS` | Comma-separated node URLs the indexer reads and votes over |
+| `QNET_API_URL` | Single node URL, used when `QNET_API_URLS` is unset |
+| `QNET_API_URLS` | Comma-separated node URLs: the indexer reads and votes over them; the API routes ask them in turn |
 | `QNET_BOOTSTRAP_NODES` | Comma-separated node list used for validator discovery |
 | `QNET_NODE_URL` | Node URL used by node-facing helpers |
 | `QNET_API_KEY` | Sent as `X-API-Key` to the node to bypass its rate limits |
 | `BRIDGE_API_BASE` | Base URL of the activation bridge used by `/api/node/activate` |
-| `REDIS_URL` | Enables Redis-backed distributed rate limiting |
 | `RATE_LIMIT_TRUSTED_PROXY`, `FAUCET_TRUSTED_PROXY` | Trust `X-Forwarded-For` when behind a proxy |
 | `FAUCET_ENV`, `NEXT_PUBLIC_NETWORK` | Selects the testnet or mainnet faucet configuration |
 | `FAUCET_PRIVATE_KEY` | Faucet signing key, read only at runtime |
@@ -226,10 +229,13 @@ Values are operator-supplied. Never commit them; never place them in a document.
 | `NEXT_PUBLIC_GIT_COMMIT` | Commit shown by the build-verification route |
 | `NODE_ENV` | Standard Next.js environment selector |
 
-In a production build `/api/tx/[hash]` requires `QNET_API_URL` to be an http(s) URL with a publicly
-routable host: an unset or malformed value, or a loopback, private, link-local or CGNAT host, makes the
-route answer 503 naming the misconfiguration. Outside production an unset or malformed value falls
-back to `http://127.0.0.1:8001`. The indexer accepts any http(s) URL in `QNET_API_URLS`.
+The API routes read the node through `src/lib/node-api.ts`: each read goes to the first node in the list that is
+not cooling down, and a transport failure, timeout or 5xx moves it to the next and benches the failed node for
+15 s, so one node restarting in a roll or saturated by a load test does not take balances and lookups with it. A
+swap submission is a write and goes to one node only. A production build keeps only http(s) URLs with a publicly
+routable host (a loopback, private, link-local or CGNAT host is dropped); with none left `/api/tx/[hash]` answers
+503 naming the misconfiguration. Outside production an empty list falls back to `http://127.0.0.1:8001`. The
+indexer accepts any http(s) URL in `QNET_API_URLS`.
 
 ## Running locally
 
@@ -262,14 +268,14 @@ Containers:
 
 ```bash
 cd applications/qnet-explorer/frontend
-docker compose up -d      # web tier on port 3000, plus optional redis and nginx
+docker compose up -d      # web tier on port 3000, plus optional nginx
 ```
 
 The compose stack runs the web tier; the indexer runs as its own process against the same database.
 `ecosystem.config.example.js` lays out both under PM2, the web tier connecting as a read-only role.
 
 The compose file forwards a fixed list — `NODE_ENV`, `PORT`, `NEXT_PUBLIC_API_URL`,
-`NEXT_PUBLIC_NETWORK`, `QNET_API_URL`, `REDIS_URL`, `SECURITY_WEBHOOK_URL`, `ALERT_EMAIL`, `DB_SSL`
+`NEXT_PUBLIC_NETWORK`, `QNET_API_URL`, `SECURITY_WEBHOOK_URL`, `ALERT_EMAIL`, `DB_SSL`
 and `DB_SSL_REJECT_UNAUTHORIZED` — and writes the database connection string into the file with only
 `POSTGRES_PASSWORD` interpolated. Anything else a deployment needs (API key, faucet key, bridge base,
 proxy-trust flags) is added to the `environment:` block before compose passes it

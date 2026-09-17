@@ -277,9 +277,9 @@ export default function ClientWrapper({
                       <div className="stat-trend">+12 this hour</div>
                     </div>
                     <div className="stat-card">
-                      <div className="stat-number">424,411</div>
-                      <div className="stat-label">TPS ACHIEVED</div>
-                      <div className="stat-trend">Peak performance</div>
+                      <div className="stat-number">13k</div>
+                      <div className="stat-label">TRANSFERS/SEC</div>
+                      <div className="stat-trend">measured E2E · 40-80k on validator hardware</div>
                     </div>
                     <div className="stat-card">
                       <div className="stat-number">99.9%</div>

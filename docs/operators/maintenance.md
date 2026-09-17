@@ -133,6 +133,30 @@ independent schedules and never deletes chain history to free space:
   exceeds both the snapshot-switch gap and the retained-snapshot span, so a cold or lagging node can never need a body
   that has been pruned.
 
+### History archive
+
+A node started with `QNET_ARCHIVE=1` keeps the history the prune would otherwise drop. At the middle of every
+14,400-block epoch it writes each epoch that is finalized and not yet archived (normally the previous one, at most
+six per pass; one right after start, so a restart shows at once whether the archive can write) into
+`<data dir>/archive/seg_{epoch}.qarc`, with a `seg_{epoch}.json` meta beside it (blocks, heights whose body was already
+gone, macroblocks carried, size, SHA3-256). A block enters a segment only when it hashes to its slot's committed
+hash, the macroblock's QC-certified window list names it, and its transactions rebuild the merkle root; any
+mismatch refuses the whole segment (`[ERR][HISTORY] segment_refused`) and the pass stops there. Producer signatures,
+VRF proofs and timeout proofs are left out: none is part of the block hash, and an empty block drops from ~7 KB to a
+few hundred bytes. The macroblocks that certify the epoch go in with their committee signatures and the signers'
+public keys, so a segment proves finality on its own after the node strips QC signatures from its database
+(about 20 KB per macroblock with five signers: ~3.3 MB an epoch, ~7 GB a year). A macroblock whose signatures were
+already stripped when its segment was written is counted in `macroblocks_unsigned`. Writes are file, fsync, rename, then the meta the same way; a segment without its meta is deleted
+at the next start.
+
+While the archive owes an epoch, the body prune and the transaction-index prune stop below that epoch, so the
+archive can still rebuild its blocks. The hold is bounded by `ARCHIVE_HOLD_MAX_BLOCKS` = 7 days: past it both prunes
+resume (`[ERR][HISTORY] hold_released`) and later segments list the lost heights as missing. A rollback that retracts
+the chain position also deletes every segment reaching above the target. Segments are a node-local, off-consensus
+copy: apply, sync and finality never read them; the RPC block and header reads fall back to them, and the explorer
+refills pruned bodies from them. The explorer needs `n - quorum + 1` of its endpoints to serve the same body (3 of the five
+genesis nodes), so enable it on all five: `QNET_SET_ENV=QNET_ARCHIVE=1 scripts/deploy-genesis.sh 005 001 002 003 004`.
+
 Expect this in API answers: `/api/v1/logs`, `/api/v1/logs/proof` and the token-transfer feeds return
 `oldest_available`, `pruned_below` or `window_pruned`, so an empty result below the prune floor is distinguishable
 from "no events". Registry and total-supply seals are pruned one 14,400-block window below the head
@@ -200,7 +224,8 @@ time and wait until it reports `healthy` on `/api/v1/node/health` with `blocks_b
 committee than the fault bound tolerates turns a maintenance window into a liveness incident. `/healthz` answers
 with the new image's `build=` once the replacement has taken. `scripts/deploy-genesis.sh` runs this pass for the
 genesis fleet: it recreates each container from its own `docker inspect` output, leaving `QNET_ROLLBACK_*`,
-`QNET_RECOVERY_HALTED` and `QNET_BUILD_ID` out of the carried environment, and touches the next node only after the
+`QNET_RECOVERY_HALTED` and `QNET_BUILD_ID` out of the carried environment (`QNET_SET_ENV=KEY=VALUE[,KEY=VALUE]` adds or
+replaces entries), and touches the next node only after the
 previous one answers `/healthz`, is fewer than 10 blocks below the network height with at least one validated peer,
 has taken part in a checkpoint as a validator and seen a full-quorum seal at or above that window above its restart
 height, and has run 30 blocks past its restart with a failover-free metrics window. `QNET_RECOVERY_HALTED=1` skips the

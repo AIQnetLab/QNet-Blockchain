@@ -38,6 +38,10 @@ const _forceHttps = (() => {
 
 export const GENESIS_NODES = _forceHttps ? GENESIS_NODES_HTTPS : GENESIS_NODES_HTTP;
 
+// The block explorer is the chain's history archive: nodes keep about a day of transactions, the
+// explorer keeps all of them, so the wallet pages its history from here.
+export const EXPLORER_API = 'https://aiqnet.io';
+
 /**
  * The genesis nodes that own a light node's shard, in the order the chain ranks them.
  *

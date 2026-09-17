@@ -38,7 +38,11 @@ import {
   isTokenRefreshNeeded,
   teardownLightNode,
 } from '../services/PushService';
-import { getRandomGenesisNode } from '../config/nodes';
+import { getRandomGenesisNode, EXPLORER_API } from '../config/nodes';
+import {
+  HISTORY_PAGE, EXPLORER_REFRESH_MS, fmtTokenBaseUnits, historyRowKey, tokenRowFromEvent, splitExplorerItems,
+  mergeHistory, appendHistory, cacheableHistory,
+} from '../utils/txHistory';
 import { TRANSFER_FEE_NANO, TRANSFER_FEE_QNC } from '../config/fees';
 import translations from '../i18n/translations';
 import styles from './WalletScreen.styles';
@@ -51,10 +55,6 @@ const BURN_CONTRACT_PROGRAM_ID = 'CCZSessk1TbWie6Ye2JX2cNEWHTEWxCwe5sLz8JaFriw';
 // Prevents hammering the node API: no matter how many components re-render,
 // only one actual network request goes out per minute.
 const _blockHeightCache = { height: 0, fetchedAt: 0, inFlight: false };
-
-// How many confirmed rows survive a restart. Enough to fill several screens; a wallet with more
-// history refills the rest from the node on the first successful fetch.
-const HISTORY_CACHE_MAX = 100;
 
 // The activation record is tagged with the wallet that owns it. Records written before the burn path
 // was aligned carry the Solana address and newer ones the QNet address, so ownership matches EITHER
@@ -79,21 +79,6 @@ const TabBox = React.memo(
     prev.deps.length === next.deps.length &&
     prev.deps.every((v, i) => Object.is(v, next.deps[i]))
 );
-
-// Format a u64 base-unit token amount by its decimals using string math (exact past 2^53 — a
-// 0-decimal high-supply token can reach ~1.8e19, well beyond a JS float's safe integer range).
-function fmtTokenBaseUnits(base, decimals) {
-  const s = String(base == null ? '0' : base).replace(/[^0-9]/g, '') || '0';
-  const d = Number(decimals) || 0;
-  // Thousands-group an all-digit string directly (never via Number()) so no low-order digit is lost.
-  const group = (digits) => digits.replace(/^0+(?=\d)/, '').replace(/\B(?=(\d{3})+(?!\d))/g, ',');
-  if (d <= 0) return group(s);
-  const padded = s.padStart(d + 1, '0');
-  const intPart = padded.slice(0, padded.length - d);
-  const frac = padded.slice(padded.length - d).replace(/0+$/, '');
-  const intFmt = group(intPart);
-  return frac ? `${intFmt}.${frac}` : intFmt;
-}
 
 // 16px coin/token mark next to a history row's amount. Native QNC → the cyan "Q" brand; a QRC-20
 // transfer → an emoji logo or a deterministic coloured-letter avatar (colour from the contract
@@ -213,21 +198,22 @@ const TxRow = React.memo(function TxRow({ tx, onCopy, hideAmounts }) {
       : (() => {
           const d = new Date(tx.timestamp);
           const p = (n) => String(n).padStart(2, '0');
-          return `${p(d.getDate())}.${p(d.getMonth() + 1)}.${d.getFullYear()}, ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+          return `${p(d.getDate())}.${p(d.getMonth() + 1)}.${d.getFullYear()}, ${p(d.getHours())}:${p(d.getMinutes())}`;
         })();
   return (
     <TouchableOpacity
       style={{ backgroundColor: '#16213e', borderRadius: 12, padding: 16, marginBottom: 12, borderWidth: 1, borderColor: tx.status === 'pending' ? '#ffaa00' : '#1a1a2e' }}
       onPress={() => onCopy(tx.hash)}
     >
-      <View style={{ flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+      {/* One line on any screen: both sides shrink their text to fit instead of the amount dropping below. */}
+      <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
         <View style={{ flexDirection: 'row', alignItems: 'center', flexShrink: 1 }}>
           <View style={{ width: 32, height: 32, borderRadius: 16, backgroundColor: isSend ? '#ff444420' : '#00ff8820', alignItems: 'center', justifyContent: 'center', marginRight: 12 }}>
             <Text style={{ color: isSend ? '#ff4444' : '#00ff88', fontSize: 18 }}>{isBurn ? '🔥' : (isSend ? '↑' : '↓')}</Text>
           </View>
           <View style={{ flexShrink: 1 }}>
-            <Text style={{ color: '#fff', fontSize: 16, fontWeight: '600' }}>{isBurn ? '🔥 Burn' : (isSend ? 'Sent' : 'Received')}</Text>
-            <Text style={{ color: '#666', fontSize: 12 }}>{dateLabel}</Text>
+            <Text style={{ color: '#fff', fontSize: 16, fontWeight: '600' }} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.5}>{isBurn ? '🔥 Burn' : (isSend ? 'Sent' : 'Received')}</Text>
+            <Text style={{ color: '#666', fontSize: 12 }} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.5}>{dateLabel}</Text>
           </View>
         </View>
         <View style={{ alignItems: 'flex-end', flexShrink: 1, maxWidth: '100%', marginLeft: 'auto', paddingLeft: 8 }}>
@@ -244,7 +230,7 @@ const TxRow = React.memo(function TxRow({ tx, onCopy, hideAmounts }) {
               <Text style={{ color: '#00e5f0', fontSize: 12, fontWeight: '800', marginLeft: 4 }} accessibilityLabel="QC-verified">✓</Text>
             )}
           </View>
-          {tx.fee > 0 && <Text style={{ color: '#666', fontSize: 11 }}>Fee: {hideAmounts ? '••••' : `${fmtAmount(tx.fee, 5)} QNC`}</Text>}
+          {tx.fee > 0 && <Text style={{ color: '#666', fontSize: 11 }} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.5}>Fee: {hideAmounts ? '••••' : `${fmtAmount(tx.fee, 5)} QNC`}</Text>}
         </View>
       </View>
       <View style={{ borderTopWidth: 1, borderTopColor: '#1a1a2e', paddingTop: 8 }}>
@@ -353,6 +339,10 @@ const WalletScreen = () => {
   const wsReconnectTimerRef = useRef(null);   // cancellable reconnect timer
   const wsBackoffRef = useRef(0);             // reconnect attempt count for exponential backoff
   const txHistoryDebounceRef = useRef(null);  // coalesce bursty history refreshes
+  const historyCursorRef = useRef(undefined); // next older explorer page: undefined = not asked yet, null = none left
+  const explorerHistoryAtRef = useRef(0);     // last explorer first-page request (ms): background refreshes are throttled
+  const historyLoadingOlderRef = useRef(false);
+  const [historyLoadingOlder, setHistoryLoadingOlder] = useState(false);
   // v3.27: Track Merkle proof verification status for trustless display
   const [balanceVerified, setBalanceVerified] = useState(false);
   const [language, setLanguage] = useState('en');
@@ -2101,7 +2091,7 @@ const WalletScreen = () => {
   useEffect(() => {
     if (wallet?.qnetAddress && activeTab === 'history') {
       // Load immediately when switching to history tab
-      loadTxHistory();
+      loadTxHistory(true);
       
       const historyInterval = setInterval(() => {
         if (wallet?.qnetAddress && activeTab === 'history') {
@@ -2152,7 +2142,7 @@ const WalletScreen = () => {
               await AsyncStorage.setItem('qnet_last_activated_node', JSON.stringify({
                 nodeType, code: codeStr, timestamp: Date.now(),
                 burnTxHash: code?.burnTxHash || 'stored',
-                walletAddress: currentAddr
+                walletAddress: wallet.qnetAddress || wallet.address
               }));
               return;
             }
@@ -2210,7 +2200,7 @@ const WalletScreen = () => {
         const tab = activeTabRef.current;
         const nodeType = activatedNodeTypeRef.current;
         const jobs = [];
-        if (tab === 'history' && wallet?.qnetAddress) jobs.push(loadTxHistory());
+        if (tab === 'history' && wallet?.qnetAddress) jobs.push(loadTxHistory(true));
         if (tab === 'assets' && wallet?.publicKey) jobs.push(loadBalance(wallet.publicKey));
         if (tab === 'node') {
           jobs.push(loadAllUserNodes());
@@ -2265,6 +2255,7 @@ const WalletScreen = () => {
         setTxHistory([]);
         pendingTxRef.current = null;
       }
+      if (lastHistoryAddrRef.current !== wallet.qnetAddress) historyCursorRef.current = undefined;
       lastHistoryAddrRef.current = wallet.qnetAddress;
 
       // Load cached nodes and trigger discovery for load balancing
@@ -2276,7 +2267,7 @@ const WalletScreen = () => {
       connectWebSocket();
 
       // Load TX history
-      loadTxHistory();
+      loadTxHistory(true);
       
       return () => {
         wsShouldReconnectRef.current = false; // stop any resurrecting reconnect
@@ -3211,7 +3202,7 @@ const WalletScreen = () => {
                 
                 setTxHistory(prev => {
                   if (prev.some(t => t.hash === newTx.hash)) return prev;
-                  return [newTx, ...prev].slice(0, 50);
+                  return [newTx, ...prev];
                 });
                 
                 if (wallet?.publicKey) {
@@ -3237,118 +3228,89 @@ const WalletScreen = () => {
     }
   };
 
-  // v3.35: Load TX history from API
-  // FIX: Preserve pending TXs that haven't been confirmed yet
-  // BEFORE: setTxHistory(formattedTxs) — REPLACED everything, pending TX disappeared
-  // NOW: Merge — keep pending TXs that aren't yet in blockchain response
-  const loadTxHistory = async () => {
+  // History = the explorer archive (whole history, paged) + one node (the freshest rows, and the
+  // fallback when the explorer is down) + node lifecycle rows from the registry, merged into what is
+  // already on screen rather than replacing it. See utils/txHistory.
+  const fetchExplorerHistory = async (address, cursor) => {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 8000);
+    try {
+      const q = `limit=${HISTORY_PAGE}` + (cursor ? `&cursor=${encodeURIComponent(cursor)}` : '');
+      const r = await fetch(`${EXPLORER_API}/api/address/${address}/history?${q}`, { method: 'GET', signal: ctl.signal });
+      if (!r.ok) return null;
+      const body = await r.json();
+      return body && body.success && Array.isArray(body.items) ? body : null;
+    } catch (_) {
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
+  // Decimals/symbol for the ✓ badge come from the wallet's own added-token list, never from a feed.
+  const trustedTokenMetaMap = () => new Map(
+    (customTokens || []).map(ct => [String(ct.contract || '').toLowerCase(),
+      { decimals: Number(ct.decimals) || 0, symbol: ct.symbol }])
+  );
+
+  // `fresh`: the user asked (tab opened, pull-to-refresh, wallet loaded). Background refreshes (timer, new
+  // block) ask the explorer at most every EXPLORER_REFRESH_MS; the node covers the newest rows in between.
+  const loadTxHistory = async (fresh = false) => {
     if (!wallet?.qnetAddress) return;
+    const address = wallet.qnetAddress;
+    const askExplorer = fresh || Date.now() - explorerHistoryAtRef.current >= EXPLORER_REFRESH_MS;
+    if (askExplorer) explorerHistoryAtRef.current = Date.now();
 
     try {
-      const myAddress = wallet.qnetAddress.toLowerCase();
-
-      // Fetch the native tx list (carries native QNC transfers) and the node-decoded token-transfer
-      // events in parallel. Token transfers are no longer derived from client-side calldata parsing.
+      const myAddress = address.toLowerCase();
       const apiUrl = walletManager.getRandomBootstrapNode();
-      const controller = new AbortController();
-      const t = setTimeout(() => controller.abort(), 5000);
-      const nativePromise = fetch(
-        `${apiUrl}/api/v1/account/${wallet.qnetAddress}/transactions?limit=50`,
-        { method: 'GET', headers: { 'Content-Type': 'application/json' }, signal: controller.signal }
-      ).finally(() => clearTimeout(t));
-      const tokenEventsPromise = walletManager.getAccountTokenTransfers(wallet.qnetAddress, 50);
-      // Node lifecycle, from the registry rather than the tx index: the registration TX is pruned with
-      // every other transaction below the node's retention horizon, so this is the only feed that still
-      // has the wallet's own activation a day after it happened.
-      const nodeEventsCtl = new AbortController();
-      const nodeEventsT = setTimeout(() => nodeEventsCtl.abort(), 5000);
-      const nodeEventsPromise = fetch(
-        `${apiUrl}/api/v1/account/${wallet.qnetAddress}/node-events`,
-        { method: 'GET', headers: { 'Content-Type': 'application/json' }, signal: nodeEventsCtl.signal }
-      ).then(r => (r.ok ? r.json() : null)).catch(() => null).finally(() => clearTimeout(nodeEventsT));
+      const nodeJson = (path) => {
+        const ctl = new AbortController();
+        const timer = setTimeout(() => ctl.abort(), 5000);
+        return fetch(`${apiUrl}${path}`, { method: 'GET', headers: { 'Content-Type': 'application/json' }, signal: ctl.signal })
+          .then(r => (r.ok ? r.json() : null)).catch(() => null).finally(() => clearTimeout(timer));
+      };
+      const [explorerPage, nodeNative, nodeTokenEvents, nodeEventsData] = await Promise.all([
+        askExplorer ? fetchExplorerHistory(address, null) : null,
+        nodeJson(`/api/v1/account/${address}/transactions?limit=${HISTORY_PAGE}`),
+        walletManager.getAccountTokenTransfers(address, HISTORY_PAGE),
+        // Node lifecycle comes from the registry: the registration TX leaves the tx index a day later.
+        nodeJson(`/api/v1/account/${address}/node-events`),
+      ]);
+      if (lastHistoryAddrRef.current !== address) return;   // the wallet changed while this was in flight
 
-      // Token rows first: node-decoded QRC-20/721 events, metadata embedded per row (no metadata fetch).
-      // u64 amounts stay STRINGS. Direction: 'receive' iff the tokens land on me and I'm not the sender.
-      // tokenLogIndex disambiguates multiple transfer logs sharing one tx_hash (unique React key + no
-      // row collapse in the FlatList).
-      const tokenEvents = await tokenEventsPromise;
-      // Trusted per-contract display metadata: the QC-committed logs_root leaf binds base-units+parties
-      // but NOT decimals/symbol, so a serving node's per-row decimals could otherwise inflate the shown
-      // magnitude under the ✓ badge. Prefer the wallet's OWN added-token metadata (reviewed at add-time,
-      // node-independent) keyed by contract; fall back to the node's per-row value only for tokens the
-      // user hasn't added (where no magnitude is implied trustworthy anyway). Base units stay verbatim —
-      // they are the value actually proven against the committed leaf.
-      const trustedTokenMeta = new Map(
-        (customTokens || []).map(ct => [String(ct.contract || '').toLowerCase(),
-          { decimals: Number(ct.decimals) || 0, symbol: ct.symbol }])
-      );
-      const tokenTxs = (tokenEvents || [])
-        // A malicious/buggy node may return rows unrelated to me — only display transfers I'm party to.
-        .filter(ev => {
-          const f = String(ev.from || '').toLowerCase(), t = String(ev.to || '').toLowerCase();
-          return f === myAddress || t === myAddress;
-        })
-        .map(ev => {
-          const tm = trustedTokenMeta.get(String(ev.contract || '').toLowerCase());
-          const dec = tm ? tm.decimals : (Number(ev.decimals) || 0);
-          const sym = tm ? tm.symbol : ev.symbol;
-          return {
-        hash: ev.tx_hash,
-        tokenLogIndex: ev.log_index,
-        from: ev.from,
-        to: ev.to,
-        amount: 0,
-        status: 'pending', // promoted to 'confirmed' below only after a QC-anchored inclusion proof
-        verified: false,
-        timestamp: (ev.timestamp || 0) * 1000,
-        type: (String(ev.to || '').toLowerCase() === myAddress && String(ev.from || '').toLowerCase() !== myAddress) ? 'receive' : 'send',
-        fee: 0,
-        tokenContract: ev.contract,
-        tokenSymbol: sym,
-        tokenLogo: ev.logo,
-        tokenStd: ev.std,
-        tokenId: ev.token_id,
-        // True only when decimals/symbol came from the wallet's OWN added-token registry (node-independent).
-        // The ✓ trust badge requires this so it never sits next to a node-scaled magnitude for a token the
-        // user never added (a dust-airdrop-as-"1,000,000 USDC" phishing row): base units are proven, but the
-        // human magnitude is only trustworthy for added tokens.
-        tokenMetaTrusted: !!tm,
-        // Raw fields (verbatim from the node) needed to recompute the logs_root leaf for the P4 binding.
-        tokenKind: ev.kind,
-        tokenRawAmount: String(ev.amount == null ? '' : ev.amount),
-        tokenAmountDisplay: fmtTokenBaseUnits(String(ev.amount || '0'), dec),
-          };
-        });
+      const archived = explorerPage ? splitExplorerItems(explorerPage.items, address) : { native: [], tokenEvents: [] };
+
+      // Token events from both feeds, one per (hash, log index). The node's row is the one its inclusion
+      // proof can bind; the explorer's says the transfer is already on chain.
+      const events = new Map();
+      for (const ev of archived.tokenEvents) events.set(`${ev.tx_hash}:${ev.log_index}`, ev);
+      for (const ev of (nodeTokenEvents || [])) {
+        // A source may return rows unrelated to this wallet: only transfers it is a party to.
+        if (String(ev.from || '').toLowerCase() !== myAddress && String(ev.to || '').toLowerCase() !== myAddress) continue;
+        const k = `${ev.tx_hash}:${ev.log_index}`;
+        events.set(k, { ...ev, archived: !!events.get(k)?.archived });
+      }
+      const trusted = trustedTokenMetaMap();
+      const tokenTxs = [...events.values()].map(ev => tokenRowFromEvent(ev, myAddress, trusted));
       const tokenHashes = new Set(tokenTxs.map(t => t.hash));
 
-      // Native rows: keep every native type; drop only a ContractCall a token event already represents
-      // (avoids a duplicate "0 QNC" row). A non-transfer contract call (approve / WASM) stays visible.
-      let nativeTxs = [];
-      // Whether the node actually answered. An unanswered request is not an empty history.
-      let nativeOk = false;
-      const response = await nativePromise;
-      if (response.ok) {
-        nativeOk = true;
-        const data = await response.json();
-        const transactions = data.transactions || data || [];
-        nativeTxs = transactions
-          .filter(tx => !(String(tx.tx_type) === 'ContractCall' && tokenHashes.has(tx.hash || tx.tx_hash)))
-          .map(tx => ({
-            hash: tx.hash || tx.tx_hash,
-            from: tx.from || tx.sender,
-            to: tx.to || tx.recipient,
-            amount: (tx.amount || 0) / 1e9,
-            status: 'confirmed',
-            // v3.33: Convert Unix timestamp (seconds) to milliseconds for Date()
-            timestamp: (tx.timestamp || 0) * 1000,
-            type: (tx.from || tx.sender || '').toLowerCase() === myAddress ? 'send' : 'receive',
-            fee: (tx.fee || tx.gas_used || 0) / 1e9,
-          }));
-      }
+      const nodeTxs = (nodeNative && Array.isArray(nodeNative.transactions) ? nodeNative.transactions : []).map(tx => ({
+        hash: tx.hash || tx.tx_hash,
+        txType: tx.tx_type,
+        from: tx.from || tx.sender,
+        to: tx.to || tx.recipient,
+        amount: (tx.amount || 0) / 1e9,
+        status: 'confirmed',
+        timestamp: (tx.timestamp || 0) * 1000,
+        type: (tx.from || tx.sender || '').toLowerCase() === myAddress ? 'send' : 'receive',
+        fee: (tx.fee || tx.gas_used || 0) / 1e9,
+      }));
+      // The explorer row first: it carries the fee the chain debited. A ContractCall a token event already
+      // represents is dropped (no duplicate "0 QNC" row); any other contract call stays.
+      const nativeTxs = [...archived.native, ...nodeTxs]
+        .filter(tx => !(tx.txType === 'ContractCall' && tokenHashes.has(tx.hash)));
 
-      // Lifecycle rows. Sorted in with the rest by timestamp; a pruned block body leaves timestamp 0,
-      // and the row then shows its block height instead of a date rather than claiming "Genesis".
-      const nodeEventsData = await nodeEventsPromise;
       const nodeEventTxs = ((nodeEventsData && nodeEventsData.events) || []).map(ev => ({
         hash: `node:${ev.node_id}`,
         nodeEvent: true,
@@ -3364,44 +3326,32 @@ const WalletScreen = () => {
         type: 'receive',
       }));
 
-      // Merge + sort newest-first so native + token rows interleave chronologically (a native Transfer
-      // and a token event never share a hash, so no further dedup is needed).
-      const formattedTxs = [...nativeTxs, ...tokenTxs, ...nodeEventTxs]
-        .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+      // Nothing answered: what is on screen is the best record there is.
+      if (!explorerPage && !nodeNative && !nodeEventsData && tokenTxs.length === 0) return;
 
-      // MERGE with pending TXs instead of replacing, but ONLY pending sent from THIS wallet —
-      // a pending TX from a previously opened wallet must never survive a wallet switch.
+      // The span the explorer page vouches for: all of history on its last page, down to its oldest row
+      // otherwise. Without the explorer nothing already shown is dropped.
+      const archivedTimes = [...archived.native, ...tokenTxs.filter(t => t.status === 'confirmed')].map(t => t.timestamp || 0);
+      const coveredFromMs = !explorerPage ? Infinity
+        : (explorerPage.next_cursor && archivedTimes.length ? Math.min(...archivedTimes) : 0);
+      if (explorerPage && historyCursorRef.current === undefined) historyCursorRef.current = explorerPage.next_cursor || null;
+
       setTxHistory(prev => {
-        const confirmedHashes = new Set(formattedTxs.map(t => t.hash));
-        const stillPending = prev.filter(t =>
-          t.status === 'pending' &&
-          (t.from || '').toLowerCase() === myAddress &&
-          !confirmedHashes.has(t.hash)
-        );
-        // When the node did not answer, the rows already on screen are the best record there is:
-        // keep them instead of replacing the list with the token/lifecycle rows alone. A rate-limited
-        // or erroring node blanked the history every time this ran.
-        const keptConfirmed = nativeOk ? [] : prev.filter(t =>
-          t.status === 'confirmed' && !t.nodeEvent && !confirmedHashes.has(t.hash));
-        const merged = [...stillPending, ...formattedTxs, ...keptConfirmed]
-          .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
-        // Keep the confirmed rows on disk under THIS wallet. History is a read model of the chain,
-        // so caching it costs nothing in correctness and stops a cold start from showing an empty
-        // wallet until the first fetch lands. Pending rows are deliberately not cached: they are
-        // local intent, and a stale one would reappear as a ghost after a restart.
-        if (nativeOk && myAddress) {
-          const keep = merged.filter(t => t.status === 'confirmed').slice(0, HISTORY_CACHE_MAX);
-          AsyncStorage.setItem(`qnet_tx_history_${myAddress}`, JSON.stringify(keep)).catch(() => {});
-        }
+        const merged = mergeHistory(prev, [...nativeTxs, ...tokenTxs, ...nodeEventTxs], {
+          myAddress, coveredFromMs, nowMs: Date.now(), nodeEventsOk: !!nodeEventsData,
+        });
+        AsyncStorage.setItem(`qnet_tx_history_${myAddress}`, JSON.stringify(cacheableHistory(merged))).catch(() => {});
         return merged;
       });
 
       // P4: verify each token transfer's inclusion against a committee-QC-anchored logs_root. 'verified'
       // → confirmed + trust badge; 'consistent' → confirmed but unverified (real on-chain row below the
-      // trust floor, so it stops showing ⏳ forever); 'rejected'/'pending' → stay pending (never confirmed).
-      if (tokenTxs.length) {
+      // trust floor); 'rejected'/'pending' → unchanged. Only rows a node can still prove are asked about:
+      // an archived transfer older than the node's window has no proof left to fetch.
+      const provable = tokenTxs.filter(t => (t.timestamp || 0) > Date.now() - 24 * 3600 * 1000);
+      if (provable.length) {
         const statuses = new Map();
-        await Promise.all(tokenTxs.map(async t => {
+        await Promise.all(provable.map(async t => {
           // Bind the proof to THIS row's own fields (contract/from/to/amount/kind/std/token_id).
           const row = {
             tx_hash: t.hash, log_index: t.tokenLogIndex, contract: t.tokenContract,
@@ -3420,6 +3370,34 @@ const WalletScreen = () => {
       }
     } catch (e) {
       // API error - keep existing history
+    }
+  };
+
+  // The next older explorer page, when the list is scrolled to its end.
+  const loadOlderHistory = async () => {
+    const cursor = historyCursorRef.current;
+    if (!wallet?.qnetAddress || typeof cursor !== 'string' || historyLoadingOlderRef.current) return;
+    const address = wallet.qnetAddress;
+    historyLoadingOlderRef.current = true;
+    setHistoryLoadingOlder(true);
+    try {
+      const page = await fetchExplorerHistory(address, cursor);
+      if (!page || lastHistoryAddrRef.current !== address || historyCursorRef.current !== cursor) return;
+      const myAddress = address.toLowerCase();
+      const { native, tokenEvents } = splitExplorerItems(page.items, address);
+      const trusted = trustedTokenMetaMap();
+      const tokenRows = tokenEvents.map(ev => tokenRowFromEvent(ev, myAddress, trusted));
+      const tokenHashes = new Set(tokenRows.map(t => t.hash));
+      const rows = [...native.filter(tx => !(tx.txType === 'ContractCall' && tokenHashes.has(tx.hash))), ...tokenRows];
+      historyCursorRef.current = page.next_cursor || null;
+      setTxHistory(prev => {
+        const merged = appendHistory(prev, rows);
+        AsyncStorage.setItem(`qnet_tx_history_${myAddress}`, JSON.stringify(cacheableHistory(merged))).catch(() => {});
+        return merged;
+      });
+    } finally {
+      historyLoadingOlderRef.current = false;
+      setHistoryLoadingOlder(false);
     }
   };
 
@@ -5325,7 +5303,7 @@ const WalletScreen = () => {
                           // v4.10: Dynamic pricing — fetch from server if not cached
                           let requiredAmount = activationPricing?.cost;
                           if (!requiredAmount) {
-                            const freshPricing = await walletManager.calculateActivationCost(selectedNodeType || 'light');
+                            const freshPricing = await walletManager.calculateActivationCost(nodeStatus || 'light');
                             requiredAmount = freshPricing.cost;
                           }
                           
@@ -5766,7 +5744,7 @@ const WalletScreen = () => {
 
       case 'history':
         return (
-          <TabBox key="history" deps={[txHistory, refreshing, balancesHidden]} render={() => (
+          <TabBox key="history" deps={[txHistory, refreshing, balancesHidden, historyLoadingOlder]} render={() => (
           <FlatList
             key="history-tab"
             style={styles.content}
@@ -5776,7 +5754,7 @@ const WalletScreen = () => {
             ]}
             data={txHistory}
             extraData={balancesHidden}
-            keyExtractor={(tx, index) => tx.tokenContract ? `${tx.hash}-${tx.tokenLogIndex ?? index}` : (tx.hash || String(index))}
+            keyExtractor={(tx, index) => (tx.hash ? historyRowKey(tx) : String(index))}
             renderItem={({ item }) => <TxRow tx={item} onCopy={handleCopyTxHash} hideAmounts={balancesHidden} />}
             ListHeaderComponent={<Text style={[styles.sectionTitle, { marginBottom: 16 }]}>Transaction History</Text>}
             ListEmptyComponent={
@@ -5784,6 +5762,11 @@ const WalletScreen = () => {
                 <Text style={{ color: '#666', fontSize: 16 }}>No transactions yet</Text>
               </View>
             }
+            onEndReached={loadOlderHistory}
+            onEndReachedThreshold={0.5}
+            ListFooterComponent={historyLoadingOlder
+              ? <Text style={{ color: '#666', fontSize: 12, textAlign: 'center', paddingVertical: 16 }}>Loading older transactions...</Text>
+              : null}
             showsVerticalScrollIndicator={true}
             onScroll={handleUserActivity}
             scrollEventThrottle={500}
@@ -5796,7 +5779,7 @@ const WalletScreen = () => {
                 refreshing={refreshing}
                 onRefresh={async () => {
                   setRefreshing(true);
-                  await loadTxHistory();
+                  await loadTxHistory(true);
                   setRefreshing(false);
                 }}
                 colors={['#00d4ff']}
@@ -5894,11 +5877,11 @@ const WalletScreen = () => {
                 {/* Node Status Card */}
                 <View style={styles.nodeMonitoringCard}>
                   <View style={styles.nodeMonitoringHeader}>
-                    <View style={{flex: 1}}>
+                    <View style={{flex: 1, marginRight: 12}}>
                       {nodePseudonym ? (
                         <>
                           <Text style={styles.nodeMonitoringLabel}>Node name:</Text>
-                          <Text style={styles.nodeMonitoringValue}>
+                          <Text style={styles.nodeMonitoringValue} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.5}>
                             {nodePseudonym}
                           </Text>
                           <View style={{marginTop: 12}}>
@@ -5971,21 +5954,24 @@ const WalletScreen = () => {
                       color: activatedNodeType === 'light'
                         ? (lightOnChainPending || lightNodeStatus.needsReactivation ? '#ff9500' : '#34c759')
                         : (serverNodeStatus.isOnline ? '#34c759' : '#ff3b30')
-                    }]}>
+                    }]} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.5}>
                       {activatedNodeType === 'light'
-                        ? (lightOnChainPending ? 'Registration pending on chain - not earning yet'
+                        ? (lightOnChainPending ? 'Registration pending'
                           : lightNodeStatus.needsReactivation ? 'Needs Reactivation' : 'Active')
                         : (serverNodeStatus.isOnline ? 'Active' : 'Server Offline')}
                     </Text>
                   </View>
                   {lightOnChainPending && (
-                    <TouchableOpacity
-                      style={[styles.button,{marginTop: 4, marginBottom: 12}, reactivatingNode && styles.buttonDisabled]}
-                      onPress={handleRetryRegistration}
-                      disabled={reactivatingNode}
-                    >
-                      <Text style={styles.buttonText}>{reactivatingNode ? 'Retrying...' : 'Retry registration'}</Text>
-                    </TouchableOpacity>
+                    <>
+                      <Text style={styles.rewardHint}>Not on chain yet - the node is not earning</Text>
+                      <TouchableOpacity
+                        style={[styles.button,{marginTop: 4, marginBottom: 12}, reactivatingNode && styles.buttonDisabled]}
+                        onPress={handleRetryRegistration}
+                        disabled={reactivatingNode}
+                      >
+                        <Text style={styles.buttonText}>{reactivatingNode ? 'Retrying...' : 'Retry registration'}</Text>
+                      </TouchableOpacity>
+                    </>
                   )}
                   {activatedNodeType === 'light' && bgRefreshDenied && (
                     <Text style={styles.rewardHint}>
@@ -5998,7 +5984,7 @@ const WalletScreen = () => {
                     <>
                       <View style={styles.rewardItem}>
                         <Text style={styles.rewardLabel}>Next Rewards:</Text>
-                        <Text style={[styles.rewardValue, { color: '#34c759' }]}>
+                        <Text style={[styles.rewardValue, { color: '#34c759' }]} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.5}>
                           {(() => {
                             const EMISSION_INTERVAL = 14400;
                             const h = currentBlockHeight || serverNodeStatus.currentBlockHeight || 0;
@@ -6021,7 +6007,7 @@ const WalletScreen = () => {
                       {activatedNodeType !== 'light' && serverNodeStatus.reputation != null && serverNodeStatus.reputation < 70 && (
                         <View style={styles.rewardItem}>
                           <Text style={styles.rewardLabel}>Reputation:</Text>
-                          <Text style={[styles.rewardValue, { color: '#ff3b30' }]}>
+                          <Text style={[styles.rewardValue, { color: '#ff3b30' }]} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.5}>
                             ⚠ Banned (equivocation)
                           </Text>
                         </View>
@@ -6031,7 +6017,7 @@ const WalletScreen = () => {
                         <Text style={styles.rewardLabel}>Pending Rewards:</Text>
                         <Text style={[styles.rewardValue, {
                           color: (serverNodeStatus.pendingRewards || 0) > 0 ? '#34c759' : '#00d4ff'
-                        }]}>
+                        }]} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.5}>
                           {(() => {
                             if (balancesHidden) return '••••';
                             const rewards = (serverNodeStatus.pendingRewards || 0) / 1e9;
@@ -6057,14 +6043,9 @@ const WalletScreen = () => {
                       disabled={Boolean((serverNodeStatus.pendingRewards || 0) <= 0 || processingValidation)}
                       onPress={handleClaimServerNodeRewards}
                     >
+                      {/* The amount lives in the Pending Rewards row; the button only names the action. */}
                       <Text style={styles.buttonText}>
-                        {processingValidation ? 'Claiming...' :
-                         (serverNodeStatus.pendingRewards || 0) <= 0 ? 'Claim Rewards' :
-                         balancesHidden ? 'Claim Rewards' :
-                         (() => {
-                           const rewards = (serverNodeStatus.pendingRewards || 0) / 1e9;
-                           return `Claim ${rewards.toFixed(6).replace(/\.?0+$/, '')} QNC`;
-                         })()}
+                        {processingValidation ? 'Claiming...' : 'Claim Rewards'}
                       </Text>
                     </TouchableOpacity>
                   )}
@@ -6338,7 +6319,7 @@ const WalletScreen = () => {
           style={[styles.tab, activeTab === 'history' && styles.activeTab]}
           onPress={() => {
             setActiveTab('history');
-            loadTxHistory(); // Refresh history when tab opened
+            loadTxHistory(true); // Refresh history when tab opened
           }}
         >
           <Text style={[styles.tabText, activeTab === 'history' && styles.activeTabText]} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.7}>History</Text>

@@ -144,8 +144,9 @@ and `state_root`, so block identity is a function of the producer's committed co
 
 The producer signs a SHA3-256 digest under the domain tag `Block_Sig_v23.1` covering, in order, height, timestamp,
 merkle root, previous hash, state root, producer, timeout round, carried baseline and a digest of the transactions'
-wire key/signature material, and publishes it as `dilithium3_v4:<hex>`. An empty signature on any non-genesis
-microblock is a hard reject.
+wire key/signature material, and publishes the raw ML-DSA-65 signature bytes (below height 1,584,000 the string
+`dilithium3_v4:<hex>`, twice the size; one form per height). An empty signature on any non-genesis microblock is a
+hard reject.
 
 ### 4.2 The roster snapshot and its N-2 derivation
 

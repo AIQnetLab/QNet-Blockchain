@@ -147,7 +147,8 @@ re-proves, and a proof anchored there reports `consistent` rather than `verified
 The pin also keeps the walk inside the window where the material it needs exists. Nodes retain
 committee signatures for the most recent `QC_SIG_RETENTION_MB` = 14,880 macroblocks and keep the
 checkpoint, signer list and `sig_merkle_root` for everything older; below that horizon
-`/api/v1/macroblock/{index}/proof` answers `qc_sigs_pruned` with `action: "repin_recent_anchor"`. A pin
+`/api/v1/macroblock/{index}/proof` answers `qc_sigs_pruned` with `action: "repin_recent_anchor"`, unless the node
+keeps a history archive holding the signed macroblock. A pin
 is therefore refreshed by app release on a cadence inside that window, which is what
 `SNAPSHOT_MAX_WS_WALK_MB` — the shared cold-join and light-client walk budget — is sized for. See
 [state](../architecture/state.md).
@@ -172,9 +173,15 @@ verified badge is earned only by the checks above.
   SHA3-256 over `QNET_VALIDATOR_SET:`, the epoch as u64 LE, then — for each validator, sorted by
   `node_id` — the node id, address and node-type strings, the reputation as an IEEE-754 f64 LE, the
   last-seen timestamp as u64 LE and the active flag as one byte; the device mirrors that byte layout.
-- **Native QNC transaction history.** Rows from `/api/v1/account/{addr}/transactions`, and node
-  lifecycle rows from `/api/v1/account/{addr}/node-events`, are rendered as
-  served; QRC-20/721 transfer rows carry logs-root inclusion proofs. Up to 100 confirmed rows are
+- **Transaction history.** The whole history comes from the explorer archive
+  (`https://aiqnet.io/api/address/{addr}/history`, 50 rows a page, older pages loaded when the list is scrolled to its
+  end; opening the tab and pull-to-refresh ask for the first page at once, background refreshes at most every 30 s);
+  the node's `/api/v1/account/{addr}/transactions` and token-transfer feed add the newest rows and stand in when
+  the explorer is down, and `/api/v1/account/{addr}/node-events` adds node lifecycle rows. Rows are rendered as
+  served and only those the wallet is a party to are kept. A refresh merges into the list instead of replacing it: a
+  confirmed row missing from the explorer's first page is dropped only when it is inside the span that page covers
+  and older than five minutes. QRC-20/721 transfer rows a node can still prove (the last 24 hours) carry logs-root
+  inclusion proofs; older archived transfers are shown as confirmed without the badge. Up to 500 confirmed rows are
   cached per wallet address and shown while a session's first fetch is in flight.
 - **WebSocket balance pushes.** A `BalanceUpdate` event addressed to this wallet is applied directly
   to the displayed balance. On the polled path the UI holds the last known balance and refuses to
@@ -195,7 +202,8 @@ proofs and a 60-second negative cache are held in memory for the life of the app
 Balance, token, token-transfer, reward-claim, transaction-submit and contract calls go through a
 hedged path: two health-ranked nodes, a per-attempt timeout and a hedge timer, first success wins and
 the rest are aborted. Single plain requests against one node are used for the light client's
-macroblock-proof and registry fetches, node discovery, the native transaction-history list, the 1DEV
+macroblock-proof and registry fetches, node discovery, the native transaction-history list and the explorer history
+page, the 1DEV
 burn-progress read against the Solana RPC, and every push, ping and self-attestation call. Requests
 where the **server builds the transaction** go to exactly one node, since hedging them would produce
 two distinct on-chain transactions for one logical operation.

@@ -24,10 +24,11 @@
 
 import { NextRequest, NextResponse } from 'next/server';
 import { getRateLimitKey } from '../../../../../../lib/rate-limit';
+import { nodeEndpoints } from '@/lib/node-api';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // BOOTSTRAP NODES — for initial validator discovery only
-// Uses QNET_BOOTSTRAP_NODES env (comma-separated) or falls back to QNET_API_URL
+// Uses QNET_BOOTSTRAP_NODES env (comma-separated) or falls back to the web tier's node list
 // No hardcoded IPs — single source of truth from environment config
 // ═══════════════════════════════════════════════════════════════════════════════
 const BOOTSTRAP_NODES: string[] = (() => {
@@ -36,13 +37,8 @@ const BOOTSTRAP_NODES: string[] = (() => {
   if (bootstrapEnv) {
     return bootstrapEnv.split(',').map(s => s.trim()).filter(Boolean);
   }
-  // Priority 2: Single known node (dev/testing)
-  const apiUrl = process.env.QNET_API_URL;
-  if (apiUrl) {
-    return [apiUrl];
-  }
-  // Priority 3: Default (should be overridden in production .env)
-  return ['https://162.244.25.114:8001'];
+  // Priority 2: the web tier's node list (QNET_API_URLS / QNET_API_URL)
+  return nodeEndpoints();
 })();
 
 function getRandomBootstrapNode(): string {

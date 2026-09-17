@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { fetchNode } from '@/lib/node-api';
 import { getBlockByHeight, getBlockByHash, getTransactionsByBlock, BlockRow } from '../../../../../lib/db';
 import type { Block, BlockTransaction } from '@/lib/types';
 import { chainFeeNano, chainFeeNanoBig } from '@/lib/fee';
@@ -6,9 +7,6 @@ import { chainFeeNano, chainFeeNanoBig } from '@/lib/fee';
 // ============================================================================
 // PRODUCTION v2.97: PostgreSQL-first with Node RPC fallback
 // ============================================================================
-
-// Node RPC (fallback for real-time data)
-const NODE_RPC_URL = process.env.QNET_API_URL || 'https://162.244.25.114:8001';
 
 // Map transaction type to display name
 // v3.15: Claims from system_rewards_pool show as Transfer
@@ -197,17 +195,11 @@ async function fetchBlock(identifier: string): Promise<Block | null> {
   
   // 2. Fallback to Node RPC
   try {
-    const endpoint = isHeight
-      ? `${NODE_RPC_URL}/api/v1/block/${encodeURIComponent(identifier)}`
-      : `${NODE_RPC_URL}/api/v1/block/hash/${encodeURIComponent(identifier)}`;
-    
-    const response = await fetch(endpoint, {
-      headers: { 'Content-Type': 'application/json' },
-      cache: 'no-store',
-      signal: AbortSignal.timeout(10000),
-    });
-    
-    if (!response.ok) {
+    const path = isHeight
+      ? `/api/v1/block/${encodeURIComponent(identifier)}`
+      : `/api/v1/block/hash/${encodeURIComponent(identifier)}`;
+    const response = await fetchNode(path, { cache: 'no-store' });
+    if (!response || !response.ok) {
       return null;
     }
     

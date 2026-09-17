@@ -3139,8 +3139,8 @@ impl BlockPipeline {
                 // MANDATORY signature: previously empty `mb.signature` slipped past
                 // verification entirely (the surrounding `if !mb.signature.is_empty()`
                 // wrapped the verify call but had no else branch — empty was implicit
-                // accept). Honest producers always emit
-                // "dilithium3_v4:<hex>" via `sign_microblock_with_dilithium`,
+                // accept). Honest producers always emit a signature via
+                // `sign_microblock_with_dilithium` (`encode_microblock_signature`),
                 // so an empty signature on a non-genesis block can only come from
                 // a malformed or hostile sender. Reject hard.
                 if mb.signature.is_empty() {
@@ -5057,6 +5057,7 @@ impl BlockPipeline {
 
             // Body expiry at the epoch boundary, on every node that applies it (self-gated to Super).
             ctx.storage.prune_bodies_at_epoch(height);
+            ctx.storage.archive_history_at(height);
 
             // ────────────────────────────────────────────────────────────────
             // v14.10: GENESIS GLOBAL STATE (was missing in pipeline apply path!)

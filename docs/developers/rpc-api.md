@@ -49,7 +49,7 @@ Authentication is per-endpoint and applies where an action is privileged or dest
 
 | Gate | Where it applies | Behaviour |
 | --- | --- | --- |
-| `X-API-Key` header | `POST /rpc`, `POST /` and `GET /api/v1/blocks/headers` | Matched against `QNET_API_KEY_EXPLORER` / `QNET_API_KEY_ADMIN`. Minimum 16 characters, enforced both at load and at check. A valid key bypasses rate limiting; it grants no extra methods. |
+| `X-API-Key` header | `POST /rpc`, `POST /`, `GET /api/v1/blocks/headers` and the `/api/v1/archive` routes | Matched against `QNET_API_KEY_EXPLORER` / `QNET_API_KEY_ADMIN`. Minimum 16 characters, enforced both at load and at check. A valid key bypasses rate limiting; it grants no extra methods. |
 | `QNET_DEV_API_KEY` | same three routes | Additional key, compiled in under `#[cfg(debug_assertions)]` for debug builds. |
 | Internal-IP check | `POST /api/v1/p2p/message`, `POST /api/v1/shutdown`, the JSON-RPC operator methods | `is_internal_ip()` accepts loopback, RFC1918, IPv4 link-local, IPv6 loopback, `fc00::/7`, `fe80::/10`, and anything in `QNET_WHITELIST_IPS`. Unparseable strings are rejected. |
 | `QNET_ADMIN_SECRET` | `POST /api/v1/shutdown` | Mandatory. If the variable is unset or empty the request is denied. Also requires an internal caller IP and a matching `admin_secret` field in the body. |
@@ -58,8 +58,8 @@ Authentication is per-endpoint and applies where an action is privileged or dest
 | `QNET_BENCHMARK_SECRET` | `POST /api/v1/benchmark/start`, `POST /api/v1/benchmark/stop` | Start requires `QNET_BOOTSTRAP_ID` (genesis node) or a configured `QNET_BENCHMARK_SECRET`; whenever the secret is configured, the request body's `secret` must match it — genesis status does not bypass a configured secret. Stop additionally requires a genesis node or an internal IP whenever the secret is configured. |
 | Submitter-IP match | `DELETE /api/v1/bundle/{bundle_id}` | Caller IP must equal the recorded submitter IP, or pass `is_internal_ip()`. |
 
-The API key applies to the two JSON-RPC routes and to `GET /api/v1/blocks/headers`, and is read from
-the `x-api-key` header.
+The API key applies to the two JSON-RPC routes, to `GET /api/v1/blocks/headers` and to the `/api/v1/archive` routes,
+and is read from the `x-api-key` header.
 
 Signature-based authorisation is separate from transport authentication. Every value transfer, reward
 claim and contract deployment carries a mandatory ML-DSA-65 (FIPS 204) signature. The transfer and
@@ -86,6 +86,7 @@ address (`warp::addr::remote()`).
 | `mev_bundle` | 30 | 60 s | 120 s | bundle submit/status/cancel |
 | `benchmark` | 5 | 60 s | 300 s | all `/api/v1/benchmark/*`, `POST /api/v1/shutdown` |
 | `headers` | 30 | 60 s | 60 s | `GET /api/v1/blocks/headers`; a valid API key bypasses it |
+| `archive` | 30 | 60 s | 60 s | `GET /api/v1/archive`, `GET /api/v1/archive/segment/{epoch}`; a valid API key bypasses it |
 
 `tx_rate` is `QNET_API_RATE_LIMIT`, parsed as requests per minute and clamped to `1..=10_000`,
 default `100`.
@@ -287,13 +288,16 @@ rate limit returns `-32029`.
 | GET | `/api/v1/genesis/block` | Full block 0 with its transactions, bincode + zstd, as `application/octet-stream` (computed once per process; identical bytes on every node, so a joining node's multi-source hash vote agrees); HTTP 404 `{error:"genesis_block_unavailable"}` when the node cannot reconstruct block 0 |
 | GET | `/api/v1/microblock/{height}` | Block JSON; HTTP 404 `Block not yet produced` for a future height, `Block not found` for a missing one; HTTP 500 `Failed to load block` on a storage error |
 | GET | `/api/v1/microblocks?from=&to=` | `{from, to, items[{height, data}]}` with `data` as base64 raw bytes; `to` is clamped to `from + 100` |
-| GET | `/api/v1/blocks/headers?from=&limit=` | `{from, next, head, items[{height, hash, body, timestamp, producer, tx_count, previous_hash, merkle_root}]}` for the heights this node holds in `[from, min(from + limit, head + 1))`, hashes hex; `from` defaults to 0 and `limit` to 100, clamped `1..=1000`. `hash` comes from the height→hash index and outlives the body; the header fields appear only when `body` is true, and a row that fails to decode comes back as `{height, hash, body: false, error: "undecodable"}`. `next` is the first height not covered, `head` the applied tip. `headers` rate bucket; at most 4 scans run at once |
+| GET | `/api/v1/blocks/headers?from=&limit=` | `{from, next, head, items[{height, hash, body, timestamp, producer, tx_count, previous_hash, merkle_root}]}` for the heights this node holds in `[from, min(from + limit, head + 1))`, hashes hex; `from` defaults to 0 and `limit` to 100, clamped `1..=1000`. `hash` comes from the height→hash index and outlives the body; the header fields appear only when `body` is true, which past the retention window it is where this node's history archive holds the block, and a row that fails to decode comes back as `{height, hash, body: false, error: "undecodable"}`. `next` is the first height not covered, `head` the applied tip. `headers` rate bucket; at most 4 scans run at once |
+| GET | `/api/v1/archive?from_epoch=&limit=` | `{enabled, segment_blocks, next_epoch, segments[{epoch, first_height, last_height, blocks, missing[[from, to]], macroblocks, macroblocks_unsigned, bytes, sha3}]}`: the history segments this node holds, ascending from `from_epoch` (default 0), `limit` default 100, clamped `1..=1000`. `macroblocks` counts the certifying macroblocks a segment carries, `macroblocks_unsigned` those whose committee signatures were already stripped when it was written. `enabled` is false and the list empty on a node started without `QNET_ARCHIVE=1`. `archive` rate bucket |
+| GET | `/api/v1/archive/segment/{epoch}` | One segment file as written, streamed as `application/octet-stream` with `Content-Length` and `X-Segment-Sha3` (the index's `sha3`); HTTP 404 when this node holds no segment for the epoch. Format, little-endian: header `QARC`, version byte, epoch, first and last height (u64); frames of `zstd_len u32` + zstd of `{len u32, record}` records, each about 1 MiB uncompressed, holding first the blocks (bincode `MicroBlock` with `signature`, `vrf_proof` and `timeout_proof` emptied) and then every macroblock whose window covers the epoch (bincode `(MacroBlock bytes, [(signer, public key)])`, the committee signatures kept); a block index and a macroblock index, each `count u32` + `{key u64, frame_offset u64, record_offset u32}` (key = height or macroblock index); footer `block_index_offset u64` + `macro_index_offset u64` + `QARX`, so one record is read by decoding one frame. A segment verifies without trusting its server: signatures → checkpoint → the window's block hashes → block → transactions. `archive` rate bucket |
 | GET | `/api/v1/macroblock/{index}` | `{index, height, timestamp, micro_blocks_count, micro_blocks[], state_root, consensus_data{...}, previous_hash}` |
 | GET | `/api/v1/blocks/stats` | Height, block-time and macroblock-boundary counters |
 
 `/api/v1/block/latest`, `/api/v1/block/{height}`, `/api/v1/block/hash/{hash}` and
 `/api/v1/microblock/{height}`, and `chain_getBlock` / `chain_getBlocks` over JSON-RPC and WebSocket,
-return the block JSON plus a `hash` field: the block's consensus hash as hex from the height→hash index,
+return the block JSON plus a `hash` field (past the retention window the block comes from the node's history
+archive where it keeps one, with an empty `signature`): the block's consensus hash as hex from the height→hash index,
 `null` when the index holds no row for the height and none can be rebuilt from the stored body.
 `previous_hash` keeps its 32-element byte-array form.
 
@@ -305,7 +309,7 @@ commits to.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| GET | `/api/v1/macroblock/{index}/proof` | Full bundle: `{index, epoch, checkpoint, qc{signers, sigs}, committee, committee_pubkeys, eligible_raw, banned, recovery_anchor_checkpoint}`. `committee_pubkeys` covers the derived committee union the QC's actual signers. |
+| GET | `/api/v1/macroblock/{index}/proof` | Full bundle: `{index, epoch, checkpoint, qc{signers, sigs}, committee, committee_pubkeys, eligible_raw, banned, recovery_anchor_checkpoint}`. `committee_pubkeys` covers the derived committee union the QC's actual signers. Past the QC-signature retention the signatures and any signer key the node can no longer resolve come from its history archive, when it keeps one and the archived checkpoint hashes the same. |
 | GET | `/api/v1/registry/height/{height}` | `{registry_root, entries}` — the chain-confirmed roster as of that height plus its LtHash root |
 | GET | `/api/v1/validators/proof` | `{validators[], epoch, merkle_root, last_update_height, current_height, total_validators, active_validators}`; the root is SHA3-256 over the tag `QNET_VALIDATOR_SET:` + epoch + each sorted validator's fields |
 | GET | `/api/v1/account/{address}/balance/proof` | Balance, nonce, all four heartbeat leaf fields, `last_claimed_epoch`, `banned_at_height`, `is_node`, `merkle_proof[{sibling, is_right}]`, `state_root`, `block_height`, `proof_valid` |
@@ -314,7 +318,7 @@ commits to.
 
 The macroblock proof endpoint has five distinct error returns: `macroblock_not_found`,
 `no_checkpoint_qc`, `qc_decode_failed`, `banned_decode_failed`, and `qc_sigs_pruned` (with
-`action: "repin_recent_anchor"`).
+`action: "repin_recent_anchor"`; only when neither the database nor the history archive holds the signatures).
 The log-proof endpoint answers an unfinalized window with `{error:"window_not_finalized"}` and a
 pruned window with `{error:"window_pruned", oldest_available}`.
 

@@ -16,6 +16,7 @@
 #   QNET_ROLLBACK_TO_LAST_SEALED=1 ./deploy-genesis.sh   # recover to the last sealed macroblock
 #   QNET_ROLLBACK_TO_HEIGHT=627483 ./deploy-genesis.sh   # or to an exact height
 #   QNET_RECOVERY_HALTED=1 ./deploy-genesis.sh           # chain stopped: M3/M4 not measurable
+#   QNET_SET_ENV=QNET_ARCHIVE=1 ./deploy-genesis.sh 002  # set or replace env entries on these nodes
 set -uo pipefail
 
 IMAGE="ghcr.io/aiqnetlab/qnet-production:latest"
@@ -30,6 +31,12 @@ REENTRY_TIMEOUT="${REENTRY_TIMEOUT:-600}"
 # n-f over the committee, so it changes with committee size (6 members => 5, 5 => 4) and a hardcoded
 # number would either hang the gate on a healthy node or accept a seal that is short of quorum.
 QUORUM="${QUORUM:-}"
+# KEY=VALUE[,KEY=VALUE] added to the recreated containers, replacing an entry with the same key. No spaces
+# or quotes: the list travels as one ssh argument.
+SET_ENV="${QNET_SET_ENV:-}"
+if [ -n "$SET_ENV" ] && ! [[ "$SET_ENV" =~ ^[A-Z][A-Z0-9_]*=[A-Za-z0-9_./:-]*(,[A-Z][A-Z0-9_]*=[A-Za-z0-9_./:-]*)*$ ]]; then
+  echo "[ERR] QNET_SET_ENV must be KEY=VALUE[,KEY=VALUE] with no spaces"; exit 1
+fi
 
 declare -A NODE_IP=(
   [001]=154.38.160.39 [002]=62.171.157.44 [003]=161.97.86.81
@@ -46,7 +53,7 @@ container_of() { echo "${NODE_CONTAINER[$1]:-qnet-genesis-$1}"; }
 rsh()  { ssh -i "$SSH_KEY" -p "$2" -o StrictHostKeyChecking=no -o ConnectTimeout=15 "root@$1" "$3"; }
 # The recreate runs from a script fed on stdin, not from a quoted argument: nesting docker templates,
 # grep patterns and shell quoting inside an ssh argument is how the first version of this broke.
-rsh_script() { ssh -i "$SSH_KEY" -p "$2" -o StrictHostKeyChecking=no -o ConnectTimeout=15 "root@$1" "bash -s -- $3 $4 $5"; }
+rsh_script() { ssh -i "$SSH_KEY" -p "$2" -o StrictHostKeyChecking=no -o ConnectTimeout=15 "root@$1" "bash -s -- $3 $4 $5 $6"; }
 
 # Measure the healthy signer count once, from the first reachable node, unless it was given.
 #
@@ -87,9 +94,9 @@ for id in "${TARGETS[@]}"; do
     echo "  [ERR] pull failed — node left untouched, roll stopped"; exit 1
   fi
 
-  if ! rsh_script "$ip" "$port" "$cont" "$LOCAL_TAG" "${QNET_ROLLBACK_TO_LAST_SEALED:-}${QNET_ROLLBACK_TO_HEIGHT:+H$QNET_ROLLBACK_TO_HEIGHT}" <<'INNER'
+  if ! rsh_script "$ip" "$port" "$cont" "$LOCAL_TAG" "${SET_ENV:--}" "${QNET_ROLLBACK_TO_LAST_SEALED:-}${QNET_ROLLBACK_TO_HEIGHT:+H$QNET_ROLLBACK_TO_HEIGHT}" <<'INNER'
 set -e
-N="$1"; TAG="$2"; RECOVER="${3:-}"
+N="$1"; TAG="$2"; SETENV="${3:--}"; RECOVER="${4:-}"
 docker inspect "$N" >/dev/null 2>&1 || { echo "no such container: $N"; exit 1; }
 
 # Carry the container's env MINUS two kinds of entry that must not survive a roll:
@@ -98,10 +105,17 @@ docker inspect "$N" >/dev/null 2>&1 || { echo "no such container: $N"; exit 1; }
 #                    the new binary, so /healthz reports the build we just replaced — the stamp lies
 #                    exactly where it is needed, and a roll cannot be told from a no-op.
 ENVS=""
+SETS=(); SET_KEYS=" "
+if [ "$SETENV" != "-" ]; then
+  IFS=',' read -ra SETS <<< "$SETENV"
+  for kv in "${SETS[@]}"; do SET_KEYS="$SET_KEYS${kv%%=*} "; done
+fi
 while IFS= read -r e; do
   case "$e" in ''|QNET_ROLLBACK_*|QNET_RECOVERY_HALTED*|QNET_BUILD_ID=*) continue;; esac
+  case "$SET_KEYS" in *" ${e%%=*} "*) continue;; esac
   ENVS="$ENVS -e $(printf '%q' "$e")"
 done < <(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$N")
+for kv in "${SETS[@]}"; do ENVS="$ENVS -e $(printf '%q' "$kv")"; done
 
 case "$RECOVER" in
   H*) ENVS="$ENVS -e QNET_ROLLBACK_TO_HEIGHT=${RECOVER#H}" ;;

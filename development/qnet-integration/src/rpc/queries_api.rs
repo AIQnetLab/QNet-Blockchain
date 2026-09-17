@@ -991,7 +991,8 @@ pub(super) async fn handle_block_headers(
         let mut items = Vec::with_capacity(to.saturating_sub(from) as usize);
         for h in from..to {
             let hash = storage.load_microblock_hash(h).ok().flatten();
-            let header = match storage.load_microblock_header(h) {
+            // A body gone from the retention window is still a body where the archive holds it.
+            let header = match storage.load_microblock_header(h).map(|hd| hd.or_else(|| storage.archived_header(h))) {
                 Ok(hd) => hd,
                 Err(e) => {
                     println!("[WARN][RPC] headers_row_undecodable h={} err={}", h, e);
@@ -1020,6 +1021,71 @@ pub(super) async fn handle_block_headers(
             Ok(warp::reply::with_status(warp::reply::json(&json!({ "error": "internal error" })), warp::http::StatusCode::INTERNAL_SERVER_ERROR).into_response())
         }
     }
+}
+
+/// History archive index: the segments this node holds, one per epoch, ascending from `from_epoch`
+/// (limit ≤ 1000). `enabled: false` on a node started without QNET_ARCHIVE=1.
+pub(super) async fn handle_archive_list(
+    q: ArchiveListQuery,
+    remote_addr: Option<std::net::SocketAddr>,
+    api_key: Option<String>,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<warp::reply::Response, Rejection> {
+    use warp::Reply;
+    if let Err(rate_limit_response) = check_api_rate_limit_with_key(remote_addr, api_key, "archive") {
+        return Ok(rate_limit_response.into_response());
+    }
+    let storage = blockchain.get_storage();
+    let body = match storage.history_archive() {
+        Some(a) => json!({
+            "enabled": true,
+            "segment_blocks": crate::storage::ARCHIVE_SEGMENT_BLOCKS,
+            "next_epoch": a.next_epoch(),
+            "segments": a.segments(q.from_epoch, q.limit.clamp(1, 1000) as usize),
+        }),
+        None => json!({ "enabled": false, "segment_blocks": crate::storage::ARCHIVE_SEGMENT_BLOCKS, "next_epoch": null, "segments": [] }),
+    };
+    Ok(warp::reply::json(&body).into_response())
+}
+
+/// One archive segment exactly as written (zstd), streamed from disk; `X-Segment-Sha3` repeats the
+/// hash the index lists, so a copy can be checked before it is used.
+pub(super) async fn handle_archive_segment(
+    epoch: u64,
+    remote_addr: Option<std::net::SocketAddr>,
+    api_key: Option<String>,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<warp::reply::Response, Rejection> {
+    use warp::Reply;
+    if let Err(rate_limit_response) = check_api_rate_limit_with_key(remote_addr, api_key, "archive") {
+        return Ok(rate_limit_response.into_response());
+    }
+    let not_found = || warp::reply::with_status(
+        warp::reply::json(&json!({ "error": "segment not archived here", "epoch": epoch })),
+        warp::http::StatusCode::NOT_FOUND,
+    ).into_response();
+    let Some((path, meta)) = blockchain.get_storage().history_archive().and_then(|a| a.segment_file(epoch)) else {
+        return Ok(not_found());
+    };
+    let file = match tokio::fs::File::open(&path).await { Ok(f) => f, Err(_) => return Ok(not_found()) };
+    let len = match file.metadata().await { Ok(m) => m.len(), Err(_) => return Ok(not_found()) };
+    let body = futures::stream::unfold(Some(file), |state| async move {
+        let mut f = state?;
+        let mut buf = vec![0u8; 64 * 1024];
+        match tokio::io::AsyncReadExt::read(&mut f, &mut buf).await {
+            Ok(0) => None,
+            Ok(n) => { buf.truncate(n); Some((Ok::<Vec<u8>, std::io::Error>(buf), Some(f))) }
+            Err(e) => Some((Err(e), None)),
+        }
+    });
+    let mut r = warp::http::Response::new(warp::hyper::Body::wrap_stream(body));
+    let headers = r.headers_mut();
+    headers.insert("Content-Type", warp::http::HeaderValue::from_static("application/octet-stream"));
+    headers.insert("Content-Length", warp::http::HeaderValue::from(len));
+    if let Ok(v) = warp::http::HeaderValue::from_str(&meta.sha3) {
+        headers.insert("X-Segment-Sha3", v);
+    }
+    Ok(r)
 }
 
 pub(super) async fn handle_macroblock_by_index(
@@ -1088,28 +1154,39 @@ pub(super) async fn handle_macroblock_proof(
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
     if let Err(rl) = check_api_rate_limit(remote_addr, "read_only") { return Ok(rl); }
-    let mb = match blockchain.get_macroblock(index).await {
+    type Certified = (qnet_consensus::checkpoint_bft::Checkpoint, qnet_consensus::checkpoint_bft::QuorumCertificate);
+    let decode_qc = |mb: &qnet_state::MacroBlock| -> Option<Certified> {
+        mb.consensus_data.checkpoint_qc.as_ref().and_then(|b| bincode::deserialize(b).ok())
+    };
+    let storage = blockchain.get_storage();
+    let mut mb = match blockchain.get_macroblock(index).await {
         Ok(Some(m)) => m,
         _ => return Ok(warp::reply::json(&json!({"error": "macroblock_not_found", "index": index}))),
     };
-    let qc_bytes = match &mb.consensus_data.checkpoint_qc {
-        Some(b) => b,
-        None => return Ok(warp::reply::json(&json!({"error": "no_checkpoint_qc", "index": index}))),
-    };
-    let (cp, qc): (qnet_consensus::checkpoint_bft::Checkpoint, qnet_consensus::checkpoint_bft::QuorumCertificate) =
-        match bincode::deserialize(qc_bytes) {
-            Ok(v) => v,
-            Err(_) => return Ok(warp::reply::json(&json!({"error": "qc_decode_failed", "index": index}))),
-        };
-    // Past the retention horizon the committee signatures are stripped (the archive keeps the
-    // checkpoint half). Serving the proof anyway would hand the device a QC it can only fail to
-    // verify, which reads as a hostile node; say so instead so it re-pins on a recent anchor.
-    if qc.sigs.is_empty() {
-        return Ok(warp::reply::json(&json!({
-            "error": "qc_sigs_pruned", "index": index, "action": "repin_recent_anchor"
-        })));
+    if mb.consensus_data.checkpoint_qc.is_none() {
+        return Ok(warp::reply::json(&json!({"error": "no_checkpoint_qc", "index": index})));
     }
-    let storage = blockchain.get_storage();
+    let (mut cp, mut qc) = match decode_qc(&mb) {
+        Some(v) => v,
+        None => return Ok(warp::reply::json(&json!({"error": "qc_decode_failed", "index": index}))),
+    };
+    // Past the retention horizon the node has stripped the committee signatures; a history archive keeps
+    // the signed copy and its signers' keys. Without one, serving the proof would hand the device a QC it
+    // can only fail to verify, which reads as a hostile node; say so instead so it re-pins recently.
+    let mut archived_keys: Vec<(String, Vec<u8>)> = Vec::new();
+    if qc.sigs.is_empty() {
+        match storage.archived_macroblock(index).and_then(|(amb, keys)| decode_qc(&amb).map(|c| (amb, c, keys))) {
+            Some((amb, (acp, aqc), keys)) if !aqc.sigs.is_empty() && acp.hash() == cp.hash() => {
+                mb = amb;
+                cp = acp;
+                qc = aqc;
+                archived_keys = keys;
+            }
+            _ => return Ok(warp::reply::json(&json!({
+                "error": "qc_sigs_pruned", "index": index, "action": "repin_recent_anchor"
+            }))),
+        }
+    }
     // At the window head the certificate covers - mb.height is the macroblock index here, and read
     // as a height it named the genesis-era committee for every macroblock.
     let committee = BlockchainNode::committee_for_height(&storage, cp.window_head_height).unwrap_or_default();
@@ -1126,7 +1203,8 @@ pub(super) async fn handle_macroblock_proof(
     for nid in committee.iter().chain(qc.signers.iter()) {
         if committee_pubkeys.contains_key(nid) { continue; }
         let pk = qnet_consensus::consensus_crypto::get_consensus_pk(nid)
-            .or_else(|| storage.load_vrf_public_key(nid).ok().flatten());
+            .or_else(|| storage.load_vrf_public_key(nid).ok().flatten())
+            .or_else(|| archived_keys.iter().find(|(id, _)| id == nid).map(|(_, pk)| pk.clone()));
         if let Some(pk) = pk {
             committee_pubkeys.insert(nid.clone(), json!(hex::encode(&pk)));
         }
@@ -1148,7 +1226,7 @@ pub(super) async fn handle_macroblock_proof(
         },
     };
     let checkpoint = checkpoint_json(&cp);
-    let recovery_anchor_checkpoint = recovery_anchor_json(&blockchain.get_storage(), &cp);
+    let recovery_anchor_checkpoint = recovery_anchor_json(&storage, &cp);
     let qc_json = json!({
         "signers": qc.signers,
         // sigs are the ASCII "dilithium_sig_<id>_<b64>" strings; lossless from_utf8 drops any non-UTF8

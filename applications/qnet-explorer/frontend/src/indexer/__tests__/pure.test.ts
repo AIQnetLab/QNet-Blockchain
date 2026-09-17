@@ -3,7 +3,7 @@ import * as assert from 'node:assert/strict';
 import { quoteBigInts, uintString, transformTransaction, batchRowsOf, shapeBlock, blockRowFromHeader, toMs, merkleRootOf, SLOT_GAP_REANCHOR_GATE_HEIGHT } from '../transform';
 import { insertBatchTransfers, insertTransactions, insertBlocks, deltaOf, negate, mergeDelta } from '../sql';
 import { ranges, dedupeHeaders, flushGroups, FLUSH_BLOCKS, FLUSH_BATCH_ROWS } from '../chain';
-import { pickNetworkHeight, reduceHeaderViews, HEIGHT_SLACK } from '../node-client';
+import { pickNetworkHeight, reduceHeaderViews, archiveFloor, HEIGHT_SLACK } from '../node-client';
 
 // A u64 amount above 2^53 survives the JSON hop exactly: quoted before parse, kept as a digit string.
 test('wide integers never pass through a double', () => {
@@ -214,4 +214,13 @@ test('header views reduce to what the endpoints agree on', () => {
   assert.equal(out.items.length, 1);
   assert.equal(out.items[0].hash, H);
   assert.equal(out.head, 100, 'a lone inflated head decides nothing');
+});
+
+// Bodies past the retention window are reachable only where enough archives agree: the reach is the
+// honestOne-th lowest archive start, and nothing without that many archives.
+test('archive reach needs as many archives as an agreed body', () => {
+  assert.equal(archiveFloor([1_382_400, null, 1_396_800, 1_382_400, null], 3), 1_396_800);
+  assert.equal(archiveFloor([1_382_400, null, 0, 1_396_800, 14_400], 3), 1_382_400);
+  assert.equal(archiveFloor([1_382_400, null, 1_382_400, null, null], 3), Number.POSITIVE_INFINITY);
+  assert.equal(archiveFloor([], 1), Number.POSITIVE_INFINITY);
 });

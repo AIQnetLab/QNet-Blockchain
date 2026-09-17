@@ -443,10 +443,8 @@ impl BlockchainNode {
             producer, hdr.vrf_output.as_ref().map(|v| &v[..]), hdr.timeout_round, hdr.carried_baseline,
             &hdr.pk_digest,
         );
-        // Wire format: "dilithium3_v4:" + hex(detached_sig).
-        let sig_str = match std::str::from_utf8(&hdr.signature) { Ok(s) => s, Err(_) => return false };
-        let sig_hex = match sig_str.strip_prefix("dilithium3_v4:") { Some(x) => x, None => return false };
-        let sig_bytes = match hex::decode(sig_hex) { Ok(b) => b, Err(_) => return false };
+        // The wire form the block at `height` must carry (raw from the MICROBLOCK_SIG_RAW gate, hex below).
+        let sig_bytes = match crate::node::decode_microblock_signature(height, &hdr.signature) { Some(b) => b, None => return false };
         use pqcrypto_mldsa::mldsa65 as dilithium3;
         use pqcrypto_traits::sign::{PublicKey as PkTrait, DetachedSignature as SigTrait};
         let pk = match <dilithium3::PublicKey as PkTrait>::from_bytes(pk_bytes) { Ok(p) => p, Err(_) => return false };

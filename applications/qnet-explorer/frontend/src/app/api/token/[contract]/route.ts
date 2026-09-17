@@ -2,23 +2,14 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getContractTokenTransfers } from '../../../../../lib/db';
 import { formatTokenAmount } from '@/lib/token-format';
 import { sanitizeLogo } from '@/lib/sanitize-logo';
+import { fetchNode } from '@/lib/node-api';
 
 // ============================================================================
 // QRC-20 token detail: node /api/v1/token/{contract} + recent transfers
 // ============================================================================
-// Reuses the same NODE_API env + header pattern as the address route (single
-// source of truth for on-chain token metadata). Recent transfers come from the
-// explorer's effect-sourced token_transfers index (real transfer logs, not
-// decoded calldata intent).
-
-const NODE_API = process.env.QNET_API_URL || 'https://162.244.25.114:8001';
-const API_KEY = process.env.QNET_API_KEY || '';
-
-function nodeHeaders(): Record<string, string> {
-  const h: Record<string, string> = { 'Content-Type': 'application/json' };
-  if (API_KEY) h['X-API-Key'] = API_KEY;
-  return h;
-}
+// Token metadata comes from the nodes (the source of truth for on-chain state).
+// Recent transfers come from the explorer's effect-sourced token_transfers
+// index (real transfer logs, not decoded calldata intent).
 
 // Node token metadata: GET /api/v1/token/{contract}
 // -> { success, token: { contract_address, name, symbol, decimals, total_supply, deployer, deployed_at } }
@@ -71,11 +62,8 @@ export async function GET(
   // Fetch token metadata from the node (authoritative on-chain state).
   let info: TokenInfo | null = null;
   try {
-    const res = await fetch(`${NODE_API}/api/v1/token/${encodeURIComponent(contract)}`, {
-      headers: nodeHeaders(),
-      signal: AbortSignal.timeout(10000),
-    });
-    if (res.ok) {
+    const res = await fetchNode(`/api/v1/token/${encodeURIComponent(contract)}`);
+    if (res && res.ok) {
       const body = await res.json().catch(() => null);
       if (body?.success && body.token) {
         const t = body.token as {

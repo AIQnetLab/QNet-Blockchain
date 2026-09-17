@@ -989,12 +989,35 @@ pub(crate) fn microblock_signing_digest(mb: &qnet_state::MicroBlock) -> [u8; 32]
     )
 }
 
+const MICROBLOCK_SIG_HEX_PREFIX: &str = "dilithium3_v4:";
+
+/// A microblock's producer signature as the block at `height` carries it: the raw ML-DSA-65 bytes from
+/// the MICROBLOCK_SIG_RAW gate, `dilithium3_v4:<hex>` below it.
+pub(crate) fn encode_microblock_signature(height: u64, sig: &[u8]) -> Vec<u8> {
+    use qnet_state::feature_gates::{is_active, id};
+    if is_active(id::MICROBLOCK_SIG_RAW, height) {
+        sig.to_vec()
+    } else {
+        format!("{}{}", MICROBLOCK_SIG_HEX_PREFIX, hex::encode(sig)).into_bytes()
+    }
+}
+
+/// The detached signature in `wire`, if it is the form a block at `height` must carry. One form per
+/// height: a signature re-encoded into the other form is not a signature of that block.
+pub(crate) fn decode_microblock_signature(height: u64, wire: &[u8]) -> Option<Vec<u8>> {
+    use qnet_state::feature_gates::{is_active, id};
+    if is_active(id::MICROBLOCK_SIG_RAW, height) {
+        (wire.len() == pqcrypto_mldsa::mldsa65::signature_bytes()).then(|| wire.to_vec())
+    } else {
+        let sig_hex = std::str::from_utf8(wire).ok()?.strip_prefix(MICROBLOCK_SIG_HEX_PREFIX)?;
+        hex::decode(sig_hex).ok()
+    }
+}
+
 /// Block_Sig_v23.1 digest + detached ML-DSA-65 against the producer's registered VRF PK. h==0/genesis
 /// never reaches here (maybe_supersede early-returns h==0); relaunch-from-scratch has no legacy sigs.
 pub(crate) fn verify_microblock_producer_sig_sync(storage: &Storage, mb: &qnet_state::MicroBlock) -> bool {
-    let sig_str = match std::str::from_utf8(&mb.signature) { Ok(s) => s, Err(_) => return false };
-    let sig_hex = match sig_str.strip_prefix("dilithium3_v4:") { Some(x) => x, None => return false };
-    let sig_bytes = match hex::decode(sig_hex) { Ok(b) => b, Err(_) => return false };
+    let sig_bytes = match decode_microblock_signature(mb.height, &mb.signature) { Some(b) => b, None => return false };
     let pk = match producer_verify_pk(storage, &mb.producer) { Some(p) => p, None => return false };
     let msg_hash = microblock_signing_digest(mb);
     use pqcrypto_mldsa::mldsa65 as dilithium3;
@@ -5046,7 +5069,10 @@ impl BlockchainNode {
         // v2.70: Use auto-format loader that handles both EfficientMicroBlock and legacy MicroBlock
         // EfficientMicroBlock stores only TX hashes - full TXs are in separate "transactions" CF
         // load_microblock_auto_format() reconstructs full block with transactions
-        match self.storage.load_microblock_auto_format(height) {
+        // Past the retention window the history archive answers, where this node keeps one.
+        let loaded = self.storage.load_microblock_auto_format(height)
+            .map(|b| b.or_else(|| self.storage.archived_block(height)));
+        match loaded {
             Ok(Some(microblock)) => {
                 // Convert MicroBlock to Block format for API compatibility
                 let block = qnet_state::Block {
@@ -8478,7 +8504,12 @@ mod tests {
         hasher.update(&h.pk_digest);
         let digest = hasher.finalize();
         let sig = pqcrypto_mldsa::mldsa65::detached_sign(digest.as_ref(), sk);
-        format!("dilithium3_v4:{}", hex::encode(sig.as_bytes())).into_bytes()
+        // The wire form by hand too: raw bytes from the raw-signature gate, the hex string below it.
+        if height >= qnet_state::feature_gates::MICROBLOCK_SIG_RAW_GATE_HEIGHT {
+            sig.as_bytes().to_vec()
+        } else {
+            format!("dilithium3_v4:{}", hex::encode(sig.as_bytes())).into_bytes()
+        }
     }
 
     fn eqv_mk_checkpoint(node: &str, index: u64, mb: u8) -> qnet_consensus::checkpoint_bft::Checkpoint {
@@ -8628,6 +8659,66 @@ mod tests {
         b.signature = eqv_sign_block(&sk, h, node, &b);
         assert!(BlockchainNode::verify_equivocation_proof(&_st, node, h, &a, &b),
                 "a real same-height double-sign MUST verify (verifier non-vacuous)");
+    }
+
+    /// One wire form per height: hex below the raw-signature gate, the bare 3,309 bytes from it. A
+    /// signature re-encoded into the other form, or cut short, is not that height's signature.
+    #[test]
+    fn a_block_signature_has_one_wire_form_per_height() {
+        use pqcrypto_traits::sign::DetachedSignature as _;
+        let gate = qnet_state::feature_gates::MICROBLOCK_SIG_RAW_GATE_HEIGHT;
+        let (_pk, sk) = pqcrypto_mldsa::mldsa65::keypair();
+        let sig = pqcrypto_mldsa::mldsa65::detached_sign(b"digest", &sk).as_bytes().to_vec();
+
+        let hex_form = encode_microblock_signature(gate - 1, &sig);
+        assert!(hex_form.starts_with(b"dilithium3_v4:"));
+        assert_eq!(decode_microblock_signature(gate - 1, &hex_form), Some(sig.clone()));
+        assert_eq!(decode_microblock_signature(gate, &hex_form), None, "hex is not a signature from the gate on");
+
+        let raw_form = encode_microblock_signature(gate, &sig);
+        assert_eq!(raw_form, sig);
+        assert_eq!(raw_form.len() * 2 + "dilithium3_v4:".len(), hex_form.len());
+        assert_eq!(decode_microblock_signature(gate, &raw_form), Some(sig.clone()));
+        assert_eq!(decode_microblock_signature(gate - 1, &raw_form), None, "raw bytes are not a signature below the gate");
+        assert_eq!(decode_microblock_signature(gate, &raw_form[..raw_form.len() - 1]), None);
+    }
+
+    /// Past the gate a double sign is still proven, and a proof built from a re-encoded signature is not.
+    #[test]
+    fn eqv_raw_signatures_past_the_gate() {
+        let node = "eqv_test_blk_raw";
+        let (_st, _d) = eqv_storage();
+        let (_pk, sk) = eqv_gen_and_register(&_st, node);
+        let h = qnet_state::feature_gates::MICROBLOCK_SIG_RAW_GATE_HEIGHT;
+        let mut a = eqv_mk_header(1000, 1, 0);
+        let mut b = eqv_mk_header(1001, 2, 0);
+        a.signature = eqv_sign_block(&sk, h, node, &a);
+        b.signature = eqv_sign_block(&sk, h, node, &b);
+        assert_eq!(a.signature.len(), pqcrypto_mldsa::mldsa65::signature_bytes());
+        assert!(BlockchainNode::verify_equivocation_proof(&_st, node, h, &a, &b));
+        let mut hexed = b.clone();
+        hexed.signature = format!("dilithium3_v4:{}", hex::encode(&b.signature)).into_bytes();
+        assert!(!BlockchainNode::verify_equivocation_proof(&_st, node, h, &a, &hexed),
+                "a signature in the pre-gate form must not prove anything past the gate");
+    }
+
+    /// A block produced past the gate verifies in the tie-break and the pipeline checks alike, and the
+    /// same signature in the pre-gate hex form verifies in neither.
+    #[tokio::test]
+    async fn a_raw_signed_block_verifies_past_the_gate() {
+        use pqcrypto_traits::sign::DetachedSignature as _;
+        let node = "sig_raw_producer";
+        let (st, _d) = eqv_storage();
+        let (_pk, sk) = eqv_gen_and_register(&st, node);
+        let h = qnet_state::feature_gates::MICROBLOCK_SIG_RAW_GATE_HEIGHT;
+        let mut mb = qnet_state::MicroBlock::new(h, 1_000, [3u8; 32], vec![], node.to_string());
+        let sig = pqcrypto_mldsa::mldsa65::detached_sign(microblock_signing_digest(&mb).as_ref(), &sk);
+        mb.signature = encode_microblock_signature(h, sig.as_bytes());
+        assert!(verify_microblock_producer_sig_sync(&st, &mb));
+        assert_eq!(BlockchainNode::verify_microblock_signature(&st, &mb, node, None).await, Ok(true));
+        mb.signature = format!("dilithium3_v4:{}", hex::encode(sig.as_bytes())).into_bytes();
+        assert!(!verify_microblock_producer_sig_sync(&st, &mb));
+        assert_eq!(BlockchainNode::verify_microblock_signature(&st, &mb, node, None).await, Ok(false));
     }
 
     #[test]

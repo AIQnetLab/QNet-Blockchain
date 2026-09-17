@@ -111,6 +111,13 @@ pub const SLOT_GAP_REANCHOR_GATE_HEIGHT: u64 = 1_339_200;
 /// every node must run the binary before this height. Window 104.
 pub const CONTRACT_GAS_SIGNED_GATE_HEIGHT: u64 = 1_497_600;
 
+/// From this height a microblock carries its producer signature as the raw ML-DSA-65 bytes; below it as
+/// the UTF-8 string `dilithium3_v4:<hex>` (twice the size on disk and on the wire). Exactly one form is
+/// valid at each height, and from the gate a signature has a single byte encoding (the hex below it
+/// decodes in either case). The pre-v4 compact forms are accepted only below it. A consensus rule: every node must run the binary
+/// before this height. Epoch 110.
+pub const MICROBLOCK_SIG_RAW_GATE_HEIGHT: u64 = 1_584_000;
+
 /// Kept as a const fn so the single source of the number stays in `transaction.rs`, where the charging
 /// code documents it, while the registry entry above stays a plain literal expression.
 const fn qnet_state_gas_metering_height() -> u64 { crate::transaction::GAS_METERING_ACTIVATION_HEIGHT }
@@ -133,6 +140,7 @@ pub mod id {
     pub const GAS_METERING: &str = "gas_metering";
     pub const SLOT_GAP_REANCHOR: &str = "slot_gap_reanchor";
     pub const CONTRACT_GAS_SIGNED: &str = "contract_gas_signed";
+    pub const MICROBLOCK_SIG_RAW: &str = "microblock_sig_raw";
 }
 
 /// (feature id, activation height). Heights are hardcoded in the binary, so every node agrees
@@ -156,6 +164,7 @@ const ACTIVATIONS: &[(&str, u64)] = &[
     (id::GAS_METERING, GAS_METERING_GATE_HEIGHT),
     (id::SLOT_GAP_REANCHOR, SLOT_GAP_REANCHOR_GATE_HEIGHT),
     (id::CONTRACT_GAS_SIGNED, CONTRACT_GAS_SIGNED_GATE_HEIGHT),
+    (id::MICROBLOCK_SIG_RAW, MICROBLOCK_SIG_RAW_GATE_HEIGHT),
 ];
 
 /// Core gate: active iff `feature` is unlisted (genesis-active default) or `height` has reached
@@ -221,6 +230,7 @@ mod tests {
             BURN_ATTESTATION_REQUIRED, REGISTRY_ROOT_REQUIRED, LIGHT_REG_EPOCH_ROSTER,
             LOGS_ROOT_REQUIRED, REWARD_EPOCH_ROOT_REQUIRED, LIGHT_KEY_COMMITMENT,
             LIGHT_SHARD_BACKUP_OWNERS, GAS_METERING, SLOT_GAP_REANCHOR, CONTRACT_GAS_SIGNED,
+            MICROBLOCK_SIG_RAW,
         ];
         for name in SCHEDULED {
             assert!(super::ACTIVATIONS.iter().any(|(f, _)| f == name),

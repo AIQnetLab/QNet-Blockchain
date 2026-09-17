@@ -129,6 +129,24 @@ impl Storage {
             }
         });
     }
+
+    /// History archive pass at mid-epoch, clear of the boundary's reward and snapshot work, plus a one-epoch
+    /// pass once finality is known after start (it shows at once whether the archive can write, without
+    /// loading a node that is re-entering consensus). Writes the epochs finalized by now. No-op without an archive.
+    pub fn archive_history_at(self: &Arc<Self>, height: u64) {
+        let Some(arch) = self.history_archive() else { return };
+        let finalized = crate::node::LAST_FINALIZED_HEIGHT.load(Ordering::SeqCst);
+        let segment = super::history_archive::SEGMENT_BLOCKS;
+        let max_epochs = if height % segment == segment / 2 {
+            super::history_archive::EPOCHS_PER_RUN
+        } else if finalized > 0 && arch.take_boot_pass() {
+            1
+        } else {
+            return;
+        };
+        let storage = Arc::clone(self);
+        tokio::task::spawn_blocking(move || { storage.archive_finalized_epochs(finalized, max_epochs); });
+    }
 }
 
 #[cfg(test)]

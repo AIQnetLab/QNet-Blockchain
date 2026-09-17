@@ -109,11 +109,12 @@ caps are compile-time constants of the eclipse defence, identical on every node 
 | Variable | Purpose | Default | Example |
 |----------|---------|---------|---------|
 | `QNET_DATA_DIR` | RocksDB data directory. Must be the mounted volume. | `/app/data` (set by the image); otherwise auto-selected | `/app/data` |
+| `QNET_ARCHIVE` | `1` keeps a history archive: every finalized epoch is written to one segment file under `<data dir>/archive` before its bodies are pruned, and served over `/api/v1/archive`. Super nodes only; off-consensus. | unset | `1` |
 | `QNET_MAX_STORAGE_GB` | Storage ceiling in GB. When it is reached the node runs emergency cleanup and, if still full, refuses to save further blocks. | `2000` for Super | `2000` |
 | `QNET_ACCOUNT_CACHE_CAPACITY` | Account read-through cache entries. Sizes RAM, not correctness — a cold entry reloads from the store. | `500000` | `500000` |
 | `QNET_MERKLE_NODE_CACHE_CAP` | Merkle node read-through cache entries. Same caveat. | `2000000` | `2000000` |
 
-Microblock-body pruning is fixed. Bodies are retained for `MICROBLOCK_BODY_RETENTION_BLOCKS`, a compile-time constant in the integration crate, and removed by `prune_old_microblock_bodies`.
+Microblock-body pruning is fixed. Bodies are retained for `MICROBLOCK_BODY_RETENTION_BLOCKS`, a compile-time constant in the integration crate, and removed by `prune_old_microblock_bodies`. With `QNET_ARCHIVE=1` the prune waits for the archive, for at most `ARCHIVE_HOLD_MAX_BLOCKS` (7 days); see [maintenance](maintenance.md#history-archive).
 
 ## Logging
 

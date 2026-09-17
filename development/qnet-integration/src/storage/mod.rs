@@ -11,10 +11,12 @@ mod snapshots;
 mod snapshot_index;
 mod account_mirror;
 mod boundary_snapshot;
+mod history_archive;
 mod persistent;
 
 pub use account_mirror::{account_delta, MirrorTicket};
 pub use boundary_snapshot::is_snapshot_boundary;
+pub use history_archive::{HistoryArchive, SegmentMeta, SEGMENT_BLOCKS as ARCHIVE_SEGMENT_BLOCKS};
 
 pub(crate) use rocksdb::{DB, Options, ColumnFamily, ColumnFamilyDescriptor, WriteBatch};
 pub(crate) use qnet_state::Transaction;
@@ -1412,6 +1414,8 @@ pub struct Storage {
     /// apply, read before cold RocksDB → kills 30s verify_stuck.
     /// Rollback-aware. O(1), scale-independent.
     recent_microblocks: Arc<dashmap::DashMap<u64, Arc<qnet_state::MicroBlock>>>,
+    /// Finalized history written before body pruning drops it (QNET_ARCHIVE=1, Super only).
+    history_archive: once_cell::sync::OnceCell<Arc<history_archive::HistoryArchive>>,
 }
 
 /// v27 HOLE3: recent-block cache cap (macroblock window + slack).

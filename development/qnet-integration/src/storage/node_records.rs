@@ -1016,7 +1016,11 @@ impl Storage {
         // Retention: 100,000 blocks (~28h at 1 block/sec). Explorer API queries use tx_by_address;
         // keeping ~1 day is sufficient for most wallet UIs. Historical queries → archive node.
         let tx_pruned = if current_height > TX_INDEX_RETENTION_BLOCKS {
-            let prune_before = current_height - TX_INDEX_RETENTION_BLOCKS;
+            // Rebuilding an archived block needs its transaction rows, so they wait for the archive too.
+            let prune_before = match self.archive_hold_floor(current_height) {
+                Some(floor) => (current_height - TX_INDEX_RETENTION_BLOCKS).min(floor),
+                None => current_height - TX_INDEX_RETENTION_BLOCKS,
+            };
             self.prune_old_transactions(prune_before).unwrap_or(0)
         } else {
             0

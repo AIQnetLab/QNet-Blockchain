@@ -254,8 +254,8 @@ jobs:
         echo "✅ Staging deployment simulation completed"
         echo ""
         echo "📊 QNet Staging Status:"
-        echo "- Blockchain TPS: 424,411"
-        echo "- Mobile TPS: 8,859"
+        echo "- Batched transfers/sec: 13,000"
+        echo "- Single transfers/sec: 450"
         echo "- Post-Quantum Security: Enabled"
         echo "- Project Size: 11MB"
 
@@ -274,8 +274,8 @@ jobs:
         echo "✅ Production deployment simulation completed"
         echo ""
         echo "📊 QNet Production Status:"
-        echo "- Blockchain Performance: 424,411 TPS"
-        echo "- Mobile Performance: 8,859 TPS"
+        echo "- Batched throughput: 13,000 transfers/sec"
+        echo "- Single-transfer throughput: 450 transfers/sec"
         echo "- Security: Post-quantum cryptography"
         echo "- Optimization: 99.96% size reduction (11MB)"
     
@@ -291,7 +291,7 @@ jobs:
           
           ## ✅ Release Highlights
           - **Blockchain Core**: Post-quantum cryptography enabled
-          - **Performance**: 424,411 TPS blockchain, 8,859 TPS mobile
+          - **Performance**: 13,000 batched / 450 single transfers per second, measured end-to-end
           - **Frontend**: Next.js explorer interface
           - **Security**: Comprehensive security audit passed
           - **Optimization**: 11MB total size (99.96% reduction from 30GB)
@@ -311,8 +311,8 @@ jobs:
           - Multi-signature transactions
           
           ## 📈 Performance Metrics
-          - Blockchain TPS: 424,411
-          - Mobile TPS: 8,859
+          - Batched transfers/sec: 13,000
+          - Single transfers/sec: 450
           - Memory usage: <1GB
           - Build time: <5 minutes
           
