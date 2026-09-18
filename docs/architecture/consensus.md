@@ -281,7 +281,7 @@ SHA3-256( "Block_Sig_v23.1" || height_be || timestamp_be || merkle_root || previ
         || timeout_round_be || carried_baseline_be || microblock_pk_digest(transactions) )
 ```
 
-signed as a detached ML-DSA-65 signature. Below `MICROBLOCK_SIG_RAW_GATE_HEIGHT` (1,584,000) it is carried as the UTF-8
+signed as a detached ML-DSA-65 signature. Below `MICROBLOCK_SIG_RAW_GATE_HEIGHT` (1,612,800) it is carried as the UTF-8
 string `dilithium3_v4:<hex>` (6,632 bytes); from that height as the raw 3,309 signature bytes. Exactly one form is valid at
 each height, from the gate a signature has a single byte encoding (the hex below it decodes in either case), and the
 pre-v4 compact forms are accepted only below the gate. Because the digest already covers `state_root`, binding

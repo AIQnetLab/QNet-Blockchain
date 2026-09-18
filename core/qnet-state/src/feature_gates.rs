@@ -114,9 +114,10 @@ pub const CONTRACT_GAS_SIGNED_GATE_HEIGHT: u64 = 1_497_600;
 /// From this height a microblock carries its producer signature as the raw ML-DSA-65 bytes; below it as
 /// the UTF-8 string `dilithium3_v4:<hex>` (twice the size on disk and on the wire). Exactly one form is
 /// valid at each height, and from the gate a signature has a single byte encoding (the hex below it
-/// decodes in either case). The pre-v4 compact forms are accepted only below it. A consensus rule: every node must run the binary
-/// before this height. Epoch 110.
-pub const MICROBLOCK_SIG_RAW_GATE_HEIGHT: u64 = 1_584_000;
+/// decodes in either case). The pre-v4 compact forms are accepted only below it. A consensus rule: every
+/// node must run the binary before this height. Epoch 112 (first set at 1,584,000, which the fleet crossed
+/// on the previous binary, so every block up to 1,612,799 carries the hex form).
+pub const MICROBLOCK_SIG_RAW_GATE_HEIGHT: u64 = 1_612_800;
 
 /// Kept as a const fn so the single source of the number stays in `transaction.rs`, where the charging
 /// code documents it, while the registry entry above stays a plain literal expression.
