@@ -331,8 +331,9 @@ Two paths prove liveness:
   takes POST with a 64 KB body limit because each enveloped ML-DSA-65 signature embeds its own
   message, so the response is far larger than a query string will carry. If the keychain is
   unavailable the ping window is missed and retried in the next window. The answer is capped at 8
-  seconds, counted after the key read and the signing. A refused or late answer, such as one to an
-  expired challenge, falls back to a pull self-attestation.
+  seconds, counted after the key read and the signing. A challenge stays answerable until the shard's
+  commit window opens, so an answer minutes late still counts for the epoch it was pushed in; a refused
+  one, or one past that point, falls back to a pull self-attestation.
 - **Pull self-attestation.** On any wakeup the app builds the challenge `selfattest:{height-2}:{hash}`
   from the `previous_hash` of block `height-1`, deduplicated per 14,400-block epoch, and submits it
   through the same ping-response endpoint to the node's three shard owners in rank order (the genesis

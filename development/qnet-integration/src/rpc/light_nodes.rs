@@ -1473,16 +1473,18 @@ pub(super) async fn handle_light_node_pending_challenge(
                 }
                 
                 // Generate a server-stamped challenge (G2: authenticated, FCM-safe).
-                let challenge = make_challenge_stamp(&node_id);
-                let expires_at = now + 180; // 3 minute expiry (matches LIGHT_CHALLENGE_TTL_SECS)
-                
-                // Store pending challenge
+                let (challenge, expires_at) = make_challenge_stamp(&node_id);
+
+                // The pending map is only the hand-off to a device that polls in its own slot, so it
+                // keeps the short horizon: the stamp verifies statelessly, and holding one row per light
+                // node until the epoch ends would be a roster-sized map at scale instead of a few slots'
+                // worth. An answer that arrives after the row is gone still verifies.
                 {
                     let mut challenges = PENDING_CHALLENGES.lock();
                     challenges.insert(node_id.clone(), PendingChallenge {
                         challenge: challenge.clone(),
                         created_at: now,
-                        expires_at,
+                        expires_at: now + crate::rpc::LIGHT_CHALLENGE_TTL_SECS,
                     });
                 }
                 
@@ -2494,7 +2496,7 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
                         let semaphore = semaphore.clone();
                         let blockchain = blockchain_for_pings.clone();
                         // G2: server-stamped challenge bound to THIS node (FCM-safe, stateless).
-                        let challenge = make_challenge_stamp(&light_node.node_id);
+                        let (challenge, _expires_at) = make_challenge_stamp(&light_node.node_id);
                         let delay = p2p.get_ping_delay(role);
                         let _our_node_id = blockchain.get_node_id();
                         
@@ -2657,7 +2659,9 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
                                             challenges.insert(light_node.node_id.clone(), PendingChallenge {
                                                 challenge: challenge.clone(),
                                                 created_at: now,
-                                                expires_at: now + 180, // 3 minute expiry
+                                                // The row is the hand-off to a polling device, not the
+                                                // deadline: the stamp itself stays answerable far longer.
+                                                expires_at: now + crate::rpc::LIGHT_CHALLENGE_TTL_SECS,
                                             });
                                         }
                                     }

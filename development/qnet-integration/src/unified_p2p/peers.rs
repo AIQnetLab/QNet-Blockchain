@@ -2620,7 +2620,16 @@ impl SimplifiedP2P {
                     block_height,
                 };
                 if !self.verify_light_ping_signature(&light_node_id, &challenge, &light_node_signature) {
-                    if crate::node::is_warn() {
+                    // A node holds ping keys only for the shards it owns, so a relay for any other shard
+                    // fails here by construction and is nothing to report: three fifths of the fleet's
+                    // attestations reach each node that way, and at WARN they buried the cases that do
+                    // mean something — a shard this node owns, where the pull below has to heal the row.
+                    let epoch = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed) / 14400;
+                    if !self.node_in_my_shard_for_epoch(epoch, &light_node_id) {
+                        if crate::node::is_debug() {
+                            println!("[DBG][P2P] light_sig_other_shard node={} pinger={}", light_node_id, pinger_id);
+                        }
+                    } else if crate::node::is_warn() {
                         println!("[WARN][P2P] light_sig_invalid node={} pinger={}", light_node_id, pinger_id);
                     }
                     // An owner the device never replied to directly holds no identity row for it, or a stale one.

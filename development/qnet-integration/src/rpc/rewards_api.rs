@@ -623,7 +623,8 @@ pub(super) async fn handle_get_reward_history(
         // Only resolved when it can change the answer: a zero this node CAN serve.
         let shard_certified = if servable && amount == 0 && is_light {
             let shard = crate::node::light_shard_of(&node_id);
-            Some(storage.load_light_bitmaps(epoch).map(|m| m.contains_key(&shard)).unwrap_or(false))
+            let bitmap_epoch = crate::reward_epoch::work_epoch_of(epoch);
+            Some(storage.load_light_bitmaps(bitmap_epoch).map(|m| m.contains_key(&shard)).unwrap_or(false))
         } else { None };
         let status = reward_history_status(servable, amount, epoch, last_claimed, shard_certified);
         epochs_history.push(json!({

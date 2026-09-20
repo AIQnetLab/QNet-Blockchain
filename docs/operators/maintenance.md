@@ -225,7 +225,9 @@ committee than the fault bound tolerates turns a maintenance window into a liven
 with the new image's `build=` once the replacement has taken. `scripts/deploy-genesis.sh` runs this pass for the
 genesis fleet: it recreates each container from its own `docker inspect` output, leaving `QNET_ROLLBACK_*`,
 `QNET_RECOVERY_HALTED` and `QNET_BUILD_ID` out of the carried environment (`QNET_SET_ENV=KEY=VALUE[,KEY=VALUE]` adds or
-replaces entries), and touches the next node only after the
+replaces entries). The container it replaces is renamed aside rather than deleted, and its log is gzipped to
+`/root/qnet-logs/<container>-pre-<timestamp>.log.gz` in the background (newest five kept) before it is dropped, so
+the hours before a roll can still be read afterwards. It touches the next node only after the
 previous one answers `/healthz`, is fewer than 10 blocks below the network height with at least one validated peer,
 has taken part in a checkpoint as a validator and seen a full-quorum seal at or above that window above its restart
 height, and has run 30 blocks past its restart with a failover-free metrics window. `QNET_RECOVERY_HALTED=1` skips the

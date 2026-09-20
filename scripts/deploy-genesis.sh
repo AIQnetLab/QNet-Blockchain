@@ -129,8 +129,27 @@ PORTS=$(docker inspect --format '{{range $p, $c := .HostConfig.PortBindings}}{{r
 REST=$(docker inspect --format '{{.HostConfig.RestartPolicy.Name}}' "$N")
 LOGS=$(docker inspect --format '{{range $k, $v := .HostConfig.LogConfig.Config}}--log-opt {{$k}}={{$v}} {{end}}' "$N")
 
-docker stop "$N" >/dev/null && docker rm "$N" >/dev/null
-eval docker run -d --name "$N" --restart="${REST:-always}" $LOGS $ENVS $PORTS $BINDS "$TAG" >/dev/null
+# Keep what the old container saw. `docker rm` takes its log with it, and an incident is then only as
+# reconstructable as the window that survived the roll — twice now the hours that mattered were gone.
+# The old container is renamed aside, the new one starts as before (same stop/run gap), and the archive
+# is written afterwards in the background. Its restart policy is cleared first: a daemon restart would
+# otherwise bring a second node up on the same data directory.
+OLD="${N}-pre-$(date -u +%Y%m%dT%H%M%SZ)"
+LOGDIR=/root/qnet-logs
+docker stop "$N" >/dev/null
+docker rename "$N" "$OLD"
+docker update --restart=no "$OLD" >/dev/null 2>&1 || true
+if ! eval docker run -d --name "$N" --restart="${REST:-always}" $LOGS $ENVS $PORTS $BINDS "$TAG" >/dev/null; then
+  docker rm -f "$N" >/dev/null 2>&1 || true
+  docker rename "$OLD" "$N"
+  docker update --restart="${REST:-always}" "$N" >/dev/null 2>&1 || true
+  docker start "$N" >/dev/null 2>&1 || true
+  echo "run failed — the previous container is back up"
+  exit 1
+fi
+mkdir -p "$LOGDIR"
+# The last two days of it: the rotation allows 10 GB per container, and an incident is read in hours.
+setsid nohup nice -n 19 sh -c "docker logs --since 48h --timestamps '$OLD' 2>&1 | gzip -1 > '$LOGDIR/$OLD.log.gz'; docker rm '$OLD' >/dev/null 2>&1; ls -1t '$LOGDIR/$N'-pre-*.log.gz 2>/dev/null | tail -n +6 | xargs -r rm -f" >/dev/null 2>&1 &
 INNER
   then
     echo "  [ERR] recreate failed on $id — roll stopped, fix this node before continuing"; exit 1

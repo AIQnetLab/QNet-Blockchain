@@ -342,12 +342,16 @@ impl ApiRateLimiter {
             block_duration: 3600,
         });
 
-        // Attestation is once/epoch (dedup) but wakeups + retries can burst; per-IP bound so a spammer
-        // can't force unpriced storage reads + Dilithium verifies at 10M-node scale.
+        // Attestation is once/epoch and the per-epoch dedup runs BEFORE the Dilithium verify, so an
+        // honest device costs one verification per epoch however often it answers. That is the bound
+        // that matters; the per-IP cap only stops one source from flooding. It has to be wide, because
+        // an IP is not a device: a household answers from several phones and a carrier NAT fronts
+        // thousands of them, and every answer over the cap is a device losing its epoch for a reason
+        // it cannot see.
         configs.insert("light_node_ping".to_string(), RateLimitConfig {
-            max_requests: 6,
+            max_requests: 120,
             window_seconds: 60,
-            block_duration: 300,
+            block_duration: 60,
         });
 
         configs.insert("light_node_token_refresh".to_string(), RateLimitConfig {
@@ -4536,6 +4540,19 @@ pub fn generate_quantum_challenge() -> String {
 // poll). Off-consensus path. Secret = SHA3(domain | node seed) — stable across restarts, never logged.
 pub(crate) const LIGHT_CHALLENGE_TTL_SECS: u64 = 180;
 
+/// How long a stamp issued at `height` stays answerable: until the shard's owners start building the
+/// epoch bitmap, and never less than LIGHT_CHALLENGE_TTL_SECS (which is also the margin the slot draw
+/// leaves for a stamp issued in the last drawn slot).
+///
+/// The reward unit is the whole epoch, so an answer three minutes late proves exactly the presence an
+/// answer three seconds late proves. The fixed 180 s threw the late ones away — a phone leaving doze, a
+/// push the system held back, a node restarting under a roll — and each throw cost that device its
+/// epoch. The grid runs at one block per second, so blocks left in the window are seconds left.
+fn challenge_lifetime_at(height: u64) -> u64 {
+    let commit_opens_at = 14_400u64.saturating_sub(crate::node::light_commit_window(height / 14_400));
+    commit_opens_at.saturating_sub(height % 14_400).max(LIGHT_CHALLENGE_TTL_SECS)
+}
+
 fn light_challenge_mac(node_id: &str, nonce: &[u8; 16], expiry: u64) -> [u8; 16] {
     use sha3::{Digest, Sha3_256};
     // Must go through the accessor: reading the raw env var ignores QNET_WALLET_SEED_FILE, and a
@@ -4557,20 +4574,22 @@ fn light_challenge_mac(node_id: &str, nonce: &[u8; 16], expiry: u64) -> [u8; 16]
     mac
 }
 
-/// Issue a server-authenticated, unexpired challenge stamp for `node_id`.
-fn make_challenge_stamp(node_id: &str) -> String {
+/// Issue a server-authenticated challenge stamp for `node_id`, with the expiry the epoch allows.
+/// Returns the stamp and that expiry, so a caller serving it (the polling route) reports the same one.
+fn make_challenge_stamp(node_id: &str) -> (String, u64) {
     use rand::{RngCore, rngs::OsRng};
     use std::time::{SystemTime, UNIX_EPOCH};
     let mut nonce = [0u8; 16];
     OsRng.fill_bytes(&mut nonce);
+    let height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
     let expiry = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
-        + LIGHT_CHALLENGE_TTL_SECS;
+        + challenge_lifetime_at(height);
     let mac = light_challenge_mac(node_id, &nonce, expiry);
     let mut buf = Vec::with_capacity(40);
     buf.extend_from_slice(&nonce);
     buf.extend_from_slice(&expiry.to_be_bytes());
     buf.extend_from_slice(&mac);
-    hex::encode(buf)
+    (hex::encode(buf), expiry)
 }
 
 /// Verify a challenge stamp was issued by THIS server to THIS node and is not expired.
@@ -4587,6 +4606,30 @@ fn verify_challenge_stamp(node_id: &str, challenge: &str) -> bool {
     if expiry < now { return false; }
     let expected = light_challenge_mac(node_id, &nonce, expiry);
     bytes[24..40] == expected[..]
+}
+
+#[cfg(test)]
+mod tests_light_challenge_lifetime {
+    use super::*;
+
+    /// A stamp stays answerable until the shard's owners start building the epoch bitmap: a device that
+    /// answers minutes late — doze, a held-back push, a node restarting under a roll — still proves the
+    /// epoch it was pinged in. Below that it never drops under the floor the slot draw is sized for.
+    #[test]
+    fn a_stamp_is_answerable_until_the_commit_window_opens() {
+        let epoch = 200u64;
+        let start = epoch * 14_400;
+        let commit = crate::node::light_commit_window(epoch);
+        let answerable_for = 14_400 - commit;
+        assert_eq!(challenge_lifetime_at(start), answerable_for);
+        assert_eq!(challenge_lifetime_at(start + 7_200), answerable_for - 7_200);
+        assert_eq!(challenge_lifetime_at(start + answerable_for - LIGHT_CHALLENGE_TTL_SECS),
+                   LIGHT_CHALLENGE_TTL_SECS, "the last drawn slot still gets the full floor");
+        assert_eq!(challenge_lifetime_at(start + 14_399), LIGHT_CHALLENGE_TTL_SECS,
+                   "inside the commit window a stamp gets the floor, not zero");
+        assert!(challenge_lifetime_at(start) > LIGHT_CHALLENGE_TTL_SECS,
+                "an epoch is worth more than three minutes of answering time");
+    }
 }
 
 #[cfg(test)]
