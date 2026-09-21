@@ -7,16 +7,27 @@ import styles from '../screens/WalletScreen.styles';
 const shortMiddle = (s, head, tail) =>
   !s || s.length <= head + tail + 3 ? String(s || '') : `${s.slice(0, head)}...${s.slice(-tail)}`;
 
+const ICON = {
+  success: { box: 'txSuccessIcon', text: 'txSuccessIconText', glyph: '✓' },
+  pending: { box: 'txPendingIcon', text: 'txPendingIconText', glyph: '⧗' },
+  failed: { box: 'txErrorIcon', text: 'txErrorIconText', glyph: '✕' },
+};
+
 /**
  * The outcome of one submitted transaction — a send, a token transfer, a reward claim, an activation.
- * Callers pass the outcome, never a layout, so every flow reports success and failure the same way,
- * inline on the send screen or as the body of the alert modal. Inside the modal the title and the
- * button belong to the modal, so both props are left out there.
+ * Callers pass the outcome, never a layout, so every flow reports itself the same way on the same
+ * full-screen surface.
+ *
+ * Three outcomes, because a transaction really has three: it applied, it was refused, or nobody
+ * answered and the chain has not decided yet. `pending` exists so an unanswered submit is never
+ * reported as a refusal — it still shows its amount, since it may well have gone through.
  */
 export default function TxResultCard({
-  ok, title, amount, symbol, counterparty, counterpartyLabel = 'To', note, hash, error,
+  state = 'success', title, amount, symbol, counterparty, counterpartyLabel = 'To', note, hash, error,
   actionLabel = 'Done', onAction, onCopied,
 }) {
+  const icon = ICON[state] || ICON.failed;
+  const failed = state === 'failed';
   const copy = () => {
     if (!hash) return;
     Clipboard.setString(hash);
@@ -27,12 +38,12 @@ export default function TxResultCard({
 
   return (
     <View style={styles.txResultContainer}>
-      <View style={ok ? styles.txSuccessIcon : styles.txErrorIcon}>
-        <Text style={ok ? styles.txSuccessIconText : styles.txErrorIconText}>{ok ? '✓' : '✕'}</Text>
+      <View style={styles[icon.box]}>
+        <Text style={styles[icon.text]}>{icon.glyph}</Text>
       </View>
       {title ? <Text style={styles.txResultTitle}>{title}</Text> : null}
 
-      {ok && amount !== undefined && amount !== null && amount !== '' ? (
+      {!failed && amount !== undefined && amount !== null && amount !== '' ? (
         <Text style={styles.txResultAmount} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.5}>
           {amount}{symbol ? ` ${symbol}` : ''}
         </Text>
@@ -43,7 +54,7 @@ export default function TxResultCard({
       ) : null}
 
       {note ? <Text style={styles.txResultNote}>{note}</Text> : null}
-      {!ok && error ? <Text style={styles.txErrorMessage}>{String(error)}</Text> : null}
+      {failed && error ? <Text style={styles.txErrorMessage}>{String(error)}</Text> : null}
 
       {hash ? (
         <TouchableOpacity style={styles.txHashContainer} activeOpacity={0.7} onPress={open} onLongPress={copy}>

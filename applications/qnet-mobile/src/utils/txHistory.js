@@ -12,6 +12,22 @@ const INDEX_LAG_GRACE_MS = 5 * 60 * 1000;
 
 const lc = (s) => String(s || '').toLowerCase();
 
+/**
+ * Which way a transfer moved for this wallet: out, in, or back to itself. A transfer whose sender and
+ * recipient are both this wallet moves no money — only its fee leaves — so it is its own direction
+ * instead of an outgoing row showing a minus in front of an amount that never left.
+ *
+ * Every feed decides direction here: the explorer page, the node's transactions, a block event and the
+ * row a fresh send adds. One answer per transfer, whichever source delivered it.
+ */
+export function txDirection(from, to, myAddress) {
+  const me = lc(myAddress);
+  const out = lc(from) === me;
+  const inbound = lc(to) === me;
+  if (out && inbound) return 'self';
+  return out ? 'send' : 'receive';
+}
+
 export function fmtTokenBaseUnits(base, decimals) {
   const s = String(base == null ? '0' : base).replace(/[^0-9]/g, '') || '0';
   const d = Number(decimals) || 0;
@@ -41,7 +57,6 @@ export function historyRowKey(t) {
  * already on chain; any other waits for its inclusion proof.
  */
 export function tokenRowFromEvent(ev, myAddress, trustedTokenMeta) {
-  const me = lc(myAddress);
   const tm = trustedTokenMeta.get(lc(ev.contract));
   const dec = tm ? tm.decimals : (Number(ev.decimals) || 0);
   return {
@@ -53,7 +68,7 @@ export function tokenRowFromEvent(ev, myAddress, trustedTokenMeta) {
     status: ev.archived ? 'confirmed' : 'pending',
     verified: false,
     timestamp: (Number(ev.timestamp) || 0) * 1000,
-    type: (lc(ev.to) === me && lc(ev.from) !== me) ? 'receive' : 'send',
+    type: txDirection(ev.from, ev.to, myAddress),
     fee: 0,
     tokenContract: ev.contract,
     tokenSymbol: tm ? tm.symbol : ev.symbol,
@@ -87,7 +102,8 @@ export function splitExplorerItems(items, myAddress) {
       });
       continue;
     }
-    const send = lc(it.from) === me;
+    const direction = txDirection(it.from, it.to, myAddress);
+    const send = direction !== 'receive'; // a self-transfer pays the fee like any other outgoing one
     native.push({
       hash: it.hash,
       ...(it.source === 'batch' ? { batchIndex: Number(it.idx) } : {}),
@@ -97,7 +113,7 @@ export function splitExplorerItems(items, myAddress) {
       amount: (Number(it.amount) || 0) / 1e9,
       status: 'confirmed',
       timestamp: Number(it.timestamp) || 0,
-      type: send ? 'send' : 'receive',
+      type: direction,
       fee: send ? (Number(it.fee) || 0) / 1e9 : 0,
     });
   }

@@ -41,7 +41,7 @@ import {
 import { getRandomGenesisNode, EXPLORER_API, explorerTxUrl } from '../config/nodes';
 import TxResultCard from '../components/TxResultCard';
 import {
-  matchesAsset,
+  matchesAsset, txDirection,
   HISTORY_PAGE, EXPLORER_REFRESH_MS, fmtTokenBaseUnits, historyRowKey, tokenRowFromEvent, splitExplorerItems,
   mergeHistory, appendHistory, cacheableHistory,
 } from '../utils/txHistory';
@@ -182,17 +182,22 @@ const TxRow = React.memo(function TxRow({ tx, onCopy, onOpen, hideAmounts }) {
       </TouchableOpacity>
     );
   }
+  // One of three directions (see txDirection): out, in, or back to this same wallet. A transfer to
+  // itself moves no money — only its fee leaves — so it carries no sign and no outgoing red.
+  const isSelf = tx.type === 'self';
   const isSend = tx.type === 'send';
   // Burn: a success-gated token burn event (kind), or a native/token transfer to the burn address.
   const isBurn = tx.tokenKind === 'burn' || (typeof tx.to === 'string' && tx.to === CANONICAL_BURN_ADDR);
-  const counter = isSend ? tx.to : tx.from;
+  const counter = (isSend || isSelf) ? tx.to : tx.from;
+  const sign = isSelf ? '' : (isSend ? '-' : '+');
+  const tone = isSelf ? '#00d4ff' : (isSend ? '#ff4444' : '#00ff88');
   const isToken = !!tx.tokenContract;
   const isNft = tx.tokenStd === 'qrc721';
   const amountLabel = isToken
     ? (isNft
-        ? `${isSend ? '-' : '+'}${tx.tokenSymbol ? `${tx.tokenSymbol} ` : ''}#${tx.tokenId || '?'}`
-        : `${isSend ? '-' : '+'}${tx.tokenAmountDisplay || '0'}${tx.tokenSymbol ? ` ${tx.tokenSymbol}` : ''}`)
-    : `${tx.amount === 0 ? '0' : `${isSend ? '-' : '+'}${tx.amount.toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: Math.abs(tx.amount) >= 1 ? 4 : 8 })}`} QNC`;
+        ? `${sign}${tx.tokenSymbol ? `${tx.tokenSymbol} ` : ''}#${tx.tokenId || '?'}`
+        : `${sign}${tx.tokenAmountDisplay || '0'}${tx.tokenSymbol ? ` ${tx.tokenSymbol}` : ''}`)
+    : `${tx.amount === 0 ? '0' : `${sign}${tx.amount.toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: Math.abs(tx.amount) >= 1 ? 4 : 8 })}`} QNC`;
   const dateLabel = tx.status === 'pending'
     ? '⏳ Pending...'
     : (!tx.timestamp || tx.timestamp === 0 || tx.timestamp < 1000000)
@@ -212,11 +217,11 @@ const TxRow = React.memo(function TxRow({ tx, onCopy, onOpen, hideAmounts }) {
       {/* One line on any screen: both sides shrink their text to fit instead of the amount dropping below. */}
       <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
         <View style={{ flexDirection: 'row', alignItems: 'center', flexShrink: 1 }}>
-          <View style={{ width: 32, height: 32, borderRadius: 16, backgroundColor: isSend ? '#ff444420' : '#00ff8820', alignItems: 'center', justifyContent: 'center', marginRight: 12 }}>
-            <Text style={{ color: isSend ? '#ff4444' : '#00ff88', fontSize: 18 }}>{isBurn ? '🔥' : (isSend ? '↑' : '↓')}</Text>
+          <View style={{ width: 32, height: 32, borderRadius: 16, backgroundColor: `${tone}20`, alignItems: 'center', justifyContent: 'center', marginRight: 12 }}>
+            <Text style={{ color: tone, fontSize: 18 }}>{isBurn ? '🔥' : (isSelf ? '↺' : (isSend ? '↑' : '↓'))}</Text>
           </View>
           <View style={{ flexShrink: 1 }}>
-            <Text style={{ color: '#fff', fontSize: 16, fontWeight: '600' }} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.5}>{isBurn ? '🔥 Burn' : (isSend ? 'Sent' : 'Received')}</Text>
+            <Text style={{ color: '#fff', fontSize: 16, fontWeight: '600' }} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.5}>{isBurn ? '🔥 Burn' : (isSelf ? 'Sent to self' : (isSend ? 'Sent' : 'Received'))}</Text>
             <Text style={{ color: '#666', fontSize: 12 }} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.5}>{dateLabel}</Text>
           </View>
         </View>
@@ -224,7 +229,7 @@ const TxRow = React.memo(function TxRow({ tx, onCopy, onOpen, hideAmounts }) {
           <View style={{ flexDirection: 'row', alignItems: 'center' }}>
             {/* QNC brand mark for native rows; the token's own icon for a QRC-20 transfer. */}
             <TxCoinMark token={isToken ? { contract: tx.tokenContract, symbol: tx.tokenSymbol, logo: tx.tokenLogo } : null} />
-            <Text style={{ color: isSend ? '#ff4444' : '#00ff88', fontSize: 16, fontWeight: '600', flexShrink: 1 }} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.5}>
+            <Text style={{ color: tone, fontSize: 16, fontWeight: '600', flexShrink: 1 }} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.5}>
               {hideAmounts ? '••••' : amountLabel}
             </Text>
             {/* Trust badge: a ✓ marks a token transfer proven against a committee-QC-anchored logs_root
@@ -239,7 +244,7 @@ const TxRow = React.memo(function TxRow({ tx, onCopy, onOpen, hideAmounts }) {
       </View>
       <View style={{ borderTopWidth: 1, borderTopColor: '#1a1a2e', paddingTop: 8 }}>
         <Text style={{ color: '#888', fontSize: 11 }}>
-          {isSend ? 'To: ' : 'From: '}
+          {isSelf ? 'To self: ' : (isSend ? 'To: ' : 'From: ')}
           <Text style={{ color: '#00d4ff', fontFamily: 'monospace' }}>{counter?.slice(0, 12)}...{counter?.slice(-8)}</Text>
         </Text>
       </View>
@@ -336,6 +341,7 @@ const WalletScreen = () => {
   // { txHash, expectedQnc, previousQnc, timestamp, status: 'pending'|'confirmed'|'failed' }
   const pendingTxRef = useRef(null);
   const txPollingRef = useRef(null); // Interval ID for cleanup
+  const outcomeRunRef = useRef(0);   // generation of the unknown-outcome resolver, so an older run steps aside
   // v3.30: TX History with WebSocket real-time updates
   const [txHistory, setTxHistory] = useState([]); // Array of { hash, from, to, amount, status, timestamp, type }
   const wsRef = useRef(null); // WebSocket connection
@@ -1329,20 +1335,10 @@ const WalletScreen = () => {
           // node-tab effect can't re-fire (type/code re-set to identical values) and this closure's
           // nodePseudonym state is still pre-setState — hence the explicit pseudonym argument.
           try { await loadLightNodeStatus(result.pseudonym, nodeType); } catch (_) {}
-          showAlert(
-            'Node Restored!',
-            '',
-            [{ text: 'OK', onPress: () => {
-              setShowActivationInput(false);
-              setActivationInputCode('');
-            }}],
-            <TxResultCard
-              ok
-              note={`Your existing ${nodeType} node has been reactivated and restored.\n\nNode ID: ${activationInputCode.trim()}\nSystem ID: ${result.pseudonym}`}
-              hash={result.onChainTxHash}
-              onCopied={() => showAlert('Copied', 'Transaction hash copied to clipboard')}
-            />
-          );
+          const restoredNote = `Your existing ${nodeType} node has been reactivated and restored.\n\nNode ID: ${activationInputCode.trim()}\nSystem ID: ${result.pseudonym}`;
+          setShowActivationInput(false);
+          setActivationInputCode('');
+          setTxResult({ success: true, title: 'Node Restored', note: restoredNote, txHash: result.onChainTxHash });
         } else {
           // Fresh activation: self-attest NOW so this-epoch eligibility is recorded even when the
           // node's ping slot already passed this epoch (else it earns nothing until app reopen).
@@ -1353,20 +1349,10 @@ const WalletScreen = () => {
           const activatedText = result.onChainPending
             ? result.message
             : `Your ${nodeType} node has been successfully activated and registered in the network.`;
-          showAlert(
-            'Node Activated!',
-            '',
-            [{ text: 'OK', onPress: () => {
-              setShowActivationInput(false);
-              setActivationInputCode('');
-            }}],
-            <TxResultCard
-              ok
-              note={`${activatedText}\n\nNode ID: ${activationInputCode.trim()}\nSystem ID: ${result.pseudonym}`}
-              hash={result.onChainTxHash}
-              onCopied={() => showAlert('Copied', 'Transaction hash copied to clipboard')}
-            />
-          );
+          const activatedNote = `${activatedText}\n\nNode ID: ${activationInputCode.trim()}\nSystem ID: ${result.pseudonym}`;
+          setShowActivationInput(false);
+          setActivationInputCode('');
+          setTxResult({ success: true, title: 'Node Activated', note: activatedNote, txHash: result.onChainTxHash });
         }
       } else {
         throw new Error(result.error || 'Failed to activate node');
@@ -1558,6 +1544,31 @@ const WalletScreen = () => {
     setSendAmount('');
   };
 
+  /**
+   * Which of the three outcomes a result carries. `unknown` is a submit nobody answered: the chain has
+   * not decided, so it is neither a success nor a refusal, and the resolver below settles it.
+   */
+  const txResultState = (r) => (r.unknown ? 'pending' : (r.success ? 'success' : 'failed'));
+
+  /** What the result says under the amount: the caller's own note, else the state of its confirmation. */
+  const txResultNote = (r) => {
+    if (r.note) return r.note;
+    if (r.unknown) return 'The network did not answer in time. The transaction may already be on its way — this updates as soon as the chain decides.';
+    if (!r.success) return null;
+    if (r.confirmed) return 'Included in a block.';
+    if (r.stillPending) return 'Not in a block yet — it stays queued, and the history row updates when it lands.';
+    if (r.confirming) return 'Waiting for the block that includes it.';
+    return null;
+  };
+
+  // Dismissing a result returns the flow that raised it to where it belongs — the send screen closes,
+  // a claim reloads the node, a failed send goes back to its filled-in form.
+  const dismissTxResult = () => {
+    const onDismiss = txResult && txResult.onDismiss;
+    setTxResult(null);
+    if (onDismiss) onDismiss();
+  };
+
   // Android hardware-back: dismiss the topmost open overlay/modal instead of exiting the app.
   // Returns true (handled) while anything is open; on the home tab returns false so the OS can exit.
   useEffect(() => {
@@ -1576,6 +1587,7 @@ const WalletScreen = () => {
       if (showAddTokenModal) { closeAddTokenModal(); return true; }
       if (showTokenManager) { setShowTokenManager(false); return true; }
       if (showHeaderMenu) { setShowHeaderMenu(false); return true; }
+      if (txResult) { dismissTxResult(); return true; }
       if (showSendScreen) { closeSendScreen(); return true; }
       if (showSettings) { setShowSettings(false); return true; }
       // Pre-wallet onboarding full-screens: back steps in instead of exiting the app,
@@ -1600,7 +1612,7 @@ const WalletScreen = () => {
     showChangePassword, showExportSeed, showExportActivation, showAutoLockPicker,
     showLanguagePicker, showSeedConfirm, showSendScreen, showSettings,
     showCreateOptions, importStep, activeTab, showAddTokenModal,
-    showTokenManager, showHeaderMenu,
+    showTokenManager, showHeaderMenu, txResult,
   ]);
 
 
@@ -1648,7 +1660,8 @@ const WalletScreen = () => {
   // which hasn't received the block yet → stale balance without protection.
   // loadBalance clears pendingTxRef ONLY when the queried node's balance
   // actually reflects the TX (qncBalance <= expectedQnc).
-  const startTxConfirmationPolling = (txHash, expectedBalance, previousBalance) => {
+  const startTxConfirmationPolling = (txHash) => {
+    outcomeRunRef.current++; // an answered submit retires any resolver still asking about an older one
     // Clear any existing polling (clearTimeout also cancels a setInterval handle)
     if (txPollingRef.current) {
       clearTimeout(txPollingRef.current);
@@ -1749,16 +1762,79 @@ const WalletScreen = () => {
 
     txPollingRef.current = setTimeout(poll, baseDelayMs);
   };
-  
+
+  /**
+   * Settle a submit nobody answered. The chain decides it by (from, nonce) — no other key can produce a
+   * transaction with that nonce — so this asks until the account's nonce reaches ours or the screen runs
+   * out of patience. It never turns into a refusal on its own: the mempool may hold the transaction for
+   * up to half an hour, and calling that "failed" is exactly the guess this replaces.
+   */
+  const startUnknownOutcomeResolution = (outcome) => {
+    if (txPollingRef.current) { clearTimeout(txPollingRef.current); txPollingRef.current = null; }
+
+    // A newer send supersedes this one: its answer may still arrive, and it must not write over the
+    // result that replaced it or steal the poll slot.
+    const run = ++outcomeRunRef.current;
+    const deadline = Date.now() + 180000;
+    let attempts = 0;
+    let answered = false; // whether any node ever told us the account's nonce
+
+    const ask = async () => {
+      attempts++;
+      let res = { landed: false };
+      try {
+        res = await walletManager.resolveSubmitByNonce(outcome.from, outcome.nonce, {
+          toAddress: outcome.to, amountNano: outcome.amountNano, sinceMs: outcome.sinceMs,
+        });
+      } catch (_) {
+        // Unreachable node: nothing learned, ask again on the next tick.
+      }
+      if (run !== outcomeRunRef.current) return;
+      answered = answered || !!res.known;
+
+      if (res.landed) {
+        txPollingRef.current = null;
+        setTxResult(prev => prev && prev.unknown
+          ? { ...prev, unknown: false, success: true, title: 'Transaction Sent',
+              txHash: res.txHash || prev.txHash, confirmed: true }
+          : prev);
+        if (wallet?.publicKey) loadBalance(wallet.publicKey);
+        loadTxHistory();
+        return;
+      }
+
+      if (Date.now() >= deadline) {
+        txPollingRef.current = null;
+        // Say only what was actually learned: the chain answered and does not have it yet, or nothing
+        // answered at all and the outcome is simply still unread.
+        const note = answered
+          ? 'Still not in a block. It can wait in the queue for up to half an hour — the history updates if it lands. A new send from this wallet takes its place: only one of the two can ever apply, so this cannot pay twice.'
+          : 'No node could be reached to check. Open the history once you are back online — it shows whether this transaction landed.';
+        setTxResult(prev => prev && prev.unknown ? { ...prev, note } : prev);
+        if (wallet?.publicKey) loadBalance(wallet.publicKey);
+        return;
+      }
+
+      txPollingRef.current = setTimeout(ask, Math.min(3000 + attempts * 1000, 10000));
+    };
+
+    txPollingRef.current = setTimeout(ask, 3000);
+  };
+
   // Send QNC transaction (real blockchain transaction)
   const handleSendTransaction = async () => {
     if (!sendAddress || !sendAmount || sendingTransaction) return;
     
     const amount = parseFloat(sendAmount);
     if (isNaN(amount) || amount <= 0) {
-      setTxResult({ success: false, error: 'Please enter a valid amount' });
+      setTxResult({ success: false, title: 'Cannot Send', error: 'Please enter a valid amount' });
       return;
     }
+
+    // A send back to this same wallet: it still pays the fee, but the amount never leaves, so neither the
+    // balance nor the history may show it as spent.
+    const myQnetAddress = wallet?.qnetAddress || wallet?.address;
+    const toSelf = txDirection(myQnetAddress, sendAddress, myQnetAddress) === 'self';
 
     // QRC-20 gas is paid in QNC (separate balance), NOT in the token itself: a token send needs `amount` of
     // the token here and its fee in QNC (checked below, once the call is sized); native QNC needs amount + fee.
@@ -1767,6 +1843,7 @@ const WalletScreen = () => {
       if (amount > sendingToken.balance) {
         setTxResult({
           success: false,
+          title: 'Cannot Send',
           error: `Insufficient balance. Need ${amount} ${sendingToken.symbol}.\nYour balance: ${sendingToken.balance} ${sendingToken.symbol}`,
         });
         return;
@@ -1777,6 +1854,7 @@ const WalletScreen = () => {
       if (needNano > Math.round(sendingToken.balance * 1e9)) {
         setTxResult({
           success: false,
+          title: 'Cannot Send',
           error: `Insufficient balance. Need ${(needNano / 1e9).toFixed(6)} ${sendingToken.symbol} (including the ${TRANSFER_FEE_QNC} QNC fee).\nYour balance: ${sendingToken.balance.toFixed(6)} ${sendingToken.symbol}`,
         });
         return;
@@ -1792,6 +1870,7 @@ const WalletScreen = () => {
       if (!isValidEon && !isValidHex) {
         setTxResult({
           success: false,
+          title: 'Cannot Send',
           error: 'Invalid address format.\nMust be EON (45 chars) or Hex (64 chars)'
         });
         return;
@@ -1811,6 +1890,7 @@ const WalletScreen = () => {
         if (need.needNano > Math.round((tokenBalances.qnc || 0) * 1e9)) {
           setTxResult({
             success: false,
+            title: 'Cannot Send',
             error: `Not enough QNC for the network fee. Need ${(need.needNano / 1e9).toFixed(6)} QNC${need.depositNano ? ' (fee + refundable 0.01 QNC deposit for a new recipient)' : ''}.\nYour QNC balance: ${fmtAmount(tokenBalances.qnc || 0, 6)} QNC`,
           });
           return;
@@ -1825,12 +1905,17 @@ const WalletScreen = () => {
         const txHash = result.tx_hash || result.txHash;
         setTxResult({
           success: true,
+          title: 'Transaction Sent',
           txHash,
           amount,
           to: sendAddress,
+          counterpartyLabel: toSelf ? 'To self' : 'To',
           symbol: sendingToken.symbol,
           confirming: true,
+          onDismiss: closeSendScreen,
         });
+        // Same confirmation poll as a native send: the result screen says "waiting" only while it is.
+        if (txHash) startTxConfirmationPolling(txHash);
         // Show the transfer in history immediately as a pending TOKEN row (icon + amount + symbol).
         if (txHash) {
           addPendingTxToHistory(txHash, sendAddress, amount, need.feeNano / 1e9, {
@@ -1842,9 +1927,10 @@ const WalletScreen = () => {
           });
         }
         // Optimistic balance update using the TOKEN's decimals (string math): subtract the sent
-        // base units from the current base units, then merge back into the Assets list row.
+        // base units from the current base units, then merge back into the Assets list row. A transfer
+        // to this same wallet returns them, so its balance is unchanged.
         setQrcTokens((prev) => prev.map((t) => {
-          if (t.contract !== sendingToken.contract) return t;
+          if (t.contract !== sendingToken.contract || toSelf) return t;
           try {
             const curBase = BigInt(walletManager.toBaseUnits(String(t.balance || '0'), decimals));
             const sentBase = BigInt(amountBaseUnits);
@@ -1873,18 +1959,23 @@ const WalletScreen = () => {
 
       if (result.success) {
         const previousBalance = sendingToken.balance;
+        // A transfer to this same wallet returns its amount; only the fee actually leaves.
+        const leavesNano = toSelf ? 0 : Math.round(amount * 1e9);
         const expectedBalance = sendingToken.symbol === 'QNC'
-          ? Math.max(0, Math.round(previousBalance * 1e9) - Math.round(amount * 1e9) - TRANSFER_FEE_NANO) / 1e9
+          ? Math.max(0, Math.round(previousBalance * 1e9) - leavesNano - TRANSFER_FEE_NANO) / 1e9
           : previousBalance;
 
         // Show success with "confirming" status
         setTxResult({
           success: true,
+          title: 'Transaction Sent',
           txHash: result.txHash,
           amount: amount,
           to: sendAddress,
+          counterpartyLabel: toSelf ? 'To self' : 'To',
           symbol: sendingToken.symbol,
-          confirming: true // Shows "Confirming..." in UI
+          confirming: true, // the note tracks this until the poller confirms or gives up
+          onDismiss: closeSendScreen,
         });
 
         // v3.29: Set pending TX state
@@ -1907,15 +1998,41 @@ const WalletScreen = () => {
           addPendingTxToHistory(result.txHash, sendAddress, amount, TRANSFER_FEE_QNC);
 
           // Start polling for TX confirmation
-          startTxConfirmationPolling(result.txHash, expectedBalance, previousBalance);
+          startTxConfirmationPolling(result.txHash);
         }
+      } else if (result.unknown) {
+        // Nobody answered the submit. The transaction may be in a mempool already, so it is neither
+        // sent nor failed until the chain says which — the resolver below asks it, keyed by the nonce.
+        setTxResult({
+          unknown: true,
+          title: 'Awaiting Confirmation',
+          amount,
+          to: sendAddress,
+          counterpartyLabel: toSelf ? 'To self' : 'To',
+          symbol: sendingToken.symbol,
+          onDismiss: closeSendScreen,
+        });
+        startUnknownOutcomeResolution(result);
       } else {
         // TX rejected by node - no pending state needed
-        setTxResult({ success: false, error: result.error || 'Transaction failed' });
+        setTxResult({ success: false, title: 'Transaction Failed', error: result.error || 'Transaction failed' });
       }
     } catch (error) {
-      // TX failed to send
-      setTxResult({ success: false, error: error.message || 'Transaction failed' });
+      // A token call that went unanswered carries the same unknown outcome; anything else is a refusal.
+      if (error && error.unknown) {
+        setTxResult({
+          unknown: true,
+          title: 'Awaiting Confirmation',
+          amount,
+          to: sendAddress,
+          counterpartyLabel: toSelf ? 'To self' : 'To',
+          symbol: sendingToken.symbol,
+          onDismiss: closeSendScreen,
+        });
+        startUnknownOutcomeResolution(error.unknown);
+      } else {
+        setTxResult({ success: false, title: 'Transaction Failed', error: error.message || 'Transaction failed' });
+      }
     } finally {
       setSendingTransaction(false);
     }
@@ -1947,30 +2064,39 @@ const WalletScreen = () => {
         const stopped = result.stoppedAtEpoch != null
           ? `This claim stopped at epoch ${result.stoppedAtEpoch} — claim again once it is credited to collect anything later.`
           : 'Credited once a block includes it.';
-        showAlert(
-          'Claim submitted',
-          '',
-          [{ text: 'OK', onPress: () => {
+        setTxResult({
+          success: true,
+          title: 'Claim Submitted',
+          amount: claimedAmount,
+          symbol: 'QNC',
+          note: stopped,
+          txHash: result.txHash,
+          onDismiss: () => {
             loadServerNodeStatus();
             if (wallet && wallet.publicKey) loadBalance(wallet.publicKey);
-          }}],
-          <TxResultCard
-            ok
-            amount={claimedAmount}
-            symbol="QNC"
-            note={stopped}
-            hash={result.txHash}
-            onCopied={() => showAlert('Copied', 'Transaction hash copied to clipboard')}
-          />
-        );
+          },
+        });
       } else {
         // Nothing was submitted here — the node refused the claim, so it is not a failed transaction.
-        showAlert('Cannot claim', '', [{ text: 'OK', onPress: () => {} }],
-          <TxResultCard ok={false} error={result.message} />);
+        setTxResult({ success: false, title: 'Cannot Claim', error: result.message });
       }
     } catch (error) {
-      showAlert('Claim failed', '', [{ text: 'OK', onPress: () => {} }],
-        <TxResultCard ok={false} error={error.message} />);
+      // An unanswered claim is unknown, not failed: a re-quote after it lands simply skips the epochs
+      // it already paid, so the amount can never be collected twice.
+      if (error && error.unknown) {
+        setTxResult({
+          unknown: true,
+          title: 'Awaiting Confirmation',
+          symbol: 'QNC',
+          note: 'The network did not answer in time. If the claim went through, its epochs are already marked paid and a new claim collects only what is left.',
+          onDismiss: () => {
+            loadServerNodeStatus();
+            if (wallet && wallet.publicKey) loadBalance(wallet.publicKey);
+          },
+        });
+      } else {
+        setTxResult({ success: false, title: 'Claim Failed', error: error.message });
+      }
     } finally {
       setProcessingValidation(false);
     }
@@ -3194,7 +3320,7 @@ const WalletScreen = () => {
                   amount: (tx.amount || 0) / 1e9,
                   status: 'confirmed',
                   timestamp: tx.timestamp ? tx.timestamp * 1000 : Date.now(),
-                  type: from === myAddr ? 'send' : 'receive',
+                  type: txDirection(from, to, myAddr),
                   fee: (tx.fee || tx.gas_used || 0) / 1e9
                 };
                 
@@ -3301,7 +3427,7 @@ const WalletScreen = () => {
         amount: (tx.amount || 0) / 1e9,
         status: 'confirmed',
         timestamp: (tx.timestamp || 0) * 1000,
-        type: (tx.from || tx.sender || '').toLowerCase() === myAddress ? 'send' : 'receive',
+        type: txDirection(tx.from || tx.sender, tx.to || tx.recipient, myAddress),
         fee: (tx.fee || tx.gas_used || 0) / 1e9,
       }));
       // The explorer row first: it carries the fee the chain debited. A ContractCall a token event already
@@ -3411,7 +3537,7 @@ const WalletScreen = () => {
       amount: token && token.contract ? 0 : amount,
       status: 'pending',
       timestamp: Date.now(),
-      type: 'send',
+      type: txDirection(wallet?.qnetAddress, to, wallet?.qnetAddress),
       fee: fee
     };
     if (token && token.contract) {
@@ -4529,31 +4655,8 @@ const WalletScreen = () => {
       case 'assets':
         // Show Send Screen (inline, same size as assets)
         if (showSendScreen && sendingToken) {
-          // Transaction Result Screen
-          if (txResult) {
-            return (
-              <TabBox key="assets-result" deps={[txResult]} render={() => (
-              <ScrollView
-                style={styles.content}
-                contentContainerStyle={[styles.scrollContentContainer, styles.sendScreenContainer]}
-              >
-                {/* No header on the result screen: the ✓/✕ icon + title convey the outcome and the
-                    Done button dismisses — the redundant "← Back / Success" bar is removed. */}
-                <TxResultCard
-                  ok={!!txResult.success}
-                  title={txResult.success ? 'Transaction Sent!' : 'Transaction Failed'}
-                  amount={txResult.amount}
-                  symbol={txResult.symbol}
-                  counterparty={txResult.to}
-                  hash={txResult.txHash}
-                  error={txResult.error}
-                  onAction={closeSendScreen}
-                  onCopied={() => showAlert('Copied', 'Transaction hash copied to clipboard')}
-                />
-              </ScrollView>
-              )} />
-            );
-          }
+          // The result of a submitted send renders on the shared full-screen surface (see the root
+          // render), so the form below stays mounted underneath and a failure returns straight to it.
 
           // The fee the chain prepays for this send: a transfer's is fixed, a token call's follows its size.
           const feePreviewNano = !sendingToken?.contract ? TRANSFER_FEE_NANO : (() => {
@@ -6334,6 +6437,30 @@ const WalletScreen = () => {
       {/* Tab Content */}
       <View style={styles.tabContentContainer}>
         {renderTabContent()}
+        {/* One result surface for every transaction — send, token transfer, claim, activation — so an
+            outcome always arrives the same way, over whichever tab started it. */}
+        {txResult ? (
+          <View style={styles.txResultOverlay}>
+            <ScrollView
+              style={styles.content}
+              contentContainerStyle={[styles.scrollContentContainer, styles.sendScreenContainer]}
+            >
+              <TxResultCard
+                state={txResultState(txResult)}
+                title={txResult.title}
+                amount={txResult.amount}
+                symbol={txResult.symbol}
+                counterparty={txResult.to}
+                counterpartyLabel={txResult.counterpartyLabel}
+                note={txResultNote(txResult)}
+                hash={txResult.txHash}
+                error={txResult.error}
+                onAction={dismissTxResult}
+                onCopied={() => showAlert('Copied', 'Transaction hash copied to clipboard')}
+              />
+            </ScrollView>
+          </View>
+        ) : null}
       </View>
 
       {/* Change Password Modal */}

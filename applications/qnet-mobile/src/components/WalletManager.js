@@ -3067,9 +3067,94 @@ export class WalletManager {
 
   // Submit a signed TX (hedged POST). Gossip routes it to the current producer within ~1 microblock,
   // so no producer-lookup round-trip is needed.
+  // The 900 ms hedge already covers a node that is simply not answering, so the timeout only has to
+  // outlast a slow one. It is generous on purpose: waiting longer costs a few seconds, giving up early
+  // costs an unresolved outcome (see _unknownOutcome). Same budget as the claim submit.
   async submitSignedTx(txPayload) {
-    const res = await this._hedged('/api/v1/transaction', { method: 'POST', body: txPayload, timeoutMs: 5000, hedgeMs: 900 });
+    const res = await this._hedged('/api/v1/transaction', { method: 'POST', body: txPayload, timeoutMs: 8000, hedgeMs: 900 });
     return res.data || {};
+  }
+
+  /**
+   * Did the submit come back without a verdict? An aborted or broken request says nothing about the
+   * transaction — the node may hold it and only the reply was lost — so this class of failure is
+   * UNKNOWN, never failed. A verdict the node actually returned is not this.
+   */
+  static isUnansweredSubmit(err) {
+    const s = `${(err && err.name) || ''} ${(err && err.message) || ''}`.toLowerCase();
+    return /abort|timeout|timed out|network request failed|failed to fetch|all nodes failed|network error/.test(s);
+  }
+
+  /**
+   * The outcome of a submit nobody answered, decided by the chain and keyed by (from, nonce). The
+   * account's confirmed nonce reaching ours means a transaction of ours with that nonce applied: no
+   * other key can sign one, and a retry reuses the nonce, so at most one copy can ever apply.
+   *
+   * The applied hash is read back from the account's history rather than trusted from the submit: a
+   * hedged submit puts one copy on each of two nodes, each stamps its own timestamp, so the hash the
+   * wallet was handed is not necessarily the copy that landed.
+   */
+  async resolveSubmitByNonce(address, nonce, { toAddress = null, amountNano = null, sinceMs = 0 } = {}) {
+    const res = await this._hedged(`/api/v1/account/${address}`, { timeoutMs: 4000, hedgeMs: 700 });
+    if (!res || !res.ok || !res.data) return { landed: false, known: false };
+    if ((Number(res.data.nonce) || 0) < nonce) return { landed: false, known: true };
+    return { landed: true, known: true, txHash: await this._appliedTxHash(address, toAddress, amountNano, sinceMs) };
+  }
+
+  /**
+   * Newest applied transfer from this wallet to that recipient for that exact nanoQNC amount, no older
+   * than the submit. The age bound is what keeps an identical earlier transfer from being named as this
+   * one; a wallet that really did send the same amount twice within minutes can still be pointed at the
+   * twin, which costs a link, never a wrong outcome — the nonce above decides that.
+   */
+  async _appliedTxHash(address, toAddress, amountNano, sinceMs = 0) {
+    if (!toAddress || amountNano == null) return null;
+    const me = String(address).toLowerCase();
+    const to = String(toAddress).toLowerCase();
+    // Node clocks stamp the transaction, so allow the fleet's spread against this device's clock.
+    const notBefore = sinceMs ? Math.floor(sinceMs / 1000) - 120 : 0;
+    try {
+      const res = await this._hedged(`/api/v1/account/${address}/transactions`, { timeoutMs: 5000, hedgeMs: 800 });
+      const rows = (res && res.ok && res.data && Array.isArray(res.data.transactions)) ? res.data.transactions : [];
+      const mine = rows
+        .filter((t) => t && String(t.from).toLowerCase() === me && String(t.to).toLowerCase() === to
+                    && Number(t.amount) === Number(amountNano) && (Number(t.timestamp) || 0) >= notBefore)
+        .sort((a, b) => (Number(b.timestamp) || 0) - (Number(a.timestamp) || 0));
+      return mine.length ? mine[0].hash : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /**
+   * POST the signed claim. An unanswered submit is unknown, not failed: the claim may be in flight, and
+   * because the chain marks an epoch paid, a later claim collects only what is still owed — so the
+   * caller reports it as pending and nothing is ever paid twice. Only the submit is tagged this way; an
+   * unanswered quote submitted nothing and stays an ordinary error.
+   */
+  async _submitClaim(body) {
+    try {
+      return await this._hedged('/api/v1/rewards/claim', { method: 'POST', timeoutMs: 8000, hedgeMs: 1200, body });
+    } catch (e) {
+      if (!WalletManager.isUnansweredSubmit(e)) throw e;
+      const err = new Error('The network did not answer — this claim may still be on its way');
+      err.unknown = { unknown: true, claim: true };
+      throw err;
+    }
+  }
+
+  /**
+   * The unknown outcome of an unanswered submit, in one shape for every path, so the UI reports and
+   * resolves it the same way wherever it comes from.
+   *
+   * Forgetting the local nonce is the part that makes a retry safe: the next send re-reads the chain,
+   * which hands back the next nonce if this one applied and the same nonce if it did not — so the
+   * retry replaces the lost copy instead of paying a second time.
+   */
+  _unknownOutcome(address, nonce, extra = {}) {
+    delete WalletManager.nonceCache[address];
+    console.warn(`[SEND] submit unanswered, outcome unknown: nonce=${nonce}`);
+    return { unknown: true, nonce, from: address, ...extra };
   }
 
   // Nonce for the next TX from `address`, tracked locally so back-to-back sends skip the round-trip;
@@ -6409,19 +6494,16 @@ export class WalletManager {
         const dilithiumKeys = await this._walletDilithiumKeys(password);
         const claimsSignature = await signWithDilithium(
           signMessage, dilithiumKeys.secretKey, dilithiumKeys.publicKey, nodeId);
-        const submitRes = await this._hedged('/api/v1/rewards/claim', {
-          method: 'POST', timeoutMs: 8000, hedgeMs: 1200,
-          body: {
-            node_id: nodeId,
-            wallet_address: walletAddress,
-            dilithium_signature: dilithiumSignature,
-            dilithium_public_key: dilithiumKeys.publicKey,
-            claims_data: claimResult.claims_data,
-            claims_signature: claimsSignature,
-            // Inside the signed message and reused as the TX timestamp, so the payload cannot be
-            // re-stamped into a fresh hash and replayed.
-            claim_timestamp: claimResult.claim_timestamp,
-          },
+        const submitRes = await this._submitClaim({
+          node_id: nodeId,
+          wallet_address: walletAddress,
+          dilithium_signature: dilithiumSignature,
+          dilithium_public_key: dilithiumKeys.publicKey,
+          claims_data: claimResult.claims_data,
+          claims_signature: claimsSignature,
+          // Inside the signed message and reused as the TX timestamp, so the payload cannot be
+          // re-stamped into a fresh hash and replayed.
+          claim_timestamp: claimResult.claim_timestamp,
         });
         const submitted = submitRes.data || {};
         if (!submitRes.ok || !submitted.success) {
@@ -6591,13 +6673,22 @@ export class WalletManager {
 
       // Local nonce → hedged submit; one retry with a chain-fresh nonce if the node rejects on drift.
       let txNonce = await this.resolveNonce(fromAddress);
-      let result = await buildAndSubmit(txNonce);
-      if (result && result.success === false && !result.tx_hash &&
-          // `pk_unresolved` = we elided the pubkey but the node has no committed key for us. The forced
-        // fresh resolveNonce below re-reads has_dilithium_pk (false), so the retry re-attaches the pk.
-        /nonce|pk_unresolved/i.test(`${result.error || ''} ${result.details || ''}`)) {
-        txNonce = await this.resolveNonce(fromAddress, true);
+      let result;
+      try {
         result = await buildAndSubmit(txNonce);
+        if (result && result.success === false && !result.tx_hash &&
+            // `pk_unresolved` = we elided the pubkey but the node has no committed key for us. The forced
+          // fresh resolveNonce below re-reads has_dilithium_pk (false), so the retry re-attaches the pk.
+          /nonce|pk_unresolved/i.test(`${result.error || ''} ${result.details || ''}`)) {
+          txNonce = await this.resolveNonce(fromAddress, true);
+          result = await buildAndSubmit(txNonce);
+        }
+      } catch (e) {
+        if (!WalletManager.isUnansweredSubmit(e)) throw e;
+        // Nobody answered: the transaction may already be in a mempool, so calling this a failure would
+        // be a guess. Hand the caller the unknown outcome and the nonce that decides it.
+        return { success: false, ...this._unknownOutcome(fromAddress, txNonce,
+          { to: toAddress, amount, amountNano: amountSmallest, sinceMs: Date.now() }) };
       }
       // Affirmative accept: require a real tx_hash (or explicit success). An ambiguous/empty 200 is
       // NOT a successful send — never show "sent" + deduct balance for a TX the node may have dropped.
@@ -6686,8 +6777,9 @@ export class WalletManager {
         dilithium_signature: dilSig,
       };
       if (!WalletManager._pkElidable(from)) { body.dilithium_public_key = dilPkHex; }
+      // Same budget as a native transfer: the hedge covers a silent node, the timeout only a slow one.
       const res = await this._hedged('/api/v1/contract/call', {
-        method: 'POST', timeoutMs: 5000, hedgeMs: 900,
+        method: 'POST', timeoutMs: 8000, hedgeMs: 900,
         body,
       });
       return res.data || {};
@@ -6695,18 +6787,28 @@ export class WalletManager {
 
     // Local nonce → hedged submit; one retry with a chain-fresh nonce on drift (mirrors sendQNC).
     let txNonce = await this.resolveNonce(from);
-    let result = await buildAndSubmit(txNonce);
-    // A node from before gas-bound contract signatures refuses the new form; it takes the old one.
-    if (result && result.success === false && !result.tx_hash &&
-        /signature|dilithium/i.test(`${result.error || ''} ${result.details || ''}`)) {
-      result = await buildAndSubmit(txNonce, true);
-    }
-    if (result && result.success === false && !result.tx_hash &&
-        // `pk_unresolved` = we elided the pubkey but the node has no committed key for us. The forced
-        // fresh resolveNonce below re-reads has_dilithium_pk (false), so the retry re-attaches the pk.
-        /nonce|pk_unresolved/i.test(`${result.error || ''} ${result.details || ''}`)) {
-      txNonce = await this.resolveNonce(from, true);
+    let result;
+    try {
       result = await buildAndSubmit(txNonce);
+      // A node from before gas-bound contract signatures refuses the new form; it takes the old one.
+      if (result && result.success === false && !result.tx_hash &&
+          /signature|dilithium/i.test(`${result.error || ''} ${result.details || ''}`)) {
+        result = await buildAndSubmit(txNonce, true);
+      }
+      if (result && result.success === false && !result.tx_hash &&
+          // `pk_unresolved` = we elided the pubkey but the node has no committed key for us. The forced
+          // fresh resolveNonce below re-reads has_dilithium_pk (false), so the retry re-attaches the pk.
+          /nonce|pk_unresolved/i.test(`${result.error || ''} ${result.details || ''}`)) {
+        txNonce = await this.resolveNonce(from, true);
+        result = await buildAndSubmit(txNonce);
+      }
+    } catch (e) {
+      if (!WalletManager.isUnansweredSubmit(e)) throw e;
+      // Unanswered: unknown, not failed (see _unknownOutcome). This path throws on anything but an
+      // affirmed call, so the outcome rides on the error for the caller to resolve and report.
+      const err = new Error('The network did not answer — this call may still be on its way');
+      err.unknown = this._unknownOutcome(from, txNonce, { to: contractAddress });
+      throw err;
     }
     const accepted = !!(result && (result.tx_hash || result.success === true));
     if (!accepted) {

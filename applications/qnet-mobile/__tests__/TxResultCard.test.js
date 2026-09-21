@@ -18,7 +18,7 @@ describe('transaction result surface', () => {
     let tree;
     await act(async () => {
       tree = renderer.create(
-        <TxResultCard ok title="Transaction Sent!" amount="10" symbol="QNC" counterparty={'a'.repeat(45)} hash="f00d" />
+        <TxResultCard state="success" title="Transaction Sent" amount="10" symbol="QNC" counterparty={'a'.repeat(45)} hash="f00d" />
       );
     });
     expect(texts(tree)).toContain('✓');
@@ -34,12 +34,27 @@ describe('transaction result surface', () => {
   it('reports a failure the same way, with no amount and no hash card', async () => {
     let tree;
     await act(async () => {
-      tree = renderer.create(<TxResultCard ok={false} title="Claim failed" amount="10" error="node refused" />);
+      tree = renderer.create(<TxResultCard state="failed" title="Claim Failed" amount="10" error="node refused" />);
     });
     expect(texts(tree)).toContain('✕');
     expect(texts(tree)).toContain('node refused');
     expect(texts(tree)).not.toContain('10');
     expect(tree.root.findAllByType(TouchableOpacity)).toHaveLength(0);
+    await act(async () => { tree.unmount(); });
+  });
+
+  it('reports an unanswered submit as pending — its amount stands, and it is not an error', async () => {
+    let tree;
+    await act(async () => {
+      tree = renderer.create(
+        <TxResultCard state="pending" title="Awaiting Confirmation" amount="10" symbol="QNC" note="not decided yet" />
+      );
+    });
+    const shown = texts(tree);
+    expect(shown).toContain('⧗');
+    expect(shown).toContain('10 QNC');
+    expect(shown).toContain('not decided yet');
+    expect(shown).not.toContain('✕');
     await act(async () => { tree.unmount(); });
   });
 });

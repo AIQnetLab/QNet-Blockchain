@@ -5,6 +5,7 @@
  */
 import {
   historyRowKey, splitExplorerItems, tokenRowFromEvent, mergeHistory, appendHistory, cacheableHistory, fmtTokenBaseUnits,
+  txDirection,
 } from '../src/utils/txHistory';
 
 const ME = 'aaaaaaaaaaaaaaaaaaaeonaaaaaaaaaaaaaaaaaaaaaa';
@@ -76,6 +77,24 @@ describe('tx history', () => {
     const merged = appendHistory(shown, [row('b', NOW - 2_000), row('c', NOW - 3_000), row('b', NOW - 2_000, { batchIndex: 3 })]);
     expect(merged.map(historyRowKey)).toEqual(['a', 'b', 'b:b3', 'c']);
     expect(cacheableHistory([...merged, { ...row('p', NOW), status: 'pending' }]).map(t => t.hash)).toEqual(['a', 'b', 'b', 'c']);
+  });
+
+  it('reads a transfer back to the same wallet as its own direction, in every feed', () => {
+    expect(txDirection(ME, OTHER, ME)).toBe('send');
+    expect(txDirection(OTHER, ME, ME)).toBe('receive');
+    expect(txDirection(ME, ME, ME)).toBe('self');
+    expect(txDirection(ME.toUpperCase(), ME, ME)).toBe('self');
+
+    // The explorer page: a self transfer is not a receipt, and it still paid its fee.
+    const { native } = splitExplorerItems(
+      [{ source: 'tx', hash: 'h9', idx: 0, timestamp: NOW, from: ME, to: ME, amount: '10000000000', tx_type: 'Transfer', fee: '150000' }], ME);
+    expect(native[0]).toMatchObject({ type: 'self', amount: 10, fee: 0.00015 });
+
+    // A token transfer reads the same way.
+    const token = tokenRowFromEvent(
+      { tx_hash: 'h10', log_index: 0, contract: 'c1', from: ME, to: ME, amount: '500', decimals: 2, symbol: 'TK', timestamp: NOW / 1000 },
+      ME, new Map());
+    expect(token.type).toBe('self');
   });
 
   it('formats base units exactly past 2^53', () => {

@@ -1101,6 +1101,24 @@ const styles = StyleSheet.create({
     fontSize: 40,
     fontWeight: '700',
   },
+  txResultOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: '#11131f',
+  },
+  txPendingIcon: {
+    width: 80,
+    height: 80,
+    borderRadius: 40,
+    backgroundColor: 'rgba(255, 184, 0, 0.2)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginBottom: 24,
+  },
+  txPendingIconText: {
+    color: '#ffb800',
+    fontSize: 40,
+    fontWeight: '700',
+  },
   txResultTitle: {
     color: '#ffffff',
     fontSize: 24,
