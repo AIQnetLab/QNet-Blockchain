@@ -158,8 +158,8 @@ export default function HomeClient({ initialStats }: HomeClientProps) {
             </div>
             <h3>Post-Quantum Cryptography</h3>
             <p>
-              ML-DSA-65 (NIST FIPS 204) quantum signatures. 31/31 crypto tests passed (100% perfect). 
-              NIST-approved algorithms protecting against quantum computing threats.
+              ML-DSA-65 (NIST FIPS 204) signatures on every transaction and consensus message, ML-KEM-768
+              (FIPS 203) key exchange between nodes. NIST-standardised algorithms against quantum computing threats.
             </p>
           </div>
           
@@ -237,8 +237,8 @@ export default function HomeClient({ initialStats }: HomeClientProps) {
             </div>
             <h3>Reputation-Based Security</h3>
             <p>
-              No token locking or slashing! Security through reputation scoring (0-100). 
-              Full liquidity maintained while ensuring network security through behavior-based trust.
+              No token locking, no slashing of funds. A node that signs two conflicting blocks is proven on
+              chain and excluded from consensus; everyone else keeps full liquidity and an equal say.
             </p>
           </div>
           
@@ -261,8 +261,8 @@ export default function HomeClient({ initialStats }: HomeClientProps) {
             </div>
             <h3>Mobile-First Design</h3>
             <p>
-              NOT MINING certified! Simple ping responses every 4 hours. 
-              Battery usage like messaging apps. iOS/Android store ready with hardware security.
+              A phone runs a light node by signing a periodic status request — nothing is computed, and battery use
+              is that of a messaging app. Keys live in the hardware-backed keystore on iOS and Android.
             </p>
           </div>
           <div className="feature-card premium">
@@ -284,8 +284,8 @@ export default function HomeClient({ initialStats }: HomeClientProps) {
             </div>
             <h3>Radical Transparency</h3>
             <p>
-              Every single line of code is on GitHub under MIT license. App Store & Play Store apps are 
-              100% open source. Verifiable builds ensure live version matches public code.
+              Every single line of code is on GitHub under the MIT license — the node, the explorer and the wallet
+              apps. Verifiable builds ensure the live version matches public code.
             </p>
           </div>
         </div>
@@ -295,30 +295,30 @@ export default function HomeClient({ initialStats }: HomeClientProps) {
         <div className="section-header">
           <h2 className="section-title">Mobile-First Blockchain</h2>
           <p className="section-subtitle">
-            World's first blockchain designed for mobile devices - NOT mining!
+            A blockchain designed for phones: participation is a signed answer, not computation
           </p>
         </div>
-        
+
         <div className="technology-grid expanded">
           <div className="tech-item">
-            <h4 className="tech-title">NOT Mining Certified</h4>
-            <p>Simple ping responses every 4 hours. &lt;1 second processing, &lt;0.01% battery usage. No CPU/GPU mining, no device heating.</p>
+            <h4 className="tech-title">Presence, Not Computation</h4>
+            <p>A light node answers a signed status request from the network a few times per four-hour epoch. Nothing is computed between requests; the device stays cool and the battery barely notices.</p>
           </div>
           <div className="tech-item">
-            <h4 className="tech-title">iOS App Store Ready</h4>
-            <p>1.2s launch time, 23MB memory, Hardware Keychain integration. TestFlight ready for July 2025 submission.</p>
+            <h4 className="tech-title">iOS</h4>
+            <p>Keys in the Keychain, Face ID or Touch ID unlock, silent push wake-ups for status requests. App Store listing in preparation.</p>
           </div>
           <div className="tech-item">
-            <h4 className="tech-title">Android Play Store Ready</h4>
-            <p>1.4s launch time, 28MB memory, Target API 34 (Android 14). Doze mode optimized, AAB package ready.</p>
+            <h4 className="tech-title">Android</h4>
+            <p>Keys in the Android Keystore, biometric unlock, background wake-ups that survive Doze. Google Play listing in preparation.</p>
           </div>
           <div className="tech-item">
             <h4 className="tech-title">Hardware-Backed Security</h4>
             <p>iOS Keychain & Android Keystore integration. Post-quantum keys stored in secure hardware enclaves.</p>
           </div>
           <div className="tech-item">
-            <h4 className="tech-title">Ping-Based Participation</h4>
-            <p>Every 4 hours network ping with cryptographic proof. Rewards from two pools: Base Emission and Pool #3 activation benefits.</p>
+            <h4 className="tech-title">Rewards for Answering</h4>
+            <p>Each epoch&apos;s answers are recorded on chain. That epoch&apos;s emission is shared by the nodes that answered — three quarters among light nodes, one quarter among super nodes — and claimed from the app.</p>
           </div>
           <div className="tech-item">
             <h4 className="tech-title">11 Languages Supported</h4>
@@ -342,7 +342,7 @@ export default function HomeClient({ initialStats }: HomeClientProps) {
           </div>
           <div className="tech-item">
             <h4 className="tech-title">Phase 2: QNC to Pool #3 (Future)</h4>
-            <p>QNC tokens are SENT TO POOL #3 for node activation. DYNAMIC PRICING v3.18: Light(10k-30k), Super(7.5k-22.5k) QNC based on network size → Pool #3 → redistributed to ALL active nodes!</p>
+            <p>Activation is paid in QNC and goes to Pool #3, which is redistributed to all active nodes. The price scales with network size; the exact schedule is set before Phase 2 opens.</p>
           </div>
           <div className="tech-item">
             <h4 className="tech-title">Sharp Drop Halving Innovation</h4>
@@ -353,24 +353,24 @@ export default function HomeClient({ initialStats }: HomeClientProps) {
             <p>Network size multipliers: 0-100K nodes (0.5x discount), 100K-300K (1.0x standard), 300K-1M (2.0x), 1M+ (3.0x premium). ALL fees → Pool #3!</p>
           </div>
           <div className="tech-item">
-            <h4 className="tech-title">Three Reward Pools</h4>
-            <p>1. Base Emission (halving schedule) | 2. Activation Pool #3 (ALL nodes benefit from Phase 2 activations)</p>
+            <h4 className="tech-title">Two Reward Pools</h4>
+            <p>1. Base emission on the halving schedule, split each epoch among the nodes that answered | 2. Pool #3, fed by Phase 2 activations and shared by all active nodes. Transaction fees go to the block producer.</p>
           </div>
           <div className="tech-item">
-            <h4 className="tech-title">Hybrid Post-Quantum Cryptography</h4>
-            <p>Dilithium2 + Ed25519 dual-signature system. Best of both worlds: quantum-resistant + high-performance. Future-proof security architecture.</p>
+            <h4 className="tech-title">Post-Quantum Throughout</h4>
+            <p>Signatures: ML-DSA-65 only — for wallets, nodes and consensus alike. Transport between nodes: TLS 1.3 over QUIC with hybrid X25519 + ML-KEM-768 key exchange, authenticated with ML-DSA-65.</p>
           </div>
           <div className="tech-item">
-            <h4 className="tech-title">Reputation-Based Consensus</h4>
-            <p>Score range 0-100. No token locking. Double-sign detection with automatic penalties. Mobile-friendly security.</p>
+            <h4 className="tech-title">Equivocation Is Final</h4>
+            <p>No token locking. Producers and committees are drawn by verifiable randomness from all eligible nodes; a signed proof of double-signing, recorded on chain, removes the offender from every future draw.</p>
           </div>
           <div className="tech-item">
-            <h4 className="tech-title">Rate Limiting & DDoS Protection</h4>
-            <p>Token bucket system: 30 requests/minute per peer. Real-time spam detection. Regional load balancing across 6 continents.</p>
+            <h4 className="tech-title">Rate Limiting</h4>
+            <p>Per-address limits by request class — 100 transactions and 300 reads a minute, 5 activations an hour — and a bounded pool for signature verification, so a flood of requests cannot starve consensus.</p>
           </div>
           <div className="tech-item">
-            <h4 className="tech-title">Cross-Chain Integration</h4>
-            <p>Solana SPL token (1DEV) bridge for Phase 1 activation. Seamless transition to native QNC in Phase 2 with Pool #3 benefits.</p>
+            <h4 className="tech-title">Phase 1 on Solana</h4>
+            <p>Activation burns 1DEV, an SPL token, on Solana; QNet nodes verify the burn transaction themselves. No bridge and no wrapped assets — Phase 2 moves activation to native QNC.</p>
           </div>
         </div>
       </section>

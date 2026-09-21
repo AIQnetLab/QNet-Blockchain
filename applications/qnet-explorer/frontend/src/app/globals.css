@@ -34,7 +34,7 @@ main.qnet-container {
 }
 
 /* Page-specific wrappers */
-.page-home, .page-nodes, .page-explorer, .page-dao, .page-testnet, .page-wallet, .page-docs, .page-privacy {
+.page-home, .page-nodes, .page-explorer, .page-dao, .page-testnet, .page-wallet, .page-docs, .page-privacy, .page-terms, .page-support {
   width: 100%;
 }
 
@@ -1961,8 +1961,8 @@ a[href*="play.google.com"] img {
   margin: 0 auto 3rem;
 }
 
-/* Privacy Policy Page */
-.page-privacy .content-card {
+/* Privacy, Terms and Support pages share one document layout */
+.page-privacy .content-card, .page-terms .content-card, .page-support .content-card {
   background: rgba(0, 20, 40, 0.4);
   border: 1px solid rgba(0, 255, 136, 0.2);
   border-radius: 12px;

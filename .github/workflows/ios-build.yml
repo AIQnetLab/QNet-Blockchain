@@ -1,0 +1,65 @@
+name: iOS build
+
+# Compiles the wallet for the iOS simulator on a clean macOS runner, unsigned: proof that the Xcode
+# project, the pods and the native ML-DSA module build outside one developer's machine. A signed
+# archive for TestFlight needs the developer account's certificates; that lane is added once the
+# account exists and its secrets are in the repository.
+
+on:
+  push:
+    branches: [testnet, main]
+    paths:
+      - 'applications/qnet-mobile/**'
+      - '.github/workflows/ios-build.yml'
+  pull_request:
+    paths:
+      - 'applications/qnet-mobile/**'
+  workflow_dispatch:
+
+jobs:
+  simulator:
+    runs-on: macos-15
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: applications/qnet-mobile
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: applications/qnet-mobile/package-lock.json
+
+      # patch-package runs as postinstall; when its context does not match on this platform the patch
+      # is applied by hand with fuzz, which is what it needs (a two-line compiler-flag change).
+      - name: Install JavaScript dependencies
+        run: |
+          npm ci --no-audit --no-fund --ignore-scripts
+          npx patch-package || (cd node_modules/react-native-quick-crypto && patch -p1 --forward < ../../patches/react-native-quick-crypto+1.0.15.patch)
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+          bundler-cache: true
+          working-directory: applications/qnet-mobile
+
+      - name: Install pods
+        run: bundle exec pod install --project-directory=ios
+
+      - name: Build for the simulator
+        run: |
+          set -o pipefail
+          xcodebuild -workspace ios/QNetMobile.xcworkspace -scheme QNetMobile -configuration Release \
+            -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath build CODE_SIGNING_ALLOWED=NO COMPILER_INDEX_STORE_ENABLE=NO \
+            build 2>&1 | tail -n 200
+
+      - name: Keep the build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-build-logs
+          path: applications/qnet-mobile/build/Logs
+          if-no-files-found: ignore

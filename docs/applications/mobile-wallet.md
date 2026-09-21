@@ -381,6 +381,21 @@ Refresh off for the app, is proven only when it is opened. See
 - Cross-language jest pins assert that the JavaScript registry-root fold and the SMT account-proof
   fold reproduce roots emitted by the Rust node, and that the shard-owner derivation matches shards
   the node's `light_shard_of` produced, importing the shipped modules rather than copies.
+- Node transport: `src/config/nodes.js` holds the genesis nodes twice, by address over HTTP and by
+  public name over HTTPS (`node1.aiqnet.io` … `node5.aiqnet.io`, a TLS terminator per node — see the
+  operator guide). `QNET_FORCE_HTTPS=1` at build time selects the names and makes the app HTTPS-only:
+  a discovered node without TLS is left out of the pool (`usableNodeUrl`). iOS needs this, since App
+  Transport Security refuses cleartext to a public host; the Android manifest's cleartext exception
+  goes away with the same switch.
+- iOS: `ITSAppUsesNonExemptEncryption` is `YES` (standard algorithms in the app's own native module),
+  `RCTNewArchEnabled` matches Android (`false`), background tasks are `com.transistorsoft.fetch` and
+  `com.transistorsoft.customtask`, and `PrivacyInfo.xcprivacy` declares the two things a light-node
+  registration leaves on the genesis nodes — the push token and the reward wallet address — as
+  identifiers used for app functionality, not linked, not for tracking. `.github/workflows/ios-build.yml`
+  compiles the simulator build on macOS on every change.
+- Store listings, the review notes and the data-declaration answers for both stores live in
+  `store-listing/`; the privacy policy, terms and support pages the stores link to are at
+  `aiqnet.io/privacy`, `/terms` and `/support`.
 
 ## Related documents
 

@@ -177,7 +177,7 @@ the deliverable (running your own nodes and serving their endpoints publicly is 
 permitted); you may not redistribute modified versions as a substitute for the original; and you
 may not remove or alter copyright, licence or attribution notices. The licence is perpetual with
 no change date, and production use beyond the Additional Use Grant requires a separate commercial
-licence from the licensor.
+licence from the licensor, Orrery Group LLC.
 
 Scope: BSL 1.1 covers `core/`, `development/` (except `development/qnet-sdk/`), `audit/`,
 `governance/`, `deployment/`, `infrastructure/`, `testing/` and `monitoring/`. The client

@@ -1,6 +1,12 @@
+const path = require('path');
+
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   reactStrictMode: false,
+  // The workspace root, stated: with several lockfiles in the repository Next guesses the repository
+  // root instead, and then bundles `pg` from the workspace's node_modules rather than leaving it
+  // external — which breaks every page in development with "Can't resolve 'fs'".
+  outputFileTracingRoot: path.join(__dirname, '..'),
   // Client-side Router Cache: reuse a visited route's payload on back-navigation
   // (instant tab-switch). Live data is refreshed by each page's own client polling.
   experimental: {

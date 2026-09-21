@@ -7,11 +7,8 @@
  * Import from this file: import { GENESIS_NODES, getSolanaRpcUrl } from '../config/nodes';
  */
 
-// Bootstrap genesis nodes. The nodes serve plain HTTP on :8001 (no TLS terminator
-// is deployed). This transport carries only PUBLIC chain data + SIGNED txs — fund
-// safety rests on the Dilithium/Ed25519 signatures, not TLS. Default is HTTP; HTTPS
-// is opt-in (QNET_FORCE_HTTPS=1) for once a real TLS endpoint exists — enabling it
-// without one makes every request fail.
+// Bootstrap genesis nodes. The node itself serves plain HTTP on :8001; this transport carries only
+// PUBLIC chain data + SIGNED txs, so fund safety rests on the ML-DSA-65 signatures, not on TLS.
 export const GENESIS_NODES_HTTP = [
   'http://154.38.160.39:8001',    // Genesis 001
   'http://62.171.157.44:8001',    // Genesis 002
@@ -20,12 +17,16 @@ export const GENESIS_NODES_HTTP = [
   'http://162.244.25.114:8001',   // Genesis 005
 ];
 
+// The same five behind their public names: a TLS terminator on each server in front of :8001, with a
+// certificate for the name (scripts/node-tls.sh). Off by default until every node serves them —
+// QNET_FORCE_HTTPS=1 switches the app to these, and with it to HTTPS only: iOS refuses cleartext to a
+// public host, and Android drops the exception once this is the default.
 export const GENESIS_NODES_HTTPS = [
-  'https://154.38.160.39:8001',
-  'https://62.171.157.44:8001',
-  'https://161.97.86.81:8001',
-  'https://5.189.130.160:8001',
-  'https://162.244.25.114:8001',
+  'https://node1.aiqnet.io',
+  'https://node2.aiqnet.io',
+  'https://node3.aiqnet.io',
+  'https://node4.aiqnet.io',
+  'https://node5.aiqnet.io',
 ];
 
 const _forceHttps = (() => {
@@ -37,6 +38,13 @@ const _forceHttps = (() => {
 })();
 
 export const GENESIS_NODES = _forceHttps ? GENESIS_NODES_HTTPS : GENESIS_NODES_HTTP;
+
+/**
+ * Whether a node URL may be used under the current transport rule. Under HTTPS a discovered node that
+ * only speaks plain HTTP is left out rather than reached: the platform would refuse the request anyway,
+ * and a pool that silently half-fails is worse than a smaller one.
+ */
+export const usableNodeUrl = (url) => !_forceHttps || String(url || '').startsWith('https://');
 
 // The block explorer is the chain's history archive: nodes keep about a day of transactions, the
 // explorer keeps all of them, so the wallet pages its history from here.

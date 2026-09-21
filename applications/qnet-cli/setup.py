@@ -10,7 +10,7 @@ with open("../README.md", "r", encoding="utf-8") as fh:
 setup(
     name="qnet-cli",
     version="0.1.0",
-    author="QNet Team",
+    author="Orrery Group LLC",
     author_email="team@qnet.network",
     description="Command line interface for QNet blockchain",
     long_description=long_description,

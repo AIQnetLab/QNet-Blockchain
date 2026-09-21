@@ -12,9 +12,9 @@ export const metadata: Metadata = {
   title: 'QNet - Post-Quantum Blockchain',
   description: 'Experimental AI-developed blockchain built by one person. No funding. No team. No corporate backing. Just pure determination to prove that a single developer can build a quantum-resistant blockchain that challenges the entire industry.',
   keywords: 'blockchain, quantum-resistant, post-quantum, cryptocurrency, decentralized, QNet',
-  authors: [{ name: 'QNet Developer' }],
-  creator: 'QNet Developer',
-  publisher: 'QNet',
+  authors: [{ name: 'Orrery Group LLC', url: 'https://aiqnet.io' }],
+  creator: 'Orrery Group LLC',
+  publisher: 'Orrery Group LLC',
   robots: 'index, follow',
   icons: {
     icon: [

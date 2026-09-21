@@ -7,7 +7,7 @@ name = "qnet-mempool"
 version = "0.1.0"
 description = "Python bindings for QNet mempool"
 authors = [
-    {name = "QNet Team", email = "team@qnet.io"}
+    {name = "Orrery Group LLC", email = "support@aiqnet.io"}
 ]
 requires-python = ">=3.8"
 classifiers = [

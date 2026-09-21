@@ -2,7 +2,7 @@
 name = "qnet-integration"
 version = "0.1.0"
 edition = "2021"
-authors = ["QNet Team"]
+authors = ["Orrery Group LLC"]
 description = "QNet blockchain integration node"
 license = "BUSL-1.1"
 

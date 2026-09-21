@@ -1,0 +1,103 @@
+APP STORE LISTING — QNet Wallet
+Publisher: Orrery Group LLC (Apple Developer Program, Organization) · Bundle ID: com.qnet.mobile
+
+====================
+NAME (30 chars max)
+====================
+QNet Wallet
+
+====================
+SUBTITLE (30 chars max)
+====================
+Wallet and light node for QNet
+
+====================
+PROMOTIONAL TEXT (170 chars max, editable without a new build)
+====================
+Non-custodial wallet for the QNet network with an optional light node. Keys stay on your device; the network only ever sees what you sign.
+
+====================
+DESCRIPTION (4000 chars max)
+====================
+QNet Wallet is a non-custodial wallet for the QNet network. Keys are created on your iPhone and never leave it. The app has no accounts, no analytics and no tracking.
+
+WALLET
+• Create a wallet or import one from a BIP39 seed phrase
+• Send and receive QNC and QNet tokens; scan QR codes; save a QR code of your address
+• Transaction history that outlives node pruning — every entry opens in the block explorer
+• Filter history by asset
+• Face ID, Touch ID or password unlock
+
+LIGHT NODE (OPTIONAL)
+The app can run a QNet light node. A few times per four-hour epoch the network sends your iPhone a silent status request; the app signs it and answers in the background. The device signs a periodic status request and nothing else — no processing runs between requests. Each epoch's answers are recorded on chain, and that epoch's emission is shared among the nodes that answered. Rewards are claimed from the app as an ordinary on-chain transaction.
+
+Activating a node is an on-chain action you sign yourself. In the current phase it burns 1DEV tokens on Solana; the burned tokens are destroyed, and the publisher receives nothing.
+
+POST-QUANTUM CRYPTOGRAPHY
+Transactions are signed on the device with ML-DSA-65 (NIST FIPS 204). The QNet network's transport uses ML-KEM-768 hybrid key exchange.
+
+OPEN SOURCE
+The app, the browser extension, the explorer and the node are one public repository under the MIT license. Anyone can read exactly what the app does and build it.
+
+LANGUAGES
+English, Chinese (Simplified), Russian, Spanish, French, German, Japanese, Korean, Portuguese, Arabic, Italian.
+
+GOOD TO KNOW
+• QNet is an experimental network at the testnet stage. Tokens may have no monetary value; rewards are decided by the network protocol and are not guaranteed.
+• Your seed phrase is the only backup. Nobody can recover it for you.
+• A light node needs Background App Refresh and the app left running in the background: https://aiqnet.io/support
+
+====================
+KEYWORDS (100 chars max, comma-separated)
+====================
+qnet,wallet,crypto,post-quantum,quantum,node,light node,blockchain,non-custodial,QNC
+
+====================
+URLS
+====================
+Support URL:    https://aiqnet.io/support
+Marketing URL:  https://aiqnet.io/wallet
+Privacy Policy: https://aiqnet.io/privacy
+Copyright:      2026 Orrery Group LLC
+
+====================
+CATEGORY
+====================
+Primary: Finance. Secondary: Utilities.
+
+====================
+AGE RATING
+====================
+Answer the questionnaire truthfully: no gambling, no contests, no unrestricted web access, no user-generated
+content. Cryptocurrency features are not part of the rating questionnaire.
+
+====================
+APP REVIEW INFORMATION — NOTES (paste into App Store Connect; the sign-in section stays empty, there is no account)
+====================
+QNet Wallet is a non-custodial wallet for the QNet network, published by Orrery Group LLC (an organization
+account). There is no sign-in: a wallet is created from a seed phrase on the device.
+
+A test wallet with a QNC balance and an already activated light node is provided below so every screen
+can be reached: Assets (send/receive/history), Receive, Node (status and reward claim), Activate.
+  Seed phrase:   <provided at submission, never committed>
+  Password:      <provided at submission>
+
+About the light node: the device signs a periodic status request from the network — no computation is
+performed on the device, and nothing runs between requests. The request arrives as a silent push
+(content-available) and is answered in the background. Rewards are protocol emission recorded on chain,
+shared among the nodes that answered in an epoch, and claimed as an ordinary on-chain transaction; the
+app offers no currency for tasks and has no referral programme.
+
+About activation: activating a node is an on-chain registration the user signs. In the current phase it
+burns 1DEV tokens the user already holds on Solana; the tokens are destroyed — the publisher receives
+nothing and sells nothing. The app sells no digital goods and has no in-app purchases. The network is at
+the testnet stage; the app says so.
+
+Encryption: ML-DSA-65 signatures, ML-KEM-768 and AES — standard algorithms (NIST FIPS 203/204/197)
+implemented in the app, not proprietary ones. ITSAppUsesNonExemptEncryption is set to YES.
+
+====================
+NOT PREPARED YET
+====================
+Screenshots for 6.9" and 6.5" iPhones (and 13" iPad if iPad is enabled — consider iPhone-only for the
+first release). Store-listing translations (English only at launch).

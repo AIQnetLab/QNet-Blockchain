@@ -4,9 +4,7 @@ import React from 'react';
 
 export default function QNetWalletExtensionPage() {
   const handleDownload = () => {
-    // In production, this would link to Chrome Web Store
-    // For now, show development instructions
-    alert('QNet Wallet Extension will be available on Chrome Web Store soon!\n\nFor development: Load the extension from applications/qnet-wallet/ folder.');
+    window.open('https://chromewebstore.google.com/detail/qnet-wallet/pahnggomgmhhjjncgfnmmofmplfhkncg', '_blank', 'noopener,noreferrer');
   };
 
   return (
@@ -19,7 +17,7 @@ export default function QNetWalletExtensionPage() {
               QNet Wallet Extension
             </h1>
             <p className="text-xl text-gray-300 max-w-2xl mx-auto">
-              The official QNet blockchain wallet. Manage your 1DEV tokens, activate nodes, and earn rewards - all in one secure extension.
+              The QNet wallet for the browser: hold and send QNC and QNet tokens, with keys that never leave your browser. Nodes are activated from the mobile app.
             </p>
           </div>
 
@@ -35,17 +33,17 @@ export default function QNetWalletExtensionPage() {
 
             <div className="bg-gray-800 bg-opacity-50 p-6 rounded-lg border border-cyan-500 border-opacity-30">
               <div className="text-4xl mb-4">⚡</div>
-              <h3 className="text-xl font-semibold mb-3">One-Click Activation</h3>
+              <h3 className="text-xl font-semibold mb-3">Verified Balances</h3>
               <p className="text-gray-300">
-                Activate QNet nodes with a single click. Choose from Light, Full, or Super node types.
+                A balance comes with the node&apos;s account proof and is checked against the state root before it is shown.
               </p>
             </div>
 
             <div className="bg-gray-800 bg-opacity-50 p-6 rounded-lg border border-cyan-500 border-opacity-30">
               <div className="text-4xl mb-4">💰</div>
-              <h3 className="text-xl font-semibold mb-3">Reward Tracking</h3>
+              <h3 className="text-xl font-semibold mb-3">Web3 Provider</h3>
               <p className="text-gray-300">
-                Monitor your node performance and automatically claim rewards every 4 hours.
+                Sites can ask the extension to connect and to sign; every request is shown to you first, and the key stays where it is.
               </p>
             </div>
           </div>

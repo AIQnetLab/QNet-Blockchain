@@ -1,47 +1,31 @@
-QNet Wallet - Decentralized Cryptocurrency Wallet
+QNet Wallet is a non-custodial wallet for the QNet network. Keys are created on your device and never leave it. The app has no accounts, no analytics and no tracking.
 
-QNet Wallet is a secure, open-source mobile wallet for the QNet blockchain ecosystem. Built with privacy and security in mind, it provides users with full control over their digital assets.
+WALLET
+• Create a wallet or import one from a BIP39 seed phrase
+• Send and receive QNC and QNet tokens; scan QR codes; save a QR code of your address
+• Transaction history that outlives node pruning — every entry opens in the block explorer
+• Filter history by asset
+• Fingerprint, face or password unlock
 
-KEY FEATURES:
+LIGHT NODE (OPTIONAL)
+The app can run a QNet light node. A few times per four-hour epoch the network sends your phone a status request; the app signs it and answers from the background, without being opened. The device signs a periodic status request and nothing else — no processing runs between requests. Each epoch's answers are recorded on chain, and that epoch's emission is shared among the nodes that answered. Rewards are claimed from the app as an ordinary on-chain transaction.
 
-🔐 SECURITY FIRST
-• Non-custodial: You own your keys and your crypto
-• BIP39 mnemonic seed phrase support
-• Secure keychain storage on device
-• No tracking, no analytics, no third-party services
+Activating a node is an on-chain action you sign yourself. In the current phase it burns 1DEV tokens on Solana; the burned tokens are destroyed, and the publisher receives nothing.
 
-💰 COMPLETE WALLET FUNCTIONALITY
-• Send and receive QNet tokens
-• Transaction history with detailed information
-• QR code support for easy payments
-• Real-time balance updates
+POST-QUANTUM CRYPTOGRAPHY
+Transactions are signed on the device with ML-DSA-65 (NIST FIPS 204). The QNet network's transport uses ML-KEM-768 hybrid key exchange.
 
-🌍 DECENTRALIZED ARCHITECTURE
-• Direct connection to QNet blockchain nodes
-• No central servers required
-• Byzantine fault-tolerant consensus
-• Quantum-resistant cryptography support
+OPEN SOURCE
+The app, the browser extension, the explorer and the node are one public repository under the MIT license. Anyone can read exactly what the app does and build it.
 
-🚀 PERFORMANCE
-• Fast transaction processing
-• Optimized for mobile devices
-• Low battery consumption
-• Works on older Android devices (Android 5.0+)
+LANGUAGES
+English, Chinese (Simplified), Russian, Spanish, French, German, Japanese, Korean, Portuguese, Arabic, Italian.
 
-OPEN SOURCE & TRANSPARENT
-• Fully auditable code
-• Community-driven development
-• Regular security updates
-• No hidden functionality
+GOOD TO KNOW
+• QNet is an experimental network at the testnet stage. Tokens may have no monetary value; rewards are decided by the network protocol and are not guaranteed.
+• Your seed phrase is the only backup. Nobody can recover it for you.
+• A light node needs the app to stay installed and allowed to run in the background: https://aiqnet.io/support
 
-PRIVACY FOCUSED
-• No personal data collection
-• No KYC requirements
-• Optional privacy features
-• Local-only data storage
-
-QNet Wallet puts you in full control of your digital assets while maintaining the highest standards of security and privacy.
-
-SOURCE CODE: https://github.com/AIQnetLab/QNet-Blockchain
-LICENSE: Apache-2.0
-
+Privacy policy: https://aiqnet.io/privacy
+Terms of use: https://aiqnet.io/terms
+Support: support@aiqnet.io · https://aiqnet.io/support

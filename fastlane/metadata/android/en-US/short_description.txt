@@ -1,2 +1,1 @@
-Secure, decentralized cryptocurrency wallet for QNet blockchain
-
+Non-custodial post-quantum wallet with an optional light node

@@ -10,7 +10,7 @@ import nacl from 'tweetnacl'; // Ed25519 signing for node operations
 import * as Keychain from 'react-native-keychain';
 // v3.35: Centralized node configuration (no duplication!)
 // v4.10: Added getSolanaRpcUrl for centralized Solana RPC management
-import { GENESIS_NODES, NODE_DISCOVERY, getRandomGenesisNode, getSolanaRpcUrl, rotateSolanaRpc } from '../config/nodes';
+import { GENESIS_NODES, NODE_DISCOVERY, getRandomGenesisNode, getSolanaRpcUrl, rotateSolanaRpc, usableNodeUrl } from '../config/nodes';
 // Post-quantum BFT light-client: trustless committee-QC state-root verification
 // (replaces the MITM-bypassable 2/3 peer-poll). MITM-proof at any network size.
 import { verifyMacroblockStateRoot, verifyLogInclusion, verifyLogWindowInclusion, verifyMacroblockLogsRoot, transferLogLeaf } from '../crypto/QcLightClient';
@@ -3005,7 +3005,7 @@ export class WalletManager {
     if (cache && cache.length > 0) {
       const now = Math.floor(Date.now() / 1000);
       const eligible = (n) => (now - (n.lastSeen || 0)) < NODE_DISCOVERY.MAX_STALE_SECS
-        && n.reputation >= NODE_DISCOVERY.MIN_REPUTATION && n.isSynced !== false;
+        && n.reputation >= NODE_DISCOVERY.MIN_REPUTATION && n.isSynced !== false && usableNodeUrl(n.url);
       pool = cache.filter(n => eligible(n) && !this._recentlyFailed(n.url));
       if (pool.length === 0) pool = cache.filter(eligible);   // relax if all transiently marked bad
     }
@@ -3410,7 +3410,8 @@ export class WalletManager {
       const filtered = WalletManager.discoveredNodesCache
         .filter(n => {
           const age = currentTime - (n.lastSeen || 0);
-          return age < NODE_DISCOVERY.MAX_STALE_SECS && n.reputation >= NODE_DISCOVERY.MIN_REPUTATION && n.isSynced !== false;
+          return age < NODE_DISCOVERY.MAX_STALE_SECS && n.reputation >= NODE_DISCOVERY.MIN_REPUTATION
+            && n.isSynced !== false && usableNodeUrl(n.url);
         })
         .sort((a, b) => b.reputation - a.reputation) // Sorted by blockchain reputation
         .slice(0, 20)

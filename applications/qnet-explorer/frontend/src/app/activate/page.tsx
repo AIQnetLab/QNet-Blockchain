@@ -272,16 +272,16 @@ export default function ActivatePage() {
               }}>
                 {selectedNodeType === 'light' && (
                   <>
-                    <div>• Ping interval: every 4 h (mobile)</div>
-                    <div>• Response rate: 100%</div>
+                    <div>• Answers a status request a few times per 4 h epoch</div>
+                    <div>• An epoch counts when the device answered in it</div>
                     <div>• Up to 3 devices per node</div>
                     <div>• Battery-friendly design</div>
                   </>
                 )}
                 {selectedNodeType === 'super' && (
                   <>
-                    <div>• Ping interval: every 4 min</div>
-                    <div>• Response rate: ≥ 98%</div>
+                    <div>• Signed heartbeats every second while running</div>
+                    <div>• Eligible for an epoch when its heartbeats cover most of it</div>
                     <div>• Backbone routing priority</div>
                     <div>• High-performance hardware</div>
                   </>

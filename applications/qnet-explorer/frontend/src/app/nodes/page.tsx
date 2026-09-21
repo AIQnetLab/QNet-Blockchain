@@ -80,24 +80,7 @@ export default function NodesPage() {
           </p>
         </div>
 
-        <div className="network-stats compact">
-          <div className="stat-card">
-            <div className="stat-number">148</div>
-            <div className="stat-label">Online Nodes</div>
-          </div>
-          <div className="stat-card">
-            <div className="stat-number">94.9%</div>
-            <div className="stat-label">Network Health</div>
-          </div>
-          <div className="stat-card">
-            <div className="stat-number">40+</div>
-            <div className="stat-label">Reputation Req</div>
-          </div>
-          <div className="stat-card">
-            <div className="stat-number">6</div>
-            <div className="stat-label">Regions</div>
-          </div>
-        </div>
+        {/* Live node counts are on the home page and in the explorer; nothing invented is shown here. */}
 
         <div className="explorer-tabs">
           <div className="tabs-nav">
@@ -149,8 +132,8 @@ export default function NodesPage() {
                     
                     <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
                       <div style={{ fontSize: '0.85rem', lineHeight: '1.4', whiteSpace: 'nowrap', textAlign: 'center' }}>
-                        {selectedNodeType === 'light' && '• Ping: 4h • Uptime: 99% • Devices: ≤3 • Low Power'}
-                        {selectedNodeType === 'super' && '• Ping: 4min • Uptime: ≥98% • Backbone • High Perf'}
+                        {selectedNodeType === 'light' && '• Answers a status request a few times per 4 h epoch • Up to 3 devices per node • Low power'}
+                        {selectedNodeType === 'super' && '• Signed heartbeats every second • Eligible when its heartbeats cover most of the epoch • Public server, static address'}
                       </div>
 
                       <div style={{ 

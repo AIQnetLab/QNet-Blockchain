@@ -2,6 +2,21 @@
 
 use super::*;
 
+/// The URL a device answers this node's ping at. The public HTTPS name when the operator set one
+/// (`QNET_PUBLIC_RPC_URL`, a TLS terminator in front of :8001), otherwise the plain address. A phone
+/// whose platform refuses cleartext to a public host can only answer the former.
+fn public_rpc_url() -> String {
+    if let Ok(u) = std::env::var("QNET_PUBLIC_RPC_URL") {
+        let u = u.trim().trim_end_matches('/');
+        if !u.is_empty() { return u.to_string(); }
+    }
+    let bid = std::env::var("QNET_BOOTSTRAP_ID").unwrap_or_default();
+    crate::genesis_constants::GENESIS_NODE_IPS.iter()
+        .find(|(_, id)| *id == bid)
+        .map(|(ip, _)| format!("http://{}:8001", ip))
+        .unwrap_or_default()
+}
+
 pub(super) async fn handle_light_node_token_refresh(
     remote_addr: Option<std::net::SocketAddr>,
     req:         TokenRefreshRequest,
@@ -2539,14 +2554,7 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
                                         .map(|(token, _, _)| token);
 
                                     if let Some(real_token) = real_token_opt {
-                                        let our_response_url = {
-                                            use crate::genesis_constants::GENESIS_NODE_IPS;
-                                            let bid = std::env::var("QNET_BOOTSTRAP_ID").unwrap_or_default();
-                                            GENESIS_NODE_IPS.iter()
-                                                .find(|(_, id)| *id == bid)
-                                                .map(|(ip, _)| format!("http://{}:8001", ip))
-                                                .unwrap_or_default()
-                                        };
+                                        let our_response_url = public_rpc_url();
                                         let fcm = FCMPushService::new();
                                         match fcm.send_ping_notification(&real_token, &light_node.node_id, &challenge, &our_response_url).await {
                                             Ok(()) => {
@@ -2597,14 +2605,7 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
                                 crate::unified_p2p::PushType::UnifiedPush => {
                                     // UnifiedPush notification (F-Droid users)
                                     if let Some(endpoint) = &light_node.unified_push_endpoint {
-                                        let up_response_url = {
-                                            use crate::genesis_constants::GENESIS_NODE_IPS;
-                                            let bid = std::env::var("QNET_BOOTSTRAP_ID").unwrap_or_default();
-                                            GENESIS_NODE_IPS.iter()
-                                                .find(|(_, id)| *id == bid)
-                                                .map(|(ip, _)| format!("http://{}:8001", ip))
-                                                .unwrap_or_default()
-                                        };
+                                        let up_response_url = public_rpc_url();
                                         let client = reqwest::Client::new();
                                         let payload = serde_json::json!({
                                             "action": "ping_response",

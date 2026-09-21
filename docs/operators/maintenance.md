@@ -181,6 +181,20 @@ RocksDB), 90 % fatal. A fatal reading is re-measured 30 s later, and only if it 
 minutes of the previous one, up to 120 s. A Super node below 4 GB of RAM (`MIN_RAM_SERVER_MB = 4000`) refuses to
 start unless `QNET_SKIP_RAM_CHECK` is set, and then logs `[CRIT][MEMORY] INSUFFICIENT_RAM`.
 
+## Public HTTPS endpoint
+
+The node's RPC is plain HTTP on `:8001`. A phone platform that refuses cleartext to a public host — iOS
+does, and the Android build will once the exception is dropped — can only reach a node through a TLS
+name. `scripts/node-tls.sh` puts that in front of each genesis node: a Caddy container in host network
+mode terminating `https://node1.aiqnet.io` … `node5.aiqnet.io` on 443 and proxying to `127.0.0.1:8001`,
+with a Let's Encrypt certificate Caddy obtains and renews itself. The node container is not touched.
+
+Order: the node's A record must resolve to its server first (ACME validates over 80/443 of the name; the
+script refuses to start a terminator the name does not point at), then `./node-tls.sh 001 … 005`, then
+`QNET_PUBLIC_RPC_URL=https://nodeN.aiqnet.io` in the node's environment at its next roll
+(`QNET_SET_ENV=QNET_PUBLIC_RPC_URL=… ./deploy-genesis.sh 00N`). That variable is what the node writes
+into a light-node ping as the address to answer at; without it the ping still names `http://IP:8001`.
+
 ## Backup and restore
 
 **The identity secret is the BIP39 mnemonic, and nothing else.** The node's ML-DSA-65 keypair is derived

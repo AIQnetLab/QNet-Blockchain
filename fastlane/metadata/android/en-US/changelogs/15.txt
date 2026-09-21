@@ -1,0 +1,5 @@
+• One full-screen result for every transaction: send, token transfer, reward claim, node activation
+• A send the network did not answer in time now waits for the chain instead of reporting a failure, and can never charge twice
+• Transfers to your own address show as such
+• History survives node pruning, opens each entry in the explorer, and can be filtered by asset
+• Network side: a node's answer counts for the epoch it was pinged in, even when it arrives late

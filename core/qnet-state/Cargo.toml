@@ -2,7 +2,7 @@
 name = "qnet-state"
 version = "0.1.0"
 edition = "2021"
-authors = ["QNet Team"]
+authors = ["Orrery Group LLC"]
 description = "State management for QNet blockchain"
 license = "BUSL-1.1"
 
