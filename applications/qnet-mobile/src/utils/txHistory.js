@@ -159,3 +159,13 @@ export function appendHistory(prev, older) {
 export function cacheableHistory(rows) {
   return rows.filter((t) => t.status === 'confirmed').slice(0, HISTORY_CACHE_MAX);
 }
+
+/**
+ * Does a row belong to the selected asset filter: 'all', 'qnc' (native and node lifecycle) or a token
+ * contract. Filtering is local to the rows already held — the feed itself stays one paged list.
+ */
+export function matchesAsset(row, asset) {
+  if (!asset || asset === 'all') return true;
+  if (asset === 'qnc') return !row.tokenContract;
+  return lc(row.tokenContract) === lc(asset);
+}

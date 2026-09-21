@@ -42,6 +42,9 @@ export const GENESIS_NODES = _forceHttps ? GENESIS_NODES_HTTPS : GENESIS_NODES_H
 // explorer keeps all of them, so the wallet pages its history from here.
 export const EXPLORER_API = 'https://aiqnet.io';
 
+/** Public page of one transaction. One source, so a moved path is changed in one place. */
+export const explorerTxUrl = (hash) => `${EXPLORER_API}/explorer/tx/${encodeURIComponent(hash || '')}`;
+
 /**
  * The genesis nodes that own a light node's shard, in the order the chain ranks them.
  *

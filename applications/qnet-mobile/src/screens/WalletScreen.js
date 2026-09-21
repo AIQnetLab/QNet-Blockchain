@@ -38,8 +38,10 @@ import {
   isTokenRefreshNeeded,
   teardownLightNode,
 } from '../services/PushService';
-import { getRandomGenesisNode, EXPLORER_API } from '../config/nodes';
+import { getRandomGenesisNode, EXPLORER_API, explorerTxUrl } from '../config/nodes';
+import TxResultCard from '../components/TxResultCard';
 import {
+  matchesAsset,
   HISTORY_PAGE, EXPLORER_REFRESH_MS, fmtTokenBaseUnits, historyRowKey, tokenRowFromEvent, splitExplorerItems,
   mergeHistory, appendHistory, cacheableHistory,
 } from '../utils/txHistory';
@@ -145,7 +147,7 @@ function TxCoinMark({ token }) {
 // Canonical burn address (matches core CANONICAL_BURN_ADDR) — a transfer here is a 🔥 burn.
 const CANONICAL_BURN_ADDR = '0000000000000000000eon00000000000000036877022';
 
-const TxRow = React.memo(function TxRow({ tx, onCopy, hideAmounts }) {
+const TxRow = React.memo(function TxRow({ tx, onCopy, onOpen, hideAmounts }) {
   // Node lifecycle row. Sourced from the permanent node registry, not the tx index — the registration
   // TX is pruned with all other transactions after ~28 h, which is why a wallet whose only history was
   // its own activation went blank. Carries no amount and no counterparty, so it renders its own way.
@@ -201,9 +203,11 @@ const TxRow = React.memo(function TxRow({ tx, onCopy, hideAmounts }) {
           return `${p(d.getDate())}.${p(d.getMonth() + 1)}.${d.getFullYear()}, ${p(d.getHours())}:${p(d.getMinutes())}`;
         })();
   return (
+    // A pending row is not in the explorer yet, so it copies instead of opening a page that has nothing.
     <TouchableOpacity
       style={{ backgroundColor: '#16213e', borderRadius: 12, padding: 16, marginBottom: 12, borderWidth: 1, borderColor: tx.status === 'pending' ? '#ffaa00' : '#1a1a2e' }}
-      onPress={() => onCopy(tx.hash)}
+      onPress={() => (tx.status === 'pending' ? onCopy(tx.hash) : onOpen(tx.hash))}
+      onLongPress={() => onCopy(tx.hash)}
     >
       {/* One line on any screen: both sides shrink their text to fit instead of the amount dropping below. */}
       <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
@@ -343,6 +347,7 @@ const WalletScreen = () => {
   const explorerHistoryAtRef = useRef(0);     // last explorer first-page request (ms): background refreshes are throttled
   const historyLoadingOlderRef = useRef(false);
   const [historyLoadingOlder, setHistoryLoadingOlder] = useState(false);
+  const [historyAsset, setHistoryAsset] = useState('all');   // 'all' | 'qnc' | token contract
   // v3.27: Track Merkle proof verification status for trustless display
   const [balanceVerified, setBalanceVerified] = useState(false);
   const [language, setLanguage] = useState('en');
@@ -423,7 +428,15 @@ const WalletScreen = () => {
     setCustomAlert({ title, message, buttons, richContent });
   };
 
-  // Stable copy handler for TxRow — setCustomAlert is stable, so the FlatList rows never re-bind onPress.
+  // Stable handlers for TxRow — setCustomAlert is stable, so the FlatList rows never re-bind onPress.
+  const handleOpenTx = React.useCallback((hash) => {
+    if (!hash) return;
+    Linking.openURL(explorerTxUrl(hash)).catch(() => {
+      Clipboard.setString(hash);
+      setCustomAlert({ title: 'Copied', message: 'Transaction hash copied', buttons: [{ text: 'OK', onPress: () => {} }], richContent: null });
+    });
+  }, []);
+
   const handleCopyTxHash = React.useCallback((hash) => {
     if (!hash) return;
     Clipboard.setString(hash);
@@ -1318,11 +1331,17 @@ const WalletScreen = () => {
           try { await loadLightNodeStatus(result.pseudonym, nodeType); } catch (_) {}
           showAlert(
             'Node Restored!',
-            `Your existing ${nodeType} node has been reactivated and restored.\n\nNode ID: ${activationInputCode.trim()}\nSystem ID: ${result.pseudonym}`,
+            '',
             [{ text: 'OK', onPress: () => {
               setShowActivationInput(false);
               setActivationInputCode('');
-            }}]
+            }}],
+            <TxResultCard
+              ok
+              note={`Your existing ${nodeType} node has been reactivated and restored.\n\nNode ID: ${activationInputCode.trim()}\nSystem ID: ${result.pseudonym}`}
+              hash={result.onChainTxHash}
+              onCopied={() => showAlert('Copied', 'Transaction hash copied to clipboard')}
+            />
           );
         } else {
           // Fresh activation: self-attest NOW so this-epoch eligibility is recorded even when the
@@ -1336,11 +1355,17 @@ const WalletScreen = () => {
             : `Your ${nodeType} node has been successfully activated and registered in the network.`;
           showAlert(
             'Node Activated!',
-            `${activatedText}\n\nNode ID: ${activationInputCode.trim()}\nSystem ID: ${result.pseudonym}`,
+            '',
             [{ text: 'OK', onPress: () => {
               setShowActivationInput(false);
               setActivationInputCode('');
-            }}]
+            }}],
+            <TxResultCard
+              ok
+              note={`${activatedText}\n\nNode ID: ${activationInputCode.trim()}\nSystem ID: ${result.pseudonym}`}
+              hash={result.onChainTxHash}
+              onCopied={() => showAlert('Copied', 'Transaction hash copied to clipboard')}
+            />
           );
         }
       } else {
@@ -1919,60 +1944,33 @@ const WalletScreen = () => {
         // The batch actually submitted (result.amount is QNC), not the displayed pending figure.
         const claimedAmount = Number(result.amount || 0).toFixed(4);
         
-        // v2.80: Rich content with clickable transaction hash
-        const richContent = (
-          <View style={{ paddingHorizontal: 16, paddingVertical: 12 }}>
-            <Text style={[styles.modalContent, { textAlign: 'center', marginBottom: 16 }]}>
-              Claim for {claimedAmount} QNC from your {activatedNodeType} node submitted - credited when included.
-              {result.stoppedAtEpoch != null ? `\n\nThis claim stopped at epoch ${result.stoppedAtEpoch} - claim again once it is credited to collect anything later.` : ''}
-            </Text>
-            <Text style={[styles.modalContent, { textAlign: 'center', marginBottom: 8, fontSize: 12, color: '#888' }]}>
-              Transaction:
-            </Text>
-            <TouchableOpacity 
-              onPress={() => {
-                const explorerUrl = `https://explorer.qnet.network/tx/${result.txHash}`;
-                Linking.openURL(explorerUrl).catch(() => {
-                  Clipboard.setString(result.txHash);
-                  showAlert('Copied', 'Transaction hash copied to clipboard');
-                });
-              }}
-              style={{ backgroundColor: 'rgba(0, 255, 255, 0.1)', padding: 12, borderRadius: 8, borderWidth: 1, borderColor: '#00ffff40' }}
-            >
-              <Text style={{ color: '#00ffff', fontSize: 12, fontFamily: 'monospace', textAlign: 'center' }}>
-                {result.txHash?.slice(0, 20)}...{result.txHash?.slice(-20)}
-              </Text>
-              <Text style={{ color: '#888', fontSize: 10, textAlign: 'center', marginTop: 4 }}>
-                Tap to open in Explorer
-              </Text>
-            </TouchableOpacity>
-          </View>
-        );
-        
+        const stopped = result.stoppedAtEpoch != null
+          ? `This claim stopped at epoch ${result.stoppedAtEpoch} — claim again once it is credited to collect anything later.`
+          : 'Credited once a block includes it.';
         showAlert(
-          'Claim Submitted',
-          '', // Empty - using richContent
-          [
-            { text: 'Copy Hash', style: 'default', onPress: () => {
-              Clipboard.setString(result.txHash);
-              showAlert('Copied', 'Transaction hash copied to clipboard');
-            }},
-            { text: 'OK', onPress: () => {
-              // Reload server node status (will show updated pending rewards)
-              loadServerNodeStatus();
-              // Reload balance
-              if (wallet && wallet.publicKey) {
-                loadBalance(wallet.publicKey);
-              }
-            }}
-          ],
-          richContent
+          'Claim submitted',
+          '',
+          [{ text: 'OK', onPress: () => {
+            loadServerNodeStatus();
+            if (wallet && wallet.publicKey) loadBalance(wallet.publicKey);
+          }}],
+          <TxResultCard
+            ok
+            amount={claimedAmount}
+            symbol="QNC"
+            note={stopped}
+            hash={result.txHash}
+            onCopied={() => showAlert('Copied', 'Transaction hash copied to clipboard')}
+          />
         );
       } else {
-        showAlert('Cannot Claim', result.message);
+        // Nothing was submitted here — the node refused the claim, so it is not a failed transaction.
+        showAlert('Cannot claim', '', [{ text: 'OK', onPress: () => {} }],
+          <TxResultCard ok={false} error={result.message} />);
       }
     } catch (error) {
-      showAlert('Error', 'Failed to claim rewards: ' + error.message);
+      showAlert('Claim failed', '', [{ text: 'OK', onPress: () => {} }],
+        <TxResultCard ok={false} error={error.message} />);
     } finally {
       setProcessingValidation(false);
     }
@@ -4541,50 +4539,17 @@ const WalletScreen = () => {
               >
                 {/* No header on the result screen: the ✓/✕ icon + title convey the outcome and the
                     Done button dismisses — the redundant "← Back / Success" bar is removed. */}
-                <View style={styles.txResultContainer}>
-                  {txResult.success ? (
-                    <>
-                      <View style={styles.txSuccessIcon}>
-                        <Text style={styles.txSuccessIconText}>✓</Text>
-                      </View>
-                      <Text style={styles.txResultTitle}>Transaction Sent!</Text>
-                      <Text style={styles.txResultAmount} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.5}>
-                        {txResult.amount} {txResult.symbol}
-                      </Text>
-                      <Text style={styles.txResultTo}>
-                        To: {txResult.to?.substring(0, 12)}...{txResult.to?.substring(txResult.to.length - 8)}
-                      </Text>
-                      <TouchableOpacity
-                        style={styles.txHashContainer}
-                        activeOpacity={0.7}
-                        onPress={() => {
-                          if (txResult.txHash) {
-                            Clipboard.setString(txResult.txHash);
-                            showAlert('Copied', 'Transaction hash copied to clipboard');
-                          }
-                        }}
-                      >
-                        <Text style={styles.txHashLabel}>Transaction Hash (tap to copy)</Text>
-                        <Text style={styles.txHashValue}>{txResult.txHash?.substring(0, 24)}...</Text>
-                      </TouchableOpacity>
-                    </>
-                  ) : (
-                    <>
-                      <View style={styles.txErrorIcon}>
-                        <Text style={styles.txErrorIconText}>✕</Text>
-                      </View>
-                      <Text style={styles.txResultTitle}>Transaction Failed</Text>
-                      <Text style={styles.txErrorMessage}>{txResult.error}</Text>
-                    </>
-                  )}
-                  
-                  <TouchableOpacity 
-                    style={styles.txDoneButton}
-                    onPress={closeSendScreen}
-                  >
-                    <Text style={styles.txDoneButtonText}>Done</Text>
-                  </TouchableOpacity>
-                </View>
+                <TxResultCard
+                  ok={!!txResult.success}
+                  title={txResult.success ? 'Transaction Sent!' : 'Transaction Failed'}
+                  amount={txResult.amount}
+                  symbol={txResult.symbol}
+                  counterparty={txResult.to}
+                  hash={txResult.txHash}
+                  error={txResult.error}
+                  onAction={closeSendScreen}
+                  onCopied={() => showAlert('Copied', 'Transaction hash copied to clipboard')}
+                />
               </ScrollView>
               )} />
             );
@@ -5742,9 +5707,19 @@ const WalletScreen = () => {
           )} />
         );
 
-      case 'history':
+      case 'history': {
+        // Filtering is local to the rows already held: one paged feed, no extra request per filter.
+        const assetChips = [{ key: 'all', label: 'All' }, { key: 'qnc', label: 'QNC' }];
+        const seen = new Set();
+        for (const t of txHistory) {
+          const c = t.tokenContract;
+          if (!c || seen.has(c.toLowerCase())) continue;
+          seen.add(c.toLowerCase());
+          assetChips.push({ key: c, label: t.tokenSymbol || 'Token' });
+        }
+        const shown = txHistory.filter((t) => matchesAsset(t, historyAsset));
         return (
-          <TabBox key="history" deps={[txHistory, refreshing, balancesHidden, historyLoadingOlder]} render={() => (
+          <TabBox key="history" deps={[txHistory, refreshing, balancesHidden, historyLoadingOlder, historyAsset]} render={() => (
           <FlatList
             key="history-tab"
             style={styles.content}
@@ -5752,11 +5727,30 @@ const WalletScreen = () => {
               styles.scrollContentContainer,
               Platform.OS === 'ios' && { paddingBottom: 50 }
             ]}
-            data={txHistory}
+            data={shown}
             extraData={balancesHidden}
             keyExtractor={(tx, index) => (tx.hash ? historyRowKey(tx) : String(index))}
-            renderItem={({ item }) => <TxRow tx={item} onCopy={handleCopyTxHash} hideAmounts={balancesHidden} />}
-            ListHeaderComponent={<Text style={[styles.sectionTitle, { marginBottom: 16 }]}>Transaction History</Text>}
+            renderItem={({ item }) => <TxRow tx={item} onCopy={handleCopyTxHash} onOpen={handleOpenTx} hideAmounts={balancesHidden} />}
+            ListHeaderComponent={
+              <>
+                <Text style={[styles.sectionTitle, { marginBottom: 16 }]}>Transaction History</Text>
+                {assetChips.length > 2 ? (
+                  <View style={styles.historyFilterRow}>
+                    {assetChips.map((c) => (
+                      <TouchableOpacity
+                        key={c.key}
+                        style={[styles.historyChip, historyAsset === c.key && styles.historyChipActive]}
+                        onPress={() => setHistoryAsset(c.key)}
+                      >
+                        <Text style={[styles.historyChipText, historyAsset === c.key && styles.historyChipTextActive]}>
+                          {c.label}
+                        </Text>
+                      </TouchableOpacity>
+                    ))}
+                  </View>
+                ) : null}
+              </>
+            }
             ListEmptyComponent={
               <View style={{ alignItems: 'center', paddingVertical: 40 }}>
                 <Text style={{ color: '#666', fontSize: 16 }}>No transactions yet</Text>
@@ -5789,6 +5783,7 @@ const WalletScreen = () => {
           />
           )} />
         );
+      }
 
       case 'node':
         return (

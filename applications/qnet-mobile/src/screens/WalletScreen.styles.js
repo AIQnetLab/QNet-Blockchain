@@ -1136,6 +1136,45 @@ const styles = StyleSheet.create({
     fontSize: 14,
     fontFamily: 'monospace',
   },
+  txHashHint: {
+    color: '#666',
+    fontSize: 11,
+    marginTop: 6,
+  },
+  txResultNote: {
+    color: '#888',
+    fontSize: 13,
+    textAlign: 'center',
+    marginBottom: 20,
+    paddingHorizontal: 8,
+  },
+  historyFilterRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    marginBottom: 12,
+  },
+  historyChip: {
+    backgroundColor: '#16213e',
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: '#1a1a2e',
+    paddingVertical: 6,
+    paddingHorizontal: 14,
+    marginRight: 8,
+    marginBottom: 8,
+  },
+  historyChipActive: {
+    backgroundColor: 'rgba(0, 212, 255, 0.15)',
+    borderColor: '#00d4ff',
+  },
+  historyChipText: {
+    color: '#888',
+    fontSize: 13,
+    fontWeight: '600',
+  },
+  historyChipTextActive: {
+    color: '#00d4ff',
+  },
   txErrorMessage: {
     color: '#ff6b6b',
     fontSize: 14,

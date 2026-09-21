@@ -6138,6 +6138,8 @@ export class WalletManager {
         nextPingWindow: registrationResult ? registrationResult.next_ping_window : null,
         quantumSecured,
         onChainPending,
+        // The registration transaction, so the activation result links to it like any other.
+        onChainTxHash: (registrationResult && registrationResult.onchain_tx_hash) || null,
         onChainError: (registrationResult && registrationResult.onchain_error) || null,
         pendingRegistration: !registrationResult
       };
