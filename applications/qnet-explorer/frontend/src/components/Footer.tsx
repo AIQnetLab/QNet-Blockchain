@@ -1,7 +1,6 @@
 'use client';
 
 import React, { memo } from 'react';
-import Link from 'next/link';
 
 const FooterComponent = () => {
   return (
@@ -21,12 +20,7 @@ const FooterComponent = () => {
             <a href="https://t.me/AiQnetLab" target="_blank" rel="noopener noreferrer" className="social-link">
               <div className="social-icon" style={{ backgroundColor: '#00ffff', maskImage: `url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M21.192 2.012a2.033 2.033 0 0 0-1.806-.415L2.14 8.71c-1.25.485-1.234 1.748.022 2.086l4.69 1.407 10.95-6.57-8.312 7.493-.588 4.542a1.49 1.49 0 0 0 1.42 1.482 1.49 1.49 0 0 0 .61-.13l2.364-1.182 4.418 3.26a1.488 1.488 0 0 0 2.21-.76l3.582-16.73A2.033 2.033 0 0 0 21.192 2.012z"></path></svg>')` }} />
             </a>
-          </div>
-          {/* Store badges return here once the listings are live; a badge that opens a missing page is a broken promise. */}
-          <div style={{ display: 'flex', gap: '1rem', justifyContent: 'center', marginTop: '0.5rem', fontSize: '0.85rem' }}>
-            <Link href="/privacy">Privacy</Link>
-            <Link href="/terms">Terms</Link>
-            <Link href="/support">Support</Link>
+            {/* The App Store and Google Play badges return here once the listings are live. */}
           </div>
         </div>
         <div className="footer-right">

@@ -43,6 +43,8 @@ const HeaderComponent = () => {
     { href: '/wallet', label: 'Wallet' },
     { href: '/docs', label: 'Docs' },
     { href: '/privacy', label: 'Privacy' },
+    { href: '/terms', label: 'Terms' },
+    { href: '/support', label: 'Support' },
   ];
 
   // Explorer subdomain navigation (minimal)
