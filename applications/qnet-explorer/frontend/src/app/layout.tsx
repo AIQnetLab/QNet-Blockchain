@@ -10,7 +10,7 @@ import type { Metadata, Viewport } from 'next';
 
 export const metadata: Metadata = {
   title: 'QNet - Post-Quantum Blockchain',
-  description: 'Experimental AI-developed blockchain built by one person. No funding. No team. No corporate backing. Just pure determination to prove that a single developer can build a quantum-resistant blockchain that challenges the entire industry.',
+  description: 'An experimental blockchain designed by one person and built with AI assistance. No funding. No team. No corporate backing. The architecture and every protocol decision are one person\'s; the code is written with AI tools under that direction.',
   keywords: 'blockchain, quantum-resistant, post-quantum, cryptocurrency, decentralized, QNet',
   authors: [{ name: 'Orrery Group LLC', url: 'https://aiqnet.io' }],
   creator: 'Orrery Group LLC',

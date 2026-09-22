@@ -7,8 +7,10 @@
  * Import from this file: import { GENESIS_NODES, getSolanaRpcUrl } from '../config/nodes';
  */
 
-// Bootstrap genesis nodes. The node itself serves plain HTTP on :8001; this transport carries only
-// PUBLIC chain data + SIGNED txs, so fund safety rests on the ML-DSA-65 signatures, not on TLS.
+// The genesis nodes by address. A node itself serves plain HTTP on :8001; this transport carries only
+// PUBLIC chain data + SIGNED txs, so fund safety rests on the ML-DSA-65 signatures, not on TLS. The
+// app no longer talks to these directly — they are kept as the key for `publicNodeUrl` and for
+// development against a node with no terminator.
 export const GENESIS_NODES_HTTP = [
   'http://154.38.160.39:8001',    // Genesis 001
   'http://62.171.157.44:8001',    // Genesis 002
@@ -18,9 +20,8 @@ export const GENESIS_NODES_HTTP = [
 ];
 
 // The same five behind their public names: a TLS terminator on each server in front of :8001, with a
-// certificate for the name (scripts/node-tls.sh). Off by default until every node serves them —
-// QNET_FORCE_HTTPS=1 switches the app to these, and with it to HTTPS only: iOS refuses cleartext to a
-// public host, and Android drops the exception once this is the default.
+// certificate for the name (scripts/node-tls.sh). This is what the app uses. iOS refuses cleartext to a
+// public host, and the Android manifest carries no cleartext exception, so the app is HTTPS-only.
 export const GENESIS_NODES_HTTPS = [
   'https://node1.aiqnet.io',
   'https://node2.aiqnet.io',
@@ -29,22 +30,25 @@ export const GENESIS_NODES_HTTPS = [
   'https://node5.aiqnet.io',
 ];
 
-const _forceHttps = (() => {
-  try {
-    return typeof process !== 'undefined' && process?.env?.QNET_FORCE_HTTPS === '1';
-  } catch (_) {
-    return false;
-  }
-})();
-
-export const GENESIS_NODES = _forceHttps ? GENESIS_NODES_HTTPS : GENESIS_NODES_HTTP;
+export const GENESIS_NODES = GENESIS_NODES_HTTPS;
 
 /**
- * Whether a node URL may be used under the current transport rule. Under HTTPS a discovered node that
- * only speaks plain HTTP is left out rather than reached: the platform would refuse the request anyway,
- * and a pool that silently half-fails is worse than a smaller one.
+ * Whether a node URL may be used at all: HTTPS only. A discovered node that only speaks plain HTTP is
+ * left out rather than reached — the platform would refuse the request anyway, and a pool that silently
+ * half-fails is worse than a smaller one.
  */
-export const usableNodeUrl = (url) => !_forceHttps || String(url || '').startsWith('https://');
+export const usableNodeUrl = (url) => String(url || '').startsWith('https://');
+
+/**
+ * The address the app actually calls for a URL a node handed it. A genesis node names itself by
+ * address (`http://IP:8001`, e.g. as the place to answer a ping) until its operator sets its public
+ * name; the app knows both forms, so it answers at the name. Anything else comes back unchanged.
+ */
+export function publicNodeUrl(url) {
+  const u = String(url || '').replace(/\/+$/, '');
+  const i = GENESIS_NODES_HTTP.indexOf(u);
+  return i >= 0 ? GENESIS_NODES_HTTPS[i] : url;
+}
 
 // The block explorer is the chain's history archive: nodes keep about a day of transactions, the
 // explorer keeps all of them, so the wallet pages its history from here.

@@ -39,7 +39,7 @@ Therefore:
 | Device or other IDs | Collected (the push token). Purpose: App functionality. Not shared. Optional: no when a light node is activated. Ephemeral: no. |
 | User IDs | Collected (the wallet address bound to a registered node). Purpose: App functionality. Not shared. |
 | Financial info / Personal info / Location / Contacts / App activity / Diagnostics | Not collected. |
-| Data encrypted in transit | Yes once the app talks to the nodes over HTTPS (`QNET_FORCE_HTTPS=1`, see `src/config/nodes.js`); until then the node connections are HTTP and the answer must be "no". |
+| Data encrypted in transit | Yes — every connection is HTTPS: the nodes by their public names (`src/config/nodes.js`), the explorer, the Solana RPC. |
 | Can users request deletion | Yes — support@aiqnet.io deletes the push token and node registration on request; on-chain data cannot be deleted by anyone, and the policy says so. |
 | Independent security review | No. |
 
@@ -75,6 +75,5 @@ not engaged: the device signs a status request and computes nothing.
 - Screenshots from the current build for every required device class.
 - The test wallet for review: a funded wallet with an activated light node, seed and password handed over
   inside the store consoles only — never in this repository.
-- Node connections over HTTPS (`QNET_FORCE_HTTPS=1`, `usesCleartextTraffic` removed on Android) so the
-  iOS build works under App Transport Security and the Data safety answer on encryption in transit is
-  "yes".
+- Node connections are HTTPS-only already (public names, no cleartext exception on Android), which is
+  what App Transport Security on iOS requires and what the "encrypted in transit" answer rests on.

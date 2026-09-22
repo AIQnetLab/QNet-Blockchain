@@ -8,7 +8,7 @@ import messaging from '@react-native-firebase/messaging';
 import BackgroundFetch from 'react-native-background-fetch';
 import { AppState, Platform } from 'react-native';
 // v3.35: Centralized node configuration (no duplication!)
-import { GENESIS_NODES, getRandomGenesisNode, lightShardOwnerUrls } from '../config/nodes';
+import { GENESIS_NODES, getRandomGenesisNode, lightShardOwnerUrls, publicNodeUrl } from '../config/nodes';
 
 // Push types
 export const PushType = {
@@ -451,7 +451,8 @@ async function answerChallenge(pingNodeId, challenge, responseUrl, deadline) {
               // Presented so the node can verify the delegation against the hash the chain committed.
               const identityPk = await AsyncStorage.getItem(`qnet_identity_pk_${pingNodeId}`);
 
-              const apiUrl = responseUrl || await getRandomBootstrapNodeAsync();
+              // The ping names the node to answer, by address; the answer goes to that node's public name.
+              const apiUrl = publicNodeUrl(responseUrl) || await getRandomBootstrapNodeAsync();
               // Capped after the Keychain read and the signing, which take their own share of the wake.
               const timeoutMs = Math.min(RESPONSE_MS, deadline - Date.now());
               if (timeoutMs < SELF_ATTEST_MIN_POST_MS) return false;

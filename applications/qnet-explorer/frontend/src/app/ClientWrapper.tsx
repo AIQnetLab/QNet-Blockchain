@@ -243,13 +243,14 @@ export default function ClientWrapper({
                   <div className="hero-text">
                     <h1 className="hero-title">
                       <span className="title-main">Quantum Network</span>
-                      <span className="subtitle">Experimental AI-developed blockchain built by one person</span>
+                      <span className="subtitle">An experimental blockchain designed by one person and built with AI assistance</span>
                     </h1>
-                    
+
                     <div className="hero-description">
                       <p>
-                        No funding. No team. No corporate backing. Just pure determination to prove that 
-                        a single developer can build a quantum-resistant blockchain that challenges the entire industry.
+                        No funding. No team. No corporate backing. The architecture and every protocol decision are one
+                        person&apos;s; the code is written with AI tools under that direction — to prove that a single
+                        developer can build a quantum-resistant blockchain that challenges the entire industry.
                       </p>
                     </div>
                     

@@ -381,12 +381,13 @@ Refresh off for the app, is proven only when it is opened. See
 - Cross-language jest pins assert that the JavaScript registry-root fold and the SMT account-proof
   fold reproduce roots emitted by the Rust node, and that the shard-owner derivation matches shards
   the node's `light_shard_of` produced, importing the shipped modules rather than copies.
-- Node transport: `src/config/nodes.js` holds the genesis nodes twice, by address over HTTP and by
-  public name over HTTPS (`node1.aiqnet.io` … `node5.aiqnet.io`, a TLS terminator per node — see the
-  operator guide). `QNET_FORCE_HTTPS=1` at build time selects the names and makes the app HTTPS-only:
-  a discovered node without TLS is left out of the pool (`usableNodeUrl`). iOS needs this, since App
-  Transport Security refuses cleartext to a public host; the Android manifest's cleartext exception
-  goes away with the same switch.
+- Node transport is HTTPS only. `src/config/nodes.js` names the genesis nodes by their public names
+  (`node1.aiqnet.io` … `node5.aiqnet.io`, a TLS terminator per node — see the operator guide) and keeps
+  their addresses only as the key for `publicNodeUrl`: a ping still names the node to answer by
+  `http://IP:8001` until the operator sets `QNET_PUBLIC_RPC_URL`, and the app answers at the name. A
+  discovered node without TLS is left out of the pool (`usableNodeUrl`). iOS needs this, since App
+  Transport Security refuses cleartext to a public host; the Android manifest carries no cleartext
+  exception.
 - iOS: `ITSAppUsesNonExemptEncryption` is `YES` (standard algorithms in the app's own native module),
   `RCTNewArchEnabled` matches Android (`false`), background tasks are `com.transistorsoft.fetch` and
   `com.transistorsoft.customtask`, and `PrivacyInfo.xcprivacy` declares the two things a light-node

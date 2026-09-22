@@ -10,7 +10,7 @@ import nacl from 'tweetnacl'; // Ed25519 signing for node operations
 import * as Keychain from 'react-native-keychain';
 // v3.35: Centralized node configuration (no duplication!)
 // v4.10: Added getSolanaRpcUrl for centralized Solana RPC management
-import { GENESIS_NODES, NODE_DISCOVERY, getRandomGenesisNode, getSolanaRpcUrl, rotateSolanaRpc, usableNodeUrl } from '../config/nodes';
+import { GENESIS_NODES, NODE_DISCOVERY, getRandomGenesisNode, getSolanaRpcUrl, rotateSolanaRpc, usableNodeUrl, publicNodeUrl } from '../config/nodes';
 // Post-quantum BFT light-client: trustless committee-QC state-root verification
 // (replaces the MITM-bypassable 2/3 peer-poll). MITM-proof at any network size.
 import { verifyMacroblockStateRoot, verifyLogInclusion, verifyLogWindowInclusion, verifyMacroblockLogsRoot, transferLogLeaf } from '../crypto/QcLightClient';
@@ -2896,7 +2896,7 @@ export class WalletManager {
               const discoveredNodes = data.peers
                 .filter(peer => peer.address && peer.address.includes(':'))
                 .map(peer => ({
-                  url: peer.address.startsWith('http') ? peer.address : `http://${peer.address}`,
+                  url: publicNodeUrl(peer.address.startsWith('http') ? peer.address : `http://${peer.address}`),
                   nodeType: peer.node_type,
                   reputation: peer.reputation || 0, // v3.13: Store reputation!
                   lastSeen: Date.now()
@@ -3365,7 +3365,8 @@ export class WalletManager {
           const nodes = data.validators
             .filter(v => v.address && v.is_active && v.reputation >= NODE_DISCOVERY.MIN_REPUTATION && v.is_synced !== false)
             .map(v => ({
-              url: v.address.startsWith('http') ? v.address : `http://${v.address}`,
+              // A genesis node advertises its address; the pool keeps it by its public name (HTTPS).
+              url: publicNodeUrl(v.address.startsWith('http') ? v.address : `http://${v.address}`),
               reputation: v.reputation, // BLOCKCHAIN reputation - verified by proof!
               nodeType: v.node_type,
               nodeId: v.node_id,
@@ -4260,7 +4261,7 @@ export class WalletManager {
               (peer.reputation || 0) >= MIN_REPUTATION
             )
             .map(peer => ({
-              url: peer.address.startsWith('http') ? peer.address : `http://${peer.address}`,
+              url: publicNodeUrl(peer.address.startsWith('http') ? peer.address : `http://${peer.address}`),
               reputation: peer.reputation,
               nodeType: peer.node_type,
               lastSeen: Date.now()
