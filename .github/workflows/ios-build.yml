@@ -54,12 +54,31 @@ jobs:
           xcodebuild -workspace ios/QNetMobile.xcworkspace -scheme QNetMobile -configuration Release \
             -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
             -derivedDataPath build CODE_SIGNING_ALLOWED=NO COMPILER_INDEX_STORE_ENABLE=NO \
-            build 2>&1 | tail -n 200
+            build 2>&1 | tee xcodebuild.log | tail -n 200
+
+      # The job summary is readable without signing in to GitHub, the raw log is not: on failure the
+      # compiler errors and the tail of the log go there, so a failed run explains itself to anyone.
+      - name: Summarise the failure
+        if: failure()
+        run: |
+          {
+            echo '## xcodebuild failed'
+            echo '### errors'
+            echo '```'
+            grep -E '(error:|fatal error:|\*\* BUILD FAILED|The following build commands failed)' xcodebuild.log | sort -u | head -n 80
+            echo '```'
+            echo '### last 120 lines'
+            echo '```'
+            tail -n 120 xcodebuild.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Keep the build log on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: ios-build-logs
-          path: applications/qnet-mobile/build/Logs
+          path: |
+            applications/qnet-mobile/xcodebuild.log
+            applications/qnet-mobile/build/Logs
           if-no-files-found: ignore

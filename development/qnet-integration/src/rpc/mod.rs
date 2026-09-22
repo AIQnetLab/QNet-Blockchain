@@ -633,6 +633,30 @@ fn is_private_ip(ip: &IpAddr) -> bool {
     }
 }
 
+/// The client a request came from, seen through the TLS terminator on this host. A loopback peer
+/// carrying X-Forwarded-For is that proxy speaking for someone else, and the client is the address it
+/// appended — the last one, so a value the client wrote into the header itself is never taken. Every
+/// other peer is what the socket says. Without this every proxied request would look like localhost,
+/// which the limiter whitelists, and the per-address limits would not exist for the public at all.
+fn client_addr() -> impl Filter<Extract = (Option<std::net::SocketAddr>,), Error = Rejection> + Clone {
+    warp::addr::remote()
+        .and(warp::header::optional::<String>("x-forwarded-for"))
+        .map(|peer: Option<std::net::SocketAddr>, xff: Option<String>| forwarded_client(peer, xff.as_deref()))
+}
+
+/// Port 0 marks a forwarded address; every consumer keys on the IP alone.
+fn forwarded_client(peer: Option<std::net::SocketAddr>, xff: Option<&str>) -> Option<std::net::SocketAddr> {
+    let p = peer?;
+    if !p.ip().is_loopback() { return Some(p); }
+    let Some(last) = xff.and_then(|h| h.rsplit(',').next()).map(str::trim).filter(|s| !s.is_empty()) else {
+        return Some(p);
+    };
+    match last.trim_start_matches('[').trim_end_matches(']').parse::<IpAddr>() {
+        Ok(ip) => Some(std::net::SocketAddr::new(ip, 0)),
+        Err(_) => Some(p),
+    }
+}
+
 /// Helper function to check rate limit and return error response if exceeded
 /// Bypasses rate limit for: whitelisted IPs, valid API keys
 fn check_api_rate_limit(ip: Option<std::net::SocketAddr>, endpoint_type: &str) -> Result<(), warp::reply::Json> {
@@ -1154,7 +1178,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::post())
         .and(warp::body::content_length_limit(1024 * 1024)) // 1MB max
         .and(warp::body::json())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(warp::header::optional::<String>("x-api-key"))
         .and(blockchain_filter.clone())
         .and_then(|request: RpcRequest, remote_addr: Option<std::net::SocketAddr>, api_key: Option<String>, blockchain: Arc<BlockchainNode>| async move {
@@ -1174,7 +1198,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::post())
         .and(warp::body::content_length_limit(1024 * 1024)) // 1MB max
         .and(warp::body::json())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(warp::header::optional::<String>("x-api-key"))
         .and(blockchain_filter.clone())
         .and_then(|request: RpcRequest, remote_addr: Option<std::net::SocketAddr>, api_key: Option<String>, blockchain: Arc<BlockchainNode>| async move {
@@ -1198,7 +1222,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("height"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(|remote_addr: Option<std::net::SocketAddr>, blockchain: Arc<BlockchainNode>| async move {
             // v3.19: Rate limiting for DDoS protection
@@ -1322,7 +1346,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::end())
         .and(warp::get())
         .and(warp::query::<BlockHeadersQuery>())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(warp::header::optional::<String>("x-api-key"))
         .and(blockchain_filter.clone())
         .and_then(handle_block_headers);
@@ -1333,7 +1357,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::end())
         .and(warp::get())
         .and(warp::query::<ArchiveListQuery>())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(warp::header::optional::<String>("x-api-key"))
         .and(blockchain_filter.clone())
         .and_then(handle_archive_list);
@@ -1343,7 +1367,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::param::<u64>())
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(warp::header::optional::<String>("x-api-key"))
         .and(blockchain_filter.clone())
         .and_then(handle_archive_segment);
@@ -1364,7 +1388,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("balance"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_account_balance);
     
@@ -1376,7 +1400,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("proof"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_account_balance_with_proof);
 
@@ -1389,7 +1413,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("proof"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_token_balance_with_proof);
 
@@ -1399,7 +1423,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("proof"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_validators_with_proof);
     
@@ -1409,7 +1433,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("transactions"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_account_transactions);
 
@@ -1424,7 +1448,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::end())
         .and(warp::get())
         .and(warp::query::<LeafsetQuery>())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_epoch_leafset);
 
@@ -1437,7 +1461,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("node-events"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_account_node_events);
 
@@ -1450,7 +1474,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::end())
         .and(warp::get())
         .and(warp::query::<TokenTransfersQuery>())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_account_token_transfers);
 
@@ -1462,7 +1486,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::end())
         .and(warp::get())
         .and(warp::query::<TokenTransfersQuery>())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_token_transfers);
 
@@ -1472,7 +1496,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::end())
         .and(warp::get())
         .and(warp::query::<TokenTransfersRangeQuery>())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_token_transfers_range);
 
@@ -1483,7 +1507,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::end())
         .and(warp::get())
         .and(warp::query::<LogProofQuery>())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_log_proof);
 
@@ -1515,7 +1539,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("latest"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_block_latest);
     
@@ -1524,7 +1548,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::param::<u64>())
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_block_by_height);
 
@@ -1535,7 +1559,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("block"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_genesis_block);
 
@@ -1545,7 +1569,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::param::<String>())
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_block_by_hash);
     
@@ -1555,7 +1579,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::param::<u64>())
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_macroblock_by_index);
 
@@ -1566,7 +1590,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("proof"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_macroblock_proof);
 
@@ -1577,7 +1601,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::param::<u64>())
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_registry_height);
 
@@ -1588,7 +1612,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("consensus-position"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_debug_consensus_position);
     
@@ -1599,7 +1623,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("latest"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(warp::query::<std::collections::HashMap<String, String>>())
         .and(blockchain_filter.clone())
         .and_then(handle_snapshot_latest);
@@ -1610,7 +1634,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::param::<u64>())
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_snapshot_download);
 
@@ -1621,7 +1645,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("manifest"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_snapshot_manifest);
 
@@ -1633,7 +1657,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::param::<usize>())
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_snapshot_chunk);
 
@@ -1649,7 +1673,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::post())
         .and(warp::body::content_length_limit(64 * 1024)) // 64KB max
         .and(warp::body::json())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_transaction_submit);
     
@@ -1661,7 +1685,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::post())
         .and(warp::body::content_length_limit(128 * 1024)) // 128KB (Dilithium sig is large)
         .and(warp::body::json())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_node_registration_client_submit);
 
@@ -1673,7 +1697,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::post())
         .and(warp::body::content_length_limit(16 * 1024)) // 16KB max
         .and(warp::body::json())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_node_reactivation_submit);
 
@@ -1683,7 +1707,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::param::<String>())
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_transaction_get);
     
@@ -1693,7 +1717,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("status"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_mempool_status);
     
@@ -1702,7 +1726,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("transactions"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(warp::query::<HashMap<String, String>>())
         .and(blockchain_filter.clone())
         .and_then(handle_mempool_transactions);
@@ -1716,7 +1740,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::post())
         .and(warp::body::content_length_limit(256 * 1024)) // 256 KB max bundle payload
         .and(warp::body::json())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_bundle_submit);
 
@@ -1726,7 +1750,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("status"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_bundle_status);
 
@@ -1735,7 +1759,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::param::<String>())
         .and(warp::path::end())
         .and(warp::delete())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_bundle_cancel);
     
@@ -1750,7 +1774,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("peers"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(warp::header::headers_cloned())
         .and(blockchain_filter.clone())
         .and_then(|remote_addr: Option<std::net::SocketAddr>, _headers: warp::http::HeaderMap, blockchain: Arc<BlockchainNode>| async move {
@@ -1862,7 +1886,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::post())
         .and(warp::body::content_length_limit(256 * 1024)) // 256 KB max batch payload
         .and(warp::body::json())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_batch_transfer);
     
@@ -1873,7 +1897,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("discovery"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_node_discovery);
 
@@ -1882,7 +1906,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("health"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_node_health);
 
@@ -1893,7 +1917,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("recommendations"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_gas_recommendations);
     
@@ -1906,7 +1930,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::post())
         .and(warp::body::content_length_limit(16 * 1024)) // 16KB max
         .and(warp::body::json())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_auth_challenge);
 
@@ -1918,7 +1942,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::post())
         .and(warp::body::content_length_limit(16 * 1024)) // 16KB max
         .and(warp::body::json())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_network_ping);
 
@@ -1930,7 +1954,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::post())
         .and(warp::body::content_length_limit(64 * 1024)) // 64KB max
         .and(warp::body::json())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_light_node_register);
 
@@ -1941,7 +1965,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::end())
         .and(warp::get())
         .and(warp::query::<HashMap<String, String>>())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_light_node_ping_response);
 
@@ -1958,7 +1982,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         // paths with it. 64 KB matches light-node/register, which carries the same cert.
         .and(warp::body::content_length_limit(64 * 1024))
         .and(warp::body::json::<HashMap<String, String>>())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_light_node_ping_response);
 
@@ -1970,7 +1994,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::end())
         .and(warp::get())
         .and(warp::query::<HashMap<String, String>>())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_light_node_status);
 
@@ -2017,7 +2041,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         // many unclaimed epochs would be rejected by the filter before the handler ever sees it.
         .and(warp::body::content_length_limit(256 * 1024))
         .and(warp::body::json())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_claim_rewards);
     
@@ -2028,7 +2052,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::param::<String>()) // node_id
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_get_pending_rewards);
     
@@ -2040,7 +2064,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::end())
         .and(warp::get())
         .and(warp::query::<RewardHistoryQuery>()) // ?offset=0&limit=10
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_get_reward_history);
     
@@ -2051,7 +2075,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::param::<String>()) // node_id
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_get_reward_pools);
     
@@ -2062,7 +2086,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::param::<String>()) // wallet_address
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_get_rewards_by_wallet);
     
@@ -2075,7 +2099,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::post())
         .and(warp::body::content_length_limit(64 * 1024)) // 64KB max
         .and(warp::body::json())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_get_pending_rewards_batch);
     
@@ -2086,7 +2110,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("stats"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_get_reward_network_stats);
     
@@ -2097,7 +2121,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::param::<String>()) // node_id
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_get_reward_summary);
     
@@ -2108,7 +2132,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::post())
         .and(warp::body::content_length_limit(64 * 1024))
         .and(warp::body::json())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_register_node);
 
@@ -2130,7 +2154,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::post())
         .and(warp::body::content_length_limit(16 * 1024)) // 16KB max
         .and(warp::body::json())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_generate_activation_code);
 
@@ -2150,7 +2174,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("node-device"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(warp::query::<HashMap<String, String>>())
         .and(blockchain_filter.clone())
         .and_then(handle_node_device_check);
@@ -2163,7 +2187,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::post())
         .and(warp::body::content_length_limit(16 * 1024)) // 16KB max
         .and(warp::body::json())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_register_device);
 
@@ -2174,7 +2198,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::post())
         .and(warp::body::content_length_limit(4 * 1024)) // 4KB max
         .and(warp::body::json())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_graceful_shutdown);
 
@@ -2186,7 +2210,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("failovers"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(warp::query::<HashMap<String, String>>())
         .and(blockchain_filter.clone())
         .and_then(handle_failover_history);
@@ -2197,7 +2221,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("failovers"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(warp::query::<HashMap<String, String>>())
         .and(blockchain_filter.clone())
         .and_then(handle_failover_history);
@@ -2207,7 +2231,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("stats"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_stats);
     
@@ -2217,7 +2241,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("status"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_producer_status);
     
@@ -2227,7 +2251,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("status"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_sync_status);
     
@@ -2241,7 +2265,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("stats"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_public_stats);
     
@@ -2262,7 +2286,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("network"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_network_diagnostics);
 
@@ -2272,7 +2296,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("stats"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_block_statistics);
 
@@ -2282,7 +2306,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("metrics"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_shred_protocol_metrics);
 
@@ -2292,7 +2316,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("metrics"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_parallel_executor_metrics);
 
@@ -2302,7 +2326,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("status"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_pre_execution_status);
 
@@ -2312,7 +2336,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("timeouts"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_adaptive_bft_timeouts);
 
@@ -2322,7 +2346,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("performance"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_performance_metrics);
     
@@ -2332,7 +2356,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("history"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(warp::query::<HashMap<String, String>>())
         .and(blockchain_filter.clone())
         .and_then(handle_reputation_history);
@@ -2348,7 +2372,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::post())
         .and(warp::body::content_length_limit(2 * 1024 * 1024))
         .and(warp::body::json())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_p2p_message);
     
@@ -2362,7 +2386,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::post())
         .and(warp::body::content_length_limit(2 * 1024 * 1024)) // 2MB max (WASM bytecode)
         .and(warp::body::json())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_contract_deploy);
     
@@ -2374,7 +2398,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::post())
         .and(warp::body::content_length_limit(128 * 1024)) // 128KB max
         .and(warp::body::json())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_contract_call);
     
@@ -2384,7 +2408,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::param::<String>())
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_contract_info);
 
@@ -2395,7 +2419,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::end())
         .and(warp::get())
         .and(warp::query::<ContractStateQuery>())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_contract_state);
 
@@ -2406,7 +2430,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::end())
         .and(warp::get())
         .and(warp::query::<ContractLogsQuery>())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_contract_logs);
 
@@ -2418,7 +2442,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::post())
         .and(warp::body::content_length_limit(128 * 1024)) // 128KB max
         .and(warp::body::json())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_contract_estimate_gas);
     
@@ -2430,7 +2454,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::post())
         .and(warp::body::content_length_limit(128 * 1024)) // 128KB max
         .and(warp::body::json())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_token_deploy);
 
@@ -2442,7 +2466,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::post())
         .and(warp::body::content_length_limit(128 * 1024)) // 128KB max
         .and(warp::body::json())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_nft_deploy);
 
@@ -2455,7 +2479,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::post())
         .and(warp::body::content_length_limit(1024 * 1024)) // 1MB max (code blobs)
         .and(warp::body::json())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_wasm_deploy);
 
@@ -2495,7 +2519,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("richlist"))
         .and(warp::path::end())
         .and(warp::query::<std::collections::HashMap<String, String>>())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(warp::get())
         .and(blockchain_filter.clone())
         .and_then(handle_qnc_richlist);
@@ -2512,7 +2536,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::post())
         .and(warp::body::content_length_limit(64 * 1024)) // 64KB max
         .and(warp::body::json())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_benchmark_start);
 
@@ -2522,7 +2546,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("status"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and_then(handle_benchmark_status);
 
     // GET /api/v1/benchmark/results - Get benchmark results (v10.0: rate-limited)
@@ -2531,7 +2555,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("results"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and_then(handle_benchmark_results);
 
     // POST /api/v1/benchmark/stop - Stop benchmark (v10.0: auth + rate-limited)
@@ -2540,7 +2564,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("stop"))
         .and(warp::path::end())
         .and(warp::post())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and_then(handle_benchmark_stop);
 
     // GET /api/v1/benchmark/presets - Get available presets (v10.0: rate-limited)
@@ -2549,7 +2573,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("presets"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and_then(handle_benchmark_presets);
 
     // Combine benchmark routes
@@ -2672,7 +2696,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("fcm-token-sync"))
         .and(warp::path::end())
         .and(warp::post())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(warp::body::content_length_limit(64 * 1024)) // 64KB max
         .and(warp::body::json())
         .and(blockchain_filter.clone())
@@ -2684,7 +2708,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("fcm-token-get"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(warp::query::<std::collections::HashMap<String, String>>())
         .and(blockchain_filter.clone())
         .and_then(handle_internal_fcm_token_get);
@@ -2695,7 +2719,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("light-ping-keys-get"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(warp::query::<std::collections::HashMap<String, String>>())
         .and(blockchain_filter.clone())
         .and_then(handle_internal_light_ping_keys_get);
@@ -2706,7 +2730,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("token-refresh"))
         .and(warp::path::end())
         .and(warp::post())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(warp::body::content_length_limit(16 * 1024)) // 16KB max
         .and(warp::body::json())
         .and(blockchain_filter.clone())
@@ -2770,7 +2794,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::end())
         .and(warp::ws())
         .and(warp::query::<WsSubscribeQuery>())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .map(|ws: warp::ws::Ws, query: WsSubscribeQuery, remote_addr: Option<std::net::SocketAddr>, blockchain: Arc<BlockchainNode>| {
             // Extract IP for rate limiting
@@ -4606,6 +4630,30 @@ fn verify_challenge_stamp(node_id: &str, challenge: &str) -> bool {
     if expiry < now { return false; }
     let expected = light_challenge_mac(node_id, &nonce, expiry);
     bytes[24..40] == expected[..]
+}
+
+#[cfg(test)]
+mod tests_client_addr {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    fn peer(ip: [u8; 4]) -> Option<SocketAddr> { Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::from(ip)), 40000)) }
+
+    /// Only a loopback peer may be spoken for, and only by the last address in the header — the one the
+    /// terminator appended. A public peer keeps its own address whatever it sends.
+    #[test]
+    fn a_forwarded_address_is_taken_only_from_the_local_proxy() {
+        let lo = peer([127, 0, 0, 1]);
+        assert_eq!(forwarded_client(lo, Some("203.0.113.9")).unwrap().ip().to_string(), "203.0.113.9");
+        assert_eq!(forwarded_client(lo, Some("1.2.3.4, 203.0.113.9")).unwrap().ip().to_string(), "203.0.113.9");
+        assert_eq!(forwarded_client(lo, Some("[2001:db8::7]")).unwrap().ip().to_string(), "2001:db8::7");
+        assert_eq!(forwarded_client(lo, None), lo);
+        assert_eq!(forwarded_client(lo, Some("garbage")), lo);
+        assert_eq!(forwarded_client(lo, Some("")), lo);
+        let public = peer([198, 51, 100, 4]);
+        assert_eq!(forwarded_client(public, Some("127.0.0.1")), public);
+        assert_eq!(forwarded_client(None, Some("203.0.113.9")), None);
+    }
 }
 
 #[cfg(test)]

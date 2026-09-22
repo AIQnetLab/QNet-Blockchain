@@ -189,6 +189,11 @@ name. `scripts/node-tls.sh` puts that in front of each genesis node: a Caddy con
 mode terminating `https://node1.aiqnet.io` … `node5.aiqnet.io` on 443 and proxying to `127.0.0.1:8001`,
 with a Let's Encrypt certificate Caddy obtains and renews itself. The node container is not touched.
 
+Behind the terminator every request reaches the node from 127.0.0.1, an address the per-client rate
+limiter whitelists; the node therefore takes the client address from `X-Forwarded-For` — the last entry,
+the one the proxy appended — but only when the socket peer is loopback. A request that arrives on :8001
+directly is judged by its socket address as before.
+
 Order: the node's A record must resolve to its server first (ACME validates over 80/443 of the name; the
 script refuses to start a terminator the name does not point at), then `./node-tls.sh 001 … 005`, then
 `QNET_PUBLIC_RPC_URL=https://nodeN.aiqnet.io` in the node's environment at its next roll

@@ -45,6 +45,11 @@ is signed. Key sizes are 1952-byte public key, 4032-byte secret key, 3309-byte d
   `1000 * 2^(n-3)` ms, capped at 300,000 ms, persisted across restarts.
 - Biometric unlock stores the wallet **password** (not a key) in the OS keychain under service
   `com.qnet.wallet.biometric`, with `BIOMETRY_CURRENT_SET` and `WHEN_UNLOCKED_THIS_DEVICE_ONLY`.
+- iOS has no wallet password (`WalletManager.DEVICE_AUTH`): the vault secret is 256 random bits generated
+  at create/import and stored in that keychain item with `BIOMETRY_ANY_OR_DEVICE_PASSCODE`, so the wallet
+  unlocks with Face ID, Touch ID or the device passcode and cannot be created on a device without one.
+  Seed export, activation-code export and code generation re-run the same device check. The vault format,
+  the back-off and every signing path are unchanged — only the source of the password differs.
 - A **separate**, randomly seeded ML-DSA-65 keypair is generated at node registration for signing
   liveness pings. Its secret key is stored in the keychain under service `qnet_ping_sk_{node_id}`
   with `AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY`, so a background push handler can answer a challenge

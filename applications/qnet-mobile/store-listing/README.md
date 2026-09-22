@@ -73,7 +73,7 @@ not engaged: the device signs a status request and computes nothing.
 ## Before submission
 
 - Screenshots from the current build for every required device class.
-- The test wallet for review: a funded wallet with an activated light node, seed and password handed over
-  inside the store consoles only — never in this repository.
+- The test wallet for review: a funded wallet with an activated light node, its seed (and, for Google, the
+  Android password) handed over inside the store consoles only — never in this repository.
 - Node connections are HTTPS-only already (public names, no cleartext exception on Android), which is
   what App Transport Security on iOS requires and what the "encrypted in transit" answer rests on.

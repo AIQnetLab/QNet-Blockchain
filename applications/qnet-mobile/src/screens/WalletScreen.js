@@ -288,6 +288,7 @@ const fmtAmount = (value, decimals) =>
 
 const WalletScreen = () => {
   const [walletManager] = useState(() => new WalletManager()); // lazy: construct once, not every render
+  const deviceAuth = WalletManager.DEVICE_AUTH; // iOS: Face ID / Touch ID / passcode seal the vault, no wallet password
   const [hasWallet, setHasWallet] = useState(false);
   const [wallet, setWallet] = useState(null);
   const [balance, setBalance] = useState(0);
@@ -1593,7 +1594,7 @@ const WalletScreen = () => {
       // Pre-wallet onboarding full-screens: back steps in instead of exiting the app,
       // mirroring the in-form Back buttons (import step 2 → step 1, else → landing).
       if (showCreateOptions) {
-        if (showCreateOptions === 'import' && importStep === 2) {
+        if (showCreateOptions === 'import' && importStep === 2 && !deviceAuth) {
           setImportStep(1); setSeedPhrase(''); setPasswordError(''); setTermsAccepted(false);
         } else {
           setShowCreateOptions(false);
@@ -2417,6 +2418,7 @@ const WalletScreen = () => {
 
   const validatePassword = () => {
     setPasswordError('');
+    if (deviceAuth) return true; // no wallet password on iOS: the vault secret is generated and Keychain-held
 
     if (!password || password.length === 0) {
       setPasswordError('Password is required');
@@ -2458,8 +2460,11 @@ const WalletScreen = () => {
       const newWallet = await walletManager.generateWallet();
       setLoading(false);
       
-      // Store temporarily and show seed phrase
-      setTempWallet({ ...newWallet, password });
+      // Store temporarily and show seed phrase. On iOS the vault secret is generated here and held by
+      // the Keychain behind Face ID / Touch ID or the passcode; there is no password to type or lose.
+      const vaultPassword = deviceAuth ? walletManager.generateVaultPassword() : password;
+      if (deviceAuth) setPassword(vaultPassword);
+      setTempWallet({ ...newWallet, password: vaultPassword });
       const words = newWallet.mnemonic.split(' ');
       
       // Select 3 random positions to verify from the 12-word mnemonic  
@@ -2548,7 +2553,19 @@ const WalletScreen = () => {
       setLoading(true);
       
       const imported = await walletManager.importWallet(seedToImport);
-      
+
+      // iOS: a generated vault secret, taken by the Keychain before anything is shown or stored.
+      const vaultPassword = deviceAuth ? walletManager.generateVaultPassword() : password;
+      if (deviceAuth) {
+        if (!(await walletManager.enableBiometricUnlock(vaultPassword))) {
+          setLoading(false);
+          showAlert('Device lock required', 'Set a passcode, Face ID or Touch ID in iOS Settings first — the wallet is protected by it.');
+          return;
+        }
+        setPassword(vaultPassword);
+        setBiometricEnabled(true);
+      }
+
       // Set UI state immediately for instant response
       setSeedPhrase('');
       setWallet(imported);
@@ -2590,17 +2607,17 @@ const WalletScreen = () => {
       
       // Save wallet before showing UI — with quick-crypto PBKDF2 is native (< 1s).
       // Must complete before UI advances: closing app mid-save loses the wallet.
-      await walletManager.storeWallet(imported, password);
+      await walletManager.storeWallet(imported, vaultPassword);
       // Sync activation codes after save
       (async () => {
         // After wallet is saved, sync activation codes
         try {
-          const mnemonic = await walletManager.getEncryptedMnemonic(password);
+          const mnemonic = await walletManager.getEncryptedMnemonic(vaultPassword);
           if (mnemonic) {
             const syncedCodes = await walletManager.syncActivationCodes(
               imported.publicKey,
               mnemonic,
-              password
+              vaultPassword
             );
             if (syncedCodes && Object.keys(syncedCodes).length > 0) {
               const nodeType = Object.keys(syncedCodes)[0];
@@ -2703,6 +2720,13 @@ const WalletScreen = () => {
     setLoading(true);
     const savedWallet = { ...tempWallet };
     delete savedWallet.password;
+    // iOS: the Keychain must take the vault secret before the vault exists — a device with no passcode
+    // refuses it, and a wallet nobody could reopen after the first lock must never be written.
+    if (deviceAuth && !(await walletManager.enableBiometricUnlock(tempWallet.password))) {
+      setLoading(false);
+      showAlert('Device lock required', 'Set a passcode, Face ID or Touch ID in iOS Settings first — the wallet is protected by it.');
+      return;
+    }
     try {
       await walletManager.storeWallet(tempWallet, tempWallet.password);
     } catch (error) {
@@ -2710,6 +2734,7 @@ const WalletScreen = () => {
       showAlert('Error', 'Failed to save wallet: ' + (error.message || 'Unknown error'));
       return;
     }
+    if (deviceAuth) setBiometricEnabled(true);
 
     setShowSeedConfirm(false);
     setTempWallet(null);
@@ -2756,6 +2781,13 @@ const WalletScreen = () => {
     if (!pw) return;
     await _doUnlock(pw);
   };
+
+  // iOS: the lock screen is the Face ID / Touch ID prompt itself. It opens as soon as a sealed wallet
+  // exists and none is open — first launch and every auto-lock alike; a cancelled prompt leaves the
+  // button on screen to repeat it.
+  useEffect(() => {
+    if (deviceAuth && hasWallet && !wallet && lockoutMs <= 0 && !loading) handleBiometricUnlock();
+  }, [hasWallet, wallet]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const unlockWallet = async () => {
     if (lockoutMs > 0) return;
@@ -3619,11 +3651,7 @@ const WalletScreen = () => {
   };
 
   const generateActivationCode = async () => {
-    // Prompt for password to generate/retrieve activation code
-    Alert.prompt(
-      'Enter Password',
-      'Enter your wallet password to generate activation code:',
-      async (password) => {
+    const withPassword = async (password) => {
         if (!password) return;
         
         try {
@@ -3651,28 +3679,36 @@ const WalletScreen = () => {
         } catch (error) {
           showAlert('Error', 'Failed to generate activation code');
         }
-      },
+    };
+    // iOS: a fresh Face ID / passcode check stands in for the password prompt.
+    if (deviceAuth) { withPassword(await walletManager.tryBiometricUnlock()); return; }
+    Alert.prompt(
+      'Enter Password',
+      'Enter your wallet password to generate activation code:',
+      withPassword,
       'secure-text'
     );
   };
 
   const exportSeedPhrase = async () => {
-    if (!exportPassword) {
-      showAlert('Error', 'Please enter your password');
+    // iOS: the phrase is behind a fresh Face ID / passcode check, not a typed password.
+    const pw = deviceAuth ? await walletManager.tryBiometricUnlock() : exportPassword;
+    if (!pw) {
+      if (!deviceAuth) showAlert('Error', 'Please enter your password');
       return;
     }
 
     try {
       // Verify password
-      const passwordValid = await walletManager.verifyPassword(exportPassword);
+      const passwordValid = await walletManager.verifyPassword(pw);
       if (!passwordValid) {
         setExportPassword('');
         showAlert('Error', 'Incorrect password');
         return;
       }
-      
+
       // Get mnemonic from encrypted storage
-      const mnemonic = await walletManager.getEncryptedMnemonic(exportPassword);
+      const mnemonic = await walletManager.getEncryptedMnemonic(pw);
       
       if (!mnemonic) {
         setExportPassword('');
@@ -3712,14 +3748,15 @@ const WalletScreen = () => {
   };
 
   const exportActivationCode = async () => {
-    if (!exportPassword) {
-      showAlert('Error', 'Please enter your password');
+    const pw = deviceAuth ? await walletManager.tryBiometricUnlock() : exportPassword;
+    if (!pw) {
+      if (!deviceAuth) showAlert('Error', 'Please enter your password');
       return;
     }
 
     try {
       // Quick password verification
-      const passwordValid = await walletManager.verifyPassword(exportPassword);
+      const passwordValid = await walletManager.verifyPassword(pw);
       if (!passwordValid) {
         setExportPassword('');
         showAlert('Error', 'Incorrect password');
@@ -3727,7 +3764,7 @@ const WalletScreen = () => {
       }
 
       // Get stored activation codes directly
-      const storedCodes = await walletManager.getStoredActivationCodes(exportPassword);
+      const storedCodes = await walletManager.getStoredActivationCodes(pw);
       
       if (storedCodes && Object.keys(storedCodes).length > 0) {
         // v4.5: Show codes WITH burn_tx_hash + burn_amount (needed for Docker -e)
@@ -4216,8 +4253,11 @@ const WalletScreen = () => {
             keyboardShouldPersistTaps="handled"
           >
             <Text style={styles.title}>Create Wallet</Text>
-            <Text style={styles.subtitle}>Enter a strong password (min 8 characters)</Text>
-            
+            <Text style={styles.subtitle}>
+              {deviceAuth ? 'Protected by Face ID, Touch ID or your device passcode' : 'Enter a strong password (min 8 characters)'}
+            </Text>
+
+            {!deviceAuth && (<>
             <TextInput
               style={[styles.input, passwordError && password.length > 0 && password.length < 8 ? styles.inputError : null]}
               placeholder="Enter password"
@@ -4265,6 +4305,7 @@ const WalletScreen = () => {
                 ✓ Passwords match
               </Text>
             )}
+            </>)}
 
             {passwordError ? (
               <Text style={styles.errorText}>{passwordError}</Text>
@@ -4385,8 +4426,8 @@ const WalletScreen = () => {
     }
 
     if (showCreateOptions === 'import') {
-      // Step 1: Set password
-      if (importStep === 1) {
+      // Step 1: Set password (not on iOS — device authentication seals the vault, so import starts at the seed)
+      if (importStep === 1 && !deviceAuth) {
         return (
           <SafeAreaView 
             style={[styles.container, Platform.OS === 'ios' && {paddingTop: 44}]} 
@@ -4492,7 +4533,7 @@ const WalletScreen = () => {
       }
 
       // Step 2: Enter seed phrase
-      if (importStep === 2) {
+      if (importStep === 2 || deviceAuth) {
         return (
           <SafeAreaView 
             style={[styles.container, Platform.OS === 'ios' && {paddingTop: 44}]} 
@@ -4567,6 +4608,7 @@ const WalletScreen = () => {
               <TouchableOpacity 
                 style={[styles.button, styles.secondaryButton]}
                 onPress={() => {
+                  if (deviceAuth) { setShowCreateOptions(false); setPassword(''); setConfirmPassword(''); } // no step 1 on iOS
                   setImportStep(1);
                   setSeedPhrase('');
                   setPasswordError('');
@@ -4607,6 +4649,31 @@ const WalletScreen = () => {
                 {t('wallet_locked')} {lockoutDisplay}
               </Text>
             </View>
+          ) : deviceAuth ? (
+            /* iOS: the prompt opens by itself (see the effect next to handleBiometricUnlock); the button
+               repeats it after a cancel, and the only other way in is the recovery phrase. */
+            <>
+              {unlockError ? (
+                <Text style={styles.errorText}>{unlockError}</Text>
+              ) : null}
+
+              <TouchableOpacity
+                style={styles.button}
+                onPress={handleBiometricUnlock}
+                disabled={loading}
+              >
+                <Text style={styles.buttonText}>
+                  {loading ? 'Unlocking...' : t('unlock_wallet')}
+                </Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={[styles.button, styles.secondaryButton]}
+                onPress={deleteWallet}
+              >
+                <Text style={[styles.buttonText, styles.secondaryButtonText]}>Restore from recovery phrase</Text>
+              </TouchableOpacity>
+            </>
           ) : (
             <>
               <TextInput
@@ -4624,7 +4691,7 @@ const WalletScreen = () => {
                 <Text style={styles.errorText}>{unlockError}</Text>
               ) : null}
 
-              <TouchableOpacity 
+              <TouchableOpacity
                 style={styles.button}
                 onPress={unlockWallet}
                 disabled={loading}
@@ -6267,14 +6334,17 @@ const WalletScreen = () => {
               <View style={styles.settingGroup}>
                 <Text style={styles.settingGroupTitle}>{t('security_options')}</Text>
                 
-                <TouchableOpacity 
+                {/* iOS has no wallet password to change and device authentication is not optional there. */}
+                {!deviceAuth && (
+                <TouchableOpacity
                   style={styles.actionButton}
                   onPress={() => setShowChangePassword(true)}
                 >
                   <Text style={styles.actionButtonText}>{t('change_password')}</Text>
                 </TouchableOpacity>
+                )}
 
-                {biometricSupported && (
+                {biometricSupported && !deviceAuth && (
                   <TouchableOpacity
                     style={[styles.actionButton, biometricEnabled && { borderColor: '#4caf50', borderWidth: 1 }]}
                     onPress={handleToggleBiometric}
@@ -6707,6 +6777,7 @@ const WalletScreen = () => {
                 {t('recovery_phrase_warning')}
               </Text>
 
+              {!deviceAuth && (
               <TextInput
                 style={styles.input}
                 placeholder={t('enter_password_to_reveal')}
@@ -6715,6 +6786,7 @@ const WalletScreen = () => {
                 value={exportPassword}
                 onChangeText={setExportPassword}
               />
+              )}
             </ScrollView>
 
             <View style={styles.modalActions}>
@@ -6750,6 +6822,7 @@ const WalletScreen = () => {
                 {t('activation_code_warning')}
               </Text>
 
+              {!deviceAuth && (
               <TextInput
                 style={styles.input}
                 placeholder={t('enter_password_to_generate')}
@@ -6758,6 +6831,7 @@ const WalletScreen = () => {
                 value={exportPassword}
                 onChangeText={setExportPassword}
               />
+              )}
             </ScrollView>
 
             <View style={styles.modalActions}>

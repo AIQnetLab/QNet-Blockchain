@@ -1,5 +1,5 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { AppState } from 'react-native'; // Clear in-memory derived key when app backgrounds
+import { AppState, Platform } from 'react-native'; // Clear in-memory derived key when app backgrounds
 import CryptoJS from 'crypto-js'; // Required for generateQNetAddress, generateMnemonic
 import 'react-native-get-random-values'; // Must be imported first — polyfills crypto.getRandomValues
 import { smtFold } from '../crypto/SmtFold'; // pure; shared with the jest proof pin
@@ -2619,8 +2619,25 @@ export class WalletManager {
     } catch { return null; }
   }
 
+  /**
+   * iOS opens the wallet the way every wallet on the platform does: Face ID or Touch ID, with the
+   * device passcode as the fallback, and no wallet password anywhere. The vault is still sealed with a
+   * secret — a generated one the Keychain holds behind that device authentication — so the storage
+   * format and every signing path stay exactly what Android uses with a typed password.
+   */
+  static DEVICE_AUTH = Platform.OS === 'ios';
+  static DEVICE_AUTH_FLAG = 'qnet_device_auth';
+
+  /** A vault secret the user never sees: 256 random bits, base64. */
+  generateVaultPassword() {
+    return Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString('base64');
+  }
+
   async isBiometricEnabled() {
     try {
+      // Under device authentication the Keychain item itself is behind Face ID, so its presence is
+      // tracked separately — reading it here would raise the prompt on every launch.
+      if (WalletManager.DEVICE_AUTH) return (await AsyncStorage.getItem(WalletManager.DEVICE_AUTH_FLAG)) === '1';
       const creds = await Keychain.getGenericPassword({
         service: WalletManager.KEYCHAIN_SERVICE,
       });
@@ -2630,13 +2647,19 @@ export class WalletManager {
 
   async enableBiometricUnlock(password) {
     try {
-      const type = await Keychain.getSupportedBiometryType();
-      if (!type) return false;
+      const deviceAuth = WalletManager.DEVICE_AUTH;
+      if (!deviceAuth && !(await Keychain.getSupportedBiometryType())) return false;
       await Keychain.setGenericPassword('qnet_wallet', password, {
         service: WalletManager.KEYCHAIN_SERVICE,
-        accessControl: Keychain.ACCESS_CONTROL.BIOMETRY_CURRENT_SET,
+        // iOS: biometry of any enrolment, or the passcode when there is none — the write fails on a
+        // device with no passcode at all, which is the one state the wallet must not be created in.
+        // Android: biometrics only, bound to the enrolled set.
+        accessControl: deviceAuth
+          ? Keychain.ACCESS_CONTROL.BIOMETRY_ANY_OR_DEVICE_PASSCODE
+          : Keychain.ACCESS_CONTROL.BIOMETRY_CURRENT_SET,
         accessible: Keychain.ACCESSIBLE.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
       });
+      if (deviceAuth) await AsyncStorage.setItem(WalletManager.DEVICE_AUTH_FLAG, '1');
       return true;
     } catch { return false; }
   }
@@ -2644,6 +2667,7 @@ export class WalletManager {
   async disableBiometricUnlock() {
     try {
       await Keychain.resetGenericPassword({ service: WalletManager.KEYCHAIN_SERVICE });
+      await AsyncStorage.removeItem(WalletManager.DEVICE_AUTH_FLAG);
       return true;
     } catch { return false; }
   }

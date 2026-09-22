@@ -26,7 +26,7 @@ WALLET
 • Send and receive QNC and QNet tokens; scan QR codes; save a QR code of your address
 • Transaction history that outlives node pruning — every entry opens in the block explorer
 • Filter history by asset
-• Face ID, Touch ID or password unlock
+• Unlocks with Face ID, Touch ID or the device passcode — there is no app password
 
 LIGHT NODE (OPTIONAL)
 The app can run a QNet light node. A few times per four-hour epoch the network sends your iPhone a silent status request; the app signs it and answers in the background. The device signs a periodic status request and nothing else — no processing runs between requests. Each epoch's answers are recorded on chain, and that epoch's emission is shared among the nodes that answered. Rewards are claimed from the app as an ordinary on-chain transaction.
@@ -80,7 +80,7 @@ account). There is no sign-in: a wallet is created from a seed phrase on the dev
 A test wallet with a QNC balance and an already activated light node is provided below so every screen
 can be reached: Assets (send/receive/history), Receive, Node (status and reward claim), Activate.
   Seed phrase:   <provided at submission, never committed>
-  Password:      <provided at submission>
+  (No app password: the wallet unlocks with Face ID, Touch ID or the device passcode.)
 
 About the light node: the device signs a periodic status request from the network — no computation is
 performed on the device, and nothing runs between requests. The request arrives as a silent push
