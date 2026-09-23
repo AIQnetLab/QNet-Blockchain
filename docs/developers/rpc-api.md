@@ -342,13 +342,13 @@ are one stored row.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| GET | `/api/v1/account/{address}` | Serialized account. The 1952-byte `dilithium_public_key` is replaced on the wire by a boolean `has_dilithium_pk`. An unknown account yields a zeroed default object. |
+| GET | `/api/v1/account/{address}` | Serialized account. The 1952-byte `dilithium_public_key` is replaced on the wire by a boolean `has_dilithium_pk`. An account the genesis block funded carries `genesis_allocation: true` (on the public testnet: a load-test account with a public key); the field appears once the node has read block 0, which it starts on the first such request. An unknown account yields a zeroed default object. |
 | GET | `/api/v1/account/{address}/balance` | `{address, balance}` in nanoQNC; addresses longer than 64 characters are rejected |
 | GET | `/api/v1/account/{address}/transactions` | First page of up to 50 transactions plus a total count |
 | GET | `/api/v1/account/{address}/node-events` | `{address, count, events[{type: "node_activation", node_id, node_type, height, timestamp, burn_tx}]}` for the wallet's genesis, super and light node ids, read from the node registry rows rather than the transaction index; `timestamp` is 0 once the registering block's body is pruned |
 | GET | `/api/v1/account/{address}/token-transfers?limit=&before=` | `{address, count, transfers[], oldest_available}`, each transfer enriched with symbol, decimals, logo and a `{height:016x}_{log_index:08x}` cursor |
 | GET | `/api/v1/account/{address}/tokens` | QRC-20 holdings. Uses the reverse owns-index when `OWNS_INDEX_READY` is set (`source: "reverse_index"`), otherwise a full account scan (`source: "blockchain_state"`) |
-| GET | `/api/v1/richlist?limit=` | `{success, total_supply_raw, circulating_raw, burned_raw, holder_count, holders[{address, balance_raw, percent}], source}`; `circulating = total_supply − burn-sink balance`. Limit defaults to 100, clamped `1..=500`. |
+| GET | `/api/v1/richlist?limit=` | `{success, total_supply_raw, circulating_raw, burned_raw, holder_count, holder_count_all, genesis_allocations, holders[{address, balance_raw, percent}], source}`; `circulating = total_supply − burn-sink balance`. Accounts funded by the genesis block are left out of `holders` and `holder_count` and reported as `genesis_allocations: {accounts, holding, balance_raw}` (`holding` = those still holding a balance); `holder_count_all` is the raw count. Their balances were never minted into `total_supply`. `genesis_allocations` is null on a node without block 0, which then serves the unfiltered list. The filtered view is recomputed at most every 30 s. Limit defaults to 100, clamped `1..=500`. |
 
 Feed limits: token-transfer feeds default to 50 and are clamped `1..=200`; the `before` cursor must
 be at most 40 characters of hex or underscore.

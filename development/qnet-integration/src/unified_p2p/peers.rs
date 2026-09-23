@@ -2701,6 +2701,15 @@ impl SimplifiedP2P {
                 // without this cap. Consensus-critical handlers (TimeoutVote / commit /
                 // reveal) had their count limits removed in v18 because those are
                 // protocol-driven (not topology-driven) and self-cap via round dedup.
+                //
+                // A copy of an announcement already taken from another peer costs a set lookup and
+                // must not count: every peer relays every node's announcements, so counting copies
+                // charged each relay for the whole network's volume (the cap tripped ~1/h per peer
+                // on six nodes and grows with them). Only a peer's first-seen announces count.
+                let announce_key = format!("{}:{}", node_id, timestamp);
+                if self.seen_announcements.contains(&announce_key) {
+                    return;
+                }
                 let local_h = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
                 if local_h > 0 {
                     let active_count = self.active_full_super_nodes.len();
@@ -2712,7 +2721,6 @@ impl SimplifiedP2P {
 
                 // v9.1: Dedup — skip if already processed this exact announcement.
                 // Prevents 27× redundant Dilithium verification from gossip fan-out.
-                let announce_key = format!("{}:{}", node_id, timestamp);
                 if !self.seen_announcements.insert(announce_key) {
                     return; // Already seen and verified
                 }

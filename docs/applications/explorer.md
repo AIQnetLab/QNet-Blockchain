@@ -175,7 +175,7 @@ identifier; `/api/activity`, for example, allows 600 requests per minute per cli
 | `GET /api/blocks/[hash]` | Block by hash |
 | `GET /api/tx/[hash]` | Transaction by hash; a `BatchTransfers` envelope carries its recipients |
 | `GET /api/tokens`, `GET /api/token/[contract]`, `GET /api/token/[contract]/holders` | Token list, token detail, holders |
-| `GET /api/qnc` | Native QNC rich list, proxied from the node's `/api/v1/richlist` |
+| `GET /api/qnc` | Native QNC rich list, proxied from the node's `/api/v1/richlist`; the genesis-funded load-test accounts come apart as `genesis_allocations` and the QNC page shows them on one line instead of among holders. `GET /api/address/[address]` sets `genesisAllocation` for such an account and the address page says so |
 | `GET /api/network/stats` | Head, totals and emission from the head snapshot, plus Super nodes (distinct `Heartbeat` senders in the last complete 14,400-block epoch) and Light nodes (the largest per-epoch sum of bitmap `eligible_count` over the last three complete epochs), cached 60 s |
 | `GET /api/search`, `GET /api/search/suggest` | Search and type-ahead |
 | `POST /api/faucet/claim` | Testnet faucet dispatch |

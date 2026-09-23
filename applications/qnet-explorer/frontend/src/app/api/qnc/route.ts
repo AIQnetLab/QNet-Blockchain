@@ -30,12 +30,20 @@ export async function GET(request: Request) {
         }))
       : [];
 
+    // Accounts the genesis block funded (on this network: the load-test accounts). The node leaves them
+    // out of holders and holder_count; null when the node could not read block 0.
+    const ga = body.genesis_allocations;
+    const genesis_allocations = ga && typeof ga.accounts === 'number'
+      ? { accounts: ga.accounts, holding: Number(ga.holding) || 0, balance: qnc(ga.balance_raw) }
+      : null;
+
     return NextResponse.json({
       success: true,
       total_supply: qnc(body.total_supply_raw),
       circulating: qnc(body.circulating_raw),
       burned: qnc(body.burned_raw),
       holder_count: typeof body.holder_count === 'number' ? body.holder_count : holders.length,
+      genesis_allocations,
       holders,
       source: body.source || 'node',
     });

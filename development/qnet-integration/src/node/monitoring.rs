@@ -350,90 +350,6 @@ impl BlockchainNode {
         self.storage.load_microblock(height).map_err(|e| QNetError::StorageError(e.to_string()))
     }
     
-    /// Start archive compliance monitoring (MANDATORY enforcement)
-    pub(super) async fn start_archive_compliance_monitoring(&self) {
-        let archive_manager = self.archive_manager.clone();
-        let node_id = self.node_id.clone();
-        let node_type = self.node_type;
-        
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(4 * 3600)); // 4 hours
-            
-            loop {
-                interval.tick().await;
-                
-                println!("[INFO][ARCHIVE] compliance_check_start node={}", node_id);
-                
-                // Enforce compliance (mandatory, not optional)
-                {
-                    let mut manager = archive_manager.write().await;
-                    if let Err(e) = manager.enforce_compliance().await {
-                        println!("[ERR][ARCHIVE] compliance_enforcement_failed err={}", e);
-                    } else {
-                        // Get compliance stats for logging
-                        match manager.get_archive_stats().await {
-                            Ok(stats) => {
-                                println!("[INFO][ARCHIVE] compliance_stats compliant={}/{} non_compliant={} underreplicated={} avg_replicas={:.1}",
-                                         stats.compliant_nodes, stats.total_nodes,
-                                         stats.non_compliant_nodes,
-                                         stats.underreplicated_chunks,
-                                         stats.avg_replicas);
-                                
-                                // Alert if this node is non-compliant
-                                // v3.18: Super node type removed
-                                if stats.non_compliant_nodes > 0 {
-                                    let required_chunks = match node_type {
-                                        NodeType::Super => 8,
-                                        NodeType::Light => 0,
-                                    };
-                                    println!("[WARN][ARCHIVE] compliance_issue non_compliant={}", stats.non_compliant_nodes);
-                                    println!("[INFO][ARCHIVE] required_chunks={} node_type={:?}", required_chunks, node_type);
-                                }
-                            },
-                            Err(e) => println!("[ERR][ARCHIVE] stats_failed err={}", e),
-                        }
-                    }
-                }
-            }
-        });
-        
-        println!("[INFO][ARCHIVE] compliance_monitoring_started interval=4h");
-    }
-    
-    /// Check network size and rebalance archive quotas for small networks
-    pub(super) async fn check_and_rebalance_small_network(&self) {
-        let archive_manager = self.archive_manager.clone();
-        
-        tokio::spawn(async move {
-            // Wait a bit for network discovery
-            tokio::time::sleep(Duration::from_secs(30)).await;
-            
-            let mut manager = archive_manager.write().await;
-            
-            // Validate current network capacity
-            match manager.validate_network_replication_capacity().await {
-                Ok(true) => {
-                    println!("[INFO][ARCHIVE] network_capacity_ok");
-                },
-                Ok(false) => {
-                    println!("[WARN][ARCHIVE] network_capacity_insufficient action=rebalancing");
-                    
-                    // Trigger emergency rebalancing
-                    if let Err(e) = manager.rebalance_for_small_network().await {
-                        println!("[ERR][ARCHIVE] emergency_rebalancing_failed err={}", e);
-                    } else {
-                        println!("[INFO][ARCHIVE] emergency_rebalancing_complete network=small");
-                    }
-                },
-                Err(e) => {
-                    println!("[ERR][ARCHIVE] network_capacity_validation_failed err={}", e);
-                }
-            }
-        });
-        
-        println!("[INFO][ARCHIVE] small_network_rebalancing_scheduled");
-    }
-    
     /// Start storage usage monitoring with automatic cleanup
     pub(super) async fn start_storage_monitoring(&self) {
         let storage = self.storage.clone();
@@ -495,6 +411,11 @@ impl BlockchainNode {
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(300)); // Every 5 minutes
             let mut last_rss_mb: u64 = 0;
+            // Leak signal = the RSS FLOOR rising hour over hour. A 5-minute delta fired on a periodic
+            // one-tick peak (+120-180 MB, released by the next tick) while RSS stayed flat for days; a
+            // floor ignores transient peaks and still climbs with memory that is never released.
+            let mut rss_hour: std::collections::VecDeque<u64> = std::collections::VecDeque::with_capacity(12);
+            let mut prev_hour_floor_mb: u64 = 0;
             
             // ═══════════════════════════════════════════════════════════════════════════════
             // v3.1: FULLY AUTOMATIC MEMORY LIMITS - NO USER INPUT REQUIRED
@@ -697,9 +618,16 @@ db_cache_mb={} db_memtable_mb={} db_readers_mb={} {}",
                     }
                 }
                 
-                // CRITICAL: Warn if memory growing too fast (>100MB in 5 minutes)
-                if delta_mb > 100 {
-                    println!("[WARN][MEMORY] node={} rapid_growth delta_mb={} possible_leak", node_id, delta_mb);
+                // 12 ticks = one hour. Compare each full hour's floor with the previous hour's.
+                rss_hour.push_back(rss_mb);
+                if rss_hour.len() == 12 {
+                    let floor_mb = rss_hour.iter().copied().min().unwrap_or(rss_mb);
+                    if prev_hour_floor_mb > 0 && floor_mb > prev_hour_floor_mb + 256 {
+                        println!("[WARN][MEMORY] node={} rss_floor_rising floor_mb={} prev_floor_mb={} possible_leak",
+                                 node_id, floor_mb, prev_hour_floor_mb);
+                    }
+                    prev_hour_floor_mb = floor_mb;
+                    rss_hour.clear();
                 }
                 
                 // v3.1: DYNAMIC - Warn if RSS > warn_mb (default 60% of system RAM)

@@ -38,7 +38,7 @@ contracts at your own risk. See [SECURITY.md](SECURITY.md) for how to report a v
 | Node types | `Light`, `Super` |
 | Reputation | Binary `{70.0, 0.0}`; `INITIAL_REPUTATION = MIN_CONSENSUS_REPUTATION = 70.0` |
 | State model | Account-based, committed in a state merkle root; RocksDB persistence |
-| Native token | QNC, 9 decimals; `MAX_QNC_SUPPLY = 4_294_967_296` QNC (2^32); genesis supply 0, no premine |
+| Native token | QNC, 9 decimals; `MAX_QNC_SUPPLY = 4_294_967_296` QNC (2^32); genesis supply 0, no premine. The public testnet's genesis also funds 50,000 load-test accounts with 1,000 QNC each, whose keys derive from a public seed; that balance is outside `total_supply`, and the explorer lists it apart |
 | Emission | One emission every `EMISSION_BLOCK_INTERVAL = 14_400` microblocks, split 25% operators / 75% light nodes when both cohorts are non-empty; when either cohort is empty the other receives the whole emission. Rewards are pull-only via signed claims |
 | Transaction fees | Credited in full to the block producer's registered wallet |
 | Smart contracts | WASM contracts execute on the apply path in the deterministic `qnet-vm` interpreter (fuel-metered, float-free), so contract state is part of the state root. QRC-20 and QRC-721 are native transaction arms in the state crate |

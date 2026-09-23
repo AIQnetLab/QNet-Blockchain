@@ -2171,6 +2171,28 @@ mod v32_9_pattern_c_tests {
     }
 
     #[test]
+    fn richlist_skip_set_steps_over_listed_holders() {
+        let (storage, _dir) = open_test_storage();
+        let rows = [("addr_a", 900u64), ("addr_t1", 800), ("addr_t2", 800), ("addr_b", 700), ("addr_c", 10)];
+        let updates: Vec<(String, Option<u64>)> =
+            rows.iter().map(|(a, b)| (a.to_string(), Some(*b))).collect();
+        storage.richlist_reconcile(&updates).expect("reconcile");
+        let skip: std::collections::HashSet<String> =
+            ["addr_t1", "addr_t2", "addr_absent"].iter().map(|s| s.to_string()).collect();
+
+        // The skipped holders outrank addr_b; K still counts only kept rows.
+        assert_eq!(storage.richlist_top_k_skipping(2, &skip).expect("skip"),
+            vec![("addr_a".to_string(), 900), ("addr_b".to_string(), 700)]);
+        assert_eq!(storage.richlist_top_k_skipping(10, &skip).expect("skip all").len(), 3,
+            "a holder below the skipped ones is still reached");
+
+        assert_eq!(storage.richlist_balance_of("addr_t2"), Some(800));
+        assert_eq!(storage.richlist_balance_of("addr_absent"), None, "not a holder");
+        storage.richlist_reconcile(&[("addr_t2".to_string(), None)]).expect("remove");
+        assert_eq!(storage.richlist_balance_of("addr_t2"), None, "removed holder has no balance row");
+    }
+
+    #[test]
     fn rocks_merkle_store_honors_contract() {
         // Phase C fork-guard: the RocksDB MerkleNodeStore must honor put_batch
         // semantics on a REAL DB — leaf_dels remove exactly one leaf, and a

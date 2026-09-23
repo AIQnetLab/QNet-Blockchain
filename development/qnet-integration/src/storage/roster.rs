@@ -533,6 +533,37 @@ impl Storage {
         Ok(out)
     }
 
+    /// Top-K holders like `richlist_top_k`, stepping over the addresses in `skip`. Reads K plus the skipped
+    /// entries ranked above the K-th kept one, so the cost is bounded by `skip`, not by the holder count.
+    pub fn richlist_top_k_skipping(&self, k: usize, skip: &std::collections::HashSet<String>)
+        -> IntegrationResult<Vec<(String, u64)>>
+    {
+        use rocksdb::{IteratorMode, Direction};
+        let cf = self.persistent.db.cf_handle("node_registry")
+            .ok_or_else(|| IntegrationError::StorageError("node_registry column family not found".to_string()))?;
+        let prefix = b"rlst_";
+        let mut out: Vec<(String, u64)> = Vec::with_capacity(k.min(1024));
+        let iter = self.persistent.db.iterator_cf(&cf, IteratorMode::From(prefix, Direction::Forward));
+        for item in iter {
+            if out.len() >= k { break; }
+            let (key, val) = match item { Ok(kv) => kv, Err(_) => break };
+            if !key.starts_with(prefix) { break; }
+            if key.len() <= prefix.len() + 8 { continue; }
+            let addr = match std::str::from_utf8(&key[prefix.len() + 8..]) { Ok(s) => s, Err(_) => continue };
+            if skip.contains(addr) { continue; }
+            let bal = val.get(..8).and_then(|b| b.try_into().ok()).map(u64::from_be_bytes).unwrap_or(0);
+            out.push((addr.to_string(), bal));
+        }
+        Ok(out)
+    }
+
+    /// Balance of `addr` as the rich-list index holds it; None when it is not a holder. O(1).
+    pub fn richlist_balance_of(&self, addr: &str) -> Option<u64> {
+        let cf = self.persistent.db.cf_handle("node_registry")?;
+        self.persistent.db.get_cf(&cf, format!("rlpos_{}", addr).as_bytes()).ok().flatten()
+            .and_then(|v| v.get(..8).and_then(|b| b.try_into().ok()).map(u64::from_be_bytes))
+    }
+
     /// Total rich-list holders (non-contract, non-system, non-burn, balance>0), O(1).
     pub fn richlist_holder_count(&self) -> u64 {
         match self.persistent.db.cf_handle("node_registry") {

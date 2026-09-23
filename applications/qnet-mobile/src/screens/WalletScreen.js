@@ -5167,7 +5167,7 @@ const WalletScreen = () => {
                 {activationPricing 
                   ? activationPricing.phase === 2 
                     ? `Active Nodes: ${(activationPricing.networkSize/1000).toFixed(0)}K • ${activationPricing.multiplier}x multiplier • ${activationPricing.cost} QNC`
-                    : `Dynamic pricing: ${activationPricing.cost} 1DEV`
+                    : `Activation: ${activationPricing.cost} 1DEV, burned`
                   : 'Loading pricing...'}
               </Text>
               <View style={styles.phaseProgress}>
@@ -5375,11 +5375,11 @@ const WalletScreen = () => {
                       }]}>
                         {activationPricing ? `${activationPricing.cost} ${activationPricing.currency}` : '...'}
                       </Text>
-                      {nodeStatus !== 'light' && (
-                        <Text style={[styles.modalContent, { textAlign: 'center', fontSize: 9, marginTop: 2, color: 'rgba(255, 255, 255, 0.5)' }]}>
-                          Tokens will be burned permanently
-                        </Text>
-                      )}
+                      <Text style={[styles.modalContent, { textAlign: 'center', fontSize: 9, marginTop: 2, color: 'rgba(255, 255, 255, 0.5)' }]}>
+                        {activationPricing?.phase === 2
+                          ? 'Not a purchase: the QNC goes to Pool #3, shared by all active nodes.'
+                          : 'Burned, not a purchase: the tokens are destroyed and nobody receives them. Irreversible.'}
+                      </Text>
                     </View>
                     </View>
                   </View>
@@ -6128,7 +6128,7 @@ const WalletScreen = () => {
                   </View>
                   {lightOnChainPending && (
                     <>
-                      <Text style={styles.rewardHint}>Not on chain yet - the node is not earning</Text>
+                      <Text style={styles.rewardHint}>Not on chain yet: the node is not counted</Text>
                       <TouchableOpacity
                         style={[styles.button,{marginTop: 4, marginBottom: 12}, reactivatingNode && styles.buttonDisabled]}
                         onPress={handleRetryRegistration}

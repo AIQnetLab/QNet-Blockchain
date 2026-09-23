@@ -103,7 +103,7 @@ export default function NodesPage() {
               <div className="activation-content" style={{ padding: '0.5rem 1.5rem 1rem' }}>
                 <h3 style={{ fontSize: '1.4rem', marginBottom: '1rem', textAlign: 'center' }}>Node Activation</h3>
                 <p style={{ width: '100%', marginBottom: '1.5rem', color: '#e5e5e5', textAlign: 'center', fontSize: '0.9rem' }}>
-                  Activate your QNet node to join the network and start earning rewards
+                  Activate a node to take part in the network. Nodes that answer the network's checks share each epoch's emission. Activation burns 1DEV; the tokens are destroyed and nobody receives them.
                 </p>
                 
                 <div style={{ width: '100%', padding: '1rem', background: 'rgba(0, 255, 255, 0.05)', borderRadius: '10px', border: '1px solid rgba(0, 255, 255, 0.2)' }}>

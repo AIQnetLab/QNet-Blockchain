@@ -18,11 +18,18 @@ interface QncHolder {
   percent: string;
 }
 
+interface GenesisAllocations {
+  accounts: number;
+  holding: number;
+  balance: string; // exact QNC decimal, no unit
+}
+
 interface QncData {
   total_supply: string;
   circulating: string;
   burned: string;
   holder_count: number;
+  genesis_allocations: GenesisAllocations | null;
   holders: QncHolder[];
 }
 
@@ -163,6 +170,16 @@ export default function QncPage() {
             <span className="detail-label">Holders</span>
             <span className="detail-value">{data.holder_count.toLocaleString('en-US')}</span>
           </div>
+          {data.genesis_allocations && data.genesis_allocations.accounts > 0 && (
+            <div className="detail-row">
+              <span className="detail-label">Load-test accounts</span>
+              <span className="detail-value">
+                {data.genesis_allocations.accounts.toLocaleString('en-US')} accounts funded in the genesis block for
+                stress tests, holding {data.genesis_allocations.balance} QNC. Their keys are public; they are not
+                part of the supply above and are left out of holders and shares.
+              </span>
+            </div>
+          )}
         </div>
       </div>
 

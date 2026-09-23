@@ -91,7 +91,7 @@ Lines worth alerting on directly:
 | `[CRIT][WATCHDOG] chain_stuck …` | the chain-stuck watchdog fired; alert only, the process keeps running |
 | `[CRIT][WATCHDOG] chain_halted …` | the best height known to this node, its own or the network's, has not moved for 300 s — the whole network is stopped; alert only |
 | `[CRIT][WATCHDOG] runtime_stalled …` | the async runtime missed its heartbeat for 2 s or more; logged once per stall from a separate OS thread with tokio's worker, task and queue counts and RocksDB's write-stop, compaction, flush, memtable and L0 state, which `[WARN][PIPELINE] slow_storage_write` also carries; `runtime_recovered` closes the episode |
-| `[INFO][ARCHIVE] compliance_check_start` / `compliance_stats` | the four-hourly archive-replication report; informational, actual retention is governed by the pruning rules below |
+| `[WARN][MEMORY] rss_floor_rising …` | the lowest RSS of the last hour exceeds the previous hour's lowest by more than 256 MB — memory that is not released, as opposed to a periodic peak that the next five-minute sample no longer shows |
 
 Three of these describe how a node handles its own failure. The **error ladder** counts consecutive
 transitions into a recoverable error state and resets on any other transition: at 10 cycles it requests a

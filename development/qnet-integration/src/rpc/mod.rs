@@ -4385,10 +4385,16 @@ async fn handle_account_info(
             // pk-elision. `has_dilithium_pk` is that GROUND TRUTH — never infer it from nonce>=1, because a
             // node-constructed NodeActivation raises the wallet's nonce WITHOUT binding the wallet key.
             let has_dilithium_pk = account.dilithium_public_key.as_ref().map_or(false, |p| p.len() == 1952);
+            // Present only for a genesis-funded (load-test) account, and only once the set is loaded.
+            let genesis_allocation = genesis_allocations_nowait(blockchain.get_storage())
+                .map_or(false, |set| set.contains(&address));
             let mut v = serde_json::to_value(&account).unwrap_or_else(|_| json!({}));
             if let Some(obj) = v.as_object_mut() {
                 obj.remove("dilithium_public_key");
                 obj.insert("has_dilithium_pk".to_string(), json!(has_dilithium_pk));
+                if genesis_allocation {
+                    obj.insert("genesis_allocation".to_string(), json!(true));
+                }
             }
             Ok(warp::reply::json(&v))
         }

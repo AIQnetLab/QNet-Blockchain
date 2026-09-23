@@ -4386,9 +4386,6 @@ pub struct BlockchainNode {
     shard_coordinator: Option<Arc<qnet_sharding::ShardCoordinator>>,
     parallel_validator: Option<Arc<qnet_sharding::ParallelValidator>>,
     
-    // Archive replication manager for distributed storage
-    archive_manager: Arc<tokio::sync::RwLock<crate::archive_manager::ArchiveReplicationManager>>,
-    
     // Reward manager for lazy rewards system
     
     // PRODUCTION v2.96: Track HeartbeatCommitment TXs with confirmation status
@@ -5276,7 +5273,6 @@ impl Clone for BlockchainNode {
             consensus_nonce_storage: self.consensus_nonce_storage.clone(),
             shard_coordinator: self.shard_coordinator.clone(),
             parallel_validator: self.parallel_validator.clone(),
-            archive_manager: self.archive_manager.clone(),
             parallel_executor: self.parallel_executor.clone(),
             adaptive_bft: self.adaptive_bft.clone(),
             pre_execution: self.pre_execution.clone(),

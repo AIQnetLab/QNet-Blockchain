@@ -164,7 +164,7 @@ export default function ActivatePage() {
             maxWidth: "800px",
             margin: "0 auto"
           }}>
-            Activate your QNet node to join the network and start earning rewards
+            Activate a node to take part in the network. Nodes that answer the network's checks share each epoch's emission.
           </p>
           
           <div style={{
@@ -301,6 +301,11 @@ export default function ActivatePage() {
                 </div>
                 <div style={{ fontSize: "0.85rem", color: "#ccc" }}>
                   {currentCostInfo.details}
+                </div>
+                <div style={{ fontSize: "0.85rem", color: "#ccc", marginTop: "8px" }}>
+                  {currentCostInfo.method === 'burn'
+                    ? 'Not a purchase: the 1DEV are destroyed on Solana and nobody receives them — not Orrery Group LLC, not the nodes. The burn transaction is the public registration of the node.'
+                    : 'Not a purchase: the QNC goes to Pool #3 and is shared among all active nodes; the publisher receives nothing.'}
                 </div>
               </div>
             </div>

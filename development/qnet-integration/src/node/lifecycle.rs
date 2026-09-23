@@ -1568,10 +1568,6 @@ impl BlockchainNode {
             None
         };
         
-        // Initialize archive replication manager
-        if is_debug() { println!("[DBG][NODE] archive_manager_init"); }
-        let mut archive_manager = crate::archive_manager::ArchiveReplicationManager::new();
-        
         // Initialize reward manager with Genesis timestamp
         if is_debug() { println!("[DBG][NODE] rewards_system_init"); }
         
@@ -1615,32 +1611,6 @@ impl BlockchainNode {
         // This enables dynamic pricing in quantum_crypto.rs
         crate::set_genesis_timestamp(genesis_timestamp);
         if is_info() { println!("[INFO][PRICING] init genesis_ts={}", genesis_timestamp); }
-        
-        
-        // Get node IP for archive registration - use ENV or auto-detect
-        let node_ip = match std::env::var("QNET_PUBLIC_IP") {
-            Ok(ip) => format!("{}:{}", ip, p2p_port),
-            Err(_) => {
-                // PRODUCTION: Auto-detect public IP or use P2P discovered address
-                // For now, fallback to local for development only
-                if std::env::var("QNET_PRODUCTION").unwrap_or_default() == "1" {
-                    if is_warn() { println!("[WARN][NODE] public_ip_not_set"); }
-                }
-                format!("0.0.0.0:{}", p2p_port) // Listen on all interfaces
-            }
-        };
-        
-        // Register node for MANDATORY archival responsibilities (no choice)
-        if let Err(e) = archive_manager.register_archive_node(&node_id, node_type, &node_ip).await {
-            if is_warn() { println!("[WARN][NODE] archive_reg_fail err={}", e); }
-        } else {
-            // v3.18: Super node type removed
-            let quota = match node_type {
-                NodeType::Light => 0,
-                NodeType::Super => 8,
-            };
-            if is_info() { println!("[INFO][NODE] archive_reg chunks={}", quota); }
-        }
         
         // Initialize Parallel Executor if sharding is enabled
         let parallel_executor = if let (Some(ref shard_coord), Some(ref parallel_val)) = (&shard_coordinator, &parallel_validator) {
@@ -1744,7 +1714,6 @@ impl BlockchainNode {
             
             shard_coordinator,
             parallel_validator,
-            archive_manager: Arc::new(tokio::sync::RwLock::new(archive_manager)),
             // v2.96: DashMap for confirmation tracking + retry
             heartbeat_commitment_tracker: Arc::new(DashMap::new()),
             bitmap_commitment_tracker: Arc::new(DashMap::new()),
@@ -3507,16 +3476,6 @@ impl BlockchainNode {
         } else {
             println!("[INFO][NODE] Light node: Sync-only mode (no block production)");
             // Light nodes will sync through P2P received blocks
-        }
-        
-        // PRODUCTION: Start archive compliance enforcement (mandatory for Super nodes)
-        // v3.18: Super node type removed
-        if matches!(self.node_type, NodeType::Super) {
-            println!("[INFO][ARCHIVE] compliance_monitoring_start");
-            self.start_archive_compliance_monitoring().await;
-            
-            // Check network capacity and rebalance for small networks
-            self.check_and_rebalance_small_network().await;
         }
         
         // PRODUCTION: Start storage monitoring for all nodes

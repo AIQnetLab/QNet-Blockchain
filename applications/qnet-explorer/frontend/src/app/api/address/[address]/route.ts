@@ -19,6 +19,7 @@ export interface AddressData {
   firstSeen: number;
   lastActive: number;
   isSystem?: boolean;
+  genesisAllocation?: boolean;   // funded in the genesis block: a load-test account with a public key
   nodeInfo?: {
     nodeId: string;
     nodeType: 'SUPER' | 'LIGHT';  // v3.18: FULL removed
@@ -271,6 +272,7 @@ export async function GET(
       data: {
         address,
         balance: formatAmount(balance),
+        genesisAllocation: accountResponse?.genesis_allocation === true,
         txCount: total,
         txCountCapped: totalCapped,
         firstSeen: firstSeen,
@@ -303,6 +305,7 @@ export async function GET(
       data: {
         address,
         balance: formatAmount(balance),
+        genesisAllocation: accountResponse.genesis_allocation === true,
         txCount: 0,
         firstSeen: 0,
         lastActive: 0,

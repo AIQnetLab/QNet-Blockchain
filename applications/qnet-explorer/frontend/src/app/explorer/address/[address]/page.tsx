@@ -14,6 +14,7 @@ interface AddressData {
   firstSeen: number;
   lastActive: number;
   historyUnavailable?: boolean;   // balance is authoritative; TX history read failed (DB down/resync)
+  genesisAllocation?: boolean;    // load-test account funded in the genesis block (public key)
   nodeInfo?: {
     nodeId: string;
     nodeType: 'SUPER' | 'LIGHT';  // v3.18: FULL removed
@@ -401,6 +402,14 @@ export default function AddressPage() {
         <div className="balance-display">
           <div className="main-balance">{data.balance}</div>
         </div>
+        {data.genesisAllocation && (
+          <div className="detail-row">
+            <span className="detail-value">
+              Load-test account: funded in the genesis block for stress tests. Its key is public, so anyone can
+              move this balance; it is not part of the QNC supply and is not counted among holders.
+            </span>
+          </div>
+        )}
         {/* v3.11: Merkle proof verification — temporarily hidden
         <BalanceVerification address={address} />
         */}

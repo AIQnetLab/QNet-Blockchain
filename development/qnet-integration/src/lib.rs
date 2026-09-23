@@ -18,7 +18,6 @@ pub mod parallel_executor;
 pub mod adaptive_bft;
 pub mod pre_execution;
 pub mod network_config;
-pub mod archive_manager;
 pub mod genesis_constants;
 pub mod galc;              // Genesis-Anchored Live Checkpoint — live genesis-signed WS pin for cold-join
 pub mod reward_sharding;

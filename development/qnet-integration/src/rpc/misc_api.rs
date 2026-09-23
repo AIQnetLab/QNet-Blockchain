@@ -1007,11 +1007,79 @@ pub(super) async fn handle_tokens_for_address(
     })))
 }
 
-/// GET /api/v1/richlist?limit=N — native QNC rich list served O(K) from the apply-time index:
-/// top-K holders (balance desc, address asc) + holder count read straight from storage, with NO
-/// account scan and NO consensus lock. Supply is the AUTHORITATIVE emission watermark
-/// (get_total_supply), not a balance re-sum (which would omit unclaimed rewards and contract/pool-held
-/// QNC). Rate-limited; percent is balance/circulating. limit clamped 1..=500.
+/// Addresses the genesis block funded. On this network these are the load-test accounts of the
+/// 29.08 launch: their keys derive from a public seed and their balances were never minted into
+/// total_supply, so a rich list that counted them would show 50,000 holders nobody owns and shares of
+/// a supply that excludes them. Read from block 0 itself — every node agrees without an env flag, and
+/// a fair-launch genesis funds nobody, which leaves the set empty. Set once, only on a successful read.
+static GENESIS_ALLOCATIONS: std::sync::OnceLock<Arc<std::collections::HashSet<String>>> = std::sync::OnceLock::new();
+static GENESIS_ALLOCATIONS_LOADING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Blocking read of block 0 (tens of MB with a prefund): call off the async runtime.
+fn load_genesis_allocations(storage: &crate::storage::Storage) -> Option<Arc<std::collections::HashSet<String>>> {
+    if let Some(set) = GENESIS_ALLOCATIONS.get() { return Some(set.clone()); }
+    let block = storage.load_microblock_auto_format(0).ok().flatten()?;
+    let set: std::collections::HashSet<String> = block.transactions.iter()
+        .filter(|tx| tx.from == "genesis")
+        .filter_map(|tx| match &tx.tx_type {
+            qnet_state::TransactionType::Transfer { to, .. } => Some(to.clone()),
+            _ => None,
+        })
+        .collect();
+    if is_info() { println!("[INFO][RPC] genesis_allocations_loaded accounts={}", set.len()); }
+    Some(GENESIS_ALLOCATIONS.get_or_init(|| Arc::new(set)).clone())
+}
+
+/// Non-blocking membership for hot paths: the set when already loaded, otherwise None after starting
+/// the one background load.
+pub(super) fn genesis_allocations_nowait(storage: Arc<crate::storage::Storage>) -> Option<Arc<std::collections::HashSet<String>>> {
+    if let Some(set) = GENESIS_ALLOCATIONS.get() { return Some(set.clone()); }
+    if !GENESIS_ALLOCATIONS_LOADING.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        tokio::task::spawn_blocking(move || {
+            if load_genesis_allocations(&storage).is_none() {
+                GENESIS_ALLOCATIONS_LOADING.store(false, std::sync::atomic::Ordering::Release); // retry later
+            }
+        });
+    }
+    None
+}
+
+/// One rich-list pass without the genesis allocations, reused for RICH_VIEW_TTL.
+struct RichView {
+    at: std::time::Instant,
+    holders: Vec<(String, u64)>,
+    alloc_accounts: usize,
+    alloc_holding: u64,
+    alloc_balance: u64,
+}
+static RICH_VIEW: std::sync::Mutex<Option<RichView>> = std::sync::Mutex::new(None);
+const RICH_VIEW_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+const RICH_VIEW_MAX: usize = 500;
+
+/// Point reads over the allocation set plus a skip-scan: bounded by the set, not by the holder count.
+fn build_rich_view(storage: &crate::storage::Storage, allocs: &std::collections::HashSet<String>) -> RichView {
+    let (mut holding, mut balance) = (0u64, 0u64);
+    for addr in allocs {
+        if let Some(b) = storage.richlist_balance_of(addr) {
+            holding += 1;
+            balance = balance.saturating_add(b);
+        }
+    }
+    RichView {
+        at: std::time::Instant::now(),
+        holders: storage.richlist_top_k_skipping(RICH_VIEW_MAX, allocs).unwrap_or_default(),
+        alloc_accounts: allocs.len(),
+        alloc_holding: holding,
+        alloc_balance: balance,
+    }
+}
+
+/// GET /api/v1/richlist?limit=N — native QNC rich list served from the apply-time index: top-K holders
+/// (balance desc, address asc) + holder count, with NO account scan and NO consensus lock. The genesis
+/// allocations are left out of both and reported apart under `genesis_allocations` (`holder_count_all`
+/// keeps the raw count). Supply is the AUTHORITATIVE emission watermark (get_total_supply), not a
+/// balance re-sum (which would omit unclaimed rewards and contract/pool-held QNC). Rate-limited;
+/// percent is balance/circulating. limit clamped 1..=500.
 pub(super) async fn handle_qnc_richlist(
     params: std::collections::HashMap<String, String>,
     remote_addr: Option<std::net::SocketAddr>,
@@ -1020,12 +1088,35 @@ pub(super) async fn handle_qnc_richlist(
     if let Err(resp) = check_api_rate_limit(remote_addr, "read_only") {
         return Ok(resp);
     }
-    let limit = params.get("limit").and_then(|s| s.parse::<usize>().ok()).unwrap_or(100).clamp(1, 500);
+    let limit = params.get("limit").and_then(|s| s.parse::<usize>().ok()).unwrap_or(100).clamp(1, RICH_VIEW_MAX);
 
-    // O(K) reads from the rich-list index — no account pass, no consensus lock.
     let storage = blockchain.get_storage();
-    let holders = storage.richlist_top_k(limit).unwrap_or_default();
-    let holder_count = storage.richlist_holder_count();
+    let holder_count_all = storage.richlist_holder_count();
+    let cached = RICH_VIEW.lock().ok().and_then(|g| g.as_ref()
+        .filter(|v| v.at.elapsed() < RICH_VIEW_TTL)
+        .map(|v| (v.holders.clone(), v.alloc_accounts, v.alloc_holding, v.alloc_balance)));
+    let view = match cached {
+        Some(v) => Some(v),
+        None => {
+            let st = storage.clone();
+            tokio::task::spawn_blocking(move || {
+                let allocs = load_genesis_allocations(&st)?;
+                let v = build_rich_view(&st, &allocs);
+                let out = (v.holders.clone(), v.alloc_accounts, v.alloc_holding, v.alloc_balance);
+                if let Ok(mut g) = RICH_VIEW.lock() { *g = Some(v); }
+                Some(out)
+            }).await.ok().flatten()
+        }
+    };
+    // Block 0 not stored here (a snapshot-joined node): the unfiltered list, labelled as such.
+    let (holders, holder_count, genesis_allocations) = match view {
+        Some((mut hs, accounts, holding, bal)) => {
+            hs.truncate(limit);
+            (hs, holder_count_all.saturating_sub(holding),
+             json!({ "accounts": accounts, "holding": holding, "balance_raw": bal.to_string() }))
+        }
+        None => (storage.richlist_top_k(limit).unwrap_or_default(), holder_count_all, serde_json::Value::Null),
+    };
 
     // Authoritative supply figures (brief state lock): minted total + burn-sink balance → circulating.
     let burn_addr = qnet_state::transaction::CANONICAL_BURN_ADDR;
@@ -1047,6 +1138,8 @@ pub(super) async fn handle_qnc_richlist(
         "circulating_raw": circulating.to_string(),
         "burned_raw": burned_raw.to_string(),
         "holder_count": holder_count,
+        "holder_count_all": holder_count_all,
+        "genesis_allocations": genesis_allocations,
         "holders": rows,
         "source": "richlist_index",
     })))

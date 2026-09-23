@@ -214,8 +214,8 @@ export default function HomeClient({ initialStats }: HomeClientProps) {
             </div>
             <h3>Pool #3</h3>
             <p>
-              When users pay QNC to activate Phase 2 nodes, their QNC goes to Pool #3 
-              which redistributes rewards to ALL active nodes. Everyone benefits from network growth!
+              In Phase 2 the QNC spent on activation goes to Pool #3, which is shared among all
+              active nodes. None of it goes to the publisher.
             </p>
           </div>
           
@@ -339,19 +339,19 @@ export default function HomeClient({ initialStats }: HomeClientProps) {
         <div className="technology-grid expanded">
           <div className="tech-item">
             <h4 className="tech-title">Phase 1: 1DEV Burn (Current)</h4>
-            <p>1DEV tokens are BURNED on Solana for node activation. 1,500 1DEV burn for any node type. Price decreases with burn progress. Transition at 90% burned OR 5 years.</p>
+            <p>1DEV tokens are BURNED on Solana for node activation. 1,500 1DEV burn for any node type; the amount decreases as the supply burns. The tokens are destroyed and nobody receives them. Transition at 90% burned OR 5 years.</p>
           </div>
           <div className="tech-item">
             <h4 className="tech-title">Phase 2: QNC to Pool #3 (Future)</h4>
-            <p>Activation is paid in QNC and goes to Pool #3, which is redistributed to all active nodes. The price scales with network size; the exact schedule is set before Phase 2 opens.</p>
+            <p>Activation spends QNC, which goes to Pool #3 and is redistributed to all active nodes. The amount scales with network size; the exact schedule is set before Phase 2 opens.</p>
           </div>
           <div className="tech-item">
             <h4 className="tech-title">Sharp Drop Halving Innovation</h4>
             <p>Years 0-20: Standard ÷2 every 4 years | Years 20-24: Sharp drop ÷10 | Years 24+: Resume from low base. Saves 107M QNC!</p>
           </div>
           <div className="tech-item">
-            <h4 className="tech-title">Dynamic Activation Pricing</h4>
-            <p>Network size multipliers: 0-100K nodes (0.5x discount), 100K-300K (1.0x standard), 300K-1M (2.0x), 1M+ (3.0x premium). ALL fees → Pool #3!</p>
+            <h4 className="tech-title">Activation Amount by Network Size</h4>
+            <p>Network size multipliers: 0-100K nodes 0.5x, 100K-300K 1.0x, 300K-1M 2.0x, 1M+ 3.0x. Every Phase 2 activation goes to Pool #3.</p>
           </div>
           <div className="tech-item">
             <h4 className="tech-title">Two Reward Pools</h4>

@@ -42,8 +42,8 @@ android {
         applicationId "com.qnetmobile"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 16
-        versionName "1.1.5"
+        versionCode 17
+        versionName "1.1.6"
         manifestPlaceholders = [usesCleartextTraffic: "true"]
 
         // NDK: pqclean Dilithium3 reference C code (same as pqcrypto-dilithium 0.5).

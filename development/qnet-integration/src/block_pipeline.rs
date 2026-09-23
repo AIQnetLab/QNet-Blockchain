@@ -2104,6 +2104,7 @@ impl BlockPipeline {
             const STUCK_THRESHOLD_MS: u64 = 30_000;
             let mut last_verified: u64 = 0;
             let mut last_applied: u64 = 0;
+            let mut last_tip: u64 = 0;
             // 0 sentinel = "no verify/apply seen yet"; the dump guards require != 0, so the boot wait
             // (nothing to apply) can't trip a spurious CRIT — stall is measured from first real progress.
             let mut last_verified_progress_ms: u64 = 0;
@@ -2128,14 +2129,19 @@ impl BlockPipeline {
                 let dup_now = metrics_watchdog.duplicates_skipped.load(Ordering::Relaxed);
                 let verify_progress_now = verified_now.saturating_add(dup_now);
                 let apply_progress_now = applied_now.saturating_add(dup_now);
+                // The node's own blocks are applied inline by the producer and never pass this stage, and
+                // their echoes need not come back either: through a 30-block production round neither
+                // counter moves, which read as a 30 s apply stall. A moving tip is progress.
+                let tip_now = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(Ordering::Relaxed);
 
                 if verify_progress_now != last_verified {
                     last_verified = verify_progress_now;
                     last_verified_progress_ms = now;
                     verify_stuck_repeats = 0; // a later, unrelated stall must open at WARN again
                 }
-                if apply_progress_now != last_applied {
+                if apply_progress_now != last_applied || tip_now != last_tip {
                     last_applied = apply_progress_now;
+                    last_tip = tip_now;
                     last_applied_progress_ms = now;
                     apply_stuck_repeats = 0; // a later, unrelated stall must open at WARN again
                 }
