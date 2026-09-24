@@ -3,7 +3,8 @@
   "version": "1.1.6",
   "private": true,
   "scripts": {
-    "android": "react-native run-android",
+    "android": "react-native run-android --mode siteDebug",
+    "android:play": "react-native run-android --mode playDebug --appId io.aiqnet.wallet",
     "ios": "react-native run-ios",
     "lint": "eslint .",
     "start": "react-native start",

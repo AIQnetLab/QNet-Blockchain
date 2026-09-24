@@ -285,8 +285,8 @@ export default function HomeClient({ initialStats }: HomeClientProps) {
             </div>
             <h3>Radical Transparency</h3>
             <p>
-              Every single line of code is on GitHub under the MIT license — the node, the explorer and the wallet
-              apps. Verifiable builds ensure the live version matches public code.
+              Every line of code is public on GitHub: the wallet apps and the explorer under Apache-2.0, the node
+              under the Business Source License 1.1. Verifiable builds ensure the live version matches public code.
             </p>
           </div>
         </div>
@@ -303,7 +303,7 @@ export default function HomeClient({ initialStats }: HomeClientProps) {
         <div className="technology-grid expanded">
           <div className="tech-item">
             <h4 className="tech-title">Presence, Not Computation</h4>
-            <p>A light node answers a signed status request from the network a few times per four-hour epoch. Nothing is computed between requests; the device stays cool and the battery barely notices.</p>
+            <p>A light node answers a signed status request from the network a few times per four-hour epoch. Between requests the app only sends one signed attestation per epoch; nothing is computed, the device stays cool and the battery barely notices.</p>
           </div>
           <div className="tech-item">
             <h4 className="tech-title">iOS</h4>

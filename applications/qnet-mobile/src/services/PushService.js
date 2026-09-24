@@ -658,6 +658,21 @@ export async function teardownLightNode() {
 }
 
 /**
+ * A light-node record left by another wallet (a vault cleared as corrupted, an interrupted switch) must not
+ * keep this phone answering for that node. `ownAddresses` are the current wallet's addresses — QNet, Solana,
+ * and the QNet alias older builds derived from the Solana one.
+ */
+export async function teardownLightNodeIfForeign(ownAddresses) {
+  try {
+    const info = JSON.parse((await AsyncStorage.getItem('qnet_light_node_info')) || 'null');
+    const owner = info && info.walletAddress;
+    if (owner && !ownAddresses.filter(Boolean).includes(owner)) await teardownLightNode();
+  } catch (error) {
+    console.warn('[LightNode] foreign-record check failed:', error.message || error);
+  }
+}
+
+/**
  * Handle incoming push message (FCM or UnifiedPush)
  */
 export async function handlePushMessage(data) {

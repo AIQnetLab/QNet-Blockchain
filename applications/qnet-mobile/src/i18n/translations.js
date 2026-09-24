@@ -84,49 +84,16 @@ const translations = {
     accept_terms: 'I accept the Terms of Service and Privacy Policy',
     read_terms: 'Read Terms of Service',
     terms_title: 'Terms of Service & Privacy Policy',
-    terms_text: `QNET WALLET TERMS OF SERVICE AND USER AGREEMENT
+    terms_text: `QNET WALLET — TERMS OF USE (SUMMARY)
 
-By using this software, you acknowledge and agree to the following terms:
+QNet Wallet is published by Orrery Group LLC. The full Terms of Use and the Privacy Policy are published at the links below; by accepting you agree to both.
 
-1. NO WARRANTY
-This software is provided "as is" without warranty of any kind, express or implied. The developers make no representations or warranties regarding the software's functionality, security, or fitness for any particular purpose.
-
-2. ASSUMPTION OF RISK
-You acknowledge that:
-• Cryptocurrency transactions are irreversible
-• Private keys and seed phrases are your sole responsibility
-• Loss of your seed phrase means permanent loss of access to your funds
-• Software bugs, hacks, or technical failures may result in loss of funds
-• The value of cryptocurrencies is highly volatile and may decrease to zero
-
-3. NO LIABILITY
-The developers, contributors, and affiliated parties shall not be liable for any direct, indirect, incidental, special, consequential, or punitive damages, including but not limited to loss of funds, loss of data, or loss of profits.
-
-4. YOUR RESPONSIBILITIES
-You are solely responsible for:
-• Securing your seed phrase and private keys
-• Ensuring the legality of cryptocurrency use in your jurisdiction
-• Paying any applicable taxes on cryptocurrency transactions
-• Verifying transaction details before signing
-• Maintaining the security of your device
-
-5. PROHIBITED USE
-You agree not to use this wallet for:
-• Any illegal activities
-• Money laundering or terrorist financing
-• Violating any applicable laws or regulations
-• Attempting to hack or disrupt the software
-
-6. INDEMNIFICATION
-You agree to indemnify and hold harmless the developers from any claims, damages, losses, or expenses arising from your use of this software.
-
-7. CHANGES TO TERMS
-These terms may be updated at any time without prior notice. Continued use of the software constitutes acceptance of the updated terms.
-
-8. GOVERNING LAW
-These terms shall be governed by the laws of the jurisdiction in which you reside.
-
-By clicking "Accept", you confirm that you have read, understood, and agree to be bound by these terms.`,
+• You must be at least 18 years old.
+• The wallet is non-custodial: keys stay on this device. Nobody, including the publisher, can recover a lost recovery phrase or reverse a transaction.
+• QNet is an experimental network at the testnet stage. Tokens may have no monetary value, and node rewards are decided by the network protocol and are not guaranteed.
+• Use the software only where it is lawful for you, and verify addresses and amounts before signing.
+• The software is provided as is, without warranty; the publisher is not liable for any loss arising from its use.
+• These terms are governed by the laws of the State of Wyoming, United States.`,
     accept: 'Accept',
     decline: 'Decline',
   },

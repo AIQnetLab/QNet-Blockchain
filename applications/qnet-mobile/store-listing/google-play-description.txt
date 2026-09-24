@@ -34,6 +34,5 @@ Developer email:      support@aiqnet.io   (Google publishes it)
 ====================
 NOT PREPARED YET
 ====================
-Store-listing translations (English only at launch; the app itself ships eleven UI languages).
-Fresh screenshots per device class (phone, 7" and 10" tablet) from the current build — the ones under
-fastlane/metadata/android/en-US/images are from an older version.
+Store-listing translations (English only at launch; the app itself has partial translations into ten more languages).
+Tablet screenshots (7" and 10"); the phone set under fastlane/metadata/android/en-US/images is current.

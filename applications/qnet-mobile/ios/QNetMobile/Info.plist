@@ -24,8 +24,8 @@
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
-	<!-- Standard algorithms (ML-DSA-65, ML-KEM-768, AES, SHA-3) implemented in the app's own native module,
-	     not taken from the OS: non-exempt in Apple's classification. Without this key every build stops at
+	<!-- Standard algorithms (ML-DSA-65 and SHA-3 in the app's own native module, AES-256-GCM in its JS crypto
+	     library), not taken from the OS: non-exempt in Apple's classification. Without this key every build stops at
 	     "Missing Compliance". -->
 	<key>ITSAppUsesNonExemptEncryption</key>
 	<true/>

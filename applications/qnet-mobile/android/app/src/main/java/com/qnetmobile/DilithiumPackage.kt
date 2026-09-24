@@ -10,7 +10,7 @@ import com.facebook.react.uimanager.ViewManager
  */
 class DilithiumPackage : ReactPackage {
     override fun createNativeModules(reactContext: ReactApplicationContext): List<NativeModule> {
-        return listOf(DilithiumModule(reactContext))
+        return listOf(DilithiumModule(reactContext), StoreModule(reactContext))
     }
 
     override fun createViewManagers(reactContext: ReactApplicationContext): List<ViewManager<*, *>> {

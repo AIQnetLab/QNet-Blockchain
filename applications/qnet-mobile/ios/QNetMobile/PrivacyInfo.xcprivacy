@@ -29,9 +29,9 @@
 			</array>
 		</dict>
 	</array>
-	<!-- What a light node registration leaves on the network's genesis nodes: the push token that the
-	     status request is delivered through, and the wallet address the node's rewards go to. Neither is
-	     tied to a name or an account; nothing else is retained off the device. -->
+	<!-- What leaves the device and stays: the push token (issued at launch; stored by the genesis nodes
+	     for a light node), the wallet addresses (in reads, Solana RPC and the node registration) and the
+	     transactions the user signs (public chain). None is tied to a name or an account. -->
 	<key>NSPrivacyCollectedDataTypes</key>
 	<array>
 		<dict>
@@ -49,6 +49,18 @@
 		<dict>
 			<key>NSPrivacyCollectedDataType</key>
 			<string>NSPrivacyCollectedDataTypeUserID</string>
+			<key>NSPrivacyCollectedDataTypeLinked</key>
+			<false/>
+			<key>NSPrivacyCollectedDataTypeTracking</key>
+			<false/>
+			<key>NSPrivacyCollectedDataTypePurposes</key>
+			<array>
+				<string>NSPrivacyCollectedDataTypePurposeAppFunctionality</string>
+			</array>
+		</dict>
+		<dict>
+			<key>NSPrivacyCollectedDataType</key>
+			<string>NSPrivacyCollectedDataTypeOtherFinancialInfo</string>
 			<key>NSPrivacyCollectedDataTypeLinked</key>
 			<false/>
 			<key>NSPrivacyCollectedDataTypeTracking</key>

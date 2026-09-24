@@ -5,6 +5,8 @@ apply plugin: "com.google.gms.google-services"
 
 react {
     autolinkLibrariesWithApp()
+    // With the store flavors the debug variants are siteDebug / playDebug; they load JS from Metro.
+    debuggableVariants = ["siteDebug", "playDebug", "siteDebugOptimized", "playDebugOptimized"]
 }
 
 /**
@@ -87,6 +89,25 @@ android {
             }
         }
     }
+    // Two distributions of one app. `site` keeps com.qnetmobile, the id every APK from aiqnet.io and GitHub
+    // has carried, so an update installs over what users already run. `play` is io.aiqnet.wallet: Google
+    // Play keeps a package name forever, and com.qnetmobile stays reserved by a closed developer account.
+    // Both are registered in the same Firebase project, so light-node pushes reach either.
+    flavorDimensions "store"
+    productFlavors {
+        site {
+            dimension "store"
+            applicationId "com.qnetmobile"
+        }
+        play {
+            dimension "store"
+            applicationId "io.aiqnet.wallet"
+            // ARM only: Play requires 16 KB-aligned 64-bit libraries, and the x86_64 libconceal shipped by
+            // react-native-keychain 8 is 4 KB-aligned; x86 cannot ship without its 64-bit twin.
+            ndk { abiFilters "armeabi-v7a", "arm64-v8a" }
+        }
+    }
+
     buildTypes {
         debug {
             signingConfig signingConfigs.debug

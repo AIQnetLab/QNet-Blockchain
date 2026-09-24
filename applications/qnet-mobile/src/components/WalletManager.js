@@ -32,6 +32,8 @@ export class WalletManager {
     this.keyCache = null;       // Uint8Array (32-byte AES key), NOT the password
     this._keyCacheSalt = null;  // Hex salt that was used to derive keyCache
     this._keyCacheIter = 0;     // Iteration count used to derive keyCache
+    this._keyCachePwTag = null; // SHA3(salt:password) of the password keyCache came from
+    this._walletGen = 0;        // bumped whenever the wallet on this device changes
     this._failedAttempts = 0;
     this._lockoutUntil = 0;
     this._rateLimitLoaded = false;
@@ -2715,18 +2717,26 @@ export class WalletManager {
     );
   }
 
-  // Set keyCache and remember which salt/iterations produced it.
-  _setCachedKey(key, saltHex, iterations) {
-    this.keyCache      = key;
-    this._keyCacheSalt = saltHex;
-    this._keyCacheIter = iterations;
+  // Which password a cached key came from, so the cache never answers for a different one.
+  _pwTag(saltHex, password) {
+    const sha3_256 = require('js-sha3').sha3_256;
+    return sha3_256(`${saltHex}:${password == null ? '' : String(password)}`);
+  }
+
+  // Set keyCache and remember which salt/iterations/password produced it.
+  _setCachedKey(key, saltHex, iterations, password) {
+    this.keyCache       = key;
+    this._keyCacheSalt  = saltHex;
+    this._keyCacheIter  = iterations;
+    this._keyCachePwTag = this._pwTag(saltHex, password);
   }
 
   // Clear keyCache on failed attempts or vault change.
   _clearCachedKey() {
-    this.keyCache      = null;
-    this._keyCacheSalt = null;
-    this._keyCacheIter = 0;
+    this.keyCache       = null;
+    this._keyCacheSalt  = null;
+    this._keyCacheIter  = 0;
+    this._keyCachePwTag = null;
   }
 
   // Encrypt plaintext string → { version:3, salt, iv, encrypted } (all hex).
@@ -2759,19 +2769,20 @@ export class WalletManager {
     const iterations = vaultData.version === 3
       ? WalletManager.VAULT_ITERATIONS_V3
       : WalletManager.VAULT_ITERATIONS_V2;
-    // Reuse cached key if it was derived from the same salt+iterations.
-    // This eliminates duplicate PBKDF2 calls when verifyPassword → loadWallet
-    // are called back-to-back (every unlock).
+    // Reuse the cached key only for the same salt, iterations AND password: it spares the second
+    // PBKDF2 when verifyPassword → loadWallet run back-to-back, and a wrong password still derives a
+    // wrong key and fails.
     const canReuseCache =
       this.keyCache &&
       this._keyCacheSalt === vaultData.salt &&
-      this._keyCacheIter === iterations;
+      this._keyCacheIter === iterations &&
+      this._keyCachePwTag === this._pwTag(vaultData.salt, password);
     let key;
     if (canReuseCache) {
       key = this.keyCache;
     } else {
       key = await this._deriveKeyNative(password, vaultData.salt, iterations);
-      this._setCachedKey(key, vaultData.salt, iterations);
+      this._setCachedKey(key, vaultData.salt, iterations, password);
     }
     const plainBuf = await crypto.subtle.decrypt(
       { name: 'AES-GCM', iv: this._hexToBytes(vaultData.iv) },
@@ -2823,19 +2834,92 @@ export class WalletManager {
   }
 
   // Encrypt and store wallet with PBKDF2 + AES (like extension)
+  // Everything on the device that belongs to one wallet (its address, activation, node, tokens, lockout
+  // counter). Device settings — language, auto-lock, network mode, discovered nodes — are not in it, and
+  // transaction history is kept per address (qnet_tx_history_<addr>).
+  static WALLET_SCOPED_KEYS = [
+    'qnet_address', 'qnet_address_scheme',
+    'qnet_activation_codes', 'qnet_activation_meta_light', 'qnet_activation_meta_full', 'qnet_activation_meta_super',
+    'qnet_last_activated_node', 'qnet_cached_server_status', 'qnet_activation_unconfirmed_at',
+    'qnet_custom_tokens', 'qnet_hidden_tokens', 'qnet_node_rewards', 'qnet_rate_limit',
+    'qnet_last_sent_fcm_token', 'qnet_last_token_refresh_ts', 'qnet_needs_token_refresh',
+  ];
+  static WALLET_SCOPED_PREFIXES = [
+    'blockchain_check_', 'node_pseudonym_', 'qnet_onchain_reg_pending_',
+    'node_last_ping_', 'node_next_ping_', 'qnet_identity_pk_',
+  ];
+
+  // Forget the wallet that was on this device. Work still in flight for it (a sync, a registration)
+  // sees the generation change and writes nothing. The light-node identity is torn down by the caller
+  // (PushService.teardownLightNode), the vault itself by the caller or by storeWallet overwriting it.
+  async wipeWalletScope() {
+    this._walletGen++;
+    this._clearCachedKey();
+    this._failedAttempts = 0;
+    this._lockoutUntil = 0;
+    const all = await AsyncStorage.getAllKeys();
+    const doomed = all.filter(k => WalletManager.WALLET_SCOPED_KEYS.includes(k) ||
+      WalletManager.WALLET_SCOPED_PREFIXES.some(p => k.startsWith(p)));
+    if (doomed.length > 0) await AsyncStorage.multiRemove(doomed);
+  }
+
+  // Re-encrypt the vault, and the activation codes kept under the same password, with a new password.
+  // The vault is re-encrypted as stored — seed phrase included — rather than rebuilt from the unlocked
+  // wallet object, which carries no seed phrase.
+  async changePassword(currentPassword, newPassword) {
+    const raw = await AsyncStorage.getItem('qnet_wallet');
+    if (!raw) throw new Error('No wallet on this device');
+    const vault = JSON.parse(raw);
+    const plain = vault.version === 3 || vault.version === 2
+      ? await this._decryptGCM(vault, currentPassword)
+      : await this._decryptCBC(vault, currentPassword);
+    if (!plain) throw new Error('Current password is incorrect');
+    JSON.parse(plain); // a wrong CBC key yields garbage rather than throwing
+
+    const codesRaw = await AsyncStorage.getItem('qnet_activation_codes');
+    const codes = codesRaw ? JSON.parse(codesRaw) : {};
+    const recoded = {};
+    for (const [nodeType, codeData] of Object.entries(codes)) {
+      if (!codeData || !codeData.salt || !codeData.encrypted) continue;
+      try {
+        const code = codeData.version === 3 || codeData.version === 2
+          ? await this._decryptGCM(codeData, currentPassword)
+          : await this._decryptCBC(codeData, currentPassword);
+        if (!code) continue;
+        const { vault: codeVault } = await this._encryptGCM(code, newPassword);
+        recoded[nodeType] = { ...codeVault, nodeType };
+      } catch (_) { /* a code this password never opened stays out; sync recovers it */ }
+    }
+
+    const { vault: newVault, derivedKey } = await this._encryptGCM(plain, newPassword);
+    await AsyncStorage.setItem('qnet_wallet', JSON.stringify(newVault));
+    await AsyncStorage.setItem('qnet_activation_codes', JSON.stringify(recoded));
+    this._setCachedKey(derivedKey, newVault.salt, WalletManager.VAULT_ITERATIONS_V3, newPassword);
+    return true;
+  }
+
+  // The address an activation code is bound to: the Solana wallet that burned (the node checks the code
+  // against burn_wallet). Callers hold either address; a QNet one maps to this device's Solana address.
+  async _burnWalletFor(walletAddress) {
+    const a = String(walletAddress || '');
+    if (a && !(a.length === 45 && a.includes('eon'))) return a;
+    return (await AsyncStorage.getItem('qnet_wallet_address')) || null;
+  }
+
   async storeWallet(walletData, password) {
     try {
-      // The first session after an import never decrypts again, so seed the identity cache here too.
-      await this.cacheLightIdentityPk(walletData);
-      // Only clear activation codes when it's a DIFFERENT wallet
-      // (import/create already clears them explicitly in WalletScreen)
-      // Previously this line deleted codes on EVERY save, causing data loss
-      const existingAddress = await AsyncStorage.getItem('qnet_wallet_address');
-      if (existingAddress && walletData.address && existingAddress !== walletData.address) {
-        // Different wallet — clear old activation codes
-        await AsyncStorage.removeItem('qnet_activation_codes');
+      // A different wallet takes this device: nothing the previous one left may carry over. The same
+      // wallet re-saved keeps everything.
+      const prevQnet = await AsyncStorage.getItem('qnet_address');
+      const prevSol = await AsyncStorage.getItem('qnet_wallet_address');
+      if ((prevQnet && walletData.qnetAddress && prevQnet !== walletData.qnetAddress) ||
+          (prevSol && walletData.address && prevSol !== walletData.address)) {
+        await this.wipeWalletScope();
       }
-      
+      // The first session after an import never decrypts again, so seed the identity cache here too —
+      // after the wipe, which clears every identity key.
+      await this.cacheLightIdentityPk(walletData);
+
       // Extract and use temporary mnemonic if present
       const mnemonic = walletData._tempMnemonic || walletData.mnemonic;
       if (walletData._tempMnemonic) {
@@ -2854,11 +2938,17 @@ export class WalletManager {
       // Encrypt wallet data — AES-256-GCM + PBKDF2 600K (v3)
       // derivedKey is reused for keyCache — no 2nd PBKDF2 call
       const { vault: vaultData, derivedKey: vaultKey } = await this._encryptGCM(JSON.stringify(storageData), password);
-      this._setCachedKey(vaultKey, vaultData.salt, WalletManager.VAULT_ITERATIONS_V3);
+      this._setCachedKey(vaultKey, vaultData.salt, WalletManager.VAULT_ITERATIONS_V3, password);
 
       await AsyncStorage.setItem('qnet_wallet', JSON.stringify(vaultData));
       await AsyncStorage.setItem('qnet_wallet_address', walletData.address);
-      
+      // getCurrentWallet (the no-password path) reads the QNet address from here, so it must follow the
+      // wallet just saved rather than wait for the next unlock.
+      if (walletData.qnetAddress) {
+        await AsyncStorage.setItem('qnet_address', walletData.qnetAddress);
+        await AsyncStorage.setItem('qnet_address_scheme', 'fips204');
+      }
+
       return true;
     } catch (error) {
       // console.error('Error storing wallet:', error);
@@ -3498,7 +3588,7 @@ export class WalletManager {
           // derivedKey is reused for keyCache — no 2nd PBKDF2 call needed
           const { vault: newVault, derivedKey: newKey } = await this._encryptGCM(JSON.stringify(wallet), password);
           await AsyncStorage.setItem('qnet_wallet', JSON.stringify(newVault));
-          this._setCachedKey(newKey, newVault.salt, WalletManager.VAULT_ITERATIONS_V3);
+          this._setCachedKey(newKey, newVault.salt, WalletManager.VAULT_ITERATIONS_V3, password);
           migrated = true;
           console.log(`[INFO][WALLET] vault_migrated from_version=${fromVersion} to_version=3 iterations=${WalletManager.VAULT_ITERATIONS_V3}`);
         } catch (migrationError) {
@@ -3509,9 +3599,9 @@ export class WalletManager {
         }
       } else {
         // Cache CryptoKey for faster subsequent unlocks (skip if already cached by verifyPassword)
-        if (!this.keyCache) {
+        if (!this.keyCache || this._keyCacheSalt !== vaultData.salt) {
           const k = await this._deriveKeyNative(password, vaultData.salt, WalletManager.VAULT_ITERATIONS_V3);
-          this._setCachedKey(k, vaultData.salt, WalletManager.VAULT_ITERATIONS_V3);
+          this._setCachedKey(k, vaultData.salt, WalletManager.VAULT_ITERATIONS_V3, password);
         }
       }
 
@@ -4823,11 +4913,17 @@ export class WalletManager {
 
   // Encrypt and store activation code securely
   async storeActivationCode(code, nodeType, password, metadata = {}) {
+    // The encryption below takes about a second; a wallet switch inside it must not bring this code back.
+    const gen = this._walletGen;
     try {
+      // Encrypt the activation code — AES-256-GCM + PBKDF2 600K (v3)
+      const { vault: codeVault } = await this._encryptGCM(code, password);
+      if (gen !== this._walletGen) return false;
+
       // Get existing encrypted codes or initialize
       const existingCodesStr = await AsyncStorage.getItem('qnet_activation_codes');
       let encryptedCodes = existingCodesStr ? JSON.parse(existingCodesStr) : {};
-      
+
       // Store activation metadata (timestamp, tx signature, phase, wallet address, burn amount)
       // CRITICAL: phase determines which wallet address to use for claims
       // Phase 1: Solana address, Phase 2: QNet address
@@ -4841,18 +4937,15 @@ export class WalletManager {
         phase: metadata.phase || 1,  // Default to Phase 1
         walletAddress: metadata.walletAddress || null  // The address used for activation
       }));
-      
-      // Encrypt the activation code — AES-256-GCM + PBKDF2 600K (v3)
-      const { vault: codeVault } = await this._encryptGCM(code, password);
 
       // Store encrypted code with metadata
       encryptedCodes[nodeType] = {
         ...codeVault,
         nodeType: nodeType
       };
-      
+
       await AsyncStorage.setItem('qnet_activation_codes', JSON.stringify(encryptedCodes));
-      
+
       return true;
     } catch (error) {
       // console.error('Error storing activation code:', error);
@@ -4897,6 +4990,12 @@ export class WalletManager {
   // PRODUCTION: Codes are retrieved from QNet blockchain registry, NOT generated locally
   async syncActivationCodes(walletAddress, seedPhrase, password) {
     try {
+      // Codes are always derived from the Solana burn wallet, whichever address the caller holds, and
+      // nothing is written once the device has switched to another wallet mid-sync.
+      const gen = this._walletGen;
+      const burnWallet = await this._burnWalletFor(walletAddress);
+      const stale = () => gen !== this._walletGen;
+
       // Check for existing stored codes first (local cache)
       const existingCodes = await this.getStoredActivationCodes(password);
       
@@ -4915,11 +5014,11 @@ export class WalletManager {
             console.log('[syncActivationCodes] Local codes exist but NOT verified on-chain — ignoring cache');
             // Don't return cached codes — fall through to re-check server/blockchain
           } else {
-            return existingCodes;
+            return stale() ? null : existingCodes;
           }
         } catch (e) {
           // Network error — trust local cache as fallback
-          return existingCodes;
+          return stale() ? null : existingCodes;
         }
       }
       
@@ -4931,13 +5030,18 @@ export class WalletManager {
         if (metaData) {
           const meta = JSON.parse(metaData);
           console.log(`Found activation metadata for ${nodeType} node`);
-          
+          const metaWallet = meta.walletAddress;
+          if (metaWallet && burnWallet && !(metaWallet.length === 45 && metaWallet.includes('eon')) && metaWallet !== burnWallet) {
+            continue; // burned by another Solana wallet
+          }
+
           // Regenerate code LOCALLY from stored burn metadata
-          if (meta.burnTxHash && meta.burnAmount && password) {
+          if (meta.burnTxHash && meta.burnAmount && password && burnWallet) {
             try {
               const code = this.generateActivationCodeLocally(
-                nodeType, walletAddress, meta.burnTxHash, meta.burnAmount
+                nodeType, burnWallet, meta.burnTxHash, meta.burnAmount
               );
+              if (stale()) return null;
               await this.storeActivationCode(code, nodeType, password, {
                 burnTxHash: meta.burnTxHash,
                 burnAmount: meta.burnAmount,
@@ -4988,9 +5092,11 @@ export class WalletManager {
               try {
                 const metaStr = await AsyncStorage.getItem(`qnet_activation_meta_${nodeType}`);
                 const meta = metaStr ? JSON.parse(metaStr) : null;
-                if (meta && meta.burnTxHash && meta.burnAmount) {
+                const mw = meta && meta.walletAddress;
+                const foreign = !!mw && !(mw.length === 45 && mw.includes('eon')) && mw !== burnWallet;
+                if (meta && !foreign && meta.burnTxHash && meta.burnAmount && burnWallet) {
                   code = this.generateActivationCodeLocally(
-                    nodeType, walletAddress, meta.burnTxHash, meta.burnAmount
+                    nodeType, burnWallet, meta.burnTxHash, meta.burnAmount
                   );
                 }
               } catch (recoverError) {
@@ -4999,6 +5105,7 @@ export class WalletManager {
             }
             
             if (code && nodeType && password) {
+              if (stale()) return null;
               await this.storeActivationCode(code, nodeType, password, { fromBlockchain: true });
               return { [nodeType]: code };
             }
@@ -5014,7 +5121,8 @@ export class WalletManager {
       }
       
       // Fallback: Check Solana for burn transactions
-      const activatedNodes = await this.checkBlockchainForActivations(walletAddress);
+      if (stale()) return null;
+      const activatedNodes = await this.checkBlockchainForActivations(burnWallet || walletAddress);
       
       // checkBlockchainForActivations returns array of node type strings: ['light'] or ['light','full','super']
       // If burn found, try to recover code from server using stored burn TX metadata
@@ -5029,17 +5137,18 @@ export class WalletManager {
         const meta = metaStr ? JSON.parse(metaStr) : null;
         const burnTxHash = meta?.signature || meta?.burnTxHash;
         
-        if (burnTxHash && meta?.burnAmount) {
+        if (burnTxHash && meta?.burnAmount && burnWallet) {
           try {
             // Regenerate code LOCALLY — no server needed
             const code = this.generateActivationCodeLocally(
-              burnNodeType, walletAddress, burnTxHash, meta.burnAmount
+              burnNodeType, burnWallet, burnTxHash, meta.burnAmount
             );
             console.log('[syncActivationCodes] ✅ Code regenerated locally from burn TX');
+            if (stale()) return null;
             await this.storeActivationCode(code, burnNodeType, password, {
               burnTxHash,
               burnAmount: meta.burnAmount,
-              walletAddress: meta.walletAddress || walletAddress,
+              walletAddress: meta.walletAddress || burnWallet,
               phase: meta?.phase || 1
             });
             return { [burnNodeType]: code };
@@ -5247,6 +5356,10 @@ export class WalletManager {
   // Check blockchain for burn transactions to find activated nodes
   // v4.10: Added rate-limit protection — initial delay + retry with backoff
   async checkBlockchainForActivations(walletAddress) {
+    // Only the wallet on this device records what it finds, and a switch mid-scan records nothing.
+    const gen = this._walletGen;
+    const own = await AsyncStorage.getItem('qnet_wallet_address');
+    const mayWrite = () => gen === this._walletGen && !!own && own === walletAddress;
     try {
       console.warn('[QNET_DEBUG] checkBlockchainForActivations called for:', walletAddress);
       const activatedNodes = [];
@@ -5395,23 +5508,26 @@ export class WalletManager {
                     if (nodeType && ['light', 'super'].includes(nodeType)) {
                       // Found exact type from memo!
                       // console.log('[checkBlockchainForActivations] ✅ Exact node type determined:', nodeType);
-                      // Store activation metadata for future quick lookups and code recovery
-                      await AsyncStorage.setItem(`qnet_activation_meta_${nodeType}`, JSON.stringify({
+                      // Store activation metadata for future quick lookups and code recovery,
+                      // stamped with the Solana wallet that burned
+                      if (mayWrite()) await AsyncStorage.setItem(`qnet_activation_meta_${nodeType}`, JSON.stringify({
                         timestamp: tx.blockTime ? tx.blockTime * 1000 : Date.now(),
                         signature: sigInfo.signature,
                         burnTxHash: sigInfo.signature, // CRITICAL: burn TX hash = Solana signature
                         nodeType: nodeType,
-                        phase: 1
+                        phase: 1,
+                        walletAddress,
                       }));
                       return [nodeType];
                     } else {
                       // Old activation without memo - store metadata and return all types
-                      await AsyncStorage.setItem('qnet_activation_meta_light', JSON.stringify({
+                      if (mayWrite()) await AsyncStorage.setItem('qnet_activation_meta_light', JSON.stringify({
                         timestamp: tx.blockTime ? tx.blockTime * 1000 : Date.now(),
                         signature: sigInfo.signature,
                         burnTxHash: sigInfo.signature,
                         nodeType: 'light',
-                        phase: 1
+                        phase: 1,
+                        walletAddress,
                       }));
                       return ['light', 'super']; // v4.10: Removed 'full'
                     }
@@ -5481,7 +5597,7 @@ export class WalletManager {
       
       // Cache the result
       const cacheKey = `blockchain_check_${walletAddress}`;
-      await AsyncStorage.setItem(cacheKey, JSON.stringify({
+      if (mayWrite()) await AsyncStorage.setItem(cacheKey, JSON.stringify({
         timestamp: Date.now(),
         activatedNodes: activatedNodes
       }));
@@ -5495,6 +5611,7 @@ export class WalletManager {
   
   // Get all stored activation codes
   async getStoredActivationCodes(password) {
+    const gen = this._walletGen;
     try {
       // Password is required for decryption
       if (!password) {
@@ -5544,7 +5661,34 @@ export class WalletManager {
           // Error processing this code - skip
         }
       }
-      
+
+      // A code belongs to this device's wallet only if its burn says so: one burned by another wallet is
+      // dropped, and one derived from the wrong address (the QNet one instead of the Solana burn wallet)
+      // is re-derived, since the node checks it against burn_wallet and would refuse it.
+      const burnWallet = await AsyncStorage.getItem('qnet_wallet_address');
+      const qnetOwner = await AsyncStorage.getItem('qnet_address');
+      for (const nodeType of Object.keys(decryptedCodes)) {
+        const code = decryptedCodes[nodeType].code;
+        if (code.startsWith('QNET-BOOT-')) continue;
+        let meta = null;
+        try { meta = JSON.parse((await AsyncStorage.getItem(`qnet_activation_meta_${nodeType}`)) || 'null'); } catch (_) {}
+        const metaWallet = meta && meta.walletAddress;
+        const isEon = !!metaWallet && metaWallet.length === 45 && metaWallet.includes('eon');
+        if (metaWallet && ((isEon && qnetOwner && metaWallet !== qnetOwner) || (!isEon && burnWallet && metaWallet !== burnWallet))) {
+          delete decryptedCodes[nodeType];
+          continue;
+        }
+        if (burnWallet && meta && meta.burnTxHash && meta.burnAmount) {
+          const expected = this.generateActivationCodeLocally(nodeType, burnWallet, meta.burnTxHash, meta.burnAmount);
+          if (expected !== code) {
+            decryptedCodes[nodeType].code = expected;
+            if (gen === this._walletGen) {
+              try { await this.storeActivationCode(expected, nodeType, password, meta); } catch (_) {}
+            }
+          }
+        }
+      }
+
       return decryptedCodes;
     } catch (error) {
       // console.error('Error getting stored activation codes:', error);

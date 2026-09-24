@@ -29,7 +29,7 @@ export default function TermsPage() {
             <ul>
               <li>A non-custodial wallet: keys are generated and held on your device. Orrery Group LLC never holds, moves or has access to your funds and cannot reverse, cancel or recover a transaction.</li>
               <li>An optional light node: your device answers signed status requests from the QNet network and can claim the rewards the network protocol assigns to it.</li>
-              <li>Free, open-source software under the MIT license. The source is public and you may build it yourself.</li>
+              <li>Free software with public source: the apps are open source under Apache-2.0, and the node is source-available under the Business Source License 1.1. You may read the source and build it yourself.</li>
             </ul>
           </div>
 
@@ -57,7 +57,8 @@ export default function TermsPage() {
             <p>
               Activating a node is an on-chain action you initiate and sign yourself. In Phase 1 it burns 1DEV tokens on the
               Solana blockchain; burned tokens are destroyed and go to no one, including Orrery Group LLC. The action is
-              irreversible. Whether a node stays eligible depends on the device answering the network&apos;s requests, which in
+              irreversible. The Google Play version of the app does not start an activation; it recovers and runs one the wallet
+              already holds. Whether a node stays eligible depends on the device answering the network&apos;s requests, which in
               turn depends on your device, its settings and its connectivity.
             </p>
           </div>
@@ -65,6 +66,7 @@ export default function TermsPage() {
           <div className="privacy-section">
             <h3>Your responsibilities</h3>
             <ul>
+              <li>You must be at least 18 years old to use the software.</li>
               <li>Use the software only where and how it is lawful for you, and comply with the laws that apply to you, including tax law.</li>
               <li>Keep your device, password and seed phrase secure.</li>
               <li>Do not use the software to attack, overload or defraud the network or other users, or to break any law.</li>
@@ -84,7 +86,8 @@ export default function TermsPage() {
             <h3>Third-party services</h3>
             <p>
               The software relies on services run by others: the QNet network nodes, public Solana RPC endpoints, Google
-              Firebase Cloud Messaging for push delivery, and the app stores that distribute it. Those services are governed by
+              Firebase Cloud Messaging for push delivery, CoinGecko and GitHub for token prices and logos, and the app stores
+              that distribute it. Those services are governed by
               their own terms, and their availability is not something Orrery Group LLC controls. Apple and Google are not
               parties to these terms and have no obligation to provide support for the software.
             </p>

@@ -245,8 +245,8 @@ const HomeSection = React.memo(function HomeSection({ setActiveSection }: { setA
               </div>
               <h3>Radical Transparency</h3>
               <p>
-                  Every single line of code is on GitHub under MIT license. App Store & Play Store apps are 
-                  100% open source. Verifiable builds ensure live version matches public code.
+                  Every line of code is public on GitHub: the wallet apps and the explorer under Apache-2.0, the
+                  node under the Business Source License 1.1. Verifiable builds ensure live version matches public code.
               </p>
           </div>
         </div>

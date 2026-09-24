@@ -38,3 +38,6 @@ target_link_libraries(dilithium_native
     log
 )
 
+# 16 KB page alignment: Google Play requires it of every 64-bit library in apps targeting Android 15+.
+target_link_options(dilithium_native PRIVATE "-Wl,-z,max-page-size=16384")
+

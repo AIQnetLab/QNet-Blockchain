@@ -73,7 +73,7 @@ export default function WalletPage() {
             <h4>Light node</h4>
             <p>
               A few times per four-hour epoch the network sends the phone a status request; the phone signs it and answers.
-              Nothing is computed, nothing runs in the background between requests. Each epoch&apos;s answers are recorded on
+              Between requests the app only wakes now and then to send one signed attestation per epoch; nothing is computed. Each epoch&apos;s answers are recorded on
               chain, and the emission for that epoch is shared by the nodes that answered: three quarters among light nodes,
               one quarter among super nodes. Rewards are claimed from the app as an ordinary transaction.
             </p>
@@ -83,7 +83,8 @@ export default function WalletPage() {
             <h4>Activation</h4>
             <p>
               Phase 1: a node is activated by burning 1DEV on Solana from the app; the tokens are destroyed, and the burn
-              transaction is the proof. Phase 2 moves activation to QNC. The <a href="/docs">documentation</a> has the details.
+              transaction is the proof. The Google Play version does not start an activation; it recovers and runs one the
+              wallet already holds. Phase 2 moves activation to QNC. The <a href="/docs">documentation</a> has the details.
             </p>
           </div>
 
@@ -106,7 +107,8 @@ export default function WalletPage() {
           <div className="tool-card-large">
             <h4>Open source</h4>
             <p>
-              The apps, the extension, the explorer and the node are one public repository under the MIT license:{' '}
+              The apps, the extension and the explorer are open source under Apache-2.0, and the node is source-available
+              under the Business Source License 1.1 — all in one public repository:{' '}
               <a href="https://github.com/AIQnetLab/QNet-Blockchain/tree/testnet" target="_blank" rel="noopener noreferrer">github.com/AIQnetLab/QNet-Blockchain</a>.
             </p>
           </div>

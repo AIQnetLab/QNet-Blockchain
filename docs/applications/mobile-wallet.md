@@ -379,6 +379,15 @@ Refresh off for the app, is proven only when it is opened. See
   module on iOS with byte-identical return shapes. The library load is fail-soft: a failed
   `System.loadLibrary` marks the module unavailable and every method rejects with
   `DILITHIUM_NATIVE_UNAVAILABLE` instead of crashing.
+- Android has two product flavors of one app. `site` keeps the package `com.qnetmobile` that every APK on
+  aiqnet.io and GitHub has carried, so updates install over existing copies (`./gradlew assembleSiteRelease`).
+  `play` is `io.aiqnet.wallet` for Google Play (`./gradlew bundlePlayRelease`, an AAB), because Play reserves a
+  package name forever and `com.qnetmobile` belongs to a closed developer account. Both packages are clients of
+  the Firebase project `qnet-wallet`, so light-node pushes reach either. The Play build is ARM-only (every
+  64-bit library 16 KB-aligned) and does not start a node activation: its Activate tab recovers an activation
+  the wallet already holds, and the Node tab runs it (`src/config/store.js`).
+- Dollar values on the Solana tab appear only for a quoted price on mainnet; otherwise a dash.
+- Settings and the terms screen link to the privacy policy, the terms and the support page on aiqnet.io.
 - Release signing reads `keystore.properties`, falling back to the `QNET_KEYSTORE_PASSWORD` and
   `QNET_KEY_PASSWORD` environment variables; both are operator-supplied. Keystores and signing
   properties are never committed. An F-Droid reproducible-build metadata file points at the `android`

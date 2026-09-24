@@ -37,6 +37,7 @@ import {
   refreshFcmTokenOnServer,
   isTokenRefreshNeeded,
   teardownLightNode,
+  teardownLightNodeIfForeign,
 } from '../services/PushService';
 import { getRandomGenesisNode, EXPLORER_API, explorerTxUrl } from '../config/nodes';
 import TxResultCard from '../components/TxResultCard';
@@ -46,6 +47,8 @@ import {
   mergeHistory, appendHistory, cacheableHistory,
 } from '../utils/txHistory';
 import { TRANSFER_FEE_NANO, TRANSFER_FEE_QNC } from '../config/fees';
+import { IN_APP_ACTIVATION } from '../config/store';
+import { mergeTokenBalances } from '../utils/balanceMerge';
 import translations from '../i18n/translations';
 import styles from './WalletScreen.styles';
 
@@ -286,6 +289,13 @@ async function fetchCachedBlockHeight() {
 const fmtAmount = (value, decimals) =>
   (Number(value) || 0).toFixed(decimals).replace(/(\.\d*?)0+$/, '$1').replace(/\.$/, '');
 
+// Published by Orrery Group LLC on aiqnet.io; the app shows the same pages, it does not keep its own copy.
+const LEGAL_LINKS = [
+  ['Privacy Policy', 'https://aiqnet.io/privacy'],
+  ['Terms of Use', 'https://aiqnet.io/terms'],
+  ['Support', 'https://aiqnet.io/support'],
+];
+
 const WalletScreen = () => {
   const [walletManager] = useState(() => new WalletManager()); // lazy: construct once, not every render
   const deviceAuth = WalletManager.DEVICE_AUTH; // iOS: Face ID / Touch ID / passcode seal the vault, no wallet password
@@ -317,7 +327,11 @@ const WalletScreen = () => {
     sol: 0.0,
     '1dev': 0.0
   });
+  // A dollar figure only for a quoted price on mainnet; devnet tokens and unquoted tokens show a dash.
+  const usd = (price, amount, digits = 2) =>
+    (price > 0 && !isTestnet ? `$${(price * amount).toFixed(digits)}` : '—');
   const [tokenBalances, setTokenBalances] = useState({
+    owner: null, // QNet address these balances were read for
     qnc: 0,
     sol: 0,
     '1dev': 0
@@ -404,6 +418,8 @@ const WalletScreen = () => {
   const [lightNodeStatus, setLightNodeStatus] = useState(null); // Light node network status
   const [bgRefreshDenied, setBgRefreshDenied] = useState(false); // iOS Background App Refresh is off for the app
   const lastHistoryAddrRef = useRef(null); // wallet the loaded history belongs to (a switch clears it, an unlock does not)
+  const currentOwnerRef = useRef(null); // QNet address of the wallet on screen; late reads for another are dropped
+  useEffect(() => { if (wallet?.qnetAddress) currentOwnerRef.current = wallet.qnetAddress; }, [wallet]);
   const [serverNodeStatus, setServerNodeStatus] = useState(null); // Super node network status
   const [allUserNodes, setAllUserNodes] = useState([]); // All nodes owned by this wallet (unified view)
   const [loadingAllNodes, setLoadingAllNodes] = useState(false); // Loading state for all nodes
@@ -1363,16 +1379,21 @@ const WalletScreen = () => {
       
       // User-friendly error messages for known activation failures
       // PRIORITY: "wrong wallet" checks FIRST — catches all variations including wrapped ML-DSA-65 errors
-      if (msg.includes('belongs to different wallet') || 
+      if (msg.includes('belongs to different wallet') ||
+          msg.includes('xor mismatch') ||
           msg.includes('invalid activation code') ||
           msg.includes('code belongs') ||
           msg.includes('not found or does not match')) {
         showAlert(
           'Code Mismatch',
           'This activation code does not belong to this wallet.\n\n' +
-          'Each activation code is cryptographically bound to the wallet that burned 1DEV tokens. ' +
-          'You can only activate a node using the same wallet that received the code.\n\n' +
-          'If you lost access to the original wallet, you will need to burn tokens again from this wallet to get a new code.'
+          (IN_APP_ACTIVATION
+            ? 'Each activation code is cryptographically bound to the wallet that burned 1DEV tokens. '
+            : 'Each activation code is cryptographically bound to the wallet that holds the activation. ') +
+          'You can only activate a node using the same wallet that received the code.' +
+          (IN_APP_ACTIVATION
+            ? '\n\nIf you lost access to the original wallet, you will need to burn tokens again from this wallet to get a new code.'
+            : '')
         );
       } else if (msg.includes('invalid') && msg.includes('format')) {
         showAlert(
@@ -1387,7 +1408,8 @@ const WalletScreen = () => {
       } else if (msg.includes('expired') || msg.includes('expir')) {
         showAlert(
           'Code Expired',
-          'This activation code has expired.\n\nPlease burn tokens again to obtain a new activation code.'
+          'This activation code has expired.' +
+          (IN_APP_ACTIVATION ? '\n\nPlease burn tokens again to obtain a new activation code.' : '')
         );
       } else if (
           msg.includes('burn transaction not found') ||
@@ -1397,10 +1419,13 @@ const WalletScreen = () => {
           msg.includes('insufficient amount on solana')
         ) {
         showAlert(
-          'Burn Not Confirmed Yet',
-          'The Solana network has not yet confirmed your burn transaction.\n\n' +
-          'This usually resolves within 30–60 seconds. Please wait a moment and try activating again.\n\n' +
-          'Your activation code is saved — no need to burn tokens again.'
+          IN_APP_ACTIVATION ? 'Burn Not Confirmed Yet' : 'Activation Not Confirmed Yet',
+          IN_APP_ACTIVATION
+            ? 'The Solana network has not yet confirmed your burn transaction.\n\n' +
+              'This usually resolves within 30–60 seconds. Please wait a moment and try activating again.\n\n' +
+              'Your activation code is saved — no need to burn tokens again.'
+            : 'The network has not yet confirmed this wallet\'s activation.\n\n' +
+              'This usually resolves within 30–60 seconds. Please wait a moment and try again; your activation code is saved.'
         );
       } else if (msg.includes('network') || msg.includes('timeout') || msg.includes('fetch') || msg.includes('econnrefused')) {
         showAlert(
@@ -2566,7 +2591,15 @@ const WalletScreen = () => {
         setBiometricEnabled(true);
       }
 
-      // Set UI state immediately for instant response
+      // Save wallet before showing UI — with quick-crypto PBKDF2 is native (< 1s). Closing the app
+      // mid-save would lose the wallet, and the save also clears what a previous wallet left on the
+      // device, so it runs before the new wallet's screen and effects read that storage.
+      await walletManager.storeWallet(imported, vaultPassword);
+      await teardownLightNodeIfForeign([
+        imported.qnetAddress, imported.publicKey, walletManager.generateQNetAddressFromSolana(imported.publicKey),
+      ]);
+
+      resetWalletScopedState(imported.qnetAddress);
       setSeedPhrase('');
       setWallet(imported);
       setHasWallet(true);
@@ -2576,38 +2609,10 @@ const WalletScreen = () => {
       setConfirmPassword('');
       setImportStep(1); // Reset to step 1 for next time
       setLoading(false);
-      
-      // Clear activation and node state from previous wallet
-      setActivatedNodeType(null);
-      setActivationCode(null);
-      setNodePseudonym('');
-      setNodeStatus(null);
-      setLightNodeStatus(null);
-      setServerNodeStatus(null);
-      
-      // Clear stored activation data from AsyncStorage
-      await AsyncStorage.removeItem('qnet_activation_codes');
-      await AsyncStorage.removeItem('qnet_activation_meta_light');
-      await AsyncStorage.removeItem('qnet_activation_meta_full');
-      await AsyncStorage.removeItem('qnet_activation_meta_super');
-      await AsyncStorage.removeItem('qnet_last_activated_node');
-      // Clear cache for any previous wallet
-      const keys = await AsyncStorage.getAllKeys();
-      const blockchainCacheKeys = keys.filter(key => key.startsWith('blockchain_check_'));
-      const pseudonymKeys = keys.filter(key => key.startsWith('node_pseudonym_'));
-      const keysToRemove = [...blockchainCacheKeys, ...pseudonymKeys];
-      if (keysToRemove.length > 0) {
-        await AsyncStorage.multiRemove(keysToRemove);
-      }
-      
+
       // Switch directly to assets tab without alert
       setActiveTab('assets');
-      // Force immediate balance load without delay
-      loadBalance(imported.publicKey);
-      
-      // Save wallet before showing UI — with quick-crypto PBKDF2 is native (< 1s).
-      // Must complete before UI advances: closing app mid-save loses the wallet.
-      await walletManager.storeWallet(imported, vaultPassword);
+      loadBalance(imported.publicKey, imported);
       // Sync activation codes after save
       (async () => {
         // After wallet is saved, sync activation codes
@@ -2656,7 +2661,7 @@ const WalletScreen = () => {
               // rejected. A silent failure is fine here: the badge falls to OFFLINE and the user retries.
               if (nodeType === 'light') {
                 try {
-                  await walletManager.registerNodeWithCode(codeStr, imported.qnetAddress || imported.address, password);
+                  await walletManager.registerNodeWithCode(codeStr, imported.qnetAddress || imported.address, vaultPassword);
                 } catch (regErr) {
                   console.log('Light re-register on restore failed (will need manual reactivate):', regErr.message);
                 }
@@ -2736,6 +2741,12 @@ const WalletScreen = () => {
     }
     if (deviceAuth) setBiometricEnabled(true);
 
+    // storeWallet has already cleared what a previous wallet left on the device; its light node stops
+    // answering here, and the screen follows.
+    await teardownLightNodeIfForeign([
+      savedWallet.qnetAddress, savedWallet.publicKey, walletManager.generateQNetAddressFromSolana(savedWallet.publicKey),
+    ]);
+    resetWalletScopedState(savedWallet.qnetAddress);
     setShowSeedConfirm(false);
     setTempWallet(null);
     setLoading(false);
@@ -2743,22 +2754,9 @@ const WalletScreen = () => {
     setHasWallet(true);
     setConfirmPassword('');
     setSeedConfirmWords({});
-    setActivatedNodeType(null);
-    setActivationCode(null);
-    setNodePseudonym('');
-    setNodeStatus(null);
-    setLightNodeStatus(null);
-    setServerNodeStatus(null);
-
-    AsyncStorage.removeItem('qnet_activation_codes');
-    AsyncStorage.removeItem('qnet_activation_meta_light');
-    AsyncStorage.removeItem('qnet_activation_meta_full');
-    AsyncStorage.removeItem('qnet_activation_meta_super');
-    AsyncStorage.removeItem('qnet_last_activated_node');
-    AsyncStorage.removeItem(`blockchain_check_${savedWallet.publicKey}`);
 
     setActiveTab('assets');
-    loadBalance(savedWallet.publicKey);
+    loadBalance(savedWallet.publicKey, savedWallet);
   };
 
   const _startLockoutCountdown = (remainingMs) => {
@@ -2819,9 +2817,12 @@ const WalletScreen = () => {
       return;
     }
 
-
     // Load wallet asynchronously (may trigger vault migration)
     walletManager.loadWallet(pw).then(loadedWallet => {
+      // The secret that opened the vault signs this session's sends, claims and registrations — also
+      // when it came from Face ID / fingerprint rather than the password field. Set only once the
+      // session is open; auto-lock and logout clear it.
+      setPassword(pw);
       setLoading(false);
       // Show migration notification if vault was upgraded
       if (loadedWallet._migrated) {
@@ -2841,8 +2842,15 @@ const WalletScreen = () => {
 
       setWallet(loadedWallet);
 
+      // A light-node record another wallet left on this device stops answering here.
+      teardownLightNodeIfForeign([
+        loadedWallet.qnetAddress,
+        loadedWallet.publicKey,
+        walletManager.generateQNetAddressFromSolana(loadedWallet.publicKey),
+      ]);
+
       // Load balance in parallel
-      loadBalance(loadedWallet.publicKey);
+      loadBalance(loadedWallet.publicKey, loadedWallet);
 
       // Retry a pending on-chain node registration if one was left unlanded. Password is available here;
       // the wallet ML-DSA key that signs the on-chain TX can't be decrypted on a background push wake, so
@@ -3009,29 +3017,17 @@ const WalletScreen = () => {
               style: 'destructive',
               onPress: async () => {
                 try {
+                  // The same clean slate as a delete: the old wallet's node stops answering here and
+                  // none of its data carries over to the next one.
+                  await teardownLightNode();
+                  resetWalletScopedState(null);
+                  await walletManager.wipeWalletScope();
                   await AsyncStorage.removeItem('qnet_wallet');
                   await AsyncStorage.removeItem('qnet_wallet_address');
+                  await walletManager.disableBiometricUnlock();
+                  setBiometricEnabled(false);
                   setHasWallet(false);
                   setPassword('');
-                  setActivatedNodeType(null);
-                  setActivationCode(null);
-                  setNodeStatus(null);
-                  setLightNodeStatus(null);
-                  setServerNodeStatus(null);
-                  setNodePseudonym('');
-                  // Clear ALL node-related AsyncStorage (both light and super)
-                  const keysAll = await AsyncStorage.getAllKeys();
-                  const nodeKeys = keysAll.filter(k =>
-                    k.startsWith('blockchain_check_') ||
-                    k.startsWith('node_pseudonym_') ||
-                    k === 'qnet_activation_codes' ||
-                    k === 'qnet_activation_meta_light' ||
-                    k === 'qnet_activation_meta_full' ||
-                    k === 'qnet_activation_meta_super' ||
-                    k === 'qnet_last_activated_node' ||
-                    k === 'qnet_cached_server_status'
-                  );
-                  if (nodeKeys.length > 0) await AsyncStorage.multiRemove(nodeKeys);
                   showAlert('Success', 'Wallet data cleared. You can now create a new wallet or import an existing one.');
                 } catch (clearError) {
                   // console.error('Error clearing wallet:', clearError);
@@ -3069,6 +3065,8 @@ const WalletScreen = () => {
         persisted = raw ? JSON.parse(raw) : [];
         if (!Array.isArray(persisted)) persisted = [];
       } catch (_) { persisted = []; }
+      const stillCurrent = () => !currentOwnerRef.current || currentOwnerRef.current === qnetAddress;
+      if (!stillCurrent()) return;
       setCustomTokens(persisted);
 
       await Promise.all(persisted.map(async (c) => {
@@ -3088,6 +3086,7 @@ const WalletScreen = () => {
       }));
 
       const list = Array.from(byContract.values());
+      if (!stillCurrent()) return;
       setQrcTokens(list);
 
       // Trustless upgrade: verify each held token's balance via its two-level proof against the
@@ -3102,7 +3101,7 @@ const WalletScreen = () => {
           const tk = toProve[proofIdx++];
           try {
             const r = await walletManager.getTokenBalanceWithProof(tk.contract, qnetAddress, tk.decimals);
-            if (r && r.ok && r.verified) {
+            if (r && r.ok && r.verified && stillCurrent()) {
               setQrcTokens((prev) => prev.map((t) => (t.contract === tk.contract
                 ? { ...t, balance: r.balance, verified: true } : t)));
             }
@@ -3177,10 +3176,11 @@ const WalletScreen = () => {
     })();
   }, []);
 
-  const loadBalance = async (publicKey) => {
+  // `target` is the wallet to read for; flows that have just created, imported or unlocked one pass it,
+  // because the `wallet` state in this closure may still be the previous one (or null).
+  const loadBalance = async (publicKey, target = null) => {
     try {
-      // Get current wallet reference (might be set after initial call)
-      const currentWallet = wallet || await walletManager.getCurrentWallet();
+      const currentWallet = target || wallet || await walletManager.getCurrentWallet();
       // Load QRC-20 token holdings in the SAME effect as balances (non-blocking).
       const qnetAddr = currentWallet?.qnetAddress;
       if (qnetAddr) loadQrcTokens(qnetAddr);
@@ -3200,6 +3200,10 @@ const WalletScreen = () => {
         walletManager.getQNCBalanceWithProof(currentWallet?.qnetAddress, true)
       ]);
       
+      // A read that started for a wallet no longer on screen (a send poller of the previous one, a
+      // switch mid-fetch) applies nothing.
+      if (currentOwnerRef.current && qnetAddr && qnetAddr !== currentOwnerRef.current) return;
+
       const qncOk = !!qncResult?.ok;
       const isBalanceVerified = qncResult?.verified || false;
       setBalanceVerified && setBalanceVerified(qncOk && isBalanceVerified);
@@ -3223,17 +3227,12 @@ const WalletScreen = () => {
         qncToApply = q;
       }
 
-      // Merge: overwrite a token ONLY when its fetch succeeded (null/failed ⇒ keep last-known).
-      setTokenBalances(prev => {
-        const next = { ...prev };
-        if (bal != null) next.sol = bal;
-        if (oneDevBalance != null) next['1dev'] = oneDevBalance;
-        if (qncToApply != null) {
-          // Anti-zeroing: an UNVERIFIED node may not LOWER the displayed balance (keep last-known).
-          next.qnc = (!optimistic && !isBalanceVerified && qncToApply < (prev.qnc || 0)) ? prev.qnc : qncToApply;
-        }
-        return next;
-      });
+      // Merge: overwrite a token ONLY when its fetch succeeded (null/failed ⇒ keep last-known) — and
+      // "last-known" is only ever this same address's; another wallet's balances start from zero.
+      setTokenBalances(prev => mergeTokenBalances(prev, {
+        owner: qnetAddr || null, sol: bal, oneDev: oneDevBalance, qnc: qncToApply,
+        verified: isBalanceVerified, optimistic,
+      }));
       if (bal != null) setBalance(bal);
 
       await fetchTokenPrices();
@@ -3327,7 +3326,7 @@ const WalletScreen = () => {
                 updateTxStatus(data.data.tx_hash, 'confirmed');
               }
               if (Number.isFinite(newBalanceQnc)) {
-                setTokenBalances(prev => ({ ...prev, qnc: newBalanceQnc }));
+                setTokenBalances(prev => mergeTokenBalances(prev, { owner: myAddress, qnc: newBalanceQnc, verified: true }));
               }
               if (txHistoryDebounceRef.current) clearTimeout(txHistoryDebounceRef.current);
               txHistoryDebounceRef.current = setTimeout(() => { txHistoryDebounceRef.current = null; loadTxHistory(); }, 1200);
@@ -3590,15 +3589,7 @@ const WalletScreen = () => {
   };
 
   const fetchTokenPrices = async () => {
-    // Set fallback prices ONLY if not already set (prevent resetting real prices)
-    setTokenPrices(prev => {
-      if (prev.sol === 0 || prev.sol === undefined) {
-        return { qnc: 0.0125, sol: 150.00, '1dev': 0.0001 };
-      }
-      return prev; // Keep existing prices
-    });
-    
-    // Fetch real prices (no delay needed)
+    // Only quoted prices are shown; until a quote arrives the price stays 0 and renders as a dash.
     try {
       // Only fetch prices if wallet is loaded
       if (!wallet) return;
@@ -3648,6 +3639,53 @@ const WalletScreen = () => {
     } catch (error) {
       // Silently fail, keep existing prices
     }
+  };
+
+  // A recovered code: a light node gets the code alone, ready to paste; a super node also gets the burn it
+  // came from (transaction and amount), which its server activation asks for.
+  const showRecoveredCode = async (nodeType, code, burnTxHash, burnAmount) => {
+    const isSuper = nodeType === 'super';
+    if (isSuper && (!burnTxHash || !burnAmount)) {
+      try {
+        const meta = JSON.parse((await AsyncStorage.getItem(`qnet_activation_meta_${nodeType}`)) || 'null');
+        burnTxHash = burnTxHash || meta?.burnTxHash || meta?.signature;
+        burnAmount = burnAmount || meta?.burnAmount;
+      } catch (_) { /* show what we have */ }
+    }
+    const copyText = isSuper
+      ? [code, burnTxHash && `Burn TX: ${burnTxHash}`, burnAmount && `Burn Amount: ${burnAmount}`].filter(Boolean).join('\n')
+      : code;
+    const view = (
+      <View style={{ paddingHorizontal: 16, paddingVertical: 12 }}>
+        <TouchableOpacity
+          onPress={() => { Clipboard.setString(copyText); }}
+          style={{ backgroundColor: 'rgba(0, 212, 255, 0.1)', borderRadius: 8, padding: 10, marginBottom: isSuper ? 12 : 0 }}
+        >
+          <Text style={{ fontFamily: 'monospace', color: '#00d4ff', fontSize: 13, textAlign: 'center', lineHeight: 20 }}>
+            {code}
+          </Text>
+          <Text style={{ color: '#888', fontSize: 10, textAlign: 'center', marginTop: 4 }}>
+            Tap to copy
+          </Text>
+        </TouchableOpacity>
+        {isSuper && (
+          <Text style={[styles.modalContent, { textAlign: 'left', fontSize: 13 }]}>
+            <Text style={{ fontWeight: 'bold' }}>Node Type:</Text> SUPER
+            {burnTxHash ? <>{'\n'}<Text style={{ fontWeight: 'bold' }}>Burn TX:</Text> {burnTxHash}</> : null}
+            {burnAmount ? <>{'\n'}<Text style={{ fontWeight: 'bold' }}>Burn Amount:</Text> {burnAmount} 1DEV</> : null}
+          </Text>
+        )}
+      </View>
+    );
+    showAlert(
+      'Code Recovered',
+      '',
+      [
+        { text: 'Copy Code', style: 'default', onPress: () => { Clipboard.setString(copyText); } },
+        { text: 'OK', style: 'default' }
+      ],
+      view
+    );
   };
 
   const generateActivationCode = async () => {
@@ -3834,7 +3872,9 @@ const WalletScreen = () => {
         // No codes stored yet
         setShowExportActivation(false);
         setExportPassword('');
-        showAlert('Info', 'No activation codes generated yet. Generate one from the Activation tab.');
+        showAlert('Info', IN_APP_ACTIVATION
+          ? 'No activation codes generated yet. Generate one from the Activation tab.'
+          : 'No activation codes are stored in this wallet.');
       }
     } catch (error) {
       // console.error('Export activation error:', error);
@@ -3859,28 +3899,30 @@ const WalletScreen = () => {
     try {
       setLoading(true);
       
-      // Verify current password by trying to unlock wallet
-      const walletData = await walletManager.loadWallet(currentPassword);
-      if (!walletData) {
+      // Re-encrypt the vault as stored (seed phrase included) and the activation codes; a wrong current
+      // password fails the decryption.
+      try {
+        await walletManager.changePassword(currentPassword, newPassword);
+      } catch (_) {
         showAlert('Error', 'Current password is incorrect');
         setLoading(false);
         return;
       }
-
-      // Re-encrypt wallet with new password
-      await walletManager.storeWallet(walletData, newPassword);
+      setPassword(newPassword);
 
       // Update Keychain if biometric unlock is enabled
       if (biometricEnabled) {
         await walletManager.enableBiometricUnlock(newPassword);
       }
       
+      setLoading(false);
       showAlert('Success', 'Password changed successfully!');
       setShowChangePassword(false);
       setCurrentPassword('');
       setNewPassword('');
       setConfirmNewPassword('');
     } catch (error) {
+      setLoading(false);
       showAlert('Error', 'Failed to change password: ' + error.message);
     }
   };
@@ -3920,6 +3962,35 @@ const WalletScreen = () => {
     }
   };
 
+  // Everything on screen that belongs to one wallet, back to empty — run whenever the wallet on this
+  // device changes (delete, clear, create, import), so nothing of the previous one is shown or used.
+  const resetWalletScopedState = (nextQnetAddress = null) => {
+    currentOwnerRef.current = nextQnetAddress;
+    outcomeRunRef.current++; // a send-outcome resolver of the previous wallet steps aside
+    lastHistoryAddrRef.current = null;
+    historyCursorRef.current = undefined;
+    setHistoryAsset('all');
+    setTokenBalances({ owner: nextQnetAddress, qnc: 0, sol: 0, '1dev': 0 });
+    setBalance(0);
+    setBalanceVerified(false);
+    setQrcTokens([]);
+    setCustomTokens([]);
+    setHiddenTokens(new Set());
+    setTxHistory([]);
+    pendingTxRef.current = null;
+    if (txPollingRef.current) { clearInterval(txPollingRef.current); txPollingRef.current = null; }
+    setTxResult(null);
+    setShowSendScreen(false);
+    setSendingToken(null);
+    setActivatedNodeType(null);
+    setActivationCode(null);
+    setNodePseudonym('');
+    setNodeStatus(null);
+    setLightNodeStatus(null);
+    setServerNodeStatus(null);
+    setAllUserNodes([]);
+  };
+
   const deleteWallet = async () => {
     showAlert(
       '⚠️ Delete Wallet',
@@ -3935,32 +4006,15 @@ const WalletScreen = () => {
               // signing key, and removes qnet_light_node_info / qnet_ping_node_id / last-attest epoch.
               // Otherwise the "deleted" device keeps attesting (and earning eligibility) for 1-2 epochs.
               await teardownLightNode();
+              resetWalletScopedState(null);
+              await walletManager.wipeWalletScope();
               await AsyncStorage.removeItem('qnet_wallet');
               await AsyncStorage.removeItem('qnet_wallet_address');
               await walletManager.disableBiometricUnlock();
               setBiometricEnabled(false);
               setWallet(null);
               setHasWallet(false);
-              setActivatedNodeType(null);
-              setActivationCode(null);
-              setNodeStatus(null);
-              setLightNodeStatus(null);
-              setServerNodeStatus(null);
-              setNodePseudonym('');
-              // Clear ALL node-related AsyncStorage (both light and super)
-              const keysAll = await AsyncStorage.getAllKeys();
-              const nodeKeys = keysAll.filter(k =>
-                k.startsWith('blockchain_check_') ||
-                k.startsWith('node_pseudonym_') ||
-                k === 'qnet_activation_codes' ||
-                k === 'qnet_activation_meta_light' ||
-                k === 'qnet_activation_meta_full' ||
-                k === 'qnet_activation_meta_super' ||
-                k === 'qnet_last_activated_node' ||
-                k === 'qnet_cached_server_status'
-              );
-              if (nodeKeys.length > 0) await AsyncStorage.multiRemove(nodeKeys);
-              
+
             } catch (error) {
               showAlert('Error', 'Failed to delete wallet: ' + error.message);
             }
@@ -4000,6 +4054,11 @@ const WalletScreen = () => {
               scrollEnabled={true}
             >
               <Text style={styles.termsModalText}>{t('terms_text')}</Text>
+              {LEGAL_LINKS.slice(0, 2).map(([label, url]) => (
+                <TouchableOpacity key={url} onPress={() => Linking.openURL(url).catch(() => {})}>
+                  <Text style={[styles.termsModalText, { color: '#00d4ff', marginTop: 12 }]}>{label}: {url}</Text>
+                </TouchableOpacity>
+              ))}
             </ScrollView>
             
             <View style={styles.termsModalButtons}>
@@ -4850,7 +4909,7 @@ const WalletScreen = () => {
 
         // Normal Assets View
         return (
-          <TabBox key="assets-normal" deps={[refreshing, wallet, selectedNetwork, tokenBalances, balance, tokenPrices, copiedAddress, qrcTokens, hiddenTokens, balancesHidden]} render={() => (
+          <TabBox key="assets-normal" deps={[refreshing, wallet, selectedNetwork, tokenBalances, balance, tokenPrices, isTestnet, copiedAddress, qrcTokens, hiddenTokens, balancesHidden]} render={() => (
           <ScrollView
             style={styles.content}
             contentContainerStyle={styles.scrollContentContainer}
@@ -5042,12 +5101,12 @@ const WalletScreen = () => {
                     </View>
                     <View style={styles.tokenDetails}>
                       <Text style={styles.tokenName}>SOL</Text>
-                      <Text style={styles.tokenPrice}>${tokenPrices.sol.toFixed(2)}</Text>
+                      <Text style={styles.tokenPrice}>{usd(tokenPrices.sol, 1)}</Text>
                     </View>
                   </View>
                   <View style={styles.tokenBalance}>
                     <Text style={styles.tokenAmount}>{maskAmt(fmtAmount(balance, 4))}</Text>
-                    <Text style={styles.tokenValue}>{maskAmt(`$${(balance * tokenPrices.sol).toFixed(2)}`)}</Text>
+                    <Text style={styles.tokenValue}>{maskAmt(usd(tokenPrices.sol, balance))}</Text>
                   </View>
                 </View>
                 {/* 1DEV Token */}
@@ -5066,12 +5125,12 @@ const WalletScreen = () => {
                     </View>
                     <View style={styles.tokenDetails}>
                       <Text style={styles.tokenName}>1DEV</Text>
-                      <Text style={styles.tokenPrice}>${tokenPrices['1dev'].toFixed(4)}</Text>
+                      <Text style={styles.tokenPrice}>{usd(tokenPrices['1dev'], 1, 4)}</Text>
                     </View>
                   </View>
                   <View style={styles.tokenBalance}>
                     <Text style={styles.tokenAmount}>{maskAmt(fmtAmount(tokenBalances['1dev'], 4))}</Text>
-                    <Text style={styles.tokenValue}>{maskAmt(`$${(tokenBalances['1dev'] * tokenPrices['1dev']).toFixed(2)}`)}</Text>
+                    <Text style={styles.tokenValue}>{maskAmt(usd(tokenPrices['1dev'], tokenBalances['1dev']))}</Text>
                   </View>
                 </View>
               </View>
@@ -5158,6 +5217,7 @@ const WalletScreen = () => {
           >
             <Text style={styles.tabTitle}>Node Activation</Text>
             
+            {IN_APP_ACTIVATION ? (<>
             {/* Phase Indicator */}
             <View style={styles.phaseCard}>
               <Text style={styles.phaseTitle}>
@@ -5628,6 +5688,16 @@ const WalletScreen = () => {
                   : 'Get Activation Code'}
               </Text>
             </TouchableOpacity>
+            </>) : (
+              /* Google Play build: no activation is started here (see config/store.js). An activation this
+                 wallet already holds is found by the recovery below and registered from the Node tab. */
+              <View style={styles.phaseCard}>
+                <Text style={styles.phaseTitle}>Recover a node activation</Text>
+                <Text style={styles.phaseSubtitle}>
+                  A wallet that already holds a node activation on chain recovers its activation code here, then activates the node on the Node tab.
+                </Text>
+              </View>
+            )}
 
             {/* Recover Code button — for users who already burned 1DEV but lost their code */}
             {!activatedNodeType && !activatingNode && (
@@ -5698,7 +5768,7 @@ const WalletScreen = () => {
                           walletAddress: wallet.qnetAddress || wallet.address
                         }));
                         
-                        showAlert('Code Found', `Your ${firstType} node activation code was found in local storage.`);
+                        showRecoveredCode(firstType, codeStr, firstCode?.burnTxHash, firstCode?.burnAmount);
                         return;
                       }
                     }
@@ -5735,44 +5805,16 @@ const WalletScreen = () => {
                             walletAddress: qnetEonAddress
                           })).catch(() => {});
                           
-                          const richRecovered2 = (
-                            <View style={{ paddingHorizontal: 16, paddingVertical: 12 }}>
-                              <Text style={[styles.modalContent, { textAlign: 'left', marginBottom: 8, fontSize: 13 }]}>
-                                <Text style={{ fontWeight: 'bold' }}>Activation Code:</Text>
-                              </Text>
-                              <TouchableOpacity
-                                onPress={() => { Clipboard.setString(nodeType === 'super' ? `${code}\nBurn TX: ${burnInfo.burnTxHash}` : code); }}
-                                style={{ backgroundColor: 'rgba(0, 212, 255, 0.1)', borderRadius: 8, padding: 10, marginBottom: 12 }}
-                              >
-                                <Text style={{ fontFamily: 'monospace', color: '#00d4ff', fontSize: 13, textAlign: 'center', lineHeight: 20 }}>
-                                  {code}
-                                </Text>
-                                <Text style={{ color: '#888', fontSize: 10, textAlign: 'center', marginTop: 4 }}>
-                                  Tap to copy
-                                </Text>
-                              </TouchableOpacity>
-                              <Text style={[styles.modalContent, { textAlign: 'left', fontSize: 13 }]}>
-                                <Text style={{ fontWeight: 'bold' }}>Node Type:</Text> {nodeType.toUpperCase()}{'\n'}
-                                {nodeType === 'super' && <><Text style={{ fontWeight: 'bold' }}>Burn TX:</Text> {burnInfo.burnTxHash.substring(0, 20)}...</>}
-                              </Text>
-                            </View>
-                          );
-                          showAlert(
-                            'Code Recovered',
-                            '',
-                            [
-                              { text: 'Copy Code', style: 'default', onPress: () => { Clipboard.setString(nodeType === 'super' ? `${code}\nBurn TX: ${burnInfo.burnTxHash}` : code); } },
-                              { text: 'OK', style: 'default' }
-                            ],
-                            richRecovered2
-                          );
+                          showRecoveredCode(nodeType, code, burnInfo.burnTxHash, burnInfo.burnAmount);
                           return;
                         }
                         
                         // burnAmount not found in TX — show what we have
                         showAlert(
-                          'Burn Transaction Found',
-                          `Found burn TX: ${burnInfo.burnTxHash.substring(0, 20)}...\nType: ${nodeType}\nAmount: ${burnInfo.burnAmount || 'unknown'}\n\nCould not read burn amount from Solana. Please try again.`,
+                          IN_APP_ACTIVATION ? 'Burn Transaction Found' : 'Activation Found',
+                          IN_APP_ACTIVATION
+                            ? `Found burn TX: ${burnInfo.burnTxHash.substring(0, 20)}...\nType: ${nodeType}\nAmount: ${burnInfo.burnAmount || 'unknown'}\n\nCould not read burn amount from Solana. Please try again.`
+                            : `Found the activation transaction ${burnInfo.burnTxHash.substring(0, 20)}... (${nodeType}), but could not read its details from Solana. Please try again.`,
                           [{ text: 'OK' }]
                         );
                         return;
@@ -5799,37 +5841,7 @@ const WalletScreen = () => {
                           walletAddress: wallet.qnetAddress || wallet.address
                         })).catch(() => {});
                         
-                        const richRecovered3 = (
-                          <View style={{ paddingHorizontal: 16, paddingVertical: 12 }}>
-                            <Text style={[styles.modalContent, { textAlign: 'left', marginBottom: 8, fontSize: 13 }]}>
-                              <Text style={{ fontWeight: 'bold' }}>Activation Code:</Text>
-                            </Text>
-                            <TouchableOpacity
-                              onPress={() => { Clipboard.setString(firstType === 'super' ? `${code}\nBurn TX: ${value?.burnTxHash || ''}` : code); }}
-                              style={{ backgroundColor: 'rgba(0, 212, 255, 0.1)', borderRadius: 8, padding: 10, marginBottom: 12 }}
-                            >
-                              <Text style={{ fontFamily: 'monospace', color: '#00d4ff', fontSize: 13, textAlign: 'center', lineHeight: 20 }}>
-                                {code}
-                              </Text>
-                              <Text style={{ color: '#888', fontSize: 10, textAlign: 'center', marginTop: 4 }}>
-                                Tap to copy
-                              </Text>
-                            </TouchableOpacity>
-                            <Text style={[styles.modalContent, { textAlign: 'left', fontSize: 13 }]}>
-                              <Text style={{ fontWeight: 'bold' }}>Node Type:</Text> {firstType.toUpperCase()}
-                              {firstType === 'super' && <>{'\n'}<Text style={{ fontWeight: 'bold' }}>Burn TX:</Text> {(value?.burnTxHash || '').substring(0, 20)}...</>}
-                            </Text>
-                          </View>
-                        );
-                        showAlert(
-                          'Code Recovered',
-                          '',
-                          [
-                            { text: 'Copy Code', style: 'default', onPress: () => { Clipboard.setString(firstType === 'super' ? `${code}\nBurn TX: ${value?.burnTxHash || ''}` : code); } },
-                            { text: 'OK', style: 'default' }
-                          ],
-                          richRecovered3
-                        );
+                        showRecoveredCode(firstType, code, value?.burnTxHash, value?.burnAmount);
                         return;
                       }
                     }
@@ -5857,7 +5869,9 @@ const WalletScreen = () => {
                     // Step 4: Nothing found
                     showAlert(
                       'No Activation Found',
-                      'No 1DEV burn transaction or activation code was found for this wallet address.\n\nIf you recently burned tokens, please wait a few minutes and try again.',
+                      IN_APP_ACTIVATION
+                        ? 'No 1DEV burn transaction or activation code was found for this wallet address.\n\nIf you recently burned tokens, please wait a few minutes and try again.'
+                        : 'No node activation was found for this wallet address.',
                       [{ text: 'OK' }]
                     );
                   } catch (error) {
@@ -6223,7 +6237,9 @@ const WalletScreen = () => {
             <View style={styles.emptyState}>
                 <Text style={styles.emptyText}>No Active Node</Text>
                 <Text style={styles.emptySubtext}>
-                  Get an activation code to run a Light node here. Super nodes are set up on a server.
+                  {IN_APP_ACTIVATION
+                    ? 'Get an activation code to run a Light node here. Super nodes are set up on a server.'
+                    : 'If this wallet already holds a node activation, recover its code to run the node here. Super nodes are set up on a server.'}
                 </Text>
 
                 <TouchableOpacity
@@ -6233,7 +6249,7 @@ const WalletScreen = () => {
                   }}
                 >
                   <Text style={styles.buttonText}>
-                    Get Activation Code
+                    {IN_APP_ACTIVATION ? 'Get Activation Code' : 'Recover Activation Code'}
                   </Text>
                 </TouchableOpacity>
             </View>
@@ -6385,6 +6401,16 @@ const WalletScreen = () => {
               </View>
             </View>
 
+            {/* The published texts, one tap from the app (the stores require the privacy policy in-app too). */}
+            <View style={styles.settingGroup}>
+              <Text style={styles.settingGroupTitle}>Legal and support</Text>
+              {LEGAL_LINKS.map(([label, url]) => (
+                <TouchableOpacity key={url} style={styles.actionButton} onPress={() => Linking.openURL(url).catch(() => {})}>
+                  <Text style={styles.actionButtonText}>{label}</Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+
             {/* Danger Zone */}
             <View style={styles.settingGroup}>
               <Text style={[styles.settingGroupTitle, {color: '#ff4444'}]}>{t('danger_zone')}</Text>
@@ -6398,8 +6424,9 @@ const WalletScreen = () => {
                     [
                       {text: t('cancel'), style: 'cancel'},
                       {text: t('logout'), style: 'destructive', onPress: () => {
-                        // Just lock the wallet, don't delete it
+                        // Just lock the wallet, don't delete it — and drop the session secret, as auto-lock does
                         setWallet(null);
+                        setPassword('');
                         setActiveTab('assets');
                         // Wallet data remains in AsyncStorage, user just needs to unlock again
                       }}
