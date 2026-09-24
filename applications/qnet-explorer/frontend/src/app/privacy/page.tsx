@@ -58,7 +58,10 @@ export default function PrivacyPage() {
                 about your addresses, automatically while it is open. Like any web server, those services see the requesting IP
                 address and the request in ordinary technical logs kept for a short time for operation and abuse prevention. They
                 are not used to profile you. For dollar values the app also fetches SOL and 1DEV prices from CoinGecko, and the
-                Solana tab loads token logos from GitHub; those requests carry no address, but the services see your IP address.
+                Solana tab loads token logos from GitHub. The Android app installed from outside Google Play (the APK) asks
+                GitHub whether a newer version exists, at most every 12 hours after the wallet is opened and whenever you tap
+                Check for updates, and Download fetches the new APK from GitHub. None of these requests carries an address, but
+                the services see your IP address.
               </li>
               <li>
                 <strong>Light node.</strong> When you activate a light node, the app registers with the network&apos;s genesis nodes

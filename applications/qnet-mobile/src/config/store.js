@@ -9,3 +9,7 @@ export const STORE = Platform.OS === 'ios' ? 'ios' : (NativeModules.QNetStore?.S
 // burns 1DEV, so the Play build does not start one; it still recovers and registers an activation this
 // wallet already holds on chain.
 export const IN_APP_ACTIVATION = STORE !== 'play';
+
+// The installed build (Android only; 0 / '' where the native module does not report it).
+export const APP_VERSION_CODE = Number(NativeModules.QNetStore?.VERSION_CODE) || 0;
+export const APP_VERSION_NAME = NativeModules.QNetStore?.VERSION_NAME || '';

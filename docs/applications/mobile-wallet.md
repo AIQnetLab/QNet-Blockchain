@@ -388,6 +388,12 @@ Refresh off for the app, is proven only when it is opened. See
   the wallet already holds, and the Node tab runs it (`src/config/store.js`).
 - Dollar values on the Solana tab appear only for a quoted price on mainnet; otherwise a dash.
 - Settings and the terms screen link to the privacy policy, the terms and the support page on aiqnet.io.
+- The site APK updates from GitHub Releases (`src/services/UpdateCheck.js`): once a wallet is open, at most every
+  12 hours, it lists the repository's releases, takes the highest `wallet-<versionName>-<versionCode>` release that
+  carries `QNet-Wallet.apk`, and offers the download when its versionCode is above the installed one; Settings has
+  «Check for updates». The APK is signed with the same key, so it installs over the old one and keeps the wallet.
+  Play and iOS builds never ask. To publish: bump `versionCode`/`versionName` in `android/app/build.gradle`,
+  `./gradlew assembleSiteRelease`, create the release with that tag and attach the APK as `QNet-Wallet.apk`.
 - Release signing reads `keystore.properties`, falling back to the `QNET_KEYSTORE_PASSWORD` and
   `QNET_KEY_PASSWORD` environment variables; both are operator-supplied. Keystores and signing
   properties are never committed. An F-Droid reproducible-build metadata file points at the `android`

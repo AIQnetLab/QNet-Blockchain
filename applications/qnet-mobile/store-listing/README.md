@@ -76,12 +76,17 @@ them to. Everything else: not collected. `NSPrivacyTracking` is false; there is 
 
 ## Google Play — Financial features declaration
 
-Declare **Cryptocurrency wallet** (non-custodial) and **Tokenized digital asset (NFT) sales, trading, and awards**:
-the blockchain-based content policy requires the declaration for an app that "enables users to earn
-tokenized digital assets", which a light node's rewards are. The wallet is non-custodial, which Google's
-cryptocurrency exchanges and software wallets policy places out of scope of its licensing requirements; no
-exchange, no fiat on-ramp, no custody, no lending. The same policy's prohibition on device mining is not
-engaged: the device signs status requests and one attestation per epoch, and computes nothing else.
+Declared: **Cryptocurrency wallet** only. Light-node rewards are QNC, a fungible coin, not a tokenized digital
+asset (NFT); the app sells, trades and awards no NFTs. Declaring the NFT category as well disables the
+non-custodial exemption and demands a crypto licence in every targeted jurisdiction.
+
+Documentation step (all countries targeted): Google lists Bahrain, Canada, the EU, Israel, Japan, the Philippines,
+South Africa, South Korea, the UAE, the UK and the US, and in each the app is declared **a non-custodial software
+wallet** — keys stay on the device; no exchange, no fiat on-ramp, no custody, no lending. For "all countries or
+regions" the publisher accepts Google's terms that any licence local law requires is held and that changes in
+legal status are reported. The IARC questionnaire answers "convertible cryptocurrency rewards: yes" for the
+node rewards. The policy's prohibition on device mining is not engaged: the device signs status requests and
+one attestation per epoch, and computes nothing else.
 
 ## Google Play — build and package
 

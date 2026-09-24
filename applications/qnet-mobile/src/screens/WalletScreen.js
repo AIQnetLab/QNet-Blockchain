@@ -47,7 +47,8 @@ import {
   mergeHistory, appendHistory, cacheableHistory,
 } from '../utils/txHistory';
 import { TRANSFER_FEE_NANO, TRANSFER_FEE_QNC } from '../config/fees';
-import { IN_APP_ACTIVATION } from '../config/store';
+import { IN_APP_ACTIVATION, STORE, APP_VERSION_CODE, APP_VERSION_NAME } from '../config/store';
+import { checkForUpdate, dismissUpdate } from '../services/UpdateCheck';
 import { mergeTokenBalances } from '../utils/balanceMerge';
 import translations from '../i18n/translations';
 import styles from './WalletScreen.styles';
@@ -420,6 +421,15 @@ const WalletScreen = () => {
   const lastHistoryAddrRef = useRef(null); // wallet the loaded history belongs to (a switch clears it, an unlock does not)
   const currentOwnerRef = useRef(null); // QNet address of the wallet on screen; late reads for another are dropped
   useEffect(() => { if (wallet?.qnetAddress) currentOwnerRef.current = wallet.qnetAddress; }, [wallet]);
+  // The site APK looks for a newer release once a wallet is open (at most every 12 hours; Play and the App
+  // Store update their own builds, so checkForUpdate does nothing there).
+  const walletOpen = !!wallet;
+  useEffect(() => {
+    if (!walletOpen) return undefined;
+    let alive = true;
+    checkForUpdate().then((r) => { if (alive && r.status === 'update') offerUpdate(r.release); });
+    return () => { alive = false; };
+  }, [walletOpen]);
   const [serverNodeStatus, setServerNodeStatus] = useState(null); // Super node network status
   const [allUserNodes, setAllUserNodes] = useState([]); // All nodes owned by this wallet (unified view)
   const [loadingAllNodes, setLoadingAllNodes] = useState(false); // Loading state for all nodes
@@ -3641,6 +3651,17 @@ const WalletScreen = () => {
     }
   };
 
+  // A newer release of the site APK: download it and install it over this one (same signing key, so the
+  // wallet and its data stay).
+  const offerUpdate = (u) => showAlert(
+    'Update available',
+    `QNet Wallet ${u.versionName} is available (this is ${APP_VERSION_NAME}). Download it and install it over this app — your wallet and settings stay.`,
+    [
+      { text: 'Later', style: 'cancel', onPress: () => { dismissUpdate(u.versionCode); } },
+      { text: 'Download', style: 'default', onPress: () => { Linking.openURL(u.url).catch(() => {}); } },
+    ]
+  );
+
   // A recovered code: a light node gets the code alone, ready to paste; a super node also gets the burn it
   // came from (transaction and amount), which its server activation asks for.
   const showRecoveredCode = async (nodeType, code, burnTxHash, burnAmount) => {
@@ -6409,6 +6430,19 @@ const WalletScreen = () => {
                   <Text style={styles.actionButtonText}>{label}</Text>
                 </TouchableOpacity>
               ))}
+              {STORE === 'site' && (
+                <TouchableOpacity
+                  style={styles.actionButton}
+                  onPress={async () => {
+                    const r = await checkForUpdate({ force: true });
+                    if (r.status === 'update') offerUpdate(r.release);
+                    else if (r.status === 'current') showAlert('Up to date', `QNet Wallet ${APP_VERSION_NAME} (${APP_VERSION_CODE}) is the latest version.`);
+                    else showAlert('Could not check', 'GitHub could not be reached. Try again later.');
+                  }}
+                >
+                  <Text style={styles.actionButtonText}>Check for updates · {APP_VERSION_NAME}</Text>
+                </TouchableOpacity>
+              )}
             </View>
 
             {/* Danger Zone */}

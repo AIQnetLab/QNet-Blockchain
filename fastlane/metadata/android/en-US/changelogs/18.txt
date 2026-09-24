@@ -1,0 +1,2 @@
+• The Android app from the website now checks GitHub for a newer version and offers to download it
+• Settings shows the installed version, with a button to check for updates now

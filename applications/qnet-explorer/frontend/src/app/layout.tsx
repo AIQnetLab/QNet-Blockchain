@@ -27,6 +27,8 @@ export const metadata: Metadata = {
     apple: '/icon-128.png',
   },
   metadataBase: new URL('https://aiqnet.io'),
+  // './' resolves against each page's own path, so every page names itself without its query string.
+  alternates: { canonical: './' },
   openGraph: {
     title: 'QNet - Post-Quantum Blockchain',
     description: 'The next generation of decentralized technology with quantum resistance.',
