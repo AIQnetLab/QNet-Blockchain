@@ -43,7 +43,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 22.16.0
           cache: npm
           cache-dependency-path: applications/qnet-mobile/package-lock.json
 
@@ -78,7 +78,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 22.16.0
           cache: npm
           cache-dependency-path: applications/qnet-mobile/package-lock.json
 
@@ -183,7 +183,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 22.16.0
           cache: npm
           cache-dependency-path: applications/qnet-mobile/package-lock.json
 
