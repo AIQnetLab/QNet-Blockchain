@@ -37,5 +37,13 @@ target 'QNetMobile' do
       :mac_catalyst_enabled => false,
       # :ccache_enabled => true
     )
+    # fmt 11 turns its format strings into consteval checks under C++20, which the Xcode 26 compiler rejects;
+    # under C++17 it checks them at run time instead. Only the fmt pod is built that way.
+    installer.pods_project.targets.each do |target|
+      next unless target.name == 'fmt'
+      target.build_configurations.each do |config|
+        config.build_settings['CLANG_CXX_LANGUAGE_STANDARD'] = 'c++17'
+      end
+    end
   end
 end
