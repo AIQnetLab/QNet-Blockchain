@@ -1,0 +1,10 @@
+{
+  "extName": {
+    "message": "Carteira QNet",
+    "description": "Extension name in the browser and the store."
+  },
+  "extDescription": {
+    "message": "Carteira QNet pós-quântica (ML-DSA-65) com conta Solana. Ativa um nó Light ou Super da QNet e registra o nó Light.",
+    "description": "Store and extensions-page description, at most 132 characters."
+  }
+}

@@ -1,24 +1,3 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-env/
-venv/
-.env
-build/
+node_modules/
 dist/
-
-# Documentation
-_build/
-.doctrees/
-
-# IDE
-.idea/
-.vscode/
-*.swp
-
-# OS
-.DS_Store
-Thumbs.db
+*.tsbuildinfo

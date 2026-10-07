@@ -3,10 +3,16 @@ apply plugin: "org.jetbrains.kotlin.android"
 apply plugin: "com.facebook.react"
 apply plugin: "com.google.gms.google-services"
 
+// The last update of the old package com.qnetmobile, for the installs that still have it: the same app with the
+// wallet only, no node, and a notice to install io.aiqnet.wallet and restore there with the recovery phrase
+// (./gradlew assembleRelease -PqnetLegacyMove, published once as a GitHub release, only after the Play listing is public:
+// release order and tag rule in docs/applications/mobile-wallet.md; never on Google Play or aiqnet.io).
+def legacyMove = project.hasProperty("qnetLegacyMove")
+
 react {
     autolinkLibrariesWithApp()
-    // With the store flavors the debug variants are siteDebug / playDebug; they load JS from Metro.
-    debuggableVariants = ["siteDebug", "playDebug", "siteDebugOptimized", "playDebugOptimized"]
+    // Only that update's JavaScript carries the move notice, its texts and its link (metro.legacy.config.js).
+    if (legacyMove) bundleConfig = file("../../metro.legacy.config.js")
 }
 
 /**
@@ -41,12 +47,14 @@ android {
 
     namespace "com.qnetmobile"
     defaultConfig {
-        applicationId "com.qnetmobile"
+        // One Android package: the Play-signed file from Google Play is the file aiqnet.io serves.
+        applicationId legacyMove ? "com.qnetmobile" : "io.aiqnet.wallet"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 18
-        versionName "1.1.7"
-        manifestPlaceholders = [usesCleartextTraffic: "true"]
+        versionCode 20
+        versionName "1.3.0"
+        buildConfigField "boolean", "QNET_LEGACY_MOVE", legacyMove ? "true" : "false"
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
 
         // NDK: pqclean Dilithium3 reference C code (same as pqcrypto-dilithium 0.5).
         // Build ALL ABIs so libdilithium_native.so is present on every device: many low-end
@@ -89,23 +97,10 @@ android {
             }
         }
     }
-    // Two distributions of one app. `site` keeps com.qnetmobile, the id every APK from aiqnet.io and GitHub
-    // has carried, so an update installs over what users already run. `play` is io.aiqnet.wallet: Google
-    // Play keeps a package name forever, and com.qnetmobile stays reserved by a closed developer account.
-    // Both are registered in the same Firebase project, so light-node pushes reach either.
-    flavorDimensions "store"
-    productFlavors {
-        site {
-            dimension "store"
-            applicationId "com.qnetmobile"
-        }
-        play {
-            dimension "store"
-            applicationId "io.aiqnet.wallet"
-            // ARM only: Play requires 16 KB-aligned 64-bit libraries, and the x86_64 libconceal shipped by
-            // react-native-keychain 8 is 4 KB-aligned; x86 cannot ship without its 64-bit twin.
-            ndk { abiFilters "armeabi-v7a", "arm64-v8a" }
-        }
+    // Debug-only resources: the network security config that also lets a debug build reach Metro on this
+    // machine. Kept outside `src/debug`, which the repository's .gitignore excludes as a build folder.
+    sourceSets {
+        debug.res.srcDirs += 'src/metroDebug/res'
     }
 
     buildTypes {
@@ -114,6 +109,9 @@ android {
         }
         release {
             signingConfig signingConfigs.release
+            // ARM only: Play requires 16 KB-aligned 64-bit libraries, and x86 cannot ship without its 64-bit twin.
+            // Debug builds keep every ABI for emulators.
+            ndk { abiFilters "armeabi-v7a", "arm64-v8a" }
             minifyEnabled true
             shrinkResources true
             proguardFiles getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro"
@@ -142,6 +140,34 @@ dependencies {
         implementation jscFlavor
     }
 
+    // BiometricPrompt with a CryptoObject for the vault's biometric key (SecurityModule).
+    implementation("androidx.biometric:biometric:1.1.0")
+
+    // Google Play's classic integrity token and its dialogs, for the device check of a light node (DeviceAttestModule).
+    implementation("com.google.android.play:integrity:1.6.0")
+
+    // JVM tests (src/test) and on-device tests of the device key (src/androidTest).
+    testImplementation("junit:junit:4.13.2")
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
+    androidTestImplementation("androidx.test:runner:1.6.2")
+
     // Bouncy Castle removed — Dilithium3 now handled by native pqclean C code (NDK)
     // pqclean dilithium3 is compiled via externalNativeBuild/CMakeLists.txt
+}
+
+// No release build without a light-client pin the release gate accepts (MOBNET-R5-03): written by
+// scripts/ws-pin.js, proven from the previous pin, recent. Debug builds are not held back.
+def qnetReleaseCheck = tasks.register("qnetReleaseCheck", Exec) {
+    workingDir = file("../..")
+    commandLine "node", "scripts/release-check.js"
+}
+// Nor one whose release JS bundle carries a removed flow or a forbidden text (the Metro half of the bundle scan,
+// __tests__/BundleContent.test.js). The old package's last update is scanned as it is built, with the legacy config: its
+// move notice must be in it (--legacy).
+def qnetBundleCheck = tasks.register("qnetBundleCheck", Exec) {
+    workingDir = file("../..")
+    commandLine(["node", "scripts/bundle-check.js", "--platform", "android"] + (legacyMove ? ["--legacy"] : []))
+}
+tasks.configureEach { task ->
+    if (task.name == "preReleaseBuild") task.dependsOn(qnetReleaseCheck, qnetBundleCheck)
 }

@@ -70,8 +70,8 @@ Two node types exist, `NodeType::Light` and `NodeType::Super`.
 | Chain persistence | Full history, subject to retention rules | None |
 | Archival duty | Yes | Never |
 | Consensus key in registry row | Mandatory, 1952-byte ML-DSA-65 `vrf_pk` | Absent |
-| Registration | Server-initiated by the node itself | Client-initiated from the mobile wallet |
-| Devices per identity | One | Up to 3 |
+| Registration | Server-initiated by the node itself | Submitted by the aiqnet.io node cabinet or the browser extension; the wallet signs its consent in QNet Wallet or the extension |
+| Devices per identity | One server | One phone or tablet, which passes the system's device check |
 
 Five genesis identities (`genesis_node_001` … `genesis_node_005`) are pinned in the binary with their 1952-byte public
 keys and addresses, and hold enumerable privileges: they are the bootstrap peer set, the fallback committee for the
@@ -711,7 +711,10 @@ the consensus committee of the attestation epoch, and that epoch must be within 
 (4) a committed `burn_tx → node_id` uniqueness index, keyed on node id rather than wallet because one wallet owns two
 pseudonyms and a wallet-keyed bind would let one burn activate both tiers. The reward wallet must be derivable either
 from the signing ML-DSA-65 wallet key or from the burning external address. Genesis identities are burn-exempt, bound
-to the five hardcoded ids.
+to the five hardcoded ids. From the `wallet_one_node` gate a wallet registers one node of either type: a registration
+whose wallet already has another node on chain is refused, and a block may not carry two registrations of one wallet
+under different node ids; a Light registration's burner may then sign
+`qnet_burn_owner_v2:{node_id}:{wallet}:{proof}:{attest_root_tag}:{burn_tx}` instead, which carries no time.
 
 ---
 

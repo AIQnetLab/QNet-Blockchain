@@ -1,31 +1,32 @@
-QNet Wallet is a non-custodial wallet for the QNet network. Keys are created on your device and never leave it. The app has no accounts, no analytics and no tracking.
+QNet Wallet is a non-custodial wallet for the QNet network. Keys are created on your device and never leave it. The app has no accounts, no analytics and no tracking, and works the same on phones and tablets.
 
 WALLET
-• Create a wallet or import one from a BIP39 seed phrase
-• Send and receive QNC and QNet tokens; show a QR code of your address
-• Transaction history that outlives node pruning — every entry opens in the block explorer
-• Filter history by asset
-• Fingerprint, face or password unlock
+• Create a wallet or restore one from a 12- or 24-word recovery phrase
+• Send and receive QNC and QNet tokens, and SOL and 1DEV from the wallet's Solana address (Solana devnet test tokens); show a QR code of your address, or scan an address or a Solana payment request to fill in the Send form
+• Transaction history that outlives node pruning; each confirmed QNet transaction opens in the block explorer, and the SOL and 1DEV sends made on this device are listed too
+• History split by network, QNet and Solana, under a header for each day
+• Unlock with fingerprint, face or the device's screen lock, or with a password on a device without one
+• A built-in web browser to use websites with the wallet: every connection, message signature, send and contract call is shown and confirmed in the app first
 
 LIGHT NODE (OPTIONAL)
-The app can run a QNet light node. A few times per four-hour epoch the network sends your phone a status request; the app signs it and answers from the background, without being opened. Between requests the app only wakes now and then to send one signed attestation per epoch; nothing is computed beyond signing. Each epoch's answers are recorded on chain, and that epoch's emission is shared among the nodes that answered. Rewards are claimed from the app as an ordinary on-chain transaction.
+A QNet light node is registered to a wallet on the QNet network. If the network lists one for your wallet, the Node tab shows it and this device can run it: about once every four hours the network sends a short signed status request, and the app answers with one ML-DSA-65 signature. This is not mining: no hashing, no proof-of-work, and blocks are produced by server nodes. The Node tab shows whether the node answered this epoch, how many epochs the network counted, and the node balance, which you can move into your wallet with an ordinary transaction. You can stop at any time. A wallet's super node runs on a server; the Node tab shows its status, epochs and node balance. The app sells nothing and has no in-app purchases.
 
-This version does not activate new nodes. A wallet that already holds a node activation on chain recovers its activation code in the app and runs its light node from there.
+The node runs only on phones and tablets that pass the system's device check, one node per device; on Android this needs a Google Play certified device.
 
 POST-QUANTUM CRYPTOGRAPHY
-Transactions are signed on the device with ML-DSA-65 (NIST FIPS 204). The QNet network's transport uses ML-KEM-768 hybrid key exchange.
+QNet transactions are signed on the device with ML-DSA-65 (NIST FIPS 204); SOL and 1DEV transfers are signed on the device with the wallet's Solana key (Ed25519).
 
 OPEN SOURCE
-The app, the browser extension and the explorer are open source under Apache-2.0; the node is source-available under the Business Source License 1.1. All of it is one public repository, so anyone can read exactly what the app does and build it.
+The app is open source under Apache-2.0, in one public repository with the rest of QNet; the node is source-available under the Business Source License 1.1.
 
 LANGUAGES
-English, with partial translations into Chinese (Simplified), Russian, Spanish, French, German, Japanese, Korean, Portuguese, Arabic and Italian.
+English, Chinese (Simplified), Russian, Spanish, French, German, Japanese, Korean, Portuguese, Arabic and Italian.
 
 GOOD TO KNOW
-• QNet is an experimental network at the testnet stage. Tokens may have no monetary value; rewards are decided by the network protocol and are not guaranteed.
-• Your seed phrase is the only backup. Nobody can recover it for you.
-• A light node needs the app to stay installed and allowed to run in the background: https://aiqnet.io/support
+• QNet is an experimental network at the testnet stage. QNC has no market value. SOL and 1DEV in the app are Solana devnet test tokens with no market value either. Any node balance is set by the network protocol, is not guaranteed and is not paid by Orrery Group LLC.
+• Your recovery phrase is the only backup. Nobody can recover it for you.
+• A light node needs the app to stay installed and allowed to run in the background; battery restrictions can delay or skip its answers: https://aiqnet.io/support?from=app
 
-Privacy policy: https://aiqnet.io/privacy
-Terms of use: https://aiqnet.io/terms
-Support: support@aiqnet.io · https://aiqnet.io/support
+Privacy policy: https://aiqnet.io/privacy?from=app
+Terms of use: https://aiqnet.io/terms?from=app
+Support: support@aiqnet.io · https://aiqnet.io/support?from=app

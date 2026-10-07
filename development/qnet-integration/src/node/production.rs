@@ -10,6 +10,30 @@ pub(crate) fn tip_reconcile_target(local_h: u64, attempts: u32, fin_floor: u64) 
     local_h.saturating_sub(1u64 << attempts.min(40)).max(fin_floor).max(1)
 }
 
+/// Of the TXs one sender numbers the same, keeps the first: the second applies Ok without debiting (the
+/// idempotent branch), so it pays nothing, earns nothing and only occupies block space. Returns the hashes
+/// it drops; they are not in the block, so the post-save cleanup must leave them pooled (not confirmed),
+/// and the producer evicts each once its nonce is consumed.
+///
+/// A system TX is not counted: it never consumes its sender's nonce (a NodeActivation below the
+/// tx_target_bound gate is the one that does), and on several `from` and `nonce` are unsigned. System TXs
+/// lead the block, so counted here a relay's copy naming a user's (from, nonce) dropped that user's own TX,
+/// which the cleanup then confirmed and removed from the pool, block after block.
+pub(crate) fn drop_duplicate_nonces(txs: &mut Vec<qnet_state::Transaction>) -> Vec<String> {
+    let mut seen: std::collections::HashSet<(String, u64)> = std::collections::HashSet::new();
+    let mut dropped = Vec::new();
+    txs.retain(|tx| {
+        let uncounted = tx.gas_limit == 0
+            || (tx.is_system_tx() && !matches!(tx.tx_type, qnet_state::TransactionType::NodeActivation { .. }));
+        if uncounted || seen.insert((tx.from.clone(), tx.nonce)) {
+            return true;
+        }
+        dropped.push(tx.hash.clone());
+        false
+    });
+    dropped
+}
+
 /// Height whose orphan row (a body above the applied tip) the producer already reported once.
 static ORPHAN_ROW_NOTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Height whose certified slot the producer already reported yielding.
@@ -67,8 +91,11 @@ impl BlockchainNode {
                     // supersede them, never this heuristic. The round-1 leader once rolled its own
                     // certified chain back to adopt a round-0 branch it could not verify.
                     let windows: std::cell::RefCell<std::collections::HashMap<u64, Option<Vec<[u8; 32]>>>> = Default::default();
+                    // A target decided by certified content or by the round at the parting point is not a
+                    // heuristic one: the floor does not apply to it (failover_tenure_bound).
+                    let decided = crate::block_pipeline::take_fork_recovery_decided(fork_h);
                     // An unreadable body is never the certified one and vouches for nothing: round 0, zero hash.
-                    let protected = crate::unified_p2p::round_protected_floor(
+                    let protected = if decided { rollback_to } else { crate::unified_p2p::round_protected_floor(
                         rollback_to, local_h,
                         LAST_FINALIZED_HEIGHT.load(std::sync::atomic::Ordering::SeqCst), |h| {
                         match storage.load_microblock_auto_format(h) {
@@ -90,7 +117,11 @@ impl BlockchainNode {
                         // record is written only where the slot's own authorised leader built on a
                         // different parent, so a round here vouches for nothing.
                         crate::block_pipeline::contradicted_tail(h)
-                    });
+                    }) };
+                    if decided {
+                        println!("[WARN][FORK] rollback_decided target={} reason=parting_point_evidence floor=skipped",
+                                 rollback_to);
+                    }
                     if protected > rollback_to {
                         println!("[WARN][FORK] rollback_floor_raised from={} to={} reason=certified_round_blocks",
                                  rollback_to, protected);
@@ -467,42 +498,47 @@ impl BlockchainNode {
         let meshed_esc = peers_esc >= TIMEOUT_ESCALATION_MIN_PEERS;
         let boot_ok_esc = wall_now.saturating_sub(boot_wall) >= TIMEOUT_ESCALATION_BOOT_FLOOR_SECS;
         let failover_height = next_height; // own verified tip + 1
-        let own_w = failover_height / 90;
+        // The key this slot fails over under: the window alone below the failover_tenure_bound gate, the window
+        // and the slot's tenure from it.
+        let own_key = crate::unified_p2p::FailoverKey::for_slot(failover_height);
         let tc_floor = crate::unified_p2p::observed_tc_window_floor();
         let bound_w = crate::unified_p2p::certified_view_bound_windows();
-        // f+1 amplification: adopt the LOWEST committee-supported window above own
+        // f+1 amplification: adopt the LOWEST committee-supported key above own
         // (≥1 honest witness proves it real), capped by the producibility bound. Only
         // scanned during an actual stall — the scan clones voter ids O(votes), and in
         // steady state (no failover) there is nothing to amplify toward.
-        let amplified_w = if local_delay > STALL_GRACE_SECS {
-            crate::unified_p2p::lowest_window_with_support(own_w)
-                .filter(|w| bound_w == u64::MAX || *w <= bound_w.saturating_add(1))
+        let amplified = if local_delay > STALL_GRACE_SECS {
+            crate::unified_p2p::lowest_key_with_support(own_key)
+                .filter(|k| bound_w == u64::MAX || k.window <= bound_w.saturating_add(1))
         } else { None };
-        // Own-window key is voted IN ADDITION to an amplified one from the FIRST
+        // A key below the finality-derived window floor is a left view: the floor window's own key instead.
+        let floored = |k: crate::unified_p2p::FailoverKey| if k.window >= tc_floor { k }
+            else { crate::unified_p2p::FailoverKey::for_slot(tc_floor.saturating_mul(90)) };
+        // Own key is voted IN ADDITION to an amplified one from the FIRST
         // tick (cross-key voting is legal; the receiver dedups per voter). The old
         // 3-tick delay split the quorum during the h=601 fork: amplified votes sat
         // at 3/4 while the own-window round starved at 1/4. Floor still enforced —
         // once a window certified, no honest vote re-enters a lower window.
-        let (mb_idx, also_emit_own_w) = match amplified_w {
-            Some(w) => {
-                let prev = AMPLIFIED_WINDOW.swap(w, Ordering::Relaxed);
-                let ticks = if prev == w {
+        let (fkey, also_emit_own_key) = match amplified {
+            Some(k) => {
+                let prev = AMPLIFIED_WINDOW.swap(k.first_slot(), Ordering::Relaxed);
+                let ticks = if prev == k.first_slot() {
                     AMPLIFY_STUCK_TICKS.fetch_add(1, Ordering::Relaxed) + 1
                 } else {
                     AMPLIFY_STUCK_TICKS.store(0, Ordering::Relaxed);
                     0
                 };
                 if is_warn() {
-                    println!("[WARN][TIMEOUT] window_amplified from={} to={} floor={} ticks={}",
-                             own_w, w, tc_floor, ticks);
+                    println!("[WARN][TIMEOUT] window_amplified from=({}) to=({}) floor={} ticks={}",
+                             own_key, k, tc_floor, ticks);
                 }
-                let own_ok = own_w >= tc_floor && own_w < w;
-                (w.max(tc_floor), if own_ok { Some(own_w) } else { None })
+                let own_ok = own_key.window >= tc_floor && own_key.order() < k.order();
+                (floored(k), if own_ok { Some(own_key) } else { None })
             }
             None => {
                 AMPLIFIED_WINDOW.store(0, Ordering::Relaxed);
                 AMPLIFY_STUCK_TICKS.store(0, Ordering::Relaxed);
-                (own_w.max(tc_floor), None)
+                (floored(own_key), None)
             }
         };
         // Bound by the SAME horizon production uses, not the old 2-window seal allowance.
@@ -521,9 +557,14 @@ impl BlockchainNode {
             println!("[WARN][PROD] parked reason=roster_derivation_horizon h={} seal_base={} rotation=live",
                      failover_height, seal_base);
         }
-        // Same-round n−f certified rotation round for the FRONTIER macroblock — the sole
-        // rotation input, identical on every node once the round cert propagates.
-        let failover_round = crate::unified_p2p::get_certified_rotation_round(mb_idx);
+        // Same-round n−f certified rotation round for the FRONTIER key — the sole
+        // rotation input, identical on every node once the round cert propagates. Relative to the window
+        // baseline for a window-only key; for a tenure key the tenure's own count, which starts at 0.
+        let failover_round = if fkey.is_legacy() {
+            crate::unified_p2p::get_certified_rotation_round(fkey.window)
+        } else {
+            crate::unified_p2p::certified_round_at(fkey)
+        };
         update_failover_metrics(local_delay, failover_round);
 
         // A4: no-progress age keyed on the certified VIEW (mb_idx, failover_round), NOT
@@ -535,8 +576,8 @@ impl BlockchainNode {
         // identical on every node. The relative round subtracts a LOCAL finalized baseline,
         // so it shifts when that baseline shifts, re-stamping the entry wall below and
         // starving both escape ceilings that depend on round_age.
-        let view_key = (mb_idx << 8)
-            | crate::unified_p2p::highest_certified_round_for(mb_idx).min(0xFF);
+        let view_key = (fkey.first_slot() << 8)
+            | crate::unified_p2p::certified_round_at(fkey).min(0xFF);
         let prev_view = ROUND_ENTRY_VIEW.swap(view_key, Ordering::Relaxed);
         let ventry = ROUND_ENTRY_WALL.load(Ordering::Relaxed);
         if view_key != prev_view || ventry == 0 || wall_now < ventry {
@@ -546,14 +587,14 @@ impl BlockchainNode {
 
         // At MAX_FAILOVER_ROUND, >MAX rotations in one window is a sync/partition issue, not
         // producer liveness. HOLD, don't go terminal: the vote round is clamped to the cap in
-        // emit_macroblock_view_change_vote (DoS bound — no runaway climb), the pacemaker keeps
+        // emit_failover_vote (DoS bound — no runaway climb), the pacemaker keeps
         // emitting the bounded round so progress resumes the instant the partition heals, and
         // we drive sync recovery in parallel. Keyed on the SAME frontier mb the vote uses.
         let failover_capped = failover_round >= MAX_FAILOVER_ROUND;
         if failover_capped {
             if is_warn() {
-                println!("[WARN][TIMEOUT] failover_round_capped round={} cap={} mb={} action=hold+recovery_sync",
-                         failover_round, MAX_FAILOVER_ROUND, mb_idx);
+                println!("[WARN][TIMEOUT] failover_round_capped round={} cap={} {} action=hold+recovery_sync",
+                         failover_round, MAX_FAILOVER_ROUND, fkey);
             }
             CHRONIC_STALL_REQUESTED.store(true, Ordering::Relaxed);
         }
@@ -580,10 +621,10 @@ impl BlockchainNode {
         // TIMING changes; forging a yield still needs the leader's key.
         let leader_yielded = get_expected_producer(failover_height)
             .map(|(p, _)| !p.is_empty() && p != node_id
-                && crate::unified_p2p::window_has_vote_from(own_w, &p))
+                && crate::unified_p2p::key_has_live_vote_from(own_key, &p))
             .unwrap_or(false);
         // No !failover_capped gate — at the cap the pacemaker HOLDS (keeps emitting) rather
-        // than going terminal; emit_macroblock_view_change_vote clamps the round to the cap.
+        // than going terminal; emit_failover_vote clamps the round to the cap.
         // The vote to rotate a dead leader is NOT gated on production_unlocked: that is a
         // per-node sync flag, and gating on it drops exactly the stragglers a stall left
         // behind from the quorum that would rescue it. Round is certified+1 (not derived
@@ -629,7 +670,7 @@ impl BlockchainNode {
             // is RELATIVE and depends on the local baseline; using it here would diverge
             // this node's expected-producer from the canonical leader. The metrics/view-key
             // labels below stay relative (display only).
-            let expected_producer = if mb_idx == own_w {
+            let expected_producer = if fkey == own_key {
                 Some(Self::select_microblock_producer_with_round(
                     failover_height, &unified_p2p, &node_id, node_type, Some(&storage),
                     crate::unified_p2p::certified_round_for_slot(failover_height),
@@ -660,7 +701,7 @@ impl BlockchainNode {
                             // reads — no f+1, no clock). We stop leading once the TC forms,
                             // so still exactly one leader per certified round. Otherwise the
                             // 4-of-5 alive-but-stuck deadlock waits out the full hard ceiling.
-                            if crate::unified_p2p::round_one_short_of_quorum(mb_idx, &node_id) {
+                            if crate::unified_p2p::round_one_short_of_quorum(fkey, &node_id) {
                                 None
                             } else {
                                 Some("self_expected")
@@ -701,8 +742,8 @@ impl BlockchainNode {
                         .map(|m| m as i64)
                         .unwrap_or(-1);
                     println!(
-                        "[INFO][TIMEOUT] emit_suppressed h={} mb={} expected={} hb_age_ms={} delay={}s reason={}",
-                        failover_height, mb_idx,
+                        "[INFO][TIMEOUT] emit_suppressed h={} {} expected={} hb_age_ms={} delay={}s reason={}",
+                        failover_height, fkey,
                         expected_producer.as_deref().unwrap_or("-"),
                         hb_age, local_delay, reason
                     );
@@ -714,13 +755,13 @@ impl BlockchainNode {
                 let tau = TAU_SECS[failover_round.min(8) as usize];
                 let should_emit = {
                     let last = LAST_TIMEOUT_EMIT_PER_MB
-                        .get(&mb_idx)
+                        .get(&fkey)
                         .map(|v| *v)
                         .unwrap_or(0);
                     now_u64.saturating_sub(last) >= tau
                 };
                 if should_emit {
-                    LAST_TIMEOUT_EMIT_PER_MB.insert(mb_idx, now_u64);
+                    LAST_TIMEOUT_EMIT_PER_MB.insert(fkey, now_u64);
                     if is_info() {
                         let hb_age = expected_producer
                             .as_deref()
@@ -728,8 +769,8 @@ impl BlockchainNode {
                             .map(|m| m as i64)
                             .unwrap_or(-1);
                         println!(
-                            "[INFO][TIMEOUT] emit_microblock_vote h={} mb={} cert_round={} delay={}s expected={} hb_age_ms={} reason=primary_silent",
-                            failover_height, mb_idx, failover_round,
+                            "[INFO][TIMEOUT] emit_microblock_vote h={} {} cert_round={} delay={}s expected={} hb_age_ms={} reason=primary_silent",
+                            failover_height, fkey, failover_round,
                             local_delay,
                             expected_producer.as_deref().unwrap_or("-"),
                             hb_age
@@ -758,21 +799,21 @@ impl BlockchainNode {
                         }
                     }
 
-                    // Canonical emission helper: signs the QNET_TIMEOUT_V2 payload
-                    // and broadcasts via `broadcast_timeout_vote` — the same path
-                    // the macroblock-boundary view-change uses.
-                    Self::emit_macroblock_view_change_vote(
-                        mb_idx.saturating_mul(90),
+                    // Canonical emission helper: signs the QNET_TIMEOUT_V2 or _V3 payload
+                    // for the key and broadcasts via `broadcast_timeout_vote` — the same
+                    // path the slot yield uses.
+                    Self::emit_failover_vote(
+                        fkey,
                         &node_id,
                         &unified_p2p,
                         Some(&storage),
                     ).await;
-                    // Resume valve: amplified-window sync stalled ≥3 ticks — emit
-                    // the own-window key IN ADDITION (delay, never park; the TC
-                    // floor above keeps this from re-entering a certified window).
-                    if let Some(own_w) = also_emit_own_w {
-                        Self::emit_macroblock_view_change_vote(
-                            own_w.saturating_mul(90),
+                    // Resume valve: amplified-key sync stalled — emit the own key IN
+                    // ADDITION (delay, never park; the TC floor above keeps this from
+                    // re-entering a certified window).
+                    if let Some(own_k) = also_emit_own_key {
+                        Self::emit_failover_vote(
+                            own_k,
                             &node_id,
                             &unified_p2p,
                             Some(&storage),
@@ -904,10 +945,12 @@ impl BlockchainNode {
             match self.unified_p2p.as_ref() {
                 Some(p2p) => {
                     let (tc_n, tc_rej) = p2p.rehydrate_timeout_certificates_verified(&tc_bytes);
+                    let v3_bytes = self.storage.load_timeout_certificates_v3().unwrap_or(None).unwrap_or_default();
+                    let (v3_n, v3_rej) = p2p.rehydrate_timeout_certificates_v3_verified(&v3_bytes);
                     let hc_n = crate::unified_p2p::rehydrate_highest_certified_rounds();
                     if is_info() {
-                        println!("[INFO][CONS] timeout_state_rehydrated certs={} rejected={} hi_cert={}",
-                                 tc_n, tc_rej, hc_n);
+                        println!("[INFO][CONS] timeout_state_rehydrated certs={} rejected={} certs_v3={} rejected_v3={} hi_cert={}",
+                                 tc_n, tc_rej, v3_n, v3_rej, hc_n);
                     }
                 }
                 None => {
@@ -933,12 +976,13 @@ impl BlockchainNode {
                     // restore, so writing it separately is not merely redundant: two writes are two
                     // moments, and a certificate formed between them came back without its round.
                     let tc = crate::unified_p2p::snapshot_timeout_certificates();
+                    let tc3 = crate::unified_p2p::snapshot_timeout_certificates_v3();
                     // RocksDB write, so OFF the runtime: a compaction holding the write path stalls
                     // whichever worker thread runs it, and with it every other task scheduled there -
                     // the whole-runtime stall this node logs as runtime_stalled. The blocking pool
-                    // absorbs the wait; only this 2s tick is delayed.
+                    // absorbs the wait; only this 2s tick is delayed. Both blobs in one batch.
                     let sf = storage_flush.clone();
-                    match tokio::task::spawn_blocking(move || sf.save_timeout_certificates(&tc)).await {
+                    match tokio::task::spawn_blocking(move || sf.save_timeout_certificates_all(&tc, &tc3)).await {
                         Ok(Err(e)) => { if is_warn() { println!("[WARN][CONS] tcerts_flush_fail err={}", e); } }
                         Err(e) => { if is_warn() { println!("[WARN][CONS] cert_flush_join_fail err={}", e); } }
                         Ok(Ok(())) => {}
@@ -2437,9 +2481,16 @@ impl BlockchainNode {
                     //
                     // With 30000 nodes, thousands may be syncing at any moment. Without this gate,
                     // VRF selects unsynced node → can't produce → 5s timeout → throughput drops.
-                    let reg_synced = coordinator_is_production_ready();
+                    // Behind is read from the head f+1 in-set nodes stand behind when there are enough of them: one
+                    // node's height claim decided it for everyone on 04.10 and kept the fleet out of the registry.
                     let reg_our_h = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
-                    let reg_best_h = crate::unified_p2p::BEST_PEER_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+                    let reg_corroborated = unified_p2p.as_ref().and_then(|p| p.corroborated_behind_head());
+                    let reg_synced = match reg_corroborated {
+                        Some(c) => c <= reg_our_h.saturating_add(90),
+                        None => coordinator_is_production_ready(),
+                    };
+                    let reg_best_h = reg_corroborated.unwrap_or_else(||
+                        crate::unified_p2p::BEST_PEER_HEIGHT.load(std::sync::atomic::Ordering::Relaxed));
 
                     // Sync-INDEPENDENT binding-TX rebroadcast: a node's own NodeRegistration must land
                     // on-chain even while it is still syncing (identity binding is signature-validated,
@@ -3153,8 +3204,10 @@ impl BlockchainNode {
                     .map(|id| ["001", "002", "003", "004", "005"].contains(&id.trim()))
                     .unwrap_or(false);
                 
-                // Only check registry once at startup for Genesis nodes
-                if is_genesis_node && !REGISTRY_CONFIRMED.load(std::sync::atomic::Ordering::Relaxed) {
+                // Only while the static roster supplies the candidates: above it they come from macroblock N-2,
+                // and a genesis restarted there waited for five registrations it never got and never produced.
+                if registry_wait_applies(is_genesis_node, next_block_height)
+                    && !REGISTRY_CONFIRMED.load(std::sync::atomic::Ordering::Relaxed) {
                     if let Some(ref p2p) = unified_p2p {
                         let registry_count = p2p.get_active_full_super_nodes().len();
                         if registry_count < 5 {
@@ -3362,23 +3415,24 @@ impl BlockchainNode {
                         // yet — rotation can't advance the seal frontier anyway; the independent
                         // macroblock backfill does. This vote is emitted defensively: the moment the
                         // backfill releases the throttle, the already-broadcast yield gathers its n−f.
+                        let yield_key = crate::unified_p2p::FailoverKey::for_slot(next_block_height);
                         if is_my_turn_to_produce
-                            && mb_idx >= crate::unified_p2p::observed_tc_window_floor() {
+                            && !crate::unified_p2p::failover_key_left(yield_key) {
                             let now_u64 = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
                                 .as_secs();
-                            let last = LAST_TIMEOUT_EMIT_PER_MB.get(&mb_idx).map(|v| *v).unwrap_or(0);
+                            let last = LAST_TIMEOUT_EMIT_PER_MB.get(&yield_key).map(|v| *v).unwrap_or(0);
                             if now_u64.saturating_sub(last) >= 5 {
                                 // Stamp pacing only on an actual broadcast: a deferred emit
                                 // (anchor fetch in flight, crypto absent) retries next tick.
-                                if Self::emit_macroblock_view_change_vote(
-                                    mb_idx.saturating_mul(90),
+                                if Self::emit_failover_vote(
+                                    yield_key,
                                     &node_id,
                                     &unified_p2p,
                                     Some(&storage),
                                 ).await {
-                                    LAST_TIMEOUT_EMIT_PER_MB.insert(mb_idx, now_u64);
+                                    LAST_TIMEOUT_EMIT_PER_MB.insert(yield_key, now_u64);
                                     if is_info() {
                                         println!("[INFO][PROD] slot_yield h={} mb={} reason={}",
                                                  next_block_height, mb_idx, reason);
@@ -4583,6 +4637,18 @@ impl BlockchainNode {
                         }
                         txs = kept;
                     }
+                    // From the wallet_one_node gate: one registration per wallet, the first kept in lane order, so
+                    // the block never carries the pair validators reject (same_block_wallet_conflict).
+                    if qnet_state::feature_gates::is_active(qnet_state::feature_gates::id::WALLET_ONE_NODE, next_block_height) {
+                        let (kept, dropped) = Self::keep_first_registration_per_wallet(txs);
+                        txs = kept;
+                        if is_info() {
+                            for (node_id, wallet) in &dropped {
+                                println!("[INFO][PRODUCER] reg_dropped reason=wallet_one_node node={} wallet={}...",
+                                         node_id, qnet_state::char_prefix(wallet, 16));
+                            }
+                        }
+                    }
 
                     // Producer pre-filter (C): drop any NodeActivation whose wallet lacks a burn-attested
                     // registration — committed in a PRIOR block OR a (kept) NodeRegistration in THIS block
@@ -4845,7 +4911,7 @@ impl BlockchainNode {
                             // CPU-bound ML-DSA verifies run AFTER the lock is dropped (below).
                             let sg = state.read().await;
                             for (i, tx) in txs.iter().enumerate() {
-                                match Self::producer_tx_prepare(tx, &*sg, snap_in_progress) {
+                                match Self::producer_tx_prepare(tx, &*sg, snap_in_progress, next_block_height) {
                                     TxPrep::Admit => {}
                                     TxPrep::Evict => evict_idx.push(i),
                                     TxPrep::Defer => { defer_idx.insert(i); }
@@ -4898,17 +4964,14 @@ impl BlockchainNode {
                     // v3.18: Calculate fees_collected BEFORE creating microblock
                     // Fees go directly to producer (Pool 2 removed)
                     // ═══════════════════════════════════════════════════════════════════
-                    // Two txs from one sender at the same nonce: the second applies Ok without debiting
-                    // (idempotent branch), so it pays nothing and earns nothing — it would just occupy
-                    // block space. Drop it here; this is block CONTENT selection, not a validity rule,
-                    // so it cannot diverge from a validator (which charges neither of them either).
+                    // Two txs from one sender at the same nonce: only the first goes in (drop_duplicate_nonces).
+                    // Block CONTENT selection, not a validity rule, so it cannot diverge from a validator.
                     {
-                        let mut seen: std::collections::HashSet<(String, u64)> = std::collections::HashSet::new();
-                        let before = txs.len();
-                        txs.retain(|tx| tx.gas_limit == 0 || seen.insert((tx.from.clone(), tx.nonce)));
-                        if txs.len() != before && is_warn() {
-                            println!("[WARN][MB] dup_nonce_dropped h={} count={}", next_block_height, before - txs.len());
+                        let dropped = drop_duplicate_nonces(&mut txs);
+                        if !dropped.is_empty() && is_warn() {
+                            println!("[WARN][MB] dup_nonce_dropped h={} count={}", next_block_height, dropped.len());
                         }
+                        keep_in_mempool.extend(dropped);
                     }
                     let mut block_fees_collected: u64 = 0;
                     let mut block_gas_used: u64 = 0;
@@ -5054,14 +5117,35 @@ impl BlockchainNode {
                             let last_r = LAST_SIGNED_ROUND.load(std::sync::atomic::Ordering::SeqCst);
                             let last_h = LAST_SIGNED_HEIGHT.load(std::sync::atomic::Ordering::SeqCst);
                             let win = crate::node::window_of_height(next_block_height);
-                            if !crate::node::may_sign(
-                                next_block_height, certified_abs, hwm_h, last_w, last_r, last_h) {
-                                println!("[WARN][PROD] production_yielded h={} win={} round={} hwm_h={} last_w={} last_r={} reason=already_signed_this_round",
-                                         next_block_height, win, certified_abs, hwm_h, last_w, last_r);
+                            // The exact record is kept below the gate too, so it is complete when the gate is
+                            // crossed; heights at or below finality never need it again.
+                            let finalized_now = LAST_FINALIZED_HEIGHT.load(std::sync::atomic::Ordering::SeqCst);
+                            if let Ok(Some(floor)) = storage.signature_record_floor() {
+                                if finalized_now > floor.saturating_add(90) {
+                                    let _ = storage.prune_signature_records_to(finalized_now);
+                                }
+                            }
+                            // From the failover_tenure_bound gate the exact (height, round) record decides; below
+                            // it the window rule does. An unreadable record signs nothing.
+                            let exact = crate::node::failover_tenure_bound(next_block_height);
+                            let allowed = if exact {
+                                match (storage.signature_record_floor(), storage.signed_round_at(next_block_height)) {
+                                    (Ok(floor), Ok(signed_at)) => crate::node::may_sign_exact(
+                                        next_block_height, certified_abs, hwm_h, floor.unwrap_or(hwm_h), signed_at),
+                                    _ => false,
+                                }
+                            } else {
+                                crate::node::may_sign(next_block_height, certified_abs, hwm_h, last_w, last_r, last_h)
+                            };
+                            if !allowed {
+                                println!("[WARN][PROD] production_yielded h={} win={} round={} hwm_h={} last_w={} last_r={} rule={} reason=already_signed_this_round",
+                                         next_block_height, win, certified_abs, hwm_h, last_w, last_r,
+                                         if exact { "exact" } else { "window" });
                                 crate::unified_p2p::BLOCK_BROADCAST_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
                                 continue;
                             }
-                            if let Err(e) = storage.save_highest_signed_mark(
+                            if let Err(e) = storage.save_signature_record(
+                                next_block_height, certified_abs,
                                 next_block_height.max(hwm_h), win, certified_abs, next_block_height) {
                                 println!("[ERR][PROD] production_yielded h={} reason=hwm_persist_failed err={}",
                                          next_block_height, e);
@@ -5174,7 +5258,7 @@ impl BlockchainNode {
                                 qnet_state::TransactionType::Transfer { .. }
                                 | qnet_state::TransactionType::BatchTransfers { .. }));
                         if pure_transfers {
-                            let outcomes = state_guard.apply_transfers_parallel(&txs, Some(&mut inline_snap));
+                            let outcomes = state_guard.apply_transfers_parallel(&txs, next_block_height, Some(&mut inline_snap));
                             for (tx, outcome) in txs.iter().zip(outcomes) {
                                 let charged = outcome.as_ref().map_or(false, |o| o.charged);
                                 if let Err(e) = outcome {
@@ -5682,6 +5766,7 @@ impl BlockchainNode {
                             {
                                 storage.request_boundary_pin(&sg, height_for_storage);
                             }
+                            storage.request_proof_view(&sg, height_for_storage);
                             sg.retain_block_journal(journal);
                         }
 

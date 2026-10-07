@@ -23,6 +23,73 @@ fn node_row_lock(node_id: &str) -> &'static parking_lot::Mutex<()> {
     &NODE_ROW_LOCKS[i]
 }
 
+/// Epochs the light uptime index remembers per node: the last counted epoch and the 63 before it.
+pub const LIGHT_UPTIME_WINDOW: u64 = 64;
+/// Uptime rows read per batched read during an epoch pass.
+const UPTIME_READ_CHUNK: usize = 8_192;
+
+/// A light node's row in the uptime index (`light_up_{node}` in `pending_rewards`): the last epoch
+/// its shard owners counted it in, and a mask of the 64 epochs up to that one (bit k = `last - k`).
+/// Derived by every node from the committed light bitmaps at its epoch pass; in no root, never
+/// consensus, like `light_elig_`. Only a counted node is written, so the mask is shifted when read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LightUptime {
+    pub last: u64,
+    pub mask: u64,
+}
+
+impl LightUptime {
+    pub fn encode(&self) -> [u8; 16] {
+        let mut out = [0u8; 16];
+        out[..8].copy_from_slice(&self.last.to_be_bytes());
+        out[8..].copy_from_slice(&self.mask.to_be_bytes());
+        out
+    }
+
+    pub fn decode(v: &[u8]) -> Option<Self> {
+        if v.len() != 16 { return None; }
+        let last = u64::from_be_bytes(v[..8].try_into().ok()?);
+        let mask = u64::from_be_bytes(v[8..].try_into().ok()?);
+        (mask & 1 == 1).then_some(LightUptime { last, mask })
+    }
+
+    /// The row after counting `epoch`, or None when nothing changes. Epochs may arrive in any order
+    /// (a boot backfill runs after later boundaries) and more than once: an epoch already set, or one
+    /// older than the window of the stored row, changes nothing.
+    pub fn mark(prior: Option<Self>, epoch: u64) -> Option<Self> {
+        let Some(p) = prior else { return Some(LightUptime { last: epoch, mask: 1 }); };
+        if epoch > p.last {
+            let shift = epoch - p.last;
+            let mask = if shift >= LIGHT_UPTIME_WINDOW { 1 } else { (p.mask << shift) | 1 };
+            return Some(LightUptime { last: epoch, mask });
+        }
+        let back = p.last - epoch;
+        if back >= LIGHT_UPTIME_WINDOW { return None; }
+        let bit = 1u64 << back;
+        if p.mask & bit != 0 { return None; }
+        Some(LightUptime { last: p.last, mask: p.mask | bit })
+    }
+
+    /// The mask seen from `end`: bit k = epoch `end - k`. Epochs after `end` (a pass still running, or
+    /// a chain rolled back under the row) drop out.
+    pub fn aligned_to(&self, end: u64) -> u64 {
+        if self.last <= end {
+            let shift = end - self.last;
+            if shift >= LIGHT_UPTIME_WINDOW { 0 } else { self.mask << shift }
+        } else {
+            let shift = self.last - end;
+            if shift >= LIGHT_UPTIME_WINDOW { 0 } else { self.mask >> shift }
+        }
+    }
+
+    /// The last epoch at or before `end` the node was counted in, if the row still knows it.
+    pub fn last_counted_at_or_before(&self, end: u64) -> Option<u64> {
+        if self.last <= end { return Some(self.last); }
+        let aligned = self.aligned_to(end);
+        (aligned != 0).then(|| end - aligned.trailing_zeros() as u64)
+    }
+}
+
 impl Storage {
     /// Batch-write the eligible super set for an epoch in one WriteBatch (epoch-boundary snapshot).
     pub fn save_super_eligible_batch(&self, epoch: u64, node_ids: &[String]) -> IntegrationResult<()> {
@@ -63,11 +130,36 @@ impl Storage {
     /// and chunked (bounded WriteBatch) for tens of millions of nodes. Read-only w.r.t. reward_root — the
     /// reward path recomputes from light_bm_ directly; this index only serves O(1) status recency.
     pub fn snapshot_light_eligible(&self, epoch: u64, cutoff: u64) -> IntegrationResult<usize> {
+        self.light_epoch_pass(epoch, cutoff, true)
+    }
+
+    /// The uptime index alone, for an epoch whose recency rows were derived before this index existed
+    /// (the boot backfill after an upgrade). Same walk, same marks.
+    pub fn snapshot_light_uptime(&self, epoch: u64, cutoff: u64) -> IntegrationResult<usize> {
+        self.light_epoch_pass(epoch, cutoff, false)
+    }
+
+    /// One walk of the finalized epoch's committed light bitmaps: the recency rows (when `recency`) and
+    /// the uptime marks (when this node has not marked the epoch yet). Both are local derived indices.
+    fn light_epoch_pass(&self, epoch: u64, cutoff: u64, recency: bool) -> IntegrationResult<usize> {
+        // One marking pass at a time: the uptime marks are a read-modify-write per node, and the
+        // boundary pass and a boot backfill may otherwise run at once for different epochs of the same
+        // node. A pass with nothing to mark (a re-run) takes no lock.
+        static PASS: parking_lot::Mutex<()> = parking_lot::const_mutex(());
         let cf = self.persistent.db.cf_handle("pending_rewards")
             .ok_or_else(|| IntegrationError::StorageError("pending_rewards column family not found".to_string()))?;
         let bitmaps = self.load_light_bitmaps(epoch).unwrap_or_default();
+        // The shards that committed a row, kept as both markers' value: an epoch whose shard committed none is the
+        // network's miss for every node of it, never the device's (`light_elig_shards`, `light_uptime_done_masks`).
+        let shard_mask = [bitmaps.keys().fold(0u8, |m, s| m | (1u8 << (*s as u8)))];
+        // An epoch with no bitmap at all is not marked: here that is a node that never saw the epoch's
+        // blocks (a snapshot join), and marking it would record every node as missing it.
+        let wants_uptime = !bitmaps.is_empty() && !self.light_uptime_derived(epoch);
+        let _g = wants_uptime.then(|| PASS.lock());
+        let uptime = wants_uptime && !self.light_uptime_derived(epoch);
         let mut batch = rocksdb::WriteBatch::default();
         let (mut n, mut inbatch) = (0usize, 0usize);
+        let mut marks: Vec<String> = Vec::new();
         // Stable hash-shard (SAME as the bitmap builder + emission reader): bit i in shard g = the i-th
         // sorted roster node with light_shard_of()==g. Streamed (no O(roster) Vec), one walk.
         if !bitmaps.is_empty() {
@@ -79,29 +171,159 @@ impl Storage {
                 let bit = reg_index as usize;
                 if let Some(bm) = bitmaps.get(&gidx) {
                     if bm.get(bit / 8).map(|b| b & (1 << (bit % 8)) != 0).unwrap_or(false) {
-                        batch.put_cf(&cf, format!("light_elig_{:010}_{}", epoch, node_id).as_bytes(), &[]);
-                        n += 1; inbatch += 1;
+                        n += 1;
+                        if recency {
+                            batch.put_cf(&cf, format!("light_elig_{:010}_{}", epoch, node_id).as_bytes(), &[]);
+                            inbatch += 1;
+                        }
+                        if uptime {
+                            marks.push(node_id.to_string());
+                            if marks.len() >= UPTIME_READ_CHUNK {
+                                inbatch += self.light_uptime_mark_chunk(&cf, &mut batch, &marks, epoch);
+                                marks.clear();
+                            }
+                        }
                         if inbatch >= 100_000 { let _ = self.persistent.db.write(std::mem::take(&mut batch)); inbatch = 0; }
                     }
                 }
             });
             scan?;
+            if uptime { self.light_uptime_mark_chunk(&cf, &mut batch, &marks, epoch); }
         }
-        // Recency needs ~2 epochs; range-delete anything older than a small window so the index stays
-        // bounded (one range-delete, zero-padded key ⇒ lexical order == numeric order).
-        if epoch >= 4 {
-            batch.delete_range_cf(&cf, b"light_elig_0000000000_".as_ref(),
-                format!("light_elig_{:010}_", epoch - 3).as_bytes());
+        if recency {
+            // Recency needs ~2 epochs; range-delete anything older than a small window so the index stays
+            // bounded (one range-delete, zero-padded key ⇒ lexical order == numeric order).
+            if epoch >= 4 {
+                batch.delete_range_cf(&cf, b"light_elig_0000000000_".as_ref(),
+                    format!("light_elig_{:010}_", epoch - 3).as_bytes());
+            }
+            // Derivation marker, written by the single deriver so every caller sets it. Distinguishes "not
+            // derived here" from "derived, and nobody attested" — the latter is a legitimate empty epoch and
+            // must not be rescanned forever.
+            batch.put_cf(&cf, Self::light_elig_done_key(epoch).as_bytes(), &shard_mask);
         }
-        // Derivation marker, written by the single deriver so every caller sets it. Distinguishes "not
-        // derived here" from "derived, and nobody attested" — the latter is a legitimate empty epoch and
-        // must not be rescanned forever.
-        batch.put_cf(&cf, Self::light_elig_done_key(epoch).as_bytes(), &[]);
+        if uptime {
+            // Written after the marks it vouches for: an epoch counts toward a node's window only once
+            // every node of it was marked. Markers far behind every window are dropped.
+            batch.put_cf(&cf, Self::light_uptime_done_key(epoch).as_bytes(), &shard_mask);
+            if let Some(old) = epoch.checked_sub(2 * LIGHT_UPTIME_WINDOW) {
+                batch.delete_range_cf(&cf, Self::light_uptime_done_key(0).as_bytes(),
+                    Self::light_uptime_done_key(old).as_bytes());
+            }
+        }
         self.persistent.db.write(batch)?;
         Ok(n)
     }
 
     fn light_elig_done_key(epoch: u64) -> String { format!("light_elig_done_{:010}", epoch) }
+
+    fn light_uptime_key(node_id: &str) -> String { format!("light_up_{}", node_id) }
+
+    fn light_uptime_done_key(epoch: u64) -> String { format!("light_up_done_{:010}", epoch) }
+
+    /// Mark `epoch` for each node of `nodes` (one batched read). Returns the rows put in `batch`. A row
+    /// that could not be read is left alone rather than overwritten.
+    fn light_uptime_mark_chunk(&self, cf: &impl rocksdb::AsColumnFamilyRef, batch: &mut rocksdb::WriteBatch,
+                               nodes: &[String], epoch: u64) -> usize {
+        if nodes.is_empty() { return 0; }
+        let keys: Vec<String> = nodes.iter().map(|n| Self::light_uptime_key(n)).collect();
+        let mut put = 0;
+        let rows = self.persistent.db.multi_get_cf(keys.iter().map(|k| (cf, k.as_bytes())));
+        for (key, row) in keys.iter().zip(rows) {
+            let prior = match row {
+                Ok(Some(v)) => LightUptime::decode(&v),
+                Ok(None) => None,
+                Err(_) => continue,
+            };
+            if let Some(next) = LightUptime::mark(prior, epoch) {
+                batch.put_cf(cf, key.as_bytes(), next.encode());
+                put += 1;
+            }
+        }
+        put
+    }
+
+    /// True iff this node marked `epoch` in the uptime index (the whole epoch, not part of it).
+    pub fn light_uptime_derived(&self, epoch: u64) -> bool {
+        match self.persistent.db.cf_handle("pending_rewards") {
+            Some(cf) => self.persistent.db.get_cf(&cf, Self::light_uptime_done_key(epoch).as_bytes())
+                .ok().flatten().is_some(),
+            None => false,
+        }
+    }
+
+    /// The epochs of the window ending at `end` that this node marked: bit k is epoch `end - k`. One
+    /// seek over at most 64 adjacent marker keys.
+    pub fn light_uptime_done_mask(&self, end: u64) -> u64 {
+        let Some(cf) = self.persistent.db.cf_handle("pending_rewards") else { return 0; };
+        let first = end.saturating_sub(LIGHT_UPTIME_WINDOW - 1);
+        let from = Self::light_uptime_done_key(first);
+        let prefix = b"light_up_done_";
+        let mut mask = 0u64;
+        let iter = self.persistent.db.iterator_cf(&cf, rocksdb::IteratorMode::From(from.as_bytes(), rocksdb::Direction::Forward));
+        for item in iter {
+            let Ok((k, _)) = item else { break };
+            if !k.starts_with(prefix) { break; }
+            let Some(e) = std::str::from_utf8(&k[prefix.len()..]).ok().and_then(|s| s.parse::<u64>().ok()) else { continue };
+            if e > end { break; }
+            if e >= first { mask |= 1u64 << (end - e); }
+        }
+        mask
+    }
+
+    /// `light_uptime_done_mask` and, beside it, the epochs of the same window in which `shard` committed a row:
+    /// bit k is epoch `end - k`. A marker written before the shards were kept counts every shard as committed.
+    pub fn light_uptime_done_masks(&self, end: u64, shard: usize) -> (u64, u64) {
+        let Some(cf) = self.persistent.db.cf_handle("pending_rewards") else { return (0, 0); };
+        let first = end.saturating_sub(LIGHT_UPTIME_WINDOW - 1);
+        let from = Self::light_uptime_done_key(first);
+        let prefix = b"light_up_done_";
+        let (mut done, mut committed) = (0u64, 0u64);
+        let iter = self.persistent.db.iterator_cf(&cf, rocksdb::IteratorMode::From(from.as_bytes(), rocksdb::Direction::Forward));
+        for item in iter {
+            let Ok((k, v)) = item else { break };
+            if !k.starts_with(prefix) { break; }
+            let Some(e) = std::str::from_utf8(&k[prefix.len()..]).ok().and_then(|s| s.parse::<u64>().ok()) else { continue };
+            if e > end { break; }
+            if e < first { continue; }
+            done |= 1u64 << (end - e);
+            if Self::shard_in_marker(&v, shard) { committed |= 1u64 << (end - e); }
+        }
+        (done, committed)
+    }
+
+    /// A pass marker's value names the shards that committed a row; an empty one predates that and names all.
+    fn shard_in_marker(v: &[u8], shard: usize) -> bool {
+        v.first().map_or(true, |m| shard < 8 && m & (1u8 << shard) != 0)
+    }
+
+    /// The shards that committed a row in `epoch` as this node's recency pass read them (bit g, shard g); None
+    /// while the pass has not run here. A marker written before the shards were kept names all five.
+    pub fn light_elig_shards(&self, epoch: u64) -> Option<u8> {
+        let cf = self.persistent.db.cf_handle("pending_rewards")?;
+        let v = self.persistent.db.get_cf(&cf, Self::light_elig_done_key(epoch).as_bytes()).ok()??;
+        Some(v.first().copied().unwrap_or(0b1_1111))
+    }
+
+    /// The committed index counts `node_id` in `epoch` (`snapshot_light_eligible`). One point read.
+    pub fn light_counted_in(&self, epoch: u64, node_id: &str) -> bool {
+        let Some(cf) = self.persistent.db.cf_handle("pending_rewards") else { return false; };
+        self.persistent.db.get_cf(&cf, format!("light_elig_{:010}_{}", epoch, node_id).as_bytes()).ok().flatten().is_some()
+    }
+
+    /// A light node's roster entry: its registration height and its permanent bitmap index. One point read.
+    pub fn light_roster_entry(&self, node_id: &str) -> Option<(u64, u32)> {
+        let cf = self.persistent.db.cf_handle("node_registry")?;
+        let v = self.persistent.db.get_cf(&cf, format!("lrtr_{}", node_id).as_bytes()).ok()??;
+        Self::decode_roster_index_value(&v).filter(|(_, _, w)| !w.is_empty()).map(|(h, i, _)| (h, i))
+    }
+
+    /// A light node's uptime row: the last epoch it was counted in, and the 64 epochs up to it.
+    pub fn light_uptime(&self, node_id: &str) -> Option<LightUptime> {
+        let cf = self.persistent.db.cf_handle("pending_rewards")?;
+        let v = self.persistent.db.get_cf(&cf, Self::light_uptime_key(node_id).as_bytes()).ok()??;
+        LightUptime::decode(&v)
+    }
 
     /// True iff `snapshot_light_eligible` has run for `epoch` on THIS node. The recency verdict below
     /// reads absence as "did not attest", so a snapshot this node never ran reports a live light node as
@@ -165,8 +387,8 @@ impl Storage {
     
     /// Save node registration information (for local cache only)
     /// NOTE: api_endpoint is now stored ON-CHAIN in NodeRegistration TX!
-    /// Stores BOTH forward index (node_id → data) AND reverse index (wallet → node_id)
-    /// for O(1) lookups in both directions.
+    /// Writes the forward row (node_<id> → data) only, with no reg_height; there is no wallet → node reverse
+    /// index: a wallet's nodes are found by deriving its ids (resolve_node_id, wallet_node_records).
     pub fn save_node_registration(&self, node_id: &str, node_type: &str, wallet: &str, reputation: f64) -> IntegrationResult<()> {
         self.save_node_registration_inner(node_id, node_type, wallet, reputation, None, None, None)
     }

@@ -8,9 +8,10 @@ import { matchesAsset } from '../src/utils/txHistory';
 const texts = (tree) => tree.root.findAllByType(Text).map((t) => t.props.children).flat(Infinity).join('');
 
 describe('transaction result surface', () => {
+  // With the site's app marker, so the page opens in the site's app view (R3-XPD-01).
   it('points at the explorer page of this transaction', () => {
-    expect(explorerTxUrl('abc')).toBe(`${EXPLORER_API}/explorer/tx/abc`);
-    expect(explorerTxUrl('')).toBe(`${EXPLORER_API}/explorer/tx/`);
+    expect(explorerTxUrl('abc')).toBe(`${EXPLORER_API}/explorer/tx/abc?from=app`);
+    expect(explorerTxUrl('')).toBe(`${EXPLORER_API}/explorer/tx/?from=app`);
   });
 
   it('reports a success with its amount and opens the hash in the explorer', async () => {
@@ -26,7 +27,7 @@ describe('transaction result surface', () => {
 
     const hashCard = tree.root.findAllByType(TouchableOpacity)[0];
     await act(async () => { hashCard.props.onPress(); });
-    expect(open).toHaveBeenCalledWith(`${EXPLORER_API}/explorer/tx/f00d`);
+    expect(open).toHaveBeenCalledWith(`${EXPLORER_API}/explorer/tx/f00d?from=app`);
     open.mockRestore();
     await act(async () => { tree.unmount(); });
   });

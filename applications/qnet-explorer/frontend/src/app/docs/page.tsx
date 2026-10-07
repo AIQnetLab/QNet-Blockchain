@@ -19,10 +19,18 @@ const SECTIONS: { title: string; items: { name: string; path: string; what: stri
   {
     title: 'Developers',
     items: [
+      { name: 'Overview', path: 'developers/overview.md', what: 'Where to start: what the testnet offers and the limits to design around.' },
+      { name: 'dApp integration', path: 'developers/dapp-integration.md', what: 'Connecting a web page or game to the QNet wallets.' },
+      { name: 'Sign-in', path: 'developers/sign-in.md', what: 'Signing users in with their wallet, checked on your server.' },
+      { name: 'Transactions', path: 'developers/transactions.md', what: 'Transfers, token transfers, contract calls and deploys: signing, gas and status.' },
+      { name: 'Smart contracts', path: 'developers/smart-contracts.md', what: 'Writing, deploying and calling contracts, gas and events.' },
+      { name: 'SDK', path: 'developers/sdk.md', what: 'The developer kit for pages, servers and tools.' },
+      { name: 'CLI', path: 'developers/cli.md', what: 'The qnet command: keys, transfers, deploys and calls.' },
       { name: 'RPC API', path: 'developers/rpc-api.md', what: 'Every endpoint a wallet, an explorer or a script can call.' },
-      { name: 'Smart contracts', path: 'developers/smart-contracts.md', what: 'Deploying and calling contracts, gas and events.' },
-      { name: 'SDK', path: 'developers/sdk.md', what: 'Signing and sending transactions from your own code.' },
+      { name: 'Security', path: 'developers/security.md', what: 'What to do so users and servers stay safe.' },
       { name: '1DEV burn contract', path: 'developers/1dev-burn-contract.md', what: 'The Solana side of Phase 1 activation.' },
+      { name: 'QNet Link', path: 'protocols/qnet-link-v1.md', what: 'How aiqnet.io asks QNet Wallet to share its addresses, link its light node to a device or move its node balance.' },
+      { name: 'Light node messages', path: 'protocols/light-node-messages.md', what: 'What the wallet, the node and the device sign for a light node, and the device check.' },
     ],
   },
   {
@@ -44,10 +52,10 @@ const SECTIONS: { title: string; items: { name: string; path: string; what: stri
   {
     title: 'Applications',
     items: [
-      { name: 'Mobile wallet', path: 'applications/mobile-wallet.md', what: 'The iOS and Android app and the light node it runs.' },
+      { name: 'Mobile wallet', path: 'applications/mobile-wallet.md', what: 'The app for phones and tablets and the light node it runs.' },
       { name: 'Browser wallet', path: 'applications/browser-wallet.md', what: 'The browser extension.' },
       { name: 'Explorer', path: 'applications/explorer.md', what: 'This website: what it indexes and what it serves.' },
-      { name: 'CLI', path: 'applications/cli.md', what: 'The command-line tools.' },
+      { name: 'Python CLI', path: 'applications/cli.md', what: 'The read-only command-line tool for node, wallet and network information.' },
     ],
   },
 ];

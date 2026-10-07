@@ -109,11 +109,34 @@ alert per stuck window. An operator decision, not a restart, is the intended res
 ## Disk growth and pruning
 
 A Super node is archival by design: it keeps macroblocks, block hashes, snapshots and full account state for the whole
-chain, while Light nodes store no chain data at all. Storage is RocksDB across 30 column families with `use_fsync`
+chain, while Light nodes store no chain data at all. Storage is RocksDB across 34 column families with `use_fsync`
 enabled, WAL capped at 512 MB, memtables capped at 1 GB in total with up to four per family, RocksDB's own LOG files
 bounded to 64 MB × 10, one shared 512 MB LRU block cache, and Lz4 compression with Zstd for the cold `blocks` and
-`snapshots` families. The node prunes on two
-independent schedules and never deletes chain history to free space:
+`snapshots` families.
+
+Two derived databases sit inside the same data directory and share that block cache, so a container volume needs no
+change:
+
+- `state_tree/` holds the account tree (3 families) and is kept across restarts: about 2–3.3 GB at 10M accounts. Its
+  memtables are bounded by 256 MB and its WAL by 256 MB, with fsync on.
+- `state_aux/` holds the account leaf preimages and every contract storage tree (5 families). It is deleted and rebuilt
+  at every start, written without a WAL: about 0.9–1.3 GB of preimages at 10M accounts plus about 380 bytes per
+  contract storage slot (about 3.8 GB per 10M token balances). Its memtables are bounded by 128 MB; its write queue by
+  256 MB.
+- Certified proof views hold at most five RocksDB snapshots per derived DB, about 5–11 GB of superseded rows at 13k
+  transfers per second, and never more than three times the two DBs' live data. They are released, without
+  compaction, when cached usage reaches 95% and resume once a fresh measurement is below 90%.
+- Serving certified proofs (`?mb=` on the balance-proof routes) adds `clamp(cores / 4, 2, 8)` threads named
+  `qnet-proof-N` and a 64 MB answer cache. Proof reads skip the block cache, and the `[INFO][PROOFVIEW] stats` line
+  every 5 minutes counts what they served, refused and found.
+- The first start of this binary rebuilds `state_tree/` through its normal snapshot restore or replay and then empties
+  the main DB's old `merkle_leaves` and `merkle_nodes` families. A downgrade before that point finds them intact; after
+  it, the older binary rebuilds them on its own next restore or replay, and a node that can neither restore nor replay
+  (no snapshot, bodies pruned) resyncs from a peer snapshot, as it already does. The two directories stay on disk after a
+  downgrade until the operator deletes them; an upgrade back finds the old families repopulated and rebuilds
+  `state_tree/`.
+
+The node prunes on two independent schedules and never deletes chain history to free space:
 
 - **Hourly maintenance pass** (`PRUNE_RUNS_PER_HOUR = 1`): ping history and attestations by timestamp; consensus
   rounds down to the last 1000; failover events on a 24-hour cutoff; snapshots down to the newest
@@ -189,20 +212,23 @@ name. `scripts/node-tls.sh` puts that in front of each genesis node: a Caddy con
 mode terminating `https://node1.aiqnet.io` … `node5.aiqnet.io` on 443 and proxying to `127.0.0.1:8001`,
 with a Let's Encrypt certificate Caddy obtains and renews itself. The node container is not touched.
 
-Behind the terminator every request reaches the node from 127.0.0.1, an address the per-client rate
-limiter whitelists; the node therefore takes the client address from `X-Forwarded-For` — the last entry,
-the one the proxy appended — but only when the socket peer is loopback. A request that arrives on :8001
-directly is judged by its socket address as before.
+The node takes the client address from `X-Forwarded-For` — the last entry, the one the proxy appended —
+but only when the socket peer is loopback; a request from any other peer, one that arrives on :8001
+directly included, is judged by its socket address. An entry that names the host itself (127.0.0.1, ::1,
+0.0.0.0) or is no address was not written by the terminator, and the request counts as `0.0.0.0`: never
+loopback, never whitelisted. Whether the terminator's connections reach the node as loopback, and whether it
+writes the entry itself rather than passing a client's on, is checked per host before a roll:
+[genesis-host-checks.md](genesis-host-checks.md), section 1. The genesis-only internal routes never answer
+loopback.
 
 Order: the node's A record must resolve to its server first (ACME validates over 80/443 of the name; the
-script refuses to start a terminator the name does not point at), then `./node-tls.sh 001 … 005`, then
-`QNET_PUBLIC_RPC_URL=https://nodeN.aiqnet.io` in the node's environment at its next roll
-(`QNET_SET_ENV=QNET_PUBLIC_RPC_URL=… ./deploy-genesis.sh 00N`). That variable is what the node writes
-into a light-node ping as the address to answer at; without it the ping still names `http://IP:8001`.
+script refuses to start a terminator the name does not point at), then `./node-tls.sh 001 … 005`. A
+light-node push names no address to answer at, so nothing in the node's environment names its HTTPS
+address.
 
 ## Backup and restore
 
-**The identity secret is the BIP39 mnemonic, and nothing else.** The node's ML-DSA-65 keypair is derived
+**The identity secret is the 12- or 24-word recovery phrase (the mnemonic), and nothing else.** The node's ML-DSA-65 keypair is derived
 deterministically from the mnemonic at every boot. Back the mnemonic up offline. Supply it through
 `QNET_WALLET_SEED_FILE` (a file readable only by the node, mode 0600) rather than `QNET_WALLET_SEED`: a value passed as
 a container environment variable is readable through `docker inspect`, through `/proc/<pid>/environ` and by most
@@ -257,7 +283,10 @@ The release carries the rule dormant with an activation height compiled into the
 height, and the operator's whole job is to have the new binary deployed fleet-wide before the height arrives — so
 treat the activation height as the deadline for the rolling pass above. The current gates and their heights are in
 [consensus.md](../architecture/consensus.md#consensus-feature-gates); a release note that names one is telling you
-when the deployment must be finished.
+when the deployment must be finished. A crossed gate never moves: only a gate the fleet has not reached may be moved
+to a later epoch boundary, before the first roll of its build, and `scripts/deploy-genesis.sh` refuses to move one
+whose old height is not `GATE_MARGIN` (28,800 blocks) above the fleet tip ("gate already crossed, its height is
+frozen").
 
 **Protocol-breaking upgrade.** A change that alters what any node considers valid and is not carried by a gate cannot
 be rolled. Use the halt-height mechanism: set the *same* `QNET_HALT_HEIGHT` on every node. The 30-second monitor loop compares the
@@ -369,7 +398,10 @@ horizon the node has parked on `roster_derivation_horizon`, and the problem is n
 **Fleet stalled or forked above its last seal.** When every branch agrees up to the last sealed macroblock and only the
 unsealed tail differs or stops, roll the fleet back to that point instead of cutting a restart release. Set
 `QNET_ROLLBACK_TO_LAST_SEALED=1` (or `QNET_ROLLBACK_TO_HEIGHT=<h>`) on every node, start them together, and remove the
-variable before the next start. At boot, before state recovery, each node truncates to that height, retracts the
+variable before the next start. No rollback goes below what a node holds certified: LAST_SEALED means that certified
+floor, and an explicit height below it is refused (`[ERR][ROLLBACK] refused … reason=certified_checkpoint_irrevocable`,
+the node starts unchanged), because a certificate is n−f signatures and any surviving copy pulls the fleet back to it.
+At boot, before state recovery, each node truncates to that height, retracts the
 macroblocks and certified pairs above it, drops its own vote commitments above it and lowers its anti-double-sign mark
 to the height it ends at, so it can sign the re-produced windows. Run with either variable, `scripts/deploy-genesis.sh`
 sets it on the containers it recreates and strips it on its next roll; until then a restart of such a container
@@ -377,8 +409,10 @@ repeats the rollback. A recovery decree prunes from one host: on each genesis no
 `target_height`) returns that node's consensus signature over the decree, and `node_decreeSubmit` (the same params plus
 `sigs`) with signatures from a quorum of the genesis consensus keys and a `seq` above the last applied one gossips it;
 every node that verifies it deletes the blocks above `target_height`, retracts the macroblocks and certified pairs
-above it, records the `seq` and exits for a clean boot. Both methods answer internal callers only. For a fork in which no branch holds a quorum, `QNET_ROLLBACK_TO_HEIGHT`
-brings every stored marker back to one height at boot and the node rejoins from the network.
+above it, records the `seq` and exits for a clean boot. A decree whose target is below a node's certified floor is
+refused by that node (and by `node_decreeSubmit`), which records its `seq` so it is not gossiped again. Both methods
+answer internal callers only. For a fork in which no branch holds a quorum, `QNET_ROLLBACK_TO_HEIGHT` brings every
+stored marker back to one height at boot, never below the node's certified floor, and the node rejoins from the network.
 
 **Storage full.** Distinguish the two meanings. If the *filesystem* is full the node cannot flush and should be stopped
 before it is starved; free space outside the data directory, then restart. If the node logs `storage_warn_85pct_full`

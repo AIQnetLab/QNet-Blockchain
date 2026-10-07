@@ -627,6 +627,9 @@ impl SimplifiedP2P {
                             );
                         }
                         crate::block_pipeline::mark_peer_as_fork_source(&source_peer_id);
+                        // And no heuristic rollback toward it while flagged: the 2f+1 that flagged it are the
+                        // majority. 04.10: one node's branch kept pulling the finalized majority back by round.
+                        crate::block_pipeline::quarantine_fork_source(&source_peer_id);
                     }
                 }
             }
@@ -689,10 +692,7 @@ impl SimplifiedP2P {
                 // receiver MUST compare in the same relative units (get_baseline_round),
                 // NOT raw absolute — once baseline>0 a units mismatch makes receivers
                 // refuse to ack (acks=1/4 forever). v16.2 safety preserved. O(1)/ack.
-                let local_certified_abs = HIGHEST_CERTIFIED_ROUND
-                    .get(&mb_idx)
-                    .map(|e| *e.value())
-                    .unwrap_or(0);
+                let local_certified_abs = window_view_round(mb_idx);
                 let baseline = get_baseline_round(mb_idx);
                 let local_certified_rel = local_certified_abs.saturating_sub(baseline);
                 if local_certified_rel != round {
@@ -1128,6 +1128,54 @@ impl SimplifiedP2P {
                     println!("[DBG][TIMEOUT] proof_response count={} from={}", certificates.len(), sender_id);
                 }
                 self.handle_timeout_proof_response(certificates);
+            }
+
+            // Tenure-bound vote: the same tiers as TimeoutVote, keyed by (window, tenure).
+            NetworkMessage::TimeoutVoteV3 { window, tenure, timeout_round, voter_id, anchor, high_qc_idx,
+                                            high_qc_hash, tip_height, tip_hash, signature,
+                                            cert_window, cert_tenure, cert_round } => {
+                self.update_peer_last_seen(&voter_id);
+                // SyncInfo FIRST, as for TimeoutVote: pull-only, verified on arrival.
+                self.process_tc_claim_v3(cert_window, cert_tenure, cert_round);
+                let local_mb_index = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed) / 90;
+                if local_mb_index > 20 && window.saturating_add(20) < local_mb_index {
+                    return; // stale window
+                }
+                let bound_w = certified_view_bound_windows();
+                if bound_w != u64::MAX && window > bound_w.saturating_add(1) {
+                    if crate::node::is_debug() {
+                        println!("[DBG][TIMEOUT] vote_oob mb={} bound={} action=drop", window, bound_w);
+                    }
+                    return;
+                }
+                if crate::node::is_info() {
+                    println!("[INFO][TIMEOUT] vote_recv mb={} tenure={} round={} voter={}", window, tenure, timeout_round, voter_id);
+                }
+                self.handle_timeout_vote_v3(window, tenure, timeout_round, voter_id, anchor, high_qc_idx,
+                                            high_qc_hash, tip_height, tip_hash, signature);
+            }
+
+            // Tenure-bound certificate: the same window sanity as TimeoutCertificateBroadcast.
+            NetworkMessage::TimeoutCertificateV3Broadcast { proof } => {
+                let local_mb_index = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed) / 90;
+                let bound_w = certified_view_bound_windows();
+                if (local_mb_index > 20 && proof.window.saturating_add(20) < local_mb_index)
+                    || (bound_w != u64::MAX && proof.window > bound_w.saturating_add(1)) {
+                    return;
+                }
+                let key = proof.key();
+                if key.is_legacy() { return; }
+                if crate::node::is_info() {
+                    println!("[INFO][TIMEOUT] proof_recv {} round={} votes={}", key, proof.timeout_round, proof.votes.len());
+                }
+                self.handle_timeout_proof_broadcast_keyed(key, proof.timeout_round, proof.anchor.to_vec(), proof.votes);
+            }
+
+            NetworkMessage::TimeoutCertificatesV3Response { certificates, sender_id } => {
+                if crate::node::is_debug() {
+                    println!("[DBG][TIMEOUT] proof_response_v3 count={} from={}", certificates.len(), sender_id);
+                }
+                self.handle_timeout_proof_response_v3(certificates);
             }
 
             // v14.7.2: BlockCommitVote / BlockCommitCertificate handlers REMOVED.
@@ -1770,6 +1818,16 @@ impl SimplifiedP2P {
                 // Re-gossip BEFORE executing: execution prunes and restarts this process.
                 self.gossip_to_random_peers(NetworkMessage::RecoveryDecree {
                     seq, target_height, sigs: sigs.clone() }, 8);
+                // Never below what this node holds certified (a QC is irrevocable). A node forked below
+                // that point has a lower floor and still executes. The seq is recorded either way, so the
+                // decree is not re-gossiped on every redelivery.
+                let floor = crate::node::BlockchainNode::certified_rollback_floor(&storage);
+                if target_height < floor {
+                    println!("[ERR][DECREE] refused seq={} target={} certified_floor={} reason=certified_checkpoint_irrevocable",
+                             seq, target_height, floor);
+                    let _ = storage.set_applied_decree_seq(seq);
+                    return;
+                }
                 std::thread::sleep(std::time::Duration::from_secs(2)); // let the fan-out flush
                 crate::consensus_v2_node::execute_recovery_decree(&storage, seq, target_height);
             }
@@ -2294,135 +2352,86 @@ impl SimplifiedP2P {
                     return;
                 }
 
-                // SECURITY: reject a future-dated registered_at (clock-skew bound only). Gossip is
-                // unauthenticated for a not-yet-on-chain node (the Dilithium proof only opens over the public
-                // wallet_address), so an unbounded timestamp would let an attacker pin registered_at≈u64::MAX
-                // and permanently freeze the newer-only dedupe below against the real node's later registration.
-                {
-                    let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-                    if registered_at > now_secs.saturating_add(300) {
-                        if crate::node::is_warn() {
-                            println!("[WARN][GOSSIP] future_registered_at_rejected node={} ts={}", node_id, registered_at);
-                        }
-                        return;
-                    }
-                }
+                // `registered_at` is not read here: the chain decides it. (It used to be bounded against
+                // this node's clock to protect a newer-only dedupe that is gone; a bound on the sender's
+                // clock would only drop bindings sent by a genesis whose clock runs ahead.)
 
-                // DEDUPE: Check if already in registry
-                {
-                    let registry = self.light_node_registry.read();
-                    if let Some(existing) = registry.get(&node_id) {
-                        // Already have this registration
-                        // SECURITY: Only accept updates with newer timestamp
-                        if registered_at <= existing.registered_at {
-                            return;
-                        }
-                        // SECURITY: Don't accept gossip-based failure increments
-                        // Failures are tracked locally by each pinger node
-                        // Gossip can only reset failures (successful re-registration)
-                        if consecutive_failures > existing.consecutive_failures && consecutive_failures > 0 {
-                            if crate::node::is_warn() {
-                                println!("[WARN][GOSSIP] suspicious_failure_increment_rejected node={}", node_id);
-                            }
-                            return;
-                        }
+                // H8: a gossiped binding is taken only for a light node the chain registered, only
+                // under the key its registration committed, and only when its delegation verifies and
+                // is not older than the stored one. The old guards did not hold: the wallet signature
+                // opens over a public address (any fresh key passes it), the committed-key check
+                // looked up a raw key the chain keeps only as a hash (so it never fired for a light
+                // node), and a `genesis_` id skipped every check. No light node has a genesis id.
+                let Some(storage) = self.storage.as_ref() else { return; };
+                if !node_id.starts_with("light_")
+                    || crate::rpc::generate_light_node_pseudonym(&wallet_address) != node_id {
+                    if crate::node::is_warn() {
+                        println!("[WARN][GOSSIP] light_binding_not_pseudonym_rejected node={}", node_id);
                     }
+                    return;
                 }
-                
-                // Pure ML-DSA-65: the mobile-signed ML-DSA-65 proof over wallet_address is the SOLE
-                // gossip authenticator (mandatory). Genesis nodes (genesis_*) are trusted by definition
-                // and skip it. The former Part-2 Ed25519 (light_node_gossip:...) wallet-key proof and
-                // its wire fields are fully removed in P8.
-                let is_genesis = node_id.starts_with("genesis_");
-                if !is_genesis {
-                    // ML-DSA-65 (ML-DSA-65) — quantum-resistant identity proof (MANDATORY)
-                    if !signature.is_empty() && !quantum_pubkey.is_empty() {
-                        let dilithium_ok = self.verify_mobile_dilithium_gossip(&wallet_address, &signature, &quantum_pubkey);
-                        if !dilithium_ok {
-                            if crate::node::is_warn() {
-                                println!("[WARN][GOSSIP] dilithium_invalid node={} wallet={}...",
-                                    node_id, qnet_state::char_prefix(&wallet_address, 16));
-                            }
-                            return;
-                        }
+                if ping_pubkey.is_empty() || ping_delegation_cert.is_empty() { return; }
+                // The echo of the stored binding, an older one and a legacy one after a v2 binding cost
+                // no signature check and go no further (the write re-checks under the node's lock).
+                let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                let verdict = crate::light_binding::admit_copy(
+                    storage.get_light_binding(&node_id).as_ref(), &ping_pubkey, &ping_delegation_cert, now_secs);
+                if verdict != crate::light_binding::Admit::Apply {
+                    if crate::node::is_debug() && verdict != crate::light_binding::Admit::Same {
+                        println!("[DBG][GOSSIP] light_binding_not_newer node={} verdict={:?}", node_id, verdict);
+                    }
+                    return;
+                }
+                if !storage.is_node_registration_onchain(&node_id) {
+                    if crate::node::is_debug() {
+                        println!("[DBG][GOSSIP] light_binding_not_onchain node={}", node_id);
+                    }
+                    return;
+                }
+                let Some(identity) = storage.resolve_light_identity_pk(&node_id, Some(&quantum_pubkey)) else {
+                    if crate::node::is_warn() {
+                        println!("[WARN][GOSSIP] light_binding_identity_unresolved node={}", node_id);
+                    }
+                    return;
+                };
+                if crate::light_binding::verify_delegation(&ping_delegation_cert, &ping_pubkey, &node_id, &identity).is_none() {
+                    if crate::node::is_warn() {
+                        println!("[WARN][GOSSIP] light_binding_delegation_invalid node={}", node_id);
+                    }
+                    return;
+                }
+                match storage.save_light_ping_keys_identity(&node_id, &ping_pubkey, &ping_delegation_cert, &identity) {
+                    Ok(crate::storage::PingKeyWrite::Applied) => {}
+                    Ok(w) => {
                         if crate::node::is_debug() {
-                            println!("[DBG][GOSSIP] dilithium_ok node={}", node_id);
-                        }
-                    } else {
-                        if crate::node::is_warn() {
-                            println!("[WARN][GOSSIP] dilithium_missing_rejected node={} wallet={}...",
-                                node_id, qnet_state::char_prefix(&wallet_address, 16));
+                            println!("[DBG][GOSSIP] light_binding_not_newer node={} verdict={:?}", node_id, w);
                         }
                         return;
                     }
-
-                    // SECURITY: identity continuity. The mobile Dilithium proof only opens over the PUBLIC
-                    // wallet_address, so any freshly-minted key passes it — it does NOT bind the key to the
-                    // node's identity. A node's quantum key is activation-derived (immutable), so a gossip
-                    // carrying a DIFFERENT key for a known node_id is an identity-swap/hijack attempt. Bind
-                    // to the established key (RAM entry, else the committed VRF key) and reject a mismatch.
-                    // This gates BOTH the is_active overwrite below and the persisted-drop clear.
-                    if !quantum_pubkey.is_empty() {
-                        // VRF-ONLY: the committed on-chain key is the sole authoritative, un-poisonable
-                        // identity. (C trims the RAM quantum_pubkey to empty, so the former RAM fallback was
-                        // dead.) A not-yet-on-chain pseudonym has no established key to bind to; once it
-                        // commits on-chain its own gossip matches the VRF key and any pre-registration poison
-                        // is rejected here — an attacker can never produce a VRF-matching key.
-                        let established = self.storage.as_ref()
-                            .and_then(|s| s.load_vrf_public_key(&node_id).ok().flatten())
-                            .map(hex::encode);
-                        if let Some(est) = established {
-                            if est != quantum_pubkey {
-                                if crate::node::is_warn() {
-                                    println!("[WARN][GOSSIP] identity_mismatch_rejected node={}", node_id);
-                                }
-                                return;
-                            }
-                        }
-                    }
+                    Err(_) => return,
                 }
-
-                // C: ping keys → dedicated CF (read per-ping), written only AFTER the identity guard above
-                // passes so a forged key cannot poison it. The resident entry below keeps the crypto EMPTY.
-                if let Some(s) = &self.storage {
-                    let _ = s.save_light_ping_keys(&node_id, &ping_pubkey, &ping_delegation_cert);
-                }
-
-                // Store in local registry (cap, eviction and trimming live in the shared admission).
-                {
-                    let mut registry = self.light_node_registry.write();
-                    self.admit_light(&mut registry, LightNodeRegistrationData {
-                        node_id: node_id.clone(),
-                        wallet_address: wallet_address.clone(),
-                        device_token_hash: String::new(),
-                        quantum_pubkey: String::new(),
-                        registered_at,
-                        signature: String::new(),
-                        push_type: push_type.clone(),
-                        unified_push_endpoint: unified_push_endpoint.clone(),
-                        last_seen,
-                        consecutive_failures,
-                        is_active,
-                        ping_pubkey: String::new(),
-                        ping_delegation_cert: String::new(),
-                    });
-                }
+                // S1: the chain decides an on-chain node's wallet, registration time and activity, and
+                // its push channel comes from the genesis that took the binding (the token sync). The
+                // resident entry is derived from the chain (admit_light_from_chain), so none of those
+                // gossiped fields is written here.
 
                 if crate::node::is_info() {
-                    println!("[INFO][GOSSIP] light_node_accepted node={} hop={} dilithium=ok", node_id, gossip_hop);
+                    println!("[INFO][GOSSIP] light_binding_accepted node={} hop={}", node_id, gossip_hop);
                 }
 
-                // RE-GOSSIP: Forward to other peers with incremented hop
+                // RE-GOSSIP: Forward to other peers with incremented hop. The static wallet signature,
+                // the token hash and a UnifiedPush endpoint (a push capability) are not passed on (S2, H6, NB-2).
+                let _ = (device_token_hash, signature, unified_push_endpoint);
                 let forward_msg = NetworkMessage::LightNodeRegistration {
                     node_id,
                     wallet_address,
-                    device_token_hash,
+                    device_token_hash: String::new(),
                     quantum_pubkey,
                     registered_at,
-                    signature,
+                    signature: String::new(),
                     gossip_hop: gossip_hop + 1,
                     push_type,
-                    unified_push_endpoint,
+                    unified_push_endpoint: None,
                     last_seen,
                     consecutive_failures,
                     is_active,
@@ -2446,74 +2455,14 @@ impl SimplifiedP2P {
                 }
             }
 
-            // PRODUCTION: Light Node registry sync response
+            // Retired with the request above (H8). The registry is derived from block apply, and this
+            // arm admitted entries on the strength of a `sender_id` the message itself names - any
+            // peer could write it. Accepted and ignored, like the request.
             NetworkMessage::LightNodeRegistryResponse { sender_id, registrations, total_count } => {
                 self.update_peer_last_seen(from_peer);
-
-                // ─────────────────────────────────────────────────────────────
-                // SENDER AUTHENTICATION — only consensus-tier peers may sync.
-                //
-                // The Light-node registry feeds pinger selection and reward
-                // window aggregation. Without this gate any peer could push
-                // an unbounded list of `LightNodeRegistrationData` into the
-                // local registry — there is NO cryptographic check on the
-                // payload entries themselves, so the attacker controls the
-                // whole record (node_id, wallet, FCM token, quantum_pubkey).
-                // Pollution is bounded by `MAX_LIGHT_NODE_REGISTRY` so the
-                // attack does not OOM, but it does:
-                //   * inflate pinger selection candidates (resource burn);
-                //   * occupy capacity that legitimate registrations cannot
-                //     reclaim until eviction fires;
-                //   * mix attacker-controlled FCM tokens into the local
-                //     dedup keyspace (operationally noisy).
-                //
-                // Honest registry sync exclusively flows between consensus-
-                // tier peers (Genesis + active Super). Restricting the
-                // accepted senders to those identities closes the pollution
-                // path without changing the on-the-wire format. New Super
-                // nodes pick up the constraint automatically: as soon as
-                // their NodeRegistration TX is applied to chain state and
-                // mirrored into `active_full_super_nodes`, peers will accept
-                // their sync responses.
-                //
-                // Scalability: at thousands of Super-nodes the active map is
-                // O(1) DashMap lookup; gating cost is negligible.
-                let sender_authenticated = sender_id.starts_with("genesis_node_")
-                    || self.active_full_super_nodes.contains_key(&sender_id);
-                if !sender_authenticated {
-                    if crate::node::is_warn() {
-                        println!(
-                            "[WARN][SYNC] light_registry_response_unauthenticated sender={} count={} action=drop",
-                            sender_id, registrations.len()
-                        );
-                    }
-                    return;
-                }
-
-                if crate::node::is_info() {
-                    println!("[INFO][SYNC] Light node registry response from {} ({} nodes, {} total)",
+                if crate::node::is_debug() {
+                    println!("[DBG][SYNC] light_registry_response_retired from={} count={} total={}",
                              sender_id, registrations.len(), total_count);
-                }
-
-                // Shared admission: dedup by node_id, role cap, trimmed entry. The raw insert this
-                // replaces honoured none of them — a synced entry kept the sender's full crypto payload
-                // and could push the map past the cap without evicting.
-                let mut added = 0;
-                {
-                    let mut registry = self.light_node_registry.write();
-                    // Once for the whole page: the eviction scan is the expensive part.
-                    super::propagation::make_room_for(&mut registry, registrations.len());
-                    for reg in registrations {
-                        // An entry already known here is never overwritten by a peer.
-                        if !registry.contains_key(&reg.node_id) {
-                            self.admit_light(&mut registry, reg);
-                            added += 1;
-                        }
-                    }
-                }
-
-                if crate::node::is_info() {
-                    println!("[INFO][SYNC] Added {} new Light nodes to registry", added);
                 }
             }
             
@@ -2528,30 +2477,28 @@ impl SimplifiedP2P {
                 if gossip_hop >= 3 {
                     return;
                 }
-                
-                // DEDUPE the gossip echo, and ONLY the echo. The key must live in the same unit as
-                // the credit it guards: eligibility is per EPOCH, slot numbers repeat every epoch,
-                // and the map is retained 24 h = 6 epochs. Keyed on {id}:{slot} alone, an
-                // attestation suppressed that device's replies in the same slot for six
-                // epochs — the shard owner dropped the relayed reply before recording eligibility,
-                // and the device lost those rewards. The LOCAL epoch is used, not the message
-                // block_height, which is relay-tamperable. Built by the SAME helper the writer uses,
-                // so a dedupe read can never look up a shape the insert does not produce.
-                let attestation_key = Self::attestation_key(&light_node_id, slot);
-                {
-                    let attestations = self.light_node_attestations.read();
-                    if attestations.contains_key(&attestation_key) {
-                        // Already have attestation for this Light node in this slot
-                        return;
+                // Bounded and in a creditable form before anything else: nothing signs the reply on relay, and
+                // a held one lives up to a minute (ND-1).
+                if !crate::light_device::ping::relay_fields_well_formed(&light_node_id, &challenge, &light_node_signature,
+                                                                        &pinger_signature) {
+                    if crate::node::is_debug() {
+                        println!("[DBG][P2P] light_relay_malformed node={} pinger={} reply_len={}", light_node_id, pinger_id,
+                                 light_node_signature.len());
                     }
-                }
-                // An echo of an attestation already recorded here this epoch. The map above stops deduping
-                // past its bound; this set is the eligibility record itself.
-                let local_epoch = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed) / 14400;
-                if self.epoch_light_eligible.read().get(&local_epoch).map_or(false, |s| s.contains(&light_node_id)) {
                     return;
                 }
-                
+
+                // DEDUPE the gossip echo, and ONLY the echo (`light_relay_seen`). It keys on the LOCAL epoch, so a
+                // reply anchored in the next epoch (this owner is behind across the boundary, and the node was
+                // credited here in this one) is no echo: it is held below and deduped once the tip reaches it.
+                // The anchor is only parsed here; the chain is read below.
+                let parsed_anchor = crate::light_device::ping::relay_anchor(&challenge, &light_node_signature, block_height);
+                let tip_now = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+                if crate::light_device::ping::relay_echo_dedupe_applies(&parsed_anchor, tip_now)
+                    && self.light_relay_seen(&light_node_id, slot) {
+                    return;
+                }
+
                 // TIMESTAMP VALIDATION: Must be within ±5 minutes
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -2564,7 +2511,34 @@ impl SimplifiedP2P {
                     }
                     return;
                 }
-                
+
+                // The anchor before any signature (light-node-messages 5.8, A8): a relayed reply signs a
+                // canonical block of this epoch whose height the unsigned block_height repeats (a legacy
+                // reply: any later height of that epoch, as a genesis of the previous binary relays it), so
+                // a reply stockpiled in an earlier epoch cannot be credited through a registered relay. A
+                // server stamp is never credited on relay: only the genesis that issued it can check it. An
+                // anchor above this owner's tip, in its epoch or the next, is not refused: this owner is behind
+                // the genesis that credited the reply at its own tip, and the reply waits for the tip after the
+                // pinger's checks below (the previous binary read no anchor on relay and credited it).
+                let anchored = parsed_anchor.and_then(|a| {
+                    use crate::light_device::ping::{relay_anchor_on_chain, RelayAnchor, ReplyRefusal};
+                    let tip = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+                    match crate::node::try_get_storage().map(|st| relay_anchor_on_chain(st, &a, tip)) {
+                        Some(RelayAnchor::Current) => Ok(None),
+                        Some(RelayAnchor::AboveTip) => Ok(Some(a.height)),
+                        _ => Err(ReplyRefusal::Anchor),
+                    }
+                });
+                let wait_for_tip = match anchored {
+                    Ok(h) => h,
+                    Err(r) => {
+                        if crate::node::is_debug() {
+                            println!("[DBG][P2P] light_relay_refused node={} pinger={} reason={}", light_node_id, pinger_id, r.as_str());
+                        }
+                        return;
+                    }
+                };
+
                 // The pinger must be a REAL super, established by the chain — not by the gossip-filled
                 // `active_full_super_nodes` map, which is populated from a self-signed
                 // ActiveNodeAnnouncement whose key is TOFV-accepted for non-genesis identities (no burn,
@@ -2574,10 +2548,11 @@ impl SimplifiedP2P {
                 // random bootstrap node, so every ping that lands on a Super would be silently dropped
                 // and that light node would earn NOTHING for the epoch. Light nodes are users and are
                 // paid for confirmed pings unconditionally — a relay rule must never be what breaks that.
+                // A non-genesis pinger must also sign under the consensus key the chain committed for it, bound in
+                // the key registry: a light node registers no consensus key, and an unbound id would be verified
+                // trust-on-first-sight, so anyone could sign as any registered light node (ND-1).
                 let pinger_ok = pinger_id.starts_with("genesis_node_")
-                    || crate::node::try_get_storage()
-                        .and_then(|st| st.node_reg_height(&pinger_id).ok().flatten())
-                        .is_some();
+                    || crate::node::try_get_storage().map_or(false, |st| crate::light_device::ping::relay_pinger_admissible(st, &pinger_id));
                 if !pinger_ok {
                     if crate::node::is_info() {
                         println!("[ERR][P2P] unregistered_pinger {} for Light node {}", pinger_id, light_node_id);
@@ -2595,7 +2570,24 @@ impl SimplifiedP2P {
                         return;
                     }
                 }
-                
+
+                // F7: only an owner of the node's shard can credit the relay, so nobody else verifies anything of it;
+                // and of copies of one reply arriving together only the first is verified (`RelayClaims`), the
+                // claim held until it is admitted or refused.
+                let relay_epoch = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed) / 14400;
+                if !self.node_in_my_shard_for_epoch(relay_epoch, &light_node_id) {
+                    if crate::node::is_debug() {
+                        println!("[DBG][P2P] light_relay_not_owner node={} pinger={}", light_node_id, pinger_id);
+                    }
+                    return;
+                }
+                let Some(_claim) = crate::rpc::RELAY_CLAIMS.claim(&light_node_id, relay_epoch, &light_node_signature) else {
+                    if crate::node::is_debug() {
+                        println!("[DBG][P2P] light_relay_in_flight node={} pinger={}", light_node_id, pinger_id);
+                    }
+                    return;
+                };
+
                 // VERIFY: Pinger signature on attestation
                 let attestation_data = format!("attestation:{}:{}:{}:{}",
                     light_node_id, slot, timestamp, challenge);
@@ -2606,51 +2598,7 @@ impl SimplifiedP2P {
                     return;
                 }
 
-                // The DEVICE's own signature over the challenge is the only thing proving the phone
-                // actually answered; it was carried here and verified by nobody. Same verifier the HTTP
-                // ingress uses, so relay and ingress accept an identical set.
                 let attestation = LightNodeAttestation {
-                    light_node_id: light_node_id.clone(),
-                    pinger_id: pinger_id.clone(),
-                    slot,
-                    timestamp,
-                    light_node_signature: light_node_signature.clone(),
-                    pinger_signature: pinger_signature.clone(),
-                    challenge: challenge.clone(),
-                    block_height,
-                };
-                if !self.verify_light_ping_signature(&light_node_id, &challenge, &light_node_signature) {
-                    // A node holds ping keys only for the shards it owns, so a relay for any other shard
-                    // fails here by construction and is nothing to report: three fifths of the fleet's
-                    // attestations reach each node that way, and at WARN they buried the cases that do
-                    // mean something — a shard this node owns, where the pull below has to heal the row.
-                    let epoch = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed) / 14400;
-                    if !self.node_in_my_shard_for_epoch(epoch, &light_node_id) {
-                        if crate::node::is_debug() {
-                            println!("[DBG][P2P] light_sig_other_shard node={} pinger={}", light_node_id, pinger_id);
-                        }
-                    } else if crate::node::is_warn() {
-                        println!("[WARN][P2P] light_sig_invalid node={} pinger={}", light_node_id, pinger_id);
-                    }
-                    // An owner the device never replied to directly holds no identity row for it, or a stale one.
-                    self.maybe_pull_light_identity(attestation);
-                    return;
-                }
-                
-                // Store through the single writer, and record eligibility for a my-shard node: the same
-                // admission the identity pull finishes with.
-                self.admit_relayed_attestation(attestation);
-                
-                // WHITEPAPER: Light nodes have FIXED reputation of 70
-                // NO reputation changes for Light nodes - they are always eligible if attested
-                
-                if crate::node::is_info() {
-                    println!("[INFO][P2P] Light node {} attested by {} in slot {} height={}",
-                             light_node_id, pinger_id, slot, block_height);
-                }
-                
-                // RE-GOSSIP
-                let forward_msg = NetworkMessage::LightNodeAttestation {
                     light_node_id,
                     pinger_id,
                     slot,
@@ -2658,10 +2606,20 @@ impl SimplifiedP2P {
                     light_node_signature,
                     pinger_signature,
                     challenge,
-                    gossip_hop: gossip_hop + 1,
-                    block_height, // v2.59: Propagate height for all nodes
+                    block_height,
                 };
-                self.gossip_to_random_peers(forward_msg, 3);
+                if let Some(anchor_height) = wait_for_tip {
+                    // Only an owner of the node's shard credits it; for any other shard the device's
+                    // signature fails by construction (`finish_light_relay`), and the relay goes no further.
+                    let epoch = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed) / 14400;
+                    if self.node_in_my_shard_for_epoch(epoch, &attestation.light_node_id) {
+                        let direct = Self::genesis_peer_ip(&attestation.pinger_id)
+                            .map_or(false, |ip| from_peer.split(':').next() == Some(ip) || from_peer == attestation.pinger_id);
+                        self.hold_relayed_attestation(attestation, anchor_height, gossip_hop, direct);
+                    }
+                    return;
+                }
+                self.finish_light_relay(attestation, gossip_hop);
             }
             
             // PRODUCTION: Active Super node announcement for pinger selection
@@ -2669,6 +2627,14 @@ impl SimplifiedP2P {
                 node_id, node_type, shard_id, reputation, timestamp, signature, gossip_hop
             } => {
                 self.update_peer_last_seen(from_peer);
+
+                // A genesis's ping tick (F5): owner liveness and the push schedule it names, straight from that genesis,
+                // never relayed and never in the active map. Sent at the relay limit, so a node of an earlier release
+                // drops it below.
+                if let Some(schedule) = crate::rpc::ping_tick_schedule(&node_type) {
+                    self.take_ping_tick(from_peer, &node_id, &node_type, schedule, shard_id, reputation, timestamp, &signature);
+                    return;
+                }
 
                 // v17.1: IP-anchor gate intentionally NOT applied here.
                 // ActiveNodeAnnouncement is gossip-relayed (gossip_hop up to

@@ -1,0 +1,4 @@
+# The extension ships LF-only UTF-8 files and the crypto bundle is compared byte for byte with its
+# rebuild, so a Windows checkout (core.autocrlf) must not rewrite line endings here.
+* text=auto eol=lf
+*.png binary

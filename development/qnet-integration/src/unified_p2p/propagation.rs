@@ -2,10 +2,10 @@
 
 use super::*;
 
-/// Memo + log latch for the light-shard recovery sweep: `epoch * 128 + covered_mask * 4 + state`,
-/// state 0 quiet / 1 recovering / 2 stood down. Keyed by the covered set too, so a shard takeover
-/// re-evaluates instead of inheriting the previous owner's verdict.
-static SHARD_SWEEP_STATE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+/// The last reading of what decides the dormant rule (`rpc::DormantFacts`), `epoch << 8 | decidable shard mask`, so its
+/// change is logged once. A shard outside the mask committed no row (or was not derived here) in one of the two epochs
+/// before, so every node of it is pushed: the recovery sweep, per shard (F11).
+static DORMANT_FACTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
 
 /// Place newly admitted light nodes into their ping-slot buckets. Returns how many were placed —
 /// a node outside the shards we cover belongs to no bucket of ours. Pure, so the invariant "a node
@@ -36,6 +36,55 @@ const MAX_PING_CATCHUP_SLOTS: u64 = 15;
 /// the upgrade must reach every genesis before this window's first block (104 * 14,400 = 1,497,600).
 const BOUNDED_SLOT_DRAW_FROM_WINDOW: u64 = 104;
 
+/// The first window whose first push is drawn over the epoch's first UNSPACED_FIRST_PUSH_SLOTS (P-1): the window
+/// after the one this genesis first pinged in, stored from a tip the network stands behind and kept in its storage
+/// (`rpc::first_push_draw_from`), so no restart re-draws a live window. Until armed, and on a node that never pings, the
+/// bounded draw stays.
+static FIRST_PUSH_DRAW_WINDOW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// The first window drawn over FIRST_PUSH_SLOTS with its rounds spaced (`rpc::ROUND_SPACING_SLOTS`): the window after
+/// the one this genesis first pinged in on a release with them, stored from a tip the network stands behind and kept
+/// (`rpc::spaced_rounds_from`). A switch at a restart mid-window would re-draw the live window, and a device whose old
+/// slot had not come while its new one had passed would get no push that epoch; so the window the release lands in keeps
+/// its draw to its end, as it began.
+///
+/// Mixed versions in the epoch of the roll. The release before this one draws every node over the bounded range (232
+/// slots), pushes it in that slot and the next two, sends no retry round and stores no window, so a genesis upgraded in
+/// epoch W stores W + 1 for the early draw and the spaced rounds alike. In W it draws every node into the slot the
+/// release before does and pushes it in the same three slots, and also sends a retry round an hour on that the release
+/// before does not: no node is pushed less. From W + 1 it draws over 138 slots and spaces its rounds, while a genesis the
+/// roll reaches later keeps the bounded draw to the end of the epoch it is upgraded in; so for as long as the roll takes
+/// (minutes per genesis, longer when it stops at a milestone), the owners of one shard may draw an epoch differently. A
+/// shard is pushed by one owner at a time, and a hand-over inside an epoch (a cover after ten silent slots, or the
+/// hand-back) between owners on different draws would leave unpushed the nodes whose due points under the new pusher's
+/// draw had passed while those under the old pusher's had not come. So a genesis that starts pushing a shard inside an
+/// epoch, or after a gap in its reads (`ShardReads`), reads it to the epoch's end under each other owner's draw too, as
+/// that owner's ping ticks name it (`foreign_draws`, `rpc::OwnerSchedules`; the bounded draw for one never heard naming
+/// one), with its own round shape: every node whose first push or retry round under the draw of whoever pushed the
+/// shard before is still due gets it, however long the roll takes. Node-local, not a consensus rule; the tests
+/// `the_roll_from_the_release_before_drops_no_node` and `a_cover_between_owners_on_different_draws_drops_no_node` play
+/// the roll through.
+static SPACED_ROUND_WINDOW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// How many slots `window`'s first push is drawn over when the early draw starts at `first_push_from` and the spaced
+/// rounds at `spaced_from`.
+pub(crate) fn ping_draw_slots(window: u64, first_push_from: u64, spaced_from: u64) -> u64 {
+    if window >= spaced_from {
+        crate::rpc::FIRST_PUSH_SLOTS
+    } else if window >= first_push_from {
+        crate::rpc::UNSPACED_FIRST_PUSH_SLOTS
+    } else if window >= BOUNDED_SLOT_DRAW_FROM_WINDOW {
+        240 - crate::node::light_commit_window(window).div_ceil(60) - 2 - crate::rpc::LIGHT_CHALLENGE_TTL_SECS.div_ceil(60)
+    } else {
+        240
+    }
+}
+
+/// Whether `window`'s rounds are spaced on this genesis (`SPACED_ROUND_WINDOW`).
+pub(crate) fn spaced_rounds_in(window: u64) -> bool {
+    window >= SPACED_ROUND_WINDOW.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Buckets one ping tick reads, newest first: the grace read {slot, slot-1, slot-2} (mod 240) of every
 /// slot passed since `last_read` (absolute slots, window * 240 + slot), a new window from its slot 0. A
 /// first tick, a rollback or a gap past MAX_PING_CATCHUP_SLOTS reads only the grace slots, with the gap.
@@ -49,6 +98,187 @@ pub(super) fn ping_buckets_to_read(last_read: Option<u64>, now: u64) -> (Vec<usi
     let span = now - first;
     ((0..=span + 2).map(|g| ((slot + 240 - g) % 240) as usize).collect(), gap)
 }
+
+/// Buckets one push tick reads, first pushes first: the grace read (`ping_buckets_to_read`), then the same
+/// slots RETRY_AFTER_SLOTS earlier, the retry round of the nodes drawn there (R-a, P-1). The retry read never
+/// wraps into the window's end: those slots' first pushes have not come yet.
+pub(super) fn push_buckets_to_read(last_read: Option<u64>, now: u64) -> (Vec<usize>, u64) {
+    let (mut buckets, gap) = ping_buckets_to_read(last_read, now);
+    let slot = (now % 240) as usize;
+    let retry = crate::rpc::RETRY_AFTER_SLOTS as usize;
+    let retry_read: Vec<usize> = (0..buckets.len()).filter_map(|g| slot.checked_sub(g + retry)).collect();
+    buckets.extend(retry_read);
+    (buckets, gap)
+}
+
+/// One bucket a push tick reads (a drawn slot) and the due points it is read for, earliest first
+/// (`rpc::PushLedger::may_push`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PushRead {
+    pub(crate) bucket: usize,
+    pub(crate) dues: Vec<crate::rpc::Due>,
+}
+
+/// What one push tick at absolute slot `now` reads, first pushes first, and the gap a tick without continuity skipped.
+/// Before the spaced rounds (`spaced` false) the buckets of `push_buckets_to_read`, each slot a due point of its own.
+/// With them each due point of the round and of the retry round (`rpc::spaced_due_offsets`) that came since the last
+/// tick, with its grace: the drawn slot `slot - g - offset` for each g of the grace read (`ping_buckets_to_read`), due in
+/// `slot - g`, never wrapping into the window's end. A bucket two due points reach in one catch-up tick is read once,
+/// with both, and a push a catch-up made late meets the next due point when that one is nearer than
+/// `rpc::MIN_PUSH_GAP_SLOTS` (`rpc::Due::spaced`): no two pushes this genesis records for a node go out closer. `done` is
+/// the last slot a run of this genesis before a restart read, when this tick's reads join it (`rpc::push_read_mark`): no
+/// due point up to it is read again with the spaced rounds, as its push went out or was shed once already and the
+/// record that would close it went with the restart.
+///
+/// Scale (M-11): at ten million light nodes on five genesis a shard holds two million, about 14,500 a bucket over 138
+/// slots. A tick on the regular pace reads three buckets for each of the six due points, 18 against the 6 of the rounds
+/// a slot apart. Every id read gets one ledger read in RAM (about 0.1 us) under the slot index's lock alone, the light
+/// registry's not held (`get_light_nodes_to_ping`); only the ids it lets through get the eligibility and registry tests
+/// under those locks, and the storage reads for a silent one. The round's first push and the retry round's let through
+/// what they did before. The four repeats add some 174,000 ids a tick (522,000 for three shards), some 17 ms of ledger
+/// reads a tick a shard, and let through only a node offered a push here in the epoch (sent or shed, not answered here,
+/// pruned every ten slots once counted elsewhere). No grace slot passes once its due point's push went out or the dormant
+/// rule held the node there, and a hold offers no repeat: a node held dormant is read twice an epoch, at the round's
+/// first push and the retry round's (six times with the rounds a slot apart). For the one round after a restart or a
+/// takeover, whose first pushes went out from a record this genesis does not have, a repeat lets through any node of the
+/// shard not counted (`rpc::PushLedger::may_push`), its shard read with one hash per id only then. A per-slot index of
+/// the pushed nodes would read only the silent ones, but hold some 1.3 million ids (30 slots of three shards); the
+/// buckets hold nothing new, and the retry round read from them survives a restart of this genesis.
+pub(super) fn push_reads(last_read: Option<u64>, now: u64, spaced: bool, done: Option<u64>) -> (Vec<PushRead>, u64) {
+    if !spaced {
+        let (buckets, gap) = push_buckets_to_read(last_read, now);
+        let reads = buckets.into_iter().map(|bucket| PushRead { bucket, dues: vec![crate::rpc::Due::once(now)] }).collect();
+        return (reads, gap);
+    }
+    let (grace, gap) = ping_buckets_to_read(last_read, now);
+    let slot = now % 240;
+    let mut reads: Vec<PushRead> = Vec::new();
+    let mut at = [usize::MAX; 240];
+    for (offset, into_round) in crate::rpc::spaced_due_offsets() {
+        for g in 0..grace.len() as u64 {
+            let Some(bucket) = slot.checked_sub(g + offset).map(|b| b as usize) else { break; };
+            if done.map_or(false, |d| now - g <= d) { break; }
+            let due = crate::rpc::Due::spaced(now - g, into_round);
+            match at[bucket] {
+                usize::MAX => {
+                    at[bucket] = reads.len();
+                    reads.push(PushRead { bucket, dues: vec![due] });
+                }
+                i => reads[i].dues.push(due),
+            }
+        }
+    }
+    (reads, gap)
+}
+
+/// What this genesis read of each light shard it pushes in the live window, one entry a shard, so a shard that changed
+/// hands inside the epoch is read as the owner before it pushed it (`foreign_draws`) and a round begun before this
+/// genesis held its records still gets its repeats (`rpc::PushLedger::may_push`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ShardReads {
+    /// The shards pushed at this process's last tick (none before its first).
+    pub(crate) mask: usize,
+    /// The first absolute due slot from which every due point of the shard was read here: kept while the ticks join (no
+    /// gap), and for the own shard across a restart whose first tick joins the run before (`rpc::push_read_mark`). Past
+    /// its epoch's first slot, another owner may have pushed the shard before in the epoch.
+    pub(crate) read_from: [u64; 5],
+    /// The first absolute due slot whose push this process's ledger records for the shard: its first tick, or the tick
+    /// it took the shard over at.
+    pub(crate) held_from: [u64; 5],
+    /// The last slot the run before this process read, when its first tick joined that read (`rpc::push_read_mark`): no
+    /// due point up to it is read again in this process (`push_reads`).
+    pub(crate) done: Option<u64>,
+}
+
+impl ShardReads {
+    pub(crate) const fn new() -> Self {
+        ShardReads { mask: 0, read_from: [0; 5], held_from: [0; 5], done: None }
+    }
+
+    /// One tick pushing the shards of `covered` (a mask; `own` this genesis's shard), its reads starting at due slot
+    /// `first_due` and joining this process's last ones (`joined`). A shard pushed at the last tick too keeps what it
+    /// had; one newly pushed starts at `first_due`, except the own shard on the first tick after a restart whose reads
+    /// join the run before, which keeps that run's `resumed`.
+    pub(crate) fn advance(&mut self, covered: usize, own: usize, first_due: u64, joined: bool, resumed: Option<u64>) {
+        for sh in 0..5 {
+            let bit = 1 << sh;
+            if covered & bit == 0 || (joined && self.mask & bit != 0) { continue; }
+            self.read_from[sh] = if sh == own { resumed.unwrap_or(first_due) } else { first_due };
+            self.held_from[sh] = first_due;
+        }
+        self.mask = covered;
+    }
+}
+
+static SHARD_READS: parking_lot::Mutex<ShardReads> = parking_lot::const_mutex(ShardReads::new());
+
+/// The draws besides its own that genesis `me` reads `shard` under in `window`, once another owner may have pushed it
+/// earlier in the window (`ShardReads::read_from`): each other owner's draw, from the schedule its ticks named
+/// (`schedules`, `rpc::OwnerSchedules`; u64::MAX, the bounded draw, for one never heard naming one), that differs from
+/// its own (`schedules[me]`). None when the owners agree, as they do outside the epochs of a roll.
+pub(crate) fn foreign_draws(window: u64, me: usize, shard: usize, schedules: &[(u64, u64); 5]) -> Vec<u64> {
+    let draw = |g: usize| ping_draw_slots(window, schedules[g].0, schedules[g].1);
+    let own = draw(me);
+    let mut out = Vec::new();
+    for g in crate::node::light_shard_owners(shard) {
+        let d = draw(g);
+        if g != me && d != own && !out.contains(&d) { out.push(d); }
+    }
+    out
+}
+
+/// How many times the slot index was built: the positions `ForeignIndex` keeps are of one build.
+static SLOT_INDEX_BUILDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The slot index is stale (the queue of admitted ids overflowed): the next tick builds it again. A flag rather than a
+/// write to the index, so a writer of the registry never waits on the index.
+static SLOT_INDEX_STALE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The slot index's ids again under other owners' draws (`foreign_draws`), as positions in its buckets, so it holds no
+/// id of its own (eight bytes a node: some 16 MB for a shard of two million): per draw, the shards read under it and its
+/// 240 buckets. Built only while a shard is read under another draw, in the epochs of a roll; empty otherwise.
+pub(crate) struct ForeignIndex {
+    /// The slot index build it follows (`SLOT_INDEX_BUILDS`) and the (draw, shards) it was asked for.
+    key: (u64, Vec<(u64, usize)>),
+    draws: Vec<(u64, usize, Vec<Vec<(u8, u32)>>)>,
+    /// How many ids of each index bucket are placed.
+    placed: Vec<usize>,
+}
+
+impl ForeignIndex {
+    pub(crate) const fn new() -> Self {
+        ForeignIndex { key: (u64::MAX, Vec::new()), draws: Vec::new(), placed: Vec::new() }
+    }
+
+    /// Follow the slot index `buckets` (build `build`, of `window`) for `wanted` (draw, shards): built again when either
+    /// changes, else extended with the ids the index gained since. One hash for the shard and one for the slot per id.
+    pub(crate) fn sync(&mut self, buckets: &[Vec<String>], build: u64, window: u64, wanted: &[(u64, usize)]) {
+        if self.key.0 != build || self.key.1 != wanted || self.placed.len() != buckets.len() {
+            self.key = (build, wanted.to_vec());
+            self.draws = wanted.iter().map(|(d, m)| (*d, *m, vec![Vec::new(); 240])).collect();
+            self.placed = vec![0; buckets.len()];
+        }
+        if self.draws.is_empty() { return; }
+        for (b, ids) in buckets.iter().enumerate() {
+            for (i, id) in ids.iter().enumerate().skip(self.placed[b]) {
+                let bit = 1usize << crate::node::light_shard_of(id);
+                for (draw, mask, out) in self.draws.iter_mut() {
+                    if *mask & bit != 0 {
+                        out[SimplifiedP2P::slot_in_draw(id, window, *draw) as usize].push((b as u8, i as u32));
+                    }
+                }
+            }
+            self.placed[b] = ids.len();
+        }
+    }
+
+    /// The ids drawn into `bucket` under every draw it follows, out of the slot index `buckets`.
+    pub(crate) fn ids<'a>(&'a self, buckets: &'a [Vec<String>], bucket: usize) -> impl Iterator<Item = &'a String> + 'a {
+        self.draws.iter().flat_map(move |(_, _, out)| out.get(bucket).into_iter().flatten()
+            .filter_map(move |(b, i)| buckets.get(*b as usize).and_then(|ids| ids.get(*i as usize))))
+    }
+}
+
+static FOREIGN_INDEX: parking_lot::Mutex<ForeignIndex> = parking_lot::const_mutex(ForeignIndex::new());
 
 /// Single admission point for the resident light registry: role cap with inactive-first eviction plus
 /// the trimmed entry (heavy crypto lives in the VRF/ping-key CFs). Gossip and bulk sync both pass here.
@@ -129,7 +359,7 @@ impl SimplifiedP2P {
         if q.len() >= PENDING_MAX {
             q.clear();
             drop(q);
-            self.light_ping_slot_cache.write().0 = u64::MAX; // force a full pass on the next slot
+            SLOT_INDEX_STALE.store(true, std::sync::atomic::Ordering::Relaxed); // force a full pass on the next slot
             return;
         }
         q.push(id);
@@ -141,6 +371,14 @@ impl SimplifiedP2P {
     /// Derived from the applied block instead, the registry is a function of the chain continuously,
     /// and gossip is only a latency optimisation.
     pub fn admit_light_from_chain(&self, node_id: &str, wallet: &str, registered_at: u64) {
+        self.admit_light_entry_from_chain(node_id, wallet, registered_at);
+        // A binding the app posted before the registration applied is promoted now, and one this
+        // genesis took before it is checked and sent on, off this path. After the entry exists: the
+        // follow-up sets the entry's push channel.
+        crate::rpc::on_light_registration_applied(node_id, registered_at);
+    }
+
+    fn admit_light_entry_from_chain(&self, node_id: &str, wallet: &str, registered_at: u64) {
         let mut registry = self.light_node_registry.write();
         // The chain wins over gossip for the fields the chain decides. A gossiped entry carries the
         // sender's own wallet and timestamp; leaving it in place would let a peer's claim outlive the
@@ -432,59 +670,6 @@ impl SimplifiedP2P {
         }
     }
 
-    /// PQ v2.90: Verify ML-DSA-65 (ML-DSA-65) gossip signature.
-    /// Mobile app signs wallet_address with ML-DSA-65 keypair derived from activation code.
-    /// format: "dilithium_sig_{nodeId}_{base64([sig_len_LE][sig+msg][pk_len_LE][pk])}"
-    /// expected_message: wallet_address (the original message signed by the mobile app)
-    pub(super) fn verify_mobile_dilithium_gossip(&self, expected_message: &str, formatted_signature: &str, public_key_hex: &str) -> bool {
-        use pqcrypto_mldsa::mldsa65 as dilithium3;
-        use pqcrypto_traits::sign::*;
-
-        if !formatted_signature.starts_with("dilithium_sig_") {
-            // Fallback: raw hex ML-DSA-65 signed message
-            let pk_bytes = match hex::decode(public_key_hex) { Ok(b) => b, Err(_) => return false };
-            let sig_bytes = match hex::decode(formatted_signature) { Ok(b) => b, Err(_) => return false };
-            let mut signed_msg = sig_bytes;
-            signed_msg.extend_from_slice(expected_message.as_bytes());
-            let pk = match dilithium3::PublicKey::from_bytes(&pk_bytes) { Ok(k) => k, Err(_) => return false };
-            let sm = match dilithium3::SignedMessage::from_bytes(&signed_msg) { Ok(s) => s, Err(_) => return false };
-            return dilithium3::open(&sm, &pk).is_ok();
-        }
-
-        // Extract base64 payload: "dilithium_sig_{nodeId}_{base64}"
-        let base64_data = match formatted_signature.rfind('_') {
-            Some(pos) if pos > 14 => &formatted_signature[pos + 1..],
-            _ => return false,
-        };
-
-        let decoded = match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, base64_data) {
-            Ok(d) => d,
-            Err(_) => return false,
-        };
-
-        if decoded.len() < 8 { return false; }
-        let signed_msg_len = u32::from_le_bytes([decoded[0], decoded[1], decoded[2], decoded[3]]) as usize;
-        if decoded.len() < 4 + signed_msg_len + 4 { return false; }
-
-        let signed_message_bytes = &decoded[4..4 + signed_msg_len];
-        let pk_offset = 4 + signed_msg_len;
-        if decoded.len() < pk_offset + 4 { return false; }
-        let pk_len = u32::from_le_bytes([decoded[pk_offset], decoded[pk_offset+1], decoded[pk_offset+2], decoded[pk_offset+3]]) as usize;
-        if decoded.len() < pk_offset + 4 + pk_len { return false; }
-
-        let pk_bytes_from_sig = &decoded[pk_offset + 4..pk_offset + 4 + pk_len];
-        let pk_bytes_from_request = match hex::decode(public_key_hex) { Ok(b) => b, Err(_) => return false };
-        if pk_bytes_from_sig != pk_bytes_from_request.as_slice() { return false; }
-
-        let public_key = match dilithium3::PublicKey::from_bytes(&pk_bytes_from_request) { Ok(k) => k, Err(_) => return false };
-        let signed_message = match dilithium3::SignedMessage::from_bytes(signed_message_bytes) { Ok(s) => s, Err(_) => return false };
-
-        match dilithium3::open(&signed_message, &public_key) {
-            Ok(verified_msg) => verified_msg == expected_message.as_bytes(),
-            Err(_) => false,
-        }
-    }
-
     /// Verify signature for heartbeat (ASYNC version)
     /// PRODUCTION: Supports pure ML-DSA-65 (ML-DSA-65) formats (binary, JSON, legacy)
     pub async fn verify_dilithium_heartbeat_signature_async(&self, message: &str, signature: &str, node_id: &str) -> bool {
@@ -773,56 +958,39 @@ impl SimplifiedP2P {
         }
     }
     
+    /// Verify a LIGHT node's reply to its ping challenge. SINGLE implementation — the HTTP ingress and
+    /// the gossip relay must accept exactly the same set, or a relay admits what the ingress rejects.
+    /// Runs the checks of light-node-messages section 5.8 in its order, the per-epoch dedupe being the
+    /// callers' (it runs before this): structure, the anchor, the device record and the device signature
+    /// with its counter (`ping_hw2:` only), then σ under the node's ping key.
+    ///
+    /// - `ping_dilithium:` (no device signature) is fail-closed on the chain: the delegation cert is
+    ///   verified under the key the chain vouches for, so an identity with none is refused. It counts
+    ///   until `LIGHT_DEVICE_ENFORCE_EPOCH`, so installed apps keep working.
+    /// - `ping_hw2:` counts only when the device record here counts and its key signed the anchor.
+    /// - `compact_bin:` is refused for light nodes: for an identity absent from the registry it fell back
+    ///   to trust-on-first-verify against the key the message itself carries.
+    ///
+    /// The anchor `selfattest:{h}:{hash}` must be a canonical block of this node's current epoch; on relay
+    /// the record's unsigned `block_height` must equal `h` (a legacy reply's may be any later height of
+    /// that epoch, `ping::relay_height_fits`), and a server stamp is never credited (only its issuer can
+    /// check it, which the ingress did before calling this).
+    pub fn verify_light_ping_signature(&self, node_id: &str, challenge: &str, signature: &str,
+                                       route: crate::light_device::ping::Route) -> Result<(), crate::light_device::ping::ReplyRefusal> {
+        use crate::light_device::ping::{self, ReplyRefusal};
+        // Only a non-light identity still takes the heartbeat form (no light reply is one).
+        if signature.starts_with("compact_bin:") && !node_id.starts_with("light_") && !node_id.is_empty() && !challenge.is_empty() {
+            return self.verify_dilithium_heartbeat_signature(challenge, signature, node_id).then_some(()).ok_or(ReplyRefusal::Sigma);
+        }
+        let storage = self.storage.as_deref().or_else(|| crate::node::try_get_storage().map(|s| s.as_ref()))
+            .ok_or(ReplyRefusal::Sigma)?;
+        let tip = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+        ping::verify_reply(&ping::ReplyCtx::production(storage, tip), node_id, challenge, signature, route)
+    }
+
     /// Verify signature for heartbeat (SYNC version)
     /// SAFE: Uses std::thread::spawn to isolate runtime, avoiding nested runtime panic
     /// Supports pure ML-DSA-65 (ML-DSA-65) formats (binary, JSON, legacy)
-    /// Verify a LIGHT node's own signature over its ping challenge. SINGLE implementation — the HTTP
-    /// ingress and the gossip relay must accept exactly the same set, or a relay admits what the
-    /// ingress rejects.
-    ///
-    /// The two formats are NOT equally rooted, and the difference matters:
-    /// - `ping_dilithium:` is fail-closed on the chain — the delegation cert is verified against
-    ///   `load_vrf_public_key`, so an identity with no on-chain key is refused outright.
-    /// - `compact_bin:` goes through the consensus PK binding, which for an identity ALREADY in the
-    ///   registry is a real on-chain binding, but for one absent from it falls back to trust-on-first-
-    ///   verify against the key the message itself carries. That admit does not REGISTER the key, and
-    ///   the eligibility bitmap enumerates the on-chain roster rather than this RAM registry, so a
-    ///   gossip-only identity cannot reach a payout — but the acceptance gate here is weaker than the
-    ///   sibling above, and freshness comes from the challenge, not from the key.
-    pub fn verify_light_ping_signature(&self, node_id: &str, challenge: &str, signature: &str) -> bool {
-        if node_id.is_empty() || challenge.is_empty() || signature.is_empty() {
-            return false;
-        }
-        if signature.starts_with("compact_bin:") {
-            return self.verify_dilithium_heartbeat_signature(challenge, signature, node_id);
-        }
-        if let Some(inner_sig) = signature.strip_prefix("ping_dilithium:") {
-            let storage = match self.storage.as_ref() {
-                Some(s) => s,
-                None => return false,
-            };
-            let (ping_pk_hex, delegation_cert) = match storage.get_light_ping_keys(node_id) {
-                Some(kv) => kv,
-                None => return false,
-            };
-            if ping_pk_hex.is_empty() || delegation_cert.is_empty() {
-                return false;
-            }
-            // Supers commit the key itself; a light node commits its hash and the key was recorded
-            // when the device proved the delegation. Either way the delegation is checked under a key
-            // the CHAIN vouches for - an identity with neither is refused, as before.
-            let onchain_pk_hex = match storage.resolve_light_identity_pk(node_id, None) {
-                Some(hex) => hex,
-                None => return false,
-            };
-            let delegation_msg = format!("delegate_ping:{}:{}", ping_pk_hex, node_id);
-            if !crate::rpc::verify_mobile_dilithium_signature(&delegation_msg, &delegation_cert, &onchain_pk_hex) {
-                return false;
-            }
-            return crate::rpc::verify_mobile_dilithium_signature(challenge, inner_sig, &ping_pk_hex);
-        }
-        false
-    }
 
     pub fn verify_dilithium_heartbeat_signature(&self, message: &str, signature: &str, node_id: &str) -> bool {
         use crate::quantum_crypto::DilithiumSignature;
@@ -1706,20 +1874,36 @@ impl SimplifiedP2P {
         self.light_node_registry.read().get(node_id).cloned()
     }
     
-    /// Register Light node locally and gossip to network
-    pub fn register_light_node(&self, registration: LightNodeRegistrationData) {
+    /// Register Light node locally and gossip to network. Returns what the ping-key write did (None with no
+    /// storage or on a storage error): the legacy register changes an on-chain node's push record only for a
+    /// key it applied (M-8).
+    pub fn register_light_node(&self, registration: LightNodeRegistrationData) -> Option<crate::storage::PingKeyWrite> {
         // C: ping keys → dedicated CF (read per-ping); resident entry keeps pubkey/sig/ping-keys EMPTY so
-        // it stays ~300B at tens of millions of nodes. Identity comes from the committed VRF key.
-        if let Some(s) = &self.storage {
-            let _ = s.save_light_ping_keys(&registration.node_id, &registration.ping_pubkey, &registration.ping_delegation_cert);
-        }
+        // it stays ~300B at tens of millions of nodes. The key the delegation was checked under is
+        // recorded with it: every reader re-checks it against the chain's commitment, and when the
+        // registration applies a row under a key the chain did not commit is dropped
+        // (`vouch_local_binding`).
+        let key_write = self.storage.as_ref().and_then(|s| s.save_light_ping_keys_identity(&registration.node_id,
+            &registration.ping_pubkey, &registration.ping_delegation_cert, &registration.quantum_pubkey).ok());
         {
             let mut registry = self.light_node_registry.write();
             self.admit_light(&mut registry, registration.clone());
         }
 
-        // Gossip to network — the FULL `registration` values (below), NOT the trimmed resident entry.
-        let msg = NetworkMessage::LightNodeRegistration {
+        let msg = Self::light_registration_gossip(registration);
+        self.gossip_to_random_peers(msg, 5);
+        if crate::node::is_info() {
+            println!("[INFO][P2P] Light node registration gossiped to network");
+        }
+        key_write
+    }
+
+    /// The gossip of a light registration: the FULL `registration` values, NOT the trimmed resident entry,
+    /// except the UnifiedPush endpoint. It is a push capability (anyone holding it can POST to the device), no
+    /// receiver reads it (the push channel comes from the genesis-only token sync), and gossip reaches
+    /// arbitrary peers (NB-2).
+    pub(crate) fn light_registration_gossip(registration: LightNodeRegistrationData) -> NetworkMessage {
+        NetworkMessage::LightNodeRegistration {
             node_id: registration.node_id,
             wallet_address: registration.wallet_address,
             device_token_hash: registration.device_token_hash,
@@ -1728,17 +1912,12 @@ impl SimplifiedP2P {
             signature: registration.signature,
             gossip_hop: 0,
             push_type: registration.push_type,
-            unified_push_endpoint: registration.unified_push_endpoint,
+            unified_push_endpoint: None,
             last_seen: registration.last_seen,
             consecutive_failures: registration.consecutive_failures,
             is_active: registration.is_active,
             ping_pubkey: registration.ping_pubkey,
             ping_delegation_cert: registration.ping_delegation_cert,
-        };
-        
-        self.gossip_to_random_peers(msg, 5);
-        if crate::node::is_info() {
-            println!("[INFO][P2P] Light node registration gossiped to network");
         }
     }
     
@@ -1832,13 +2011,9 @@ impl SimplifiedP2P {
         added
     }
     
-    /// Restore FCM push types from local RocksDB `fcm_tokens` CF after a node restart.
-    /// Called once during startup, right after `restore_light_nodes_from_storage`.
-    ///
-    /// Problem: `restore_light_nodes_from_storage` initialises all entries with
-    /// `push_type = Polling` because FCM tokens are not gossiped (privacy).
-    /// This method patches the in-memory registry with the real push_type/endpoint
-    /// so the ping service delivers FCM pushes immediately after reboot.
+    /// Restore the resident push channels after a restart, once, right after
+    /// `restore_light_nodes_from_storage` (which seeds every entry as polling): each from what this
+    /// genesis pushes the node on (`rpc::push_channel`), as `refresh_light_node_push_channel` sets it.
     pub fn update_device_tokens_from_storage(
         &self,
         storage: &crate::storage::Storage,
@@ -1847,16 +2022,12 @@ impl SimplifiedP2P {
 
         let mut updated = 0usize;
         for node in registry.values_mut() {
-            if let Some((_, push_type_str, endpoint)) = storage.get_fcm_data(&node.node_id) {
-                let new_push_type: PushType = match push_type_str.as_str() {
-                    "fcm"         => PushType::FCM,
-                    "unifiedpush" => PushType::UnifiedPush,
-                    _             => PushType::Polling,
-                };
-                node.push_type = new_push_type;
-                node.unified_push_endpoint = endpoint;
-                updated += 1;
-            }
+            // Only a node holding a record with a token or an endpoint can have a channel: one point
+            // read for every other node, as before.
+            if storage.get_fcm_entry(&node.node_id).map_or(true, |e| e.token.is_empty() && e.endpoint.is_none()) { continue; }
+            let Some(channel) = crate::rpc::push_channel(storage, &node.node_id) else { continue; };
+            Self::set_resident_channel(node, Some(channel));
+            updated += 1;
         }
 
         if updated > 0 {
@@ -1901,22 +2072,39 @@ impl SimplifiedP2P {
     /// Ping slot of a light node in `window_number`, re-randomised per window. From
     /// BOUNDED_SLOT_DRAW_FROM_WINDOW the draw leaves out the last slots: on the regular one-slot tick a
     /// node's primary and two grace pushes, and the lifetime of the last challenge, end before the light
-    /// commit window opens. A catch-up push after a stalled tick can still be answered too late for it.
+    /// commit window opens. From the window `arm_push_schedule` names for the early draw it is the epoch's first
+    /// UNSPACED_FIRST_PUSH_SLOTS, which leaves the retry round an hour later room before the commit: a push drawn
+    /// late in the epoch was missed half as often again as an early one. From the window it names for the spaced
+    /// rounds it is the first FIRST_PUSH_SLOTS, which leaves the spaced round and retry round that room.
     pub fn calculate_randomized_slot(light_node_id: &str, window_number: u64) -> u64 {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (first_push_from, spaced_from) = (FIRST_PUSH_DRAW_WINDOW.load(Relaxed), SPACED_ROUND_WINDOW.load(Relaxed));
+        Self::slot_in_draw(light_node_id, window_number, ping_draw_slots(window_number, first_push_from, spaced_from))
+    }
+
+    /// The slot of `light_node_id` in `window_number` drawn over the first `slots` slots.
+    pub(crate) fn slot_in_draw(light_node_id: &str, window_number: u64, slots: u64) -> u64 {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
-        
+
         let mut hasher = DefaultHasher::new();
         light_node_id.hash(&mut hasher);
         window_number.hash(&mut hasher);  // Randomize per window!
-        let hash = hasher.finish();
-        let slots = if window_number >= BOUNDED_SLOT_DRAW_FROM_WINDOW {
-            240 - crate::node::light_commit_window(window_number).div_ceil(60) - 2
-                - crate::rpc::LIGHT_CHALLENGE_TTL_SECS.div_ceil(60)
-        } else {
-            240
-        };
-        hash % slots
+        hasher.finish() % slots.max(1)
+    }
+
+    /// Start the early first-push draw (P-1) at `first_push_from` and the spaced rounds at `spaced_from`, each once per
+    /// process and each once known: the pinger calls it on every tick with a known height, with the windows this
+    /// genesis's first arm stored (`rpc::first_push_draw_from`, `rpc::spaced_rounds_from`; None until one is stored from
+    /// a tip the network stands behind), so every restart keeps the draw and the rounds the live window began with.
+    pub fn arm_push_schedule(first_push_from: Option<u64>, spaced_from: Option<u64>) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if let Some(w) = first_push_from {
+            let _ = FIRST_PUSH_DRAW_WINDOW.compare_exchange(u64::MAX, w, Relaxed, Relaxed);
+        }
+        if let Some(w) = spaced_from {
+            let _ = SPACED_ROUND_WINDOW.compare_exchange(u64::MAX, w, Relaxed, Relaxed);
+        }
     }
     
     /// Get next ping time for a Light node (for polling fallback)
@@ -2037,6 +2225,22 @@ impl SimplifiedP2P {
         self.epoch_light_eligible.read().get(&epoch)
             .map(|s| s.contains(light_node_id)).unwrap_or(false)
     }
+
+    /// `f` with a test of whether a node attested in `epoch` here, for a pass over many nodes (the push ledger's
+    /// prune): the lock is taken once, and yielded every 4,096 tests to an answer waiting to record itself, instead of
+    /// taken for every node (M-11).
+    pub(crate) fn with_counted_in<R>(&self, epoch: u64, f: impl FnOnce(&mut dyn FnMut(&str) -> bool) -> R) -> R {
+        let mut guard = self.epoch_light_eligible.read();
+        let mut tests = 0u32;
+        let mut counted = |id: &str| {
+            tests = tests.wrapping_add(1);
+            if tests % 4096 == 0 {
+                parking_lot::RwLockReadGuard::bump(&mut guard);
+            }
+            guard.get(&epoch).map_or(false, |s| s.contains(id))
+        };
+        f(&mut counted)
+    }
     
     /// Get Light nodes to ping in current slot
     /// ARCHITECTURE v2.89: ONLY Genesis nodes ping Light nodes (reliability guarantee)
@@ -2049,11 +2253,13 @@ impl SimplifiedP2P {
     /// With Genesis-only pinging: 100% reliability, 100% coverage
     /// 
     /// SCALABILITY: 2M pings per Genesis per epoch = 139 pings/sec = easily handled
-    pub fn get_light_nodes_to_ping(&self) -> Vec<(LightNodeRegistrationData, PingerRole)> {
-        let current_slot = Self::get_current_slot();
-        let current_window = Self::get_current_window_number();
+    ///
+    /// The slot and the epoch come from `tip`, the tick's one height load (L-4). Storage point reads: the ping loop
+    /// runs it on a blocking thread, never on a runtime worker (M-11).
+    pub(crate) fn get_light_nodes_to_ping(&self, tip: u64) -> crate::rpc::LightPingSelection {
+        let (current_window, current_slot, now_slot) = crate::rpc::light_ping_slot_at(tip);
         let our_node_id = &self.node_id;
-        let mut result = Vec::new();
+        let mut result = crate::rpc::LightPingSelection { now_slot, nodes: Vec::new() };
 
         // v2.89: ONLY Genesis nodes ping Light nodes (5 fixed shard owners, always online).
         if !is_genesis_pinger() { return result; }
@@ -2066,82 +2272,45 @@ impl SimplifiedP2P {
                      our_node_id, our_genesis_idx, current_slot);
         }
 
-        // How long an owner may be silent before the rank below it starts covering its shard. Ten ping
-        // slots: long enough that a restart or a slow minute never causes a handover, short enough that
-        // a shard is not left unpinged for a meaningful part of its epoch.
-        const OWNER_SILENT_SECS: u64 = 600;
-        // Which shards we ping this slot. Our own always; a shard we back up only while every owner
-        // ranked above us is silent. Pinging is what PRODUCES the attestations the bitmap commits, so
-        // a shard whose genesis is down needs a stand-in here, not only at commit time - otherwise the
-        // backup commits an empty bitmap and the whole shard still loses the epoch.
-        // An empty liveness map means we have not learned anything yet, not that the fleet is down.
-        // Judging silence from it would make a freshly started genesis take over all three of its
-        // shards - three fifths of a ten-million-node registry - for no reason.
-        let liveness_known = !self.active_full_super_nodes.is_empty();
+        // Which shards we push this slot (F5). Our own always; a shard we back up only while every owner ranked
+        // above us is judged silent from the ping ticks it sends after each completed tick (`OwnerLiveness`):
+        // a primary whose push loop is wedged, that is behind the network, or whose provider answers none of its
+        // pushes (`PushHealth`), sends none and is taken over though its other announcements go on. Pushing is what PRODUCES the answers the bitmap commits, so a shard whose
+        // genesis is down needs a stand-in here, not only at commit time. Covering starts after ten silent slots
+        // and ends after three heard in a row, so a slow minute never hands a shard over and back.
         let now_ts = self.current_timestamp();
-        let owner_alive = |idx: usize| -> bool {
-            if idx == our_genesis_idx || !liveness_known { return true; }
-            // Point-read: the map is keyed by node_id. Scanning it instead cost O(active supers) per
-            // owner per slot, which at the target super-node count is a six-figure walk every second
-            // to answer a question about five fixed identities.
+        let alive = crate::rpc::OWNER_LIVENESS.judge(our_genesis_idx, now_ts, |idx| {
+            // A genesis never heard ticking here (an earlier release) is judged by its last announcement of any kind.
             let id = format!("genesis_node_{:03}", idx + 1);
-            self.active_full_super_nodes.get(&id)
-                .map_or(false, |e| now_ts.saturating_sub(e.value().last_seen) < OWNER_SILENT_SECS)
-        };
-        let covered = crate::node::light_shards_to_cover(our_genesis_idx, &owner_alive);
+            self.active_full_super_nodes.get(&id).map(|e| now_ts.saturating_sub(e.value().last_seen))
+        });
+        let covered = crate::node::light_shards_to_cover(our_genesis_idx, &|idx| alive[idx]);
         let covered_mask: usize = covered.iter().fold(0, |m, (sh, _)| m | (1 << sh));
+        crate::rpc::set_covered_shards(covered.len());
         if covered_mask != 1 << our_genesis_idx && crate::node::is_warn() {
             println!("[WARN][GENESIS-PING] shard_takeover idx={} covering={:?} reason=owner_silent",
                      our_genesis_idx, covered.iter().map(|(sh, _)| *sh).collect::<Vec<_>>());
         }
 
-        // "Dormant" must mean the DEVICE stopped answering, never that nobody asked. When this shard
-        // has no committed bitmap for the epoch just ended, the silence is ours: the owner was down,
-        // wedged or restarting through the commit window, and every device in the shard looks dormant
-        // through no fault of its own. Sweeping wakes the whole shard instead of waiting for ten
-        // million people to open an app.
-        //
-        // BOUNDED, because recovery is for a TRANSIENT gap. Unbounded it fired every slot for hours
-        // (07.09): no bitmap can be committed behind a closed gate, so "none last epoch" stays true
-        // forever — a full-registry sweep every epoch at 10M nodes. Past RECOVERY_EPOCHS it stands down.
-        const RECOVERY_EPOCHS: u64 = 3;
-        // Decided ONCE per (epoch, covered shards) and reused for the whole epoch. The probe reads a
-        // whole epoch of bitmaps — megabytes at 10M light nodes — and the answer cannot usefully
-        // change inside an epoch, so running it per ping slot was the cost the stand-down exists to
-        // avoid. State: 0 quiet, 1 recovering, 2 stood down.
-        let latch_base = current_window * 128 + (covered_mask as u64) * 4;
-        let cached = SHARD_SWEEP_STATE.load(std::sync::atomic::Ordering::Relaxed);
-        let state = if cached >= latch_base && cached <= latch_base + 2 {
-            cached - latch_base
-        } else {
-            let missing_epochs = match crate::node::try_get_storage() {
-                // take_while short-circuits: a healthy epoch costs exactly one read.
-                Some(st) => (1..=RECOVERY_EPOCHS + 1)
-                    .take_while(|back| {
-                        let e = current_window.saturating_sub(*back);
-                        e > 0 && st.load_light_bitmaps(e)
-                            .map(|m| covered.iter().any(|(sh, _)| !m.contains_key(sh)))
-                            .unwrap_or(false)
-                    })
-                    .count() as u64,
-                None => 0,
-            };
-            let s = if missing_epochs == 0 { 0 } else if missing_epochs <= RECOVERY_EPOCHS { 1 } else { 2 };
-            SHARD_SWEEP_STATE.store(latch_base + s, std::sync::atomic::Ordering::Relaxed);
-            if s != 0 && crate::node::is_warn() {
-                let shards: Vec<usize> = covered.iter().map(|(sh, _)| *sh).collect();
-                if s == 1 {
-                    println!("[WARN][GENESIS-PING] shard_recovery_sweep shards={:?} epoch={} missing_epochs={} reason=no_committed_bitmap",
-                             shards, current_window, missing_epochs);
-                } else {
-                    println!("[CRIT][GENESIS-PING] shard_bitmap_absent shards={:?} epoch={} missing_epochs>{} action=sweep_stood_down reason=pinging_cannot_fix_this",
-                             shards, current_window, RECOVERY_EPOCHS);
-                }
-            }
-            s
+        // "Dormant" must mean the DEVICE stopped answering, never that nobody asked (F1, F3). A node is left
+        // unpushed only after a proven device miss in each of the two epochs before (`rpc::proven_dormant`). An
+        // epoch this genesis did not derive, or in which the node's shard committed no row, proves nothing: every
+        // node of that shard is pushed (the recovery sweep, per shard, F11). Two point reads a tick, never latched:
+        // the first ticks of an epoch may run before the boundary pass derived the epoch just ended, and a latched
+        // "not derived" would push every dormant node for the whole epoch. Logged when it changes.
+        let facts = match self.storage.as_deref().or_else(|| crate::node::try_get_storage().map(|s| s.as_ref())) {
+            Some(st) => crate::rpc::DormantFacts::read(st, current_window),
+            None => crate::rpc::DormantFacts::default(),
         };
-        let recovering = state == 1;
-        let mut registry = self.light_node_registry.read();
+        let packed = current_window << 8 | facts.decidable as u64;
+        if DORMANT_FACTS.swap(packed, std::sync::atomic::Ordering::Relaxed) != packed {
+            let sweeping: Vec<usize> = covered.iter().map(|(sh, _)| *sh).filter(|sh| facts.neutral(*sh)).collect();
+            if !sweeping.is_empty() && crate::node::is_warn() {
+                println!("[WARN][GENESIS-PING] shard_recovery_sweep shards={:?} epoch={} reason=last_two_epochs_not_committed_or_not_derived",
+                         sweeping, current_window);
+            }
+        }
+        let registry = self.light_node_registry.read();
         let reg_len = registry.len();
 
         // A full pass ONLY when what the slot is derived from changes: the window (the slot is
@@ -2149,10 +2318,11 @@ impl SimplifiedP2P {
         // registry SIZE as well meant one registration rebuilt everything — at ten million light nodes
         // that is ten million id clones under this read lock, on a slot that fires every minute.
         // Stable hash-shard (light_shard_of): a node's shard never moves as the registry grows.
+        let stale = SLOT_INDEX_STALE.swap(false, std::sync::atomic::Ordering::Relaxed);
         let need_rebuild = {
             let c = self.light_ping_slot_cache.read();
             c.0 != current_window || c.2 != covered_mask
-        };
+        } || stale;
         if need_rebuild {
             // The id snapshot AND the pending queue are taken together, under the read lock that
             // excludes every writer. That is what makes them consistent: the queue is only ever filled
@@ -2169,9 +2339,11 @@ impl SimplifiedP2P {
             let mut buckets: Vec<Vec<String>> = vec![Vec::new(); 240];
             index_new_light_nodes(&mut buckets, ours, current_window, covered_mask);
             *self.light_ping_slot_cache.write() = (current_window, buckets, covered_mask);
-            registry = self.light_node_registry.read();
+            SLOT_INDEX_BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         } else {
-            // Everything admitted since the last slot, placed in O(new).
+            // Everything admitted since the last slot, placed in O(new). A node queued after the take is placed at the
+            // next tick, so the registry's lock is not needed for it.
+            drop(registry);
             let newly = std::mem::take(&mut *self.light_ping_pending.write());
             if !newly.is_empty() {
                 let mut c = self.light_ping_slot_cache.write();
@@ -2182,64 +2354,161 @@ impl SimplifiedP2P {
             }
         }
 
-        // Read the grace slots {cur, cur-1, cur-2} (mod 240) of every slot passed since the last tick. B:
-        // wake only plausibly-live nodes — attested (own-shard recency, epoch map held once) or registered
-        // within the grace window. Dormant nodes stop being woken (they self-attest on return); a fresh node
-        // gets its first ping via registered_at. Liveness authority is on-chain; this is a whom-to-wake hint.
+        // Read the buckets of every due point that came since the last tick, with its grace (`push_reads`): with the
+        // spaced rounds the drawn slot, 15 and 30 slots on, and the retry round 60, 75 and 90 slots on; before them the
+        // grace slots {cur, cur-1, cur-2} and the same slots an hour earlier. A node already counted this epoch is never
+        // pushed. A fresh one (its first WAKE_GRACE_EPOCHS epochs), one of a shard the dormant rule cannot decide this
+        // epoch (`facts`), and one whose answer this genesis holds for one of the two epochs before, are pushed at once;
+        // for the rest the dormant rule is read from storage after the locks are released. Liveness authority is
+        // on-chain; this is a whom-to-wake decision.
         // A whole epoch behind the chain (resync): the slots passed belong to epochs already committed,
         // so the tick reads only the grace slots.
         let behind = self.corroborated_head_ceiling() / 14400 > current_window;
         let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-        const WAKE_GRACE_EPOCHS: u64 = 3;
-        let elig = self.epoch_light_eligible.read();
-        let attested_recent = |id: &str| (0..WAKE_GRACE_EPOCHS)
-            .any(|d| elig.get(&current_window.saturating_sub(d)).map(|s| s.contains(id)).unwrap_or(false));
-        let this_epoch = |id: &str| elig.get(&current_window).map(|s| s.contains(id)).unwrap_or(false);
-        let now_slot = current_window * 240 + current_slot;
+        const WAKE_GRACE_EPOCHS: u64 = crate::rpc::WAKE_GRACE_EPOCHS;
+        let storage = self.storage.as_deref().or_else(|| crate::node::try_get_storage().map(|s| s.as_ref()));
+        let window_start = current_window * 240;
+        // The first tick after a restart: the run before kept the last slot it read (`rpc::push_read_mark`). In this
+        // window and within the catch-up bound, this tick's reads join it, and no due point that run read is read
+        // again: each of those pushes went out or was shed once, and the record that would close it is gone.
         let last_read = self.light_ping_last_read.swap(now_slot, std::sync::atomic::Ordering::Relaxed);
-        let (buckets, gap) = ping_buckets_to_read((last_read != u64::MAX && !behind).then_some(last_read), now_slot);
+        let first_tick = last_read == u64::MAX;
+        let resumed = if first_tick && !behind { storage.and_then(crate::rpc::push_read_mark) } else { None }
+            .filter(|(l, _)| *l >= window_start && *l < now_slot && now_slot - *l <= MAX_PING_CATCHUP_SLOTS);
+        let last = if behind { None } else if first_tick { resumed.map(|(l, _)| l) } else { Some(last_read) };
+        let mut reads_state = SHARD_READS.lock();
+        if first_tick { reads_state.done = resumed.map(|(l, _)| l); }
+        let (reads, gap) = push_reads(last, now_slot, spaced_rounds_in(current_window), reads_state.done);
         if gap > 0 && crate::node::is_info() {
             println!("[INFO][GENESIS-PING] ping_read_gap gap_slots={} max={} slot={} action=grace_slots_only",
                      gap, MAX_PING_CATCHUP_SLOTS, current_slot);
         }
-        let cache = self.light_ping_slot_cache.read();
-        for s in buckets {
-            for node_id in cache.1.get(s).into_iter().flatten() {
-                let node = match registry.get(node_id) { Some(n) => n, None => continue };
-                if this_epoch(node_id) { continue; }  // already attested this epoch — nothing to wake
-                let fresh = now_secs.saturating_sub(node.registered_at) < WAKE_GRACE_EPOCHS * 14400;
-                if !recovering && !fresh && !attested_recent(node_id) { continue; }  // dormant — self-attests on return
-                let role = match crate::node::light_owner_rank(crate::node::light_shard_of(node_id), our_genesis_idx) {
-                    Some(0) => PingerRole::Primary,
-                    Some(1) => PingerRole::Backup1,
-                    Some(_) => PingerRole::Backup2,
-                    None => continue,
-                };
-                result.push((node.clone(), role));
+        // Since when every due point of each shard pushed was read here, and since when this process records its pushes
+        // (`ShardReads`), kept with the slot read for the next restart.
+        let joined = last.is_some() && gap == 0;
+        let first_due = match (resumed, last) {
+            (Some((l, _)), _) => l + 1,
+            (None, Some(l)) if joined && l < now_slot => (l + 1).saturating_sub(crate::rpc::DUE_GRACE_SLOTS),
+            _ => now_slot.saturating_sub(crate::rpc::DUE_GRACE_SLOTS),
+        }.max(window_start);
+        reads_state.advance(covered_mask, our_genesis_idx, first_due, joined, resumed.map(|(_, r)| r));
+        let shard_reads = *reads_state;
+        drop(reads_state);
+        if let Some(st) = storage {
+            crate::rpc::keep_push_read_mark(st, now_slot, shard_reads.read_from[our_genesis_idx]);
+        }
+        // A shard another owner may have pushed earlier in the window is read under that owner's draw too, where it
+        // differs from ours (`foreign_draws`): in the epochs of a roll, never otherwise.
+        let mut schedules = crate::rpc::OWNER_SCHEDULES.get();
+        schedules[our_genesis_idx] = (FIRST_PUSH_DRAW_WINDOW.load(std::sync::atomic::Ordering::Relaxed),
+                                      SPACED_ROUND_WINDOW.load(std::sync::atomic::Ordering::Relaxed));
+        let mut wanted: Vec<(u64, usize)> = Vec::new();
+        for (sh, _) in covered.iter().filter(|(sh, _)| shard_reads.read_from[*sh] > window_start) {
+            for d in foreign_draws(current_window, our_genesis_idx, *sh, &schedules) {
+                match wanted.iter_mut().find(|(x, _)| *x == d) {
+                    Some(w) => w.1 |= 1 << sh,
+                    None => wanted.push((d, 1 << sh)),
+                }
             }
         }
+        wanted.sort_unstable();
+        if !wanted.is_empty() && crate::node::is_debug() {
+            println!("[DBG][GENESIS-PING] foreign_draws draws={:?} slot={}", wanted, current_slot);
+        }
+        // A repeat of a round begun before this process held its shard's records (a restart, a takeover) is due to any
+        // node not counted; the shard is hashed only while such a round is read.
+        let oldest_round = reads.iter().flat_map(|r| r.dues.iter()).filter(|d| d.repeat).map(|d| d.round).min();
+        let orphans = oldest_round.map_or(false, |o| covered.iter().any(|(sh, _)| shard_reads.held_from[*sh] > o));
+        let held_from = |id: &str| if orphans { shard_reads.held_from[crate::node::light_shard_of(id)] } else { 0 };
+        // The ledger first, in RAM, under the slot index's locks alone: one push a due point and MAX_PUSHES_PER_EPOCH an
+        // epoch at this rank, a repeat only to a node offered a push here (U13, `PushLedger::may_push`). The registry's
+        // lock is not held, so block apply admits meanwhile (no writer of it takes the slot index's, so taking it after
+        // them waits on nothing that waits on them); before the eligibility lock, which the ledger's prune takes under
+        // its own, and before any storage read.
+        let cache = self.light_ping_slot_cache.read();
+        let mut foreign = FOREIGN_INDEX.lock();
+        foreign.sync(&cache.1, SLOT_INDEX_BUILDS.load(std::sync::atomic::Ordering::Relaxed), current_window, &wanted);
+        let mut due: Vec<&String> = Vec::new();
+        for r in &reads {
+            due.extend(cache.1.get(r.bucket).into_iter().flatten().chain(foreign.ids(&cache.1, r.bucket))
+                .filter(|id| crate::rpc::PUSH_LEDGER.may_push(id, now_slot, &r.dues, || held_from(id))));
+        }
+        if !wanted.is_empty() {
+            // A node drawn into two buckets this tick reads is offered once.
+            let mut seen = std::collections::HashSet::with_capacity(due.len());
+            due.retain(|id| seen.insert(*id));
+        }
+        let registry = self.light_node_registry.read();
+        let elig = self.epoch_light_eligible.read();
+        let held_in = |id: &str, e: Option<u64>| e.and_then(|e| elig.get(&e)).map_or(false, |s| s.contains(id));
+        let this_epoch = |id: &str| elig.get(&current_window).map(|s| s.contains(id)).unwrap_or(false);
+        // (node id, role, shard, whether the dormant rule must be read for it)
+        let mut candidates: Vec<(String, PingerRole, usize, bool)> = Vec::new();
+        for node_id in due {
+            let node = match registry.get(node_id) { Some(n) => n, None => continue };
+            if this_epoch(node_id) { continue; }  // already attested this epoch — nothing to wake
+            let shard = crate::node::light_shard_of(node_id);
+            let role = match crate::node::light_owner_rank(shard, our_genesis_idx) {
+                Some(0) => PingerRole::Primary,
+                Some(1) => PingerRole::Backup1,
+                Some(_) => PingerRole::Backup2,
+                None => continue,
+            };
+            let fresh = now_secs.saturating_sub(node.registered_at) < WAKE_GRACE_EPOCHS * 14400;
+            let answered_before = held_in(node_id, current_window.checked_sub(1)) || held_in(node_id, current_window.checked_sub(2));
+            let check = !fresh && !facts.neutral(shard) && !answered_before;
+            candidates.push((node_id.clone(), role, shard, check));
+        }
+        drop(elig);
+        drop(registry);
+        drop(foreign);
+        drop(cache);
+        // The dormant rule, then: push only an on-chain node with a device bound to it, with how its device is reached
+        // (`rpc::push_reach_at`), so the push itself reads nothing again. These are storage point reads, so they run
+        // after the locks above are released.
+        match storage {
+            Some(storage) => {
+                let (device_epoch, device_now) = (crate::light_device::current_epoch(), crate::light_device::now_secs());
+                let mut dormant = 0usize;
+                for (node_id, role, shard, check) in candidates {
+                    // Two proven device misses: not woken, and held so (`SendOutcome::Dormant`) until its own answer, so
+                    // the epoch counts toward the rule next epoch too and the node never flips back every third epoch.
+                    if check && (crate::rpc::PUSH_LEDGER.held_dormant(&node_id, current_window)
+                        || crate::rpc::proven_dormant(storage, &crate::rpc::REACH_CACHE, &facts, &node_id, shard, current_window)) {
+                        crate::rpc::PUSH_LEDGER.record(&node_id, now_slot, crate::rpc::SendOutcome::Dormant, now_secs);
+                        dormant += 1;
+                        continue;
+                    }
+                    if let Some(reach) = crate::rpc::push_reach_at(storage, &node_id, device_epoch, device_now) {
+                        result.nodes.push((node_id, role, reach));
+                    }
+                }
+                if dormant > 0 && crate::node::is_debug() {
+                    println!("[DBG][GENESIS-PING] dormant_skipped count={} slot={}", dormant, current_slot);
+                }
+            }
+            None => result.nodes.clear(),
+        }
 
-        if crate::node::is_debug() && !result.is_empty() {
+        if crate::node::is_debug() && !result.nodes.is_empty() {
             println!("[DBG][GENESIS-PING] Genesis {} has {} Light nodes to ping this slot (registry: {})",
-                     our_genesis_idx + 1, result.len(), reg_len);
+                     our_genesis_idx + 1, result.nodes.len(), reg_len);
         }
         result
     }
     
-    /// Shard-owner push-channel self-heal: when our stored record for a my-shard node is
-    /// missing or polling while another genesis just served its attestation, pull that
-    /// genesis's record and feed it through our OWN internal sync endpoint (localhost) —
-    /// the same LWW receiver every peer sync uses, so storage + RAM registry stay in one
-    /// path. Bounded: only degraded my-shard nodes, once per (node, epoch), 64k dedup cap.
+    /// Shard-owner push-channel self-heal: when nothing we hold for a my-shard node is a channel of
+    /// its binding here (no record, a polling one, or one left by a replaced device or written under
+    /// another key) while another genesis just served its attestation, pull that genesis's record and
+    /// apply it under the binding order (`apply_pulled_push_record`), storage and RAM registry together.
+    /// Bounded: only degraded my-shard nodes, once per (node, epoch), 64k dedup cap.
     pub(super) fn maybe_pull_push_channel(node_id: &str, attestor_id: &str, epoch: u64) {
         fn pull_dedup() -> &'static dashmap::DashMap<String, u64> {
             static M: std::sync::OnceLock<dashmap::DashMap<String, u64>> = std::sync::OnceLock::new();
             M.get_or_init(dashmap::DashMap::new)
         }
         let degraded = match crate::node::try_get_storage() {
-            Some(s) => s.get_fcm_record(node_id)
-                .map(|(_, pt, _, _)| pt.eq_ignore_ascii_case("polling"))
-                .unwrap_or(true),
+            Some(s) => crate::rpc::push_record_degraded(s, node_id),
             None => return,
         };
         if !degraded { return; }
@@ -2249,54 +2518,169 @@ impl SimplifiedP2P {
         let node = node_id.to_string();
         let src_ip = ip.to_string();
         tokio::spawn(async move {
-            let client = match reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(5)).build() { Ok(c) => c, Err(_) => return };
-            let url = format!("http://{}:8001/api/v1/internal/fcm-token-get?node_id={}", src_ip, node);
-            let v: serde_json::Value = match client.get(&url).send().await.ok()
+            let path = format!("/api/v1/internal/fcm-token-get?node_id={}", node);
+            let v: serde_json::Value = match crate::rpc::genesis_internal_call_tls(&src_ip, &path, |c, url| c.get(url)).await.ok()
                 .and_then(|r| if r.status().is_success() { Some(r) } else { None })
             {
                 Some(r) => match r.json().await { Ok(v) => v, Err(_) => return },
                 None => return,
             };
             let (token, pt) = (v["token"].as_str().unwrap_or(""), v["push_type"].as_str().unwrap_or(""));
-            if v["success"].as_bool() != Some(true) || token.is_empty() || pt.is_empty() { return; }
-            let body = serde_json::json!({
-                "pseudonym": node, "token": token, "push_type": pt,
-                "endpoint": v["endpoint"].as_str().filter(|s| !s.is_empty()),
-                "origin_ip": src_ip, "ts": v["ts"].as_u64(),
-            });
-            match client.post("http://127.0.0.1:8001/api/v1/internal/fcm-token-sync")
-                .json(&body).send().await
-            {
-                Ok(r) if r.status().is_success() => {
-                    if crate::node::is_info() {
-                        println!("[INFO][LIGHT] push_channel_pulled node={} from={} push={}", node, src_ip, pt);
-                    }
+            let endpoint = v["endpoint"].as_str().filter(|e| !e.is_empty());
+            if v["success"].as_bool() != Some(true) || (token.is_empty() && endpoint.is_none()) || pt.is_empty() { return; }
+            // Applied here rather than through this node's own sync route: the route wants a signed
+            // proof for a v2 binding, and a pulled record carries none. It is taken only for the
+            // binding this node already holds (or, with no v2 binding, as before).
+            let applied = crate::node::try_get_storage().map_or(false, |s| crate::rpc::apply_pulled_push_record(
+                s, crate::node::try_get_p2p().map(|p| p.as_ref()), &node, token, pt, endpoint,
+                v["ts"].as_u64().unwrap_or(0), v["seq"].as_u64().unwrap_or(0), v["writer"].as_str().unwrap_or("")));
+            if applied {
+                if crate::node::is_info() {
+                    println!("[INFO][LIGHT] push_channel_pulled node={} from={} push={}", node, src_ip, pt);
                 }
-                _ => if crate::node::is_debug() {
-                    println!("[DBG][LIGHT] push_channel_pull_failed node={} from={}", node, src_ip);
-                },
+            } else if crate::node::is_debug() {
+                println!("[DBG][LIGHT] push_channel_pull_failed node={} from={}", node, src_ip);
             }
         });
     }
 
     /// IP of the genesis peer `attestor_id` names; None for a non-genesis id or for this node itself.
-    fn genesis_peer_ip(attestor_id: &str) -> Option<&'static str> {
+    pub(super) fn genesis_peer_ip(attestor_id: &str) -> Option<&'static str> {
         // Pad so the legacy unpadded id form ("genesis_node_1") still resolves.
         let digits = format!("{:0>3}", attestor_id.strip_prefix("genesis_node_")?);
         if std::env::var("QNET_BOOTSTRAP_ID").ok().as_deref() == Some(digits.as_str()) { return None; }
         crate::genesis_constants::GENESIS_NODE_IPS.iter().find(|(_, id)| *id == digits).map(|(ip, _)| *ip)
     }
 
+    /// A relayed attestation this node already took: the gossip echo, and ONLY the echo. The key must live
+    /// in the same unit as the credit it guards: eligibility is per EPOCH, slot numbers repeat every epoch,
+    /// and the map is retained 24 h = 6 epochs. Keyed on {id}:{slot} alone, an attestation suppressed that
+    /// device's replies in the same slot for six epochs — the shard owner dropped the relayed reply before
+    /// recording eligibility, and the device lost those rewards. The LOCAL epoch is used, not the message
+    /// block_height, which is relay-tamperable. Built by the SAME helper the writer uses, so a dedupe read
+    /// can never look up a shape the insert does not produce. The eligibility set is read too: the map stops
+    /// deduping past its bound, and the set is the eligibility record itself.
+    pub(super) fn light_relay_seen(&self, light_node_id: &str, slot: u64) -> bool {
+        if self.light_node_attestations.read().contains_key(&Self::attestation_key(light_node_id, slot)) { return true; }
+        let local_epoch = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed) / 14400;
+        self.epoch_light_eligible.read().get(&local_epoch).map_or(false, |s| s.contains(light_node_id))
+    }
+
+    /// The last steps of a relayed attestation whose pinger checked out, and whose anchor this node's tip
+    /// has reached: the device's own signature over the challenge, the only thing proving the phone
+    /// answered, under the same verifier the HTTP ingress uses (so relay and ingress accept an identical
+    /// set); the heal of a refusal a pull can mend; admission and the re-gossip.
+    pub(super) fn finish_light_relay(&self, attestation: LightNodeAttestation, gossip_hop: u8) {
+        use crate::light_device::ping::{self, ReplyRefusal};
+        let (node, pinger) = (attestation.light_node_id.clone(), attestation.pinger_id.clone());
+        let route = ping::Route::Relay { block_height: attestation.block_height };
+        if let Err(refusal) = self.verify_light_ping_signature(&node, &attestation.challenge, &attestation.light_node_signature, route) {
+            // A node holds ping keys and device records only for the shards it owns, so a relay for any other
+            // shard fails here by construction and is nothing to report: three fifths of the fleet's
+            // attestations reach each node that way, and at WARN they buried the cases that do mean
+            // something — a shard this node owns, where a pull below has to heal a row.
+            let epoch = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed) / 14400;
+            if !self.node_in_my_shard_for_epoch(epoch, &node) {
+                if crate::node::is_debug() {
+                    println!("[DBG][P2P] light_sig_other_shard node={} pinger={} reason={}", node, pinger, refusal.as_str());
+                }
+            } else if crate::node::is_warn() {
+                println!("[WARN][P2P] light_sig_invalid node={} pinger={} reason={}", node, pinger, refusal.as_str());
+            }
+            match refusal {
+                // An owner the device never replied to directly holds no identity row for it, or a stale one.
+                ReplyRefusal::Sigma => self.maybe_pull_light_identity(attestation),
+                // Or the device record the relaying genesis holds, or its latest statement or change, never
+                // reached this one.
+                r if ping::heals_by_record_pull(r) => self.maybe_pull_device_record(attestation),
+                _ => {}
+            }
+            return;
+        }
+        let (slot, block_height) = (attestation.slot, attestation.block_height);
+        // Store through the single writer, and record eligibility for a my-shard node: the same admission
+        // the identity pull finishes with. Light nodes keep the FIXED reputation of 70: no change here.
+        // Not relayed further (F7): the genesis that took the answer sent it to every owner itself.
+        self.admit_relayed_attestation(attestation);
+        if crate::node::is_info() {
+            println!("[INFO][P2P] Light node {} attested by {} in slot {} height={} hop={}", node, pinger, slot, block_height, gossip_hop);
+        }
+    }
+
+    /// Hold a relayed attestation of a my-shard node whose anchor is above this node's tip (this owner is
+    /// behind the genesis that credited it), and finish it (`finish_light_relay`) once the tip reaches the
+    /// anchor: one drain task while anything is held, bounded by `ping::HeldRelays` in count and bytes.
+    /// Nothing is credited on holding, and a reply still held after `ping::RELAY_HOLD_SECS` is dropped as
+    /// before. Only a genesis pinger's relay is held: their keys are pinned, and only genesis nodes ping
+    /// light nodes; any other relay is judged at once or dropped. `direct`: the pinger sent it itself.
+    pub(super) fn hold_relayed_attestation(&self, a: LightNodeAttestation, anchor_height: u64, gossip_hop: u8, direct: bool) {
+        use crate::light_device::ping::HeldRelays;
+        type Held = parking_lot::Mutex<HeldRelays<(LightNodeAttestation, u8)>>;
+        fn held() -> &'static Held {
+            static H: std::sync::OnceLock<Held> = std::sync::OnceLock::new();
+            H.get_or_init(|| parking_lot::Mutex::new(HeldRelays::new()))
+        }
+        static DRAINING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        use std::sync::atomic::Ordering::{Relaxed, SeqCst};
+        let Ok(handle) = tokio::runtime::Handle::try_current() else { return; };
+        let (node, pinger) = (a.light_node_id.clone(), a.pinger_id.clone());
+        let genesis = pinger.starts_with("genesis_node_");
+        if !genesis {
+            return;
+        }
+        let now = crate::light_device::now_secs();
+        let size = a.light_node_signature.len() + a.pinger_signature.len() + a.challenge.len() + node.len() + pinger.len() + 64;
+        if !held().lock().hold(&node, &pinger, genesis, direct, anchor_height, now, size, (a, gossip_hop)) {
+            if crate::node::is_debug() {
+                println!("[DBG][P2P] light_relay_not_held node={} pinger={} anchor={}", node, pinger, anchor_height);
+            }
+            return;
+        }
+        if crate::node::is_debug() {
+            println!("[DBG][P2P] light_relay_held node={} pinger={} anchor={} tip={}", node, pinger, anchor_height,
+                     LOCAL_BLOCKCHAIN_HEIGHT.load(Relaxed));
+        }
+        if DRAINING.swap(true, SeqCst) { return; }
+        handle.spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                let tip = LOCAL_BLOCKCHAIN_HEIGHT.load(Relaxed);
+                let (due, dropped) = held().lock().take_due(tip, crate::light_device::now_secs());
+                if dropped > 0 && crate::node::is_debug() {
+                    println!("[DBG][P2P] light_relay_hold_expired count={} tip={}", dropped, tip);
+                }
+                if let Some(p2p) = crate::node::try_get_p2p() {
+                    for (a, hop) in due {
+                        if !p2p.light_relay_seen(&a.light_node_id, a.slot) { p2p.finish_light_relay(a, hop); }
+                    }
+                }
+                if held().lock().is_empty() {
+                    DRAINING.store(false, SeqCst);
+                    // A hold that came in meanwhile found the task running: take it on again.
+                    if held().lock().is_empty() || DRAINING.swap(true, SeqCst) { return; }
+                }
+            }
+        });
+    }
+
     /// Admit a relayed attestation whose device signature verified. Eligibility is recorded only for a
     /// node in one of our shards and only for the CURRENT local epoch: block_height is not signed, and a
     /// forged future height would drive the prune in record_light_epoch_eligible and wipe the live set.
+    /// Only an answer anchored before its epoch's commit opened (`relay_creditable`): a backup's row commits
+    /// what it holds (F2), and no answer may count in an epoch it was not given in time for.
     pub(super) fn admit_relayed_attestation(&self, a: LightNodeAttestation) {
-        let (node, pinger, block_height) = (a.light_node_id.clone(), a.pinger_id.clone(), a.block_height);
+        let (node, pinger, block_height, answered_at) =
+            (a.light_node_id.clone(), a.pinger_id.clone(), a.block_height, a.timestamp);
         self.store_attestation(a);
         let local_epoch = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed) / 14400;
-        if block_height / 14400 == local_epoch && self.node_in_my_shard_for_epoch(local_epoch, &node) {
-            self.record_light_epoch_eligible(block_height, &node);
+        if !crate::rpc::relay_creditable(block_height, local_epoch) {
+            if crate::node::is_debug() {
+                println!("[DBG][P2P] light_relay_after_commit node={} pinger={} height={}", node, pinger, block_height);
+            }
+            return;
+        }
+        if self.node_in_my_shard_for_epoch(local_epoch, &node) {
+            self.record_light_epoch_eligible(block_height, &node, answered_at);
             // The attestor just served this node, so its push channel is live: heal ours if degraded.
             Self::maybe_pull_push_channel(&node, &pinger, local_epoch);
         }
@@ -2317,7 +2701,7 @@ impl SimplifiedP2P {
             S.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(32)))
         }
         let local_epoch = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed) / 14400;
-        if !a.light_node_signature.starts_with("ping_dilithium:")
+        if crate::light_device::ping::sigma_text(&a.light_node_signature).is_none()
             || !self.node_in_my_shard_for_epoch(local_epoch, &a.light_node_id) { return; }
         // Already recorded here this epoch: this node's row is current, so a copy that fails was tampered
         // with, and a pull could not help.
@@ -2333,8 +2717,8 @@ impl SimplifiedP2P {
         tokio::spawn(async move {
             let _permit = permit;
             let node = a.light_node_id.clone();
-            let url = format!("http://{}:8001/api/v1/internal/light-ping-keys-get?node_id={}", ip, node);
-            let v: serde_json::Value = match HTTP_CLIENT.get(&url).send().await.ok()
+            let path = format!("/api/v1/internal/light-ping-keys-get?node_id={}", node);
+            let v: serde_json::Value = match crate::rpc::genesis_internal_call_tls(ip, &path, |c, url| c.get(url)).await.ok()
                 .filter(|r| r.status().is_success())
             {
                 Some(r) => match r.json().await { Ok(v) => v, Err(_) => return },
@@ -2349,10 +2733,10 @@ impl SimplifiedP2P {
             let (pp, cert, presented) = (field("ping_pubkey"), field("ping_delegation_cert"), field("identity_pubkey"));
             if v["success"].as_bool() != Some(true) || pp.is_empty() || cert.is_empty() { return; }
             // The three checks the HTTP ingress runs before it records an identity (light_nodes.rs).
-            let inner_sig = a.light_node_signature.strip_prefix("ping_dilithium:").unwrap_or("");
+            let inner_sig = crate::light_device::ping::sigma_text(&a.light_node_signature).unwrap_or_default();
             let admitted = storage.resolve_light_identity_pk(&node, Some(presented.as_str())).filter(|id| {
-                crate::rpc::verify_mobile_dilithium_signature(&format!("delegate_ping:{}:{}", pp, node), &cert, id)
-                    && crate::rpc::verify_mobile_dilithium_signature(&a.challenge, inner_sig, &pp)
+                crate::light_binding::verify_delegation(&cert, &pp, &node, id).is_some()
+                    && crate::rpc::verify_mobile_dilithium_signature(&a.challenge, &inner_sig, &pp)
             });
             let Some(identity) = admitted else {
                 if crate::node::is_warn() {
@@ -2360,27 +2744,126 @@ impl SimplifiedP2P {
                 }
                 return;
             };
-            if storage.save_light_ping_keys_identity(&node, &pp, &cert, &identity).is_err() { return; }
+            // The binding order holds here too: a peer still holding a replaced device's row cannot
+            // bring it back, and a newer row catches this node up.
+            match storage.save_light_ping_keys_identity(&node, &pp, &cert, &identity) {
+                Ok(w) if w.holds() => {}
+                Ok(w) => {
+                    if crate::node::is_info() {
+                        println!("[INFO][LIGHT] light_identity_pull_superseded node={} from={} verdict={:?}", node, ip, w);
+                    }
+                    return;
+                }
+                Err(_) => return,
+            }
             if crate::node::is_info() {
                 println!("[INFO][LIGHT] light_identity_pulled node={} from={}", node, ip);
             }
+            // Admitted through the shared verifier with the row now held: a device reply's own checks and
+            // its counter run there, as for any relay. A new binding's row releases the device record the
+            // old one held, so a missed statement of the new binding shows only now: pull it too.
             if let Some(p2p) = crate::node::try_get_p2p() {
-                p2p.admit_relayed_attestation(a);
+                let route = crate::light_device::ping::Route::Relay { block_height: a.block_height };
+                match p2p.verify_light_ping_signature(&a.light_node_id, &a.challenge, &a.light_node_signature, route) {
+                    Ok(()) => p2p.admit_relayed_attestation(a),
+                    Err(r) if crate::light_device::ping::heals_by_record_pull(r) => p2p.maybe_pull_device_record(a),
+                    Err(_) => {}
+                }
             }
         });
     }
 
-    /// Update push_type + last_seen for a light node (called on token-refresh).
-    pub fn update_light_node_push_type(&self, node_id: &str, push_type_str: &str, timestamp: u64) {
-        let mut registry = self.light_node_registry.write();
-        if let Some(node) = registry.get_mut(node_id) {
-            node.push_type = match push_type_str {
-                "fcm"         => PushType::FCM,
-                "unifiedpush" => PushType::UnifiedPush,
-                _             => PushType::Polling,
-            };
-            node.last_seen = timestamp;
+    /// Heal a device reply relayed by a genesis that holds the node's device record when this owner holds
+    /// none or one behind it (`ping::heals_by_record_pull`): a statement's or a change's sync missed it (the
+    /// sender re-sends it for an hour, then pulls heal). Pull the
+    /// pinger's record once per (node, epoch) - from the statement's ingress when the pinger keeps no proof,
+    /// every signature re-verified here - then admit the reply through the shared verifier.
+    pub(super) fn maybe_pull_device_record(&self, a: LightNodeAttestation) {
+        fn pull_dedup() -> &'static dashmap::DashMap<String, u64> {
+            static M: std::sync::OnceLock<dashmap::DashMap<String, u64>> = std::sync::OnceLock::new();
+            M.get_or_init(dashmap::DashMap::new)
         }
+        fn pull_permits() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
+            static S: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+            S.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(8)))
+        }
+        let local_epoch = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed) / 14400;
+        if !a.light_node_signature.starts_with("ping_hw2:") || !self.node_in_my_shard_for_epoch(local_epoch, &a.light_node_id) { return; }
+        let Some(storage) = crate::node::try_get_storage() else { return; };
+        let Some(ip) = Self::genesis_peer_ip(&a.pinger_id) else { return; };
+        if pull_dedup().len() > 65_536 { pull_dedup().clear(); }
+        if pull_dedup().insert(a.light_node_id.clone(), local_epoch) == Some(local_epoch) { return; }
+        let Ok(permit) = pull_permits().clone().try_acquire_owned() else {
+            pull_dedup().remove(&a.light_node_id);
+            return;
+        };
+        tokio::spawn(async move {
+            let _permit = permit;
+            let genesis = crate::light_device::statement::GenesisSet::production();
+            let pulled = crate::rpc::pull_device_record(storage, genesis, crate::light_device::is_mainnet(), &a.light_node_id, ip).await;
+            if !pulled { return; }
+            // The record now held may be a new binding's whose ping key this node missed too: pull that row.
+            if let Some(p2p) = crate::node::try_get_p2p() {
+                let route = crate::light_device::ping::Route::Relay { block_height: a.block_height };
+                match p2p.verify_light_ping_signature(&a.light_node_id, &a.challenge, &a.light_node_signature, route) {
+                    Ok(()) => p2p.admit_relayed_attestation(a),
+                    Err(crate::light_device::ping::ReplyRefusal::Sigma) => p2p.maybe_pull_light_identity(a),
+                    Err(_) => {}
+                }
+            }
+        });
+    }
+
+    /// Set a light node's resident push channel (token refresh, token sync, bind, unbind, apply) to what
+    /// this genesis pushes it on (`rpc::push_channel`), polling when nothing: never a stored record that
+    /// is not the linked device's. `last_seen` is not touched: it is public in `/node/status`, and a
+    /// binding change is not the device being seen (it would date every bind, refresh and unbind).
+    pub fn refresh_light_node_push_channel(&self, storage: &crate::storage::Storage, node_id: &str) {
+        let channel = crate::rpc::push_channel(storage, node_id);
+        if let Some(node) = self.light_node_registry.write().get_mut(node_id) {
+            Self::set_resident_channel(node, channel);
+        }
+    }
+
+    fn set_resident_channel(node: &mut LightNodeRegistrationData, channel: Option<crate::rpc::PushChannel>) {
+        (node.push_type, node.unified_push_endpoint) = match channel {
+            Some(crate::rpc::PushChannel::Fcm(_)) => (PushType::FCM, None),
+            Some(crate::rpc::PushChannel::UnifiedPush(e)) => (PushType::UnifiedPush, Some(e)),
+            None => (PushType::Polling, None),
+        };
+    }
+
+    /// Gossip a verified binding, to the node's shard owners directly (random gossip reaches a given
+    /// genesis only by chance on a large network, and they are the ones that push and credit) and to
+    /// random peers. The receiver re-checks it (identity under the chain commitment, delegation,
+    /// sequence) and takes nothing else from the message: the static wallet signature is no longer sent
+    /// (S2) and neither is a token hash (H6). The chain-decided fields ride along only because the
+    /// message's field list is fixed.
+    pub fn gossip_light_binding(&self, node_id: &str, wallet: &str, identity_pk: &str, ping_pk: &str, cert: &str, push_type: PushType, now: u64) {
+        let msg = NetworkMessage::LightNodeRegistration {
+            node_id: node_id.to_string(),
+            wallet_address: wallet.to_string(),
+            device_token_hash: String::new(),
+            quantum_pubkey: identity_pk.to_string(),
+            registered_at: now,
+            signature: String::new(),
+            gossip_hop: 0,
+            push_type,
+            unified_push_endpoint: None,
+            last_seen: now,
+            consecutive_failures: 0,
+            is_active: true,
+            ping_pubkey: ping_pk.to_string(),
+            ping_delegation_cert: cert.to_string(),
+        };
+        for owner in crate::node::light_shard_owners(crate::node::light_shard_of(node_id)) {
+            let id = format!("genesis_node_{:03}", owner + 1);
+            if id == self.node_id { continue; }
+            if let Some(addr) = self.get_peer_addr_by_id(&id) {
+                self.send_network_message(&addr, msg.clone());
+            }
+        }
+        self.gossip_to_random_peers(msg, 5);
     }
 
     /// THE single writer for the attestation map. Both callers - the origination path (this genesis
@@ -2441,20 +2924,55 @@ impl SimplifiedP2P {
         
         // Store locally first + record into the per-epoch eligibility set (the live origination
         // path: this genesis received the light node's ping reply directly).
-        let owners = crate::node::light_shard_owners(crate::node::light_shard_of(&attestation.light_node_id));
-        self.record_light_epoch_eligible(attestation.block_height, &attestation.light_node_id);
+        let shard = crate::node::light_shard_of(&attestation.light_node_id);
+        self.record_light_epoch_eligible(attestation.block_height, &attestation.light_node_id, attestation.timestamp);
         self.store_attestation(attestation);
 
-        // Every owner of the shard commits its own bitmap, and random gossip reaches a given genesis
-        // only by chance on a large network: the other owners get the attestation directly.
-        for owner in owners {
-            let id = format!("genesis_node_{:03}", owner + 1);
-            if id == self.node_id { continue; }
-            if let Some(addr) = self.get_peer_addr_by_id(&id) {
-                self.send_network_message(&addr, msg.clone());
+        // F7: to the other owners of the shard, directly, and to nobody else: they alone credit it, and random gossip
+        // made some thirteen verified copies of each answer. Each send is acknowledged where the transport allows; an
+        // owner that missed one anyway is healed by a backup's row (F2) and never blamed for it (F1).
+        let our_idx = Self::genesis_index(&self.node_id);
+        for owner in crate::rpc::light_relay_targets(shard, our_idx) {
+            if let Some(addr) = self.genesis_addr(owner) {
+                self.send_owner_relay(addr, msg.clone());
             }
         }
-        self.gossip_to_random_peers(msg, 5);
+    }
+
+    /// The genesis index (0..5) of `node_id`, padded or not.
+    pub(super) fn genesis_index(node_id: &str) -> Option<usize> {
+        let digits = format!("{:0>3}", node_id.strip_prefix("genesis_node_")?);
+        ["001", "002", "003", "004", "005"].iter().position(|g| *g == digits)
+    }
+
+    /// Where genesis `idx` is reached: its connected address, else its address in the binary's table.
+    pub(super) fn genesis_addr(&self, idx: usize) -> Option<String> {
+        let id = format!("genesis_node_{:03}", idx + 1);
+        if id == self.node_id { return None; }
+        self.get_peer_addr_by_id(&id)
+            .or_else(|| crate::genesis_constants::GENESIS_NODE_IPS.get(idx).map(|(ip, _)| format!("{}:8001", ip)))
+    }
+
+    /// Send an answer's relay to an owner and wait for its acknowledgement, in the background and bounded; without
+    /// the acknowledged transport, or past the bound, as a plain send.
+    fn send_owner_relay(&self, addr: String, msg: NetworkMessage) {
+        static IN_FLIGHT: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+        let permits = IN_FLIGHT.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(512))).clone();
+        let (Ok(handle), Some(p2p), Ok(permit)) =
+            (tokio::runtime::Handle::try_current(), crate::node::try_get_p2p(), permits.try_acquire_owned()) else {
+            self.send_network_message(&addr, msg);
+            return;
+        };
+        handle.spawn(async move {
+            let _permit = permit;
+            if let Err(e) = p2p.send_critical_tx_with_ack(&addr, msg.clone()).await {
+                if e.contains("QUIC not enabled") {
+                    p2p.send_network_message(&addr, msg);
+                } else if crate::node::is_debug() {
+                    println!("[DBG][P2P] light_owner_relay_unacked addr={} err={}", crate::unified_p2p::get_privacy_id_for_addr(&addr), e);
+                }
+            }
+        });
     }
     
     /// v2.89: Get total registered Light node count
@@ -2493,8 +3011,10 @@ impl SimplifiedP2P {
         // v9.3: Don't register if more than 1 macroblock behind network.
         // Syncing nodes must not participate in consensus — they can be selected
         // as producer but can't produce, causing network stall.
+        // The corroborated head, not the single highest claim: one node advertising a height nobody else holds
+        // kept every other node out of the registry (04.10).
         let local_height = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Acquire);
-        let network_height = self.get_max_peer_height();
+        let network_height = self.corroborated_behind_head().unwrap_or_else(|| self.get_max_peer_height());
         if network_height > 90 && local_height + 90 < network_height {
             if crate::node::is_warn() {
                 println!("[WARN][ACTIVE] register_skip reason=syncing local={} net={} gap={}",
@@ -2553,6 +3073,69 @@ impl SimplifiedP2P {
         self.gossip_to_random_peers(msg, adaptive_fanout);
     }
 
+    /// F5: after each ping tick it completed, a genesis pinger tells the other four, straight and signed, that it
+    /// pushes, naming its push schedule (`rpc::ping_tick_type`). Their owner liveness reads nothing else of it, so a
+    /// genesis whose push loop stopped, that is behind the network, or whose provider answered none of its pushes five
+    /// ticks in a row (the loop then skips this, `rpc::PushHealth`), is taken over within ten slots; the schedule tells
+    /// the owner that takes a shard over, or the one it hands it back to, how the other pushed it (`foreign_draws`).
+    pub async fn announce_ping_tick(&self) {
+        if !is_genesis_pinger() { return; }
+        let now = self.current_timestamp();
+        let reputation = self.get_node_reputation_from_blockchain(&self.node_id);
+        let node_type = crate::rpc::ping_tick_type(FIRST_PUSH_DRAW_WINDOW.load(std::sync::atomic::Ordering::Relaxed),
+                                                   SPACED_ROUND_WINDOW.load(std::sync::atomic::Ordering::Relaxed));
+        let data = format!("active:{}:{}:{}:{}:{}", self.node_id, node_type, self.shard_id, reputation as u64, now);
+        let Some(signature) = self.sign_dilithium_async(&data, &self.node_id).await else {
+            if crate::node::is_warn() {
+                println!("[WARN][GENESIS-PING] ping_tick_unsigned reason=dilithium_unavailable");
+            }
+            return;
+        };
+        let msg = NetworkMessage::ActiveNodeAnnouncement {
+            node_id: self.node_id.clone(),
+            node_type,
+            shard_id: self.shard_id,
+            reputation,
+            timestamp: now,
+            signature,
+            gossip_hop: crate::rpc::PING_TICK_HOP,
+        };
+        for idx in 0..5usize {
+            if let Some(addr) = self.genesis_addr(idx) {
+                self.send_network_message(&addr, msg.clone());
+            }
+        }
+    }
+
+    /// A ping tick another genesis sent (`announce_ping_tick`): taken only straight from that genesis, newer than its
+    /// last and not too soon after it, before its signature is verified; never relayed, never in the active map. The
+    /// push schedule it names (`schedule`, from `node_type`, which the signature covers) is kept for its sender.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn take_ping_tick(&self, from_peer: &str, node_id: &str, node_type: &str, schedule: Option<(u64, u64)>,
+                                 shard_id: u8, reputation: f64, timestamp: u64, signature: &str) {
+        let Some(idx) = crate::rpc::ping_tick_sender(node_id, from_peer) else {
+            if crate::node::is_debug() {
+                println!("[DBG][GENESIS-PING] ping_tick_refused node={} reason=not_direct", node_id);
+            }
+            return;
+        };
+        let now = self.current_timestamp();
+        if Self::genesis_index(&self.node_id) == Some(idx) || !crate::rpc::OWNER_LIVENESS.tick_admissible(idx, timestamp, now) {
+            return;
+        }
+        let data = format!("active:{}:{}:{}:{}:{}", node_id, node_type, shard_id, reputation as u64, timestamp);
+        if !self.verify_dilithium_heartbeat_signature(&data, signature, node_id) {
+            if crate::node::is_warn() {
+                println!("[WARN][GENESIS-PING] ping_tick_sig_invalid node={}", node_id);
+            }
+            return;
+        }
+        crate::rpc::OWNER_LIVENESS.heard(idx, timestamp, now);
+        if let Some(schedule) = schedule {
+            crate::rpc::OWNER_SCHEDULES.learn(idx, schedule);
+        }
+    }
+
     /// Register this node as active Super node (SYNC version for std::thread::spawn)
     /// WARNING: Only use in pure sync contexts where NO tokio runtime exists!
     pub fn register_as_active_node(&self) {
@@ -2580,9 +3163,9 @@ impl SimplifiedP2P {
             return;
         }
 
-        // v9.3: Don't register if syncing (>1 macroblock behind)
+        // v9.3: Don't register if syncing (>1 macroblock behind), read from the corroborated head.
         let local_height = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Acquire);
-        let network_height = self.get_max_peer_height();
+        let network_height = self.corroborated_behind_head().unwrap_or_else(|| self.get_max_peer_height());
         if network_height > 90 && local_height + 90 < network_height {
             if crate::node::is_warn() {
                 println!("[WARN][ACTIVE] register_skip reason=syncing local={} net={} gap={}",
@@ -2812,6 +3395,21 @@ impl SimplifiedP2P {
         )
     }
 
+    /// The head f+1 in-set nodes stand behind, this node's own tip counted as one of them: the (f+1)-th highest of
+    /// {own tip} ∪ fresh in-set peer heights, f from the in-set size (committee ∪ genesis). None below f+1 values: then
+    /// nothing can be corroborated and the caller keeps its old reading. SYNC-HINT ONLY, like the ceiling above.
+    pub fn corroborated_behind_head(&self) -> Option<u64> {
+        let n_inset = {
+            let cc = CURRENT_COMMITTEE.read();
+            cc.members.union(&cc.genesis_ids).count()
+        };
+        corroborated_head(
+            LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed),
+            self.fresh_in_set_peer_heights(),
+            n_inset,
+        )
+    }
+
     // failover_frontier_ceiling REMOVED: the failover vote key is a pure function of the voter's
     // OWN verified chain + f+1 committee-signed window amplification — peer-claimed heights are
     // sync hints only and must never derive a consensus key (eclipse/staleness split honest votes).
@@ -2981,16 +3579,6 @@ impl SimplifiedP2P {
         self.get_node_reputation_from_blockchain(node_id)
     }
     
-    /// Get delay before pinging based on role (Primary=0, Backup1=30s, Backup2=60s)
-    pub fn get_ping_delay(&self, role: PingerRole) -> std::time::Duration {
-        match role {
-            PingerRole::Primary => std::time::Duration::from_secs(0),
-            PingerRole::Backup1 => std::time::Duration::from_secs(30),
-            PingerRole::Backup2 => std::time::Duration::from_secs(60),
-            PingerRole::None => std::time::Duration::from_secs(u64::MAX),
-        }
-    }
-    
     /// Cleanup old attestations (older than 24 hours)
     pub fn cleanup_old_attestations(&self) {
         let now = std::time::SystemTime::now()
@@ -3084,7 +3672,9 @@ impl SimplifiedP2P {
     }
 
     /// Record an attested light node into the per-epoch eligibility set (uncapped) + prune old epochs.
-    pub(super) fn record_light_epoch_eligible(&self, block_height: u64, light_node_id: &str) {
+    /// `answered_at` is the attestation's own stamp (the pinger's), kept with the persisted row: the status
+    /// reports it as the node's last answer.
+    pub(super) fn record_light_epoch_eligible(&self, block_height: u64, light_node_id: &str, answered_at: u64) {
         const EPOCH_BLOCKS: u64 = 14400;
         let epoch = block_height / EPOCH_BLOCKS;
         let (inserted, new_epoch) = {
@@ -3101,7 +3691,7 @@ impl SimplifiedP2P {
         // only on the first attestation of a new epoch — O(roster) once/epoch, not per ping.
         if inserted {
             if let Some(storage) = crate::node::try_get_storage() {
-                let _ = storage.save_light_epoch_eligible(epoch, light_node_id);
+                let _ = storage.save_light_epoch_eligible(epoch, light_node_id, answered_at);
                 if new_epoch { let _ = storage.prune_light_epoch_eligible(epoch.saturating_sub(2)); }
             }
         }
@@ -3338,6 +3928,835 @@ mod tests_ping_slot_index {
             assert_eq!(top + 3 + ttl.div_ceil(60), opens_at / 60, "window {}: the draw uses every slot that fits", window);
         }
     }
+
+    /// P-1: from the window armed for the spaced rounds the first push falls in the epoch's first 138 slots, and the
+    /// retry round's last repeat, with its grace and a push's whole minute, ends at least five minutes before the commit.
+    /// In a window armed only for the early draw (the one a genesis switches in) the first 168 slots, whose retry round of
+    /// three a slot apart ends as early. The windows before keep the draw they began with.
+    #[test]
+    fn the_first_push_is_drawn_early_and_the_retry_round_ends_before_the_commit() {
+        use crate::rpc::{DUE_GRACE_SLOTS, FIRST_PUSH_SLOTS, RETRY_AFTER_SLOTS, ROUND_PUSHES, ROUND_SPACING_SLOTS};
+        let (from, spaced) = (4_000u64, 4_002u64);
+        assert_eq!(ping_draw_slots(spaced, from, spaced), FIRST_PUSH_SLOTS);
+        assert_eq!(ping_draw_slots(spaced + 1, from, spaced), FIRST_PUSH_SLOTS);
+        assert_eq!(ping_draw_slots(spaced - 1, from, spaced), crate::rpc::UNSPACED_FIRST_PUSH_SLOTS, "the early draw until the spaced window");
+        assert_eq!(ping_draw_slots(from - 1, from, spaced), 240 - 3 - 2 - 3, "the bounded draw until the armed window");
+        assert_eq!(ping_draw_slots(BOUNDED_SLOT_DRAW_FROM_WINDOW - 1, from, spaced), 240);
+        assert_eq!(ping_draw_slots(from, u64::MAX, u64::MAX), 232, "never armed: the bounded draw");
+        assert_eq!(ping_draw_slots(from, from, from), FIRST_PUSH_SLOTS, "both armed at once: a genesis that never pinged before");
+        assert_eq!(FIRST_PUSH_SLOTS, 138);
+        // The earlier of the two commit openings, whatever the gate: 150 blocks before the epoch's end.
+        let opens_at = 14_400 - crate::node::light_commit_window(spaced).max(150);
+        // (window, the last push's offset from the drawn slot): the spaced retry round's last repeat and its grace; the
+        // retry round of three a slot apart, each slot a due point of its own.
+        let last_spaced = RETRY_AFTER_SLOTS + (ROUND_PUSHES - 1) * ROUND_SPACING_SLOTS + DUE_GRACE_SLOTS;
+        for (window, last_offset) in [(spaced, last_spaced), (from, RETRY_AFTER_SLOTS + ROUND_PUSHES - 1)] {
+            let draw = ping_draw_slots(window, from, spaced);
+            let slots: Vec<u64> = (0..20_000)
+                .map(|i| SimplifiedP2P::slot_in_draw(&format!("light_{:05}", i), window, draw))
+                .collect();
+            let top = *slots.iter().max().unwrap();
+            assert_eq!(top, draw - 1, "window {window}: every early slot is used");
+            assert!(slots.iter().filter(|s| **s < draw / 2).count() > 9_000, "window {window}: spread over the range");
+            let last = top + last_offset;
+            assert_eq!(last, 229, "window {window}: the schedule's last push is in slot 229");
+            assert!((last + 1) * 60 + 300 <= opens_at, "window {window}: the last push leaves five minutes before the commit");
+        }
+        // The same id and window keep their slot: the draw is a function of both, nothing else.
+        assert_eq!(SimplifiedP2P::slot_in_draw("light_x", 7, 232), SimplifiedP2P::slot_in_draw("light_x", 7, 232));
+        // Arming names the windows the early draw and the spaced rounds start at, once (a window no other test reaches).
+        SimplifiedP2P::arm_push_schedule(None, None);
+        SimplifiedP2P::arm_push_schedule(Some(u64::MAX - 2), Some(u64::MAX - 2));
+        SimplifiedP2P::arm_push_schedule(Some(6), Some(6));
+        assert_eq!(FIRST_PUSH_DRAW_WINDOW.load(std::sync::atomic::Ordering::Relaxed), u64::MAX - 2, "armed once, at the first call");
+        assert_eq!(SPACED_ROUND_WINDOW.load(std::sync::atomic::Ordering::Relaxed), u64::MAX - 2, "armed once, at the first call");
+        assert!(!spaced_rounds_in(4096) && spaced_rounds_in(u64::MAX - 2));
+        assert_eq!(SimplifiedP2P::calculate_randomized_slot("light_x", 4096), SimplifiedP2P::slot_in_draw("light_x", 4096, 232));
+    }
+
+    /// G-1: every push of a node's epoch - with the spaced rounds its first push, the repeats 15 and 30 slots on and the
+    /// retry round of three an hour after the drawn slot, each due point with its grace; in the window a genesis switches
+    /// in, the round of three a slot apart and its retry round - is read on the regular tick at exactly those slots, and
+    /// leaves with five minutes left for its delivery and answer before the epoch's commit, whatever slot the node drew,
+    /// whichever owner rank sends it and wherever in its minute the tick and the pacer put it. The epoch still drawn over
+    /// the bounded range keeps its own: its round's last push leaves more than a minute before the commit. A tick
+    /// catching up after a stall may read a slot later, and the lifetime rule lets nothing out at or after the commit,
+    /// nor with less than its floor left.
+    #[test]
+    fn every_push_repeat_and_retry_leaves_before_the_commit() {
+        use crate::rpc::{DUE_GRACE_SLOTS, FIRST_PUSH_SLOTS, RETRY_AFTER_SLOTS, ROUND_PUSHES, UNSPACED_FIRST_PUSH_SLOTS};
+        // No owner rank waits before it pushes: a backup that covers a shard pushes at once (its ranks above are
+        // silent by then), so the schedule is the same at every rank.
+        assert!(!include_str!("../rpc/light_nodes.rs").contains("get_ping_delay"), "no backup wait");
+        let backup = 0u64;
+        let paced = crate::rpc::PACE_WINDOW_US.div_ceil(1_000_000);
+        let (round, retry) = (ROUND_PUSHES, RETRY_AFTER_SLOTS);
+        // The slots a node drawn at s is read in: each due point and its grace; before the spaced rounds each slot of a
+        // round, a due point of its own.
+        let spaced_reads = |s: u64| -> Vec<u64> {
+            crate::rpc::spaced_due_offsets().flat_map(|(o, _)| (0..=DUE_GRACE_SLOTS).map(move |g| s + o + g)).collect()
+        };
+        let unspaced_reads = |s: u64| -> Vec<u64> { (0..round).map(|i| s + i).chain((0..round).map(|i| s + retry + i)).collect() };
+        for window in [4_000u64, 4_096] {
+            // The earlier of the two commit openings, whatever the gate: 150 blocks before the epoch's end.
+            let commit = 14_400 - crate::node::light_commit_window(window).max(150);
+            let base = window * 240;
+            let read_in = |s: u64, spaced: bool| -> Vec<u64> {
+                (0..240u64).filter(|t| {
+                    push_reads(t.checked_sub(1).map(|p| base + p), base + t, spaced, None).0.iter().any(|r| r.bucket == s as usize)
+                }).collect()
+            };
+            for (draw, spaced) in [(FIRST_PUSH_SLOTS, true), (UNSPACED_FIRST_PUSH_SLOTS, false)] {
+                let mut last = 0u64;
+                for s in 0..draw {
+                    let reads = read_in(s, spaced);
+                    let want = if spaced { spaced_reads(s) } else { unspaced_reads(s) };
+                    assert_eq!(reads, want, "window {window}, slot {s}, spaced {spaced}: a round of three and a retry round of three");
+                    let t = *reads.last().unwrap();
+                    // The tick may fire at the slot's last second; then the pacer.
+                    let leaves = (t + 1) * 60 + backup + paced;
+                    assert!(leaves + 300 <= commit, "slot {s}: its last push leaves at block {leaves}, the commit opens at {commit}");
+                    last = last.max(t);
+                }
+                assert_eq!(last, 229, "spaced {spaced}: the schedule's last push is in slot 229");
+            }
+            // The bounded draw, rounds a slot apart: the round's last push leaves more than a minute before the commit; a
+            // retry round drawn late is left to the lifetime rule below.
+            let opens = crate::rpc::commit_opens_at(window) - window * 14_400;
+            for s in 0..ping_draw_slots(window, u64::MAX, u64::MAX) {
+                let reads = read_in(s, false);
+                assert_eq!(reads[..3].to_vec(), vec![s, s + 1, s + 2], "bounded slot {s}");
+                assert!((s + round) * 60 + backup + paced + 60 < opens, "bounded slot {s}: the round's last push");
+            }
+            // A catch-up tick: whatever it reads, no push leaves at or after the commit or under the floor.
+            let floor = crate::rpc::PUSH_MIN_LIFETIME_SECS;
+            let e0 = window * 14_400;
+            for h in [commit - floor - 1, commit - floor, commit - floor + 1, commit - 1, commit, 14_399] {
+                let lives = crate::rpc::push_lifetime(window, e0 + h);
+                assert_eq!(lives.is_some(), h + floor <= crate::rpc::commit_opens_at(window) - e0, "block {h}");
+                assert!(lives.map_or(true, |l| e0 + h + l <= crate::rpc::commit_opens_at(window)), "it ends at the commit");
+            }
+        }
+        assert!(backup <= 60 && paced <= 55);
+    }
+
+    /// R-a and P-1: a tick reads the grace slots, then the same slots an hour earlier; first pushes come first,
+    /// and the retry read never wraps into the window's last slots.
+    #[test]
+    fn a_push_tick_reads_the_round_then_the_retry_round() {
+        let w = 240 * 9;
+        let retry = crate::rpc::RETRY_AFTER_SLOTS as usize;
+        assert_eq!(push_buckets_to_read(Some(w + 99), w + 100), (vec![100, 99, 98, 100 - retry, 99 - retry, 98 - retry], 0));
+        assert_eq!(push_buckets_to_read(None, w + 61), (vec![61, 60, 59, 1, 0], 0), "no wrap below slot 0");
+        assert_eq!(push_buckets_to_read(None, w + 10), (vec![10, 9, 8], 0), "no retry before slot 60");
+        assert_eq!(push_buckets_to_read(None, w), (vec![0, 239, 238], 0));
+        // A catch-up tick reads both rounds of every slot passed.
+        let (b, gap) = push_buckets_to_read(Some(w + 95), w + 100);
+        assert_eq!(gap, 0);
+        assert_eq!(b[..7].to_vec(), (94..=100).rev().collect::<Vec<usize>>());
+        assert_eq!(b[7..].to_vec(), (94 - retry..=100 - retry).rev().collect::<Vec<usize>>());
+        // Over one window at one slot a tick, a node drawn at slot s is read at s, s+1, s+2 and at s+60, s+61,
+        // s+62: a round of three and a retry round of three.
+        for s in [0usize, 59, 107, 167] {
+            let reads: Vec<u64> = (0..240u64).filter(|t| {
+                push_buckets_to_read(t.checked_sub(1).map(|p| w + p), w + t).0.contains(&s)
+            }).collect();
+            let s = s as u64;
+            let want: Vec<u64> = [s, s + 1, s + 2, s + 60, s + 61, s + 62].into_iter().filter(|t| *t < 240).collect();
+            assert_eq!(reads, want, "slot {s}");
+        }
+        // Before the spaced rounds every read is a due point of the tick's own slot alone.
+        let (reads, gap) = push_reads(Some(w + 99), w + 100, false, None);
+        assert_eq!((reads.iter().map(|r| r.bucket).collect::<Vec<_>>(), gap), push_buckets_to_read(Some(w + 99), w + 100));
+        assert_eq!(push_reads(Some(w + 99), w + 100, false, Some(w + 99)).0, reads, "a restart's mark changes nothing here");
+        assert!(reads.iter().all(|r| r.dues == vec![crate::rpc::Due::once(w + 100)]));
+    }
+
+    /// With the spaced rounds a tick reads each due point that came since the last tick with its grace: the drawn slots
+    /// 0, 15, 30, 60, 75 and 90 slots back, first pushes first, the repeats marked with their round's first slot, never
+    /// wrapping below slot 0; a bucket two due points reach in one catch-up tick is read once, with both, earliest first.
+    /// After a restart whose tick joins the run before it, no due point that run read is read again.
+    #[test]
+    fn a_spaced_tick_reads_each_due_point_with_its_grace() {
+        use crate::rpc::Due;
+        let w = 240 * 9;
+        let (reads, gap) = push_reads(Some(w + 99), w + 100, true, None);
+        assert_eq!(gap, 0);
+        let buckets: Vec<usize> = reads.iter().map(|r| r.bucket).collect();
+        assert_eq!(buckets, vec![100, 99, 98, 85, 84, 83, 70, 69, 68, 40, 39, 38, 25, 24, 23, 10, 9, 8]);
+        for (i, r) in reads.iter().enumerate() {
+            let (g, offset_index) = ((i % 3) as u64, i / 3);
+            let into_round = [0, 15, 30, 0, 15, 30][offset_index];
+            assert_eq!(r.dues, vec![Due::spaced(w + 100 - g, into_round)], "bucket {}", r.bucket);
+            assert_eq!(r.dues[0].round, w + r.bucket as u64 + [0, 0, 0, 60, 60, 60][offset_index], "bucket {}", r.bucket);
+        }
+        assert_eq!(push_reads(None, w + 10, true, None).0.iter().map(|r| r.bucket).collect::<Vec<_>>(), vec![10, 9, 8], "nothing before slot 0");
+        assert_eq!(push_reads(None, w, true, None).0.iter().map(|r| r.bucket).collect::<Vec<_>>(), vec![0], "no wrap into the window's end");
+        assert_eq!(push_reads(None, w + 16, true, None).0.iter().map(|r| r.bucket).collect::<Vec<_>>(), vec![16, 15, 14, 1, 0]);
+        // A catch-up over 15 slots: the round's first push of slot 85 and its first repeat (due in slot 100) meet in
+        // bucket 85, read once with both.
+        let (reads, gap) = push_reads(Some(w + 85), w + 100, true, None);
+        assert_eq!(gap, 0);
+        let b85: Vec<&PushRead> = reads.iter().filter(|r| r.bucket == 85).collect();
+        assert_eq!(b85.len(), 1);
+        assert_eq!(b85[0].dues, vec![Due::spaced(w + 85, 0), Due::spaced(w + 100, 15)]);
+        let mut seen = reads.iter().map(|r| r.bucket).collect::<Vec<_>>();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), reads.len(), "every bucket once");
+        // A stall past the bound reads the grace slots only, as before.
+        let (reads, gap) = push_reads(Some(w + 80), w + 100, true, None);
+        assert_eq!(gap, 20);
+        assert_eq!(reads.len(), 18);
+        // The first tick after a restart whose run before read up to slot 99: only the due points of slot 100; the next
+        // tick reads the grace of slot 101 down to slot 100, never 99 again.
+        let (reads, _) = push_reads(Some(w + 99), w + 100, true, Some(w + 99));
+        assert!(reads.iter().all(|r| r.dues.iter().all(|d| d.met_from + crate::rpc::MIN_PUSH_GAP_SLOTS - 1 == w + 100)));
+        assert_eq!(reads.iter().map(|r| r.bucket).collect::<Vec<_>>(), vec![100, 85, 70, 40, 25, 10]);
+        let (reads, _) = push_reads(Some(w + 100), w + 101, true, Some(w + 99));
+        assert_eq!(reads.iter().map(|r| r.bucket).collect::<Vec<_>>(), vec![101, 100, 86, 85, 71, 70, 41, 40, 26, 25, 11, 10]);
+        assert_eq!(push_reads(Some(w + 101), w + 102, true, Some(w + 99)).0, push_reads(Some(w + 101), w + 102, true, None).0,
+                   "three slots on, nothing left to skip");
+    }
+
+    /// One genesis pushing one light shard in the tests: its push schedule (the windows its early draw and its spaced
+    /// rounds start at), its ledger, what it read (`ShardReads`), the slot it last read in this process and the mark it
+    /// keeps across a restart (`rpc::push_read_mark`). `tick` runs what the selection runs for the shard.
+    struct SimOwner {
+        me: usize,
+        schedule: (u64, u64),
+        ledger: crate::rpc::PushLedger,
+        reads: ShardReads,
+        last: Option<u64>,
+        mark: Option<(u64, u64)>,
+        /// Whether a shard another owner may have pushed earlier in the window is read under that owner's draw too.
+        foreign: bool,
+    }
+
+    impl SimOwner {
+        fn new(me: usize, schedule: (u64, u64)) -> Self {
+            SimOwner { me, schedule, ledger: crate::rpc::PushLedger::new(), reads: ShardReads::new(), last: None, mark: None, foreign: true }
+        }
+
+        /// A restart: the ledger, the reads and the slot last read go; the mark stays.
+        fn restart(&mut self) {
+            self.ledger = crate::rpc::PushLedger::new();
+            self.reads = ShardReads::new();
+            self.last = None;
+        }
+
+        /// One tick at absolute slot `now` pushing `shard`, knowing the other owners' schedules as `known`:
+        /// `bucket(draw, b)` the nodes (indices into `nodes`) drawn into bucket b under a draw, `counted` the
+        /// selection's eligibility test and `outcome` what an offer came to. The nodes offered, in order.
+        #[allow(clippy::too_many_arguments)]
+        fn tick(&mut self, now: u64, shard: usize, known: [(u64, u64); 5], nodes: &[String],
+                bucket: &dyn Fn(u64, usize) -> Vec<usize>, counted: &dyn Fn(usize) -> bool,
+                outcome: &dyn Fn(usize) -> crate::rpc::SendOutcome) -> Vec<usize> {
+            let (w, ws) = (now / 240, now / 240 * 240);
+            let first_tick = self.last.is_none();
+            let resumed = if first_tick { self.mark } else { None }
+                .filter(|(l, _)| *l >= ws && *l < now && now - *l <= MAX_PING_CATCHUP_SLOTS);
+            let last = if first_tick { resumed.map(|(l, _)| l) } else { self.last };
+            if first_tick { self.reads.done = resumed.map(|(l, _)| l); }
+            let (reads, gap) = push_reads(last, now, w >= self.schedule.1, self.reads.done);
+            let mut seen: Vec<usize> = reads.iter().map(|r| r.bucket).collect();
+            seen.sort_unstable();
+            seen.dedup();
+            assert_eq!(seen.len(), reads.len(), "slot {now}: a bucket read twice in one tick");
+            let joined = last.is_some() && gap == 0;
+            let first_due = match (resumed, last) {
+                (Some((l, _)), _) => l + 1,
+                (None, Some(l)) if joined && l < now => (l + 1).saturating_sub(crate::rpc::DUE_GRACE_SLOTS),
+                _ => now.saturating_sub(crate::rpc::DUE_GRACE_SLOTS),
+            }.max(ws);
+            self.reads.advance(1 << shard, self.me, first_due, joined, resumed.map(|(_, r)| r));
+            self.last = Some(now);
+            self.mark = Some((now, self.reads.read_from[self.me]));
+            let mut schedules = known;
+            schedules[self.me] = self.schedule;
+            let mut draws = vec![ping_draw_slots(w, self.schedule.0, self.schedule.1)];
+            if self.foreign && self.reads.read_from[shard] > ws {
+                draws.extend(foreign_draws(w, self.me, shard, &schedules));
+            }
+            let held = self.reads.held_from[shard];
+            let mut offered: Vec<usize> = Vec::new();
+            let mut once = std::collections::HashSet::new();
+            for r in &reads {
+                for d in &draws {
+                    for i in bucket(*d, r.bucket) {
+                        if !once.contains(&i) && self.ledger.may_push(&nodes[i], now, &r.dues, || held) {
+                            once.insert(i);
+                            offered.push(i);
+                        }
+                    }
+                }
+            }
+            offered.retain(|i| !counted(*i));
+            for i in &offered { self.ledger.record(&nodes[*i], now, outcome(*i), 1_800_000_000 + now); }
+            offered
+        }
+    }
+
+    /// One owner's pushes to a node drawn in slot `s` of window `w`, one tick at each slot of `ticks` (rising), each as
+    /// the selection runs it (`SimOwner::tick`): skipped once `counted` says it is counted, asked of the ledger
+    /// (`PushLedger::may_push`), and `outcome` of the slot recorded. At `restart` the genesis starts again: an empty ledger,
+    /// its read mark kept. Every tick offers the node once at most. The slots a push, a challenge or a hold went out in.
+    fn sim(w: u64, s: u64, spaced: bool, ticks: impl IntoIterator<Item = u64>, counted: impl Fn(u64) -> bool,
+           outcome: impl Fn(u64) -> crate::rpc::SendOutcome, restart: Option<u64>) -> Vec<u64> {
+        let schedule = if spaced { (0, 0) } else { (0, u64::MAX) };
+        let mut o = SimOwner::new(0, schedule);
+        let nodes = ["light_mobile_sim".to_string()];
+        let mut sent = Vec::new();
+        for t in ticks {
+            if restart == Some(t) { o.restart(); }
+            let (c, out) = (counted(t), outcome(t));
+            let offered = o.tick(w * 240 + t, 0, [schedule; 5], &nodes, &|_, b| if b as u64 == s { vec![0] } else { vec![] },
+                                 &|_| c, &|_| out);
+            assert!(offered.len() <= 1, "slot {t}: the node offered {} times in one tick", offered.len());
+            if !offered.is_empty() && out != crate::rpc::SendOutcome::Unsent { sent.push(t); }
+        }
+        sent
+    }
+
+    /// Owner decision of 06.10: the first push in the drawn slot, a repeat 15 slots later and a last one 30 slots
+    /// later, each only while the node is not counted; the retry round the same from 60 slots after the drawn slot; one
+    /// push a due point, MAX_PUSHES_PER_EPOCH at most, and none once the node is counted.
+    #[test]
+    fn a_round_is_three_pushes_fifteen_slots_apart_and_the_retry_round_an_hour_on() {
+        use crate::rpc::SendOutcome::{Accepted, Failed, Gone, Polled};
+        let w = 4_100u64;
+        for s in [0u64, 1, 47, 89, 90, 120, 137] {
+            let never = sim(w, s, true, 0..240, |_| false, |_| Accepted, None);
+            assert_eq!(never, vec![s, s + 15, s + 30, s + 60, s + 75, s + 90], "slot {s}");
+            assert_eq!(never.len(), crate::rpc::MAX_PUSHES_PER_EPOCH as usize);
+            for round in [&never[..3], &never[3..]] {
+                assert!(round.windows(2).all(|p| p[1] - p[0] == crate::rpc::ROUND_SPACING_SLOTS), "slot {s}: {round:?}");
+            }
+            assert!(*never.last().unwrap() <= 229);
+            // A push that failed at the provider, or found the token gone, or a challenge left for a poll, went out too:
+            // its due point is spent, and the next one tries again.
+            for o in [Failed, Gone, Polled] {
+                assert_eq!(sim(w, s, true, 0..240, |_| false, |_| o, None), never, "slot {s}: {o:?}");
+            }
+            // Counted after any push: nothing more in the epoch, of the round or of the retry round.
+            for k in 1..=never.len() {
+                let answered = never[k - 1] + 1;
+                assert_eq!(sim(w, s, true, 0..240, |t| t >= answered, |_| Accepted, None), never[..k].to_vec(), "slot {s}, k {k}");
+            }
+            // Counted before the drawn slot (the app's own answer): no push at all.
+            assert!(sim(w, s, true, 0..240, |t| t + 1 >= s, |_| Accepted, None).is_empty(), "slot {s}");
+        }
+        // The ledger alone holds the line too: once a node answered here (its entry gone) no repeat is due to it, and
+        // a node never offered here gets no repeat; the round's first push and the retry round's are due to anyone.
+        let l = crate::rpc::PushLedger::new();
+        let base = w * 240 + 40;
+        assert!(l.may_push("light_a", base, &[crate::rpc::Due::spaced(base, 0)], || 0));
+        assert!(!l.may_push("light_a", base + 15, &[crate::rpc::Due::spaced(base + 15, 15)], || 0), "never offered here");
+        l.record("light_a", base, Accepted, 1);
+        assert!(!l.may_push("light_a", base + 1, &[crate::rpc::Due::spaced(base, 0)], || 0), "one push a due point");
+        assert!(l.may_push("light_a", base + 15, &[crate::rpc::Due::spaced(base + 15, 15)], || 0));
+        l.answered("light_a");
+        assert!(!l.may_push("light_a", base + 15, &[crate::rpc::Due::spaced(base + 15, 15)], || 0), "answered here");
+        // A round begun before this genesis held the shard's records (a restart, a takeover): its repeat is due to a
+        // node it has no record of; a round begun after, not.
+        assert!(l.may_push("light_b", base + 15, &[crate::rpc::Due::spaced(base + 15, 15)], || base + 1), "held since after its round began");
+        assert!(!l.may_push("light_b", base + 15, &[crate::rpc::Due::spaced(base + 15, 15)], || base), "held since its round began");
+        // The selection skips a counted node before anything is read, and the pinger checks again right before it sends.
+        let src = include_str!("propagation.rs");
+        let sel = &src[src.find("pub(crate) fn get_light_nodes_to_ping(&self, tip: u64)").unwrap()..];
+        let sel = &sel[..sel.find("fn maybe_pull_push_channel").unwrap()];
+        let ledger = sel.find("crate::rpc::PUSH_LEDGER.may_push(id, now_slot, &r.dues, || held_from(id))").expect("the ledger in RAM");
+        let elig = sel.find("let elig = self.epoch_light_eligible.read();").expect("the eligibility lock");
+        assert!(ledger < elig, "the ledger is read before the eligibility lock is taken");
+        assert!(elig < sel.find("if this_epoch(node_id) { continue; }").unwrap());
+        assert!(sel.find("if this_epoch(node_id) { continue; }").unwrap() < sel.find("crate::rpc::push_reach_at(").unwrap());
+        assert!(sel.contains("spaced_rounds_in(current_window)"));
+        // The registry's lock is not held while the ledger is read: dropped before, taken again after.
+        let regained = sel.rfind("let registry = self.light_node_registry.read();").unwrap();
+        let released = sel[..ledger].rfind("drop(registry);").expect("released before the ledger");
+        assert!(!sel[released..ledger].contains("light_node_registry") && ledger < regained && regained < elig);
+        // No writer of the registry waits on the slot index: a full queue only marks it stale.
+        let queue = &src[src.find("fn queue_for_ping_index(&self, id: String)").unwrap()..];
+        let queue = &queue[..queue.find("q.push(id);").unwrap()];
+        assert!(!queue.contains("light_ping_slot_cache") && queue.contains("SLOT_INDEX_STALE.store(true"));
+    }
+
+    /// A push that found no instant in its slot is tried in the next slots of its due point, and a tick a short stall
+    /// missed is caught up, but one push at most goes out for a due point, and none closer than MIN_PUSH_GAP_SLOTS to the
+    /// last: a push a catch-up made late meets the next due point when that one is nearer.
+    #[test]
+    fn a_shed_push_or_a_missed_tick_is_tried_again_within_its_due_point_once() {
+        use crate::rpc::SendOutcome::{Accepted, Unsent};
+        let (w, s) = (4_100u64, 40u64);
+        let all = |_: u64| false;
+        // Shed in the drawn slot: out in the next, and the repeat still 15 slots after the drawn slot.
+        assert_eq!(sim(w, s, true, 0..240, all, |t| if t == s { Unsent } else { Accepted }, None),
+                   vec![s + 1, s + 15, s + 30, s + 60, s + 75, s + 90]);
+        // The retry round's push shed twice goes out in the last slot of its grace.
+        assert_eq!(sim(w, s, true, 0..240, all, |t| if t == s + 60 || t == s + 61 { Unsent } else { Accepted }, None),
+                   vec![s, s + 15, s + 30, s + 62, s + 75, s + 90]);
+        // Shed in every slot of its grace: no push for that due point, and the next one tries (the node is held here).
+        assert_eq!(sim(w, s, true, 0..240, all, |t| if (s..=s + 2).contains(&t) { Unsent } else { Accepted }, None),
+                   vec![s + 15, s + 30, s + 60, s + 75, s + 90]);
+        // Shed at every slot: nothing goes out, ever (`not_sent`), and the node is still offered once a tick.
+        assert!(sim(w, s, true, 0..240, all, |_| Unsent, None).is_empty());
+        // A stall that missed the drawn slot's tick: the next tick sends it, and the repeat keeps its slot.
+        let ticks = |skip: std::ops::Range<u64>| (0..240u64).filter(move |t| !skip.contains(t));
+        assert_eq!(sim(w, s, true, ticks(s..s + 1), all, |_| Accepted, None), vec![s + 1, s + 15, s + 30, s + 60, s + 75, s + 90]);
+        assert_eq!(sim(w, s, true, ticks(s..s + 2), all, |_| Accepted, None), vec![s + 2, s + 15, s + 30, s + 60, s + 75, s + 90]);
+        // Caught up later than its grace: the push stands in for the repeat 15 slots after the drawn slot, which would
+        // otherwise follow it within MIN_PUSH_GAP_SLOTS.
+        assert_eq!(sim(w, s, true, ticks(s..s + 14), all, |_| Accepted, None), vec![s + 14, s + 30, s + 60, s + 75, s + 90]);
+        // One catch-up tick reaching the drawn slot's due point and the first repeat's, the first push already out: one
+        // push, for the repeat.
+        assert_eq!(sim(w, s, true, ticks(s + 1..s + 15), all, |_| Accepted, None), vec![s, s + 15, s + 30, s + 60, s + 75, s + 90]);
+        assert_eq!(sim(w, s, true, ticks(s + 3..s + 17), all, |_| Accepted, None), vec![s, s + 17, s + 30, s + 60, s + 75, s + 90]);
+        // Every pair of pushes at least MIN_PUSH_GAP_SLOTS apart, whatever stall of up to the catch-up bound.
+        for start in s..s + 95 {
+            for len in 1..=MAX_PING_CATCHUP_SLOTS {
+                let sent = sim(w, s, true, ticks(start..start + len), all, |_| Accepted, None);
+                assert!(sent.windows(2).all(|p| p[1] - p[0] >= crate::rpc::MIN_PUSH_GAP_SLOTS), "stall {start}+{len}: {sent:?}");
+                assert!(sent.len() <= crate::rpc::MAX_PUSHES_PER_EPOCH as usize);
+            }
+        }
+    }
+
+    /// A restart loses the ledger but keeps the slot it last read (`rpc::push_read_mark`): a first tick that joins it
+    /// sends no due point the run before read, and a repeat of a round begun before the restart is still due to the
+    /// node, whose record went with the restart (`ShardReads::held_from`); the retry round is read from the buckets an
+    /// hour back. A restart in any slot sends the node what an uninterrupted genesis sends, one push a due point; one
+    /// down past the catch-up bound loses only the due points of its stop.
+    #[test]
+    fn a_restart_sends_no_due_point_twice_and_keeps_the_round() {
+        use crate::rpc::SendOutcome::{Accepted, Unsent};
+        let (w, s) = (4_100u64, 30u64);
+        let never = |_: u64| false;
+        let all = sim(w, s, true, 0..240, never, |_| Accepted, None);
+        assert_eq!(all, vec![s, s + 15, s + 30, s + 60, s + 75, s + 90]);
+        for restart in 1..240 {
+            assert_eq!(sim(w, s, true, 0..240, never, |_| Accepted, Some(restart)), all, "restart at slot {restart}");
+        }
+        // Down for a while: a stop within the catch-up bound is caught up (a late push stands in for the next due point
+        // when that one is nearer); a longer one loses the due points it was down for, nothing else.
+        let down = |from: u64, len: u64| (0..240u64).filter(move |t| !(from..from + len).contains(t));
+        assert_eq!(sim(w, s, true, down(s + 10, 10), never, |_| Accepted, Some(s + 20)), vec![s, s + 20, s + 60, s + 75, s + 90]);
+        assert_eq!(sim(w, s, true, down(s + 5, 20), never, |_| Accepted, Some(s + 25)), vec![s, s + 30, s + 60, s + 75, s + 90]);
+        assert_eq!(sim(w, s, true, down(s + 62, 20), never, |_| Accepted, Some(s + 82)), vec![s, s + 15, s + 30, s + 60, s + 90]);
+        // A push shed in the slot before a restart loses the rest of its grace: never a duplicate, the round goes on.
+        assert_eq!(sim(w, s, true, 0..240, never, |t| if t == s { Unsent } else { Accepted }, Some(s + 1)),
+                   vec![s + 15, s + 30, s + 60, s + 75, s + 90]);
+        // Whatever the stop, one push a due point: never two closer than MIN_PUSH_GAP_SLOTS, six at most.
+        for from in 1..200u64 {
+            for len in [0u64, 1, 2, 5, 13, 15, 16, 30] {
+                let sent = sim(w, s, true, down(from, len), never, |_| Accepted, Some(from + len));
+                assert!(sent.windows(2).all(|p| p[1] - p[0] >= crate::rpc::MIN_PUSH_GAP_SLOTS), "stop {from}+{len}: {sent:?}");
+                assert!(sent.len() <= crate::rpc::MAX_PUSHES_PER_EPOCH as usize, "stop {from}+{len}: {sent:?}");
+            }
+        }
+        // The mark of an earlier window, or of a slot ahead of the tip (a rollback), is not joined.
+        let mut o = SimOwner::new(0, (0, 0));
+        let nodes = ["light_mobile_sim".to_string()];
+        o.mark = Some((w * 240 - 1, 0));
+        let b = |_: u64, bucket: usize| if bucket == 0 { vec![0] } else { vec![] };
+        assert_eq!(o.tick(w * 240, 0, [(0, 0); 5], &nodes, &b, &|_| false, &|_| Accepted), vec![0]);
+        assert_eq!(o.reads.done, None);
+        o.restart();
+        o.mark = Some((w * 240 + 9, 0));
+        o.tick(w * 240 + 5, 0, [(0, 0); 5], &nodes, &b, &|_| false, &|_| Accepted);
+        assert_eq!(o.reads.done, None, "a mark ahead of the tip");
+        // The selection keeps the mark every tick and joins it on its first tick only.
+        let src = include_str!("propagation.rs");
+        assert!(src.contains("crate::rpc::keep_push_read_mark(st, now_slot, shard_reads.read_from[our_genesis_idx]);"));
+        assert!(src.contains("if first_tick { reads_state.done = resumed.map(|(l, _)| l); }"));
+    }
+
+    /// A node the dormant rule holds is read again only at the round's first push and the retry round's: a hold closes
+    /// its due point's grace like a push, and a node only held, woken or refused here is offered no repeat. Twice an
+    /// epoch, where with the rounds a slot apart it was six times. Once its shard's facts turn neutral it is pushed at
+    /// the next of those two, and its repeats follow.
+    #[test]
+    fn a_dormant_hold_closes_its_due_point_and_offers_no_repeat() {
+        use crate::rpc::SendOutcome::{Accepted, Dormant};
+        let (w, s) = (4_100u64, 40u64);
+        let never = |_: u64| false;
+        assert_eq!(sim(w, s, true, 0..240, never, |_| Dormant, None), vec![s, s + 60]);
+        assert_eq!(sim(w, s, true, 0..240, never, |t| if t < s + 10 { Dormant } else { Accepted }, None),
+                   vec![s, s + 60, s + 75, s + 90]);
+        // Before the spaced rounds each slot of a round is a due point of its own: held in each, as before.
+        assert_eq!(sim(w, s, false, 0..240, never, |_| Dormant, None), vec![s, s + 1, s + 2, s + 60, s + 61, s + 62]);
+        // On the ledger: a hold closes its due point and offers no repeat; a woken or refused node gets its first push
+        // and no repeat until one went out here.
+        let l = crate::rpc::PushLedger::new();
+        let d = w * 240 + s;
+        l.record("light_held", d, Dormant, 1);
+        for g in 1..=crate::rpc::DUE_GRACE_SLOTS {
+            assert!(!l.may_push("light_held", d + g, &[crate::rpc::Due::spaced(d, 0)], || 0), "grace slot {g}");
+        }
+        assert!(!l.may_push("light_held", d + 15, &[crate::rpc::Due::spaced(d + 15, 15)], || 0));
+        assert!(!l.may_push("light_held", d + 16, &[crate::rpc::Due::spaced(d + 15, 15)], || 0));
+        assert!(l.may_push("light_held", d + 60, &[crate::rpc::Due::spaced(d + 60, 0)], || 0), "the retry round's first push");
+        l.woke("light_woken", d - 5, false, 1);
+        l.refused("light_refused", w, "superseded", 1);
+        for n in ["light_woken", "light_refused"] {
+            assert!(!l.may_push(n, d + 15, &[crate::rpc::Due::spaced(d + 15, 15)], || 0), "{n}: no repeat");
+            assert!(l.may_push(n, d, &[crate::rpc::Due::spaced(d, 0)], || 0), "{n}: its first push");
+        }
+    }
+
+    /// The nodes of a test shard in window `w`, bucketed under each draw an owner may use there.
+    struct SimShard {
+        nodes: Vec<String>,
+        by_draw: Vec<(u64, Vec<Vec<usize>>)>,
+    }
+
+    impl SimShard {
+        fn new(w: u64, n: usize) -> Self {
+            let nodes: Vec<String> = (0..n).map(|i| format!("light_mix_{i:05}")).collect();
+            let draws = [ping_draw_slots(w, u64::MAX, u64::MAX), crate::rpc::UNSPACED_FIRST_PUSH_SLOTS, crate::rpc::FIRST_PUSH_SLOTS];
+            let by_draw = draws.iter().map(|d| {
+                let mut b = vec![Vec::new(); 240];
+                for (i, id) in nodes.iter().enumerate() { b[SimplifiedP2P::slot_in_draw(id, w, *d) as usize].push(i); }
+                (*d, b)
+            }).collect();
+            SimShard { nodes, by_draw }
+        }
+
+        fn bucket(&self, draw: u64, b: usize) -> Vec<usize> {
+            self.by_draw.iter().find(|(d, _)| *d == draw).map(|(_, x)| x[b].clone()).unwrap_or_default()
+        }
+
+        /// The nodes whose slot under `draw` is in `slots`.
+        fn drawn_in(&self, draw: u64, slots: std::ops::Range<u64>) -> Vec<usize> {
+            slots.flat_map(|t| self.bucket(draw, t as usize)).collect()
+        }
+    }
+
+    /// A genesis pushing the test shard: one of the release before this one (it reads the grace slots, pushes each node
+    /// drawn there over the bounded range and keeps no record), or of this one.
+    enum Pusher {
+        Earlier(Option<u64>),
+        This(SimOwner),
+    }
+
+    /// What an owner does in a slot: ticks, starts again first, or starts again on this release with a schedule.
+    #[derive(Clone, Copy)]
+    enum Step {
+        Tick,
+        Restart,
+        UpgradeTo((u64, u64)),
+    }
+
+    /// Shard 0 over window `w`, nobody answering: owner o (genesis o) ticks in the slots `plan(o, t)` names, knowing the
+    /// others' schedules as `known(o, t)` says. How many pushes each node got.
+    fn run_shard(w: u64, shard: &SimShard, pushers: &mut [Pusher], plan: &dyn Fn(usize, u64) -> Option<Step>,
+                 known: &dyn Fn(usize, u64) -> [(u64, u64); 5]) -> Vec<usize> {
+        let mut got = vec![0usize; shard.nodes.len()];
+        let bounded = ping_draw_slots(w, u64::MAX, u64::MAX);
+        for t in 0..240u64 {
+            let now = w * 240 + t;
+            for o in 0..pushers.len() {
+                let Some(step) = plan(o, t) else { continue; };
+                match step {
+                    Step::Tick => {}
+                    Step::Restart => match &mut pushers[o] {
+                        Pusher::Earlier(last) => *last = None,
+                        Pusher::This(p) => p.restart(),
+                    },
+                    Step::UpgradeTo(s) => pushers[o] = Pusher::This(SimOwner::new(o, s)),
+                }
+                let offered = match &mut pushers[o] {
+                    Pusher::Earlier(last) => {
+                        let (buckets, _) = ping_buckets_to_read(*last, now);
+                        *last = Some(now);
+                        buckets.into_iter().flat_map(|b| shard.bucket(bounded, b)).collect::<Vec<_>>()
+                    }
+                    Pusher::This(p) => p.tick(now, 0, known(o, t), &shard.nodes, &|d, b| shard.bucket(d, b),
+                                              &|_| false, &|_| crate::rpc::SendOutcome::Accepted),
+                };
+                for i in offered { got[i] += 1; }
+            }
+        }
+        got
+    }
+
+    fn unpushed(got: &[usize]) -> Vec<usize> {
+        got.iter().enumerate().filter(|(_, n)| **n == 0).map(|(i, _)| i).collect()
+    }
+
+    /// The spaced rounds and their draw start at a window boundary this genesis stores at its first ping on a release
+    /// with them, from a tip the network stands behind: the window it lands in keeps the early draw and the rounds a slot
+    /// apart to its end, a restart later in that window keeps them too (drawn again, a node whose new slot had passed
+    /// while its old one had not would get no push), and every window from the stored one on is spaced, across any
+    /// restart.
+    #[test]
+    fn the_spaced_rounds_start_at_a_kept_window_boundary_never_at_a_restart() {
+        use crate::rpc::{first_push_draw_from, spaced_rounds_from, FIRST_PUSH_SLOTS, UNSPACED_FIRST_PUSH_SLOTS};
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let s = crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage");
+        assert_eq!(first_push_draw_from(&s, Some(300)), Some(301), "the early draw armed long ago");
+        // Behind the network nothing is stored. The release lands in window 500, mid-window: 500 runs the old schedule
+        // to its end.
+        assert_eq!(spaced_rounds_from(&s, None), None, "behind the network");
+        let (early, spaced) = (first_push_draw_from(&s, Some(500)).unwrap(), spaced_rounds_from(&s, Some(500)).unwrap());
+        assert_eq!((early, spaced), (301, 501));
+        assert_eq!(ping_draw_slots(500, early, spaced), UNSPACED_FIRST_PUSH_SLOTS, "window 500 keeps the draw it began with");
+        // A restart later in window 500 reads the stored window, behind the network or not: still the old draw, and the
+        // old reads.
+        assert_eq!(spaced_rounds_from(&s, None), Some(501));
+        let again = spaced_rounds_from(&s, Some(500)).unwrap();
+        assert_eq!(again, 501);
+        assert_eq!(ping_draw_slots(500, first_push_draw_from(&s, Some(500)).unwrap(), again), UNSPACED_FIRST_PUSH_SLOTS);
+        let now = 500 * 240 + 120;
+        assert_eq!(push_reads(Some(now - 1), now, 500 >= again, None).0.iter().map(|r| r.bucket).collect::<Vec<_>>(),
+                   push_buckets_to_read(Some(now - 1), now).0);
+        // From the boundary on the spaced draw and rounds, also after a restart in a later window.
+        assert_eq!(ping_draw_slots(501, early, spaced), FIRST_PUSH_SLOTS);
+        assert_eq!(spaced_rounds_from(&s, Some(507)), Some(501), "a restart in a later window keeps it");
+        assert_eq!(ping_draw_slots(507, early, spaced_rounds_from(&s, Some(507)).unwrap()), FIRST_PUSH_SLOTS);
+        // A genesis that never pinged: both start at the window after its first ping, the bounded draw until then.
+        let fresh_dir = tempfile::TempDir::new().expect("tempdir");
+        let fresh = crate::storage::Storage::new(fresh_dir.path().to_str().unwrap()).expect("storage");
+        let (e, sp) = (first_push_draw_from(&fresh, Some(800)).unwrap(), spaced_rounds_from(&fresh, Some(800)).unwrap());
+        assert_eq!((e, sp), (801, 801));
+        assert_eq!(ping_draw_slots(800, e, sp), ping_draw_slots(800, u64::MAX, u64::MAX), "the bounded draw");
+        assert_eq!(ping_draw_slots(801, e, sp), FIRST_PUSH_SLOTS);
+        // The rounds' shape follows the same window: the selection asks for the window it reads.
+        let src = include_str!("propagation.rs");
+        assert!(src.contains("spaced_rounds_in(current_window), reads_state.done);"));
+        assert!(src.contains("pub(crate) fn spaced_rounds_in(window: u64) -> bool {
+    window >= SPACED_ROUND_WINDOW.load("));
+    }
+
+    /// Mixed versions in the epochs of the roll from the release running before (`SPACED_ROUND_WINDOW`): it draws over
+    /// the bounded range, reads only the grace slots, sends no retry round and stores no window. A genesis upgraded in
+    /// window W stores W + 1 for both its windows, so in W it draws every node into the slot the release before does,
+    /// reads those slots too and adds a retry round: no node is pushed less. The primary and its backup are upgraded
+    /// in W, the primary's restart long enough for a cover; every node of the shard gets a push in W and in W + 1.
+    /// When the roll straddles W + 1, the backup spaced there and the primary still on the bounded draw until its own
+    /// restart, a cover between them still leaves no node unpushed.
+    #[test]
+    fn the_roll_from_the_release_before_drops_no_node() {
+        let w = 4_200u64;
+        let (fresh, upgraded) = ((u64::MAX, u64::MAX), (w + 1, w + 1));
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let s = crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage");
+        assert_eq!((crate::rpc::first_push_draw_from(&s, Some(w)), crate::rpc::spaced_rounds_from(&s, Some(w))), (Some(w + 1), Some(w + 1)),
+                   "upgraded in W from storage the release before never wrote");
+        // In W the same draw as the release before, and its grace reads among the reads.
+        assert_eq!(ping_draw_slots(w, upgraded.0, upgraded.1), ping_draw_slots(w, fresh.0, fresh.1));
+        for t in 0..240u64 {
+            let (now, last) = (w * 240 + t, t.checked_sub(1).map(|p| w * 240 + p));
+            let ours: Vec<usize> = push_reads(last, now, w >= upgraded.1, None).0.iter().map(|r| r.bucket).collect();
+            let before = ping_buckets_to_read(last, now).0;
+            assert_eq!(ours[..before.len()].to_vec(), before, "slot {t}: the grace reads, then the retry round's");
+        }
+        // W: the backup (1) was upgraded early in W, while it covered nothing; the primary (0) at slot 150, down
+        // fifteen slots: the backup covers from 160 until three ticks after the primary is back at 165. W + 1: both
+        // spaced, the primary pushing alone.
+        let shard_w = SimShard::new(w, 3_000);
+        let mut pushers = [Pusher::Earlier(None), Pusher::This(SimOwner::new(1, upgraded))];
+        let plan = |o: usize, t: u64| -> Option<Step> {
+            match (o, t) {
+                (0, 150..=164) => None,
+                (0, 165) => Some(Step::UpgradeTo(upgraded)),
+                (0, _) => Some(Step::Tick),
+                (1, 160..=167) => Some(Step::Tick),
+                _ => None,
+            }
+        };
+        // The backup hears the primary's schedule from its first tick on this release; the primary has the backup's.
+        let known = |o: usize, t: u64| -> [(u64, u64); 5] {
+            let mut k = [fresh; 5];
+            if o == 1 && t >= 166 { k[0] = upgraded; }
+            if o == 0 { k[1] = upgraded; }
+            k
+        };
+        let got = run_shard(w, &shard_w, &mut pushers, &plan, &known);
+        assert_eq!(unpushed(&got), Vec::<usize>::new(), "epoch W");
+        let shard_next = SimShard::new(w + 1, 3_000);
+        let both = |_: usize, _: u64| [upgraded; 5];
+        let got = run_shard(w + 1, &shard_next, &mut pushers, &|o, _| (o == 0).then_some(Step::Tick), &both);
+        assert_eq!(unpushed(&got), Vec::<usize>::new(), "epoch W + 1");
+        // The roll straddles W + 1: the backup spaced there, the primary on the release before until its restart at 100,
+        // down fifteen slots and back on this release (its windows W + 2), the backup covering from 110 to 118.
+        let late = (w + 2, w + 2);
+        let mut pushers = [Pusher::Earlier(None), Pusher::This(SimOwner::new(1, upgraded))];
+        let plan = |o: usize, t: u64| -> Option<Step> {
+            match (o, t) {
+                (0, 115) => Some(Step::UpgradeTo(late)),
+                (0, 100..=114) => None,
+                (0, _) => Some(Step::Tick),
+                (1, 110..=117) => Some(Step::Tick),
+                _ => None,
+            }
+        };
+        let known = |o: usize, t: u64| -> [(u64, u64); 5] {
+            let mut k = [fresh; 5];
+            if o == 0 { k[1] = upgraded; }
+            if o == 1 && t >= 116 { k[0] = late; }
+            k
+        };
+        let got = run_shard(w + 1, &shard_next, &mut pushers, &plan, &known);
+        assert_eq!(unpushed(&got), Vec::<usize>::new(), "epoch W + 1, the roll straddling it");
+    }
+
+    /// A cover inside an epoch of the roll: a primary on the draw before the switch goes silent inside the epoch and its
+    /// backup, on the spaced draw, covers. The backup reads the shard under the primary's draw too (`foreign_draws`, the
+    /// schedule from the primary's ticks, the bounded draw for one of the release before), so every node still gets its
+    /// first push or its retry round; without that a seventh to a fifth of the shard got nothing. A restart late in the epoch
+    /// (silent at 180, covered from 190, back at 200) leaves unpushed only nodes a single shared draw leaves unpushed
+    /// too: those drawn into the ten silent slots with no room left for a retry round.
+    #[test]
+    fn a_cover_between_owners_on_different_draws_drops_no_node() {
+        let w = 4_300u64;
+        let shard = SimShard::new(w, 4_000);
+        let fresh = (u64::MAX, u64::MAX);
+        let spaced = (w, w);
+        // The primary silent from slot 100 to the epoch's end, the backup covering from 110.
+        let silent_at_100 = |o: usize, t: u64| match o { 0 if t < 100 => Some(Step::Tick), 1 if t >= 110 => Some(Step::Tick), _ => None };
+        for (old, earlier) in [((w + 1, w + 1), false), ((w - 40, w + 1), false), (fresh, true)] {
+            let known = |_: usize, _: u64| [old, spaced, fresh, fresh, fresh];
+            let run = |foreign: bool| {
+                let primary = if earlier { Pusher::Earlier(None) } else { Pusher::This(SimOwner::new(0, old)) };
+                let mut backup = SimOwner::new(1, spaced);
+                backup.foreign = foreign;
+                run_shard(w, &shard, &mut [primary, Pusher::This(backup)], &silent_at_100, &known)
+            };
+            assert_eq!(unpushed(&run(true)), Vec::<usize>::new(), "primary {old:?}");
+            let lost = unpushed(&run(false)).len();
+            assert!(lost * 20 > shard.nodes.len(), "primary {old:?}: read under its own draw alone the cover left {lost} unpushed");
+            if earlier { continue; }
+            // The primary back at 130 after a restart longer than the catch-up bound, the backup handing back at 133.
+            let back_at_130 = |o: usize, t: u64| match (o, t) {
+                (0, 130) => Some(Step::Restart),
+                (0, 100..=129) => None,
+                (0, _) => Some(Step::Tick),
+                (1, 110..=132) => Some(Step::Tick),
+                _ => None,
+            };
+            let got = run_shard(w, &shard, &mut [Pusher::This(SimOwner::new(0, old)), Pusher::This(SimOwner::new(1, spaced))],
+                                &back_at_130, &known);
+            assert_eq!(unpushed(&got), Vec::<usize>::new(), "primary {old:?} back at 130");
+        }
+        // A restart late in the epoch: the backup spaced, the primary on the release before, restarted for its upgrade
+        // at 180 and back at 200 on this release (its windows W + 1); the backup covers from 190 until three ticks after
+        // 200. The backup never hears a schedule from the primary of the release before (the bounded draw); the primary
+        // hears the backup's from its second tick on.
+        let plan = |o: usize, t: u64| match (o, t) {
+            (0, 200) => Some(Step::UpgradeTo((w + 1, w + 1))),
+            (0, 180..=199) => None,
+            (0, _) => Some(Step::Tick),
+            (1, 190..=202) => Some(Step::Tick),
+            _ => None,
+        };
+        let run = |backup: (u64, u64), foreign: bool| {
+            let mut b = SimOwner::new(1, backup);
+            b.foreign = foreign;
+            let known = |o: usize, t: u64| if o == 0 && t > 200 { [fresh, backup, fresh, fresh, fresh] } else { [fresh; 5] };
+            run_shard(w, &shard, &mut [Pusher::Earlier(None), Pusher::This(b)], &plan, &known)
+        };
+        let mixed = unpushed(&run(spaced, true));
+        let same = unpushed(&run((w + 1, w + 1), true));
+        let bounded = ping_draw_slots(w, u64::MAX, u64::MAX);
+        assert!(!same.is_empty() && same.iter().all(|i| shard.drawn_in(bounded, 180..190).contains(i)), "the silence alone");
+        assert!(mixed.iter().all(|i| same.contains(i)), "no node a single draw reaches is left: {} of {}", mixed.len(), same.len());
+        assert!(unpushed(&run(spaced, false)).len() > mixed.len(), "the foreign draw is what reaches them");
+    }
+
+    /// A hand-back between owners armed for the spaced draw in different epochs, so they draw the live epoch differently:
+    /// the backup covered the shard from before the epoch, the primary takes it back inside it. The primary starts
+    /// pushing inside the epoch and reads the shard under the backup's draw too, so every node gets its first push or its
+    /// retry round, whichever of the two is on the spaced draw and wherever in the epoch the hand-back falls.
+    #[test]
+    fn a_hand_back_between_owners_armed_in_different_epochs_drops_no_node() {
+        let w = 4_400u64;
+        let shard = SimShard::new(w, 4_000);
+        let (spaced, bounded) = ((w, w), (w + 1, w + 1));
+        for (primary, backup) in [(spaced, bounded), (bounded, spaced)] {
+            for back in [30u64, 120, 200] {
+                let plan = |o: usize, t: u64| match o { 0 if t >= back => Some(Step::Tick), 1 if t < back + 3 => Some(Step::Tick), _ => None };
+                let known = |_: usize, _: u64| [primary, backup, (u64::MAX, u64::MAX), (u64::MAX, u64::MAX), (u64::MAX, u64::MAX)];
+                let run = |foreign: bool| {
+                    let mut p = SimOwner::new(0, primary);
+                    p.foreign = foreign;
+                    run_shard(w, &shard, &mut [Pusher::This(p), Pusher::This(SimOwner::new(1, backup))], &plan, &known)
+                };
+                assert_eq!(unpushed(&run(true)), Vec::<usize>::new(), "primary {primary:?}, back at {back}");
+                if back == 120 {
+                    assert!(!unpushed(&run(false)).is_empty(), "primary {primary:?}: its own draw alone leaves nodes out");
+                }
+            }
+        }
+    }
+
+    /// The foreign draws: only an owner of the shard whose draw differs, each draw once; the index of them follows the
+    /// slot index by position, is built again when the index or the draws asked change, extended with the ids the index
+    /// gained, and empty when no draw is asked.
+    #[test]
+    fn the_foreign_index_follows_the_slot_index() {
+        let w = 4_500u64;
+        let (fresh, spaced, early) = ((u64::MAX, u64::MAX), (w, w), (w - 3, w + 1));
+        let all_spaced = [spaced; 5];
+        assert!(foreign_draws(w, 0, 0, &all_spaced).is_empty(), "the owners agree");
+        let mut s = all_spaced;
+        s[3] = fresh;
+        assert!(foreign_draws(w, 0, 0, &s).is_empty(), "genesis 3 owns no part of shard 0");
+        assert_eq!(foreign_draws(w, 0, 3, &s), vec![ping_draw_slots(w, u64::MAX, u64::MAX)]);
+        s[4] = early;
+        assert_eq!(foreign_draws(w, 2, 2, &s), vec![ping_draw_slots(w, u64::MAX, u64::MAX), crate::rpc::UNSPACED_FIRST_PUSH_SLOTS],
+                   "each other owner's draw once, in owner order");
+        assert!(foreign_draws(w, 0, 0, &[fresh; 5]).is_empty());
+        // The index.
+        let ids: Vec<String> = (0..600).map(|i| format!("light_fx_{i:04}")).collect();
+        let mut buckets: Vec<Vec<String>> = vec![Vec::new(); 240];
+        for id in &ids[..400] { buckets[SimplifiedP2P::slot_in_draw(id, w, crate::rpc::FIRST_PUSH_SLOTS) as usize].push(id.clone()); }
+        let shard0 = |id: &str| crate::node::light_shard_of(id) == 0;
+        let bounded = ping_draw_slots(w, u64::MAX, u64::MAX);
+        let mut f = ForeignIndex::new();
+        let check = |f: &ForeignIndex, buckets: &[Vec<String>], n: usize| {
+            for b in 0..240 {
+                let mut got: Vec<&String> = f.ids(buckets, b).collect();
+                got.sort();
+                let mut want: Vec<&String> = ids[..n].iter().filter(|id| shard0(id) && SimplifiedP2P::slot_in_draw(id, w, bounded) == b as u64).collect();
+                want.sort();
+                assert_eq!(got, want, "bucket {b}");
+            }
+        };
+        f.sync(&buckets, 7, w, &[(bounded, 1)]);
+        check(&f, &buckets, 400);
+        for id in &ids[400..] { buckets[SimplifiedP2P::slot_in_draw(id, w, crate::rpc::FIRST_PUSH_SLOTS) as usize].push(id.clone()); }
+        f.sync(&buckets, 7, w, &[(bounded, 1)]);
+        check(&f, &buckets, 600);
+        // A new build of the slot index (positions changed): built again.
+        buckets.iter_mut().for_each(|b| b.reverse());
+        f.sync(&buckets, 8, w, &[(bounded, 1)]);
+        check(&f, &buckets, 600);
+        f.sync(&buckets, 8, w, &[]);
+        assert_eq!((0..240).map(|b| f.ids(&buckets, b).count()).sum::<usize>(), 0, "nothing asked, nothing held");
+        // The selection syncs it under the slot index's lock and offers a node read under two draws once.
+        let src = include_str!("propagation.rs");
+        assert!(src.contains("foreign.sync(&cache.1, SLOT_INDEX_BUILDS.load(std::sync::atomic::Ordering::Relaxed), current_window, &wanted);"));
+        assert!(src.contains("due.retain(|id| seen.insert(*id));"));
+    }
+
+    /// What a genesis read of each shard: kept while its ticks join, started again by a gap, a new cover or a restart,
+    /// and for its own shard across a restart that joins the run before.
+    #[test]
+    fn shard_reads_follow_joined_ticks_covers_and_restarts() {
+        let ws = 4_600u64 * 240;
+        let mut r = ShardReads::new();
+        r.advance(1 << 2, 2, ws, false, None);
+        assert_eq!((r.read_from[2], r.held_from[2]), (ws, ws), "a first tick at the epoch's start");
+        r.advance(1 << 2, 2, ws + 40, true, None);
+        assert_eq!(r.read_from[2], ws, "joined: kept");
+        r.advance(1 << 2 | 1 << 1, 2, ws + 50, true, None);
+        assert_eq!((r.read_from[1], r.held_from[1], r.read_from[2]), (ws + 50, ws + 50, ws), "a cover starts at its tick");
+        r.advance(1 << 2 | 1 << 1, 2, ws + 70, false, None);
+        assert_eq!((r.read_from[1], r.read_from[2]), (ws + 70, ws + 70), "a gap starts both again");
+        let mut after = ShardReads::new();
+        after.advance(1 << 2, 2, ws + 81, true, Some(ws));
+        assert_eq!((after.read_from[2], after.held_from[2]), (ws, ws + 81), "a restart joining the run before: reads kept, records not");
+    }
 }
 
 #[cfg(test)]
@@ -3355,5 +4774,32 @@ mod tests_genesis_peer_ip {
         assert_eq!(SimplifiedP2P::genesis_peer_ip("super_node_12"), None);
         assert_eq!(SimplifiedP2P::genesis_peer_ip("genesis_node_0001"), None);
         assert_eq!(SimplifiedP2P::genesis_peer_ip("genesis_node_"), None);
+    }
+}
+
+#[cfg(test)]
+mod light_registration_gossip_tests {
+    use super::*;
+
+    /// NB-2: a UnifiedPush endpoint is a push capability, and registration gossip reaches arbitrary peers for
+    /// three hops while no receiver reads it. Neither the origin nor a forward carries it.
+    #[test]
+    fn a_registration_gossip_carries_no_push_endpoint() {
+        let r = LightNodeRegistrationData {
+            node_id: "light_mobile_nb2".to_string(), wallet_address: "w".to_string(), device_token_hash: String::new(),
+            quantum_pubkey: "k".to_string(), registered_at: 1, signature: String::new(), push_type: PushType::UnifiedPush,
+            unified_push_endpoint: Some("https://ntfy.sh/upXYZ".to_string()), last_seen: 1, consecutive_failures: 0,
+            is_active: true, ping_pubkey: String::new(), ping_delegation_cert: String::new(),
+        };
+        match SimplifiedP2P::light_registration_gossip(r) {
+            NetworkMessage::LightNodeRegistration { unified_push_endpoint, push_type, .. } => {
+                assert_eq!(unified_push_endpoint, None);
+                assert_eq!(push_type, PushType::UnifiedPush);
+            }
+            _ => panic!("not a registration"),
+        }
+        let peers = include_str!("peers.rs");
+        let fwd = &peers[peers.find("let _ = (device_token_hash, signature, unified_push_endpoint);").expect("the forward")..];
+        assert!(fwd[..fwd.find("gossip_to_random_peers(forward_msg, 3)").unwrap()].contains("unified_push_endpoint: None,"));
     }
 }

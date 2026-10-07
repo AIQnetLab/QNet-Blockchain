@@ -1,0 +1,276 @@
+/* Approval window layout (400 x 640 popup). Colors and fonts come from the shared tokens in popup.css,
+   which approve.html links; approve.js adds this sheet. Class names carry an ap- prefix so they never
+   collide with the popup's. Logical properties only, so right-to-left languages mirror the layout. */
+
+body.page-approve {
+  display: flex;
+  justify-content: center;
+}
+
+.page-approve #app {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: 100%;
+  max-width: 440px;
+  min-width: 0;
+  padding: 16px;
+}
+
+.ap-header {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.ap-kicker {
+  color: var(--qnet-primary);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.ap-title {
+  font-size: 18px;
+  font-weight: 700;
+}
+
+.ap-origin,
+.ap-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  padding: 12px;
+  background: var(--bg-card);
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius-lg);
+}
+
+.ap-origin {
+  border-color: var(--border-active);
+  background: var(--gradient-card);
+}
+
+.ap-origin-host {
+  font-size: 16px;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+  direction: ltr;
+  unicode-bidi: isolate;
+}
+
+.ap-label {
+  color: var(--text-muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.ap-mono {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+  direction: ltr;
+  unicode-bidi: isolate;
+}
+
+/* A whole address on one line, sized to its card as in the popup (popup.css, .account-address): 11.1 px in a 360 px
+   window, 12.6 px at 400 px; a shorter text (Loading, an error) wraps as any text does. */
+.ap-card {
+  container-type: inline-size;
+}
+
+.ap-address {
+  color: var(--text-primary);
+  font-size: clamp(10.5px, 100cqi / 27.2, 13px);
+  line-height: 1.5;
+}
+
+/* Left-to-right blocks start on the page's own side in a right-to-left page. */
+[dir='rtl'] .ap-origin-host,
+[dir='rtl'] .ap-mono {
+  text-align: right;
+}
+
+.ap-text {
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.ap-muted {
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.ap-strong {
+  font-weight: 700;
+}
+
+.ap-warning {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 10px;
+  color: var(--text-primary);
+  background: rgba(245, 158, 11, 0.12);
+  border: 1px solid var(--warning);
+  border-radius: var(--radius-md);
+}
+
+.ap-message {
+  max-height: 220px;
+  overflow: auto;
+  padding: 10px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius-md);
+}
+
+/* a contract call's input: hex (left to right, whole) and, when it reads as text, that text */
+.ap-args {
+  max-height: 140px;
+  overflow: auto;
+  padding: 8px 10px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-all;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius-md);
+}
+
+.ap-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+
+.ap-row-label {
+  color: var(--text-secondary);
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow-wrap: break-word;
+}
+
+.ap-row-value {
+  text-align: end;
+  unicode-bidi: plaintext;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.ap-check {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.ap-check input {
+  flex: 0 0 auto;
+  margin-top: 2px;
+  accent-color: var(--qnet-primary);
+}
+
+.ap-ok {
+  color: var(--success);
+}
+
+.ap-warn {
+  color: var(--warning);
+}
+
+.ap-error {
+  color: var(--error);
+}
+
+.ap-notice,
+.ap-status {
+  color: var(--warning);
+  font-size: 12px;
+  min-height: 1em;
+}
+
+.ap-queued {
+  color: var(--text-muted);
+  font-size: 11px;
+  text-align: center;
+}
+
+.ap-input {
+  width: 100%;
+  padding: 10px 12px;
+  color: var(--text-primary);
+  font: inherit;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius-md);
+}
+
+.ap-input:focus {
+  outline: none;
+  border-color: var(--border-active);
+}
+
+.ap-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.ap-btn {
+  flex: 1 1 0;
+  min-width: 120px;
+  padding: 11px 12px;
+  font: inherit;
+  font-weight: 600;
+  color: var(--text-primary);
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  cursor: pointer;
+}
+
+.ap-btn-primary {
+  background: var(--gradient-button);
+}
+
+.ap-btn-secondary {
+  background: transparent;
+  border-color: var(--border-primary);
+}
+
+.ap-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.ap-btn:focus-visible {
+  outline: 2px solid var(--qnet-primary);
+  outline-offset: 2px;
+}
+
+/* a note shown until its condition is met (the end of a message to sign: R2-ERP-05) */
+.ap-hidden {
+  display: none;
+}
+
+/* a random gap above the actions, drawn again with every view: where Confirm sits in the window is not known in
+   advance, whatever the window's place (R4-ERP-01) */
+.ap-shift-0 { height: 0; }
+.ap-shift-1 { height: 16px; }
+.ap-shift-2 { height: 32px; }
+.ap-shift-3 { height: 48px; }
+.ap-shift-4 { height: 64px; }
+.ap-shift-5 { height: 80px; }
+.ap-shift-6 { height: 96px; }

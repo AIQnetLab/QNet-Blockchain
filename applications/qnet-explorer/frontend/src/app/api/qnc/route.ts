@@ -4,8 +4,8 @@ import { fetchNode } from '@/lib/node-api';
 
 // ============================================================================
 // Native QNC overview: node /api/v1/richlist (top-N holders + total/circulating
-// supply). QNC is the native coin (no contract) — this is the coin's rich list,
-// the analog of a SOL/ETH holders view, not a QRC-20 token page.
+// supply). QNC is the native coin (no contract) — this is the native coin's
+// holders view, not a QRC-20 token page.
 // ============================================================================
 
 // nanoQNC (u64 base units, 9 decimals) → exact QNC decimal string (BigInt, >2^53 safe).

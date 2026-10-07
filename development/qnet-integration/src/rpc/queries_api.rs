@@ -25,43 +25,12 @@ pub(super) async fn handle_account_balance_with_proof(
     
     // Validate address parameter
     if address.len() > 64 {
-        return Ok(warp::reply::json(&json!({
-            "error": "Invalid address",
-            "message": "Address parameter too long (max 64 characters)"
-        })));
+        return Ok(warp::reply::json(&legacy_balance_proof_bad_address()));
     }
-    
+
     // Get balance with proof from state manager
     match blockchain.get_balance_with_proof(&address).await {
-        Ok(proof) => {
-            // Convert proof to JSON-friendly format
-            let proof_array: Vec<serde_json::Value> = proof.proof.iter()
-                .map(|(hash, is_right)| {
-                    json!({
-                        "sibling": hex::encode(hash),
-                        "is_right": is_right
-                    })
-                })
-                .collect();
-            
-            Ok(warp::reply::json(&json!({
-                "address": proof.address,
-                "balance": proof.balance,
-                "nonce": proof.nonce,
-                // Every leaf input, or the client cannot rebuild the hash it is verifying.
-                "heartbeat_epoch": proof.heartbeat_epoch,
-                "heartbeat_slots": proof.heartbeat_slots,
-                "heartbeat_final_epoch": proof.heartbeat_final_epoch,
-                "heartbeat_final_slots": proof.heartbeat_final_slots,
-                "last_claimed_epoch": proof.last_claimed_epoch,
-                "banned_at_height": proof.banned_at_height,
-                "is_node": proof.is_node,
-                "merkle_proof": proof_array,
-                "state_root": hex::encode(proof.state_root),
-                "block_height": proof.block_height,
-                "proof_valid": true
-            })))
-        }
+        Ok(proof) => Ok(warp::reply::json(&legacy_balance_proof_body(&proof))),
         Err(e) => {
             // Account not found - return empty balance with proof
             let msg = e.to_string();
@@ -74,18 +43,107 @@ pub(super) async fn handle_account_balance_with_proof(
             } else {
                 println!("[WARN][RPC] api_error endpoint=balance_proof address={} err={}", address, msg);
             }
-            Ok(warp::reply::json(&json!({
-                "address": address,
-                "balance": 0,
-                "nonce": 0,
-                "merkle_proof": [],
-                "state_root": "",
-                "block_height": 0,
-                "error": "account not found",
-                "proof_valid": false
-            })))
+            Ok(warp::reply::json(&legacy_balance_proof_missing(&address)))
         }
     }
+}
+
+// The legacy proof bodies, answered without `mb` byte for byte as old clients parse them. A golden
+// test pins each (certified_proofs.rs).
+
+pub(super) fn legacy_balance_proof_bad_address() -> serde_json::Value {
+    json!({
+        "error": "Invalid address",
+        "message": "Address parameter too long (max 64 characters)"
+    })
+}
+
+pub(super) fn legacy_balance_proof_body(proof: &qnet_state::BalanceProof) -> serde_json::Value {
+    // Convert proof to JSON-friendly format
+    let proof_array: Vec<serde_json::Value> = proof.proof.iter()
+        .map(|(hash, is_right)| {
+            json!({
+                "sibling": hex::encode(hash),
+                "is_right": is_right
+            })
+        })
+        .collect();
+    json!({
+        "address": proof.address,
+        "balance": proof.balance,
+        "nonce": proof.nonce,
+        // Every leaf input, or the client cannot rebuild the hash it is verifying.
+        "heartbeat_epoch": proof.heartbeat_epoch,
+        "heartbeat_slots": proof.heartbeat_slots,
+        "heartbeat_final_epoch": proof.heartbeat_final_epoch,
+        "heartbeat_final_slots": proof.heartbeat_final_slots,
+        "last_claimed_epoch": proof.last_claimed_epoch,
+        "banned_at_height": proof.banned_at_height,
+        "is_node": proof.is_node,
+        "merkle_proof": proof_array,
+        "state_root": hex::encode(proof.state_root),
+        "block_height": proof.block_height,
+        "proof_valid": true
+    })
+}
+
+pub(super) fn legacy_balance_proof_missing(address: &str) -> serde_json::Value {
+    json!({
+        "address": address,
+        "balance": 0,
+        "nonce": 0,
+        "merkle_proof": [],
+        "state_root": "",
+        "block_height": 0,
+        "error": "account not found",
+        "proof_valid": false
+    })
+}
+
+pub(super) fn legacy_token_proof_bad_parameter() -> serde_json::Value {
+    json!({ "error": "Invalid parameter", "proof_valid": false })
+}
+
+pub(super) fn legacy_token_proof_body(p: &qnet_state::TokenBalanceProof) -> serde_json::Value {
+    let hexvec = |v: &Vec<([u8; 32], bool)>| -> Vec<serde_json::Value> {
+        v.iter().map(|(h, r)| json!({ "sibling": hex::encode(h), "is_right": r })).collect()
+    };
+    json!({
+        "contract_address": p.contract_address,
+        "holder": p.holder,
+        // Level-2 (balance:{holder} -> storage_root)
+        "token_balance": p.token_balance,     // raw stored decimal string
+        "storage_proof": hexvec(&p.storage_proof),
+        "storage_root": hex::encode(p.storage_root),
+        // Level-1 (contract account leaf -> state_root): ALL leaf-determining fields
+        "account_balance": p.account_balance.to_string(),
+        "account_nonce": p.account_nonce,
+        "contract_code_hash": p.contract_code_hash,
+        "heartbeat_epoch": p.heartbeat_epoch,
+        "heartbeat_slots": p.heartbeat_slots,
+        "heartbeat_final_epoch": p.heartbeat_final_epoch,
+        "heartbeat_final_slots": p.heartbeat_final_slots,
+        // The leaf hashes last_claimed_epoch and banned_at_height; omitting either left the
+        // client unable to rebuild it.
+        "last_claimed_epoch": p.last_claimed_epoch,
+        "banned_at_height": p.banned_at_height,
+        "is_node": p.is_node,
+        "account_proof": hexvec(&p.account_proof),
+        // Anchors
+        "state_root": hex::encode(p.state_root),
+        "block_height": p.block_height,
+        "proof_valid": true
+    })
+}
+
+pub(super) fn legacy_token_proof_unprovable(contract: &str, holder: &str) -> serde_json::Value {
+    json!({
+        "contract_address": contract,
+        "holder": holder,
+        "token_balance": "0",
+        "error": "token balance not provable",
+        "proof_valid": false
+    })
 }
 
 /// V2: GET /api/v1/token/{contract}/{holder}/balance/proof
@@ -102,47 +160,13 @@ pub(super) async fn handle_token_balance_with_proof(
         return Ok(rate_limit_response);
     }
     if contract.len() > 64 || holder.len() > 64 {
-        return Ok(warp::reply::json(&json!({ "error": "Invalid parameter", "proof_valid": false })));
+        return Ok(warp::reply::json(&legacy_token_proof_bad_parameter()));
     }
-    let hexvec = |v: &Vec<([u8; 32], bool)>| -> Vec<serde_json::Value> {
-        v.iter().map(|(h, r)| json!({ "sibling": hex::encode(h), "is_right": r })).collect()
-    };
     match blockchain.get_token_balance_with_proof(&contract, &holder).await {
-        Ok(p) => Ok(warp::reply::json(&json!({
-            "contract_address": p.contract_address,
-            "holder": p.holder,
-            // Level-2 (balance:{holder} -> storage_root)
-            "token_balance": p.token_balance,     // raw stored decimal string
-            "storage_proof": hexvec(&p.storage_proof),
-            "storage_root": hex::encode(p.storage_root),
-            // Level-1 (contract account leaf -> state_root): ALL leaf-determining fields
-            "account_balance": p.account_balance.to_string(),
-            "account_nonce": p.account_nonce,
-            "contract_code_hash": p.contract_code_hash,
-            "heartbeat_epoch": p.heartbeat_epoch,
-            "heartbeat_slots": p.heartbeat_slots,
-            "heartbeat_final_epoch": p.heartbeat_final_epoch,
-            "heartbeat_final_slots": p.heartbeat_final_slots,
-            // The leaf hashes last_claimed_epoch and banned_at_height; omitting either left the
-            // client unable to rebuild it.
-            "last_claimed_epoch": p.last_claimed_epoch,
-            "banned_at_height": p.banned_at_height,
-            "is_node": p.is_node,
-            "account_proof": hexvec(&p.account_proof),
-            // Anchors
-            "state_root": hex::encode(p.state_root),
-            "block_height": p.block_height,
-            "proof_valid": true
-        }))),
+        Ok(p) => Ok(warp::reply::json(&legacy_token_proof_body(&p))),
         Err(e) => {
             println!("[WARN][RPC] api_error endpoint=token_balance_proof contract={} holder={} err={}", contract, holder, e);
-            Ok(warp::reply::json(&json!({
-                "contract_address": contract,
-                "holder": holder,
-                "token_balance": "0",
-                "error": "token balance not provable",
-                "proof_valid": false
-            })))
+            Ok(warp::reply::json(&legacy_token_proof_unprovable(&contract, &holder)))
         }
     }
 }
@@ -317,11 +341,15 @@ pub(super) async fn handle_account_transactions(
         Ok(transactions) => {
             // Convert to JSON format
             let txs: Vec<serde_json::Value> = transactions.iter().map(|tx| {
+                let (to, amount) = match crate::rpc::batch_received_by(tx, &address) {
+                    Some(got) if tx.from != address => (Some(address.clone()), got),
+                    _ => crate::rpc::tx_display_to_amount(tx),
+                };
                 json!({
                     "hash": tx.hash,
                     "from": tx.from,
-                    "to": tx.to,
-                    "amount": tx.amount,
+                    "to": to,
+                    "amount": amount,
                     "timestamp": tx.timestamp,
                     "gas_price": tx.gas_price,
                     "gas_limit": tx.gas_limit,
@@ -460,6 +488,18 @@ pub(super) struct LogProofQuery {
     pub(super) log_index: Option<usize>,
 }
 
+/// The macroblock whose checkpoint commits the logs window ending at `end`, once this node both stores
+/// it and has applied the window: the checkpoint's logs_root is the one the client verifies, an applied
+/// but uncertified window may still change, and a certified one not yet applied has no logs here. The
+/// answer keeps its `window_not_finalized` name for old clients. O(1), no row read.
+pub(super) fn logs_window_gate(storage: &crate::storage::Storage, end: u64, applied: u64) -> Result<u64, serde_json::Value> {
+    let index = end / 90;
+    if end > applied || index > storage.proof_views().newest_certified_index() {
+        return Err(json!({"error": "window_not_finalized", "window_end": end}));
+    }
+    Ok(index)
+}
+
 /// GET /api/v1/logs/proof?tx_hash=&log_index= — P4 light-client transfer-inclusion proof. Returns the
 /// merkle sibling path from the event leaf to the window's logs_root; the client recomputes the root
 /// and checks it equals the QC-anchored `Checkpoint.logs_root` it independently verified for [start,end].
@@ -482,11 +522,10 @@ pub(super) async fn handle_log_proof(
     // same window keying as the consensus signal (K=90). Leaves via the SHARED builder (no drift).
     let end = ((h - 1) / 90 + 1) * 90;
     let start = end.saturating_sub(89).max(1);
-    // Only prove FINALIZED windows: every block in [start,end] must be applied, else the leaf set is
-    // partial and the proof can never match the eventual QC-committed Checkpoint.logs_root.
-    if end > blockchain.get_height().await {
-        return Ok(warp::reply::json(&json!({"error": "window_not_finalized", "window_end": end})));
-    }
+    let macroblock_index = match logs_window_gate(&storage, end, blockchain.get_height().await) {
+        Ok(j) => j,
+        Err(body) => return Ok(warp::reply::json(&body)),
+    };
     // Lower bound: blocklogs below the prune floor are physically gone (get_block_logs → empty), so a
     // straddling window rebuilds a truncated-suffix leaf set whose root is NOT the QC-committed
     // logs_root. Reject like getLogs rather than emit an authoritative-looking non-consensus root.
@@ -519,6 +558,7 @@ pub(super) async fn handle_log_proof(
     let l2: Vec<serde_json::Value> = l2_pairs.iter().map(|(hsh, right)| json!({ "hash": hex::encode(hsh), "right": right })).collect();
     Ok(warp::reply::json(&json!({
         "tx_hash": q.tx_hash, "log_index": target_li,
+        "macroblock_index": macroblock_index,
         "window_start": start, "window_end": end, "block_index": block_index,
         "leaf": hex::encode(&raw),
         "proof": l1,                            // level 1: leaf → block_root
@@ -637,10 +677,11 @@ pub(super) async fn handle_transaction_history(
                         _ => true, // "all" or unknown
                     };
                     
-                    // Direction filter
+                    // Direction filter. "Received" means apply paid or created this address: a batch
+                    // recipient or a deploy's derived address, never an unsigned envelope `to`.
                     let direction_match = match query.direction.as_str() {
                         "sent" => tx.from == query.address,
-                        "received" => tx.to.as_ref().map(|t| t == &query.address).unwrap_or(false),
+                        "received" => crate::storage::tx_index_counterparties(tx).iter().any(|a| a == &query.address),
                         _ => true, // "all" or unknown
                     };
                     
@@ -684,11 +725,16 @@ pub(super) async fn handle_transaction_history(
                     _ => "other",
                 };
                 
+                // A batch this address received shows as its own row: this address and what it got.
+                let (to, amount) = match crate::rpc::batch_received_by(tx, &query.address) {
+                    Some(got) if direction == "received" => (Some(query.address.clone()), got),
+                    _ => crate::rpc::tx_display_to_amount(tx),
+                };
                 json!({
                     "hash": tx.hash,
                     "from": tx.from,
-                    "to": tx.to,
-                    "amount": tx.amount,
+                    "to": to,
+                    "amount": amount,
                     "timestamp": tx.timestamp,
                     "gas_price": tx.gas_price,
                     "gas_limit": tx.gas_limit,
@@ -743,14 +789,32 @@ pub(super) async fn handle_transaction_history(
 /// API: GET /api/v1/transactions/recent?page=1&per_page=50
 pub(super) async fn handle_recent_transactions(
     query: RecentTransactionsQuery,
+    remote_addr: Option<std::net::SocketAddr>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
-    let page = if query.page == 0 { 1 } else { query.page };
-    let per_page = query.per_page.min(100).max(1); // Clamp to 1-100
-    
-    let storage = blockchain.get_storage();
-    
-    match storage.get_recent_transactions(page, per_page).await {
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "read_only") {
+        return Ok(rate_limit_response);
+    }
+    let current_height = blockchain.get_height().await;
+    Ok(recent_transactions_reply(blockchain.get_storage(), current_height, query.page, query.per_page).await)
+}
+
+/// The feed answer at `current_height`: read from the newest blocks (Storage::recent_transactions_page),
+/// so its cost does not grow with the history or the number of accounts.
+pub(super) async fn recent_transactions_reply(
+    storage: Arc<crate::storage::Storage>,
+    current_height: u64,
+    page: usize,
+    per_page: usize,
+) -> warp::reply::Json {
+    let page = if page == 0 { 1 } else { page };
+    let per_page = per_page.min(100).max(1); // Clamp to 1-100
+
+    let read = on_blocking_slot(recent_feed_slots(), move || storage.recent_transactions_page(current_height, page, per_page))
+        .await
+        .unwrap_or_else(|e| Err(crate::errors::IntegrationError::Other(format!("recent_feed_join: {}", e))));
+
+    match read {
         Ok((transactions, total_count)) => {
             let txs: Vec<Value> = transactions.iter().map(|tx| {
                 json!({
@@ -768,8 +832,7 @@ pub(super) async fn handle_recent_transactions(
             }).collect();
             
             let total_pages = (total_count + per_page - 1) / per_page;
-            let current_height = blockchain.get_height().await;
-            
+
             let response = json!({
                 "success": true,
                 "transactions": txs,
@@ -783,17 +846,37 @@ pub(super) async fn handle_recent_transactions(
                 },
                 "current_height": current_height
             });
-            Ok(warp::reply::json(&response))
+            warp::reply::json(&response)
         }
         Err(e) => {
-            println!("[API] ❌ Recent transactions error: {}", e);
+            println!("[WARN][RPC] api_error endpoint=recent_transactions err={}", e);
             let error_response = json!({
                 "success": false,
                 "error": format!("Failed to fetch recent transactions: {}", e)
             });
-            Ok(warp::reply::json(&error_response))
+            warp::reply::json(&error_response)
         }
     }
+}
+
+/// Feed reads share one feed behind a lock, so more than two on the blocking pool would only wait there.
+fn recent_feed_slots() -> &'static tokio::sync::Semaphore {
+    static SLOTS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    SLOTS.get_or_init(|| tokio::sync::Semaphore::new(2))
+}
+
+/// `read` on the blocking pool under one of `slots`. The slot moves into the read: a request dropped while
+/// its read runs (the client went away) frees it only when the read ends, so dropped requests never stack
+/// more reads on the pool than there are slots.
+async fn on_blocking_slot<T: Send + 'static>(
+    slots: &'static tokio::sync::Semaphore,
+    read: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, tokio::task::JoinError> {
+    let slot = slots.acquire().await;
+    tokio::task::spawn_blocking(move || {
+        let _slot = slot;
+        read()
+    }).await
 }
 
 pub(super) async fn handle_block_latest(
@@ -1333,6 +1416,8 @@ pub(super) async fn handle_debug_consensus_position(
         "tc_window_floor": tc_floor,
         "floor_above_window": tc_floor > own_window,
         "certified_round_current_window": crate::unified_p2p::highest_certified_round_for(own_window),
+        // The round the next slot is elected on: its tenure's from the failover_tenure_bound gate.
+        "certified_round_next_slot": crate::unified_p2p::certified_round_for_slot(height.saturating_add(1)),
     })))
 }
 
@@ -1453,5 +1538,127 @@ pub(super) async fn handle_snapshot_download(
             println!("[WARN][RPC] api_error endpoint=snapshot_download err={}", e);
             Ok(json_reply(json!({"error": "Failed to get snapshot", "details": "internal error"})))
         }
+    }
+}
+
+#[cfg(test)]
+mod recent_feed_reply_tests {
+    use super::*;
+
+    fn tx(n: u64) -> qnet_state::Transaction {
+        qnet_state::Transaction {
+            from: format!("sender_{}", n),
+            to: Some(format!("recipient_{}", n)),
+            amount: n,
+            tx_type: qnet_state::TransactionType::Transfer { from: format!("sender_{}", n), to: format!("recipient_{}", n), amount: n },
+            timestamp: 1_700_000_000 + n,
+            hash: format!("{:064x}", n),
+            signature: None,
+            public_key: None,
+            gas_price: 10,
+            gas_limit: 10_000,
+            nonce: n,
+            data: None,
+            dilithium_signature: None,
+            dilithium_public_key: None,
+            chain_id: qnet_state::transaction::QNET_CHAIN_ID,
+        }
+    }
+
+    fn put(s: &crate::storage::Storage, height: u64, txs: Vec<qnet_state::Transaction>, previous_hash: [u8; 32]) -> [u8; 32] {
+        let mb = qnet_state::MicroBlock {
+            height, timestamp: 1_700_000_000 + height, transactions: txs, producer: "genesis_node_001".to_string(),
+            signature: vec![0u8; 64], merkle_root: [0u8; 32], previous_hash, vrf_output: None, vrf_proof: None,
+            fees_collected: 0, state_root: [0u8; 32], timeout_round: 0, carried_baseline: 0, timeout_proof: None,
+        };
+        s.save_microblock(height, &bincode::serialize(&mb).unwrap()).expect("save");
+        mb.hash()
+    }
+
+    async fn body(storage: &Arc<crate::storage::Storage>, height: u64, page: usize, per_page: usize) -> Value {
+        let reply = recent_transactions_reply(storage.clone(), height, page, per_page).await.into_response();
+        let bytes = warp::hyper::body::to_bytes(reply.into_body()).await.expect("body");
+        serde_json::from_slice(&bytes).expect("json")
+    }
+
+    fn keys(v: &Value) -> Vec<String> {
+        let mut k: Vec<String> = v.as_object().expect("object").keys().cloned().collect();
+        k.sort();
+        k
+    }
+
+    // The answer keeps the keys clients read, rows newest first; pages and per_page clamp as before.
+    #[tokio::test]
+    async fn the_recent_feed_answer_keeps_its_shape_and_order() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = Arc::new(crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage"));
+        let h1 = put(&storage, 1, vec![tx(1)], [0u8; 32]);
+        put(&storage, 2, vec![tx(2), tx(3)], h1);
+
+        let v = body(&storage, 2, 1, 2).await;
+        assert_eq!(keys(&v), ["current_height", "pagination", "success", "transactions"]);
+        assert_eq!(v["success"], json!(true));
+        assert_eq!(v["current_height"], json!(2));
+        assert_eq!(v["pagination"], json!({
+            "page": 1, "per_page": 2, "total_count": 3, "total_pages": 2, "has_next": true, "has_prev": false
+        }));
+        let rows = v["transactions"].as_array().expect("rows");
+        let order: Vec<&str> = rows.iter().map(|r| r["hash"].as_str().unwrap()).collect();
+        assert_eq!(order, [tx(3).hash.as_str(), tx(2).hash.as_str()]);
+        assert_eq!(keys(&rows[0]), ["amount", "from", "gas_limit", "gas_price", "hash", "is_quantum_signed", "nonce", "timestamp", "to", "type"]);
+        assert_eq!(rows[0]["type"], json!(format!("{:?}", tx(3).tx_type)));
+        assert_eq!((rows[0]["from"].clone(), rows[0]["to"].clone(), rows[0]["amount"].clone()), (json!("sender_3"), json!("recipient_3"), json!(3)));
+
+        let last = body(&storage, 2, 2, 2).await;
+        assert_eq!(last["transactions"][0]["hash"], json!(tx(1).hash));
+        assert_eq!((last["pagination"]["has_next"].clone(), last["pagination"]["has_prev"].clone()), (json!(false), json!(true)));
+
+        let clamped = body(&storage, 2, 0, 0).await;
+        assert_eq!((clamped["pagination"]["page"].clone(), clamped["pagination"]["per_page"].clone()), (json!(1), json!(1)));
+        assert_eq!(body(&storage, 2, 1, 5_000).await["pagination"]["per_page"], json!(100));
+    }
+
+    // The route hands the handler the caller's address, and the handler spends the read_only budget before
+    // it reads anything; once that budget is spent the caller gets the rate-limit answer.
+    #[test]
+    fn the_recent_feed_is_behind_the_read_limiter() {
+        let src = include_str!("queries_api.rs").replace("\r\n", "\n");
+        let handler = &src[src.find("pub(super) async fn handle_recent_transactions(").expect("handler")..];
+        let handler = &handler[..handler.find("\n}\n").expect("handler end")];
+        let limited = handler.find("check_api_rate_limit(remote_addr, \"read_only\")").expect("limited");
+        assert!(limited < handler.find("get_height").expect("height read"));
+        assert!(limited < handler.find("get_storage").expect("storage read"));
+
+        let rpc = include_str!("mod.rs").replace("\r\n", "\n");
+        let route = &rpc[rpc.find("let transactions_recent = api_v1").expect("route")..];
+        let route = &route[..route.find(';').expect("route end")];
+        assert!(route.contains(".and(client_addr())") && route.contains("handle_recent_transactions"));
+
+        let caller = Some(std::net::SocketAddr::from(([198, 51, 100, 200], 40000)));
+        let budget = API_RATE_LIMITER.configs["read_only"].max_requests;
+        for i in 0..budget {
+            assert!(check_api_rate_limit(caller, "read_only").is_ok(), "request {} is within the budget", i);
+        }
+        assert!(check_api_rate_limit(caller, "read_only").is_err(), "past the budget the caller is refused");
+    }
+
+    // A request dropped while its read runs (the client went away) keeps the slot taken until the read
+    // ends, so a client that connects and leaves cannot stack reads on the blocking pool past the slots.
+    #[tokio::test]
+    async fn a_dropped_request_frees_its_slot_only_when_its_read_ends() {
+        let slots: &'static tokio::sync::Semaphore = Box::leak(Box::new(tokio::sync::Semaphore::new(1)));
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let request = tokio::spawn(on_blocking_slot(slots, move || {
+            started_tx.send(()).expect("started");
+            let _ = release_rx.recv();
+        }));
+        tokio::task::spawn_blocking(move || started_rx.recv().expect("the read started")).await.expect("join");
+        request.abort();
+        assert!(request.await.expect_err("dropped").is_cancelled());
+        assert_eq!(slots.available_permits(), 0, "the read still runs, so its slot is still taken");
+        release_tx.send(()).expect("release");
+        let freed = tokio::time::timeout(std::time::Duration::from_secs(5), slots.acquire()).await;
+        assert!(freed.is_ok(), "the slot comes back once the read ends");
     }
 }

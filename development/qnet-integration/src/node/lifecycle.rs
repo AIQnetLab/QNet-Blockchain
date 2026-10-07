@@ -6,30 +6,17 @@ use super::*;
 static HB_WITHHELD_WINDOW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl BlockchainNode {
-    /// The last height covered by a macroblock this node actually holds sealed. A window whose
-    /// macroblock carries no microblocks was never certified — the placeholder row exists, the seal
-    /// does not — so it is not a recovery point. Walks down from the tip and stops at the first
-    /// sealed window rather than scanning the chain.
-    fn last_sealed_height(storage: &Storage) -> Option<u64> {
-        const MI: u64 = 90;
-        let tip = storage.get_chain_height().ok()?;
-        let mut idx = tip / MI;
-        // A live fleet cannot have more than a few windows unsealed; deeper than that the node is not
-        // merely forked and an operator rollback is the wrong tool.
-        let floor = idx.saturating_sub(8);
-        while idx > 0 && idx >= floor {
-            let sealed = storage.get_macroblock_by_height(idx).ok().flatten()
-                .and_then(|raw| bincode::deserialize::<qnet_state::MacroBlock>(&raw).ok())
-                .map_or(false, |mb| !mb.micro_blocks.is_empty());
-            if sealed { return Some((idx + 1).saturating_mul(MI).saturating_sub(1)); }
-            idx -= 1;
+    /// The boot rollback target and verdict: `QNET_ROLLBACK_TO_LAST_SEALED` resolves to the certified floor
+    /// (`certified_rollback_floor`, the last certified point this node holds), an explicit target below that
+    /// floor is refused, and an explicit target at or above it stands. Err carries the floor of a refusal;
+    /// Ok(None) means nothing to do.
+    pub(crate) fn boot_rollback_target(explicit: Option<u64>, to_certified: bool, floor: u64) -> Result<Option<u64>, u64> {
+        match (explicit, to_certified) {
+            (Some(h), _) if h < floor => Err(floor),
+            (Some(h), _) => Ok(Some(h)),
+            (None, true) if floor > 0 => Ok(Some(floor)),
+            _ => Ok(None),
         }
-        None
-    }
-
-    #[cfg(test)]
-    pub(crate) fn last_sealed_height_for_test(storage: &Storage) -> Option<u64> {
-        Self::last_sealed_height(storage)
     }
 
     /// Truncate the stored chain to `target` and bring every DURABLE side-index back to it. RAM state
@@ -109,24 +96,18 @@ impl BlockchainNode {
             .and_then(|v| v.trim().parse::<u64>().ok());
         let to_sealed = std::env::var("QNET_ROLLBACK_TO_LAST_SEALED")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false);
-        let sealed = Self::last_sealed_height(storage);
-        let target = match (explicit, to_sealed) {
-            (Some(h), _) => {
-                // An explicit target below the last sealed window discards CERTIFIED history. That is
-                // the operator's call and the reason the explicit form exists, but it must never pass
-                // silently, and unlike the self-chosen target it repeats on every restart.
-                if sealed.map_or(false, |s| h < s) {
-                    println!("[WARN][ROLLBACK] target_below_last_sealed target={} last_sealed={} — certified blocks will be discarded",
-                             h, sealed.unwrap_or(0));
-                }
-                Some(h)
+        if explicit.is_none() && !to_sealed { return; }
+        // Never below what this node holds certified: a QC is irrevocable, and the fleet that rolled below one
+        // on 04.10 produced but never sealed again. LAST_SEALED means exactly that point.
+        let floor = Self::certified_rollback_floor(storage);
+        let target = match Self::boot_rollback_target(explicit, to_sealed, floor) {
+            Ok(Some(t)) => t,
+            Ok(None) => { println!("[ERR][ROLLBACK] no_certified_point_found action=start_unchanged"); return; }
+            Err(floor) => {
+                println!("[ERR][ROLLBACK] refused target={} certified_floor={} reason=certified_checkpoint_irrevocable action=start_unchanged",
+                         explicit.unwrap_or(0), floor);
+                return;
             }
-            (None, true) => sealed,
-            _ => return,
-        };
-        let target = match target {
-            Some(t) => t,
-            None => { println!("[ERR][ROLLBACK] no_sealed_macroblock_found action=start_unchanged"); return; }
         };
         match Self::rollback_storage_to(storage, target).await {
             Ok(0) => println!("[INFO][ROLLBACK] already_at_or_below target={}", target),
@@ -548,6 +529,9 @@ impl BlockchainNode {
                 .unwrap_or(2_000_000);
             state_setup.set_merkle_node_store(storage.merkle_node_store());
             state_setup.set_merkle_node_cache_cap(node_cache_cap);
+            // Certified proof rows (preimages, contract storage trees) go to the aux DB, written
+            // off the apply path; the first full reset below fills it.
+            state_setup.set_proof_aux_sink(storage.proof_aux_sink());
             if is_info() {
                 println!("[INFO][MERKLE] node_store=rocksdb cache_cap={}", node_cache_cap);
             }
@@ -691,6 +675,7 @@ impl BlockchainNode {
                                                      snapshot_height, accounts.len(), snap_total_supply,
                                                      hex::encode(&state_root[..8]), accounts_data.len() / 1024);
                                         }
+                                        storage.request_proof_view(&state_guard, snapshot_height);
                                     } else if let Some(addr) = state_guard.repair_single_phantom(&state_root) {
                                         // One extra leaf over the certified root — the accounts-CF phantom
                                         // a rolled-back block left behind. Repaired against the 2f+1 root
@@ -706,6 +691,7 @@ impl BlockchainNode {
                                             cs.last_minted_emission_mb = Self::emission_mb_index(snapshot_height);
                                         }
                                         restored_snapshot_height = snapshot_height;
+                                        storage.request_proof_view(&state_guard, snapshot_height);
                                     } else {
                                         eprintln!("[ERR][STATE] snapshot_merkle_mismatch expected={} computed={} action=clear_and_full_replay",
                                                   hex::encode(&state_root[..8]), hex::encode(&computed_merkle[..8]));
@@ -1031,6 +1017,17 @@ impl BlockchainNode {
                 println!("[INFO][STATE] restart_statics_init chain_h={} metric_reset=now vrf_announce_h={} finalized_round={} signed_hwm={}",
                          pre_snapshot_chain_height, vrf_init, finalized_round, signed_hwm);
             }
+        }
+
+        // The exact signing record starts above whatever this node signed without it: everything up to the
+        // loaded watermark keeps the height-only rule. Seeded once; a fresh node starts at 0.
+        match storage.seed_signature_record_floor(HIGHEST_SIGNED_HEIGHT.load(std::sync::atomic::Ordering::SeqCst)) {
+            Ok(true) => if is_info() {
+                println!("[INFO][STATE] signature_record_floor_seeded floor={}",
+                         HIGHEST_SIGNED_HEIGHT.load(std::sync::atomic::Ordering::SeqCst));
+            },
+            Ok(false) => {}
+            Err(e) => println!("[ERR][STATE] signature_record_floor_seed_failed err={} — gated heights will not be signed", e),
         }
 
         // Initialize production-ready mempool with AUTO-SCALING
@@ -2027,6 +2024,12 @@ impl BlockchainNode {
                     let _ = blockchain.storage.snapshot_light_eligible(ep, light_roster_cutoff(ep));
                 }
             }
+            // The uptime index behind the status's counted epochs: the rest of its 64-epoch window, one
+            // roster walk per unindexed epoch, off the boot path.
+            {
+                let st = blockchain.storage.clone();
+                tokio::task::spawn_blocking(move || crate::node::BlockchainNode::backfill_light_uptime(&st, boot_h));
+            }
         }
         
         // v4.3: Restore P2P light node registry from blockchain storage (RocksDB)
@@ -2498,6 +2501,8 @@ impl BlockchainNode {
                     let needs_offload = matches!(&message,
                         crate::unified_p2p::NetworkMessage::TimeoutVote { .. }
                         | crate::unified_p2p::NetworkMessage::TimeoutCertificateBroadcast { .. }
+                        | crate::unified_p2p::NetworkMessage::TimeoutVoteV3 { .. }
+                        | crate::unified_p2p::NetworkMessage::TimeoutCertificateV3Broadcast { .. }
                         | crate::unified_p2p::NetworkMessage::ProducerReady { .. }
                         | crate::unified_p2p::NetworkMessage::ReadyAck { .. }
                     );
@@ -3799,13 +3804,13 @@ impl BlockchainNode {
                         let committed_shards = crate::node::try_get_storage()
                             .and_then(|s| s.load_light_bitmaps(current_epoch).ok())
                             .unwrap_or_default();
-                        // Rank 0 holds one shard, its own, so this is the only row it waits for.
-                        let own_row = crate::node::try_get_storage()
-                            .map_or(false, |s| s.has_light_bitmap_from(current_epoch, my_idx, my_idx));
-                        let target_shard = match (0..5usize)
+                        // Each owner waits for its own row of the shard; a backup also compares its answers
+                        // with the committed OR below, at its deadline, before it stands down (F2).
+                        let own_row = |sh: usize| crate::node::try_get_storage()
+                            .map_or(false, |s| s.has_light_bitmap_from(current_epoch, sh, my_idx));
+                        let (target_shard, target_rank) = match (0..5usize)
                             .filter_map(|sh| crate::node::light_owner_rank(sh, my_idx).map(|r| (sh, r)))
-                            .filter(|(sh, rank)| !crate::node::light_owner_stands_down(
-                                *rank, own_row, committed_shards.contains_key(sh)))
+                            .filter(|(sh, rank)| !crate::node::light_owner_stands_down(*rank, own_row(*sh), None))
                             .filter(|(_, rank)| backups_active || *rank == 0)
                             .filter(|(_, rank)| blocks_until_epoch_end <= owner_deadline[*rank])
                             // A shard with nothing left to try must not hold the slot. Its own
@@ -3816,9 +3821,8 @@ impl BlockchainNode {
                                 .get(&(current_epoch, *sh))
                                 .map_or(true, |s| !s.is_confirmed() && s.retry_count < MAX_RETRIES))
                             .min_by_key(|(_, rank)| *rank)
-                            .map(|(sh, _)| sh)
                         {
-                            Some(sh) => sh,
+                            Some(t) => t,
                             None => continue,
                         };
                         // One tracker slot per (epoch, shard).
@@ -3916,6 +3920,14 @@ impl BlockchainNode {
                                     }
                                 } else {
 
+                                // A backup commits only what the committed OR lacks (F2): the answers only it
+                                // holds. Every one it holds was anchored before the commit opened
+                                // (`admit_relayed_attestation`), so none counts in an epoch it was not given in.
+                                let or_rows = committed_shards.get(&target_shard);
+                                let held = eligible_indices.len();
+                                if target_rank > 0 && or_rows.is_some() {
+                                    eligible_indices = crate::node::light_missing_bits(&eligible_indices, or_rows.map(|v| v.as_slice()));
+                                }
                                 if shard_members == 0 {
                                     let mut status = HeartbeatCommitmentStatus::new("no_assigned_nodes".to_string(), current_height);
                                     status.mark_confirmed(current_height);
@@ -3924,7 +3936,19 @@ impl BlockchainNode {
                                         println!("[INFO][LIGHT-BITMAP] Genesis {} shard empty (total={}) - skip",
                                                  genesis_idx + 1, total_light_nodes);
                                     }
+                                } else if crate::node::light_owner_stands_down(target_rank, false, or_rows.map(|_| eligible_indices.len())) {
+                                    let mut status = HeartbeatCommitmentStatus::new("no_missing_bits".to_string(), current_height);
+                                    status.mark_confirmed(current_height);
+                                    bitmap_tracker.insert(track_key, status);
+                                    if is_info() {
+                                        println!("[INFO][LIGHT-BITMAP] backup_stands_down epoch={} shard={} rank={} held={} reason=committed_or_holds_all",
+                                                 current_epoch, target_shard, target_rank, held);
+                                    }
                                 } else {
+                                    if target_rank > 0 && is_info() {
+                                        println!("[INFO][LIGHT-BITMAP] backup_row epoch={} shard={} rank={} held={} missing={} committed_row={}",
+                                                 current_epoch, target_shard, target_rank, held, eligible_indices.len(), or_rows.is_some());
+                                    }
 
                                 if is_info() {
                                     println!("[INFO][LIGHT-BITMAP] Genesis {} hash-shard → {} eligible / {} assigned Light nodes",
@@ -3985,9 +4009,13 @@ impl BlockchainNode {
                                                 // before adding the new one so the next producer cannot pull
                                                 // multiple versions of the same logical commitment into one
                                                 // block.
+                                                // From the tx_target_bound gate an unchanged bitmap is the same
+                                                // hash (its envelope is pinned): that one is the pending version
+                                                // itself, never a stale one (the removal marks what it removes as
+                                                // included, and the re-add would then be refused).
                                                 let stale_hashes: Vec<String> = bitmap_tracker
                                                     .get(&track_key)
-                                                    .map(|e| e.all_tx_hashes.clone())
+                                                    .map(|e| e.all_tx_hashes.iter().filter(|h| **h != tx.hash).cloned().collect())
                                                     .unwrap_or_default();
                                                 if !stale_hashes.is_empty() {
                                                     mempool.batch_remove_transactions(&stale_hashes);
@@ -4001,13 +4029,16 @@ impl BlockchainNode {
                                                     Some(st) => crate::node::refuse_held_commitment(st, &tx).await.is_err(),
                                                     None => false,
                                                 };
-                                                if !held && mempool.add_binary_transaction(tx_bytes, tx.hash.clone(), gas_price) {
+                                                let pooled = mempool.get_binary_transaction(&tx.hash).is_some();
+                                                if !held && (pooled || mempool.add_binary_transaction(tx_bytes, tx.hash.clone(), gas_price)) {
                                                     let tx_hash_clone = tx.hash.clone();
                                                     if let Some(mut existing) = bitmap_tracker.get_mut(&track_key) {
                                                         existing.increment_retry();
                                                         existing.value_mut().sent_at_height = current_height;
                                                         existing.value_mut().tx_hash = tx_hash_clone.clone();
-                                                        existing.value_mut().all_tx_hashes.push(tx_hash_clone.clone());
+                                                        if !existing.all_tx_hashes.contains(&tx_hash_clone) {
+                                                            existing.value_mut().all_tx_hashes.push(tx_hash_clone.clone());
+                                                        }
                                                         println!("[INFO][LIGHT-BITMAP] TX retry #{} submitted epoch={} hash={} total_hashes={}",
                                                                  existing.retry_count, current_epoch, &tx_hash_clone[..16], existing.all_tx_hashes.len());
                                                     } else {

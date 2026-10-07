@@ -391,7 +391,8 @@ pub(super) async fn handle_register_node(
     // ═══════════════════════════════════════════════════════════════════════════════
     // v4.9: MIGRATION / DUPLICATE CHECK — different logic for Light vs Super nodes
     //
-    // LIGHT NODES (mobile): Up to 3 devices per node. Handled by handle_light_node_register.
+    // LIGHT NODES (mobile): one device at a time, the one the binding names. Handled by handle_light_node_register.
+
     //   This endpoint (handle_register_node) is a legacy/generic path.
     //   If light node already exists → silently update (same node_id, overwrite is safe).
     //
@@ -535,7 +536,8 @@ pub(super) async fn handle_register_node(
             let registration = LightNodeRegistrationData {
                 node_id: node_id.clone(),
                 wallet_address: wallet_address.to_string(),
-                device_token_hash: format!("hash_{}", device_id),
+                // Gossip carries no device or token identifier (H6).
+                device_token_hash: String::new(),
                 quantum_pubkey: quantum_pubkey.to_string(),
                 registered_at: now,
                 signature: String::new(), // No signature for legacy API
@@ -1237,297 +1239,23 @@ pub(super) async fn handle_activations_by_wallet(
     }
 }
 
-/// Handle activation code generation from burn transaction
-pub(super) async fn handle_generate_activation_code(
-    request: GenerateActivationCodeRequest,
-    remote_addr: Option<std::net::SocketAddr>,
-    _blockchain: Arc<BlockchainNode>,
-) -> Result<impl Reply, Rejection> {
-    // SECURITY: Strict rate limiting for activation code generation (expensive operation)
-    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "activation") {
-        return Ok(rate_limit_response);
-    }
-
-    // ONE phase resolver, ahead of everything that branches on a phase. It derives from the live 1DEV
-    // supply — the same number the burn attestors sign — and NEVER from the request: the phase selects
-    // which entry-price rule the on-chain NodeActivation is judged by, so an applicant choosing it is
-    // choosing its own Sybil cost. Fail-closed on a supply-read outage; a request that declares a
-    // different phase is rejected rather than silently corrected, because it would pay under one rule
-    // and be recorded under the other.
-    let pricing = match live_activation_pricing().await {
-        Ok(p) => p,
-        Err(e) => {
-            println!("[ERROR][GENERATE] activation_price_unavailable err={}", e);
-            return Ok(warp::reply::json(&json!({
-                "success": false,
-                "error": format!("Activation price unavailable: {}", e),
-                "retryable": true
-            })));
-        }
-    };
-    if request.phase != pricing.phase {
-        println!("[WARN][GENERATE] phase_mismatch declared={} network={}", request.phase, pricing.phase);
-        return Ok(warp::reply::json(&json!({
-            "success": false,
-            "error": format!("Declared phase {} is not the network phase {}", request.phase, pricing.phase),
-            "phase": pricing.phase
-        })));
-    }
-
-    // SECURITY: Validate wallet addresses
-    // Phase 1: wallet_address = Solana (burn), qnet_reward_wallet = EON (rewards) - REQUIRED
-    // Phase 2: wallet_address = EON (burn + rewards)
-    
-    // Determine the QNet EON address for rewards (used for "1 wallet = 1 node" check)
-    let qnet_wallet_for_rewards: String;
-    
-    if pricing.phase == 2 {
-        // Phase 2: wallet_address is EON, used for everything
-        if let Err(e) = validate_eon_address_with_error(&request.wallet_address) {
-            return Ok(warp::reply::json(&json!({
-                "success": false,
-                "error": "Invalid EON wallet address format",
-                "details": e
-            })));
-        }
-        qnet_wallet_for_rewards = request.wallet_address.clone();
-    } else {
-        // Phase 1: wallet_address is Solana (for burn), qnet_reward_wallet is EON (for rewards)
-        
-        // Validate Solana address (for burn verification)
-        let is_valid_solana = request.wallet_address.len() >= 32 
-            && request.wallet_address.len() <= 44
-            && request.wallet_address.chars().all(|c| c.is_alphanumeric() && c != '0' && c != 'O' && c != 'I' && c != 'l');
-        if !is_valid_solana {
-            return Ok(warp::reply::json(&json!({
-                "success": false,
-                "error": "Invalid Solana wallet address format for burn verification"
-            })));
-        }
-        
-        // REQUIRED: QNet EON address for rewards
-        match &request.qnet_reward_wallet {
-            Some(qnet_addr) => {
-                if let Err(e) = validate_eon_address_with_error(qnet_addr) {
-                    return Ok(warp::reply::json(&json!({
-                        "success": false,
-                        "error": "Invalid QNet EON reward wallet address",
-                        "details": e,
-                        "hint": "Phase 1 requires both Solana address (for burn) and QNet EON address (for rewards)"
-                    })));
-                }
-                qnet_wallet_for_rewards = qnet_addr.clone();
-            }
-            None => {
-                return Ok(warp::reply::json(&json!({
-                    "success": false,
-                    "error": "Missing qnet_reward_wallet for Phase 1",
-                    "hint": "Phase 1 requires 'qnet_reward_wallet' field with QNet EON address for rewards"
-                })));
-            }
-        }
-        
-        println!("   QNet Reward Wallet: {}...", qnet_state::char_prefix(&qnet_wallet_for_rewards, 8));
-    }
-    
-    // Validate node type
-    // v3.18: Full nodes removed - only Light and Super allowed
-    let valid_node_types = ["light", "super"];
-    if !valid_node_types.contains(&request.node_type.to_lowercase().as_str()) {
-        // Reject "full" node type
-        if request.node_type.to_lowercase() == "full" {
-            return Ok(warp::reply::json(&json!({
-                "success": false,
-                "error": "Full node type removed in v3.18. Use Super node instead."
-            })));
-        }
-        return Ok(warp::reply::json(&json!({
-            "success": false,
-            "error": "Invalid node type. Must be: light or super"
-        })));
-    }
-    
-    println!("[GENERATE] 🔐 Generating activation code from burn transaction");
-    println!("   Wallet: {}", qnet_state::char_prefix(&request.wallet_address, 8));
-    println!("   Burn TX: {}", qnet_state::char_prefix(&request.burn_tx_hash, 8));
-    println!("   Node Type: {}", request.node_type);
-    println!("   Amount: {} {}", request.burn_amount, if pricing.phase == 1 { "1DEV" } else { "QNC" });
-    println!("   Phase: {}", pricing.phase);
-
-    // CRITICAL: Verify burn transaction actually exists on Solana/QNet blockchain
-    match verify_burn_transaction_exists(&request.burn_tx_hash, &request.wallet_address, request.burn_amount, pricing.phase).await {
-        Ok((false, _)) => {
-            println!("❌ Burn transaction verification failed");
-            let error_response = json!({
-                "success": false,
-                "error": "Burn transaction not found or invalid",
-                "burn_tx_hash": request.burn_tx_hash,
-                "wallet_address": request.wallet_address
-            });
-            return Ok(warp::reply::json(&error_response));
-        }
-        Err(e) => {
-            println!("❌ Burn verification error: {}", e);
-            let error_response = json!({
-                "success": false,
-                "error": format!("Burn verification failed: {}", e),
-                "burn_tx_hash": request.burn_tx_hash
-            });
-            return Ok(warp::reply::json(&error_response));
-        }
-        Ok((true, _actual_burned)) => {
-            println!("[INFO][GENERATE] burn_tx_verified_on_solana tx={}...",
-                qnet_state::char_prefix(&request.burn_tx_hash, 16));
-        }
-    }
-    
-    // DYNAMIC PRICING — burn_amount MUST be >= the current activation price, so a user cannot
-    // underpay and still get an XOR code. Phase and price come from the live 1DEV supply through
-    // the canonical helper, the same number attestors sign, so a discounted tier is accepted.
-    {
-        let minimum_required = pricing.cost_for(&request.node_type);
-
-        if request.burn_amount < minimum_required {
-            println!("[WARN][GENERATE] insufficient_burn amount={} required={} phase={} burn_pct={:.1}",
-                request.burn_amount, minimum_required, pricing.phase, pricing.burn_pct);
-            return Ok(warp::reply::json(&json!({
-                "success": false,
-                "error": format!("Insufficient burn amount: {} provided, {} required",
-                    request.burn_amount, minimum_required),
-                "required_amount": minimum_required,
-                "provided_amount": request.burn_amount,
-                "phase": pricing.phase,
-                "burn_percentage": pricing.burn_pct,
-                "currency": pricing.currency(),
-                "hint": format!("Current activation price is {} {}. Burn at least this amount.",
-                    minimum_required, pricing.currency())
-            })));
-        }
-
-        println!("[INFO][GENERATE] price_check_passed amount={} required={} phase={}",
-            request.burn_amount, minimum_required, pricing.phase);
-    }
-    
-    // ═══════════════════════════════════════════════════════════════════════════════
-    // v4.5: 1 wallet = 1 node — checked via PERSISTENT RocksDB, NOT in-memory!
-    // Code generation is DETERMINISTIC from burn_tx_hash, so same burn → same code.
-    // Recovery: just re-generate from same burn_tx_hash → identical code returned.
-    // ═══════════════════════════════════════════════════════════════════════════════
-    
-    // 1 wallet = 1 node: Check PERSISTENT storage (RocksDB) — survives restarts!
-    // Check BOTH Solana and EON addresses to prevent 2 nodes from same operator
-    if let Some(storage) = crate::node::try_get_storage() {
-        // Check 1: By QNet EON reward wallet
-        match storage.get_nodes_by_wallet(&qnet_wallet_for_rewards) {
-            Ok(nodes) if !nodes.is_empty() => {
-                let (existing_node_id, existing_type, _rep) = &nodes[0];
-                println!("[WARN][GENERATE] wallet_already_has_node wallet={}... node={} type={}",
-                    qnet_state::char_prefix(&qnet_wallet_for_rewards, 16),
-                    existing_node_id, existing_type);
-                let response = json!({
-                    "success": false,
-                    "error": "This wallet already has an active node registered on blockchain",
-                    "existing_node_type": existing_type,
-                    "existing_node_id": existing_node_id,
-                    "qnet_wallet": qnet_wallet_for_rewards,
-                    "hint": "Each QNet wallet can only activate ONE node (Light or Super). Code is deterministic — use same burn_tx_hash to regenerate.",
-                    "message": "1 wallet = 1 node rule enforced via persistent blockchain storage"
-                });
-                return Ok(warp::reply::json(&response));
-            }
-            _ => {}
-        }
-        // Check 2: By Solana wallet (in case light node was registered with Solana address)
-        // Phase 1: wallet_address = Solana, qnet_reward_wallet = EON — check both
-        if pricing.phase == 1 && request.wallet_address != qnet_wallet_for_rewards {
-            match storage.get_nodes_by_wallet(&request.wallet_address) {
-                Ok(nodes) if !nodes.is_empty() => {
-                    let (existing_node_id, existing_type, _rep) = &nodes[0];
-                    println!("[WARN][GENERATE] solana_wallet_already_has_node wallet={}... node={} type={}",
-                        qnet_state::char_prefix(&request.wallet_address, 16),
-                        existing_node_id, existing_type);
-                    let response = json!({
-                        "success": false,
-                        "error": "This Solana wallet already has an active node registered on blockchain",
-                        "existing_node_type": existing_type,
-                        "existing_node_id": existing_node_id,
-                        "solana_wallet": request.wallet_address,
-                        "hint": "Each wallet can only activate ONE node (Light or Super).",
-                        "message": "1 wallet = 1 node rule enforced (Solana address check)"
-                    });
-                    return Ok(warp::reply::json(&response));
-                }
-                _ => {}
-            }
-        }
-        println!("[INFO][GENERATE] wallet_clean eon={}... solana={}... proceeding",
-            qnet_state::char_prefix(&qnet_wallet_for_rewards, 16),
-            qnet_state::char_prefix(&request.wallet_address, 16));
-    } else {
-        println!("[WARN][GENERATE] storage_unavailable skipping_1wallet1node_check");
-    }
-
-    // Generate quantum-secure activation code
-    match generate_quantum_activation_code(&request).await {
-        Ok(activation_code) => {
-            println!("✅ Quantum activation code generated successfully");
-            
-            // Record in blockchain with secure hash
-            let registry = &*GLOBAL_ACTIVATION_REGISTRY;
-            let code_hash = registry.hash_activation_code_for_blockchain(&activation_code)
-                .unwrap_or_else(|_| blake3::hash(activation_code.as_bytes()).to_hex().to_string());
-            
-            let node_info = crate::activation_validation::NodeInfo {
-                activation_code: code_hash.clone(), // Use hash for secure blockchain storage
-                wallet_address: qnet_wallet_for_rewards.clone(), // ALWAYS QNet EON address for rewards!
-                device_signature: format!("generated_{}", chrono::Utc::now().timestamp()),
-                node_type: request.node_type.clone(),
-                activated_at: chrono::Utc::now().timestamp() as u64,
-                last_seen: chrono::Utc::now().timestamp() as u64,
-                migration_count: 0,
-                node_id: String::new(), // Will be populated when node starts on server
-                burn_tx_hash: request.burn_tx_hash.clone(), // CRITICAL: Store burn_tx for XOR decryption
-                phase: pricing.phase,
-                burn_amount: request.burn_amount, // CRITICAL: Store exact amount for XOR key derivation
-            };
-
-            if let Err(e) = registry.register_activation_on_blockchain(&activation_code, node_info).await {
-                println!("⚠️ Blockchain registration warning: {}", e);
-                // Continue anyway - user can still use the code
-            }
-
-            let response = json!({
-                "success": true,
-                "activation_code": activation_code,
-                "wallet_address": request.wallet_address,
-                "node_type": request.node_type,
-                "phase": pricing.phase,
-                "burn_tx_hash": request.burn_tx_hash,
-                "generated_at": chrono::Utc::now().timestamp(),
-                "permanent": true,
-                "quantum_secure": true,
-                "message": "Activation code generated successfully"
-            });
-            Ok(warp::reply::json(&response))
-        }
-        Err(e) => {
-            println!("❌ Code generation failed: {}", e);
-            let error_response = json!({
-                "success": false,
-                "error": format!("Code generation failed: {}", e),
-                "wallet_address": request.wallet_address,
-                "burn_tx_hash": request.burn_tx_hash
-            });
-            Ok(warp::reply::json(&error_response))
-        }
-    }
-}
-
 // ═══════════════════════════════════════════════════════════════
 // ON-CHAIN ACTIVATION VERIFICATION
 // Mobile wallets MUST verify activation exists in current blockchain
 // before showing node as active (prevents stale cache issues)
 // ═══════════════════════════════════════════════════════════════
+
+/// `(current_height, network_height, authoritative)`: whether this node can vouch for an absence, that is,
+/// it is at the network's height (the cached network height, never below its own). verify-activation and
+/// the public light-node status compute it here, one way.
+pub(super) async fn absence_vouch(blockchain: &BlockchainNode) -> (u64, u64, bool) {
+    let current_height = blockchain.get_height().await;
+    let network_height = blockchain.get_unified_p2p()
+        .and_then(|p2p| p2p.get_cached_network_height())
+        .map(|nh| nh.max(current_height))
+        .unwrap_or(current_height);
+    (current_height, network_height, current_height >= network_height)
+}
 
 pub(super) async fn handle_verify_activation_onchain(
     mut params: HashMap<String, String>,
@@ -1546,8 +1274,8 @@ pub(super) async fn handle_verify_activation_onchain(
         }
     };
 
-    // Level 1: O(1) reverse index lookup in RocksDB (wallet → node_id)
-    // Populated automatically when NodeRegistration and NodeActivation TXs are processed in blocks.
+    // Level 1: the wallet's chain-confirmed node, read from the registry rows block apply writes: its derived
+    // genesis, super and light ids in that order (a cache row with no registration height never answers).
     // Survives restarts. This is the primary and fastest check.
     let storage = blockchain.get_storage();
     if let Ok(Some((node_id, node_type))) = storage.get_node_by_wallet(&wallet_address) {
@@ -1579,12 +1307,7 @@ pub(super) async fn handle_verify_activation_onchain(
     // network's height. A node that is behind, isolated or forked has simply not applied the block
     // the registration is in, and answering a flat "no" to that is how a client ends up deleting a
     // perfectly good activation. `authoritative` is the third state: absence this node can vouch for.
-    let current_height = blockchain.get_height().await;
-    let network_height = blockchain.get_unified_p2p()
-        .and_then(|p2p| p2p.get_cached_network_height())
-        .map(|nh| nh.max(current_height))
-        .unwrap_or(current_height);
-    let authoritative = current_height >= network_height;
+    let (current_height, network_height, authoritative) = absence_vouch(&blockchain).await;
     Ok(warp::reply::json(&json!({
         "verified": false,
         "authoritative": authoritative,
@@ -2538,344 +2261,163 @@ pub(super) async fn handle_producer_status(
     Ok(warp::reply::json(&status))
 }
 
-/// v6.0: Handle client-created NodeRegistration TX submission
-/// Flow:
-///   1. Client calls POST /api/v1/light-node/register  → gets node_id + registration_proof
-///   2. Client creates TX, signs with wallet Ed25519 key
-///   3. Client POSTs here (ideally to current producer for minimal latency)
-///   4. Server verifies signature, adds to mempool, broadcasts to P2P
+/// `POST /api/v1/node-registration/submit`: a light registration built by the client - the wallet's
+/// consent (ML-DSA-65) and the burner's owner bind (Ed25519) over the same fields, with the consent's time T
+/// or, from the `wallet_one_node` gate, without a time - which this node checks
+/// (registration_door::check_client_submit), backs with the committee's burn attestations and hands to the
+/// pool and its peers. Every refusal carries a stable `code` next to its old text; a resubmit for a node
+/// whose registration the pool holds gets that hash again.
 pub(super) async fn handle_node_registration_client_submit(
     req: NodeRegistrationClientRequest,
     remote_addr: Option<std::net::SocketAddr>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
-    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "transaction") {
-        return Ok(rate_limit_response);
+    let refused = |r: SubmitRefusal| {
+        r.log(&req.node_id);
+        warp::reply::json(r.body())
+    };
+    if let Err(retry) = api_rate_limit_retry(remote_addr, "transaction") {
+        return Ok(refused(SubmitRefusal::rate_limited("rate_limited", retry)));
     }
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    // The height the producer judges what this door admits: the node's tip + 1.
+    let admission_height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT
+        .load(std::sync::atomic::Ordering::Acquire).saturating_add(1);
+    let bind_v2 = crate::node::BlockchainNode::owner_bind_v2_allowed(&qnet_state::NodeType::Light, admission_height);
+    let mut checked = match check_client_submit(&req, now, bind_v2) {
+        Ok(c) => c,
+        Err(r) => return Ok(refused(r)),
+    };
 
-    // Only light nodes use client-side TX creation.
-    // Super node registration is server-initiated (requires server-side authorization + staking).
-    if req.node_type != "light" {
-        if crate::node::is_warn() {
-            println!("[WARN][NODE-REG-CLIENT] reject node={} reason=node_type_not_light", req.node_id);
-        }
-        return Ok(warp::reply::json(&json!({
-            "success": false,
-            "error": "Only light node self-registration is supported via this endpoint"
-        })));
-    }
-
-    // Validate EON address: from and wallet_address must be identical
-    if req.from != req.wallet_address {
-        if crate::node::is_warn() {
-            println!("[WARN][NODE-REG-CLIENT] reject node={} reason=from_ne_wallet", req.node_id);
-        }
-        return Ok(warp::reply::json(&json!({
-            "success": false,
-            "error": "from and wallet_address must match"
-        })));
-    }
-    if let Err(e) = validate_eon_address_with_error(&req.from) {
-        if crate::node::is_warn() {
-            println!("[WARN][NODE-REG-CLIENT] reject node={} reason=invalid_eon", req.node_id);
-        }
-        return Ok(warp::reply::json(&json!({
-            "success": false,
-            "error": "Invalid wallet address",
-            "details": e
-        })));
-    }
-
-    // SECURITY check #1: node_id MUST be the wallet-derived pseudonym. node_id keys the on-chain
-    // registry + the light-reward roster + the attestation-key commitment, so an unbound node_id would
-    // let anyone register an arbitrary id for a wallet. The region prefix is a cosmetic privacy label
-    // (per-node QNET_REGION), so we bind only the wallet-hash suffix — region-agnostic, deterministic.
-    {
-        let expected_suffix = blake3::hash(
-            format!("LIGHT_NODE_PRIVACY_{}", req.wallet_address).as_bytes()
-        ).to_hex();
-        let suffix_ok = req.node_id.starts_with("light_")
-            && req.node_id.rsplit('_').next() == Some(&expected_suffix[..16]);
-        if !suffix_ok {
-            if crate::node::is_warn() {
-                println!("[WARN][NODE-REG-CLIENT] reject node={} reason=node_id_not_pseudonym", req.node_id);
-            }
-            return Ok(warp::reply::json(&json!({
-                "success": false,
-                "error": "node_id is not the wallet-derived pseudonym"
-            })));
-        }
-    }
-
-    // SECURITY check #2: proof-of-ownership of the burning Solana wallet. Every light node backs its
-    // registration with a Solana 1DEV burn, so control of `burn_wallet` is the universal proof the
-    // submitter is the real owner (works for native AND Solana-imported QNet wallets). Without this an
-    // attacker could front-run a victim's first registration using the victim's PUBLIC burn_tx and
-    // commit an attacker-owned Dilithium key as the victim's immutable attestation root.
-    match (req.burn_wallet.as_deref().filter(|s| !s.is_empty()), req.owner_signature.as_deref()) {
-        (Some(solana_wallet), Some(owner_sig)) if !owner_sig.is_empty() => {
-            // Shared builder — block validation rebuilds the identical string from the TX, so the two
-            // can never drift apart. The attestation root is bound in: for a Solana-derived wallet it is
-            // the ONLY thing tying the submitted ML-DSA key to the burner's intent.
-            let wire_pk = req.dilithium_public_key.as_deref()
-                .and_then(|h| hex::decode(h).ok()).unwrap_or_default();
-            let owner_msg = qnet_state::Transaction::burn_owner_bind_message(
-                &req.node_id, &req.wallet_address, &req.registration_proof, req.timestamp, &wire_pk,
-                req.burn_tx_hash.as_deref().unwrap_or(""));
-            match crate::crypto::solana_derivation::verify_ed25519_signature(
-                owner_msg.as_bytes(), owner_sig, solana_wallet
-            ) {
-                Ok(true) => {}
-                _ => {
-                    if crate::node::is_warn() {
-                        println!("[WARN][NODE-REG-CLIENT] reject node={} reason=owner_signature_invalid", req.node_id);
-                    }
-                    return Ok(warp::reply::json(&json!({
-                        "success": false,
-                        "error": "owner_signature invalid — not the burning wallet's owner"
-                    })));
-                }
-            }
-        }
-        _ => {
-            if crate::node::is_warn() {
-                println!("[WARN][NODE-REG-CLIENT] reject node={} reason=burn_wallet_or_owner_sig_missing", req.node_id);
-            }
-            return Ok(warp::reply::json(&json!({
-                "success": false,
-                "error": "burn_wallet + owner_signature required (proof of wallet ownership)"
-            })));
-        }
-    }
-
-    // SECURITY check #3: wallet_address (which DETERMINES node_id) must be DERIVED from a credential the
-    // submitter provably controls. PURE DILITHIUM (F0.1): a native wallet derives from the ML-DSA-65 key
-    // (control proven by the client_node_reg Dilithium signature verified below); a Solana-imported wallet
-    // derives from burn_wallet (control proven by owner_signature above). Closes node_id squatting.
-    let native_bound = req.dilithium_public_key.as_deref()
-        .and_then(crate::crypto::solana_derivation::eon_from_qnet_dilithium_pubkey)
-        .as_deref() == Some(req.wallet_address.as_str());
-    let solana_bound = req.burn_wallet.as_deref()
-        .map(crate::crypto::solana_derivation::eon_from_solana_address)
-        .as_deref() == Some(req.wallet_address.as_str());
-    if !native_bound && !solana_bound {
-        if crate::node::is_warn() {
-            println!("[WARN][NODE-REG-CLIENT] reject node={} reason=wallet_not_derived", req.node_id);
-        }
-        return Ok(warp::reply::json(&json!({
-            "success": false,
-            "error": "wallet_address not derived from dilithium_public_key or burn_wallet (ownership unproven)"
-        })));
-    }
-
-    // Reject stale requests: timestamp must be within 5 minutes
-    {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        if now.abs_diff(req.timestamp) > 300 {
-            if crate::node::is_warn() {
-                println!("[WARN][NODE-REG-CLIENT] reject node={} reason=timestamp_stale skew={}s", req.node_id, now.abs_diff(req.timestamp));
-            }
-            return Ok(warp::reply::json(&json!({
-                "success": false,
-                "error": "Request timestamp too old or too far in future (max 5 min)"
-            })));
-        }
-    }
-
-    // Build the on-chain NodeRegistration TX NOW (Light only; super is blocked above) so the SAME strict
-    // verifier the producer/block-validator uses (verify_node_lifecycle_dilithium: raw detached sig
-    // len==3309 + pk len==1952 over the canonical client_node_reg message) gates admission. This makes
-    // the admission accept-set a SUBSET of the block-validation accept-set by construction — the asymmetry
-    // that let a sig pass here and get poison-evicted at the producer is closed. Burn fields are stamped
-    // after this gate (they are not part of the signed message).
-    let mut reg_tx = crate::node::BlockchainNode::create_node_registration_tx_with_timestamp(
-        &req.node_id,
-        qnet_state::NodeType::Light,
-        &req.wallet_address,
-        &req.registration_proof,
-        "",
-        Some(req.timestamp),
-    );
-    // Mark client-signed so build_canonical_verify_message selects the client_node_reg preimage.
-    reg_tx.data = Some(format!("client_node_reg:{}:{}:{}:",
-        req.node_id, req.wallet_address, req.registration_proof));
-    // FIX-5 wire: client sends HEX of the raw detached sig (3309 B) + raw pk (1952 B). A malformed hex
-    // decodes to None → the gate below rejects (never a silent sig-less admission).
-    if let Some(ref dil_sig) = req.dilithium_signature {
-        reg_tx.dilithium_signature = hex::decode(dil_sig).ok();
-    }
-    if let Some(ref dil_pk) = req.dilithium_public_key {
-        reg_tx.dilithium_public_key = hex::decode(dil_pk).ok();
-    }
-
-    // Signature gate — SAME verifier as the producer/block-validator. Native (Dilithium-derived) wallet:
-    // the client_node_reg sig is MANDATORY. Solana-imported wallet: optional (authority = owner_signature
-    // + 2f+1 burn quorum), but if present it must verify — mirroring the producer's `Some(sig)=>verify,_=>true`.
-    let has_sig = reg_tx.dilithium_signature.as_deref().map_or(false, |s| !s.is_empty());
-    if native_bound {
-        if !has_sig || !crate::node::BlockchainNode::verify_node_lifecycle_dilithium(&reg_tx) {
-            if crate::node::is_warn() {
-                println!("[WARN][NODE-REG-CLIENT] reject node={} reason=dilithium_sig_invalid", req.node_id);
-            }
-            return Ok(warp::reply::json(&json!({
-                "success": false,
-                "error": "native registration requires a valid ML-DSA-65 signature (pure-PQ)"
-            })));
-        }
-    } else if has_sig && !crate::node::BlockchainNode::verify_node_lifecycle_dilithium(&reg_tx) {
-        if crate::node::is_warn() {
-            println!("[WARN][NODE-REG-CLIENT] reject node={} reason=dilithium_sig_invalid", req.node_id);
-        }
-        return Ok(warp::reply::json(&json!({
-            "success": false,
-            "error": "ML-DSA-65 signature verification failed"
-        })));
-    }
-
-    // Early state-level check: reject already-registered nodes before mempool
-    // This gives immediate feedback to the client and prevents mempool pollution
+    // Registered already: immediate feedback, and no attestation round spent on it.
     {
         let state_mgr = blockchain.get_state_manager();
         let state = state_mgr.read().await;
         if state.is_node_registered(&req.node_id) {
-            if crate::node::is_warn() {
-                println!("[WARN][NODE-REG-CLIENT] reject node={} reason=already_registered", req.node_id);
-            }
-            return Ok(warp::reply::json(&json!({
-                "success": false,
-                "error": "Node already registered",
-                "node_id": req.node_id
-            })));
+            return Ok(refused(SubmitRefusal::new(SubmitCode::AlreadyRegistered, "already_registered", "Node already registered")
+                .with("node_id", req.node_id.clone())));
+        }
+    }
+    // One wallet, one node (wallet_one_node gate): the rule the producer and block validation apply, asked here
+    // before any attestation round. After the check above, so a node already on chain keeps its own answer.
+    if let Some((other, _)) = crate::node::BlockchainNode::wallet_one_node_other(
+        &blockchain.get_storage(), &req.wallet_address, &req.node_id, admission_height)
+    {
+        return Ok(refused(SubmitRefusal::new(SubmitCode::WalletHasNode, "wallet_has_node", WALLET_HAS_NODE_TEXT)
+            .with("node_id", other)));
+    }
+
+    // U5 (b): the pool holds this node's registration and a block can still carry it: the same hash
+    // again, no new attestation round. A consent stays usable for a day, so without this every replay of
+    // a signed pair would buy a round of issuance promotions and a pool entry.
+    let mempool = blockchain.get_mempool();
+    if let Some(tx_hash) = reusable_pending_registration(&mempool, &req.node_id, next_apply_epoch()) {
+        if crate::node::is_info() {
+            println!("[INFO][NODE-REG-CLIENT] resubmit_pending node={} hash={}...",
+                     req.node_id, qnet_state::char_prefix(&tx_hash, 16));
+        }
+        return Ok(warp::reply::json(&json!({
+            "success": true,
+            "tx_hash": tx_hash,
+            "node_id": req.node_id,
+            "pending": true,
+            "message": "NodeRegistration TX already pending"
+        })));
+    }
+    // One attestation round per node at a time: a second submit meanwhile retries and then finds the
+    // first one's registration above.
+    let Some(_round) = SubmitInFlight::enter(&req.node_id, now) else {
+        return Ok(refused(SubmitRefusal::new(SubmitCode::QuorumPending, "submit_in_flight",
+            "burn-attestation quorum not yet reached (another submit for this node is collecting it); retry shortly")));
+    };
+
+    // attest_epoch is pinned from THIS node's tip: behind the chain, the tx it would arm has its
+    // verifier window already closing, so refuse (retryable) with the server arm gate's own test.
+    if let Some(p2p) = blockchain.get_unified_p2p() {
+        let local = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Acquire);
+        let ceiling = p2p.corroborated_head_ceiling();
+        if crate::node::arm_deficit_exceeded(local, ceiling) {
+            return Ok(refused(SubmitRefusal::new(SubmitCode::BehindChain, "node_behind", "node is behind the chain; retry shortly")
+                .with("height", local).with("head", ceiling)));
         }
     }
 
-    // Option A: embed the Solana 1DEV burn so this ON-CHAIN Light registration passes burn-attestation
-    // (without it, burn_attestation_required=0 hard-rejects the empty-burn TX and light never lands on
-    // chain). The registration_proof the client signed = blake3(burn_tx:node_id:wallet)[..32], so
-    // recomputing it from the sent burn binds the burn to the signature — a swapped burn fails below.
-    // The round committee (genesis era = the 5 genesis) attests the verified Solana burn; ≥quorum sigs
-    // are embedded so verify_burn_attestation_quorum accepts on every node. The on-chain reg then
-    // populates lrtr_ + the burn→wallet cbw binding (light Sybil control under consensus).
-    if let (Some(burn_tx), Some(burn_amount), Some(solana_wallet)) = (
-        req.burn_tx_hash.as_deref().filter(|s| !s.is_empty()),
-        req.burn_amount.filter(|a| *a > 0),
-        req.burn_wallet.as_deref().filter(|s| !s.is_empty()),
-    ) {
-        let proof_input = format!("{}:{}:{}", burn_tx, req.node_id, req.wallet_address);
-        let proof_hash = blake3::hash(proof_input.as_bytes()).to_hex().to_string();
-        if proof_hash.get(..32) != Some(req.registration_proof.as_str()) {
-            if crate::node::is_warn() {
-                println!("[WARN][NODE-REG-CLIENT] reject node={} reason=burn_proof_mismatch", req.node_id);
-            }
-            return Ok(warp::reply::json(&json!({
-                "success": false,
-                "error": "burn_tx_hash does not match the signed registration_proof"
-            })));
-        }
-        // attest_epoch is pinned from THIS node's tip: behind the chain, the tx it would arm has its
-        // verifier window already closing, so refuse (retryable) with the server arm gate's own test.
-        if let Some(p2p) = blockchain.get_unified_p2p() {
-            let local = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Acquire);
-            let ceiling = p2p.corroborated_head_ceiling();
-            if crate::node::arm_deficit_exceeded(local, ceiling) {
-                if crate::node::is_warn() {
-                    println!("[WARN][NODE-REG-CLIENT] reject node={} reason=node_behind local={} ceiling={} (retryable)", req.node_id, local, ceiling);
-                }
-                return Ok(warp::reply::json(&json!({
-                    "success": false,
-                    "error": "node is behind the chain; retry shortly",
-                    "height": local,
-                    "head": ceiling
-                })));
-            }
-        }
-        // Local Phase-1 cost hint (advisory only); each attestor recomputes + signs its own value.
-        // Through the single-flight cache: an uncached read here is one Solana round-trip per
-        // registration attempt, i.e. an attacker-paced fan-out to one external endpoint.
-        let cost_hint = match cached_solana_1dev_supply().await {
-            Ok((tb, cs)) => qnet_state::Transaction::phase1_activation_cost(tb, cs),
-            Err(_) => 0,
-        };
-        // The client-declared burn_amount is now only a hint; the embedded burn_amount is the
-        // committee-certified agreed_amount (== what the counted 2f+1 signed), so an honest over-burn
-        // still verifies. Exact-burn (declared == actual) ⇒ agreed_amount == burn_amount (unchanged).
-        let storage_ref = crate::node::get_storage();
-        // The client's owner_signature (verified above) travels to every attestor: an attestor refuses
-        // to attest a burn whose owner did not authorize this beneficiary.
-        let owner_sig_str = req.owner_signature.clone().unwrap_or_default();
-        let reg_attest_tag = qnet_state::Transaction::attest_root_tag(
-            reg_tx.dilithium_public_key.as_deref().unwrap_or(&[]));
-        let owner_proof = crate::node::BurnOwnerProof {
-            node_id: &req.node_id,
-            registration_proof: &req.registration_proof,
-            timestamp: req.timestamp,
-            signature: &owner_sig_str,
-            attest_root_tag: &reg_attest_tag,
-        };
-        let (attestors, agreed_cost, agreed_amount, agreed_epoch) = crate::node::BlockchainNode::collect_burn_attestations(
-            burn_tx, solana_wallet, &req.wallet_address, burn_amount,
-            qnet_state::NodeType::Light, cost_hint, &owner_proof, &**storage_ref,
-        ).await;
-        // Quorum of the committee OF agreed_epoch — the SAME committee the attestors signed for and the
-        // on-chain verifier re-resolves (M-5), so `need` EXACTLY matches the verifier's threshold. Genesis
-        // era ⇒ the genesis set; post-genesis None ⇒ this node can't read that epoch's N-2 committee ⇒
-        // return retry-later rather than arm a registration the verifier rejects forever.
-        let arm_genesis_era = agreed_epoch <= 2;
-        let arm_rep_h = agreed_epoch.saturating_sub(1) * 90 + 1;
-        let arm_committee_len = match crate::node::BlockchainNode::committee_for_height(&**storage_ref, arm_rep_h) {
-            Some(c) => c.len(),
-            None if arm_genesis_era => crate::genesis_constants::genesis_node_count(),
-            None => {
-                if crate::node::is_warn() {
-                    println!("[WARN][NODE-REG-CLIENT] reject node={} reason=committee_unavailable epoch={} (retryable)", req.node_id, agreed_epoch);
-                }
-                return Ok(warp::reply::json(&json!({
-                    "success": false,
-                    "error": "burn-attestation committee unavailable (node syncing); retry shortly",
-                    "epoch": agreed_epoch
-                })));
-            }
-        };
-        let need = qnet_consensus::checkpoint_bft::quorum_size(arm_committee_len);
-        if attestors.len() < need {
-            if crate::node::is_warn() {
-                println!("[WARN][NODE-REG-CLIENT] reject node={} reason=burn_quorum_not_reached got={} need={} (retryable)", req.node_id, attestors.len(), need);
-            }
-            return Ok(warp::reply::json(&json!({
-                "success": false,
-                "error": "burn-attestation quorum not yet reached; retry shortly",
-                "got": attestors.len(),
-                "need": need,
-                "cost": agreed_cost,
-                "amount": agreed_amount
-            })));
-        }
-        if let qnet_state::TransactionType::NodeRegistration {
-            burn_tx: bt, burn_wallet: bw, burn_owner_sig: bos, burn_amount: ba, burn_cost: bc,
-            burn_attestors: at, attest_epoch: ae, ..
-        } = &mut reg_tx.tx_type {
-            *bt = burn_tx.to_string();
-            *bw = solana_wallet.to_string();
-            // Carry the burner's authorization ON-CHAIN (verified above at admission, re-verified at
-            // block validation) — the admission check alone is advisory, any node can craft the TX.
-            *bos = req.owner_signature.clone().unwrap_or_default();
-            *ba = agreed_amount;
-            *bc = agreed_cost;
-            *at = attestors;
-            *ae = agreed_epoch;
-        }
+    // U14: a burn this door has not looked at costs every attestor a Solana lookup, and the cabinet's
+    // payment key is a fresh burner each time, so the door meters first sight per client address and
+    // per node before it asks.
+    let storage_ref = crate::node::get_storage();
+    let known = storage_ref.attest_burn_verified_get(&checked.burn_tx, &checked.burn_wallet).ok().flatten().is_some();
+    if let Err(retry) = door_admit_lookup(remote_addr.map(|a| a.ip()), &req.node_id, &checked.burn_tx,
+                                          &checked.burn_wallet, known, now) {
+        return Ok(refused(SubmitRefusal::rate_limited("first_sight_metered", retry)));
     }
 
-    // Recalculate hash with updated fields
-    reg_tx.hash = reg_tx.calculate_hash();
+    // Local Phase-1 cost hint (advisory only); each attestor recomputes + signs its own value.
+    // Through the single-flight cache: an uncached read here is one Solana round-trip per
+    // registration attempt, i.e. an attacker-paced fan-out to one external endpoint.
+    let cost_hint = match cached_solana_1dev_supply().await {
+        Ok((tb, cs)) => qnet_state::Transaction::phase1_activation_cost(tb, cs),
+        Err(_) => 0,
+    };
+    // The client-declared burn_amount is only a hint; the embedded amount is the committee-certified
+    // agreed_amount (what the counted attestors signed), so an honest over-burn still verifies. The
+    // owner signature travels to every attestor: none attests a burn whose owner did not name this
+    // beneficiary.
+    let reg_attest_tag = qnet_state::Transaction::attest_root_tag(
+        checked.reg_tx.dilithium_public_key.as_deref().unwrap_or(&[]));
+    let owner_proof = crate::node::BurnOwnerProof {
+        node_id: &req.node_id,
+        registration_proof: &req.registration_proof,
+        timestamp: req.timestamp,
+        signature: &checked.owner_sig,
+        attest_root_tag: &reg_attest_tag,
+    };
+    let (attestors, agreed_cost, agreed_amount, agreed_epoch) = crate::node::BlockchainNode::collect_burn_attestations(
+        &checked.burn_tx, &checked.burn_wallet, &req.wallet_address, checked.burn_amount,
+        qnet_state::NodeType::Light, cost_hint, &owner_proof, &**storage_ref, Some(&*blockchain),
+    ).await;
+    // Quorum of the committee OF agreed_epoch — the SAME committee the attestors signed for and the
+    // on-chain verifier re-resolves (M-5), so `need` EXACTLY matches the verifier's threshold. Genesis
+    // era ⇒ the genesis set; post-genesis None ⇒ this node can't read that epoch's N-2 committee ⇒
+    // return retry-later rather than arm a registration the verifier rejects forever.
+    let arm_genesis_era = agreed_epoch <= 2;
+    let arm_rep_h = agreed_epoch.saturating_sub(1) * 90 + 1;
+    let arm_committee_len = match crate::node::BlockchainNode::committee_for_height(&**storage_ref, arm_rep_h) {
+        Some(c) => c.len(),
+        None if arm_genesis_era => crate::genesis_constants::genesis_node_count(),
+        None => {
+            return Ok(refused(SubmitRefusal::new(SubmitCode::CommitteeUnavailable, "committee_unavailable",
+                "burn-attestation committee unavailable (node syncing); retry shortly").with("epoch", agreed_epoch)));
+        }
+    };
+    let need = qnet_consensus::checkpoint_bft::quorum_size(arm_committee_len);
+    if attestors.len() < need {
+        return Ok(refused(SubmitRefusal::new(SubmitCode::QuorumPending, "burn_quorum_not_reached",
+            "burn-attestation quorum not yet reached; retry shortly")
+            .with("got", attestors.len()).with("need", need).with("cost", agreed_cost).with("amount", agreed_amount)));
+    }
+    stamp_burn_attestation(&mut checked, attestors, agreed_cost, agreed_amount, agreed_epoch);
+    // The judge every peer and the producer run, at the height the next block is judged: a registration
+    // they would drop is a retry here, never a success.
+    if let Err(e) = crate::node::BlockchainNode::verify_burn_attestation_quorum(
+        &checked.reg_tx, crate::node::BlockchainNode::admission_height(), &**storage_ref).await
+    {
+        if crate::node::is_warn() {
+            println!("[WARN][NODE-REG-CLIENT] judge_refused node={} reason={}", req.node_id, e);
+        }
+        return Ok(refused(SubmitRefusal::new(SubmitCode::QuorumPending, "burn_quorum_unverified",
+            "burn-attestation quorum not yet reached; retry shortly")));
+    }
 
+    let reg_tx = checked.reg_tx;
     let tx_hash = reg_tx.hash.clone();
     let tx_bytes = bincode::serialize(&reg_tx).unwrap_or_default();
-    let mempool = blockchain.get_mempool();
-
+    // A registration the pool still holds for this node went stale; this one replaces it (one per node).
+    if let Some(old) = pending_registration_tx(&req.node_id) {
+        if crate::node::is_info() {
+            println!("[INFO][NODE-REG-CLIENT] rearm node={} replaces={}...", req.node_id, qnet_state::char_prefix(&old, 16));
+        }
+    }
     if mempool.add_binary_transaction(tx_bytes.clone(), tx_hash.clone(), 0) {
         println!("[INFO][NODE-REG-CLIENT] tx_added node={} wallet={}... hash={}...",
                  req.node_id,
@@ -2894,11 +2436,8 @@ pub(super) async fn handle_node_registration_client_submit(
             "message": "NodeRegistration TX submitted successfully"
         })))
     } else {
-        eprintln!("[WARN][NODE-REG-CLIENT] tx_add_failed node={}", req.node_id);
-        Ok(warp::reply::json(&json!({
-            "success": false,
-            "error": "Failed to add TX to mempool (duplicate or mempool full)"
-        })))
+        Ok(refused(SubmitRefusal::new(SubmitCode::MempoolRejected, "tx_add_failed",
+            "Failed to add TX to mempool (duplicate or mempool full)")))
     }
 }
 

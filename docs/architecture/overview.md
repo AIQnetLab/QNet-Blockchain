@@ -135,8 +135,9 @@ checkpoint quorum certificate.
 | Consensus | Excluded by type, before any reputation check | Producer, checkpoint voter, failover voter |
 | Consensus key | None; the registry row holds at most the SHA3-256 digest (`vrf_pk_sha3`) of the key its device's ping delegation is verified under | Mandatory 1952-byte ML-DSA-65 `vrf_pk` |
 | Archival | Never | Yes |
-| Registration | Client-side from the mobile wallet | Server-side by the node itself |
-| Devices | At most 3 bound devices | Server or VPS |
+| Registration | Submitted by the aiqnet.io node cabinet or the browser extension with the wallet's consent; the receiving node builds the transaction | Server-side by the node itself |
+| Devices | One phone or tablet at a time: the device its binding names | Server or VPS |
+
 
 A Super node whose registration would carry a `vrf_pk` of the wrong length aborts its registration arm
 rather than stamping a keyless row, because the chain-confirmed identity fields are immutable once
@@ -189,8 +190,9 @@ A Super node runs these concurrently; each owns a distinct module.
 - **Sync manager** (`sync_manager.rs`) — initial catch-up, desync recovery and post-rollback resync,
   in sequential waves bounded by pipeline backpressure. Certified bodies it already holds above the
   applied tip go to the pipeline from disk before peers are asked for them.
-- **Storage** (`storage/`) — RocksDB with 30 declared column families, plus an hourly cleanup pass
-  that applies the per-artifact retention rules. See [state and storage](./state.md).
+- **Storage** (`storage/`) — RocksDB with 34 declared column families, the derived account-tree DB
+  (`state_tree/`) and proof aux DB (`state_aux/`) with the certified proof views over them, plus an
+  hourly cleanup pass that applies the per-artifact retention rules. See [state and storage](./state.md).
 - **RPC and WebSocket server** (`rpc/`) — the HTTP API, rate limiting, and event subscriptions. See
   [RPC API](../developers/rpc-api.md).
 - **Liveness loops** (`node/lifecycle.rs`) — periodic anchored Heartbeat transactions for Super nodes
@@ -231,7 +233,8 @@ Outside the Rust workspace: `applications/qnet-mobile` (the [mobile wallet](../a
 `applications/qnet-wallet` (the [browser extension](../applications/browser-wallet.md)),
 `applications/qnet-explorer` (the [explorer](../applications/explorer.md)),
 `applications/qnet-cli` (the [command-line tool](../applications/cli.md)),
-`development/qnet-sdk` (the TypeScript [SDK](../developers/sdk.md)) and `development/qnet-contracts`
+`development/qnet-sdk` (the TypeScript [SDK](../developers/sdk.md) and the [`qnet` command line](../developers/cli.md)),
+`contracts` (Rust contract templates in a Cargo workspace of its own) and `development/qnet-contracts`
 (contract examples and the external burn program, see [smart contracts](../developers/smart-contracts.md)).
 
 ## Data flow

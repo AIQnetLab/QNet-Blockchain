@@ -9,6 +9,9 @@ const { getDefaultConfig, mergeConfig } = require('@react-native/metro-config');
 const path = require('path');
 
 const config = {
+  // Part of every transform cache key. Metro does not key its cache on babel.config.js, so a change there
+  // (release builds strip console output) needs a bump here, or untouched files keep their old transforms.
+  cacheVersion: 'strip-console-1',
   transformer: {
     // Disable inline requires so ALL modules go into the main bundle upfront.
     // Without this, js-sha3 and @solana/web3.js are lazy-loaded as separate

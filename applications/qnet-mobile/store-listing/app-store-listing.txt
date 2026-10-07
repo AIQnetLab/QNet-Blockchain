@@ -1,5 +1,7 @@
 APP STORE LISTING — QNet Wallet
-Publisher: Orrery Group LLC (Apple Developer Program, Organization) · Bundle ID: com.qnet.mobile
+Publisher: Orrery Group LLC (Apple Developer Program, Organization) · Bundle ID: com.qnetmobile
+(the Xcode project's PRODUCT_BUNDLE_IDENTIFIER and the site's apple-app-site-association use the same ID;
+__tests__/StoreListing.test.js keeps the three equal)
 
 ====================
 NAME (30 chars max)
@@ -9,55 +11,56 @@ QNet Wallet
 ====================
 SUBTITLE (30 chars max)
 ====================
-Wallet and light node for QNet
+Post-quantum wallet for QNet
 
 ====================
 PROMOTIONAL TEXT (170 chars max, editable without a new build)
 ====================
-Non-custodial wallet for the QNet network with an optional light node. Keys stay on your device; the network only ever sees what you sign.
+Non-custodial wallet for the QNet network with post-quantum signatures. Keys are created on your device and never leave it.
 
 ====================
 DESCRIPTION (4000 chars max)
 ====================
-QNet Wallet is a non-custodial wallet for the QNet network. Keys are created on your iPhone and never leave it. The app has no accounts, no analytics and no tracking.
+QNet Wallet is a non-custodial wallet for the QNet network. Keys are created on your device and never leave it. The app has no accounts, no analytics and no tracking, and works the same on iPhone and iPad.
 
 WALLET
-• Create a wallet or import one from a BIP39 seed phrase
-• Send and receive QNC and QNet tokens; show a QR code of your address
-• Transaction history that outlives node pruning — every entry opens in the block explorer
-• Filter history by asset
-• Unlocks with Face ID, Touch ID or the device passcode — there is no app password
+• Create a wallet or restore one from a 12- or 24-word recovery phrase
+• Send and receive QNC and QNet tokens, and SOL and 1DEV from the wallet's Solana address (Solana devnet test tokens); show a QR code of your address, or scan an address or a Solana payment request to fill in the Send form
+• Transaction history that outlives node pruning; each confirmed QNet transaction opens in the block explorer, and the SOL and 1DEV sends made on this device are listed too
+• History split by network, QNet and Solana, under a header for each day
+• Unlocks with Face ID, Touch ID or the device passcode, or with a password on a device without one
+• A built-in web browser to use websites with the wallet: every connection, message signature, send and contract call is shown and confirmed in the app first
 
 LIGHT NODE (OPTIONAL)
-The app can run a QNet light node. A few times per four-hour epoch the network sends your iPhone a silent status request; the app signs it and answers in the background. Between requests the app only wakes now and then to send one signed attestation per epoch; nothing is computed beyond signing. Each epoch's answers are recorded on chain, and that epoch's emission is shared among the nodes that answered. Rewards are claimed from the app as an ordinary on-chain transaction.
+A QNet light node is registered to a wallet on the QNet network. If the network lists one for your wallet, the Node tab shows it and this device can run it: about once every four hours the network sends a short signed status request, and the app answers with one ML-DSA-65 signature. This is not mining: no hashing, no proof-of-work, and blocks are produced by server nodes. The Node tab shows whether the node answered this epoch, how many epochs the network counted, and the node balance, which you can move into your wallet with an ordinary transaction. You can stop at any time. A wallet's super node runs on a server; the Node tab shows its status, epochs and node balance. The app sells nothing and has no in-app purchases.
 
-Activating a node is an on-chain action you sign yourself. In the current phase it burns 1DEV tokens on Solana; the burned tokens are destroyed, and the publisher receives nothing.
+The node runs only on a device that passes the system's device check, one node per device. It runs on iPhone and iPad; it is not offered on Mac or Apple Vision Pro.
 
 POST-QUANTUM CRYPTOGRAPHY
-Transactions are signed on the device with ML-DSA-65 (NIST FIPS 204). The QNet network's transport uses ML-KEM-768 hybrid key exchange.
+QNet transactions are signed on the device with ML-DSA-65 (NIST FIPS 204); SOL and 1DEV transfers are signed on the device with the wallet's Solana key (Ed25519).
 
 OPEN SOURCE
-The app, the browser extension and the explorer are open source under Apache-2.0; the node is source-available under the Business Source License 1.1. All of it is one public repository, so anyone can read exactly what the app does and build it.
+The app is open source under Apache-2.0, in one public repository with the rest of QNet; the node is source-available under the Business Source License 1.1.
 
 LANGUAGES
-English, with partial translations into Chinese (Simplified), Russian, Spanish, French, German, Japanese, Korean, Portuguese, Arabic and Italian.
+English, Chinese (Simplified), Russian, Spanish, French, German, Japanese, Korean, Portuguese, Arabic and Italian.
 
 GOOD TO KNOW
-• QNet is an experimental network at the testnet stage. Tokens may have no monetary value; rewards are decided by the network protocol and are not guaranteed.
-• Your seed phrase is the only backup. Nobody can recover it for you.
-• A light node needs Background App Refresh and the app left running in the background: https://aiqnet.io/support
+• QNet is an experimental network at the testnet stage. QNC has no market value. SOL and 1DEV in the app are Solana devnet test tokens with no market value either. Any node balance is set by the network protocol, is not guaranteed and is not paid by Orrery Group LLC.
+• Your recovery phrase is the only backup. Nobody can recover it for you.
+• The system decides when an app may run in the background, so some epochs can be missed; an app closed from the app switcher, or not opened since the phone restarted, answers again when it is opened: https://aiqnet.io/support?from=app
 
 ====================
 KEYWORDS (100 chars max, comma-separated)
 ====================
-qnet,wallet,crypto,post-quantum,quantum,node,light node,blockchain,non-custodial,QNC
+qnet,wallet,crypto,post-quantum,quantum,node,blockchain,non-custodial,QNC,ML-DSA
 
 ====================
 URLS
 ====================
-Support URL:    https://aiqnet.io/support
-Marketing URL:  https://aiqnet.io/wallet
-Privacy Policy: https://aiqnet.io/privacy
+Support URL:    https://aiqnet.io/support?from=app
+Marketing URL:  https://aiqnet.io/explorer?from=app
+Privacy Policy: https://aiqnet.io/privacy?from=app
 Copyright:      2026 Orrery Group LLC
 
 ====================
@@ -68,36 +71,62 @@ Primary: Finance. Secondary: Utilities.
 ====================
 AGE RATING
 ====================
-Answer the questionnaire truthfully: no gambling, no contests, no unrestricted web access, no user-generated
-content. Cryptocurrency features are not part of the rating questionnaire.
+Answer the questionnaire truthfully: no gambling, no contests, no user-generated content — and Unrestricted
+Web Access: Yes, because the built-in browser opens any website (store-listing/README.md, "App Store — age
+rating"). Cryptocurrency features are not part of the rating questionnaire.
+
+====================
+AVAILABILITY (App Store Connect, before the first node release)
+====================
+iPhone and iPad: on. Mac (iPhone and iPad apps on Apple silicon): off. Apple Vision Pro: off. TestFlight builds are
+not offered on Mac. Content rights: contains, shows or accesses third-party content — Yes (the web browser, token logos).
 
 ====================
 APP REVIEW INFORMATION — NOTES (paste into App Store Connect; the sign-in section stays empty, there is no account)
 ====================
-QNet Wallet is a non-custodial wallet for the QNet network, published by Orrery Group LLC (an organization
-account). There is no sign-in: a wallet is created from a seed phrase on the device.
+QNet Wallet is a non-custodial wallet for the QNet test network (QNC has no market value) by Orrery Group LLC; it also sends SOL and 1DEV (Solana devnet test tokens). No sign-in or account; Face ID, Touch ID or passcode unlocks a wallet made from a recovery phrase.
 
-A test wallet with a QNC balance and an already activated light node is provided below so every screen
-can be reached: Assets (send/receive/history), Receive, Node (status and reward claim), Activate.
-  Seed phrase:   <provided at submission, never committed>
-  (No app password: the wallet unlocks with Face ID, Touch ID or the device passcode.)
+NODE TAB. The open wallet's node as the network records it: none (text only); a light node on this device (status, balance, Move to wallet), on another device or on none (Use this device); a super node on its server, only shown (status, last seen, epochs, balance, Move to wallet). Only on aiqnet.io: one line. A linked light node answers the network's status request about once per four-hour epoch with one ML-DSA-65 signature: no hashing, no proof-of-work; server nodes produce blocks. The wallet works fully without a node.
 
-About the light node: the device signs a periodic status request from the network — no computation is
-performed on the device, and nothing runs between requests. The request arrives as a silent push
-(content-available) and is answered in the background. Rewards are protocol emission recorded on chain,
-shared among the nodes that answered in an epoch, and claimed as an ordinary on-chain transaction; the
-app offers no currency for tasks and has no referral programme.
+WHERE A NODE COMES FROM. One per wallet, made outside this app. For a light node, on aiqnet.io in a browser, the website burns 1DEV test tokens from a one-time address it creates, funded from the user's Solana wallet, possibly this app with an ordinary SOL and 1DEV send. Burned tokens go to nobody, Orrery Group LLC included. A super node is registered with the QNet browser extension on a computer and runs on the user's own server with the QNet node software; the app only shows it. The app has no receipt code, burn or code entry, or link to aiqnet.io's node page; its browser does not open it.
 
-About activation: activating a node is an on-chain registration the user signs. In the current phase it
-burns 1DEV tokens the user already holds on Solana; the tokens are destroyed — the publisher receives
-nothing and sells nothing. The app sells no digital goods and has no in-app purchases. The network is at
-the testnet stage; the app says so.
+REQUESTS FROM THE WEBSITE. Five sheets no button or menu inside the app opens: only a verified universal link on link.aiqnet.io, each confirmed with Face ID, Touch ID or passcode: (1) "Share this wallet's addresses"; (2) "Set up a light node for this wallet": the wallet signs that the website may prepare a light node for it with a one-time address the website then makes (no funds leave the wallet); (3) "Link this wallet's node to this device": the wallet signs its own consent to its node's registration (if still pending) and binds this device's answer key and push channel; (4) "Move node balance to this wallet"; (5) "Unlink this wallet's node from this device". The app signs nothing for another wallet and never burns or buys anything.
 
-Encryption: ML-DSA-65 signatures, SHA-3/SHAKE and AES-256-GCM — standard algorithms (NIST FIPS 204/202/197)
-implemented in the app, not proprietary ones. ITSAppUsesNonExemptEncryption is set to YES.
+DEVICE CHECK. Light nodes run only on a physical iPhone or iPad; when one is linked the app uses Apple's App Attest and DeviceCheck (no prompt, no tracking) so that one device runs one node; the link sheet and "Use this device" disclose it before Confirm; the wallet is never checked. A demo node moves to a review device at once (in four hours if it ran this app's node before).
+
+NODE BALANCE. Each epoch the protocol splits its issuance among the nodes that answered its status request, in the background or when the app is opened. Move to wallet claims it in an ordinary transaction; not a payment from Orrery Group LLC, not guaranteed. The app offers nothing for downloads, referrals, posts, reviews or any promotional action.
+
+DEMO. Wallet A: node on the publisher's test device. Node > Use this device > confirm: Online, "Answered this epoch: Yes, <time>"; Move to wallet works (above 1 QNC); then with A open https://aiqnet.io/node in Safari: "QNet Wallet on this phone" > "Open QNet Wallet" (sheet 1), Device > "Move the node to another device" > "Open QNet Wallet" (sheet 3), "Unlink this device" (sheet 5). Wallet B: no node. Wallet C (optional): no node; Testnet > "Get test tokens"; My node > Activate > "Make a payment address" > "Open QNet Wallet" (sheet 2), send the amounts, "Burn", "Continue in QNet Wallet" > "Open QNet Wallet" (sheet 3 with consent).
+A: <12 words, pasted by the owner at submission, never committed>
+B: <12 words, pasted by the owner at submission, never committed>
+C: <12 words, pasted by the owner at submission, never committed>
+
+Before pasting: check that aiqnet.io runs with CABINET_PHONE_FLOWS=1 (sheets 2, 3 and 5 need it, docs/applications/explorer.md)
+and that the DEMO labels match the live site. The block above is at most 3,850 characters with three real phrases of the
+longest words (store-listing test), under App Store Connect's 4,000. The BACKGROUND paragraph goes into the attached PDF,
+with {x} replaced by the measured battery figure. Attach the 2–3 minute recording: cabinet activation on testnet with
+the reservation sheet, the SOL and 1DEV sent from this app to the payment address, the link sheet with its device check,
+the Node tab going Online, Move to wallet, the unlink sheet.
+
+ATTACHED PDF — BACKGROUND (not pasted into the notes):
+BACKGROUND, only while a node is linked (sheet 5, another device's link or deleting the wallet ends it): a silent push (no alert, sound or badge) about once per epoch, answered with one signature within seconds; background fetch refreshes the status and sends a missing reply. No notification permission is asked or shown. Battery: {x}% per 24 h.
+
+====================
+EXPORT COMPLIANCE (App Store Connect's encryption questions, not the notes)
+====================
+Encryption: ML-DSA-65 signatures, Ed25519 signatures (Solana transfers), SHA-3/SHAKE, X25519 with HKDF-SHA256 and
+AES-256-GCM (the encrypted answers to aiqnet.io's requests), PBKDF2-SHA256 with AES-256-GCM (keys at rest) — standard
+algorithms (NIST FIPS 204/202/197, RFC 7748/8032/5869/8018) implemented in the app, not proprietary ones; the device key
+of App Attest is Apple's. ITSAppUsesNonExemptEncryption is set to YES (store-listing/README.md, "Export compliance").
+====================
+SCREENSHOTS
+====================
+The same six scenes on iPhone 6.9" (1320×2868) and iPad 13" (2064×2752), taken from the build under review on each
+layout: Assets with a QNC balance; the send confirmation; History; the Node tab linked to this device (Online, answered
+this epoch, counted epochs, a modest node balance, Move to wallet); the in-app browser on the explorer; Receive with the
+QR. Never the web cabinet, a burn, a price or a code; captions name features only.
 
 ====================
 NOT PREPARED YET
 ====================
-Screenshots for 6.9" and 6.5" iPhones (and 13" iPad if iPad is enabled — consider iPhone-only for the
-first release). Store-listing translations (English only at launch).
+The screenshots above. Store-listing translations (English only at launch).

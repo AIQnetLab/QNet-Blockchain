@@ -31,7 +31,7 @@ Initial allocation, as published by the project: 750,000,000 1DEV (75%) distribu
 | 1DEV mint, mainnet | `4R3DPW4BY97kJRfv8J5wgTtbDpoXpRv92W957tXMpump` |
 | Burn contract, all clusters | `CCZSessk1TbWie6Ye2JX2cNEWHTEWxCwe5sLz8JaFriw` |
 
-All four are compile-time constants in `development/qnet-integration/src/network_config.rs`, selected by the network profile, and the mainnet mint is the same literal the mobile and browser wallets compile in — one value across node, app and extension, so a burn is measured against the same mint everywhere. The devnet/testnet mint is a test token, distinct from the mainnet mint above. An environment override is accepted only when it is base58 of pubkey length, and a value that is not exits at startup. See [configuration.md](../operators/configuration.md).
+All four are compile-time constants in `development/qnet-integration/src/network_config.rs`, selected by the network profile. The browser extension compiles both mints, the same literals, and burns against the one of its Solana cluster (devnet in every build today, `dist/background/config.js`). The mobile app and the aiqnet.io node cabinet compile the devnet mint only: the app reads the 1DEV balance, and the cabinet burns on devnet. The devnet/testnet mint is a test token, distinct from the mainnet mint above; a mainnet release has to give the app and the cabinet the mainnet mint first. An environment override is accepted only when it is base58 of pubkey length, and a value that is not exits at startup. See [configuration.md](../operators/configuration.md).
 
 The burn program in `development/qnet-contracts/1dev-burn-contract` pins the devnet mint as its `OFFICIAL_1DEV_MINT` constant and rejects any other mint, so a mainnet deployment requires rebuilding that program against the mainnet mint.
 
@@ -90,7 +90,7 @@ An existing operator is not re-charged at the transition: `NodeActivation` apply
 
 ## Burn mechanics
 
-- A burn is permanent: tokens sent to the Solana burn address leave the 1DEV supply and cannot be recovered or re-minted.
+- A burn is permanent. Activation burns are made in two places, both with the SPL Token `Burn` instruction, which removes the tokens from the 1DEV supply; they cannot be recovered or re-minted: the QNet browser extension, with the wallet's own key (its Activate tab, or the node cabinet at aiqnet.io/node asking it through `qnet_activateNode`), and the node cabinet itself, with a one-time payment key it creates in the browser, for a light node only, whose burn names the wallet it is for (see [node-activation.md](node-activation.md#activation-code)). Nodes also accept a transfer to the Solana incinerator as a burn (see [node-activation.md](node-activation.md)).
 - One burn activates exactly one node. The binding is enforced from committed QNet state by a `burn_tx -> node_id` uniqueness index, keyed on `node_id` rather than wallet, precisely because one wallet owns two distinct pseudonyms (Super and Light) and a wallet-keyed bind would let a single burn activate both tiers for one fee.
 - The burning Solana wallet must sign an authorization message binding the beneficiary wallet, node id and the node's attestation-root tag, so a burn can only ever activate the node its owner named, running the key its owner named.
 - A quorum of committee members must independently sign an attestation over `(burn_tx, burner, beneficiary, amount, node_type, cost, attest_epoch)`. Attestation is committee-wide, not limited to the genesis nodes.

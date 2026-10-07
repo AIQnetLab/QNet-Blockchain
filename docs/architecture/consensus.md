@@ -49,10 +49,23 @@ branch on `is_active`, and deploy the binary everywhere before that height.
 | `light_key_commitment` | a light node's registration writes its key commitment into its registry row, as a Super node's registration does | 691,200 |
 | `light_shard_backup_owners` | a light shard's eligibility bitmap is accepted from any of its three genesis owners, and the light commit window opens 150 blocks before the epoch end instead of 50 | 691,200 |
 | `slot_gap_reanchor` | a microblock timestamp follows its parent's or declares a gap (see [slot cadence](#slot-cadence-and-block-timestamps)) instead of the genesis grid | 1,339,200 |
+| `contract_gas_signed` | a contract call's signature covers its gas price and gas limit; below it the form without them is accepted too | 1,497,600 |
+| `microblock_sig_raw` | a microblock carries its producer signature as raw ML-DSA-65 bytes instead of the `dilithium3_v4:<hex>` string | 1,612,800 |
+| `tx_target_bound` | every field a transaction's apply acts on is covered by a signature bound to the account it acts on, and a system transaction's unsigned envelope fields hold the one value its builder writes ([Transactions](../developers/transactions.md#system-transactions)) | 2,851,200 |
+| `wallet_one_node` | one wallet, one node of either type: a non-genesis `NodeRegistration` is refused when its wallet already has another node registered on chain below the block (its genesis, super or light id), and a block may not carry two registrations of one wallet under different node ids; a light registration's owner bind may take its form without a time ([light node messages](../protocols/light-node-messages.md#4-wallet-key-and-ping-key-messages)) | 2,851,200 |
+| `failover_tenure_bound` | a failover round belongs to the 30-block tenure it was certified for ([timeout votes](#timeout-votes)); fork choice compares two blocks only where their branches part and never rolls back toward a branch that contradicts this node's finality ([fork choice](#fork-choice)); a producer may sign a (height, round) it never signed at that round or above ([producer self-checks](#producer-self-checks)) | 2,851,200 |
 
 The five gates at height 0 run from the genesis block. The two light gates share the epoch boundary 691,200
 (48 × 14,400): the bitmap-owner rule reads the block height while the commit-window rule reads the epoch start, and only
-a boundary moves both together. Because the heights live in the binary, agreement needs no on-chain governance vote. See
+a boundary moves both together. `wallet_one_node` holds the same provisional height as `tx_target_bound` until
+`scripts/gate-height.sh` sets it for the push that ships it; below it a wallet registered with both types keeps both, so
+blocks already on disk replay unchanged. The rule is judged where registrations are judged (block verification, the
+producer's re-check and the admission doors), never in apply or replay. `failover_tenure_bound` holds the same
+provisional height the same way. It is read at the first slot of a tenure (`failover_tenure_bound(h)` asks the gate at
+`tenure_first_slot(h)`), so no tenure runs on two rules: with the gate `G` on a window boundary, slot `G` is the last slot
+of a tenure that keeps the old rules, the first gated tenure is `[G+1, G+30]`, and window `G/90` is the last window that
+holds an old-rule slot. Because the heights live in the binary,
+agreement needs no on-chain governance vote. See
 [maintenance](../operators/maintenance.md#upgrading-a-node) for how a gated change is rolled out.
 
 ## Slot cadence and block timestamps
@@ -138,10 +151,14 @@ the whole roster with no exclusion sets and no collisions. The round used is the
 relative one. A microblock carries two signed fields, `timeout_round` and `carried_baseline`, whose sum is the absolute
 round. Both come from a single snapshot of the slot's certified round, so `timeout_round + carried_baseline ==
 certified_round_for_slot(h)` holds by construction and any pollution in a node's local baseline cancels in the
-reconstructed value. The slot's certified round is the higher of the certified rounds of its own window and of the window
-its 30-block tenure began in: 90 = 3 × 30 puts every window rollover on the last slot of a tenure, and keying that slot
-on the new window alone would re-elect the leader the tenure had already rotated away from. Election, the ingest gate,
-fork choice and the producer's authority re-check all read it. Electing on the absolute round is what prevents two honest nodes with divergent baselines from each
+reconstructed value. Below the `failover_tenure_bound` gate the slot's certified round is the higher of the certified
+rounds of its own window and of the window its 30-block tenure began in: 90 = 3 × 30 puts every window rollover on the
+last slot of a tenure, and keying that slot on the new window alone would re-elect the leader the tenure had already
+rotated away from. A round keyed by window still carries into the next tenure of the same window, for the nodes that hold
+its certificate: one certificate then elects two producers for one height while it propagates. From the gate the round
+is keyed by the tenure itself, and the slot's certified round is the highest round certified for its own tenure, under
+either window the tenure's slots fall in, so a certificate rotates the tenure it was raised for and no other. Election,
+the ingest gate, fork choice and the producer's authority re-check all read `certified_round_for_slot`. Electing on the absolute round is what prevents two honest nodes with divergent baselines from each
 electing themselves.
 
 Ingest enforces the exact predicate the producer used: `failover_round_authorized_for_slot(h, block_round,
@@ -159,13 +176,14 @@ Timeout-vote emission, window amplification and the chronic-stall nudge run in a
 long awaits — sync scans, macroblock consensus, rollback — and a liveness mechanism inside it would
 park with it. The task reads only atomics and shared
 handles; a tick that exceeds 2 s is cancelled and retried, which is safe because emission is idempotent
-under the per-window pacing and every acceptance check (signature, window committee, voter dedup, the
+under the per-key pacing and every acceptance check (signature, window committee, voter dedup, the
 TC window floor) lives on the receiver.
 
-When a node's vote key is amplified to a higher committee-supported window, it votes for its **own**
-window in the same tick as well (cross-key voting; the receiver dedups per voter, the TC floor still
-bars re-entering a certified window), so the node's vote counts toward both keys' quorums from the
-first tick.
+A node votes under the key of the slot it fails over, `FailoverKey::for_slot(tip + 1)`: the window alone below the gate,
+the window and the slot's tenure from it. When its vote key is amplified to a higher committee-supported key — the
+lowest key above its own, ordered by first slot and then window, that `f+1` distinct committee voters already voted for —
+it votes for its **own** key in the same tick as well (cross-key voting; the receiver dedups per voter, the TC floor still
+bars re-entering a certified window), so the node's vote counts toward both keys' quorums from the first tick.
 
 ## Candidate roster
 
@@ -183,9 +201,11 @@ recoverable error state pending background sync.
 
 ### Genesis window and warmup
 
-Heights up to and including 180 use the static genesis candidate list — the five pinned genesis consensus identities whose
-ML-DSA-65 public keys are embedded in the binary. Epochs 1 and 2 have no on-chain `N-2` anchor and fall back to the same
-set, so the genesis-era committee is 5 and its quorum is 4. A separate gate applies to newcomers: `ACTIVATION_WARMUP_BLOCKS
+Heights up to and including 180 (`GENESIS_STATIC_ROSTER_LAST_HEIGHT`) use the static genesis candidate list — the five
+pinned genesis consensus identities whose ML-DSA-65 public keys are embedded in the binary. Epochs 1 and 2 have no on-chain
+`N-2` anchor and fall back to the same set, so the genesis-era committee is 5 and its quorum is 4. Only for those heights
+does a genesis node wait, before producing, until all five genesis nodes are in its active registry, so that every one
+reads the same static list; above them the candidates come from macroblock `N-2` and a restarted genesis produces at once. A separate gate applies to newcomers: `ACTIVATION_WARMUP_BLOCKS
 = 180` (two epochs). A registered Super node becomes producer-eligible only once its registration height is buried that
 deep, so a fresh joiner syncs as an observer before it can be elected. Genesis nodes (registration height 0) are exempt.
 
@@ -299,7 +319,7 @@ finality marker.
 
 A durable anti-double-sign mark is written with `fsync` before the signature is produced, so a crash between the two
 costs one slot rather than a second signature. It holds the highest height ever signed and the window, absolute round and
-height of the last signature. A block is signable above every height ever signed, or inside the last signature's window
+height of the last signature. Below the `failover_tenure_bound` gate it decides as follows. A block is signable above every height ever signed, or inside the last signature's window
 when its `(absolute round, height)` pair is strictly above the last one: within one view heights must climb, and a
 strictly higher view in that window may re-sign a height. Rounds of different windows are separate counters and are
 never compared. The higher view is what lets a producer that rolled back re-extend the branch it adopted — a different
@@ -307,6 +327,17 @@ view at one height is failover, not a double sign, and it already needs an n-f t
 the mark on height alone would bar such a producer from every height it had signed on the branch it abandoned. Only an
 operator rollback lowers the mark, to the height the node ends up at: it declares the blocks above abandoned across the
 fleet, and a mark above the tip would forbid heights nobody else will produce either.
+
+The window term still refuses forever a producer that signed up to `X` in one window and was rolled back into the window
+before: none of its heights there is above `X`, and the window differs. From the gate an exact record decides instead:
+with each signature, in the same synced write as the mark, the node stores the highest round it signed at that height
+(`sgr_` ++ height), and it may sign `(h, r)` exactly when nothing at `h` was signed at `r` or above. Equivocation is two
+bodies at one `(height, absolute round)`, so this refuses precisely the pair that would equivocate and nothing else: after
+any automatic rollback the producer signs every height it never signed, and its own heights at a higher round. Heights at
+or below the record's floor keep the height-only rule — the floor is seeded once at boot to the watermark loaded from a
+binary that kept no record, and raised to finality when the record is pruned there, where production never builds. The
+record is written below the gate too, so it is complete when the gate is crossed. An operator rollback lowers only the
+watermark; the record keeps refusing a pair this node already signed, and the fleet fails over past such a slot.
 
 Every one of these production preconditions reads local state only: the right to produce never depends on observing
 other nodes, because an input shared by every member of a connected mesh cannot distinguish isolation from a silent
@@ -569,7 +600,19 @@ verifier:
 
 ```
 QNET_TIMEOUT_V2:{window}:{round}:{hex(anchor)}:{high_qc_idx}:{hex(high_qc_hash)}:{tip_height}:{hex(tip_hash)}
+QNET_TIMEOUT_V3:{window}:{tenure}:{round}:{hex(anchor)}:{high_qc_idx}:{hex(high_qc_hash)}:{tip_height}:{hex(tip_hash)}
 ```
+
+The window-only form `V2` is the vote below the `failover_tenure_bound` gate. From the gate a vote and its certificate are
+keyed by `(window, tenure)` and signed in the `V3` form, where `tenure = (target_height - 1) / 30`. The key names the
+tenure, not the exact slot: voters stalled at different slots of one tenure must still aggregate, and each voter's signed
+tip already pins its slot. A tenure key is accepted only for a gated tenure and only under one of the windows its slots
+fall in (two for the tenure whose last slot opens a window, one otherwise); a window-only vote or certificate is refused
+for any window that holds no slot below the gate. Votes of two tenures therefore never sum to one quorum: on the sandbox
+on 04.10 two voters stalled at the last slot of a tenure and two at the first slot of the next formed one window
+certificate that rotated both. On the wire the gated forms are separate message variants appended to the message enum
+(`TimeoutVoteV3`, `TimeoutCertificateV3Broadcast`, `TimeoutCertificatesV3Response`), so a binary below the gate never
+sends them and an older binary that receives one drops it as unparsable while the connection stays up.
 
 `window` is the vote window (`target_height / 90`), `anchor` is the hash of the window's roster anchor — macroblock
 `window-2` while it is sealed, the frozen anchor `M_A` while finality is stalled, zeros for windows below 3 — and the
@@ -586,7 +629,9 @@ macroblock above its own seal is behind, not frozen: it pulls the anchor and abs
 anchor. The emitted round is `max(certified + 1, R)`, where `R` is the highest round
 already supported by `f+1` distinct committee voters — f+1 amplification jumps the target to a round at least one honest
 validator has reached, rather than stepping one round at a time — clamped to `MAX_FAILOVER_ROUND = 50`. Amplifying the vote
-*target* cannot cause dual production, because leader election still reads only the n−f-certified round. Re-emission per window is paced by its certified failover round: 5, 7, 11, 16 and 25 s, then every 30 s. At the cap the
+*target* cannot cause dual production, because leader election still reads only the n−f-certified round. The certified
+round and the cap are per key: the window's below the gate, the tenure's from it, so every tenure starts again at 0.
+Re-emission per key is paced by its certified failover round: 5, 7, 11, 16 and 25 s, then every 30 s. At the cap the
 pacemaker holds — it keeps emitting the clamped round and requests chronic-stall recovery sync in parallel — rather than
 going terminal.
 
@@ -596,7 +641,7 @@ anchor for the window is signature-verified last. Any other anchor is signature-
 a macroblock this node holds at or below the window's roster base, searched no deeper than `MAX_DERIVED_ROSTER_WINDOWS`
 below the lower of `window-2` and this node's own seal frontier. Resolution rather than equality with a re-derived anchor,
 because the anchor a node signs follows its own seal frontier; macroblock storage is index-keyed and first-write-wins, so
-an anchor minted on another branch resolves to nothing. A `(window, round)` bucket is tallied per anchor and a
+an anchor minted on another branch resolves to nothing. A `(key, round)` bucket is tallied per anchor and a
 certificate forms from one anchor group; a voter's newer vote with a different anchor replaces its older one. Received
 votes are re-gossiped to a rotated subset of the node's connected peers — self and the original voter excluded, with no
 committee filter on the recipients — with fanout 5 when the window committee exceeds 100 members and 3 otherwise. The
@@ -616,27 +661,35 @@ node's own seal are what tell a frozen-arm voter that it is behind.
 ### Certificates and round advance
 
 A `TimeoutProof` (aliased `TimeoutCertificate` in the integration layer) holds `height` — which is the vote **window**, not
-a block height — plus `timeout_round`, `anchor`, and the vector of signed votes. The votes themselves are the proof. The
-certificate forms when the votes of one anchor group reach the n−f quorum over the window committee, using the same quorum
-function as Checkpoint-BFT; on certification the proof is stored at `(window, round)` and `HIGHEST_CERTIFIED_ROUND[window]`
-is raised monotonically. A received certificate passes the same gates: window at or above the floor, round within
+a block height — plus `timeout_round`, `anchor`, and the vector of signed votes. The votes themselves are the proof. A
+`TimeoutProofV3`, the gated form on the wire and in a block, adds the `tenure`. The certificate forms when the votes of one
+anchor group reach the n−f quorum over the window committee, using the same quorum function as Checkpoint-BFT; on
+certification the proof is stored at `(key, round)` and `HIGHEST_CERTIFIED_ROUND[key]` is raised monotonically. A received
+certificate passes the same gates: an admissible key, window at or above the floor, round within
 `certified + MAX_FAILOVER_ROUND`, n−f distinct committee voters, one signature verified before its anchor must resolve,
-then every signature. The certificates are the one persisted fact; on restore the tracker is derived from them.
+then every signature. The certificates are the one persisted fact — window-only ones in `tcerts_v1`, tenure-bound ones in
+`tcerts_v3`, written in one batch and both re-verified on restore — and the tracker is derived from them.
+`RequestTimeoutCertificates` still names a window range; the answer carries window-only certificates in the v2 response
+and tenure-bound ones whose window is in range in the v3 response, at most 8 of each.
 
-That tracker is the *only* input that rotates the microblock leader. It advances on an n−f quorum within a single window
+That tracker is the *only* input that rotates the microblock leader. It advances on an n−f quorum within a single key
 and on nothing else — not on f+1, not across rounds, not on a clock. Producer and ingest gate read the same value, so they
 cannot disagree about whether a round is authorised, which is what prevents dual production.
 
 A microblock whose absolute round exceeds 0 is rejected at ingest unless that round is certified. The block stays replayable
 and the node rate-limited-pulls the window's certificates (`FAILOVER_CERT_PULL_COOLDOWN_SECS = 2` per window). A round>0
-microblock may also carry its own n−f `TimeoutProof` in its `timeout_proof` field; ingest adopts it in-band before checking
-authorization, so a node that missed the one-shot certificate broadcast still converges.
+microblock may also carry its own n−f certificate in its `timeout_proof` field; ingest adopts it in-band before checking
+authorization, so a node that missed the one-shot certificate broadcast still converges. From the gate that field holds a
+`TimeoutProofV3`, and only one certified for the carrying block's own tenure is adopted: a certificate for another tenure
+authorises nothing at that height.
 
 ### The failover floor
 
 The vote and certificate view floor is derived from finality, never stored: `observed_tc_window_floor() =
 LAST_FINALIZED_HEIGHT / MACROBLOCK_INTERVAL`. No honest node forms, accepts or tallies a vote or certificate for a window
-below it — a finalized window is sealed, which closes the banked-vote double-certificate vector. Because finality is a
+below it — a finalized window is sealed, which closes the banked-vote double-certificate vector — nor for a tenure key
+whose last slot is at or below `LAST_FINALIZED_HEIGHT`. A new certificate evicts the banked votes below it: lower windows
+for a window-only key, lower tenures for a tenure key. Because finality is a
 ratchet always at or below the node's applied tip, the floor can never sit *above* the window a node is failing over at.
 For the same reason a fork rollback retains certificate state: a certified round is a fact such a rollback cannot unmake.
 An operator rollback, which declares the chain above its target abandoned, deletes the persisted certificates with the
@@ -701,7 +754,7 @@ the tail rule in [fork choice](#fork-choice) counts.
 ## Fork choice
 
 At a stored height above finality, `maybe_supersede_by_certified_round` decides between the block a node holds and an
-incoming competitor, in this exact precedence:
+incoming competitor, in this exact precedence (the gated steps are described after the list):
 
 1. **QC-certified content, in our favour.** If a certificate names the body at that height — the stored window
    macroblock, else the committed 30-block checkpoint covering it — and *our* body equals that hash while the
@@ -721,6 +774,18 @@ that sibling holds our finality at that height forever. The equal-round tie-brea
 against the stored hash — because ML-DSA signatures are randomized and a signature-keyed tie could be re-ground at will. The
 same-producer requirement closes a reorg denial-of-service in which any registered node could grind a lower value and force
 a wasteful rollback.
+
+From the `failover_tenure_bound` gate, judged at the disputed height, two more steps sit after the content steps and
+before the round steps. A competitor whose branch contradicts this node's finality is ignored: its parent sits at or below
+the finality evidence floor, `max(LAST_FINALIZED_HEIGHT, committed_lists_top)`, and is not the block that evidence names
+there — the certified hash (sealed window or committed checkpoint) first, this node's own committed row only at or below
+its finalized height, so a node on the losing branch never reads the winning one as the contradiction. A block found so
+is remembered by hash (bounded at `4 × 90`, pruned at finality), and its children are contradicted without a lookup. Then
+a competitor on a different parent from ours is not compared at all: the rounds of two blocks with different parents say
+nothing about each other. The node records where the walk came from and requests the height below, so the comparison
+happens where the branches part; a branch found to contradict finality there is marked up the recorded walk. Only
+siblings — blocks on one parent — reach the round steps. A rollback decided by certified content or by a sibling's higher
+authorised round is marked decided, and the fork-recovery consumer does not apply the round-protected floor to it.
 
 `maybe_supersede_by_certified_round` returns immediately if the height is at or below `LAST_FINALIZED_HEIGHT`, so fork
 choice never touches finalized history, and for a height above the applied tip, where a stored row is not chain state. A
@@ -742,8 +807,20 @@ set is largest. Any `f+1` of them includes an honest party, and a branch cannot 
 records the contradicted height (`CONTRADICTED_TAILS`, bounded by `CONTRADICTED_TAILS_MAX = 256`) and signals fork
 recovery at `max(h-1, finalized)`.
 
-The fork-recovery consumer clamps its target at the snapshot anchor and then applies the round-protected floor: within
-two windows above the target, a block produced under a certified failover round is kept, with everything beneath it,
+From the gate neither destructive leg of a hash-chain break runs — not this one, and not the anchor-recovery detector,
+which compared the child's round with our block at the child's height although the two have different parents. On
+04.10 a lone node's branch built on a higher round kept rolling the finalized majority back at every height. A block
+whose branch contradicts finality is ignored outright, with no walk; every other break only solicits the parent height
+and broadcasts the rejection evidence, and the decision is taken by the sibling rule when the rival's block at the
+parting height arrives.
+
+Below and above the gate, a source that `2f+1` observers rejected as a chain break (`fork_source_flagged`) drives no
+heuristic rollback for the fork-cooldown window: the round-supersede, authenticated-child and anchor-recovery legs refuse
+a block from that peer or producer, logging `rollback_refused … reason=fork_source_quorum`, unless the producer is the
+leader this node elects for the height. Certified content still decides, and blocks that extend the chain still apply.
+
+The fork-recovery consumer clamps its target at the snapshot anchor and, unless the target was decided, applies the
+round-protected floor: within two windows above the target, a block produced under a certified failover round is kept, with everything beneath it,
 unless a certificate for a higher round of its slot has a voter quorum tip below it. The walk stops at the first height
 where the network names a different body — the certified window list, the committed checkpoint's list, or the
 contradicted-tail record — and a target at or below finality is never raised.
@@ -767,15 +844,19 @@ The pipeline carries its own bounded machinery so a contested or gappy tail is r
 | Mechanism | Bound |
 |---|---|
 | Fork-source peer cooldown — a peer that supplied a forked-branch block is deprioritised by the sync peer selector, falling back to the full set if every candidate is in cooldown | `FORKED_PEER_COOLDOWN_MS` = 5 minutes |
+| Fork-source quarantine — a source flagged by `2f+1` observers drives no heuristic rollback, refreshed by every new flag | `FORKED_PEER_COOLDOWN_MS` = 5 minutes, 1024 sources |
+| Gated: blocks contradicting finality, and the walk trail toward a parting point | `4 × 90` blocks, 512 entries |
 | Missing-parent request, deduplicated per height | `MISSING_BLOCK_REQUEST_TTL_MS` = 30 s |
 | Range repair, preferred over a cascade of single-height requests once the gap is large enough | `RANGE_SYNC_GAP_THRESHOLD` = 5 blocks, `RANGE_SYNC_WINDOW` = 500 (one serve-side batch), `RANGE_SYNC_RETRY_MS` = 10 s |
 | Deferred-block buffer, keyed by parent hash so siblings racing for one slot coexist instead of overwriting each other. At either cap the entry furthest from the tip is evicted and the arrival admitted, since the arrival is the one closer to what the node needs next. Swept on a clock whether or not blocks arrive; a parked block whose parent slot is already occupied is a child of the losing sibling and is dropped, so its height is fetched again | `DEFERRED_MAX` = 2000, `DEFERRED_MAX_PER_PRODUCER` = 2 × `ROTATION_INTERVAL_BLOCKS`, `DEFERRED_MAX_AGE_SECS` = 120, `DEFERRED_SWEEP_SECS` = 1 |
 | Apply-stage reorder window: the apply stage executes only the child of its applied tip, and a verified block beyond it waits in height order until the tip reaches its parent; past any bound it is dropped and refetched | `APPLY_HELD_MAX` = 512, `APPLY_HELD_MAX_BYTES` = 256 MiB, `APPLY_HELD_MAX_AGE` = 20 s |
+| Commit wait: a block whose parent passed verify but is not committed yet is not judged on a registry that may lack the parent's rows when it carries a `NodeRegistration`, `NodeActivation` or `NodeReactivation` (the one-node rule, the burn binding, the activation's registration, the reactivation key), or a transaction whose signer key does not resolve yet: a `Heartbeat` (the signer's key under its committed registry row), an `EquivocationProof` or `VoteEquivocationProof` (the offender's committed key), or a transaction signed in the registry envelope whose label a block still in flight registers or reactivates (its signer's binding in the consensus key registry, which that apply writes: unbound, a first-seen key verifies; bound, only that key does). A heartbeat of a signer whose key is already on chain is judged at once, since no chain apply changes a key once it resolves, and so is an envelope label nothing in flight can bind; idle eviction from the key registry, a reorg's pruning and an off-chain key write change those verdicts on their own, outside the wait. A waiting block is verified again from the top once the parent's slot is committed, so it gets the verdict every node that held the parent on arrival gives, and needs no gate; it is never rejected for waiting, and past a bound it is dropped and refetched | `COMMIT_DEFERRED_MAX` = 256, `COMMIT_DEFERRED_MAX_BYTES` = 128 MiB, `COMMIT_DEFERRED_MAX_AGE` = 60 s |
 | Gossip acceptance horizon above the local chain height | `GOSSIP_HORIZON` = 200 blocks; `DEFERRED_MAX` while syncing |
 
 Every hash-chain break solicits the parent height for repair, and break reports are witnessed per `(height, peer)`,
-where they only steer sync-source preference; the one break that rolls a tail back is the authenticated child described
-under [fork choice](#fork-choice). The pipeline tracks
+where they only steer sync-source preference; below the gate the one break that rolls a tail back is the authenticated
+child described under [fork choice](#fork-choice), and from the gate none does. A block deferred for a missing parent is
+dropped instead of parked when its parent is known to contradict finality. The pipeline tracks
 occupancy per stage with a 30-second stuck-stage detector over its operation codes, so a stalled stage is visible as
 itself instead of as generic sync lag. A verify livelock — one height re-entering verify without advancing — that persists
 over two detector windows nominates a fork-recovery target one block below the hung height, doubling in depth with each
@@ -794,6 +875,16 @@ the frozen-roster horizon caps it; the value is a pure function of committed sca
 height. `MAX_UNSEALED_WINDOWS = 2` drives sync and desync detection — a sync nudge at the QC-verified frontier and the
 macroblock-behind test in the sync coordinator. The apply-side seal backpressure also uses `MAX_DERIVED_ROSTER_WINDOWS *
 90`, so following the chain is not finality-gated.
+
+**Operator rollbacks** never go below what the node holds certified. `certified_rollback_floor` is the highest sealed
+window whose QC-named body list (all 90 hashes, not a placeholder) matches the bodies the node holds, walking down from
+the tip, raised to the highest committed checkpoint head at or below the tip whose list matches the stored bodies. A QC is
+`n−f` signatures and irrevocable: any surviving copy re-locks the engine on it and steers content fork choice back to its
+bodies, so after a rollback below one the fleet produced but never sealed again. `QNET_ROLLBACK_TO_LAST_SEALED=1`
+therefore rolls back to that floor, an explicit `QNET_ROLLBACK_TO_HEIGHT` below it is refused before any truncation
+(`[ERR][ROLLBACK] refused … reason=certified_checkpoint_irrevocable`), and a recovery decree below it is refused by every
+node that holds the floor — its sequence recorded, so it is not re-gossiped forever. A node forked below that point has a
+lower floor, because its own bodies do not match, and still heals.
 
 ## Related documents
 

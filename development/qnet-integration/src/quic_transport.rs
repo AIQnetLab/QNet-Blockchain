@@ -1853,8 +1853,19 @@ impl QuicTransport {
         }
 
         // Deserialize payload
-        bincode::deserialize(&data[6..6+payload_len])
-            .map_err(|e| format!("Deserialize failed: {}", e))
+        let msg: NetworkMessage = bincode::deserialize(&data[6..6+payload_len])
+            .map_err(|e| format!("Deserialize failed: {}", e))?;
+        // The cap above is the one the SENDER's header byte chose; the message must also fit its own type's
+        // cap, the one an honest sender enforces on itself (serialize_message). Otherwise a small message
+        // labelled a Block rode in at 10 MB instead of 2 MB (ND-1).
+        let own_limit = max_size_for_message_type(Self::get_message_type(&msg));
+        if payload_len > own_limit {
+            return Err(format!(
+                "Message type={} labelled type={} payload={}B exceeds its own type_limit={}B",
+                Self::get_message_type(&msg), msg_type, payload_len, own_limit
+            ));
+        }
+        Ok(msg)
     }
     
     /// Connect to a peer (client mode) with auto-retry
@@ -2619,6 +2630,8 @@ impl QuicTransport {
             NetworkMessage::MacroblocksBatch { .. } => 10,
             NetworkMessage::TimeoutCertificateBroadcast { .. } => 10,
             NetworkMessage::TimeoutCertificatesResponse { .. } => 10,
+            NetworkMessage::TimeoutCertificateV3Broadcast { .. } => 10,
+            NetworkMessage::TimeoutCertificatesV3Response { .. } => 10,
             // Catch-up reply: carries a checkpoint plus its full certificate, so it is the same
             // size class as the frames above. On the 2 MB catch-all it is refused at the sender,
             // silently, above roughly a 680-member committee.
@@ -3384,6 +3397,28 @@ mod tests_reachability {
 mod tests_wire_caps {
     use super::*;
     use crate::unified_p2p::NetworkMessage;
+
+    /// ND-1: the per-type cap used to be chosen by the sender's own header byte, never checked against the
+    /// decoded variant, so a light attestation labelled a Block rode in at 10 MB. It must fit its own cap.
+    #[test]
+    fn a_frame_must_fit_the_cap_of_the_type_it_decodes_to() {
+        let att = |filler: usize| NetworkMessage::LightNodeAttestation {
+            light_node_id: "light_n".to_string(), pinger_id: "genesis_node_001".to_string(), slot: 1, timestamp: 1,
+            light_node_signature: format!("ping_dilithium:{}", "A".repeat(filler)), pinger_signature: String::new(),
+            challenge: String::new(), gossip_hop: 0, block_height: 1,
+        };
+        let honest = QuicTransport::serialize_message(&att(8_000)).expect("an honest attestation fits");
+        assert!(QuicTransport::parse_message(&honest).is_ok());
+        let mut relabelled = honest.clone();
+        relabelled[1] = 1;
+        assert!(QuicTransport::parse_message(&relabelled).is_ok(), "a small frame fits either cap");
+        let payload = bincode::serialize(&att(3 * 1024 * 1024)).unwrap();
+        let mut forged = vec![PROTOCOL_VERSION, 1];
+        forged.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        forged.extend_from_slice(&payload);
+        let err = QuicTransport::parse_message(&forged).unwrap_err();
+        assert!(err.contains("exceeds its own type_limit"), "{}", err);
+    }
 
     /// The receiver rejects any frame above `max_size_for_message_type` BEFORE deserializing, so a
     /// message whose real frame outgrows its own cap is dropped by every peer with no log on either

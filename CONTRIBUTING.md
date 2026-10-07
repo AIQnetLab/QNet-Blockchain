@@ -34,15 +34,17 @@ The root `Cargo.toml` declares these members:
 | `qnet-state` | `core/qnet-state` | Accounts, transactions, state commitment, RocksDB |
 | `qnet-sharding` | `core/qnet-sharding` | Shard coordinator and parallel transaction validator |
 | `qnet-vm` | `core/qnet-vm` | Deterministic WASM contract VM (`wasmi`) and deploy-time validator |
+| `qnet-device-attest` | `core/qnet-device-attest` | Offline verification of the phone and tablet hardware evidence behind light nodes |
 | `qnet-integration` | `development/qnet-integration` | The node binary `qnet-node`, P2P, RPC |
 | `qnet-loadtest` | `development/qnet-loadtest` | External load-test harness |
 | `qnet-audit` | `audit` | Security and correctness test suites |
 
 Applications live outside the workspace under `applications/`: `qnet-mobile` (React Native),
-`qnet-wallet` (browser extension), `qnet-explorer` (Next.js), `qnet-cli` (Python). Two more
-components sit outside it as well: `development/qnet-sdk` (a TypeScript client package) and
-`development/qnet-contracts/1dev-burn-contract` (a Solana program that declares its own Cargo
-workspace).
+`qnet-wallet` (browser extension), `qnet-explorer` (Next.js), `qnet-cli` (Python). Three more
+components sit outside it as well: `development/qnet-sdk` (the TypeScript package `@aiqnet/sdk` and
+the `qnet` command line), `contracts` (Rust contract templates for the QNet VM, in a Cargo workspace
+of its own) and `development/qnet-contracts/1dev-burn-contract` (a Solana program that declares its
+own Cargo workspace).
 
 ## Build and test
 
@@ -75,6 +77,16 @@ cd applications/qnet-mobile        && npm install && npm test      # jest, react
 cd applications/qnet-mobile        && npm run lint                 # eslint
 cd applications/qnet-explorer/frontend && npm install && npm run lint && npm run build
 cd applications/qnet-wallet        && npm install && npm run build  # esbuild bundle
+```
+
+Documentation, protocols, the SDK and the contract templates:
+
+```bash
+node docs/protocols/tools/qnet-link-vectors.mjs --check   # the QNet Link vectors are current
+node docs/protocols/tools/light-node-vectors.mjs --check  # the light node vectors are current
+node --test docs/tools/docs-claims.test.mjs               # the documents' pinned statements
+cd development/qnet-sdk && npm ci && npm test              # the SDK and the qnet command
+cd contracts && cargo test                                  # the contract helper, templates and build tool
 ```
 
 Two notes. The mobile app runs `patch-package` on `postinstall`, and `.gitattributes` forces `*.patch`

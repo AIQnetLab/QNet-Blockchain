@@ -1,0 +1,10 @@
+{
+  "extName": {
+    "message": "محفظة QNet",
+    "description": "Extension name in the browser and the store."
+  },
+  "extDescription": {
+    "message": "محفظة QNet مقاومة للحوسبة الكمية (ML-DSA-65) مع حساب Solana. تفعّل عقدة QNet من نوع Light أو Super وتسجّل عقدة Light.",
+    "description": "Store and extensions-page description, at most 132 characters."
+  }
+}

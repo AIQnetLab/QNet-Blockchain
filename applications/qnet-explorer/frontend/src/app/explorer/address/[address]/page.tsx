@@ -1,11 +1,13 @@
 'use client';
 
 import React, { useState, useCallback, useEffect, useRef } from 'react';
-import Link from 'next/link';
+import ExplorerLink from '@/components/ExplorerLink';
 import { useParams } from 'next/navigation';
 import { useChainHead } from '@/hooks/useChainHead';
 import { getCache, setCache, isCacheStale } from '@/lib/explorer-cache';
 import TokenIcon from '@/components/TokenIcon';
+import { useActivationContent } from '@/contexts/AppContext';
+import { txPartyLabel, txTypeLabel } from '@/lib/tx-labels';
 
 interface AddressData {
   address: string;
@@ -57,74 +59,60 @@ interface AddressData {
   }>;
 }
 
-// v3.11: Balance proof verification result
+// The balance check's answer (/api/address/[address]/balance-proof): verified against the committee certificate of a
+// checkpoint, or why it is not.
 interface BalanceProofResult {
   verified: boolean;
-  balance: number;
-  blockHeight: number;
+  balance: string;
+  exists: boolean;
+  macroblockIndex: number;
+  stateHeight: number;
   stateRoot: string;
-  proofSize: number;
   verificationTime: number;
   error?: string;
 }
 
-// v3.11: Balance Verification Component
 const BalanceVerification = ({ address }: { address: string }) => {
   const [verifying, setVerifying] = useState(false);
   const [result, setResult] = useState<BalanceProofResult | null>(null);
   const [expanded, setExpanded] = useState(false);
-  
+
   const verifyBalance = async () => {
     setVerifying(true);
     setResult(null);
-    
     const startTime = performance.now();
-    
+    const failed = (error: string): BalanceProofResult => ({
+      verified: false, balance: '', exists: false, macroblockIndex: 0, stateHeight: 0, stateRoot: '',
+      verificationTime: Math.round(performance.now() - startTime), error,
+    });
     try {
-      // Fetch balance with Merkle proof
       const response = await fetch(`/api/address/${address}/balance-proof`);
       const data = await response.json();
-      
-      if (data.success && data.verified !== undefined) {
+      if (data.success && data.verified === true && typeof data.stateRoot === 'string' && typeof data.balance === 'string') {
         setResult({
-          verified: data.verified,
-          balance: data.balance || 0,
-          blockHeight: data.blockHeight || 0,
-          stateRoot: data.stateRoot || '',
-          proofSize: data.nodesAgreed || data.proofSize || 0,
+          verified: true,
+          balance: data.balance,
+          exists: data.exists === true,
+          macroblockIndex: Number(data.macroblockIndex) || 0,
+          stateHeight: Number(data.stateHeight) || 0,
+          stateRoot: data.stateRoot,
           verificationTime: Math.round(performance.now() - startTime),
         });
       } else {
-        setResult({
-          verified: false,
-          balance: 0,
-          blockHeight: 0,
-          stateRoot: '',
-          proofSize: 0,
-          verificationTime: Math.round(performance.now() - startTime),
-          error: data.error || 'Verification failed',
-        });
+        setResult(failed(typeof data.error === 'string' ? data.error : 'Verification failed'));
       }
     } catch (err) {
-      setResult({
-        verified: false,
-        balance: 0,
-        blockHeight: 0,
-        stateRoot: '',
-        proofSize: 0,
-        verificationTime: Math.round(performance.now() - startTime),
-        error: err instanceof Error ? err.message : 'Unknown error',
-      });
+      setResult(failed(err instanceof Error ? err.message : 'Unknown error'));
     } finally {
       setVerifying(false);
     }
   };
-  
+
   return (
     <div className="verification-section">
       <div className="verification-header">
-        <button 
-          onClick={verifyBalance} 
+        <button
+          onClick={verifyBalance}
           disabled={verifying}
           className={`verify-btn ${result?.verified ? 'verified' : ''}`}
         >
@@ -138,7 +126,7 @@ const BalanceVerification = ({ address }: { address: string }) => {
                 <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/>
                 <polyline points="22 4 12 14.01 9 11.01"/>
               </svg>
-              Verified (Multi-Node Consensus)
+              Verified by the committee certificate
             </>
           ) : (
             <>
@@ -149,38 +137,42 @@ const BalanceVerification = ({ address }: { address: string }) => {
             </>
           )}
         </button>
-        
+
         {result && (
-          <button 
-            onClick={() => setExpanded(!expanded)} 
+          <button
+            onClick={() => setExpanded(!expanded)}
             className="details-toggle"
           >
             {expanded ? 'Hide Details' : 'Show Details'}
           </button>
         )}
       </div>
-      
+
       {result && expanded && (
         <div className={`verification-details ${result.verified ? 'verified' : 'failed'}`}>
           <div className="detail-row">
             <span className="detail-label">Status</span>
             <span className={`detail-value ${result.verified ? 'text-success' : 'text-error'}`}>
-              {result.verified ? 'Cryptographically Verified' : (result.error || 'Verification Failed')}
+              {result.verified ? 'Proven against the certified state root' : (result.error || 'Verification failed')}
             </span>
           </div>
           {result.verified && (
             <>
               <div className="detail-row">
-                <span className="detail-label">Block Height</span>
-                <span className="detail-value">{result.blockHeight.toLocaleString()}</span>
+                <span className="detail-label">Proven Balance</span>
+                <span className="detail-value">{result.balance} QNC{result.exists ? '' : ' (no account yet)'}</span>
+              </div>
+              <div className="detail-row">
+                <span className="detail-label">Checkpoint</span>
+                <span className="detail-value">{result.macroblockIndex.toLocaleString()}</span>
+              </div>
+              <div className="detail-row">
+                <span className="detail-label">State at block</span>
+                <span className="detail-value">{result.stateHeight.toLocaleString()}</span>
               </div>
               <div className="detail-row">
                 <span className="detail-label">State Root</span>
                 <span className="detail-value mono">{result.stateRoot.slice(0, 16)}...</span>
-              </div>
-              <div className="detail-row">
-                <span className="detail-label">Nodes Agreed</span>
-                <span className="detail-value">{result.proofSize} / 5 nodes</span>
               </div>
               <div className="detail-row">
                 <span className="detail-label">Verification Time</span>
@@ -189,7 +181,10 @@ const BalanceVerification = ({ address }: { address: string }) => {
             </>
           )}
           <div className="verification-note">
-            Multi-node consensus verification ensures your balance is authentic without trusting any single node.
+            The balance is proven against the state root that the network&apos;s validator committee signed for this
+            checkpoint. The site checks the committee&apos;s signatures itself, so no single node is trusted. The proven
+            balance is the account&apos;s balance at that checkpoint, which is certified about one to two minutes after its
+            block; the balance shown above is the latest the explorer read and can be newer.
           </div>
         </div>
       )}
@@ -220,9 +215,9 @@ const OtherTokens = ({
             <div key={token.contract_address || idx} className="token-row-expanded">
               <span className="token-symbol">
                 {token.contract_address ? (
-                  <Link href={`/explorer/token/${token.contract_address}`} className="address-link">
+                  <ExplorerLink href={`/explorer/token/${token.contract_address}`} className="address-link">
                     {token.symbol || truncate(token.contract_address, 6, 4)}
-                  </Link>
+                  </ExplorerLink>
                 ) : (
                   token.symbol
                 )}
@@ -319,6 +314,8 @@ const CopyBtn = ({ text }: { text: string }) => {
 export default function AddressPage() {
   const params = useParams();
   const address = params.address as string;
+  // The app's view names reward and activation types by what they change (src/lib/tx-labels.ts).
+  const full = useActivationContent();
   
   // v3.52: Show cached data instantly, but ALWAYS fetch fresh data + auto-refresh
   const cachedData = address ? getCache<AddressData>('address', address) : null;
@@ -473,12 +470,12 @@ export default function AddressPage() {
                   return (
                     <tr key={idx}>
                       <td>
-                        <Link href={`/explorer/tx/${tx.hash}`} className="address-link">
+                        <ExplorerLink href={`/explorer/tx/${tx.hash}`} className="address-link">
                           {truncate(tx.hash, 6, 4)}
-                        </Link>
+                        </ExplorerLink>
                       </td>
                       <td>
-                        <span className={`type-badge type-${tx.type.toLowerCase()}`}>{tx.type}</span>
+                        <span className={`type-badge type-${tx.type.toLowerCase()}`}>{txTypeLabel(tx.type, full)}</span>
                       </td>
                       <td>
                         <span className={isSend ? 'tx-out' : 'tx-in'}>
@@ -488,29 +485,29 @@ export default function AddressPage() {
                           const addr = isSend ? tx.to : tx.from;
                           const isValid = addr && addr.length > 10 && addr.includes('eon');
                           return isValid ? (
-                            <Link href={`/explorer/address/${addr}`} className="address-link">
+                            <ExplorerLink href={`/explorer/address/${addr}`} className="address-link">
                               {truncate(addr, 6, 4)}
-                            </Link>
+                            </ExplorerLink>
                           ) : (
-                            <span className="address-link">{addr || 'N/A'}</span>
+                            <span className="address-link">{txPartyLabel(addr || 'N/A', full)}</span>
                           );
                         })()}
                       </td>
                       <td className={isSend ? 'amount-out' : 'amount-in'}>
                         {tx.amount.includes('QNC') ? (
-                          <Link href="/explorer/qnc" className="token-amount-link" style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                          <ExplorerLink href="/explorer/qnc" className="token-amount-link" style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
                             <TokenIcon native size={16} />
                             <span>{isSend ? '-' : '+'}{tx.amount}</span>
-                          </Link>
+                          </ExplorerLink>
                         ) : (
                           // No value moved (Heartbeat/Registration/etc.): bare amount, no +/- sign.
                           <span>{tx.amount}</span>
                         )}
                       </td>
                       <td>
-                        <Link href={`/explorer/block/${tx.block}`} className="address-link">
+                        <ExplorerLink href={`/explorer/block/${tx.block}`} className="address-link">
                           {tx.block}
-                        </Link>
+                        </ExplorerLink>
                       </td>
                       <td>{formatTimeAgo(tx.timestamp)}</td>
                     </tr>
@@ -567,16 +564,16 @@ export default function AddressPage() {
                 return (
                   <tr key={`${t.hash}-${idx}`}>
                     <td>
-                      <Link href={`/explorer/tx/${t.hash}`} className="address-link">
+                      <ExplorerLink href={`/explorer/tx/${t.hash}`} className="address-link">
                         {truncate(t.hash, 6, 4)}
-                      </Link>
+                      </ExplorerLink>
                     </td>
                     <td>
                       <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
                         <TokenIcon logo={t.logo} symbol={t.symbol} address={t.contract} size={16} />
-                        <Link href={`/explorer/token/${t.contract}`} className="address-link">
+                        <ExplorerLink href={`/explorer/token/${t.contract}`} className="address-link">
                           {t.symbol || truncate(t.contract, 6, 4)}
-                        </Link>
+                        </ExplorerLink>
                       </span>
                     </td>
                     <td className={isOut ? 'amount-out' : 'amount-in'}>
@@ -586,17 +583,17 @@ export default function AddressPage() {
                     <td>
                       <span className={isOut ? 'tx-out' : 'tx-in'}>{isOut ? '→ ' : '← '}</span>
                       {counterValid ? (
-                        <Link href={`/explorer/address/${counter}`} className="address-link">
+                        <ExplorerLink href={`/explorer/address/${counter}`} className="address-link">
                           {truncate(counter, 6, 4)}
-                        </Link>
+                        </ExplorerLink>
                       ) : (
-                        <span className="address-link">{t.kind === 'mint' ? 'Mint' : t.kind === 'burn' ? '🔥 Burn' : (counter || 'N/A')}</span>
+                        <span className="address-link">{t.kind === 'mint' ? 'Mint' : t.kind === 'burn' ? '🔥 Burn' : txPartyLabel(counter || 'N/A', full)}</span>
                       )}
                     </td>
                     <td>
-                      <Link href={`/explorer/block/${t.block}`} className="address-link">
+                      <ExplorerLink href={`/explorer/block/${t.block}`} className="address-link">
                         {t.block}
-                      </Link>
+                      </ExplorerLink>
                     </td>
                     <td>{formatTimeAgo(t.timestamp)}</td>
                   </tr>

@@ -3,6 +3,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { useChainHead } from '@/hooks/useChainHead';
 import Link from 'next/link';
+import { ANDROID_PLAY_URL } from '@/lib/app-links';
 
 interface NetworkStats {
   activeNodes: number;
@@ -97,9 +98,9 @@ export default function HomeClient({ initialStats }: HomeClientProps) {
             </div>
             <div className="stat-card">
               <div className="stat-number">{stats?.currentRound !== undefined ? stats.currentRound : '—'}</div>
-              <div className="stat-label">REWARD EPOCH</div>
+              <div className="stat-label">EPOCH</div>
               <div className="stat-trend">
-                {stats ? `Next: ${String(stats.blocksUntilReward).replace(/\B(?=(\d{3})+(?!\d))/g, ',')} blocks (${formatTimeRemaining(stats.secondsUntilReward)})` : 'Loading...'}
+                {stats ? `Ends in: ${String(stats.blocksUntilReward).replace(/\B(?=(\d{3})+(?!\d))/g, ',')} blocks (${formatTimeRemaining(stats.secondsUntilReward)})` : 'Loading...'}
               </div>
             </div>
             <div className="stat-card">
@@ -130,7 +131,7 @@ export default function HomeClient({ initialStats }: HomeClientProps) {
 
       <section className="features-section" style={{ marginTop: '1rem' }}>
         <div className="section-header">
-          <h2 className="section-title">Revolutionary Features</h2>
+          <h2 className="section-title">Features</h2>
         </div>
         
         <div className="features-grid">
@@ -262,8 +263,9 @@ export default function HomeClient({ initialStats }: HomeClientProps) {
             </div>
             <h3>Mobile-First Design</h3>
             <p>
-              A phone runs a light node by signing a periodic status request — nothing is computed, and battery use
-              is that of a messaging app. Keys live in the hardware-backed keystore on iOS and Android.
+              A phone or tablet runs a light node by signing a periodic status request. No hashing and no proof-of-work:
+              each answer is one signature, so the device does no sustained work. Keys live in the hardware-backed
+              keystore of the device.
             </p>
           </div>
           <div className="feature-card premium">
@@ -296,30 +298,26 @@ export default function HomeClient({ initialStats }: HomeClientProps) {
         <div className="section-header">
           <h2 className="section-title">Mobile-First Blockchain</h2>
           <p className="section-subtitle">
-            A blockchain designed for phones: participation is a signed answer, not computation
+            A blockchain designed for phones: participation is a signed answer, not proof-of-work
           </p>
         </div>
 
         <div className="technology-grid expanded">
           <div className="tech-item">
-            <h4 className="tech-title">Presence, Not Computation</h4>
-            <p>A light node answers a signed status request from the network a few times per four-hour epoch. Between requests the app only sends one signed attestation per epoch; nothing is computed, the device stays cool and the battery barely notices.</p>
+            <h4 className="tech-title">Presence, Not Proof-of-Work</h4>
+            <p>A light node answers a signed status request from the network a few times per four-hour epoch. Between requests the app only sends one signed attestation per epoch. No hashing and no proof-of-work: each answer is one signature, so the phone does no sustained work.</p>
           </div>
           <div className="tech-item">
-            <h4 className="tech-title">iOS</h4>
-            <p>Keys in the Keychain, Face ID or Touch ID unlock, silent push wake-ups for status requests. App Store listing in preparation.</p>
-          </div>
-          <div className="tech-item">
-            <h4 className="tech-title">Android</h4>
-            <p>Keys in the Android Keystore, biometric unlock, background wake-ups that survive Doze. Google Play listing in preparation.</p>
+            <h4 className="tech-title">One App on Every Phone and Tablet</h4>
+            <p>The same app and the same screens on iPhone, iPad and Android phones and tablets: silent push wake-ups for status requests, and an unlock with Face ID, Touch ID, a fingerprint or the device passcode, or an app password on a device without them. On <a href={ANDROID_PLAY_URL} target="_blank" rel="noopener noreferrer">Google Play</a> now; the App Store listing is in preparation.</p>
           </div>
           <div className="tech-item">
             <h4 className="tech-title">Hardware-Backed Security</h4>
-            <p>iOS Keychain & Android Keystore integration. Post-quantum keys stored in secure hardware enclaves.</p>
+            <p>Post-quantum keys are encrypted at rest and protected by the system keystore. A light node is bound to one device by a key in its secure hardware: one device runs one node, and computers and emulators run none.</p>
           </div>
           <div className="tech-item">
-            <h4 className="tech-title">Rewards for Answering</h4>
-            <p>Each epoch&apos;s answers are recorded on chain. That epoch&apos;s emission is shared by the nodes that answered — three quarters among light nodes, one quarter among super nodes — and claimed from the app.</p>
+            <h4 className="tech-title">How Emission Is Split</h4>
+            <p>For each epoch the chain records which nodes were online. The protocol adds a share of that epoch&apos;s emission to their node balance — three quarters among light nodes, one quarter among super nodes — and the wallet moves it into itself with an ordinary transaction.</p>
           </div>
           <div className="tech-item">
             <h4 className="tech-title">11 Languages Supported</h4>
@@ -332,14 +330,14 @@ export default function HomeClient({ initialStats }: HomeClientProps) {
         <div className="section-header">
           <h2 className="section-title">Economic Model V2 - Sharp Drop Halving</h2>
           <p className="section-subtitle">
-            Revolutionary two-phase system with Pool #3 activation benefits
+            Two activation phases and two reward pools
           </p>
         </div>
         
         <div className="technology-grid expanded">
           <div className="tech-item">
             <h4 className="tech-title">Phase 1: 1DEV Burn (Current)</h4>
-            <p>1DEV tokens are BURNED on Solana for node activation. 1,500 1DEV burn for any node type; the amount decreases as the supply burns. The tokens are destroyed and nobody receives them. Transition at 90% burned OR 5 years.</p>
+            <p>1DEV tokens are burned on Solana for node activation. 1,500 1DEV burn for any node type; the amount decreases as the supply burns. The tokens are destroyed and nobody receives them. Transition at 90% burned OR 5 years.</p>
           </div>
           <div className="tech-item">
             <h4 className="tech-title">Phase 2: QNC to Pool #3 (Future)</h4>
@@ -347,7 +345,7 @@ export default function HomeClient({ initialStats }: HomeClientProps) {
           </div>
           <div className="tech-item">
             <h4 className="tech-title">Sharp Drop Halving Innovation</h4>
-            <p>Years 0-20: Standard ÷2 every 4 years | Years 20-24: Sharp drop ÷10 | Years 24+: Resume from low base. Saves 107M QNC!</p>
+            <p>Years 0-20: Standard ÷2 every 4 years | Years 20-24: Sharp drop ÷10 | Years 24+: Resume from low base.</p>
           </div>
           <div className="tech-item">
             <h4 className="tech-title">Activation Amount by Network Size</h4>
@@ -355,7 +353,7 @@ export default function HomeClient({ initialStats }: HomeClientProps) {
           </div>
           <div className="tech-item">
             <h4 className="tech-title">Two Reward Pools</h4>
-            <p>1. Base emission on the halving schedule, split each epoch among the nodes that answered | 2. Pool #3, fed by Phase 2 activations and shared by all active nodes. Transaction fees go to the block producer.</p>
+            <p>1. Base emission on the halving schedule, split each epoch among the nodes recorded as online | 2. Pool #3, fed by Phase 2 activations and shared by all active nodes. Transaction fees go to the block producer.</p>
           </div>
           <div className="tech-item">
             <h4 className="tech-title">Post-Quantum Throughout</h4>

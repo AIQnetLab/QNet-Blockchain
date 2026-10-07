@@ -27,7 +27,7 @@ const DEVNET_RPC = 'https://api.devnet.solana.com';
 const TOKEN_NAME = '1DEV Test Token';
 const TOKEN_SYMBOL = '1DEV-TEST';
 const TOKEN_DECIMALS = 6;
-const TOTAL_SUPPLY = 1_000_000_000; // 1 billion tokens (pump.fun standard)
+const TOTAL_SUPPLY = 1_000_000_000; // 1 billion tokens
 const FAUCET_AMOUNT = 100_000_000; // 100M tokens for faucet (10% of supply)
 
 async function createTestToken() {
@@ -131,7 +131,6 @@ async function createTestToken() {
       privateKey: Array.from(faucetWallet.secretKey)
     },
     urls: {
-      solscan: `https://solscan.io/token/${mint.toString()}?cluster=devnet`,
       solanaExplorer: `https://explorer.solana.com/address/${mint.toString()}?cluster=devnet`
     }
   };
@@ -166,7 +165,6 @@ SOLANA_RPC_URL=${DEVNET_RPC}
   console.log(`Faucet Balance: ${FAUCET_AMOUNT.toLocaleString()} 1DEV-TEST`);
   console.log('');
   console.log('🔗 Explorer Links:');
-  console.log(`Solscan: https://solscan.io/token/${mint.toString()}?cluster=devnet`);
   console.log(`Solana Explorer: https://explorer.solana.com/address/${mint.toString()}?cluster=devnet`);
   console.log('');
   console.log('📁 Files Created:');

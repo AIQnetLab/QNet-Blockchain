@@ -1,11 +1,13 @@
 'use client';
 
 import React, { useState, useCallback, useEffect } from 'react';
-import Link from 'next/link';
+import ExplorerLink from '@/components/ExplorerLink';
 import { useParams } from 'next/navigation';
 import { setCache } from '@/lib/explorer-cache';
 import { formatTokenAmount } from '@/lib/token-format';
 import TokenIcon from '@/components/TokenIcon';
+import { useActivationContent } from '@/contexts/AppContext';
+import { txDataEntries, txPartyLabel, txTypeLabel } from '@/lib/tx-labels';
 
 // Decoded QRC-20 ContractCall: the contract is the tx `to`, the method + args
 // live in the tx `data` JSON ({"method","args":[...]}). Decimals must be
@@ -160,6 +162,8 @@ const TokenTransferCard = ({ call }: { call: DecodedTokenCall }) => {
     return () => { active = false; };
   }, [call.contract]);
 
+  const full = useActivationContent();
+
   // Until decimals are known, show raw base units (still exact, no float).
   const decimals = meta ? meta.decimals : 0;
   const symbol = meta ? meta.symbol : '';
@@ -169,9 +173,9 @@ const TokenTransferCard = ({ call }: { call: DecodedTokenCall }) => {
   const addrLink = (addr: string) => {
     const isValid = addr && addr.length > 10 && addr.includes('eon');
     return isValid ? (
-      <Link href={`/explorer/address/${addr}`} className="address-link">{truncate(addr, 12, 8)}</Link>
+      <ExplorerLink href={`/explorer/address/${addr}`} className="address-link">{truncate(addr, 12, 8)}</ExplorerLink>
     ) : (
-      <span className="address-link">{addr || 'N/A'}</span>
+      <span className="address-link">{txPartyLabel(addr || 'N/A', full)}</span>
     );
   };
 
@@ -188,10 +192,10 @@ const TokenTransferCard = ({ call }: { call: DecodedTokenCall }) => {
         <div className="detail-row">
           <span className="detail-label">Amount</span>
           <span className="detail-value">
-            <Link href={`/explorer/token/${call.contract}`} className="token-amount-link" style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+            <ExplorerLink href={`/explorer/token/${call.contract}`} className="token-amount-link" style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
               <TokenIcon logo={logo} symbol={symbol} address={call.contract} size={16} />
               <span>{amount}{symbol ? ` ${symbol}` : ''}</span>
-            </Link>
+            </ExplorerLink>
           </span>
         </div>
         <div className="detail-row">
@@ -201,9 +205,9 @@ const TokenTransferCard = ({ call }: { call: DecodedTokenCall }) => {
         <div className="detail-row">
           <span className="detail-label">Token</span>
           <span className="detail-value">
-            <Link href={`/explorer/token/${call.contract}`} className="address-link">
+            <ExplorerLink href={`/explorer/token/${call.contract}`} className="address-link">
               {symbol || truncate(call.contract, 12, 8)}
-            </Link>
+            </ExplorerLink>
             <CopyBtn text={call.contract} />
           </span>
         </div>
@@ -219,6 +223,8 @@ const TokenTransferCard = ({ call }: { call: DecodedTokenCall }) => {
 export default function TransactionPage() {
   const params = useParams();
   const hash = params.hash as string;
+  // The app's view names reward and activation types by what they change (src/lib/tx-labels.ts).
+  const full = useActivationContent();
   
   // v2.103: Initialize with null to avoid hydration mismatch (localStorage not available on server)
   const [tx, setTx] = useState<TransactionData | null>(null);
@@ -282,7 +288,7 @@ export default function TransactionPage() {
       <div className="block-header">
         <div className="block-header-top">
           <span className={`block-label`}>TRANSACTION</span>
-          <span className={`type-badge ${typeBadgeClass(tx.type)}`}>{tx.type}</span>
+          <span className={`type-badge ${typeBadgeClass(tx.type)}`}>{txTypeLabel(tx.type, full)}</span>
         </div>
         <div className="block-hash-display">
           <h1>{hash}</h1>
@@ -306,20 +312,20 @@ export default function TransactionPage() {
           <div className="detail-row">
             <span className="detail-label">Block</span>
             <span className="detail-value">
-              <Link href={`/explorer/block/${tx.block}`} className="address-link">
+              <ExplorerLink href={`/explorer/block/${tx.block}`} className="address-link">
                 {tx.block}
-              </Link>
+              </ExplorerLink>
             </span>
           </div>
           <div className="detail-row">
             <span className="detail-label">From</span>
             <span className="detail-value">
               {tx.from && tx.from.length > 10 && tx.from.includes('eon') ? (
-                <Link href={`/explorer/address/${tx.from}`} className="address-link">
+                <ExplorerLink href={`/explorer/address/${tx.from}`} className="address-link">
                   {truncate(tx.from, 12, 8)}
-                </Link>
+                </ExplorerLink>
               ) : (
-                <span className="address-link">{tx.from || 'N/A'}</span>
+                <span className="address-link">{txPartyLabel(tx.from || 'N/A', full)}</span>
               )}
               <CopyBtn text={tx.from} />
             </span>
@@ -328,11 +334,11 @@ export default function TransactionPage() {
             <span className="detail-label">To</span>
             <span className="detail-value">
               {tx.to && tx.to.length > 10 && tx.to.includes('eon') ? (
-                <Link href={`/explorer/address/${tx.to}`} className="address-link">
+                <ExplorerLink href={`/explorer/address/${tx.to}`} className="address-link">
                   {truncate(tx.to, 12, 8)}
-                </Link>
+                </ExplorerLink>
               ) : (
-                <span className="address-link">{tx.to || 'N/A'}</span>
+                <span className="address-link">{txPartyLabel(tx.to || 'N/A', full)}</span>
               )}
               <CopyBtn text={tx.to} />
             </span>
@@ -341,10 +347,10 @@ export default function TransactionPage() {
             <span className="detail-label">Amount</span>
             <span className="detail-value" style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
               {(tx.amount || '0').includes('QNC') ? (
-                <Link href="/explorer/qnc" className="token-amount-link" style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                <ExplorerLink href="/explorer/qnc" className="token-amount-link" style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
                   <TokenIcon native size={16} />
                   <span>{tx.amount || '0'}</span>
-                </Link>
+                </ExplorerLink>
               ) : (
                 <span>{tx.amount || '0'}</span>
               )}
@@ -385,7 +391,7 @@ export default function TransactionPage() {
                   <div className="detail-row" key={i}>
                     <span className="detail-label">#{i + 1}</span>
                     <span className="detail-value">
-                      <Link href={`/explorer/address/${r.to}`} className="addr">{r.to}</Link>
+                      <ExplorerLink href={`/explorer/address/${r.to}`} className="addr">{r.to}</ExplorerLink>
                       {' — '}{(Number(r.amount) / 1e9).toFixed(9)} QNC
                     </span>
                   </div>
@@ -396,12 +402,13 @@ export default function TransactionPage() {
         }
 
         // Fallback: type-specific public data (bitmap epoch/eligible_count,
-        // reward pool, etc.) for non-token transactions.
-        return tx.tx_type_data && Object.keys(tx.tx_type_data).length > 0 ? (
+        // reward pool, etc.) for non-token transactions; the app's view shows only the neutral facts.
+        const entries = txDataEntries(tx.tx_type_data, full);
+        return entries.length > 0 ? (
           <div className="block-card">
             <h2 className="card-title">Transaction Data</h2>
             <div className="details-grid">
-              {Object.entries(tx.tx_type_data).map(([key, value]) => (
+              {entries.map(([key, value]) => (
                 <div className="detail-row" key={key}>
                   <span className="detail-label">{humanizeKey(key)}</span>
                   <span className="detail-value">{formatDataValue(value)}</span>

@@ -205,7 +205,9 @@ impl SimplifiedP2P {
             let all_genesis_ips: Vec<String> = GENESIS_NODE_IPS.iter()
                 .map(|(ip, _)| ip.to_string())
                 .collect();
-            let working_genesis_ips = Self::filter_working_genesis_nodes_static(all_genesis_ips);
+            // Bootstrap discovery: with nothing known yet this waits for the first probe round, on the
+            // blocking pool (never on a worker); afterwards it answers at once from the probe cache.
+            let working_genesis_ips = Self::filter_working_genesis_nodes_bootstrap(all_genesis_ips).await;
              
              for ip in working_genesis_ips {
                  known_node_ips.push(ip.clone());
@@ -846,11 +848,11 @@ impl SimplifiedP2P {
                 let min_height = current_mb_index.saturating_sub(20);
                 
                 let timeout_votes_before = TIMEOUT_VOTES.len();
-                TIMEOUT_VOTES.retain(|(h, _), _| *h >= min_height);
+                TIMEOUT_VOTES.retain(|(k, _), _| k.window >= min_height);
                 let timeout_votes_removed = timeout_votes_before.saturating_sub(TIMEOUT_VOTES.len());
                 
                 let timeout_certs_before = TIMEOUT_CERTIFICATES.len();
-                TIMEOUT_CERTIFICATES.retain(|(h, _), _| *h >= min_height);
+                TIMEOUT_CERTIFICATES.retain(|(k, _), _| k.window >= min_height);
                 let timeout_certs_removed = timeout_certs_before.saturating_sub(TIMEOUT_CERTIFICATES.len());
                 
                 // The round trackers are u64->u64 and must outlive the vote payloads: a node behind
@@ -858,7 +860,7 @@ impl SimplifiedP2P {
                 // shorter window - they carry ML-DSA signatures and are the memory cost.
                 let round_min = current_mb_index.saturating_sub(
                     crate::node::BlockchainNode::MAX_DERIVED_ROSTER_WINDOWS as u64 + 2);
-                HIGHEST_CERTIFIED_ROUND.retain(|h, _| *h >= round_min);
+                HIGHEST_CERTIFIED_ROUND.retain(|k, _| k.window >= round_min);
                 // v15.11: prune per-mb baseline rounds alongside their
                 // companion HIGHEST_*_ROUND maps. Keys are mb_index so the
                 // same retention window applies.
@@ -874,7 +876,7 @@ impl SimplifiedP2P {
                 GLOBAL_PEER_LAST_SEEN_BY_IP.retain(|_, last_seen| *last_seen >= stale_cutoff);
 
                 let timeout_voted_before = TIMEOUT_VOTED_HEIGHTS.len();
-                TIMEOUT_VOTED_HEIGHTS.retain(|h, _| *h >= min_height);
+                TIMEOUT_VOTED_HEIGHTS.retain(|k, _| k.window >= min_height);
                 let timeout_voted_removed = timeout_voted_before.saturating_sub(TIMEOUT_VOTED_HEIGHTS.len());
 
                 // v14.8.5: re-introduced as BFT-safe distinct-peer tracker

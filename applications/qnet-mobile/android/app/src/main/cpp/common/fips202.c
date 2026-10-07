@@ -582,7 +582,16 @@ void shake256_inc_ctx_clone(shake256incctx *dest, const shake256incctx *src) {
     memcpy(dest->ctx, src->ctx, PQC_SHAKEINCCTX_BYTES);
 }
 
+/* QNet: a released state is wiped first; it may have absorbed a key or a seed (MPLAT-R2-05). */
+static void qnet_wipe_state(void *p, size_t n) {
+    volatile uint8_t *v = (volatile uint8_t *)p;
+    while (n--) {
+        *v++ = 0;
+    }
+}
+
 void shake256_inc_ctx_release(shake256incctx *state) {
+    qnet_wipe_state(state->ctx, PQC_SHAKEINCCTX_BYTES);
     free(state->ctx);
 }
 
@@ -631,6 +640,7 @@ void shake128_ctx_clone(shake128ctx *dest, const shake128ctx *src) {
 
 /** Release the allocated state. Call only once. */
 void shake128_ctx_release(shake128ctx *state) {
+    qnet_wipe_state(state->ctx, PQC_SHAKECTX_BYTES);
     free(state->ctx);
 }
 
@@ -679,6 +689,7 @@ void shake256_ctx_clone(shake256ctx *dest, const shake256ctx *src) {
 
 /** Release the allocated state. Call only once. */
 void shake256_ctx_release(shake256ctx *state) {
+    qnet_wipe_state(state->ctx, PQC_SHAKECTX_BYTES);
     free(state->ctx);
 }
 

@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- HTTPS only, to every host, trusting the system CA store alone (no user-installed CAs). The app talks
+     only to its genesis names, the explorer, Solana RPC and GitHub, all over TLS; anything a node hands it
+     that is not https is dropped before a request is made (src/config/nodes.js canonicalNodeUrl). No pin-set:
+     Let's Encrypt is re-rooting its chains (Root YE / Root YR under ISRG X1 / X2), and a pin that stopped
+     matching would cut every installed copy off the network until an update. -->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

@@ -208,10 +208,6 @@
                     <div class="address-text" id="walletAddress">Loading...</div>
                 </div>
 
-                <div class="action-button" id="generateCodeButton">
-                    Generate Activation Code
-                </div>
-
                 <div class="action-button" id="exportSeedButton">
                     Export Seed Phrase
                 </div>
@@ -247,21 +243,6 @@
                 result += chars.charAt(Math.floor(Math.random() * chars.length));
             }
             return result;
-        }
-
-        // Generate activation code
-        function generateActivationCode() {
-            const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-            let code = 'QNET-';
-            
-            for (let i = 0; i < 3; i++) {
-                for (let j = 0; j < 6; j++) {
-                    code += chars.charAt(Math.floor(Math.random() * chars.length));
-                }
-                if (i < 2) code += '-';
-            }
-            
-            return code;
         }
 
         // Create wallet
@@ -332,11 +313,6 @@
         }
 
         // Action buttons
-        document.getElementById('generateCodeButton').addEventListener('click', () => {
-            const code = generateActivationCode();
-            alert(`Node Activation Code:\n\n${code}`);
-        });
-
         document.getElementById('exportSeedButton').addEventListener('click', () => {
             alert('Seed Phrase:\n\nabandon ability able about above absent absorb abstract absurd abuse access accident');
         });

@@ -2,73 +2,139 @@
 
 use super::*;
 
-/// Handle POST /api/v1/benchmark/start
-/// SECURITY: Only Genesis/Bootstrap nodes can run benchmarks
+/// Hard ceilings of one run, the largest the presets use. ML-DSA-65 keys for at most this many accounts
+/// (about 6 KB each, generated on the blocking pool), at most this many transactions, at most this rate.
+pub(super) const BENCH_MAX_ACCOUNTS: usize = 50_000;
+pub(super) const BENCH_MAX_TOTAL: u64 = 10_000_000;
+pub(super) const BENCH_MAX_TPS: u64 = 150_000;
+/// A shorter `QNET_BENCHMARK_SECRET` counts as unset.
+pub(super) const BENCH_MIN_SECRET_LEN: usize = 16;
+
+/// Why a benchmark request is refused before anything is read or changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BenchRefusal {
+    /// `QNET_BENCHMARK_SECRET` is not set on this node (or is shorter than 16 characters).
+    Disabled,
+    /// The request does not carry the secret.
+    Unauthorized,
+}
+
+impl BenchRefusal {
+    pub(super) fn to_json(self) -> Value {
+        match self {
+            BenchRefusal::Disabled => json!({
+                "success": false,
+                "error": "benchmark_disabled",
+                "message": "The benchmark routes are disabled on this node"
+            }),
+            BenchRefusal::Unauthorized => json!({"success": false, "error": "unauthorized"}),
+        }
+    }
+}
+
+/// Every `/api/v1/benchmark/*` route is disabled unless the operator set `QNET_BENCHMARK_SECRET` (at least
+/// 16 characters; a genesis node is not exempt), and then serves only a caller presenting it. Compared
+/// as SHA3-256 digests, so the time taken says nothing about the secret or its length.
+pub(super) fn benchmark_gate(configured: Option<&str>, provided: Option<&str>) -> Result<(), BenchRefusal> {
+    let expected = configured.filter(|s| s.len() >= BENCH_MIN_SECRET_LEN).ok_or(BenchRefusal::Disabled)?;
+    match provided {
+        Some(p) if secret_eq(expected, p) => Ok(()),
+        _ => Err(BenchRefusal::Unauthorized),
+    }
+}
+
+fn secret_eq(a: &str, b: &str) -> bool {
+    let (da, db) = (Sha3_256::digest(a.as_bytes()), Sha3_256::digest(b.as_bytes()));
+    da.iter().zip(db.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// The gate as each route applies it: a disabled route answers at once; otherwise the `benchmark` rate
+/// limit, then the secret. None: go on.
+pub(super) fn benchmark_admit(remote_addr: Option<std::net::SocketAddr>, provided: Option<&str>, route: &str)
+    -> Option<warp::reply::Json>
+{
+    let configured = std::env::var("QNET_BENCHMARK_SECRET").ok();
+    if benchmark_gate(configured.as_deref(), None) == Err(BenchRefusal::Disabled) {
+        return Some(warp::reply::json(&BenchRefusal::Disabled.to_json()));
+    }
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "benchmark") {
+        return Some(rate_limit_response);
+    }
+    match benchmark_gate(configured.as_deref(), provided) {
+        Ok(()) => None,
+        Err(r) => {
+            println!("[WARN][RPC] benchmark_auth_failed route={} ip={}", route,
+                     remote_addr.map(|a| a.ip().to_string()).unwrap_or_default());
+            Some(warp::reply::json(&r.to_json()))
+        }
+    }
+}
+
+/// The run a start request asks for: a preset, or the custom form, with the request's own values on top.
+/// A value the request names above a ceiling (or fewer than two accounts) is refused, never clamped; the
+/// custom form's derived defaults are clamped to the ceilings.
+pub(super) fn benchmark_config(request: &BenchmarkStartRequest) -> Result<crate::benchmark::BenchmarkConfig, String> {
+    use crate::benchmark::{BenchmarkConfig, BenchmarkPreset};
+    let limits = || format!("num_accounts 2..={}, total <= {}, target_tps <= {}",
+                            BENCH_MAX_ACCOUNTS, BENCH_MAX_TOTAL, BENCH_MAX_TPS);
+    if request.num_accounts.map_or(false, |n| !(2..=BENCH_MAX_ACCOUNTS).contains(&n))
+        || request.total.map_or(false, |t| t > BENCH_MAX_TOTAL)
+        || request.target_tps.map_or(false, |t| t > BENCH_MAX_TPS)
+    {
+        return Err(limits());
+    }
+    let mut cfg = if let Some(preset) = request.preset {
+        BenchmarkConfig::from_preset(preset)
+    } else if request.shards.is_some() || request.total.is_some() || request.target_tps.is_some() {
+        let shards = request.shards.unwrap_or(256).clamp(1, 256);
+        let derived = shards as u64 * 100_000;
+        BenchmarkConfig {
+            preset: BenchmarkPreset::Custom,
+            shards,
+            total_transactions: derived.min(BENCH_MAX_TOTAL),
+            target_tps: derived.min(BENCH_MAX_TPS),
+            num_accounts: (shards * 40).min(BENCH_MAX_ACCOUNTS),
+            initial_balance: 1_000_000 * crate::benchmark::ONE_QNC,
+            use_pq_sig: false,
+        }
+    } else {
+        BenchmarkConfig::default()
+    };
+    if let Some(shards) = request.shards { cfg.shards = shards.clamp(1, 256); }
+    if let Some(total) = request.total { cfg.total_transactions = total; }
+    if let Some(tps) = request.target_tps { cfg.target_tps = tps; }
+    if let Some(accounts) = request.num_accounts { cfg.num_accounts = accounts; }
+    cfg.use_pq_sig = request.use_pq.unwrap_or(false);
+    // Every preset is inside the ceilings; checked again so none edited later can pass one.
+    if !(2..=BENCH_MAX_ACCOUNTS).contains(&cfg.num_accounts) || cfg.total_transactions > BENCH_MAX_TOTAL
+        || cfg.target_tps > BENCH_MAX_TPS
+    {
+        return Err(limits());
+    }
+    Ok(cfg)
+}
+
+/// Handle POST /api/v1/benchmark/start. The secret rides the `X-Benchmark-Secret` header or the body's
+/// `secret`.
 pub(super) async fn handle_benchmark_start(
     request: BenchmarkStartRequest,
+    secret_header: Option<String>,
     remote_addr: Option<std::net::SocketAddr>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
-    use crate::benchmark::{BENCHMARK_MANAGER, BenchmarkConfig};
+    use crate::benchmark::BENCHMARK_MANAGER;
 
-    // v10.0: Rate limit benchmark start
-    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "benchmark") {
-        return Ok(rate_limit_response);
+    let provided = secret_header.as_deref().or(request.secret.as_deref());
+    if let Some(refused) = benchmark_admit(remote_addr, provided, "start") {
+        return Ok(refused);
     }
-
-    // SECURITY: Only allow benchmark on Genesis/Bootstrap nodes or with valid secret
-    let is_genesis_node = std::env::var("QNET_BOOTSTRAP_ID").is_ok();
-    let benchmark_secret = std::env::var("QNET_BENCHMARK_SECRET").ok();
-
-    if !is_genesis_node && benchmark_secret.is_none() {
-        return Ok(warp::reply::json(&json!({
-            "success": false,
-            "error": "Benchmark only available on Genesis nodes or with QNET_BENCHMARK_SECRET"
-        })));
-    }
-
-    // v10.0: Validate the secret value, not just its existence
-    if let Some(expected_secret) = &benchmark_secret {
-        let provided_secret = request.secret.as_deref().unwrap_or("");
-        if provided_secret != expected_secret.as_str() {
-            println!("[WARN][RPC] benchmark_auth_failed reason=invalid_secret");
-            return Ok(warp::reply::json(&json!({
-                "success": false,
-                "error": "unauthorized"
-            })));
-        }
-    }
-    
-    // Build config from preset or custom values
-    let use_pq = request.use_pq.unwrap_or(false);
-    let config = if let Some(preset) = request.preset {
-        let mut cfg = BenchmarkConfig::from_preset(preset);
-        if let Some(shards) = request.shards { cfg.shards = shards.min(256).max(1); }
-        if let Some(total) = request.total { cfg.total_transactions = total; }
-        if let Some(tps) = request.target_tps { cfg.target_tps = tps; }
-        if let Some(accounts) = request.num_accounts { cfg.num_accounts = accounts; }
-        cfg.use_pq_sig = use_pq;
-        cfg
-    } else if request.shards.is_some() || request.total.is_some() || request.target_tps.is_some() {
-        let shards = request.shards.unwrap_or(256).min(256).max(1);
-        let tps_per_shard = 100_000u64;
-        BenchmarkConfig {
-            preset: crate::benchmark::BenchmarkPreset::Custom,
-            shards,
-            total_transactions: request.total.unwrap_or(shards as u64 * tps_per_shard),
-            target_tps: request.target_tps.unwrap_or(shards as u64 * tps_per_shard),
-            num_accounts: request.num_accounts.unwrap_or(shards * 40),
-            initial_balance: 1_000_000 * crate::benchmark::ONE_QNC,
-            use_pq_sig: use_pq,
-        }
-    } else {
-        let mut cfg = BenchmarkConfig::default();
-        cfg.use_pq_sig = use_pq;
-        cfg
+    let config = match benchmark_config(&request) {
+        Ok(c) => c,
+        Err(e) => return Ok(warp::reply::json(&json!({"success": false, "error": "benchmark_limits", "message": e}))),
     };
-    
-    println!("[BENCHMARK] 🔐 Genesis node authorized. Starting {:?} benchmark...", config.preset);
-    
+
+    println!("[BENCHMARK] 🔐 Operator authorized. Starting {:?} benchmark...", config.preset);
+
     // Start benchmark
     match BENCHMARK_MANAGER.start(config.clone()).await {
         Ok(_) => {
@@ -76,7 +142,7 @@ pub(super) async fn handle_benchmark_start(
             let blockchain_clone = blockchain.clone();
             let total = config.total_transactions;
             let target_tps = config.target_tps;
-            
+
             let is_progressive = config.is_progressive();
             let is_pq = config.use_pq_sig;
             tokio::spawn(async move {
@@ -177,6 +243,7 @@ pub(super) async fn run_benchmark_generator(
     let accounts_snapshot = BENCHMARK_MANAGER.get_accounts_snapshot().await;
     if accounts_snapshot.len() < 2 {
         println!("[BENCHMARK] ❌ Not enough accounts! Need at least 2, have {}", accounts_snapshot.len());
+        BENCHMARK_MANAGER.stop().await;
         return;
     }
     println!("[BENCHMARK] 📋 Accounts snapshot: {} accounts cloned for workers", accounts_snapshot.len());
@@ -582,6 +649,7 @@ pub(super) async fn run_progressive_benchmark(
     let accounts_snapshot = BENCHMARK_MANAGER.get_accounts_snapshot().await;
     if accounts_snapshot.len() < 2 {
         println!("[BENCHMARK] ❌ Not enough accounts!");
+        BENCHMARK_MANAGER.stop().await;
         return;
     }
     
@@ -752,4 +820,103 @@ pub(super) async fn run_progressive_benchmark(
     println!("[BENCHMARK] ⏱️  Duration:         {:.2}s", elapsed);
     println!("[BENCHMARK] 🚀 MAX STABLE TPS:   {} ({:.0}K)", max_tps, max_tps as f64 / 1000.0);
     println!("[BENCHMARK] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::benchmark::{BenchmarkConfig, BenchmarkPreset, BENCHMARK_MANAGER};
+
+    const SECRET: &str = "operator-secret-0123456789";
+
+    fn start_request(v: Value) -> BenchmarkStartRequest {
+        serde_json::from_value(v).expect("start request")
+    }
+
+    async fn body_of(r: impl Reply) -> Value {
+        let bytes = warp::hyper::body::to_bytes(r.into_response().into_body()).await.expect("body");
+        serde_json::from_slice(&bytes).expect("json body")
+    }
+
+    /// No secret configured (or one too short): every route is disabled, whatever the caller sends; a genesis
+    /// node has no exemption, since the gate never looks at the node's role.
+    #[test]
+    fn the_gate_is_closed_without_a_configured_secret() {
+        for configured in [None, Some(""), Some("short-secret")] {
+            for provided in [None, Some(""), Some("short-secret"), Some(SECRET)] {
+                assert_eq!(benchmark_gate(configured, provided), Err(BenchRefusal::Disabled), "{configured:?} {provided:?}");
+            }
+        }
+    }
+
+    /// With the secret configured only the exact secret passes: no secret, a wrong one, a prefix or an
+    /// extension of it are refused.
+    #[test]
+    fn the_gate_takes_only_the_exact_secret() {
+        let c = Some(SECRET);
+        assert_eq!(benchmark_gate(c, Some(SECRET)), Ok(()));
+        let longer = format!("{SECRET}x");
+        for bad in [None, Some(""), Some("wrong"), Some(&SECRET[..SECRET.len() - 1]), Some(longer.as_str())] {
+            assert_eq!(benchmark_gate(c, bad), Err(BenchRefusal::Unauthorized), "{bad:?}");
+        }
+        assert!(!secret_eq(SECRET, "operator-secret-0123456788"));
+        assert_eq!(BenchRefusal::Disabled.to_json()["error"], json!("benchmark_disabled"));
+        assert_eq!(BenchRefusal::Unauthorized.to_json()["error"], json!("unauthorized"));
+    }
+
+    /// Values a request names above a ceiling, or fewer than two accounts, are refused; every preset is
+    /// inside the ceilings; the custom form's derived defaults are clamped.
+    #[test]
+    fn a_start_request_is_bounded() {
+        for bad in [
+            json!({"num_accounts": BENCH_MAX_ACCOUNTS + 1}),
+            json!({"num_accounts": usize::MAX}),
+            json!({"num_accounts": 1}),
+            json!({"num_accounts": 0}),
+            json!({"total": BENCH_MAX_TOTAL + 1}),
+            json!({"total": u64::MAX}),
+            json!({"target_tps": BENCH_MAX_TPS + 1}),
+            json!({"preset": "full_scale", "num_accounts": 1_000_000}),
+            json!({"preset": "stability_test", "target_tps": u64::MAX}),
+        ] {
+            assert!(benchmark_config(&start_request(bad.clone())).is_err(), "{bad}");
+        }
+        for preset in ["stability_test", "stress_test", "max_capacity", "progressive_max", "single_shard", "small_scale",
+                       "medium_scale", "large_scale", "extra_large", "full_scale", "custom"] {
+            let cfg = benchmark_config(&start_request(json!({"preset": preset}))).expect(preset);
+            assert!(cfg.num_accounts <= BENCH_MAX_ACCOUNTS && cfg.total_transactions <= BENCH_MAX_TOTAL
+                    && cfg.target_tps <= BENCH_MAX_TPS, "{preset}");
+        }
+        let custom = benchmark_config(&start_request(json!({"shards": 256}))).expect("derived defaults clamp");
+        assert_eq!((custom.preset, custom.total_transactions, custom.target_tps, custom.num_accounts),
+                   (BenchmarkPreset::Custom, BENCH_MAX_TOTAL, BENCH_MAX_TPS, 256 * 40));
+        let named = benchmark_config(&start_request(json!({"target_tps": 1_000, "total": 5_000, "num_accounts": 2, "use_pq": true})))
+            .expect("inside the ceilings");
+        assert_eq!((named.target_tps, named.total_transactions, named.num_accounts, named.use_pq_sig), (1_000, 5_000, 2, true));
+        let only_accounts = benchmark_config(&start_request(json!({"num_accounts": 10}))).expect("accounts alone");
+        assert_eq!(only_accounts.num_accounts, 10, "honoured on the default run too");
+        assert_eq!(BenchmarkConfig::default().num_accounts, benchmark_config(&start_request(json!({}))).unwrap().num_accounts);
+    }
+
+    /// On a node without the secret (every live node today) each route answers "disabled" and changes
+    /// nothing: a stop leaves a running benchmark running, status and results reveal nothing.
+    #[tokio::test]
+    async fn every_route_answers_disabled_without_the_secret() {
+        if std::env::var("QNET_BENCHMARK_SECRET").is_ok() {
+            return; // the check below is about an unset secret
+        }
+        let addr: Option<std::net::SocketAddr> = Some("203.0.113.9:40000".parse().unwrap());
+        assert_eq!(benchmark_admit(addr, Some(SECRET), "start").map(|_| ()), Some(()), "start refused before any keygen");
+        BENCHMARK_MANAGER.set_running_for_test(true);
+        let stop = body_of(handle_benchmark_stop(Some(SECRET.into()), addr).await.unwrap()).await;
+        assert_eq!(stop["error"], json!("benchmark_disabled"));
+        assert!(BENCHMARK_MANAGER.is_running(), "a refused stop changes nothing");
+        BENCHMARK_MANAGER.set_running_for_test(false);
+        let status = body_of(handle_benchmark_status(None, addr).await.unwrap()).await;
+        assert_eq!(status, BenchRefusal::Disabled.to_json(), "no run state revealed");
+        let results = body_of(handle_benchmark_results(None, addr).await.unwrap()).await;
+        assert_eq!(results, BenchRefusal::Disabled.to_json());
+        let presets = body_of(handle_benchmark_presets(None, addr).await.unwrap()).await;
+        assert_eq!(presets, BenchRefusal::Disabled.to_json());
+    }
 }

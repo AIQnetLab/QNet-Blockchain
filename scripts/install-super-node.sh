@@ -2,13 +2,23 @@
 # ============================================================
 # QNet Super Node — Install & Auto-Update Script
 # ============================================================
+# A super node is activated only in the QNet browser extension on a computer (Activate tab, Super): the
+# extension burns 1DEV from the wallet's own Solana address and shows the activation code, the burn
+# transaction and the burned amount. The Overview of aiqnet.io/node shows the same three for the wallet in
+# any browser where it is connected. This server then runs the node with the same wallet's recovery phrase.
+#
 # Usage:
+#   export QNET_ACTIVATION_CODE="QNET-SXXXXX-XXXXXX-XXXXXX"
+#   export QNET_BURN_TX_HASH="<the Solana burn transaction signature>"
+#   export QNET_BURN_AMOUNT="<the whole 1DEV amount burned>"
+#   export QNET_WALLET_SEED_FILE=/path/to/qnet_seed     # a file holding the recovery phrase (preferred)
+#   # or: export QNET_WALLET_SEED="word1 word2 ... word12"  (this script writes it to a 0600 file)
 #   curl -fsSL https://raw.githubusercontent.com/AIQnetLab/QNet-Blockchain/testnet/scripts/install-super-node.sh | bash
 #
 # What this does:
 #   1. Installs Docker (if not present)
 #   2. Pulls the latest qnet-production image from ghcr.io (public, no auth needed)
-#   3. Starts your Super node
+#   3. Starts your Super node, with the recovery phrase mounted as a file at /run/secrets/qnet_seed
 #   4. Installs Watchtower — auto-updates your node when we push a new release
 #      (checks every 5 minutes, zero-downtime rolling restart)
 # ============================================================
@@ -24,32 +34,48 @@ ok()   { echo -e "${GREEN}[OK]${NC} $1"; }
 warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 err()  { echo -e "${RED}[ERR]${NC} $1"; exit 1; }
 
-# ── Required: wallet seed ────────────────────────────────────
-if [ -z "$QNET_WALLET_SEED" ]; then
+usage() {
   echo ""
-  echo "Required env vars before running:"
+  echo "Required before running (the QNet browser extension's Activate tab, or the Overview of"
+  echo "aiqnet.io/node for this wallet, shows the code, the burn and the amount):"
   echo ""
-  echo "  export QNET_WALLET_SEED=\"word1 word2 ... word12\""
-  echo "  export QNET_ACTIVATION_CODE=\"QNET-XXXX-XXXX-XXXX\"  # from mobile app"
+  echo "  export QNET_ACTIVATION_CODE=\"QNET-SXXXXX-XXXXXX-XXXXXX\""
+  echo "  export QNET_BURN_TX_HASH=\"<the Solana burn transaction signature>\""
+  echo "  export QNET_BURN_AMOUNT=\"<the whole 1DEV amount burned>\""
+  echo "  export QNET_WALLET_SEED_FILE=/path/to/qnet_seed   # or QNET_WALLET_SEED=\"word1 ... word12\""
   echo ""
   echo "  bash install-super-node.sh"
   echo ""
-  err "QNET_WALLET_SEED is not set"
-fi
+}
 
-# ── Required: activation code ────────────────────────────────
-if [ -z "$QNET_ACTIVATION_CODE" ]; then
-  echo ""
-  warn "QNET_ACTIVATION_CODE not set — node will start but won't register until code is provided."
-  warn "Generate an activation code in the QNet mobile app and set it via:"
-  warn "  docker exec qnet-super-node qnet-node --register --code YOUR-CODE"
-  echo ""
-fi
+# ── Required: code, burn and amount ─────────────────────────
+[ -n "$QNET_ACTIVATION_CODE" ] || { usage; err "QNET_ACTIVATION_CODE is not set"; }
+[ -n "$QNET_BURN_TX_HASH" ] || { usage; err "QNET_BURN_TX_HASH is not set"; }
+case "$QNET_BURN_AMOUNT" in
+  ''|*[!0-9]*) usage; err "QNET_BURN_AMOUNT must be the whole number of 1DEV burned";;
+esac
 
 # ── Optional settings ─────────────────────────────────────────
 NODE_NAME="${QNET_NODE_NAME:-qnet-super-node}"
 DATA_DIR="${QNET_DATA_DIR:-/opt/qnet/data}"
 MAX_STORAGE_GB="${QNET_MAX_STORAGE_GB:-500}"
+
+# ── Required: the wallet's recovery phrase, as a file only its owner can read ──
+# The same wallet that burned in the extension: the node checks the code against this phrase's own Solana
+# address. The phrase is passed as a file, never as an environment variable (docker inspect shows those).
+if [ -n "$QNET_WALLET_SEED_FILE" ]; then
+  [ -r "$QNET_WALLET_SEED_FILE" ] || err "QNET_WALLET_SEED_FILE=$QNET_WALLET_SEED_FILE is not a readable file"
+  SEED_FILE="$QNET_WALLET_SEED_FILE"
+elif [ -n "$QNET_WALLET_SEED" ]; then
+  SEED_FILE="$(dirname "$DATA_DIR")/qnet_seed"
+  mkdir -p "$(dirname "$SEED_FILE")"
+  (umask 077; printf %s "$QNET_WALLET_SEED" > "$SEED_FILE")
+  ok "Recovery phrase written to $SEED_FILE"
+else
+  usage; err "QNET_WALLET_SEED_FILE (or QNET_WALLET_SEED) is not set"
+fi
+chmod 600 "$SEED_FILE"
+SEED_FILE="$(cd "$(dirname "$SEED_FILE")" && pwd)/$(basename "$SEED_FILE")"
 
 # ── 1. Install Docker ────────────────────────────────────────
 if ! command -v docker &>/dev/null; then
@@ -73,26 +99,19 @@ ok "Image pulled"
 docker stop "$NODE_NAME" 2>/dev/null && docker rm "$NODE_NAME" 2>/dev/null || true
 
 # ── 5. Start Super node ──────────────────────────────────────
-ACTIVATION_ARG=""
-[ -n "$QNET_ACTIVATION_CODE" ] && ACTIVATION_ARG="-e QNET_ACTIVATION_CODE=$QNET_ACTIVATION_CODE"
-
-# Optional: exact 1DEV burn tx hash for precise on-chain burn verification.
-# Without it the node falls back to scanning recent Solana signatures (slower,
-# and fails if the burn is older than the scan window or the RPC is unreachable).
-BURN_ARG=""
-[ -n "$QNET_BURN_TX_HASH" ] && BURN_ARG="-e QNET_BURN_TX_HASH=$QNET_BURN_TX_HASH"
-
 docker run -d \
   --name "$NODE_NAME" \
   --restart=always \
   --log-opt max-size=100m \
   --log-opt max-file=10 \
   -e QNET_PRODUCTION=1 \
-  -e QNET_WALLET_SEED="$QNET_WALLET_SEED" \
   -e DOCKER_ENV=1 \
+  -e QNET_ACTIVATION_CODE="$QNET_ACTIVATION_CODE" \
+  -e QNET_BURN_TX_HASH="$QNET_BURN_TX_HASH" \
+  -e QNET_BURN_AMOUNT="$QNET_BURN_AMOUNT" \
+  -v "$SEED_FILE":/run/secrets/qnet_seed:ro \
+  -e QNET_WALLET_SEED_FILE=/run/secrets/qnet_seed \
   -e QNET_MAX_STORAGE_GB="$MAX_STORAGE_GB" \
-  $ACTIVATION_ARG \
-  $BURN_ARG \
   -p 9876:9876 \
   -p 9877:9877 \
   -p 8001:8001 \
@@ -138,14 +157,13 @@ echo "  QNet Super Node installed successfully"
 echo "============================================"
 echo "  Container : $NODE_NAME"
 echo "  Data dir  : $DATA_DIR"
+echo "  Phrase    : $SEED_FILE (mode 600)"
 echo "  API       : http://localhost:8001/api/v1/height"
 echo "  Logs      : docker logs -f $NODE_NAME"
 echo "  Updates   : automatic via Watchtower (every 5 min)"
 echo "============================================"
 echo ""
-if [ -z "$QNET_ACTIVATION_CODE" ]; then
-  echo "NEXT STEP: Register your node with an activation code."
-  echo "  1. Open QNet mobile app → Settings → Generate Node Code"
-  echo "  2. Run: docker exec $NODE_NAME qnet-node --register --code YOUR-CODE"
-  echo ""
-fi
+echo "The node registers itself once it has caught up with the chain; the Overview of aiqnet.io/node"
+echo "then shows it for this wallet. One wallet runs one node: if this wallet already has another node,"
+echo "the log says wallet_has_node and nothing is registered."
+echo ""

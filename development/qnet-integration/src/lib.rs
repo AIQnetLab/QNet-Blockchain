@@ -21,6 +21,8 @@ pub mod network_config;
 pub mod genesis_constants;
 pub mod galc;              // Genesis-Anchored Live Checkpoint — live genesis-signed WS pin for cold-join
 pub mod reward_sharding;
+pub mod light_binding;     // Light-node binding v2: sequence rule, preimages, pending bindings (no consensus)
+pub mod light_device;      // Device layer, Phase A: challenges, evidence, statements, device records (no consensus)
 pub mod reward_epoch;      // Reward epochs: one owner for an epoch root, its total, and its serveability
 pub mod registry_lthash;   // Homomorphic (incremental, O(1)) multiset hash for registry_root at scale
 pub mod consensus_state;   // L1 consensus state machine (single coordinator)

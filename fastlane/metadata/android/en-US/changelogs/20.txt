@@ -1,0 +1,7 @@
+• Send SOL and 1DEV; scan a Solana address or a payment request
+• Scan a QNet address on the Send screen
+• A built-in web browser: sites connect, sign or send only after you confirm in the app
+• Node tab: runs this wallet's node on this device after a device check, one node per device; move its balance there
+• Unlock with the device's screen lock where it has one, otherwise with a password
+• All 11 languages in full; works on tablets
+• No notification permission asked

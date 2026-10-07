@@ -1,16 +1,21 @@
 {
   "compilerOptions": {
-    "target": "ES2020",
-    "module": "commonjs",
-    "lib": ["ES2020"],
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022", "DOM"],
+    "types": ["node"],
     "strict": true,
-    "esModuleInterop": true,
-    "outDir": "dist",
+    "isolatedModules": true,
+    "skipLibCheck": true,
     "declaration": true,
-    "declarationMap": true,
-    "sourceMap": true,
-    "rootDir": "src"
+    "emitDeclarationOnly": true,
+    "outDir": "dist",
+    "rootDir": "src",
+    "paths": {
+      "#mobile/*": ["./src/shared/mobile/*"],
+      "#wallet-core/*": ["./src/shared/wallet-core/*"]
+    }
   },
-  "include": ["src/**/*"],
-  "exclude": ["node_modules", "dist", "**/*.test.ts"]
+  "include": ["src"]
 }

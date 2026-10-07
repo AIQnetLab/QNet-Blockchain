@@ -1277,40 +1277,34 @@ impl BlockchainNode {
     
     // PRODUCTION: Byzantine consensus methods for Checkpoint-BFT v2 (macroblock QC)
 
-    /// v14.8: CANONICAL MACROBLOCK VIEW CHANGE.
+    /// CANONICAL FAILOVER VOTE for `key` (`FailoverKey::for_slot` of the stalled slot).
     ///
-    /// Called whenever the n−f threshold for commit OR reveal fails for a
-    /// macroblock round. Signs + broadcasts a ML-DSA-65 TimeoutVote at
-    /// (mb_index, cert_round + 1). After n−f such votes the existing
-    /// TimeoutCertificate aggregator bumps HIGHEST_CERTIFIED_ROUND[mb_index],
-    /// which is mixed into should_initiate_consensus() hash — so every
-    /// honest node deterministically picks a DIFFERENT leader for the next
-    /// attempt, IN THE SAME EPOCH, and consensus resumes without waiting for
-    /// the next 90-block boundary.
+    /// Signs + broadcasts a ML-DSA-65 timeout vote at (key, cert_round + 1): the window-only form below the
+    /// `failover_tenure_bound` gate, the tenure-bound form from it. After n−f such votes the
+    /// TimeoutCertificate aggregator raises HIGHEST_CERTIFIED_ROUND[key], so every honest node elects the
+    /// next candidate for the slots that key rotates — a tenure alone from the gate.
     ///
     /// Idempotent: the underlying broadcast path dedupes via
     /// TIMEOUT_VOTED_HEIGHTS, so calling this twice for the same round is safe.
     /// Returns true only when a vote was actually signed and broadcast — callers pace on that.
-    pub(super) async fn emit_macroblock_view_change_vote(
-        round_id: u64,
+    pub(super) async fn emit_failover_vote(
+        key: crate::unified_p2p::FailoverKey,
         node_id: &str,
         unified_p2p: &Option<Arc<SimplifiedP2P>>,
         storage: Option<&Arc<Storage>>,
     ) -> bool {
         let Some(p2p) = unified_p2p else { return false; };
-        // round_id == 0 is VALID: window 0 (heights 1..89) fails over with the fixed genesis-5
-        // committee and a zero anchor — no special genesis mechanics.
-        if round_id % 90 != 0 {
-            return false;
-        }
-        let mb_index = round_id / 90;
+        // Window 0 (heights 1..89) is VALID: it fails over with the fixed genesis-5 committee and a
+        // zero anchor — no special genesis mechanics. Committee and anchor stay per WINDOW.
+        let mb_index = key.window;
 
         // Window-monotonic floor (anti-double-TC): once ANY window certified, never vote below it —
         // resuming a lower key would let ≤f cross-window Byzantine votes certify two adjacent windows.
-        if mb_index < crate::unified_p2p::observed_tc_window_floor() {
+        // A tenure whose every slot is final is left the same way.
+        if crate::unified_p2p::failover_key_left(key) {
             if is_info() {
-                println!("[INFO][TIMEOUT] emit_suppressed mb={} reason=below_tc_floor floor={}",
-                         mb_index, crate::unified_p2p::observed_tc_window_floor());
+                println!("[INFO][TIMEOUT] emit_suppressed {} reason=below_tc_floor floor={}",
+                         key, crate::unified_p2p::observed_tc_window_floor());
             }
             return false;
         }
@@ -1363,11 +1357,11 @@ impl BlockchainNode {
         // Base = certified+1 (consensus-visible, identical on every node). f+1 round amplification:
         // jump to the highest round ≥1 honest validator already reached. Leader election still reads
         // only the n−f-certified round, so amplifying the TARGET cannot cause dual production.
-        // Strictly the window's own certified round: MAX_FAILOVER_ROUND is a PER-WINDOW bound, and
-        // seeding from a carried round would make it a cross-window ratchet with an absorbing state.
-        let current_cert = p2p.get_highest_certified_round(mb_index);
+        // Strictly the key's own certified round: MAX_FAILOVER_ROUND is a PER-KEY bound, and
+        // seeding from a carried round would make it a cross-key ratchet with an absorbing state.
+        let current_cert = crate::unified_p2p::certified_round_at(key);
         let f = committee.len().saturating_sub(1) / 3;
-        let observed = crate::unified_p2p::highest_failover_round_with_support(mb_index, f + 1);
+        let observed = crate::unified_p2p::highest_failover_round_with_support(key, f + 1);
         // DoS bound + hold-at-cap: never vote past MAX_FAILOVER_ROUND. Past it, >MAX rotations in one
         // window is a sync/partition problem, not leader liveness — clamping stops the runaway
         // certified-round climb while the pacemaker keeps voting the bounded round, so progress resumes
@@ -1391,14 +1385,14 @@ impl BlockchainNode {
             None => (0, [0u8; 32], 0, [0u8; 32]),
         };
 
-        let vote_msg = crate::unified_p2p::timeout_vote_message(
-            mb_index, next_round, &anchor, high_qc_idx, &high_qc_hash, tip_height, &tip_hash);
+        let vote_msg = crate::unified_p2p::timeout_vote_message_for(
+            key, next_round, &anchor, high_qc_idx, &high_qc_hash, tip_height, &tip_hash);
 
         let crypto = match try_get_quantum_crypto() {
             Some(c) => c,
             None => {
                 if is_warn() {
-                    println!("[WARN][MB-VIEW] no_crypto mb={} round={}", mb_index, next_round);
+                    println!("[WARN][MB-VIEW] no_crypto {} round={}", key, next_round);
                 }
                 return false;
             }
@@ -1406,11 +1400,11 @@ impl BlockchainNode {
         match crypto.create_consensus_signature(node_id, &vote_msg).await {
             Ok(sig) => {
                 if is_info() {
-                    println!("[INFO][MB-VIEW] view_change_vote mb={} round={} cert_was={} tip={}",
-                             mb_index, next_round, current_cert, tip_height);
+                    println!("[INFO][MB-VIEW] view_change_vote {} round={} cert_was={} tip={}",
+                             key, next_round, current_cert, tip_height);
                 }
                 p2p.broadcast_timeout_vote(
-                    mb_index,
+                    key,
                     next_round,
                     anchor,
                     high_qc_idx,
@@ -1423,8 +1417,8 @@ impl BlockchainNode {
             }
             Err(e) => {
                 if is_warn() {
-                    println!("[WARN][MB-VIEW] sign_fail mb={} round={} err={}",
-                             mb_index, next_round, e);
+                    println!("[WARN][MB-VIEW] sign_fail {} round={} err={}",
+                             key, next_round, e);
                 }
                 false
             }

@@ -1,0 +1,6 @@
+validation_guide_sample.json holds the sample values Apple publishes in its Attestation Object
+Validation Guide (https://developer.apple.com/documentation/devicecheck/attestation-object-validation-guide):
+the example Team ID, bundle ID and server challenge, the key identifier, the attestation object and
+the expected intermediate values. The guide's separate "public key SHA256 hash" value does not match
+its own sample and is left out; the key identifier (SHA-256 of the certified point) is what the
+verifier checks.

@@ -1,0 +1,1509 @@
+/* QNet Wallet pages (popup, setup, approve): the shared palette, gradients and fonts.
+   style-src 'self': no inline styles anywhere.
+   Components: .btn (.btn-primary|secondary|danger|ghost, .btn-block), .input, .field, .check,
+   .segmented/.seg, .notice (-info|-warn|-danger|-success), .message, .kv, .card, .badge, .addr, .list,
+   .row/.stack, .loading/.spinner, .toast, .code-box, .phrase, .word-grid, .qr-frame. */
+
+:root {
+  color-scheme: dark;
+
+  --bg-primary: #0f0f1a;
+  --bg-secondary: #1a1a2e;
+  --bg-tertiary: #16213e;
+  --bg-card: rgba(255, 255, 255, 0.06);
+  --bg-card-strong: rgba(255, 255, 255, 0.1);
+  --bg-modal: rgba(15, 15, 26, 0.95);
+
+  --gradient-main: linear-gradient(135deg, #00d4ff 0%, #9945ff 50%, #7c3aed 100%);
+  --gradient-card: linear-gradient(145deg, rgba(0, 212, 255, 0.12) 0%, rgba(153, 69, 255, 0.08) 100%);
+  --gradient-button: linear-gradient(135deg, #00d4ff 0%, #9945ff 100%);
+  --gradient-page: linear-gradient(135deg, #0f0f1a 0%, #1a1a2e 30%, #16213e 60%, #0f0f1a 100%);
+  --qnet-gradient: linear-gradient(135deg, #00d4ff 0%, #9945ff 50%, #0099cc 100%);
+
+  --qnet-primary: #00d4ff;
+  --qnet-secondary: #0099cc;
+  --qnet-glow: rgba(0, 212, 255, 0.4);
+  --solana-primary: #9945ff;
+  --solana-secondary: #7c3aed;
+  --solana-glow: rgba(153, 69, 255, 0.4);
+  --accent: var(--qnet-primary);
+  --accent-glow: var(--qnet-glow);
+
+  --text-primary: #ffffff;
+  --text-secondary: #b8bcc8;
+  --text-muted: #8892b0;
+
+  --success: #10b981;
+  --error: #ef4444;
+  --warning: #f59e0b;
+  --info: #3b82f6;
+
+  --border-primary: rgba(255, 255, 255, 0.1);
+  --border-active: rgba(0, 212, 255, 0.5);
+  --shadow-card: 0 8px 32px rgba(0, 0, 0, 0.3);
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+
+  --font-primary: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Cascadia Mono', Consolas, 'Courier New', monospace;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: var(--font-primary);
+  background: var(--gradient-page);
+  color: var(--text-primary);
+  font-size: 13px;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+}
+
+body.page-popup {
+  width: 360px;
+  height: 600px;
+  overflow: hidden;
+}
+
+body.page-setup,
+body.page-approve {
+  min-height: 100vh;
+}
+
+#app {
+  height: 100%;
+}
+
+h1, h2, h3 {
+  font-weight: 600;
+  line-height: 1.25;
+}
+
+h2 {
+  font-size: 1.15rem;
+}
+
+h3 {
+  font-size: 0.95rem;
+}
+
+img {
+  display: block;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* ---------------------------------------------------------------- layout helpers */
+
+.stack {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+/* A stack taller than its scrolling parent scrolls; its items keep their height instead of squashing. */
+.stack > * {
+  flex-shrink: 0;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.row.between {
+  justify-content: space-between;
+}
+
+.row.actions {
+  justify-content: flex-end;
+  flex-wrap: wrap;
+}
+
+.row.actions > .btn {
+  flex: 1 1 0;
+}
+
+.grow {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.right {
+  text-align: end;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+}
+
+.center {
+  text-align: center;
+}
+
+.hidden {
+  display: none !important;
+}
+
+.muted {
+  color: var(--text-muted);
+}
+
+.small {
+  font-size: 0.8rem;
+}
+
+.mono {
+  font-family: var(--font-mono);
+}
+
+.wrap {
+  overflow-wrap: anywhere;
+  word-break: break-all;
+}
+
+.lead {
+  color: var(--text-secondary);
+}
+
+.title-gradient {
+  background: var(--qnet-gradient);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  letter-spacing: 0.5px;
+}
+
+.center-screen {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  padding: 24px;
+  text-align: center;
+}
+
+/* the tab body's 12 px side gutter, so a whole address fits on one line here too */
+.screen-pad {
+  height: 100%;
+  overflow-y: auto;
+  padding: 20px 12px;
+}
+
+.heading {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.heading .lead {
+  font-size: 0.85rem;
+}
+
+/* ---------------------------------------------------------------- brand */
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.brand-mark {
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
+}
+
+.brand-name {
+  font-weight: 700;
+  font-size: 1.05rem;
+  background: var(--qnet-gradient);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+.logo-lg {
+  width: 88px;
+  height: 88px;
+  border-radius: 20px;
+  filter: drop-shadow(0 0 24px var(--qnet-glow)) drop-shadow(0 0 40px var(--solana-glow));
+}
+
+/* ---------------------------------------------------------------- controls */
+
+.btn {
+  font: inherit;
+  font-weight: 600;
+  font-size: 0.85rem;
+  padding: 10px 14px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-primary);
+  background: var(--bg-card);
+  color: var(--text-primary);
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease;
+  user-select: none;
+}
+
+.btn:hover:not(:disabled) {
+  background: var(--bg-card-strong);
+  border-color: var(--border-active);
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn-primary {
+  background: var(--qnet-gradient);
+  border-color: transparent;
+  box-shadow: 0 0 18px var(--qnet-glow);
+}
+
+.btn-primary:hover:not(:disabled) {
+  background: var(--qnet-gradient);
+  box-shadow: 0 4px 24px var(--qnet-glow), 0 0 30px var(--qnet-glow);
+}
+
+.btn-danger {
+  background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%);
+  border-color: transparent;
+}
+
+.btn-danger:hover:not(:disabled) {
+  background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%);
+  box-shadow: 0 4px 12px rgba(239, 68, 68, 0.35);
+}
+
+.btn-ghost {
+  background: transparent;
+  color: var(--text-secondary);
+  padding: 6px 10px;
+}
+
+.btn-block {
+  width: 100%;
+}
+
+.btn[aria-pressed='true'] {
+  box-shadow: 0 0 0 2px var(--accent) inset;
+}
+
+.input {
+  width: 100%;
+  font: inherit;
+  font-size: 0.9rem;
+  padding: 10px 12px;
+  color: var(--text-primary);
+  background: var(--bg-card);
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius-md);
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px rgba(0, 212, 255, 0.2);
+}
+
+.input::placeholder {
+  color: var(--text-muted);
+}
+
+.textarea {
+  resize: vertical;
+  font-family: var(--font-mono);
+  min-height: 88px;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.field-label {
+  font-size: 0.8rem;
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+
+/* an input with a control beside it (the send form's amount and Max) */
+.field-row {
+  display: flex;
+  align-items: stretch;
+  gap: 6px;
+}
+
+.field-row .input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.field-row .btn {
+  flex: 0 0 auto;
+}
+
+/* a recipient field: a whole address (45 characters of the widest monospace advance, 0.602 em) fits the input's
+   content box (the field less 2 x 12 px padding and 2 x 1 px border), so what was pasted can be read whole */
+.field-address {
+  container-type: inline-size;
+}
+
+.field-address .input-address {
+  font-family: var(--font-mono);
+  font-size: clamp(9.5px, calc((100cqi - 26px) / 27.2), 13px);
+}
+
+/* a sent transaction waiting for its confirmation (room for the turning spinner's corners) */
+.pending-line {
+  align-items: center;
+  gap: 10px;
+  padding: 6px;
+}
+
+.pending-line .spinner {
+  flex: 0 0 auto;
+}
+
+.hint {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+}
+
+.hint-warn {
+  color: var(--warning);
+}
+
+.hint-ok {
+  color: var(--success);
+}
+
+.hint-bad {
+  color: var(--error);
+}
+
+.check {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.check input {
+  margin-top: 3px;
+  accent-color: var(--qnet-primary);
+}
+
+.segmented {
+  display: inline-flex;
+  padding: 2px;
+  gap: 2px;
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: var(--radius-sm);
+}
+
+.seg {
+  font: inherit;
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.4px;
+  padding: 6px 10px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.seg:hover {
+  color: var(--text-primary);
+}
+
+.seg[aria-pressed='true'] {
+  color: #ffffff;
+  background: linear-gradient(135deg, var(--qnet-primary), var(--qnet-secondary));
+  box-shadow: 0 0 16px var(--qnet-glow);
+}
+
+.seg[data-value='solana'][aria-pressed='true'] {
+  background: linear-gradient(135deg, var(--solana-primary), #00ffd1);
+  box-shadow: 0 0 16px var(--solana-glow);
+}
+
+/* ---------------------------------------------------------------- messages */
+
+.notice {
+  border-radius: var(--radius-md);
+  padding: 10px 12px;
+  font-size: 0.8rem;
+  border: 1px solid;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.notice ul {
+  padding-inline-start: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.notice-title {
+  font-weight: 600;
+}
+
+.notice-info {
+  background: rgba(59, 130, 246, 0.08);
+  border-color: rgba(59, 130, 246, 0.3);
+  color: #c7d8fb;
+}
+
+.notice-warn {
+  background: rgba(245, 158, 11, 0.08);
+  border-color: rgba(245, 158, 11, 0.35);
+  color: #fcd9a0;
+}
+
+.notice-danger {
+  background: rgba(239, 68, 68, 0.1);
+  border-color: rgba(239, 68, 68, 0.4);
+  color: #fecaca;
+}
+
+.notice-success {
+  background: rgba(16, 185, 129, 0.08);
+  border-color: rgba(16, 185, 129, 0.35);
+  color: #b7f0da;
+}
+
+.message {
+  font-size: 0.8rem;
+  min-height: 0;
+}
+
+.message:empty {
+  display: none;
+}
+
+.message-error {
+  color: var(--error);
+}
+
+.message-warn {
+  color: var(--warning);
+}
+
+.message-info {
+  color: var(--text-secondary);
+}
+
+.message-success {
+  color: var(--success);
+}
+
+.badge {
+  display: inline-block;
+  font-size: 0.7rem;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid;
+}
+
+.badge-ok {
+  color: var(--success);
+  border-color: rgba(16, 185, 129, 0.4);
+  background: rgba(16, 185, 129, 0.08);
+}
+
+.badge-warn {
+  color: var(--warning);
+  border-color: rgba(245, 158, 11, 0.4);
+  background: rgba(245, 158, 11, 0.08);
+}
+
+.badge-danger {
+  color: var(--error);
+  border-color: rgba(239, 68, 68, 0.4);
+  background: rgba(239, 68, 68, 0.08);
+}
+
+.badge-muted {
+  color: var(--text-muted);
+  border-color: var(--border-primary);
+  background: transparent;
+}
+
+.toast {
+  position: absolute;
+  left: 12px;
+  right: 12px;
+  bottom: 12px;
+  padding: 10px 12px;
+  font-size: 0.8rem;
+  border-radius: var(--radius-md);
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-primary);
+  box-shadow: var(--shadow-card);
+  opacity: 0;
+  transform: translateY(8px);
+  pointer-events: none;
+  transition: opacity 0.2s ease, transform 0.2s ease;
+}
+
+.toast.show {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.toast-success {
+  border-inline-start: 4px solid var(--success);
+}
+
+.toast-error {
+  border-inline-start: 4px solid var(--error);
+}
+
+.toast-warn {
+  border-inline-start: 4px solid var(--warning);
+}
+
+.toast-info {
+  border-inline-start: 4px solid var(--info);
+}
+
+.loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 32px 0;
+}
+
+.spinner {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  border: 2px solid rgba(0, 212, 255, 0.2);
+  border-top-color: var(--qnet-primary);
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.progress {
+  height: 4px;
+  border-radius: 2px;
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.08);
+}
+
+/* The moving band is a background, not a translated child, so nothing extends past the track. */
+.progress-bar {
+  width: 100%;
+  height: 100%;
+  background: linear-gradient(90deg, transparent 0%, #00d4ff 20%, #9945ff 35%, transparent 55%) no-repeat;
+  background-size: 200% 100%;
+  animation: slide 1.6s ease-in-out infinite;
+}
+
+@keyframes slide {
+  from {
+    background-position: 150% 0;
+  }
+  to {
+    background-position: -150% 0;
+  }
+}
+
+/* ---------------------------------------------------------------- data */
+
+.card {
+  background: var(--bg-card);
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius-lg);
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.card-label {
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  color: var(--text-muted);
+}
+
+.kv {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 6px 12px;
+  font-size: 0.8rem;
+  background: var(--bg-card);
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius-md);
+  padding: 10px 12px;
+}
+
+.kv dt {
+  color: var(--text-muted);
+}
+
+.kv dd {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  text-align: end;
+  unicode-bidi: plaintext;
+}
+
+/* a whole address (kit.kvList): the list's full width, below its label */
+.kv .kv-wide {
+  grid-column: 1 / -1;
+}
+
+.kv dt.kv-wide {
+  margin-bottom: -4px;
+}
+
+.kv dd.kv-addr {
+  text-align: start;
+}
+
+/* a wallet's two addresses under what happens to it (Reset wallet) */
+.wallet-pair {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.addr {
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  overflow-wrap: anywhere;
+  word-break: break-all;
+}
+
+.addr-edge {
+  color: var(--accent);
+  font-weight: 700;
+}
+
+.addr-mid {
+  color: var(--text-secondary);
+}
+
+.addr-box {
+  padding: 10px 12px;
+  border-radius: var(--radius-md);
+  background: var(--bg-card);
+  border: 1px solid var(--border-primary);
+  text-align: center;
+}
+
+.token-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.token-icon {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  object-fit: cover;
+}
+
+/* a built-in QNet token has no image of its own: the first character of its symbol in the icon's circle */
+.token-letter {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  font-weight: 700;
+  font-size: 0.95rem;
+  color: var(--text-primary);
+  background: var(--gradient-card);
+  border: 1px solid var(--border-active);
+}
+
+.history-icon.token-letter {
+  font-size: 0.85rem;
+}
+
+.token-info {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+/* the quiet line under the balances: "Updating…", or why the figure shown may be old or unverified */
+.asset-status:empty {
+  display: none;
+}
+
+.token-name {
+  font-weight: 600;
+}
+
+/* a token named after QNet's own coin: its warning mark and name in the warning colour (M-5) */
+.token-reserved {
+  color: var(--warning);
+}
+
+/* the short contract id under every built-in token's name: two tokens alike in name differ there */
+.token-contract {
+  font-size: 0.72rem;
+  overflow-wrap: anywhere;
+}
+
+.token-amount {
+  font-weight: 600;
+  font-size: 1rem;
+  text-align: end;
+  direction: ltr;
+  unicode-bidi: isolate;
+  /* a token's balance may run to 39 digits (u128): it takes at most half the row and wraps there, never the name */
+  flex: 0 0 auto;
+  max-width: 50%;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.list {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.list-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  background: var(--bg-card);
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius-md);
+}
+
+.row-title {
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.amount {
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+/* History of either network (owner, 06.10): rows newest first under the header of their day, one row per transaction,
+   laid out as the app's. A row is the asset's icon with a round badge of what happened at its lower corner, what
+   happened over who it was with (and the status of a row not confirmed), and at its end the amount: incoming green,
+   outgoing plain, to yourself blue, muted when nothing moved. The amount is written compactly (popup.js rowAmount), is
+   never scaled and takes at most half the row: its symbol goes under its number when both do not fit on one line. Every
+   row is a button that opens its detail. */
+.history-in .amount {
+  color: var(--success);
+}
+
+.history-self .amount {
+  color: var(--qnet-primary);
+}
+
+.history-failed .amount {
+  color: var(--text-muted);
+}
+
+.history-days {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.history-day {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.history-date {
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--text-muted);
+  padding-inline-start: 2px;
+}
+
+.history-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 10px 12px;
+  background: var(--bg-card);
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius-md);
+  color: inherit;
+  font: inherit;
+  text-align: start;
+}
+
+button.history-row {
+  cursor: pointer;
+}
+
+button.history-row:hover,
+button.history-row:focus-visible {
+  border-color: var(--border-active);
+}
+
+.history-icon {
+  width: 36px;
+  height: 36px;
+  flex: 0 0 auto;
+}
+
+/* the icon with room at its inline end and bottom for the badge, which reaches past the icon's corner */
+.history-avatar {
+  position: relative;
+  display: inline-flex;
+  flex: 0 0 auto;
+  padding-inline-end: 4px;
+  padding-bottom: 4px;
+}
+
+/* The badge of what a row did, as the app draws it: a disc in the action's colour on the icon's lower corner (the inline
+   end), ringed off the icon, with a dark glyph drawn through a mask over the whole disc. Each glyph is the app's own
+   (qnet-mobile src/screens/HistoryTab.js BADGES): a 24-unit vector whose box is the disc, round strokes 2.6 wide, so
+   both histories draw the same marks. The colours are the amounts': outgoing white, incoming green, the QNet blue for a
+   transfer to yourself, a swap and a node action; grey for a contract, amber for a burn, red with a white glyph for a
+   failure. */
+.history-action {
+  --badge: var(--text-primary);
+  position: absolute;
+  inset-inline-end: 0;
+  bottom: 0;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--badge);
+  box-shadow: 0 0 0 2px var(--bg-secondary);
+  color: var(--bg-primary);
+}
+
+.history-action::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background-color: currentColor;
+  -webkit-mask: var(--glyph) center / contain no-repeat;
+  mask: var(--glyph) center / contain no-repeat;
+}
+
+[dir='rtl'] .history-action-sent::before {
+  transform: scaleX(-1);
+}
+
+.history-action-received {
+  --badge: var(--success);
+}
+
+.history-action-self,
+.history-action-node,
+.history-action-swap {
+  --badge: var(--qnet-primary);
+}
+
+.history-action-call {
+  --badge: var(--text-secondary);
+}
+
+.history-action-burn {
+  --badge: var(--warning);
+}
+
+.history-action-failed {
+  --badge: var(--error);
+  color: var(--text-primary);
+}
+
+/* sent: M8 16L16 8M10 8h6v6 */
+.history-action-sent { --glyph: url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0naHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmcnIHZpZXdCb3g9JzAgMCAyNCAyNCcgZmlsbD0nbm9uZScgc3Ryb2tlPScjMDAwJyBzdHJva2Utd2lkdGg9JzIuNicgc3Ryb2tlLWxpbmVjYXA9J3JvdW5kJyBzdHJva2UtbGluZWpvaW49J3JvdW5kJz48cGF0aCBkPSdNOCAxNkwxNiA4TTEwIDhoNnY2Jy8+PC9zdmc+"); }
+/* received: M12 6v12M7 13l5 5 5-5 */
+.history-action-received { --glyph: url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0naHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmcnIHZpZXdCb3g9JzAgMCAyNCAyNCcgZmlsbD0nbm9uZScgc3Ryb2tlPScjMDAwJyBzdHJva2Utd2lkdGg9JzIuNicgc3Ryb2tlLWxpbmVjYXA9J3JvdW5kJyBzdHJva2UtbGluZWpvaW49J3JvdW5kJz48cGF0aCBkPSdNMTIgNnYxMk03IDEzbDUgNSA1LTUnLz48L3N2Zz4="); }
+/* self: M17 12a5 5 0 1 1-1.8-3.85M17 5.5v3.2h-3.2 */
+.history-action-self { --glyph: url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0naHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmcnIHZpZXdCb3g9JzAgMCAyNCAyNCcgZmlsbD0nbm9uZScgc3Ryb2tlPScjMDAwJyBzdHJva2Utd2lkdGg9JzIuNicgc3Ryb2tlLWxpbmVjYXA9J3JvdW5kJyBzdHJva2UtbGluZWpvaW49J3JvdW5kJz48cGF0aCBkPSdNMTcgMTJhNSA1IDAgMSAxLTEuOC0zLjg1TTE3IDUuNXYzLjJoLTMuMicvPjwvc3ZnPg=="); }
+/* swap: M6 9.5h11.5L14.5 6.5M18 14.5H6.5l3 3 */
+.history-action-swap { --glyph: url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0naHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmcnIHZpZXdCb3g9JzAgMCAyNCAyNCcgZmlsbD0nbm9uZScgc3Ryb2tlPScjMDAwJyBzdHJva2Utd2lkdGg9JzIuNicgc3Ryb2tlLWxpbmVjYXA9J3JvdW5kJyBzdHJva2UtbGluZWpvaW49J3JvdW5kJz48cGF0aCBkPSdNNiA5LjVoMTEuNUwxNC41IDYuNU0xOCAxNC41SDYuNWwzIDMnLz48L3N2Zz4="); }
+/* node: M12 5.5l5.6 3.25v6.5L12 18.5l-5.6-3.25v-6.5z, a filled circle r 1.9 at the centre */
+.history-action-node { --glyph: url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0naHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmcnIHZpZXdCb3g9JzAgMCAyNCAyNCcgZmlsbD0nbm9uZScgc3Ryb2tlPScjMDAwJyBzdHJva2Utd2lkdGg9JzIuNicgc3Ryb2tlLWxpbmVjYXA9J3JvdW5kJyBzdHJva2UtbGluZWpvaW49J3JvdW5kJz48cGF0aCBkPSdNMTIgNS41bDUuNiAzLjI1djYuNUwxMiAxOC41bC01LjYtMy4yNXYtNi41eicvPjxjaXJjbGUgY3g9JzEyJyBjeT0nMTInIHI9JzEuOScgZmlsbD0nIzAwMCcgc3Ryb2tlPSdub25lJy8+PC9zdmc+"); }
+/* call: M9.5 8l-4 4 4 4M14.5 8l4 4-4 4 */
+.history-action-call { --glyph: url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0naHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmcnIHZpZXdCb3g9JzAgMCAyNCAyNCcgZmlsbD0nbm9uZScgc3Ryb2tlPScjMDAwJyBzdHJva2Utd2lkdGg9JzIuNicgc3Ryb2tlLWxpbmVjYXA9J3JvdW5kJyBzdHJva2UtbGluZWpvaW49J3JvdW5kJz48cGF0aCBkPSdNOS41IDhsLTQgNCA0IDRNMTQuNSA4bDQgNC00IDQnLz48L3N2Zz4="); }
+/* burn: M12 4.5c.5 2.4 2.2 3.6 3.3 5.2.9 1.3 1.2 2.4 1.2 3.6a4.5 4.5 0 0 1-9 0c0-1.7.8-3 1.8-4 .1 1.2.6 2.1 1.5 2.5-.2-2.6.4-5 1.2-7.3z, filled */
+.history-action-burn { --glyph: url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0naHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmcnIHZpZXdCb3g9JzAgMCAyNCAyNCcgZmlsbD0nbm9uZScgc3Ryb2tlPScjMDAwJyBzdHJva2Utd2lkdGg9JzIuNicgc3Ryb2tlLWxpbmVjYXA9J3JvdW5kJyBzdHJva2UtbGluZWpvaW49J3JvdW5kJz48cGF0aCBkPSdNMTIgNC41Yy41IDIuNCAyLjIgMy42IDMuMyA1LjIuOSAxLjMgMS4yIDIuNCAxLjIgMy42YTQuNSA0LjUgMCAwIDEtOSAwYzAtMS43LjgtMyAxLjgtNCAuMSAxLjIuNiAyLjEgMS41IDIuNS0uMi0yLjYuNC01IDEuMi03LjN6JyBmaWxsPScjMDAwJyBzdHJva2U9J25vbmUnLz48L3N2Zz4="); }
+/* failed: M8.5 8.5l7 7M15.5 8.5l-7 7 */
+.history-action-failed { --glyph: url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0naHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmcnIHZpZXdCb3g9JzAgMCAyNCAyNCcgZmlsbD0nbm9uZScgc3Ryb2tlPScjMDAwJyBzdHJva2Utd2lkdGg9JzIuNicgc3Ryb2tlLWxpbmVjYXA9J3JvdW5kJyBzdHJva2UtbGluZWpvaW49J3JvdW5kJz48cGF0aCBkPSdNOC41IDguNWw3IDdNMTUuNSA4LjVsLTcgNycvPjwvc3ZnPg=="); }
+
+.history-main {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* the amount at the row's end: left to right in every language (sign, number, symbol), as wide as it needs up to half the
+   row (what happened and who with wrap beside it, never the amount: its symbol goes under its number only past half) */
+.history-row > .amount {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  align-items: baseline;
+  column-gap: 0.3em;
+  max-width: 50%;
+  direction: ltr;
+  unicode-bidi: isolate;
+}
+
+.amount-number,
+.amount-symbol {
+  white-space: nowrap;
+}
+
+.amount-symbol {
+  font-size: 0.85em;
+}
+
+.history-sub {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  column-gap: 8px;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+
+.history-status {
+  font-weight: 600;
+}
+
+.history-status-warn {
+  color: var(--warning);
+}
+
+.history-status-danger {
+  color: var(--error);
+}
+
+/* the detail of a history row: the row's icon and badge, larger, what happened and the amount large under it */
+.detail-head {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  text-align: center;
+}
+
+.history-avatar-large .history-icon {
+  width: 48px;
+  height: 48px;
+  font-size: 1.1rem;
+}
+
+.history-avatar-large .history-action {
+  width: 22px;
+  height: 22px;
+}
+
+.detail-amount {
+  font-size: 1.35rem;
+  font-weight: 700;
+  direction: ltr;
+  unicode-bidi: isolate;
+  overflow-wrap: anywhere;
+}
+
+.detail-amount.history-in {
+  color: var(--success);
+}
+
+.detail-amount.history-self {
+  color: var(--qnet-primary);
+}
+
+.detail-amount.history-failed {
+  color: var(--text-muted);
+}
+
+/* a hash or a signature as its own copy control: whole, wrapping at any character */
+.value-copy {
+  display: block;
+  width: 100%;
+  padding: 4px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  line-height: 1.5;
+  text-align: start;
+  overflow-wrap: anywhere;
+  word-break: break-all;
+  cursor: pointer;
+  direction: ltr;
+  unicode-bidi: isolate;
+}
+
+.value-copy:hover {
+  border-color: var(--border-active);
+  background: var(--bg-card-strong);
+}
+
+.value-copy.copied::after {
+  content: attr(data-copied);
+  display: block;
+  margin-top: 2px;
+  font-family: var(--font-primary);
+  font-size: 0.7rem;
+  font-weight: 600;
+  color: var(--success);
+}
+
+.section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--border-primary);
+}
+
+.section:last-child {
+  border-bottom: none;
+}
+
+.danger-zone h3 {
+  color: var(--error);
+}
+
+/* ---------------------------------------------------------------- lock screen */
+
+.lock-screen {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-primary);
+}
+
+.lock-top {
+  padding: 14px 24px 10px;
+  text-align: center;
+  border-bottom: 1px solid rgba(0, 212, 255, 0.2);
+  background: rgba(0, 212, 255, 0.03);
+}
+
+.lock-top h1 {
+  font-size: 2.2rem;
+}
+
+.lock-body {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  padding: 24px 28px;
+  text-align: center;
+}
+
+.lock-body .input {
+  text-align: center;
+  font-size: 1rem;
+  padding: 14px 16px;
+  border-radius: var(--radius-lg);
+}
+
+.lock-body .btn-primary {
+  padding: 14px 16px;
+  font-size: 1rem;
+  border-radius: var(--radius-lg);
+}
+
+/* ---------------------------------------------------------------- wallet frame */
+
+.wallet {
+  position: relative;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-modal);
+}
+
+.wallet.net-solana {
+  --accent: var(--solana-primary);
+  --accent-glow: var(--solana-glow);
+}
+
+/* the header and the tab bar keep a gutter at both edges (owner, 06.10): nothing in them touches the popup's edge */
+.topbar {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  height: 50px;
+  padding: 0 16px;
+  background: var(--bg-card);
+  border-bottom: 1px solid var(--border-primary);
+}
+
+.wallet > .notice {
+  margin: 8px 12px 0;
+}
+
+/* Lock in the header (owner, 06.10): the ghost button's size and padding with a lock glyph in its text colour, drawn
+   through a mask of a 24-unit vector (shackle, body, keyhole), as History's badges; its name is the tooltip and the
+   accessible label */
+.icon-button {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+}
+
+.icon-button:hover:not(:disabled) {
+  color: var(--text-primary);
+}
+
+.lock-icon {
+  display: block;
+  width: 18px;
+  height: 18px;
+  background-color: currentColor;
+  -webkit-mask: url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0naHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmcnIHZpZXdCb3g9JzAgMCAyNCAyNCcgZmlsbD0nbm9uZScgc3Ryb2tlPScjMDAwJyBzdHJva2Utd2lkdGg9JzInIHN0cm9rZS1saW5lY2FwPSdyb3VuZCcgc3Ryb2tlLWxpbmVqb2luPSdyb3VuZCc+PHJlY3QgeD0nNScgeT0nMTAuNScgd2lkdGg9JzE0JyBoZWlnaHQ9JzEwJyByeD0nMi41Jy8+PHBhdGggZD0nTTguNSAxMC41VjcuNWEzLjUgMy41IDAgMCAxIDcgMHYzJy8+PHBhdGggZD0nTTEyIDE0LjZ2Mi4yJy8+PC9zdmc+") center / contain no-repeat;
+  mask: url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0naHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmcnIHZpZXdCb3g9JzAgMCAyNCAyNCcgZmlsbD0nbm9uZScgc3Ryb2tlPScjMDAwJyBzdHJva2Utd2lkdGg9JzInIHN0cm9rZS1saW5lY2FwPSdyb3VuZCcgc3Ryb2tlLWxpbmVqb2luPSdyb3VuZCc+PHJlY3QgeD0nNScgeT0nMTAuNScgd2lkdGg9JzE0JyBoZWlnaHQ9JzEwJyByeD0nMi41Jy8+PHBhdGggZD0nTTguNSAxMC41VjcuNWEzLjUgMy41IDAgMCAxIDcgMHYzJy8+PHBhdGggZD0nTTEyIDE0LjZ2Mi4yJy8+PC9zdmc+") center / contain no-repeat;
+}
+
+/* Six tabs in the 360 px popup, inside a 12 px gutter: a tab is its label's width on one line (never wrapped, never
+   cut) and the spare width is shared out; a language whose labels are wider than the bar has them set smaller as one
+   (popup.js fitTabs, to 80 % at most), and only past that the bar scrolls sideways, with no scrollbar drawn (popup.js
+   brings the chosen tab into view). */
+.tabs {
+  display: flex;
+  /* a scrolling box may shrink below its content in the popup's column: the bar keeps its height whatever the tab shows */
+  flex: 0 0 auto;
+  padding: 0 12px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+  border-bottom: 1px solid var(--border-primary);
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.tabs::-webkit-scrollbar {
+  display: none;
+}
+
+.tab {
+  flex: 1 0 auto;
+  font: inherit;
+  font-size: 0.72rem;
+  font-weight: 600;
+  padding: 10px 5px 8px;
+  background: transparent;
+  border: none;
+  border-bottom: 3px solid transparent;
+  color: #8a8a8a;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.tab:hover {
+  color: #ffffff;
+}
+
+.tab[aria-selected='true'] {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+  background: linear-gradient(180deg, transparent 0%, rgba(0, 212, 255, 0.08) 100%);
+}
+
+.tab-body {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: 14px 12px 64px;
+}
+
+/* The whole address on one line is the copy control. Its highlight reaches 5 px into the padding of the box around it,
+   so the address itself lines up with the box's other content and keeps the box's full width. */
+.account-address {
+  display: block;
+  width: calc(100% + 10px);
+  margin: 0 -5px;
+  padding: 6px 4px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: start;
+  cursor: pointer;
+  direction: ltr;
+  unicode-bidi: isolate;
+}
+
+/* A whole address on one line (owner, 29.09), never cut: its box is a size container and the address takes the type
+   size at which 45 characters, the longest address (QNet; Solana has at most 44), fill the box. 27.2 em holds 45
+   characters of the widest advance in the monospace list (0.602 em; Consolas 0.55, Cascadia Mono 0.586). In the
+   360 px popup the box is 310 px wide: 11.4 px type; beside a 17 px scrollbar 293 px: 10.8 px. The 10.5 px floor
+   only binds in a box narrower than 286 px (a setup tab under about 400 px wide), where the address wraps instead. */
+.account-address,
+.kv dd.kv-addr {
+  container-type: inline-size;
+}
+
+.account-address .addr,
+.kv-addr .addr {
+  display: block;
+  font-size: clamp(10.5px, 100cqi / 27.2, 13px);
+  line-height: 1.5;
+}
+
+.account-address:hover {
+  border-color: var(--border-active);
+  background: var(--bg-card-strong);
+}
+
+.account-address:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* "Copied" on the address for a moment once it is copied */
+.account-address.copied::after {
+  content: attr(data-copied);
+  display: block;
+  margin-top: 2px;
+  font-family: var(--font-primary);
+  font-size: 0.7rem;
+  font-weight: 600;
+  color: var(--success);
+}
+
+/* the same control as a value of a list (review From, the Activate account) or in the Receive box; in a list its row
+   takes the 5 px of the list's padding, so the row itself holds the highlight */
+.kv .account-address {
+  padding-block: 2px;
+}
+
+.kv dd.kv-addr:has(> .account-address) {
+  margin-inline: -5px;
+}
+
+.kv dd.kv-addr > .account-address {
+  width: 100%;
+  margin: 0;
+}
+
+.addr-box .account-address {
+  padding-block: 0;
+  text-align: center;
+}
+
+/* ---------------------------------------------------------------- receive */
+
+.receive {
+  align-items: stretch;
+}
+
+.qr-frame {
+  align-self: center;
+  background: #ffffff;
+  padding: 8px;
+  border-radius: var(--radius-lg);
+  box-shadow: 0 4px 20px rgba(0, 212, 255, 0.2);
+}
+
+.qr {
+  display: block;
+  width: 184px;
+  height: 184px;
+  image-rendering: pixelated;
+}
+
+/* ---------------------------------------------------------------- activate and secrets */
+
+.node-card .price {
+  font-weight: 700;
+  color: var(--qnet-primary);
+}
+
+.node-super .price {
+  color: var(--solana-primary);
+}
+
+.code-box {
+  font-size: 1.05rem;
+  letter-spacing: 1px;
+  text-align: center;
+  padding: 12px;
+  border-radius: var(--radius-md);
+  background: rgba(0, 0, 0, 0.3);
+  border: 1px dashed var(--border-active);
+  overflow-wrap: anywhere;
+  user-select: none;
+}
+
+.code-box.revealed {
+  user-select: text;
+  border-style: solid;
+}
+
+/* the activation code in Settings: the code over its Show and Copy buttons */
+.code-row {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* an exported private key: a long hex or base58 string, broken at any character */
+.key-box {
+  font-size: 0.82rem;
+  letter-spacing: 0.3px;
+  word-break: break-all;
+  border-color: rgba(239, 68, 68, 0.5);
+}
+
+.env dt {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  color: var(--text-secondary);
+}
+
+.phrase {
+  min-height: 150px;
+  padding: 12px 14px;
+  border-radius: var(--radius-md);
+  background: rgba(0, 0, 0, 0.3);
+  border: 1px dashed rgba(239, 68, 68, 0.5);
+  white-space: pre-line;
+  columns: 2;
+  line-height: 1.9;
+  font-size: 0.85rem;
+  user-select: none;
+}
+
+.phrase.revealed {
+  border-style: solid;
+}
+
+.word-grid {
+  list-style: none;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  counter-reset: word;
+  /* the words are never selected or copied from the grid: the Copy button is the only copy (R11, R14) */
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.word-grid li {
+  counter-increment: word;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 8px 10px;
+  background: var(--bg-card);
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius-md);
+}
+
+.word-grid li::before {
+  content: counter(word) '.';
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  min-width: 1.6em;
+}
+
+.word {
+  font-weight: 600;
+}
+
+/* ---------------------------------------------------------------- languages
+   Addresses, codes, hashes, words and amounts stay left to right, isolated from the text around them
+   (Arabic pages are dir="rtl"). Text wraps instead of overflowing; nothing is cut. */
+
+.mono,
+.addr,
+.code-box,
+.phrase,
+.word,
+.amount,
+.price,
+.env dt {
+  direction: ltr;
+  unicode-bidi: isolate;
+}
+
+.addr-box {
+  direction: ltr;
+}
+
+/* Sentences may carry a long token (an origin, a date): they break it rather than overflow. Labels of
+   controls do not, so a translation too long for its control shows up in scripts/overflow-check.mjs. */
+p,
+li,
+dt,
+label,
+.notice,
+.message,
+.hint,
+.toast,
+.row-title,
+.token-name {
+  overflow-wrap: break-word;
+  min-width: 0;
+}
+
+.select {
+  appearance: auto;
+  cursor: pointer;
+}
+
+.select option {
+  color: var(--text-primary);
+  background: var(--bg-secondary);
+}
+
+/* one line of text that opens a page (the Activate tab's aiqnet.io/node) */
+.inline-link {
+  color: var(--accent, #00d4ff);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.inline-link:hover { opacity: 0.85; }

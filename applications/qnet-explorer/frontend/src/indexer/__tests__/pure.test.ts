@@ -47,6 +47,21 @@ test('batch envelope shapes into envelope row and recipient rows', () => {
   assert.deepEqual(rows[999], { tx_hash: row.hash, tx_index: 999, block: 10, timestamp: row.timestamp, from_address: 'sender_eon', to_address: 'r999', amount: '1000' });
 });
 
+// A registration keeps its burn facts, bounded; nothing else of its body (keys, attestations) goes into the row.
+test('a registration row keeps the node, the burn and the burner', () => {
+  const burnTx = '3NDb8AYafSq8kfkHZbBt5yJdao5UpeVKQVTgwghoAVnH2xxuBQm6ywZ9ZmgEEpsp2TmuU834XhyEsuhmRX7Lom3U';
+  const reg = {
+    node_id: 'light_mobile_6526ab8fd00ff8ca', node_type: 'Light', wallet_address: 'd9fa370374e24333242eon847d1d354dcd87fe873823e',
+    registration_proof: 'd2ec2e275368718cdf2393a85276ce2b', api_endpoint: '', burn_tx: burnTx, burn_wallet: '9z1QsPH2k9xpYY9EQYh8EdPjhnt9CXnsxZZkYgT5Km96',
+    burn_owner_sig: 'ab'.repeat(64), vrf_pk: [], burn_amount: 1500, burn_cost: 1500, burn_attestors: [['genesis_node_001', 'cd'.repeat(3309)]], attest_epoch: 3,
+  };
+  const row = transformTransaction({ hash: 'f'.repeat(64), from: reg.wallet_address, amount: 0, nonce: 0, gas_price: 0, gas_limit: 0, tx_type: { NodeRegistration: reg } }, 7, 1000, 0)!;
+  assert.equal(row.tx_type, 'NodeRegistration');
+  assert.deepEqual(row.tx_type_data, { node_id: reg.node_id, node_type: 'Light', burn_tx: burnTx, burn_wallet: reg.burn_wallet, burn_amount: 1500 });
+  const genesis = transformTransaction({ hash: 'e'.repeat(64), from: 'genesis', amount: 0, nonce: 0, gas_price: 0, gas_limit: 0, tx_type: { NodeRegistration: { node_id: 'genesis_node_001', node_type: 'Super' } } }, 0, 1000, 0);
+  assert.deepEqual(genesis?.tx_type_data ?? null, genesis ? { node_id: 'genesis_node_001', node_type: 'Super', burn_tx: null, burn_wallet: null, burn_amount: null } : null);
+});
+
 // The bulk statements keep a fixed parameter count however many rows they carry (the 65 535 cap).
 test('bulk statements have a constant parameter count', () => {
   const big = Array.from({ length: 30_000 }, (_, i) => ({ tx_hash: 'h', tx_index: i, block: 1, timestamp: 1, from_address: 'f', to_address: 't', amount: '1' }));

@@ -69,17 +69,31 @@ describe('light node wakes and token refresh', () => {
     Keychain.getGenericPassword.mockResolvedValue({ password: 'sk' });
     await AsyncStorage.setItem(`qnet_ping_dilithium_pk_${NODE}`, 'pk');
   };
+  // A binding an older build made (no sequence): only such a device sends its push target anywhere.
+  const linkedHere = () => AsyncStorage.multiSet([
+    ['qnet_light_node_info', JSON.stringify({ nodeId: NODE, pushType: 'fcm' })],
+    ['qnet_ping_node_id', NODE],
+  ]);
 
   it('sends a token refresh to the shard owners in rank order and stops at the first success', async () => {
     await withPingKey();
+    await linkedHere();
     global.fetch = jest.fn((url) => { calls.push(url); return reply({ success: calls.length === 2 }); });
     const res = await Push.refreshFcmTokenOnServer(NODE);
     expect(res.success).toBe(true);
     expect(calls).toEqual(lightShardOwnerUrls(NODE).slice(0, 2).map(u => u + REFRESH));
   });
 
+  it('sends no push target for a node that is not linked to this device', async () => {
+    await withPingKey();
+    global.fetch = jest.fn((url) => { calls.push(url); return reply({ success: true }); });
+    expect(await Push.refreshFcmTokenOnServer(NODE)).toEqual({ success: false, error: 'not_linked' });
+    expect(calls).toEqual([]);
+  });
+
   it('falls back to another node only after every owner failed', async () => {
     await withPingKey();
+    await linkedHere();
     global.fetch = jest.fn((url) => { calls.push(url); return reply({ success: calls.length === 4 }); });
     const res = await Push.refreshFcmTokenOnServer(NODE);
     expect(res.success).toBe(true);
@@ -100,9 +114,12 @@ describe('light node wakes and token refresh', () => {
   it('does not self-attest when the pushed ping was answered', async () => {
     await withPingKey();
     global.fetch = jest.fn((url) => { calls.push(url); return reply({ success: true }); });
-    const ok = await Push.handlePushMessage({ action: 'ping_response', challenge: 'c', node_id: NODE, response_url: 'http://x' });
+    // A real stamp shape (nonce ‖ expiry ‖ mac), from genesis 003 naming itself by address.
+    const expiry = Buffer.alloc(8); expiry.writeBigUInt64BE(BigInt(Math.floor(Date.now() / 1000) + 600));
+    const stamp = Buffer.concat([Buffer.alloc(16, 1), expiry, Buffer.alloc(16, 2)]).toString('hex');
+    const ok = await Push.handlePushMessage({ action: 'ping_response', challenge: stamp, node_id: NODE, response_url: 'http://161.97.86.81:8001' });
     expect(ok).toBe(true);
-    expect(calls.some(u => u.endsWith('/api/v1/height'))).toBe(false);
+    expect(calls).toEqual(['https://node3.aiqnet.io/api/v1/light-node/ping-response']);
   });
 
   it('configures the periodic wake for an FCM phone', async () => {
@@ -122,6 +139,8 @@ describe('light node wakes and token refresh', () => {
     global.fetch = jest.fn((url) => { calls.push(url); return reply({}); });
     for (const pushType of ['fcm', 'polling']) {
       calls = [];
+      // A reply with no height is a failure to retry (F10): its short wait would keep the next wake silent.
+      await AsyncStorage.removeItem('qnet_self_attest_hold');
       await AsyncStorage.setItem('qnet_light_node_info', JSON.stringify({ nodeId: NODE, pushType, nextPingTime: inWindow }));
       await Push.onBackgroundFetch(`t-${pushType}`);
       expect(calls.some(u => u.endsWith('/api/v1/height'))).toBe(true);
@@ -172,101 +191,10 @@ describe('light node wakes and token refresh', () => {
   });
 
   it('reads a rate-limited status reply as unknown, not as absent from the chain', async () => {
-    await AsyncStorage.setItem('qnet_light_node_info', JSON.stringify({ nodeId: NODE, pushType: 'fcm' }));
-    global.fetch = jest.fn(() => reply({ success: false, error: 'Rate limit exceeded' }));
-    expect((await Push.checkNodeStatus()).onChainRegistered).toBeNull();
-  });
-});
-
-describe('pending on-chain registration', () => {
-  const AsyncStorage = require('@react-native-async-storage/async-storage');
-  const { WalletManager } = require('../src/components/WalletManager');
-  const W = 'eon_test_wallet';
-  const MARKER = `qnet_onchain_reg_pending_${W}`;
-  const marker = async () => JSON.parse(await AsyncStorage.getItem(MARKER));
-
-  beforeEach(async () => {
-    await AsyncStorage.clear();
-    await AsyncStorage.setItem('qnet_address', W);
-  });
-
-  it('keeps the marker through mempool admission and clears it once status reports the node on chain', async () => {
-    const wm = new WalletManager();
-    wm.createAndSubmitNodeRegistrationTx = jest.fn();
-    expect(await wm._recordOnchainSubmitOutcome(W, { nodeId: 'n' }, { success: true, tx_hash: 'h' })).toBe('admitted');
-    expect(await marker()).toMatchObject({ nodeId: 'n', txHash: 'h', attempts: 1 }); // admission counts toward the backoff
-    await AsyncStorage.setItem(MARKER, JSON.stringify({ ...(await marker()), savedAt: 0 })); // backoff over: only the hold stops it
-    await wm.retryPendingOnchainRegistration('pw', { onChainRegistered: false }); // inside the inclusion window
-    expect(wm.createAndSubmitNodeRegistrationTx).not.toHaveBeenCalled();
-    await wm.retryPendingOnchainRegistration('pw', { onChainRegistered: true });
-    expect(await AsyncStorage.getItem(MARKER)).toBeNull();
-  });
-
-  it('keeps retrying past the attempt cap only while the chain reports the node absent', async () => {
-    const wm = new WalletManager();
-    await AsyncStorage.setItem(MARKER, JSON.stringify({ nodeId: 'n', attempts: 12, savedAt: 0 }));
-    wm.createAndSubmitNodeRegistrationTx = jest.fn()
-      .mockResolvedValue({ success: false, error: 'burn-attestation quorum not yet reached' });
-    await wm.retryPendingOnchainRegistration('pw', { onChainRegistered: null });
-    expect(wm.createAndSubmitNodeRegistrationTx).not.toHaveBeenCalled();
-    await wm.retryPendingOnchainRegistration('pw', { onChainRegistered: false });
-    expect(wm.createAndSubmitNodeRegistrationTx).toHaveBeenCalledTimes(1);
-    expect((await marker()).attempts).toBe(13);
-  });
-
-  it('clears the marker when the submit answers already registered', async () => {
-    const wm = new WalletManager();
-    await AsyncStorage.setItem(MARKER, JSON.stringify({ nodeId: 'n', attempts: 0, savedAt: 0 }));
-    wm.createAndSubmitNodeRegistrationTx = jest.fn().mockResolvedValue({ success: false, error: 'Node already registered' });
-    await wm.retryPendingOnchainRegistration('pw', { onChainRegistered: false });
-    expect(await AsyncStorage.getItem(MARKER)).toBeNull();
-  });
-
-  it('yields to a TX admitted inside the inclusion hold instead of replacing it', async () => {
-    const wm = new WalletManager();
-    await wm._recordOnchainSubmitOutcome(W, { nodeId: 'n' }, { success: true, tx_hash: 'h' });
-    const submit = jest.fn();
-    expect(await wm._submitRegistration(W, { nodeId: 'n' }, submit)).toMatchObject({ outcome: 'held', txHash: 'h' });
-    expect(submit).not.toHaveBeenCalled();
-  });
-
-  it('runs overlapping submits one at a time', async () => {
-    const wm = new WalletManager();
-    let inFlight = 0;
-    let peak = 0;
-    const submit = async () => {
-      inFlight += 1;
-      peak = Math.max(peak, inFlight);
-      await new Promise(resolve => setTimeout(resolve, 5));
-      inFlight -= 1;
-      return { success: false, error: 'burn-attestation quorum not yet reached' };
-    };
-    await Promise.all([wm._submitRegistration(W, { nodeId: 'n' }, submit), wm._submitRegistration(W, { nodeId: 'n' }, submit)]);
-    expect(peak).toBe(1);
-    expect((await marker()).attempts).toBe(2);
-  });
-
-  it('an automatic retry re-reads the backoff after waiting behind another submit', async () => {
-    const wm = new WalletManager();
-    await AsyncStorage.setItem(MARKER, JSON.stringify({ nodeId: 'n', attempts: 0, savedAt: 0 }));
-    const failing = async () => {
-      await new Promise(resolve => setTimeout(resolve, 5));
-      return { success: false, error: 'burn-attestation quorum not yet reached' };
-    };
-    const automatic = jest.fn();
-    const [, queued] = await Promise.all([
-      wm._submitRegistration(W, { nodeId: 'n' }, failing),
-      wm._submitRegistration(W, { nodeId: 'n' }, automatic, { automatic: true }),
-    ]);
-    expect(queued.outcome).toBe('skipped');
-    expect(automatic).not.toHaveBeenCalled();
-  });
-
-  it('the automatic retry waits out its backoff', async () => {
-    const wm = new WalletManager();
-    await AsyncStorage.setItem(MARKER, JSON.stringify({ nodeId: 'n', attempts: 1, savedAt: Date.now() }));
-    wm.createAndSubmitNodeRegistrationTx = jest.fn();
-    await wm.retryPendingOnchainRegistration('pw', { onChainRegistered: false });
-    expect(wm.createAndSubmitNodeRegistrationTx).not.toHaveBeenCalled();
+    const { readNodeStatus } = require('../src/services/LightNode');
+    global.fetch = jest.fn((url) => { calls.push(url); return reply({ success: false, error: 'Rate limit exceeded' }); });
+    expect((await readNodeStatus(NODE)).onChain).toBeNull();
+    // Only the node's shard owners are asked.
+    expect(calls.map((u) => u.split('/api/')[0]).sort()).toEqual([...lightShardOwnerUrls(NODE)].sort());
   });
 });

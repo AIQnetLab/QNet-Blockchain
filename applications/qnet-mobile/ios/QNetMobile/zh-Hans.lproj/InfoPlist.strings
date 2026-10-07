@@ -1,0 +1,3 @@
+/* The purpose strings iOS shows in the phone's language (Info.plist holds the English ones). */
+"NSFaceIDUsageDescription" = "QNet Wallet 使用面容 ID 安全地解锁您的钱包并授权交易";
+"NSCameraUsageDescription" = "QNet Wallet 仅在您于“发送”页面点按扫描图标时使用相机，从二维码中读取地址。";

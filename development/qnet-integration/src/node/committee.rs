@@ -370,10 +370,39 @@ impl BlockchainNode {
             && qnet_consensus::consensus_crypto::verify_consensus_signature_bound(offender, &msg_b, sb, &pk_bytes).await
     }
 
+    /// The vote-proof half of the tx_target_bound rule, which needs the Checkpoint type qnet-state cannot see.
+    /// From the gate a VoteEquivocationProof carries its checkpoints in canonical order (smaller hash first)
+    /// and checkpoint_a's timestamp, as build_vote_equivocation_tx writes it. Nothing signs either, so without
+    /// this one proof minted another valid hash by swapping its sides or restamping its time. Every judge
+    /// outside apply runs it beside the shared predicate (tx_target_bound); apply trusts the verify stage
+    /// for a proof, as it does for the proof's signatures. Any other TX passes.
+    pub(crate) fn vote_proof_envelope_bound(tx: &qnet_state::Transaction, height: u64) -> Result<(), String> {
+        let (checkpoint_a, checkpoint_b) = match &tx.tx_type {
+            qnet_state::TransactionType::VoteEquivocationProof { checkpoint_a, checkpoint_b, .. } => (checkpoint_a, checkpoint_b),
+            _ => return Ok(()),
+        };
+        if !qnet_state::feature_gates::is_active(qnet_state::feature_gates::id::TX_TARGET_BOUND, height) {
+            return Ok(());
+        }
+        use qnet_consensus::checkpoint_bft::Checkpoint;
+        let (ca, cb) = match (bincode::deserialize::<Checkpoint>(checkpoint_a), bincode::deserialize::<Checkpoint>(checkpoint_b)) {
+            (Ok(a), Ok(b)) => (a, b),
+            // The verifier refuses the same proof, so nothing a judge would accept is lost.
+            _ => return Err("[REJECT][TX] system_envelope_unbound type=vote_equivocation_proof checkpoint_undecodable".to_string()),
+        };
+        let ordered = ca.hash() < cb.hash();
+        if !ordered || tx.timestamp != ca.timestamp {
+            return Err(format!(
+                "[REJECT][TX] system_envelope_unbound type=vote_equivocation_proof ordered={} timestamp={} checkpoint_a_timestamp={}",
+                ordered, tx.timestamp, ca.timestamp));
+        }
+        Ok(())
+    }
+
     /// Offender consensus PK from COMMITTED chain state (never the RAM registry, which is
     /// idle-evicted and per-process ⇒ a fork source: this verdict feeds banned_validators, which is
     /// folded into epoch_commitment and rejected on mismatch).
-    pub(super) fn equivocation_offender_pk(storage: &Storage, offender: &str) -> Option<Vec<u8>> {
+    pub(crate) fn equivocation_offender_pk(storage: &Storage, offender: &str) -> Option<Vec<u8>> {
         // The standalone vrf_pk_ row is NOT pruned when a branch is reorged out and is also writable
         // off-chain, so on its own it is a local artefact. Cross-check it against the commitment in the
         // canonical node_ registry row (reg_height-bounded, covered by registry_root, pruned on reorg):
@@ -418,8 +447,7 @@ impl BlockchainNode {
         // fields are inside the signed preimage, so neither can be flipped to dodge this.
         if block_a.timeout_round.saturating_add(block_a.carried_baseline)
             != block_b.timeout_round.saturating_add(block_b.carried_baseline) { return false; }
-        if equivocation_identity_hash(height, offender, block_a)
-            == equivocation_identity_hash(height, offender, block_b) { return false; }
+        if block_a.identity_hash(height, offender) == block_b.identity_hash(height, offender) { return false; }
         let pk_bytes = match Self::equivocation_offender_pk(storage, offender) {
             Some(p) => p,
             None => return false,

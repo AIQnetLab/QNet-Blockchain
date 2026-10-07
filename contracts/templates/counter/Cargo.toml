@@ -1,0 +1,12 @@
+[package]
+name = "counter"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal QNet contract: one counter in storage."
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+qnet-contract = { path = "../../qnet-contract" }

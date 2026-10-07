@@ -279,7 +279,7 @@ class SimpleCLI:
             # "claim_rewards:{node_id}:{wallet}", and one over the payload the node quotes back. This
             # CLI holds no key and has no post-quantum signer, so it cannot produce either.
             print("❌ Claiming requires your wallet's ML-DSA-65 key, which this CLI does not hold.")
-            print("   Claim from the QNet wallet app, or via @qnet/sdk claimRewards() with a signer.")
+            print("   Claim from the QNet wallet app.")
             print(f"   node_id: {node_id}")
         except Exception as e:
             print(f"Error claiming rewards: {e}")

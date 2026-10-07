@@ -6,7 +6,11 @@
 jest.mock('../src/crypto/DilithiumCrypto', () => ({ verifyDilithium: jest.fn() }));
 
 const { sha3_256 } = require('js-sha3');
-const { resolvePubkeys, recomputeRegistryRoot, quorumSize } = require('../src/crypto/QcLightClient');
+const { resolvePubkeys, recomputeRegistryRoot, quorumSize, clearQcCache: clearTopCache } = require('../src/crypto/QcLightClient');
+
+// Snapshots bound to a root are kept by root (MOBNET-R3-06): each case starts from an empty cache so it sees its own
+// served registry.
+beforeEach(() => clearTopCache());
 
 // A registry row binds a node to a pubkey by sha3(pk); the root is the LtHash over the rows.
 function entry(nodeId, pkHex, regHeight = 90, regIndex = 0) {
@@ -199,12 +203,18 @@ test('the bar is the strict quorum, and an anchored checkpoint has no bar at all
 // ── the refusal, end to end ────────────────────────────────────────────────
 // A malicious server serving a well-formed, fully-signed checkpoint that carries a recovery anchor
 // must not confirm a state_root. This is the finding: the chain rejects such a macroblock outright,
-// so a device that accepted it would show a balance the network never finalized.
-const {
-  verifyMacroblockStateRoot, clearQcCache, epochCommitment,
-} = require('../src/crypto/QcLightClient');
+// so a device that accepted it would show a balance the network never finalized. These run in the
+// genesis era, so the release pin is set aside (an unpinned build walks from genesis).
+let verifyMacroblockStateRoot, clearQcCache, epochCommitment, verifyDilithium;
+jest.isolateModules(() => {
+  jest.doMock('../src/config/genesisConsensus', () => ({
+    ...jest.requireActual('../src/config/genesisConsensus'),
+    WS_CHECKPOINT: { index: 0, hash: '00'.repeat(32), anchors: {} },
+  }));
+  ({ verifyMacroblockStateRoot, clearQcCache, epochCommitment } = require('../src/crypto/QcLightClient'));
+  ({ verifyDilithium } = require('../src/crypto/DilithiumCrypto')); // the instance this light client calls
+});
 const { GENESIS_NODE_IDS } = require('../src/config/genesisConsensus');
-const { verifyDilithium } = require('../src/crypto/DilithiumCrypto');
 
 // bincode Vec<EligibleProducer>: u64le count, then per entry u64le len ++ utf8 id ++ u32le reputation.
 function eligibleRawHex(ids) {

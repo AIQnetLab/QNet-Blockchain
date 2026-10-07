@@ -1,0 +1,30 @@
+{
+  "comment": "Security support of the release lines the site runs on: the Next.js major that package.json pins and the Node.js major its `engines` names (the deploy scripts install the same NODE_MAJOR). scripts/audit-check.mjs (npm run audit:check, also part of npm run check:release) fails once today is past a line's `securityUntil`, or when the pinned line has no entry here, and warns from `warnDays` before; npm audit alone never reports a line that is out of support (SITE-R5-CSP-01). Update an entry from its `source` when the vendor changes its schedule, and add the next line before upgrading to it.",
+  "warnDays": 90,
+  "lines": [
+    {
+      "name": "next",
+      "major": 16,
+      "released": "2025-10-21",
+      "securityUntil": "2027-10-21",
+      "source": "https://nextjs.org/support-policy",
+      "rule": "Active LTS until the next major is released, then Maintenance LTS (critical and security fixes only) until two years after the major's first release."
+    },
+    {
+      "name": "node",
+      "major": 22,
+      "released": "2024-04-24",
+      "securityUntil": "2027-04-30",
+      "source": "https://github.com/nodejs/Release/blob/main/schedule.json",
+      "rule": "The schedule's `end` date of the line."
+    },
+    {
+      "name": "node",
+      "major": 24,
+      "released": "2025-05-06",
+      "securityUntil": "2028-04-30",
+      "source": "https://github.com/nodejs/Release/blob/main/schedule.json",
+      "rule": "The schedule's `end` date of the line."
+    }
+  ]
+}

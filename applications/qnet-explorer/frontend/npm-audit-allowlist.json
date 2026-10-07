@@ -1,0 +1,19 @@
+{
+  "comment": "Advisories `npm audit` reports for the explorer workspace (applications/qnet-explorer, where the lockfile is) that do not reach the running site, each with the reason and an `until` date (YYYY-MM-DD, UTC) after which the entry no longer excuses it: a reason that waits for an upgrade expires instead of holding forever. scripts/audit-check.mjs (npm run audit:check, also part of npm run check:release) fails on any other advisory, with or without --omit=dev, and on a release line past its security support (release-support.json); src/lib/__tests__/dependency-audit.test.mjs checks the gate's logic and that each entry keeps a reason and a date. docs/applications/explorer.md, 'Dependency advisories', says the same.",
+  "advisories": [
+    {
+      "id": "GHSA-vfj7-8cjw-p6xm",
+      "package": "braces",
+      "path": "tailwindcss > chokidar, micromatch > braces; eslint-config-next > fast-glob > micromatch > braces",
+      "why": "Build and lint tools only: tailwindcss expands the site's own content globs while it builds the stylesheet, and eslint lints the sources; no request, page or route of the running site reaches braces. Every published braces version is affected and none is fixed yet.",
+      "until": "2026-11-04"
+    },
+    {
+      "id": "GHSA-rj75-hqrm-r3gf",
+      "package": "postcss-selector-parser",
+      "path": "tailwindcss > postcss-selector-parser 6.1.4; tailwindcss > postcss-nested > postcss-selector-parser 6.1.4",
+      "why": "Build tools only: while it builds the stylesheet, tailwindcss 3 parses the selectors of the site's own stylesheets and of the class names it finds in src/app, src/components and src/pages, and postcss-nested flattens the style objects of tailwindcss's own plugins, tailwindcss-animate and tailwind.config.ts; every selector either copy sees comes from this repository. The running site serves the built CSS and loads neither, and no request, page or route reaches either copy. The fix is 7.1.6 only (the site's own postcss-selector-parser is 7.1.6), every tailwindcss 3 release, the latest 3.4.19 included, requires ^6.1.2, and no 6.x release has it yet; forcing the 7.x major under tailwindcss 3, which 7.0.0 broke on purpose (insertions during iteration behave differently), risks changing the selectors it writes, so this waits for a 6.x fix.",
+      "until": "2026-11-05"
+    }
+  ]
+}

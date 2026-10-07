@@ -1699,12 +1699,46 @@ impl SimplifiedP2P {
     // This replaces NTP-based delay calculation with Byzantine agreement
     // ═══════════════════════════════════════════════════════════════════════════════════════
     
-    /// Handle incoming timeout vote (v2). Verifies the voter's signature over ITS OWN payload,
-    /// gates on the WINDOW-KEYED committee (identical on every verifier — the quorum denominator
-    /// can never split by local height), checks the deterministic anchor, and tallies.
+    /// Handle incoming timeout vote (v2, window-only). Refused for any window that holds no slot below the
+    /// `failover_tenure_bound` gate: from there a round belongs to a tenure, and the window-only form cannot say which.
     pub(super) fn handle_timeout_vote(&self, height: u64, timeout_round: u64, voter_id: String,
                            anchor: Vec<u8>, high_qc_idx: u64, high_qc_hash: Vec<u8>,
                            tip_height: u64, tip_hash: Vec<u8>, signature: Vec<u8>) {
+        let key = FailoverKey::legacy(height);
+        if !key.admissible() {
+            if crate::node::is_warn() {
+                println!("[WARN][TIMEOUT] vote_form_refused mb={} voter={} reason=window_only_past_gate", height, voter_id);
+            }
+            return;
+        }
+        self.handle_timeout_vote_keyed(key, timeout_round, voter_id, anchor, high_qc_idx, high_qc_hash,
+                                       tip_height, tip_hash, signature);
+    }
+
+    /// Handle incoming tenure-bound timeout vote (v3): its key must be a tenure key the gate admits, under one of
+    /// the windows that tenure's slots fall in.
+    pub(super) fn handle_timeout_vote_v3(&self, window: u64, tenure: u64, timeout_round: u64, voter_id: String,
+                           anchor: Vec<u8>, high_qc_idx: u64, high_qc_hash: Vec<u8>,
+                           tip_height: u64, tip_hash: Vec<u8>, signature: Vec<u8>) {
+        let key = FailoverKey { window, tenure };
+        if key.is_legacy() || !key.admissible() {
+            if crate::node::is_debug() {
+                println!("[DBG][TIMEOUT] vote_key_inadmissible {} voter={} action=drop", key, voter_id);
+            }
+            return;
+        }
+        self.handle_timeout_vote_keyed(key, timeout_round, voter_id, anchor, high_qc_idx, high_qc_hash,
+                                       tip_height, tip_hash, signature);
+    }
+
+    /// One body for both forms. Verifies the voter's signature over ITS OWN payload, gates on the
+    /// WINDOW-KEYED committee (identical on every verifier — the quorum denominator can never split by
+    /// local height), checks the deterministic anchor, and tallies under (key, round).
+    pub(super) fn handle_timeout_vote_keyed(&self, key: FailoverKey, timeout_round: u64, voter_id: String,
+                           anchor: Vec<u8>, high_qc_idx: u64, high_qc_hash: Vec<u8>,
+                           tip_height: u64, tip_hash: Vec<u8>, signature: Vec<u8>) {
+        // Committee, anchor, foreign-anchor witnesses and seal claims stay per WINDOW.
+        let height = key.window;
         if anchor.len() != 32 || high_qc_hash.len() != 32 || tip_hash.len() != 32 {
             if crate::node::is_warn() {
                 println!("[WARN][TIMEOUT] vote_invalid_fields h={} voter={}", height, voter_id);
@@ -1712,16 +1746,17 @@ impl SimplifiedP2P {
             return;
         }
         // View floor: a window below the highest certified one is a left view — never tally it
-        // (banked below-floor votes cannot be topped-up to a second TC on an adjacent window).
-        if height < observed_tc_window_floor() {
+        // (banked below-floor votes cannot be topped-up to a second TC on an adjacent window). A tenure
+        // whose every slot is final is left the same way.
+        if failover_key_left(key) {
             if crate::node::is_debug() {
-                println!("[DBG][TIMEOUT] vote_below_floor h={} floor={} action=drop", height, observed_tc_window_floor());
+                println!("[DBG][TIMEOUT] vote_below_floor {} floor={} action=drop", key, observed_tc_window_floor());
             }
             return;
         }
         // Round bound: a legit failover round never exceeds certified+MAX_FAILOVER_ROUND — caps the
-        // (window,round) key space so ≤f Byzantine cannot mint unbounded distinct keys.
-        if timeout_round > highest_certified_round_for(height).saturating_add(crate::node::MAX_FAILOVER_ROUND) {
+        // (key,round) space so ≤f Byzantine cannot mint unbounded distinct keys.
+        if timeout_round > certified_round_at(key).saturating_add(crate::node::MAX_FAILOVER_ROUND) {
             if crate::node::is_debug() {
                 println!("[DBG][TIMEOUT] vote_round_oob h={} round={} action=drop", height, timeout_round);
             }
@@ -1767,8 +1802,8 @@ impl SimplifiedP2P {
         let local_anchor_opt = local_anchor_for_window_cached(height);
         let matches_local = local_anchor_opt.map_or(false, |a| a == anchor_arr);
         // The signed payload is identical for every gate below, so build it once.
-        let vote_msg = timeout_vote_message(height, timeout_round, &anchor_arr,
-                                            high_qc_idx, &qc_hash_arr, tip_height, &tip_hash_arr);
+        let vote_msg = timeout_vote_message_for(key, timeout_round, &anchor_arr,
+                                                high_qc_idx, &qc_hash_arr, tip_height, &tip_hash_arr);
         // A vote whose anchor is not ours may still be honest — the anchor a node signs is derived
         // from its own seal frontier, which legitimately lags. Resolving it against the macroblocks
         // we hold is a bounded storage descent, so it is paid ONLY for an authenticated vote:
@@ -1838,9 +1873,9 @@ impl SimplifiedP2P {
             note_sealed_claim(height, &voter_id, high_qc_idx);
         }
 
-        if TIMEOUT_CERTIFICATES.contains_key(&(height, timeout_round)) {
+        if TIMEOUT_CERTIFICATES.contains_key(&(key, timeout_round)) {
             if crate::node::is_debug() {
-                println!("[DBG][TIMEOUT] proof_exists h={} round={} ignoring_vote", height, timeout_round);
+                println!("[DBG][TIMEOUT] proof_exists {} round={} ignoring_vote", key, timeout_round);
             }
             return;
         }
@@ -1861,7 +1896,7 @@ impl SimplifiedP2P {
         // change); a same-key re-vote with advanced tip/high_qc is an UPDATE (replace, rate-
         // bounded) — never slashed, so honest supersession/progress mid-stall is safe.
         let votes_count = {
-            let mut entry = TIMEOUT_VOTES.entry((height, timeout_round)).or_insert_with(HashMap::new);
+            let mut entry = TIMEOUT_VOTES.entry((key, timeout_round)).or_insert_with(HashMap::new);
             match entry.get(&voter_id) {
                 Some(existing) if existing.anchor != anchor_arr => {
                     // One live claim per voter: the newer vote replaces the older view. Views still
@@ -1891,8 +1926,8 @@ impl SimplifiedP2P {
         };
 
         if crate::node::is_info() {
-            println!("[INFO][TIMEOUT] vote_collected h={} round={} voter={} count={}/{}",
-                     height, timeout_round, voter_id, votes_count, byzantine_threshold);
+            println!("[INFO][TIMEOUT] vote_collected {} round={} voter={} count={}/{}",
+                     key, timeout_round, voter_id, votes_count, byzantine_threshold);
         }
 
         // Leader-selection round (HIGHEST_CERTIFIED_ROUND) advances ONLY on a same-round
@@ -1903,7 +1938,7 @@ impl SimplifiedP2P {
 
         // Signed n−f same-round → TimeoutCertificate (strongest advancement).
         if votes_count >= byzantine_threshold {
-            self.generate_and_broadcast_timeout_proof(height, timeout_round, anchor_arr);
+            self.generate_and_broadcast_timeout_proof(key, timeout_round, anchor_arr);
         }
 
         // Vote gossip for fast round-convergence under partial reach. Without
@@ -1937,19 +1972,9 @@ impl SimplifiedP2P {
                     peer_addrs.truncate(gossip_fanout);
                 }
                 if !peer_addrs.is_empty() {
-                    let gossip_msg = NetworkMessage::TimeoutVote {
-                        height,
-                        timeout_round,
-                        voter_id: voter_id.clone(),
-                        anchor: anchor_arr.to_vec(),
-                        high_qc_idx,
-                        high_qc_hash: qc_hash_arr.to_vec(),
-                        tip_height,
-                        tip_hash: tip_hash_arr.to_vec(),
-                        signature: signature.clone(),
-                        cert_mb: height,
-                        cert_round: self.get_highest_certified_round(height),
-                    };
+                    let gossip_msg = Self::timeout_vote_wire(key, timeout_round, voter_id.clone(), anchor_arr,
+                                                             high_qc_idx, qc_hash_arr, tip_height, tip_hash_arr,
+                                                             signature.clone());
                     let quic_transport = self.quic_transport.clone();
                     let quic_enabled = self.quic_enabled.load(std::sync::atomic::Ordering::Relaxed);
                     if let Ok(handle) = tokio::runtime::Handle::try_current().map(|h| Some(h)).or(Ok::<_, ()>(None)) {
@@ -1978,8 +2003,8 @@ impl SimplifiedP2P {
                             });
                             if crate::node::is_debug() {
                                 println!(
-                                    "[DBG][TIMEOUT] gossip_rebroadcast h={} round={} fanout={} via_voter={}",
-                                    height, timeout_round, gossip_fanout, voter_id
+                                    "[DBG][TIMEOUT] gossip_rebroadcast {} round={} fanout={} via_voter={}",
+                                    key, timeout_round, gossip_fanout, voter_id
                                 );
                             }
                         }
@@ -2007,14 +2032,15 @@ impl SimplifiedP2P {
     
     /// Generate and broadcast TimeoutProof when n−f votes collected.
     /// Proof = the signed per-voter payloads themselves; no separate signature.
-    pub(super) fn generate_and_broadcast_timeout_proof(&self, height: u64, timeout_round: u64, anchor: [u8; 32]) {
+    pub(super) fn generate_and_broadcast_timeout_proof(&self, key: FailoverKey, timeout_round: u64, anchor: [u8; 32]) {
         // Never form a TC for a left view (a window below the floor) — the anti-double-TC barrier.
-        if height < observed_tc_window_floor() { return; }
-        let votes = match TIMEOUT_VOTES.get(&(height, timeout_round)) {
+        if failover_key_left(key) { return; }
+        let height = key.window;
+        let votes = match TIMEOUT_VOTES.get(&(key, timeout_round)) {
             Some(v) => v.clone(),
             None => {
                 if crate::node::is_warn() {
-                    println!("[WARN][TIMEOUT] proof_gen_no_votes h={} round={}", height, timeout_round);
+                    println!("[WARN][TIMEOUT] proof_gen_no_votes {} round={}", key, timeout_round);
                 }
                 return;
             }
@@ -2039,26 +2065,26 @@ impl SimplifiedP2P {
         let quorum = qnet_consensus::checkpoint_bft::quorum_size(committee_len);
         if committee_len == 0 || signed_votes.len() < quorum {
             if crate::node::is_warn() {
-                println!("[WARN][TIMEOUT] proof_gen_short h={} round={} have={} need={}",
-                         height, timeout_round, signed_votes.len(), quorum);
+                println!("[WARN][TIMEOUT] proof_gen_short {} round={} have={} need={}",
+                         key, timeout_round, signed_votes.len(), quorum);
             }
             return;
         }
         let proof = TimeoutProof { height, timeout_round, anchor, votes: signed_votes.clone() };
-        TIMEOUT_CERTIFICATES.insert((height, timeout_round), proof);
+        TIMEOUT_CERTIFICATES.insert((key, timeout_round), proof);
 
         // O(1) tracker update + raise the view floor (prunes now-below-floor banked votes).
-        HIGHEST_CERTIFIED_ROUND.entry(height)
+        HIGHEST_CERTIFIED_ROUND.entry(key)
             .and_modify(|cur| { if timeout_round > *cur { *cur = timeout_round; } })
             .or_insert(timeout_round);
-        evict_votes_below_certified(height);
+        evict_votes_below_certified(key);
 
         if crate::node::is_info() {
-            println!("[INFO][TC] certified mb={} round={} voters={}", height, timeout_round, votes.len());
+            println!("[INFO][TC] certified {} round={} voters={}", key, timeout_round, votes.len());
         }
 
         // Broadcast proof to all nodes (for sync/new nodes)
-        self.broadcast_timeout_proof(height, timeout_round, anchor, signed_votes);
+        self.broadcast_timeout_proof(key, timeout_round, anchor, signed_votes);
     }
 
     /// Parallel best-effort fan-out of a consensus message to all validator peers
@@ -2209,15 +2235,23 @@ impl SimplifiedP2P {
         self.broadcast_consensus_message_parallel(msg);
     }
 
-    /// Broadcast timeout proof to all connected nodes
+    /// Broadcast timeout proof to all connected nodes: the window-only form for a legacy key, the
+    /// tenure-bound form otherwise.
     /// ARCHITECTURE: Same as broadcast_certificate_announce_tracked - parallel with retries
-    pub(super) fn broadcast_timeout_proof(&self, height: u64, timeout_round: u64,
+    pub(super) fn broadcast_timeout_proof(&self, key: FailoverKey, timeout_round: u64,
                                anchor: [u8; 32], votes: Vec<SignedTimeoutVote>) {
-        let msg = NetworkMessage::TimeoutCertificateBroadcast {
-            height,
-            timeout_round,
-            anchor: anchor.to_vec(),
-            votes,
+        let height = key.window;
+        let msg = if key.is_legacy() {
+            NetworkMessage::TimeoutCertificateBroadcast {
+                height,
+                timeout_round,
+                anchor: anchor.to_vec(),
+                votes,
+            }
+        } else {
+            NetworkMessage::TimeoutCertificateV3Broadcast {
+                proof: TimeoutProofV3 { window: key.window, tenure: key.tenure, timeout_round, anchor, votes },
+            }
         };
         
         // Get runtime handle
@@ -2238,7 +2272,7 @@ impl SimplifiedP2P {
         let success_count = Arc::new(AtomicUsize::new(0));
         
         if crate::node::is_info() {
-            println!("[INFO][TIMEOUT] proof_broadcast h={} round={} peers={}", height, timeout_round, total_peers);
+            println!("[INFO][TIMEOUT] proof_broadcast {} round={} peers={}", key, timeout_round, total_peers);
         }
         
         // Spawn parallel broadcast task
@@ -2616,25 +2650,63 @@ impl SimplifiedP2P {
         OWN_CLAIM_BROADCAST.retain(|round, _| *round >= min_round);
     }
 
-    pub fn broadcast_timeout_vote(&self, height: u64, timeout_round: u64,
+    /// The wire form of a vote for `key`: TimeoutVote for a window-only key, TimeoutVoteV3 for a tenure key. The
+    /// SyncInfo claim is the sender's certified round for the same key (the window view for the window-only form).
+    pub(super) fn timeout_vote_wire(key: FailoverKey, timeout_round: u64, voter_id: String, anchor: [u8; 32],
+                                    high_qc_idx: u64, high_qc_hash: [u8; 32], tip_height: u64, tip_hash: [u8; 32],
+                                    signature: Vec<u8>) -> NetworkMessage {
+        if key.is_legacy() {
+            NetworkMessage::TimeoutVote {
+                height: key.window,
+                timeout_round,
+                voter_id,
+                anchor: anchor.to_vec(),
+                high_qc_idx,
+                high_qc_hash: high_qc_hash.to_vec(),
+                tip_height,
+                tip_hash: tip_hash.to_vec(),
+                signature,
+                cert_mb: key.window,
+                cert_round: window_view_round(key.window),
+            }
+        } else {
+            NetworkMessage::TimeoutVoteV3 {
+                window: key.window,
+                tenure: key.tenure,
+                timeout_round,
+                voter_id,
+                anchor: anchor.to_vec(),
+                high_qc_idx,
+                high_qc_hash: high_qc_hash.to_vec(),
+                tip_height,
+                tip_hash: tip_hash.to_vec(),
+                signature,
+                cert_window: key.window,
+                cert_tenure: key.tenure,
+                cert_round: certified_round_at(key),
+            }
+        }
+    }
+
+    pub fn broadcast_timeout_vote(&self, key: FailoverKey, timeout_round: u64,
                                    anchor: [u8; 32], high_qc_idx: u64, high_qc_hash: [u8; 32],
                                    tip_height: u64, tip_hash: [u8; 32], signature: Vec<u8>) {
-        // Retransmit until certified: suppress only once the n−f TC for this (height,round) is
+        // Retransmit until certified: suppress only once the n−f TC for this (key,round) is
         // held. The view-timeout redrive re-invokes this each tick, so a vote lost to packet loss /
         // peer churn is re-broadcast until the TC forms. A single-shot send is not liveness-safe —
         // one lost failover vote wedged finality on onboarding (no node received it, TC never formed).
-        if self.has_timeout_certificate(height, timeout_round) {
+        if self.has_timeout_certificate(key, timeout_round) {
             return;
         }
         // Highest round emitted (retain-cleanup + observability); no longer the suppression gate.
-        TIMEOUT_VOTED_HEIGHTS.insert(height, timeout_round);
+        TIMEOUT_VOTED_HEIGHTS.insert(key, timeout_round);
 
         // BFT FIX: Count own vote locally BEFORE broadcasting.
         // Standard BFT protocol: every node includes its own vote in the local tally.
         // Without this, a node only sees N-1 votes from peers and never reaches
         // the 2/3+ threshold when the network is at minimum quorum.
-        self.handle_timeout_vote(
-            height, timeout_round,
+        self.handle_timeout_vote_keyed(
+            key, timeout_round,
             self.node_id.clone(),
             anchor.to_vec(), high_qc_idx, high_qc_hash.to_vec(),
             tip_height, tip_hash.to_vec(),
@@ -2642,22 +2714,11 @@ impl SimplifiedP2P {
         );
 
         // Broadcast to all validators (cert_* = SyncInfo claims for behind receivers).
-        let msg = NetworkMessage::TimeoutVote {
-            height,
-            timeout_round,
-            voter_id: self.node_id.clone(),
-            anchor: anchor.to_vec(),
-            high_qc_idx,
-            high_qc_hash: high_qc_hash.to_vec(),
-            tip_height,
-            tip_hash: tip_hash.to_vec(),
-            signature,
-            cert_mb: height,
-            cert_round: self.get_highest_certified_round(height),
-        };
-        
+        let msg = Self::timeout_vote_wire(key, timeout_round, self.node_id.clone(), anchor,
+                                          high_qc_idx, high_qc_hash, tip_height, tip_hash, signature);
+
         if crate::node::is_info() {
-            println!("[INFO][TIMEOUT] vote_broadcast h={} round={}", height, timeout_round);
+            println!("[INFO][TIMEOUT] vote_broadcast {} round={}", key, timeout_round);
         }
         
         // ARCHITECTURE: Parallel broadcast with retries (same as certificate broadcast)
@@ -2744,19 +2805,19 @@ impl SimplifiedP2P {
 
 
     /// Get current timeout proof if available
-    pub fn get_timeout_certificate(&self, height: u64, timeout_round: u64) -> Option<TimeoutProof> {
-        TIMEOUT_CERTIFICATES.get(&(height, timeout_round)).map(|v| v.clone())
+    pub fn get_timeout_certificate(&self, key: FailoverKey, timeout_round: u64) -> Option<TimeoutProof> {
+        TIMEOUT_CERTIFICATES.get(&(key, timeout_round)).map(|v| v.clone())
     }
 
-    /// Check if timeout proof exists for given height/round
-    pub fn has_timeout_certificate(&self, height: u64, timeout_round: u64) -> bool {
-        TIMEOUT_CERTIFICATES.contains_key(&(height, timeout_round))
+    /// Check if timeout proof exists for given key/round
+    pub fn has_timeout_certificate(&self, key: FailoverKey, timeout_round: u64) -> bool {
+        TIMEOUT_CERTIFICATES.contains_key(&(key, timeout_round))
     }
 
-    /// Get highest certified timeout round for a macroblock index. Advanced ONLY
-    /// by a signed same-round 2f+1 TimeoutCertificate (handle_timeout_proof_broadcast)
+    /// Highest certified timeout round anywhere in a macroblock window (`window_view_round`). Advanced
+    /// ONLY by a signed same-round 2f+1 TimeoutCertificate (handle_timeout_proof_broadcast)
     /// — supermajority-backed, so a ≤f attacker cannot move it upward.
     pub fn get_highest_certified_round(&self, height: u64) -> u64 {
-        HIGHEST_CERTIFIED_ROUND.get(&height).map(|v| *v).unwrap_or(0)
+        window_view_round(height)
     }
 }

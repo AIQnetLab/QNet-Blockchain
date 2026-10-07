@@ -20,13 +20,10 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
     // Initialize Firebase
     FirebaseApp.configure()
     
-    // Set up push notifications
+    // Silent data pushes only: no notification permission is asked for, and registering for remote notifications
+    // asks the user nothing.
     UNUserNotificationCenter.current().delegate = self
     Messaging.messaging().delegate = self
-    
-    // Request notification permission
-    let authOptions: UNAuthorizationOptions = [.alert, .badge, .sound]
-    UNUserNotificationCenter.current().requestAuthorization(options: authOptions) { _, _ in }
     application.registerForRemoteNotifications()
     
     let delegate = ReactNativeDelegate()
@@ -59,10 +56,46 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
     return true
   }
   
-  // Handle FCM token refresh
-  func messaging(_ messaging: Messaging, didReceiveRegistrationToken fcmToken: String?) {
-    print("[FCM] Token: \(fcmToken ?? "nil")")
-    // Token will be handled by React Native Firebase SDK
+  // A Universal Link (https://link.aiqnet.io/l, verified by iOS against that host's apple-app-site-association) goes
+  // to React Native's Linking. The app registers no custom URL scheme, so nothing else arrives this way.
+  func application(
+    _ application: UIApplication,
+    continue userActivity: NSUserActivity,
+    restorationHandler: @escaping ([UIUserActivityRestoring]?) -> Void
+  ) -> Bool {
+    guard userActivity.activityType == NSUserActivityTypeBrowsingWeb else { return false }
+    return RCTLinkingManager.application(application, continue: userActivity, restorationHandler: restorationHandler)
+  }
+
+  // No third-party keyboard ever receives what is typed in the wallet (MPLAT-R2-02). iOS forces the system
+  // keyboard only in secure text fields, and the recovery-phrase field cannot be one; a custom keyboard (with Full
+  // Access it may sync or cloud-check text) would get all twelve words. The wallet has no text that needs one.
+  func application(
+    _ application: UIApplication,
+    shouldAllowExtensionPointIdentifier extensionPointIdentifier: UIApplication.ExtensionPointIdentifier
+  ) -> Bool {
+    return extensionPointIdentifier != .keyboard
+  }
+
+  // The token is handled by React Native Firebase; it is never logged.
+  func messaging(_ messaging: Messaging, didReceiveRegistrationToken fcmToken: String?) {}
+
+  // The app-switcher snapshot is taken after resign-active, so an opaque cover goes on first and comes off
+  // when the app is active again: no balance, address or recovery phrase is ever in the snapshot.
+  private var privacyCover: UIView?
+
+  func applicationWillResignActive(_ application: UIApplication) {
+    guard privacyCover == nil, let window = window else { return }
+    let cover = UIView(frame: window.bounds)
+    cover.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+    cover.backgroundColor = UIColor(red: 17.0/255.0, green: 19.0/255.0, blue: 31.0/255.0, alpha: 1.0)
+    window.addSubview(cover)
+    privacyCover = cover
+  }
+
+  func applicationDidBecomeActive(_ application: UIApplication) {
+    privacyCover?.removeFromSuperview()
+    privacyCover = nil
   }
 
   // Handle APNs device token — required for FCM to work on iOS
@@ -72,11 +105,6 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
 
   // No background-push method here: React Native Firebase runs the JS handler and completes the push itself;
   // one here would complete it at once, and with the delegate proxy off it would take the push from RNFB.
-
-  // Handle foreground notifications (show banner while app is open)
-  func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification, withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
-    completionHandler([.banner, .badge, .sound])
-  }
 }
 
 class ReactNativeDelegate: RCTDefaultReactNativeFactoryDelegate {

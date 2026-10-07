@@ -1269,8 +1269,79 @@ pub struct StoredTimeoutVote {
     pub updated_at: u64,
 }
 
-/// Collected timeout votes per (window = target_height/90, round).
-static TIMEOUT_VOTES: Lazy<Arc<DashMap<(u64, u64), HashMap<String, StoredTimeoutVote>>>> =
+/// What a failover round is certified for: the window (committee and anchor, unchanged) and, from the
+/// `failover_tenure_bound` gate, the 30-block tenure of the slot. Below the gate the tenure is LEGACY_TENURE and
+/// every rule reads exactly as before.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Serialize, serde::Deserialize)]
+pub struct FailoverKey { pub window: u64, pub tenure: u64 }
+
+/// The tenure of a window-only key (`QNET_TIMEOUT_V2`).
+pub const LEGACY_TENURE: u64 = u64::MAX;
+
+impl FailoverKey {
+    pub const fn legacy(window: u64) -> Self { FailoverKey { window, tenure: LEGACY_TENURE } }
+    pub fn is_legacy(&self) -> bool { self.tenure == LEGACY_TENURE }
+    /// The key slot `h` fails over under: (h/90, its tenure) from the gate, the window alone below it.
+    pub fn for_slot(h: u64) -> Self {
+        let window = h / qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
+        if crate::node::failover_tenure_bound(h) {
+            FailoverKey { window, tenure: crate::node::tenure_of(h) }
+        } else {
+            Self::legacy(window)
+        }
+    }
+    /// A key the rules accept: a tenure key for a gated tenure, under one of the windows its slots fall in; a
+    /// window-only key for a window that still holds a slot below the gate.
+    pub fn admissible(&self) -> bool {
+        if self.is_legacy() {
+            !crate::node::failover_tenure_bound(self.window.saturating_mul(qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL))
+        } else {
+            // A tenure whose last slot does not fit a height is no tenure: saturating it would land on a
+            // window the arithmetic accepts.
+            if self.tenure.checked_add(1).and_then(|t| t.checked_mul(crate::node::ROTATION_INTERVAL_BLOCKS)).is_none() {
+                return false;
+            }
+            let (a, b) = windows_of_tenure(self.tenure);
+            crate::node::failover_tenure_bound(self.first_slot()) && (self.window == a || self.window == b)
+        }
+    }
+    /// First slot the key can rotate; orders keys for amplification.
+    pub fn first_slot(&self) -> u64 {
+        if self.is_legacy() {
+            self.window.saturating_mul(qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL)
+        } else {
+            self.tenure.saturating_mul(crate::node::ROTATION_INTERVAL_BLOCKS).saturating_add(1)
+        }
+    }
+    /// Last slot the key can rotate.
+    pub fn last_slot(&self) -> u64 {
+        let mi = qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
+        if self.is_legacy() {
+            self.window.saturating_mul(mi).saturating_add(mi - 1)
+        } else {
+            self.tenure.saturating_add(1).saturating_mul(crate::node::ROTATION_INTERVAL_BLOCKS)
+        }
+    }
+    /// Amplification order: first slot, then window.
+    pub fn order(&self) -> (u64, u64) { (self.first_slot(), self.window) }
+}
+
+impl std::fmt::Display for FailoverKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.is_legacy() { write!(f, "mb={} tenure=-", self.window) }
+        else { write!(f, "mb={} tenure={}", self.window, self.tenure) }
+    }
+}
+
+/// The windows a tenure's slots fall in: one, or two when its last slot opens the next window.
+pub fn windows_of_tenure(t: u64) -> (u64, u64) {
+    let mi = qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
+    let rot = crate::node::ROTATION_INTERVAL_BLOCKS;
+    (t.saturating_mul(rot).saturating_add(1) / mi, t.saturating_add(1).saturating_mul(rot) / mi)
+}
+
+/// Collected timeout votes per (key, round).
+static TIMEOUT_VOTES: Lazy<Arc<DashMap<(FailoverKey, u64), HashMap<String, StoredTimeoutVote>>>> =
     Lazy::new(|| Arc::new(DashMap::new()));
 
 /// Committee members seen voting on a DIFFERENT sealed w-2 anchor, keyed (window, their_anchor).
@@ -1355,13 +1426,14 @@ pub fn block_attestation_count(height: u64, block_hash: &[u8; 32]) -> usize {
 }
 
 /// Generated timeout certificates (cached for block validation)
-/// Key: (macroblock_index, timeout_round), Value: TimeoutCertificate
-static TIMEOUT_CERTIFICATES: Lazy<Arc<DashMap<(u64, u64), TimeoutCertificate>>> = 
+/// Key: (failover key, timeout_round), Value: TimeoutCertificate. The tenure lives in the key; `height` in the
+/// value is the window.
+static TIMEOUT_CERTIFICATES: Lazy<Arc<DashMap<(FailoverKey, u64), TimeoutCertificate>>> =
     Lazy::new(|| Arc::new(DashMap::new()));
 
-/// O(1) tracker: highest certified round per macroblock index.
+/// O(1) tracker: highest certified round per failover key.
 /// Updated on every certificate insert — avoids linear scan of TIMEOUT_CERTIFICATES.
-static HIGHEST_CERTIFIED_ROUND: Lazy<Arc<DashMap<u64, u64>>> =
+static HIGHEST_CERTIFIED_ROUND: Lazy<Arc<DashMap<FailoverKey, u64>>> =
     Lazy::new(|| Arc::new(DashMap::new()));
 
 /// Window-monotonic floor: highest window with a locally-VERIFIED TC. A voter never emits below it
@@ -1422,6 +1494,24 @@ pub fn timeout_vote_message(
 ) -> String {
     format!("QNET_TIMEOUT_V2:{}:{}:{}:{}:{}:{}:{}",
             w, round, hex::encode(anchor),
+            high_qc_idx, hex::encode(high_qc_hash),
+            tip_height, hex::encode(tip_hash))
+}
+
+/// The signed payload for `key`: the window-only form (`QNET_TIMEOUT_V2`, byte-identical to `timeout_vote_message`)
+/// for a legacy key, else `QNET_TIMEOUT_V3`, which also binds the tenure the vote rotates. The voter's exact slot is
+/// not in the key on purpose: voters stuck at different slots of one tenure must still aggregate, and the signed
+/// tip already pins each one's slot.
+pub fn timeout_vote_message_for(
+    key: FailoverKey, round: u64, anchor: &[u8; 32],
+    high_qc_idx: u64, high_qc_hash: &[u8; 32],
+    tip_height: u64, tip_hash: &[u8; 32],
+) -> String {
+    if key.is_legacy() {
+        return timeout_vote_message(key.window, round, anchor, high_qc_idx, high_qc_hash, tip_height, tip_hash);
+    }
+    format!("QNET_TIMEOUT_V3:{}:{}:{}:{}:{}:{}:{}:{}",
+            key.window, key.tenure, round, hex::encode(anchor),
             high_qc_idx, hex::encode(high_qc_hash),
             tip_height, hex::encode(tip_hash))
 }
@@ -1624,23 +1714,25 @@ pub fn certified_view_bound_windows() -> u64 {
     base + crate::node::BlockchainNode::MAX_DERIVED_ROSTER_WINDOWS as u64
 }
 
-/// Lowest window ABOVE `above_w` supported by ≥ f+1 DISTINCT committee voters (any round) —
-/// min-target amplification: f+1 guarantees ≥1 honest witness whose verified chain reached that
-/// window, and MIN (not max) is the provably-convergent choice when two windows transiently carry
+/// Lowest key ABOVE `own` (by first slot, then window) supported by ≥ f+1 DISTINCT committee voters (any
+/// round) — min-target amplification: f+1 guarantees ≥1 honest witness whose verified chain reached that
+/// slot range, and MIN (not max) is the provably-convergent choice when two keys transiently carry
 /// support. Votes are committee-filtered at insert, so counting distinct voters is sound.
-pub fn lowest_window_with_support(above_w: u64) -> Option<u64> {
-    let mut by_w: std::collections::BTreeMap<u64, std::collections::HashSet<String>> =
+pub fn lowest_key_with_support(own: FailoverKey) -> Option<FailoverKey> {
+    let mut by_k: std::collections::BTreeMap<(u64, u64, u64), (FailoverKey, std::collections::HashSet<String>)> =
         std::collections::BTreeMap::new();
     for e in TIMEOUT_VOTES.iter() {
-        let (w, _r) = *e.key();
-        if w > above_w {
-            by_w.entry(w).or_default().extend(e.value().keys().cloned());
+        let (k, _r) = *e.key();
+        if k.order() > own.order() {
+            let (s, w) = k.order();
+            by_k.entry((s, w, k.tenure)).or_insert_with(|| (k, std::collections::HashSet::new()))
+                .1.extend(e.value().keys().cloned());
         }
     }
-    for (w, voters) in by_w {
-        if let Some(c) = failover_committee_for_window(w) {
+    for (_, (k, voters)) in by_k {
+        if let Some(c) = failover_committee_for_window(k.window) {
             let f = c.len().saturating_sub(1) / 3;
-            if voters.len() >= f + 1 { return Some(w); }
+            if voters.len() >= f + 1 { return Some(k); }
         }
     }
     None
@@ -1654,16 +1746,16 @@ pub fn lowest_window_with_support(above_w: u64) -> Option<u64> {
 /// NEVER the wall clock — so it cannot resurrect the h=556 f+1-minority-drives-rotation split. It
 /// only lifts this node's self-vote suppression; the emitted vote stays committee/anchor/sig-gated
 /// and the node ceases to lead once the TC forms (exactly one leader per certified round). O(votes).
-pub fn round_one_short_of_quorum(w: u64, voter: &str) -> bool {
-    let committee = match failover_committee_for_window(w) { Some(c) => c, None => return false };
+pub fn round_one_short_of_quorum(key: FailoverKey, voter: &str) -> bool {
+    let committee = match failover_committee_for_window(key.window) { Some(c) => c, None => return false };
     // Must mirror the TC threshold exactly, or the self-yield that rotates the network off a stuck
     // leader fires at a bar no certificate is formed at.
     let quorum = qnet_consensus::checkpoint_bft::quorum_size(committee.len());
     if quorum == 0 { return false; }
-    let certified = highest_certified_round_for(w);
+    let certified = certified_round_at(key);
     for e in TIMEOUT_VOTES.iter() {
-        let (kw, kr) = *e.key();
-        if kw != w || kr <= certified { continue; } // live rounds only — a consumed round is no rotation demand
+        let (kk, kr) = *e.key();
+        if kk != key || kr <= certified { continue; } // live rounds only — a consumed round is no rotation demand
         let voters = e.value();
         if voters.contains_key(voter) { continue; }  // we already voted this round ⇒ not withholding
         // Per ANCHOR group, mirroring the certificate tally: a bucket can now hold two honest
@@ -1680,14 +1772,14 @@ pub fn round_one_short_of_quorum(w: u64, voter: &str) -> bool {
 }
 
 /// True if `voter` holds a stored (sig-verified, committee-filtered, deduped) timeout vote for
-/// window `w` at a round ABOVE the highest certified one — a LIVE yield. A consumed vote
+/// `key` at a round ABOVE the highest certified one — a LIVE yield. A consumed vote
 /// (round == certified, retained after its TC formed) must NOT keep the fast path firing
-/// against a leader that already rotated and recovered within the same window. O(windows).
-pub fn window_has_vote_from(w: u64, voter: &str) -> bool {
-    let certified = highest_certified_round_for(w);
+/// against a leader that already rotated and recovered within the same key. O(keys).
+pub fn key_has_live_vote_from(key: FailoverKey, voter: &str) -> bool {
+    let certified = certified_round_at(key);
     TIMEOUT_VOTES
         .iter()
-        .any(|e| e.key().0 == w && e.key().1 > certified && e.value().contains_key(voter))
+        .any(|e| e.key().0 == key && e.key().1 > certified && e.value().contains_key(voter))
 }
 
 /// Failover VIEW floor = the highest FINALIZED window. No honest node forms, accepts, or tallies a
@@ -1699,10 +1791,23 @@ pub fn observed_tc_window_floor() -> u64 {
         / qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL
 }
 
-/// On a new 2f+1 TC for window `w`: evict banked votes below `w` so stale keys cannot later be
-/// topped-up to quorum (the banked-vote double-TC vector). The floor is finality-derived, not stored.
-fn evict_votes_below_certified(w: u64) {
-    TIMEOUT_VOTES.retain(|(h, _), _| *h >= w);
+/// On a new 2f+1 TC for `key`: evict banked votes below it so stale keys cannot later be topped-up
+/// to quorum (the banked-vote double-TC vector). A window-only key evicts lower windows, as before; a
+/// tenure key evicts lower tenures and window-only keys of lower windows. The floor is finality-derived.
+fn evict_votes_below_certified(key: FailoverKey) {
+    if key.is_legacy() {
+        TIMEOUT_VOTES.retain(|(k, _), _| k.window >= key.window);
+    } else {
+        TIMEOUT_VOTES.retain(|(k, _), _| if k.is_legacy() { k.window >= key.window } else { k.tenure >= key.tenure });
+    }
+}
+
+/// A failover key for a view this node has left: below the finality-derived window floor, or a tenure
+/// whose every slot is already final. No vote or certificate is tallied, formed or accepted for it.
+pub fn failover_key_left(key: FailoverKey) -> bool {
+    key.window < observed_tc_window_floor()
+        || (!key.is_legacy()
+            && key.last_slot() <= crate::node::LAST_FINALIZED_HEIGHT.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// This node's highest-TC hint (window, round) for outbound SyncInfo claims - the window it is
@@ -1713,12 +1818,42 @@ pub fn current_tc_hint() -> (u64, u64) {
     let w = observed_tc_window_floor()
         .max(LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed)
              .saturating_add(1) / mi);
-    (w, highest_certified_round_for(w))
+    (w, window_view_round(w))
 }
 
 #[cfg(test)]
 pub(crate) fn test_insert_timeout_vote(w: u64, round: u64, voter: &str) {
-    TIMEOUT_VOTES.entry((w, round)).or_insert_with(HashMap::new).insert(
+    test_insert_timeout_vote_keyed(FailoverKey::legacy(w), round, voter);
+}
+
+/// Installs a certificate for (key, round) as the verified paths do (one dummy vote) and raises the tracker.
+#[cfg(test)]
+pub(crate) fn test_certify(key: FailoverKey, round: u64) {
+    TIMEOUT_CERTIFICATES.insert((key, round), TimeoutProof {
+        height: key.window, timeout_round: round, anchor: [0u8; 32],
+        votes: vec![SignedTimeoutVote { voter_id: "test_voter".into(), signature: vec![1], high_qc_idx: 0,
+                                        high_qc_hash: [0u8; 32], tip_height: 0, tip_hash: [0u8; 32] }],
+    });
+    HIGHEST_CERTIFIED_ROUND.entry(key).and_modify(|c| { if round > *c { *c = round; } }).or_insert(round);
+}
+
+/// Forgets every certificate and vote under `key`.
+#[cfg(test)]
+pub(crate) fn test_forget_key(key: FailoverKey) {
+    TIMEOUT_CERTIFICATES.retain(|(k, _), _| *k != key);
+    TIMEOUT_VOTES.retain(|(k, _), _| *k != key);
+    HIGHEST_CERTIFIED_ROUND.remove(&key);
+}
+
+/// Distinct voters banked under (key, round).
+#[cfg(test)]
+pub(crate) fn test_voters_at(key: FailoverKey, round: u64) -> usize {
+    TIMEOUT_VOTES.get(&(key, round)).map(|v| v.len()).unwrap_or(0)
+}
+
+#[cfg(test)]
+pub(crate) fn test_insert_timeout_vote_keyed(key: FailoverKey, round: u64, voter: &str) {
+    TIMEOUT_VOTES.entry((key, round)).or_insert_with(HashMap::new).insert(
         voter.to_string(),
         StoredTimeoutVote {
             signature: Vec::new(), anchor: [0u8; 32],
@@ -1777,9 +1912,9 @@ pub(crate) fn test_clear_timeout_state() {
     FAILOVER_COMMITTEE_CACHE.clear();
 }
 
-/// Track which macroblock indices we've already voted for timeout (prevent double-voting)
-/// Key: macroblock_index, Value: timeout_round we voted for
-static TIMEOUT_VOTED_HEIGHTS: Lazy<Arc<DashMap<u64, u64>>> =
+/// Track which failover keys we've already voted for timeout (prevent double-voting)
+/// Key: failover key, Value: timeout_round we voted for
+static TIMEOUT_VOTED_HEIGHTS: Lazy<Arc<DashMap<FailoverKey, u64>>> =
     Lazy::new(|| Arc::new(DashMap::new()));
 
 // v14.8.10: `TIMEOUT_JUMP_TARGET` + `jump_to_highest` REMAIN REMOVED — they
@@ -1869,31 +2004,62 @@ pub fn get_baseline_round(mb_index: u64) -> u64 {
 /// A tenure spans at most two windows, so the round governing a slot is the higher of its own
 /// window and the window its tenure began in. Both operands are certificate-driven, so this stays
 /// a pure function of n-f-certified state — no clock, no node-local frontier.
+///
+/// From the `failover_tenure_bound` gate the round is keyed by the tenure itself, so this reads the highest round
+/// certified for the slot's own tenure under either window its slots fall in. A certificate raised for one tenure
+/// then rotates that tenure alone: on 04.10 a round raised for the tenure ending a window carried into the next one
+/// in the same window for the nodes that held it, and the fleet elected two producers for one height.
 pub fn certified_round_for_slot(h: u64) -> u64 {
     // The two intervals must keep a tenure inside at most two windows, or reading two is not enough.
     const _: () = assert!(crate::node::ROTATION_INTERVAL_BLOCKS <= qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL);
-    let w = h / qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
-    let read = |k: u64| HIGHEST_CERTIFIED_ROUND.get(&k).map(|v| *v).unwrap_or(0);
-    let tenure_start = (h.saturating_sub(1) / crate::node::ROTATION_INTERVAL_BLOCKS)
-        .saturating_mul(crate::node::ROTATION_INTERVAL_BLOCKS)
-        .saturating_add(1);
-    let w0 = tenure_start / qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
+    let read = |k: FailoverKey| HIGHEST_CERTIFIED_ROUND.get(&k).map(|v| *v).unwrap_or(0);
+    let [k, k0] = slot_keys(h);
     // Certified entries ONLY. The apply baseline is RAM-resident, never persisted and never
     // repopulated by the boot replay, so folding it in here would make the ceiling — which drives
     // both the election and the ingest gate — differ between a restarted node and its peers. It is
     // also the wrong unit: a rotation round belongs to the tenure that certified it, not to every
     // later tenure that happens to share a window.
-    if w0 == w { read(w) } else { read(w).max(read(w0)) }
+    if k0 == k { read(k) } else { read(k).max(read(k0)) }
 }
 
-/// Windows a slot's certified round may be keyed under: its own, and the window its tenure started
-/// in when the tenure straddles a boundary (the same pair `certified_round_for_slot` reads).
-fn slot_windows(h: u64) -> (u64, u64) {
+/// The highest round certified for `key`: for a tenure key the tenure's, under either window its slots fall
+/// in; for a window-only key that window's entry.
+pub fn certified_round_at(key: FailoverKey) -> u64 {
+    let read = |k: FailoverKey| HIGHEST_CERTIFIED_ROUND.get(&k).map(|v| *v).unwrap_or(0);
+    if key.is_legacy() { return read(key); }
+    let (a, b) = windows_of_tenure(key.tenure);
+    let ra = read(FailoverKey { window: a, tenure: key.tenure });
+    if a == b { ra } else { ra.max(read(FailoverKey { window: b, tenure: key.tenure })) }
+}
+
+/// The highest round certified anywhere in window `w`: its window-only entry and every tenure key under it.
+/// A window-level view for hints, telemetry and the macroblock initiator; below the gate it is exactly the
+/// window's entry. Never a slot's election round.
+pub fn window_view_round(w: u64) -> u64 {
+    let read = |k: FailoverKey| HIGHEST_CERTIFIED_ROUND.get(&k).map(|v| *v).unwrap_or(0);
+    // A window's slots 90w..=90w+89 fall in four tenures at most: the one ending at 90w and the next three.
+    let first_t = crate::node::tenure_of(w.saturating_mul(qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL));
+    let mut best = read(FailoverKey::legacy(w));
+    for t in first_t..=first_t.saturating_add(3) {
+        best = best.max(read(FailoverKey { window: w, tenure: t }));
+    }
+    best
+}
+
+/// Keys a slot's certified round may sit under: below the gate its own window and the window its tenure
+/// started in (the same pair the straddling fix reads); from the gate its tenure under each window its
+/// slots fall in, own window first. The two entries are equal when there is only one.
+fn slot_keys(h: u64) -> [FailoverKey; 2] {
     let mi = qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
-    let tenure_start = (h.saturating_sub(1) / crate::node::ROTATION_INTERVAL_BLOCKS)
-        .saturating_mul(crate::node::ROTATION_INTERVAL_BLOCKS)
-        .saturating_add(1);
-    (h / mi, tenure_start / mi)
+    if crate::node::failover_tenure_bound(h) {
+        let t = crate::node::tenure_of(h);
+        let (a, b) = windows_of_tenure(t);
+        let own = h / mi;
+        let other = if own == a { b } else { a };
+        [FailoverKey { window: own, tenure: t }, FailoverKey { window: other, tenure: t }]
+    } else {
+        [FailoverKey::legacy(h / mi), FailoverKey::legacy(crate::node::tenure_first_slot(h) / mi)]
+    }
 }
 
 /// The tip a certificate's voters vouch for: the (f+1)-th highest claim, with f taken for the largest
@@ -1918,10 +2084,10 @@ pub fn certified_quorum_tip(tips: &mut Vec<u64>) -> Option<u64> {
 pub fn superseded_by_certified_round(h: u64, block_round: u64, our_hash: Option<[u8; 32]>) -> Option<(u64, u64)> {
     let certified = certified_round_for_slot(h);
     if block_round >= certified { return None; }
-    let (w, w0) = slot_windows(h);
+    let [k, k0] = slot_keys(h);
     for r in (block_round + 1)..=certified {
-        let tc = TIMEOUT_CERTIFICATES.get(&(w, r))
-            .or_else(|| if w0 != w { TIMEOUT_CERTIFICATES.get(&(w0, r)) } else { None });
+        let tc = TIMEOUT_CERTIFICATES.get(&(k, r))
+            .or_else(|| if k0 != k { TIMEOUT_CERTIFICATES.get(&(k0, r)) } else { None });
         if let Some(tc) = tc {
             let mut tips: Vec<u64> = tc.votes.iter().map(|v| match our_hash {
                 Some(ours) if v.tip_height == h && v.tip_hash != [0u8; 32] && v.tip_hash != ours => h.saturating_sub(1),
@@ -1980,7 +2146,7 @@ pub fn rotation_round_and_baseline_for_slot(h: u64) -> (u64, u64) {
 
 pub fn get_certified_rotation_round(mb_index: u64) -> u64 {
     let baseline = get_baseline_round(mb_index);
-    let certified = HIGHEST_CERTIFIED_ROUND.get(&mb_index).map(|v| *v).unwrap_or(0);
+    let certified = HIGHEST_CERTIFIED_ROUND.get(&FailoverKey::legacy(mb_index)).map(|v| *v).unwrap_or(0);
     certified.saturating_sub(baseline)
 }
 
@@ -1991,7 +2157,7 @@ pub fn get_certified_rotation_round(mb_index: u64) -> u64 {
 /// this is what makes carrying the baseline in-block node-independent AND producer-pollution-immune.
 pub fn rotation_round_and_baseline(mb_index: u64) -> (u64, u64) {
     let baseline = get_baseline_round(mb_index);
-    let certified = HIGHEST_CERTIFIED_ROUND.get(&mb_index).map(|v| *v).unwrap_or(0);
+    let certified = HIGHEST_CERTIFIED_ROUND.get(&FailoverKey::legacy(mb_index)).map(|v| *v).unwrap_or(0);
     (certified.saturating_sub(baseline), baseline)
 }
 
@@ -1999,9 +2165,10 @@ pub fn rotation_round_and_baseline(mb_index: u64) -> (u64, u64) {
 /// producer attaches it to a round>0 microblock so a lagging receiver adopts the round in-band
 /// instead of wedging. None on the happy path (no failover round certified). O(1) DashMap read.
 pub fn certified_timeout_proof_bytes(mb_index: u64) -> Option<Vec<u8>> {
-    let abs = HIGHEST_CERTIFIED_ROUND.get(&mb_index).map(|v| *v).unwrap_or(0);
+    let key = FailoverKey::legacy(mb_index);
+    let abs = HIGHEST_CERTIFIED_ROUND.get(&key).map(|v| *v).unwrap_or(0);
     if abs == 0 { return None; }
-    let proof = TIMEOUT_CERTIFICATES.get(&(mb_index, abs))?;
+    let proof = TIMEOUT_CERTIFICATES.get(&(key, abs))?;
     bincode::serialize(&*proof).ok()
 }
 
@@ -2009,17 +2176,17 @@ pub fn certified_timeout_proof_bytes(mb_index: u64) -> Option<Vec<u8>> {
 /// runs on a round certified in the previous window, so the boundary block's proof lives under that
 /// window's key — looking only under the block's own window found nothing exactly there, and the
 /// receiver then had to pull a certificate the sender was holding all along.
+/// From the gate the bytes are a `TimeoutProofV3`, which names the tenure the round was certified for.
 pub fn certified_timeout_proof_for_slot(h: u64) -> Option<Vec<u8>> {
     let abs = certified_round_for_slot(h);
     if abs == 0 { return None; }
-    let w = h / qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
-    let tenure_start = (h.saturating_sub(1) / crate::node::ROTATION_INTERVAL_BLOCKS)
-        .saturating_mul(crate::node::ROTATION_INTERVAL_BLOCKS)
-        .saturating_add(1);
-    let w0 = tenure_start / qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
-    let proof = TIMEOUT_CERTIFICATES.get(&(w, abs))
-        .or_else(|| TIMEOUT_CERTIFICATES.get(&(w0, abs)))?;
-    bincode::serialize(&*proof).ok()
+    let [k, k0] = slot_keys(h);
+    let (key, proof) = match TIMEOUT_CERTIFICATES.get(&(k, abs)) {
+        Some(p) => (k, p.value().clone()),
+        None => (k0, TIMEOUT_CERTIFICATES.get(&(k0, abs))?.value().clone()),
+    };
+    if key.is_legacy() { bincode::serialize(&proof).ok() }
+    else { bincode::serialize(&TimeoutProofV3::from_held(key, &proof)).ok() }
 }
 
 /// Highest failover round for `mb_index` co-signed by ≥ `support` DISTINCT committee voters
@@ -2028,11 +2195,11 @@ pub fn certified_timeout_proof_for_slot(h: u64) -> Option<Vec<u8>> {
 /// offset may raise its vote TARGET to it and reconverge — instead of voting certified+1 forever
 /// while the split never closes. NEVER feeds leader election: the certified/rotation round still
 /// advances only on a same-round n-f TC, so this cannot cause dual production. O(active rounds).
-pub fn highest_failover_round_with_support(mb_index: u64, support: usize) -> u64 {
+pub fn highest_failover_round_with_support(key: FailoverKey, support: usize) -> u64 {
     let mut best = 0u64;
     for e in TIMEOUT_VOTES.iter() {
-        let (h, r) = *e.key();
-        if h == mb_index && r > best && e.value().len() >= support {
+        let (k, r) = *e.key();
+        if k == key && r > best && e.value().len() >= support {
             best = r;
         }
     }
@@ -2063,7 +2230,8 @@ pub fn failover_round_authorized(mb_index: u64, block_round: u64, carried_baseli
     // round-0 leader could stamp carried_baseline=huge; the abs<=certified check must run for EVERY block
     // (a genuine happy path has abs=baseline<=certified, so certified>=0+cb still holds; only a forged
     // inflated baseline — abs>certified — is rejected, blocking the record_finalized_round poison).
-    highest_certified_round_for(mb_index) >= block_round.saturating_add(carried_baseline)
+    HIGHEST_CERTIFIED_ROUND.get(&FailoverKey::legacy(mb_index)).map(|v| *v).unwrap_or(0)
+        >= block_round.saturating_add(carried_baseline)
 }
 
 /// (f+1)-th highest of a fresh-height multiset (≥1 honest ≥ it). SYNC-HINT REGISTER ONLY — feeds
@@ -2075,6 +2243,34 @@ pub fn frontier_order_statistic(mut hs: Vec<u64>) -> u64 {
     let f = hs.len().saturating_sub(1) / 3;
     hs.sort_unstable_by(|a, b| b.cmp(a)); // descending
     hs[f]
+}
+
+/// The head f+1 in-set nodes stand behind, `own` counted as one of them: the (f+1)-th highest of {own} ∪ `peers`,
+/// f from the in-set size `n_inset`. f+1 values include at least one honest node, so ≤f inflated claims cannot raise
+/// it. None with fewer than f+1 values: nothing can be corroborated and the caller keeps its old reading.
+/// SYNC-HINT ONLY (registration and "am I behind"), never a consensus input.
+pub(crate) fn corroborated_head(own: u64, mut peers: Vec<u64>, n_inset: usize) -> Option<u64> {
+    let need = qnet_consensus::checkpoint_bft::byzantine_f(n_inset) + 1;
+    peers.push(own);
+    if peers.len() < need { return None; }
+    peers.sort_unstable_by(|a, b| b.cmp(a));
+    Some(peers[need - 1])
+}
+
+#[cfg(test)]
+mod tests_corroborated_head {
+    use super::corroborated_head;
+
+    /// 04.10: one node advertising 568110 while the rest stood at 567879 made every other node skip registration as
+    /// "syncing". With five in the set f = 1, so the single claim is outvoted by the second-highest value.
+    #[test]
+    fn a_single_high_claim_cannot_make_a_node_behind() {
+        assert_eq!(corroborated_head(567_879, vec![568_110, 567_879, 567_878, 567_879], 5), Some(567_879));
+        assert_eq!(corroborated_head(567_879, vec![568_110], 5), Some(567_879), "own tip is the second value");
+        // f + 1 agreeing claims do carry: one of them is honest, so a node really behind still sees it.
+        assert_eq!(corroborated_head(100, vec![568_110, 568_100], 5), Some(568_100));
+        assert_eq!(corroborated_head(567_879, Vec::new(), 31), None, "one value cannot be corroborated in a set of 31");
+    }
 }
 
 /// Fold our OWN applied tip into a corroborated ceiling. 0 is preserved verbatim — it means "no
@@ -3606,6 +3802,8 @@ impl SimplifiedP2P {
             NetworkMessage::ConsensusV2 { .. }
             | NetworkMessage::TimeoutVote { .. }
             | NetworkMessage::TimeoutCertificateBroadcast { .. }
+            | NetworkMessage::TimeoutVoteV3 { .. }
+            | NetworkMessage::TimeoutCertificateV3Broadcast { .. }
             | NetworkMessage::ProducerReady { .. }
             | NetworkMessage::ReadyAck { .. }
             | NetworkMessage::RequestConsensusState { .. }
@@ -4518,6 +4716,37 @@ pub enum NetworkMessage {
         target_height: u64,
         sigs: Vec<(String, Vec<u8>)>,
     },
+
+    /// Tenure-bound timeout vote, from the `failover_tenure_bound` gate. Signed payload = timeout_vote_message_for
+    /// (domain "QNET_TIMEOUT_V3"): window, tenure, round, sealed anchor and the voter's OWN high_qc/tip.
+    /// cert_window/cert_tenure/cert_round are UNSIGNED SyncInfo claims (the sender's highest certified round for
+    /// that key), as in TimeoutVote.
+    TimeoutVoteV3 {
+        window: u64,              // target_height / 90
+        tenure: u64,              // (target_height - 1) / 30
+        timeout_round: u64,
+        voter_id: String,
+        anchor: Vec<u8>,          // 32B hash(macroblock window-2), zeros for window<3
+        high_qc_idx: u64,
+        high_qc_hash: Vec<u8>,
+        tip_height: u64,
+        tip_hash: Vec<u8>,
+        signature: Vec<u8>,       // Dilithium over timeout_vote_message_for(...)
+        cert_window: u64,
+        cert_tenure: u64,
+        cert_round: u64,
+    },
+
+    /// Tenure-bound timeout certificate (from the gate).
+    TimeoutCertificateV3Broadcast {
+        proof: TimeoutProofV3,
+    },
+
+    /// Response with tenure-bound certificates for RequestTimeoutCertificates (its range is still windows).
+    TimeoutCertificatesV3Response {
+        certificates: Vec<TimeoutProofV3>,
+        sender_id: String,
+    },
 }
 
 /// PRODUCTION: Active node info for gossip sync
@@ -4557,6 +4786,25 @@ pub struct SignedTimeoutVote {
     pub high_qc_hash: [u8; 32],
     pub tip_height: u64,
     pub tip_hash: [u8; 32],
+}
+
+/// A tenure-bound certificate (`QNET_TIMEOUT_V3`) as it travels and rides in a block: the window and the tenure it
+/// was certified for, then the same anchor and per-voter payloads as `TimeoutProof`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TimeoutProofV3 {
+    pub window: u64,
+    pub tenure: u64,
+    pub timeout_round: u64,
+    pub anchor: [u8; 32],
+    pub votes: Vec<SignedTimeoutVote>,
+}
+
+impl TimeoutProofV3 {
+    pub fn key(&self) -> FailoverKey { FailoverKey { window: self.window, tenure: self.tenure } }
+    pub fn from_held(key: FailoverKey, p: &TimeoutProof) -> Self {
+        TimeoutProofV3 { window: key.window, tenure: key.tenure, timeout_round: p.timeout_round,
+                         anchor: p.anchor, votes: p.votes.clone() }
+    }
 }
 
 // Legacy alias for compatibility
@@ -4812,10 +5060,9 @@ fn discover_genesis_nodes_via_dht() -> Vec<String> {
 
 #[allow(dead_code)]
 
-/// Module-level read of HIGHEST_CERTIFIED_ROUND for (macroblock_index).
-/// Used by `block_pipeline::verify_stage` which has no P2P handle.
+/// Module-level window view of HIGHEST_CERTIFIED_ROUND for (macroblock_index): `window_view_round`.
 pub fn highest_certified_round_for(mb_index: u64) -> u64 {
-    HIGHEST_CERTIFIED_ROUND.get(&mb_index).map(|v| *v).unwrap_or(0)
+    window_view_round(mb_index)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -4834,9 +5081,40 @@ pub fn highest_certified_round_for(mb_index: u64) -> u64 {
 // cleanup loop. Payload size is O(active_mb_window) not O(total_validators).
 // ═══════════════════════════════════════════════════════════════════════════
 pub fn snapshot_timeout_certificates() -> Vec<u8> {
+    // `tcerts_v1` keeps its format: window-only certificates only.
     let entries: Vec<((u64, u64), TimeoutCertificate)> = TIMEOUT_CERTIFICATES
         .iter()
-        .map(|e| (*e.key(), e.value().clone()))
+        .filter(|e| e.key().0.is_legacy())
+        .map(|e| ((e.key().0.window, e.key().1), e.value().clone()))
+        .collect();
+    bincode::serialize(&entries).unwrap_or_default()
+}
+
+/// The certificate a block at `height` carries in `timeout_proof`, decoded in the form its height takes: from the
+/// failover_tenure_bound gate a `TimeoutProofV3` certified for the block's OWN tenure (one for another tenure
+/// authorises nothing at this height), below it a window-only `TimeoutProof`. (key, round, anchor, votes); None
+/// for anything else. DoS bound: the proof is excluded from the block hash, so a relay can swap it, and a round
+/// committee is ≤1000, so a proof with more votes is malformed and dropped before the O(votes) verify.
+pub fn decode_block_timeout_proof(height: u64, bytes: &[u8]) -> Option<(FailoverKey, u64, [u8; 32], Vec<SignedTimeoutVote>)> {
+    const MAX_TC_VOTES: usize = 2048;
+    if crate::node::failover_tenure_bound(height) {
+        let p: TimeoutProofV3 = bincode::deserialize(bytes).ok()?;
+        let key = p.key();
+        if p.votes.len() > MAX_TC_VOTES || key.is_legacy() || p.tenure != crate::node::tenure_of(height)
+            || !key.admissible() { return None; }
+        return Some((key, p.timeout_round, p.anchor, p.votes));
+    }
+    let p: TimeoutProof = bincode::deserialize(bytes).ok()?;
+    if p.votes.len() > MAX_TC_VOTES { return None; }
+    Some((FailoverKey::legacy(p.height), p.timeout_round, p.anchor, p.votes))
+}
+
+/// Tenure-bound certificates for `tcerts_v3`: (key, round, proof).
+pub fn snapshot_timeout_certificates_v3() -> Vec<u8> {
+    let entries: Vec<(FailoverKey, u64, TimeoutProofV3)> = TIMEOUT_CERTIFICATES
+        .iter()
+        .filter(|e| !e.key().0.is_legacy())
+        .map(|e| (e.key().0, e.key().1, TimeoutProofV3::from_held(e.key().0, e.value())))
         .collect();
     bincode::serialize(&entries).unwrap_or_default()
 }
@@ -4865,6 +5143,20 @@ pub fn tc_blob_structural(bytes: &[u8]) -> Vec<((u64, u64), TimeoutCertificate)>
     }
 }
 
+/// The same pre-filter over a `tcerts_v3` blob: a tenure key, matching the proof's own fields, admissible under
+/// this binary's gate, with votes. Every survivor is still signature-verified before it is installed.
+pub fn tc_blob_v3_structural(bytes: &[u8]) -> Vec<(FailoverKey, u64, TimeoutProofV3)> {
+    if bytes.is_empty() { return Vec::new(); }
+    match bincode::deserialize::<Vec<(FailoverKey, u64, TimeoutProofV3)>>(bytes) {
+        Ok(entries) => entries
+            .into_iter()
+            .filter(|(k, r, v)| !k.is_legacy() && v.key() == *k && v.timeout_round == *r
+                && k.admissible() && !v.votes.is_empty())
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
 /// Rehydrate the certified-round tracker by DERIVING it from the certificates rehydrated just
 /// before: it is the highest round this node holds a verified proof for, and nothing else.
 ///
@@ -4880,10 +5172,10 @@ pub fn tc_blob_structural(bytes: &[u8]) -> Vec<((u64, u64), TimeoutCertificate)>
 pub fn rehydrate_highest_certified_rounds() -> usize {
     let mut count = 0usize;
     for e in TIMEOUT_CERTIFICATES.iter() {
-        let (mb, round) = *e.key();
-        let raises = HIGHEST_CERTIFIED_ROUND.get(&mb).map(|c| round > *c).unwrap_or(true);
+        let (key, round) = *e.key();
+        let raises = HIGHEST_CERTIFIED_ROUND.get(&key).map(|c| round > *c).unwrap_or(true);
         if raises {
-            HIGHEST_CERTIFIED_ROUND.insert(mb, round);
+            HIGHEST_CERTIFIED_ROUND.insert(key, round);
             count += 1;
         }
     }
@@ -4935,15 +5227,16 @@ mod tests {
         test_insert_timeout_vote(2, 1, "voter_a");
         test_insert_timeout_vote(2, 1, "voter_b");          // w=2 supported (2 distinct)
         test_insert_timeout_vote(1, 1, "voter_c");          // w=1 NOT supported (1 distinct)
-        assert_eq!(lowest_window_with_support(0), Some(2), "f+1 support fires; single vote does not");
+        let lk = FailoverKey::legacy;
+        assert_eq!(lowest_key_with_support(lk(0)), Some(lk(2)), "f+1 support fires; single vote does not");
         // Same voter across two rounds of one window counts ONCE (distinct-voter rule).
         test_insert_timeout_vote(1, 2, "voter_c");
-        assert_eq!(lowest_window_with_support(0), Some(2), "same voter twice ≠ two voters");
+        assert_eq!(lowest_key_with_support(lk(0)), Some(lk(2)), "same voter twice ≠ two voters");
         // A second distinct voter on w=1 flips the min-target to the LOWER supported window.
         test_insert_timeout_vote(1, 1, "voter_d");
-        assert_eq!(lowest_window_with_support(0), Some(1), "MIN of supported windows wins");
-        assert_eq!(lowest_window_with_support(1), Some(2), "strictly-above filter");
-        assert_eq!(lowest_window_with_support(2), None, "nothing above");
+        assert_eq!(lowest_key_with_support(lk(0)), Some(lk(1)), "MIN of supported windows wins");
+        assert_eq!(lowest_key_with_support(lk(1)), Some(lk(2)), "strictly-above filter");
+        assert_eq!(lowest_key_with_support(lk(2)), None, "nothing above");
 
         // ── Rehydration hardening. A certified-round pair installs ONLY when backed by a co-persisted
         // structurally-consistent TC. Rehydrate must NOT raise the floor — that boot re-raise is what
@@ -4975,9 +5268,9 @@ mod tests {
         assert_eq!(observed_tc_window_floor(), 2, "floor = finalized window");
         test_insert_timeout_vote(4, 1, "voter_a"); // banked at window 4
         test_insert_timeout_vote(6, 1, "voter_b"); // at window 6
-        evict_votes_below_certified(5); // a TC certified window 5
-        assert!(!TIMEOUT_VOTES.contains_key(&(4, 1)), "below-certified banked vote pruned");
-        assert!(TIMEOUT_VOTES.contains_key(&(6, 1)), "at-or-above vote retained");
+        evict_votes_below_certified(FailoverKey::legacy(5)); // a TC certified window 5
+        assert!(!TIMEOUT_VOTES.contains_key(&(FailoverKey::legacy(4), 1)), "below-certified banked vote pruned");
+        assert!(TIMEOUT_VOTES.contains_key(&(FailoverKey::legacy(6), 1)), "at-or-above vote retained");
         // A stuck node with tip in window 4-5 has floor 2 (finality) — it CAN still receive/form a TC
         // for its own window, the wedge this fixes. Certified round survives (finality 2 < window 5).
         assert_eq!(observed_tc_window_floor(), 2, "floor stays at finality, never above the tip");
@@ -4990,10 +5283,10 @@ mod tests {
         let sw = 0u64; // genesis window: committee = 5 ⇒ quorum 4 ⇒ decisive at 3 others
         test_insert_timeout_vote(sw, 1, "g_a");
         test_insert_timeout_vote(sw, 1, "g_b");
-        assert!(!round_one_short_of_quorum(sw, "g_e"), "2 < quorum-1 ⇒ our vote not yet decisive");
+        assert!(!round_one_short_of_quorum(FailoverKey::legacy(sw), "g_e"), "2 < quorum-1 ⇒ our vote not yet decisive");
         test_insert_timeout_vote(sw, 1, "g_c"); // 3 distinct = quorum-1
-        assert!(round_one_short_of_quorum(sw, "g_e"), "quorum-1 others ⇒ self-yield fires");
-        assert!(!round_one_short_of_quorum(sw, "g_a"), "already voted this round ⇒ not withholding");
+        assert!(round_one_short_of_quorum(FailoverKey::legacy(sw), "g_e"), "quorum-1 others ⇒ self-yield fires");
+        assert!(!round_one_short_of_quorum(FailoverKey::legacy(sw), "g_a"), "already voted this round ⇒ not withholding");
 
         test_clear_timeout_state();
     }
@@ -5014,7 +5307,7 @@ mod tests {
 
         // Exactly what rehydrate_timeout_certificates_verified installs: a verified proof, and
         // nothing else. There is no second blob to carry the round any more.
-        TIMEOUT_CERTIFICATES.insert((mb, round), TimeoutProof {
+        TIMEOUT_CERTIFICATES.insert((FailoverKey::legacy(mb), round), TimeoutProof {
             height: mb,
             timeout_round: round,
             anchor: [0u8; 32],
@@ -5060,7 +5353,7 @@ mod tests {
         // baseline is now CARRIED in the block (3rd arg), not read from LAST_FINALIZED_ROUND_PER_MB.
         let mb = 9_100_001u64;
         // 2f+1 certified ABSOLUTE round 12 for this macroblock.
-        HIGHEST_CERTIFIED_ROUND.insert(mb, 12);
+        HIGHEST_CERTIFIED_ROUND.insert(FailoverKey::legacy(mb), 12);
         assert!(failover_round_authorized(mb, 0, 0),  "round 0 (happy path) is always authorised");
         assert!(failover_round_authorized(mb, 11, 0), "round below certified is authorised");
         assert!(failover_round_authorized(mb, 12, 0), "round == certified is authorised");
@@ -5068,7 +5361,7 @@ mod tests {
 
         // Non-zero carried baseline ⇒ the comparison is in ABSOLUTE units (block_round + carried_baseline).
         let mb2 = 9_100_002u64;
-        HIGHEST_CERTIFIED_ROUND.insert(mb2, 12);    // absolute certified round
+        HIGHEST_CERTIFIED_ROUND.insert(FailoverKey::legacy(mb2), 12);    // absolute certified round
         assert!(failover_round_authorized(mb2, 7, 5),  "abs 7+5=12 <= 12 → authorised");
         assert!(!failover_round_authorized(mb2, 8, 5), "abs 8+5=13 > 12 → rejected");
 
@@ -6051,8 +6344,9 @@ mod tests_failover_slot_key {
     /// network had already skipped for 29 consecutive slots — one un-skippable slot, and the chain
     /// stopped there. The round must follow the tenure across the boundary.
     /// Windows far from any other test's keys, and only this test's own entries are touched:
-    /// the maps are process-global and the harness runs tests in parallel threads.
-    const W0: u64 = 900_000;         // tenure begins here
+    /// the maps are process-global and the harness runs tests in parallel threads. Below the
+    /// failover_tenure_bound gate, where the window-keyed rule still governs every slot.
+    const W0: u64 = 23_457;          // tenure begins here
     const H_MID: u64 = W0 * 90 - 1;  // mid-tenure slot, own window
     const H_BOUNDARY: u64 = W0 * 90; // last slot of the tenure, first of the next window
     const H_NEXT: u64 = W0 * 90 + 1; // fresh tenure in the new window
@@ -6060,7 +6354,8 @@ mod tests_failover_slot_key {
     #[test]
     fn a_tenure_keeps_its_certified_round_across_a_window_boundary() {
         let _guard = TEST_FAILOVER_STATE_LOCK.lock();
-        HIGHEST_CERTIFIED_ROUND.insert(W0 - 1, 3); // the round the network rotated onto
+        assert!(!crate::node::failover_tenure_bound(H_NEXT), "the window-keyed rule");
+        HIGHEST_CERTIFIED_ROUND.insert(FailoverKey::legacy(W0 - 1), 3); // the round the network rotated onto
         assert_eq!(certified_round_for_slot(H_MID), 3, "mid-tenure slot, own window");
         assert_eq!(certified_round_for_slot(H_BOUNDARY), 3,
                    "last slot of the tenure: the boundary must not discard the certified skip");
@@ -6083,39 +6378,38 @@ mod tests_failover_slot_key {
         // baseline is empty, has to compute the same answer.
         assert_eq!(certified_round_for_slot(H_NEXT), 0, "the apply baseline never raises the ceiling");
 
-        HIGHEST_CERTIFIED_ROUND.remove(&(W0 - 1));
+        HIGHEST_CERTIFIED_ROUND.remove(&FailoverKey::legacy(W0 - 1));
         LAST_FINALIZED_ROUND_PER_MB.remove(&W0);
     }
 
-    /// OPEN DEFECT, forensic h=627304 — run with `--ignored` to see it fail.
+    /// Forensic h=627304 and the 04.10 sandbox fork, closed from the failover_tenure_bound gate.
     ///
-    /// A failover round is keyed `(window, round)` but BELONGS to the tenure that raised it. Window W
-    /// opens on `W*90`, which is the LAST slot of the straddling tenure, so a timeout raised for that
-    /// tenure is keyed under W. The tenure that opens the window then reads the same key and inherits
-    /// a round raised for a tenure that has already ended. Whether a node holds that certificate at
-    /// `W*90+1` is pure propagation timing, and the leader is `(round0_idx + round) % N`, so one unit
-    /// of disagreement elects the ADJACENT candidate: on 07.09 two leaders produced from 627304 and
-    /// the fleet split 2-vs-4 with neither side able to certify the window.
-    ///
-    /// The fix cannot be inferred from the certificate as it stands: when the new tenure's leader
-    /// produces nothing, the quorum tip stays in the PREVIOUS tenure, so a certificate rotating off
-    /// the new leader is indistinguishable from one raised for the old. The vote has to name the
-    /// tenure it is for — a wire change, hence this stays open rather than half-fixed.
+    /// A failover round is keyed `(window, round)` below the gate but BELONGS to the tenure that raised
+    /// it. Window W opens on `W*90`, which is the LAST slot of the straddling tenure, so a timeout raised
+    /// for that tenure is keyed under W, and the tenure that opens the window then inherits a round raised
+    /// for a tenure that has already ended — whether a node holds that certificate at `W*90+1` is pure
+    /// propagation timing. From the gate the vote names its tenure (`QNET_TIMEOUT_V3`), so the round
+    /// stays with the tenure that raised it.
     #[test]
-    #[ignore = "open defect h=627304: the window-opening tenure inherits the previous tenure's round"]
     fn a_tenure_does_not_inherit_a_round_raised_for_the_one_before_it() {
         let _guard = TEST_FAILOVER_STATE_LOCK.lock();
         const W: u64 = 910_000;
         let straddling_last = W * 90;      // last slot of the tenure that began in W-1
         let opening_first = W * 90 + 1;    // first slot of the tenure that opens W
-        HIGHEST_CERTIFIED_ROUND.insert(W, 1); // raised while the straddling tenure was ending
+        assert!(crate::node::failover_tenure_bound(straddling_last) && crate::node::failover_tenure_bound(opening_first));
+        let raised_for = FailoverKey::for_slot(straddling_last);
+        assert_eq!(raised_for, FailoverKey { window: W, tenure: crate::node::tenure_of(straddling_last) });
+        HIGHEST_CERTIFIED_ROUND.insert(raised_for, 1); // raised while the straddling tenure was ending
 
         assert_eq!(certified_round_for_slot(straddling_last), 1,
                    "the tenure that raised the round keeps it to its last slot");
+        assert_eq!(certified_round_for_slot(straddling_last - 1), 1,
+                   "and in the window its other slots fall in");
         assert_eq!(certified_round_for_slot(opening_first), 0,
                    "the NEXT tenure elects its own leader: inheriting this round is what forked 627304");
+        assert_eq!(window_view_round(W), 1, "the window view still shows the round");
 
-        HIGHEST_CERTIFIED_ROUND.remove(&W);
+        HIGHEST_CERTIFIED_ROUND.remove(&raised_for);
     }
 
     /// Both operands are certificate-driven, so the carry cannot invent a round: with nothing
@@ -6127,6 +6421,153 @@ mod tests_failover_slot_key {
         assert_eq!(certified_round_for_slot(800_000 * 90), 0);
         assert_eq!(certified_round_for_slot(800_000 * 90 + 1), 0);
         assert_eq!(certified_round_for_slot(800_001 * 90 - 1), 0);
+    }
+}
+
+#[cfg(test)]
+mod tests_failover_tenure_key {
+    use super::*;
+
+    const G: u64 = qnet_state::feature_gates::FAILOVER_TENURE_BOUND_GATE_HEIGHT;
+    const MI: u64 = qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
+
+    /// The v3 payload binds window, tenure and round, and is never the v2 payload; the v2 bytes stay exactly
+    /// what a binary below the gate signs.
+    #[test]
+    fn the_v3_vote_binds_the_tenure_and_the_v2_bytes_do_not_move() {
+        let (a, qh, th) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+        let k = FailoverKey { window: 7, tenure: 22 };
+        let m = timeout_vote_message_for(k, 3, &a, 5, &qh, 640, &th);
+        assert!(m.starts_with("QNET_TIMEOUT_V3:7:22:3:"), "{m}");
+        assert_ne!(m, timeout_vote_message_for(FailoverKey { window: 7, tenure: 23 }, 3, &a, 5, &qh, 640, &th), "tenure binds");
+        assert_ne!(m, timeout_vote_message_for(FailoverKey { window: 8, tenure: 22 }, 3, &a, 5, &qh, 640, &th), "window binds");
+        assert_ne!(m, timeout_vote_message_for(k, 4, &a, 5, &qh, 640, &th), "round binds");
+        assert_eq!(timeout_vote_message_for(FailoverKey::legacy(7), 3, &a, 5, &qh, 640, &th),
+                   timeout_vote_message(7, 3, &a, 5, &qh, 640, &th), "the window-only form is byte-identical");
+        assert!(!timeout_vote_message(7, 3, &a, 5, &qh, 640, &th).starts_with("QNET_TIMEOUT_V3"));
+    }
+
+    /// Window G/90 holds exactly one slot below the gate (G itself, the last slot of the tenure ending there), so
+    /// it is the last window the window-only form may name; the first gated tenure starts at G+1.
+    #[test]
+    fn the_window_only_form_ends_with_the_last_window_holding_an_old_slot() {
+        assert_eq!(G % MI, 0);
+        assert!(!crate::node::failover_tenure_bound(G), "slot G keeps the old rules");
+        assert!(crate::node::failover_tenure_bound(G + 1), "the first gated tenure starts one above");
+        assert_eq!(FailoverKey::for_slot(G), FailoverKey::legacy(G / MI));
+        assert_eq!(FailoverKey::for_slot(G + 1), FailoverKey { window: G / MI, tenure: G / 30 });
+        assert!(FailoverKey::legacy(G / MI).admissible(), "a v2 vote for the gate's window is still taken");
+        assert!(!FailoverKey::legacy(G / MI + 1).admissible(), "a v2 vote for any later window is dropped");
+        assert!(FailoverKey::legacy(G / MI - 1000).admissible());
+        assert!(!FailoverKey { window: G / MI - 1, tenure: (G - 31) / 30 }.admissible(), "no tenure key below the gate");
+    }
+
+    /// The gate seam is the 627304 shape at the transition: window G/90 opens on slot G, the last slot of the tenure that
+    /// began in the window before. A window-only certificate raised there (by nodes stalled at G, or from v2 votes replayed
+    /// for that window) still governs slot G, as does the window that tenure began in, and moves no gated slot: the first
+    /// gated tenure elects on its own key from round 0, and the window baseline slot G leaves behind is clamped away.
+    #[test]
+    fn a_window_certificate_at_the_gate_seam_governs_slot_g_alone() {
+        let _g = TEST_FAILOVER_STATE_LOCK.lock();
+        let (seam, before) = (FailoverKey::legacy(G / MI), FailoverKey::legacy(G / MI - 1));
+        test_certify(seam, 2);
+        record_finalized_round(G / MI, 2);
+        assert_eq!(certified_round_for_slot(G), 2, "slot G keeps the window round");
+        assert_eq!(rotation_round_and_baseline_for_slot(G), (0, 2));
+        assert_eq!((certified_round_for_slot(G + 1), certified_round_for_slot(G + 89)), (0, 0),
+                   "the first gated tenure does not inherit it");
+        assert_eq!(rotation_round_and_baseline_for_slot(G + 1), (0, 0), "nor the baseline slot G recorded");
+        assert_eq!(certified_timeout_proof_for_slot(G + 1), None);
+        test_forget_key(seam);
+        test_certify(before, 3);
+        assert_eq!(certified_round_for_slot(G), 3, "the straddling tenure keeps its round to its last slot");
+        assert_eq!(certified_round_for_slot(G + 1), 0);
+        let first = FailoverKey::for_slot(G + 1);
+        test_certify(first, 1);
+        assert_eq!((certified_round_for_slot(G), certified_round_for_slot(G + 30), certified_round_for_slot(G + 31)),
+                   (3, 1, 0), "each key rotates its own slots");
+        for k in [before, first] { test_forget_key(k); }
+        LAST_FINALIZED_ROUND_PER_MB.remove(&(G / MI));
+    }
+
+    /// A tenure key must name a window its slots fall in: both windows for the tenure that straddles a boundary,
+    /// only its own for the others.
+    #[test]
+    fn a_tenure_key_names_one_of_its_own_windows() {
+        let w = G / MI + 10;
+        let straddling = (w * MI - 1) / 30;          // slots w*90-29 ..= w*90
+        let inner = (w * MI + 1 - 1) / 30;           // slots w*90+1 ..= w*90+30
+        assert_eq!(windows_of_tenure(straddling), (w - 1, w));
+        assert_eq!(windows_of_tenure(inner), (w, w));
+        assert!(FailoverKey { window: w - 1, tenure: straddling }.admissible());
+        assert!(FailoverKey { window: w, tenure: straddling }.admissible());
+        assert!(FailoverKey { window: w, tenure: inner }.admissible());
+        assert!(!FailoverKey { window: w + 1, tenure: inner }.admissible(), "a window outside the tenure is refused");
+        assert!(!FailoverKey { window: w - 1, tenure: inner }.admissible());
+        assert!(!FailoverKey { window: u64::MAX / MI, tenure: u64::MAX - 1 }.admissible(), "no overflow to an accepted key");
+        // Every key a slot votes under is admissible, from either side of a boundary.
+        for h in (w * MI - 35)..=(w * MI + 35) {
+            assert!(FailoverKey::for_slot(h).admissible(), "slot {h}");
+        }
+    }
+
+    /// From the gate a block carries the proof of its own tenure, as a TimeoutProofV3; one for another tenure, the
+    /// window-only form, or an oversized one is refused before any verify. Below the gate the old form stands.
+    #[test]
+    fn a_block_proof_is_taken_only_for_the_carrying_blocks_tenure() {
+        let w = G / MI + 20;
+        let h = w * MI + 40;                          // inside the tenure starting at w*90+31
+        let t = crate::node::tenure_of(h);
+        let vote = SignedTimeoutVote { voter_id: "v".into(), signature: vec![1], high_qc_idx: 0,
+                                       high_qc_hash: [0u8; 32], tip_height: h - 1, tip_hash: [0u8; 32] };
+        let v3 = |tenure: u64, votes: Vec<SignedTimeoutVote>| bincode::serialize(&TimeoutProofV3 {
+            window: w, tenure, timeout_round: 1, anchor: [0u8; 32], votes }).unwrap();
+        let got = decode_block_timeout_proof(h, &v3(t, vec![vote.clone()])).expect("own tenure");
+        assert_eq!((got.0, got.1), (FailoverKey { window: w, tenure: t }, 1));
+        assert!(decode_block_timeout_proof(h, &v3(t + 1, vec![vote.clone()])).is_none(), "the next tenure's certificate");
+        assert!(decode_block_timeout_proof(h, &v3(t - 1, vec![vote.clone()])).is_none(), "the previous tenure's certificate");
+        assert!(decode_block_timeout_proof(h, &v3(t, vec![vote.clone(); 2049])).is_none(), "oversized");
+        let legacy = bincode::serialize(&TimeoutProof { height: w, timeout_round: 1, anchor: [0u8; 32], votes: vec![vote.clone()] }).unwrap();
+        assert!(decode_block_timeout_proof(h, &legacy).map_or(true, |(k, ..)| k.tenure == t && !k.is_legacy()),
+                "the window-only form never passes as a tenure certificate");
+        let low = (G / MI - 50) * MI + 40;
+        assert_eq!(decode_block_timeout_proof(low, &bincode::serialize(&TimeoutProof {
+            height: low / MI, timeout_round: 2, anchor: [0u8; 32], votes: vec![vote] }).unwrap()).map(|g| (g.0, g.1)),
+            Some((FailoverKey::legacy(low / MI), 2)), "below the gate the old form stands");
+    }
+
+    /// `tcerts_v3` carries tenure keys only and keeps `tcerts_v1` in its old format; the structural pre-filter
+    /// drops an entry whose key does not match its own proof or that the gate does not admit. The tracker is
+    /// re-derived from whatever survives verification, tenure keys included.
+    #[test]
+    fn the_tenure_certificates_persist_apart_and_rederive_their_rounds() {
+        let _g = TEST_FAILOVER_STATE_LOCK.lock();
+        test_clear_timeout_state();
+        let w = G / MI + 30;
+        let t = FailoverKey::for_slot(w * MI + 5);
+        let old = FailoverKey::legacy(G / MI - 60);
+        test_certify(t, 2);
+        test_certify(old, 1);
+        let v1 = tc_blob_structural(&snapshot_timeout_certificates());
+        assert_eq!(v1.iter().map(|(k, _)| *k).collect::<Vec<_>>(), vec![(old.window, 1)], "v1 holds window-only keys");
+        let v3: Vec<(FailoverKey, u64, TimeoutProofV3)> =
+            bincode::deserialize(&snapshot_timeout_certificates_v3()).unwrap();
+        assert_eq!(v3.iter().map(|(k, r, _)| (*k, *r)).collect::<Vec<_>>(), vec![(t, 2)]);
+        // Structural filter: a key that does not match its own proof, or one the gate does not admit, is dropped.
+        let good = v3[0].clone();
+        let mut wrong_key = good.clone(); wrong_key.0.tenure += 1;
+        let mut wrong_window = good.clone(); wrong_window.0.window += 5; wrong_window.2.window += 5;
+        let blob = bincode::serialize(&vec![good.clone(), wrong_key, wrong_window]).unwrap();
+        let kept = tc_blob_v3_structural(&blob);
+        assert_eq!(kept.iter().map(|(k, r, _)| (*k, *r)).collect::<Vec<_>>(), vec![(t, 2)]);
+
+        HIGHEST_CERTIFIED_ROUND.clear();
+        assert_eq!(certified_round_at(t), 0);
+        assert_eq!(rehydrate_highest_certified_rounds(), 2);
+        assert_eq!(certified_round_at(t), 2, "a held tenure certificate implies its round after a restart");
+        assert_eq!(certified_round_for_slot(w * MI + 5), 2);
+        assert_eq!(certified_round_for_slot(w * MI + 35), 0, "and only for its own tenure");
+        test_clear_timeout_state();
     }
 }
 
@@ -6143,9 +6584,12 @@ mod superseded_tail_tests {
             }).collect(),
         }
     }
+    /// Certifies `round` for the key of the window's first tenure that opens in it (slot w*90+1): the
+    /// tenure key above the failover_tenure_bound gate, the window itself below it.
     fn certify_with(w: u64, round: u64, tips: &[(u64, [u8; 32])]) {
-        TIMEOUT_CERTIFICATES.insert((w, round), tc_with(w, round, tips));
-        HIGHEST_CERTIFIED_ROUND.entry(w).and_modify(|c| { if round > *c { *c = round; } }).or_insert(round);
+        let key = FailoverKey::for_slot(w * 90 + 1);
+        TIMEOUT_CERTIFICATES.insert((key, round), tc_with(w, round, tips));
+        HIGHEST_CERTIFIED_ROUND.entry(key).and_modify(|c| { if round > *c { *c = round; } }).or_insert(round);
     }
     fn certify(w: u64, round: u64, tips: &[u64]) {
         let v: Vec<(u64, [u8; 32])> = tips.iter().map(|t| (*t, [0u8; 32])).collect();

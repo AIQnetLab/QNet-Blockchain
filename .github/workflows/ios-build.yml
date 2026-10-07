@@ -1,23 +1,73 @@
 name: iOS build
 
 # Compiles the wallet for the iOS simulator on a clean macOS runner, unsigned: proof that the Xcode
-# project, the pods and the native ML-DSA module build outside one developer's machine. A signed
-# archive for TestFlight needs the developer account's certificates; that lane is added once the
-# account exists and its secrets are in the repository.
+# project, the pods and the native ML-DSA module build outside one developer's machine, once the checks job
+# passed (dependency audit, unit tests, light-client pin). A manual run also archives a signed Release build
+# and uploads it to TestFlight (the testflight job).
+#
+# Both macOS jobs resolve the pods after npm ci and the patches, compare the result with ios/Podfile.lock and
+# keep the resolved lock as an artifact: the committed lock is replaced by that file, never edited by hand.
 
 on:
   push:
     branches: [testnet, main]
     paths:
       - 'applications/qnet-mobile/**'
+      - 'docs/protocols/**'
       - '.github/workflows/ios-build.yml'
   pull_request:
     paths:
       - 'applications/qnet-mobile/**'
+      - 'docs/protocols/**'
   workflow_dispatch:
+    inputs:
+      testflight:
+        description: 'Also archive, sign and upload the build to TestFlight'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
 
 jobs:
+  # The gate the build waits for (MOBNET-R5-03): the production dependency audit, the unit tests and the light-client
+  # pin check against the live head. Nothing in it may fail.
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: applications/qnet-mobile
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: applications/qnet-mobile/package-lock.json
+
+      - name: Install JavaScript dependencies
+        run: |
+          npm ci --no-audit --no-fund --ignore-scripts
+          npx patch-package
+          grep -q 'QNet patch (origin integrity)' node_modules/react-native-webview/apple/RNCWebViewImpl.m
+
+      - name: Dependency audit
+        run: npm run audit:prod
+
+      - name: Unit tests
+        run: npx jest --testTimeout=60000
+
+      # The release bundles of both platforms carry no removed flow, and the iOS one none of Android's own texts.
+      - name: Bundle scan
+        run: node scripts/bundle-check.js --platform all
+
+      - name: Light-client pin
+        run: npm run check:release -- --online
+
   simulator:
+    needs: checks
     runs-on: macos-15
     timeout-minutes: 60
     defaults:
@@ -34,10 +84,13 @@ jobs:
 
       # patch-package runs as postinstall; when its context does not match on this platform the patch
       # is applied by hand with fuzz, which is what it needs (a two-line compiler-flag change).
+      # patch-package applies every patch it can before it reports a failure, so the webview patch is in place
+      # either way; the in-app browser's origin integrity lives in it, and the build stops if it is not.
       - name: Install JavaScript dependencies
         run: |
           npm ci --no-audit --no-fund --ignore-scripts
           npx patch-package || (cd node_modules/react-native-quick-crypto && patch -p1 --forward < ../../patches/react-native-quick-crypto+1.0.15.patch)
+          grep -q 'QNet patch (origin integrity)' node_modules/react-native-webview/apple/RNCWebViewImpl.m
 
       - uses: ruby/setup-ruby@v1
         with:
@@ -46,7 +99,32 @@ jobs:
           working-directory: applications/qnet-mobile
 
       - name: Install pods
-        run: bundle exec pod install --project-directory=ios
+        run: |
+          cp ios/Podfile.lock "$RUNNER_TEMP/Podfile.lock.repo"
+          bundle exec pod install --project-directory=ios
+
+      # The native modules come from node_modules, so a new package version changes the pods without a Podfile
+      # change. A lock that differs is reported with its diff; the resolved one is kept to be committed.
+      - name: Compare the pod lock with the repository's
+        run: |
+          if cmp -s "$RUNNER_TEMP/Podfile.lock.repo" ios/Podfile.lock; then
+            echo 'ios/Podfile.lock matches the pods this run resolved.' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning file=applications/qnet-mobile/ios/Podfile.lock::pod install resolved other pods than ios/Podfile.lock records; commit the ios-podfile-lock artifact of this run"
+            {
+              echo '## ios/Podfile.lock differs from the resolved pods'
+              echo 'Commit the `ios-podfile-lock` artifact of this run as `applications/qnet-mobile/ios/Podfile.lock`.'
+              echo '```diff'
+              { diff -u "$RUNNER_TEMP/Podfile.lock.repo" ios/Podfile.lock || true; } | head -n 400
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Keep the resolved pod lock
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-podfile-lock
+          path: applications/qnet-mobile/ios/Podfile.lock
 
       - name: Build for the simulator
         run: |
@@ -82,3 +160,195 @@ jobs:
             applications/qnet-mobile/xcodebuild.log
             applications/qnet-mobile/build/Logs
           if-no-files-found: ignore
+
+  # A signed Release archive of the QNetMobile scheme, uploaded to TestFlight, on a manual run only. Signing is
+  # automatic for team 33H36C42XS through the App Store Connect API key (secrets ASC_KEY_ID, ASC_ISSUER_ID,
+  # ASC_KEY_P8); the build number is the project's CURRENT_PROJECT_VERSION, so every upload needs a new one.
+  # The secrets reach only the steps that use them, nothing prints them, and the key file is deleted at the end.
+  testflight:
+    needs: checks
+    if: github.event_name == 'workflow_dispatch' && inputs.testflight
+    runs-on: macos-15
+    timeout-minutes: 90
+    concurrency:
+      group: ios-testflight
+      cancel-in-progress: false
+    env:
+      TEAM_ID: 33H36C42XS
+    defaults:
+      run:
+        working-directory: applications/qnet-mobile
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: applications/qnet-mobile/package-lock.json
+
+      - name: Install JavaScript dependencies
+        run: |
+          npm ci --no-audit --no-fund --ignore-scripts
+          npx patch-package || (cd node_modules/react-native-quick-crypto && patch -p1 --forward < ../../patches/react-native-quick-crypto+1.0.15.patch)
+          grep -q 'QNet patch (origin integrity)' node_modules/react-native-webview/apple/RNCWebViewImpl.m
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+          bundler-cache: true
+          working-directory: applications/qnet-mobile
+
+      - name: Install pods
+        run: |
+          cp ios/Podfile.lock "$RUNNER_TEMP/Podfile.lock.repo"
+          bundle exec pod install --project-directory=ios
+
+      # The pods this release is built from, recorded beside it.
+      - name: Compare the pod lock with the repository's
+        run: |
+          if cmp -s "$RUNNER_TEMP/Podfile.lock.repo" ios/Podfile.lock; then
+            echo 'ios/Podfile.lock matches the pods this build uses.' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning file=applications/qnet-mobile/ios/Podfile.lock::this build uses other pods than ios/Podfile.lock records; commit the testflight-podfile-lock artifact of this run"
+            {
+              echo '## ios/Podfile.lock differs from the pods of this build'
+              echo 'Commit the `testflight-podfile-lock` artifact of this run as `applications/qnet-mobile/ios/Podfile.lock`.'
+              echo '```diff'
+              { diff -u "$RUNNER_TEMP/Podfile.lock.repo" ios/Podfile.lock || true; } | head -n 400
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Keep the pod lock of this build
+        uses: actions/upload-artifact@v4
+        with:
+          name: testflight-podfile-lock
+          path: applications/qnet-mobile/ios/Podfile.lock
+
+      - name: Read the version and build number
+        run: |
+          set -o pipefail
+          xcodebuild -workspace ios/QNetMobile.xcworkspace -scheme QNetMobile -configuration Release -sdk iphoneos \
+            -showBuildSettings -json 2>/dev/null > "$RUNNER_TEMP/settings.json"
+          read -r version build < <(python3 -c 'import json, sys
+          s = next(t["buildSettings"] for t in json.load(open(sys.argv[1])) if t["target"] == "QNetMobile")
+          print(s["MARKETING_VERSION"], s["CURRENT_PROJECT_VERSION"])' "$RUNNER_TEMP/settings.json")
+          [[ "$version" =~ ^[0-9]+(\.[0-9]+){0,2}$ && "$build" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]] \
+            || { echo "::error::MARKETING_VERSION or CURRENT_PROJECT_VERSION is missing or malformed"; exit 1; }
+          echo "APP_VERSION=$version" >> "$GITHUB_ENV"
+          echo "BUILD_NUMBER=$build" >> "$GITHUB_ENV"
+          echo "Version $version ($build)"
+
+      # altool looks for AuthKey_<key id>.p8 in ~/.appstoreconnect/private_keys; xcodebuild takes the same file by
+      # path. ASC_KEY_P8 holds the .p8 text (or that text in base64).
+      - name: Place the App Store Connect API key
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: |
+          [ -n "$ASC_KEY_ID" ] && [ -n "$ASC_ISSUER_ID" ] && [ -n "$ASC_KEY_P8" ] \
+            || { echo "::error::set the secrets ASC_KEY_ID, ASC_ISSUER_ID and ASC_KEY_P8"; exit 1; }
+          [[ "$ASC_KEY_ID" =~ ^[A-Z0-9]{10}$ ]] || { echo "::error::ASC_KEY_ID is not a 10-character key id"; exit 1; }
+          dir="$HOME/.appstoreconnect/private_keys"
+          key="$dir/AuthKey_$ASC_KEY_ID.p8"
+          install -d -m 0700 "$dir"
+          umask 077
+          if printf '%s' "$ASC_KEY_P8" | grep -q -- '-----BEGIN PRIVATE KEY-----'; then
+            printf '%s\n' "$ASC_KEY_P8" > "$key"
+          else
+            printf '%s' "$ASC_KEY_P8" | base64 --decode > "$key" 2>/dev/null || true
+          fi
+          grep -q -- '-----BEGIN PRIVATE KEY-----' "$key" \
+            || { rm -f "$key"; echo "::error::ASC_KEY_P8 is not the .p8 key text"; exit 1; }
+          echo "ASC_KEY_PATH=$key" >> "$GITHUB_ENV"
+
+      - name: Archive
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          set -o pipefail
+          xcodebuild -workspace ios/QNetMobile.xcworkspace -scheme QNetMobile -configuration Release \
+            -sdk iphoneos -destination 'generic/platform=iOS' -archivePath "$RUNNER_TEMP/QNetMobile.xcarchive" -derivedDataPath build \
+            -allowProvisioningUpdates -authenticationKeyPath "$ASC_KEY_PATH" \
+            -authenticationKeyID "$ASC_KEY_ID" -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
+            DEVELOPMENT_TEAM="$TEAM_ID" CODE_SIGN_STYLE=Automatic COMPILER_INDEX_STORE_ENABLE=NO \
+            archive 2>&1 | tee xcodebuild.log | tail -n 200
+
+      # manageAppVersionAndBuildNumber off: the uploaded build number is CURRENT_PROJECT_VERSION as archived.
+      - name: Export for App Store Connect
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          set -o pipefail
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>teamID</key><string>$TEAM_ID</string>
+            <key>signingStyle</key><string>automatic</string>
+            <key>destination</key><string>export</string>
+            <key>manageAppVersionAndBuildNumber</key><false/>
+            <key>uploadSymbols</key><true/>
+          </dict>
+          </plist>
+          EOF
+          xcodebuild -exportArchive -archivePath "$RUNNER_TEMP/QNetMobile.xcarchive" -exportPath "$RUNNER_TEMP/export" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+            -allowProvisioningUpdates -authenticationKeyPath "$ASC_KEY_PATH" \
+            -authenticationKeyID "$ASC_KEY_ID" -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
+            2>&1 | tee xcodebuild-export.log | tail -n 100
+          ipa=$(find "$RUNNER_TEMP/export" -maxdepth 1 -name '*.ipa' | head -n 1)
+          [ -n "$ipa" ] || { echo "::error::the export wrote no .ipa"; exit 1; }
+          shipped=$(unzip -p "$ipa" 'Payload/*.app/Info.plist' | plutil -extract CFBundleVersion raw -o - -)
+          [ "$shipped" = "$BUILD_NUMBER" ] || { echo "::error::the .ipa carries build $shipped, not $BUILD_NUMBER"; exit 1; }
+          echo "IPA=$ipa" >> "$GITHUB_ENV"
+
+      - name: Upload to TestFlight
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          xcrun altool --upload-app --type ios --file "$IPA" --apiKey "$ASC_KEY_ID" --apiIssuer "$ASC_ISSUER_ID"
+          {
+            echo '## Uploaded to TestFlight'
+            echo "QNet Wallet $APP_VERSION ($BUILD_NUMBER), bundle com.qnetmobile. App Store Connect processes the build before testers see it."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Summarise the failure
+        if: failure()
+        run: |
+          {
+            echo '## TestFlight lane failed'
+            for log in xcodebuild.log xcodebuild-export.log; do
+              [ -f "$log" ] || continue
+              echo "### $log: errors"
+              echo '```'
+              grep -E '(error:|fatal error:|\*\* (ARCHIVE|EXPORT) FAILED|The following build commands failed)' "$log" | sort -u | head -n 80
+              echo '```'
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: testflight-logs
+          path: |
+            applications/qnet-mobile/xcodebuild.log
+            applications/qnet-mobile/xcodebuild-export.log
+            applications/qnet-mobile/build/Logs
+          if-no-files-found: ignore
+
+      - name: Delete the API key
+        if: always()
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+        run: |
+          rm -f "$HOME/.appstoreconnect/private_keys/AuthKey_$ASC_KEY_ID.p8" "$RUNNER_TEMP/ExportOptions.plist"
+          rmdir "$HOME/.appstoreconnect/private_keys" "$HOME/.appstoreconnect" 2>/dev/null || true

@@ -1,0 +1,10 @@
+{
+  "extName": {
+    "message": "Portefeuille QNet",
+    "description": "Extension name in the browser and the store."
+  },
+  "extDescription": {
+    "message": "Portefeuille QNet post-quantique (ML-DSA-65) avec compte Solana. Active un nœud QNet Light ou Super et inscrit le nœud Light.",
+    "description": "Store and extensions-page description, at most 132 characters."
+  }
+}

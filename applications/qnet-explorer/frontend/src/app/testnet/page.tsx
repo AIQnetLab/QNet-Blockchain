@@ -1,6 +1,27 @@
 'use client';
 
-import { useState } from 'react';
+// The testnet faucet: 1,500 test 1DEV and 0.005 test SOL on Solana devnet to the address entered, enough for a wallet
+// to send the activation's 1DEV and SOL to a payment address of My node, whose card links here ("Get them to your
+// wallet"). The card hands over the connected wallet's Solana address without a URL (src/lib/faucet-handover.ts):
+// the field is filled in once, and nothing is sent before the visitor presses the button. It also hands over the faucet
+// pass the site gave for the QNet wallet being activated, sent with the claims (SITE M-13). A refused claim names the
+// time to try again.
+
+import { useEffect, useState } from 'react';
+import Link from 'next/link';
+import { retryAt, takeHandedOver, takeHandedPass } from '@/lib/faucet-handover';
+
+// Test SOL a claim asks for: the payment address's SOL and its 1DEV account's rent, with the wallet's network fees.
+const FAUCET_SOL = 0.005;
+
+const TIME = new Intl.DateTimeFormat('en', { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
+const DAY_TIME = new Intl.DateTimeFormat('en', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
+
+// " Try again at 14:05." (the day too when it is not within the next twelve hours); empty when no time is known.
+function tryAgain(at: number | null, now: number): string {
+  if (at === null) return '';
+  return ` Try again at ${at - now < 12 * 3_600_000 ? TIME.format(at) : DAY_TIME.format(at)}.`;
+}
 
 export default function TestnetPage() {
   const [lastFaucetClaim, setLastFaucetClaim] = useState<number | null>(null);
@@ -11,10 +32,24 @@ export default function TestnetPage() {
   const [errorMessage, setErrorMessage] = useState('');
   const [devTxHash, setDevTxHash] = useState('');
   const [solTxHash, setSolTxHash] = useState('');
+  const [sentText, setSentText] = useState('');
+  // The address came from My node's payment card: the success note leads back there.
+  const [fromNode, setFromNode] = useState(false);
+  // The faucet pass from My node, for the claims of the wallet being activated.
+  const [faucetPass, setFaucetPass] = useState<string | null>(null);
+
+  useEffect(() => {
+    const handed = takeHandedOver();
+    if (handed) {
+      setFaucetAddress(handed);
+      setFromNode(true);
+    }
+    setFaucetPass(takeHandedPass());
+  }, []);
 
   const handleFaucetClaim = async () => {
     if (!faucetAddress.trim()) {
-      alert('Please enter a valid testnet address');
+      setErrorMessage('Enter a Solana address first.');
       return;
     }
 
@@ -31,33 +66,41 @@ export default function TestnetPage() {
 
     try {
       const address = faucetAddress.trim();
+      const withPass = faucetPass ? { pass: faucetPass } : {};
 
       const [devResponse, solResponse] = await Promise.all([
         fetch('/api/faucet/claim', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ walletAddress: address, amount: 1500, tokenType: '1DEV' }),
+          body: JSON.stringify({ walletAddress: address, amount: 1500, tokenType: '1DEV', ...withPass }),
         }),
         fetch('/api/faucet/claim', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ walletAddress: address, amount: 0.001, tokenType: 'SOL' }),
+          body: JSON.stringify({ walletAddress: address, amount: FAUCET_SOL, tokenType: 'SOL', ...withPass }),
         }),
       ]);
 
       const [devData, solData] = await Promise.all([devResponse.json(), solResponse.json()]);
+      const answered = Date.now();
+      const devRetry = devData.success ? null : retryAt(devData, answered);
+      const solRetry = solData.success ? null : retryAt(solData, answered);
 
       if (devData.success || solData.success) {
         setLastFaucetClaim(now);
         setDevTxHash(devData.txHash || '');
         setSolTxHash(solData.txHash || '');
+        // Name only what was sent: one of the two claims can fail while the other goes through.
+        setSentText(`${[devData.success && '1,500 1DEV', solData.success && `${FAUCET_SOL} SOL`].filter(Boolean).join(' + ')} sent to your address`);
         setShowSuccessAlert(true);
         setFaucetAddress('');
-        if (!devData.success) setErrorMessage('1DEV: ' + (devData.error || 'failed'));
-        if (!solData.success) setErrorMessage('SOL: ' + (solData.error || 'failed'));
+        if (!devData.success) setErrorMessage('1DEV: ' + (devData.error || 'failed') + tryAgain(devRetry, answered));
+        if (!solData.success) setErrorMessage('SOL: ' + (solData.error || 'failed') + tryAgain(solRetry, answered));
       } else {
         const err = [devData.error, solData.error].filter(Boolean).join(' | ') || 'Failed to send tokens. Please try again.';
-        setErrorMessage(err);
+        // Both refused: the time both may go again.
+        const both = devRetry !== null && solRetry !== null ? Math.max(devRetry, solRetry) : devRetry ?? solRetry;
+        setErrorMessage(err + tryAgain(both, answered));
       }
     } catch (error) {
       setErrorMessage('Network error. Please check your connection.');
@@ -77,11 +120,11 @@ export default function TestnetPage() {
         </div>
 
         <div style={{ maxWidth: '1000px', margin: '0 auto' }}>
-          <div className="explorer-card" style={{ padding: 'clamp(1.25rem, 5vw, 3rem)' }}>
+          <div className="explorer-card" id="faucet" style={{ padding: 'clamp(1.25rem, 5vw, 3rem)', scrollMarginTop: '90px' }}>
             <div className="card-header" style={{ marginBottom: '2rem', textAlign: 'center', flexDirection: 'column', alignItems: 'center' }}>
               <h3 style={{ fontSize: '1.8rem', marginBottom: '1rem' }}>Token Faucet</h3>
               <div className="faucet-heading" style={{ fontSize: '1.1rem', color: '#e5e5e5', lineHeight: '1.5' }}>
-                Get 1,500 1DEV tokens + 0.001 SOL for QNet node activation testing
+                Get 1,500 1DEV tokens + {FAUCET_SOL} SOL for QNet node activation testing
               </div>
             </div>
 
@@ -114,6 +157,12 @@ export default function TestnetPage() {
               </button>
             </div>
             
+            {fromNode && (
+              <p style={{ marginTop: '1rem', color: '#bdeff2', fontSize: '0.95rem' }}>
+                Your wallet&apos;s Solana address from My node is filled in. Check it, then press the button.
+              </p>
+            )}
+
             {errorMessage && (
               <div style={{
                 marginTop: '1rem',
@@ -189,7 +238,7 @@ export default function TestnetPage() {
             }}>
               <h3 style={{ color: '#00ffff', marginBottom: '1rem' }}>Tokens sent!</h3>
               <p style={{ color: '#e5e5e5', marginBottom: '1rem' }}>
-                1,500 1DEV + 0.001 SOL have been sent to your address
+                {sentText}
               </p>
               {devTxHash && (
                 <div style={{
@@ -246,6 +295,13 @@ export default function TestnetPage() {
               >
                 OK
               </button>
+              {fromNode && (
+                <p style={{ marginTop: '1rem' }}>
+                  <Link href="/node/activate" style={{ color: '#00ffff', textDecoration: 'underline' }}>
+                    Back to your activation on My node
+                  </Link>
+                </p>
+              )}
             </div>
           </div>
         )}

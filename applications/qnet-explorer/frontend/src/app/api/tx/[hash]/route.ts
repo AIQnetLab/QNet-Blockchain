@@ -101,7 +101,7 @@ export async function GET(
 ) {
   // Rate limiting
   const clientId = getClientIdentifier(request);
-  const rateLimitResult = rateLimit(clientId, RATE_LIMIT_MAX, RATE_LIMIT_WINDOW);
+  const rateLimitResult = rateLimit(`tx:${clientId}`, RATE_LIMIT_MAX, RATE_LIMIT_WINDOW);
   
   if (!rateLimitResult.allowed) {
     return NextResponse.json({

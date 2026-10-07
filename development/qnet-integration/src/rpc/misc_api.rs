@@ -142,7 +142,7 @@ lazy_static::lazy_static! {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(super) struct LightNodeInfo {
     pub node_id: String,
-    pub devices: Vec<LightNodeDevice>, // Up to 3 mobile devices
+    pub devices: Vec<LightNodeDevice>, // The node's one device (A15); empty after an unbind
     pub quantum_pubkey: String,
     pub registered_at: u64,
     pub last_ping: u64,
@@ -174,10 +174,147 @@ pub(super) struct FcmTokenSyncRequest {
     /// Absent from a pre-upgrade sender ⇒ receiver stamps arrival time (legacy behavior).
     #[serde(default)]
     pub(super) ts:         Option<u64>,
+    /// The binding sequence the record belongs to (U8). Absent from a legacy record.
+    #[serde(default)]
+    pub(super) seq:        Option<u64>,
+    /// The device's own signatures behind a v2 record (H5), so the receiver re-verifies it instead
+    /// of trusting whoever reached the route. Required for a node with a v2 binding.
+    #[serde(default)]
+    pub(super) proof:      Option<TokenSyncProof>,
+    /// A legacy record's writer (`light_binding::record_writer` of the wallet key the genesis that took
+    /// it accepted it under). Absent from a v2 record and from an older sender.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) writer:     Option<String>,
+    /// The bound device's platform hint a v2 record's bind named ("android", "ios"): unsigned and display-only.
+    /// Absent from a record that names none (a token refresh keeps the stored one) and from an older sender.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) platform:   Option<String>,
+    /// The bound device's model hint a v2 record's bind named (`light_binding::model_hint`), as `platform`:
+    /// unsigned, display-only, absent when none and from an older sender, ignored by an older receiver.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) model:      Option<String>,
+}
+
+/// The signed facts behind a v2 push record: the binding (identity key, ping key, v2 delegation) and
+/// either the wallet key's attach or the ping key's token refresh over this exact push target.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub(crate) struct TokenSyncProof {
+    pub(crate) identity_pubkey: String,
+    pub(crate) ping_pubkey:     String,
+    /// `v2.{seq}.{sig}`
+    pub(crate) delegation_cert: String,
+    /// "attach" (signed by the wallet key) or "refresh" (signed by the ping key).
+    pub(crate) kind:            String,
+    pub(crate) sig:             String,
+    pub(crate) sig_ts:          u64,
+}
+
+/// The client for genesis-to-genesis internal calls. Each genesis's HTTPS name is pinned to its
+/// address in the binary's table, so a call reaches that very host over TLS with no DNS lookup, and
+/// over IPv4: the receiver's allowlist knows the genesis nodes by those addresses.
+fn genesis_internal_client() -> &'static reqwest::Client {
+    static C: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    C.get_or_init(|| {
+        let mut b = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .connect_timeout(std::time::Duration::from_secs(3));
+        for (ip, _) in crate::genesis_constants::GENESIS_NODE_IPS {
+            let addr = format!("{}:443", ip).parse::<std::net::SocketAddr>();
+            if let (Some(name), Ok(addr)) = (crate::genesis_constants::genesis_https_name_for_ip(ip), addr) {
+                b = b.resolve(name, addr);
+            }
+        }
+        b.build().unwrap_or_default()
+    })
+}
+
+/// How a genesis-to-genesis call may leave TLS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PlainFallback {
+    /// TLS only: a pull whose answer this node applies, and every device-layer route. Anyone on the path
+    /// can make TLS fail, so a fallback would hand them the answer or the request in clear (NB-3, ND-3).
+    Never,
+    /// Plain HTTP when the connection to 443 could not be made or timed out (a host whose terminator is
+    /// down), or the host answered 403 over TLS (a terminator that passed no caller address). Never after a
+    /// TLS or certificate error. Logged at WARN.
+    OnConnectFailure,
+}
+
+/// A failed HTTPS attempt that may retry in plain HTTP: a timeout, or a connection the transport refused,
+/// reset or dropped. A TLS or certificate failure (surfaced as an I/O error of another kind) never is.
+pub(crate) fn plain_fallback_allowed(e: &reqwest::Error) -> bool {
+    if e.is_timeout() {
+        return true;
+    }
+    if !e.is_connect() {
+        return false;
+    }
+    let mut src: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(e);
+    while let Some(s) = src {
+        if let Some(io) = s.downcast_ref::<std::io::Error>() {
+            use std::io::ErrorKind::*;
+            return matches!(io.kind(), ConnectionRefused | ConnectionReset | ConnectionAborted | NotConnected
+                | AddrNotAvailable | TimedOut);
+        }
+        src = s.source();
+    }
+    false
+}
+
+/// Call a genesis peer's internal route (H5) over its HTTPS name, so push tokens and the device's proofs do
+/// not cross the internet in clear; a plain retry only as `PlainFallback::OnConnectFailure` allows. `path`
+/// starts with `/`.
+pub(crate) async fn genesis_internal_call(
+    ip: &str,
+    path: &str,
+    build: impl Fn(&reqwest::Client, &str) -> reqwest::RequestBuilder,
+) -> reqwest::Result<reqwest::Response> {
+    genesis_internal_call_with(ip, path, PlainFallback::OnConnectFailure, build).await
+}
+
+/// `genesis_internal_call` over TLS only (`PlainFallback::Never`).
+pub(crate) async fn genesis_internal_call_tls(
+    ip: &str,
+    path: &str,
+    build: impl Fn(&reqwest::Client, &str) -> reqwest::RequestBuilder,
+) -> reqwest::Result<reqwest::Response> {
+    genesis_internal_call_with(ip, path, PlainFallback::Never, build).await
+}
+
+async fn genesis_internal_call_with(
+    ip: &str,
+    path: &str,
+    fallback: PlainFallback,
+    build: impl Fn(&reqwest::Client, &str) -> reqwest::RequestBuilder,
+) -> reqwest::Result<reqwest::Response> {
+    let client = genesis_internal_client();
+    let Some(name) = crate::genesis_constants::genesis_https_name_for_ip(ip) else {
+        // An address with no HTTPS name in the binary's table is no genesis: nothing to protect over TLS.
+        return build(client, &format!("http://{}:8001{}", ip, path)).send().await;
+    };
+    match build(client, &format!("https://{}{}", name, path)).send().await {
+        Ok(r) if r.status() != reqwest::StatusCode::FORBIDDEN || fallback == PlainFallback::Never => return Ok(r),
+        Ok(r) => if crate::node::is_warn() {
+            println!("[WARN][LIGHT] genesis_internal_downgrade ip={} path={} status={} fallback=plain", ip, path, r.status());
+        },
+        Err(e) if fallback == PlainFallback::OnConnectFailure && plain_fallback_allowed(&e) => if crate::node::is_warn() {
+            println!("[WARN][LIGHT] genesis_internal_downgrade ip={} path={} err={} fallback=plain", ip, path, e);
+        },
+        Err(e) => {
+            if crate::node::is_warn() {
+                println!("[WARN][LIGHT] genesis_internal_https_failed ip={} path={} err={} fallback=none", ip, path, e);
+            }
+            return Err(e);
+        }
+    }
+    build(client, &format!("http://{}:8001{}", ip, path)).send().await
 }
 
 /// Fire-and-forget: broadcast a newly-registered FCM token to all peer genesis nodes
 /// so every genesis node can send FCM pings regardless of which one took the registration.
+/// A v2 record carries its binding sequence and proof; a legacy one carries neither, only the writer
+/// it was accepted under (empty when not known).
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn sync_fcm_token_to_genesis_peers(
     pseudonym: &str,
     token:     &str,
@@ -185,12 +322,14 @@ pub(super) async fn sync_fcm_token_to_genesis_peers(
     endpoint:  Option<&str>,
     our_ip:    &str,
     ts:        u64,
+    seq:       u64,
+    proof:     Option<TokenSyncProof>,
+    writer:    &str,
+    platform:  &str,
+    model:     &str,
 ) {
     use crate::genesis_constants::GENESIS_NODE_IPS;
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-        .unwrap_or_default();
+    const SYNC_PATH: &str = "/api/v1/internal/fcm-token-sync";
 
     let body = FcmTokenSyncRequest {
         pseudonym: pseudonym.to_string(),
@@ -199,22 +338,47 @@ pub(super) async fn sync_fcm_token_to_genesis_peers(
         endpoint:  endpoint.map(|s| s.to_string()),
         origin_ip: our_ip.to_string(),
         ts:        Some(ts),
+        seq:       (seq > 0).then_some(seq),
+        writer:    (seq == 0 && proof.is_none() && !writer.is_empty()).then(|| writer.to_string()),
+        platform:  (seq > 0 && !platform.is_empty()).then(|| platform.to_string()),
+        model:     (seq > 0 && !model.is_empty()).then(|| model.to_string()),
+        proof,
     };
 
+    // A record without a proof is taken on the sender's address alone, so it goes over TLS only (L-1); a failed
+    // peer heals through its own pull (`fcm-token-get`). A v2 record carries the device's signatures, which the
+    // receiver checks: while the roll leaves a genesis whose TLS terminator passes no caller address, it may still
+    // retry in plain HTTP (logged at WARN).
+    let body_ref = &body;
+    let send = move |ip: &'static str| async move {
+        if body_ref.proof.is_some() {
+            genesis_internal_call(ip, SYNC_PATH, |c, url| c.post(url).json(body_ref)).await
+        } else {
+            genesis_internal_call_tls(ip, SYNC_PATH, |c, url| c.post(url).json(body_ref)).await
+        }
+    };
+
+    // A peer that has not applied the node's registration yet cannot check a v2 record and refuses it
+    // as not_registered; the block reaches it within seconds (a promoted pending binding is sent the
+    // moment this genesis applies it), so those peers get one more try.
+    let mut behind: Vec<&'static str> = Vec::new();
     for (ip, _id) in GENESIS_NODE_IPS {
         // Skip self
         if *ip == our_ip || ip.is_empty() { continue; }
 
-        let url = format!("http://{}:8001/api/v1/internal/fcm-token-sync", ip);
-        match client.post(&url).json(&body).send().await {
+        match send(*ip).await {
             Ok(resp) if resp.status().is_success() => {
                 if crate::node::is_info() {
                     println!("[INFO][LIGHT] fcm_token_synced_to ip={} pseudonym={}", ip, pseudonym);
                 }
             }
             Ok(resp) => {
+                let status = resp.status();
+                let reason = resp.json::<serde_json::Value>().await.ok()
+                    .and_then(|v| v["reason"].as_str().map(|r| r.to_string())).unwrap_or_default();
+                if reason == "not_registered" && body.proof.is_some() { behind.push(*ip); }
                 if crate::node::is_warn() {
-                    println!("[WARN][LIGHT] fcm_token_sync_rejected ip={} status={}", ip, resp.status());
+                    println!("[WARN][LIGHT] fcm_token_sync_rejected ip={} status={} reason={}", ip, status, reason);
                 }
             }
             Err(e) => {
@@ -222,6 +386,14 @@ pub(super) async fn sync_fcm_token_to_genesis_peers(
                     println!("[WARN][LIGHT] fcm_token_sync_failed ip={} err={}", ip, e);
                 }
             }
+        }
+    }
+    if behind.is_empty() { return; }
+    tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+    for ip in behind {
+        let ok = send(ip).await.map_or(false, |r| r.status().is_success());
+        if crate::node::is_info() {
+            println!("[INFO][LIGHT] fcm_token_sync_retry ip={} pseudonym={} ok={}", ip, pseudonym, ok);
         }
     }
 }
@@ -248,62 +420,168 @@ pub(super) async fn handle_internal_fcm_token_sync(
         ));
     }
 
-    if req.token.is_empty() || req.pseudonym.is_empty() {
-        return Ok(warp::reply::with_status(
-            warp::reply::json(&serde_json::json!({"success": false, "error": "Missing fields"})),
-            warp::http::StatusCode::BAD_REQUEST,
-        ));
-    }
-
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-    let incoming_ts = req.ts.unwrap_or(now);
-
-    // LWW merge: an older incoming record must never clobber a newer local one — that is
-    // exactly how a pinger ended up holding a stale push channel and silently never waking
-    // the device. Equal ts (re-broadcast of the same record) is applied idempotently.
-    if let Some((_, _, _, stored_ts)) = blockchain.get_storage().get_fcm_record(&req.pseudonym) {
-        if incoming_ts < stored_ts {
-            if crate::node::is_debug() {
-                println!("[DBG][LIGHT] fcm_sync_stale_ignored pseudonym={} incoming_ts={} stored_ts={}",
-                         req.pseudonym, incoming_ts, stored_ts);
-            }
-            return Ok(warp::reply::with_status(
-                warp::reply::json(&serde_json::json!({"success": true, "applied": false, "reason": "stale"})),
-                warp::http::StatusCode::OK,
-            ));
-        }
-    }
-
-    match blockchain.get_storage().save_fcm_token(
-        &req.pseudonym,
-        &req.token,
-        &req.push_type,
-        req.endpoint.as_deref(),
-        incoming_ts,
-    ) {
-        Ok(()) => {
-            // Update in-memory push_type so ping service uses FCM immediately
-            // (without waiting for node restart / update_device_tokens_from_storage)
-            if let Some(p2p) = blockchain.get_unified_p2p() {
-                p2p.update_light_node_push_type(&req.pseudonym, &req.push_type, now);
-            }
+    let p2p = blockchain.get_unified_p2p();
+    let (status, body) = match apply_token_sync(&blockchain.get_storage(), p2p.as_deref(), &req, now) {
+        SyncOutcome::Applied => {
             if crate::node::is_info() {
-                println!("[INFO][LIGHT] fcm_token_synced_from ip={} pseudonym={} push={}",
-                         caller_ip, req.pseudonym, req.push_type);
+                println!("[INFO][LIGHT] fcm_token_synced_from ip={} pseudonym={} push={} seq={}",
+                         caller_ip, req.pseudonym, req.push_type, req.seq.unwrap_or(0));
             }
-            Ok(warp::reply::with_status(
-                warp::reply::json(&serde_json::json!({"success": true})),
-                warp::http::StatusCode::OK,
-            ))
+            (warp::http::StatusCode::OK, serde_json::json!({"success": true}))
         }
-        Err(e) => {
-            println!("[WARN][LIGHT] fcm_token_sync_save_failed pseudonym={} err={}", req.pseudonym, e);
-            Ok(warp::reply::with_status(
-                warp::reply::json(&serde_json::json!({"success": false, "error": "internal error"})),
-                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
-            ))
+        // An older record than the stored one: never clobbers it. That is exactly how a pinger ended
+        // up holding a stale push channel and silently never waking the device.
+        SyncOutcome::Stale(reason) => {
+            if crate::node::is_debug() {
+                println!("[DBG][LIGHT] fcm_sync_stale_ignored pseudonym={} reason={}", req.pseudonym, reason);
+            }
+            (warp::http::StatusCode::OK, serde_json::json!({"success": true, "applied": false, "reason": reason}))
         }
+        SyncOutcome::Refused(reason) => {
+            if crate::node::is_warn() {
+                println!("[WARN][LIGHT] fcm_sync_refused ip={} pseudonym={} reason={}", caller_ip, req.pseudonym, reason);
+            }
+            let code = if reason == "storage" { warp::http::StatusCode::INTERNAL_SERVER_ERROR } else { warp::http::StatusCode::BAD_REQUEST };
+            (code, serde_json::json!({"success": false, "error": reason, "reason": reason}))
+        }
+    };
+    Ok(warp::reply::with_status(warp::reply::json(&body), status))
+}
+
+/// What a token sync did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SyncOutcome {
+    Applied,
+    Stale(&'static str),
+    Refused(&'static str),
+}
+
+/// Merge a peer genesis's push record. A legacy record (no proof) is taken only for a node that never
+/// had a v2 binding, last writer wins by `ts` as before. A v2 record is re-verified from the device's
+/// own signatures - identity under the chain commitment, the v2 delegation, and the attach or token
+/// refresh over this exact push target - then applied binding first, so a newer binding reaches this
+/// genesis together with its token, and ordered by `(seq, ts)`: a replaced device's record never
+/// comes back (U8).
+pub(super) fn apply_token_sync(
+    storage: &crate::storage::Storage,
+    p2p: Option<&crate::unified_p2p::SimplifiedP2P>,
+    req: &FcmTokenSyncRequest,
+    now: u64,
+) -> SyncOutcome {
+    use crate::light_binding as lb;
+    let node = req.pseudonym.as_str();
+    if node.is_empty() { return SyncOutcome::Refused("missing_fields"); }
+    let pt = lb::canonical_push_type(Some(req.push_type.as_str()));
+    let ts = req.ts.unwrap_or(now);
+    // The endpoint is where this genesis POSTs on each push and wake: the check the taking genesis ran,
+    // run again here, whatever form the record comes in.
+    if pt == "unifiedpush" && req.endpoint.as_deref().map_or(false, |e| !e.is_empty() && validate_unified_push_endpoint(e).is_err()) {
+        return SyncOutcome::Refused("bad_endpoint");
+    }
+    let written = match &req.proof {
+        None => {
+            // A legacy UnifiedPush registration may carry its endpoint and no token.
+            let endpoint_only = pt == "unifiedpush" && req.endpoint.as_deref().map_or(false, |e| !e.is_empty());
+            if req.token.is_empty() && !endpoint_only { return SyncOutcome::Refused("missing_fields"); }
+            if storage.get_light_binding(node).map_or(false, |b| !b.never_v2()) {
+                return SyncOutcome::Refused("proof_required");
+            }
+            // Under the writer the sending genesis accepted it under: a legacy row here takes only its own.
+            storage.save_fcm_token_by(node, &req.token, pt, req.endpoint.as_deref(), ts, req.writer.as_deref().unwrap_or(""))
+                .map(|w| (w, 0u64))
+        }
+        Some(p) => {
+            // Checked against the registration's commitment, which this genesis may not hold yet.
+            if !storage.is_node_registration_onchain(node) { return SyncOutcome::Refused("not_registered"); }
+            let seq = match req.seq { Some(s) if s > 0 => s, _ => return SyncOutcome::Refused("bad_proof") };
+            if lb::parse_cert(&p.delegation_cert).and_then(|f| f.seq()) != Some(seq) {
+                return SyncOutcome::Refused("bad_proof");
+            }
+            let identity = match storage.resolve_light_identity_pk(node, Some(&p.identity_pubkey)) {
+                Some(k) if k.eq_ignore_ascii_case(&p.identity_pubkey) => k,
+                _ => return SyncOutcome::Refused("identity_mismatch"),
+            };
+            if lb::verify_delegation(&p.delegation_cert, &p.ping_pubkey, node, &identity).is_none() {
+                return SyncOutcome::Refused("bad_proof");
+            }
+            // A v2 record keeps exactly what its message signs: the token for FCM, the endpoint for
+            // UnifiedPush, nothing for polling; an unsigned extra field is dropped, not stored.
+            let token = if pt == "fcm" { req.token.as_str() } else { "" };
+            let endpoint = if pt == "unifiedpush" { req.endpoint.as_deref().filter(|e| !e.is_empty()) } else { None };
+            let target = lb::push_target(pt, token, endpoint);
+            let signed = match p.kind.as_str() {
+                "attach" => lb::attach_v2_message(node, &p.ping_pubkey, target, seq, p.sig_ts)
+                    .map_or(false, |m| verify_mobile_dilithium_signature(&m, &p.sig, &identity)),
+                "refresh" => verify_mobile_dilithium_signature(
+                    &lb::token_refresh_v2_message(node, target, seq, p.sig_ts), &p.sig, &p.ping_pubkey),
+                _ => false,
+            };
+            if !signed { return SyncOutcome::Refused("bad_proof"); }
+            match storage.save_light_ping_keys_identity(node, &p.ping_pubkey, &p.delegation_cert, &identity) {
+                Ok(w) if w.holds() => {}
+                Ok(_) => return SyncOutcome::Stale("stale_seq"),
+                Err(_) => return SyncOutcome::Refused("storage"),
+            }
+            // Ordered by the signed time of the message that set it, as at the genesis that took it:
+            // the unsigned `ts` of the request plays no part in a v2 record.
+            let platform = lb::platform_hint(req.platform.as_deref());
+            let model = lb::model_hint(req.model.as_deref());
+            storage.save_fcm_token_seq_platform(node, token, pt, endpoint, p.sig_ts, seq, platform, model)
+                .map(|w| (w, seq))
+
+        }
+    };
+    match written {
+        Ok((true, _)) => {
+            if let Some(p2p) = p2p {
+                p2p.refresh_light_node_push_channel(storage, node);
+            }
+            SyncOutcome::Applied
+        }
+        Ok((false, 0)) => SyncOutcome::Stale("stale"),
+        Ok((false, _)) => SyncOutcome::Stale("stale_seq"),
+        Err(_) => SyncOutcome::Refused("storage"),
+    }
+}
+
+/// A push record this shard owner pulled from a peer genesis to heal its own (the peer served the
+/// device's attestation, so its channel is live). It carries no proof, so it is taken only for the
+/// binding this node already holds - a v2 record at exactly the stored sequence - or, for a node with
+/// no v2 binding, a legacy record, under the writer the peer kept (a legacy row here takes only its own).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_pulled_push_record(
+    storage: &crate::storage::Storage,
+    p2p: Option<&crate::unified_p2p::SimplifiedP2P>,
+    node_id: &str, token: &str, push_type: &str, endpoint: Option<&str>, ts: u64, seq: u64, writer: &str,
+) -> bool {
+    let binding = storage.get_light_binding(node_id);
+    let current = binding.as_ref().filter(|b| !b.never_v2()).map(|b| b.seq);
+    let admissible = match current {
+        Some(s) => s > 0 && seq == s,
+        None => seq == 0,
+    };
+    if !admissible || (token.is_empty() && endpoint.map_or(true, |e| e.is_empty())) { return false; }
+    // A stamp from the future would pin the channel: every later refresh of this binding reads as older.
+    if ts > crate::light_device::now_secs().saturating_add(crate::light_binding::FRESH_TS_WINDOW_SECS) { return false; }
+    let pt = crate::light_binding::canonical_push_type(Some(push_type));
+    if pt == "unifiedpush" && endpoint.map_or(false, |e| !e.is_empty() && validate_unified_push_endpoint(e).is_err()) {
+        return false;
+    }
+    let written = if seq == 0 {
+        storage.save_fcm_token_by(node_id, token, pt, endpoint, ts, writer)
+    } else {
+        storage.save_fcm_token_seq(node_id, token, pt, endpoint, ts, seq)
+    };
+    match written {
+        Ok(true) => {
+            if let Some(p2p) = p2p {
+                p2p.refresh_light_node_push_channel(storage, node_id);
+            }
+            true
+        }
+        _ => false,
     }
 }
 
@@ -329,11 +607,12 @@ pub(super) async fn handle_internal_fcm_token_get(
             warp::http::StatusCode::BAD_REQUEST,
         )),
     };
-    match blockchain.get_storage().get_fcm_record(node_id) {
-        Some((token, push_type, endpoint, ts)) => Ok(warp::reply::with_status(
+    match blockchain.get_storage().get_fcm_entry(node_id).filter(|e| !e.token.is_empty() || e.endpoint.is_some()) {
+        Some(e) => Ok(warp::reply::with_status(
             warp::reply::json(&serde_json::json!({
-                "success": true, "token": token, "push_type": push_type,
-                "endpoint": endpoint.unwrap_or_default(), "ts": ts,
+                "success": true, "token": e.token, "push_type": e.push_type,
+                "endpoint": e.endpoint.unwrap_or_default(), "ts": e.updated_at, "seq": e.seq,
+                "writer": e.writer,
             })),
             warp::http::StatusCode::OK,
         )),
@@ -344,10 +623,11 @@ pub(super) async fn handle_internal_fcm_token_get(
     }
 }
 
-/// The internal genesis-to-genesis endpoints answer only the other genesis nodes and this host.
-fn is_genesis_peer_ip(caller_ip: &str) -> bool {
+/// The internal genesis-to-genesis endpoints answer only the other genesis nodes (U16). Not loopback: a
+/// request through this host's TLS terminator is its client (the X-Forwarded-For the terminator
+/// appends), and one that arrives as loopback is a terminator that passed no client on, i.e. the public.
+pub(super) fn is_genesis_peer_ip(caller_ip: &str) -> bool {
     crate::genesis_constants::GENESIS_NODE_IPS.iter().any(|(ip, _)| *ip == caller_ip)
-        || caller_ip == "127.0.0.1" || caller_ip == "::1"
 }
 
 /// Handler: GET /api/v1/internal/light-ping-keys-get?node_id=X
@@ -367,22 +647,36 @@ pub(super) async fn handle_internal_light_ping_keys_get(
     }
     let node_id = params.get("node_id").map(|s| s.as_str()).unwrap_or("");
     let storage = blockchain.get_storage();
-    let row = storage.get_light_ping_keys(node_id)
-        .filter(|(_, cert)| !cert.is_empty())
-        .zip(storage.light_ping_identity(node_id));
-    Ok(match row {
-        Some(((ping_pubkey, cert), identity)) => warp::reply::with_status(
-            warp::reply::json(&serde_json::json!({
-                "success": true, "ping_pubkey": ping_pubkey,
-                "ping_delegation_cert": cert, "identity_pubkey": identity,
-            })),
-            warp::http::StatusCode::OK,
-        ),
+    let answer = storage.get_light_binding(node_id).and_then(|b| light_ping_keys_answer(&b));
+    Ok(match answer {
+        Some(v) => warp::reply::with_status(warp::reply::json(&v), warp::http::StatusCode::OK),
         None => warp::reply::with_status(
             warp::reply::json(&serde_json::json!({"success": false, "error": "not_found"})),
             warp::http::StatusCode::OK,
         ),
     })
+}
+
+/// What the identity pull serves of a binding row: a bound device's key, delegation and the identity it
+/// was proven under (the sequence rides in the cert, `v2.{seq}.{sig}`; the puller applies it under the
+/// binding order), or a withdrawn row's floor with its unbind (the device's, or the wallet key's with
+/// `"signer": "wallet"`), which a genesis that missed the unbind re-verifies and takes
+/// (`light_unbind::pulled_unbind`). Anything else is not served.
+pub(crate) fn light_ping_keys_answer(b: &crate::light_binding::BindingRow) -> Option<serde_json::Value> {
+    if b.identity_pubkey.is_empty() { return None; }
+    if !b.ping_pubkey.is_empty() && !b.cert.is_empty() {
+        return Some(serde_json::json!({
+            "success": true, "ping_pubkey": b.ping_pubkey,
+            "ping_delegation_cert": b.cert, "identity_pubkey": b.identity_pubkey,
+            "seq": b.seq, "floor": b.floor, "v2": b.v2, "bound_at": b.bound_at,
+        }));
+    }
+    let u = b.unbind.as_ref().filter(|_| b.v2 && b.floor > 0)?;
+    Some(serde_json::json!({
+        "success": true, "ping_pubkey": "", "ping_delegation_cert": "", "identity_pubkey": b.identity_pubkey,
+        "seq": 0, "floor": b.floor, "v2": true, "bound_at": 0,
+        "unbind": u.to_json(),
+    }))
 }
 
 /// Public endpoint: POST /api/v1/light-node/token-refresh
@@ -398,6 +692,11 @@ pub(super) struct TokenRefreshRequest {
     pub(super) endpoint:     Option<String>,
     pub(super) signature:    String,   // "ping_dilithium:" + Dilithium sign of "token_refresh:{node_id}:{timestamp}"
     pub(super) timestamp:    u64,
+    /// v2 (U7): the binding sequence. With it the ping key signs
+    /// `{chain_tag}token_refresh:{node_id}:{hex(sha3(push_target))}:{seq}:{timestamp}`, binding the
+    /// token itself; without it the legacy preimage, accepted only while the node has no v2 binding.
+    #[serde(default)]
+    pub(super) seq:          Option<u64>,
 }
 pub(super) fn default_fcm_str() -> String { "fcm".to_string() }
 
@@ -709,6 +1008,8 @@ pub(super) async fn handle_reputation_history(
 /// Generate quantum-secure activation code with XOR-encrypted wallet
 /// CRITICAL: Must match bridge-server.py format for decrypt compatibility!
 /// Format: QNET-{type+timestamp}-{encrypted_wallet1}-{encrypted_wallet2+entropy}
+/// The reference generator the contract KATs check (activation_code_kat_tests); no route calls it.
+#[cfg(test)]
 pub(super) async fn generate_quantum_activation_code(
     request: &GenerateActivationCodeRequest,
 ) -> Result<String, String> {
@@ -833,6 +1134,15 @@ pub(super) async fn handle_token_info(
             if is_token {
                 let decimals: u8 = if std_type == "qrc721" { 0 }
                     else { storage.get("decimals").and_then(|d| d.parse::<u8>().ok()).unwrap_or(9) };
+                // From the tx_target_bound gate a deploy records its block height, and its time is that
+                // block's producer-signed timestamp; a contract deployed earlier keeps the tx timestamp.
+                // A header point read: rebuilding the body would pull every tx of that block per request.
+                let deployed_height = storage.get("deployed_height").and_then(|h| h.parse::<u64>().ok());
+                let deployed_at = match deployed_height {
+                    Some(h) => blockchain.get_storage().block_timestamp_at(h).ok().flatten()
+                        .map(|ts| ts.to_string()).unwrap_or_default(),
+                    None => storage.get("deployed_at").cloned().unwrap_or_default(),
+                };
                 Ok(warp::reply::json(&json!({
                     "success": true,
                     "token": {
@@ -853,7 +1163,8 @@ pub(super) async fn handle_token_info(
                         "total_minted": storage.get("total_minted").and_then(|s| s.parse::<u128>().ok()).unwrap_or(0).to_string(),
                         "total_burned": storage.get("total_burned").and_then(|s| s.parse::<u128>().ok()).unwrap_or(0).to_string(),
                         "deployer": storage.get("deployer").cloned().unwrap_or_default(),
-                        "deployed_at": storage.get("deployed_at").cloned().unwrap_or_default()
+                        "deployed_at": deployed_at,
+                        "deployed_height": deployed_height
                     },
                     "source": "blockchain_state"
                 })))
@@ -1173,19 +1484,20 @@ pub(super) struct BenchmarkStartRequest {
     /// Note: ML-DSA-65 is ~50x slower than Ed25519; expect ~1-2K TPS per core.
     #[serde(default)]
     pub(super) use_pq: Option<bool>,
-    /// v10.0: Authentication secret (must match QNET_BENCHMARK_SECRET env var)
+    /// Must match QNET_BENCHMARK_SECRET (the `X-Benchmark-Secret` header may carry it instead).
     #[serde(default)]
     pub(super) secret: Option<String>,
 }
 
-/// Handle GET /api/v1/benchmark/status (v10.0: rate-limited)
+/// Handle GET /api/v1/benchmark/status (the secret in `X-Benchmark-Secret`; see `benchmark_admit`)
 pub(super) async fn handle_benchmark_status(
+    secret: Option<String>,
     remote_addr: Option<std::net::SocketAddr>,
 ) -> Result<impl Reply, Rejection> {
     use crate::benchmark::BENCHMARK_MANAGER;
 
-    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "benchmark") {
-        return Ok(rate_limit_response);
+    if let Some(refused) = benchmark_admit(remote_addr, secret.as_deref(), "status") {
+        return Ok(refused);
     }
 
     let status = BENCHMARK_MANAGER.get_status().await;
@@ -1204,14 +1516,15 @@ pub(super) async fn handle_benchmark_status(
     })))
 }
 
-/// Handle GET /api/v1/benchmark/results (v10.0: rate-limited)
+/// Handle GET /api/v1/benchmark/results (the secret in `X-Benchmark-Secret`)
 pub(super) async fn handle_benchmark_results(
+    secret: Option<String>,
     remote_addr: Option<std::net::SocketAddr>,
 ) -> Result<impl Reply, Rejection> {
     use crate::benchmark::BENCHMARK_MANAGER;
 
-    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "benchmark") {
-        return Ok(rate_limit_response);
+    if let Some(refused) = benchmark_admit(remote_addr, secret.as_deref(), "results") {
+        return Ok(refused);
     }
 
     let results = BENCHMARK_MANAGER.get_results().await;
@@ -1234,24 +1547,15 @@ pub(super) async fn handle_benchmark_results(
     })))
 }
 
-/// Handle POST /api/v1/benchmark/stop (v10.0: auth + rate-limited)
+/// Handle POST /api/v1/benchmark/stop (the secret in `X-Benchmark-Secret`)
 pub(super) async fn handle_benchmark_stop(
+    secret: Option<String>,
     remote_addr: Option<std::net::SocketAddr>,
 ) -> Result<impl Reply, Rejection> {
     use crate::benchmark::BENCHMARK_MANAGER;
 
-    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "benchmark") {
-        return Ok(rate_limit_response);
-    }
-    // v10.0: Require QNET_BENCHMARK_SECRET for stop (same as start)
-    if let Some(_expected_secret) = std::env::var("QNET_BENCHMARK_SECRET").ok() {
-        // Stop requires auth but has no body — only allow from genesis nodes or internal IPs
-        let ip_str = remote_addr.map(|a| a.ip().to_string()).unwrap_or_default();
-        let is_genesis = std::env::var("QNET_BOOTSTRAP_ID").is_ok();
-        if !is_genesis && !is_internal_ip(&ip_str) {
-            println!("[WARN][RPC] benchmark_stop_rejected ip={} reason=unauthorized", ip_str);
-            return Ok(warp::reply::json(&json!({"success": false, "error": "unauthorized"})));
-        }
+    if let Some(refused) = benchmark_admit(remote_addr, secret.as_deref(), "stop") {
+        return Ok(refused);
     }
 
     BENCHMARK_MANAGER.stop().await;
@@ -1269,12 +1573,13 @@ pub(super) async fn handle_benchmark_stop(
     })))
 }
 
-/// Handle GET /api/v1/benchmark/presets (v10.0: rate-limited)
+/// Handle GET /api/v1/benchmark/presets (the secret in `X-Benchmark-Secret`)
 pub(super) async fn handle_benchmark_presets(
+    secret: Option<String>,
     remote_addr: Option<std::net::SocketAddr>,
 ) -> Result<impl Reply, Rejection> {
-    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "benchmark") {
-        return Ok(rate_limit_response);
+    if let Some(refused) = benchmark_admit(remote_addr, secret.as_deref(), "presets") {
+        return Ok(refused);
     }
     Ok(warp::reply::json(&json!({
         "success": true,
@@ -1325,4 +1630,99 @@ pub(super) async fn handle_benchmark_presets(
         "formula": "TPS = shards × 50,000",
         "max_theoretical": "12.8M TPS (256 shards × 50K)"
     })))
+}
+
+#[cfg(test)]
+mod internal_call_tests {
+    use super::*;
+
+    /// NB-3 / ND-3: a genesis-to-genesis call retried in plain HTTP after ANY failure over TLS, so anyone on the
+    /// path downgraded it by breaking the handshake. Only a connection that could not be made may retry; a
+    /// TLS failure never does (and the TLS-only routes never retry at all).
+    #[tokio::test]
+    async fn only_a_failed_connection_may_retry_in_plain_http() {
+        let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(5)).build().expect("client");
+        let refused_port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            l.local_addr().expect("addr").port()
+        };
+        let e = client.get(format!("https://127.0.0.1:{}/", refused_port)).send().await.expect_err("nothing listens");
+        assert!(plain_fallback_allowed(&e), "a refused connection may retry: {:?}", e);
+
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = l.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            while let Ok((mut s, _)) = l.accept().await {
+                let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await;
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            }
+        });
+        let e = client.get(format!("https://127.0.0.1:{}/", port)).send().await.expect_err("not TLS");
+        assert!(!plain_fallback_allowed(&e), "a TLS failure never retries in clear: {:?}", e);
+    }
+
+    /// NB-3: a pulled push record stamped in the future pinned the channel (every later refresh read as
+    /// older); it is refused, and one stamped now is taken.
+    #[test]
+    fn a_pulled_push_record_from_the_future_is_refused() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let s = crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage");
+        let node = "light_mobile_nb3pull";
+        let now = crate::light_device::now_secs();
+        assert!(!apply_pulled_push_record(&s, None, node, "tok_forged", "fcm", None, u64::MAX, 0, ""));
+        assert!(!apply_pulled_push_record(&s, None, node, "tok_forged", "fcm", None, now + 3_600, 0, ""));
+        assert!(apply_pulled_push_record(&s, None, node, "tok_real", "fcm", None, now, 0, ""));
+        assert_eq!(s.get_fcm_entry(node).map(|e| e.token), Some("tok_real".to_string()));
+    }
+
+    /// L-1: a push record without a proof (trusted by its sender's address alone) and an unbind cross between the
+    /// genesis nodes over TLS only; only a record carrying the device's signatures may still retry in plain HTTP.
+    #[test]
+    fn the_token_and_unbind_syncs_never_send_an_unproven_record_in_clear() {
+        let src = include_str!("misc_api.rs");
+        let sync = &src[src.find("pub(super) async fn sync_fcm_token_to_genesis_peers(").unwrap()..];
+        let sync = &sync[..sync.find("pub(super) async fn handle_internal_fcm_token_sync(").unwrap()];
+        let proven = sync.find("if body_ref.proof.is_some() {").expect("the proof decides");
+        let plain = sync.find("genesis_internal_call(ip, SYNC_PATH").expect("the v2 path");
+        let tls = sync.find("genesis_internal_call_tls(ip, SYNC_PATH").expect("the TLS-only path");
+        assert!(proven < plain && plain < tls);
+        assert_eq!(sync.matches("genesis_internal_call(").count(), 1, "one call site, behind the proof");
+        assert_eq!(sync.matches("send(").count(), 2, "both rounds go through it");
+        let unbind = include_str!("light_unbind.rs");
+        let unbind = &unbind[unbind.find("pub(super) async fn sync_unbind_to_genesis_peers(").unwrap()..];
+        let unbind = &unbind[..unbind.find("\n}\n").unwrap()];
+        assert!(unbind.contains("genesis_internal_call_tls(ip, PATH") && !unbind.contains("genesis_internal_call(ip"));
+    }
+}
+
+#[cfg(test)]
+mod activation_code_kat_tests {
+    use super::*;
+
+    /// PX-03: qnet-link-v1 names this generator the reference for the activation code, with KATs in its
+    /// vectors; nothing held the generator or the stateless decoder to them. Both KATs (the burner's Solana
+    /// address, the wallet's own address) reproduce here, decode to their address, and refuse another.
+    #[tokio::test]
+    async fn the_activation_code_matches_the_contract_kats() {
+        let v: Value = serde_json::from_str(include_str!("../../../../docs/protocols/qnet-link-v1.vectors.json"))
+            .expect("vectors parse");
+        for (kat, addr_key) in [("activationCodeKat", "solanaAddress"), ("walletActivationCodeKat", "qnetAddress")] {
+            let k = &v[kat];
+            let (addr, burn_tx) = (k[addr_key].as_str().unwrap(), k["burnTx"].as_str().unwrap());
+            let amount = k["burnAmount"].as_u64().unwrap();
+            let req = GenerateActivationCodeRequest {
+                wallet_address: addr.to_string(), burn_tx_hash: burn_tx.to_string(),
+                node_type: k["nodeType"].as_str().unwrap().to_string(), burn_amount: amount,
+            };
+            let code = generate_quantum_activation_code(&req).await.expect("code");
+            assert_eq!(code, k["code"].as_str().unwrap(), "{kat}");
+            let registry = &*GLOBAL_ACTIVATION_REGISTRY;
+            assert!(matches!(registry.verify_code_ownership_stateless(&code, addr, burn_tx, amount), Ok(true)), "{kat}");
+            let mut other = addr.as_bytes().to_vec();
+            other[0] = if other[0] == b'1' { b'2' } else { b'1' };
+            let other = String::from_utf8(other).unwrap();
+            assert!(matches!(registry.verify_code_ownership_stateless(&code, &other, burn_tx, amount), Ok(false)), "{kat}");
+        }
+    }
 }

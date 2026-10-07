@@ -40,9 +40,11 @@ impl SimplifiedP2P {
         let entries = tc_blob_structural(bytes);
         let (mut installed, mut rejected) = (0usize, 0usize);
         for (k, v) in entries {
-            match self.verify_timeout_certificate(v.height, v.timeout_round, v.anchor, &v.votes) {
+            let key = FailoverKey::legacy(k.0);
+            if !key.admissible() { rejected += 1; continue; }
+            match self.verify_timeout_certificate(key, v.timeout_round, v.anchor, &v.votes) {
                 Some(verified_votes) => {
-                    TIMEOUT_CERTIFICATES.insert(k, TimeoutProof {
+                    TIMEOUT_CERTIFICATES.insert((key, k.1), TimeoutProof {
                         height: v.height,
                         timeout_round: v.timeout_round,
                         anchor: v.anchor,
@@ -56,10 +58,29 @@ impl SimplifiedP2P {
         (installed, rejected)
     }
 
+    /// The same for the tenure-bound blob (`tcerts_v3`), through the same verifier.
+    pub fn rehydrate_timeout_certificates_v3_verified(&self, bytes: &[u8]) -> RehydrateCounts {
+        let (mut installed, mut rejected) = (0usize, 0usize);
+        for (key, round, v) in tc_blob_v3_structural(bytes) {
+            match self.verify_timeout_certificate(key, round, v.anchor, &v.votes) {
+                Some(verified_votes) => {
+                    TIMEOUT_CERTIFICATES.insert((key, round), TimeoutProof {
+                        height: key.window, timeout_round: round, anchor: v.anchor, votes: verified_votes,
+                    });
+                    installed += 1;
+                }
+                None => rejected += 1,
+            }
+        }
+        (installed, rejected)
+    }
+
     pub(super) fn verify_timeout_certificate(
-        &self, height: u64, timeout_round: u64, anchor: [u8; 32],
+        &self, key: FailoverKey, timeout_round: u64, anchor: [u8; 32],
         votes: &[SignedTimeoutVote],
     ) -> Option<Vec<SignedTimeoutVote>> {
+        // Committee and anchor are per WINDOW; the tenure enters only the signed payload.
+        let height = key.window;
         // Window-keyed committee + quorum (identical on every verifier). Anchor absent locally →
         // pull + defer (sender/requester paths retransmit); NEVER signature-only post-genesis.
         let committee = match failover_committee_for_window(height) {
@@ -89,13 +110,13 @@ impl SimplifiedP2P {
         // frame carries genuine evidence; iterating the set would let a forged frame buy
         // quorum-many ML-DSA verifies, which is the amplification this gate exists to stop.
         let authenticated = by_voter.values().next().map_or(false, |v| {
-            let msg = timeout_vote_message(height, timeout_round, &anchor,
-                                           v.high_qc_idx, &v.high_qc_hash, v.tip_height, &v.tip_hash);
+            let msg = timeout_vote_message_for(key, timeout_round, &anchor,
+                                               v.high_qc_idx, &v.high_qc_hash, v.tip_height, &v.tip_hash);
             self.verify_timeout_vote_signature(&v.voter_id, &msg, &v.signature)
         });
         if !authenticated {
             if crate::node::is_warn() {
-                println!("[WARN][TC] unauthenticated mb={} round={} action=drop", height, timeout_round);
+                println!("[WARN][TC] unauthenticated {} round={} action=drop", key, timeout_round);
             }
             return None;
         }
@@ -116,27 +137,42 @@ impl SimplifiedP2P {
         let verified: Vec<SignedTimeoutVote> = candidates
             .into_par_iter()
             .filter(|v| {
-                let msg = timeout_vote_message(height, timeout_round, &anchor,
-                                               v.high_qc_idx, &v.high_qc_hash,
-                                               v.tip_height, &v.tip_hash);
+                let msg = timeout_vote_message_for(key, timeout_round, &anchor,
+                                                   v.high_qc_idx, &v.high_qc_hash,
+                                                   v.tip_height, &v.tip_hash);
                 self.verify_timeout_vote_signature(&v.voter_id, &msg, &v.signature)
             })
             .collect();
         if verified.len() < quorum { None } else { Some(verified) }
     }
 
+    /// A window-only certificate (v2).
     pub(super) fn handle_timeout_proof_broadcast(&self, height: u64, timeout_round: u64,
                                        anchor: Vec<u8>, votes: Vec<SignedTimeoutVote>) {
+        self.handle_timeout_proof_broadcast_keyed(FailoverKey::legacy(height), timeout_round, anchor, votes);
+    }
+
+    /// The single acceptance path for a certificate under `key`. A key the gate does not admit is refused
+    /// here: from the gate a window-only certificate cannot say which tenure it rotates.
+    pub(super) fn handle_timeout_proof_broadcast_keyed(&self, key: FailoverKey, timeout_round: u64,
+                                       anchor: Vec<u8>, votes: Vec<SignedTimeoutVote>) {
+        let height = key.window;
         // Skip if we already have this proof
-        if TIMEOUT_CERTIFICATES.contains_key(&(height, timeout_round)) {
+        if TIMEOUT_CERTIFICATES.contains_key(&(key, timeout_round)) {
+            return;
+        }
+        if !key.admissible() {
+            if crate::node::is_debug() {
+                println!("[DBG][TIMEOUT] tc_key_inadmissible {} round={} action=drop", key, timeout_round);
+            }
             return;
         }
         // Never ACCEPT a TC for a left view — a node past window W ignores a certificate for an
         // earlier window (it cannot drive a reorg here); a genuinely-lagging node has a low floor
         // and still accepts it to advance.
-        if height < observed_tc_window_floor() {
+        if failover_key_left(key) {
             if crate::node::is_debug() {
-                println!("[DBG][TIMEOUT] tc_below_floor h={} floor={} action=drop", height, observed_tc_window_floor());
+                println!("[DBG][TIMEOUT] tc_below_floor {} floor={} action=drop", key, observed_tc_window_floor());
             }
             return;
         }
@@ -145,9 +181,9 @@ impl SimplifiedP2P {
         // Dilithium verify in verify_timeout_certificate, so a peer cannot cycle timeout_round to
         // unbounded novel keys (each bypassing the dedup above) and force an unbounded verify storm —
         // this path is reachable with UNVERIFIED block bytes via maybe_supersede's adopt.
-        if timeout_round > highest_certified_round_for(height).saturating_add(crate::node::MAX_FAILOVER_ROUND) {
+        if timeout_round > certified_round_at(key).saturating_add(crate::node::MAX_FAILOVER_ROUND) {
             if crate::node::is_debug() {
-                println!("[DBG][TIMEOUT] tc_round_oob h={} round={} action=drop", height, timeout_round);
+                println!("[DBG][TIMEOUT] tc_round_oob {} round={} action=drop", key, timeout_round);
             }
             return;
         }
@@ -164,30 +200,30 @@ impl SimplifiedP2P {
 
         // Distinct committee signers ≥ quorum (dedup + committee filter + anchor re-derivation
         // inside) — a replayed vote, non-committee key, or forked anchor cannot advance the round.
-        let verified_votes = match self.verify_timeout_certificate(height, timeout_round, anchor_arr, &votes) {
+        let verified_votes = match self.verify_timeout_certificate(key, timeout_round, anchor_arr, &votes) {
             Some(v) => v,
             None => {
                 if crate::node::is_warn() {
-                    println!("[WARN][TIMEOUT] tc_rejected h={} round={} raw_votes={}",
-                             height, timeout_round, votes.len());
+                    println!("[WARN][TIMEOUT] tc_rejected {} round={} raw_votes={}",
+                             key, timeout_round, votes.len());
                 }
                 return;
             }
         };
         let signers = verified_votes.len();
 
-        TIMEOUT_CERTIFICATES.insert((height, timeout_round), TimeoutProof {
+        TIMEOUT_CERTIFICATES.insert((key, timeout_round), TimeoutProof {
             height, timeout_round, anchor: anchor_arr, votes: verified_votes,
         });
 
         // Tracker + view floor (prunes below-floor banked votes) — round advances only on a quorum.
-        HIGHEST_CERTIFIED_ROUND.entry(height)
+        HIGHEST_CERTIFIED_ROUND.entry(key)
             .and_modify(|cur| { if timeout_round > *cur { *cur = timeout_round; } })
             .or_insert(timeout_round);
-        evict_votes_below_certified(height);
+        evict_votes_below_certified(key);
 
         if crate::node::is_info() {
-            println!("[INFO][TC] certified mb={} round={} voters={} source=broadcast", height, timeout_round, signers);
+            println!("[INFO][TC] certified {} round={} voters={} source=broadcast", key, timeout_round, signers);
         }
     }
 
@@ -241,13 +277,26 @@ impl SimplifiedP2P {
     /// cert_mb) bounds the pull fan-out so cycling cert_mb cannot amplify.
     pub(crate) fn process_tc_claim(&self, cert_mb: u64, cert_round: u64) {
         if cert_mb == 0 && cert_round == 0 { return; }
+        if cert_round <= self.get_highest_certified_round(cert_mb) { return; }
+        self.pull_claimed_certificates(cert_mb, cert_round);
+    }
+
+    /// A tenure-bound claim (TimeoutVoteV3): compared with this node's round for the same key, and pulled
+    /// through the same budget. The request range is still windows.
+    pub(crate) fn process_tc_claim_v3(&self, window: u64, tenure: u64, cert_round: u64) {
+        let key = FailoverKey { window, tenure };
+        if cert_round == 0 || key.is_legacy() || !key.admissible() { return; }
+        if cert_round <= certified_round_at(key) { return; }
+        self.pull_claimed_certificates(window, cert_round);
+    }
+
+    fn pull_claimed_certificates(&self, cert_mb: u64, cert_round: u64) {
         // Sanity bound: a real TC only exists for a producible window (≤ local tip + throttle slack);
         // a far-future cert_mb is fabricated and un-pullable.
         let local_w = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed) / 90;
         // Same horizon as production and the view ceiling above.
         if cert_mb > local_w.saturating_add(
             crate::node::BlockchainNode::MAX_DERIVED_ROSTER_WINDOWS as u64 + 1) { return; }
-        if cert_round <= self.get_highest_certified_round(cert_mb) { return; }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
         // GLOBAL token bucket: ≤ TC_CLAIM_PULLS_PER_SEC SyncInfo-driven pulls/sec regardless of how
@@ -270,23 +319,23 @@ impl SimplifiedP2P {
         self.request_timeout_proofs(cert_mb, cert_mb);
     }
 
-    /// #80: adopt a 2f+1 TimeoutProof attached to a round>0 microblock. Verifies + stores it via the
-    /// SAME path as a gossiped proof (distinct committee signers ≥ quorum), advancing
+    /// #80: adopt a 2f+1 TimeoutProof attached to a round>0 microblock at `height`. Verifies + stores it
+    /// via the SAME path as a gossiped proof (distinct committee signers ≥ quorum), advancing
     /// HIGHEST_CERTIFIED_ROUND so ingest authorises the block in-band — no dependence on the separate
     /// TC broadcast. Self-authenticating: a forged/insufficient proof is rejected inside and advances
-    /// nothing (the block then falls to the pull path). Idempotent (dedup on (mb_idx, round)).
-    pub fn adopt_timeout_proof_bytes(&self, bytes: &[u8]) {
-        let proof: TimeoutProof = match bincode::deserialize(bytes) {
-            Ok(p) => p,
-            Err(_) => return,
-        };
-        // DoS bound: the proof is excluded from the block hash, so a relay can swap it. The round
-        // committee is <=1000, so a proof with more votes is malformed — drop it before the O(votes)
-        // dedup/verify loop (verify_timeout_certificate would reject it anyway on the quorum check).
-        const MAX_TC_VOTES: usize = 2048;
-        if proof.votes.len() > MAX_TC_VOTES { return; }
-        self.handle_timeout_proof_broadcast(proof.height, proof.timeout_round,
-                                            proof.anchor.to_vec(), proof.votes);
+    /// nothing (the block then falls to the pull path). Idempotent (dedup on (key, round)).
+    /// From the gate the bytes are a `TimeoutProofV3`, and only one certified for the carrying block's
+    /// own tenure is taken: a certificate for another tenure authorises nothing at this height.
+    pub fn adopt_timeout_proof_bytes_at(&self, height: u64, bytes: &[u8]) {
+        match decode_block_timeout_proof(height, bytes) {
+            Some((key, round, anchor, votes)) =>
+                self.handle_timeout_proof_broadcast_keyed(key, round, anchor.to_vec(), votes),
+            None => {
+                if crate::node::is_debug() {
+                    println!("[DBG][TIMEOUT] block_proof_refused h={} action=ignore", height);
+                }
+            }
+        }
     }
 
     /// Handle request for timeout proofs (for syncing nodes)
@@ -305,23 +354,38 @@ impl SimplifiedP2P {
         PROOF_SERVE_LAST.retain(|_, t| now.saturating_sub(*t) < 300);
 
         let to_height = to_height.min(from_height.saturating_add(MAX_PROOFS as u64));
+        // Window-only certificates answer in the v2 response, tenure-bound ones in the v3 response, up to
+        // MAX_PROOFS each: a node below the gate never receives a frame it cannot parse for a range it asked.
         let mut certificates = Vec::new();
+        let mut certificates_v3 = Vec::new();
         for entry in TIMEOUT_CERTIFICATES.iter() {
-            if certificates.len() >= MAX_PROOFS { break; }
-            let (h, _r) = entry.key();
-            if *h >= from_height && *h <= to_height {
-                certificates.push(entry.value().clone());
+            if certificates.len() >= MAX_PROOFS && certificates_v3.len() >= MAX_PROOFS { break; }
+            let (k, _r) = entry.key();
+            if k.window >= from_height && k.window <= to_height {
+                if k.is_legacy() {
+                    if certificates.len() < MAX_PROOFS { certificates.push(entry.value().clone()); }
+                } else if certificates_v3.len() < MAX_PROOFS {
+                    certificates_v3.push(TimeoutProofV3::from_held(*k, entry.value()));
+                }
             }
         }
 
-        if certificates.is_empty() {
+        let mut responses = Vec::new();
+        if !certificates.is_empty() {
+            responses.push(NetworkMessage::TimeoutCertificatesResponse {
+                certificates,
+                sender_id: self.node_id.clone(),
+            });
+        }
+        if !certificates_v3.is_empty() {
+            responses.push(NetworkMessage::TimeoutCertificatesV3Response {
+                certificates: certificates_v3,
+                sender_id: self.node_id.clone(),
+            });
+        }
+        if responses.is_empty() {
             return;
         }
-
-        let response_msg = NetworkMessage::TimeoutCertificatesResponse {
-            certificates,
-            sender_id: self.node_id.clone(),
-        };
 
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let quic_transport = self.quic_transport.clone();
@@ -342,16 +406,27 @@ impl SimplifiedP2P {
                     Err(_) => return,
                 };
                 let t = transport.read().await;
-                let _ = t.send_message(quic_addr, &response_msg).await;
+                for response_msg in &responses {
+                    let _ = t.send_message(quic_addr, response_msg).await;
+                }
             });
         }
     }
-    
+
     /// Handle response with timeout proofs
     pub(super) fn handle_timeout_proof_response(&self, certificates: Vec<TimeoutProof>) {
         for proof in certificates {
             self.handle_timeout_proof_broadcast(proof.height, proof.timeout_round,
                                                 proof.anchor.to_vec(), proof.votes);
+        }
+    }
+
+    /// Handle response with tenure-bound timeout proofs.
+    pub(super) fn handle_timeout_proof_response_v3(&self, certificates: Vec<TimeoutProofV3>) {
+        for proof in certificates.into_iter().take(16) {
+            let key = proof.key();
+            if key.is_legacy() { continue; }
+            self.handle_timeout_proof_broadcast_keyed(key, proof.timeout_round, proof.anchor.to_vec(), proof.votes);
         }
     }
     
@@ -652,12 +727,12 @@ impl SimplifiedP2P {
         let current_mb_index = current_height / 90;
         let min_mb = current_mb_index.saturating_sub(20);
 
-        TIMEOUT_VOTES.retain(|(h, _), _| *h >= min_mb);
-        TIMEOUT_CERTIFICATES.retain(|(h, _), _| *h >= min_mb);
-        HIGHEST_CERTIFIED_ROUND.retain(|h, _| *h >= min_mb);
+        TIMEOUT_VOTES.retain(|(k, _), _| k.window >= min_mb);
+        TIMEOUT_CERTIFICATES.retain(|(k, _), _| k.window >= min_mb);
+        HIGHEST_CERTIFIED_ROUND.retain(|k, _| k.window >= min_mb);
         // v15.11: per-mb baseline rounds share retention with HIGHEST_*_ROUND.
         LAST_FINALIZED_ROUND_PER_MB.retain(|h, _| *h >= min_mb);
-        TIMEOUT_VOTED_HEIGHTS.retain(|h, _| *h >= min_mb);
+        TIMEOUT_VOTED_HEIGHTS.retain(|k, _| k.window >= min_mb);
 
         // ═══════════════════════════════════════════════════════════════════
         // v23 / v23.1: prune microblock-rotation-related DashMaps under the
@@ -673,7 +748,7 @@ impl SimplifiedP2P {
         //     - 3` (with an extra 3-round safety margin for views that
         //     started during the boundary transition between mbs).
         // ═══════════════════════════════════════════════════════════════════
-        crate::node::LAST_TIMEOUT_EMIT_PER_MB.retain(|h, _| *h >= min_mb);
+        crate::node::LAST_TIMEOUT_EMIT_PER_MB.retain(|k, _| k.window >= min_mb);
         let min_leadership_round = min_mb
             .saturating_mul(90)
             .saturating_div(crate::node::ROTATION_INTERVAL_BLOCKS)

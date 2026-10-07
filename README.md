@@ -53,23 +53,34 @@ contracts at your own risk. See [SECURITY.md](SECURITY.md) for how to report a v
 | Chain data | Stores and serves chain state, and may take on archival duty | Stores no blocks, headers or state |
 | Producer eligibility | From `ACTIVATION_WARMUP_BLOCKS = 180` blocks past its registration height; genesis identities are eligible immediately | Not applicable |
 | Reward eligibility | On-chain heartbeat subwindow popcount >= 9 for the epoch and never banned | Per-epoch eligibility bitmaps published on chain by genesis nodes |
-| Where it runs | Servers and desktops, via Docker | Mobile devices, inside the wallet app; at most 3 devices per Light node |
-| Registration | Created server-side by the node itself | Created client-side by the mobile wallet |
+| Where it runs | Servers and desktops, via Docker | A phone or tablet, inside QNet Wallet; one device per Light node, which passes the system's device check |
+| Registration | Created server-side by the node itself | Submitted by the aiqnet.io node cabinet or the browser extension; the wallet signs its consent in QNet Wallet or the extension |
 
 Five pinned genesis identities (`genesis_node_001` through `genesis_node_005`) form the consensus
 committee at network start, and the committee is sampled from the on-chain roster thereafter.
 
 ## Node activation
 
-Running a node requires an activation code, obtained by paying the network's entry cost. Two
-phases exist. In Phase 1 the payment is a burn of the external 1DEV token on Solana; the price is
+A node is registered on the network after its owner pays the network's entry cost. Two phases
+exist. In Phase 1 the payment is a burn of the external 1DEV token on Solana; the price is
 identical for both node types and falls as more of the 1DEV supply is burned, following
 `max(1500 - 150 x floor(burn% / 10), 300)` whole 1DEV. In Phase 2 the payment is QNC transferred
 on-chain rather than burned, with base costs of 10,000 QNC for a Light node and 7,500 QNC for a
 Super node before a network-size multiplier. The transition happens when 90% of the 1DEV supply
 has been burned or five years have passed since the genesis block, whichever comes first; Phase 1
-is the active path today. Every burn is cryptographically bound to one node identity and
-re-verified by every node that validates a block carrying it. See
+is the active path today. The Phase 1 burn is made in one of two places, with one activation per wallet:
+the QNet browser extension burns with the wallet's own key, from its Activate tab or when the node
+cabinet at aiqnet.io/node asks it (`qnet_activateNode`); and the node cabinet itself, in a phone's or a
+computer's browser, burns with a one-time payment key it creates in the page, whose activation code
+names the wallet the burn is for. That payment key burns for a Light node only, once QNet Wallet has
+signed the wallet's reservation; a Super node is activated only in the extension. QNet Wallet on a
+phone or tablet signs the wallet's consent to the registration and links the node to its device, on a
+sheet a verified `link.aiqnet.io` link opens ([QNet Link](docs/protocols/qnet-link-v1.md) section 14). A burn yields
+an activation code. A Super node's server takes the code with the burn transaction and amount; a Light node
+needs no code of its own: its registration carries the burn, the wallet's consent and the owner bind, and its
+code is only a receipt. Every burn is
+cryptographically bound to one node identity and re-verified by every node that validates a block
+carrying it. See
 [docs/economics/node-activation.md](docs/economics/node-activation.md).
 
 ## Repository layout
@@ -97,13 +108,15 @@ invocation, from the repository root:
 ```bash
 docker build -f development/qnet-integration/Dockerfile.production -t qnet-production .
 
+printf %s "<your 12- or 24-word recovery phrase>" > ./qnet_seed && chmod 600 ./qnet_seed
+
 docker run -d --name my-qnet-node --restart=always \
   -e QNET_PRODUCTION=1 \
   -e DOCKER_ENV=1 \
   -e QNET_ACTIVATION_CODE="<your activation code>" \
   -e QNET_BURN_TX_HASH="<your Solana burn transaction signature>" \
   -e QNET_BURN_AMOUNT="<exact 1DEV amount burned>" \
-  -e QNET_WALLET_SEED="<your BIP39 mnemonic>" \
+  -v "$(pwd)/qnet_seed:/run/secrets/qnet_seed:ro" -e QNET_WALLET_SEED_FILE=/run/secrets/qnet_seed \
   -p 9876:9876 -p 9877:9877 -p 8001:8001 -p 10876:10876/udp \
   -v "$(pwd)/super_node_data:/app/data" \
   qnet-production
@@ -142,9 +155,15 @@ publishes, and makes the node retry that bind and exit rather than move to anoth
 | [docs/operators/running-a-node.md](docs/operators/running-a-node.md) | Installing and running a node |
 | [docs/operators/configuration.md](docs/operators/configuration.md) | Environment variables and ports |
 | [docs/operators/maintenance.md](docs/operators/maintenance.md) | Monitoring, upgrades, restart, recovery |
-| [docs/developers/rpc-api.md](docs/developers/rpc-api.md) | HTTP/RPC reference |
+| [docs/developers/overview.md](docs/developers/overview.md) | Where developers start: what exists, who talks to what, limits |
+| [docs/developers/dapp-integration.md](docs/developers/dapp-integration.md) | Connecting web pages to the QNet wallets |
+| [docs/developers/sign-in.md](docs/developers/sign-in.md) | Sign-in with a QNet wallet |
+| [docs/developers/transactions.md](docs/developers/transactions.md) | Transaction formats, gas, fees and status |
 | [docs/developers/smart-contracts.md](docs/developers/smart-contracts.md) | WASM contracts and token standards |
-| [docs/developers/sdk.md](docs/developers/sdk.md) | SDK and protocol definitions |
+| [docs/developers/sdk.md](docs/developers/sdk.md) | The `@aiqnet/sdk` developer kit |
+| [docs/developers/cli.md](docs/developers/cli.md) | The `qnet` command line |
+| [docs/developers/rpc-api.md](docs/developers/rpc-api.md) | HTTP/RPC reference |
+| [docs/developers/security.md](docs/developers/security.md) | Security rules for developers |
 | [docs/developers/1dev-burn-contract.md](docs/developers/1dev-burn-contract.md) | The Solana burn program used in Phase 1 activation |
 | [docs/applications/mobile-wallet.md](docs/applications/mobile-wallet.md) | Mobile wallet and Light node |
 | [docs/applications/browser-wallet.md](docs/applications/browser-wallet.md) | Browser extension wallet |

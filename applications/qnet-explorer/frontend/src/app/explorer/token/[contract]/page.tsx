@@ -1,9 +1,11 @@
 'use client';
 
 import React, { useState, useCallback, useEffect, useRef } from 'react';
-import Link from 'next/link';
+import ExplorerLink from '@/components/ExplorerLink';
 import { useParams } from 'next/navigation';
 import TokenIcon from '@/components/TokenIcon';
+import { useActivationContent } from '@/contexts/AppContext';
+import { txPartyLabel } from '@/lib/tx-labels';
 
 interface TokenTransfer {
   hash: string;
@@ -91,13 +93,15 @@ const CopyBtn = ({ text }: { text: string }) => {
 
 // Render an address as a link if it looks like an EON address.
 const AddrLink = ({ addr }: { addr: string }) => {
+  // A system account shown by name reads without its reward word in the app's view (src/lib/tx-labels.ts).
+  const full = useActivationContent();
   const isValid = addr && addr.length > 10 && addr.includes('eon');
   return isValid ? (
-    <Link href={`/explorer/address/${addr}`} className="address-link">
+    <ExplorerLink href={`/explorer/address/${addr}`} className="address-link">
       {truncate(addr, 6, 4)}
-    </Link>
+    </ExplorerLink>
   ) : (
-    <span className="address-link">{addr || 'N/A'}</span>
+    <span className="address-link">{txPartyLabel(addr || 'N/A', full)}</span>
   );
 };
 
@@ -364,9 +368,9 @@ export default function TokenPage() {
               {data.transfers.map((t, idx) => (
                 <tr key={`${t.hash}-${idx}`}>
                   <td>
-                    <Link href={`/explorer/tx/${t.hash}`} className="address-link">
+                    <ExplorerLink href={`/explorer/tx/${t.hash}`} className="address-link">
                       {truncate(t.hash, 6, 4)}
-                    </Link>
+                    </ExplorerLink>
                   </td>
                   <td>
                     <span className={`type-badge type-${t.method.toLowerCase()}`}>{t.method}</span>
@@ -381,9 +385,9 @@ export default function TokenPage() {
                   </td>
                   <td>{t.fee}</td>
                   <td>
-                    <Link href={`/explorer/block/${t.block}`} className="address-link">
+                    <ExplorerLink href={`/explorer/block/${t.block}`} className="address-link">
                       {t.block}
-                    </Link>
+                    </ExplorerLink>
                   </td>
                   <td>{formatTimeAgo(t.timestamp)}</td>
                 </tr>

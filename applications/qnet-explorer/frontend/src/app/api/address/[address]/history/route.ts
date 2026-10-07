@@ -14,7 +14,7 @@ const RATE_LIMIT_MAX = 120;
 const RATE_LIMIT_WINDOW = 60 * 1000;
 
 export async function GET(request: NextRequest, { params }: { params: Promise<{ address: string }> }) {
-  const rl = rateLimit(getClientIdentifier(request), RATE_LIMIT_MAX, RATE_LIMIT_WINDOW);
+  const rl = rateLimit(`history:${getClientIdentifier(request)}`, RATE_LIMIT_MAX, RATE_LIMIT_WINDOW);
   if (!rl.allowed) {
     return NextResponse.json({ success: false, error: 'Rate limit exceeded' }, { status: 429, headers: { 'Retry-After': String(Math.ceil((rl.resetTime - Date.now()) / 1000)) } });
   }

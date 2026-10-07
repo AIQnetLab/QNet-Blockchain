@@ -75,8 +75,8 @@ The QUIC listener binds IPv4. Pre-flight treats UDP 10876 as critical: if it is 
 | `QNET_ACTIVATION_CODE` | 25-character `QNET-...` activation code. Highest-priority activation source; a saved code in RocksDB is used only if this is unset. | none | `QNET-SXXXXX-YYYYYY-ZZZZZZ` |
 | `QNET_BURN_TX_HASH` | Solana signature of the 1DEV burn that backs the code. Also selects the exact transaction to verify instead of scanning the wallet's recent signatures. | none | `<solana_tx_signature>` |
 | `QNET_BURN_AMOUNT` | Whole 1DEV tokens burned. Part of the key material that decrypts the code, so it must match exactly. | `0` | `1500` |
-| `QNET_WALLET_SEED_FILE` | Path to a file holding the BIP39 mnemonic. Preferred over the inline form. | none | `/run/secrets/qnet_seed` |
-| `QNET_WALLET_SEED` | The mnemonic inline. The ML-DSA-65 consensus keypair is derived deterministically from it. | none | — |
+| `QNET_WALLET_SEED_FILE` | Path to a file holding the 12- or 24-word recovery phrase (mnemonic), in its canonical form: lowercase words on one line, single spaces. Preferred over the inline form. | none | `/run/secrets/qnet_seed` |
+| `QNET_WALLET_SEED` | The mnemonic inline, in the same canonical form. The ML-DSA-65 consensus keypair and the Solana address are derived deterministically from the text as written (trimmed only; the words and checksum are not checked), so any other spelling is another wallet. | none | — |
 | `QNET_GENESIS_SEED_FILE` / `QNET_GENESIS_SEED` | Same mechanism, consulted only when no wallet seed is present. | none | — |
 | `QNET_BOOTSTRAP_ID` | Genesis bootstrap identity, `001`–`005`. Reserved for the five pinned genesis nodes; any other value is rejected. Also selects the light-node shard this node owns — `00N` pings and commits the eligibility bitmap for shard `N-1` — and the two shards it backs up: first backup for `N-2`, second for `N-3` (mod 5). It pings a backed-up shard while every owner ranked above it has been silent for 600 s, and commits that shard's bitmap if no owner's bitmap has landed by its deadline: the owner may commit in the epoch's last 150 blocks, the first backup in the last 100, the second in the last 50. The five values must be distinct across the genesis set. See [economics](../economics/overview.md). | none | `001` |
 | `QNET_PRODUCTION` | `1` enables on-chain uniqueness checking of the activation code, Solana burn verification, and activation recording at startup. | unset | `1` |
@@ -170,8 +170,8 @@ These affect local CPU and memory allocation. Most defaults adapt to the detecte
 | Variable | Purpose | Notes |
 |----------|---------|-------|
 | `QNET_HALT_HEIGHT` | The node stops at this block height. | For coordinated upgrades. Meaningful only if the whole network agrees on the height; halting one node alone takes it offline. |
-| `QNET_ROLLBACK_TO_LAST_SEALED` | `1` (or `true`) rolls the stored chain back at boot, before state recovery, to the last height of the newest window this node holds sealed (a stored macroblock with a non-empty microblock list), searching the tip's window and the 8 below it. Blocks above that height are deleted, the macroblocks and certified pairs above it are retracted, this node's own vote commitments above it are dropped, and its anti-double-sign mark is lowered to the height it ends at. A target at or above the tip deletes no blocks but still retracts those markers and lowers the mark. With no sealed window in range the node logs `no_sealed_macroblock_found` and starts unchanged. | Fleet-wide recovery: set it on every node, start them together, then remove it — it acts again on every start it is present for. |
-| `QNET_ROLLBACK_TO_HEIGHT` | The same rollback to an explicit height, taking precedence over `QNET_ROLLBACK_TO_LAST_SEALED`. A target below the last sealed window logs `target_below_last_sealed` and discards certified blocks. | Same one-shot discipline. |
+| `QNET_ROLLBACK_TO_LAST_SEALED` | `1` (or `true`) rolls the stored chain back at boot, before state recovery, to this node's certified floor: the highest height it holds certified, either the highest sealed window whose full QC-named body list matches the stored bodies or the highest committed checkpoint head at or below the tip whose list matches, whichever is higher. A certificate is n−f signatures and irrevocable, so no rollback goes below it. Blocks above the floor are deleted, the macroblocks and certified pairs above it are retracted, this node's own vote commitments above it are dropped, and its anti-double-sign mark is lowered to the height it ends at. A floor at or above the tip deletes no blocks but still retracts those markers and lowers the mark. With nothing certified here the node logs `no_certified_point_found` and starts unchanged. | Fleet-wide recovery: set it on every node, start them together, then remove it — it acts again on every start it is present for. |
+| `QNET_ROLLBACK_TO_HEIGHT` | The same rollback to an explicit height, taking precedence over `QNET_ROLLBACK_TO_LAST_SEALED`. A target below the certified floor is refused: the node logs `[ERR][ROLLBACK] refused target=… certified_floor=… reason=certified_checkpoint_irrevocable` and starts unchanged. | Same one-shot discipline. |
 | `QNET_CLEAN_DATA` | `1` deletes the known data directories and peer cache at startup. | Destructive and unconfirmed. It runs before storage is opened, after the startup guards (restart manifest, container check, logger, clock plausibility). |
 | `QNET_FORCE_RESET` + `QNET_CONFIRM_RESET` | Resets stored chain height. Requires `QNET_FORCE_RESET=1` **and** `QNET_CONFIRM_RESET=YES`; either alone is refused. | Destructive; recovery procedure only. |
 
@@ -183,10 +183,11 @@ These affect local CPU and memory allocation. Most defaults adapt to the detecte
 |----------|--------|
 | `QNET_BYPASS_DOCKER_CHECK` | Allows the binary to run outside a container. |
 | `QNET_SKIP_RAM_CHECK` | Starts below the 4 GB memory floor. |
-| `QNET_DEV_MODE` | Relaxes CORS to allow any origin and permits additional HTTP methods. |
+| `QNET_DEV_MODE` | Adds PUT and DELETE to the CORS methods and `X-Requested-With` to its headers; any origin is allowed in every mode. |
+
 | `QNET_DEV_API_KEY` | Extra API key, honoured in debug builds. |
 | `QNET_BENCHMARK_MODE` | Prefunds a genesis set of 100 blake3-derived accounts at 10,000 QNC each and enlarges the mempool; the code logs `BENCHMARK_MODE_ACTIVE — NOT FOR PRODUCTION`. Genesis-creation only, and only on a chain that carries no value. |
-| `QNET_BENCHMARK_SECRET` | Shared secret gating the benchmark start/stop endpoints. |
+| `QNET_BENCHMARK_SECRET` | Shared secret, at least 16 characters, that enables every `/api/v1/benchmark/*` route and must come in each request's `X-Benchmark-Secret` header (`start` also takes the body's `secret`). Unset, every benchmark route answers `benchmark_disabled`, on a genesis node too; leave it unset on a production node. |
 | `QNET_LOADTEST_ACCOUNTS`, `QNET_LOADTEST_BALANCE_QNC`, `QNET_LOADTEST_ALLOW` | Pre-funds generated accounts at genesis; refused unless `QNET_LOADTEST_ALLOW` is set. Pre-funded public-key accounts are drainable — never on a value-bearing chain. |
 | `QNET_PEER_IPS` | Replaces peer discovery with a fixed list, pinning the node to a hand-written topology. |
 | `QNET_MANUAL_IP` | Supplies an IP for the genesis duplication and authorisation checks when detection fails. |
@@ -199,7 +200,7 @@ These affect local CPU and memory allocation. Most defaults adapt to the detecte
 
 ## Handling secrets
 
-Five values are secrets and must never appear in a committed file, a shell history, a support ticket or a log paste: the wallet mnemonic (`QNET_WALLET_SEED` / `QNET_GENESIS_SEED`), `QNET_ADMIN_SECRET`, `QNET_API_KEY_EXPLORER`, `QNET_API_KEY_ADMIN` and `QNET_KEY_ENCRYPTION_SECRET`. The activation code and burn transaction hash are not cryptographic secrets, but they identify your node licence and should be treated as private.
+Five values are secrets and must never appear in a committed file, a shell history, a support ticket or a log paste: the wallet mnemonic (`QNET_WALLET_SEED` / `QNET_GENESIS_SEED`), `QNET_ADMIN_SECRET`, `QNET_API_KEY_EXPLORER`, `QNET_API_KEY_ADMIN` and `QNET_KEY_ENCRYPTION_SECRET`. The activation code and burn transaction hash are not cryptographic secrets, but they identify your node's activation and should be treated as private.
 
 Practical guidance:
 

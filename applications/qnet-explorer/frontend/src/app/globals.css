@@ -114,6 +114,58 @@ main.qnet-container {
   text-shadow: 0 0 10px #00ffff; 
 }
 
+/* The header's Docs menu: a list under its button; inside the phone's menu, the same list in place. */
+.nav-menu {
+  position: relative;
+}
+.nav-menu-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.35rem;
+  font-family: inherit;
+}
+.nav-menu-caret {
+  font-size: 0.75em;
+  transition: transform 0.2s ease;
+}
+.nav-menu.open .nav-menu-caret {
+  transform: rotate(180deg);
+}
+.nav-menu-list {
+  position: absolute;
+  top: calc(100% + 0.75rem);
+  right: 0;
+  min-width: 13rem;
+  display: flex;
+  flex-direction: column;
+  padding: 0.5rem 0;
+  background: rgba(0, 0, 0, 0.95);
+  border: 1px solid rgba(0, 255, 255, 0.3);
+  border-radius: 10px;
+  box-shadow: 0 8px 32px rgba(0, 255, 255, 0.15);
+  z-index: 1001;
+}
+.nav-menu-list[hidden] {
+  display: none;
+}
+.nav-menu-link {
+  display: flex;
+  align-items: center;
+  box-sizing: border-box;
+  min-height: 44px;
+  padding: 0.6rem 1.25rem;
+  color: #f0f0f0;
+  font-weight: 500;
+  text-decoration: none;
+}
+.nav-menu-link:hover,
+.nav-menu-link:focus-visible,
+.nav-menu-link[aria-current='page'] {
+  color: #00ffff;
+  background: rgba(0, 255, 255, 0.08);
+}
+
 /* Footer */
 .qnet-footer { 
   background: rgba(0, 0, 0, 0.4); 
@@ -474,9 +526,23 @@ main.qnet-container {
   gap: 2rem;
 }
 
+/* Three columns on desktops, two on tablets, one on phones; minmax(0, 1fr) lets a column shrink below its longest word. */
 .technology-grid.expanded {
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 2.5rem;
+}
+
+@media (max-width: 1024px) {
+  .technology-grid.expanded {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 1.5rem;
+  }
+}
+
+@media (max-width: 600px) {
+  .technology-grid.expanded {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 
 .tech-item {
@@ -788,7 +854,7 @@ main.qnet-container {
 }
 
 @media (max-width: 768px) {
-  .qnet-nav, .action-buttons, .tabs-nav, .footer-content {
+  .action-buttons, .tabs-nav, .footer-content {
     flex-direction: column;
     gap: 1rem;
     text-align: center;
@@ -1411,101 +1477,8 @@ main.qnet-container {
   }
 }
 
-/* Mobile Phones */
+/* Mobile Phones (the header menu is in the 1200 px block below) */
 @media (max-width: 768px) {
-  /* Header & Navigation */
-  .qnet-header {
-    height: 60px;
-  }
-  .header-content {
-    justify-content: space-between;
-  }
-  .mobile-menu-button {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    background: rgba(0, 0, 0, 0.8);
-    border: 2px solid rgba(0, 255, 255, 0.5);
-    color: #00ffff;
-    width: 44px;
-    height: 44px;
-    border-radius: 8px;
-    font-size: 1.2rem;
-    cursor: pointer;
-    z-index: 1001;
-    transition: all 0.3s ease;
-    box-shadow: 0 0 10px rgba(0, 255, 255, 0.2);
-  }
-  .mobile-menu-button:hover {
-    background: rgba(0, 255, 255, 0.1);
-    border-color: #00ffff;
-    box-shadow: 0 0 20px rgba(0, 255, 255, 0.4);
-    transform: scale(1.05);
-  }
-  .qnet-nav {
-    display: none;
-    flex-direction: column;
-    position: absolute;
-    top: 60px;
-    left: 0;
-    right: 0;
-    width: 100vw;
-    background: rgba(0, 0, 0, 0.95);
-    backdrop-filter: blur(20px);
-    border-bottom: 2px solid rgba(0, 255, 255, 0.3);
-    padding: 1rem 0;
-    z-index: 999;
-    box-shadow: 0 8px 32px rgba(0, 255, 255, 0.15);
-  }
-  .qnet-nav.active {
-    display: flex;
-    animation: slideDown 0.3s ease-out;
-  }
-  @keyframes slideDown {
-    from {
-      opacity: 0;
-      transform: translateY(-10px);
-    }
-    to {
-      opacity: 1;
-      transform: translateY(0);
-    }
-  }
-  .nav-button {
-    padding: 1.2rem 1.5rem;
-    width: 100%;
-    text-align: center;
-    border-bottom: 1px solid rgba(0, 255, 255, 0.1);
-    transition: all 0.3s ease;
-    position: relative;
-    background: transparent;
-  }
-  .nav-button:hover {
-    background: rgba(0, 255, 255, 0.1);
-    color: #00ffff;
-    text-shadow: 0 0 10px rgba(0, 255, 255, 0.5);
-  }
-  .nav-button[data-state="active"] {
-    background: rgba(0, 255, 255, 0.15);
-    color: #00ffff;
-    text-shadow: 0 0 15px rgba(0, 255, 255, 0.8);
-  }
-  .nav-button:last-child {
-    border-bottom: none;
-  }
-  .header-right-desktop {
-    display: none;
-  }
-  .header-right-mobile {
-    display: block;
-    padding: 1rem;
-    margin-top: 0.5rem;
-  }
-  .header-right-mobile .qnet-button {
-    width: calc(100% - 2rem);
-    margin: 0 1rem;
-  }
-
   /* General Layout & Fonts */
   .hero-section { padding: 2rem 1rem; min-height: calc(100vh - 60px); }
   .features-section, .technology-section, .explorer-section { padding: 2rem 1rem; }
@@ -1581,6 +1554,29 @@ main.qnet-container {
   color: #d8d8d8; 
   flex: 1;
   text-align: right;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.25rem 1.25rem;
+}
+
+/* Privacy, Terms and Support: on every page, out of the header. */
+.footer-links {
+  display: flex;
+  gap: 1rem;
+}
+.footer-link {
+  display: inline-flex;
+  align-items: center;
+  min-height: 44px;
+  color: #bdeff2;
+  text-decoration: none;
+}
+.footer-link:hover,
+.footer-link:focus-visible {
+  color: #00ffff;
+  text-decoration: underline;
 }
 
 .social-links {
@@ -1643,11 +1639,6 @@ main.qnet-container {
 .activation-content {
   padding: 0.5rem 1.5rem 1.5rem;
   gap: 1rem;
-}
-
-.technology-grid.expanded { 
-  grid-template-columns: repeat(3, 1fr); /* Enforce 3 columns */
-  gap: 2.5rem; 
 }
 
 .page-home .technology-section .tech-item h4 {
@@ -1751,9 +1742,11 @@ a[href*="play.google.com"] img {
   }
 }
 
-/* == 2. MOBILE PHONES == */
-@media (max-width: 768px) {
-  /* --- Header & Mobile Navigation --- */
+/* == 2. HEADER MENU: tablets, phones and narrow windows == */
+/* The full bar (Explorer, My node, Wallet, Testnet, Docs and the wallet button, its longest label "Approve in
+   wallet…" included) needs about 800 px with the page's scrollbar; up to 860 px the links and the wallet button move
+   into the menu. */
+@media (max-width: 860px) {
   .qnet-header { height: 60px; }
   .header-content { justify-content: space-between; }
   .mobile-menu-button {
@@ -1778,14 +1771,20 @@ a[href*="play.google.com"] img {
     box-shadow: 0 0 20px rgba(0, 255, 255, 0.4);
     transform: scale(1.05);
   }
+  /* As wide as the header (left/right), and scrolls when it is taller than the screen below the header. */
   .qnet-nav {
     display: none;
     flex-direction: column;
+    gap: 1rem;
+    text-align: center;
     position: absolute;
     top: 60px;
     left: 0;
     right: 0;
-    width: 100vw;
+    max-height: calc(100vh - 60px);
+    max-height: calc(100dvh - 60px);
+    overflow-y: auto;
+    overscroll-behavior: contain;
     background: rgba(0, 0, 0, 0.95);
     backdrop-filter: blur(20px);
     border-bottom: 2px solid rgba(0, 255, 255, 0.3);
@@ -1827,10 +1826,29 @@ a[href*="play.google.com"] img {
     text-shadow: 0 0 15px rgba(0, 255, 255, 0.8);
   }
   .nav-button:last-child { border-bottom: none; }
+  .nav-menu { width: 100%; }
+  .nav-menu-button { width: 100%; }
+  .nav-menu-list {
+    position: static;
+    min-width: 0;
+    padding: 0;
+    border: none;
+    border-radius: 0;
+    box-shadow: none;
+    background: rgba(0, 255, 255, 0.04);
+  }
+  .nav-menu-link {
+    justify-content: center;
+    padding: 0.9rem 1.5rem;
+    border-bottom: 1px solid rgba(0, 255, 255, 0.1);
+  }
   .header-right-desktop { display: none; }
   .header-right-mobile { display: block; padding: 1rem; margin-top: 0.5rem; }
   .header-right-mobile .qnet-button { width: calc(100% - 2rem); margin: 0 1rem; }
+}
 
+/* == 3. MOBILE PHONES == */
+@media (max-width: 768px) {
   /* --- General Layout & Typography --- */
   .hero-section { padding: 2rem 1rem; min-height: calc(100vh - 60px); }
   .features-section, .technology-section, .explorer-section { padding: 2rem 1rem; }
@@ -1994,14 +2012,14 @@ a[href*="play.google.com"] img {
 
 .privacy-section ul {
   list-style: none;
-  padding-left: 0;
+  padding-inline-start: 0;
   margin: 1rem 0;
 }
 
 .privacy-section ul li {
   color: #dddddd;
   line-height: 1.8;
-  padding-left: 1.5rem;
+  padding-inline-start: 1.5rem;
   position: relative;
   margin-bottom: 0.5rem;
 }
@@ -2011,7 +2029,7 @@ a[href*="play.google.com"] img {
   color: #dddddd;
   font-weight: bold;
   position: absolute;
-  left: 0;
+  inset-inline-start: 0;
 }
 
 .privacy-section a {
@@ -2026,7 +2044,7 @@ a[href*="play.google.com"] img {
 }
 
 @media (max-width: 768px) {
-  .page-privacy .content-card {
+  .page-privacy .content-card, .page-terms .content-card, .page-support .content-card {
     padding: 2rem 1.5rem;
   }
   
@@ -3803,7 +3821,8 @@ a[href*="play.google.com"] img {
   .explorer-header { margin-bottom: 1rem; }
   .explorer-header h1 { font-size: 1.25rem; }
   .explorer-header p { font-size: 0.78rem; }
-  .explorer-search input { font-size: 0.82rem; padding: 0.7rem 0.8rem; }
+  /* 16 px and 44 px: iOS zooms into a smaller text field on focus */
+  .explorer-search input { font-size: 1rem; min-height: 44px; padding: 0.7rem 0.8rem; }
   .activity-header { padding: 0.6rem 0.75rem; flex-direction: column; align-items: flex-start; }
   .filter-chips { flex-wrap: wrap; }
   .filter-chip { font-size: 0.65rem; padding: 0.25rem 0.5rem; }
@@ -3818,8 +3837,8 @@ a[href*="play.google.com"] img {
   .explorer-header h1 { font-size: 1.1rem; }
   .explorer-header p { font-size: 0.7rem; }
   .explorer-search { margin: 0 auto 1rem; }
-  .explorer-search input { font-size: 0.75rem; padding: 0.6rem 0.6rem; }
-  .search-btn { padding: 0 0.6rem; }
+  .explorer-search input { font-size: 1rem; min-height: 44px; padding: 0.6rem 0.6rem; }
+  .search-btn { padding: 0 0.6rem; min-height: 44px; }
   .filter-chip { font-size: 0.6rem; padding: 0.2rem 0.4rem; }
 }
 
@@ -3917,4 +3936,1270 @@ a[href*="play.google.com"] img {
     font-size: 0.75rem;
   }
   .page-ellipsis { font-size: 0.75rem; }
+}
+/* --- Wallet connect (header) --- */
+.wallet-widget {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.wallet-button {
+  padding: 0.6rem 1.25rem;
+  font-size: 0.8rem;
+}
+.wallet-button:disabled {
+  opacity: 0.6;
+  cursor: default;
+  transform: none;
+  box-shadow: none;
+}
+.wallet-switch {
+  display: inline-flex;
+  border: 1px solid rgba(0, 255, 255, 0.4);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.wallet-switch button {
+  background: transparent;
+  border: 0;
+  color: #9adfe6;
+  padding: 0.4rem 0.7rem;
+  font-size: 0.75rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+.wallet-switch button.active {
+  background: rgba(0, 255, 255, 0.18);
+  color: #00ffff;
+}
+.wallet-address {
+  background: rgba(0, 255, 255, 0.08);
+  border: 1px solid rgba(0, 255, 255, 0.4);
+  border-radius: 6px;
+  color: #e8ffff;
+  padding: 0.4rem 0.75rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+.wallet-switch button:hover,
+.wallet-address:hover {
+  color: #00ffff;
+}
+.wallet-menu,
+.wallet-error {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  width: 320px;
+  max-width: calc(100vw - 2rem);
+  border-radius: 8px;
+  z-index: 1002;
+}
+.wallet-menu {
+  background: rgba(0, 0, 0, 0.95);
+  border: 1px solid rgba(0, 255, 255, 0.35);
+  padding: 0.9rem;
+  box-shadow: 0 8px 32px rgba(0, 255, 255, 0.15);
+}
+.wallet-menu-label {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #8aa;
+  margin-bottom: 0.35rem;
+}
+.wallet-menu-address {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.8rem;
+  color: #e8ffff;
+  word-break: break-all;
+  user-select: all;
+  margin-bottom: 0.75rem;
+}
+.wallet-menu-actions {
+  display: flex;
+  gap: 0.5rem;
+}
+.wallet-menu-actions .qnet-button {
+  flex: 1;
+  padding: 0.5rem 0.75rem;
+  font-size: 0.75rem;
+}
+.wallet-menu-note {
+  font-size: 0.75rem;
+  color: #ffb4b4;
+  margin: 0.6rem 0 0;
+}
+.wallet-error {
+  display: flex;
+  gap: 0.5rem;
+  align-items: flex-start;
+  background: rgba(40, 0, 0, 0.95);
+  border: 1px solid rgba(255, 90, 90, 0.5);
+  padding: 0.6rem 0.75rem;
+  color: #ffd0d0;
+  font-size: 0.8rem;
+}
+.wallet-error span {
+  flex: 1;
+}
+.wallet-error-close {
+  background: transparent;
+  border: 0;
+  color: inherit;
+  cursor: pointer;
+  font-size: 1rem;
+  line-height: 1;
+  padding: 0;
+}
+/* Same placement as the error, neutral colours: the install hint is guidance, not a failure. */
+.wallet-note {
+  background: rgba(0, 20, 30, 0.95);
+  border-color: rgba(0, 255, 255, 0.35);
+  color: #d6f6ff;
+}
+.wallet-note .wallet-error-close {
+  font-size: 0.8rem;
+  text-decoration: underline;
+}
+/* In the mobile menu the widget is part of the page flow. */
+.header-right-mobile .wallet-widget {
+  flex-wrap: wrap;
+  justify-content: center;
+}
+.header-right-mobile .wallet-menu,
+.header-right-mobile .wallet-error {
+  position: static;
+  width: 100%;
+  max-width: none;
+}
+.header-right-mobile .wallet-menu-actions .qnet-button {
+  width: auto;
+  margin: 0;
+}
+/* --- The node cabinet (/node) and the link page (/l): cards, notes, fields --- */
+.page-activate {
+  width: 100%;
+}
+.activate-page {
+  max-width: 880px;
+}
+.activate-page .explorer-header {
+  margin-bottom: 2rem;
+}
+.activate-card {
+  background: rgba(0, 8, 16, 0.92);
+  -webkit-backdrop-filter: blur(15px);
+  backdrop-filter: blur(15px);
+  border: 1px solid rgba(0, 255, 255, 0.25);
+  border-radius: 12px;
+  padding: 1.5rem;
+  margin-bottom: 1.25rem;
+  color: #dddddd;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.activate-card p {
+  margin: 0 0 1rem;
+}
+.activate-card a,
+.activate-link-button {
+  color: #00d4ff;
+}
+.activate-step {
+  color: #00ffff;
+  font-size: 1.2rem;
+  font-weight: 600;
+  line-height: 1.3;
+  margin: 0 0 1rem;
+}
+.activate-center {
+  text-align: center;
+}
+.activate-types {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
+}
+.activate-type {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.35rem;
+  min-width: 0;
+  text-align: start;
+  background: rgba(0, 0, 0, 0.6);
+  border: 2px solid rgba(0, 255, 255, 0.25);
+  border-radius: 10px;
+  padding: 1.1rem 1.25rem;
+  color: #f0f0f0;
+  font: inherit;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+.activate-type:hover:not(:disabled) {
+  border-color: rgba(0, 255, 255, 0.6);
+}
+.activate-type.selected,
+.activate-type.selected:hover:not(:disabled) {
+  border-color: #00ffff;
+  background: rgba(0, 255, 255, 0.08);
+}
+.activate-type:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+.activate-type:focus-visible,
+.activate-link-button:focus-visible {
+  outline: 2px solid #00ffff;
+  outline-offset: 2px;
+}
+.activate-type-name {
+  font-size: 1.1rem;
+  font-weight: 700;
+  color: #ffffff;
+}
+.activate-type-where {
+  font-size: 0.9rem;
+  color: #bbbbbb;
+}
+.activate-type-price {
+  margin-top: 0.4rem;
+  font-weight: 600;
+  color: #00ffff;
+}
+.activate-facts {
+  margin: 0;
+  padding-inline-start: 1.25rem;
+}
+.activate-facts li {
+  margin-bottom: 0.35rem;
+}
+/* The primary action outside the cabinet (the link page, the Support form); the cabinet's buttons are below. */
+.activate-primary {
+  display: inline-block;
+  margin: 0 0 0.75rem;
+  text-align: center;
+  max-width: 100%;
+}
+.activate-link-button {
+  background: none;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  text-align: start;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  cursor: pointer;
+}
+.activate-link-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+.activate-note {
+  font-size: 0.9rem;
+  color: #aaaaaa;
+}
+.activate-status {
+  color: #9adfe6;
+}
+.activate-error {
+  color: #ffd0d0;
+  background: rgba(40, 0, 0, 0.6);
+  border: 1px solid rgba(255, 90, 90, 0.5);
+  border-radius: 8px;
+  padding: 0.75rem 1rem;
+}
+.activate-waiting {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.75rem;
+  text-align: center;
+}
+.activate-waiting > * {
+  margin: 0;
+}
+.activate-qr {
+  width: min(280px, 100%);
+  height: auto;
+  border-radius: 8px;
+}
+/* A second, smaller code beside the main one: the SOL of a payment address, with its line. */
+.activate-qr-small {
+  width: min(140px, 45%);
+  flex: none;
+}
+.cabinet-sol-request {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 1rem;
+}
+.cabinet-sol-request > p {
+  flex: 1 1 12rem;
+  margin: 0;
+}
+.activate-mono,
+.activate-code,
+.activate-env {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  overflow-wrap: anywhere;
+}
+.activate-mono,
+.activate-env {
+  word-break: break-all;
+}
+/* The code stays on one line down to 320 px wide screens. */
+.activate-code {
+  display: inline-block;
+  font-size: clamp(0.85rem, 4vw, 1.15rem);
+  font-weight: 700;
+  color: #ffffff;
+  letter-spacing: 0.03em;
+  margin-inline-end: 0.75rem;
+  user-select: all;
+}
+.activate-result {
+  border: 1px solid rgba(0, 255, 255, 0.35);
+  border-radius: 10px;
+  padding: 1.25rem;
+  background: rgba(0, 0, 0, 0.5);
+}
+.activate-result-warn {
+  border-color: rgba(255, 170, 60, 0.6);
+}
+.activate-result h4,
+.activate-next h4 {
+  color: #00ffff;
+  font-size: 1.05rem;
+  margin: 0;
+}
+.activate-fields {
+  margin: 0;
+}
+.activate-field {
+  display: grid;
+  grid-template-columns: 9.5rem minmax(0, 1fr);
+  gap: 0.75rem;
+  padding: 0.5rem 0;
+  border-top: 1px solid rgba(0, 255, 255, 0.12);
+}
+.activate-field dt {
+  color: #8aa;
+  font-size: 0.85rem;
+}
+.activate-field dd {
+  margin: 0;
+  color: #e8ffff;
+  min-width: 0;
+}
+.activate-next {
+  border-top: 1px solid rgba(0, 255, 255, 0.2);
+  padding-top: 1rem;
+}
+.activate-env {
+  background: rgba(0, 0, 0, 0.7);
+  border: 1px solid rgba(0, 255, 255, 0.2);
+  border-radius: 8px;
+  padding: 0.75rem 1rem;
+  color: #e8ffff;
+  font-size: 0.85rem;
+  white-space: pre-wrap;
+  margin: 0;
+}
+@media (max-width: 640px) {
+  .activate-card {
+    padding: 1.25rem 1rem;
+  }
+  .activate-types {
+    grid-template-columns: 1fr;
+  }
+  .activate-field {
+    grid-template-columns: 1fr;
+    gap: 0.2rem;
+  }
+  .activate-primary {
+    display: block;
+    width: 100%;
+  }
+}
+/* The page a browser shows for an app link (/l). */
+.page-link {
+  width: 100%;
+}
+.link-open {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  margin-bottom: 0.75rem;
+}
+.link-open .activate-primary {
+  margin: 0;
+}
+
+/* --- The node cabinet's layout: one column of cards; inside each, stacked groups with one spacing. --- */
+.cabinet {
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+}
+.cabinet > *,
+.cabinet .activate-card > *,
+.cabinet .cabinet-choice > *,
+.cabinet .cabinet-balance > *,
+.cabinet div.activate-result > *,
+.cabinet .activate-next > *,
+.cabinet div[role='alert'] > * {
+  margin: 0;
+  min-width: 0;
+}
+.cabinet .activate-card p {
+  margin: 0;
+}
+.cabinet .explorer-header {
+  margin: 0 0 0.25rem;
+}
+.cabinet .explorer-header .section-subtitle {
+  max-width: 40rem;
+  margin: 0 auto;
+  font-size: 1rem;
+  line-height: 1.5;
+  color: #cfd8dc;
+}
+.cabinet .activate-card {
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+  margin: 0;
+}
+.cabinet .cabinet-choice,
+.cabinet .cabinet-balance,
+.cabinet div[role='alert'] {
+  display: flex;
+  flex-direction: column;
+  gap: 0.625rem;
+}
+.cabinet div.activate-result,
+.cabinet .activate-next {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+/* A button on its own takes its own width; on a phone the whole row (below). */
+.cabinet :is(.activate-card, .cabinet-choice, .cabinet-balance, div.activate-result, .activate-next, div[role='alert']) > :is(.qnet-button, .activate-link-button),
+.cabinet > .activate-link-button {
+  align-self: flex-start;
+}
+.cabinet-lead {
+  color: #dddddd;
+  line-height: 1.6;
+}
+
+/* The cabinet's buttons: primary filled, secondary outlined, both the same size. */
+.cabinet .qnet-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  box-sizing: border-box;
+  min-height: 44px;
+  max-width: 100%;
+  margin: 0;
+  padding: 0.625rem 1.25rem;
+  border: 1px solid #00e5f0;
+  border-radius: 8px;
+  background: #00e5f0;
+  color: #001a1f;
+  font-family: 'Inter', sans-serif;
+  font-size: 0.8125rem;
+  font-weight: 700;
+  line-height: 1.25;
+  letter-spacing: 0.06em;
+  text-align: center;
+  text-transform: uppercase;
+  text-decoration: none;
+  white-space: normal;
+  box-shadow: none;
+  transform: none;
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease, box-shadow 0.15s ease;
+}
+.cabinet .qnet-button:hover {
+  background: #5ff3fb;
+  border-color: #5ff3fb;
+  box-shadow: 0 0 18px rgba(0, 229, 240, 0.35);
+  transform: none;
+}
+.cabinet .qnet-button.secondary {
+  background: transparent;
+  border-color: rgba(0, 229, 240, 0.55);
+  color: #9ff6ff;
+}
+.cabinet .qnet-button.secondary:hover {
+  background: rgba(0, 229, 240, 0.1);
+  border-color: #00e5f0;
+  color: #ffffff;
+  box-shadow: none;
+}
+.cabinet .qnet-button:focus-visible {
+  outline: 2px solid #00ffff;
+  outline-offset: 3px;
+}
+.cabinet .qnet-button:disabled,
+.cabinet .qnet-button:disabled:hover {
+  opacity: 0.45;
+  cursor: not-allowed;
+  box-shadow: none;
+}
+.cabinet .qnet-button:disabled:hover {
+  background: #00e5f0;
+  border-color: #00e5f0;
+}
+.cabinet .qnet-button.secondary:disabled:hover {
+  background: transparent;
+  border-color: rgba(0, 229, 240, 0.55);
+  color: #9ff6ff;
+}
+.cabinet .activate-copy {
+  padding-inline: 1rem;
+  vertical-align: middle;
+}
+/* A text button on its own line keeps a finger-sized target; one inside a sentence stays text. */
+.cabinet .activate-link-button {
+  display: inline-flex;
+  align-items: center;
+  min-height: 44px;
+}
+.cabinet p .activate-link-button {
+  display: inline;
+  min-height: 0;
+}
+.cabinet-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+/* The cabinet's pages: pills that wrap on wide screens and form an even grid on a phone. */
+.cabinet-nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+.cabinet-nav-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  min-height: 44px;
+  padding: 0.5rem 1rem;
+  border: 1px solid rgba(0, 255, 255, 0.25);
+  border-radius: 999px;
+  color: #9adfe6;
+  font-size: 0.875rem;
+  font-weight: 500;
+  line-height: 1.2;
+  text-align: center;
+  text-decoration: none;
+  transition: border-color 0.15s ease, background 0.15s ease, color 0.15s ease;
+}
+.cabinet-nav-link:hover {
+  border-color: rgba(0, 255, 255, 0.6);
+  color: #ffffff;
+}
+.cabinet-nav-link:focus-visible {
+  outline: 2px solid #00ffff;
+  outline-offset: 2px;
+}
+.cabinet-nav-link[aria-current='page'] {
+  border-color: #00ffff;
+  color: #ffffff;
+  font-weight: 600;
+  background: rgba(0, 255, 255, 0.12);
+}
+.cabinet-label {
+  display: block;
+  color: #dddddd;
+}
+/* An input and its button on one row; stacked on a phone. */
+.cabinet-row {
+  display: flex;
+  align-items: stretch;
+  gap: 0.625rem;
+}
+.cabinet-row .qnet-button {
+  flex: none;
+}
+.cabinet-input {
+  flex: 1 1 auto;
+  box-sizing: border-box;
+  min-width: 0;
+  min-height: 44px;
+  padding-block: 0.625rem;
+  padding-inline: 0.875rem;
+  border: 1px solid rgba(0, 255, 255, 0.3);
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.6);
+  color: #e8ffff;
+  font-size: 1rem;
+  transition: border-color 0.15s ease;
+}
+.cabinet-input:focus {
+  border-color: #00ffff;
+}
+.cabinet-input:focus-visible {
+  outline: 2px solid #00ffff;
+  outline-offset: 1px;
+}
+.cabinet-input[aria-invalid='true'] {
+  border-color: rgba(255, 90, 90, 0.7);
+}
+.cabinet-badge-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.75rem;
+}
+.cabinet-badge {
+  padding-block: 0.15rem;
+  padding-inline: 0.6rem;
+  border-radius: 999px;
+  font-size: 0.8rem;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+}
+.cabinet-badge.online {
+  background: rgba(0, 200, 120, 0.2);
+  color: #7dffc4;
+}
+.cabinet-badge.offline {
+  background: rgba(255, 170, 60, 0.2);
+  color: #ffd29a;
+}
+.cabinet-badge.waiting {
+  background: rgba(0, 229, 240, 0.18);
+  color: #9ff6ff;
+}
+.cabinet-table-wrap {
+  overflow-x: auto;
+}
+/* Cells wrap between words only: the card's overflow-wrap: anywhere would split an epoch or an amount on a phone. */
+.cabinet-table {
+  inline-size: 100%;
+  border-collapse: collapse;
+  overflow-wrap: normal;
+}
+.cabinet-table th,
+.cabinet-table td {
+  padding-block: 0.625rem;
+  padding-inline: 0.5rem;
+  border-block-start: 1px solid rgba(0, 255, 255, 0.12);
+  text-align: start;
+}
+.cabinet-table th {
+  color: #8aa;
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+/* My node over the site's matrix rain (src/components/MatrixRain.tsx): the way, the sections and any line outside a card
+   sit on the same opaque, blurred panel as the cards, so nothing is read against the moving characters. */
+.cabinet .cabinet-progress,
+.cabinet .cabinet-nav,
+.cabinet > p,
+.cabinet > div[role='alert'] {
+  border-radius: 12px;
+  background: rgba(0, 8, 16, 0.9);
+  -webkit-backdrop-filter: blur(15px);
+  backdrop-filter: blur(15px);
+}
+.cabinet .cabinet-progress {
+  padding: 0.875rem 0.5rem;
+}
+.cabinet .cabinet-nav {
+  padding: 0.5rem;
+}
+.cabinet > p,
+.cabinet > div[role='alert'] {
+  padding: 0.875rem 1.25rem;
+}
+/* Read by screen readers, not shown. */
+.cabinet-hidden-text {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* The way to a running node: Connect, Activate, Link your phone, Running. */
+.cabinet-progress {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0.5rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.cabinet-progress-step {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.4rem;
+  min-width: 0;
+  color: #7fa9b3;
+  font-size: 0.9rem;
+  line-height: 1.25;
+  text-align: center;
+}
+/* The line from the step before, dot edge to dot edge. */
+.cabinet-progress-step::before {
+  content: '';
+  position: absolute;
+  top: 17px;
+  left: calc(-50% - 0.5rem + 20px);
+  width: calc(100% + 0.5rem - 40px);
+  height: 2px;
+  background: rgba(0, 255, 255, 0.18);
+}
+.cabinet-progress-step:first-child::before {
+  display: none;
+}
+.cabinet-progress-step.done::before,
+.cabinet-progress-step.now::before {
+  background: #00e5f0;
+}
+.cabinet-progress-dot {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  width: 36px;
+  height: 36px;
+  border: 2px solid rgba(0, 255, 255, 0.3);
+  border-radius: 50%;
+  background: #02121a;
+  color: #9adfe6;
+  font-weight: 700;
+}
+.cabinet-progress-step.done .cabinet-progress-dot {
+  border-color: #00e5f0;
+  background: #00e5f0;
+  color: #001a1f;
+}
+.cabinet-progress-step.now .cabinet-progress-dot {
+  border-color: #00ffff;
+  color: #ffffff;
+  box-shadow: 0 0 0 4px rgba(0, 255, 255, 0.16);
+}
+.cabinet-progress-step.done .cabinet-progress-name {
+  color: #cfeff3;
+}
+.cabinet-progress-step.now .cabinet-progress-name {
+  color: #ffffff;
+  font-weight: 700;
+}
+
+/* The connected wallet: the whole address, which a tap copies. */
+.cabinet .cabinet-wallet-card {
+  gap: 0.75rem;
+}
+.cabinet-kicker {
+  color: #8aa;
+  font-size: 0.8rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.cabinet-address {
+  display: block;
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 44px;
+  padding: 0.75rem 1rem;
+  border: 1px solid rgba(0, 255, 255, 0.3);
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.45);
+  color: #e8ffff;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 1rem;
+  line-height: 1.5;
+  text-align: start;
+  word-break: break-all;
+  overflow-wrap: anywhere;
+  cursor: pointer;
+  transition: border-color 0.15s ease;
+}
+.cabinet-address:hover {
+  border-color: rgba(0, 255, 255, 0.65);
+}
+.cabinet-address:focus-visible {
+  outline: 2px solid #00ffff;
+  outline-offset: 2px;
+}
+.cabinet-copy-note {
+  color: #7dffc4;
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+.cabinet-wallet-foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem 1rem;
+}
+.cabinet-wallet-foot > * {
+  margin: 0;
+}
+
+/* Before a wallet: the ways to connect beside How it works in short. */
+.cabinet-connect {
+  display: grid;
+  gap: 1.25rem;
+  align-items: start;
+}
+.cabinet-connect-card {
+  scroll-margin-top: 80px;
+}
+.cabinet-connect-card:focus {
+  outline: none;
+}
+.cabinet-connect-card:focus-visible {
+  outline: 2px solid #00ffff;
+  outline-offset: 2px;
+}
+/* The header's Connect wallet brought the card into view: marked for a moment (src/lib/cabinet/connect-card.ts). */
+.cabinet-connect-card.cabinet-flash {
+  animation: cabinet-flash 1.6s ease-out;
+}
+@keyframes cabinet-flash {
+  0%,
+  40% {
+    border-color: #00ffff;
+    box-shadow: 0 0 0 3px rgba(0, 255, 255, 0.45);
+  }
+  100% {
+    box-shadow: 0 0 0 3px rgba(0, 255, 255, 0);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .cabinet-connect-card.cabinet-flash {
+    animation: none;
+    border-color: #00ffff;
+  }
+}
+/* The record of a node on its way to the network: done, now, ahead (NextSteps.tsx). */
+.cabinet-checks {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  list-style: none;
+  padding: 0;
+}
+.cabinet-check {
+  display: flex;
+  align-items: baseline;
+  gap: 0.625rem;
+  color: #8aa;
+}
+.cabinet-check::before {
+  content: '';
+  flex: none;
+  width: 0.75rem;
+  height: 0.75rem;
+  border-radius: 50%;
+  border: 2px solid rgba(0, 255, 255, 0.35);
+  transform: translateY(0.1rem);
+}
+.cabinet-check.done {
+  color: #dddddd;
+}
+.cabinet-check.done::before {
+  background: #00e5f0;
+  border-color: #00e5f0;
+}
+.cabinet-check.now {
+  color: #ffffff;
+  font-weight: 600;
+}
+.cabinet-check.now::before {
+  border-color: #00ffff;
+  box-shadow: 0 0 0 3px rgba(0, 255, 255, 0.2);
+}
+/* A part of a page shown on request: Check another code. */
+.cabinet-more > summary {
+  display: flex;
+  align-items: center;
+  min-height: 44px;
+  color: #00d4ff;
+  cursor: pointer;
+}
+.cabinet-more > summary:focus-visible {
+  outline: 2px solid #00ffff;
+  outline-offset: 2px;
+}
+.cabinet-more:not([open]) {
+  gap: 0;
+}
+.cabinet-subtitle {
+  color: #00ffff;
+  font-size: 1.05rem;
+  font-weight: 600;
+}
+.cabinet-epoch.missed td:nth-child(3) {
+  color: #ffd29a;
+}
+.cabinet-options {
+  display: flex;
+  flex-direction: column;
+}
+.cabinet .cabinet-option {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin: 0;
+  padding-block: 1rem;
+  border-top: 1px solid rgba(0, 255, 255, 0.14);
+}
+.cabinet .cabinet-option:first-child {
+  padding-top: 0;
+  border-top: 0;
+}
+.cabinet .cabinet-option:last-child {
+  padding-bottom: 0;
+}
+.cabinet .cabinet-option > * {
+  margin: 0;
+  min-width: 0;
+}
+.cabinet .cabinet-option > .qnet-button {
+  align-self: flex-start;
+}
+@media (min-width: 900px) {
+  .cabinet-connect {
+    grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
+  }
+}
+
+/* How it works: in short beside the connect screen, and every step with its picture on /docs/how-it-works. */
+.guide-short-way {
+  display: flex;
+  flex-direction: column;
+  gap: 0.625rem;
+}
+.guide-short-title {
+  margin: 0;
+  color: #ffffff;
+  font-size: 1rem;
+  font-weight: 700;
+}
+.guide-short-steps {
+  display: flex;
+  flex-direction: column;
+  gap: 0.625rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.guide-short-steps li {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.625rem;
+  line-height: 1.45;
+}
+.guide-number {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  width: 28px;
+  height: 28px;
+  border: 1.5px solid #00e5f0;
+  border-radius: 50%;
+  color: #00ffff;
+  font-size: 0.9rem;
+  font-weight: 700;
+  line-height: 1;
+}
+.guide-switch {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  border: 1px solid rgba(0, 255, 255, 0.4);
+  border-radius: 10px;
+  overflow: hidden;
+}
+.guide-switch-option {
+  min-height: 48px;
+  padding: 0.5rem 0.75rem;
+  border: 0;
+  background: transparent;
+  color: #9adfe6;
+  font: inherit;
+  font-size: 1rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+.guide-switch-option + .guide-switch-option {
+  border-inline-start: 1px solid rgba(0, 255, 255, 0.4);
+}
+.guide-switch-option[aria-pressed='true'] {
+  background: #00e5f0;
+  color: #001a1f;
+}
+.guide-switch-option:focus-visible {
+  outline: 2px solid #00ffff;
+  outline-offset: -4px;
+}
+.guide-steps {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.guide-step {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 360px);
+  gap: 1.25rem;
+  align-items: center;
+  padding: 1.25rem;
+  border: 1px solid rgba(0, 255, 255, 0.25);
+  border-radius: 12px;
+  background: rgba(0, 8, 16, 0.92);
+  -webkit-backdrop-filter: blur(15px);
+  backdrop-filter: blur(15px);
+}
+.guide-step-text {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.875rem;
+  min-width: 0;
+  color: #e6f7fa;
+  font-size: 1.0625rem;
+  line-height: 1.6;
+}
+.guide-step-text .guide-number {
+  width: 36px;
+  height: 36px;
+  font-size: 1.05rem;
+}
+.guide-step-words {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.guide-step-words p {
+  margin: 0;
+}
+/* The page a step sends the reader to (the Wallet page, the faucet). */
+.guide-step-link {
+  display: inline-flex;
+  align-items: center;
+  align-self: flex-start;
+  min-height: 44px;
+  color: #00d4ff;
+  font-weight: 600;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.guide-step-link:focus-visible {
+  outline: 2px solid #00ffff;
+  outline-offset: 2px;
+}
+.guide-art {
+  display: block;
+  justify-self: center;
+  width: 100%;
+  max-width: 360px;
+  height: auto;
+}
+/* A phone is drawn on its own, so its screen reads at the size of a real one. */
+.guide-art-phone {
+  max-width: 250px;
+}
+/* A computer's picture has a narrower twin whose words stay readable on a phone's screen (GuideArt.tsx). */
+.guide-art-narrow {
+  display: none;
+}
+.guide-faq-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  margin: 0;
+}
+.guide-faq-item dt {
+  margin-bottom: 0.25rem;
+  color: #ffffff;
+  font-weight: 700;
+}
+.guide-faq-item dd {
+  margin: 0;
+  color: #cfd8dc;
+  line-height: 1.6;
+}
+.guide-connect {
+  display: flex;
+  justify-content: center;
+}
+/* The header's link to the remembered wallet shows its address as written. */
+.wallet-held {
+  display: inline-block;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+/* Tablets: the section keeps the site's padding; the cards a little less. */
+@media (max-width: 1024px) {
+  .cabinet .activate-card {
+    padding: 1.25rem;
+  }
+}
+/* Phones: one column, full-width buttons, the pages as an even grid, readable text. */
+@media (max-width: 640px) {
+  .cabinet {
+    gap: 1rem;
+  }
+  .cabinet .explorer-header .section-title {
+    font-size: 1.75rem;
+  }
+  .cabinet .explorer-header .section-subtitle {
+    font-size: 0.9375rem;
+  }
+  .cabinet .activate-card {
+    padding: 1.25rem 1rem;
+    gap: 1rem;
+  }
+  .cabinet .activate-step {
+    font-size: 1.1rem;
+  }
+  .cabinet-nav {
+    display: grid;
+    grid-auto-flow: column;
+    grid-auto-columns: minmax(0, 1fr);
+  }
+  .cabinet-nav-link {
+    padding-inline: 0.5rem;
+    border-radius: 10px;
+  }
+  .cabinet :is(.activate-card, .cabinet-choice, .cabinet-balance, div.activate-result, .activate-next, div[role='alert']) > .qnet-button {
+    align-self: stretch;
+  }
+  .cabinet .activate-waiting > .qnet-button {
+    align-self: stretch;
+  }
+  .cabinet-actions {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .cabinet-actions .qnet-button {
+    width: 100%;
+  }
+  .cabinet-actions .activate-link-button {
+    align-self: flex-start;
+  }
+  .cabinet-row {
+    flex-direction: column;
+  }
+  .cabinet-row .qnet-button {
+    width: 100%;
+  }
+  .cabinet-progress-step {
+    font-size: 0.8125rem;
+  }
+  .cabinet-progress-dot {
+    width: 32px;
+    height: 32px;
+  }
+  .cabinet-progress-step::before {
+    top: 15px;
+    left: calc(-50% - 0.5rem + 18px);
+    width: calc(100% + 0.5rem - 36px);
+  }
+  .cabinet-address {
+    font-size: 0.9375rem;
+  }
+  .cabinet-wallet-foot .qnet-button,
+  .cabinet .cabinet-option > .qnet-button,
+  .guide-connect > .qnet-button {
+    align-self: stretch;
+    width: 100%;
+  }
+  .guide-step {
+    grid-template-columns: minmax(0, 1fr);
+    padding: 1rem;
+    gap: 1rem;
+  }
+  .guide-art {
+    max-width: 100%;
+  }
+  .guide-art-phone {
+    max-width: 250px;
+  }
+  .guide-art-wide {
+    display: none;
+  }
+  .guide-art-narrow {
+    display: block;
+    max-width: 360px;
+  }
+  .guide-step-text {
+    font-size: 1rem;
+  }
+}
+@media (max-width: 419px) {
+  .cabinet-nav {
+    gap: 0.375rem;
+  }
+  .cabinet-nav-link {
+    padding-inline: 0.25rem;
+    font-size: 0.8125rem;
+  }
+  .cabinet .explorer-header .section-title {
+    font-size: 1.6rem;
+  }
+}
+/* The Support page's device-check request (src/components/SupportRequest.tsx). */
+.support-request {
+  display: flex;
+  flex-direction: column;
+  gap: 0.9rem;
+  margin-block-start: 1rem;
+}
+.support-request label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  color: #dddddd;
+}
+/* A finger-sized target, and 16 px text so a phone does not zoom in when a field is focused. */
+.support-request input,
+.support-request select,
+.support-request textarea {
+  min-height: 44px;
+  padding-block: 0.6rem;
+  padding-inline: 0.75rem;
+  border: 1px solid rgba(0, 255, 255, 0.3);
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.6);
+  color: #e8ffff;
+  font: inherit;
+  font-size: 1rem;
+}
+.support-request .qnet-button {
+  align-self: flex-start;
+  text-decoration: none;
 }

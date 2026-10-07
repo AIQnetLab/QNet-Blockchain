@@ -35,7 +35,7 @@ calling contract's own linear memory.
 | `storage_read` | `(key_ptr: i32, key_len: i32, out_ptr: i32, out_cap: i32) -> i32` | returns `-1` when the key is absent, otherwise the full stored length while copying at most `out_cap` bytes |
 | `get_caller` | `(out_ptr: i32, out_cap: i32) -> i32` | caller address bytes; returns the full length, copies at most `out_cap` |
 | `get_block_height` | `() -> i64` | height of the block applying the call |
-| `get_value` | `() -> i64` | native QNC attached to the call, as context |
+| `get_value` | `() -> i64` | always 0 in the entry call (a call carries no QNC); in a nested call, the informational `value` the caller passed |
 | `emit_log` | `(data_ptr: i32, data_len: i32)` | appends an opaque event payload and charges fuel |
 | `revert` | `(msg_ptr: i32, msg_len: i32)` | always traps, carrying the message |
 
@@ -67,20 +67,24 @@ caller that passes a short buffer receives a truncated copy and a length larger 
 
 - **Entry name.** The call transaction's `data.method` selects the exported function, defaulting to
   `"run"`.
-- **Arguments.** `data.args` is a JSON string of hex. It is hex-decoded into the bytes the contract
-  reads with `get_call_args`. A JSON value of any other shape leaves the argument bytes empty.
+- **Arguments.** `data.args` is a JSON string of even-length hex, or `null` (or absent) for no
+  argument bytes. It is hex-decoded into the bytes the contract reads with `get_call_args`. Anything
+  else (an array, an object, a number, a string that is not hex) is refused: the call endpoint answers
+  with an error when the target is a WebAssembly contract already on chain, and apply refuses such a
+  call in any case (`wasm_call_args_not_hex_string`, `wasm_call_args_not_hex`), so it never runs with
+  empty input.
 - **Return values.** The entry itself returns nothing. A contract returns bytes to a calling
   contract with `set_return`, and exposes data to the outside world through storage and events.
 - **Reachable contracts.** `data.accessList` declares, under the same signature, every contract the
   call may reach with `call_contract`, capped at 64 entries. A target outside the declared set
   returns `-1` on every node. The call endpoint below builds its calldata from `contract`, `method`
-  and `args` only, so declaring an access list requires a client that builds and signs the
-  transaction itself.
+  and `args` only, so a call submitted today declares no access list and `call_contract` returns
+  `-1`.
 
 ## Determinism rules enforced at deploy
 
 `qnet_vm::validate_wasm_module` accepts a module only when all of the following hold. They are also
-enforced by `POST /api/v1/wasm/deploy` before it submits the transaction.
+enforced by `POST /api/v1/contract/deploy` before it submits the transaction.
 
 1. The module is at most 512 KiB.
 2. The module validates under a feature set containing only mutable globals, sign extension,
@@ -96,43 +100,51 @@ enforced by `POST /api/v1/wasm/deploy` before it submits the transaction.
 
 ## Deploying
 
-Assemble the text into module bytes with any WAT assembler, then hex-encode those bytes:
+Assemble the text into module bytes with any WebAssembly text assembler. The Rust form of this
+contract, with the build flags a Rust module needs, is the `counter` template in
+[`contracts/`](../../../contracts/README.md).
+
+Deploy the module with the `qnet` command of `@aiqnet/sdk` (`qnet check counter.wasm`, then
+`qnet deploy counter.wasm`), or submit it yourself to `POST /api/v1/contract/deploy` (2 MiB body
+limit):
 
 ```
-wat2wasm counter.wat -o counter.wasm
-```
-
-Submit them to `POST /api/v1/wasm/deploy` (1 MiB body limit):
-
-```json
 {
   "from": "<deployer EON address>",
-  "code": "<hex of counter.wasm>",
+  "code": "<base64 of counter.wasm>",
+  "constructor_args": null,
+  "gas_limit": <500000 + 10 * (2 * module bytes + 102)>,
+  "gas_price": 10,
   "nonce": 1,
   "dilithium_signature": "<hex>",
   "dilithium_public_key": "<hex>"
 }
 ```
 
-The signature is ML-DSA-65 over `q{chain_id}|contract_deploy:{from}:{code_hash}:{nonce}:{gas_price}:{gas_limit}`, where
-`chain_id` is the node's compile-time `QNET_CHAIN_ID` (`q1337` on testnet) and `code_hash` is the hex
-SHA3-256 of the module bytes. The contract address is derived on-chain from
-the deployer address and the nonce and is returned as `contract.contract_address`; a caller-supplied
-address is never used. Deployment stores the validated code and runs nothing — there is no
-constructor, so a contract initialises its own state from its entry points.
+The signature is ML-DSA-65 over `q1337|contract_deploy:{from}:{code_hash}:{nonce}:{gas_price}:{gas_limit}`, where
+`q1337|` is the chain tag (`q` followed by the node's compile-time `QNET_CHAIN_ID`, 1337 on testnet) and `code_hash` is
+the hex SHA3-256 of the module bytes. The gas limit must cover the deploy's intrinsic gas, 500,000 plus 10
+per byte of the deploy payload the node builds (twice the module size plus 102 bytes), and may not
+exceed 1,000,000. `POST /api/v1/wasm/deploy` fixes a gas limit of 200,000, below that, so a deploy
+sent there cannot land. The contract address is derived on-chain from the deployer address and the
+nonce and is returned as `contract_address`; a caller-supplied address is never used. Deployment
+stores the validated code and runs nothing — there is no constructor, so a contract initialises its
+own state from its entry points. The exact formats are in
+[docs/developers/transactions.md](../../../docs/developers/transactions.md).
 
 ## Calling
 
-Submit `POST /api/v1/contract/call`:
+Call it with `qnet call <contract> run`, or submit `POST /api/v1/contract/call` yourself (the public
+key may be left out once the chain holds it):
 
-```json
+```
 {
   "from": "<caller EON address>",
   "contract_address": "<contract EON address>",
   "method": "run",
-  "args": "",
-  "gas_limit": 1000000,
-  "gas_price": 1000,
+  "args": null,
+  "gas_limit": <100000 + 5 * calldata bytes + fuel>,
+  "gas_price": 10,
   "nonce": 2,
   "dilithium_signature": "<hex>",
   "dilithium_public_key": "<hex>"
@@ -141,7 +153,7 @@ Submit `POST /api/v1/contract/call`:
 
 The node builds the transaction calldata as the JSON object `{"args":…,"contract":…,"method":…}` —
 keys in that order, no whitespace — and the ML-DSA-65 signature covers
-`q{chain_id}|contract_call:{from}:{sha3_256(calldata bytes)}:{nonce}:{gas_price}:{gas_limit}`. The signature binds the literal
+`q1337|contract_call:{from}:{sha3_256(calldata bytes)}:{nonce}:{gas_price}:{gas_limit}`, with the same chain tag. The signature binds the literal
 calldata bytes, so a client must sign that exact serialisation. `method: "reset"` selects the
 other entry point. The interpreter's fuel budget is `gas_limit` minus the intrinsic gas of the
 transaction; fuel is consumed, and billed, whether or not the call succeeds. The gas settlement rules
@@ -154,8 +166,8 @@ advances.
 
 `GET /api/v1/logs?contract={address}&from={height}&to={height}` returns the events of a height range
 with each payload hex-encoded, so the first eight bytes of a `counter.wat` event are the new value
-in little-endian order. The range is capped at 500 blocks per request, and the response reports the
-node's prune floor.
+in little-endian order. A request covers at most 501 heights (`to` is cut to `from` + 500), and the
+response reports the node's prune floor.
 
 `POST /api/v1/contract/call` with `is_view: true` and `method: "storageGet"` reads one storage key
 of a WASM contract directly from committed state, with `args` carrying the key. It needs no

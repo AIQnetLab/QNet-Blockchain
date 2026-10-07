@@ -1,11 +1,10 @@
 import "./globals.css";
 import "./mobile-fixes.css";
 
+import { headers } from 'next/headers';
 import { ThemeProvider } from "@/components/theme/theme-provider";
-import { AppProvider } from "@/contexts/AppContext";
-import Header from '@/components/Header';
-import MatrixRain from '@/components/MatrixRain';
-import Footer from '@/components/Footer';
+import SiteShell from '@/components/SiteShell';
+import { LINK_HOST, requestHost } from '@/lib/hosts';
 import type { Metadata, Viewport } from 'next';
 
 export const metadata: Metadata = {
@@ -16,15 +15,19 @@ export const metadata: Metadata = {
   creator: 'Orrery Group LLC',
   publisher: 'Orrery Group LLC',
   robots: 'index, follow',
+  // The QNet icon at the sizes browsers ask for (each file is that size): /favicon.ico (16, 32 and 48) first, which every
+  // browser also requests by itself, then the PNGs; the 180 px one for iPhone and iPad home screens.
   icons: {
     icon: [
-      { url: '/icon-128.png', sizes: '128x128', type: 'image/png' },
-      { url: '/icon-48.png', sizes: '48x48', type: 'image/png' },
+      { url: '/favicon.ico', sizes: '16x16 32x32 48x48', type: 'image/x-icon' },
+      { url: '/icon-16.png', sizes: '16x16', type: 'image/png' },
       { url: '/icon-32.png', sizes: '32x32', type: 'image/png' },
-      { url: '/icon-16.png', sizes: '16x16', type: 'image/png' }
+      { url: '/icon-48.png', sizes: '48x48', type: 'image/png' },
+      { url: '/icon-128.png', sizes: '128x128', type: 'image/png' },
+      { url: '/icon-192.png', sizes: '192x192', type: 'image/png' },
     ],
-    shortcut: '/icon-32.png',
-    apple: '/icon-128.png',
+    shortcut: '/favicon.ico',
+    apple: [{ url: '/icon-180.png', sizes: '180x180', type: 'image/png' }],
   },
   metadataBase: new URL('https://aiqnet.io'),
   // './' resolves against each page's own path, so every page names itself without its query string.
@@ -49,66 +52,19 @@ export const viewport: Viewport = {
   initialScale: 1,
 };
 
-export default function RootLayout({
+export default async function RootLayout({
   children,
 }: {
   children: React.ReactNode;
 }) {
+  // Reading the request renders every page per request, so each response carries its own CSP nonce
+  // (src/proxy.ts), which Next.js puts on its scripts. The site has no inline scripts of its own.
+  // Any page rendered for the link host renders without the site's shell (SiteShell): the link page, and
+  // any other page a request there could reach past the proxy's host rule (SITE-R4-CSP-01).
+  const onLinkHost = requestHost((await headers()).get('host')) === LINK_HOST;
   return (
     <html lang="en" suppressHydrationWarning>
-      <head suppressHydrationWarning>
-        <script
-          suppressHydrationWarning
-          dangerouslySetInnerHTML={{
-            __html: `
-              // QNet Wallet Detection and Integration
-              window.qnetWalletReady = false;
-              
-              // Check for QNet wallet extension
-              function checkQNetWallet() {
-                if (window.qnet && window.qnet.isQNet) {
-                  window.qnetWalletReady = true;
-                  /* log disabled */
-                  
-                  // Emit custom event for components
-                  window.dispatchEvent(new CustomEvent('qnet:walletReady', {
-                    detail: { provider: window.qnet }
-                  }));
-                  
-                  return true;
-                }
-                return false;
-              }
-              
-              // Initial check
-              if (!checkQNetWallet()) {
-                // Listen for QNet wallet injection
-                window.addEventListener('qnet#initialized', () => {
-                  checkQNetWallet();
-                });
-                
-                // Fallback check after delay
-                setTimeout(() => {
-                  if (!checkQNetWallet()) {
-                    
-                    // Show install prompt
-                    window.dispatchEvent(new CustomEvent('qnet:walletNotFound'));
-                  }
-                }, 2000);
-              }
-              
-              // QNet is the only supported wallet
-              
-              // Handle favicon errors gracefully
-              window.addEventListener('error', function(e) {
-                if (e.filename && e.filename.includes('favicon')) {
-                  e.preventDefault();
-                  return false;
-                }
-              }, true);
-            `,
-          }}
-        />
+      <head>
         <link rel="manifest" href="/manifest.json" />
       </head>
       <body suppressHydrationWarning className="font-sans antialiased quantum-bg">
@@ -118,18 +74,10 @@ export default function RootLayout({
           enableSystem
           disableTransitionOnChange
         >
-          <AppProvider>
-            <div className="app-wrapper">
-              <MatrixRain />
-              <Header />
-              <main className="qnet-container">
-                {children}
-              </main>
-              <Footer />
-            </div>
-          </AppProvider>
+          {/* The wallet context, header and footer for the site's pages; the link page and the link host alone (SiteShell). */}
+          <SiteShell onLinkHost={onLinkHost}>{children}</SiteShell>
         </ThemeProvider>
       </body>
     </html>
   );
-} 
+}

@@ -1,0 +1,17 @@
+[package]
+name = "qnet-device-attest"
+version = "0.1.0"
+edition = "2021"
+authors = ["Orrery Group LLC"]
+description = "Offline verification of the phone and tablet hardware evidence behind QNet light nodes"
+license = "BUSL-1.1"
+
+[lib]
+name = "qnet_device_attest"
+
+[dependencies]
+# ECDSA P-256/P-384, RSA PKCS#1 and SHA-2; already compiled into the node through its TLS stack
+ring = "0.17"
+# Play Integrity verdict payload and the attestation status list
+serde_json = "1.0.111"
+base64 = "0.22"

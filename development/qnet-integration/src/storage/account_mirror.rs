@@ -224,6 +224,20 @@ impl PinnedDbSnapshot {
         let snap: rocksdb::SnapshotWithThreadMode<'static, DB> = unsafe { std::mem::transmute(snap) };
         PinnedDbSnapshot { snap, db: Arc::clone(db) }
     }
+
+    /// Point read of `key` in column family `cf` as of the snapshot. Err: a missing family or a
+    /// failed read, never folded into absence.
+    pub(crate) fn get_cf_opt(&self, cf: &str, key: &[u8], ro: rocksdb::ReadOptions) -> Result<Option<Vec<u8>>, String> {
+        let h = self.db.cf_handle(cf).ok_or_else(|| format!("column family '{}' not found", cf))?;
+        self.snap.get_cf_opt(&h, key, ro).map_err(|e| e.to_string())
+    }
+
+    /// A raw iterator over column family `cf` as of the snapshot; None when the family is missing.
+    pub(crate) fn raw_iterator_cf_opt(&self, cf: &str, ro: rocksdb::ReadOptions)
+        -> Option<rocksdb::DBRawIteratorWithThreadMode<'_, DB>> {
+        let h = self.db.cf_handle(cf)?;
+        Some(self.snap.raw_iterator_cf_opt(&h, ro))
+    }
 }
 
 /// Resolves when its write has landed: true iff it succeeded.

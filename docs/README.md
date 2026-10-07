@@ -49,10 +49,18 @@ types, `Light` and `Super`.
 
 | Document | Covers |
 | --- | --- |
+| [Developer overview](developers/overview.md) | What the testnet offers developers, who talks to what, the limits to design around |
+| [dApp integration](developers/dapp-integration.md) | The wallet provider a web page talks to: discovery, methods, results, errors, events |
+| [Sign-in](developers/sign-in.md) | Signing users in with a wallet signature, checked on the server |
+| [Transactions](developers/transactions.md) | Transfer, token transfer, contract call and deploy: signed text, gas, fees, submit, status |
+| [Smart contracts](developers/smart-contracts.md) | The WASM contract VM, host functions, limits, events, templates, token standards |
+| [SDK](developers/sdk.md) | `@aiqnet/sdk`: wallet connection, sign-in, transaction builders, node client, key files |
+| [CLI](developers/cli.md) | The `qnet` command: keys, reads, transfers, contract deploys and calls |
 | [RPC API](developers/rpc-api.md) | The HTTP JSON-RPC and REST surface exposed by a node |
-| [Smart contracts](developers/smart-contracts.md) | The WASM contract VM, deploy-time validation, token standards |
-| [SDK](developers/sdk.md) | Client-side protocol definitions and how to build and sign transactions |
+| [Security](developers/security.md) | What developers must do to keep users and servers safe |
 | [1DEV burn contract](developers/1dev-burn-contract.md) | The Solana Anchor program behind Phase 1 activation burns |
+| [QNet Link v1](protocols/qnet-link-v1.md) | aiqnet.io ↔ wallet requests: the encrypted phone link, its relay, `qnet_activateNode`, test vectors |
+| [Light node messages](protocols/light-node-messages.md) | What the wallet key, the ping key and the device key sign for a light node: binding, answers, the device check, statements, status, test vectors |
 
 ## Use the applications
 
@@ -61,7 +69,7 @@ types, `Light` and `Super`.
 | [Mobile wallet](applications/mobile-wallet.md) | The React Native wallet and Light node client |
 | [Browser wallet](applications/browser-wallet.md) | The browser extension wallet |
 | [Explorer](applications/explorer.md) | The block explorer front end and its backend |
-| [CLI](applications/cli.md) | The command-line tool |
+| [CLI](applications/cli.md) | The read-only Python command-line tool |
 
 ## Repository documents
 
@@ -79,8 +87,8 @@ If you are new to the codebase, read [architecture/overview.md](architecture/ove
 [architecture/consensus.md](architecture/consensus.md) and
 [architecture/state.md](architecture/state.md). Operators can go straight to
 [operators/running-a-node.md](operators/running-a-node.md) and
-[operators/configuration.md](operators/configuration.md). Application developers generally need only
-[developers/rpc-api.md](developers/rpc-api.md) and [developers/sdk.md](developers/sdk.md).
+[operators/configuration.md](operators/configuration.md). Application developers start with
+[developers/overview.md](developers/overview.md).
 
 ## Conventions used here
 

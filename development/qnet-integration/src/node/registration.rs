@@ -148,11 +148,8 @@ impl BlockchainNode {
                 last_macroblock_index,
                 api_endpoint: api_endpoint.to_string(),
             },
-            data: Some(format!(
-                "node_reactivation:{}:h={}:mb={}:{}",
-                node_id, current_height, last_macroblock_index,
-                qnet_state::char_prefix(&last_macroblock_hash, 16)
-            )),
+            data: Some(qnet_state::Transaction::reactivation_data(
+                node_id, current_height, last_macroblock_index, last_macroblock_hash)),
             dilithium_signature: None,    // Filled by caller for Super nodes
             dilithium_public_key: None,   // Filled by caller for Super nodes
             chain_id: qnet_state::transaction::QNET_CHAIN_ID,
@@ -863,10 +860,6 @@ impl BlockchainNode {
         // copy was pure duplication: one heartbeat per node per subwindow, 100k nodes, is the single
         // largest recurring wire cost in the protocol — this halves it.
         let hb_sig = identity?.sign(hb_msg.as_bytes()).ok()?;
-        let epoch = current_height / 14400;
-        let subwindow = (current_height % 14400) / 1440;
-        let current_time = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
         let mut tx = qnet_state::Transaction {
             from: node_id.to_string(),
             to: None,
@@ -876,13 +869,15 @@ impl BlockchainNode {
                 anchor_height,
                 anchor_hash,
             },
-            timestamp: current_time,
+            // The signature covers only the anchor, so every other envelope field is the one value the
+            // tx_target_bound rule pins (check_commitment_envelope): no time, the anchor's slot as nonce.
+            timestamp: 0,
             hash: String::new(),
             signature: None,
             public_key: None,
             gas_price: u64::MAX,
             gas_limit: 0,
-            nonce: epoch * 10 + subwindow + 1,
+            nonce: qnet_state::Transaction::heartbeat_nonce(anchor_height),
             data: None,
             dilithium_signature: Some(hb_sig),
             // Signer LABEL, not a key: the consensus key is resolved from committed state.
@@ -941,14 +936,6 @@ impl BlockchainNode {
                      bitmap.len() / 1024, bitmap_compressed.len() / 1024);
         }
         
-        let current_time = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        
-        let shard_index = genesis_id.strip_prefix("genesis_node_")
-            .and_then(|n| n.parse::<u64>().ok())
-            .filter(|n| (1..=5).contains(n)).map(|n| n - 1).unwrap_or(0);
         let mut tx = qnet_state::Transaction {
             from: signer_id.to_string(),
             to: None,
@@ -960,18 +947,17 @@ impl BlockchainNode {
                 eligible_count,
                 bitmap_compressed,
             },
-            timestamp: current_time,
+            // Nothing signs the time: zero, as the tx_target_bound rule pins it (check_commitment_envelope).
+            timestamp: 0,
             hash: String::new(),
             signature: None,
             public_key: None,
             gas_price: u64::MAX, // System TX priority
             gas_limit: 0,        // FREE operation
-            // Deterministic and unique per (epoch, shard). One owner can now emit for its own shard AND
-            // for a shard it covers in the SAME epoch; the mempool indexes a sender's TXs by nonce, so
-            // a shared nonce would have let the second bitmap evict the first.
-            nonce: epoch * 10 + shard_index + 1,
-            data: Some(format!("Light Node Bitmap: {} eligible / {} assigned, epoch {}", 
-                              eligible_count, index_span, epoch)),
+            // Deterministic and unique per (epoch, shard): one owner emits for its own shard AND for a shard
+            // it covers in the same epoch, and the rule pins this value.
+            nonce: qnet_state::Transaction::light_bitmap_nonce(genesis_id, epoch),
+            data: Some(qnet_state::Transaction::bitmap_data(eligible_count, index_span, epoch)),
             dilithium_signature: None,
             dilithium_public_key: None,
             chain_id: qnet_state::transaction::QNET_CHAIN_ID,
@@ -1077,22 +1063,10 @@ impl BlockchainNode {
             Some(x) if x.len() == 3309 => x,
             _ => return false,
         };
-        // The resolved key must match the commitment in the CANONICAL registry row. producer_verify_pk
-        // also reads the standalone vrf_pk_ row and the RAM registry, neither of which is pruned when a
-        // branch is reorged out — accepting a key that only those hold would make a block-validity
-        // verdict depend on which branches this node happened to apply. Genesis rows carry the same
-        // commitment (written by apply_genesis_registrations), so the rule is uniform.
-        let committed_tag = match storage.node_signer_key_commitment(node_id) {
-            Ok(Some(t)) => t,
-            _ => return false,
+        let pk = match Self::heartbeat_signer_pk(storage, node_id) {
+            Some(p) => p,
+            None => return false,
         };
-        let pk = match crate::node::producer_verify_pk(storage, node_id) {
-            Some(p) if p.len() == 1952 => p,
-            _ => return false,
-        };
-        if hex::encode(Sha3_256::digest(&pk)) != committed_tag {
-            return false;
-        }
         let d3_sig = match <dilithium3::DetachedSignature as SigTrait>::from_bytes(sig) {
             Ok(x) => x, Err(_) => return false,
         };
@@ -1101,6 +1075,21 @@ impl BlockchainNode {
         };
         dilithium3::verify_detached_signature(
             &d3_sig, Self::build_canonical_verify_message(tx).as_bytes(), &d3_pk).is_ok()
+    }
+
+    /// The key a heartbeat signed by `node_id` is verified against, None when none resolves (the heartbeat
+    /// is then refused). Once it resolves no chain apply changes it: the commitment is write-once and only a
+    /// key hashing to it is returned. Outside chain apply it can stop resolving: a reorg prunes the row, and
+    /// the registration RPC can overwrite the RAM key this reads first with one that does not hash to it.
+    pub(crate) fn heartbeat_signer_pk(storage: &crate::storage::Storage, node_id: &str) -> Option<Vec<u8>> {
+        // The resolved key must match the commitment in the CANONICAL registry row. producer_verify_pk
+        // also reads the standalone vrf_pk_ row and the RAM registry, neither of which is pruned when a
+        // branch is reorged out — accepting a key that only those hold would make a block-validity
+        // verdict depend on which branches this node happened to apply. Genesis rows carry the same
+        // commitment (written by apply_genesis_registrations), so the rule is uniform.
+        let committed_tag = storage.node_signer_key_commitment(node_id).ok().flatten()?;
+        let pk = crate::node::producer_verify_pk(storage, node_id).filter(|p| p.len() == 1952)?;
+        (hex::encode(Sha3_256::digest(&pk)) == committed_tag).then_some(pk)
     }
 
     /// Write a canonical block's side indices. THE single durable writer for them: called only after
@@ -1333,6 +1322,31 @@ impl BlockchainNode {
         healed
     }
 
+    /// Fill the light uptime index (status `counted`) for the finished epochs of its window that this
+    /// node has not indexed and still holds the committed bitmaps of: the epochs before the binary
+    /// that keeps the index ran, and the ones a node missed while it was down. Oldest first, one roster
+    /// walk each, off every lock; an epoch without bitmaps here is left unindexed, never read as missed.
+    pub(crate) fn backfill_light_uptime(storage: &crate::storage::Storage, current_height: u64) -> u32 {
+        const EPOCH_BLOCKS: u64 = 14400;
+        let Some(end) = (current_height / EPOCH_BLOCKS).checked_sub(1) else { return 0; };
+        let first = end.saturating_sub(crate::storage::LIGHT_UPTIME_WINDOW - 1);
+        let mut filled = 0u32;
+        for ep in first..=end {
+            if storage.light_uptime_derived(ep) { continue; }
+            if storage.load_light_bitmaps(ep).map_or(true, |b| b.is_empty()) { continue; }
+            match storage.snapshot_light_uptime(ep, light_roster_cutoff(ep)) {
+                Ok(_) => filled += 1,
+                Err(err) => if is_warn() {
+                    println!("[WARN][REWARDS] light_uptime_backfill_failed epoch={} err={}", ep, err);
+                },
+            }
+        }
+        if filled > 0 && is_info() {
+            println!("[INFO][REWARDS] light_uptime_backfilled epochs={} through={}", filled, end);
+        }
+        filled
+    }
+
     /// Re-freeze any epoch that holds a 2f+1-certified reward_root but whose sharded leaf-set is Absent
     /// locally (freeze-race, or a snapshot/catch-up that carried the root but not the shard). Re-derives
     /// from the committed super_elig_/light_bm_ indices, verifies the set recombines to the certified root,
@@ -1433,6 +1447,14 @@ impl BlockchainNode {
         for tx in transactions {
             if tx.tx_type != qnet_state::TransactionType::RewardDistribution
                || tx.from != StateManager::REWARDS_POOL {
+                continue;
+            }
+            // The predicate every other judge runs: from the gate a claim whose unsigned envelope was
+            // rewritten credits nothing, on the validator and the producer-inline path alike.
+            if let Err(e) = tx.check_signed_target_bound(height) {
+                if is_warn() {
+                    println!("[WARN][REWARDS] claim_refused h={} reason={} action=skip_tx", height, e);
+                }
                 continue;
             }
             let to = match &tx.to { Some(w) => w, None => continue };

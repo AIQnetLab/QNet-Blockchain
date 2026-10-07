@@ -1,0 +1,54 @@
+[package]
+name = "qnet-device-oracle"
+version = "0.1.0"
+edition = "2021"
+authors = ["Orrery Group LLC"]
+description = "QNet device oracle: the per-device slot lease, vendor checks and lease statements for light nodes"
+license = "BUSL-1.1"
+publish = false
+
+# Its own workspace: the oracle is built and deployed on its own hosts and is never linked into the node.
+[workspace]
+
+[lib]
+name = "qnet_device_oracle"
+path = "src/lib.rs"
+
+[[bin]]
+name = "qnet-device-oracle"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+bincode = "1.3"
+base64 = "0.22"
+hex = "0.4"
+sha3 = "0.10"
+parking_lot = "0.12"
+aws-lc-rs = { version = "1.15", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm", "alloc"] }
+pqcrypto-mldsa = "0.1"
+pqcrypto-traits = "0.3"
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "prefer-post-quantum"] }
+httparse = "1.8"
+# The evidence verifier the genesis attestors use: receipts, Play verdicts, the revocation list.
+qnet-device-attest = { path = "../../core/qnet-device-attest" }
+reqwest = { version = "0.11", default-features = false, features = ["blocking", "rustls-tls"] }
+rocksdb = { version = "0.21", default-features = false }
+
+[dev-dependencies]
+tempfile = "3.8"
+rcgen = "0.12"
+
+[profile.dev]
+debug = 1
+
+[profile.test]
+opt-level = 1
+
+[profile.release]
+opt-level = 3
+debug = false
+strip = "debuginfo"
+lto = "fat"
+codegen-units = 1

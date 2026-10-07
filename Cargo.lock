@@ -3283,6 +3283,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "qnet-device-attest"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "ring",
+ "serde_json",
+]
+
+[[package]]
 name = "qnet-integration"
 version = "0.1.0"
 dependencies = [
@@ -3329,6 +3338,7 @@ dependencies = [
  "proptest-derive",
  "qnet-consensus",
  "qnet-core",
+ "qnet-device-attest",
  "qnet-mempool",
  "qnet-sharding",
  "qnet-state",
@@ -3340,6 +3350,7 @@ dependencies = [
  "rcgen",
  "reed-solomon-erasure",
  "reqwest",
+ "ring",
  "rocksdb",
  "rsa",
  "rustls 0.23.36",

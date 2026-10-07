@@ -1,41 +1,18 @@
 /**
- * Production-safe logger utility
- * Logs only in development mode (__DEV__ = true)
- * In production, all logs are disabled to improve performance
+ * Diagnostics for development builds only: every method is a no-op in a release build (and the release
+ * bundle has its console calls stripped anyway, see babel.config.js). Never pass a token, challenge,
+ * activation code, burn transaction, address or URL with a query to it.
  */
 
 const isDev = typeof __DEV__ !== 'undefined' ? __DEV__ : false;
+const noop = () => {};
 
 export const logger = {
-  log: (...args) => {
-    if (isDev) {
-      console.log(...args);
-    }
-  },
-  
-  error: (...args) => {
-    // Always log errors, even in production (for crash reporting).
-    console.error(...args);
-  },
-  
-  warn: (...args) => {
-    if (isDev) {
-      console.warn(...args);
-    }
-  },
-  
-  info: (...args) => {
-    if (isDev) {
-      console.info(...args);
-    }
-  },
-  
-  debug: (...args) => {
-    if (isDev) {
-      console.debug(...args);
-    }
-  }
+  log: isDev ? (...args) => console.log(...args) : noop,
+  error: isDev ? (...args) => console.error(...args) : noop,
+  warn: isDev ? (...args) => console.warn(...args) : noop,
+  info: isDev ? (...args) => console.info(...args) : noop,
+  debug: isDev ? (...args) => console.debug(...args) : noop,
 };
 
 export default logger;
-

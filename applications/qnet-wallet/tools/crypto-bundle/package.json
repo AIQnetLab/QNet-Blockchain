@@ -1,0 +1,28 @@
+{
+  "name": "qnet-crypto-bundle",
+  "version": "3.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Builds dist/lib/qnet-core.js, the one crypto module of the QNet wallet extension",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "node build.js",
+    "build:dev": "node build.js --dev"
+  },
+  "dependencies": {
+    "@noble/curves": "2.4.0",
+    "@noble/hashes": "2.4.0",
+    "@noble/post-quantum": "0.7.1",
+    "@scure/base": "2.4.0",
+    "@scure/bip39": "2.4.0",
+    "buffer": "6.0.3",
+    "hash-wasm": "4.12.0",
+    "js-sha3": "0.9.3"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2"
+  }
+}

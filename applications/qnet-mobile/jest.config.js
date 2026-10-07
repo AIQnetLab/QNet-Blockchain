@@ -15,4 +15,7 @@ module.exports = {
     '^rpc-websockets/(.*)$': '<rootDir>/node_modules/rpc-websockets/dist/$1',
   },
   setupFiles: ['<rootDir>/jest.setup.js'],
+  // As CI runs the suite (ios-build.yml): the first new-password check of a test file builds the estimator's word
+  // lists of eleven languages, which takes seconds on its own.
+  testTimeout: 60000,
 };

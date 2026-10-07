@@ -5,7 +5,7 @@
  */
 import {
   historyRowKey, splitExplorerItems, tokenRowFromEvent, mergeHistory, appendHistory, cacheableHistory, fmtTokenBaseUnits,
-  txDirection,
+  txDirection, nodeNativeRow,
 } from '../src/utils/txHistory';
 
 const ME = 'aaaaaaaaaaaaaaaaaaaeonaaaaaaaaaaaaaaaaaaaaaa';
@@ -97,8 +97,120 @@ describe('tx history', () => {
     expect(token.type).toBe('self');
   });
 
+  it("a node's row is only reported: the archive's row confirms it, and a node never downgrades an archived row", () => {
+    const nodeRow = nodeNativeRow({ hash: 'h1', from: OTHER, to: ME, amount: 2_500_000_000, fee: 150_000, timestamp: (NOW - 5_000) / 1000 }, ME);
+    expect(nodeRow).toMatchObject({ status: 'reported', type: 'receive', amount: 2.5, fee: 0.00015 });
+    expect(cacheableHistory([nodeRow])).toEqual([]);
+
+    // The explorer's row for the same transaction comes first in a refresh and wins.
+    const archived = row('h1', NOW - 5_000);
+    const both = mergeHistory([], [archived, nodeRow], { myAddress: ME, coveredFromMs: 0, nowMs: NOW, nodeEventsOk: true });
+    expect(both).toEqual([archived]);
+
+    // A later refresh that did not ask the explorer brings only the node's row: the archived one stays.
+    const later = mergeHistory(both, [nodeRow], { myAddress: ME, coveredFromMs: Infinity, nowMs: NOW, nodeEventsOk: true });
+    expect(later).toEqual([archived]);
+
+    // Only a node knows it so far: shown as reported.
+    const only = mergeHistory([], [nodeRow], { myAddress: ME, coveredFromMs: Infinity, nowMs: NOW, nodeEventsOk: true });
+    expect(only[0].status).toBe('reported');
+  });
+
   it('formats base units exactly past 2^53', () => {
     expect(fmtTokenBaseUnits('18446744073709551615', 0)).toBe('18,446,744,073,709,551,615');
     expect(fmtTokenBaseUnits('1500000000', 9)).toBe('1.5');
+  });
+});
+
+describe('a node\'s transaction lookup (MOBNET-R2-01)', () => {
+  const { txLookupState } = require('../src/utils/txHistory');
+  const H = 'ab'.repeat(32);
+  it('"found" in a mempool is pending, never included', () => {
+    const mempool = { tx_hash: H, status: 'found', transaction: { hash: H, status: 'pending', block_height: null } };
+    expect(txLookupState(mempool, H)).toBe('pending');
+  });
+  it('included only with a block height and the stored status', () => {
+    expect(txLookupState({ status: 'found', transaction: { hash: H, status: 'confirmed', block_height: 1234 } }, H)).toBe('included');
+    expect(txLookupState({ status: 'found', transaction: { hash: H, status: 'confirmed', block_height: null } }, H)).toBe('unknown');
+    expect(txLookupState({ status: 'found', transaction: { hash: H, status: 'confirmed', block_height: '12' } }, H)).toBe('unknown');
+    expect(txLookupState({ status: 'found', transaction: { hash: 'cd'.repeat(32), status: 'confirmed', block_height: 5 } }, H)).toBe('unknown');
+  });
+  it('absent and malformed answers', () => {
+    expect(txLookupState({ status: 'not_found', transaction: null }, H)).toBe('absent');
+    expect(txLookupState(null, H)).toBe('unknown');
+    expect(txLookupState({ status: 'error' }, H)).toBe('unknown');
+  });
+  it('the result card polls with this rule, not with "found"', () => {
+    const src = require('fs').readFileSync(require('path').join(__dirname, '../src/screens/WalletScreen.js'), 'utf8');
+    expect(src).toMatch(/if \(txLookupState\(txData, txHash\) === 'included'\) \{/);
+    expect(src).not.toMatch(/txData\.status !== 'not_found'/);
+  });
+});
+
+describe('a landed send is never left "Not found" (L-10)', () => {
+  const { rowsDueToDrop, PENDING_ROW_MAX_MS, historyBadge } = require('../src/utils/txHistory');
+  const sent = (hash, ts, extra = {}) => ({ ...row(hash, ts), from: ME, to: OTHER, type: 'send', status: 'pending', ...extra });
+  const opts = (extra = {}) => ({ myAddress: ME, coveredFromMs: Infinity, nowMs: NOW, nodeEventsOk: true, ...extra });
+
+  it('a confirmed or reported row with its hash replaces a pending or not-found row, on an older page too', () => {
+    const dropped = sent('h-landed', NOW - PENDING_ROW_MAX_MS - 1, { status: 'dropped' });
+    const pending = sent('h-pending', NOW - 1_000);
+    // Scrolled to the page that holds them: the archive's rows come after the rows already shown, and still win.
+    const out = appendHistory([dropped, pending], [row('h-landed', NOW - PENDING_ROW_MAX_MS - 1, { from: ME, to: OTHER, type: 'send' })]);
+    expect(out.filter((r) => r.hash === 'h-landed')).toHaveLength(1);
+    expect(historyBadge(out.find((r) => r.hash === 'h-landed'))).toBe('confirmed');
+    const reported = appendHistory([pending], [{ ...row('h-pending', NOW - 900), from: ME, to: OTHER, type: 'send', status: 'reported' }]);
+    expect(reported).toHaveLength(1);
+    expect(reported[0].status).toBe('reported');
+    // A row of another hash stays as it is.
+    expect(appendHistory([dropped], [row('other', NOW - 5_000)]).map((r) => r.status).sort()).toEqual(['confirmed', 'dropped']);
+    // A send that ran and failed is "Failed", not "Not found".
+    const failed = appendHistory([dropped], [row('h-landed', NOW - PENDING_ROW_MAX_MS - 1, { from: ME, to: OTHER, type: 'send', status: 'failed' })]);
+    expect(failed.map((r) => historyBadge(r))).toEqual(['failed']);
+  });
+
+  it('names the rows a merge would mark not found, and only those', () => {
+    const due = sent('due', NOW - PENDING_ROW_MAX_MS);
+    const young = sent('young', NOW - PENDING_ROW_MAX_MS + 1);
+    const carried = sent('carried', NOW - PENDING_ROW_MAX_MS - 5);
+    const notMine = { ...sent('theirs', NOW - PENDING_ROW_MAX_MS - 5), from: OTHER };
+    const already = sent('already', NOW - PENDING_ROW_MAX_MS - 5, { status: 'dropped' });
+    expect(rowsDueToDrop([due, young, carried, notMine, already], [row('carried', NOW - 10)], { myAddress: ME, nowMs: NOW }).map((r) => r.hash))
+      .toEqual(['due']);
+  });
+
+  it('the chain\'s answer by nonce decides before "Not found": landed, taken by another, or not read yet', () => {
+    const at = NOW - PENDING_ROW_MAX_MS - 1;
+    const prev = [sent('landed', at), sent('copy', at - 1), sent('gone', at - 2), sent('unread', at - 3), sent('silent', at - 4)];
+    const settled = new Map([
+      ['landed', { landed: true, txHash: 'landed' }],
+      ['copy', { landed: true, txHash: 'hedged-copy' }],
+      ['gone', { gone: true }],
+      ['unread', { unread: true }],
+    ]);
+    const out = mergeHistory(prev, [], opts({ settled }));
+    const by = (h) => out.find((r) => r.hash === h);
+    expect(by('landed').status).toBe('reported');
+    expect(by('hedged-copy').status).toBe('reported');
+    expect(by('copy')).toBeUndefined();
+    expect(by('gone')).toBeUndefined();
+    expect(by('unread').status).toBe('pending');
+    expect(by('silent').status).toBe('dropped');
+    // The archive's row of the copy that landed replaces the reported one once it is listed.
+    const later = mergeHistory(out, [{ ...row('hedged-copy', at), from: ME, to: OTHER, type: 'send' }], opts({ coveredFromMs: 0 }));
+    expect(later.filter((r) => r.hash === 'hedged-copy').map((r) => r.status)).toEqual(['confirmed']);
+  });
+
+  it('the screen asks by nonce before marking, and the result card\'s settle removes a not-found row too', () => {
+    const src = require('fs').readFileSync(require('path').join(__dirname, '../src/screens/WalletScreen.js'), 'utf8');
+    const load = src.slice(src.indexOf('const loadTxHistory = async'), src.indexOf('const loadOlderHistory = async'));
+    expect(load.indexOf('rowsDueToDrop(txHistoryRef.current, freshRows')).toBeGreaterThan(0);
+    expect(load.indexOf('walletManager.resolveSubmitByNonce(s.from, s.nonce')).toBeGreaterThan(load.indexOf('rowsDueToDrop('));
+    expect(load.indexOf('mergeHistory(prev, freshRows')).toBeGreaterThan(load.indexOf('walletManager.resolveSubmitByNonce('));
+    expect(load).toMatch(/nodeEventsOk: !!nodeEventsData, settled,/);
+    expect(src).toMatch(/addPendingTxToHistory\(result\.txHash, sendAddress, amount, TRANSFER_FEE_QNC, null, settle\);/);
+    expect(src).toMatch(/\}, settle\);/);
+    const poll = src.slice(src.indexOf('const settleByNonce = async'), src.indexOf('const settleLater = '));
+    expect(poll.match(/unsettledRow\(r\) && r\.hash === txHash/g)).toHaveLength(2);
   });
 });

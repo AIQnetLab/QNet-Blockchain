@@ -55,7 +55,7 @@ struct ActivationCodeData {
     node_type: NodeType,
     tx_hash: String,
     wallet_address: String,
-    purchase_phase: u8,    // Phase when code was purchased (for info only)
+    purchase_phase: u8,    // Phase when the code was made (for info only)
 }
 
 // Helper function for masking activation codes
@@ -219,7 +219,7 @@ async fn validate_phase_and_pricing(phase: u8, node_type: NodeType, pricing: &Pr
             // Phase 1: Quantum-secure validation with Light node blocking
             let decoded = decode_activation_code_quantum_secure(activation_code, node_type).await?;
             println!("   🔐 Quantum decryption successful for Phase 1");
-            println!("   💰 Payment verified: Code purchased during Phase {}", decoded.purchase_phase);
+            println!("   💰 Activation code made during Phase {}", decoded.purchase_phase);
             
             // CRITICAL: Verify burn transaction on Solana blockchain
             // decoded.wallet_address is only a 5-byte prefix on first launch (before registry);
@@ -238,12 +238,12 @@ async fn validate_phase_and_pricing(phase: u8, node_type: NodeType, pricing: &Pr
         2 => {
             println!("   📊 Phase 2: Tiered pricing based on node type");
             println!("   💰 Action: TRANSFER {} QNC TOKENS to Pool 3", price as u64);
-            println!("   ⚠️  Critical: Must match activation code purchased type");
+            println!("   ⚠️  Critical: Must match the node type of the activation code");
             
             // Phase 2: Quantum-secure validation with Light node blocking
             let decoded = decode_activation_code_quantum_secure(activation_code, node_type).await?;
             println!("   🔐 Quantum decryption successful for Phase 2");
-            println!("   💰 Payment verified: Code purchased during Phase {}", decoded.purchase_phase);
+            println!("   💰 Activation code made during Phase {}", decoded.purchase_phase);
             
             println!("   ✅ Phase 2 validation passed with quantum security");
         },

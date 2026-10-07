@@ -21,9 +21,15 @@ impl BlockchainNode {
         if let Err(validation_error) = tx.validate() {
             return Err(QNetError::ValidationError(format!("Transaction validation failed: {}", validation_error)));
         }
+        Self::target_bound_admissible(&tx, Self::admission_height())?;
         if !Self::gas_limit_admissible(&tx) {
             return Err(QNetError::ValidationError(format!(
                 "gas_limit {} exceeds MAX_GAS_LIMIT {}", tx.gas_limit, qnet_state::gas_limits::MAX_GAS_LIMIT)));
+        }
+        // The very transfer the sender signed, already pending here under a re-stamped hash: the answer names
+        // the hash that will land. Any other copy is refused before a verify.
+        if let Some(pending) = self.pending_copy(&tx)? {
+            return Ok(pending);
         }
         crate::node::refuse_held_commitment(&self.state, &tx).await.map_err(QNetError::ValidationError)?;
 
@@ -95,6 +101,13 @@ impl BlockchainNode {
         // block validation rejects, or the TX poisons every block a producer packs it into.
         Self::reactivation_key_admissible(&self.get_storage(), &tx)
             .map_err(|e| QNetError::ValidationError(format!("[REJECT][RPC] {}", e)))?;
+
+        // The registration judge the gossip door, the producer and block validation run, at the height the
+        // producer will judge the TX: this door must not pool one they refuse.
+        if matches!(tx.tx_type, qnet_state::TransactionType::NodeRegistration { .. }) {
+            Self::verify_burn_attestation_quorum(&tx, Self::admission_height(), &self.get_storage()).await
+                .map_err(|e| QNetError::ValidationError(format!("[REJECT][RPC] {}", e)))?;
+        }
 
         // DECENTRALIZED: System transactions don't need signature
         // validated through deterministic consensus rules, not crypto signature
@@ -192,6 +205,9 @@ impl BlockchainNode {
                 );
                 // "Self-verifying" now means "verify the EMBEDDED proof here": the apply arm marks the
                 // offender's account, so a junk proof must never reach it.
+                if self_verifying {
+                    self.refuse_redundant_proof(&tx).await?;
+                }
                 if self_verifying
                     && !Self::equivocation_proof_verified(&self.get_storage(), &tx).await {
                     return Err(QNetError::ValidationError(
@@ -316,9 +332,11 @@ impl BlockchainNode {
                 .ok_or_else(|| QNetError::ValidationError(
                     format!("Gas calculation overflow: {} * {}", effective_gas, tx.gas_limit)
                 ))?;
-            let required_balance = tx.amount.checked_add(gas_cost)
+            let moved = Self::debited_value(&tx)
+                .ok_or_else(|| QNetError::ValidationError("Transfer amounts overflow".to_string()))?;
+            let required_balance = moved.checked_add(gas_cost)
                 .ok_or_else(|| QNetError::ValidationError(
-                    format!("Balance calculation overflow: {} + {}", tx.amount, gas_cost)
+                    format!("Balance calculation overflow: {} + {}", moved, gas_cost)
                 ))?;
             
             if sender_balance < required_balance {
@@ -333,10 +351,9 @@ impl BlockchainNode {
             if is_info() { println!("[INFO][TX] system_tx_bypass_validation from={}", tx.from); }
         }
         
-        // PRODUCTION v2.77: Use BLAKE3 via calculate_hash() for consistency
-        // CRITICAL: calculate_hash() excludes signature - no circular dependency!
-        // This ensures TX hash is the same everywhere (mobile, explorer, blockchain)
-        let tx_hash = tx.calculate_hash();
+        // The SHA3-256 canonical hash (it excludes the signatures), the same everywhere: validate() at the
+        // top refused this TX unless tx.hash == calculate_hash().
+        let tx_hash = tx.hash.clone();
         
         // bincode still used for mempool storage (fast binary serialization)
         let tx_bytes = bincode::serialize(&tx)
@@ -375,11 +392,12 @@ impl BlockchainNode {
         
         // v2.72: Broadcast PendingTx via WebSocket for real-time explorer updates
         if added {
+            let (shown_to, shown_amount) = crate::rpc::tx_display_to_amount(&tx);
             crate::rpc::broadcast_ws_event(crate::rpc::WsEvent::PendingTx {
                 tx_hash: tx_hash.clone(),
                 from: tx.from.clone(),
-                to: tx.to.clone().unwrap_or_default(),
-                amount: tx.amount,
+                to: shown_to.unwrap_or_default(),
+                amount: shown_amount,
             });
         }
         
@@ -613,6 +631,16 @@ impl BlockchainNode {
     /// permanently: a future TX type that adopts a new signature format
     /// only needs to be handled here, and both paths pick it up.
     pub(crate) async fn verify_dilithium_tx_signature_async(tx: &qnet_state::Transaction, lane: VerifyLane) -> Result<bool, QNetError> {
+        Self::verify_dilithium_tx_signature_on(tx, lane, None).await
+    }
+
+    /// `verify_dilithium_tx_signature_async` reading committed rows from `storage` (None: the node's own
+    /// storage). The block verify stage passes the storage it reads every other row of the block from.
+    pub(crate) async fn verify_dilithium_tx_signature_on(
+        tx: &qnet_state::Transaction,
+        lane: VerifyLane,
+        storage: Option<&crate::storage::Storage>,
+    ) -> Result<bool, QNetError> {
         use crate::quantum_crypto::DilithiumSignature;
 
         // PURE DILITHIUM (F0.1): value-moving user TX are authorised by a DIRECT ML-DSA-65 verify
@@ -654,8 +682,11 @@ impl BlockchainNode {
         // Heartbeat carries a RAW detached signature and NO key (the key is resolved from committed
         // state), so it never reaches the envelope path below.
         if matches!(&tx.tx_type, qnet_state::TransactionType::Heartbeat { .. }) {
-            let storage = crate::node::get_storage();
-            return Ok(Self::verify_heartbeat_dilithium(tx, &storage));
+            let storage = match storage {
+                Some(s) => s,
+                None => crate::node::get_storage().as_ref(),
+            };
+            return Ok(Self::verify_heartbeat_dilithium(tx, storage));
         }
 
         // FIX-5: node-signed SYSTEM TXs (ping/commitment/bitmap) keep the registry-envelope
@@ -721,6 +752,26 @@ impl BlockchainNode {
         }
     }
 
+    /// The signer label the registry-envelope arm of `verify_dilithium_tx_signature_on` looks up for `tx`:
+    /// its key binding in the consensus key registry decides the verdict (bound, only that key verifies;
+    /// unbound, a first-seen key does). None when `tx` never reaches that arm (a value TX, a lifecycle TX
+    /// verified against its wire key, a heartbeat, an unsigned TX) or when the arm looks up a raw key's hex,
+    /// which no registration binds.
+    pub(crate) fn registry_envelope_signer(tx: &qnet_state::Transaction) -> Option<String> {
+        if tx.is_value_class() || tx.dilithium_signature.as_ref().map_or(true, |s| s.is_empty()) {
+            return None;
+        }
+        match &tx.tx_type {
+            qnet_state::TransactionType::NodeReactivation { .. } | qnet_state::TransactionType::Heartbeat { .. } => None,
+            qnet_state::TransactionType::NodeRegistration { .. }
+                if tx.data.as_deref().unwrap_or("").starts_with("client_node_reg:") => None,
+            _ => match tx.dilithium_public_key.as_deref() {
+                Some(pk) if !pk.is_empty() && pk.len() != 1952 => Some(String::from_utf8_lossy(pk).into_owned()),
+                _ => None,
+            },
+        }
+    }
+
     /// FIX-5: fill an elided value-TX's dilithium_public_key from the COMMITTED in-mem StateManager.
     /// Resolves ONLY from `State::get_account` (never the detached accounts CF, never an intra-block
     /// scratch view) so two honest validators feed byte-identical pk bytes into verify_detached. A
@@ -756,9 +807,90 @@ impl BlockchainNode {
         Self::verify_user_tx_dilithium_at(tx, Self::admission_height())
     }
 
+    /// The native value a TX debits besides its fee, as apply reads it: a batch's transfers (apply never
+    /// reads its envelope), every other class its signed amount. None when a batch's sum overflows.
+    pub(crate) fn debited_value(tx: &qnet_state::Transaction) -> Option<u64> {
+        match &tx.tx_type {
+            qnet_state::TransactionType::BatchTransfers { transfers, .. } =>
+                transfers.iter().try_fold(0u64, |acc, t| acc.checked_add(t.amount)),
+            _ => Some(tx.amount),
+        }
+    }
+
     /// The height a TX entering the pool is judged at: the next block.
-    fn admission_height() -> u64 {
+    pub(crate) fn admission_height() -> u64 {
         crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Acquire).saturating_add(1)
+    }
+
+    /// The signed-target rule at every door (RPC, gossip, benchmark), judged at `height`, the admission
+    /// height: the pool then holds nothing that producer_tx_prepare and block validation refuse there.
+    /// Every door runs validate() on the same value first, which already pinned the hash to the body, so
+    /// the rule's own SHA3 is skipped here.
+    pub(crate) fn target_bound_admissible(tx: &qnet_state::Transaction, height: u64) -> Result<(), QNetError> {
+        tx.check_signed_target_bound_validated(height)
+            .and_then(|_| Self::vote_proof_envelope_bound(tx, height))
+            .map_err(|e| QNetError::ValidationError(format!("Transaction validation failed: {}", e)))
+    }
+
+    /// The tx_target_bound rule as the producer and the block verify stage judge a TX at `height`: the shared
+    /// predicate both apply paths also run, plus its vote-proof half (vote_proof_envelope_bound), which needs
+    /// the Checkpoint type. The doors run the same pair through target_bound_admissible.
+    pub(crate) fn tx_target_bound(tx: &qnet_state::Transaction, height: u64) -> Result<(), String> {
+        tx.check_signed_target_bound(height)?;
+        Self::vote_proof_envelope_bound(tx, height)
+    }
+
+    /// O15: the identity of what the sender signed, SHA3-256(canonical preimage || signature). Every copy of one
+    /// signed TX has it, whatever hash a node's copy carries (a value TX's timestamp is in the hash, outside the
+    /// signature), so a wallet tracks this instead of a receipt hash. None for an unsigned TX.
+    pub fn signed_id(tx: &qnet_state::Transaction) -> Option<String> {
+        let sig = tx.dilithium_signature.as_deref().filter(|s| !s.is_empty())?;
+        let mut h = Sha3_256::new();
+        h.update(Self::build_canonical_verify_message(tx).as_bytes());
+        h.update(sig);
+        Some(hex::encode(h.finalize()))
+    }
+
+    /// Admission only, before any verify (no gate): a relay's copy of a pooled commitment that differs from it
+    /// only in fields no signature covers (SIGBIND-R1-01), or a second version of a pending value TX's
+    /// (from, nonce) paying no more (SIGBIND-R1-02). Each would cost a signature verify, the first also a pool
+    /// replacement, and adds nothing: one version lands. Ok(Some(hash)) when `tx` carries the pending
+    /// version's signature over the same body, re-stamped: the sender's own TX, pending under that hash.
+    fn pending_copy(&self, tx: &qnet_state::Transaction) -> Result<Option<String>, QNetError> {
+        if self.mempool.is_relayed_commitment_copy(tx) {
+            return Err(QNetError::ValidationError(format!(
+                "[REJECT][TX] commitment_copy_pending from={}", qnet_state::char_prefix(&tx.from, 20))));
+        }
+        let Some(held) = self.mempool.value_nonce_holder(tx) else { return Ok(None) };
+        // The same payment: every field the signature covers equal (a relay's re-stamp, or the wallet's own
+        // re-sign of it on a retry, fresh ML-DSA randomness and all). Nothing is stored for it, so its own
+        // signature needs no verify; the answer names the pending copy.
+        let same_signed = self.mempool.pooled_transaction(&held).map_or(false, |p| {
+            p.from == tx.from && p.nonce == tx.nonce && p.tx_type == tx.tx_type && p.to == tx.to && p.amount == tx.amount
+                && p.gas_price == tx.gas_price && p.gas_limit == tx.gas_limit && p.data == tx.data
+        });
+        if same_signed {
+            return Ok(Some(held));
+        }
+        Err(QNetError::ValidationError(format!(
+            "[REJECT][TX] nonce_already_pending from={} nonce={} pending={} (a replacement must pay a higher gas_price)",
+            qnet_state::char_prefix(&tx.from, 20), tx.nonce, qnet_state::char_prefix(&held, 16))))
+    }
+
+    /// Admission only: a slashing proof adds nothing while one against the same offender is pooled or once
+    /// that offender is banned (the ban is write-once), and verifying one costs two ML-DSA verifies. Refused
+    /// before those, so each distinct-hash copy of one proof costs a lookup. Block validity is unchanged.
+    async fn refuse_redundant_proof(&self, tx: &qnet_state::Transaction) -> Result<(), QNetError> {
+        let offender = match tx.slashed_offender() { Some(o) => o, None => return Ok(()) };
+        if self.mempool.has_pending_evidence_against(offender) {
+            return Err(QNetError::ValidationError(format!(
+                "[REJECT][SLASH] proof_already_pending offender={}", qnet_state::char_prefix(offender, 20))));
+        }
+        if self.state.read().await.get_account(offender).map_or(false, |a| a.banned_at_height > 0) {
+            return Err(QNetError::ValidationError(format!(
+                "[REJECT][SLASH] offender_already_banned offender={}", qnet_state::char_prefix(offender, 20))));
+        }
+        Ok(())
     }
 
     /// `verify_user_tx_dilithium` for a TX in the block at `height`: below the contract-gas gate a contract TX
@@ -830,16 +962,22 @@ impl BlockchainNode {
     /// committed pk is indistinguishable from not-yet-synced; dropping it would silently lose a valid tx).
     /// This is what makes producer apply verify-then-commit: a tx can never be applied+materialised into
     /// registry_root and then rejected+abandoned (the wedge that split a producer from n−f).
-    pub(super) fn producer_tx_prepare(tx: &qnet_state::Transaction, state: &qnet_state::State, snap_in_progress: bool) -> TxPrep {
+    pub(super) fn producer_tx_prepare(tx: &qnet_state::Transaction, state: &qnet_state::State, snap_in_progress: bool, height: u64) -> TxPrep {
         let is_client_nodereg = matches!(tx.tx_type,
             qnet_state::TransactionType::NodeRegistration { .. }
         ) && tx.data.as_deref().unwrap_or("").starts_with("client_node_reg:");
         let is_system_tx = !is_client_nodereg
             && (tx.is_system_tx() || tx.from.starts_with("system_"));
+        // Every class, before the system-TX admit: the block verify stage runs it on every tx at this height.
+        // A system TX gets the full rule; any other TX meets validate() next, which evicts a body its hash
+        // does not name at every height, so its rule skips that one SHA3 — the verdict is the same.
         if is_system_tx {
+            if Self::tx_target_bound(tx, height).is_err() {
+                return TxPrep::Evict;
+            }
             return TxPrep::Admit;
         }
-        if tx.validate().is_err() {
+        if tx.check_signed_target_bound_validated(height).is_err() || tx.validate().is_err() {
             return TxPrep::Evict;
         }
         if tx.is_value_class() {
@@ -960,7 +1098,8 @@ impl BlockchainNode {
     /// NodeRegistration / NodeActivation are deliberately NOT gated here: they carry an alternate
     /// authenticator (a Solana owner_signature for imported wallets, whose wallet == eon(solana_addr)
     /// ≠ eon(dpk)) and/or a deferred Dilithium sig, and their Sybil anchor is the deterministic 2f+1
-    /// burn-attestation quorum (verify_burn_attestation_quorum), not a signature-presence check.
+    /// burn-attestation quorum (verify_burn_attestation_quorum), not a signature-presence check. From the
+    /// tx_target_bound gate a NodeActivation is refused outright by Transaction::check_signed_target_bound.
     /// `height` is the block the verdict is for: the apply path passes the block's own height, the
     /// two admission doors pass the current tip. Rules that changed by feature gate must be evaluated
     /// at the height that will judge the TX, not at whatever this node happens to run.
@@ -1193,6 +1332,153 @@ impl BlockchainNode {
         node_id == expected
     }
 
+    /// The registration is signed by the wallet key it names: the envelope key derives to `wallet` and its
+    /// signature over the canonical message verifies.
+    pub(crate) fn registration_native_bound(tx: &qnet_state::Transaction, wallet: &str) -> bool {
+        tx.dilithium_public_key.as_deref()
+            .and_then(crate::crypto::solana_derivation::eon_from_qnet_dilithium_pubkey_bytes)
+            .as_deref() == Some(wallet)
+            && Self::verify_node_lifecycle_dilithium(tx)
+    }
+
+    /// From the tx_target_bound gate every identity field a registration commits sits under the WALLET
+    /// signature. Only the client form signs vrf_pk and api_endpoint, and only a native-bound registration
+    /// has a wallet signature at all: a Solana-derived one is authorised by the burner's signature over the
+    /// envelope key, which covers neither. So the client form is required, a Super must be native-bound (a
+    /// Solana-derived wallet registers Light), and a Light announces no endpoint (validate() says so, but
+    /// the block path never runs validate()). Genesis identities are exempted by the caller.
+    pub(crate) fn registration_signature_bound(
+        tx: &qnet_state::Transaction, native_bound: bool, height: u64,
+    ) -> Result<(), String> {
+        if !qnet_state::feature_gates::is_active(qnet_state::feature_gates::id::TX_TARGET_BOUND, height) {
+            return Ok(());
+        }
+        let (node_type, api_endpoint) = match &tx.tx_type {
+            qnet_state::TransactionType::NodeRegistration { node_type, api_endpoint, .. } => (node_type, api_endpoint),
+            _ => return Ok(()),
+        };
+        if !tx.data.as_deref().unwrap_or("").starts_with("client_node_reg:") {
+            return Err("burn_attestation_required: server-form registration (its signature covers no vrf_pk or endpoint)".to_string());
+        }
+        match node_type {
+            qnet_state::NodeType::Light if !api_endpoint.is_empty() =>
+                Err("burn_attestation_required: a light registration announces no endpoint".to_string()),
+            qnet_state::NodeType::Light => Ok(()),
+            _ if !native_bound =>
+                Err("burn_attestation_required: a super registration must be signed by the wallet key it names".to_string()),
+            _ => Ok(()),
+        }
+    }
+
+    /// The one-node rule for a registration of `node_id` by `wallet` judged at `height`: from the
+    /// wallet_one_node gate, the wallet's other chain-confirmed node registered below `height`, as
+    /// (node_id, node_type) (storage wallet_other_node). None below the gate or when the wallet has none.
+    /// Every door (RPC, gossip, the client submit, the attestor, the super server) and every judge (the
+    /// producer, block validation) asks this one function.
+    pub(crate) fn wallet_one_node_other(
+        storage: &crate::storage::Storage, wallet: &str, node_id: &str, height: u64,
+    ) -> Option<(String, String)> {
+        if !qnet_state::feature_gates::is_active(qnet_state::feature_gates::id::WALLET_ONE_NODE, height) {
+            return None;
+        }
+        storage.wallet_other_node(wallet, node_id, height)
+    }
+
+    /// `wallet_one_node_other` as the consensus refusal a registration gets.
+    pub(crate) fn wallet_one_node_refusal(
+        storage: &crate::storage::Storage, wallet: &str, node_id: &str, height: u64,
+    ) -> Option<String> {
+        Self::wallet_one_node_other(storage, wallet, node_id, height)
+            .map(|(other, node_type)| format!("wallet_has_node: wallet already has {} node {}", node_type, other))
+    }
+
+    /// The burner's owner bind over a registration: the v1 form (with the consent's time) at any height, or,
+    /// for a Light registration from the wallet_one_node gate, the v2 form without a time. A Super never takes
+    /// v2: its server signs the owner bind with the same phrase that burned, at the moment it registers.
+    pub(crate) fn burn_owner_bind_verifies(
+        node_id: &str, node_type: &qnet_state::NodeType, wallet: &str, reg_proof: &str, timestamp: u64,
+        attest_root: &[u8], burn_tx: &str, owner_sig: &str, burn_wallet: &str, height: u64,
+    ) -> bool {
+        let verify = |msg: String| crate::crypto::solana_derivation::verify_ed25519_signature(
+            msg.as_bytes(), owner_sig, burn_wallet).unwrap_or(false);
+        verify(qnet_state::Transaction::burn_owner_bind_message(node_id, wallet, reg_proof, timestamp, attest_root, burn_tx))
+            || (Self::owner_bind_v2_allowed(node_type, height)
+                && verify(qnet_state::Transaction::burn_owner_bind_message_v2(node_id, wallet, reg_proof, attest_root, burn_tx)))
+    }
+
+    /// Owner bind v2 is accepted for a Light registration judged at `height` from the wallet_one_node gate.
+    pub(crate) fn owner_bind_v2_allowed(node_type: &qnet_state::NodeType, height: u64) -> bool {
+        matches!(node_type, qnet_state::NodeType::Light)
+            && qnet_state::feature_gates::is_active(qnet_state::feature_gates::id::WALLET_ONE_NODE, height)
+    }
+
+    /// (wallet, node_id) of a registration the one-node rule counts: every NodeRegistration except a genesis
+    /// identity's (reg_proof "genesis" on a real genesis node id, protocol-minted and exempt).
+    pub(crate) fn one_node_registration_key(tx: &qnet_state::Transaction) -> Option<(&str, &str)> {
+        match &tx.tx_type {
+            qnet_state::TransactionType::NodeRegistration { node_id, wallet_address, registration_proof, .. } => {
+                if registration_proof == "genesis" && crate::genesis_constants::is_legacy_genesis_node(node_id) {
+                    None
+                } else {
+                    Some((wallet_address.as_str(), node_id.as_str()))
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// The one-node rule inside one block: the first wallet that two counted registrations name under
+    /// different node ids, in block order. The rows of a block are written only after it applies, so the
+    /// storage read in verify_burn_attestation_quorum cannot see a same-block pair; this pure check of the
+    /// block's bytes does. A repeat of one node id is no conflict: apply skips the second as a duplicate.
+    pub(crate) fn same_block_wallet_conflict(txs: &[qnet_state::Transaction]) -> Option<String> {
+        let mut first: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+        for tx in txs {
+            if let Some((wallet, node_id)) = Self::one_node_registration_key(tx) {
+                match first.get(wallet) {
+                    Some(seen) if *seen != node_id => return Some(wallet.to_string()),
+                    Some(_) => {}
+                    None => { first.insert(wallet, node_id); }
+                }
+            }
+        }
+        None
+    }
+
+    /// The block verify stage's same-block rule at `height`: from the wallet_one_node gate, the wallet that two
+    /// counted registrations of the block name under different node ids.
+    pub(crate) fn same_block_one_node_refusal(txs: &[qnet_state::Transaction], height: u64) -> Option<String> {
+        if !qnet_state::feature_gates::is_active(qnet_state::feature_gates::id::WALLET_ONE_NODE, height) {
+            return None;
+        }
+        Self::same_block_wallet_conflict(txs)
+    }
+
+    /// The producer's side of `same_block_wallet_conflict`: keep, in order, every tx but a registration whose
+    /// wallet an earlier kept registration names under another node id. Returns the kept txs and the dropped
+    /// (node_id, wallet) pairs. What it keeps never has a conflict.
+    pub(crate) fn keep_first_registration_per_wallet(
+        txs: Vec<qnet_state::Transaction>,
+    ) -> (Vec<qnet_state::Transaction>, Vec<(String, String)>) {
+        let mut first: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut dropped = Vec::new();
+        let mut kept = Vec::with_capacity(txs.len());
+        for tx in txs {
+            if let Some((wallet, node_id)) = Self::one_node_registration_key(&tx) {
+                match first.get(wallet) {
+                    Some(seen) if seen != node_id => {
+                        dropped.push((node_id.to_string(), wallet.to_string()));
+                        continue;
+                    }
+                    Some(_) => {}
+                    None => { first.insert(wallet.to_string(), node_id.to_string()); }
+                }
+            }
+            kept.push(tx);
+        }
+        (kept, dropped)
+    }
+
     pub(crate) async fn verify_burn_attestation_quorum(
         tx: &qnet_state::Transaction,
         height: u64,
@@ -1223,12 +1509,22 @@ impl BlockchainNode {
         }
         // Genesis identities are protocol-minted (anchored by GENESIS_CONSENSUS_PKS), not burn-backed —
         // but the exemption MUST bind to a real genesis node_id, else any reg sets reg_proof="genesis".
+        // From the tx_target_bound gate every judge refuses a genesis proof before this runs
+        // (check_signed_target_bound): the exemption then serves only blocks below the gate.
         if reg_proof == "genesis" {
             if crate::genesis_constants::is_legacy_genesis_node(node_id) {
                 return Ok(());
             }
             return Err(QNetError::ValidationError(
                 "burn_attestation_required: genesis reg_proof from non-genesis node_id".to_string()));
+        }
+        // One wallet, one node of either type, from the wallet_one_node gate. Read before any signature or
+        // committee work: a chain-confirmed row of this wallet's other node registered below `height`. Rows at
+        // or above it are not part of the chain below the block judged, and cache rows are no registration, so
+        // the verdict is the same on every node that applied the chain below `height`. A second registration of
+        // the SAME node stays the apply-level duplicate skip.
+        if let Some(e) = Self::wallet_one_node_refusal(storage, wallet, node_id, height) {
+            return Err(QNetError::ValidationError(e));
         }
         // A burn-backed registration MUST reference its burn; an empty burn_tx is the dodge to reject.
         if burn_tx.is_empty() {
@@ -1238,19 +1534,19 @@ impl BlockchainNode {
         // Beneficiary binding. The burner address is inside the 2f+1-signed message and each attestor
         // signs the fee payer IT verified on Solana, so burn_wallet is committee truth. The burn is the
         // only Sybil cost, hence its owner is the sole authority on which node it activates: require an
-        // Ed25519 signature by that address over (node_id, wallet_address, registration_proof, timestamp).
-        // Without it a public burn_tx can be front-run — the beneficiary set to the attacker's wallet
-        // (burn theft) or to a victim's, squatting the node_id derived from it. Deterministic: a pure
-        // function of TX bytes, no external read.
+        // Ed25519 signature by that address over (node_id, wallet_address, registration_proof, timestamp,
+        // wallet key, burn), or, for a Light registration from the wallet_one_node gate, over the same fields
+        // without the timestamp (owner bind v2). Without it a public burn_tx can be front-run — the
+        // beneficiary set to the attacker's wallet (burn theft) or to a victim's, squatting the node_id
+        // derived from it. Deterministic: a pure function of TX bytes and the height, no external read.
         if burn_wallet.is_empty() || burn_owner_sig.is_empty() {
             return Err(QNetError::ValidationError(
                 "burn_attestation_required: NodeRegistration missing burn_wallet / burn_owner_sig".to_string()));
         }
         let attest_root = tx.dilithium_public_key.as_deref().unwrap_or(&[]);
-        let bind_msg = qnet_state::Transaction::burn_owner_bind_message(
-            node_id, wallet, reg_proof, tx.timestamp, attest_root, burn_tx);
-        let owner_ok = crate::crypto::solana_derivation::verify_ed25519_signature(
-            bind_msg.as_bytes(), burn_owner_sig, burn_wallet).unwrap_or(false);
+        let owner_ok = Self::burn_owner_bind_verifies(
+            node_id, node_type, wallet, reg_proof, tx.timestamp, attest_root, burn_tx, burn_owner_sig, burn_wallet,
+            height);
         if !owner_ok {
             return Err(QNetError::ValidationError(
                 "burn_attestation_required: burn_owner_sig does not authorize this beneficiary".to_string()));
@@ -1260,15 +1556,13 @@ impl BlockchainNode {
         // since node_id is that wallet's pseudonym the victim's identity is occupied forever. So
         // wallet_address must derive from a credential the registrant demonstrably holds — the WALLET
         // ML-DSA-65 key that signed this registration, or the burning Solana address itself.
-        let native_bound = tx.dilithium_public_key.as_deref()
-            .and_then(crate::crypto::solana_derivation::eon_from_qnet_dilithium_pubkey_bytes)
-            .as_deref() == Some(wallet)
-            && Self::verify_node_lifecycle_dilithium(tx);
+        let native_bound = Self::registration_native_bound(tx, wallet);
         let solana_bound = crate::crypto::solana_derivation::eon_from_solana_address(burn_wallet) == wallet;
         if !native_bound && !solana_bound {
             return Err(QNetError::ValidationError(
                 "burn_attestation_required: wallet_address proven by neither the signing wallet key nor burn_wallet".to_string()));
         }
+        Self::registration_signature_bound(tx, native_bound, height).map_err(QNetError::ValidationError)?;
         // Cost gate: the committee-attested Phase-1 cost MUST be present (old no-cost format is rejected
         // while the gate is active), meet the protocol floor, and be covered by the bound amount. The
         // cost is part of the 2f+1-signed message below, so this binds the registration to the cost the
@@ -1372,6 +1666,17 @@ impl BlockchainNode {
                 valid.insert(attestor_id.clone());
             }
         }
+        // From the tx_target_bound gate every entry must count. Nothing the registrant signs covers the
+        // list, and skipped entries (non-members, repeats, bad signatures) cost the relay nothing, so a
+        // fee-free pending registration could be padded to the list cap. The collector embeds exactly
+        // the distinct members that signed, so an honest list always passes.
+        if qnet_state::feature_gates::is_active(qnet_state::feature_gates::id::TX_TARGET_BOUND, height)
+            && valid.len() != attestors.len()
+        {
+            return Err(QNetError::ValidationError(format!(
+                "burn_attestation_required: {} of {} attestor entries do not count",
+                attestors.len() - valid.len(), attestors.len())));
+        }
         if valid.len() >= threshold {
             Ok(())
         } else {
@@ -1443,6 +1748,32 @@ impl BlockchainNode {
         Some((self.node_id.clone(), sig))
     }
 
+    /// Where a committee member answers JSON-RPC: its announced endpoint (the RAM map, then the committed
+    /// row), else the binary's genesis address.
+    pub(crate) fn member_endpoint_ip(storage: &crate::storage::Storage, member_id: &str) -> Option<String> {
+        crate::genesis_constants::get_node_endpoint_ip(member_id)
+            .or_else(|| storage.load_node_endpoint(member_id).ok().flatten()
+                .map(|ep| crate::genesis_constants::endpoint_ip_only(&ep))
+                .filter(|ip| !ip.is_empty()))
+            .or_else(|| crate::genesis_constants::genesis_ip_for_node_id(member_id).map(|s| s.to_string()))
+            .filter(|ip| !ip.is_empty())
+    }
+
+    /// Where each committee member is asked: this node's own attestor in-process when the caller holds
+    /// this node (its attestor then serves it as a committee caller, and no request hairpins through the
+    /// network), every other member - and this node when the caller does not hold it - at the JSON-RPC
+    /// address it announced. None = in-process.
+    pub(crate) fn attest_targets(
+        committee: &[String], own_id: &str, in_process: bool, storage: &crate::storage::Storage,
+    ) -> Vec<(String, Option<String>)> {
+        committee.iter().filter_map(|member_id| {
+            if in_process && member_id == own_id {
+                return Some((member_id.clone(), None));
+            }
+            Self::member_endpoint_ip(storage, member_id).map(|ip| (member_id.clone(), Some(format!("http://{}:8001/", ip))))
+        }).collect()
+    }
+
     /// Super-side: gather ≥2f+1 committee burn-attestations for this node's Phase-1 Solana burn so the
     /// NodeRegistration passes the burn-attestation gate. Queries each committee JSON-RPC endpoint
     /// (node_attestBurn); each independently re-verifies the Solana burn AND recomputes the Phase-1
@@ -1452,10 +1783,13 @@ impl BlockchainNode {
     /// NodeRegistration.burn_amount so the on-chain value is exactly what the counted 2f+1 signed —
     /// closing the over-burn footgun (declared < actual would otherwise fail every signature). At a 10%
     /// burn-boundary signers may split → fewer than `need` agree → caller retries (liveness hiccup, never
-    /// a fork). caller checks the count.
+    /// a fork). caller checks the count. An answer counts only as `BurnAttestTally` counts it: from the
+    /// member asked, once, with a signature block validation accepts.
+    /// `own`: this node, when the caller holds it - its own attestor is then asked in-process, first and
+    /// alone: the others are asked only once this node has verified the burn on Solana.
     pub async fn collect_burn_attestations(
         burn_tx: &str, solana_wallet: &str, qnet_wallet: &str, amount: u64, node_type: qnet_state::NodeType,
-        cost: u64, owner: &BurnOwnerProof<'_>, storage: &crate::storage::Storage,
+        cost: u64, owner: &BurnOwnerProof<'_>, storage: &crate::storage::Storage, own: Option<&BlockchainNode>,
     ) -> (Vec<(String, String)>, u64, u64, u64) {
         let nt = match node_type { qnet_state::NodeType::Light => "light", _ => "super" };
         // Attestor set = the consensus committee for the current tip (genesis era ⇒ the genesis set,
@@ -1489,88 +1823,84 @@ impl BlockchainNode {
                         "timestamp": owner.timestamp, "owner_signature": owner.signature,
                         "attest_root": owner.attest_root_tag }
         });
-        // Group sigs by the (cost, amount) PAIR each attestor signed; the embedded registration cost AND
-        // amount are exactly what the quorum shares, so keep only the pair-bucket that first reaches
-        // `need` distinct members. Returning the agreed amount lets the registrant embed committee truth.
-        let mut by_pair: std::collections::BTreeMap<(u64, u64), Vec<(String, String)>> = std::collections::BTreeMap::new();
-        let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        // Sigs grouped by the (cost, amount) PAIR each attestor signed, each one checked as block validation
+        // checks it (BurnAttestTally); the embedded registration cost AND amount are exactly what the quorum
+        // shares, so the pair-bucket that first reaches `need` distinct members wins. Returning the agreed
+        // amount lets the registrant embed committee truth.
+        let mut tally = BurnAttestTally::new(burn_tx, solana_wallet, qnet_wallet, &node_type, attest_epoch, need);
 
         // Resolve endpoints first (pure local lookups), then query through a BOUNDED-CONCURRENCY window.
         // With a 1000-member committee and a 30 s per-request timeout, serial or batch-at-a-time
         // collection lets slow members push it past the 2-epoch attestation validity window. Order-
         // independent — the quorum is a set — so the window changes nothing except wall-clock.
-        let targets: Vec<(String, String)> = committee.iter().filter_map(|member_id| {
-            let ip = crate::genesis_constants::get_node_endpoint_ip(member_id)
-                .or_else(|| storage.load_node_endpoint(member_id).ok().flatten()
-                    .map(|ep| crate::genesis_constants::endpoint_ip_only(&ep))
-                    .filter(|ip| !ip.is_empty()))
-                .or_else(|| crate::genesis_constants::genesis_ip_for_node_id(member_id).map(|s| s.to_string()));
-            match ip {
-                Some(i) if !i.is_empty() => Some((member_id.clone(), format!("http://{}:8001/", i))),
-                _ => None,
-            }
-        }).collect();
+        let own_id = crate::unified_p2p::GLOBAL_NODE_ID.read().clone();
+        let mut targets = Self::attest_targets(&committee, &own_id, own.is_some(), storage);
         let unresolved = committee.len().saturating_sub(targets.len());
+
+        // This node's own attestor first, alone. Every member pays a first-sight Solana lookup for a burn it
+        // has not seen, so a submit naming no real burn would cost one at every member; asked here first, it
+        // costs one network-wide, and the others are asked only once this node verified the burn.
+        let mut reached = false;
+        if let (Some(node), Some(at)) = (own, targets.iter().position(|(_, url)| url.is_none())) {
+            let (member_id, _) = targets.remove(at);
+            let json = crate::rpc::attest_burn_in_process(node, body["params"].clone()).await;
+            reached = Self::offer_attest_answer(&mut tally, &member_id, &json, storage).await;
+            if !reached && storage.attest_burn_verified_get(burn_tx, solana_wallet).ok().flatten().is_none() {
+                if is_info() {
+                    println!("[INFO][REG] attest_fanout_skipped burner={} reason=burn_not_verified_here",
+                             qnet_state::char_prefix(solana_wallet, 12));
+                }
+                targets.clear();
+            }
+        }
 
         const ATTEST_FANOUT: usize = 32;
         use futures::stream::StreamExt;
         // One sliding window of ATTEST_FANOUT requests, each slot refilled as its reply lands: a slow
         // member holds one slot instead of stalling every later member, and the quorum break returns at
         // the need-th agreeing signature, dropping the requests still in flight.
-        'outer: {
+        if !reached && !targets.is_empty() {
             let mut calls = futures::stream::iter(targets.iter().cloned()).map(|(member_id, url)| {
                 let client = client.clone();
                 let body = body.clone();
                 async move {
-                    let resp = client.post(&url).json(&body).send().await.ok()?;
-                    let json: serde_json::Value = resp.json().await.ok()?;
+                    // This node's own attestor was asked above: every target left has an address.
+                    let json: serde_json::Value = client.post(&url?).json(&body).send().await.ok()?.json().await.ok()?;
                     Some((member_id, json))
                 }
             }).buffer_unordered(ATTEST_FANOUT);
             while let Some(out) = calls.next().await {
                 let (member_id, json) = match out { Some(x) => x, None => continue };
-                let result = match json.get("result") {
-                    Some(r) => r,
-                    None => {
-                        // -32050 attest_pending: the attestor's issuance throttle queued this burn —
-                        // a non-vote this round; the convergence driver re-collects next cooldown.
-                        if let Some(err) = json.get("error") {
-                            if err.get("code").and_then(|c| c.as_i64()) == Some(-32050) {
-                                let ra = err.get("data").and_then(|d| d.get("retry_after_secs")).and_then(|v| v.as_u64()).unwrap_or(0);
-                                if is_info() { println!("[INFO][REG] attest_pending member={} retry_after={}s", member_id, ra); }
-                            }
-                        }
-                        continue;
-                    }
-                };
-                let gid = result.get("genesis_id").and_then(|v| v.as_str()).unwrap_or("");
-                let sig = result.get("sig").and_then(|v| v.as_str()).unwrap_or("");
-                let signed_cost = result.get("cost").and_then(|v| v.as_u64()).unwrap_or(0);
-                // The attestor signed over the ACTUAL on-Solana burned amount; embed exactly that.
-                let signed_amount = result.get("amount").and_then(|v| v.as_u64()).unwrap_or(0);
-                // The attestor echoes the burner address it verified and signed. A different one means it
-                // signed a different message than the one the registrant will embed.
-                let signed_burner = result.get("burn_wallet").and_then(|v| v.as_str()).unwrap_or("");
-                if gid.is_empty() || sig.is_empty() || signed_cost == 0 || signed_amount == 0
-                    || signed_burner != solana_wallet
-                    || !committee.iter().any(|m| m == gid) { continue; }
-                if !seen.insert(gid.to_string()) { continue; } // distinct only
-                let bucket = by_pair.entry((signed_cost, signed_amount)).or_default();
-                bucket.push((gid.to_string(), sig.to_string()));
-                if bucket.len() >= need { break 'outer; }
+                if Self::offer_attest_answer(&mut tally, &member_id, &json, storage).await { break; }
             }
         }
-        if let Some(((c, a), v)) = by_pair.iter().find(|(_, v)| v.len() >= need) {
-            return (v.clone(), *c, *a, attest_epoch);
-        }
-        if unresolved > 0 && committee.len().saturating_sub(unresolved) < need {
+        if !tally.reached() && unresolved > 0 && committee.len().saturating_sub(unresolved) < need {
             eprintln!("[WARN][REG] attestors_unreachable committee={} unresolved={} need={} — quorum impossible until endpoints are known",
                       committee.len(), unresolved, need);
         }
-        // No (cost, amount) bucket reached quorum — return the largest bucket + its pair so the caller can
-        // log got/need and retry (e.g. a 10% boundary split, or attestors disagreeing on the amount).
-        by_pair.into_iter().max_by_key(|(_, v)| v.len())
-            .map(|((c, a), v)| (v, c, a, attest_epoch)).unwrap_or_else(|| (Vec::new(), cost, amount, attest_epoch))
+        // No (cost, amount) bucket reached quorum: the largest bucket + its pair, so the caller can log got/need
+        // and retry (e.g. a 10% boundary split, or attestors disagreeing on the amount).
+        let (v, c, a) = tally.outcome().unwrap_or_else(|| (Vec::new(), cost, amount));
+        (v, c, a, attest_epoch)
+    }
+
+    /// One attestor's JSON-RPC answer into the tally; true once a pair reached quorum. An error answer is a
+    /// non-vote this round (-32050 attest_pending: the attestor's throttle queued the burn).
+    async fn offer_attest_answer(
+        tally: &mut BurnAttestTally<'_>, member_id: &str, json: &serde_json::Value, storage: &crate::storage::Storage,
+    ) -> bool {
+        match json.get("result") {
+            Some(result) => tally.offer(member_id, result, storage).await,
+            None => {
+                if let Some(err) = json.get("error") {
+                    if err.get("code").and_then(|c| c.as_i64()) == Some(-32050) {
+                        let ra = err.get("data").and_then(|d| d.get("retry_after_secs")).and_then(|v| v.as_u64()).unwrap_or(0);
+                        if is_info() { println!("[INFO][REG] attest_pending member={} retry_after={}s", member_id, ra); }
+                    }
+                }
+                false
+            }
+        }
     }
 
     /// PRODUCTION v2.19.25: Validate and add transaction received from P2P network
@@ -1581,6 +1911,8 @@ impl BlockchainNode {
         if let Err(validation_error) = tx.validate() {
             return Err(QNetError::ValidationError(format!("Transaction validation failed: {}", validation_error)));
         }
+        // Same rule, same height as the RPC door: a relay's rewritten copy stops here, before any crypto.
+        Self::target_bound_admissible(&tx, Self::admission_height())?;
         // Hash-first ingress gate: pending, included or tombstoned — reject before
         // ANY crypto. A gossip echo of a known tx used to pay the full pipeline
         // including ML-DSA verify (51k singles produced 49k such re-validations and
@@ -1590,50 +1922,20 @@ impl BlockchainNode {
         if self.mempool.already_known(&tx.hash) {
             return Err(QNetError::ValidationError("already_known".to_string()));
         }
+        // A copy a relay can stream at line rate: answered as an echo, so the ingest does not log each one.
+        match self.pending_copy(&tx) {
+            Ok(None) => {}
+            Ok(Some(_)) => return Err(QNetError::ValidationError("already_known: signed_tx_pending".to_string())),
+            Err(e) => return Err(QNetError::ValidationError(format!("already_known: {}", e))),
+        }
         if !Self::gas_limit_admissible(&tx) {
             return Err(QNetError::ValidationError(format!(
                 "gas_limit {} exceeds MAX_GAS_LIMIT {}", tx.gas_limit, qnet_state::gas_limits::MAX_GAS_LIMIT)));
         }
         // Before the rate limiter and every verify: a commitment the state holds costs nothing further.
         crate::node::refuse_held_commitment(&self.state, &tx).await.map_err(QNetError::ValidationError)?;
-
-        // v32.12: gossip-side activation admission rate limit. NodeRegistration
-        // and NodeActivation TXs trigger heavy block-include + state-apply paths.
-        // Under mass-onboarding burst (N joiners simultaneously) admission must
-        // be bounded so producer's 1-sec deadline stays achievable. Excess TXs
-        // get rejected; gossip will re-deliver from peers when window reopens.
-        // Window = 1 sec rolling; cap = 20 admissions/sec/node (covers 1200
-        // activations/minute — far above realistic mass-onboarding rate).
-        if matches!(tx.tx_type,
-            qnet_state::TransactionType::NodeRegistration { .. }
-            | qnet_state::TransactionType::NodeActivation { .. }
-        ) {
-            const ACTIVATION_ADMIT_RATE_PER_SEC: u32 = 20;
-            static ACTIVATION_ADMIT_COUNTER: once_cell::sync::Lazy<
-                std::sync::Mutex<(u64, u32)>
-            > = once_cell::sync::Lazy::new(|| std::sync::Mutex::new((0, 0)));
-            let now_secs = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs()).unwrap_or(0);
-            let mut g = ACTIVATION_ADMIT_COUNTER.lock()
-                .unwrap_or_else(|p| p.into_inner());
-            if g.0 != now_secs {
-                g.0 = now_secs;
-                g.1 = 0;
-            }
-            if g.1 >= ACTIVATION_ADMIT_RATE_PER_SEC {
-                if crate::node::is_warn() {
-                    println!(
-                        "[WARN][TX-GOSSIP] activation_rate_exceeded count={}/{} action=defer",
-                        g.1, ACTIVATION_ADMIT_RATE_PER_SEC,
-                    );
-                }
-                return Err(QNetError::ValidationError(
-                    "activation_admit_rate_exceeded — retry next window".to_string()
-                ));
-            }
-            g.1 += 1;
-        }
+        // Likewise a slashing proof whose offender already has one pooled, or is banned.
+        self.refuse_redundant_proof(&tx).await?;
 
         // ═══════════════════════════════════════════════════════════════════════
         // GOSSIP-PATH TRANSACTION TYPE WHITELIST
@@ -1733,13 +2035,54 @@ impl BlockchainNode {
         Self::reactivation_key_admissible(&self.storage, &tx)
             .map_err(|e| QNetError::ValidationError(format!("[REJECT][GOSSIP] {}", e)))?;
 
+        // v32.12: gossip-side activation admission rate limit. NodeRegistration
+        // and NodeActivation TXs trigger heavy block-include + state-apply paths, and their verifies (a burn
+        // quorum, an ML-DSA signature) are the costly part. Charged after every cheap refusal above, so a
+        // copy or a malformed TX refused anyway never spends an honest registration's slot.
+        // Under mass-onboarding burst (N joiners simultaneously) admission must
+        // be bounded so producer's 1-sec deadline stays achievable. Excess TXs
+        // get rejected; gossip will re-deliver from peers when window reopens.
+        // Window = 1 sec rolling; cap = 20 admissions/sec/node (covers 1200
+        // activations/minute — far above realistic mass-onboarding rate).
+        if matches!(tx.tx_type,
+            qnet_state::TransactionType::NodeRegistration { .. }
+            | qnet_state::TransactionType::NodeActivation { .. }
+        ) {
+            const ACTIVATION_ADMIT_RATE_PER_SEC: u32 = 20;
+            static ACTIVATION_ADMIT_COUNTER: once_cell::sync::Lazy<
+                std::sync::Mutex<(u64, u32)>
+            > = once_cell::sync::Lazy::new(|| std::sync::Mutex::new((0, 0)));
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs()).unwrap_or(0);
+            let mut g = ACTIVATION_ADMIT_COUNTER.lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if g.0 != now_secs {
+                g.0 = now_secs;
+                g.1 = 0;
+            }
+            if g.1 >= ACTIVATION_ADMIT_RATE_PER_SEC {
+                if crate::node::is_warn() {
+                    println!(
+                        "[WARN][TX-GOSSIP] activation_rate_exceeded count={}/{} action=defer",
+                        g.1, ACTIVATION_ADMIT_RATE_PER_SEC,
+                    );
+                }
+                return Err(QNetError::ValidationError(
+                    "activation_admit_rate_exceeded — retry next window".to_string()
+                ));
+            }
+            g.1 += 1;
+        }
+
         // Advisory mirror of the block-validation burn-attestation gate
         // (verify_burn_attestation_quorum): reject an invalid NodeRegistration at admission so a
         // producer never wastes a slot on a block its peers would reject. The authoritative
-        // deterministic check runs at block validation; here we use the current chain tip and the
-        // SAME pure verifier. Inert below the gate height (returns Ok), so onboarding is unchanged.
+        // deterministic check runs at block validation; here the SAME pure verifier runs at the
+        // admission height (the next block, as the producer judges it), so a gated rule's boundary
+        // block gets one verdict at both.
         if matches!(tx.tx_type, qnet_state::TransactionType::NodeRegistration { .. }) {
-            let h = self.storage.get_chain_height().unwrap_or(0);
+            let h = Self::admission_height();
             if let Err(e) = Self::verify_burn_attestation_quorum(&tx, h, &self.storage).await {
                 if crate::node::is_warn() {
                     println!("[WARN][TX-GOSSIP] reject_gossip_node_registration reason={}", e);
@@ -1967,8 +2310,10 @@ impl BlockchainNode {
             }
         }
         
-        // Balance validation for transfers
-        if let qnet_state::TransactionType::Transfer { .. } = &tx.tx_type {
+        // Balance validation for transfers and batches (a batch debits its transfers, as the RPC door checks)
+        if matches!(tx.tx_type,
+            qnet_state::TransactionType::Transfer { .. } | qnet_state::TransactionType::BatchTransfers { .. })
+        {
             let state = self.state.read().await;
             let balance = state.get_balance(&tx.from);
             // SECURITY: checked arithmetic to prevent overflow attacks
@@ -1978,15 +2323,17 @@ impl BlockchainNode {
                 .ok_or_else(|| QNetError::ValidationError(
                     format!("Gas calculation overflow: {} * {}", effective_gas, tx.gas_limit)
                 ))?;
-            let total_cost = tx.amount.checked_add(gas_cost)
+            let moved = Self::debited_value(&tx)
+                .ok_or_else(|| QNetError::ValidationError("Transfer amounts overflow".to_string()))?;
+            let total_cost = moved.checked_add(gas_cost)
                 .ok_or_else(|| QNetError::ValidationError(
-                    format!("Balance calculation overflow: {} + {}", tx.amount, gas_cost)
+                    format!("Balance calculation overflow: {} + {}", moved, gas_cost)
                 ))?;
 
             if balance < total_cost {
                 return Err(QNetError::ValidationError(format!(
                     "Insufficient balance: {} < {} (need {} + gas)",
-                    balance, total_cost, tx.amount
+                    balance, total_cost, moved
                 )));
             }
         }
@@ -1995,8 +2342,8 @@ impl BlockchainNode {
         
         // Add to mempool (NO BROADCAST - already received from network)
         // v2.26: Direct access - SimpleMempool is already thread-safe
-        // v2.77: Use SHA3-256 via calculate_hash() for NIST compliance
-        let tx_hash = tx.calculate_hash();
+        // The SHA3-256 hash: validate() at the top refused this TX unless tx.hash == calculate_hash().
+        let tx_hash = tx.hash.clone();
         let tx_bytes = bincode::serialize(&tx).unwrap_or_default();
         
         if !self.mempool.add_binary_transaction(tx_bytes, tx_hash, tx.gas_price) {
@@ -2030,10 +2377,12 @@ impl BlockchainNode {
         if let Err(validation_error) = tx.validate() {
             return Err(QNetError::ValidationError(format!("Transaction validation failed: {}", validation_error)));
         }
-        
-        // Signature validation
-        if tx.signature.as_ref().map_or(true, |s| s.is_empty()) {
-            return Err(QNetError::ValidationError("Transaction signature is empty".to_string()));
+        Self::target_bound_admissible(&tx, Self::admission_height())?;
+
+        // Presence of the TX's authenticator, the ML-DSA-65 signature (verified by the producer). The legacy
+        // `signature` it used to require is refused from the tx_target_bound gate, and no generator sets it.
+        if tx.dilithium_signature.as_ref().map_or(true, |s| s.is_empty()) {
+            return Err(QNetError::ValidationError("Transaction dilithium_signature is empty".to_string()));
         }
         
         // Add to mempool - v2.26: Direct access - SimpleMempool is already thread-safe
@@ -2090,7 +2439,7 @@ impl BlockchainNode {
             }
             
             // Basic validation (skip balance check for benchmark)
-            if tx.validate().is_err() {
+            if tx.validate().is_err() || Self::target_bound_admissible(tx, Self::admission_height()).is_err() {
                 continue;
             }
             
@@ -2197,7 +2546,7 @@ impl BlockchainNode {
             }
 
             // Basic structure validation (skip balance — benchmark accounts)
-            if tx.validate().is_err() {
+            if tx.validate().is_err() || Self::target_bound_admissible(tx, Self::admission_height()).is_err() {
                 continue;
             }
 
@@ -2258,6 +2607,16 @@ impl BlockchainNode {
     pub async fn get_account(&self, address: &str) -> Result<Option<qnet_state::Account>, QNetError> {
         let state = self.state.read().await;
         Ok(state.get_account(address))
+    }
+
+    /// An RPC account read that tells a missing row (Ok(None)) from a storage read failure (Err).
+    pub async fn try_get_account(&self, address: &str) -> Result<Option<qnet_state::Account>, ()> {
+        self.state.read().await.try_get_account(address)
+    }
+
+    /// `try_get_account` without the contract storage and code (never clones a resident contract's storage).
+    pub async fn try_get_account_basic(&self, address: &str) -> Result<Option<qnet_state::AccountBasic>, ()> {
+        self.state.read().await.try_get_account_basic(address)
     }
 
     /// Light token-metadata read (symbol, decimals, logo, is_nft) that does NOT clone the whole contract
@@ -2323,5 +2682,86 @@ impl BlockchainNode {
             "parallel_validation": self.perf_config.parallel_validation,
         }))
     }
-    
+
+}
+
+/// The collector's count of the attestors' answers (`collect_burn_attestations`). An answer counts only from
+/// the member it was asked of, once, and only when its signature verifies under that member's committed key
+/// (`committed_signer_pk`, the genesis-pinned fallback included) over the burn message the registration will
+/// carry: exactly what block validation checks (`verify_burn_attestation_quorum`). A member answering first
+/// with a junk signature, or under another member's id, then only spends its own vote, and the honest n-f
+/// still fill the quorum. Entries are grouped by the (cost, amount) pair each attestor signed.
+pub(crate) struct BurnAttestTally<'a> {
+    burn_tx: &'a str,
+    solana_wallet: &'a str,
+    qnet_wallet: &'a str,
+    node_type: &'a qnet_state::NodeType,
+    attest_epoch: u64,
+    need: usize,
+    by_pair: std::collections::BTreeMap<(u64, u64), Vec<(String, String)>>,
+    seen: std::collections::BTreeSet<String>,
+}
+
+impl<'a> BurnAttestTally<'a> {
+    pub(crate) fn new(
+        burn_tx: &'a str, solana_wallet: &'a str, qnet_wallet: &'a str, node_type: &'a qnet_state::NodeType,
+        attest_epoch: u64, need: usize,
+    ) -> Self {
+        BurnAttestTally {
+            burn_tx, solana_wallet, qnet_wallet, node_type, attest_epoch, need,
+            by_pair: std::collections::BTreeMap::new(), seen: std::collections::BTreeSet::new(),
+        }
+    }
+
+    /// Count `member_id`'s answer (the JSON-RPC `result`). True once one pair holds `need` entries.
+    pub(crate) async fn offer(&mut self, member_id: &str, result: &serde_json::Value, storage: &crate::storage::Storage) -> bool {
+        let gid = result.get("genesis_id").and_then(|v| v.as_str()).unwrap_or("");
+        let sig = result.get("sig").and_then(|v| v.as_str()).unwrap_or("");
+        let signed_cost = result.get("cost").and_then(|v| v.as_u64()).unwrap_or(0);
+        // The attestor signed over the ACTUAL on-Solana burned amount; embed exactly that.
+        let signed_amount = result.get("amount").and_then(|v| v.as_u64()).unwrap_or(0);
+        // The attestor echoes the burner address it verified and signed. A different one means it signed a
+        // different message than the one the registrant will embed.
+        let signed_burner = result.get("burn_wallet").and_then(|v| v.as_str()).unwrap_or("");
+        if gid.is_empty() || sig.is_empty() || signed_cost == 0 || signed_amount == 0 || signed_burner != self.solana_wallet {
+            return self.reached();
+        }
+        if gid != member_id {
+            if is_warn() {
+                println!("[WARN][REG] attestation_refused member={} claimed={} reason=not_the_member_asked", member_id, gid);
+            }
+            return self.reached();
+        }
+        if self.seen.contains(gid) { return self.reached(); }
+        let msg = qnet_state::Transaction::burn_attestation_message(
+            self.burn_tx, self.solana_wallet, self.qnet_wallet, signed_amount, self.node_type, signed_cost, self.attest_epoch);
+        let pk = match storage.committed_signer_pk(gid) {
+            Some(p) => p,
+            None => {
+                if is_warn() { println!("[WARN][REG] attestation_refused member={} reason=no_committed_key", member_id); }
+                return self.reached();
+            }
+        };
+        if !qnet_consensus::consensus_crypto::verify_consensus_signature_bound(gid, &msg, sig, &pk).await {
+            if is_warn() { println!("[WARN][REG] attestation_refused member={} reason=bad_signature", member_id); }
+            return self.reached();
+        }
+        self.seen.insert(gid.to_string());
+        self.by_pair.entry((signed_cost, signed_amount)).or_default().push((gid.to_string(), sig.to_string()));
+        self.reached()
+    }
+
+    /// Whether one pair holds `need` entries.
+    pub(crate) fn reached(&self) -> bool {
+        self.by_pair.values().any(|v| v.len() >= self.need)
+    }
+
+    /// The pair that reached `need`, else the largest one, as (entries, cost, amount); None when nothing counted.
+    pub(crate) fn outcome(self) -> Option<(Vec<(String, String)>, u64, u64)> {
+        let need = self.need;
+        if let Some(((c, a), v)) = self.by_pair.iter().find(|(_, v)| v.len() >= need) {
+            return Some((v.clone(), *c, *a));
+        }
+        self.by_pair.into_iter().max_by_key(|(_, v)| v.len()).map(|((c, a), v)| (v, c, a))
+    }
 }

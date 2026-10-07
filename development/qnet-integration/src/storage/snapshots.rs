@@ -1539,6 +1539,8 @@ impl Storage {
     /// re-persisting the snapshot anchor along with it. Truncating blocks while leaving these behind
     /// is what let a rolled-back node report a tip it does not hold and sync forever.
     pub fn prune_snapshots_above(&self, target: u64) -> IntegrationResult<u64> {
+        // Proof views above the target describe the abandoned chain too.
+        self.persistent.views.retract_above(target);
         let cf = self.persistent.db.cf_handle("snapshots")
             .ok_or_else(|| IntegrationError::StorageError("snapshots column family not found".to_string()))?;
         // Under the fence, the generation bumped first: a serializer that captured below this prune finds
@@ -1649,6 +1651,7 @@ impl Storage {
         if let Some(cons) = self.persistent.db.cf_handle("consensus") {
             batch.delete_cf(&cons, b"latest_round");
             batch.delete_cf(&cons, b"tcerts_v1");
+            batch.delete_cf(&cons, b"tcerts_v3");
         }
         if let Some(sync) = self.persistent.db.cf_handle("sync_state") {
             batch.delete_cf(&sync, b"sync_progress");
@@ -3468,6 +3471,8 @@ impl Storage {
             cs.total_supply = total_supply;
             cs.last_minted_emission_mb = last_minted_emission_mb;
         }
+        // The anchor is a certified boundary: its proof view can be served at once.
+        self.request_proof_view(&sg, anchor_height);
         // Seal the anchor's total_supply so a cold-joiner can serve/verify the checkpoint at its anchor
         // head via get_total_supply_at (mirror of the registry_root seal carried through the binding).
         let _ = self.seal_total_supply(anchor_height, total_supply);

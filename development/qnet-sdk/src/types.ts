@@ -1,162 +1,109 @@
-// ─────────────────────────────────────────────────────────────────────────────
-// QNet SDK — Core types
-// ─────────────────────────────────────────────────────────────────────────────
+// Shapes of the transactions the shared builders return (applications/qnet-mobile/src/crypto/TxBuilders.js).
+// Every integer is its exact decimal text: u64 values pass 2^53.
 
-/** Hex-encoded 32-byte block hash */
-export type BlockHash = string;
+/** A u64 as decimal digits, no sign, no leading zeros. */
+export type U64 = string;
+/** A u64 given as a bigint, a safe integer or decimal digits. */
+export type U64Input = bigint | number | string;
 
-/** QNet EON address (e.g. "19chexeon15chex4...") */
-export type QNetAddress = string;
-
-export type NodeType = 'genesis' | 'super' | 'light';
-
-export interface QNetConfig {
-  /** Base URL of any genesis node API, e.g. "http://154.38.160.39:9876" */
-  endpoint: string;
-  /** Optional API key for protected endpoints */
-  apiKey?: string;
-  /** Request timeout in milliseconds (default 15000) */
-  timeoutMs?: number;
+interface TxBase {
+  readonly path: string;
+  readonly from: string;
+  readonly nonce: U64;
+  readonly gasPrice: U64;
+  readonly gasLimit: U64;
+  /** The most the fee can be: (gasPrice + gasPrice / 2) x gasLimit, in nano-QNC. Unused gas is refunded. */
+  readonly maxFeeNano: U64;
+  /** The exact text the transaction signs. */
+  readonly preimage: string;
 }
 
-// ── Block types ───────────────────────────────────────────────────────────────
-
-export interface MicroBlock {
-  height: number;
-  hash: BlockHash;
-  previousHash: BlockHash;
-  producer: string;
-  timestamp: number;
-  transactionCount: number;
-  merkleRoot: string;
-  blockType: 'MICROBLOCK' | 'MACROBLOCK';
-  pohHash?: string;
+export interface TransferTx extends TxBase {
+  readonly kind: 'transfer';
+  readonly to: string;
+  readonly amountNano: U64;
 }
 
-export interface MacroBlock extends MicroBlock {
-  blockType: 'MACROBLOCK';
-  epoch: number;
-  totalTransactions: number;
-  stateRoot: string;
+export interface TokenTransferTx extends TxBase {
+  readonly kind: 'tokenTransfer';
+  readonly contract: string;
+  readonly method: 'transfer';
+  readonly args: readonly [string, U64];
+  readonly to: string;
+  /** Base units of the token. */
+  readonly amount: U64;
+  readonly callData: string;
+  readonly intrinsicGas: U64;
 }
 
-// ── Transaction types ─────────────────────────────────────────────────────────
-
-export type TransactionType =
-  | 'TRANSFER'
-  | 'CONTRACT_DEPLOY'
-  | 'CONTRACT_CALL'
-  | 'REWARD_CLAIM'
-  | 'EMISSION';
-
-export interface Transaction {
-  hash: string;
-  from: QNetAddress;
-  to?: QNetAddress;
-  value: string;          // QNC amount in smallest unit (string to avoid u64 overflow)
-  fee: string;
-  nonce: number;
-  type: TransactionType;
-  data?: string;          // hex-encoded calldata
-  signature: string;      // hex-encoded Ed25519 or Dilithium signature
-  blockHeight: number;
-  timestamp: number;
-  status: 'pending' | 'confirmed' | 'failed';
+export interface ContractCallTx extends TxBase {
+  readonly kind: 'contractCall';
+  readonly contract: string;
+  readonly method: string;
+  /** Call input as lowercase hex, or null for none. */
+  readonly args: string | null;
+  readonly callData: string;
+  readonly intrinsicGas: U64;
+  /** Gas left for the contract's code: gasLimit - intrinsicGas. */
+  readonly fuel: U64;
 }
 
-export interface SendTransactionParams {
-  from: QNetAddress;
-  to: QNetAddress;
-  value: string;
-  fee?: string;
-  data?: string;
-  /** Hex-encoded Dilithium3 (ML-DSA-65) or Ed25519 signature */
-  signature: string;
-  signatureType?: 'ed25519' | 'dilithium3';
+export interface ContractDeployTx extends TxBase {
+  readonly kind: 'contractDeploy';
+  readonly codeSize: U64;
+  readonly codeHash: string;
+  readonly codeBase64: string;
+  readonly deployData: string;
+  readonly intrinsicGas: U64;
+  /** Where the chain will place the contract: derived from the sender and the nonce. */
+  readonly contractAddress: string;
 }
 
-// ── Account / Wallet ──────────────────────────────────────────────────────────
+export type Tx = TransferTx | TokenTransferTx | ContractCallTx | ContractDeployTx;
 
-export interface AccountBalance {
-  address: QNetAddress;
-  balance: string;         // QNC in smallest unit
-  balanceFormatted: string; // human-readable "123.456 QNC"
-  nonce: number;
-  pendingRewards: string;
-  lockedUntilHeight: number;
+export interface TransferParams {
+  from: string;
+  to: string;
+  amountNano: U64Input;
+  nonce: U64Input;
+  gasPrice?: U64Input;
+  gasLimit?: U64Input;
 }
 
-export interface WalletKeys {
-  qnetAddress: QNetAddress;
-  publicKeyHex: string;
-  /** Present only when generated locally — never transmitted */
-  privateKeyHex?: string;
-  keyType: 'ed25519' | 'dilithium3';
+export interface TokenTransferParams {
+  from: string;
+  token: string;
+  to: string;
+  /** Base units of the token (the decimal amount times 10^decimals). */
+  amount: U64Input;
+  nonce: U64Input;
+  gasPrice?: U64Input;
+  gasLimit?: U64Input | null;
 }
 
-// ── Node / Network ────────────────────────────────────────────────────────────
-
-export interface NodeStatus {
-  nodeId: string;
-  nodeType: NodeType;
-  version: string;
-  latestHeight: number;
-  latestHash: BlockHash;
-  peersConnected: number;
-  isSynced: boolean;
-  uptimeSeconds: number;
-  blockProductionRate: number; // blocks/minute
+export interface ContractCallParams {
+  from: string;
+  contract: string;
+  method: string;
+  /** Call input as even-length hex, or null. */
+  args?: string | null;
+  nonce: U64Input;
+  gasPrice?: U64Input;
+  /** Explicit gas limit; leave out to use the intrinsic gas plus `fuel`. */
+  gasLimit?: U64Input | null;
+  /** Fuel budget for the contract's code (default WASM_DEFAULT_FUEL). Not together with gasLimit. */
+  fuel?: number | null;
 }
 
-export interface NetworkStats {
-  latestHeight: number;
-  activeNodes: number;
-  tps: number;           // transactions per second (last 60s)
-  totalTransactions: number;
-  totalStaked: string;   // QNC
-  currentEpoch: number;
+export interface ContractDeployParams {
+  from: string;
+  code: Uint8Array;
+  nonce: U64Input;
+  gasPrice?: U64Input;
+  gasLimit?: U64Input | null;
 }
 
-// ── Rewards ───────────────────────────────────────────────────────────────────
-
-export interface PendingRewards {
-  address: QNetAddress;
-  pendingQNC: string;
-  lastClaimedHeight: number;
-  eligibleSince: number;
-}
-
-export interface RewardClaimResult {
-  txHash: string;
-  amount: string;
-  height: number;
-}
-
-/** Step 1 of the claim handshake: the batch the node offers, for the wallet to sign. */
-export interface RewardClaimQuote {
-  /** Exact payload bytes that go into the transaction — echo them back UNCHANGED. */
-  claimsData: string;
-  /** The message to sign with the wallet's ML-DSA-65 key. */
-  signMessage: string;
-  /** Timestamp bound into signMessage; must be echoed so the signature stays valid. */
-  claimTimestamp: number;
-  /** Exact base units as a decimal string — nanoQNC exceeds 2^53, so never parse it as a number. */
-  amountNano: string;
-  epochsClaimed: number;
-  /** The wallet's on-chain claim watermark; an honest batch starts just above it. */
-  lastClaimedEpoch: number;
-  stoppedAtEpoch?: number;
-  stoppedReason?: string;
-}
-
-/** Signs `message` with the wallet's ML-DSA-65 key and returns the node's expected signature format. */
-export type DilithiumSigner = (message: string) => Promise<string> | string;
-
-// ── Faucet ────────────────────────────────────────────────────────────────────
-
-export interface FaucetClaimResult {
-  devTxHash?: string;
-  solTxHash?: string;
-  devAmount: number;
-  solAmount: number;
+export interface TxRoute {
+  readonly path: string;
+  readonly maxBodyBytes: number;
 }

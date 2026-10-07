@@ -1,0 +1,756 @@
+diff --git a/node_modules/react-native-camera-kit/android/build.gradle b/node_modules/react-native-camera-kit/android/build.gradle
+index 145733b..dc5abc3 100644
+--- a/node_modules/react-native-camera-kit/android/build.gradle
++++ b/node_modules/react-native-camera-kit/android/build.gradle
+@@ -61,13 +61,11 @@ dependencies {
+     // implementation "androidx.camera:camera-video:${camerax_version}"
+     // If you want to additionally use the CameraX View class
+     implementation "androidx.camera:camera-view:${camerax_version}"
+-    // If you want to additionally add CameraX ML Kit Vision Integration
+-    // implementation "androidx.camera:camera-mlkit-vision:${camerax_version}"
+     // If you want to additionally use the CameraX Extensions library
+     // implementation "androidx.camera:camera-extensions:${camerax_version}"
+ 
+-    implementation 'com.google.mlkit:barcode-scanning:17.3.0'
+-    implementation 'com.google.android.gms:play-services-mlkit-face-detection:17.1.0'
++    // QNet patch: QR codes are decoded on the device by this pure Java library (no network); no face detection.
++    implementation 'com.google.zxing:core:3.5.4'
+ }
+ repositories {
+     mavenCentral()
+diff --git a/node_modules/react-native-camera-kit/android/src/main/java/com/rncamerakit/CKCamera.kt b/node_modules/react-native-camera-kit/android/src/main/java/com/rncamerakit/CKCamera.kt
+index bf8d9e7..6c67960 100644
+--- a/node_modules/react-native-camera-kit/android/src/main/java/com/rncamerakit/CKCamera.kt
++++ b/node_modules/react-native-camera-kit/android/src/main/java/com/rncamerakit/CKCamera.kt
+@@ -45,9 +45,6 @@ import android.graphics.Rect
+ import android.graphics.RectF
+ import android.util.Size
+ import com.facebook.react.uimanager.UIManagerHelper
+-import com.google.android.gms.tasks.Task
+-import com.google.android.gms.tasks.Tasks
+-import com.google.mlkit.vision.barcode.common.Barcode
+ import com.rncamerakit.events.*
+ 
+ class RectOverlay constructor(context: Context) :
+@@ -85,7 +82,6 @@ class CKCamera(context: ThemedReactContext) : FrameLayout(context), LifecycleObs
+     private var preview: Preview? = null
+     private var imageCapture: ImageCapture? = null
+     private var imageAnalyzer: ImageAnalysis? = null
+-    private var faceAnalyzer: FaceAnalyzer? = null
+     private var orientationListener: OrientationEventListener? = null
+     private var viewFinder: PreviewView = PreviewView(context)
+     private var rectOverlay: RectOverlay = RectOverlay(context)
+@@ -115,10 +111,6 @@ class CKCamera(context: ThemedReactContext) : FrameLayout(context), LifecycleObs
+     private var barcodeFrameSize: Size? = null
+     private var allowedBarcodeTypes: Array<CodeFormat>? = null
+ 
+-    // Face detection props
+-    private var faceDetectionEnabled: Boolean = false
+-    private var faceDetectionThrottleMs: Long = FaceAnalyzer.DEFAULT_THROTTLE_MS
+-
+     private fun getActivity() : Activity {
+         return currentContext.currentActivity!!
+     }
+@@ -149,8 +141,6 @@ class CKCamera(context: ThemedReactContext) : FrameLayout(context), LifecycleObs
+     override fun onDetachedFromWindow() {
+         super.onDetachedFromWindow()
+ 
+-        faceAnalyzer?.close()
+-        faceAnalyzer = null
+         cameraExecutor.shutdown()
+         orientationListener?.disable()
+         cameraProvider?.unbindAll()
+@@ -358,79 +348,15 @@ class CKCamera(context: ThemedReactContext) : FrameLayout(context), LifecycleObs
+ 
+         val useCases = mutableListOf(preview, imageCapture)
+ 
+-        faceAnalyzer?.close()
+-        faceAnalyzer = null
+-
++        // QNet patch: QR codes only, decoded on the device (QRCodeAnalyzer); the result is handled on the main thread.
+         val barcodeAnalyzer: QRCodeAnalyzer? = if (scanBarcode) {
+-            QRCodeAnalyzer({ barcodes, imageSize ->
+-                if (barcodes.isEmpty()) return@QRCodeAnalyzer
+-
+-                // 1. Filter by allowed barcode formats
+-                val allowedTypes = convertAllowedBarcodeTypes()
+-                val filteredByType = if (allowedTypes.isEmpty()) {
+-                    barcodes
+-                } else {
+-                    barcodes.filter { barcode ->
+-                        barcode.format in allowedTypes
+-                    }
+-                }
+-
+-                if (filteredByType.isEmpty()) return@QRCodeAnalyzer
+-
+-                val barcodeFrame = barcodeFrame
+-                val vf = viewFinder
+-
+-                // 2. No frame? → behave like original code
+-                if (barcodeFrame == null) {
+-                    onBarcodeRead(filteredByType)
+-                    return@QRCodeAnalyzer
+-                }
+-
+-                val frameRect = barcodeFrame.frameRect
+-
+-                // 3. Calculate scaling factors (image is always rotated by 90 degrees)
+-                val scaleX = vf.width.toFloat() / imageSize.height
+-                val scaleY = vf.height.toFloat() / imageSize.width
+-
+-                // 4. filter barcodes inside the frame
+-                val filteredBarcodes = filteredByType.filter { barcode ->
+-                    val barcodeBoundingBox = barcode.boundingBox ?: return@filter false
+-
+-                    val scaledBarcodeBoundingBox = Rect(
+-                        (barcodeBoundingBox.left * scaleX).toInt(),
+-                        (barcodeBoundingBox.top * scaleY).toInt(),
+-                        (barcodeBoundingBox.right * scaleX).toInt(),
+-                        (barcodeBoundingBox.bottom * scaleY).toInt()
+-                    )
+-                    frameRect.contains(scaledBarcodeBoundingBox)
+-                }
+-
+-                // 5. Emit if any left
+-                if (filteredBarcodes.isNotEmpty()) {
+-                    onBarcodeRead(filteredBarcodes)
+-                }
++            QRCodeAnalyzer({ code, imageSize ->
++                post { onQRCodeDetected(code, imageSize) }
+             }, scanThrottleDelay)
+         } else null
+ 
+-        faceAnalyzer = if (faceDetectionEnabled) {
+-            FaceAnalyzer(
+-                faceDetectionThrottleMs,
+-                context,
+-                viewFinder,
+-                { state -> onFaceDetectionInstallStatus(state) },
+-                { payloads -> onFaceDetected(payloads) }
+-            )
+-        } else null
+-
+-        val activeFaceAnalyzer = faceAnalyzer
+-        if (barcodeAnalyzer != null || activeFaceAnalyzer != null) {
+-            imageAnalyzer!!.setAnalyzer(cameraExecutor) { image ->
+-                val tasks = mutableListOf<Task<*>>()
+-                barcodeAnalyzer?.analyzeWithoutClosing(image)?.let { tasks.add(it) }
+-                activeFaceAnalyzer?.analyzeWithoutClosing(image)?.let { tasks.add(it) }
+-                if (tasks.isEmpty()) image.close()
+-                else Tasks.whenAllComplete(tasks).addOnCompleteListener { image.close() }
+-            }
++        if (barcodeAnalyzer != null) {
++            imageAnalyzer!!.setAnalyzer(cameraExecutor, barcodeAnalyzer)
+             useCases.add(imageAnalyzer)
+         }
+ 
+@@ -579,33 +505,38 @@ class CKCamera(context: ThemedReactContext) : FrameLayout(context), LifecycleObs
+         rectOverlay.drawRectBounds(focusRects)
+     }
+ 
+-    private fun onBarcodeRead(barcodes: List<Barcode>) {
+-        val codeFormat = CodeFormat.fromBarcodeType(barcodes.first().format);
+-        val surfaceId = UIManagerHelper.getSurfaceId(currentContext)
+-        UIManagerHelper
+-            .getEventDispatcherForReactTag(currentContext, id)
+-            ?.dispatchEvent(ReadCodeEvent(surfaceId, id, barcodes.first().rawValue, codeFormat.code))
+-    }
++    private fun onQRCodeDetected(code: ScannedCode, imageSize: Size) {
++        // 1. Only QR codes are decoded: nothing to emit when QR is not among the allowed types
++        val allowedTypes = allowedBarcodeTypes
++        if (!allowedTypes.isNullOrEmpty() && CodeFormat.QR !in allowedTypes) return
+ 
+-    private fun onFaceDetected(payloads: List<FacePayload>) {
+-        // CameraX auto-mirrors the front-camera Preview but not ImageAnalysis,
+-        // so flip X here to keep bounds in preview-space for JS consumers.
+-        val mirrored = if (lensType == CameraSelector.LENS_FACING_FRONT) {
+-            payloads.map { it.copy(boundsX = 1.0 - it.boundsX - it.boundsWidth) }
+-        } else {
+-            payloads
++        // 2. No frame? → emit
++        val barcodeFrame = barcodeFrame
++        if (barcodeFrame == null) {
++            onBarcodeRead(code.text)
++            return
+         }
+-        val surfaceId = UIManagerHelper.getSurfaceId(currentContext)
+-        UIManagerHelper
+-            .getEventDispatcherForReactTag(currentContext, id)
+-            ?.dispatchEvent(FaceDetectedEvent(surfaceId, id, mirrored))
++
++        // 3. The upright frame as the preview shows it (filled and centred), then emit only a code inside the frame
++        val vf = viewFinder
++        if (vf.width <= 0 || vf.height <= 0) return
++        val scale = max(vf.width.toFloat() / imageSize.width, vf.height.toFloat() / imageSize.height)
++        val offsetX = (vf.width - imageSize.width * scale) / 2f
++        val offsetY = (vf.height - imageSize.height * scale) / 2f
++        val onScreen = Rect(
++            (offsetX + code.box.left * scale).toInt(),
++            (offsetY + code.box.top * scale).toInt(),
++            (offsetX + code.box.right * scale).toInt(),
++            (offsetY + code.box.bottom * scale).toInt()
++        )
++        if (barcodeFrame.frameRect.contains(onScreen)) onBarcodeRead(code.text)
+     }
+ 
+-    private fun onFaceDetectionInstallStatus(state: String) {
++    private fun onBarcodeRead(codeStringValue: String) {
+         val surfaceId = UIManagerHelper.getSurfaceId(currentContext)
+         UIManagerHelper
+             .getEventDispatcherForReactTag(currentContext, id)
+-            ?.dispatchEvent(FaceDetectionInstallStatusEvent(surfaceId, id, state))
++            ?.dispatchEvent(ReadCodeEvent(surfaceId, id, codeStringValue, CodeFormat.QR.code))
+     }
+ 
+     private fun onOrientationChange(orientation: Int) {
+@@ -735,18 +666,10 @@ class CKCamera(context: ThemedReactContext) : FrameLayout(context), LifecycleObs
+         if (restartCamera) bindCameraUseCases()
+     }
+ 
+-    fun setFaceDetectionEnabled(enabled: Boolean) {
+-        val restartCamera = enabled != faceDetectionEnabled
+-        faceDetectionEnabled = enabled
+-        if (restartCamera) bindCameraUseCases()
+-    }
++    // QNet patch: this build has no face detection; the props are accepted and do nothing.
++    fun setFaceDetectionEnabled(enabled: Boolean) = Unit
+ 
+-    fun setFaceDetectionThrottleMs(throttleMs: Int) {
+-        val newThrottle = if (throttleMs < 0) FaceAnalyzer.DEFAULT_THROTTLE_MS else throttleMs.toLong()
+-        if (faceDetectionThrottleMs == newThrottle) return
+-        faceDetectionThrottleMs = newThrottle
+-        faceAnalyzer?.throttleMs = newThrottle
+-    }
++    fun setFaceDetectionThrottleMs(throttleMs: Int) = Unit
+ 
+     fun setScanThrottleDelay(delayMs: Int) {
+         val newDelay = if (delayMs < 0) 2000L else delayMs.toLong()
+@@ -847,10 +770,6 @@ class CKCamera(context: ThemedReactContext) : FrameLayout(context), LifecycleObs
+         return false
+     }
+ 
+-    private fun convertAllowedBarcodeTypes(): Set<Int> {
+-        return allowedBarcodeTypes?.map { it.toBarcodeType() }?.toSet() ?: emptySet()
+-    }
+-
+     companion object {
+ 
+         private const val TAG = "CameraKit"
+diff --git a/node_modules/react-native-camera-kit/android/src/main/java/com/rncamerakit/CodeFormat.kt b/node_modules/react-native-camera-kit/android/src/main/java/com/rncamerakit/CodeFormat.kt
+index 907c6c3..9387ee1 100644
+--- a/node_modules/react-native-camera-kit/android/src/main/java/com/rncamerakit/CodeFormat.kt
++++ b/node_modules/react-native-camera-kit/android/src/main/java/com/rncamerakit/CodeFormat.kt
+@@ -1,7 +1,6 @@
+ package com.rncamerakit
+ 
+-import com.google.mlkit.vision.barcode.common.Barcode
+-
++// QNet patch: only QR codes are decoded (QRCodeAnalyzer); the names stay for the allowedBarcodeTypes prop.
+ enum class CodeFormat(val code: String) {
+     CODE_128("code-128"),
+     CODE_39("code-39"),
+@@ -18,44 +17,7 @@ enum class CodeFormat(val code: String) {
+     DATA_MATRIX("data-matrix"),
+     UNKNOWN("unknown");
+ 
+-    fun toBarcodeType(): Int {
+-        return when (this) {
+-            CODE_128 -> Barcode.FORMAT_CODE_128
+-            CODE_39 -> Barcode.FORMAT_CODE_39
+-            CODE_93 -> Barcode.FORMAT_CODE_93
+-            CODABAR -> Barcode.FORMAT_CODABAR
+-            EAN_13 -> Barcode.FORMAT_EAN_13
+-            EAN_8 -> Barcode.FORMAT_EAN_8
+-            ITF -> Barcode.FORMAT_ITF
+-            UPC_A -> Barcode.FORMAT_UPC_A
+-            UPC_E -> Barcode.FORMAT_UPC_E
+-            QR -> Barcode.FORMAT_QR_CODE
+-            PDF_417 -> Barcode.FORMAT_PDF417
+-            AZTEC -> Barcode.FORMAT_AZTEC
+-            DATA_MATRIX -> Barcode.FORMAT_DATA_MATRIX
+-            UNKNOWN -> -1 // Or any other default value you prefer
+-        }
+-    }
+-
+     companion object {
+-        fun fromBarcodeType(@Barcode.BarcodeFormat barcodeType: Int): CodeFormat =
+-            when (barcodeType) {
+-                Barcode.FORMAT_CODE_128 -> CODE_128
+-                Barcode.FORMAT_CODE_39 -> CODE_39
+-                Barcode.FORMAT_CODE_93 -> CODE_93
+-                Barcode.FORMAT_CODABAR -> CODABAR
+-                Barcode.FORMAT_EAN_13 -> EAN_13
+-                Barcode.FORMAT_EAN_8 -> EAN_8
+-                Barcode.FORMAT_ITF -> ITF
+-                Barcode.FORMAT_UPC_A -> UPC_A
+-                Barcode.FORMAT_UPC_E -> UPC_E
+-                Barcode.FORMAT_QR_CODE -> QR
+-                Barcode.FORMAT_PDF417 -> PDF_417
+-                Barcode.FORMAT_AZTEC -> AZTEC
+-                Barcode.FORMAT_DATA_MATRIX -> DATA_MATRIX
+-                else -> UNKNOWN
+-            }
+-        
+         fun fromName(name: String?): CodeFormat? {
+             return values().firstOrNull { it.code == name }
+         }
+diff --git a/node_modules/react-native-camera-kit/android/src/main/java/com/rncamerakit/FaceAnalyzer.kt b/node_modules/react-native-camera-kit/android/src/main/java/com/rncamerakit/FaceAnalyzer.kt
+deleted file mode 100644
+index 058ef88..0000000
+--- a/node_modules/react-native-camera-kit/android/src/main/java/com/rncamerakit/FaceAnalyzer.kt
++++ /dev/null
+@@ -1,218 +0,0 @@
+-package com.rncamerakit
+-
+-import android.annotation.SuppressLint
+-import android.content.Context
+-import android.util.Log
+-import androidx.camera.core.ExperimentalGetImage
+-import androidx.camera.core.ImageAnalysis
+-import androidx.camera.core.ImageProxy
+-import androidx.camera.view.PreviewView
+-import com.google.android.gms.common.ConnectionResult
+-import com.google.android.gms.common.GoogleApiAvailability
+-import com.google.android.gms.common.moduleinstall.InstallStatusListener
+-import com.google.android.gms.common.moduleinstall.ModuleInstall
+-import com.google.android.gms.common.moduleinstall.ModuleInstallClient
+-import com.google.android.gms.common.moduleinstall.ModuleInstallRequest
+-import com.google.android.gms.common.moduleinstall.ModuleInstallStatusUpdate
+-import com.google.android.gms.tasks.Task
+-import com.google.mlkit.vision.common.InputImage
+-import com.google.mlkit.vision.face.Face
+-import com.google.mlkit.vision.face.FaceDetection
+-import com.google.mlkit.vision.face.FaceDetector
+-import com.google.mlkit.vision.face.FaceDetectorOptions
+-import kotlin.math.max
+-
+-data class FacePayload(
+-    val id: Int,
+-    val yaw: Double,
+-    val pitch: Double,
+-    val roll: Double,
+-    val boundsX: Double,
+-    val boundsY: Double,
+-    val boundsWidth: Double,
+-    val boundsHeight: Double,
+-)
+-
+-class FaceAnalyzer(
+-    @Volatile var throttleMs: Long,
+-    context: Context,
+-    private val previewView: PreviewView,
+-    private val onInstallStatus: (state: String) -> Unit,
+-    private val onFaceDetected: (payloads: List<FacePayload>) -> Unit
+-) : ImageAnalysis.Analyzer {
+-
+-    @Volatile private var detector: FaceDetector? = null
+-    @Volatile private var closed = false
+-    @Volatile private var moduleClient: ModuleInstallClient? = null
+-    @Volatile private var installListener: InstallStatusListener? = null
+-
+-    private var lastEmitMs = 0L
+-    private var nextLocalId: Int = -1
+-
+-    init {
+-        ensureModuleAndCreateDetector(context.applicationContext)
+-    }
+-
+-    private fun createDetector() = FaceDetection.getClient(
+-        FaceDetectorOptions.Builder()
+-            .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST)
+-            .setLandmarkMode(FaceDetectorOptions.LANDMARK_MODE_NONE)
+-            .setClassificationMode(FaceDetectorOptions.CLASSIFICATION_MODE_NONE)
+-            .setMinFaceSize(MIN_FACE_SIZE)
+-            .enableTracking()
+-            .build()
+-    )
+-
+-    private fun setDetectorIfAlive(d: FaceDetector) {
+-        if (closed) d.close() else detector = d
+-    }
+-
+-    private fun ensureModuleAndCreateDetector(context: Context) {
+-        val status = GoogleApiAvailability.getInstance().isGooglePlayServicesAvailable(context)
+-        if (status != ConnectionResult.SUCCESS) {
+-            Log.w(TAG, "Google Play Services unavailable (status=$status); face detection disabled.")
+-            onInstallStatus("unavailable")
+-            return
+-        }
+-
+-        val newDetector = createDetector()
+-        val client = ModuleInstall.getClient(context).also { moduleClient = it }
+-
+-        client.areModulesAvailable(newDetector)
+-            .addOnSuccessListener { response ->
+-                if (response.areModulesAvailable()) {
+-                    setDetectorIfAlive(newDetector)
+-                    onInstallStatus("ready")
+-                } else {
+-                    onInstallStatus("pending")
+-                    requestInstall(client, newDetector)
+-                }
+-            }
+-            .addOnFailureListener {
+-                onInstallStatus("pending")
+-                requestInstall(client, newDetector)
+-            }
+-    }
+-
+-    private fun requestInstall(client: ModuleInstallClient, newDetector: FaceDetector) {
+-        val listener = InstallStatusListener { update ->
+-            when (update.installState) {
+-                ModuleInstallStatusUpdate.InstallState.STATE_DOWNLOADING ->
+-                    onInstallStatus("downloading")
+-                ModuleInstallStatusUpdate.InstallState.STATE_INSTALLING ->
+-                    onInstallStatus("installing")
+-                ModuleInstallStatusUpdate.InstallState.STATE_COMPLETED -> {
+-                    setDetectorIfAlive(newDetector)
+-                    onInstallStatus("ready")
+-                    unregisterInstallListener()
+-                }
+-                ModuleInstallStatusUpdate.InstallState.STATE_FAILED,
+-                ModuleInstallStatusUpdate.InstallState.STATE_CANCELED -> {
+-                    newDetector.close()
+-                    Log.w(TAG, "MLKit face module install ended in state=${update.installState}")
+-                    onInstallStatus("failed")
+-                    unregisterInstallListener()
+-                }
+-                else -> {}
+-            }
+-        }
+-        installListener = listener
+-
+-        val request = ModuleInstallRequest.newBuilder()
+-            .addApi(newDetector)
+-            .setListener(listener)
+-            .build()
+-
+-        client.installModules(request)
+-            .addOnSuccessListener { response ->
+-                if (response.areModulesAlreadyInstalled()) {
+-                    setDetectorIfAlive(newDetector)
+-                    onInstallStatus("ready")
+-                    unregisterInstallListener()
+-                }
+-            }
+-            .addOnFailureListener { e ->
+-                newDetector.close()
+-                Log.w(TAG, "MLKit face module install request failed: ${e.message}")
+-                onInstallStatus("failed")
+-                unregisterInstallListener()
+-            }
+-    }
+-
+-    private fun unregisterInstallListener() {
+-        val l = installListener ?: return
+-        installListener = null
+-        moduleClient?.unregisterListener(l)
+-    }
+-
+-    @SuppressLint("UnsafeExperimentalUsageError")
+-    @ExperimentalGetImage
+-    fun analyzeWithoutClosing(image: ImageProxy): Task<*>? {
+-        val det = detector ?: return null
+-        val mediaImage = image.image ?: return null
+-
+-        val now = System.currentTimeMillis()
+-        if (now - lastEmitMs < throttleMs) {
+-            return null
+-        }
+-        lastEmitMs = now
+-
+-        val rotation = image.imageInfo.rotationDegrees
+-        val inputImage = InputImage.fromMediaImage(mediaImage, rotation)
+-        val width = if (rotation == 90 || rotation == 270) image.height else image.width
+-        val height = if (rotation == 90 || rotation == 270) image.width else image.height
+-
+-        return det.process(inputImage)
+-            .addOnSuccessListener { faces -> dispatch(faces, width, height) }
+-    }
+-
+-    @SuppressLint("UnsafeExperimentalUsageError")
+-    @ExperimentalGetImage
+-    override fun analyze(image: ImageProxy) {
+-        val task = analyzeWithoutClosing(image)
+-        if (task == null) {
+-            image.close()
+-            return
+-        }
+-        task.addOnCompleteListener { image.close() }
+-    }
+-
+-    private fun dispatch(faces: List<Face>, imgWidth: Int, imgHeight: Int) {
+-        val viewW = previewView.width.toFloat()
+-        val viewH = previewView.height.toFloat()
+-        if (viewW <= 0f || viewH <= 0f) return
+-        val srcW = imgWidth.toFloat().coerceAtLeast(1f)
+-        val srcH = imgHeight.toFloat().coerceAtLeast(1f)
+-        val scale = max(viewW / srcW, viewH / srcH)
+-        val offsetX = (viewW - srcW * scale) / 2f
+-        val offsetY = (viewH - srcH * scale) / 2f
+-
+-        val payloads = faces.map { face ->
+-            val box = face.boundingBox
+-            FacePayload(
+-                id = face.trackingId ?: nextLocalId.also { nextLocalId-- },
+-                yaw = face.headEulerAngleY.toDouble(),
+-                pitch = face.headEulerAngleX.toDouble(),
+-                roll = face.headEulerAngleZ.toDouble(),
+-                boundsX = ((offsetX + box.left * scale) / viewW).toDouble(),
+-                boundsY = ((offsetY + box.top * scale) / viewH).toDouble(),
+-                boundsWidth = (box.width() * scale / viewW).toDouble(),
+-                boundsHeight = (box.height() * scale / viewH).toDouble(),
+-            )
+-        }
+-        onFaceDetected(payloads)
+-    }
+-
+-    fun close() {
+-        closed = true
+-        unregisterInstallListener()
+-        detector?.close()
+-        detector = null
+-    }
+-
+-    companion object {
+-        private const val TAG = "FaceAnalyzer"
+-        private const val MIN_FACE_SIZE = 0.15f
+-        const val DEFAULT_THROTTLE_MS = 100L
+-    }
+-}
+diff --git a/node_modules/react-native-camera-kit/android/src/main/java/com/rncamerakit/QRCodeAnalyzer.kt b/node_modules/react-native-camera-kit/android/src/main/java/com/rncamerakit/QRCodeAnalyzer.kt
+index 9faf67b..bee1487 100644
+--- a/node_modules/react-native-camera-kit/android/src/main/java/com/rncamerakit/QRCodeAnalyzer.kt
++++ b/node_modules/react-native-camera-kit/android/src/main/java/com/rncamerakit/QRCodeAnalyzer.kt
+@@ -1,53 +1,99 @@
+ package com.rncamerakit
+ 
+-import android.annotation.SuppressLint
++import android.graphics.PointF
++import android.graphics.RectF
+ import android.util.Size
+-import androidx.camera.core.ExperimentalGetImage
+ import androidx.camera.core.ImageAnalysis
+ import androidx.camera.core.ImageProxy
+-import com.google.android.gms.tasks.Task
+-import com.google.mlkit.vision.barcode.BarcodeScanning
+-import com.google.mlkit.vision.barcode.common.Barcode
+-import com.google.mlkit.vision.common.InputImage
++import com.google.zxing.BinaryBitmap
++import com.google.zxing.DecodeHintType
++import com.google.zxing.PlanarYUVLuminanceSource
++import com.google.zxing.ResultPoint
++import com.google.zxing.common.HybridBinarizer
++import com.google.zxing.qrcode.QRCodeReader
++import com.google.zxing.qrcode.detector.FinderPattern
++import kotlin.math.abs
++import kotlin.math.hypot
++import kotlin.math.max
+ 
++// A QR code read from one frame: its text and its box in the frame turned upright.
++class ScannedCode(val text: String, val box: RectF)
++
++// QNet patch: QR codes are decoded on the device, by the bundled decoder, from the luminance (Y) plane of each frame;
++// nothing is sent anywhere. Runs on the analyzer thread and closes every frame before returning.
+ class QRCodeAnalyzer (
+-    private val onQRCodesDetected: (qrCodes: List<Barcode>, imageSize: Size) -> Unit,
++    private val onQRCodeDetected: (code: ScannedCode, imageSize: Size) -> Unit,
+     private val scanThrottleDelay: Long = 0L
+ ) : ImageAnalysis.Analyzer {
+-    // Time in milliseconds of the last time we dispatched detected barcodes
++    // Time in milliseconds of the last time we dispatched a detected code
+     private var lastBarcodeDetectedTime: Long = 0L
++    private val reader = QRCodeReader()
++    private val hints = mapOf(DecodeHintType.CHARACTER_SET to "UTF-8")
++    private var luma = ByteArray(0)
+ 
+-    @SuppressLint("UnsafeExperimentalUsageError")
+-    @ExperimentalGetImage
+-    fun analyzeWithoutClosing(image: ImageProxy): Task<*>? {
+-        val mediaImage = image.image ?: return null
+-
+-        val inputImage = InputImage.fromMediaImage(mediaImage, image.imageInfo.rotationDegrees)
+-
+-        val scanner = BarcodeScanning.getClient()
+-        return scanner.process(inputImage)
+-            .addOnSuccessListener { barcodes ->
+-                // Throttle callback invocations based on scanThrottleDelay (ms)
+-                val now = System.currentTimeMillis()
+-                if (scanThrottleDelay > 0 && (now - lastBarcodeDetectedTime) < scanThrottleDelay) {
+-                    return@addOnSuccessListener
+-                }
+-
+-                if (barcodes.isNotEmpty()) {
+-                    lastBarcodeDetectedTime = now
+-                    onQRCodesDetected(barcodes, Size(image.width, image.height))
+-                }
++    override fun analyze(image: ImageProxy) {
++        try {
++            // Throttle callback invocations based on scanThrottleDelay (ms); throttled frames are not decoded
++            if (scanThrottleDelay > 0 && (System.currentTimeMillis() - lastBarcodeDetectedTime) < scanThrottleDelay) {
++                return
+             }
++            val code = decode(image) ?: return
++            lastBarcodeDetectedTime = System.currentTimeMillis()
++            val rotation = image.imageInfo.rotationDegrees
++            val upright = if (rotation == 90 || rotation == 270) Size(image.height, image.width) else Size(image.width, image.height)
++            onQRCodeDetected(code, upright)
++        } finally {
++            image.close()
++        }
+     }
+ 
+-    @SuppressLint("UnsafeExperimentalUsageError")
+-    @ExperimentalGetImage
+-    override fun analyze(image: ImageProxy) {
+-        val task = analyzeWithoutClosing(image)
+-        if (task == null) {
+-            image.close()
+-            return
++    private fun decode(image: ImageProxy): ScannedCode? {
++        val width = image.width
++        val height = image.height
++        // The Y plane has a pixel stride of 1; rows may be padded to rowStride
++        val plane = image.planes[0]
++        val rowStride = plane.rowStride
++        val buffer = plane.buffer
++        buffer.rewind()
++        if (luma.size != rowStride * height) luma = ByteArray(rowStride * height)
++        buffer.get(luma, 0, minOf(buffer.remaining(), luma.size))
++
++        val result = try {
++            val source = PlanarYUVLuminanceSource(luma, rowStride, height, 0, 0, width, height, false)
++            reader.decode(BinaryBitmap(HybridBinarizer(source)), hints)
++        } catch (e: Exception) {
++            // No readable QR code in this frame
++            return null
++        } finally {
++            reader.reset()
+         }
+-        task.addOnCompleteListener { image.close() }
++
++        val points = result.resultPoints?.filterNotNull().orEmpty()
++        if (points.size < 3) return ScannedCode(result.text, RectF())
++        // Finder pattern centres (bottom-left, top-left, top-right; the outer two swap for a mirrored code) sit 3.5
++        // modules inside the code's corners along its edges, so a tilted code's corners are found too
++        val (p0, p1, p2) = points
++        val u = unit(p1, p2)
++        val v = unit(p1, p0)
++        // A finder's module size is measured along a row: a tilted code's comes out long by 1 / max(|cos|, |sin|)
++        val d = 3.5f * max(abs(u.x), abs(u.y)) * points.take(3).maxOf { (it as? FinderPattern)?.estimatedModuleSize ?: 0f }
++        val xs = floatArrayOf(p1.x - d * (u.x + v.x), p2.x + d * (u.x - v.x), p0.x - d * (u.x - v.x), p0.x + p2.x - p1.x + d * (u.x + v.x))
++        val ys = floatArrayOf(p1.y - d * (u.y + v.y), p2.y + d * (u.y - v.y), p0.y - d * (u.y - v.y), p0.y + p2.y - p1.y + d * (u.y + v.y))
++        val box = RectF(xs.min(), ys.min(), xs.max(), ys.max())
++        return ScannedCode(result.text, upright(box, width.toFloat(), height.toFloat(), image.imageInfo.rotationDegrees))
++    }
++
++    // The unit vector from a to b
++    private fun unit(a: ResultPoint, b: ResultPoint): PointF {
++        val n = hypot(b.x - a.x, b.y - a.y)
++        return if (n > 0f) PointF((b.x - a.x) / n, (b.y - a.y) / n) else PointF()
++    }
++
++    // From buffer coordinates to the frame turned clockwise by rotationDegrees
++    private fun upright(box: RectF, w: Float, h: Float, rotation: Int): RectF = when (rotation) {
++        90 -> RectF(h - box.bottom, box.left, h - box.top, box.right)
++        180 -> RectF(w - box.right, h - box.bottom, w - box.left, h - box.top)
++        270 -> RectF(box.top, w - box.right, box.bottom, w - box.left)
++        else -> box
+     }
+ }
+diff --git a/node_modules/react-native-camera-kit/android/src/main/java/com/rncamerakit/events/FaceDetectedEvent.kt b/node_modules/react-native-camera-kit/android/src/main/java/com/rncamerakit/events/FaceDetectedEvent.kt
+deleted file mode 100644
+index 4e76025..0000000
+--- a/node_modules/react-native-camera-kit/android/src/main/java/com/rncamerakit/events/FaceDetectedEvent.kt
++++ /dev/null
+@@ -1,36 +0,0 @@
+-package com.rncamerakit.events
+-
+-import com.facebook.react.bridge.Arguments
+-import com.facebook.react.bridge.WritableMap
+-import com.facebook.react.uimanager.events.Event
+-import com.rncamerakit.FacePayload
+-
+-class FaceDetectedEvent(
+-    surfaceId: Int,
+-    viewId: Int,
+-    private val faces: List<FacePayload>,
+-) : Event<FaceDetectedEvent>(surfaceId, viewId) {
+-    override fun getEventName(): String = EVENT_NAME
+-
+-    override fun getEventData(): WritableMap {
+-        val array = Arguments.createArray()
+-        for (face in faces) {
+-            val map = Arguments.createMap().apply {
+-                putInt("id", face.id)
+-                putDouble("yaw", face.yaw)
+-                putDouble("pitch", face.pitch)
+-                putDouble("roll", face.roll)
+-                putDouble("boundsX", face.boundsX)
+-                putDouble("boundsY", face.boundsY)
+-                putDouble("boundsWidth", face.boundsWidth)
+-                putDouble("boundsHeight", face.boundsHeight)
+-            }
+-            array.pushMap(map)
+-        }
+-        return Arguments.createMap().apply { putArray("faces", array) }
+-    }
+-
+-    companion object {
+-        const val EVENT_NAME = "topFaceDetected"
+-    }
+-}
+diff --git a/node_modules/react-native-camera-kit/android/src/main/java/com/rncamerakit/events/FaceDetectionInstallStatusEvent.kt b/node_modules/react-native-camera-kit/android/src/main/java/com/rncamerakit/events/FaceDetectionInstallStatusEvent.kt
+deleted file mode 100644
+index 25803af..0000000
+--- a/node_modules/react-native-camera-kit/android/src/main/java/com/rncamerakit/events/FaceDetectionInstallStatusEvent.kt
++++ /dev/null
+@@ -1,21 +0,0 @@
+-package com.rncamerakit.events
+-
+-import com.facebook.react.bridge.Arguments
+-import com.facebook.react.bridge.WritableMap
+-import com.facebook.react.uimanager.events.Event
+-
+-class FaceDetectionInstallStatusEvent(
+-    surfaceId: Int,
+-    viewId: Int,
+-    private val state: String,
+-) : Event<FaceDetectionInstallStatusEvent>(surfaceId, viewId) {
+-    override fun getEventName(): String = EVENT_NAME
+-
+-    override fun getEventData(): WritableMap = Arguments.createMap().apply {
+-        putString("state", state)
+-    }
+-
+-    companion object {
+-        const val EVENT_NAME = "topFaceDetectionInstallStatus"
+-    }
+-}
+diff --git a/node_modules/react-native-camera-kit/android/src/newarch/java/com/rncamerakit/CKCameraManager.kt b/node_modules/react-native-camera-kit/android/src/newarch/java/com/rncamerakit/CKCameraManager.kt
+index d97c3f6..d49741a 100644
+--- a/node_modules/react-native-camera-kit/android/src/newarch/java/com/rncamerakit/CKCameraManager.kt
++++ b/node_modules/react-native-camera-kit/android/src/newarch/java/com/rncamerakit/CKCameraManager.kt
+@@ -60,8 +60,6 @@ class CKCameraManager(context: ReactApplicationContext) : SimpleViewManager<CKCa
+             ErrorEvent.EVENT_NAME to mapOf("registrationName" to "onError"),
+             CaptureButtonPressInEvent.EVENT_NAME to mapOf("registrationName" to "onCaptureButtonPressIn"),
+             CaptureButtonPressOutEvent.EVENT_NAME to mapOf("registrationName" to "onCaptureButtonPressOut"),
+-            FaceDetectedEvent.EVENT_NAME to mapOf("registrationName" to "onFaceDetected"),
+-            FaceDetectionInstallStatusEvent.EVENT_NAME to mapOf("registrationName" to "onFaceDetectionInstallStatus"),
+         )
+     }
+ 
+diff --git a/node_modules/react-native-camera-kit/android/src/oldarch/java/com/rncamerakit/CKCameraManager.kt b/node_modules/react-native-camera-kit/android/src/oldarch/java/com/rncamerakit/CKCameraManager.kt
+index 9474b9f..1f629d8 100644
+--- a/node_modules/react-native-camera-kit/android/src/oldarch/java/com/rncamerakit/CKCameraManager.kt
++++ b/node_modules/react-native-camera-kit/android/src/oldarch/java/com/rncamerakit/CKCameraManager.kt
+@@ -54,8 +54,6 @@ class CKCameraManager(var context: ReactApplicationContext) : SimpleViewManager<
+             ErrorEvent.EVENT_NAME to mapOf("registrationName" to "onError"),
+             CaptureButtonPressInEvent.EVENT_NAME to mapOf("registrationName" to "onCaptureButtonPressIn"),
+             CaptureButtonPressOutEvent.EVENT_NAME to mapOf("registrationName" to "onCaptureButtonPressOut"),
+-            FaceDetectedEvent.EVENT_NAME to mapOf("registrationName" to "onFaceDetected"),
+-            FaceDetectionInstallStatusEvent.EVENT_NAME to mapOf("registrationName" to "onFaceDetectionInstallStatus"),
+         )
+     }
+ 

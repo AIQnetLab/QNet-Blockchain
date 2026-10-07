@@ -1,394 +1,100 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getRateLimitKey } from '../../../../../lib/rate-limit';
+import { readJsonPost } from '@/server/request-guard';
+import { LEGACY_COOLDOWN_MS, LEGACY_HOURLY, LEGACY_PER_IP, PASS_SHARE, PER_NETWORK, legacyFaucetGuard } from '@/server/faucet-guard';
+import { checkFaucetPass, sharedFaucetPassKey } from '@/server/faucet-pass';
+import { signLegacyTransaction, toBaseUnits } from '@/server/solana-tx';
+import { faucetEnvironment, loadFaucetSigner } from '@/server/faucet-config';
+import { confirmSignature, latestBlockhash, sendTransaction } from '@/server/solana-rpc';
+import { sharedSolanaRpc } from '@/server/solana-endpoint';
+import {
+  ONE_DEV_DECIMALS,
+  SOL_DECIMALS,
+  oneDevTransferInstructions,
+  solTransferInstructions,
+} from '@/server/faucet-tx';
 
 // ============================================================================
-// Faucet Claim API - 1DEV (Solana SPL) + SOL + QNC
-// Security: uses only @solana/web3.js + @solana/spl-token (no wallet-adapter)
+// Faucet Claim API - devnet 1DEV (Solana SPL) + devnet SOL, from the faucet wallet. Nothing else is handed out.
+// The Solana transactions are built, signed and confirmed by src/server/solana-tx.ts and solana-rpc.ts,
+// with no Solana SDK in this process: the only code near FAUCET_PRIVATE_KEY is the site's own.
 // ============================================================================
 
-const FAUCET_CONFIG = {
-  testnet: { '1DEV': 1500, SOL: 1.0, QNC: 50000 },
-  mainnet: { '1DEV': 1500, SOL: 0.1, QNC: 1000 },
-  cooldown: {
-    testnet: 24 * 60 * 60 * 1000,
-    mainnet: 24 * 60 * 60 * 1000,
-  },
-  maxRequestsPerIP: 10,
-  maxRequestsPerAddress: 5,
-};
+// The most one claim may ask for. The /testnet page asks 0.005 SOL, enough for a wallet to fund a payment address of
+// My node (its SOL and its 1DEV account's rent, with the fees); the faucet wallet's SOL is shared, so a claim never
+// takes more than 0.01 (SITE-R1-02). Test tokens only: on a release whose network is not testnet (faucetEnvironment,
+// from BURN_CLUSTER) the faucet sends nothing (SITE-R3-01).
+const FAUCET_AMOUNTS = { '1DEV': 1500, SOL: 0.01 } as const;
+const faucetAmounts = (environment: 'testnet' | 'mainnet'): typeof FAUCET_AMOUNTS | null => (environment === 'mainnet' ? null : FAUCET_AMOUNTS);
+// {walletAddress, amount, tokenType, pass} fits in a few hundred bytes.
+const FAUCET_BODY_MAX_BYTES = 1024;
 
-const rateLimitStore = new Map<string, { count: number; lastReset: number }>();
-const addressCooldowns = new Map<string, number>();
-
-// ---------------------------------------------------------------------------
-// Faucet signing key loader
-// ---------------------------------------------------------------------------
-// The key is read ONLY from the runtime secret FAUCET_PRIVATE_KEY (a JSON
-// byte-array, injected by the deploy's secrets manager). It is never logged
-// and there is no on-disk fallback — the wallet must not be recoverable from
-// repo/config files. Returns null when unset/malformed so callers fail closed.
-function loadFaucetWallet(
-  Keypair: typeof import('@solana/web3.js').Keypair,
-): import('@solana/web3.js').Keypair | null {
-  const raw = process.env.FAUCET_PRIVATE_KEY;
-  if (!raw) return null;
-  try {
-    const bytes = JSON.parse(raw);
-    if (!Array.isArray(bytes) || bytes.length === 0) return null;
-    return Keypair.fromSecretKey(new Uint8Array(bytes));
-  } catch {
-    // Never surface the key material in the error path.
-    return null;
-  }
-}
+type SendResult = { success: boolean; txHash?: string; error?: string; releasable?: boolean };
 
 function validateSolanaAddress(address: string): boolean {
   const base58Regex = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
   return base58Regex.test(address);
 }
 
-function validateQNetAddress(address: string): boolean {
-  const eonRegex = /^[a-z0-9]{19}eon[a-z0-9]{15}[a-z0-9]{4}$/;
-  return eonRegex.test(address);
-}
-
-function checkRateLimit(ip: string): { allowed: boolean; resetTime?: number } {
-  const now = Date.now();
-  const windowMs = 60 * 60 * 1000;
-  const record = rateLimitStore.get(ip);
-
-  if (!record || now - record.lastReset > windowMs) {
-    rateLimitStore.set(ip, { count: 1, lastReset: now });
-    return { allowed: true };
-  }
-
-  if (record.count >= FAUCET_CONFIG.maxRequestsPerIP) {
-    return { allowed: false, resetTime: record.lastReset + windowMs };
-  }
-
-  record.count++;
-  return { allowed: true };
-}
-
-// Cooldown key = `${address}:${tokenType}` — NOT the bare address. A claim is a PAIR of parallel
-// requests (1DEV + SOL) for the same wallet; keying by address alone made the first request's
-// pre-dispatch reservation 429 the second one ("wait 24 hours"), so exactly one token ever
-// arrived. Per-type keys let one claim's pair coexist while each token type still enforces its
-// own 24h-per-address limit — anti-abuse is not weakened.
-function cooldownKey(address: string, tokenType: string): string {
-  return `${address}:${tokenType}`;
-}
-
-function checkAddressCooldown(
-  key: string,
-  environment: 'testnet' | 'mainnet',
-): { allowed: boolean; nextClaimTime?: number } {
-  const now = Date.now();
-  const lastClaim = addressCooldowns.get(key);
-  const cooldownMs = FAUCET_CONFIG.cooldown[environment];
-
-  if (lastClaim && now - lastClaim > cooldownMs * 2) {
-    addressCooldowns.delete(key);
-  }
-
-  if (!lastClaim || now - lastClaim > cooldownMs) {
-    return { allowed: true };
-  }
-
-  return { allowed: false, nextClaimTime: lastClaim + cooldownMs };
-}
-
 // ---------------------------------------------------------------------------
-// v14.5: SECURE ENVIRONMENT DETECTION
+// 1DEV (SPL token) and SOL on Solana devnet
 // ---------------------------------------------------------------------------
-// Previous implementation inferred the environment from the Host header,
-// which is supplied by the client and can be forged:
-//   curl -H "Host: testnet.example" https://mainnet.example/api/faucet/claim
-// That caused the rate-limit bypass branch (environment === 'testnet' skips
-// the limit) to fire on mainnet, enabling unlimited SPL 1DEV transfers.
-//
-// New rule: environment comes ONLY from a server-side build-time or runtime
-// env var that the client cannot influence. FAUCET_ENV must be 'testnet' or
-// 'mainnet' — anything else (or missing) defaults to the safer 'mainnet'.
-// NEXT_PUBLIC_NETWORK is accepted as a secondary fallback because it is
-// already used across the frontend for network switching; note it is fixed
-// at build time so still not attacker-influenceable per request.
-// ---------------------------------------------------------------------------
-function detectEnvironment(_request: NextRequest): 'testnet' | 'mainnet' {
-  const explicit = (process.env.FAUCET_ENV || process.env.NEXT_PUBLIC_NETWORK || '').toLowerCase();
-  if (explicit === 'testnet' || explicit === 'dev' || explicit === 'development') {
-    return 'testnet';
+// The result says whether the anti-double-claim reservation may be released:
+//   releasable true  — definitely not sent (a failure before sending, or the RPC refused it), or it
+//                      definitely cannot land (failed on chain, or its blockhash expired unseen).
+//   releasable false — it may still land (no answer to the send, or no confirmation before the
+//                      deadline while its blockhash is valid): the reservation stays.
+// The transaction id is the faucet's signature, known before sending, so it is echoed even when
+// the send itself gets no answer.
+async function sendSolanaTransfer(kind: '1DEV' | 'SOL', address: string, amount: number): Promise<SendResult> {
+  const signer = loadFaucetSigner();
+  if (!signer) {
+    return { success: false, error: 'Faucet configuration error - private key not found', releasable: true };
   }
-  // Default: safer branch — mainnet rules (full rate limiting).
-  return 'mainnet';
-}
-
-// ---------------------------------------------------------------------------
-// 1DEV token send (Solana SPL)
-// ---------------------------------------------------------------------------
-// Confirm a submitted tx with a THREE-WAY outcome so the caller can decide whether it is safe to
-// release the anti-double-claim reservation:
-//   'landed'  — tx confirmed on-chain (deliver, keep cooldown).
-//   'failed'  — DEFINITIVE not-landed: an on-chain error, OR the blockhash provably expired without
-//               the tx landing (an expired-blockhash tx can NEVER land) → safe to release + retry.
-//   'unknown' — AMBIGUOUS: RPC flaked / polling window elapsed while the blockhash is still valid, so
-//               the tx may still land (maxRetries keeps rebroadcasting) → KEEP the reservation.
-// Each poll iteration is isolated in try/catch so a transient RPC error never aborts the loop into a
-// false 'failed'.
-async function confirmSig(
-  connection: import('@solana/web3.js').Connection,
-  signature: string,
-  blockhash: string,
-  lastValidBlockHeight: number,
-): Promise<{ status: 'landed' | 'failed' | 'unknown'; err: unknown }> {
   try {
-    const conf = await connection.confirmTransaction(
-      { signature, blockhash, lastValidBlockHeight },
-      'confirmed',
-    );
-    return conf.value?.err
-      ? { status: 'failed', err: conf.value.err }
-      : { status: 'landed', err: null };
-  } catch {
-    // Poll until the tx lands, definitively errors, or the blockhash provably expires.
-    for (let i = 0; i < 24; i++) {
-      try {
-        const st = await connection.getSignatureStatus(signature, { searchTransactionHistory: true });
-        const s = st.value;
-        if (s) {
-          if (s.err) return { status: 'failed', err: s.err };
-          if (s.confirmationStatus === 'confirmed' || s.confirmationStatus === 'finalized') {
-            return { status: 'landed', err: null };
-          }
-        }
-        // Blockhash expired with no status yet ⇒ the tx can never land ⇒ definitive failure.
-        const currentHeight = await connection.getBlockHeight('confirmed');
-        if (currentHeight > lastValidBlockHeight) {
-          return { status: 'failed', err: 'blockhash_expired' };
-        }
-      } catch {
-        // transient RPC error — ignore this tick, the blockhash may still be valid
-      }
-      await new Promise((r) => setTimeout(r, 2500));
-    }
-    // Polling window elapsed while the blockhash could still be valid — cannot prove it didn't land.
-    return { status: 'unknown', err: 'confirmation_timeout' };
-  }
-}
+    const raw = toBaseUnits(amount, kind === '1DEV' ? ONE_DEV_DECIMALS : SOL_DECIMALS);
+    if (raw === null) return { success: false, error: 'Invalid amount', releasable: true };
 
-async function send1DEVTokens(
-  address: string,
-  amount: number,
-): Promise<{ success: boolean; txHash?: string; error?: string; releasable?: boolean }> {
-  const TOKEN_MINT = '62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ';
-  const DECIMALS = 6;
-
-  try {
-    const { Connection, Keypair, PublicKey, Transaction, ComputeBudgetProgram } = await import(
-      '@solana/web3.js'
-    );
-    const {
-      createTransferInstruction,
-      getAssociatedTokenAddress,
-      createAssociatedTokenAccountIdempotentInstruction,
-    } = await import('@solana/spl-token');
-
-    const rpcEndpoints = [
-      'https://api.devnet.solana.com',
-      'https://rpc.ankr.com/solana_devnet',
-    ];
-
-    const connection = new Connection(rpcEndpoints[0], {
-      commitment: 'processed',
-      confirmTransactionInitialTimeout: 60000,
-    });
-
-    // Fail-closed: the signing key comes ONLY from the runtime secret (injected
-    // by the deploy's secrets manager). No on-disk fallback — a committed key
-    // file would leak the wallet to anyone with repo access.
-    const faucetWallet = loadFaucetWallet(Keypair);
-    if (!faucetWallet) {
-      return { success: false, error: 'Faucet configuration error - private key not found' };
+    const rpc = sharedSolanaRpc();
+    let signed: { wire: Uint8Array; signature: string };
+    let lastValidBlockHeight: number;
+    try {
+      const latest = await latestBlockhash(rpc);
+      lastValidBlockHeight = latest.lastValidBlockHeight;
+      const instructions = kind === '1DEV'
+        ? oneDevTransferInstructions(signer.publicKey, address, raw)
+        : solTransferInstructions(signer.publicKey, address, raw);
+      signed = signLegacyTransaction(instructions, signer, latest.blockhash);
+    } catch (error: unknown) {
+      // Nothing was sent.
+      const msg = error instanceof Error ? error.message : `Failed to send ${kind}`;
+      return { success: false, error: msg, releasable: true };
     }
 
-    const mintPubkey = new PublicKey(TOKEN_MINT);
-    const recipientPubkey = new PublicKey(address);
+    const sent = await sendTransaction(rpc, signed.wire);
+    if (sent.state === 'refused') return { success: false, error: sent.error, releasable: true };
 
-    const recipientTokenAddress = await getAssociatedTokenAddress(mintPubkey, recipientPubkey);
-    const faucetTokenAddress = await getAssociatedTokenAddress(mintPubkey, faucetWallet.publicKey);
-
-    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
-
-    const transaction = new Transaction();
-    transaction.recentBlockhash = blockhash;
-    transaction.feePayer = faucetWallet.publicKey;
-
-    transaction.add(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50000 }));
-    transaction.add(ComputeBudgetProgram.setComputeUnitLimit({ units: 400000 }));
-
-    // Create the recipient ATA IDEMPOTENTLY. The non-idempotent variant aborts the whole tx with
-    // IllegalOwner when the ATA already exists — so the transfer below never runs and nothing is
-    // delivered (the historical false-"success" cause). Idempotent = no-op if the ATA already exists.
-    transaction.add(
-      createAssociatedTokenAccountIdempotentInstruction(
-        faucetWallet.publicKey,
-        recipientTokenAddress,
-        recipientPubkey,
-        mintPubkey,
-      ),
-    );
-
-    transaction.add(
-      createTransferInstruction(
-        faucetTokenAddress,
-        recipientTokenAddress,
-        faucetWallet.publicKey,
-        amount * 10 ** DECIMALS,
-      ),
-    );
-
-    // Confirm on-chain BEFORE reporting success — a submitted-but-failed tx must never read as
-    // delivered. Preflight on so a doomed tx is rejected up front instead of silently accepted.
-    const signature = await connection.sendTransaction(transaction, [faucetWallet], {
-      preflightCommitment: 'confirmed',
-      maxRetries: 3,
-    });
-    const conf = await confirmSig(connection, signature, blockhash, lastValidBlockHeight);
-    if (conf.status !== 'landed') {
-      // 'failed' ⇒ releasable (definitely didn't land); 'unknown' ⇒ NOT releasable (may still land).
-      return {
-        success: false,
-        txHash: signature,
-        error: `On-chain/confirm ${conf.status}: ${JSON.stringify(conf.err)}`,
-        releasable: conf.status === 'failed',
-      };
-    }
-
-    return { success: true, txHash: signature };
-  } catch (error: unknown) {
-    // Thrown before a signature exists ⇒ nothing was submitted ⇒ safe to release the reservation.
-    const msg = error instanceof Error ? error.message : 'Failed to send 1DEV tokens';
-    return { success: false, error: msg, releasable: true };
-  }
-}
-
-// ---------------------------------------------------------------------------
-// SOL transfer — sends from faucet wallet (same key as 1DEV)
-// ---------------------------------------------------------------------------
-async function sendSOLTokens(
-  address: string,
-  amount: number,
-): Promise<{ success: boolean; txHash?: string; error?: string; releasable?: boolean }> {
-  try {
-    const { Connection, Keypair, PublicKey, Transaction, SystemProgram, ComputeBudgetProgram } =
-      await import('@solana/web3.js');
-
-    const connection = new Connection('https://api.devnet.solana.com', {
-      commitment: 'processed',
-      confirmTransactionInitialTimeout: 60000,
-    });
-
-    // Fail-closed: signing key sourced only from the runtime secret (same
-    // wallet as 1DEV). No on-disk fallback.
-    const faucetWallet = loadFaucetWallet(Keypair);
-    if (!faucetWallet) {
-      return { success: false, error: 'Faucet configuration error - private key not found' };
-    }
-
-    const recipientPubkey = new PublicKey(address);
-    const lamports = Math.round(amount * 1e9);
-
-    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
-    const transaction = new Transaction();
-    transaction.recentBlockhash = blockhash;
-    transaction.feePayer = faucetWallet.publicKey;
-
-    transaction.add(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50000 }));
-    transaction.add(
-      SystemProgram.transfer({
-        fromPubkey: faucetWallet.publicKey,
-        toPubkey: recipientPubkey,
-        lamports,
-      }),
-    );
-
-    const signature = await connection.sendTransaction(transaction, [faucetWallet], {
-      preflightCommitment: 'confirmed',
-      maxRetries: 3,
-    });
-    // Confirm before reporting success (same discipline as the 1DEV path).
-    const conf = await confirmSig(connection, signature, blockhash, lastValidBlockHeight);
-    if (conf.status !== 'landed') {
-      return {
-        success: false,
-        txHash: signature,
-        error: `On-chain/confirm ${conf.status}: ${JSON.stringify(conf.err)}`,
-        releasable: conf.status === 'failed',
-      };
-    }
-
-    return { success: true, txHash: signature };
-  } catch (error: unknown) {
-    const msg = error instanceof Error ? error.message : 'Failed to send SOL';
-    return { success: false, error: msg, releasable: true };
-  }
-}
-
-// ---------------------------------------------------------------------------
-// QNC tokens (QNet native, plain HTTP)
-// ---------------------------------------------------------------------------
-async function sendQNCTokens(
-  address: string,
-  amount: number,
-): Promise<{ success: boolean; txHash?: string; error?: string; releasable?: boolean }> {
-  const bootstrapNodes = [
-    'https://154.38.160.39:8001',
-    'https://62.171.157.44:8001',
-    'https://161.97.86.81:8001',
-    'https://5.189.130.160:8001',
-    'https://162.244.25.114:8001',
-  ];
-  const qnetApiUrl =
-    process.env.QNET_NODE_URL || bootstrapNodes[Math.floor(Math.random() * bootstrapNodes.length)];
-
-  try {
-    const response = await fetch(`${qnetApiUrl}/v1/faucet/claim`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'User-Agent': 'QNet-Explorer-Faucet/1.0' },
-      body: JSON.stringify({ address, amount, token: 'QNC' }),
-      signal: AbortSignal.timeout(15000),
-    });
-
-    if (response.ok) {
-      const data = await response.json();
-      return { success: true, txHash: data.txHash };
-    }
-    // Definitive server-side reject (node returned an error status): nothing was dispensed ⇒ releasable.
-    const err = await response.json().catch(() => ({ message: 'QNet faucet request failed' }));
-    return { success: false, error: err.message || 'QNet faucet request failed', releasable: true };
-  } catch {
-    // Network error / timeout after the request left: the node MAY have processed it ⇒ keep the
-    // reservation (releasable stays undefined) so a lost-response claim is not double-dispensed.
-    return { success: false, error: 'QNet faucet unavailable' };
+    const conf = await confirmSignature(rpc, signed.signature, lastValidBlockHeight);
+    if (conf.status === 'landed') return { success: true, txHash: signed.signature };
+    return {
+      success: false,
+      txHash: signed.signature,
+      error: `On-chain/confirm ${conf.status}: ${conf.reason}`,
+      releasable: conf.status === 'failed',
+    };
+  } finally {
+    signer.seed.fill(0);
   }
 }
 
 // ---------------------------------------------------------------------------
 // Dispatcher
 // ---------------------------------------------------------------------------
-async function sendTokens(
-  tokenType: string,
-  amount: number,
-  address: string,
-  environment: 'testnet' | 'mainnet',
-): Promise<{ success: boolean; txHash?: string; error?: string; releasable?: boolean }> {
+async function sendTokens(tokenType: string, amount: number, address: string): Promise<SendResult> {
   switch (tokenType) {
     case '1DEV':
-      return send1DEVTokens(address, amount);
     case 'SOL':
-      return sendSOLTokens(address, amount);
-    case 'QNC':
-      return sendQNCTokens(address, amount);
+      return sendSolanaTransfer(tokenType, address, amount);
     default:
       // Unsupported type never sent anything ⇒ releasable.
       return { success: false, error: 'Unsupported token type', releasable: true };
@@ -400,14 +106,26 @@ async function sendTokens(
 // ---------------------------------------------------------------------------
 export async function POST(request: NextRequest) {
   try {
-    const body = await request.json();
-    const { walletAddress, amount, tokenType = '1DEV' } = body;
+    // Before anything else: no Origin (a script, the SDK) or aiqnet.io's own, a JSON body, a size cap.
+    // Another site's page can then send nothing here with its visitors' IP addresses.
+    const read = await readJsonPost(request, FAUCET_BODY_MAX_BYTES);
+    if (!read.ok) {
+      return NextResponse.json({ success: false, error: read.error }, { status: read.status });
+    }
+    const body = read.value;
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      return NextResponse.json({ success: false, error: 'Invalid request body' }, { status: 400 });
+    }
+    const { walletAddress, amount, tokenType = '1DEV', pass = null } = body as Record<string, unknown>;
 
-    if (!walletAddress) {
+    if (typeof walletAddress !== 'string' || !walletAddress) {
       return NextResponse.json(
         { success: false, error: 'Missing required field: walletAddress' },
         { status: 400 },
       );
+    }
+    if (typeof tokenType !== 'string') {
+      return NextResponse.json({ success: false, error: 'Unsupported token type' }, { status: 400 });
     }
     // Amount must be a finite positive number — reject negatives/NaN/strings/objects before any math.
     if (typeof amount !== 'number' || !Number.isFinite(amount) || amount <= 0) {
@@ -417,22 +135,23 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Validate address format
-    const isValid =
-      tokenType === 'QNC' ? validateQNetAddress(walletAddress) : validateSolanaAddress(walletAddress);
-
-    if (!isValid) {
+    if (!validateSolanaAddress(walletAddress)) {
       return NextResponse.json(
         { success: false, error: 'Invalid wallet address format' },
         { status: 400 },
       );
     }
 
-    const environment = detectEnvironment(request);
+    const environment = faucetEnvironment();
+    const amounts = faucetAmounts(environment);
+    if (!amounts) {
+      return NextResponse.json({ success: false, error: 'The faucet sends test tokens only' }, { status: 404 });
+    }
 
     // Validate amount
-    const maxAmount =
-      FAUCET_CONFIG[environment][tokenType as keyof (typeof FAUCET_CONFIG)['testnet']];
+    const maxAmount = Object.prototype.hasOwnProperty.call(amounts, tokenType)
+      ? amounts[tokenType as keyof typeof FAUCET_AMOUNTS]
+      : undefined;
     if (!maxAmount || amount > maxAmount) {
       return NextResponse.json(
         { success: false, error: `Maximum amount for ${tokenType} is ${maxAmount}` },
@@ -440,47 +159,27 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Rate-limiting & cooldown for mainnet only
-    if (environment !== 'testnet') {
-      const cooldownCheck = checkAddressCooldown(cooldownKey(walletAddress, tokenType), environment);
-      if (!cooldownCheck.allowed) {
-        return NextResponse.json(
-          {
-            success: false,
-            error: 'Please wait 24 hours between claims.',
-            nextClaimTime: new Date(cooldownCheck.nextClaimTime!).toISOString(),
-          },
-          { status: 429 },
-        );
-      }
-
-      // Derive the per-IP key from trusted proxy headers. On mainnet with no
-      // trusted proxy configured this fails closed (503) instead of collapsing
-      // every caller into one shared bucket.
-      const ipKey = getRateLimitKey(request);
-      if (!ipKey.ok) {
-        return NextResponse.json(
-          { success: false, error: `Service misconfigured: ${ipKey.reason}` },
-          { status: 503 },
-        );
-      }
-
-      const rl = checkRateLimit(ipKey.ip);
-      if (!rl.allowed) {
-        return NextResponse.json(
-          { success: false, error: 'Too many requests. Please try again later.' },
-          { status: 429 },
-        );
-      }
-
-      // Reserve the per-(address, tokenType) slot BEFORE dispatching (which now awaits confirmation for
-      // seconds), so concurrent same-wallet same-token claims can't all pass the cooldown check and each
-      // send. Released below only on a hard pre-send / on-chain failure — a landed-but-slow tx keeps the
-      // reservation. Keyed per token type so the UI's parallel 1DEV+SOL pair never 429s itself.
-      addressCooldowns.set(cooldownKey(walletAddress, tokenType), Date.now());
+    // Every claim (SITE-R1-02): the per-(address, token) cooldown, the per-IP and per-network windows (X-Real-IP from
+    // nginx, else the socket address) and the faucet's hourly budget per token, most of it kept for claims with a faucet
+    // pass, one of each token per wallet a day (SITE M-13). A pass that does not check out, or has ended, makes the claim
+    // an open one. The places are taken before the transfer is sent, keyed per token so the page's parallel 1DEV and SOL
+    // pair never refuses itself (src/server/faucet-guard.ts). A refusal says when to try again.
+    const wallet = checkFaucetPass(sharedFaucetPassKey(), pass, Date.now());
+    const admission = legacyFaucetGuard().admit(walletAddress, tokenType, getRateLimitKey(request), wallet);
+    if (!admission.ok) {
+      const headers: Record<string, string> = admission.retryAfterS ? { 'Retry-After': String(admission.retryAfterS) } : {};
+      return NextResponse.json(
+        {
+          success: false,
+          error: admission.error,
+          ...(admission.retryAfterS ? { retryAfterS: admission.retryAfterS } : {}),
+          ...(admission.nextClaimTime ? { nextClaimTime: new Date(admission.nextClaimTime).toISOString() } : {}),
+        },
+        { status: admission.status, headers },
+      );
     }
 
-    const result = await sendTokens(tokenType, amount, walletAddress, environment);
+    const result = await sendTokens(tokenType, amount, walletAddress);
 
     if (result.success) {
       return NextResponse.json({
@@ -498,9 +197,7 @@ export async function POST(request: NextRequest) {
     // (RPC flake / confirm timeout while the blockhash may still be valid) KEEPS the reservation so a
     // slow-but-landed tx can never be double-paid on retry. Always echo the signature (when present)
     // so the money-moving operation is observable on a Solana explorer even on failure.
-    if (environment !== 'testnet' && result.releasable === true) {
-      addressCooldowns.delete(cooldownKey(walletAddress, tokenType));
-    }
+    if (result.releasable === true) admission.release();
     return NextResponse.json(
       { success: false, error: result.error, txHash: result.txHash ?? null },
       { status: 500 },
@@ -513,17 +210,20 @@ export async function POST(request: NextRequest) {
 // ---------------------------------------------------------------------------
 // GET /api/faucet/claim
 // ---------------------------------------------------------------------------
-export async function GET(request: NextRequest) {
-  const environment = detectEnvironment(request);
+export async function GET() {
+  const environment = faucetEnvironment();
+  const amounts = faucetAmounts(environment);
   return NextResponse.json({
     environment,
-    supportedTokens: Object.keys(FAUCET_CONFIG[environment]),
-    amounts: FAUCET_CONFIG[environment],
-    cooldownMs: FAUCET_CONFIG.cooldown[environment],
+    supportedTokens: amounts ? Object.keys(amounts) : [],
+    amounts: amounts ?? {},
+    cooldownMs: LEGACY_COOLDOWN_MS,
     rateLimit: {
-      maxRequestsPerIP: FAUCET_CONFIG.maxRequestsPerIP,
-      maxRequestsPerAddress: FAUCET_CONFIG.maxRequestsPerAddress,
-      windowMs: 60 * 60 * 1000,
+      maxRequestsPerIP: LEGACY_PER_IP.max,
+      maxRequestsPerNetwork: PER_NETWORK.max,
+      windowMs: LEGACY_PER_IP.windowMs,
+      hourlyPerToken: LEGACY_HOURLY,
+      passShare: PASS_SHARE,
     },
   });
 }

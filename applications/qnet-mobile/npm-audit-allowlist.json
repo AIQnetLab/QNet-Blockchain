@@ -1,0 +1,23 @@
+{
+  "comment": "Advisories `npm audit --omit=dev` reports that do not reach the shipped app, each with the reason. scripts/audit-check.js fails on any other advisory; __tests__/DependencyAudit.test.js checks the reasons still hold (who depends on the package, and that the app bundle cannot load it).",
+  "advisories": [
+    {
+      "id": "GHSA-5p2g-fcmc-qvqq",
+      "package": "image-size",
+      "path": "react-native > metro > image-size",
+      "why": "Build tool only. Metro (the bundler) reads the project's own image assets with it on the developer's machine to record their width and height; no code in the app requires it and it is not in the JS bundle or the APK/IPA. The DoS needs a crafted JXL/HEIF image, and the only images it ever parses are the repository's own. Upgrading needs image-size 2.x, whose API Metro 0.83 does not use (it passes file paths), so the bundler would break."
+    },
+    {
+      "id": "GHSA-w3rx-r6r6-pgpr",
+      "package": "image-size",
+      "path": "react-native > metro > image-size",
+      "why": "Same package and reason as GHSA-5p2g-fcmc-qvqq: an ICNS parsing loop in a build-time tool that parses only the repository's own assets."
+    },
+    {
+      "id": "GHSA-528h-pc64-c93x",
+      "package": "stream-json",
+      "path": "@solana/web3.js > jayson > stream-json",
+      "why": "Not in the app. @solana/web3.js's React Native entry (lib/index.native.js) loads only jayson/lib/client/browser, which requires nothing but uuid and jayson's generateRequest; stream-json is required by jayson/lib/utils.js, the JSON-RPC server's stream parser, which that client never loads, so Metro never bundles it. The advisory concerns stream-json's pick/ignore/filter/replace filters on hostile input, which nothing in the app runs."
+    }
+  ]
+}

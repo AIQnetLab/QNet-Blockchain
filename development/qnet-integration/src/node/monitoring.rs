@@ -63,12 +63,13 @@ impl BlockchainNode {
                     if let Some(tx) = tx_opt {
                         // Extract tx_type as string for explorer
                         let tx_type_str = format!("{:?}", tx.tx_type);
-                        
+                        let (shown_to, shown_amount) = crate::rpc::tx_display_to_amount(&tx);
+
                         return Ok(Some(TransactionInfo {
                             hash: stored_hash, // Use the mempool hash for consistency
                             from: tx.from,
-                            to: tx.to,
-                            amount: tx.amount,
+                            to: shown_to,
+                            amount: shown_amount,
                             nonce: tx.nonce,
                             gas_price: tx.gas_price,
                             gas_limit: tx.gas_limit,
@@ -158,12 +159,13 @@ impl BlockchainNode {
                 
                 // Extract tx_type as string for explorer
                 let tx_type_str = format!("{:?}", tx.tx_type);
-                
+                let (shown_to, shown_amount) = crate::rpc::tx_display_to_amount(&tx);
+
                 Ok(Some(TransactionInfo {
                     hash: tx.hash,
                     from: tx.from,
-                    to: tx.to,
-                    amount: tx.amount,
+                    to: shown_to,
+                    amount: shown_amount,
                     nonce: tx.nonce,
                     gas_price: tx.gas_price,
                     gas_limit: tx.gas_limit,

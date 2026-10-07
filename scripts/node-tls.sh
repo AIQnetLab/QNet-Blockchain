@@ -39,8 +39,18 @@ if [ "$resolved" != "$IP" ]; then
 fi
 
 mkdir -p /root/qnet-tls
+# Written in place: the file is bind-mounted into the running terminator. Behind this terminator every request
+# reaches the node from the docker bridge gateway, an address the node takes as its local interface, so the
+# node's operator, peer and internal surfaces are refused here, before the node.
 cat > /root/qnet-tls/Caddyfile <<EOF
 $HOST {
+    @operator path /rpc /rpc/* /api/v1/internal/* /api/v1/p2p/* /api/v1/node-reactivation/* /api/v1/shutdown /api/v1/shutdown/* /api/v1/benchmark/*
+    respond @operator 403
+    @rootpost {
+        path /
+        method POST
+    }
+    respond @rootpost 403
     reverse_proxy 127.0.0.1:8001
 }
 EOF

@@ -176,7 +176,20 @@ impl Storage {
             light_rotation: Arc::new(RwLock::new(light_rotation)),
             recent_microblocks: Arc::new(dashmap::DashMap::new()),
             history_archive: once_cell::sync::OnceCell::new(),
+            recent_tx_feed: parking_lot::Mutex::new(None),
         };
+        // Proof views release under disk pressure from the cached usage and resume only on a fresh
+        // measurement of this data directory.
+        {
+            let (usage, max) = (storage.current_storage_usage.clone(), storage.max_storage_size);
+            let dir = std::path::PathBuf::from(data_dir);
+            storage.persistent.views.set_disk_probes(
+                Box::new(move || max > 0 && (*usage.read() as f64 / max as f64) * 100.0 >= 95.0),
+                Box::new(move || if max == 0 { None } else {
+                    super::proof_views::dir_size(&dir).map(|s| s as f64 / max as f64 * 100.0)
+                }),
+            );
+        }
         if storage.storage_mode == StorageMode::Super && std::env::var("QNET_ARCHIVE").as_deref() == Ok("1") {
             if let Err(e) = storage.open_history_archive(Path::new(data_dir).join("archive")) {
                 println!("[ERR][HISTORY] open_failed err={} action=run_without_archive", e);
@@ -745,10 +758,12 @@ impl Storage {
             let from_key = format!("addr_{}_{:016x}_{}", tx.from, stamp, tx_hash_str);
             batch.put_cf(&tx_by_addr_cf, from_key.as_bytes(), tx_hash_str.as_bytes());
             
-            // Index 'to' address (if present, including system addresses)
-            let to_addr = tx.to.as_ref().map(|s| s.as_str()).unwrap_or(&tx.from);
-            let to_key = format!("addr_{}_{:016x}_{}", to_addr, stamp, tx_hash_str);
-            batch.put_cf(&tx_by_addr_cf, to_key.as_bytes(), tx_hash_str.as_bytes());
+            // Counterparties apply actually paid or created (a batch's recipients, a deploy's derived
+            // address), including system addresses.
+            for to_addr in super::tx_index_counterparties(tx) {
+                let to_key = format!("addr_{}_{:016x}_{}", to_addr, stamp, tx_hash_str);
+                batch.put_cf(&tx_by_addr_cf, to_key.as_bytes(), tx_hash_str.as_bytes());
+            }
 
             // QRC-20/721 counterparties are indexed from the success-gated transfer EVENTS
             // (build_token_transfer_rows), not from calldata intent — see the token_transfers index.

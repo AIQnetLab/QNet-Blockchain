@@ -1,0 +1,21 @@
+# QNet WASM contracts: helper crate, templates and the build/check tool.
+# A workspace of its own, separate from the node workspace at the repo root.
+[workspace]
+members = [
+    "qnet-contract",
+    "templates/counter",
+    "templates/game-items",
+    "tool",
+    "tool/abi-probe",
+]
+resolver = "2"
+
+# Contract builds (wasm32). Without LTO precompiled core code keeps a call_indirect
+# encoding the node's deploy validator refuses.
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+debug = false
+strip = true

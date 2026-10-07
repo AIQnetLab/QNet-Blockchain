@@ -33,6 +33,9 @@ target_compile_options(dilithium_native PRIVATE
     -O2
 )
 
+# Native error logging in debug builds only; release builds log nothing.
+target_compile_definitions(dilithium_native PRIVATE $<$<CONFIG:Debug>:QNET_NATIVE_LOG>)
+
 target_link_libraries(dilithium_native
     android
     log

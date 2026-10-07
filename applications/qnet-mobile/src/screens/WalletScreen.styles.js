@@ -1,6 +1,17 @@
 import { Platform, StyleSheet } from 'react-native';
 
 const styles = StyleSheet.create({
+  // The layout direction of a whole screen (Arabic is right to left), and runs that stay left to right in any
+  // language: addresses, hashes, amounts.
+  dirLtr: {
+    direction: 'ltr',
+  },
+  dirRtl: {
+    direction: 'rtl',
+  },
+  ltr: {
+    writingDirection: 'ltr',
+  },
   loadingContainer: {
     flex: 1,
     justifyContent: 'center',
@@ -17,20 +28,26 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: '#11131f', // Same as splash screen background for smooth transition
   },
+  // One centred column of at most 640 on every screen, so a tablet or a wide window shows the phone layout, not lines
+  // stretched across the screen. Flex only: nothing reads the window width. The screen's own background shows beside it.
   centerContent: {
     flex: 1,
+    width: '100%',
+    maxWidth: 640,
+    alignSelf: 'center',
     justifyContent: 'center',
     alignItems: 'center',
     padding: 20,
-    backgroundColor: '#0f0f1a', // Same as container for consistency
   },
   formContent: {
     flexGrow: 1,
+    width: '100%',
+    maxWidth: 640,
+    alignSelf: 'center',
     justifyContent: 'flex-start',
     alignItems: 'center',
     padding: 20,
     paddingTop: 80,
-    backgroundColor: '#0f0f1a',
   },
   // Wraps a form's ScrollView so an open keyboard shrinks the form instead of covering it.
   keyboardAvoid: {
@@ -41,7 +58,10 @@ const styles = StyleSheet.create({
     padding: 20,
   },
   scrollContentContainer: {
-    paddingBottom: Platform.OS === 'ios' ? 20 : 20,
+    width: '100%',
+    maxWidth: 640,
+    alignSelf: 'center',
+    paddingBottom: 20,
   },
   title: {
     fontSize: 28,
@@ -174,37 +194,21 @@ const styles = StyleSheet.create({
     borderBottomWidth: 1,
     borderBottomColor: '#00d4ff',
   },
-  tabNav: {
-    flexDirection: 'row',
-    backgroundColor: '#16213e',
-    paddingVertical: 5,
-    borderBottomWidth: 1,
-    borderBottomColor: '#00d4ff',
-  },
-  tab: {
-    flex: 1,
-    paddingVertical: 15,
-    alignItems: 'center',
-    justifyContent: 'center',
-    borderBottomWidth: 2,
-    borderBottomColor: 'transparent',
-  },
-  activeTab: {
-    borderBottomColor: '#00d4ff',
-  },
-  tabText: {
-    color: '#b0b0b0',
-    fontSize: 12,
-    fontWeight: '600',
-    lineHeight: 18,
-    includeFontPadding: false,
-  },
-  activeTabText: {
-    color: '#00d4ff',
-  },
+  // Between the header and the bottom bar (components/BottomBar, which keeps clear of the system bars itself).
   tabContentContainer: {
     flex: 1,
-    marginBottom: Platform.OS === 'ios' ? 10 : 60, // Space to ensure content is scrollable above tab nav
+  },
+  // The in-app browser pane: placed over the tab content area (its top and height are measured), under
+  // everything else; invisible and untouchable while another tab is open or the wallet is locked.
+  browserPane: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    top: 0,
+    height: 0,
+  },
+  browserPaneHidden: {
+    opacity: 0,
   },
   tabTitle: {
     fontSize: 24,
@@ -315,18 +319,6 @@ const styles = StyleSheet.create({
     backgroundColor: '#1a1a2e',
     borderRadius: 8,
   },
-  activateCard: {
-    backgroundColor: '#16213e',
-    borderRadius: 15,
-    padding: 20,
-    marginBottom: 20,
-  },
-  phaseText: {
-    color: '#00d4ff',
-    fontSize: 16,
-    fontWeight: 'bold',
-    marginBottom: 10,
-  },
   statusText: {
     color: '#888',
     fontSize: 14,
@@ -404,7 +396,11 @@ const styles = StyleSheet.create({
     color: '#888',
     fontSize: 13,
   },
+  // A long value wraps inside its box instead of squeezing the title beside it.
   settingDropdown: {
+    flexShrink: 1,
+    maxWidth: '50%',
+    marginStart: 10,
     backgroundColor: '#1a1a2e',
     borderRadius: 8,
     paddingHorizontal: 12,
@@ -416,6 +412,7 @@ const styles = StyleSheet.create({
     color: '#00d4ff',
     fontSize: 14,
     fontWeight: '600',
+    textAlign: 'center',
   },
   modalOverlay: {
     position: 'absolute',
@@ -427,7 +424,11 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     alignItems: 'center',
     padding: 20,
+    // Android draws siblings by elevation before zIndex, but touches follow zIndex: the password prompt and the
+    // alerts sit above the browser request sheet and the QNet Link screen (elevation 20, zIndex 9000) in both, or
+    // the prompt their Confirm opens would take taps while drawn underneath them (__tests__/OverlayOrder.test.js).
     zIndex: 9999,
+    elevation: 40,
   },
   modalBox: {
     backgroundColor: '#1a1a2e', // Like extension modal background
@@ -485,14 +486,19 @@ const styles = StyleSheet.create({
   modalOverlayKeyboard: {
     paddingTop: 0,
   },
+  // Buttons share a row while their labels fit; a long label takes a row of its own instead of breaking a word.
   modalActions: {
     flexDirection: 'row',
+    flexWrap: 'wrap',
     gap: 10,
     paddingHorizontal: 20,
     paddingBottom: 20,
     paddingTop: 5,
   },
   modalButton: {
+    flexGrow: 1,
+    flexShrink: 1,
+    minWidth: '40%',
     paddingVertical: 11,
     paddingHorizontal: 18,
     borderRadius: 10,
@@ -526,6 +532,7 @@ const styles = StyleSheet.create({
     fontWeight: '600',
     color: '#1a1a2e',
     letterSpacing: 0.3,
+    textAlign: 'center',
   },
   modalButtonTextSecondary: {
     color: '#00d4ff',
@@ -539,6 +546,26 @@ const styles = StyleSheet.create({
     marginBottom: 15,
     textAlign: 'center',
     lineHeight: 20,
+  },
+  // A send's recipient on its password prompt: whole, in groups of four, left to right in every language.
+  freshRecipient: {
+    color: '#ffffff',
+    fontSize: 15,
+    lineHeight: 22,
+    fontFamily: 'monospace',
+    writingDirection: 'ltr',
+    textAlign: 'left',
+    backgroundColor: '#11131f',
+    borderRadius: 8,
+    padding: 10,
+    marginBottom: 15,
+  },
+  // What a field in a dialog is for: above the field, wrapping, so the placeholder stays one short word.
+  modalLabel: {
+    color: '#b0b0b0',
+    fontSize: 13,
+    fontWeight: '600',
+    marginBottom: 6,
   },
   modalSubtitle: {
     color: '#b0b0b0',
@@ -562,6 +589,7 @@ const styles = StyleSheet.create({
     borderColor: '#00d4ff',
   },
   timeOptionText: {
+    flexShrink: 1,
     color: '#ffffff',
     fontSize: 16,
   },
@@ -592,7 +620,7 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: 'bold',
     color: '#00d4ff',
-    marginRight: 10,
+    marginEnd: 10,
     minWidth: 20,
   },
   seedWordText: {
@@ -669,6 +697,7 @@ const styles = StyleSheet.create({
   },
   addressText: {
     color: '#ffffff',
+    writingDirection: 'ltr',
     fontSize: 12,
     fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
     marginVertical: 2,
@@ -683,6 +712,106 @@ const styles = StyleSheet.create({
     color: '#00d4ff',
     fontSize: 11,
     textAlign: 'center',
+  },
+  // The quiet line under Send and Receive while the figures are being updated, or when they could not be.
+  balanceStatusLine: {
+    color: '#8a8fa3',
+    fontSize: 12,
+    textAlign: 'center',
+    marginTop: 8,
+  },
+  // The QNet Send screen's token switch: one row of chips, scrolled sideways when they do not fit.
+  sendTokenScroll: {
+    flexGrow: 0,
+    marginBottom: 12,
+  },
+  sendTokenRow: {
+    flexDirection: 'row',
+  },
+  // Settings → Export private key: one block per key, the key shown in a box.
+  keyRevealBlock: {
+    marginBottom: 16,
+  },
+  keyRevealFormat: {
+    color: '#888',
+    fontSize: 12,
+    marginBottom: 6,
+  },
+  keyRevealBox: {
+    backgroundColor: '#11131f',
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#2a2d3e',
+    padding: 12,
+    minHeight: 64,
+    justifyContent: 'center',
+    marginBottom: 8,
+  },
+  keyRevealKey: {
+    color: '#ffffff',
+    fontSize: 13,
+    lineHeight: 19,
+    fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
+    writingDirection: 'ltr',
+    textAlign: 'left',
+  },
+  keyRevealCopy: {
+    flex: 0,
+    alignSelf: 'stretch',
+  },
+  // The account whose key is exported, chosen before the password: one option under the other, so a long name fits.
+  keyAccountRow: {
+    flexDirection: 'column',
+    gap: 8,
+    marginBottom: 8,
+  },
+  keyAccountOption: {
+    alignSelf: 'stretch',
+    paddingVertical: 10,
+    paddingHorizontal: 8,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#2a2d3e',
+    backgroundColor: '#11131f',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  keyAccountOptionOn: {
+    borderColor: 'rgba(0, 212, 255, 0.6)',
+    backgroundColor: 'rgba(0, 212, 255, 0.1)',
+  },
+  keyAccountText: {
+    color: '#b0b0b0',
+    fontSize: 13,
+    textAlign: 'center',
+  },
+  keyAccountTextOn: {
+    color: '#ffffff',
+    fontWeight: '600',
+  },
+  // Send / Receive under the address on Assets.
+  assetActions: {
+    flexDirection: 'row',
+    gap: 12,
+    marginTop: 4,
+    marginBottom: 20,
+  },
+  assetAction: {
+    flex: 1,
+    minHeight: 44,
+    borderRadius: 12,
+    paddingVertical: 11,
+    paddingHorizontal: 12,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'rgba(0, 212, 255, 0.12)',
+    borderWidth: 1,
+    borderColor: 'rgba(0, 212, 255, 0.4)',
+  },
+  assetActionText: {
+    color: '#00d4ff',
+    fontSize: 15,
+    fontWeight: '600',
   },
   tokenList: {
     marginBottom: 20,
@@ -704,14 +833,14 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     flexShrink: 1,
     maxWidth: '100%',
-    marginRight: 12,
+    marginEnd: 12,
   },
   tokenIcon: {
     width: 40,
     height: 40,
     justifyContent: 'center',
     alignItems: 'center',
-    marginRight: 12,
+    marginEnd: 12,
   },
   tokenIconText: {
     color: '#1a1a2e',
@@ -739,10 +868,10 @@ const styles = StyleSheet.create({
   checkMark: {
     color: '#00ff00',
     fontSize: 12,
-    marginLeft: 6,
+    marginStart: 6,
     fontWeight: 'bold',
     position: 'absolute',
-    right: 10,
+    end: 10,
     top: '50%',
     transform: [{ translateY: -6 }],
   },
@@ -763,7 +892,7 @@ const styles = StyleSheet.create({
     alignItems: 'flex-end',
     flexShrink: 1,
     maxWidth: '100%',
-    marginLeft: 'auto',
+    marginStart: 'auto',
   },
   tokenAmount: {
     color: '#ffffff',
@@ -792,12 +921,12 @@ const styles = StyleSheet.create({
     color: '#00d4ff',
     fontSize: 24,
     fontWeight: '300',
-    marginLeft: 8,
+    marginStart: 8,
   },
   // Header overflow (⋮) menu
   headerMenuBtn: {
     position: 'absolute',
-    right: 14,
+    end: 14,
     top: 0,
     bottom: 0,
     justifyContent: 'center',
@@ -813,10 +942,11 @@ const styles = StyleSheet.create({
     position: 'absolute',
     top: 0, left: 0, right: 0, bottom: 0,
     zIndex: 10000,
+    elevation: 45, // drawn in the order it is touched (see modalOverlay)
   },
   menuCard: {
     position: 'absolute',
-    right: 10,
+    end: 10,
     minWidth: 210,
     backgroundColor: '#16213e',
     borderRadius: 12,
@@ -824,7 +954,7 @@ const styles = StyleSheet.create({
     borderColor: 'rgba(0, 212, 255, 0.3)',
     paddingVertical: 4,
     zIndex: 10001,
-    elevation: 30,
+    elevation: 50,
     shadowColor: '#000',
     shadowOpacity: 0.4,
     shadowRadius: 14,
@@ -838,6 +968,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
   },
   menuItemText: {
+    flexShrink: 1,
     color: '#e6f6ff',
     fontSize: 15,
     fontWeight: '600',
@@ -846,7 +977,7 @@ const styles = StyleSheet.create({
     color: '#00d4ff',
     fontSize: 15,
     fontWeight: '700',
-    marginLeft: 24,
+    marginStart: 24,
   },
   menuDivider: {
     height: 1,
@@ -873,7 +1004,7 @@ const styles = StyleSheet.create({
   // Wraps beside the close X instead of pushing it out of the header.
   mgrTitle: {
     flexShrink: 1,
-    marginRight: 12,
+    marginEnd: 12,
   },
   mgrClose: {
     color: '#8aa0b3',
@@ -968,6 +1099,7 @@ const styles = StyleSheet.create({
     marginBottom: 4,
   },
   sendBalanceAmount: {
+    writingDirection: 'ltr',
     color: '#00d4ff',
     fontSize: 20,
     fontWeight: '700',
@@ -994,6 +1126,7 @@ const styles = StyleSheet.create({
   },
   sendFeeContainer: {
     flexDirection: 'row',
+    flexWrap: 'wrap',
     justifyContent: 'space-between',
     alignItems: 'center',
     paddingVertical: 12,
@@ -1005,11 +1138,15 @@ const styles = StyleSheet.create({
   sendFeeLabel: {
     color: '#888',
     fontSize: 14,
+    flexShrink: 1,
+    marginEnd: 12,
   },
   sendFeeValue: {
     color: '#ffaa00',
     fontSize: 14,
     fontWeight: '600',
+    marginStart: 'auto',
+    writingDirection: 'ltr',
   },
   sendTotalContainer: {
     flexDirection: 'row',
@@ -1026,7 +1163,7 @@ const styles = StyleSheet.create({
     color: '#fff',
     fontSize: 16,
     fontWeight: '600',
-    marginRight: 12,
+    marginEnd: 12,
   },
   sendTotalValue: {
     color: '#00d4ff',
@@ -1035,21 +1172,24 @@ const styles = StyleSheet.create({
     flexShrink: 1,
     maxWidth: '100%',
     textAlign: 'right',
-    marginLeft: 'auto',
+    marginStart: 'auto',
   },
   // Send Screen Styles (inline, not modal)
   sendScreenContainer: {
     paddingTop: 0,
   },
+  // A sub-screen (Send, Receive) starts right under the app header: its compact row takes the place of the top padding.
+  subScreen: {
+    paddingTop: 4,
+  },
   sendScreenHeader: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    paddingVertical: 16,
-    paddingHorizontal: 4,
+    minHeight: 40,
     borderBottomWidth: 1,
     borderBottomColor: 'rgba(255, 255, 255, 0.1)',
-    marginBottom: 20,
+    marginBottom: 14,
   },
   sendScreenTitle: {
     color: '#00d4ff',
@@ -1059,13 +1199,41 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     marginHorizontal: 8,
   },
+  // Back and the spacer opposite share the row's sides equally, so the title stays centred in any language.
   backButton: {
+    flex: 1,
+    alignItems: 'flex-start',
     paddingVertical: 8,
-    paddingHorizontal: 4,
+    paddingEnd: 4,
+  },
+  headerSpacer: {
+    flex: 1,
   },
   backButtonText: {
     color: '#00d4ff',
     fontSize: 16,
+  },
+  // The Send screen's recipient field, full width; on QNet the scan icon sits inside it at the end (the right, the left
+  // in Arabic). The wrapper takes the field's bottom margin so the icon is centred on the field alone.
+  recipientField: {
+    marginBottom: 20,
+  },
+  recipientInput: {
+    marginBottom: 0,
+  },
+  // The icon's 44 dp target covers the field's last 44 dp: its 1 dp border and 43 dp of end padding, so the text stops
+  // where the target starts.
+  recipientInputScan: {
+    paddingEnd: 43,
+  },
+  scanButton: {
+    position: 'absolute',
+    end: 0,
+    top: 0,
+    bottom: 0,
+    width: 44,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   // Transaction Result Styles
   txResultContainer: {
@@ -1133,6 +1301,7 @@ const styles = StyleSheet.create({
     marginBottom: 8,
   },
   txResultTo: {
+    textAlign: 'center',
     color: '#888',
     fontSize: 14,
     marginBottom: 24,
@@ -1150,6 +1319,7 @@ const styles = StyleSheet.create({
     marginBottom: 8,
   },
   txHashValue: {
+    writingDirection: 'ltr',
     color: '#00d4ff',
     fontSize: 14,
     fontFamily: 'monospace',
@@ -1178,7 +1348,7 @@ const styles = StyleSheet.create({
     borderColor: '#1a1a2e',
     paddingVertical: 6,
     paddingHorizontal: 14,
-    marginRight: 8,
+    marginEnd: 8,
     marginBottom: 8,
   },
   historyChipActive: {
@@ -1192,6 +1362,211 @@ const styles = StyleSheet.create({
   },
   historyChipTextActive: {
     color: '#00d4ff',
+  },
+  // A history row's status: Pending, Confirmed or Failed.
+  historyBadge: {
+    borderRadius: 6,
+    paddingHorizontal: 6,
+    paddingVertical: 1,
+    marginEnd: 6,
+    marginVertical: 1,
+  },
+  historyBadge_pending: { backgroundColor: 'rgba(255, 170, 0, 0.15)' },
+  historyBadge_confirmed: { backgroundColor: 'rgba(0, 255, 136, 0.12)' },
+  historyBadge_failed: { backgroundColor: 'rgba(255, 68, 68, 0.15)' },
+  historyBadge_dropped: { backgroundColor: 'rgba(138, 143, 163, 0.15)' },
+  historyBadgeText: {
+    fontSize: 11,
+    fontWeight: '600',
+  },
+  historyBadgeText_pending: { color: '#ffaa00' },
+  historyBadgeText_confirmed: { color: '#00ff88' },
+  historyBadgeText_failed: { color: '#ff4444' },
+  historyBadgeText_dropped: { color: '#8a8fa3' },
+  // History (screens/HistoryTab): a header per day, then one compact row per transaction, the amount never cut.
+  histDay: {
+    color: '#7d8299',
+    fontSize: 13,
+    fontWeight: '600',
+    marginTop: 8,
+    marginBottom: 8,
+    paddingHorizontal: 4,
+  },
+  histRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#16213e',
+    borderRadius: 12,
+    paddingVertical: 12,
+    paddingHorizontal: 12,
+    marginBottom: 8,
+  },
+  // The app's mark drawn larger than its round, its clear margin cut off (screens/HistoryTab AssetIcon).
+  histIconZoom: {
+    overflow: 'hidden',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  // The action's badge over the icon's lower end corner, ringed in the card's colour so it reads apart from the logo.
+  histBadge: {
+    position: 'absolute',
+    bottom: -4,
+    end: -4,
+    backgroundColor: '#16213e',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  // The sent arrow on a screen laid out right to left points the way that screen reads.
+  histBadgeMirrored: {
+    transform: [{ scaleX: -1 }],
+  },
+  histMiddle: {
+    flex: 1,
+    minWidth: 0,
+    marginStart: 12,
+    marginEnd: 8,
+  },
+  histTitle: {
+    color: '#ffffff',
+    fontSize: 15,
+    fontWeight: '600',
+  },
+  histSub: {
+    color: '#7d8299',
+    fontSize: 12,
+    marginTop: 2,
+  },
+  // The line under the title: whom with, then the status of a row not final, which wraps under it when both do not fit.
+  histSubLine: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    alignItems: 'baseline',
+    columnGap: 8,
+  },
+  histParty: {
+    flexShrink: 1,
+  },
+  // The amounts take at most 45% of the row, so what happened and whom with keep the rest: a compact number (at most 11
+  // characters) and a short symbol fit there whole at 320 dp, and a long symbol gives way first.
+  histRight: {
+    flexShrink: 1,
+    maxWidth: '45%',
+    alignItems: 'flex-end',
+  },
+  // An amount reads left to right in every language: the sign, the number, the symbol.
+  histAmountLine: {
+    flexDirection: 'row',
+    alignItems: 'baseline',
+    justifyContent: 'flex-end',
+    maxWidth: '100%',
+    direction: 'ltr',
+  },
+  // A single amount with a long symbol: the number, and the symbol under it at the line's end.
+  histAmountStack: {
+    alignItems: 'flex-end',
+    maxWidth: '100%',
+  },
+  histAmountLineNext: {
+    marginTop: 2,
+  },
+  // The number keeps its full width; only the symbol after it gives way.
+  histAmount: {
+    flexShrink: 0,
+    fontSize: 15,
+    fontWeight: '600',
+    writingDirection: 'ltr',
+  },
+  // A symbol longer than about six characters ends in an ellipsis (its detail screen and the row's label say it whole).
+  histSymbol: {
+    flexShrink: 1,
+    maxWidth: 64,
+    fontSize: 13,
+    fontWeight: '600',
+  },
+  // Under its number, a symbol is no wider than the longest number (about ten characters) so it never widens the column.
+  histSymbolStacked: {
+    maxWidth: 80,
+    fontSize: 13,
+    fontWeight: '600',
+    marginTop: 1,
+    writingDirection: 'ltr',
+  },
+  // A row's status while it is not final, after whom it was with on the line under its title.
+  histStatus: {
+    fontWeight: '600',
+  },
+  histStatus_pending: { color: '#ffaa00' },
+  histStatus_failed: { color: '#ff4444' },
+  histStatus_dropped: { color: '#8a8fa3' },
+  // The detail screen of one transaction.
+  txDetailHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 12,
+  },
+  txDetailBack: {
+    minHeight: 44,
+    justifyContent: 'center',
+    paddingEnd: 16,
+  },
+  txDetailBackText: {
+    color: '#00d4ff',
+    fontSize: 16,
+    fontWeight: '600',
+  },
+  txDetailCard: {
+    backgroundColor: '#16213e',
+    borderRadius: 16,
+    padding: 16,
+    marginBottom: 16,
+  },
+  txDetailIcon: {
+    alignSelf: 'center',
+    marginBottom: 12,
+  },
+  txDetailHeading: {
+    color: '#ffffff',
+    fontSize: 18,
+    fontWeight: '700',
+    textAlign: 'center',
+  },
+  txDetailAmount: {
+    fontSize: 26,
+    fontWeight: '700',
+    textAlign: 'center',
+    marginTop: 8,
+    writingDirection: 'ltr',
+  },
+  txDetailBadge: {
+    alignSelf: 'center',
+    marginTop: 8,
+    marginBottom: 8,
+    marginEnd: 0,
+  },
+  txDetailField: {
+    borderTopWidth: 1,
+    borderTopColor: '#1f2a4d',
+    paddingVertical: 10,
+  },
+  txDetailLabel: {
+    color: '#7d8299',
+    fontSize: 12,
+    marginBottom: 3,
+  },
+  txDetailValue: {
+    color: '#ffffff',
+    fontSize: 14,
+  },
+  txDetailMono: {
+    fontFamily: 'monospace',
+    fontSize: 13,
+    writingDirection: 'ltr',
+    textAlign: 'left',
+  },
+  txDetailWarning: {
+    color: '#ff5555',
+    fontSize: 12,
+    marginTop: 8,
   },
   txErrorMessage: {
     color: '#ff6b6b',
@@ -1212,46 +1587,6 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: '700',
   },
-  phaseCard: {
-    backgroundColor: '#16213e',
-    borderRadius: 15,
-    padding: 20,
-    marginBottom: 20,
-    borderWidth: 1,
-    borderColor: 'rgba(0, 212, 255, 0.2)',
-  },
-  phaseTitle: {
-    fontSize: 18,
-    fontWeight: 'bold',
-    color: '#00d4ff',
-    marginBottom: 8,
-  },
-  phaseSubtitle: {
-    fontSize: 14,
-    color: '#888',
-    marginBottom: 15,
-  },
-  phaseProgress: {
-    marginTop: 10,
-  },
-  progressText: {
-    fontSize: 12,
-    color: '#888',
-    marginBottom: 8,
-  },
-  progressBar: {
-    height: 8,
-    backgroundColor: 'rgba(0, 212, 255, 0.1)',
-    borderRadius: 4,
-    overflow: 'hidden',
-  },
-  progressFill: {
-    height: '100%',
-    backgroundColor: '#00d4ff',
-  },
-  nodeTypesContainer: {
-    marginBottom: 20,
-  },
   sectionTitle: {
     fontSize: 16,
     fontWeight: '600',
@@ -1263,98 +1598,6 @@ const styles = StyleSheet.create({
     color: '#ffa500',
     marginBottom: 15,
     textAlign: 'center',
-    fontStyle: 'italic',
-  },
-  warningBox: {
-    backgroundColor: 'rgba(74, 144, 226, 0.1)',
-    borderRadius: 8,
-    padding: 10,
-    marginBottom: 10,
-    borderWidth: 1,
-    borderColor: 'rgba(74, 144, 226, 0.3)',
-  },
-  warningText: {
-    fontSize: 12,
-    color: '#ffffff',
-    marginBottom: 2,
-    fontWeight: '500',
-  },
-  warningSubtext: {
-    fontSize: 11,
-    color: '#888888',
-    marginTop: 2,
-    textAlign: 'center',
-  },
-  nodeTypeCard: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    backgroundColor: '#16213e',
-    borderRadius: 12,
-    padding: 12,
-    marginBottom: 8,
-    borderWidth: 1,
-    borderColor: 'rgba(0, 212, 255, 0.2)',
-  },
-  nodeTypeActive: {
-    borderColor: '#00d4ff',
-    backgroundColor: 'rgba(0, 212, 255, 0.1)',
-  },
-  nodeTypeActivated: {
-    borderColor: 'rgba(0, 212, 255, 0.6)',
-    backgroundColor: 'rgba(0, 212, 255, 0.08)',
-    opacity: 0.95,
-  },
-  nodeTypeDisabled: {
-    opacity: 0.5,
-    borderColor: 'rgba(128, 128, 128, 0.3)',
-    backgroundColor: 'rgba(128, 128, 128, 0.05)',
-  },
-  nodeTypeDisabledText: {
-    color: '#666666',
-  },
-  nodeTypeInfo: {
-    flex: 1,
-  },
-  nodeTypeName: {
-    fontSize: 15,
-    fontWeight: '600',
-    color: '#ffffff',
-    marginBottom: 3,
-  },
-  nodeTypeDesc: {
-    fontSize: 11,
-    color: '#888',
-  },
-  nodeTypePrice: {
-    fontSize: 14,
-    fontWeight: 'bold',
-    color: '#00d4ff',
-  },
-  activationStatus: {
-    backgroundColor: 'rgba(0, 255, 127, 0.1)',
-    borderRadius: 10,
-    padding: 15,
-    marginVertical: 15,
-    borderWidth: 1,
-    borderColor: 'rgba(0, 255, 127, 0.3)',
-    alignItems: 'center',
-  },
-  activationStatusTitle: {
-    fontSize: 16,
-    fontWeight: '600',
-    color: '#00ff7f',
-    marginBottom: 8,
-  },
-  activationStatusCode: {
-    fontSize: 13,
-    color: '#ffffff',
-    fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
-    marginBottom: 8,
-  },
-  activationStatusInfo: {
-    fontSize: 11,
-    color: '#888888',
     fontStyle: 'italic',
   },
   nodeMonitoringCard: {
@@ -1372,9 +1615,16 @@ const styles = StyleSheet.create({
     marginBottom: 20,
   },
   nodeMonitoringTitle: {
+    flexShrink: 1,
     fontSize: 18,
     fontWeight: '600',
     color: '#ffffff',
+  },
+  nodeExplainer: {
+    fontSize: 13,
+    lineHeight: 18,
+    color: '#888888',
+    marginBottom: 16,
   },
   alertInput: {
     borderWidth: 1,
@@ -1402,6 +1652,7 @@ const styles = StyleSheet.create({
     borderColor: '#ff3b30',
   },
   statusBadgeText: {
+    textAlign: 'center',
     fontSize: 11,
     fontWeight: '600',
     color: '#00ff7f',
@@ -1416,12 +1667,6 @@ const styles = StyleSheet.create({
     fontSize: 12,
     color: '#888888',
     marginBottom: 4,
-  },
-  nodeMonitoringCode: {
-    fontSize: 14,
-    color: '#00d4ff',
-    fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
-    fontWeight: '500',
   },
   nodeMonitoringValue: {
     fontSize: 14,
@@ -1466,9 +1711,8 @@ const styles = StyleSheet.create({
     color: '#ffffff',
     marginBottom: 20,
   },
-  // A label and its value always share one line: the label keeps its width and the value takes the rest,
-  // rendered with numberOfLines={1} + adjustsFontSizeToFit so a narrow screen or a large system font
-  // shrinks the value instead of dropping it to a line of its own.
+  // A label and its value share one line: a long label wraps within 60% of it and the value takes the rest.
+  // An amount shrinks to fit (numberOfLines={1} + adjustsFontSizeToFit); a status or a countdown wraps.
   rewardItem: {
     flexDirection: 'row',
     justifyContent: 'space-between',
@@ -1478,11 +1722,16 @@ const styles = StyleSheet.create({
     borderBottomWidth: 1,
     borderBottomColor: 'rgba(255, 255, 255, 0.05)',
   },
+  // A row whose value goes under its label when the two do not fit side by side (a long word in some language).
+  rewardItemWrap: {
+    flexWrap: 'wrap',
+  },
   rewardLabel: {
     fontSize: 14,
     color: '#888888',
     flexShrink: 0,
-    marginRight: 12,
+    maxWidth: '60%',
+    marginEnd: 12,
   },
   rewardValue: {
     fontSize: 16,
@@ -1491,7 +1740,7 @@ const styles = StyleSheet.create({
     flexShrink: 1,
     maxWidth: '100%',
     textAlign: 'right',
-    marginLeft: 'auto',
+    marginStart: 'auto',
   },
   // Plain note under a reward row (pending rewards stay out of the balance until claimed).
   rewardHint: {
@@ -1558,7 +1807,7 @@ const styles = StyleSheet.create({
   checkbox: {
     width: 24,
     height: 24,
-    marginRight: 10,
+    marginEnd: 10,
   },
   checkboxInner: {
     width: 24,
@@ -1584,6 +1833,7 @@ const styles = StyleSheet.create({
     flexWrap: 'wrap',
   },
   termsText: {
+    flexShrink: 1,
     fontSize: 14,
     color: '#ffffff',
   },
@@ -1615,7 +1865,7 @@ const styles = StyleSheet.create({
     fontWeight: 'bold',
     color: '#ffffff',
     flexShrink: 1,
-    marginRight: 12,
+    marginEnd: 12,
   },
   termsModalClose: {
     padding: 5,
@@ -1640,6 +1890,7 @@ const styles = StyleSheet.create({
   termsModalButton: {
     flex: 1,
     paddingVertical: 12,
+    paddingHorizontal: 8,
     borderRadius: 8,
     alignItems: 'center',
   },
@@ -1652,12 +1903,34 @@ const styles = StyleSheet.create({
   termsModalButtonText: {
     fontSize: 16,
     fontWeight: '600',
+    textAlign: 'center',
   },
   termsModalAcceptText: {
     color: '#000000',
   },
   termsModalDeclineText: {
     color: '#ffffff',
+  },
+  // The lock screen's mark above the app's name, and its small "forgot" link at the foot of the screen.
+  lockLogo: {
+    width: 72,
+    height: 72,
+    alignSelf: 'center',
+    marginBottom: 16,
+  },
+  lockForgot: {
+    alignSelf: 'center',
+    paddingVertical: 14,
+    paddingHorizontal: 16,
+    marginBottom: 12,
+    minHeight: 44,
+    justifyContent: 'center',
+  },
+  lockForgotText: {
+    color: '#8a8fa3',
+    fontSize: 13,
+    textAlign: 'center',
+    textDecorationLine: 'underline',
   },
   lockoutBanner: {
     backgroundColor: '#2a1a1a',

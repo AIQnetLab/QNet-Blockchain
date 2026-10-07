@@ -2,6 +2,15 @@
 
 use super::*;
 
+/// The outcome of one registration-convergence attempt that did not fail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ConvergenceArm {
+    /// Armed and delivered, or the state already holds the registration.
+    Armed,
+    /// The wallet already has another node on chain (the one-node rule): nothing is armed, now or later.
+    WalletHasNode { node_id: String, node_type: String },
+}
+
 impl BlockchainNode {
     /// Auto-detect region from IP geolocation
     pub async fn auto_detect_region() -> Result<Region, String> {
@@ -283,9 +292,8 @@ impl BlockchainNode {
                         println!("[ERR][ACTIVATION] mnemonic_mismatch solana_from_seed={}... code_wallet=different",
                             qnet_state::char_prefix(&solana_from_mnemonic, 16));
                         return Err(QNetError::ValidationError(
-                            "Activation code does not belong to this mnemonic. \
-                             The code was generated for a different wallet. \
-                             Use the same seed phrase that was used in the mobile app when burning tokens.".to_string()
+                            "Activation code does not belong to this recovery phrase: it was made for another wallet. \
+                             Start the node with the recovery phrase of the wallet that burned in the QNet browser extension.".to_string()
                         ));
                     }
                     Err(e) => {
@@ -298,8 +306,8 @@ impl BlockchainNode {
                 // No env burn data — REQUIRED for non-genesis nodes
                 println!("[ERR][ACTIVATION] missing_burn_env_vars QNET_BURN_TX_HASH and QNET_BURN_AMOUNT required for super node activation");
                 return Err(QNetError::ValidationError(
-                    "QNET_BURN_TX_HASH and QNET_BURN_AMOUNT environment variables are required for super node activation. \
-                     Get these from your mobile app: Settings > Export Activation Codes.".to_string()
+                    "QNET_BURN_TX_HASH and QNET_BURN_AMOUNT are required for a super node. \
+                     The QNet browser extension (Activate tab, \"Recover my code\") and the Overview of aiqnet.io/node show both next to the code.".to_string()
                 ));
             }
         }
@@ -388,6 +396,17 @@ impl BlockchainNode {
                  qnet_state::char_prefix(&wallet_address, 16),
                  qnet_state::char_prefix(&burn_tx_hash, 16),
                  phase, burn_amount);
+
+        // One wallet, one node (wallet_one_node gate at this node's next height): a server whose wallet already
+        // has a light node (or another node) on chain is refused before anything is stored. Its own super id on
+        // chain is a restart of the same node, which the rule never refuses.
+        if matches!(node_type, NodeType::Super) && !is_genesis_code {
+            if let Some((other, other_type)) = Self::wallet_other_node_at_tip(&self.storage, &wallet_address, &self.node_id) {
+                return Err(QNetError::ValidationError(format!(
+                    "This wallet already has a {} node on the QNet network ({}). One wallet runs one node: start this \
+                     server with another wallet's recovery phrase, code and burn.", other_type, other)));
+            }
+        }
             
         // Create node info for blockchain registry with secure hash (SHA3-256 for NIST compliance)
         let registry = crate::activation_validation::BlockchainActivationRegistry::new(
@@ -497,6 +516,38 @@ impl BlockchainNode {
             .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string())
     }
 
+    /// Beneficiary proof: sign the client-form registration with the WALLET ML-DSA-65 key from the
+    /// mnemonic, whose EON is the wallet the TX names. The form signs the super's vrf_pk and endpoint, and
+    /// the wallet binding makes it native-bound, which a super needs from the tx_target_bound gate. The
+    /// node's consensus key rides the hashed vrf_pk field instead: the two keys differ on purpose.
+    pub(crate) fn sign_client_registration(
+        tx: &mut qnet_state::Transaction, node_id: &str, wallet: &str, reg_proof: &str, mnemonic: &str,
+    ) -> Result<(), QNetError> {
+        use pqcrypto_traits::sign::{DetachedSignature as _, SecretKey as _};
+        let canonical_msg = Self::chain_bind(&match &tx.tx_type {
+            qnet_state::TransactionType::NodeRegistration { node_type, vrf_pk, api_endpoint, .. } =>
+                Self::client_node_reg_message(node_id, wallet, reg_proof, tx.timestamp, node_type, vrf_pk, api_endpoint),
+            _ => String::new(),
+        });
+        // FIX-5 wire: RAW detached sig (3309 B) + RAW pk (1952 B), the form verify_node_lifecycle_dilithium requires.
+        let (wpk, wsk) = crate::crypto::genesis_key::derive_wallet_mldsa65_from_mnemonic(mnemonic);
+        match pqcrypto_mldsa::mldsa65::SecretKey::from_bytes(&wsk) {
+            Ok(sk) => {
+                let sig = pqcrypto_mldsa::mldsa65::detached_sign(canonical_msg.as_bytes(), &sk);
+                tx.dilithium_signature = Some(sig.as_bytes().to_vec());
+                tx.dilithium_public_key = Some(wpk);
+            }
+            Err(e) => {
+                eprintln!("[WARN][REG] wallet_key_sign_failed err={:?}", e);
+                return Err(QNetError::NetworkError("wallet_key_sign_failed".to_string()));
+            }
+        }
+        // The client-form marker: verifiers rebuild the wallet-signed message above.
+        tx.data = Some(qnet_state::Transaction::client_registration_data(node_id, wallet, reg_proof));
+        tx.hash = tx.calculate_hash();
+        Ok(())
+    }
+
     /// One registration-convergence attempt (SOLE arm writer of PENDING_NODE_REGISTRATION):
     /// build + burn-attest + sign + submit + broadcast the on-chain NodeRegistration, then re-run
     /// the activation half (device registry + reward register) whose early-boot run drops its
@@ -515,11 +566,16 @@ impl BlockchainNode {
         storage: Arc<Storage>,
         mempool: Arc<qnet_mempool::SimpleMempool>,
         unified_p2p: Option<Arc<crate::unified_p2p::SimplifiedP2P>>,
-    ) -> Result<(), QNetError> {
+    ) -> Result<ConvergenceArm, QNetError> {
         let qnet_node_type = match node_type {
             NodeType::Super => qnet_state::NodeType::Super,
             NodeType::Light => qnet_state::NodeType::Light,
         };
+
+        // One wallet, one node: a wallet with another node on chain gets no registration, now or on any retry.
+        if let Some((other, other_type)) = Self::wallet_other_node_at_tip(&storage, &wallet_address, &node_id) {
+            return Ok(ConvergenceArm::WalletHasNode { node_id: other, node_type: other_type });
+        }
 
         let mut registration_tx = Self::create_node_registration_tx_with_endpoint(
             &node_id,
@@ -602,7 +658,7 @@ impl BlockchainNode {
                     };
                     let (attestors, agreed_cost, agreed_amount, agreed_epoch) = Self::collect_burn_attestations(
                         &b_tx, &solana_wallet, &wallet_address, b_amt, qnet_node_type, cost_hint,
-                        &owner_proof, &storage).await;
+                        &owner_proof, &storage, None).await;
                     // Arm gate = quorum of the committee OF agreed_epoch — the SAME committee the
                     // attestors signed for and the on-chain verifier re-resolves (M-5). Genesis era ⇒
                     // the genesis set; post-genesis None ⇒ this node can't read that epoch's N-2
@@ -644,34 +700,8 @@ impl BlockchainNode {
         // controls. The node's consensus key rides the hashed vrf_pk body field instead — the two are
         // deliberately different keys and only the wallet one proves ownership.
         {
-            let canonical_msg = Self::chain_bind(&match &registration_tx.tx_type {
-                qnet_state::TransactionType::NodeRegistration { node_type, vrf_pk, api_endpoint, .. } =>
-                    Self::client_node_reg_message(&node_id, &wallet_address, &registration_proof,
-                                                  registration_tx.timestamp, node_type, vrf_pk, api_endpoint),
-                _ => String::new(),
-            });
-            {
-                // FIX-5 wire: RAW detached sig (3309 B) + RAW pk (1952 B) — the exact form the client-reg
-                // verifier (verify_node_lifecycle_dilithium) requires.
-                use pqcrypto_traits::sign::{DetachedSignature as _, SecretKey as _};
-                let mnemonic = load_wallet_seed("QNET_WALLET_SEED").unwrap_or_default();
-                let (wpk, wsk) = crate::crypto::genesis_key::derive_wallet_mldsa65_from_mnemonic(&mnemonic);
-                match pqcrypto_mldsa::mldsa65::SecretKey::from_bytes(&wsk) {
-                    Ok(sk) => {
-                        let sig = pqcrypto_mldsa::mldsa65::detached_sign(canonical_msg.as_bytes(), &sk);
-                        registration_tx.dilithium_signature = Some(sig.as_bytes().to_vec());
-                        registration_tx.dilithium_public_key = Some(wpk);
-                    }
-                    Err(e) => {
-                        eprintln!("[WARN][REG] wallet_key_sign_failed err={:?}", e);
-                        return Err(QNetError::NetworkError("wallet_key_sign_failed".to_string()));
-                    }
-                }
-            }
-            // Mark as client-signed → other nodes MUST verify both signatures
-            registration_tx.data = Some(format!("client_node_reg:{}:{}:{}:",
-                node_id, wallet_address, registration_proof));
-            registration_tx.hash = registration_tx.calculate_hash();
+            let mnemonic = load_wallet_seed("QNET_WALLET_SEED").unwrap_or_default();
+            Self::sign_client_registration(&mut registration_tx, &node_id, &wallet_address, &registration_proof, &mnemonic)?;
             println!("[INFO][REG] signed dilithium3={} node={}",
                 registration_tx.dilithium_signature.is_some(), node_id);
         }
@@ -679,8 +709,14 @@ impl BlockchainNode {
         // A registration the state already holds is done; nothing to arm.
         if let Some(st) = crate::node::try_get_state() {
             if crate::node::refuse_held_commitment(st, &registration_tx).await.is_err() {
-                return Ok(());
+                return Ok(ConvergenceArm::Armed);
             }
+        }
+        // The judge every peer and the producer run, at the height the next block is judged: bytes they would
+        // drop are not armed; the driver collects again next cooldown.
+        if let Err(e) = Self::verify_burn_attestation_quorum(&registration_tx, Self::admission_height(), &storage).await {
+            eprintln!("[WARN][REG] registration_judge_refused node={} reason={} — retrying next cooldown", node_id, e);
+            return Err(QNetError::NetworkError(format!("registration_judge_refused: {}", e)));
         }
         // Submit + arm + deliver.
         let tx_bytes = bincode::serialize(&registration_tx).unwrap_or_default();
@@ -750,7 +786,18 @@ impl BlockchainNode {
             }
         }
 
-        Ok(())
+        Ok(ConvergenceArm::Armed)
+    }
+
+    /// The one-node rule as a super server reads it before it registers: from the wallet_one_node gate at this
+    /// node's next height, the wallet's other chain-confirmed node while this server's own id is not on chain
+    /// (its own id on chain is a restart of the same node, never refused).
+    pub(super) fn wallet_other_node_at_tip(storage: &Storage, wallet: &str, own_node_id: &str) -> Option<(String, String)> {
+        if storage.is_node_registration_onchain(own_node_id) {
+            return None;
+        }
+        let next = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed).saturating_add(1);
+        Self::wallet_one_node_other(storage, wallet, own_node_id, next)
     }
 
     /// Spawn the single-owner registration-convergence driver (once per process). Owns every
@@ -816,7 +863,13 @@ impl BlockchainNode {
                     api_endpoint.clone(), code.clone(), device_sig.clone(), qnet_rpc.clone(),
                     storage.clone(), mempool.clone(), unified_p2p.clone(),
                 ).await {
-                    Ok(()) => { if is_info() { println!("[INFO][REG] convergence_armed id={}", node_id); } }
+                    Ok(ConvergenceArm::Armed) => { if is_info() { println!("[INFO][REG] convergence_armed id={}", node_id); } }
+                    Ok(ConvergenceArm::WalletHasNode { node_id: other, node_type: other_type }) => {
+                        // Final: the network refuses a second node of this wallet, so no retry can land.
+                        println!("[ERR][REG] wallet_has_node node={} type={}: one wallet, one node; this server's super registration stops",
+                                 other, other_type);
+                        return;
+                    }
                     Err(e) => println!("[WARN][REG] convergence_attempt_failed err={} — retry", e),
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(REG_DRIVER_COOLDOWN_SECS)).await;

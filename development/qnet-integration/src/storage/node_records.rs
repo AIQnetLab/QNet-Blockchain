@@ -2,6 +2,51 @@
 
 use super::*;
 
+/// Outcome of a ping-key copy (`save_light_ping_keys_identity`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PingKeyWrite {
+    Applied,
+    /// The stored binding already: nothing written.
+    Unchanged,
+    /// Older than, or legacy after, the stored binding: nothing written.
+    Refused(crate::light_binding::Admit),
+}
+
+impl PingKeyWrite {
+    /// The copied binding is the stored one now.
+    pub fn holds(&self) -> bool {
+        matches!(self, PingKeyWrite::Applied | PingKeyWrite::Unchanged)
+    }
+}
+
+/// A light node's push record in `fcm_tokens`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FcmEntry {
+    pub token: String,
+    pub push_type: String,
+    pub endpoint: Option<String>,
+    pub updated_at: u64,
+    /// The binding sequence the record belongs to; 0 for a legacy record.
+    pub seq: u64,
+    /// For a legacy record, the wallet key it was accepted under (`light_binding::record_writer`); empty
+    /// for a v2 record (its own signatures tie it to the binding) and for one written before it was kept.
+    pub writer: String,
+    /// The bound device's platform as its bind named it (`light_binding::platform_hint`: "android", "ios"),
+    /// empty when not known. Unsigned, a display hint for the public status only.
+    pub platform: String,
+    /// The bound device's model as its bind named it (`light_binding::model_hint`), empty when not known. Unsigned,
+    /// a display hint for the public status only, kept and dropped exactly as `platform`.
+    pub model: String,
+}
+
+/// One lock stripe per node for the read-decide-write of its binding row and push record.
+fn light_binding_lock(node_id: &str) -> parking_lot::MutexGuard<'static, ()> {
+    static LOCKS: std::sync::OnceLock<Vec<parking_lot::Mutex<()>>> = std::sync::OnceLock::new();
+    let locks = LOCKS.get_or_init(|| (0..64).map(|_| parking_lot::Mutex::new(())).collect());
+    let h = node_id.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x0100_0000_01b3));
+    locks[(h % locks.len() as u64) as usize].lock()
+}
+
 impl Storage {
     /// True iff this node's NodeRegistration is chain-confirmed (reg_height stamped at
     /// block-apply / genesis boot) in the local node_registry. The on-chain binding is the
@@ -21,17 +66,11 @@ impl Storage {
         }
     }
 
-    /// O(1) lookup: get node by wallet — derives the canonical id + point-reads node_<id> (no reverse index).
+    /// The wallet's chain-confirmed node for verify-activation: the first of its genesis, super and light ids
+    /// whose `node_<id>` row carries a reg_height (`wallet_node_records` order). An RPC or discovery cache row
+    /// is not a registration and never answers verified.
     pub fn get_node_by_wallet(&self, wallet_address: &str) -> IntegrationResult<Option<(String, String)>> {
-        let registry_cf = self.persistent.db.cf_handle("node_registry")
-            .ok_or_else(|| IntegrationError::StorageError("node_registry column family not found".to_string()))?;
-        let id = match self.resolve_node_id(wallet_address) { Some(i) => i, None => return Ok(None) };
-        let node_type = match self.persistent.db.get_cf(&registry_cf, format!("node_{}", id).as_bytes())? {
-            Some(v) => serde_json::from_slice::<serde_json::Value>(&v).ok()
-                .and_then(|j| j["node_type"].as_str().map(|s| s.to_string())).unwrap_or_default(),
-            None => return Ok(None),
-        };
-        Ok(Some((id, node_type)))
+        Ok(self.wallet_node_records(wallet_address)?.into_iter().next().map(|(id, node_type, _, _)| (id, node_type)))
     }
     
     /// v4.9: Save device signature for node (used for migration detection)
@@ -286,6 +325,30 @@ impl Storage {
         }
     }
 
+    /// A light registration's key commitment as the push-record rule reads it, in one point read: None
+    /// when the node is not on chain here, Some(None) when its registration committed no key (applied
+    /// before key commitments), else the commitment.
+    pub fn light_registration_commitment(&self, node_id: &str) -> Option<Option<String>> {
+        let cf = self.persistent.db.cf_handle("node_registry")?;
+        let v = self.persistent.db.get_cf(&cf, format!("node_{}", node_id).as_bytes()).ok().flatten()?;
+        let p = serde_json::from_slice::<serde_json::Value>(&v).ok()?;
+        p["reg_height"].as_u64()?;
+        Some(p["vrf_pk_sha3"].as_str().filter(|c| !c.is_empty()).map(|c| c.to_string()))
+    }
+
+    /// A node's chain-confirmed registration as the status reads it, in one point read: the height it
+    /// applied at (None = not on chain) and the burn behind it.
+    pub fn node_registration_record(&self, node_id: &str) -> (Option<u64>, Option<String>) {
+        let Some(cf) = self.persistent.db.cf_handle("node_registry") else { return (None, None); };
+        let Some(v) = self.persistent.db.get_cf(&cf, format!("node_{}", node_id).as_bytes()).ok().flatten() else {
+            return (None, None);
+        };
+        let Ok(p) = serde_json::from_slice::<serde_json::Value>(&v) else { return (None, None); };
+        let reg_height = p["reg_height"].as_u64();
+        let burn = p["burn"].as_str().filter(|b| !b.is_empty()).map(|b| b.to_string());
+        (reg_height, burn)
+    }
+
     pub fn node_reg_height(&self, node_id: &str) -> IntegrationResult<Option<u64>> {
         let registry_cf = self.persistent.db.cf_handle("node_registry")
             .ok_or_else(|| IntegrationError::StorageError("node_registry column family not found".to_string()))?;
@@ -303,8 +366,10 @@ impl Storage {
     /// Get the node registered to a wallet (mobile app reads it even when the node is offline — data comes
     /// from chain storage, not node memory). Deterministic wallet→node resolution: derive the wallet's
     /// canonical id (pure fn of the wallet) and point-read node_<id>. No stored reverse index ⇒ every
-    /// honest node returns the identical answer, no per-node flip. O(1) (≤3 point-reads). One wallet backs
-    /// at most one node (each id costs a burn). Vec-typed for the existing callers; ≤1 element.
+    /// honest node returns the identical answer, no per-node flip. O(1) (≤3 point-reads). Vec-typed for the
+    /// existing callers, with at most one element: the first id whose row exists, a cache row included. A
+    /// wallet registered with both types before the `wallet_one_node` gate holds two nodes, and this names
+    /// only the first; `wallet_node_records` lists every chain-confirmed one.
     pub fn get_nodes_by_wallet(&self, wallet_address: &str) -> IntegrationResult<Vec<(String, String, f64)>> {
         let registry_cf = self.persistent.db.cf_handle("node_registry")
             .ok_or_else(|| IntegrationError::StorageError("node_registry column family not found".to_string()))?;
@@ -322,20 +387,15 @@ impl Storage {
 
     /// Every node identity this wallet owns, with the permanent registry facts a client needs to render
     /// its own node lifecycle: (node_id, node_type, reg_height, burn_tx). Unlike `resolve_node_id` this
-    /// returns ALL matches — one wallet can hold a Super and a Light identity at once — and it reads only
-    /// the `node_<id>` row, which is retained for the life of the chain, so the answer survives the
-    /// tx-index retention that removes the registration TX itself.
+    /// returns ALL matches — a wallet registered with both types before the `wallet_one_node` gate holds a
+    /// Super and a Light identity at once — and it reads only the `node_<id>` row, which is retained for the
+    /// life of the chain, so the answer survives the tx-index retention that removes the registration TX
+    /// itself.
     pub fn wallet_node_records(&self, wallet: &str) -> IntegrationResult<Vec<(String, String, u64, String)>> {
         let cf = self.persistent.db.cf_handle("node_registry")
             .ok_or_else(|| IntegrationError::StorageError("node_registry column family not found".to_string()))?;
-        let mut cands: Vec<String> = Vec::with_capacity(3);
-        for (id, w) in crate::genesis_constants::GENESIS_WALLETS {
-            if *w == wallet { cands.push(format!("genesis_node_{}", id)); break; }
-        }
-        cands.push(crate::rpc::generate_super_node_pseudonym(wallet));
-        cands.push(crate::rpc::generate_light_node_pseudonym(wallet));
         let mut out = Vec::new();
-        for id in cands {
+        for id in Self::wallet_node_candidates(wallet) {
             let raw = match self.persistent.db.get_cf(&cf, format!("node_{}", id).as_bytes()) {
                 Ok(Some(v)) => v,
                 _ => continue,
@@ -347,10 +407,40 @@ impl Storage {
                 id,
                 p["node_type"].as_str().unwrap_or("").to_string(),
                 h,
-                p["burn_tx"].as_str().unwrap_or("").to_string(),
+                // The row keeps the backing burn under "burn" (save_node_registration_inner).
+                p["burn"].as_str().unwrap_or("").to_string(),
             ));
         }
         Ok(out)
+    }
+
+    /// The one-node rule's read (`wallet_one_node` gate): the wallet's chain-confirmed node other than
+    /// `own_node_id` registered strictly below `below_height`, as (node_id, node_type), the first in the order
+    /// of `wallet_node_records` (genesis, super, light). A cache row (no reg_height) is not a registration and a
+    /// row at or above the height judged is not yet part of the chain below it, so neither counts. A pure
+    /// function of committed rows: every node that applied the chain below `below_height` gives the same answer.
+    pub fn wallet_other_node(&self, wallet: &str, own_node_id: &str, below_height: u64) -> Option<(String, String)> {
+        let cf = self.persistent.db.cf_handle("node_registry")?;
+        Self::wallet_node_candidates(wallet).into_iter()
+            .filter(|id| id != own_node_id)
+            .find_map(|id| {
+                let raw = self.persistent.db.get_cf(&cf, format!("node_{}", id).as_bytes()).ok().flatten()?;
+                let p: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+                let h = p["reg_height"].as_u64()?;
+                (h < below_height).then(|| (id, p["node_type"].as_str().unwrap_or("").to_string()))
+            })
+    }
+
+    /// The wallet's candidate node ids, pure functions of the wallet: its genesis id when it is a genesis
+    /// wallet, then super_node_<h> and light_mobile_<h>.
+    fn wallet_node_candidates(wallet: &str) -> Vec<String> {
+        let mut cands: Vec<String> = Vec::with_capacity(3);
+        for (id, w) in crate::genesis_constants::GENESIS_WALLETS {
+            if *w == wallet { cands.push(format!("genesis_node_{}", id)); break; }
+        }
+        cands.push(crate::rpc::generate_super_node_pseudonym(wallet));
+        cands.push(crate::rpc::generate_light_node_pseudonym(wallet));
+        cands
     }
 
     /// Derive the wallet's candidate node ids (pure functions of the wallet: genesis constant map, else
@@ -358,13 +448,7 @@ impl Storage {
     /// identically on every node — resolution never reads a mutable, race-able reverse slot.
     pub(super) fn resolve_node_id(&self, wallet: &str) -> Option<String> {
         let cf = self.persistent.db.cf_handle("node_registry")?;
-        let mut cands: Vec<String> = Vec::with_capacity(3);
-        for (id, w) in crate::genesis_constants::GENESIS_WALLETS {
-            if *w == wallet { cands.push(format!("genesis_node_{}", id)); break; }
-        }
-        cands.push(crate::rpc::generate_super_node_pseudonym(wallet));
-        cands.push(crate::rpc::generate_light_node_pseudonym(wallet));
-        cands.into_iter().find(|id|
+        Self::wallet_node_candidates(wallet).into_iter().find(|id|
             matches!(self.persistent.db.get_cf(&cf, format!("node_{}", id).as_bytes()), Ok(Some(_))))
     }
     
@@ -613,6 +697,7 @@ impl Storage {
     /// genesis node that received the registration, never gossiped).
     /// `ts` is the record's authoritative event time (stamped by the genesis that served the
     /// original refresh) — carried through peer sync verbatim so every copy converges LWW.
+    /// A legacy write: sequence 0, so it never replaces the channel of a v2 binding. No writer recorded.
     pub fn save_fcm_token(
         &self,
         node_id: &str,
@@ -620,19 +705,183 @@ impl Storage {
         push_type: &str,
         endpoint: Option<&str>,
         ts: u64,
-    ) -> IntegrationResult<()> {
+    ) -> IntegrationResult<bool> {
+        self.write_fcm_record(node_id, token, push_type, endpoint, ts, 0, "")
+    }
+
+    /// A legacy write that keeps the wallet key it was accepted under (`light_binding::record_writer`).
+    /// Where the node's channel can only be a record under one key (`legacy_writer_required`), only a
+    /// record under that key is written, and it replaces a record written under another key whatever
+    /// their times: a record someone else planted never takes the channel from the owner's, and never
+    /// keeps it once the owner's arrives. Elsewhere records merge last-writer-wins, as before.
+    pub fn save_fcm_token_by(
+        &self,
+        node_id: &str,
+        token: &str,
+        push_type: &str,
+        endpoint: Option<&str>,
+        ts: u64,
+        writer: &str,
+    ) -> IntegrationResult<bool> {
+        self.write_fcm_record(node_id, token, push_type, endpoint, ts, 0, writer)
+    }
+
+    /// Write a push channel ordered by `(seq, ts)`: a record never replaces one with a higher binding
+    /// sequence, and within one binding never a later one. Ok(false) = older than the stored record,
+    /// nothing written. An empty token is a binding with no push channel (the old device's is gone).
+    pub fn save_fcm_token_seq(
+        &self,
+        node_id: &str,
+        token: &str,
+        push_type: &str,
+        endpoint: Option<&str>,
+        ts: u64,
+        seq: u64,
+    ) -> IntegrationResult<bool> {
+        self.write_fcm_record_full(node_id, token, push_type, endpoint, ts, seq, "", "", "")
+    }
+
+    /// `save_fcm_token_seq` with the device's platform and model hints (`light_binding::platform_hint`,
+    /// `model_hint`). An empty hint keeps the one a record of the same binding holds: a token refresh names neither.
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_fcm_token_seq_platform(
+        &self,
+        node_id: &str,
+        token: &str,
+        push_type: &str,
+        endpoint: Option<&str>,
+        ts: u64,
+        seq: u64,
+        platform: &str,
+        model: &str,
+    ) -> IntegrationResult<bool> {
+        self.write_fcm_record_full(node_id, token, push_type, endpoint, ts, seq, "", platform, model)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_fcm_record(
+        &self,
+        node_id: &str,
+        token: &str,
+        push_type: &str,
+        endpoint: Option<&str>,
+        ts: u64,
+        seq: u64,
+        writer: &str,
+    ) -> IntegrationResult<bool> {
+        self.write_fcm_record_full(node_id, token, push_type, endpoint, ts, seq, writer, "", "")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_fcm_record_full(
+        &self,
+        node_id: &str,
+        token: &str,
+        push_type: &str,
+        endpoint: Option<&str>,
+        ts: u64,
+        seq: u64,
+        writer: &str,
+        platform: &str,
+        model: &str,
+    ) -> IntegrationResult<bool> {
         let fcm_cf = self.persistent.db.cf_handle("fcm_tokens")
             .ok_or_else(|| IntegrationError::StorageError("fcm_tokens column family not found".to_string()))?;
-
-        let data = serde_json::json!({
+        let _g = light_binding_lock(node_id);
+        let row = self.get_light_binding(node_id);
+        // Judged only for a legacy write that names its writer.
+        let required = if seq == 0 && !writer.is_empty() { self.legacy_writer_required(node_id, row.as_ref()) } else { None };
+        let own = required.as_deref().map_or(false, |w| w.eq_ignore_ascii_case(writer));
+        if required.is_some() && !own { return Ok(false); }
+        let stored = self.get_fcm_entry(node_id);
+        if let Some(stored) = &stored {
+            let displaces = own && stored.seq == 0 && !stored.writer.is_empty() && !stored.writer.eq_ignore_ascii_case(writer);
+            if !displaces && (seq, ts) < (stored.seq, stored.updated_at) { return Ok(false); }
+        }
+        // A channel of a withdrawn binding (a refresh that raced its unbind) is not written back.
+        if seq > 0 && row.map_or(false, |b| seq <= b.floor) {
+            return Ok(false);
+        }
+        let mut data = serde_json::json!({
             "token": token,
             "push_type": push_type,
             "endpoint": endpoint.unwrap_or(""),
             "updated_at": ts,
+            "seq": seq,
         });
-
+        if seq == 0 && !writer.is_empty() { data["writer"] = serde_json::json!(writer); }
+        // The platform and the model belong to the binding: a write that names none of either keeps the one its
+        // binding's record holds; a record of another binding (an older device's) gives neither.
+        let held = stored.filter(|e| e.seq == seq && seq > 0);
+        let keep = |named: &str, held: Option<String>| {
+            if !named.is_empty() || seq == 0 { named.to_string() } else { held.unwrap_or_default() }
+        };
+        let platform = keep(platform, held.as_ref().map(|e| e.platform.clone()));
+        let model = keep(model, held.map(|e| e.model));
+        if seq > 0 && !platform.is_empty() { data["platform"] = serde_json::json!(platform); }
+        if seq > 0 && !model.is_empty() { data["model"] = serde_json::json!(model); }
         self.persistent.db.put_cf(&fcm_cf, node_id.as_bytes(), data.to_string().as_bytes())?;
-        Ok(())
+        Ok(true)
+    }
+
+    /// The one key a legacy push record must be written under to be the node's channel here, exactly as
+    /// `rpc::device_reach` reads records: a bound legacy row the chain vouches for takes its own key; with
+    /// no such row, an on-chain registration takes its commitment. None = any writer: a v2 or withdrawn
+    /// row (a legacy record is never its channel), a row an older binary wrote with no key, a
+    /// registration that committed no key, and a node not on chain here (records merge until it is).
+    fn legacy_writer_required(&self, node_id: &str, row: Option<&crate::light_binding::BindingRow>) -> Option<String> {
+        if let Some(b) = row {
+            if !b.never_v2() { return None; }
+            if b.device_bound() && self.light_binding_vouched(node_id, b) { return b.legacy_writer(); }
+        }
+        self.light_registration_commitment(node_id).flatten()
+    }
+
+    /// A binding row's key, judged under the chain's commitment: a v2 row was proven under it when it was
+    /// taken; a legacy row the legacy register took before the registration applied may carry another
+    /// wallet's key, so it counts only while its key resolves under the commitment. A row an older binary
+    /// wrote with no key counts as before.
+    pub fn light_binding_vouched(&self, node_id: &str, row: &crate::light_binding::BindingRow) -> bool {
+        self.binding_key_vouched(node_id, row.v2, &row.identity_pubkey)
+    }
+
+    /// `light_binding_vouched` of a row read slim (`light_binding_reach`).
+    pub fn light_binding_reach_vouched(&self, node_id: &str, row: &crate::light_binding::BindingReach) -> bool {
+        self.binding_key_vouched(node_id, row.v2, &row.identity_pubkey)
+    }
+
+    fn binding_key_vouched(&self, node_id: &str, v2: bool, identity_pubkey: &str) -> bool {
+        v2 || identity_pubkey.is_empty() || self.resolve_light_identity_pk(node_id, Some(identity_pubkey))
+            .map_or(false, |k| k.eq_ignore_ascii_case(identity_pubkey))
+    }
+
+    /// With no binding row the chain vouches for here, whether a legacy record written under `writer` is
+    /// the node's: one written before writers were kept, one under the registration's commitment, and any
+    /// for a registration that committed no key - every write path after such a registration applied
+    /// checks the wallet-derived key (`resolve_light_identity_pk`), so nobody else's record reaches it.
+    pub fn unbound_record_writer_ok(&self, node_id: &str, writer: &str) -> bool {
+        writer.is_empty() || match self.light_registration_commitment(node_id) {
+            Some(Some(c)) => c.eq_ignore_ascii_case(writer),
+            Some(None) => true,
+            None => false,
+        }
+    }
+
+    /// The stored push record as written, an empty token included.
+    pub fn get_fcm_entry(&self, node_id: &str) -> Option<FcmEntry> {
+        let fcm_cf = self.persistent.db.cf_handle("fcm_tokens")?;
+        let raw = self.persistent.db.get_cf(&fcm_cf, node_id.as_bytes()).ok()??;
+        let json: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+        Some(FcmEntry {
+            token: json["token"].as_str().unwrap_or("").to_string(),
+            push_type: json["push_type"].as_str().unwrap_or("polling").to_string(),
+            endpoint: json["endpoint"].as_str().filter(|s| !s.is_empty()).map(|s| s.to_string()),
+            updated_at: json["updated_at"].as_u64().unwrap_or(0),
+            seq: json["seq"].as_u64().unwrap_or(0),
+            writer: json["writer"].as_str().unwrap_or("").to_string(),
+            platform: crate::light_binding::platform_hint(json["platform"].as_str()).to_string(),
+            model: crate::light_binding::model_hint(json["model"].as_str()).to_string(),
+        })
     }
 
     /// Full FCM record incl. its LWW timestamp: (token, push_type, endpoint, updated_at).
@@ -661,9 +910,53 @@ impl Storage {
         if token.is_empty() { None } else { Some((token, push_type, endpoint)) }
     }
 
+    /// A light node's push row (`rpc::LightPushRow`): its last miss and last answer at this genesis, one row per
+    /// node overwritten by the next. Kept beside the push records under `lpush:{node}`, a key no node id takes;
+    /// node-local like them, never gossiped, and no block rule reads it.
+    pub fn light_push_row(&self, node_id: &str) -> Option<Vec<u8>> {
+        let cf = self.persistent.db.cf_handle("fcm_tokens")?;
+        self.persistent.db.get_cf(&cf, Self::light_push_row_key(node_id)).ok().flatten()
+    }
+
+    pub fn put_light_push_row(&self, node_id: &str, row: &[u8]) -> IntegrationResult<()> {
+        let cf = self.persistent.db.cf_handle("fcm_tokens")
+            .ok_or_else(|| IntegrationError::StorageError("fcm_tokens column family not found".to_string()))?;
+        self.persistent.db.put_cf(&cf, Self::light_push_row_key(node_id), row)?;
+        Ok(())
+    }
+
+    fn light_push_row_key(node_id: &str) -> Vec<u8> {
+        format!("lpush:{}", node_id).into_bytes()
+    }
+
+    /// A reach record (`rpc::light_owners`): the nodes of `shard` that genesis `signer` reached in `epoch` and that
+    /// gave it no answer, a compressed bitmap over their roster index. Kept beside the push rows under
+    /// `lreach:{epoch}:{shard}:{signer}`, node-local, for the last few epochs; no block rule reads it.
+    pub fn light_reach(&self, epoch: u64, shard: usize, signer: usize) -> Option<Vec<u8>> {
+        let cf = self.persistent.db.cf_handle("fcm_tokens")?;
+        self.persistent.db.get_cf(&cf, Self::light_reach_key(epoch, shard, signer)).ok().flatten()
+    }
+
+    /// Store a reach record, and drop every record older than three epochs before it.
+    pub fn put_light_reach(&self, epoch: u64, shard: usize, signer: usize, record: &[u8]) -> IntegrationResult<()> {
+        let cf = self.persistent.db.cf_handle("fcm_tokens")
+            .ok_or_else(|| IntegrationError::StorageError("fcm_tokens column family not found".to_string()))?;
+        let mut batch = WriteBatch::default();
+        batch.put_cf(&cf, Self::light_reach_key(epoch, shard, signer), record);
+        if let Some(old) = epoch.checked_sub(3) {
+            batch.delete_range_cf(&cf, b"lreach:0000000000:".as_ref(), format!("lreach:{:010}:", old).as_bytes());
+        }
+        self.persistent.db.write(batch)?;
+        Ok(())
+    }
+
+    fn light_reach_key(epoch: u64, shard: usize, signer: usize) -> Vec<u8> {
+        format!("lreach:{:010}:{}:{}", epoch, shard, signer).into_bytes()
+    }
+
     /// C: light ping delegation keys — operational CF read per-ping so the crypto stays off the RAM
     /// registry. Written at register / gossip-receive AFTER the identity guard passes; No-op on empty.
-    pub fn save_light_ping_keys(&self, node_id: &str, ping_pubkey: &str, ping_delegation_cert: &str) -> IntegrationResult<()> {
+    pub fn save_light_ping_keys(&self, node_id: &str, ping_pubkey: &str, ping_delegation_cert: &str) -> IntegrationResult<PingKeyWrite> {
         self.save_light_ping_keys_identity(node_id, ping_pubkey, ping_delegation_cert, "")
     }
 
@@ -672,18 +965,236 @@ impl Storage {
     /// (ten million raw keys would be tens of gigabytes), so the device carries the key and the node
     /// keeps it here once, after checking it against the commitment. With the identity recorded, the
     /// per-attestation work is one signature under the ping key - the delegation is already proven.
-    pub fn save_light_ping_keys_identity(&self, node_id: &str, ping_pubkey: &str, ping_delegation_cert: &str, identity_pubkey: &str) -> IntegrationResult<()> {
-        if ping_pubkey.is_empty() { return Ok(()); }
+    ///
+    /// Every copy path (self-attest heal, identity pull, gossip, token sync) writes here, so the binding
+    /// order holds on all of them: nothing older than the stored binding, nothing legacy once a v2
+    /// binding exists, and the sequence and floor are never lowered (`light_binding::admit_copy`).
+    /// The caller has verified the delegation.
+    pub fn save_light_ping_keys_identity(&self, node_id: &str, ping_pubkey: &str, ping_delegation_cert: &str, identity_pubkey: &str) -> IntegrationResult<PingKeyWrite> {
+        use crate::light_binding::{admit_copy, parse_cert, Admit, BindingRow};
+        if ping_pubkey.is_empty() { return Ok(PingKeyWrite::Refused(Admit::Malformed)); }
         let cf = self.persistent.db.cf_handle("light_ping_keys")
             .ok_or_else(|| IntegrationError::StorageError("light_ping_keys column family not found".to_string()))?;
+        let _g = light_binding_lock(node_id);
+        let stored = self.get_light_binding(node_id);
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        match admit_copy(stored.as_ref(), ping_pubkey, ping_delegation_cert, now) {
+            Admit::Apply => {}
+            Admit::Same => return Ok(PingKeyWrite::Unchanged),
+            refused => return Ok(PingKeyWrite::Refused(refused)),
+        }
+        let prev = stored.unwrap_or_default();
         // A proven identity is never replaced by a write that carries none: gossip must not undo what
         // the device itself proved.
-        let identity = if identity_pubkey.is_empty() {
-            self.light_ping_identity(node_id).unwrap_or_default()
-        } else { identity_pubkey.to_string() };
-        let v = json!({ "ping_pubkey": ping_pubkey, "ping_delegation_cert": ping_delegation_cert, "identity_pubkey": identity });
-        self.persistent.db.put_cf(&cf, node_id.as_bytes(), v.to_string().as_bytes())?;
+        let identity = if identity_pubkey.is_empty() { prev.identity_pubkey.clone() } else { identity_pubkey.to_string() };
+        let row = match parse_cert(ping_delegation_cert).and_then(|f| f.seq()) {
+            Some(seq) => BindingRow {
+                ping_pubkey: ping_pubkey.to_string(),
+                cert: ping_delegation_cert.to_string(),
+                identity_pubkey: identity,
+                seq,
+                floor: prev.floor,
+                bound_at: now,
+                v2: true,
+                device_fp: crate::light_binding::device_fp(ping_pubkey).unwrap_or_default(),
+                unbind: None,
+                retired_fps: Vec::new(),
+            },
+            // A legacy key that replaces another keeps the one it replaced among the retired ones (M-8).
+            None => BindingRow {
+                ping_pubkey: ping_pubkey.to_string(),
+                cert: ping_delegation_cert.to_string(),
+                identity_pubkey: identity,
+                device_fp: crate::light_binding::device_fp(ping_pubkey).unwrap_or_default(),
+                unbind: None,
+                retired_fps: prev.retired_with(ping_pubkey),
+                ..prev
+            },
+        };
+        self.persistent.db.put_cf(&cf, node_id.as_bytes(), row.to_json().to_string().as_bytes())?;
+        Ok(PingKeyWrite::Applied)
+    }
+
+    /// Record a fresh v2 binding (the bind route and a promoted pending binding). The caller verified
+    /// the delegation and the attach; the sequence rule is checked again here, under the node's lock,
+    /// so two binds racing for one node cannot leave the older one stored. Ok(Err) = refused.
+    pub fn bind_light_v2(
+        &self, node_id: &str, ping_pubkey: &str, cert_sig_hex: &str, identity_pubkey: &str, seq: u64, now: u64,
+    ) -> IntegrationResult<Result<crate::light_binding::BindingRow, crate::light_binding::Refusal>> {
+        use crate::light_binding::{admit_fresh, format_v2_cert, BindingRow};
+        let cf = self.persistent.db.cf_handle("light_ping_keys")
+            .ok_or_else(|| IntegrationError::StorageError("light_ping_keys column family not found".to_string()))?;
+        let _g = light_binding_lock(node_id);
+        let stored = self.get_light_binding(node_id);
+        match admit_fresh(stored.as_ref(), ping_pubkey, seq, now) {
+            Err(r) => return Ok(Err(r)),
+            Ok(true) => return Ok(Ok(stored.unwrap_or_default())),
+            Ok(false) => {}
+        }
+        let row = BindingRow {
+            ping_pubkey: ping_pubkey.to_string(),
+            cert: format_v2_cert(seq, cert_sig_hex),
+            identity_pubkey: identity_pubkey.to_string(),
+            seq,
+            floor: stored.as_ref().map_or(0, |s| s.floor),
+            bound_at: now,
+            v2: true,
+            device_fp: crate::light_binding::device_fp(ping_pubkey).unwrap_or_default(),
+            unbind: None,
+            retired_fps: Vec::new(),
+        };
+        self.persistent.db.put_cf(&cf, node_id.as_bytes(), row.to_json().to_string().as_bytes())?;
+        Ok(Ok(row))
+    }
+
+    /// Withdraw a light node's binding (an unbind at `seq`): the row keeps only the floor, the proven
+    /// wallet key and the unbind's own proof, and the push record is deleted, both under the node's lock
+    /// after `rule` passes on the stored row (Ok(false) = nothing left to withdraw, nothing written).
+    /// Ok(Ok(row)) = the row now.
+    pub fn withdraw_light_binding(
+        &self, node_id: &str, seq: u64, identity_pubkey: &str, proof: Option<crate::light_binding::UnbindRecord>,
+        rule: impl FnOnce(Option<&crate::light_binding::BindingRow>) -> Result<bool, crate::light_binding::Refusal>,
+    ) -> IntegrationResult<Result<crate::light_binding::BindingRow, crate::light_binding::Refusal>> {
+        use crate::light_binding::BindingRow;
+        let cf = self.persistent.db.cf_handle("light_ping_keys")
+            .ok_or_else(|| IntegrationError::StorageError("light_ping_keys column family not found".to_string()))?;
+        let fcm_cf = self.persistent.db.cf_handle("fcm_tokens")
+            .ok_or_else(|| IntegrationError::StorageError("fcm_tokens column family not found".to_string()))?;
+        let _g = light_binding_lock(node_id);
+        let stored = self.get_light_binding(node_id);
+        match rule(stored.as_ref()) {
+            Err(r) => return Ok(Err(r)),
+            Ok(false) => return Ok(Ok(stored.unwrap_or_default())),
+            Ok(true) => {}
+        }
+        let row = BindingRow::withdrawn(stored.as_ref(), seq, identity_pubkey, proof);
+        let mut batch = WriteBatch::default();
+        batch.put_cf(&cf, node_id.as_bytes(), row.to_json().to_string().as_bytes());
+        batch.delete_cf(&fcm_cf, node_id.as_bytes());
+        self.persistent.db.write(batch)?;
+        Ok(Ok(row))
+    }
+
+    /// Drop a legacy binding row the chain does not vouch for (its key and delegation do not verify under
+    /// the registration's commitment: another wallet key wrote it before the registration applied), with
+    /// the legacy push record written under that same key. Only while the row is still exactly `seen`: a
+    /// binding that replaced it meanwhile stays. Any other record stays: a v2 one (a verified binding's),
+    /// and a legacy one written under another key or before writers were kept (the owner's may have
+    /// arrived by the legacy sync after the plant).
+    pub fn drop_unvouched_light_binding(&self, node_id: &str, seen: &crate::light_binding::BindingRow) -> IntegrationResult<bool> {
+        let cf = self.persistent.db.cf_handle("light_ping_keys")
+            .ok_or_else(|| IntegrationError::StorageError("light_ping_keys column family not found".to_string()))?;
+        let fcm_cf = self.persistent.db.cf_handle("fcm_tokens")
+            .ok_or_else(|| IntegrationError::StorageError("fcm_tokens column family not found".to_string()))?;
+        let _g = light_binding_lock(node_id);
+        if seen.v2 || self.get_light_binding(node_id).as_ref() != Some(seen) { return Ok(false); }
+        let mut batch = WriteBatch::default();
+        batch.delete_cf(&cf, node_id.as_bytes());
+        let planted = seen.legacy_writer();
+        if self.get_fcm_entry(node_id).map_or(false, |e| e.seq == 0 && planted.as_deref() == Some(e.writer.as_str())) {
+            batch.delete_cf(&fcm_cf, node_id.as_bytes());
+        }
+        self.persistent.db.write(batch)?;
+        Ok(true)
+    }
+
+    /// A light node's binding row, a withdrawn one (no ping key, a floor) included.
+    pub fn get_light_binding(&self, node_id: &str) -> Option<crate::light_binding::BindingRow> {
+        let cf = self.persistent.db.cf_handle("light_ping_keys")?;
+        let raw = self.persistent.db.get_cf(&cf, node_id.as_bytes()).ok()??;
+        let v: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+        Some(crate::light_binding::BindingRow::from_json(&v))
+    }
+
+    /// The binding row's fields that decide how its device is reached (`light_binding::BindingReach`), parsed without
+    /// copying its keys, certificates or unbind proof: the pinger reads it for every node it may push (M-11). A row
+    /// this form cannot read is read whole.
+    pub fn light_binding_reach(&self, node_id: &str) -> Option<crate::light_binding::BindingReach> {
+        #[derive(serde::Deserialize)]
+        struct Slim<'a> {
+            #[serde(default, borrow)]
+            ping_pubkey: std::borrow::Cow<'a, str>,
+            #[serde(default, borrow)]
+            identity_pubkey: std::borrow::Cow<'a, str>,
+            #[serde(default)]
+            seq: u64,
+            #[serde(default)]
+            floor: u64,
+            #[serde(default)]
+            v2: bool,
+        }
+        let cf = self.persistent.db.cf_handle("light_ping_keys")?;
+        let raw = self.persistent.db.get_cf(&cf, node_id.as_bytes()).ok()??;
+        match serde_json::from_slice::<Slim>(&raw) {
+            Ok(s) => Some(crate::light_binding::BindingReach {
+                has_key: !s.ping_pubkey.is_empty(),
+                seq: s.seq,
+                floor: s.floor,
+                v2: s.v2,
+                identity_pubkey: if s.v2 { String::new() } else { s.identity_pubkey.into_owned() },
+            }),
+            Err(_) => serde_json::from_slice::<serde_json::Value>(&raw).ok()
+                .map(|v| crate::light_binding::BindingReach::of(&crate::light_binding::BindingRow::from_json(&v))),
+        }
+    }
+
+    // Pending bindings (U4): the full entry under `e:{node}`, and a small meta row under `m:{node}` so
+    // the RAM index loads without reading the ~11 KB entries.
+
+    pub fn put_light_pending_bind(&self, p: &crate::light_binding::PendingBind) -> IntegrationResult<()> {
+        self.put_light_pending_bind_from(p, "")
+    }
+
+    /// `put_light_pending_bind`, recording in the meta row the network the binding was posted from.
+    pub fn put_light_pending_bind_from(&self, p: &crate::light_binding::PendingBind, source: &str) -> IntegrationResult<()> {
+        let cf = self.persistent.db.cf_handle("light_pending_bind")
+            .ok_or_else(|| IntegrationError::StorageError("light_pending_bind column family not found".to_string()))?;
+        let entry = bincode::serialize(p).map_err(|e| IntegrationError::StorageError(e.to_string()))?;
+        let mut meta = Vec::with_capacity(16 + source.len());
+        meta.extend_from_slice(&p.stored_at.to_be_bytes());
+        meta.extend_from_slice(&p.consent_ts.to_be_bytes());
+        meta.extend_from_slice(source.as_bytes());
+        let mut batch = WriteBatch::default();
+        batch.put_cf(&cf, format!("e:{}", p.node_id).as_bytes(), entry);
+        batch.put_cf(&cf, format!("m:{}", p.node_id).as_bytes(), meta);
+        self.persistent.db.write(batch)?;
         Ok(())
+    }
+
+    /// A pending binding, in its layout or the one before `platform` was added (bincode is positional, so an
+    /// entry an older binary stored does not decode as the new one).
+    pub fn get_light_pending_bind(&self, node_id: &str) -> Option<crate::light_binding::PendingBind> {
+        let cf = self.persistent.db.cf_handle("light_pending_bind")?;
+        let raw = self.persistent.db.get_cf(&cf, format!("e:{}", node_id).as_bytes()).ok()??;
+        crate::light_binding::PendingBind::decode(&raw)
+    }
+
+
+    pub fn delete_light_pending_bind(&self, node_id: &str) -> IntegrationResult<()> {
+        let cf = self.persistent.db.cf_handle("light_pending_bind")
+            .ok_or_else(|| IntegrationError::StorageError("light_pending_bind column family not found".to_string()))?;
+        let mut batch = WriteBatch::default();
+        batch.delete_cf(&cf, format!("e:{}", node_id).as_bytes());
+        batch.delete_cf(&cf, format!("m:{}", node_id).as_bytes());
+        self.persistent.db.write(batch)?;
+        Ok(())
+    }
+
+    /// (node id, stored_at, consent_ts, source network) of every pending binding, from the meta rows only.
+    pub fn light_pending_bind_meta(&self) -> Vec<(String, u64, u64, String)> {
+        let Some(cf) = self.persistent.db.cf_handle("light_pending_bind") else { return Vec::new(); };
+        let mut out = Vec::new();
+        let iter = self.persistent.db.iterator_cf(&cf, rocksdb::IteratorMode::From(b"m:", rocksdb::Direction::Forward));
+        for item in iter {
+            let Ok((k, v)) = item else { break };
+            let Some(node) = k.strip_prefix(b"m:") else { break };
+            if v.len() < 16 { continue; }
+            let stored_at = u64::from_be_bytes(v[..8].try_into().unwrap_or([0; 8]));
+            let consent_ts = u64::from_be_bytes(v[8..16].try_into().unwrap_or([0; 8]));
+            let source = String::from_utf8_lossy(&v[16..]).into_owned();
+            out.push((String::from_utf8_lossy(node).into_owned(), stored_at, consent_ts, source));
+        }
+        out
     }
 
     /// The identity key a light node's ping delegation was proven under, if one was recorded.
@@ -1026,8 +1537,12 @@ impl Storage {
             0
         };
 
+        // 6b. Device-layer attestor votes (genesis only; every other node holds none). A vote binds nothing
+        //     after its TTL of minutes; the ones older than the ephemeral cutoff go, a bounded batch a pass.
+        let device_votes = self.device_prune_votes(cutoff_timestamp, 10_000);
+
         let total_removed = pings_removed as u64 + att_removed as u64 + consensus_removed as u64
-            + failover_removed as u64 + snapshots_removed as u64 + tx_pruned;
+            + failover_removed as u64 + snapshots_removed as u64 + tx_pruned + device_votes as u64;
 
         // 7. Compact ONLY the CFs that were deleted from, and only once enough rows
         //    went to justify it. Compacting every CF rewrote microblocks + merkle_nodes

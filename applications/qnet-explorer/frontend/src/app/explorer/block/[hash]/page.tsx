@@ -1,10 +1,12 @@
 'use client';
 
 import React, { useState, useCallback, useEffect } from 'react';
-import Link from 'next/link';
+import ExplorerLink from '@/components/ExplorerLink';
 import { useParams } from 'next/navigation';
 import type { Block, BlockTransaction, HeartbeatEntry } from '@/lib/types';
 import { getCache, setCache, isCacheStale } from '@/lib/explorer-cache';
+import { useActivationContent } from '@/contexts/AppContext';
+import { txPartyLabel, txTypeLabel } from '@/lib/tx-labels';
 
 // Helper to truncate
 const truncate = (str: string, start = 8, end = 6): string => {
@@ -73,6 +75,8 @@ const CopyBtn = ({ text }: { text: string }) => {
 export default function BlockPage() {
   const params = useParams();
   const hash = params.hash as string;
+  // The app's view names reward and activation types by what they change (src/lib/tx-labels.ts).
+  const full = useActivationContent();
   
   // v2.102: Sync cache read for instant display
   const cachedBlock = hash ? getCache<Block>('block', hash) : null;
@@ -186,9 +190,9 @@ export default function BlockPage() {
             <span className="detail-value">
               {block.height > 0 ? (
                 <>
-                  <Link href={`/explorer/block/${block.height - 1}`} className="address-link">
+                  <ExplorerLink href={`/explorer/block/${block.height - 1}`} className="address-link">
                     {truncate(block.previous_hash)}
-                  </Link>
+                  </ExplorerLink>
                   <CopyBtn text={block.previous_hash} />
                 </>
               ) : (
@@ -259,7 +263,7 @@ export default function BlockPage() {
       {/* MacroBlock Consensus Data */}
       {isMacro && block.consensus_data && (
         <div className="block-card">
-          <h2 className="card-title">Consensus Data (Emission Window)</h2>
+          <h2 className="card-title">{full ? 'Consensus Data (Emission Window)' : 'Consensus Data'}</h2>
           <div className="details-grid">
             <div className="detail-row">
               <span className="detail-label">Commits</span>
@@ -285,7 +289,7 @@ export default function BlockPage() {
             )}
             {block.consensus_data.pool3_total_activations !== undefined && (
               <div className="detail-row highlight">
-                <span className="detail-label">Pool 3 Activations</span>
+                <span className="detail-label">{full ? 'Pool 3 Activations' : 'Pool 3 total'}</span>
                 <span className="detail-value">{formatAmount(block.consensus_data.pool3_total_activations.toString())}</span>
               </div>
             )}
@@ -310,31 +314,31 @@ export default function BlockPage() {
               <tr key={idx}>
                 <td>
                   {tx.hash ? (
-                    <Link href={`/explorer/tx/${tx.hash}`} className="address-link">
+                    <ExplorerLink href={`/explorer/tx/${tx.hash}`} className="address-link">
                       {truncate(tx.hash, 6, 4)}
-                    </Link>
+                    </ExplorerLink>
                   ) : (
                     <span className="mono">{idx + 1}</span>
                   )}
                 </td>
                 <td>
-                  <span className={`type-badge type-${tx.type.toLowerCase()}`}>{tx.type}</span>
+                  <span className={`type-badge type-${tx.type.toLowerCase()}`}>{txTypeLabel(tx.type, full)}</span>
                 </td>
                 <td>
                   {tx.from && tx.from.length > 10 && tx.from.includes('eon') ? (
-                    <Link href={`/explorer/address/${tx.from}`} className="address-link">
+                    <ExplorerLink href={`/explorer/address/${tx.from}`} className="address-link">
                       {truncate(tx.from, 6, 4)}
-                    </Link>
+                    </ExplorerLink>
                   ) : (
-                    <span className="address-link">{tx.from || 'N/A'}</span>
+                    <span className="address-link">{txPartyLabel(tx.from || 'N/A', full)}</span>
                   )}
                   <span className="tx-arrow">→</span>
                   {tx.to && tx.to.length > 10 && tx.to.includes('eon') ? (
-                    <Link href={`/explorer/address/${tx.to}`} className="address-link">
+                    <ExplorerLink href={`/explorer/address/${tx.to}`} className="address-link">
                       {truncate(tx.to, 6, 4)}
-                    </Link>
+                    </ExplorerLink>
                   ) : (
-                    <span className="address-link">{tx.to || 'N/A'}</span>
+                    <span className="address-link">{txPartyLabel(tx.to || 'N/A', full)}</span>
                   )}
                 </td>
                 <td>{formatAmount(tx.amount)}</td>
@@ -368,9 +372,9 @@ export default function BlockPage() {
                     <td>{formatTime(entry.timestamp)}</td>
                     <td>{entry.node_id}</td>
                     <td>
-                      <Link href={`/explorer/address/${entry.node_address}`} className="address-link">
+                      <ExplorerLink href={`/explorer/address/${entry.node_address}`} className="address-link">
                         {truncate(entry.node_address, 6, 4)}
-                      </Link>
+                      </ExplorerLink>
                     </td>
                     <td>
                       <span className={`node-type-badge ${entry.node_type.toLowerCase()}`}>
@@ -398,9 +402,9 @@ export default function BlockPage() {
               {block.micro_blocks.map((mbHash, idx) => (
                 <div key={idx} className="related-block-row">
                   <span className="related-label">#{idx + 1}</span>
-                  <Link href={`/explorer/block/${mbHash}`} className="block-link">
+                  <ExplorerLink href={`/explorer/block/${mbHash}`} className="block-link">
                     {truncate(mbHash, 12, 12)}
-                  </Link>
+                  </ExplorerLink>
                   <CopyBtn text={mbHash} />
                 </div>
               ))}

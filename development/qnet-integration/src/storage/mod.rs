@@ -7,14 +7,31 @@ mod compression;
 mod roster;
 mod registry;
 mod node_records;
+mod light_device;
 mod snapshots;
 mod snapshot_index;
 mod account_mirror;
 mod boundary_snapshot;
 mod history_archive;
 mod persistent;
+mod tree_db;
+mod aux_db;
+mod proof_views;
+mod row_sketch;
+mod certified_read;
+#[cfg(test)]
+mod certified_bounds_tests;
 
 pub use account_mirror::{account_delta, MirrorTicket};
+pub use proof_views::{ProofViews, ProofStats, View, ViewSet, PROOF_VIEWS_KEPT, PROOF_CANDIDATES_KEPT};
+pub use certified_read::{AccountAnswer, ContractStatus, ProofFailure, ProofSteps, StorageAnswer, TokenAnswer};
+#[cfg(test)]
+pub(crate) use proof_views::rig as proof_view_rig;
+pub use tree_db::TREE_WRITE_CHUNK_BYTES;
+pub use aux_db::AUX_QUEUE_CAP_BYTES;
+pub use node_records::{FcmEntry, PingKeyWrite};
+pub use light_device::DeviceWrite;
+pub use roster::{LightUptime, LIGHT_UPTIME_WINDOW};
 pub use boundary_snapshot::is_snapshot_boundary;
 pub use history_archive::{HistoryArchive, SegmentMeta, SEGMENT_BLOCKS as ARCHIVE_SEGMENT_BLOCKS};
 
@@ -175,6 +192,23 @@ mod identity_heal_tests {
 #[inline]
 pub(crate) fn mb_fmt_key(height: u64) -> String { format!("microblock_fmt_{:020}", height) }
 
+/// The addresses a stored TX is listed under besides its sender: the ones apply pays or creates, never
+/// an envelope field nothing signs. A batch lists its recipients (its envelope names none), a deploy
+/// the address apply derives from (from, nonce), a lifecycle TX or proof none (it pays no one); every
+/// other class its `to`. Sorted and deduplicated.
+pub(crate) fn tx_index_counterparties(tx: &qnet_state::Transaction) -> Vec<String> {
+    match &tx.tx_type {
+        qnet_state::TransactionType::BatchTransfers { transfers, .. } => transfers.iter()
+            .map(|t| t.to_address.clone())
+            .collect::<std::collections::BTreeSet<String>>()
+            .into_iter().collect(),
+        qnet_state::TransactionType::ContractDeploy =>
+            vec![qnet_state::transaction::derive_contract_address(&tx.from, tx.nonce)],
+        _ if tx.moves_no_envelope_value() => Vec::new(),
+        _ => tx.to.iter().cloned().collect(),
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // ROLLBACK PROTECTION v3.23: Prevent race condition between rollback and block save
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -197,13 +231,14 @@ pub const TX_INDEX_RETENTION_BLOCKS: u64 = 100_000;
 /// here cannot silently stop retention from holding.
 pub const PRUNE_RUNS_PER_HOUR: u64 = 1;
 
-pub(crate) const ALL_CF_NAMES: [&str; 30] = [
+pub(crate) const ALL_CF_NAMES: [&str; 34] = [
     "blocks", "transactions", "accounts", "metadata",
     "microblocks", "consensus", "sync_state",
     "pending_rewards", "node_registry", "ping_history",
     "failover_events", "snapshots", "tx_index",
     "tx_by_address", "attestations", "heartbeats",
-    "contract_storage", "fcm_tokens", "light_ping_keys",
+    "contract_storage", "fcm_tokens", "light_ping_keys", "light_pending_bind",
+    "light_device", "light_device_key", "light_device_attkey",
     "accounts_stage", "node_registry_stage", "pending_rewards_stage", "contract_storage_stage",
     "mempool", "cross_shard_pending", "cross_shard_receipts",
     "merkle_leaves", "merkle_nodes", "wallet_token", "reward_agg",
@@ -573,6 +608,22 @@ pub struct PersistentStorage {
     snapshot_gen: AtomicU64,
     /// Heights whose frame rows are being written in this process: one writer per height.
     snapshot_writing: parking_lot::Mutex<std::collections::HashSet<u64>>,
+    /// The one LRU block cache, shared with the two derived DBs.
+    block_cache: rocksdb::Cache,
+    /// `<data_dir>/state_tree`: the account tree consensus reads.
+    tree: tree_db::TreeDb,
+    /// `<data_dir>/state_aux` behind its writer: preimages and contract storage trees.
+    aux: Arc<aux_db::AuxWriter>,
+    /// Certified proof views over snapshots of the two.
+    views: Arc<proof_views::ProofViews>,
+}
+
+impl Drop for PersistentStorage {
+    fn drop(&mut self) {
+        // The writer threads and every held snapshot keep their DB open; release them first.
+        self.views.shutdown();
+        self.aux.shutdown();
+    }
 }
 
 /// Owned, thread-movable RocksDB consistent snapshot. The held `Arc<DB>` keeps
@@ -630,6 +681,18 @@ const MAX_TRANSACTION_POOL_BYTES: usize = 128 * 1024 * 1024;
 
 /// Durable anti-double-sign watermark (metadata CF).
 const HIGHEST_SIGNED_HEIGHT_KEY: &[u8] = b"highest_signed_microblock_height";
+
+/// Exact signing record (metadata CF): `sgr_` ++ height BIG-endian → the highest round this node signed there.
+const SIGNATURE_RECORD_PREFIX: &[u8] = b"sgr_";
+/// Heights at or below this carry no record (pruned at finality, or signed before the record existed).
+const SIGNATURE_RECORD_FLOOR_KEY: &[u8] = b"sigrec_floor";
+
+pub(crate) fn signature_record_key(height: u64) -> [u8; 12] {
+    let mut k = [0u8; 12];
+    k[..4].copy_from_slice(SIGNATURE_RECORD_PREFIX);
+    k[4..].copy_from_slice(&height.to_be_bytes());
+    k
+}
 
 impl TransactionPool {
     pub fn new() -> Self {
@@ -1142,33 +1205,6 @@ pub struct PatternRecognizer {
     pattern_stats: HashMap<TransactionPattern, u64>,
 }
 
-/// Phase C (default-OFF): RocksDB-backed persistent Merkle store.
-///
-/// Moves the committed leaf/node set off-heap into two dedicated column
-/// families so the ~2.5GB resident tree at 10M accounts lives on disk with
-/// only a bounded cache in RAM. Point reads are single `get_cf` lookups; a
-/// finalize's delta is one atomic `WriteBatch`. Cloning the `Arc<DB>` is
-/// zero-copy and the CF names are resolved per-call via `cf_handle`, so the
-/// store carries no borrowed CF lifetime.
-struct RocksMerkleNodeStore {
-    db: Arc<DB>,
-    leaf_cf: &'static str,
-    node_cf: &'static str,
-}
-
-impl RocksMerkleNodeStore {
-    /// 36-byte node key = 4-byte big-endian depth ++ 32-byte node key. Big-endian
-    /// keeps depth-major ordering in the CF; the fixed 36-byte width keeps every
-    /// node key strictly below the 37-byte all-0xFF upper bound used by the wipe.
-    #[inline]
-    fn node_db_key(depth: u32, key: &[u8; 32]) -> [u8; 36] {
-        let mut k = [0u8; 36];
-        k[..4].copy_from_slice(&depth.to_be_bytes());
-        k[4..].copy_from_slice(key);
-        k
-    }
-}
-
 /// Store read failures observed by get_leaf. A deletion authority must distinguish
 /// "absent" from "unreadable": the CF true-up snapshots this counter around each page
 /// and vetoes deletions when it moved — an IO error must never read as certain absence.
@@ -1177,187 +1213,6 @@ pub static MERKLE_LEAF_READ_ERRS: std::sync::atomic::AtomicU64 = std::sync::atom
 /// read reports its own outcome.
 pub static ACCOUNT_READ_ERRS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-impl qnet_state::MerkleNodeStore for RocksMerkleNodeStore {
-    fn get_leaf(&self, key: &[u8; 32]) -> Option<[u8; 32]> { self.try_get_leaf(key).ok().flatten() }
-    fn try_get_leaf(&self, key: &[u8; 32]) -> Result<Option<[u8; 32]>, ()> {
-        // EVERY unreadable outcome — missing CF, IO error, malformed value — is an Err and bumps
-        // the counter: a probe that cannot read a leaf must never be taken as proof of absence.
-        let cf = match self.db.cf_handle(self.leaf_cf) {
-            Some(cf) => cf,
-            None => {
-                MERKLE_LEAF_READ_ERRS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return Err(());
-            }
-        };
-        // Keys-only probes must not evict the hot working set from the block cache.
-        let mut ro = rocksdb::ReadOptions::default();
-        ro.fill_cache(false);
-        let v = match self.db.get_cf_opt(&cf, &key[..], &ro) {
-            Ok(Some(v)) => v,
-            Ok(None) => return Ok(None),
-            Err(_) => {
-                MERKLE_LEAF_READ_ERRS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return Err(());
-            }
-        };
-        if v.len() == 32 {
-            let mut out = [0u8; 32];
-            out.copy_from_slice(&v);
-            Ok(Some(out))
-        } else {
-            MERKLE_LEAF_READ_ERRS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Err(())
-        }
-    }
-
-    fn get_node(&self, depth: u32, key: &[u8; 32]) -> Option<[u8; 32]> {
-        let cf = self.db.cf_handle(self.node_cf)?;
-        let dbk = Self::node_db_key(depth, key);
-        let v = self.db.get_cf(&cf, &dbk[..]).ok().flatten()?;
-        if v.len() == 32 {
-            let mut out = [0u8; 32];
-            out.copy_from_slice(&v);
-            Some(out)
-        } else {
-            None
-        }
-    }
-
-    /// Leaf keys sort bytewise and a subtree is a contiguous key range, so the probe
-    /// is one seek plus at most `limit` steps — no full scan at any tree size.
-    fn leaves_under(&self, lo: &[u8; 32], hi: &[u8; 32], limit: usize) -> Vec<([u8; 32], [u8; 32])> {
-        let cf = match self.db.cf_handle(self.leaf_cf) {
-            Some(cf) => cf,
-            None => return Vec::new(),
-        };
-        let mut out = Vec::new();
-        if limit == 0 {
-            return out;
-        }
-        // Upper bound lets RocksDB skip files that cannot hold the range; fill_cache off keeps a
-        // probe from evicting hot data out of the shared block cache.
-        let mut ro = rocksdb::ReadOptions::default();
-        ro.set_iterate_upper_bound({
-            let mut end = hi.to_vec();
-            end.push(0u8); // inclusive `hi` -> exclusive bound
-            end
-        });
-        ro.fill_cache(false);
-        let mode = rocksdb::IteratorMode::From(&lo[..], rocksdb::Direction::Forward);
-        for item in self.db.iterator_cf_opt(&cf, ro, mode) {
-            let (k, v) = match item {
-                Ok(kv) => kv,
-                Err(_) => break,
-            };
-            if k.len() != 32 || k.as_ref() > &hi[..] {
-                break;
-            }
-            if v.len() != 32 {
-                continue;
-            }
-            let mut key = [0u8; 32];
-            let mut val = [0u8; 32];
-            key.copy_from_slice(&k);
-            val.copy_from_slice(&v);
-            out.push((key, val));
-            if out.len() >= limit {
-                break;
-            }
-        }
-        out
-    }
-
-    fn all_leaves(&self) -> Vec<([u8; 32], [u8; 32])> {
-        let cf = match self.db.cf_handle(self.leaf_cf) {
-            Some(cf) => cf,
-            None => return Vec::new(),
-        };
-        let mut out = Vec::new();
-        for item in self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start) {
-            // A dropped row here silently SHRINKS the leaf set that recompute_root then
-            // declares complete — the authority the CF true-up deletes against. Flag it.
-            let (k, v) = match item {
-                Ok(kv) => kv,
-                Err(_) => {
-                    MERKLE_LEAF_READ_ERRS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    continue;
-                }
-            };
-            if k.len() != 32 || v.len() != 32 {
-                MERKLE_LEAF_READ_ERRS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                continue;
-            }
-            let mut key = [0u8; 32];
-            let mut val = [0u8; 32];
-            key.copy_from_slice(&k);
-            val.copy_from_slice(&v);
-            out.push((key, val));
-        }
-        out
-    }
-
-    fn wipe_leaves(&self) -> Result<(), String> {
-        let leaf_cf = self.db.cf_handle(self.leaf_cf)
-            .ok_or_else(|| format!("merkle leaf CF '{}' not found", self.leaf_cf))?;
-        // Leaf keys are exactly 32 bytes, so a 33-byte upper bound covers every one of them.
-        let lo = [0u8; 1];
-        let hi = [0xFFu8; 33];
-        self.db.delete_range_cf(&leaf_cf, &lo[..], &hi[..]).map_err(|e| e.to_string())
-    }
-
-    fn put_batch(
-        &self,
-        leaf_puts: &[([u8; 32], [u8; 32])],
-        leaf_dels: &[[u8; 32]],
-        node_puts: &[((u32, [u8; 32]), [u8; 32])],
-        node_dels: &[(u32, [u8; 32])],
-        wipe_all_nodes: bool,
-    ) -> Result<(), String> {
-        let leaf_cf = self.db.cf_handle(self.leaf_cf)
-            .ok_or_else(|| format!("merkle leaf CF '{}' not found", self.leaf_cf))?;
-        let node_cf = self.db.cf_handle(self.node_cf)
-            .ok_or_else(|| format!("merkle node CF '{}' not found", self.node_cf))?;
-
-        // Full rebuild: wipe the ENTIRE node set as its OWN committed write BEFORE
-        // the puts batch. A single 36-byte-wide range [0x00 .. 0xFF×37) covers every
-        // node key (all are 36 bytes < the 37-byte upper bound), so no stale node can
-        // survive to silently fork the chain. Committing separately avoids same-batch
-        // DeleteRange+Put ordering ambiguity — the subsequent puts carry the complete
-        // non-default node set. LEAVES are never wiped.
-        if wipe_all_nodes {
-            let lo = [0u8; 1];
-            let hi = [0xFFu8; 37];
-            self.db.delete_range_cf(&node_cf, &lo[..], &hi[..])
-                .map_err(|e| e.to_string())?;
-        }
-
-        let mut batch = WriteBatch::default();
-
-        // Leaves: leaf_puts/leaf_dels are disjoint by contract ⇒ order-independent.
-        for key in leaf_dels {
-            batch.delete_cf(&leaf_cf, &key[..]);
-        }
-        for (key, val) in leaf_puts {
-            batch.put_cf(&leaf_cf, &key[..], &val[..]);
-        }
-
-        // Nodes: on the merge path (no wipe) apply node_dels BEFORE node_puts so a
-        // re-put of the same key wins. After a wipe there is nothing left to delete,
-        // so node_dels are a no-op — node_puts alone repopulate the full set.
-        if !wipe_all_nodes {
-            for (depth, key) in node_dels {
-                let dbk = Self::node_db_key(*depth, key);
-                batch.delete_cf(&node_cf, &dbk[..]);
-            }
-        }
-        for ((depth, key), val) in node_puts {
-            let dbk = Self::node_db_key(*depth, key);
-            batch.put_cf(&node_cf, &dbk[..], &val[..]);
-        }
-
-        self.db.write(batch).map_err(|e| e.to_string())
-    }
-}
 /// What a save actually did. A plain bool conflated two very different non-writes: a rollback
 /// declining a height above its target (transient, self-correcting) and a node whose storage mode
 /// keeps no blocks at all (persistent, and NOT something a fork recovery can fix). The caller must
@@ -1416,6 +1271,8 @@ pub struct Storage {
     recent_microblocks: Arc<dashmap::DashMap<u64, Arc<qnet_state::MicroBlock>>>,
     /// Finalized history written before body pruning drops it (QNET_ARCHIVE=1, Super only).
     history_archive: once_cell::sync::OnceCell<Arc<history_archive::HistoryArchive>>,
+    /// The public recent-transactions feed, read from the newest blocks (recent_transactions_page).
+    recent_tx_feed: parking_lot::Mutex<Option<chain_reads::RecentTxFeed>>,
 }
 
 /// v27 HOLE3: recent-block cache cap (macroblock window + slack).
@@ -1464,18 +1321,21 @@ impl Storage {
         self.persistent.load_highest_signed_mark()
     }
 
-    /// Phase C: RocksDB-backed persistent Merkle store over the two dedicated
-    /// column families ("merkle_leaves", "merkle_nodes"). Both CFs are created at
-    /// open (build_column_families), so on a fresh genesis DB they always exist.
-    /// Handed to `StateManager::set_merkle_node_store` when the persistent-tree
-    /// feature is enabled, moving the committed tree off-heap. The `Arc<DB>` clone
-    /// is zero-copy; CF handles are resolved lazily on each store operation.
-    pub fn merkle_node_store(&self) -> std::sync::Arc<dyn qnet_state::MerkleNodeStore> {
-        std::sync::Arc::new(RocksMerkleNodeStore {
-            db: self.persistent.db.clone(),
-            leaf_cf: "merkle_leaves",
-            node_cf: "merkle_nodes",
-        })
+    /// Exact signing record — proxies to PersistentStorage.
+    pub fn save_signature_record(&self, height: u64, round: u64, hwm: u64, window: u64, last_round: u64, last_height: u64) -> IntegrationResult<()> {
+        self.persistent.save_signature_record(height, round, hwm, window, last_round, last_height)
+    }
+    pub fn signed_round_at(&self, height: u64) -> IntegrationResult<Option<u64>> {
+        self.persistent.signed_round_at(height)
+    }
+    pub fn signature_record_floor(&self) -> IntegrationResult<Option<u64>> {
+        self.persistent.signature_record_floor()
+    }
+    pub fn seed_signature_record_floor(&self, hwm: u64) -> IntegrationResult<bool> {
+        self.persistent.seed_signature_record_floor(hwm)
+    }
+    pub fn prune_signature_records_to(&self, finalized: u64) -> IntegrationResult<()> {
+        self.persistent.prune_signature_records_to(finalized)
     }
 
     // Smart-contract VM: WASM code blobs are stored via the existing
@@ -1823,6 +1683,13 @@ impl Storage {
     pub async fn get_transactions_by_address(&self, address: &str, page: usize, per_page: usize) -> IntegrationResult<Vec<qnet_state::Transaction>> {
         self.persistent.get_transactions_by_address(address, page, per_page).await
     }
+
+    /// The same rows with the height each index row names (rows of one height in descending hash order).
+    pub fn address_transactions_with_height(&self, address: &str, page: usize, per_page: usize)
+        -> IntegrationResult<Vec<(Option<u64>, qnet_state::Transaction)>>
+    {
+        self.persistent.address_transactions_with_height(address, page, per_page)
+    }
     
     /// Count transactions for an address
     pub async fn count_transactions_by_address(&self, address: &str) -> IntegrationResult<usize> {
@@ -1847,11 +1714,6 @@ impl Storage {
     }
     pub fn prune_token_transfers_below(&self, prune_before: u64) -> usize {
         self.persistent.prune_token_transfers_below(prune_before)
-    }
-    
-    /// Get recent transactions globally (paginated, newest first)
-    pub async fn get_recent_transactions(&self, page: usize, per_page: usize) -> IntegrationResult<(Vec<qnet_state::Transaction>, usize)> {
-        self.persistent.get_recent_transactions(page, per_page).await
     }
     
     /// Count total transactions in the blockchain
@@ -1894,6 +1756,12 @@ impl Storage {
     }
     pub fn load_timeout_certificates(&self) -> IntegrationResult<Option<Vec<u8>>> {
         self.persistent.load_timeout_certificates()
+    }
+    pub fn save_timeout_certificates_all(&self, legacy: &[u8], tenure_bound: &[u8]) -> IntegrationResult<()> {
+        self.persistent.save_timeout_certificates_all(legacy, tenure_bound)
+    }
+    pub fn load_timeout_certificates_v3(&self) -> IntegrationResult<Option<Vec<u8>>> {
+        self.persistent.load_timeout_certificates_v3()
     }
     pub fn save_highest_certified_rounds(&self, payload: &[u8]) -> IntegrationResult<()> {
         self.persistent.save_highest_certified_rounds(payload)
@@ -2193,61 +2061,6 @@ mod v32_9_pattern_c_tests {
     }
 
     #[test]
-    fn rocks_merkle_store_honors_contract() {
-        // Phase C fork-guard: the RocksDB MerkleNodeStore must honor put_batch
-        // semantics on a REAL DB — leaf_dels remove exactly one leaf, and a
-        // wipe_all_nodes rebuild drops the ENTIRE old node set (no orphan survives).
-        let (storage, _dir) = open_test_storage();
-        let store = storage.merkle_node_store();
-
-        let k1 = [1u8; 32];
-        let k2 = [2u8; 32];
-        let k3 = [3u8; 32];
-        let v = |b: u8| [b; 32];
-
-        // Seed three leaves.
-        store.put_batch(
-            &[(k1, v(11)), (k2, v(22)), (k3, v(33))],
-            &[], &[], &[], false,
-        ).expect("seed leaves");
-        assert_eq!(store.get_leaf(&k2), Some(v(22)));
-        assert_eq!(store.all_leaves().len(), 3);
-
-        // Delete one leaf via leaf_dels.
-        store.put_batch(&[], &[k2], &[], &[], false).expect("del leaf");
-        assert_eq!(store.get_leaf(&k2), None, "deleted leaf must be absent");
-        assert!(!store.all_leaves().iter().any(|(k, _)| *k == k2),
-            "all_leaves must not contain the deleted leaf");
-        assert_eq!(store.all_leaves().len(), 2);
-
-        // Seed an OLD node set at two depths.
-        let na = [0xAAu8; 32];
-        let nb = [0xBBu8; 32];
-        store.put_batch(
-            &[], &[],
-            &[((0, na), v(1)), ((5, nb), v(2))],
-            &[], false,
-        ).expect("seed nodes");
-        assert_eq!(store.get_node(0, &na), Some(v(1)));
-        assert_eq!(store.get_node(5, &nb), Some(v(2)));
-
-        // Full rebuild carrying a DIFFERENT node set — old nodes must vanish.
-        let nc = [0xCCu8; 32];
-        store.put_batch(
-            &[], &[],
-            &[((7, nc), v(9))],
-            &[], true, // wipe_all_nodes
-        ).expect("rebuild nodes");
-        assert_eq!(store.get_node(0, &na), None, "old node must be wiped on rebuild");
-        assert_eq!(store.get_node(5, &nb), None, "old node must be wiped on rebuild");
-        assert_eq!(store.get_node(7, &nc), Some(v(9)), "only the new node set survives");
-
-        // Leaves are never wiped by a node rebuild.
-        assert_eq!(store.get_leaf(&k1), Some(v(11)));
-        assert_eq!(store.get_leaf(&k3), Some(v(33)));
-    }
-
-    #[test]
     fn super_eligible_index_roundtrips_sorted_and_epoch_isolated() {
         // R6: the apply-time super-eligibility index must return EXACTLY the saved node set, sorted
         // by node_id, deduped, epoch-isolated — so every node recomputes the same reward_root
@@ -2391,6 +2204,50 @@ mod v32_9_pattern_c_tests {
         let wp = "walletPhantomOnly";
         storage.save_node_registration_at_height("activation_ffff", "super", wp, 70.0, 300).unwrap();
         assert!(storage.get_nodes_by_wallet(wp).unwrap().is_empty(), "a non-derivable id is never resolvable");
+    }
+
+    /// The one-node rule reads chain-confirmed rows below the height it judges, never a cache row, a row at or
+    /// above that height, or the registration's own node; verify-activation and node-events read the same rows.
+    #[test]
+    fn wallet_other_node_reads_only_chain_rows_below_the_height() {
+        let (storage, _dir) = open_test_storage();
+        let w = "walletOneNode";
+        let super_id = crate::rpc::generate_super_node_pseudonym(w);
+        let light_id = crate::rpc::generate_light_node_pseudonym(w);
+
+        // A cache row (no reg_height) is not a node: nothing is refused and verify-activation says no.
+        storage.save_node_registration(&super_id, "super", w, 70.0).unwrap();
+        assert_eq!(storage.wallet_other_node(w, &light_id, 1_000), None, "a cache row is ignored");
+        assert_eq!(storage.get_node_by_wallet(w).unwrap(), None, "a cache row never answers verified");
+        assert!(storage.wallet_node_records(w).unwrap().is_empty());
+
+        // Chain-confirmed at 500: it counts only for a height above 500, and never for its own id.
+        storage.save_node_registration_at_height_burn(&super_id, "super", w, 70.0, 500, "burnSuper").unwrap();
+        assert_eq!(storage.wallet_other_node(w, &light_id, 500), None, "a row at the height judged is ignored");
+        assert_eq!(storage.wallet_other_node(w, &light_id, 400), None, "a row above it is ignored");
+        assert_eq!(storage.wallet_other_node(w, &light_id, 501), Some((super_id.clone(), "super".to_string())));
+        assert_eq!(storage.wallet_other_node(w, &super_id, 10_000), None, "the registration's own node is ignored");
+        assert_eq!(storage.get_node_by_wallet(w).unwrap(), Some((super_id.clone(), "super".to_string())));
+
+        // A wallet registered with both types before the gate: each sees the other, in genesis, super, light order.
+        storage.save_node_registration_at_height_burn(&light_id, "light", w, 70.0, 600, "burnLight").unwrap();
+        assert_eq!(storage.wallet_other_node(w, &super_id, 601), Some((light_id.clone(), "light".to_string())));
+        assert_eq!(storage.wallet_other_node(w, "super_node_other", 601), Some((super_id.clone(), "super".to_string())));
+        // node-events carries each row's burn (the row keeps it under "burn").
+        let events = storage.wallet_node_records(w).unwrap();
+        assert_eq!(events, vec![
+            (super_id.clone(), "super".to_string(), 500, "burnSuper".to_string()),
+            (light_id.clone(), "light".to_string(), 600, "burnLight".to_string()),
+        ]);
+
+        // A genesis wallet's genesis node counts from the block after genesis.
+        let (gid, gw) = crate::genesis_constants::GENESIS_WALLETS[0];
+        let genesis_id = format!("genesis_node_{}", gid);
+        let gw_light = crate::rpc::generate_light_node_pseudonym(gw);
+        assert_eq!(storage.wallet_other_node(gw, &gw_light, 1), None, "no genesis row yet");
+        storage.save_node_registration_at_height(&genesis_id, "super", gw, 70.0, 0).unwrap();
+        assert_eq!(storage.wallet_other_node(gw, &gw_light, 1), Some((genesis_id.clone(), "super".to_string())));
+        assert_eq!(storage.wallet_other_node(gw, &genesis_id, 1), None);
     }
 
     #[test]
@@ -3236,41 +3093,83 @@ mod tests_certified_pair_wal {
     /// A pair above the seal frontier is what re-seals a late-committing boundary; a re-certification
     /// run moves the index far past the retain window in minutes, so index distance alone must not
     /// discard it. Pairs at or below the frontier still go.
-    /// The operator recovery point is the last SEALED window, not the last window that has a row.
-    /// A stalled fleet writes placeholder macroblocks for windows nobody certified; rolling back to
-    /// one of those would land the chain on state no quorum ever agreed. Empty body = not a
-    /// recovery point, whatever its index says.
+    /// The operator recovery point is the last CERTIFIED point this node holds, never below it. A stalled
+    /// fleet writes placeholder macroblocks for windows nobody certified; rolling back to one of those would
+    /// land the chain on state no quorum ever agreed, so an empty or partial list is not a seal. Macroblock
+    /// `idx` covers [(idx-1)*90+1, idx*90]: the point is idx*90 (the old reading, (idx+1)*90-1, kept up to 89
+    /// uncertified blocks). 04.10: a rollback below a certified checkpoint never sealed again, so an explicit
+    /// target below the floor is refused, and a node whose own bodies contradict the seal has a lower floor.
     #[tokio::test]
-    async fn the_recovery_point_is_the_last_sealed_window() {
+    async fn the_recovery_point_is_the_last_certified_point_and_nothing_goes_below_it() {
         use crate::node::BlockchainNode;
-        let (s, _d) = open_test_storage();
         let mk = |idx: u64, micro: Vec<[u8; 32]>| qnet_state::MacroBlock::new(
             idx, 0, [0u8; 32], micro, [0u8; 32], qnet_state::ConsensusData::default());
+        let full = |tag: u8| vec![[tag; 32]; 90];
 
-        // Tip inside window 12; windows 10 and 11 have rows, only 10 carries a body.
+        // Tip inside window 13; window 10 ([811, 900]) sealed with a full list, 11 a placeholder, 12 partial.
+        let (s, _d) = open_test_storage();
         s.set_chain_height(12 * 90 + 40).expect("height");
-        s.save_macroblock(10, &mk(10, vec![[1u8; 32]])).await.expect("sealed 10");
+        s.save_macroblock(10, &mk(10, full(1))).await.expect("sealed 10");
         s.save_macroblock(11, &mk(11, Vec::new())).await.expect("placeholder 11");
-        s.save_macroblock(12, &mk(12, Vec::new())).await.expect("placeholder 12");
+        s.save_macroblock(12, &mk(12, vec![[2u8; 32]])).await.expect("partial 12");
+        let floor = BlockchainNode::certified_rollback_floor(&s);
+        assert_eq!(floor, 10 * 90, "window 10 ends at 900; the placeholders above are no seal");
+        assert_eq!(BlockchainNode::boot_rollback_target(None, true, floor), Ok(Some(900)), "LAST_SEALED resolves to the floor");
+        assert_eq!(BlockchainNode::boot_rollback_target(Some(899), false, floor), Err(900), "below the floor: refused");
+        assert_eq!(BlockchainNode::boot_rollback_target(Some(950), false, floor), Ok(Some(950)), "above it: the operator's call");
+        assert_eq!(BlockchainNode::boot_rollback_target(None, false, floor), Ok(None));
 
-        // Window 10 covers [900, 989], so its last height is 989 — NOT 11's or 12's range.
-        assert_eq!(BlockchainNode::last_sealed_height_for_test(&s), Some(11 * 90 - 1),
-                   "the placeholders above the seal are skipped");
+        // This node's own body inside window 10 is not the one the seal names: it is the forked node, its
+        // floor sits lower, and the rollback that heals it is allowed.
+        // (A body's save writes the chain height in its batch, so the tip is set after the bodies.)
+        let (forked, _d2) = open_test_storage();
+        let body = qnet_state::MicroBlock::new(815, 1815, [0u8; 32], vec![], "genesis_node_001".to_string());
+        forked.save_microblock(815, &bincode::serialize(&body).unwrap()).expect("own body");
+        forked.set_chain_height(12 * 90 + 40).expect("height");
+        forked.save_macroblock(10, &mk(10, full(1))).await.expect("sealed 10");
+        assert_eq!(BlockchainNode::certified_rollback_floor(&forked), 0, "nothing certified matches here");
+        assert_eq!(BlockchainNode::boot_rollback_target(Some(800), false, 0), Ok(Some(800)));
+        assert_eq!(BlockchainNode::boot_rollback_target(None, true, 0), Ok(None), "and LAST_SEALED invents nothing");
 
-        // A higher SEALED window wins over lower ones; the placeholder between them is irrelevant.
-        // (A fresh store: a written macroblock is immutable, so 12 cannot be re-sealed in place.)
-        let (s2, _d3) = open_test_storage();
-        s2.set_chain_height(12 * 90 + 40).expect("height");
-        s2.save_macroblock(10, &mk(10, vec![[1u8; 32]])).await.expect("sealed 10");
-        s2.save_macroblock(11, &mk(11, Vec::new())).await.expect("placeholder 11");
-        s2.save_macroblock(12, &mk(12, vec![[2u8; 32]])).await.expect("sealed 12");
-        assert_eq!(BlockchainNode::last_sealed_height_for_test(&s2), Some(13 * 90 - 1),
-                   "the highest sealed window is the recovery point");
+        // The same body named by the seal: the window matches and is the floor.
+        let (matching, _d3) = open_test_storage();
+        matching.save_microblock(815, &bincode::serialize(&body).unwrap()).expect("own body");
+        matching.set_chain_height(12 * 90 + 40).expect("height");
+        let mut named = full(1);
+        named[815 - 811] = body.hash();
+        matching.save_macroblock(10, &mk(10, named)).await.expect("sealed 10");
+        assert_eq!(BlockchainNode::certified_rollback_floor(&matching), 900);
+
+        // A committed checkpoint above the seal whose list names the bodies held here raises the floor to its
+        // head; one whose list names another body there does not.
+        let pair = |head: u64, hashes: Vec<[u8; 32]>| bincode::serialize(&vec![
+            crate::consensus_v2_driver::ConsensusMsg::Proposal(qnet_consensus::checkpoint_bft::Checkpoint {
+                index: head / 30, parent_qc: None, window_head_height: head, window_mb_hashes: hashes,
+                state_root: [0u8; 32], beacon: [0u8; 32], epoch_commitment: [0u8; 32], reward_root: [0u8; 32],
+                registry_root: [0u8; 32], dilithium_pk_root: [0u8; 32], reward_epoch_root: [0u8; 32], logs_root: [0u8; 32],
+                total_supply: 0, timestamp: 0, proposer: "n0".to_string(), proposer_sig: Vec::new(), recovery_anchor: None,
+            })]).unwrap();
+        let mut bodies = Vec::new();
+        let mut parent = [0u8; 32];
+        for h in 901..=930u64 {
+            let b = qnet_state::MicroBlock::new(h, 1000 + h, parent, vec![], "genesis_node_001".to_string());
+            parent = b.hash();
+            s.save_microblock(h, &bincode::serialize(&b).unwrap()).expect("body");
+            bodies.push(b.hash());
+        }
+        s.set_chain_height(12 * 90 + 40).expect("height");
+        let mut other = bodies.clone();
+        other[14] = [0xEE; 32];
+        s.record_certified_pair_at(31, 930, &pair(930, other)).expect("pair naming another body");
+        assert_eq!(BlockchainNode::certified_rollback_floor(&s), 900, "a list that contradicts the bodies held is no floor");
+        s.record_certified_pair_at(32, 930, &pair(930, bodies)).expect("pair");
+        assert_eq!(BlockchainNode::certified_rollback_floor(&s), 930, "the committed checkpoint above the seal");
+        assert_eq!(BlockchainNode::boot_rollback_target(Some(910), false, 930), Err(930));
 
         // Nothing sealed anywhere within reach ⇒ no recovery point, and the caller must not invent one.
-        let (empty, _d2) = open_test_storage();
+        let (empty, _d4) = open_test_storage();
         empty.set_chain_height(12 * 90 + 40).expect("height");
-        assert_eq!(BlockchainNode::last_sealed_height_for_test(&empty), None);
+        assert_eq!(BlockchainNode::certified_rollback_floor(&empty), 0);
     }
 
     /// A shard's eligibility is the union of what its owners committed. A backup covers what the

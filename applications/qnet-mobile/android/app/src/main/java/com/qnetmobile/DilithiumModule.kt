@@ -12,9 +12,14 @@ import android.util.Log
  *
  * Signature size : 3309 bytes (FIPS 204 / pqclean dilithium3)
  * Public key size: 1952 bytes
- * Secret key size: 4032 bytes (stored as hex, never leaves device)
+ * Secret key size: 4032 bytes (hex over the bridge, never leaves the device)
  *
- * Seed management: secret key is re-derived from the activation-code seed on every use.
+ * The native side serializes keygen and signing under one lock, PQClean wipes its secret locals and the stack
+ * it used (dilithium_jni.c). Here the byte arrays and char buffers that held a seed or a secret key are zeroed
+ * as soon as the call is done. What this module cannot zero: the seed string and the secret key's hex String
+ * as they arrive from and go to JavaScript (immutable on both sides of the bridge). The determinism check at
+ * wallet creation asks publicKeyFromSeed, so no second secret key is handed out. No self-test runs in a
+ * release build.
  */
 class DilithiumModule(reactContext: ReactApplicationContext) :
     ReactContextBaseJavaModule(reactContext) {
@@ -45,8 +50,8 @@ class DilithiumModule(reactContext: ReactApplicationContext) :
 
     // ---- Native declarations ----
 
-    /** Returns pk (1952 bytes) || sk (4032 bytes) = 5984 bytes */
-    private external fun nativeGenerateKeypair(seedStr: String): ByteArray?
+    /** seedBytes = UTF-8 of the seed string. Returns pk (1952 bytes) || sk (4032 bytes) = 5984 bytes */
+    private external fun nativeGenerateKeypair(seedBytes: ByteArray): ByteArray?
 
     /** Returns 3309-byte detached signature */
     private external fun nativeSign(skBytes: ByteArray, msgBytes: ByteArray): ByteArray?
@@ -54,33 +59,14 @@ class DilithiumModule(reactContext: ReactApplicationContext) :
     /** Returns true if signature is valid */
     private external fun nativeVerify(pkBytes: ByteArray, sigBytes: ByteArray, msgBytes: ByteArray): Boolean
 
-    /** Runs self-test, logs results to logcat and returns status string */
+    /** Fixed-seed keygen/sign/verify; debug builds only */
     private external fun nativeCompatTest(): String?
 
     override fun getName(): String = NAME
 
-    // Run the native compat test on init — verifies the pqclean C code is working. Skipped when the
-    // native lib is unavailable; catches Throwable so a JNI link error on this background thread can
-    // never take the whole app down.
-    init {
-        if (nativeAvailable) {
-            Thread {
-                try {
-                    val result = nativeCompatTest()
-                    Log.e("DILITHIUM_COMPAT", "=== PQCLEAN NATIVE COMPAT TEST ===")
-                    Log.e("DILITHIUM_COMPAT", "Result: $result")
-                    Log.e("DILITHIUM_COMPAT", "SIG_SIZE=$SIGNATURE_SIZE (pqcrypto-dilithium 0.5 compatible)")
-                } catch (t: Throwable) {
-                    Log.e("DILITHIUM_COMPAT", "ERROR: ${t.message}")
-                }
-            }.start()
-        }
-    }
-
     /**
      * Generate Dilithium3 keypair from deterministic seed.
      * Returns { publicKey: hex, secretKey: hex, publicKeySize, secretKeySize }
-     * secretKey is the raw sk bytes in hex — re-derived from seed when needed.
      */
     @ReactMethod
     fun generateKeypairFromSeed(seed: String, promise: Promise) {
@@ -88,8 +74,11 @@ class DilithiumModule(reactContext: ReactApplicationContext) :
             promise.reject("DILITHIUM_NATIVE_UNAVAILABLE", "Post-quantum crypto is unavailable on this device build.")
             return
         }
+        val seedBytes = seed.toByteArray(Charsets.UTF_8)
+        var combined: ByteArray? = null
+        var sk: ByteArray? = null
         try {
-            val combined = nativeGenerateKeypair(seed)
+            combined = nativeGenerateKeypair(seedBytes)
                 ?: throw RuntimeException("nativeGenerateKeypair returned null")
 
             if (combined.size != PUBLIC_KEY_SIZE + SECRET_KEY_SIZE) {
@@ -97,25 +86,56 @@ class DilithiumModule(reactContext: ReactApplicationContext) :
             }
 
             val pk = combined.copyOfRange(0, PUBLIC_KEY_SIZE)
-            val sk = combined.copyOfRange(PUBLIC_KEY_SIZE, PUBLIC_KEY_SIZE + SECRET_KEY_SIZE)
+            sk = combined.copyOfRange(PUBLIC_KEY_SIZE, PUBLIC_KEY_SIZE + SECRET_KEY_SIZE)
 
             val result = Arguments.createMap()
             result.putString("publicKey", bytesToHex(pk))
-            // Store sk as hex — it can always be re-derived from seed
-            // but storing it avoids re-running keygen on every sign call
             result.putString("secretKey", bytesToHex(sk))
             result.putInt("publicKeySize", pk.size)
             result.putInt("secretKeySize", sk.size)
             promise.resolve(result)
         } catch (e: Throwable) {
             promise.reject("DILITHIUM_KEYGEN_ERROR", "Failed to generate Dilithium3 keypair: ${e.message}", e)
+        } finally {
+            seedBytes.fill(0)
+            combined?.fill(0)
+            sk?.fill(0)
+        }
+    }
+
+    /**
+     * The public key alone for a seed: the wallet's determinism check derives the key a second time, and the
+     * secret half of that second keypair never leaves native code (MPLAT-R2-05).
+     */
+    @ReactMethod
+    fun publicKeyFromSeed(seed: String, promise: Promise) {
+        if (!nativeAvailable) {
+            promise.reject("DILITHIUM_NATIVE_UNAVAILABLE", "Post-quantum crypto is unavailable on this device build.")
+            return
+        }
+        val seedBytes = seed.toByteArray(Charsets.UTF_8)
+        var combined: ByteArray? = null
+        try {
+            combined = nativeGenerateKeypair(seedBytes)
+                ?: throw RuntimeException("nativeGenerateKeypair returned null")
+            if (combined.size != PUBLIC_KEY_SIZE + SECRET_KEY_SIZE) {
+                throw RuntimeException("Unexpected keypair size: ${combined.size}")
+            }
+            val result = Arguments.createMap()
+            result.putString("publicKey", bytesToHex(combined.copyOfRange(0, PUBLIC_KEY_SIZE)))
+            result.putInt("publicKeySize", PUBLIC_KEY_SIZE)
+            promise.resolve(result)
+        } catch (e: Throwable) {
+            promise.reject("DILITHIUM_KEYGEN_ERROR", "Failed to derive the public key: ${e.message}", e)
+        } finally {
+            seedBytes.fill(0)
+            combined?.fill(0)
         }
     }
 
     /**
      * Sign a message with Dilithium3.
-     * secretKeySeed: hex-encoded 4032-byte secret key (from generateKeypairFromSeed).
-     *   If it looks like a raw seed string (not hex / wrong length), re-derive the keypair.
+     * secretKeyHex: hex-encoded 4032-byte secret key (from generateKeypairFromSeed).
      * Returns signature in backend-compatible format:
      *   "dilithium_sig_{nodeId}_{base64}"
      * where base64 encodes:
@@ -124,7 +144,7 @@ class DilithiumModule(reactContext: ReactApplicationContext) :
     @ReactMethod
     fun sign(
         message: String,
-        secretKeySeed: String,
+        secretKeyHex: String,
         publicKeyHex: String,
         nodeId: String,
         promise: Promise
@@ -133,11 +153,10 @@ class DilithiumModule(reactContext: ReactApplicationContext) :
             promise.reject("DILITHIUM_NATIVE_UNAVAILABLE", "Post-quantum crypto is unavailable on this device build.")
             return
         }
+        var skBytes: ByteArray? = null
         try {
             val messageBytes = message.toByteArray(Charsets.UTF_8)
-
-            // Resolve sk bytes: if hex of correct length use directly, else re-derive
-            val skBytes: ByteArray = resolveSecretKey(secretKeySeed)
+            skBytes = secretKeyBytes(secretKeyHex)
             val pkBytes: ByteArray = hexToBytes(publicKeyHex)
 
             val sigBytes = nativeSign(skBytes, messageBytes)
@@ -166,6 +185,8 @@ class DilithiumModule(reactContext: ReactApplicationContext) :
             promise.resolve(result)
         } catch (e: Throwable) {
             promise.reject("DILITHIUM_SIGN_ERROR", "Failed to sign with Dilithium3: ${e.message}", e)
+        } finally {
+            skBytes?.fill(0)
         }
     }
 
@@ -177,16 +198,17 @@ class DilithiumModule(reactContext: ReactApplicationContext) :
     @ReactMethod
     fun signDetached(
         message: String,
-        secretKeySeed: String,
+        secretKeyHex: String,
         promise: Promise
     ) {
         if (!nativeAvailable) {
             promise.reject("DILITHIUM_NATIVE_UNAVAILABLE", "Post-quantum crypto is unavailable on this device build.")
             return
         }
+        var skBytes: ByteArray? = null
         try {
             val messageBytes = message.toByteArray(Charsets.UTF_8)
-            val skBytes: ByteArray = resolveSecretKey(secretKeySeed)
+            skBytes = secretKeyBytes(secretKeyHex)
             val sigBytes = nativeSign(skBytes, messageBytes)
                 ?: throw RuntimeException("nativeSign returned null")
             if (sigBytes.size != SIGNATURE_SIZE) {
@@ -197,6 +219,8 @@ class DilithiumModule(reactContext: ReactApplicationContext) :
             promise.resolve(result)
         } catch (e: Throwable) {
             promise.reject("DILITHIUM_SIGN_ERROR", "Failed to sign (detached) with Dilithium3: ${e.message}", e)
+        } finally {
+            skBytes?.fill(0)
         }
     }
 
@@ -210,6 +234,10 @@ class DilithiumModule(reactContext: ReactApplicationContext) :
         publicKeyHex: String,
         promise: Promise
     ) {
+        if (!nativeAvailable) {
+            promise.reject("DILITHIUM_NATIVE_UNAVAILABLE", "Post-quantum crypto is unavailable on this device build.")
+            return
+        }
         try {
             val pkBytes  = hexToBytes(publicKeyHex)
             val sigBytes = hexToBytes(signatureHex)
@@ -222,19 +250,20 @@ class DilithiumModule(reactContext: ReactApplicationContext) :
     }
 
     /**
-     * Run pqclean compatibility test (native).
-     * Generates keypair, signs, verifies. Logs PK/SIG hex for cross-check with Rust.
+     * Fixed-seed keygen/sign/verify self-test. Debug builds only: a release build answers "skipped" and
+     * touches no key material.
      */
     @ReactMethod
     fun compatibilityTest(promise: Promise) {
         try {
-            val result = nativeCompatTest()
-                ?: throw RuntimeException("nativeCompatTest returned null")
-            Log.e("DILITHIUM_COMPAT", "compatibilityTest result: $result")
             val map = Arguments.createMap()
-            map.putString("result", result)
             map.putString("sigSize", SIGNATURE_SIZE.toString())
             map.putBoolean("isPqclean", true)
+            if (!BuildConfig.DEBUG || !nativeAvailable) {
+                map.putString("result", "skipped")
+            } else {
+                map.putString("result", nativeCompatTest() ?: throw RuntimeException("nativeCompatTest returned null"))
+            }
             promise.resolve(map)
         } catch (e: Throwable) {
             promise.reject("COMPAT_TEST_ERROR", e.message, e)
@@ -243,19 +272,13 @@ class DilithiumModule(reactContext: ReactApplicationContext) :
 
     // ---- Private helpers ----
 
-    /**
-     * Resolve secret key bytes.
-     * If secretKeySeed is hex of length 2*SECRET_KEY_SIZE (8064 chars) — decode directly.
-     * Otherwise treat as a seed string and re-derive keypair.
-     */
-    private fun resolveSecretKey(secretKeySeed: String): ByteArray {
-        if (secretKeySeed.length == SECRET_KEY_SIZE * 2 && secretKeySeed.all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' }) {
-            return hexToBytes(secretKeySeed)
+    /** The 4032-byte secret key from its hex; anything else is refused (no re-derivation from a string). */
+    private fun secretKeyBytes(secretKeyHex: String): ByteArray {
+        require(secretKeyHex.length == SECRET_KEY_SIZE * 2 &&
+            secretKeyHex.all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' }) {
+            "Secret key must be $SECRET_KEY_SIZE bytes of hex"
         }
-        // Legacy path: re-derive from seed string
-        val combined = nativeGenerateKeypair(secretKeySeed)
-            ?: throw RuntimeException("Failed to re-derive keypair from seed")
-        return combined.copyOfRange(PUBLIC_KEY_SIZE, PUBLIC_KEY_SIZE + SECRET_KEY_SIZE)
+        return hexToBytes(secretKeyHex)
     }
 
     private fun putU32LE(buf: ByteArray, offset: Int, value: Int) {
@@ -265,16 +288,28 @@ class DilithiumModule(reactContext: ReactApplicationContext) :
         buf[offset+3] = ((value shr 24) and 0xFF).toByte()
     }
 
-    private fun bytesToHex(bytes: ByteArray): String =
-        bytes.joinToString("") { "%02x".format(it) }
+    private fun bytesToHex(bytes: ByteArray): String {
+        val hex = "0123456789abcdef"
+        val out = CharArray(bytes.size * 2)
+        for (i in bytes.indices) {
+            val v = bytes[i].toInt() and 0xFF
+            out[2 * i] = hex[v ushr 4]
+            out[2 * i + 1] = hex[v and 0x0F]
+        }
+        val text = String(out)
+        out.fill('0') // the String is a copy; the buffer that also held the key's hex is wiped
+        return text
+    }
 
     private fun hexToBytes(hex: String): ByteArray {
         val len = hex.length
         require(len % 2 == 0) { "Odd hex length: $len" }
         val data = ByteArray(len / 2)
         for (i in 0 until len step 2) {
-            data[i / 2] = ((Character.digit(hex[i], 16) shl 4) +
-                            Character.digit(hex[i + 1], 16)).toByte()
+            val hi = Character.digit(hex[i], 16)
+            val lo = Character.digit(hex[i + 1], 16)
+            require(hi >= 0 && lo >= 0) { "Invalid hex" }
+            data[i / 2] = ((hi shl 4) + lo).toByte()
         }
         return data
     }
