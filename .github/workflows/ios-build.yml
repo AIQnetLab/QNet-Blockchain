@@ -50,7 +50,7 @@ jobs:
       - name: Install JavaScript dependencies
         run: |
           npm ci --no-audit --no-fund --ignore-scripts
-          npx patch-package
+          npx patch-package || (cd node_modules/react-native-quick-crypto && patch -p1 --forward < ../../patches/react-native-quick-crypto+1.0.15.patch)
           grep -q 'QNet patch (origin integrity)' node_modules/react-native-webview/apple/RNCWebViewImpl.m
 
       - name: Dependency audit
