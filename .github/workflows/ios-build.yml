@@ -2,8 +2,8 @@ name: iOS build
 
 # Compiles the wallet for the iOS simulator on a clean macOS runner, unsigned: proof that the Xcode
 # project, the pods and the native ML-DSA module build outside one developer's machine, once the checks job
-# passed (dependency audit, unit tests, light-client pin). A manual run also archives a signed Release build
-# and uploads it to TestFlight (the testflight job).
+# passed (dependency audit, unit tests, light-client pin). A manual run, or a push whose commit message carries
+# [testflight], also archives a signed Release build and uploads it to TestFlight (the testflight job).
 #
 # Both macOS jobs resolve the pods after npm ci and the patches, compare the result with ios/Podfile.lock and
 # keep the resolved lock as an artifact: the committed lock is replaced by that file, never edited by hand.
@@ -167,7 +167,11 @@ jobs:
   # The secrets reach only the steps that use them, nothing prints them, and the key file is deleted at the end.
   testflight:
     needs: checks
-    if: github.event_name == 'workflow_dispatch' && inputs.testflight
+    # The Run workflow button exists only for workflows on the default branch, so a push whose commit message
+    # carries [testflight] starts this job too.
+    if: >-
+      (github.event_name == 'workflow_dispatch' && inputs.testflight) ||
+      (github.event_name == 'push' && contains(github.event.head_commit.message, '[testflight]'))
     runs-on: macos-26
     timeout-minutes: 90
     concurrency:
