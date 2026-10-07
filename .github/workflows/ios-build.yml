@@ -68,7 +68,7 @@ jobs:
 
   simulator:
     needs: checks
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 60
     defaults:
       run:
@@ -168,7 +168,7 @@ jobs:
   testflight:
     needs: checks
     if: github.event_name == 'workflow_dispatch' && inputs.testflight
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 90
     concurrency:
       group: ios-testflight
