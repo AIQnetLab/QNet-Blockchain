@@ -397,6 +397,110 @@ export async function getAddressTokenTransfers(address: string, limit: number = 
   return result.rows;
 }
 
+// ── address history (wallet feed) ───────────────────────────────────────────────────────────────────
+// Transactions the address sent or received, batch credits and token transfers as one newest-first list,
+// paged by keyset. Total order: block, then source (tx > batch > token), then the row's position, then
+// its hash byte-wise - so a page boundary never repeats or skips a row, whatever lands meanwhile.
+
+export type HistorySource = 'tx' | 'batch' | 'token';
+const HISTORY_RANK: Record<HistorySource, number> = { tx: 2, batch: 1, token: 0 };
+
+export interface HistoryCursor { block: number; rank: number; idx: number; hash: string }
+
+export interface AddressHistoryRow {
+  source: HistorySource;
+  hash: string;
+  idx: number;                  // tx_index | recipient index in the envelope | log_index
+  block: number;
+  timestamp: number;            // as stored (seconds or ms)
+  from_address: string;
+  to_address: string | null;
+  amount: string;               // nano QNC for tx/batch, token base units for token
+  tx_type: string | null;
+  gas_price: string | null;
+  gas_limit: string | null;
+  contract: string | null;
+  kind: string | null;
+  std: string | null;
+  token_id: string | null;
+}
+
+export function encodeHistoryCursor(r: AddressHistoryRow): string {
+  return `${r.block}.${HISTORY_RANK[r.source]}.${r.idx}.${r.hash}`;
+}
+
+export function decodeHistoryCursor(s: string | null | undefined): HistoryCursor | null {
+  if (!s) return null;
+  const m = /^(\d{1,15})\.([0-2])\.(\d{1,9})\.([A-Za-z0-9_:-]{1,128})$/.exec(s);
+  if (!m) throw new Error('Invalid cursor');
+  return { block: Number(m[1]), rank: Number(m[2]), idx: Number(m[3]), hash: m[4] };
+}
+
+function historyCompareDesc(a: AddressHistoryRow, b: AddressHistoryRow): number {
+  if (a.block !== b.block) return b.block - a.block;
+  if (a.source !== b.source) return HISTORY_RANK[b.source] - HISTORY_RANK[a.source];
+  if (a.idx !== b.idx) return b.idx - a.idx;
+  return a.hash < b.hash ? 1 : a.hash > b.hash ? -1 : 0;
+}
+
+export async function getAddressHistoryPage(address: string, cursorText: string | null, limit: number): Promise<{ rows: AddressHistoryRow[]; nextCursor: string | null }> {
+  validateAddress(address);
+  if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new Error('Invalid limit: must be between 1 and 100');
+  const cursor = decodeHistoryCursor(cursorText);
+  const take = limit + 1;
+
+  // Rows strictly after the cursor for a source of rank `rank`; `hashCol` compares byte-wise.
+  const after = (rank: number, idxCol: string, hashCol: string, params: unknown[]): string => {
+    if (!cursor) return 'TRUE';
+    params.push(cursor.block);
+    const b = `$${params.length}`;
+    if (rank < cursor.rank) return `block <= ${b}`;
+    if (rank > cursor.rank) return `block < ${b}`;
+    params.push(cursor.idx, cursor.hash);
+    return `(block, ${idxCol}, ${hashCol} COLLATE "C") < (${b}, $${params.length - 1}, $${params.length} COLLATE "C")`;
+  };
+  const txSide = (col: 'from_address' | 'to_address') => {
+    const params: unknown[] = [address, take];
+    const text = `SELECT 'tx' AS source, hash, tx_index AS idx, block, timestamp, from_address, to_address, amount::text AS amount,
+                         tx_type, gas_price::text AS gas_price, gas_limit::text AS gas_limit,
+                         NULL AS contract, NULL AS kind, NULL AS std, NULL AS token_id
+                  FROM transactions WHERE ${col} = $1 AND ${after(HISTORY_RANK.tx, 'tx_index', 'hash', params)}
+                  ORDER BY block DESC, tx_index DESC, hash COLLATE "C" DESC LIMIT $2`;
+    return query<AddressHistoryRow>(text, params);
+  };
+  const batchParams: unknown[] = [address, take];
+  const batchText = `SELECT 'batch' AS source, tx_hash AS hash, tx_index AS idx, block, timestamp, from_address, to_address, amount::text AS amount,
+                            'BatchTransfers' AS tx_type, NULL AS gas_price, NULL AS gas_limit,
+                            NULL AS contract, NULL AS kind, NULL AS std, NULL AS token_id
+                     FROM batch_transfers WHERE to_address = $1 AND ${after(HISTORY_RANK.batch, 'tx_index', 'tx_hash', batchParams)}
+                     ORDER BY block DESC, tx_index DESC, tx_hash COLLATE "C" DESC LIMIT $2`;
+  const tokenSide = (col: 'from_address' | 'to_address') => {
+    const params: unknown[] = [address, take];
+    const text = `SELECT 'token' AS source, tx_hash AS hash, log_index AS idx, block, timestamp, from_address, to_address, amount::text AS amount,
+                         NULL AS tx_type, NULL AS gas_price, NULL AS gas_limit, contract, kind, std, token_id
+                  FROM token_transfers WHERE ${col} = $1 AND ${after(HISTORY_RANK.token, 'log_index', 'tx_hash', params)}
+                  ORDER BY block DESC, log_index DESC, tx_hash COLLATE "C" DESC LIMIT $2`;
+    return query<AddressHistoryRow>(text, params);
+  };
+
+  const parts = await Promise.all([txSide('from_address'), txSide('to_address'), query<AddressHistoryRow>(batchText, batchParams), tokenSide('from_address'), tokenSide('to_address')]);
+  const seen = new Set<string>();
+  const merged: AddressHistoryRow[] = [];
+  for (const part of parts) {
+    for (const r of part.rows) {
+      const row = { ...r, block: Number(r.block), idx: Number(r.idx), timestamp: Number(r.timestamp) };
+      const key = `${row.source}:${row.hash}:${row.idx}`;          // a self-transfer comes back from both sides
+      if (seen.has(key)) continue;
+      seen.add(key);
+      merged.push(row);
+    }
+  }
+  merged.sort(historyCompareDesc);
+  const rows = merged.slice(0, limit);
+  const nextCursor = merged.length > limit && rows.length > 0 ? encodeHistoryCursor(rows[rows.length - 1]) : null;
+  return { rows, nextCursor };
+}
+
 export async function getContractTokenTransfers(contract: string, limit: number = 50): Promise<TokenTransferRow[]> {
   validateAddress(contract);
   if (!Number.isInteger(limit) || limit < 1 || limit > 500) limit = 50;

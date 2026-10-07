@@ -7,8 +7,9 @@ pub(crate) const ALL_COLUMN_FAMILIES: &[&str] = &[
     "blocks", "transactions", "accounts", "metadata", "microblocks", "consensus",
     "sync_state", "pending_rewards", "node_registry", "ping_history", "failover_events",
     "snapshots", "tx_index", "tx_by_address", "attestations", "heartbeats",
-    "contract_storage", "fcm_tokens", "light_ping_keys", "mempool", "cross_shard_pending", "cross_shard_receipts",
-    "accounts_stage", "node_registry_stage", "pending_rewards_stage", "contract_storage_stage",
+    "contract_storage", "fcm_tokens", "light_ping_keys", "light_pending_bind", "light_device", "light_device_key",
+    "light_device_attkey", "mempool", "cross_shard_pending",
+    "cross_shard_receipts", "accounts_stage", "node_registry_stage", "pending_rewards_stage", "contract_storage_stage",
     "merkle_leaves", "merkle_nodes", "wallet_token", "reward_agg",
 ];
 
@@ -234,6 +235,14 @@ impl PersistentStorage {
                 // Light-node ping delegation keys (operational, non-consensus): key=node_id, value JSON
                 // {ping_pubkey, ping_delegation_cert}. Read per-ping so the hot crypto stays off the RAM registry.
                 ColumnFamilyDescriptor::new("light_ping_keys", create_cf_opts()),
+                // Bindings for light nodes whose registration has not applied yet (operational,
+                // best effort, capped): `e:{node}` the entry, `m:{node}` its 16-byte meta row.
+                ColumnFamilyDescriptor::new("light_pending_bind", create_cf_opts()),
+                // Device layer (operational, non-consensus, genesis only): the device records, the device-key
+                // index and the remotely provisioned attestation-key index (storage/light_device.rs).
+                ColumnFamilyDescriptor::new("light_device", create_cf_opts()),
+                ColumnFamilyDescriptor::new("light_device_key", create_cf_opts()),
+                ColumnFamilyDescriptor::new("light_device_attkey", create_cf_opts()),
                 // Cold-join staging: a downloaded snapshot is restored HERE, verified, then
                 // promoted into the live state CFs. Live state is never mutated before the
                 // consensus binding passes, so a rejected snapshot leaves no orphaned state.
@@ -271,9 +280,8 @@ impl PersistentStorage {
                 // pruning task once an epoch has rolled).
                 ColumnFamilyDescriptor::new("cross_shard_pending", create_hot_cf_opts()),
                 ColumnFamilyDescriptor::new("cross_shard_receipts", create_hot_cf_opts()),
-                // Persistent Merkle store (always on): the committed node/leaf set lives
-                // in RocksDB, the in-RAM maps are bounded read-through caches.
-                // Leaf key = raw 32-byte addr_hash; node key = 4-byte BE depth ++ 32-byte key.
+                // Legacy account-tree families: the tree lives in the tree DB (tree_db.rs). Kept
+                // declared so an older binary opens this DB; emptied after this boot's own rebuild.
                 ColumnFamilyDescriptor::new("merkle_leaves", create_merkle_cf_opts()),
                 ColumnFamilyDescriptor::new("merkle_nodes", create_merkle_cf_opts()),
                 // Wallet→token reverse index (NON-consensus): key `owns_{wallet}_{contract}` marks a
@@ -332,13 +340,35 @@ impl PersistentStorage {
             }
         };
         
+        let db = Arc::new(db);
+        Self::check_storage_format(&db)?;
+
+        // The derived tree and aux DBs live inside the data directory, so no volume changes.
+        let legacy_rows_present = super::tree_db::legacy_merkle_rows_present(&db);
+        let tree = super::tree_db::open_tree_db(path, &block_cache, legacy_rows_present)?;
+        let aux_db = super::aux_db::open_aux_db(path, &block_cache)?;
+        // The aux DB is recreated empty, so it matches the tree only while the tree is empty too.
+        // Otherwise it takes rows from the first full reset on, which every boot path except a
+        // blocked replay performs; until then no view is captured over it.
+        let aux_active = Arc::new(AtomicBool::new(!super::tree_db::tree_has_leaves(&tree.db)));
+        let aux_queued = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let aux_sketch = Arc::new(super::row_sketch::RowSketch::new(super::aux_db::AUX_SKETCH_FAMILIES));
+        let views = super::proof_views::ProofViews::new(
+            db.clone(), tree.db.clone(), aux_db.clone(), tree.rebuilt.clone(), tree.write_failed.clone(),
+            aux_active.clone(), aux_queued.clone());
+        let aux = super::aux_db::AuxWriter::start(aux_db, views.clone(), aux_sketch, aux_active, aux_queued)?;
         let store = Self {
-            db: Arc::new(db),
+            db,
             snapshot_write_lock: parking_lot::Mutex::new(()),
             snapshot_gen: AtomicU64::new(0),
             snapshot_writing: parking_lot::Mutex::new(std::collections::HashSet::new()),
+            block_cache,
+            tree,
+            aux,
+            views,
         };
-        store.enforce_storage_format()?;
+        store.views.init_newest(store.last_sealed_mb_index());
+        store.views.start()?;
         Ok(store)
     }
 
@@ -346,13 +376,14 @@ impl PersistentStorage {
     /// structs and the macroblock preimage all changed; there is no backfill for the hash-addressed
     /// index, so opening old data would not fail — it would silently mis-read the chain. Failing
     /// loudly at startup turns "remember to wipe" from a convention into a checked precondition.
-    pub(super) fn enforce_storage_format(&self) -> IntegrationResult<()> {
+    /// Checked before the derived DBs open, on the bare main DB.
+    fn check_storage_format(db: &DB) -> IntegrationResult<()> {
         const FORMAT_KEY: &[u8] = b"storage_format_version";
         const FORMAT_VERSION: u64 = 2; // 2 = zero-padded keys + hash-addressed index, PoH removed
 
-        let metadata_cf = self.db.cf_handle("metadata")
+        let metadata_cf = db.cf_handle("metadata")
             .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
-        let stored = self.db.get_cf(&metadata_cf, FORMAT_KEY)?
+        let stored = db.get_cf(&metadata_cf, FORMAT_KEY)?
             .filter(|v| v.len() == 8)
             .map(|v| { let mut b = [0u8; 8]; b.copy_from_slice(&v[..8]); u64::from_be_bytes(b) });
 
@@ -369,14 +400,14 @@ impl PersistentStorage {
             None => {
                 // No marker: either a fresh directory, or one written before versioning existed.
                 // A populated unversioned store is pre-format data and must not be opened.
-                let has_blocks = self.db.get_cf(&metadata_cf, b"chain_height")?.is_some();
+                let has_blocks = db.get_cf(&metadata_cf, b"chain_height")?.is_some();
                 if has_blocks {
                     eprintln!("[CRIT][STORAGE] unversioned_populated_store action=wipe_data_dir_required");
                     return Err(IntegrationError::StorageError(
                         "existing chain data predates the current storage format — wipe the data directory".to_string()
                     ));
                 }
-                self.db.put_cf(&metadata_cf, FORMAT_KEY, &FORMAT_VERSION.to_be_bytes())?;
+                db.put_cf(&metadata_cf, FORMAT_KEY, &FORMAT_VERSION.to_be_bytes())?;
                 Ok(())
             }
         }
@@ -454,7 +485,7 @@ impl PersistentStorage {
                 let from_key = format!("addr_{}_{:016x}_{}", tx.from, stamp, tx.hash);
                 batch.put_cf(&tx_by_addr_cf, from_key.as_bytes(), tx.hash.as_bytes());
 
-                if let Some(ref to) = tx.to {
+                for to in super::tx_index_counterparties(tx) {
                     let to_key = format!("addr_{}_{:016x}_{}", to, stamp, tx.hash);
                     batch.put_cf(&tx_by_addr_cf, to_key.as_bytes(), tx.hash.as_bytes());
                 }
@@ -2075,25 +2106,47 @@ impl PersistentStorage {
         Ok(None)
     }
 
+    /// Lowest microblock height at or above `from` held on disk; one forward seek, same key order.
+    pub fn lowest_stored_microblock_from(&self, from: u64) -> IntegrationResult<Option<u64>> {
+        let cf = self.db.cf_handle("microblocks")
+            .ok_or_else(|| IntegrationError::StorageError("microblocks column family not found".to_string()))?;
+        let start = mb_body_key(from);
+        let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::From(start.as_bytes(), rocksdb::Direction::Forward));
+        for item in iter {
+            let (k, _) = item?;
+            let key = match std::str::from_utf8(&k) { Ok(s) => s, Err(_) => continue };
+            let digits = match key.strip_prefix("microblock_") { Some(d) => d, None => break };
+            if let Ok(h) = digits.parse::<u64>() { return Ok(Some(h)); }
+        }
+        Ok(None)
+    }
+
     /// RocksDB's own memory, in MB: (shared block cache, live memtables, open table readers).
     /// The cache is one shared LRU so it is read once; the other two are per-CF and summed.
     pub fn rocksdb_memory_mb(&self) -> (u64, u64, u64) {
         const MB: u64 = 1024 * 1024;
-        let names = ALL_COLUMN_FAMILIES;
-        let mut cache = 0u64;
+        // The cache is shared by all three DBs, so it is read once.
+        let cache = self.block_cache.get_usage() as u64;
         let (mut memtables, mut readers) = (0u64, 0u64);
-        for name in names {
-            let cf = match self.db.cf_handle(name) { Some(c) => c, None => continue };
-            if cache == 0 {
-                cache = self.db.property_int_value_cf(&cf, "rocksdb.block-cache-usage")
+        for (db, names) in self.all_dbs() {
+            for name in names {
+                let cf = match db.cf_handle(name) { Some(c) => c, None => continue };
+                memtables += db.property_int_value_cf(&cf, "rocksdb.cur-size-all-mem-tables")
+                    .ok().flatten().unwrap_or(0);
+                readers += db.property_int_value_cf(&cf, "rocksdb.estimate-table-readers-mem")
                     .ok().flatten().unwrap_or(0);
             }
-            memtables += self.db.property_int_value_cf(&cf, "rocksdb.cur-size-all-mem-tables")
-                .ok().flatten().unwrap_or(0);
-            readers += self.db.property_int_value_cf(&cf, "rocksdb.estimate-table-readers-mem")
-                .ok().flatten().unwrap_or(0);
         }
         (cache / MB, memtables / MB, readers / MB)
+    }
+
+    /// The main DB, the tree DB and the aux DB, each with its column families.
+    fn all_dbs(&self) -> [(&DB, &[&'static str]); 3] {
+        [
+            (&*self.db, ALL_COLUMN_FAMILIES),
+            (&*self.tree.db, &super::tree_db::TREE_CFS[..]),
+            (self.aux.db(), &super::aux_db::AUX_CFS[..]),
+        ]
     }
 
     /// What RocksDB is doing right now, as k=v for a stall report: write stop / delayed-write
@@ -2102,31 +2155,33 @@ impl PersistentStorage {
     /// errors. Property reads only - no I/O, safe from a watchdog thread mid-stall.
     pub fn rocksdb_stall_facts(&self) -> String {
         const MB: u64 = 1024 * 1024;
-        let get = |cf: &rocksdb::ColumnFamily, name: &str| -> u64 {
-            self.db.property_int_value_cf(cf, name).ok().flatten().unwrap_or(0)
-        };
         let (mut imm, mut memtables, mut l0_max, mut l0_cf) = (0u64, 0u64, 0u64, "-");
-        let mut db_wide: Option<(u64, u64, u64, u64, u64, u64, u64)> = None;
-        for name in ALL_COLUMN_FAMILIES {
-            let cf = match self.db.cf_handle(name) { Some(c) => c, None => continue };
-            if db_wide.is_none() {
-                db_wide = Some((
-                    get(&cf, "rocksdb.is-write-stopped"),
-                    get(&cf, "rocksdb.actual-delayed-write-rate"),
-                    get(&cf, "rocksdb.num-running-compactions"),
-                    get(&cf, "rocksdb.num-running-flushes"),
-                    get(&cf, "rocksdb.compaction-pending"),
-                    get(&cf, "rocksdb.mem-table-flush-pending"),
-                    get(&cf, "rocksdb.background-errors"),
-                ));
+        // DB-wide figures add up over the three DBs: a stall in any of them holds the writer back.
+        let mut wide = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+        for (db, names) in self.all_dbs() {
+            let get = |cf: &rocksdb::ColumnFamily, name: &str| -> u64 {
+                db.property_int_value_cf(cf, name).ok().flatten().unwrap_or(0)
+            };
+            let mut first = true;
+            for name in names {
+                let cf = match db.cf_handle(name) { Some(c) => c, None => continue };
+                if first {
+                    first = false;
+                    wide.0 += get(&cf, "rocksdb.is-write-stopped");
+                    wide.1 += get(&cf, "rocksdb.actual-delayed-write-rate");
+                    wide.2 += get(&cf, "rocksdb.num-running-compactions");
+                    wide.3 += get(&cf, "rocksdb.num-running-flushes");
+                    wide.4 += get(&cf, "rocksdb.compaction-pending");
+                    wide.5 += get(&cf, "rocksdb.mem-table-flush-pending");
+                    wide.6 += get(&cf, "rocksdb.background-errors");
+                }
+                imm += get(&cf, "rocksdb.num-immutable-mem-table");
+                memtables += get(&cf, "rocksdb.cur-size-all-mem-tables");
+                let l0 = get(&cf, "rocksdb.num-files-at-level0");
+                if l0 > l0_max { l0_max = l0; l0_cf = name; }
             }
-            imm += get(&cf, "rocksdb.num-immutable-mem-table");
-            memtables += get(&cf, "rocksdb.cur-size-all-mem-tables");
-            let l0 = get(&cf, "rocksdb.num-files-at-level0");
-            if l0 > l0_max { l0_max = l0; l0_cf = name; }
         }
-        let (stopped, delayed, comp, flush, comp_pending, flush_pending, bg_err) =
-            db_wide.unwrap_or((0, 0, 0, 0, 0, 0, 0));
+        let (stopped, delayed, comp, flush, comp_pending, flush_pending, bg_err) = wide;
         format!("write_stopped={} delayed_rate={} running_compactions={} running_flushes={} \
                  compaction_pending={} flush_pending={} imm_memtables={} memtables_mb={} l0_max={}/{} bg_errors={}",
                 stopped, delayed, comp, flush, comp_pending, flush_pending, imm, memtables / MB,
@@ -2160,6 +2215,71 @@ impl PersistentStorage {
         buf[16..24].copy_from_slice(&round.to_be_bytes());
         buf[24..].copy_from_slice(&last_height.to_be_bytes());
         self.db.put_cf_opt(&metadata_cf, HIGHEST_SIGNED_HEIGHT_KEY, &buf, &opts)?;
+        Ok(())
+    }
+
+    /// The exact signing record for one signature, written with the watermark in ONE synced batch BEFORE the
+    /// signature is produced: `sgr_`+height → the round signed there (a higher round replaces a lower one),
+    /// and the (highest height, window, round, last height) mark the window rule reads. A crash costs one slot.
+    pub fn save_signature_record(&self, height: u64, round: u64, hwm: u64, window: u64, last_round: u64, last_height: u64) -> IntegrationResult<()> {
+        let metadata_cf = self.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
+        let mut opts = rocksdb::WriteOptions::default();
+        opts.set_sync(true);
+        let mut buf = [0u8; 32];
+        buf[..8].copy_from_slice(&hwm.to_be_bytes());
+        buf[8..16].copy_from_slice(&window.to_be_bytes());
+        buf[16..24].copy_from_slice(&last_round.to_be_bytes());
+        buf[24..].copy_from_slice(&last_height.to_be_bytes());
+        let round = self.signed_round_at(height)?.map_or(round, |r| r.max(round));
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.put_cf(&metadata_cf, signature_record_key(height), round.to_be_bytes());
+        batch.put_cf(&metadata_cf, HIGHEST_SIGNED_HEIGHT_KEY, buf);
+        self.db.write_opt(batch, &opts)?;
+        Ok(())
+    }
+
+    /// The highest round this node signed at `height`; None when the record holds nothing there.
+    pub fn signed_round_at(&self, height: u64) -> IntegrationResult<Option<u64>> {
+        let metadata_cf = self.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
+        Ok(self.db.get_cf(&metadata_cf, signature_record_key(height))?
+            .filter(|v| v.len() == 8)
+            .map(|v| { let mut x = [0u8; 8]; x.copy_from_slice(&v); u64::from_be_bytes(x) }))
+    }
+
+    /// Heights at or below this carry no record. None before the boot seed ran.
+    pub fn signature_record_floor(&self) -> IntegrationResult<Option<u64>> {
+        let metadata_cf = self.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
+        Ok(self.db.get_cf(&metadata_cf, SIGNATURE_RECORD_FLOOR_KEY)?
+            .filter(|v| v.len() == 8)
+            .map(|v| { let mut x = [0u8; 8]; x.copy_from_slice(&v); u64::from_be_bytes(x) }))
+    }
+
+    /// At boot, once: with no floor yet, the floor is the legacy watermark, so everything a binary without the
+    /// record signed keeps the height-only rule. Returns whether it seeded.
+    pub fn seed_signature_record_floor(&self, hwm: u64) -> IntegrationResult<bool> {
+        if self.signature_record_floor()?.is_some() { return Ok(false); }
+        let metadata_cf = self.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
+        let mut opts = rocksdb::WriteOptions::default();
+        opts.set_sync(true);
+        self.db.put_cf_opt(&metadata_cf, SIGNATURE_RECORD_FLOOR_KEY, hwm.to_be_bytes(), &opts)?;
+        Ok(true)
+    }
+
+    /// Drop the record at or below `finalized` and raise the floor to it. Production never builds there.
+    pub fn prune_signature_records_to(&self, finalized: u64) -> IntegrationResult<()> {
+        let metadata_cf = self.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
+        let floor = self.signature_record_floor()?.unwrap_or(0).max(finalized);
+        let mut opts = rocksdb::WriteOptions::default();
+        opts.set_sync(true);
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.delete_range_cf(&metadata_cf, signature_record_key(0), signature_record_key(finalized.saturating_add(1)));
+        batch.put_cf(&metadata_cf, SIGNATURE_RECORD_FLOOR_KEY, floor.to_be_bytes());
+        self.db.write_opt(batch, &opts)?;
         Ok(())
     }
 
@@ -2369,6 +2489,7 @@ impl PersistentStorage {
     /// boundary, which is the busiest point in the protocol cycle.
     pub async fn save_macroblock(&self, height: u64, macroblock: &qnet_state::MacroBlock) -> IntegrationResult<()> {
         let db = self.db.clone();
+        let views = self.views.clone();
         let macroblock = macroblock.clone();
         tokio::task::spawn_blocking(move || -> IntegrationResult<()> {
             let microblocks_cf = db.cf_handle("microblocks")
@@ -2438,6 +2559,8 @@ impl PersistentStorage {
             // This index BECAME present (the idempotent-skip above returned early otherwise) — signal the
             // pipeline's committee-deferred redrive, whose clear condition is exactly "macroblock n2 exists".
             MACROBLOCK_SAVE_SEQ.fetch_add(1, Ordering::Relaxed);
+            // The proof view at 90·height may promote now; the stored row, not this hook, decides.
+            views.on_macroblock_saved(height);
             println!("[INFO][STORAGE] macroblock_saved h={}", height);
             Ok(())
         })
@@ -2532,6 +2655,9 @@ impl PersistentStorage {
 
         self.db.write(batch)?;
         super::MACROBLOCK_DELETE_SEQ.fetch_add(1, Ordering::Relaxed);
+        // The single deletion point: a proof view of this index stops being served with it.
+        drop(_snapshot_fence);
+        self.views.on_macroblock_deleted(macroblock_index, self.last_sealed_mb_index());
 
         if crate::node::is_info() {
             println!("[INFO][STORAGE] delete_mb idx={} h={} +snapshots", macroblock_index, macroblock_index * 90);
@@ -2640,6 +2766,24 @@ impl PersistentStorage {
         let cf = self.db.cf_handle("consensus")
             .ok_or_else(|| IntegrationError::StorageError("consensus column family not found".to_string()))?;
         Ok(self.db.get_cf(&cf, b"tcerts_v1")?)
+    }
+
+    /// Both certificate blobs in one batch: `tcerts_v1` (window-only, its old format) and `tcerts_v3`
+    /// (tenure-bound, from the failover_tenure_bound gate).
+    pub fn save_timeout_certificates_all(&self, legacy: &[u8], tenure_bound: &[u8]) -> IntegrationResult<()> {
+        let cf = self.db.cf_handle("consensus")
+            .ok_or_else(|| IntegrationError::StorageError("consensus column family not found".to_string()))?;
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.put_cf(&cf, b"tcerts_v1", legacy);
+        batch.put_cf(&cf, b"tcerts_v3", tenure_bound);
+        self.db.write(batch)?;
+        Ok(())
+    }
+
+    pub fn load_timeout_certificates_v3(&self) -> IntegrationResult<Option<Vec<u8>>> {
+        let cf = self.db.cf_handle("consensus")
+            .ok_or_else(|| IntegrationError::StorageError("consensus column family not found".to_string()))?;
+        Ok(self.db.get_cf(&cf, b"tcerts_v3")?)
     }
 
     pub fn save_highest_certified_rounds(&self, payload: &[u8]) -> IntegrationResult<()> {
@@ -2784,6 +2928,14 @@ impl PersistentStorage {
     
     /// Get transactions for an address (paginated, most recent first)
     pub async fn get_transactions_by_address(&self, address: &str, page: usize, per_page: usize) -> IntegrationResult<Vec<qnet_state::Transaction>> {
+        Ok(self.address_transactions_with_height(address, page, per_page)?.into_iter().map(|(_, tx)| tx).collect())
+    }
+
+    /// `get_transactions_by_address` with the height each index row names (`addr_{address}_{height:016x}_{hash}`;
+    /// None for a row whose key does not parse). Rows of one height come in descending hash order.
+    pub fn address_transactions_with_height(&self, address: &str, page: usize, per_page: usize)
+        -> IntegrationResult<Vec<(Option<u64>, qnet_state::Transaction)>>
+    {
         let tx_by_addr_cf = self.db.cf_handle("tx_by_address")
             .ok_or_else(|| IntegrationError::StorageError("tx_by_address column family not found".to_string()))?;
         let tx_cf = self.db.cf_handle("transactions")
@@ -2838,11 +2990,12 @@ impl PersistentStorage {
                 };
                 
                 if let Ok(tx) = bincode::deserialize::<qnet_state::Transaction>(&decompressed) {
-                    transactions.push(tx);
+                    transactions.push((super::Storage::addr_index_height(&key), tx));
                     if transactions.len() >= per_page {
                         break;
                     }
                 }
+
             }
         }
         
@@ -3053,69 +3206,6 @@ impl PersistentStorage {
         }
         
         Ok(count)
-    }
-    
-    /// Get recent transactions globally (paginated, newest first)
-    /// Uses tx_by_address CF which stores addr_{address}_{timestamp}_{tx_hash}
-    /// By iterating in reverse, we get newest transactions first
-    pub async fn get_recent_transactions(&self, page: usize, per_page: usize) -> IntegrationResult<(Vec<qnet_state::Transaction>, usize)> {
-        let tx_by_addr_cf = self.db.cf_handle("tx_by_address")
-            .ok_or_else(|| IntegrationError::StorageError("tx_by_address column family not found".to_string()))?;
-        let tx_cf = self.db.cf_handle("transactions")
-            .ok_or_else(|| IntegrationError::StorageError("transactions column family not found".to_string()))?;
-        
-        // Iterate in reverse to get newest transactions first
-        let iter = self.db.iterator_cf(&tx_by_addr_cf, rocksdb::IteratorMode::End);
-        
-        let mut transactions = Vec::new();
-        let mut seen_hashes = std::collections::HashSet::new();
-        let skip_count = page.saturating_sub(1) * per_page;
-        let mut skipped = 0;
-        let mut total_count = 0;
-        
-        for item in iter {
-            let (key, value) = item?;
-            let key_str = std::str::from_utf8(&key).unwrap_or("");
-            
-            // Only process addr_* keys
-            if !key_str.starts_with("addr_") {
-                continue;
-            }
-            
-            let tx_hash = std::str::from_utf8(&value).unwrap_or("");
-            
-            // Skip duplicates (same TX can appear twice - from and to)
-            if seen_hashes.contains(tx_hash) {
-                continue;
-            }
-            seen_hashes.insert(tx_hash.to_string());
-            total_count += 1;
-            
-            // Pagination: skip previous pages
-            if skipped < skip_count {
-                skipped += 1;
-                continue;
-            }
-            
-            // Already have enough for this page
-            if transactions.len() >= per_page {
-                continue; // Keep counting total but don't load more
-            }
-            
-            // Load transaction
-            let tx_key = format!("tx_{}", tx_hash);
-            if let Some(tx_data) = self.db.get_cf(&tx_cf, tx_key.as_bytes())? {
-                // Decompress if needed
-                let decompressed = zstd::decode_all(tx_data.as_slice())
-                    .unwrap_or_else(|_| tx_data.to_vec());
-                
-                if let Ok(tx) = bincode::deserialize::<qnet_state::Transaction>(&decompressed) {
-                    transactions.push(tx);
-                }
-            }
-        }
-        
-        Ok((transactions, total_count))
     }
     
     /// Count total transactions in the blockchain

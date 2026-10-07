@@ -810,7 +810,7 @@ impl SimplifiedP2P {
             return Err("No peers available for macroblock sync".to_string());
         }
 
-        // v2.96: Get LIVE genesis nodes from failover cache (updated every 20s)
+        // Live genesis nodes from the probe cache: answers at once, silent peers are probed off this worker.
         let working_genesis_ips = Self::filter_working_genesis_nodes_static(get_genesis_bootstrap_ips());
 
         // Peer-pick: trust = QC, not peer-reported height (P3). The server serves finalized

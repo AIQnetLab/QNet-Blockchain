@@ -1,4 +1,5 @@
 import HomeClient from './HomeClient';
+import InAppGuard from '@/components/InAppGuard';
 import { headHub } from '@/server/head-hub';
 
 // Home statistics come from the process head snapshot (no per-request queries).
@@ -27,5 +28,10 @@ export default async function HomePage() {
   } catch (error) {
     console.error(`[ERR][WEB] home_ssr_failed err=${error instanceof Error ? error.message : String(error)}`);
   }
-  return <HomeClient initialStats={initialStats} />;
+  // Not part of the QNet app's view (the tokenomics describe activation and its cost): there it goes to the explorer.
+  return (
+    <InAppGuard>
+      <HomeClient initialStats={initialStats} />
+    </InAppGuard>
+  );
 }

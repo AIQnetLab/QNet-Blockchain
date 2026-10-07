@@ -1,0 +1,22 @@
+diff --git a/node_modules/@react-native-async-storage/async-storage/ios/RNCAsyncStorage.mm b/node_modules/@react-native-async-storage/async-storage/ios/RNCAsyncStorage.mm
+index fa3bb04..465a2a6 100644
+--- a/node_modules/@react-native-async-storage/async-storage/ios/RNCAsyncStorage.mm
++++ b/node_modules/@react-native-async-storage/async-storage/ios/RNCAsyncStorage.mm
+@@ -633,10 +633,15 @@ RCT_EXPORT_MODULE()
+         return nil;
+     }
+     [value writeToFile:filePath atomically:YES encoding:NSUTF8StringEncoding error:&error];
+-    [RCTGetCache() setObject:value forKey:key cost:value.length];
+     if (error) {
++        // QNet patch: the atomic write left the old file in place, so the next read must reach it, not a cached
++        // value that was never stored (a caller checks what a failed write left behind).
++        [RCTGetCache() removeObjectForKey:key];
+         errorOut = RCTMakeError(@"Failed to write value.", error, @{@"key": key});
+-    } else if (_manifest[key] != (id)kCFNull) {
++        return errorOut;
++    }
++    [RCTGetCache() setObject:value forKey:key cost:value.length];
++    if (_manifest[key] != (id)kCFNull) {
+         *changedManifest = YES;
+         _manifest[key] = (id)kCFNull;
+     }

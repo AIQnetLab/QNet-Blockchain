@@ -5,10 +5,20 @@
 	<!-- Push Notifications: required for FCM silent pushes to wake the app in background/killed state -->
 	<key>aps-environment</key>
 	<string>production</string>
-	<!-- Keychain Sharing: allows react-native-keychain to use the default keychain group -->
+	<!-- Keychain groups (MVA-R2-05). The first entry is where every item written without an explicit group goes,
+	     so it is the app's own identifier (TEAMID.com.qnetmobile), which no other app has. The second is the group
+	     older builds wrote to, named after the bundle id com.qnet.mobile: kept only while WalletManager moves each
+	     item out of it (migrateKeychainGroup at launch, the vault secret at the next unlock); a later release
+	     removes it. -->
 	<key>keychain-access-groups</key>
 	<array>
+		<string>$(AppIdentifierPrefix)com.qnetmobile</string>
 		<string>$(AppIdentifierPrefix)com.qnet.mobile</string>
+	</array>
+	<!-- QNet Link: Universal Links for https://link.aiqnet.io/l only (link.aiqnet.io/.well-known/apple-app-site-association) -->
+	<key>com.apple.developer.associated-domains</key>
+	<array>
+		<string>applinks:link.aiqnet.io</string>
 	</array>
 </dict>
 </plist>

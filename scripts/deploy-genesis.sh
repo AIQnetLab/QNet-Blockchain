@@ -13,9 +13,15 @@
 #
 #   ./deploy-genesis.sh                                  # all five, in order
 #   ./deploy-genesis.sh 001 003                          # only these
-#   QNET_ROLLBACK_TO_LAST_SEALED=1 ./deploy-genesis.sh   # recover to the last sealed macroblock
-#   QNET_ROLLBACK_TO_HEIGHT=627483 ./deploy-genesis.sh   # or to an exact height
+#   QNET_ROLLBACK_TO_LAST_SEALED=1 ./deploy-genesis.sh   # recover to each node's certified floor
+#   QNET_ROLLBACK_TO_HEIGHT=627483 ./deploy-genesis.sh   # or to an exact height, refused below that floor
 #   QNET_RECOVERY_HALTED=1 ./deploy-genesis.sh           # chain stopped: M3/M4 not measurable
+#   QNET_SET_ENV=QNET_ARCHIVE=1 ./deploy-genesis.sh 002  # set or replace env entries on these nodes
+#   SKIP_GATE_CHECK=1 ./deploy-genesis.sh                # image without a build stamp: gates checked by hand
+#
+# A gate added or moved in the build must sit GATE_MARGIN blocks above the tip when the roll starts (the
+# check below). Its height is set at push time: ./gate-height.sh prints the first epoch boundary at least
+# 604,800 blocks above the fleet tip. Host checks before a roll: docs/operators/genesis-host-checks.md.
 set -uo pipefail
 
 IMAGE="ghcr.io/aiqnetlab/qnet-production:latest"
@@ -30,6 +36,12 @@ REENTRY_TIMEOUT="${REENTRY_TIMEOUT:-600}"
 # n-f over the committee, so it changes with committee size (6 members => 5, 5 => 4) and a hardcoded
 # number would either hang the gate on a healthy node or accept a seal that is short of quorum.
 QUORUM="${QUORUM:-}"
+# KEY=VALUE[,KEY=VALUE] added to the recreated containers, replacing an entry with the same key. No spaces
+# or quotes: the list travels as one ssh argument.
+SET_ENV="${QNET_SET_ENV:-}"
+if [ -n "$SET_ENV" ] && ! [[ "$SET_ENV" =~ ^[A-Z][A-Z0-9_]*=[A-Za-z0-9_./:-]*(,[A-Z][A-Z0-9_]*=[A-Za-z0-9_./:-]*)*$ ]]; then
+  echo "[ERR] QNET_SET_ENV must be KEY=VALUE[,KEY=VALUE] with no spaces"; exit 1
+fi
 
 declare -A NODE_IP=(
   [001]=154.38.160.39 [002]=62.171.157.44 [003]=161.97.86.81
@@ -46,7 +58,7 @@ container_of() { echo "${NODE_CONTAINER[$1]:-qnet-genesis-$1}"; }
 rsh()  { ssh -i "$SSH_KEY" -p "$2" -o StrictHostKeyChecking=no -o ConnectTimeout=15 "root@$1" "$3"; }
 # The recreate runs from a script fed on stdin, not from a quoted argument: nesting docker templates,
 # grep patterns and shell quoting inside an ssh argument is how the first version of this broke.
-rsh_script() { ssh -i "$SSH_KEY" -p "$2" -o StrictHostKeyChecking=no -o ConnectTimeout=15 "root@$1" "bash -s -- $3 $4 $5"; }
+rsh_script() { ssh -i "$SSH_KEY" -p "$2" -o StrictHostKeyChecking=no -o ConnectTimeout=15 "root@$1" "bash -s -- $3 $4 $5 $6"; }
 
 # Measure the healthy signer count once, from the first reachable node, unless it was given.
 #
@@ -75,6 +87,131 @@ if [ "$QUORUM" -lt 2 ]; then
 fi
 echo "=== signer count for a healthy seal: $QUORUM (measured) ==="
 
+# ── Gate check, before any node is touched. A consensus rule ships dormant behind an activation height
+# (core/qnet-state/src/feature_gates.rs), and "a mixed fleet cannot fork before the gate" holds only if
+# the roll finishes BEFORE that height. Rolled after it, upgraded nodes enforce the rule while the rest
+# do not, and a node that later replays a block the old binaries applied above the gate computes other
+# state. So every gate the new build adds or moves, compared with the build each node runs now, must sit
+# at least GATE_MARGIN blocks above the fleet tip. Two epochs at one block a second: more than twice the
+# worst case of the timeouts above over six nodes, with time left to finish a roll that stopped half
+# way. The heights come from the source of the commits the build stamps name, so both commits must be in
+# the local repository. SKIP_GATE_CHECK=1 is for an image without a stamp, or a recovery roll whose
+# heights were checked by hand; never a fallback.
+GATE_MARGIN="${GATE_MARGIN:-28800}"
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+case "$GATE_MARGIN" in ''|*[!0-9]*) echo "[ERR] GATE_MARGIN must be a block count"; exit 1;; esac
+
+image_build() {
+  rsh "$1" "$2" "docker image inspect --format '{{range .Config.Env}}{{println .}}{{end}}' $IMAGE" 2>/dev/null \
+    | tr -d '\r' | sed -n 's/^QNET_BUILD_ID=//p'
+}
+
+# `gate height` for every ACTIVATIONS entry of the node source at commit $1, each height resolved through
+# the constants it names (the gas-metering one lives in transaction.rs). `?` = a height it cannot read.
+gate_table() {
+  local f
+  # A commit id only: an empty one would make `git show :path` read the index instead.
+  [[ "$1" =~ ^[0-9a-f]{7,40}$ ]] || return 1
+  for f in transaction.rs feature_gates.rs; do
+    git -C "$REPO" cat-file -e "$1:core/qnet-state/src/$f" 2>/dev/null || return 1
+  done
+  { git -C "$REPO" show "$1:core/qnet-state/src/transaction.rs"; echo '@@FEATURE_GATES@@'
+    git -C "$REPO" show "$1:core/qnet-state/src/feature_gates.rs"; } | awk '
+    function res(e, n) {
+      gsub(/^[ \t]+|[ \t]+$/, "", e)
+      if (e ~ /^[0-9][0-9_]*(u64)?$/) { sub(/u64$/, "", e); gsub(/_/, "", e); return e }
+      if (n < 8 && (e in d)) return res(d[e], n + 1)
+      return "?"
+    }
+    { sub(/\r$/, "") }
+    /^@@FEATURE_GATES@@$/ { fg = 1; next }
+    /^ *(pub )?const [A-Z0-9_]+: u64 = [^;]+;/ {
+      l = $0; sub(/^ *(pub )?const /, "", l); n = l; sub(/:.*/, "", n)
+      e = l; sub(/^[^=]*= */, "", e); sub(/;.*/, "", e); d[n] = e; next
+    }
+    /^ *(pub )?const fn [a-z0-9_]+\(\) -> u64 \{ *crate::transaction::[A-Z0-9_]+ *\}/ {
+      l = $0; sub(/^ *(pub )?const fn /, "", l); n = l; sub(/\(.*/, "", n)
+      e = l; sub(/.*crate::transaction::/, "", e); sub(/[^A-Z0-9_].*/, "", e); d[n "()"] = e; next
+    }
+    fg && /^const ACTIVATIONS/ { act = 1; next }
+    act && /^\];/ { act = 0; next }
+    act && /^ *\(id::[A-Z0-9_]+,/ {
+      l = $0; sub(/^ *\(id::/, "", l); g = l; sub(/,.*/, "", g)
+      e = l; sub(/^[^,]*, */, "", e); sub(/\)[ \t]*,?[ \t]*(\/\/.*)?$/, "", e); ids[++k] = g; ex[g] = e
+    }
+    END { for (i = 1; i <= k; i++) print ids[i], res(ex[ids[i]], 0) }'
+}
+
+# The image is pulled on the first target to read its stamp; a pull touches no running container.
+first="${TARGETS[0]}"; fip="${NODE_IP[$first]:-}"
+if [ -z "$fip" ]; then echo "[ERR] unknown node id: $first"; exit 1; fi
+if ! rsh "$fip" "$(port_of "$first")" "docker pull -q $IMAGE >/dev/null"; then
+  echo "[ERR] pull failed on $first — nothing touched"; exit 1
+fi
+NEW_BUILD=$(image_build "$fip" "$(port_of "$first")")
+echo "=== image to roll: build=${NEW_BUILD:-<unstamped>} ==="
+
+if [ -n "${SKIP_GATE_CHECK:-}" ]; then
+  echo "=== gate check SKIPPED (SKIP_GATE_CHECK set): every added or moved activation height must be"
+  echo "    checked by hand to sit above the tip by more than the whole roll ==="
+else
+  tip=0; declare -A LIVE=()
+  for n in $(printf '%s\n' "${!NODE_IP[@]}" | sort); do
+    a=$(rsh "${NODE_IP[$n]}" "$(port_of "$n")" "curl -s -m 8 http://localhost:8001/healthz" 2>/dev/null | tr -d '\r')
+    nh=$(echo "$a" | sed -n 's/.*h=\([0-9]*\).*/\1/p'); nb=$(echo "$a" | sed -n 's/.*build=\([^ ]*\).*/\1/p')
+    if [ -z "$nh" ]; then echo "  [WARN] $n did not answer /healthz: the build it runs is not compared"; continue; fi
+    if [ -z "$nb" ]; then
+      echo "[ERR] $n reports no build stamp, so the gates it runs are unknown — check by hand, then SKIP_GATE_CHECK=1"; exit 1
+    fi
+    [ "$nh" -gt "$tip" ] && tip=$nh
+    LIVE[$nb]="${LIVE[$nb]:+${LIVE[$nb]} }$n"
+  done
+  if [ ${#LIVE[@]} -eq 0 ]; then echo "[ERR] no node answered /healthz — the tip is unknown, nothing touched"; exit 1; fi
+  if ! new_tab=$(gate_table "$NEW_BUILD"); then
+    echo "[ERR] the image's build=${NEW_BUILD:-<unstamped>} is not a commit in the local repository — git fetch and"
+    echo "      rerun; an unstamped image needs its gates checked by hand, then SKIP_GATE_CHECK=1"; exit 1
+  fi
+  declare -A NEWG=()
+  while read -r g v; do [ -n "$g" ] && NEWG[$g]=$v; done <<< "$new_tab"
+  refused=""
+  for b in "${!LIVE[@]}"; do
+    if ! old_tab=$(gate_table "$b"); then
+      echo "[ERR] build=$b (nodes ${LIVE[$b]}) is not a commit in the local repository — git fetch and rerun;"
+      echo "      an unstamped node needs its gates checked by hand, then SKIP_GATE_CHECK=1"; exit 1
+    fi
+    unset OLDG; declare -A OLDG=()
+    while read -r g v; do [ -n "$g" ] && OLDG[$g]=$v; done <<< "$old_tab"
+    for g in "${!NEWG[@]}"; do
+      nv=${NEWG[$g]}; ov=${OLDG[$g]:-}
+      if [ "$nv" = "?" ]; then echo "  [ERR] gate $g: height not readable from the source"; refused=1; continue; fi
+      [ "$ov" = "$nv" ] && continue
+      # A gate a node may already have crossed never moves: blocks between its old and new height would
+      # replay under the other rule, and a node syncing them would accept what the fleet refused.
+      if [ -n "$ov" ] && [ "$ov" != "?" ] && [ "$ov" -le $((tip + GATE_MARGIN)) ]; then
+        echo "  [ERR] gate $g: $ov -> $nv, but $ov is not $GATE_MARGIN blocks above the tip $tip: gate already crossed,"
+        echo "        its height is frozen (nodes ${LIVE[$b]} run ${b:0:7})"
+        refused=1; continue
+      fi
+      if [ "$nv" -gt $((tip + GATE_MARGIN)) ]; then
+        echo "  gate $g: ${ov:-new} -> $nv, $((nv - tip)) blocks above the tip (nodes ${LIVE[$b]} run ${b:0:7})"
+      else
+        echo "  [ERR] gate $g: ${ov:-new} -> $nv, not $GATE_MARGIN blocks above the tip $tip (nodes ${LIVE[$b]} run ${b:0:7})"
+        refused=1
+      fi
+    done
+    for g in "${!OLDG[@]}"; do
+      if [ -n "${NEWG[$g]:-}" ] || [ "${OLDG[$g]}" = "0" ]; then continue; fi
+      echo "  [ERR] gate $g (${OLDG[$g]} in ${b:0:7}) is gone from the new build, so its rule is active from genesis"
+      refused=1
+    done
+  done
+  if [ -n "$refused" ]; then
+    echo "[ERR] roll refused, nothing touched: move each gate above to a later epoch boundary (./gate-height.sh"
+    echo "      prints one), rebuild, rerun"; exit 1
+  fi
+  echo "=== gate check: tip $tip, margin $GATE_MARGIN, every added or moved gate is ahead ==="
+fi
+
 for id in "${TARGETS[@]}"; do
   ip="${NODE_IP[$id]:-}"
   if [ -z "$ip" ]; then echo "[ERR] unknown node id: $id"; exit 1; fi
@@ -86,10 +223,17 @@ for id in "${TARGETS[@]}"; do
   if ! rsh "$ip" "$port" "docker pull -q $IMAGE >/dev/null && docker tag $IMAGE $LOCAL_TAG"; then
     echo "  [ERR] pull failed — node left untouched, roll stopped"; exit 1
   fi
+  # Every node gets the build the roll started with: a push during the roll would otherwise put a second
+  # build, whose gates nobody checked, on part of the fleet.
+  got=$(image_build "$ip" "$port")
+  if [ "$got" != "$NEW_BUILD" ]; then
+    echo "  [ERR] pulled build=${got:-<unstamped>}, the roll started with build=${NEW_BUILD:-<unstamped>} — node left untouched, roll stopped"
+    exit 1
+  fi
 
-  if ! rsh_script "$ip" "$port" "$cont" "$LOCAL_TAG" "${QNET_ROLLBACK_TO_LAST_SEALED:-}${QNET_ROLLBACK_TO_HEIGHT:+H$QNET_ROLLBACK_TO_HEIGHT}" <<'INNER'
+  if ! rsh_script "$ip" "$port" "$cont" "$LOCAL_TAG" "${SET_ENV:--}" "${QNET_ROLLBACK_TO_LAST_SEALED:-}${QNET_ROLLBACK_TO_HEIGHT:+H$QNET_ROLLBACK_TO_HEIGHT}" <<'INNER'
 set -e
-N="$1"; TAG="$2"; RECOVER="${3:-}"
+N="$1"; TAG="$2"; SETENV="${3:--}"; RECOVER="${4:-}"
 docker inspect "$N" >/dev/null 2>&1 || { echo "no such container: $N"; exit 1; }
 
 # Carry the container's env MINUS two kinds of entry that must not survive a roll:
@@ -98,10 +242,17 @@ docker inspect "$N" >/dev/null 2>&1 || { echo "no such container: $N"; exit 1; }
 #                    the new binary, so /healthz reports the build we just replaced — the stamp lies
 #                    exactly where it is needed, and a roll cannot be told from a no-op.
 ENVS=""
+SETS=(); SET_KEYS=" "
+if [ "$SETENV" != "-" ]; then
+  IFS=',' read -ra SETS <<< "$SETENV"
+  for kv in "${SETS[@]}"; do SET_KEYS="$SET_KEYS${kv%%=*} "; done
+fi
 while IFS= read -r e; do
   case "$e" in ''|QNET_ROLLBACK_*|QNET_RECOVERY_HALTED*|QNET_BUILD_ID=*) continue;; esac
+  case "$SET_KEYS" in *" ${e%%=*} "*) continue;; esac
   ENVS="$ENVS -e $(printf '%q' "$e")"
 done < <(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$N")
+for kv in "${SETS[@]}"; do ENVS="$ENVS -e $(printf '%q' "$kv")"; done
 
 case "$RECOVER" in
   H*) ENVS="$ENVS -e QNET_ROLLBACK_TO_HEIGHT=${RECOVER#H}" ;;
@@ -115,8 +266,27 @@ PORTS=$(docker inspect --format '{{range $p, $c := .HostConfig.PortBindings}}{{r
 REST=$(docker inspect --format '{{.HostConfig.RestartPolicy.Name}}' "$N")
 LOGS=$(docker inspect --format '{{range $k, $v := .HostConfig.LogConfig.Config}}--log-opt {{$k}}={{$v}} {{end}}' "$N")
 
-docker stop "$N" >/dev/null && docker rm "$N" >/dev/null
-eval docker run -d --name "$N" --restart="${REST:-always}" $LOGS $ENVS $PORTS $BINDS "$TAG" >/dev/null
+# Keep what the old container saw. `docker rm` takes its log with it, and an incident is then only as
+# reconstructable as the window that survived the roll — twice now the hours that mattered were gone.
+# The old container is renamed aside, the new one starts as before (same stop/run gap), and the archive
+# is written afterwards in the background. Its restart policy is cleared first: a daemon restart would
+# otherwise bring a second node up on the same data directory.
+OLD="${N}-pre-$(date -u +%Y%m%dT%H%M%SZ)"
+LOGDIR=/root/qnet-logs
+docker stop "$N" >/dev/null
+docker rename "$N" "$OLD"
+docker update --restart=no "$OLD" >/dev/null 2>&1 || true
+if ! eval docker run -d --name "$N" --restart="${REST:-always}" $LOGS $ENVS $PORTS $BINDS "$TAG" >/dev/null; then
+  docker rm -f "$N" >/dev/null 2>&1 || true
+  docker rename "$OLD" "$N"
+  docker update --restart="${REST:-always}" "$N" >/dev/null 2>&1 || true
+  docker start "$N" >/dev/null 2>&1 || true
+  echo "run failed — the previous container is back up"
+  exit 1
+fi
+mkdir -p "$LOGDIR"
+# The last two days of it: the rotation allows 10 GB per container, and an incident is read in hours.
+setsid nohup nice -n 19 sh -c "docker logs --since 48h --timestamps '$OLD' 2>&1 | gzip -1 > '$LOGDIR/$OLD.log.gz'; docker rm '$OLD' >/dev/null 2>&1; ls -1t '$LOGDIR/$N'-pre-*.log.gz 2>/dev/null | tail -n +6 | xargs -r rm -f" >/dev/null 2>&1 &
 INNER
   then
     echo "  [ERR] recreate failed on $id — roll stopped, fix this node before continuing"; exit 1

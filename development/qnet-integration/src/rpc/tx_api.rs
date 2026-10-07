@@ -28,7 +28,10 @@ pub(super) async fn handle_transaction_submit(
             "details": e
         })));
     }
-    
+    if let Err(r) = check_recipient(&blockchain, &tx_request.to).await {
+        return Ok(warp::reply::json(&r.to_json(&tx_request.to)));
+    }
+
     // =========================================================================
     // CRITICAL SECURITY: Ed25519 Signature Verification (NIST FIPS 186-5)
     // Without this, ANYONE could send transactions from ANY address!
@@ -61,22 +64,7 @@ pub(super) async fn handle_transaction_submit(
     }
 
     // Create the transaction (pure Dilithium — no Ed25519 signature/public_key).
-    let tx = qnet_state::Transaction::new(
-        tx_request.from.clone(),
-        Some(tx_request.to.clone()),
-        tx_request.amount,
-        tx_request.nonce,
-        tx_request.gas_price,
-        tx_request.gas_limit,
-        chrono::Utc::now().timestamp() as u64,
-        None, // no Ed25519 signature on QNet
-        qnet_state::TransactionType::Transfer {
-            from: tx_request.from.clone(),
-            to: tx_request.to.clone(),
-            amount: tx_request.amount,
-        },
-        None,
-    )
+    let tx = transfer_tx(&tx_request, chrono::Utc::now().timestamp() as u64)
     // FIX-5: hex(raw detached sig) / hex(raw pk) -> bytes; bad hex -> None -> verify rejects.
     // An ELIDED pk stays None here and on into the mempool — it is never re-added to the wire.
     .with_quantum_signature(hex::decode(&dil_sig).ok(), dil_pk.as_deref().and_then(|p| hex::decode(p).ok()));
@@ -122,11 +110,12 @@ pub(super) async fn handle_transaction_submit(
     // This ensures client receives the SAME hash as stored in blockchain
     match bincode::serialize(&tx) {
         Ok(_tx_bytes) => {
-            let tx_hash = tx.calculate_hash();
+            let signed_id = crate::node::BlockchainNode::signed_id(&tx);
             
-            // Add to mempool using public method
+            // Add to mempool using public method. The answer names the hash that will land: this TX's, or
+            // the one a copy of this very signed transfer is already pending under here.
             match blockchain.add_transaction_to_mempool(tx).await {
-                Ok(_) => {
+                Ok(tx_hash) => {
                     println!("[INFO][TX] submitted tx={} from={} to={} amount={}", 
                              qnet_state::char_prefix(&tx_hash, 16),
                              qnet_state::char_prefix(&tx_request.from, 16),
@@ -135,6 +124,7 @@ pub(super) async fn handle_transaction_submit(
                     let response = json!({
                         "success": true,
                         "tx_hash": tx_hash,
+                        "signed_id": signed_id,
                         "message": "Transaction submitted successfully"
                     });
                     Ok(warp::reply::json(&response))
@@ -167,6 +157,157 @@ pub(super) async fn handle_transaction_submit(
         }
     }
 }
+
+/// Why a door refuses a transfer's recipient (SH7 step 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RecipientRefusal {
+    /// The recipient account is a contract.
+    Contract,
+    /// This node could not read the recipient's row.
+    Unreadable,
+}
+
+impl RecipientRefusal {
+    pub(super) fn code(self) -> &'static str {
+        match self {
+            RecipientRefusal::Contract => "recipient_is_contract",
+            RecipientRefusal::Unreadable => "recipient_unreadable",
+        }
+    }
+
+    pub(super) fn details(self, to: &str) -> String {
+        match self {
+            RecipientRefusal::Contract => format!(
+                "{to} is a contract account: a contract holds no key and cannot send QNC or a built-in token, so value sent to it can never move again"),
+            RecipientRefusal::Unreadable => format!("this node could not read the account {to}; ask again or ask another node"),
+        }
+    }
+
+    pub(super) fn to_json(self, to: &str) -> Value {
+        json!({
+            "success": false,
+            "error": match self {
+                RecipientRefusal::Contract => "Recipient is a contract account",
+                RecipientRefusal::Unreadable => "Recipient account could not be read",
+            },
+            "code": self.code(),
+            "details": self.details(to),
+            "recipient": to,
+        })
+    }
+
+    pub(super) fn to_rpc_error(self, to: &str) -> RpcError {
+        RpcError { code: -32602, message: format!("{}: {}", self.code(), self.details(to)), data: None }
+    }
+}
+
+/// SH7 step 1, at the doors only: QNC or a QRC-20 token sent to a contract account can never move again (a
+/// contract holds no key, no host function sends QNC, a WebAssembly contract cannot call a built-in token),
+/// so every RPC door that builds a transfer refuses one whose recipient account is a contract. A row this
+/// node cannot read is refused too (ask again), never guessed. Not a block rule: a block holding such a
+/// transfer applies as before.
+pub(super) fn recipient_verdict(read: Result<Option<qnet_state::AccountBasic>, ()>) -> Result<(), RecipientRefusal> {
+    match read {
+        Ok(Some(a)) if a.is_contract => Err(RecipientRefusal::Contract),
+        Ok(_) => Ok(()),
+        Err(()) => Err(RecipientRefusal::Unreadable),
+    }
+}
+
+pub(super) async fn check_recipient(blockchain: &BlockchainNode, to: &str) -> Result<(), RecipientRefusal> {
+    recipient_verdict(blockchain.try_get_account_basic(to).await)
+}
+
+/// The holder a QRC-20 call credits: `transfer` args[0], `transferFrom` args[1]. None for any other method,
+/// for an argument that is not a string (apply refuses that call itself) and for the burn address, which
+/// apply never credits.
+pub(super) fn qrc20_credited<'a>(method: &str, args: &'a Value) -> Option<&'a str> {
+    let i = match method {
+        "transfer" => 0,
+        "transferFrom" | "transfer_from" => 1,
+        _ => return None,
+    };
+    args.get(i).and_then(|v| v.as_str()).filter(|to| *to != qnet_state::transaction::CANONICAL_BURN_ADDR)
+}
+
+/// The unsigned transfer the submit handler builds. The recipient and amount fill both the header the
+/// signature covers and the payload apply pays, from the same request fields (tx_target_bound).
+pub(super) fn transfer_tx(tx_request: &TransactionRequest, timestamp: u64) -> qnet_state::Transaction {
+    qnet_state::Transaction::new(
+        tx_request.from.clone(),
+        Some(tx_request.to.clone()),
+        tx_request.amount,
+        tx_request.nonce,
+        tx_request.gas_price,
+        tx_request.gas_limit,
+        timestamp,
+        None, // no Ed25519 signature on QNet
+        qnet_state::TransactionType::Transfer {
+            from: tx_request.from.clone(),
+            to: tx_request.to.clone(),
+            amount: tx_request.amount,
+        },
+        None,
+    )
+}
+
+/// `GET /api/v1/transaction/by-nonce/{from}/{nonce}` (O15): the value TX a wallet signed at this nonce, pending
+/// or confirmed, by the hash its copy carries here and by `signed_id`, the same for every copy. A value TX's
+/// timestamp is in its hash but outside its signature, so the copy that lands may carry another hash than the
+/// one a submit returned. Confirmed TXs are looked up in the sender's recent history this node keeps.
+pub(super) async fn handle_transaction_by_nonce(
+    from: String,
+    nonce: u64,
+    remote_addr: Option<std::net::SocketAddr>,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "read_only") {
+        return Ok(rate_limit_response);
+    }
+    if from.is_empty() || from.len() > 128 {
+        return Ok(warp::reply::json(&json!({ "success": false, "error": "invalid_from" })));
+    }
+    let mempool = blockchain.get_mempool();
+    if let Some(hash) = mempool.pending_value_hash(&from, nonce) {
+        let signed_id = mempool.pooled_transaction(&hash).and_then(|tx| crate::node::BlockchainNode::signed_id(&tx));
+        return Ok(warp::reply::json(&json!({
+            "success": true, "status": "pending", "from": from, "nonce": nonce, "hash": hash, "signed_id": signed_id,
+        })));
+    }
+    if let Some(tx) = confirmed_value_tx_by_nonce(&blockchain.get_storage(), &from, nonce) {
+        return Ok(warp::reply::json(&json!({
+            "success": true, "status": "confirmed", "from": from, "nonce": nonce, "hash": tx.hash,
+            "signed_id": crate::node::BlockchainNode::signed_id(&tx),
+        })));
+    }
+    Ok(warp::reply::json(&json!({ "success": false, "status": "not_found", "from": from, "nonce": nonce })))
+}
+
+/// The confirmed value TX `from` signed at `nonce`, from the sender's recent history this node keeps (the last
+/// 500 index rows, most recent first). A sender's nonces rise with the height that includes them, but the rows
+/// of one height come in hash order: a value TX numbered lower than `nonce` settles "not here" only once the
+/// scan has left its height, since the one asked for may sit in the same block under a lower hash.
+pub(super) fn confirmed_value_tx_by_nonce(storage: &crate::storage::Storage, from: &str, nonce: u64) -> Option<qnet_state::Transaction> {
+    const PAGE: usize = 100;
+    const PAGES: usize = 5;
+    // The height of the newest lower-numbered value TX seen; rows below it cannot hold `nonce`.
+    let mut floor: Option<u64> = None;
+    for page in 0..PAGES {
+        let rows = storage.address_transactions_with_height(from, page, PAGE).unwrap_or_default();
+        for (height, tx) in &rows {
+            if let (Some(f), Some(h)) = (floor, height) {
+                if h < &f { return None; }
+            }
+            if tx.from != from || !tx.is_value_class() { continue; }
+            if tx.nonce == nonce { return Some(tx.clone()); }
+            // A row whose height does not parse settles nothing: the scan goes on, to its bound.
+            if tx.nonce < nonce && floor.is_none() { floor = *height; }
+        }
+        if rows.len() < PAGE { break; }
+    }
+    None
+}
+
 
 pub(super) async fn handle_transaction_get(
     tx_hash: String,
@@ -544,6 +685,7 @@ pub(super) async fn handle_bundle_status(
 pub(super) async fn handle_bundle_cancel(
     bundle_id: String,
     remote_addr: Option<std::net::SocketAddr>,
+    from_page: bool,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
     // v10.0: Rate limit bundle cancellations
@@ -563,8 +705,9 @@ pub(super) async fn handle_bundle_cancel(
         }
     };
 
-    // v10.0 SECURITY: Verify cancel request comes from the original submitter IP
-    let caller_ip = remote_addr.map(|a| a.ip().to_string()).unwrap_or_default();
+    // v10.0 SECURITY: Verify cancel request comes from the original submitter IP. A page's request is nobody in
+    // particular (gate_client): any site would otherwise cancel its visitors' bundles from their own address.
+    let caller_ip = gate_client(remote_addr, from_page).map(|a| a.ip().to_string()).unwrap_or_default();
     if let Some(submitter_ip) = BUNDLE_SUBMITTER_IPS.get(&bundle_id) {
         if submitter_ip.value() != &caller_ip && !is_internal_ip(&caller_ip) {
             println!("[WARN][RPC] bundle_cancel_rejected bundle={} caller_ip={} submitter_ip={}",
@@ -591,6 +734,33 @@ pub(super) async fn handle_bundle_cancel(
         });
         Ok(warp::reply::json(&error_response))
     }
+}
+
+/// The unsigned batch the handler builds. The envelope is (BATCH_TRANSFERS_TO, exact sum) and an empty
+/// memo travels as none: the signed digest writes nothing for either, so the client's signature still
+/// verifies and the two forms cannot give one batch two hashes (tx_target_bound).
+pub(super) fn batch_transfer_tx(
+    request: &BatchTransferRequest, from: &str, total_amount: u64, timestamp: u64,
+) -> qnet_state::Transaction {
+    qnet_state::Transaction::new(
+        from.to_string(),
+        Some(qnet_state::transaction::BATCH_TRANSFERS_TO.to_string()),
+        total_amount,
+        request.nonce,
+        request.gas_price,
+        request.gas_limit,
+        timestamp,
+        None, // no Ed25519 on QNet
+        qnet_state::TransactionType::BatchTransfers {
+            transfers: request.transfers.iter().map(|t| BatchTransferData {
+                to_address: t.to_address.clone(),
+                amount: t.amount,
+                memo: t.memo.clone().filter(|m| !m.is_empty()),
+            }).collect(),
+            batch_id: request.batch_id.clone()
+        },
+        None,
+    )
 }
 
 pub(super) async fn handle_batch_transfer(
@@ -636,8 +806,23 @@ pub(super) async fn handle_batch_transfer(
             })));
         }
     }
+    let mut checked = std::collections::HashSet::new();
+    for (i, transfer) in request.transfers.iter().enumerate() {
+        if !checked.insert(transfer.to_address.as_str()) { continue; }
+        if let Err(r) = check_recipient(&blockchain, &transfer.to_address).await {
+            let mut body = r.to_json(&transfer.to_address);
+            body["transfer"] = json!(i + 1);
+            return Ok(warp::reply::json(&body));
+        }
+    }
 
-    let total_amount: u64 = request.transfers.iter().map(|t| t.amount).fold(0u64, |acc, a| acc.saturating_add(a));
+    // Checked, not saturated: the envelope amount must equal the transfers' exact sum (tx_target_bound).
+    let total_amount: u64 = match request.transfers.iter().try_fold(0u64, |acc, t| acc.checked_add(t.amount)) {
+        Some(t) => t,
+        None => return Ok(warp::reply::json(&json!({
+            "success": false, "error": "sum of transfer amounts overflows"
+        }))),
+    };
 
     // Pure-PQ: one ML-DSA-65 signature over the batch canonical preimage
     // (from/total/count/batch_id/transfers-digest/nonce/gas). Elided pk is
@@ -658,31 +843,15 @@ pub(super) async fn handle_batch_transfer(
         }
     }
 
-    let batch_tx = qnet_state::Transaction::new(
-        from_address.clone(),
-        Some("batch_transfers".to_string()),
-        total_amount,
-        request.nonce,
-        request.gas_price,
-        request.gas_limit,
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
-        None, // no Ed25519 on QNet
-        qnet_state::TransactionType::BatchTransfers {
-            transfers: request.transfers.iter().map(|t| BatchTransferData {
-                to_address: t.to_address.clone(),
-                amount: t.amount,
-                memo: t.memo.clone(),
-            }).collect(),
-            batch_id: request.batch_id.clone()
-        },
-        None,
-    )
+    let batch_tx = batch_transfer_tx(&request, &from_address, total_amount,
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs())
     .with_quantum_signature(
         hex::decode(&request.dilithium_signature).ok(),
         dil_pk.as_deref().and_then(|p| hex::decode(p).ok()),
     );
     
     // Submit batch transaction to blockchain
+    let signed_id = crate::node::BlockchainNode::signed_id(&batch_tx);
     match blockchain.submit_transaction(batch_tx).await {
         Ok(tx_hash) => {
             if crate::node::is_debug() {
@@ -694,6 +863,7 @@ pub(super) async fn handle_batch_transfer(
                 "success": true,
                 "batch_id": request.batch_id,
                 "transaction_hash": tx_hash,
+                "signed_id": signed_id,
                 "transfer_count": request.transfers.len(),
                 "total_amount": total_amount,
                 "from_address": from_address,
@@ -719,6 +889,7 @@ pub(super) async fn handle_batch_transfer(
 
 pub(super) async fn handle_node_discovery(
     remote_addr: Option<std::net::SocketAddr>,
+    from_page: bool,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
     // FIX M13: Rate limit node discovery
@@ -727,10 +898,12 @@ pub(super) async fn handle_node_discovery(
     }
     let peers = blockchain.get_connected_peers().await.unwrap_or_default();
     
-    // FIX R20-M2: Mask peer IPs for external callers to prevent network topology mapping
-    let caller_ip = remote_addr
+    // FIX R20-M2: Mask peer IPs for external callers to prevent network topology mapping. A page is an
+    // external caller whatever address its visitor sends from (gate_client).
+    let caller_ip = gate_client(remote_addr, from_page)
         .map(|a| a.ip().to_string())
         .unwrap_or_else(|| "unknown".to_string());
+
     let caller_is_internal = is_internal_ip(&caller_ip);
 
     let peer_nodes: Vec<Value> = peers.iter().map(|peer| {
@@ -1048,4 +1221,110 @@ pub(super) async fn handle_network_ping(
         "timestamp": now,
         "quantum_secure": true
     })))
+}
+
+#[cfg(test)]
+mod recipient_tests {
+    use super::*;
+
+    fn basic(is_contract: bool, contract_type: Option<&str>) -> qnet_state::AccountBasic {
+        qnet_state::AccountBasic {
+            address: "r".to_string(), balance: 0, nonce: 0, has_dilithium_pk: false,
+            is_contract, contract_type: contract_type.map(str::to_string),
+        }
+    }
+
+    /// SH7 step 1: a contract recipient is refused at the door, a missing or wallet row passes, and a row
+    /// this node cannot read is refused (ask again), never guessed.
+    #[test]
+    fn a_contract_recipient_is_refused_at_the_door() {
+        assert_eq!(recipient_verdict(Ok(Some(basic(true, Some("qrc20"))))), Err(RecipientRefusal::Contract));
+        assert_eq!(recipient_verdict(Ok(Some(basic(true, Some("wasm"))))), Err(RecipientRefusal::Contract));
+        assert_eq!(recipient_verdict(Ok(Some(basic(false, None)))), Ok(()));
+        assert_eq!(recipient_verdict(Ok(None)), Ok(()), "a new account");
+        assert_eq!(recipient_verdict(Err(())), Err(RecipientRefusal::Unreadable));
+        let body = RecipientRefusal::Contract.to_json("eon_contract");
+        assert_eq!((body["success"].clone(), body["code"].clone(), body["recipient"].clone()),
+                   (json!(false), json!("recipient_is_contract"), json!("eon_contract")));
+        assert!(body["details"].as_str().unwrap().contains("contract account"));
+        let rpc = RecipientRefusal::Unreadable.to_rpc_error("eon_x");
+        assert_eq!(rpc.code, -32602);
+        assert!(rpc.message.starts_with("recipient_unreadable: "));
+    }
+
+    /// The holder a QRC-20 call credits: transfer's first argument, transferFrom's second; nothing for
+    /// other methods, a non-string argument or the burn address (apply never credits it).
+    #[test]
+    fn the_qrc20_credited_holder_is_the_one_apply_credits() {
+        let burn = qnet_state::transaction::CANONICAL_BURN_ADDR;
+        assert_eq!(qrc20_credited("transfer", &json!(["bob", "5"])), Some("bob"));
+        assert_eq!(qrc20_credited("transferFrom", &json!(["alice", "bob", 5])), Some("bob"));
+        assert_eq!(qrc20_credited("transfer_from", &json!(["alice", "bob", 5])), Some("bob"));
+        assert_eq!(qrc20_credited("transfer", &json!([burn, "5"])), None);
+        assert_eq!(qrc20_credited("transfer", &json!([7, "5"])), None);
+        assert_eq!(qrc20_credited("transfer", &json!("00ff")), None);
+        for other in ["approve", "mint", "burn", "balanceOf"] {
+            assert_eq!(qrc20_credited(other, &json!(["bob", "5"])), None, "{other}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod by_nonce_tests {
+    use super::*;
+
+    fn transfer(from: &str, to: &str, nonce: u64, ts: u64) -> qnet_state::Transaction {
+        qnet_state::Transaction::new(
+            from.to_string(), Some(to.to_string()), 1_000, nonce, 10, 10_000, ts, None,
+            qnet_state::TransactionType::Transfer { from: from.to_string(), to: to.to_string(), amount: 1_000 },
+            None,
+        )
+    }
+
+    /// Store the block at `height` on `parent`; its hash, the next block's parent.
+    fn save(storage: &crate::storage::Storage, height: u64, parent: [u8; 32], txs: Vec<qnet_state::Transaction>) -> [u8; 32] {
+        let mut b = qnet_state::MicroBlock::new(height, 1000 + height, parent, txs, "genesis_node_001".to_string());
+        b.merkle_root = crate::node::BlockchainNode::calculate_merkle_root(&b.transactions);
+        storage.save_microblock(height, &bincode::serialize(&b).unwrap()).unwrap();
+        b.hash()
+    }
+
+    /// Two transfers of `from` in one block at `n` and `n + 1`, whose index rows come in the given order (rows of
+    /// one height are read in descending hash order).
+    fn pair(from: &str, n: u64, lower_first: bool) -> (qnet_state::Transaction, qnet_state::Transaction) {
+        for ts in 1_800_000_000u64.. {
+            let (a, b) = (transfer(from, "eon_dst", n, ts), transfer(from, "eon_dst", n + 1, ts));
+            if (a.hash > b.hash) == lower_first { return (a, b); }
+        }
+        unreachable!()
+    }
+
+    /// M8: a sender's two transfers in one block are found whichever hash order their rows come in, and a
+    /// nonce never included is settled once the scan leaves the height of a lower one.
+    #[test]
+    fn a_confirmed_transfer_is_found_whatever_the_hash_order_in_its_block() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = crate::storage::Storage::new(dir.path().to_str().unwrap()).unwrap();
+        let (one, _) = pair("eon_s", 1, true);
+        let (two, three) = pair("eon_s", 2, true);
+        let (u2, u3) = pair("eon_u", 2, false);
+        let g = save(&storage, 0, [0u8; 32], vec![transfer("eon_g", "eon_h", 0, 1)]);
+
+        let b1 = save(&storage, 1, g, vec![one.clone()]);
+        // A transfer to the sender rides in the same block: not its own, skipped.
+        save(&storage, 2, b1, vec![two.clone(), three.clone(), u2.clone(), u3.clone(), transfer("eon_other", "eon_s", 9, 7)]);
+
+        let rows = storage.address_transactions_with_height("eon_s", 0, 100).unwrap();
+        let order: Vec<(Option<u64>, u64)> = rows.iter().filter(|(_, t)| t.from == "eon_s").map(|(h, t)| (*h, t.nonce)).collect();
+        assert_eq!(order, vec![(Some(2), 2), (Some(2), 3), (Some(1), 1)], "the lower nonce's row comes first in its block");
+        let found = |from: &str, n: u64| confirmed_value_tx_by_nonce(&storage, from, n).map(|t| t.hash);
+        assert_eq!(found("eon_s", 3), Some(three.hash.clone()), "behind a lower nonce of the same block");
+        assert_eq!(found("eon_s", 2), Some(two.hash.clone()));
+        assert_eq!(found("eon_s", 1), Some(one.hash.clone()));
+        assert_eq!(found("eon_u", 2), Some(u2.hash.clone()));
+        assert_eq!(found("eon_u", 3), Some(u3.hash.clone()));
+        assert_eq!(found("eon_s", 4), None, "never included");
+        assert_eq!(found("eon_s", 9), None, "an incoming transfer is not the sender's");
+        assert_eq!(found("eon_nobody", 1), None);
+    }
 }

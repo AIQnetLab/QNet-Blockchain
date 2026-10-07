@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { searchQrc20DeploysByText } from '../../../../lib/db';
+import { fetchNode } from '@/lib/node-api';
 
 // ============================================================================
 // Unified search resolver: one box → tx | block | address | token.
@@ -10,15 +11,6 @@ import { searchQrc20DeploysByText } from '../../../../lib/db';
 // explorer's own PG contract-deploy index (same source as /api/tokens). No new
 // node endpoint — the node already exposes /api/v1/token/{c} per-contract.
 
-const NODE_API = process.env.QNET_API_URL || 'https://162.244.25.114:8001';
-const API_KEY = process.env.QNET_API_KEY || '';
-
-function nodeHeaders(): Record<string, string> {
-  const h: Record<string, string> = { 'Content-Type': 'application/json' };
-  if (API_KEY) h['X-API-Key'] = API_KEY;
-  return h;
-}
-
 interface SearchResult { type: 'tx' | 'block' | 'address' | 'token'; href: string; }
 
 // Is `q` a QRC-20 contract on-chain? 200 + {token:{...}} ⇒ token, else not.
@@ -26,11 +18,8 @@ async function isToken(q: string): Promise<boolean> {
   try {
     // encodeURIComponent so a crafted `q` (containing '/', '?', '#', whitespace) cannot inject extra
     // path/query segments into this server→node request (SSRF/path-manipulation on the internal API).
-    const res = await fetch(`${NODE_API}/api/v1/token/${encodeURIComponent(q)}`, {
-      headers: nodeHeaders(),
-      signal: AbortSignal.timeout(6000),
-    });
-    if (!res.ok) return false;
+    const res = await fetchNode(`/api/v1/token/${encodeURIComponent(q)}`, { timeoutMs: 6000 });
+    if (!res || !res.ok) return false;
     const body = await res.json().catch(() => null);
     return !!(body?.success && body.token);
   } catch {

@@ -142,6 +142,16 @@ if [ "$(id -u)" = "0" ]; then\n\
   echo "Fixing data directory permissions..."\n\
   chown -R qnet:qnet "$DATA_DIR"\n\
   chmod -R 755 "$DATA_DIR"\n\
+  \n\
+  # A seed file mounted from the host keeps its host owner and mode (0600, root), which the qnet user cannot\n\
+  # read: the node gets a copy it owns, in memory (/dev/shm), and the variable names the copy.\n\
+  for SEED_VAR in QNET_WALLET_SEED_FILE QNET_GENESIS_SEED_FILE; do\n\
+    SEED_SRC="$(printenv "$SEED_VAR" || true)"\n\
+    if [ -n "$SEED_SRC" ] && [ -f "$SEED_SRC" ] && ! gosu qnet test -r "$SEED_SRC"; then\n\
+      SEED_COPY="/dev/shm/$SEED_VAR"\n\
+      install -m 0400 -o qnet -g qnet "$SEED_SRC" "$SEED_COPY" && export "$SEED_VAR=$SEED_COPY"\n\
+    fi\n\
+  done\n\
   echo "Starting QNet node as qnet user..."\n\
   exec gosu qnet /usr/local/bin/qnet-node "$@"\n\
 else\n\

@@ -111,6 +111,65 @@ pub const SLOT_GAP_REANCHOR_GATE_HEIGHT: u64 = 1_339_200;
 /// every node must run the binary before this height. Window 104.
 pub const CONTRACT_GAS_SIGNED_GATE_HEIGHT: u64 = 1_497_600;
 
+/// From this height a microblock carries its producer signature as the raw ML-DSA-65 bytes; below it as
+/// the UTF-8 string `dilithium3_v4:<hex>` (twice the size on disk and on the wire). Exactly one form is
+/// valid at each height, and from the gate a signature has a single byte encoding (the hex below it
+/// decodes in either case). The pre-v4 compact forms are accepted only below it. A consensus rule: every
+/// node must run the binary before this height. Epoch 112 (first set at 1,584,000, which the fleet crossed
+/// on the previous binary, so every block up to 1,612,799 carries the hex form).
+pub const MICROBLOCK_SIG_RAW_GATE_HEIGHT: u64 = 1_612_800;
+
+/// From this height the fields apply, the state or history act on must be covered by a signature bound to
+/// the account they act on (Transaction::check_signed_target_bound lists each rule): a transfer pays the
+/// payload it signed, a call runs on the contract its calldata names, a batch envelope and a claim envelope
+/// equal their signed totals, no tx carries an unsigned public_key or the legacy signature, a transfer,
+/// batch, heartbeat or proof carries no data and a registration, reactivation or bitmap only the note its
+/// body rebuilds (a light registration no vrf_pk, every burn attestor entry counting), a lifecycle tx or
+/// proof no `to` or amount and a proof no envelope signature, a system-built envelope is its builder's (a
+/// proof from system_slashing with nonce and gas zero, its sides in canonical order and side a's timestamp;
+/// a registration from its wallet and a bitmap from its signer, gas_limit zero), a deploy carries its
+/// canonical payload and derived address, a
+/// NodeActivation is refused, a non-genesis registration uses the wallet-signed form (a super natively
+/// bound) and none claims the genesis proof, every tx hash names its body, a deploy records its block
+/// height, and the parallel transfer path binds a first-use key only on success. Below it none of this
+/// applies, so blocks under the gate replay unchanged. One gate for all of them: the same gap, one binary,
+/// one flip. A consensus rule: every node must run the binary before this height. Epoch 254: the first
+/// boundary at least 5 days (432,000 blocks) above the tip read on 07.10 (3,213,731). scripts/deploy-genesis.sh refuses to roll a
+/// build whose added or moved gate is not GATE_MARGIN blocks above the fleet tip: before the first roll of
+/// this build, a late roll moves this to a later boundary; once any node has crossed it, the height never
+/// changes (the script refuses to move a gate whose old height is within GATE_MARGIN of the tip).
+pub const TX_TARGET_BOUND_GATE_HEIGHT: u64 = 3_657_600;
+
+/// From this height one wallet backs one node of either type (`wallet_one_node`), and a light registration's
+/// owner bind may take its form without a time. Three rules, one gate:
+///   - a non-genesis NodeRegistration is refused when its wallet already has a chain-confirmed node (its genesis,
+///     super or light id) registered below the height being judged, other than the node it names;
+///   - a block carrying two non-genesis registrations of one wallet under different node ids is refused (the
+///     producer keeps the first);
+///   - a Light registration's burn_owner_sig may verify over `burn_owner_bind_message_v2` when the v1 form fails:
+///     it names the node, the wallet, the proof, the wallet key and the burn but no time, so the burner signs it
+///     once when the burn is made and the registration can be finished later with a fresh wallet consent.
+/// Below it none of this applies, so blocks under the gate replay unchanged, and a wallet registered with both
+/// types before it keeps both. A consensus rule: every node must run the binary before this height. Provisional:
+/// equal to TX_TARGET_BOUND_GATE_HEIGHT until scripts/gate-height.sh sets it at push time; once any node has
+/// crossed it, the height never changes (scripts/deploy-genesis.sh refuses to move a crossed gate).
+pub const WALLET_ONE_NODE_GATE_HEIGHT: u64 = 3_657_600;
+
+/// From this height a failover round belongs to the tenure it was certified for (`failover_tenure_bound`). Three rules,
+/// one gate:
+///   - a timeout vote and its certificate name the window AND the 30-block tenure of the slot they fail over
+///     (`QNET_TIMEOUT_V3`), so a certificate rotates that tenure alone; the window-only form is refused for any window
+///     holding no slot below the gate, and a slot is elected on the highest round certified for its own tenure;
+///   - fork choice compares two blocks only where their branches part, never rolls back toward a branch whose parent
+///     contradicts this node's finalized or committed checkpoint content, and ranks the parting blocks by certified
+///     content, then certified round, then the equal-round tie-break;
+///   - a producer may sign (height, round) whenever it never signed that height at that round or above.
+/// Evaluated at the FIRST slot of a tenure, so no tenure runs on two rules: on an epoch boundary the first tenure under it
+/// starts one block above it. A consensus rule: every node must run the binary before this height. Provisional: equal to
+/// TX_TARGET_BOUND_GATE_HEIGHT until scripts/gate-height.sh sets it at push time; once any node has crossed it, the height
+/// never changes (scripts/deploy-genesis.sh refuses to move a crossed gate).
+pub const FAILOVER_TENURE_BOUND_GATE_HEIGHT: u64 = 3_657_600;
+
 /// Kept as a const fn so the single source of the number stays in `transaction.rs`, where the charging
 /// code documents it, while the registry entry above stays a plain literal expression.
 const fn qnet_state_gas_metering_height() -> u64 { crate::transaction::GAS_METERING_ACTIVATION_HEIGHT }
@@ -133,6 +192,10 @@ pub mod id {
     pub const GAS_METERING: &str = "gas_metering";
     pub const SLOT_GAP_REANCHOR: &str = "slot_gap_reanchor";
     pub const CONTRACT_GAS_SIGNED: &str = "contract_gas_signed";
+    pub const MICROBLOCK_SIG_RAW: &str = "microblock_sig_raw";
+    pub const TX_TARGET_BOUND: &str = "tx_target_bound";
+    pub const WALLET_ONE_NODE: &str = "wallet_one_node";
+    pub const FAILOVER_TENURE_BOUND: &str = "failover_tenure_bound";
 }
 
 /// (feature id, activation height). Heights are hardcoded in the binary, so every node agrees
@@ -156,6 +219,10 @@ const ACTIVATIONS: &[(&str, u64)] = &[
     (id::GAS_METERING, GAS_METERING_GATE_HEIGHT),
     (id::SLOT_GAP_REANCHOR, SLOT_GAP_REANCHOR_GATE_HEIGHT),
     (id::CONTRACT_GAS_SIGNED, CONTRACT_GAS_SIGNED_GATE_HEIGHT),
+    (id::MICROBLOCK_SIG_RAW, MICROBLOCK_SIG_RAW_GATE_HEIGHT),
+    (id::TX_TARGET_BOUND, TX_TARGET_BOUND_GATE_HEIGHT),
+    (id::WALLET_ONE_NODE, WALLET_ONE_NODE_GATE_HEIGHT),
+    (id::FAILOVER_TENURE_BOUND, FAILOVER_TENURE_BOUND_GATE_HEIGHT),
 ];
 
 /// Core gate: active iff `feature` is unlisted (genesis-active default) or `height` has reached
@@ -221,6 +288,7 @@ mod tests {
             BURN_ATTESTATION_REQUIRED, REGISTRY_ROOT_REQUIRED, LIGHT_REG_EPOCH_ROSTER,
             LOGS_ROOT_REQUIRED, REWARD_EPOCH_ROOT_REQUIRED, LIGHT_KEY_COMMITMENT,
             LIGHT_SHARD_BACKUP_OWNERS, GAS_METERING, SLOT_GAP_REANCHOR, CONTRACT_GAS_SIGNED,
+            MICROBLOCK_SIG_RAW, TX_TARGET_BOUND, WALLET_ONE_NODE, FAILOVER_TENURE_BOUND,
         ];
         for name in SCHEDULED {
             assert!(super::ACTIVATIONS.iter().any(|(f, _)| f == name),
@@ -258,6 +326,51 @@ mod tests {
         assert!(super::is_active(super::id::LIGHT_SHARD_BACKUP_OWNERS, o));
     }
 
+    /// The signed-target rule starts on an epoch boundary above every gate the chain has already
+    /// crossed, so every block on disk replays with the rule off.
+    #[test]
+    fn tx_target_bound_is_dormant_below_its_gate() {
+        let h = super::TX_TARGET_BOUND_GATE_HEIGHT;
+        assert_eq!(h % 14_400, 0, "an epoch boundary");
+        assert!(h > super::MICROBLOCK_SIG_RAW_GATE_HEIGHT, "above the last gate already crossed");
+        assert!(!super::is_active(super::id::TX_TARGET_BOUND, h - 1), "old blocks replay unchecked");
+        assert!(super::is_active(super::id::TX_TARGET_BOUND, h), "checked from the gate");
+        assert!(super::is_active(super::id::TX_TARGET_BOUND, u64::MAX));
+    }
+
+    /// The one-node rule starts on an epoch boundary above every gate the chain has already crossed, so every
+    /// block on disk (a wallet registered with both types among them) replays with the rule off.
+    #[test]
+    fn wallet_one_node_is_dormant_below_its_gate() {
+        let h = super::WALLET_ONE_NODE_GATE_HEIGHT;
+        assert_eq!(h % 14_400, 0, "an epoch boundary");
+        assert!(h > super::MICROBLOCK_SIG_RAW_GATE_HEIGHT, "above the last gate already crossed");
+        assert!(!super::is_active(super::id::WALLET_ONE_NODE, h - 1), "old blocks replay unchecked");
+        assert!(super::is_active(super::id::WALLET_ONE_NODE, h), "checked from the gate");
+        assert!(super::is_active(super::id::WALLET_ONE_NODE, u64::MAX));
+    }
+
+    /// The tenure-bound failover rule starts on an epoch boundary that is also a window boundary, above every gate
+    /// already crossed: the tenure ending at the gate stays on the old rules and the first gated tenure starts one block
+    /// above it, so every block on disk replays with the rule off.
+    #[test]
+    fn failover_tenure_bound_is_dormant_below_its_gate() {
+        let h = super::FAILOVER_TENURE_BOUND_GATE_HEIGHT;
+        assert_eq!(h % 14_400, 0, "an epoch boundary");
+        assert_eq!(h % 90, 0, "a window boundary, so one window holds the single old-rule slot");
+        assert!(h > super::MICROBLOCK_SIG_RAW_GATE_HEIGHT, "above the last gate already crossed");
+        assert!(!super::is_active(super::id::FAILOVER_TENURE_BOUND, h - 1), "old rules below");
+        assert!(super::is_active(super::id::FAILOVER_TENURE_BOUND, h), "new rules from the gate");
+        assert!(super::is_active(super::id::FAILOVER_TENURE_BOUND, u64::MAX));
+    }
+
+    /// NodeActivation, the other way a wallet gained a super identity, is refused from tx_target_bound. Were
+    /// the one-node rule earlier, a wallet with a light node could still become a super node through it.
+    #[test]
+    fn wallet_one_node_starts_no_earlier_than_tx_target_bound() {
+        assert!(super::WALLET_ONE_NODE_GATE_HEIGHT >= super::TX_TARGET_BOUND_GATE_HEIGHT);
+    }
+
     #[test]
     fn gas_metering_keeps_its_activation_height() {
         let h = super::GAS_METERING_GATE_HEIGHT;
@@ -279,5 +392,17 @@ mod tests {
         assert!(super::is_active(super::id::LIGHT_REG_EPOCH_ROSTER, u64::MAX), "active at the highest height");
         // recency_span_epoch is NOT gated (genesis rule = deployed behavior) ⇒ unlisted ⇒ always active.
         assert!(super::is_active(super::id::RECENCY_SPAN_EPOCH, 0), "recency is genesis-active (matches deployed HEAD)");
+    }
+
+    /// SIGBIND-R1-03: the roll script accepted any moved gate whose new height was ahead of the tip, so a gate
+    /// the fleet had crossed could be moved up and every block between replayed under the other rule. A gate
+    /// whose old height is within the margin of the tip is refused as frozen, before the ahead-of-tip check.
+    #[test]
+    fn the_roll_script_freezes_a_crossed_gate() {
+        let script = include_str!("../../../scripts/deploy-genesis.sh");
+        let frozen = script.find(r#"[ "$ov" -le $((tip + GATE_MARGIN)) ]"#).expect("the frozen-gate test");
+        let refusal = script.find("gate already crossed").expect("its refusal");
+        let ahead = script.find(r#"if [ "$nv" -gt $((tip + GATE_MARGIN)) ]; then"#).expect("the ahead-of-tip check");
+        assert!(frozen < refusal && refusal < ahead, "the frozen check runs first");
     }
 }

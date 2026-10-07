@@ -178,6 +178,22 @@ pub const GENESIS_NODE_IPS: &[(&str, &str)] = &[
     ("162.244.25.114", "005"),   // Genesis Node #5 - Europe
 ];
 
+/// The public HTTPS name of each genesis node, by bootstrap id. A TLS terminator on the host forwards
+/// 443 to the node's RPC port and passes the caller's address on in `X-Forwarded-For`.
+pub const GENESIS_NODE_HTTPS_NAMES: &[(&str, &str)] = &[
+    ("001", "node1.aiqnet.io"),
+    ("002", "node2.aiqnet.io"),
+    ("003", "node3.aiqnet.io"),
+    ("004", "node4.aiqnet.io"),
+    ("005", "node5.aiqnet.io"),
+];
+
+/// The HTTPS name of the genesis node at `ip`, if it has one.
+pub fn genesis_https_name_for_ip(ip: &str) -> Option<&'static str> {
+    let id = get_genesis_id_by_ip(ip)?;
+    GENESIS_NODE_HTTPS_NAMES.iter().find(|(i, _)| *i == id).map(|(_, name)| *name)
+}
+
 /// Legacy genesis node IDs (single-digit form, kept for backward compatibility
 /// with code paths that still emit the unpadded representation).
 pub const LEGACY_GENESIS_NODES: &[&str] = &[
@@ -676,6 +692,20 @@ mod tests_v17_security {
     #[test]
     fn genesis_node_count_matches_ip_table() {
         assert_eq!(genesis_node_count(), GENESIS_NODE_IPS.len());
+    }
+
+    /// Every genesis has one HTTPS name, and each name belongs to one genesis.
+    #[test]
+    fn every_genesis_has_one_https_name() {
+        use std::collections::BTreeSet;
+        assert_eq!(GENESIS_NODE_HTTPS_NAMES.len(), GENESIS_NODE_IPS.len());
+        let names: BTreeSet<_> = GENESIS_NODE_IPS.iter()
+            .map(|(ip, _)| genesis_https_name_for_ip(ip).expect("name"))
+            .collect();
+        assert_eq!(names.len(), GENESIS_NODE_IPS.len());
+        assert_eq!(genesis_https_name_for_ip("154.38.160.39"), Some("node1.aiqnet.io"));
+        assert_eq!(genesis_https_name_for_ip("162.244.25.114"), Some("node5.aiqnet.io"));
+        assert_eq!(genesis_https_name_for_ip("62.171.138.98"), None);
     }
 
     // v27 HOLE1: genesis identity binary-pinned — lock that the embedded

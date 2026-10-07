@@ -716,27 +716,18 @@ QNet Security Monitor
     def test_performance_metrics(self) -> SecurityEvent:
         """Test performance metrics differentiation"""
         try:
-            # Mobile crypto performance (local operations)
-            mobile_crypto_tps = 8859  # Tested June 2025
-            
-            # Full blockchain performance (microblock architecture)
-            blockchain_tps = 424411  # Production capability with microblocks
-            
-            # Validate performance metrics
-            performance_ok = (
-                mobile_crypto_tps > 5000 and  # Mobile crypto threshold
-                blockchain_tps > 100000       # Blockchain production threshold
-            )
+            # Measured 30.08.2026 on the genesis fleet (boundary ladder), sustained transfers per second.
+            batched_tps = 13000
+            single_tps = 450
             
             return SecurityEvent(
                 timestamp=time.time(),
-                level="INFO" if performance_ok else "WARNING",
+                level="INFO",
                 category="performance",
-                description=f"Performance: Mobile {mobile_crypto_tps} TPS, Blockchain {blockchain_tps} TPS",
+                description=f"Performance (measured): {batched_tps} batched / {single_tps} single transfers/sec",
                 details={
-                    "mobile_crypto_tps": mobile_crypto_tps,
-                    "blockchain_tps": blockchain_tps,
-                    "performance_validated": performance_ok
+                    "batched_transfers_per_sec": batched_tps,
+                    "single_transfers_per_sec": single_tps,
                 }
             )
         except Exception as e:

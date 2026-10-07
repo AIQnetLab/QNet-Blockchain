@@ -1,0 +1,6 @@
+Certificate chains published by Google as test data of its Android key attestation verifier
+(https://github.com/android/keyattestation, directory testdata/, Apache License 2.0). They come from
+real devices, except p256_sha384_intermediate (synthetic) and invalid_tags_not_in_ascending_order
+(edited after signing). The files are unchanged apart from renaming and LF line endings; the
+originals are named <device>/<sdk>/<name>.pem; oem_sdk33_tee_ec.pem is the sdk33/TEE_EC.pem
+chain of a phone from another manufacturer, factory-provisioned.

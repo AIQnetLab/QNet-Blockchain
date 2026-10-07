@@ -1,10 +1,13 @@
 # 1DEV burn contract
 
 The 1DEV burn contract is an Anchor program deployed on Solana, the external chain that hosts the 1DEV
-SPL token. It serves Phase 1 of QNet node activation: an operator burns 1DEV to the Solana incinerator
-address in an ordinary SPL token transaction, and the signature of that transaction — carried inside
-an activation code — is what a QNet node checks before accepting an activation. The program itself
-never moves tokens; it has no CPI into the token program and no instruction debits a balance. The burn
+SPL token. It serves Phase 1 of QNet node activation: 1DEV is burned in an ordinary SPL token
+transaction with the Token program's `Burn` instruction, by the browser extension with the wallet's own
+key or, on a phone or any browser without the extension, by the aiqnet.io node cabinet with its
+one-time payment key, which burns for a light node only (a node also accepts a transfer to the Solana
+incinerator address), and the signature of that transaction — part of
+the key material of the activation code — is what a QNet node checks before accepting an activation.
+The program itself never moves tokens; it has no CPI into the token program and no instruction debits a balance. The burn
 is a separate, prior transaction, and the program records that it happened, counts activations, tracks
 the share of the 1DEV supply burned, and holds the one-way flag that ends Phase 1. Phase 2 replaces
 the burn with a QNC payment on QNet itself; this program stores the Phase 2 amounts as constants but
@@ -123,9 +126,12 @@ Verification lives in `verify_burn_transaction_exists` in
    the request fails or Solana has not indexed the signature yet, each with a ten-second timeout; the attestation path passes a budget of one so an unauthenticated caller
    cannot multiply one request into several upstream round trips.
 2. Rejects the burn when `meta.err` is non-null.
-3. Requires `accountKeys[0]`, the fee payer that signed the Solana transaction, to equal the
-   registering wallet. A mismatch fails verification, so one burn cannot be presented by a second
-   wallet.
+3. Requires `accountKeys[0]`, the fee payer that signed the Solana transaction, to equal the burning
+   Solana address the request names: `burn_wallet` of a light-node registration (the extension's own
+   Solana address, or the cabinet's one-time payment key), the Solana address a Super node's server derives
+   from its wallet's recovery phrase, or `solana_wallet` of a burn attestation request (`node_attestBurn`). A
+   mismatch fails verification. This ties the burn to the key that paid for it, not to the
+   QNet wallet it is for: that link is the owner bind below.
 4. Requires a burn indicator: a parsed `burn` or `burnChecked` instruction among the outer or the
    inner instructions, or the Solana incinerator address among the account keys. A parsed `transfer`
    is not an indicator on its own, so a transfer to any other destination is refused.
@@ -141,6 +147,15 @@ Verification lives in `verify_burn_transaction_exists` in
    increase from zero.
 6. Requires that total to reach the quoted price converted to base units at six decimals. A larger
    burn is accepted, and the actual burned amount in whole 1DEV is what the node reports.
+
+A light-node registration (`POST /api/v1/node-registration/submit`, `check_client_submit` in
+`development/qnet-integration/src/rpc/registration_door.rs`) names the beneficiary through the burning key
+itself. It carries `burn_wallet` and `owner_signature`, the burning key's Ed25519 signature over
+`burn_owner_bind_message(node_id, wallet_address, registration_proof, timestamp, wallet key, burn_tx)`, the
+string block validation rebuilds; a request without them is refused (`burn_wallet_or_owner_sig_missing`), and
+one whose signature does not verify against `burn_wallet` too (`owner_signature_invalid`). The QNet wallet
+must derive from the consenting ML-DSA-65 key or from the burning address (`wallet_not_derived`). This bind,
+not the fee-payer check, is what stops a second wallet from registering with someone else's public burn.
 
 The result is what a committee attestor signs; the quorum of those attestations is what block
 validation re-verifies deterministically, so the Solana read itself stays on the admission side. See

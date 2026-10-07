@@ -1,0 +1,1087 @@
+diff --git a/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebChromeClient.java b/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebChromeClient.java
+index 1b5c4c9..4db176c 100644
+--- a/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebChromeClient.java
++++ b/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebChromeClient.java
+@@ -10,6 +10,8 @@ import android.view.View;
+ import android.view.ViewGroup;
+ import android.webkit.ConsoleMessage;
+ import android.webkit.GeolocationPermissions;
++import android.webkit.JsPromptResult;
++import android.webkit.JsResult;
+ import android.webkit.PermissionRequest;
+ import android.webkit.ValueCallback;
+ import android.webkit.WebChromeClient;
+@@ -139,74 +141,44 @@ public class RNCWebChromeClient extends WebChromeClient implements LifecycleEven
+         UIManagerHelper.getEventDispatcherForReactTag(this.mWebView.getThemedReactContext(), reactTag).dispatchEvent(new TopLoadingProgressEvent(reactTag, event));
+     }
+ 
++    // QNet patch: web pages get no camera, microphone, protected media or location, and no file picker; the
++    // in-app browser never asks Android for those permissions on a page's behalf.
+     @Override
+     public void onPermissionRequest(final PermissionRequest request) {
++        request.deny();
++    }
+ 
+-        grantedPermissions = new ArrayList<>();
+-
+-        ArrayList<String> requestedAndroidPermissions = new ArrayList<>();
+-        for (String requestedResource : request.getResources()) {
+-            String androidPermission = null;
+-
+-            if (requestedResource.equals(PermissionRequest.RESOURCE_AUDIO_CAPTURE)) {
+-                androidPermission = Manifest.permission.RECORD_AUDIO;
+-            } else if (requestedResource.equals(PermissionRequest.RESOURCE_VIDEO_CAPTURE)) {
+-                androidPermission = Manifest.permission.CAMERA;
+-            } else if(requestedResource.equals(PermissionRequest.RESOURCE_PROTECTED_MEDIA_ID)) {
+-                if (mAllowsProtectedMedia) {
+-                  grantedPermissions.add(requestedResource);
+-                } else {
+-                  /**
+-                   * Legacy handling (Kept in case it was working under some conditions (given Android version or something))
+-                   *
+-                   * Try to ask user to grant permission using Activity.requestPermissions
+-                   *
+-                   * Find more details here: https://github.com/react-native-webview/react-native-webview/pull/2732
+-                   */
+-                  androidPermission = PermissionRequest.RESOURCE_PROTECTED_MEDIA_ID;
+-                }            }
+-            // TODO: RESOURCE_MIDI_SYSEX, RESOURCE_PROTECTED_MEDIA_ID.
+-            if (androidPermission != null) {
+-                if (ContextCompat.checkSelfPermission(this.mWebView.getThemedReactContext(), androidPermission) == PackageManager.PERMISSION_GRANTED) {
+-                    grantedPermissions.add(requestedResource);
+-                } else {
+-                    requestedAndroidPermissions.add(androidPermission);
+-                }
+-            }
+-        }
+-
+-        // If all the permissions are already granted, send the response to the WebView synchronously
+-        if (requestedAndroidPermissions.isEmpty()) {
+-            request.grant(grantedPermissions.toArray(new String[0]));
+-            grantedPermissions = null;
+-            return;
+-        }
++    // QNet patch: pages cannot open JavaScript dialogs. A dialog would be drawn by the app over whatever is on screen
++    // (another tab, the lock screen) with words the page chose, a text field included; each is answered at once
++    // instead: alert() returns, confirm() is false, prompt() is null, and a page may always be left.
++    @Override
++    public boolean onJsAlert(WebView view, String url, String message, JsResult result) {
++        result.confirm();
++        return true;
++    }
+ 
+-        // Otherwise, ask to Android System for native permissions asynchronously
++    @Override
++    public boolean onJsConfirm(WebView view, String url, String message, JsResult result) {
++        result.cancel();
++        return true;
++    }
+ 
+-        this.permissionRequest = request;
++    @Override
++    public boolean onJsPrompt(WebView view, String url, String message, String defaultValue, JsPromptResult result) {
++        result.cancel();
++        return true;
++    }
+ 
+-        requestPermissions(requestedAndroidPermissions);
++    @Override
++    public boolean onJsBeforeUnload(WebView view, String url, String message, JsResult result) {
++        result.confirm();
++        return true;
+     }
+ 
+ 
+     @Override
+     public void onGeolocationPermissionsShowPrompt(String origin, GeolocationPermissions.Callback callback) {
+-
+-        if (ContextCompat.checkSelfPermission(this.mWebView.getThemedReactContext(), Manifest.permission.ACCESS_FINE_LOCATION)
+-                != PackageManager.PERMISSION_GRANTED) {
+-
+-            /*
+-             * Keep the trace of callback and origin for the async permission request
+-             */
+-            geolocationPermissionCallback = callback;
+-            geolocationPermissionOrigin = origin;
+-
+-            requestPermissions(Collections.singletonList(Manifest.permission.ACCESS_FINE_LOCATION));
+-
+-        } else {
+-            callback.invoke(origin, true, false);
+-        }
++        callback.invoke(origin, false, false);
+     }
+ 
+     private PermissionAwareActivity getPermissionAwareActivity() {
+@@ -315,10 +287,7 @@ public class RNCWebChromeClient extends WebChromeClient implements LifecycleEven
+ 
+     @Override
+     public boolean onShowFileChooser(WebView webView, ValueCallback<Uri[]> filePathCallback, FileChooserParams fileChooserParams) {
+-        String[] acceptTypes = fileChooserParams.getAcceptTypes();
+-        boolean allowMultiple = fileChooserParams.getMode() == WebChromeClient.FileChooserParams.MODE_OPEN_MULTIPLE;
+-
+-        return this.mWebView.getThemedReactContext().getNativeModule(RNCWebViewModule.class).startPhotoPickerIntent(filePathCallback, acceptTypes, allowMultiple, fileChooserParams.isCaptureEnabled());
++        return false;
+     }
+ 
+     @Override
+diff --git a/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebView.java b/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebView.java
+index 80c6803..67d3a61 100644
+--- a/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebView.java
++++ b/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebView.java
+@@ -9,7 +9,6 @@ import android.view.Menu;
+ import android.view.MenuItem;
+ import android.view.MotionEvent;
+ import android.view.View;
+-import android.webkit.JavascriptInterface;
+ import android.webkit.ValueCallback;
+ import android.webkit.WebChromeClient;
+ import android.webkit.WebView;
+@@ -31,6 +30,7 @@ import com.facebook.react.bridge.ReactApplicationContext;
+ import com.facebook.react.bridge.WritableMap;
+ import com.facebook.react.bridge.WritableNativeArray;
+ import com.facebook.react.bridge.WritableNativeMap;
++import com.facebook.react.common.build.ReactBuildConfig;
+ import com.facebook.react.uimanager.ThemedReactContext;
+ import com.facebook.react.uimanager.UIManagerHelper;
+ import com.facebook.react.uimanager.events.ContentSizeChangeEvent;
+@@ -55,8 +55,6 @@ public class RNCWebView extends WebView implements LifecycleEventListener {
+     String injectedJSBeforeContentLoaded;
+     protected static final String JAVASCRIPT_INTERFACE = "ReactNativeWebView";
+     protected @Nullable
+-    RNCWebViewBridge fallbackBridge;
+-    protected @Nullable
+     WebViewCompat.WebMessageListener bridgeListener = null;
+ 
+     /**
+@@ -247,31 +245,56 @@ public class RNCWebView extends WebView implements LifecycleEventListener {
+         return this.messagingEnabled;
+     }
+ 
++    // QNet patch (origin integrity): messages come only through WebViewCompat.addWebMessageListener, which
++    // reports the sender's origin and whether it is the top frame. A subframe, or an origin that is not https
++    // (debug builds: also plain-http loopback), is dropped here, and the event carries the origin WebView
++    // reported, never anything the page wrote. There is no addJavascriptInterface fallback: that object is
++    // reachable from every frame and says nothing about the sender, so without WEB_MESSAGE_LISTENER the page
++    // simply cannot message the app.
+     protected void createRNCWebViewBridge(RNCWebView webView) {
+-        if (WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)){
+-          if (this.bridgeListener == null) {
+-            this.bridgeListener = new WebViewCompat.WebMessageListener() {
+-              @Override
+-              public void onPostMessage(@NonNull WebView view, @NonNull WebMessageCompat message, @NonNull Uri sourceOrigin, boolean isMainFrame, @NonNull JavaScriptReplyProxy replyProxy) {
+-                RNCWebView.this.onMessage(message.getData(), sourceOrigin.toString());
++        if (!WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)) {
++          FLog.w(TAG, "WEB_MESSAGE_LISTENER is not supported by this WebView: messaging stays off.");
++          return;
++        }
++        if (this.bridgeListener == null) {
++          this.bridgeListener = new WebViewCompat.WebMessageListener() {
++            @Override
++            public void onPostMessage(@NonNull WebView view, @NonNull WebMessageCompat message, @NonNull Uri sourceOrigin, boolean isMainFrame, @NonNull JavaScriptReplyProxy replyProxy) {
++              String data = message.getData();
++              if (!isMainFrame || data == null || !isAllowedMessageOrigin(sourceOrigin)) {
++                return;
+               }
+-            };
+-            WebViewCompat.addWebMessageListener(
+-              webView,
+-              JAVASCRIPT_INTERFACE,
+-              Set.of("*"),
+-              this.bridgeListener
+-            );
+-          }
+-        } else {
+-          if (fallbackBridge == null) {
+-            fallbackBridge = new RNCWebViewBridge(webView);
+-            addJavascriptInterface(fallbackBridge, JAVASCRIPT_INTERFACE);
+-          }
++              RNCWebView.this.onMessage(data, sourceOrigin.toString());
++            }
++          };
++          // Chromium's origin rules have no "every https host" form (a host wildcard must be "*.domain"), so
++          // the object is exposed with "*" and the listener above decides: top frame and an https origin (debug:
++          // plain-http loopback on any port), or the message is dropped.
++          WebViewCompat.addWebMessageListener(
++            webView,
++            JAVASCRIPT_INTERFACE,
++            Set.of("*"),
++            this.bridgeListener
++          );
+         }
+         injectJavascriptObject();
+     }
+ 
++    private static final String TAG = "RNCWebView";
++
++    private static boolean isAllowedMessageOrigin(Uri origin) {
++        String scheme = origin.getScheme();
++        String host = origin.getHost();
++        if (host == null || host.isEmpty() || origin.getUserInfo() != null) {
++            return false;
++        }
++        if ("https".equals(scheme)) {
++            return true;
++        }
++        return ReactBuildConfig.DEBUG && "http".equals(scheme)
++            && ("localhost".equals(host) || "127.0.0.1".equals(host));
++    }
++
+     private void injectJavascriptObject() {
+       if (getSettings().getJavaScriptEnabled()) {
+         String js = "(function(){\n" +
+@@ -324,7 +347,8 @@ public class RNCWebView extends WebView implements LifecycleEventListener {
+       injectJavascriptObject();
+     }
+ 
+-    public void onMessage(String message, String sourceUrl) {
++    // frameOrigin: the sender's origin as WebView reported it (the listener only passes top-frame messages).
++    public void onMessage(String message, String frameOrigin) {
+         ThemedReactContext reactContext = getThemedReactContext();
+         RNCWebView mWebView = this;
+ 
+@@ -336,8 +360,10 @@ public class RNCWebView extends WebView implements LifecycleEventListener {
+                     if (mRNCWebViewClient == null) {
+                         return;
+                     }
+-                    WritableMap data = mRNCWebViewClient.createWebViewEvent(webView, sourceUrl);
++                    WritableMap data = mRNCWebViewClient.createWebViewEvent(webView, frameOrigin);
+                     data.putString("data", message);
++                    data.putString("frameOrigin", frameOrigin);
++                    data.putBoolean("isMainFrame", true);
+ 
+                     if (mMessagingJSModule != null) {
+                         dispatchDirectMessage(data);
+@@ -349,6 +375,8 @@ public class RNCWebView extends WebView implements LifecycleEventListener {
+         } else {
+             WritableMap eventData = Arguments.createMap();
+             eventData.putString("data", message);
++            eventData.putString("frameOrigin", frameOrigin);
++            eventData.putBoolean("isMainFrame", true);
+ 
+             if (mMessagingJSModule != null) {
+                 dispatchDirectMessage(eventData);
+@@ -430,30 +458,6 @@ public class RNCWebView extends WebView implements LifecycleEventListener {
+       return this.getThemedReactContext().getReactApplicationContext();
+   }
+ 
+-  protected class RNCWebViewBridge {
+-        private String TAG = "RNCWebViewBridge";
+-        RNCWebView mWebView;
+-
+-        RNCWebViewBridge(RNCWebView c) {
+-          mWebView = c;
+-        }
+-
+-        /**
+-         * This method is called whenever JavaScript running within the web view calls:
+-         * - window[JAVASCRIPT_INTERFACE].postMessage
+-         */
+-        @JavascriptInterface
+-        public void postMessage(String message) {
+-            if (mWebView.getMessagingEnabled()) {
+-                // Post to main thread because `mWebView.getUrl()` requires to be executed on main.
+-                mWebView.post(() -> mWebView.onMessage(message, mWebView.getUrl()));
+-            } else {
+-                FLog.w(TAG, "ReactNativeWebView.postMessage method was called but messaging is disabled. Pass an onMessage handler to the WebView.");
+-            }
+-        }
+-    }
+-
+-
+     protected static class ProgressChangedFilter {
+         private boolean waitingForCommandLoadUrl = false;
+ 
+diff --git a/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebViewClient.java b/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebViewClient.java
+index 209b855..9112eb7 100644
+--- a/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebViewClient.java
++++ b/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebViewClient.java
+@@ -1,6 +1,7 @@
+ package com.reactnativecommunity.webview;
+ 
+ import android.graphics.Bitmap;
++import android.net.Uri;
+ import android.net.http.SslError;
+ import android.os.Build;
+ import android.os.SystemClock;
+@@ -21,6 +22,7 @@ import com.facebook.react.bridge.Arguments;
+ import com.facebook.react.bridge.ReactContext;
+ import com.facebook.react.bridge.ReadableArray;
+ import com.facebook.react.bridge.WritableMap;
++import com.facebook.react.common.build.ReactBuildConfig;
+ import com.facebook.react.uimanager.ThemedReactContext;
+ import com.facebook.react.uimanager.UIManagerHelper;
+ import com.reactnativecommunity.webview.events.SubResourceErrorEvent;
+@@ -39,6 +41,16 @@ public class RNCWebViewClient extends WebViewClient {
+     protected static final int SHOULD_OVERRIDE_URL_LOADING_TIMEOUT = 250;
+ 
+     protected boolean mLastLoadFailed = false;
++    // QNet patch: the URL of the document on screen, as the last committed navigation left it (doUpdateVisitedHistory).
++    // A main-frame navigation that ends without committing (ERR_ABORTED: a 204 answer, a navigation refused below)
++    // still gets onPageFinished with its own URL; the finish events carry this one instead, so the address bar and
++    // the page's origin never move to a page that is not on screen (MB2-01).
++    protected @Nullable String mCommittedUrl = null;
++    // QNet patch: the last committed URL that was not a wallet-only page (doUpdateVisitedHistory, MB3-01).
++    protected @Nullable String mAllowedCommittedUrl = null;
++    // QNet patch: the URL of the last main-frame load that started (onPageStarted): a commit of that URL is a load, any
++    // other commit is the page's own history change (pushState).
++    protected @Nullable String mStartedUrl = null;
+     protected RNCWebView.ProgressChangedFilter progressChangedFilter = null;
+     protected @Nullable RNCBasicAuthCredential basicAuthCredential = null;
+ 
+@@ -59,13 +71,30 @@ public class RNCWebViewClient extends WebViewClient {
+ 
+             reactWebView.callInjectedJavaScript();
+ 
+-            emitFinishEvent(webView, url);
++            emitFinishEvent(webView, committedUrlOr(url));
+         }
+     }
+ 
+     @Override
+     public void doUpdateVisitedHistory (WebView webView, String url, boolean isReload) {
+       super.doUpdateVisitedHistory(webView, url, isReload);
++      mCommittedUrl = url;
++      // QNet patch: a wallet-only page that committed anyway (its request was answered with the empty 403 of
++      // shouldInterceptRequest) is left at once and never becomes the page on screen, the address shown or a Recent
++      // entry: the committed URL stays the last page that was allowed (MB3-01).
++      Uri committed = url == null ? null : Uri.parse(url);
++      if (committed != null && committed.getHost() != null && isWalletOnlyPage(committed.getHost(), committed.getPath())) {
++        mCommittedUrl = mAllowedCommittedUrl;
++        final boolean back = webView.canGoBack();
++        reportWalletOnly(webView, url, true, url.equals(mStartedUrl), back);
++        webView.post(() -> {
++          webView.stopLoading();
++          if (back) webView.goBack();
++          else webView.loadUrl("about:blank");
++        });
++        return;
++      }
++      mAllowedCommittedUrl = url;
+ 
+       ((RNCWebView) webView).dispatchEvent(
+         webView,
+@@ -78,13 +107,103 @@ public class RNCWebViewClient extends WebViewClient {
+     public void onPageStarted(WebView webView, String url, Bitmap favicon) {
+       super.onPageStarted(webView, url, favicon);
+       mLastLoadFailed = false;
++      mStartedUrl = url;
+ 
+       RNCWebView reactWebView = (RNCWebView) webView;
+       reactWebView.callInjectedJavaScriptBeforeContentLoaded();
+     }
+ 
++    // QNet patch: the scheme policy is decided here, natively, before JS is asked, so it holds even when the JS
++    // thread is too busy to answer in time (the undecided case then allows only what passed here). https only
++    // (debug builds: also plain-http loopback) and about:blank; a subframe may also be about:srcdoc, data: or
++    // blob:. Everything else (intent:, market:, tel:, custom schemes, http:, file:, javascript: ...) is refused
++    // and never handed to another app.
++    protected static boolean isAllowedNavigation(Uri uri, boolean isMainFrame) {
++        if (uri == null) {
++            return false;
++        }
++        String scheme = uri.getScheme() == null ? "" : uri.getScheme().toLowerCase(java.util.Locale.ROOT);
++        String host = uri.getHost();
++        boolean credentials = uri.getUserInfo() != null;
++        switch (scheme) {
++            case "https":
++                return host != null && !host.isEmpty() && !credentials && !isWalletOnlyPage(host, uri.getPath());
++            case "http":
++                return ReactBuildConfig.DEBUG && !credentials && ("localhost".equals(host) || "127.0.0.1".equals(host));
++            case "about":
++                String url = uri.toString();
++                return "about:blank".equals(url) || (!isMainFrame && "about:srcdoc".equals(url));
++            case "data":
++            case "blob":
++                return !isMainFrame;
++            default:
++                return false;
++        }
++    }
++
++    // QNet patch: the aiqnet.io pages the in-app browser never loads, in any frame: the QNet Link host and, on the site's
++    // own names (aiqnet.io, www., explorer.), its node cabinet, /activate, /wallet, /l, its home, /docs, /dao, /testnet,
++    // /qnet-wallet-extension (src/browser/url.js isWalletOnlyPage). Decided here: a busy JS thread lets none by.
++    protected static boolean isWalletOnlyPage(String host, @Nullable String path) {
++        String h = host.toLowerCase(java.util.Locale.ROOT);
++        if (h.endsWith(".")) h = h.substring(0, h.length() - 1);
++        if ("link.aiqnet.io".equals(h)) return true;
++        if (!"aiqnet.io".equals(h) && !"www.aiqnet.io".equals(h) && !"explorer.aiqnet.io".equals(h)) return false;
++        String p = path == null ? "" : path.toLowerCase(java.util.Locale.ROOT).replaceAll("/{2,}", "/"); // decoded; "//" as "/"
++        return p.isEmpty() || "/".equals(p) || p.matches("^/(activate|wallet|node|l|docs|dao|testnet|qnet-wallet-extension)(/.*)?$");
++    }
++
++    // The committed URL for an event about the page on screen; the callback's own URL before anything committed.
++    private String committedUrlOr(String url) {
++        return mCommittedUrl != null ? mCommittedUrl : url;
++    }
++
++    // QNet patch: a main-frame https navigation to a wallet-only page that the native policy refused is told to JS as an
++    // onShouldStartLoadWithRequest event without a lock (nothing waits for the answer, and a refusal loads nothing), so
++    // the app says why and opens the explorer in its place exactly as the JS policy does on iOS (APP-7). `committed`: the
++    // page committed anyway and is being left here (a POST form answered with the empty 403, or the page's own
++    // pushState); `loaded`: that commit was a load, not a history change; `wentBack`: it is left by going back (else to
++    // about:blank). Anything else refused here (an intent:, a custom scheme) is not reported.
++    private void reportWalletOnly(WebView view, String url, boolean committed, boolean loaded, boolean wentBack) {
++        Uri uri = url == null ? null : Uri.parse(url);
++        if (uri == null || uri.getHost() == null || !"https".equalsIgnoreCase(uri.getScheme())
++                || !isWalletOnlyPage(uri.getHost(), uri.getPath())) {
++            return;
++        }
++        WritableMap event = createWebViewEvent(view, url);
++        event.putBoolean("walletOnly", true);
++        event.putBoolean("committed", committed);
++        event.putBoolean("loaded", loaded);
++        event.putBoolean("wentBack", wentBack);
++        int reactTag = RNCWebViewWrapper.getReactTagFromWebView(view);
++        UIManagerHelper.getEventDispatcherForReactTag((ReactContext) view.getContext(), reactTag)
++            .dispatchEvent(new TopShouldStartLoadWithRequestEvent(reactTag, event));
++    }
++
++    // QNet patch: a main-frame navigation JS did not decide while the UI thread waited (a busy JS thread) was refused
++    // above; it goes to JS again as an onShouldStartLoadWithRequest event without a lock, and the library's JS loads it
++    // (its loadUrl command) once the JS policy allows it. A link tapped while the app is busy then opens late, never
++    // silently not at all, and still only once the JS policy let it through (MB2-06). The event names the top frame.
++    private void askJsToLoad(WebView view, String url) {
++        WritableMap event = createWebViewEvent(view, url);
++        int reactTag = RNCWebViewWrapper.getReactTagFromWebView(view);
++        UIManagerHelper.getEventDispatcherForReactTag((ReactContext) view.getContext(), reactTag)
++            .dispatchEvent(new TopShouldStartLoadWithRequestEvent(reactTag, event));
++    }
++
+     @Override
+     public boolean shouldOverrideUrlLoading(WebView view, String url) {
++        if (!isAllowedNavigation(Uri.parse(url), true)) {
++            reportWalletOnly(view, url, false, true, false);
++            return true;
++        }
++        return askJsShouldOverride(view, url, true);
++    }
++
++    // QNet patch: when JS does not answer in time, a main-frame navigation is refused (it may be one the JS policy
++    // would refuse) and asked of JS again without a lock (askJsToLoad); a subframe one is allowed, having passed the
++    // native policy (MB2-06). The event says which frame it is for, so JS judges a subframe as one.
++    private boolean askJsShouldOverride(WebView view, String url, boolean isMainFrame) {
+         final RNCWebView rncWebView = (RNCWebView) view;
+         final boolean isJsDebugging = rncWebView.getReactApplicationContext().getJavaScriptContextHolder().get() == 0;
+ 
+@@ -95,6 +214,7 @@ public class RNCWebViewClient extends WebViewClient {
+ 
+             final WritableMap event = createWebViewEvent(view, url);
+             event.putDouble("lockIdentifier", lockIdentifier);
++            event.putBoolean("isTopFrame", isMainFrame);
+             rncWebView.dispatchDirectShouldStartLoadWithRequest(event);
+ 
+             try {
+@@ -103,9 +223,10 @@ public class RNCWebViewClient extends WebViewClient {
+                     final long startTime = SystemClock.elapsedRealtime();
+                     while (lockObject.get() == RNCWebViewModuleImpl.ShouldOverrideUrlLoadingLock.ShouldOverrideCallbackState.UNDECIDED) {
+                         if (SystemClock.elapsedRealtime() - startTime > SHOULD_OVERRIDE_URL_LOADING_TIMEOUT) {
+-                            FLog.w(TAG, "Did not receive response to shouldOverrideUrlLoading in time, defaulting to allow loading.");
++                            FLog.w(TAG, "Did not receive response to shouldOverrideUrlLoading in time, " + (isMainFrame ? "refusing and asking again." : "allowing the subframe."));
+                             RNCWebViewModuleImpl.shouldOverrideUrlLoadingLock.removeLock(lockIdentifier);
+-                            return false;
++                            if (isMainFrame) askJsToLoad(view, url);
++                            return isMainFrame;
+                         }
+                         lockObject.wait(SHOULD_OVERRIDE_URL_LOADING_TIMEOUT);
+                     }
+@@ -113,7 +234,8 @@ public class RNCWebViewClient extends WebViewClient {
+             } catch (InterruptedException e) {
+                 FLog.e(TAG, "shouldOverrideUrlLoading was interrupted while waiting for result.", e);
+                 RNCWebViewModuleImpl.shouldOverrideUrlLoadingLock.removeLock(lockIdentifier);
+-                return false;
++                if (isMainFrame) askJsToLoad(view, url);
++                return isMainFrame;
+             }
+ 
+             final boolean shouldOverride = lockObject.get() == RNCWebViewModuleImpl.ShouldOverrideUrlLoadingLock.ShouldOverrideCallbackState.SHOULD_OVERRIDE;
+@@ -134,8 +256,28 @@ public class RNCWebViewClient extends WebViewClient {
+ 
+     @Override
+     public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+-        final String url = request.getUrl().toString();
+-        return this.shouldOverrideUrlLoading(view, url);
++        if (!isAllowedNavigation(request.getUrl(), request.isForMainFrame())) {
++            if (request.isForMainFrame()) reportWalletOnly(view, request.getUrl().toString(), false, true, false);
++            return true;
++        }
++        return askJsShouldOverride(view, request.getUrl().toString(), request.isForMainFrame());
++    }
++
++    // QNet patch: Android never calls shouldOverrideUrlLoading for a POST navigation (a form submitted with method
++    // POST), so neither policy above would see one. Every request passes here whatever its method and frame: a
++    // wallet-only page, in any frame and for any resource, and a main-frame document of a scheme the policy refuses
++    // are answered with an empty 403 and never load (MB3-01).
++    @Override
++    public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
++        Uri uri = request.getUrl();
++        String scheme = uri == null || uri.getScheme() == null ? "" : uri.getScheme().toLowerCase(java.util.Locale.ROOT);
++        boolean web = "https".equals(scheme) || "http".equals(scheme);
++        boolean walletOnly = web && uri.getHost() != null && isWalletOnlyPage(uri.getHost(), uri.getPath());
++        if (walletOnly || (request.isForMainFrame() && web && !isAllowedNavigation(uri, true))) {
++            return new WebResourceResponse("text/plain", "utf-8", 403, "Forbidden",
++                new java.util.HashMap<String, String>(), new java.io.ByteArrayInputStream(new byte[0]));
++        }
++        return super.shouldInterceptRequest(view, request);
+     }
+ 
+     @Override
+@@ -237,8 +379,9 @@ public class RNCWebViewClient extends WebViewClient {
+         mLastLoadFailed = true;
+ 
+         // In case of an error JS side expect to get a finish event first, and then get an error event
+-        // Android WebView does it in the opposite way, so we need to simulate that behavior
+-        emitFinishEvent(webView, failingUrl);
++        // Android WebView does it in the opposite way, so we need to simulate that behavior. The finish event names
++        // the page still on screen (QNet patch, MB2-01).
++        emitFinishEvent(webView, committedUrlOr(failingUrl));
+ 
+         WritableMap eventData = createWebViewEvent(webView, failingUrl);
+         eventData.putDouble("code", errorCode);
+diff --git a/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebViewManagerImpl.kt b/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebViewManagerImpl.kt
+index f83033b..18dac88 100644
+--- a/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebViewManagerImpl.kt
++++ b/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebViewManagerImpl.kt
+@@ -91,50 +91,8 @@ class RNCWebViewManagerImpl(private val newArch: Boolean = false) {
+         if (ReactBuildConfig.DEBUG) {
+             WebView.setWebContentsDebuggingEnabled(true)
+         }
+-        webView.setDownloadListener(DownloadListener { url, userAgent, contentDisposition, mimetype, contentLength ->
+-            val module = webView.reactApplicationContext.getNativeModule(RNCWebViewModule::class.java) ?: return@DownloadListener
+-            val request: DownloadManager.Request = try {
+-                DownloadManager.Request(Uri.parse(url))
+-            } catch (e: IllegalArgumentException) {
+-                Log.w(TAG, "Unsupported URI, aborting download", e)
+-                return@DownloadListener
+-            }
+-            var fileName = URLUtil.guessFileName(url, contentDisposition, mimetype)
+-
+-            // Sanitize filename by replacing invalid characters with "_"
+-            fileName = fileName.replace(invalidCharRegex, "_")
+-
+-            val downloadMessage = "Downloading $fileName"
+-
+-            //Attempt to add cookie, if it exists
+-            var urlObj: URL? = null
+-            try {
+-                urlObj = URL(url)
+-                val baseUrl = urlObj.protocol + "://" + urlObj.host
+-                val cookie = CookieManager.getInstance().getCookie(baseUrl)
+-                request.addRequestHeader("Cookie", cookie)
+-            } catch (e: MalformedURLException) {
+-                Log.w(TAG, "Error getting cookie for DownloadManager", e)
+-            }
+-
+-            //Finish setting up request
+-            request.addRequestHeader("User-Agent", userAgent)
+-            request.setTitle(fileName)
+-            request.setDescription(downloadMessage)
+-            request.allowScanningByMediaScanner()
+-            request.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+-            request.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, fileName)
+-            module.setDownloadRequest(request)
+-            if (module.grantFileDownloaderPermissions(
+-                    getDownloadingMessageOrDefault(),
+-                    getLackPermissionToDownloadMessageOrDefault()
+-                )
+-            ) {
+-                module.downloadFile(
+-                    getDownloadingMessageOrDefault()
+-                )
+-            }
+-        })
++        // QNet patch: a page cannot download files into the phone's storage (no DownloadManager request).
++        webView.setDownloadListener(DownloadListener { _, _, _, _, _ -> })
+         return RNCWebViewWrapper(context, webView)
+     }
+ 
+@@ -475,6 +433,9 @@ class RNCWebViewManagerImpl(private val newArch: Boolean = false) {
+ 
+         // Remove all previous cookies
+         CookieManager.getInstance().removeAllCookies(null);
++        // QNet patch: and every site's storage (localStorage, IndexedDB, service workers), so a session
++        // starts with nothing an earlier one left.
++        android.webkit.WebStorage.getInstance().deleteAllData();
+ 
+         // Disable caching
+         view.settings.cacheMode = WebSettings.LOAD_NO_CACHE
+diff --git a/node_modules/react-native-webview/apple/RNCWebView.mm b/node_modules/react-native-webview/apple/RNCWebView.mm
+index 2be7877..3cd33d3 100644
+--- a/node_modules/react-native-webview/apple/RNCWebView.mm
++++ b/node_modules/react-native-webview/apple/RNCWebView.mm
+@@ -156,6 +156,9 @@ static inline std::string nullSafeStringWithLength(id value) {
+                     .loading = static_cast<bool>([[dictionary valueForKey:@"loading"] boolValue]),
+                     .data = nullSafeString([dictionary valueForKey:@"data"])
+                 };
++                // QNet patch: the sender's origin and frame, as RNCWebViewImpl read them from WKFrameInfo.
++                data.frameOrigin = nullSafeString([dictionary valueForKey:@"frameOrigin"]);
++                data.isMainFrame = static_cast<bool>([[dictionary valueForKey:@"isMainFrame"] boolValue]);
+                 webViewEventEmitter->onMessage(data);
+             }
+         };
+diff --git a/node_modules/react-native-webview/apple/RNCWebViewImpl.m b/node_modules/react-native-webview/apple/RNCWebViewImpl.m
+index 3890426..b7a872c 100644
+--- a/node_modules/react-native-webview/apple/RNCWebViewImpl.m
++++ b/node_modules/react-native-webview/apple/RNCWebViewImpl.m
+@@ -152,8 +152,17 @@ RCTAutoInsetsProtocol>
+ #if defined(__IPHONE_OS_VERSION_MAX_ALLOWED) && __IPHONE_OS_VERSION_MAX_ALLOWED >= 130000 /* __IPHONE_13_0 */
+   BOOL _savedAutomaticallyAdjustsScrollIndicatorInsets;
+ #endif
++  // QNet patch: the URL of the document on screen (set when a navigation commits), and the main-frame navigation
++  // that has started but not committed yet. While one is provisional, WKWebView.URL already names its target.
++  NSURL *_qnetCommittedURL;
++  WKNavigation *_qnetProvisionalNavigation;
+ }
+ 
++// QNet patch: an allowed navigation gets WebKit's public policy, WKNavigationActionPolicyAllow; no private WebKit value
++// is used. The app's own link host (link.aiqnet.io) and the wallet-only aiqnet.io pages never reach it: the JS policy
++// (src/browser/url.js isWalletOnlyPage) cancels them in decidePolicyForNavigationAction first, so no page in this
++// browser hands a link back to this app.
++
+ - (instancetype)initWithFrame:(CGRect)frame
+ {
+   if ((self = [super initWithFrame:frame])) {
+@@ -790,16 +799,33 @@ RCTAutoInsetsProtocol>
+       didReceiveScriptMessage:(WKScriptMessage *)message
+ {
+   if ([message.name isEqualToString:HistoryShimName]) {
++    // QNet patch: a same-document navigation (pushState) of the committed page moves the URL on screen.
++    if (_qnetProvisionalNavigation == nil) {
++      _qnetCommittedURL = _webView.URL;
++    }
+     if (_onLoadingFinish) {
+       NSMutableDictionary<NSString *, id> *event = [self baseEvent];
+       [event addEntriesFromDictionary: @{@"navigationType": message.body}];
+       _onLoadingFinish(event);
+     }
+   } else if ([message.name isEqualToString:MessageHandlerName]) {
++    // QNet patch (origin integrity): the message handler is reachable from every frame, so only the top frame
++    // may message the app, only with a string, and the event carries the sender's origin as WebKit reports it
++    // (frameInfo.securityOrigin), never anything the page wrote.
++    WKFrameInfo *frame = message.frameInfo;
++    WKSecurityOrigin *securityOrigin = frame.securityOrigin;
++    if (!frame.isMainFrame || ![message.body isKindOfClass:[NSString class]]
++        || securityOrigin.protocol.length == 0 || securityOrigin.host.length == 0) {
++      return;
++    }
+     if (_onMessage) {
++      NSString *frameOrigin = securityOrigin.port > 0
++        ? [NSString stringWithFormat:@"%@://%@:%ld", securityOrigin.protocol, securityOrigin.host, (long)securityOrigin.port]
++        : [NSString stringWithFormat:@"%@://%@", securityOrigin.protocol, securityOrigin.host];
+       NSMutableDictionary<NSString *, id> *event = [self baseEvent];
+       [event addEntriesFromDictionary: @{@"data": message.body}];
+-      [event addEntriesFromDictionary: @{@"url": message.frameInfo.request.URL.absoluteString}];
++      [event addEntriesFromDictionary: @{@"url": frame.request.URL.absoluteString ?: @""}];
++      [event addEntriesFromDictionary: @{@"frameOrigin": frameOrigin, @"isMainFrame": @YES}];
+       _onMessage(event);
+     }
+   }
+@@ -1145,8 +1171,10 @@ RCTAutoInsetsProtocol>
+ 
+ - (NSMutableDictionary<NSString *, id> *)baseEvent
+ {
++  // QNet patch: while a navigation is provisional the event names the document still on screen, never the target.
++  NSURL *shownURL = _qnetProvisionalNavigation != nil ? _qnetCommittedURL : _webView.URL;
+   NSDictionary *event = @{
+-    @"url": _webView.URL.absoluteString ?: @"",
++    @"url": shownURL.absoluteString ?: @"",
+     @"title": _webView.title ?: @"",
+     @"loading" : @(_webView.loading),
+     @"canGoBack": @(_webView.canGoBack),
+@@ -1211,93 +1239,38 @@ RCTAutoInsetsProtocol>
+ #pragma mark - WKNavigationDelegate methods
+ 
+ /**
+- * alert
++ * alert, confirm, prompt
++ *
++ * QNet patch: pages cannot open JavaScript dialogs. A dialog would be a native alert drawn over whatever the app
++ * shows (another tab, the lock screen) with an empty title, words the page chose and, for prompt(), a text field:
++ * a page could pose as the wallet itself. Each is answered at once instead: alert() returns, confirm() is false,
++ * prompt() is null.
+  */
+ - (void)webView:(WKWebView *)webView runJavaScriptAlertPanelWithMessage:(NSString *)message initiatedByFrame:(WKFrameInfo *)frame completionHandler:(void (^)(void))completionHandler
+ {
+-#if !TARGET_OS_OSX
+-  UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"" message:message preferredStyle:UIAlertControllerStyleAlert];
+-  [alert addAction:[UIAlertAction actionWithTitle:@"Ok" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+-    completionHandler();
+-  }]];
+-  [[self topViewController] presentViewController:alert animated:YES completion:NULL];
+-#else
+-  NSAlert *alert = [[NSAlert alloc] init];
+-  [alert setMessageText:message];
+-  [alert beginSheetModalForWindow:[NSApp keyWindow] completionHandler:^(__unused NSModalResponse response){
+-    completionHandler();
+-  }];
+-#endif // !TARGET_OS_OSX
++  completionHandler();
+ }
+ 
+-/**
+- * confirm
+- */
+ - (void)webView:(WKWebView *)webView runJavaScriptConfirmPanelWithMessage:(NSString *)message initiatedByFrame:(WKFrameInfo *)frame completionHandler:(void (^)(BOOL))completionHandler{
+-#if !TARGET_OS_OSX
+-  UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"" message:message preferredStyle:UIAlertControllerStyleAlert];
+-  [alert addAction:[UIAlertAction actionWithTitle:@"Ok" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+-    completionHandler(YES);
+-  }]];
+-  [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:^(__unused UIAlertAction *action) {
+-    completionHandler(NO);
+-  }]];
+-  [[self topViewController] presentViewController:alert animated:YES completion:NULL];
+-#else
+-  NSAlert *alert = [[NSAlert alloc] init];
+-  [alert setMessageText:message];
+-  [alert addButtonWithTitle:NSLocalizedString(@"OK", @"OK button")];
+-  [alert addButtonWithTitle:NSLocalizedString(@"Cancel", @"Cancel button")];
+-  void (^callbacksHandlers)(NSModalResponse response) = ^void(NSModalResponse response) {
+-    completionHandler(response == NSAlertFirstButtonReturn);
+-  };
+-  [alert beginSheetModalForWindow:[NSApp keyWindow] completionHandler:callbacksHandlers];
+-#endif // !TARGET_OS_OSX
++  completionHandler(NO);
+ }
+ 
+-/**
+- * prompt
+- */
+ - (void)webView:(WKWebView *)webView runJavaScriptTextInputPanelWithPrompt:(NSString *)prompt defaultText:(NSString *)defaultText initiatedByFrame:(WKFrameInfo *)frame completionHandler:(void (^)(NSString *))completionHandler{
++  completionHandler(nil);
++}
++
+ #if !TARGET_OS_OSX
+-  UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"" message:prompt preferredStyle:UIAlertControllerStyleAlert];
+-  [alert addTextFieldWithConfigurationHandler:^(UITextField *textField) {
+-    textField.text = defaultText;
+-  }];
+-  UIAlertAction *okAction = [UIAlertAction actionWithTitle:@"Ok" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+-    completionHandler([[alert.textFields lastObject] text]);
+-  }];
+-  [alert addAction:okAction];
+-  UIAlertAction *cancelAction = [UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:^(__unused UIAlertAction *action) {
+-    completionHandler(nil);
+-  }];
+-  [alert addAction:cancelAction];
+-  alert.preferredAction = okAction;
+-  [[self topViewController] presentViewController:alert animated:YES completion:NULL];
+-#else
+-  NSAlert *alert = [[NSAlert alloc] init];
+-  [alert setMessageText:prompt];
+-
+-  const NSRect RCTSingleTextFieldFrame = NSMakeRect(0.0, 0.0, 275.0, 22.0);
+-  NSTextField *textField = [[NSTextField alloc] initWithFrame:RCTSingleTextFieldFrame];
+-  textField.cell.scrollable = YES;
+-  if (@available(macOS 10.11, *)) {
+-    textField.maximumNumberOfLines = 1;
+-  }
+-  textField.stringValue = defaultText;
+-  [alert setAccessoryView:textField];
+-
+-  [alert addButtonWithTitle:NSLocalizedString(@"OK", @"OK button")];
+-  [alert addButtonWithTitle:NSLocalizedString(@"Cancel", @"Cancel button")];
+-  [alert beginSheetModalForWindow:[NSApp keyWindow] completionHandler:^(NSModalResponse response) {
+-    if (response == NSAlertFirstButtonReturn) {
+-      completionHandler([textField stringValue]);
+-    } else {
+-      completionHandler(nil);
+-    }
+-  }];
+-#endif // !TARGET_OS_OSX
++/**
++ * QNet patch: a file input never opens the upload sheet (MB3-04). WebKit asks this on iOS 18.4 and later (on older
++ * releases the document-start scripts added in resetupScripts stop file inputs as far as scripts can: MB4-01); the
++ * parameters are typed loosely so the file builds with any SDK. Cancelled: no file, photo or camera picture reaches
++ * a page.
++ */
++- (void)webView:(WKWebView *)webView runOpenPanelWithParameters:(id)parameters initiatedByFrame:(WKFrameInfo *)frame completionHandler:(void (^)(NSArray<NSURL *> *URLs))completionHandler
++{
++  completionHandler(nil);
+ }
++#endif
+ 
+ #if defined(__IPHONE_OS_VERSION_MAX_ALLOWED) && __IPHONE_OS_VERSION_MAX_ALLOWED >= 150000 /* iOS 15 */
+ /**
+@@ -1383,20 +1356,10 @@ RCTAutoInsetsProtocol>
+                     decisionHandler(WKNavigationActionPolicyCancel);
+                     return;
+                 }
+-                if (self->_onLoadingStart) {
+-                    // We have this check to filter out iframe requests and whatnot
+-                    if (isTopFrame) {
+-                        NSMutableDictionary<NSString *, id> *event = [self baseEvent];
+-                        [event addEntriesFromDictionary: @{
+-                            @"url": (request.URL).absoluteString,
+-                            @"navigationType": navigationTypes[@(navigationType)]
+-                        }];
+-                        self->_onLoadingStart(event);
+-                    }
+-                }
+-
+-                // Allow all navigation by default
+-                decisionHandler(WKNavigationActionPolicyAllow);
++                // QNet patch: no load-start event here. Allowing a navigation is not loading it: it may still fail
++                // or be cancelled (a 204, a download, WebKit 102), and the page on screen stays. The event is sent
++                // when the navigation commits (didCommitNavigation), with the URL of the document then on screen.
++                decisionHandler(WKNavigationActionPolicyAllow);
+             });
+ 
+         }];
+@@ -1418,20 +1381,34 @@ RCTAutoInsetsProtocol>
+         return;
+     }
+ 
+-    if (_onLoadingStart) {
+-        // We have this check to filter out iframe requests and whatnot
+-        if (isTopFrame) {
+-            NSMutableDictionary<NSString *, id> *event = [self baseEvent];
+-            [event addEntriesFromDictionary: @{
+-                @"url": (request.URL).absoluteString,
+-                @"navigationType": navigationTypes[@(navigationType)]
+-            }];
+-            _onLoadingStart(event);
+-        }
+-    }
++    // QNet patch: as above, the load-start event is sent at commit; an allowed navigation gets WebKit's public
++    // policy (the app's own links were cancelled before it).
++    decisionHandler(WKNavigationActionPolicyAllow);
++}
+ 
+-    // Allow all navigation by default
+-    decisionHandler(WKNavigationActionPolicyAllow);
++/**
++ * QNet patch: a main-frame navigation has started; until it commits, events name the document still on screen.
++ */
++- (void)webView:(WKWebView *)webView didStartProvisionalNavigation:(WKNavigation *)navigation
++{
++  _qnetProvisionalNavigation = navigation;
++}
++
++/**
++ * QNet patch: the navigation committed, so its document is the one on screen now: this is where the load-start
++ * event (and with it the address the app shows) comes from.
++ */
++- (void)webView:(WKWebView *)webView didCommitNavigation:(WKNavigation *)navigation
++{
++  if (navigation == _qnetProvisionalNavigation) {
++    _qnetProvisionalNavigation = nil;
++  }
++  _qnetCommittedURL = webView.URL;
++  if (_onLoadingStart) {
++    NSMutableDictionary<NSString *, id> *event = [self baseEvent];
++    [event addEntriesFromDictionary: @{ @"navigationType": @"other" }];
++    _onLoadingStart(event);
++  }
+ }
+ 
+ /**
+@@ -1499,6 +1476,19 @@ RCTAutoInsetsProtocol>
+   didFailProvisionalNavigation:(WKNavigation *)navigation
+                      withError:(NSError *)error
+ {
++  // QNet patch: the navigation never committed; the document on screen is still the committed one.
++  if (navigation == _qnetProvisionalNavigation) {
++    _qnetProvisionalNavigation = nil;
++  }
++  BOOL quiet = ([error.domain isEqualToString:NSURLErrorDomain] && error.code == NSURLErrorCancelled)
++    || ([error.domain isEqualToString:@"WebKitErrorDomain"] && (error.code == 102 || error.code == 101));
++  if (quiet) {
++    // QNet patch: no error for these, but the app hears that nothing loaded, with the URL of the page still shown.
++    if (_onLoadingFinish && _qnetProvisionalNavigation == nil) {
++      _onLoadingFinish([self baseEvent]);
++    }
++    return;
++  }
+   if (_onLoadingError) {
+     if ([error.domain isEqualToString:NSURLErrorDomain] && error.code == NSURLErrorCancelled) {
+       // NSURLErrorCancelled is reported when a page has a redirect OR if you load
+@@ -1586,6 +1576,10 @@ didFinishNavigation:(WKNavigation *)navigation
+     [self forceIgnoreSilentHardwareSwitch:true];
+   }
+ 
++  // QNet patch: a finished navigation is committed.
++  if (_qnetProvisionalNavigation == nil) {
++    _qnetCommittedURL = webView.URL;
++  }
+   if (_onLoadingFinish) {
+     _onLoadingFinish([self baseEvent]);
+   }
+@@ -1876,6 +1870,94 @@ didFinishNavigation:(WKNavigation *)navigation
+   WKUserScript *userScript = [[WKUserScript alloc] initWithSource:html5HistoryAPIShimSource injectionTime:WKUserScriptInjectionTimeAtDocumentStart forMainFrameOnly:YES];
+   [wkWebViewConfig.userContentController addUserScript:userScript];
+ 
++  // QNet patch: no file picker, as on Android (onShowFileChooser answers false): WKWebView itself would offer every
++  // page an upload sheet (photos, files, the camera). iOS 18.4 and later ask the delegate, which cancels
++  // (runOpenPanelWithParameters below) (MB3-04). Before iOS 18.4 WebKit gives the app no say in it, so two
++  // document-start scripts stop file inputs in every frame (MB4-01). In the page's world: click() and showPicker() on
++  // a file input do nothing, and every shadow root the page attaches, open or closed, is watched like the document:
++  // its file inputs are disabled and clicks on them cancelled. In the app's own content world, which the page can
++  // neither see nor change: a click whose path (open shadow roots included) holds a file input, or a label of one,
++  // is cancelled before any page listener sees it, and file inputs in the document and its open shadow roots are
++  // disabled. What no script can reach (a page that takes pristine methods from a frame it made) may still show the
++  // system sheet below iOS 18.4; a file leaves only if the user picks one.
++  NSString *noFilePickerSource =
++    @"(function () {\n"
++     "  var isFile = function (el) { return !!el && el.tagName === 'INPUT' && String(el.type).toLowerCase() === 'file'; };\n"
++     "  var proto = window.HTMLInputElement && window.HTMLInputElement.prototype;\n"
++     "  if (proto) {\n"
++     "    var click = proto.click;\n"
++     "    proto.click = function () { if (isFile(this)) return; return click.apply(this, arguments); };\n"
++     "    if (proto.showPicker) {\n"
++     "      var showPicker = proto.showPicker;\n"
++     "      proto.showPicker = function () { if (isFile(this)) return; return showPicker.apply(this, arguments); };\n"
++     "    }\n"
++     "  }\n"
++     "  var inPath = function (e) {\n"
++     "    var path = e.composedPath ? e.composedPath() : [e.target];\n"
++     "    for (var i = 0; i < path.length; i++) {\n"
++     "      var n = path[i];\n"
++     "      if (isFile(n) || (n && n.tagName === 'LABEL' && isFile(n.control))) return true;\n"
++     "    }\n"
++     "    return false;\n"
++     "  };\n"
++     "  var stop = function (e) { if (inPath(e)) { e.preventDefault(); e.stopImmediatePropagation(); } };\n"
++     "  var disable = function (root) {\n"
++     "    if (!root || !root.querySelectorAll) return;\n"
++     "    if (isFile(root)) root.disabled = true;\n"
++     "    var list = root.querySelectorAll('input[type=file]');\n"
++     "    for (var i = 0; i < list.length; i++) list[i].disabled = true;\n"
++     "  };\n"
++     "  var watch = function (root) {\n"
++     "    root.addEventListener('click', stop, true);\n"
++     "    disable(root);\n"
++     "    new MutationObserver(function (records) {\n"
++     "      for (var r = 0; r < records.length; r++) {\n"
++     "        var rec = records[r];\n"
++     "        if (rec.type === 'attributes') disable(rec.target);\n"
++     "        for (var n = 0; n < rec.addedNodes.length; n++) disable(rec.addedNodes[n]);\n"
++     "      }\n"
++     "    }).observe(root, { childList: true, subtree: true, attributes: true, attributeFilter: ['type', 'disabled'] });\n"
++     "  };\n"
++     "  var eproto = window.Element && window.Element.prototype;\n"
++     "  if (eproto && eproto.attachShadow) {\n"
++     "    var attach = eproto.attachShadow;\n"
++     "    eproto.attachShadow = function () { var root = attach.apply(this, arguments); try { watch(root); } catch (_) {} return root; };\n"
++     "  }\n"
++     "  watch(document);\n"
++     "})();\n";
++  WKUserScript *noFilePicker = [[WKUserScript alloc] initWithSource:noFilePickerSource injectionTime:WKUserScriptInjectionTimeAtDocumentStart forMainFrameOnly:NO];
++  [wkWebViewConfig.userContentController addUserScript:noFilePicker];
++  NSString *noFilePickerGuardSource =
++    @"(function () {\n"
++     "  var isFile = function (el) { return !!el && el.tagName === 'INPUT' && String(el.type).toLowerCase() === 'file'; };\n"
++     "  window.addEventListener('click', function (e) {\n"
++     "    var path = e.composedPath ? e.composedPath() : [e.target];\n"
++     "    for (var i = 0; i < path.length; i++) {\n"
++     "      var n = path[i];\n"
++     "      if (isFile(n) || (n && n.tagName === 'LABEL' && isFile(n.control))) { e.preventDefault(); e.stopImmediatePropagation(); return; }\n"
++     "    }\n"
++     "  }, true);\n"
++     "  var disable = function (root) {\n"
++     "    if (!root || !root.querySelectorAll) return;\n"
++     "    if (isFile(root)) root.disabled = true;\n"
++     "    if (root.shadowRoot) disable(root.shadowRoot);\n"
++     "    var all = root.querySelectorAll('*');\n"
++     "    for (var i = 0; i < all.length; i++) {\n"
++     "      if (isFile(all[i])) all[i].disabled = true;\n"
++     "      if (all[i].shadowRoot) disable(all[i].shadowRoot);\n"
++     "    }\n"
++     "  };\n"
++     "  new MutationObserver(function (records) {\n"
++     "    for (var r = 0; r < records.length; r++) {\n"
++     "      var rec = records[r];\n"
++     "      if (rec.type === 'attributes') disable(rec.target);\n"
++     "      for (var n = 0; n < rec.addedNodes.length; n++) disable(rec.addedNodes[n]);\n"
++     "    }\n"
++     "  }).observe(document, { childList: true, subtree: true, attributes: true, attributeFilter: ['type', 'disabled'] });\n"
++     "})();\n";
++  WKUserScript *noFilePickerGuard = [[WKUserScript alloc] initWithSource:noFilePickerGuardSource injectionTime:WKUserScriptInjectionTimeAtDocumentStart forMainFrameOnly:NO inContentWorld:[WKContentWorld defaultClientWorld]];
++  [wkWebViewConfig.userContentController addUserScript:noFilePickerGuard];
++
+   if(_sharedCookiesEnabled) {
+     // More info to sending cookies with WKWebView
+     // https://stackoverflow.com/questions/26573137/can-i-set-the-cookies-to-be-used-by-a-wkwebview/26577303#26577303
+diff --git a/node_modules/react-native-webview/lib/WebViewShared.js b/node_modules/react-native-webview/lib/WebViewShared.js
+index 907f697..b505802 100644
+--- a/node_modules/react-native-webview/lib/WebViewShared.js
++++ b/node_modules/react-native-webview/lib/WebViewShared.js
+@@ -1 +1 @@
+-var _interopRequireDefault=require("@babel/runtime/helpers/interopRequireDefault");Object.defineProperty(exports,"__esModule",{value:true});exports.useWebViewLogic=exports.defaultRenderLoading=exports.defaultRenderError=exports.defaultOriginWhitelist=exports.createOnShouldStartLoadWithRequest=void 0;var _slicedToArray2=_interopRequireDefault(require("@babel/runtime/helpers/slicedToArray"));var _asyncToGenerator2=_interopRequireDefault(require("@babel/runtime/helpers/asyncToGenerator"));var _toConsumableArray2=_interopRequireDefault(require("@babel/runtime/helpers/toConsumableArray"));var _escapeStringRegexp=_interopRequireDefault(require("escape-string-regexp"));var _react=_interopRequireWildcard(require("react"));var _reactNative=require("react-native");var _WebView=_interopRequireDefault(require("./WebView.styles"));var _jsxRuntime=require("react/jsx-runtime");var _this=this,_jsxFileName="/home/runner/work/react-native-webview/react-native-webview/src/WebViewShared.tsx";function _interopRequireWildcard(e,t){if("function"==typeof WeakMap)var r=new WeakMap(),n=new WeakMap();return(_interopRequireWildcard=function _interopRequireWildcard(e,t){if(!t&&e&&e.__esModule)return e;var o,i,f={__proto__:null,default:e};if(null===e||"object"!=typeof e&&"function"!=typeof e)return f;if(o=t?n:r){if(o.has(e))return o.get(e);o.set(e,f);}for(var _t in e)"default"!==_t&&{}.hasOwnProperty.call(e,_t)&&((i=(o=Object.defineProperty)&&Object.getOwnPropertyDescriptor(e,_t))&&(i.get||i.set)?o(f,_t,i):f[_t]=e[_t]);return f;})(e,t);}var defaultOriginWhitelist=exports.defaultOriginWhitelist=['http://*','https://*'];var extractOrigin=function extractOrigin(url){var result=/^[A-Za-z][A-Za-z0-9+\-.]+:(\/\/)?[^/]*/.exec(url);return result===null?'':result[0];};var originWhitelistToRegex=function originWhitelistToRegex(originWhitelist){return`^${(0,_escapeStringRegexp.default)(originWhitelist).replace(/\\\*/g,'.*')}`;};var passesWhitelist=function passesWhitelist(compiledWhitelist,url){var origin=extractOrigin(url);return compiledWhitelist.some(function(x){return new RegExp(x).test(origin);});};var compileWhitelist=function compileWhitelist(originWhitelist){return['about:blank'].concat((0,_toConsumableArray2.default)(originWhitelist||[])).map(originWhitelistToRegex);};var createOnShouldStartLoadWithRequest=exports.createOnShouldStartLoadWithRequest=function createOnShouldStartLoadWithRequest(loadRequest,originWhitelist,onShouldStartLoadWithRequest){return function(_ref){var nativeEvent=_ref.nativeEvent;var shouldStart=true;var url=nativeEvent.url,lockIdentifier=nativeEvent.lockIdentifier;if(!passesWhitelist(compileWhitelist(originWhitelist),url)){_reactNative.Linking.canOpenURL(url).then(function(){var _ref2=(0,_asyncToGenerator2.default)(function*(supported){if(supported){return _reactNative.Linking.openURL(url);}console.warn(`Can't open url: ${url}`);return undefined;});return function(_x){return _ref2.apply(this,arguments);};}()).catch(function(e){console.warn('Error opening URL: ',e);});shouldStart=false;}else if(onShouldStartLoadWithRequest){shouldStart=onShouldStartLoadWithRequest(nativeEvent);}loadRequest(shouldStart,url,lockIdentifier);};};var defaultRenderLoading=exports.defaultRenderLoading=function defaultRenderLoading(){return(0,_jsxRuntime.jsx)(_reactNative.View,{style:_WebView.default.loadingOrErrorView,children:(0,_jsxRuntime.jsx)(_reactNative.ActivityIndicator,{})});};var defaultRenderError=exports.defaultRenderError=function defaultRenderError(errorDomain,errorCode,errorDesc){return(0,_jsxRuntime.jsxs)(_reactNative.View,{style:_WebView.default.loadingOrErrorView,children:[(0,_jsxRuntime.jsx)(_reactNative.Text,{style:_WebView.default.errorTextTitle,children:"Error loading page"}),(0,_jsxRuntime.jsx)(_reactNative.Text,{style:_WebView.default.errorText,children:`Domain: ${errorDomain}`}),(0,_jsxRuntime.jsx)(_reactNative.Text,{style:_WebView.default.errorText,children:`Error Code: ${errorCode}`}),(0,_jsxRuntime.jsx)(_reactNative.Text,{style:_WebView.default.errorText,children:`Description: ${errorDesc}`})]});};var useWebViewLogic=exports.useWebViewLogic=function useWebViewLogic(_ref3){var startInLoadingState=_ref3.startInLoadingState,onNavigationStateChange=_ref3.onNavigationStateChange,onLoadStart=_ref3.onLoadStart,onLoad=_ref3.onLoad,onLoadProgress=_ref3.onLoadProgress,onLoadEnd=_ref3.onLoadEnd,onError=_ref3.onError,onLoadSubResourceError=_ref3.onLoadSubResourceError,onHttpErrorProp=_ref3.onHttpErrorProp,onMessageProp=_ref3.onMessageProp,onOpenWindowProp=_ref3.onOpenWindowProp,onRenderProcessGoneProp=_ref3.onRenderProcessGoneProp,onContentProcessDidTerminateProp=_ref3.onContentProcessDidTerminateProp,originWhitelist=_ref3.originWhitelist,onShouldStartLoadWithRequestProp=_ref3.onShouldStartLoadWithRequestProp,onShouldStartLoadWithRequestCallback=_ref3.onShouldStartLoadWithRequestCallback;var _useState=(0,_react.useState)(startInLoadingState?'LOADING':'IDLE'),_useState2=(0,_slicedToArray2.default)(_useState,2),viewState=_useState2[0],setViewState=_useState2[1];var _useState3=(0,_react.useState)(null),_useState4=(0,_slicedToArray2.default)(_useState3,2),lastErrorEvent=_useState4[0],setLastErrorEvent=_useState4[1];var startUrl=(0,_react.useRef)(null);var updateNavigationState=(0,_react.useCallback)(function(event){onNavigationStateChange==null?void 0:onNavigationStateChange(event.nativeEvent);},[onNavigationStateChange]);var onLoadingStart=(0,_react.useCallback)(function(event){startUrl.current=event.nativeEvent.url;onLoadStart==null?void 0:onLoadStart(event);updateNavigationState(event);},[onLoadStart,updateNavigationState]);var onLoadingError=(0,_react.useCallback)(function(event){event.persist();if(onError){onError(event);}else{console.warn('Encountered an error loading page',event.nativeEvent);}onLoadEnd==null?void 0:onLoadEnd(event);if(event.isDefaultPrevented()){return;}setViewState('ERROR');setLastErrorEvent(event.nativeEvent);},[onError,onLoadEnd]);var onLoadingSubResourceError=(0,_react.useCallback)(function(event){onLoadSubResourceError==null?void 0:onLoadSubResourceError(event);},[onLoadSubResourceError]);var onHttpError=(0,_react.useCallback)(function(event){onHttpErrorProp==null?void 0:onHttpErrorProp(event);},[onHttpErrorProp]);var onRenderProcessGone=(0,_react.useCallback)(function(event){onRenderProcessGoneProp==null?void 0:onRenderProcessGoneProp(event);},[onRenderProcessGoneProp]);var onContentProcessDidTerminate=(0,_react.useCallback)(function(event){onContentProcessDidTerminateProp==null?void 0:onContentProcessDidTerminateProp(event);},[onContentProcessDidTerminateProp]);var onLoadingFinish=(0,_react.useCallback)(function(event){onLoad==null?void 0:onLoad(event);onLoadEnd==null?void 0:onLoadEnd(event);var url=event.nativeEvent.url;if(_reactNative.Platform.OS!=='android'||url===startUrl.current){setViewState('IDLE');}updateNavigationState(event);},[onLoad,onLoadEnd,updateNavigationState]);var onMessage=(0,_react.useCallback)(function(event){onMessageProp==null?void 0:onMessageProp(event);},[onMessageProp]);var onLoadingProgress=(0,_react.useCallback)(function(event){var progress=event.nativeEvent.progress;if(_reactNative.Platform.OS==='android'&&progress===1){setViewState(function(prevViewState){return prevViewState==='LOADING'?'IDLE':prevViewState;});}onLoadProgress==null?void 0:onLoadProgress(event);},[onLoadProgress]);var onShouldStartLoadWithRequest=(0,_react.useMemo)(function(){return createOnShouldStartLoadWithRequest(onShouldStartLoadWithRequestCallback,originWhitelist,onShouldStartLoadWithRequestProp);},[originWhitelist,onShouldStartLoadWithRequestProp,onShouldStartLoadWithRequestCallback]);var onOpenWindow=(0,_react.useCallback)(function(event){onOpenWindowProp==null?void 0:onOpenWindowProp(event);},[onOpenWindowProp]);return{onShouldStartLoadWithRequest:onShouldStartLoadWithRequest,onLoadingStart:onLoadingStart,onLoadingProgress:onLoadingProgress,onLoadingError:onLoadingError,onLoadingSubResourceError:onLoadingSubResourceError,onLoadingFinish:onLoadingFinish,onHttpError:onHttpError,onRenderProcessGone:onRenderProcessGone,onContentProcessDidTerminate:onContentProcessDidTerminate,onMessage:onMessage,onOpenWindow:onOpenWindow,viewState:viewState,setViewState:setViewState,lastErrorEvent:lastErrorEvent};};
+\ No newline at end of file
++var _interopRequireDefault=require("@babel/runtime/helpers/interopRequireDefault");Object.defineProperty(exports,"__esModule",{value:true});exports.useWebViewLogic=exports.defaultRenderLoading=exports.defaultRenderError=exports.defaultOriginWhitelist=exports.createOnShouldStartLoadWithRequest=void 0;var _slicedToArray2=_interopRequireDefault(require("@babel/runtime/helpers/slicedToArray"));var _asyncToGenerator2=_interopRequireDefault(require("@babel/runtime/helpers/asyncToGenerator"));var _toConsumableArray2=_interopRequireDefault(require("@babel/runtime/helpers/toConsumableArray"));var _escapeStringRegexp=_interopRequireDefault(require("escape-string-regexp"));var _react=_interopRequireWildcard(require("react"));var _reactNative=require("react-native");var _WebView=_interopRequireDefault(require("./WebView.styles"));var _jsxRuntime=require("react/jsx-runtime");var _this=this,_jsxFileName="/home/runner/work/react-native-webview/react-native-webview/src/WebViewShared.tsx";function _interopRequireWildcard(e,t){if("function"==typeof WeakMap)var r=new WeakMap(),n=new WeakMap();return(_interopRequireWildcard=function _interopRequireWildcard(e,t){if(!t&&e&&e.__esModule)return e;var o,i,f={__proto__:null,default:e};if(null===e||"object"!=typeof e&&"function"!=typeof e)return f;if(o=t?n:r){if(o.has(e))return o.get(e);o.set(e,f);}for(var _t in e)"default"!==_t&&{}.hasOwnProperty.call(e,_t)&&((i=(o=Object.defineProperty)&&Object.getOwnPropertyDescriptor(e,_t))&&(i.get||i.set)?o(f,_t,i):f[_t]=e[_t]);return f;})(e,t);}var defaultOriginWhitelist=exports.defaultOriginWhitelist=['http://*','https://*'];var extractOrigin=function extractOrigin(url){var result=/^[A-Za-z][A-Za-z0-9+\-.]+:(\/\/)?[^/]*/.exec(url);return result===null?'':result[0];};var originWhitelistToRegex=function originWhitelistToRegex(originWhitelist){return`^${(0,_escapeStringRegexp.default)(originWhitelist).replace(/\\\*/g,'.*')}`;};var passesWhitelist=function passesWhitelist(compiledWhitelist,url){var origin=extractOrigin(url);return compiledWhitelist.some(function(x){return new RegExp(x).test(origin);});};var compileWhitelist=function compileWhitelist(originWhitelist){return['about:blank'].concat((0,_toConsumableArray2.default)(originWhitelist||[])).map(originWhitelistToRegex);};var createOnShouldStartLoadWithRequest=exports.createOnShouldStartLoadWithRequest=function createOnShouldStartLoadWithRequest(loadRequest,originWhitelist,onShouldStartLoadWithRequest){return function(_ref){var nativeEvent=_ref.nativeEvent;var shouldStart=true;var url=nativeEvent.url,lockIdentifier=nativeEvent.lockIdentifier;if(!passesWhitelist(compileWhitelist(originWhitelist),url)){shouldStart=false;}else if(onShouldStartLoadWithRequest){shouldStart=onShouldStartLoadWithRequest(nativeEvent);}loadRequest(shouldStart,url,lockIdentifier);};};var defaultRenderLoading=exports.defaultRenderLoading=function defaultRenderLoading(){return(0,_jsxRuntime.jsx)(_reactNative.View,{style:_WebView.default.loadingOrErrorView,children:(0,_jsxRuntime.jsx)(_reactNative.ActivityIndicator,{})});};var defaultRenderError=exports.defaultRenderError=function defaultRenderError(errorDomain,errorCode,errorDesc){return(0,_jsxRuntime.jsxs)(_reactNative.View,{style:_WebView.default.loadingOrErrorView,children:[(0,_jsxRuntime.jsx)(_reactNative.Text,{style:_WebView.default.errorTextTitle,children:"Error loading page"}),(0,_jsxRuntime.jsx)(_reactNative.Text,{style:_WebView.default.errorText,children:`Domain: ${errorDomain}`}),(0,_jsxRuntime.jsx)(_reactNative.Text,{style:_WebView.default.errorText,children:`Error Code: ${errorCode}`}),(0,_jsxRuntime.jsx)(_reactNative.Text,{style:_WebView.default.errorText,children:`Description: ${errorDesc}`})]});};var useWebViewLogic=exports.useWebViewLogic=function useWebViewLogic(_ref3){var startInLoadingState=_ref3.startInLoadingState,onNavigationStateChange=_ref3.onNavigationStateChange,onLoadStart=_ref3.onLoadStart,onLoad=_ref3.onLoad,onLoadProgress=_ref3.onLoadProgress,onLoadEnd=_ref3.onLoadEnd,onError=_ref3.onError,onLoadSubResourceError=_ref3.onLoadSubResourceError,onHttpErrorProp=_ref3.onHttpErrorProp,onMessageProp=_ref3.onMessageProp,onOpenWindowProp=_ref3.onOpenWindowProp,onRenderProcessGoneProp=_ref3.onRenderProcessGoneProp,onContentProcessDidTerminateProp=_ref3.onContentProcessDidTerminateProp,originWhitelist=_ref3.originWhitelist,onShouldStartLoadWithRequestProp=_ref3.onShouldStartLoadWithRequestProp,onShouldStartLoadWithRequestCallback=_ref3.onShouldStartLoadWithRequestCallback;var _useState=(0,_react.useState)(startInLoadingState?'LOADING':'IDLE'),_useState2=(0,_slicedToArray2.default)(_useState,2),viewState=_useState2[0],setViewState=_useState2[1];var _useState3=(0,_react.useState)(null),_useState4=(0,_slicedToArray2.default)(_useState3,2),lastErrorEvent=_useState4[0],setLastErrorEvent=_useState4[1];var startUrl=(0,_react.useRef)(null);var updateNavigationState=(0,_react.useCallback)(function(event){onNavigationStateChange==null?void 0:onNavigationStateChange(event.nativeEvent);},[onNavigationStateChange]);var onLoadingStart=(0,_react.useCallback)(function(event){startUrl.current=event.nativeEvent.url;onLoadStart==null?void 0:onLoadStart(event);updateNavigationState(event);},[onLoadStart,updateNavigationState]);var onLoadingError=(0,_react.useCallback)(function(event){event.persist();if(onError){onError(event);}else{console.warn('Encountered an error loading page',event.nativeEvent);}onLoadEnd==null?void 0:onLoadEnd(event);if(event.isDefaultPrevented()){return;}setViewState('ERROR');setLastErrorEvent(event.nativeEvent);},[onError,onLoadEnd]);var onLoadingSubResourceError=(0,_react.useCallback)(function(event){onLoadSubResourceError==null?void 0:onLoadSubResourceError(event);},[onLoadSubResourceError]);var onHttpError=(0,_react.useCallback)(function(event){onHttpErrorProp==null?void 0:onHttpErrorProp(event);},[onHttpErrorProp]);var onRenderProcessGone=(0,_react.useCallback)(function(event){onRenderProcessGoneProp==null?void 0:onRenderProcessGoneProp(event);},[onRenderProcessGoneProp]);var onContentProcessDidTerminate=(0,_react.useCallback)(function(event){onContentProcessDidTerminateProp==null?void 0:onContentProcessDidTerminateProp(event);},[onContentProcessDidTerminateProp]);var onLoadingFinish=(0,_react.useCallback)(function(event){onLoad==null?void 0:onLoad(event);onLoadEnd==null?void 0:onLoadEnd(event);var url=event.nativeEvent.url;if(_reactNative.Platform.OS!=='android'||url===startUrl.current){setViewState('IDLE');}updateNavigationState(event);},[onLoad,onLoadEnd,updateNavigationState]);var onMessage=(0,_react.useCallback)(function(event){onMessageProp==null?void 0:onMessageProp(event);},[onMessageProp]);var onLoadingProgress=(0,_react.useCallback)(function(event){var progress=event.nativeEvent.progress;if(_reactNative.Platform.OS==='android'&&progress===1){setViewState(function(prevViewState){return prevViewState==='LOADING'?'IDLE':prevViewState;});}onLoadProgress==null?void 0:onLoadProgress(event);},[onLoadProgress]);var onShouldStartLoadWithRequest=(0,_react.useMemo)(function(){return createOnShouldStartLoadWithRequest(onShouldStartLoadWithRequestCallback,originWhitelist,onShouldStartLoadWithRequestProp);},[originWhitelist,onShouldStartLoadWithRequestProp,onShouldStartLoadWithRequestCallback]);var onOpenWindow=(0,_react.useCallback)(function(event){onOpenWindowProp==null?void 0:onOpenWindowProp(event);},[onOpenWindowProp]);return{onShouldStartLoadWithRequest:onShouldStartLoadWithRequest,onLoadingStart:onLoadingStart,onLoadingProgress:onLoadingProgress,onLoadingError:onLoadingError,onLoadingSubResourceError:onLoadingSubResourceError,onLoadingFinish:onLoadingFinish,onHttpError:onHttpError,onRenderProcessGone:onRenderProcessGone,onContentProcessDidTerminate:onContentProcessDidTerminate,onMessage:onMessage,onOpenWindow:onOpenWindow,viewState:viewState,setViewState:setViewState,lastErrorEvent:lastErrorEvent};};
+\ No newline at end of file
+diff --git a/node_modules/react-native-webview/lib/WebViewTypes.d.ts b/node_modules/react-native-webview/lib/WebViewTypes.d.ts
+index f666e81..7fec95d 100644
+--- a/node_modules/react-native-webview/lib/WebViewTypes.d.ts
++++ b/node_modules/react-native-webview/lib/WebViewTypes.d.ts
+@@ -68,6 +68,8 @@ export interface FileDownload {
+ export type DecelerationRateConstant = 'normal' | 'fast';
+ export interface WebViewMessage extends WebViewNativeEvent {
+     data: string;
++    frameOrigin?: string;
++    isMainFrame?: boolean;
+ }
+ export interface WebViewError extends WebViewNativeEvent {
+     /**
+diff --git a/node_modules/react-native-webview/src/RNCWebViewNativeComponent.ts b/node_modules/react-native-webview/src/RNCWebViewNativeComponent.ts
+index ca3af15..cbfabfc 100644
+--- a/node_modules/react-native-webview/src/RNCWebViewNativeComponent.ts
++++ b/node_modules/react-native-webview/src/RNCWebViewNativeComponent.ts
+@@ -29,6 +29,9 @@ export type WebViewMessageEvent = Readonly<{
+   canGoForward: boolean;
+   lockIdentifier: Double;
+   data: string;
++  // QNet patch: the sender's origin as the platform reports it, and whether it is the top frame.
++  frameOrigin: string;
++  isMainFrame: boolean;
+ }>;
+ export type WebViewOpenWindowEvent = Readonly<{
+   targetUrl: string;
+diff --git a/node_modules/react-native-webview/src/WebViewShared.tsx b/node_modules/react-native-webview/src/WebViewShared.tsx
+index b4c8ed8..4ea4dc7 100644
+--- a/node_modules/react-native-webview/src/WebViewShared.tsx
++++ b/node_modules/react-native-webview/src/WebViewShared.tsx
+@@ -1,6 +1,6 @@
+ import escapeStringRegexp from 'escape-string-regexp';
+ import React, { useCallback, useMemo, useRef, useState } from 'react';
+-import { Linking, View, ActivityIndicator, Text, Platform } from 'react-native';
++import { View, ActivityIndicator, Text, Platform } from 'react-native';
+ import {
+   OnShouldStartLoadWithRequest,
+   ShouldStartLoadRequestEvent,
+@@ -45,17 +45,8 @@ const createOnShouldStartLoadWithRequest = (
+     const { url, lockIdentifier } = nativeEvent;
+ 
+     if (!passesWhitelist(compileWhitelist(originWhitelist), url)) {
+-      Linking.canOpenURL(url)
+-        .then(async (supported) => {
+-          if (supported) {
+-            return Linking.openURL(url);
+-          }
+-          console.warn(`Can't open url: ${url}`);
+-          return undefined;
+-        })
+-        .catch((e: unknown) => {
+-          console.warn('Error opening URL: ', e);
+-        });
++      // QNet patch: a URL outside the whitelist is blocked, never handed to another app (intent:, market:,
++      // tel: and the like would otherwise open with no confirmation).
+       shouldStart = false;
+     } else if (onShouldStartLoadWithRequest) {
+       shouldStart = onShouldStartLoadWithRequest(nativeEvent);
+diff --git a/node_modules/react-native-webview/src/WebViewTypes.ts b/node_modules/react-native-webview/src/WebViewTypes.ts
+index 4e7247f..c7aa709 100644
+--- a/node_modules/react-native-webview/src/WebViewTypes.ts
++++ b/node_modules/react-native-webview/src/WebViewTypes.ts
+@@ -105,6 +105,9 @@ export type DecelerationRateConstant = 'normal' | 'fast';
+ 
+ export interface WebViewMessage extends WebViewNativeEvent {
+   data: string;
++  // QNet patch: set by the native side for the top frame only; absent means the message is not trusted.
++  frameOrigin?: string;
++  isMainFrame?: boolean;
+ }
+ 
+ export interface WebViewError extends WebViewNativeEvent {

@@ -17,8 +17,8 @@
 -keep class com.facebook.hermes.** { *; }
 -keep class com.facebook.jni.** { *; }
 
-# Keep our application classes
--keep class com.qnetmobile.** { *; }
+# No blanket keep of com.qnetmobile: the native modules are kept by React Native's consumer rules
+# (every NativeModule and every native method), the activity and application by the manifest.
 
 # AsyncStorage
 -keep class com.reactnativecommunity.asyncstorage.** { *; }
@@ -42,8 +42,7 @@
 -keep class java.security.** { *; }
 -keep class org.bouncycastle.** { *; }
 
-# Keep Solana/Web3 related classes if any
--keep class org.bitcoinj.** { *; }
+# Protocol buffers
 -keep class com.google.protobuf.** { *; }
 
 # Optimization for React Native
@@ -62,17 +61,13 @@
     public static *** e(...);
 }
 
-# Keep source file names for stack traces (can be removed for max obfuscation)
--keepattributes SourceFile,LineNumberTable
-
-# If you want maximum obfuscation, uncomment this:
-# -renamesourcefileattribute SourceFile
-# -keepattributes !SourceFile,!LineNumberTable
+# No source file names or line numbers of our own in the release build; a library that keeps the
+# attribute gets the placeholder name instead of the real one.
+-renamesourcefileattribute SourceFile
 
 # Warnings to ignore
 -dontwarn com.facebook.react.**
 -dontwarn com.facebook.hermes.**
--dontwarn org.bitcoinj.**
 -dontwarn okio.**
 -dontwarn retrofit2.**
 -dontwarn javax.naming.**

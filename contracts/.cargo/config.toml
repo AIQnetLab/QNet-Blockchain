@@ -1,0 +1,17 @@
+# Flags that make rustc output pass the node's deploy validator (core/qnet-vm validate_wasm_module):
+# no bulk-memory or reference-types instructions, single-byte call_indirect table index, and a
+# declared memory maximum. rustc warns that bulk-memory-opt and call-indirect-overlong are unknown
+# features; both still apply, and without them the validator refuses the module.
+[target.wasm32-unknown-unknown]
+rustflags = [
+  "-C", "target-feature=-bulk-memory,-bulk-memory-opt,-reference-types,-call-indirect-overlong",
+  "-C", "link-arg=--initial-memory=131072",
+  "-C", "link-arg=--max-memory=131072",
+  "-C", "link-arg=-zstack-size=32768",
+]
+
+[alias]
+# Build every template for wasm32 and check it against the deploy rules.
+build-contracts = "run --quiet -p qnet-contract-tool -- build"
+# Check already built modules: cargo check-contract path/to/module.wasm ...
+check-contract = "run --quiet -p qnet-contract-tool -- check"

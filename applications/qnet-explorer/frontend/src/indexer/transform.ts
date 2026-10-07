@@ -136,6 +136,19 @@ export function extractTxTypeData(rawType: unknown): Record<string, unknown> | n
   if (batch && typeof batch === 'object' && Array.isArray(batch.transfers)) {
     return { batch_id: clip(batch.batch_id, 128), transfer_count: batch.transfers.length };
   }
+  // A registration's burn facts, public on chain: the node cabinet derives a node's activation code from them once
+  // the nodes have pruned the block (src/server/cabinet/registration-record.ts).
+  const reg = t.NodeRegistration as Record<string, unknown> | undefined;
+  if (reg && typeof reg === 'object') {
+    const amount = typeof reg.burn_amount === 'string' && /^\d{1,15}$/.test(reg.burn_amount) ? Number(reg.burn_amount) : num(reg.burn_amount);
+    return {
+      node_id: clip(reg.node_id, 128),
+      node_type: clip(reg.node_type, 16),
+      burn_tx: clip(reg.burn_tx, 128),
+      burn_wallet: clip(reg.burn_wallet, 64),
+      burn_amount: amount,
+    };
+  }
   return null;
 }
 

@@ -1,0 +1,127 @@
+/* Setup tab layout on top of popup.css (same palette and components). Loaded by setup.js, because the
+   page contract lets every page link popup.css only. */
+
+body.page-setup {
+  font-size: 14px;
+  display: flex;
+  justify-content: center;
+}
+
+/* The column is as wide as the tab allows (up to the shell's 640 px), whatever the screen holds: a whole address sizes
+   its type to its box (popup.css, .account-address) and gives the column no width of its own. */
+.page-setup #app {
+  width: 100%;
+  max-width: 640px;
+}
+
+.setup-shell {
+  width: 100%;
+  max-width: 640px;
+  padding: 32px 20px 48px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.setup-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.setup-header .brand-mark {
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  filter: drop-shadow(0 0 8px rgba(0, 212, 255, 0.5));
+}
+
+.setup-header .brand-name {
+  font-weight: 700;
+  font-size: 1.25rem;
+  background: var(--qnet-gradient);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+.setup-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border-primary);
+  border-radius: 16px;
+  padding: 24px;
+  box-shadow: var(--shadow-card);
+}
+
+.setup-card h2 {
+  font-size: 1.5rem;
+  background: var(--qnet-gradient);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+.setup-card .stack {
+  gap: 16px;
+}
+
+.setup-card .row.actions > .btn {
+  flex: 0 1 auto;
+  min-width: 140px;
+}
+
+.choices {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+}
+
+.choice {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 16px;
+  border-radius: var(--radius-lg);
+  background: var(--gradient-card);
+  border: 1px solid var(--border-primary);
+}
+
+.choice .btn {
+  margin-top: auto;
+}
+
+.words-cover {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 180px;
+  border-radius: var(--radius-lg);
+  border: 1px dashed var(--border-active);
+  background: rgba(0, 0, 0, 0.25);
+}
+
+/* the word grid, then its Copy button with the warning */
+.words-shown {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.words-shown .word-grid li {
+  font-size: 1rem;
+  padding: 10px 12px;
+}
+
+.setup-card .kv dd {
+  text-align: start;
+}
+
+@media (max-width: 480px) {
+  .setup-card {
+    padding: 16px;
+  }
+
+  .word-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}

@@ -42,16 +42,17 @@ call `verify_detached_signature` directly.
 
 ## Key derivation and node identity
 
-Identity is a pure function of the operator's BIP-39 mnemonic. Keys are **never randomly generated
-and never written to disk**. Two *independent* ML-DSA-65 keypairs are derived from the same BIP-39
-64-byte seed on two distinct domains.
+Identity is a pure function of the operator's 12- or 24-word recovery phrase (the mnemonic). Keys are
+**never randomly generated and never written to disk**. Two *independent* ML-DSA-65 keypairs are
+derived from the same 64-byte recovery-phrase seed on two distinct domains.
 
 | Key | KeyGen seed `xi` | Used for |
 | --- | --- | --- |
-| Consensus / block-signing key | `SHA3-256(XI_DOMAIN \|\| bip39_seed64)` | block signatures, consensus messages, VRF, handshake proofs |
-| Wallet key | `SHAKE-256("QNET_WALLET_MLDSA65_v1:" \|\| hex(bip39_seed64))` truncated to 32 bytes | the on-chain EON address and value transactions |
+| Consensus / block-signing key | `SHA3-256(XI_DOMAIN \|\| seed64)` | block signatures, consensus messages, VRF, handshake proofs |
+| Wallet key | `SHAKE-256("QNET_WALLET_MLDSA65_v1:" \|\| hex(seed64))` truncated to 32 bytes | the on-chain EON address and value transactions |
 
-where `XI_DOMAIN = "QNet/ML-DSA-65/consensus-identity/v1"`. Both seeds feed
+where `seed64 = PBKDF2-HMAC-SHA512(phrase, "mnemonic", 2048 iterations, 64 bytes)` and
+`XI_DOMAIN = "QNet/ML-DSA-65/consensus-identity/v1"`. Both seeds feed
 `ml_dsa_65::KG::keygen_from_seed(xi)`, producing standard FIPS 204 encodings. The **wallet** key
 determines the account address: `WalletIdentity::derive_wallet_address` derives it from the wallet
 public key.
@@ -80,7 +81,8 @@ address    = body + hex(SHA3-256(body))[0..8]
 
 So: 19 hex characters, the literal string `eon`, 15 hex characters, and an 8-hex-character SHA3-256
 checksum over the body. This is the only place raw SHA-512 is used as a hash function; SHA-512 also
-appears as the PRF inside BIP-39's PBKDF2 and SLIP-10's HMAC chain (see the hash table below).
+appears as the PRF inside the recovery-phrase seed's PBKDF2 and the HMAC chain of the hardened Ed25519
+key derivation of the Solana account (see the hash table below).
 
 Because the address commits to the public key, **the address is the address-to-key binding**. Value
 transaction verification enforces `eon_from_qnet_dilithium_pubkey_bytes(pk) == tx.from` on every
@@ -231,9 +233,9 @@ cannot be rewritten in flight to mint a second valid hash for one signature.
 | SHA3-256 | block hashes, transaction hashes, all merkle and SMT nodes, all domain-tagged digests, LtHash row seeds and committed digests, checkpoint hash, leader selection, database key derivation |
 | SHA3-512 | VRF output derivation only (truncated to 32 bytes) |
 | SHAKE-256 | LtHash lane expansion (2048-byte stream) and the wallet KeyGen-seed derivation |
-| SHA-512 | as a raw hash, address derivation only; also the PRF inside BIP-39's PBKDF2 and the SLIP-10 `ed25519 seed` HMAC chain |
+| SHA-512 | as a raw hash, address derivation only; also the PRF inside the recovery-phrase seed's PBKDF2 and the `ed25519 seed` HMAC chain of the hardened Ed25519 key derivation |
 | BLAKE3 | non-consensus derivations only: node pseudonyms, device-token hashing, activation-code hashing, and a reward-shard index |
-| PBKDF2-HMAC-SHA512 | BIP-39 mnemonic-to-seed only |
+| PBKDF2-HMAC-SHA512 | recovery phrase to seed only |
 | PBKDF2-HMAC-SHA256 | mobile wallet secret-key encryption only |
 
 The `sha3` crate is used for FIPS 202 SHA3-256, SHA3-512 and SHAKE-256. Transaction hashes are

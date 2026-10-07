@@ -1,398 +1,362 @@
 # Smart contracts
 
-QNet executes smart contracts in a deterministic WebAssembly interpreter (`core/qnet-vm`) invoked from
-block application, plus two token standards — QRC-20 and QRC-721 — implemented natively in the Rust
-apply arms rather than as WASM modules. This document describes the execution engine, the deploy-time
-determinism gate, the host ABI, the fuel and gas budgets, contract address derivation, the storage and
-event-log models, and the transaction data formats and RPC paths used to deploy and call contracts.
+QNet runs contracts in a deterministic WebAssembly interpreter (`core/qnet-vm`), called from block
+application, and implements two token standards, QRC-20 (fungible) and QRC-721 (collections),
+natively in the Rust apply code rather than as WebAssembly. This document describes the module a
+contract must be, the host functions it can call, how it is deployed and called, what it costs, its
+storage and events, how to read its state, and the Rust templates in `contracts/`.
+
+The Rust workspace `contracts/` (helper crate, templates and a checking tool) is described in
+[`contracts/README.md`](../../contracts/README.md); the `qnet` command that deploys and calls is in
+[CLI](cli.md).
 
 ## The virtual machine
 
 | Property | Value |
 | --- | --- |
-| Crate | `core/qnet-vm` (workspace member, leaf crate — depends on no consensus code) |
-| Engine | `wasmi` 0.47 interpreter, fuel metering enabled |
-| Deploy validator | `wasmparser` 0.252 with a restricted feature set |
-| Apply entry point | `execute_wasm_calltree`, called from the `ContractCall` arm in `core/qnet-state/src/transaction.rs` |
+| Crate | `core/qnet-vm`, a leaf crate with no consensus dependencies |
+| Engine | the `wasmi` 0.47.2 interpreter with fuel metering; `wasmparser` 0.252.0 for deploy validation |
+| Called from | the `ContractCall` and `ContractDeploy` arms of `core/qnet-state/src/transaction.rs` |
+| Enabled | on every node from genesis |
 
-WASM contracts are live from genesis on every node.
+## Module rules
 
-## Determinism gate at deploy
+`validate_wasm_module` runs when a node receives a deploy and again when the deploy is applied. A
+module is accepted only when:
 
-`validate_wasm_module` runs before any module is stored. A module is accepted only when all of the
-following hold. At runtime the consensus call-tree executor additionally enforces fuel, the store
-memory limiter, `MAX_WRITES_PER_FRAME`, `MAX_LOG_DATA_BYTES`, `MAX_LOGS_PER_TX`, `MAX_CALL_DEPTH`, the
-reentrancy ban, and `MAX_CONTRACT_STORAGE_ENTRIES` at commit. The off-consensus `dry_run` executor
-behind RPC views runs one frame with its own budgets, described under
-[read-only views](#read-only-views).
+| Rule | Limit |
+| --- | --- |
+| Size | at most 524,288 bytes (512 KiB); in practice a deploy carries at most 24,949 bytes ([Deploying](#deploying)) |
+| Features | the base instruction set plus mutable globals, sign extension, multi-value and saturating float-to-int conversion. Floating-point types and instructions, bulk memory, reference types, SIMD, threads and atomics, tail calls, exceptions, multiple memories and 64-bit memory are refused |
+| Memory | every memory declares a maximum, at most 256 pages (16 MiB) |
+| Functions | at most 8,192 defined functions |
+| Imports | functions only; an imported memory or table is refused |
 
-- The module validates under a feature set containing only `MUTABLE_GLOBAL`, `SIGN_EXTENSION`,
-  `MULTI_VALUE` and `SATURATING_FLOAT_TO_INT`. Floating-point value types and operators, threads and
-  atomics, SIMD and relaxed SIMD, reference types, GC, tail calls, exceptions and memory64 all fall
-  outside that set and fail validation.
-- Module size is at most `max_code_bytes`.
-- Every declared linear memory has an explicit maximum, and that maximum is at most
-  `max_memory_pages`. A memory with no declared maximum is rejected, because an unbounded
-  `memory.grow` would resolve according to host RAM and split the state root.
-- The function count is at most `max_functions`.
-- Imported memories and imported tables are rejected. Imported host functions are accepted — that is
-  how the ABI below is provided.
+A node does **not** check at deploy that the imports are host functions with the right types, that
+the module exports `memory`, or that its entries have the right type. Such a module deploys and then
+fails every call. `qnet check`, `qnet deploy` and `cargo check-contract` in `contracts/` check all of it
+before anything is sent.
 
-On the consensus call-tree path each frame's store carries a `StoreLimits` limiter capping each linear
-memory at `max_memory_pages * 65536` bytes, so an over-cap `memory.grow` fails identically on every
-node instead of reaching the host allocator. In the off-consensus `dry_run` store used by RPC views,
-growth is bounded by the module's own deploy-validated maximum. Contract storage is a sorted
-`BTreeMap`, so iteration order is fixed.
+A module that can be called:
 
-### Protocol limits
+- exports its linear memory as `memory` (every host function reads and writes through it);
+- exports each entry point as a function of type `() -> ()`, under any name; a call's `method` picks
+  it, `run` when the call names none;
+- imports only functions of module `env`, with the exact types below.
+
+Each call instantiates the module afresh: linear memory and globals start from the module's own
+initial state, a `start` function (if any) runs first, and only storage, events and the return bytes
+outlive the call.
+
+The smallest valid contract, in WebAssembly text:
+
+```wat
+(module
+  (memory (export "memory") 1 1)
+  (func (export "run")))
+```
+
+## Host functions
+
+All in module `env`. Pointers and lengths are `i32` offsets and byte counts in the contract's own
+memory; an access outside that memory stops the call. Functions marked "copies" write at most the
+given capacity and return the full length, so a contract can size a buffer and ask again.
+
+| Function | Type | Behaviour |
+| --- | --- | --- |
+| `storage_read` | `(key_ptr, key_len, out_ptr, out_cap: i32) -> i32` | this contract's value for the key: `-1` when absent, else its length (copies) |
+| `storage_write` | `(key_ptr, key_len, val_ptr, val_len: i32)` | sets the key for this contract; an empty value is stored as empty (there is no delete) |
+| `get_caller` | `(out_ptr, out_cap: i32) -> i32` | the transaction's sender in the entry call, the calling contract in a nested call: 45 ASCII bytes (copies) |
+| `get_contract` | `(out_ptr, out_cap: i32) -> i32` | this contract's own address (copies) |
+| `get_call_args` | `(out_ptr, out_cap: i32) -> i32` | the call's input bytes (copies) |
+| `set_return` | `(ptr, len: i32)` | the bytes handed back to a calling contract |
+| `get_block_height` | `() -> i64` | the height of the block applying the call; the only clock a contract has |
+| `get_value` | `() -> i64` | always 0 in the entry call (a call carries no QNC); in a nested call, the informational `value` the caller passed |
+| `emit_log` | `(ptr, len: i32)` | records an event ([Events](#events)) |
+| `revert` | `(msg_ptr, msg_len: i32)` | stops the call; the message is not returned or stored anywhere |
+| `call_contract` | `(addr_ptr, addr_len, entry_ptr, entry_len, args_ptr, args_len: i32, value: i64, ret_ptr, ret_cap: i32) -> i32` | calls `entry` of the contract at `addr` with `args`; `>= 0` is the callee's return length (copies), `-1` not a reachable WebAssembly contract, `-2` depth limit or re-entry, `-3` the callee stopped |
+
+Safe Rust bindings for all eleven are in `contracts/qnet-contract` (`storage`, `caller`,
+`this_contract`, `args`, `set_return`, `emit`, `revert`, `call`, and a panic handler that reverts).
+
+**Contract-to-contract calls.** A contract can reach another contract only if the transaction lists
+it in the access list of its calldata. `POST /api/v1/contract/call` builds the calldata from
+`contract`, `method` and `args` only, so a call submitted today carries no access list and
+`call_contract` returns `-1`. The call stack is at most 8 contracts deep and no contract may be
+entered again while it is on the stack.
+
+## Deploying
+
+A deploy goes to `POST /api/v1/contract/deploy`, with the module base64-encoded, an empty
+`constructor_args`, a gas limit the sender chooses and the public key always attached. The node
+builds the deploy payload `{"code":"<module hex>","code_hash":"<SHA3-256 of the module>","wasm":true}`;
+the signature covers `code_hash`. The exact text, body and answer are in
+[Transactions](transactions.md#contract-deploy).
+
+- **Gas and size.** A deploy's intrinsic gas is 500,000 + 10 per byte of the deploy payload, which is
+  2 × module bytes + 102 bytes long. No transaction may carry more than 1,000,000 gas, so a module can
+  be at most **24,949 bytes**. At the minimum price that deploy costs 0.015 QNC.
+- **No constructor.** Deploying stores the validated code and runs nothing. A contract that needs an
+  owner fixes it at build time (as the `game-items` template does); an `init` entry that stores its
+  first caller could be called first by anyone, because the address is known before the deploy lands.
+- **Immutable.** There is no upgrade, replacement or removal of code, and a second deploy to an
+  address that holds a contract is refused.
+- **Confirming it.** The route returns no transaction hash. The deploy is done when
+  `GET /api/v1/account/{contract}` shows `is_contract: true`; `qnet deploy` waits for exactly that.
+
+`POST /api/v1/wasm/deploy` also accepts a module (hex), but it fixes the gas limit at 200,000, below
+any deploy's intrinsic gas, so a deploy sent through it cannot land. Use `/api/v1/contract/deploy`.
+
+### Contract address
+
+The chain derives the address from the deployer and the deploy's nonce; the deployer cannot choose it:
+
+```
+h        = hex(SHA3-256("qnet_contract_v1" || from || nonce as 8 bytes little-endian))
+address  = h[0..19] + "eon" + h[19..34] + hex(SHA3-256(h[0..19] + "eon" + h[19..34]))[0..8]
+```
+
+It has the form and checksum of a wallet address. `deriveContractAddress(from, nonce)` in the builders
+and the SDK computes it; for the transaction vectors, `d9fa370374e24333242eon847d1d354dcd87fe873823e`
+at nonce 5 gives `6ce70dafadba812b808eon6216f3fb34b4696928abec9`.
+
+## Calling
+
+A call goes to `POST /api/v1/contract/call` with `method` and `args` (the call input as a hex string,
+or `null`); the node builds the calldata `{"args":…,"contract":…,"method":…}` and the signature covers
+its SHA3-256 ([Transactions](transactions.md#contract-call-and-token-transfer)). The contract reads
+the decoded bytes with `get_call_args`.
+
+- **Fuel.** The call runs on `gas_limit − (100,000 + 5 × calldata bytes)` of fuel. Fuel counts the
+  interpreter's instructions; `emit_log` costs 1,500 + 8 per byte more. The sender pays the intrinsic
+  gas plus the fuel burned, at 1.5 × the gas price; unused fuel is refunded.
+- **Outcome.** When the call returns normally, its storage writes and events are committed. When it
+  reverts, traps or runs out of fuel, nothing of it is kept, the fee and the burned fuel are paid and
+  the nonce is used. The node records neither case, and the entry call's `set_return` bytes go
+  nowhere: a client learns a call's effect from its events and storage.
+- **No QNC out.** A call's `amount` is always 0, no host function sends QNC, and a contract cannot call a
+  built-in token, so a contract can never send QNC or a built-in token on. A node's submit routes refuse a QNC
+  transfer, a batch transfer, or a built-in token `transfer` or `transferFrom`, whose recipient account is a
+  contract (`recipient_is_contract`; `recipient_unreadable` when the node could not read the recipient's
+  account: ask again or ask another node). The check is made at the routes, not in the block rules: a block
+  that carries such a transfer applies it, and the value stays in the contract account for good. Check that a
+  recipient is not a contract before sending (`getAccount(to).isContract`); `qnet transfer` and
+  `qnet token transfer` refuse one.
+- **Block budget.** The fuel reserved by all calls of one block (their `gas_limit` minus intrinsic
+  gas) is at most 50,000,000.
+
+Fuel measured for the templates in the node's VM (`contracts/tool/tests/vm.rs`): counter `run` 2,731;
+game-items `mint` 17,100 and `transfer` 18,104 (each decodes one address, whose checksum costs about
+8,500). A gas limit of intrinsic plus 30,000 covers these entries with room to spare; the clients' default
+fuel is 200,000.
+
+## Storage
+
+- Each contract has its own key-value storage, reached only by its own code. Keys and values are
+  byte strings.
+- On chain every entry is kept in the contract account's `contract_storage` map as
+  `hex(key) → hex(value)`, lowercase. Four metadata entries are stored as plain text and cannot be
+  reached from the contract: `type` (`wasm`), `code`, `deployer` and `deployed_at`.
+- There is no delete and no way to list keys: choose keys a reader can rebuild, such as
+  `bal:<address>:<item>`.
+- A single call may write at most 50,000 distinct keys; a contract holds at most 50,000,000 entries.
+  A call that would exceed either is not committed.
+- Storage is part of the state commitment: each contract's entries form a Merkle tree whose root is
+  in the contract's account leaf, which is in the checkpoint's `state_root`
+  ([State](../architecture/state.md)).
+
+## Events
+
+`emit_log(ptr, len)` records an event of up to 16,384 bytes, tagged with the emitting contract's
+address. One transaction may record at most 512 events in all. The payload is opaque: a contract
+defines its own encoding (the templates use readable text). Events are kept only when the call
+returns normally.
+
+Events are committed in the checkpoint's `logs_root`: each event is a leaf
+`SHA3-256(tx_hash || log_index as 4 bytes little-endian || contract || 0x00 || data)`, where
+`log_index` is the event's position in its block's list; a Merkle tree per block and one per
+90-block window lead to `logs_root`, which the committee certifies.
+
+| Route | Answer |
+| --- | --- |
+| `GET /api/v1/logs?contract=&from=&to=` | `{success, from, to, oldest_available, pruned_below, count, logs[{height, log_index, tx_hash, contract, data}]}` with `data` as hex; at most 501 heights per request (`to` is cut to `from` + 500); `from` defaults to 0, which is long pruned, so always pass it |
+| `GET /api/v1/logs/proof?tx_hash=&log_index=` | the leaf, its path to the block root and the block root's path to `logs_root`, for a window that is final; errors `window_not_finalized`, `window_pruned`, `Log not found in window` |
+
+`log_index` is the position within the block, not within the transaction; each `/api/v1/logs` row
+carries it, counted before the `contract` filter, so a row of a filtered page names the index its proof
+takes. Nodes keep events as long as their block bodies (about a day on the testnet); `oldest_available`
+says where that starts. `NodeClient.verifyLog` in the SDK checks a proof against a committee-certified
+checkpoint; its `getLogs` rows carry that position as `logIndex` (`null` only for a filtered page from a
+node whose rows lack it, when `verifyLog` finds it from the event's height).
+
+## Reading contract state
+
+| Read | Gives |
+| --- | --- |
+| `GET /api/v1/account/{contract}` | the whole account, including `is_contract`, `contract_code_hash` and the full `contract_storage` map (keys and values hex, the code under `code`) |
+| `POST /api/v1/contract/call` with `"is_view": true`, `"method": "storageGet"`, `"args": ["<key>"]` | one value; the key is the UTF-8 bytes of the text given, and the value comes back as text, so it suits text keys and values (like the `game-items` storage). The other fields of a call body must be present; no signature |
+| `GET /api/v1/logs` | the contract's events |
+
+A read-only call of any other method runs it with no input and returns no value: the answer is
+`"success": true` with `"result": {"error": "view '<method>' returned no value"}`. Contracts expose
+data through storage and events instead.
+
+`GET /api/v1/contract/{address}` and `GET /api/v1/contract/{address}/state` read a store that nothing
+writes; they answer "not found" and `null` for every contract.
+
+## Limits
 
 | Constant | Value | Meaning |
 | --- | --- | --- |
-| `VmLimits::max_memory_pages` | 256 | 16 MiB of linear memory at 64 KiB per page |
-| `VmLimits::max_code_bytes` | 524288 | 512 KiB module size |
-| `VmLimits::max_functions` | 8192 | functions per module |
-| `MAX_CALL_DEPTH` | 8 | contracts on the call stack at once |
-| `MAX_WRITES_PER_FRAME` | 50000 | distinct storage writes per frame invocation |
-| `MAX_LOG_DATA_BYTES` | 16384 | bytes in a single event |
-| `MAX_LOGS_PER_TX` | 512 | events across the whole call tree of one transaction |
-| `LOG_FUEL_BASE` | 1500 | fuel charged per `emit_log` |
-| `LOG_FUEL_PER_BYTE` | 8 | fuel charged per logged byte |
-| `MAX_WASM_ACCESS_LIST` | 64 | contracts a call may declare it will reach |
-| `MAX_CONTRACT_STORAGE_ENTRIES` | 50000000 | entries per contract |
-| `VIEW_CALL_FUEL` | 50000000 | fuel for an off-consensus RPC view |
+| `VmLimits::max_code_bytes` | 524,288 | module size the validator accepts |
+| `MAX_WASM_CODE_BYTES` (builders) | 24,949 | module size one deploy can carry |
+| `VmLimits::max_memory_pages` | 256 | 16 MiB of linear memory |
+| `VmLimits::max_functions` | 8,192 | functions per module |
+| `MAX_CALL_DEPTH` | 8 | contracts on the call stack |
+| `MAX_WRITES_PER_FRAME` | 50,000 | distinct keys one call frame writes |
+| `MAX_LOG_DATA_BYTES` | 16,384 | bytes in one event |
+| `MAX_LOGS_PER_TX` | 512 | events of one transaction |
+| `LOG_FUEL_BASE`, `LOG_FUEL_PER_BYTE` | 1,500, 8 | fuel of one event |
+| `MAX_WASM_ACCESS_LIST` | 64 | contracts one call may declare |
+| `MAX_CONTRACT_STORAGE_ENTRIES` | 50,000,000 | entries per contract |
+| `gas_limits::MAX_GAS_LIMIT` | 1,000,000 | gas of one transaction |
+| `gas_limits::BLOCK_FUEL_LIMIT` | 50,000,000 | fuel reserved by one block's calls |
+| `VIEW_CALL_FUEL` | 50,000,000 | fuel of a read-only call |
 
-## Fuel and gas
+## Building contracts in Rust
 
-Gas and fuel are two separate budgets with two separate ceilings.
-
-**Intrinsic gas.** `compute_gas_used()` is a pure function of the transaction type and data length:
-`CONTRACT_DEPLOY` = 500000 plus 10 per byte of transaction data; `CONTRACT_CALL` = 100000 plus 5 per
-byte. `MAX_GAS_LIMIT` is 1000000 per transaction. The effective gas price is `gas_price`, plus 50 per
-cent for an ML-DSA-65-signed transaction (`effective_gas_price`).
-
-**Fuel.** The interpreter receives `gas_limit - compute_gas_used()` as its fuel budget. Fuel is
-`wasmi`'s instruction counter. The one explicit host-side fuel charge is `emit_log`, priced at
-`LOG_FUEL_BASE + LOG_FUEL_PER_BYTE * len`; if the remaining fuel cannot pay it, or the event exceeds
-`MAX_LOG_DATA_BYTES`, the frame traps. Fuel exhaustion is a deterministic trap.
-
-**Settlement.** The sender prepays `gas_limit * effective_gas_price`. At heights at or above
-`GAS_METERING_ACTIVATION_HEIGHT` (100000), the activation height of the `gas_metering` feature gate,
-`apply_gas_refund` credits back
-`compute_gas_refund() - wasm_fuel_fee(fuel)`, i.e. the unused intrinsic gas minus the metered compute
-fee `fuel * effective_gas_price`. The producer's fee credit adds exactly the same compute fee, so the
-charge is a symmetric account move and total supply is unchanged. Fuel is billed even when the call
-tree traps, because the work was performed. `reserved_fuel()` is non-zero only for `ContractCall`.
-
-**Block ceilings.** Every validator independently sums, from signed fields alone and without
-executing anything, the charged gas and the reserved fuel of a proposed block, and rejects the block
-if either exceeds `BLOCK_GAS_LIMIT` (200000000) or `BLOCK_FUEL_LIMIT` (50000000). Charged gas is
-`compute_gas_used()` at heights at or above `GAS_METERING_ACTIVATION_HEIGHT` and `gas_limit` below it;
-transactions from `system_` senders or with `gas_limit` 0 are not counted. This check runs from genesis
-in `development/qnet-integration/src/block_pipeline.rs`. The producer counts the same way while filling
-and ends the block before the first transaction that would take its charged gas past
-`BLOCK_FILL_SOFT_GAS` (130000000) or its reserved fuel past `BLOCK_FUEL_LIMIT`, leaving that transaction
-and the ones after it in the mempool. `BLOCK_FILL_SOFT_GAS` is a producer-local target;
-`QNET_BLOCK_FILL_GAS` overrides it, clamped to the range 10000000 to `BLOCK_GAS_LIMIT`. Validators accept
-blocks up to the consensus limits.
-
-## Host ABI
-
-All imports live in module `env`. All pointer and length arguments index the calling contract's own
-linear memory, which the module must export as `memory`. The entry function is called with no
-arguments and returns nothing; results are returned through `set_return` (call-tree path) or through
-contract storage.
-
-Available in every execution context:
-
-| Function | Signature | Behaviour |
-| --- | --- | --- |
-| `storage_write` | `(key_ptr, key_len, val_ptr, val_len)` | writes into this contract's overlay; traps past `MAX_WRITES_PER_FRAME` |
-| `storage_read` | `(key_ptr, key_len, out_ptr, out_cap) -> i32` | returns `-1` when absent, otherwise the full value length; the value is truncated into `out_cap` bytes |
-| `get_caller` | `(out_ptr, out_cap) -> i32` | caller address bytes, returns the full length |
-| `get_block_height` | `() -> i64` | height of the block being applied; in a view, the serving node's current height |
-| `get_value` | `() -> i64` | the call's `value` context: 0 in the entry frame and in a view, since a `ContractCall` carries no native QNC; inside a callee, the `value` its caller passed to `call_contract` |
-| `emit_log` | `(data_ptr, data_len)` | appends an opaque event payload; charges fuel |
-| `revert` | `(msg_ptr, msg_len)` | always traps, carrying the message |
-
-Additionally available inside the multi-frame (cross-contract) executor:
-
-| Function | Signature | Behaviour |
-| --- | --- | --- |
-| `get_contract` | `(out_ptr, out_cap) -> i32` | this contract's own address |
-| `get_call_args` | `(out_ptr, out_cap) -> i32` | argument bytes passed by the caller |
-| `set_return` | `(ptr, len)` | sets this frame's return bytes |
-| `call_contract` | `(addr_ptr, addr_len, entry_ptr, entry_len, args_ptr, args_len, value: i64, ret_ptr, ret_cap) -> i32` | `>= 0` is the full return length, `< 0` is an error code |
-
-`get_block_height` is the only time-like input to a contract.
-
-### Cross-contract calls
-
-`call_contract` runs the callee against the callee's own storage. Semantics:
-
-- **Depth** is bounded by `MAX_CALL_DEPTH`.
-- **Reentrancy is forbidden unconditionally**: if the target address is already anywhere on the call
-  stack, the call returns `CALL_ERR_DEPTH_OR_REENTRANT` without executing.
-- **One shared fuel budget** is threaded through the tree: a child spends the parent's remaining fuel
-  and the parent resumes with whatever the child left.
-- **Frame outcomes**: a frame that returns cleanly commits its storage writes into the tree-wide delta
-  and hands its logs to its caller. A frame that traps discards its own writes and its own logs —
-  including the logs its children handed up — and surfaces `CALL_ERR_TRAPPED` to its caller, which may
-  itself revert or continue.
-- **The storage delta is tree-wide**, one map shared by every frame, and reads see it: a write
-  committed by a child that already returned is visible to later frames and stays in the delta even if
-  the frame that made the call subsequently traps. What discards committed writes is a trap that
-  reaches the entry frame, which drops the whole tree. A contract that must not keep a child's effects
-  after a later step fails therefore propagates the failure — any frame can `revert` — rather than
-  relying on the failing frame alone to unwind them.
-- **`MAX_LOGS_PER_TX` counts the whole tree**: the counter lives on the shared call state, so a child's
-  `emit_log` is counted in the caller's budget, and the cap bounds the events one transaction can
-  contribute to `logs_root` regardless of cross-contract fan-out.
-- **Value** is context only: the `value` argument is what the callee reads through `get_value`, and
-  the VM result type carries storage writes and logs.
-
-| Code | Value | Meaning |
-| --- | --- | --- |
-| `CALL_ERR_NOT_CONTRACT` | -1 | target has no code, is not a WASM contract in the resolved set, or the entry-name bytes are not valid UTF-8 |
-| `CALL_ERR_DEPTH_OR_REENTRANT` | -2 | depth cap reached, or target already on the stack |
-| `CALL_ERR_TRAPPED` | -3 | callee trapped |
-
-The set of callable contracts is bounded. The apply layer builds its resolver from accounts in the
-lazily pre-loaded working set whose `contract_storage["type"] == "wasm"` and whose `code` entry decodes
-as hex. Those accounts come from an `accessList` array in the signed transaction data — the caller
-declares, under signature, every contract the call may reach — which `get_all_affected_addresses` adds
-to the working set, capped at `MAX_WASM_ACCESS_LIST`. Any target outside that set deterministically
-returns `CALL_ERR_NOT_CONTRACT` on every node.
-
-## Deploying a contract
-
-The contract address is derived on-chain and never taken from a caller-supplied `to`:
+`contracts/` is a Cargo workspace of its own. Plain compiler output is refused at deploy (it uses
+bulk-memory and reference-type instructions, a `call_indirect` encoding the validator rejects, and no
+memory maximum); `contracts/.cargo/config.toml` turns those features off and fixes the memory at
+2 pages with a 32 KiB stack, and the release profile adds the link-time optimisation that is required.
+Built and tested with rustc 1.93.1:
 
 ```
-sha3_256("qnet_contract_v1" || from || nonce_le)
+rustup target add wasm32-unknown-unknown
+cd contracts
+cargo build-contracts                     # every template, each checked against the deploy rules
+cargo check-contract path/to/module.wasm  # any module built elsewhere
+cargo test
 ```
 
-The digest is rendered in EON form as `{hash[0..19]}eon{hash[19..34]}{checksum}`, where the checksum is
-the first four bytes of `sha3_256` over the assembled body. A deployer therefore cannot squat an
-address, and the address the RPC returns equals the address apply derives. Deploy is init-once: if an
-account at the derived address is already a smart contract, the deploy is rejected.
+The build fails when a module is larger than 24,949 bytes, is refused by the node's own
+`validate_wasm_module`, imports anything but the host functions with their exact types, exports no
+`memory`, or exports a function that is not `() -> ()`. Keep contracts `#![no_std]` and free of
+`f32`/`f64`: standard-library collections and formatting quickly pass the size cap, and floating
+point is refused.
 
-Authorization is an ML-DSA-65 (Dilithium3) signature over the canonical message
-`q{chain_id}|contract_deploy:{from}:{code_hash}:{nonce}:{gas_price}:{gas_limit}`, where `code_hash` is read from the
-transaction data and `q{chain_id}` is the chain tag (`q1337` on testnet).
-The signature and public key are carried as hex-encoded raw bytes. See
-[cryptography](../architecture/cryptography.md) for the signature scheme.
+The whole counter template (`contracts/templates/counter/src/lib.rs` without its tests):
 
-The WASM deploy branch validates the module and stores the code; state is initialised by the
-contract's own methods after deployment.
+```rust
+#![cfg_attr(target_arch = "wasm32", no_std)]
 
-### Deploy transaction data formats
+use qnet_contract::{caller, emit, entry, revert, storage, Buf, ADDRESS_LEN};
 
-| Form | Data JSON | Result at apply |
+const KEY: &[u8] = b"count";
+
+entry! {
+    /// Adds one to the counter.
+    fn run() {
+        match load().checked_add(1) {
+            Some(next) => store_and_log(next),
+            None => revert(b"overflow"),
+        }
+    }
+
+    /// Sets the counter back to zero.
+    fn reset() {
+        store_and_log(0);
+    }
+}
+
+fn load() -> u64 {
+    let mut b = [0u8; 8];
+    match storage::read(KEY, &mut b) {
+        Some(8) => u64::from_le_bytes(b),
+        _ => 0,
+    }
+}
+
+fn store_and_log(value: u64) {
+    let bytes = value.to_le_bytes();
+    storage::write(KEY, &bytes);
+    emit(
+        Buf::<{ 8 + ADDRESS_LEN }>::new()
+            .push(&bytes)
+            .push(caller().as_bytes())
+            .as_bytes(),
+    );
+}
+```
+
+## Templates
+
+| Template | Entries | Storage and events |
 | --- | --- | --- |
-| Executable WASM | `{"wasm": true, "code": "<hex>", "code_hash": "<hex>"}` | module validated, `type="wasm"`, `code=<hex>` stored |
-| QRC-20 | `{"qrc20": true, "name", "symbol", "decimals", "logo", "initial_supply", "mintable", "burnable", "code_hash"}` | native token contract materialised |
-| QRC-721 | `{"qrc721": true, "name", "symbol", "code_hash"}` | native NFT collection materialised |
+| `counter` | `run` adds one, `reset` sets zero | key `count`, 8 bytes little-endian; each call emits the new value followed by the caller's address. The Rust form of `development/qnet-contracts/examples/counter.wat`, with the same storage and events |
+| `game-items` | `mint(to, item, amount)` (owner only), `transfer(to, item, amount)`, `balance(holder, item)` (returns the count to a calling contract) | arguments concatenated: an address as its 45 ASCII bytes (its checksum must hold, `bad address` otherwise), `item` and `amount` as 8 bytes little-endian each; text keys `bal:<address>:<item>` and `supply:<item>`; text events `mint:<to>:<item>:<amount>` and `transfer:<from>:<to>:<item>:<amount>`. The owner is compiled in from `GAME_ITEMS_OWNER`; a build without it can never mint |
 
-Exactly one of `wasm`, `qrc20` and `qrc721` must be `true`, and `code_hash` must equal the canonical
-deploy digest that `deploy_code_hash` recomputes from the payload. For WASM it is `sha3_256` of the
-module bytes. For a token it is `sha3_256` over the tag `QRC20|` or `QRC721|` followed by each field
-fed as `{byte_len}:{value}` of its string form, in the order `name`, `symbol`, `decimals`,
-`initial_supply`, `mintable`, `burnable`, `logo` for QRC-20 and `name`, `symbol` for QRC-721; an absent
-field is fed as the default the apply arm reads (`decimals` 9, `initial_supply` 0, flags `false`,
-strings empty). `classify_contract_deploy` enforces both rules at admission and again at apply, so
-neither the code nor a token field can be swapped under a signature that still verifies.
+Sizes and deploy gas (rustc 1.93.1): `counter.wasm` 2,382 bytes, 548,660 gas; `game_items.wasm` with an
+owner 7,363 bytes, 648,280 gas.
 
-## Calling a contract
+An address argument is read with `Args::address()`, which checks its form and its checksum (the first 8 hex
+digits of SHA3-256 over the first 37 characters, as the node checks a wallet address) and reverts with
+`bad address` otherwise. A mistyped recipient therefore reverts the call instead of crediting an address no
+key controls; the check costs about 8,500 fuel per address (a `game-items` transfer about 18,100 in all). A
+client should still check every address it encodes into call arguments with `isValidAddress` before asking the
+wallet to sign, since the wallets show a call's arguments only as hex or text.
 
-A `ContractCall` transaction's `data` is the exact calldata bound by the signature: authorization is
-an ML-DSA-65 signature over `q{chain_id}|contract_call:{from}:{sha3(raw tx.data)}:{nonce}:{gas_price}:{gas_limit}`, so the literal
-calldata bytes are committed and no re-serialisation can diverge. The public key may be omitted once
-it is committed on-chain; the submit path rehydrates it.
+## Built-in tokens
 
-Dispatch depends on the target account's `contract_storage["type"]`:
+QRC-20 and QRC-721 contracts are selected by `contract_storage["type"]` and run in the Rust apply code.
+They use the same storage commitment, events and `logs_root` as WebAssembly contracts, and a
+WebAssembly contract cannot call them.
 
-- `qrc20` and `qrc721` run the native apply arms described below.
-- `wasm` runs the VM. The entry point name comes from `data.method`, defaulting to `"run"`. Arguments
-  are supplied as `args`, a JSON string of hex, and are hex-decoded into the bytes the contract reads
-  through `get_call_args`. `accessList`, if present, declares the reachable contract set. Each field
-  decodes fail-closed: a non-string `method`, an `args` value that is not a hex string, or an
-  `accessList` that is not an array of strings or holds more than `MAX_WASM_ACCESS_LIST` entries
-  rejects the transaction.
+**QRC-20.** Stored fields: `name`, `symbol`, `decimals` (default 9), optional `logo`, `mintable`,
+`burnable`, `total_supply`, `total_minted`, `total_burned` (so `total_supply = total_minted −
+total_burned`), and balances under `balance:{address}` and allowances under
+`allowance:{owner}:{spender}` as decimal strings. Methods, called through `POST /api/v1/contract/call`
+with an `args` array: `transfer [to, amount]`, `approve [spender, amount]`, `transferFrom` (or
+`transfer_from`) `[from, to, amount]`, `mint [to, amount]` (the deployer, only if `mintable`), `burn
+[amount]` (only if `burnable`). Amounts are base units, as a JSON number or a decimal string (use the
+string). An unknown method is not applied.
 
-Commit rules for a WASM call: the per-contract storage deltas are written into
-`Account.contract_storage` only when the call tree did not trap and no touched contract would exceed
-`MAX_CONTRACT_STORAGE_ENTRIES`. On a trap or a cap breach nothing is committed, the fee is consumed
-and the nonce advances.
+- A transfer to the burn address `0000000000000000000eon00000000000000036877022` destroys the tokens,
+  for any token.
+- A new holder entry moves a refundable 0.01 QNC deposit from the payer to the escrow account
+  `system_storage_rent_escrow`; whoever's operation removes the entry later receives it.
+- Each move emits an event with the JSON payload `{"amt","from","kind","std","t":"xfer","tid","to"}`,
+  which the token-transfer feeds (`/api/v1/account/{address}/token-transfers`,
+  `/api/v1/token/{contract}/transfers`) index.
 
-A `ContractCall`'s `amount` must be 0: `check_contract_call_value` rejects a non-zero `amount` at
-admission and again at apply, before any state change. The host ABI moves contract storage, return
-bytes and events only, so native QNC credited to a contract address would stay there.
+**QRC-721.** Stored fields `name`, `symbol`; per token `owner:{token_id}`, `approved:{token_id}`, per
+holder `bal:{address}`. Methods: `mint` (the deployer only), `transfer`, `approve`, `transferFrom` (or
+`transfer_from`); `token_id` is always a string.
 
-### Endpoints
+**Reads.** `GET /api/v1/token/{contract}` (name, symbol, decimals, supply), `GET
+/api/v1/token/{contract}/balance/{holder}`, `GET /api/v1/account/{address}/tokens`, and the view methods
+of `POST /api/v1/contract/call` (`balanceOf`, `totalSupply`, `name`, `symbol`, `decimals`, `allowance`;
+`ownerOf`, `getApproved`). A holder's QRC-20 balance also has a proof against the committee-certified
+state root: `GET /api/v1/token/{contract}/{holder}/balance/proof`. Token names and symbols have no
+proof.
 
-Full request and response shapes are in the [RPC API reference](rpc-api.md).
-
-| Method and path | Purpose |
-| --- | --- |
-| `POST /api/v1/wasm/deploy` | deploy executable WASM (`from`, hex `code`, `nonce`, signature, public key); 1 MiB body limit; validates the module before submitting |
-| `POST /api/v1/contract/deploy` | deploy executable WASM from base64 `code` (`from`, `gas_limit` 50000 to 1000000, `gas_price`, `nonce`, empty `constructor_args`, signature, public key); 2 MiB body limit; validates the module and submits the executable-WASM deploy data above |
-| `POST /api/v1/token/deploy` | deploy a QRC-20 token |
-| `POST /api/v1/nft/deploy` | deploy a QRC-721 collection |
-| `POST /api/v1/contract/call` | state-changing call (signature required) or, with `is_view: true`, a read-only query |
-| `POST /api/v1/contract/estimate-gas` | gas estimate for a contract operation |
-| `GET /api/v1/contract/{address}` | contract metadata |
-| `GET /api/v1/contract/{address}/state` | read one or more raw storage keys |
-| `GET /api/v1/logs` | event logs filtered by `contract`, `from`, `to` |
-| `GET /api/v1/logs/proof` | two-level inclusion proof for one event |
-| `GET /api/v1/token/{address}` | token metadata |
-| `GET /api/v1/token/{address}/balance/{holder}` | token balance |
-| `GET /api/v1/token/{contract}/{holder}/balance/proof` | trustless balance proof |
-| `GET /api/v1/token/{contract}/transfers` | decoded transfer feed for a token |
-| `GET /api/v1/account/{address}/tokens` | tokens held by an address |
-| `GET /api/v1/account/{address}/token-transfers` | decoded transfer feed for an address |
-| `GET /api/v1/token-transfers` | decoded transfers over a height range |
-
-### Read-only views
-
-`is_view: true` on `POST /api/v1/contract/call` answers off-consensus, from current committed state.
-For `qrc20` and `qrc721` targets the handler reads the storage keys directly (`balanceOf`, `allowance`,
-`ownerOf`, `getApproved`, `name`, `symbol`, and so on). For a WASM contract:
-
-- `storageGet` / `storage_get` / `get` returns the raw stored value for one storage key, via
-  `view_storage_get`. This is how a WASM contract exposes readable data: write it to storage and read
-  the key back.
-- Any other method name is executed by `view_call`, which runs the method through `qnet_vm::dry_run`
-  against current on-chain storage with `VIEW_CALL_FUEL`.
-
-`dry_run` is a single-frame executor. It binds the seven host functions available in every execution
-context and runs the module against an in-memory `MemHost` seeded from the contract's committed
-`contract_storage`. Its budgets are `VIEW_CALL_FUEL`, the same `emit_log` fuel charge and
-`MAX_LOG_DATA_BYTES`, a cap of 50,000 distinct storage entries in the in-memory map, and linear-memory
-growth bounded by the module's own deploy-validated maximum. The map and the logs are discarded when
-the call returns, and a trap is reported to the caller as a reverted view.
-
-Views are never hashed and change no state.
-
-## Storage model
-
-Contract code and contract state both live inside `Account.contract_storage`, a `String -> String`
-map.
-
-- VM keys and values are stored hex-encoded. The reserved metadata keys `type`, `deployer`, `code`
-  and `deployed_at` are excluded from the byte map a contract sees, and any non-hex entry is skipped.
-  Because none of the reserved words are valid lowercase hex, a hex-encoded data key can never collide
-  with metadata.
-- Contract state is consensus state. `compute_storage_root` builds a per-contract Merkle tree over the
-  entire `contract_storage` map (one leaf per key, with domain-separated key and value hashing); that
-  root is a field of the account leaf and so folds into `state_root`. See
-  [state](../architecture/state.md).
-- QRC-20 and QRC-721 entry creation charges `STORAGE_DEPOSIT_PER_ENTRY_NANO_QNC` (10000000 nanoQNC,
-  0.01 QNC), moved from the payer into the reserved escrow `system_storage_rent_escrow` and refunded
-  when the entry is removed. It is an account move, never a mint or a burn. The refund goes to the
-  caller of the operation that removes the entry, not to the account that created it — a QRC-721 burn
-  refunds the owner pointer, a balance entry that reaches zero and any cleared approval to the burner.
-  Design contracts on that basis: the deposit is a bond on the state entry, and whoever cleans the
-  entry up collects it. Every refundable entry is charged on creation, so the escrow always covers a
-  removal; a shortfall rejects the transaction identically on every node rather than paying short.
-
-## Event logs
-
-Both `emit_log` from WASM and the native token arms feed one thread-local log sink. A thread-local sink
-is sound because a block that carries any contract transaction applies its transactions one at a time;
-only a block of 32 or more transactions that are all transfers takes the parallel apply path, and
-transfers emit no events. The validator apply path clears the sink at block start (`clear_wasm_logs`),
-truncates a rejected transaction's partial emissions back to a pre-apply mark, and drains it at block
-end (`drain_wasm_logs`); the producer's inline apply path clears it before each transaction and drains
-it after each successful one. Both paths therefore commit the events of successful transactions only,
-in apply order.
-
-The commitment is two levels of Merkle tree with distinct domain separators, so a block sub-root can
-never be reinterpreted as a leaf:
-
-| Level | Input | Domains |
-| --- | --- | --- |
-| Leaf | `sha3_256(tx_hash \|\| u32le(log_index) \|\| contract_hex \|\| 0x00 \|\| data)` | — |
-| 1 | one block's leaves, in emit order, to a per-block sub-root | `log-leaf` / `log-node` |
-| 2 | the window's ordered per-block sub-roots to `logs_root` | `logw-leaf` / `logw-node` |
-
-The window is the 90 microblocks of one macroblock window. `logs_root` is a field of `Checkpoint`,
-hashed into `Checkpoint::hash()`, and therefore certified by the 2f+1 quorum certificate; the proposer
-computes it and `content_ok` rejects any checkpoint whose `logs_root` it cannot reproduce. The
-`logs_root_required` feature gate has activation height 0 and is active from genesis. See
-[consensus](../architecture/consensus.md).
-
-Binding `(tx_hash, log_index)` into the leaf means an inclusion proof commits to exact receipt
-coordinates and cannot be replayed under a different transaction or index. A proof is therefore
-O(one block) plus O(the window's sub-roots), never O(the whole window).
-
-Per-block logs are persisted under `blocklogs_{height}` and the per-block sub-root under
-`blocklogsroot_{height}`. Both are pruned below a watermark; `GET /api/v1/logs` and
-`GET /api/v1/logs/proof` report that floor rather than return a partial, non-matching leaf set, and
-the proof endpoint serves windows that are already finalized.
-
-Log payloads are opaque bytes; the log query endpoint filters by contract address and height range,
-clamping `to` to the chain tip and to `from` + `MAX_LOG_RANGE` (500).
-The native token arms emit a structured, sorted-key JSON payload tagged `t:"xfer"`, which is what the
-decoded transfer feeds index.
-
-## Token standards
-
-QRC-20 and QRC-721 are native Rust apply arms selected by `contract_storage["type"]`, sharing the same
-log sink, the same `logs_root` and the same storage commitment as WASM contracts.
-
-### QRC-20
-
-Deploy stores `deployer`, `deployed_at`, `type`, `name`, `symbol`, `decimals` (default 9), optional
-sanitised `logo`, `mintable`, `burnable`, `total_supply`, and the lifetime counters `total_minted`
-(seeded at the initial supply) and `total_burned` (seeded at 0), which keep the invariant
-`total_supply == total_minted - total_burned`. A non-zero initial supply also materialises
-`balance:{deployer}` and charges its storage deposit. `mintable` and `burnable` both default to
-`false`, and `mint` and `burn` are rejected unless the deploy set the matching flag to `true`;
-`POST /api/v1/token/deploy` accepts both as optional booleans. The signed `code_hash` is the canonical
-deploy digest over `name`, `symbol`, `decimals`, `initial_supply`, `mintable`, `burnable` and `logo`.
-
-Methods: `transfer`, `approve`, `transferFrom` (also `transfer_from`), `mint`, `burn`. An unknown
-method is rejected, so a typo cannot silently succeed after the fee was charged.
-
-Storage keys: `balance:{address}`, `allowance:{owner}:{spender}`. Amounts are accepted as a JSON
-number or a decimal string; the string form is exact beyond 2^53. Balances are read with checked
-arithmetic and a present-but-unparseable entry is rejected rather than coerced to zero.
-
-Two behaviours worth knowing:
-
-- A transfer to the canonical burn address `0000000000000000000eon00000000000000036877022` is a real
-  supply burn for any token, including a non-burnable one, and never credits the sink.
-- A self-transfer cannot mint. The debit is written first and the credit re-reads the already-debited
-  value from the live map, so the aliased case nets to a no-op.
-
-### QRC-721
-
-Deploy stores the base `deployer` and `deployed_at` metadata plus `type`, `name` and `symbol`; the
-signed `code_hash` is the canonical deploy digest over `name` and `symbol`.
-Methods: `mint`, `transfer`, `approve`, `transferFrom` (also `transfer_from`); an unknown method is
-rejected. Minting is gated to the recorded deployer, and an absent deployer entry rejects rather than
-mints.
-
-Storage keys: `owner:{token_id}` for per-token ownership, `bal:{address}` for a holder's count,
-`approved:{token_id}` for approvals. `token_id` is always a string argument — a numeric id is rejected
-so a float-lossy value can never alias another token's key. Mint cannot overwrite an existing owner,
-and a transfer requires the owner or an approved address.
+**Deploying tokens.** `POST /api/v1/token/deploy` and `POST /api/v1/nft/deploy` fix the gas limit at
+50,000, below any deploy's intrinsic gas, so a token or collection deploy sent through them cannot
+land.
 
 ## Example sources
 
-`development/qnet-contracts/examples/counter.wat` is a working contract for the VM described above —
-a persistent counter with two entry points — alongside a README covering the host ABI, the required
-exports and the deploy and call requests. It is covered by `example_counter_wat_is_deployable_and_runs`
-in `core/qnet-state/src/transaction.rs`, which deploys and calls it through the apply path.
+`development/qnet-contracts/examples/counter.wat` is the counter in WebAssembly text; the test
+`example_counter_wat_is_deployable_and_runs` in `core/qnet-state/src/transaction.rs` deploys and calls
+it through the apply path, and `contracts/tool/tests/vm.rs` checks that the Rust counter leaves the
+same storage and events.
 
-The Phase-1 burn contract in the same tree targets Solana's Anchor toolchain — see
-[1DEV burn contract](1dev-burn-contract.md).
+The Phase 1 burn program in the same tree runs on Solana: see [1DEV burn contract](1dev-burn-contract.md).
 
 ## Related documents
 
-- [RPC API reference](rpc-api.md) — full request and response shapes
-- [State](../architecture/state.md) — accounts, storage commitment, transaction types
-- [Consensus](../architecture/consensus.md) — checkpoints, quorum certificates, `logs_root`
-- [Cryptography](../architecture/cryptography.md) — ML-DSA-65 signatures, SHA3-256, address format
-- [Economics](../economics/overview.md) — fees and the producer fee credit
-- [SDK](sdk.md) — client libraries
+- [Transactions](transactions.md): the signed texts, gas, fees and status
+- [CLI](cli.md): `qnet check`, `deploy`, `call`, `logs`
+- [RPC API](rpc-api.md): every route
+- [State](../architecture/state.md): accounts and the storage commitment
+- [Consensus](../architecture/consensus.md): checkpoints and `logs_root`

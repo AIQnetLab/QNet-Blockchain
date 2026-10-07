@@ -767,6 +767,45 @@ impl BlockchainNode {
         (idx * 90).min(chain_height)
     }
 
+    /// The highest height this node holds certified, which no rollback may go below: the highest sealed window
+    /// (a full QC-named body list, not a placeholder) whose bodies here match it, walking down from the tip as
+    /// the boot finality ceiling does, raised to the highest committed checkpoint head at or below the tip
+    /// whose list matches the stored bodies. A QC is n−f signatures and irrevocable: any surviving copy re-locks
+    /// the engine on it and steers content fork choice back to its bodies, so after a rollback below it the
+    /// fleet produced but never sealed again (04.10). A node forked below that point still heals: its own
+    /// bodies do not match, so its floor sits lower. 0 = nothing certified here.
+    pub(crate) fn certified_rollback_floor(storage: &crate::storage::Storage) -> u64 {
+        const MI: u64 = qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
+        let tip = storage.get_chain_height().unwrap_or(0);
+        let anchor = SNAPSHOT_ANCHOR_MB.load(std::sync::atomic::Ordering::SeqCst);
+        let mut floor = 0u64;
+        let mut idx = tip / MI;
+        let mut steps = 0u64;
+        while idx > 0 && steps < crate::node::BlockchainNode::MAX_DERIVED_ROSTER_WINDOWS as u64 {
+            steps += 1;
+            // The adopted snapshot anchor is certified by construction and holds no bodies below it.
+            if idx <= anchor { floor = idx * MI; break; }
+            if let Some(list) = crate::block_pipeline::certified_window_hashes(storage, idx) {
+                let (_, mismatched) = Self::window_content_verdict(storage, &list, (idx - 1) * MI + 1, idx * MI, tip);
+                if mismatched.is_empty() { floor = idx * MI; break; }
+            }
+            idx -= 1;
+        }
+        for (_, bytes) in storage.load_certified_pairs().unwrap_or_default() {
+            let cp = match bincode::deserialize::<Vec<crate::consensus_v2_driver::ConsensusMsg>>(&bytes).ok()
+                .and_then(|msgs| msgs.into_iter().find_map(|m| match m {
+                    crate::consensus_v2_driver::ConsensusMsg::Proposal(cp) => Some(cp),
+                    _ => None,
+                })) { Some(cp) => cp, None => continue };
+            let head = cp.window_head_height;
+            let n = cp.window_mb_hashes.len() as u64;
+            if head > tip || head <= floor || n == 0 || n > head { continue; }
+            let (missing, mismatched) = Self::window_content_verdict(storage, &cp.window_mb_hashes, head - n + 1, head, tip);
+            if missing.is_empty() && mismatched.is_empty() { floor = head; }
+        }
+        floor.min(tip)
+    }
+
     pub async fn process_received_macroblock(&self, received: crate::unified_p2p::ReceivedBlock) -> Result<(), QNetError> {
         let index = received.height;  // For macroblocks, height = index
         
@@ -1064,7 +1103,14 @@ impl BlockchainNode {
     /// hash_chain_break walk that used to do this converged one height per repair round.
     pub(crate) fn signal_certified_fork_point(mismatched: &[u64], head_height: u64) {
         if let Some(first) = mismatched.iter().min().copied() {
-            crate::block_pipeline::signal_fork_recovery(first.saturating_sub(1).max(1));
+            // Content-QC authority: from the failover_tenure_bound gate the rollback is decided, so the
+            // round floor cannot cancel it.
+            let target = first.saturating_sub(1).max(1);
+            if crate::node::failover_tenure_bound(first) {
+                crate::block_pipeline::signal_fork_recovery_decided(target);
+            } else {
+                crate::block_pipeline::signal_fork_recovery(target);
+            }
             if is_warn() {
                 println!("[WARN][FORK] fork_point_certified first_mismatch={} head_h={} mismatched={} action=rollback_once",
                          first, head_height, mismatched.len());

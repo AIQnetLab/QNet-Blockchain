@@ -59,6 +59,16 @@ pub fn work_window_of(epoch: u64) -> (u64, u64) {
     (end.saturating_sub(1).saturating_mul(EMISSION_BLOCK_INTERVAL), end.saturating_mul(EMISSION_BLOCK_INTERVAL))
 }
 
+/// The epoch number of the work window reward key `epoch` pays for — the key its eligibility rows are
+/// filed under: light bitmaps, the super roster, the roster cutoff. Not the macroblock-indexed reward
+/// key itself. Everything that files or reads those rows goes through this, because asking for them
+/// under the reward key finds nothing — and a reader that takes nothing for "this shard published no
+/// bitmap" blames the shard for every unpaid device.
+#[inline]
+pub fn work_epoch_of(epoch: u64) -> u64 {
+    work_window_of(epoch).0 / EMISSION_BLOCK_INTERVAL
+}
+
 /// Grid epochs above the claim watermark, ascending, up to the highest root stored here. An epoch
 /// whose root is missing is still yielded: the watermark is monotonic, so callers stop there.
 pub fn grid_epochs_after(storage: &crate::storage::Storage, last_claimed: u64) -> impl Iterator<Item = u64> {
@@ -316,6 +326,19 @@ mod tests {
             assert_eq!(expected, (k - 1) * MB_PER_EPOCH, "epoch key formula drifted at k={}", k);
             assert_eq!(emission_height_of(expected).unwrap(), h, "height/epoch round-trip broke at k={}", k);
         }
+    }
+
+    /// Light bitmaps are filed under the WORK WINDOW's epoch, never under the macroblock-indexed reward
+    /// key. Reading them under the key finds nothing, and a reader that takes nothing for "this shard
+    /// published no bitmap" blames the shard for every device that simply did not answer.
+    #[test]
+    fn light_bitmaps_are_keyed_by_the_work_windows_epoch() {
+        for epoch in [2 * MB_PER_EPOCH, 17_920, 1_000 * MB_PER_EPOCH] {
+            let (start, _) = work_window_of(epoch);
+            assert_eq!(work_epoch_of(epoch), start / EMISSION_BLOCK_INTERVAL);
+            assert_ne!(work_epoch_of(epoch), epoch, "the reward key is not the row key");
+        }
+        assert_eq!(work_epoch_of(17_920), 111, "epoch 111 = blocks 1,598,400..1,612,799");
     }
 
     /// Exactly one macroblock certifies an epoch, and it is the one sealed AT the emission height.

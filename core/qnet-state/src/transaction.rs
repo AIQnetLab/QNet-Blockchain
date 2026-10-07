@@ -155,6 +155,11 @@ fn is_info_log() -> bool {
     LOG_LEVEL.load(Ordering::Relaxed) >= 3
 }
 
+/// The crate's log level (0 none .. 4 debug), for gating log lines outside this module.
+pub(crate) fn log_level() -> u8 {
+    LOG_LEVEL.load(Ordering::Relaxed)
+}
+
 fn is_debug_log() -> bool {
     LOG_LEVEL.load(Ordering::Relaxed) >= 4
 }
@@ -199,6 +204,14 @@ pub const STORAGE_RENT_ESCROW_ADDR: &str = "system_storage_rent_escrow";
 /// Transferring a token here is a REAL burn: QRC-20/721 destroy supply/ownership on-chain (below);
 /// native QNC accumulates here unspendably and is excluded from circulating supply (off-consensus).
 pub const CANONICAL_BURN_ADDR: &str = "0000000000000000000eon00000000000000036877022";
+
+/// A batch transfer's envelope `to`. Its recipients live in the payload; the envelope names only the
+/// kind, and from the tx_target_bound gate it must read exactly this.
+pub const BATCH_TRANSFERS_TO: &str = "batch_transfers";
+
+/// A slashing proof's `from`. A proof is built by whichever node detects the offence, not by an account,
+/// and from the tx_target_bound gate its envelope must read exactly this with nonce and gas zero.
+pub const SLASHING_SENDER: &str = "system_slashing";
 
 /// Gas price in nanoQNC (QNet native units)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -324,6 +337,36 @@ pub struct EquivocationHeader {
     pub signature: Vec<u8>,
 }
 
+impl EquivocationHeader {
+    /// THE block-identity digest for equivocation: the fields that make two blocks DIFFERENT blocks.
+    ///
+    /// Byte-identical to `MicroBlock::hash`'s field set, deliberately: the storage anti-fork guard
+    /// produces the evidence when those hashes differ, and the on-chain acceptor decides the ban from it.
+    /// If the two ever disagree, one of them is wrong about what a block IS. It also orders a proof's two
+    /// headers (smaller first), which the tx_target_bound rule pins.
+    ///
+    /// It must NOT compare the signature or the VRF proof. Both are randomised ML-DSA outputs, so an
+    /// honest producer re-emitting the same block after a rollback signs different bytes over the same
+    /// digest; comparing them would turn a normal restart into a permanent, chain-committed ban.
+    pub fn identity_hash(&self, height: u64, producer_id: &str) -> [u8; 32] {
+        let mut hasher = Sha3_256::new();
+        hasher.update(&height.to_le_bytes());
+        hasher.update(&self.timestamp.to_le_bytes());
+        hasher.update(&self.previous_hash);
+        hasher.update(&self.merkle_root);
+        hasher.update(producer_id.as_bytes());
+        hasher.update(&self.timeout_round.to_le_bytes());
+        hasher.update(&self.carried_baseline.to_le_bytes());
+        // Mirrors MicroBlock::hash, which binds state_root. Without it a state-root-only fork folds
+        // pin-identical inputs on both sides (same txs, same merkle_root, deterministic timestamp,
+        // and vrf_output is None in production), so hash_a == hash_b and the evidence is discarded
+        // before it can be recorded. The fork would be rejected but never slashable.
+        hasher.update(&self.state_root);
+        crate::block::fold_vrf_output(&mut hasher, &self.vrf_output);
+        hasher.finalize().into()
+    }
+}
+
 /// Transaction types
 /// Largest decompressed light-eligibility bitmap a node will accept, in bytes. One definition for
 /// both the wire-shape check in `validate()` and the bounded decompressor in the consumer, so the
@@ -401,6 +444,44 @@ pub fn deploy_code_hash(kind: DeployKind, parsed: &serde_json::Value) -> Result<
         }
     }
     Ok(hex::encode(h.finalize()))
+}
+
+/// The one byte form of a deploy payload: the declared kind flag, exactly the keys
+/// `deploy_code_hash` reads (each in one encoding, defaults written out) and the lowercase digest.
+/// From the tx_target_bound gate tx.data must equal it, so nothing the signed digest leaves out (an
+/// unread key padding the per-byte fee, spacing, a number spelled as a string, hex case) can vary
+/// under a valid signature. `initial_supply` is a decimal string so a JS reader stays exact past
+/// 2^53; `decimals` is a number. Keys are sorted (BTreeMap), independent of serde_json features.
+pub fn canonical_deploy_data(kind: DeployKind, parsed: &serde_json::Value) -> Result<String, String> {
+    use serde_json::Value as V;
+    let mut m: std::collections::BTreeMap<&str, V> = std::collections::BTreeMap::new();
+    match kind {
+        DeployKind::Wasm => {
+            let code_hex = parsed.get("code").and_then(|c| c.as_str())
+                .ok_or_else(|| "[REJECT][TX] deploy_wasm_missing_code".to_string())?;
+            let code = hex::decode(code_hex)
+                .map_err(|_| "[REJECT][TX] deploy_wasm_code_not_hex".to_string())?;
+            m.insert("wasm", V::Bool(true));
+            m.insert("code", V::String(hex::encode(code)));
+        }
+        DeployKind::Qrc20 => {
+            m.insert("qrc20", V::Bool(true));
+            m.insert("name", V::String(deploy_str(parsed, "name")));
+            m.insert("symbol", V::String(deploy_str(parsed, "symbol")));
+            m.insert("decimals", V::from(deploy_u64(parsed, "decimals", 9)));
+            m.insert("initial_supply", V::String(deploy_u64(parsed, "initial_supply", 0).to_string()));
+            m.insert("mintable", V::Bool(deploy_bool(parsed, "mintable")));
+            m.insert("burnable", V::Bool(deploy_bool(parsed, "burnable")));
+            m.insert("logo", V::String(deploy_str(parsed, "logo")));
+        }
+        DeployKind::Qrc721 => {
+            m.insert("qrc721", V::Bool(true));
+            m.insert("name", V::String(deploy_str(parsed, "name")));
+            m.insert("symbol", V::String(deploy_str(parsed, "symbol")));
+        }
+    }
+    m.insert("code_hash", V::String(deploy_code_hash(kind, parsed)?));
+    serde_json::to_string(&m).map_err(|e| format!("[REJECT][TX] deploy_data_encode err={}", e))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1465,14 +1546,65 @@ impl Transaction {
         node_id: &str, wallet: &str, registration_proof: &str, timestamp: u64, attest_root: &[u8],
         burn_tx: &str,
     ) -> String {
+        Self::burn_owner_bind_message_tagged(
+            node_id, wallet, registration_proof, timestamp, &Self::attest_root_tag(attest_root), burn_tx)
+    }
+
+    /// The same string from the attestation root's tag, the form a burn attestor is asked with (it never holds
+    /// the 1952-byte key itself).
+    pub fn burn_owner_bind_message_tagged(
+        node_id: &str, wallet: &str, registration_proof: &str, timestamp: u64, attest_root_tag: &str,
+        burn_tx: &str,
+    ) -> String {
         format!("qnet_onchain_reg:{}:{}:{}:{}:{}:{}",
-                node_id, wallet, registration_proof, timestamp, Self::attest_root_tag(attest_root), burn_tx)
+                node_id, wallet, registration_proof, timestamp, attest_root_tag, burn_tx)
+    }
+
+    /// The owner bind without a time, valid for a Light registration from the `wallet_one_node` gate. The v1 form
+    /// shares T with the wallet's consent, so a burner could authorise its burn only together with one consent;
+    /// this one binds the same node, wallet, proof, wallet key and burn, and nothing that changes later, so the
+    /// burner signs it once right after the burn is signed and the wallet consents whenever the registration is
+    /// finished. The proof already commits to the burn, the node and the wallet.
+    pub fn burn_owner_bind_message_v2(
+        node_id: &str, wallet: &str, registration_proof: &str, attest_root: &[u8], burn_tx: &str,
+    ) -> String {
+        Self::burn_owner_bind_message_v2_tagged(
+            node_id, wallet, registration_proof, &Self::attest_root_tag(attest_root), burn_tx)
+    }
+
+    /// `burn_owner_bind_message_v2` from the attestation root's tag.
+    pub fn burn_owner_bind_message_v2_tagged(
+        node_id: &str, wallet: &str, registration_proof: &str, attest_root_tag: &str, burn_tx: &str,
+    ) -> String {
+        format!("qnet_burn_owner_v2:{}:{}:{}:{}:{}", node_id, wallet, registration_proof, attest_root_tag, burn_tx)
     }
 
     /// Stable tag for a registration's attestation root: sha3-256 of the ML-DSA-65 public key, or the
     /// empty string when the registration carries none.
     pub fn attest_root_tag(attest_root: &[u8]) -> String {
         if attest_root.is_empty() { String::new() } else { hex::encode(Sha3_256::digest(attest_root)) }
+    }
+
+    // The `data` notes of the fee-free lifecycle TXs. No signature covers `data`, but it is in the hash, so
+    // from the tx_target_bound gate each must be exactly the note rebuilt from the TX's own body fields:
+    // one builder per note, shared by the node's constructors and the gated rule.
+
+    /// A NodeRegistration's note: the client-form marker verifiers pick the wallet-signed preimage by.
+    pub fn client_registration_data(node_id: &str, wallet: &str, registration_proof: &str) -> String {
+        format!("client_node_reg:{}:{}:{}:", node_id, wallet, registration_proof)
+    }
+
+    /// A NodeReactivation's note.
+    pub fn reactivation_data(
+        node_id: &str, current_height: u64, last_macroblock_index: u64, last_macroblock_hash: &str,
+    ) -> String {
+        format!("node_reactivation:{}:h={}:mb={}:{}",
+                node_id, current_height, last_macroblock_index, crate::char_prefix(last_macroblock_hash, 16))
+    }
+
+    /// A LightNodeEligibilityBitmap's note.
+    pub fn bitmap_data(eligible_count: u32, index_span: u32, epoch: u64) -> String {
+        format!("Light Node Bitmap: {} eligible / {} assigned, epoch {}", eligible_count, index_span, epoch)
     }
 
     /// Deterministic Phase-1 super/light activation cost in whole 1DEV, computed with INTEGER math so
@@ -1554,6 +1686,42 @@ impl Transaction {
     /// priority lane, where it would be packed ahead of every paying transaction.
     pub fn is_merkle_reward_claim(&self) -> bool {
         matches!(self.tx_type, TransactionType::RewardDistribution) && self.from == "system_rewards_pool"
+    }
+
+    /// Node lifecycle TXs and slashing proofs: no signature covers their `to` or `amount` and apply reads
+    /// neither, so nothing is paid to anyone. From the tx_target_bound gate they carry none, and history
+    /// lists no counterparty or value for them at any height.
+    pub fn moves_no_envelope_value(&self) -> bool {
+        matches!(self.tx_type,
+            TransactionType::NodeRegistration { .. }
+            | TransactionType::NodeReactivation { .. }
+            | TransactionType::Heartbeat { .. }
+            | TransactionType::LightNodeEligibilityBitmap { .. }
+            | TransactionType::EquivocationProof { .. }
+            | TransactionType::VoteEquivocationProof { .. })
+    }
+
+    /// The identity a slashing proof bans, None for any other TX. A ban is write-once, so once one proof
+    /// against an offender is pooled or applied, another adds nothing.
+    pub fn slashed_offender(&self) -> Option<&str> {
+        match &self.tx_type {
+            TransactionType::EquivocationProof { offender, .. }
+            | TransactionType::VoteEquivocationProof { offender, .. } => Some(offender.as_str()),
+            _ => None,
+        }
+    }
+
+    /// What a merkle claim's wallet signed, as an amount: the sum of its payload's `amount` fields (the
+    /// claim signature covers sha3(data), never tx.amount). None unless the payload is a non-empty
+    /// `claims` array whose every entry carries a u64 `amount` and the sum fits. The RPC builder takes
+    /// tx.amount from here and the gated rule compares against it, so the two cannot drift.
+    pub fn claim_entries_total(data: &str) -> Option<u64> {
+        let v: serde_json::Value = serde_json::from_str(data).ok()?;
+        let entries = v.get("claims")?.as_array()?;
+        if entries.is_empty() {
+            return None;
+        }
+        entries.iter().try_fold(0u64, |acc, e| acc.checked_add(e.get("amount")?.as_u64()?))
     }
 
     /// The value-transfer classes eligible for FIX-5 pk-elision + dilithium_pk_root binding. SINGLE
@@ -1686,12 +1854,21 @@ impl Transaction {
     pub fn light_bitmap_commitment_id(&self) -> Option<String> {
         match &self.tx_type {
             TransactionType::LightNodeEligibilityBitmap { genesis_id, .. } => {
-                let signer = self.dilithium_public_key.as_deref()
+                self.light_bitmap_signer().map(|signer| format!("{}:{}", genesis_id, signer))
+            }
+            _ => None,
+        }
+    }
+
+    /// A light eligibility bitmap's signer label: the one its envelope key field names, else the shard's own
+    /// genesis id. The commitment id and the tx_target_bound `from` rule read it from here.
+    pub fn light_bitmap_signer(&self) -> Option<&str> {
+        match &self.tx_type {
+            TransactionType::LightNodeEligibilityBitmap { genesis_id, .. } => Some(
+                self.dilithium_public_key.as_deref()
                     .and_then(|b| std::str::from_utf8(b).ok())
                     .filter(|s| !s.is_empty())
-                    .unwrap_or(genesis_id.as_str());
-                Some(format!("{}:{}", genesis_id, signer))
-            }
+                    .unwrap_or(genesis_id.as_str())),
             _ => None,
         }
     }
@@ -1797,24 +1974,48 @@ impl Transaction {
     /// NOTE: `public_key` IS included (set BEFORE hash calculation, client-side signing).
     /// `dilithium_public_key` is EXCLUDED since FIX-5 — see the elision note in the body.
     pub fn canonical_bytes(&self) -> Vec<u8> {
-        // Create canonical version: all fields except hash and signatures
-        // public_key IS included - must be set before calculate_hash()!
-        let mut canonical = self.clone();
-        canonical.hash = String::new();
-        canonical.signature = None;
-        canonical.dilithium_signature = None;
+        // The bincode encoding of this Transaction with `hash` empty and both signatures and
+        // `dilithium_public_key` None, written from borrows: the same fields in the same order with the
+        // same serde encodings, so the bytes are identical to serializing such a clone — without copying
+        // the 3309 B signature, the 1952 B key and the whole payload on every hash.
         // FIX-5: pk is elidable (shipped once, then None) — it MUST be out of the hash preimage,
         // else an elided TX would hash differently than its first-use form. Safe: from ==
         // format_eon(SHA512(pk)) already commits to the key, and `from` stays in the preimage.
-        canonical.dilithium_public_key = None;
-
-        // Deterministic canonical serialization (includes tx_type, data, all fields)
+        #[derive(Serialize)]
+        struct Preimage<'a> {
+            hash: &'a str,
+            from: &'a str,
+            to: &'a Option<String>,
+            amount: u64,
+            nonce: u64,
+            gas_price: u64,
+            gas_limit: u64,
+            timestamp: u64,
+            signature: Option<&'a str>,
+            public_key: &'a Option<String>,
+            tx_type: &'a TransactionType,
+            data: &'a Option<String>,
+            dilithium_signature: Option<&'a [u8]>,
+            dilithium_public_key: Option<&'a [u8]>,
+            chain_id: u64,
+        }
+        // Exhaustive destructure: a field added to Transaction fails to compile here until the
+        // preimage decides about it.
+        let Transaction {
+            hash: _, from, to, amount, nonce, gas_price, gas_limit, timestamp, signature: _, public_key,
+            tx_type, data, dilithium_signature: _, dilithium_public_key: _, chain_id,
+        } = self;
+        let preimage = Preimage {
+            hash: "", from, to, amount: *amount, nonce: *nonce, gas_price: *gas_price, gas_limit: *gas_limit,
+            timestamp: *timestamp, signature: None, public_key, tx_type, data,
+            dilithium_signature: None, dilithium_public_key: None, chain_id: *chain_id,
+        };
         // FIX R22-S3: unwrap_or_default() silently produced empty Vec on failure,
         // causing ALL failed TXs to hash to the same SHA3-256(empty) constant.
         // bincode::serialize on an in-memory struct cannot fail (no I/O, no size overflow),
         // so expect() is safe here. If it ever did fail, a panic is far safer than
         // silent hash collision which could bypass duplicate detection.
-        bincode::serialize(&canonical)
+        bincode::serialize(&preimage)
             .expect("[FATAL][TX] canonical_bytes serialization failed — struct is in-memory, this is unreachable")
     }
     
@@ -2036,6 +2237,286 @@ impl Transaction {
         Ok(())
     }
 
+    /// The fields apply, the state or history act on must be ones a signature bound to the affected
+    /// account covers, and the body must be the one its hash names. Off below the tx_target_bound gate,
+    /// so blocks under it replay unchanged. Admission, the producer, the block verify stage and both
+    /// apply paths call this one function, so they cannot disagree. From the gate:
+    /// - a transfer pays the `to`/`amount` it signed; a call runs on the contract its calldata names;
+    /// - a batch envelope is (BATCH_TRANSFERS_TO, sum of its transfers), with no empty memo (its digest
+    ///   cannot tell one from none);
+    /// - no tx carries `public_key` or the legacy `signature`, which no type signs and nothing reads past block
+    ///   0; both sat outside every signature, and the legacy one outside the hash too, so a relay padded a
+    ///   pending copy with it for free under the honest hash;
+    /// - a transfer, batch, heartbeat or equivocation proof carries no `data`, which none of them signs;
+    ///   a registration, reactivation or bitmap carries exactly the note its own body fields rebuild, and
+    ///   a light registration no `vrf_pk` (its form signs none). Each is fee-free or flat-fee, so an
+    ///   unsigned field in the hash let a relay rehash a pending copy padded to the wire cap for free;
+    /// - a lifecycle tx or proof carries no `to` and no `amount` (moves_no_envelope_value);
+    /// - an equivocation proof carries no envelope signature or key: it authenticates itself through what
+    ///   it embeds, and a signature outside its hash would let a relay's copy decide the block's verdict;
+    /// - a system-built envelope is the one its builder writes, since nothing signs it: a proof is from
+    ///   SLASHING_SENDER with nonce and gas zero, its headers in canonical order (smaller identity hash first)
+    ///   and block_a's timestamp (a vote proof's order and time need the Checkpoint type and are judged
+    ///   beside this rule, in the node); a registration is from its wallet and a bitmap from its signer, both
+    ///   with gas_limit zero. Free, these let one proof mint unlimited fee-free top-priority copies, and let
+    ///   a copy naming a user's (from, nonce) displace that user's own TX in the producer;
+    /// - a heartbeat, registration, reactivation or bitmap has every envelope field no signature covers at
+    ///   the one value its builder writes (`check_commitment_envelope`): otherwise anyone who saw one pending
+    ///   minted copies with new hashes and the same signature, each costing every node a verify and a pool
+    ///   replacement;
+    /// - no registration claims the genesis proof: genesis identities are minted in block 0 only;
+    /// - a deploy carries the canonical payload, names its derived address or none, and moves no value;
+    /// - a merkle claim's envelope is exactly its signed entries' total, with no nonce, gas or legacy sig;
+    /// - a NodeActivation, whose signer is bound to no account, is refused;
+    /// - every tx's `hash` is the hash of its body (a block root covers hashes, not bodies).
+    pub fn check_signed_target_bound(&self, height: u64) -> Result<(), String> {
+        if !self.check_signed_fields(height)? {
+            return Ok(());
+        }
+        // Last, after the cheap refusals: one SHA3 over the canonical bytes.
+        let computed = self.calculate_hash();
+        if computed != self.hash {
+            return Err(format!(
+                "[REJECT][TX] tx_body_unbound stored={} computed={}",
+                crate::char_prefix(&self.hash, 16), crate::char_prefix(&computed, 16)));
+        }
+        Ok(())
+    }
+
+    /// `check_signed_target_bound` for a caller that validate() has just accepted this very value for:
+    /// validate() pins `hash` to the body at every height, so the second SHA3 is skipped. The doors and
+    /// the producer's user-TX path, where validate() runs anyway; every other judge uses the full check.
+    pub fn check_signed_target_bound_validated(&self, height: u64) -> Result<(), String> {
+        self.check_signed_fields(height).map(|_| ())
+    }
+
+    /// Every rule of `check_signed_target_bound` but the body hash. Ok(false) below the gate.
+    fn check_signed_fields(&self, height: u64) -> Result<bool, String> {
+        if !crate::feature_gates::is_active(crate::feature_gates::id::TX_TARGET_BOUND, height) {
+            return Ok(false);
+        }
+        if self.public_key.is_some() {
+            return Err("[REJECT][TX] unsigned_field_present field=public_key".to_string());
+        }
+        if let Some(sig) = self.signature.as_deref() {
+            return Err(format!("[REJECT][TX] unsigned_field_present field=signature len={}", sig.len()));
+        }
+        if self.moves_no_envelope_value() {
+            if let Some(to) = self.to.as_deref() {
+                return Err(format!("[REJECT][TX] unsigned_field_present field=to to={}", crate::char_prefix(to, 20)));
+            }
+            if self.amount != 0 {
+                return Err(format!("[REJECT][TX] unsigned_field_present field=amount amount={}", self.amount));
+            }
+        }
+        match &self.tx_type {
+            TransactionType::Transfer { to, amount, .. } => {
+                if self.to.as_deref() != Some(to.as_str()) || *amount != self.amount {
+                    return Err(format!(
+                        "[REJECT][TX] transfer_payload_mismatch tx_to={} payload_to={} tx_amount={} payload_amount={}",
+                        crate::char_prefix(self.to.as_deref().unwrap_or(""), 20), crate::char_prefix(to, 20),
+                        self.amount, amount));
+                }
+                self.check_no_data()?;
+            }
+            TransactionType::BatchTransfers { transfers, .. } => {
+                let sum = transfers.iter().try_fold(0u64, |a, t| a.checked_add(t.amount));
+                if self.to.as_deref() != Some(BATCH_TRANSFERS_TO) || sum != Some(self.amount) {
+                    return Err(format!(
+                        "[REJECT][BATCH-TRANSFER] envelope_mismatch to={} amount={} sum={:?}",
+                        crate::char_prefix(self.to.as_deref().unwrap_or(""), 20), self.amount, sum));
+                }
+                if transfers.iter().any(|t| t.memo.as_deref() == Some("")) {
+                    return Err("[REJECT][BATCH-TRANSFER] empty_memo (send none instead)".to_string());
+                }
+                self.check_no_data()?;
+            }
+            TransactionType::ContractCall => {
+                let named = self.data.as_deref()
+                    .and_then(|d| serde_json::from_str::<serde_json::Value>(d).ok())
+                    .and_then(|v| v.get("contract").and_then(|c| c.as_str()).map(str::to_owned));
+                if named.is_none() || named.as_deref() != self.to.as_deref() {
+                    return Err(format!(
+                        "[REJECT][CONTRACT] call_target_mismatch to={} data_contract={}",
+                        crate::char_prefix(self.to.as_deref().unwrap_or(""), 20),
+                        crate::char_prefix(named.as_deref().unwrap_or(""), 20)));
+                }
+            }
+            TransactionType::ContractDeploy => {
+                self.check_contract_deploy_envelope()?;
+                let kind = self.classify_contract_deploy()?;
+                let data = self.data.as_deref().unwrap_or("");
+                let parsed: serde_json::Value = serde_json::from_str(data)
+                    .map_err(|_| "[REJECT][TX] deploy_data_not_json".to_string())?;
+                if canonical_deploy_data(kind, &parsed)? != data {
+                    return Err(format!("[REJECT][TX] deploy_data_not_canonical kind={:?} len={}", kind, data.len()));
+                }
+            }
+            TransactionType::RewardDistribution if self.is_merkle_reward_claim() => {
+                let signed_total = self.data.as_deref().and_then(Self::claim_entries_total);
+                if signed_total != Some(self.amount) || self.nonce != 0 || self.gas_price != 0
+                    || self.gas_limit != 0
+                {
+                    return Err(format!(
+                        "[REJECT][CLAIM] claim_envelope_unbound amount={} signed_total={:?} nonce={} gas={}/{}",
+                        self.amount, signed_total, self.nonce, self.gas_price, self.gas_limit));
+                }
+            }
+            // Identity, roster row and consensus key come from the burn-attested NodeRegistration and no
+            // flow needs this TX, while its apply debits `from`, consumes the nonce, sets is_node for good
+            // and stamps a super row under a signer bound to nothing. Refused, not bound.
+            TransactionType::NodeActivation { .. } => {
+                return Err(format!("[REJECT][TX] node_activation_retired from={}", crate::char_prefix(&self.from, 20)));
+            }
+            TransactionType::Heartbeat { anchor_height, .. } => {
+                self.check_no_data()?;
+                self.check_commitment_envelope("heartbeat", Self::heartbeat_nonce(*anchor_height), u64::MAX, Some(0))?;
+            }
+            // The embedded headers or votes are the proof; nothing verifies a signature on the envelope, and
+            // one sits outside the hash. A relay's copy carrying one kept the honest hash, and the verify
+            // stage checks any it finds: a junk one rejected the block, a valid one under a fresh label hung
+            // on each node's RAM key registry. So the envelope carries none.
+            TransactionType::EquivocationProof { .. } | TransactionType::VoteEquivocationProof { .. } => {
+                self.check_no_data()?;
+                if self.dilithium_signature.is_some() || self.dilithium_public_key.is_some() {
+                    return Err("[REJECT][TX] unsigned_field_present field=signature type=equivocation_proof".to_string());
+                }
+                self.check_proof_envelope()?;
+            }
+            TransactionType::NodeRegistration { node_id, node_type, wallet_address, registration_proof, vrf_pk, .. } => {
+                // Genesis identities are minted in block 0, and the genesis proof exempts a registration from
+                // the identity bind, the burn quorum and every signature rule: after block 0 it let an unsigned
+                // registration rewrite a genesis node's announced endpoint.
+                if registration_proof == "genesis" {
+                    return Err(format!("[REJECT][TX] genesis_proof_after_block_0 node_id={}", crate::char_prefix(node_id, 20)));
+                }
+                self.check_system_envelope(wallet_address, "node_registration")?;
+                self.check_commitment_envelope("node_registration", 0, 0, None)?;
+                self.check_note(&Self::client_registration_data(node_id, wallet_address, registration_proof))?;
+                if matches!(node_type, NodeType::Light) && !vrf_pk.is_empty() {
+                    return Err(format!("[REJECT][TX] unsigned_field_present field=vrf_pk node_type=light len={}", vrf_pk.len()));
+                }
+            }
+            TransactionType::NodeReactivation { node_id, current_height, last_macroblock_hash, last_macroblock_index, .. } => {
+                self.check_commitment_envelope("node_reactivation", *last_macroblock_index, u64::MAX, None)?;
+                self.check_note(&Self::reactivation_data(node_id, *current_height, *last_macroblock_index, last_macroblock_hash))?;
+            }
+            TransactionType::LightNodeEligibilityBitmap { genesis_id, epoch, index_span, eligible_count, .. } => {
+                self.check_system_envelope(self.light_bitmap_signer().unwrap_or_default(), "light_bitmap")?;
+                self.check_commitment_envelope("light_bitmap", Self::light_bitmap_nonce(genesis_id, *epoch), u64::MAX, Some(0))?;
+                self.check_note(&Self::bitmap_data(*eligible_count, *index_span, *epoch))?;
+            }
+            _ => {}
+        }
+        Ok(true)
+    }
+
+    /// `data` for a type whose signature does not cover it: none at all.
+    fn check_no_data(&self) -> Result<(), String> {
+        match &self.data {
+            Some(d) => Err(format!("[REJECT][TX] unsigned_field_present field=data len={}", d.len())),
+            None => Ok(()),
+        }
+    }
+
+    /// `data` for a type that carries a note built from its own body fields: exactly that note.
+    fn check_note(&self, expected: &str) -> Result<(), String> {
+        if self.data.as_deref() != Some(expected) {
+            return Err(format!(
+                "[REJECT][TX] unsigned_note_mismatch len={} expected_len={}",
+                self.data.as_deref().map_or(0, str::len), expected.len()));
+        }
+        Ok(())
+    }
+
+    /// A fee-free system TX whose `from` nothing signs names the identity its body binds, and has gas_limit
+    /// zero: a system TX never consumes a nonce or pays gas, and gas_limit zero is what the producer's and the
+    /// verify stage's resource sets exempt.
+    fn check_system_envelope(&self, expected_from: &str, kind: &str) -> Result<(), String> {
+        if self.from != expected_from || self.gas_limit != 0 {
+            return Err(format!(
+                "[REJECT][TX] system_envelope_unbound type={} from={} expected_from={} gas_limit={}",
+                kind, crate::char_prefix(&self.from, 20), crate::char_prefix(expected_from, 20), self.gas_limit));
+        }
+        Ok(())
+    }
+
+    /// A commitment-class system TX's envelope fields that its signature leaves out, at the one value its
+    /// builder writes: the nonce derived from its signed body, the fixed gas price, gas_limit zero and, where
+    /// nothing signs the time either, timestamp zero. Its hash is then a function of what the signer signed,
+    /// so a relay's copy is the same hash (a hash lookup) instead of a new one costing a verify and a pool
+    /// replacement. Neither nonce nor gas is read by apply for these types: a system TX consumes no nonce and
+    /// pays no gas.
+    fn check_commitment_envelope(&self, kind: &str, nonce: u64, gas_price: u64, timestamp: Option<u64>) -> Result<(), String> {
+        if self.nonce != nonce || self.gas_price != gas_price || self.gas_limit != 0
+            || timestamp.map_or(false, |t| self.timestamp != t)
+        {
+            return Err(format!(
+                "[REJECT][TX] system_envelope_unbound type={} nonce={} expected_nonce={} gas={}/{} timestamp={}",
+                kind, self.nonce, nonce, self.gas_price, self.gas_limit, self.timestamp));
+        }
+        Ok(())
+    }
+
+    /// A heartbeat's nonce: its anchor's (epoch, subwindow) slot plus one, the index its commitment key names.
+    pub fn heartbeat_nonce(anchor_height: u64) -> u64 {
+        const EPOCH_INTERVAL: u64 = 14400; // matches commitment_dedup_key
+        (anchor_height / EPOCH_INTERVAL).wrapping_mul(10)
+            .wrapping_add((anchor_height % EPOCH_INTERVAL) / 1440)
+            .wrapping_add(1)
+    }
+
+    /// A light eligibility bitmap's nonce: unique per (epoch, shard), so one owner's bitmaps for its own shard
+    /// and for a shard it covers never share one. A shard id outside genesis_node_001..005 counts as shard 0.
+    pub fn light_bitmap_nonce(genesis_id: &str, epoch: u64) -> u64 {
+        let shard_index = genesis_id.strip_prefix("genesis_node_")
+            .and_then(|n| n.parse::<u64>().ok())
+            .filter(|n| (1..=5).contains(n)).map(|n| n - 1).unwrap_or(0);
+        epoch.wrapping_mul(10).wrapping_add(shard_index).wrapping_add(1)
+    }
+
+    /// A slashing proof's envelope, exactly as the detector builds it: from SLASHING_SENDER, nonce and gas
+    /// zero, and for a block proof the headers in canonical order (smaller identity hash first) stamped
+    /// with block_a's timestamp. A vote proof's order and time live in its checkpoints, which qnet-state
+    /// cannot decode; the node judges them beside this rule.
+    fn check_proof_envelope(&self) -> Result<(), String> {
+        if self.from != SLASHING_SENDER || self.nonce != 0 || self.gas_price != 0 || self.gas_limit != 0 {
+            return Err(format!(
+                "[REJECT][TX] system_envelope_unbound type=equivocation_proof from={} nonce={} gas={}/{}",
+                crate::char_prefix(&self.from, 20), self.nonce, self.gas_price, self.gas_limit));
+        }
+        if let TransactionType::EquivocationProof { offender, height, block_a, block_b } = &self.tx_type {
+            let ordered = block_a.identity_hash(*height, offender) < block_b.identity_hash(*height, offender);
+            if !ordered || self.timestamp != block_a.timestamp {
+                return Err(format!(
+                    "[REJECT][TX] system_envelope_unbound type=equivocation_proof ordered={} timestamp={} block_a_timestamp={}",
+                    ordered, self.timestamp, block_a.timestamp));
+            }
+        }
+        Ok(())
+    }
+
+    /// A deploy's `to` and `amount` sit outside its signature and apply reads neither: the address is
+    /// derived from (from, nonce) and no value moves. So `to` is that address or absent, and `amount`
+    /// is zero; anything else is a history or directory entry nothing signed.
+    pub fn check_contract_deploy_envelope(&self) -> Result<(), String> {
+        if !matches!(self.tx_type, TransactionType::ContractDeploy) {
+            return Ok(());
+        }
+        if self.amount != 0 {
+            return Err(format!("[REJECT][TX] deploy_amount_nonzero amount={}", self.amount));
+        }
+        if let Some(to) = self.to.as_deref() {
+            let derived = derive_contract_address(&self.from, self.nonce);
+            if to != derived {
+                return Err(format!(
+                    "[REJECT][TX] deploy_to_not_derived to={} derived={}",
+                    crate::char_prefix(to, 20), crate::char_prefix(&derived, 20)));
+            }
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         self.enforce_wire_limits()?;
         // Retired types are refused before anything else: every one of them is fee-free and
@@ -2141,7 +2622,21 @@ impl Transaction {
                 // A deploy must declare one standard and, for WASM, carry runnable code. Binding
                 // rule lives in classify_contract_deploy, enforced again at apply; this call only
                 // keeps a dead-stub deploy out of the mempool before a producer wastes a slot.
-                self.classify_contract_deploy()?;
+                let kind = self.classify_contract_deploy()?;
+                // Admission only (the gated rule binds blocks): a squatting `to` or a value nothing
+                // moves never enters the pool, so a relay's copy cannot race the original with it.
+                self.check_contract_deploy_envelope()?;
+                // The module check apply runs, here too, so a relay that swaps the kind flag onto a
+                // token's digest input is refused at the door instead of failing closed in a block.
+                // Not in classify: apply calls that before its stale-nonce skip.
+                if kind == DeployKind::Wasm {
+                    let code = self.data.as_deref()
+                        .and_then(|d| serde_json::from_str::<serde_json::Value>(d).ok())
+                        .and_then(|v| v.get("code").and_then(|c| c.as_str()).and_then(|h| hex::decode(h).ok()))
+                        .ok_or_else(|| "[REJECT][TX] deploy_wasm_code_unreadable".to_string())?;
+                    qnet_vm::validate_wasm_module(&code, &qnet_vm::VmLimits::default())
+                        .map_err(|e| format!("[REJECT][VM] {}", e))?;
+                }
             }
             TransactionType::ContractCall => {
                 if self.to.as_ref().map(|s| s.is_empty()).unwrap_or(true) {
@@ -2659,6 +3154,9 @@ impl Transaction {
     /// transitions) so the persist layer maintains the wallet→token reverse index in the SAME batch.
     /// owns is NON-consensus (never in state_root) — a stale/wrong index self-heals via boot backfill.
     pub fn apply_to_state_at_indexed(&self, accounts: &mut HashMap<String, Account>, block_height: u64, owns: &mut Vec<OwnsDelta>) -> Result<(), StateError> {
+        // First, before any write (the pk bind below included), in the same place as the parallel path.
+        self.check_signed_target_bound(block_height).map_err(StateError::InvalidTransaction)?;
+
         // SECURITY: Out-of-gas check — reject TX if compute_gas_used() > gas_limit
         // System TXs (gas_limit=0, gas_used=0) are exempt
         if self.gas_limit > 0 {
@@ -3023,9 +3521,18 @@ impl Transaction {
                 contract.contract_storage.insert(
                     "deployer".to_string(), self.from.clone()
                 );
-                contract.contract_storage.insert(
-                    "deployed_at".to_string(), self.timestamp.to_string()
-                );
+                // The deploy time is state, so it must come from something every copy of the TX shares:
+                // from the tx_target_bound gate the block height, never tx.timestamp, which no signature
+                // covers and a relay can rewrite. Contracts deployed below the gate keep `deployed_at`.
+                if crate::feature_gates::is_active(crate::feature_gates::id::TX_TARGET_BOUND, block_height) {
+                    contract.contract_storage.insert(
+                        "deployed_height".to_string(), block_height.to_string()
+                    );
+                } else {
+                    contract.contract_storage.insert(
+                        "deployed_at".to_string(), self.timestamp.to_string()
+                    );
+                }
 
                 // v3.40: QRC-20 token initialization — FULL state in blockchain
                 // This is the SINGLE SOURCE OF TRUTH for token data.
@@ -4514,181 +5021,6 @@ impl TransactionProcessor {
         }
         
         Ok(())
-    }
-}
-
-/// Dynamic gas pricing system
-/// FIX R14-M1: All arithmetic uses fixed-point basis points (10000 = 1.0x) for determinism
-#[derive(Debug, Clone)]
-pub struct DynamicGasPricing {
-    /// Current mempool size
-    mempool_size: usize,
-    /// Target block utilization in basis points (8000 = 80%)
-    target_utilization_bps: u64,
-    /// Current block utilization in basis points (0-10000)
-    current_utilization_bps: u64,
-    /// Base gas price adjustment factor in basis points (10000 = 1.0x)
-    adjustment_factor_bps: u64,
-}
-
-impl DynamicGasPricing {
-    pub fn new() -> Self {
-        Self {
-            mempool_size: 0,
-            target_utilization_bps: 8_000, // 80%
-            current_utilization_bps: 0,
-            adjustment_factor_bps: 10_000, // 1.0x
-        }
-    }
-
-    /// Update network load metrics
-    pub fn update_network_load(&mut self, mempool_size: usize, block_utilization: f64) {
-        self.mempool_size = mempool_size;
-        // Convert f64 utilization (0.0-1.0) to basis points (0-10000)
-        self.current_utilization_bps = (block_utilization * 10_000.0).min(10_000.0).max(0.0) as u64;
-        self.adjustment_factor_bps = self.calculate_adjustment_factor_bps();
-    }
-
-    /// Calculate gas price adjustment in basis points (deterministic integer math)
-    fn calculate_adjustment_factor_bps(&self) -> u64 {
-        // Mempool congestion factor (basis points)
-        let mempool_factor_bps: u64 = match self.mempool_size {
-            0..=100 => 8_000,       // 0.8x — low congestion discount
-            101..=500 => 10_000,    // 1.0x — normal
-            501..=1000 => 15_000,   // 1.5x — high congestion
-            1001..=2000 => 20_000,  // 2.0x — very high
-            _ => 30_000,            // 3.0x — extreme
-        };
-
-        // Utilization factor (basis points)
-        let utilization_factor_bps: u64 = if self.current_utilization_bps > self.target_utilization_bps {
-            // Above target: increase price (1.0 + delta * 2.0)
-            let delta = self.current_utilization_bps.saturating_sub(self.target_utilization_bps);
-            10_000u64.saturating_add(delta.saturating_mul(2))
-        } else {
-            // Below target: decrease price (1.0 - delta * 0.5)
-            let delta = self.target_utilization_bps.saturating_sub(self.current_utilization_bps);
-            10_000u64.saturating_sub(delta / 2)
-        };
-
-        // Combined: (mempool * utilization) / 10000, capped at 5x (50000), min 0.5x (5000)
-        let combined = mempool_factor_bps.saturating_mul(utilization_factor_bps) / 10_000;
-        combined.max(5_000).min(50_000)
-    }
-    
-    /// Get current dynamic gas price
-    pub fn get_dynamic_gas_price(&self, tier: GasTier) -> GasPrice {
-        let base_price = match tier {
-            GasTier::Eco => GasPrice::mobile(),
-            GasTier::Standard => GasPrice::standard(),
-            GasTier::Fast => GasPrice::fast(),
-            GasTier::Priority => GasPrice::priority(),
-        };
-        
-        // FIX R14-M1: Fixed-point integer arithmetic for deterministic gas pricing
-        // adjustment_factor_bps is in basis points (10000 = 1.0x, 15000 = 1.5x)
-        let adjusted_price = base_price.0.saturating_mul(self.adjustment_factor_bps) / 10_000;
-        GasPrice(adjusted_price)
-    }
-    
-    /// Get gas price recommendations for mobile wallets
-    pub fn get_mobile_gas_recommendations(&self) -> MobileGasRecommendations {
-        MobileGasRecommendations {
-            eco: self.get_dynamic_gas_price(GasTier::Eco),
-            standard: self.get_dynamic_gas_price(GasTier::Standard),
-            fast: self.get_dynamic_gas_price(GasTier::Fast),
-            priority: self.get_dynamic_gas_price(GasTier::Priority),
-            network_load: self.get_network_load_status(),
-            estimated_confirmation_time: self.estimate_confirmation_time(),
-        }
-    }
-    
-    /// Get human-readable network load status
-    fn get_network_load_status(&self) -> NetworkLoadStatus {
-        let status = match self.mempool_size {
-            0..=100 => NetworkLoadStatus::Low,
-            101..=500 => NetworkLoadStatus::Normal,
-            501..=1000 => NetworkLoadStatus::High,
-            1001..=2000 => NetworkLoadStatus::Extreme,
-            _ => NetworkLoadStatus::Extreme,
-        };
-        status
-    }
-    
-    /// Estimate confirmation time based on network load
-    fn estimate_confirmation_time(&self) -> ConfirmationTime {
-        match self.mempool_size {
-            0..=100 => ConfirmationTime::Seconds(1),
-            101..=500 => ConfirmationTime::Seconds(2),
-            501..=1000 => ConfirmationTime::Seconds(5),
-            1001..=2000 => ConfirmationTime::Seconds(10),
-            _ => ConfirmationTime::Seconds(30),
-        }
-    }
-}
-
-/// Gas pricing tiers for mobile optimization
-#[derive(Debug, Clone, Copy)]
-pub enum GasTier {
-    Eco,      // Slowest, cheapest
-    Standard, // Normal speed and price
-    Fast,     // Faster, higher price
-    Priority, // Fastest, highest price
-}
-
-/// Mobile gas recommendations for wallet integration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MobileGasRecommendations {
-    pub eco: GasPrice,
-    pub standard: GasPrice,
-    pub fast: GasPrice,
-    pub priority: GasPrice,
-    pub network_load: NetworkLoadStatus,
-    pub estimated_confirmation_time: ConfirmationTime,
-}
-
-/// Network load status
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum NetworkLoadStatus {
-    Low,
-    Normal,
-    High,
-    Extreme,
-}
-
-/// Estimated confirmation time
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ConfirmationTime {
-    Seconds(u64),
-    Minutes(u64),
-}
-
-/// Dynamic gas pricing configuration (thread-safe)
-static DYNAMIC_GAS_PRICING: Lazy<Arc<RwLock<Option<DynamicGasPricing>>>> = 
-    Lazy::new(|| Arc::new(RwLock::new(None)));
-
-/// Initialize dynamic gas pricing
-pub fn init_dynamic_gas_pricing() {
-    let pricing = DynamicGasPricing::new();
-    match DYNAMIC_GAS_PRICING.write() {
-        Ok(mut guard) => *guard = Some(pricing),
-        Err(poisoned) => *poisoned.into_inner() = Some(pricing),
-    }
-}
-
-/// Get dynamic gas pricing
-pub fn get_dynamic_gas_pricing() -> Option<DynamicGasPricing> {
-    match DYNAMIC_GAS_PRICING.read() {
-        Ok(guard) => guard.as_ref().cloned(),
-        Err(poisoned) => poisoned.into_inner().as_ref().cloned(),
-    }
-}
-
-/// Update dynamic gas pricing
-pub fn update_dynamic_gas_pricing(new_pricing: DynamicGasPricing) {
-    match DYNAMIC_GAS_PRICING.write() {
-        Ok(mut guard) => *guard = Some(new_pricing),
-        Err(poisoned) => *poisoned.into_inner() = Some(new_pricing),
     }
 }
 
@@ -6252,7 +6584,6 @@ mod tests_wasm_e2e {
 }
 
 
-
 #[cfg(test)]
 mod tests_activation_pricing_and_chain_binding {
     use super::*;
@@ -6333,6 +6664,38 @@ mod tests_activation_pricing_and_chain_binding {
 }
 
 #[cfg(test)]
+mod tests_burn_owner_bind {
+    use super::*;
+
+    const NODE: &str = "light_mobile_6526ab8fd00ff8ca";
+    const WALLET: &str = "d9fa370374e24333242eon847d1d354dcd87fe873823e";
+    const PROOF: &str = "d2ec2e275368718cdf2393a85276ce2b";
+    const TAG: &str = "cc8dbbec8ddd7b01f7926748b3738028ab92570e04e694bf0f4ddc346085de6f";
+    const BURN: &str = "3NDb8AYafSq8kfkHZbBt5yJdao5UpeVKQVTgwghoAVnH2xxuBQm6ywZ9ZmgEEpsp2TmuU834XhyEsuhmRX7Lom3U";
+
+    /// The two owner-bind preimages, byte for byte: the site, the extension and the node build them apart.
+    #[test]
+    fn the_owner_bind_preimages_are_the_contract_strings() {
+        assert_eq!(Transaction::burn_owner_bind_message_tagged(NODE, WALLET, PROOF, 1_790_000_000, TAG, BURN),
+                   format!("qnet_onchain_reg:{}:{}:{}:1790000000:{}:{}", NODE, WALLET, PROOF, TAG, BURN));
+        assert_eq!(Transaction::burn_owner_bind_message_v2_tagged(NODE, WALLET, PROOF, TAG, BURN),
+                   "qnet_burn_owner_v2:light_mobile_6526ab8fd00ff8ca:d9fa370374e24333242eon847d1d354dcd87fe873823e:\
+                    d2ec2e275368718cdf2393a85276ce2b:cc8dbbec8ddd7b01f7926748b3738028ab92570e04e694bf0f4ddc346085de6f:\
+                    3NDb8AYafSq8kfkHZbBt5yJdao5UpeVKQVTgwghoAVnH2xxuBQm6ywZ9ZmgEEpsp2TmuU834XhyEsuhmRX7Lom3U");
+        // The key forms hash the key into the same tag.
+        let key = [7u8; 1952];
+        let tag = hex::encode(Sha3_256::digest(key));
+        assert_eq!(Transaction::attest_root_tag(&key), tag);
+        assert_eq!(Transaction::burn_owner_bind_message_v2(NODE, WALLET, PROOF, &key, BURN),
+                   Transaction::burn_owner_bind_message_v2_tagged(NODE, WALLET, PROOF, &tag, BURN));
+        assert_eq!(Transaction::burn_owner_bind_message(NODE, WALLET, PROOF, 5, &key, BURN),
+                   Transaction::burn_owner_bind_message_tagged(NODE, WALLET, PROOF, 5, &tag, BURN));
+        // Neither form can be read as the other: their prefixes differ and v2 carries no time.
+        assert!(!Transaction::burn_owner_bind_message_v2_tagged(NODE, WALLET, PROOF, TAG, BURN).starts_with("qnet_onchain_reg:"));
+    }
+}
+
+#[cfg(test)]
 mod commitment_mark_retention_tests {
     use super::*;
 
@@ -6357,5 +6720,742 @@ mod commitment_mark_retention_tests {
         assert!(Transaction::commitment_mark_retention_blocks(7) >= 1_440 + HB_ANCHOR_MAX_LAG_BLOCKS,
                 "a heartbeat mark outlives the heartbeat's admission window");
         assert_eq!(Transaction::commitment_mark_retention_blocks(0), 0);
+    }
+}
+
+#[cfg(test)]
+mod tests_signed_target_bound {
+    // A transfer's payload and a call's target are outside the signature; from the gate they must equal the
+    // signed fields. Below it the old rule stands, so blocks already on disk replay unchanged.
+    use super::*;
+    use crate::account::Account;
+    use std::collections::HashMap;
+
+    const GATE: u64 = crate::feature_gates::TX_TARGET_BOUND_GATE_HEIGHT;
+
+    fn sender() -> String { derive_contract_address("signed_target_sender", 0) }
+
+    fn transfer(to: &str, amount: u64, payload_to: &str, payload_amount: u64) -> Transaction {
+        Transaction::new(
+            sender(), Some(to.to_string()), amount, 1, 1, 10_000, 0, None,
+            TransactionType::Transfer { from: sender(), to: payload_to.to_string(), amount: payload_amount },
+            None,
+        )
+    }
+
+    fn call(to: &str, data: &str) -> Transaction {
+        Transaction::new(sender(), Some(to.to_string()), 0, 1, 1, 1_000_000, 0, None,
+            TransactionType::ContractCall, Some(data.to_string()))
+    }
+
+    fn token(holder: &str, balance: u64) -> Account {
+        let mut c = Account::default();
+        c.is_contract = true;
+        c.contract_storage.insert("type".to_string(), "qrc20".to_string());
+        c.contract_storage.insert(format!("balance:{}", holder), balance.to_string());
+        c
+    }
+
+    fn funded() -> HashMap<String, Account> {
+        let mut s = Account::new(sender());
+        s.balance = 1_000_000_000_000;
+        let mut accounts = HashMap::new();
+        accounts.insert(sender(), s);
+        accounts.insert("tokA".to_string(), token(&sender(), 1_000));
+        accounts.insert("tokB".to_string(), token(&sender(), 1_000));
+        accounts
+    }
+
+    #[test]
+    fn the_rule_is_off_below_the_gate_and_on_from_it() {
+        let honest = transfer("bob", 5, "bob", 5);
+        let rerouted = transfer("bob", 5, "mallory", 5);
+        let inflated = transfer("bob", 5, "bob", 5_000);
+        for (tx, what) in [(&rerouted, "payload to"), (&inflated, "payload amount")] {
+            assert_eq!(tx.check_signed_target_bound(GATE - 1), Ok(()), "{}: unchecked below the gate", what);
+            let err = tx.check_signed_target_bound(GATE).unwrap_err();
+            assert!(err.contains("transfer_payload_mismatch"), "{}: {}", what, err);
+        }
+        assert_eq!(honest.check_signed_target_bound(GATE), Ok(()));
+
+        let named = call("tokA", r#"{"args":["bob","1"],"contract":"tokA","method":"transfer"}"#);
+        let retargeted = call("tokB", r#"{"args":["bob","1"],"contract":"tokA","method":"transfer"}"#);
+        let unnamed = call("tokA", r#"{"args":["bob","1"],"method":"transfer"}"#);
+        let not_json = call("tokA", "transfer(bob,1)");
+        assert_eq!(named.check_signed_target_bound(GATE), Ok(()));
+        for (tx, what) in [(&retargeted, "retargeted"), (&unnamed, "names no target"), (&not_json, "not json")] {
+            assert_eq!(tx.check_signed_target_bound(GATE - 1), Ok(()), "{}: unchecked below the gate", what);
+            let err = tx.check_signed_target_bound(GATE).unwrap_err();
+            assert!(err.contains("call_target_mismatch"), "{}: {}", what, err);
+        }
+        // A heartbeat carrying no `data` passes at any height, once its hash names its body.
+        let heartbeat = Transaction::new("super_x".to_string(), None, 0, 1, u64::MAX, 0, 0, None,
+            TransactionType::Heartbeat { node_id: "super_x".to_string(), anchor_height: 1, anchor_hash: "ab".repeat(32) },
+            None);
+        assert_eq!(heartbeat.check_signed_target_bound(GATE), Ok(()));
+    }
+
+    #[test]
+    fn apply_refuses_a_rewritten_transfer_payload_from_the_gate() {
+        let mut rewritten = transfer("bob", 5, "mallory", 500_000);
+        rewritten.dilithium_public_key = Some(vec![7u8; 1952]); // would bind on first use
+        rewritten.hash = rewritten.calculate_hash();
+        assert!(rewritten.binds_dilithium_pk());
+
+        let mut accounts = funded();
+        let err = rewritten.apply_to_state_at(&mut accounts, GATE).unwrap_err();
+        assert!(format!("{:?}", err).contains("transfer_payload_mismatch"), "{:?}", err);
+        let s = &accounts[&sender()];
+        assert_eq!((s.balance, s.nonce), (1_000_000_000_000, 0), "nothing debited");
+        assert!(s.dilithium_public_key.is_none(), "refused before the pk bind");
+        assert!(!accounts.contains_key("mallory") && !accounts.contains_key("bob"), "nobody credited");
+
+        // Below the gate the payload is paid, as it always was: old blocks replay unchanged.
+        let mut replay = funded();
+        rewritten.apply_to_state_at(&mut replay, GATE - 1).expect("replay below the gate");
+        assert_eq!(replay["mallory"].balance, 500_000);
+
+        let mut accounts = funded();
+        transfer("bob", 5, "bob", 5).apply_to_state_at(&mut accounts, GATE).expect("honest transfer");
+        assert_eq!(accounts["bob"].balance, 5);
+    }
+
+    #[test]
+    fn a_call_retargeted_to_another_token_is_refused_from_the_gate() {
+        let on_a = r#"{"args":["bob","100"],"contract":"tokA","method":"transfer"}"#;
+        let bal = |a: &HashMap<String, Account>, t: &str, who: &str|
+            a[t].contract_storage.get(&format!("balance:{}", who)).cloned();
+
+        let retargeted = call("tokB", on_a);
+        let mut accounts = funded();
+        let err = retargeted.apply_to_state_at(&mut accounts, GATE).unwrap_err();
+        assert!(format!("{:?}", err).contains("call_target_mismatch"), "{:?}", err);
+        assert_eq!(bal(&accounts, "tokB", &sender()), Some("1000".to_string()), "no token moved");
+        assert_eq!(bal(&accounts, "tokB", "bob"), None);
+        assert_eq!(accounts[&sender()].nonce, 0, "no fee, no nonce");
+
+        let mut replay = funded();
+        retargeted.apply_to_state_at(&mut replay, GATE - 1).expect("replay below the gate");
+        assert_eq!(bal(&replay, "tokB", "bob"), Some("100".to_string()), "the old rule ran it on tx.to");
+
+        let unnamed = call("tokA", r#"{"args":["bob","100"],"method":"transfer"}"#);
+        assert!(unnamed.apply_to_state_at(&mut funded(), GATE).is_err(), "a call naming no target");
+        assert!(unnamed.apply_to_state_at(&mut funded(), GATE - 1).is_ok());
+
+        let mut accounts = funded();
+        call("tokA", on_a).apply_to_state_at(&mut accounts, GATE).expect("honest call");
+        assert_eq!(bal(&accounts, "tokA", "bob"), Some("100".to_string()));
+        assert_eq!(bal(&accounts, "tokB", &sender()), Some("1000".to_string()));
+    }
+
+    fn batch(to: Option<&str>, amount: u64, items: &[(&str, u64, Option<&str>)]) -> Transaction {
+        let transfers = items.iter().map(|(t, a, m)| BatchTransferData {
+            to_address: t.to_string(), amount: *a, memo: m.map(str::to_string),
+        }).collect::<Vec<_>>();
+        let n = transfers.len() as u64;
+        Transaction::new(sender(), to.map(str::to_string), amount, 1, 1, 10_000 * n, 0, None,
+            TransactionType::BatchTransfers { transfers, batch_id: "b1".to_string() }, None)
+    }
+
+    fn rehashed(mut tx: Transaction, edit: impl FnOnce(&mut Transaction)) -> Transaction {
+        edit(&mut tx);
+        tx.hash = tx.calculate_hash();
+        tx
+    }
+
+    /// Nothing signs a batch's envelope, and apply never reads it; history and admission do. From the gate
+    /// it must be (BATCH_TRANSFERS_TO, exact sum), and an empty memo (which the digest cannot tell from
+    /// none) is refused.
+    #[test]
+    fn a_batch_envelope_must_equal_its_transfers_from_the_gate() {
+        let honest = batch(Some(BATCH_TRANSFERS_TO), 7, &[("bob", 3, Some("rent")), ("carol", 4, None)]);
+        assert_eq!(honest.check_signed_target_bound(GATE), Ok(()));
+        let cases = [
+            (batch(Some("mallory"), 7, &[("bob", 3, None), ("carol", 4, None)]), "envelope_mismatch"),
+            (batch(Some(BATCH_TRANSFERS_TO), 1_000_000, &[("bob", 3, None), ("carol", 4, None)]), "envelope_mismatch"),
+            (batch(None, 7, &[("bob", 3, None), ("carol", 4, None)]), "envelope_mismatch"),
+            (batch(Some(BATCH_TRANSFERS_TO), 0, &[("bob", u64::MAX, None), ("carol", 1, None)]), "envelope_mismatch"),
+            (batch(Some(BATCH_TRANSFERS_TO), 7, &[("bob", 3, Some("")), ("carol", 4, None)]), "empty_memo"),
+        ];
+        for (tx, why) in &cases {
+            assert_eq!(tx.check_signed_target_bound(GATE - 1), Ok(()), "{}: unchecked below the gate", why);
+            let err = tx.check_signed_target_bound(GATE).unwrap_err();
+            assert!(err.contains(why), "{}: {}", why, err);
+        }
+        // Apply refuses it from the gate before anything moves; below it the old batch still applies.
+        let forged = &cases[0].0;
+        let mut accounts = funded();
+        assert!(forged.apply_to_state_at(&mut accounts, GATE).is_err());
+        assert_eq!(accounts[&sender()].nonce, 0);
+        let mut replay = funded();
+        forged.apply_to_state_at(&mut replay, GATE - 1).expect("replay below the gate");
+        assert_eq!(replay["carol"].balance, 4);
+    }
+
+    /// `data` and `public_key` are in a transfer's hash but outside its signature: from the gate a transfer
+    /// or batch carries neither, so a relay cannot mint a second valid hash from them.
+    #[test]
+    fn a_transfer_or_batch_carries_no_unsigned_extras_from_the_gate() {
+        let base = transfer("bob", 5, "bob", 5);
+        let with_data = rehashed(base.clone(), |t| t.data = Some(r#"{"method":"transfer","args":["x","9"]}"#.to_string()));
+        let with_pk = rehashed(base.clone(), |t| t.public_key = Some("ab".repeat(64)));
+        let empty_data = rehashed(base.clone(), |t| t.data = Some(String::new()));
+        let batch_data = rehashed(batch(Some(BATCH_TRANSFERS_TO), 3, &[("bob", 3, None)]), |t| t.data = Some("pad".repeat(1000)));
+        for tx in [&with_data, &with_pk, &empty_data, &batch_data] {
+            assert_eq!(tx.check_signed_target_bound(GATE - 1), Ok(()));
+            let err = tx.check_signed_target_bound(GATE).unwrap_err();
+            assert!(err.contains("unsigned_field_present"), "{}", err);
+        }
+        assert_eq!(base.check_signed_target_bound(GATE), Ok(()));
+    }
+
+    fn registration(node_type: NodeType, vrf_pk: Vec<u8>) -> Transaction {
+        Transaction::new("w1".to_string(), None, 0, 0, 0, 0, 1000, None,
+            TransactionType::NodeRegistration {
+                node_id: "n1".to_string(), node_type, wallet_address: "w1".to_string(),
+                registration_proof: "burn".to_string(), api_endpoint: String::new(), burn_tx: String::new(),
+                burn_wallet: String::new(), burn_owner_sig: String::new(), vrf_pk, burn_amount: 0, burn_cost: 0,
+                burn_attestors: Vec::new(), attest_epoch: 0,
+            },
+            Some(Transaction::client_registration_data("n1", "w1", "burn")))
+    }
+
+    /// Two headers of one (height, producer) that differ, in the detector's canonical order: the smaller
+    /// identity hash first. The timestamps differ, so a proof stamped with the wrong side's is caught.
+    fn ordered_headers(height: u64, producer: &str) -> (EquivocationHeader, EquivocationHeader) {
+        let header = |tag: u8| EquivocationHeader {
+            timestamp: 1_700_000_000 + tag as u64, merkle_root: [tag; 32], previous_hash: [0u8; 32], state_root: [tag; 32],
+            vrf_output: None, timeout_round: 0, carried_baseline: 0, pk_digest: [0u8; 32], signature: vec![tag; 8],
+        };
+        let (x, y) = (header(1), header(2));
+        if x.identity_hash(height, producer) < y.identity_hash(height, producer) { (x, y) } else { (y, x) }
+    }
+
+    /// One of each lifecycle class and both proofs, as their honest builders shape them:
+    /// [heartbeat, reactivation, bitmap, vote proof, block proof, light registration, super registration].
+    fn lifecycle_txs() -> [Transaction; 7] {
+        let heartbeat = Transaction::new("super_x".to_string(), None, 0, 1, u64::MAX, 0, 0, None,
+            TransactionType::Heartbeat { node_id: "super_x".to_string(), anchor_height: 1, anchor_hash: "ab".repeat(32) },
+            None);
+        let mbh = "cd".repeat(32);
+        let reactivation = Transaction::new("super_x".to_string(), None, 0, 2, u64::MAX, 0, 0, None,
+            TransactionType::NodeReactivation {
+                node_id: "super_x".to_string(), current_height: 100, last_macroblock_hash: mbh.clone(),
+                last_macroblock_index: 2, api_endpoint: String::new(),
+            },
+            Some(Transaction::reactivation_data("super_x", 100, 2, &mbh)));
+        let bitmap = Transaction::new("genesis_node_001".to_string(), None, 0, 11, u64::MAX, 0, 0, None,
+            TransactionType::LightNodeEligibilityBitmap {
+                genesis_id: "genesis_node_001".to_string(), epoch: 1, index_span: 16, eligible_count: 3,
+                bitmap_compressed: vec![1, 2, 3],
+            },
+            Some(Transaction::bitmap_data(3, 16, 1)));
+        let proof = Transaction::new("system_slashing".to_string(), None, 0, 0, 0, 0, 0, None,
+            TransactionType::VoteEquivocationProof {
+                offender: "super_x".to_string(), checkpoint_a: vec![1], signature_a: vec![2],
+                checkpoint_b: vec![3], signature_b: vec![4],
+            },
+            None);
+        let (block_a, block_b) = ordered_headers(42, "super_x");
+        let block_proof = Transaction::new(SLASHING_SENDER.to_string(), None, 0, 0, 0, 0, block_a.timestamp, None,
+            TransactionType::EquivocationProof { offender: "super_x".to_string(), height: 42, block_a, block_b },
+            None);
+        let light = registration(NodeType::Light, Vec::new());
+        let sup = registration(NodeType::Super, vec![9u8; 1952]);
+        [heartbeat, reactivation, bitmap, proof, block_proof, light, sup]
+    }
+
+    /// The fee-free lifecycle TXs sign none of `data`/`public_key`, yet both are in the hash, so a relay could
+    /// rehash a pending copy padded to the wire cap. From the gate: no `public_key` on any type, no `data` on a
+    /// heartbeat or proof, exactly the note rebuilt from the body on a registration, reactivation or bitmap,
+    /// and no `vrf_pk` on a light registration (its form signs none). Below the gate a padded copy replays.
+    #[test]
+    fn fee_free_lifecycle_txs_carry_no_unsigned_padding_from_the_gate() {
+        let [heartbeat, reactivation, bitmap, proof, block_proof, light, sup] = lifecycle_txs();
+        for tx in [&heartbeat, &reactivation, &bitmap, &proof, &block_proof, &light, &sup] {
+            assert_eq!(tx.check_signed_target_bound(GATE), Ok(()), "{:?}", tx.tx_type);
+        }
+        let pad = "pad".repeat(1000);
+        let cases = [
+            (rehashed(heartbeat.clone(), |t| t.data = Some(pad.clone())), "field=data"),
+            (rehashed(proof.clone(), |t| t.data = Some(pad.clone())), "field=data"),
+            (rehashed(reactivation.clone(), |t| t.data = Some(format!("{}{}", t.data.clone().unwrap(), pad))), "unsigned_note_mismatch"),
+            (rehashed(reactivation.clone(), |t| t.data = None), "unsigned_note_mismatch"),
+            (rehashed(bitmap.clone(), |t| t.data = Some(pad.clone())), "unsigned_note_mismatch"),
+            (rehashed(light.clone(), |t| t.data = Some(format!("{}{}", t.data.clone().unwrap(), pad))), "unsigned_note_mismatch"),
+            (rehashed(light.clone(), |t| t.data = Some("node_registration:n1:w1:burn:".to_string())), "unsigned_note_mismatch"),
+            (rehashed(light.clone(), |t| if let TransactionType::NodeRegistration { vrf_pk, .. } = &mut t.tx_type {
+                *vrf_pk = vec![9u8; 1952];
+            }), "field=vrf_pk"),
+            (rehashed(sup.clone(), |t| t.public_key = Some("ab".repeat(2048))), "field=public_key"),
+            (rehashed(heartbeat.clone(), |t| t.public_key = Some("ab".to_string())), "field=public_key"),
+            (rehashed(call("tokA", r#"{"args":[],"contract":"tokA","method":"m"}"#), |t| t.public_key = Some("ab".to_string())),
+             "field=public_key"),
+        ];
+        for (tx, why) in &cases {
+            assert_eq!(tx.check_signed_target_bound(GATE - 1), Ok(()), "{}: unchecked below the gate", why);
+            let err = tx.check_signed_target_bound(GATE).unwrap_err();
+            assert!(err.contains(why), "{}: {}", why, err);
+        }
+    }
+
+    /// SIGBIND-R1-01: a heartbeat signs only its anchor, a bitmap its body, a registration and a reactivation
+    /// their body and time, so nonce, gas and (heartbeat, bitmap) timestamp sat in the hash outside every
+    /// signature: anyone who saw one pending minted unlimited copies, same signature, new hashes, each a full
+    /// verify and a pool replacement at every node. From the gate each is the one value its builder writes;
+    /// below it the old copies replay.
+    #[test]
+    fn a_commitment_envelope_is_the_builders_from_the_gate() {
+        let [heartbeat, reactivation, bitmap, _, _, light, sup] = lifecycle_txs();
+        assert_eq!(heartbeat.nonce, Transaction::heartbeat_nonce(1));
+        assert_eq!(Transaction::heartbeat_nonce(14_400 + 1_440 * 3 + 7), 14);
+        assert_eq!(bitmap.nonce, Transaction::light_bitmap_nonce("genesis_node_001", 1));
+        assert_eq!(Transaction::light_bitmap_nonce("genesis_node_005", 2), 25);
+        let mut cases: Vec<(Transaction, &str)> = Vec::new();
+        for (tx, time_unsigned) in [(&heartbeat, true), (&bitmap, true), (&reactivation, false), (&light, false), (&sup, false)] {
+            cases.push((rehashed(tx.clone(), |t| t.nonce = t.nonce.wrapping_add(1)), "system_envelope_unbound"));
+            cases.push((rehashed(tx.clone(), |t| t.gas_price = t.gas_price.wrapping_sub(1)), "system_envelope_unbound"));
+            cases.push((rehashed(tx.clone(), |t| t.gas_limit = 1), "system_envelope_unbound"));
+            if time_unsigned {
+                cases.push((rehashed(tx.clone(), |t| t.timestamp = 1_700_000_000), "system_envelope_unbound"));
+            }
+        }
+        for (tx, why) in &cases {
+            assert_eq!(tx.check_signed_target_bound(GATE - 1), Ok(()), "{:?}: unchecked below the gate", tx.tx_type);
+            let err = tx.check_signed_target_bound(GATE).unwrap_err();
+            assert!(err.contains(why), "{:?}: {}", tx.tx_type, err);
+        }
+        // A registration's and a reactivation's time is signed, so each may carry its own.
+        for tx in [&reactivation, &light] {
+            assert_eq!(rehashed(tx.clone(), |t| t.timestamp = 1_700_000_000).check_signed_target_bound(GATE), Ok(()));
+        }
+    }
+
+    /// A lifecycle TX or proof pays no one: its `to` and `amount` are in the hash, outside every signature, and
+    /// apply reads neither, yet history showed them, so a relay's replacement could list a fabricated receipt
+    /// under any victim. From the gate each carries neither; below it the old copy replays.
+    #[test]
+    fn a_lifecycle_tx_or_proof_names_no_recipient_and_no_value_from_the_gate() {
+        for tx in lifecycle_txs() {
+            assert!(tx.moves_no_envelope_value(), "{:?}", tx.tx_type);
+            assert_eq!(tx.check_signed_target_bound(GATE), Ok(()), "{:?}", tx.tx_type);
+            let named = rehashed(tx.clone(), |t| t.to = Some(sender()));
+            let valued = rehashed(tx.clone(), |t| t.amount = 1_000_000_000_000_000_000);
+            for (bad, why) in [(&named, "field=to"), (&valued, "field=amount")] {
+                assert_eq!(bad.check_signed_target_bound(GATE - 1), Ok(()), "{}: unchecked below the gate", why);
+                let err = bad.check_signed_target_bound(GATE).unwrap_err();
+                assert!(err.contains(why), "{:?} {}: {}", tx.tx_type, why, err);
+            }
+        }
+        for tx in [transfer("bob", 5, "bob", 5), claim(7, |_| {})] {
+            assert!(!tx.moves_no_envelope_value(), "a class that pays keeps its envelope");
+        }
+    }
+
+    /// A proof authenticates itself through the headers or votes it embeds. Its envelope signature, key and
+    /// legacy signature sit outside the hash, so a relay's copy carrying any of them kept the honest hash and
+    /// the block verify stage then judged what it attached. From the gate every judge refuses such a copy,
+    /// apply included; the heartbeat's own signature is untouched.
+    #[test]
+    fn a_proof_carries_no_envelope_signature_from_the_gate() {
+        let [heartbeat, _, _, vote_proof, block_proof, _, _] = lifecycle_txs();
+        for proof in [vote_proof, block_proof.clone()] {
+            let mut junk = proof.clone();
+            junk.dilithium_signature = Some(vec![0u8]);
+            let mut labelled = proof.clone();
+            labelled.dilithium_signature = Some(vec![1u8; 3309]);
+            labelled.dilithium_public_key = Some(b"fresh_label".to_vec());
+            let mut keyed = proof.clone();
+            keyed.dilithium_public_key = Some(vec![2u8; 1952]);
+            let mut legacy = proof.clone();
+            legacy.signature = Some("x".repeat(16_000));
+            for copy in [&junk, &labelled, &keyed, &legacy] {
+                assert_eq!(copy.calculate_hash(), proof.hash, "outside the hash: the copy keeps the honest hash");
+                assert_eq!(copy.check_signed_target_bound(GATE - 1), Ok(()));
+                assert!(copy.check_signed_target_bound(GATE).unwrap_err().contains("field=signature"));
+            }
+        }
+        let mut junk = block_proof.clone();
+        junk.dilithium_signature = Some(vec![0u8]);
+        let mut accounts = HashMap::new();
+        assert!(junk.apply_to_state_at(&mut accounts, GATE).is_err());
+        assert!(accounts.get("super_x").map_or(true, |a| a.banned_at_height == 0), "no ban from the refused copy");
+        block_proof.apply_to_state_at(&mut accounts, GATE).expect("the honest proof applies");
+        assert_eq!(accounts["super_x"].banned_at_height, GATE);
+        let mut replay = HashMap::new();
+        junk.apply_to_state_at(&mut replay, GATE - 1).expect("replay below the gate");
+        assert_eq!(replay["super_x"].banned_at_height, GATE - 1);
+
+        let signed = heartbeat.with_quantum_signature(Some(vec![3u8; 3309]), Some(b"super_x".to_vec()));
+        assert_eq!(signed.check_signed_target_bound(GATE), Ok(()), "a heartbeat's signature is its authenticator");
+    }
+
+    /// Genesis identities are minted in block 0, and the genesis proof exempts a registration from the identity
+    /// bind, the burn quorum and every signature rule. From the gate no registration may claim it; block 0 is
+    /// judged at height 0, below the gate, so the genesis block replays unchanged.
+    #[test]
+    fn no_registration_claims_the_genesis_proof_from_the_gate() {
+        let reg = Transaction::new("w1".to_string(), None, 0, 0, 0, 0, 0, None,
+            TransactionType::NodeRegistration {
+                node_id: "genesis_node_003".to_string(), node_type: NodeType::Super, wallet_address: "w1".to_string(),
+                registration_proof: "genesis".to_string(), api_endpoint: "http://198.51.100.66:8001".to_string(),
+                burn_tx: String::new(), burn_wallet: String::new(), burn_owner_sig: String::new(), vrf_pk: vec![9u8; 1952],
+                burn_amount: 0, burn_cost: 0, burn_attestors: Vec::new(), attest_epoch: 0,
+            },
+            Some(Transaction::client_registration_data("genesis_node_003", "w1", "genesis")));
+        assert_eq!(reg.check_signed_target_bound(0), Ok(()));
+        assert_eq!(reg.check_signed_target_bound(GATE - 1), Ok(()));
+        assert!(reg.check_signed_target_bound(GATE).unwrap_err().contains("genesis_proof_after_block_0"));
+        let mut accounts = HashMap::new();
+        assert!(reg.apply_to_state_at(&mut accounts, GATE).is_err());
+    }
+
+    /// Nothing signs a proof's from, nonce, gas, timestamp or header order, nor a registration's or a bitmap's
+    /// from and gas_limit, and a proof never expires. So anyone holding one proof minted unlimited fee-free,
+    /// top-priority copies under distinct hashes, and a copy naming a user's (from, nonce) displaced that
+    /// user's own TX in the producer. From the gate each envelope is exactly what its builder writes; below it
+    /// every copy replays. Apply refuses a copy and bans nobody through it.
+    #[test]
+    fn a_system_built_envelope_is_the_one_its_builder_writes_from_the_gate() {
+        let [_, _, bitmap, vote_proof, block_proof, light, sup] = lifecycle_txs();
+        let victim = sender();
+        let mut copies = Vec::new();
+        for proof in [&vote_proof, &block_proof] {
+            copies.push(rehashed(proof.clone(), |t| t.from = victim.clone()));
+            copies.push(rehashed(proof.clone(), |t| t.nonce = 7));
+            copies.push(rehashed(proof.clone(), |t| t.gas_price = 1));
+            copies.push(rehashed(proof.clone(), |t| t.gas_limit = 1));
+        }
+        copies.push(rehashed(block_proof.clone(), |t| t.timestamp += 1));
+        copies.push(rehashed(block_proof.clone(), |t| {
+            if let TransactionType::EquivocationProof { block_a, block_b, .. } = &mut t.tx_type {
+                std::mem::swap(block_a, block_b);
+            }
+        }));
+        copies.push(rehashed(block_proof.clone(), |t| {
+            if let TransactionType::EquivocationProof { block_a, block_b, .. } = &mut t.tx_type {
+                std::mem::swap(block_a, block_b);
+                t.timestamp = block_a.timestamp; // stamped consistently: the order alone is wrong
+            }
+        }));
+        for reg in [&light, &sup] {
+            copies.push(rehashed(reg.clone(), |t| t.from = victim.clone()));
+            copies.push(rehashed(reg.clone(), |t| t.gas_limit = 1));
+        }
+        copies.push(rehashed(bitmap.clone(), |t| t.from = victim.clone()));
+        copies.push(rehashed(bitmap.clone(), |t| t.gas_limit = 1));
+
+        let mut hashes: std::collections::HashSet<String> = [&vote_proof, &block_proof, &light, &sup, &bitmap].iter()
+            .map(|t| t.hash.clone()).collect();
+        for tx in [&vote_proof, &block_proof, &light, &sup, &bitmap] {
+            assert_eq!(tx.check_signed_target_bound(GATE), Ok(()), "the builder's shape passes: {:?}", tx.tx_type);
+        }
+        for tx in &copies {
+            assert!(hashes.insert(tx.hash.clone()), "each copy is a new hash: {:?}", tx.tx_type);
+            assert_eq!(tx.check_signed_target_bound(GATE - 1), Ok(()), "unchecked below the gate");
+            let err = tx.check_signed_target_bound(GATE).unwrap_err();
+            assert!(err.contains("system_envelope_unbound"), "{}", err);
+        }
+
+        // A bitmap's signer is the label its envelope names: a backup owner signs for another shard as itself.
+        let backup = rehashed(bitmap.clone(), |t| t.from = "genesis_node_003".to_string())
+            .with_quantum_signature(Some(vec![1u8; 8]), Some(b"genesis_node_003".to_vec()));
+        assert_eq!(backup.check_signed_target_bound(GATE), Ok(()));
+        let mislabelled = bitmap.clone().with_quantum_signature(Some(vec![1u8; 8]), Some(b"genesis_node_003".to_vec()));
+        assert!(mislabelled.check_signed_target_bound(GATE).unwrap_err().contains("system_envelope_unbound"));
+
+        let copy = rehashed(block_proof.clone(), |t| t.from = victim.clone());
+        let mut accounts = HashMap::new();
+        assert!(copy.apply_to_state_at(&mut accounts, GATE).is_err());
+        assert!(accounts.get("super_x").map_or(true, |a| a.banned_at_height == 0), "no ban from the refused copy");
+        let mut replay = HashMap::new();
+        copy.apply_to_state_at(&mut replay, GATE - 1).expect("replay below the gate");
+        assert_eq!(replay["super_x"].banned_at_height, GATE - 1);
+    }
+
+    /// The legacy `signature` is outside the hash and every signature, and nothing reads it past block 0, so a
+    /// relay attached up to 16 KB to any pending TX under its honest hash and the bytes rode into blocks free.
+    /// From the gate no TX carries it, apply included; below it such a copy replays, and genesis (block 0,
+    /// judged at height 0) keeps its markers.
+    #[test]
+    fn no_tx_carries_the_legacy_signature_from_the_gate() {
+        let [heartbeat, reactivation, bitmap, vote_proof, block_proof, light, sup] = lifecycle_txs();
+        let paying = [
+            transfer("bob", 5, "bob", 5),
+            call("tokA", r#"{"args":[],"contract":"tokA","method":"m"}"#),
+            batch(Some(BATCH_TRANSFERS_TO), 3, &[("bob", 3, None)]),
+            claim(7, |_| {}),
+        ];
+        for honest in [heartbeat, reactivation, bitmap, vote_proof, block_proof, light, sup].iter().chain(paying.iter()) {
+            assert_eq!(honest.check_signed_target_bound(GATE), Ok(()), "{:?}", honest.tx_type);
+            let mut padded = honest.clone();
+            padded.signature = Some("x".repeat(16_384));
+            assert_eq!(padded.calculate_hash(), honest.hash, "outside the hash: the copy keeps the honest hash");
+            assert_eq!(padded.check_signed_target_bound(GATE - 1), Ok(()));
+            assert!(padded.check_signed_target_bound(GATE).unwrap_err().contains("field=signature"), "{:?}", honest.tx_type);
+        }
+        let mut padded = transfer("bob", 5, "bob", 5);
+        padded.signature = Some("x".repeat(16_384));
+        let mut accounts = funded();
+        assert!(padded.apply_to_state_at(&mut accounts, GATE).is_err());
+        assert!(!accounts.contains_key("bob"), "nothing paid");
+        let mut replay = funded();
+        padded.apply_to_state_at(&mut replay, GATE - 1).expect("replay below the gate");
+        assert_eq!(replay["bob"].balance, 5);
+    }
+
+    /// canonical_bytes serializes from borrows; its bytes must stay those of the clone-and-clear encoding it
+    /// replaced, whichever optional fields are present, or every TX hash on chain would change.
+    #[test]
+    fn canonical_bytes_equal_the_cleared_clone_encoding() {
+        fn reference(tx: &Transaction) -> Vec<u8> {
+            let mut c = tx.clone();
+            c.hash = String::new();
+            c.signature = None;
+            c.dilithium_signature = None;
+            c.dilithium_public_key = None;
+            bincode::serialize(&c).unwrap()
+        }
+        let bare = transfer("bob", 5, "bob", 5);
+        let mut full = bare.clone();
+        full.hash = "ff".repeat(32);
+        full.signature = Some("legacy".to_string());
+        full.public_key = Some("ab".repeat(32));
+        full.data = Some("note".to_string());
+        full.dilithium_signature = Some(vec![1u8; 3309]);
+        full.dilithium_public_key = Some(vec![2u8; 1952]);
+        let mut reg = registration(NodeType::Super, vec![9u8; 1952]);
+        if let TransactionType::NodeRegistration { burn_attestors, .. } = &mut reg.tx_type {
+            burn_attestors.push(("genesis_node_001".to_string(), "sig".to_string()));
+        }
+        let txs = [bare.clone(), full.clone(), reg, call("tokA", r#"{"contract":"tokA"}"#),
+                   batch(Some(BATCH_TRANSFERS_TO), 3, &[("bob", 3, Some("m"))])];
+        for tx in &txs {
+            assert_eq!(tx.canonical_bytes(), reference(tx), "{:?}", tx.tx_type);
+        }
+        // What the preimage clears never moves the hash.
+        let mut cleared = full.clone();
+        cleared.hash = String::new();
+        cleared.signature = None;
+        cleared.dilithium_signature = None;
+        cleared.dilithium_public_key = None;
+        assert_eq!(full.calculate_hash(), cleared.calculate_hash());
+        assert_ne!(full.calculate_hash(), bare.calculate_hash(), "public_key and data are in it");
+    }
+
+    /// A block's root covers tx hashes, not bodies. From the gate a body that is not the one its hash names
+    /// is refused by every judge, apply included; below it the old block replays.
+    #[test]
+    fn every_tx_hash_must_name_its_body_from_the_gate() {
+        let honest = transfer("bob", 5, "bob", 5);
+        let mut swapped = honest.clone();
+        swapped.timestamp += 1; // a body change under the honest hash
+        let err = swapped.check_signed_target_bound(GATE).unwrap_err();
+        assert!(err.contains("tx_body_unbound"), "{}", err);
+        assert_eq!(swapped.check_signed_target_bound(GATE - 1), Ok(()));
+        // Fields outside the hash (signatures, the elidable key) are not the body.
+        let mut signed = honest.clone();
+        signed.dilithium_signature = Some(vec![1u8; 3309]);
+        signed.dilithium_public_key = None;
+        assert_eq!(signed.check_signed_target_bound(GATE), Ok(()));
+
+        let mut accounts = funded();
+        let err = swapped.apply_to_state_at(&mut accounts, GATE).unwrap_err();
+        assert!(format!("{:?}", err).contains("tx_body_unbound"), "{:?}", err);
+        assert!(!accounts.contains_key("bob"));
+        let mut replay = funded();
+        swapped.apply_to_state_at(&mut replay, GATE - 1).expect("replay below the gate");
+        assert_eq!(replay["bob"].balance, 5);
+    }
+
+    fn deploy_tx(to: Option<String>, amount: u64, data: &str) -> Transaction {
+        Transaction::new(sender(), to, amount, 1, 1, 1_000_000, 0, None,
+            TransactionType::ContractDeploy, Some(data.to_string()))
+    }
+
+    fn canonical(kind: DeployKind, input: serde_json::Value) -> String {
+        canonical_deploy_data(kind, &input).expect("canonical")
+    }
+
+    /// Only code_hash is signed, and the per-byte fee reads the whole payload. From the gate the payload is
+    /// its one canonical form; every in-repo builder writes exactly that form.
+    #[test]
+    fn a_deploy_must_carry_its_canonical_payload_from_the_gate() {
+        let token_input = serde_json::json!({
+            "qrc20": true, "name": "Tok", "symbol": "TK", "decimals": 6, "logo": "",
+            "initial_supply": "1000", "mintable": false, "burnable": true,
+        });
+        let token = canonical(DeployKind::Qrc20, token_input.clone());
+        let nft = canonical(DeployKind::Qrc721, serde_json::json!({ "qrc721": true, "name": "N", "symbol": "NF" }));
+        let wasm = canonical(DeployKind::Wasm, serde_json::json!({ "wasm": true, "code": "0061736D01000000" }));
+        let derived = Some(derive_contract_address(&sender(), 1));
+        for data in [&token, &nft, &wasm] {
+            assert_eq!(deploy_tx(derived.clone(), 0, data).check_signed_target_bound(GATE), Ok(()), "{}", data);
+            // Idempotent: the canonical form of a canonical payload is itself.
+            let parsed: serde_json::Value = serde_json::from_str(data).unwrap();
+            let kind = deploy_tx(None, 0, data).classify_contract_deploy().unwrap();
+            assert_eq!(&canonical_deploy_data(kind, &parsed).unwrap(), data);
+        }
+        assert!(wasm.contains("0061736d01000000"), "code in lowercase hex: {}", wasm);
+        assert!(token.contains(r#""decimals":6"#) && token.contains(r#""initial_supply":"1000""#), "{}", token);
+
+        // Same digest, other bytes: each is refused from the gate and accepted below it.
+        let mut padded: serde_json::Value = serde_json::from_str(&token).unwrap();
+        padded["x"] = serde_json::json!("a".repeat(10_000));
+        let mut decimals_str: serde_json::Value = serde_json::from_str(&token).unwrap();
+        decimals_str["decimals"] = serde_json::json!("6");
+        let mut no_logo: serde_json::Value = serde_json::from_str(&token).unwrap();
+        no_logo.as_object_mut().unwrap().remove("logo");
+        let spaced = token.replace(",", ", ");
+        let upper = wasm.replace("0061736d01000000", "0061736D01000000");
+        for data in [padded.to_string(), decimals_str.to_string(), no_logo.to_string(), spaced, upper] {
+            let tx = deploy_tx(derived.clone(), 0, &data);
+            assert!(tx.classify_contract_deploy().is_ok(), "the digest still matches: {}", data);
+            assert_eq!(tx.check_signed_target_bound(GATE - 1), Ok(()));
+            let err = tx.check_signed_target_bound(GATE).unwrap_err();
+            assert!(err.contains("deploy_data_not_canonical"), "{}", err);
+        }
+        // A payload that is not a deploy at all is refused from the gate as well.
+        assert!(deploy_tx(None, 0, "{}").check_signed_target_bound(GATE).is_err());
+    }
+
+    /// A deploy's `to` and `amount` are unsigned and apply reads neither: `to` is the derived address or
+    /// none, `amount` zero. Admission refuses the rest at any height; the gated rule binds blocks.
+    #[test]
+    fn a_deploy_names_its_derived_address_and_moves_no_value() {
+        let data = canonical(DeployKind::Qrc721, serde_json::json!({ "qrc721": true, "name": "N", "symbol": "NF" }));
+        let derived = derive_contract_address(&sender(), 1);
+        let squat = deploy_tx(Some(derive_contract_address("victim", 7)), 0, &data);
+        let paid = deploy_tx(Some(derived.clone()), 5, &data);
+        for (tx, why) in [(&squat, "deploy_to_not_derived"), (&paid, "deploy_amount_nonzero")] {
+            assert!(tx.validate().unwrap_err().contains(why));
+            assert_eq!(tx.check_signed_target_bound(GATE - 1), Ok(()));
+            assert!(tx.check_signed_target_bound(GATE).unwrap_err().contains(why));
+        }
+        for tx in [deploy_tx(Some(derived), 0, &data), deploy_tx(None, 0, &data)] {
+            assert_eq!(tx.validate(), Ok(()));
+            assert_eq!(tx.check_signed_target_bound(GATE), Ok(()));
+        }
+    }
+
+    /// The module check apply runs, at admission too: a relay that moves the WASM flag onto a token's digest
+    /// input keeps classify passing but is refused at the door, not left to fail closed inside a block.
+    #[test]
+    fn admission_refuses_a_wasm_deploy_that_is_no_module() {
+        const COUNTER_WAT: &str = include_str!("../../../development/qnet-contracts/examples/counter.wat");
+        let code = wat::parse_str(COUNTER_WAT).unwrap();
+        let module = canonical(DeployKind::Wasm, serde_json::json!({ "wasm": true, "code": hex::encode(&code) }));
+        assert_eq!(deploy_tx(None, 0, &module).validate(), Ok(()));
+        let swapped = canonical(DeployKind::Wasm, serde_json::json!({ "wasm": true, "code": hex::encode(b"QRC20|not a module") }));
+        let tx = deploy_tx(None, 0, &swapped);
+        assert!(tx.classify_contract_deploy().is_ok(), "the digest matches its own bytes");
+        assert!(tx.validate().unwrap_err().contains("[REJECT][VM]"));
+    }
+
+    /// The deploy time is state. From the gate it is the block height, which every copy of the TX shares;
+    /// below it the unsigned tx.timestamp, as blocks on disk were applied.
+    #[test]
+    fn a_deploy_records_its_block_height_from_the_gate() {
+        let data = canonical(DeployKind::Qrc721, serde_json::json!({ "qrc721": true, "name": "N", "symbol": "NF" }));
+        let mut tx = deploy_tx(None, 0, &data);
+        tx.timestamp = 1_700_000_123;
+        tx.hash = tx.calculate_hash();
+        let addr = derive_contract_address(&sender(), 1);
+        let mut at_gate = funded();
+        tx.apply_to_state_at(&mut at_gate, GATE).expect("deploy at the gate");
+        let st = &at_gate[&addr].contract_storage;
+        assert_eq!(st.get("deployed_height").map(String::as_str), Some(GATE.to_string().as_str()));
+        assert!(st.get("deployed_at").is_none());
+        let mut below = funded();
+        tx.apply_to_state_at(&mut below, GATE - 1).expect("deploy below the gate");
+        let st = &below[&addr].contract_storage;
+        assert_eq!(st.get("deployed_at").map(String::as_str), Some("1700000123"));
+        assert!(st.get("deployed_height").is_none());
+    }
+
+    #[test]
+    fn claim_entries_total_sums_only_well_formed_payloads() {
+        assert_eq!(Transaction::claim_entries_total(r#"{"claims":[{"amount":3},{"amount":4}]}"#), Some(7));
+        for bad in [
+            r#"{"claims":[]}"#, r#"{"claims":[{"amount":3},{"epoch":1}]}"#, r#"{"claims":[{"amount":"3"}]}"#,
+            r#"{"claims":[{"amount":3.5}]}"#, r#"{"claims":[{"amount":-1}]}"#, "not json", r#"{"other":1}"#,
+            &format!(r#"{{"claims":[{{"amount":{}}},{{"amount":1}}]}}"#, u64::MAX),
+        ] {
+            assert_eq!(Transaction::claim_entries_total(bad), None, "{}", bad);
+        }
+    }
+
+    fn claim(amount: u64, edit: impl FnOnce(&mut Transaction)) -> Transaction {
+        let mut tx = Transaction::new("system_rewards_pool".to_string(), Some(sender()), amount, 0, 0, 0, 1_700_000_000, None,
+            TransactionType::RewardDistribution,
+            Some(r#"{"claims":[{"epoch":1,"amount":3,"proof":[]},{"epoch":2,"amount":4,"proof":[]}]}"#.to_string()));
+        tx.dilithium_signature = Some(b"sig".to_vec());
+        edit(&mut tx);
+        tx.hash = tx.calculate_hash();
+        tx
+    }
+
+    /// A merkle claim is signed over (to, timestamp, sha3(data)) only; from the gate its envelope must be
+    /// what that signature implies, so a relay can neither show a fabricated amount nor mint fee-free
+    /// variants. The emission TX is not a claim and is untouched.
+    #[test]
+    fn a_claim_envelope_must_match_what_its_wallet_signed_from_the_gate() {
+        assert_eq!(claim(7, |_| {}).check_signed_target_bound(GATE), Ok(()));
+        let variants = [
+            claim(1_000_000_000_000_000_000, |_| {}), claim(0, |_| {}),
+            claim(7, |t| t.nonce = 5), claim(7, |t| t.gas_price = 1), claim(7, |t| t.gas_limit = 1),
+        ];
+        for tx in &variants {
+            assert_eq!(tx.check_signed_target_bound(GATE - 1), Ok(()));
+            assert!(tx.check_signed_target_bound(GATE).unwrap_err().contains("claim_envelope_unbound"));
+        }
+        let with_pk = claim(7, |t| t.public_key = Some("x".to_string()));
+        let with_sig = claim(7, |t| t.signature = Some("x".to_string()));
+        for (tx, why) in [(&with_pk, "field=public_key"), (&with_sig, "field=signature")] {
+            assert_eq!(tx.check_signed_target_bound(GATE - 1), Ok(()));
+            assert!(tx.check_signed_target_bound(GATE).unwrap_err().contains(why), "{}", why);
+        }
+        let emission = Transaction::new("system_emission".to_string(), Some("system_rewards_pool".to_string()),
+            1_000, 0, 0, 0, 0, None, TransactionType::RewardDistribution, Some("emission_v3:epoch=1".to_string()));
+        assert_eq!(emission.check_signed_target_bound(GATE), Ok(()));
+    }
+
+    fn activation(from: &str, node_type: NodeType, phase: ActivationPhase, amount: u64) -> Transaction {
+        Transaction::new(from.to_string(), None, 0, 1, 0, 0, 0, None,
+            TransactionType::NodeActivation { node_type, amount, phase }, None)
+    }
+
+    /// A NodeActivation's signer is bound to no account. From the gate it is refused outright (the
+    /// admission-only price rule in validate() is unchanged); below it, it applies as it always did.
+    #[test]
+    fn node_activation_is_refused_from_the_gate() {
+        let p2 = phase2_entry_floor_nano(&NodeType::Super);
+        for tx in [activation(&sender(), NodeType::Light, ActivationPhase::Phase1, 0),
+                   activation(&sender(), NodeType::Super, ActivationPhase::Phase2, p2)] {
+            assert_eq!(tx.validate(), Ok(()));
+            assert_eq!(tx.check_signed_target_bound(GATE - 1), Ok(()));
+            assert!(tx.check_signed_target_bound(GATE).unwrap_err().contains("node_activation_retired"));
+        }
+    }
+
+    #[test]
+    fn apply_refuses_an_activation_from_the_gate() {
+        let p2 = phase2_entry_floor_nano(&NodeType::Super);
+        let tx = activation(&sender(), NodeType::Super, ActivationPhase::Phase2, p2);
+        let rich = || { let mut a = funded(); a.get_mut(&sender()).unwrap().balance = 2 * p2; a };
+        let mut accounts = rich();
+        let before = accounts[&sender()].balance;
+        assert!(tx.apply_to_state_at(&mut accounts, GATE).is_err());
+        let s = &accounts[&sender()];
+        assert_eq!((s.balance, s.nonce, s.is_node), (before, 0, false), "nothing debited, bumped or set");
+        let absent = activation("0000000000000000000eon00000000000000000000000", NodeType::Light, ActivationPhase::Phase1, 0);
+        let mut empty = HashMap::new();
+        assert!(absent.apply_to_state_at(&mut empty, GATE).is_err());
+        assert!(empty.is_empty(), "no account created for the target");
+
+        let mut replay = rich();
+        tx.apply_to_state_at(&mut replay, GATE - 1).expect("replay below the gate");
+        let s = &replay[&sender()];
+        assert_eq!((s.balance, s.nonce, s.is_node), (before - p2, 1, true), "the old activation still replays");
     }
 }

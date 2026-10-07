@@ -6,12 +6,32 @@ mod tx_api;
 use tx_api::*;
 mod queries_api;
 use queries_api::*;
+mod certified_proofs;
+use certified_proofs::*;
+#[cfg(test)]
+mod certified_e2e_tests;
 mod rewards_api;
+#[cfg(test)]
+pub(crate) use rewards_api::{merkle_claim_tx, claim_quote_signer_ok};
 use rewards_api::*;
 mod light_nodes;
 pub use light_nodes::*;
+mod light_bind;
+pub(crate) use light_bind::*;
+mod light_status;
+use light_status::*;
+mod light_push;
+pub(crate) use light_push::*;
+mod light_owners;
+pub(crate) use light_owners::*;
+mod light_unbind;
+pub(crate) use light_unbind::*;
+mod light_device;
+pub(crate) use light_device::*;
 mod registration_api;
 pub use registration_api::*;
+mod registration_door;
+pub(crate) use registration_door::*;
 mod contracts_api;
 pub(crate) use contracts_api::*;
 mod benchmark;
@@ -35,6 +55,33 @@ pub(crate) use dashmap::{DashMap, DashSet};
 pub(crate) use once_cell::sync::Lazy;
 pub(crate) use futures::{StreamExt, SinkExt};
 pub(crate) use tokio::sync::broadcast;
+
+/// The recipient and value history and lookups show for a TX: what apply pays or creates, never an
+/// envelope field nothing signs. A batch shows its kind and the sum of its transfers; a deploy the
+/// address apply derives and no value (a deploy moves none); a lifecycle TX or proof, which pays no one,
+/// neither; every other class its signed fields.
+pub(crate) fn tx_display_to_amount(tx: &qnet_state::Transaction) -> (Option<String>, u64) {
+    match &tx.tx_type {
+        qnet_state::TransactionType::BatchTransfers { transfers, .. } => (
+            Some(qnet_state::transaction::BATCH_TRANSFERS_TO.to_string()),
+            transfers.iter().fold(0u64, |acc, t| acc.saturating_add(t.amount)),
+        ),
+        qnet_state::TransactionType::ContractDeploy =>
+            (Some(qnet_state::transaction::derive_contract_address(&tx.from, tx.nonce)), 0),
+        _ if tx.moves_no_envelope_value() => (None, 0),
+        _ => (tx.to.clone(), tx.amount),
+    }
+}
+
+/// What `address` receives from a batch: the sum of its transfers to it, or None if it is no recipient.
+pub(crate) fn batch_received_by(tx: &qnet_state::Transaction, address: &str) -> Option<u64> {
+    match &tx.tx_type {
+        qnet_state::TransactionType::BatchTransfers { transfers, .. } => transfers.iter()
+            .filter(|t| t.to_address == address)
+            .fold(None, |acc: Option<u64>, t| Some(acc.unwrap_or(0).saturating_add(t.amount))),
+        _ => None,
+    }
+}
 
 // ============================================================================
 // v2.96: HELPER FUNCTIONS FOR BLOCKCHAIN CONSENSUS DATA
@@ -342,18 +389,58 @@ impl ApiRateLimiter {
             block_duration: 3600,
         });
 
-        // Attestation is once/epoch (dedup) but wakeups + retries can burst; per-IP bound so a spammer
-        // can't force unpriced storage reads + Dilithium verifies at 10M-node scale.
+        // Attestation is once/epoch and the per-epoch dedup runs BEFORE the Dilithium verify, so an
+        // honest device costs one verification per epoch however often it answers. That is the bound
+        // that matters; the per-IP cap only stops one source from flooding. It has to be wide, because
+        // an IP is not a device: a household answers from several phones and a carrier NAT fronts
+        // thousands of them, and every answer over the cap is a device losing its epoch for a reason
+        // it cannot see.
         configs.insert("light_node_ping".to_string(), RateLimitConfig {
-            max_requests: 6,
+            max_requests: 120,
             window_seconds: 60,
-            block_duration: 300,
+            block_duration: 60,
         });
 
-        configs.insert("light_node_token_refresh".to_string(), RateLimitConfig {
-            max_requests: 2,
+        // Token refresh, bind, pending bind and unbind are signed by the device or the wallet and limited per
+        // NODE after their signatures verify; per address only their failed requests are counted, an IPv6
+        // address by its /64 (light_bind.rs `FailLimiter`, L-2), so they have no bucket here.
+
+        // A device challenge is 32 random bytes and a MAC; the app asks one per device message. Wide for a
+        // carrier NAT; each enrolment it opens is limited again per address and per node (light_device.rs).
+        configs.insert("light_device_challenge".to_string(), RateLimitConfig {
+            max_requests: 120,
+            window_seconds: 60,
+            block_duration: 60,
+        });
+
+        // A lease refresh and a key rotation are signed by the device key and limited per node after the
+        // signature verifies (light_device.rs); wide per address for a carrier NAT, like bind.
+        configs.insert("light_device_refresh".to_string(), RateLimitConfig {
+            max_requests: 30,
             window_seconds: 3600,
-            block_duration: 1800,
+            block_duration: 600,
+        });
+        configs.insert("light_device_rotate".to_string(), RateLimitConfig {
+            max_requests: 30,
+            window_seconds: 3600,
+            block_duration: 600,
+        });
+
+        // "I'm back" is unsigned and sends a push: each address gets few, and the sender caps each node
+        // and the wake budget on top (light_push.rs).
+        configs.insert("light_node_wake".to_string(), RateLimitConfig {
+            max_requests: 20,
+            window_seconds: 3600,
+            block_duration: 600,
+        });
+
+        // The signed status costs one or two ML-DSA-65 verifications and reads nothing private before
+        // they pass. An app reads it when its Node tab opens and before a bind; the cap is wide for the
+        // same carrier-NAT reason as the ping.
+        configs.insert("light_node_status_signed".to_string(), RateLimitConfig {
+            max_requests: 120,
+            window_seconds: 60,
+            block_duration: 60,
         });
         
         configs.insert("claim_rewards".to_string(), RateLimitConfig {
@@ -405,7 +492,28 @@ impl ApiRateLimiter {
             window_seconds: 60,
             block_duration: 60,
         });
-        
+
+        // History archive: index pages and segment downloads (a segment is one epoch of blocks).
+        configs.insert("archive".to_string(), RateLimitConfig {
+            max_requests: 30,
+            window_seconds: 60,
+            block_duration: 60,
+        });
+
+        // Certified proofs and the certified state, keyed by an IPv4 address or an IPv6 /64
+        // (`certified_proofs::limiter_key`): one host holds a whole /64, so a full-address key would
+        // give it 2^64 buckets. Each proof also holds a slot of the proof pool (certified_proofs.rs).
+        configs.insert(certified_proofs::CERTIFIED_PROOF_BUCKET.to_string(), RateLimitConfig {
+            max_requests: 600,
+            window_seconds: 60,
+            block_duration: 30,
+        });
+        configs.insert(certified_proofs::CERTIFIED_STATE_BUCKET.to_string(), RateLimitConfig {
+            max_requests: 600,
+            window_seconds: 60,
+            block_duration: 30,
+        });
+
         if tx_rate != 100 {
             println!("[INFO][SECURITY] api_rate_limit_configured tx={}/min general={}/min read={}/min", 
                      tx_rate, general_rate, read_rate);
@@ -622,31 +730,174 @@ fn is_private_ip(ip: &IpAddr) -> bool {
     }
 }
 
+/// The client a request came from, seen through the TLS terminator on this host. A loopback peer
+/// carrying X-Forwarded-For is that proxy speaking for someone else, and the client is the address it
+/// appended — the last one, so a value the client wrote into the header itself is never taken. Every
+/// other peer is what the socket says. Without this every proxied request would look like localhost,
+/// which the limiter whitelists, and the per-address limits would not exist for the public at all.
+fn client_addr() -> impl Filter<Extract = (Option<std::net::SocketAddr>,), Error = Rejection> + Clone {
+    warp::addr::remote()
+        .and(warp::header::optional::<String>("x-forwarded-for"))
+        .map(|peer: Option<std::net::SocketAddr>, xff: Option<String>| forwarded_client(peer, xff.as_deref()))
+}
+
+/// Port 0 marks a forwarded address; every consumer keys on the IP alone. A request the local proxy
+/// speaks for is never this host: when the entry it names is not an address, or names this host itself
+/// (loopback, unspecified), the terminator did not write it - a client did, through a terminator that
+/// passes the header on - and the request is taken as nobody in particular (0.0.0.0: not whitelisted, not
+/// loopback, never a genesis, one shared bucket in every per-address limit).
+/// The default gateway of this node's network namespace (a container's bridge gateway), read once from the kernel's
+/// route table. A terminator on the host reaches a bridge-networked node from this address, so its X-Forwarded-For
+/// names the client exactly as a loopback terminator's does; without the header the request is this host's own.
+static LOCAL_GATEWAY: Lazy<Option<IpAddr>> = Lazy::new(|| {
+    std::fs::read_to_string("/proc/net/route").ok().and_then(|t| default_gateway(&t))
+});
+
+/// The IPv4 default gateway in /proc/net/route text: the row with destination 00000000 and the gateway flag.
+fn default_gateway(route_table: &str) -> Option<IpAddr> {
+    route_table.lines().skip(1).find_map(|l| {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        if f.len() < 4 || f[1] != "00000000" { return None; }
+        let flags = u32::from_str_radix(f[3], 16).ok()?;
+        if flags & 0x2 == 0 { return None; }
+        let g = u32::from_str_radix(f[2], 16).ok()?;
+        if g == 0 { return None; }
+        Some(IpAddr::V4(std::net::Ipv4Addr::from(g.to_le_bytes())))
+    })
+}
+
+fn forwarded_client(peer: Option<std::net::SocketAddr>, xff: Option<&str>) -> Option<std::net::SocketAddr> {
+    let p = peer?;
+    if !p.ip().is_loopback() && Some(p.ip()) != *LOCAL_GATEWAY { return Some(p); }
+    let Some(header) = xff else { return Some(p); };
+    let nobody = std::net::SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
+    let last = header.rsplit(',').next().map(str::trim).unwrap_or("");
+    let names_this_host = |ip: IpAddr| ip.is_loopback() || ip.is_unspecified() || matches!(ip,
+        IpAddr::V6(v6) if v6.to_ipv4_mapped().map_or(false, |v4| v4.is_loopback() || v4.is_unspecified()));
+    match last.trim_start_matches('[').trim_end_matches(']').parse::<IpAddr>() {
+        Ok(ip) if !names_this_host(ip) => Some(std::net::SocketAddr::new(ip, 0)),
+        _ => Some(nobody),
+    }
+}
+
+/// Whether a web page sent the request: it carries an Origin header, which a browser writes on every
+/// cross-origin request and on every POST and DELETE. Servers, operator tools and genesis-to-genesis calls
+/// send none. An Origin that is not text is still an Origin.
+fn from_page() -> impl Filter<Extract = (bool,), Error = std::convert::Infallible> + Clone {
+    warp::header::optional::<String>("origin")
+        .map(|origin: Option<String>| origin.is_some())
+        .or(warp::any().map(|| true))
+        .unify()
+}
+
+/// The request's Origin header: None when absent; an Origin that is not text reads as "" (no allowed origin).
+fn request_origin() -> impl Filter<Extract = (Option<String>,), Error = std::convert::Infallible> + Clone {
+    warp::header::optional::<String>("origin")
+        .or(warp::any().map(|| Some(String::new())))
+        .unify()
+}
+
+/// The origins the registration doors answer (the submit route and `node_attestBurn`), checked by the server
+/// whatever CORS answered: no Origin (the app, the site's server, a node asking another), the site, and the
+/// browser extension (any chrome-extension:// or moz-extension:// id, which differs per build and per install).
+/// Any other page would spend the doors' first-sight lookups from its visitors' addresses.
+pub(crate) fn registration_origin_allowed(origin: Option<&str>) -> bool {
+    const SITES: [&str; 2] = ["https://aiqnet.io", "https://www.aiqnet.io"];
+    match origin {
+        None => true,
+        Some(o) => SITES.iter().any(|s| o.eq_ignore_ascii_case(s))
+            || ["chrome-extension://", "moz-extension://"].iter().any(|scheme| {
+                o.get(..scheme.len()).map_or(false, |p| p.eq_ignore_ascii_case(scheme))
+                    && o.get(scheme.len()..).map_or(false, |id| !id.is_empty() && !id.contains('/'))
+            }),
+    }
+}
+
+/// The answer to a registration request from an origin `registration_origin_allowed` refuses: 403, in the
+/// submit route's form, or for JSON-RPC (`rpc_id`) in its envelope.
+fn origin_refused(rpc_id: Option<u64>) -> warp::reply::WithStatus<warp::reply::Json> {
+    let body = match rpc_id {
+        Some(id) => json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32005, "message": "Origin not allowed" } }),
+        None => json!({ "success": false, "error": "Origin not allowed" }),
+    };
+    warp::reply::with_status(warp::reply::json(&body), warp::http::StatusCode::FORBIDDEN)
+}
+
+/// The caller as an IP-gated decision sees it: the operator methods and routes, the genesis-only internal
+/// routes, the bundle cancel and the peer list. CORS lets any site send a request from its visitor's
+/// browser, from the visitor's address - this host, its LAN, a whitelisted or a genesis address included -
+/// so a request from a page is nobody in particular (0.0.0.0, as in forwarded_client). The rate limits
+/// keep keying on client_addr.
+fn gate_client(client: Option<std::net::SocketAddr>, from_page: bool) -> Option<std::net::SocketAddr> {
+    if from_page {
+        return Some(std::net::SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0));
+    }
+    client
+}
+
+/// client_addr for the routes that answer only local, whitelisted or genesis callers (served outside the
+/// CORS filter): gate_client of the request.
+fn gate_addr() -> impl Filter<Extract = (Option<std::net::SocketAddr>,), Error = Rejection> + Clone {
+    client_addr().and(from_page()).map(gate_client)
+}
+
+/// The paths of the gate_addr routes, which `start_rpc_server` serves outside the CORS filter. A preflight for
+/// one is refused with no CORS headers (`gated_preflight`), so a page never sends a request there that needs
+/// one, and the answer to any other carries no `Access-Control-Allow-Origin` a page could read it by.
+const GATED_PATHS: &[&str] = &[
+    "/api/v1/internal/",
+    "/api/v1/p2p/message",
+    "/api/v1/node-reactivation/submit",
+    "/api/v1/shutdown",
+];
+
+fn is_gated_path(path: &str) -> bool {
+    GATED_PATHS.iter().any(|p| if p.ends_with('/') { path.starts_with(p) } else { path == *p || path.strip_prefix(p) == Some("/") })
+}
+
+/// An `OPTIONS` request (a CORS preflight) for a gated path: 403 with no CORS headers, where the CORS filter
+/// would answer it. The gated routes serve no `OPTIONS`; any other request passes on to the routes.
+fn gated_preflight() -> impl Filter<Extract = (warp::reply::WithStatus<&'static str>,), Error = Rejection> + Clone {
+    warp::options()
+        .and(warp::path::full())
+        .and_then(|path: warp::path::FullPath| async move {
+            if is_gated_path(path.as_str()) {
+
+                Ok(warp::reply::with_status("", warp::http::StatusCode::FORBIDDEN))
+            } else {
+                Err(warp::reject::not_found())
+            }
+        })
+}
+
 /// Helper function to check rate limit and return error response if exceeded
 /// Bypasses rate limit for: whitelisted IPs, valid API keys
 fn check_api_rate_limit(ip: Option<std::net::SocketAddr>, endpoint_type: &str) -> Result<(), warp::reply::Json> {
+    api_rate_limit_retry(ip, endpoint_type).map_err(|retry_after| warp::reply::json(&rate_limit_body(retry_after)))
+}
+
+/// The per-address limit alone: Err carries the seconds to wait, for a route that answers in its own
+/// form (the registration submit adds its stable `code`).
+fn api_rate_limit_retry(ip: Option<std::net::SocketAddr>, endpoint_type: &str) -> Result<(), u64> {
     let ip_addr = match ip {
         Some(addr) => addr.ip(),
         None => return Ok(()), // Allow if no IP (shouldn't happen)
     };
-    
     // SECURITY: Bypass rate limit for whitelisted IPs (localhost, explorer servers)
     if is_ip_whitelisted(ip_addr) {
         return Ok(());
     }
-    
     let (allowed, retry_after) = API_RATE_LIMITER.check_rate_limit(ip_addr, endpoint_type);
-    
-    if !allowed {
-        return Err(warp::reply::json(&json!({
-            "success": false,
-            "error": "Rate limit exceeded",
-            "retry_after_seconds": retry_after,
-            "message": format!("Too many requests. Please wait {} seconds before retrying.", retry_after)
-        })));
-    }
-    
-    Ok(())
+    if allowed { Ok(()) } else { Err(retry_after) }
+}
+
+fn rate_limit_body(retry_after: u64) -> Value {
+    json!({
+        "success": false,
+        "error": "Rate limit exceeded",
+        "retry_after_seconds": retry_after,
+        "message": format!("Too many requests. Please wait {} seconds before retrying.", retry_after)
+    })
 }
 
 /// Extended rate limit check with API key support (for routes that accept X-API-Key header)
@@ -665,38 +916,6 @@ fn check_api_rate_limit_with_key(
 }
 
 // ============================================================================
-// SECURITY: CORS Configuration for Production
-// ============================================================================
-
-/// Allowed origins for CORS in production
-/// - Official QNet domains
-/// - Local development (localhost)
-const ALLOWED_ORIGINS: &[&str] = &[
-    "https://qnet.network",
-    "https://app.qnet.network",
-    "https://explorer.qnet.network",
-    "https://wallet.qnet.network",
-    "https://docs.qnet.network",
-    "http://localhost:3000",      // Local dev
-    "http://localhost:8080",      // Local dev
-    "http://127.0.0.1:3000",
-    "http://127.0.0.1:8080",
-    "capacitor://localhost",      // Mobile app (Capacitor)
-    "ionic://localhost",          // Mobile app (Ionic)
-];
-
-/// Check if origin is allowed
-#[allow(dead_code)]
-fn is_origin_allowed(origin: &str) -> bool {
-    // In development mode, allow all origins
-    if std::env::var("QNET_DEV_MODE").is_ok() {
-        return true;
-    }
-    
-    // Check against whitelist
-    ALLOWED_ORIGINS.iter().any(|&allowed| origin == allowed)
-}
-
 // DYNAMIC NETWORK DETECTION - No timestamp dependency for robust deployment
 
 /// SECURITY: Validate address with detailed error
@@ -836,7 +1055,7 @@ struct NodeReactivationRequest {
 /// Client signs: "q{chain}|client_node_reg:{node_id}:{wallet_address}:{registration_proof}:{timestamp}"
 /// This endpoint accepts the signed TX and routes it directly to the current producer.
 #[derive(Debug, Deserialize)]
-struct NodeRegistrationClientRequest {
+pub(crate) struct NodeRegistrationClientRequest {
     /// EON wallet address of the node owner (= tx.from)
     from: String,
     /// Node pseudonym (from /api/v1/light-node/register response)
@@ -870,11 +1089,12 @@ struct NodeRegistrationClientRequest {
     /// Solana address that performed the burn (committee verifies the on-chain burn against it).
     #[serde(default)]
     burn_wallet: Option<String>,
-    /// Proof-of-ownership: Solana-key signature over
-    /// "qnet_onchain_reg:{node_id}:{wallet_address}:{registration_proof}:{timestamp}", verified against
-    /// `burn_wallet`. Binds the on-chain registration (which commits the node's IMMUTABLE Dilithium
-    /// attestation root) to the wallet that actually burned — so an attacker cannot front-run a
-    /// victim's first registration with the victim's public burn_tx and plant an attacker-owned key.
+    /// Proof-of-ownership: Solana-key signature over the owner bind
+    /// (`Transaction::burn_owner_bind_message`, or from the wallet_one_node gate `burn_owner_bind_message_v2`,
+    /// which names no time), verified against `burn_wallet`. Binds the on-chain registration (which commits
+    /// the node's IMMUTABLE Dilithium attestation root) to the wallet that actually burned — so an attacker
+    /// cannot front-run a victim's first registration with the victim's public burn_tx and plant an
+    /// attacker-owned key.
     #[serde(default)]
     owner_signature: Option<String>,
 }
@@ -924,6 +1144,15 @@ pub(super) struct BlockHeadersQuery {
 
 fn default_headers_limit() -> u64 { 100 }
 
+/// /api/v1/archive?from_epoch=&limit= — limit is clamped to [1, 1000].
+#[derive(Debug, Deserialize)]
+pub(super) struct ArchiveListQuery {
+    #[serde(default)]
+    pub(super) from_epoch: u64,
+    #[serde(default = "default_headers_limit")]
+    pub(super) limit: u64,
+}
+
 /// Query parameters for global recent transactions
 #[derive(Debug, Deserialize)]
 struct RecentTransactionsQuery {
@@ -961,19 +1190,15 @@ struct BatchTransferRequest {
     dilithium_public_key: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+/// The inputs of the reference activation-code generator (`generate_quantum_activation_code`), held to the
+/// contract KATs. The node serves no route that makes a code: the clients derive it, and the node verifies it.
+#[cfg(test)]
 struct GenerateActivationCodeRequest {
-    /// Phase 1: Solana address (for burn verification)
-    /// Phase 2: QNet EON address (for both burn and rewards)
+    /// The address the code encrypts: the burner's Solana address, or the wallet's own address.
     wallet_address: String,
-    /// QNet EON address for rewards (REQUIRED for Phase 1, optional for Phase 2)
-    /// Format: {19 hex}eon{15 hex}{8 checksum} = 45 chars
-    #[serde(default)]
-    qnet_reward_wallet: Option<String>,
     burn_tx_hash: String,
     node_type: String,
     burn_amount: u64,
-    phase: u8,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -1124,20 +1349,34 @@ struct RewardHistoryQuery {
 /// Start comprehensive API server (JSON-RPC + REST)
 pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
     let blockchain = Arc::new(blockchain);
+    // The pending-binding index loads once, here: until it has, every light registration the chain
+    // applies spawns a task to look (light_binding::pending_may_contain).
+    {
+        let storage = blockchain.get_storage();
+        tokio::task::spawn_blocking(move || crate::light_binding::pending_index_init(&storage));
+    }
     let blockchain_clone_for_filter = blockchain.clone();
     let blockchain_filter = warp::any().map(move || blockchain_clone_for_filter.clone());
     
     // JSON-RPC endpoints with rate limiting + API key support
     // X-API-Key header bypasses rate limit for authorized clients (Explorer, Admin)
     // SECURITY: Limit body size to 1MB to prevent payload attacks
+    // Exactly /rpc: a proxy that refuses this path must not be bypassed by /rpc/<anything>.
     let rpc_path = warp::path("rpc")
+        .and(warp::path::end())
         .and(warp::post())
         .and(warp::body::content_length_limit(1024 * 1024)) // 1MB max
         .and(warp::body::json())
-        .and(warp::addr::remote())
+        .and(client_addr())
+        .and(from_page())
+        .and(request_origin())
         .and(warp::header::optional::<String>("x-api-key"))
         .and(blockchain_filter.clone())
-        .and_then(|request: RpcRequest, remote_addr: Option<std::net::SocketAddr>, api_key: Option<String>, blockchain: Arc<BlockchainNode>| async move {
+        .and_then(|request: RpcRequest, remote_addr: Option<std::net::SocketAddr>, from_page: bool, origin: Option<String>, api_key: Option<String>, blockchain: Arc<BlockchainNode>| async move {
+            // The burn attestor answers the registration doors' origins only (registration_origin_allowed).
+            if request.method == "node_attestBurn" && !registration_origin_allowed(origin.as_deref()) {
+                return Ok::<_, Rejection>(origin_refused(Some(request.id)).into_response());
+            }
             // SECURITY: Rate limit ALL JSON-RPC methods (bypass with valid API key)
             let method = &request.method;
             let limit_category = match method.as_str() {
@@ -1147,17 +1386,23 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
             if let Err(rate_limit_response) = check_api_rate_limit_with_key(remote_addr, api_key, limit_category) {
                 return Ok::<_, Rejection>(rate_limit_response.into_response());
             }
-            handle_rpc(request, remote_addr, blockchain).await.map(|r| r.into_response())
+            handle_rpc(request, remote_addr, from_page, blockchain).await.map(|r| r.into_response())
         });
 
     let root_path = warp::path::end()
         .and(warp::post())
         .and(warp::body::content_length_limit(1024 * 1024)) // 1MB max
         .and(warp::body::json())
-        .and(warp::addr::remote())
+        .and(client_addr())
+        .and(from_page())
+        .and(request_origin())
         .and(warp::header::optional::<String>("x-api-key"))
         .and(blockchain_filter.clone())
-        .and_then(|request: RpcRequest, remote_addr: Option<std::net::SocketAddr>, api_key: Option<String>, blockchain: Arc<BlockchainNode>| async move {
+        .and_then(|request: RpcRequest, remote_addr: Option<std::net::SocketAddr>, from_page: bool, origin: Option<String>, api_key: Option<String>, blockchain: Arc<BlockchainNode>| async move {
+            // The burn attestor answers the registration doors' origins only (registration_origin_allowed).
+            if request.method == "node_attestBurn" && !registration_origin_allowed(origin.as_deref()) {
+                return Ok::<_, Rejection>(origin_refused(Some(request.id)).into_response());
+            }
             // SECURITY: Rate limit ALL JSON-RPC methods (bypass with valid API key)
             let method = &request.method;
             let limit_category = match method.as_str() {
@@ -1167,7 +1412,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
             if let Err(rate_limit_response) = check_api_rate_limit_with_key(remote_addr, api_key, limit_category) {
                 return Ok::<_, Rejection>(rate_limit_response.into_response());
             }
-            handle_rpc(request, remote_addr, blockchain).await.map(|r| r.into_response())
+            handle_rpc(request, remote_addr, from_page, blockchain).await.map(|r| r.into_response())
         });
     
     // REST API endpoints (new)
@@ -1178,16 +1423,21 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("height"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(|remote_addr: Option<std::net::SocketAddr>, blockchain: Arc<BlockchainNode>| async move {
             // v3.19: Rate limiting for DDoS protection
             if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "read_only") {
                 return Ok::<_, Rejection>(rate_limit_response.into_response());
             }
-            
+            // The node-wide budget (M-6, light_push::HEIGHT_READ_BUDGET): past it a 503 with a wait.
+            let mut permit = None;
+            if let Some(shed) = shed_past(&HEIGHT_READ_BUDGET, remote_addr, &mut permit) {
+                return Ok::<_, Rejection>(shed);
+            }
+
             let height = blockchain.get_height().await;
-            
+
             // API DEADLOCK FIX: Use cached network height to avoid circular HTTP calls
             let mut network_height = height;
             
@@ -1295,17 +1545,38 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         });
     
     // Compact headers for indexers. The hash comes from the height→hash index and outlives the body;
-    // body fields are present only inside the retention window.
+    // body fields are present inside the retention window, and past it where this node's archive holds the block.
     let blocks_headers = api_v1
         .and(warp::path("blocks"))
         .and(warp::path("headers"))
         .and(warp::path::end())
         .and(warp::get())
         .and(warp::query::<BlockHeadersQuery>())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(warp::header::optional::<String>("x-api-key"))
         .and(blockchain_filter.clone())
         .and_then(handle_block_headers);
+
+    // History archive (nodes started with QNET_ARCHIVE=1): the segment index and one segment file.
+    let archive_list = api_v1
+        .and(warp::path("archive"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::query::<ArchiveListQuery>())
+        .and(client_addr())
+        .and(warp::header::optional::<String>("x-api-key"))
+        .and(blockchain_filter.clone())
+        .and_then(handle_archive_list);
+    let archive_segment = api_v1
+        .and(warp::path("archive"))
+        .and(warp::path("segment"))
+        .and(warp::path::param::<u64>())
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(client_addr())
+        .and(warp::header::optional::<String>("x-api-key"))
+        .and(blockchain_filter.clone())
+        .and_then(handle_archive_segment);
 
     // Account endpoints
     let account_info = api_v1
@@ -1313,6 +1584,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::param::<String>())
         .and(warp::path::end())
         .and(warp::get())
+        .and(warp::query::<HashMap<String, String>>())
         .and(blockchain_filter.clone())
         .and_then(handle_account_info);
     
@@ -1323,11 +1595,13 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("balance"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_account_balance);
     
-    // v3.11: Balance with Merkle proof for Light clients
+    // GET /api/v1/account/{address}/balance/proof[?mb=latest|<j>]: with `mb`, the certified form over
+    // the view of macroblock j (certified_proofs.rs); without it, the legacy body. The query is read as
+    // raw pairs, which never rejects, so a duplicate or malformed `mb` gets a typed 400.
     let account_balance_proof = api_v1
         .and(warp::path("account"))
         .and(warp::path::param::<String>())
@@ -1335,11 +1609,13 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("proof"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(warp::query::<Vec<(String, String)>>())
+        .and(client_addr())
         .and(blockchain_filter.clone())
-        .and_then(handle_account_balance_with_proof);
+        .and_then(handle_account_balance_proof_route);
 
-    // V2: GET /api/v1/token/{contract}/{holder}/balance/proof — two-level trustless QRC-20 balance proof
+    // GET /api/v1/token/{contract}/{holder}/balance/proof[?mb=latest|<j>]: two-level QRC-20 balance
+    // proof, certified with `mb`, legacy without it.
     let token_balance_proof = api_v1
         .and(warp::path("token"))
         .and(warp::path::param::<String>())
@@ -1348,9 +1624,20 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("proof"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(warp::query::<Vec<(String, String)>>())
+        .and(client_addr())
         .and(blockchain_filter.clone())
-        .and_then(handle_token_balance_with_proof);
+        .and_then(handle_token_balance_proof_route);
+
+    // GET /api/v1/state/certified: the views this node serves and its three heights, kept apart.
+    let state_certified = api_v1
+        .and(warp::path("state"))
+        .and(warp::path("certified"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(client_addr())
+        .and(blockchain_filter.clone())
+        .and_then(handle_state_certified);
 
     // v3.32: Validator set with Merkle proof for trustless light clients
     let validators_proof = api_v1
@@ -1358,7 +1645,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("proof"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_validators_with_proof);
     
@@ -1368,7 +1655,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("transactions"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_account_transactions);
 
@@ -1383,7 +1670,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::end())
         .and(warp::get())
         .and(warp::query::<LeafsetQuery>())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_epoch_leafset);
 
@@ -1396,7 +1683,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("node-events"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_account_node_events);
 
@@ -1409,7 +1696,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::end())
         .and(warp::get())
         .and(warp::query::<TokenTransfersQuery>())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_account_token_transfers);
 
@@ -1421,7 +1708,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::end())
         .and(warp::get())
         .and(warp::query::<TokenTransfersQuery>())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_token_transfers);
 
@@ -1431,7 +1718,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::end())
         .and(warp::get())
         .and(warp::query::<TokenTransfersRangeQuery>())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_token_transfers_range);
 
@@ -1442,7 +1729,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::end())
         .and(warp::get())
         .and(warp::query::<LogProofQuery>())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_log_proof);
 
@@ -1457,7 +1744,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(blockchain_filter.clone())
         .and_then(handle_transaction_history);
     
-    // Global recent transactions (paginated, newest first)
+    // Global recent transactions (paginated, newest first), from the newest blocks only
     // GET /api/v1/transactions/recent?page=1&per_page=50
     let transactions_recent = api_v1
         .and(warp::path("transactions"))
@@ -1465,6 +1752,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::end())
         .and(warp::get())
         .and(warp::query::<RecentTransactionsQuery>())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_recent_transactions);
     
@@ -1474,7 +1762,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("latest"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_block_latest);
     
@@ -1483,7 +1771,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::param::<u64>())
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_block_by_height);
 
@@ -1494,7 +1782,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("block"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_genesis_block);
 
@@ -1504,7 +1792,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::param::<String>())
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_block_by_hash);
     
@@ -1514,7 +1802,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::param::<u64>())
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_macroblock_by_index);
 
@@ -1525,7 +1813,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("proof"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_macroblock_proof);
 
@@ -1536,7 +1824,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::param::<u64>())
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_registry_height);
 
@@ -1547,7 +1835,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("consensus-position"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_debug_consensus_position);
     
@@ -1558,7 +1846,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("latest"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(warp::query::<std::collections::HashMap<String, String>>())
         .and(blockchain_filter.clone())
         .and_then(handle_snapshot_latest);
@@ -1569,7 +1857,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::param::<u64>())
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_snapshot_download);
 
@@ -1580,7 +1868,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("manifest"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_snapshot_manifest);
 
@@ -1592,7 +1880,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::param::<usize>())
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_snapshot_chunk);
 
@@ -1608,7 +1896,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::post())
         .and(warp::body::content_length_limit(64 * 1024)) // 64KB max
         .and(warp::body::json())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_transaction_submit);
     
@@ -1619,10 +1907,18 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::end())
         .and(warp::post())
         .and(warp::body::content_length_limit(128 * 1024)) // 128KB (Dilithium sig is large)
+        .and(request_origin())
         .and(warp::body::json())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
-        .and_then(handle_node_registration_client_submit);
+        .and_then(|origin: Option<String>, req: NodeRegistrationClientRequest, remote_addr: Option<std::net::SocketAddr>,
+                   blockchain: Arc<BlockchainNode>| async move {
+            // Only the registration doors' origins (registration_origin_allowed), before any work.
+            if !registration_origin_allowed(origin.as_deref()) {
+                return Ok::<_, Rejection>(origin_refused(None).into_response());
+            }
+            handle_node_registration_client_submit(req, remote_addr, blockchain).await.map(|r| r.into_response())
+        });
 
     // v9.4: NodeReactivation TX submit (returning nodes re-enter eligible producers)
     let node_reactivation_submit = api_v1
@@ -1632,9 +1928,21 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::post())
         .and(warp::body::content_length_limit(16 * 1024)) // 16KB max
         .and(warp::body::json())
-        .and(warp::addr::remote())
+        .and(gate_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_node_reactivation_submit);
+
+    // O15: the value TX a wallet signed at a nonce, pending or confirmed, whatever hash its copy carries.
+    let transaction_by_nonce = api_v1
+        .and(warp::path("transaction"))
+        .and(warp::path("by-nonce"))
+        .and(warp::path::param::<String>())
+        .and(warp::path::param::<u64>())
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(client_addr())
+        .and(blockchain_filter.clone())
+        .and_then(handle_transaction_by_nonce);
 
     // Transaction get - RATE LIMITED v3.19
     let transaction_get = api_v1
@@ -1642,7 +1950,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::param::<String>())
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_transaction_get);
     
@@ -1652,7 +1960,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("status"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_mempool_status);
     
@@ -1661,7 +1969,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("transactions"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(warp::query::<HashMap<String, String>>())
         .and(blockchain_filter.clone())
         .and_then(handle_mempool_transactions);
@@ -1675,7 +1983,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::post())
         .and(warp::body::content_length_limit(256 * 1024)) // 256 KB max bundle payload
         .and(warp::body::json())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_bundle_submit);
 
@@ -1685,7 +1993,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("status"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_bundle_status);
 
@@ -1694,9 +2002,11 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::param::<String>())
         .and(warp::path::end())
         .and(warp::delete())
-        .and(warp::addr::remote())
+        .and(client_addr())
+        .and(from_page())
         .and(blockchain_filter.clone())
-        .and_then(handle_bundle_cancel);
+        .and_then(handle_bundle_cancel)
+        .boxed();
     
         // Peer discovery endpoint (for P2P network) - BIDIRECTIONAL REGISTRATION
         // v30.B3: rate-limited per source IP. Until v30 this endpoint was the
@@ -1709,7 +2019,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("peers"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(warp::header::headers_cloned())
         .and(blockchain_filter.clone())
         .and_then(|remote_addr: Option<std::net::SocketAddr>, _headers: warp::http::HeaderMap, blockchain: Arc<BlockchainNode>| async move {
@@ -1821,7 +2131,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::post())
         .and(warp::body::content_length_limit(256 * 1024)) // 256 KB max batch payload
         .and(warp::body::json())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_batch_transfer);
     
@@ -1832,7 +2142,8 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("discovery"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
+        .and(from_page())
         .and(blockchain_filter.clone())
         .and_then(handle_node_discovery);
 
@@ -1841,7 +2152,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("health"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_node_health);
 
@@ -1852,7 +2163,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("recommendations"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_gas_recommendations);
     
@@ -1865,7 +2176,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::post())
         .and(warp::body::content_length_limit(16 * 1024)) // 16KB max
         .and(warp::body::json())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_auth_challenge);
 
@@ -1877,7 +2188,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::post())
         .and(warp::body::content_length_limit(16 * 1024)) // 16KB max
         .and(warp::body::json())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_network_ping);
 
@@ -1889,9 +2200,48 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::post())
         .and(warp::body::content_length_limit(64 * 1024)) // 64KB max
         .and(warp::body::json())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_light_node_register);
+
+    // Light node binding v2: a fresh signed binding to one device (U2/U3), or a pending one for a
+    // registration not applied yet (U4). Two keys, two signatures and a consent (~28 KB in hex), plus
+    // the device block (a platform attestation object or key chain, ~8 KB) and a vendor token (up to 16 KB).
+    let light_node_bind = api_v1
+        .and(warp::path("light-node"))
+        .and(warp::path("bind"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::body::content_length_limit(96 * 1024))
+        .and(warp::body::json())
+        .and(client_addr())
+        .and(blockchain_filter.clone())
+        .and_then(handle_light_node_bind);
+
+    // Unbind (U6): one signature and a wallet key, plus room for the device layer's release block.
+    let light_node_unbind = api_v1
+        .and(warp::path("light-node"))
+        .and(warp::path("unbind"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::body::content_length_limit(32 * 1024))
+        .and(warp::body::json())
+        .and(client_addr())
+        .and(blockchain_filter.clone())
+        .and_then(handle_light_node_unbind);
+
+    // "I'm back" (U11): a node id.
+    let light_node_wake = api_v1
+        .and(warp::path("light-node"))
+        .and(warp::path("wake"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::body::content_length_limit(4 * 1024))
+        .and(warp::body::json())
+        .and(client_addr())
+        .and(from_page())
+        .and(blockchain_filter.clone())
+        .and_then(handle_light_node_wake);
 
     // Light node ping response endpoint (GET for legacy, POST for the large ML-DSA-65 signatures)
     let light_node_ping_response_get = api_v1
@@ -1900,7 +2250,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::end())
         .and(warp::get())
         .and(warp::query::<HashMap<String, String>>())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_light_node_ping_response);
 
@@ -1916,8 +2266,9 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         // every ping response before the handler ran, taking the push AND self-attest liveness
         // paths with it. 64 KB matches light-node/register, which carries the same cert.
         .and(warp::body::content_length_limit(64 * 1024))
-        .and(warp::body::json::<HashMap<String, String>>())
-        .and(warp::addr::remote())
+        // A map of strings; the timing fields (light-node-messages 5.10) are taken as numbers too.
+        .and(warp::body::json::<HashMap<String, Value>>().map(answer_fields))
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_light_node_ping_response);
 
@@ -1929,9 +2280,23 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::end())
         .and(warp::get())
         .and(warp::query::<HashMap<String, String>>())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_light_node_status);
+
+    // The signed status: the public fields plus what only the node's ping key or wallet key may read
+    // (binding sequence, registration record, device state). One ML-DSA-65 signature and an optional
+    // wallet key in hex, so 16 KB is ample.
+    let light_node_status_signed = api_v1
+        .and(warp::path("light-node"))
+        .and(warp::path("status"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::body::content_length_limit(16 * 1024))
+        .and(warp::body::json())
+        .and(client_addr())
+        .and(blockchain_filter.clone())
+        .and_then(handle_light_node_status_signed);
 
     // Server node status endpoint (Super-node monitoring, including Genesis bootstrap nodes)
     let server_node_status = api_v1
@@ -1955,13 +2320,14 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::query::<HashMap<String, String>>())
         .and_then(handle_light_node_next_ping);
 
-    // Light node pending challenge endpoint (for polling fallback)
+    // Light node pending challenge endpoint (for polling fallback), under the read-only per-address limit (L-5).
     let light_node_pending_challenge = api_v1
         .and(warp::path("light-node"))
         .and(warp::path("pending-challenge"))
         .and(warp::path::end())
         .and(warp::get())
         .and(warp::query::<HashMap<String, String>>())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_light_node_pending_challenge);
 
@@ -1976,7 +2342,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         // many unclaimed epochs would be rejected by the filter before the handler ever sees it.
         .and(warp::body::content_length_limit(256 * 1024))
         .and(warp::body::json())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_claim_rewards);
     
@@ -1987,7 +2353,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::param::<String>()) // node_id
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_get_pending_rewards);
     
@@ -1999,7 +2365,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::end())
         .and(warp::get())
         .and(warp::query::<RewardHistoryQuery>()) // ?offset=0&limit=10
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_get_reward_history);
     
@@ -2010,7 +2376,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::param::<String>()) // node_id
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_get_reward_pools);
     
@@ -2021,7 +2387,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::param::<String>()) // wallet_address
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_get_rewards_by_wallet);
     
@@ -2034,7 +2400,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::post())
         .and(warp::body::content_length_limit(64 * 1024)) // 64KB max
         .and(warp::body::json())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_get_pending_rewards_batch);
     
@@ -2045,7 +2411,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("stats"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_get_reward_network_stats);
     
@@ -2056,7 +2422,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::param::<String>()) // node_id
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_get_reward_summary);
     
@@ -2067,7 +2433,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::post())
         .and(warp::body::content_length_limit(64 * 1024))
         .and(warp::body::json())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_register_node);
 
@@ -2081,17 +2447,6 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::header::optional::<String>("x-qnet-wallet"))
         .and(blockchain_filter.clone())
         .and_then(handle_activations_by_wallet);
-
-    // Generate activation code from burn transaction endpoint (with strict rate limiting)
-    let generate_activation_code = api_v1
-        .and(warp::path("generate-activation-code"))
-        .and(warp::path::end())
-        .and(warp::post())
-        .and(warp::body::content_length_limit(16 * 1024)) // 16KB max
-        .and(warp::body::json())
-        .and(warp::addr::remote())
-        .and(blockchain_filter.clone())
-        .and_then(handle_generate_activation_code);
 
     // On-chain activation verification endpoint (for mobile wallet)
     let verify_activation = api_v1
@@ -2109,7 +2464,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("node-device"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(warp::query::<HashMap<String, String>>())
         .and(blockchain_filter.clone())
         .and_then(handle_node_device_check);
@@ -2122,7 +2477,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::post())
         .and(warp::body::content_length_limit(16 * 1024)) // 16KB max
         .and(warp::body::json())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_register_device);
 
@@ -2133,7 +2488,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::post())
         .and(warp::body::content_length_limit(4 * 1024)) // 4KB max
         .and(warp::body::json())
-        .and(warp::addr::remote())
+        .and(gate_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_graceful_shutdown);
 
@@ -2145,7 +2500,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("failovers"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(warp::query::<HashMap<String, String>>())
         .and(blockchain_filter.clone())
         .and_then(handle_failover_history);
@@ -2156,7 +2511,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("failovers"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(warp::query::<HashMap<String, String>>())
         .and(blockchain_filter.clone())
         .and_then(handle_failover_history);
@@ -2166,7 +2521,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("stats"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_stats);
     
@@ -2176,7 +2531,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("status"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_producer_status);
     
@@ -2186,7 +2541,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("status"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_sync_status);
     
@@ -2200,7 +2555,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("stats"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_public_stats);
     
@@ -2221,7 +2576,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("network"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_network_diagnostics);
 
@@ -2231,7 +2586,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("stats"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_block_statistics);
 
@@ -2241,7 +2596,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("metrics"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_shred_protocol_metrics);
 
@@ -2251,7 +2606,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("metrics"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_parallel_executor_metrics);
 
@@ -2261,7 +2616,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("status"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_pre_execution_status);
 
@@ -2271,7 +2626,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("timeouts"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_adaptive_bft_timeouts);
 
@@ -2281,7 +2636,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("performance"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_performance_metrics);
     
@@ -2291,7 +2646,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("history"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(warp::query::<HashMap<String, String>>())
         .and(blockchain_filter.clone())
         .and_then(handle_reputation_history);
@@ -2307,7 +2662,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::post())
         .and(warp::body::content_length_limit(2 * 1024 * 1024))
         .and(warp::body::json())
-        .and(warp::addr::remote())
+        .and(gate_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_p2p_message);
     
@@ -2321,7 +2676,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::post())
         .and(warp::body::content_length_limit(2 * 1024 * 1024)) // 2MB max (WASM bytecode)
         .and(warp::body::json())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_contract_deploy);
     
@@ -2333,7 +2688,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::post())
         .and(warp::body::content_length_limit(128 * 1024)) // 128KB max
         .and(warp::body::json())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_contract_call);
     
@@ -2343,7 +2698,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::param::<String>())
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_contract_info);
 
@@ -2354,7 +2709,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::end())
         .and(warp::get())
         .and(warp::query::<ContractStateQuery>())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_contract_state);
 
@@ -2365,7 +2720,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::end())
         .and(warp::get())
         .and(warp::query::<ContractLogsQuery>())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_contract_logs);
 
@@ -2377,7 +2732,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::post())
         .and(warp::body::content_length_limit(128 * 1024)) // 128KB max
         .and(warp::body::json())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_contract_estimate_gas);
     
@@ -2389,7 +2744,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::post())
         .and(warp::body::content_length_limit(128 * 1024)) // 128KB max
         .and(warp::body::json())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_token_deploy);
 
@@ -2401,7 +2756,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::post())
         .and(warp::body::content_length_limit(128 * 1024)) // 128KB max
         .and(warp::body::json())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_nft_deploy);
 
@@ -2414,7 +2769,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::post())
         .and(warp::body::content_length_limit(1024 * 1024)) // 1MB max (code blobs)
         .and(warp::body::json())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_wasm_deploy);
 
@@ -2454,7 +2809,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("richlist"))
         .and(warp::path::end())
         .and(warp::query::<std::collections::HashMap<String, String>>())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(warp::get())
         .and(blockchain_filter.clone())
         .and_then(handle_qnc_richlist);
@@ -2463,7 +2818,9 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
     // BENCHMARK ENDPOINTS - Real Transaction Load Testing
     // ============================================================================
     
-    // POST /api/v1/benchmark/start - Start benchmark with config (v10.0: rate-limited + auth)
+    // Every benchmark route: disabled unless QNET_BENCHMARK_SECRET is set, then only with the secret
+    // (`X-Benchmark-Secret`, or the start body's `secret`); see rpc/benchmark.rs benchmark_admit.
+    // POST /api/v1/benchmark/start - Start benchmark with config
     let benchmark_start = api_v1
         .and(warp::path("benchmark"))
         .and(warp::path("start"))
@@ -2471,7 +2828,8 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::post())
         .and(warp::body::content_length_limit(64 * 1024)) // 64KB max
         .and(warp::body::json())
-        .and(warp::addr::remote())
+        .and(warp::header::optional::<String>("x-benchmark-secret"))
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .and_then(handle_benchmark_start);
 
@@ -2481,7 +2839,8 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("status"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(warp::header::optional::<String>("x-benchmark-secret"))
+        .and(client_addr())
         .and_then(handle_benchmark_status);
 
     // GET /api/v1/benchmark/results - Get benchmark results (v10.0: rate-limited)
@@ -2490,7 +2849,8 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("results"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(warp::header::optional::<String>("x-benchmark-secret"))
+        .and(client_addr())
         .and_then(handle_benchmark_results);
 
     // POST /api/v1/benchmark/stop - Stop benchmark (v10.0: auth + rate-limited)
@@ -2499,7 +2859,8 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("stop"))
         .and(warp::path::end())
         .and(warp::post())
-        .and(warp::addr::remote())
+        .and(warp::header::optional::<String>("x-benchmark-secret"))
+        .and(client_addr())
         .and_then(handle_benchmark_stop);
 
     // GET /api/v1/benchmark/presets - Get available presets (v10.0: rate-limited)
@@ -2508,7 +2869,8 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("presets"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(warp::header::optional::<String>("x-benchmark-secret"))
+        .and(client_addr())
         .and_then(handle_benchmark_presets);
 
     // Combine benchmark routes
@@ -2518,9 +2880,11 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .or(benchmark_stop)
         .or(benchmark_presets);
     
-    // CORS configuration - PRODUCTION SECURITY
-    // In development mode (QNET_DEV_MODE=1), allow all origins
-    // In production, restrict to whitelisted domains only
+    // CORS: the public routes carry no cookies or other credentials, so any origin may call them: a web page, or the
+    // browser extension, whose chrome-extension:// / moz-extension:// origin differs per build or per install (a list
+    // of origins refused the extension's POSTs with 403, the node registration among them). The routes that answer
+    // only local, whitelisted or genesis callers, and the bundle cancel by the submitter's address, are served
+    // outside this filter (`gated_routes`); DELETE, which only the bundle cancel uses, is not a public method.
     let cors = if std::env::var("QNET_DEV_MODE").is_ok() {
         println!("⚠️  CORS: Development mode - allowing all origins");
         warp::cors()
@@ -2529,9 +2893,9 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
             .allow_headers(vec!["Content-Type", "Authorization", "User-Agent", "X-Requested-With", "X-API-Key"])
             .max_age(3600)
     } else {
-        println!("[INFO][RPC] cors_mode=production restricted_origins=true");
+        println!("[INFO][RPC] cors_mode=public any_origin=true credentials=false");
         warp::cors()
-            .allow_origins(ALLOWED_ORIGINS.iter().map(|s| *s))
+            .allow_any_origin()
             .allow_methods(vec!["POST", "GET", "OPTIONS"])
             .allow_headers(vec!["Content-Type", "Authorization", "User-Agent", "X-API-Key"])
             .max_age(86400) // 24 hours cache
@@ -2546,6 +2910,8 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
     let blockchain_routes = microblock_one
         .or(microblocks_range)
         .or(blocks_headers)
+        .or(archive_list)
+        .or(archive_segment)
         .or(block_latest)
         .or(block_by_height)
         .or(genesis_block)
@@ -2563,6 +2929,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .or(account_balance)
         .or(account_balance_proof)  // v3.11: Balance with Merkle proof
         .or(token_balance_proof)  // V2: trustless QRC-20 token balance proof
+        .or(state_certified)
         .or(validators_proof)       // v3.32: Validator set with Merkle proof
         .or(epoch_leafset)
         .or(account_transactions)
@@ -2574,6 +2941,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .or(batch_transfer);
         
     let transaction_routes = transaction_submit
+        .or(transaction_by_nonce)
         .or(transaction_get)
         .or(transaction_history)  // Extended history API with pagination
         .or(transactions_recent)  // Global recent transactions API
@@ -2581,8 +2949,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .or(mempool_transactions);
     
     let bundle_routes = bundle_submit
-        .or(bundle_status)
-        .or(bundle_cancel);
+        .or(bundle_status);
         
     let node_routes = node_discovery
         .or(node_health)
@@ -2590,8 +2957,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .or(auth_challenge)
         .or(network_ping)
         .or(node_device_check)
-        .or(register_device)
-        .or(graceful_shutdown);
+        .or(register_device);
     
     let monitoring_routes = failover_history
         .or(network_failovers)
@@ -2629,7 +2995,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("fcm-token-sync"))
         .and(warp::path::end())
         .and(warp::post())
-        .and(warp::addr::remote())
+        .and(gate_addr())
         .and(warp::body::content_length_limit(64 * 1024)) // 64KB max
         .and(warp::body::json())
         .and(blockchain_filter.clone())
@@ -2641,7 +3007,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("fcm-token-get"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(gate_addr())
         .and(warp::query::<std::collections::HashMap<String, String>>())
         .and(blockchain_filter.clone())
         .and_then(handle_internal_fcm_token_get);
@@ -2652,10 +3018,33 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("light-ping-keys-get"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::addr::remote())
+        .and(gate_addr())
         .and(warp::query::<std::collections::HashMap<String, String>>())
         .and(blockchain_filter.clone())
         .and_then(handle_internal_light_ping_keys_get);
+
+    // Internal genesis-to-genesis reach record read (IP-restricted): the owners' proof that a device was reached.
+    let internal_light_reach_get = api_v1
+        .and(warp::path("internal"))
+        .and(warp::path("light-reach-get"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(gate_addr())
+        .and(warp::query::<std::collections::HashMap<String, String>>())
+        .and(blockchain_filter.clone())
+        .and_then(handle_internal_light_reach_get);
+
+    // Internal genesis-to-genesis unbind (IP-restricted): re-verified from the signer's own signature.
+    let internal_light_unbind_sync = api_v1
+        .and(warp::path("internal"))
+        .and(warp::path("light-unbind-sync"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(gate_addr())
+        .and(warp::body::content_length_limit(32 * 1024))
+        .and(warp::body::json())
+        .and(blockchain_filter.clone())
+        .and_then(handle_internal_light_unbind_sync);
 
     // Public: lightweight FCM token refresh (Ed25519-signed)
     let light_node_token_refresh = api_v1
@@ -2663,7 +3052,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path("token-refresh"))
         .and(warp::path::end())
         .and(warp::post())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(warp::body::content_length_limit(16 * 1024)) // 16KB max
         .and(warp::body::json())
         .and(blockchain_filter.clone())
@@ -2671,17 +3060,86 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
             handle_light_node_token_refresh(remote_addr, body, bc).await
         });
 
+    // Device layer (A1-A6): the challenge, and the genesis-only attestor round, record sync and pull.
+    let light_device_challenge = api_v1
+        .and(warp::path("light-node"))
+        .and(warp::path("device-challenge"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::query::<HashMap<String, String>>())
+        .and(client_addr())
+        .and_then(handle_device_challenge);
+    // The attestor request carries the device's public evidence and the wallet's delegation (~30 KB).
+    let internal_device_attest = api_v1
+        .and(warp::path("internal"))
+        .and(warp::path("light-device-attest"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(gate_addr())
+        .and(warp::body::content_length_limit(96 * 1024))
+        .and(warp::body::json())
+        .and(blockchain_filter.clone())
+        .and_then(handle_internal_device_attest);
+    // A final statement: five raw signatures, the lease and its signature (~40 KB in hex).
+    let internal_device_sync = api_v1
+        .and(warp::path("internal"))
+        .and(warp::path("light-device-sync"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(gate_addr())
+        .and(warp::body::content_length_limit(96 * 1024))
+        .and(warp::body::json())
+        .and(blockchain_filter.clone())
+        .and_then(handle_internal_device_sync);
+    let internal_device_get = api_v1
+        .and(warp::path("internal"))
+        .and(warp::path("light-device-get"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(gate_addr())
+        .and(warp::query::<HashMap<String, String>>())
+        .and(blockchain_filter.clone())
+        .and_then(handle_internal_device_get);
+    // The lease refresh (A9): a device signature and a vendor token (a Play token is up to 16 KB).
+    let light_device_refresh = api_v1
+        .and(warp::path("light-node"))
+        .and(warp::path("device-refresh"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::body::content_length_limit(32 * 1024))
+        .and(warp::body::json())
+        .and(client_addr())
+        .and(blockchain_filter.clone())
+        .and_then(handle_light_device_refresh);
+    // The key rotation (A10): the new key's evidence as at /bind, the old key's signature and the token.
+    let light_device_rotate = api_v1
+        .and(warp::path("light-node"))
+        .and(warp::path("device-rotate"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::body::content_length_limit(96 * 1024))
+        .and(warp::body::json())
+        .and(client_addr())
+        .and(blockchain_filter.clone())
+        .and_then(handle_light_device_rotate);
+    let light_device_routes = light_device_challenge
+        .or(light_device_refresh)
+        .or(light_device_rotate)
+        .boxed();
+
     let light_node_routes = light_node_register
+        .or(light_device_routes)
+        .or(light_node_bind)
+        .or(light_node_unbind)
+        .or(light_node_wake)
         .or(light_node_token_refresh)
         .or(light_node_ping_response_get)
         .or(light_node_ping_response_post)
         .or(light_node_status)
+        .or(light_node_status_signed)
         .or(server_node_status)
         .or(light_node_next_ping)
         .or(light_node_pending_challenge)
-        .or(internal_fcm_sync)
-        .or(internal_fcm_get)
-        .or(internal_light_keys_get)
         .or(claim_rewards)
         .or(pending_rewards)
         .or(reward_history)
@@ -2692,13 +3150,26 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .or(rewards_summary)
         .or(register_node)
         .or(activations_by_wallet)
-        .or(generate_activation_code)
         .or(verify_activation)
         .or(node_secure_info)
-        .or(node_registration_submit)
-        .or(node_reactivation_submit);
+        .or(node_registration_submit);
 
-    let p2p_routes = p2p_message;
+    // The routes that answer only local, whitelisted or genesis callers (gate_addr, GATED_PATHS), and the bundle
+    // cancel, which answers the submitter's address: served outside the CORS filter, so no page reads an answer,
+    // and a request that carries an Origin header is nobody in particular there (gate_client).
+    let gated_routes = internal_fcm_sync
+        .or(internal_fcm_get)
+        .or(internal_light_keys_get)
+        .or(internal_light_reach_get)
+        .or(internal_light_unbind_sync)
+        .or(internal_device_attest)
+        .or(internal_device_sync)
+        .or(internal_device_get)
+        .or(p2p_message)
+        .or(node_reactivation_submit)
+        .or(graceful_shutdown)
+        .or(bundle_cancel)
+        .boxed();
     
     // Smart contract routes
     let contract_routes = contract_deploy
@@ -2727,7 +3198,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::end())
         .and(warp::ws())
         .and(warp::query::<WsSubscribeQuery>())
-        .and(warp::addr::remote())
+        .and(client_addr())
         .and(blockchain_filter.clone())
         .map(|ws: warp::ws::Ws, query: WsSubscribeQuery, remote_addr: Option<std::net::SocketAddr>, blockchain: Arc<BlockchainNode>| {
             // Extract IP for rate limiting
@@ -2780,10 +3251,12 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
             )
         });
     
-    // Combine route groups
-    let routes = health
+    // Combine route groups. The WebSocket subscription stays outside the CORS filter: React Native sends
+    // `Origin: https://<node host>` on every WebSocket handshake, which no browser allow-list names, so the filter
+    // answered the wallet app 403 (sandbox 28.09; production too). The feed carries only public block and
+    // transaction notices, with no cookie or credential, so an origin check guards nothing there.
+    let rest_routes = health
         .or(healthz)        // v14.8.5: lock-free liveness probe
-        .or(ws_subscribe) // WebSocket before REST routes
         .or(basic_routes)
         .or(blockchain_routes)
         .or(account_routes)
@@ -2792,12 +3265,15 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .or(node_routes)
         .or(light_node_routes)
         .or(contract_routes)
-        .or(p2p_routes)
         .or(monitoring_routes)
         .or(public_routes) // PUBLIC: Cached endpoints for website
         .or(benchmark_routes) // BENCHMARK: Real transaction load testing
         .with(cors);
-    
+    // WebSocket and the gated routes before the REST routes; a preflight for a gated path is refused before the
+    // CORS filter would answer it.
+    let routes = ws_subscribe.or(gated_preflight()).or(gated_routes).or(rest_routes);
+
+
     // PORT BIND RETRY: survive TIME_WAIT after fast Docker restart (same pattern as Genesis signal_listener)
     // warp::serve().run() binds internally and panics on failure — probe first with retry
     {
@@ -2839,6 +3315,8 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
     if !matches!(node_type, crate::node::NodeType::Light) {
         start_light_node_ping_service(blockchain.clone());
         println!("🕐 Light node randomized ping service started");
+        // The device layer's background work: the five genesis only (a no-op on any other node).
+        start_device_maintenance(blockchain.clone());
         
         // v35: legacy local heartbeat service removed. Liveness is now the spread on-chain
         // Heartbeat-TX emitted by start_commitment_tx_loop (tallied in Account.heartbeat_slots).
@@ -2855,6 +3333,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
 async fn handle_rpc(
     request: RpcRequest,
     remote_addr: Option<std::net::SocketAddr>,
+    from_page: bool,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
     let response = match request.method.as_str() {
@@ -2894,15 +3373,16 @@ async fn handle_rpc(
         "node_getTransferStatus" => node_get_transfer_status(blockchain, request.params).await,
 
         // Phase-1 burn attestation (genesis-side): verify the external Solana 1DEV burn + sign.
-        "node_attestBurn" => node_attest_burn(blockchain, request.params).await,
+        "node_attestBurn" => node_attest_burn(blockchain, request.params, remote_addr).await,
 
         // Recovery relaxation. OPERATOR actions, so they are restricted to the loopback/private
         // interface: on 0.0.0.0 they were reachable by anyone on the internet, and while neither can
         // relax a healthy network (rc_try_arm re-checks every condition), disarming during a genuine
-        // halt is a free denial of the one recovery path the node has.
+        // halt is a free denial of the one recovery path the node has. A web page is never the local
+        // interface (gate_client), whatever address its visitor's browser sends from.
         "node_armRecovery" | "node_disarmRecovery" | "node_recoveryStatus"
         | "node_decreeEndorse" | "node_decreeSubmit" => {
-            let ip = remote_addr.map(|a| a.ip().to_string()).unwrap_or_default();
+            let ip = gate_client(remote_addr, from_page).map(|a| a.ip().to_string()).unwrap_or_default();
             if !is_internal_ip(&ip) {
                 Err(RpcError { code: -32004, message: "operator method: local interface only".to_string(), data: None })
             } else {
@@ -2966,9 +3446,68 @@ const ATTEST_LOOKUPS_GLOBAL: u32 = 240;
 /// dead burn is free, short enough that a burn confirmed late still gets a second chance.
 const ATTEST_BAD_TTL_SECS: u64 = 600;
 const ATTEST_BAD_CAP: usize = 65_536;
+/// The share of the global ceiling that callers outside the committee may spend (H10). The committee's
+/// submit doors meter their clients per address and per node before they ask; anyone else - a joining
+/// super collecting for its own registration - reaches the attestor directly, so a flood of fresh keys
+/// from outside can take at most this lane and never the doors' quota.
+const ATTEST_LOOKUPS_OUTSIDE: u32 = 60;
+/// First-sight lookups one outside address (IPv6: its /64) may start per window.
+static ATTEST_OUTSIDE_ADDR_LIMIT: KeyedLimiter = KeyedLimiter::new(10, 600);
 
-static ATTEST_LOOKUPS: Lazy<parking_lot::Mutex<(u64, u32, std::collections::HashMap<String, u32>)>> =
-    Lazy::new(|| parking_lot::Mutex::new((0, 0, std::collections::HashMap::new())));
+/// A committee caller's share of the doors' quota (the global ceiling less the outside lane) per window (M-9),
+/// split over the committee callers asking (`doors_asking`) but never over fewer than the genesis count, so one
+/// door never takes more than a genesis door's share: garbage pushed through one submit door spends that door's
+/// share and never starves submits arriving at the others. Split over the callers that ask, not over the whole
+/// committee, so a large committee whose members mostly serve no submits leaves the doors that do a usable share.
+/// Never below one burner's count, so every door can serve a burner.
+fn attest_door_share(doors_asking: usize) -> u32 {
+    let split = doors_asking.max(crate::genesis_constants::genesis_node_count()).max(1);
+    ((ATTEST_LOOKUPS_GLOBAL - ATTEST_LOOKUPS_OUTSIDE) / split as u32).max(ATTEST_LOOKUPS_PER_BURNER)
+}
+
+/// First-sight lookup budget of one window.
+#[derive(Default)]
+struct LookupBudget {
+    window: u64,
+    global: u32,
+    outside: u32,
+    per_burner: std::collections::HashMap<String, u32>,
+    /// Spent per committee caller (this node's own door, or a member's address).
+    per_door: std::collections::HashMap<String, u32>,
+    /// Committee callers that spent in the previous window: a window's shares start split over them, so the
+    /// doors that ask first cannot take the shares of those that keep asking.
+    doors_before: usize,
+}
+
+impl LookupBudget {
+    /// Ok(()) = this burner may spend one first-sight lookup now; Err(retry_after_secs) otherwise. `door`: the
+    /// committee caller asking, which spends its own share (`attest_door_share` over the callers that spent in
+    /// this window or the last, whichever are more).
+    fn admit(&mut self, burner: &str, outside: bool, door: Option<&str>, now: u64) -> Result<(), u64> {
+        let window = now / ATTEST_LOOKUP_WINDOW_SECS;
+        if self.window != window {
+            let doors_before = if window == self.window.saturating_add(1) { self.per_door.len() } else { 0 };
+            *self = LookupBudget { window, doors_before, ..Default::default() };
+        }
+        let retry = ATTEST_LOOKUP_WINDOW_SECS - (now % ATTEST_LOOKUP_WINDOW_SECS);
+        if self.global >= ATTEST_LOOKUPS_GLOBAL { return Err(retry); }
+        if outside && self.outside >= ATTEST_LOOKUPS_OUTSIDE { return Err(retry); }
+        if let Some(key) = door {
+            let spent = self.per_door.get(key).copied();
+            let asking = self.per_door.len() + usize::from(spent.is_none());
+            if spent.unwrap_or(0) >= attest_door_share(asking.max(self.doors_before)) { return Err(retry); }
+        }
+        let c = self.per_burner.entry(burner.to_string()).or_insert(0);
+        if *c >= ATTEST_LOOKUPS_PER_BURNER { return Err(retry); }
+        *c += 1;
+        self.global += 1;
+        if outside { self.outside += 1; }
+        if let Some(key) = door { *self.per_door.entry(key.to_string()).or_insert(0) += 1; }
+        Ok(())
+    }
+}
+
+static ATTEST_LOOKUPS: Lazy<parking_lot::Mutex<LookupBudget>> = Lazy::new(|| parking_lot::Mutex::new(LookupBudget::default()));
 static ATTEST_BAD_BURNS: Lazy<parking_lot::Mutex<std::collections::HashMap<String, u64>>> =
     Lazy::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
 
@@ -3002,19 +3541,11 @@ fn attest_lookup_mark_bad(burn_tx: &str, burner: &str) {
 }
 
 /// Ok(()) = this burner may spend one first-sight Solana lookup. Err(retry_after_secs) = its window quota
-/// is used up.
-fn attest_lookup_admit(burner: &str) -> Result<(), u64> {
+/// is used up, or, for a caller outside the committee, the outside lane is, or, for a committee caller,
+/// its door's share is.
+fn attest_lookup_admit(burner: &str, outside: bool, door: Option<&str>) -> Result<(), u64> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-    let mut g = ATTEST_LOOKUPS.lock();
-    let window = now / ATTEST_LOOKUP_WINDOW_SECS;
-    if g.0 != window { g.0 = window; g.1 = 0; g.2.clear(); }
-    let retry = ATTEST_LOOKUP_WINDOW_SECS - (now % ATTEST_LOOKUP_WINDOW_SECS);
-    if g.1 >= ATTEST_LOOKUPS_GLOBAL { return Err(retry); }
-    let c = g.2.entry(burner.to_string()).or_insert(0);
-    if *c >= ATTEST_LOOKUPS_PER_BURNER { return Err(retry); }
-    *c += 1;
-    g.1 += 1;
-    Ok(())
+    ATTEST_LOOKUPS.lock().admit(burner, outside, door, now)
 }
 
 /// Pending slots one burning wallet may hold at once. The queue is FIFO, so a burner cannot buy
@@ -3276,6 +3807,13 @@ async fn node_decree_submit(blockchain: Arc<BlockchainNode>, params: Option<Valu
     if !crate::consensus_v2_node::verify_recovery_decree(&genesis_hash, seq, target, &sigs) {
         return Err(RpcError { code: -32000, message: "decree signature quorum not met".into(), data: None });
     }
+    // The same floor every receiving node applies: never below what this node holds certified.
+    let floor = BlockchainNode::certified_rollback_floor(&storage);
+    if target < floor {
+        return Err(RpcError { code: -32000,
+            message: format!("target {} is below the certified floor {}: a certified checkpoint is irrevocable", target, floor),
+            data: None });
+    }
     if let Some(p2p) = blockchain.get_unified_p2p() {
         p2p.gossip_to_random_peers(crate::unified_p2p::NetworkMessage::RecoveryDecree {
             seq, target_height: target, sigs }, 16);
@@ -3349,7 +3887,30 @@ async fn node_recovery_status(_blockchain: Arc<BlockchainNode>) -> Result<Value,
     }
 }
 
-async fn node_attest_burn(blockchain: Arc<BlockchainNode>, params: Option<Value>) -> Result<Value, RpcError> {
+/// Who asks the burn attestor (H10).
+#[derive(Debug, Clone, Copy)]
+enum AttestCaller {
+    /// This node's own submit door, asking in-process: a committee caller by construction.
+    Own,
+    /// A JSON-RPC caller at this address. Loopback is no credential: behind a TLS terminator that passed
+    /// no client on, every public caller would read as loopback.
+    Remote(Option<IpAddr>),
+}
+
+async fn node_attest_burn(blockchain: Arc<BlockchainNode>, params: Option<Value>, remote_addr: Option<std::net::SocketAddr>) -> Result<Value, RpcError> {
+    attest_burn(&blockchain, params, AttestCaller::Remote(remote_addr.map(|a| a.ip()))).await
+}
+
+/// This node's own attestor, asked by its own collector (`collect_burn_attestations`) without a network
+/// hop, answering in the JSON-RPC envelope the collector reads from every other member.
+pub(crate) async fn attest_burn_in_process(blockchain: &BlockchainNode, params: Value) -> Value {
+    match attest_burn(blockchain, Some(params), AttestCaller::Own).await {
+        Ok(result) => json!({ "jsonrpc": "2.0", "id": 1, "result": result }),
+        Err(e) => json!({ "jsonrpc": "2.0", "id": 1, "error": e }),
+    }
+}
+
+async fn attest_burn(blockchain: &BlockchainNode, params: Option<Value>, caller: AttestCaller) -> Result<Value, RpcError> {
     let params = params.unwrap_or(serde_json::Value::Null);
     let burn_tx = params.get("burn_tx").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let solana_wallet = params.get("solana_wallet").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -3374,25 +3935,45 @@ async fn node_attest_burn(blockchain: Arc<BlockchainNode>, params: Option<Value>
     // I/O. Only the burning wallet's owner may obtain an attestation for its burn: the per-attestor
     // dedup below binds burn_tx to the FIRST wallet attested, so without this check anyone reading a
     // public burn_tx could lock it to a bogus beneficiary and permanently brick the real owner's burn.
-    // Cheap Ed25519 verify ⇒ also the DoS shield for everything that follows.
+    // Cheap Ed25519 verify ⇒ also the DoS shield for everything that follows. The owner bind is the v1 form
+    // (with the consent's time) or, for a light node from the wallet_one_node gate at this node's next
+    // height, the v2 form without a time: the same strings block validation rebuilds.
+    let own_next = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT
+        .load(std::sync::atomic::Ordering::Relaxed).saturating_add(1);
+    let node_id = params.get("node_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
     {
         let reg_proof = params.get("registration_proof").and_then(|v| v.as_str()).unwrap_or("");
         let owner_sig = params.get("owner_signature").and_then(|v| v.as_str()).unwrap_or("");
-        let node_id = params.get("node_id").and_then(|v| v.as_str()).unwrap_or("");
         let ts = params.get("timestamp").and_then(|v| v.as_u64()).unwrap_or(0);
         let attest_root = params.get("attest_root").and_then(|v| v.as_str()).unwrap_or("");
         if attest_root.len() > 64 {
             return Err(RpcError { code: -32602, message: "attest_root malformed".to_string(), data: None });
         }
-        let bind_msg = format!("qnet_onchain_reg:{}:{}:{}:{}:{}:{}",
-                               node_id, qnet_wallet, reg_proof, ts, attest_root, burn_tx);
-        let ok = !owner_sig.is_empty() && crate::crypto::solana_derivation::verify_ed25519_signature(
-            bind_msg.as_bytes(), owner_sig, &solana_wallet).unwrap_or(false);
-        if !ok {
+        let verify = |msg: String| crate::crypto::solana_derivation::verify_ed25519_signature(
+            msg.as_bytes(), owner_sig, &solana_wallet).unwrap_or(false);
+        let v1 = !owner_sig.is_empty() && verify(qnet_state::Transaction::burn_owner_bind_message_tagged(
+            &node_id, &qnet_wallet, reg_proof, ts, attest_root, &burn_tx));
+        let v2 = !v1 && !owner_sig.is_empty() && matches!(node_type, qnet_state::NodeType::Light)
+            && verify(qnet_state::Transaction::burn_owner_bind_message_v2_tagged(
+                &node_id, &qnet_wallet, reg_proof, attest_root, &burn_tx));
+        if !v1 && !(v2 && crate::node::BlockchainNode::owner_bind_v2_allowed(&node_type, own_next)) {
+            // A light owner bind v2 before the gate is sound, only not accepted yet: the client retries once
+            // this node lists `owner_bind_v2`, never treats it as a refusal of the burn.
+            if v2 {
+                return Err(RpcError { code: -32602,
+                    message: "bind_v2_pending: the owner bind without a time is accepted from the wallet_one_node gate; retry later".to_string(),
+                    data: Some(json!({ "code": "bind_v2_pending" })) });
+            }
             return Err(RpcError { code: -32602,
                 message: "owner_signature does not authorize this beneficiary for the burning wallet".to_string(),
                 data: None });
         }
+    }
+    // One wallet, one node (wallet_one_node gate at this node's next height): no attestation for a wallet that
+    // already has another node, before any epoch, committee or Solana work. Block validation refuses the
+    // registration anyway; this spends nothing on it.
+    if crate::node::BlockchainNode::wallet_one_node_other(&blockchain.get_storage(), &qnet_wallet, &node_id, own_next).is_some() {
+        return Err(RpcError { code: -32602, message: "wallet already has a node".to_string(), data: None });
     }
     // Arithmetic epoch bound BEFORE any committee resolution (mirrors sign_burn_attestation):
     // only ~4 distinct epochs are ever resolvable, so the membership cache below stays complete
@@ -3443,9 +4024,34 @@ async fn node_attest_burn(blockchain: Arc<BlockchainNode>, params: Option<Value>
             if attest_lookup_known_bad(&burn_tx, &solana_wallet) {
                 return Err(RpcError { code: -32000, message: "burn previously failed verification".to_string(), data: None });
             }
-            if let Err(retry) = attest_lookup_admit(&solana_wallet) {
-                return Err(RpcError { code: -32050, message: "attest_pending".to_string(),
-                                      data: Some(json!({ "retry_after_secs": retry })) });
+            // H10: a committee member asks from its submit door, which already metered the client per
+            // address and per node (U14). Anyone else gets the outside lane: per address, and a share
+            // of the quota the doors never compete for.
+            let (caller_ip, outside) = match caller {
+                AttestCaller::Own => (None, false),
+                AttestCaller::Remote(ip) => (ip, !ip.map_or(false, |ip| attest_caller_in_committee(blockchain, ip, attest_epoch))),
+            };
+            let addr_key = if outside { caller_ip.filter(|ip| !is_ip_whitelisted(*ip)).map(lookup_meter_key) } else { None };
+            // A committee caller spends its own door's share: this node's door, or the member's address.
+            let door_key = match caller {
+                AttestCaller::Own => Some("own".to_string()),
+                AttestCaller::Remote(ip) if !outside => ip.map(lookup_meter_key),
+                AttestCaller::Remote(_) => None,
+            };
+            let door = door_key.as_deref();
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+            let pending = |retry: u64| RpcError { code: -32050, message: "attest_pending".to_string(),
+                                                  data: Some(json!({ "retry_after_secs": retry })) };
+            if let Some(k) = &addr_key {
+                ATTEST_OUTSIDE_ADDR_LIMIT.check(k, now).map_err(pending)?;
+            }
+            attest_lookup_admit(&solana_wallet, outside, door).map_err(pending)?;
+            if let Some(k) = &addr_key {
+                ATTEST_OUTSIDE_ADDR_LIMIT.allows(k, now);
+            }
+            if outside && is_info() {
+                println!("[INFO][BURN] attest_outside_lookup caller={} burner={}",
+                         caller_ip.map(|ip| ip.to_string()).unwrap_or_default(), qnet_state::char_prefix(&solana_wallet, 12));
             }
             // ONE attempt, not three. The retry loop inside exists for the registrant's own submit path
             // (a fresh Solana TX can take 5-15 s to index); here it multiplies every unauthenticated
@@ -3679,6 +4285,9 @@ async fn tx_submit(
     if let Err(e) = validate_eon_address_with_error(to) {
         return Err(RpcError { code: -32602, message: format!("Invalid 'to' address: {}", e), data: None });
     }
+    if let Err(r) = tx_api::check_recipient(&blockchain, to).await {
+        return Err(r.to_rpc_error(to));
+    }
 
     // SECURITY: Use as_u64() directly — as_f64()→as u64 causes precision loss for large values
     let amount = params["amount"].as_u64().ok_or_else(|| RpcError {
@@ -3862,6 +4471,9 @@ async fn mempool_submit(
             code: -32602,
             message: "Missing to field".to_string(), data: None,
         })?;
+        if let Err(r) = tx_api::check_recipient(&blockchain, to).await {
+            return Err(r.to_rpc_error(to));
+        }
         
         let amount = tx_data["amount"].as_u64().ok_or_else(|| RpcError {
             code: -32602,
@@ -3952,17 +4564,18 @@ async fn account_get_info(
         message: "Missing address parameter".to_string(), data: None,
     })?;
     
-    match blockchain.get_account(address).await {
+    match blockchain.try_get_account(address).await {
         Ok(account) => Ok(json!(account)),
-        Err(_) => Ok(json!({
-            "address": address,
-            "balance": 0,
-            "nonce": 0,
-            "is_node": false,
-            "node_type": null,
+        Err(()) => Err(account_unreadable_rpc_error()),
+    }
+}
 
-            "reputation": 0.0
-        })),
+/// SH2 for the JSON-RPC account reads: a row this node could not read is an error, never an empty account.
+fn account_unreadable_rpc_error() -> RpcError {
+    RpcError {
+        code: -32000,
+        message: "account_unreadable: this node could not read the account from its storage; ask again or ask another node".to_string(),
+        data: None,
     }
 }
 
@@ -3980,17 +4593,11 @@ async fn account_get_balance(
         message: "Missing address parameter".to_string(), data: None,
     })?;
     
-    match blockchain.get_balance(address).await {
-        Ok(balance) => Ok(json!({
-            "balance": balance
+    match blockchain.try_get_account_basic(address).await {
+        Ok(account) => Ok(json!({
+            "balance": account.map_or(0, |a| a.balance)
         })),
-        Err(e) => {
-            println!("[WARN][RPC] rpc_error method=account_get_balance address={} err={}", address, e);
-            Err(RpcError {
-                code: -32000,
-                message: "internal error".to_string(), data: None,
-            })
-        }
+        Err(()) => Err(account_unreadable_rpc_error()),
     }
 }
 
@@ -4305,39 +4912,86 @@ async fn node_get_transfer_status(
     }
 } 
 
+/// The answer for an account row this node could not read (SH2): 503, never the default account, which
+/// a client cannot tell from the chain's "no such account".
+fn account_unreadable_answer(address: &str) -> (warp::http::StatusCode, Value) {
+    (warp::http::StatusCode::SERVICE_UNAVAILABLE, json!({
+        "success": false,
+        "error": "account_unreadable",
+        "message": "This node could not read the account from its storage; ask again or ask another node",
+        "address": address,
+    }))
+}
+
+/// A missing row: the chain has no such account yet.
+fn account_default_answer(address: &str) -> Value {
+    json!({
+        "address": address,
+        "balance": 0,
+        "nonce": 0,
+        "is_node": false,
+        "node_type": null,
+        "has_dilithium_pk": false,
+        "reputation": 0.0
+    })
+}
+
+/// `?fields=basic` (SH8): the account without its contract storage and code.
+fn account_basic_answer(address: &str, read: Result<Option<qnet_state::AccountBasic>, ()>) -> (warp::http::StatusCode, Value) {
+    let b = match read {
+        Ok(b) => b.unwrap_or_else(|| qnet_state::AccountBasic {
+            address: address.to_string(), balance: 0, nonce: 0, has_dilithium_pk: false, is_contract: false, contract_type: None,
+        }),
+        Err(()) => return account_unreadable_answer(address),
+    };
+    (warp::http::StatusCode::OK, json!({
+        "address": address,
+        "balance": b.balance,
+        "nonce": b.nonce,
+        "has_dilithium_pk": b.has_dilithium_pk,
+        "is_contract": b.is_contract,
+        "contract_type": b.contract_type,
+    }))
+}
+
 // REST API Handler Functions
+/// `GET /api/v1/account/{address}[?fields=basic]`.
 async fn handle_account_info(
     address: String,
+    params: HashMap<String, String>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
-    match blockchain.get_account(&address).await {
-        Ok(Some(account)) => {
-            // FIX-5: project the account for the wire. Two reasons the raw pk must NOT be serialized here:
-            // (a) it is a 1952-byte JSON array on EVERY balance poll — unaffordable at 10M light clients;
-            // (b) the only thing a wallet needs is whether its key is already committed, so it can decide
-            // pk-elision. `has_dilithium_pk` is that GROUND TRUTH — never infer it from nonce>=1, because a
-            // node-constructed NodeActivation raises the wallet's nonce WITHOUT binding the wallet key.
-            let has_dilithium_pk = account.dilithium_public_key.as_ref().map_or(false, |p| p.len() == 1952);
-            let mut v = serde_json::to_value(&account).unwrap_or_else(|_| json!({}));
-            if let Some(obj) = v.as_object_mut() {
-                obj.remove("dilithium_public_key");
-                obj.insert("has_dilithium_pk".to_string(), json!(has_dilithium_pk));
+    let (status, body) = match params.get("fields").map(|f| f.as_str()) {
+        Some("basic") => account_basic_answer(&address, blockchain.try_get_account_basic(&address).await),
+        Some(_) => (warp::http::StatusCode::BAD_REQUEST, json!({
+            "success": false, "error": "fields_unsupported", "message": "fields takes one value: basic"
+        })),
+        None => match blockchain.try_get_account(&address).await {
+            Ok(Some(account)) => {
+                // FIX-5: project the account for the wire. Two reasons the raw pk must NOT be serialized here:
+                // (a) it is a 1952-byte JSON array on EVERY balance poll — unaffordable at 10M light clients;
+                // (b) the only thing a wallet needs is whether its key is already committed, so it can decide
+                // pk-elision. `has_dilithium_pk` is that GROUND TRUTH — never infer it from nonce>=1, because a
+                // node-constructed NodeActivation raises the wallet's nonce WITHOUT binding the wallet key.
+                let has_dilithium_pk = account.dilithium_public_key.as_ref().map_or(false, |p| p.len() == 1952);
+                // Present only for a genesis-funded (load-test) account, and only once the set is loaded.
+                let genesis_allocation = genesis_allocations_nowait(blockchain.get_storage())
+                    .map_or(false, |set| set.contains(&address));
+                let mut v = serde_json::to_value(&account).unwrap_or_else(|_| json!({}));
+                if let Some(obj) = v.as_object_mut() {
+                    obj.remove("dilithium_public_key");
+                    obj.insert("has_dilithium_pk".to_string(), json!(has_dilithium_pk));
+                    if genesis_allocation {
+                        obj.insert("genesis_allocation".to_string(), json!(true));
+                    }
+                }
+                (warp::http::StatusCode::OK, v)
             }
-            Ok(warp::reply::json(&v))
-        }
-        Ok(None) | Err(_) => {
-            let default_account = json!({
-                "address": address,
-                "balance": 0,
-                "nonce": 0,
-                "is_node": false,
-                "node_type": null,
-                "has_dilithium_pk": false,
-                "reputation": 0.0
-            });
-            Ok(warp::reply::json(&default_account))
-        }
-    }
+            Ok(None) => (warp::http::StatusCode::OK, account_default_answer(&address)),
+            Err(()) => account_unreadable_answer(&address),
+        },
+    };
+    Ok(warp::reply::with_status(warp::reply::json(&body), status))
 }
 
 async fn handle_account_balance(
@@ -4347,31 +5001,26 @@ async fn handle_account_balance(
 ) -> Result<impl Reply, Rejection> {
     // v3.19: Rate limiting for DDoS protection
     if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "read_only") {
-        return Ok(rate_limit_response);
+        return Ok(warp::reply::with_status(rate_limit_response, warp::http::StatusCode::OK));
     }
-    
+
     // v3.19: Validate address parameter (max 64 chars)
     if address.len() > 64 {
-        return Ok(warp::reply::json(&json!({
+        return Ok(warp::reply::with_status(warp::reply::json(&json!({
             "error": "Invalid address",
             "message": "Address parameter too long (max 64 characters)"
-        })));
+        })), warp::http::StatusCode::OK));
     }
-    
-    match blockchain.get_balance(&address).await {
-        Ok(balance) => Ok(warp::reply::json(&json!({
+
+    // A row this node could not read answers the SH2 error, never a zero balance.
+    let (status, body) = match blockchain.try_get_account_basic(&address).await {
+        Ok(account) => (warp::http::StatusCode::OK, json!({
             "address": address,
-            "balance": balance
-        }))),
-        Err(e) => {
-            println!("[WARN][RPC] api_error endpoint=get_balance address={} err={}", address, e);
-            let error_response = json!({
-                "error": "Failed to get balance",
-                "details": "internal error"
-            });
-            Ok(warp::reply::json(&error_response))
-        }
-    }
+            "balance": account.map_or(0, |a| a.balance)
+        })),
+        Err(()) => account_unreadable_answer(&address),
+    };
+    Ok(warp::reply::with_status(warp::reply::json(&body), status))
 }
 
 /// v5.0: GET /api/v1/snapshot/{height}/manifest — chunk manifest for parallel download
@@ -4464,19 +5113,18 @@ async fn handle_snapshot_chunk(
 // REMOVED: verify_dilithium_signature — dead after the /reactivate endpoint retired (B: reactivation is
 // self-attest; light identity verifies via the ping-delegation chain against the on-chain key).
 
-/// PRODUCTION v2.78: Verify Light node signature (pure post-quantum ML-DSA-65 / ML-DSA-65)
-/// ARCHITECTURE: Light nodes use compact_bin ML-DSA-65 signature format
-/// Same format as Super nodes for consistency and quantum resistance
-async fn verify_light_node_signature(node_id: &str, challenge: &str, signature: &str, blockchain: &Arc<BlockchainNode>) -> bool {
+/// A light node's reply at this genesis's HTTP ingress (light-node-messages section 5.8).
+async fn verify_light_node_signature(node_id: &str, challenge: &str, signature: &str, blockchain: &Arc<BlockchainNode>)
+    -> Result<(), crate::light_device::ping::ReplyRefusal> {
     // Delegates to the SINGLE implementation shared with the gossip relay — duplicating the format
     // rules here is how a relay ends up admitting what this ingress rejects.
     match blockchain.get_unified_p2p() {
-        Some(p2p) => p2p.verify_light_ping_signature(node_id, challenge, signature),
+        Some(p2p) => p2p.verify_light_ping_signature(node_id, challenge, signature, crate::light_device::ping::Route::Ingress),
         None => {
             if crate::node::is_warn() {
                 println!("[WARN][LIGHT] p2p_unavailable node={}", node_id);
             }
-            false
+            Err(crate::light_device::ping::ReplyRefusal::Sigma)
         }
     }
 }
@@ -4496,6 +5144,19 @@ pub fn generate_quantum_challenge() -> String {
 // and the same genesis re-verifies the mac. No per-node store (survives FCM-woken devices that never
 // poll). Off-consensus path. Secret = SHA3(domain | node seed) — stable across restarts, never logged.
 pub(crate) const LIGHT_CHALLENGE_TTL_SECS: u64 = 180;
+
+/// How long a stamp issued at `height` stays answerable: until the shard's owners start building the
+/// epoch bitmap, and never less than LIGHT_CHALLENGE_TTL_SECS (which is also the margin the slot draw
+/// leaves for a stamp issued in the last drawn slot).
+///
+/// The reward unit is the whole epoch, so an answer three minutes late proves exactly the presence an
+/// answer three seconds late proves. The fixed 180 s threw the late ones away — a phone leaving doze, a
+/// push the system held back, a node restarting under a roll — and each throw cost that device its
+/// epoch. The grid runs at one block per second, so blocks left in the window are seconds left.
+fn challenge_lifetime_at(height: u64) -> u64 {
+    let commit_opens_at = 14_400u64.saturating_sub(crate::node::light_commit_window(height / 14_400));
+    commit_opens_at.saturating_sub(height % 14_400).max(LIGHT_CHALLENGE_TTL_SECS)
+}
 
 fn light_challenge_mac(node_id: &str, nonce: &[u8; 16], expiry: u64) -> [u8; 16] {
     use sha3::{Digest, Sha3_256};
@@ -4518,20 +5179,22 @@ fn light_challenge_mac(node_id: &str, nonce: &[u8; 16], expiry: u64) -> [u8; 16]
     mac
 }
 
-/// Issue a server-authenticated, unexpired challenge stamp for `node_id`.
-fn make_challenge_stamp(node_id: &str) -> String {
+/// Issue a server-authenticated challenge stamp for `node_id`, with the expiry the epoch allows.
+/// Returns the stamp and that expiry, so a caller serving it (the polling route) reports the same one.
+fn make_challenge_stamp(node_id: &str) -> (String, u64) {
     use rand::{RngCore, rngs::OsRng};
     use std::time::{SystemTime, UNIX_EPOCH};
     let mut nonce = [0u8; 16];
     OsRng.fill_bytes(&mut nonce);
+    let height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
     let expiry = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
-        + LIGHT_CHALLENGE_TTL_SECS;
+        + challenge_lifetime_at(height);
     let mac = light_challenge_mac(node_id, &nonce, expiry);
     let mut buf = Vec::with_capacity(40);
     buf.extend_from_slice(&nonce);
     buf.extend_from_slice(&expiry.to_be_bytes());
     buf.extend_from_slice(&mac);
-    hex::encode(buf)
+    (hex::encode(buf), expiry)
 }
 
 /// Verify a challenge stamp was issued by THIS server to THIS node and is not expired.
@@ -4548,6 +5211,205 @@ fn verify_challenge_stamp(node_id: &str, challenge: &str) -> bool {
     if expiry < now { return false; }
     let expected = light_challenge_mac(node_id, &nonce, expiry);
     bytes[24..40] == expected[..]
+}
+
+#[cfg(test)]
+mod tests_client_addr {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    fn peer(ip: [u8; 4]) -> Option<SocketAddr> { Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::from(ip)), 40000)) }
+
+    /// The bridge gateway a host terminator reaches a container from is read from the kernel's route table.
+    #[test]
+    fn the_default_gateway_is_read_from_the_route_table() {
+        let table = "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\n\
+                     eth0\t00000000\t010011AC\t0003\t0\t0\t0\t00000000\n\
+                     eth0\t000011AC\t00000000\t0001\t0\t0\t0\t0000FFFF\n";
+        assert_eq!(default_gateway(table), Some("172.17.0.1".parse().unwrap()));
+        assert_eq!(default_gateway("Iface\tDestination\tGateway\tFlags\neth0\t000011AC\t00000000\t0001\n"), None);
+        assert_eq!(default_gateway(""), None);
+    }
+
+    /// Only a loopback peer may be spoken for, and only by the last address in the header — the one the
+    /// terminator appended. A public peer keeps its own address whatever it sends.
+    #[test]
+    fn a_forwarded_address_is_taken_only_from_the_local_proxy() {
+        let lo = peer([127, 0, 0, 1]);
+        assert_eq!(forwarded_client(lo, Some("203.0.113.9")).unwrap().ip().to_string(), "203.0.113.9");
+        assert_eq!(forwarded_client(lo, Some("1.2.3.4, 203.0.113.9")).unwrap().ip().to_string(), "203.0.113.9");
+        assert_eq!(forwarded_client(lo, Some("[2001:db8::7]")).unwrap().ip().to_string(), "2001:db8::7");
+        assert_eq!(forwarded_client(lo, None), lo, "a local caller with no proxy in between");
+        let public = peer([198, 51, 100, 4]);
+        assert_eq!(forwarded_client(public, Some("127.0.0.1")), public);
+        assert_eq!(forwarded_client(None, Some("203.0.113.9")), None);
+    }
+
+    /// A header the terminator did not write - one naming this host, or no address at all - makes the
+    /// request nobody in particular: never loopback, so never whitelisted and never a committee caller.
+    #[test]
+    fn a_forwarded_entry_that_names_this_host_is_nobody() {
+        let lo = peer([127, 0, 0, 1]);
+        for forged in ["127.0.0.1", "1.2.3.4, 127.0.0.1", "::1", "[::1]", "::ffff:127.0.0.1", "0.0.0.0", "garbage", ""] {
+            let c = forwarded_client(lo, Some(forged)).unwrap();
+            assert!(c.ip().is_unspecified(), "{forged:?} -> {c}");
+            assert!(!c.ip().is_loopback() && !is_ip_whitelisted(c.ip()) && !is_private_ip(&c.ip()), "{forged:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests_gated_routes {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    /// The blocks `let {name} = api_v1 ... ;` of `start_rpc_server` that read `gate_addr()`, with the path their
+    /// `warp::path(..)` segments name.
+    fn server(src: &str) -> &str {
+        let body = &src[src.find("pub async fn start_rpc_server").expect("server")..];
+        &body[..body.find("
+async fn handle_rpc(").expect("the next function")]
+    }
+
+    fn gate_routes(src: &str) -> Vec<(String, String)> {
+        let body = server(src);
+        let mut out = Vec::new();
+        for (at, _) in body.match_indices(" = api_v1") {
+            let name = body[..at].rsplit("let ").next().unwrap_or("").trim().to_string();
+            let block = &body[at..at + body[at..].find(';').unwrap_or(0)];
+            if !block.contains(".and(gate_addr())") { continue; }
+            let mut path = String::from("/api/v1");
+            for seg in block.split("warp::path(\"").skip(1) {
+                path.push('/');
+                path.push_str(&seg[..seg.find('"').unwrap_or(0)]);
+            }
+            out.push((name, path));
+        }
+        out
+    }
+
+    /// M1: a request a page sends carries an Origin header, and an IP-gated decision takes it as nobody in
+    /// particular, whatever address the visitor's browser sends from (this host, its LAN, a genesis address).
+    #[test]
+    fn a_page_is_nobody_at_an_ip_gated_decision() {
+        let lan = Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 20)), 50000));
+        assert_eq!(gate_client(lan, false), lan, "a caller with no Origin header is what its address says");
+        let page = gate_client(lan, true).unwrap();
+        assert!(page.ip().is_unspecified());
+        assert!(!is_internal_ip(&page.ip().to_string()) && !is_genesis_peer_ip(&page.ip().to_string()));
+        for (ip, _) in crate::genesis_constants::GENESIS_NODE_IPS {
+            let g = Some(SocketAddr::new(ip.parse().unwrap(), 443));
+            assert!(!is_genesis_peer_ip(&gate_client(g, true).unwrap().ip().to_string()), "{ip}");
+        }
+        assert!(!is_internal_ip(&gate_client(Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1)), true).unwrap().ip().to_string()));
+    }
+
+    /// M1: every route that reads gate_addr is served outside the CORS filter (`gated_routes`, its path in
+    /// GATED_PATHS), so no answer of one carries a CORS header; the public CORS methods leave out DELETE, which
+    /// only the bundle cancel (gated too) uses.
+    #[test]
+    fn the_ip_gated_routes_are_served_outside_the_cors_filter() {
+        let src = include_str!("mod.rs");
+        let gated = gate_routes(src);
+        let body = server(src);
+        let names: Vec<&str> = gated.iter().map(|(n, _)| n.as_str()).collect();
+        for want in ["internal_fcm_sync", "internal_fcm_get", "internal_light_keys_get", "internal_light_reach_get", "internal_light_unbind_sync",
+                     "internal_device_attest", "internal_device_sync", "internal_device_get", "p2p_message",
+                     "node_reactivation_submit", "graceful_shutdown"] {
+            assert!(names.contains(&want), "{want} reads gate_addr");
+        }
+        let group = &body[body.find("let gated_routes = ").expect("gated group")..];
+        let group = &group[..group.find(';').unwrap()];
+        for (name, path) in &gated {
+            assert!(is_gated_path(path), "{name}: {path} is a gated path");
+            assert!(group.contains(&format!("{name}\n")) || group.contains(&format!("({name})")), "{name} is in gated_routes");
+        }
+        assert!(group.contains(".or(bundle_cancel)"));
+        // No group served under the CORS filter names a gated route.
+        let rest = &body[body.find("let rest_routes = ").expect("rest")..];
+        let rest = &rest[..rest.find(';').unwrap()];
+        assert!(rest.contains(".with(cors)") && !rest.contains("gated_routes"));
+        for (at, _) in body.match_indices("_routes = ") {
+            let block = &body[at..at + body[at..].find(';').unwrap()];
+            if block.starts_with("_routes = internal_fcm_sync") { continue; }
+            for name in names.iter().copied().chain(["bundle_cancel"]) {
+                assert!(!block.contains(&format!("({name})")) && !block.contains(&format!("= {name}\n")), "{name} in {}", &block[..40.min(block.len())]);
+            }
+        }
+        assert!(body.contains("let routes = ws_subscribe.or(gated_preflight()).or(gated_routes).or(rest_routes);"));
+        let production = &body[body.find("cors_mode=public").unwrap()..];
+        let methods = &production[production.find("allow_methods(").unwrap()..];
+        let methods = &methods[..methods.find(')').unwrap()];
+        assert!(methods.contains("\"POST\"") && methods.contains("\"GET\"") && !methods.contains("DELETE"), "{methods}");
+    }
+
+    #[test]
+    fn the_gated_paths_are_exactly_these() {
+        for p in ["/api/v1/internal/fcm-token-sync", "/api/v1/internal/light-device-get", "/api/v1/p2p/message",
+                  "/api/v1/p2p/message/", "/api/v1/node-reactivation/submit", "/api/v1/shutdown"] {
+            assert!(is_gated_path(p), "{p}");
+        }
+        for p in ["/api/v1/height", "/api/v1/light-node/unbind", "/api/v1/p2p/messages", "/api/v1/shutdownx",
+                  "/api/v1/internalx", "/rpc", "/api/v1/bundle/submit"] {
+            assert!(!is_gated_path(p), "{p}");
+        }
+    }
+
+    /// A preflight for a gated path is refused with no CORS headers before the CORS filter would answer it; a
+    /// public path's preflight is still answered, and a gated route's own answer carries no CORS header.
+    #[tokio::test]
+    async fn a_preflight_for_a_gated_path_is_refused_and_a_public_one_answered() {
+        let cors = warp::cors().allow_any_origin().allow_methods(vec!["POST", "GET", "OPTIONS"])
+            .allow_headers(vec!["Content-Type"]);
+        let public = warp::path!("api" / "v1" / "height").and(warp::get()).map(|| "h").with(cors);
+        let gated = warp::path!("api" / "v1" / "internal" / "fcm-token-sync").and(warp::post()).and(gate_addr())
+            .map(|c: Option<SocketAddr>| if c.map_or(false, |a| a.ip().is_unspecified()) { "nobody" } else { "caller" });
+        let routes = gated_preflight().or(gated).or(public);
+        let preflight = |path: &'static str| warp::test::request().method("OPTIONS").path(path)
+            .header("origin", "https://example.org").header("access-control-request-method", "POST")
+            .header("access-control-request-headers", "content-type");
+        let r = preflight("/api/v1/internal/fcm-token-sync").reply(&routes).await;
+        assert_eq!(r.status(), 403);
+        assert!(r.headers().get("access-control-allow-origin").is_none());
+        let r = preflight("/api/v1/height").reply(&routes).await;
+        assert_eq!(r.status(), 200);
+        assert_eq!(r.headers().get("access-control-allow-origin").map(|v| v.to_str().unwrap()), Some("https://example.org"));
+
+        // A simple request still reaches the gated route: it answers no CORS header, and takes the page as nobody.
+        let r = warp::test::request().method("POST").path("/api/v1/internal/fcm-token-sync")
+            .remote_addr("192.168.1.20:5000".parse().unwrap()).header("origin", "https://example.org")
+            .reply(&routes).await;
+        assert!(r.headers().get("access-control-allow-origin").is_none());
+        assert_eq!(r.body().as_ref(), b"nobody");
+        let r = warp::test::request().method("POST").path("/api/v1/internal/fcm-token-sync")
+            .remote_addr("192.168.1.20:5000".parse().unwrap()).reply(&routes).await;
+        assert_eq!(r.body().as_ref(), b"caller");
+    }
+}
+
+#[cfg(test)]
+mod tests_light_challenge_lifetime {
+
+    use super::*;
+
+    /// A stamp stays answerable until the shard's owners start building the epoch bitmap: a device that
+    /// answers minutes late — doze, a held-back push, a node restarting under a roll — still proves the
+    /// epoch it was pinged in. Below that it never drops under the floor the slot draw is sized for.
+    #[test]
+    fn a_stamp_is_answerable_until_the_commit_window_opens() {
+        let epoch = 200u64;
+        let start = epoch * 14_400;
+        let commit = crate::node::light_commit_window(epoch);
+        let answerable_for = 14_400 - commit;
+        assert_eq!(challenge_lifetime_at(start), answerable_for);
+        assert_eq!(challenge_lifetime_at(start + 7_200), answerable_for - 7_200);
+        assert_eq!(challenge_lifetime_at(start + answerable_for - LIGHT_CHALLENGE_TTL_SECS),
+                   LIGHT_CHALLENGE_TTL_SECS, "the last drawn slot still gets the full floor");
+        assert_eq!(challenge_lifetime_at(start + 14_399), LIGHT_CHALLENGE_TTL_SECS,
+                   "inside the commit window a stamp gets the floor, not zero");
+        assert!(challenge_lifetime_at(start) > LIGHT_CHALLENGE_TTL_SECS,
+                "an epoch is worth more than three minutes of answering time");
+    }
 }
 
 #[cfg(test)]
@@ -4625,5 +5487,326 @@ mod block_json_tests {
         assert_eq!(v["hash"], "ab".repeat(32));
         assert_eq!(v["previous_hash"].as_array().map(|a| a.len()), Some(32), "wire shape of the block is unchanged");
         assert!(block_json(&block, None)["hash"].is_null());
+    }
+}
+
+#[cfg(test)]
+mod tests_signed_target_bound {
+    use super::*;
+
+    // Every wallet, the extension and the load harness send through these two builders: the fields the
+    // signature covers and the fields apply acts on come from the same request values, so an honest
+    // transfer or call passes the tx_target_bound rule at the gate.
+    #[test]
+    fn the_rest_builders_pass_the_signed_target_rule_from_the_gate() {
+        let gate = qnet_state::feature_gates::TX_TARGET_BOUND_GATE_HEIGHT;
+        let from = qnet_state::transaction::derive_contract_address("rest_builder_wallet", 1);
+        let to = qnet_state::transaction::derive_contract_address("rest_builder_wallet", 2);
+
+        let transfer: TransactionRequest = serde_json::from_value(serde_json::json!({
+            "from": from, "to": to, "amount": 5, "gas_price": 100_000, "gas_limit": 10_000, "nonce": 1
+        })).expect("transfer request");
+        let tx = tx_api::transfer_tx(&transfer, 1_700_000_000);
+        assert_eq!(tx.validate(), Ok(()));
+        assert_eq!(tx.check_signed_target_bound(gate), Ok(()));
+
+        let call: ContractCallRequest = serde_json::from_value(serde_json::json!({
+            "from": from, "contract_address": to, "method": "transfer", "args": [from, "1"],
+            "gas_limit": 200_000, "gas_price": 100_000, "nonce": 2
+        })).expect("call request");
+        let tx = contracts_api::contract_call_tx(&call, 1_700_000_000);
+        assert_eq!(tx.validate(), Ok(()));
+        assert_eq!(tx.check_signed_target_bound(gate), Ok(()));
+    }
+
+    /// The claim builder takes the envelope amount from the payload's own total and leaves nonce, gas and
+    /// the legacy fields empty, so an honest claim passes from the gate; an unsummable payload builds none.
+    #[test]
+    fn the_rest_claim_builder_passes_at_the_gate() {
+        let gate = qnet_state::feature_gates::TX_TARGET_BOUND_GATE_HEIGHT;
+        let wallet = qnet_state::transaction::derive_contract_address("rest_claim_wallet", 1);
+        let data = r#"{"claims":[{"epoch":3,"amount":40,"proof":[]},{"epoch":4,"amount":2,"proof":[]}]}"#;
+        let tx = rewards_api::merkle_claim_tx(&wallet, data, "sig", Some("ab"), 1_780_000_000).expect("summable");
+        assert_eq!(tx.amount, 42);
+        assert_eq!(Some(tx.amount), qnet_state::Transaction::claim_entries_total(data));
+        assert_eq!(tx.check_signed_target_bound(gate), Ok(()));
+        assert!(rewards_api::merkle_claim_tx(&wallet, r#"{"claims":[{"epoch":3}]}"#, "sig", None, 0).is_none());
+    }
+
+    /// The batch builder writes the envelope as (BATCH_TRANSFERS_TO, exact sum) and an empty memo as none,
+    /// which the signed digest cannot tell apart, so the client's signature still verifies and the batch
+    /// passes from the gate.
+    #[test]
+    fn the_rest_batch_builder_passes_at_the_gate() {
+        let gate = qnet_state::feature_gates::TX_TARGET_BOUND_GATE_HEIGHT;
+        let from = qnet_state::transaction::derive_contract_address("rest_batch_wallet", 1);
+        let to = |i: u64| qnet_state::transaction::derive_contract_address("rest_batch_to", i);
+        let request: BatchTransferRequest = serde_json::from_value(serde_json::json!({
+            "transfers": [
+                { "from": from, "to_address": to(1), "amount": 3, "memo": "" },
+                { "from": from, "to_address": to(2), "amount": 4, "memo": "rent" },
+            ],
+            "batch_id": "b1", "nonce": 1, "gas_price": 100_000, "gas_limit": 20_000,
+            "dilithium_signature": "00",
+        })).expect("batch request");
+        let tx = tx_api::batch_transfer_tx(&request, &from, 7, 1_700_000_000);
+        assert_eq!(tx.check_signed_target_bound(gate), Ok(()));
+        assert_eq!(tx.validate(), Ok(()));
+        let with_empty = {
+            let mut t = tx.clone();
+            if let qnet_state::TransactionType::BatchTransfers { transfers, .. } = &mut t.tx_type {
+                transfers[0].memo = Some(String::new());
+            }
+            t
+        };
+        assert_eq!(crate::node::BlockchainNode::build_canonical_verify_message(&tx),
+                   crate::node::BlockchainNode::build_canonical_verify_message(&with_empty),
+                   "none and an empty memo sign the same bytes");
+    }
+
+    /// Every deploy builder emits the canonical payload for its RPC-shaped input, so an honest deploy passes
+    /// the gated canonical-form rule, and the digest it returns is the one classify re-derives.
+    #[test]
+    fn the_deploy_builders_emit_the_canonical_payload() {
+        use qnet_state::transaction::DeployKind;
+        let gate = qnet_state::feature_gates::TX_TARGET_BOUND_GATE_HEIGHT;
+        let from = qnet_state::transaction::derive_contract_address("rest_deploy_wallet", 1);
+        let inputs = [
+            (DeployKind::Wasm, serde_json::json!({ "wasm": true, "code": "0061736D01000000" })),
+            (DeployKind::Qrc721, serde_json::json!({ "qrc721": true, "name": "N", "symbol": "NF" })),
+            (DeployKind::Qrc20, serde_json::json!({
+                "qrc20": true, "name": "Tok", "symbol": "TK", "decimals": 9u8, "logo": "",
+                "initial_supply": 1_000u64.to_string(), "mintable": false, "burnable": false,
+            })),
+        ];
+        for (kind, input) in inputs {
+            let (code_hash, payload) = contracts_api::deploy_payload(kind, &input).expect("payload");
+            let tx = qnet_state::Transaction::new(from.clone(),
+                Some(qnet_state::transaction::derive_contract_address(&from, 3)), 0, 3, 1000, 1_000_000,
+                1_700_000_000, None, qnet_state::TransactionType::ContractDeploy, Some(payload));
+            assert_eq!(tx.contract_deploy_code_hash().as_deref(), Ok(code_hash.as_str()), "{:?}", kind);
+            assert_eq!(tx.check_signed_target_bound(gate), Ok(()), "{:?}", kind);
+        }
+    }
+
+    /// History, lookups and the address index show what apply paid or created: a batch's recipients and
+    /// sum, a deploy's derived address with no value, nothing for a lifecycle TX, never an envelope nothing
+    /// signs.
+    #[test]
+    fn history_and_index_follow_what_apply_paid() {
+        let from = "sender_wallet".to_string();
+        let forged_batch = qnet_state::Transaction::new(from.clone(), Some("merchant".to_string()), 1_000_000, 1, 1, 30_000, 0, None,
+            qnet_state::TransactionType::BatchTransfers {
+                transfers: vec![
+                    qnet_state::transaction::BatchTransferData { to_address: "alice".to_string(), amount: 1, memo: None },
+                    qnet_state::transaction::BatchTransferData { to_address: "bob".to_string(), amount: 2, memo: None },
+                    qnet_state::transaction::BatchTransferData { to_address: "alice".to_string(), amount: 3, memo: None },
+                ],
+                batch_id: "b".to_string(),
+            }, None);
+        assert_eq!(crate::storage::tx_index_counterparties(&forged_batch), vec!["alice".to_string(), "bob".to_string()]);
+        assert_eq!(tx_display_to_amount(&forged_batch), (Some(qnet_state::transaction::BATCH_TRANSFERS_TO.to_string()), 6));
+        assert_eq!(batch_received_by(&forged_batch, "alice"), Some(4));
+        assert_eq!(batch_received_by(&forged_batch, "merchant"), None, "the envelope pays nobody");
+
+        let deploy = qnet_state::Transaction::new(from.clone(), Some("victim_future_token".to_string()), 500, 4, 1, 1_000_000, 0, None,
+            qnet_state::TransactionType::ContractDeploy, Some("{}".to_string()));
+        let derived = qnet_state::transaction::derive_contract_address(&from, 4);
+        assert_eq!(crate::storage::tx_index_counterparties(&deploy), vec![derived.clone()]);
+        assert_eq!(tx_display_to_amount(&deploy), (Some(derived), 0));
+
+        let transfer = qnet_state::Transaction::new(from.clone(), Some("carol".to_string()), 9, 1, 1, 10_000, 0, None,
+            qnet_state::TransactionType::Transfer { from, to: "carol".to_string(), amount: 9 }, None);
+        assert_eq!(crate::storage::tx_index_counterparties(&transfer), vec!["carol".to_string()]);
+        assert_eq!(tx_display_to_amount(&transfer), (Some("carol".to_string()), 9));
+
+        // A lifecycle TX pays no one: a relay's copy naming a victim and a fabricated amount (a pre-gate
+        // block may carry one) lists no counterparty and shows no value.
+        let heartbeat = qnet_state::Transaction::new("super_x".to_string(), Some("victim".to_string()),
+            1_000_000_000_000_000_000, 1, u64::MAX, 0, 0, None,
+            qnet_state::TransactionType::Heartbeat { node_id: "super_x".to_string(), anchor_height: 1, anchor_hash: "ab".repeat(32) },
+            None);
+        assert!(crate::storage::tx_index_counterparties(&heartbeat).is_empty());
+        assert_eq!(tx_display_to_amount(&heartbeat), (None, 0));
+    }
+}
+
+#[cfg(test)]
+mod tests_attest_lanes {
+    use super::*;
+
+    /// H10: callers outside the committee share one lane of the attestor's first-sight budget. When it
+    /// is spent they wait, while the committee's submit doors still reach the rest of the ceiling; the
+    /// ceiling and the per-burner count hold for every caller.
+    #[test]
+    fn the_outside_lane_is_a_share_and_never_the_doors_quota() {
+        let now = 1_800_000_020;
+        let mut b = LookupBudget::default();
+        for i in 0..ATTEST_LOOKUPS_OUTSIDE {
+            assert_eq!(b.admit(&format!("outside_{i}"), true, None, now), Ok(()));
+        }
+        let retry = b.admit("outside_x", true, None, now).unwrap_err();
+        assert!(retry > 0 && retry <= ATTEST_LOOKUP_WINDOW_SECS);
+        // Six committee doors, each with its share: together they keep the rest of the ceiling.
+        let doors: Vec<String> = (0..6).map(|d| format!("198.51.100.{d}")).collect();
+        for i in ATTEST_LOOKUPS_OUTSIDE..ATTEST_LOOKUPS_GLOBAL {
+            let door = doors[(i as usize) % doors.len()].as_str();
+            assert_eq!(b.admit(&format!("door_{i}"), false, Some(door), now), Ok(()), "the doors keep the rest");
+        }
+        assert!(b.admit("door_x", false, Some("198.51.100.99"), now).is_err(), "the global ceiling");
+        assert_eq!(b.admit("door_x", false, Some(doors[0].as_str()), now + ATTEST_LOOKUP_WINDOW_SECS), Ok(()),
+                   "a new window");
+
+        let mut b = LookupBudget::default();
+        for _ in 0..ATTEST_LOOKUPS_PER_BURNER { assert_eq!(b.admit("one_burner", false, Some("own"), now), Ok(())); }
+        assert!(b.admit("one_burner", false, Some("own"), now).is_err(), "per burner, for a committee caller too");
+    }
+
+    /// M-9: each committee caller spends its own share of the doors' quota. Garbage pushed through one door
+    /// (fresh burners, each first sight) leaves every other door its share. The doors' quota is split over the
+    /// callers that ask, never over fewer than the genesis count: a committee of a thousand whose submits come
+    /// through five doors leaves each of them a fifth, and the share never falls below one burner's count.
+    #[test]
+    fn a_flood_through_one_door_spends_only_its_share() {
+        let now = 1_800_000_020;
+        let doors_quota = ATTEST_LOOKUPS_GLOBAL - ATTEST_LOOKUPS_OUTSIDE;
+        let genesis = crate::genesis_constants::genesis_node_count();
+        assert_eq!(attest_door_share(0), doors_quota / genesis as u32);
+        assert_eq!(attest_door_share(1), doors_quota / genesis as u32, "one door never takes more than a genesis door's share");
+        assert_eq!(attest_door_share(genesis), doors_quota / genesis as u32, "five doors asking, whatever the committee size");
+        assert_eq!(attest_door_share(6), doors_quota / 6);
+        assert_eq!(attest_door_share(1000), ATTEST_LOOKUPS_PER_BURNER, "the floor when a thousand doors ask");
+
+        let mut b = LookupBudget::default();
+        let alone = attest_door_share(1);
+        for i in 0..alone {
+            assert_eq!(b.admit(&format!("junk_{i}"), false, Some("own"), now), Ok(()));
+        }
+        assert!(b.admit("junk_x", false, Some("own"), now).is_err(), "the flooded door waits");
+        for d in 1..6 {
+            let door = format!("203.0.113.{d}");
+            assert_eq!(b.admit(&format!("honest_{d}"), false, Some(door.as_str()), now), Ok(()),
+                       "another door keeps its share");
+        }
+        for i in 1..attest_door_share(6) {
+            assert_eq!(b.admit(&format!("honest_1_{i}"), false, Some("203.0.113.1"), now), Ok(()));
+        }
+        assert!(b.admit("honest_1_x", false, Some("203.0.113.1"), now).is_err(), "six doors asking: a sixth each");
+
+        // The next window starts split over the six doors that asked in this one: the flooded door cannot
+        // take more than a sixth before the others ask again.
+        let next = now + ATTEST_LOOKUP_WINDOW_SECS;
+        for i in 0..attest_door_share(6) {
+            assert_eq!(b.admit(&format!("junk_n_{i}"), false, Some("own"), next), Ok(()), "a new window");
+        }
+        assert!(b.admit("junk_n_x", false, Some("own"), next).is_err());
+        // A window with no lookups between forgets the doors.
+        let later = next + 2 * ATTEST_LOOKUP_WINDOW_SECS;
+        for i in 0..alone {
+            assert_eq!(b.admit(&format!("junk_l_{i}"), false, Some("own"), later), Ok(()));
+        }
+        assert!(b.admit("junk_l_x", false, Some("own"), later).is_err());
+    }
+
+    /// The collector asks its own attestor in-process, where it is a committee caller, and every other
+    /// member at the address it resolves; a member with no address is skipped. Without this node in hand
+    /// (a joining super's own registration) it asks itself at its announced address, never at loopback.
+    #[test]
+    fn the_collector_asks_itself_in_process() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage");
+        let own = format!("genesis_node_{}", crate::genesis_constants::GENESIS_NODE_IPS[0].1);
+        let other = format!("genesis_node_{}", crate::genesis_constants::GENESIS_NODE_IPS[1].1);
+        let members = [own.clone(), other.clone(), "super_attest_lane_unknown".to_string()];
+        let targets = BlockchainNode::attest_targets(&members, &own, true, &storage);
+        assert_eq!(targets.len(), 2, "{targets:?}");
+        assert_eq!(targets[0], (own.clone(), None));
+        assert_eq!(targets[1].0, other);
+        let url = targets[1].1.as_deref().unwrap();
+        assert!(url.starts_with("http://") && url.ends_with(":8001/") && !url.contains("127.0.0.1"), "{url}");
+        let without = BlockchainNode::attest_targets(&members, &own, false, &storage);
+        let own_url = without[0].1.as_deref().expect("its announced address");
+        assert!(own_url.contains(crate::genesis_constants::GENESIS_NODE_IPS[0].0) && !own_url.contains("127.0.0.1"), "{own_url}");
+    }
+
+    /// M-9: the submit route and `node_attestBurn` answer a request with no Origin, from the site and from the
+    /// extension; any other page, a sandbox site included, gets 403 before any work. The global CORS answer stays.
+    #[tokio::test]
+    async fn the_registration_doors_answer_only_their_origins() {
+        for ok in [None, Some("https://aiqnet.io"), Some("https://www.aiqnet.io"),
+                   Some("HTTPS://AIQNET.IO"), Some("chrome-extension://abcdefghijklmnopabcdefghijklmnop"),
+                   Some("moz-extension://0b1c2d3e-4f50-6172-8394-a5b6c7d8e9f0")] {
+            assert!(registration_origin_allowed(ok), "{ok:?}");
+        }
+        for bad in ["", "null", "https://other.test", "https://aiqnet.io.other.test", "http://aiqnet.io",
+                    "https://aiqnet.io/", "https://node1.aiqnet.io", "https://test.aiqnet.io", "chrome-extension://",
+                    "chrome-extension://id/x", "moz-extension://", "file://"] {
+            assert!(!registration_origin_allowed(Some(bad)), "{bad:?}");
+        }
+
+        // The header as the routes read it: absent is None, a non-text Origin is still one and is refused.
+        let gate = warp::path("door").and(request_origin()).map(|origin: Option<String>| {
+            if registration_origin_allowed(origin.as_deref()) { warp::reply::json(&json!({ "ok": true })).into_response() }
+            else { origin_refused(Some(7)).into_response() }
+        });
+        let r = warp::test::request().method("POST").path("/door").reply(&gate).await;
+        assert_eq!(r.status(), 200);
+        let r = warp::test::request().method("POST").path("/door").header("origin", "https://aiqnet.io").reply(&gate).await;
+        assert_eq!(r.status(), 200);
+        let r = warp::test::request().method("POST").path("/door").header("origin", "https://other.test").reply(&gate).await;
+        assert_eq!(r.status(), 403);
+        let body: Value = serde_json::from_slice(r.body()).unwrap();
+        assert_eq!((body["id"].clone(), body["error"]["code"].clone()), (json!(7), json!(-32005)));
+        let r = warp::test::request().method("POST").path("/door")
+            .header("origin", warp::http::HeaderValue::from_bytes(b"\xff\xfe").unwrap()).reply(&gate).await;
+        assert_eq!(r.status(), 403);
+        assert_eq!(origin_refused(None).into_response().status(), 403);
+
+        // Both JSON-RPC routes and the submit route refuse before any work; nothing else at JSON-RPC is filtered.
+        let src = include_str!("mod.rs").replace("\r\n", "\n");
+        let server = &src[src.find("pub async fn start_rpc_server(").unwrap()..];
+        for (route, work) in [("let rpc_path = warp::path(\"rpc\")", "handle_rpc(request"),
+                              ("let root_path = warp::path::end()", "handle_rpc(request"),
+                              ("let node_registration_submit = api_v1", "handle_node_registration_client_submit(req")] {
+            let at = &server[server.find(route).unwrap_or_else(|| panic!("missing {route}"))..];
+            let check = at.find("registration_origin_allowed(origin.as_deref())").expect("the origin check");
+            assert!(check < at.find(work).unwrap(), "{route}: the origin check comes first");
+        }
+        assert_eq!(server.matches("request.method == \"node_attestBurn\" && !registration_origin_allowed").count(), 2);
+    }
+}
+#[cfg(test)]
+mod tests_account_answers {
+    use super::*;
+
+    /// SH2: a row this node could not read answers 503 `account_unreadable`, never the default account;
+    /// a missing row still answers the default account.
+    #[test]
+    fn an_unreadable_account_is_an_error_and_a_missing_one_the_default() {
+        let (status, body) = account_unreadable_answer("eon_x");
+        assert_eq!(status, warp::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!((body["success"].clone(), body["error"].clone()), (json!(false), json!("account_unreadable")));
+        assert!(body.get("balance").is_none() && body.get("nonce").is_none(), "no figure a client could take for the chain's");
+        let d = account_default_answer("eon_new");
+        assert_eq!((d["balance"].clone(), d["nonce"].clone(), d["has_dilithium_pk"].clone()), (json!(0), json!(0), json!(false)));
+        assert_eq!(account_basic_answer("eon_x", Err(())).0, warp::http::StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// SH8: `?fields=basic` answers exactly address, balance, nonce, has_dilithium_pk, is_contract and
+    /// contract_type, for a stored account and a missing one alike.
+    #[test]
+    fn the_basic_form_names_only_the_light_fields() {
+        let token = qnet_state::AccountBasic {
+            address: "eon_token".into(), balance: 12, nonce: 3, has_dilithium_pk: false, is_contract: true,
+            contract_type: Some("qrc20".into()),
+        };
+        let (status, v) = account_basic_answer("eon_token", Ok(Some(token)));
+        assert_eq!(status, warp::http::StatusCode::OK);
+        let keys: std::collections::BTreeSet<&str> = v.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        assert_eq!(keys, ["address", "balance", "has_dilithium_pk", "contract_type", "is_contract", "nonce"].into_iter().collect());
+        assert_eq!((v["is_contract"].clone(), v["contract_type"].clone(), v["balance"].clone()), (json!(true), json!("qrc20"), json!(12)));
+        let (_, missing) = account_basic_answer("eon_new", Ok(None));
+        assert_eq!(missing, json!({"address": "eon_new", "balance": 0, "nonce": 0, "has_dilithium_pk": false,
+                                   "is_contract": false, "contract_type": null}));
     }
 }

@@ -33,8 +33,14 @@ target_compile_options(dilithium_native PRIVATE
     -O2
 )
 
+# Native error logging in debug builds only; release builds log nothing.
+target_compile_definitions(dilithium_native PRIVATE $<$<CONFIG:Debug>:QNET_NATIVE_LOG>)
+
 target_link_libraries(dilithium_native
     android
     log
 )
+
+# 16 KB page alignment: Google Play requires it of every 64-bit library in apps targeting Android 15+.
+target_link_options(dilithium_native PRIVATE "-Wl,-z,max-page-size=16384")
 

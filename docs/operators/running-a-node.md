@@ -1,6 +1,6 @@
 # Running a node
 
-This document covers installing, starting, verifying, migrating and removing a QNet **Super node** on a Linux server. Super nodes are the node role that runs on server hardware: they store the chain, serve the HTTP API and participate in consensus. Light nodes run in the mobile app — see [mobile wallet](../applications/mobile-wallet.md). Everything below is Docker-based; the node binary runs inside a container. For the full variable reference see [configuration](configuration.md); for day-2 operations see [maintenance](maintenance.md).
+This document covers installing, starting, verifying, migrating and removing a QNet **Super node** on a Linux server. Super nodes are the node role that runs on server hardware: they store the chain, serve the HTTP API and participate in consensus. Light nodes run in QNet Wallet on a phone or tablet, one device per node — see [mobile wallet](../applications/mobile-wallet.md). Everything below is Docker-based; the node binary runs inside a container. For the full variable reference see [configuration](configuration.md); for day-2 operations see [maintenance](maintenance.md).
 
 ## Node roles on a server
 
@@ -8,7 +8,7 @@ This document covers installing, starting, verifying, migrating and removing a Q
 |------|---------------|---------------------|-----------|----------|
 | Super | Linux server / VPS, in Docker | Activation code + 1DEV burn data + wallet mnemonic | Yes | Yes |
 | Genesis (bootstrap) | Reserved for the five pinned genesis identities | `QNET_BOOTSTRAP_ID` = `001`..`005` | Yes | Yes |
-| Light | Mobile app only | In-app, from the wallet | No | No |
+| Light | QNet Wallet on a phone or tablet only, one device per node | Registered on aiqnet.io/node (the cabinet's one-time payment key burns and QNet Wallet signs the wallet's consent) or by the QNet browser extension | No | No |
 
 The protocol has two node types, `Light` and `Super`. The server binary accepts a Super activation code; a Light code presented to it terminates the process.
 
@@ -97,19 +97,21 @@ If the host is behind NAT, forward the same ports and set `QNET_EXTERNAL_IP` to 
 
 ## Activation code and burn data
 
-A Super node needs proof that a node licence was purchased. In Phase 1 that proof is a 1DEV burn on Solana; the wallet turns it into an **activation code** — a 25-character string of the form `QNET-XXXXXX-XXXXXX-XXXXXX`. The code carries a 5-byte prefix of the wallet address, XOR-encrypted under a key derived from `SHA3-256("{burn_tx}:{node_type}:{burn_amount}")`. Given the burn transaction and the burned amount, that prefix can be checked against a wallet with no node state; the full wallet address is resolved from the on-chain activation record. See [node activation](../economics/node-activation.md).
+A Super node needs proof of activation. In Phase 1 that proof is a 1DEV burn on Solana, signed by the wallet in the QNet [browser extension](../applications/browser-wallet.md) (see [node activation](../economics/node-activation.md)): from its Activate tab (choose Super), or when the node cabinet at aiqnet.io/node asks it. The cabinet's one-time payment key burns for Light nodes only. The wallet derives an **activation code** from the burn — a 25-character string of the form `QNET-SXXXXX-XXXXXX-XXXXXX`, one code per wallet. The code carries a 5-byte prefix of the wallet address, XOR-encrypted under a key derived from `SHA3-256("{burn_tx}:{node_type}:{burn_amount}")`. Given the burn transaction and the burned amount, that prefix can be checked against a wallet with no node state; the full wallet address is resolved from the on-chain activation record. See [node activation](../economics/node-activation.md).
 
-Obtain the code, the Solana burn transaction signature and the exact burned amount from the mobile app (Settings, export activation data). Supply them to the container as environment variables:
+After a Super burn the aiqnet.io/node cabinet that asked shows the code, the Solana burn transaction signature and the exact burned amount next to the variable names below; the extension's Activate tab shows the code alone, with one line to aiqnet.io/node ("Recover my code" in the extension finds the code again for the wallet's existing burn). The Overview of aiqnet.io/node shows them too, with the server's settings and a `docker run` command filled in, for the wallet in any browser where it is connected: the site keeps a verified record of the wallet's burn (see [node activation](../economics/node-activation.md#one-wallet-one-code)). One wallet has one code, for a Light or a Super node: a wallet that already burned for a Light node gets no Super code, and the other way round. From the network's one-node rule (gate `wallet_one_node`) the network itself refuses a second node of either type for one wallet, and a server whose wallet already has another node never registers: it refuses the activation at start ("This wallet already has a light node on the QNet network (...)", naming the other node) or, when it only learns of the other node once it has caught up with the chain, logs `[ERR][REG] wallet_has_node` and stops its registration. Supply them to the container as environment variables:
 
 | Variable | Value |
 |----------|-------|
 | `QNET_ACTIVATION_CODE` | The 25-character `QNET-...` code |
 | `QNET_BURN_TX_HASH` | The Solana burn transaction signature |
 | `QNET_BURN_AMOUNT` | The exact whole-token amount burned |
-| `QNET_WALLET_SEED_FILE` | Path to a file containing the BIP39 mnemonic (preferred) |
+| `QNET_WALLET_SEED_FILE` | Path to a file containing the 12- or 24-word recovery phrase (mnemonic) (preferred) |
 | `QNET_WALLET_SEED` | The mnemonic inline (discouraged — see below) |
 
 The mnemonic must be the **same wallet** that performed the burn: the server derives the Solana address from it and checks it against the address encrypted in the code. It also derives the node's ML-DSA-65 consensus keypair deterministically from the mnemonic, so the mnemonic alone reconstitutes the node identity.
+
+Write the mnemonic exactly in its canonical form: the 12 or 24 words in lowercase, on one line, separated by single spaces. The node derives the keys from the text as written (it only trims the ends) and does not check the words or their checksum, so capitals, a line break between words, a double space or a typo silently give another wallet, whose Solana address does not match the burn.
 
 Passing the mnemonic with `-e` makes it readable through `docker inspect` and `/proc/<pid>/environ`; the node logs a warning when it reads a seed from the environment. Mount a file instead:
 
@@ -117,6 +119,8 @@ Passing the mnemonic with `-e` makes it readable through `docker inspect` and `/
 printf %s "your mnemonic words here" > ./qnet_seed
 chmod 600 ./qnet_seed
 ```
+
+The file stays readable by its owner only. The container starts as root and runs the node as its own `qnet` user, which cannot read a mounted file of another owner with mode `0600`: before it starts the node, the entrypoint copies the file named by `QNET_WALLET_SEED_FILE` (or `QNET_GENESIS_SEED_FILE`) to `/dev/shm` inside the container, in memory, owned by `qnet` with mode `0400`, and points the variable at the copy (`development/qnet-integration/Dockerfile.production`).
 
 Never commit an activation code, burn hash or mnemonic to a repository, a shared config file or a support ticket.
 
@@ -147,6 +151,8 @@ Notes on the command:
 
 If none of `QNET_BOOTSTRAP_ID`, `QNET_ACTIVATION_CODE` or a previously saved activation in RocksDB is present, the node prints the required-variable list and exits.
 
+Once the server has joined the network, the Overview of aiqnet.io/node follows the node for its wallet: online or not (the nodes' peer view or the node's on-chain heartbeat), when it was last seen, its heartbeats this epoch against the number needed, its counted and missed epochs, and its node balance, which moves to the wallet from the Node tab of QNet Wallet. The Device tab says that a Super node runs on its server and has no device to link.
+
 ### Genesis bootstrap nodes
 
 The five genesis identities start with `QNET_BOOTSTRAP_ID` set to `001`–`005` and a wallet seed, with no activation code or burn data; burn verification is skipped for them. The five ids and the genesis IP list are pinned in the binary. Genesis mode is also entered by setting `QNET_GENESIS_BOOTSTRAP=1` or by a source-IP match against the pinned genesis list. Do not set these variables on an ordinary Super node.
@@ -173,7 +179,7 @@ The test logs `identity_linkage_skipped` when no seed is supplied, and fails whe
 
 ### Light nodes
 
-Light nodes run inside the mobile app and register through the wallet. They keep no chain data and hold no consensus key.
+Light nodes run inside QNet Wallet on a phone or tablet, one device per node, after the system's device check. The Light burn is made on aiqnet.io/node by the cabinet's one-time payment key, after QNet Wallet confirms the wallet the node is for, with the wallet's consent signed in QNet Wallet on a sheet a verified `link.aiqnet.io` link opens, or by the QNet browser extension with the wallet's own key; the cabinet or the extension submits the registration. The app links the node to its device ("Use this device") and moves the node balance. Light nodes keep no chain data and hold no consensus key. See [mobile wallet](../applications/mobile-wallet.md) and [node activation](../economics/node-activation.md).
 
 ## First-run expectations
 

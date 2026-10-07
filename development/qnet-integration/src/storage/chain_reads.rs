@@ -13,6 +13,19 @@ pub struct MicroBlockHeader {
     pub tx_count: usize,
 }
 
+/// Blocks below the tip the public recent-transactions feed reaches (one hour at one block per second),
+/// and the transactions it holds in all. Together they bound the work of a feed request.
+pub const RECENT_TX_FEED_BLOCKS: u64 = 3_600;
+pub const RECENT_TX_FEED_WINDOW: usize = 1_000;
+
+/// The recent-transactions feed: (height, hash) of the newest transactions up to `tip`, newest first,
+/// together with the hash of the block it was built on, so a replaced tip is noticed.
+pub(crate) struct RecentTxFeed {
+    tip: u64,
+    tip_hash: Option<[u8; 32]>,
+    entries: std::collections::VecDeque<(u64, String)>,
+}
+
 impl Storage {
     /// Get microblocks range for batch sync  
     /// CRITICAL: Returns full MicroBlock format for network sync (not EfficientMicroBlock)
@@ -563,6 +576,152 @@ impl Storage {
         Err(IntegrationError::StorageError(format!("undecodable_microblock_row h={} bytes={}", height, data.len())))
     }
 
+    /// Hashes of a stored block's transactions in block order, from its row alone: no transaction body
+    /// is read and nothing feeds the tx pool. Ok(None) when the slot holds no body (burned, pruned, absent).
+    pub fn block_tx_hashes(&self, height: u64) -> IntegrationResult<Option<Vec<String>>> {
+        let (rb_in_progress, _) = get_rollback_status();
+        if !rb_in_progress {
+            if let Some(mb) = self.recent_microblocks.get(&height) {
+                return Ok(Some(mb.value().transactions.iter().map(|tx| tx.hash.clone()).collect()));
+            }
+        }
+        let raw = match self.load_microblock(height)? { Some(d) => d, None => return Ok(None) };
+        let data = if raw.len() >= 4 && raw[0..4] == [0x28, 0xb5, 0x2f, 0xfd] {
+            zstd::decode_all(&raw[..]).map_err(|e| IntegrationError::Other(format!("zstd: {}", e)))?
+        } else { raw };
+        let fmt = self.persistent.db.cf_handle("metadata")
+            .and_then(|cf| self.persistent.db.get_cf(&cf, mb_fmt_key(height).as_bytes()).ok())
+            .flatten()
+            .and_then(|v| v.first().copied());
+        if fmt != Some(0x01) {
+            if let Ok(eb) = bincode::deserialize::<qnet_state::EfficientMicroBlock>(&data) {
+                if eb.height == height {
+                    return Ok(Some(eb.transaction_hashes.iter().map(hex::encode).collect()));
+                }
+            }
+        }
+        if fmt != Some(0x02) {
+            if let Ok(mb) = bincode::deserialize::<qnet_state::MicroBlock>(&data) {
+                if mb.height == height {
+                    return Ok(Some(mb.transactions.into_iter().map(|tx| tx.hash).collect()));
+                }
+            }
+        }
+        Err(IntegrationError::StorageError(format!("undecodable_microblock_row h={} bytes={}", height, data.len())))
+    }
+
+    /// (height, hash) of the transactions in the blocks `floor..=top`, newest first (height descending,
+    /// and within a block from its last transaction to its first), at most `limit`. Also returns the
+    /// heights visited: the walk stops at `limit` transactions or at `floor`, whichever comes first.
+    fn recent_tx_walk(&self, top: u64, floor: u64, limit: usize) -> (Vec<(u64, String)>, u64) {
+        let mut out = Vec::new();
+        let mut visited = 0u64;
+        let mut h = top;
+        while h >= floor && out.len() < limit {
+            visited += 1;
+            match self.block_tx_hashes(h) {
+                Ok(Some(hashes)) => out.extend(hashes.into_iter().rev().map(|x| (h, x))),
+                Ok(None) => {}
+                Err(e) => if crate::node::is_warn() {
+                    println!("[WARN][STORAGE] recent_feed_block_unreadable h={} err={}", h, e);
+                },
+            }
+            if h == 0 { break; }
+            h -= 1;
+        }
+        out.truncate(limit);
+        (out, visited)
+    }
+
+    /// Bring the feed to `tip`. While the committed block at the feed's tip is still the one it was built
+    /// on, the feed holds this chain: an unchanged or lower `tip` (a request that read the height before
+    /// another advanced the feed) reads nothing, and a grown tip reads only the new blocks. Anything else
+    /// (first use, a rollback, a replaced tip, a gap past the reach): rebuilt from the newest blocks.
+    /// Committed means at or below the durable tip (committed_hash_at): a row a rollback left above it is
+    /// not chain, so it never vouches for blocks that replaced the ones below it.
+    /// Returns the heights visited, at most RECENT_TX_FEED_BLOCKS.
+    fn refresh_recent_tx_feed(&self, feed: &mut Option<RecentTxFeed>, tip: u64) -> u64 {
+        let floor = tip.saturating_sub(RECENT_TX_FEED_BLOCKS - 1);
+        if let Some(f) = feed.as_mut() {
+            let held = self.committed_hash_at(f.tip) == f.tip_hash;
+            // An empty slot at the feed's tip proves nothing about the blocks below it.
+            if held && (tip == f.tip || (tip < f.tip && f.tip_hash.is_some())) {
+                return 0;
+            }
+            if held && f.tip_hash.is_some() && f.tip < tip && tip - f.tip < RECENT_TX_FEED_BLOCKS {
+                let tip_hash = self.committed_hash_at(tip);
+                let (fresh, visited) = self.recent_tx_walk(tip, f.tip + 1, RECENT_TX_FEED_WINDOW);
+                for entry in fresh.into_iter().rev() {
+                    f.entries.push_front(entry);
+                }
+                while f.entries.back().map_or(false, |(h, _)| *h < floor) {
+                    f.entries.pop_back();
+                }
+                f.entries.truncate(RECENT_TX_FEED_WINDOW);
+                f.tip = tip;
+                f.tip_hash = tip_hash;
+                return visited;
+            }
+        }
+        let tip_hash = self.committed_hash_at(tip);
+        let (entries, visited) = self.recent_tx_walk(tip, floor, RECENT_TX_FEED_WINDOW);
+        if crate::node::is_debug() {
+            println!("[DBG][STORAGE] recent_feed_rebuilt tip={} visited={} txs={}", tip, visited, entries.len());
+        }
+        *feed = Some(RecentTxFeed { tip, tip_hash, entries: entries.into() });
+        visited
+    }
+
+    /// One page of the public recent-transactions feed and the feed's size: newest first (height
+    /// descending, and within a block from its last transaction to its first), over the last
+    /// RECENT_TX_FEED_BLOCKS blocks up to `tip`, at most RECENT_TX_FEED_WINDOW transactions in all.
+    /// The work is bounded by those caps and `per_page`, never by the history or the number of accounts:
+    /// at an unchanged tip a request reads only its page's bodies, and a grown tip adds only the new blocks.
+    /// A feed already past `tip` on the same chain serves it without what lies above `tip`. A body missing
+    /// from the tx rows is left out of its page.
+    pub fn recent_transactions_page(&self, tip: u64, page: usize, per_page: usize) -> IntegrationResult<(Vec<Transaction>, usize)> {
+        let skip = page.saturating_sub(1).saturating_mul(per_page);
+        let (hashes, total) = {
+            let mut feed = self.recent_tx_feed.lock();
+            self.refresh_recent_tx_feed(&mut feed, tip);
+            match feed.as_ref() {
+                Some(f) => {
+                    let above = f.entries.iter().take_while(|(h, _)| *h > tip).count();
+                    (
+                        f.entries.iter().skip(above).skip(skip).take(per_page).map(|(_, hash)| hash.clone()).collect::<Vec<_>>(),
+                        f.entries.len() - above,
+                    )
+                }
+                None => (Vec::new(), 0),
+            }
+        };
+        let tx_cf = self.persistent.db.cf_handle("transactions")
+            .ok_or_else(|| IntegrationError::StorageError("transactions column family not found".to_string()))?;
+        let mut transactions = Vec::with_capacity(hashes.len());
+        for hash in hashes {
+            let mut key = [0u8; 32];
+            let cached = match hex::decode(&hash) {
+                Ok(b) if b.len() == 32 => { key.copy_from_slice(&b); self.transaction_pool.get_transaction(&key) }
+                _ => None,
+            };
+            if let Some(tx) = cached {
+                transactions.push(tx);
+                continue;
+            }
+            let data = match self.persistent.db.get_cf(&tx_cf, format!("tx_{}", hash).as_bytes())? {
+                Some(d) => d,
+                None => continue,
+            };
+            let data = if data.len() >= 4 && data[0..4] == [0x28, 0xb5, 0x2f, 0xfd] {
+                zstd::decode_all(&data[..]).unwrap_or(data)
+            } else { data };
+            if let Ok(tx) = bincode::deserialize::<Transaction>(&data) {
+                transactions.push(tx);
+            }
+        }
+        Ok((transactions, total))
+    }
+
     /// Block timestamp from the retained header row alone — no tx rows needed, so it survives body
     /// expiry (genesis timing must never depend on reconstructable transactions).
     pub fn block_timestamp_at(&self, height: u64) -> IntegrationResult<Option<u64>> {
@@ -822,5 +981,188 @@ mod header_read_tests {
         assert!(s.load_microblock_header(9).unwrap().is_none(), "no row, no header");
         s.put_microblock_row_for_test(10, b"not a block").unwrap();
         assert!(s.load_microblock_header(10).is_err(), "a present row that decodes in neither form is an error");
+    }
+}
+
+#[cfg(test)]
+mod recent_feed_tests {
+    use super::*;
+
+    fn open() -> (Storage, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = Storage::new(dir.path().to_str().unwrap()).expect("storage init");
+        (storage, dir)
+    }
+
+    fn tx(n: u64) -> Transaction {
+        Transaction {
+            from: format!("sender_{}", n),
+            to: Some(format!("recipient_{}", n)),
+            amount: n,
+            tx_type: qnet_state::TransactionType::Transfer { from: format!("sender_{}", n), to: format!("recipient_{}", n), amount: n },
+            timestamp: 1_700_000_000 + n,
+            hash: format!("{:064x}", n),
+            signature: None,
+            public_key: None,
+            gas_price: 10,
+            gas_limit: 10_000,
+            nonce: n,
+            data: None,
+            dilithium_signature: None,
+            dilithium_public_key: None,
+            chain_id: qnet_state::transaction::QNET_CHAIN_ID,
+        }
+    }
+
+    /// Through the store's own save path (compact row, tx rows, hash index); returns the block hash.
+    fn put(s: &Storage, height: u64, txs: Vec<Transaction>, previous_hash: [u8; 32]) -> [u8; 32] {
+        let mb = qnet_state::MicroBlock {
+            height, timestamp: 1_700_000_000 + height, transactions: txs, producer: "genesis_node_001".to_string(),
+            signature: vec![0u8; 64], merkle_root: [0u8; 32], previous_hash, vrf_output: None, vrf_proof: None,
+            fees_collected: 0, state_root: [0u8; 32], timeout_round: 0, carried_baseline: 0, timeout_proof: None,
+        };
+        s.save_microblock(height, &bincode::serialize(&mb).unwrap()).expect("save");
+        mb.hash()
+    }
+
+    /// A bare compact row of `count` hashes at `height`, its hash-index entry and the durable tip moved to
+    /// it, as a committed save leaves them; for long histories.
+    fn put_row(s: &Storage, height: u64, count: u64, tag: u8) {
+        let hashes = (0..count).map(|i| {
+            let mut h = [tag; 32];
+            h[..8].copy_from_slice(&height.to_be_bytes());
+            h[8..16].copy_from_slice(&i.to_be_bytes());
+            h
+        }).collect();
+        let eb = qnet_state::EfficientMicroBlock::new(height, 1_700_000_000 + height, [0u8; 32], hashes, "super_a".to_string());
+        s.put_microblock_row_for_test(height, &bincode::serialize(&eb).unwrap()).unwrap();
+        let mut id = [tag; 32];
+        id[..8].copy_from_slice(&height.to_be_bytes());
+        s.save_microblock_hash(height, &id).unwrap();
+        s.set_chain_height(height).unwrap();
+    }
+
+    fn hashes(txs: &[Transaction]) -> Vec<String> { txs.iter().map(|t| t.hash.clone()).collect() }
+
+    // Newest first: the higher block first, and inside a block its last transaction first. Pages walk the
+    // feed without overlap, the size is the feed's, and a page past it is empty.
+    #[test]
+    fn the_feed_is_newest_first_and_pages_without_overlap() {
+        let (s, _d) = open();
+        let h1 = put(&s, 1, vec![tx(1), tx(2)], [0u8; 32]);
+        let h2 = put(&s, 2, vec![], h1);
+        let h3 = put(&s, 3, vec![tx(3), tx(4), tx(5)], h2);
+        put(&s, 4, vec![tx(6)], h3);
+        let page = |p| s.recent_transactions_page(4, p, 2).unwrap();
+        assert_eq!(page(1), (vec![tx(6), tx(5)], 6));
+        assert_eq!(hashes(&page(2).0), hashes(&[tx(4), tx(3)]));
+        assert_eq!(hashes(&page(3).0), hashes(&[tx(2), tx(1)]));
+        assert_eq!(page(4), (vec![], 6));
+        assert_eq!(page(usize::MAX).0, vec![], "a huge page number is empty, not an overflow");
+        // An earlier tip serves the chain as it stood there.
+        assert_eq!(hashes(&s.recent_transactions_page(2, 1, 10).unwrap().0), hashes(&[tx(2), tx(1)]));
+    }
+
+    // The heights a build visits stop at the transaction cap or at the block reach, whichever comes first,
+    // and neither grows with the history below them.
+    #[test]
+    fn a_build_visits_a_bounded_number_of_blocks_whatever_the_history() {
+        for history in [1_500u64, 6_000] {
+            let (s, _d) = open();
+            for h in 1..=history { put_row(&s, h, 1, 0x11); }
+            let mut feed = None;
+            assert_eq!(s.refresh_recent_tx_feed(&mut feed, history), RECENT_TX_FEED_WINDOW as u64, "history {}", history);
+            let f = feed.as_ref().unwrap();
+            assert_eq!(f.entries.len(), RECENT_TX_FEED_WINDOW);
+            assert_eq!(f.entries.front().unwrap().0, history);
+            assert_eq!(f.entries.back().unwrap().0, history - RECENT_TX_FEED_WINDOW as u64 + 1);
+        }
+        for history in [4_000u64, 9_000] {
+            let (s, _d) = open();
+            for h in 1..=history { put_row(&s, h, 0, 0x22); }
+            let mut feed = None;
+            assert_eq!(s.refresh_recent_tx_feed(&mut feed, history), RECENT_TX_FEED_BLOCKS, "empty blocks, history {}", history);
+            assert!(feed.as_ref().unwrap().entries.is_empty());
+        }
+        // A tip far above anything stored still visits no more than the reach.
+        let (s, _d) = open();
+        let mut feed = None;
+        assert_eq!(s.refresh_recent_tx_feed(&mut feed, 10_000_000), RECENT_TX_FEED_BLOCKS);
+        // A block holding more than the cap fills the feed with its newest transactions alone.
+        put_row(&s, 7, (RECENT_TX_FEED_WINDOW + 500) as u64, 0x33);
+        let mut feed = None;
+        assert_eq!(s.refresh_recent_tx_feed(&mut feed, 7), 1);
+        assert_eq!(feed.as_ref().unwrap().entries.len(), RECENT_TX_FEED_WINDOW);
+    }
+
+    // Same tip: nothing read. Grown tip on the same chain: only the new blocks. A lower tip on the same
+    // chain (a request that read the height before another advanced the feed): nothing read, and its page
+    // leaves out what lies above it. A rollback or a replaced block at the tip: rebuilt, so no transaction
+    // of an abandoned block stays in the feed.
+    #[test]
+    fn the_feed_follows_the_tip_reading_only_what_changed() {
+        let (s, _d) = open();
+        for h in 1..=20 { put_row(&s, h, 2, 0x44); }
+        let mut feed = None;
+        // A first build visits every height down to genesis here: 15..=0.
+        assert_eq!(s.refresh_recent_tx_feed(&mut feed, 15), 16);
+        assert_eq!(s.refresh_recent_tx_feed(&mut feed, 15), 0, "unchanged tip reads nothing");
+        assert_eq!(s.refresh_recent_tx_feed(&mut feed, 18), 3, "grown tip reads the new blocks only");
+        let f = feed.as_ref().unwrap();
+        assert_eq!((f.entries.len(), f.entries.front().unwrap().0), (36, 18));
+        assert_eq!(s.refresh_recent_tx_feed(&mut feed, 16), 0, "a late request on the same chain reads nothing");
+        assert_eq!(feed.as_ref().unwrap().tip, 18);
+        assert_eq!(s.recent_transactions_page(18, 1, 100).unwrap().1, 36);
+        assert_eq!(s.recent_transactions_page(16, 1, 100).unwrap().1, 32, "the page stops at its own tip");
+
+        // A rollback to 16: the rows above it go, then other blocks take 17 and 18.
+        let meta = s.persistent.db.cf_handle("metadata").unwrap();
+        let bodies = s.persistent.db.cf_handle("microblocks").unwrap();
+        for h in 17..=18u64 {
+            s.persistent.db.delete_cf(&bodies, mb_body_key(h).as_bytes()).unwrap();
+            s.persistent.db.delete_cf(&meta, mb_hash_key(h).as_bytes()).unwrap();
+        }
+        s.set_chain_height(16).unwrap();
+        assert_eq!(s.refresh_recent_tx_feed(&mut feed, 16), 17, "the feed's tip is gone: rebuilt");
+        let f = feed.as_ref().unwrap();
+        assert_eq!((f.entries.len(), f.entries.front().unwrap().0), (32, 16));
+        put_row(&s, 17, 2, 0x66);
+        put_row(&s, 18, 2, 0x66);
+        assert_eq!(s.refresh_recent_tx_feed(&mut feed, 18), 2);
+        let f = feed.as_ref().unwrap();
+        assert!(f.entries.iter().filter(|(h, _)| *h > 16).all(|(_, x)| x.ends_with("66")), "only the new blocks above 16");
+
+        // The block at the tip replaced (another hash at the same height), then the chain grows past it.
+        s.set_chain_height(20).unwrap();
+        assert_eq!(s.refresh_recent_tx_feed(&mut feed, 20), 2);
+        put_row(&s, 20, 1, 0x55);
+        put_row(&s, 21, 1, 0x55);
+        assert_eq!(s.refresh_recent_tx_feed(&mut feed, 21), 22, "the old tip is not the block built on: rebuilt");
+        let f = feed.as_ref().unwrap();
+        assert_eq!(f.entries.len(), 19 * 2 + 2);
+        let at_20: Vec<&String> = f.entries.iter().filter(|(h, _)| *h == 20).map(|(_, x)| x).collect();
+        assert_eq!(at_20.len(), 1, "only the replacing block's transaction at 20");
+        assert!(at_20[0].ends_with("55"), "{}", at_20[0]);
+        assert_eq!(s.refresh_recent_tx_feed(&mut feed, 21), 0);
+    }
+
+    // A rollback that leaves the old tip's row behind (a failed delete, a lowered height marker) and a chain
+    // that regrows below it: the leftover is above the durable tip, so it vouches for nothing, and a request
+    // at the regrown tip gets the replacing blocks, never the abandoned ones.
+    #[test]
+    fn a_row_left_above_the_durable_tip_never_keeps_abandoned_blocks_in_the_feed() {
+        let (s, _d) = open();
+        for h in 1..=20 { put_row(&s, h, 2, 0x44); }
+        let mut feed = None;
+        assert_eq!(s.refresh_recent_tx_feed(&mut feed, 20), 21);
+        s.set_chain_height(15).unwrap();
+        put_row(&s, 16, 2, 0x77);
+        put_row(&s, 17, 2, 0x77);
+        assert_eq!(s.load_microblock_hash(20).unwrap().map(|h| h[31]), Some(0x44), "the old tip's row is still there");
+        assert_eq!(s.refresh_recent_tx_feed(&mut feed, 17), 18, "the old tip is above the durable tip: rebuilt");
+        let f = feed.as_ref().unwrap();
+        assert_eq!((f.tip, f.entries.len()), (17, 34));
+        assert!(f.entries.iter().filter(|(h, _)| *h > 15).all(|(_, x)| x.ends_with("77")), "only the replacing blocks above 15");
+        assert_eq!(s.refresh_recent_tx_feed(&mut feed, 17), 0);
     }
 }

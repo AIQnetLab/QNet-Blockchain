@@ -1,125 +1,53 @@
 #!/bin/bash
+# Web-server hardening for the aiqnet.io host, run after deployment/deploy-aiqnet.sh. It sets http-level
+# nginx options only and never writes a site: /etc/nginx/sites-available/aiqnet.io belongs to
+# deploy-aiqnet.sh alone, whose file carries the QNet Link relay's own location (no access log, the
+# Fetch Metadata refusal, a rate-limit zone of its own), the link host and the redirect-only names
+# (docs/protocols/qnet-link-v1.md sections 5 and 12); applications/qnet-explorer/frontend/src/lib/__tests__/
+# deploy-config.test.mjs keeps every script other than the deploy scripts from writing a site file.
+#
+# Security headers come from the app (applications/qnet-explorer/frontend), not from nginx: next.config.js
+# sends X-Frame-Options, X-Content-Type-Options, Referrer-Policy, Permissions-Policy,
+# Cross-Origin-Opener-Policy and HSTS, and src/proxy.ts sends each page's Content-Security-Policy with a
+# fresh script nonce. A second Content-Security-Policy from nginx would be enforced alongside the app's, and
+# a second copy of the others with a different value would conflict with it.
 
-echo "=== QNet Security Hardening Script ==="
-echo "Applying additional security measures..."
+set -euo pipefail
 
-# 1. Fix Nginx rate limiting configuration
-echo "1. Configuring rate limiting..."
-cat > /etc/nginx/conf.d/rate-limiting.conf << 'EOF'
-# Rate limiting zones
-limit_req_zone $binary_remote_addr zone=general:10m rate=10r/s;
-limit_req_zone $binary_remote_addr zone=api:10m rate=5r/s;
-EOF
+SITE_FILE=/etc/nginx/sites-available/aiqnet.io
 
-# 2. Update security headers
-echo "2. Configuring security headers..."
-cat > /etc/nginx/snippets/security-headers.conf << 'EOF'
-# Security Headers
-add_header X-Frame-Options "SAMEORIGIN" always;
-add_header X-XSS-Protection "1; mode=block" always;
-add_header X-Content-Type-Options "nosniff" always;
-add_header Referrer-Policy "strict-origin-when-cross-origin" always;
-add_header Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; connect-src 'self' https:; frame-ancestors 'none';" always;
-add_header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload" always;
-add_header Permissions-Policy "geolocation=(), microphone=(), camera=()" always;
+echo "=== QNet web-server hardening ==="
 
-# Hide Nginx version
+# 1. The site file must be the deploy script's: refuse to go on over one without the relay's rules.
+echo "1. Checking the site file written by deployment/deploy-aiqnet.sh..."
+if [ ! -f "$SITE_FILE" ]; then
+    echo "✗ $SITE_FILE is missing: run step 3 of deployment/deploy-aiqnet.sh first." >&2
+    exit 1
+fi
+for rule in 'location ^~ /api/link/ {' 'access_log off;' 'if ($aiqnet_cross_fetch) {' 'zone=aiqnet_link' 'server_name link.aiqnet.io;'; do
+    if ! grep -qF -- "$rule" "$SITE_FILE"; then
+        echo "✗ $SITE_FILE lacks '$rule': it is not the file deployment/deploy-aiqnet.sh writes." >&2
+        echo "  Replace it with the file of step 3 of deploy-aiqnet.sh, then run this script again." >&2
+        exit 1
+    fi
+done
+
+# 2. http-level options, in conf.d (included in the http context): the nginx version stays out of every
+# answer and error page.
+echo "2. Hiding the nginx version..."
+cat > /etc/nginx/conf.d/security-hardening.conf << 'EOF'
+# scripts/security_hardening.sh: http-level options only. Sites are written by deployment/deploy-aiqnet.sh.
 server_tokens off;
 EOF
 
-# 3. Create improved site configuration
-echo "3. Updating site configuration..."
-cat > /etc/nginx/sites-available/aiqnet.io << 'EOF'
-server {
-    listen 80;
-    server_name aiqnet.io www.aiqnet.io;
-    return 301 https://$server_name$request_uri;
-}
-
-server {
-    listen 443 ssl http2;
-    server_name aiqnet.io www.aiqnet.io;
-
-    # SSL Configuration
-    ssl_certificate /etc/letsencrypt/live/aiqnet.io/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/aiqnet.io/privkey.pem;
-
-    # SSL Security
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers ECDHE-RSA-AES256-GCM-SHA512:DHE-RSA-AES256-GCM-SHA512:ECDHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES256-GCM-SHA384;
-    ssl_prefer_server_ciphers off;
-    ssl_session_cache shared:SSL:10m;
-    ssl_session_timeout 10m;
-
-    # Include security headers
-    include /etc/nginx/snippets/security-headers.conf;
-
-    # Rate limiting
-    limit_req zone=general burst=20 nodelay;
-
-    # Block common attack patterns
-    location ~* \.(php|asp|exe|pl|cgi|scgi)$ {
-        return 444;
-    }
-
-    # Block access to sensitive files
-    location ~* \.(env|git|svn|htaccess|htpasswd)$ {
-        return 444;
-    }
-
-    # Block admin panels and common attack paths
-    location ~* /(admin|wp-admin|phpmyadmin|adminer|config|\.git) {
-        return 444;
-    }
-
-    # Main application
-    location / {
-        proxy_pass http://localhost:3000;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection 'upgrade';
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_cache_bypass $http_upgrade;
-
-        # Security
-        proxy_hide_header X-Powered-By;
-    }
-
-    # API rate limiting
-    location /api/ {
-        limit_req zone=api burst=10 nodelay;
-        
-        proxy_pass http://localhost:3000;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection 'upgrade';
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_cache_bypass $http_upgrade;
-    }
-}
-EOF
-
-# 4. Test and apply configuration
-echo "4. Testing and applying configuration..."
+# 3. Test and apply.
+echo "3. Testing and applying the configuration..."
 if nginx -t; then
-    echo "✓ Nginx configuration is valid"
     systemctl reload nginx
-    echo "✓ Nginx reloaded successfully"
+    echo "✓ nginx reloaded"
 else
-    echo "✗ Nginx configuration error!"
+    echo "✗ nginx configuration error: nothing was reloaded" >&2
     exit 1
 fi
 
-echo "=== Security Hardening Complete ==="
-echo "✓ Rate limiting configured"
-echo "✓ Security headers applied"
-echo "✓ Attack patterns blocked"
-echo "✓ Nginx configuration updated"
-echo ""
-echo "Site is secured and ready for production!" 
+echo "=== Hardening complete: nginx version hidden; the site file of deploy-aiqnet.sh left as it is ==="

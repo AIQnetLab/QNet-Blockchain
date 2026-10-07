@@ -1,5 +1,8 @@
 'use client';
 
+// The site's background: falling cyan characters behind every page, My node's included (owner, 04.10); the panels of a
+// page are drawn over it, opaque and blurred, so the text stays readable.
+
 import { useRef, useEffect, useCallback } from 'react';
 
 const MatrixRain = () => {
@@ -9,7 +12,7 @@ const MatrixRain = () => {
     // Semi-transparent black for trailing effect
     ctx.fillStyle = 'rgba(0, 0, 0, 0.05)';
     ctx.fillRect(0, 0, ctx.canvas.width, ctx.canvas.height);
-    
+
     ctx.font = `${fontSize}px 'Courier New', monospace`;
 
     for (let i = 0; i < drops.length; i++) {
@@ -21,9 +24,9 @@ const MatrixRain = () => {
 
       // All characters are cyan
       ctx.fillStyle = `rgba(0, 255, 255, ${flickerIntensity})`;
-      
+
       ctx.fillText(char, x, y);
-      
+
       // Move drop down
       drops[i] += speeds[i];
 
@@ -38,7 +41,7 @@ const MatrixRain = () => {
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    
+
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
@@ -60,18 +63,18 @@ const MatrixRain = () => {
         speeds[i] = 0.5 + Math.random() * 1.5;
       }
     };
-    
+
     setup();
 
     const render = () => {
       draw(ctx, drops, fontSize, matrix, speeds);
       animationFrameId = window.requestAnimationFrame(render);
     };
-    
+
     render();
-    
+
     window.addEventListener('resize', setup);
-    
+
     return () => {
       window.cancelAnimationFrame(animationFrameId);
       window.removeEventListener('resize', setup);
@@ -97,4 +100,4 @@ const MatrixRain = () => {
   );
 };
 
-export default MatrixRain; 
+export default MatrixRain;

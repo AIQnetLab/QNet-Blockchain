@@ -280,7 +280,7 @@ def claim():
         # holds no key and has no post-quantum signer, so it cannot produce either. Say so plainly
         # instead of posting a request the node will reject.
         click.echo("❌ Claiming requires your wallet's ML-DSA-65 key, which this CLI does not hold.", err=True)
-        click.echo(f"   Claim from the QNet wallet app, or via @qnet/sdk claimRewards() with a signer.")
+        click.echo("   Claim from the QNet wallet app.")
         click.echo(f"   Node: {config.node_url}  node_id: {node_id}  wallet: {wallet_address}")
             
     except Exception as e:

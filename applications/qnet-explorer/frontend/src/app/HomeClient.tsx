@@ -3,6 +3,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { useChainHead } from '@/hooks/useChainHead';
 import Link from 'next/link';
+import { ANDROID_PLAY_URL } from '@/lib/app-links';
 
 interface NetworkStats {
   activeNodes: number;
@@ -67,13 +68,14 @@ export default function HomeClient({ initialStats }: HomeClientProps) {
           <div className="hero-text">
             <h1 className="hero-title">
               <span className="title-main">Quantum Network</span>
-              <span className="subtitle">Experimental AI-developed blockchain built by one person</span>
+              <span className="subtitle">An experimental blockchain designed by one person and built with AI assistance</span>
             </h1>
-            
+
             <div className="hero-description">
               <p>
-                No funding. No team. No corporate backing. Just pure determination to prove that 
-                a single developer can build a quantum-resistant blockchain that challenges the entire industry.
+                No funding. No team. No corporate backing. The architecture and every protocol decision are one
+                person&apos;s; the code is written with AI tools under that direction — to prove that a single
+                developer can build a quantum-resistant blockchain that challenges the entire industry.
               </p>
             </div>
             
@@ -96,9 +98,9 @@ export default function HomeClient({ initialStats }: HomeClientProps) {
             </div>
             <div className="stat-card">
               <div className="stat-number">{stats?.currentRound !== undefined ? stats.currentRound : '—'}</div>
-              <div className="stat-label">REWARD EPOCH</div>
+              <div className="stat-label">EPOCH</div>
               <div className="stat-trend">
-                {stats ? `Next: ${String(stats.blocksUntilReward).replace(/\B(?=(\d{3})+(?!\d))/g, ',')} blocks (${formatTimeRemaining(stats.secondsUntilReward)})` : 'Loading...'}
+                {stats ? `Ends in: ${String(stats.blocksUntilReward).replace(/\B(?=(\d{3})+(?!\d))/g, ',')} blocks (${formatTimeRemaining(stats.secondsUntilReward)})` : 'Loading...'}
               </div>
             </div>
             <div className="stat-card">
@@ -129,7 +131,7 @@ export default function HomeClient({ initialStats }: HomeClientProps) {
 
       <section className="features-section" style={{ marginTop: '1rem' }}>
         <div className="section-header">
-          <h2 className="section-title">Revolutionary Features</h2>
+          <h2 className="section-title">Features</h2>
         </div>
         
         <div className="features-grid">
@@ -158,8 +160,8 @@ export default function HomeClient({ initialStats }: HomeClientProps) {
             </div>
             <h3>Post-Quantum Cryptography</h3>
             <p>
-              ML-DSA-65 (NIST FIPS 204) quantum signatures. 31/31 crypto tests passed (100% perfect). 
-              NIST-approved algorithms protecting against quantum computing threats.
+              ML-DSA-65 (NIST FIPS 204) signatures on every transaction and consensus message, ML-KEM-768
+              (FIPS 203) key exchange between nodes. NIST-standardised algorithms against quantum computing threats.
             </p>
           </div>
           
@@ -213,8 +215,8 @@ export default function HomeClient({ initialStats }: HomeClientProps) {
             </div>
             <h3>Pool #3</h3>
             <p>
-              When users pay QNC to activate Phase 2 nodes, their QNC goes to Pool #3 
-              which redistributes rewards to ALL active nodes. Everyone benefits from network growth!
+              In Phase 2 the QNC spent on activation goes to Pool #3, which is shared among all
+              active nodes. None of it goes to the publisher.
             </p>
           </div>
           
@@ -237,8 +239,8 @@ export default function HomeClient({ initialStats }: HomeClientProps) {
             </div>
             <h3>Reputation-Based Security</h3>
             <p>
-              No token locking or slashing! Security through reputation scoring (0-100). 
-              Full liquidity maintained while ensuring network security through behavior-based trust.
+              No token locking, no slashing of funds. A node that signs two conflicting blocks is proven on
+              chain and excluded from consensus; everyone else keeps full liquidity and an equal say.
             </p>
           </div>
           
@@ -261,8 +263,9 @@ export default function HomeClient({ initialStats }: HomeClientProps) {
             </div>
             <h3>Mobile-First Design</h3>
             <p>
-              NOT MINING certified! Simple ping responses every 4 hours. 
-              Battery usage like messaging apps. iOS/Android store ready with hardware security.
+              A phone or tablet runs a light node by signing a periodic status request. No hashing and no proof-of-work:
+              each answer is one signature, so the device does no sustained work. Keys live in the hardware-backed
+              keystore of the device.
             </p>
           </div>
           <div className="feature-card premium">
@@ -284,8 +287,8 @@ export default function HomeClient({ initialStats }: HomeClientProps) {
             </div>
             <h3>Radical Transparency</h3>
             <p>
-              Every single line of code is on GitHub under MIT license. App Store & Play Store apps are 
-              100% open source. Verifiable builds ensure live version matches public code.
+              Every line of code is public on GitHub: the wallet apps and the explorer under Apache-2.0, the node
+              under the Business Source License 1.1. Verifiable builds ensure the live version matches public code.
             </p>
           </div>
         </div>
@@ -295,30 +298,26 @@ export default function HomeClient({ initialStats }: HomeClientProps) {
         <div className="section-header">
           <h2 className="section-title">Mobile-First Blockchain</h2>
           <p className="section-subtitle">
-            World's first blockchain designed for mobile devices - NOT mining!
+            A blockchain designed for phones: participation is a signed answer, not proof-of-work
           </p>
         </div>
-        
+
         <div className="technology-grid expanded">
           <div className="tech-item">
-            <h4 className="tech-title">NOT Mining Certified</h4>
-            <p>Simple ping responses every 4 hours. &lt;1 second processing, &lt;0.01% battery usage. No CPU/GPU mining, no device heating.</p>
+            <h4 className="tech-title">Presence, Not Proof-of-Work</h4>
+            <p>A light node answers a signed status request from the network a few times per four-hour epoch. Between requests the app only sends one signed attestation per epoch. No hashing and no proof-of-work: each answer is one signature, so the phone does no sustained work.</p>
           </div>
           <div className="tech-item">
-            <h4 className="tech-title">iOS App Store Ready</h4>
-            <p>1.2s launch time, 23MB memory, Hardware Keychain integration. TestFlight ready for July 2025 submission.</p>
-          </div>
-          <div className="tech-item">
-            <h4 className="tech-title">Android Play Store Ready</h4>
-            <p>1.4s launch time, 28MB memory, Target API 34 (Android 14). Doze mode optimized, AAB package ready.</p>
+            <h4 className="tech-title">One App on Every Phone and Tablet</h4>
+            <p>The same app and the same screens on iPhone, iPad and Android phones and tablets: silent push wake-ups for status requests, and an unlock with Face ID, Touch ID, a fingerprint or the device passcode, or an app password on a device without them. On <a href={ANDROID_PLAY_URL} target="_blank" rel="noopener noreferrer">Google Play</a> now; the App Store listing is in preparation.</p>
           </div>
           <div className="tech-item">
             <h4 className="tech-title">Hardware-Backed Security</h4>
-            <p>iOS Keychain & Android Keystore integration. Post-quantum keys stored in secure hardware enclaves.</p>
+            <p>Post-quantum keys are encrypted at rest and protected by the system keystore. A light node is bound to one device by a key in its secure hardware: one device runs one node, and computers and emulators run none.</p>
           </div>
           <div className="tech-item">
-            <h4 className="tech-title">Ping-Based Participation</h4>
-            <p>Every 4 hours network ping with cryptographic proof. Rewards from two pools: Base Emission and Pool #3 activation benefits.</p>
+            <h4 className="tech-title">How Emission Is Split</h4>
+            <p>For each epoch the chain records which nodes were online. The protocol adds a share of that epoch&apos;s emission to their node balance — three quarters among light nodes, one quarter among super nodes — and the wallet moves it into itself with an ordinary transaction.</p>
           </div>
           <div className="tech-item">
             <h4 className="tech-title">11 Languages Supported</h4>
@@ -331,46 +330,46 @@ export default function HomeClient({ initialStats }: HomeClientProps) {
         <div className="section-header">
           <h2 className="section-title">Economic Model V2 - Sharp Drop Halving</h2>
           <p className="section-subtitle">
-            Revolutionary two-phase system with Pool #3 activation benefits
+            Two activation phases and two reward pools
           </p>
         </div>
         
         <div className="technology-grid expanded">
           <div className="tech-item">
             <h4 className="tech-title">Phase 1: 1DEV Burn (Current)</h4>
-            <p>1DEV tokens are BURNED on Solana for node activation. 1,500 1DEV burn for any node type. Price decreases with burn progress. Transition at 90% burned OR 5 years.</p>
+            <p>1DEV tokens are burned on Solana for node activation. 1,500 1DEV burn for any node type; the amount decreases as the supply burns. The tokens are destroyed and nobody receives them. Transition at 90% burned OR 5 years.</p>
           </div>
           <div className="tech-item">
             <h4 className="tech-title">Phase 2: QNC to Pool #3 (Future)</h4>
-            <p>QNC tokens are SENT TO POOL #3 for node activation. DYNAMIC PRICING v3.18: Light(10k-30k), Super(7.5k-22.5k) QNC based on network size → Pool #3 → redistributed to ALL active nodes!</p>
+            <p>Activation spends QNC, which goes to Pool #3 and is redistributed to all active nodes. The amount scales with network size; the exact schedule is set before Phase 2 opens.</p>
           </div>
           <div className="tech-item">
             <h4 className="tech-title">Sharp Drop Halving Innovation</h4>
-            <p>Years 0-20: Standard ÷2 every 4 years | Years 20-24: Sharp drop ÷10 | Years 24+: Resume from low base. Saves 107M QNC!</p>
+            <p>Years 0-20: Standard ÷2 every 4 years | Years 20-24: Sharp drop ÷10 | Years 24+: Resume from low base.</p>
           </div>
           <div className="tech-item">
-            <h4 className="tech-title">Dynamic Activation Pricing</h4>
-            <p>Network size multipliers: 0-100K nodes (0.5x discount), 100K-300K (1.0x standard), 300K-1M (2.0x), 1M+ (3.0x premium). ALL fees → Pool #3!</p>
+            <h4 className="tech-title">Activation Amount by Network Size</h4>
+            <p>Network size multipliers: 0-100K nodes 0.5x, 100K-300K 1.0x, 300K-1M 2.0x, 1M+ 3.0x. Every Phase 2 activation goes to Pool #3.</p>
           </div>
           <div className="tech-item">
-            <h4 className="tech-title">Three Reward Pools</h4>
-            <p>1. Base Emission (halving schedule) | 2. Activation Pool #3 (ALL nodes benefit from Phase 2 activations)</p>
+            <h4 className="tech-title">Two Reward Pools</h4>
+            <p>1. Base emission on the halving schedule, split each epoch among the nodes recorded as online | 2. Pool #3, fed by Phase 2 activations and shared by all active nodes. Transaction fees go to the block producer.</p>
           </div>
           <div className="tech-item">
-            <h4 className="tech-title">Hybrid Post-Quantum Cryptography</h4>
-            <p>Dilithium2 + Ed25519 dual-signature system. Best of both worlds: quantum-resistant + high-performance. Future-proof security architecture.</p>
+            <h4 className="tech-title">Post-Quantum Throughout</h4>
+            <p>Signatures: ML-DSA-65 only — for wallets, nodes and consensus alike. Transport between nodes: TLS 1.3 over QUIC with hybrid X25519 + ML-KEM-768 key exchange, authenticated with ML-DSA-65.</p>
           </div>
           <div className="tech-item">
-            <h4 className="tech-title">Reputation-Based Consensus</h4>
-            <p>Score range 0-100. No token locking. Double-sign detection with automatic penalties. Mobile-friendly security.</p>
+            <h4 className="tech-title">Equivocation Is Final</h4>
+            <p>No token locking. Producers and committees are drawn by verifiable randomness from all eligible nodes; a signed proof of double-signing, recorded on chain, removes the offender from every future draw.</p>
           </div>
           <div className="tech-item">
-            <h4 className="tech-title">Rate Limiting & DDoS Protection</h4>
-            <p>Token bucket system: 30 requests/minute per peer. Real-time spam detection. Regional load balancing across 6 continents.</p>
+            <h4 className="tech-title">Rate Limiting</h4>
+            <p>Per-address limits by request class — 100 transactions and 300 reads a minute, 5 activations an hour — and a bounded pool for signature verification, so a flood of requests cannot starve consensus.</p>
           </div>
           <div className="tech-item">
-            <h4 className="tech-title">Cross-Chain Integration</h4>
-            <p>Solana SPL token (1DEV) bridge for Phase 1 activation. Seamless transition to native QNC in Phase 2 with Pool #3 benefits.</p>
+            <h4 className="tech-title">Phase 1 on Solana</h4>
+            <p>Activation burns 1DEV, an SPL token, on Solana; QNet nodes verify the burn transaction themselves. No bridge and no wrapped assets — Phase 2 moves activation to native QNC.</p>
           </div>
         </div>
       </section>

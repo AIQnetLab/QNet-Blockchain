@@ -3,7 +3,7 @@
 use dashmap::{DashMap, DashSet};
 use std::sync::Arc;
 use parking_lot::RwLock;
-use std::collections::{VecDeque, BTreeMap};
+use std::collections::{BTreeMap, HashMap};
 use serde::{Serialize, Deserialize};
 use serde_json;
 use bincode;
@@ -52,6 +52,83 @@ impl TxStorage {
 /// closed on either bound and the client resubmits.
 const MAX_MEMPOOL_BYTES: usize = 512 * 1024 * 1024;
 
+/// The pool's order: highest priority first, FIFO within one priority (an arrival sequence), with a hash
+/// index so a removal, a replacement or a membership check touches one entry in O(log n) instead of
+/// scanning every queued hash under the write lock. A hash is queued at most once.
+#[derive(Default)]
+struct PriorityQueue {
+    levels: BTreeMap<u64, BTreeMap<u64, String>>,
+    index: HashMap<String, (u64, u64)>,
+    next_seq: u64,
+}
+
+impl PriorityQueue {
+    /// Queue `hash` at `priority` behind everything already there. A hash already queued stays where it is.
+    fn push_back(&mut self, priority: u64, hash: String) {
+        if self.index.contains_key(&hash) {
+            return;
+        }
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1);
+        self.index.insert(hash.clone(), (priority, seq));
+        self.levels.entry(priority).or_default().insert(seq, hash);
+    }
+
+    /// Drop `hash` from the queue; false when it was not queued.
+    fn remove(&mut self, hash: &str) -> bool {
+        let Some((priority, seq)) = self.index.remove(hash) else { return false };
+        if let Some(level) = self.levels.get_mut(&priority) {
+            level.remove(&seq);
+            if level.is_empty() {
+                self.levels.remove(&priority);
+            }
+        }
+        true
+    }
+
+    fn contains_at(&self, priority: u64, hash: &str) -> bool {
+        self.index.get(hash).map_or(false, |(p, _)| *p == priority)
+    }
+
+    fn has_level(&self, priority: u64) -> bool {
+        self.levels.contains_key(&priority)
+    }
+
+    fn len(&self) -> usize {
+        self.index.len()
+    }
+
+    fn level_count(&self) -> usize {
+        self.levels.len()
+    }
+
+    fn clear(&mut self) {
+        self.levels.clear();
+        self.index.clear();
+    }
+
+    fn lowest_priority(&self) -> Option<u64> {
+        self.levels.keys().next().copied()
+    }
+
+    /// Take the oldest hash of the lowest priority.
+    fn pop_lowest(&mut self) -> Option<(u64, String)> {
+        let priority = self.lowest_priority()?;
+        let level = self.levels.get_mut(&priority)?;
+        let (_, hash) = level.pop_first()?;
+        if level.is_empty() {
+            self.levels.remove(&priority);
+        }
+        self.index.remove(&hash);
+        Some((priority, hash))
+    }
+
+    /// Every queued hash, highest priority first, oldest first within a priority.
+    fn iter_desc(&self) -> impl Iterator<Item = (u64, &String)> + '_ {
+        self.levels.iter().rev().flat_map(|(p, level)| level.values().map(move |h| (*p, h)))
+    }
+}
+
 /// Optimized mempool implementation with binary support and priority queue
 /// ARCHITECTURE: Priority-based transaction ordering for spam protection
 pub struct SimpleMempool {
@@ -60,9 +137,9 @@ pub struct SimpleMempool {
     /// Payload bytes currently held; maintained ONLY via tx_store_insert /
     /// tx_store_remove / clear so no removal path can leak the counter.
     total_bytes: Arc<std::sync::atomic::AtomicUsize>,
-    // PRODUCTION: Priority queue (BTreeMap) sorted by gas_price descending
-    // Key: gas_price (u64), Value: FIFO queue of tx hashes at that price
-    by_gas_price: Arc<RwLock<BTreeMap<u64, VecDeque<String>>>>,
+    // PRODUCTION: Priority queue sorted by gas_price descending, FIFO within one price, with a hash index
+    // so every removal (a commitment replacement among them) touches one entry, not the whole queue.
+    by_gas_price: Arc<RwLock<PriorityQueue>>,
     use_binary: bool, // Toggle for binary storage
     // PROTOCOL-LEVEL: TX hashes confirmed in recent blocks (prevents re-inclusion after gossip)
     // Analogous to processed transaction signatures - standard L1 mechanism
@@ -126,6 +203,38 @@ pub struct SimpleMempool {
     // joiners who never submitted never enter it) AND the deterministic inclusion lane (iterate this
     // set directly, O(pending regs) not O(system bucket)). Maintained in lockstep with commitment_index.
     pending_registration_hashes: Arc<DashSet<String>>,
+
+    /// One pending slashing proof per offender (Transaction::slashed_offender), the first one kept. A proof is
+    /// verified before it is pooled and its ban is write-once, so a second adds nothing, while each copy is
+    /// fee-free at top priority: keyed by hash only, distinct-hash copies of one proof filled the pool and
+    /// pushed paying TXs out. Offender -> hash; cleared with the commitment indices on every removal path.
+    evidence_index: Arc<DashMap<String, String>>,
+    /// Reverse of `evidence_index`: hash -> offender.
+    evidence_reverse: Arc<DashMap<String, String>>,
+
+    /// One pending value TX per (from, nonce): (hash, gas_price) of the version kept. A value TX's timestamp
+    /// is in its hash but outside its signature, so a relay could re-stamp one pending transfer into
+    /// thousands of distinct-hash copies, each passing every check, filling the sender's quota and the
+    /// producer's pull while only one can land. A later version is taken only when it pays more (a
+    /// replacement the sender signed); the lower-priced one then leaves the pool.
+    value_nonce_index: Arc<DashMap<(String, u64), (String, u64)>>,
+    /// Reverse of `value_nonce_index`: hash -> (from, nonce).
+    value_nonce_reverse: Arc<DashMap<String, (String, u64)>>,
+}
+
+/// Per-sender quota namespace for system TXs. A system TX pays no fee and on several nothing signs `from`,
+/// so counted in the named wallet's own bucket, relayed copies could fill it and shut that wallet out of the
+/// pool. No address a user TX may carry starts with this.
+const SYSTEM_QUOTA_PREFIX: &str = "system_tx:";
+
+/// Outcome of `claim_sender_slot`.
+enum SlotClaim {
+    /// The slot is this attempt's (or the TX has no sender to count).
+    Claimed,
+    /// A concurrent admission of the same bytes holds it; that admission owns every claim they share.
+    Twin,
+    /// The sender's bucket is full.
+    OverQuota,
 }
 
 /// Finalized marks are pruned when the first mark crosses a boundary of this many blocks (one
@@ -173,7 +282,8 @@ impl SimpleMempool {
             ("mp_sender_map", self.tx_sender_map.len() as u64),
             ("mp_commitments", self.commitment_index.len() as u64),
             ("mp_finalized_marks", self.committed_epochs_cache.len() as u64),
-            ("mp_gas_levels", self.by_gas_price.read().len() as u64),
+            ("mp_evidence", self.evidence_index.len() as u64),
+            ("mp_gas_levels", self.by_gas_price.read().level_count() as u64),
         ]
     }
 
@@ -189,7 +299,7 @@ impl SimpleMempool {
             config,
             transactions: Arc::new(DashMap::new()),
             total_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            by_gas_price: Arc::new(RwLock::new(BTreeMap::new())),
+            by_gas_price: Arc::new(RwLock::new(PriorityQueue::default())),
             use_binary,
             included_tx_hashes: Arc::new(DashMap::new()),
             tx_timestamps: DashMap::new(),
@@ -207,6 +317,36 @@ impl SimpleMempool {
             committed_epochs_cache: Arc::new(DashMap::new()),
             marks_pruned_step: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             pending_registration_hashes: Arc::new(DashSet::new()),
+            evidence_index: Arc::new(DashMap::new()),
+            evidence_reverse: Arc::new(DashMap::new()),
+            value_nonce_index: Arc::new(DashMap::new()),
+            value_nonce_reverse: Arc::new(DashMap::new()),
+        }
+    }
+
+    /// Whether a slashing proof against `offender` is pooled. O(1): the doors ask before the two ML-DSA
+    /// verifies a proof costs.
+    pub fn has_pending_evidence_against(&self, offender: &str) -> bool {
+        self.evidence_index.contains_key(offender)
+    }
+
+    /// Claims `offender`'s single evidence slot for `hash`; false when a proof already holds it.
+    fn register_evidence(&self, offender: &str, hash: &str) -> bool {
+        use dashmap::mapref::entry::Entry;
+        match self.evidence_index.entry(offender.to_string()) {
+            Entry::Occupied(_) => false,
+            Entry::Vacant(e) => {
+                e.insert(hash.to_string());
+                self.evidence_reverse.insert(hash.to_string(), offender.to_string());
+                true
+            }
+        }
+    }
+
+    /// Releases a slot claimed this admission attempt by a TX that never entered storage.
+    fn rollback_evidence_registration(&self, offender: &str, hash: &str) {
+        if self.evidence_index.remove_if(offender, |_, current| current == hash).is_some() {
+            self.evidence_reverse.remove(hash);
         }
     }
 
@@ -347,23 +487,14 @@ impl SimpleMempool {
         // and either ordering converges on a consistent state.
         if let Some(ref old) = old_hash {
             self.commitment_reverse.remove(old);
+            // Storage goes under the queue lock the insert holds: an old version still being admitted
+            // either finds its successor in the index there and drops itself, or is stored first and
+            // removed here. Removed outside the lock, it could be stored after its removal and stay.
+            let mut priority_queue = self.by_gas_price.write();
             self.tx_store_remove(old);
             self.tx_timestamps.remove(old);
-            if let Some((_, sender)) = self.tx_sender_map.remove(old) {
-                if let Some(mut count) = self.tx_count_by_sender.get_mut(&sender) {
-                    *count = count.saturating_sub(1);
-                }
-            }
-            // Priority-queue cleanup must hold the outer write lock because
-            // `by_gas_price` is the linearisation point for the producer's
-            // pull path. Brief contention here (only on commitment retries)
-            // is acceptable; commitments are at most one per validator per
-            // epoch boundary.
-            let mut priority_queue = self.by_gas_price.write();
-            for (_gas_price, hashes) in priority_queue.iter_mut() {
-                hashes.retain(|h| h != old);
-            }
-            priority_queue.retain(|_, hashes| !hashes.is_empty());
+            self.decrement_sender_for_hash(old);
+            priority_queue.remove(old);
             drop(priority_queue);
 
             // v15.9: persistent mempool — the prior commitment was just
@@ -377,13 +508,13 @@ impl SimpleMempool {
         old_hash
     }
 
-    /// Remove any commitment-dedup index entries pointing at this hash.
+    /// Remove any commitment-dedup or evidence-dedup index entries pointing at this hash.
     /// Called from every TX-removal path so that the dedup tables stay
     /// proportionate to live mempool occupancy. The `remove_if` guard on
     /// the forward index prevents accidental removal of a NEWER replacement
     /// that happens to share the same key — only the entry whose value
     /// equals `hash` is cleared.
-    fn cleanup_commitment_indices_for_hash(&self, hash: &str) {
+    fn cleanup_dedup_indices_for_hash(&self, hash: &str) {
         if let Some((_, key)) = self.commitment_reverse.remove(hash) {
             // Drop from the backlog set only when the forward entry is truly gone (a replacement race
             // leaves the key live under a newer hash — still-resident registration, keep it).
@@ -393,20 +524,183 @@ impl SimpleMempool {
                 self.pending_registration_hashes.remove(hash);
             }
         }
+        if let Some((_, offender)) = self.evidence_reverse.remove(hash) {
+            self.evidence_index.remove_if(&offender, |_, current| current == hash);
+        }
+        if let Some((_, key)) = self.value_nonce_reverse.remove(hash) {
+            self.value_nonce_index.remove_if(&key, |_, current| current.0 == hash);
+        }
     }
 
-    /// Roll back a commitment registration made this admission attempt (count-rejected TX that never
-    /// entered storage). Mirrors cleanup_commitment_indices_for_hash so the backlog set stays in
-    /// lockstep with commitment_index.
+    /// The (from, nonce) slot of a value TX, None for any other TX.
+    fn value_nonce_key(tx: &Transaction) -> Option<(String, u64)> {
+        (tx.is_value_class() && !tx.from.is_empty()).then(|| (tx.from.clone(), tx.nonce))
+    }
+
+    /// The version pooled for `tx`'s (from, nonce) when it keeps `tx` out: another hash paying at least as
+    /// much. Returns that version's hash. O(1): the doors ask before any signature verify, so a re-stamped
+    /// copy of a pending transfer costs one map lookup.
+    pub fn value_nonce_holder(&self, tx: &Transaction) -> Option<String> {
+        self.value_nonce_blocker(tx, &tx.hash)
+    }
+
+    fn value_nonce_blocker(&self, tx: &Transaction, hash: &str) -> Option<String> {
+        let key = Self::value_nonce_key(tx)?;
+        let held = self.value_nonce_index.get(&key)?;
+        let (held_hash, gas_price) = held.value();
+        (held_hash != hash && *gas_price >= tx.gas_price).then(|| held_hash.clone())
+    }
+
+    /// The hash of the value TX pending for (from, nonce), if one is (O15: a wallet finds the copy of what it
+    /// signed that is pending, whatever hash that copy carries).
+    pub fn pending_value_hash(&self, from: &str, nonce: u64) -> Option<String> {
+        self.value_nonce_index.get(&(from.to_string(), nonce)).map(|e| e.value().0.clone())
+    }
+
+    /// Decode the pooled TX stored under `hash` (bincode, or the JSON the raw path may keep).
+    pub fn pooled_transaction(&self, hash: &str) -> Option<Transaction> {
+        let stored = self.transactions.get(hash)?;
+        let bytes: &[u8] = match stored.value() {
+            TxStorage::Json(j) => j.as_bytes(),
+            TxStorage::Binary(b) => b.as_slice(),
+        };
+        bincode::deserialize::<Transaction>(bytes).ok()
+            .or_else(|| serde_json::from_slice::<Transaction>(bytes).ok())
+    }
+
+    /// A commitment TX that differs from the version pooled for its key only in envelope fields no signature
+    /// covers: same sender, body, payload, signature and key, another hash. It is a relay's copy minted from
+    /// the pending one (below the tx_target_bound gate nothing pins those fields), and the doors refuse it
+    /// before any verify. An honest re-sign carries fresh ML-DSA randomness, so it is never one.
+    pub fn is_relayed_commitment_copy(&self, tx: &Transaction) -> bool {
+        let Some(key) = tx.commitment_dedup_key() else { return false };
+        let Some(hash) = self.commitment_index.get(&key).map(|h| h.value().clone()) else { return false };
+        if hash == tx.hash {
+            return false;
+        }
+        self.pooled_transaction(&hash).map_or(false, |p| {
+            p.from == tx.from && p.tx_type == tx.tx_type && p.data == tx.data
+                && p.dilithium_signature == tx.dilithium_signature && p.dilithium_public_key == tx.dilithium_public_key
+        })
+    }
+
+    /// Roll back a commitment registration made this admission attempt by a TX that never entered
+    /// storage. The index entry goes only while it still names `hash`; the backlog set and the reverse
+    /// entry go regardless, since `hash` will not be stored (a successor's replacement may have run
+    /// before this attempt filed them).
     fn rollback_commitment_registration(&self, key: &(String, u64, u8), hash: &str) {
-        if self.commitment_index.remove_if(key, |_, current| current == hash).is_some()
-            && key.2 == 4
-        {
+        self.commitment_index.remove_if(key, |_, current| current == hash);
+        if key.2 == 4 {
             self.pending_registration_hashes.remove(hash);
         }
         self.commitment_reverse.remove(hash);
     }
-    
+
+    /// True when `key` already names a version, which this admission replaces one for one. It needs no
+    /// room, so a full pool must not evict for it: on the commitment classes a relay can mint copies
+    /// from fields no signature covers, and each would displace a paying TX for free. A version still
+    /// being admitted counts: it is either stored before this one replaces it, or finds itself replaced
+    /// at its insert and drops. So does this very hash, held by a twin admission that already made its
+    /// room: this attempt then either finds the twin's quota slot and stops, or stores in its place.
+    fn commitment_key_held(&self, key: Option<&(String, u64, u8)>) -> bool {
+        key.map_or(false, |k| self.commitment_index.contains_key(k))
+    }
+
+    /// Claims `hash`'s slot in its sender's quota for one admission attempt. The bucket's entry lock
+    /// serialises every claim on that bucket, and two copies of one TX share it, so a twin admission of
+    /// the same bytes finds the first one's slot instead of counting a second.
+    fn claim_sender_slot(&self, tx: &Transaction, hash: &str) -> SlotClaim {
+        if tx.from.is_empty() {
+            return SlotClaim::Claimed;
+        }
+        let quota_key = Self::quota_key(tx);
+        let mut count = self.tx_count_by_sender.entry(quota_key.clone()).or_insert(0);
+        if self.tx_sender_map.contains_key(hash) {
+            return SlotClaim::Twin;
+        }
+        if *count >= self.max_per_sender {
+            println!("[WARN][MEMPOOL] per_sender_limit sender={} count={} max={}",
+                     qnet_state::char_prefix(&tx.from, 16), *count, self.max_per_sender);
+            return SlotClaim::OverQuota;
+        }
+        *count += 1;
+        self.tx_sender_map.insert(hash.to_string(), quota_key);
+        SlotClaim::Claimed
+    }
+
+    /// Undoes what an admission attempt claimed before it failed to store `hash`: its quota slot, its
+    /// commitment registration and its evidence slot. Each is keyed by `hash`, so only this attempt's
+    /// own claims go. Never called for a twin, which shares them with the admission that holds them.
+    fn release_admission(&self, hash: &str, key: Option<&(String, u64, u8)>, offender: Option<&str>) {
+        self.decrement_sender_for_hash(hash);
+        if let Some(k) = key {
+            self.rollback_commitment_registration(k, hash);
+        }
+        if let Some(o) = offender {
+            self.rollback_evidence_registration(o, hash);
+        }
+    }
+
+    /// Checked under the queue lock right before the insert: a commitment version still owns its key.
+    /// One replaced while it was being admitted is dropped, or it would stay beside its successor with
+    /// no index entry, at a priority no paying TX can evict.
+    fn still_owns_commitment(&self, key: Option<&(String, u64, u8)>, hash: &str) -> bool {
+        key.map_or(true, |k| self.commitment_index.get(k).map_or(false, |current| current.value() == hash))
+    }
+
+    /// The single-TX insert, under the queue lock the caller holds: storage and queue together. False,
+    /// with nothing stored, when the hash is already stored, or when a commitment version lost its key
+    /// while it was being admitted, whose claims are then released.
+    #[allow(clippy::too_many_arguments)]
+    fn insert_locked(
+        &self,
+        priority_queue: &mut PriorityQueue,
+        hash: &str,
+        storage: TxStorage,
+        priority: u64,
+        key: Option<&(String, u64, u8)>,
+        offender: Option<&str>,
+        nonce_slot: Option<(&(String, u64), u64)>,
+        displaced: &mut Option<String>,
+    ) -> bool {
+        if self.transactions.contains_key(hash) {
+            return false;
+        }
+        if !self.still_owns_commitment(key, hash) {
+            self.release_admission(hash, key, offender);
+            return false;
+        }
+        // One version per (from, nonce), decided under the queue lock every insert holds, so of two copies
+        // racing past the doors' check one is kept. A higher-priced version replaces the kept one.
+        if let Some((slot, gas_price)) = nonce_slot {
+            let held = self.value_nonce_index.get(slot).map(|e| e.value().clone());
+            if let Some((held_hash, held_price)) = held.filter(|(h, _)| h != hash) {
+                if held_price >= gas_price {
+                    self.release_admission(hash, key, offender);
+                    return false;
+                }
+                if self.tx_store_remove(&held_hash) {
+                    self.tx_timestamps.remove(&held_hash);
+                    self.decrement_sender_for_hash(&held_hash);
+                    self.cleanup_dedup_indices_for_hash(&held_hash);
+                    priority_queue.remove(&held_hash);
+                    *displaced = Some(held_hash);
+                }
+            }
+            self.value_nonce_index.insert(slot.clone(), (hash.to_string(), gas_price));
+            self.value_nonce_reverse.insert(hash.to_string(), slot.clone());
+        }
+        self.tx_store_insert(hash.to_string(), storage);
+        self.tx_timestamps.insert(hash.to_string(), std::time::Instant::now());
+        // A deliberate local re-admission (RPC resubmit) lifts this node's
+        // expiry tombstone; peers clear their own the same way.
+        self.expired_tx_hashes.remove(hash);
+        // v14.8.4: System TXs keyed at u64::MAX so block producers drain
+        // them first — protocol bootstrap cannot be delayed by user TXs.
+        priority_queue.push_back(priority, hash.to_string());
+        true
+    }
+
     /// Add raw transaction (optimized with binary option and priority queue)
     /// PRODUCTION: Priority-based insertion for spam protection
     /// gas_price: Transaction gas price for priority sorting (higher = earlier processing)
@@ -448,6 +742,12 @@ impl SimpleMempool {
             return false;
         }
 
+        // One pending proof per offender, checked before a full pool can make room for a second.
+        let offender = parsed_tx.slashed_offender();
+        if offender.map_or(false, |o| self.has_pending_evidence_against(o)) {
+            return false;
+        }
+
         // FIX M-H15: Evict lowest-priority TX when mempool is full.
         // System TXs are treated as highest priority for eviction purposes
         // (effective_priority = u64::MAX) so a spam flood of user TXs
@@ -462,58 +762,9 @@ impl SimpleMempool {
         } else {
             gas_price
         };
-        if self.transactions.len() >= self.config.max_size || self.bytes_full() {
-            let mut priority_queue = self.by_gas_price.write();
-            if let Some(mut lowest_entry) = priority_queue.first_entry() {
-                let lowest_gas = *lowest_entry.key();
-                if effective_priority > lowest_gas {
-                    if let Some(tx_hash) = lowest_entry.get().front().cloned() {
-                        // Remove evicted TX from both structures
-                        lowest_entry.get_mut().pop_front();
-                        if lowest_entry.get().is_empty() {
-                            lowest_entry.remove();
-                        }
-                        self.tx_store_remove(&tx_hash);
-                        self.tx_timestamps.remove(&tx_hash);
-                        // Release the evicted tx's quota slot too: every other removal path is gated
-                        // on transactions.remove() succeeding, which is already false by here, so
-                        // without this the counter and tx_sender_map grow forever and eventually lock
-                        // the victim's wallet out of the mempool entirely.
-                        self.decrement_sender_for_hash(&tx_hash);
-                        // v15.5: keep commitment dedup tables proportional to
-                        // live mempool occupancy when low-priority eviction
-                        // drops a commitment-class TX.
-                        self.cleanup_commitment_indices_for_hash(&tx_hash);
-                        println!("[INFO][MEMPOOL] evicted_low_priority gas={} for_new_gas={} new_is_system={}",
-                                 lowest_gas, effective_priority, is_system);
-                    }
-                } else if parsed_tx.is_merkle_reward_claim() && lowest_gas <= self.config.min_gas_price {
-                    // A claim sits AT the floor, so `>` can never displace another floor entry. Rewards
-                    // must stay claimable under load, so let a claim take a floor slot on equal terms;
-                    // it cannot displace anyone who actually paid.
-                    if let Some(tx_hash) = lowest_entry.get().front().cloned() {
-                        lowest_entry.get_mut().pop_front();
-                        if lowest_entry.get().is_empty() {
-                            lowest_entry.remove();
-                        }
-                        self.tx_store_remove(&tx_hash);
-                        self.tx_timestamps.remove(&tx_hash);
-                        self.decrement_sender_for_hash(&tx_hash);
-                        self.cleanup_commitment_indices_for_hash(&tx_hash);
-                    } else {
-                        return false;
-                    }
-                } else {
-                    println!("[WARN][MEMPOOL] pool_full size={} rejected_gas={} system={}",
-                             self.transactions.len(), gas_price, is_system);
-                    return false;
-                }
-            } else {
-                return false;
-            }
-            drop(priority_queue);
-        }
 
+        // Every refusal that needs no room runs before a full pool makes room: a TX refused anyway
+        // must not cost a paying TX its slot on the way out.
         // PROTOCOL: Reject TX already confirmed in recent blocks (prevents post-gossip re-inclusion)
         if self.included_tx_hashes.contains_key(&hash) {
             return false;
@@ -551,14 +802,86 @@ impl SimpleMempool {
                 return false;
             }
         }
+        let key_held = self.commitment_key_held(commitment_key.as_ref());
+        // A second version of a pending (from, nonce) that pays no more is refused before any room is made.
+        if self.value_nonce_blocker(&parsed_tx, &hash).is_some() {
+            return false;
+        }
+
+        // The evidence slot, atomically: of two proofs racing past the check above, one is kept, and
+        // the rest are refused before any room is made.
+        if let Some(o) = offender {
+            if !self.register_evidence(o, &hash) {
+                return false;
+            }
+        }
+        // A TX that may need room claims its quota slot first, so one refused at its sender's limit
+        // costs no paying TX its slot. A replacement claims after replacing, once its predecessor's
+        // slot in the same bucket is free.
+        if !key_held {
+            match self.claim_sender_slot(&parsed_tx, &hash) {
+                SlotClaim::Claimed => {}
+                SlotClaim::Twin => return false,
+                SlotClaim::OverQuota => {
+                    self.release_admission(&hash, None, offender);
+                    return false;
+                }
+            }
+        }
+
+        if !key_held && (self.transactions.len() >= self.config.max_size || self.bytes_full()) {
+            let mut priority_queue = self.by_gas_price.write();
+            if let Some(lowest_gas) = priority_queue.lowest_priority() {
+                if effective_priority > lowest_gas {
+                    if let Some((_, tx_hash)) = priority_queue.pop_lowest() {
+                        // Remove evicted TX from both structures
+                        self.tx_store_remove(&tx_hash);
+                        self.tx_timestamps.remove(&tx_hash);
+                        // Release the evicted tx's quota slot too: every other removal path is gated
+                        // on transactions.remove() succeeding, which is already false by here, so
+                        // without this the counter and tx_sender_map grow forever and eventually lock
+                        // the victim's wallet out of the mempool entirely.
+                        self.decrement_sender_for_hash(&tx_hash);
+                        // v15.5: keep commitment dedup tables proportional to
+                        // live mempool occupancy when low-priority eviction
+                        // drops a commitment-class TX.
+                        self.cleanup_dedup_indices_for_hash(&tx_hash);
+                        println!("[INFO][MEMPOOL] evicted_low_priority gas={} for_new_gas={} new_is_system={}",
+                                 lowest_gas, effective_priority, is_system);
+                    }
+                } else if parsed_tx.is_merkle_reward_claim() && lowest_gas <= self.config.min_gas_price {
+                    // A claim sits AT the floor, so `>` can never displace another floor entry. Rewards
+                    // must stay claimable under load, so let a claim take a floor slot on equal terms;
+                    // it cannot displace anyone who actually paid.
+                    if let Some((_, tx_hash)) = priority_queue.pop_lowest() {
+                        self.tx_store_remove(&tx_hash);
+                        self.tx_timestamps.remove(&tx_hash);
+                        self.decrement_sender_for_hash(&tx_hash);
+                        self.cleanup_dedup_indices_for_hash(&tx_hash);
+                    } else {
+                        self.release_admission(&hash, None, offender);
+                        return false;
+                    }
+                } else {
+                    println!("[WARN][MEMPOOL] pool_full size={} rejected_gas={} system={}",
+                             self.transactions.len(), gas_price, is_system);
+                    self.release_admission(&hash, None, offender);
+                    return false;
+                }
+            } else {
+                self.release_admission(&hash, None, offender);
+                return false;
+            }
+            drop(priority_queue);
+        }
 
         // v15.5: COMMITMENT REPLACEMENT — single-version-in-mempool guarantee
         // for the deterministic-(identity, epoch_or_index) TX class. Any
         // prior version sharing the same dedup key is removed from every
-        // storage layer here, BEFORE per-sender count and storage insertion,
-        // so the count and capacity bookkeeping that follows reflects the
-        // post-replacement state. Non-commitment TXs return None and skip
-        // this branch with one DashMap miss of overhead.
+        // storage layer here, BEFORE storage insertion, so the capacity
+        // bookkeeping that follows reflects the post-replacement state.
+        // Non-commitment TXs return None and skip this branch with one
+        // DashMap miss of overhead.
         // ═══════════════════════════════════════════════════════════════════
         if let Some(ref key) = commitment_key {
             if let Some(old_hash) = self.replace_or_register_commitment(key.clone(), &hash) {
@@ -568,25 +891,15 @@ impl SimpleMempool {
                          qnet_state::char_prefix(&hash, 16));
             }
         }
-
-        // FIX L-M9: Per-sender limit defense-in-depth
-        if !parsed_tx.from.is_empty() {
-            let mut sender_count = self.tx_count_by_sender
-                .entry(Self::quota_key(&parsed_tx))
-                .or_insert(0);
-            if *sender_count >= self.max_per_sender {
-                println!("[WARN][MEMPOOL] per_sender_limit sender={} count={} max={}",
-                         qnet_state::char_prefix(&parsed_tx.from, 16), *sender_count, self.max_per_sender);
-                // v15.5: roll back the commitment registration we just made
-                // so a count-rejected TX does not leave a dangling forward-
-                // index entry pointing at a hash that never enters storage.
-                if let Some(ref key) = commitment_key {
-                    self.rollback_commitment_registration(key, &hash);
+        if key_held {
+            match self.claim_sender_slot(&parsed_tx, &hash) {
+                SlotClaim::Claimed => {}
+                SlotClaim::Twin => return false,
+                SlotClaim::OverQuota => {
+                    self.release_admission(&hash, commitment_key.as_ref(), offender);
+                    return false;
                 }
-                return false;
             }
-            *sender_count += 1;
-            self.tx_sender_map.insert(hash.clone(), Self::quota_key(&parsed_tx));
         }
 
         // Store as binary if enabled (50% space saving)
@@ -605,25 +918,18 @@ impl SimpleMempool {
         let persist_payload: Option<Vec<u8>> = bincode::serialize(&parsed_tx).ok();
 
         // v2.67: CRITICAL - Add to BOTH structures atomically under priority queue lock
+        let nonce_key = Self::value_nonce_key(&parsed_tx);
+        let mut displaced = None;
         {
             let mut priority_queue = self.by_gas_price.write();
-
-            // Double-check inside lock
-            if self.transactions.contains_key(&hash) {
+            if !self.insert_locked(&mut priority_queue, &hash, storage, effective_priority,
+                                   commitment_key.as_ref(), offender,
+                                   nonce_key.as_ref().map(|k| (k, parsed_tx.gas_price)), &mut displaced) {
                 return false;
             }
-
-            self.tx_store_insert(hash.clone(), storage);
-            self.tx_timestamps.insert(hash.clone(), std::time::Instant::now());
-            // A deliberate local re-admission (RPC resubmit) lifts this node's
-            // expiry tombstone; peers clear their own the same way.
-            self.expired_tx_hashes.remove(&hash);
-            // v14.8.4: System TXs keyed at u64::MAX so block producers drain
-            // them first — protocol bootstrap cannot be delayed by user TXs.
-            priority_queue
-                .entry(effective_priority)
-                .or_insert_with(VecDeque::new)
-                .push_back(hash.clone());
+        }
+        if let Some(old) = displaced {
+            self.fire_persist_remove(&old);
         }
 
         // v15.9: persistent mempool — mirror admission to RocksDB.
@@ -648,6 +954,10 @@ impl SimpleMempool {
     fn quota_key(tx: &qnet_state::Transaction) -> String {
         if tx.is_merkle_reward_claim() {
             if let Some(to) = tx.to.as_ref() { return to.clone(); }
+        }
+        // A wallet's own bucket holds only TXs its key signs; system TXs keep their limit apart.
+        if tx.is_system_tx() {
+            return format!("{}{}", SYSTEM_QUOTA_PREFIX, tx.from);
         }
         tx.from.clone()
     }
@@ -674,6 +984,12 @@ impl SimpleMempool {
             return false;
         }
 
+        // One pending proof per offender, checked before a full pool can make room for a second.
+        let offender = parsed_tx.slashed_offender();
+        if offender.map_or(false, |o| self.has_pending_evidence_against(o)) {
+            return false;
+        }
+
         // A merkle reward-claim keeps the min-fee bypass but NOT the consensus lane: at u64::MAX it
         // would be packed ahead of every paying transaction. Floor priority instead — above free spam,
         // below anyone who paid.
@@ -685,75 +1001,8 @@ impl SimpleMempool {
             gas_price
         };
 
-        // FIX M-H15: Evict lowest-priority TX when mempool is full
-        let mut evicted_for_persist: Option<String> = None;
-        if self.transactions.len() >= self.config.max_size || self.bytes_full() {
-            let mut priority_queue = self.by_gas_price.write();
-            if let Some(mut lowest_entry) = priority_queue.first_entry() {
-                let lowest_gas = *lowest_entry.key();
-                if effective_priority > lowest_gas {
-                    if let Some(tx_hash) = lowest_entry.get().front().cloned() {
-                        lowest_entry.get_mut().pop_front();
-                        if lowest_entry.get().is_empty() {
-                            lowest_entry.remove();
-                        }
-                        self.tx_store_remove(&tx_hash);
-                        self.tx_timestamps.remove(&tx_hash);
-                        // Release the evicted tx's quota slot too: every other removal path is gated
-                        // on transactions.remove() succeeding, which is already false by here, so
-                        // without this the counter and tx_sender_map grow forever and eventually lock
-                        // the victim's wallet out of the mempool entirely.
-                        self.decrement_sender_for_hash(&tx_hash);
-                        // v15.5: keep commitment dedup tables proportional to
-                        // live mempool occupancy when low-priority eviction
-                        // drops a commitment-class TX.
-                        self.cleanup_commitment_indices_for_hash(&tx_hash);
-                        // v15.9: defer the persistent-mirror removal to AFTER
-                        // we release the priority-queue write lock — the
-                        // hook performs disk I/O and must not run under
-                        // the lock.
-                        evicted_for_persist = Some(tx_hash.clone());
-                        println!("[INFO][MEMPOOL] evicted_low_priority gas={} for_new_gas={} new_is_system={}",
-                                 lowest_gas, effective_priority, is_system);
-                    }
-                } else if parsed_tx.is_merkle_reward_claim() && lowest_gas <= self.config.min_gas_price {
-                    // A claim sits AT the floor, so `>` can never displace another floor entry. Rewards
-                    // must stay claimable under load, so let a claim take a floor slot on equal terms;
-                    // it cannot displace anyone who actually paid.
-                    if let Some(tx_hash) = lowest_entry.get().front().cloned() {
-                        lowest_entry.get_mut().pop_front();
-                        if lowest_entry.get().is_empty() {
-                            lowest_entry.remove();
-                        }
-                        self.tx_store_remove(&tx_hash);
-                        self.tx_timestamps.remove(&tx_hash);
-                        self.decrement_sender_for_hash(&tx_hash);
-                        self.cleanup_commitment_indices_for_hash(&tx_hash);
-                        // Mirror removal too (deferred past the lock, same as the sibling branch) —
-                        // else the displaced tx resurrects from the persistent mempool on restart.
-                        evicted_for_persist = Some(tx_hash.clone());
-                    } else {
-                        return false;
-                    }
-                } else {
-                    println!("[WARN][MEMPOOL] pool_full size={} rejected_gas={} system={}",
-                             self.transactions.len(), gas_price, is_system);
-                    return false;
-                }
-            } else {
-                return false;
-            }
-            drop(priority_queue);
-        }
-
-        // v15.9: persistent mempool — flush the deferred eviction now that
-        // the priority-queue write lock is released. Doing the disk
-        // delete outside the lock keeps admission throughput unaffected
-        // by RocksDB latency.
-        if let Some(ref evicted_hash) = evicted_for_persist {
-            self.fire_persist_remove(evicted_hash);
-        }
-
+        // Every refusal that needs no room runs before a full pool makes room: a TX refused anyway
+        // must not cost a paying TX its slot on the way out.
         // PROTOCOL: Reject TX already confirmed in recent blocks (prevents post-gossip re-inclusion)
         if self.included_tx_hashes.contains_key(&hash) {
             return false;
@@ -797,6 +1046,92 @@ impl SimpleMempool {
                 return false;
             }
         }
+        let key_held = self.commitment_key_held(commitment_key.as_ref());
+        // A second version of a pending (from, nonce) that pays no more is refused before any room is made.
+        if self.value_nonce_blocker(&parsed_tx, &hash).is_some() {
+            return false;
+        }
+
+        // Evidence slot, then (for a TX that may need room) the quota slot, both before any room is
+        // made: see `add_raw_transaction`.
+        if let Some(o) = offender {
+            if !self.register_evidence(o, &hash) {
+                return false;
+            }
+        }
+        if !key_held {
+            match self.claim_sender_slot(&parsed_tx, &hash) {
+                SlotClaim::Claimed => {}
+                SlotClaim::Twin => return false,
+                SlotClaim::OverQuota => {
+                    self.release_admission(&hash, None, offender);
+                    return false;
+                }
+            }
+        }
+
+        // FIX M-H15: Evict lowest-priority TX when mempool is full
+        let mut evicted_for_persist: Option<String> = None;
+        if !key_held && (self.transactions.len() >= self.config.max_size || self.bytes_full()) {
+            let mut priority_queue = self.by_gas_price.write();
+            if let Some(lowest_gas) = priority_queue.lowest_priority() {
+                if effective_priority > lowest_gas {
+                    if let Some((_, tx_hash)) = priority_queue.pop_lowest() {
+                        self.tx_store_remove(&tx_hash);
+                        self.tx_timestamps.remove(&tx_hash);
+                        // Release the evicted tx's quota slot too: every other removal path is gated
+                        // on transactions.remove() succeeding, which is already false by here, so
+                        // without this the counter and tx_sender_map grow forever and eventually lock
+                        // the victim's wallet out of the mempool entirely.
+                        self.decrement_sender_for_hash(&tx_hash);
+                        // v15.5: keep commitment dedup tables proportional to
+                        // live mempool occupancy when low-priority eviction
+                        // drops a commitment-class TX.
+                        self.cleanup_dedup_indices_for_hash(&tx_hash);
+                        // v15.9: defer the persistent-mirror removal to AFTER
+                        // we release the priority-queue write lock — the
+                        // hook performs disk I/O and must not run under
+                        // the lock.
+                        evicted_for_persist = Some(tx_hash.clone());
+                        println!("[INFO][MEMPOOL] evicted_low_priority gas={} for_new_gas={} new_is_system={}",
+                                 lowest_gas, effective_priority, is_system);
+                    }
+                } else if parsed_tx.is_merkle_reward_claim() && lowest_gas <= self.config.min_gas_price {
+                    // A claim sits AT the floor, so `>` can never displace another floor entry. Rewards
+                    // must stay claimable under load, so let a claim take a floor slot on equal terms;
+                    // it cannot displace anyone who actually paid.
+                    if let Some((_, tx_hash)) = priority_queue.pop_lowest() {
+                        self.tx_store_remove(&tx_hash);
+                        self.tx_timestamps.remove(&tx_hash);
+                        self.decrement_sender_for_hash(&tx_hash);
+                        self.cleanup_dedup_indices_for_hash(&tx_hash);
+                        // Mirror removal too (deferred past the lock, same as the sibling branch) —
+                        // else the displaced tx resurrects from the persistent mempool on restart.
+                        evicted_for_persist = Some(tx_hash.clone());
+                    } else {
+                        self.release_admission(&hash, None, offender);
+                        return false;
+                    }
+                } else {
+                    println!("[WARN][MEMPOOL] pool_full size={} rejected_gas={} system={}",
+                             self.transactions.len(), gas_price, is_system);
+                    self.release_admission(&hash, None, offender);
+                    return false;
+                }
+            } else {
+                self.release_admission(&hash, None, offender);
+                return false;
+            }
+            drop(priority_queue);
+        }
+
+        // v15.9: persistent mempool — flush the deferred eviction now that
+        // the priority-queue write lock is released. Doing the disk
+        // delete outside the lock keeps admission throughput unaffected
+        // by RocksDB latency.
+        if let Some(ref evicted_hash) = evicted_for_persist {
+            self.fire_persist_remove(evicted_hash);
+        }
 
         // ═══════════════════════════════════════════════════════════════════
         // v15.5: COMMITMENT REPLACEMENT — see `add_raw_transaction` for the
@@ -815,62 +1150,38 @@ impl SimpleMempool {
                          qnet_state::char_prefix(&hash, 16));
             }
         }
-
-        // Per-sender limit (defense in depth)
-        let sender = &parsed_tx.from;
-        if !sender.is_empty() {
-            let mut sender_count = self.tx_count_by_sender.entry(Self::quota_key(&parsed_tx)).or_insert(0);
-            if *sender_count >= self.max_per_sender {
-                println!("[WARN][MEMPOOL] per_sender_limit sender={}.. count={}",
-                         qnet_state::char_prefix(&sender, 16), *sender_count);
-                // v15.5: roll back the commitment registration on count
-                // rejection to keep dedup indices in lockstep with storage.
-                if let Some(ref key) = commitment_key {
-                    self.rollback_commitment_registration(key, &hash);
+        if key_held {
+            match self.claim_sender_slot(&parsed_tx, &hash) {
+                SlotClaim::Claimed => {}
+                SlotClaim::Twin => return false,
+                SlotClaim::OverQuota => {
+                    self.release_admission(&hash, commitment_key.as_ref(), offender);
+                    return false;
                 }
-                return false;
             }
-            *sender_count += 1;
-            self.tx_sender_map.insert(hash.clone(), Self::quota_key(&parsed_tx));
         }
 
         // v2.67: CRITICAL - Add to BOTH structures atomically under priority queue lock
         // This prevents race condition where TX is in transactions but not in priority queue
-        let persist_payload: Vec<u8>;
+        // v15.9: keep a copy of the binary payload for the persistent mirror, written after the lock
+        // is released.
+        let persist_payload = tx_bytes.clone();
+        let nonce_key = Self::value_nonce_key(&parsed_tx);
+        let mut displaced = None;
         {
             let mut priority_queue = self.by_gas_price.write();
-
-            // Double-check inside lock to prevent duplicates
-            if self.transactions.contains_key(&hash) {
+            if !self.insert_locked(&mut priority_queue, &hash, TxStorage::Binary(tx_bytes), effective_priority,
+                                   commitment_key.as_ref(), offender,
+                                   nonce_key.as_ref().map(|k| (k, parsed_tx.gas_price)), &mut displaced) {
                 return false;
             }
-
-            // v15.9: keep a copy of the binary payload BEFORE moving it into
-            // the in-RAM map; we use it to mirror the admission to the
-            // persistent mempool CF after the lock is released.
-            persist_payload = tx_bytes.clone();
-
-            // Add to transactions first
-            self.tx_store_insert(hash.clone(), TxStorage::Binary(tx_bytes));
-            self.tx_timestamps.insert(hash.clone(), std::time::Instant::now());
-            // A deliberate local re-admission (RPC resubmit) lifts this node's
-            // expiry tombstone; peers clear their own the same way.
-            self.expired_tx_hashes.remove(&hash);
-
-            // Then add to priority queue (same lock scope)
-            priority_queue
-                .entry(effective_priority)
-                .or_insert_with(VecDeque::new)
-                .push_back(hash.clone());
 
             // v2.67: Verify consistency for system TX at top-priority slot
             if is_system {
                 // Look in the queue this TX was actually filed under. Probing u64::MAX only was correct
                 // while every system TX sat at top priority; merkle reward claims do not, so a perfectly
                 // successful admission logged [ERR] every time.
-                let queue_has = priority_queue.get(&effective_priority)
-                    .map(|v| v.contains(&hash))
-                    .unwrap_or(false);
+                let queue_has = priority_queue.contains_at(effective_priority, &hash);
                 let tx_has = self.transactions.contains_key(&hash);
 
                 println!("[INFO][MEMPOOL] system_tx_added hash={} size={} queue={} tx={}",
@@ -882,6 +1193,9 @@ impl SimpleMempool {
             }
         }
 
+        if let Some(old) = displaced {
+            self.fire_persist_remove(&old);
+        }
         // v15.9: persistent mempool — mirror the admission to RocksDB after
         // releasing the priority-queue lock. The hook is async-safe and
         // returns immediately; the actual disk write is a single
@@ -999,9 +1313,7 @@ impl SimpleMempool {
                             *count = count.saturating_sub(1);
                         }
                     }
-                    for (_gp, hashes) in priority_queue.iter_mut() {
-                        hashes.retain(|h| h != &old);
-                    }
+                    priority_queue.remove(&old);
                     println!("[INFO][MEMPOOL] commitment_replaced_trusted id={} epoch={} type={} old={} new={}",
                              qnet_state::char_prefix(&key.0, 16), key.1, key.2,
                              qnet_state::char_prefix(&old, 16),
@@ -1026,16 +1338,10 @@ impl SimpleMempool {
             // A deliberate local re-admission (RPC resubmit) lifts this node's
             // expiry tombstone; peers clear their own the same way.
             self.expired_tx_hashes.remove(&hash);
-            priority_queue
-                .entry(gas_price)
-                .or_insert_with(VecDeque::new)
-                .push_back(hash);
+            priority_queue.push_back(gas_price, hash);
             added += 1;
         }
 
-        // Drop empty priority levels created by commitment evictions above
-        // so the queue stays compact across batch boundaries.
-        priority_queue.retain(|_, hashes| !hashes.is_empty());
         drop(priority_queue);
 
         // v15.9: replay persistent-mirror hooks AFTER releasing the lock.
@@ -1090,9 +1396,8 @@ impl SimpleMempool {
         
         // Iterate from HIGHEST gas_price to LOWEST (BTreeMap.iter().rev())
         // Within same gas_price: FIFO order (fair for same-price transactions)
-        priority_queue.iter()
-            .rev()  // CRITICAL: Reverse iteration for highest-first
-            .flat_map(|(_gas_price, hashes)| hashes.iter())
+        priority_queue.iter_desc()  // CRITICAL: highest-first
+            .map(|(_gas_price, hash)| hash)
             .take(limit)
             .filter_map(|hash| self.get_raw_transaction(hash))
             .collect()
@@ -1104,9 +1409,8 @@ impl SimpleMempool {
     pub fn get_pending_binary_transactions(&self, limit: usize) -> Vec<Vec<u8>> {
         let priority_queue = self.by_gas_price.read();
         
-        priority_queue.iter()
-            .rev()
-            .flat_map(|(_gas_price, hashes)| hashes.iter())
+        priority_queue.iter_desc()
+            .map(|(_gas_price, hash)| hash)
             .take(limit)
             .filter_map(|hash| self.get_binary_transaction(hash))
             .collect()
@@ -1124,14 +1428,9 @@ impl SimpleMempool {
                 }
             }
             // v15.5: keep commitment dedup tables in lockstep with storage.
-            self.cleanup_commitment_indices_for_hash(hash);
+            self.cleanup_dedup_indices_for_hash(hash);
             // CRITICAL: Also remove from priority queue
-            let mut priority_queue = self.by_gas_price.write();
-            for (_gas_price, hashes) in priority_queue.iter_mut() {
-                hashes.retain(|h| h != hash);
-            }
-            priority_queue.retain(|_, hashes| !hashes.is_empty());
-            drop(priority_queue);
+            self.by_gas_price.write().remove(hash);
 
             // v15.9: persistent mempool — mirror the removal to RocksDB.
             // Lock is released before the disk delete to keep the
@@ -1165,6 +1464,10 @@ impl SimpleMempool {
         self.commitment_index.clear();
         self.commitment_reverse.clear();
         self.pending_registration_hashes.clear();
+        self.evidence_index.clear();
+        self.evidence_reverse.clear();
+        self.value_nonce_index.clear();
+        self.value_nonce_reverse.clear();
         self.expired_tx_hashes.clear();
 
         // v15.9: mirror the wipe to RocksDB. Each hash gets its own
@@ -1209,20 +1512,17 @@ impl SimpleMempool {
                 self.decrement_sender_for_hash(hash);
                 // v15.5: clear commitment dedup tables for every hash that
                 // actually existed in storage. Idempotent and O(1) per hash.
-                self.cleanup_commitment_indices_for_hash(hash);
+                self.cleanup_dedup_indices_for_hash(hash);
                 removed_hashes.push(hash);
             }
         }
 
         // Step 2: Clean priority queue in one pass (more efficient than individual removes)
         if !removed_hashes.is_empty() {
-            let hash_set: std::collections::HashSet<&String> = hashes.iter().collect();
             let mut priority_queue = self.by_gas_price.write();
-            for (_gas_price, queue_hashes) in priority_queue.iter_mut() {
-                queue_hashes.retain(|h| !hash_set.contains(h));
+            for hash in hashes {
+                priority_queue.remove(hash);
             }
-            // Remove empty gas_price levels
-            priority_queue.retain(|_, queue_hashes| !queue_hashes.is_empty());
             drop(priority_queue);
 
             // Mirror every removal to the persistent pool (outside the lock).
@@ -1310,19 +1610,16 @@ impl SimpleMempool {
         let priority_queue = self.by_gas_price.read();
         
         // v2.67: Debug logging for emission blocks (system TX have gas_price == u64::MAX)
-        let total_in_queue: usize = priority_queue.values().map(|v| v.len()).sum();
-        let has_system_tx = priority_queue.contains_key(&u64::MAX);
+        let total_in_queue: usize = priority_queue.len();
+        let has_system_tx = priority_queue.has_level(u64::MAX);
         
         if has_system_tx || total_in_queue > 0 {
             println!("[INFO][MEMPOOL] get_pending queue_size={} has_system_tx={} tx_map_size={}", 
                     total_in_queue, has_system_tx, self.transactions.len());
         }
         
-        let result: Vec<(String, Vec<u8>)> = priority_queue.iter()
-            .rev()  // Highest gas_price first (u64::MAX = system TX = first)
-            .flat_map(|(gas_price, hashes)| {
-                hashes.iter().map(move |h| (*gas_price, h.clone()))
-            })
+        let result: Vec<(String, Vec<u8>)> = priority_queue.iter_desc()  // Highest gas_price first (u64::MAX = system TX = first)
+            .map(|(gas_price, h)| (gas_price, h.clone()))
             .take(limit)
             .filter_map(|(gas_price, hash)| {
                 match self.get_binary_transaction(&hash) {
@@ -1348,6 +1645,12 @@ impl SimpleMempool {
     /// (admitted, not yet applied/evicted). O(1). Valve input for the attestor issuance throttle.
     pub fn pending_registration_backlog(&self) -> usize {
         self.pending_registration_hashes.len()
+    }
+
+    /// Hash of the NodeRegistration resident for `node_id`, if any. The pool holds one per node (its
+    /// commitment key), so this is the registration a resubmit for the node would replace.
+    pub fn resident_registration(&self, node_id: &str) -> Option<String> {
+        self.commitment_index.get(&(node_id.to_string(), 0, 4)).map(|h| h.value().clone())
     }
 
     /// Deterministic registration-inclusion lane: the SAME next `limit` NodeRegistrations on every
@@ -1424,15 +1727,13 @@ impl SimpleMempool {
                 // otherwise an expired commitment would block a fresh
                 // submission for the same `(identity, epoch_or_index)` until
                 // the next mempool clear.
-                self.cleanup_commitment_indices_for_hash(hash);
+                self.cleanup_dedup_indices_for_hash(hash);
             }
             // Remove from priority queue
-            let expired_set: std::collections::HashSet<&String> = expired_hashes.iter().collect();
             let mut priority_queue = self.by_gas_price.write();
-            for (_gas_price, hashes) in priority_queue.iter_mut() {
-                hashes.retain(|h| !expired_set.contains(h));
+            for hash in &expired_hashes {
+                priority_queue.remove(hash);
             }
-            priority_queue.retain(|_, hashes| !hashes.is_empty());
             drop(priority_queue);
 
             // v15.9: persistent mempool — mirror TTL evictions to RocksDB
@@ -1516,15 +1817,13 @@ impl SimpleMempool {
         let priority_queue = self.by_gas_price.read();
         let mut out: Vec<(String, Vec<u8>)> = Vec::new();
         let mut bytes = 0usize;
-        'outer: for (_gas_price, hashes) in priority_queue.iter().rev() {
-            for h in hashes.iter() {
-                if out.len() >= count_limit { break 'outer; }
-                if let Some(data) = self.get_binary_transaction(h) {
-                    let sz = data.len();
-                    if !out.is_empty() && bytes.saturating_add(sz) > byte_budget { break 'outer; }
-                    bytes = bytes.saturating_add(sz);
-                    out.push((h.clone(), data));
-                }
+        for (_gas_price, h) in priority_queue.iter_desc() {
+            if out.len() >= count_limit { break; }
+            if let Some(data) = self.get_binary_transaction(h) {
+                let sz = data.len();
+                if !out.is_empty() && bytes.saturating_add(sz) > byte_budget { break; }
+                bytes = bytes.saturating_add(sz);
+                out.push((h.clone(), data));
             }
         }
         out
@@ -1555,7 +1854,7 @@ impl SimpleMempool {
     /// v2.67: Debug method to check mempool consistency
     pub fn debug_check_consistency(&self) -> (usize, usize, bool) {
         let tx_count = self.transactions.len();
-        let queue_count: usize = self.by_gas_price.read().values().map(|v| v.len()).sum();
+        let queue_count: usize = self.by_gas_price.read().len();
         let is_consistent = tx_count == queue_count;
         
         if !is_consistent {
@@ -1760,6 +2059,261 @@ mod hygiene_tests {
         let bound = (per_block * (qnet_state::Transaction::commitment_mark_retention_blocks(7) + MARK_PRUNE_STEP_BLOCKS)) as usize;
         assert!(peak <= bound, "peak {} above {}", peak, bound);
     }
+
+    /// A block-equivocation proof against `offender`. `from` and `nonce` vary its hash the way a relay's copy
+    /// does below the tx_target_bound gate.
+    fn proof_tx(offender: &str, from: &str, nonce: u64) -> (Transaction, String) {
+        let header = |tag: u8| qnet_state::EquivocationHeader {
+            timestamp: 1_700_000_000, merkle_root: [tag; 32], previous_hash: [0u8; 32], state_root: [tag; 32],
+            vrf_output: None, timeout_round: 0, carried_baseline: 0, pk_digest: [0u8; 32], signature: vec![tag; 8],
+        };
+        let tx = Transaction::new(from.to_string(), None, 0, nonce, 0, 0, 1_700_000_000, None,
+            qnet_state::TransactionType::EquivocationProof {
+                offender: offender.to_string(), height: 42, block_a: header(1), block_b: header(2),
+            },
+            None);
+        let hash = format!("{:x}", Sha3_256::digest(&tx.canonical_bytes()));
+        (tx, hash)
+    }
+
+    // Keyed by hash alone, each distinct-hash copy of one proof took its own fee-free, top-priority slot and,
+    // in a full pool, displaced a paying TX. One pending proof per offender now, refused before any eviction
+    // on both admission paths; the slot frees when the proof leaves the pool.
+    #[test]
+    fn one_pending_proof_per_offender_and_a_copy_displaces_nothing() {
+        let pool = SimpleMempool::new(SimpleMempoolConfig { max_size: 2, min_gas_price: 1, max_per_sender: 100 });
+        let (p1, h1) = proof_tx("super_eqv", "system_slashing", 0);
+        let (p2, h2) = proof_tx("super_eqv", "eon_victim", 7);
+        let (p3, h3) = proof_tx("super_eqv", "eon_victim", 8);
+        assert!(h1 != h2 && h2 != h3);
+        assert!(pool.add_binary_transaction(bincode::serialize(&p1).unwrap(), h1.clone(), 0));
+        assert!(pool.has_pending_evidence_against("super_eqv"));
+        let (t, th) = test_tx("eon_payer", 1);
+        assert!(pool.add_binary_transaction(t, th.clone(), 10));
+        assert_eq!(pool.size(), 2, "the pool is full");
+
+        assert!(!pool.add_binary_transaction(bincode::serialize(&p2).unwrap(), h2.clone(), 0), "binary path");
+        assert!(!pool.add_raw_transaction(serde_json::to_string(&p3).unwrap(), h3.clone(), 0), "json path");
+        assert!(pool.get_binary_transaction(&th).is_some(), "the paying TX was not evicted for either copy");
+        assert_eq!(pool.size(), 2);
+
+        pool.batch_remove_transactions(&[h1]);
+        assert!(!pool.has_pending_evidence_against("super_eqv"), "the slot frees when the proof leaves");
+        assert!(pool.add_binary_transaction(bincode::serialize(&p2).unwrap(), h2.clone(), 0));
+        pool.remove_transaction(&h2);
+        assert!(!pool.has_pending_evidence_against("super_eqv"));
+        assert!(pool.holder_census().iter().any(|(n, v)| *n == "mp_evidence" && *v == 0));
+    }
+
+    /// A heartbeat for `super_hb`; `nonce` sits outside its signed message, so a relay varies it freely.
+    fn heartbeat_tx(nonce: u64) -> (Transaction, String) {
+        let tx = Transaction::new("super_hb".to_string(), None, 0, nonce, 0, 0, 1_700_000_000, None,
+            qnet_state::TransactionType::Heartbeat {
+                node_id: "super_hb".to_string(), anchor_height: 1_500, anchor_hash: "ab".repeat(32),
+            },
+            None);
+        let hash = format!("{:x}", Sha3_256::digest(&tx.canonical_bytes()));
+        (tx, hash)
+    }
+
+    // The pool keeps one version per commitment key, but it made room before replacing: each nonce copy
+    // of a pending heartbeat evicted a paying TX, and so did every echo of a pending system TX. A copy now
+    // replaces its predecessor without evicting, and anything refused anyway is refused before eviction.
+    #[test]
+    fn a_commitment_copy_or_an_echo_displaces_no_paying_tx() {
+        let pool = SimpleMempool::new(SimpleMempoolConfig { max_size: 2, min_gas_price: 1, max_per_sender: 100 });
+        let (hb, hb_hash) = heartbeat_tx(1);
+        assert!(pool.add_binary_transaction(bincode::serialize(&hb).unwrap(), hb_hash.clone(), 0));
+        let (t, th) = test_tx("eon_payer", 1);
+        assert!(pool.add_binary_transaction(t, th.clone(), 10));
+        assert_eq!(pool.size(), 2, "the pool is full");
+
+        let mut last = hb_hash.clone();
+        for nonce in 2..6u64 {
+            let (copy, h) = heartbeat_tx(nonce);
+            assert!(h != last);
+            let admitted = if nonce % 2 == 0 {
+                pool.add_binary_transaction(bincode::serialize(&copy).unwrap(), h.clone(), 0)
+            } else {
+                pool.add_raw_transaction(serde_json::to_string(&copy).unwrap(), h.clone(), 0)
+            };
+            assert!(admitted, "a copy still replaces its predecessor (nonce {})", nonce);
+            assert!(pool.get_binary_transaction(&last).is_none(), "one version per key");
+            last = h;
+            assert!(pool.get_binary_transaction(&th).is_some(), "the paying TX stays (nonce {})", nonce);
+            assert_eq!(pool.size(), 2);
+        }
+
+        // An echo of the pending version, and a body that does not match its hash, evict nothing either.
+        let (cur, _) = heartbeat_tx(5);
+        assert!(!pool.add_binary_transaction(bincode::serialize(&cur).unwrap(), last.clone(), 0));
+        assert!(!pool.add_raw_transaction(serde_json::to_string(&cur).unwrap(), last.clone(), 0));
+        let (other, _) = heartbeat_tx(9);
+        assert!(!pool.add_binary_transaction(bincode::serialize(&other).unwrap(), "00".repeat(32), 0));
+        assert!(pool.get_binary_transaction(&th).is_some());
+        assert_eq!(pool.size(), 2);
+
+        // A system TX under a fresh key still makes room, as before.
+        let (p, ph) = proof_tx("super_other", "system_slashing", 0);
+        assert!(pool.add_binary_transaction(bincode::serialize(&p).unwrap(), ph, 0));
+        assert!(pool.get_binary_transaction(&th).is_none(), "a TX that needs room still takes the lowest");
+        assert!(pool.get_binary_transaction(&last).is_some());
+    }
+
+    // A system TX pays no fee and on several nothing signs `from`: counted in the named wallet's bucket,
+    // relayed copies could fill it and shut the wallet out. System TXs keep their own limit, apart.
+    #[test]
+    fn system_copies_naming_a_wallet_do_not_spend_its_quota() {
+        let pool = SimpleMempool::new(SimpleMempoolConfig { max_size: 100, min_gas_price: 1, max_per_sender: 2 });
+        for (i, offender) in ["off_a", "off_b"].iter().enumerate() {
+            let (p, h) = proof_tx(offender, "eon_quota_victim", i as u64);
+            assert!(pool.add_binary_transaction(bincode::serialize(&p).unwrap(), h, 0));
+        }
+        let (t1, h1) = test_tx("eon_quota_victim", 1);
+        let (t2, h2) = test_tx("eon_quota_victim", 2);
+        let (t3, h3) = test_tx("eon_quota_victim", 3);
+        assert!(pool.add_binary_transaction(t1, h1, 10));
+        assert!(pool.add_binary_transaction(t2, h2, 10), "the wallet's own slots are untouched by the copies");
+        assert!(!pool.add_binary_transaction(t3, h3, 10), "its own limit still binds");
+        let (p, h) = proof_tx("off_c", "eon_quota_victim", 9);
+        assert!(!pool.add_binary_transaction(bincode::serialize(&p).unwrap(), h, 0), "and so does the system one");
+    }
+
+    // A sender at its limit made room first and was refused after: each copy cost another user's TX its
+    // slot for nothing. The quota slot is claimed before any eviction now, on both paths.
+    #[test]
+    fn a_sender_at_its_limit_evicts_nothing() {
+        for json in [false, true] {
+            let pool = SimpleMempool::new(SimpleMempoolConfig { max_size: 2, min_gas_price: 1, max_per_sender: 1 });
+            let (a1, ah1) = test_tx("eon_sender_at_limit", 1);
+            let (b1, bh1) = test_tx("eon_other_payer", 1);
+            assert!(pool.add_binary_transaction(a1, ah1, 10));
+            assert!(pool.add_binary_transaction(b1, bh1.clone(), 5));
+            let (a2, ah2) = test_tx("eon_sender_at_limit", 2);
+            let admitted = if json {
+                let tx: Transaction = bincode::deserialize(&a2).unwrap();
+                pool.add_raw_transaction(serde_json::to_string(&tx).unwrap(), ah2, 20)
+            } else {
+                pool.add_binary_transaction(a2, ah2, 20)
+            };
+            assert!(!admitted, "the sender's limit binds (json={})", json);
+            assert!(pool.get_binary_transaction(&bh1).is_some(), "the other payer keeps its slot (json={})", json);
+            assert_eq!(pool.size(), 2);
+        }
+    }
+
+    // Claims taken before a full pool refuses are handed back: the quota slot of a TX refused as
+    // pool_full, and the evidence slot of a proof refused the same way.
+    #[test]
+    fn a_pool_full_refusal_keeps_no_claim() {
+        let pool = SimpleMempool::new(SimpleMempoolConfig { max_size: 1, min_gas_price: 1, max_per_sender: 1 });
+        let (hi, hih) = test_tx("eon_high_payer", 1);
+        assert!(pool.add_binary_transaction(hi, hih.clone(), 50));
+        let (lo, loh) = test_tx("eon_low_payer", 1);
+        assert!(!pool.add_binary_transaction(lo.clone(), loh.clone(), 10), "pool_full");
+        pool.remove_transaction(&hih);
+        assert!(pool.add_binary_transaction(lo, loh, 10), "its quota slot was not kept");
+
+        let pool = SimpleMempool::new(SimpleMempoolConfig { max_size: 1, min_gas_price: 1, max_per_sender: 100 });
+        let (hb, hbh) = heartbeat_tx(1);
+        assert!(pool.add_binary_transaction(bincode::serialize(&hb).unwrap(), hbh, 0));
+        let (p, ph) = proof_tx("super_full", "system_slashing", 0);
+        assert!(!pool.add_binary_transaction(bincode::serialize(&p).unwrap(), ph, 0), "top priority is full");
+        assert!(!pool.has_pending_evidence_against("super_full"), "the evidence slot was handed back");
+        assert!(pool.tx_count_by_sender.get("system_tx:system_slashing").map_or(true, |c| *c == 0));
+    }
+
+    // Two copies of one heartbeat in flight at once: HA has replaced H0 and claimed its slot but is not
+    // stored yet when HB replaces it. HB makes no room, and HA, finding it lost its key, drops at its
+    // insert instead of staying beside HB with no index entry.
+    #[test]
+    fn a_version_replaced_while_admitted_is_dropped() {
+        let pool = SimpleMempool::new(SimpleMempoolConfig { max_size: 2, min_gas_price: 1, max_per_sender: 100 });
+        let (h0, h0h) = heartbeat_tx(1);
+        assert!(pool.add_binary_transaction(bincode::serialize(&h0).unwrap(), h0h.clone(), 0));
+        let (t, th) = test_tx("eon_payer", 1);
+        assert!(pool.add_binary_transaction(t, th.clone(), 10));
+        let (ha, hah) = heartbeat_tx(2);
+        let (hb, hbh) = heartbeat_tx(3);
+        let key = ha.commitment_dedup_key().unwrap();
+
+        assert_eq!(pool.replace_or_register_commitment(key.clone(), &hah), Some(h0h));
+        assert!(matches!(pool.claim_sender_slot(&ha, &hah), SlotClaim::Claimed));
+        assert!(pool.commitment_key_held(Some(&key)), "a version in flight holds its key");
+        assert!(pool.add_binary_transaction(bincode::serialize(&hb).unwrap(), hbh.clone(), 0));
+        assert!(pool.get_binary_transaction(&th).is_some());
+        {
+            let mut queue = pool.by_gas_price.write();
+            assert!(!pool.insert_locked(&mut queue, &hah, TxStorage::Binary(bincode::serialize(&ha).unwrap()),
+                                        u64::MAX, Some(&key), None, None, &mut None));
+        }
+        assert!(pool.get_binary_transaction(&hah).is_none(), "HA dropped");
+        assert_eq!(pool.commitment_index.get(&key).map(|h| h.value().clone()), Some(hbh.clone()));
+        assert!(!pool.commitment_reverse.contains_key(&hah) && pool.commitment_reverse.contains_key(&hbh));
+        assert!(!pool.tx_sender_map.contains_key(&hah));
+        assert_eq!(pool.tx_count_by_sender.get("system_tx:super_hb").map(|c| *c), Some(1));
+        assert_eq!(pool.size(), 2);
+        assert!(pool.debug_check_consistency().2);
+    }
+
+    // The same races with real threads: nonce copies of one heartbeat, and a sender at its limit less one,
+    // each flooding a full pool at once. One version and one sender TX end up stored, and only the TX the
+    // one admission needed room for is gone.
+    #[test]
+    fn concurrent_copies_and_quota_floods_keep_the_pool_whole() {
+        let pool = SimpleMempool::new(SimpleMempoolConfig { max_size: 3, min_gas_price: 1, max_per_sender: 100 });
+        let (h0, h0h) = heartbeat_tx(0);
+        assert!(pool.add_binary_transaction(bincode::serialize(&h0).unwrap(), h0h, 0));
+        let (p1, p1h) = test_tx("eon_payer_1", 1);
+        let (p2, p2h) = test_tx("eon_payer_2", 1);
+        assert!(pool.add_binary_transaction(p1, p1h.clone(), 5));
+        assert!(pool.add_binary_transaction(p2, p2h.clone(), 6));
+        std::thread::scope(|s| {
+            for t in 0..8u64 {
+                let pool = &pool;
+                s.spawn(move || {
+                    for i in 0..25u64 {
+                        let (copy, h) = heartbeat_tx(1 + t * 25 + i);
+                        pool.add_binary_transaction(bincode::serialize(&copy).unwrap(), h, 0);
+                    }
+                });
+            }
+        });
+        let hb_key = heartbeat_tx(0).0.commitment_dedup_key().unwrap();
+        let current = pool.commitment_index.get(&hb_key).map(|h| h.value().clone()).expect("one version");
+        assert!(pool.get_binary_transaction(&current).is_some());
+        assert!(pool.get_binary_transaction(&p1h).is_some() && pool.get_binary_transaction(&p2h).is_some());
+        assert_eq!(pool.size(), 3);
+        assert_eq!(pool.commitment_reverse.len(), 1);
+        assert_eq!(pool.tx_count_by_sender.get("system_tx:super_hb").map(|c| *c), Some(1));
+        assert!(pool.debug_check_consistency().2);
+
+        let pool = SimpleMempool::new(SimpleMempoolConfig { max_size: 3, min_gas_price: 1, max_per_sender: 1 });
+        let (q1, q1h) = test_tx("eon_payer_1", 1);
+        let (q2, q2h) = test_tx("eon_payer_2", 1);
+        let (q3, q3h) = test_tx("eon_payer_3", 1);
+        assert!(pool.add_binary_transaction(q1, q1h.clone(), 5));
+        assert!(pool.add_binary_transaction(q2, q2h.clone(), 6));
+        assert!(pool.add_binary_transaction(q3, q3h.clone(), 7));
+        std::thread::scope(|s| {
+            for t in 0..8u64 {
+                let pool = &pool;
+                s.spawn(move || {
+                    for i in 0..4u64 {
+                        let (x, xh) = test_tx("eon_flooder", 1 + t * 4 + i);
+                        pool.add_binary_transaction(x, xh, 20);
+                    }
+                });
+            }
+        });
+        assert_eq!(pool.tx_count_by_sender.get("eon_flooder").map(|c| *c), Some(1), "one flooder TX");
+        assert!(pool.get_binary_transaction(&q1h).is_none(), "the one admission took the lowest slot");
+        assert!(pool.get_binary_transaction(&q2h).is_some() && pool.get_binary_transaction(&q3h).is_some(),
+                "and nothing else");
+        assert_eq!(pool.size(), 3);
+        assert_eq!(pool.tx_sender_map.len(), 3);
+        assert!(pool.debug_check_consistency().2);
+    }
 }
 
 #[cfg(test)]
@@ -1777,5 +2331,156 @@ mod ingress_gate_tests {
 
         pool.batch_remove_transactions(&[h.clone()]);
         assert!(pool.already_known(&h), "included tombstone must be known");
+    }
+
+    fn registration(node_id: &str, timestamp: u64) -> (Vec<u8>, String) {
+        let tx = Transaction::new(
+            "eon_wallet_r".to_string(), None, 0, 0, 0, 0, timestamp, None,
+            qnet_state::TransactionType::NodeRegistration {
+                node_id: node_id.to_string(), node_type: qnet_state::NodeType::Light,
+                wallet_address: "eon_wallet_r".to_string(), registration_proof: "p".to_string(),
+                api_endpoint: String::new(), burn_tx: "b".to_string(), vrf_pk: Vec::new(),
+                burn_wallet: "w".to_string(), burn_owner_sig: "s".to_string(), burn_amount: 1,
+                burn_cost: 1, burn_attestors: Vec::new(), attest_epoch: 1,
+            },
+            None,
+        );
+        let hash = format!("{:x}", Sha3_256::digest(&tx.canonical_bytes()));
+        (bincode::serialize(&tx).unwrap(), hash)
+    }
+
+    /// The registration a node holds in the pool is found by its node id; a newer one replaces it, and
+    /// once it leaves the pool nothing is found.
+    #[test]
+    fn the_resident_registration_of_a_node_is_found_by_its_id() {
+        let pool = super::hygiene_tests::test_pool_pub();
+        assert_eq!(pool.resident_registration("light_mobile_r"), None);
+        let (b1, h1) = registration("light_mobile_r", 1);
+        assert!(pool.add_binary_transaction(b1, h1.clone(), 0));
+        assert_eq!(pool.resident_registration("light_mobile_r"), Some(h1.clone()));
+        assert_eq!(pool.resident_registration("light_mobile_other"), None);
+        let (b2, h2) = registration("light_mobile_r", 2);
+        assert!(pool.add_binary_transaction(b2, h2.clone(), 0));
+        assert_eq!(pool.resident_registration("light_mobile_r"), Some(h2.clone()), "one per node, the newer");
+        assert_eq!(pool.pending_registration_backlog(), 1);
+        pool.batch_remove_transactions(&[h2]);
+        assert_eq!(pool.resident_registration("light_mobile_r"), None);
+    }
+}
+
+#[cfg(test)]
+mod sigbind_r1_tests {
+    use super::*;
+
+    fn pool(max_size: usize) -> SimpleMempool {
+        SimpleMempool::new(SimpleMempoolConfig { max_size, min_gas_price: 1, max_per_sender: 10_000 })
+    }
+
+    fn signed_transfer(nonce: u64, gas_price: u64, timestamp: u64, sig: u8) -> (Transaction, Vec<u8>, String) {
+        let mut tx = Transaction::new("eon_sender_a".to_string(), Some("eon_recipient_b".to_string()), 7, nonce,
+            gas_price, 10_000, timestamp, None,
+            qnet_state::TransactionType::Transfer {
+                from: "eon_sender_a".to_string(), to: "eon_recipient_b".to_string(), amount: 7,
+            },
+            None);
+        tx.dilithium_signature = Some(vec![sig; 3309]);
+        tx.hash = format!("{:x}", Sha3_256::digest(&tx.canonical_bytes()));
+        let bytes = bincode::serialize(&tx).unwrap();
+        let hash = tx.hash.clone();
+        (tx, bytes, hash)
+    }
+
+    /// The queue behind the pool: highest priority first, FIFO within a priority, each hash once, and a
+    /// removal touching only its entry.
+    #[test]
+    fn the_priority_queue_keeps_order_and_removes_by_hash() {
+        let mut q = PriorityQueue::default();
+        for (p, h) in [(5u64, "a"), (9, "b"), (5, "c"), (u64::MAX, "d"), (9, "e")] {
+            q.push_back(p, h.to_string());
+        }
+        q.push_back(1, "a".to_string());
+        let order: Vec<&str> = q.iter_desc().map(|(_, h)| h.as_str()).collect();
+        assert_eq!(order, ["d", "b", "e", "a", "c"]);
+        assert!(q.contains_at(5, "a") && !q.contains_at(1, "a"), "a hash is queued once");
+        assert!(q.remove("b") && !q.remove("b"));
+        assert_eq!(q.len(), 4);
+        assert!(q.remove("d") && !q.has_level(u64::MAX), "an emptied level goes");
+        assert_eq!(q.pop_lowest(), Some((5, "a".to_string())));
+        assert_eq!(q.pop_lowest(), Some((5, "c".to_string())));
+        assert_eq!((q.lowest_priority(), q.level_count()), (Some(9), 1));
+    }
+
+    /// SIGBIND-R1-02: a relay re-stamps a pending transfer (timestamp is in the hash, outside the signature).
+    /// The pool keeps the first version per (from, nonce): a copy is refused, and the doors see it before any
+    /// verify. A version paying more (a replacement the sender signed) takes the slot and the old one goes.
+    #[test]
+    fn one_pending_version_per_sender_nonce_unless_it_pays_more() {
+        let pool = pool(100);
+        let (first, fb, fh) = signed_transfer(4, 10, 1_700_000_000, 1);
+        assert!(pool.add_binary_transaction(fb, fh.clone(), 10));
+        let (copy, cb, ch) = signed_transfer(4, 10, 1_700_000_999, 1);
+        assert_ne!(fh, ch);
+        assert_eq!(pool.value_nonce_holder(&copy), Some(fh.clone()), "the door refuses it before any verify");
+        assert!(!pool.add_binary_transaction(cb, ch.clone(), 10), "a re-stamped copy is refused");
+        assert_eq!(pool.pending_value_hash("eon_sender_a", 4), Some(fh.clone()), "O15: found by (from, nonce)");
+        assert_eq!(pool.pending_value_hash("eon_sender_a", 9), None);
+        assert_eq!(pool.value_nonce_holder(&first), None, "the kept version itself is not blocked");
+        let (other, ob, oh) = signed_transfer(5, 10, 1_700_000_000, 1);
+        assert_eq!(pool.value_nonce_holder(&other), None);
+        assert!(pool.add_binary_transaction(ob, oh, 10), "another nonce is untouched");
+        let (bump, bb, bh) = signed_transfer(4, 20, 1_700_000_500, 2);
+        assert_eq!(pool.value_nonce_holder(&bump), None);
+        assert!(pool.add_binary_transaction(bb, bh.clone(), 20), "a higher-priced version replaces");
+        assert!(pool.get_binary_transaction(&fh).is_none(), "the lower-priced version left the pool");
+        assert_eq!(pool.size(), 2);
+        assert!(pool.debug_check_consistency().2);
+        pool.batch_remove_transactions(&[bh]);
+        let (again, ab, ah) = signed_transfer(4, 10, 1_700_000_001, 3);
+        assert_eq!(pool.value_nonce_holder(&again), None, "the slot frees with its TX");
+        assert!(pool.add_binary_transaction(ab, ah, 10));
+        let _ = first;
+    }
+
+    /// A full pool does not make room for a refused copy.
+    #[test]
+    fn a_restamped_copy_evicts_nothing_from_a_full_pool() {
+        let pool = pool(2);
+        let (_, fb, fh) = signed_transfer(4, 10, 1_700_000_000, 1);
+        let (_, ob, oh) = signed_transfer(5, 10, 1_700_000_000, 1);
+        assert!(pool.add_binary_transaction(fb, fh.clone(), 10));
+        assert!(pool.add_binary_transaction(ob, oh.clone(), 10));
+        let (_, cb, ch) = signed_transfer(4, 10, 1_700_000_777, 1);
+        assert!(!pool.add_binary_transaction(cb, ch, 10));
+        assert!(pool.get_binary_transaction(&fh).is_some() && pool.get_binary_transaction(&oh).is_some());
+    }
+
+    fn heartbeat(nonce: u64, sig: u8) -> (Transaction, Vec<u8>, String) {
+        let mut tx = Transaction::new("super_hb".to_string(), None, 0, nonce, u64::MAX, 0, 0, None,
+            qnet_state::TransactionType::Heartbeat {
+                node_id: "super_hb".to_string(), anchor_height: 1_500, anchor_hash: "ab".repeat(32),
+            },
+            None);
+        tx.dilithium_signature = Some(vec![sig; 3309]);
+        tx.dilithium_public_key = Some(b"super_hb".to_vec());
+        tx.hash = format!("{:x}", Sha3_256::digest(&tx.canonical_bytes()));
+        let bytes = bincode::serialize(&tx).unwrap();
+        let hash = tx.hash.clone();
+        (tx, bytes, hash)
+    }
+
+    /// SIGBIND-R1-01 (admission): a copy of a pooled commitment that differs only in fields no signature
+    /// covers is a relay's, refused at the doors before the verify; an honest re-sign (another signature)
+    /// and the pooled version itself are not.
+    #[test]
+    fn a_relayed_commitment_copy_is_known_before_any_verify() {
+        let pool = pool(100);
+        let (pooled, pb, ph) = heartbeat(2, 1);
+        assert!(!pool.is_relayed_commitment_copy(&pooled), "nothing pooled yet");
+        assert!(pool.add_binary_transaction(pb, ph, u64::MAX));
+        assert!(!pool.is_relayed_commitment_copy(&pooled), "the pooled version itself");
+        let (copy, _, _) = heartbeat(3, 1);
+        assert!(pool.is_relayed_commitment_copy(&copy), "same signature, another nonce");
+        let (resigned, _, _) = heartbeat(3, 2);
+        assert!(!pool.is_relayed_commitment_copy(&resigned), "a fresh signature is the signer's");
     }
 }

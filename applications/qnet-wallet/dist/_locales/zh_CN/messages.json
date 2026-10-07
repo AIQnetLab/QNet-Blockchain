@@ -1,0 +1,10 @@
+{
+  "extName": {
+    "message": "QNet 钱包",
+    "description": "Extension name in the browser and the store."
+  },
+  "extDescription": {
+    "message": "抗量子 QNet 钱包（ML-DSA-65），带 Solana 账户。激活 QNet Light 或 Super 节点，并记录 Light 节点。",
+    "description": "Store and extensions-page description, at most 132 characters."
+  }
+}

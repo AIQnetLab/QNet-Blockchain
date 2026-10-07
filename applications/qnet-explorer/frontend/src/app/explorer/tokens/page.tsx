@@ -1,8 +1,9 @@
 'use client';
 
 import React, { useState, useCallback, useEffect } from 'react';
-import Link from 'next/link';
+import ExplorerLink from '@/components/ExplorerLink';
 import { useRouter } from 'next/navigation';
+import { useKeepFromApp } from '@/contexts/AppContext';
 
 // ============================================================================
 // Token directory
@@ -49,6 +50,7 @@ const formatDeployed = (ts: number): string => {
 
 export default function TokensDirectoryPage() {
   const router = useRouter();
+  const keep = useKeepFromApp();
 
   // --- Contract lookup (existing behavior) ---
   const [contract, setContract] = useState('');
@@ -68,7 +70,7 @@ export default function TokensDirectoryPage() {
       const res = await fetch(`/api/token/${encodeURIComponent(value)}`);
       const result = await res.json().catch(() => null);
       if (res.ok && result?.success) {
-        router.push(`/explorer/token/${value}`);
+        router.push(keep(`/explorer/token/${value}`));
       } else {
         setLookupError(result?.error || 'No QRC-20 token found at that contract address.');
       }
@@ -77,7 +79,7 @@ export default function TokensDirectoryPage() {
     } finally {
       setChecking(false);
     }
-  }, [contract, router]);
+  }, [contract, router, keep]);
 
   const onKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter') lookup();
@@ -239,9 +241,9 @@ export default function TokensDirectoryPage() {
                 {tokens.map((t, idx) => (
                   <tr key={t.contract_address || idx}>
                     <td>
-                      <Link href={`/explorer/token/${t.contract_address}`} className="address-link">
+                      <ExplorerLink href={`/explorer/token/${t.contract_address}`} className="address-link">
                         {t.name || t.symbol || truncate(t.contract_address, 6, 4)}
-                      </Link>
+                      </ExplorerLink>
                     </td>
                     <td>
                       {t.symbol ? (
@@ -251,9 +253,9 @@ export default function TokensDirectoryPage() {
                       )}
                     </td>
                     <td>
-                      <Link href={`/explorer/token/${t.contract_address}`} className="address-link">
+                      <ExplorerLink href={`/explorer/token/${t.contract_address}`} className="address-link">
                         {truncate(t.contract_address, 6, 4)}
-                      </Link>
+                      </ExplorerLink>
                     </td>
                     <td>
                       {t.total_supply}
@@ -261,9 +263,9 @@ export default function TokensDirectoryPage() {
                     </td>
                     <td>
                       {t.deployer && t.deployer.length > 10 && t.deployer.includes('eon') ? (
-                        <Link href={`/explorer/address/${t.deployer}`} className="address-link">
+                        <ExplorerLink href={`/explorer/address/${t.deployer}`} className="address-link">
                           {truncate(t.deployer, 6, 4)}
-                        </Link>
+                        </ExplorerLink>
                       ) : (
                         <span className="address-link">{t.deployer || '—'}</span>
                       )}

@@ -6,6 +6,7 @@ members = [
     "core/qnet-state",
     "core/qnet-sharding",
     "core/qnet-vm",
+    "core/qnet-device-attest",
     "development/qnet-integration",
     "development/qnet-loadtest",
     "audit"

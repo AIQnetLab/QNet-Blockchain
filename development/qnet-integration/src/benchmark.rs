@@ -315,7 +315,7 @@ pub fn generate_pq_transaction_from_snapshot(
         gas_limit: GAS_LIMIT_TRANSFER,
         data: None,
         signature: None,                                          // Ed25519 field unused (pure PQ)
-        public_key: Some(hex::encode(sender.pq_pk.as_bytes())),   // ML-DSA-65 pubkey hex
+        public_key: None, // the key rides dilithium_public_key; this field is unsigned (tx_target_bound)
         tx_type: qnet_state::TransactionType::Transfer {
             from: sender.address.clone(),
             to: receiver.address.clone(),
@@ -353,6 +353,8 @@ pub struct BenchmarkManager {
     pq_accounts: RwLock<Vec<PqBenchmarkAccount>>,
     /// Running state
     is_running: AtomicBool,
+    /// A start is generating keys: a second one is refused meanwhile.
+    starting: AtomicBool,
     /// Transactions sent (pub for direct update from benchmark generator)
     pub transactions_sent: AtomicU64,
     /// Transactions confirmed (pub for direct update from benchmark generator)
@@ -380,6 +382,7 @@ impl BenchmarkManager {
             accounts: RwLock::new(Vec::new()),
             pq_accounts: RwLock::new(Vec::new()),
             is_running: AtomicBool::new(false),
+            starting: AtomicBool::new(false),
             transactions_sent: AtomicU64::new(0),
             transactions_confirmed: AtomicU64::new(0),
             errors: AtomicU64::new(0),
@@ -392,41 +395,21 @@ impl BenchmarkManager {
         }
     }
 
-    /// Initialize benchmark accounts (pure ML-DSA-65 / ML-DSA-65).
-    /// ML-DSA-65 keygen is CPU-heavy, so we log progress every 100 accounts.
+    /// Initialize benchmark accounts (pure ML-DSA-65), keys generated on the blocking pool.
     pub async fn initialize(&self, num_accounts: usize) {
-        let mut accounts = self.accounts.write().await;
-        accounts.clear();
-
-        println!("[BENCHMARK] 🔑 Generating {} test accounts with Dilithium3 (ML-DSA-65) keys...", num_accounts);
-
-        for i in 0..num_accounts {
-            accounts.push(BenchmarkAccount::new(i));
-            if (i + 1) % 100 == 0 {
-                println!("[BENCHMARK] 🔐 Dilithium3 keygen: {}/{}", i + 1, num_accounts);
-            }
+        match generate_keyed(num_accounts, BenchmarkAccount::new).await {
+            Ok(v) => *self.accounts.write().await = v,
+            Err(e) => println!("[BENCHMARK] ❌ {}", e),
         }
-
-        println!("[BENCHMARK] ✅ Dilithium3 accounts ready");
     }
 
-    /// Initialize the PQ account pool used by the rpc.rs generator path
-    /// (pure ML-DSA-65 / ML-DSA-65). Kept for API stability.
-    /// ML-DSA-65 keygen is CPU-heavy, so we log progress every 100 accounts.
+    /// Initialize the PQ account pool used by the rpc.rs generator path (pure ML-DSA-65), keys generated
+    /// on the blocking pool. Kept for API stability.
     pub async fn initialize_pq(&self, num_accounts: usize) {
-        let mut pq = self.pq_accounts.write().await;
-        pq.clear();
-
-        println!("[BENCHMARK] 🔑 Generating {} pure Dilithium3 (ML-DSA-65) accounts...", num_accounts);
-
-        for i in 0..num_accounts {
-            pq.push(PqBenchmarkAccount::new(i));
-            if (i + 1) % 100 == 0 {
-                println!("[BENCHMARK] 🔐 Dilithium3 keygen: {}/{}", i + 1, num_accounts);
-            }
+        match generate_keyed(num_accounts, PqBenchmarkAccount::new).await {
+            Ok(v) => *self.pq_accounts.write().await = v,
+            Err(e) => println!("[BENCHMARK] ❌ {}", e),
         }
-
-        println!("[BENCHMARK] ✅ Dilithium3 accounts ready ({} accounts)", num_accounts);
     }
 
     /// Get PQ accounts snapshot for lock-free generation in workers
@@ -434,11 +417,17 @@ impl BenchmarkManager {
         self.pq_accounts.read().await.clone()
     }
 
-    /// Start benchmark
+    /// Start benchmark. The run is claimed before the keys are generated, so two starts never both pass;
+    /// a start that does not finish (an error, or its request dropped during keygen) releases the claim.
     pub async fn start(&self, config: BenchmarkConfig) -> Result<(), String> {
-        if self.is_running.load(Ordering::SeqCst) {
+        if self.starting.swap(true, Ordering::SeqCst) {
+            return Err("Benchmark is starting".to_string());
+        }
+        let mut claim = StartClaim { manager: self, running: false };
+        if self.is_running.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
             return Err("Benchmark already running".to_string());
         }
+        claim.running = true;
 
         // Reset state
         self.transactions_sent.store(0, Ordering::SeqCst);
@@ -455,20 +444,25 @@ impl BenchmarkManager {
         if config.use_pq_sig {
             let pq_count = self.pq_accounts.read().await.len();
             if pq_count < config.num_accounts {
-                self.initialize_pq(config.num_accounts).await;
+                let keyed = generate_keyed(config.num_accounts, PqBenchmarkAccount::new).await?;
+                *self.pq_accounts.write().await = keyed;
             }
         } else {
             let accounts_count = self.accounts.read().await.len();
             if accounts_count < config.num_accounts {
-                self.initialize(config.num_accounts).await;
+                let keyed = generate_keyed(config.num_accounts, BenchmarkAccount::new).await?;
+                *self.accounts.write().await = keyed;
             }
+        }
+        if !self.is_running.load(Ordering::SeqCst) {
+            return Err("Benchmark stopped while it was starting".to_string());
         }
 
         // Store config
         *self.config.write().await = config.clone();
 
-        // Mark as running
-        self.is_running.store(true, Ordering::SeqCst);
+        // The run is on: keep the claim.
+        claim.running = false;
 
         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
         println!("🚀 QNET BENCHMARK STARTED - {:?}", config.preset);
@@ -675,7 +669,7 @@ impl BenchmarkManager {
             gas_limit: GAS_LIMIT_TRANSFER,
             data: None,
             signature: None,                                          // Ed25519 field unused (pure PQ)
-            public_key: Some(hex::encode(sender.pq_pk.as_bytes())),   // ML-DSA-65 pubkey hex
+            public_key: None, // the key rides dilithium_public_key; this field is unsigned (tx_target_bound)
             tx_type: qnet_state::TransactionType::Transfer {
                 from: sender.address.clone(),
                 to: receiver.address.clone(),
@@ -727,6 +721,11 @@ impl BenchmarkManager {
         self.is_running.load(Ordering::SeqCst)
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_running_for_test(&self, running: bool) {
+        self.is_running.store(running, Ordering::SeqCst);
+    }
+
     /// Get config
     pub async fn get_config(&self) -> BenchmarkConfig {
         self.config.read().await.clone()
@@ -742,6 +741,39 @@ impl Default for BenchmarkManager {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Releases a start's claim when it returns or is dropped; `running` still set means the start did not
+/// finish, so the run it claimed is released too.
+struct StartClaim<'a> {
+    manager: &'a BenchmarkManager,
+    running: bool,
+}
+
+impl Drop for StartClaim<'_> {
+    fn drop(&mut self) {
+        if self.running {
+            self.manager.is_running.store(false, Ordering::SeqCst);
+        }
+        self.manager.starting.store(false, Ordering::SeqCst);
+    }
+}
+
+/// ML-DSA-65 keys for `n` benchmark accounts, generated on the blocking pool: keygen is CPU-bound and must
+/// never hold an async worker, which the RPC and consensus tasks share.
+async fn generate_keyed<T: Send + 'static>(n: usize, make: fn(usize) -> T) -> Result<Vec<T>, String> {
+    tokio::task::spawn_blocking(move || {
+        println!("[BENCHMARK] 🔑 Generating {} test accounts with Dilithium3 (ML-DSA-65) keys...", n);
+        let mut accounts = Vec::with_capacity(n);
+        for i in 0..n {
+            accounts.push(make(i));
+            if (i + 1) % 1_000 == 0 {
+                println!("[BENCHMARK] 🔐 Dilithium3 keygen: {}/{}", i + 1, n);
+            }
+        }
+        println!("[BENCHMARK] ✅ Dilithium3 accounts ready ({} accounts)", n);
+        accounts
+    }).await.map_err(|e| format!("benchmark keygen failed: {}", e))
 }
 
 // Global benchmark manager instance
@@ -1268,4 +1300,30 @@ mod tests {
     // bench_server_direct_*. Those used POST /api/v1/transaction which rejects
     // EON1benchmark* addresses (validate_eon_address expects 41-char
     // hex+eon format). The correct path is POST /api/v1/benchmark/start (above).
+}
+
+#[cfg(test)]
+mod start_claim_tests {
+    use super::*;
+
+    /// Two starts at once: one runs, the other is refused while the first generates keys. A start whose
+    /// request is dropped during keygen releases the run, so the next start is not locked out.
+    #[tokio::test]
+    async fn a_start_is_claimed_once_and_released_when_dropped() {
+        let m = BenchmarkManager::new();
+        let cfg = BenchmarkConfig { num_accounts: 2, ..BenchmarkConfig::default() };
+        let (a, b) = tokio::join!(m.start(cfg.clone()), m.start(cfg.clone()));
+        assert_eq!(a.is_ok() as u8 + b.is_ok() as u8, 1, "{a:?} {b:?}");
+        assert!(m.is_running());
+        assert!(m.start(cfg.clone()).await.is_err(), "already running");
+        m.stop().await;
+
+        let m = BenchmarkManager::new();
+        let slow = BenchmarkConfig { num_accounts: 200, ..BenchmarkConfig::default() };
+        let dropped = tokio::time::timeout(std::time::Duration::from_millis(0), m.start(slow)).await;
+        assert!(dropped.is_err(), "dropped while its keys were being generated");
+        assert!(!m.is_running(), "the claim is released");
+        assert!(m.start(cfg).await.is_ok());
+        assert!(m.is_running());
+    }
 }

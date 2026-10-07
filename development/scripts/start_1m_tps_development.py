@@ -33,7 +33,7 @@ def create_sharding_module():
 name = "qnet-sharding"
 version = "0.1.0"
 edition = "2021"
-authors = ["QNet Team"]
+authors = ["Orrery Group LLC"]
 description = "Advanced sharding implementation for 1M TPS"
 
 [dependencies]

@@ -8,6 +8,15 @@
 #include "symmetric.h"
 #include <stdint.h>
 
+/* QNet: secrets on the stack (the expanded key s1/s2/t0, the signing seed K, rhoprime, rnd, y, z) are wiped
+ * before these functions return, with stores the compiler may not drop (MPLAT-R2-05). Outputs are unchanged. */
+static void qnet_wipe(void *p, size_t n) {
+    volatile uint8_t *v = (volatile uint8_t *)p;
+    while (n--) {
+        *v++ = 0;
+    }
+}
+
 /*************************************************
 * Name:        PQCLEAN_MLDSA65_CLEAN_crypto_sign_keypair
 *
@@ -63,6 +72,11 @@ int PQCLEAN_MLDSA65_CLEAN_crypto_sign_keypair(uint8_t *pk, uint8_t *sk) {
     shake256(tr, TRBYTES, pk, PQCLEAN_MLDSA65_CLEAN_CRYPTO_PUBLICKEYBYTES);
     PQCLEAN_MLDSA65_CLEAN_pack_sk(sk, rho, tr, key, &t0, &s1, &s2);
 
+    qnet_wipe(seedbuf, sizeof(seedbuf));
+    qnet_wipe(&s1, sizeof(s1));
+    qnet_wipe(&s1hat, sizeof(s1hat));
+    qnet_wipe(&s2, sizeof(s2));
+    qnet_wipe(&t0, sizeof(t0));
     return 0;
 }
 
@@ -191,6 +205,17 @@ rej:
     /* Write signature */
     PQCLEAN_MLDSA65_CLEAN_pack_sig(sig, sig, &z, &h);
     *siglen = PQCLEAN_MLDSA65_CLEAN_CRYPTO_BYTES;
+
+    qnet_wipe(seedbuf, sizeof(seedbuf));
+    qnet_wipe(&s1, sizeof(s1));
+    qnet_wipe(&s2, sizeof(s2));
+    qnet_wipe(&t0, sizeof(t0));
+    qnet_wipe(&y, sizeof(y));
+    qnet_wipe(&z, sizeof(z));
+    qnet_wipe(&w0, sizeof(w0));
+    qnet_wipe(&w1, sizeof(w1));
+    qnet_wipe(&h, sizeof(h));
+    qnet_wipe(&cp, sizeof(cp));
     return 0;
 }
 

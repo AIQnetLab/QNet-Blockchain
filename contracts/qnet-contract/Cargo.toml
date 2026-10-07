@@ -1,0 +1,11 @@
+[package]
+name = "qnet-contract"
+version = "0.1.0"
+edition = "2021"
+description = "Bindings for the QNet WASM contract host (module env), without an allocator."
+publish = false
+
+[features]
+default = ["panic-handler"]
+# A panic ends the call with revert("panic"). Turn off to provide your own handler.
+panic-handler = []

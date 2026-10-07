@@ -66,7 +66,7 @@ export default function Page() {
                 </div>
                 <div className="hero-description">
                   <p>
-                    AI-designed post-quantum cryptography with 424,411 TPS verified performance. 
+                    AI-designed post-quantum cryptography with 13,000 transfers/sec measured end-to-end. 
                     Revolutionary Pool #3 system where activation fees benefit all active nodes. 
                     This is an experimental blockchain - no guarantees provided.
                   </p>
@@ -82,9 +82,9 @@ export default function Page() {
               </div>
               <div className="network-stats">
                 <div className="stat-card">
-                  <div className="stat-number">424,411</div>
-                  <div className="stat-label">Max TPS</div>
-                  <div className="stat-trend">Verified Performance</div>
+                  <div className="stat-number">13k</div>
+                  <div className="stat-label">Transfers/sec</div>
+                  <div className="stat-trend">measured E2E · 40-80k on validator hardware</div>
                 </div>
                 <div className="stat-card">
                   <div className="stat-number">31/31</div>

@@ -130,13 +130,25 @@ impl Storage {
 
     /// Persist a light node's per-epoch attestation (genesis restart resilience): the boundary bitmap TX
     /// is built from RAM only, so a mid-epoch restart would otherwise drop this shard's attestations.
-    /// Zero-padded epoch key ⇒ O(1) range-delete prune. Idempotent.
-    pub fn save_light_epoch_eligible(&self, epoch: u64, node_id: &str) -> IntegrationResult<()> {
+    /// Zero-padded epoch key ⇒ O(1) range-delete prune. Idempotent. The value is `answered_at` (Unix
+    /// seconds, 8 bytes BE): the pinger's stamp of the answer that counted the node in this epoch. A
+    /// 1-byte value, written before the time was kept, carries none.
+    pub fn save_light_epoch_eligible(&self, epoch: u64, node_id: &str, answered_at: u64) -> IntegrationResult<()> {
         let cf = self.persistent.db.cf_handle("pending_rewards")
             .ok_or_else(|| IntegrationError::StorageError("pending_rewards column family not found".to_string()))?;
         let key = format!("lelig_{:010}_{}", epoch, node_id);
-        self.persistent.db.put_cf(&cf, key.as_bytes(), &[1u8])?;
+        self.persistent.db.put_cf(&cf, key.as_bytes(), answered_at.to_be_bytes())?;
         Ok(())
+    }
+
+    /// When the answer that counted `node_id` in `epoch` was given (`save_light_epoch_eligible`); None when
+    /// this genesis holds no row for it, or one without a time.
+    pub fn light_counted_answer_at(&self, node_id: &str, epoch: u64) -> Option<u64> {
+        let cf = self.persistent.db.cf_handle("pending_rewards")?;
+        let key = format!("lelig_{:010}_{}", epoch, node_id);
+        self.persistent.db.get_cf(&cf, key.as_bytes()).ok().flatten()
+            .filter(|v| v.len() == 8)
+            .map(|v| { let mut b = [0u8; 8]; b.copy_from_slice(&v); u64::from_be_bytes(b) })
     }
 
     /// Reload persisted light attestations for epochs >= from_epoch (boot rebuild of the RAM map).
@@ -167,6 +179,16 @@ impl Storage {
         let end = format!("lelig_{:010}_", before_epoch);
         self.persistent.db.delete_range_cf(&cf, &b"lelig_0000000000_"[..], end.as_bytes())?;
         Ok(())
+    }
+
+    /// Each owner's own committed row of a shard's epoch, (owner, bitmap), before the OR that
+    /// `load_light_bitmaps` takes. Read only: the device layer's cross-owner monitor compares them.
+    pub fn load_light_bitmaps_by_owner(&self, epoch: u64, shard: usize) -> Vec<(usize, Vec<u8>)> {
+        let Some(cf) = self.persistent.db.cf_handle("pending_rewards") else { return Vec::new(); };
+        crate::node::light_shard_owners(shard).into_iter().filter_map(|signer| {
+            let d = self.persistent.db.get_cf(&cf, Self::light_bm_key(epoch, shard, signer).as_bytes()).ok()??;
+            (d.len() > 8).then(|| (signer, d[8..].to_vec()))
+        }).collect()
     }
 
     /// Load the ≤5 Light eligibility bitmaps for an epoch as (genesis_idx → bitmap), sorted.
@@ -290,4 +312,26 @@ impl Storage {
             .collect()
     }
 
+}
+
+#[cfg(test)]
+mod tests_light_answer_time {
+    use super::*;
+
+    /// The row of a counted light node keeps the time of the answer that counted it; the loader still reads keys
+    /// only, and a row written before the time was kept (one byte) has none.
+    #[test]
+    fn the_counting_answer_keeps_its_time_and_an_old_row_has_none() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = Storage::new(dir.path().to_str().unwrap()).unwrap();
+        s.save_light_epoch_eligible(150, "light_a", 1_790_000_123).unwrap();
+        assert_eq!(s.light_counted_answer_at("light_a", 150), Some(1_790_000_123));
+        assert_eq!(s.light_counted_answer_at("light_a", 149), None);
+        assert_eq!(s.light_counted_answer_at("light_b", 150), None);
+        assert_eq!(s.load_light_epoch_eligible(150).unwrap(), vec![(150, "light_a".to_string())]);
+        let cf = s.persistent.db.cf_handle("pending_rewards").unwrap();
+        s.persistent.db.put_cf(&cf, b"lelig_0000000151_light_a", [1u8]).unwrap();
+        assert_eq!(s.light_counted_answer_at("light_a", 151), None);
+        assert_eq!(s.load_light_epoch_eligible(150).unwrap().len(), 2, "the old row still counts the node");
+    }
 }

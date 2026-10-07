@@ -1,0 +1,17 @@
+[package]
+name = "game-items"
+version = "0.1.0"
+edition = "2021"
+description = "QNet contract: numbered game items with owner mint, transfer and balances."
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+qnet-contract = { path = "../../qnet-contract" }
+
+# Read at build time; the build tool reminds when unset and refuses a value that is not a valid address
+# (its checksum included), since the deployed code can never change.
+[package.metadata.qnet.env]
+GAME_ITEMS_OWNER = { kind = "address", meaning = "the address allowed to mint; a build without it can never mint" }

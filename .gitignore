@@ -57,6 +57,11 @@ target/
 **/*.rs.bk
 *.pdb
 
+# Built app packages: store uploads and release assets, never repository files (an old build at the root
+# would publish screens no current build has)
+*.apk
+*.aab
+
 # Android/React Native SENSITIVE FILES - NEVER COMMIT!
 *.keystore
 *.jks
@@ -163,6 +168,8 @@ keys/
 logs/
 *.key
 *.pem
+# Public certificate chains (no keys) the device-attest tests read
+!core/qnet-device-attest/tests/testdata/**/*.pem
 *.cert
 blockchain_data/
 peers.json

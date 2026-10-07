@@ -302,6 +302,19 @@ export class NodeClient {
     return out;
   }
 
+  // Where each admitted endpoint's history archive starts: null for a node without one (or one too old to
+  // answer). A body past the retention window can still be agreed on where enough archives reach down.
+  async getArchiveStarts(): Promise<Array<number | null>> {
+    const pool = this.admitted();
+    const res = await Promise.allSettled(pool.map(e => this.fetchOne<{ enabled?: boolean; segments?: Array<{ first_height?: unknown }> }>(
+      e, '/api/v1/archive?limit=1', { method: 'GET' }, MAX_SMALL_BYTES, 8_000)));
+    return res.map(r => {
+      if (r.status !== 'fulfilled' || !r.value.enabled || !Array.isArray(r.value.segments)) return null;
+      const first = Number(r.value.segments[0]?.first_height);
+      return Number.isSafeInteger(first) && first >= 0 ? first : null;
+    });
+  }
+
   async getBlock(height: number, pin?: string): Promise<NodeBlock | null> {
     return (await this.getBlockFrom(height, pin))?.block ?? null;
   }
@@ -421,6 +434,13 @@ export class NodeClient {
       if (this.wsSocket) { try { this.wsSocket.close(); } catch { /* closing */ } }
     };
   }
+}
+
+// The lowest height `honestOne` archives all reach: a body below the retention window is served by
+// agreement only from there up. Fewer archives than that: nothing below the window is reachable.
+export function archiveFloor(starts: Array<number | null>, honestOne: number): number {
+  const s = starts.filter((x): x is number => x !== null).sort((a, b) => a - b);
+  return honestOne >= 1 && s.length >= honestOne ? s[honestOne - 1] : Number.POSITIVE_INFINITY;
 }
 
 // One header page per endpoint, reduced to what the endpoints agree on:

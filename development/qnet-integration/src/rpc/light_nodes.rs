@@ -8,25 +8,49 @@ pub(super) async fn handle_light_node_token_refresh(
     blockchain:  Arc<BlockchainNode>,
 ) -> Result<impl warp::Reply, warp::Rejection> {
     use std::time::{SystemTime, UNIX_EPOCH};
-
-    // Rate limit
-    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "light_node_token_refresh") {
-        return Ok(rate_limit_response);
-    }
-
+    use crate::light_binding as lb;
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+
+    // The address's budget of failed requests (L-2): every refusal up to and including the signature check spends
+    // it (`fail`); a refresh the bound device signed spends none, and is held by the node's own limit.
+    if let Some(wait) = TOKEN_REFRESH_FAIL_LIMIT.blocked(remote_addr, now) {
+        let mut v = lb::Refusal::RateLimited.to_json();
+        v["retry_after_seconds"] = serde_json::json!(wait);
+        return Ok(warp::reply::json(&v));
+    }
+    let fail = |v: serde_json::Value| -> Result<warp::reply::Json, Rejection> {
+        TOKEN_REFRESH_FAIL_LIMIT.charge(remote_addr, now);
+        Ok(warp::reply::json(&v))
+    };
 
     // Timestamp within 5 minutes
     if now.abs_diff(req.timestamp) > 300 {
-        return Ok(warp::reply::json(&serde_json::json!({
-            "success": false, "error": "Request expired"
-        })));
+        return fail(serde_json::json!({
+            "success": false, "error": "Request expired", "reason": "expired"
+        }));
     }
 
-    if req.node_id.is_empty() || req.device_token.is_empty() {
-        return Ok(warp::reply::json(&serde_json::json!({
-            "success": false, "error": "node_id and device_token required"
-        })));
+    let pt = lb::canonical_push_type(Some(req.push_type.as_str()));
+    // v2 signs the push target itself (the token, or the endpoint for UnifiedPush); the legacy form
+    // needs a token, as before.
+    let target = lb::push_target(pt, &req.device_token, req.endpoint.as_deref()).to_string();
+    let well_formed = match req.seq {
+        None => !req.device_token.is_empty(),
+        Some(_) => pt == "polling" || !target.is_empty(),
+    };
+    if req.node_id.is_empty() || !well_formed {
+        return fail(serde_json::json!({
+            "success": false, "error": "node_id and device_token required", "reason": "bad_request"
+        }));
+    }
+    // Every form: the record's endpoint is where the genesis nodes POST, on each push and each wake.
+    let endpoint_sent = if req.seq.is_some() { Some(target.as_str()) } else { req.endpoint.as_deref().filter(|e| !e.is_empty()) };
+    if let (Some(ep), "unifiedpush") = (endpoint_sent, pt) {
+        if let Err(e) = validate_unified_push_endpoint(ep) {
+            return fail(serde_json::json!({
+                "success": false, "error": format!("Invalid UnifiedPush endpoint: {}", e), "reason": "bad_request"
+            }));
+        }
     }
 
     // PING DELEGATION v7.1: token-refresh auth is rooted in the node's Dilithium ping-delegation
@@ -34,35 +58,32 @@ pub(super) async fn handle_light_node_token_refresh(
     // RAM-poisonable Ed25519 gossip pubkey. The delegation cert is verified against the IMMUTABLE
     // on-chain key (load_vrf_public_key), so an attacker who poisons the RAM registry cannot forge
     // this node's token-refresh. Fail-closed at every missing/mismatch step.
-    // Request signature format: "ping_dilithium:<dilithium_sig>".
-    if !req.signature.starts_with("ping_dilithium:") {
-        if crate::node::is_warn() {
-            println!("[WARN][LIGHT] token_refresh_bad_sig_prefix node={}", req.node_id);
-        }
-        return Ok(warp::reply::json(&serde_json::json!({
-            "success": false, "error": "Invalid signature"
-        })));
-    }
-    let inner_sig = &req.signature[15..]; // Skip "ping_dilithium:" prefix
-
-    // C: ping keys live in the dedicated CF (point-read), not the trimmed RAM registry.
-    let (ping_pk_hex, delegation_cert) = match blockchain.get_storage().get_light_ping_keys(&req.node_id) {
-        Some(kv) => kv,
+    // Request signature format: "ping_dilithium:<dilithium_sig>" (v2 also takes the bare signature).
+    let inner_sig = match req.signature.strip_prefix("ping_dilithium:") {
+        Some(s) => s,
+        None if req.seq.is_some() => req.signature.as_str(),
         None => {
-            return Ok(warp::reply::json(&serde_json::json!({
-                "success": false, "error": "Node not found or missing ping delegation"
-            })));
+            if crate::node::is_warn() {
+                println!("[WARN][LIGHT] token_refresh_bad_sig_prefix node={}", req.node_id);
+            }
+            return fail(serde_json::json!({
+                "success": false, "error": "Invalid signature", "reason": "bad_signature"
+            }));
         }
     };
 
-    if ping_pk_hex.is_empty() || delegation_cert.is_empty() {
+    // C: ping keys live in the dedicated CF (point-read), not the trimmed RAM registry.
+    let binding = blockchain.get_storage().get_light_binding(&req.node_id)
+        .filter(|b| !b.ping_pubkey.is_empty() && !b.cert.is_empty());
+    let Some(binding) = binding else {
         if crate::node::is_warn() {
             println!("[WARN][LIGHT] token_refresh_ping_delegation_missing node={}", req.node_id);
         }
-        return Ok(warp::reply::json(&serde_json::json!({
-            "success": false, "error": "Node not found or missing ping delegation"
-        })));
-    }
+        return fail(serde_json::json!({
+            "success": false, "error": "Node not found or missing ping delegation", "reason": "not_registered"
+        }));
+    };
+    let ping_pk_hex = binding.ping_pubkey.clone();
 
     // The identity the delegation must verify under: the committed key when the chain holds one, else
     // the key the device recorded when it last proved itself against the committed hash. Fail-closed.
@@ -72,75 +93,126 @@ pub(super) async fn handle_light_node_token_refresh(
             if crate::node::is_warn() {
                 println!("[WARN][LIGHT] token_refresh_no_onchain_key node={}", req.node_id);
             }
-            return Ok(warp::reply::json(&serde_json::json!({
-                "success": false, "error": "Invalid signature"
-            })));
+            return fail(serde_json::json!({
+                "success": false, "error": "Invalid signature", "reason": "bad_signature"
+            }));
         }
     };
 
-    // Step 1: Verify the delegation cert authorizing ping_pubkey, against the on-chain key.
-    let delegation_msg = format!("delegate_ping:{}:{}", ping_pk_hex, req.node_id);
-    if !verify_mobile_dilithium_signature(&delegation_msg, &delegation_cert, &onchain_pk_hex) {
+    // Step 1: Verify the delegation cert authorizing ping_pubkey, against the on-chain key, in the form
+    // the binding was made (v2 once a v2 binding exists).
+    let Some(form) = lb::verify_delegation(&binding.cert, &ping_pk_hex, &req.node_id, &onchain_pk_hex) else {
         if crate::node::is_warn() {
             println!("[WARN][LIGHT] token_refresh_delegation_cert_invalid node={}", req.node_id);
         }
-        return Ok(warp::reply::json(&serde_json::json!({
-            "success": false, "error": "Invalid signature"
-        })));
-    }
+        return fail(serde_json::json!({
+            "success": false, "error": "Invalid signature", "reason": "bad_signature"
+        }));
+    };
 
     // Step 2: Verify the token-refresh signature against the authorized ping_pubkey.
     // Message string MUST stay byte-identical to what the mobile signs.
-    let message = format!("token_refresh:{}:{}", req.node_id, req.timestamp);
+    let message = match req.seq {
+        None => format!("token_refresh:{}:{}", req.node_id, req.timestamp),
+        // v2 (U7): the preimage binds the push target and the sequence.
+        Some(seq) => lb::token_refresh_v2_message(&req.node_id, &target, seq, req.timestamp),
+    };
     if !verify_mobile_dilithium_signature(&message, inner_sig, &ping_pk_hex) {
         if crate::node::is_warn() {
             println!("[WARN][LIGHT] token_refresh_bad_sig node={}", req.node_id);
         }
-        return Ok(warp::reply::json(&serde_json::json!({
-            "success": false, "error": "Invalid signature"
-        })));
+        return fail(serde_json::json!({
+            "success": false, "error": "Invalid signature", "reason": "bad_signature"
+        }));
     }
-
-    let pt = match req.push_type.as_str() {
-        "unifiedpush" => "unifiedpush",
-        "polling"     => "polling",
-        _             => "fcm",
+    // The refresh belongs to the stored binding. Judged only once the bound device's key signed it, so
+    // the binding's form and sequence are told to nobody else: a legacy refresh (its token is not
+    // signed) is taken only while no v2 binding exists, a v2 one only at the stored sequence.
+    match req.seq {
+        None if !binding.never_v2() => return Ok(warp::reply::json(&lb::Refusal::BindV2Required.to_json())),
+        Some(_) if form.seq() != req.seq => return Ok(warp::reply::json(&lb::Refusal::StaleSeq.to_json())),
+        _ => {}
+    }
+    let seq = req.seq.unwrap_or(0);
+    // A v2 record keeps exactly what the refresh signs (as /bind does): the token for FCM, the
+    // endpoint for UnifiedPush, nothing for polling. A legacy record keeps the fields as sent.
+    let (rec_token, rec_endpoint): (String, Option<String>) = match (req.seq, pt) {
+        (None, _) => (req.device_token.clone(), req.endpoint.clone()),
+        (Some(_), "fcm") => (req.device_token.clone(), None),
+        (Some(_), "unifiedpush") => (String::new(), req.endpoint.clone()),
+        (Some(_), _) => (String::new(), None),
     };
+    // A legacy record keeps the wallet key its refresh was proven under (the delegation's), so it
+    // belongs to the legacy binding here and displaces a record someone else planted.
+    let writer = if req.seq.is_none() { lb::record_writer(&onchain_pk_hex) } else { String::new() };
 
     // LWW record: an unchanged triple keeps its original stamp; a changed one is stamped now
     // by this (serving) genesis — the ordering authority for the update. The peer fan-out runs
     // in BOTH cases: the old unchanged-skip also skipped the sync, so a peer that missed the
     // original update (the shard-owner pinger included) stayed stale forever.
-    let stored = blockchain.get_storage().get_fcm_record(&req.node_id);
-    let unchanged = stored.as_ref().map(|(t, p, e, _)|
-        t == &req.device_token && p == pt && e.as_deref() == req.endpoint.as_deref()
+    let stored = blockchain.get_storage().get_fcm_entry(&req.node_id);
+    let unchanged = stored.as_ref().map(|e|
+        e.token == rec_token && e.push_type == pt && e.endpoint.as_deref() == rec_endpoint.as_deref()
+            && e.seq == seq && e.writer == writer
     ).unwrap_or(false);
+    // A v2 refresh older than the message that set the channel now (a replay of an earlier refresh, or
+    // the device's clock went back) is refused before the budget, as the write below would refuse it.
+    if !unchanged && req.seq.is_some()
+        && stored.as_ref().map_or(false, |e| (seq, req.timestamp) < (e.seq, e.updated_at)) {
+        return Ok(warp::reply::json(&lb::Refusal::Expired.to_json()));
+    }
+    // The node's budget is spent only by a refresh that changes the channel: a replay of a captured
+    // refresh inside its window cannot use it up and lock out the device's real refresh.
+    if !unchanged && !TOKEN_REFRESH_NODE_LIMIT.allows(&req.node_id, now) {
+        return Ok(warp::reply::json(&lb::Refusal::RateLimited.to_json()));
+    }
     // Monotonic bump past the stored stamp: a genuinely newer event must supersede even
-    // when this genesis's clock lags the one that stamped the old record.
+    // when this genesis's clock lags the one that stamped the old record. A v2 record is ordered by
+    // the refresh's own signed time instead, as every peer orders it, so a replayed refresh or attach
+    // never takes the channel back.
     let record_ts = if unchanged {
-        stored.as_ref().map(|r| r.3).unwrap_or(now)
+        stored.as_ref().map(|e| e.updated_at).unwrap_or(now)
+    } else if req.seq.is_some() {
+        req.timestamp
     } else {
-        std::cmp::max(now, stored.as_ref().map(|r| r.3.saturating_add(1)).unwrap_or(now))
+        std::cmp::max(now, stored.as_ref().map(|e| e.updated_at.saturating_add(1)).unwrap_or(now))
     };
 
     if !unchanged {
-        if let Err(e) = blockchain.get_storage().save_fcm_token(
-            &req.node_id, &req.device_token, pt, req.endpoint.as_deref(), record_ts,
-        ) {
-            println!("[WARN][LIGHT] token_refresh_save_failed node={} err={}", req.node_id, e);
-            return Ok(warp::reply::json(&serde_json::json!({
-                "success": false, "error": "Storage error"
-            })));
+        let written = if req.seq.is_some() {
+            blockchain.get_storage().save_fcm_token_seq(&req.node_id, &rec_token, pt, rec_endpoint.as_deref(), record_ts, seq)
+        } else {
+            blockchain.get_storage().save_fcm_token_by(&req.node_id, &rec_token, pt, rec_endpoint.as_deref(), record_ts, &writer)
+        };
+        match written {
+            Ok(true) => {}
+            // The binding's channel was set by a message signed later than this refresh.
+            Ok(false) => return Ok(warp::reply::json(&lb::Refusal::Expired.to_json())),
+            Err(e) => {
+                println!("[WARN][LIGHT] token_refresh_save_failed node={} err={}", req.node_id, e);
+                return Ok(warp::reply::json(&serde_json::json!({
+                    "success": false, "error": "Storage error"
+                })));
+            }
         }
         if let Some(p2p) = blockchain.get_unified_p2p() {
-            p2p.update_light_node_push_type(&req.node_id, pt, now);
+            p2p.refresh_light_node_push_channel(&blockchain.get_storage(), &req.node_id);
         }
         if crate::node::is_info() {
-            println!("[INFO][LIGHT] token_refreshed node={} push={}", req.node_id, pt);
+            println!("[INFO][LIGHT] token_refreshed node={} push={} seq={}", req.node_id, pt, seq);
         }
     } else if crate::node::is_debug() {
         println!("[DBG][LIGHT] token_refresh_unchanged node={} resync_peers=true", req.node_id);
     }
+    // A v2 record travels with the device's own signatures, so each peer re-verifies it (H5).
+    let proof = req.seq.map(|_| TokenSyncProof {
+        identity_pubkey: onchain_pk_hex.clone(),
+        ping_pubkey: ping_pk_hex.clone(),
+        delegation_cert: binding.cert.clone(),
+        kind: "refresh".to_string(),
+        sig: inner_sig.to_string(),
+        sig_ts: req.timestamp,
+    });
 
     // Sync to peer genesis nodes (fire-and-forget), carrying the record's authoritative ts.
     // Unchanged-record rebroadcasts (anti-stale heal) are bounded to one per node per hour.
@@ -155,16 +227,16 @@ pub(super) async fn handle_light_node_token_refresh(
         fanout_dedup().insert(req.node_id.clone(), now);
         use crate::genesis_constants::GENESIS_NODE_IPS;
         let node_id_clone = req.node_id.clone();
-        let token_clone = req.device_token.clone();
+        let token_clone = rec_token.clone();
         let pt_clone = pt.to_string();
-        let ep_clone = req.endpoint.clone();
+        let ep_clone = rec_endpoint.clone();
         let our_ip = {
             let bid = std::env::var("QNET_BOOTSTRAP_ID").unwrap_or_default();
             GENESIS_NODE_IPS.iter().find(|(_, id)| *id == bid)
                 .map(|(ip, _)| ip.to_string()).unwrap_or_default()
         };
         tokio::spawn(async move {
-            sync_fcm_token_to_genesis_peers(&node_id_clone, &token_clone, &pt_clone, ep_clone.as_deref(), &our_ip, record_ts).await;
+            sync_fcm_token_to_genesis_peers(&node_id_clone, &token_clone, &pt_clone, ep_clone.as_deref(), &our_ip, record_ts, seq, proof, &writer, "", "").await;
         });
     }
 
@@ -207,6 +279,38 @@ pub(super) struct LightNodeRegisterRequest {
     pub(super) ping_pubkey: Option<String>,           // 3904 hex (ML-DSA-65) or 64 hex (legacy Ed25519)
     #[serde(default)]
     pub(super) ping_delegation_cert: Option<String>,  // ML-DSA-65 sig of "delegate_ping:{ping_pubkey}:{node_id}"
+}
+
+/// The legacy register's answer for an on-chain node the caller cannot re-attach: the same whatever is
+/// bound to the node, so it tells nothing the public status does not.
+fn already_registered_reply(pseudonym: &str) -> serde_json::Value {
+    let (next_ping_time, window_number) = crate::unified_p2p::SimplifiedP2P::get_next_ping_time(pseudonym);
+    json!({
+        "success": true,
+        "already_registered": true,
+        "node_id": pseudonym,
+        "node_type": "light",
+        "next_ping_time": next_ping_time,
+        "next_ping_window": window_number,
+        "message": "Node already registered. Your existing node has been restored."
+    })
+}
+
+/// Whether the legacy register may write the push record. For a node already on chain (`reactivating`) its only
+/// proof is a static signature over the public wallet address, which anyone who saw it can replay; a replay brings
+/// no ping key the chain's key newly delegated, so only a ping-key write that applied lets the record change. An
+/// unchanged or refused key (a replay of the current delegation or an older one) keeps the stored record; the
+/// installed app changes its token through the token refresh, which its ping key signs with a time (M-8).
+pub(crate) fn legacy_record_write_allowed(reactivating: bool, key_write: Option<crate::storage::PingKeyWrite>) -> bool {
+    !reactivating || key_write == Some(crate::storage::PingKeyWrite::Applied)
+}
+
+/// The legacy register's ownership rule for a registration not yet on chain, the chain door's own: the
+/// wallet derives from the ML-DSA-65 key that signs it, or from the burning Solana address whose key
+/// signs the activation.
+pub(crate) fn legacy_register_wallet_bound(wallet: &str, quantum_pubkey: &str, burn_wallet: &str) -> bool {
+    crate::crypto::solana_derivation::eon_from_qnet_dilithium_pubkey(quantum_pubkey).as_deref() == Some(wallet)
+        || crate::crypto::solana_derivation::eon_from_solana_address(burn_wallet) == wallet
 }
 
 pub(super) async fn handle_light_node_register(
@@ -285,24 +389,42 @@ pub(super) async fn handle_light_node_register(
             // Resolved, not point-read: the chain holds only a HASH of a light node's key, so a full-key
             // lookup answers None for every light node and this branch could never say yes - a legitimate
             // owner re-registering was refused and its ping-key rotation never ran.
+            // The key's own signature is checked here too, before anything about the node's binding is
+            // told: a caller without the committed key and its signature gets the same answer whatever is
+            // bound (legacy, v2, or withdrawn by the owner's Stop).
             let identity_ok = blockchain.get_storage()
                 .resolve_light_identity_pk(&pseudonym, Some(&register_request.quantum_pubkey))
                 .map(|committed| committed.eq_ignore_ascii_case(&register_request.quantum_pubkey))
-                .unwrap_or(false);
-            if identity_ok {
-                reactivating_existing = true;
-                println!("[INFO][LIGHT] reactivation_on_register pseudonym={}", pseudonym);
-            } else {
-                let (next_ping_time, window_number) = crate::unified_p2p::SimplifiedP2P::get_next_ping_time(&pseudonym);
+                .unwrap_or(false)
+                && verify_mobile_dilithium_signature(
+                    &register_request.wallet_address, &register_request.quantum_signature, &register_request.quantum_pubkey);
+            if !identity_ok {
                 println!("[INFO][LIGHT] registration_rejected reason=already_registered pseudonym={}", pseudonym);
+                return Ok(warp::reply::json(&already_registered_reply(&pseudonym)));
+            }
+            // Once a v2 binding exists only /light-node/bind changes the device: this branch authenticates
+            // with a static signature over a public address, which any listener can replay.
+            if !legacy_attach_allowed(blockchain.get_storage().get_light_binding(&pseudonym).as_ref()) {
+                println!("[INFO][LIGHT] registration_rejected reason=bind_v2_required pseudonym={}", pseudonym);
+                return Ok(warp::reply::json(&crate::light_binding::Refusal::BindV2Required.to_json()));
+            }
+            reactivating_existing = true;
+            println!("[INFO][LIGHT] reactivation_on_register pseudonym={}", pseudonym);
+        }
+        // One wallet, one node (wallet_one_node gate at this node's next height): a fresh activation for a wallet
+        // that already has another node on chain is refused, as the submit door and block validation refuse it.
+        // After the return above, so a node already on chain keeps its answer.
+        if !reactivating_existing {
+            let next = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Acquire).saturating_add(1);
+            if let Some((other, _)) = crate::node::BlockchainNode::wallet_one_node_other(
+                &blockchain.get_storage(), &register_request.wallet_address, &pseudonym, next)
+            {
+                println!("[INFO][LIGHT] registration_rejected reason=wallet_has_node pseudonym={} other={}", pseudonym, other);
                 return Ok(warp::reply::json(&json!({
-                    "success": true,
-                    "already_registered": true,
-                    "node_id": pseudonym,
-                    "node_type": "light",
-                    "next_ping_time": next_ping_time,
-                    "next_ping_window": window_number,
-                    "message": "Node already registered. Your existing node has been restored."
+                    "success": false,
+                    "code": "wallet_has_node",
+                    "error": WALLET_HAS_NODE_TEXT,
+                    "node_id": other,
                 })));
             }
         }
@@ -330,7 +452,22 @@ pub(super) async fn handle_light_node_register(
         let xor_wallet = register_request.burn_wallet.as_deref()
             .filter(|w| !w.is_empty())
             .unwrap_or(wallet);
-        
+
+        // The wallet, which names the node, must derive from a credential this caller proves below (the
+        // chain door's rule): otherwise anyone's burn would attach a device to someone else's node before
+        // its registration applies. Not a failed attempt: counting it would let strangers lock a wallet.
+        if !legacy_register_wallet_bound(wallet, &register_request.quantum_pubkey, xor_wallet) {
+            if crate::node::is_info() {
+                println!("[INFO][LIGHT] registration_rejected reason=wallet_not_derived wallet={}...",
+                    qnet_state::char_prefix(&wallet, 16));
+            }
+            return Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": "wallet_address not derived from quantum_pubkey or burn_wallet (ownership unproven)",
+                "reason": "wallet_not_derived"
+            })));
+        }
+
         // burn_tx_hash is REQUIRED — no fallback to in-memory
         let burn_tx = match &register_request.burn_tx_hash {
             Some(tx) if !tx.is_empty() => tx.as_str(),
@@ -541,7 +678,8 @@ pub(super) async fn handle_light_node_register(
             })));
         }
 
-        let dilithium_ok = verify_mobile_dilithium_signature(
+        // A returning node's signature was checked with its committed key at the top.
+        let dilithium_ok = reactivating_existing || verify_mobile_dilithium_signature(
             wallet,
             &register_request.quantum_signature,
             &register_request.quantum_pubkey,
@@ -604,48 +742,49 @@ pub(super) async fn handle_light_node_register(
         }
     }
 
-    // Hash device token for privacy (GDPR compliance)
-    let device_token_hash = {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut hasher = DefaultHasher::new();
-        register_request.device_token.hash(&mut hasher);
-        format!("fcm_{:016x}", hasher.finish())
-    };
-    
+    // The registration may have applied during the burn and price checks above (seconds of network I/O),
+    // after the top found the node not on chain and after its apply looked here for a binding to check.
+    // Judged again now, as the top judges it, and nothing is awaited from here to the writes below: only
+    // the committed key (its signature verified above) re-attaches an on-chain node, and never once a v2
+    // binding exists. A binding written by a genesis that has not applied the registration yet is judged
+    // by every reader under the commitment once it has (`light_push::device_reach`).
+    if !reactivating_existing && blockchain.get_storage().is_node_registration_onchain(&light_node_pseudonym) {
+        let committed = blockchain.get_storage()
+            .resolve_light_identity_pk(&light_node_pseudonym, Some(&register_request.quantum_pubkey))
+            .map_or(false, |k| k.eq_ignore_ascii_case(&register_request.quantum_pubkey));
+        if !committed {
+            println!("[INFO][LIGHT] registration_rejected reason=registered_meanwhile pseudonym={}", light_node_pseudonym);
+            return Ok(warp::reply::json(&already_registered_reply(&light_node_pseudonym)));
+        }
+        if !legacy_attach_allowed(blockchain.get_storage().get_light_binding(&light_node_pseudonym).as_ref()) {
+            println!("[INFO][LIGHT] registration_rejected reason=bind_v2_required pseudonym={}", light_node_pseudonym);
+            return Ok(warp::reply::json(&crate::light_binding::Refusal::BindV2Required.to_json()));
+        }
+        reactivating_existing = true;
+        println!("[INFO][LIGHT] reactivation_on_register pseudonym={} reason=registered_meanwhile", light_node_pseudonym);
+    }
+
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-    
+
+    // H6: no token hash is kept or gossiped. The former value was an unkeyed hash with fixed keys, so
+    // any peer could link a device across registrations by it.
     let new_device = LightNodeDevice {
         wallet_address: register_request.wallet_address.clone(),
-        device_token_hash,
+        device_token_hash: String::new(),
         device_id: register_request.device_id.clone(),
         last_active: now,
         is_active: true,
     };
     
-    // Register Light node or add device to existing node using pseudonym
-    let registration_result = {
+    // Register the Light node, or replace its device, under its pseudonym.
+    {
         let mut registry = LIGHT_NODE_REGISTRY.lock();
-        
+
         if let Some(existing_node) = registry.get_mut(&light_node_pseudonym) {
-            // One phone holds one slot: its re-registration replaces its own entry, refreshing last_active.
-            existing_node.devices.retain(|d| d.device_id != new_device.device_id);
-            // Check device limit (max 3 devices per Light node)
-            if existing_node.devices.len() >= 3 {
-                // Remove oldest inactive device if needed
-                existing_node.devices.retain(|d| d.is_active && (now - d.last_active) < 24 * 60 * 60);
-                
-                if existing_node.devices.len() >= 3 {
-                    return Ok(warp::reply::json(&json!({
-                        "success": false,
-                        "error": "Maximum 3 devices per Light node. Remove inactive devices first."
-                    })));
-                }
-            }
-            
-            // Add new device
-            existing_node.devices.push(new_device);
-            "device_added"
+            // One node, one device (A15): the registering phone replaces the entry. The binding decides which
+            // device answers for the node, and the app's random device id identifies nothing.
+
+            existing_node.devices = vec![new_device];
         } else {
             // v10.0 SCALABILITY: Bound registry to 100K entries; evict oldest if full
             const MAX_LIGHT_NODE_REGISTRY: usize = 100_000;
@@ -674,9 +813,8 @@ pub(super) async fn handle_light_node_register(
                 reward_eligible: true,
             };
             registry.insert(light_node_pseudonym.clone(), light_node);
-            "node_created"
         }
-    };
+    }
     
     // Determine push type from request
     let push_type = match register_request.push_type.as_deref() {
@@ -728,25 +866,17 @@ pub(super) async fn handle_light_node_register(
     // This ensures ALL Super nodes have the same Light node registry
     if let Some(p2p) = blockchain.get_unified_p2p() {
         use crate::unified_p2p::LightNodeRegistrationData;
-        
-        // Get device token hash from local registry
-        let device_token_hash = {
-            let registry = LIGHT_NODE_REGISTRY.lock();
-            registry.get(&light_node_pseudonym)
-                .and_then(|n| n.devices.first())
-                .map(|d| d.device_token_hash.clone())
-                .unwrap_or_default()
-        };
-        
-        // Register in P2P gossip-synced registry and broadcast to network
-        // Pure ML-DSA-65: the mobile ML-DSA-65 signature is the sole gossip authenticator
+
+        // Register in P2P gossip-synced registry and broadcast to network. Receivers check the
+        // delegation under the key the chain committed (H8); the static wallet signature is not sent
+        // on (S2), because anyone who saw it could replay this very route with it.
         let registration = LightNodeRegistrationData {
             node_id: light_node_pseudonym.clone(),
             wallet_address: register_request.wallet_address.clone(),
-            device_token_hash,
+            device_token_hash: String::new(),
             quantum_pubkey: register_request.quantum_pubkey.clone(),
             registered_at: now,
-            signature: register_request.quantum_signature.clone(),
+            signature: String::new(),
             push_type: push_type.clone(),
             unified_push_endpoint: register_request.unified_push_endpoint.clone(),
             last_seen: now,
@@ -755,27 +885,44 @@ pub(super) async fn handle_light_node_register(
             ping_pubkey: register_request.ping_pubkey.clone().unwrap_or_default(),
             ping_delegation_cert: register_request.ping_delegation_cert.clone().unwrap_or_default(),
         };
-        p2p.register_light_node(registration);
+        let key_write = p2p.register_light_node(registration);
         println!("[INFO][GOSSIP] light_node_gossiped pseudonym={} push={}", light_node_pseudonym, push_type_str);
 
-        if !register_request.device_token.is_empty() {
+        // The push channel goes into the push record, the only place a push is read from, with the key
+        // this registration was accepted under: a UnifiedPush endpoint too, with or without a token. A node
+        // already on chain changes it only with a ping key this request newly proved (M-8).
+        let record_allowed = legacy_record_write_allowed(reactivating_existing, key_write);
+        if !record_allowed && crate::node::is_info() {
+            println!("[INFO][LIGHT] push_record_kept pseudonym={} reason=no_new_ping_key key_write={:?}",
+                     light_node_pseudonym, key_write);
+        }
+        let has_channel = record_allowed && (!register_request.device_token.is_empty()
+            || matches!(push_type, crate::unified_p2p::PushType::UnifiedPush));
+        if has_channel {
             let pt_str = match push_type {
                 crate::unified_p2p::PushType::FCM => "fcm",
                 crate::unified_p2p::PushType::UnifiedPush => "unifiedpush",
                 crate::unified_p2p::PushType::Polling => "polling",
             };
+            let writer = crate::light_binding::record_writer(&register_request.quantum_pubkey);
             // Same monotonic bump as token-refresh so a re-register supersedes regardless of skew.
             let reg_ts = std::cmp::max(now, blockchain.get_storage()
-                .get_fcm_record(&light_node_pseudonym)
-                .map(|r| r.3.saturating_add(1)).unwrap_or(now));
-            match blockchain.get_storage().save_fcm_token(
+                .get_fcm_entry(&light_node_pseudonym)
+                .map(|e| e.updated_at.saturating_add(1)).unwrap_or(now));
+            match blockchain.get_storage().save_fcm_token_by(
                 &light_node_pseudonym,
                 &register_request.device_token,
                 pt_str,
                 register_request.unified_push_endpoint.as_deref(),
                 reg_ts,
+                &writer,
             ) {
-                Ok(()) => {
+                Ok(false) => {
+                    if crate::node::is_info() {
+                        println!("[INFO][LIGHT] fcm_token_not_saved pseudonym={} reason=record_held", light_node_pseudonym);
+                    }
+                }
+                Ok(true) => {
                     if crate::node::is_info() {
                         println!("[INFO][LIGHT] fcm_token_saved pseudonym={} push={}",
                                  light_node_pseudonym, pt_str);
@@ -803,6 +950,11 @@ pub(super) async fn handle_light_node_register(
                                 endpoint_clone.as_deref(),
                                 &our_ip,
                                 reg_ts,
+                                0,
+                                None,
+                                &writer,
+                                "",
+                                "",
                             ).await;
                         });
                     }
@@ -816,19 +968,9 @@ pub(super) async fn handle_light_node_register(
             }
         }
 
-        // v6.0: Client-side TX creation flow
-        // NodeRegistration TX is now created and submitted by the CLIENT (wallet app),
-        // not by the server. This ensures:
-        // 1. TX is signed by the user's own key (not a server ephemeral key)
-        // 2. Client can route TX directly to the current producer (producer-aware routing)
-        // 3. NodeRegistration follows the same pipeline as Transfer TX
-        //
-        // The server returns registration_proof so the client can construct the TX.
-        // registration_proof = blake3(burn_tx_hash:node_id:wallet_address)[..32]
-        if registration_result == "node_created" {
-            let device_sig_hash = blake3::hash(register_request.device_id.as_bytes()).to_hex().to_string();
-            let _ = device_sig_hash; // kept for proof computation below
-        }
+        // v6.0: the NodeRegistration TX is created and signed by the client (wallet app) with its own key and
+        // routed like a transfer; this route returns registration_proof =
+        // blake3(burn_tx_hash:node_id:wallet_address)[..32] for it to build the TX with.
     }
     
     // Compute registration_proof: deterministic, includes burn_tx_hash for on-chain verifiability
@@ -1082,54 +1224,78 @@ pub(super) async fn handle_light_node_ping_response(
     params: HashMap<String, String>,
     remote_addr: Option<std::net::SocketAddr>,
     blockchain: Arc<BlockchainNode>,
+) -> Result<warp::reply::Response, Rejection> {
+    // Per-IP rate limit BEFORE any storage read / crypto verify (unpriced-work DoS bound at scale).
+    if let Err(rate_limited) = check_api_rate_limit(remote_addr, "light_node_ping") {
+        return Ok(rate_limited.into_response());
+    }
+    // Then the node-wide budget (M-6): past it a 503 with a wait that ends before the epoch's commit, before any
+    // storage read or ML-DSA-65 work. The permit is held while the answer is handled.
+    let mut permit = None;
+    if let Some(shed) = shed_past(&PING_ANSWER_BUDGET, remote_addr, &mut permit) {
+        return Ok(shed);
+    }
+    let answer = answer_light_node_ping(params, blockchain).await.map(|r| r.into_response());
+    drop(permit);
+    answer
+}
+
+async fn answer_light_node_ping(
+    params: HashMap<String, String>,
+    blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
     use std::time::{SystemTime, UNIX_EPOCH};
     use crate::unified_p2p::{SimplifiedP2P, LightNodeAttestation};
-
-    // Per-IP rate limit BEFORE any storage read / crypto verify (unpriced-work DoS bound at scale).
-    if let Err(rate_limited) = check_api_rate_limit(remote_addr, "light_node_ping") {
-        return Ok(rate_limited);
-    }
 
     let node_id = params.get("node_id").unwrap_or(&"unknown".to_string()).clone();
     let signature = params.get("signature").unwrap_or(&"".to_string()).clone();
     let challenge = params.get("challenge").unwrap_or(&"".to_string()).clone();
 
-    // Cheap structural reject before the anchor storage read + Dilithium verify.
+    // Cheap structural reject before the anchor storage read + Dilithium verify (light-node-messages 5.8,
+    // step 1). A reply with the device signature is parsed here and checked below.
+    let malformed = || Ok(warp::reply::json(&json!({ "success": false, "error": "malformed ping-response" })));
     if !node_id.starts_with("light_") || signature.is_empty() || challenge.is_empty() {
-        return Ok(warp::reply::json(&json!({ "success": false, "error": "malformed ping-response" })));
+        return malformed();
     }
+    let hw = if signature.starts_with("ping_hw2:") {
+        match crate::light_device::messages::parse_hwping_wire(&signature) {
+            Some(w) => Some(w),
+            None => return malformed(),
+        }
+    } else {
+        None
+    };
+    let tip = blockchain.get_height().await;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    // What the answer tells about the push it answers (light-node-messages 5.10); never a reason to refuse it.
+    let timing = AnswerTiming::from_params(&params);
 
-    // Two accepted challenge forms:
-    // 1. Server stamp (push path, G2): must be one THIS server stamped for THIS node, unexpired.
+    // Two accepted challenge forms (step 2):
+    // 1. Server stamp (push path, G2): must be one THIS server stamped for THIS node, unexpired. Credited
+    //    only here, never on relay, and only until the device layer's enforcement epoch; a reply with the
+    //    device signature never answers one.
     // 2. PULL self-attestation: "selfattest:{height}:{block_hash}" — a same-epoch canonical block
     //    hash, unknowable before that block exists, so it proves the device is online THIS epoch
     //    with the same strength as a stamped challenge but with no FCM delivery dependency.
     //    (FCM stays as a best-effort wakeup; liveness no longer depends on it at scale.)
-    if let Some(rest) = challenge.strip_prefix("selfattest:") {
-        let parsed = (|| {
-            let (h_str, hash) = rest.split_once(':')?;
-            let h: u64 = h_str.parse().ok()?;
-            if hash.is_empty() || hash.contains(':') { return None; }
-            Some((h, hash))
-        })();
-        let tip = blockchain.get_height().await;
-        let valid = match parsed {
-            Some((h, hash)) if h <= tip && h / 14400 == tip / 14400 => {
-                blockchain.get_storage().get_microblock_hash_hex(h).ok().flatten()
-                    .map(|canon| canon == hash).unwrap_or(false)
-            }
-            _ => false,
-        };
+    let anchor = crate::light_device::ping::Anchor::parse(&challenge);
+    if challenge.starts_with("selfattest:") {
+        let valid = anchor.as_ref().map_or(false, |a| crate::light_device::ping::anchor_on_chain(&blockchain.get_storage(), a, tip));
         if !valid {
+            // An answer to the epoch that just ended counts in neither: its shard owner records it as late.
+            let late = note_stale_answer(&blockchain.get_storage(), &node_id, &challenge, &signature, tip, now,
+                                         timing.measure(now));
             if crate::node::is_warn() {
-                println!("[WARN][LIGHT] selfattest_anchor_invalid node={}", node_id);
+                println!("[WARN][LIGHT] selfattest_anchor_invalid node={} late_recorded={}", node_id, late);
             }
             return Ok(warp::reply::json(&json!({
                 "success": false,
+                "reason": "anchor_not_current",
                 "error": "Invalid or stale self-attest anchor"
             })));
         }
+    } else if hw.is_some() || !crate::light_device::ping::legacy_counts(tip / 14400) {
+        return malformed();
     } else if !verify_challenge_stamp(&node_id, &challenge) {
         if crate::node::is_warn() {
             println!("[WARN][LIGHT] challenge_unrecognized node={}", node_id);
@@ -1140,7 +1306,6 @@ pub(super) async fn handle_light_node_ping_response(
         })));
     }
 
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     let current_slot = SimplifiedP2P::get_current_slot();
     let our_node_id = blockchain.get_node_id();
 
@@ -1160,25 +1325,81 @@ pub(super) async fn handle_light_node_ping_response(
         }
     }
 
+    // Between the shard's commit and the epoch's end an answer counts in no epoch (B-2): nothing is credited,
+    // the shard owner records it as that epoch's late answer once it verifies, and the app is told only that
+    // the epoch's commit is closed. Nothing is moved to the next epoch.
+    if in_commit_gap(tip) {
+        let storage = blockchain.get_storage();
+        let epoch = tip / 14400;
+        let late = owns_light_shard(&node_id) && !late_recorded(&storage, &node_id, epoch)
+            && verify_light_node_signature(&node_id, &challenge, &signature, &blockchain).await.is_ok()
+            && record_late_answer(&storage, &node_id, epoch, now, timing.measure(now));
+        if crate::node::is_info() {
+            println!("[INFO][LIGHT] answer_in_commit_gap node={} tip={} late_recorded={}", node_id, tip, late);
+        }
+        return Ok(warp::reply::json(&gap_reply(&node_id)));
+    }
+
+    // Steps 4 and 5 before any ML-DSA-65 work: the device record here and the device's own signature over
+    // the anchor (nothing written; the shared verifier below runs them again and takes the counter).
+    if let (Some(w), Some(a)) = (&hw, &anchor) {
+        let checked = crate::light_device::ping::check_device_reply(&blockchain.get_storage(),
+            crate::light_device::evidence::Verifier::production(), &node_id, a, w, now);
+        if let Err(r) = checked {
+            note_refusal(&blockchain.get_storage(), &node_id, tip, r.as_str(), now, &challenge, &signature);
+            if crate::node::is_info() {
+                println!("[INFO][LIGHT] device_reply_refused node={} reason={}", node_id, r.as_str());
+            }
+            return Ok(warp::reply::json(&json!({ "success": false, "error": "The device check of this reply failed" })));
+        }
+    }
+
     // Anti-poison: if the request presents its ping delegation, refresh the ping-key CF before verifying,
     // so the node's own authenticated ping overwrites any pre-registration gossip poison. The overwrite is
     // bound to (a) a cert that verifies under the node's committed on-chain key AND (b) a valid ping signature
     // under the PRESENTED key — so a replay of an old (pp,cert) with a garbage ping sig cannot downgrade the
     // stored key, while a node whose CF was poisoned heals it with its own correctly-signed ping.
-    if let (Some(pp), Some(cert)) = (params.get("ping_pubkey"), params.get("ping_delegation_cert")) {
-        if !pp.is_empty() && !cert.is_empty() && signature.starts_with("ping_dilithium:") {
-            let inner_ping_sig = &signature[15..];
+    // A presented key and delegation this genesis already holds, with the identity they were proven under, change
+    // nothing: the shared verifier below checks σ under them, once, instead of the delegation and σ here and σ again
+    // there (two of three ML-DSA-65 checks an answer).
+    let presented_known = match (params.get("ping_pubkey"), params.get("ping_delegation_cert")) {
+        (Some(pp), Some(cert)) if !pp.is_empty() => blockchain.get_storage().get_light_binding(&node_id)
+            .map_or(false, |b| b.ping_pubkey == *pp && b.cert == *cert && !b.identity_pubkey.is_empty()),
+        _ => false,
+    };
+    if let (false, Some(pp), Some(cert), Some(inner_ping_sig)) =
+        (presented_known, params.get("ping_pubkey"), params.get("ping_delegation_cert"), crate::light_device::ping::sigma_text(&signature)) {
+        if !pp.is_empty() && !cert.is_empty() {
+            let inner_ping_sig = inner_ping_sig.as_str();
             // A light node's identity key lives on its device; the chain holds its hash. The device may
             // present the key here, and it is admitted only if it hashes to that commitment - so the
             // delegation below is still checked under a key the chain vouches for.
             let presented = params.get("identity_pubkey").map(|s| s.as_str());
             if let Some(onchain_pk_hex) = blockchain.get_storage().resolve_light_identity_pk(&node_id, presented) {
-                let delegation_msg = format!("delegate_ping:{}:{}", pp, node_id);
-                if verify_mobile_dilithium_signature(&delegation_msg, cert, &onchain_pk_hex)
+                if crate::light_binding::verify_delegation(cert, pp, &node_id, &onchain_pk_hex).is_some()
                     && verify_mobile_dilithium_signature(&challenge, inner_ping_sig, pp) {
                     // Record the identity the delegation was proven under, so later attestations need
-                    // only the ping signature.
-                    let _ = blockchain.get_storage().save_light_ping_keys_identity(&node_id, pp, cert, &onchain_pk_hex);
+                    // only the ping signature. The binding order holds (U8): a device whose binding
+                    // was replaced presents an older delegation, which is refused, and its answer is
+                    // not credited - it would fail under the stored key anyway, so say why.
+                    let storage = blockchain.get_storage();
+                    if let Ok(crate::storage::PingKeyWrite::Refused(
+                        verdict @ (crate::light_binding::Admit::Stale | crate::light_binding::Admit::V1AfterV2),
+                    )) = storage.save_light_ping_keys_identity(&node_id, pp, cert, &onchain_pk_hex)
+                    {
+                        let current = storage.get_light_ping_keys(&node_id).map(|(k, _)| k);
+                        if current.as_deref() != Some(pp.as_str()) {
+                            note_refusal(&storage, &node_id, tip, "superseded", now, &challenge, &signature);
+                            if crate::node::is_info() {
+                                println!("[INFO][LIGHT] superseded_device_refused node={} verdict={:?}", node_id, verdict);
+                            }
+                            return Ok(warp::reply::json(&json!({
+                                "success": false,
+                                "reason": "superseded",
+                                "error": "The node runs on another device"
+                            })));
+                        }
+                    }
                 } else if crate::node::is_warn() {
                     println!("[WARN][LIGHT] presented_ping_delegation_rejected node={}", node_id);
                 }
@@ -1188,13 +1409,17 @@ pub(super) async fn handle_light_node_ping_response(
         }
     }
 
-    // PRODUCTION v2.78: Verify Light node post-quantum ML-DSA-65 signature
-    let signature_valid = verify_light_node_signature(&node_id, &challenge, &signature, &blockchain).await;
-
-    if !signature_valid {
-        println!("[LIGHT] ❌ Invalid signature from Light node {}", node_id);
+    // The shared verifier (steps 2 to 6, and the device counter), the one relay admission runs too.
+    if let Err(r) = verify_light_node_signature(&node_id, &challenge, &signature, &blockchain).await {
+        note_refusal(&blockchain.get_storage(), &node_id, tip, r.as_str(), now, &challenge, &signature);
+        if crate::node::is_info() {
+            println!("[INFO][LIGHT] reply_refused node={} reason={}", node_id, r.as_str());
+        }
+        // `reason` says why; `ping_signature` (no ping key here, or another one) is answered again with the delegation, which the
+        // app otherwise sends only after a bind or a key rotation.
         return Ok(warp::reply::json(&json!({
             "success": false,
+            "reason": r.as_str(),
             "error": "Invalid quantum signature"
         })));
     }
@@ -1269,9 +1494,13 @@ pub(super) async fn handle_light_node_ping_response(
             }
         };
         
-        // Create attestation with Light node's signature
-        // v2.59: Include block_height for epoch-based reward filtering
-        let current_block_height = blockchain.get_height().await;
+        // Create attestation with Light node's signature. block_height is the anchor's height, which
+        // relay admission requires the record to repeat (it is not signed); a stamp's reply carries the
+        // tip and is credited here only.
+        let current_block_height = match &anchor {
+            Some(a) => a.height,
+            None => blockchain.get_height().await,
+        };
         let attestation = LightNodeAttestation {
             light_node_id: node_id.clone(),
             pinger_id: our_node_id.clone(),
@@ -1343,7 +1572,23 @@ pub(super) async fn handle_light_node_ping_response(
     }
     
     println!("[LIGHT] 📡 Light node {} responded and attested in slot {}", node_id, current_slot);
-    
+
+    // The node's last answer as its shard owner took it, with how long the push took to reach the device
+    // (`device.last_answer`); nothing of this epoch is left to record as a miss. The push receipts the answer
+    // carries refine the node's last miss here (light-node-messages 5.10), never its crediting.
+    PUSH_LEDGER.answered(&node_id);
+    if owns_light_shard(&node_id) {
+        let receipts = PushReceipts::from_params(&params);
+        record_answer(&blockchain.get_storage(), &node_id, now, timing.measure(now), receipts.as_ref(), timing.answered_at,
+                      anchor.as_ref().map(|a| a.epoch()));
+    }
+
+    // A lease refresh riding in the reply (light-node-messages 5.6): run at this genesis in the background,
+    // never relayed.
+    if let Some(param) = params.get("device_refresh").filter(|p| !p.is_empty()) {
+        refresh_from_ping(&blockchain, &node_id, param);
+    }
+
     // Clear pending challenge if exists (for polling nodes)
     {
         let mut challenges = PENDING_CHALLENGES.lock();
@@ -1391,61 +1636,83 @@ pub(super) async fn handle_light_node_next_ping(
     })))
 }
 
-/// Handle pending challenge request (for polling-based Light nodes)
-/// Returns the challenge if one is pending, or null if not
-/// Security: Only registered polling nodes can request challenges
+/// `GET /api/v1/light-node/pending-challenge?node_id=` (polling devices): the challenge left for the device, or one
+/// for its slot. Cheap checks first: the per-address limit, the shape, the epoch, then RAM, then storage. A device this
+/// genesis pushes, or whose device record does not count, is answered exactly as a polling device whose slot is not
+/// due, so the route tells nobody how a device is reached (L-5). Handing a challenge out marks nothing: the device
+/// counts as having fetched it only when its poll is signed with its ping key (`ts`, `sig`), and its answer settles
+/// the epoch itself.
 pub(super) async fn handle_light_node_pending_challenge(
     params: HashMap<String, String>,
+    remote_addr: Option<std::net::SocketAddr>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
     use std::time::{SystemTime, UNIX_EPOCH};
-    
+
+    if let Err(rate_limited) = check_api_rate_limit(remote_addr, "read_only") {
+        return Ok(rate_limited);
+    }
     let node_id = match params.get("node_id") {
-        Some(id) => id.clone(),
-        None => return Ok(warp::reply::json(&json!({
+        Some(id) if id.starts_with("light_") && id.len() <= 128 => id.clone(),
+        _ => return Ok(warp::reply::json(&json!({
             "success": false,
             "error": "node_id parameter required"
         }))),
     };
-    
-    // Security: Verify node exists and is registered for polling (point-read: no full-map clone)
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let tip = blockchain.get_height().await;
+    let no_challenge = |message: &str| {
+        let (next_ping_time, _) = crate::unified_p2p::SimplifiedP2P::get_next_ping_time(&node_id);
+        warp::reply::json(&json!({
+            "success": true,
+            "node_id": node_id,
+            "has_challenge": false,
+            "message": message,
+            "next_ping_time": next_ping_time
+        }))
+    };
+
+    // None between the epoch's commit and its end, as no push goes out then: an answer would count in no epoch.
+    // The next poll time is the node's own slot, as outside the gap. None either while this genesis is behind the
+    // network (F14): its anchor and epoch are stale, and the device polls another genesis.
+    let gap = in_commit_gap(tip);
+    if gap || this_genesis_behind() {
+        return Ok(no_challenge(if gap { "The epoch's commit is closed" } else { "This node is catching up with the network" }));
+    }
+
+    // A node this genesis holds (point-read: no full-map clone).
     if let Some(p2p) = blockchain.get_unified_p2p() {
-        match p2p.get_light_node(&node_id) {
-            Some(node) => {
-                // Only polling nodes can use this endpoint. Liveness is on-chain (B): a poll always yields
-                // the challenge; answering it records eligibility, which IS the reactivation.
-                if !matches!(node.push_type, crate::unified_p2p::PushType::Polling) {
-                    return Ok(warp::reply::json(&json!({
-                        "success": false,
-                        "error": "This endpoint is only for polling-mode nodes"
-                    })));
-                }
-            }
-            None => {
-                return Ok(warp::reply::json(&json!({
-                    "success": false,
-                    "error": "Node not found. Please register first."
-                })));
-            }
+        if p2p.get_light_node(&node_id).is_none() {
+            return Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": "Node not found. Please register first."
+            })));
         }
     }
-    
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-    
-    // Check for pending challenge
+    // Only a device this genesis does not push polls (`light_poll_allowed`), judged as the pinger and a wake judge it,
+    // and (A12) only one whose device record counts, as only such a device is pushed. Any other is not due.
+    let storage = blockchain.get_storage();
+    if !light_poll_allowed(&storage, &node_id) || !device_layer_pushable(&storage, &node_id) {
+        return Ok(no_challenge("Not your ping slot yet"));
+    }
+
+    // Check for pending challenge: this node's entry alone, an expired or unanswerable one dropped here; the ping
+    // loop sweeps the rest (`sweep_polling_challenges`).
     let pending = {
         let mut challenges = PENDING_CHALLENGES.lock();
-        
-        // Clean up expired challenges
-        challenges.retain(|_, c| c.expires_at > now);
-        
-        // Get challenge for this node
-        challenges.get(&node_id).cloned()
+        match challenges.get(&node_id) {
+            Some(c) if c.expires_at > now && polling_challenge_answerable(&c.challenge, tip) => Some(c.clone()),
+            Some(_) => { challenges.remove(&node_id); None }
+            None => None,
+        }
     };
-    
+
     match pending {
         Some(challenge) => {
-            println!("[POLLING] 📤 Returning pending challenge for {}", node_id);
+            if crate::node::is_debug() {
+                println!("[DBG][POLLING] pending_challenge_returned node={}", node_id);
+            }
+            note_poll_fetched(&storage, &node_id, &params, tip, now);
             Ok(warp::reply::json(&json!({
                 "success": true,
                 "node_id": node_id,
@@ -1471,23 +1738,33 @@ pub(super) async fn handle_light_node_pending_challenge(
                         })));
                     }
                 }
-                
-                // Generate a server-stamped challenge (G2: authenticated, FCM-safe).
-                let challenge = make_challenge_stamp(&node_id);
-                let expires_at = now + 180; // 3 minute expiry (matches LIGHT_CHALLENGE_TTL_SECS)
-                
-                // Store pending challenge
+
+                // The block the pushed devices answer with this epoch (`polling_challenge`): whichever
+                // genesis the device polled and answers, every shard owner credits the relayed answer.
+                let anchor = push_anchor(&storage, tip);
+                let (challenge, expires_at) = polling_challenge(&node_id, anchor.as_deref(), now);
+                if !polling_challenge_answerable(&challenge, tip) {
+                    return Ok(no_challenge("Not your ping slot yet"));
+                }
+
+                // The pending map is only the hand-off to a device that polls in its own slot, so it
+                // keeps the short horizon: the challenge verifies statelessly, and holding one row per light
+                // node until the epoch ends would be a roster-sized map at scale instead of a few slots'
+                // worth. An answer that arrives after the row is gone still verifies.
                 {
                     let mut challenges = PENDING_CHALLENGES.lock();
                     challenges.insert(node_id.clone(), PendingChallenge {
                         challenge: challenge.clone(),
                         created_at: now,
-                        expires_at,
+                        expires_at: now + crate::rpc::LIGHT_CHALLENGE_TTL_SECS,
                     });
                 }
-                
-                println!("[POLLING] 🎯 Generated challenge for {} (polling mode)", node_id);
-                
+
+                if crate::node::is_debug() {
+                    println!("[DBG][POLLING] challenge_generated node={}", node_id);
+                }
+                note_poll_fetched(&storage, &node_id, &params, tip, now);
+
                 Ok(warp::reply::json(&json!({
                     "success": true,
                     "node_id": node_id,
@@ -1497,19 +1774,32 @@ pub(super) async fn handle_light_node_pending_challenge(
                     "expires_at": expires_at
                 })))
             } else {
-                // Not this node's slot
-                let (next_ping_time, _) = crate::unified_p2p::SimplifiedP2P::get_next_ping_time(&node_id);
-                
-                Ok(warp::reply::json(&json!({
-                    "success": true,
-                    "node_id": node_id,
-                    "has_challenge": false,
-                    "message": "Not your ping slot yet",
-                    "next_ping_time": next_ping_time
-                })))
+                Ok(no_challenge("Not your ping slot yet"))
             }
         }
     }
+}
+
+/// The device fetched the challenge left for it in the tip's epoch, counted (`PushLedger::fetched`) only when the poll
+/// carries `ts` within the fresh window and `sig`, the node's ping key over `light_poll_message`, under the delegation
+/// the chain vouches for (`ping_key_signed`). A poll in its name by anyone else marks nothing; the signature is checked
+/// only while a challenge the pinger left here this epoch waits for its fetch.
+fn note_poll_fetched(storage: &crate::storage::Storage, node_id: &str, params: &HashMap<String, String>, tip: u64, now: u64) {
+    let epoch = tip / 14_400;
+    if !PUSH_LEDGER.awaits_fetch(node_id, epoch) { return; }
+    let (Some(ts), Some(sig)) = (params.get("ts").and_then(|t| t.parse::<u64>().ok()), params.get("sig")) else { return; };
+    if now.abs_diff(ts) > crate::light_binding::FRESH_TS_WINDOW_SECS || sig.len() != crate::light_binding::MLDSA65_SIG_HEX {
+        return;
+    }
+    if ping_key_signed(storage, node_id, &crate::light_binding::light_poll_message(node_id, ts), sig) {
+        PUSH_LEDGER.fetched(node_id, epoch, now);
+    }
+}
+
+/// Drop the polling challenges no longer worth handing out at `tip` (expired, or of an epoch that ended): once a
+/// tick, off the request path.
+pub(super) fn sweep_polling_challenges(tip: u64, now: u64) {
+    PENDING_CHALLENGES.lock().retain(|_, c| c.expires_at > now && polling_challenge_answerable(&c.challenge, tip));
 }
 
 /// Validate UnifiedPush endpoint URL
@@ -1536,8 +1826,21 @@ pub(super) fn validate_unified_push_endpoint(endpoint: &str) -> Result<(), Strin
         "up.qnet.network",      // QNet's own (future)
     ];
     
+    // An address in place of a name must be a public one and no genesis node's: the genesis nodes POST
+    // here on each push and wake, and must not be aimed at their own hosts or internal networks.
+    if let Some(url::Host::Ipv4(ip)) = url.host() {
+        let o = ip.octets();
+        let internal = ip.is_private() || ip.is_loopback() || ip.is_link_local() || ip.is_unspecified()
+            || ip.is_broadcast() || ip.is_documentation() || ip.is_multicast()
+            || o[0] == 0 || o[0] >= 240 || (o[0] == 100 && (o[1] & 0xc0) == 64);
+        let genesis = crate::genesis_constants::GENESIS_NODE_IPS.iter().any(|(g, _)| g.parse::<std::net::Ipv4Addr>() == Ok(ip));
+        if internal || genesis {
+            return Err("UnifiedPush endpoint must not name an internal or genesis address".to_string());
+        }
+    }
+
     let host = url.host_str().unwrap_or("");
-    
+
     // Check if domain or subdomain of trusted provider
     let is_trusted = trusted_domains.iter().any(|&domain| {
         host == domain || host.ends_with(&format!(".{}", domain))
@@ -1559,149 +1862,97 @@ pub(super) fn validate_unified_push_endpoint(endpoint: &str) -> Result<(), Strin
     }
 }
 
-/// Owner-shard verdict proxy: the current-epoch attestation view is shard-owner RAM
-/// (bounded at 10M nodes), so a non-owner consults the owner before declaring a node
-/// inactive — every genesis then returns ONE verdict and the app stops flip-flopping
-/// with the node it happens to poll. 60s per-node cache (64k cap); None on any error
-/// (caller keeps its local verdict). `fwd=1` marks a proxied call — never recursed.
-async fn shard_owner_says_active(node_id: &str) -> Option<bool> {
+/// What the other owners of a node's light shard say of it (`shard_owners_view`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct OwnersView {
+    /// Some owner that sees the node on chain took its answer this epoch.
+    pub(crate) answered: bool,
+    /// Some owner reports it active.
+    pub(crate) active: bool,
+}
+
+impl OwnersView {
+    /// The view of the owners that replied (`replies`, each an owner's public status): answered or active when any
+    /// of them says so. None when none replied with a verdict.
+    pub(crate) fn of(replies: &[serde_json::Value]) -> Option<Self> {
+        let verdicts: Vec<&serde_json::Value> = replies.iter().filter(|v| v["is_active"].as_bool().is_some()).collect();
+        if verdicts.is_empty() { return None; }
+        Some(OwnersView {
+            answered: verdicts.iter().any(|v| v["onchain_registered"].as_bool() == Some(true)
+                && v["answered_this_epoch"].as_bool() == Some(true)),
+            active: verdicts.iter().any(|v| v["is_active"].as_bool() == Some(true)),
+        })
+    }
+}
+
+/// Owner-shard verdict proxy (F13): the current epoch's answers are shard-owner RAM (bounded at 10M nodes), and the
+/// owner that took an answer may be any of the three: the primary was down or restarting when the device answered a
+/// backup, or a relay was lost. So a genesis asks every owner of the node's shard but itself, at once, before it calls
+/// the node inactive; every genesis then gives one verdict. 60 s per-node cache (64k cap), an owner that failed is
+/// skipped for 15 s, at most 16 consultations in flight; None on no verdict (the caller keeps its own). `fwd=1` marks
+/// a proxied call, never recursed.
+pub(super) async fn shard_owners_view(node_id: &str) -> Option<OwnersView> {
     use crate::genesis_constants::GENESIS_NODE_IPS;
-    fn cache() -> &'static dashmap::DashMap<String, (bool, u64)> {
-        static M: std::sync::OnceLock<dashmap::DashMap<String, (bool, u64)>> = std::sync::OnceLock::new();
+    fn cache() -> &'static dashmap::DashMap<String, (OwnersView, u64)> {
+        static M: std::sync::OnceLock<dashmap::DashMap<String, (OwnersView, u64)>> = std::sync::OnceLock::new();
         M.get_or_init(dashmap::DashMap::new)
     }
-    // Per-owner negative cache: an unreachable owner must not cost every status poll a
-    // 2s timeout — skip its shard's proxying for 15s after a failure.
+    // Per-owner negative cache: an unreachable owner must not cost every status poll a 2 s timeout.
     fn owner_down() -> &'static dashmap::DashMap<usize, u64> {
         static M: std::sync::OnceLock<dashmap::DashMap<usize, u64>> = std::sync::OnceLock::new();
         M.get_or_init(dashmap::DashMap::new)
     }
     // Global in-flight bound: the proxy is reachable from a public endpoint, so outbound
-    // fan-in to the owner is capped process-wide; overflow degrades to the local verdict.
+    // fan-in to the owners is capped process-wide; overflow degrades to the local verdict.
     fn inflight() -> &'static tokio::sync::Semaphore {
         static S: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
         S.get_or_init(|| tokio::sync::Semaphore::new(16))
     }
-    let owner = crate::node::light_shard_of(node_id);
+    fn client() -> &'static reqwest::Client {
+        static C: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+        C.get_or_init(|| reqwest::Client::builder().timeout(std::time::Duration::from_secs(2)).build().unwrap_or_default())
+    }
+    let shard = crate::node::light_shard_of(node_id);
     let our_idx = std::env::var("QNET_BOOTSTRAP_ID").ok()
         .and_then(|id| id.parse::<usize>().ok())
         .map(|n| n.saturating_sub(1));
-    if our_idx == Some(owner) { return None; }
-    let (ip, _) = GENESIS_NODE_IPS.get(owner)?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-    if let Some(e) = cache().get(node_id) { if e.value().1 > now { return Some(e.value().0); } }
-    if let Some(d) = owner_down().get(&owner) { if *d.value() > now { return None; } }
+    // An expiry further off than its lifetime was set before this genesis's clock was set back: expired.
+    if let Some(e) = cache().get(node_id) { if e.value().1 > now && e.value().1 <= now + 60 { return Some(e.value().0); } }
+    let owners: Vec<usize> = crate::node::light_shard_owners(shard).into_iter()
+        .filter(|o| Some(*o) != our_idx)
+        .filter(|o| owner_down().get(o).map_or(true, |d| *d.value() <= now || *d.value() > now + 15))
+        .collect();
+    if owners.is_empty() { return None; }
     if cache().len() > 65_536 { cache().clear(); }
     let _permit = inflight().try_acquire().ok()?;
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(2)).build().ok()?;
-    let url = format!("http://{}:8001/api/v1/light-node/status?node_id={}&fwd=1", ip, node_id);
-    let v: Option<serde_json::Value> = match client.get(&url).send().await {
-        Ok(r) if r.status().is_success() => r.json().await.ok(),
-        _ => None,
-    };
-    // Only a transport-level failure marks the owner down; a well-formed reply without
-    // a verdict (e.g. the owner does not know the node) is a per-node None, not an outage.
-    let v = match v {
-        Some(v) => v,
-        None => { owner_down().insert(owner, now + 15); return None; }
-    };
-    let active = v["is_active"].as_bool()?;
-    cache().insert(node_id.to_string(), (active, now + 60));
-    Some(active)
+    let asks = owners.iter().map(|o| async move {
+        let (ip, _) = GENESIS_NODE_IPS.get(*o)?;
+        let url = format!("http://{}:8001/api/v1/light-node/status?node_id={}&fwd=1", ip, node_id);
+        match client().get(&url).send().await {
+            Ok(r) if r.status().is_success() => r.json::<serde_json::Value>().await.ok(),
+            _ => None,
+        }
+    });
+    let replies = futures::future::join_all(asks).await;
+    // Only a transport-level failure marks an owner down; a well-formed reply without a verdict (the owner does
+    // not know the node) is a per-node None, not an outage.
+    for (o, r) in owners.iter().zip(replies.iter()) {
+        if r.is_none() { owner_down().insert(*o, now + 15); }
+    }
+    let replies: Vec<serde_json::Value> = replies.into_iter().flatten().collect();
+    let view = OwnersView::of(&replies)?;
+    cache().insert(node_id.to_string(), (view, now + 60));
+    Some(view)
 }
 
-/// Handle Light node status check
-/// Returns current activity status and failure count
-pub(super) async fn handle_light_node_status(
-    params: HashMap<String, String>,
-    remote_addr: Option<std::net::SocketAddr>,
-    blockchain: Arc<BlockchainNode>,
-) -> Result<impl Reply, Rejection> {
-    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "read_only") {
-        return Ok(rate_limit_response);
-    }
-    let node_id = match params.get("node_id") {
-        Some(id) => id.clone(),
-        None => return Ok(warp::reply::json(&json!({
-            "success": false,
-            "error": "node_id parameter required"
-        }))),
-    };
-    
-    // On-chain readiness = the registration row is applied, the same condition the ping handler needs
-    // before it can resolve the node's identity. Node-independent and durable, unlike RAM-registry
-    // presence which is gossip-lagged. The client gates self-attest on this, so answering "no" for
-    // every light node - which the full-key lookup did - silenced the whole class.
-    let onchain_registered = blockchain.get_storage().is_node_registration_onchain(&node_id);
-
-    // B: liveness is derived from the committed attestation-eligibility index (node-independent, durable),
-    // NOT a per-genesis RAM FSM. needs_reactivation = registered on-chain but not attested in the last two
-    // COMMITTED epochs. Any genesis returns the same answer; the app resolves it by self-attesting on wake.
-    let cur_height = blockchain.get_storage().get_chain_height().unwrap_or(0);
-    let attested_recent = blockchain.get_storage().light_attested_recent_onchain(&node_id, cur_height);
-    let needs_reactivation = onchain_registered && !attested_recent;
-    let (next_ping_time, window_number) = crate::unified_p2p::SimplifiedP2P::get_next_ping_time(&node_id);
-
-    if let Some(p2p) = blockchain.get_unified_p2p() {
-        if let Some(node) = p2p.get_light_node(&node_id) {
-            let current_slot = crate::unified_p2p::SimplifiedP2P::get_current_slot();
-            let has_attestation = p2p.has_attestation(&node_id, current_slot);
-            // Agree with the ping-scheduler's liveness view (get_light_nodes_to_ping). A node that attested
-            // in the current — not-yet-committed — epoch (converged across genesis via attestation gossip) or
-            // is within the fresh-registration grace is live now, even though light_elig_ only records it at
-            // the next boundary. Without this a just-activated / just-reactivated node reads OFFLINE for up to
-            // a full epoch and the app loops redundant self-attests. Non-consensus: this only shapes the UI verdict.
-            const WAKE_GRACE_SECS: u64 = 3 * 14400;
-            let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-            let fresh = now_secs.saturating_sub(node.registered_at) < WAKE_GRACE_SECS;
-            let attested_now = p2p.has_attestation_in_window(&node_id);
-            let mut needs_reactivation = needs_reactivation && !attested_now && !fresh;
-            if needs_reactivation && !params.contains_key("fwd") {
-                if shard_owner_says_active(&node_id).await == Some(true) { needs_reactivation = false; }
-            }
-            return Ok(warp::reply::json(&json!({
-                "success": true,
-                "node_id": node_id,
-                "is_active": !needs_reactivation,
-                "registered_at": node.registered_at,
-                "push_type": format!("{:?}", node.push_type),
-                "has_attestation_current_slot": has_attestation,
-                "next_ping_time": next_ping_time,
-                "next_ping_window": window_number,
-                "needs_reactivation": needs_reactivation,
-                "onchain_registered": onchain_registered
-            })));
-        }
-    }
-
-    // RAM-registry miss: the recency index is committed and node-independent, so still answer
-    // authoritatively when the node is on-chain. Apply the same current-epoch attestation grace as the
-    // RAM-hit branch so the verdict is identical across genesis (honors "any genesis returns the same answer").
-    if onchain_registered {
-        let attested_now = blockchain.get_unified_p2p().map(|p| p.has_attestation_in_window(&node_id)).unwrap_or(false);
-        let mut needs_reactivation = needs_reactivation && !attested_now;
-        if needs_reactivation && !params.contains_key("fwd") {
-            if shard_owner_says_active(&node_id).await == Some(true) { needs_reactivation = false; }
-        }
-        return Ok(warp::reply::json(&json!({
-            "success": true,
-            "node_id": node_id,
-            "is_active": !needs_reactivation,
-            "has_attestation_current_slot": attested_now,
-            "next_ping_time": next_ping_time,
-            "next_ping_window": window_number,
-            "needs_reactivation": needs_reactivation,
-            "onchain_registered": true
-        })));
-    }
-
-    Ok(warp::reply::json(&json!({
-        "success": false,
-        "error": "Node not found",
-        "onchain_registered": onchain_registered
-    })))
+/// When `epoch` began: the time of its first block, alike at every genesis that holds it, else read from the tip at a
+/// block a second. None for an epoch the tip has not reached.
+pub(crate) fn epoch_started_at(storage: &crate::storage::Storage, epoch: u64, tip: u64, now: u64) -> Option<u64> {
+    let first = epoch.checked_mul(14_400)?;
+    if first > tip { return None; }
+    storage.block_timestamp_at(first).ok().flatten().or_else(|| Some(now.saturating_sub(tip - first)))
 }
 
 /// Handle Server node (Super, including Genesis) status check
@@ -1875,36 +2126,36 @@ pub(super) async fn handle_server_node_status(
 
             // Not in active Super/Genesis list — check light_node_registry (point-read: no full-map clone)
             if target_id.starts_with("light_") {
-                if let Some(node) = p2p.get_light_node(target_id) {
+                if p2p.get_light_node(target_id).is_some() {
                     let block_height = blockchain.get_height().await;
                     let pending_rewards = match blockchain.get_node_wallet(target_id).await {
                         Some(w) => wallet_claimable_qnc(&blockchain, &w).await,
                         None => 0,
                     };
-                    // B: online = attested on-chain in the last committed epochs, OR attesting in the current
-                    // (uncommitted) epoch, OR within the fresh-registration grace — mirrors handle_light_node_status
-                    // so a just-(re)activated live node is not reported OFFLINE for up to a full epoch.
-                    const WAKE_GRACE_SECS: u64 = 3 * 14400;
-                    let fresh = now.saturating_sub(node.registered_at) < WAKE_GRACE_SECS;
+                    // Online is the light status's is_active (status v2): counted in the last committed
+                    // epochs, answering in this one, counted by the shard owner, or in the registration's
+                    // first epochs with a device linked. One view, so both routes give one answer.
+                    let status = super::light_status::light_status(&blockchain, target_id, true).await;
                     // On-chain attestation is the light tier's liveness fact; keep it separate from the
                     // display verdict, which also honours the grace and the owner-shard proxy.
                     let attested_onchain = blockchain.get_storage()
                         .light_attested_recent_onchain(target_id, block_height);
-                    let mut is_online = attested_onchain
-                        || p2p.has_attestation_in_window(target_id)
-                        || fresh;
-                    // Same owner-shard verdict as handle_light_node_status (cached) — one answer everywhere.
-                    if !is_online && shard_owner_says_active(target_id).await == Some(true) { is_online = true; }
+                    let is_online = status.is_active;
                     // Strict on-chain registration truth; is_online stays a labeled approximation.
-                    let onchain = blockchain.get_storage().is_node_registration_onchain(target_id);
+                    let onchain = status.onchain;
+                    // When the epoch of the node's last answer began (status v2 `device.last_answer_epoch`), never the
+                    // answer's own second: this route answers anyone for a wallet address, and the exact time is the
+                    // signed status's (H-1). The registry row's time is the registration's and was never updated.
+                    let last_seen = status.device_view.as_ref().and_then(|d| d.last_answer_epoch)
+                        .and_then(|e| epoch_started_at(&blockchain.get_storage(), e, block_height, now));
                     return Ok(warp::reply::json(&json!({
                         "success": true,
                         "node_id": target_id,
                         "node_type": "Light",
                         "onchain_registered": onchain,
                         "is_online": is_online,
-                        "last_seen": node.last_seen,
-                        "last_seen_ago_seconds": now.saturating_sub(node.last_seen),
+                        "last_seen": last_seen.unwrap_or(0),
+                        "last_seen_ago_seconds": last_seen.map(|t| now.saturating_sub(t)),
                         // A light node proves liveness by one attestation per epoch, not by heartbeats.
                         // The hardcoded 0 reached the wallet as "0 of 1" for a node that had attested.
                         "heartbeat_count": u8::from(attested_onchain),
@@ -2015,37 +2266,37 @@ pub(super) async fn handle_server_node_status(
     })))
 }
 
-// FCM Push Service for Light Node Pings with Rate Limiting
-// Google FCM limit: ~500 requests/second per project
-// We use a global rate limiter to stay well under this limit
+// Push delivery for light nodes, metered per second (light_push::FCM_PUSHES_PER_SEC).
 
 pub(crate) use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 // Note: Lazy is already imported at the top of the file
 
-/// Global FCM rate limiter state
-pub(super) static FCM_RATE_LIMITER: Lazy<FcmRateLimiter> = Lazy::new(|| FcmRateLimiter::new());
+/// Every push this genesis sends: up to three shards' share and the wakes (`PUSH_QUOTA_PER_SEC`); the pacer keeps
+/// the epoch's pushes at the share of the shards covered.
+pub(super) static FCM_RATE_LIMITER: Lazy<FcmRateLimiter> = Lazy::new(|| FcmRateLimiter::with_rate(PUSH_QUOTA_PER_SEC));
+/// "I'm back" pushes, a share of the above.
+pub(super) static WAKE_RATE_LIMITER: Lazy<FcmRateLimiter> = Lazy::new(|| FcmRateLimiter::with_rate(WAKE_PUSHES_PER_SEC));
 
 pub(super) struct FcmRateLimiter {
     /// Requests sent in current second
     pub(super) requests_this_second: AtomicU64,
     /// Current second timestamp
     pub(super) current_second: AtomicU64,
-    /// Max requests per second (conservative limit)
+    /// Max requests per second
     pub(super) max_per_second: u64,
 }
 
 impl FcmRateLimiter {
-    fn new() -> Self {
+    fn with_rate(max_per_second: u64) -> Self {
         Self {
             requests_this_second: AtomicU64::new(0),
             current_second: AtomicU64::new(0),
-            // Conservative limit: 100/sec per node (5 Genesis × 100 = 500 total)
-            max_per_second: 100,
+            max_per_second,
         }
     }
-    
+
     /// Check if we can send, and increment counter if yes
-    fn try_acquire(&self) -> bool {
+    pub(super) fn try_acquire(&self) -> bool {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -2076,6 +2327,9 @@ impl FcmRateLimiter {
         false  // Rate limit exceeded
     }
 }
+
+/// One service for the process, so its access token is cached for every push rather than fetched anew.
+pub(super) static FCM_SERVICE: Lazy<FCMPushService> = Lazy::new(FCMPushService::new);
 
 pub(super) struct FCMPushService {
     // FCM V1 API with Service Account authentication
@@ -2204,84 +2458,76 @@ impl FCMPushService {
         Ok(access_token)
     }
     
-    async fn send_ping_notification(&self, device_token: &str, node_id: &str, challenge: &str, response_url: &str) -> Result<(), String> {
-        // PRODUCTION: Real FCM notification using Google's FCM HTTP v1 API
-        
-        // Get OAuth2 access token (from Service Account or legacy key)
+    /// Send one prepared v1 message (`light_push::fcm_message`: data only, no notification, so the app
+    /// wakes in the background instead of the system showing a banner). The caller logs the outcome; the
+    /// token is never logged.
+    pub(super) async fn send_message(&self, message: &serde_json::Value) -> Result<(), String> {
         let access_token = self.get_access_token().await?;
-        
-        // RATE LIMITING: Prevent exceeding Google's 500/sec limit
         if !FCM_RATE_LIMITER.acquire().await {
             return Err("FCM rate limit exceeded - try again later".to_string());
         }
-        
-        println!("[FCM] 📱 Sending FCM push to Light node: {} (token: {}...)", 
-                 node_id, qnet_state::char_prefix(&device_token, 8));
-        
-        // Get project ID from environment or use default
         let project_id = std::env::var("FCM_PROJECT_ID").unwrap_or_else(|_| "qnet-wallet".to_string());
-        
-        // Create FCM message payload (V1 API format).
-        // IMPORTANT: No top-level "notification" key — this is a data-only (silent) push.
-        // On iOS, if "notification" is present and the app is killed, iOS intercepts the
-        // push and shows a system banner WITHOUT waking the app for background processing.
-        // A silent push (data-only + content-available:1) wakes the app in the background
-        // so didReceiveRemoteNotification fires and JS setBackgroundMessageHandler can run.
-        let message_payload = serde_json::json!({
-            "message": {
-                "token": device_token,
-                "data": {
-                    "action": "ping_response",
-                    "node_id": node_id,
-                    "challenge": challenge,
-                    "response_url": response_url,
-                    "quantum_secure": "true",
-                    "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs().to_string()
-                },
-                "android": {
-                    "priority": "high"
-                },
-                "apns": {
-                    "headers": {
-                        "apns-priority": "5",
-                        "apns-push-type": "background"
-                    },
-                    "payload": {
-                        "aps": {
-                            "content-available": 1
-                        }
-                    }
-                }
-            }
-        });
-        
-        // Create HTTP client for FCM V1 API
-        let client = reqwest::Client::new();
         let fcm_url = format!("https://fcm.googleapis.com/v1/projects/{}/messages:send", project_id);
-        
-        // Send FCM notification with OAuth2 Bearer token
-        match client.post(&fcm_url)
+        static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+        let client = CLIENT.get_or_init(|| reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10)).build().unwrap_or_default());
+        let response = client.post(&fcm_url)
             .header("Authorization", format!("Bearer {}", access_token))
-            .header("Content-Type", "application/json")
-            .json(&message_payload)
-            .timeout(std::time::Duration::from_secs(10))
-            .send().await {
-            Ok(response) => {
-                let status = response.status();
-                if status.is_success() {
-                    println!("[FCM] ✅ FCM push notification sent successfully to node {}", node_id);
-                    Ok(())
-                } else {
-                    let error_text = response.text().await.unwrap_or_else(|_| "unknown error".to_string());
-                    println!("[FCM] ❌ FCM API error {}: {}", status, error_text);
-                    Err(format!("FCM API error: {} - {}", status, error_text))
-                }
-            }
-            Err(e) => {
-                println!("[FCM] ❌ FCM network error: {}", e);
-                Err(format!("FCM network error: {}", e))
-            }
+            .json(message)
+            .send().await
+            .map_err(|e| format!("FCM network error: {}", e.without_url()))?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
         }
+        // The provider's error names the failure (an unregistered token, a quota), never the token.
+        let error_text: String = response.text().await.unwrap_or_default().chars().take(300).collect();
+        Err(format!("FCM API error: {} - {}", status, error_text))
+    }
+}
+
+/// The challenge a polling device answers, and until when: `selfattest:{anchor}` with the block the pushed
+/// devices answer with (`push_anchor`), the form every shard owner credits on relay, whichever genesis the
+/// device polled and answers. A server stamp is credited by its issuer alone, on its ingress (only the
+/// issuer can check it), so a stamp a non-owner issued would count nowhere and one a backup owner issued
+/// only in that owner's bitmap: it is the fallback for a node lacking the anchor's block.
+pub(super) fn polling_challenge(node_id: &str, anchor: Option<&str>, now: u64) -> (String, u64) {
+    match anchor {
+        Some(a) => {
+            let tip = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+            (format!("selfattest:{}", a), now + challenge_lifetime_at(tip))
+        }
+        None => make_challenge_stamp(node_id),
+    }
+}
+
+/// A polling challenge is still worth handing out at `tip`: an anchor of the current epoch, or a server
+/// stamp while legacy replies count.
+pub(super) fn polling_challenge_answerable(challenge: &str, tip: u64) -> bool {
+    match crate::light_device::ping::Anchor::parse(challenge) {
+        Some(a) => a.epoch() == tip / crate::light_device::EPOCH_BLOCKS,
+        None => crate::light_device::ping::legacy_counts(tip / crate::light_device::EPOCH_BLOCKS),
+    }
+}
+
+/// Hand a polling device its challenge (`polling_challenge`; `anchor` as `push_anchor` gives it). The map
+/// only bridges to the device's poll in its own slot and is bounded; the challenge verifies statelessly, so
+/// a full map delays nobody past that poll.
+pub(super) fn store_polling_challenge(node_id: &str, anchor: Option<&str>, now: u64) {
+    const MAX_PENDING_CHALLENGES: usize = 10_000;
+    let (challenge, _) = polling_challenge(node_id, anchor, now);
+    let mut challenges = PENDING_CHALLENGES.lock();
+    if challenges.len() >= MAX_PENDING_CHALLENGES {
+        challenges.retain(|_, c| c.expires_at > now);
+    }
+    if challenges.len() < MAX_PENDING_CHALLENGES {
+        challenges.insert(node_id.to_string(), PendingChallenge {
+            challenge,
+            created_at: now,
+            expires_at: now + crate::rpc::LIGHT_CHALLENGE_TTL_SECS,
+        });
+    } else if crate::node::is_warn() {
+        println!("[WARN][RPC] pending_challenges_full size={}", challenges.len());
     }
 }
 
@@ -2370,6 +2616,18 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
         };
 
         let mut last_reward_heal_slot = u64::MAX;
+        // The hourly cleanup runs in its own task; this says one is still running.
+        let cleanup_running = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // The last epoch whose misses were recorded (`epoch_misses`), and the slot of the last ledger prune.
+        let mut misses_done: Option<u64> = None;
+        let mut last_prune_slot = u64::MAX;
+        // Restarted while its provider failed, a genesis stays quiet until a push is answered (`PushHealth`); and it
+        // judges the genesis it heard ticking before by their ticks at once (`OwnerLiveness`).
+        if is_genesis_node {
+            PUSH_HEALTH.restore(&blockchain_for_pings.get_storage());
+            OWNER_LIVENESS.restore(&blockchain_for_pings.get_storage());
+            OWNER_SCHEDULES.restore(&blockchain_for_pings.get_storage());
+        }
         loop {
             check_interval.tick().await;
             
@@ -2407,44 +2665,52 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
                 // Cleanup old attestations every hour, offset per node. The slot is derived
                 // from chain height, so an unoffset check fires within the same second on
                 // every node and no quorum member is left serving during the sweep.
-                if current_slot % 60 == cleanup_slot_offset {
-                    // RAM cleanup
-                    p2p.cleanup_old_attestations();
+                // In its own task (L-4): run inline, its seconds delayed the tick past the slot it read, and at an
+                // epoch's last slot a tick stamped its pushes with a slot of the next epoch. One at a time.
+                if current_slot % 60 == cleanup_slot_offset
+                    && !cleanup_running.swap(true, std::sync::atomic::Ordering::AcqRel)
+                {
+                    let (p2p, blockchain, running) = (p2p.clone(), blockchain_for_pings.clone(), cleanup_running.clone());
+                    tokio::spawn(async move {
+                        // RAM cleanup
+                        p2p.cleanup_old_attestations();
 
-                    // PRODUCTION v2.78: RocksDB cleanup (persistent storage)
-                    blockchain_for_pings.cleanup_old_storage_data().await;
+                        // PRODUCTION v2.78: RocksDB cleanup (persistent storage)
+                        blockchain.cleanup_old_storage_data().await;
 
-                    // ─────────────────────────────────────────────────────────
-                    // v20: CONSENSUS PK REGISTRY — IDLE LRU SWEEP
-                    // ─────────────────────────────────────────────────────────
-                    // Reclaims registry slots held by super-nodes that have not
-                    // produced a single signature-verified consensus message
-                    // within `QNET_PK_REGISTRY_IDLE_DAYS` (default 30). Pinned
-                    // genesis-anchor entries are never evicted regardless of
-                    // staleness — BFT safety requires their PKs always
-                    // available for verification.
-                    //
-                    // The sweep is the proactive counterpart to the in-line
-                    // single-shot eviction performed by register_*() when the
-                    // cap is hit. Running once an hour keeps the registry
-                    // responsive to operator churn at thousand-node scale
-                    // without amplifying the lock-contention surface.
-                    //
-                    // Cost: O(N) read pass + bounded write pass over the
-                    // PK registry. At 100K entries with ~5% idle, expected
-                    // wall-clock ~10 ms per sweep — negligible at hourly
-                    // cadence.
-                    // ─────────────────────────────────────────────────────────
-                    let idle_threshold =
-                        qnet_consensus::consensus_crypto::consensus_pk_registry_idle_threshold_secs();
-                    let evicted =
-                        qnet_consensus::consensus_crypto::evict_idle_consensus_pks(idle_threshold);
-                    if evicted > 0 && crate::node::is_info() {
-                        println!(
-                            "[INFO][CLEANUP] consensus_pk_idle_sweep evicted={} threshold_secs={}",
-                            evicted, idle_threshold
-                        );
-                    }
+                        // ─────────────────────────────────────────────────────────
+                        // v20: CONSENSUS PK REGISTRY — IDLE LRU SWEEP
+                        // ─────────────────────────────────────────────────────────
+                        // Reclaims registry slots held by super-nodes that have not
+                        // produced a single signature-verified consensus message
+                        // within `QNET_PK_REGISTRY_IDLE_DAYS` (default 30). Pinned
+                        // genesis-anchor entries are never evicted regardless of
+                        // staleness — BFT safety requires their PKs always
+                        // available for verification.
+                        //
+                        // The sweep is the proactive counterpart to the in-line
+                        // single-shot eviction performed by register_*() when the
+                        // cap is hit. Running once an hour keeps the registry
+                        // responsive to operator churn at thousand-node scale
+                        // without amplifying the lock-contention surface.
+                        //
+                        // Cost: O(N) read pass + bounded write pass over the
+                        // PK registry. At 100K entries with ~5% idle, expected
+                        // wall-clock ~10 ms per sweep — negligible at hourly
+                        // cadence.
+                        // ─────────────────────────────────────────────────────────
+                        let idle_threshold =
+                            qnet_consensus::consensus_crypto::consensus_pk_registry_idle_threshold_secs();
+                        let evicted =
+                            qnet_consensus::consensus_crypto::evict_idle_consensus_pks(idle_threshold);
+                        if evicted > 0 && crate::node::is_info() {
+                            println!(
+                                "[INFO][CLEANUP] consensus_pk_idle_sweep evicted={} threshold_secs={}",
+                                evicted, idle_threshold
+                            );
+                        }
+                        running.store(false, std::sync::atomic::Ordering::Release);
+                    });
                 }
             }
             
@@ -2470,209 +2736,218 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
             // ================================================================
             // LIGHT NODE PINGING (v2.89: Genesis-only)
             // ================================================================
-            
+
             if let Some(p2p) = blockchain_for_pings.get_unified_p2p() {
-                
-                // Get Light nodes to ping (ONLY Genesis nodes get results now)
-                let nodes_to_ping = p2p.get_light_nodes_to_ping();
-                
-                if !nodes_to_ping.is_empty() {
-                    // v2.89: Batch logging for Genesis (avoid 139 logs/sec)
-                    if is_genesis_node {
-                        if is_info() {
-                            println!("[INFO][GENESIS-PING] Slot {}: {} Light nodes to ping", 
-                                     current_slot, nodes_to_ping.len());
+                let tip = blockchain_for_pings.get_height().await;
+                let epoch = tip / 14400;
+                // P-1: the early first-push draw starts with the window after this genesis's first ping, and the spaced
+                // rounds with the window after its first ping on a release with them, both kept across restarts, once
+                // the height is known. A window not stored yet is stored only from a tip the network stands behind, so a
+                // genesis back from a long stop never stores one it is already past; a stored one is armed at once.
+                if tip > 0 {
+                    let storage = blockchain_for_pings.get_storage();
+                    let head = p2p.corroborated_head_ceiling();
+                    let live = (head > 0 && !pinger_behind(tip, head)).then_some(epoch);
+                    SimplifiedP2P::arm_push_schedule(first_push_draw_from(&storage, live), spaced_rounds_from(&storage, live));
+                }
+                // The misses of the epoch whose commit opened (after a stalled loop, of the one before): what each
+                // node that gave no answer got from here, merged into its row (`device.last_miss`). Before any push
+                // of a new epoch, which would reuse the ledger's entries.
+                let decided = if in_commit_gap(tip) { Some(epoch) } else { epoch.checked_sub(1) };
+                if let Some(d) = decided.filter(|d| misses_done.map_or(true, |m| m < *d)) {
+                    misses_done = Some(d);
+                    let entries = PUSH_LEDGER.take_epoch(d);
+                    let signer = std::env::var("QNET_BOOTSTRAP_ID").ok()
+                        .and_then(|id| ["001", "002", "003", "004", "005"].iter().position(|g| *g == id));
+                    match (entries.is_empty(), signer) {
+                        (false, Some(signer)) => {
+                            let storage = blockchain_for_pings.get_storage();
+                            tokio::task::spawn_blocking(move || {
+                                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+                                let held = entries.len();
+                                // Its reach records first (F3): the devices reached and silent here, which the dormant
+                                // rule of all three owners reads; the other owners pull them (`pull_reach_records`).
+                                let reached = reached_unanswered(&entries, |id| storage.light_counted_answer_at(id, d).is_some());
+                                let recorded = save_reach_records(&storage, d, signer, &reached);
+                                mark_reach_decided(d);
+                                let misses = epoch_misses(entries, |id| storage.light_counted_answer_at(id, d).is_some(), now);
+                                let missed = misses.len();
+                                let written = save_misses(&storage, misses);
+                                if crate::node::is_info() {
+                                    println!("[INFO][LIGHT] epoch_misses_recorded epoch={} entries={} missed={} rows={} reached_silent={}",
+                                             d, held, missed, written, recorded);
+                                }
+                            });
                         }
-                    } else {
-                        println!("[LIGHT] 📡 Slot {}: {} Light nodes to ping", 
-                                 current_slot, nodes_to_ping.len());
+                        _ => mark_reach_decided(d),
                     }
-                    
+                }
+                // F14: behind the network this genesis's epoch and anchor are stale. No push, no ping tick: the owners
+                // below take its shards over until it caught up.
+                let behind = this_genesis_behind();
+                if behind && is_genesis_node && crate::node::is_warn() {
+                    println!("[WARN][LIGHT] pinger_behind tip={} action=no_push_no_tick", tip);
+                }
+                // The other owners' reach records of the last two epochs, once each.
+                if let Some(our) = std::env::var("QNET_BOOTSTRAP_ID").ok()
+                    .and_then(|id| ["001", "002", "003", "004", "005"].iter().position(|g| *g == id)) {
+                    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+                    pull_reach_records(blockchain_for_pings.get_storage(), our, tip, now);
+                }
+                // Entries of nodes that answered at another genesis go every ten slots; those that answered here
+                // went at their answer. A pass over the whole ledger, so on a blocking thread, with the epoch's
+                // answers read under one lock (M-11).
+                if current_slot % 10 == 0 && last_prune_slot != current_slot {
+                    last_prune_slot = current_slot;
+                    let p2p = p2p.clone();
+                    tokio::task::spawn_blocking(move || {
+                        p2p.with_counted_in(epoch, |counted| PUSH_LEDGER.prune(epoch, counted));
+                    });
+                }
+                // Polling challenges no longer worth handing out, once a tick, off the poll route (L-5).
+                sweep_polling_challenges(tip, SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs());
+
+                // Get Light nodes to ping (ONLY Genesis nodes get results now). Storage point reads for every node it
+                // may push, so on a blocking thread, never on a runtime worker (M-11); the slot comes from `tip`.
+                let selection = if behind {
+                    LightPingSelection::default()
+                } else {
+                    let p2p = p2p.clone();
+                    tokio::task::spawn_blocking(move || p2p.get_light_nodes_to_ping(tip)).await.unwrap_or_default()
+                };
+                // The slot the selection read stamps every push of the tick, and the commit is judged in its epoch
+                // (L-4).
+                let abs_slot = selection.now_slot;
+                let nodes_to_ping = selection.nodes;
+                // No push at or after the epoch's commit (R-c): an answer then counts in no epoch, and the next
+                // epoch gets its own push.
+                let open = push_lifetime(abs_slot / 240, tip).is_some();
+                // What the tick's pushes got from the provider, None when it sent none (`PushHealth`).
+                let mut tick_tally: Option<Arc<PushTally>> = None;
+
+                if !nodes_to_ping.is_empty() && open {
+                    let offered = nodes_to_ping.len();
                     let mut futures = FuturesUnordered::new();
-                    
-                    for (light_node, role) in nodes_to_ping {
+                    // F6: one shard's share of the budget for each shard covered, so a takeover sheds nothing.
+                    EPOCH_PACER.set_rate(epoch_push_rate(covered_shards()));
+                    // One anchor per tick: the block every device pushed now answers with.
+                    let anchor = push_anchor(&blockchain_for_pings.get_storage(), tip);
+                    if anchor.is_none() && crate::node::is_warn() {
+                        println!("[WARN][LIGHT] push_anchor_unavailable slot={} action=no_push_this_tick", current_slot);
+                    }
+                    // What the tick did, for its one summary line (per push only at DEBUG).
+                    let tally = Arc::new(PushTally::default());
+
+                    // In the order the selection gives (first pushes, then the round's repeats, then the retry
+                    // round), which is the order they take their instants in: a slot over the budget sheds its
+                    // later pushes, never its first ones. A backup that covers a shard pushes at once: the ranks
+                    // above it are silent by then (`OwnerLiveness`), and a wait only shortened the device's time.
+                    for (light_node, role, channel) in nodes_to_ping {
                         let semaphore = semaphore.clone();
                         let blockchain = blockchain_for_pings.clone();
-                        // G2: server-stamped challenge bound to THIS node (FCM-safe, stateless).
-                        let challenge = make_challenge_stamp(&light_node.node_id);
-                        let delay = p2p.get_ping_delay(role);
-                        let _our_node_id = blockchain.get_node_id();
-                        
+                        let anchor = anchor.clone();
+                        let tally = tally.clone();
+
                         futures.push(async move {
-                            // BACKUP DELAY: Wait for primary to attempt first
-                            if delay.as_secs() > 0 {
-                                tokio::time::sleep(delay).await;
-                                
-                                // Re-check if attestation appeared while waiting
-                                if let Some(p2p) = blockchain.get_unified_p2p() {
-                                    if p2p.has_attestation(&light_node.node_id, current_slot) {
-                                        // Primary succeeded, skip
-                                        return;
-                                    }
-                                }
-                            }
-                            
-                            // Acquire semaphore permit
-                            let _permit = match semaphore.acquire().await {
-                                Ok(p) => p,
-                                Err(_) => { println!("[RPC] ⚠️ Semaphore closed"); return; }
-                            };
-                            
                             let role_str = match role {
                                 PingerRole::Primary => "PRIMARY",
                                 PingerRole::Backup1 => "BACKUP1",
                                 PingerRole::Backup2 => "BACKUP2",
                                 PingerRole::None => "NONE",
                             };
-                            
-                            // Send ping based on push type
-                            match light_node.push_type {
-                                crate::unified_p2p::PushType::FCM => {
-                                    // FCM push notification (Google Play users).
-                                    // Load the REAL FCM token from local RocksDB storage.
-                                    // The gossiped registry only carries a privacy hash —
-                                    // the actual 152-char token is stored in fcm_tokens CF.
-                                    let real_token_opt = blockchain.get_storage()
-                                        .get_fcm_data(&light_node.node_id)
-                                        .map(|(token, _, _)| token);
 
-                                    if let Some(real_token) = real_token_opt {
-                                        let our_response_url = {
-                                            use crate::genesis_constants::GENESIS_NODE_IPS;
-                                            let bid = std::env::var("QNET_BOOTSTRAP_ID").unwrap_or_default();
-                                            GENESIS_NODE_IPS.iter()
-                                                .find(|(_, id)| *id == bid)
-                                                .map(|(ip, _)| format!("http://{}:8001", ip))
-                                                .unwrap_or_default()
-                                        };
-                                        let fcm = FCMPushService::new();
-                                        match fcm.send_ping_notification(&real_token, &light_node.node_id, &challenge, &our_response_url).await {
-                                            Ok(()) => {
-                                                if crate::node::is_info() {
-                                                    println!("[INFO][LIGHT] fcm_sent role={} node={} slot={}",
-                                                             role_str, light_node.node_id, current_slot);
-                                                }
-                                            }
-                                            Err(e) => {
-                                                if !e.contains("FCM_SERVER_KEY not configured") {
-                                                    if crate::node::is_warn() {
-                                                        println!("[WARN][LIGHT] fcm_error role={} node={} err={}",
-                                                                 role_str, light_node.node_id, e);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    } else {
-                                        let now = std::time::SystemTime::now()
-                                            .duration_since(std::time::UNIX_EPOCH)
-                                            .unwrap_or_default()
-                                            .as_secs();
-                                        {
-                                            let mut challenges = PENDING_CHALLENGES.lock();
-                                            // v10.0: Bound PENDING_CHALLENGES to 10K; cleanup expired before insert
-                                            const MAX_PENDING_CHALLENGES: usize = 10_000;
-                                            if challenges.len() >= MAX_PENDING_CHALLENGES {
-                                                challenges.retain(|_, c| c.expires_at > now);
-                                                // If still full after cleanup, skip insert
-                                                if challenges.len() >= MAX_PENDING_CHALLENGES {
-                                                    println!("[WARN][RPC] pending_challenges_full size={}", challenges.len());
-                                                }
-                                            }
-                                            if challenges.len() < MAX_PENDING_CHALLENGES {
-                                                challenges.insert(light_node.node_id.clone(), PendingChallenge {
-                                                    challenge: challenge.clone(),
-                                                    created_at: now,
-                                                    expires_at: now + 180,
-                                                });
+                            // The v2 push (U12) over the channel the device's push record names, and only
+                            // a record of the binding held here: never the resident entry, which a
+                            // registration planted before the chain admitted the node could have set and
+                            // which nothing ties to the binding. A polling device, or one whose channel
+                            // this genesis lacks or holds only for another binding, fetches the tick's
+                            // anchor as its challenge (`polling_challenge`). The selection decided the channel
+                            // (`push_reach_at`), so nothing is read again here.
+                            let node_id = light_node.as_str();
+                            match (channel, anchor) {
+                                (Some(channel), Some(anchor)) => {
+                                    // One even stream of pushes (`EPOCH_PACER`): a push with no instant left
+                                    // in its slot is shed, and the next slot of its due point tries again. Recorded
+                                    // as unsent: the system's miss, never the device's (F3).
+                                    let now_us = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_micros() as u64;
+                                    let Some(at) = EPOCH_PACER.reserve(now_us, now_us + PACE_WINDOW_US) else {
+                                        PUSH_LEDGER.record(node_id, abs_slot, SendOutcome::Unsent, now_us / 1_000_000);
+                                        tally.shed.fetch_add(1, AtomicOrdering::Relaxed);
+                                        return;
+                                    };
+                                    tokio::time::sleep(std::time::Duration::from_micros(at.saturating_sub(now_us))).await;
+                                    if blockchain.get_unified_p2p().map_or(false, |p| p.has_attestation_in_window(node_id)) {
+                                        return;
+                                    }
+                                    let _permit = match semaphore.acquire().await {
+                                        Ok(p) => p,
+                                        Err(_) => { println!("[RPC] ⚠️ Semaphore closed"); return; }
+                                    };
+                                    // It lives until the commit of the epoch it is for, from the tip now (R-c).
+                                    let Some(ttl) = push_lifetime(abs_slot / 240, crate::node::local_height()) else { return; };
+                                    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+                                    match deliver_push(&channel, PushAction::Epoch, &anchor, ttl).await {
+                                        Ok(()) => {
+                                            PUSH_LEDGER.record(node_id, abs_slot, SendOutcome::Accepted, now);
+                                            tally.took(&channel);
+                                            if crate::node::is_debug() {
+                                                println!("[DBG][LIGHT] push_sent role={} node={} slot={} channel={} ttl={}",
+                                                         role_str, node_id, current_slot, channel.name(), ttl);
                                             }
                                         }
-                                        if crate::node::is_debug() {
-                                            println!("[DBG][LIGHT] fcm_token_missing role={} node={} action=polling_fallback",
-                                                     role_str, light_node.node_id);
+                                        Err(e) => {
+                                            let gone = push_target_gone(&e);
+                                            PUSH_LEDGER.record(node_id, abs_slot, if gone { SendOutcome::Gone } else { SendOutcome::Failed }, now);
+                                            tally.failed(&channel, gone, &e);
+                                            if crate::node::is_debug() {
+                                                println!("[DBG][LIGHT] push_failed role={} node={} channel={} err={}",
+                                                         role_str, node_id, channel.name(), e);
+                                            }
+                                            // A device stops by unbinding and then deleting its token: a token
+                                            // the provider no longer knows may be an unbind this genesis missed.
+                                            if gone {
+                                                repair_withdrawn_binding(node_id, abs_slot / 240);
+                                            }
                                         }
                                     }
                                 }
-                                crate::unified_p2p::PushType::UnifiedPush => {
-                                    // UnifiedPush notification (F-Droid users)
-                                    if let Some(endpoint) = &light_node.unified_push_endpoint {
-                                        let up_response_url = {
-                                            use crate::genesis_constants::GENESIS_NODE_IPS;
-                                            let bid = std::env::var("QNET_BOOTSTRAP_ID").unwrap_or_default();
-                                            GENESIS_NODE_IPS.iter()
-                                                .find(|(_, id)| *id == bid)
-                                                .map(|(ip, _)| format!("http://{}:8001", ip))
-                                                .unwrap_or_default()
-                                        };
-                                        let client = reqwest::Client::new();
-                                        let payload = serde_json::json!({
-                                            "action": "ping_response",
-                                            "node_id": light_node.node_id,
-                                            "challenge": challenge,
-                                            "response_url": up_response_url,
-                                            "timestamp": std::time::SystemTime::now()
-                                                .duration_since(std::time::UNIX_EPOCH)
-                                                .unwrap_or_default()
-                                                .as_secs()
-                                        });
-                                        
-                                        match client.post(endpoint)
-                                            .header("Content-Type", "application/json")
-                                            .json(&payload)
-                                            .timeout(std::time::Duration::from_secs(10))
-                                            .send()
-                                            .await 
-                                        {
-                                            Ok(response) if response.status().is_success() => {
-                                                println!("[LIGHT] 📤 {} sent UnifiedPush to {} slot {} (awaiting response)", 
-                                                         role_str, light_node.node_id, current_slot);
-                                            }
-                                            Ok(response) => {
-                                                println!("[LIGHT] ❌ {} UnifiedPush error for {}: HTTP {}", 
-                                                         role_str, light_node.node_id, response.status());
-                                            }
-                                            Err(e) => {
-                                                println!("[LIGHT] ❌ {} UnifiedPush network error for {}: {}", 
-                                                         role_str, light_node.node_id, e);
-                                            }
-                                        }
-                                    } else {
-                                        println!("[LIGHT] ⚠️ {} has UnifiedPush type but no endpoint", light_node.node_id);
-                                    }
+                                // No anchor this tick: nothing is pushed; the next tick or the device's own
+                                // wake covers it. Unsent, as a shed push.
+                                (Some(_), None) => {
+                                    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+                                    PUSH_LEDGER.record(node_id, abs_slot, SendOutcome::Unsent, now);
                                 }
-                                crate::unified_p2p::PushType::Polling => {
-                                    // Polling mode - store challenge for device to fetch
-                                    let now = std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_secs();
-                                    
-                                    {
-                                        let mut challenges = PENDING_CHALLENGES.lock();
-                                        // v10.0: Bound PENDING_CHALLENGES to 10K
-                                        const MAX_PENDING_CHALLENGES: usize = 10_000;
-                                        if challenges.len() >= MAX_PENDING_CHALLENGES {
-                                            challenges.retain(|_, c| c.expires_at > now);
-                                        }
-                                        if challenges.len() < MAX_PENDING_CHALLENGES {
-                                            challenges.insert(light_node.node_id.clone(), PendingChallenge {
-                                                challenge: challenge.clone(),
-                                                created_at: now,
-                                                expires_at: now + 180, // 3 minute expiry
-                                            });
-                                        }
+                                (None, anchor) => {
+                                    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+                                    store_polling_challenge(node_id, anchor.as_deref(), now);
+                                    PUSH_LEDGER.record(node_id, abs_slot, SendOutcome::Polled, now);
+                                    tally.polled.fetch_add(1, AtomicOrdering::Relaxed);
+                                    if crate::node::is_debug() {
+                                        println!("[DBG][LIGHT] challenge_stored role={} node={} slot={}",
+                                                 role_str, node_id, current_slot);
                                     }
-
-                                    println!("[INFO][LIGHT] challenge_stored role={} node={} slot={}",
-                                             role_str, light_node.node_id, current_slot);
                                 }
                             }
                         });
                     }
-                    
+
                     // Wait for all Light node pings
                     while futures.next().await.is_some() {}
+                    tally.log(current_slot, offered);
+                    tick_tally = Some(tally);
                 }
-                
+                // F5: the tick is done. Its signed tick, straight to the other genesis, is what tells them this
+                // genesis pushes; a genesis behind the network, whose push loop stopped, or whose provider answered
+                // none of its pushes QUIET_AFTER_FAILED_TICKS ticks in a row (`PushHealth`) sends none.
+                let pushing = PUSH_HEALTH.settle_tick(&blockchain_for_pings.get_storage(), tick_tally.as_deref(), current_slot);
+                if !behind && pushing {
+                    p2p.announce_ping_tick().await;
+                }
+                if is_genesis_node {
+                    OWNER_LIVENESS.keep(&blockchain_for_pings.get_storage());
+                    OWNER_SCHEDULES.keep(&blockchain_for_pings.get_storage());
+                }
+
                 // B: no ping-failure accrual — liveness is derived from committed attestation recency and
                 // the wake-scheduler stops waking dormant nodes on its own. Reactivation = self-attest.
             }
@@ -2746,18 +3021,13 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
                 for (node_id, light_node) in registry.iter_mut() {
                     let devices_before = light_node.devices.len();
                     
-                    // Remove devices inactive for more than 24 hours
+                    // Remove devices inactive for more than 24 hours. The app's device id is never logged.
                     light_node.devices.retain(|device| {
-                        let is_recent = (now - device.last_active) < 24 * 60 * 60;
-                        let keep_device = device.is_active && is_recent;
-                        
-                        if !keep_device {
-                            println!("[CLEANUP] 📱 Removing inactive device {} from Light node {} (inactive for {}h)", 
-                                     qnet_state::char_prefix(&device.device_id, 8), 
-                                     node_id,
-                                     (now - device.last_active) / 3600);
+                        let keep_device = device.is_active && now.saturating_sub(device.last_active) < 24 * 60 * 60;
+                        if !keep_device && crate::node::is_debug() {
+                            println!("[DBG][CLEANUP] inactive_device_removed node={} idle_hours={}",
+                                     node_id, now.saturating_sub(device.last_active) / 3600);
                         }
-                        
                         keep_device
                     });
                     

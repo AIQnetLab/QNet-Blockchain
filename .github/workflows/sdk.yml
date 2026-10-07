@@ -1,0 +1,69 @@
+name: SDK
+
+# Builds, type-checks, tests and packs @aiqnet/sdk. The SDK compiles the transaction, signing and light-client
+# sources of the mobile app and the extension's crypto core by path, so a change there runs this too.
+on:
+  push:
+    branches: [testnet, master]
+    paths:
+      - 'development/qnet-sdk/**'
+      - 'applications/qnet-mobile/src/**'
+      - 'applications/qnet-mobile/scripts/release-check.js'
+      - 'applications/qnet-wallet/tools/crypto-bundle/src/**'
+      - 'docs/protocols/**'
+      - '.github/workflows/sdk.yml'
+  pull_request:
+    paths:
+      - 'development/qnet-sdk/**'
+      - 'applications/qnet-mobile/src/**'
+      - 'applications/qnet-mobile/scripts/release-check.js'
+      - 'applications/qnet-wallet/tools/crypto-bundle/src/**'
+      - 'docs/protocols/**'
+      - '.github/workflows/sdk.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sdk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: development/qnet-sdk
+    steps:
+      - uses: actions/checkout@v4
+
+      # The test script passes a glob to node --test, which Node reads from version 21.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: development/qnet-sdk/package-lock.json
+
+      - name: Install
+        run: npm ci --no-audit --no-fund
+
+      - name: Type check
+        run: npm run typecheck
+
+      # Builds dist/ (the shared-source allow-list and the declarations are checked there), then runs every suite.
+      - name: Build and test
+        run: npm test
+
+      # The light-client pin's age is a release gate (prepack runs it); here the package's contents are checked.
+      - name: Pack
+        run: |
+          npm pack --dry-run --ignore-scripts --json > "$RUNNER_TEMP/pack.json"
+          node -e '
+            const files = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))[0].files.map((f) => f.path);
+            const want = ["package.json", "dist/index.js", "dist/index.d.ts", "dist/node.js", "dist/node.d.ts", "dist/cli.js"];
+            const missing = want.filter((f) => !files.includes(f));
+            const stray = files.filter((f) => f !== "package.json" && f !== "README.md" && !f.startsWith("dist/"));
+            if (missing.length || stray.length) {
+              console.error(`[ERR][PACK] missing=${missing.join(",")} stray=${stray.join(",")}`);
+              process.exit(1);
+            }
+            console.log(`[INFO][PACK] ${files.length} files`);
+          ' "$RUNNER_TEMP/pack.json"

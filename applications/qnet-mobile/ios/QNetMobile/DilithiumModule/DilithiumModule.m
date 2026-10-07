@@ -14,6 +14,11 @@
  *   Public key : 1952 bytes
  *   Secret key : 4032 bytes
  *   Signature  : 3309 bytes
+ *
+ * Keygen and signing run under one lock (randombytes_ios.c). Native buffers that held a seed or a secret key
+ * are zeroed before they go out of scope, PQClean wipes its own secret locals (sign.c), and the stack a keypair
+ * or signature used is overwritten before the lock is released. The NSString the key arrives in (hex, from JS)
+ * is immutable and cannot be wiped here. The self-test runs in debug builds only.
  */
 
 #import "DilithiumModule.h"
@@ -60,11 +65,6 @@ static BOOL hexToBytes(NSString *hex, uint8_t *out, size_t expected_len) {
     return YES;
 }
 
-/** Derive deterministic 32-byte seed via SHAKE-256 (same as Android). */
-static void deriveSeedFromString(const char *str, size_t len, uint8_t out[32]) {
-    shake256(out, 32, (const uint8_t *)str, len);
-}
-
 /* ---- 4-byte little-endian write ---- */
 static void writeU32LE(uint8_t *buf, uint32_t value) {
     buf[0] = (uint8_t)(value & 0xFF);
@@ -73,13 +73,54 @@ static void writeU32LE(uint8_t *buf, uint32_t value) {
     buf[3] = (uint8_t)((value >> 24) & 0xFF);
 }
 
+/** The 4032-byte secret key from its hex; anything else is refused (no re-derivation from a string). */
+static BOOL secretKeyFromHex(NSString *secretKeyHex, uint8_t sk[DILITHIUM_SK_SIZE]) {
+    if (secretKeyHex.length != DILITHIUM_SK_SIZE * 2 || !hexToBytes(secretKeyHex, sk, DILITHIUM_SK_SIZE)) {
+        dilithium_secure_zero(sk, DILITHIUM_SK_SIZE);
+        return NO;
+    }
+    return YES;
+}
+
 @implementation DilithiumModule
 
 RCT_EXPORT_MODULE(DilithiumModule)
 
-/** All methods run on a serial queue to keep single-threaded seed state safe. */
+/** All methods run on one serial queue; the C lock covers anything else that reaches the library. */
 - (dispatch_queue_t)methodQueue {
-    return dispatch_queue_create("com.qnetmobile.dilithium", DISPATCH_QUEUE_SERIAL);
+    static dispatch_queue_t queue;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ queue = dispatch_queue_create("com.qnetmobile.dilithium", DISPATCH_QUEUE_SERIAL); });
+    return queue;
+}
+
+/** SHAKE-256 of the seed string's UTF-8, copied into a buffer of our own that is wiped (no NSData copy). */
+static BOOL seed32FromString(NSString *seed, uint8_t seed32[32]) {
+    NSUInteger max = [seed lengthOfBytesUsingEncoding:NSUTF8StringEncoding];
+    if (max == 0) return NO;
+    uint8_t *buf = (uint8_t *)malloc(max);
+    if (!buf) return NO;
+    NSUInteger used = 0;
+    BOOL ok = [seed getBytes:buf maxLength:max usedLength:&used encoding:NSUTF8StringEncoding
+                     options:0 range:NSMakeRange(0, seed.length) remainingRange:NULL];
+    if (ok && used > 0) shake256(seed32, 32, buf, used);
+    dilithium_secure_zero(buf, max);
+    free(buf);
+    return ok && used > 0;
+}
+
+/** One deterministic keypair for a seed, under the lock; the stack it used is overwritten before release. */
+static int keypairFromSeed(NSString *seed, uint8_t pk[DILITHIUM_PK_SIZE], uint8_t sk[DILITHIUM_SK_SIZE]) {
+    uint8_t seed32[32];
+    if (!seed32FromString(seed, seed32)) return -2;
+    dilithium_lock();
+    dilithium_set_keygen_seed(seed32);
+    int ret = PQCLEAN_MLDSA65_CLEAN_crypto_sign_keypair(pk, sk);
+    dilithium_clear_keygen_seed();
+    dilithium_burn_stack();
+    dilithium_unlock();
+    dilithium_secure_zero(seed32, sizeof(seed32));
+    return ret;
 }
 
 /**
@@ -92,73 +133,78 @@ RCT_EXPORT_METHOD(generateKeypairFromSeed:(NSString *)seed
                   resolver:(RCTPromiseResolveBlock)resolve
                   rejecter:(RCTPromiseRejectBlock)reject)
 {
-    const char *seedStr = seed.UTF8String;
-    size_t seedLen = strlen(seedStr);
-
-    uint8_t seed32[32];
-    deriveSeedFromString(seedStr, seedLen, seed32);
-    dilithium_set_keygen_seed(seed32);
-
     uint8_t pk[DILITHIUM_PK_SIZE];
     uint8_t sk[DILITHIUM_SK_SIZE];
-    int ret = PQCLEAN_MLDSA65_CLEAN_crypto_sign_keypair(pk, sk);
-    dilithium_clear_keygen_seed();
+    int ret = keypairFromSeed(seed, pk, sk);
+    if (ret == -2) {
+        reject(@"DILITHIUM_KEYGEN_ERROR", @"Empty seed", nil);
+        return;
+    }
 
     if (ret != 0) {
+        dilithium_secure_zero(sk, sizeof(sk));
         reject(@"DILITHIUM_KEYGEN_ERROR",
                [NSString stringWithFormat:@"nativeGenerateKeypair failed: %d", ret],
                nil);
         return;
     }
 
+    NSString *skHex = bytesToHex(sk, DILITHIUM_SK_SIZE);
+    dilithium_secure_zero(sk, sizeof(sk));
     resolve(@{
         @"publicKey":     bytesToHex(pk, DILITHIUM_PK_SIZE),
-        @"secretKey":     bytesToHex(sk, DILITHIUM_SK_SIZE),
+        @"secretKey":     skHex,
         @"publicKeySize": @(DILITHIUM_PK_SIZE),
         @"secretKeySize": @(DILITHIUM_SK_SIZE),
     });
 }
 
 /**
- * sign(message, secretKeySeed, publicKeyHex, nodeId) → { signature, signatureSize, totalBinarySize }
+ * publicKeyFromSeed(seed: string) → { publicKey, publicKeySize }
  *
- * secretKeySeed: 8064-char hex of raw secret key bytes (from generateKeypairFromSeed).
- *   If not valid hex of correct length, treats as seed string and re-derives keypair.
+ * The public key alone: the wallet's determinism check derives the key a second time, and the secret half of
+ * that keypair never leaves this function (MPLAT-R2-05).
+ */
+RCT_EXPORT_METHOD(publicKeyFromSeed:(NSString *)seed
+                  resolver:(RCTPromiseResolveBlock)resolve
+                  rejecter:(RCTPromiseRejectBlock)reject)
+{
+    uint8_t pk[DILITHIUM_PK_SIZE];
+    uint8_t sk[DILITHIUM_SK_SIZE];
+    int ret = keypairFromSeed(seed, pk, sk);
+    dilithium_secure_zero(sk, sizeof(sk));
+    if (ret != 0) {
+        reject(@"DILITHIUM_KEYGEN_ERROR", [NSString stringWithFormat:@"publicKeyFromSeed failed: %d", ret], nil);
+        return;
+    }
+    resolve(@{ @"publicKey": bytesToHex(pk, DILITHIUM_PK_SIZE), @"publicKeySize": @(DILITHIUM_PK_SIZE) });
+}
+
+/**
+ * sign(message, secretKeyHex, publicKeyHex, nodeId) → { signature, signatureSize, totalBinarySize }
+ *
+ * secretKeyHex: 8064-char hex of raw secret key bytes (from generateKeypairFromSeed).
  *
  * Signature format (identical to Android):
  *   "dilithium_sig_{nodeId}_{base64([4LE:len(sig||msg)] [sig||msg] [4LE:len(pk)] [pk])}"
  */
 RCT_EXPORT_METHOD(sign:(NSString *)message
-                  secretKeySeed:(NSString *)secretKeySeed
+                  secretKeySeed:(NSString *)secretKeyHex
                   publicKeyHex:(NSString *)publicKeyHex
                   nodeId:(NSString *)nodeId
                   resolver:(RCTPromiseResolveBlock)resolve
                   rejecter:(RCTPromiseRejectBlock)reject)
 {
-    /* Resolve secret key bytes */
     uint8_t sk[DILITHIUM_SK_SIZE];
-    BOOL isRawHex = (secretKeySeed.length == DILITHIUM_SK_SIZE * 2) &&
-                    hexToBytes(secretKeySeed, sk, DILITHIUM_SK_SIZE);
-
-    if (!isRawHex) {
-        /* Legacy / seed path: re-derive keypair from seed string */
-        const char *seedStr = secretKeySeed.UTF8String;
-        uint8_t seed32[32];
-        deriveSeedFromString(seedStr, strlen(seedStr), seed32);
-        dilithium_set_keygen_seed(seed32);
-
-        uint8_t pk_tmp[DILITHIUM_PK_SIZE];
-        if (PQCLEAN_MLDSA65_CLEAN_crypto_sign_keypair(pk_tmp, sk) != 0) {
-            dilithium_clear_keygen_seed();
-            reject(@"DILITHIUM_SIGN_ERROR", @"Failed to re-derive keypair from seed", nil);
-            return;
-        }
-        dilithium_clear_keygen_seed();
+    if (!secretKeyFromHex(secretKeyHex, sk)) {
+        reject(@"DILITHIUM_SIGN_ERROR", @"Secret key must be 4032 bytes of hex", nil);
+        return;
     }
 
     /* Resolve public key bytes */
     uint8_t pk[DILITHIUM_PK_SIZE];
     if (!hexToBytes(publicKeyHex, pk, DILITHIUM_PK_SIZE)) {
+        dilithium_secure_zero(sk, sizeof(sk));
         reject(@"DILITHIUM_SIGN_ERROR",
                [NSString stringWithFormat:@"Invalid public key hex (expected %d bytes)", DILITHIUM_PK_SIZE],
                nil);
@@ -171,11 +217,12 @@ RCT_EXPORT_METHOD(sign:(NSString *)message
 
     uint8_t sig[DILITHIUM_SIG_SIZE];
     size_t  sigLen = 0;
+    dilithium_lock();
     int ret = PQCLEAN_MLDSA65_CLEAN_crypto_sign_signature(
                   sig, &sigLen, msgBytes, msgLen, sk);
-
-    /* Zero secret key immediately after use — prevent key material in stack residue */
-    memset(sk, 0, DILITHIUM_SK_SIZE);
+    dilithium_burn_stack();
+    dilithium_unlock();
+    dilithium_secure_zero(sk, sizeof(sk));
 
     if (ret != 0 || sigLen != DILITHIUM_SIG_SIZE) {
         reject(@"DILITHIUM_SIGN_ERROR",
@@ -217,38 +264,30 @@ RCT_EXPORT_METHOD(sign:(NSString *)message
 }
 
 /**
- * FIX-5: signDetached(message, secretKeySeed) → { signature }
+ * FIX-5: signDetached(message, secretKeyHex) → { signature }
  * Returns ONLY the RAW detached ML-DSA-65 signature (3309 bytes) as hex — no "dilithium_sig_" envelope,
  * no base64, no embedded message, no pubkey trailer. Matches the node's raw-detached value-TX verifier.
  */
 RCT_EXPORT_METHOD(signDetached:(NSString *)message
-                  secretKeySeed:(NSString *)secretKeySeed
+                  secretKeySeed:(NSString *)secretKeyHex
                   resolver:(RCTPromiseResolveBlock)resolve
                   rejecter:(RCTPromiseRejectBlock)reject)
 {
     uint8_t sk[DILITHIUM_SK_SIZE];
-    BOOL isRawHex = (secretKeySeed.length == DILITHIUM_SK_SIZE * 2) &&
-                    hexToBytes(secretKeySeed, sk, DILITHIUM_SK_SIZE);
-    if (!isRawHex) {
-        const char *seedStr = secretKeySeed.UTF8String;
-        uint8_t seed32[32];
-        deriveSeedFromString(seedStr, strlen(seedStr), seed32);
-        dilithium_set_keygen_seed(seed32);
-        uint8_t pk_tmp[DILITHIUM_PK_SIZE];
-        if (PQCLEAN_MLDSA65_CLEAN_crypto_sign_keypair(pk_tmp, sk) != 0) {
-            dilithium_clear_keygen_seed();
-            reject(@"DILITHIUM_SIGN_ERROR", @"Failed to re-derive keypair from seed", nil);
-            return;
-        }
-        dilithium_clear_keygen_seed();
+    if (!secretKeyFromHex(secretKeyHex, sk)) {
+        reject(@"DILITHIUM_SIGN_ERROR", @"Secret key must be 4032 bytes of hex", nil);
+        return;
     }
 
     const uint8_t *msgBytes = (const uint8_t *)message.UTF8String;
     size_t msgLen = strlen(message.UTF8String);
     uint8_t sig[DILITHIUM_SIG_SIZE];
     size_t  sigLen = 0;
+    dilithium_lock();
     int ret = PQCLEAN_MLDSA65_CLEAN_crypto_sign_signature(sig, &sigLen, msgBytes, msgLen, sk);
-    memset(sk, 0, DILITHIUM_SK_SIZE);
+    dilithium_burn_stack();
+    dilithium_unlock();
+    dilithium_secure_zero(sk, sizeof(sk));
 
     if (ret != 0 || sigLen != DILITHIUM_SIG_SIZE) {
         reject(@"DILITHIUM_SIGN_ERROR",
@@ -270,7 +309,7 @@ RCT_EXPORT_METHOD(verify:(NSString *)message
                   rejecter:(RCTPromiseRejectBlock)reject)
 {
     size_t sigLen = signatureHex.length / 2;
-    uint8_t *sig = (uint8_t *)malloc(sigLen);
+    uint8_t *sig = (uint8_t *)malloc(sigLen > 0 ? sigLen : 1);
     uint8_t pk[DILITHIUM_PK_SIZE];
 
     if (!sig) {
@@ -300,58 +339,41 @@ RCT_EXPORT_METHOD(verify:(NSString *)message
 /**
  * compatibilityTest() → { result, sigSize, isPqclean }
  *
- * Runs the same self-test as Android: fixed seed → keygen → sign → verify.
- * Logs PK/SIG chunks to NSLog for cross-checking with Rust compat test.
+ * Fixed seed → keygen → sign → verify, in debug builds only; a release build answers "skipped".
  */
 RCT_EXPORT_METHOD(compatibilityTest:(RCTPromiseResolveBlock)resolve
                   rejecter:(RCTPromiseRejectBlock)reject)
 {
+#if DEBUG
     const char *testSeed = "QNET_COMPAT_TEST_SEED_v1";
     const char *testMsg  = "compatibility_test_message";
     size_t msgLen = strlen(testMsg);
 
     uint8_t seed32[32];
-    deriveSeedFromString(testSeed, strlen(testSeed), seed32);
-    dilithium_set_keygen_seed(seed32);
-
     uint8_t pk[DILITHIUM_PK_SIZE];
     uint8_t sk[DILITHIUM_SK_SIZE];
-    PQCLEAN_MLDSA65_CLEAN_crypto_sign_keypair(pk, sk);
-    dilithium_clear_keygen_seed();
-
     uint8_t sig[DILITHIUM_SIG_SIZE];
     size_t  sigLen = 0;
+
+    shake256(seed32, 32, (const uint8_t *)testSeed, strlen(testSeed));
+    dilithium_lock();
+    dilithium_set_keygen_seed(seed32);
+    PQCLEAN_MLDSA65_CLEAN_crypto_sign_keypair(pk, sk);
+    dilithium_clear_keygen_seed();
     PQCLEAN_MLDSA65_CLEAN_crypto_sign_signature(
         sig, &sigLen, (const uint8_t *)testMsg, msgLen, sk);
+    dilithium_unlock();
+    dilithium_secure_zero(sk, sizeof(sk));
 
     int ok = PQCLEAN_MLDSA65_CLEAN_crypto_sign_verify(
                  sig, sigLen, (const uint8_t *)testMsg, msgLen, pk);
 
-    NSLog(@"=== PQCLEAN COMPAT TEST (iOS) ===");
-    NSLog(@"PK_LEN=%d SIG_LEN=%zu SELF_VERIFY=%@",
-          DILITHIUM_PK_SIZE, sigLen, ok == 0 ? @"true" : @"false");
-
-    /* Log PK in 1000-char hex chunks (matches Android logcat format) */
-    NSString *pkHex = bytesToHex(pk, DILITHIUM_PK_SIZE);
-    for (int i = 0; i * 1000 < (int)pkHex.length; i++) {
-        NSInteger start = i * 1000;
-        NSInteger end   = MIN(start + 1000, (NSInteger)pkHex.length);
-        NSLog(@"PQCLEAN_PK[%d]%@", i,
-              [pkHex substringWithRange:NSMakeRange(start, end - start)]);
-    }
-
-    /* Log SIG in 1000-char hex chunks */
-    NSString *sigHex = bytesToHex(sig, sigLen);
-    for (int i = 0; i * 1000 < (int)sigHex.length; i++) {
-        NSInteger start = i * 1000;
-        NSInteger end   = MIN(start + 1000, (NSInteger)sigHex.length);
-        NSLog(@"PQCLEAN_SIG[%d]%@", i,
-              [sigHex substringWithRange:NSMakeRange(start, end - start)]);
-    }
-
     NSString *result = [NSString stringWithFormat:
         @"OK:PK_LEN=%d:SIG_LEN=%zu:SELF=%@",
         DILITHIUM_PK_SIZE, sigLen, ok == 0 ? @"OK" : @"FAIL"];
+#else
+    NSString *result = @"skipped";
+#endif
 
     resolve(@{
         @"result":    result,

@@ -271,245 +271,17 @@ impl SimplifiedP2P {
     
 
     
-    /// Static version for use in async contexts
-    /// v4.2 CRITICAL FIX: Non-blocking connectivity check
-    /// Previous version used blocking std::net::TcpStream in async runtime,
-    /// causing cascading API deadlocks when peers went offline.
-    /// Now uses spawn_blocking + parallel probes with strict timeout budget.
+    /// Genesis peers counted working (recent traffic, or the last probe found a silent one online),
+    /// or every configured peer when none is. Answers at once and probes silent peers in the background;
+    /// waits for the first round only when nothing is known and the thread has no runtime context.
     pub fn filter_working_genesis_nodes_static(nodes: Vec<String>) -> Vec<String> {
-        use std::net::{TcpStream, SocketAddr};
-        use std::time::Duration;
-        use parking_lot::Mutex;
-        use std::collections::HashMap;
+        GENESIS_PROBES.answer(nodes, genesis_probe_ttl(), may_wait_here())
+    }
 
-        // Cache connectivity results to prevent repeated probes
-        static CACHED_GENESIS_CONNECTIVITY: std::sync::OnceLock<Mutex<HashMap<String, (Vec<String>, std::time::SystemTime)>>> = std::sync::OnceLock::new();
-
-        let connectivity_cache = CACHED_GENESIS_CONNECTIVITY.get_or_init(|| Mutex::new(HashMap::new()));
-
-        let mut cache_key_nodes = nodes.clone();
-        cache_key_nodes.sort();
-        let cache_key = cache_key_nodes.join("|");
-
-        let current_time = std::time::SystemTime::now();
-
-        // Check cache first
-        {
-            let cache = connectivity_cache.lock();
-            if let Some((cached_working_nodes, cached_time)) = cache.get(&cache_key) {
-                if let Ok(cache_age) = current_time.duration_since(*cached_time) {
-                    let cache_ttl = if std::env::var("QNET_BOOTSTRAP_ID").is_ok() {
-                        30 // Genesis nodes: 30 seconds
-                    } else {
-                        45 // Regular nodes: 45 seconds
-                    };
-
-                    if cache_age.as_secs() < cache_ttl {
-                        if crate::node::is_debug() {
-                            println!("[INFO][P2P] cached peers={} age={}s ttl={}s",
-                                     cached_working_nodes.len(), cache_age.as_secs(), cache_ttl);
-                        }
-                        return cached_working_nodes.clone();
-                    }
-                }
-            }
-        }
-
-        // ═══════════════════════════════════════════════════════════════════
-        // v15.1: TRAFFIC-BASED LIVENESS FAST PATH (root-cause fix)
-        // ═══════════════════════════════════════════════════════════════════
-        // Before falling back to an expensive TCP probe that can mis-classify
-        // a busy-but-alive peer as offline (observed: 001 → 002/003 marked
-        // offline at 09:47:32 while 002/003 were actively shredding blocks
-        // to 001), short-circuit for every peer that has sent us any message
-        // within PEER_ALIVE_FRESHNESS_SECS (= 60s). The per-instance
-        // `PeerInfo.last_seen` is mirrored into GLOBAL_PEER_LAST_SEEN_BY_IP
-        // on every receive, so actual traffic is the authoritative liveness
-        // signal. TCP probe then runs ONLY for genuinely silent peers
-        // (cold-start or unreachable), where it is the right tool.
-        //
-        // Scalability: O(peers) constant-time DashMap lookups before any
-        // syscall. At the 1000-node committee cap this is sub-millisecond.
-        //
-        // Safety: the registry is populated only from verified message
-        // receive paths (signed blocks, BFT votes, sync responses). A
-        // Byzantine peer cannot forge liveness for another peer's IP — they
-        // can only vouch for their own, which is the intended semantics.
-        // ═══════════════════════════════════════════════════════════════════
-        let now_secs = current_time
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-
-        let mut working_nodes = Vec::new();
-        let mut need_probe = Vec::new();
-        let mut skipped_probe = 0u32;
-
-        for ip in &nodes {
-            if peer_alive_by_ip(ip, now_secs) {
-                working_nodes.push(ip.clone());
-                skipped_probe += 1;
-            } else {
-                need_probe.push(ip.clone());
-            }
-        }
-
-        if skipped_probe > 0 && crate::node::is_info() {
-            println!(
-                "[INFO][CONNECTIVITY] traffic_fastpath alive={} probe_needed={} freshness={}s",
-                skipped_probe, need_probe.len(), PEER_ALIVE_FRESHNESS_SECS,
-            );
-        }
-
-        // ═══════════════════════════════════════════════════════════════════
-        // COLD-START / SILENT-PEER TCP PROBE (unchanged semantics, hardened)
-        // ═══════════════════════════════════════════════════════════════════
-        // Only reached for peers we have NOT received recent traffic from.
-        // This is the right situation for a TCP SYN probe — we have no
-        // better signal. Three sequential attempts with increasing
-        // timeouts absorb the transient p99 latency spikes seen on
-        // cross-continental VPS links under BFT load (2s single-shot was
-        // the exact trigger of the 09:47:32 false-offline cascade).
-        //
-        // Budget worst case: (3 + 5 + 8)s = 16s per peer, but only on
-        // peers that are genuinely silent for > PEER_ALIVE_FRESHNESS_SECS.
-        // In a healthy network this list is empty and the entire function
-        // returns from the fast path above.
-        // ═══════════════════════════════════════════════════════════════════
-        if !need_probe.is_empty() {
-            if crate::node::is_info() {
-                println!(
-                    "[INFO][CONNECTIVITY] probe_start peers={} strategy=retries_3x",
-                    need_probe.len(),
-                );
-            }
-
-            let handles: Vec<_> = need_probe.iter().map(|ip| {
-                let ip_clone = ip.clone();
-                std::thread::spawn(move || {
-                    let addr = format!("{}:8001", ip_clone);
-                    let socket_addr = match addr.parse::<SocketAddr>() {
-                        Ok(a) => a,
-                        Err(_) => return (ip_clone, false, 0u64),
-                    };
-
-                    // Three attempts with escalating timeouts: 3s, 5s, 8s.
-                    // Cross-continental p99 under BFT load can spike past
-                    // 2s; the escalation keeps the happy-path cost low
-                    // while absorbing transient latency.
-                    const PROBE_TIMEOUTS: [u64; 3] = [3, 5, 8];
-                    for timeout_secs in PROBE_TIMEOUTS {
-                        let start = std::time::Instant::now();
-                        if TcpStream::connect_timeout(
-                            &socket_addr,
-                            Duration::from_secs(timeout_secs),
-                        ).is_ok() {
-                            let rtt = start.elapsed().as_millis() as u64;
-                            return (ip_clone, true, rtt);
-                        }
-                        // Brief back-off between attempts so we don't hammer
-                        // a peer mid-recovery.
-                        std::thread::sleep(Duration::from_millis(200));
-                    }
-                    (ip_clone, false, 0)
-                })
-            }).collect();
-
-            let mut online_count = 0u32;
-            let mut offline_count = 0u32;
-
-            // Wall-clock budget covers worst case 3+5+8 = 16s per peer +
-            // inter-attempt back-off + thread join overhead.
-            let join_deadline = std::time::Instant::now() + Duration::from_secs(20);
-            for handle in handles {
-                let remaining = join_deadline.saturating_duration_since(std::time::Instant::now());
-                if remaining.is_zero() {
-                    offline_count += 1;
-                    continue;
-                }
-                match handle.join() {
-                    Ok((ip, true, rtt)) => {
-                        if crate::node::is_debug() {
-                            println!(
-                                "[DBG][CONNECTIVITY] peer={} status=online rtt={}ms source=probe",
-                                get_privacy_id_for_addr(&ip), rtt,
-                            );
-                        }
-                        working_nodes.push(ip);
-                        online_count += 1;
-                    }
-                    Ok((ip, false, _)) => {
-                        if crate::node::is_warn() {
-                            println!(
-                                "[WARN][CONNECTIVITY] peer={} status=offline attempts=3 source=probe",
-                                get_privacy_id_for_addr(&ip),
-                            );
-                        }
-                        offline_count += 1;
-                    }
-                    Err(_) => {
-                        offline_count += 1;
-                    }
-                }
-            }
-
-            if crate::node::is_info() {
-                println!(
-                    "[INFO][CONNECTIVITY] probe_done online={} offline={} traffic_alive={}",
-                    online_count, offline_count, skipped_probe,
-                );
-            }
-        }
-
-        let online_count = working_nodes.len() as u32;
-        let offline_count = (nodes.len() as u32).saturating_sub(online_count);
-        if crate::node::is_info() {
-            println!(
-                "[INFO][CONNECTIVITY] refresh_done online={} offline={} total={}",
-                online_count, offline_count, online_count + offline_count,
-            );
-        }
-        
-        // Minimum peer requirement
-        let min_required_nodes = 2;
-        if working_nodes.len() < min_required_nodes {
-            if crate::node::is_warn() {
-                println!("[WARN][CONNECTIVITY] low_peers reachable={} min_required={}", 
-                         working_nodes.len(), min_required_nodes);
-            }
-            
-            if working_nodes.is_empty() {
-                if crate::node::is_warn() {
-                    println!("[WARN][CONNECTIVITY] no_peers_reachable fallback=all_configured");
-                }
-                connectivity_cache.lock().insert(cache_key, (nodes.clone(), current_time));
-                return nodes;
-            }
-        }
-        
-        // Cache results
-        {
-            let mut cache = connectivity_cache.lock();
-            cache.insert(cache_key, (working_nodes.clone(), current_time));
-
-            if cache.len() > 5 {
-                let mut keys_to_remove = Vec::new();
-                let cutoff_time = current_time - Duration::from_secs(300);
-                for (key, (_, cached_time)) in cache.iter() {
-                    if *cached_time < cutoff_time {
-                        keys_to_remove.push(key.clone());
-                    }
-                }
-                for key in keys_to_remove {
-                    cache.remove(&key);
-                }
-            }
-        }
-        
-        if crate::node::is_info() {
-            println!("[INFO][CONNECTIVITY] cache_updated working={}", working_nodes.len());
-        }
-        working_nodes
+    /// Async form that waits for the first probe round while nothing is known (bootstrap discovery);
+    /// the wait runs on the blocking pool, never on a worker.
+    pub async fn filter_working_genesis_nodes_bootstrap(nodes: Vec<String>) -> Vec<String> {
+        GENESIS_PROBES.answer_awaiting(nodes, genesis_probe_ttl()).await
     }
     
     /// Get primary validator for consensus round (replaces single leader concept)
@@ -2707,11 +2479,12 @@ impl SimplifiedP2P {
     
 
     
-    /// Get our external IP address with STUN support for NAT traversal
+    /// Get our external IP address with STUN support for NAT traversal. Every probe is awaited under its
+    /// own deadline, so a slow resolver or a hung child process never holds a runtime worker.
     pub(super) async fn get_our_ip_address() -> Result<String, Box<dyn std::error::Error>> {
-        use std::process::Command;
-        use std::net::{SocketAddr, UdpSocket};
-        
+        use std::net::SocketAddr;
+        use tokio::process::Command;
+
         // IMPROVED: Check if we're in Docker and need special handling
         if std::path::Path::new("/.dockerenv").exists() {
             if crate::node::is_info() {
@@ -2742,9 +2515,7 @@ impl SimplifiedP2P {
         }
         
         // IMPROVED: Try STUN server for NAT traversal (Google's public STUN)
-        if let Ok(socket) = UdpSocket::bind("0.0.0.0:0") {
-            socket.set_read_timeout(Some(Duration::from_secs(3))).ok();
-            
+        if let Ok(socket) = tokio::net::UdpSocket::bind("0.0.0.0:0").await {
             // STUN servers for NAT traversal
             let stun_servers = [
                 "stun.l.google.com:19302",
@@ -2765,9 +2536,9 @@ impl SimplifiedP2P {
                         0x08, 0x09, 0x0A, 0x0B,
                     ];
                     
-                    if socket.send_to(&stun_request, stun_addr).is_ok() {
+                    if socket.send_to(&stun_request, stun_addr).await.is_ok() {
                         let mut buf = [0u8; 1024];
-                        if let Ok((len, _)) = socket.recv_from(&mut buf) {
+                        if let Ok(Ok((len, _))) = tokio::time::timeout(Duration::from_secs(3), socket.recv_from(&mut buf)).await {
                             // Parse STUN response for XOR-MAPPED-ADDRESS
                             if len >= 32 {
                                 // Bound so every buf[i+11] access stays within the received bytes.
@@ -2794,32 +2565,22 @@ impl SimplifiedP2P {
         }
         
         // Fallback to HTTP-based IP detection
-        if let Ok(output) = Command::new("curl")
-            .arg("-s")
-            .arg("--max-time")
-            .arg("3")
-            .arg("https://api.ipify.org")
-            .output() {
-            if output.status.success() {
-                if let Ok(ip) = String::from_utf8(output.stdout) {
-                    let ip = ip.trim();
-                    if !ip.is_empty() && ip != "0.0.0.0" {
-                        return Ok(ip.to_string());
-                    }
-                }
+        if let Some(ip) = probe_stdout(
+            Command::new("curl").arg("-s").arg("--max-time").arg("3").arg("https://api.ipify.org"),
+            Duration::from_secs(5),
+        ).await {
+            let ip = ip.trim();
+            if !ip.is_empty() && ip != "0.0.0.0" {
+                return Ok(ip.to_string());
             }
         }
-        
+
         // Fallback to hostname -I
-        if let Ok(output) = Command::new("hostname").arg("-I").output() {
-            if output.status.success() {
-                if let Ok(ip_list) = String::from_utf8(output.stdout) {
-                    // Get first non-localhost IP
-                    for ip in ip_list.split_whitespace() {
-                        if !ip.starts_with("127.") && !ip.starts_with("::1") {
-                            return Ok(ip.to_string());
-                        }
-                    }
+        if let Some(ip_list) = probe_stdout(Command::new("hostname").arg("-I"), Duration::from_secs(2)).await {
+            // Get first non-localhost IP
+            for ip in ip_list.split_whitespace() {
+                if !ip.starts_with("127.") && !ip.starts_with("::1") {
+                    return Ok(ip.to_string());
                 }
             }
         }
@@ -2839,4 +2600,612 @@ impl SimplifiedP2P {
         Err("Could not determine IP address".into())
     }
 
+}
+
+/// Stdout of a successful probe command, awaited under `deadline`. A child still running at the deadline
+/// is killed with its dropped future, so a hung resolver neither holds a worker nor outlives the lookup.
+async fn probe_stdout(cmd: &mut tokio::process::Command, deadline: Duration) -> Option<String> {
+    match tokio::time::timeout(deadline, cmd.kill_on_drop(true).output()).await {
+        Ok(Ok(out)) if out.status.success() => String::from_utf8(out.stdout).ok(),
+        _ => None,
+    }
+}
+
+// Per-peer probe cache behind `filter_working_genesis_nodes_static`: a peer silent past
+// PEER_ALIVE_FRESHNESS_SECS is probed on a detached thread, at most one probe per peer in flight,
+// and re-probed once its verdict is older than the TTL.
+
+/// Escalating connect timeouts of one probe, in seconds: cheap when the peer answers, tolerant of
+/// latency spikes when it is slow.
+const GENESIS_PROBE_TIMEOUTS_SECS: [u64; 3] = [3, 5, 8];
+
+/// Pause between probe attempts.
+const GENESIS_PROBE_BACKOFF_MS: u64 = 200;
+
+/// Longest a bootstrap caller waits for the first probe round (3 + 5 + 8 s of connects plus slack).
+const GENESIS_PROBE_WAIT_BUDGET: Duration = Duration::from_secs(20);
+
+/// Past GENESIS_PROBE_MAX_PEERS, verdicts older than this are evicted. The answer itself keeps the
+/// last verdict whatever its age: a caller seen rarely still gets the probed set, not the fallback.
+const GENESIS_PROBE_VERDICT_MAX_AGE: Duration = Duration::from_secs(300);
+
+/// Reachable genesis peers below this ⇒ low-peers warning.
+const GENESIS_MIN_WORKING_NODES: usize = 2;
+
+/// Bound on remembered peers (callers pass the genesis list).
+const GENESIS_PROBE_MAX_PEERS: usize = 256;
+
+static GENESIS_PROBES: Lazy<GenesisProbeCache> =
+    Lazy::new(|| GenesisProbeCache::new(Box::new(tcp_probe_genesis), GENESIS_PROBE_WAIT_BUDGET));
+
+/// Re-probe interval of a silent peer: 30 s on genesis nodes, 45 s elsewhere.
+fn genesis_probe_ttl() -> Duration {
+    if std::env::var("QNET_BOOTSTRAP_ID").is_ok() {
+        Duration::from_secs(30)
+    } else {
+        Duration::from_secs(45)
+    }
+}
+
+/// Whether this thread may block for the first probe round: false on any thread with a runtime
+/// context (every worker, the blocking pool, a `block_on` thread).
+fn may_wait_here() -> bool {
+    tokio::runtime::Handle::try_current().is_err()
+}
+
+/// TCP probe of a genesis API port: Some(rtt_ms) on the first attempt that connects. Blocking.
+fn tcp_probe_genesis(ip: &str) -> Option<u64> {
+    let addr = format!("{}:8001", ip).parse::<std::net::SocketAddr>().ok()?;
+    for (attempt, timeout_secs) in GENESIS_PROBE_TIMEOUTS_SECS.iter().enumerate() {
+        let start = Instant::now();
+        if std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(*timeout_secs)).is_ok() {
+            return Some(start.elapsed().as_millis() as u64);
+        }
+        if attempt + 1 < GENESIS_PROBE_TIMEOUTS_SECS.len() {
+            thread::sleep(Duration::from_millis(GENESIS_PROBE_BACKOFF_MS));
+        }
+    }
+    None
+}
+
+#[derive(Default)]
+struct GenesisProbeEntry {
+    /// Verdict of the last finished probe (online?) and when it landed.
+    verdict: Option<(bool, Instant)>,
+    /// A probe of this peer is running.
+    in_flight: bool,
+}
+
+/// What is known about a requested peer set right now.
+struct GenesisConnectivity {
+    /// Recent traffic, or the last probe found the peer online.
+    working: Vec<String>,
+    /// No requested peer has recent traffic or a live verdict.
+    nothing_known: bool,
+}
+
+impl GenesisConnectivity {
+    /// The working set, or every configured peer when none is known working.
+    fn into_answer(self, nodes: Vec<String>) -> Vec<String> {
+        if self.working.is_empty() { nodes } else { self.working }
+    }
+}
+
+struct GenesisProbeCache {
+    peers: Mutex<HashMap<String, GenesisProbeEntry>>,
+    /// Notified whenever a verdict lands (bootstrap waiters).
+    landed: parking_lot::Condvar,
+    /// Reachability check of one peer: Some(rtt_ms) when it answered. Blocking.
+    probe: Box<dyn Fn(&str) -> Option<u64> + Send + Sync>,
+    wait_budget: Duration,
+}
+
+impl GenesisProbeCache {
+    fn new(probe: Box<dyn Fn(&str) -> Option<u64> + Send + Sync>, wait_budget: Duration) -> Self {
+        Self { peers: Mutex::new(HashMap::new()), landed: parking_lot::Condvar::new(), probe, wait_budget }
+    }
+
+    /// Answer from what is known; a caller that may wait and knows nothing yet waits for the first round.
+    fn answer(&'static self, nodes: Vec<String>, ttl: Duration, may_wait: bool) -> Vec<String> {
+        let known = self.snapshot(&nodes, ttl);
+        if known.nothing_known && may_wait {
+            self.wait_landed(&nodes);
+            return self.assess(&nodes, None).0.into_answer(nodes);
+        }
+        known.into_answer(nodes)
+    }
+
+    /// `answer` for an async caller; the bootstrap wait runs on the blocking pool.
+    async fn answer_awaiting(&'static self, nodes: Vec<String>, ttl: Duration) -> Vec<String> {
+        let known = self.snapshot(&nodes, ttl);
+        if !known.nothing_known {
+            return known.into_answer(nodes);
+        }
+        let request = nodes.clone();
+        match tokio::task::spawn_blocking(move || {
+            self.wait_landed(&request);
+            self.assess(&request, None).0.into_answer(request)
+        }).await {
+            Ok(answer) => answer,
+            // The blocking pool is gone (runtime shutting down): answer from what is known.
+            Err(_) => self.assess(&nodes, None).0.into_answer(nodes),
+        }
+    }
+
+    /// What is known now; starts a background probe of each silent peer whose verdict is missing or
+    /// older than `ttl` and has none in flight. No I/O on the calling thread.
+    fn snapshot(&'static self, nodes: &[String], ttl: Duration) -> GenesisConnectivity {
+        let (known, due) = self.assess(nodes, Some(ttl));
+        if !due.is_empty() {
+            self.spawn_round(due, nodes.to_vec());
+        }
+        if crate::node::is_debug() {
+            println!("[DBG][CONNECTIVITY] genesis_answer working={} total={} nothing_known={}",
+                     known.working.len(), nodes.len(), known.nothing_known);
+        }
+        known
+    }
+
+    /// Classify `nodes`; with `claim_ttl`, also mark in flight and return the silent peers due a probe.
+    fn assess(&self, nodes: &[String], claim_ttl: Option<Duration>) -> (GenesisConnectivity, Vec<String>) {
+        let now = Instant::now();
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mut working = Vec::new();
+        let mut nothing_known = true;
+        let mut due = Vec::new();
+        let mut peers = self.peers.lock();
+        if peers.len() > GENESIS_PROBE_MAX_PEERS {
+            peers.retain(|_, e| e.in_flight
+                || e.verdict.map_or(false, |(_, at)| now.duration_since(at) < GENESIS_PROBE_VERDICT_MAX_AGE));
+        }
+        for ip in nodes {
+            if peer_alive_by_ip(ip, now_secs) {
+                working.push(ip.clone());
+                nothing_known = false;
+                continue;
+            }
+            // Silent peer: its last verdict decides (a stale one is re-probed below); none yet ⇒ not working.
+            if let Some((online, _)) = peers.get(ip).and_then(|e| e.verdict) {
+                nothing_known = false;
+                if online {
+                    working.push(ip.clone());
+                }
+            }
+            if let Some(ttl) = claim_ttl {
+                let entry = peers.entry(ip.clone()).or_default();
+                if !entry.in_flight && entry.verdict.map_or(true, |(_, at)| now.duration_since(at) >= ttl) {
+                    entry.in_flight = true;
+                    due.push(ip.clone());
+                }
+            }
+        }
+        (GenesisConnectivity { working, nothing_known }, due)
+    }
+
+    /// Probe `batch` on a detached thread, one scoped thread per peer; each verdict lands as soon as
+    /// it is known. `nodes` only feeds the summary line.
+    fn spawn_round(&'static self, batch: Vec<String>, nodes: Vec<String>) {
+        if crate::node::is_info() {
+            println!("[INFO][CONNECTIVITY] probe_start peers={} strategy=retries_3x mode=background", batch.len());
+        }
+        let claimed = batch.clone();
+        let spawned = thread::Builder::new()
+            .name("genesis-probe".to_string())
+            .spawn(move || self.run_round(batch, nodes));
+        if let Err(e) = spawned {
+            // No thread, no probe: release the claims so a later call retries.
+            {
+                let mut peers = self.peers.lock();
+                for ip in &claimed {
+                    if let Some(entry) = peers.get_mut(ip) {
+                        entry.in_flight = false;
+                    }
+                }
+            }
+            self.landed.notify_all();
+            if crate::node::is_warn() {
+                println!("[WARN][CONNECTIVITY] probe_spawn_failed peers={} err={}", claimed.len(), e);
+            }
+        }
+    }
+
+    fn run_round(&'static self, batch: Vec<String>, nodes: Vec<String>) {
+        let started = Instant::now();
+        let (mut online, mut offline) = (0u32, 0u32);
+        thread::scope(|s| {
+            let probes: Vec<_> = batch.iter().map(|ip| {
+                let spawned = thread::Builder::new()
+                    .name("genesis-probe".to_string())
+                    .spawn_scoped(s, move || self.probe_one(ip));
+                (ip, spawned)
+            }).collect();
+            for (ip, spawned) in probes {
+                // A peer whose thread could not start is probed here: this thread is off the runtime.
+                let up = match spawned {
+                    Ok(handle) => handle.join().unwrap_or(false),
+                    Err(_) => self.probe_one(ip),
+                };
+                if up { online += 1; } else { offline += 1; }
+            }
+        });
+        if crate::node::is_info() {
+            println!("[INFO][CONNECTIVITY] probe_done online={} offline={} elapsed_ms={}",
+                     online, offline, started.elapsed().as_millis());
+        }
+        self.log_refresh(&nodes);
+    }
+
+    /// One probe; its verdict lands even if the probe unwinds (as offline), then waiters wake.
+    fn probe_one(&self, ip: &str) -> bool {
+        struct Landing<'a> {
+            cache: &'a GenesisProbeCache,
+            ip: &'a str,
+            online: bool,
+        }
+        impl Drop for Landing<'_> {
+            fn drop(&mut self) {
+                {
+                    let mut peers = self.cache.peers.lock();
+                    let entry = peers.entry(self.ip.to_string()).or_default();
+                    entry.in_flight = false;
+                    entry.verdict = Some((self.online, Instant::now()));
+                }
+                self.cache.landed.notify_all();
+            }
+        }
+        let mut landing = Landing { cache: self, ip, online: false };
+        match (self.probe)(ip) {
+            Some(rtt) => {
+                landing.online = true;
+                if crate::node::is_debug() {
+                    println!("[DBG][CONNECTIVITY] peer={} status=online rtt={}ms source=probe",
+                             get_privacy_id_for_addr(ip), rtt);
+                }
+            }
+            None => {
+                if crate::node::is_warn() {
+                    println!("[WARN][CONNECTIVITY] peer={} status=offline attempts={} source=probe",
+                             get_privacy_id_for_addr(ip), GENESIS_PROBE_TIMEOUTS_SECS.len());
+                }
+            }
+        }
+        landing.online
+    }
+
+    /// Wait until no requested peer has a probe in flight, or the budget runs out. Only off the
+    /// runtime: a plain thread, or the blocking pool via `answer_awaiting`.
+    fn wait_landed(&self, nodes: &[String]) {
+        let deadline = Instant::now() + self.wait_budget;
+        let mut peers = self.peers.lock();
+        while nodes.iter().any(|ip| peers.get(ip).map_or(false, |e| e.in_flight)) {
+            if self.landed.wait_until(&mut peers, deadline).timed_out() {
+                break;
+            }
+        }
+    }
+
+    /// Round summary over the whole request, with the low-peers warnings.
+    fn log_refresh(&self, nodes: &[String]) {
+        let working = self.assess(nodes, None).0.working.len();
+        if crate::node::is_info() {
+            println!("[INFO][CONNECTIVITY] refresh_done online={} offline={} total={}",
+                     working, nodes.len().saturating_sub(working), nodes.len());
+        }
+        if working < GENESIS_MIN_WORKING_NODES && crate::node::is_warn() {
+            println!("[WARN][CONNECTIVITY] low_peers reachable={} min_required={}",
+                     working, GENESIS_MIN_WORKING_NODES);
+            if working == 0 {
+                println!("[WARN][CONNECTIVITY] no_peers_reachable fallback=all_configured");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod genesis_probe_tests {
+    use super::*;
+
+    /// Probe double: hangs like a blackholed connect until released (at most 10 s), then answers
+    /// online for the peers in `online`; counts calls per peer.
+    struct Blackhole {
+        open: Mutex<bool>,
+        opened: parking_lot::Condvar,
+        calls: Mutex<HashMap<String, usize>>,
+        hanging: AtomicUsize,
+        online: Vec<String>,
+    }
+
+    impl Blackhole {
+        fn new(online: &[&str]) -> &'static Blackhole {
+            Box::leak(Box::new(Blackhole {
+                open: Mutex::new(false),
+                opened: parking_lot::Condvar::new(),
+                calls: Mutex::new(HashMap::new()),
+                hanging: AtomicUsize::new(0),
+                online: online.iter().map(|s| s.to_string()).collect(),
+            }))
+        }
+
+        fn probe(&self, ip: &str) -> Option<u64> {
+            *self.calls.lock().entry(ip.to_string()).or_default() += 1;
+            self.hanging.fetch_add(1, Ordering::SeqCst);
+            {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let mut open = self.open.lock();
+                while !*open {
+                    if self.opened.wait_until(&mut open, deadline).timed_out() {
+                        break;
+                    }
+                }
+            }
+            self.hanging.fetch_sub(1, Ordering::SeqCst);
+            self.online.iter().any(|p| p == ip).then_some(1)
+        }
+
+        fn set_open(&self, open: bool) {
+            *self.open.lock() = open;
+            self.opened.notify_all();
+        }
+
+        fn calls(&self, ip: &str) -> usize {
+            self.calls.lock().get(ip).copied().unwrap_or(0)
+        }
+
+        fn hanging(&self) -> usize {
+            self.hanging.load(Ordering::SeqCst)
+        }
+    }
+
+    fn cache_over(hole: &'static Blackhole) -> &'static GenesisProbeCache {
+        Box::leak(Box::new(GenesisProbeCache::new(Box::new(move |ip: &str| hole.probe(ip)), Duration::from_secs(5))))
+    }
+
+    fn nodes(ips: &[&str]) -> Vec<String> {
+        ips.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn verdict(cache: &GenesisProbeCache, ip: &str) -> Option<bool> {
+        cache.peers.lock().get(ip).and_then(|e| e.verdict).map(|(up, _)| up)
+    }
+
+    fn in_flight(cache: &GenesisProbeCache, ip: &str) -> bool {
+        cache.peers.lock().get(ip).map_or(false, |e| e.in_flight)
+    }
+
+    /// Bounded spin until `cond` holds.
+    fn eventually(what: &str, cond: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !cond() {
+            assert!(Instant::now() < deadline, "timed out waiting for {}", what);
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    const TTL: Duration = Duration::from_secs(30);
+
+    // On the only worker of a runtime every call returns at once while one probe per peer hangs;
+    // the verdicts serve the next call.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn the_answer_does_not_wait_for_a_blackholed_peer() {
+        let hole = Blackhole::new(&["198.51.100.11"]);
+        let cache = cache_over(hole);
+        let req = nodes(&["198.51.100.11", "198.51.100.12"]);
+        let slowest = {
+            let req = req.clone();
+            tokio::spawn(async move {
+                let mut slowest = Duration::ZERO;
+                for _ in 0..20 {
+                    let started = Instant::now();
+                    let answer = cache.answer(req.clone(), TTL, may_wait_here());
+                    slowest = slowest.max(started.elapsed());
+                    assert_eq!(answer, req, "nothing known yet: every configured peer");
+                }
+                slowest
+            }).await.expect("worker task")
+        };
+        assert!(slowest < Duration::from_millis(100), "slowest answer took {:?}", slowest);
+        eventually("both probes hanging", || hole.hanging() == 2);
+        assert_eq!((hole.calls("198.51.100.11"), hole.calls("198.51.100.12")), (1, 1));
+
+        hole.set_open(true);
+        eventually("verdicts landed", || verdict(cache, "198.51.100.11").is_some()
+            && verdict(cache, "198.51.100.12").is_some());
+        let (took, answer) = tokio::spawn(async move {
+            let started = Instant::now();
+            let answer = cache.answer(req, TTL, may_wait_here());
+            (started.elapsed(), answer)
+        }).await.expect("worker task");
+        assert!(took < Duration::from_millis(100), "answer took {:?}", took);
+        assert_eq!(answer, nodes(&["198.51.100.11"]), "the online verdict serves, the offline one is out");
+    }
+
+    // Racing callers start one probe per peer; a fresh verdict starts none; a stale one starts one
+    // more per peer while it keeps serving.
+    #[test]
+    fn one_probe_in_flight_per_peer() {
+        let req = nodes(&["198.51.100.21", "198.51.100.22", "198.51.100.23"]);
+        let hole = Blackhole::new(&["198.51.100.21", "198.51.100.22", "198.51.100.23"]);
+        let cache = cache_over(hole);
+        let race = |ttl: Duration| thread::scope(|s| {
+            for _ in 0..8 {
+                let req = req.clone();
+                s.spawn(move || for _ in 0..25 { cache.answer(req.clone(), ttl, false); });
+            }
+        });
+
+        race(TTL);
+        eventually("three probes hanging", || hole.hanging() == 3);
+        for ip in &req {
+            assert_eq!(hole.calls(ip), 1, "{}: one probe while one is in flight", ip);
+        }
+        hole.set_open(true);
+        eventually("verdicts landed", || req.iter().all(|ip| verdict(cache, ip) == Some(true) && !in_flight(cache, ip)));
+
+        for _ in 0..10 {
+            assert_eq!(cache.answer(req.clone(), TTL, false), req);
+        }
+        for ip in &req {
+            assert_eq!(hole.calls(ip), 1, "{}: fresh verdict, no new probe", ip);
+        }
+
+        hole.set_open(false);
+        race(Duration::ZERO);
+        eventually("re-probes hanging", || hole.hanging() == 3);
+        for ip in &req {
+            assert_eq!(hole.calls(ip), 2, "{}: one re-probe once the verdict is stale", ip);
+        }
+        assert_eq!(cache.answer(req.clone(), Duration::ZERO, false), req, "the last verdict serves meanwhile");
+        hole.set_open(true);
+        eventually("re-probes landed", || req.iter().all(|ip| !in_flight(cache, ip)));
+    }
+
+    // Verdicts land in the cache (online in, offline out); a peer with recent traffic is never probed.
+    #[test]
+    fn verdicts_reach_the_cache_and_traffic_skips_the_probe() {
+        let hole = Blackhole::new(&["198.51.100.31"]);
+        hole.set_open(true);
+        let cache = cache_over(hole);
+        let req = nodes(&["198.51.100.31", "198.51.100.32", "198.51.100.33"]);
+        let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        touch_peer_liveness_by_ip("198.51.100.33", now_secs);
+
+        assert_eq!(cache.answer(req.clone(), TTL, false), nodes(&["198.51.100.33"]));
+        eventually("verdicts landed", || !in_flight(cache, "198.51.100.31") && !in_flight(cache, "198.51.100.32")
+            && verdict(cache, "198.51.100.32").is_some());
+        assert_eq!(verdict(cache, "198.51.100.31"), Some(true));
+        assert_eq!(verdict(cache, "198.51.100.32"), Some(false));
+        assert_eq!(cache.answer(req.clone(), TTL, false), nodes(&["198.51.100.31", "198.51.100.33"]));
+        assert_eq!(hole.calls("198.51.100.33"), 0, "traffic is the liveness signal: no probe");
+    }
+
+    // A verdict past the eviction age still decides for a rare caller (the probed set, not the
+    // fallback, and no bootstrap wait) and is re-probed at that call.
+    #[test]
+    fn an_old_verdict_still_serves_and_is_reprobed() {
+        let Some(long_ago) = Instant::now().checked_sub(GENESIS_PROBE_VERDICT_MAX_AGE + TTL) else { return };
+        let hole = Blackhole::new(&["198.51.100.61", "198.51.100.62"]);
+        let cache = cache_over(hole);
+        let req = nodes(&["198.51.100.61", "198.51.100.62"]);
+        {
+            let mut peers = cache.peers.lock();
+            peers.entry("198.51.100.61".to_string()).or_default().verdict = Some((true, long_ago));
+            peers.entry("198.51.100.62".to_string()).or_default().verdict = Some((false, long_ago));
+        }
+        let started = Instant::now();
+        assert_eq!(cache.answer(req.clone(), TTL, may_wait_here()), nodes(&["198.51.100.61"]),
+                   "the last verdicts decide, however old");
+        assert!(started.elapsed() < Duration::from_millis(100), "known peers: no bootstrap wait");
+        eventually("both re-probes hanging", || hole.hanging() == 2);
+        hole.set_open(true);
+        eventually("re-probes landed", || req.iter().all(|ip| !in_flight(cache, ip)));
+        assert_eq!(cache.answer(req.clone(), TTL, false), req, "the fresh verdicts serve: 62 is back");
+    }
+
+    // Nothing known: a thread without a runtime waits for the first round and gets the probed set.
+    #[test]
+    fn bootstrap_caller_off_the_runtime_waits_for_the_first_round() {
+        let hole = Blackhole::new(&["198.51.100.41"]);
+        let cache = cache_over(hole);
+        let req = nodes(&["198.51.100.41", "198.51.100.42"]);
+        assert!(may_wait_here(), "a plain test thread carries no runtime");
+        let opener = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(150));
+            hole.set_open(true);
+        });
+        let started = Instant::now();
+        assert_eq!(cache.answer(req, TTL, may_wait_here()), nodes(&["198.51.100.41"]));
+        assert!(started.elapsed() >= Duration::from_millis(100), "it waited for the round");
+        opener.join().expect("opener");
+    }
+
+    // The async bootstrap form waits on the blocking pool; the runtime's only worker keeps running.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn bootstrap_wait_leaves_the_worker_free() {
+        let hole = Blackhole::new(&["198.51.100.51"]);
+        let cache = cache_over(hole);
+        let req = nodes(&["198.51.100.51", "198.51.100.52"]);
+        let waiter = tokio::spawn(cache.answer_awaiting(req, TTL));
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let ticker = {
+            let ticks = ticks.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    ticks.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!waiter.is_finished(), "the first round is still in flight");
+        let seen = ticks.load(Ordering::SeqCst);
+        assert!(seen >= 10, "the worker stayed free: {} ticks in 300 ms", seen);
+        hole.set_open(true);
+        assert_eq!(waiter.await.expect("waiter"), nodes(&["198.51.100.51"]));
+        ticker.abort();
+    }
+
+    // The production entry point on a worker returns at once; 192.0.2.0/24 is never routed, so
+    // its probe hangs behind the answer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn the_public_filter_returns_at_once_on_a_worker() {
+        let req = nodes(&["192.0.2.1", "192.0.2.2"]);
+        let (took, answer) = {
+            let req = req.clone();
+            tokio::spawn(async move {
+                let started = Instant::now();
+                let answer = SimplifiedP2P::filter_working_genesis_nodes_static(req);
+                (started.elapsed(), answer)
+            }).await.expect("worker task")
+        };
+        assert!(took < Duration::from_millis(100), "answer took {:?}", took);
+        assert_eq!(answer, req, "nothing known yet: every configured peer");
+    }
+}
+
+#[cfg(test)]
+mod external_ip_probe_tests {
+    use super::*;
+
+    fn command(unix: &[&str], windows: &[&str]) -> tokio::process::Command {
+        let argv = if cfg!(windows) { windows } else { unix };
+        let mut cmd = tokio::process::Command::new(argv[0]);
+        cmd.args(&argv[1..]);
+        cmd
+    }
+
+    // On a single-threaded runtime a blocking wait would starve every other task; the probe instead yields
+    // while the child runs, gives up at its deadline, and the ticker keeps running throughout.
+    #[tokio::test]
+    async fn a_hung_probe_neither_holds_the_worker_nor_outlives_its_deadline() {
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let ticker = {
+            let ticks = ticks.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    ticks.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+        };
+        let started = Instant::now();
+        let mut hung = command(&["sleep", "30"], &["ping", "-n", "30", "127.0.0.1"]);
+        assert_eq!(probe_stdout(&mut hung, Duration::from_millis(400)).await, None);
+        let took = started.elapsed();
+        ticker.abort();
+        assert!(took < Duration::from_secs(3), "the deadline bounds the probe: took {:?}", took);
+        let seen = ticks.load(Ordering::SeqCst);
+        assert!(seen >= 10, "the worker stayed free: {} ticks", seen);
+    }
+
+    #[tokio::test]
+    async fn a_probe_answers_its_stdout_and_nothing_on_failure() {
+        let mut echo = command(&["echo", "203.0.113.7"], &["cmd", "/C", "echo 203.0.113.7"]);
+        let out = probe_stdout(&mut echo, Duration::from_secs(5)).await.expect("stdout");
+        assert_eq!(out.trim(), "203.0.113.7");
+        let mut missing = tokio::process::Command::new("qnet-no-such-probe-binary");
+        assert_eq!(probe_stdout(&mut missing, Duration::from_secs(5)).await, None);
+    }
 }

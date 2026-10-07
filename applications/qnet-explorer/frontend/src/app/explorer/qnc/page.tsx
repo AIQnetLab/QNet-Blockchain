@@ -1,12 +1,14 @@
 'use client';
 
 import React, { useState, useCallback, useEffect } from 'react';
-import Link from 'next/link';
+import ExplorerLink from '@/components/ExplorerLink';
 import TokenIcon from '@/components/TokenIcon';
+import { useActivationContent } from '@/contexts/AppContext';
+import { txPartyLabel } from '@/lib/tx-labels';
 
 // ============================================================================
 // Native QNC overview: supply + rich list (top holders) + recent QNC transfers.
-// QNC is the NATIVE coin (no contract address, like ETH/SOL) — this is the coin's
+// QNC is the NATIVE coin (no contract address) — this is the coin's
 // holders/supply/history view, not a QRC-20 token page.
 //   supply + holders : /api/qnc      -> node /api/v1/richlist
 //   recent transfers : /api/activity -> filtered to native QNC value txs
@@ -18,11 +20,18 @@ interface QncHolder {
   percent: string;
 }
 
+interface GenesisAllocations {
+  accounts: number;
+  holding: number;
+  balance: string; // exact QNC decimal, no unit
+}
+
 interface QncData {
   total_supply: string;
   circulating: string;
   burned: string;
   holder_count: number;
+  genesis_allocations: GenesisAllocations | null;
   holders: QncHolder[];
 }
 
@@ -53,15 +62,19 @@ const formatTimeAgo = (timestamp: number): string => {
 };
 
 const AddrLink = ({ addr }: { addr: string }) => {
+  // A system account shown by name reads without its reward word in the app's view (src/lib/tx-labels.ts).
+  const full = useActivationContent();
   const isValid = addr && addr.length > 10 && addr.includes('eon');
   return isValid ? (
-    <Link href={`/explorer/address/${addr}`} className="address-link">{truncate(addr)}</Link>
+    <ExplorerLink href={`/explorer/address/${addr}`} className="address-link">{truncate(addr)}</ExplorerLink>
   ) : (
-    <span className="address-link">{addr || 'N/A'}</span>
+    <span className="address-link">{txPartyLabel(addr || 'N/A', full)}</span>
   );
 };
 
 export default function QncPage() {
+  // The app's view shows no burned supply (L-14).
+  const full = useActivationContent();
   const [data, setData] = useState<QncData | null>(null);
   const [transfers, setTransfers] = useState<QncTransfer[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -155,14 +168,26 @@ export default function QncPage() {
               </span>
             </span>
           </div>
-          <div className="detail-row">
-            <span className="detail-label">Burned</span>
-            <span className="detail-value">{data.burned} QNC</span>
-          </div>
+          {full && (
+            <div className="detail-row">
+              <span className="detail-label">Burned</span>
+              <span className="detail-value">{data.burned} QNC</span>
+            </div>
+          )}
           <div className="detail-row">
             <span className="detail-label">Holders</span>
             <span className="detail-value">{data.holder_count.toLocaleString('en-US')}</span>
           </div>
+          {data.genesis_allocations && data.genesis_allocations.accounts > 0 && (
+            <div className="detail-row">
+              <span className="detail-label">Load-test accounts</span>
+              <span className="detail-value">
+                {data.genesis_allocations.accounts.toLocaleString('en-US')} accounts funded in the genesis block for
+                stress tests, holding {data.genesis_allocations.balance} QNC. Their keys are public; they are not
+                part of the supply above and are left out of holders and shares.
+              </span>
+            </div>
+          )}
         </div>
       </div>
 
@@ -228,7 +253,7 @@ export default function QncPage() {
               {transfers.map((t, idx) => (
                 <tr key={`${t.hash}-${idx}`}>
                   <td>
-                    <Link href={`/explorer/tx/${t.hash}`} className="address-link">{truncate(t.hash)}</Link>
+                    <ExplorerLink href={`/explorer/tx/${t.hash}`} className="address-link">{truncate(t.hash)}</ExplorerLink>
                   </td>
                   <td><AddrLink addr={t.from} /></td>
                   <td><AddrLink addr={t.to} /></td>
@@ -239,7 +264,7 @@ export default function QncPage() {
                     </span>
                   </td>
                   <td>
-                    <Link href={`/explorer/block/${t.block}`} className="address-link">{t.block}</Link>
+                    <ExplorerLink href={`/explorer/block/${t.block}`} className="address-link">{t.block}</ExplorerLink>
                   </td>
                   <td>{formatTimeAgo(t.timestamp)}</td>
                 </tr>

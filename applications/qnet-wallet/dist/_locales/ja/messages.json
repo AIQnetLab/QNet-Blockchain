@@ -1,0 +1,10 @@
+{
+  "extName": {
+    "message": "QNet ウォレット",
+    "description": "Extension name in the browser and the store."
+  },
+  "extDescription": {
+    "message": "Solana アカウント付きの耐量子 QNet ウォレット（ML-DSA-65）。QNet の Light または Super ノードを有効化し、Light ノードを記録します。",
+    "description": "Store and extensions-page description, at most 132 characters."
+  }
+}

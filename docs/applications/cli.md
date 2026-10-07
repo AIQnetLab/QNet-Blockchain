@@ -1,8 +1,10 @@
 # Command-line tool
 
 This document describes the small Python tool in `applications/qnet-cli`: a thin HTTP client that
-prints node, wallet, reward and network information fetched from a QNet node. For client development
-use the [SDK](../developers/sdk.md) or the [RPC API](../developers/rpc-api.md) directly.
+prints node, wallet, reward and network information fetched from a QNet node. For development
+(keys, transfers, contract deploys and calls) use the `qnet` command of `@aiqnet/sdk`
+([CLI](../developers/cli.md)), the [SDK](../developers/sdk.md) or the [RPC API](../developers/rpc-api.md)
+directly.
 
 ## Layout
 
@@ -49,8 +51,7 @@ over `urllib` instead of `requests`.
 Operations that need a key — sending QNC, claiming rewards — are authorised by ML-DSA-65 signatures
 from the wallet key: one over `q{chain_id}|claim_rewards:{node_id}:{wallet_address}` and one over
 `q{chain_id}|qnet_claim_v1:{wallet_address}:{claim_timestamp}:{sha3_256(claims_data)}` for the batch
-the node quotes. Perform them in the [mobile wallet](mobile-wallet.md) or through the SDK with a
-signer.
+the node quotes. Perform them in the [mobile wallet](mobile-wallet.md).
 
 ## Running it
 
@@ -72,6 +73,7 @@ localhost default.
 ## Related documents
 
 - [RPC API](../developers/rpc-api.md) — the node's HTTP and JSON-RPC surface.
-- [SDK](../developers/sdk.md) — the maintained client library.
+- [SDK](../developers/sdk.md) and the [`qnet` command](../developers/cli.md) — the maintained client
+  library and developer command line.
 - [Running a node](../operators/running-a-node.md) — node lifecycle.
 - [Mobile wallet](mobile-wallet.md) — where key-holding operations such as reward claims are done.

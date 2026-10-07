@@ -1,21 +1,31 @@
 {
   "manifest_version": 3,
-  "name": "QNet Wallet",
-  "version": "2.1.4",
-  "description": "Multi-network wallet for QNet blockchain and Solana",
+  "name": "__MSG_extName__",
+  "version": "3.1.0",
+  "description": "__MSG_extDescription__",
+  "default_locale": "en",
+  "minimum_chrome_version": "111",
+  "homepage_url": "https://aiqnet.io",
   "permissions": [
     "storage",
-    "activeTab",
-    "tabs"
+    "alarms",
+    "idle"
   ],
   "host_permissions": [
-    "<all_urls>"
+    "https://node1.aiqnet.io/*",
+    "https://node2.aiqnet.io/*",
+    "https://node3.aiqnet.io/*",
+    "https://node4.aiqnet.io/*",
+    "https://node5.aiqnet.io/*",
+    "https://aiqnet.io/*",
+    "https://api.devnet.solana.com/*"
   ],
   "content_security_policy": {
-    "extension_pages": "script-src 'self'; object-src 'none'; style-src 'self' 'unsafe-inline';"
+    "extension_pages": "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data:; connect-src 'self' https://node1.aiqnet.io https://node2.aiqnet.io https://node3.aiqnet.io https://node4.aiqnet.io https://node5.aiqnet.io https://aiqnet.io https://api.devnet.solana.com; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'"
   },
   "background": {
-    "service_worker": "background.js"
+    "service_worker": "background/sw.js",
+    "type": "module"
   },
   "icons": {
     "16": "icons/icon-16.png",
@@ -24,8 +34,8 @@
     "128": "icons/icon-128.png"
   },
   "action": {
-    "default_popup": "popup.html",
-    "default_title": "QNet Wallet",
+    "default_popup": "ui/popup.html",
+    "default_title": "__MSG_extName__",
     "default_icon": {
       "16": "icons/icon-16.png",
       "32": "icons/icon-32.png",
@@ -36,31 +46,26 @@
   "content_scripts": [
     {
       "matches": [
-        "<all_urls>"
+        "https://aiqnet.io/*",
+        "https://games.aiqnet.io/*"
       ],
       "js": [
-        "content.js"
+        "inject/provider.js"
       ],
-      "run_at": "document_start"
-    }
-  ],
-  "web_accessible_resources": [
+      "world": "MAIN",
+      "run_at": "document_start",
+      "all_frames": false
+    },
     {
-      "resources": [
-        "setup.html",
-        "setup.js",
-        "app.html",
-        "app.js",
-        "inject.js",
-        "styles/*",
-        "scripts/*",
-        "src/*",
-        "icons/*",
-        "lib/*"
-      ],
       "matches": [
-        "<all_urls>"
-      ]
+        "https://aiqnet.io/*",
+        "https://games.aiqnet.io/*"
+      ],
+      "js": [
+        "content/relay.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": false
     }
   ]
 }

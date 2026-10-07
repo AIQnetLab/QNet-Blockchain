@@ -228,8 +228,8 @@ export default function ClientWrapper({
                       <div className="stat-trend">+12 this hour</div>
                     </div>
                     <div className="stat-card">
-                      <div className="stat-number">424,411</div>
-                      <div className="stat-label">TPS ACHIEVED</div>
+                      <div className="stat-number">13,000</div>
+                      <div className="stat-label">TRANSFERS/SEC</div>
                       <div className="stat-trend">Peak performance</div>
                     </div>
                     <div className="stat-card">

@@ -1,18 +1,20 @@
 {
   "name": "qnet-wallet",
-  "version": "2.1.4",
-  "description": "QNet Wallet browser extension with post-quantum Dilithium-3 hybrid signatures",
+  "version": "3.1.0",
+  "description": "QNet Wallet browser extension: post-quantum (ML-DSA-65) QNet wallet with the Solana account that activates nodes",
   "private": true,
-  "dependencies": {
-    "@noble/post-quantum": "^0.5.4"
-  },
-  "devDependencies": {
-    "esbuild": "^0.27.3",
-    "typescript": "^5.0.0"
+  "type": "module",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=22"
   },
   "scripts": {
-    "build:dilithium": "node tools/dilithium-wasm/build.js",
-    "build": "npm run build:dilithium",
-    "test": "node tools/dilithium-wasm/compat_test.js"
+    "bundle:install": "npm ci --prefix tools/crypto-bundle",
+    "build": "npm run build --prefix tools/crypto-bundle",
+    "build:dev": "node scripts/build-dev.mjs",
+    "package": "node scripts/package.mjs",
+    "test": "node --test \"test/*.test.mjs\"",
+    "test:live": "node --test \"test/live/*.test.mjs\"",
+    "check:overflow": "node scripts/overflow-check.mjs"
   }
 }

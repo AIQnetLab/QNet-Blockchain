@@ -2,7 +2,8 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getTransactionsByAddress, getAddressTokenTransfers, getContractDeployByAddress, getBatchCreditsByAddress } from '../../../../../lib/db';
 import { mapTxType, formatAmount } from '@/lib/tx-mapping';
 import { formatTokenAmount } from '@/lib/token-format';
-import { sanitizeLogo } from '@/lib/sanitize-logo';
+import { parseDeployMeta, type DeployMeta } from '@/lib/deploy-meta';
+import { fetchNode } from '@/lib/node-api';
 
 // ============================================================================
 // PRODUCTION v3.0: PostgreSQL-based address data
@@ -18,6 +19,7 @@ export interface AddressData {
   firstSeen: number;
   lastActive: number;
   isSystem?: boolean;
+  genesisAllocation?: boolean;   // funded in the genesis block: a load-test account with a public key
   nodeInfo?: {
     nodeId: string;
     nodeType: 'SUPER' | 'LIGHT';  // v3.18: FULL removed
@@ -61,31 +63,6 @@ export interface AddressData {
   }>;
 }
 
-// QRC-20 metadata parsed from a contract's ContractDeploy `data` JSON
-// ({symbol,decimals,logo,qrc20}). Used to render token transfers without a node round-trip.
-interface DeployMeta {
-  symbol: string;
-  decimals: number;
-  logo: string;
-}
-
-function parseDeployMeta(dataStr: string | null): DeployMeta {
-  let symbol = '';
-  let decimals = 9; // node default
-  let logo = '';
-  if (dataStr) {
-    try {
-      const d = JSON.parse(dataStr) as { symbol?: unknown; decimals?: unknown; logo?: unknown };
-      if (typeof d.symbol === 'string') symbol = d.symbol;
-      if (typeof d.decimals === 'number' && Number.isInteger(d.decimals) && d.decimals >= 0 && d.decimals <= 30) {
-        decimals = d.decimals;
-      }
-      logo = sanitizeLogo(d.logo);
-    } catch { /* keep defaults */ }
-  }
-  return { symbol, decimals, logo };
-}
-
 // Mapped QRC-20 token holding for the address page. Balance is scaled by the
 // token's OWN decimals (u64 base units → human string, exact BigInt math).
 type AddressToken = AddressData['tokens'][number];
@@ -103,17 +80,10 @@ interface NodeTokenEntry {
 // Fetch and map this address's QRC-20 holdings from the node. Returns [] on any
 // error (never throws) so it can run in parallel with the balance/tx fetch
 // without failing the whole address response.
-async function fetchAddressTokens(
-  address: string,
-  nodeApi: string,
-  nodeHeaders: Record<string, string>
-): Promise<AddressToken[]> {
+async function fetchAddressTokens(address: string): Promise<AddressToken[]> {
   try {
-    const res = await fetch(`${nodeApi}/api/v1/account/${address}/tokens`, {
-      headers: nodeHeaders,
-      signal: AbortSignal.timeout(10000),
-    });
-    if (!res.ok) return [];
+    const res = await fetchNode(`/api/v1/account/${encodeURIComponent(address)}/tokens`);
+    if (!res || !res.ok) return [];
     const body = await res.json().catch(() => null);
     const rawList: unknown = body?.tokens;
     if (!Array.isArray(rawList)) return [];
@@ -179,22 +149,15 @@ export async function GET(
     return NextResponse.json({ success: false, error: 'Invalid EON address' }, { status: 400 });
   }
   
-  // v3.50: Node API is the single source of truth for balance; PostgreSQL for TX
-  // history. NODE_API/headers are declared here (not inside the try) so the catch
-  // path can still make a best-effort token fetch when the DB read fails.
-  const NODE_API = process.env.QNET_API_URL || 'https://162.244.25.114:8001';
-  const API_KEY = process.env.QNET_API_KEY || '';
-  const nodeHeaders: Record<string, string> = { 'Content-Type': 'application/json' };
-  if (API_KEY) nodeHeaders['X-API-Key'] = API_KEY;
+  // The node is the source of truth for balance; PostgreSQL for TX history.
+  const fetchAccount = () => fetchNode(`/api/v1/account/${encodeURIComponent(address)}`)
+    .then(r => (r && r.ok ? r.json() : null)).catch(() => null);
 
   try {
     // Parallel: node balance + node QRC-20 token holdings + PostgreSQL TX history + token transfers
     const [accountResponse, tokens, txResult, batchCredits, tokenTransferRows] = await Promise.all([
-      fetch(`${NODE_API}/api/v1/account/${encodeURIComponent(address)}`, {
-        headers: nodeHeaders,
-        signal: AbortSignal.timeout(10000),
-      }).then(r => r.ok ? r.json() : null).catch(() => null),
-      fetchAddressTokens(address, NODE_API, nodeHeaders),
+      fetchAccount(),
+      fetchAddressTokens(address),
       getTransactionsByAddress(address, 1, 100),
       getBatchCreditsByAddress(address, 100),
       getAddressTokenTransfers(address, 50),
@@ -309,6 +272,7 @@ export async function GET(
       data: {
         address,
         balance: formatAmount(balance),
+        genesisAllocation: accountResponse?.genesis_allocation === true,
         txCount: total,
         txCountCapped: totalCapped,
         firstSeen: firstSeen,
@@ -324,11 +288,8 @@ export async function GET(
     // and flag history as temporarily unavailable — the address page renders with real
     // data instead of hard-failing. A transient DB blip must not blank the whole page.
     const [accountResponse, tokens] = await Promise.all([
-      fetch(`${NODE_API}/api/v1/account/${encodeURIComponent(address)}`, {
-        headers: nodeHeaders,
-        signal: AbortSignal.timeout(10000),
-      }).then(r => r.ok ? r.json() : null).catch(() => null),
-      fetchAddressTokens(address, NODE_API, nodeHeaders),
+      fetchAccount(),
+      fetchAddressTokens(address),
     ]);
     if (!accountResponse) {
       // Node also unreachable (DB down + node blip): balance is genuinely unknown. Don't fabricate a
@@ -344,6 +305,7 @@ export async function GET(
       data: {
         address,
         balance: formatAmount(balance),
+        genesisAllocation: accountResponse.genesis_allocation === true,
         txCount: 0,
         firstSeen: 0,
         lastActive: 0,

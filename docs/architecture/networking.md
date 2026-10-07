@@ -142,13 +142,14 @@ Related request/response pairs share one row below.
 | `ShredProtocolChunk` | 8 | One Reed-Solomon data or parity shred of a block body |
 | `RequestMissingChunks` / `MissingChunksResponse` | 0 | Ask for, and serve, specific missing shred indices; a response names the block hash and parity count of the set it was cut from |
 | `ConsensusV2` | 10 | Opaque Checkpoint-BFT frame routed to the consensus v2 runtime. A completed quorum or timeout certificate is relayed to `RELAY_FANOUT` (8) peers, not to every peer: committee members rebuild the same certificate from the votes they already collected, so the relay is redundancy rather than the delivery path |
-| `TimeoutVote` | 0 | Signed failover vote for a window and round, carrying the voter's own high-QC and tip |
-| `TimeoutCertificateBroadcast` | 10 | Aggregated per-voter timeout proofs forming a round certificate |
-| `RequestTimeoutCertificates` | 0 | Pull timeout certificates for a height range |
-| `TimeoutCertificatesResponse` | 10 | Serve those certificates with full per-voter payloads |
+| `TimeoutVote` | 0 | Signed failover vote for a window and round, carrying the voter's own high-QC and tip; refused for any window past the `failover_tenure_bound` gate ([consensus](consensus.md#timeout-votes)) |
+| `TimeoutCertificateBroadcast` | 10 | Aggregated per-voter timeout proofs forming a round certificate for a window |
+| `TimeoutVoteV3` / `TimeoutCertificateV3Broadcast` | 0 / 10 | The same vote and certificate keyed by window and tenure, from the `failover_tenure_bound` gate; appended at the tail of the message enum, never sent below the gate |
+| `RequestTimeoutCertificates` | 0 | Pull timeout certificates for a window range |
+| `TimeoutCertificatesResponse` / `TimeoutCertificatesV3Response` | 10 | Serve those certificates with full per-voter payloads, window-only ones in the first and tenure-bound ones in the second, at most 8 of each |
 | `ProducerReady` / `ReadyAck` | 0 | Round-change handshake; fires only at failover round above 0, both signed |
 | `ProducerHeartbeat` | 0 | Signed producer liveness beacon over the wire-supplied anchor hash |
-| `BlockRejection` | 0 | Signed observer report of a rejected block, aggregated per (height, source); once distinct observers reach a quorum of that window's failover committee (at least 3), sync peer selection deprioritises the source for `FORKED_PEER_COOLDOWN_MS` (5 min), unless it is the producer elected for that height |
+| `BlockRejection` | 0 | Signed observer report of a rejected block, aggregated per (height, source); once distinct observers reach a quorum of that window's failover committee (at least 3), sync peer selection deprioritises the source and no heuristic rollback is taken toward its blocks for `FORKED_PEER_COOLDOWN_MS` (5 min), unless it is the producer elected for that height |
 | `BlockAttestationMsg` | 0 | Signed confirmation of an accepted block, emitted only by that height's committee slice; a receiver admits it only from that slice, and a rival hash backed by f+1 attesters while its own block has none makes it pull the window's anchor |
 | `VrfLeaderClaim` / `VrfKeyAnnounce` | 0 | Self-verifiable VRF leadership claim with gossip TTL; self-signed VRF public-key announcement, installed only when its key matches the chain-committed `vrf_pk_sha3` for that id and no key is stored |
 | `RequestConsensusState` / `ConsensusState` | 0 / 10 | Checkpoint catch-up. A node asks 3 random peers for the `[Proposal, Qc]` pair of one index when a refused proposal names a parent certificate it does not hold and, with a doubling backoff, while it holds a certificate whose checkpoint never arrived or its peers' timeouts name a certificate it lacks. The answer is the pair at that index, else the newest held below it, else the newest held, else the sealed frontier read from storage. The three members after a proposer in the sorted committee also send it their pair unasked, once per index, when its proposal extends an older certificate than theirs. A receiver admits only as many answers as it asked for plus one unsolicited answer per 5 s, and verifies each off the consensus loop against the committee of the served checkpoint's window |
@@ -158,21 +159,21 @@ Related request/response pairs share one row below.
 | `PeerListRequest` / `PeerListResponse` | 0 | Ask for, and serve, `(addr, node_id, height)` peer triples |
 | `FindNode` / `FindNodeResponse` | 0 | Lookup by target hash, answered from the routing table with the K closest pairs. The responder is live; nodes discover peers through bootstrap dial and peer exchange rather than by issuing lookups |
 | `HealthPing` | 4 | Signed liveness and height beacon, plus unsigned certificate sync hints. Carries no public key: the verifying key is resolved from the consensus registry by sender id |
-| `ActiveNodeAnnouncement` | 0 | Signed announcement of an active Super node with shard and reputation |
+| `ActiveNodeAnnouncement` | 0 | Signed announcement of an active Super node with shard and reputation. A node announces only while it is not behind: its tip within 90 blocks of the head `f+1` in-set nodes (committee ∪ genesis, its own tip counted) stand behind, or of the highest peer height when fewer than `f+1` heights are known. A genesis's **ping tick** is this message with `node_type` `genesis_ping_tick:{first}:{spaced}` (the epochs its light push schedule switches at; `genesis_ping_tick` alone from an earlier build), signed over the same preimage, sent after each light ping tick it completed (none while its push provider has answered none of its pushes for 5 ticks in a row, so a genesis that cannot push is covered like a silent one; push server endpoints, the device owners' choice, are not judged) straight to the other four genesis with `gossip_hop` 3 (a node of an earlier release drops it unread); the receiver takes it only from that genesis's own address, at least 15 s after its last tick and newer than it on the sender's own clock (or after 90 s of silence, a sender whose clock was set back; the sender's clock only orders its own ticks, so any spread between the genesis clocks is fine), verifies it, records it for owner liveness and the push schedule it names alone and neither stores it in the active map nor relays it ([light node messages](../protocols/light-node-messages.md) section 5.10) |
 | `ActiveNodesRequest` / `ActiveNodesResponse` | 0 | Ask for, and serve, the active-node list |
 | `SystemEvent` | 0 | Broadcast of a system-level event with JSON payload |
 | `LightNodeRegistration` | 0 | Gossip a Light node's registration record into the registry |
-| `LightNodeAttestation` | 0 | Doubly-signed proof that a Light node answered a ping challenge; the node that took the device's reply sends it directly to each connected owner genesis of the node's shard other than itself, and to 5 random peers |
+| `LightNodeAttestation` | 0 | Doubly-signed proof that a Light node answered a ping challenge; the node that took the device's reply sends it to each owner genesis of the node's shard other than itself (its connected address, else its address in the binary's table), over the acknowledged QUIC stream where available, and to nobody else; a receiver never relays it on. A receiver that does not own the node's shard drops it before any signature check, and of copies of one reply arriving together only the first is verified (an in-flight claim on node, epoch and reply); an answer anchored at or after its epoch's commit opening is stored but not credited |
 | `CertificateAnnounce` / `CertificateRequest` / `CertificateResponse` | 0 | Announce a post-quantum certificate by serial; ask for and serve one by owner and serial |
-| `RecoveryDecree` | 0 | Coordinated-recovery order naming a target height, valid only under a quorum of the genesis consensus keys over `RDCR:{genesis hash}:{seq}:{target}` and ignored at or below the last applied sequence; an accepting node re-gossips it to 8 peers, then executes it |
+| `RecoveryDecree` | 0 | Coordinated-recovery order naming a target height, valid only under a quorum of the genesis consensus keys over `RDCR:{genesis hash}:{seq}:{target}` and ignored at or below the last applied sequence; an accepting node re-gossips it to 8 peers, then executes it, unless the target is below the last point it holds certified ([reorg bounds](consensus.md#reorg-bounds)): then it records the sequence and refuses |
 
 ## Inbound quality-of-service lanes
 
 Every inbound message is dispatched into one of three channels before handling, so a cold-sync flood cannot delay
 finality:
 
-- **Finality lane** (reserved): `ConsensusV2`, `TimeoutVote`, `TimeoutCertificateBroadcast`, `ProducerReady`,
-  `ReadyAck` — non-redundant quorum frames with no repair path — and the checkpoint catch-up pair
+- **Finality lane** (reserved): `ConsensusV2`, `TimeoutVote`, `TimeoutCertificateBroadcast`, `TimeoutVoteV3`,
+  `TimeoutCertificateV3Broadcast`, `ProducerReady`, `ReadyAck` — non-redundant quorum frames with no repair path — and the checkpoint catch-up pair
   `RequestConsensusState` / `ConsensusState`, which has to land while a finality stall saturates gossip. Overflow
   increments `FINALITY_LANE_DROPPED`, meaning unrepairable consensus loss; a non-zero value warrants investigation.
 - **Bulk lane** (bounded, drop-on-full): `RequestBlocks`, `RequestMacroblocks`, `BlocksBatch`, `MacroblocksBatch`,
@@ -210,7 +211,8 @@ lowest-reputation member only if the newcomer's reputation is strictly higher; `
 closest entries, excluding the requester.
 
 **Announcement gossip.** `ActiveNodeAnnouncement`, `LightNodeRegistration` and `LightNodeAttestation` carry a
-`gossip_hop` counter and are dropped at hop 3 or above. Announcement re-gossip fanout decays per hop:
+`gossip_hop` counter and are dropped at hop 3 or above (a ping tick is taken before that check and never relayed;
+an attestation is never relayed). Announcement re-gossip fanout decays per hop:
 `ceil(sqrt(peers))` clamped to 2..6 at hop 0, half that clamped to 1..3 at hop 1, and 1 thereafter. `VrfLeaderClaim` is
 relayed only when newly verified, with `VRF_CLAIM_GOSSIP_TTL` 4 and a fanout of `ceil(sqrt(peer_count))` clamped to
 2..20, excluding the sender.
@@ -369,16 +371,28 @@ with a per-producer monotonic timestamp guard.
 
 Alongside QUIC, a node calls its peers' TCP API port, so peers reach each other on port 8001 as well as on the QUIC port.
 Public calls use the REST surface documented in [rpc-api.md](../developers/rpc-api.md); the `/api/v1/internal/`
-endpoints answer only genesis IPs and loopback.
+endpoints answer only the five genesis addresses, and refuse every other caller, loopback included, with HTTP 403.
+A genesis calls another's internal route over that genesis's HTTPS name, pinned to its address in the binary
+(`genesis_internal_call`); a push-record copy that carries the device's own signatures retries on the plain port when
+the connection to 443 cannot be made or the host answers 403 over TLS (a terminator that passed no caller address on),
+never after a TLS or certificate error, while a push-record copy without them (trusted by its sender's address alone),
+the unbind copy, the device routes, the pulls and the wake hand-off (2 s per owner, connection included) never retry
+in plain (`genesis_internal_call_tls`); a copy that fails is logged at WARN and heals through the pulls.
 
 | Call | Made by | Purpose |
 | --- | --- | --- |
 | `POST /api/v1/auth/challenge` | `verify_peer_authenticity` | Authenticates a bootstrap candidate before it enters the peer table |
 | `GET /api/v1/microblock/{height}` | `check_block_exists_on_network` | Corroborates a height against several peers at once |
-| `GET /api/v1/light-node/status?node_id={id}&fwd=1` | `shard_owner_says_active` | Takes a light node's activity verdict from the genesis that owns its shard |
+| `GET /api/v1/light-node/status?node_id={id}&fwd=1` | `shard_owners_view` | Takes a light node's activity verdict and this epoch's answer from every other owner genesis of its shard, at once |
+| `GET /api/v1/internal/light-reach-get?epoch={e}&shard={s}` | `pull_reach_records` | Fetches another owner's reach record of a shard's epoch (the devices it reached, or held by the dormant rule, that gave it no answer), which the dormant rule of every owner reads |
 | `GET /api/v1/internal/fcm-token-get?node_id={id}` | `maybe_pull_push_channel` | Refills a genesis's missing or polling push-channel record for a node of its shard from the genesis that attested it |
 | `GET /api/v1/internal/light-ping-keys-get?node_id={id}` | `maybe_pull_light_identity` | Fetches a light node's ping key and delegation when a relayed attestation fails to verify locally |
-| `POST /api/v1/internal/fcm-token-sync` | `sync_fcm_token_to_genesis_peers` | Copies a push-channel record a genesis just stored to every other genesis, which accepts it only from a genesis address and keeps the newer record by timestamp |
+| `POST /api/v1/internal/fcm-token-sync` | `sync_fcm_token_to_genesis_peers` | Copies a push-channel record a genesis just stored to every other genesis, which accepts it only from a genesis address, re-verifies a v2 record from the device's own signatures, and keeps the newer record |
+| `POST /api/v1/internal/light-unbind-sync` | `sync_unbind_to_genesis_peers` | Copies an unbind to every other genesis, which re-verifies it from its signer's own signature (the device's ping key or the wallet key) and applies it under the copy rule |
+
+| `POST /api/v1/internal/light-device-attest` | `ask_attestor` | Asks each other genesis's attestor to sign a device statement (enrolment, rotation, rebind) |
+| `POST /api/v1/internal/light-device-sync` | `distribute` | Sends a final device statement or a signed state change to every other genesis, again from a persisted outbox until each has taken it |
+| `GET /api/v1/internal/light-device-get?node_id={id}` | `pull_device_record` | Fetches a node's device record from the genesis that holds it when a request or a change rests on a record this genesis lacks |
 | `GET /api/v1/rewards/epoch/{epoch}/leafset?shard={n}` | `repair_unservable_reward_epochs` | Fetches, shard by shard, the reward leaf set of a committed epoch this node cannot serve, trying each other genesis in turn, and keeps a set only when its merkle root equals the committed root |
 
 `check_block_exists_on_network` answers first from the signed heights already held in the peer table and falls back to
@@ -387,11 +401,16 @@ fewer, 5 up to 100, 7 above that — chosen at random and queried in parallel wi
 global budget. Each response body is parsed and checked before it counts, so a peer that answers 200 with empty or
 malformed content does not register as holding the block.
 
-A node other than the genesis that owns a light node's shard consults that owner before it reports the node as needing
-reactivation; the verdict is cached for 60 s per node, an owner that failed is skipped for 15 s, at most 16 requests are
-in flight under a 2 s timeout, and `fwd=1` marks a proxied request, which the owner answers from its own view. The two
-internal pulls run on a genesis for nodes of its own shards, once per node and epoch: the push-channel record is merged
-through the node's own loopback `POST /api/v1/internal/fcm-token-sync`, and a pulled ping key is stored only when the
+Before it reports a light node as inactive, a node consults every owner genesis of the node's shard but itself, at
+once: the owner that took this epoch's answer may be any of the three (the primary was down or restarting when the
+device answered a backup, or a relay was lost). The node is answered when an owner that sees it on chain says so, and
+active when any owner says so; the view is cached for 60 s per node, an owner that failed is skipped for 15 s, at most
+16 consultations are in flight under a 2 s timeout, and `fwd=1` marks a proxied request, which an owner answers from
+its own view. Each owner pulls the other two owners' reach records of the two epochs before the current one, once
+each (the epoch just ended once 30 blocks of the next passed, so every owner decided it), over TLS, retrying every
+300 s while an owner answers `not_decided`; at most twelve pulls an epoch. The two
+internal pulls run on a genesis for nodes of its own shards, once per node and epoch: the push-channel record is applied
+directly (`apply_pulled_push_record`), and only for the binding this node already holds, and a pulled ping key is stored only when the
 chain vouches for the identity key — the committed consensus key, the registration's key hash, or, for a row without
 one, the registered wallet address the key derives — the delegation verifies under that key and the ping key signs the
 challenge the relay carried, with at most 32 identity pulls in flight.

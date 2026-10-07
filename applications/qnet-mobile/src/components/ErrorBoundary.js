@@ -8,6 +8,11 @@ import {
   ScrollView
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import logger from '../utils/logger';
+import { tr, isRTL, currentLanguage } from '../i18n';
+
+// The caches "Clear cache" removes, by exact key (services/HistoryCache, services/NodePool, the Node tab's last reads).
+export const CACHE_KEYS = Object.freeze(['qnet_node_rewards', 'qnet_cached_server_status', 'qnet_tx_history', 'qnet_node_pool']);
 
 class ErrorBoundary extends React.Component {
   constructor(props) {
@@ -27,7 +32,7 @@ class ErrorBoundary extends React.Component {
 
   componentDidCatch(error, errorInfo) {
     // Log error details for debugging
-    console.error('ErrorBoundary caught:', error, errorInfo);
+    logger.error('ErrorBoundary caught:', error, errorInfo);
     
     // Save error to state for display
     this.setState({
@@ -59,7 +64,8 @@ class ErrorBoundary extends React.Component {
     // Strip anything that looks like an address, a JSON value, or a hex blob.
     return raw
       .replace(/0x[a-fA-F0-9]{10,}/g, '0x…')
-      .replace(/[A-Za-z0-9+/]{40,}={0,2}/g, '…base64…')
+      .replace(/QNET-[A-Z0-9]{4,6}-[A-Z0-9]{3,6}-[A-Z0-9]{5,6}/gi, 'QNET-…')
+      .replace(/[A-Za-z0-9+/]{32,}={0,2}/g, '…base64…')
       .replace(/"[^"]{32,}"/g, '"…"')
       .split('\n')
       .slice(0, 5) // keep only top 5 frames
@@ -83,9 +89,10 @@ class ErrorBoundary extends React.Component {
       const rawComponentStack = errorInfo?.componentStack || '';
       const errorLog = {
         timestamp: new Date().toISOString(),
-        // Safe summary: error name + first line of message (no stack data).
-        name: error?.name || 'Error',
-        summary: (error?.message || error?.toString() || '').split('\n')[0].slice(0, 200),
+        // Safe summary: error name + first line of message (no stack data), with addresses, codes and
+        // key-like strings masked the same way as the frames.
+        name: error?.name || 'Error', // i18n-ignore: a stored log field, never shown
+        summary: this.redactStack((error?.message || error?.toString() || '').split('\n')[0]).slice(0, 200),
         // Fingerprint for de-dup / support correlation — not reversible.
         stackFp: await this.computeStackFingerprint(rawStack),
         componentStackFp: await this.computeStackFingerprint(rawComponentStack),
@@ -102,7 +109,7 @@ class ErrorBoundary extends React.Component {
 
       await AsyncStorage.setItem('qnet_error_logs', JSON.stringify(logs));
     } catch (e) {
-      console.error('Failed to log error:', e);
+      logger.error('Failed to log error:', e);
     }
   }
 
@@ -116,28 +123,19 @@ class ErrorBoundary extends React.Component {
 
   handleClearCache = async () => {
     try {
-      // Clear problematic cached data
-      const keysToRemove = [
-        'blockchain_check_',
-        'qnet_node_rewards_',
-        'qnet_activation_meta_'
-      ];
-      
+      // Only what the app reads again from the network by itself: the node balance and server status it last showed,
+      // the confirmed history rows and the read pool. The wallet, its node record and its settings stay.
       const allKeys = await AsyncStorage.getAllKeys();
-      const keysToDelete = allKeys.filter(key => 
-        keysToRemove.some(prefix => key.startsWith(prefix))
-      );
-      
-      if (keysToDelete.length > 0) {
-        await AsyncStorage.multiRemove(keysToDelete);
-      }
-      
+      const keysToDelete = allKeys.filter((key) => CACHE_KEYS.includes(key));
+      if (keysToDelete.length > 0) await AsyncStorage.multiRemove(keysToDelete);
+      // Success is said only for a cache that was there and is gone now.
+      const removed = keysToDelete.length > 0;
       Alert.alert(
-        'Cache Cleared',
-        'App cache has been cleared. The app will now restart.',
+        removed ? tr('crash_cache_cleared_title') : '',
+        tr(removed ? 'crash_cache_cleared_body' : 'crash_cache_empty'),
         [
           {
-            text: 'OK',
+            text: tr('common_ok'),
             onPress: () => {
               // Reset the error boundary
               this.handleReset();
@@ -146,26 +144,24 @@ class ErrorBoundary extends React.Component {
         ]
       );
     } catch (error) {
-      Alert.alert('Error', 'Failed to clear cache: ' + error.message);
+      Alert.alert(tr('error'), `${tr('crash_clear_failed')}\n${tr('err_detail', { detail: (error && error.message) || '' })}`);
     }
   };
 
   render() {
     if (this.state.hasError) {
       return (
-        <View style={styles.container}>
+        <View style={[styles.container, isRTL(currentLanguage()) ? styles.rtl : styles.ltr]}>
           <ScrollView contentContainerStyle={styles.content}>
-            <Text style={styles.title}>Oops! Something went wrong</Text>
+            <Text style={styles.title}>{tr('crash_title')}</Text>
             
-            <Text style={styles.subtitle}>
-              The app encountered an unexpected error. You can try to continue or clear the cache if the problem persists.
-            </Text>
+            <Text style={styles.subtitle}>{tr('crash_body')}</Text>
 
             {/* Raw error text / stack can embed file paths, inlined values and
                 secrets — only render it in dev builds, never in production UI. */}
             {__DEV__ && this.state.error && (
               <View style={styles.errorDetails}>
-                <Text style={styles.errorTitle}>Error Details:</Text>
+                <Text style={styles.errorTitle}>{tr('crash_details')}</Text>
                 <Text style={styles.errorText}>
                   {this.state.error.toString()}
                 </Text>
@@ -182,22 +178,19 @@ class ErrorBoundary extends React.Component {
                 style={[styles.button, styles.primaryButton]}
                 onPress={this.handleReset}
               >
-                <Text style={styles.buttonText}>Try Again</Text>
+                <Text style={styles.buttonText}>{tr('common_try_again')}</Text>
               </TouchableOpacity>
 
               <TouchableOpacity 
                 style={[styles.button, styles.secondaryButton]}
                 onPress={this.handleClearCache}
               >
-                <Text style={styles.buttonText}>Clear Cache</Text>
+                <Text style={styles.buttonText}>{tr('crash_clear_cache')}</Text>
               </TouchableOpacity>
             </View>
 
             {this.state.errorCount > 2 && (
-              <Text style={styles.warning}>
-                The app has crashed {this.state.errorCount} times. 
-                Consider clearing the cache or reinstalling the app.
-              </Text>
+              <Text style={styles.warning}>{tr('crash_count', { count: this.state.errorCount })}</Text>
             )}
           </ScrollView>
         </View>
@@ -212,6 +205,13 @@ const styles = StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: '#0f0f1a',
+  },
+  // The language the wallet screen last showed decides the direction (Arabic: right to left).
+  rtl: {
+    direction: 'rtl',
+  },
+  ltr: {
+    direction: 'ltr',
   },
   // Fills the screen so short content centres, but can outgrow it and scroll.
   content: {

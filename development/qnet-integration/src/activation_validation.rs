@@ -1435,6 +1435,11 @@ impl BlockchainActivationRegistry {
         Ok(current_height)
     }
 
+    /// A new activation is judged at the next block, the height the doors use.
+    pub(crate) fn onchain_activation_retired(next_height: u64) -> bool {
+        qnet_state::feature_gates::is_active(qnet_state::feature_gates::id::TX_TARGET_BOUND, next_height)
+    }
+
     /// Submit activation to blockchain
     async fn submit_activation_to_blockchain(&self, record: ActivationRecord) -> Result<(), IntegrationError> {
         // PRODUCTION: Submit real activation transaction to QNet blockchain
@@ -1455,7 +1460,15 @@ impl BlockchainActivationRegistry {
         if record.code_hash.len() != 64 {
             return Err(IntegrationError::ValidationError("Activation code hash must be 64 characters".to_string()));
         }
-        
+
+        // Every judge refuses a NodeActivation from the tx_target_bound gate, so arming one would only put
+        // bytes in the local pool that the producer evicts. The caller still writes the local activation
+        // record (used codes, active nodes).
+        if Self::onchain_activation_retired(crate::node::local_height().saturating_add(1)) {
+            println!("[INFO][ACTIVATION] onchain_activation_skipped reason=retired_from_gate");
+            return Ok(());
+        }
+
         // Submit to blockchain through consensus engine
         match self.consensus_submit_activation(&record).await {
             Ok(tx_hash) => {

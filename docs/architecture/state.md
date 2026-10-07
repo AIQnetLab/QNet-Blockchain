@@ -94,6 +94,15 @@ Rules that follow from the schema:
 
 `StateMerkleTree::hash_account` is the one authoritative implementation.
 
+For certified proofs the node also keeps every account's leaf inputs except the address in a fixed byte
+form, `AccountLeafPreimage` (`core/qnet-state/src/leaf_preimage.rs`): version `0x01`, `balance` and
+`nonce` as LE u64, one flag byte (bit 0 `is_contract`, bit 1 `is_node`, other bits zero), the code hash
+as a LE u16 length (`0xFFFF` = none, at most 1024) followed by its UTF-8 bytes, `storage_root` (32 bytes,
+contracts only), then `heartbeat_epoch` u64, `heartbeat_slots` u16, `heartbeat_final_epoch` u64,
+`heartbeat_final_slots` u16, `last_claimed_epoch` u64 and `banned_at_height` u64, all LE: 56 bytes for a
+plain account. Decoding is strict (known version, exact length, no unknown flag bit, valid UTF-8), and
+`leaf_hash(address)` rebuilds the leaf through `hash_account` itself, so there is one leaf schema.
+
 ## State Merkle tree
 
 The consensus state commitment is a binary sparse Merkle tree (`StateMerkleTree`,
@@ -177,6 +186,18 @@ heartbeat fields, `last_claimed_epoch`, `banned_at_height` and `is_node` — eve
 `storage_root`) in `state_root`, level 2 proves the `balance:{holder}` leaf in that `storage_root`,
 and it carries every field `hash_account` reads for a contract leaf so both levels can be rebuilt.
 
+`tree_proof::prove_leaf` (`core/qnet-state/src/tree_proof.rs`) is a read-only prover for any frozen tree
+view reached through a `TreeReader` (point reads of stored nodes, ordered range reads of leaves). It walks
+the same compressed fold as the live prover — a test pins its steps to `generate_proof` over a
+store-backed tree — but every read reports its own failure instead of reading it as absence, and a branch
+the view should store and does not is `ProveError::Inconsistent`, never a guessed default. Every negative
+answer carries a proof: `Absence` for an empty bucket (zero seed, exactly 40 steps) and `AbsenceInBucket`
+for a shared one, which returns all of the bucket's entries (at most 64; a bucket read stops at 4096
+entries). `verify_leaf` checks the kinds exactly: for `AbsenceInBucket`, exactly 40 steps, 1 to 64
+entries with keys strictly ascending, all inside the asked key's bucket, none equal to it and no zero
+leaf; the seed is the bucket fold of the entries. `verify_account_proof` and `verify_storage_proof` bind
+the address (or storage key) and the claimed fields (or raw value) to the proven leaf.
+
 ## Per-contract storage tree
 
 Contract accounts commit their storage through a second tree of the same `StateMerkleTree` type with
@@ -189,6 +210,31 @@ client reproduces it with no width or padding ambiguity (balances are decimal st
 contract whose restored storage does not hash to its committed `storage_root`. See
 [../developers/smart-contracts.md](../developers/smart-contracts.md).
 
+Every contract's storage tree is mirrored, with its raw values, into the aux DB (see
+[Derived tree and aux databases](#derived-tree-and-aux-databases)); consensus never reads the mirror.
+`install_token_tree` is the only place a tree enters the in-memory `token_trees` cache, and a source
+test pins that. It attaches the aux sink to the tree: `Install::Silent` when the sink already holds this
+exact tree, `Install::Full` otherwise, which wipes the contract's aux rows and streams the whole tree in
+jobs of at most 64 MiB with the root row last. `StateManager` keeps a positive record of the storage root
+the sink holds per contract (`mirrored`), set by every mirrored finalize and full emit, dropped by a
+contract wipe, and cleared by a full reset or a failed aux write. A contract's first touch builds its tree
+from the pre-block storage when the sink holds that root and applies only the diff; anything else (a
+deploy, an unknown or different mirror) builds from the post-block storage and emits it whole, logging
+`[WARN][MERKLE] storage_mirror_mismatch` when a recorded mirror differs. The root is a pure function of the
+map either way, and a property test pins that. A tree updated incrementally keeps some stored nodes a
+fresh build of the same map would not (a stored chain top whose sibling was deleted), so after a silent
+re-install the sink can hold rows of the previous node set under single buckets. Every row at a branch
+position and the root row stay current through any sequence of diffs and re-installs, and the storage
+proof path classifies each subtree from its leaves and reads a stored row only for a branch
+(`StoredRows::Branches`); a test replays 1,000 random diffs with periodic re-installs and checks the
+leaves, raw values, root row, branch rows and proofs against a fresh build. A mirrored tree never evicts,
+so its full recompute deletes exactly the old node set and needs no contract-wide wipe; leftover rows go
+with the next full emit or full reset.
+`rollback_block` takes each touched contract back by the POST→PRE diff, from the cached tree or a silent
+build from the post-block storage when the sink holds that root, and emits the pre-block tree whole
+otherwise (`[WARN][MERKLE] rollback_storage_full`); a contract the block created, or whose leaf it put
+back unread, is wiped and forgotten by the mirror.
+
 ## Storage engine
 
 Persistence is RocksDB 0.21, opened with `open_cf_descriptors`; a downgrade-safe path unions the
@@ -199,14 +245,18 @@ Microblock body pruning and failover-event writes are gated on `storage_mode == 
 
 ### Column families
 
-There are exactly 30, listed in `ALL_CF_NAMES` — the single source of truth for the flush and
-compaction sweeps, since RocksDB releases a WAL segment only once every family has flushed past it:
-chain data `blocks`, `microblocks`, `transactions`, `metadata`; state `accounts`, `contract_storage`,
-`merkle_leaves`, `merkle_nodes`; consensus and liveness `consensus`, `attestations`, `heartbeats`,
-`failover_events`, `ping_history`, `light_ping_keys`; rewards `pending_rewards`, `reward_agg`;
-registry `node_registry`; indexes `tx_index`, `tx_by_address`, `wallet_token`; sync `sync_state`,
-`snapshots`; cold-join staging `accounts_stage`, `node_registry_stage`, `pending_rewards_stage`,
-`contract_storage_stage`; and `mempool`, `fcm_tokens`, `cross_shard_pending`, `cross_shard_receipts`.
+The main DB declares exactly 34, listed in `ALL_CF_NAMES` — the single source of truth for the flush
+and compaction sweeps, since RocksDB releases a WAL segment only once every family has flushed past it:
+chain data `blocks`, `microblocks`, `transactions`, `metadata`; state `accounts`, `contract_storage`;
+the legacy tree families `merkle_leaves`, `merkle_nodes`; consensus and liveness `consensus`,
+`attestations`, `heartbeats`, `failover_events`, `ping_history`, `light_ping_keys`, `light_pending_bind`;
+device layer `light_device`, `light_device_key`, `light_device_attkey`; rewards `pending_rewards`,
+`reward_agg`; registry `node_registry`; indexes `tx_index`, `tx_by_address`, `wallet_token`; sync
+`sync_state`, `snapshots`; cold-join staging `accounts_stage`, `node_registry_stage`,
+`pending_rewards_stage`, `contract_storage_stage`; and `mempool`, `fcm_tokens`, `cross_shard_pending`,
+`cross_shard_receipts`. The account tree itself lives in a separate tree DB and the certified-proof rows in
+an aux DB, both described below; `merkle_leaves` and `merkle_nodes` stay declared so an older binary
+still opens the main DB, and are emptied once this binary's own rebuild has landed.
 
 Families are opened with one of five option profiles: cold (Zstd — `blocks`, `snapshots`), hot (Lz4,
 small buffers), generic (Lz4), indexed (Lz4 plus partitioned filters and index), and merkle (Lz4 plus
@@ -223,8 +273,6 @@ and 36 files. Durability settings are `set_use_fsync(true)`, `bytes_per_sync` 1 
 | --- | --- | --- |
 | `accounts` | raw address bytes | bincode-serialized `Account` |
 | `contract_storage` | `{contract_address}\x00{storage_key}` | raw value bytes |
-| `merkle_leaves` | raw 32-byte address hash | 32-byte account leaf hash |
-| `merkle_nodes` | 4-byte big-endian depth ++ 32-byte node key (36 bytes) | 32-byte node hash |
 | `metadata` | `chain_height` | 8-byte big-endian height |
 | `node_registry` | `node_{node_id}` | JSON registry row |
 
@@ -255,13 +303,109 @@ Indexes below. The primary block save path writes an `EfficientMicroBlock` (tran
 `microblocks` and the full transaction bodies, Zstd level 3 compressed and lossless, into
 `transactions`. Blocks are stored versioned as `StoredMicroBlock` — `V1Full` / `V2Efficient` /
 `V3Light` with byte tags `0x01`/`0x02`/`0x03`; tag `0x04` is reserved. WASM contract logs
-live *outside* the 30 named families, in the RocksDB default family under `blocklogs_{height:010}`
+live *outside* the 34 named families, in the RocksDB default family under `blocklogs_{height:010}`
 with a per-block sub-root at `blocklogsroot_{height:010}`.
+
+### Derived tree and aux databases
+
+Two more RocksDB databases live inside the data directory, beside the main DB and sharing its block
+cache. A RocksDB snapshot covers a whole database, so keeping them apart lets a certified proof view pin
+only tree rows, never every superseded `accounts` row.
+
+`<data_dir>/state_tree` (`storage/tree_db.rs`) holds what consensus reads, and is kept across restarts:
+
+| Family | Key | Value |
+| --- | --- | --- |
+| `acct_leaves` | 32-byte address hash | 32-byte account leaf hash |
+| `acct_nodes` | 4-byte big-endian depth ++ 32-byte node key (36 bytes); the root at (256, all-zero) | 32-byte node hash |
+| `tree_meta` | `format` = 1, `seq`, `write_open`, `rebuilt_root` | see below |
+
+Each finalize carries a `seq`, monotonic across resets and restarts (a tree attached to the store starts
+from the stored `seq`), written in the same batch as the root row. No `WriteBatch` exceeds
+`TREE_WRITE_CHUNK_BYTES` = 64 MiB: a larger delta marks `write_open` in its first chunk and puts the root
+row, `seq`, `rebuilt_root` (after a full rebuild) and the `write_open` delete in its last, so a failed chunk
+never shows the finalize's root or seq. The tree DB is wiped at open in exactly two cases, logged
+`[WARN][STORAGE] tree_db_wiped reason=`: `write_open` is present (`interrupted_chunked_write`), or it holds
+rows while the main DB's legacy merkle families do too (`legacy_rows_present`: an older binary ran after
+the last retirement). The legacy families are range-deleted and compacted (`[INFO][STORAGE]
+legacy_merkle_cf_retired`) only once a full-rebuild delta of this process has landed, polled every 10 s for
+the first hour; a boot that never rebuilds keeps them for a downgrade.
+
+`<data_dir>/state_aux` (`storage/aux_db.rs`) holds what a certified proof needs and consensus never reads.
+Every row is derived and re-emitted by the full reset every boot performs, so it is destroyed and
+recreated at every open and written without a WAL:
+
+| Family | Key | Value |
+| --- | --- | --- |
+| `acct_pre` | 32-byte address hash | `AccountLeafPreimage` bytes |
+| `stor_leaves` | contract hash ++ storage leaf key (64 bytes) | 32-byte storage leaf |
+| `stor_nodes` | contract hash ++ 4-byte big-endian depth ++ node key (68 bytes) | 32-byte node hash; the storage root at (256, all-zero) |
+| `stor_pre` | contract hash ++ storage leaf key | raw stored value bytes |
+| `aux_meta` | `seq` | the `seq` of the last finalize whose aux job landed |
+
+The contract hash is the contract's own account leaf key. Every leaf write of the account tree records its
+preimage operation — a put of the fields, or a delete from `remove`, `remove_lazy` and `restore_leaf_lazy`
+(`[WARN][MERKLE] preimage_unknown`, counted in `PREIMAGE_UNKNOWN_TOTAL`) — last write wins per key, and a
+key with no record emits nothing. The rows go into one shared buffer that drains itself at 64 MiB and
+leaves with each finalize as one job carrying that finalize's `seq`. One writer thread, `qnet-aux-writer`,
+applies the jobs in order: contract wipes first as range deletes, then rows in batches of at most 64 MiB.
+Its queue holds at most `AUX_QUEUE_CAP_BYTES` = 256 MiB; a full queue holds the apply path back (a wait
+over 100 ms logs `[WARN][PROOFVIEW] aux_backpressure`, at most once a minute). A failed write logs
+`[ERR][PROOFVIEW] aux_write_failed`, stops all recording, emission and capture and clears the mirror
+record until the next full reset re-arms the sink behind a full wipe. The sink also starts inactive when
+the tree DB already holds leaves at open, because a kept tree matches the fresh aux DB only after a full
+reset.
+
+`MERKLE_STORE_WRITE_FAILURES` counts account-tree writes that failed on the flusher or inline; each tree
+also latches its own count since its last full reset, and no proof view is captured while it is set.
+
+### Certified proof views
+
+At every boundary height 90j the block's apply path — the validator pipeline, the producer's inline
+apply, the verified replay, both Tier-1 snapshot arms and the cold-join rehydrate — calls
+`Storage::request_proof_view` under the lock that applied the block, behind its rows and before the
+frontier moves. It queues a marker behind the block's aux job and asks the account tree to run a marker
+once every delta flushed so far has landed (`after_merkle_flush`; a marker counts as a queued job, so
+eviction cannot switch the tree to inline writes ahead of it). Each marker takes an O(1) snapshot of its
+DB and offers it to the views registry (`storage/proof_views.rs`): the tree part only when its snapshot
+shows exactly its finalize's `seq` and root row (no root row for the empty tree), the aux part only when
+`aux_meta.seq` matches. A complete pair is a candidate; the worker thread `qnet-proof-views` promotes it
+to a served view only when the stored macroblock j carries a checkpoint with `window_head_height` = 90j
+and `state_root` equal to the snapshot's root (and the macroblock's own `state_root` agrees). A
+mismatch logs `[ERR][PROOFVIEW] certified_root_mismatch` once and the candidate is never served. The
+stored row is the authority: the save hook and a poll of `macroblock_save_seq()` only make a candidate
+due, and every pending candidate is re-read at least every 30 s.
+
+At most `PROOF_VIEWS_KEPT` = 3 views (a client's acceptance window) and `PROOF_CANDIDATES_KEPT` = 2
+candidates are held, so each DB carries at most five snapshots. An offer at height H drops every
+candidate above H and any older-`seq` part at H. `PersistentStorage::delete_macroblock`, the single place
+a macroblock is deleted, demotes its view back to a candidate (`view_demoted`); `prune_snapshots_above`
+drops views and candidates above its target (`view_retracted`); every 60 s each view's macroblock is
+re-read and a view that fails is demoted. `newest_certified_index` is the highest macroblock index stored,
+raised by saves, lowered by deleting the top, never reported below a served view. Under disk pressure
+(the cached usage at 95%) every view and candidate is released once per episode and captures stop until a
+fresh measurement of the data directory, taken every 60 s, is below 90%; nothing is compacted. While the
+two derived DBs' SST total exceeds `VIEW_SPACE_AMP_LIMIT` = 3 times their live data, the oldest view is
+retired every 60 s, never the newest. Views do not survive a restart: the Tier-1 anchor and every replayed
+boundary are offered again, and their macroblocks are already stored.
+
+The read side (`storage/certified_read.rs`) proves over one view's two snapshots and nothing else: the
+account with `tree_proof::prove_leaf` over the tree snapshot, a contract's `balance:{holder}` key with
+`StoredRows::Branches` over the aux snapshot, after checking that the snapshot holds the contract's storage
+root row at exactly the `storage_root` of the proven contract leaf (no row for the empty tree). An included
+leaf's fields come from its `acct_pre` row, accepted only when they hash to the leaf; without one, a plain
+account may be served from its single live `accounts` row read past the block cache, only when that row
+hashes to the same leaf, and an address with stored contract slots, or a row larger than a plain account's,
+is refused unread, since a contract's row carries its whole storage map. A storage value comes from
+`stor_pre` or the one live `contract_storage` slot under the same hash check. Every proof is folded back to
+the view's root before it leaves; a fold that fails, or a branch the view should hold and does not, logs
+`[ERR][PROOFVIEW] proof_self_check_failed` once per index and kind. No path reads `StateManager` or takes a
+state lock. The RPC answers are in [RPC: certified state proofs](../developers/rpc-api.md#certified-state-proofs).
 
 ### Caches, journaling and rollback
 
-The disk-backed merkle node store (`RocksMerkleNodeStore`) is wired unconditionally at node startup
-and is the authority from block 0. The in-memory `leaves`
+The disk-backed account-tree store (`TreeDbStore`, over the tree DB above) is wired unconditionally at
+node startup and is the authority from block 0. The in-memory `leaves`
 and `intermediate_nodes` maps are bounded read-through caches (`DEFAULT_NODE_CACHE_CAP` = 2,000,000
 entries, overridable with `QNET_MERKLE_NODE_CACHE_CAP`); this is consensus-neutral, since the root is
 a pure function of the leaf set. While the leaf map
@@ -536,7 +680,7 @@ and account state, so chain continuity remains a point lookup afterwards. Each r
 `body_prune_watermark` key in the metadata family and co-prunes each pruned block's `chd_` child link and
 hash-keyed header plus the off-consensus `blocklogs_` and `blocklogsroot_` rows in the same window, and
 the token-transfer rows below the same floor; retained branch blocks leave through the `brn_` index when
-finality passes their height (`prune_branches_below_finality`); `log_prune_floor()` exposes that watermark so `getLogs` can report `pruned_below`,
+finality passes their height (`prune_branches_below_finality`); `log_prune_floor()` exposes that watermark so the logs query (`GET /api/v1/logs`) can report `pruned_below`,
 distinguishing an aged-out height from a block that genuinely emitted no events. A compile-time
 assertion enforces that `MICROBLOCK_BODY_RETENTION_BLOCKS` exceeds both `SNAPSHOT_SYNC_SWITCH_GAP`
 (1,500) and `SNAPSHOT_KEEP_COUNT × SNAPSHOT_INCREMENTAL_INTERVAL` (3 × 3,600), so a cold or lagging

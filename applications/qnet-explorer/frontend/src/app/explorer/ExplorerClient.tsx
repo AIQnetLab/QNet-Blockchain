@@ -1,10 +1,12 @@
 'use client';
 
 import { memo, useState, useEffect, useCallback, useRef, useMemo } from 'react';
-import Link from 'next/link';
+import ExplorerLink from '@/components/ExplorerLink';
 import { batchCache, getListCache, setListCache, noteChainHeight } from '@/lib/explorer-cache';
 import { useChainHead } from '@/hooks/useChainHead';
 import TokenIcon from '@/components/TokenIcon';
+import { useActivationContent, useKeepFromApp } from '@/contexts/AppContext';
+import { txPartyLabel, txTypeLabel } from '@/lib/tx-labels';
 
 // Transaction list. First paint comes from SSR (the server's head snapshot); afterwards the head stream
 // drives refreshes (no timers), pages move by cursor, numbered jumps stay within the offset cap.
@@ -58,29 +60,31 @@ function formatTimeAgo(timestamp: number, blockHeight?: number): string {
 
 const ActivityRow = memo(function ActivityRow({ item }: { item: ActivityItem }) {
   const displayTime = formatTimeAgo(item.timestamp, item.block);
+  // The app's view names reward and activation types by what they change (src/lib/tx-labels.ts).
+  const full = useActivationContent();
   return (
     <tr className="activity-row">
       <td className="col-hash">
-        <Link href={`/explorer/tx/${item.hash}`} className="addr">
+        <ExplorerLink href={`/explorer/tx/${item.hash}`} className="addr">
           {item.hash.slice(0, 8)}...{item.hash.slice(-6)}
-        </Link>
+        </ExplorerLink>
       </td>
       <td className="col-type">
-        <span className={`type-badge ${getBadgeClass(item.type)}`}>{item.type}</span>
+        <span className={`type-badge ${getBadgeClass(item.type)}`}>{txTypeLabel(item.type, full)}</span>
       </td>
       <td className="col-addresses">
         {item.from && item.from.length > 10 && item.from.includes('eon') ? (
-          <Link href={`/explorer/address/${item.from}`} className="addr">{item.from.slice(0, 6)}...{item.from.slice(-4)}</Link>
+          <ExplorerLink href={`/explorer/address/${item.from}`} className="addr">{item.from.slice(0, 6)}...{item.from.slice(-4)}</ExplorerLink>
         ) : (
-          <span className="addr">{item.from || 'N/A'}</span>
+          <span className="addr">{txPartyLabel(item.from || 'N/A', full)}</span>
         )}
         <span className="arr">→</span>
         {item.to === 'batch_transfers' ? (
           <span className="addr">batch recipients</span>
         ) : item.to && item.to.length > 10 && item.to.includes('eon') ? (
-          <Link href={`/explorer/address/${item.to}`} className="addr">{item.to.slice(0, 6)}...{item.to.slice(-4)}</Link>
+          <ExplorerLink href={`/explorer/address/${item.to}`} className="addr">{item.to.slice(0, 6)}...{item.to.slice(-4)}</ExplorerLink>
         ) : (
-          <span className="addr">{item.to || 'N/A'}</span>
+          <span className="addr">{txPartyLabel(item.to || 'N/A', full)}</span>
         )}
       </td>
       <td className="col-amount">
@@ -94,10 +98,10 @@ const ActivityRow = memo(function ActivityRow({ item }: { item: ActivityItem }) 
               <span>{item.amount}</span>
             </span>
           );
-          return href ? <Link href={href} className="token-amount-link">{chip}</Link> : chip;
+          return href ? <ExplorerLink href={href} className="token-amount-link">{chip}</ExplorerLink> : chip;
         })()}
       </td>
-      <td className="col-block"><Link href={`/explorer/block/${item.block}`}>{item.block}</Link></td>
+      <td className="col-block"><ExplorerLink href={`/explorer/block/${item.block}`}>{item.block}</ExplorerLink></td>
       <td className="col-time" suppressHydrationWarning>{displayTime}</td>
     </tr>
   );
@@ -227,7 +231,10 @@ export default function ExplorerClient({ initialData, initialHeight, initialTota
   }, [pagination.maxPage, shownPage]);
 
   const toggleSort = () => { setSortOrder(prev => (prev === 'desc' ? 'asc' : 'desc')); setPos({ page: 1, cursor: null, dir: 'next' }); };
-  const goToResult = (href: string) => { window.location.href = href; };
+  const keep = useKeepFromApp();
+  const full = useActivationContent();
+  // A full navigation: the next page starts fresh, with the app's marker kept on it (R5-XPD-06).
+  const goToResult = (href: string) => { window.location.href = keep(href); };
 
   useEffect(() => {
     const q = searchQuery.trim();
@@ -324,7 +331,7 @@ export default function ExplorerClient({ initialData, initialHeight, initialTota
                 {TX_TYPES.map(type => (
                   <button key={type} className={`filter-chip ${typeFilters.includes(type) ? 'active' : ''}`}
                     onClick={() => { setTypeFilters(prev => (prev.includes(type) ? prev.filter(t => t !== type) : [...prev, type])); setPos({ page: 1, cursor: null, dir: 'next' }); }}>
-                    {type}
+                    {txTypeLabel(type, full)}
                   </button>
                 ))}
               </div>
@@ -337,7 +344,7 @@ export default function ExplorerClient({ initialData, initialHeight, initialTota
           {rows.length === 0 && hasFetched ? (
             <div className="empty-state">
               <p>No transactions found</p>
-              <span>{typeFilters.length > 0 ? `No ${typeFilters.join('/')} transactions yet` : 'Waiting for network activity...'}</span>
+              <span>{typeFilters.length > 0 ? `No ${typeFilters.map((type) => txTypeLabel(type, full)).join('/')} transactions yet` : 'Waiting for network activity...'}</span>
             </div>
           ) : rows.length === 0 ? (
             <div className="table-placeholder" />

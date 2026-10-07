@@ -1,0 +1,10 @@
+{
+  "extName": {
+    "message": "QNet Wallet",
+    "description": "Extension name in the browser and the store."
+  },
+  "extDescription": {
+    "message": "Post-quantum QNet wallet (ML-DSA-65) with a Solana account. Activates a QNet light or super node and records the light node.",
+    "description": "Store and extensions-page description, at most 132 characters."
+  }
+}

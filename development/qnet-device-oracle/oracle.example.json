@@ -1,0 +1,41 @@
+{
+  "network": "testnet",
+  "role": "primary",
+  "listen": "0.0.0.0:8740",
+  "data_dir": "/var/lib/qnet-oracle",
+  "tls": {
+    "cert": "/etc/qnet-oracle/tls/server.crt",
+    "key": "/etc/qnet-oracle/tls/server.key",
+    "client_ca": "/etc/qnet-oracle/tls/ca.crt"
+  },
+  "clients": [
+    { "name": "genesis-001", "role": "genesis", "sha256": "<sha256 of genesis-001.crt>" },
+    { "name": "genesis-002", "role": "genesis", "sha256": "<sha256 of genesis-002.crt>" },
+    { "name": "genesis-003", "role": "genesis", "sha256": "<sha256 of genesis-003.crt>" },
+    { "name": "genesis-004", "role": "genesis", "sha256": "<sha256 of genesis-004.crt>" },
+    { "name": "genesis-005", "role": "genesis", "sha256": "<sha256 of genesis-005.crt>" },
+    { "name": "support", "role": "support", "sha256": "<sha256 of support.crt>" },
+    { "name": "standby", "role": "replica", "sha256": "<sha256 of standby-replica.crt>" }
+  ],
+  "secrets": {
+    "oracle_key": "/etc/qnet-oracle/secrets/oracle.key",
+    "evidence_key": "/etc/qnet-oracle/secrets/evidence.key",
+    "alert_webhook": "/etc/qnet-oracle/secrets/alert_webhook.url"
+  },
+  "apple": {
+    "key": "/etc/qnet-oracle/secrets/devicecheck.p8",
+    "key_id": "<DeviceCheck key id>"
+  },
+  "google": {
+    "decryption_key": "/etc/qnet-oracle/secrets/play_decryption.key",
+    "verification_key": "/etc/qnet-oracle/secrets/play_verification.key",
+    "service_account": "/etc/qnet-oracle/secrets/service_account.json"
+  },
+  "lease": { "background_tokens": false },
+  "gates": { "enforce": false, "metric_bound": 4, "certs_bound": 100 },
+  "limits": { "node_per_day": 6, "node_per_30d": 20, "rebinds_per_key_day": 1, "foreign_per_att_key_day": 2, "ip_per_hour": 30 },
+  "alerts": { "command": null, "min_interval_secs": 1800 },
+  "quota": { "play_daily": 10000, "bad_tokens_hourly": 100 },
+  "server": { "workers": 32, "queue": 256, "max_body": 262144 },
+  "replica_log_days": 7
+}

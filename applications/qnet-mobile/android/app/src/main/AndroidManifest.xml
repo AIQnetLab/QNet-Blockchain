@@ -2,28 +2,66 @@
     xmlns:tools="http://schemas.android.com/tools">
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Secret screens hide other apps' overlay windows (Window.setHideOverlayWindows, API 31+). -->
+    <uses-permission android:name="android.permission.HIDE_OVERLAY_WINDOWS" />
+    <!-- The camera is for the QR scan on the Send screens (QNet and Solana) only, asked for when the scan icon is
+         tapped; a device without one still installs the app. The in-app browser gives web pages no camera (its WebView
+         denies every permission request), and no microphone, location or storage; no library may bring those
+         permissions into the app. -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" tools:node="remove" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" tools:node="remove" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" tools:node="remove" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" tools:node="remove" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" tools:node="remove" />
+    <!-- The network's pushes are silent data messages: the app shows no notification, and no library may make it ask
+         to show one. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" tools:node="remove" />
 
+    <!-- No backup and no device-to-device transfer of any app data: allowBackup=false alone does not stop
+         Android 12+ device transfer for apps targeting 31+, so both rule files exclude every domain.
+         No cleartext and no user-installed CAs: xml/network_security_config. -->
     <application
       android:name=".MainApplication"
       android:label="@string/app_name"
       android:icon="@mipmap/ic_launcher"
       android:roundIcon="@mipmap/ic_launcher_round"
       android:allowBackup="false"
+      android:fullBackupContent="@xml/backup_rules"
+      android:dataExtractionRules="@xml/data_extraction_rules"
+      android:networkSecurityConfig="@xml/network_security_config"
       android:theme="@style/AppTheme"
-      android:usesCleartextTraffic="true"
-      tools:replace="android:usesCleartextTraffic"
       android:supportsRtl="true">
+      <!-- An empty task affinity keeps other apps' activities out of the wallet's task (task hijacking). -->
       <activity
         android:name=".MainActivity"
         android:label="@string/app_name"
         android:configChanges="keyboard|keyboardHidden|orientation|screenLayout|screenSize|smallestScreenSize|uiMode"
         android:launchMode="singleTask"
+        android:taskAffinity=""
         android:windowSoftInputMode="adjustResize"
         android:exported="true">
         <intent-filter>
             <action android:name="android.intent.action.MAIN" />
             <category android:name="android.intent.category.LAUNCHER" />
         </intent-filter>
+        <!-- QNet Link (docs/protocols/qnet-link-v1.md): a verified App Link for exactly https://link.aiqnet.io/l,
+             checked against link.aiqnet.io/.well-known/assetlinks.json. The site's intent: URL naming this package
+             arrives through this filter too. No other host, path or scheme opens the app. -->
+        <intent-filter android:autoVerify="true">
+            <action android:name="android.intent.action.VIEW" />
+            <category android:name="android.intent.category.DEFAULT" />
+            <category android:name="android.intent.category.BROWSABLE" />
+            <data android:scheme="https" android:host="link.aiqnet.io" android:path="/l" />
+        </intent-filter>
       </activity>
+      <!-- Tells the app when the user swipes it away from the recent apps, so a light node answers nothing until the app
+           is opened again (TaskState.kt). Not exported; it runs only while the app has been in front. -->
+      <service
+        android:name=".TaskWatchService"
+        android:exported="false"
+        android:stopWithTask="false" />
     </application>
 </manifest>

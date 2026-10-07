@@ -2,6 +2,15 @@
 
 use super::*;
 
+/// The digest a deploy's client signs and the one byte form of the payload this node sends, both derived
+/// from the same input, so every deploy builder emits exactly what the tx_target_bound rule accepts.
+pub(super) fn deploy_payload(
+    kind: qnet_state::transaction::DeployKind, input: &Value,
+) -> Result<(String, String), String> {
+    Ok((qnet_state::transaction::deploy_code_hash(kind, input)?,
+        qnet_state::transaction::canonical_deploy_data(kind, input)?))
+}
+
 /// Handle smart contract deployment
 /// NIST/CISCO COMPLIANT: Post-quantum signature verification (pure CRYSTALS-ML-DSA-65 / ML-DSA-65)
 pub(super) async fn handle_contract_deploy(
@@ -114,22 +123,17 @@ pub(super) async fn handle_contract_deploy(
     // Single-source on-chain derivation; apply ignores caller-supplied `to` (no address squatting)
     let contract_address = qnet_state::transaction::derive_contract_address(&request.from, request.nonce);
 
-    // ONE canonical deploy payload, byte-shape-identical to /api/v1/wasm/deploy: the executable code
-    // travels on-chain so apply stores a runnable contract, never a code-hash-only stub. code_hash is
-    // derived from that payload by the shared helper, so the signed digest and the stored bytes are
-    // bound together — classify_contract_deploy re-derives and rejects any mismatch.
-    let mut deploy_data = json!({
-        "wasm": true,
-        "code": hex::encode(&wasm_code),
-    });
-    let code_hash = match qnet_state::transaction::deploy_code_hash(
-        qnet_state::transaction::DeployKind::Wasm, &deploy_data) {
-        Ok(h) => h,
+    // ONE canonical deploy payload, byte-identical to /api/v1/wasm/deploy: the executable code travels
+    // on-chain so apply stores a runnable contract, never a code-hash-only stub. The digest and the
+    // canonical bytes come from the same input, so the signed digest and the stored bytes are bound
+    // together — classify_contract_deploy and the gated canonical-form rule re-derive both.
+    let (code_hash, payload) = match deploy_payload(
+        qnet_state::transaction::DeployKind::Wasm, &json!({ "wasm": true, "code": hex::encode(&wasm_code) })) {
+        Ok(p) => p,
         Err(e) => return Ok(warp::reply::json(&json!({
             "success": false, "error": "Invalid WASM deploy payload", "details": e
         }))),
     };
-    deploy_data["code_hash"] = json!(code_hash);
 
     // Create ContractDeploy transaction with security metadata
     let mut tx = qnet_state::Transaction::new(
@@ -142,7 +146,7 @@ pub(super) async fn handle_contract_deploy(
         chrono::Utc::now().timestamp() as u64,     // timestamp
         None,                                      // signature (pure-Dilithium; Ed25519 not on a QNet path)
         qnet_state::TransactionType::ContractDeploy,  // tx_type
-        Some(serde_json::to_string(&deploy_data).unwrap_or_default()), // data
+        Some(payload),                             // data: the canonical payload
     );
     // Carry the caller's ML-DSA-65 signature so the value-TX gate verifies it (over the canonical
     // "q{chain}|contract_deploy:{from}:{code_hash}:{nonce}:{gas_price}:{gas_limit}" message) and binds the key to `from`.
@@ -152,9 +156,9 @@ pub(super) async fn handle_contract_deploy(
     tx.hash = tx.calculate_hash();
 
     // Submit to mempool
-    let tx_hash = tx.hash.clone();
+    // The hash that will land: this TX's, or the one a copy of this very signed TX is pending under.
     match blockchain.add_transaction_to_mempool(tx).await {
-        Ok(_) => {
+        Ok(tx_hash) => {
             println!("[CONTRACT] ✅ deployment_submitted contract={} hash={}",
                      qnet_state::char_prefix(&contract_address, 16), 
                      qnet_state::char_prefix(&tx_hash, 16));
@@ -517,9 +521,10 @@ pub(super) async fn handle_contract_call(
 
     // A WASM contract takes calldata as a HEX STRING; apply rejects any other shape rather than
     // executing with empty args. Report it at the door when the target is already on-chain
-    // (unknown/pending targets are simply left to the binding apply-side gate).
-    if let Ok(Some(account)) = blockchain.get_account(&request.contract_address).await {
-        let is_wasm = account.contract_storage.get("type").map(|t| t == "wasm").unwrap_or(false);
+    // (unknown/pending targets are simply left to the binding apply-side gate). Read light: the target's
+    // type, never a clone of its whole storage.
+    if let Ok(Some(target)) = blockchain.try_get_account_basic(&request.contract_address).await {
+        let is_wasm = target.contract_type.as_deref() == Some("wasm");
         let args_ok = match &request.args {
             Value::Null => true,
             Value::String(s) => hex::decode(s).is_ok(),
@@ -533,25 +538,21 @@ pub(super) async fn handle_contract_call(
                 "method": request.method
             })));
         }
+        // SH7 step 1: a QRC-20 transfer to a contract account is refused here (not in apply).
+        if target.contract_type.as_deref() == Some("qrc20") {
+            if let Some(to) = qrc20_credited(&request.method, &request.args) {
+                if let Err(r) = check_recipient(&blockchain, to).await {
+                    let mut body = r.to_json(to);
+                    body["contract_address"] = json!(request.contract_address);
+                    body["method"] = json!(request.method);
+                    return Ok(warp::reply::json(&body));
+                }
+            }
+        }
     }
 
     // Create ContractCall transaction; tx.data is the exact calldata bound by the AC-1 signature
-    let mut tx = qnet_state::Transaction::new(
-        request.from.clone(),                      // from
-        Some(request.contract_address.clone()),    // to: contract address
-        0,                                         // amount: a call carries no native value
-        request.nonce,                             // nonce
-        request.gas_price,                         // gas_price
-        request.gas_limit,                         // gas_limit
-        chrono::Utc::now().timestamp() as u64,     // timestamp
-        None,                                      // signature (pure-Dilithium; Ed25519 not on a QNet path)
-        qnet_state::TransactionType::ContractCall, // tx_type
-        Some(serde_json::to_string(&json!({        // data = exact calldata bound by the AC-1 signature
-            "contract": request.contract_address,
-            "method": request.method,
-            "args": request.args
-        })).unwrap_or_default()),
-    );
+    let mut tx = contract_call_tx(&request, chrono::Utc::now().timestamp() as u64);
     // Carry the caller's ML-DSA-65 signature so the value-TX gate verifies it (over the canonical
     // "q{chain}|contract_call:{from}:{sha3(tx.data calldata)}:{nonce}:{gas_price}:{gas_limit}" message) and binds the key to `from`.
     // FIX-5: hex(raw detached) -> bytes; value gate verifies
@@ -560,11 +561,11 @@ pub(super) async fn handle_contract_call(
     tx.dilithium_public_key = if dilithium_pk.is_empty() { None } else { hex::decode(&dilithium_pk).ok() };
     tx.hash = tx.calculate_hash();
 
-    let tx_hash = tx.hash.clone();
     
     // Submit to mempool
+    // The hash that will land: this TX's, or the one a copy of this very signed TX is pending under.
     match blockchain.add_transaction_to_mempool(tx).await {
-        Ok(_) => {
+        Ok(tx_hash) => {
             println!("📜 Contract call submitted: {}::{}", 
                      qnet_state::char_prefix(&request.contract_address, 16), request.method);
             
@@ -585,6 +586,27 @@ pub(super) async fn handle_contract_call(
             })))
         }
     }
+}
+
+/// The unsigned call the call handler builds. The target goes into `tx.to`, which apply runs on, and into
+/// the signed calldata as "contract", the only place the signature covers it (tx_target_bound).
+pub(super) fn contract_call_tx(request: &ContractCallRequest, timestamp: u64) -> qnet_state::Transaction {
+    qnet_state::Transaction::new(
+        request.from.clone(),                      // from
+        Some(request.contract_address.clone()),    // to: contract address
+        0,                                         // amount: a call carries no native value
+        request.nonce,                             // nonce
+        request.gas_price,                         // gas_price
+        request.gas_limit,                         // gas_limit
+        timestamp,                                 // timestamp
+        None,                                      // signature (pure-Dilithium; Ed25519 not on a QNet path)
+        qnet_state::TransactionType::ContractCall, // tx_type
+        Some(serde_json::to_string(&json!({        // data = exact calldata bound by the AC-1 signature
+            "contract": request.contract_address,
+            "method": request.method,
+            "args": request.args
+        })).unwrap_or_default()),
+    )
 }
 
 /// Handle contract info query
@@ -650,6 +672,30 @@ pub(super) async fn handle_contract_info(
 /// log receipts over a BOUNDED height range, optionally filtered by contract address. Read-only:
 /// the log store is a side index (never consensus state / never hashed), so this cannot affect
 /// state_root and needs no signature.
+/// The log rows of heights `from..=to`, those of `contract` only when one is named (lowercase).
+/// `log_index` is the row's position in the block's whole log list, counted before the contract
+/// filter: the index `/api/v1/logs/proof` and `wasm_exec::log_leaf` use.
+fn logs_page(storage: &crate::storage::Storage, from: u64, to: u64, contract: Option<&str>) -> Vec<Value> {
+    let mut rows = Vec::new();
+    let mut h = from;
+    while h <= to {
+        for (log_index, (tx_hash, c, data)) in storage.get_block_logs(h).into_iter().enumerate() {
+            if contract.map_or(true, |f| c.to_lowercase() == f) {
+                rows.push(json!({
+                    "height": h,
+                    "log_index": log_index,
+                    "tx_hash": tx_hash,
+                    "contract": c,
+                    "data": hex::encode(&data),
+                }));
+            }
+        }
+        if h == u64::MAX { break; }
+        h += 1;
+    }
+    rows
+}
+
 pub(super) async fn handle_contract_logs(
     query: ContractLogsQuery,
     remote_addr: Option<std::net::SocketAddr>,
@@ -665,21 +711,7 @@ pub(super) async fn handle_contract_logs(
     const MAX_LOG_RANGE: u64 = 500;
     let to = query.to.unwrap_or(tip).min(tip).min(from.saturating_add(MAX_LOG_RANGE));
     let filter = query.contract.as_ref().map(|c| c.to_lowercase());
-    let mut logs_out: Vec<serde_json::Value> = Vec::new();
-    let mut h = from;
-    while h <= to {
-        for (tx_hash, contract, data) in storage.get_block_logs(h) {
-            if filter.as_ref().map_or(true, |f| &contract.to_lowercase() == f) {
-                logs_out.push(json!({
-                    "height": h,
-                    "tx_hash": tx_hash,
-                    "contract": contract,
-                    "data": hex::encode(&data),
-                }));
-            }
-        }
-        h = h.saturating_add(1);
-    }
+    let logs_out = logs_page(&storage, from, to, filter.as_deref());
     // Retention honesty: blocklogs below the prune floor are physically gone on this node, so an
     // empty result there is NOT "no events". Report `oldest_available` always, and set
     // `pruned_below` when the request dips below it — the client then knows results under that
@@ -1269,20 +1301,16 @@ pub(super) async fn handle_wasm_deploy(
 
     let nonce = request.nonce;
     let contract_address = qnet_state::transaction::derive_contract_address(&request.from, nonce);
-    // Canonical deploy payload FIRST, then its digest — sha3(module bytes) for WASM, re-derived by
+    // Canonical deploy payload and its digest — sha3(module bytes) for WASM, re-derived by
     // classify_contract_deploy on every node so the stored code cannot differ from the signed hash.
-    let mut deploy_data = json!({
-        "wasm": true,
-        "code": request.code.trim(),
-    });
-    let code_hash = match qnet_state::transaction::deploy_code_hash(
-        qnet_state::transaction::DeployKind::Wasm, &deploy_data) {
-        Ok(h) => h,
+    // The code is written in lowercase hex whatever case the caller sent; the digest reads the bytes.
+    let (_, payload) = match deploy_payload(
+        qnet_state::transaction::DeployKind::Wasm, &json!({ "wasm": true, "code": request.code.trim() })) {
+        Ok(p) => p,
         Err(e) => return Ok(warp::reply::json(&json!({
             "success": false, "error": "Invalid WASM deploy payload", "details": e
         }))),
     };
-    deploy_data["code_hash"] = json!(code_hash);
     let gas_price = 1000u64;
     let gas_limit = 200_000u64;
 
@@ -1298,17 +1326,17 @@ pub(super) async fn handle_wasm_deploy(
         signature: None,
         public_key: None,
         tx_type: qnet_state::TransactionType::ContractDeploy,
-        data: Some(serde_json::to_string(&deploy_data).unwrap_or_default()),
+        data: Some(payload),
         // FIX-5: hex(raw detached) -> bytes; value gate verifies
         dilithium_signature: hex::decode(&request.dilithium_signature).ok(),
         dilithium_public_key: hex::decode(&request.dilithium_public_key).ok(),
         chain_id: qnet_state::transaction::QNET_CHAIN_ID,
     };
     tx.hash = tx.calculate_hash();
-    let tx_hash = tx.hash.clone();
 
+    // The hash that will land: this TX's, or the one a copy of this very signed TX is pending under.
     match blockchain.submit_transaction(tx).await {
-        Ok(_) => {
+        Ok(tx_hash) => {
             println!("[INFO][VM] wasm_deploy_submitted contract={} code_bytes={} hash={}",
                      qnet_state::char_prefix(&contract_address, 16), code.len(),
                      qnet_state::char_prefix(&tx_hash, 16));
@@ -1382,21 +1410,18 @@ pub(super) async fn handle_nft_deploy(
 
     let nonce = request.nonce;
     let contract_address = qnet_state::transaction::derive_contract_address(&request.from, nonce);
-    // Canonical deploy payload FIRST, then its digest — the value the client signs and that
+    // Canonical deploy payload and its digest — the value the client signs and that
     // classify_contract_deploy re-derives on every node, binding name/symbol to the signature.
-    let mut deploy_data = json!({
+    let (_, payload) = match deploy_payload(qnet_state::transaction::DeployKind::Qrc721, &json!({
         "qrc721": true,
         "name": request.name,
         "symbol": request.symbol,
-    });
-    let code_hash = match qnet_state::transaction::deploy_code_hash(
-        qnet_state::transaction::DeployKind::Qrc721, &deploy_data) {
-        Ok(h) => h,
+    })) {
+        Ok(p) => p,
         Err(e) => return Ok(warp::reply::json(&json!({
             "success": false, "error": "Invalid NFT deploy payload", "details": e
         }))),
     };
-    deploy_data["code_hash"] = json!(code_hash);
     let gas_price = 1000u64;
     let gas_limit = 50_000u64;
 
@@ -1412,17 +1437,17 @@ pub(super) async fn handle_nft_deploy(
         signature: None,
         public_key: None,
         tx_type: qnet_state::TransactionType::ContractDeploy,
-        data: Some(serde_json::to_string(&deploy_data).unwrap_or_default()),
+        data: Some(payload),
         // FIX-5: hex(raw detached) -> bytes; value gate verifies
         dilithium_signature: hex::decode(&request.dilithium_signature).ok(),
         dilithium_public_key: hex::decode(&request.dilithium_public_key).ok(),
         chain_id: qnet_state::transaction::QNET_CHAIN_ID,
     };
     tx.hash = tx.calculate_hash();
-    let tx_hash = tx.hash.clone();
 
+    // The hash that will land: this TX's, or the one a copy of this very signed TX is pending under.
     match blockchain.submit_transaction(tx).await {
-        Ok(_) => {
+        Ok(tx_hash) => {
             println!("[INFO][NFT] qrc721_deploy_submitted name={} symbol={} contract={} hash={}",
                      request.name, request.symbol,
                      qnet_state::char_prefix(&contract_address, 16),
@@ -1556,7 +1581,7 @@ pub(super) async fn handle_token_deploy(
     // Canonical deploy payload FIRST, then its digest: code_hash commits to every field apply reads
     // (name/symbol/decimals/supply/flags/logo), so nothing here is malleable under the client's
     // signature. The client signs the same digest — see WalletManager.js deployToken.
-    let mut deploy_data = json!({
+    let (_, payload) = match deploy_payload(qnet_state::transaction::DeployKind::Qrc20, &json!({
         "qrc20": true,
         "name": request.name,
         "symbol": request.symbol,
@@ -1567,15 +1592,12 @@ pub(super) async fn handle_token_deploy(
         "initial_supply": request.initial_supply.to_string(),
         "mintable": request.mintable,
         "burnable": request.burnable,
-    });
-    let code_hash = match qnet_state::transaction::deploy_code_hash(
-        qnet_state::transaction::DeployKind::Qrc20, &deploy_data) {
-        Ok(h) => h,
+    })) {
+        Ok(p) => p,
         Err(e) => return Ok(warp::reply::json(&json!({
             "success": false, "error": "Invalid token deploy payload", "details": e
         }))),
     };
-    deploy_data["code_hash"] = json!(code_hash);
 
     // v3.40: Create ContractDeploy transaction — goes to mempool -> block -> all nodes
     // QRC-20 metadata is stored in tx.data as JSON so apply_to_state can parse it
@@ -1594,7 +1616,7 @@ pub(super) async fn handle_token_deploy(
         signature: None,
         public_key: None,
         tx_type: qnet_state::TransactionType::ContractDeploy,
-        data: Some(serde_json::to_string(&deploy_data).unwrap_or_default()),
+        data: Some(payload),
         // FIX-5: hex(raw detached) -> bytes; value gate verifies
         dilithium_signature: hex::decode(&request.dilithium_signature).ok(),
         dilithium_public_key: hex::decode(&request.dilithium_public_key).ok(),
@@ -1603,11 +1625,11 @@ pub(super) async fn handle_token_deploy(
 
     // Calculate hash BEFORE submit (same as all other TX handlers)
     tx.hash = tx.calculate_hash();
-    let tx_hash = tx.hash.clone();
     
     // Submit to mempool -> included in block -> apply_to_state on ALL nodes
+    // The hash that will land: this TX's, or the one a copy of this very signed TX is pending under.
     match blockchain.submit_transaction(tx).await {
-        Ok(_) => {
+        Ok(tx_hash) => {
             println!("[INFO][TOKEN] qrc20_deploy_submitted name={} symbol={} supply={} contract={} hash={}",
                      request.name, request.symbol, request.initial_supply,
                      qnet_state::char_prefix(&contract_address, 16),
@@ -1634,5 +1656,35 @@ pub(super) async fn handle_token_deploy(
                 "details": format!("{:?}", e)
             })))
         }
+    }
+}
+
+#[cfg(test)]
+mod logs_tests {
+    use super::*;
+
+    /// SH1: a page filtered by contract names each row's position in the block's whole log list, the index
+    /// `/api/v1/logs/proof` takes and `log_leaf` hashes.
+    #[test]
+    fn a_filtered_page_carries_the_whole_block_log_index() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage");
+        let logs = vec![
+            ("aa".repeat(32), "tokenA".to_string(), vec![1u8]),
+            ("bb".repeat(32), "tokenB".to_string(), vec![2u8]),
+            ("cc".repeat(32), "TokenA".to_string(), vec![3u8]),
+        ];
+        storage.save_block_logs(7, &logs).expect("save logs");
+        let page = logs_page(&storage, 5, 9, Some("tokena"));
+        let got: Vec<(u64, u64)> = page.iter().map(|r| (r["height"].as_u64().unwrap(), r["log_index"].as_u64().unwrap())).collect();
+        assert_eq!(got, vec![(7, 0), (7, 2)]);
+        assert_eq!(page[1]["tx_hash"], json!("cc".repeat(32)));
+        assert_eq!(page[1]["data"], json!("03"));
+        let all = logs_page(&storage, 7, 7, None);
+        assert_eq!(all.iter().map(|r| r["log_index"].as_u64().unwrap()).collect::<Vec<_>>(), vec![0, 1, 2]);
+        let stored = storage.get_block_logs(7);
+        let li = page[1]["log_index"].as_u64().unwrap() as usize;
+        assert_eq!(qnet_state::wasm_exec::log_leaf(&stored[li].0, li as u32, &stored[li].1, &stored[li].2),
+                   qnet_state::wasm_exec::log_leaf(&"cc".repeat(32), 2, "TokenA", &[3u8]));
     }
 }

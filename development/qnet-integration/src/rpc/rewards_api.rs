@@ -28,9 +28,6 @@ pub(super) async fn handle_claim_rewards(
     // and is NOT verified on this QNet path.
     // Chain-bound: the same wallet key signs transfers, so an authorization minted on one chain
     // must not be replayable on another.
-    let claim_message = crate::node::BlockchainNode::chain_bind(
-        &format!("claim_rewards:{}:{}", claim_request.node_id, claim_request.wallet_address));
-    
     // v5.0: MANDATORY ML-DSA-65 (ML-DSA-65) signature for ALL reward claims — no exceptions.
     // Android (NDK/JNI) and iOS (ObjC bridge) both support Dilithium since v5.0.
     {
@@ -55,12 +52,17 @@ pub(super) async fn handle_claim_rewards(
             }
         };
 
-        if !verify_mobile_dilithium_signature(&claim_message, &dilithium_sig, &dilithium_pubkey) {
-            println!("[WARN][CLAIM] dilithium_invalid node={}", claim_request.node_id);
-            return Ok(warp::reply::json(&json!({
-                "success": false,
-                "error": "Invalid Dilithium3 signature for reward claim"
-            })));
+        // H12: the key must be the wallet's own, from the quote on, as the claim's apply requires it; a
+        // key the caller merely holds would take the node's claim lock and a proof walk for a stranger.
+        if let Err(reason) = claim_quote_signer_ok(&claim_request.node_id, &claim_request.wallet_address,
+                                                   &dilithium_sig, &dilithium_pubkey) {
+            println!("[WARN][CLAIM] rejected reason={} node={}", reason, claim_request.node_id);
+            let error = if reason == "key_not_wallet" {
+                "dilithium_public_key does not belong to this wallet"
+            } else {
+                "Invalid Dilithium3 signature for reward claim"
+            };
+            return Ok(warp::reply::json(&json!({ "success": false, "error": error, "reason": reason })));
         }
         println!("[INFO][CLAIM] dilithium_verified node={} quantum_safe=true", claim_request.node_id);
     }
@@ -122,29 +124,15 @@ pub(super) async fn handle_claim_rewards(
         if data.len() > MAX_CLAIMS_DATA {
             return Ok(warp::reply::json(&json!({ "success": false, "error": "claims_data too large" })));
         }
-        let total_amount: u64 = serde_json::from_str::<serde_json::Value>(data).ok()
-            .and_then(|v| v.get("claims").and_then(|c| c.as_array().cloned()))
-            .map(|a| a.iter().filter_map(|e| e.get("amount").and_then(|x| x.as_u64()))
-                 .fold(0u64, |acc, x| acc.saturating_add(x)))
-            .unwrap_or(0);
-        let mut tx = qnet_state::Transaction {
-            hash: String::new(),
-            from: "system_rewards_pool".to_string(),
-            to: Some(wallet_address.clone()),
-            amount: total_amount,
-            nonce: 0,
-            gas_price: 0,
-            gas_limit: 0,
-            timestamp: claim_request.claim_timestamp.unwrap_or(0),
-            signature: None,
-            public_key: None,
-            tx_type: qnet_state::TransactionType::RewardDistribution,
-            data: Some(data.clone()),
-            dilithium_signature: Some(sig.clone().into_bytes()),
-            dilithium_public_key: claim_request.dilithium_public_key.clone().map(String::into_bytes),
-            chain_id: qnet_state::transaction::QNET_CHAIN_ID,
+        let tx = match merkle_claim_tx(&wallet_address, data, sig,
+                                       claim_request.dilithium_public_key.as_deref(),
+                                       claim_request.claim_timestamp.unwrap_or(0)) {
+            Some(tx) => tx,
+            None => return Ok(warp::reply::json(&json!({
+                "success": false, "error": "claims_data carries no summable claim amounts"
+            }))),
         };
-        tx.hash = tx.calculate_hash();
+        let total_amount = tx.amount;
         if !crate::node::BlockchainNode::claim_authorized(&tx, &wallet_address, data) {
             println!("[WARN][CLAIM] payload_signature_invalid wallet={}..", qnet_state::char_prefix(&wallet_address, 16));
             return Ok(warp::reply::json(&json!({
@@ -306,6 +294,47 @@ pub(super) async fn handle_claim_rewards(
     }
 
     Ok(warp::reply::json(&json!({ "success": false, "error": "No claimable rewards" })))
+}
+
+/// The claim request's own signature (`{chain_tag}claim_rewards:{N}:{W}`): valid, and under a key whose
+/// EON address is `W`, the rule the claim's apply holds its payload to (`claim_authorized`).
+pub(crate) fn claim_quote_signer_ok(node_id: &str, wallet: &str, sig_hex: &str, pk_hex: &str) -> Result<(), &'static str> {
+    if crate::crypto::solana_derivation::eon_from_qnet_dilithium_pubkey(pk_hex).as_deref() != Some(wallet) {
+        return Err("key_not_wallet");
+    }
+    let message = crate::node::BlockchainNode::chain_bind(&format!("claim_rewards:{}:{}", node_id, wallet));
+    if !verify_mobile_dilithium_signature(&message, sig_hex, pk_hex) {
+        return Err("bad_signature");
+    }
+    Ok(())
+}
+
+/// The merkle claim the claim handler submits for a wallet-signed payload. Its envelope is exactly what
+/// the signature implies (tx_target_bound): the amount is the payload's own total, and nonce, gas and the
+/// legacy signature fields stay empty. None when the payload carries no summable amounts.
+pub(crate) fn merkle_claim_tx(
+    wallet: &str, data: &str, sig: &str, pk_hex: Option<&str>, timestamp: u64,
+) -> Option<qnet_state::Transaction> {
+    let amount = qnet_state::Transaction::claim_entries_total(data)?;
+    let mut tx = qnet_state::Transaction {
+        hash: String::new(),
+        from: "system_rewards_pool".to_string(),
+        to: Some(wallet.to_string()),
+        amount,
+        nonce: 0,
+        gas_price: 0,
+        gas_limit: 0,
+        timestamp,
+        signature: None,
+        public_key: None,
+        tx_type: qnet_state::TransactionType::RewardDistribution,
+        data: Some(data.to_string()),
+        dilithium_signature: Some(sig.as_bytes().to_vec()),
+        dilithium_public_key: pk_hex.map(|p| p.as_bytes().to_vec()),
+        chain_id: qnet_state::transaction::QNET_CHAIN_ID,
+    };
+    tx.hash = tx.calculate_hash();
+    Some(tx)
 }
 
 // GET /api/v1/rewards/pending/{node_id} - Get pending rewards for a node
@@ -548,8 +577,14 @@ pub(super) struct LeafsetQuery {
 
 /// History status of one epoch. Zero is tested before the watermark, so "claimed" only names an
 /// epoch in which the wallet held a leaf.
-fn reward_history_status(servable: bool, amount: u64, epoch: u64, last_claimed: u64) -> &'static str {
+/// `shard_certified` is Some(false) only for a LIGHT node whose shard published no bitmap for the
+/// epoch. Then a zero is not the node's doing: the epoch's reward root was sealed without that shard,
+/// and no later block can add it (the owners were all silent through the commit window). Reporting it
+/// as "not_eligible" told the owner they had missed their pings when they had not.
+fn reward_history_status(servable: bool, amount: u64, epoch: u64, last_claimed: u64,
+                         shard_certified: Option<bool>) -> &'static str {
     if !servable { "unavailable" }
+    else if amount == 0 && shard_certified == Some(false) { "shard_not_certified" }
     else if amount == 0 { "not_eligible" }
     else if epoch <= last_claimed { "claimed" }
     else { "claimable" }
@@ -591,6 +626,10 @@ pub(super) async fn handle_get_reward_history(
     epochs.reverse();
     let total_epochs = epochs.len();
 
+    // A super node has no light shard, so the shard verdict below must not be applied to it.
+    let is_light = blockchain.get_unified_p2p()
+        .map_or(false, |p| p.get_light_node(&node_id).is_some());
+
     let mut epochs_history = Vec::new();
     for &epoch in epochs.iter().skip(offset).take(limit) {
         // The window this epoch paid for, from the helper the reward gather itself uses.
@@ -610,12 +649,19 @@ pub(super) async fn handle_get_reward_history(
             Ok(Some(_)) => (0, true), // certified as distributing nothing
             _ => (0, false),
         };
-        let status = reward_history_status(servable, amount, epoch, last_claimed);
+        // Only resolved when it can change the answer: a zero this node CAN serve.
+        let shard_certified = if servable && amount == 0 && is_light {
+            let shard = crate::node::light_shard_of(&node_id);
+            let bitmap_epoch = crate::reward_epoch::work_epoch_of(epoch);
+            Some(storage.load_light_bitmaps(bitmap_epoch).map(|m| m.contains_key(&shard)).unwrap_or(false))
+        } else { None };
+        let status = reward_history_status(servable, amount, epoch, last_claimed, shard_certified);
         epochs_history.push(json!({
             "epoch": epoch,
             "block_range": format!("{}-{}", start_h, end_h),
             "amount_qnc": amount as f64 / 1_000_000_000.0,
             "status": status,
+            "shard_certified": shard_certified,
         }));
     }
 
@@ -1190,10 +1236,58 @@ mod tests_reward_history {
     /// An epoch below the watermark in which the wallet had no leaf was never claimed by it.
     #[test]
     fn zero_amount_epochs_are_not_eligible_even_below_the_watermark() {
-        assert_eq!(reward_history_status(true, 0, 160, 13_600), "not_eligible");
-        assert_eq!(reward_history_status(true, 5, 160, 13_600), "claimed");
-        assert_eq!(reward_history_status(true, 5, 13_760, 13_600), "claimable");
-        assert_eq!(reward_history_status(true, 0, 13_760, 13_600), "not_eligible");
-        assert_eq!(reward_history_status(false, 5, 160, 13_600), "unavailable", "an unservable epoch says so first");
+        assert_eq!(reward_history_status(true, 0, 160, 13_600, None), "not_eligible");
+        assert_eq!(reward_history_status(true, 5, 160, 13_600, None), "claimed");
+        assert_eq!(reward_history_status(true, 5, 13_760, 13_600, None), "claimable");
+        assert_eq!(reward_history_status(true, 0, 13_760, 13_600, None), "not_eligible");
+        assert_eq!(reward_history_status(false, 5, 160, 13_600, None), "unavailable", "an unservable epoch says so first");
+    }
+
+    /// A light whose shard published no bitmap earned nothing THROUGH NO FAULT OF ITS OWN. Calling
+    /// that "not_eligible" told the owner they had missed their pings; the epoch's root was simply
+    /// sealed without their shard, and no later block can add it.
+    #[test]
+    fn a_shard_with_no_bitmap_is_not_the_nodes_fault() {
+        assert_eq!(reward_history_status(true, 0, 13_760, 13_600, Some(false)), "shard_not_certified");
+        assert_eq!(reward_history_status(true, 0, 13_760, 13_600, Some(true)), "not_eligible",
+                   "the shard committed and this node still earned nothing - that one IS on the node");
+        assert_eq!(reward_history_status(false, 0, 13_760, 13_600, Some(false)), "unavailable",
+                   "an epoch this node cannot serve says so first, whatever the shard did");
+        assert_eq!(reward_history_status(true, 5, 13_760, 13_600, Some(false)), "claimable",
+                   "a paid epoch is paid; the shard verdict only explains a zero");
+    }
+}
+
+#[cfg(test)]
+mod tests_claim_signer {
+    use super::claim_quote_signer_ok;
+    use pqcrypto_mldsa::mldsa65 as d3;
+    use pqcrypto_traits::sign::{DetachedSignature as _, PublicKey as _};
+
+    fn keys() -> (String, d3::SecretKey) {
+        let (pk, sk) = d3::keypair();
+        (hex::encode(pk.as_bytes()), sk)
+    }
+    fn sign(sk: &d3::SecretKey, msg: &str) -> String {
+        hex::encode(d3::detached_sign(msg.as_bytes(), sk).as_bytes())
+    }
+
+    /// H12: a claim quote is signed by the wallet's own key. Anyone can sign the same message with a key
+    /// of their own; that signature verifies, and is refused before the node's claim lock is taken.
+    #[test]
+    fn a_claim_quote_with_a_foreign_key_is_refused() {
+        let (pk, sk) = keys();
+        let wallet = crate::crypto::solana_derivation::eon_from_qnet_dilithium_pubkey(&pk).expect("eon");
+        let node = crate::rpc::generate_light_node_pseudonym(&wallet);
+        let msg = crate::node::BlockchainNode::chain_bind(&format!("claim_rewards:{}:{}", node, wallet));
+        assert_eq!(claim_quote_signer_ok(&node, &wallet, &sign(&sk, &msg), &pk), Ok(()));
+
+        let (foreign_pk, foreign_sk) = keys();
+        let foreign_sig = sign(&foreign_sk, &msg);
+        assert!(crate::rpc::verify_mobile_dilithium_signature(&msg, &foreign_sig, &foreign_pk), "it does verify");
+        assert_eq!(claim_quote_signer_ok(&node, &wallet, &foreign_sig, &foreign_pk), Err("key_not_wallet"));
+        // The wallet's key over another wallet's quote, or a signature over something else.
+        assert_eq!(claim_quote_signer_ok(&node, &wallet, &sign(&sk, "claim_rewards:x:y"), &pk), Err("bad_signature"));
+        assert_eq!(claim_quote_signer_ok(&node, &wallet, &foreign_sig, &pk), Err("bad_signature"));
     }
 }

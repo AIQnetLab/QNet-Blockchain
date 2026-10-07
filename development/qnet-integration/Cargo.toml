@@ -2,7 +2,7 @@
 name = "qnet-integration"
 version = "0.1.0"
 edition = "2021"
-authors = ["QNet Team"]
+authors = ["Orrery Group LLC"]
 description = "QNet blockchain integration node"
 license = "BUSL-1.1"
 
@@ -22,6 +22,7 @@ qnet-consensus = { path = "../../core/qnet-consensus" }
 qnet-mempool = { path = "../../core/qnet-mempool" }
 qnet-sharding = { path = "../../core/qnet-sharding" }
 qnet-vm = { path = "../../core/qnet-vm" }  # smart-contract VM (P2 dry-run; inert on apply)
+qnet-device-attest = { path = "../../core/qnet-device-attest" }  # phone/tablet hardware evidence (device layer; no consensus)
 
 # Async runtime
 tokio = { version = "1.35", features = ["full"] }
@@ -141,6 +142,8 @@ criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 tempfile = "3.8.1"
 proptest = "1.4"
 proptest-derive = "0.4"
+# P-256 device signatures in the device-layer tests (already in the tree through the TLS stack)
+ring = "0.17"
 
 # Production build profiles are defined in workspace Cargo.toml
 

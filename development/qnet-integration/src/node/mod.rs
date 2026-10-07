@@ -12,6 +12,7 @@ mod committee;
 mod state_apply;
 
 mod rewards;
+mod device;
 
 /// Concatenated source of every file in this module. Source-scanning invariant tests use it
 /// so a method moving between submodules cannot silently disarm them.
@@ -20,7 +21,7 @@ mod rewards;
 /// directory on disk.
 #[cfg(test)]
 pub(crate) fn node_sources_manifest() -> &'static [&'static str] {
-    &["mod.rs", "activation.rs", "committee.rs", "consensus.rs", "leader.rs", "lifecycle.rs",
+    &["mod.rs", "activation.rs", "committee.rs", "consensus.rs", "device.rs", "leader.rs", "lifecycle.rs",
       "monitoring.rs", "production.rs", "registration.rs", "rewards.rs", "state_apply.rs",
       "sync.rs", "transactions.rs"]
 }
@@ -32,6 +33,7 @@ pub(crate) fn node_sources() -> String {
         include_str!("activation.rs"),
         include_str!("committee.rs"),
         include_str!("consensus.rs"),
+        include_str!("device.rs"),
         include_str!("leader.rs"),
         include_str!("lifecycle.rs"),
         include_str!("monitoring.rs"),
@@ -104,6 +106,28 @@ pub const MIN_COMPATIBLE_VERSION: u32 = 1;  // Minimum version we can work with
 /// See the BFT SCALING ARCHITECTURE block above for the full pipeline.
 pub const MAX_VALIDATORS: usize = 1000;
 pub const ROTATION_INTERVAL_BLOCKS: u64 = 30; // Producer rotation every 30 blocks
+/// Last height whose producer candidates are the static genesis roster: from 181 they come from macroblock N-2.
+pub const GENESIS_STATIC_ROSTER_LAST_HEIGHT: u64 = 180;
+
+/// The 30-block leader tenure a slot belongs to: slots 1..=30 are tenure 0, 31..=60 tenure 1.
+pub(crate) fn tenure_of(h: u64) -> u64 { h.saturating_sub(1) / ROTATION_INTERVAL_BLOCKS }
+
+/// First slot of the tenure `h` belongs to.
+pub(crate) fn tenure_first_slot(h: u64) -> u64 {
+    tenure_of(h).saturating_mul(ROTATION_INTERVAL_BLOCKS).saturating_add(1)
+}
+
+/// Does slot `h` run on the tenure-bound failover rules? Read at the tenure's FIRST slot, so a tenure never
+/// changes rules halfway through.
+pub(crate) fn failover_tenure_bound(h: u64) -> bool {
+    qnet_state::feature_gates::is_active(qnet_state::feature_gates::id::FAILOVER_TENURE_BOUND, tenure_first_slot(h))
+}
+
+/// Does a genesis node producing `next_h` wait for every genesis to register first? Only while candidates come
+/// from the static roster: above it they come from macroblock N-2, and the wait only keeps a restarted node out.
+pub(crate) fn registry_wait_applies(is_genesis: bool, next_h: u64) -> bool {
+    is_genesis && next_h <= GENESIS_STATIC_ROSTER_LAST_HEIGHT
+}
 #[allow(dead_code)]
 const MIN_BYZANTINE_NODES: usize = 4; // 3f+1 where f=1
 pub(crate) const SNAPSHOT_FULL_INTERVAL: u64 = 43200; // Full snapshot every 12 hours (43,200 microblocks = 480 macroblocks)
@@ -830,6 +854,13 @@ pub fn get_expected_producer(height: u64) -> Option<(String, u64)> {
     EXPECTED_PRODUCER_CACHE.read().get(&height).cloned()
 }
 
+/// Seeds the round-0 selection of one leadership round, as the election caches it.
+#[cfg(test)]
+pub(crate) fn test_seed_producer_selection(leadership_round: u64, round0: &str, candidates: &[&str]) {
+    producer_cache::CACHED_PRODUCER_SELECTION.insert(leadership_round,
+        (round0.to_string(), candidates.iter().map(|c| (c.to_string(), 0.7)).collect()));
+}
+
 /// Re-derive the deterministic leader for `height` at an ARBITRARY rotation round — the
 /// producer==leader hard-gate at ingest needs the leader for the BLOCK's claimed round, not
 /// our locally-cached round. Reuses the round-0 baseline `CACHED_PRODUCER_SELECTION` (round0
@@ -989,12 +1020,35 @@ pub(crate) fn microblock_signing_digest(mb: &qnet_state::MicroBlock) -> [u8; 32]
     )
 }
 
+const MICROBLOCK_SIG_HEX_PREFIX: &str = "dilithium3_v4:";
+
+/// A microblock's producer signature as the block at `height` carries it: the raw ML-DSA-65 bytes from
+/// the MICROBLOCK_SIG_RAW gate, `dilithium3_v4:<hex>` below it.
+pub(crate) fn encode_microblock_signature(height: u64, sig: &[u8]) -> Vec<u8> {
+    use qnet_state::feature_gates::{is_active, id};
+    if is_active(id::MICROBLOCK_SIG_RAW, height) {
+        sig.to_vec()
+    } else {
+        format!("{}{}", MICROBLOCK_SIG_HEX_PREFIX, hex::encode(sig)).into_bytes()
+    }
+}
+
+/// The detached signature in `wire`, if it is the form a block at `height` must carry. One form per
+/// height: a signature re-encoded into the other form is not a signature of that block.
+pub(crate) fn decode_microblock_signature(height: u64, wire: &[u8]) -> Option<Vec<u8>> {
+    use qnet_state::feature_gates::{is_active, id};
+    if is_active(id::MICROBLOCK_SIG_RAW, height) {
+        (wire.len() == pqcrypto_mldsa::mldsa65::signature_bytes()).then(|| wire.to_vec())
+    } else {
+        let sig_hex = std::str::from_utf8(wire).ok()?.strip_prefix(MICROBLOCK_SIG_HEX_PREFIX)?;
+        hex::decode(sig_hex).ok()
+    }
+}
+
 /// Block_Sig_v23.1 digest + detached ML-DSA-65 against the producer's registered VRF PK. h==0/genesis
 /// never reaches here (maybe_supersede early-returns h==0); relaunch-from-scratch has no legacy sigs.
 pub(crate) fn verify_microblock_producer_sig_sync(storage: &Storage, mb: &qnet_state::MicroBlock) -> bool {
-    let sig_str = match std::str::from_utf8(&mb.signature) { Ok(s) => s, Err(_) => return false };
-    let sig_hex = match sig_str.strip_prefix("dilithium3_v4:") { Some(x) => x, None => return false };
-    let sig_bytes = match hex::decode(sig_hex) { Ok(b) => b, Err(_) => return false };
+    let sig_bytes = match decode_microblock_signature(mb.height, &mb.signature) { Some(b) => b, None => return false };
     let pk = match producer_verify_pk(storage, &mb.producer) { Some(p) => p, None => return false };
     let msg_hash = microblock_signing_digest(mb);
     use pqcrypto_mldsa::mldsa65 as dilithium3;
@@ -1104,9 +1158,9 @@ mod fix5_kat_tests {
         let pk_bytes = pk.as_bytes().to_vec();
         let from = crate::crypto::solana_derivation::eon_from_qnet_dilithium_pubkey_bytes(&pk_bytes).expect("eon");
         let tx = qnet_state::Transaction::new(
-            from.clone(), None, 0, 1, 10, 100_000, 1_700_000_000,
+            from.clone(), Some("c".to_string()), 0, 1, 10, 100_000, 1_700_000_000, None,
+            qnet_state::TransactionType::ContractCall,
             Some(r#"{"args":[],"contract":"c","method":"m"}"#.to_string()),
-            qnet_state::TransactionType::ContractCall, None,
         );
         let sign = |msg: &str| tx.clone().with_quantum_signature(
             Some(d3::detached_sign(msg.as_bytes(), &sk).as_bytes().to_vec()), Some(pk_bytes.clone()));
@@ -1197,6 +1251,397 @@ mod fix5_kat_tests {
         assert!(v("http://127.0.0.1:8001").is_err());
         assert!(v("http://192.168.1.4:8001").is_err());
         assert!(v("http://[fe80::1]:8001").is_err());
+    }
+}
+
+#[cfg(test)]
+mod signed_target_bound_tests {
+    // A transfer's payload and a call's target sit outside the signed preimage, so a relay's rewritten copy
+    // still verifies. From the tx_target_bound gate the producer evicts it (and the verify stage and apply
+    // refuse it through the same predicate); below the gate nothing changes.
+    use super::{BlockchainNode, TxPrep};
+    use pqcrypto_mldsa::mldsa65 as d3;
+    use pqcrypto_traits::sign::{PublicKey as PkT, DetachedSignature as SigT};
+
+    const GATE: u64 = qnet_state::feature_gates::TX_TARGET_BOUND_GATE_HEIGHT;
+
+    fn eon() -> String {
+        crate::crypto::solana_derivation::eon_from_qnet_dilithium_pubkey_bytes(d3::keypair().0.as_bytes()).expect("eon")
+    }
+
+    /// Signs `tx` with a fresh wallet key and returns it with `from` set to that wallet.
+    fn signed(build: impl Fn(&str) -> qnet_state::Transaction) -> qnet_state::Transaction {
+        let (pk, sk) = d3::keypair();
+        let from = crate::crypto::solana_derivation::eon_from_qnet_dilithium_pubkey_bytes(pk.as_bytes()).expect("eon");
+        let tx = build(&from);
+        let sig = d3::detached_sign(BlockchainNode::build_canonical_verify_message(&tx).as_bytes(), &sk);
+        tx.with_quantum_signature(Some(sig.as_bytes().to_vec()), Some(pk.as_bytes().to_vec()))
+    }
+
+    fn prepared(tx: &qnet_state::Transaction, height: u64) -> &'static str {
+        match BlockchainNode::producer_tx_prepare(tx, &qnet_state::State::new(), false, height) {
+            TxPrep::Admit => "admit",
+            TxPrep::Evict => "evict",
+            TxPrep::Defer => "defer",
+            TxPrep::Verify(_) => "verify",
+        }
+    }
+
+    #[test]
+    fn a_rewritten_transfer_payload_still_verifies_but_is_refused() {
+        let to = eon();
+        let honest = signed(|from| qnet_state::Transaction::new(
+            from.to_string(), Some(to.clone()), 1_000_000_000, 1, 10, 10_000, 1_700_000_000, None,
+            qnet_state::TransactionType::Transfer { from: from.to_string(), to: to.clone(), amount: 1_000_000_000 },
+            None,
+        ));
+        let mut rewritten = honest.clone();
+        rewritten.tx_type = qnet_state::TransactionType::Transfer {
+            from: honest.from.clone(), to: eon(), amount: 9_000_000_000,
+        };
+        rewritten.hash = rewritten.calculate_hash();
+
+        assert!(BlockchainNode::verify_user_tx_dilithium_at(&rewritten, GATE),
+                "the payload is outside the preimage: the signature alone cannot catch the rewrite");
+        assert_eq!(rewritten.validate(), Ok(()), "nor does validate(): the rule is the gated check");
+        assert!(BlockchainNode::target_bound_admissible(&rewritten, GATE).is_err(), "refused at the door");
+        assert!(BlockchainNode::target_bound_admissible(&rewritten, GATE - 1).is_ok());
+        assert!(BlockchainNode::target_bound_admissible(&honest, GATE).is_ok());
+        assert_eq!(prepared(&rewritten, GATE), "evict", "the producer drops it from the gate");
+        assert_eq!(prepared(&rewritten, GATE - 1), "verify", "below the gate the old rule stands");
+        assert_eq!(prepared(&honest, GATE), "verify");
+    }
+
+    #[test]
+    fn a_retargeted_call_still_verifies_but_is_refused() {
+        let token_a = eon();
+        let honest = signed(|from| qnet_state::Transaction::new(
+            from.to_string(), Some(token_a.clone()), 0, 1, 10, 200_000, 1_700_000_000, None,
+            qnet_state::TransactionType::ContractCall,
+            Some(format!(r#"{{"args":["{}","100"],"contract":"{}","method":"transfer"}}"#, eon(), token_a)),
+        ));
+        let mut retargeted = honest.clone();
+        retargeted.to = Some(eon());
+        retargeted.hash = retargeted.calculate_hash();
+
+        assert!(BlockchainNode::verify_user_tx_dilithium_at(&retargeted, GATE),
+                "tx.to is outside the preimage: the signature alone cannot catch the retarget");
+        assert_eq!(retargeted.validate(), Ok(()));
+        assert!(BlockchainNode::target_bound_admissible(&retargeted, GATE).is_err(), "refused at the door");
+        assert!(BlockchainNode::target_bound_admissible(&retargeted, GATE - 1).is_ok());
+        assert!(BlockchainNode::target_bound_admissible(&honest, GATE).is_ok());
+        assert_eq!(prepared(&retargeted, GATE), "evict");
+        assert_eq!(prepared(&retargeted, GATE - 1), "verify");
+        assert_eq!(prepared(&honest, GATE), "verify");
+    }
+
+    /// The in-crate builders outside the RPC keep the payload equal to the header. Genesis is judged at height
+    /// 0, below every gate (its allocations carry a `data` note the gated rule would refuse); both benchmark
+    /// generators pass from the gate.
+    #[test]
+    fn genesis_and_benchmark_transfers_pass_from_the_gate() {
+        let genesis = crate::genesis::create_genesis_block(crate::genesis::GenesisConfig {
+            accounts: vec![(eon(), 5), (eon(), 7)], timestamp: 1_700_000_000, network: "test".to_string(),
+        }).expect("genesis");
+        let transfers = genesis.transactions.iter()
+            .filter(|t| matches!(t.tx_type, qnet_state::TransactionType::Transfer { .. })).count();
+        assert_eq!(transfers, 2, "one allocation per account");
+        for tx in &genesis.transactions {
+            assert_eq!(tx.check_signed_target_bound(genesis.height), Ok(()), "{:?}", tx.tx_type);
+            if let qnet_state::TransactionType::Transfer { to, amount, .. } = &tx.tx_type {
+                assert_eq!((tx.to.as_deref(), tx.amount), (Some(to.as_str()), *amount), "payload equals header");
+            }
+        }
+        assert_eq!(genesis.height, 0);
+        let pq = [crate::benchmark::PqBenchmarkAccount::new(0), crate::benchmark::PqBenchmarkAccount::new(1)];
+        let tx = crate::benchmark::generate_pq_transaction_from_snapshot(&pq).expect("pq benchmark tx");
+        assert_eq!(tx.check_signed_target_bound(GATE), Ok(()));
+        let plain = [crate::benchmark::BenchmarkAccount::new(0), crate::benchmark::BenchmarkAccount::new(1)];
+        let tx = crate::benchmark::BenchmarkManager::generate_transaction_from_snapshot(&plain).expect("benchmark tx");
+        assert_eq!(tx.check_signed_target_bound(GATE), Ok(()));
+    }
+
+    /// Any peer could forge an activation for a victim wallet: unsigned (the form a Byzantine producer packs)
+    /// or under a junk envelope key. The producer admits both today; from the gate it evicts them, and the
+    /// doors refuse them. The rule lives in the shared predicate, not in the system-TX bind gate.
+    #[test]
+    fn a_forged_activation_is_evicted_from_the_gate() {
+        let victim = eon();
+        let p2 = qnet_state::transaction::phase2_entry_floor_nano(&qnet_state::NodeType::Super);
+        let unsigned = qnet_state::Transaction::new(victim.clone(), None, 0, 1, 0, 0, 1_700_000_000, None,
+            qnet_state::TransactionType::NodeActivation {
+                node_type: qnet_state::NodeType::Super, amount: p2, phase: qnet_state::account::ActivationPhase::Phase2,
+            }, None);
+        let mut junk = unsigned.clone();
+        junk.dilithium_signature = Some(b"dilithium_sig_x_AAAA".to_vec());
+        junk.dilithium_public_key = Some(b"x".to_vec());
+        for tx in [&unsigned, &junk] {
+            assert_eq!(prepared(tx, GATE - 1), "admit", "below the gate the producer admits it unverified");
+            assert_eq!(prepared(tx, GATE), "evict");
+            assert!(BlockchainNode::target_bound_admissible(tx, GATE).is_err());
+            assert!(BlockchainNode::target_bound_admissible(tx, GATE - 1).is_ok());
+            assert_eq!(BlockchainNode::verify_system_tx_binds(tx, GATE), Ok(()), "not where the rule lives");
+        }
+    }
+
+    /// The only builder stops arming an activation at the same gate id every judge reads.
+    #[test]
+    fn the_builder_stops_arming_from_the_gate() {
+        use crate::activation_validation::BlockchainActivationRegistry as R;
+        assert!(!R::onchain_activation_retired(GATE - 1));
+        assert!(R::onchain_activation_retired(GATE));
+    }
+
+    /// A claim is signed over (to, timestamp, sha3(data)) only, so an inflated copy still passes the wallet
+    /// signature check. From the gate the producer evicts it; the honest claim (amount = its entries) passes.
+    #[test]
+    fn an_inflated_claim_is_evicted_from_the_gate() {
+        let (pk, sk) = d3::keypair();
+        let wallet = crate::crypto::solana_derivation::eon_from_qnet_dilithium_pubkey_bytes(pk.as_bytes()).expect("eon");
+        let data = r#"{"claims":[{"epoch":7,"amount":100,"proof":[]},{"epoch":8,"amount":20,"proof":[]}]}"#;
+        let msg = BlockchainNode::claim_sign_message(&wallet, data, 1_780_000_000);
+        let sig = hex::encode(d3::detached_sign(msg.as_bytes(), &sk).as_bytes());
+        let honest = crate::rpc::merkle_claim_tx(&wallet, data, &sig, Some(&hex::encode(pk.as_bytes())), 1_780_000_000)
+            .expect("summable payload");
+        assert_eq!(honest.amount, 120);
+        assert!(BlockchainNode::claim_authorized(&honest, &wallet, data));
+        assert_eq!(prepared(&honest, GATE), "admit");
+
+        let mut inflated = honest.clone();
+        inflated.amount = 1_000_000_000_000_000_000;
+        inflated.hash = inflated.calculate_hash();
+        assert!(BlockchainNode::claim_authorized(&inflated, &wallet, data), "the amount is outside the signature");
+        assert_eq!(prepared(&inflated, GATE - 1), "admit");
+        assert_eq!(prepared(&inflated, GATE), "evict");
+        assert!(BlockchainNode::target_bound_admissible(&inflated, GATE).is_err());
+    }
+
+    /// Both doors check what a batch actually debits (its transfers), not the envelope apply never reads.
+    #[test]
+    fn the_doors_check_what_a_batch_debits() {
+        let batch = qnet_state::Transaction::new(eon(), Some("batch_transfers".to_string()), 0, 1, 1, 20_000, 0, None,
+            qnet_state::TransactionType::BatchTransfers {
+                transfers: vec![
+                    qnet_state::transaction::BatchTransferData { to_address: eon(), amount: 3, memo: None },
+                    qnet_state::transaction::BatchTransferData { to_address: eon(), amount: 4, memo: None },
+                ],
+                batch_id: "b".to_string(),
+            }, None);
+        assert_eq!(BlockchainNode::debited_value(&batch), Some(7), "the envelope says 0, the transfers 7");
+        let mut overflow = batch.clone();
+        if let qnet_state::TransactionType::BatchTransfers { transfers, .. } = &mut overflow.tx_type {
+            transfers[0].amount = u64::MAX;
+        }
+        assert_eq!(BlockchainNode::debited_value(&overflow), None);
+        let transfer = qnet_state::Transaction::new(eon(), Some(eon()), 5, 1, 1, 10_000, 0, None,
+            qnet_state::TransactionType::Transfer { from: eon(), to: eon(), amount: 5 }, None);
+        assert_eq!(BlockchainNode::debited_value(&transfer), Some(5));
+    }
+
+    /// The node's fee-free lifecycle builders write exactly the notes the gated rule rebuilds, so their TXs pass
+    /// from the gate; a relay's padded copy still verifies under the node's signature but is refused there.
+    #[test]
+    fn lifecycle_builders_pass_the_gate_and_a_padded_copy_does_not() {
+        use pqcrypto_traits::sign::SecretKey as SkT;
+        let (pk, sk) = d3::keypair();
+        let identity = crate::crypto::vrf::WalletIdentity::from_seed_and_keys(
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+            pk.as_bytes().to_vec(), sk.as_bytes().to_vec()).expect("identity");
+        let node_id = "super_lifecycle_gate";
+        let mut react = BlockchainNode::create_node_reactivation_tx(node_id, 100, &"cd".repeat(32), 2, "http://203.0.113.7:8001");
+        BlockchainNode::sign_reactivation_tx(&mut react, node_id, Some(&identity));
+        assert_eq!(react.check_signed_target_bound(GATE), Ok(()));
+        let mut padded = react.clone();
+        padded.data = Some(format!("{}{}", react.data.clone().unwrap_or_default(), "pad".repeat(1000)));
+        padded.hash = padded.calculate_hash();
+        assert!(BlockchainNode::verify_node_lifecycle_dilithium(&padded), "the note is outside the signature");
+        assert!(BlockchainNode::target_bound_admissible(&padded, GATE).is_err(), "refused at the door");
+        assert!(padded.check_signed_target_bound(GATE).is_err(), "and at the verify stage and apply");
+        assert_eq!(padded.check_signed_target_bound(GATE - 1), Ok(()));
+        // A replacement naming a victim and a value history would show: still verifies, refused from the gate.
+        let mut receipt = react.clone();
+        receipt.to = Some(eon());
+        receipt.amount = 1_000_000_000_000_000_000;
+        receipt.hash = receipt.calculate_hash();
+        assert!(BlockchainNode::verify_node_lifecycle_dilithium(&receipt), "to and amount are outside the signature");
+        assert!(BlockchainNode::target_bound_admissible(&receipt, GATE).is_err());
+        assert!(BlockchainNode::target_bound_admissible(&receipt, GATE - 1).is_ok());
+
+        // Signed as the emitter does (lifecycle): the envelope key field carries the signer's label, which is
+        // also its `from`. A backup owner signs another shard's bitmap as itself.
+        let mut bitmap = BlockchainNode::create_light_node_bitmap_tx("genesis_node_002", "genesis_node_003", 5, &[0, 3, 7], 13)
+            .expect("bitmap tx");
+        bitmap.dilithium_signature = Some(b"dilithium_sig_genesis_node_003_AAAA".to_vec());
+        bitmap.dilithium_public_key = Some(b"genesis_node_003".to_vec());
+        assert_eq!(bitmap.check_signed_target_bound(GATE), Ok(()));
+        let mut own_shard = BlockchainNode::create_light_node_bitmap_tx("genesis_node_002", "genesis_node_002", 5, &[0, 3, 7], 13)
+            .expect("bitmap tx");
+        assert_eq!(own_shard.check_signed_target_bound(GATE), Ok(()), "unlabelled, the signer is the shard's genesis");
+        own_shard.dilithium_public_key = Some(b"genesis_node_003".to_vec());
+        assert!(own_shard.check_signed_target_bound(GATE).is_err(), "a label other than its `from`");
+
+        // The light client-submit shape (registration_api): the server builds the client form around the
+        // wallet's signature.
+        let wallet = eon();
+        let light_id = crate::rpc::generate_light_node_pseudonym(&wallet);
+        let mut light = BlockchainNode::create_node_registration_tx_with_timestamp(
+            &light_id, qnet_state::NodeType::Light, &wallet, "burn", "", Some(1_700_000_000));
+        light.data = Some(qnet_state::Transaction::client_registration_data(&light_id, &wallet, "burn"));
+        light.hash = light.calculate_hash();
+        assert_eq!(light.check_signed_target_bound(GATE), Ok(()));
+    }
+
+    /// A slashing proof authenticates itself through the headers it embeds; its envelope signature sits
+    /// outside the hash. A relay's copy with one byte attached keeps the honest hash: below the gate the
+    /// producer packs it unverified and every peer's verify stage then rejects the block over it. From the
+    /// gate the producer evicts it and the doors refuse it before the known-hash check, so the honest copy
+    /// still enters.
+    #[test]
+    fn a_proof_with_an_attached_signature_is_refused_from_the_gate() {
+        let header = |tag: u8| qnet_state::EquivocationHeader {
+            timestamp: 1_700_000_000, merkle_root: [tag; 32], previous_hash: [0u8; 32], state_root: [tag; 32],
+            vrf_output: None, timeout_round: 0, carried_baseline: 0, pk_digest: [0u8; 32], signature: vec![tag; 8],
+        };
+        let (header_a, header_b) = (header(1), header(2));
+        let evidence = super::BlockEquivocationEvidence {
+            hash_a: header_a.identity_hash(42, "super_proof_gate"), hash_b: header_b.identity_hash(42, "super_proof_gate"),
+            detected_ts: 0, header_a, header_b,
+        };
+        let (hash, bytes) = super::build_block_equivocation_tx(&(42, "super_proof_gate".to_string()), &evidence)
+            .expect("proof tx");
+        let honest: qnet_state::Transaction = bincode::deserialize(&bytes).expect("decode");
+        assert_eq!(honest.hash, hash);
+        assert_eq!(honest.check_signed_target_bound(GATE), Ok(()), "the detector's proof passes");
+        assert_eq!(prepared(&honest, GATE), "admit");
+        assert!(BlockchainNode::target_bound_admissible(&honest, GATE).is_ok());
+
+        let mut relayed = honest.clone();
+        relayed.dilithium_signature = Some(vec![0u8]);
+        assert_eq!(relayed.calculate_hash(), honest.hash, "the attached byte is outside the hash");
+        assert_eq!(prepared(&relayed, GATE - 1), "admit", "below the gate the producer packs it unverified");
+        assert_eq!(prepared(&relayed, GATE), "evict");
+        assert!(BlockchainNode::target_bound_admissible(&relayed, GATE).is_err());
+        assert!(BlockchainNode::target_bound_admissible(&relayed, GATE - 1).is_ok());
+    }
+
+    /// The genesis builder's registrations sit in block 0, judged at height 0, below every gate. From the
+    /// gate a copy (here with a new endpoint, in the client form, unsigned) is evicted by the producer and
+    /// refused by the doors, before the burn quorum's genesis exemption could accept it.
+    #[test]
+    fn a_genesis_registration_after_block_0_is_refused_from_the_gate() {
+        let txs = BlockchainNode::create_genesis_registration_txs();
+        assert!(!txs.is_empty());
+        for tx in &txs {
+            assert_eq!(tx.check_signed_target_bound(0), Ok(()), "block 0 replays");
+            let mut rewritten = tx.clone();
+            if let qnet_state::TransactionType::NodeRegistration { node_id, wallet_address, api_endpoint, .. } = &mut rewritten.tx_type {
+                *api_endpoint = "http://198.51.100.66:8001".to_string();
+                rewritten.data = Some(qnet_state::Transaction::client_registration_data(node_id, wallet_address, "genesis"));
+            }
+            rewritten.hash = rewritten.calculate_hash();
+            assert_eq!(prepared(&rewritten, GATE - 1), "admit", "below the gate the producer admits it unsigned");
+            assert_eq!(prepared(&rewritten, GATE), "evict");
+            assert!(BlockchainNode::target_bound_admissible(&rewritten, GATE).is_err());
+        }
+    }
+
+    fn rehashed(mut tx: qnet_state::Transaction, edit: impl FnOnce(&mut qnet_state::Transaction)) -> qnet_state::Transaction {
+        edit(&mut tx);
+        tx.hash = tx.calculate_hash();
+        tx
+    }
+
+    /// Censorship through the producer's one-TX-per-(from, nonce) rule: a relay renames a pending proof,
+    /// registration or bitmap to a user's (from, nonce) with gas_limit 1, which the old gas_limit-0 exemption
+    /// missed. System TXs lead the block, so the producer kept the copy and dropped the user's own TX, and
+    /// the post-save cleanup then marked that TX confirmed and removed it: lost at that producer, its nonce
+    /// never consumed, repeatable every block. Now a system TX is not counted (it never consumes a nonce),
+    /// a genuine duplicate is kept pooled rather than confirmed, and from the gate the copies are refused.
+    #[test]
+    fn a_system_copy_naming_a_users_nonce_no_longer_displaces_the_user() {
+        let (pk, sk) = d3::keypair();
+        let victim = crate::crypto::solana_derivation::eon_from_qnet_dilithium_pubkey_bytes(pk.as_bytes()).expect("eon");
+        let transfer = |amount: u64| {
+            let to = eon();
+            let tx = qnet_state::Transaction::new(victim.clone(), Some(to.clone()), amount, 5, 10, 10_000, 1_700_000_000, None,
+                qnet_state::TransactionType::Transfer { from: victim.clone(), to, amount }, None);
+            let sig = d3::detached_sign(BlockchainNode::build_canonical_verify_message(&tx).as_bytes(), &sk);
+            tx.with_quantum_signature(Some(sig.as_bytes().to_vec()), Some(pk.as_bytes().to_vec()))
+        };
+        let (own, second) = (transfer(1_000), transfer(2_000));
+        let as_victim = |t: &mut qnet_state::Transaction| { t.from = victim.clone(); t.nonce = 5; t.gas_limit = 1; };
+
+        let header = |tag: u8| qnet_state::EquivocationHeader {
+            timestamp: 1_700_000_000, merkle_root: [tag; 32], previous_hash: [0u8; 32], state_root: [tag; 32],
+            vrf_output: None, timeout_round: 0, carried_baseline: 0, pk_digest: [0u8; 32], signature: vec![tag; 8],
+        };
+        let (header_a, header_b) = (header(1), header(2));
+        let evidence = super::BlockEquivocationEvidence {
+            hash_a: header_a.identity_hash(42, "super_censor"), hash_b: header_b.identity_hash(42, "super_censor"),
+            detected_ts: 0, header_a, header_b,
+        };
+        let (_, bytes) = super::build_block_equivocation_tx(&(42, "super_censor".to_string()), &evidence).expect("proof tx");
+        let proof: qnet_state::Transaction = bincode::deserialize(&bytes).expect("decode");
+        let wallet = eon();
+        let light_id = crate::rpc::generate_light_node_pseudonym(&wallet);
+        let reg = rehashed(BlockchainNode::create_node_registration_tx_with_timestamp(
+            &light_id, qnet_state::NodeType::Light, &wallet, "burn", "", Some(1_700_000_000)),
+            |t| t.data = Some(qnet_state::Transaction::client_registration_data(&light_id, &wallet, "burn")));
+        let mut bitmap = BlockchainNode::create_light_node_bitmap_tx("genesis_node_002", "genesis_node_003", 5, &[0, 3, 7], 13)
+            .expect("bitmap tx");
+        bitmap.dilithium_public_key = Some(b"genesis_node_003".to_vec()); // the emitter's label, as it signs
+        let copies: Vec<qnet_state::Transaction> = [&proof, &reg, &bitmap].iter()
+            .map(|t| rehashed((*t).clone(), as_victim)).collect();
+
+        // The producer's block order: system TXs first, then the user's own TX and a duplicate it signed.
+        let mut txs: Vec<qnet_state::Transaction> = copies.clone();
+        txs.push(own.clone());
+        txs.push(second.clone());
+        let dropped = super::production::drop_duplicate_nonces(&mut txs);
+        assert_eq!(dropped, vec![second.hash.clone()], "only the user's own duplicate, kept pooled by the caller");
+        assert!(txs.iter().any(|t| t.hash == own.hash), "the user's TX stays in the block");
+        assert_eq!(txs.len(), copies.len() + 1);
+
+        // A NodeActivation does consume its sender's nonce (below the gate), so it is still counted.
+        let activation = qnet_state::Transaction::new(victim.clone(), None, 0, 5, 0, 1, 1_700_000_000, None,
+            qnet_state::TransactionType::NodeActivation {
+                node_type: qnet_state::NodeType::Light, amount: 0, phase: qnet_state::account::ActivationPhase::Phase1,
+            }, None);
+        let mut txs = vec![activation, own.clone()];
+        assert_eq!(super::production::drop_duplicate_nonces(&mut txs), vec![own.hash.clone()]);
+
+        // From the gate every copy is refused at the doors and evicted by the producer.
+        for (honest, copy) in [&proof, &reg, &bitmap].iter().zip(copies.iter()) {
+            assert!(BlockchainNode::target_bound_admissible(honest, GATE).is_ok(), "{:?}", honest.tx_type);
+            assert!(BlockchainNode::target_bound_admissible(copy, GATE - 1).is_ok(), "unchecked below the gate");
+            let err = BlockchainNode::tx_target_bound(copy, GATE).unwrap_err();
+            assert!(err.contains("system_envelope_unbound"), "{}", err);
+            assert!(BlockchainNode::target_bound_admissible(copy, GATE).is_err());
+            assert_eq!(prepared(copy, GATE), "evict", "{:?}", copy.tx_type);
+        }
+    }
+
+    /// The legacy `signature` sits outside the hash and every signature: a relay attached 16 KB to a pending
+    /// TX, kept its hash and its valid signature, and the bytes rode into blocks for free. From the gate the
+    /// doors refuse such a copy and the producer evicts it; the honest TX passes.
+    #[test]
+    fn a_legacy_signature_padded_copy_is_refused_from_the_gate() {
+        let to = eon();
+        let honest = signed(|from| qnet_state::Transaction::new(
+            from.to_string(), Some(to.clone()), 1_000, 1, 10, 10_000, 1_700_000_000, None,
+            qnet_state::TransactionType::Transfer { from: from.to_string(), to: to.clone(), amount: 1_000 },
+            None,
+        ));
+        let mut padded = honest.clone();
+        padded.signature = Some("x".repeat(16_384));
+        assert_eq!(padded.calculate_hash(), honest.hash, "outside the hash");
+        assert!(BlockchainNode::verify_user_tx_dilithium_at(&padded, GATE), "and outside the signature");
+        assert!(BlockchainNode::target_bound_admissible(&padded, GATE - 1).is_ok());
+        assert!(BlockchainNode::target_bound_admissible(&padded, GATE).is_err());
+        assert_eq!(prepared(&padded, GATE - 1), "verify");
+        assert_eq!(prepared(&padded, GATE), "evict");
+        assert!(BlockchainNode::target_bound_admissible(&honest, GATE).is_ok());
+        assert_eq!(prepared(&honest, GATE), "verify");
     }
 }
 
@@ -1390,11 +1835,20 @@ pub(crate) fn light_owner_deadlines(epoch: u64) -> [u64; 3] {
     [w, w * 2 / 3, w / 3]
 }
 
-/// Whether an owner stands down for a shard's epoch. The primary waits only for its own row, so a
-/// backup's partial cover landing first never keeps the primary's bits out of the OR-merge; a backup
-/// stands down on any row, so a healthy primary costs the backups nothing.
-pub(crate) fn light_owner_stands_down(rank: usize, own_row: bool, any_row: bool) -> bool {
-    if rank == 0 { own_row } else { any_row }
+/// Whether an owner stands down for a shard's epoch: once its own row is on chain, and a backup also once the
+/// committed OR of the shard's rows holds every node it took an answer of (`missing`, `light_missing_bits`;
+/// None while not yet compared). A backup that stood down on any row lost every answer only it held: the
+/// primary restarted or was down when the device answered, the relay to it was lost, and the device never
+/// answers a counted epoch again. A backup's row carries only the bits the OR lacks.
+pub(crate) fn light_owner_stands_down(rank: usize, own_row: bool, missing: Option<usize>) -> bool {
+    own_row || (rank > 0 && missing == Some(0))
+}
+
+/// The indices of `eligible` whose bit the committed OR of the shard's rows (`committed`, bit i = reg_index i)
+/// does not hold: what a backup still commits.
+pub(crate) fn light_missing_bits(eligible: &[u32], committed: Option<&[u8]>) -> Vec<u32> {
+    let held = |i: u32| committed.and_then(|bm| bm.get(i as usize / 8)).map_or(false, |b| b & (1 << (i % 8)) != 0);
+    eligible.iter().copied().filter(|i| !held(*i)).collect()
 }
 
 /// The roster is frozen when the window opens, never inside it. Bit positions are permanent reg_index
@@ -2105,6 +2559,15 @@ pub(crate) fn may_sign(height: u64, round: u64,
                        highest_h: u64, last_w: u64, last_r: u64, last_h: u64) -> bool {
     height > highest_h
         || (window_of_height(height) == last_w && (round, height) > (last_r, last_h))
+}
+
+/// May this node sign `round` at `height`? Equivocation is two bodies at one (height, absolute round), so a pair is new
+/// exactly when nothing at that height was signed at this round or above. Heights at or below `record_floor` carry no
+/// record (pruned at finality, or signed before the record existed) and keep the height-only rule. The window term of
+/// `may_sign` is gone: a node that signed up to X in one window and was rolled back into the window before could never
+/// sign there again (04.10, and 627483 on 07.09). From the failover_tenure_bound gate.
+pub(crate) fn may_sign_exact(height: u64, round: u64, highest_h: u64, record_floor: u64, signed_at: Option<u64>) -> bool {
+    if height > record_floor { signed_at.map_or(true, |r| round > r) } else { height > highest_h }
 }
 
 // v3.33: FORMAL FINALITY — blocks at or below this height are IRREVERSIBLE.
@@ -2881,39 +3344,6 @@ pub struct BlockEquivocationEvidence {
 pub static BLOCK_EQUIVOCATION_EVIDENCE: once_cell::sync::Lazy<DashMap<(u64, String), BlockEquivocationEvidence>> =
     once_cell::sync::Lazy::new(|| DashMap::new());
 
-/// THE block-identity digest for equivocation — the fields that make two blocks DIFFERENT blocks.
-///
-/// Byte-identical to `MicroBlock::hash`'s field set, deliberately: the storage anti-fork guard
-/// produces the evidence when those hashes differ, and the on-chain acceptor decides the ban from it.
-/// If the two ever disagree, one of them is wrong about what a block IS.
-///
-/// It must NOT compare the signature or the VRF proof. Both are randomised ML-DSA outputs, so an
-/// honest producer re-emitting the same block after a rollback signs different bytes over the same
-/// digest — comparing them would turn a normal restart into a permanent, chain-committed ban.
-pub(crate) fn equivocation_identity_hash(
-    height: u64,
-    producer_id: &str,
-    h: &qnet_state::EquivocationHeader,
-) -> [u8; 32] {
-    let mut hasher = Sha3_256::new();
-    hasher.update(&height.to_le_bytes());
-    hasher.update(&h.timestamp.to_le_bytes());
-    hasher.update(&h.previous_hash);
-    hasher.update(&h.merkle_root);
-    hasher.update(producer_id.as_bytes());
-    hasher.update(&h.timeout_round.to_le_bytes());
-    hasher.update(&h.carried_baseline.to_le_bytes());
-    // Mirrors MicroBlock::hash, which binds state_root. Without it a state-root-only fork folds
-    // pin-identical inputs on both sides — same txs, same merkle_root, deterministic timestamp,
-    // and vrf_output is None in production — so hash_a == hash_b and the evidence is discarded
-    // before it can be recorded. The fork would be rejected but never slashable.
-    hasher.update(&h.state_root);
-    qnet_state::block::fold_vrf_output(&mut hasher, &h.vrf_output);
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&hasher.finalize());
-    out
-}
-
 /// Records a block-equivocation offence for the next macroblock's slashing list.
 ///
 /// Idempotent on (height, producer_id) — the first detection wins. Subsequent
@@ -2936,8 +3366,8 @@ pub fn record_block_equivocation(
         != header_b.timeout_round.saturating_add(header_b.carried_baseline) {
         return;
     }
-    let hash_a = equivocation_identity_hash(height, producer_id, &header_a);
-    let hash_b = equivocation_identity_hash(height, producer_id, &header_b);
+    let hash_a = header_a.identity_hash(height, producer_id);
+    let hash_b = header_b.identity_hash(height, producer_id);
     if hash_a == hash_b {
         return; // Same block — not equivocation.
     }
@@ -2990,9 +3420,10 @@ fn build_block_equivocation_tx(
     } else {
         (ev.header_b.clone(), ev.header_a.clone())
     };
+    // Every envelope field below is what the tx_target_bound rule pins: nothing signs them.
     let mut tx = qnet_state::Transaction {
         hash: String::new(),
-        from: "system_slashing".to_string(),
+        from: qnet_state::transaction::SLASHING_SENDER.to_string(),
         to: None,
         amount: 0,
         nonce: 0,
@@ -3339,6 +3770,40 @@ pub fn observe_checkpoint_vote(index: u64, voter: &str, checkpoint_hash: [u8; 32
     }
 }
 
+/// Canonical `VoteEquivocationProof` TX for one piece of evidence, whose checkpoints are already in canonical
+/// order (smaller hash first, as the detector records them). Every envelope field is what the tx_target_bound
+/// rule pins, since nothing signs them: SLASHING_SENDER, nonce and gas zero, and checkpoint_a's timestamp (the
+/// round-agreed head time, no wall clock), so every detector builds the same bytes.
+fn build_vote_equivocation_tx(offender: &str, ev: VoteEquivocationEvidence) -> qnet_state::Transaction {
+    let ts = bincode::deserialize::<qnet_consensus::checkpoint_bft::Checkpoint>(&ev.checkpoint_a)
+        .map(|c| c.timestamp).unwrap_or(0);
+    let mut tx = qnet_state::Transaction {
+        hash: String::new(),
+        from: qnet_state::transaction::SLASHING_SENDER.to_string(),
+        to: None,
+        amount: 0,
+        nonce: 0,
+        gas_price: 0,
+        gas_limit: 0,
+        timestamp: ts,
+        signature: None,
+        public_key: None,
+        tx_type: qnet_state::TransactionType::VoteEquivocationProof {
+            offender: offender.to_string(),
+            checkpoint_a: ev.checkpoint_a,
+            signature_a: ev.sig_a,
+            checkpoint_b: ev.checkpoint_b,
+            signature_b: ev.sig_b,
+        },
+        data: None,
+        dilithium_signature: None,
+        dilithium_public_key: None,
+        chain_id: qnet_state::transaction::QNET_CHAIN_ID,
+    };
+    tx.hash = tx.calculate_hash();
+    tx
+}
+
 /// Drains pending vote-equivocation evidence into canonical `VoteEquivocationProof` system TXs
 /// for the block this node is producing (block-level, never gossiped — same model as block
 /// equivocation). Deterministic TX bytes (canonical checkpoint order + checkpoint_a.timestamp,
@@ -3352,33 +3817,7 @@ pub fn drain_vote_equivocation_proof_txs(max: usize) -> Vec<(String, Vec<u8>)> {
     for key in keys {
         let ev = match VOTE_EQUIVOCATION_EVIDENCE.get(&key) { Some(v) => v.clone(), None => continue };
         let offender = key.1.clone();
-        // Deterministic timestamp from the canonical first checkpoint (the round-agreed head ts).
-        let ts = bincode::deserialize::<qnet_consensus::checkpoint_bft::Checkpoint>(&ev.checkpoint_a)
-            .map(|c| c.timestamp).unwrap_or(0);
-        let mut tx = qnet_state::Transaction {
-            hash: String::new(),
-            from: "system_slashing".to_string(),
-            to: None,
-            amount: 0,
-            nonce: 0,
-            gas_price: 0,
-            gas_limit: 0,
-            timestamp: ts,
-            signature: None,
-            public_key: None,
-            tx_type: qnet_state::TransactionType::VoteEquivocationProof {
-                offender: offender.clone(),
-                checkpoint_a: ev.checkpoint_a,
-                signature_a: ev.sig_a,
-                checkpoint_b: ev.checkpoint_b,
-                signature_b: ev.sig_b,
-            },
-            data: None,
-            dilithium_signature: None,
-            dilithium_public_key: None,
-            chain_id: qnet_state::transaction::QNET_CHAIN_ID,
-        };
-        tx.hash = tx.calculate_hash();
+        let tx = build_vote_equivocation_tx(&offender, ev);
         match bincode::serialize(&tx) {
             Ok(bytes) => {
                 let tx_hash = tx.hash.clone();
@@ -3784,14 +4223,14 @@ pub static HALT_REQUESTED: std::sync::atomic::AtomicBool =
 // handles per-peer flow control at the transport level. No consensus-layer
 // backpressure state is needed.
 
-// Stall-driven timeout-vote emission throttle. Per-mb_idx last-emission
-// timestamp; the stall detector re-emits emit_macroblock_view_change_vote
-// at most once per STALL_GRACE_SECS/mb/node, bounding gossip during a stall
+// Stall-driven timeout-vote emission throttle. Per-failover-key last-emission
+// timestamp; the stall detector re-emits emit_failover_vote
+// at most once per STALL_GRACE_SECS/key/node, bounding gossip during a stall
 // at any committee size. Purely an efficiency guard — receiver-side
 // TIMEOUT_VOTES enforces (height,round,voter) uniqueness, so duplicate
 // emissions can't affect the n−f count. Pruned by cleanup_old_timeout_data.
 pub static LAST_TIMEOUT_EMIT_PER_MB:
-    once_cell::sync::Lazy<dashmap::DashMap<u64, u64>> =
+    once_cell::sync::Lazy<dashmap::DashMap<crate::unified_p2p::FailoverKey, u64>> =
     once_cell::sync::Lazy::new(dashmap::DashMap::new);
 
 // v23.1: sticky leader per leadership-round view. Once a fallback
@@ -4363,9 +4802,6 @@ pub struct BlockchainNode {
     shard_coordinator: Option<Arc<qnet_sharding::ShardCoordinator>>,
     parallel_validator: Option<Arc<qnet_sharding::ParallelValidator>>,
     
-    // Archive replication manager for distributed storage
-    archive_manager: Arc<tokio::sync::RwLock<crate::archive_manager::ArchiveReplicationManager>>,
-    
     // Reward manager for lazy rewards system
     
     // PRODUCTION v2.96: Track HeartbeatCommitment TXs with confirmation status
@@ -4373,9 +4809,11 @@ pub struct BlockchainNode {
     // Replaces simple HashSet for retry mechanism support
     heartbeat_commitment_tracker: Arc<DashMap<u64, HeartbeatCommitmentStatus>>,
     
-    // PRODUCTION v2.78: Track BitmapCommitment TXs by epoch with confirmation + retry
-    // Same pattern as heartbeat_commitment_tracker for consistency
-    bitmap_commitment_tracker: Arc<DashMap<u64, HeartbeatCommitmentStatus>>,
+    // PRODUCTION v2.78: Track BitmapCommitment TXs with confirmation + retry.
+    // Keyed by (epoch, shard), not by epoch: an owner commits one bitmap per shard it covers, and a
+    // backup covers a second shard in the same epoch. The pair is typed rather than packed into one
+    // number so that a read cannot compare it against a bare epoch and silently match nothing.
+    bitmap_commitment_tracker: Arc<DashMap<(u64, usize), HeartbeatCommitmentStatus>>,
     
     // Parallel Executor for parallel transaction execution
     parallel_executor: Option<Arc<crate::parallel_executor::ParallelExecutor>>,
@@ -5044,7 +5482,10 @@ impl BlockchainNode {
         // v2.70: Use auto-format loader that handles both EfficientMicroBlock and legacy MicroBlock
         // EfficientMicroBlock stores only TX hashes - full TXs are in separate "transactions" CF
         // load_microblock_auto_format() reconstructs full block with transactions
-        match self.storage.load_microblock_auto_format(height) {
+        // Past the retention window the history archive answers, where this node keeps one.
+        let loaded = self.storage.load_microblock_auto_format(height)
+            .map(|b| b.or_else(|| self.storage.archived_block(height)));
+        match loaded {
             Ok(Some(microblock)) => {
                 // Convert MicroBlock to Block format for API compatibility
                 let block = qnet_state::Block {
@@ -5248,7 +5689,6 @@ impl Clone for BlockchainNode {
             consensus_nonce_storage: self.consensus_nonce_storage.clone(),
             shard_coordinator: self.shard_coordinator.clone(),
             parallel_validator: self.parallel_validator.clone(),
-            archive_manager: self.archive_manager.clone(),
             parallel_executor: self.parallel_executor.clone(),
             adaptive_bft: self.adaptive_bft.clone(),
             pre_execution: self.pre_execution.clone(),
@@ -5462,6 +5902,28 @@ mod tests {
         }
         assert!(include_str!("production.rs").contains("crate::node::commitment_backed_by_state(&state_snapshot, &key)"),
                 "the producer drops every class the state holds");
+    }
+
+    // SIGBIND-R1-01/02: both doors refuse a relay's copy (a pooled commitment re-minted from unsigned fields, a
+    // re-stamped pending transfer) before any verify, and the gossip door charges the registration rate slot
+    // only after every cheap refusal, right before the burn quorum's verifies.
+    #[test]
+    fn the_doors_refuse_copies_before_a_verify_and_charge_the_rate_slot_last() {
+        let src = include_str!("transactions.rs").replace("\r\n", "\n");
+        let rpc = &src[src.find("pub async fn submit_transaction(").unwrap()..];
+        let rpc = &rpc[..rpc.find("\n    }\n").unwrap()];
+        let at = |s: &str, pat: &str| s.find(pat).unwrap_or_else(|| panic!("missing {}", pat));
+        assert!(at(rpc, "self.pending_copy(&tx)?") < at(rpc, "verify_system_tx_binds("));
+        let gossip = &src[src.find("pub async fn validate_and_add_network_transaction(").unwrap()..];
+        let gossip = &gossip[..gossip.find("\n    }\n").unwrap()];
+        let copy = at(gossip, "match self.pending_copy(&tx)");
+        assert!(gossip.contains(r#"format!("already_known: {}", e)"#), "a streamed copy is answered as an echo, not logged");
+        let binds = at(gossip, "Self::verify_system_tx_binds(&tx");
+        let react = at(gossip, "Self::reactivation_key_admissible(&self.storage, &tx)");
+        let counter = at(gossip, "ACTIVATION_ADMIT_COUNTER.lock()");
+        let quorum = at(gossip, "Self::verify_burn_attestation_quorum(&tx, h, &self.storage)");
+        assert!(copy < binds && binds < counter && react < counter && counter < quorum,
+                "copy={} binds={} react={} counter={} quorum={}", copy, binds, react, counter, quorum);
     }
 
     // After a rewind the disk row of an account an undone block created is still that block's; a mark is
@@ -6743,6 +7205,7 @@ mod tests {
         let apply = src.find("block_timing h=").expect("inline apply timing");
         assert!(inflight < under_lock && under_lock < apply,
                 "both yields must precede the inline apply");
+        let _g = crate::block_pipeline::VERIFY_STAGE_TEST_LOCK.lock(); // a running verify stage raises the frontier
         crate::unified_p2p::note_block_verified(u64::MAX / 2);
         crate::unified_p2p::truncate_stored_height(1_000);
         assert!(crate::unified_p2p::highest_verified_height() <= 1_000,
@@ -7166,7 +7629,8 @@ mod tests {
         assert!(include_str!("../unified_p2p/dispatch.rs")
                     .contains(&format!("let present = crate::block_pipeline::{}(&storage, h)", "held_at_or_below_tip")),
                 "the range sync requests a height whose row is above the tip");
-        assert!(bp.contains(&format!("if !{} {{", "from_self")), "a block fed from disk asks no peer for its fed parent");
+        assert!(bp.contains(&format!("if !{} && !parent_waits_commit {{", "from_self")),
+                "a block fed from disk asks no peer for its fed parent, nor one whose parent waits for its own parent's commit");
         assert!(include_str!("../storage/blocks.rs").contains(&format!("let existing_mb = if {} >= height", "durable_tip")),
                 "equivocation evidence only against committed history");
     }
@@ -7312,6 +7776,40 @@ mod tests {
                 assert!(!src.contains(gone), "{} still has {}", name, gone);
             }
         }
+    }
+
+    // Every apply path asks for its boundary's proof view under the lock that applied the block,
+    // behind the block's rows and before the frontier moves or the journal is kept; the boot
+    // restore and the cold-join rehydrate ask for their anchor once its root is proven.
+    #[test]
+    fn the_apply_paths_request_a_proof_view_behind_their_rows() {
+        let pipe = include_str!("../block_pipeline.rs");
+        let rows = pipe.find("ctx.storage.mirror_block_delta(height, puts, dels)").expect("pipeline rows");
+        let pin = pipe.find("ctx.storage.request_boundary_pin(&state_guard, height)").expect("pipeline pin");
+        let view = pipe.find("ctx.storage.request_proof_view(&state_guard, height)").expect("pipeline view");
+        let frontier = pipe[rows..].find("LOCAL_BLOCKCHAIN_HEIGHT.fetch_max(height").expect("pipeline frontier") + rows;
+        assert!(rows < pin && pin < view && view < frontier, "pipeline: rows, pin, view, then the frontier");
+        let prod = include_str!("production.rs");
+        let prows = prod.find("storage.mirror_block_delta(height_for_storage, puts, dels)").expect("producer rows");
+        let pview = prod.find("storage.request_proof_view(&sg, height_for_storage)").expect("producer view");
+        let pjournal = prod.find("sg.retain_block_journal(journal)").expect("producer journal");
+        assert!(prows < pview && pview < pjournal, "producer: rows, view, journal");
+        let apply = include_str!("state_apply.rs");
+        let step = apply.find("fn replay_block_verified").expect("replay step");
+        let arows = apply[step..].find("storage.mirror_block_delta(mb.height, puts, dels)").expect("replayed rows");
+        let aview = apply[step..].find("storage.request_proof_view(sg, mb.height)").expect("replayed view");
+        let ajournal = apply[step..].find("sg.retain_block_journal(snap)").expect("replayed journal");
+        assert!(arows < aview && aview < ajournal, "replay: rows, view, journal");
+        let boot = include_str!("lifecycle.rs");
+        let verified = boot.find("snapshot_verified h=").expect("tier-1 verified arm");
+        let repaired = boot.find("snapshot_repaired_phantom h=").expect("tier-1 repaired arm");
+        let views: Vec<usize> = boot.match_indices("storage.request_proof_view(&state_guard, snapshot_height)").map(|(i, _)| i).collect();
+        assert_eq!(views.len(), 2, "both tier-1 arms ask for the anchor view");
+        assert!(views[0] > verified && views[1] > repaired, "each after its root is proven");
+        let snaps = include_str!("../storage/snapshots.rs");
+        let seeded = snaps.find("Verified — seed chain_state").expect("rehydrate verified");
+        let rview = snaps.find("self.request_proof_view(&sg, anchor_height)").expect("rehydrate view");
+        assert!(seeded < rview, "rehydrate: the anchor view after the root check");
     }
 
     // The node->wallet lookup answers from the registry row and nothing else. A chain walk behind a
@@ -7717,15 +8215,26 @@ mod tests {
         assert!(d[0] > d[1] && d[1] > d[2] && d[2] > 0, "each backup waits longer than the rank above it: {:?}", d);
     }
 
-    // The primary is silenced only by its own row, a backup by any row.
+    // The primary is silenced only by its own row; a backup by its own row or by an OR that already holds
+    // every node it took an answer of, never by any row alone (F2).
     #[test]
     fn light_owner_stand_down_depends_on_rank() {
-        assert!(!light_owner_stands_down(0, false, true), "a backup's row must not silence the primary");
-        assert!(light_owner_stands_down(0, true, true), "the primary stops once its own row landed");
+        assert!(!light_owner_stands_down(0, false, Some(0)), "a backup's row must not silence the primary");
+        assert!(light_owner_stands_down(0, true, None), "the primary stops once its own row landed");
         for rank in [1usize, 2] {
-            assert!(light_owner_stands_down(rank, false, true), "backup {} stands down on any row", rank);
-            assert!(!light_owner_stands_down(rank, false, false), "backup {} covers a shard with no row", rank);
+            assert!(light_owner_stands_down(rank, true, None), "backup {} stops once its own row landed", rank);
+            assert!(light_owner_stands_down(rank, false, Some(0)), "backup {}: the OR holds all it has", rank);
+            assert!(!light_owner_stands_down(rank, false, Some(1)), "backup {} adds what only it holds", rank);
+            assert!(!light_owner_stands_down(rank, false, None), "backup {} compares before it stands down", rank);
         }
+        // Backup holds {a, b}, the OR holds {a}: it commits {b}; the OR holds both: nothing.
+        let (a, b) = (3u32, 12u32);
+        let or_a = [1u8 << 3, 0];
+        assert_eq!(light_missing_bits(&[a, b], Some(&or_a)), vec![b]);
+        let or_ab = [1u8 << 3, 1u8 << 4];
+        assert!(light_missing_bits(&[a, b], Some(&or_ab)).is_empty());
+        assert_eq!(light_missing_bits(&[a, b], None), vec![a, b], "no row yet: everything it holds");
+        assert_eq!(light_missing_bits(&[200], Some(&or_ab)), vec![200], "past the OR's length: missing");
     }
 
     // Verify-before-serve invariant: the gate hasher (epoch_reward_merkle_root) MUST reproduce the exact
@@ -8476,7 +8985,12 @@ mod tests {
         hasher.update(&h.pk_digest);
         let digest = hasher.finalize();
         let sig = pqcrypto_mldsa::mldsa65::detached_sign(digest.as_ref(), sk);
-        format!("dilithium3_v4:{}", hex::encode(sig.as_bytes())).into_bytes()
+        // The wire form by hand too: raw bytes from the raw-signature gate, the hex string below it.
+        if height >= qnet_state::feature_gates::MICROBLOCK_SIG_RAW_GATE_HEIGHT {
+            sig.as_bytes().to_vec()
+        } else {
+            format!("dilithium3_v4:{}", hex::encode(sig.as_bytes())).into_bytes()
+        }
     }
 
     fn eqv_mk_checkpoint(node: &str, index: u64, mb: u8) -> qnet_consensus::checkpoint_bft::Checkpoint {
@@ -8626,6 +9140,66 @@ mod tests {
         b.signature = eqv_sign_block(&sk, h, node, &b);
         assert!(BlockchainNode::verify_equivocation_proof(&_st, node, h, &a, &b),
                 "a real same-height double-sign MUST verify (verifier non-vacuous)");
+    }
+
+    /// One wire form per height: hex below the raw-signature gate, the bare 3,309 bytes from it. A
+    /// signature re-encoded into the other form, or cut short, is not that height's signature.
+    #[test]
+    fn a_block_signature_has_one_wire_form_per_height() {
+        use pqcrypto_traits::sign::DetachedSignature as _;
+        let gate = qnet_state::feature_gates::MICROBLOCK_SIG_RAW_GATE_HEIGHT;
+        let (_pk, sk) = pqcrypto_mldsa::mldsa65::keypair();
+        let sig = pqcrypto_mldsa::mldsa65::detached_sign(b"digest", &sk).as_bytes().to_vec();
+
+        let hex_form = encode_microblock_signature(gate - 1, &sig);
+        assert!(hex_form.starts_with(b"dilithium3_v4:"));
+        assert_eq!(decode_microblock_signature(gate - 1, &hex_form), Some(sig.clone()));
+        assert_eq!(decode_microblock_signature(gate, &hex_form), None, "hex is not a signature from the gate on");
+
+        let raw_form = encode_microblock_signature(gate, &sig);
+        assert_eq!(raw_form, sig);
+        assert_eq!(raw_form.len() * 2 + "dilithium3_v4:".len(), hex_form.len());
+        assert_eq!(decode_microblock_signature(gate, &raw_form), Some(sig.clone()));
+        assert_eq!(decode_microblock_signature(gate - 1, &raw_form), None, "raw bytes are not a signature below the gate");
+        assert_eq!(decode_microblock_signature(gate, &raw_form[..raw_form.len() - 1]), None);
+    }
+
+    /// Past the gate a double sign is still proven, and a proof built from a re-encoded signature is not.
+    #[test]
+    fn eqv_raw_signatures_past_the_gate() {
+        let node = "eqv_test_blk_raw";
+        let (_st, _d) = eqv_storage();
+        let (_pk, sk) = eqv_gen_and_register(&_st, node);
+        let h = qnet_state::feature_gates::MICROBLOCK_SIG_RAW_GATE_HEIGHT;
+        let mut a = eqv_mk_header(1000, 1, 0);
+        let mut b = eqv_mk_header(1001, 2, 0);
+        a.signature = eqv_sign_block(&sk, h, node, &a);
+        b.signature = eqv_sign_block(&sk, h, node, &b);
+        assert_eq!(a.signature.len(), pqcrypto_mldsa::mldsa65::signature_bytes());
+        assert!(BlockchainNode::verify_equivocation_proof(&_st, node, h, &a, &b));
+        let mut hexed = b.clone();
+        hexed.signature = format!("dilithium3_v4:{}", hex::encode(&b.signature)).into_bytes();
+        assert!(!BlockchainNode::verify_equivocation_proof(&_st, node, h, &a, &hexed),
+                "a signature in the pre-gate form must not prove anything past the gate");
+    }
+
+    /// A block produced past the gate verifies in the tie-break and the pipeline checks alike, and the
+    /// same signature in the pre-gate hex form verifies in neither.
+    #[tokio::test]
+    async fn a_raw_signed_block_verifies_past_the_gate() {
+        use pqcrypto_traits::sign::DetachedSignature as _;
+        let node = "sig_raw_producer";
+        let (st, _d) = eqv_storage();
+        let (_pk, sk) = eqv_gen_and_register(&st, node);
+        let h = qnet_state::feature_gates::MICROBLOCK_SIG_RAW_GATE_HEIGHT;
+        let mut mb = qnet_state::MicroBlock::new(h, 1_000, [3u8; 32], vec![], node.to_string());
+        let sig = pqcrypto_mldsa::mldsa65::detached_sign(microblock_signing_digest(&mb).as_ref(), &sk);
+        mb.signature = encode_microblock_signature(h, sig.as_bytes());
+        assert!(verify_microblock_producer_sig_sync(&st, &mb));
+        assert_eq!(BlockchainNode::verify_microblock_signature(&st, &mb, node, None).await, Ok(true));
+        mb.signature = format!("dilithium3_v4:{}", hex::encode(sig.as_bytes())).into_bytes();
+        assert!(!verify_microblock_producer_sig_sync(&st, &mb));
+        assert_eq!(BlockchainNode::verify_microblock_signature(&st, &mb, node, None).await, Ok(false));
     }
 
     #[test]
@@ -8779,6 +9353,88 @@ mod tests {
         let forged = b"dilithium_sig_eqv_test_vote_forged_not_a_real_signature".to_vec();
         assert!(!BlockchainNode::verify_vote_equivocation_proof(&_st, node, &ba, &sa, &bb, &forged).await,
                 "a forged vote signature MUST NOT ban");
+    }
+
+    /// Flooding with one proof: nothing signs a proof's from, nonce, gas, timestamp or side order, so every
+    /// copy that varies one is another hash that still verifies, fee-free at top priority, and a proof never
+    /// expires. Below the tx_target_bound gate each copy is admissible; from it the doors refuse every copy
+    /// and the producer evicts it, while the detector's own proof, block or vote, passes. (The pool keeps one
+    /// pending proof per offender at any height: qnet-mempool's own tests.)
+    #[tokio::test]
+    async fn every_rewritten_copy_of_a_real_proof_still_verifies_but_is_refused_from_the_gate() {
+        const GATE: u64 = qnet_state::feature_gates::TX_TARGET_BOUND_GATE_HEIGHT;
+        let node = "eqv_test_envelope_copies";
+        let (st, _d) = eqv_storage();
+        let (pk, sk) = eqv_gen_and_register(&st, node);
+
+        let h = 100u64;
+        let mut a = eqv_mk_header(1000, 1, 0);
+        let mut b = eqv_mk_header(1001, 2, 0);
+        a.signature = eqv_sign_block(&sk, h, node, &a);
+        b.signature = eqv_sign_block(&sk, h, node, &b);
+        let ev = BlockEquivocationEvidence {
+            hash_a: a.identity_hash(h, node), hash_b: b.identity_hash(h, node), detected_ts: 0, header_a: a, header_b: b,
+        };
+        let (_, bytes) = build_block_equivocation_tx(&(h, node.to_string()), &ev).expect("block proof");
+        let block_proof: qnet_state::Transaction = bincode::deserialize(&bytes).expect("decode");
+
+        let ca = eqv_mk_checkpoint(node, 5, 7);
+        let mut cb = eqv_mk_checkpoint(node, 5, 8);
+        cb.timestamp = 1001; // so a proof stamped with the wrong side's time is caught
+        let (first, second) = if ca.hash() < cb.hash() { (ca, cb) } else { (cb, ca) };
+        let vote_proof = build_vote_equivocation_tx(node, VoteEquivocationEvidence {
+            checkpoint_a: bincode::serialize(&first).unwrap(), sig_a: eqv_sign_vote(node, &pk, &sk, first.hash()),
+            checkpoint_b: bincode::serialize(&second).unwrap(), sig_b: eqv_sign_vote(node, &pk, &sk, second.hash()),
+            detected_ts: 0,
+        });
+        assert_eq!(vote_proof.timestamp, first.timestamp);
+
+        let prepared = |tx: &qnet_state::Transaction, height: u64| matches!(
+            BlockchainNode::producer_tx_prepare(tx, &qnet_state::State::new(), false, height), TxPrep::Evict);
+        for honest in [&block_proof, &vote_proof] {
+            assert!(BlockchainNode::equivocation_proof_verified(&st, honest).await, "a real proof");
+            assert_eq!(BlockchainNode::tx_target_bound(honest, GATE), Ok(()), "{:?}", honest.tx_type);
+            assert!(BlockchainNode::target_bound_admissible(honest, GATE).is_ok());
+            assert!(!prepared(honest, GATE), "the producer keeps the detector's proof");
+        }
+
+        let victim = crate::crypto::solana_derivation::eon_from_qnet_dilithium_pubkey_bytes(&pk).expect("eon");
+        let rehash = |mut t: qnet_state::Transaction, edit: &dyn Fn(&mut qnet_state::Transaction)| {
+            edit(&mut t);
+            t.hash = t.calculate_hash();
+            t
+        };
+        let mut copies = Vec::new();
+        for honest in [&block_proof, &vote_proof] {
+            copies.push(rehash(honest.clone(), &|t| t.from = victim.clone()));
+            copies.push(rehash(honest.clone(), &|t| t.nonce = 1));
+            copies.push(rehash(honest.clone(), &|t| t.gas_price = 1));
+            copies.push(rehash(honest.clone(), &|t| t.gas_limit = 1));
+            copies.push(rehash(honest.clone(), &|t| t.timestamp += 1));
+        }
+        copies.push(rehash(block_proof.clone(), &|t| {
+            if let qnet_state::TransactionType::EquivocationProof { block_a, block_b, .. } = &mut t.tx_type {
+                std::mem::swap(block_a, block_b);
+                t.timestamp = block_a.timestamp;
+            }
+        }));
+        copies.push(rehash(vote_proof.clone(), &|t| {
+            if let qnet_state::TransactionType::VoteEquivocationProof { checkpoint_a, signature_a, checkpoint_b, signature_b, .. } = &mut t.tx_type {
+                std::mem::swap(checkpoint_a, checkpoint_b);
+                std::mem::swap(signature_a, signature_b);
+            }
+            t.timestamp = second.timestamp;
+        }));
+        let mut seen: std::collections::HashSet<String> = [&block_proof, &vote_proof].iter().map(|t| t.hash.clone()).collect();
+        for copy in &copies {
+            assert!(seen.insert(copy.hash.clone()), "a new hash: {:?}", copy.tx_type);
+            assert!(BlockchainNode::equivocation_proof_verified(&st, copy).await, "that still verifies");
+            assert!(BlockchainNode::target_bound_admissible(copy, GATE - 1).is_ok(), "admissible below the gate");
+            let err = BlockchainNode::tx_target_bound(copy, GATE).unwrap_err();
+            assert!(err.contains("system_envelope_unbound"), "{}", err);
+            assert!(BlockchainNode::target_bound_admissible(copy, GATE).is_err());
+            assert!(prepared(copy, GATE), "the producer evicts it");
+        }
     }
 
     // ═════════════════════════════════════════════════════════════════════════
@@ -9346,6 +10002,1403 @@ mod tests {
         // committee None, post-genesis ⇒ MUST reject (not genesis-fallback-accept).
         assert!(BlockchainNode::verify_burn_attestation_quorum(&tx, 300, &storage).await.is_err(),
             "post-genesis without N-2 committee must REJECT, not fall back to the genesis set");
+    }
+
+    const TARGET_GATE: u64 = qnet_state::feature_gates::TX_TARGET_BOUND_GATE_HEIGHT;
+
+    /// A native super registration in the client form, signed by its wallet key: vrf_pk and the endpoint
+    /// sit under that signature.
+    fn native_super_reg() -> (qnet_state::Transaction, String) {
+        use pqcrypto_traits::sign::{DetachedSignature as _, PublicKey as _};
+        let (wpk, wsk) = pqcrypto_mldsa::mldsa65::keypair();
+        let wallet = crate::crypto::solana_derivation::eon_from_qnet_dilithium_pubkey_bytes(wpk.as_bytes()).expect("eon");
+        let node_id = crate::rpc::generate_super_node_pseudonym(&wallet);
+        let vrf_pk = pqcrypto_mldsa::mldsa65::keypair().0.as_bytes().to_vec();
+        let mut tx = BlockchainNode::create_node_registration_tx_with_endpoint(
+            &node_id, qnet_state::NodeType::Super, &wallet, "burn", "http://1.2.3.4:8001");
+        if let qnet_state::TransactionType::NodeRegistration { vrf_pk: v, .. } = &mut tx.tx_type { *v = vrf_pk; }
+        tx.data = Some(format!("client_node_reg:{}:{}:burn:", node_id, wallet));
+        let msg = BlockchainNode::build_canonical_verify_message(&tx);
+        tx.dilithium_signature = Some(pqcrypto_mldsa::mldsa65::detached_sign(msg.as_bytes(), &wsk).as_bytes().to_vec());
+        tx.dilithium_public_key = Some(wpk.as_bytes().to_vec());
+        tx.hash = tx.calculate_hash();
+        (tx, wallet)
+    }
+
+    fn bound(tx: &qnet_state::Transaction, wallet: &str, h: u64) -> Result<(), String> {
+        BlockchainNode::registration_signature_bound(tx, BlockchainNode::registration_native_bound(tx, wallet), h)
+    }
+
+    /// From the gate a registration's committed identity fields sit under the wallet signature: the client
+    /// form is required, a super must be natively bound, and a light announces no endpoint. A relay's rewrite
+    /// of vrf_pk or the endpoint, or a switch to the server form, is refused; below the gate nothing changes.
+    #[test]
+    fn registration_signature_bound_is_off_below_the_gate_and_on_from_it() {
+        let solana_server = burn_reg_tx("burn", "solBurnSigSB", 1500, vec![]);
+        let err = bound(&solana_server, &burn_beneficiary(), TARGET_GATE).unwrap_err();
+        assert!(err.contains("server-form"), "{}", err);
+        assert_eq!(bound(&solana_server, &burn_beneficiary(), TARGET_GATE - 1), Ok(()));
+        let mut solana_client = solana_server.clone();
+        solana_client.data = Some(format!("client_node_reg:{}:{}:burn:", burn_node_id(), burn_beneficiary()));
+        solana_client.hash = solana_client.calculate_hash();
+        let err = bound(&solana_client, &burn_beneficiary(), TARGET_GATE).unwrap_err();
+        assert!(err.contains("super registration must be signed"), "{}", err);
+
+        let (honest, wallet) = native_super_reg();
+        assert!(BlockchainNode::registration_native_bound(&honest, &wallet));
+        assert_eq!(bound(&honest, &wallet, TARGET_GATE), Ok(()));
+        let mut vrf_swapped = honest.clone();
+        if let qnet_state::TransactionType::NodeRegistration { vrf_pk, .. } = &mut vrf_swapped.tx_type {
+            use pqcrypto_traits::sign::PublicKey as _;
+            *vrf_pk = pqcrypto_mldsa::mldsa65::keypair().0.as_bytes().to_vec();
+        }
+        let mut ep_swapped = honest.clone();
+        if let qnet_state::TransactionType::NodeRegistration { api_endpoint, .. } = &mut ep_swapped.tx_type {
+            *api_endpoint = "http://6.6.6.6:8001".to_string();
+        }
+        for tx in [&vrf_swapped, &ep_swapped] {
+            assert!(bound(tx, &wallet, TARGET_GATE).unwrap_err().contains("super registration must be signed"));
+            assert_eq!(bound(tx, &wallet, TARGET_GATE - 1), Ok(()));
+        }
+        let mut server_form = honest.clone();
+        server_form.data = Some("node_registration:relay".to_string());
+        assert!(bound(&server_form, &wallet, TARGET_GATE).unwrap_err().contains("server-form"));
+
+        let light_id = crate::rpc::generate_light_node_pseudonym(&burn_beneficiary());
+        let mut light = BlockchainNode::create_node_registration_tx(&light_id, qnet_state::NodeType::Light, &burn_beneficiary(), "burn");
+        light.data = Some(format!("client_node_reg:{}:{}:burn:", light_id, burn_beneficiary()));
+        assert_eq!(bound(&light, &burn_beneficiary(), TARGET_GATE), Ok(()), "a Solana-derived light stays open");
+        if let qnet_state::TransactionType::NodeRegistration { api_endpoint, .. } = &mut light.tx_type {
+            *api_endpoint = "http://6.6.6.6:8001".to_string();
+        }
+        assert!(bound(&light, &burn_beneficiary(), TARGET_GATE).unwrap_err().contains("announces no endpoint"));
+        assert_eq!(bound(&light, &burn_beneficiary(), TARGET_GATE - 1), Ok(()));
+    }
+
+    /// The registration judge runs the rule right after the beneficiary binding, before the cost, epoch and
+    /// committee checks, so it refuses without any committee in storage.
+    #[tokio::test]
+    async fn the_quorum_judge_runs_the_signature_rule_before_the_committee() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage");
+        let tx = burn_reg_tx("burn", "solBurnSigQJ", 1500, vec![]);
+        let err = BlockchainNode::verify_burn_attestation_quorum(&tx, TARGET_GATE + 1, &storage).await.unwrap_err();
+        assert!(format!("{}", err).contains("server-form"), "{}", err);
+        let below = format!("{:?}", BlockchainNode::verify_burn_attestation_quorum(&tx, TARGET_GATE - 1, &storage).await);
+        assert!(!below.contains("server-form"), "below the gate the rule is off: {}", below);
+    }
+
+    /// The node's own super registration (the convergence driver) is client-form and natively bound, so it
+    /// passes from the gate; the light client-submit shape passes too.
+    #[test]
+    fn the_convergence_driver_builds_a_bound_super_registration() {
+        let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let wallet = crate::crypto::vrf::WalletIdentity::derive_wallet_address(mnemonic);
+        let node_id = crate::rpc::generate_super_node_pseudonym(&wallet);
+        let mut tx = BlockchainNode::create_node_registration_tx_with_endpoint(
+            &node_id, qnet_state::NodeType::Super, &wallet, "burn", "http://1.2.3.4:8001");
+        if let qnet_state::TransactionType::NodeRegistration { vrf_pk, .. } = &mut tx.tx_type {
+            use pqcrypto_traits::sign::PublicKey as _;
+            *vrf_pk = pqcrypto_mldsa::mldsa65::keypair().0.as_bytes().to_vec();
+        }
+        BlockchainNode::sign_client_registration(&mut tx, &node_id, &wallet, "burn", mnemonic).expect("signs");
+        assert!(BlockchainNode::registration_native_bound(&tx, &wallet));
+        assert_eq!(bound(&tx, &wallet, TARGET_GATE), Ok(()));
+        assert_eq!(tx.check_signed_target_bound(TARGET_GATE), Ok(()), "its note is the one the rule rebuilds");
+
+        let light_id = crate::rpc::generate_light_node_pseudonym(&wallet);
+        let mut light = BlockchainNode::create_node_registration_tx(&light_id, qnet_state::NodeType::Light, &wallet, "burn");
+        BlockchainNode::sign_client_registration(&mut light, &light_id, &wallet, "burn", mnemonic).expect("signs");
+        assert_eq!(bound(&light, &wallet, TARGET_GATE), Ok(()));
+        assert_eq!(light.check_signed_target_bound(TARGET_GATE), Ok(()));
+    }
+
+    /// From the gate every attestor entry must count: a skipped entry (a non-member, a repeat, a bad
+    /// signature) is free padding on a fee-free registration that nothing the registrant signs covers. The
+    /// collector's list, exactly the members that signed, passes; below the gate a padded list still does.
+    #[tokio::test]
+    async fn from_the_gate_every_attestor_entry_must_count() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage");
+        let h = TARGET_GATE;
+        let epoch = (h - 1) / 90 + 1;
+        seed_committee_mb(&storage, epoch - 2, 5).await;
+        let committee = BlockchainNode::committee_for_height(&storage, (epoch - 1) * 90 + 1).expect("committee");
+        let need = qnet_consensus::checkpoint_bft::quorum_size(committee.len());
+        assert!(committee.len() > need, "a member left over to sign badly");
+        // A Solana-derived light in the client form: what a light must be from the gate.
+        let wallet = burn_beneficiary();
+        let light_id = crate::rpc::generate_light_node_pseudonym(&wallet);
+        let (burn_tx, amount) = ("solBurnSigDW", 1500u64);
+        let msg = qnet_state::Transaction::burn_attestation_message(
+            burn_tx, &burn_owner().0, &wallet, amount, &qnet_state::NodeType::Light, amount, epoch);
+        let mut keyed: Vec<(String, String)> = Vec::new();
+        for id in &committee {
+            let (pk, sk) = burn_gen_genesis(id);
+            storage.save_vrf_public_key(id, &hex::encode(&pk)).unwrap();
+            keyed.push((id.clone(), burn_sign(id, &pk, &sk, &msg)));
+        }
+        let signed: Vec<(String, String)> = keyed[..need].to_vec();
+        let reg = |attestors: Vec<(String, String)>| {
+            let mut tx = BlockchainNode::create_node_registration_tx_with_timestamp(
+                &light_id, qnet_state::NodeType::Light, &wallet, "burn", "", Some(1000));
+            if let qnet_state::TransactionType::NodeRegistration {
+                burn_tx: bt, burn_wallet, burn_owner_sig, burn_amount, burn_cost, burn_attestors, attest_epoch, ..
+            } = &mut tx.tx_type {
+                *bt = burn_tx.to_string();
+                *burn_wallet = burn_owner().0;
+                *burn_owner_sig = burn_owner_sig_full(&light_id, &wallet, "burn", 1000, &[], burn_tx);
+                *burn_amount = amount;
+                *burn_cost = amount;
+                *burn_attestors = attestors;
+                *attest_epoch = epoch;
+            }
+            tx.data = Some(qnet_state::Transaction::client_registration_data(&light_id, &wallet, "burn"));
+            tx.hash = tx.calculate_hash();
+            tx
+        };
+        let honest = reg(signed.clone());
+        BlockchainNode::verify_burn_attestation_quorum(&honest, h, &storage).await.expect("the collector's list passes");
+        assert_eq!(honest.check_signed_target_bound(h), Ok(()));
+
+        let with = |extra: (String, String)| { let mut a = signed.clone(); a.push(extra); a };
+        let bad_sig = (keyed[need].0.clone(), keyed[0].1.clone());
+        for padded in [with(("super_junk".to_string(), "a".repeat(16_000))), with(signed[0].clone()), with(bad_sig)] {
+            let tx = reg(padded);
+            let err = BlockchainNode::verify_burn_attestation_quorum(&tx, h, &storage).await.unwrap_err();
+            assert!(format!("{}", err).contains("do not count"), "{}", err);
+            BlockchainNode::verify_burn_attestation_quorum(&tx, h - 1, &storage).await.expect("below the gate the count alone decides");
+        }
+    }
+
+    /// From the gate an activation applies nothing, so neither side effect fires: no super row is deferred
+    /// and no pool-3 amount. Below it the old block replays with both.
+    #[test]
+    fn activation_side_effects_follow_the_refusal() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage");
+        let wallet = qnet_state::transaction::derive_contract_address("activation_side_effects", 1);
+        let p2 = qnet_state::transaction::phase2_entry_floor_nano(&qnet_state::NodeType::Super);
+        let act = |phase, amount| qnet_state::Transaction::new(wallet.clone(), None, 0, 1, 0, 0, 0, None,
+            qnet_state::TransactionType::NodeActivation { node_type: qnet_state::NodeType::Super, amount, phase }, None);
+        // Below the gate a Phase-1 super defers a row and a Phase-2 one moves pool 3 (its match arm comes
+        // first, so it defers no row): that is how blocks on disk applied, and it must replay so.
+        for (tx, pool3, rows) in [(act(qnet_state::account::ActivationPhase::Phase1, 0), 0u64, 1usize),
+                                  (act(qnet_state::account::ActivationPhase::Phase2, p2), p2, 0usize)] {
+            for (h, applies) in [(TARGET_GATE + 1, false), (TARGET_GATE - 1, true)] {
+                let st = qnet_state::State::new();
+                let mut a = qnet_state::Account::new(wallet.clone());
+                a.balance = 2 * p2;
+                st.restore_accounts(vec![(wallet.clone(), a)]).expect("restore");
+                let mut mb = p3_micro(h, 1);
+                mb.transactions = vec![tx.clone()];
+                let r = BlockchainNode::apply_block_to_state(&st, &mb, &storage, None);
+                let acct = st.get_account(&wallet).expect("account");
+                assert_eq!(acct.is_node, applies, "h={}", h);
+                assert_eq!(r.deferred_registrations.len(), if applies { rows } else { 0 }, "h={}: super row", h);
+                assert_eq!(r.deferred_pool3, if applies { pool3 } else { 0 }, "h={}: pool 3", h);
+                assert_eq!(acct.balance, if applies { 2 * p2 - pool3 } else { 2 * p2 }, "h={}", h);
+            }
+        }
+    }
+
+    /// The claim credit runs in apply_merkle_claims, shared by the validator and the producer-inline path.
+    /// From the gate a claim whose unsigned envelope was rewritten credits nothing there; the honest claim
+    /// and, below the gate, the rewritten one still credit the proven amount.
+    #[test]
+    fn a_rewritten_claim_credits_nothing_on_apply_from_the_gate() {
+        use pqcrypto_mldsa::mldsa65 as d3;
+        use pqcrypto_traits::sign::{DetachedSignature as _, PublicKey as _};
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage");
+        let (pk, sk) = d3::keypair();
+        let wallet = crate::crypto::solana_derivation::eon_from_qnet_dilithium_pubkey_bytes(pk.as_bytes()).expect("eon");
+        let epoch = 2 * crate::reward_epoch::MB_PER_EPOCH;
+        let amount = 100u64;
+        let leaf = {
+            let mut h = Sha3_256::new();
+            h.update(wallet.as_bytes()); h.update(&epoch.to_le_bytes()); h.update(&amount.to_le_bytes());
+            h.finalize()
+        };
+        let root: [u8; 32] = { let mut h = Sha3_256::new(); h.update([0u8]); h.update(leaf); h.finalize().into() };
+        storage.seed_epoch_root_for_test(epoch, root);
+        let data = format!(r#"{{"claims":[{{"epoch":{},"amount":{},"proof":[]}}]}}"#, epoch, amount);
+        let sig = hex::encode(d3::detached_sign(BlockchainNode::claim_sign_message(&wallet, &data, 1_780_000_000).as_bytes(), &sk).as_bytes());
+        let honest = crate::rpc::merkle_claim_tx(&wallet, &data, &sig, Some(&hex::encode(pk.as_bytes())), 1_780_000_000).expect("claim");
+        let mut inflated = honest.clone();
+        inflated.amount = 1_000_000_000_000_000_000;
+        inflated.hash = inflated.calculate_hash();
+        for (tx, h, credits) in [(&inflated, TARGET_GATE + 1, false), (&honest, TARGET_GATE + 1, true), (&inflated, TARGET_GATE - 1, true)] {
+            let sg = StateManager::new();
+            sg.credit_rewards_pool(1_000_000);
+            assert_eq!(BlockchainNode::apply_merkle_claims(&sg, &storage, std::slice::from_ref(tx), h, None), Ok(()));
+            assert_eq!(sg.get_account(&wallet).map(|a| a.balance), if credits { Some(amount) } else { None },
+                       "h={} amount={}", h, tx.amount);
+        }
+    }
+
+    /// A block root covers tx hashes, not bodies. From the gate a body under a hash it does not produce
+    /// applies nothing on the apply path (the verify stage rejects its block through the same predicate);
+    /// below it the old block replays.
+    #[test]
+    fn a_body_under_a_foreign_hash_applies_nothing_from_the_gate() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage");
+        let from = qnet_state::transaction::derive_contract_address("foreign_hash", 1);
+        let to = qnet_state::transaction::derive_contract_address("foreign_hash", 2);
+        let honest = qnet_state::Transaction::new(from.clone(), Some(to.clone()), 5, 1, 1, 10_000, 0, None,
+            qnet_state::TransactionType::Transfer { from: from.clone(), to: to.clone(), amount: 5 }, None);
+        let mut swapped = honest.clone();
+        swapped.timestamp = 99; // the body moved, the hash string did not
+        for (h, applies) in [(TARGET_GATE + 1, false), (TARGET_GATE - 1, true)] {
+            let st = qnet_state::State::new();
+            let mut a = qnet_state::Account::new(from.clone());
+            a.balance = 1_000_000;
+            st.restore_accounts(vec![(from.clone(), a)]).expect("restore");
+            let mut mb = p3_micro(h, 2);
+            mb.transactions = vec![swapped.clone()];
+            let _ = BlockchainNode::apply_block_to_state(&st, &mb, &storage, None);
+            assert_eq!(st.get_account(&to).map(|a| a.balance), if applies { Some(5) } else { None }, "h={}", h);
+        }
+    }
+
+    /// U5 (a): the cabinet may sign the owner bind hours after the wallet consented. A consent 23 hours
+    /// old passes the submit door, and the registration the door builds from it, with the committee's
+    /// attestations embedded the way the door embeds them, passes the block checks at and below the
+    /// signature-binding gate: block validation reads no consent age. Built from the contract vectors
+    /// (the consent and the test burner's owner bind share T).
+    #[tokio::test]
+    async fn a_consent_23_hours_old_is_admitted_and_passes_block_verification() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage");
+        let (body, t) = crate::rpc::submit_vector_body(0);
+        let req: crate::rpc::NodeRegistrationClientRequest = serde_json::from_value(body).expect("request");
+        let mut checked = crate::rpc::check_client_submit(&req, t + 23 * 3600, false).expect("a 23 h old consent is admitted");
+
+        let h = TARGET_GATE;
+        let epoch = (h - 1) / 90 + 1;
+        seed_committee_mb(&storage, epoch - 2, 5).await;
+        let committee = BlockchainNode::committee_for_height(&storage, (epoch - 1) * 90 + 1).expect("committee");
+        let need = qnet_consensus::checkpoint_bft::quorum_size(committee.len());
+        let (wallet, amount) = (checked.reg_tx.from.clone(), checked.burn_amount);
+        let msg = qnet_state::Transaction::burn_attestation_message(
+            &checked.burn_tx, &checked.burn_wallet, &wallet, amount, &qnet_state::NodeType::Light, amount, epoch);
+        let attestors: Vec<(String, String)> = committee.iter().take(need).map(|id| {
+            let (pk, sk) = burn_gen_genesis(id);
+            storage.save_vrf_public_key(id, &hex::encode(&pk)).unwrap();
+            (id.clone(), burn_sign(id, &pk, &sk, &msg))
+        }).collect();
+        crate::rpc::stamp_burn_attestation(&mut checked, attestors, amount, amount, epoch);
+        let tx = checked.reg_tx;
+        assert_eq!(tx.timestamp, t, "the registration carries the consent's T");
+
+        assert!(BlockchainNode::verify_node_lifecycle_dilithium(&tx), "the wallet's consent verifies");
+        assert_eq!(tx.check_signed_target_bound(h), Ok(()));
+        BlockchainNode::verify_burn_attestation_quorum(&tx, h, &storage).await.expect("passes at the gate");
+        BlockchainNode::verify_burn_attestation_quorum(&tx, h - 1, &storage).await.expect("and below it");
+        assert!(tx.validate().is_ok(), "the gossip door's structural check");
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // ONE WALLET, ONE NODE (wallet_one_node gate): a registration is refused when its wallet already has
+    // another node on chain, a block may not pair one wallet's registrations, and a light owner bind may
+    // take its form without a time. Every case on both sides of the gate.
+    // ═════════════════════════════════════════════════════════════════════════
+    const ONE_NODE_GATE: u64 = qnet_state::feature_gates::WALLET_ONE_NODE_GATE_HEIGHT;
+    type OneNodeMember = (String, Vec<u8>, pqcrypto_mldsa::mldsa65::SecretKey);
+
+    /// A storage holding the committee of the rotation epoch GATE-1 and GATE share (a gate is an epoch
+    /// boundary, a multiple of the 90-block rotation), each member's key on chain: the attestors.
+    async fn one_node_storage() -> (tempfile::TempDir, crate::storage::Storage, u64, Vec<OneNodeMember>) {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage");
+        let epoch = (ONE_NODE_GATE - 1) / 90 + 1;
+        assert_eq!(epoch, (ONE_NODE_GATE - 2) / 90 + 1, "GATE-1 and GATE share the attest epoch");
+        seed_committee_mb(&storage, epoch - 2, 5).await;
+        let committee = BlockchainNode::committee_for_height(&storage, (epoch - 1) * 90 + 1).expect("committee");
+        let need = qnet_consensus::checkpoint_bft::quorum_size(committee.len());
+        let members = committee.iter().take(need).map(|id| {
+            let (pk, sk) = burn_gen_genesis(id);
+            storage.save_vrf_public_key(id, &hex::encode(&pk)).unwrap();
+            (id.clone(), pk, sk)
+        }).collect();
+        (dir, storage, epoch, members)
+    }
+
+    /// Embed the members' attestations over the registration's own burn fields, as the collector does.
+    fn one_node_attest(tx: &mut qnet_state::Transaction, epoch: u64, members: &[OneNodeMember]) {
+        if let qnet_state::TransactionType::NodeRegistration {
+            burn_tx, burn_wallet, wallet_address, burn_amount, node_type, burn_cost, burn_attestors, attest_epoch, ..
+        } = &mut tx.tx_type {
+            let msg = qnet_state::Transaction::burn_attestation_message(
+                burn_tx, burn_wallet, wallet_address, *burn_amount, node_type, *burn_cost, epoch);
+            *burn_attestors = members.iter().map(|(id, pk, sk)| (id.clone(), burn_sign(id, pk, sk, &msg))).collect();
+            *attest_epoch = epoch;
+        }
+        tx.hash = tx.calculate_hash();
+    }
+
+    /// The contract vectors' light registration of wallet 0 (native-bound, v1 owner bind), attested.
+    fn one_node_light(epoch: u64, members: &[OneNodeMember]) -> qnet_state::Transaction {
+        let (body, t) = crate::rpc::submit_vector_body(0);
+        let req: crate::rpc::NodeRegistrationClientRequest = serde_json::from_value(body).expect("request");
+        let checked = crate::rpc::check_client_submit(&req, t, false).expect("the vector registration");
+        one_node_light_from(checked, epoch, members)
+    }
+
+    fn one_node_light_from(mut checked: crate::rpc::CheckedSubmit, epoch: u64, members: &[OneNodeMember]) -> qnet_state::Transaction {
+        let amount = checked.burn_amount;
+        crate::rpc::stamp_burn_attestation(&mut checked, Vec::new(), amount, amount, epoch);
+        let mut tx = checked.reg_tx;
+        one_node_attest(&mut tx, epoch, members);
+        tx
+    }
+
+    /// A native super registration in the client form with a v1 owner bind by the test burner, attested.
+    fn one_node_super(epoch: u64, members: &[OneNodeMember]) -> (qnet_state::Transaction, String) {
+        let (mut tx, wallet) = native_super_reg();
+        let node_id = crate::rpc::generate_super_node_pseudonym(&wallet);
+        let root = tx.dilithium_public_key.clone().unwrap_or_default();
+        let ts = tx.timestamp;
+        let burn = "solBurnSigOneNodeSuper";
+        if let qnet_state::TransactionType::NodeRegistration {
+            burn_tx, burn_wallet, burn_owner_sig, burn_amount, burn_cost, ..
+        } = &mut tx.tx_type {
+            *burn_tx = burn.to_string();
+            *burn_wallet = burn_owner().0;
+            *burn_owner_sig = burn_owner_sig_full(&node_id, &wallet, "burn", ts, &root, burn);
+            *burn_amount = 1500;
+            *burn_cost = 1500;
+        }
+        one_node_attest(&mut tx, epoch, members);
+        (tx, wallet)
+    }
+
+    async fn one_node_verdict(tx: &qnet_state::Transaction, h: u64, storage: &crate::storage::Storage) -> Result<(), String> {
+        BlockchainNode::verify_burn_attestation_quorum(tx, h, storage).await.map_err(|e| format!("{}", e))
+    }
+
+    /// Light after super: the wallet's super node on chain refuses its light registration from the gate; below
+    /// it the chain keeps both, so blocks already on disk replay unchanged.
+    #[tokio::test]
+    async fn one_node_rule_refuses_a_light_after_a_super_from_the_gate() {
+        let (_dir, storage, epoch, members) = one_node_storage().await;
+        let light = one_node_light(epoch, &members);
+        let wallet = light.from.clone();
+        one_node_verdict(&light, ONE_NODE_GATE - 1, &storage).await.expect("no other node, below the gate");
+        one_node_verdict(&light, ONE_NODE_GATE, &storage).await.expect("no other node, at the gate");
+
+        let super_id = crate::rpc::generate_super_node_pseudonym(&wallet);
+        storage.save_node_registration_at_height_burn(&super_id, "super", &wallet, 1.0, 100, "solBurnSigOther").unwrap();
+        one_node_verdict(&light, ONE_NODE_GATE - 1, &storage).await.expect("the rule is off below the gate");
+        let err = one_node_verdict(&light, ONE_NODE_GATE, &storage).await.unwrap_err();
+        assert!(err.contains(&format!("wallet_has_node: wallet already has super node {}", super_id)), "{}", err);
+    }
+
+    /// Super after light: the same rule the other way round.
+    #[tokio::test]
+    async fn one_node_rule_refuses_a_super_after_a_light_from_the_gate() {
+        let (_dir, storage, epoch, members) = one_node_storage().await;
+        let (sup, wallet) = one_node_super(epoch, &members);
+        one_node_verdict(&sup, ONE_NODE_GATE - 1, &storage).await.expect("no other node, below the gate");
+        one_node_verdict(&sup, ONE_NODE_GATE, &storage).await.expect("no other node, at the gate");
+
+        let light_id = crate::rpc::generate_light_node_pseudonym(&wallet);
+        storage.save_node_registration_at_height(&light_id, "light", &wallet, 1.0, 100).unwrap();
+        one_node_verdict(&sup, ONE_NODE_GATE - 1, &storage).await.expect("the rule is off below the gate");
+        let err = one_node_verdict(&sup, ONE_NODE_GATE, &storage).await.unwrap_err();
+        assert!(err.contains(&format!("wallet_has_node: wallet already has light node {}", light_id)), "{}", err);
+    }
+
+    /// What the rule does not count: the registration's own node (a duplicate is the apply skip), a cache row,
+    /// and a row at the height judged. A genesis wallet's genesis node counts: from the gate it registers no
+    /// light or super node.
+    #[tokio::test]
+    async fn one_node_rule_counts_only_another_chain_node_below_the_height() {
+        let (_dir, storage, epoch, members) = one_node_storage().await;
+        let light = one_node_light(epoch, &members);
+        let wallet = light.from.clone();
+        let (light_id, burn) = match &light.tx_type {
+            qnet_state::TransactionType::NodeRegistration { node_id, burn_tx, .. } => (node_id.clone(), burn_tx.clone()),
+            _ => unreachable!(),
+        };
+        storage.save_node_registration_at_height_burn(&light_id, "light", &wallet, 1.0, 100, &burn).unwrap();
+        one_node_verdict(&light, ONE_NODE_GATE, &storage).await.expect("its own node is no other node");
+
+        let super_id = crate::rpc::generate_super_node_pseudonym(&wallet);
+        storage.save_node_registration(&super_id, "super", &wallet, 1.0).unwrap();
+        one_node_verdict(&light, ONE_NODE_GATE, &storage).await.expect("a cache row is no registration");
+        storage.save_node_registration_at_height(&super_id, "super", &wallet, 1.0, ONE_NODE_GATE).unwrap();
+        one_node_verdict(&light, ONE_NODE_GATE, &storage).await.expect("a row at the height judged is not below it");
+        let err = one_node_verdict(&light, ONE_NODE_GATE + 1, &storage).await.unwrap_err();
+        assert!(err.contains("wallet_has_node"), "{}", err);
+
+        // A genesis wallet: the rule refuses before any signature or committee work, so the registration's own
+        // proofs do not matter at the gate; below it the refusal comes from those proofs instead.
+        let (gid, gw) = crate::genesis_constants::GENESIS_WALLETS[0];
+        let genesis_id = format!("genesis_node_{}", gid);
+        storage.save_node_registration_at_height(&genesis_id, "super", gw, 1.0, 0).unwrap();
+        let gw_light = crate::rpc::generate_light_node_pseudonym(gw);
+        let mut g = BlockchainNode::create_node_registration_tx(&gw_light, qnet_state::NodeType::Light, gw, "burn");
+        g.data = Some(qnet_state::Transaction::client_registration_data(&gw_light, gw, "burn"));
+        if let qnet_state::TransactionType::NodeRegistration { burn_tx, .. } = &mut g.tx_type { *burn_tx = "solBurnSigG".to_string(); }
+        g.hash = g.calculate_hash();
+        let err = one_node_verdict(&g, ONE_NODE_GATE, &storage).await.unwrap_err();
+        assert!(err.contains(&format!("wallet_has_node: wallet already has super node {}", genesis_id)), "{}", err);
+        let below = one_node_verdict(&g, ONE_NODE_GATE - 1, &storage).await.unwrap_err();
+        assert!(!below.contains("wallet_has_node"), "{}", below);
+    }
+
+    /// The same-block half, as the block verify stage and the producer apply it: one wallet under two node ids
+    /// in either order is a conflict from the gate; one id twice, two wallets and a genesis identity are not.
+    /// The producer keeps the first in lane order, and what it keeps never conflicts.
+    #[test]
+    fn one_node_rule_same_block_pairs_and_the_producer_keeps_the_first() {
+        let light = |w: &str| BlockchainNode::create_node_registration_tx(
+            &crate::rpc::generate_light_node_pseudonym(w), qnet_state::NodeType::Light, w, "burn");
+        let sup = |w: &str| BlockchainNode::create_node_registration_tx(
+            &crate::rpc::generate_super_node_pseudonym(w), qnet_state::NodeType::Super, w, "burn");
+        let w = "walletSameBlock";
+        assert_eq!(BlockchainNode::same_block_wallet_conflict(&[light(w), sup(w)]), Some(w.to_string()));
+        assert_eq!(BlockchainNode::same_block_wallet_conflict(&[sup(w), light(w)]), Some(w.to_string()));
+        assert_eq!(BlockchainNode::same_block_wallet_conflict(&[light(w), light(w)]), None, "one node twice is the apply skip");
+        assert_eq!(BlockchainNode::same_block_wallet_conflict(&[light(w), sup("walletOther")]), None);
+        let (gid, gw) = crate::genesis_constants::GENESIS_WALLETS[0];
+        let genesis = BlockchainNode::create_node_registration_tx(
+            &format!("genesis_node_{}", gid), qnet_state::NodeType::Super, gw, "genesis");
+        assert_eq!(BlockchainNode::same_block_wallet_conflict(&[genesis, light(gw)]), None, "a genesis identity is exempt");
+
+        // The block verify stage: rejects from the gate, accepts below it.
+        let pair = [light(w), sup(w)];
+        assert_eq!(BlockchainNode::same_block_one_node_refusal(&pair, ONE_NODE_GATE - 1), None);
+        assert_eq!(BlockchainNode::same_block_one_node_refusal(&pair, ONE_NODE_GATE), Some(w.to_string()));
+
+        // The producer: the first of the wallet's registrations stays, whichever type it is.
+        let transfer = qnet_state::Transaction::new(w.to_string(), Some("b".repeat(45)), 1, 1, 1, 10_000, 0, None,
+            qnet_state::TransactionType::Transfer { from: w.to_string(), to: "b".repeat(45), amount: 1 }, None);
+        let (kept, dropped) = BlockchainNode::keep_first_registration_per_wallet(
+            vec![light(w), transfer.clone(), sup(w), light(w), sup("walletOther")]);
+        assert_eq!(kept.len(), 4);
+        assert_eq!(dropped, vec![(crate::rpc::generate_super_node_pseudonym(w), w.to_string())]);
+        assert_eq!(BlockchainNode::same_block_wallet_conflict(&kept), None);
+        let (kept, dropped) = BlockchainNode::keep_first_registration_per_wallet(vec![sup(w), light(w)]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(dropped, vec![(crate::rpc::generate_light_node_pseudonym(w), w.to_string())]);
+    }
+
+    /// The vectors' burner (its seed is public test data).
+    fn vector_burner() -> ed25519_dalek::SigningKey {
+        let v: serde_json::Value = serde_json::from_str(include_str!("../../../../docs/protocols/light-node.vectors.json"))
+            .expect("vectors parse");
+        let seed: [u8; 32] = hex::decode(v["burner"]["seedHex"].as_str().unwrap()).unwrap().try_into().unwrap();
+        let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
+        assert_eq!(bs58::encode(sk.verifying_key().to_bytes()).into_string(), v["burner"]["address"].as_str().unwrap());
+        sk
+    }
+
+    /// Owner bind v2: the door takes it only with the gate, block validation from the gate and only for a light
+    /// registration; a super's v2 bind never verifies.
+    #[tokio::test]
+    async fn owner_bind_v2_is_a_light_form_from_the_gate() {
+        use ed25519_dalek::Signer;
+        let (mut body, t) = crate::rpc::submit_vector_body(0);
+        let pk = hex::decode(body["dilithium_public_key"].as_str().unwrap()).unwrap();
+        let v2 = qnet_state::Transaction::burn_owner_bind_message_v2(
+            body["node_id"].as_str().unwrap(), body["wallet_address"].as_str().unwrap(),
+            body["registration_proof"].as_str().unwrap(), &pk, body["burn_tx_hash"].as_str().unwrap());
+        body["owner_signature"] = serde_json::json!(hex::encode(vector_burner().sign(v2.as_bytes()).to_bytes()));
+        let req: crate::rpc::NodeRegistrationClientRequest = serde_json::from_value(body.clone()).expect("request");
+        // Before the gate a sound v2 bind is a retry (bind_v2_pending), never a refusal of the burn.
+        let refused = crate::rpc::check_client_submit(&req, t, false).err().expect("the door without the gate");
+        assert_eq!((refused.reason, refused.code), ("bind_v2_pending", crate::rpc::SubmitCode::BindV2Pending));
+        assert!(refused.code.retryable());
+        assert_eq!(refused.body()["code"].as_str(), Some("bind_v2_pending"));
+        // A lasting fault answers first: a client is never told to wait for a submit the gate will not cure.
+        let stale = crate::rpc::check_client_submit(&req, t + 2 * 86_400, false).err().expect("a stale consent");
+        assert_eq!(stale.reason, "timestamp_window");
+        let checked = crate::rpc::check_client_submit(&req, t, true).expect("the door with the gate");
+        // A bind that verifies in neither form is still bad_request, with or without the gate.
+        let mut forged = body.clone();
+        forged["owner_signature"] = serde_json::json!(hex::encode(burn_owner().1.sign(v2.as_bytes()).to_bytes()));
+        let forged: crate::rpc::NodeRegistrationClientRequest = serde_json::from_value(forged).expect("request");
+        for gate in [false, true] {
+            assert_eq!(crate::rpc::check_client_submit(&forged, t, gate).err().map(|e| e.reason), Some("owner_signature_invalid"));
+        }
+        // The node lists owner_bind_v2 exactly while its next block takes that bind; bind_v2 is the device binding.
+        let below = crate::light_binding::features_at(false, ONE_NODE_GATE - 1);
+        let from = crate::light_binding::features_at(false, ONE_NODE_GATE);
+        assert!(!below.contains(&"owner_bind_v2") && from.contains(&"owner_bind_v2"));
+        assert!(below.contains(&"bind_v2") && from.contains(&"bind_v2"));
+        assert_eq!(&from[..below.len()], &below[..], "only the marker is added");
+
+        let (_dir, storage, epoch, members) = one_node_storage().await;
+        let light = one_node_light_from(checked, epoch, &members);
+        let below = one_node_verdict(&light, ONE_NODE_GATE - 1, &storage).await.unwrap_err();
+        assert!(below.contains("burn_owner_sig does not authorize"), "{}", below);
+        one_node_verdict(&light, ONE_NODE_GATE, &storage).await.expect("a light v2 bind from the gate");
+
+        let (mut sup, wallet) = one_node_super(epoch, &members);
+        let node_id = crate::rpc::generate_super_node_pseudonym(&wallet);
+        let root = sup.dilithium_public_key.clone().unwrap_or_default();
+        if let qnet_state::TransactionType::NodeRegistration { burn_tx, burn_owner_sig, .. } = &mut sup.tx_type {
+            let msg = qnet_state::Transaction::burn_owner_bind_message_v2(&node_id, &wallet, "burn", &root, burn_tx);
+            *burn_owner_sig = hex::encode(burn_owner().1.sign(msg.as_bytes()).to_bytes());
+        }
+        sup.hash = sup.calculate_hash();
+        let err = one_node_verdict(&sup, ONE_NODE_GATE, &storage).await.unwrap_err();
+        assert!(err.contains("burn_owner_sig does not authorize"), "a super never takes v2: {}", err);
+
+        // The vectors' ownerBindV2 message, when the vector file carries one, is this preimage and verifies.
+        let v: serde_json::Value = serde_json::from_str(include_str!("../../../../docs/protocols/light-node.vectors.json")).unwrap();
+        let named = v["node"].as_array().into_iter().flatten()
+            .flat_map(|n| n["messages"].as_array().into_iter().flatten())
+            .filter(|m| m["name"].as_str() == Some("ownerBindV2"));
+        for m in named {
+            let i = &m["inputs"];
+            let field = |k: &str| i[k].as_str().unwrap_or_default().to_string();
+            let pre = qnet_state::Transaction::burn_owner_bind_message_v2_tagged(
+                &field("nodeId"), &field("wallet"), &field("proof"), &field("walletPublicKeySha3"), &field("burnTx"));
+            assert_eq!(m["preimage"].as_str(), Some(pre.as_str()), "the vector's v2 preimage");
+            if let Some(sig) = m["signature"].as_str() {
+                assert!(crate::crypto::solana_derivation::verify_ed25519_signature(
+                    pre.as_bytes(), sig, v["burner"]["address"].as_str().unwrap()).unwrap_or(false));
+            }
+        }
+    }
+
+    /// A light burn made from the wallet's own Solana address, registered by the cabinet with QNet Wallet's consent
+    /// (docs/protocols/light-node-own-burn.vectors.json): the burner is the Solana key the wallet's recovery phrase
+    /// makes on m/44'/501'/0'/0', and the app signs the owner bind in its v1 form at the consent's time. The site's
+    /// body is admitted by the door unchanged on both sides of the wallet_one_node gate, and the attested registration
+    /// passes block validation on both sides too: nothing in the node changes for it.
+    #[tokio::test]
+    async fn own_burn_vector_is_admitted_unchanged() {
+        use ed25519_dalek::Signer;
+        let v: serde_json::Value = serde_json::from_str(include_str!("../../../../docs/protocols/light-node-own-burn.vectors.json"))
+            .expect("vectors parse");
+        let (_dir, storage, epoch, members) = one_node_storage().await;
+        let cases = v["cases"].as_array().expect("cases");
+        assert!(cases.len() >= 2);
+        for c in cases {
+            let body = &c["submitBody"];
+            let field = |k: &str| body[k].as_str().unwrap_or_default().to_string();
+            let t = body["timestamp"].as_u64().expect("timestamp");
+            let mnemonic = c["wallet"]["mnemonic"].as_str().expect("mnemonic");
+            let wallet = field("wallet_address");
+
+            // The burner is the wallet's own Solana address; the wallet itself derives from its ML-DSA-65 key.
+            let burner = crate::crypto::solana_derivation::derive_solana_address_from_mnemonic(mnemonic).expect("solana address");
+            assert_eq!(burner, field("burn_wallet"));
+            assert_eq!(crate::crypto::solana_derivation::eon_from_qnet_dilithium_pubkey(&field("dilithium_public_key")).as_deref(),
+                       Some(wallet.as_str()), "native-bound");
+            assert_ne!(crate::crypto::solana_derivation::eon_from_solana_address(&burner), wallet, "not the Solana-derived form");
+
+            // The vector's owner bind is the node's v1 string, signed by that key (Ed25519 is deterministic).
+            let pk = hex::decode(field("dilithium_public_key")).expect("pk");
+            let msg = qnet_state::Transaction::burn_owner_bind_message(
+                &field("node_id"), &wallet, &field("registration_proof"), t, &pk, &field("burn_tx_hash"));
+            assert_eq!(c["ownerBind"]["preimage"].as_str(), Some(msg.as_str()));
+            let sk = crate::crypto::solana_derivation::derive_solana_signing_key_from_mnemonic(mnemonic).expect("solana key");
+            assert_eq!(hex::encode(sk.sign(msg.as_bytes()).to_bytes()), field("owner_signature"));
+            for h in [ONE_NODE_GATE - 1, ONE_NODE_GATE] {
+                assert!(BlockchainNode::burn_owner_bind_verifies(
+                    &field("node_id"), &qnet_state::NodeType::Light, &wallet, &field("registration_proof"), t, &pk,
+                    &field("burn_tx_hash"), &field("owner_signature"), &burner, h), "v1 at height {}", h);
+            }
+
+            // The door: the site's body, unchanged, without and with the gate.
+            let req: crate::rpc::NodeRegistrationClientRequest = serde_json::from_value(body.clone()).expect("request");
+            crate::rpc::check_client_submit(&req, t, true).expect("the door with the gate");
+            let checked = crate::rpc::check_client_submit(&req, t, false).expect("the door without the gate");
+            assert_eq!(checked.burn_wallet, burner);
+            assert_eq!(checked.owner_sig, field("owner_signature"));
+
+            // Block validation of the attested registration, below and from the gate.
+            let light = one_node_light_from(checked, epoch, &members);
+            one_node_verdict(&light, ONE_NODE_GATE - 1, &storage).await.expect("below the gate");
+            one_node_verdict(&light, ONE_NODE_GATE, &storage).await.expect("from the gate");
+
+            // The wallet's Solana key authorises its own burn only: named as the burner of another key's signature,
+            // or signing for another burn, the door refuses.
+            let mut other_burner = body.clone();
+            other_burner["burn_wallet"] = v["cases"].as_array().unwrap().iter()
+                .find(|x| x["solana"]["address"] != c["solana"]["address"]).unwrap()["solana"]["address"].clone();
+            let req: crate::rpc::NodeRegistrationClientRequest = serde_json::from_value(other_burner).expect("request");
+            assert_eq!(crate::rpc::check_client_submit(&req, t, true).err().expect("another burner").reason, "owner_signature_invalid");
+            let mut later = body.clone();
+            later["timestamp"] = serde_json::json!(t + 1);
+            let req: crate::rpc::NodeRegistrationClientRequest = serde_json::from_value(later).expect("request");
+            assert!(crate::rpc::check_client_submit(&req, t + 1, true).is_err(), "another T");
+        }
+    }
+
+    /// The API doors answer the rule with the same code and text; the text never reads as an existing
+    /// registration of this node, which clients treat as success.
+    #[test]
+    fn the_wallet_has_node_refusal_is_final_and_says_so() {
+        let c = crate::rpc::SubmitCode::WalletHasNode;
+        assert_eq!(c.as_str(), "wallet_has_node");
+        assert!(!c.retryable());
+        let text = crate::rpc::WALLET_HAS_NODE_TEXT.to_lowercase();
+        assert!(!text.contains("node already registered"), "{}", text);
+        assert!(text.contains("one wallet, one node"));
+        let src = include_str!("../rpc/registration_api.rs").replace("\r\n", "\n");
+        let door = &src[src.find("pub(super) async fn handle_node_registration_client_submit(").unwrap()..];
+        let at = |pat: &str| door.find(pat).unwrap_or_else(|| panic!("missing {}", pat));
+        assert!(at("SubmitCode::AlreadyRegistered") < at("SubmitCode::WalletHasNode"), "an identity on chain answers first");
+        assert!(at("SubmitCode::WalletHasNode") < at("collect_burn_attestations("), "before any attestation round");
+        let rpc = include_str!("../rpc/mod.rs").replace("\r\n", "\n");
+        let attest = &rpc[rpc.find("async fn attest_burn(blockchain").unwrap()..];
+        let refuse = attest.find("wallet already has a node").expect("the attestor refuses");
+        assert!(refuse < attest.find("let own_epoch").unwrap() && refuse < attest.find("cached_solana_1dev_supply()").unwrap(),
+                "before the epoch, committee and Solana work");
+    }
+
+    /// Replay never judges: replay_block_verified and apply run no verify-stage rule, so a chain written before
+    /// the gate with a light node at h and a super node of the same wallet at h+1 replays to the same roots and
+    /// rows every time. The rule lives at block verification (the pipeline and the producer) only.
+    #[test]
+    fn a_pre_gate_chain_with_both_types_replays_to_the_same_roots() {
+        let apply = include_str!("state_apply.rs");
+        for pat in ["verify_burn_attestation_quorum", "wallet_other_node", "wallet_one_node", "same_block_wallet_conflict",
+                    "WALLET_ONE_NODE"] {
+            assert!(!apply.contains(pat), "the apply path must not run {}", pat);
+        }
+        let pipeline = include_str!("../block_pipeline.rs");
+        let burn_dup = pipeline.find("burn_reuse_in_block h={}").expect("the same-block burn check");
+        let same = pipeline.find("same_block_one_node_refusal(").expect("the same-block wallet check");
+        let quorum = pipeline.find("verify_burn_attestation_quorum(tx, mb.height, &burn_storage)").expect("the judge");
+        assert!(burn_dup < same && same < quorum);
+        assert!(pipeline.contains(r#"if e.starts_with("wallet_has_node:")"#), "a one-node refusal never defers");
+        let prod = include_str!("production.rs");
+        let verify = prod.find("Self::verify_burn_attestation_quorum(&tx, next_block_height, &*storage)").expect("producer judge");
+        let keep = prod.find("Self::keep_first_registration_per_wallet(txs)").expect("producer keeps the first");
+        assert!(verify < keep);
+
+        let h = 5_000u64;
+        assert!(!qnet_state::feature_gates::is_active(qnet_state::feature_gates::id::WALLET_ONE_NODE, h + 1));
+        let w = "walletReplayBoth";
+        let light = BlockchainNode::create_node_registration_tx(
+            &crate::rpc::generate_light_node_pseudonym(w), qnet_state::NodeType::Light, w, "burnL");
+        let sup = BlockchainNode::create_node_registration_tx(
+            &crate::rpc::generate_super_node_pseudonym(w), qnet_state::NodeType::Super, w, "burnS");
+        let mut b1 = p3_micro(h, 1);
+        b1.transactions = vec![light];
+        let mut b2 = p3_micro(h + 1, 2);
+        b2.transactions = vec![sup];
+        let replay = || {
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            let storage = crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage");
+            let st = StateManager::new();
+            let mut roots = Vec::new();
+            let mut regs = Vec::new();
+            for mb in [&b1, &b2] {
+                let r = BlockchainNode::apply_block_to_state(&st, mb, &storage, None);
+                for (node_id, node_type, wallet, burn, _) in &r.deferred_registrations {
+                    storage.save_node_registration_at_height_burn(node_id, node_type, wallet, 1.0, mb.height, burn).unwrap();
+                }
+                roots.push(r.merkle_root);
+                regs.push(r.deferred_registrations.clone());
+            }
+            (roots, regs, storage.wallet_node_records(w).unwrap())
+        };
+        let (roots_a, regs_a, rows_a) = replay();
+        let (roots_b, regs_b, rows_b) = replay();
+        assert_eq!(roots_a, roots_b);
+        assert_eq!(regs_a, regs_b);
+        assert_eq!(rows_a, rows_b);
+        assert_eq!(rows_a.len(), 2, "both registrations applied: the rule is no apply rule");
+        assert_eq!((rows_a[0].2, rows_a[1].2), (h + 1, h), "super row stamped at h+1, light row at h");
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // A REGISTRATION ON AN UNCOMMITTED PARENT: the verify stage passes block h and hands it to apply; h+1 can
+    // then pass the parent check before apply(h) has written h's rows. A block whose verdict reads those rows
+    // waits for the commit (block_pipeline CommitDeferred) and is never judged on the partial registry.
+    // ═════════════════════════════════════════════════════════════════════════
+
+    /// One native wallet's super registration and light registration, each attested by the gate committee and
+    /// valid on its own: the second is refused once the first is on chain.
+    fn one_wallet_super_and_light(epoch: u64, members: &[OneNodeMember]) -> (qnet_state::Transaction, qnet_state::Transaction) {
+        let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let wallet = crate::crypto::vrf::WalletIdentity::derive_wallet_address(mnemonic);
+        let (sup, _, _) = super_with_consensus_key(epoch, members, mnemonic, "solBurnSigPipeSuper");
+        let light_id = crate::rpc::generate_light_node_pseudonym(&wallet);
+        let mut light = BlockchainNode::create_node_registration_tx(&light_id, qnet_state::NodeType::Light, &wallet, "burn");
+        BlockchainNode::sign_client_registration(&mut light, &light_id, &wallet, "burn", mnemonic).expect("signs");
+        burn_back_and_attest(&mut light, &light_id, &wallet, "solBurnSigPipeLight", epoch, members);
+        (sup, light)
+    }
+
+    /// The super registration of `mnemonic`'s wallet, attested by the gate committee, committing a consensus key
+    /// derived from the same mnemonic (one super, one key, in every test): with its node id and secret key.
+    fn super_with_consensus_key(epoch: u64, members: &[OneNodeMember], mnemonic: &str, burn: &str)
+        -> (qnet_state::Transaction, String, pqcrypto_mldsa::mldsa65::SecretKey)
+    {
+        use pqcrypto_traits::sign::SecretKey as _;
+        let wallet = crate::crypto::vrf::WalletIdentity::derive_wallet_address(mnemonic);
+        let super_id = crate::rpc::generate_super_node_pseudonym(&wallet);
+        let (pk, sk) = crate::crypto::genesis_key::derive_mldsa65_from_mnemonic(mnemonic);
+        let mut sup = BlockchainNode::create_node_registration_tx_with_endpoint(
+            &super_id, qnet_state::NodeType::Super, &wallet, "burn", "http://1.2.3.4:8001");
+        if let qnet_state::TransactionType::NodeRegistration { vrf_pk, .. } = &mut sup.tx_type {
+            *vrf_pk = pk;
+        }
+        BlockchainNode::sign_client_registration(&mut sup, &super_id, &wallet, "burn", mnemonic).expect("signs");
+        burn_back_and_attest(&mut sup, &super_id, &wallet, burn, epoch, members);
+        (sup, super_id, pqcrypto_mldsa::mldsa65::SecretKey::from_bytes(&sk).expect("consensus key"))
+    }
+
+    /// Back a client registration with the test burner's burn and the gate committee's attestations.
+    fn burn_back_and_attest(tx: &mut qnet_state::Transaction, id: &str, wallet: &str, burn: &str, epoch: u64, members: &[OneNodeMember]) {
+        let root = tx.dilithium_public_key.clone().unwrap_or_default();
+        let ts = tx.timestamp;
+        if let qnet_state::TransactionType::NodeRegistration {
+            burn_tx, burn_wallet, burn_owner_sig, burn_amount, burn_cost, ..
+        } = &mut tx.tx_type {
+            *burn_tx = burn.to_string();
+            *burn_wallet = burn_owner().0;
+            *burn_owner_sig = burn_owner_sig_full(id, wallet, "burn", ts, &root, burn);
+            *burn_amount = 1500;
+            *burn_cost = 1500;
+        }
+        one_node_attest(tx, epoch, members);
+    }
+
+    /// A block as a producer releases it (its signature taken as checked by the stage's worker pool).
+    fn pipe_block(h: u64, parent: [u8; 32], ts: u64, txs: Vec<qnet_state::Transaction>) -> qnet_state::MicroBlock {
+        let mut b = qnet_state::MicroBlock::new(h, ts, parent, txs, "genesis_node_001".to_string());
+        b.signature = vec![1u8; 64];
+        b
+    }
+
+    /// What the apply stage writes for `mb` before it publishes the slot - the registration rows and burn
+    /// bindings, then the body and the height - and the wake it fires once done.
+    fn commit_like_apply(storage: &crate::storage::Storage, mb: &qnet_state::MicroBlock, notify: &tokio::sync::Notify) {
+        registration_rows_like_apply(storage, mb);
+        storage.save_microblock(mb.height, &bincode::serialize(mb).unwrap()).unwrap();
+        storage.set_chain_height(mb.height).unwrap();
+        notify.notify_waiters();
+    }
+
+    /// The registration rows and burn bindings apply writes for `mb` before it publishes the slot.
+    fn registration_rows_like_apply(storage: &crate::storage::Storage, mb: &qnet_state::MicroBlock) {
+        for tx in &mb.transactions {
+            if let qnet_state::TransactionType::NodeRegistration { node_id, node_type, wallet_address, burn_tx, vrf_pk, .. } = &tx.tx_type {
+                let t = if matches!(node_type, qnet_state::NodeType::Light) { "light" } else { "super" };
+                let vrf = if vrf_pk.is_empty() { None } else { Some(vrf_pk.as_slice()) };
+                storage.save_node_registration_at_height_burn_vrf(node_id, t, wallet_address, 1.0, mb.height, burn_tx, vrf).unwrap();
+                storage.committed_burn_wallet_put(burn_tx, node_id).unwrap();
+            }
+        }
+    }
+
+    async fn wait_until(what: &str, f: impl Fn() -> bool) {
+        let start = std::time::Instant::now();
+        while !f() {
+            assert!(start.elapsed() < std::time::Duration::from_secs(30), "timed out waiting for {}", what);
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    /// A storage at the one-node gate committee with block h-1 committed, and blocks h (carrying `at_h`) and
+    /// h+1 (carrying `child`) on it.
+    async fn one_node_chain(at_h: &qnet_state::Transaction, child: &qnet_state::Transaction, storage: &crate::storage::Storage)
+        -> (qnet_state::MicroBlock, qnet_state::MicroBlock)
+    {
+        let h = ONE_NODE_GATE + 5; // the gate is an emission height: stay clear of it
+        let parent = pipe_block(h - 1, [7u8; 32], 2_000, vec![]);
+        storage.save_microblock(h - 1, &bincode::serialize(&parent).unwrap()).unwrap();
+        storage.set_chain_height(h - 1).unwrap();
+        let bh = pipe_block(h, parent.hash(), 2_001, vec![at_h.clone()]);
+        let bh1 = pipe_block(h + 1, bh.hash(), 2_002, vec![child.clone()]);
+        (bh, bh1)
+    }
+
+    /// h carries wallet W's super registration, h+1 its light registration. Judged on a storage without h's
+    /// rows, h+1 passes: that was the stale read. The verify stage passes h; while apply(h) is held h+1 is
+    /// neither accepted nor refused, and once h commits it is refused (wallet_has_node), in every order of
+    /// arrival and with the commit racing the child: refused every time, accepted never.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_second_registration_of_a_wallet_waits_for_its_parent_and_is_then_refused() {
+        let _g = crate::block_pipeline::VERIFY_STAGE_TEST_LOCK.lock();
+        let prev_verified = crate::unified_p2p::highest_verified_height();
+        // (arrival order, commit): 0 = child after h is released, 1 = child before h (parked for its parent),
+        // 2 = both back to back; None = apply(h) held until the child is seen waiting, Some(ms) = commit racing.
+        let cases: [(u8, Option<u64>); 7] = [(0, None), (1, None), (2, None), (0, Some(0)), (2, Some(0)), (2, Some(2)), (1, Some(5))];
+        for (order, race) in cases {
+            let (_dir, storage, epoch, members) = one_node_storage().await;
+            let storage = Arc::new(storage);
+            let (sup, light) = one_wallet_super_and_light(epoch, &members);
+            let (bh, bh1) = one_node_chain(&sup, &light, &storage).await;
+            let h = bh.height;
+            one_node_verdict(&light, h + 1, &storage).await.expect("without h's rows h+1 passes: the stale read");
+
+            let notify = Arc::new(tokio::sync::Notify::new());
+            let (feed, mut out, metrics) = crate::block_pipeline::spawn_verify_stage_for_test(storage.clone(), notify.clone());
+            feed_parent_and_child(&feed, &mut out, &bh, &bh1, order).await;
+            match race {
+                None => {
+                    wait_until("h+1 to wait for its parent", || metrics.commit_deferred_n.load(Ordering::Relaxed) == 1).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                    assert!(out.try_recv().is_err(), "order {}: h+1 is not accepted while apply(h) is held", order);
+                    assert_eq!(metrics.verify_failed.load(Ordering::Relaxed), 0, "order {}: nor refused for waiting", order);
+                }
+                Some(ms) => tokio::time::sleep(std::time::Duration::from_millis(ms)).await,
+            }
+            commit_like_apply(&storage, &bh, &notify);
+            wait_until("h+1 to be judged", || metrics.verify_failed.load(Ordering::Relaxed) == 1).await;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            assert!(out.try_recv().is_err(), "order {} race {:?}: h+1 is refused, never accepted", order, race);
+            assert_eq!(metrics.verified.load(Ordering::Relaxed), 1, "only h passed");
+            assert_eq!(metrics.commit_deferred_n.load(Ordering::Relaxed), 0, "nothing left waiting");
+            let err = one_node_verdict(&light, h + 1, &storage).await.unwrap_err();
+            assert!(err.contains("wallet_has_node"), "the refusal is the one-node rule: {}", err);
+            drop(feed);
+        }
+        crate::unified_p2p::HIGHEST_VERIFIED_HEIGHT.store(prev_verified, Ordering::Relaxed);
+    }
+
+    /// Waiting changes no verdict, so it needs no gate: a child judged after waiting for its parent gets the
+    /// verdict a node that held the parent committed on arrival gives at once. A valid registration of another
+    /// wallet is accepted on both, the same wallet's second registration refused on both.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn waiting_for_the_parent_changes_no_verdict() {
+        let _g = crate::block_pipeline::VERIFY_STAGE_TEST_LOCK.lock();
+        let prev_verified = crate::unified_p2p::highest_verified_height();
+        let timeout = std::time::Duration::from_secs(30);
+        for same_wallet in [false, true] {
+            let mut verdicts = Vec::new();
+            for parent_committed_first in [false, true] {
+                let (_dir, storage, epoch, members) = one_node_storage().await;
+                let storage = Arc::new(storage);
+                let (sup, own_light) = one_wallet_super_and_light(epoch, &members);
+                // The vectors' wallet 1 is not the super's wallet (the vectors' wallet 0 is).
+                let child = if same_wallet { own_light } else {
+                    let (body, t) = crate::rpc::submit_vector_body(1);
+                    let req: crate::rpc::NodeRegistrationClientRequest = serde_json::from_value(body).expect("request");
+                    let checked = crate::rpc::check_client_submit(&req, t, false).expect("wallet 1's registration");
+                    one_node_light_from(checked, epoch, &members)
+                };
+                let wallet = |tx: &qnet_state::Transaction| match &tx.tx_type {
+                    qnet_state::TransactionType::NodeRegistration { wallet_address, .. } => wallet_address.clone(),
+                    _ => String::new(),
+                };
+                assert_eq!(wallet(&child) == wallet(&sup), same_wallet);
+                let (bh, bh1) = one_node_chain(&sup, &child, &storage).await;
+                let notify = Arc::new(tokio::sync::Notify::new());
+                let (feed, mut out, metrics) = crate::block_pipeline::spawn_verify_stage_for_test(storage.clone(), notify.clone());
+                let dec = |b: &qnet_state::MicroBlock| crate::block_pipeline::decoded_for_test(b.clone(), "self");
+                if parent_committed_first {
+                    commit_like_apply(&storage, &bh, &notify);
+                } else {
+                    feed.send(dec(&bh)).await.unwrap();
+                    assert_eq!(tokio::time::timeout(timeout, out.recv()).await.unwrap().unwrap().height, bh.height);
+                }
+                feed.send(dec(&bh1)).await.unwrap();
+                if !parent_committed_first {
+                    wait_until("the child to wait", || metrics.commit_deferred_n.load(Ordering::Relaxed) == 1).await;
+                    assert!(out.try_recv().is_err(), "not judged while the parent is uncommitted");
+                    commit_like_apply(&storage, &bh, &notify);
+                }
+                verdicts.push(child_verdict(&mut out, &metrics, bh1.height).await);
+                drop(feed);
+            }
+            assert_eq!(verdicts[0], verdicts[1], "same_wallet={}: waiting changed the verdict", same_wallet);
+            assert_eq!(verdicts[0], !same_wallet, "same_wallet={}", same_wallet);
+        }
+        crate::unified_p2p::HIGHEST_VERIFIED_HEIGHT.store(prev_verified, Ordering::Relaxed);
+    }
+
+    /// The child's verdict: true accepted, false refused.
+    async fn child_verdict(out: &mut tokio::sync::mpsc::Receiver<crate::block_pipeline::VerifiedBlock>,
+                           metrics: &crate::block_pipeline::PipelineMetrics, h1: u64) -> bool {
+        let start = std::time::Instant::now();
+        loop {
+            if let Ok(b) = out.try_recv() { assert_eq!(b.height, h1); return true; }
+            if metrics.verify_failed.load(Ordering::Relaxed) > 0 { return false; }
+            assert!(start.elapsed() < std::time::Duration::from_secs(30), "no verdict");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Feed h and h+1 to the verify stage in `order` (0: the child after h has passed, 1: the child first, parked
+    /// for its parent, 2: back to back) and return once h has passed.
+    async fn feed_parent_and_child(feed: &tokio::sync::mpsc::Sender<crate::block_pipeline::DecodedBlock>,
+                                   out: &mut tokio::sync::mpsc::Receiver<crate::block_pipeline::VerifiedBlock>,
+                                   bh: &qnet_state::MicroBlock, bh1: &qnet_state::MicroBlock, order: u8) {
+        let dec = |b: &qnet_state::MicroBlock| crate::block_pipeline::decoded_for_test(b.clone(), "self");
+        let timeout = std::time::Duration::from_secs(30);
+        if order == 1 { feed.send(dec(bh1)).await.unwrap(); }
+        feed.send(dec(bh)).await.unwrap();
+        if order == 2 { feed.send(dec(bh1)).await.unwrap(); }
+        assert_eq!(tokio::time::timeout(timeout, out.recv()).await.unwrap().unwrap().height, bh.height);
+        if order == 0 { feed.send(dec(bh1)).await.unwrap(); }
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // A SIGNER KEY ON AN UNCOMMITTED PARENT: a heartbeat's verdict reads its signer's committed key, which the
+    // parent's apply writes. h registers super S and h+1 carries S's heartbeat: judged before apply(h) ended,
+    // h+1 was refused on one validator and accepted on another. It now waits for the commit (block_pipeline
+    // CommitDeferred), and only while that key does not resolve: a known signer's heartbeat never waits.
+    // ═════════════════════════════════════════════════════════════════════════
+
+    /// `node_id`'s heartbeat anchored at (height, hash) and signed with `sk`, in create_heartbeat_tx_static's form.
+    fn heartbeat_signed(node_id: &str, anchor: (u64, [u8; 32]), sk: &pqcrypto_mldsa::mldsa65::SecretKey) -> qnet_state::Transaction {
+        use pqcrypto_traits::sign::DetachedSignature as _;
+        let mut tx = qnet_state::Transaction {
+            from: node_id.to_string(), to: None, amount: 0,
+            tx_type: qnet_state::TransactionType::Heartbeat {
+                node_id: node_id.to_string(), anchor_height: anchor.0, anchor_hash: hex::encode(anchor.1),
+            },
+            timestamp: 0, hash: String::new(), signature: None, public_key: None,
+            gas_price: u64::MAX, gas_limit: 0, nonce: qnet_state::Transaction::heartbeat_nonce(anchor.0), data: None,
+            dilithium_signature: None,
+            dilithium_public_key: Some(node_id.as_bytes().to_vec()),
+            chain_id: qnet_state::transaction::QNET_CHAIN_ID,
+        };
+        let msg = BlockchainNode::build_canonical_verify_message(&tx);
+        tx.dilithium_signature = Some(pqcrypto_mldsa::mldsa65::detached_sign(msg.as_bytes(), sk).as_bytes().to_vec());
+        tx.hash = tx.calculate_hash();
+        tx
+    }
+
+    /// What the apply stage does for `mb`, in its order and under the state write lock: the registration rows (a
+    /// super's key row in the same batch), the body and the height (the slot is committed from here), a pause of
+    /// `pause_ms`, the RAM and consensus key-registry bindings (cache_node_registrations_from_transactions); then
+    /// the lock is released and the verify stage woken.
+    async fn commit_under_state_lock(storage: &crate::storage::Storage, state: &tokio::sync::RwLock<crate::StateManager>,
+                                     mb: &qnet_state::MicroBlock, notify: &tokio::sync::Notify, pause_ms: u64) {
+        let guard = state.write().await;
+        registration_rows_like_apply(storage, mb);
+        storage.save_microblock(mb.height, &bincode::serialize(mb).unwrap()).unwrap();
+        storage.set_chain_height(mb.height).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(pause_ms)).await;
+        BlockchainNode::cache_node_registrations_from_transactions(storage, &mb.transactions);
+        drop(guard);
+        notify.notify_waiters();
+    }
+
+    /// A super registered long before the test chain: its row commits its key and its key row is stored. The
+    /// node id and the secret key.
+    fn known_super(storage: &crate::storage::Storage, mnemonic: &str) -> (String, pqcrypto_mldsa::mldsa65::SecretKey) {
+        use pqcrypto_traits::sign::SecretKey as _;
+        let wallet = crate::crypto::vrf::WalletIdentity::derive_wallet_address(mnemonic);
+        let id = crate::rpc::generate_super_node_pseudonym(&wallet);
+        let (pk, sk) = crate::crypto::genesis_key::derive_mldsa65_from_mnemonic(mnemonic);
+        storage.save_node_registration_at_height_burn_vrf(&id, "super", &wallet, 1.0, ONE_NODE_GATE - 100, "solBurnSigKnownSuper", Some(&pk)).unwrap();
+        storage.save_vrf_public_key(&id, &hex::encode(&pk)).unwrap();
+        (id, pqcrypto_mldsa::mldsa65::SecretKey::from_bytes(&sk).expect("consensus key"))
+    }
+
+    /// h registers super S, h+1 carries S's heartbeat. Judged on a storage without h's rows h+1 is refused: that was
+    /// the stale read. While apply(h) is held h+1 is neither accepted nor refused; once h commits it is accepted, in
+    /// every order of arrival, with the commit racing the child, and with a commit that pauses inside its write
+    /// section after publishing the slot (the child re-driven in that pause waits on the state lock): accepted
+    /// every time, refused never.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_heartbeat_of_a_super_registered_in_its_parent_waits_and_is_then_accepted() {
+        let _g = crate::block_pipeline::VERIFY_STAGE_TEST_LOCK.lock();
+        let prev_verified = crate::unified_p2p::highest_verified_height();
+        let timeout = std::time::Duration::from_secs(30);
+        // (arrival order, commit, pause): None = apply(h) held until the child is seen waiting, Some(ms) = the
+        // commit racing the child; pause = ms between the committed slot and the end of the write section (longer
+        // than the stage's backstop poll, so a held child is re-driven inside it).
+        let cases: [(u8, Option<u64>, u64); 9] = [(0, None, 0), (1, None, 0), (2, None, 0), (0, None, 120), (1, None, 120),
+            (0, Some(0), 0), (2, Some(0), 120), (2, Some(2), 0), (1, Some(5), 120)];
+        for (i, (order, race, pause)) in cases.into_iter().enumerate() {
+            let (_dir, storage, epoch, members) = one_node_storage().await;
+            let storage = Arc::new(storage);
+            // A super of its own per case: the RAM key registries outlive a case.
+            let (sup, super_id, sk) = super_with_consensus_key(
+                epoch, &members, &format!("heartbeat in the child case {}", i), "solBurnSigHeartbeatChild");
+            let hb = heartbeat_signed(&super_id, (ONE_NODE_GATE + 3, [7u8; 32]), &sk);
+            let (bh, bh1) = one_node_chain(&sup, &hb, &storage).await;
+            assert!(!BlockchainNode::verify_heartbeat_dilithium(&hb, &storage), "without h's rows h+1 is refused: the stale read");
+
+            let notify = Arc::new(tokio::sync::Notify::new());
+            let state = Arc::new(tokio::sync::RwLock::new(crate::StateManager::new()));
+            let (feed, mut out, metrics) = crate::block_pipeline::spawn_verify_stage_with_state_for_test(
+                storage.clone(), notify.clone(), state.clone());
+            feed_parent_and_child(&feed, &mut out, &bh, &bh1, order).await;
+            match race {
+                None => {
+                    wait_until("h+1 to wait for its parent", || metrics.commit_deferred_n.load(Ordering::Relaxed) == 1).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                    assert!(out.try_recv().is_err(), "case {}: h+1 is not accepted while apply(h) is held", i);
+                    assert_eq!(metrics.verify_failed.load(Ordering::Relaxed), 0, "case {}: nor refused for waiting", i);
+                }
+                Some(ms) => tokio::time::sleep(std::time::Duration::from_millis(ms)).await,
+            }
+            commit_under_state_lock(&storage, &state, &bh, &notify, pause).await;
+            let child = tokio::time::timeout(timeout, out.recv()).await.expect("h+1 is judged").expect("the stage runs");
+            assert_eq!(child.height, bh1.height, "case {}: h+1 is accepted once h commits", i);
+            assert_eq!(metrics.verify_failed.load(Ordering::Relaxed), 0, "case {}: never refused on the stale read", i);
+            wait_until("nothing left waiting", || metrics.commit_deferred_n.load(Ordering::Relaxed) == 0).await;
+            assert!(BlockchainNode::verify_heartbeat_dilithium(&hb, &storage), "case {}: the key resolves once h applied", i);
+            drop(feed);
+        }
+        crate::unified_p2p::HIGHEST_VERIFIED_HEIGHT.store(prev_verified, Ordering::Relaxed);
+    }
+
+    /// A heartbeat of a signer whose key is on chain already is judged at once on a parent whose apply is held: it
+    /// never waits. Beside the heartbeat of S, registered in that parent, the block waits for S's key and is then
+    /// accepted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_heartbeat_of_a_known_signer_is_never_held() {
+        let _g = crate::block_pipeline::VERIFY_STAGE_TEST_LOCK.lock();
+        let prev_verified = crate::unified_p2p::highest_verified_height();
+        let timeout = std::time::Duration::from_secs(30);
+        for beside_new_signer in [false, true] {
+            let (_dir, storage, epoch, members) = one_node_storage().await;
+            let storage = Arc::new(storage);
+            let (sup, super_id, sk) = super_with_consensus_key(
+                epoch, &members, &format!("new signer beside a known one {}", beside_new_signer), "solBurnSigHeartbeatNew");
+            let (known_id, known_sk) = known_super(&storage, &format!("known signer {}", beside_new_signer));
+            let anchor = (ONE_NODE_GATE + 3, [7u8; 32]);
+            let mut txs = vec![heartbeat_signed(&known_id, anchor, &known_sk)];
+            if beside_new_signer { txs.push(heartbeat_signed(&super_id, anchor, &sk)); }
+            let (bh, _) = one_node_chain(&sup, &txs[0], &storage).await;
+            let bh1 = pipe_block(bh.height + 1, bh.hash(), 2_002, txs);
+
+            let notify = Arc::new(tokio::sync::Notify::new());
+            let state = Arc::new(tokio::sync::RwLock::new(crate::StateManager::new()));
+            let (feed, mut out, metrics) = crate::block_pipeline::spawn_verify_stage_with_state_for_test(
+                storage.clone(), notify.clone(), state.clone());
+            feed_parent_and_child(&feed, &mut out, &bh, &bh1, 0).await;
+            if beside_new_signer {
+                wait_until("h+1 to wait for S's key", || metrics.commit_deferred_n.load(Ordering::Relaxed) == 1).await;
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                assert!(out.try_recv().is_err(), "not judged while S's key is being written");
+                commit_under_state_lock(&storage, &state, &bh, &notify, 0).await;
+            }
+            // Without the commit nothing would release a held block: h+1 arriving here was never held.
+            let child = tokio::time::timeout(timeout, out.recv()).await.expect("h+1 is judged").expect("the stage runs");
+            assert_eq!(child.height, bh1.height, "beside_new_signer={}: h+1 is accepted", beside_new_signer);
+            assert_eq!(metrics.verify_failed.load(Ordering::Relaxed), 0);
+            if !beside_new_signer {
+                assert_eq!(storage.committed_hash_at(bh.height), None, "accepted while apply(h) was still held");
+            }
+            drop(feed);
+        }
+        crate::unified_p2p::HIGHEST_VERIFIED_HEIGHT.store(prev_verified, Ordering::Relaxed);
+    }
+
+    /// Waiting for a key changes no verdict, so it needs no gate: a child judged after waiting for its parent gets
+    /// the verdict a node that held the parent committed on arrival gives at once. S's heartbeat is accepted on
+    /// both; one signed by a key the chain never committed for S is refused on both, and so is the heartbeat of a
+    /// signer no block registers, whose key never resolves: it waits, is then judged, and is not held for good.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn waiting_for_a_signer_key_changes_no_verdict() {
+        let _g = crate::block_pipeline::VERIFY_STAGE_TEST_LOCK.lock();
+        let prev_verified = crate::unified_p2p::highest_verified_height();
+        // 0: signed with S's key, 1: signed with a key the chain never committed for S, 2: a signer never registered.
+        for kind in 0..3u8 {
+            let mut verdicts = Vec::new();
+            for parent_committed_first in [false, true] {
+                let (_dir, storage, epoch, members) = one_node_storage().await;
+                let storage = Arc::new(storage);
+                let (sup, super_id, sk) = super_with_consensus_key(
+                    epoch, &members, &format!("verdict kind {} first {}", kind, parent_committed_first), "solBurnSigHeartbeatVerdict");
+                let anchor = (ONE_NODE_GATE + 3, [7u8; 32]);
+                let hb = match kind {
+                    0 => heartbeat_signed(&super_id, anchor, &sk),
+                    1 => heartbeat_signed(&super_id, anchor, &pqcrypto_mldsa::mldsa65::keypair().1),
+                    _ => heartbeat_signed("super_never_registered_hb", anchor, &sk),
+                };
+                let (bh, bh1) = one_node_chain(&sup, &hb, &storage).await;
+                let notify = Arc::new(tokio::sync::Notify::new());
+                let state = Arc::new(tokio::sync::RwLock::new(crate::StateManager::new()));
+                let (feed, mut out, metrics) = crate::block_pipeline::spawn_verify_stage_with_state_for_test(
+                    storage.clone(), notify.clone(), state.clone());
+                if parent_committed_first {
+                    commit_under_state_lock(&storage, &state, &bh, &notify, 0).await;
+                    feed.send(crate::block_pipeline::decoded_for_test(bh1.clone(), "self")).await.unwrap();
+                } else {
+                    feed_parent_and_child(&feed, &mut out, &bh, &bh1, 0).await;
+                    wait_until("the child to wait", || metrics.commit_deferred_n.load(Ordering::Relaxed) == 1).await;
+                    assert!(out.try_recv().is_err(), "not judged while the parent is uncommitted");
+                    commit_under_state_lock(&storage, &state, &bh, &notify, 0).await;
+                }
+                verdicts.push(child_verdict(&mut out, &metrics, bh1.height).await);
+                drop(feed);
+            }
+            assert_eq!(verdicts[0], verdicts[1], "kind {}: waiting changed the verdict", kind);
+            assert_eq!(verdicts[0], kind == 0, "kind {}", kind);
+        }
+        crate::unified_p2p::HIGHEST_VERIFIED_HEIGHT.store(prev_verified, Ordering::Relaxed);
+    }
+
+    /// The same wait for an equivocation proof, whose verdict reads the offender's committed key: a proof against a
+    /// super registered in its parent is refused on a storage without h's rows (the stale read), waits while
+    /// apply(h) is held, and is accepted once h commits.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_equivocation_proof_against_a_super_registered_in_its_parent_waits_and_is_then_accepted() {
+        let _g = crate::block_pipeline::VERIFY_STAGE_TEST_LOCK.lock();
+        let prev_verified = crate::unified_p2p::highest_verified_height();
+        let timeout = std::time::Duration::from_secs(30);
+        let (_dir, storage, epoch, members) = one_node_storage().await;
+        let storage = Arc::new(storage);
+        let (sup, super_id, sk) = super_with_consensus_key(epoch, &members, "equivocation proof in the child", "solBurnSigProofChild");
+        let at = ONE_NODE_GATE + 2;
+        let (mut a, mut b) = (eqv_mk_header(1_000, 1, 0), eqv_mk_header(1_000, 2, 0));
+        a.signature = eqv_sign_block(&sk, at, &super_id, &a);
+        b.signature = eqv_sign_block(&sk, at, &super_id, &b);
+        let (block_a, block_b) = if a.identity_hash(at, &super_id) < b.identity_hash(at, &super_id) { (a, b) } else { (b, a) };
+        let mut proof = qnet_state::Transaction {
+            hash: String::new(), from: qnet_state::transaction::SLASHING_SENDER.to_string(), to: None, amount: 0,
+            nonce: 0, gas_price: 0, gas_limit: 0, timestamp: block_a.timestamp, signature: None, public_key: None,
+            tx_type: qnet_state::TransactionType::EquivocationProof { offender: super_id.clone(), height: at, block_a, block_b },
+            data: None, dilithium_signature: None, dilithium_public_key: None,
+            chain_id: qnet_state::transaction::QNET_CHAIN_ID,
+        };
+        proof.hash = proof.calculate_hash();
+        let (bh, bh1) = one_node_chain(&sup, &proof, &storage).await;
+        assert!(!BlockchainNode::equivocation_proof_verified(&storage, &proof).await, "without h's rows: the stale read");
+
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let state = Arc::new(tokio::sync::RwLock::new(crate::StateManager::new()));
+        let (feed, mut out, metrics) = crate::block_pipeline::spawn_verify_stage_with_state_for_test(
+            storage.clone(), notify.clone(), state.clone());
+        feed_parent_and_child(&feed, &mut out, &bh, &bh1, 0).await;
+        wait_until("h+1 to wait for the offender's key", || metrics.commit_deferred_n.load(Ordering::Relaxed) == 1).await;
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(out.try_recv().is_err(), "not accepted while apply(h) is held");
+        assert_eq!(metrics.verify_failed.load(Ordering::Relaxed), 0, "nor refused for waiting");
+        commit_under_state_lock(&storage, &state, &bh, &notify, 120).await;
+        let child = tokio::time::timeout(timeout, out.recv()).await.expect("h+1 is judged").expect("the stage runs");
+        assert_eq!(child.height, bh1.height, "accepted once h commits");
+        assert_eq!(metrics.verify_failed.load(Ordering::Relaxed), 0);
+        assert!(BlockchainNode::equivocation_proof_verified(&storage, &proof).await);
+        drop(feed);
+        crate::unified_p2p::HIGHEST_VERIFIED_HEIGHT.store(prev_verified, Ordering::Relaxed);
+    }
+
+    /// `label`'s HeartbeatCommitment signed in the registry envelope with (`pk`, `sk`). The verify stage judges it
+    /// by the label's binding in the consensus key registry: unbound, a first-seen key verifies; bound, only that
+    /// key does. A registration's apply writes that binding after the height is set, inside its write section.
+    fn envelope_signed(label: &str, pk: &[u8], sk: &pqcrypto_mldsa::mldsa65::SecretKey) -> qnet_state::Transaction {
+        let mut tx = qnet_state::Transaction {
+            from: label.to_string(), to: None, amount: 0,
+            tx_type: qnet_state::TransactionType::HeartbeatCommitment {
+                node_id: label.to_string(), window_start_height: 0, window_end_height: 14_400, merkle_root: String::new(),
+                heartbeat_count: 0, first_heartbeat_time: 0, last_heartbeat_time: 0, sample_seed: String::new(),
+                heartbeat_samples: Vec::new(),
+            },
+            timestamp: 0, hash: String::new(), signature: None, public_key: None, gas_price: 0, gas_limit: 0,
+            nonce: 0, data: None, dilithium_signature: None, dilithium_public_key: Some(label.as_bytes().to_vec()),
+            chain_id: qnet_state::transaction::QNET_CHAIN_ID,
+        };
+        let msg = BlockchainNode::build_canonical_verify_message(&tx);
+        tx.dilithium_signature = Some(burn_sign(label, pk, sk, &msg).into_bytes());
+        tx.hash = tx.calculate_hash();
+        tx
+    }
+
+    /// The envelope case, whose race runs the other way: h registers super S with key K, h+1 carries a TX in S's
+    /// envelope. Judged before apply(h) bound S, any key verifies as first seen; after, only K does. Signed with
+    /// K the child is accepted, signed with another key K' refused, on every path: h committed before h+1
+    /// arrives, and h+1 waiting while apply(h) is held, in several arrival orders, with the commit racing the
+    /// child, and with a commit that pauses longer than the stage's backstop poll between publishing the slot
+    /// and binding S. A child re-driven in that pause reads the registry only after the write section ends (the
+    /// state read lock), so K' is never accepted as first seen. A label no block in flight binds never waits.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_envelope_signed_tx_waits_for_its_label_binding_and_gets_the_bound_verdict() {
+        use pqcrypto_traits::sign::PublicKey as _;
+        let _g = crate::block_pipeline::VERIFY_STAGE_TEST_LOCK.lock();
+        let prev_verified = crate::unified_p2p::highest_verified_height();
+        init_global_quantum_crypto().await.expect("the envelope verifier");
+        let timeout = std::time::Duration::from_secs(30);
+        // None = h committed before h+1 arrives; Some((arrival order, commit, pause)) as in the heartbeat test.
+        let cases: [Option<(u8, Option<u64>, u64)>; 7] = [None, Some((0, None, 120)), Some((1, None, 120)), Some((2, None, 0)),
+            Some((2, Some(0), 120)), Some((1, Some(5), 120)), Some((0, Some(2), 0))];
+        // 0: signed with S's key, 1: signed with a key the chain never bound to S, 2: a label no block registers.
+        for kind in 0..3u8 {
+            let mut verdicts = Vec::new();
+            for (i, case) in cases.iter().enumerate() {
+                if kind == 2 && i > 1 { break; } // nothing to wait for: the reference and one held parent
+                let (_dir, storage, epoch, members) = one_node_storage().await;
+                let storage = Arc::new(storage);
+                // A super of its own per case: the key registries outlive a case.
+                let (sup, super_id, sk) = super_with_consensus_key(
+                    epoch, &members, &format!("envelope kind {} case {}", kind, i), "solBurnSigEnvelopeChild");
+                let pk = match &sup.tx_type {
+                    qnet_state::TransactionType::NodeRegistration { vrf_pk, .. } => vrf_pk.clone(),
+                    _ => unreachable!(),
+                };
+                let (other_pk, other_sk) = pqcrypto_mldsa::mldsa65::keypair();
+                let tx = match kind {
+                    0 => envelope_signed(&super_id, &pk, &sk),
+                    1 => envelope_signed(&super_id, other_pk.as_bytes(), &other_sk),
+                    _ => envelope_signed(&format!("super_envelope_never_registered_{}", i), other_pk.as_bytes(), &other_sk),
+                };
+                let (bh, bh1) = one_node_chain(&sup, &tx, &storage).await;
+                let lane = VerifyLane::Block(bh1.height);
+                assert_eq!(BlockchainNode::verify_dilithium_tx_signature_on(&tx, lane, Some(&*storage)).await.ok(), Some(true),
+                           "kind {}: before h's binding any key verifies as first seen: the stale read", kind);
+
+                let notify = Arc::new(tokio::sync::Notify::new());
+                let state = Arc::new(tokio::sync::RwLock::new(crate::StateManager::new()));
+                let (feed, mut out, metrics) = crate::block_pipeline::spawn_verify_stage_with_state_for_test(
+                    storage.clone(), notify.clone(), state.clone());
+                match case {
+                    None => {
+                        commit_under_state_lock(&storage, &state, &bh, &notify, 0).await;
+                        feed.send(crate::block_pipeline::decoded_for_test(bh1.clone(), "self")).await.unwrap();
+                    }
+                    Some((order, race, pause)) => {
+                        feed_parent_and_child(&feed, &mut out, &bh, &bh1, *order).await;
+                        if kind == 2 {
+                            // Judged while apply(h) is held: nothing waited for it.
+                            let child = tokio::time::timeout(timeout, out.recv()).await.expect("judged at once").expect("the stage runs");
+                            assert_eq!(child.height, bh1.height);
+                            assert_eq!(storage.committed_hash_at(bh.height), None, "accepted while apply(h) was still held");
+                            assert_eq!(metrics.commit_deferred_n.load(Ordering::Relaxed), 0, "never held");
+                            verdicts.push(true);
+                            drop(feed);
+                            continue;
+                        }
+                        match race {
+                            None => {
+                                wait_until("h+1 to wait for S's binding", || metrics.commit_deferred_n.load(Ordering::Relaxed) == 1).await;
+                                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                                assert!(out.try_recv().is_err(), "kind {} case {}: not accepted while apply(h) is held", kind, i);
+                                assert_eq!(metrics.verify_failed.load(Ordering::Relaxed), 0, "kind {} case {}: nor refused for waiting", kind, i);
+                            }
+                            Some(ms) => tokio::time::sleep(std::time::Duration::from_millis(*ms)).await,
+                        }
+                        commit_under_state_lock(&storage, &state, &bh, &notify, *pause).await;
+                    }
+                }
+                verdicts.push(child_verdict(&mut out, &metrics, bh1.height).await);
+                wait_until("nothing left waiting", || metrics.commit_deferred_n.load(Ordering::Relaxed) == 0).await;
+                assert_eq!(BlockchainNode::verify_dilithium_tx_signature_on(&tx, lane, Some(&*storage)).await.ok(), Some(kind != 1),
+                           "kind {}: the verdict once h applied", kind);
+                drop(feed);
+            }
+            assert!(verdicts.iter().all(|v| *v == verdicts[0]), "kind {}: waiting changed the verdict: {:?}", kind, verdicts);
+            assert_eq!(verdicts[0], kind != 1, "kind {}", kind);
+        }
+        crate::unified_p2p::HIGHEST_VERIFIED_HEIGHT.store(prev_verified, Ordering::Relaxed);
+    }
+
+    /// The bucket's bounds through the stage itself: h registers super S, then COMMIT_DEFERRED_MAX + 1 distinct
+    /// children of h, each carrying a heartbeat of S, arrive while apply(h) is held. The bucket keeps
+    /// COMMIT_DEFERRED_MAX, the last goes back to the fetch/sync path, and none is refused for waiting. Once h
+    /// commits every held child is judged (and accepted); the dropped one never is.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_full_commit_wait_drops_to_the_fetch_path_and_refuses_nothing() {
+        let _g = crate::block_pipeline::VERIFY_STAGE_TEST_LOCK.lock();
+        let prev_verified = crate::unified_p2p::highest_verified_height();
+        let max = crate::block_pipeline::COMMIT_DEFERRED_MAX;
+        let timeout = std::time::Duration::from_secs(30);
+        let (_dir, storage, epoch, members) = one_node_storage().await;
+        let storage = Arc::new(storage);
+        let (sup, super_id, sk) = super_with_consensus_key(epoch, &members, "a full commit wait", "solBurnSigFullWait");
+        let (bh, _) = one_node_chain(&sup, &sup, &storage).await;
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let state = Arc::new(tokio::sync::RwLock::new(crate::StateManager::new()));
+        let (feed, mut out, metrics) = crate::block_pipeline::spawn_verify_stage_with_state_for_test(
+            storage.clone(), notify.clone(), state.clone());
+        let dec = |b: &qnet_state::MicroBlock| crate::block_pipeline::decoded_for_test(b.clone(), "self");
+        feed.send(dec(&bh)).await.unwrap();
+        assert_eq!(tokio::time::timeout(timeout, out.recv()).await.unwrap().unwrap().height, bh.height);
+        for i in 0..=max as u64 {
+            let mut anchor = [7u8; 32];
+            anchor[..8].copy_from_slice(&i.to_le_bytes());
+            let child = pipe_block(bh.height + 1, bh.hash(), 2_002,
+                                   vec![heartbeat_signed(&super_id, (ONE_NODE_GATE + 3, anchor), &sk)]);
+            feed.send(dec(&child)).await.unwrap();
+        }
+        wait_until("the bucket to fill and drop one", || metrics.commit_deferred_n.load(Ordering::Relaxed) == max as u64
+            && metrics.deferred_evicted.load(Ordering::Relaxed) == 1).await;
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(metrics.commit_deferred_n.load(Ordering::Relaxed), max as u64, "the count bound");
+        assert_eq!(metrics.deferred_evicted.load(Ordering::Relaxed), 1, "one dropped to the fetch/sync path");
+        assert_eq!(metrics.verify_failed.load(Ordering::Relaxed), 0, "never refused for waiting");
+        assert!(out.try_recv().is_err(), "nor accepted while apply(h) is held");
+
+        commit_under_state_lock(&storage, &state, &bh, &notify, 0).await;
+        for n in 0..max {
+            let b = tokio::time::timeout(timeout, out.recv()).await
+                .unwrap_or_else(|_| panic!("held child {} judged", n)).expect("the stage runs");
+            assert_eq!(b.height, bh.height + 1);
+        }
+        wait_until("nothing left waiting", || metrics.commit_deferred_n.load(Ordering::Relaxed) == 0).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(out.try_recv().is_err(), "the dropped child is not judged");
+        assert_eq!(metrics.verify_failed.load(Ordering::Relaxed), 0);
+        drop(feed);
+        crate::unified_p2p::HIGHEST_VERIFIED_HEIGHT.store(prev_verified, Ordering::Relaxed);
+    }
+
+    /// H-3: the collector counts an answer only from the member asked, once, with a signature block validation
+    /// accepts. One member of a six-member committee answers first with a junk signature, then under an honest
+    /// member's id, with junk and with that member's real signature: the five honest answers still fill the
+    /// quorum, and the registration carrying them passes at and above the tx_target_bound gate, where every
+    /// entry must count.
+    #[tokio::test]
+    async fn one_bad_member_cannot_spoil_the_collected_quorum() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage");
+        let h = TARGET_GATE;
+        let epoch = (h - 1) / 90 + 1;
+        seed_committee_mb(&storage, epoch - 2, 6).await;
+        let committee = BlockchainNode::committee_for_height(&storage, (epoch - 1) * 90 + 1).expect("committee");
+        assert_eq!(committee.len(), 6);
+        let need = qnet_consensus::checkpoint_bft::quorum_size(committee.len());
+        assert_eq!(need, 5);
+        // A Solana-derived light in the client form.
+        let wallet = burn_beneficiary();
+        let burner = burn_owner().0;
+        let light_id = crate::rpc::generate_light_node_pseudonym(&wallet);
+        let (burn_tx, amount) = ("solBurnSigTally", 1500u64);
+        let msg = qnet_state::Transaction::burn_attestation_message(
+            burn_tx, &burner, &wallet, amount, &qnet_state::NodeType::Light, amount, epoch);
+        let signed: Vec<String> = committee.iter().map(|id| {
+            let (pk, sk) = burn_gen_genesis(id);
+            storage.save_vrf_public_key(id, &hex::encode(&pk)).unwrap();
+            burn_sign(id, &pk, &sk, &msg)
+        }).collect();
+        let answer = |gid: &str, sig: &str| serde_json::json!({
+            "genesis_id": gid, "sig": sig, "cost": amount, "amount": amount, "burn_wallet": burner });
+        let (bad, honest) = (&committee[0], &committee[1..]);
+        let node_type = qnet_state::NodeType::Light;
+        let mut tally = transactions::BurnAttestTally::new(burn_tx, &burner, &wallet, &node_type, epoch, need);
+        assert!(!tally.offer(bad, &answer(bad, &format!("dilithium_sig_{}_AAAA", bad)), &storage).await, "junk signature");
+        assert!(!tally.offer(bad, &answer(&honest[0], "junk"), &storage).await, "another member's id");
+        assert!(!tally.offer(bad, &answer(&honest[0], &signed[1]), &storage).await, "another member's real signature");
+        assert!(!tally.offer(&honest[1], &answer(&honest[1], &signed[1]), &storage).await, "a signature under the wrong key");
+        let mut reached = false;
+        for (i, id) in honest.iter().enumerate() {
+            assert!(!reached, "the quorum closes at the fifth honest answer");
+            reached = tally.offer(id, &answer(id, &signed[i + 1]), &storage).await;
+            assert!(!tally.offer(id, &answer(id, &signed[i + 1]), &storage).await || reached, "a repeat counts once");
+        }
+        assert!(reached && tally.reached());
+        let (entries, cost, agreed) = tally.outcome().expect("a quorum");
+        assert_eq!((entries.len(), cost, agreed), (5, amount, amount));
+        assert!(entries.iter().all(|(id, _)| id != bad), "the bad member is not in the list");
+
+        let mut tx = BlockchainNode::create_node_registration_tx_with_timestamp(
+            &light_id, qnet_state::NodeType::Light, &wallet, "burn", "", Some(1000));
+        if let qnet_state::TransactionType::NodeRegistration {
+            burn_tx: bt, burn_wallet, burn_owner_sig, burn_amount, burn_cost, burn_attestors, attest_epoch, ..
+        } = &mut tx.tx_type {
+            *bt = burn_tx.to_string();
+            *burn_wallet = burner.clone();
+            *burn_owner_sig = burn_owner_sig_full(&light_id, &wallet, "burn", 1000, &[], burn_tx);
+            *burn_amount = amount;
+            *burn_cost = amount;
+            *burn_attestors = entries;
+            *attest_epoch = epoch;
+        }
+        tx.data = Some(qnet_state::Transaction::client_registration_data(&light_id, &wallet, "burn"));
+        tx.hash = tx.calculate_hash();
+        for at in [h, h + 90] {
+            BlockchainNode::verify_burn_attestation_quorum(&tx, at, &storage).await
+                .unwrap_or_else(|e| panic!("the collected list passes at {}: {}", at, e));
+        }
     }
 }
 

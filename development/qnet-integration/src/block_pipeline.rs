@@ -268,6 +268,162 @@ fn evict_farthest_deferred(
     }
 }
 
+/// A transaction whose verdict in the verify stage reads rows only the parent's apply writes: a
+/// NodeRegistration (the wallet's `node_<id>` rows of the one-node rule, the burn's `cbw_` binding), a
+/// NodeActivation (the wallet's burn-backed registration row) or a NodeReactivation (the committed vrf_pk).
+pub(crate) fn verdict_reads_parent_rows(txs: &[qnet_state::Transaction]) -> bool {
+    txs.iter().any(|tx| matches!(tx.tx_type,
+        qnet_state::TransactionType::NodeRegistration { .. }
+        | qnet_state::TransactionType::NodeActivation { .. }
+        | qnet_state::TransactionType::NodeReactivation { .. }))
+}
+
+/// A transaction whose verdict in the verify stage reads a signer key a parent's apply writes, while that key
+/// does not resolve here yet: a Heartbeat (its signer's key under the `node_<id>` commitment,
+/// heartbeat_signer_pk), an equivocation proof (the offender's key, equivocation_offender_pk) or a TX the
+/// registry-envelope verifier judges (its signer label's binding in the consensus key registry: unbound, a
+/// first-seen key verifies; bound, only that key does). A registration's apply writes these rows and that
+/// binding, a reactivation's the binding and a missing key row. An envelope label waits only when a block
+/// in `binds_in_flight` (key_bindings_written of each block verified but maybe not applied) can bind it: an
+/// unbound label nothing in flight binds is judged as first seen whether or not the parent has applied.
+/// No chain apply rebinds or removes a key once it resolves, so a block whose keys all resolve is judged at
+/// once and a heartbeat of a known signer never waits. Idle eviction from the key registry, the pruning of a
+/// reorged-out row and an off-chain key write (the registration RPC) can change a key outside this wait;
+/// they change the verdict on their own, with or without it.
+pub(crate) fn verdict_awaits_signer_key(storage: &Storage, txs: &[qnet_state::Transaction],
+                                        binds_in_flight: &HashMap<String, u64>) -> bool {
+    use qnet_state::TransactionType as TT;
+    txs.iter().any(|tx| {
+        let key_unresolved = match &tx.tx_type {
+            TT::Heartbeat { node_id, .. } => BlockchainNode::heartbeat_signer_pk(storage, node_id).is_none(),
+            TT::EquivocationProof { offender, .. } | TT::VoteEquivocationProof { offender, .. } =>
+                BlockchainNode::equivocation_offender_pk(storage, offender).is_none(),
+            _ => false,
+        };
+        // A merkle claim's signatures are judged by apply, never by this stage.
+        let merkle_claim = matches!(tx.tx_type, TT::RewardDistribution) && tx.from == "system_rewards_pool";
+        key_unresolved || (!merkle_claim && BlockchainNode::registry_envelope_signer(tx).map_or(false, |label|
+            binds_in_flight.contains_key(&label) && !qnet_consensus::consensus_crypto::has_consensus_pk(&label)))
+    })
+}
+
+/// The labels whose consensus key binding the apply of `txs` can write (cache_node_registrations_from_transactions):
+/// each registration's node id and each reactivation's. A light registration binds none; naming it too only
+/// adds a wait.
+pub(crate) fn key_bindings_written(txs: &[qnet_state::Transaction]) -> impl Iterator<Item = &str> {
+    txs.iter().filter_map(|tx| match &tx.tx_type {
+        qnet_state::TransactionType::NodeRegistration { node_id, .. }
+        | qnet_state::TransactionType::NodeReactivation { node_id, .. } => Some(node_id.as_str()),
+        _ => None,
+    })
+}
+
+/// Hold `decoded` until its parent's slot commits (CommitDeferred); `reads` names what its verdict reads. A
+/// full bucket drops it to the fetch/sync path, which is not a failure.
+fn hold_for_parent_commit(held: &mut CommitDeferred, metrics: &PipelineMetrics, decoded: DecodedBlock, reads: &str) {
+    let h = decoded.height;
+    if held.park(decoded, std::time::Instant::now()) {
+        if is_debug() {
+            println!("[DBG][PIPELINE] commit_deferred h={} reason=parent_uncommitted reads={} held={}", h, reads, held.len());
+        }
+    } else {
+        metrics.deferred_evicted.fetch_add(1, Ordering::Relaxed);
+        if is_info() {
+            println!("[INFO][PIPELINE] commit_deferred_full h={} dropped held={}", h, held.len());
+        }
+    }
+    metrics.mark_verify_idle();
+}
+
+/// Bounds of `CommitDeferred`. A registration wave puts one in most blocks, each waiting for one apply; the
+/// count and bytes bound a producer that floods them. A parent whose apply failed never commits, so its
+/// children go back to the fetch/sync path after the age bound.
+pub(crate) const COMMIT_DEFERRED_MAX: usize = 256;
+const COMMIT_DEFERRED_MAX_BYTES: usize = 128 * 1024 * 1024;
+const COMMIT_DEFERRED_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(60);
+/// While a block waits, the verify stage also wakes on this clock: a backstop to the apply stage's wake.
+const COMMIT_DEFERRED_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Blocks on a parent the verify stage passed but the apply stage has not committed yet (the in-flight branch
+/// of the parent check), which carry a transaction `verdict_reads_parent_rows` names, or one whose signer key
+/// `verdict_awaits_signer_key` finds unresolved. Judged at once, such a block reads the registry without the
+/// parent's rows, or with part of them, depending on which stage reaches storage first: one node accepts it,
+/// another rejects it, both for good (a super registered in h and its heartbeat in h+1 split validators for
+/// the cost of one burn). So it waits here until its parent's slot is committed and is then verified again
+/// from the top, exactly like a copy arriving at that moment.
+///
+/// No gate: this changes no verdict. A parent's slot is committed only after apply wrote its rows (they go in
+/// before `save_microblock`, a super's key row in the same batch as its `node_` row), and the state read lock
+/// every such block takes in the tx-signature batch is granted only after that apply's write section ends,
+/// after the key bindings it writes once the height is set (the RAM key registry, the consensus key
+/// registry). The block is therefore judged against the chain through its parent, which is what every node
+/// judges it against when the parent was already applied on arrival (a later copy, a syncing node, the
+/// producer after its inline apply). A block on a committed parent, or whose signer keys all resolve, is
+/// judged as before: within the parent's lifetime no chain apply rebinds or removes a key that resolved, so
+/// the parent's apply cannot change that read. Nor can it bind an envelope label no block in flight names
+/// (key_bindings_written), so such a label is judged at once too. Idle eviction from the key registry, the
+/// pruning of a reorged-out `node_` row and an off-chain key write are outside this wait and change verdicts
+/// on their own, with or without it. The only verdict removed is the one read from a partly applied parent.
+/// A waiting block is never rejected for waiting: past a bound it is dropped, and the fetch/sync path brings
+/// it again.
+struct CommitDeferred {
+    held: Vec<(std::time::Instant, DecodedBlock)>,
+    bytes: usize,
+}
+
+impl CommitDeferred {
+    fn new() -> Self {
+        CommitDeferred { held: Vec::new(), bytes: 0 }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.held.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.held.len()
+    }
+
+    /// Whether the block named `hash` waits here.
+    fn holds(&self, hash: &[u8; 32]) -> bool {
+        self.held.iter().any(|(_, d)| d.microblock.hash() == *hash)
+    }
+
+    /// Hold `block`. False when the bucket is full: the caller drops it to the fetch/sync path. A second copy
+    /// of a held block is kept once.
+    fn park(&mut self, block: DecodedBlock, now: std::time::Instant) -> bool {
+        if self.holds(&block.microblock.hash()) { return true; }
+        let size = block.raw_data.len();
+        if self.held.len() >= COMMIT_DEFERRED_MAX || self.bytes.saturating_add(size) > COMMIT_DEFERRED_MAX_BYTES {
+            return false;
+        }
+        self.bytes = self.bytes.saturating_add(size);
+        self.held.push((now, block));
+        true
+    }
+
+    /// The held blocks to verify again: each whose parent slot `committed(h - 1)` now names, its parent or,
+    /// after a reorg, another block (the parent check then answers as for any arrival). Blocks past the age
+    /// bound whose parent slot is still empty are dropped; the second value counts them.
+    fn take_ready(&mut self, now: std::time::Instant, committed: impl Fn(u64) -> Option<[u8; 32]>) -> (Vec<DecodedBlock>, usize) {
+        let mut ready = Vec::new();
+        let mut expired = 0usize;
+        let mut keep = Vec::with_capacity(self.held.len());
+        for (at, d) in self.held.drain(..) {
+            let slot_committed = committed(d.microblock.height.saturating_sub(1)).is_some();
+            let aged = now.duration_since(at) > COMMIT_DEFERRED_MAX_AGE;
+            if !slot_committed && !aged {
+                keep.push((at, d));
+                continue;
+            }
+            self.bytes = self.bytes.saturating_sub(d.raw_data.len());
+            if slot_committed { ready.push(d); } else { expired += 1; }
+        }
+        self.held = keep;
+        (ready, expired)
+    }
+}
+
 /// Reset the breaker after a clean apply.
 fn clear_apply_mismatch() {
     if APPLY_MISMATCH_COUNT.load(Ordering::Relaxed) != 0 {
@@ -424,6 +580,140 @@ pub(crate) fn signal_fork_recovery(target: u64) {
     }
 }
 
+/// The pending target when it was DECIDED by evidence that settles the chain: certified content, or a higher
+/// authorised round between two blocks on one parent (`failover_tenure_bound`). The consumer skips the round
+/// floor for exactly that target. The floor guards an uncertified tail against a heuristic, and a decided
+/// rollback is not one: on 04.10 the forked node's own round-carrying blocks cancelled every rollback that
+/// would have healed it.
+static FORK_RECOVERY_DECIDED: AtomicU64 = AtomicU64::new(0);
+
+/// `signal_fork_recovery` for a decided target. Marked decided only when it became the pending target.
+pub(crate) fn signal_fork_recovery_decided(target: u64) {
+    if target == 0 { return; }
+    signal_fork_recovery(target);
+    let fin = crate::node::LAST_FINALIZED_HEIGHT.load(Ordering::SeqCst);
+    let clamped = if fin > 0 { target.max(fin) } else { target };
+    if fork_recovery_target() == clamped {
+        FORK_RECOVERY_DECIDED.store(clamped, Ordering::SeqCst);
+    }
+}
+
+/// Was `taken`, the target just taken from the signal, a decided one? The mark is consumed with it, and a mark
+/// that no longer names the pending target is dropped, so it never promotes a later heuristic target.
+pub(crate) fn take_fork_recovery_decided(taken: u64) -> bool {
+    let d = FORK_RECOVERY_DECIDED.load(Ordering::SeqCst);
+    if d != 0 && d == taken {
+        let _ = FORK_RECOVERY_DECIDED.compare_exchange(d, 0, Ordering::SeqCst, Ordering::SeqCst);
+        return true;
+    }
+    if d != 0 && FORK_RECOVERY_HEIGHT.load(Ordering::SeqCst) != d {
+        let _ = FORK_RECOVERY_DECIDED.compare_exchange(d, 0, Ordering::SeqCst, Ordering::SeqCst);
+    }
+    false
+}
+
+/// The block's branch contradicts this node's finality: its parent sits at or below the finality evidence floor
+/// (max(LAST_FINALIZED_HEIGHT, committed_lists_top)) and is not the block that evidence names there.
+pub fn parent_contradicts_finality(parent_h: u64, parent: &[u8; 32], floor: u64, named: Option<[u8; 32]>) -> bool {
+    parent_h <= floor && named.map_or(false, |n| &n != parent)
+}
+
+/// Blocks known to descend from a parent that contradicts this node's finality, with their height. A child of
+/// one is contradicted too, without a lookup. Bounded, pruned at finality.
+static FINALITY_CONTRADICTED: once_cell::sync::Lazy<dashmap::DashMap<[u8; 32], u64>> =
+    once_cell::sync::Lazy::new(dashmap::DashMap::new);
+const FINALITY_CONTRADICTED_MAX: usize = 4 * 90;
+
+/// Where an incoming block named a parent other than ours at the height below it: parent hash → (child hash,
+/// child height). The walk toward the parting point follows it back up, so a branch found to contradict
+/// finality is marked up to the block that started the walk. Bounded.
+static WALK_TRAIL: once_cell::sync::Lazy<dashmap::DashMap<[u8; 32], ([u8; 32], u64)>> =
+    once_cell::sync::Lazy::new(dashmap::DashMap::new);
+const WALK_TRAIL_MAX: usize = 512;
+
+// The finality evidence of `note_if_contradicts_finality_at`: heights at or below max(finalized,
+// committed_lists_top) carry it, and the body it names is the QC-certified hash (the sealed window or the
+// committed checkpoint) first, this node's own committed row only at or below its finalized height. Above it
+// the row is this node's claim, not finality: read first, it would make a node on the losing branch see the
+// winning branch as the one contradicting finality.
+
+/// Keep `map` within `max` entries: heights at or below finality go first, then the lowest.
+fn prune_by_height<V>(map: &dashmap::DashMap<[u8; 32], V>, max: usize, height_of: impl Fn(&V) -> u64) {
+    if map.len() <= max { return; }
+    let fin = crate::node::LAST_FINALIZED_HEIGHT.load(Ordering::SeqCst);
+    map.retain(|_, v| height_of(v) > fin);
+    if map.len() <= max { return; }
+    let top = map.iter().map(|e| height_of(e.value())).max().unwrap_or(0);
+    map.retain(|_, v| height_of(v).saturating_add(max as u64) > top);
+}
+
+fn mark_finality_contradicted(hash: [u8; 32], h: u64) {
+    FINALITY_CONTRADICTED.insert(hash, h);
+    // Every block that started a walk through this one descends from it.
+    let mut cur = hash;
+    for _ in 0..WALK_TRAIL_MAX {
+        let next = match WALK_TRAIL.remove(&cur) { Some((_, v)) => v, None => break };
+        FINALITY_CONTRADICTED.insert(next.0, next.1);
+        cur = next.0;
+    }
+    prune_by_height(&FINALITY_CONTRADICTED, FINALITY_CONTRADICTED_MAX, |h| *h);
+}
+
+/// Does `mb` descend from a parent that contradicts this node's finality? Marks it, and the walk trail above
+/// it, when it does. Read only for gated heights (`failover_tenure_bound`).
+pub(crate) fn note_if_contradicts_finality(storage: &Storage, mb: &qnet_state::MicroBlock) -> bool {
+    note_if_contradicts_finality_at(storage, mb, crate::node::LAST_FINALIZED_HEIGHT.load(Ordering::SeqCst))
+}
+
+/// The same against a given `finalized` height.
+fn note_if_contradicts_finality_at(storage: &Storage, mb: &qnet_state::MicroBlock, finalized: u64) -> bool {
+    if mb.height == 0 { return false; }
+    let contradicted = FINALITY_CONTRADICTED.contains_key(&mb.previous_hash) || {
+        let parent_h = mb.height - 1;
+        let floor = finalized.max(committed_lists_top(storage));
+        let named = certified_micro_hash(storage, parent_h)
+            .or_else(|| if parent_h <= finalized { storage.committed_hash_at(parent_h) } else { None });
+        parent_h <= floor && parent_contradicts_finality(parent_h, &mb.previous_hash, floor, named)
+    };
+    if contradicted { mark_finality_contradicted(mb.hash(), mb.height); }
+    contradicted
+}
+
+/// One step of fork choice at a stored height from the failover_tenure_bound gate, in evidence order: certified
+/// content decides at once, even between blocks on different parents; then a competitor whose branch contradicts
+/// this node's finality is ignored; then two blocks on different parents are not compared at all, the walk goes
+/// one height down toward where their branches part; only siblings go on to the round comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GatedForkStep { Decide, IgnoreContradicted, WalkToPartingPoint }
+
+pub(crate) fn gated_fork_step(content_wins: bool, contradicted: impl FnOnce() -> bool, sibling: bool) -> GatedForkStep {
+    if content_wins { return GatedForkStep::Decide; }
+    if contradicted() { return GatedForkStep::IgnoreContradicted; }
+    if !sibling { return GatedForkStep::WalkToPartingPoint; }
+    GatedForkStep::Decide
+}
+
+/// The pre-gate anchor-recovery rank of a child against OUR block at the child's height: a strictly higher
+/// authorised absolute round, or an equal-round self-fork. The two blocks need not share a parent, which is the
+/// defect the gate removes: on 04.10 a lone branch's round-3 blocks outranked the finalized majority's round-0
+/// blocks at every height.
+pub(crate) fn anchor_outranks(incoming_abs: u64, local_abs: u64, authorised: impl FnOnce() -> bool,
+                              selffork_lower: impl FnOnce() -> bool) -> bool {
+    if incoming_abs > local_abs { authorised() } else if incoming_abs == local_abs { selffork_lower() } else { false }
+}
+
+fn note_walk_trail(parent: [u8; 32], child: [u8; 32], child_h: u64) {
+    WALK_TRAIL.insert(parent, (child, child_h));
+    prune_by_height(&WALK_TRAIL, WALK_TRAIL_MAX, |v| v.1);
+}
+
+#[cfg(test)]
+pub(crate) fn test_clear_fork_choice_state() {
+    FINALITY_CONTRADICTED.clear();
+    WALK_TRAIL.clear();
+    FORK_RECOVERY_DECIDED.store(0, Ordering::SeqCst);
+}
+
 
 /// Equal-absolute-round fork-choice tie-break for a PRE-VERIFY competitor (gossip-duplicate / repair /
 /// anchor-recovery — verify_stage is skipped or not-yet-run, so the bytes are UNVERIFIED). The incoming
@@ -560,26 +850,32 @@ pub(crate) fn held_at_or_below_tip(storage: &Storage, h: u64) -> bool {
 }
 
 fn maybe_supersede_by_certified_round(storage: &Arc<Storage>, block: &IngestBlock, p2p: Option<&SimplifiedP2P>) {
+    supersede_at(storage, block, p2p,
+                 crate::node::LAST_FINALIZED_HEIGHT.load(Ordering::SeqCst),
+                 crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(Ordering::Acquire));
+}
+
+/// `maybe_supersede_by_certified_round` against this node's `finalized` height and applied `tip`.
+fn supersede_at(storage: &Arc<Storage>, block: &IngestBlock, p2p: Option<&SimplifiedP2P>, finalized: u64, tip: u64) {
     let h = block.height;
     if h == 0 { return; }
-    let finalized = crate::node::LAST_FINALIZED_HEIGHT.load(Ordering::SeqCst);
     if h <= finalized { return; } // never reorg finalized history
     // A row above the applied tip is not chain state: the apply stage installs this height.
-    if h > crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(Ordering::Acquire) { return; }
+    if h > tip { return; }
 
     // Ok(None) is genuinely absent - the ordinary ingest path installs it. Err is different: we
     // HOLD bytes we cannot read, so every presence check says "have it" and nothing ever replaces
     // them. Defend nothing in that case and let the certified competitor through below.
     let mut hold_nothing = false;
-    let (our_round, our_baseline, our_producer, our_hash) = match storage.load_microblock_auto_format(h) {
-        Ok(Some(mb)) => { let hh = mb.hash(); (mb.timeout_round, mb.carried_baseline, mb.producer, hh) },
+    let (our_round, our_baseline, our_producer, our_hash, our_prev) = match storage.load_microblock_auto_format(h) {
+        Ok(Some(mb)) => { let hh = mb.hash(); (mb.timeout_round, mb.carried_baseline, mb.producer, hh, mb.previous_hash) },
         Ok(None) => return,
         Err(e) => {
             if crate::node::is_warn() {
                 println!("[WARN][FORK] local_body_unreadable h={} err={} action=adopt_certified_only", h, e);
             }
             hold_nothing = true;
-            (0, 0, String::new(), [0u8; 32])
+            (0, 0, String::new(), [0u8; 32], [0u8; 32])
         }
     };
     let mb_idx = h / 90;
@@ -636,6 +932,44 @@ fn maybe_supersede_by_certified_round(storage: &Arc<Storage>, block: &IngestBloc
     let content_wins = certified_hash.map_or(false, |c| incoming.hash() == c && our_hash != c);
     // Holding unreadable bytes buys no authority over rounds: adopt the CERTIFIED body only.
     if hold_nothing && !content_wins { return; }
+    // A source 2f+1 observers flagged as a chain break drives no rollback; certified content still does.
+    if !content_wins && rollback_source_quarantined(&block.from_peer, &incoming.producer, h) {
+        if is_warn() {
+            println!("[WARN][FORK] rollback_refused h={} source={} reason=fork_source_quorum", h, block.from_peer);
+        }
+        return;
+    }
+    // From the failover_tenure_bound gate two blocks are compared only where their branches part, and never
+    // toward a branch whose parent contradicts this node's finality. The rounds of two blocks on different
+    // parents say nothing about each other: on 04.10 a lone node's branch kept rolling the finalized majority
+    // back because its blocks carried a higher round.
+    let gated = crate::node::failover_tenure_bound(h);
+    if gated {
+        let step = gated_fork_step(content_wins,
+            || note_if_contradicts_finality_at(storage, &incoming, finalized), incoming.previous_hash == our_prev);
+        match step {
+            GatedForkStep::IgnoreContradicted => {
+                if is_warn() {
+                    println!("[WARN][FORK] contradicts_finality h={} parent={:x?} from={} producer={} action=ignore",
+                             h, &incoming.previous_hash[..8], block.from_peer, incoming.producer);
+                }
+                return;
+            }
+            GatedForkStep::WalkToPartingPoint => {
+                // Not a sibling: walk one height down toward the parting point, where the two are compared.
+                note_walk_trail(incoming.previous_hash, incoming.hash(), h);
+                if h - 1 > finalized {
+                    if let (Some(p), Ok(handle)) = (crate::node::try_get_p2p(), tokio::runtime::Handle::try_current()) {
+                        let p = p.clone();
+                        let below = h - 1;
+                        handle.spawn(async move { let _ = p.request_block_repair(below).await; });
+                    }
+                }
+                return;
+            }
+            GatedForkStep::Decide => {}
+        }
+    }
     let incoming_abs = incoming.timeout_round.saturating_add(incoming.carried_baseline);
     let our_abs = our_round.saturating_add(our_baseline);
     let incoming_wins = if content_wins {
@@ -645,7 +979,7 @@ fn maybe_supersede_by_certified_round(storage: &Arc<Storage>, block: &IngestBloc
         // that missed the separate TC broadcast learns the round in-band; the higher round wins ONLY if
         // n−f-certified (a forged round advances nothing → not certified → ignored). Adopt only in this
         // higher-round branch — an equal/lower round needs no new round authority.
-        if let (Some(pb), Some(p)) = (incoming.timeout_proof.as_ref(), p2p) { p.adopt_timeout_proof_bytes(pb); }
+        if let (Some(pb), Some(p)) = (incoming.timeout_proof.as_ref(), p2p) { p.adopt_timeout_proof_bytes_at(incoming.height, pb); }
         // Slot rule, not window: a tenure that straddles a window boundary keeps its certified
         // round, so a competitor elected under it is already certified here.
         let certified_abs = crate::unified_p2p::certified_round_for_slot(incoming.height);
@@ -669,7 +1003,9 @@ fn maybe_supersede_by_certified_round(storage: &Arc<Storage>, block: &IngestBloc
                         let keep_from = mb_idx.saturating_sub(16);
                         FAILOVER_CERT_PULL_TIMES.retain(|k, _| *k >= keep_from);
                     }
-                    p.request_timeout_proofs(mb_idx, mb_idx);
+                    // From the window the slot's tenure began in: a tenure-bound certificate for the slot that
+                    // opens a window may sit under the window before it.
+                    p.request_timeout_proofs(crate::node::tenure_first_slot(h) / 90, mb_idx);
                 }
             }
             return;
@@ -705,7 +1041,8 @@ fn maybe_supersede_by_certified_round(storage: &Arc<Storage>, block: &IngestBloc
     // signal is never masked. (h > finalized is guaranteed above; .max is a floor clamp.)
     let target = h.saturating_sub(1).max(finalized);
     clear_contradicted_tail(h);
-    signal_fork_recovery(target);
+    // From the gate the comparison ran between siblings on certified evidence: the rollback is decided.
+    if gated { signal_fork_recovery_decided(target); } else { signal_fork_recovery(target); }
     if is_warn() {
         println!("[WARN][FORK] round_supersede h={} our_round={} new_round={} action=reorg_to_certified",
                  h, our_round, incoming.timeout_round);
@@ -1023,6 +1360,38 @@ pub fn cleanup_forked_peer_cooldown() {
         now_ms.saturating_sub(*marked_at) < FORKED_PEER_COOLDOWN_MS
     });
 }
+
+/// Sources that 2f+1 observers rejected as a chain break, with the time of the latest flag (ms). While a source is
+/// here no heuristic rollback is taken toward its blocks: the observers that flagged it are the majority, so rolling
+/// toward it moves this node away from them. Same window as the fork cooldown, refreshed by every new flag, bounded.
+static QUARANTINED_FORK_SOURCES: once_cell::sync::Lazy<dashmap::DashMap<String, u64>> =
+    once_cell::sync::Lazy::new(dashmap::DashMap::new);
+const QUARANTINED_FORK_SOURCES_MAX: usize = 1024;
+
+/// Record that 2f+1 observers flagged `source` (`fork_source_flagged`).
+pub fn quarantine_fork_source(source: &str) {
+    if source.is_empty() || source == "self" { return; }
+    let now = now_ms();
+    QUARANTINED_FORK_SOURCES.insert(source.to_string(), now);
+    if QUARANTINED_FORK_SOURCES.len() > QUARANTINED_FORK_SOURCES_MAX {
+        QUARANTINED_FORK_SOURCES.retain(|_, t| now.saturating_sub(*t) < FORKED_PEER_COOLDOWN_MS);
+    }
+}
+
+fn fork_source_quarantined(id: &str) -> bool {
+    QUARANTINED_FORK_SOURCES.get(id).map_or(false, |t| now_ms().saturating_sub(*t) < FORKED_PEER_COOLDOWN_MS)
+}
+
+/// May a block from `from_peer`, signed by `producer` at height `h`, NOT drive a rollback? True while either id is
+/// quarantined, unless `producer` is the leader this node elects for `h`: consensus outranks the heuristic, as the
+/// flag rule itself already applies. Blocks that extend our chain are unaffected; only the destructive legs ask.
+pub fn rollback_source_quarantined(from_peer: &str, producer: &str, h: u64) -> bool {
+    if crate::node::get_expected_producer(h).map_or(false, |(p, _)| p == producer) { return false; }
+    fork_source_quarantined(from_peer) || fork_source_quarantined(producer)
+}
+
+#[cfg(test)]
+pub(crate) fn test_clear_quarantine() { QUARANTINED_FORK_SOURCES.clear(); }
 
 /// Periodic cleanup of stale witness entries below `min_height`.
 /// Called by unified_p2p cleanup tasks.
@@ -1432,6 +1801,8 @@ pub struct PipelineMetrics {
     pub deferred_bytes: AtomicU64,
     pub committee_deferred_n: AtomicU64,
     pub committee_deferred_bytes: AtomicU64,
+    /// Blocks waiting for their parent's commit (`CommitDeferred`).
+    pub commit_deferred_n: AtomicU64,
     pub apply_held_n: AtomicU64,
     pub apply_held_bytes: AtomicU64,
 }
@@ -1580,6 +1951,7 @@ pub fn holder_census() -> Vec<(&'static str, u64)> {
         out.push(("pipe_deferred_mb", m.deferred_bytes.load(Ordering::Relaxed) >> 20));
         out.push(("pipe_committee_deferred", m.committee_deferred_n.load(Ordering::Relaxed)));
         out.push(("pipe_committee_deferred_mb", m.committee_deferred_bytes.load(Ordering::Relaxed) >> 20));
+        out.push(("pipe_commit_deferred", m.commit_deferred_n.load(Ordering::Relaxed)));
         out.push(("pipe_apply_held", m.apply_held_n.load(Ordering::Relaxed)));
         out.push(("pipe_apply_held_mb", m.apply_held_bytes.load(Ordering::Relaxed) >> 20));
     }
@@ -1610,6 +1982,7 @@ impl PipelineMetrics {
             deferred_bytes: AtomicU64::new(0),
             committee_deferred_n: AtomicU64::new(0),
             committee_deferred_bytes: AtomicU64::new(0),
+            commit_deferred_n: AtomicU64::new(0),
             apply_held_n: AtomicU64::new(0),
             apply_held_bytes: AtomicU64::new(0),
         }
@@ -2056,6 +2429,7 @@ impl BlockPipeline {
         // at a time inside a single-task stage.
         let verify_permits_stage = Arc::new(tokio::sync::Semaphore::new(1));
         let state_verify = ctx.state.clone(); // FIX-5: deterministic pk source (same handle apply_stage uses)
+        let apply_notify_verify = ctx.apply_notify.clone(); // wakes blocks waiting for their parent's commit
         tokio::spawn(Self::verify_stage(
             sig_verified_rx,
             verify_tx,
@@ -2066,6 +2440,7 @@ impl BlockPipeline {
             p2p_verify,
             verify_permits_stage,
             state_verify,
+            apply_notify_verify,
         ));
 
         // Stage 3: Verify → Apply (state transitions + storage write + ALL side effects)
@@ -2104,6 +2479,7 @@ impl BlockPipeline {
             const STUCK_THRESHOLD_MS: u64 = 30_000;
             let mut last_verified: u64 = 0;
             let mut last_applied: u64 = 0;
+            let mut last_tip: u64 = 0;
             // 0 sentinel = "no verify/apply seen yet"; the dump guards require != 0, so the boot wait
             // (nothing to apply) can't trip a spurious CRIT — stall is measured from first real progress.
             let mut last_verified_progress_ms: u64 = 0;
@@ -2128,14 +2504,19 @@ impl BlockPipeline {
                 let dup_now = metrics_watchdog.duplicates_skipped.load(Ordering::Relaxed);
                 let verify_progress_now = verified_now.saturating_add(dup_now);
                 let apply_progress_now = applied_now.saturating_add(dup_now);
+                // The node's own blocks are applied inline by the producer and never pass this stage, and
+                // their echoes need not come back either: through a 30-block production round neither
+                // counter moves, which read as a 30 s apply stall. A moving tip is progress.
+                let tip_now = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(Ordering::Relaxed);
 
                 if verify_progress_now != last_verified {
                     last_verified = verify_progress_now;
                     last_verified_progress_ms = now;
                     verify_stuck_repeats = 0; // a later, unrelated stall must open at WARN again
                 }
-                if apply_progress_now != last_applied {
+                if apply_progress_now != last_applied || tip_now != last_tip {
                     last_applied = apply_progress_now;
+                    last_tip = tip_now;
                     last_applied_progress_ms = now;
                     apply_stuck_repeats = 0; // a later, unrelated stall must open at WARN again
                 }
@@ -2423,9 +2804,12 @@ impl BlockPipeline {
         // without re-ordering the deferred-buffer / hash-chain state.
         verify_permits: Arc<tokio::sync::Semaphore>,
         // FIX-5: committed in-mem State — the ONLY deterministic source for an elided value-TX's
-        // dilithium_public_key (never the detached accounts CF). Legal because the parent-continuity
-        // gate pins apply-frontier == H-1 when the value-TX batch runs (see the batch below).
+        // dilithium_public_key (never the detached accounts CF). A parent passed here may still be
+        // applying, so State can lack its writes: a key not there yet defers the block, never rejects
+        // it, and a bound key never changes (see the batch below).
         state: Arc<RwLock<crate::StateManager>>,
+        // Fired by the apply stage after each committed block: wakes blocks in `commit_deferred`.
+        apply_notify: Arc<tokio::sync::Notify>,
     ) {
         // Suppress unused warning until callers acquire the permit. The
         // intentional design: hold a reference so the semaphore is
@@ -2466,6 +2850,13 @@ impl BlockPipeline {
         // — re-driven when their committee becomes available (see redrive below). Bounded by DEFERRED_MAX.
         let mut committee_deferred: HashMap<u64, DecodedBlock> = HashMap::new();
         let mut committee_deferred_bytes: usize = 0;
+        // Blocks on a parent verified here but not committed yet whose verdict reads the parent's rows
+        // (see CommitDeferred): re-driven when the parent's slot is committed.
+        let mut commit_deferred = CommitDeferred::new();
+        // The envelope labels each verified block's apply can bind (key_bindings_written), by the highest such
+        // block: every block still in flight was verified here, so a label an uncommitted parent or ancestor
+        // binds is in this map (verdict_awaits_signer_key).
+        let mut binds_in_flight: HashMap<String, u64> = HashMap::new();
         // Watermark of the last deferred re-drive (see the drain below): (applied tip, sealed-macroblock
         // index). BOTH move independently and gate the two defer reasons — pk_unresolved clears when the
         // chain APPLIES the committing block (chain_h moves); the N-2-committee defer clears when the N-2
@@ -2505,60 +2896,81 @@ impl BlockPipeline {
                     last_rollback_target = target;
                 }
             }
-            // The buffer is swept on a clock, not only per block: during a halt nothing arrives.
-            let decoded = match tokio::time::timeout(
-                std::time::Duration::from_secs(DEFERRED_SWEEP_SECS), rx.recv()).await
-            {
-                Ok(Some(d)) => d,
-                Ok(None) => break 'outer,
-                Err(_) => {
-                    if deferred_count > 0 {
+            // The buffer is swept on a clock, not only per block: during a halt nothing arrives. While a
+            // block waits for its parent's commit (commit_deferred) the stage also wakes when apply commits.
+            let received = if commit_deferred.is_empty() {
+                match tokio::time::timeout(std::time::Duration::from_secs(DEFERRED_SWEEP_SECS), rx.recv()).await {
+                    Ok(Some(d)) => Some(d),
+                    Ok(None) => break 'outer,
+                    Err(_) => None,
+                }
+            } else {
+                let woke = tokio::select! {
+                    r = rx.recv() => Some(r),
+                    _ = apply_notify.notified() => None,
+                    _ = tokio::time::sleep(COMMIT_DEFERRED_POLL) => None,
+                };
+                match woke {
+                    Some(Some(d)) => Some(d),
+                    Some(None) => break 'outer,
+                    None => None,
+                }
+            };
+            let mut to_process: Vec<DecodedBlock> = Vec::new();
+            match received {
+                None => {
+                    if deferred_count > 0
+                        && last_sweep.elapsed() >= std::time::Duration::from_secs(DEFERRED_SWEEP_SECS)
+                    {
                         sweep_deferred_now(&storage, &metrics, &mut deferred, &mut deferred_by_producer,
                                            &mut deferred_count, &mut deferred_bytes);
                         last_sweep = std::time::Instant::now();
                     }
-                    continue 'outer;
+                    if commit_deferred.is_empty() { continue 'outer; }
                 }
-            };
-            // v15.4 DIAG: a fresh block has just arrived — between recv()
-            // calls the stage was idle on the channel, so reset the op
-            // marker to a clean idle baseline. The earlier mark_verify_op
-            // calls only fire on the success-with-progress path; without
-            // this reset, an early-continue path (horizon drop, deferred
-            // insert, hash break, sig fail, etc.) would leave a stale
-            // op marker visible to the watchdog if the channel then went
-            // quiet. Resetting on recv keeps the watchdog's "op stuck"
-            // signal trustworthy: a non-idle op means a block is actively
-            // being processed right now.
-            metrics.mark_verify_idle();
+                Some(decoded) => {
+                    // v15.4 DIAG: a fresh block has just arrived — between recv()
+                    // calls the stage was idle on the channel, so reset the op
+                    // marker to a clean idle baseline. The earlier mark_verify_op
+                    // calls only fire on the success-with-progress path; without
+                    // this reset, an early-continue path (horizon drop, deferred
+                    // insert, hash break, sig fail, etc.) would leave a stale
+                    // op marker visible to the watchdog if the channel then went
+                    // quiet. Resetting on recv keeps the watchdog's "op stuck"
+                    // signal trustworthy: a non-idle op means a block is actively
+                    // being processed right now.
+                    metrics.mark_verify_idle();
 
-            // Refresh local chain tip for the horizon filter every 16 blocks —
-            // amortises storage reads while keeping the horizon close to real.
-            if horizon_cache_age == 0 {
-                horizon_cache_h = storage.get_chain_height().unwrap_or(0);
-                horizon_cache_syncing = coordinator.snapshot().is_syncing();
-            }
-            horizon_cache_age = (horizon_cache_age + 1) & 0xF;
+                    // Refresh local chain tip for the horizon filter every 16 blocks —
+                    // amortises storage reads while keeping the horizon close to real.
+                    if horizon_cache_age == 0 {
+                        horizon_cache_h = storage.get_chain_height().unwrap_or(0);
+                        horizon_cache_syncing = coordinator.snapshot().is_syncing();
+                    }
+                    horizon_cache_age = (horizon_cache_age + 1) & 0xF;
 
-            // Apply horizon filter at the entry point — never enters deferred
-            // buffer. Drops are non-failure (sync will refetch). Sync widens the
-            // horizon to DEFERRED_MAX so the dispatcher's in-flight window is
-            // admitted, not dropped — closes the apply-horizon/dispatch mismatch
-            // that throttled cold-join catch-up to a rolling-200 crawl.
-            let horizon = if horizon_cache_syncing { DEFERRED_MAX as u64 } else { GOSSIP_HORIZON };
-            if decoded.microblock.height > horizon_cache_h.saturating_add(horizon) {
-                metrics.future_dropped.fetch_add(1, Ordering::Relaxed);
-                if is_debug() {
-                    println!(
-                        "[DBG][PIPELINE] horizon_drop h={} local_tip={} horizon={} syncing={}",
-                        decoded.microblock.height, horizon_cache_h, horizon, horizon_cache_syncing,
-                    );
+                    // Apply horizon filter at the entry point — never enters deferred
+                    // buffer. Drops are non-failure (sync will refetch). Sync widens the
+                    // horizon to DEFERRED_MAX so the dispatcher's in-flight window is
+                    // admitted, not dropped — closes the apply-horizon/dispatch mismatch
+                    // that throttled cold-join catch-up to a rolling-200 crawl.
+                    let horizon = if horizon_cache_syncing { DEFERRED_MAX as u64 } else { GOSSIP_HORIZON };
+                    if decoded.microblock.height > horizon_cache_h.saturating_add(horizon) {
+                        metrics.future_dropped.fetch_add(1, Ordering::Relaxed);
+                        if is_debug() {
+                            println!(
+                                "[DBG][PIPELINE] horizon_drop h={} local_tip={} horizon={} syncing={}",
+                                decoded.microblock.height, horizon_cache_h, horizon, horizon_cache_syncing,
+                            );
+                        }
+                        // A flood of far blocks must not starve the commit re-drive below.
+                        if commit_deferred.is_empty() { continue; }
+                    } else {
+                        // Process this block, then try to drain deferred chain
+                        to_process.push(decoded);
+                    }
                 }
-                continue;
             }
-
-            // Process this block, then try to drain deferred chain
-            let mut to_process = vec![decoded];
 
             // Re-drive deferred blocks once their gate can have changed (parent already present, so the
             // contiguity drain never revisits them). This map holds BOTH defer reasons, so the watermark is
@@ -2584,6 +2996,20 @@ impl BlockPipeline {
                         to_process.push(def);
                     }
                 }
+            }
+
+            // Blocks that waited for their parent's commit: verified again from the top once the parent's
+            // slot is committed. Pushed last, so they go first and their children arriving now find them.
+            if !commit_deferred.is_empty() {
+                let (ready, expired) = commit_deferred.take_ready(std::time::Instant::now(), |h| storage.committed_hash_at(h));
+                if expired > 0 {
+                    // Not a failure: the fetch/sync path brings the block again.
+                    metrics.deferred_evicted.fetch_add(expired as u64, Ordering::Relaxed);
+                    if is_info() {
+                        println!("[INFO][PIPELINE] commit_deferred_expired n={} held={}", expired, commit_deferred.len());
+                    }
+                }
+                to_process.extend(ready);
             }
 
             while let Some(mut decoded) = to_process.pop() {
@@ -2629,6 +3055,8 @@ impl BlockPipeline {
                         .map(|m| m.timestamp)
                 }).await.ok().flatten();
             }
+            // The parent passed this stage but its apply has not committed it yet (the in-flight branch).
+            let mut parent_uncommitted = false;
             if mb.height > 0 && !(anchor_h > 0 && mb.height == anchor_h + 1) {
                 metrics.mark_verify_op(mb.height, PIPELINE_OP_VERIFY_LOAD_PREV);
                 let parent_h = mb.height - 1;
@@ -2679,15 +3107,29 @@ impl BlockPipeline {
                 let prev_hash_ok = match load_result {
                     Ok(Some(prev_hash)) => mb.previous_hash == prev_hash,
                     // Parent verified in this loop but its apply-commit hasn't reached storage
-                    // yet — proceed; FIFO to the apply stage preserves parent-before-child.
-                    Ok(None) if parent_verified_in_flight => true,
+                    // yet — proceed; FIFO to the apply stage preserves parent-before-child. A verdict
+                    // that reads the parent's rows waits for the commit (commit_deferred, below).
+                    Ok(None) if parent_verified_in_flight => { parent_uncommitted = true; true }
                     Ok(None) => {
+                        // From the gate a block descending from a parent that contradicts this node's
+                        // finality is dropped, not parked: no rollback could ever take it.
+                        if crate::node::failover_tenure_bound(mb.height) && note_if_contradicts_finality(&storage, mb) {
+                            if is_debug() {
+                                println!("[DBG][FORK] contradicts_finality h={} from={} action=drop_deferred",
+                                         mb.height, decoded.from_peer);
+                            }
+                            metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
+                            metrics.mark_verify_idle();
+                            continue;
+                        }
                         // Capture height fields BEFORE moving `decoded` into
                         // the deferred map — `mb` is borrowed from `decoded`
                         // and would be invalidated by the move otherwise.
                         let child_h = mb.height;
                         let parent_h = mb.height - 1;
                         let from_self = decoded.from_peer == "self";
+                        // Its parent is here already, waiting for its own parent's commit: nothing to fetch.
+                        let parent_waits_commit = commit_deferred.holds(&mb.previous_hash);
                         // We are here because no committed parent holds the slot (the read above
                         // returned None), so this is an ordinary gap: defer and let the drain or repair
                         // fill it. A child built on a COMPETING parent takes the mismatch path instead
@@ -2803,7 +3245,7 @@ impl BlockPipeline {
                         let gap = child_h.saturating_sub(local_tip);
                         // A block fed from disk waits for its fed parent (the feed is contiguous) and the
                         // drain releases it when that parent verifies: no peer is asked for rows on disk.
-                        if !from_self {
+                        if !from_self && !parent_waits_commit {
                             if gap > RANGE_SYNC_GAP_THRESHOLD {
                                 let from = local_tip.saturating_add(1);
                                 let _ = request_missing_range(from, child_h);
@@ -2829,6 +3271,18 @@ impl BlockPipeline {
                 };
 
                 if !prev_hash_ok {
+                    // From the failover_tenure_bound gate: a block whose branch contradicts this node's
+                    // finality is ignored outright — no rollback leg, no walk. Every other break only walks
+                    // toward the parting point (below), where the competing blocks are compared.
+                    let gated = crate::node::failover_tenure_bound(mb.height);
+                    if gated && note_if_contradicts_finality(&storage, mb) {
+                        if is_warn() {
+                            println!("[WARN][FORK] contradicts_finality h={} parent={:x?} from={} producer={} action=ignore",
+                                     mb.height, &mb.previous_hash[..8], decoded.from_peer, mb.producer);
+                        }
+                        metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
                     if is_warn() {
                         println!("[WARN][PIPELINE] hash_chain_break h={} from={} block_round={}",
                                  mb.height, decoded.from_peer, mb.timeout_round);
@@ -2841,7 +3295,8 @@ impl BlockPipeline {
                     // chain — no certificate needed. Nothing is counted: relays are not builders, and
                     // a peer id is not an identity, so the evidence is the child's own signature.
                     // Above finality only, and never against a sealed checkpoint that names ours.
-                    if let Some(ours) = our_parent {
+                    // Below the gate only: from it the walk below decides at the parting point.
+                    if let Some(ours) = our_parent.filter(|_| !gated) {
                         let disputed = mb.height.saturating_sub(1);
                         let finalized = crate::node::LAST_FINALIZED_HEIGHT.load(Ordering::SeqCst);
                         let child_abs = mb.timeout_round.saturating_add(mb.carried_baseline);
@@ -2875,7 +3330,13 @@ impl BlockPipeline {
                             }
                             ruled
                         };
-                        if overruled {
+                        let refused = overruled
+                            && rollback_source_quarantined(&decoded.from_peer, &mb.producer, mb.height);
+                        if refused && is_warn() {
+                            println!("[WARN][FORK] rollback_refused h={} source={} reason=fork_source_quorum",
+                                     disputed, decoded.from_peer);
+                        }
+                        if overruled && !refused {
                             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
                                 .map(|d| d.as_secs()).unwrap_or(0);
                             let due = FORK_RECOVERY_TRIGGER_TIMES.get(&disputed)
@@ -3013,7 +3474,9 @@ impl BlockPipeline {
                         let is_genesis_in_bootstrap = std::env::var("QNET_BOOTSTRAP_ID").is_ok()
                             && std::env::var("DOCKER_ENV").is_ok()
                             && local_h < BOOTSTRAP_GRACE_HEIGHT;
-                        if !is_genesis_in_bootstrap {
+                        // Below the gate only: it compares a child's round with OUR block at its height,
+                        // although the two have different parents.
+                        if !is_genesis_in_bootstrap && !gated {
                             let finalized_h = crate::node::LAST_FINALIZED_HEIGHT
                                 .load(std::sync::atomic::Ordering::SeqCst);
                             let disputed_h = mb.height;
@@ -3041,23 +3504,25 @@ impl BlockPipeline {
                             // → lower block.hash() (single deterministic winner, grind-immune since the hash
                             // excludes the signature; byte-identical to the apply-path resolver). One rule network-wide.
                             if let (Some(pb), Some(p)) = (decoded.microblock.timeout_proof.as_ref(), unified_p2p.as_ref()) {
-                                p.adopt_timeout_proof_bytes(pb);
+                                p.adopt_timeout_proof_bytes_at(mb.height, pb);
                             }
                             // Compare ABSOLUTE rounds (relative + carried baseline), both from the block
                             // bytes — a same-height loser-apply can no longer inflate the ranking.
                             let incoming_abs = mb.timeout_round.saturating_add(mb.carried_baseline);
                             let local_abs = local_round.saturating_add(local_baseline);
-                            let incoming_outranks = if incoming_abs > local_abs {
-                                crate::unified_p2p::failover_round_authorized_for_slot(mb.height, mb.timeout_round, mb.carried_baseline)
-                            } else if incoming_abs == local_abs {
-                                // Equal round: only a genuine same-producer self-fork (valid sig, lower hash)
-                                // supersedes, and only if we actually HOLD a competitor here (None ⇒ false).
-                                equal_round_selffork_supersedes(&storage, &decoded.microblock,
-                                    local_opt.as_ref().map(|b| (b.producer.as_str(), b.hash())))
-                            } else {
-                                false
-                            };
-                            if incoming_outranks && finalized_h > 0 && finalized_h < disputed_h {
+                            // Equal round: only a genuine same-producer self-fork (valid sig, lower hash)
+                            // supersedes, and only if we actually HOLD a competitor here (None ⇒ false).
+                            let incoming_outranks = anchor_outranks(incoming_abs, local_abs,
+                                || crate::unified_p2p::failover_round_authorized_for_slot(mb.height, mb.timeout_round, mb.carried_baseline),
+                                || equal_round_selffork_supersedes(&storage, &decoded.microblock,
+                                    local_opt.as_ref().map(|b| (b.producer.as_str(), b.hash()))));
+                            let refused = incoming_outranks
+                                && rollback_source_quarantined(&decoded.from_peer, &mb.producer, mb.height);
+                            if refused && is_warn() {
+                                println!("[WARN][FORK] rollback_refused h={} source={} reason=fork_source_quorum",
+                                         disputed_h, decoded.from_peer);
+                            }
+                            if incoming_outranks && !refused && finalized_h > 0 && finalized_h < disputed_h {
                                 let now_secs = std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .map(|d| d.as_secs())
@@ -3139,8 +3604,8 @@ impl BlockPipeline {
                 // MANDATORY signature: previously empty `mb.signature` slipped past
                 // verification entirely (the surrounding `if !mb.signature.is_empty()`
                 // wrapped the verify call but had no else branch — empty was implicit
-                // accept). Honest producers always emit
-                // "dilithium3_v4:<hex>" via `sign_microblock_with_dilithium`,
+                // accept). Honest producers always emit a signature via
+                // `sign_microblock_with_dilithium` (`encode_microblock_signature`),
                 // so an empty signature on a non-genesis block can only come from
                 // a malformed or hostile sender. Reject hard.
                 if mb.signature.is_empty() {
@@ -3277,7 +3742,7 @@ impl BlockPipeline {
                     if let (Some(pb), Some(p2p)) =
                         (decoded.microblock.timeout_proof.as_ref(), unified_p2p.as_ref())
                     {
-                        p2p.adopt_timeout_proof_bytes(pb);
+                        p2p.adopt_timeout_proof_bytes_at(mb.height, pb);
                     }
                     let round_certified =
                         crate::unified_p2p::failover_round_authorized_for_slot(mb.height, mb.timeout_round, mb.carried_baseline);
@@ -3308,7 +3773,8 @@ impl BlockPipeline {
                                 FAILOVER_CERT_PULL_TIMES.retain(|k, _| *k >= keep_from);
                             }
                             if let Some(p2p) = unified_p2p.as_ref() {
-                                p2p.request_timeout_proofs(mb_idx, mb_idx);
+                                // From the window the slot's tenure began in (its certificate may sit there).
+                                p2p.request_timeout_proofs(crate::node::tenure_first_slot(mb.height) / 90, mb_idx);
                             }
                         }
                         if is_warn() {
@@ -3404,6 +3870,34 @@ impl BlockPipeline {
                 }
             }
 
+            // A TX whose applied or displayed fields are not the ones a signature bound to its account covers
+            // (a rewritten payload, target, envelope or deploy payload, a retired activation, a system envelope
+            // other than its builder's, the legacy signature), or whose body
+            // is not the one its hash names, is a forged TX under a valid block signature: reject the block as
+            // for a bad signature. The producer evicts the same TXs at this height (producer_tx_prepare), so
+            // an honest block always passes. Off below the tx_target_bound gate. One SHA3 per TX, so a large
+            // block is checked across the rayon pool; the verdict (any refusal rejects) does not depend on
+            // which refusal is found first.
+            {
+                use rayon::prelude::*;
+                let txs = &decoded.microblock.transactions;
+                let height = mb.height;
+                let check = |tx: &qnet_state::Transaction| crate::node::BlockchainNode::tx_target_bound(tx, height).err();
+                let unbound = if txs.len() < 64 {
+                    txs.iter().find_map(check)
+                } else {
+                    txs.par_iter().find_map_any(check)
+                };
+                if let Some(reason) = unbound {
+                    if is_warn() {
+                        println!("[WARN][PIPELINE] tx_target_unbound h={} producer={} from={} reason={} action=reject_block",
+                                 mb.height, mb.producer, decoded.from_peer, reason);
+                    }
+                    metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+            }
+
             // Internal-only TX type guard: post-genesis, HARD REJECT the whole
             // block (+ peer reputation penalty) if it carries a genesis-only or
             // deprecated variant (CreateAccount / BatchRewardClaims /
@@ -3469,14 +3963,19 @@ impl BlockPipeline {
                 // the system format -> froze testnet at h=14350 (commitment window).
                 // Helper batches verifies on SIGVERIFY_RUNTIME (parallel, not seq await).
                 // FIX-5: resolve any ELIDED value-TX pk from committed in-mem State on a CLONE, then
-                // verify. This State read is DETERMINISTIC — the parent-continuity gate above pins
-                // apply-frontier == H-1, so State is complete & canonical for every account < H (never
-                // the detached accounts CF). The decoded microblock / raw shreds stay ELIDED (we clone),
+                // verify (never the detached accounts CF). The parent may still be applying (the
+                // in-flight branch above), so State can lack its writes; the only key a block adds is a
+                // first bind, so a key not there yet is Unresolved (defer, re-driven when a bind commits)
+                // and a key that is there is final: the verdict is the same either way. This read lock is
+                // also what orders a commit-deferred block after its parent's whole apply (CommitDeferred),
+                // and a heartbeat's key read below after the key rows that apply writes.
+                // The decoded microblock / raw shreds stay ELIDED (we clone),
                 // so forwarded + stored wire bytes are unchanged. A wire pk that IS present is never
                 // overwritten (its eon(pk)==from bind still runs). API-1 receive-path close: value TXs
                 // are ALWAYS verified (a signatureless forged value TX → verify false → hard-reject).
                 let mut dilithium_invalid = 0usize;
                 let mut pk_unresolved = false;
+                let awaits_parent_key: bool;
                 {
                     use futures::future::join_all;
                     let snap_in_progress = crate::storage::SNAPSHOT_REHYDRATE_IN_PROGRESS
@@ -3508,9 +4007,14 @@ impl BlockPipeline {
                             }
                         }
                     } // read-lock dropped here
-                    if !pk_unresolved && !rehydrated.is_empty() {
+                    // A signer key a parent's apply writes, read on a parent not committed yet: decided after
+                    // the read lock, which on a committed parent is granted only once that apply has ended.
+                    awaits_parent_key = parent_uncommitted
+                        && verdict_awaits_signer_key(&storage, &decoded.microblock.transactions, &binds_in_flight);
+                    if !awaits_parent_key && !pk_unresolved && !rehydrated.is_empty() {
                         let verify_futures: Vec<_> = rehydrated.iter()
-                            .map(|tx| crate::node::BlockchainNode::verify_dilithium_tx_signature_async(tx, crate::node::VerifyLane::Block(decoded.microblock.height)))
+                            .map(|tx| crate::node::BlockchainNode::verify_dilithium_tx_signature_on(
+                                tx, crate::node::VerifyLane::Block(decoded.microblock.height), Some(&*storage)))
                             .collect();
                         let results = join_all(verify_futures).await;
                         for r in results {
@@ -3522,6 +4026,14 @@ impl BlockPipeline {
                             }
                         }
                     }
+                }
+
+                if awaits_parent_key {
+                    // Judged now, a heartbeat, an equivocation proof or an envelope-signed TX reads a signer key
+                    // the parent's apply may still be writing: one node refuses the block, another accepts it.
+                    // It waits for the commit and is verified again from the top (CommitDeferred).
+                    hold_for_parent_commit(&mut commit_deferred, &metrics, decoded, "signer_key");
+                    continue;
                 }
 
                 if pk_unresolved {
@@ -3716,6 +4228,27 @@ impl BlockPipeline {
                         continue; // HARD REJECT — one burn cannot back two registrations
                     }
                 }
+                // Same-block half of the one-node rule (wallet_one_node gate): this block's rows are written
+                // only after it applies, so the verifier's storage read below cannot see a pair inside it.
+                // Pure function of the block's bytes; the producer keeps the first (production.rs).
+                if let Some(wallet) = crate::node::BlockchainNode::same_block_one_node_refusal(
+                    &decoded.microblock.transactions, mb.height)
+                {
+                    if is_warn() {
+                        println!("[WARN][PIPELINE] wallet_has_node: two registrations of one wallet in one block h={} wallet={}... action=reject_block",
+                                 mb.height, qnet_state::char_prefix(&wallet, 16));
+                    }
+                    metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
+                    continue; // HARD REJECT — one wallet, one node
+                }
+                // Every check from here on reads rows the parent's apply writes (the one-node rule, the burn
+                // binding, the reactivation key, the activation's registration). On a parent this stage passed
+                // but apply has not committed, such a block is not judged yet: it waits for the commit and is
+                // verified again from the top (CommitDeferred). Never rejected for waiting.
+                if parent_uncommitted && verdict_reads_parent_rows(&decoded.microblock.transactions) {
+                    hold_for_parent_commit(&mut commit_deferred, &metrics, decoded, "parent_rows");
+                    continue;
+                }
                 let burn_storage = storage.clone();
                 let burn_futures: Vec<_> = decoded.microblock.transactions
                     .iter()
@@ -3729,8 +4262,13 @@ impl BlockPipeline {
                         // quorum: DEFER (re-verify once N-2 applies) so an honest registration isn't dropped
                         // while behind. A genuine invalid burn (committee present) still HARD-REJECTs; synced
                         // nodes hold the committee so never defer — the deterministic reject/fork-guard holds.
+                        // A one-node refusal is decided before any committee read, from the rows below this
+                        // block, all committed here (a block on an uncommitted parent waited in commit_deferred
+                        // above), so it is never the "behind" case and never defers.
                         let h = mb.height;
-                        if crate::node::BlockchainNode::burn_committee_absent_for(
+                        let wallet_has_node = results.iter().any(|r| matches!(r,
+                            Err(crate::errors::QNetError::ValidationError(e)) if e.starts_with("wallet_has_node:")));
+                        if !wallet_has_node && crate::node::BlockchainNode::burn_committee_absent_for(
                             &storage, &decoded.microblock.transactions)
                         {
                             let sz = decoded.raw_data.len();
@@ -3787,8 +4325,8 @@ impl BlockPipeline {
                 // NodeReactivation identity gate: the returning node's WIRE key MUST equal the vrf_pk
                 // committed at its original registration (committed point-read) — the sole authority
                 // now the gossip RAM-registry path is gone. No committed key ⇒ unknown identity ⇒
-                // reject. Deterministic (committed CF + TX bytes); parent-continuity guarantees the
-                // original registration row is applied before this block is verified.
+                // reject. Deterministic (committed CF + TX bytes): a block on an uncommitted parent waited
+                // in commit_deferred above, so the original registration's row is applied before this read.
                 {
                     let react_bad = decoded.microblock.transactions.iter().find_map(|tx| {
                         if !matches!(tx.tx_type, qnet_state::TransactionType::NodeReactivation { .. }) {
@@ -3816,9 +4354,9 @@ impl BlockPipeline {
                 // un-backed one would mint a node identity (super pseudonym / activation row → reward +
                 // producer eligibility) for FREE, bypassing the 1DEV-burn Sybil cost the registration gate
                 // above enforces. Require each activation's wallet to already hold a chain-confirmed burn-
-                // attested registration — committed in a PRIOR block (parent-continuity guarantees blocks
-                // < h are applied on every node before h is verified, so the lookup is deterministic) OR a
-                // NodeRegistration in THIS block. Same activation-height gate as the registration rule;
+                // attested registration — committed in a PRIOR block (a block on an uncommitted parent waited
+                // in commit_deferred above, so blocks < h are applied before this lookup and it is
+                // deterministic) OR a NodeRegistration in THIS block. Same activation-height gate as the registration rule;
                 // genesis nodes never emit NodeActivation (genesis = NodeRegistration only).
                 if qnet_state::feature_gates::is_active(qnet_state::feature_gates::id::BURN_ATTESTATION_REQUIRED, mb.height) {
                     let this_block_burned: std::collections::HashSet<String> = decoded.microblock.transactions.iter()
@@ -3854,6 +4392,10 @@ impl BlockPipeline {
             let verified_hash = decoded.microblock.hash();
             // Answers "parent verified, apply-commit pending" for the parking guard above.
             verified_recent.insert(verified_hash, (block_height, decoded.microblock.timestamp));
+            for label in key_bindings_written(&decoded.microblock.transactions) {
+                let at = binds_in_flight.entry(label.to_string()).or_insert(block_height);
+                *at = (*at).max(block_height);
+            }
 
             // Liveness is NOT recorded here. A signature-verified block only proves the producer
             // signed something — a block that fails apply (bad state_root, unresolvable pk, breaker)
@@ -3943,6 +4485,8 @@ impl BlockPipeline {
             // inbound block (a Byzantine producer's elided-never-committed-pk block would otherwise re-run
             // the full verify indefinitely). Runs unconditionally; a residual cap bounds far-ahead spam.
             let chain_h = storage.get_chain_height().unwrap_or(0);
+            // 500 below the tip a binding block is long committed (or dead), its write section long ended.
+            binds_in_flight.retain(|_, h| h.saturating_add(500) > chain_h);
             committee_deferred.retain(|h, _| *h > chain_h);
             if committee_deferred.len() > 100 {
                 committee_deferred.retain(|h, _| *h < chain_h + 500);
@@ -3952,6 +4496,7 @@ impl BlockPipeline {
             metrics.deferred_bytes.store(deferred_bytes as u64, Ordering::Relaxed);
             metrics.committee_deferred_n.store(committee_deferred.len() as u64, Ordering::Relaxed);
             metrics.committee_deferred_bytes.store(committee_deferred_bytes as u64, Ordering::Relaxed);
+            metrics.commit_deferred_n.store(commit_deferred.len() as u64, Ordering::Relaxed);
         }
     }
 
@@ -4466,9 +5011,11 @@ impl BlockPipeline {
 
                 // Materialise the committed burn→wallet binding (cbw) for this block's registrations
                 // NOW — after state-root acceptance (so a rejected block never binds) but BEFORE
-                // save_microblock makes h loadable. The verify stage's parent-continuity gate defers
-                // verify(h+1) until load_microblock(h) succeeds (after save below), so this write
-                // happens-before verify(h+1).cbw_get → within-window cross-microblock burn reuse is
+                // save_microblock makes h loadable. Verify may pass h+1 while h is still here (the
+                // in-flight branch), but it judges a child carrying a registration, activation or
+                // reactivation only once committed_hash_at(h) names its parent (CommitDeferred), which
+                // the save and set_chain_height below make true, so this write happens-before
+                // verify(h+1).cbw_get → within-window cross-microblock burn reuse is
                 // caught. First-wins; the durable cbw set is reconciled from node_registry by
                 // rebuild_committed_burn_wallet on snapshot/reorg/boot.
                 for tx in &block.microblock.transactions {
@@ -4739,6 +5286,8 @@ impl BlockPipeline {
                         {
                             ctx.storage.request_boundary_pin(&state_guard, height);
                         }
+                        // Certified proof view at a macroblock boundary, behind this block's rows.
+                        ctx.storage.request_proof_view(&state_guard, height);
                         // v15.6: chain-height bump on the blocking pool too —
                         // it is an atomic CF write but pays the same compaction
                         // queue penalty as the block save above.
@@ -4805,6 +5354,8 @@ impl BlockPipeline {
                         }
 
                         // ── VRF key extraction from NodeRegistration TXs ──
+                        // Inside the state write section: a child that waited for this commit (CommitDeferred)
+                        // reads a signer's key binding only after the ones written here exist.
                         if !block.microblock.transactions.is_empty() {
                             let has_reg_tx = block.microblock.transactions.iter().any(|tx| {
                                 matches!(&tx.tx_type,
@@ -5057,6 +5608,7 @@ impl BlockPipeline {
 
             // Body expiry at the epoch boundary, on every node that applies it (self-gated to Super).
             ctx.storage.prune_bodies_at_epoch(height);
+            ctx.storage.archive_history_at(height);
 
             // ────────────────────────────────────────────────────────────────
             // v14.10: GENESIS GLOBAL STATE (was missing in pipeline apply path!)
@@ -5515,6 +6067,7 @@ mod tests_rollback_cache_invalidation {
     /// shallower rollback leaves the deeper fork in place.
     #[test]
     fn fork_recovery_signal_keeps_deepest_target() {
+        let _g = crate::unified_p2p::TEST_FAILOVER_STATE_LOCK.lock();
         FORK_RECOVERY_HEIGHT.store(0, Ordering::SeqCst);
 
         signal_fork_recovery(54_059);
@@ -5584,6 +6137,44 @@ mod tests_deferred_by_parent {
         assert_eq!(released, vec!["child_of_a"]);
         assert!(deferred.contains_key(&b), "unrelated waiters must not be disturbed");
     }
+}
+
+/// Process-wide state the verify stage writes (the deferred-heights index, the verified frontier): a test that
+/// runs the stage, or asserts on that state, holds this lock.
+#[cfg(test)]
+pub(crate) static VERIFY_STAGE_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+/// The verify stage alone over `storage`, as a test drives it: blocks in, verified blocks out (nothing applies
+/// them; the test commits what it wants and fires `apply_notify` the way the apply stage does). The
+/// coordinator stays at genesis loading, so the stage treats this node as syncing.
+#[cfg(test)]
+pub(crate) fn spawn_verify_stage_for_test(storage: Arc<Storage>, apply_notify: Arc<tokio::sync::Notify>)
+    -> (mpsc::Sender<DecodedBlock>, mpsc::Receiver<VerifiedBlock>, Arc<PipelineMetrics>)
+{
+    spawn_verify_stage_with_state_for_test(storage, apply_notify, Arc::new(RwLock::new(crate::StateManager::new())))
+}
+
+/// `spawn_verify_stage_for_test` over `state`, so a test can hold its write lock the way an apply does.
+#[cfg(test)]
+pub(crate) fn spawn_verify_stage_with_state_for_test(storage: Arc<Storage>, apply_notify: Arc<tokio::sync::Notify>,
+                                                    state: Arc<RwLock<crate::StateManager>>)
+    -> (mpsc::Sender<DecodedBlock>, mpsc::Receiver<VerifiedBlock>, Arc<PipelineMetrics>)
+{
+    let (in_tx, in_rx) = mpsc::channel::<DecodedBlock>(64);
+    let (out_tx, out_rx) = mpsc::channel::<VerifiedBlock>(64);
+    let (_coordinator, handle) = crate::consensus_state::ConsensusCoordinator::new(16);
+    let metrics = Arc::new(PipelineMetrics::new());
+    tokio::spawn(BlockPipeline::verify_stage(in_rx, out_tx, storage, handle, metrics.clone(),
+        "verify_stage_test".to_string(), None, Arc::new(tokio::sync::Semaphore::new(1)), state, apply_notify));
+    (in_tx, out_rx, metrics)
+}
+
+/// A block as the decode stage hands it on, its producer signature taken as checked upstream.
+#[cfg(test)]
+pub(crate) fn decoded_for_test(mb: qnet_state::MicroBlock, from_peer: &str) -> DecodedBlock {
+    let bytes = bincode::serialize(&mb).expect("block bytes");
+    DecodedBlock { height: mb.height, raw_data: bytes.clone(), decompressed: bytes, microblock: mb,
+                   from_peer: from_peer.to_string(), sig_pre_verified: true }
 }
 
 #[cfg(test)]
@@ -5747,6 +6338,7 @@ mod tests_deferred_sweep {
     /// height is visible again, and a child of a still-empty slot keeps waiting.
     #[test]
     fn a_child_of_the_losing_sibling_is_dropped_once_the_slot_fills() {
+        let _g = VERIFY_STAGE_TEST_LOCK.lock(); // a running verify stage clears the heights index
         let (lose, win) = (key(9_100_001), key(9_200_001));
         let mut deferred = HashMap::new();
         let mut by_producer = HashMap::new();
@@ -5766,6 +6358,7 @@ mod tests_deferred_sweep {
     /// slot and time on the clock.
     #[test]
     fn age_and_depth_still_evict_and_nothing_else_does() {
+        let _g = VERIFY_STAGE_TEST_LOCK.lock(); // a running verify stage clears the heights index
         let mut deferred = HashMap::new();
         let mut by_producer = HashMap::new();
         let (mut count, mut bytes) = (0usize, 0usize);
@@ -5780,6 +6373,254 @@ mod tests_deferred_sweep {
         assert!(deferred_holds(9_300_010) && !deferred_holds(9_300_020) && !deferred_holds(9_299_000));
         assert_eq!(count, 1);
         deferred_untrack(9_300_010);
+    }
+}
+
+#[cfg(test)]
+mod tests_commit_deferred {
+    use super::*;
+    use super::deferred_test_support::{key, decoded};
+
+    /// The transactions whose verdict reads the parent's rows, and only those, send a block to wait.
+    #[test]
+    fn registrations_activations_and_reactivations_read_the_parent_rows() {
+        let w = "walletCommitDeferred";
+        let reg = BlockchainNode::create_node_registration_tx(
+            &crate::rpc::generate_light_node_pseudonym(w), qnet_state::NodeType::Light, w, "burn");
+        let act = qnet_state::Transaction::new(w.to_string(), None, 0, 1, 0, 0, 0, None,
+            qnet_state::TransactionType::NodeActivation { node_type: qnet_state::NodeType::Super, amount: 0,
+                phase: qnet_state::account::ActivationPhase::Phase1 }, None);
+        let react = BlockchainNode::create_node_reactivation_tx("super_commit_deferred", 1, "", 0, "");
+        let transfer = qnet_state::Transaction::new(w.to_string(), Some("b".repeat(45)), 1, 1, 1, 10_000, 0, None,
+            qnet_state::TransactionType::Transfer { from: w.to_string(), to: "b".repeat(45), amount: 1 }, None);
+        for tx in [&reg, &act, &react] {
+            assert!(verdict_reads_parent_rows(&[transfer.clone(), tx.clone()]));
+        }
+        assert!(!verdict_reads_parent_rows(&[transfer.clone()]));
+        assert!(!verdict_reads_parent_rows(&[]));
+    }
+
+    /// Only a signer key that does not resolve sends a block to wait for its parent's commit: a heartbeat of a
+    /// signer with no committed key (or a row whose commitment no stored key matches), a proof against an
+    /// offender with none, an envelope-signed TX whose label the key registry has not bound and a block in flight
+    /// can bind. A known signer's heartbeat, a bound label, a label nothing in flight binds, and every TX verified
+    /// against its own wire key never wait for a key.
+    #[test]
+    fn only_an_unresolved_signer_key_waits() {
+        use pqcrypto_traits::sign::PublicKey as _;
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = Storage::new(dir.path().to_str().unwrap()).expect("storage");
+        let pk = pqcrypto_mldsa::mldsa65::keypair().0.as_bytes().to_vec();
+        let known = "super_awaits_key_known";
+        storage.save_node_registration_at_height_burn_vrf(known, "super", "walletAwaitsKnown", 1.0, 5, "", Some(&pk)).unwrap();
+        // On chain, but the stored key row (stamped first, so the registration keeps it) is not the committed
+        // key: the key does not resolve.
+        let mismatched = "super_awaits_key_mismatched";
+        let other = pqcrypto_mldsa::mldsa65::keypair().0.as_bytes().to_vec();
+        storage.save_vrf_public_key(mismatched, &hex::encode(&other)).unwrap();
+        storage.save_node_registration_at_height_burn_vrf(mismatched, "super", "walletAwaitsOther", 1.0, 5, "", Some(&pk)).unwrap();
+        let fresh = "super_awaits_key_fresh";
+        let system_tx = |from: &str, tx_type: qnet_state::TransactionType, sig: Option<Vec<u8>>, label: Option<Vec<u8>>| {
+            qnet_state::Transaction {
+                from: from.to_string(), to: None, amount: 0, tx_type, timestamp: 0, hash: String::new(),
+                signature: None, public_key: None, gas_price: 0, gas_limit: 0, nonce: 0, data: None,
+                dilithium_signature: sig, dilithium_public_key: label, chain_id: qnet_state::transaction::QNET_CHAIN_ID,
+            }
+        };
+        // A heartbeat's or a proof's wait does not depend on what is in flight.
+        let none: HashMap<String, u64> = HashMap::new();
+        let hb = |id: &str| system_tx(id, qnet_state::TransactionType::Heartbeat {
+            node_id: id.to_string(), anchor_height: 1, anchor_hash: "ab".repeat(32) }, Some(vec![1u8; 3309]), Some(id.as_bytes().to_vec()));
+        assert!(!verdict_awaits_signer_key(&storage, &[hb(known)], &none), "a known signer's heartbeat never waits");
+        assert!(verdict_awaits_signer_key(&storage, &[hb(fresh)], &none));
+        assert!(verdict_awaits_signer_key(&storage, &[hb(mismatched)], &none));
+        assert!(verdict_awaits_signer_key(&storage, &[hb(known), hb(fresh)], &none), "one unresolved signer is enough");
+
+        let header = qnet_state::EquivocationHeader {
+            timestamp: 1, merkle_root: [1u8; 32], previous_hash: [2u8; 32], state_root: [0u8; 32], vrf_output: None,
+            timeout_round: 0, carried_baseline: 0, pk_digest: [0u8; 32], signature: Vec::new(),
+        };
+        let proof = |offender: &str| system_tx(qnet_state::transaction::SLASHING_SENDER, qnet_state::TransactionType::EquivocationProof {
+            offender: offender.to_string(), height: 1, block_a: header.clone(), block_b: header.clone() }, None, None);
+        assert!(!verdict_awaits_signer_key(&storage, &[proof(known)], &none));
+        assert!(verdict_awaits_signer_key(&storage, &[proof(fresh)], &none));
+
+        // The registry-envelope verifier: an unbound label lets a first-seen key verify, a bound one only its own,
+        // so a label waits while a block in flight can bind it, as a registration's or reactivation's apply does.
+        let label = "super_awaits_key_envelope";
+        let w = "walletAwaitsKey";
+        let binder = BlockchainNode::create_node_registration_tx(label, qnet_state::NodeType::Super, w, "burn");
+        let react = BlockchainNode::create_node_reactivation_tx(fresh, 1, "", 0, "");
+        let transfer = qnet_state::Transaction::new(w.to_string(), Some("b".repeat(45)), 1, 1, 1, 10_000, 0, None,
+            qnet_state::TransactionType::Transfer { from: w.to_string(), to: "b".repeat(45), amount: 1 }, None);
+        let block = [binder, transfer.clone(), hb(known), react.clone()];
+        let written: Vec<&str> = key_bindings_written(&block).collect();
+        assert_eq!(written, vec![label, fresh], "a registration's and a reactivation's node id, nothing else");
+        let in_flight: HashMap<String, u64> = written.iter().map(|l| (l.to_string(), 7)).collect();
+        let commitment = |id: &str| system_tx(id, qnet_state::TransactionType::HeartbeatCommitment {
+            node_id: id.to_string(), window_start_height: 0, window_end_height: 14_400, merkle_root: String::new(),
+            heartbeat_count: 0, first_heartbeat_time: 0, last_heartbeat_time: 0, sample_seed: String::new(),
+            heartbeat_samples: Vec::new() }, Some(format!("dilithium_sig_{}_AAAA", id).into_bytes()), Some(id.as_bytes().to_vec()));
+        assert!(verdict_awaits_signer_key(&storage, &[commitment(label)], &in_flight));
+        assert!(!verdict_awaits_signer_key(&storage, &[commitment(label)], &none),
+                "an unbound label nothing in flight binds is judged as first seen at once");
+        assert!(qnet_consensus::consensus_crypto::register_consensus_pk_from_chain(label, &pk));
+        assert!(!verdict_awaits_signer_key(&storage, &[commitment(label)], &in_flight), "a bound label is final");
+        assert!(verdict_awaits_signer_key(&storage, &[commitment(fresh)], &in_flight));
+        let mut raw_key = commitment(fresh);
+        raw_key.dilithium_public_key = Some(pk.clone());
+        assert!(!verdict_awaits_signer_key(&storage, &[raw_key], &in_flight), "a raw key's hex is a label no registration binds");
+        let mut unsigned = commitment(fresh);
+        unsigned.dilithium_signature = None;
+        assert!(!verdict_awaits_signer_key(&storage, &[unsigned], &in_flight), "unsigned: the verifier reads no key");
+
+        // Verified against their own wire key (or judged by apply): no key to wait for, even under a label in flight.
+        let reg = BlockchainNode::create_node_registration_tx(
+            &crate::rpc::generate_light_node_pseudonym(w), qnet_state::NodeType::Light, w, "burn");
+        let mut claim = system_tx("system_rewards_pool", qnet_state::TransactionType::RewardDistribution,
+                                  Some(vec![1u8; 8]), Some(fresh.as_bytes().to_vec()));
+        claim.to = Some(w.to_string());
+        assert!(!verdict_awaits_signer_key(&storage, &[reg, react, transfer, claim], &in_flight));
+        assert!(!verdict_awaits_signer_key(&storage, &[], &in_flight));
+    }
+
+    /// The signer-key wait uses the same bounded bucket as the parent-rows wait: one `CommitDeferred`, and both
+    /// holds go through `hold_for_parent_commit`. Past the count bound a block waiting for a key is dropped to
+    /// the fetch/sync path, past the age bound with its parent slot still empty it is dropped unjudged. That
+    /// neither is a refusal is checked through the stage itself (node tests,
+    /// a_full_commit_wait_drops_to_the_fetch_path_and_refuses_nothing).
+    #[test]
+    fn the_signer_key_wait_uses_the_same_bounded_bucket() {
+        let src = include_str!("block_pipeline.rs").replace("\r\n", "\n");
+        let verify_at = src.find("    async fn verify_stage(").expect("verify stage");
+        let apply_at = src.find("    async fn apply_stage(").expect("apply stage");
+        let verify = &src[verify_at..apply_at];
+        assert_eq!(verify.matches("CommitDeferred::new()").count(), 1, "one bucket");
+        assert_eq!(verify.matches(".park(").count(), 0, "no hold parks outside hold_for_parent_commit");
+        assert!(verify.contains("hold_for_parent_commit(&mut commit_deferred, &metrics, decoded, \"parent_rows\")"));
+        assert!(verify.contains("hold_for_parent_commit(&mut commit_deferred, &metrics, decoded, \"signer_key\")"));
+
+        let heartbeat_block = |h: u64, parent: [u8; 32]| {
+            let mut d = decoded(h, "p", parent, 10);
+            d.microblock.transactions = vec![qnet_state::Transaction {
+                from: "super_bucket".to_string(), to: None, amount: 0,
+                tx_type: qnet_state::TransactionType::Heartbeat {
+                    node_id: "super_bucket".to_string(), anchor_height: h - 1, anchor_hash: "ab".repeat(32) },
+                timestamp: 0, hash: String::new(), signature: None, public_key: None, gas_price: u64::MAX, gas_limit: 0,
+                nonce: 0, data: None, dilithium_signature: Some(vec![1u8; 3309]),
+                dilithium_public_key: Some(b"super_bucket".to_vec()), chain_id: qnet_state::transaction::QNET_CHAIN_ID,
+            }];
+            d
+        };
+        let metrics = PipelineMetrics::new();
+        let mut held = CommitDeferred::new();
+        let start = std::time::Instant::now();
+        for i in 0..COMMIT_DEFERRED_MAX as u64 {
+            hold_for_parent_commit(&mut held, &metrics, heartbeat_block(1_000 + i, key(5_000 + i)), "signer_key");
+        }
+        hold_for_parent_commit(&mut held, &metrics, heartbeat_block(9_999, key(1)), "signer_key");
+        assert_eq!(held.len(), COMMIT_DEFERRED_MAX, "the count bound");
+        assert_eq!(metrics.deferred_evicted.load(Ordering::Relaxed), 1, "dropped to the fetch/sync path");
+        let (ready, expired) = held.take_ready(start + COMMIT_DEFERRED_MAX_AGE + std::time::Duration::from_secs(30), |_| None);
+        assert_eq!((ready.len(), expired, held.len(), held.bytes), (0, COMMIT_DEFERRED_MAX, 0, 0), "the age bound: dropped, never judged");
+    }
+
+    /// A held block goes back to the stage once its parent's slot is committed (to its parent or, after a
+    /// reorg, to another block: the parent check then answers), never before; past the age bound with that
+    /// slot still empty it is dropped, never judged; a second copy is held once and the bucket is bounded.
+    #[test]
+    fn a_held_block_is_released_by_its_parent_slot_and_dropped_only_by_age() {
+        let now = std::time::Instant::now();
+        let mut b = CommitDeferred::new();
+        let child = decoded(101, "p", key(100), 10);
+        assert!(b.park(child.clone(), now));
+        assert!(b.park(child.clone(), now), "a second copy is held once");
+        assert_eq!((b.len(), b.bytes), (1, 10));
+        assert!(b.holds(&child.microblock.hash()));
+        let (ready, expired) = b.take_ready(now + std::time::Duration::from_secs(30), |_| None);
+        assert!(ready.is_empty() && expired == 0 && b.len() == 1, "nothing committed, nothing released");
+        let (ready, expired) = b.take_ready(now, |h| (h == 100).then(|| key(100)));
+        assert_eq!((ready.len(), expired, b.len(), b.bytes), (1, 0, 0, 0));
+        assert_eq!(ready[0].microblock.height, 101);
+
+        assert!(b.park(decoded(201, "p", key(200), 10), now));
+        let (ready, _) = b.take_ready(now, |h| (h == 200).then(|| key(999)));
+        assert_eq!(ready.len(), 1, "another block at the parent slot: the parent check answers, as for any arrival");
+
+        assert!(b.park(decoded(301, "p", key(300), 10), now));
+        let (ready, expired) = b.take_ready(now + COMMIT_DEFERRED_MAX_AGE + std::time::Duration::from_secs(1), |_| None);
+        assert_eq!((ready.len(), expired, b.len()), (0, 1, 0), "dropped to the fetch/sync path, never judged");
+        assert!(b.park(decoded(401, "p", key(400), 10), now));
+        let (ready, expired) = b.take_ready(now + COMMIT_DEFERRED_MAX_AGE + std::time::Duration::from_secs(1),
+                                            |h| (h == 400).then(|| key(400)));
+        assert_eq!((ready.len(), expired, b.len()), (1, 0, 0), "a parent committed by then: verified, not dropped");
+
+        for i in 0..COMMIT_DEFERRED_MAX as u64 {
+            assert!(b.park(decoded(1_000 + i, "p", key(5_000 + i), 1), now));
+        }
+        assert!(!b.park(decoded(9_999, "p", key(1), 1), now), "the count bound");
+        let mut big = CommitDeferred::new();
+        assert!(!big.park(decoded(7, "p", key(6), COMMIT_DEFERRED_MAX_BYTES + 1), now), "the byte bound");
+    }
+
+    /// The order the no-gate argument rests on. Apply writes the rows a verdict reads before it publishes the
+    /// slot, and the vrf_pk rows after the height but inside the same state write section, then wakes the
+    /// verify stage. The verify stage takes the state read lock for every block with transactions before it
+    /// parks one, and every read of those rows comes after the park.
+    #[test]
+    fn a_committed_parent_slot_means_its_rows_are_there_when_the_child_is_judged() {
+        let src = include_str!("block_pipeline.rs").replace("\r\n", "\n");
+        let apply_at = src.find("    async fn apply_stage(").expect("apply stage");
+        let verify_at = src.find("    async fn verify_stage(").expect("verify stage");
+        let apply = &src[apply_at..];
+        let at = |s: &str, pat: &str| s.find(pat).unwrap_or_else(|| panic!("missing {}", pat));
+        let order = [
+            at(apply, "let state_guard = ctx.state.write().await;"),
+            at(apply, "ctx.storage.save_node_registration_at_height_burn_vrf("),
+            at(apply, "ctx.storage.committed_burn_wallet_put("),
+            at(apply, "storage_for_save.save_microblock(height"),
+            at(apply, "storage_for_height.set_chain_height(height)"),
+            at(apply, "BlockchainNode::cache_node_registrations_from_transactions("),
+            at(apply, "}; // state_guard dropped here"),
+            at(apply, "ctx.apply_notify.notify_waiters();"),
+        ];
+        assert!(order.windows(2).all(|w| w[0] < w[1]), "apply order: {:?}", order);
+
+        let verify = &src[verify_at..apply_at];
+        let order = [
+            at(verify, "} else if !decoded.microblock.transactions.is_empty() {"),
+            at(verify, "let sg = state.read().await;"),
+            at(verify, "if parent_uncommitted && verdict_reads_parent_rows("),
+            at(verify, "verify_burn_attestation_quorum(tx, mb.height, &burn_storage)"),
+            at(verify, "storage.load_vrf_public_key(node_id)"),
+            at(verify, "storage.wallet_is_burn_registered(&t.from)"),
+        ];
+        assert!(order.windows(2).all(|w| w[0] < w[1]), "verify order: {:?}", order);
+        assert!(verify.contains("Ok(None) if parent_verified_in_flight => { parent_uncommitted = true; true }"));
+
+        // The signer-key wait: decided after the read lock, and every read of a signer key (a heartbeat's in the
+        // signature batch, which the wait skips, an equivocation proof's after it) comes after that decision.
+        let order = [
+            at(verify, "let sg = state.read().await;"),
+            at(verify, "&& verdict_awaits_signer_key(&storage, &decoded.microblock.transactions, &binds_in_flight);"),
+            at(verify, "if !awaits_parent_key && !pk_unresolved && !rehydrated.is_empty() {"),
+            at(verify, "verify_dilithium_tx_signature_on("),
+            at(verify, "hold_for_parent_commit(&mut commit_deferred, &metrics, decoded, \"signer_key\")"),
+            at(verify, "equivocation_proof_verified(&storage, tx)"),
+        ];
+        assert!(order.windows(2).all(|w| w[0] < w[1]), "signer-key order: {:?}", order);
+
+        // A block's bindable labels are recorded when it passes, before it goes to apply, and pruned only far
+        // below the committed tip: every block in flight has its labels in the map the wait reads.
+        let order = [
+            at(verify, "let mut binds_in_flight: HashMap<String, u64> = HashMap::new();"),
+            at(verify, "verified_recent.insert(verified_hash, (block_height, decoded.microblock.timestamp));"),
+            at(verify, "for label in key_bindings_written(&decoded.microblock.transactions) {"),
+            at(verify, "if let Err(_) = tx.send(verified).await {"),
+            at(verify, "binds_in_flight.retain(|_, h| h.saturating_add(500) > chain_h);"),
+        ];
+        assert!(order.windows(2).all(|w| w[0] < w[1]), "in-flight label order: {:?}", order);
+        assert_eq!(verify.matches("binds_in_flight.retain(").count(), 1, "no other pruning");
     }
 }
 
@@ -6238,7 +7079,318 @@ mod view_divergence_tests {
         let src = include_str!("node/production.rs");
         assert!(src.contains("crate::node::may_sign("),
                 "production must call may_sign, not spell the rule out again");
+        assert!(src.contains("crate::node::may_sign_exact("),
+                "and may_sign_exact from the failover_tenure_bound gate");
+        assert!(!src.contains("signed_at.map_or(true, |r| round > r)"),
+                "the exact rule must live in one place only");
         assert!(!src.contains("(certified_abs, next_block_height) > (last_r, last_h)"),
                 "the rule must live in one place only");
+    }
+}
+
+/// Deterministic replay of the 04.10 sandbox incident against the real functions. Each step is stated twice: below
+/// the failover_tenure_bound gate, where the rules the live network runs produce the incident, and above it, where
+/// they do not. Heights derive from the gate constant, so the module follows it when scripts/gate-height.sh moves it.
+#[cfg(test)]
+mod failover_0410_replay_tests {
+    use super::*;
+    use crate::unified_p2p::{FailoverKey, TEST_FAILOVER_STATE_LOCK};
+
+    const G: u64 = qnet_state::feature_gates::FAILOVER_TENURE_BOUND_GATE_HEIGHT;
+    const MI: u64 = qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
+    const IDS: [&str; 5] = ["genesis_node_001", "genesis_node_002", "genesis_node_003", "genesis_node_004", "genesis_node_005"];
+
+    fn block(height: u64, parent: [u8; 32], producer: &str, round: u64, tag: u8) -> qnet_state::MicroBlock {
+        let mut b = qnet_state::MicroBlock::new(height, 1_000 + height, parent, vec![], producer.to_string());
+        b.merkle_root = [tag; 32];
+        b.timeout_round = round;
+        b
+    }
+
+    fn ingest(b: &qnet_state::MicroBlock, from: &str) -> IngestBlock {
+        IngestBlock { height: b.height, data: bincode::serialize(b).unwrap(), block_type: "micro".to_string(),
+                      from_peer: from.to_string(), received_at: 0 }
+    }
+
+    fn store() -> (Arc<Storage>, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = Arc::new(Storage::new(dir.path().to_str().unwrap()).unwrap());
+        (s, dir)
+    }
+
+    fn sealed(idx: u64, hashes: Vec<[u8; 32]>) -> qnet_state::MacroBlock {
+        qnet_state::MacroBlock::new(idx, 0, [0u8; 32], hashes, [0u8; 32], qnet_state::ConsensusData::default())
+    }
+
+    /// (1) Two nodes stalled at the last slot of a tenure and two at the first slot of the next, in one window. Below
+    /// the gate both vote the window key and 2 + 2 reach the quorum of 4: one certificate rotates two tenures. From the
+    /// gate each tenure has its own key and neither reaches the quorum alone.
+    #[test]
+    fn votes_from_both_sides_of_a_tenure_boundary_certify_only_below_the_gate() {
+        let _g = TEST_FAILOVER_STATE_LOCK.lock();
+        let quorum = qnet_consensus::checkpoint_bft::quorum_size(IDS.len());
+        assert_eq!(quorum, 4);
+
+        let below = (G / MI - 200) * MI;
+        let (s, s1) = (below + 30, below + 31);
+        assert_eq!(s / MI, s1 / MI, "one window");
+        assert_ne!(crate::node::tenure_of(s), crate::node::tenure_of(s1), "two tenures");
+        let (k, k1) = (FailoverKey::for_slot(s), FailoverKey::for_slot(s1));
+        assert!(k.is_legacy() && k == k1, "below the gate both stalls vote one key");
+        for v in &IDS[..2] { crate::unified_p2p::test_insert_timeout_vote_keyed(k, 1, v); }
+        for v in &IDS[3..] { crate::unified_p2p::test_insert_timeout_vote_keyed(k1, 1, v); }
+        assert_eq!(crate::unified_p2p::test_voters_at(k, 1), quorum, "a certificate assembled from two heights");
+
+        let above = (G / MI + 200) * MI;
+        let (a, a1) = (above + 30, above + 31);
+        let (t, t1) = (FailoverKey::for_slot(a), FailoverKey::for_slot(a1));
+        assert!(!t.is_legacy() && !t1.is_legacy() && t != t1 && t.window == t1.window);
+        assert!(t.admissible() && t1.admissible());
+        for v in &IDS[..2] { crate::unified_p2p::test_insert_timeout_vote_keyed(t, 1, v); }
+        for v in &IDS[3..] { crate::unified_p2p::test_insert_timeout_vote_keyed(t1, 1, v); }
+        assert!(crate::unified_p2p::test_voters_at(t, 1) < quorum && crate::unified_p2p::test_voters_at(t1, 1) < quorum,
+                "neither tenure certifies from the other's votes");
+        for key in [k, t, t1] { crate::unified_p2p::test_forget_key(key); }
+    }
+
+    /// (1)+(2) Two leaders, then one. leader(T2, 0) = 005, leader(T2, 1) = 001, leader(T3, 0) = 002, leader(T3, 1) = 003.
+    /// Below the gate a round-1 certificate in the window raises T2 AND T3: a node holding it elects 001 at T2 and 003
+    /// for the whole of T3, a node without it 005 and 002, for the same heights. From the gate the certificate for T2
+    /// raises T2 alone, and T3 elects 002 on every node.
+    #[test]
+    fn a_window_certificate_elects_two_leaders_and_a_tenure_certificate_one() {
+        let _g = TEST_FAILOVER_STATE_LOCK.lock();
+        for (w, gated) in [(G / MI - 300, false), (G / MI + 300, true)] {
+            let (h1, h2, h3) = (w * MI - 5, w * MI + 10, w * MI + 40);
+            let (t2, t3) = (crate::node::tenure_of(h2), crate::node::tenure_of(h3));
+            assert_eq!(t3, t2 + 1);
+            crate::node::test_seed_producer_selection(t2, IDS[4], &IDS);
+            crate::node::test_seed_producer_selection(t3, IDS[1], &IDS);
+            let leader = |h: u64, r: u64| crate::node::expected_producer_for_round(h, r).unwrap();
+            assert_eq!((leader(h2, 0).as_str(), leader(h2, 1).as_str()), (IDS[4], IDS[0]));
+            assert_eq!((leader(h3, 0).as_str(), leader(h3, 1).as_str()), (IDS[1], IDS[2]));
+
+            let key = FailoverKey::for_slot(h2);
+            assert_eq!(key.is_legacy(), !gated);
+            crate::unified_p2p::test_certify(key, 1);
+            let round = crate::unified_p2p::certified_round_for_slot;
+            if !gated {
+                assert_eq!((round(h2), round(h3)), (1, 1), "the window certificate raises both tenures");
+                assert_ne!(leader(h2, round(h2)), leader(h2, 0), "holders and non-holders elect different leaders at T2");
+                assert_eq!(leader(h3, round(h3)).as_str(), IDS[2], "a holder elects 003 for a tenure nobody failed over");
+            } else {
+                assert_eq!((round(h1), round(h2), round(h3)), (0, 1, 0), "the certificate rotates its own tenure alone");
+                assert_eq!(leader(h2, round(h2)).as_str(), IDS[0], "one leader for T2 once the certificate is held");
+                assert_eq!(leader(h3, round(h3)), leader(h3, 0), "T3 elects its round-0 leader on every node");
+                assert_eq!(crate::unified_p2p::window_view_round(w), 1, "the window view still shows the failover");
+            }
+            crate::unified_p2p::test_forget_key(key);
+        }
+    }
+
+    /// (2) Fork churn. The majority finalized F; 003 built F+1..F+300 alone at round 3 on a parent that differs at F.
+    /// Below the gate every one of those blocks outranks the majority's block at its height, so each re-delivery
+    /// arms a rollback toward 003. From the gate none does: the first names a parent that contradicts the finalized
+    /// checkpoint, the rest descend from it. 003 itself walks to the parting point and is decided there once, by the
+    /// certified content, and the round floor its own round-3 blocks would raise does not apply to that rollback.
+    #[tokio::test]
+    async fn a_lone_branch_on_a_higher_round_no_longer_drags_the_finalized_majority() {
+        let _g = TEST_FAILOVER_STATE_LOCK.lock();
+        test_clear_fork_choice_state();
+        test_clear_quarantine();
+        let _ = take_fork_recovery_signal();
+        let f = G + 10 * MI;
+        assert!(crate::node::failover_tenure_bound(f) && crate::node::failover_tenure_bound(f + 1));
+        let common = block(f - 1, [9u8; 32], IDS[1], 0, 0x11);
+        let maj_f = block(f, common.hash(), IDS[0], 0, 0xAA);
+        let maj_f1 = block(f + 1, maj_f.hash(), IDS[4], 0, 0xAB);
+        let mut lone = vec![block(f, common.hash(), IDS[2], 3, 0x33)];
+        for i in 1..=300u64 {
+            let parent = lone.last().unwrap().hash();
+            lone.push(block(f + i, parent, IDS[2], 3, 0x34));
+        }
+        let mut seal = vec![[0u8; 32]; MI as usize];
+        seal[MI as usize - 1] = maj_f.hash(); // window f/90 covers [f-89, f]
+
+        // ── The majority node: F finalized and sealed with its own body.
+        let (m, _dm) = store();
+        m.save_microblock(f - 1, &bincode::serialize(&common).unwrap()).unwrap();
+        m.save_microblock(f, &bincode::serialize(&maj_f).unwrap()).unwrap();
+        m.set_chain_height(f).unwrap();
+        m.save_macroblock(f / MI, &sealed(f / MI, seal.clone())).await.unwrap();
+        let mut legacy_rollbacks = 0usize;
+        let mut gated_rollbacks = 0usize;
+        for b in &lone[1..] {
+            // Below the gate: anchor recovery compares the child's round with OUR block at its height.
+            let authorised = true; // the fleet held the certificates 003 reused
+            if anchor_outranks(b.timeout_round, 0, || authorised, || false) { legacy_rollbacks += 1; }
+            match gated_fork_step(false, || note_if_contradicts_finality_at(&m, b, f), false) {
+                GatedForkStep::Decide => gated_rollbacks += 1,
+                GatedForkStep::IgnoreContradicted => {}
+                GatedForkStep::WalkToPartingPoint => panic!("a contradicted branch is never walked"),
+            }
+        }
+        assert_eq!(legacy_rollbacks, 300, "every lone block re-armed a rollback toward 003");
+        assert_eq!(gated_rollbacks, 0, "no rollback toward a branch that contradicts finality");
+        assert!(lone[1..].iter().all(|b| FINALITY_CONTRADICTED.contains_key(&b.hash())), "all 300 are marked");
+        assert!(!note_if_contradicts_finality_at(&m, &maj_f1, f), "the majority's own next block is not");
+
+        // ── 003: its own F..F+3 over the common block, finality 30 below F, the sealed window held from sync.
+        let (d, _dd) = store();
+        d.save_microblock(f - 1, &bincode::serialize(&common).unwrap()).unwrap();
+        for b in &lone[..4] { d.save_microblock(b.height, &bincode::serialize(b).unwrap()).unwrap(); }
+        d.set_chain_height(f + 3).unwrap();
+        d.save_macroblock(f / MI, &sealed(f / MI, seal)).await.unwrap();
+        let fin_003 = f - 30;
+        // The majority's F+1 sits on another parent: no comparison, a walk one height down.
+        supersede_at(&d, &ingest(&maj_f1, "genesis_node_005"), None, fin_003, f + 3);
+        assert_eq!(fork_recovery_target(), 0, "nothing decided between blocks on different parents");
+        assert_eq!(WALK_TRAIL.get(&maj_f.hash()).map(|v| *v), Some((maj_f1.hash(), f + 1)));
+        // The majority's F, the parting point: the certified content decides, once.
+        supersede_at(&d, &ingest(&maj_f, "genesis_node_001"), None, fin_003, f + 3);
+        assert_eq!(fork_recovery_target(), f - 1, "rolled back to just below the parting point");
+        assert!(f - 1 > fin_003, "never below its own finality");
+        assert!(take_fork_recovery_decided(f - 1), "a decided rollback");
+        // The floor 003's own round-3 blocks would raise against a heuristic target.
+        let keys = [FailoverKey::for_slot(f), FailoverKey::for_slot(f + 1)];
+        for k in keys { crate::unified_p2p::test_certify(k, 3); }
+        let held: std::collections::HashMap<u64, [u8; 32]> = lone[..4].iter().map(|b| (b.height, b.hash())).collect();
+        let protected = crate::unified_p2p::round_protected_floor(f - 1, f + 3, fin_003,
+            |h| held.get(&h).map(|x| (3, *x)), |_| None);
+        assert_eq!(protected, f + 3, "a heuristic target would be cancelled by the floor; a decided one skips it");
+        assert_eq!(take_fork_recovery_signal(), Some(f - 1));
+        for k in keys { crate::unified_p2p::test_forget_key(k); }
+        test_clear_fork_choice_state();
+    }
+
+    /// (3) Lockout. A producer that signed up to X in one window and was rolled back to Y in the window before is
+    /// refused by the window rule at every height in (Y, X] of the earlier window at every round, so the chain cannot
+    /// pass Y with it as leader. The exact record allows every height it never signed and its own heights at a
+    /// higher round, and still refuses the same (height, round).
+    #[test]
+    fn a_rolled_back_producer_is_locked_out_by_the_window_rule_and_not_by_the_exact_record() {
+        let w1_first = (G / MI + 50) * MI + 1;           // first height of window w1
+        let (y, x) = (w1_first - 60, w1_first + 30);     // Y in w0, X in w1
+        let win = crate::node::window_of_height;
+        assert_ne!(win(y + 1), win(x));
+        let (last_w, last_r, last_h) = (win(x), 0u64, x);
+        let mut refused = 0;
+        for h in (y + 1)..=x {
+            for r in 0..8u64 {
+                if win(h) != last_w {
+                    assert!(!crate::node::may_sign(h, r, x, last_w, last_r, last_h), "window rule h={h} r={r}");
+                    refused += 1;
+                }
+            }
+        }
+        assert!(refused > 0);
+        // The exact record: everything in (Y, X] signed at round 0, a gap at Y+5 never signed.
+        let record_floor = y - 100;
+        let signed = |h: u64| if h == y + 5 { None } else { Some(0u64) };
+        for h in (y + 1)..=x {
+            assert!(!crate::node::may_sign_exact(h, 0, x, record_floor, signed(h)) || h == y + 5, "the same pair is refused");
+            assert!(crate::node::may_sign_exact(h, 1, x, record_floor, signed(h)), "a higher round is a new pair");
+        }
+        assert!(crate::node::may_sign_exact(y + 5, 0, x, record_floor, None), "a height never signed");
+        assert!(!crate::node::may_sign_exact(record_floor, 9, x, record_floor, None), "below the record: height-only");
+        assert!(crate::node::may_sign_exact(x + 1, 0, x, record_floor, None));
+    }
+
+    /// Exhaustive small model of the exact record: sign / roll back one / roll back three / raise the round / restart,
+    /// every sequence of depth 8 from a tip four below a window boundary. No (height, round) is ever signed twice, and
+    /// from every reached state the chain reaches its target by signing and raising the round. The window rule is run
+    /// on the same sequences and does strand the chain, which is what made the exact record necessary.
+    #[test]
+    fn the_exact_record_never_double_signs_and_never_strands_the_chain() {
+        const SPAN: usize = 32;
+        #[derive(Clone)]
+        struct P { tip: u64, round: u64, hwm: u64, last: (u64, u64, u64), record: [u64; SPAN], signed: Vec<(u64, u64)> }
+        struct Model { base: u64, floor: u64, exact: bool }
+        impl Model {
+            fn sign(&self, p: &mut P) -> bool {
+                let h = p.tip + 1;
+                let i = (h - self.base) as usize;
+                let prior = if p.record[i] == u64::MAX { None } else { Some(p.record[i]) };
+                let ok = if self.exact {
+                    crate::node::may_sign_exact(h, p.round, p.hwm, self.floor, prior)
+                } else {
+                    crate::node::may_sign(h, p.round, p.hwm, p.last.0, p.last.1, p.last.2)
+                };
+                if !ok { return false; }
+                assert!(!p.signed.contains(&(h, p.round)), "signed ({}, {}) twice", h, p.round);
+                p.signed.push((h, p.round));
+                p.record[i] = prior.map_or(p.round, |r| r.max(p.round));
+                p.hwm = p.hwm.max(h);
+                p.last = (crate::node::window_of_height(h), p.round, h);
+                p.tip = h;
+                true
+            }
+            fn reaches(&self, mut p: P) -> bool {
+                let target = self.base + 12;
+                for _ in 0..64 {
+                    if p.tip >= target { return true; }
+                    if !self.sign(&mut p) { p.round += 1; }
+                }
+                p.tip >= target
+            }
+            fn walk(&self, p: &P, depth: u32, leaves: &mut usize, stranded: &mut usize) {
+                if depth == 0 {
+                    *leaves += 1;
+                    if !self.reaches(p.clone()) { *stranded += 1; }
+                    return;
+                }
+                for op in 0..5 {
+                    let mut q = p.clone();
+                    match op {
+                        0 => { self.sign(&mut q); }
+                        1 => q.tip = q.tip.saturating_sub(1).max(self.base),
+                        2 => q.tip = q.tip.saturating_sub(3).max(self.base),
+                        3 => q.round += 1,
+                        // Restart: the record, its floor and the watermark are durable, written before the
+                        // signature; the round is certified state and comes back with the certificates.
+                        _ => {}
+                    }
+                    self.walk(&q, depth - 1, leaves, stranded);
+                }
+            }
+        }
+        let base = (G / MI + 70) * MI - 4;
+        assert_ne!(crate::node::window_of_height(base + 4), crate::node::window_of_height(base + 5));
+        let start = P { tip: base, round: 0, hwm: base, last: (crate::node::window_of_height(base), 0, base),
+                        record: [u64::MAX; SPAN], signed: Vec::new() };
+        let (mut leaves, mut stranded) = (0usize, 0usize);
+        Model { base, floor: base - 1, exact: true }.walk(&start, 8, &mut leaves, &mut stranded);
+        assert_eq!(leaves, 5usize.pow(8));
+        assert_eq!(stranded, 0, "the exact record always reaches the target");
+        let (mut leaves, mut stranded) = (0usize, 0usize);
+        Model { base, floor: base - 1, exact: false }.walk(&start, 8, &mut leaves, &mut stranded);
+        assert!(stranded > 0, "the window rule strands a producer rolled back across a window boundary");
+    }
+
+    /// (4)+(5) One node's height claim made every other node skip registration; a restarted genesis waited for five
+    /// registrations at any height and never produced.
+    #[test]
+    fn one_height_claim_no_longer_keeps_the_fleet_out_and_a_restarted_genesis_does_not_wait() {
+        assert_eq!(crate::unified_p2p::corroborated_head(567_879, vec![568_110, 567_879, 567_878, 567_879], 5), Some(567_879));
+        assert_eq!(crate::unified_p2p::corroborated_head(567_879, vec![568_110], 5), Some(567_879));
+        assert!(crate::node::registry_wait_applies(true, 120));
+        assert!(!crate::node::registry_wait_applies(true, crate::node::GENESIS_STATIC_ROSTER_LAST_HEIGHT + 1));
+        assert!(!crate::node::registry_wait_applies(true, 567_871), "the restarted genesis of 04.10 produces");
+        assert!(!crate::node::registry_wait_applies(false, 120));
+    }
+
+    /// L3: a source 2f+1 observers flagged cannot drive a rollback, unless it is the leader this node elects there.
+    #[test]
+    fn a_flagged_source_drives_no_rollback_unless_consensus_elects_it() {
+        let _g = TEST_FAILOVER_STATE_LOCK.lock();
+        test_clear_quarantine();
+        let h = G + 77 * MI + 3;
+        assert!(!rollback_source_quarantined("10.0.0.3:8001", "genesis_node_003", h));
+        quarantine_fork_source("10.0.0.3:8001");
+        assert!(rollback_source_quarantined("10.0.0.3:8001", "genesis_node_003", h));
+        assert!(rollback_source_quarantined("10.0.0.9:8001", "10.0.0.3:8001", h), "either id");
+        crate::node::cache_expected_producer(h, "genesis_node_003", 0);
+        assert!(!rollback_source_quarantined("10.0.0.3:8001", "genesis_node_003", h), "consensus outranks the flag");
+        test_clear_quarantine();
     }
 }

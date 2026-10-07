@@ -24,32 +24,58 @@
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
+	<!-- Standard algorithms (ML-DSA-65 and SHA-3 in the app's own native module, PBKDF2 and AES-256-GCM in its bundled
+	     crypto library, X25519/HKDF/AES-256-GCM and Ed25519 in its JS crypto libraries), not taken from the OS: non-exempt
+	     in Apple's classification. Without this key every build stops at "Missing Compliance". -->
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<true/>
+	<!-- HTTPS only, no exceptions: every host the app talks to serves TLS, and node URLs that are not https are
+	     dropped before any request (src/config/nodes.js). -->
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsArbitraryLoads</key>
 		<false/>
-		<key>NSAllowsLocalNetworking</key>
-		<true/>
 	</dict>
-	<key>NSCameraUsageDescription</key>
-	<string>QNet Wallet needs camera access to scan QR codes for receiving cryptocurrency and activating nodes</string>
-	<key>NSPhotoLibraryAddUsageDescription</key>
-	<string>QNet Wallet needs photo library access to save QR codes for your wallet addresses</string>
-	<key>NSPhotoLibraryUsageDescription</key>
-	<string>QNet Wallet needs photo library access to load QR codes</string>
+	<!-- The vault and every other AsyncStorage file stay out of iCloud and computer backups (also the
+	     library default; pinned here so an upgrade cannot change it). Keychain items are ThisDeviceOnly. -->
+	<key>RCTAsyncStorageExcludeFromBackup</key>
+	<true/>
+	<!-- The eleven languages of the app (src/i18n): iOS offers them in Settings, the App Store lists them, and the
+	     purpose strings come in each (<lang>.lproj/InfoPlist.strings). The same list on every device (SD-R3-02). -->
+	<key>CFBundleLocalizations</key>
+	<array>
+		<string>en</string>
+		<string>zh-Hans</string>
+		<string>ru</string>
+		<string>es</string>
+		<string>ko</string>
+		<string>ja</string>
+		<string>pt</string>
+		<string>fr</string>
+		<string>de</string>
+		<string>ar</string>
+		<string>it</string>
+	</array>
 	<key>NSFaceIDUsageDescription</key>
 	<string>QNet Wallet uses Face ID to securely unlock your wallet and authorize transactions</string>
+	<!-- The camera is for the QR scan on the Send screens (QNet and Solana) only, asked for when the scan icon is tapped. Web pages in
+	     the in-app browser get no camera (the WebView patch denies them). -->
+	<key>NSCameraUsageDescription</key>
+	<string>QNet Wallet uses the camera only to scan an address from a QR code when you tap the scan icon on the Send screen.</string>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>remote-notification</string>
 		<string>fetch</string>
 	</array>
+	<!-- Only the periodic wake (a background refresh task, requested again at every return to the app): iOS schedules no
+	     other task for the app (the precise one-shot wakes are Android's). -->
 	<key>BGTaskSchedulerPermittedIdentifiers</key>
 	<array>
 		<string>com.transistorsoft.fetch</string>
 	</array>
+	<!-- Same architecture as the Android build (newArchEnabled=false): the native modules were validated there. -->
 	<key>RCTNewArchEnabled</key>
-	<true/>
+	<false/>
 	<key>UILaunchStoryboardName</key>
 	<string>LaunchScreen</string>
 	<key>UIStatusBarStyle</key>
@@ -61,6 +87,14 @@
 	<key>UISupportedInterfaceOrientations</key>
 	<array>
 		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
+	</array>
+	<!-- iPad: every orientation and no full-screen requirement, so Split View, Slide Over and Stage Manager work. -->
+	<key>UISupportedInterfaceOrientations~ipad</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationPortraitUpsideDown</string>
 		<string>UIInterfaceOrientationLandscapeLeft</string>
 		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>

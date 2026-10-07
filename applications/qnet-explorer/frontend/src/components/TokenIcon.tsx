@@ -3,14 +3,20 @@
 import { useState } from 'react';
 import { sanitizeLogo } from '@/lib/sanitize-logo';
 
+// A contract address in EON form (src/server/logo-proxy.ts CONTRACT_RE); only such a path is ever built.
+const CONTRACT_RE = /^[0-9a-f]{19}eon[0-9a-f]{15}[0-9a-f]{8}$/;
+
 // ============================================================================
 // TokenIcon — a token's icon "like normal blockchains", everywhere tokens show.
 // ============================================================================
-// Priority: (1) a real on-chain logo (only https:// URLs are rendered as <img>,
-// so an unsanitized logo can never inject a javascript:/data: scheme); (2) an
-// emoji logo shown in a chip; (3) a deterministic generated avatar (the token
-// symbol's first letter on a colour derived from the contract address) — so
-// EVERY token has an icon even with no logo set.
+// Priority: (1) a real on-chain logo: when the token's logo is an https:// URL,
+// the image is loaded from this site's own /api/token/<contract>/logo, which
+// fetches it server-side (src/server/logo-proxy.ts), never from the deployer's
+// host, so the logo cannot tell its deployer who views which address (the page
+// CSP allows images from 'self' and data: only); (2) an emoji logo shown in a
+// chip; (3) a deterministic generated avatar (the token symbol's first letter on
+// a colour derived from the contract address) — so EVERY token has an icon even
+// with no logo set, or when its logo cannot be served.
 
 function hashColor(seed: string): string {
   let h = 0;
@@ -32,6 +38,7 @@ export default function TokenIcon({ logo, symbol, address, size = 28, native = f
   const [imgFailed, setImgFailed] = useState(false);
   const logoStr = sanitizeLogo(logo); // backstop: node-mirrored sanitize at the render sink too
   const isUrl = !native && logoStr.startsWith('https://');
+  const contract = typeof address === 'string' && CONTRACT_RE.test(address) ? address : null;
   const isEmoji = !native && logoStr.length > 0 && !isUrl && logoStr.length <= 8;
   const seed = String(address || symbol || '?');
   const letter = (String(symbol || '?').trim().charAt(0) || '?').toUpperCase();
@@ -63,11 +70,11 @@ export default function TokenIcon({ logo, symbol, address, size = 28, native = f
     );
   }
 
-  if (isUrl && !imgFailed) {
+  if (isUrl && contract && !imgFailed) {
     return (
       // eslint-disable-next-line @next/next/no-img-element
       <img
-        src={logoStr}
+        src={`/api/token/${contract}/logo`}
         alt={symbol ? `${symbol} logo` : 'token logo'}
         width={size}
         height={size}

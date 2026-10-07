@@ -15,7 +15,7 @@ const DISPLAY_TYPES = new Set(Object.keys(DISPLAY_TYPE_TO_DB));
 
 export async function GET(request: NextRequest) {
   const clientId = getClientIdentifier(request);
-  const rl = rateLimit(clientId, RATE_LIMIT_MAX, RATE_LIMIT_WINDOW);
+  const rl = rateLimit(`activity:${clientId}`, RATE_LIMIT_MAX, RATE_LIMIT_WINDOW);
   const rlHeaders = {
     'X-RateLimit-Limit': String(RATE_LIMIT_MAX),
     'X-RateLimit-Remaining': String(rl.remaining),

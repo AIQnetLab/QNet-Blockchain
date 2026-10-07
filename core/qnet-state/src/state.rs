@@ -100,14 +100,14 @@ pub const MAX_QNC_SUPPLY_NANO: u64 = MAX_QNC_SUPPLY * 1_000_000_000;
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const HASH_SIZE: usize = 32;
-const TREE_DEPTH: usize = 256; // full address bit-width — guarantees ALL leaves converge to ONE root
+pub(crate) const TREE_DEPTH: usize = 256; // full address bit-width — guarantees ALL leaves converge to ONE root
 /// Depths 0..BUCKET_DEPTH are collapsed into BUCKETS: a leaf's bucket is every leaf
 /// sharing its leading PROOF_DEPTH bits, hashed as one sorted, domain-tagged blob.
 /// Only depths BUCKET_DEPTH..TREE_DEPTH are hashed as tree levels, cutting the
 /// per-leaf climb (hashes, node map traffic, proof size) from 256 levels to 40.
 /// Bucket collisions need matching 40-bit prefixes: ~2^20 grinding per extra entry,
 /// and a fat bucket only grows its own members' proofs — bounded griefing.
-const BUCKET_DEPTH: usize = 216;
+pub(crate) const BUCKET_DEPTH: usize = 216;
 /// Tree levels above the bucket layer == proof length.
 pub const PROOF_DEPTH: usize = TREE_DEPTH - BUCKET_DEPTH;
 /// Domain tag for bucket blobs: bucket preimages are 1 + 64*n bytes, never the
@@ -153,37 +153,280 @@ pub trait MerkleNodeStore: Send + Sync {
     fn leaves_under(&self, lo: &[u8; 32], hi: &[u8; 32], limit: usize) -> Vec<([u8; 32], [u8; 32])>;
     /// Bulk read of the full leaf set — used only for a full rebuild (recompute_root).
     fn all_leaves(&self) -> Vec<([u8; 32], [u8; 32])>;
-    /// Drop the ENTIRE leaf set, committed immediately.
+    /// Drop the ENTIRE leaf set, committed immediately, ahead of a full-state reset.
     ///
     /// The per-finalize delta cannot express this: a full-state reset abandons its in-memory leaf
     /// map without knowing which keys it held, so it emits no `leaf_dels` — and `recompute_root`
     /// then seeds from `all_leaves()`, folding the abandoned state into the new root. Eager, not
-    /// deferred, because that seed read happens before the next flush.
-    fn wipe_leaves(&self) -> Result<(), String>;
-    /// Durably persist one finalize's delta: leaf upserts, leaf deletes, node
-    /// upserts, node deletes. ORDERING CONTRACT: a full rebuild can emit both a
-    /// delete and a re-put for the same NODE key in one delta (clear-then-
-    /// repopulate); the impl MUST apply `node_dels` BEFORE `node_puts` so a
-    /// re-put wins — resulting node state is (existing ∖ node_dels) ∪ node_puts.
-    /// For LEAVES the caller guarantees `leaf_puts` and `leaf_dels` are disjoint
-    /// (a key ending the finalize present appears only in puts, absent only in
-    /// dels), so their relative order is irrelevant — resulting leaf state is
-    /// (existing ∖ leaf_dels) ∪ leaf_puts.
+    /// deferred, because that seed read happens before the next flush. The node set needs no wipe
+    /// here: the full recompute that follows replaces it.
+    fn wipe_for_full_reset(&self) -> Result<(), String>;
+    /// Durably persist one finalize's delta. ORDERING CONTRACT: a full rebuild can emit both a
+    /// delete and a re-put for the same NODE key in one delta (clear-then-repopulate); the impl
+    /// MUST apply `node_dels` BEFORE `node_puts` so a re-put wins — resulting node state is
+    /// (existing ∖ node_dels) ∪ node_puts. For LEAVES the caller guarantees `leaf_puts` and
+    /// `leaf_dels` are disjoint, so their relative order is irrelevant.
     ///
-    /// `wipe_all_nodes` (set on a full rebuild): the impl MUST delete its ENTIRE
-    /// node set BEFORE applying `node_puts` — `node_puts` then carries the
-    /// COMPLETE non-default node set. This replaces (not merges) the node store
-    /// so an evicted node orphaned by a removal can't survive. LEAVES are never
-    /// wiped (they are maintained precisely via leaf_puts/leaf_dels every
-    /// finalize); only the node set is rebuilt.
-    fn put_batch(
+    /// `wipe_nodes` (set on a full rebuild): the impl MUST delete its ENTIRE node set BEFORE
+    /// applying `node_puts` — `node_puts` then carries the COMPLETE non-default node set, so an
+    /// evicted node orphaned by a removal can't survive. LEAVES are never wiped.
+    ///
+    /// `seq` names this finalize. An impl that records it does so in the same write as the root
+    /// row, so a reader that sees the seq sees exactly this finalize's tree.
+    fn put_batch(&self, delta: &AcctDelta) -> Result<(), String>;
+    /// The `seq` of the last delta that landed, so a tree attached to an existing store keeps
+    /// numbering its finalizes upward. A store that does not record seqs answers 0.
+    fn stored_seq(&self) -> u64 { 0 }
+}
+
+/// One finalize's account-tree delta.
+#[derive(Debug, Clone, Default)]
+pub struct AcctDelta {
+    pub leaf_puts: Vec<([u8; 32], [u8; 32])>,
+    pub leaf_dels: Vec<[u8; 32]>,
+    pub node_puts: Vec<((u32, [u8; 32]), [u8; 32])>,
+    pub node_dels: Vec<(u32, [u8; 32])>,
+    pub wipe_nodes: bool,
+    pub seq: u64,
+}
+
+/// Account-tree rows that never reached the store (a failed `put_batch`, async or inline).
+/// Process-wide count for observability; each tree also latches its own since its last reset.
+pub static MERKLE_STORE_WRITE_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Account leaves put back without their fields (`restore_leaf_lazy`): their preimage is recorded
+/// deleted, so a certified proof for them falls back or answers unavailable.
+pub static PREIMAGE_UNKNOWN_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[inline]
+fn warn_on() -> bool { crate::transaction::log_level() >= 2 }
+
+// ── Proof aux rows ───────────────────────────────────────────────────────────────────────────
+// What a certified proof needs and consensus never reads: account leaf preimages and every contract
+// storage tree with its raw values. They are recorded beside the consensus trees and written by an
+// asynchronous sink, so none of them enters the synchronous finalize write.
+
+/// Largest buffered aux delta before it is handed to the sink, and the size of one emitted job.
+pub const AUX_BUFFER_CAP_BYTES: usize = 64 * 1024 * 1024;
+
+/// One ordered unit of aux rows. `None` deletes. Wipes apply before the rows. `seq` is set only on
+/// the job that ends an account-tree finalize, with that finalize's `AcctDelta::seq`.
+#[derive(Debug, Clone, Default)]
+pub struct AuxJob {
+    pub wipes: Vec<[u8; 32]>,
+    pub acct_pre: Vec<([u8; 32], Option<Vec<u8>>)>,
+    pub stor_leaves: Vec<(([u8; 32], [u8; 32]), Option<[u8; 32]>)>,
+    pub stor_nodes: Vec<(([u8; 32], u32, [u8; 32]), Option<[u8; 32]>)>,
+    pub stor_pre: Vec<(([u8; 32], [u8; 32]), Option<Vec<u8>>)>,
+    pub seq: Option<u64>,
+    pub bytes: usize,
+}
+
+impl AuxJob {
+    pub fn is_empty(&self) -> bool {
+        self.wipes.is_empty() && self.acct_pre.is_empty() && self.stor_leaves.is_empty()
+            && self.stor_nodes.is_empty() && self.stor_pre.is_empty()
+    }
+}
+
+/// Where aux rows go. Implemented by the integration layer over its own database.
+pub trait ProofAuxSink: Send + Sync {
+    /// FIFO; blocks while the sink's queue is over its byte cap (backpressure).
+    fn enqueue(&self, job: AuxJob);
+    /// False after a failed write: nothing is recorded or emitted until the next full reset.
+    fn active(&self) -> bool;
+    /// Queue a wipe of every aux row, then take jobs again.
+    fn reset_all(&self);
+}
+
+const PRE_ROW_OVERHEAD: usize = 48;
+
+#[derive(Default)]
+struct AuxBuffer {
+    wipes: BTreeSet<[u8; 32]>,
+    acct_pre: HashMap<[u8; 32], Option<Vec<u8>>>,
+    stor_leaves: BTreeMap<([u8; 32], [u8; 32]), Option<[u8; 32]>>,
+    stor_nodes: BTreeMap<([u8; 32], u32, [u8; 32]), Option<[u8; 32]>>,
+    stor_pre: BTreeMap<([u8; 32], [u8; 32]), Option<Vec<u8>>>,
+    bytes: usize,
+}
+
+fn pre_bytes(v: &Option<Vec<u8>>) -> usize { 32 + PRE_ROW_OVERHEAD + v.as_ref().map_or(0, |b| b.len()) }
+const STOR_LEAF_BYTES: usize = 64 + 33 + PRE_ROW_OVERHEAD;
+const STOR_NODE_BYTES: usize = 68 + 33 + PRE_ROW_OVERHEAD;
+fn stor_pre_bytes(v: &Option<Vec<u8>>) -> usize { 64 + PRE_ROW_OVERHEAD + v.as_ref().map_or(0, |b| b.len()) }
+
+impl AuxBuffer {
+    fn put_acct_pre(&mut self, k: [u8; 32], v: Option<Vec<u8>>) {
+        self.bytes += pre_bytes(&v);
+        if let Some(old) = self.acct_pre.insert(k, v) { self.bytes -= pre_bytes(&old); }
+    }
+    fn put_stor_leaf(&mut self, k: ([u8; 32], [u8; 32]), v: Option<[u8; 32]>) {
+        if self.stor_leaves.insert(k, v).is_none() { self.bytes += STOR_LEAF_BYTES; }
+    }
+    fn put_stor_node(&mut self, k: ([u8; 32], u32, [u8; 32]), v: Option<[u8; 32]>) {
+        if self.stor_nodes.insert(k, v).is_none() { self.bytes += STOR_NODE_BYTES; }
+    }
+    fn put_stor_pre(&mut self, k: ([u8; 32], [u8; 32]), v: Option<Vec<u8>>) {
+        self.bytes += stor_pre_bytes(&v);
+        if let Some(old) = self.stor_pre.insert(k, v) { self.bytes -= stor_pre_bytes(&old); }
+    }
+    /// Forget every buffered row of `c` and record its wipe: the wipe applies first in its job, so
+    /// rows recorded after this land on an empty contract.
+    fn wipe_contract(&mut self, c: [u8; 32]) {
+        let lo2 = (c, [0u8; 32]);
+        let hi2 = (c, [0xFFu8; 32]);
+        let leaves: Vec<_> = self.stor_leaves.range(lo2..=hi2).map(|(k, _)| *k).collect();
+        for k in leaves { self.stor_leaves.remove(&k); self.bytes -= STOR_LEAF_BYTES; }
+        let pres: Vec<_> = self.stor_pre.range(lo2..=hi2).map(|(k, _)| *k).collect();
+        for k in pres { if let Some(old) = self.stor_pre.remove(&k) { self.bytes -= stor_pre_bytes(&old); } }
+        let nodes: Vec<_> = self.stor_nodes.range((c, 0u32, [0u8; 32])..=(c, u32::MAX, [0xFFu8; 32])).map(|(k, _)| *k).collect();
+        for k in nodes { self.stor_nodes.remove(&k); self.bytes -= STOR_NODE_BYTES; }
+        if self.wipes.insert(c) { self.bytes += 32 + 16; }
+    }
+    fn take(&mut self, seq: Option<u64>) -> AuxJob {
+        let b = std::mem::take(self);
+        AuxJob {
+            wipes: b.wipes.into_iter().collect(),
+            acct_pre: b.acct_pre.into_iter().collect(),
+            stor_leaves: b.stor_leaves.into_iter().collect(),
+            stor_nodes: b.stor_nodes.into_iter().collect(),
+            stor_pre: b.stor_pre.into_iter().collect(),
+            seq,
+            bytes: b.bytes,
+        }
+    }
+}
+
+struct AuxState {
+    buf: AuxBuffer,
+    /// Per contract hash, the storage root the sink holds, or will once queued jobs land. A
+    /// positive record only: absence means unknown, and an unknown tree is emitted whole.
+    mirrored: HashMap<[u8; 32], [u8; 32]>,
+    cap: usize,
+    unknown_pending: u64,
+    #[cfg(test)]
+    peak_bytes: usize,
+}
+
+/// The account tree and every contract tree share one buffer and one sink.
+#[derive(Clone)]
+pub(crate) struct AuxLink {
+    state: Arc<parking_lot::Mutex<AuxState>>,
+    sink: Arc<dyn ProofAuxSink>,
+}
+
+impl AuxLink {
+    fn new(sink: Arc<dyn ProofAuxSink>) -> Self {
+        Self {
+            state: Arc::new(parking_lot::Mutex::new(AuxState {
+                buf: AuxBuffer::default(),
+                mirrored: HashMap::new(),
+                cap: AUX_BUFFER_CAP_BYTES,
+                unknown_pending: 0,
+                #[cfg(test)]
+                peak_bytes: 0,
+            })),
+            sink,
+        }
+    }
+
+    fn active(&self) -> bool { self.sink.active() }
+
+    /// Hand the buffer over once it reaches its cap. Drained rows are written once and never
+    /// revisited: deletes exist only as recorded deletes, so nothing drained is later implied away.
+    fn drain_if_full(&self, mut st: parking_lot::MutexGuard<'_, AuxState>) {
+        #[cfg(test)]
+        { st.peak_bytes = st.peak_bytes.max(st.buf.bytes); }
+        if st.buf.bytes < st.cap { return; }
+        let job = st.buf.take(None);
+        drop(st);
+        self.sink.enqueue(job);
+    }
+
+    fn record_account(&self, key: [u8; 32], op: Option<Vec<u8>>, unknown: bool) {
+        if !self.active() { return; }
+        let mut st = self.state.lock();
+        st.buf.put_acct_pre(key, op);
+        if unknown { st.unknown_pending += 1; }
+        self.drain_if_full(st);
+    }
+
+    /// The finalize's job, always sent so the sink's seq moves in step with the tree's.
+    fn finalize_job(&self, seq: u64) {
+        if !self.active() {
+            self.state.lock().buf = AuxBuffer::default();
+            return;
+        }
+        let mut st = self.state.lock();
+        let unknown = std::mem::take(&mut st.unknown_pending);
+        let job = st.buf.take(Some(seq));
+        drop(st);
+        if unknown > 0 && warn_on() {
+            println!("[WARN][MERKLE] preimage_unknown n={}", unknown);
+        }
+        self.sink.enqueue(job);
+    }
+
+    fn mirror(&self, c: &[u8; 32]) -> Option<[u8; 32]> {
+        let mut st = self.state.lock();
+        if !self.sink.active() {
+            st.mirrored.clear();
+            return None;
+        }
+        st.mirrored.get(c).copied()
+    }
+
+    fn wipe_contract(&self, c: [u8; 32]) {
+        if !self.active() { return; }
+        let mut st = self.state.lock();
+        st.buf.wipe_contract(c);
+        st.mirrored.remove(&c);
+        self.drain_if_full(st);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn merge_storage(
         &self,
-        leaf_puts: &[([u8; 32], [u8; 32])],
-        leaf_dels: &[[u8; 32]],
-        node_puts: &[((u32, [u8; 32]), [u8; 32])],
-        node_dels: &[(u32, [u8; 32])],
-        wipe_all_nodes: bool,
-    ) -> Result<(), String>;
+        c: [u8; 32],
+        node_dels: Vec<(u32, [u8; 32])>,
+        node_puts: Vec<((u32, [u8; 32]), [u8; 32])>,
+        leaf_dels: Vec<[u8; 32]>,
+        leaf_puts: Vec<([u8; 32], [u8; 32])>,
+        pre: BTreeMap<[u8; 32], Option<Vec<u8>>>,
+        root: [u8; 32],
+    ) {
+        if !self.active() { return; }
+        let mut st = self.state.lock();
+        // Dels before puts, as the account store applies them: a full rebuild re-puts what it cleared.
+        for (d, k) in node_dels { st.buf.put_stor_node((c, d, k), None); }
+        for ((d, k), v) in node_puts { st.buf.put_stor_node((c, d, k), Some(v)); }
+        for k in leaf_dels { st.buf.put_stor_leaf((c, k), None); }
+        for (k, v) in leaf_puts { st.buf.put_stor_leaf((c, k), Some(v)); }
+        for (k, v) in pre { st.buf.put_stor_pre((c, k), v); }
+        st.mirrored.insert(c, root);
+        self.drain_if_full(st);
+    }
+
+    /// Hand everything buffered to the sink now (ahead of rows streamed past the buffer).
+    fn flush_now(&self) {
+        let job = { self.state.lock().buf.take(None) };
+        if !job.is_empty() { self.sink.enqueue(job); }
+    }
+
+    fn set_mirror(&self, c: [u8; 32], root: [u8; 32]) {
+        self.state.lock().mirrored.insert(c, root);
+    }
+
+    /// A full-state reset: what was buffered describes the abandoned state, the sink wipes and re-arms.
+    fn reset(&self) {
+        {
+            let mut st = self.state.lock();
+            st.buf = AuxBuffer::default();
+            st.mirrored.clear();
+            st.unknown_pending = 0;
+        }
+        self.sink.reset_all();
+    }
 }
 
 /// What a subtree holds, capped at the two cases the fold has to tell apart.
@@ -193,13 +436,11 @@ enum SubtreeSpan {
     Branch,
 }
 
-/// One finalize's persisted delta, handed to the write-behind flusher.
-struct FlushJob {
-    leaf_puts: Vec<([u8; HASH_SIZE], [u8; HASH_SIZE])>,
-    leaf_dels: Vec<[u8; HASH_SIZE]>,
-    node_puts: Vec<((u32, [u8; HASH_SIZE]), [u8; HASH_SIZE])>,
-    node_dels: Vec<(u32, [u8; HASH_SIZE])>,
-    wipe_nodes: bool,
+/// What the write-behind flusher runs, in order: a finalize's delta, or a marker that runs once
+/// every delta queued ahead of it has landed.
+enum FlushMsg {
+    Job(AcctDelta),
+    After { root: [u8; 32], seq: u64, f: Box<dyn FnOnce([u8; 32], u64) + Send> },
 }
 
 /// State Merkle Tree for account proofs
@@ -290,12 +531,23 @@ pub struct StateMerkleTree {
     // (~9 per dirty leaf) were 95%+ of finalize cost under batch load.
     leaves_complete: bool,
     // Write-behind flusher (see set_node_store / flush_barrier).
-    flush_tx: Option<std::sync::mpsc::SyncSender<FlushJob>>,
+    flush_tx: Option<std::sync::mpsc::SyncSender<FlushMsg>>,
     flush_done: Option<std::sync::Arc<(std::sync::Mutex<u64>, std::sync::Condvar)>>,
     flush_sent: u64,
     /// Set when the incremental pass read a node it could not resolve. finalize discards the
     /// result and redoes the pass as a full recompute rather than sealing a guessed root.
     incremental_pass_invalid: bool,
+    /// Number of the last flushed finalize, carried in its delta and its aux job. Monotonic across
+    /// resets and restarts, so two finalizes never share one.
+    row_seq: u64,
+    /// Store writes that failed since this tree's store was (re)attached. Shared with the flusher.
+    write_failures: Arc<std::sync::atomic::AtomicU64>,
+    /// Account tree: preimage recording and the per-finalize aux job. Contract tree: its sink.
+    aux: Option<AuxLink>,
+    /// Set on a contract storage tree whose rows are mirrored to the aux sink under this hash.
+    sink_contract: Option<[u8; HASH_SIZE]>,
+    /// Raw-value operations of a contract tree since its last flush, by leaf key; last op wins.
+    delta_pre: BTreeMap<[u8; HASH_SIZE], Option<Vec<u8>>>,
 }
 
 impl StateMerkleTree {
@@ -340,7 +592,23 @@ impl StateMerkleTree {
             flush_done: None,
             flush_sent: 0,
             incremental_pass_invalid: false,
+            row_seq: 0,
+            write_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            aux: None,
+            sink_contract: None,
+            delta_pre: BTreeMap::new(),
         }
+    }
+
+    /// The default hash of an empty subtree at every depth (0 = empty leaf, TREE_DEPTH = empty root).
+    pub(crate) fn default_hashes() -> &'static [[u8; HASH_SIZE]] {
+        static DEFAULTS: std::sync::OnceLock<Vec<[u8; HASH_SIZE]>> = std::sync::OnceLock::new();
+        DEFAULTS.get_or_init(|| StateMerkleTree::new().default_hashes)
+    }
+
+    /// Root of the empty tree.
+    pub fn empty_root() -> [u8; HASH_SIZE] {
+        Self::default_hashes()[TREE_DEPTH]
     }
 
     /// Attach a disk-backed node store, switching `leaves`/`intermediate_nodes`
@@ -353,17 +621,30 @@ impl StateMerkleTree {
         if self.node_cache_cap == 0 {
             self.node_cache_cap = DEFAULT_NODE_CACHE_CAP;
         }
+        self.row_seq = self.row_seq.max(store.stored_seq());
+        let failures = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        self.write_failures = failures.clone();
         // Write-behind flusher: finalize hands each delta to this thread and returns.
         // Used ONLY while both caches are complete (store reads never happen then);
         // an incomplete cache falls back to the synchronous path. Bounded channel =
-        // natural backpressure if the disk cannot keep up.
-        let (tx, rx) = std::sync::mpsc::sync_channel::<FlushJob>(4);
+        // natural backpressure if the disk cannot keep up. A marker runs here once the
+        // deltas queued ahead of it have landed.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<FlushMsg>(4);
         let done = std::sync::Arc::new((std::sync::Mutex::new(0u64), std::sync::Condvar::new()));
         let done_w = done.clone();
         std::thread::Builder::new().name("merkle-flush".into()).spawn(move || {
-            while let Ok(job) = rx.recv() {
-                if let Err(e) = store.put_batch(&job.leaf_puts, &job.leaf_dels, &job.node_puts, &job.node_dels, job.wipe_nodes) {
-                    println!("[WARN][MERKLE] node_store put_batch failed: {}", e);
+            while let Ok(msg) = rx.recv() {
+                match msg {
+                    FlushMsg::Job(delta) => {
+                        if let Err(e) = store.put_batch(&delta) {
+                            Self::note_store_write_failure(&failures, delta.seq, &e);
+                        }
+                    }
+                    FlushMsg::After { root, seq, f } => {
+                        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || f(root, seq))).is_err() {
+                            println!("[ERR][MERKLE] flush_marker_panicked seq={}", seq);
+                        }
+                    }
                 }
                 let (lock, cv) = &*done_w;
                 *lock.lock().unwrap() += 1;
@@ -373,6 +654,65 @@ impl StateMerkleTree {
         self.flush_tx = Some(tx);
         self.flush_done = Some(done);
         self.flush_sent = 0;
+    }
+
+    fn note_store_write_failure(failures: &std::sync::atomic::AtomicU64, seq: u64, e: &str) {
+        failures.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        MERKLE_STORE_WRITE_FAILURES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // Always printed: a lost delta leaves rows nowhere, and nothing else reports it.
+        println!("[ERR][MERKLE] node_store_put_batch_failed seq={} err={}", seq, e);
+    }
+
+    /// Attach the aux sink to the account tree: from now on every leaf write records its preimage
+    /// operation, and every finalize hands its aux job over with its seq.
+    pub(crate) fn set_aux(&mut self, link: AuxLink) {
+        self.aux = Some(link);
+    }
+
+    /// Store writes that failed since the store was last (re)attached.
+    pub fn store_write_failures(&self) -> u64 {
+        self.write_failures.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Number of the last flushed finalize.
+    pub fn row_seq(&self) -> u64 {
+        self.row_seq
+    }
+
+    /// Run `f(root, seq)` once every delta flushed so far has landed in the store: inline when the
+    /// queue is already drained (the synchronous path included), otherwise on the flusher right
+    /// behind the last queued delta. The marker counts as a queued job, so eviction (which waits
+    /// for a drained queue) cannot switch to synchronous writes ahead of it, and the next
+    /// finalize's rows can never land before it runs.
+    pub fn run_after_flush(&mut self, f: Box<dyn FnOnce([u8; HASH_SIZE], u64) + Send>) {
+        if self.flush_fully_drained() {
+            f(self.root, self.row_seq);
+            return;
+        }
+        if let Some(ref tx) = self.flush_tx {
+            if tx.send(FlushMsg::After { root: self.root, seq: self.row_seq, f }).is_ok() {
+                self.flush_sent += 1;
+            }
+        }
+    }
+
+    /// Mirror this contract storage tree's rows to the aux sink under `contract`. The tree must be
+    /// finalized and its rows already held by the sink (a silent install) or about to be (a full emit).
+    pub(crate) fn attach_storage_sink(&mut self, link: AuxLink, contract: [u8; HASH_SIZE]) {
+        self.aux = Some(link);
+        self.sink_contract = Some(contract);
+    }
+
+    /// True for a contract tree whose rows go to the aux sink.
+    pub(crate) fn has_storage_sink(&self) -> bool {
+        self.sink_contract.is_some()
+    }
+
+    /// Whether writes are recorded as a delta: under a node store, or as a mirrored contract tree.
+    /// Read paths still follow `node_store` alone, so a mirrored contract tree reads RAM only.
+    #[inline]
+    fn records_delta(&self) -> bool {
+        self.node_store.is_some() || self.sink_contract.is_some()
     }
 
     /// True when no flush job is still queued or in flight.
@@ -411,22 +751,31 @@ impl StateMerkleTree {
     pub fn reset_preserving_store(&mut self) {
         let store = self.node_store.clone();
         let cap = self.node_cache_cap;
+        let seq = self.row_seq;
+        // Only the account tree owns the aux sink's whole row set; a contract tree never resets it.
+        let aux = if self.sink_contract.is_none() { self.aux.clone() } else { None };
         // Queued write-behind jobs still carry OLD-state rows; land them before the
         // wipe or they would resurrect after it.
         self.flush_barrier();
         if let Some(ref st) = store {
             // Fail LOUD: continuing would fold two states into one root, and every later block would
             // be rejected by peers with nothing in the log to say why.
-            if let Err(e) = st.wipe_leaves() {
+            if let Err(e) = st.wipe_for_full_reset() {
                 panic!("merkle leaf wipe failed on full-state reset: {}", e);
             }
         }
+        // Aux rows describe the abandoned state too; the sink wipes them and re-arms.
+        if let Some(ref link) = aux {
+            link.reset();
+        }
         *self = Self::new();
+        self.row_seq = seq;
         if let Some(st) = store {
             // Re-arm the store AND its flusher (set_node_store marks caches incomplete;
             // the rebuild that follows restores completeness).
             self.set_node_store(st);
         }
+        self.aux = aux;
         self.node_cache_cap = cap;
     }
 
@@ -486,7 +835,7 @@ impl StateMerkleTree {
     /// Upsert a leaf. Store None → exactly `self.leaves.insert(key,val)`.
     fn leaf_put(&mut self, key: [u8; HASH_SIZE], val: [u8; HASH_SIZE]) {
         self.leaves.insert(key, val);
-        if self.node_store.is_some() {
+        if self.records_delta() {
             self.delta_leaf_puts.push((key, val));
             // A re-insert cancels a same-finalize pending deletion so the flush
             // emits puts∩dels = ∅ and the tombstone stops suppressing reads.
@@ -499,7 +848,7 @@ impl StateMerkleTree {
     /// stale store can't resurrect it, and record it for the `leaf_dels` batch.
     fn leaf_del(&mut self, key: [u8; HASH_SIZE]) {
         self.leaves.remove(&key);
-        if self.node_store.is_some() {
+        if self.records_delta() {
             self.pending_leaf_dels.insert(key);
         }
     }
@@ -507,7 +856,7 @@ impl StateMerkleTree {
     /// Upsert an internal node. Store None → exactly `intermediate_nodes.insert`.
     fn node_put(&mut self, depth: u32, key: [u8; HASH_SIZE], val: [u8; HASH_SIZE]) {
         self.intermediate_nodes.insert((depth, key), val);
-        if self.node_store.is_some() {
+        if self.records_delta() {
             self.delta_node_puts.push(((depth, key), val));
         }
     }
@@ -517,7 +866,7 @@ impl StateMerkleTree {
     fn node_del(&mut self, depth: u32, key: [u8; HASH_SIZE]) {
         let existed = self.intermediate_nodes.remove(&(depth, key)).is_some();
         // With a complete cache a miss proves the store has no row either — no tombstone.
-        if self.node_store.is_some() && (existed || !self.node_cache_complete) {
+        if self.records_delta() && (existed || !self.node_cache_complete) {
             self.delta_node_dels.push((depth, key));
         }
     }
@@ -530,7 +879,7 @@ impl StateMerkleTree {
     /// never read (they sit on default paths with no populated leaf beneath), so
     /// leaving them as harmless dead keys cannot change the root or any proof.
     fn clear_nodes(&mut self) {
-        if self.node_store.is_some() {
+        if self.records_delta() {
             for (depth, key) in self.intermediate_nodes.keys().copied().collect::<Vec<_>>() {
                 self.delta_node_dels.push((depth, key));
             }
@@ -549,6 +898,7 @@ impl StateMerkleTree {
         let addr_hash = Self::hash_address(address);
         let account_hash = Self::hash_account(account);
         self.leaf_put(addr_hash, account_hash); // records store delta when attached
+        self.record_preimage(addr_hash, Some(account));
         self.recompute_root();
         self.dirty = false;
         self.pending_updates = 0;
@@ -574,9 +924,25 @@ impl StateMerkleTree {
         }
 
         self.leaf_put(addr_hash, account_hash);
+        self.record_preimage(addr_hash, Some(account));
         self.dirty = true;
         self.pending_updates += 1;
         self.dirty_paths.insert(addr_hash); // v32.14: incremental path tracking
+    }
+
+    /// Record the preimage operation of an account leaf write: its fields, or a delete. Only the
+    /// account tree records; the flush emits exactly what was recorded, so a key with no record
+    /// emits nothing and a drained record is never undone by implication.
+    fn record_preimage(&mut self, key: [u8; HASH_SIZE], account: Option<&Account>) {
+        if self.sink_contract.is_some() { return; }
+        if let Some(ref link) = self.aux {
+            let op = account.and_then(|a| crate::leaf_preimage::AccountLeafPreimage::of(a).encode());
+            let unknown = account.is_some() && op.is_none();
+            if unknown {
+                PREIMAGE_UNKNOWN_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            link.record_account(key, op, unknown);
+        }
     }
 
     /// Put a committed account leaf back verbatim. The undo of a block that could not read the
@@ -584,6 +950,13 @@ impl StateMerkleTree {
     pub fn restore_leaf_lazy(&mut self, address: &str, leaf: [u8; HASH_SIZE]) {
         let addr_hash = Self::hash_address(address);
         self.leaf_put(addr_hash, leaf);
+        // The fields behind this leaf are not held here: its preimage is recorded unknown (deleted).
+        if self.sink_contract.is_none() {
+            if let Some(ref link) = self.aux {
+                PREIMAGE_UNKNOWN_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                link.record_account(addr_hash, None, true);
+            }
+        }
         self.dirty = true;
         self.pending_updates += 1;
         self.dirty_paths.insert(addr_hash);
@@ -600,11 +973,27 @@ impl StateMerkleTree {
         self.dirty_paths.insert(leaf_key);
     }
 
+    /// Insert one contract-storage value: its leaf, and on a mirrored contract tree the raw value
+    /// as that leaf's preimage, so a certified storage proof can carry the value without live state.
+    pub fn insert_raw_value_lazy(&mut self, key_preimage: &str, value: &str) {
+        let leaf_key = Self::hash_storage_key(key_preimage);
+        self.leaf_put(leaf_key, Self::storage_leaf_value(value));
+        if self.sink_contract.is_some() {
+            self.delta_pre.insert(leaf_key, Some(value.as_bytes().to_vec()));
+        }
+        self.dirty = true;
+        self.pending_updates += 1;
+        self.dirty_paths.insert(leaf_key);
+    }
+
     /// V2 (incremental): remove a RAW leaf (drained storage key) WITHOUT root recomputation — the
     /// delete-side of insert_raw_lazy, so an incremental sweep can drop a drained `balance:{holder}`.
     pub fn delete_raw_lazy(&mut self, key_preimage: &str) {
         let leaf_key = Self::hash_storage_key(key_preimage);
         self.leaf_del(leaf_key);
+        if self.sink_contract.is_some() {
+            self.delta_pre.insert(leaf_key, None);
+        }
         self.dirty = true;
         self.pending_updates += 1;
         self.dirty_paths.insert(leaf_key);
@@ -618,6 +1007,7 @@ impl StateMerkleTree {
             let addr_hash = Self::hash_address(address);
             let account_hash = Self::hash_account(account);
             self.leaf_put(addr_hash, account_hash);
+            self.record_preimage(addr_hash, Some(account));
             self.dirty_paths.insert(addr_hash); // v32.14
         }
         self.dirty = true;
@@ -678,6 +1068,10 @@ impl StateMerkleTree {
     /// entries down to `node_cache_cap`. Called only from finalize. When
     /// `node_store` is None every branch is skipped — default path unchanged.
     fn flush_delta_and_evict(&mut self) {
+        if let Some(contract) = self.sink_contract {
+            self.flush_storage_delta(contract);
+            return;
+        }
         // Take the delta first to end the immutable borrow of `self` held by
         // the `if let Some(ref store)` before we mutate the cache maps.
         if self.node_store.is_none() {
@@ -687,6 +1081,11 @@ impl StateMerkleTree {
             self.delta_node_dels.clear();
             self.pending_leaf_dels.clear();
             self.node_wipe_pending = false;
+            // Aux rows still leave with their finalize, so the buffer never outgrows one block.
+            if let Some(ref link) = self.aux {
+                self.row_seq += 1;
+                link.finalize_job(self.row_seq);
+            }
             return;
         }
         let mut leaf_puts = std::mem::take(&mut self.delta_leaf_puts);
@@ -702,20 +1101,25 @@ impl StateMerkleTree {
             leaf_puts.retain(|(k, _)| !leaf_dels_set.contains(k));
         }
         let leaf_dels: Vec<[u8; HASH_SIZE]> = leaf_dels_set.into_iter().collect();
+        self.row_seq += 1;
+        let seq = self.row_seq;
+        // This finalize's aux rows go as one job carrying the same seq, so a view can pair the two.
+        if let Some(ref link) = self.aux {
+            link.finalize_job(seq);
+        }
+        let delta = AcctDelta { leaf_puts, leaf_dels, node_puts, node_dels, wipe_nodes, seq };
         // Complete caches mean the store is never read: hand the delta to the
         // write-behind thread and return. An incomplete cache (or no flusher)
         // persists synchronously — read-through must see every prior write.
         let async_ok = self.leaves_complete && self.node_cache_complete && self.flush_tx.is_some();
         if async_ok {
-            let job = FlushJob { leaf_puts, leaf_dels, node_puts, node_dels, wipe_nodes };
-            if self.flush_tx.as_ref().unwrap().send(job).is_ok() {
+            if self.flush_tx.as_ref().unwrap().send(FlushMsg::Job(delta)).is_ok() {
                 self.flush_sent += 1;
             }
         } else if let Some(ref store) = self.node_store {
-            if let Err(e) = store.put_batch(&leaf_puts, &leaf_dels, &node_puts, &node_dels, wipe_nodes) {
-                // Persist failure is non-fatal to the in-mem root (still correct
-                // for this finalize); surface it so the operator can react.
-                println!("[WARN][MERKLE] node_store put_batch failed: {}", e);
+            if let Err(e) = store.put_batch(&delta) {
+                // The in-mem root stays correct for this finalize; the failure latches capture.
+                Self::note_store_write_failure(&self.write_failures, seq, &e);
             }
         }
         // Bound the caches. Entries are re-loadable via get_leaf/get_node, so a
@@ -745,21 +1149,44 @@ impl StateMerkleTree {
             }
         }
     }
-    
+
+    /// A mirrored contract tree's flush: its rows move into the shared aux buffer under its hash,
+    /// and the aux sink then holds this tree's root for it. Its node cache is complete (it never
+    /// evicts), so a full recompute's `clear_nodes` already deleted exactly the old node set and no
+    /// contract-wide wipe is needed — a wipe would also erase raw values the tree does not hold.
+    /// A tree installed silently from a fresh build may leave its predecessor's rows under single
+    /// buckets in the sink (the incremental pass keeps a chain top whose sibling died; a fresh build
+    /// does not); branch rows and the root row stay current, which is all a proof reads there.
+    fn flush_storage_delta(&mut self, contract: [u8; HASH_SIZE]) {
+        let mut leaf_puts = std::mem::take(&mut self.delta_leaf_puts);
+        let node_puts = std::mem::take(&mut self.delta_node_puts);
+        let node_dels = std::mem::take(&mut self.delta_node_dels);
+        let leaf_dels_set = std::mem::take(&mut self.pending_leaf_dels);
+        let pre = std::mem::take(&mut self.delta_pre);
+        self.node_wipe_pending = false;
+        if !leaf_dels_set.is_empty() {
+            leaf_puts.retain(|(k, _)| !leaf_dels_set.contains(k));
+        }
+        if let Some(ref link) = self.aux {
+            link.merge_storage(contract, node_dels, node_puts, leaf_dels_set.into_iter().collect(), leaf_puts, pre, self.root);
+        }
+    }
+
     /// v3.22: Check if tree needs finalization
     pub fn is_dirty(&self) -> bool {
         self.dirty
     }
-    
+
     /// v3.22: Get pending updates count
     pub fn pending_count(&self) -> usize {
         self.pending_updates
     }
-    
+
     /// Remove account with immediate root recomputation
     pub fn remove(&mut self, address: &str) -> [u8; HASH_SIZE] {
         let addr_hash = Self::hash_address(address);
         self.leaf_del(addr_hash); // tombstones + records store delta when attached
+        self.record_preimage(addr_hash, None);
         self.dirty = true;
         self.pending_updates += 1;
         self.finalize()
@@ -771,6 +1198,7 @@ impl StateMerkleTree {
     pub fn remove_lazy(&mut self, address: &str) {
         let addr_hash = Self::hash_address(address);
         self.leaf_del(addr_hash); // tombstones + records store delta when attached
+        self.record_preimage(addr_hash, None);
         self.dirty = true;
         self.pending_updates += 1;
         self.dirty_paths.insert(addr_hash); // v32.14: path-walk needed for default-fill
@@ -928,7 +1356,7 @@ impl StateMerkleTree {
     /// len-PROOF_DEPTH steps are the in-bucket path (flags are positional); the
     /// last PROOF_DEPTH steps are tree levels whose flags MUST equal the key's
     /// bits. The tagged seed binds key+value, so no path can prove a foreign key.
-    fn verify_leaf_proof(
+    pub(crate) fn verify_leaf_proof(
         leaf_key: &[u8; HASH_SIZE],
         leaf_value: [u8; HASH_SIZE],
         proof: &[([u8; HASH_SIZE], bool)],
@@ -1018,7 +1446,7 @@ impl StateMerkleTree {
     }
 
     /// V2: SMT leaf-position hash for a contract_storage KEY (domain-separated from account addresses).
-    fn hash_storage_key(key: &str) -> [u8; HASH_SIZE] {
+    pub fn hash_storage_key(key: &str) -> [u8; HASH_SIZE] {
         let mut hasher = Sha3_256::new();
         hasher.update(b"QNET_STORAGE_KEY:");
         hasher.update(key.as_bytes());
@@ -1029,7 +1457,7 @@ impl StateMerkleTree {
 
     /// V2: SMT leaf VALUE for a contract_storage value — hash of the RAW stored string (balances are
     /// decimal strings), so a client reproduces it from the same string with no width/padding ambiguity.
-    fn storage_leaf_value(value: &str) -> [u8; HASH_SIZE] {
+    pub fn storage_leaf_value(value: &str) -> [u8; HASH_SIZE] {
         let mut hasher = Sha3_256::new();
         hasher.update(b"QNET_STORAGE_VAL:");
         hasher.update(value.as_bytes());
@@ -1069,7 +1497,7 @@ impl StateMerkleTree {
             || Self::compute_storage_root(&account.contract_storage) == account.storage_root
     }
     
-    fn hash_account(account: &Account) -> [u8; HASH_SIZE] {
+    pub(crate) fn hash_account(account: &Account) -> [u8; HASH_SIZE] {
         let mut hasher = Sha3_256::new();
         hasher.update(b"QNET_ACCOUNT_V2:");
         // Consensus-critical fields (modified only through deterministic block processing)
@@ -1143,7 +1571,7 @@ impl StateMerkleTree {
         TREE_DEPTH - 1 - depth
     }
 
-    fn get_bit(hash: &[u8; HASH_SIZE], depth: usize) -> bool {
+    pub(crate) fn get_bit(hash: &[u8; HASH_SIZE], depth: usize) -> bool {
         let b = Self::level_bit(depth);
         let byte_idx = b / 8;
         let bit_idx = 7 - (b % 8);
@@ -1154,7 +1582,7 @@ impl StateMerkleTree {
         }
     }
 
-    fn flip_bit(hash: &mut [u8; HASH_SIZE], depth: usize) {
+    pub(crate) fn flip_bit(hash: &mut [u8; HASH_SIZE], depth: usize) {
         let b = Self::level_bit(depth);
         let byte_idx = b / 8;
         let bit_idx = 7 - (b % 8);
@@ -1165,7 +1593,7 @@ impl StateMerkleTree {
 
     /// Clear the bit `depth` splits on — turns a child key into its parent key.
     #[inline]
-    fn clear_bit(hash: &mut [u8; HASH_SIZE], depth: usize) {
+    pub(crate) fn clear_bit(hash: &mut [u8; HASH_SIZE], depth: usize) {
         let b = Self::level_bit(depth);
         let byte_idx = b / 8;
         if byte_idx < HASH_SIZE {
@@ -1186,7 +1614,7 @@ impl StateMerkleTree {
     /// Inclusive key range covered by the subtree at (depth, key): the ascent has
     /// cleared the trailing `depth` bits, so the subtree is every key sharing the
     /// leading 256-depth bits.
-    fn subtree_bounds(depth: usize, key: &[u8; HASH_SIZE]) -> ([u8; HASH_SIZE], [u8; HASH_SIZE]) {
+    pub(crate) fn subtree_bounds(depth: usize, key: &[u8; HASH_SIZE]) -> ([u8; HASH_SIZE], [u8; HASH_SIZE]) {
         let mut lo = *key;
         let mut hi = *key;
         for b in (TREE_DEPTH - depth)..TREE_DEPTH {
@@ -1200,13 +1628,13 @@ impl StateMerkleTree {
 
     /// Canonical bucket key: the leaf key with its trailing BUCKET_DEPTH bits cleared.
     #[inline]
-    fn bucket_of(key: &[u8; HASH_SIZE]) -> [u8; HASH_SIZE] {
+    pub(crate) fn bucket_of(key: &[u8; HASH_SIZE]) -> [u8; HASH_SIZE] {
         Self::subtree_bounds(BUCKET_DEPTH, key).0
     }
 
     /// In-bucket leaf: domain-tagged (65-byte preimage — disjoint from 64-byte nodes).
     #[inline]
-    fn bucket_leaf(key: &[u8; HASH_SIZE], value: &[u8; HASH_SIZE]) -> [u8; HASH_SIZE] {
+    pub(crate) fn bucket_leaf(key: &[u8; HASH_SIZE], value: &[u8; HASH_SIZE]) -> [u8; HASH_SIZE] {
         let mut hasher = Sha3_256::new();
         hasher.update([BUCKET_TAG]);
         hasher.update(key);
@@ -1219,7 +1647,7 @@ impl StateMerkleTree {
     /// Mini-merkle over one bucket's sorted tagged leaves: pairwise H(l||r), an odd
     /// element promotes unchanged. Single entry => its tagged leaf. Proofs through a
     /// bucket are ordinary (sibling, is_right) steps, so the wire shape is uniform.
-    fn bucket_fold(mut level: Vec<[u8; HASH_SIZE]>) -> [u8; HASH_SIZE] {
+    pub(crate) fn bucket_fold(mut level: Vec<[u8; HASH_SIZE]>) -> [u8; HASH_SIZE] {
         debug_assert!(!level.is_empty());
         let mut buffer = [0u8; HASH_SIZE * 2];
         while level.len() > 1 {
@@ -1279,10 +1707,20 @@ impl StateMerkleTree {
         bucket_hash: [u8; HASH_SIZE],
         depth: usize,
     ) -> [u8; HASH_SIZE] {
+        Self::lonely_chain_hash_over(&self.default_hashes, bucket_key, bucket_hash, depth)
+    }
+
+    /// `lonely_chain_hash` over an explicit default-hash table, for readers without a tree.
+    pub(crate) fn lonely_chain_hash_over(
+        defaults: &[[u8; HASH_SIZE]],
+        bucket_key: &[u8; HASH_SIZE],
+        bucket_hash: [u8; HASH_SIZE],
+        depth: usize,
+    ) -> [u8; HASH_SIZE] {
         let mut acc = bucket_hash;
         let mut buffer = [0u8; HASH_SIZE * 2];
         for d in BUCKET_DEPTH..depth {
-            let sibling = self.default_hashes[d];
+            let sibling = defaults[d];
             if Self::get_bit(bucket_key, d) {
                 buffer[..HASH_SIZE].copy_from_slice(&sibling);
                 buffer[HASH_SIZE..].copy_from_slice(&acc);
@@ -1466,7 +1904,7 @@ impl StateMerkleTree {
         // store the flush must replace (not merge) the persisted node set so no
         // removal-orphaned evicted node survives. Signal the wipe; inert (and
         // reset at flush) when no store is attached.
-        if self.node_store.is_some() {
+        if self.records_delta() {
             self.node_wipe_pending = true;
             // The rebuild re-puts the complete node set into the cache.
             self.node_cache_complete = true;
@@ -1984,6 +2422,33 @@ impl Default for StateMerkleTree {
     }
 }
 
+/// An account without its contract storage and code: what a recipient check or a light account read
+/// needs. Read only by RPC; no block rule reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountBasic {
+    pub address: String,
+    pub balance: u64,
+    pub nonce: u64,
+    /// The account's ML-DSA-65 key is committed (1952 bytes), so a wallet may elide it.
+    pub has_dilithium_pk: bool,
+    pub is_contract: bool,
+    /// `contract_storage["type"]` of a contract ("qrc20", "qrc721", "wasm"); None otherwise.
+    pub contract_type: Option<String>,
+}
+
+impl AccountBasic {
+    pub fn of(a: &Account) -> Self {
+        Self {
+            address: a.address.clone(),
+            balance: a.balance,
+            nonce: a.nonce,
+            has_dilithium_pk: a.dilithium_public_key.as_ref().map_or(false, |p| p.len() == 1952),
+            is_contract: a.is_contract,
+            contract_type: if a.is_contract { a.contract_storage.get("type").cloned() } else { None },
+        }
+    }
+}
+
 /// Balance proof structure for Light clients
 #[derive(Debug, Clone)]
 pub struct BalanceProof {
@@ -2403,6 +2868,17 @@ pub struct StateManager {
     /// Journals of the most recently applied blocks, oldest first. A shallow reorg is undone from
     /// them in O(touched accounts); anything deeper falls back to a snapshot restore + replay.
     recent_journals: Arc<parking_lot::Mutex<std::collections::VecDeque<(usize, BlockSnapshot)>>>,
+    /// The proof aux sink shared by the account tree and every contract tree. None: no proof rows.
+    proof_aux: Arc<parking_lot::RwLock<Option<AuxLink>>>,
+}
+
+/// How a contract storage tree enters `token_trees`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Install {
+    /// The aux sink already holds this tree's rows (its mirrored root equals the tree's root).
+    Silent,
+    /// The aux sink's rows for this contract are unknown or stale: wipe and emit the whole tree.
+    Full,
 }
 
 /// Retained journals: depth in blocks and an estimated byte budget (a pre-image carries the account's
@@ -2440,6 +2916,7 @@ impl StateManager {
             num_shards: Arc::new(std::sync::atomic::AtomicU32::new(1)),
             token_trees: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             recent_journals: Arc::new(parking_lot::Mutex::new(std::collections::VecDeque::new())),
+            proof_aux: Arc::new(parking_lot::RwLock::new(None)),
         }
     }
 
@@ -2563,6 +3040,159 @@ impl StateManager {
     /// `QNET_MERKLE_NODE_CACHE_CAP` at startup.
     pub fn set_merkle_node_cache_cap(&self, cap: usize) {
         self.merkle_tree.write().set_node_cache_cap(cap);
+    }
+
+    /// Attach the proof aux sink. From here every account leaf write records its preimage, every
+    /// contract tree mirrors its rows, and every finalize hands its aux job over with its seq.
+    /// Install once at startup, before any block is applied; full resets keep the attachment.
+    pub fn set_proof_aux_sink(&self, sink: Arc<dyn ProofAuxSink>) {
+        let link = AuxLink::new(sink);
+        self.merkle_tree.write().set_aux(link.clone());
+        *self.proof_aux.write() = Some(link);
+    }
+
+    /// The aux link while its sink takes rows.
+    fn active_aux(&self) -> Option<AuxLink> {
+        self.proof_aux.read().as_ref().filter(|l| l.active()).cloned()
+    }
+
+    /// Number of the account tree's last flushed finalize.
+    pub fn merkle_row_seq(&self) -> u64 {
+        self.merkle_tree.read().row_seq()
+    }
+
+    /// Wait until every account-tree delta and marker queued so far has been handled.
+    pub fn merkle_flush_barrier(&self) {
+        self.merkle_tree.read().flush_barrier();
+    }
+
+    /// True once an account-tree store write failed since the last full reset: the tree store may
+    /// miss rows, so no view may be captured over it until the next rebuild.
+    pub fn merkle_store_write_failed(&self) -> bool {
+        self.merkle_tree.read().store_write_failures() > 0
+    }
+
+    /// Run `f(root, seq)` once every account-tree delta flushed so far has landed. A dirty tree has
+    /// rows no flush carried yet; the request is dropped with a warning rather than run on them.
+    pub fn after_merkle_flush(&self, height: u64, f: Box<dyn FnOnce([u8; HASH_SIZE], u64) + Send>) -> bool {
+        let mut tree = self.merkle_tree.write();
+        if tree.is_dirty() {
+            if warn_on() {
+                println!("[WARN][PROOFVIEW] marker_on_dirty_tree height={}", height);
+            }
+            return false;
+        }
+        tree.run_after_flush(f);
+        true
+    }
+
+    /// The only way a tree enters `token_trees`. With an active aux sink the tree is attached to it:
+    /// `Silent` requires the sink to hold this tree's rows already (else it is emitted whole after
+    /// all), `Full` wipes the contract's aux rows and emits the tree from `storage`, the map it was
+    /// built from. Without an active sink the tree is cached alone and nothing is emitted.
+    fn install_token_tree(
+        &self,
+        trees: &mut HashMap<String, StateMerkleTree>,
+        addr: &str,
+        mut tree: StateMerkleTree,
+        mode: Install,
+        storage: &HashMap<String, String>,
+    ) {
+        if let Some(link) = self.active_aux() {
+            let c = StateMerkleTree::hash_address(addr);
+            let root = tree.root();
+            let full = match mode {
+                Install::Full => true,
+                Install::Silent => {
+                    let held = link.mirror(&c);
+                    if held != Some(root) {
+                        if warn_on() {
+                            println!("[WARN][MERKLE] storage_mirror_mismatch contract={} mirrored={} pre={} action=full_emit",
+                                     crate::char_prefix(addr, 20),
+                                     held.map(|m| hex::encode(&m[..8])).unwrap_or_else(|| "none".to_string()),
+                                     hex::encode(&root[..8]));
+                        }
+                    }
+                    held != Some(root)
+                }
+            };
+            if full {
+                Self::emit_full(&link, c, &tree, storage);
+            }
+            tree.attach_storage_sink(link, c);
+        }
+        trees.insert(addr.to_string(), tree);
+    }
+
+    /// Replace the aux rows of contract `c` with the whole of `tree`, built from `storage`: a wipe,
+    /// then leaves and raw values from the map and nodes from the tree, streamed in jobs of at most
+    /// `AUX_BUFFER_CAP_BYTES` with the root row in the last one. Never builds a copy of the row set.
+    fn emit_full(link: &AuxLink, c: [u8; HASH_SIZE], tree: &StateMerkleTree, storage: &HashMap<String, String>) {
+        if !link.active() { return; }
+        let cap = link.state.lock().cap;
+        link.wipe_contract(c);
+        link.flush_now();
+        let mut job = AuxJob::default();
+        let push = |job: &mut AuxJob| {
+            if job.bytes >= cap {
+                link.sink.enqueue(std::mem::take(job));
+            }
+        };
+        for (k, v) in storage {
+            let lk = StateMerkleTree::hash_storage_key(k);
+            job.stor_leaves.push(((c, lk), Some(StateMerkleTree::storage_leaf_value(v))));
+            job.bytes += STOR_LEAF_BYTES;
+            let raw = Some(v.as_bytes().to_vec());
+            job.bytes += stor_pre_bytes(&raw);
+            job.stor_pre.push(((c, lk), raw));
+            push(&mut job);
+        }
+        let mut root_row = None;
+        for ((d, k), v) in tree.intermediate_nodes.iter() {
+            if *d as usize == TREE_DEPTH && *k == [0u8; HASH_SIZE] {
+                root_row = Some(*v);
+                continue;
+            }
+            job.stor_nodes.push(((c, *d, *k), Some(*v)));
+            job.bytes += STOR_NODE_BYTES;
+            push(&mut job);
+        }
+        if let Some(r) = root_row {
+            job.stor_nodes.push(((c, TREE_DEPTH as u32, [0u8; HASH_SIZE]), Some(r)));
+            job.bytes += STOR_NODE_BYTES;
+        }
+        if !job.is_empty() {
+            link.sink.enqueue(job);
+        }
+        link.set_mirror(c, tree.root_unchecked());
+    }
+
+    /// Apply the key diff `from` → `to` to a contract tree (raw values recorded on a mirrored tree).
+    fn apply_storage_diff(tree: &mut StateMerkleTree, from: &HashMap<String, String>, to: &HashMap<String, String>) {
+        for k in from.keys() {
+            if !to.contains_key(k) { tree.delete_raw_lazy(k); }
+        }
+        for (k, v) in to.iter() {
+            if from.get(k).map(|pv| pv != v).unwrap_or(true) {
+                tree.insert_raw_value_lazy(k, v);
+            }
+        }
+    }
+
+    /// Lower the aux buffer cap (tests drive drains without 64 MiB of rows).
+    #[cfg(test)]
+    fn set_aux_buffer_cap_for_test(&self, cap: usize) {
+        if let Some(l) = self.proof_aux.read().as_ref() { l.state.lock().cap = cap; }
+    }
+
+    #[cfg(test)]
+    fn aux_peak_bytes_for_test(&self) -> usize {
+        self.proof_aux.read().as_ref().map_or(0, |l| l.state.lock().peak_bytes)
+    }
+
+    #[cfg(test)]
+    fn aux_mirror_for_test(&self, addr: &str) -> Option<[u8; HASH_SIZE]> {
+        self.proof_aux.read().as_ref().and_then(|l| l.mirror(&StateMerkleTree::hash_address(addr)))
     }
 
     /// Best-effort warm of a single account: if `address` is already in
@@ -3107,6 +3737,31 @@ impl StateManager {
         self.read_account(address)
     }
 
+    /// `get_account` that tells a missing row (Ok(None)) from one the store could not read (Err), for
+    /// an RPC answer that must not pass a read failure off as an empty account. Block apply never reads
+    /// through it.
+    pub fn try_get_account(&self, address: &str) -> Result<Option<Account>, ()> {
+        if let Some(acc) = self.accounts.get(address) {
+            return Ok(Some(acc.clone()));
+        }
+        match *self.disk_store.read() {
+            Some(ref store) => store.try_load_account(address),
+            None => Ok(None),
+        }
+    }
+
+    /// `try_get_account` without cloning a resident contract's storage (an O(holders) copy on a hot
+    /// token): the fields a recipient check and a light account read need.
+    pub fn try_get_account_basic(&self, address: &str) -> Result<Option<AccountBasic>, ()> {
+        if let Some(acc) = self.accounts.get(address) {
+            return Ok(Some(AccountBasic::of(&acc)));
+        }
+        match *self.disk_store.read() {
+            Some(ref store) => store.try_load_account(address).map(|a| a.as_ref().map(AccountBasic::of)),
+            None => Ok(None),
+        }
+    }
+
     /// Read-only token metadata (symbol, decimals, logo, is_nft) for a contract WITHOUT cloning the whole
     /// Account. `get_account` clones `contract_storage` — every holder balance — just to read 4 small keys;
     /// on a hot token that is O(holders) per call, so the enrich path must use this instead. In-memory ref
@@ -3266,7 +3921,14 @@ impl StateManager {
                     let mut fresh = StateMerkleTree::build_storage_tree(&account.contract_storage);
                     let r = fresh.root();
                     let p = fresh.generate_raw_proof(&balance_key);
-                    if r == account.storage_root { trees.insert(contract.to_string(), fresh); }
+                    // Cached only when the aux sink already holds this exact tree: a read never emits.
+                    let held = match self.active_aux() {
+                        Some(link) => link.mirror(&StateMerkleTree::hash_address(contract)) == Some(r),
+                        None => true,
+                    };
+                    if r == account.storage_root && held {
+                        self.install_token_tree(&mut trees, contract, fresh, Install::Silent, &account.contract_storage);
+                    }
                     (r, p)
                 }
             }
@@ -3660,45 +4322,57 @@ impl StateManager {
     // after this returns. Applying contract txs concurrently (e.g. a future parallel/sharded executor
     // mutating state) would race PRE vs the already-advanced tree → wrong diff. Keep applies serialized.
     fn resync_contract_storage_roots(&self, accounts: &mut HashMap<String, Account>) {
+        let link = self.active_aux();
         let mut trees = self.token_trees.write();
         for (addr, account) in accounts.iter_mut() {
             if !account.is_contract { continue; }
-            match trees.get_mut(addr) {
-                Some(tree) => {
-                    match self.accounts.get(addr) {
-                        Some(pre_acct) => {
-                            // The cached tree reflects the LAST-committed storage = this tx's PRE (self.accounts
-                            // is still PRE at sweep time; write-back happens after). Diff PRE vs POST and apply
-                            // ONLY the changed keys → O(changed·depth). tree.finalize() incremental (recompute_levels).
-                            let pre = &pre_acct.contract_storage;
-                            let post = &account.contract_storage;
-                            for k in pre.keys() {
-                                if !post.contains_key(k) { tree.delete_raw_lazy(k); }
+            let pre_ref = self.accounts.get(addr);
+            if !trees.contains_key(addr.as_str()) {
+                // First touch (deploy, or first write after boot, eviction or rollback). When the aux
+                // sink provably holds PRE's tree, build from PRE silently so only the diff below is
+                // written; otherwise build from POST and emit it whole. The root is a pure function of
+                // the map, so either way storage_root == compute_storage_root(POST).
+                let mut from_pre = false;
+                if let (Some(link), Some(pre)) = (link.as_ref(), pre_ref.as_deref()) {
+                    if pre.is_contract {
+                        let held = link.mirror(&StateMerkleTree::hash_address(addr));
+                        if held == Some(pre.storage_root) {
+                            let mut tree = StateMerkleTree::build_storage_tree(&pre.contract_storage);
+                            if tree.root() == pre.storage_root {
+                                self.install_token_tree(&mut trees, addr, tree, Install::Silent, &pre.contract_storage);
+                                from_pre = true;
                             }
-                            for (k, v) in post.iter() {
-                                if pre.get(k).map(|pv| pv != v).unwrap_or(true) {
-                                    tree.insert_raw_lazy(k, StateMerkleTree::storage_leaf_value(v));
-                                }
+                        } else if let Some(m) = held {
+                            if warn_on() {
+                                println!("[WARN][MERKLE] storage_mirror_mismatch contract={} mirrored={} pre={}",
+                                         crate::char_prefix(addr, 20), hex::encode(&m[..8]), hex::encode(&pre.storage_root[..8]));
                             }
-                            account.storage_root = tree.finalize();
-                        }
-                        None => {
-                            // PRE not resident in self.accounts (only via the funnel-external update_account
-                            // path): diffing against an empty PRE would overlay POST onto a stale tree. Rebuild
-                            // from POST (== compute_storage_root), like the None branch.
-                            let mut fresh = StateMerkleTree::build_storage_tree(&account.contract_storage);
-                            account.storage_root = fresh.root();
-                            *tree = fresh;
                         }
                     }
                 }
-                None => {
-                    // First touch (freshly deployed, or first write after boot/rollback): build from POST
-                    // once (O(H)); the resulting root == compute_storage_root(POST), and the populated
-                    // intermediate_nodes make every subsequent finalize incremental.
+                if !from_pre {
                     let mut tree = StateMerkleTree::build_storage_tree(&account.contract_storage);
                     account.storage_root = tree.root();
-                    trees.insert(addr.clone(), tree);
+                    self.install_token_tree(&mut trees, addr, tree, Install::Full, &account.contract_storage);
+                    continue;
+                }
+            }
+            match pre_ref.as_deref() {
+                Some(pre_acct) => {
+                    // The cached tree reflects the LAST-committed storage = this tx's PRE (self.accounts
+                    // is still PRE at sweep time; write-back happens after). Diff PRE vs POST and apply
+                    // ONLY the changed keys → O(changed·depth). tree.finalize() incremental (recompute_levels).
+                    let tree = trees.get_mut(addr.as_str()).expect("installed above");
+                    Self::apply_storage_diff(tree, &pre_acct.contract_storage, &account.contract_storage);
+                    account.storage_root = tree.finalize();
+                }
+                None => {
+                    // PRE not resident in self.accounts (only via the funnel-external update_account
+                    // path): diffing against an empty PRE would overlay POST onto a stale tree. Rebuild
+                    // from POST (== compute_storage_root) and emit it whole.
+                    let mut fresh = StateMerkleTree::build_storage_tree(&account.contract_storage);
+                    account.storage_root = fresh.root();
+                    self.install_token_tree(&mut trees, addr, fresh, Install::Full, &account.contract_storage);
                 }
             }
         }
@@ -3784,6 +4458,7 @@ impl StateManager {
     pub fn apply_transfers_parallel(
         &self,
         txs: &[Transaction],
+        block_height: u64,
         mut snapshot: Option<&mut BlockSnapshot>,
     ) -> Vec<StateResult<ApplyOutcome>> {
         use rayon::prelude::*;
@@ -3803,6 +4478,18 @@ impl StateManager {
             credits: Vec<(String, u64)>,
         }
 
+        // The sequential dispatcher binds a first-use pk into a working copy it discards when the tx
+        // fails, and dilithium_pk_root records binds of successful txs only. From the tx_target_bound
+        // gate this path binds on success too (the nonce skip included), so the account store and that
+        // root hold the same keys; below it the bind precedes the checks, as blocks on disk replayed.
+        let bind_on_success = crate::feature_gates::is_active(crate::feature_gates::id::TX_TARGET_BOUND, block_height);
+        let bind_pk = |tx: &Transaction, cur: &mut Option<Account>| {
+            if let (Some(pk), Some(acct)) = (tx.dilithium_public_key.as_ref(), cur.as_mut()) {
+                if tx.binds_dilithium_pk() && acct.dilithium_public_key.is_none() {
+                    acct.dilithium_public_key = Some(pk.clone());
+                }
+            }
+        };
         let outs: Vec<SenderOut> = order.par_iter().map(|sender| {
             self.warm_account(sender);
             let pre = self.accounts.get(*sender).map(|a| a.clone());
@@ -3812,6 +4499,8 @@ impl StateManager {
             for &i in &by_sender[sender] {
                 let tx = &txs[i];
                 let r: StateResult<ApplyOutcome> = (|| {
+                    // First, as in the sequential dispatcher: a refused tx must not reach the pk bind.
+                    tx.check_signed_target_bound(block_height).map_err(StateError::InvalidTransaction)?;
                     if tx.gas_limit > 0 {
                         let gas_used = tx.compute_gas_used();
                         if gas_used > tx.gas_limit {
@@ -3819,12 +4508,8 @@ impl StateManager {
                                 "[REJECT][TX] out_of_gas gas_used={} gas_limit={}", gas_used, tx.gas_limit)));
                         }
                     }
-                    // pk bind precedes the arm in the sequential dispatcher — mirror that,
-                    // including binding on a tx the nonce check then skips.
-                    if let (Some(pk), Some(acct)) = (tx.dilithium_public_key.as_ref(), cur.as_mut()) {
-                        if tx.binds_dilithium_pk() && acct.dilithium_public_key.is_none() {
-                            acct.dilithium_public_key = Some(pk.clone());
-                        }
+                    if !bind_on_success {
+                        bind_pk(tx, &mut cur);
                     }
                     let (amount_sum, fee) = match &tx.tx_type {
                         TransactionType::Transfer { from, amount, .. } => {
@@ -3875,6 +4560,9 @@ impl StateManager {
                     }
                     Ok(ApplyOutcome { charged: tx.gas_debit() > 0 })
                 })();
+                if bind_on_success && r.is_ok() {
+                    bind_pk(tx, &mut cur);
+                }
                 results.push((i, r));
             }
             SenderOut { sender: sender.to_string(), pre, post: cur, results, credits }
@@ -4045,6 +4733,65 @@ impl StateManager {
         BlockSnapshot::new(&self.accounts, height)
     }
     
+    /// The aux contract rows of an undone block: each touched contract goes back to its PRE tree by
+    /// the POST→PRE key diff, from the cached tree or from a silent POST build the sink is known to
+    /// hold, so the rows written are O(changed). Anything else is emitted whole from PRE.
+    fn rollback_storage_rows(&self, snapshot: &BlockSnapshot) {
+        let link = match self.active_aux() { Some(l) => l, None => return };
+        let mut trees = self.token_trees.write();
+        for (addr, pre) in snapshot.accounts() {
+            let post = self.accounts.get(addr);
+            let post_contract = post.as_ref().map_or(false, |p| p.is_contract);
+            if !pre.is_contract && !post_contract { continue; }
+            let c = StateMerkleTree::hash_address(addr);
+            if !pre.is_contract {
+                link.wipe_contract(c); // the block made a contract out of a plain account
+                continue;
+            }
+            let reason = match post {
+                Some(ref post) if post.is_contract => {
+                    if post.storage_root == pre.storage_root && link.mirror(&c) == Some(pre.storage_root) {
+                        continue; // its storage did not move
+                    }
+                    match trees.get_mut(addr.as_str()) {
+                        Some(tree) if tree.has_storage_sink() => {
+                            Self::apply_storage_diff(tree, &post.contract_storage, &pre.contract_storage);
+                            if tree.finalize() == pre.storage_root { continue; }
+                            "cached_root_mismatch"
+                        }
+                        Some(_) => "cached_tree_unmirrored",
+                        None if link.mirror(&c) == Some(post.storage_root) => {
+                            let mut tree = StateMerkleTree::build_storage_tree(&post.contract_storage);
+                            if tree.root() != post.storage_root {
+                                "post_root_mismatch"
+                            } else {
+                                tree.attach_storage_sink(link.clone(), c);
+                                Self::apply_storage_diff(&mut tree, &post.contract_storage, &pre.contract_storage);
+                                if tree.finalize() == pre.storage_root { continue; }
+                                "uncached_root_mismatch"
+                            }
+                        }
+                        None => "mirror_unknown",
+                    }
+                }
+                _ => "post_not_contract",
+            };
+            if warn_on() {
+                println!("[WARN][MERKLE] rollback_storage_full contract={} reason={}", crate::char_prefix(addr, 20), reason);
+            }
+            let mut tree = StateMerkleTree::build_storage_tree(&pre.contract_storage);
+            let _ = tree.root();
+            Self::emit_full(&link, c, &tree, &pre.contract_storage);
+        }
+        // Contracts the block created, or whose leaf it put back unread: their PRE tree is unknown
+        // or absent, so their rows go and the mirror forgets them until a full emit.
+        for addr in snapshot.created_keys() {
+            if self.accounts.get(addr).map_or(false, |a| a.is_contract) {
+                link.wipe_contract(StateMerkleTree::hash_address(addr));
+            }
+        }
+    }
+
     /// v5.0: O(k) block rollback using journal pre-images
     /// Only touches k modified/created accounts instead of rebuilding entire Merkle tree.
     /// Previous approach: O(n) — destroy tree + re-insert all n accounts.
@@ -4094,6 +4841,10 @@ impl StateManager {
                 None => { self.registered_nodes.remove(node_id); }
             }
         }
+
+        // Aux contract rows follow the undo while `accounts` still holds POST; the account tree's
+        // finalize below carries them in its job.
+        self.rollback_storage_rows(snapshot);
 
         // 1. Remove accounts created during this block from DashMap
         for addr in snapshot.created_keys() {
@@ -4220,9 +4971,13 @@ impl StateManager {
         let addr = self.accounts.iter()
             .find(|e| StateMerkleTree::hash_address(e.key()) == key)
             .map(|e| e.key().clone())?;
+        let was_contract = self.accounts.get(&addr).map_or(false, |a| a.is_contract);
         self.merkle_tree.write().remove_lazy(&addr);
         self.accounts.remove(&addr);
         self.token_trees.write().remove(&addr);
+        if was_contract {
+            if let Some(link) = self.active_aux() { link.wipe_contract(StateMerkleTree::hash_address(&addr)); }
+        }
         if self.finalize_merkle() == *target { Some(addr) } else { None }
     }
 
@@ -4275,6 +5030,8 @@ impl StateManager {
         // block; hashing already always includes those fields, so it does not affect the root here.
         let mut tree = self.merkle_tree.write();
         tree.reset_preserving_store();
+        // Re-armed by the reset: every preimage and contract tree below is emitted into a wiped sink.
+        let link = self.active_aux();
 
         let mut count: usize = 0;
         for (address, account) in accounts {
@@ -4282,9 +5039,16 @@ impl StateManager {
             // leaf commits only storage_root, so a restored contract_storage that does NOT hash to it would
             // rebuild a valid-looking root yet serve forged balances / fork on the next write. Reject the
             // mismatch here so the rehydrate fail-closed path rejects a tampered snapshot. O(entries).
-            if !StateMerkleTree::contract_storage_root_matches(&account) {
-                return Err(StateError::InvalidTransaction(format!(
-                    "[REJECT][SNAPSHOT] storage_root_mismatch addr={}", address)));
+            // The one tree built for the check is also the one emitted, then dropped.
+            if account.is_contract {
+                let mut st = StateMerkleTree::build_storage_tree(&account.contract_storage);
+                if st.root() != account.storage_root {
+                    return Err(StateError::InvalidTransaction(format!(
+                        "[REJECT][SNAPSHOT] storage_root_mismatch addr={}", address)));
+                }
+                if let Some(ref link) = link {
+                    Self::emit_full(link, StateMerkleTree::hash_address(&address), &st, &account.contract_storage);
+                }
             }
             tree.insert_lazy(&address, &account);
             self.accounts.insert(address, account); // move, no clone
@@ -4572,7 +5336,7 @@ mod parallel_apply_tests {
         let run = || {
             let sm = StateManager::new();
             seed(&sm, 8, 1_000_000);
-            let out = sm.apply_transfers_parallel(&block, None);
+            let out = sm.apply_transfers_parallel(&block, 1, None);
             let root = sm.finalize_merkle();
             let bal = |i: u64| sm.accounts.get(&format!("pa_{:04}", i)).map(|a| (a.balance, a.nonce)).unwrap();
             (out.iter().map(|r| r.is_ok()).collect::<Vec<_>>(),
@@ -4641,7 +5405,7 @@ mod parallel_apply_tests {
             batch(2, &[(3, 5), (9, 7)], 1), // recipient pa_0009 does not exist -> created
         ];
         let mut snap = BlockSnapshot::new(&sm.accounts, 1);
-        let _ = sm.apply_transfers_parallel(&block, Some(&mut snap));
+        let _ = sm.apply_transfers_parallel(&block, 1, Some(&mut snap));
         let mid_root = sm.finalize_merkle();
         assert_ne!(pre_root, mid_root);
         sm.rollback_block(&snap);
@@ -4657,11 +5421,11 @@ mod parallel_apply_tests {
         seed(&sm, 8, 1_000_000);
         let root0 = sm.finalize_merkle();
         let mut s1 = BlockSnapshot::new(&sm.accounts, 1);
-        let _ = sm.apply_transfers_parallel(&[transfer(0, 1, 100, 1)], Some(&mut s1));
+        let _ = sm.apply_transfers_parallel(&[transfer(0, 1, 100, 1)], 1, Some(&mut s1));
         let root1 = sm.finalize_merkle();
         sm.retain_block_journal(s1);
         let mut s2 = BlockSnapshot::new(&sm.accounts, 2);
-        let _ = sm.apply_transfers_parallel(&[batch(2, &[(3, 5), (9, 7)], 1)], Some(&mut s2));
+        let _ = sm.apply_transfers_parallel(&[batch(2, &[(3, 5), (9, 7)], 1)], 2, Some(&mut s2));
         sm.retain_block_journal(s2);
         assert_ne!(sm.finalize_merkle(), root1);
 
@@ -4677,11 +5441,123 @@ mod parallel_apply_tests {
         assert!(sm.undo_blocks_above(0, 1).is_none(), "no journals left");
 
         let mut s3 = BlockSnapshot::new(&sm.accounts, 3);
-        let _ = sm.apply_transfers_parallel(&[transfer(0, 1, 1, 2)], Some(&mut s3));
+        let _ = sm.apply_transfers_parallel(&[transfer(0, 1, 1, 2)], 3, Some(&mut s3));
         sm.retain_block_journal(s3);
         let root3 = sm.finalize_merkle();
         assert!(sm.undo_blocks_above(2, 5).is_none(), "a gap between tip and journals is refused");
         assert_eq!(sm.finalize_merkle(), root3, "and nothing was touched");
+    }
+
+    /// A pure-transfer block with one rewritten payload: the parallel path gives the verdicts and the state
+    /// the sequential dispatcher gives, refusing the rewrite from the tx_target_bound gate and paying it
+    /// below (old blocks replay unchanged).
+    #[test]
+    fn parallel_apply_refuses_a_rewritten_payload_like_the_sequential_arm() {
+        let gate = crate::feature_gates::TX_TARGET_BOUND_GATE_HEIGHT;
+        let mut block: Vec<Transaction> = (0..32u64).map(|i| transfer(i, 100 + i, 10, 1)).collect();
+        block[7].tx_type = TransactionType::Transfer {
+            from: "pa_0007".to_string(), to: "pa_0999".to_string(), amount: 500_000,
+        };
+        block[7].hash = block[7].calculate_hash();
+
+        let state_of = |sm: &StateManager| {
+            let mut addrs: Vec<String> = (0..32u64).map(|i| format!("pa_{:04}", i)).collect();
+            addrs.extend((100..132u64).map(|i| format!("pa_{:04}", i)));
+            addrs.push("pa_0999".to_string());
+            (addrs.iter().map(|a| sm.accounts.get(a).map(|x| (x.balance, x.nonce))).collect::<Vec<_>>(),
+             sm.finalize_merkle())
+        };
+        for (h, rewrite_ok) in [(gate, false), (gate - 1, true)] {
+            let par = StateManager::new();
+            seed(&par, 32, 1_000_000);
+            let par_ok: Vec<bool> = par.apply_transfers_parallel(&block, h, None).iter().map(|r| r.is_ok()).collect();
+
+            let seq = StateManager::new();
+            seed(&seq, 32, 1_000_000);
+            let seq_ok: Vec<bool> = block.iter().map(|tx| seq.apply_transaction_lazy_at(tx, h).is_ok()).collect();
+
+            let mut expected = vec![true; 32];
+            expected[7] = rewrite_ok;
+            assert_eq!(par_ok, expected, "h={}", h);
+            assert_eq!(seq_ok, expected, "h={}", h);
+            let (par_state, par_root) = state_of(&par);
+            let (seq_state, seq_root) = state_of(&seq);
+            assert_eq!(par_state, seq_state, "h={}", h);
+            assert_eq!(par_root, seq_root, "h={}", h);
+            let paid = par.accounts.get("pa_0999").map(|a| a.balance);
+            assert_eq!(paid, if rewrite_ok { Some(500_000) } else { None }, "h={}", h);
+            let s7 = par.accounts.get("pa_0007").map(|a| (a.balance, a.nonce)).unwrap();
+            assert_eq!(s7, if rewrite_ok { (1_000_000 - 500_000 - 100_000, 1) } else { (1_000_000, 0) }, "h={}", h);
+        }
+    }
+
+    fn eon(i: u64) -> String { crate::transaction::derive_contract_address("parallel_bind", i) }
+
+    fn seed_eon(sm: &StateManager, n: u64, bal: u64) {
+        for i in 0..n {
+            let mut a = Account::new(eon(i));
+            a.balance = bal;
+            sm.accounts.insert(a.address.clone(), a.clone());
+            sm.merkle_tree.write().insert_lazy(&eon(i), &a);
+        }
+        sm.finalize_merkle();
+    }
+
+    /// Same verdicts, same state and the same account-store keys on both paths from the gate: the other
+    /// rules of the predicate (a forged batch envelope, a transfer carrying data or the legacy signature) and the first-use key
+    /// bind, which the parallel path now keeps only for a tx that succeeds, as the sequential dispatcher
+    /// and dilithium_pk_root do. Below the gate the parallel path still binds before its checks.
+    #[test]
+    fn parallel_matches_sequential_on_the_gated_rules_and_the_key_bind() {
+        let gate = crate::feature_gates::TX_TARGET_BOUND_GATE_HEIGHT;
+        let to = |i: u64| eon(100 + i);
+        let mut block: Vec<Transaction> = (0..32u64).map(|i| {
+            let tx = Transaction::new(eon(i), Some(to(i)), 10, 1, 10, 10_000, 1000, None,
+                TransactionType::Transfer { from: eon(i), to: to(i), amount: 10 }, None);
+            tx.with_quantum_signature(None, Some(vec![i as u8; 1952]))
+        }).collect();
+        // 0: first-use key on a transfer that fails (over balance); 1: succeeds; 2: stale nonce (skip).
+        block[0] = Transaction::new(eon(0), Some(to(0)), 5_000_000, 1, 10, 10_000, 1000, None,
+            TransactionType::Transfer { from: eon(0), to: to(0), amount: 5_000_000 }, None)
+            .with_quantum_signature(None, Some(vec![0u8; 1952]));
+        block[2] = Transaction::new(eon(2), Some(to(2)), 10, 0, 10, 10_000, 1000, None,
+            TransactionType::Transfer { from: eon(2), to: to(2), amount: 10 }, None)
+            .with_quantum_signature(None, Some(vec![2u8; 1952]));
+        // 3: a batch whose envelope names someone it does not pay; 4: a transfer carrying unsigned data.
+        block[3] = Transaction::new(eon(3), Some(to(99)), 1_000, 1, 10, 10_000, 1000, None,
+            TransactionType::BatchTransfers {
+                transfers: vec![crate::transaction::BatchTransferData { to_address: to(3), amount: 10, memo: None }],
+                batch_id: "b3".to_string(),
+            }, None);
+        block[4] = Transaction::new(eon(4), Some(to(4)), 10, 1, 10, 10_000, 1000, None,
+            TransactionType::Transfer { from: eon(4), to: to(4), amount: 10 }, Some("pad".to_string()));
+        // 5: a transfer padded with the legacy signature, outside its hash.
+        block[5].signature = Some("x".repeat(16_384));
+
+        let key_of = |sm: &StateManager, i: u64| sm.accounts.get(&eon(i)).and_then(|a| a.dilithium_public_key.clone()).is_some();
+        let state_of = |sm: &StateManager| {
+            let addrs: Vec<String> = (0..32u64).map(eon).chain((100..132u64).map(eon)).chain([to(99)]).collect();
+            (addrs.iter().map(|a| sm.accounts.get(a).map(|x| (x.balance, x.nonce))).collect::<Vec<_>>(), sm.finalize_merkle())
+        };
+        for h in [gate, gate - 1] {
+            let par = StateManager::new();
+            seed_eon(&par, 32, 1_000_000);
+            let par_ok: Vec<bool> = par.apply_transfers_parallel(&block, h, None).iter().map(|r| r.is_ok()).collect();
+            let seq = StateManager::new();
+            seed_eon(&seq, 32, 1_000_000);
+            let seq_ok: Vec<bool> = block.iter().map(|tx| seq.apply_transaction_lazy_at(tx, h).is_ok()).collect();
+
+            let mut expected = vec![true; 32];
+            expected[0] = false;
+            if h >= gate { expected[3] = false; expected[4] = false; expected[5] = false; }
+            assert_eq!(par_ok, expected, "h={}", h);
+            assert_eq!(seq_ok, expected, "h={}", h);
+            assert_eq!(state_of(&par), state_of(&seq), "h={}: balances, nonces and root", h);
+            assert!(key_of(&par, 1) && key_of(&seq, 1), "h={}: a successful first use binds", h);
+            assert!(key_of(&par, 2) && key_of(&seq, 2), "h={}: a stale-nonce skip binds, as it always did", h);
+            assert!(!key_of(&seq, 0), "the sequential path never keeps a failed tx's key");
+            assert_eq!(key_of(&par, 0), h < gate, "h={}: the parallel path keeps it only below the gate", h);
+        }
     }
 }
 
@@ -5203,34 +6079,27 @@ mod merkle_equiv_tests {
         fn all_leaves(&self) -> Vec<([u8; 32], [u8; 32])> {
             self.inner.lock().unwrap().0.iter().map(|(k, v)| (*k, *v)).collect()
         }
-        fn wipe_leaves(&self) -> Result<(), String> {
+        fn wipe_for_full_reset(&self) -> Result<(), String> {
             self.inner.lock().unwrap().0.clear();
             Ok(())
         }
         fn leaves_under(&self, lo: &[u8; 32], hi: &[u8; 32], limit: usize) -> Vec<([u8; 32], [u8; 32])> {
             self.inner.lock().unwrap().0.range(*lo..=*hi).take(limit).map(|(k, v)| (*k, *v)).collect()
         }
-        fn put_batch(
-            &self,
-            leaf_puts: &[([u8; 32], [u8; 32])],
-            leaf_dels: &[[u8; 32]],
-            node_puts: &[((u32, [u8; 32]), [u8; 32])],
-            node_dels: &[(u32, [u8; 32])],
-            wipe_all_nodes: bool,
-        ) -> Result<(), String> {
+        fn put_batch(&self, d: &AcctDelta) -> Result<(), String> {
             let mut g = self.inner.lock().unwrap();
             // leaf_puts/leaf_dels are disjoint by contract → order-independent.
-            for k in leaf_dels { g.0.remove(k); }
-            for (k, v) in leaf_puts { g.0.insert(*k, *v); }
+            for k in &d.leaf_dels { g.0.remove(k); }
+            for (k, v) in &d.leaf_puts { g.0.insert(*k, *v); }
             // Full rebuild → replace the entire node set with node_puts (the
             // complete non-default set); otherwise apply the incremental delta
             // (dels BEFORE puts so a re-put wins).
-            if wipe_all_nodes {
+            if d.wipe_nodes {
                 g.1.clear();
             } else {
-                for (d, k) in node_dels { g.1.remove(&(*d, *k)); }
+                for (dp, k) in &d.node_dels { g.1.remove(&(*dp, *k)); }
             }
-            for ((d, k), v) in node_puts { g.1.insert((*d, *k), *v); }
+            for ((dp, k), v) in &d.node_puts { g.1.insert((*dp, *k), *v); }
             Ok(())
         }
     }
@@ -5467,6 +6336,47 @@ mod cache_tests {
         assert_eq!(sm.take_mirror_stale().len(), 1, "per row: only the account with a leaf is refused");
     }
 
+    // The RPC reads tell a missing row from an unreadable one (the account answer must not pass a read
+    // failure off as an empty account), and the light form names a contract and its type from RAM or
+    // disk alike.
+    #[test]
+    fn the_rpc_account_reads_tell_missing_from_unreadable() {
+        struct Unreadable;
+        impl AccountStore for Unreadable {
+            fn load_account(&self, _a: &str) -> Option<Account> { None }
+            fn try_load_account(&self, _a: &str) -> Result<Option<Account>, ()> { Err(()) }
+        }
+        let sm = StateManager::new();
+        assert!(matches!(sm.try_get_account("nobody"), Ok(None)), "no store: missing");
+        let mut token = make_account(5);
+        token.address = "token_ram".to_string();
+        token.is_contract = true;
+        token.contract_storage.insert("type".to_string(), "qrc20".to_string());
+        token.contract_storage.insert("balance:alice".to_string(), "9".to_string());
+        sm.accounts.insert("token_ram".to_string(), token);
+        let basic = sm.try_get_account_basic("token_ram").unwrap().unwrap();
+        assert_eq!((basic.is_contract, basic.contract_type.as_deref(), basic.balance), (true, Some("qrc20"), 5));
+
+        sm.set_disk_store(Arc::new(Unreadable) as Arc<dyn AccountStore>);
+        assert!(sm.try_get_account("w_cold").is_err());
+        assert_eq!(sm.try_get_account_basic("w_cold"), Err(()));
+        assert!(sm.get_account("w_cold").is_none(), "the old read still folds both into none");
+        assert!(sm.try_get_account("token_ram").unwrap().is_some(), "a resident row needs no store");
+
+        let store = MockStore::new();
+        let mut wallet = make_account(3);
+        wallet.address = "w_disk".to_string();
+        wallet.nonce = 4;
+        wallet.dilithium_public_key = Some(vec![0u8; 1952]);
+        store.put("w_disk", wallet);
+        let sm = StateManager::new();
+        sm.set_disk_store(store.clone() as Arc<dyn AccountStore>);
+        assert_eq!(sm.try_get_account_basic("w_disk"), Ok(Some(AccountBasic {
+            address: "w_disk".to_string(), balance: 3, nonce: 4, has_dilithium_pk: true, is_contract: false, contract_type: None,
+        })));
+        assert_eq!(sm.try_get_account_basic("w_none"), Ok(None));
+    }
+
     // A row that cannot be read, and a leaf store that cannot answer either: nothing proves the
     // account absent, so the block is refused, with no leaf to put back.
     #[test]
@@ -5484,9 +6394,8 @@ mod cache_tests {
             fn get_node(&self, _d: u32, _k: &[u8; 32]) -> Option<[u8; 32]> { None }
             fn leaves_under(&self, _lo: &[u8; 32], _hi: &[u8; 32], _n: usize) -> Vec<([u8; 32], [u8; 32])> { Vec::new() }
             fn all_leaves(&self) -> Vec<([u8; 32], [u8; 32])> { Vec::new() }
-            fn wipe_leaves(&self) -> Result<(), String> { Ok(()) }
-            fn put_batch(&self, _lp: &[([u8; 32], [u8; 32])], _ld: &[[u8; 32]], _np: &[((u32, [u8; 32]), [u8; 32])],
-                         _nd: &[(u32, [u8; 32])], _w: bool) -> Result<(), String> { Ok(()) }
+            fn wipe_for_full_reset(&self) -> Result<(), String> { Ok(()) }
+            fn put_batch(&self, _d: &AcctDelta) -> Result<(), String> { Ok(()) }
         }
         let sm = StateManager::new();
         sm.merkle_tree.write().set_node_store(Arc::new(LeafErr));
@@ -7106,6 +8015,689 @@ mod tests_snapshot_supply_rollback {
         assert!(!state.is_epoch_committed("bitmap", id, *epoch), "the undo took the dedup record back");
     }
 
+}
+
+/// Stores and sinks over plain maps, shared by this crate's tests.
+#[cfg(test)]
+pub(crate) mod tests_support {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AO};
+
+    /// A node store over plain maps that records the seq of the last landed delta. A closed gate
+    /// holds every write back, like a disk that cannot keep up.
+    #[derive(Default)]
+    pub(crate) struct MapNodeStore {
+        inner: std::sync::Mutex<(BTreeMap<[u8; 32], [u8; 32]>, HashMap<(u32, [u8; 32]), [u8; 32]>, u64)>,
+        pub(crate) fail_next: AtomicBool,
+        closed: std::sync::Mutex<bool>,
+        gate: std::sync::Condvar,
+    }
+
+    impl MapNodeStore {
+        pub(crate) fn close_gate(&self) { *self.closed.lock().unwrap() = true; }
+        pub(crate) fn open_gate(&self) {
+            *self.closed.lock().unwrap() = false;
+            self.gate.notify_all();
+        }
+        pub(crate) fn root_row(&self) -> Option<[u8; 32]> {
+            self.inner.lock().unwrap().1.get(&(TREE_DEPTH as u32, [0u8; 32])).copied()
+        }
+        pub(crate) fn seq(&self) -> u64 { self.inner.lock().unwrap().2 }
+        pub(crate) fn leaf(&self, k: &[u8; 32]) -> Option<[u8; 32]> { self.inner.lock().unwrap().0.get(k).copied() }
+    }
+
+    impl MerkleNodeStore for MapNodeStore {
+        fn get_leaf(&self, key: &[u8; 32]) -> Option<[u8; 32]> { self.inner.lock().unwrap().0.get(key).copied() }
+        fn get_node(&self, depth: u32, key: &[u8; 32]) -> Option<[u8; 32]> {
+            self.inner.lock().unwrap().1.get(&(depth, *key)).copied()
+        }
+        fn leaves_under(&self, lo: &[u8; 32], hi: &[u8; 32], limit: usize) -> Vec<([u8; 32], [u8; 32])> {
+            self.inner.lock().unwrap().0.range(*lo..=*hi).take(limit).map(|(k, v)| (*k, *v)).collect()
+        }
+        fn all_leaves(&self) -> Vec<([u8; 32], [u8; 32])> {
+            self.inner.lock().unwrap().0.iter().map(|(k, v)| (*k, *v)).collect()
+        }
+        fn wipe_for_full_reset(&self) -> Result<(), String> {
+            self.inner.lock().unwrap().0.clear();
+            Ok(())
+        }
+        fn put_batch(&self, d: &AcctDelta) -> Result<(), String> {
+            {
+                let mut closed = self.closed.lock().unwrap();
+                while *closed { closed = self.gate.wait(closed).unwrap(); }
+            }
+            if self.fail_next.swap(false, AO::SeqCst) {
+                return Err("injected".to_string());
+            }
+            let mut g = self.inner.lock().unwrap();
+            for k in &d.leaf_dels { g.0.remove(k); }
+            for (k, v) in &d.leaf_puts { g.0.insert(*k, *v); }
+            if d.wipe_nodes { g.1.clear(); } else { for k in &d.node_dels { g.1.remove(k); } }
+            for (k, v) in &d.node_puts { g.1.insert(*k, *v); }
+            g.2 = d.seq;
+            Ok(())
+        }
+        fn stored_seq(&self) -> u64 { self.inner.lock().unwrap().2 }
+    }
+
+    /// Aux rows as the integration writer keeps them.
+    #[derive(Default, Clone, Debug, PartialEq)]
+    pub(crate) struct AuxRows {
+        pub(crate) acct_pre: BTreeMap<[u8; 32], Vec<u8>>,
+        pub(crate) stor_leaves: BTreeMap<([u8; 32], [u8; 32]), [u8; 32]>,
+        pub(crate) stor_nodes: BTreeMap<([u8; 32], u32, [u8; 32]), [u8; 32]>,
+        pub(crate) stor_pre: BTreeMap<([u8; 32], [u8; 32]), Vec<u8>>,
+        pub(crate) seq: Option<u64>,
+    }
+
+    /// One contract's rows without the contract prefix: (leaves, nodes, raw values).
+    pub(crate) type ContractRows = (
+        BTreeMap<[u8; 32], [u8; 32]>,
+        BTreeMap<(u32, [u8; 32]), [u8; 32]>,
+        BTreeMap<[u8; 32], Vec<u8>>,
+    );
+
+    impl AuxRows {
+        pub(crate) fn apply(&mut self, job: &AuxJob) {
+            for c in &job.wipes {
+                self.stor_leaves.retain(|(cc, _), _| cc != c);
+                self.stor_nodes.retain(|(cc, _, _), _| cc != c);
+                self.stor_pre.retain(|(cc, _), _| cc != c);
+            }
+            for (k, v) in &job.acct_pre {
+                match v { Some(b) => { self.acct_pre.insert(*k, b.clone()); } None => { self.acct_pre.remove(k); } }
+            }
+            for (k, v) in &job.stor_leaves {
+                match v { Some(b) => { self.stor_leaves.insert(*k, *b); } None => { self.stor_leaves.remove(k); } }
+            }
+            for (k, v) in &job.stor_nodes {
+                match v { Some(b) => { self.stor_nodes.insert(*k, *b); } None => { self.stor_nodes.remove(k); } }
+            }
+            for (k, v) in &job.stor_pre {
+                match v { Some(b) => { self.stor_pre.insert(*k, b.clone()); } None => { self.stor_pre.remove(k); } }
+            }
+            if job.seq.is_some() { self.seq = job.seq; }
+        }
+
+        pub(crate) fn contract(&self, c: &[u8; 32]) -> ContractRows {
+            (
+                self.stor_leaves.iter().filter(|((cc, _), _)| cc == c).map(|((_, k), v)| (*k, *v)).collect(),
+                self.stor_nodes.iter().filter(|((cc, _, _), _)| cc == c).map(|((_, d, k), v)| ((*d, *k), *v)).collect(),
+                self.stor_pre.iter().filter(|((cc, _), _)| cc == c).map(|((_, k), v)| (*k, v.clone())).collect(),
+            )
+        }
+    }
+
+    /// Assert two contract row sets are equal, naming what differs.
+    pub(crate) fn assert_rows_eq(got: &ContractRows, want: &ContractRows, ctx: &str) {
+        fn diff<K: Ord + Clone + std::fmt::Debug, V: PartialEq>(a: &BTreeMap<K, V>, b: &BTreeMap<K, V>) -> (Vec<K>, Vec<K>, Vec<K>) {
+            let extra: Vec<K> = a.keys().filter(|k| !b.contains_key(*k)).cloned().collect();
+            let missing: Vec<K> = b.keys().filter(|k| !a.contains_key(*k)).cloned().collect();
+            let changed: Vec<K> = a.iter().filter(|(k, v)| b.get(*k).map_or(false, |w| w != *v)).map(|(k, _)| k.clone()).collect();
+            (extra, missing, changed)
+        }
+        let l = diff(&got.0, &want.0);
+        let n = diff(&got.1, &want.1);
+        let p = diff(&got.2, &want.2);
+        let depths = |v: &Vec<(u32, [u8; 32])>| v.iter().map(|(d, _)| *d).collect::<Vec<_>>();
+        assert!(l.0.is_empty() && l.1.is_empty() && l.2.is_empty() && n.0.is_empty() && n.1.is_empty() && n.2.is_empty()
+                && p.0.is_empty() && p.1.is_empty() && p.2.is_empty(),
+            "{}: leaves extra={} missing={} changed={}; nodes extra={:?} missing={:?} changed={:?}; pre extra={} missing={} changed={}",
+            ctx, l.0.len(), l.1.len(), l.2.len(), depths(&n.0), depths(&n.1), depths(&n.2), p.0.len(), p.1.len(), p.2.len());
+    }
+
+    /// A mirrored contract's rows serve exactly the tree of `storage`: its leaves and raw values,
+    /// its root row, every branch row current, and proofs equal to a fresh tree's. Rows under single
+    /// buckets may differ from a fresh build (the incremental pass keeps a stored chain top whose
+    /// sibling died, and a re-installed tree leaves its predecessor's such rows behind); the proof
+    /// path never trusts them.
+    pub(crate) fn assert_mirror_serves(got: &ContractRows, storage: &HashMap<String, String>, ctx: &str) {
+        let fresh = fresh_rows(storage);
+        assert_eq!(got.0, fresh.0, "{}: leaves", ctx);
+        assert_eq!(got.2, fresh.2, "{}: raw values", ctx);
+        let mut tree = StateMerkleTree::build_storage_tree(storage);
+        let root = tree.root();
+        let root_row = got.1.get(&(TREE_DEPTH as u32, [0u8; 32])).copied();
+        assert_eq!(root_row, if storage.is_empty() { None } else { Some(root) }, "{}: root row", ctx);
+        let rows: Vec<((u32, [u8; 32]), [u8; 32])> = tree.intermediate_nodes.iter().map(|(k, v)| (*k, *v)).collect();
+        for ((d, k), v) in rows {
+            if matches!(tree.subtree_probe(d as usize, &k), SubtreeSpan::Branch) {
+                assert_eq!(got.1.get(&(d, k)), Some(&v), "{}: branch row at depth {}", ctx, d);
+            }
+        }
+        let mut keys: Vec<String> = storage.keys().take(40).cloned().collect();
+        keys.push("balance:eon_never_a".to_string());
+        keys.push("balance:eon_never_b".to_string());
+        let mut reader = ContractReader(got.clone());
+        for k in keys {
+            let p = crate::tree_proof::prove_leaf_in(&mut reader, &StateMerkleTree::hash_storage_key(&k),
+                                                     crate::tree_proof::StoredRows::Branches).expect("proves");
+            assert_eq!(p.steps, tree.generate_raw_proof(&k), "{}: proof of {}", ctx, k);
+            assert!(crate::tree_proof::verify_storage_proof(&k, storage.get(&k).map(String::as_str), &p.kind, &p.steps, &root),
+                    "{}: {} verifies", ctx, k);
+        }
+    }
+
+    /// The rows a fresh build of `storage` holds.
+    pub(crate) fn fresh_rows(storage: &HashMap<String, String>) -> ContractRows {
+        let tree = StateMerkleTree::build_storage_tree(storage);
+        (
+            tree.leaves.iter().map(|(k, v)| (*k, *v)).collect(),
+            tree.intermediate_nodes.iter().map(|(k, v)| (*k, *v)).collect(),
+            storage.iter().map(|(k, v)| (StateMerkleTree::hash_storage_key(k), v.as_bytes().to_vec())).collect(),
+        )
+    }
+
+    /// A sink that applies every job in order, at once.
+    pub(crate) struct MapAuxSink {
+        pub(crate) rows: std::sync::Mutex<AuxRows>,
+        pub(crate) jobs: std::sync::Mutex<Vec<(usize, Option<u64>)>>,
+        pub(crate) active: AtomicBool,
+        pub(crate) fail_next: AtomicBool,
+        pub(crate) resets: AtomicUsize,
+    }
+
+    impl MapAuxSink {
+        pub(crate) fn new() -> Arc<Self> {
+            Arc::new(Self {
+                rows: std::sync::Mutex::new(AuxRows::default()),
+                jobs: std::sync::Mutex::new(Vec::new()),
+                active: AtomicBool::new(true),
+                fail_next: AtomicBool::new(false),
+                resets: AtomicUsize::new(0),
+            })
+        }
+        pub(crate) fn job_bytes_since(&self, from: usize) -> usize {
+            self.jobs.lock().unwrap()[from..].iter().map(|(b, _)| *b).sum()
+        }
+        pub(crate) fn job_count(&self) -> usize { self.jobs.lock().unwrap().len() }
+    }
+
+    impl ProofAuxSink for MapAuxSink {
+        fn enqueue(&self, job: AuxJob) {
+            if !self.active.load(AO::SeqCst) { return; }
+            if self.fail_next.swap(false, AO::SeqCst) {
+                self.active.store(false, AO::SeqCst);
+                return;
+            }
+            self.jobs.lock().unwrap().push((job.bytes, job.seq));
+            self.rows.lock().unwrap().apply(&job);
+        }
+        fn active(&self) -> bool { self.active.load(AO::SeqCst) }
+        fn reset_all(&self) {
+            *self.rows.lock().unwrap() = AuxRows::default();
+            self.resets.fetch_add(1, AO::SeqCst);
+            self.active.store(true, AO::SeqCst);
+        }
+    }
+
+    /// A reader over one contract's aux rows, as a certified storage proof reads them.
+    pub(crate) struct ContractReader(pub(crate) ContractRows);
+
+    impl crate::tree_proof::TreeReader for ContractReader {
+        fn node(&mut self, depth: u32, key: &[u8; 32]) -> Result<Option<[u8; 32]>, crate::tree_proof::ReadFault> {
+            Ok(self.0 .1.get(&(depth, *key)).copied())
+        }
+        fn leaves(&mut self, lo: &[u8; 32], hi: &[u8; 32], limit: usize)
+            -> Result<Vec<([u8; 32], [u8; 32])>, crate::tree_proof::ReadFault> {
+            Ok(self.0 .0.range(*lo..=*hi).take(limit).map(|(k, v)| (*k, *v)).collect())
+        }
+    }
+}
+
+#[cfg(test)]
+mod proof_aux_tests {
+    use super::*;
+    use super::tests_support::*;
+    use crate::leaf_preimage::AccountLeafPreimage;
+    use std::sync::atomic::Ordering as AO;
+
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 >> 11
+        }
+    }
+
+    fn wallet(i: u64) -> Account {
+        let mut a = Account::new(format!("eon_pa_{:08}", i));
+        a.balance = 10_000 + i;
+        a.nonce = i % 5;
+        a
+    }
+
+    fn contract(addr: &str, storage: HashMap<String, String>) -> Account {
+        let mut a = Account::new(addr.to_string());
+        a.is_contract = true;
+        a.contract_code_hash = Some("ab".repeat(32));
+        a.storage_root = StateMerkleTree::compute_storage_root(&storage);
+        a.contract_storage = storage;
+        a
+    }
+
+    fn holders(n: u64, salt: u64) -> HashMap<String, String> {
+        let mut m: HashMap<String, String> = (0..n)
+            .map(|i| (format!("balance:eon_h_{:06}", i), format!("{}", 1 + (i * 31 + salt) % 9_999)))
+            .collect();
+        m.insert("type".to_string(), "qrc20".to_string());
+        m.insert("total_supply".to_string(), "1000000".to_string());
+        m
+    }
+
+    fn attached() -> (StateManager, Arc<MapNodeStore>, Arc<MapAuxSink>) {
+        let sm = StateManager::new();
+        let store = Arc::new(MapNodeStore::default());
+        sm.set_merkle_node_store(store.clone());
+        let sink = MapAuxSink::new();
+        sm.set_proof_aux_sink(sink.clone());
+        (sm, store, sink)
+    }
+
+    fn put_contract(sm: &StateManager, addr: &str, storage: HashMap<String, String>) {
+        sm.update_account(addr.to_string(), contract(addr, storage));
+        sm.finalize_merkle();
+    }
+
+    fn rows_of(sink: &MapAuxSink, addr: &str) -> ContractRows {
+        sink.rows.lock().unwrap().contract(&StateMerkleTree::hash_address(addr))
+    }
+
+    /// Random edit of a storage map: updates, inserts and deletes of holder keys.
+    fn churn(map: &mut HashMap<String, String>, rng: &mut Lcg, edits: usize) {
+        for _ in 0..edits {
+            let k = format!("balance:eon_h_{:06}", rng.next() % 400);
+            match rng.next() % 3 {
+                0 => { map.remove(&k); }
+                _ => { map.insert(k, format!("{}", 1 + rng.next() % 1_000_000)); }
+            }
+        }
+    }
+
+    #[test]
+    fn flush_marker_runs_after_its_finalize() {
+        let store = Arc::new(MapNodeStore::default());
+        let mut t = StateMerkleTree::new();
+        t.set_node_store(store.clone());
+        for i in 0..50 { let a = wallet(i); t.insert_lazy(&a.address, &a); }
+        t.finalize();
+        t.flush_barrier();
+        assert!(t.leaves_complete && t.node_cache_complete, "a full rebuild leaves both caches complete");
+
+        // Async: the marker sees finalize h1's rows and seq, never h2's queued behind it.
+        store.close_gate();
+        let a = wallet(100);
+        t.insert_lazy(&a.address, &a);
+        let r1 = t.finalize();
+        let s1 = t.row_seq();
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let (st, sn) = (store.clone(), seen.clone());
+        let sent_before = t.flush_sent;
+        t.run_after_flush(Box::new(move |root, seq| { *sn.lock().unwrap() = Some((root, seq, st.root_row(), st.seq())); }));
+        assert_eq!(t.flush_sent, sent_before + 1, "a marker counts as a queued job");
+        let b = wallet(101);
+        t.insert_lazy(&b.address, &b);
+        let r2 = t.finalize();
+        assert_ne!(r1, r2);
+        assert!(seen.lock().unwrap().is_none(), "nothing landed behind a closed gate");
+        store.open_gate();
+        t.flush_barrier();
+        assert_eq!(*seen.lock().unwrap(), Some((r1, s1, Some(r1), s1)), "the marker ran between h1 and h2");
+        assert_eq!(store.root_row(), Some(r2));
+
+        // Sync: caches marked incomplete (what eviction leaves) write inline, and the marker runs
+        // inline over that finalize.
+        t.leaves_complete = false;
+        t.node_cache_complete = false;
+        let d = wallet(103);
+        t.insert_lazy(&d.address, &d);
+        t.finalize();
+        let r3 = t.root_unchecked();
+        let seen3 = Arc::new(std::sync::Mutex::new(None));
+        let (st3, sn3) = (store.clone(), seen3.clone());
+        t.run_after_flush(Box::new(move |root, seq| { *sn3.lock().unwrap() = Some((root, seq, st3.root_row(), st3.seq())); }));
+        let s3 = t.row_seq();
+        assert_eq!(*seen3.lock().unwrap(), Some((r3, s3, Some(r3), s3)), "inline marker over the inline write");
+
+        // Async → sync: while a marker runs, the next finalize neither evicts nor writes inline.
+        let store2 = Arc::new(MapNodeStore::default());
+        let mut t2 = StateMerkleTree::new();
+        t2.set_node_store(store2.clone());
+        t2.set_node_cache_cap(8);
+        store2.close_gate();
+        for i in 0..50 { let a = wallet(200 + i); t2.insert_lazy(&a.address, &a); }
+        let rs = t2.finalize();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let st2 = store2.clone();
+        t2.run_after_flush(Box::new(move |_root, _seq| {
+            let _ = started_tx.send(st2.root_row());
+            let _ = release_rx.recv();
+        }));
+        store2.open_gate();
+        let row_at_marker = started_rx.recv().expect("the marker started");
+        assert_eq!(row_at_marker, Some(rs), "the marker sees the finalize queued before it");
+        let e = wallet(300);
+        t2.insert_lazy(&e.address, &e);
+        let rn = t2.finalize();
+        assert!(t2.leaves_complete, "no eviction while a marker is queued");
+        assert_eq!(store2.root_row(), Some(rs), "the next finalize's rows wait behind the marker");
+        release_tx.send(()).unwrap();
+        t2.flush_barrier();
+        assert_eq!(store2.root_row(), Some(rn));
+    }
+
+    #[test]
+    fn preimage_ops_follow_leaf_ops() {
+        let store = Arc::new(MapNodeStore::default());
+        let sink = MapAuxSink::new();
+        let mut t = StateMerkleTree::new();
+        t.set_node_store(store.clone());
+        let link = AuxLink::new(sink.clone());
+        t.set_aux(link.clone());
+        let key = |a: &Account| StateMerkleTree::hash_address(&a.address);
+        let enc = |a: &Account| AccountLeafPreimage::of(a).encode().unwrap();
+        let pre = |k: &[u8; 32]| sink.rows.lock().unwrap().acct_pre.get(k).cloned();
+        let (a, b, c, d, f, g) = (wallet(1), wallet(2), wallet(3), wallet(4), wallet(6), wallet(7));
+
+        t.insert_lazy(&a.address, &a);
+        t.insert_batch(&[(b.address.clone(), b.clone()), (c.address.clone(), c.clone())]);
+        t.finalize();
+        t.insert(&d.address, &d);
+        for x in [&a, &b, &c, &d] { assert_eq!(pre(&key(x)), Some(enc(x)), "put for {}", x.address); }
+        assert_eq!(sink.rows.lock().unwrap().seq, Some(t.row_seq()), "the finalize job carries its seq");
+
+        t.remove_lazy(&b.address);
+        t.remove(&c.address);
+        assert_eq!(pre(&key(&b)), None, "remove_lazy records a delete");
+        assert_eq!(pre(&key(&c)), None, "remove records a delete");
+
+        // Last op wins inside one finalize.
+        t.insert_lazy(&f.address, &f);
+        t.remove_lazy(&f.address);
+        t.remove_lazy(&g.address);
+        t.insert_lazy(&g.address, &g);
+        t.finalize();
+        assert_eq!(pre(&key(&f)), None);
+        assert_eq!(pre(&key(&g)), Some(enc(&g)));
+
+        // A key with no record emits nothing.
+        let foreign = [0x5Au8; 32];
+        sink.rows.lock().unwrap().acct_pre.insert(foreign, vec![9]);
+        let mut a2 = a.clone();
+        a2.balance += 1;
+        t.insert_lazy(&a2.address, &a2);
+        t.finalize();
+        assert_eq!(pre(&foreign), Some(vec![9]), "an unrecorded key is untouched");
+        assert_eq!(pre(&key(&a)), Some(enc(&a2)));
+        assert_eq!(link.state.lock().unknown_pending, 0, "no op above is an unknown preimage");
+
+        // restore_leaf_lazy puts the leaf back without its fields: a delete, counted unknown.
+        let before = PREIMAGE_UNKNOWN_TOTAL.load(AO::SeqCst);
+        t.restore_leaf_lazy(&a.address, StateMerkleTree::hash_account(&a2));
+        assert_eq!(link.state.lock().unknown_pending, 1);
+        t.finalize();
+        assert_eq!(pre(&key(&a)), None);
+        assert!(PREIMAGE_UNKNOWN_TOTAL.load(AO::SeqCst) > before);
+        assert_eq!(link.state.lock().unknown_pending, 0, "reported once per finalize");
+    }
+
+    #[test]
+    fn restore_with_drains_keeps_every_preimage() {
+        let _guard = crate::state::MARKER_TEST_LOCK.write();
+        let (sm, store, sink) = attached();
+        let per_row = 32 + PRE_ROW_OVERHEAD + 56;
+        let cap = 100_000 * per_row;
+        sm.set_aux_buffer_cap_for_test(cap);
+        let accts: Vec<(String, Account)> = (0..300_000u64).map(|i| { let a = wallet(i); (a.address.clone(), a) }).collect();
+        sm.restore_accounts_streamed(accts.clone().into_iter()).expect("restore");
+        sm.merkle_tree.read().flush_barrier();
+        let rows = sink.rows.lock().unwrap();
+        assert_eq!(rows.acct_pre.len(), 300_000, "every preimage survived the drains");
+        for (addr, a) in accts.iter().step_by(997) {
+            let k = StateMerkleTree::hash_address(addr);
+            let p = AccountLeafPreimage::decode(rows.acct_pre.get(&k).expect("row")).expect("decodes");
+            assert_eq!(Some(p.leaf_hash(addr)), store.leaf(&k), "the preimage hashes to the stored leaf");
+            assert_eq!(p, AccountLeafPreimage::of(a));
+        }
+        assert_eq!(rows.seq, Some(sm.merkle_row_seq()));
+        assert!(sink.job_count() >= 4, "the buffer drained on the way (jobs={})", sink.job_count());
+        assert!(sm.aux_peak_bytes_for_test() <= cap + per_row, "peak buffer within its cap");
+    }
+
+    #[test]
+    fn delta_sink_does_not_change_storage_roots() {
+        let _guard = crate::state::MARKER_TEST_LOCK.write();
+        let plain = StateManager::new();
+        let (mirrored, _store, _sink) = attached();
+        let mut rng = Lcg(7);
+        let names = ["eon_c_alpha", "eon_c_beta", "eon_c_gamma"];
+        let mut maps: Vec<HashMap<String, String>> = (0..3).map(|i| holders(50 + i * 20, i)).collect();
+        for round in 0..300 {
+            let i = (rng.next() % 3) as usize;
+            let edits = 1 + (rng.next() % 6) as usize;
+            churn(&mut maps[i], &mut rng, edits);
+            for sm in [&plain, &mirrored] { put_contract(sm, names[i], maps[i].clone()); }
+            if round % 50 == 49 {
+                for sm in [&plain, &mirrored] { sm.token_trees.write().clear(); }
+            }
+            if round % 100 == 99 {
+                let all = mirrored.get_all_accounts();
+                for sm in [&plain, &mirrored] { sm.restore_accounts(all.clone()).expect("rebuild"); }
+            }
+            let truth = StateMerkleTree::compute_storage_root(&maps[i]);
+            for sm in [&plain, &mirrored] {
+                assert_eq!(sm.get_account(names[i]).unwrap().storage_root, truth, "round {}", round);
+            }
+            assert_eq!(plain.finalize_merkle(), mirrored.finalize_merkle(), "round {}", round);
+        }
+    }
+
+    #[test]
+    fn storage_rows_equal_a_fresh_build_after_churn() {
+        let (sm, _store, sink) = attached();
+        let c = "eon_c_churn";
+        let mut map = holders(120, 3);
+        put_contract(&sm, c, map.clone());
+        let mut rng = Lcg(11);
+        for round in 0..1_000 {
+            let edits = 1 + (rng.next() % 4) as usize;
+            churn(&mut map, &mut rng, edits);
+            put_contract(&sm, c, map.clone());
+            if round % 97 == 0 { sm.token_trees.write().clear(); } // first touch from PRE
+        }
+        assert_eq!(sm.get_account(c).unwrap().storage_root, StateMerkleTree::compute_storage_root(&map));
+        assert_mirror_serves(&rows_of(&sink, c), &map, "after 1,000 diffs and re-installs");
+    }
+
+    #[test]
+    fn first_touch_from_pre_matches_from_post() {
+        let mut rng = Lcg(23);
+        for trial in 0..40u64 {
+            let (sm, _store, sink) = attached();
+            let c = "eon_c_first";
+            let pre = holders(300 + rng.next() % 200, trial);
+            put_contract(&sm, c, pre.clone());
+            let mut post = pre.clone();
+            let edits = 1 + (rng.next() % 5) as usize;
+            churn(&mut post, &mut rng, edits);
+            sm.token_trees.write().clear();
+            let jobs_before = sink.job_count();
+            put_contract(&sm, c, post.clone());
+            assert_eq!(sm.get_account(c).unwrap().storage_root, StateMerkleTree::compute_storage_root(&post), "trial {}", trial);
+            assert_mirror_serves(&rows_of(&sink, c), &post, &format!("trial {}", trial));
+            let (leaves, nodes, _) = fresh_rows(&post);
+            let full = leaves.len() * (STOR_LEAF_BYTES + 64) + nodes.len() * STOR_NODE_BYTES;
+            let written = sink.job_bytes_since(jobs_before);
+            assert!(written < full / 2, "trial {}: only the diff was written ({} of {})", trial, written, full);
+        }
+    }
+
+    #[test]
+    fn first_touch_without_a_matching_mirror_emits_full() {
+        let (sm, _store, sink) = attached();
+        let c = "eon_c_unmirrored";
+        // Resident without ever passing the sweep: the sink holds nothing for it.
+        let seeded = contract(c, holders(40, 1));
+        sm.accounts.insert(c.to_string(), seeded.clone());
+        sm.merkle_tree.write().insert_lazy(c, &seeded);
+        sm.finalize_merkle();
+        assert_eq!(sm.aux_mirror_for_test(c), None);
+        let post = holders(41, 1);
+        put_contract(&sm, c, post.clone());
+        assert_eq!(rows_of(&sink, c), fresh_rows(&post), "missing mirror: a full emit");
+        assert_eq!(sm.aux_mirror_for_test(c), Some(StateMerkleTree::compute_storage_root(&post)));
+
+        // A mirror that names another root is not trusted either.
+        sm.proof_aux.read().as_ref().unwrap().set_mirror(StateMerkleTree::hash_address(c), [0xEE; 32]);
+        sm.token_trees.write().clear();
+        let post2 = holders(43, 2);
+        put_contract(&sm, c, post2.clone());
+        assert_eq!(rows_of(&sink, c), fresh_rows(&post2), "different mirror: a full emit");
+        assert_eq!(sm.aux_mirror_for_test(c), Some(StateMerkleTree::compute_storage_root(&post2)));
+    }
+
+    /// Counts what an emit sends without keeping the rows.
+    struct CountingSink {
+        jobs: std::sync::Mutex<Vec<(usize, usize, usize, usize, bool)>>, // bytes, leaves, nodes, pre, has_root
+    }
+    impl ProofAuxSink for CountingSink {
+        fn enqueue(&self, job: AuxJob) {
+            let root = job.stor_nodes.iter().any(|((_, d, k), _)| *d as usize == TREE_DEPTH && *k == [0u8; 32]);
+            self.jobs.lock().unwrap().push((job.bytes, job.stor_leaves.len(), job.stor_nodes.len(), job.stor_pre.len(), root));
+        }
+        fn active(&self) -> bool { true }
+        fn reset_all(&self) {}
+    }
+
+    #[test]
+    fn emit_full_is_chunked_and_bounded() {
+        let sink = Arc::new(CountingSink { jobs: std::sync::Mutex::new(Vec::new()) });
+        let link = AuxLink::new(sink.clone());
+        let storage: HashMap<String, String> = (0..1_000_000u64)
+            .map(|i| (format!("balance:eon_{:07}", i), format!("{}", i + 1))).collect();
+        let mut tree = StateMerkleTree::build_storage_tree(&storage);
+        let _ = tree.root();
+        let c = StateMerkleTree::hash_address("eon_c_large");
+        StateManager::emit_full(&link, c, &tree, &storage);
+        let jobs = sink.jobs.lock().unwrap();
+        let max_row = STOR_NODE_BYTES.max(STOR_LEAF_BYTES + stor_pre_bytes(&Some(vec![0u8; 16])));
+        assert!(jobs.len() > 2, "a 1M-key tree goes in several jobs");
+        for (bytes, ..) in jobs.iter() { assert!(*bytes <= AUX_BUFFER_CAP_BYTES + max_row, "job of {} bytes", bytes); }
+        let (leaves, nodes, pre) = jobs.iter().fold((0, 0, 0), |a, j| (a.0 + j.1, a.1 + j.2, a.2 + j.3));
+        assert_eq!((leaves, pre), (1_000_000, 1_000_000));
+        assert_eq!(nodes, tree.intermediate_nodes.len());
+        let roots: Vec<usize> = jobs.iter().enumerate().filter(|(_, j)| j.4).map(|(i, _)| i).collect();
+        assert_eq!(roots, vec![jobs.len() - 1], "the root row goes last");
+        assert!(link.state.lock().buf.bytes <= AUX_BUFFER_CAP_BYTES, "nothing piled up in the buffer");
+    }
+
+    #[test]
+    fn rollback_emits_only_changed_storage_rows() {
+        let c = "eon_c_rollback";
+        for cached in [true, false] {
+            let (sm, _store, sink) = attached();
+            let pre = holders(2_000, 5);
+            put_contract(&sm, c, pre.clone());
+            let mut post = pre.clone();
+            post.insert("balance:eon_h_000001".to_string(), "77".to_string());
+            post.remove("balance:eon_h_000002");
+            post.insert("balance:eon_new".to_string(), "5".to_string());
+            let mut snap = sm.create_block_snapshot(9);
+            sm.journal_pre_images(&mut snap, &[c.to_string()]);
+            put_contract(&sm, c, post.clone());
+            assert_mirror_serves(&rows_of(&sink, c), &post, &format!("cached={}: POST", cached));
+            if !cached { sm.token_trees.write().clear(); }
+            let jobs_before = sink.job_count();
+            sm.rollback_block(&snap);
+            assert_mirror_serves(&rows_of(&sink, c), &pre, &format!("cached={}: the rows serve PRE's tree", cached));
+            assert_eq!(sm.aux_mirror_for_test(c), Some(StateMerkleTree::compute_storage_root(&pre)));
+            let written = sink.job_bytes_since(jobs_before);
+            assert!(written < 64 * 1024, "cached={}: O(changed) rows, wrote {} bytes", cached, written);
+        }
+        // A contract the block created goes, and the mirror forgets it.
+        let (sm, _store, sink) = attached();
+        let d = "eon_c_created";
+        let mut snap = sm.create_block_snapshot(9);
+        sm.journal_pre_images(&mut snap, &[d.to_string()]);
+        put_contract(&sm, d, holders(10, 1));
+        assert!(!rows_of(&sink, d).0.is_empty());
+        sm.rollback_block(&snap);
+        assert_eq!(rows_of(&sink, d), (BTreeMap::new(), BTreeMap::new(), BTreeMap::new()));
+        assert_eq!(sm.aux_mirror_for_test(d), None);
+    }
+
+    #[test]
+    fn restore_emits_every_contract_storage_tree() {
+        let _guard = crate::state::MARKER_TEST_LOCK.write();
+        let (sm, _store, sink) = attached();
+        let mut all: Vec<(String, Account)> = (0..50u64).map(|i| { let a = wallet(i); (a.address.clone(), a) }).collect();
+        let names: Vec<String> = (0..5).map(|i| format!("eon_c_restore_{}", i)).collect();
+        for (i, n) in names.iter().enumerate() { all.push((n.clone(), contract(n, holders(20 + i as u64 * 15, i as u64)))); }
+        sm.restore_accounts(all.clone()).expect("restore");
+        for (n, a) in all.iter().filter(|(_, a)| a.is_contract) {
+            let rows = rows_of(&sink, n);
+            assert_eq!(rows, fresh_rows(&a.contract_storage), "{}", n);
+            assert_eq!(rows.1.get(&(TREE_DEPTH as u32, [0u8; 32])), Some(&a.storage_root), "{}: root row", n);
+        }
+    }
+
+    #[test]
+    fn storage_values_hash_to_their_leaves() {
+        let (sm, _store, sink) = attached();
+        let mut rng = Lcg(41);
+        let mut map = holders(80, 9);
+        for _ in 0..200 {
+            churn(&mut map, &mut rng, 3);
+            put_contract(&sm, "eon_c_values", map.clone());
+        }
+        let rows = sink.rows.lock().unwrap();
+        assert_eq!(rows.stor_leaves.len(), rows.stor_pre.len());
+        for (k, v) in rows.stor_pre.iter() {
+            let leaf = rows.stor_leaves.get(k).expect("a leaf for every value");
+            assert_eq!(StateMerkleTree::storage_leaf_value(std::str::from_utf8(v).unwrap()), *leaf);
+        }
+    }
+
+    #[test]
+    fn aux_failure_stops_emission_until_full_reset() {
+        let _guard = crate::state::MARKER_TEST_LOCK.write();
+        let (sm, _store, sink) = attached();
+        let c = "eon_c_failing";
+        put_contract(&sm, c, holders(30, 1));
+        assert!(sm.aux_mirror_for_test(c).is_some());
+        sink.fail_next.store(true, AO::SeqCst);
+        put_contract(&sm, c, holders(31, 1));
+        assert!(!sink.active.load(AO::SeqCst), "the failed write took the sink down");
+        let jobs = sink.job_count();
+        put_contract(&sm, c, holders(32, 1));
+        let w = wallet(9);
+        sm.update_account(w.address.clone(), w);
+        sm.finalize_merkle();
+        assert_eq!(sink.job_count(), jobs, "nothing is emitted while inactive");
+        assert_eq!(sm.aux_mirror_for_test(c), None, "the mirror is forgotten");
+        let all = sm.get_all_accounts();
+        sm.restore_accounts(all.clone()).expect("full reset");
+        assert!(sink.active.load(AO::SeqCst), "a full reset re-arms the sink");
+        assert!(sink.job_count() > jobs);
+        let a = all.iter().find(|(n, _)| n == c).unwrap();
+        assert_eq!(rows_of(&sink, c), fresh_rows(&a.1.contract_storage));
+    }
+
+    #[test]
+    fn token_trees_are_installed_through_one_helper() {
+        let src = include_str!("state.rs");
+        let code = &src[..src.find("mod parallel_apply_tests").expect("test modules follow the code")];
+        let start = code.find("fn install_token_tree(").expect("the helper");
+        let end = start + code[start..].find("\n    }\n").expect("the helper's end");
+        let mut n = 0;
+        for (at, _) in code.match_indices("trees.insert(") {
+            assert!(at > start && at < end, "a token tree inserted outside install_token_tree at byte {}", at);
+            n += 1;
+        }
+        assert_eq!(n, 1, "the helper itself inserts");
+        assert!(!code.contains("token_trees.write().insert("));
+    }
 }
 
 #[cfg(test)]

@@ -2,7 +2,7 @@
 name = "qnet-consensus"
 version = "0.1.0"
 edition = "2021"
-authors = ["QNet Team"]
+authors = ["Orrery Group LLC"]
 description = "High-performance consensus mechanism for QNet blockchain"
 license = "BUSL-1.1"
 

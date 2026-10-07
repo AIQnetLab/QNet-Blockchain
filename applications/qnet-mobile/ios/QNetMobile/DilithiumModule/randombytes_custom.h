@@ -12,11 +12,22 @@
 extern "C" {
 #endif
 
-/** Set a 32-byte deterministic seed for the next keygen call (consumed once). */
+/** Set a 32-byte deterministic seed for the next keygen call (consumed once). Call under dilithium_lock. */
 void dilithium_set_keygen_seed(const uint8_t *seed32);
 
 /** Clear the seed from memory after use. */
 void dilithium_clear_keygen_seed(void);
+
+/** One lock across seed/keygen/clear and every signature. */
+void dilithium_lock(void);
+void dilithium_unlock(void);
+
+/** Zeroing that is never optimised away. */
+void dilithium_secure_zero(void *p, size_t n);
+
+/* Overwrites the stack region the last keypair or signature used (its frames and those of every function it
+ * called), right after it returns and under the same lock. */
+void dilithium_burn_stack(void);
 
 /** PQCLEAN random bytes provider. */
 int PQCLEAN_randombytes(uint8_t *output, size_t n);

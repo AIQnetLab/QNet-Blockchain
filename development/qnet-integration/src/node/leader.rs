@@ -225,7 +225,7 @@ impl BlockchainNode {
             let mut candidates = if valid_candidates.is_empty() {
                 // Genesis epoch (height 1-180): Use Genesis static list
                 // WHY 180? N-2 logic - MacroBlock #1 ready only at ~block 120
-                if current_height <= 180 {
+                if current_height <= GENESIS_STATIC_ROSTER_LAST_HEIGHT {
                     println!("[INFO][MB] genesis_epoch h={}", current_height);
                     let genesis_candidates = Self::get_genesis_candidates_with_real_reputation(p2p);
                     println!("[INFO][MB] genesis_producers={}", genesis_candidates.len());
@@ -249,7 +249,7 @@ impl BlockchainNode {
             //
             // The SYNCHRONIZED nodes will continue producing blocks.
             // This node will sync via background task and rejoin later.
-            if candidates.is_empty() && current_height > 180 {
+            if candidates.is_empty() && current_height > GENESIS_STATIC_ROSTER_LAST_HEIGHT {
                 let required_epoch = (current_height - 1) / 90;
                 eprintln!("[ERR][MB] desync mb={} h={} no_candidates action=excluded_from_production", required_epoch, current_height);
                 
@@ -827,7 +827,7 @@ impl BlockchainNode {
         // WHY 180? With N-2 logic, MacroBlock #1 is needed at block 181.
         // MacroBlock #1 is created at block 90, consensus finishes ~block 120.
         // ═══════════════════════════════════════════════════════════════════
-        if current_height <= 180 {
+        if current_height <= GENESIS_STATIC_ROSTER_LAST_HEIGHT {
             // REFACTORED v2.32: Use unified helper function (eliminates duplication)
             let mut all_qualified = Self::get_genesis_candidates_with_real_reputation(p2p);
             

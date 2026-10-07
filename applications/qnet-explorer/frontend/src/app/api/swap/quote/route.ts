@@ -1,25 +1,20 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { fetchNode } from '@/lib/node-api';
 
 // ============================================================================
 // SWAP Quote API - DEX Module
 // Status: Planned for Phase 3
 // ============================================================================
 
-const QNET_API_URL = process.env.QNET_API_URL || 'http://localhost:8001';
-
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
     
     // Try to get quote from backend DEX
-    const res = await fetch(`${QNET_API_URL}/api/v1/dex/quote`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(5000),
-    });
-    
-    if (res.ok) {
+    // A quote changes nothing, so another node may answer it.
+    const res = await fetchNode('/api/v1/dex/quote', { method: 'POST', body: JSON.stringify(body), timeoutMs: 5000 });
+
+    if (res && res.ok) {
       const data = await res.json();
       return NextResponse.json({
         success: true,

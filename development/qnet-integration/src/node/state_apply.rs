@@ -110,7 +110,7 @@ impl BlockchainNode {
                 | qnet_state::TransactionType::BatchTransfers { .. }));
         if pure_transfers {
             let outcomes = state_guard.apply_transfers_parallel(
-                &microblock.transactions, block_snapshot.as_deref_mut());
+                &microblock.transactions, h, block_snapshot.as_deref_mut());
             for (tx, outcome) in microblock.transactions.iter().zip(outcomes) {
                 let charged = outcome.as_ref().map_or(false, |o| o.charged);
                 if let Err(e) = outcome {
@@ -502,6 +502,8 @@ impl BlockchainNode {
         // Its rows follow in apply order, like any applied block's.
         let (puts, dels) = crate::storage::account_delta(sg, &snap);
         storage.mirror_block_delta(mb.height, puts, dels);
+        // A replayed boundary is already certified: its proof view promotes as soon as it lands.
+        storage.request_proof_view(sg, mb.height);
         // A replayed block is a committed block: its journal serves a later shallow undo.
         sg.retain_block_journal(snap);
         Ok(repaired)

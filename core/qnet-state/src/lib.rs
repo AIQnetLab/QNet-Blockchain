@@ -17,17 +17,19 @@ pub mod errors;
 pub mod state;
 pub mod feature_gates;
 pub mod wasm_exec;         // Smart-contract WASM execution on the apply path (VM enabled)
+pub mod leaf_preimage;     // Account leaf fields in fixed byte form, for certified proofs
+pub mod tree_proof;        // Read-only prover over a frozen tree view, and its verifiers
 
 #[cfg(feature = "python")]
 mod python_bindings;
 
 pub use account::{Account, AccountState, NodeType};
 pub use block::{Block, BlockHeader, ConsensusProof, BlockType, MicroBlock, MacroBlock, ConsensusData, LightMicroBlock, BlockHash, EfficientMicroBlock, StoredMicroBlock, storage_version, EligibleProducer, RewardHeartbeat, HeartbeatSummary, ExcludedProducerEntry};
-pub use transaction::{Transaction, TransactionReceipt, TransactionType, EquivocationHeader, gas_limits, PingSampleData, HeartbeatSampleData, ShardHeartbeatSummary, GAS_METERING_ACTIVATION_HEIGHT, MAX_CONTRACT_STORAGE_ENTRIES, DynamicGasPricing, init_dynamic_gas_pricing, update_dynamic_gas_pricing, get_dynamic_gas_pricing, OwnsDelta};
+pub use transaction::{Transaction, TransactionReceipt, TransactionType, EquivocationHeader, gas_limits, PingSampleData, HeartbeatSampleData, ShardHeartbeatSummary, GAS_METERING_ACTIVATION_HEIGHT, MAX_CONTRACT_STORAGE_ENTRIES, OwnsDelta};
 pub use state_db::StateDB;
 pub use state_manager::StateManager;
 pub use errors::{StateError, StateResult};
-pub use state::{StateManager as State, MAX_QNC_SUPPLY, MAX_QNC_SUPPLY_NANO, StateMerkleTree, BalanceProof, TokenBalanceProof};
+pub use state::{StateManager as State, MAX_QNC_SUPPLY, MAX_QNC_SUPPLY_NANO, StateMerkleTree, BalanceProof, TokenBalanceProof, AccountBasic};
 // v3.26: Atomic fee crediting protection
 pub use state::{should_credit_fees, clear_credited_fees_cache, credited_fees_count,
                 release_credited_fees};
@@ -36,9 +38,13 @@ pub use state::BlockSnapshot;
 // v7.0: Fork gate for pending_rewards in Merkle hash
 // v15.10 STAGE-2: read-through fallback trait for disk-backed accounts
 pub use state::AccountStore;
-// Read-through disk-backed node store for the merkle tree (default-off seam).
-pub use state::MerkleNodeStore;
+// Disk-backed node store for the merkle tree, and the proof aux rows written beside it.
+pub use state::{MerkleNodeStore, AcctDelta, ProofAuxSink, AuxJob, AUX_BUFFER_CAP_BYTES,
+                MERKLE_STORE_WRITE_FAILURES, PREIMAGE_UNKNOWN_TOTAL};
 pub use state::CF_ROWS_WITHOUT_LEAF;
+pub use leaf_preimage::AccountLeafPreimage;
+pub use tree_proof::{TreeReader, ReadFault, LeafProof, LeafProofKind, ProveError, StoredRows, prove_leaf, prove_leaf_in, verify_leaf,
+                     verify_account_proof, verify_storage_proof, PROOF_BUCKET_READ_CAP, ABSENCE_BUCKET_ENTRIES_MAX};
 
 #[cfg(feature = "python")]
 pub use python_bindings::*;

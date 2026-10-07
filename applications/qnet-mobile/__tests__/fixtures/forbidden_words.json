@@ -1,0 +1,13 @@
+{
+  "en": ["activat", "burn", "activation code", "reward", "mining", "earn", "price", "purchase"],
+  "ru": ["активац", "сжиг", "сожж", "наград", "майнинг", "код активации", "заработ", "доход", "цена", "цену", "цены", "покуп", "купить"],
+  "de": ["aktivier", "verbrenn", "belohnung", "mining", "preis", "kauf"],
+  "es": ["activaci", "quema", "recompensa", "minería", "precio", "compra"],
+  "fr": ["activation", "brûl", "récompense", "minage", "prix", "achat"],
+  "it": ["attivazion", "brucia", "ricompens", "mining", "prezzo", "acquist"],
+  "pt": ["ativaç", "queima", "recompensa", "mineração", "preço", "compra"],
+  "ja": ["アクティベーション", "有効化", "バーン", "焼却", "報酬", "マイニング", "価格", "購入"],
+  "ko": ["활성화", "소각", "보상", "채굴", "가격", "구매"],
+  "zh-CN": ["激活", "销毁", "燃烧", "奖励", "挖矿", "价格", "购买"],
+  "ar": ["تفعيل", "حرق", "مكافأ", "تعدين", "سعر", "شراء"]
+}

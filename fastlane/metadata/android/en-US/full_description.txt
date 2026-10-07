@@ -1,47 +1,32 @@
-QNet Wallet - Decentralized Cryptocurrency Wallet
+QNet Wallet is a non-custodial wallet for the QNet network. Keys are created on your device and never leave it. The app has no accounts, no analytics and no tracking, and works the same on phones and tablets.
 
-QNet Wallet is a secure, open-source mobile wallet for the QNet blockchain ecosystem. Built with privacy and security in mind, it provides users with full control over their digital assets.
+WALLET
+• Create a wallet or restore one from a 12- or 24-word recovery phrase
+• Send and receive QNC and QNet tokens, and SOL and 1DEV from the wallet's Solana address (Solana devnet test tokens); show a QR code of your address, or scan an address or a Solana payment request to fill in the Send form
+• Transaction history that outlives node pruning; each confirmed QNet transaction opens in the block explorer, and the SOL and 1DEV sends made on this device are listed too
+• History split by network, QNet and Solana, under a header for each day
+• Unlock with fingerprint, face or the device's screen lock, or with a password on a device without one
+• A built-in web browser to use websites with the wallet: every connection, message signature, send and contract call is shown and confirmed in the app first
 
-KEY FEATURES:
+LIGHT NODE (OPTIONAL)
+A QNet light node is registered to a wallet on the QNet network. If the network lists one for your wallet, the Node tab shows it and this device can run it: about once every four hours the network sends a short signed status request, and the app answers with one ML-DSA-65 signature. This is not mining: no hashing, no proof-of-work, and blocks are produced by server nodes. The Node tab shows whether the node answered this epoch, how many epochs the network counted, and the node balance, which you can move into your wallet with an ordinary transaction. You can stop at any time. A wallet's super node runs on a server; the Node tab shows its status, epochs and node balance. The app sells nothing and has no in-app purchases.
 
-🔐 SECURITY FIRST
-• Non-custodial: You own your keys and your crypto
-• BIP39 mnemonic seed phrase support
-• Secure keychain storage on device
-• No tracking, no analytics, no third-party services
+The node runs only on phones and tablets that pass the system's device check, one node per device; on Android this needs a Google Play certified device.
 
-💰 COMPLETE WALLET FUNCTIONALITY
-• Send and receive QNet tokens
-• Transaction history with detailed information
-• QR code support for easy payments
-• Real-time balance updates
+POST-QUANTUM CRYPTOGRAPHY
+QNet transactions are signed on the device with ML-DSA-65 (NIST FIPS 204); SOL and 1DEV transfers are signed on the device with the wallet's Solana key (Ed25519).
 
-🌍 DECENTRALIZED ARCHITECTURE
-• Direct connection to QNet blockchain nodes
-• No central servers required
-• Byzantine fault-tolerant consensus
-• Quantum-resistant cryptography support
+OPEN SOURCE
+The app is open source under Apache-2.0, in one public repository with the rest of QNet; the node is source-available under the Business Source License 1.1.
 
-🚀 PERFORMANCE
-• Fast transaction processing
-• Optimized for mobile devices
-• Low battery consumption
-• Works on older Android devices (Android 5.0+)
+LANGUAGES
+English, Chinese (Simplified), Russian, Spanish, French, German, Japanese, Korean, Portuguese, Arabic and Italian.
 
-OPEN SOURCE & TRANSPARENT
-• Fully auditable code
-• Community-driven development
-• Regular security updates
-• No hidden functionality
+GOOD TO KNOW
+• QNet is an experimental network at the testnet stage. QNC has no market value. SOL and 1DEV in the app are Solana devnet test tokens with no market value either. Any node balance is set by the network protocol, is not guaranteed and is not paid by Orrery Group LLC.
+• Your recovery phrase is the only backup. Nobody can recover it for you.
+• A light node needs the app to stay installed and allowed to run in the background; battery restrictions can delay or skip its answers: https://aiqnet.io/support?from=app
 
-PRIVACY FOCUSED
-• No personal data collection
-• No KYC requirements
-• Optional privacy features
-• Local-only data storage
-
-QNet Wallet puts you in full control of your digital assets while maintaining the highest standards of security and privacy.
-
-SOURCE CODE: https://github.com/AIQnetLab/QNet-Blockchain
-LICENSE: Apache-2.0
-
+Privacy policy: https://aiqnet.io/privacy?from=app
+Terms of use: https://aiqnet.io/terms?from=app
+Support: support@aiqnet.io · https://aiqnet.io/support?from=app

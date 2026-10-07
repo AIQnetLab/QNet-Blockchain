@@ -1,0 +1,10 @@
+{
+  "extName": {
+    "message": "QNet 지갑",
+    "description": "Extension name in the browser and the store."
+  },
+  "extDescription": {
+    "message": "Solana 계정이 있는 양자 내성 QNet 지갑(ML-DSA-65). QNet Light 또는 Super 노드를 활성화하고 Light 노드를 기록합니다.",
+    "description": "Store and extensions-page description, at most 132 characters."
+  }
+}

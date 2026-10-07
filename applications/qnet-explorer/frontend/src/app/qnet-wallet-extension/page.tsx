@@ -4,9 +4,7 @@ import React from 'react';
 
 export default function QNetWalletExtensionPage() {
   const handleDownload = () => {
-    // In production, this would link to Chrome Web Store
-    // For now, show development instructions
-    alert('QNet Wallet Extension will be available on Chrome Web Store soon!\n\nFor development: Load the extension from applications/qnet-wallet/ folder.');
+    window.open('https://chromewebstore.google.com/detail/qnet-wallet/pahnggomgmhhjjncgfnmmofmplfhkncg', '_blank', 'noopener,noreferrer');
   };
 
   return (
@@ -19,7 +17,11 @@ export default function QNetWalletExtensionPage() {
               QNet Wallet Extension
             </h1>
             <p className="text-xl text-gray-300 max-w-2xl mx-auto">
-              The official QNet blockchain wallet. Manage your 1DEV tokens, activate nodes, and earn rewards - all in one secure extension.
+              The QNet wallet for the browser: hold and send QNC, SOL and 1DEV, with keys that never leave your browser.
+              Its Activate tab, or aiqnet.io/node, burns 1DEV on Solana and issues the activation code of the wallet&apos;s
+              one node: a light node, which it also records on the QNet network, or a super node, which only the extension
+              activates and which runs on your own server. It recovers the code of an earlier burn, and Record on the
+              network records an earlier burn&apos;s light node.
             </p>
           </div>
 
@@ -35,17 +37,18 @@ export default function QNetWalletExtensionPage() {
 
             <div className="bg-gray-800 bg-opacity-50 p-6 rounded-lg border border-cyan-500 border-opacity-30">
               <div className="text-4xl mb-4">⚡</div>
-              <h3 className="text-xl font-semibold mb-3">One-Click Activation</h3>
+              <h3 className="text-xl font-semibold mb-3">Verified Balances</h3>
               <p className="text-gray-300">
-                Activate QNet nodes with a single click. Choose from Light, Full, or Super node types.
+                A balance counts as verified only when the node&apos;s account proof folds to a state root that the network&apos;s validator committee signed, which the extension checks itself.
               </p>
             </div>
 
             <div className="bg-gray-800 bg-opacity-50 p-6 rounded-lg border border-cyan-500 border-opacity-30">
               <div className="text-4xl mb-4">💰</div>
-              <h3 className="text-xl font-semibold mb-3">Reward Tracking</h3>
+              <h3 className="text-xl font-semibold mb-3">Site connection</h3>
               <p className="text-gray-300">
-                Monitor your node performance and automatically claim rewards every 4 hours.
+                Sites can ask the extension to connect and to sign; every request is shown to you first, with the requesting
+                site, and the key stays where it is. Approved sites can be removed in the settings.
               </p>
             </div>
           </div>
@@ -105,7 +108,7 @@ export default function QNetWalletExtensionPage() {
                   <div className="w-8 h-8 bg-cyan-500 rounded-full flex items-center justify-center text-black font-bold flex-shrink-0">4</div>
                   <div>
                     <h4 className="font-semibold">Start Using</h4>
-                    <p className="text-gray-300 text-sm">Create wallet or import existing seed phrase</p>
+                    <p className="text-gray-300 text-sm">Create wallet or import existing recovery phrase</p>
                   </div>
                 </div>
               </div>
@@ -116,9 +119,8 @@ export default function QNetWalletExtensionPage() {
           <div className="mt-12 text-center">
             <h3 className="text-lg font-semibold mb-4">System Requirements</h3>
             <div className="flex justify-center space-x-8 text-gray-300">
-              <div>🌐 Chrome 88+</div>
-              <div>🔷 Edge 88+</div>
-              <div>🦊 Firefox (coming soon)</div>
+              <div>🌐 Chrome 111+</div>
+              <div>🔷 Edge 111+</div>
             </div>
           </div>
         </div>

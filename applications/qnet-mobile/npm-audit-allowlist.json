@@ -1,0 +1,65 @@
+{
+  "comment": "Advisories `npm audit --omit=dev` reports that do not reach the shipped app, each with the reason. scripts/audit-check.js fails on any other advisory; __tests__/DependencyAudit.test.js checks the reasons still hold (who depends on the package, and that the app bundle cannot load it).",
+  "advisories": [
+    {
+      "id": "GHSA-5p2g-fcmc-qvqq",
+      "package": "image-size",
+      "path": "react-native > metro > image-size",
+      "why": "Build tool only. Metro (the bundler) reads the project's own image assets with it on the developer's machine to record their width and height; no code in the app requires it and it is not in the JS bundle or the APK/IPA. The DoS needs a crafted JXL/HEIF image, and the only images it ever parses are the repository's own. Upgrading needs image-size 2.x, whose API Metro 0.83 does not use (it passes file paths), so the bundler would break."
+    },
+    {
+      "id": "GHSA-w3rx-r6r6-pgpr",
+      "package": "image-size",
+      "path": "react-native > metro > image-size",
+      "why": "Same package and reason as GHSA-5p2g-fcmc-qvqq: an ICNS parsing loop in a build-time tool that parses only the repository's own assets."
+    },
+    {
+      "id": "GHSA-528h-pc64-c93x",
+      "package": "stream-json",
+      "path": "@solana/web3.js > jayson > stream-json",
+      "why": "Not in the app. @solana/web3.js's React Native entry (lib/index.native.js) loads only jayson/lib/client/browser, which requires nothing but uuid and jayson's generateRequest; stream-json is required by jayson/lib/utils.js, the JSON-RPC server's stream parser, which that client never loads, so Metro never bundles it. The advisory concerns stream-json's pick/ignore/filter/replace filters on hostile input, which nothing in the app runs."
+    },
+    {
+      "id": "GHSA-m9gg-hp2v-232j",
+      "package": "@grpc/grpc-js",
+      "path": "@react-native-firebase/app > firebase > @firebase/firestore > @grpc/grpc-js",
+      "why": "Node only. The web Firestore SDK uses it as its Node HTTP/2 transport; the app never imports Firestore (it uses the native messaging module), grpc-js needs Node's http2 and cannot run in React Native, and it is not in the JS bundle. The flaw is in a gRPC server's auth context, which the app never runs."
+    },
+    {
+      "id": "GHSA-f596-whhp-79r4",
+      "package": "@grpc/grpc-js",
+      "path": "@react-native-firebase/app > firebase > @firebase/firestore > @grpc/grpc-js",
+      "why": "Node only, as above: a gRPC server's error messages; the app runs no gRPC server and never loads the package."
+    },
+    {
+      "id": "GHSA-vfj7-8cjw-p6xm",
+      "package": "braces",
+      "path": "react-native > babel-jest > @jest/transform > micromatch > braces",
+      "why": "Test and build tool only. Jest's transform matches the repository's own file globs with it on the developer's or CI machine; it is not in the JS bundle or the APK/IPA, and the patterns it expands are the project's own."
+    },
+    {
+      "id": "GHSA-pqg4-j6r4-53mv",
+      "package": "shell-quote",
+      "path": "react-native > @react-native/community-cli-plugin > @react-native-community/cli > @react-native-community/cli-tools > shell-quote",
+      "why": "Developer tool only. The React Native command line quotes its own build commands with it on the developer's machine; it is not in the JS bundle or the APK/IPA and never sees input from users."
+    },
+    {
+      "id": "GHSA-hp3w-g68c-fv3c",
+      "package": "sprintf-js",
+      "path": "react-native > babel-jest > babel-plugin-istanbul > @istanbuljs/load-nyc-config > sprintf-js",
+      "why": "Test tool only. Coverage configuration loading in Jest; not in the JS bundle or the APK/IPA, and its format strings are the tool's own."
+    },
+    {
+      "id": "GHSA-hqr4-qq8f-hg3x",
+      "package": "stream-json",
+      "path": "@solana/web3.js > jayson > stream-json",
+      "why": "Node only. jayson's server and Node streaming parts use it; the app's Solana client resolves jayson's browser client, which never imports stream-json, and the package is not in the JS bundle. The app parses no JSONC."
+    },
+    {
+      "id": "GHSA-mjw6-4jj6-33hc",
+      "package": "stream-json",
+      "path": "@solana/web3.js > jayson > stream-json",
+      "why": "Node only, as above: the Assembler is never loaded by the app; RPC answers are parsed by the app's own strict JSON parser."
+    }
+  ]
+}
