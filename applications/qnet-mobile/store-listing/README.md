@@ -120,12 +120,19 @@ analytics. App Attest and DeviceCheck need no required-reason entry and ask the 
 
 ## Export compliance (App Store Connect)
 
-- `ITSAppUsesNonExemptEncryption` = YES (`ios/QNetMobile/Info.plist`).
+- `ITSAppUsesNonExemptEncryption` = NO (`ios/QNetMobile/Info.plist`). App Store Connect's encryption questionnaire
+  (App Information > App Encryption Documentation), answered "standard encryption algorithms" and "not available in
+  France", requires no documentation and tells the developer to declare that in Info.plist. A YES build is refused at
+  upload ("Invalid Export Compliance Code") unless it carries the `ITSEncryptionExportComplianceCode` of approved
+  documentation.
+- France is left out of the App Store availability until the French encryption declaration to ANSSI is made. Then the
+  declaration goes into App Store Connect as the app's encryption documentation, Info.plist gets YES with the code
+  Apple issues, and France is added.
 - The app implements standard algorithms outside Apple's frameworks: ML-DSA-65 (FIPS 204) and SHA-3/SHAKE in its own
   native module; PBKDF2-SHA256 and AES-256-GCM for keys at rest through its bundled native crypto library; in its
   JavaScript crypto libraries X25519 with HKDF-SHA256 and AES-256-GCM for the end-to-end encrypted answers to
   aiqnet.io's requests, and Ed25519 for Solana transfers; the device key of App Attest is Apple's own. In Apple's table that is "industry standard algorithm, not provided within the Apple operating system":
-  no CCATS; a French encryption declaration only if the app is offered in France.
+  no CCATS; the French encryption declaration only for the App Store in France.
 - The same classification (mass-market encryption, License Exception ENC) carries a US obligation: an annual
   self-classification report to BIS and the ENC Encryption Request Coordinator by 1 February for the previous year.
   Filing it is the publisher's task, not the app's.

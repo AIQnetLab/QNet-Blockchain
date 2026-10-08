@@ -1708,8 +1708,9 @@ seldom as the screen allows (`src/utils/requestPace.js`), and nothing while it i
   section 5. No system version is required: the genesis nodes judge the evidence. Android's texts that name Google
   Play live in `src/i18n/overlay.android.js`, which no iOS build carries. How the Node tab, the link sheet and the
   wakes use the key: [The device check](#the-device-check).
-- iOS: `ITSAppUsesNonExemptEncryption` is `YES` (standard algorithms in the app's own native module and its bundled
-  crypto libraries, as `store-listing/README.md` lists them),
+- iOS: `ITSAppUsesNonExemptEncryption` is `NO`: the app's standard algorithms (its own native module and bundled
+  crypto libraries, as `store-listing/README.md` lists them) need no export compliance documentation while the App
+  Store in France is left out,
   `RCTNewArchEnabled` matches Android (`false`), the one background task is `com.transistorsoft.fetch`, and
   `PrivacyInfo.xcprivacy` declares four data types, each for app functionality, linked and not for tracking: a
   device ID (the push token and the device check, only while a node is linked), a user ID (the QNet and Solana
